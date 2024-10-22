@@ -35,8 +35,7 @@ use sha2::digest::consts::U2;
 use reth_primitives::bytes::Bytes;
 
 use alloy_rlp::{length_of_length, Decodable, Encodable, MaxEncodedLenAssoc};
-use bytes::{BufMut, BytesMut};
-use itertools::Itertools;
+use bytes::BufMut;
 use rand::prelude::SliceRandom;
 use rlp::RlpStream;
 use reth_chainspec::ChainSpec;
@@ -202,7 +201,7 @@ where
 
     config: Arc<APosConfig>,          // Consensus engine configuration parameters
     /// Chain spec
-    chain_spec: Arc<ChainConfig>,
+    chain_spec: Arc<ChainSpec>,
 
     recents: schnellru::LruMap<u64, Snapshot<T>>,    // Snapshots for recent block to speed up reorgs
     signatures: schnellru::LruMap<u64, Vec<u8>>,    // Signatures of recent blocks to speed up mining
@@ -228,7 +227,7 @@ where
     pub fn new(
         	// Set any missing consensus parameters to their defaults
         config: APosConfig,
-        chain_config: Arc<ChainConfig>,
+        chain_config: ChainConfig,
     ) -> Arc<dyn Engine> {
         
         let mut conf = config.clone();
@@ -243,14 +242,12 @@ where
         
         Arc::new(APos {
             config: Arc::new(conf),
-            chain_spec:chain_config,
+            chain_spec: chain_config,
             recents,
             signatures,
             proposals: Arc::new(RwLock::new(HashMap::new())),
-            signer: Default::default(),
-            sign_fn: Default::default(),
-            lock: Arc::new(RwLock::new(())),
-            provider: Default::default(),
+            // signer: todo!(),
+            // sign_fn: todo!(),
         })
     }
 
@@ -303,7 +300,7 @@ where
                     }
             
                    
-                    let new_snapshot = Snapshot::new_snapshot(self.config.clone(),  number, hash, signers,());
+                    let new_snapshot = Snapshot::new_snapshot(self.config.clone(),  number, hash, signers);
 
                     // new_snapshot.store();
                     info!(
@@ -318,10 +315,10 @@ where
                     
 
             // No snapshot for this header, gather the header and move backward
-            let header = if let Some((ref mut parent_vec,)) = parents{
+            let header = if parents.is_some() > 0 {
                 // If we have explicit parents, pick from there (enforced)
-                let Some(header) = parent_vec.pop();
-                if header.hash_slow() != hash || header.number != number {
+                let header = parents.pop().unwrap();
+                if header.hash_slow() != hash || header.number64() != number {
                     return Err(AposError::UnknownBlock);
                 }
                 header
@@ -333,7 +330,7 @@ where
 
             headers.push(header);
             number -= 1;
-            hash = header.parent_hash.clone();
+            hash = header.parent_hash(); 
         }
 
         //Find the previous snapshot and apply any pending headers to it
@@ -454,12 +451,9 @@ where
         header.extra_data.truncate(EXTRA_VANITY);
 
         if header.number % self.config.epoch == 0 {
-            let mut extra_data: Vec<u8> = header.extra_data.to_vec();
             for signer in snap.signers {
-                header.extra_data.extend(&signer.0);
+                header.extra_data.extend_from_slice(&signer.0);
             }
-            header.extra_data = extra_data.into();
-
         }
         header.extra_data.extend(vec![0x00; SIGNATURE_LENGTH]);
 
@@ -552,7 +546,7 @@ where
 
         // For 0-period chains, refuse to seal empty blocks (no reward but would spin sealing)
         if self.config.period == 0 && block.body.is_empty() {
-            return Err(AposError::UnTransion.into());
+            return Err(AposError::UnTransion);
         }
 
 
@@ -560,7 +554,7 @@ where
         let snap = self.snapshot(block.number - 1, block.parent_hash.clone(), None).await?;
         if !snap.signers.contains(&self.signer) {
             error!(target: "consensus::engine", "err signer: {}", self.signer);
-            return Err(AposError::UnauthorizedSigner.into())
+            return Err(AposError::UnauthorizedSigner)
         }
 
         // If we're amongst the recent signers, wait for the next block
@@ -569,7 +563,7 @@ where
                 let limit = (snap.signers.len() as u64 / 2) + 1;
                 if block.number < limit || seen > block.number - limit {
                     error!(target: "consensus::engine", "Signed recently, must wait for others: limit: {}, seen: {}, number: {}, signer: {}", limit, seen, block.number, self.signer);
-                    return Err(AposError::UnauthorizedSigner.into());
+                    return Err(AposError::UnauthorizedSigner);
                 }
             }
         }
@@ -591,10 +585,10 @@ where
             );
         }
 
-        // // Beijing hard fork logic (if applicable)
-        // if self.chain_spec.is_beijing_active_at_block(block.number) {
-        //
-        // }
+        // Beijing hard fork logic (if applicable)
+        if self.chain_spec.is_beijing_active_at_block(block.number) {
+
+        }
 
         // Sign all the things!
         let sighash = self.sign_fn(self.signer, seal_hash(&block.header))?;
@@ -641,12 +635,11 @@ where
     pub fn apis(&self, chain: Arc<dyn ChainReader>) -> Vec<OtherAPI> {
         vec![OtherAPI {
             namespace: "apos".to_string(),
-            service: Box::new(API {
-                namespace: "apos".to_string(),
-                service: Box::new(self.clone()),
-                authenticated: true,
+            service: Arc::new(API {
+                chain,
+                apos: Arc::new(self.clone()),
             }),
-            authenticated: true
+            authenticated: true,
         }]
     }
 }

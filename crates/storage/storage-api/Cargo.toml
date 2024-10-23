@@ -25,3 +25,6 @@ reth-trie.workspace = true
 revm.workspace = true
 
 auto_impl.workspace = true
+
+rast-primitives.workspace=true
+alloy-primitives.workspace=true

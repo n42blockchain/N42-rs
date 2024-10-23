@@ -463,3 +463,6 @@ serial_test = "3"
 similar-asserts = "1.5.0"
 tempfile = "3.8"
 test-fuzz = "5"
+
+rlp="0.6.1"
+hashbrown="0.15.0"

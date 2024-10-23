@@ -59,3 +59,6 @@ pub use verifiers::*;
 
 mod rewards;
 pub use rewards::*;
+
+mod snapshot;
+pub use snapshot::*;

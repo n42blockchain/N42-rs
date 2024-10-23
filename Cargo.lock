@@ -5877,6 +5877,7 @@ dependencies = [
  "reth-primitives-traits",
  "rlp 0.6.1",
  "schnellru",
+ "secp256k1",
  "serde",
  "tracing",
 ]
@@ -6449,6 +6450,7 @@ dependencies = [
  "pprof",
  "proptest",
  "rand 0.8.5",
+ "rast-primitives",
  "reth-db-api",
  "reth-fs-util",
  "reth-libmdbx",
@@ -8181,7 +8183,9 @@ dependencies = [
 name = "reth-storage-api"
 version = "1.0.5"
 dependencies = [
+ "alloy-primitives",
  "auto_impl",
+ "rast-primitives",
  "reth-chainspec",
  "reth-db-api",
  "reth-execution-types",

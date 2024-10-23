@@ -19,7 +19,7 @@ use itertools::{izip, Itertools};
 use rayon::slice::ParallelSliceMut;
 use reth_chainspec::{ChainInfo, ChainSpec, EthereumHardforks};
 use reth_db::{
-    cursor::DbDupCursorRW, table, tables, BlockNumberList, PlainAccountState, PlainStorageState, Snapshot
+    cursor::DbDupCursorRW, table, tables, BlockNumberList, PlainAccountState, PlainStorageState,
 };
 use reth_db_api::{
     common::KeyValue,
@@ -67,6 +67,7 @@ use std::{
 };
 use tokio::sync::watch;
 use tracing::{debug, error, warn};
+use rast_primitives::Snapshot;
 
 /// A [`DatabaseProvider`] that holds a read-only database transaction.
 pub type DatabaseProviderRO<DB> = DatabaseProvider<<DB as Database>::TX>;
@@ -2566,21 +2567,22 @@ impl<TX:DbTx> RewardsProvider for DatabaseProvider<TX>{
     }
 }
 
-impl<TX:DbTx,F> SnapshotProvider<F> for DatabaseProvider<TX>
-where F: Fn(Header) -> Result<Address, Box<dyn Error>> + Clone+'static,
-{
-    fn load_snapshot(&self, id: BlockHashOrNumber, timestamp: u64) -> ProviderResult<Option<Snapshot<F>>> {
+impl<TX:DbTxMut+DbTx> SnapshotProvider for DatabaseProvider<TX>{
+    fn load_snapshot(&self, id: BlockHashOrNumber, timestamp: u64) -> ProviderResult<Option<Snapshot>> {
         if self.chain_spec.is_beijing_active_at_timestamp(timestamp){
             if let Some(hash)=self.convert_block_hash(id)?{
-                let mut snapshot=self.tx.get::<tables::Snapshot>(hash)?.unwrap_or_default();
-                // snapshot.ecrecover=self.f.clone();
+                let mut snapshot=self.tx.get::<tables::Snapshots>(hash)?.unwrap_or_default();
                 return Ok(Some(snapshot))
             }
         }
         Ok(None)
     }
-    fn save_snapshot(&self,id:BlockHashOrNumber,snapshot:Snapshot)->ProviderResult<()> {
-        Ok(self.tx.put::<tables::Snapshot>(self.convert_block_hash(id),Snapshot)?)
+    fn save_snapshot(&self, id: BlockHashOrNumber, snapshot: Snapshot) -> ProviderResult<()> {
+        if let Some(hash)=self.convert_block_hash(id)?{
+            Ok(self.tx.put::<tables::Snapshots>(hash, snapshot)?)
+        }else{
+            Ok(())
+        }
     }
 }
 

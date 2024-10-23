@@ -42,7 +42,9 @@ use reth_trie_common::{BranchNodeCompact, StorageTrieEntry, StoredNibbles, Store
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use rast_primitives::Snapshot;
-use std::error::Error;
+// use std::error::Error;
+// use reth_db_api::table::Decompress;
+// use clique::apos::recover_address;
 
 /// Enum for the types of tables present in libmdbx.
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -273,13 +275,6 @@ macro_rules! tables {
     };
 }
 
-// pub type EcrecoverFn=fn(Header) -> Result<Address, Box<dyn Error>> + Decompress;
-// impl Decompress for EcrecoverFn {
-//     fn decompress(&self) -> Result<(), Box<dyn StdError>> {
-//         // 实现细节...
-//         Ok(())
-//     }
-// }
 tables! {
     /// verify in the block
     table BlockVerifiers<Key=BlockNumber,Value=StoredBlockVerifiers>;
@@ -288,7 +283,7 @@ tables! {
     table BlockRewards<Key=BlockNumber,Value=StoredBlockRewards>;
 
     /// apos snapshot
-    table Snapshots<Key=BlockHash,Value=Snapshot<EcrecoverFn>>;
+    table Snapshots<Key=BlockHash,Value=Snapshot>;
 
     /// Stores the header hashes belonging to the canonical chain.
     table CanonicalHeaders<Key = BlockNumber, Value = HeaderHash>;

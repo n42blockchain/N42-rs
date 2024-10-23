@@ -22,6 +22,9 @@ use arbitrary::Arbitrary;
 use serde::{Deserialize, Serialize};
 
 use tracing::info;
+use reth_db_api::table::Decompress;
+use reth_db_api::table::Compress;
+use reth_db_api::DatabaseError;
 
 pub const NONCE_AUTH_VOTE: [u8; 8] = hex!("ffffffffffffffff"); // Magic nonce number to vote on adding a new signer
 pub const NONCE_DROP_VOTE: [u8; 8] = hex!("0000000000000000"); // Magic nonce number to vote on removing a signer
@@ -87,8 +90,9 @@ pub struct APosConfig {
 // #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, RlpEncodable, RlpDecodable,Arbitrary,Default)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize,Deserialize,Arbitrary,Default)]
 /// snapshot
-pub struct Snapshot<F>
-where F: Fn(Header) -> Result<Address, Box<dyn Error>> + Clone,
+// pub struct Snapshot<F>
+// where F: Fn(Header) -> Result<Address, Box<dyn Error>> + Clone,
+pub struct  Snapshot
 {
     /// Consensus engine parameters to fine tune behavior
     pub config: APosConfig,
@@ -104,13 +108,30 @@ where F: Fn(Header) -> Result<Address, Box<dyn Error>> + Clone,
     pub votes: Vec<Vote>,
     /// Current vote tally to avoid recalculating
     pub tally: HashMap<Address,Tally>,
-    /// recover address
-    #[serde(skip_serializing,skip_deserializing)]
-    pub ecrecover: F,
+    // /// recover address
+    // #[serde(skip_serializing,skip_deserializing)]
+    // pub ecrecover: F,
 }
 
-impl<F> Snapshot<F> 
-where F: Fn(Header) -> Result<Address, Box<dyn Error>> + Clone,
+impl Decompress for Snapshot{
+    fn decompress<B: AsRef<[u8]>>(value: B) -> Result<Self, DatabaseError> {
+        let bytes = value.as_ref();
+        let snapshot: Result<Snapshot, _> = serde_json::from_slice(bytes);
+        snapshot.map_err(|e| DatabaseError::Other(e.to_string()))
+    }
+}
+
+impl Compress for Snapshot{
+    type Compressed = Vec<u8>;
+    fn compress_to_buf<B: bytes::BufMut + AsMut<[u8]>>(self, buf: &mut B) {
+        let serialized = serde_json::to_vec(&self).expect("Serialization should not fail");
+        buf.put_slice(&serialized);
+    }
+}
+
+// impl<F> Snapshot<F> 
+// where F: Fn(Header) -> Result<Address, Box<dyn Error>> + Clone,
+impl Snapshot
 {
 	/// 创建一个新的 Snapshot
     pub fn new_snapshot(
@@ -118,7 +139,6 @@ where F: Fn(Header) -> Result<Address, Box<dyn Error>> + Clone,
         number: u64,
         hash: B256,
         signers: Vec<Address>,
-        ecrecover: F,
     ) -> Self {
         let mut snap = Snapshot {
             config,
@@ -128,7 +148,6 @@ where F: Fn(Header) -> Result<Address, Box<dyn Error>> + Clone,
             recents: HashMap::new(),
             votes: Vec::new(),
             tally: HashMap::new(),
-            ecrecover,
         };
 
         for signer in signers {
@@ -148,7 +167,6 @@ where F: Fn(Header) -> Result<Address, Box<dyn Error>> + Clone,
             recents: self.recents.clone(),
             votes: self.votes.clone(),
             tally: self.tally.clone(),
-            ecrecover: self.ecrecover.clone(),
         };
         
         // No need for special handling for votes if Vec<T> implements Clone
@@ -157,9 +175,9 @@ where F: Fn(Header) -> Result<Address, Box<dyn Error>> + Clone,
     }
 
     /// ecrecover
-    pub fn ecrecover(&self, header: Header) -> Result<Address, Box<dyn Error>> {
-        (self.ecrecover)(header)
-    }
+    // pub fn ecrecover(&self, header: Header) -> Result<Address, Box<dyn Error>> {
+    //     (self.ecrecover)(header)
+    // }
 
 	/// valid_vote returns whether it makes sense to cast the specified vote in the
     /// given snapshot context (e.g. don't try to add an already authorized signer).
@@ -207,7 +225,9 @@ where F: Fn(Header) -> Result<Address, Box<dyn Error>> + Clone,
     }
 
 	 //Create a new authorization snapshot using the given header information
-	 pub fn apply(&self, headers: Vec<Header>) -> Result<Snapshot<F>, VotingError> {
+	 pub fn apply<F>(&self, headers: Vec<Header>,func:F) -> Result<Snapshot, VotingError> 
+     where F: Fn(Header) -> Result<Address, Box<dyn Error>>,
+     {
         //If there is no header information, return the current snapshot directly
         if headers.is_empty() {
             return Ok(self.clone());
@@ -244,7 +264,7 @@ where F: Fn(Header) -> Result<Address, Box<dyn Error>> + Clone,
             }
 
             //Verify the signer and check if they are in the signer list
-            let signer = self.ecrecover(header.clone()).map_err(|e| VotingError::RecoverError(e.to_string()))?;
+            let signer = func(header.clone()).map_err(|e| VotingError::RecoverError(e.to_string()))?;
             if !snap.signers.contains(&signer) {
                 return Err(VotingError::UnauthorizedSigner);
             }

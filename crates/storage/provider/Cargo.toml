@@ -12,6 +12,7 @@ description = "Reth storage provider."
 workspace = true
 
 [dependencies]
+rast-primitives.workspace=true
 # reth
 reth-chainspec.workspace = true
 reth-blockchain-tree-api.workspace = true

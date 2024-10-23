@@ -23,7 +23,6 @@ use serde::{Deserialize, Serialize};
 
 use tracing::info;
 
-
 pub const NONCE_AUTH_VOTE: [u8; 8] = hex!("ffffffffffffffff"); // Magic nonce number to vote on adding a new signer
 pub const NONCE_DROP_VOTE: [u8; 8] = hex!("0000000000000000"); // Magic nonce number to vote on removing a signer
 
@@ -70,6 +69,7 @@ pub struct Tally {
     /// Number of votes until now wanting to pass the proposal
     pub votes: u32,
 }
+/// aposconfig
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, RlpEncodable, RlpDecodable,Arbitrary,Default)]
 pub struct APosConfig {
     /// Number of seconds between blocks to enforce
@@ -84,132 +84,11 @@ pub struct APosConfig {
     pub deposit_contract: Address,
 }
 
-// 定义 Values 结构体，包含一个 Iter
-#[derive(Debug)]
-pub struct Values<'a, K, V> {
-    inner: std::collections::hash_map::Iter<'a, K, V>,
-}
-// 为 Values 实现 Iterator trait
-impl<'a, K, V> Iterator for Values<'a, K, V> {
-    type Item = &'a V;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|(_k, v)| v)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
-    }
-}
-// 扩展 Values 实现 any 方法
-impl<'a, V> Values<'a, u64, V> {
-    pub fn any<P>(&mut self, mut predicate: P) -> bool
-    where
-        P: FnMut(&V) -> bool,
-    {
-        self.inner.any(|(_k, v)| predicate(v))
-    }
-}
-#[derive(Clone,Debug,PartialEq,Eq,Deserialize,Arbitrary,Default,Serialize,)]
-pub struct RecentsHashMap (pub std::collections::HashMap<u64,Address>);
-impl RecentsHashMap {
-    // 新建一个 RecentsHashMap 实例的函数
-    pub fn new() -> Self {
-        RecentsHashMap(std::collections::HashMap::new())
-    }
-    pub fn remove<Q: ?Sized>(&mut self, k: &Q) -> Option<Address>
-    where
-        Q: Hash + Eq,
-    {
-        self.remove(k)
-    }
-    pub fn values<'a>(&'a self) -> Values<'a, u64, Address> {
-        Values {
-            inner: self.0.iter(),
-        }
-    }
-    pub fn insert(&mut self, k: u64, v: Address) -> Option<Address> {
-        self.insert(k, v)
-    }
-}
-impl Encodable for RecentsHashMap {
-    fn encode(&self, out: &mut dyn BufMut) {
-        // 首先，我们将 HashMap 的长度编码为一个 u64
-        let len = self.0.len() as u64;
-        out.put_u64(len);
-
-        // 然后，我们遍历 HashMap 中的每一项，分别编码键和值
-        for (key, value) in self.0.iter() {
-            // 假设 u64 类型实现了 Encodable trait
-            key.encode(out);
-            value.encode(out);
-        }
-    }
-
-    fn length(&self) -> usize {
-        // 计算 HashMap 长度的编码长度
-        let mut length = std::mem::size_of::<u64>();
-
-        // 计算所有键和值的编码长度
-        for (key, value) in self.0.iter() {
-            length += key.length(); // 假设 u64 类型有 length 方法
-            length += value.length();
-        }
-
-        length
-    }
-}
-impl Decodable for RecentsHashMap {
-    fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
-        Ok(RecentsHashMap::default())
-    }
-}
-#[derive(Clone,Debug,PartialEq,Eq,Deserialize,Arbitrary,Default,Serialize,)]
-pub struct TallyHashMap (pub std::collections::HashMap<Address,Tally>);
-impl TallyHashMap {
-    // 新建一个 RecentsHashMap 实例的函数
-    pub fn new() -> Self {
-        TallyHashMap(std::collections::HashMap::new())
-    }
-    pub fn get_mut<Q: ?Sized>(&mut self, k: &Q) -> Option<&mut Tally>
-    where
-        Q: Hash + Eq,
-    {
-        self.get_mut(k)
-    }
-    pub fn insert(&mut self, k: Address, v: Tally) -> Option<Tally> {
-        self.insert(k, v)
-    }
-    pub fn remove<Q: ?Sized>(&mut self, k: &Q) -> Option<Tally>
-    where
-        Q: Hash + Eq,
-    {
-        self.remove(k)
-    }
-    pub fn clear(&mut self) {
-        self.clear();
-    }
-    pub fn get<Q: ?Sized>(&self, k: &Q) -> Option<&Tally>
-    where
-        Q: Hash + Eq,
-    {
-        self.get(k)
-    }
-}
-impl Encodable for TallyHashMap {
-    fn encode(&self, out: &mut dyn BufMut) {
-        
-    }
-}
-impl Decodable for TallyHashMap{
-    fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
-        Ok(TallyHashMap::default())
-    }
-}
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, RlpEncodable, RlpDecodable,Arbitrary,Default)]
+// #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, RlpEncodable, RlpDecodable,Arbitrary,Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize,Deserialize,Arbitrary,Default)]
+/// snapshot
 pub struct Snapshot<F>
-    where
-    F: Fn(Header) -> Result<Address, Box<dyn Error>> + Clone,
+where F: Fn(Header) -> Result<Address, Box<dyn Error>> + Clone,
 {
     /// Consensus engine parameters to fine tune behavior
     pub config: APosConfig,
@@ -220,23 +99,20 @@ pub struct Snapshot<F>
     /// Set of authorized signers at this moment
     pub signers: Vec<Address>,
     /// Set of recent signers for spam protections
-    pub recents: RecentsHashMap,
+    pub recents: HashMap<u64,Address>,
     /// List of votes cast in chronological order
     pub votes: Vec<Vote>,
     /// Current vote tally to avoid recalculating
-    // pub tally: HashMap<Address,Tally>,
-    pub tally:TallyHashMap,
+    pub tally: HashMap<Address,Tally>,
     /// recover address
+    #[serde(skip_serializing,skip_deserializing)]
     pub ecrecover: F,
 }
 
 impl<F> Snapshot<F> 
-    where 
-        F: Fn(Header) -> Result<Address, Box<dyn Error>> + Clone,
+where F: Fn(Header) -> Result<Address, Box<dyn Error>> + Clone,
 {
-    
-
-	// 创建一个新的 Snapshot
+	/// 创建一个新的 Snapshot
     pub fn new_snapshot(
         config: APosConfig,
         number: u64,
@@ -249,9 +125,9 @@ impl<F> Snapshot<F>
             number,
             hash,
             signers: Vec::new(),
-            recents: RecentsHashMap::new(),
+            recents: HashMap::new(),
             votes: Vec::new(),
-            tally: TallyHashMap::new(),
+            tally: HashMap::new(),
             ecrecover,
         };
 
@@ -262,7 +138,7 @@ impl<F> Snapshot<F>
     }
 
 
-	// Create a deep copy of the snapshot
+	/// Create a deep copy of the snapshot
     pub fn copy(&self) -> Self {
         let mut cpy = Self {
             config: self.config.clone(),
@@ -280,13 +156,14 @@ impl<F> Snapshot<F>
         cpy
     }
 
+    /// ecrecover
     pub fn ecrecover(&self, header: Header) -> Result<Address, Box<dyn Error>> {
         (self.ecrecover)(header)
     }
 
-	 // valid_vote returns whether it makes sense to cast the specified vote in the
-     // given snapshot context (e.g. don't try to add an already authorized signer).
-	 pub fn valid_vote(&self, address: Address, authorize: bool) -> bool {
+	/// valid_vote returns whether it makes sense to cast the specified vote in the
+    /// given snapshot context (e.g. don't try to add an already authorized signer).
+	pub fn valid_vote(&self, address: Address, authorize: bool) -> bool {
         if self.signers.iter().any(|x| x == &address) {
             !authorize
         } else {

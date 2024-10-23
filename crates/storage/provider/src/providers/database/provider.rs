@@ -19,7 +19,7 @@ use itertools::{izip, Itertools};
 use rayon::slice::ParallelSliceMut;
 use reth_chainspec::{ChainInfo, ChainSpec, EthereumHardforks};
 use reth_db::{
-    cursor::DbDupCursorRW,tables, BlockNumberList,  PlainAccountState, PlainStorageState
+    cursor::DbDupCursorRW, table, tables, BlockNumberList, PlainAccountState, PlainStorageState, Snapshot
 };
 use reth_db_api::{
     common::KeyValue,
@@ -45,6 +45,7 @@ use reth_primitives::{
 };
 use reth_prune_types::{PruneCheckpoint, PruneLimiter, PruneModes, PruneSegment};
 use reth_stages_types::{StageCheckpoint, StageId};
+use reth_storage_api::SnapshotProvider;
 use reth_storage_errors::provider::{ProviderResult, RootMismatch};
 use reth_trie::{
     prefix_set::{PrefixSet, PrefixSetMut, TriePrefixSets},
@@ -2562,6 +2563,24 @@ impl<TX:DbTx> RewardsProvider for DatabaseProvider<TX>{
             }
         }
         Ok(None)
+    }
+}
+
+impl<TX:DbTx,F> SnapshotProvider<F> for DatabaseProvider<TX>
+where F: Fn(Header) -> Result<Address, Box<dyn Error>> + Clone+'static,
+{
+    fn load_snapshot(&self, id: BlockHashOrNumber, timestamp: u64) -> ProviderResult<Option<Snapshot<F>>> {
+        if self.chain_spec.is_beijing_active_at_timestamp(timestamp){
+            if let Some(hash)=self.convert_block_hash(id)?{
+                let mut snapshot=self.tx.get::<tables::Snapshot>(hash)?.unwrap_or_default();
+                // snapshot.ecrecover=self.f.clone();
+                return Ok(Some(snapshot))
+            }
+        }
+        Ok(None)
+    }
+    fn save_snapshot(&self,id:BlockHashOrNumber,snapshot:Snapshot)->ProviderResult<()> {
+        Ok(self.tx.put::<tables::Snapshot>(self.convert_block_hash(id),Snapshot)?)
     }
 }
 

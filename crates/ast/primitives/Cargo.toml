@@ -27,7 +27,8 @@ schnellru.workspace = true
 
 bytes.workspace=true
 
-hashbrown="0.15.0"
-rlp="0.6.1"
+hashbrown.workspace=true
+rlp.workspace=true
+secp256k1.workspace=true
 [lints]
 workspace = true

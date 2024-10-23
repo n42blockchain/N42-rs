@@ -27,7 +27,7 @@ use reth_db_api::{
         storage_sharded_key::StorageShardedKey,
         CompactU256, ShardedKey, StoredBlockBodyIndices, StoredBlockWithdrawals,
         StoredBlockVerifiers,StoredBlockRewards, 
-        StoredAposSnapshot,
+        // StoredAposSnapshot,
     },
     table::{Decode, DupSort, Encode, Table},
 };
@@ -41,6 +41,8 @@ use reth_stages_types::StageCheckpoint;
 use reth_trie_common::{BranchNodeCompact, StorageTrieEntry, StoredNibbles, StoredNibblesSubKey};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use rast_primitives::Snapshot;
+use std::error::Error;
 
 /// Enum for the types of tables present in libmdbx.
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -271,15 +273,22 @@ macro_rules! tables {
     };
 }
 
+// pub type EcrecoverFn=fn(Header) -> Result<Address, Box<dyn Error>> + Decompress;
+// impl Decompress for EcrecoverFn {
+//     fn decompress(&self) -> Result<(), Box<dyn StdError>> {
+//         // 实现细节...
+//         Ok(())
+//     }
+// }
 tables! {
     /// verify in the block
     table BlockVerifiers<Key=BlockNumber,Value=StoredBlockVerifiers>;
 
     /// reward in the block
     table BlockRewards<Key=BlockNumber,Value=StoredBlockRewards>;
-    /// apos snapshot
-    table Snapshot<Key=BlockHash,Value=StoredAposSnapshot>;
 
+    /// apos snapshot
+    table Snapshots<Key=BlockHash,Value=Snapshot<EcrecoverFn>>;
 
     /// Stores the header hashes belonging to the canonical chain.
     table CanonicalHeaders<Key = BlockNumber, Value = HeaderHash>;

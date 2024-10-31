@@ -12,14 +12,14 @@ exclude.workspace = true
 reth-db-api.workspace=true
 serde_json.workspace=true
 #reth
-reth-primitives = { workspace = true, default-features = false, features = ["std"] }
+reth-primitives = { workspace = true, default-features = false, features = ["std","arbitrary"] }
 reth-primitives-traits.workspace = true
 alloy-rlp.workspace = true
 alloy-primitives.workspace = true
 
 # arbitrary utils
 # arbitrary = { workspace = true, features = ["derive"], optional = true }
-arbitrary.workspace=true
+# arbitrary.workspace=true
 # serde
 serde.workspace = true
 # log

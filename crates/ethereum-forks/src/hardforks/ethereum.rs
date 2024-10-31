@@ -5,7 +5,7 @@ use crate::{
 
 /// Helper methods for Ethereum forks.
 pub trait EthereumHardforks: Hardforks {
-    ///lytest
+    /// lytest
     fn is_beijing_active_at_timestamp(&self,timestamp: u64)->bool{
         self.is_fork_active_at_timestamp(EthereumHardfork::BeiJing, timestamp)
     }

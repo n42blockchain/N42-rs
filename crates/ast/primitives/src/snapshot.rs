@@ -6,7 +6,6 @@ use std::error::Error;
 use std::hash::Hash;
 use reth_primitives::{arbitrary, hex, Header};
 
-
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use bytes::BufMut;
@@ -87,11 +86,8 @@ pub struct APosConfig {
     pub deposit_contract: Address,
 }
 
-// #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, RlpEncodable, RlpDecodable,Arbitrary,Default)]
-#[derive(Clone, Debug, PartialEq, Eq, Serialize,Deserialize,Arbitrary,Default)]
 /// snapshot
-// pub struct Snapshot<F>
-// where F: Fn(Header) -> Result<Address, Box<dyn Error>> + Clone,
+#[derive(Clone, Debug, PartialEq, Eq, Serialize,Deserialize,Arbitrary,Default)]
 pub struct  Snapshot
 {
     /// Consensus engine parameters to fine tune behavior
@@ -108,9 +104,6 @@ pub struct  Snapshot
     pub votes: Vec<Vote>,
     /// Current vote tally to avoid recalculating
     pub tally: HashMap<Address,Tally>,
-    // /// recover address
-    // #[serde(skip_serializing,skip_deserializing)]
-    // pub ecrecover: F,
 }
 
 impl Decompress for Snapshot{
@@ -129,8 +122,6 @@ impl Compress for Snapshot{
     }
 }
 
-// impl<F> Snapshot<F> 
-// where F: Fn(Header) -> Result<Address, Box<dyn Error>> + Clone,
 impl Snapshot
 {
 	/// 创建一个新的 Snapshot
@@ -224,7 +215,7 @@ impl Snapshot
         }
     }
 
-	 //Create a new authorization snapshot using the given header information
+	 /// Create a new authorization snapshot using the given header information
 	 pub fn apply<F>(&self, headers: Vec<Header>,func:F) -> Result<Snapshot, VotingError> 
      where F: Fn(Header) -> Result<Address, Box<dyn Error>>,
      {

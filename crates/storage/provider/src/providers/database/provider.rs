@@ -2571,7 +2571,7 @@ impl<TX:DbTxMut+DbTx> SnapshotProvider for DatabaseProvider<TX>{
     fn load_snapshot(&self, id: BlockHashOrNumber, timestamp: u64) -> ProviderResult<Option<Snapshot>> {
         if self.chain_spec.is_beijing_active_at_timestamp(timestamp){
             if let Some(hash)=self.convert_block_hash(id)?{
-                let mut snapshot=self.tx.get::<tables::Snapshots>(hash)?.unwrap_or_default();
+                let snapshot=self.tx.get::<tables::Snapshots>(hash)?.unwrap_or_default();
                 return Ok(Some(snapshot))
             }
         }

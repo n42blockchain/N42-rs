@@ -1412,8 +1412,7 @@ mod tests {
                         0,
                         Vec::new()
                     )
-                    .hash_state_slow(),
-                    Default::default()
+                    .hash_state_slow()
                 )
                 .unwrap(),
                 state_root(expected.clone().into_iter().map(|(address, (account, storage))| (

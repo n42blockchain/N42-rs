@@ -10,7 +10,7 @@ exclude = [".github/"]
 [workspace]
 members = [
     "bin/rast/",
-    "crates/ast/primitives",
+    "crates/n42/primitives",
     "crates/primitives/",
     "crates/primitives-traits/",
     "crates/chainspec/",
@@ -30,7 +30,7 @@ members = [
     "crates/rpc/rpc-eth-api",
     "crates/exex/exex",
     "crates/net/peers",
-    "crates/ast/primitives",
+    "crates/n42/primitives",
     "crates/rpc/rpc",
     "crates/storage/provider",
     "testing/testing-utils",
@@ -193,7 +193,7 @@ alloy-genesis = { path = "./crates/alloy-genesis" }
 
 [workspace.dependencies]
 # for ast
-rast-primitives = { path = "crates/ast/primitives" }
+rast-primitives = { path = "crates/n42/primitives" }
 blst = "0.3.11"
 clique={path="crates/clique"}
 

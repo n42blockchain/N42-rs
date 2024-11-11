@@ -1,5 +1,5 @@
 [package]
-name = "rast-primitives"
+name = "n42-primitives"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

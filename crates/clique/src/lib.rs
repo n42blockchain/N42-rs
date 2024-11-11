@@ -1,4 +1,5 @@
 mod error;
 mod apos;
-pub use apos::recover_address;
 mod traits;
+mod apos_test;
+mod snapshot_test;

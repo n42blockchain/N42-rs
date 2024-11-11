@@ -9,6 +9,11 @@ repository.workspace = true
 exclude.workspace = true
 
 [dependencies]
+
+
+
+
+
 types = "0.1" 
 unexpected = "0.1" 
 
@@ -52,15 +57,23 @@ tracing.workspace = true
 
 #reth
 reth-primitives-traits.workspace = true
+reth-testing-utils = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.0.5" }
+reth-exex-test-utils = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.0.5" }
+reth-provider = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.0.5" }
+
+reth-blockchain-tree = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.0.5" }
+
 reth-primitives = { workspace = true, default-features = false, features = ["std"] }
 reth-consensus.workspace = true
 reth-beacon-consensus.workspace = true
 reth-ethereum-consensus.workspace = true
 reth-chainspec.workspace = true
-reth-provider.workspace = true
+
+
 
 # arbitrary utils
 arbitrary = { workspace = true, features = ["derive"], optional = true }
+hex = "0.4.3"
 
 [lints]
 workspace = true

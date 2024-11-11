@@ -35,12 +35,15 @@ use sha2::digest::consts::U2;
 use reth_primitives::bytes::Bytes;
 
 use alloy_rlp::{length_of_length, Decodable, Encodable, MaxEncodedLenAssoc};
-use bytes::BufMut;
+use bytes::{BufMut, BytesMut};
+use itertools::Itertools;
 use rand::prelude::SliceRandom;
 use rlp::RlpStream;
 use reth_chainspec::ChainSpec;
 
 use crate::traits::Engine;
+use crate::traits::{ChainReader,API};
+use crate::traits::API as OtherAPI;
 
 // 配置常量
 const CHECKPOINT_INTERVAL: u64 = 2048; // Number of blocks after which to save the vote snapshot to the database
@@ -62,8 +65,8 @@ pub const SIGNATURE_LENGTH: usize = 64 + 1;
 pub const NONCE_AUTH_VOTE: [u8; 8] = hex!("ffffffffffffffff"); // Magic nonce number to vote on adding a new signer
 pub const NONCE_DROP_VOTE: [u8; 8] = hex!("0000000000000000"); // Magic nonce number to vote on removing a signer
 // Difficulty constants
-pub const diff_in_turn: U256 = U256::from(2);  // Block difficulty for in-turn signatures
-pub const diff_no_turn: U256 = U256::from(1);  // Block difficulty for out-of-turn signatures
+pub const DIFF_IN_TURN: U256 = U256::from(2);  // Block difficulty for in-turn signatures
+pub const DIFF_NO_TURN: U256 = U256::from(1);  // Block difficulty for out-of-turn signatures
 
 pub const FULL_IMMUTABILITY_THRESHOLD: usize= 90000;
 
@@ -199,9 +202,9 @@ where
 
     config: Arc<APosConfig>,          // Consensus engine configuration parameters
     /// Chain spec
-    chain_spec: Arc<ChainSpec>,
+    chain_spec: Arc<ChainConfig>,
 
-    recents: schnellru::LruMap<u64, Snapshot<T>>,    // Snapshots for recent block to speed up reorgs
+    recents: schnellru::LruMap<u64, Snapshot>,    // Snapshots for recent block to speed up reorgs
     signatures: schnellru::LruMap<u64, Vec<u8>>,    // Signatures of recent blocks to speed up mining
 
     proposals: Arc<RwLock<HashMap<Address, bool>>>,   // Current list of proposals we are pushing
@@ -225,7 +228,7 @@ where
     pub fn new(
         	// Set any missing consensus parameters to their defaults
         config: APosConfig,
-        chain_config: ChainConfig,
+        chain_config: Arc<ChainConfig>,
     ) -> Arc<dyn Engine> {
         
         let mut conf = config.clone();
@@ -240,12 +243,14 @@ where
         
         Arc::new(APos {
             config: Arc::new(conf),
-            chain_spec: chain_config,
+            chain_spec:chain_config,
             recents,
             signatures,
             proposals: Arc::new(RwLock::new(HashMap::new())),
-            signer: todo!(),
-            sign_fn: todo!(),
+            signer: Default::default(),
+            sign_fn: Default::default(),
+            lock: Arc::new(RwLock::new(())),
+            provider: Default::default(),
         })
     }
 
@@ -256,9 +261,9 @@ where
         mut number: u64,
         mut hash: B256,
         mut parents: Option(Vec<Header>),
-    ) -> Result<Snapshot<T>, Box<dyn Error>> {
+    ) -> Result<Snapshot, Box<dyn Error>> {
         let mut headers: Vec<Header> = Vec::new();
-        let mut snap: Snapshot<T>;
+        let mut snap: Snapshot;
 
         while snap.is_none() {
             //Attempt to retrieve a snapshot from memory
@@ -298,7 +303,7 @@ where
                     }
             
                    
-                    let new_snapshot = Snapshot::new_snapshot(self.config.clone(),  number, hash, signers, F);
+                    let new_snapshot = Snapshot::new_snapshot(self.config.clone(),  number, hash, signers,());
 
                     // new_snapshot.store();
                     info!(
@@ -313,10 +318,10 @@ where
                     
 
             // No snapshot for this header, gather the header and move backward
-            let header = if parents.is_some() > 0 {
+            let header = if let Some((ref mut parent_vec,)) = parents{
                 // If we have explicit parents, pick from there (enforced)
-                let header = parents.pop().unwrap();
-                if header.hash_slow() != hash || header.number64() != number {
+                let Some(header) = parent_vec.pop();
+                if header.hash_slow() != hash || header.number != number {
                     return Err(AposError::UnknownBlock);
                 }
                 header
@@ -328,7 +333,7 @@ where
 
             headers.push(header);
             number -= 1;
-            hash = header.parent_hash(); 
+            hash = header.parent_hash.clone();
         }
 
         //Find the previous snapshot and apply any pending headers to it
@@ -359,7 +364,7 @@ where
     /// from.
     pub fn verify_seal(
         self,
-        snap: &Snapshot<T>,
+        snap: &Snapshot,
         header: Header,
         parents: Header,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -389,10 +394,10 @@ where
 
        ///Ensure that the difficulty corresponds to the signer's round
         let in_turn = snap.inturn(header.number, &signer);
-        if in_turn && header.difficulty != *diff_in_turn {
+        if in_turn && header.difficulty != *DIFF_IN_TURN {
             return Err(AposError::WrongDifficulty.into());
         }
-        if !in_turn && header.difficulty != *diff_in_turn {
+        if !in_turn && header.difficulty != *DIFF_IN_TURN {
             return Err(AposError::WrongDifficulty.into());
         }
 
@@ -449,9 +454,12 @@ where
         header.extra_data.truncate(EXTRA_VANITY);
 
         if header.number % self.config.epoch == 0 {
+            let mut extra_data: Vec<u8> = header.extra_data.to_vec();
             for signer in snap.signers {
-                header.extra_data.extend_from_slice(&signer.0);
+                header.extra_data.extend(&signer.0);
             }
+            header.extra_data = extra_data.into();
+
         }
         header.extra_data.extend(vec![0x00; SIGNATURE_LENGTH]);
 
@@ -460,7 +468,7 @@ where
 
       
         // Ensure the timestamp has the correct delay
-        let parent = self.provider.header(header.parent_hash)?.ok_or(Err("unknown ancestor".into()))?;
+        let parent = self.provider.header(&header.parent_hash)?.ok_or(Err("unknown ancestor".into()))?;
 
         let parent_time = parent.timestamp;
         header.timestamp = parent_time + self.config.period;
@@ -544,7 +552,7 @@ where
 
         // For 0-period chains, refuse to seal empty blocks (no reward but would spin sealing)
         if self.config.period == 0 && block.body.is_empty() {
-            return Err(AposError::UnTransion);
+            return Err(AposError::UnTransion.into());
         }
 
 
@@ -552,7 +560,7 @@ where
         let snap = self.snapshot(block.number - 1, block.parent_hash.clone(), None).await?;
         if !snap.signers.contains(&self.signer) {
             error!(target: "consensus::engine", "err signer: {}", self.signer);
-            return Err(AposError::UnauthorizedSigner)
+            return Err(AposError::UnauthorizedSigner.into())
         }
 
         // If we're amongst the recent signers, wait for the next block
@@ -561,7 +569,7 @@ where
                 let limit = (snap.signers.len() as u64 / 2) + 1;
                 if block.number < limit || seen > block.number - limit {
                     error!(target: "consensus::engine", "Signed recently, must wait for others: limit: {}, seen: {}, number: {}, signer: {}", limit, seen, block.number, self.signer);
-                    return Err(AposError::UnauthorizedSigner);
+                    return Err(AposError::UnauthorizedSigner.into());
                 }
             }
         }
@@ -573,7 +581,7 @@ where
             .duration_since(SystemTime::now())
             .unwrap();
 
-        if block.difficulty == diff_no_turn {
+        if block.difficulty == DIFF_NO_TURN {
             let wiggle = Duration::from_millis((snap.signers.len() as u64 / 2 + 1) * WIGGLE_TIME);
             let delay_with_wiggle = delay + Duration::from_millis(rand::random::<u64>() % wiggle.as_millis() as u64);
 
@@ -583,13 +591,13 @@ where
             );
         }
 
-        // Beijing hard fork logic (if applicable)
-        if self.chain_spec.is_beijing_active_at_block(block.number) {
-
-        }
+        // // Beijing hard fork logic (if applicable)
+        // if self.chain_spec.is_beijing_active_at_block(block.number) {
+        //
+        // }
 
         // Sign all the things!
-        let sighash = self.sign_fn(self.signer, seal_hash(&block.header))?;
+        let sighash = (self.sign_fn)(self.signer, seal_hash(&block.header))?;
 
         block.extra_data[block.extra_data.len() - SIGNATURE_LENGTH..].copy_from_slice(&sighash);
 
@@ -612,7 +620,7 @@ where
             parent.number,
             parent.hash_slow(),
             None,
-        ).await?;
+        ).await;
 
         calc_difficulty(&snap, self.signer)
     }
@@ -633,11 +641,12 @@ where
     pub fn apis(&self, chain: Arc<dyn ChainReader>) -> Vec<OtherAPI> {
         vec![OtherAPI {
             namespace: "apos".to_string(),
-            service: Arc::new(API {
-                chain,
-                apos: Arc::new(self.clone()),
+            service: Box::new(API {
+                namespace: "apos".to_string(),
+                service: Box::new(self.clone()),
+                authenticated: true,
             }),
-            authenticated: true,
+            authenticated: true
         }]
     }
 }
@@ -645,7 +654,7 @@ where
 
  
 
-fn calc_difficulty<T>(snap: &Snapshot<T>, signer: Address) -> U256 {
+fn calc_difficulty<T>(snap: &Snapshot, signer: Address) -> U256 {
     if snap.inturn(snap.number + 1, &signer) {
         DIFF_IN_TURN.clone()
     } else {

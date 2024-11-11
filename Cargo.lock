@@ -1770,6 +1770,7 @@ dependencies = [
  "bytes",
  "derive_more 0.14.1",
  "hash-db 0.16.0",
+ "hex",
  "hex-literal 0.3.4",
  "itertools 0.13.0",
  "keccak-hash",
@@ -1780,12 +1781,15 @@ dependencies = [
  "rand 0.8.5",
  "rast-primitives",
  "reth-beacon-consensus",
+ "reth-blockchain-tree",
  "reth-chainspec",
  "reth-consensus",
  "reth-ethereum-consensus",
+ "reth-exex-test-utils",
  "reth-primitives",
  "reth-primitives-traits",
  "reth-provider",
+ "reth-testing-utils",
  "rlp 0.4.6",
  "schnellru",
  "secp256k1",
@@ -7046,6 +7050,7 @@ dependencies = [
  "alloy-eips",
  "auto_impl",
  "futures-util",
+ "parking_lot 0.12.3",
  "reth-chainspec",
  "reth-execution-errors",
  "reth-execution-types",
@@ -7154,6 +7159,37 @@ dependencies = [
  "secp256k1",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "reth-exex-test-utils"
+version = "1.0.5"
+source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.0.5#603e39ab74509e0863fc023461a4c760fb2126d1"
+dependencies = [
+ "eyre",
+ "futures-util",
+ "rand 0.8.5",
+ "reth-blockchain-tree",
+ "reth-chainspec",
+ "reth-config",
+ "reth-consensus",
+ "reth-db",
+ "reth-db-common",
+ "reth-evm",
+ "reth-execution-types",
+ "reth-exex",
+ "reth-network",
+ "reth-node-api",
+ "reth-node-builder",
+ "reth-node-core",
+ "reth-node-ethereum",
+ "reth-payload-builder",
+ "reth-primitives",
+ "reth-provider",
+ "reth-tasks",
+ "reth-transaction-pool",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -7438,6 +7474,7 @@ dependencies = [
  "reth-config",
  "reth-consensus",
  "reth-consensus-debug-client",
+ "reth-db",
  "reth-db-api",
  "reth-db-common",
  "reth-downloaders",

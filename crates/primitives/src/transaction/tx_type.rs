@@ -1,33 +1,30 @@
-use crate::{U64, U8};
+use alloy_consensus::constants::{
+    EIP1559_TX_TYPE_ID, EIP2930_TX_TYPE_ID, EIP4844_TX_TYPE_ID, EIP7702_TX_TYPE_ID,
+    LEGACY_TX_TYPE_ID,
+};
+use alloy_primitives::{U64, U8};
 use alloy_rlp::{Decodable, Encodable};
 use serde::{Deserialize, Serialize};
 
-#[cfg(test)]
-use reth_codecs::Compact;
+/// Identifier parameter for legacy transaction
+#[cfg(any(test, feature = "reth-codec"))]
+pub(crate) const COMPACT_IDENTIFIER_LEGACY: usize = 0;
+
+/// Identifier parameter for EIP-2930 transaction
+#[cfg(any(test, feature = "reth-codec"))]
+pub(crate) const COMPACT_IDENTIFIER_EIP2930: usize = 1;
+
+/// Identifier parameter for EIP-1559 transaction
+#[cfg(any(test, feature = "reth-codec"))]
+pub(crate) const COMPACT_IDENTIFIER_EIP1559: usize = 2;
 
 /// For backwards compatibility purposes only 2 bits of the type are encoded in the identifier
-/// parameter. In the case of a 3, the full transaction type is read from the buffer as a
-/// single byte.
+/// parameter. In the case of a [`COMPACT_EXTENDED_IDENTIFIER_FLAG`], the full transaction type is
+/// read from the buffer as a single byte.
 #[cfg(any(test, feature = "reth-codec"))]
-const COMPACT_EXTENDED_IDENTIFIER_FLAG: usize = 3;
+pub(crate) const COMPACT_EXTENDED_IDENTIFIER_FLAG: usize = 3;
 
-/// Identifier for legacy transaction, however [`TxLegacy`](crate::TxLegacy) this is technically not
-/// typed.
-pub const LEGACY_TX_TYPE_ID: u8 = 0;
-
-/// Identifier for [`TxEip2930`](crate::TxEip2930) transaction.
-pub const EIP2930_TX_TYPE_ID: u8 = 1;
-
-/// Identifier for [`TxEip1559`](crate::TxEip1559) transaction.
-pub const EIP1559_TX_TYPE_ID: u8 = 2;
-
-/// Identifier for [`TxEip4844`](crate::TxEip4844) transaction.
-pub const EIP4844_TX_TYPE_ID: u8 = 3;
-
-/// Identifier for [`TxEip7702`](crate::TxEip7702) transaction.
-pub const EIP7702_TX_TYPE_ID: u8 = 4;
-
-/// Identifier for [`TxDeposit`](crate::TxDeposit) transaction.
+/// Identifier for [`TxDeposit`](op_alloy_consensus::TxDeposit) transaction.
 #[cfg(feature = "optimism")]
 pub const DEPOSIT_TX_TYPE_ID: u8 = 126;
 
@@ -38,10 +35,11 @@ pub const DEPOSIT_TX_TYPE_ID: u8 = 126;
 /// database format.
 ///
 /// Other required changes when adding a new type can be seen on [PR#3953](https://github.com/paradigmxyz/reth/pull/3953/files).
-#[cfg_attr(any(test, feature = "reth-codec"), reth_codecs::derive_arbitrary(compact))]
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize, Hash,
 )]
+#[cfg_attr(any(test, feature = "arbitrary"), derive(arbitrary::Arbitrary))]
+#[cfg_attr(any(test, feature = "reth-codec"), reth_codecs::add_arbitrary_tests(compact))]
 pub enum TxType {
     /// Legacy transaction pre EIP-2929
     #[default]
@@ -143,35 +141,35 @@ impl reth_codecs::Compact for TxType {
         B: bytes::BufMut + AsMut<[u8]>,
     {
         match self {
-            Self::Legacy => 0,
-            Self::Eip2930 => 1,
-            Self::Eip1559 => 2,
+            Self::Legacy => COMPACT_IDENTIFIER_LEGACY,
+            Self::Eip2930 => COMPACT_IDENTIFIER_EIP2930,
+            Self::Eip1559 => COMPACT_IDENTIFIER_EIP1559,
             Self::Eip4844 => {
-                buf.put_u8(*self as u8);
+                buf.put_u8(EIP4844_TX_TYPE_ID);
                 COMPACT_EXTENDED_IDENTIFIER_FLAG
             }
             Self::Eip7702 => {
-                buf.put_u8(*self as u8);
+                buf.put_u8(EIP7702_TX_TYPE_ID);
                 COMPACT_EXTENDED_IDENTIFIER_FLAG
             }
             #[cfg(feature = "optimism")]
             Self::Deposit => {
-                buf.put_u8(*self as u8);
+                buf.put_u8(DEPOSIT_TX_TYPE_ID);
                 COMPACT_EXTENDED_IDENTIFIER_FLAG
             }
         }
     }
 
     // For backwards compatibility purposes only 2 bits of the type are encoded in the identifier
-    // parameter. In the case of a 3, the full transaction type is read from the buffer as a
-    // single byte.
+    // parameter. In the case of a [`COMPACT_EXTENDED_IDENTIFIER_FLAG`], the full transaction type
+    // is read from the buffer as a single byte.
     fn from_compact(mut buf: &[u8], identifier: usize) -> (Self, &[u8]) {
         use bytes::Buf;
         (
             match identifier {
-                0 => Self::Legacy,
-                1 => Self::Eip2930,
-                2 => Self::Eip1559,
+                COMPACT_IDENTIFIER_LEGACY => Self::Legacy,
+                COMPACT_IDENTIFIER_EIP2930 => Self::Eip2930,
+                COMPACT_IDENTIFIER_EIP1559 => Self::Eip1559,
                 COMPACT_EXTENDED_IDENTIFIER_FLAG => {
                     let extended_identifier = buf.get_u8();
                     match extended_identifier {
@@ -219,9 +217,21 @@ impl Decodable for TxType {
     }
 }
 
+impl From<alloy_consensus::TxType> for TxType {
+    fn from(value: alloy_consensus::TxType) -> Self {
+        match value {
+            alloy_consensus::TxType::Legacy => Self::Legacy,
+            alloy_consensus::TxType::Eip2930 => Self::Eip2930,
+            alloy_consensus::TxType::Eip1559 => Self::Eip1559,
+            alloy_consensus::TxType::Eip4844 => Self::Eip4844,
+            alloy_consensus::TxType::Eip7702 => Self::Eip7702,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::hex;
+    use alloy_primitives::hex;
     use rand::Rng;
     use reth_codecs::Compact;
 
@@ -230,34 +240,34 @@ mod tests {
     #[test]
     fn test_u64_to_tx_type() {
         // Test for Legacy transaction
-        assert_eq!(TxType::try_from(U64::from(0)).unwrap(), TxType::Legacy);
+        assert_eq!(TxType::try_from(U64::from(LEGACY_TX_TYPE_ID)).unwrap(), TxType::Legacy);
 
         // Test for EIP2930 transaction
-        assert_eq!(TxType::try_from(U64::from(1)).unwrap(), TxType::Eip2930);
+        assert_eq!(TxType::try_from(U64::from(EIP2930_TX_TYPE_ID)).unwrap(), TxType::Eip2930);
 
         // Test for EIP1559 transaction
-        assert_eq!(TxType::try_from(U64::from(2)).unwrap(), TxType::Eip1559);
+        assert_eq!(TxType::try_from(U64::from(EIP1559_TX_TYPE_ID)).unwrap(), TxType::Eip1559);
 
         // Test for EIP4844 transaction
-        assert_eq!(TxType::try_from(U64::from(3)).unwrap(), TxType::Eip4844);
+        assert_eq!(TxType::try_from(U64::from(EIP4844_TX_TYPE_ID)).unwrap(), TxType::Eip4844);
 
         // Test for EIP7702 transaction
-        assert_eq!(TxType::try_from(U64::from(4)).unwrap(), TxType::Eip7702);
+        assert_eq!(TxType::try_from(U64::from(EIP7702_TX_TYPE_ID)).unwrap(), TxType::Eip7702);
 
         // Test for Deposit transaction
         #[cfg(feature = "optimism")]
-        assert_eq!(TxType::try_from(U64::from(126)).unwrap(), TxType::Deposit);
+        assert_eq!(TxType::try_from(U64::from(DEPOSIT_TX_TYPE_ID)).unwrap(), TxType::Deposit);
 
         // For transactions with unsupported values
-        assert!(TxType::try_from(U64::from(5)).is_err());
+        assert!(TxType::try_from(U64::from(EIP7702_TX_TYPE_ID + 1)).is_err());
     }
 
     #[test]
     fn test_txtype_to_compat() {
         let cases = vec![
-            (TxType::Legacy, 0, vec![]),
-            (TxType::Eip2930, 1, vec![]),
-            (TxType::Eip1559, 2, vec![]),
+            (TxType::Legacy, COMPACT_IDENTIFIER_LEGACY, vec![]),
+            (TxType::Eip2930, COMPACT_IDENTIFIER_EIP2930, vec![]),
+            (TxType::Eip1559, COMPACT_IDENTIFIER_EIP1559, vec![]),
             (TxType::Eip4844, COMPACT_EXTENDED_IDENTIFIER_FLAG, vec![EIP4844_TX_TYPE_ID]),
             (TxType::Eip7702, COMPACT_EXTENDED_IDENTIFIER_FLAG, vec![EIP7702_TX_TYPE_ID]),
             #[cfg(feature = "optimism")]
@@ -278,9 +288,9 @@ mod tests {
     #[test]
     fn test_txtype_from_compact() {
         let cases = vec![
-            (TxType::Legacy, 0, vec![]),
-            (TxType::Eip2930, 1, vec![]),
-            (TxType::Eip1559, 2, vec![]),
+            (TxType::Legacy, COMPACT_IDENTIFIER_LEGACY, vec![]),
+            (TxType::Eip2930, COMPACT_IDENTIFIER_EIP2930, vec![]),
+            (TxType::Eip1559, COMPACT_IDENTIFIER_EIP1559, vec![]),
             (TxType::Eip4844, COMPACT_EXTENDED_IDENTIFIER_FLAG, vec![EIP4844_TX_TYPE_ID]),
             (TxType::Eip7702, COMPACT_EXTENDED_IDENTIFIER_FLAG, vec![EIP7702_TX_TYPE_ID]),
             #[cfg(feature = "optimism")]
@@ -304,29 +314,29 @@ mod tests {
         assert_eq!(tx_type, TxType::Legacy);
 
         // Test for EIP2930 transaction
-        let tx_type = TxType::decode(&mut &[1u8][..]).unwrap();
+        let tx_type = TxType::decode(&mut &[EIP2930_TX_TYPE_ID][..]).unwrap();
         assert_eq!(tx_type, TxType::Eip2930);
 
         // Test for EIP1559 transaction
-        let tx_type = TxType::decode(&mut &[2u8][..]).unwrap();
+        let tx_type = TxType::decode(&mut &[EIP1559_TX_TYPE_ID][..]).unwrap();
         assert_eq!(tx_type, TxType::Eip1559);
 
         // Test for EIP4844 transaction
-        let tx_type = TxType::decode(&mut &[3u8][..]).unwrap();
+        let tx_type = TxType::decode(&mut &[EIP4844_TX_TYPE_ID][..]).unwrap();
         assert_eq!(tx_type, TxType::Eip4844);
 
         // Test for EIP7702 transaction
-        let tx_type = TxType::decode(&mut &[4u8][..]).unwrap();
+        let tx_type = TxType::decode(&mut &[EIP7702_TX_TYPE_ID][..]).unwrap();
         assert_eq!(tx_type, TxType::Eip7702);
 
         // Test random byte not in range
-        let buf = [rand::thread_rng().gen_range(5..=u8::MAX)];
+        let buf = [rand::thread_rng().gen_range(EIP7702_TX_TYPE_ID + 1..=u8::MAX)];
         assert!(TxType::decode(&mut &buf[..]).is_err());
 
         // Test for Deposit transaction
         #[cfg(feature = "optimism")]
         {
-            let buf = [126u8];
+            let buf = [DEPOSIT_TX_TYPE_ID];
             let tx_type = TxType::decode(&mut &buf[..]).unwrap();
             assert_eq!(tx_type, TxType::Deposit);
         }

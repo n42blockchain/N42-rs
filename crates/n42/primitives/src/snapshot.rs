@@ -10,8 +10,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use bytes::BufMut;
 use rlp::RlpStream;
-// use hashbrown::HashMap;
-use hashbrown::DefaultHashBuilder;
 use std::hash::RandomState;
 
 

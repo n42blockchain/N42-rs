@@ -1,0 +1,16 @@
+[package]
+name = "miner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+exclude.workspace = true
+
+[dependencies]
+
+reth-transaction-pool.workspace = true
+
+[lints]
+workspace = true

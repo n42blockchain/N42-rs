@@ -19,32 +19,24 @@ pub use raw::{RawDupSort, RawKey, RawTable, RawValue, TableRawRow};
 #[cfg(feature = "mdbx")]
 pub(crate) mod utils;
 
+use alloy_primitives::{Address, BlockHash, BlockNumber, TxHash, TxNumber, B256};
 use reth_db_api::{
     models::{
-        accounts::{AccountBeforeTx, BlockNumberAddress},
+        accounts::BlockNumberAddress,
         blocks::{HeaderHash, StoredBlockOmmers},
-        client_version::ClientVersion,
         storage_sharded_key::StorageShardedKey,
-        CompactU256, ShardedKey, StoredBlockBodyIndices, StoredBlockWithdrawals,
-        StoredBlockVerifiers,StoredBlockRewards, 
-        // StoredAposSnapshot,
+        AccountBeforeTx, ClientVersion, CompactU256, ShardedKey, StoredBlockBodyIndices,
+        StoredBlockWithdrawals,
     },
     table::{Decode, DupSort, Encode, Table},
 };
-use reth_primitives::{
-    Account, Address, BlockHash, BlockNumber, Bytecode, Header, Receipt, Requests, StorageEntry,
-    TransactionSignedNoHash, TxHash, TxNumber, B256,
-};
+use reth_primitives::{Account, Bytecode, Header, Receipt, StorageEntry, TransactionSignedNoHash};
 use reth_primitives_traits::IntegerList;
 use reth_prune_types::{PruneCheckpoint, PruneSegment};
 use reth_stages_types::StageCheckpoint;
 use reth_trie_common::{BranchNodeCompact, StorageTrieEntry, StoredNibbles, StoredNibblesSubKey};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use rast_primitives::Snapshot;
-// use std::error::Error;
-// use reth_db_api::table::Decompress;
-// use clique::apos::recover_address;
 
 /// Enum for the types of tables present in libmdbx.
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -276,15 +268,6 @@ macro_rules! tables {
 }
 
 tables! {
-    /// verify in the block
-    table BlockVerifiers<Key=BlockNumber,Value=StoredBlockVerifiers>;
-
-    /// reward in the block
-    table BlockRewards<Key=BlockNumber,Value=StoredBlockRewards>;
-
-    /// apos snapshot
-    table Snapshots<Key=BlockHash,Value=Snapshot>;
-
     /// Stores the header hashes belonging to the canonical chain.
     table CanonicalHeaders<Key = BlockNumber, Value = HeaderHash>;
 
@@ -385,14 +368,14 @@ tables! {
     table StorageChangeSets<Key = BlockNumberAddress, Value = StorageEntry, SubKey = B256>;
 
     /// Stores the current state of an [`Account`] indexed with `keccak256Address`
-    /// This table is in preparation for merkelization and calculation of state root.
+    /// This table is in preparation for merklization and calculation of state root.
     /// We are saving whole account data as it is needed for partial update when
-    /// part of storage is changed. Benefit for merkelization is that hashed addresses are sorted.
+    /// part of storage is changed. Benefit for merklization is that hashed addresses are sorted.
     table HashedAccounts<Key = B256, Value = Account>;
 
     /// Stores the current storage values indexed with `keccak256Address` and
     /// hash of storage key `keccak256key`.
-    /// This table is in preparation for merkelization and calculation of state root.
+    /// This table is in preparation for merklization and calculation of state root.
     /// Benefit for merklization is that hashed addresses/keys are sorted.
     table HashedStorages<Key = B256, Value = StorageEntry, SubKey = B256>;
 
@@ -419,9 +402,6 @@ tables! {
     /// Stores the history of client versions that have accessed the database with write privileges by unix timestamp in seconds.
     table VersionHistory<Key = u64, Value = ClientVersion>;
 
-    /// Stores EIP-7685 EL -> CL requests, indexed by block number.
-    table BlockRequests<Key = BlockNumber, Value = Requests>;
-
     /// Stores generic chain state info, like the last finalized block.
     table ChainState<Key = ChainStateKey, Value = BlockNumber>;
 }
@@ -431,6 +411,8 @@ tables! {
 pub enum ChainStateKey {
     /// Last finalized block key
     LastFinalizedBlock,
+    /// Last finalized block key
+    LastSafeBlockBlock,
 }
 
 impl Encode for ChainStateKey {
@@ -439,16 +421,17 @@ impl Encode for ChainStateKey {
     fn encode(self) -> Self::Encoded {
         match self {
             Self::LastFinalizedBlock => [0],
+            Self::LastSafeBlockBlock => [1],
         }
     }
 }
 
 impl Decode for ChainStateKey {
-    fn decode<B: AsRef<[u8]>>(value: B) -> Result<Self, reth_db_api::DatabaseError> {
-        if value.as_ref() == [0] {
-            Ok(Self::LastFinalizedBlock)
-        } else {
-            Err(reth_db_api::DatabaseError::Decode)
+    fn decode(value: &[u8]) -> Result<Self, reth_db_api::DatabaseError> {
+        match value {
+            [0] => Ok(Self::LastFinalizedBlock),
+            [1] => Ok(Self::LastSafeBlockBlock),
+            _ => Err(reth_db_api::DatabaseError::Decode),
         }
     }
 }

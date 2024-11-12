@@ -1,28 +1,27 @@
 //! Loads chain metadata.
 
-use std::sync::Arc;
-
+use alloy_primitives::{Address, U256, U64};
+use alloy_rpc_types::{Stage, SyncInfo, SyncStatus};
 use futures::Future;
-use reth_chainspec::{ChainInfo, ChainSpec};
+use reth_chainspec::{ChainInfo, EthereumHardforks};
 use reth_errors::{RethError, RethResult};
 use reth_network_api::NetworkInfo;
-use reth_primitives::{Address, U256, U64};
 use reth_provider::{BlockNumReader, ChainSpecProvider, StageCheckpointReader};
-use reth_rpc_types::{Stage, SyncInfo, SyncStatus};
 
-use super::EthSigner;
+use crate::{helpers::EthSigner, RpcNodeCore};
 
 /// `Eth` API trait.
 ///
 /// Defines core functionality of the `eth` API implementation.
 #[auto_impl::auto_impl(&, Arc)]
-pub trait EthApiSpec: Send + Sync {
-    /// Returns a handle for reading data from disk.
-    fn provider(&self) -> impl ChainSpecProvider + BlockNumReader + StageCheckpointReader;
-
-    /// Returns a handle for reading network data summary.
-    fn network(&self) -> impl NetworkInfo;
-
+pub trait EthApiSpec:
+    RpcNodeCore<
+    Provider: ChainSpecProvider<ChainSpec: EthereumHardforks>
+                  + BlockNumReader
+                  + StageCheckpointReader,
+    Network: NetworkInfo,
+>
+{
     /// Returns the block node is started on.
     fn starting_block(&self) -> U256;
 
@@ -84,10 +83,5 @@ pub trait EthApiSpec: Send + Sync {
             SyncStatus::None
         };
         Ok(status)
-    }
-
-    /// Returns the configured [`ChainSpec`].
-    fn chain_spec(&self) -> Arc<ChainSpec> {
-        self.provider().chain_spec()
     }
 }

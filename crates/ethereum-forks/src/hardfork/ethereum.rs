@@ -1,4 +1,5 @@
 use crate::{hardfork, ChainHardforks, ForkCondition, Hardfork};
+use alloc::{boxed::Box, format, string::String};
 use alloy_chains::Chain;
 use alloy_primitives::{uint, U256};
 use core::{
@@ -8,9 +9,6 @@ use core::{
 };
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
-
-#[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, format, string::String};
 
 hardfork!(
     /// The name of an Ethereum hardfork.
@@ -51,14 +49,8 @@ hardfork!(
         Cancun,
         /// Prague: <https://github.com/ethereum/execution-specs/blob/master/network-upgrades/mainnet-upgrades/prague.md>
         Prague,
-        /// beijing
-        BeiJing,
-        /// eip150
-        Eip150,
-        /// eip155
-        Eip155,
-        /// eip158
-        Eip158,
+        /// Osaka: <https://eips.ethereum.org/EIPS/eip-7607>
+        Osaka,
     }
 );
 
@@ -74,34 +66,8 @@ impl EthereumHardfork {
         if chain == Chain::holesky() {
             return self.holesky_activation_block()
         }
-        if chain.id() == 94 {
-            return self.ast_activation_block()
-        }
 
         None
-    }
-
-    /// Retrieves the activation block for the specified hardfork on the Ast mainnet.
-    pub const fn ast_activation_block(&self) -> Option<u64> {
-        match self {
-            Self::Homestead => Some(0),
-            Self::Dao => None,
-            Self::Eip150 => Some(0),
-            Self::Eip155 => Some(0),
-            Self::Eip158 => Some(0),
-            Self::Byzantium => Some(0),
-            Self::Constantinople => Some(0),
-            Self::Petersburg => Some(0),
-            Self::Istanbul => Some(0),
-            Self::MuirGlacier => Some(0),
-            Self::Berlin => Some(0),
-            Self::London => Some(0),
-            Self::ArrowGlacier => Some(0),
-            Self::BeiJing => Some(770000),
-            Self::Shanghai => Some(0),
-            Self::Cancun => Some(0),
-            _ => None,
-        }
     }
 
     /// Retrieves the activation block for the specified hardfork on the Ethereum mainnet.
@@ -236,36 +202,8 @@ impl EthereumHardfork {
         if chain == Chain::holesky() {
             return self.holesky_activation_timestamp()
         }
-        if chain.id() == 94 {
-            return self.ast_activation_timestamp()
-        }
 
         None
-    }
-
-    /// Retrieves the activation timestamp for the specified hardfork on the Ast mainnet.
-    pub const fn ast_activation_timestamp(&self) -> Option<u64> {
-        match self {
-            Self::Homestead => Some(0),
-            Self::Dao => None,
-            Self::Eip150 => Some(0),
-            Self::Eip155 => Some(0),
-            Self::Eip158 => Some(0),
-            Self::Byzantium => Some(0),
-            Self::Constantinople => Some(0),
-            Self::Petersburg => Some(0),
-            Self::Istanbul => Some(0),
-            Self::MuirGlacier => Some(0),
-            Self::Berlin => Some(0),
-            Self::London => Some(0),
-            Self::ArrowGlacier => Some(0),
-            Self::BeiJing => Some(770000),///////
-            Self::Shanghai => Some(0),
-            Self::Cancun => Some(0),
-
-            // upcoming hardforks
-            _ => None,
-        }
     }
 
     /// Retrieves the activation timestamp for the specified hardfork on the Ethereum mainnet.
@@ -392,28 +330,6 @@ impl EthereumHardfork {
             // Hardfork::ArbOS20Atlas => Some(1710424089),
             _ => None,
         }
-    }
-
-    /// AST mainnet list of hardforks.
-    pub const fn ast() -> [(Self, ForkCondition); 16] {
-        [
-            (Self::Homestead, ForkCondition::Block(0)),
-            (Self::Dao, ForkCondition::Never),
-            (Self::Eip150, ForkCondition::Block(0)),
-            (Self::Eip155, ForkCondition::Block(0)),
-            (Self::Eip158, ForkCondition::Block(0)),
-            (Self::Byzantium, ForkCondition::Block(0)),
-            (Self::Constantinople, ForkCondition::Block(0)),
-            (Self::Petersburg, ForkCondition::Block(0)),
-            (Self::Istanbul, ForkCondition::Block(0)),
-            (Self::MuirGlacier, ForkCondition::Block(0)),
-            (Self::Berlin, ForkCondition::Block(0)),
-            (Self::London, ForkCondition::Block(0)),
-            (Self::ArrowGlacier, ForkCondition::Block(0)),
-            (Self::BeiJing, ForkCondition::Block(770000)),
-            (Self::Shanghai, ForkCondition::Block(0)),
-            (Self::Cancun, ForkCondition::Block(0)),
-        ]
     }
 
     /// Ethereum mainnet list of hardforks.

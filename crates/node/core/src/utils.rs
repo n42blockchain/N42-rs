@@ -1,6 +1,9 @@
 //! Utility functions for node startup and shutdown, for example path parsing and retrieving single
 //! blocks from the network.
 
+use alloy_eips::BlockHashOrNumber;
+use alloy_primitives::Sealable;
+use alloy_rpc_types_engine::{JwtError, JwtSecret};
 use eyre::Result;
 use reth_chainspec::ChainSpec;
 use reth_consensus_common::validation::validate_block_pre_execution;
@@ -9,8 +12,7 @@ use reth_network_p2p::{
     headers::client::{HeadersClient, HeadersDirection, HeadersRequest},
     priority::Priority,
 };
-use reth_primitives::{BlockHashOrNumber, SealedBlock, SealedHeader};
-use reth_rpc_types::engine::{JwtError, JwtSecret};
+use reth_primitives::{SealedBlock, SealedHeader};
 use std::{
     env::VarError,
     path::{Path, PathBuf},
@@ -53,7 +55,9 @@ where
         eyre::bail!("Invalid number of headers received. Expected: 1. Received: {}", response.len())
     }
 
-    let header = response.into_iter().next().unwrap().seal_slow();
+    let sealed_header = response.into_iter().next().unwrap().seal_slow();
+    let (header, seal) = sealed_header.into_parts();
+    let header = SealedHeader::new(header, seal);
 
     let valid = match id {
         BlockHashOrNumber::Hash(hash) => header.hash() == hash,
@@ -88,16 +92,8 @@ where
         eyre::bail!("Invalid number of bodies received. Expected: 1. Received: 0")
     }
 
-    let block = response.unwrap();
-    let block = SealedBlock {
-        header,
-        body: block.transactions,
-        ommers: block.ommers,
-        withdrawals: block.withdrawals,
-        requests: block.requests,
-        verifiers:block.verifiers,
-        rewards:block.rewards,
-    };
+    let body = response.unwrap();
+    let block = SealedBlock { header, body };
 
     validate_block_pre_execution(&block, &chain_spec)?;
 

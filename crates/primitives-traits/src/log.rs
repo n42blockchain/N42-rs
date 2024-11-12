@@ -1,33 +1,28 @@
-use alloy_primitives::Bloom;
-pub use alloy_primitives::{Log, LogData};
-
-/// Calculate receipt logs bloom.
-pub fn logs_bloom<'a>(logs: impl IntoIterator<Item = &'a Log>) -> Bloom {
-    let mut bloom = Bloom::ZERO;
-    for log in logs {
-        bloom.m3_2048(log.address.as_slice());
-        for topic in log.topics() {
-            bloom.m3_2048(topic.as_slice());
-        }
-    }
-    bloom
-}
-
 #[cfg(test)]
 mod tests {
     use alloy_primitives::{Address, Bytes, Log as AlloyLog, B256};
     use alloy_rlp::{RlpDecodable, RlpEncodable};
     use proptest::proptest;
     use proptest_arbitrary_interop::arb;
-    use reth_codecs::{reth_codec, Compact};
+    use reth_codecs::{add_arbitrary_tests, Compact};
     use serde::{Deserialize, Serialize};
 
     /// This type is kept for compatibility tests after the codec support was added to
     /// alloy-primitives Log type natively
-    #[reth_codec(rlp)]
     #[derive(
-        Clone, Debug, PartialEq, Eq, RlpDecodable, RlpEncodable, Default, Serialize, Deserialize,
+        Clone,
+        Debug,
+        PartialEq,
+        Eq,
+        RlpDecodable,
+        RlpEncodable,
+        Default,
+        Serialize,
+        Deserialize,
+        Compact,
     )]
+    #[cfg_attr(any(test, feature = "arbitrary"), derive(arbitrary::Arbitrary))]
+    #[add_arbitrary_tests(compact, rlp)]
     struct Log {
         /// Contract that emitted this log.
         address: Address,

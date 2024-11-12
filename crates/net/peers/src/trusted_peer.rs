@@ -178,16 +178,6 @@ impl From<NodeRecord> for TrustedPeer {
 mod tests {
     use super::*;
     use std::net::Ipv6Addr;
-    use secp256k1::{SecretKey};
-
-    #[test]
-    fn test_enode_generation() {
-        let secret_key = SecretKey::new(&mut rand::thread_rng());
-        let host = Host::Ipv4([127,0,0,1].into());
-        let port = 12345;
-        let peer = TrustedPeer::from_secret_key(host, port, &secret_key);
-        println!("{}", peer)
-    }
 
     #[test]
     fn test_url_parse() {

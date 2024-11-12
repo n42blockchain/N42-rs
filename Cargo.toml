@@ -160,14 +160,9 @@ lto = "fat"
 codegen-units = 1
 
 [patch.'https://github.com/paradigmxyz/reth.git']
-reth-chainspec = { path = "crates/chainspec" }
 reth-primitives = { path = "crates/primitives" }
 reth-primitives-traits = { path = "crates/primitives-traits" }
-reth-node-api = { path = "crates/node/api" }
-reth-node-builder = { path = "crates/node/builder" }
 reth-node-core = { path = "crates/node/core" }
-reth-node-events = { path = "crates/node/events" }
-reth-node-metrics = { path = "crates/node/metrics" }
 reth-provider = { path = "crates/storage/provider" }
 reth-db = {path = "crates/storage/db" }
 reth-ethereum-forks = { path = "crates/ethereum-forks"}
@@ -175,17 +170,12 @@ reth-ethereum-cli = { path = "crates/ethereum/cli"}
 reth-db-api={path = "crates/storage/db-api"}
 reth-storage-api={path="crates/storage/storage-api"}
 reth-rpc-types-compat={path="crates/rpc/rpc-types-compat"}
-reth-chain-state={path="crates/chain-state"}
-reth-trie={path="crates/trie/trie"}
-reth-trie-db={path="crates/trie/db"}
-reth-rpc-eth-types={path="crates/rpc/rpc-eth-types"}
 reth-ethereum-payload-builder={path="crates/ethereum/payload"}
 reth-auto-seal-consensus={path="crates/consensus/auto-seal"}
 reth-engine-util={path="crates/engine/util"}
 reth-rpc-eth-api={path="crates/rpc/rpc-eth-api"}
 reth-exex={path="crates/exex/exex"}
 reth-network-peers = { path = "crates/net/peers"}
-reth-rpc={path="crates/rpc/rpc"}
 reth-testing-utils={path="testing/testing-utils"}
 
 [patch.crates-io]

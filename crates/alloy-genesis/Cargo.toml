@@ -11,15 +11,16 @@
 
 [package]
 edition = "2021"
-rust-version = "1.76"
+rust-version = "1.79"
 name = "alloy-genesis"
-version = "0.2.1"
+version = "0.5.4"
 authors = ["Alloy Contributors"]
 build = false
 exclude = [
     "benches/",
     "tests/",
 ]
+autolib = false
 autobins = false
 autoexamples = false
 autotests = false
@@ -42,11 +43,11 @@ name = "alloy_genesis"
 path = "src/lib.rs"
 
 [dependencies.alloy-primitives]
-version = "0.7.7"
+version = "0.8.5"
 default-features = false
 
 [dependencies.alloy-serde]
-version = "0.2"
+version = "0.5"
 default-features = false
 
 [dependencies.serde]

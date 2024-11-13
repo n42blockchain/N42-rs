@@ -27,6 +27,8 @@ use reth_db_api::{
         storage_sharded_key::StorageShardedKey,
         AccountBeforeTx, ClientVersion, CompactU256, ShardedKey, StoredBlockBodyIndices,
         StoredBlockWithdrawals,
+        StoredBlockVerifiers,StoredBlockRewards,
+        // StoredAposSnapshot,
     },
     table::{Decode, DupSort, Encode, Table},
 };
@@ -37,6 +39,7 @@ use reth_stages_types::StageCheckpoint;
 use reth_trie_common::{BranchNodeCompact, StorageTrieEntry, StoredNibbles, StoredNibblesSubKey};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use n42_primitives::Snapshot;
 
 /// Enum for the types of tables present in libmdbx.
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -268,6 +271,15 @@ macro_rules! tables {
 }
 
 tables! {
+    /// verify in the block
+    table BlockVerifiers<Key=BlockNumber,Value=StoredBlockVerifiers>;
+
+    /// reward in the block
+    table BlockRewards<Key=BlockNumber,Value=StoredBlockRewards>;
+
+    /// apos snapshot
+    table Snapshots<Key=BlockHash,Value=Snapshot>;
+
     /// Stores the header hashes belonging to the canonical chain.
     table CanonicalHeaders<Key = BlockNumber, Value = HeaderHash>;
 

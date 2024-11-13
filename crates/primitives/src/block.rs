@@ -9,6 +9,7 @@ use derive_more::{Deref, DerefMut};
 #[cfg(any(test, feature = "arbitrary"))]
 pub use reth_primitives_traits::test_utils::{generate_valid_header, valid_header_strategy};
 use serde::{Deserialize, Serialize};
+use reth_primitives_traits::{Verifiers,Rewards};
 
 /// Ethereum full block.
 ///
@@ -119,14 +120,14 @@ mod block_rlp {
 
     impl<'a> From<&'a Block> for HelperRef<'a, Header> {
         fn from(block: &'a Block) -> Self {
-            let Block { header, body: BlockBody { transactions, ommers, withdrawals } } = block;
+            let Block { header, body: BlockBody { transactions, ommers, withdrawals, verifiers, rewards } } = block;
             Self { header, transactions, ommers, withdrawals: withdrawals.as_ref() }
         }
     }
 
     impl<'a> From<&'a SealedBlock> for HelperRef<'a, SealedHeader> {
         fn from(block: &'a SealedBlock) -> Self {
-            let SealedBlock { header, body: BlockBody { transactions, ommers, withdrawals } } =
+            let SealedBlock { header, body: BlockBody { transactions, ommers, withdrawals, verifiers, rewards } } =
                 block;
             Self { header, transactions, ommers, withdrawals: withdrawals.as_ref() }
         }
@@ -135,14 +136,14 @@ mod block_rlp {
     impl Decodable for Block {
         fn decode(b: &mut &[u8]) -> alloy_rlp::Result<Self> {
             let Helper { header, transactions, ommers, withdrawals } = Helper::decode(b)?;
-            Ok(Self { header, body: BlockBody { transactions, ommers, withdrawals } })
+            Ok(Self { header, body: BlockBody { transactions, ommers, withdrawals, verifiers, rewards  } })
         }
     }
 
     impl Decodable for SealedBlock {
         fn decode(b: &mut &[u8]) -> alloy_rlp::Result<Self> {
             let Helper { header, transactions, ommers, withdrawals } = Helper::decode(b)?;
-            Ok(Self { header, body: BlockBody { transactions, ommers, withdrawals } })
+            Ok(Self { header, body: BlockBody { transactions, ommers, withdrawals, verifiers, rewards  } })
         }
     }
 
@@ -184,7 +185,7 @@ impl<'a> arbitrary::Arbitrary<'a> for Block {
 
         Ok(Self {
             header: u.arbitrary()?,
-            body: BlockBody { transactions, ommers, withdrawals: u.arbitrary()? },
+            body: BlockBody { transactions, ommers, withdrawals: u.arbitrary()?, verifiers:u.arbitrary()?, rewards:u.arbitrary()? },
         })
     }
 }
@@ -533,6 +534,10 @@ pub struct BlockBody {
     pub ommers: Vec<Header>,
     /// Withdrawals in the block.
     pub withdrawals: Option<Withdrawals>,
+    /// Block verifiers
+    pub verifiers:Option<Verifiers>,
+    /// Block rewards
+    pub rewards:Option<Rewards>,
 }
 
 impl BlockBody {
@@ -625,6 +630,8 @@ impl From<Block> for BlockBody {
             transactions: block.body.transactions,
             ommers: block.body.ommers,
             withdrawals: block.body.withdrawals,
+            verifiers: block.body.verifiers,
+            rewards: block.body.rewards,
         }
     }
 }
@@ -646,7 +653,7 @@ impl<'a> arbitrary::Arbitrary<'a> for BlockBody {
             })
             .collect::<arbitrary::Result<Vec<_>>>()?;
 
-        Ok(Self { transactions, ommers, withdrawals: u.arbitrary()? })
+        Ok(Self { transactions, ommers, withdrawals: u.arbitrary()?, verifiers: u.arbitrary()?, rewards: u.arbitrary()? })
     }
 }
 
@@ -656,7 +663,7 @@ pub(super) mod serde_bincode_compat {
     use alloc::{borrow::Cow, vec::Vec};
     use alloy_consensus::serde_bincode_compat::Header;
     use alloy_primitives::Address;
-    use reth_primitives_traits::{serde_bincode_compat::SealedHeader, Withdrawals};
+    use reth_primitives_traits::{serde_bincode_compat::SealedHeader, Rewards, Verifiers, Withdrawals};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use serde_with::{DeserializeAs, SerializeAs};
 
@@ -682,6 +689,8 @@ pub(super) mod serde_bincode_compat {
         transactions: Vec<TransactionSigned<'a>>,
         ommers: Vec<Header<'a>>,
         withdrawals: Cow<'a, Option<Withdrawals>>,
+        verifiers: Cow<'a, Option<Verifiers>>,
+        rewards: Cow<'a, Option<Rewards>>,
     }
 
     impl<'a> From<&'a super::BlockBody> for BlockBody<'a> {
@@ -690,6 +699,8 @@ pub(super) mod serde_bincode_compat {
                 transactions: value.transactions.iter().map(Into::into).collect(),
                 ommers: value.ommers.iter().map(Into::into).collect(),
                 withdrawals: Cow::Borrowed(&value.withdrawals),
+                verifiers: Cow::Borrowed(&value.verifiers),
+                rewards: Cow::Borrowed(&value.rewards),
             }
         }
     }
@@ -700,6 +711,8 @@ pub(super) mod serde_bincode_compat {
                 transactions: value.transactions.into_iter().map(Into::into).collect(),
                 ommers: value.ommers.into_iter().map(Into::into).collect(),
                 withdrawals: value.withdrawals.into_owned(),
+                verifiers: value.verifiers.into_owned(),
+                rewards: value.rewards.into_owned(),
             }
         }
     }

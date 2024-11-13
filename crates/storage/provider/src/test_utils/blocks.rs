@@ -13,7 +13,7 @@ use reth_db_api::{database::Database, models::StoredBlockBodyIndices};
 use reth_node_types::NodeTypes;
 use reth_primitives::{
     Account, BlockBody, Header, Receipt, SealedBlock, SealedBlockWithSenders, SealedHeader,
-    Transaction, TransactionSigned, TxType, Withdrawals,
+    Transaction, TransactionSigned, TxType, Withdrawals, Verifiers, Rewards,
 };
 use reth_trie::root::{state_root_unhashed, storage_root_unhashed};
 use revm::{db::BundleState, primitives::AccountInfo};
@@ -43,6 +43,8 @@ pub fn assert_genesis_block<DB: Database, N: NodeTypes>(
     );
     assert_eq!(tx.table::<tables::BlockOmmers>().unwrap(), vec![]);
     assert_eq!(tx.table::<tables::BlockWithdrawals>().unwrap(), vec![]);
+    assert_eq!(tx.table::<tables::BlockVerifiers>().unwrap(), vec![]);
+    assert_eq!(tx.table::<tables::BlockRewards>().unwrap(), vec![]);
     assert_eq!(tx.table::<tables::Transactions>().unwrap(), vec![]);
     assert_eq!(tx.table::<tables::TransactionBlocks>().unwrap(), vec![]);
     assert_eq!(tx.table::<tables::TransactionHashNumbers>().unwrap(), vec![]);

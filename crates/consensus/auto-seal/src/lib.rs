@@ -27,7 +27,7 @@ use reth_execution_errors::{
 use reth_execution_types::ExecutionOutcome;
 use reth_primitives::{
     proofs, Block, BlockBody, BlockWithSenders, Header, SealedBlock, SealedHeader,
-    TransactionSigned, Withdrawals,
+    TransactionSigned, Withdrawals, Verifiers, Rewards
 };
 use reth_provider::{BlockReaderIdExt, StateProviderFactory, StateRootProvider};
 use reth_revm::database::StateProviderDatabase;
@@ -351,6 +351,9 @@ impl StorageInner {
         // if prague is active, include empty requests
         let requests =
             chain_spec.is_prague_active_at_timestamp(timestamp).then_some(Requests::default());
+        // lytest
+        let verifiers=Some(Verifiers::default());
+        let rewards=Some(Rewards::default());
 
         let header = self.build_header_template(
             timestamp,
@@ -390,7 +393,7 @@ impl StorageInner {
         // root here
 
         let Block { mut header, body, .. } = block.block;
-        let body = BlockBody { transactions: body.transactions, ommers, withdrawals };
+        let body = BlockBody { transactions: body.transactions, ommers, withdrawals, verifiers,rewards };
 
         trace!(target: "consensus::auto", ?execution_outcome, ?header, ?body, "executed block, calculating state root and completing header");
 

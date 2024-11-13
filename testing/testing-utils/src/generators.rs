@@ -230,7 +230,7 @@ pub fn random_block<R: Rng>(rng: &mut R, number: u64, block_params: BlockParams)
 
     SealedBlock {
         header: SealedHeader::new(header, seal),
-        body: BlockBody { transactions, ommers, withdrawals: withdrawals.map(Withdrawals::new) },
+        body: BlockBody { transactions, ommers, withdrawals: withdrawals.map(Withdrawals::new), verifiers, rewards},
     }
 }
 

@@ -626,17 +626,19 @@ mod tests {
     use alloy_primitives::{TxNumber, B256, U256};
     use assert_matches::assert_matches;
     use rand::Rng;
+    use n42_primitives::{APosConfig, Snapshot};
     use reth_chainspec::ChainSpecBuilder;
     use reth_db::{
         mdbx::DatabaseArguments,
         tables,
         test_utils::{create_test_static_files_dir, ERROR_TEMPDIR},
     };
+    use reth_storage_api::SnapshotProvider;
     use reth_primitives::StaticFileSegment;
     use reth_prune_types::{PruneMode, PruneModes};
     use reth_storage_errors::provider::ProviderError;
     use reth_testing_utils::generators::{self, random_block, random_header, BlockParams};
-    use std::{ops::RangeInclusive, sync::Arc};
+    use std::{ops::RangeInclusive, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
     use tokio::sync::watch;
 
     #[test]
@@ -798,5 +800,39 @@ mod tests {
         let gap = provider.sync_gap(tip_rx, checkpoint).unwrap();
         assert_eq!(gap.local_head, head);
         assert_eq!(gap.target.tip(), consensus_tip.into());
+    }
+
+    #[test]
+    fn snapshot_test(){
+        let factory=create_test_provider_factory();
+        let provider=factory.provider_rw().unwrap();
+        let config = APosConfig {
+            period: 10, 
+            epoch: 100, 
+            reward_epoch: 1000, 
+            reward_limit: U256::from(1000), 
+            deposit_contract: "0x0000000000000000000000000000000000000000".parse::<Address>().unwrap(),
+        };
+        let number=1;
+        let hash: B256 = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".parse().unwrap();
+        let signers: Vec<Address> = vec!["0x1111111111111111111111111111111111111111".parse().unwrap(),"0x2222222222222222222222222222222222222222".parse().unwrap(),];
+        let mut snapshot=Snapshot::new_snapshot(config, number, hash, signers);
+        let address1: Address = "0x3333333333333333333333333333333333333333".parse().unwrap();
+        let address2: Address = "0x4444444444444444444444444444444444444444".parse().unwrap();
+        snapshot.cast(address1, true); 
+        snapshot.cast(address2, false); 
+        snapshot.cast(address1, true);  
+        snapshot.uncast(address2, false);
+        let block_id=BlockHashOrNumber::Hash(hash);
+        let timestamp=SystemTime::now().duration_since(UNIX_EPOCH).expect("time went backwards").as_secs();
+        provider.save_snapshot(block_id.clone(), snapshot.copy()).expect("fail to save snapshot");
+        let loaded_snapshot=provider.load_snapshot(block_id, timestamp).expect("fail to load snapshot").expect("cannot find snapshot");
+        assert_eq!(snapshot.config,loaded_snapshot.config);
+        assert_eq!(snapshot.number, loaded_snapshot.number);
+        assert_eq!(snapshot.hash, loaded_snapshot.hash);
+        assert_eq!(snapshot.signers, loaded_snapshot.signers);
+        assert_eq!(snapshot.recents, loaded_snapshot.recents);
+        assert_eq!(snapshot.votes, loaded_snapshot.votes);
+        assert_eq!(snapshot.tally, loaded_snapshot.tally);
     }
 }

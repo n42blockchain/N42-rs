@@ -6,7 +6,15 @@ mod ethereum;
 pub use ethereum::*;
 
 mod optimism;
+mod ast;
+
 pub use optimism::*;
+use crate::bootnodes::ast::AST_BOOTNODES;
+
+/// Returns parsed ast nodes
+pub fn ast_nodes() -> Vec<NodeRecord> {
+    parse_nodes(&AST_BOOTNODES[..])
+}
 
 /// Returns parsed mainnet nodes
 pub fn mainnet_nodes() -> Vec<NodeRecord> {

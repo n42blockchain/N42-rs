@@ -2,7 +2,7 @@
 
 use alloy_primitives::B256;
 use reth_codecs::{add_arbitrary_tests, Compact};
-use reth_primitives::Header;
+use reth_primitives::{Header, Verifiers, Rewards};
 use serde::{Deserialize, Serialize};
 
 /// The storage representation of a block's ommers.
@@ -18,6 +18,20 @@ pub struct StoredBlockOmmers {
 
 /// Hash of the block header.
 pub type HeaderHash = B256;
+
+/// ly
+#[derive(Serialize,Debug,PartialEq,Compact,Deserialize,Clone,Default)]
+pub struct StoredBlockVerifiers{
+    /// ly
+    pub verifiers:Verifiers,
+}
+
+/// ly
+#[derive(Debug,Serialize,Compact,Deserialize,Clone,PartialEq,Default)]
+pub struct StoredBlockRewards{
+    /// ly
+    pub rewards:Rewards,
+}
 
 #[cfg(test)]
 mod tests {

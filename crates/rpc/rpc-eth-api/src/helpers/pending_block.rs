@@ -24,7 +24,7 @@ use reth_primitives::{
         BlockEnv, CfgEnv, CfgEnvWithHandlerCfg, EVMError, Env, ExecutionResult, InvalidTransaction,
         ResultAndState, SpecId,
     },
-    Block, BlockBody, Header, Receipt, SealedBlockWithSenders, SealedHeader,
+    Block, BlockBody, Header, Receipt, SealedBlockWithSenders, SealedHeader, Rewards, Verifiers,
     TransactionSignedEcRecovered,
 };
 use reth_provider::{
@@ -438,11 +438,15 @@ pub trait LoadPendingBlock:
 
         // Convert Vec<Option<Receipt>> to Vec<Receipt>
         let receipts: Vec<Receipt> = receipts.into_iter().flatten().collect();
-
+        
+        // lytest
+        let verifiers=Some(Verifiers::default());
+        let rewards=Some(Rewards::default());
+        
         // seal the block
         let block = Block {
             header,
-            body: BlockBody { transactions: executed_txs, ommers: vec![], withdrawals },
+            body: BlockBody { transactions: executed_txs, ommers: vec![], withdrawals, verifiers, rewards },
         };
         Ok((SealedBlockWithSenders { block: block.seal_slow(), senders }, receipts))
     }

@@ -48,6 +48,8 @@ impl TryFrom<alloy_rpc_types::Block<WithOtherFields<alloy_rpc_types::Transaction
                 transactions,
                 ommers: Default::default(),
                 withdrawals: block.withdrawals.map(Into::into),
+                verifiers: Default::default(),
+                rewards: Default::default(),
             },
         })
     }

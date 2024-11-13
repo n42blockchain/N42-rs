@@ -12,6 +12,8 @@ description = "Database primitives used in reth."
 workspace = true
 
 [dependencies]
+#n42
+n42-primitives.workspace=true
 # reth
 reth-db-api.workspace = true
 reth-primitives = { workspace = true, features = ["reth-codec"] }

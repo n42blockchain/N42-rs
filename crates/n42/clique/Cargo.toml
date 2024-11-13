@@ -41,8 +41,8 @@ blst.workspace = true
 secp256k1  = { workspace = true, features = ["recovery"] }
 sha2.workspace = true
 sha3 = "0.10.5"
-# rast
-rast-primitives.workspace = true
+# n42
+n42-primitives.workspace = true
 
 alloy-serde.workspace = true
 # serde

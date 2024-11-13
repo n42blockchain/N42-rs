@@ -6,6 +6,14 @@ use alloy_primitives::{b256, B256};
 pub mod gas_units;
 pub use gas_units::{GIGAGAS, KILOGAS, MEGAGAS};
 
+/// n42 block gas limit
+pub const N42_BLOCK_GAS_LIMIT: u64 = 9_223_372_036_854_775_807;
+
+/// The n42 mainnet genesis hash:
+/// `0x138734b7044254e5ecbabf8056f5c2b73cd0847aaa5acac7345507cbeab387b8`
+pub const N42_GENESIS_HASH: B256 =
+    b256!("138734b7044254e5ecbabf8056f5c2b73cd0847aaa5acac7345507cbeab387b8");
+
 /// The client version: `reth/v{major}.{minor}.{patch}`
 pub const RETH_CLIENT_VERSION: &str = concat!("reth/v", env!("CARGO_PKG_VERSION"));
 

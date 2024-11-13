@@ -36,6 +36,12 @@ pub use block::{body::BlockBody, Block};
 mod withdrawal;
 pub use withdrawal::Withdrawals;
 
+mod verifier;
+pub use verifier::{Verifier,Verifiers,Address,PublicKey};
+
+mod reward;
+pub use reward::{Rewards,Amount,Reward};
+
 mod error;
 pub use error::{GotExpected, GotExpectedBoxed};
 

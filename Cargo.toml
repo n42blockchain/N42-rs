@@ -16,7 +16,7 @@ members = [
     "crates/engine/util/",
     "crates/ethereum/cli/",
     "crates/ethereum/payload/",
-    "crates/reth-ethereum-forks/",
+    "crates/ethereum-forks/",
     "crates/exex/exex/",
     "crates/net/peers/",
     "crates/node/core/",

@@ -427,6 +427,8 @@ where
             transactions,
             ommers: reorg_target.body.ommers,
             withdrawals: reorg_target.body.withdrawals,
+            verifiers:None,// TODO beijing
+            rewards:None,
         },
     }
     .seal_slow();

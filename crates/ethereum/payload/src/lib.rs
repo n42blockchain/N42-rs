@@ -27,7 +27,7 @@ use reth_payload_primitives::{PayloadBuilderAttributes, PayloadBuilderError};
 use reth_primitives::{
     proofs::{self},
     revm_primitives::{BlockEnv, CfgEnvWithHandlerCfg},
-    Block, BlockBody, EthereumHardforks, Header, Receipt,
+    Block, BlockBody, EthereumHardforks, Header, Receipt, Verifiers, Rewards
 };
 use reth_provider::{ChainSpecProvider, StateProviderFactory};
 use reth_revm::database::StateProviderDatabase;
@@ -432,11 +432,13 @@ where
         excess_blob_gas: excess_blob_gas.map(Into::into),
         requests_hash,
     };
-
+    // ly Simple generation.
+    let verifiers=Some(Verifiers::default());
+    let rewards=Some(Rewards::default());
     // seal the block
     let block = Block {
         header,
-        body: BlockBody { transactions: executed_txs, ommers: vec![], withdrawals },
+        body: BlockBody { transactions: executed_txs, ommers: vec![], withdrawals, verifiers,rewards},
     };
 
     let sealed_block = block.seal_slow();

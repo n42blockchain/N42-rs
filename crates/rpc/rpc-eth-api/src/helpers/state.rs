@@ -133,6 +133,33 @@ pub trait EthState: LoadState + SpawnBlocking {
         &self,
         address: Address,
         block_id: BlockId,
+    ) -> impl Future<Output = Result<Account, Self::Error>> + Send {
+        self.spawn_blocking_io(move |this| {
+            let state = this.state_at_block_id(block_id)?;
+
+            let account = state
+                .basic_account(address)
+                .map_err(Self::Error::from_eth_err)?
+                .unwrap_or_default();
+            let balance = account.balance;
+            let nonce = account.nonce;
+            let code_hash = account.bytecode_hash.unwrap_or(KECCAK_EMPTY);
+
+            // Provide a default `HashedStorage` value in order to
+            // get the storage root hash of the current state.
+            let storage_root = state
+                .hashed_storage_root(address, Default::default())
+                .map_err(Self::Error::from_eth_err)?;
+
+            Ok(Account { balance, nonce, code_hash, storage_root })
+        })
+    }
+
+    /// Returns the account at the given address for the provided block identifier.
+    fn get_account(
+        &self,
+        address: Address,
+        block_id: BlockId,
     ) -> impl Future<Output = Result<Option<Account>, Self::Error>> + Send {
         self.spawn_blocking_io(move |this| {
             let state = this.state_at_block_id(block_id)?;

@@ -14,8 +14,7 @@ exclude.workspace = true
 
 
 
-types = "0.1" 
-unexpected = "0.1" 
+unexpected = "0.1"
 
 hash-db = "0.16.0"
 keccak-hash = "0.10.0"

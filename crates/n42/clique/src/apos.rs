@@ -22,7 +22,7 @@ use std::io::{self, Write};
 
 use reth_primitives::{Block, SealedBlock, SealedHeader};
 use tracing::{info, debug, error};
-use rast_primitives::{APosConfig, Snapshot};
+use n42_primitives::{APosConfig, Snapshot};
 
 use reth_primitives_traits::Header;
 use reth_primitives::public_key_to_address;
@@ -41,9 +41,6 @@ use rand::prelude::SliceRandom;
 use rlp::RlpStream;
 use reth_chainspec::ChainSpec;
 
-use crate::traits::Engine;
-use crate::traits::{ChainReader,API};
-use crate::traits::API as OtherAPI;
 
 // 配置常量
 const CHECKPOINT_INTERVAL: u64 = 2048; // Number of blocks after which to save the vote snapshot to the database

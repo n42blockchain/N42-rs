@@ -1,4 +1,5 @@
-use reth_primitives::{BlockHashOrNumber,Verifiers};
+use reth_primitives::Verifiers;
+use alloy_eips::BlockHashOrNumber;
 use reth_storage_errors::provider::ProviderResult;
 /// lytest
 pub trait VerifiersProvider:Send+Sync{

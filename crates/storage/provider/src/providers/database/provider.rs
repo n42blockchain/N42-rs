@@ -47,7 +47,7 @@ use reth_primitives::{
 };
 use reth_prune_types::{PruneCheckpoint, PruneModes, PruneSegment};
 use reth_stages_types::{StageCheckpoint, StageId};
-use reth_storage_api::{StateProvider, StorageChangeSetReader, TryIntoHistoricalStateProvider};
+use reth_storage_api::{SnapshotProviderWriter, StateProvider, StorageChangeSetReader, TryIntoHistoricalStateProvider};
 use reth_storage_api::SnapshotProvider;
 use n42_primitives::Snapshot;
 use reth_storage_errors::provider::{ProviderResult, RootMismatch};
@@ -543,7 +543,7 @@ impl<TX: DbTx, N: NodeTypes> DatabaseProvider<TX, N> {
             })
             .collect();
 
-        construct_block(header, body, senders, ommers, withdrawals, rewards, verifiers)
+        construct_block(header, body, senders, ommers, withdrawals, verifiers, rewards )
     }
 
     /// Returns a range of blocks from the database.
@@ -2073,18 +2073,18 @@ impl<TX: DbTx, N: NodeTypes<ChainSpec: EthereumHardforks>> RewardsProvider for D
 
 impl<TX: DbTx, N: NodeTypes<ChainSpec: EthereumHardforks>> SnapshotProvider for DatabaseProvider<TX, N>{
     fn load_snapshot(&self, id: BlockHashOrNumber, timestamp: u64) -> ProviderResult<Option<Snapshot>> {
-        if let Some(hash)=self.convert_block_hash(id)?{
-            let snapshot=self.tx.get::<tables::Snapshots>(hash)?.unwrap_or_default();
+        if let Some(number)=self.convert_hash_or_number(id)?{
+            let snapshot=self.tx.get::<tables::Snapshots>(number)?.unwrap_or_default();
             return Ok(Some(snapshot))
         }
         Ok(None)
     }
-    fn save_snapshot(&self, id: BlockHashOrNumber, snapshot: Snapshot) -> ProviderResult<()> {
-        if let Some(hash)=self.convert_block_hash(id)?{
-            Ok(self.tx.put::<tables::Snapshots>(hash, snapshot)?)
-        }else{
-            Ok(())
-        }
+}
+
+
+impl<TX: DbTxMut, N: NodeTypes<ChainSpec: EthereumHardforks>> SnapshotProviderWriter for DatabaseProvider<TX, N>{
+    fn save_snapshot(&self, number: BlockNumber, snapshot: Snapshot) -> ProviderResult<()> {
+        Ok(self.tx.put::<tables::Snapshots>(number, snapshot)?)
     }
 }
 

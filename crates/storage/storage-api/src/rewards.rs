@@ -1,4 +1,5 @@
-use reth_primitives::{BlockHashOrNumber,Rewards};
+use reth_primitives::Rewards;
+use alloy_eips::BlockHashOrNumber;
 use reth_storage_errors::provider::ProviderResult;
 /// lytest
 pub trait RewardsProvider:Send+Sync{

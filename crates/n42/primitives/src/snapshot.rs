@@ -4,24 +4,20 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::error::Error;
 use std::hash::Hash;
-use reth_primitives::{arbitrary, hex, Header};
+use reth_primitives::{arbitrary, Header};
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use bytes::BufMut;
-use rlp::RlpStream;
 use std::hash::RandomState;
 
 
-use alloy_primitives::{Address, AddressError, B256, U256};
+use alloy_primitives::{Address, AddressError, B256, U256, hex};
 use alloy_rlp::{Encodable, Decodable,RlpDecodable, RlpEncodable};
 use arbitrary::Arbitrary;
 use serde::{Deserialize, Serialize};
 
 use tracing::info;
-use reth_db_api::table::Decompress;
-use reth_db_api::table::Compress;
-use reth_db_api::DatabaseError;
 
 pub const NONCE_AUTH_VOTE: [u8; 8] = hex!("ffffffffffffffff"); // Magic nonce number to vote on adding a new signer
 pub const NONCE_DROP_VOTE: [u8; 8] = hex!("0000000000000000"); // Magic nonce number to vote on removing a signer
@@ -104,21 +100,6 @@ pub struct  Snapshot
     pub tally: HashMap<Address,Tally>,
 }
 
-impl Decompress for Snapshot{
-    fn decompress<B: AsRef<[u8]>>(value: B) -> Result<Self, DatabaseError> {
-        let bytes = value.as_ref();
-        let snapshot: Result<Snapshot, _> = serde_json::from_slice(bytes);
-        snapshot.map_err(|e| DatabaseError::Other(e.to_string()))
-    }
-}
-
-impl Compress for Snapshot{
-    type Compressed = Vec<u8>;
-    fn compress_to_buf<B: bytes::BufMut + AsMut<[u8]>>(self, buf: &mut B) {
-        let serialized = serde_json::to_vec(&self).expect("Serialization should not fail");
-        buf.put_slice(&serialized);
-    }
-}
 
 impl Snapshot
 {
@@ -268,8 +249,8 @@ impl Snapshot
 
             //Count new votes
             let authorize = match header.nonce {
-                nonce if hex::encode(nonce.to_be_bytes()) == hex::encode(NONCE_AUTH_VOTE) => true,
-                nonce if hex::encode(nonce.to_be_bytes()) == hex::encode(NONCE_DROP_VOTE) => false,
+                nonce if hex::encode(nonce) == hex::encode(NONCE_AUTH_VOTE) => true,
+                nonce if hex::encode(nonce) == hex::encode(NONCE_DROP_VOTE) => false,
                 _ => return Err(VotingError::InvalidVote),
             };
 

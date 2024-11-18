@@ -272,13 +272,13 @@ macro_rules! tables {
 
 tables! {
     /// verify in the block
-    table BlockVerifiers<Key=BlockNumber,Value=StoredBlockVerifiers>;
+    table BlockVerifiers<Key = BlockNumber,Value = StoredBlockVerifiers>;
 
     /// reward in the block
-    table BlockRewards<Key=BlockNumber,Value=StoredBlockRewards>;
+    table BlockRewards<Key = BlockNumber,Value = StoredBlockRewards>;
 
     /// apos snapshot
-    table Snapshots<Key=BlockHash,Value=Snapshot>;
+    table Snapshots<Key = BlockNumber,Value = Snapshot>;
 
     /// Stores the header hashes belonging to the canonical chain.
     table CanonicalHeaders<Key = BlockNumber, Value = HeaderHash>;

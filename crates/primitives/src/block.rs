@@ -107,6 +107,8 @@ mod block_rlp {
         transactions: Vec<TransactionSigned>,
         ommers: Vec<Header>,
         withdrawals: Option<Withdrawals>,
+        verifiers: Option<Verifiers>,
+        rewards: Option<Rewards>,
     }
 
     #[derive(RlpEncodable)]
@@ -116,12 +118,14 @@ mod block_rlp {
         transactions: &'a Vec<TransactionSigned>,
         ommers: &'a Vec<Header>,
         withdrawals: Option<&'a Withdrawals>,
+        verifiers: Option<&'a Verifiers>,
+        rewards: Option<&'a Rewards>,
     }
 
     impl<'a> From<&'a Block> for HelperRef<'a, Header> {
         fn from(block: &'a Block) -> Self {
             let Block { header, body: BlockBody { transactions, ommers, withdrawals, verifiers, rewards } } = block;
-            Self { header, transactions, ommers, withdrawals: withdrawals.as_ref() }
+            Self { header, transactions, ommers, withdrawals: withdrawals.as_ref(), verifiers: verifiers.as_ref(), rewards: rewards.as_ref() }
         }
     }
 
@@ -129,20 +133,20 @@ mod block_rlp {
         fn from(block: &'a SealedBlock) -> Self {
             let SealedBlock { header, body: BlockBody { transactions, ommers, withdrawals, verifiers, rewards } } =
                 block;
-            Self { header, transactions, ommers, withdrawals: withdrawals.as_ref() }
+            Self { header, transactions, ommers, withdrawals: withdrawals.as_ref(), verifiers: verifiers.as_ref(), rewards: rewards.as_ref() }
         }
     }
 
     impl Decodable for Block {
         fn decode(b: &mut &[u8]) -> alloy_rlp::Result<Self> {
-            let Helper { header, transactions, ommers, withdrawals } = Helper::decode(b)?;
+            let Helper { header, transactions, ommers, withdrawals, verifiers, rewards  } = Helper::decode(b)?;
             Ok(Self { header, body: BlockBody { transactions, ommers, withdrawals, verifiers, rewards  } })
         }
     }
 
     impl Decodable for SealedBlock {
         fn decode(b: &mut &[u8]) -> alloy_rlp::Result<Self> {
-            let Helper { header, transactions, ommers, withdrawals } = Helper::decode(b)?;
+            let Helper { header, transactions, ommers, withdrawals, verifiers, rewards  } = Helper::decode(b)?;
             Ok(Self { header, body: BlockBody { transactions, ommers, withdrawals, verifiers, rewards  } })
         }
     }

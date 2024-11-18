@@ -370,6 +370,8 @@ impl StorageInner {
                 transactions,
                 ommers: ommers.clone(),
                 withdrawals: withdrawals.clone(),
+                verifiers: verifiers.clone(),
+                rewards: rewards.clone(),
             },
         }
         .with_recovered_senders()

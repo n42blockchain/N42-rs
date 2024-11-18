@@ -15,11 +15,14 @@ use reth_stages_types::StageCheckpoint;
 use reth_trie_common::{StoredNibbles, StoredNibblesSubKey, *};
 use serde::{Deserialize, Serialize};
 
+use n42_primitives::Snapshot;
+
 pub mod accounts;
 pub mod blocks;
 pub mod integer_list;
 pub mod sharded_key;
 pub mod storage_sharded_key;
+mod snapshot;
 
 pub use accounts::*;
 pub use blocks::*;

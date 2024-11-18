@@ -22,6 +22,7 @@ members = [
     "crates/exex/exex/",
     "crates/net/peers/",
     "crates/node/core/",
+    "crates/ethereum/node/",
     "crates/primitives/",
     "crates/primitives-traits/",
     "crates/rpc/rpc-eth-api/",
@@ -184,6 +185,7 @@ reth-node-builder = { path = "crates/node/builder" }
 reth-primitives = { path = "crates/primitives" }
 reth-primitives-traits = { path = "crates/primitives-traits" }
 reth-node-core = { path = "crates/node/core" }
+reth-node-ethereum = { path = "crates/ethereum/node" }
 reth-provider = { path = "crates/storage/provider" }
 reth-db = {path = "crates/storage/db" }
 reth-ethereum-forks = { path = "crates/ethereum-forks"}
@@ -208,6 +210,7 @@ n42-primitives = { path = "crates/n42/primitives" }
 clique={path="crates/n42/clique"}
 blst = "0.3.11"
 
+reth = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.1.1" }
 reth-auto-seal-consensus = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.1.1" }
 reth-basic-payload-builder = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.1.1" }
 reth-beacon-consensus = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.1.1" }

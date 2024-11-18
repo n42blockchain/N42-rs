@@ -1,4 +1,5 @@
-use reth_primitives::BlockHashOrNumber;
+use alloy_eips::BlockHashOrNumber;
+use alloy_primitives::BlockNumber;
 use reth_storage_errors::provider::ProviderResult;
 use n42_primitives::Snapshot;
 
@@ -6,6 +7,9 @@ use n42_primitives::Snapshot;
 pub trait SnapshotProvider{
     /// get snapshot by block id
     fn load_snapshot(&self, id: BlockHashOrNumber, timestamp: u64) -> ProviderResult<Option<Snapshot>>;
+}
+
+pub trait SnapshotProviderWriter{
     /// save snapshot
-    fn save_snapshot(&self, id: BlockHashOrNumber, snapshot: Snapshot) -> ProviderResult<()>;
+    fn save_snapshot(&self, id: BlockNumber, snapshot: Snapshot) -> ProviderResult<()>;
 }

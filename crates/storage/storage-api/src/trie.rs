@@ -33,15 +33,6 @@ pub trait StateRootProvider: Send + Sync {
     ) -> ProviderResult<(B256, TrieUpdates)>;
 
     /// Returns state root and trie updates.
-    /// See [`StateRootProvider::hashed_state_root_from_nodes`] for more info.
-    fn hashed_state_root_from_nodes_with_updates(
-        &self,
-        nodes: TrieUpdates,
-        hashed_state: HashedPostState,
-        prefix_sets: TriePrefixSetsMut,
-    ) -> ProviderResult<(B256, TrieUpdates)>;
-
-    /// Returns state root and trie updates.
     /// See [`StateRootProvider::state_root_from_nodes`] for more info.
     fn state_root_from_nodes_with_updates(
         &self,
@@ -55,7 +46,7 @@ pub trait StorageRootProvider: Send + Sync {
     /// Returns the storage root of the `HashedStorage` for target address on top of the current
     /// state.
     fn storage_root(&self, address: Address, hashed_storage: HashedStorage)
-        -> ProviderResult<B256>;
+                    -> ProviderResult<B256>;
 
     /// Returns the storage proof of the `HashedStorage` for target slot on top of the current
     /// state.

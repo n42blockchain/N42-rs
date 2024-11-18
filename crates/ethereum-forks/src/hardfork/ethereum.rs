@@ -69,20 +69,17 @@ impl EthereumHardfork {
             return self.holesky_activation_block()
         }
         if chain.id() == 94 {
-            return self.ast_activation_block()
+            return self.n42_activation_block()
         }
 
         None
     }
 
     /// Retrieves the activation block for the specified hardfork on the Ast mainnet.
-    pub const fn ast_activation_block(&self) -> Option<u64> {
+    pub const fn n42_activation_block(&self) -> Option<u64> {
         match self {
             Self::Homestead => Some(0),
             Self::Dao => None,
-            Self::Eip150 => Some(0),
-            Self::Eip155 => Some(0),
-            Self::Eip158 => Some(0),
             Self::Byzantium => Some(0),
             Self::Constantinople => Some(0),
             Self::Petersburg => Some(0),
@@ -231,20 +228,17 @@ impl EthereumHardfork {
             return self.holesky_activation_timestamp()
         }
         if chain.id() == 94 {
-            return self.ast_activation_timestamp()
+            return self.n42_activation_timestamp()
         }
 
         None
     }
 
-    /// Retrieves the activation timestamp for the specified hardfork on the Ast mainnet.
-    pub const fn ast_activation_timestamp(&self) -> Option<u64> {
+    /// Retrieves the activation timestamp for the specified hardfork on the N42 mainnet.
+    pub const fn n42_activation_timestamp(&self) -> Option<u64> {
         match self {
             Self::Homestead => Some(0),
             Self::Dao => None,
-            Self::Eip150 => Some(0),
-            Self::Eip155 => Some(0),
-            Self::Eip158 => Some(0),
             Self::Byzantium => Some(0),
             Self::Constantinople => Some(0),
             Self::Petersburg => Some(0),
@@ -389,13 +383,10 @@ impl EthereumHardfork {
     }
 
     /// AST mainnet list of hardforks.
-    pub const fn ast() -> [(Self, ForkCondition); 16] {
+    pub const fn n42() -> [(Self, ForkCondition); 13] {
         [
             (Self::Homestead, ForkCondition::Block(0)),
             (Self::Dao, ForkCondition::Never),
-            (Self::Eip150, ForkCondition::Block(0)),
-            (Self::Eip155, ForkCondition::Block(0)),
-            (Self::Eip158, ForkCondition::Block(0)),
             (Self::Byzantium, ForkCondition::Block(0)),
             (Self::Constantinople, ForkCondition::Block(0)),
             (Self::Petersburg, ForkCondition::Block(0)),

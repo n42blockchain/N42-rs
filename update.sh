@@ -9,7 +9,7 @@ paths=$(sed -n '/^\[patch.'"'"'https:\/\/github.com\/paradigmxyz\/reth.git'"'"'\
 # reth路径
 reth_dir="../reth"
 patch_path="./patch"
-base_version="1.0.5"
+base_version="1.1.1"
 
 generate_patch() {
     local source=$1
@@ -53,7 +53,7 @@ for path in $paths; do
     echo "Checking path: $source_path"
     # 检查是否存在 Cargo.toml 文件
     if [ -f "$target_path/Cargo.toml" ]; then
-        apply_patch "$target_path"
+        generate_patch "$target_path"
     else
         # 如果没有 Cargo.toml，遍历子文件夹
         echo "No Cargo.toml in $target_path, checking subdirectories..."
@@ -63,7 +63,7 @@ for path in $paths; do
             if [ -d "$sub_dir" ]; then
                 # 如果是目录，检查是否有 Cargo.toml 文件
                 if [ -f "$sub_dir/Cargo.toml" ]; then
-                    apply_patch "$sub_dir"
+                    generate_patch "$sub_dir"
                 fi
             fi
         done

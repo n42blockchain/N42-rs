@@ -1,4 +1,4 @@
-use reth_chainspec::{ChainSpec, DEV, HOLESKY, MAINNET, SEPOLIA, N42_MAINNET};
+use reth_chainspec::{ChainSpec, DEV, HOLESKY, MAINNET, SEPOLIA, N42};
 use reth_cli::chainspec::{parse_genesis, ChainSpecParser};
 use std::sync::Arc;
 
@@ -14,7 +14,7 @@ pub fn chain_value_parser(s: &str) -> eyre::Result<Arc<ChainSpec>, eyre::Error> 
         "mainnet" => MAINNET.clone(),
         "sepolia" => SEPOLIA.clone(),
         "holesky" => HOLESKY.clone(),
-        "n42" => N42_MAINNET.clone(),
+        "n42" => N42.clone(),
         "dev" => DEV.clone(),
         _ => Arc::new(parse_genesis(s)?.into()),
     })

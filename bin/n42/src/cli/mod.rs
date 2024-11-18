@@ -102,7 +102,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>, Ext: clap::Args + fmt::Debug> Cl
     /// # Example
     ///
     /// ```no_run
-    /// use reth::cli::Cli;
+    /// use n42::cli::Cli;
     /// use reth_node_ethereum::EthereumNode;
     ///
     /// Cli::parse_args()

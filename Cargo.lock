@@ -4675,6 +4675,7 @@ dependencies = [
  "clap",
  "eyre",
  "futures",
+ "num_cpus",
  "reth-basic-payload-builder",
  "reth-beacon-consensus",
  "reth-blockchain-tree",

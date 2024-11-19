@@ -4,7 +4,7 @@
 static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
 
 use clap::{Args, Parser};
-use reth::cli::Cli;
+use n42::cli::Cli;
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_node_builder::{
     engine_tree_config::{

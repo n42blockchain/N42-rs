@@ -22,7 +22,6 @@ use reth_node_metrics::recorder::install_prometheus_recorder;
 use reth_tracing::FileWorkerGuard;
 use std::{ffi::OsString, fmt, future::Future, sync::Arc};
 use tracing::info;
-use crate::commands::evm;
 
 /// Re-export of the `reth_node_core` types specifically in the `cli` module.
 ///
@@ -183,9 +182,6 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>, Ext: clap::Args + fmt::Debug> Cl
                 runner.run_command_until_exit(|ctx| command.execute::<EthereumNode>(ctx))
             }
             Commands::Prune(command) => runner.run_until_ctrl_c(command.execute::<EthereumNode>()),
-            Commands::Evm(command) => {
-                runner.run_command_until_exit(|ctx| command.execute::<EthereumNode>(ctx))
-            }
         }
     }
 
@@ -241,9 +237,6 @@ pub enum Commands<C: ChainSpecParser, Ext: clap::Args + fmt::Debug> {
     /// Prune according to the configuration without any limits
     #[command(name = "prune")]
     Prune(prune::PruneCommand<C>),
-    /// pevm
-    #[command(name = "evm")]
-    Evm(evm::EvmCommand<C>),
 }
 
 #[cfg(test)]

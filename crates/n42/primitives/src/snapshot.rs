@@ -1,26 +1,21 @@
 
 // use ethcore::snapshot::{ManifestData, SnapshotService};
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::error::Error;
-use std::hash::Hash;
 use reth_primitives::{arbitrary, Header};
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use bytes::BufMut;
-use std::hash::RandomState;
 
 
-use alloy_primitives::{Address, AddressError, B256, U256, hex};
-use alloy_rlp::{Encodable, Decodable,RlpDecodable, RlpEncodable};
+use alloy_primitives::{Address, B256, U256, hex};
+use alloy_rlp::{RlpDecodable, RlpEncodable};
 use arbitrary::Arbitrary;
 use serde::{Deserialize, Serialize};
 
 use tracing::info;
 
-pub const NONCE_AUTH_VOTE: [u8; 8] = hex!("ffffffffffffffff"); // Magic nonce number to vote on adding a new signer
-pub const NONCE_DROP_VOTE: [u8; 8] = hex!("0000000000000000"); // Magic nonce number to vote on removing a signer
+const NONCE_AUTH_VOTE: [u8; 8] = hex!("ffffffffffffffff"); // Magic nonce number to vote on adding a new signer
+const NONCE_DROP_VOTE: [u8; 8] = hex!("0000000000000000"); // Magic nonce number to vote on removing a signer
 
 
 #[derive(Debug)]
@@ -129,7 +124,7 @@ impl Snapshot
 
 	/// Create a deep copy of the snapshot
     pub fn copy(&self) -> Self {
-        let mut cpy = Self {
+        let cpy = Self {
             config: self.config.clone(),
             number: self.number,
             hash: self.hash.clone(), 
@@ -216,7 +211,7 @@ impl Snapshot
         //Create a new snapshot
         let mut snap = self.copy();
         let start = Instant::now();
-        let mut logged = Instant::now();
+        let logged = Instant::now();
 
         for (i, i_header) in headers.iter().enumerate() {
             let header = i_header.as_ref();

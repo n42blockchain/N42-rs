@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::{fmt, error};
+use std::{fmt, error, io};
 use std::time::SystemTime;
 
 use derive_more::{Display, From};
@@ -206,36 +206,36 @@ pub enum Error {
 	/// Error concerning block import.
 	#[display(fmt = "Import error: {}", _0)]
 	Import(ImportError),
-	// /// Io channel queue error
-	// #[display(fmt = "Queue error: {}", _0)]
-	// Queue(QueueError),
-	// /// Io create error
-	// #[display(fmt = "Io error: {}", _0)]
-	// Io(::io::IoError),
+	/// Io channel queue error
+	#[display(fmt = "Queue error: {}", _0)]
+	Queue(QueueError),
+	/// Io create error
+	#[display(fmt = "Io error: {}", _0)]
+	Io(io::Error),
 	/// Error concerning the Rust standard library's IO subsystem.
 	#[display(fmt = "Std Io error: {}", _0)]
-	StdIo(::std::io::Error),
-	// // /// Error concerning TrieDBs.
-	// // #[display(fmt = "Trie error: {}", _0)]
-	// // Trie(TrieError),
-	// /// Error concerning EVM code execution.
-	// #[display(fmt = "Execution error: {}", _0)]
-	// Execution(ExecutionError),
+	StdIo(io::Error),
+	/// Error concerning TrieDBs.
+	#[display(fmt = "Trie error: {}", _0)]
+	Trie(TrieError),
+	/// Error concerning EVM code execution.
+	#[display(fmt = "Execution error: {}", _0)]
+	Execution(ExecutionError),
 	/// Error concerning block processing.
 	#[display(fmt = "Block error: {}", _0)]
 	Block(BlockError),
-	// /// Error concerning transaction processing.
-	// #[display(fmt = "Transaction error: {}", _0)]
-	// Transaction(TransactionError),
+	/// Error concerning transaction processing.
+	#[display(fmt = "Transaction error: {}", _0)]
+	Transaction(TransactionError),
 	/// Snappy error
-	// #[display(fmt = "Snappy error: {}", _0)]
-	// Snappy(InvalidInput),
+	#[display(fmt = "Snappy error: {}", _0)]
+	Snappy(InvalidInput),
 	/// Consensus vote error.
 	#[display(fmt = "Engine error: {}", _0)]
 	Engine(EngineError),
-	// /// Ethkey error."
-	// #[display(fmt = "Ethkey error: {}", _0)]
-	// Ethkey(EthkeyError),
+	/// Ethkey error."
+	#[display(fmt = "Ethkey error: {}", _0)]
+	Ethkey(EthkeyError),
 	/// RLP decoding errors
 	#[display(fmt = "Decoder error: {}", _0)]
 	Decoder(rlp::DecoderError),
@@ -270,7 +270,9 @@ impl error::Error for Error {
 			Error::Ethkey(e) => Some(e),
 			Error::Decoder(e) => Some(e),
 			Error::Snapshot(e) => Some(e),
-			_ => None,
+			Error::Import(e) => Some(e),
+			Error::Queue(e) => Some(e),
+			_ => None
 		}
 	}
 }
@@ -293,6 +295,26 @@ impl<E> From<Box<E>> for Error where Error: From<E> {
 	}
 }
 
+#[derive(Debug)]
+pub enum QueueError{}
+
+#[derive(Debug)]
+pub enum TrieError{}
+
+#[derive(Debug)]
+pub enum ExecutionError{}
+
+#[derive(Debug)]
+pub enum TransactionError{}
+
+#[derive(Debug)]
+pub enum InvalidInput{}
+
+#[derive(Debug)]
+pub enum EthkeyError{}
+
+#[derive(Debug)]
+pub enum SnapshotError{}
 
 /// Voting errors.
 #[derive(Debug)]

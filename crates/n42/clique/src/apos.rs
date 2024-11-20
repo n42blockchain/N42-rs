@@ -1,46 +1,27 @@
-
-use alloy_primitives::{U256, hex, U32, Bloom, BlockNumber, keccak256, B64, B256, Address};
-
+use std::error::Error;
 use std::fmt;
-use std::sync::{Arc, RwLock};
+use std::hash::Hash;
+use std::io::{self, Write, Cursor};
+use std::sync::{Arc, RwLock, mpsc::{Sender, Receiver}};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::collections::HashMap;
 
-use std::error::Error;
-use std::hash::Hash;
-use std::time::Duration;
-use std::time::SystemTime;
-
+use alloy_primitives::{U256, hex, U32, Bloom, BlockNumber, keccak256, B64, B256, Address, Bytes};
 use alloy_genesis::ChainConfig;
-use std::time:: UNIX_EPOCH;
-use std::sync::mpsc::{Sender, Receiver};
-use blst::min_sig::Signature;
-use blst::min_sig::PublicKey as OtherPublicKey;
-
-use std::io::Cursor;
-use std::io::{self, Write};
-
-
-use reth_primitives::{Block, SealedBlock, SealedHeader};
-use tracing::{info, debug, error};
-use n42_primitives::{APosConfig, Snapshot};
-
-use reth_primitives_traits::Header;
-use reth_primitives::public_key_to_address;
-use reth_provider::{BlockReader, ChainSpecProvider, EvmEnvProvider, StateProviderFactory, HeaderProvider};
-
-use secp256k1::{ecdsa, Secp256k1};
-use secp256k1::ecdsa::{PublicKey, Message, RecoverableSignature, RecoveryId, SECP256K1};
-use secp256k1::Error as SecpError;
-use sha2::digest::consts::U2;
-use reth_primitives::bytes::Bytes;
-
 use alloy_rlp::{length_of_length, Decodable, Encodable, MaxEncodedLenAssoc};
+use blst::min_sig::{Signature, PublicKey as OtherPublicKey};
 use bytes::{BufMut, BytesMut};
 use itertools::Itertools;
 use rand::prelude::SliceRandom;
-use rlp::RlpStream;
 use reth_chainspec::ChainSpec;
-
+use reth_primitives::{Block, SealedBlock, SealedHeader, public_key_to_address, bytes::Bytes};
+use reth_primitives_traits::Header;
+use reth_storage_api::{BlockReader, EvmEnvProvider, StateProviderFactory, HeaderProvider};
+use secp256k1::{ecdsa::{PublicKey, Message, RecoverableSignature, RecoveryId, SECP256K1}, Error as SecpError};
+use sha2::digest::consts::U2;
+use tracing::{info, debug, error};
+use n42_primitives::{APosConfig, Snapshot};
+use rlp::RlpStream;
 
 // 配置常量
 const CHECKPOINT_INTERVAL: u64 = 2048; // Number of blocks after which to save the vote snapshot to the database
@@ -410,7 +391,7 @@ where
       
        //If the block is not a checkpoint, vote randomly
         header.beneficiary = Address::default();
-        header.nonce = 0;
+        header.nonce = B64::from(0u64);
 
 
         //Assemble voting snapshots to check which votes are meaningful
@@ -624,7 +605,7 @@ where
 
 
     // SealHash returns the hash of a block prior to it being sealed.
-    pub fn seal_hash(&self, header: &SealedHeader) -> B256 {
+    pub fn seal_hash(&self, header: &Header) -> B256 {
         seal_hash(header)
     }
 
@@ -764,7 +745,7 @@ fn seal_hash(header: &Header) -> B256 {
         timestamp: header.timestamp,
         extra_data: Bytes::new(),
         mix_hash: header.mix_hash,
-        nonce: header.nonce,
+        nonce: u64::from(header.nonce),
         base_fee_per_gas: header.base_fee_per_gas,
     };
 

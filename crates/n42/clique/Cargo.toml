@@ -10,19 +10,15 @@ exclude.workspace = true
 
 [dependencies]
 
-
-
-
-
 unexpected = "0.1"
 
 hash-db = "0.16.0"
 keccak-hash = "0.10.0"
-itertools = "0.13.0"
-derive_more = "0.14.0"
-lazy_static = "1.4" 
+itertools.workspace = true
+derive_more.workspace = true
+lazy_static = "1.4"
 
-parking_lot = "0.7.1"
+parking_lot.workspace = true
 primitive-types = "0.3.0"
 hex-literal = "0.3"
 num-bigint = "0.4"
@@ -60,8 +56,8 @@ reth-testing-utils.workspace = true
 reth-exex-test-utils.workspace = true
 reth-provider.workspace = true
 reth-blockchain-tree.workspace = true
-
-reth-primitives = { workspace = true, default-features = false, features = ["std"] }
+reth-storage-api.workspace=true
+reth-primitives = { workspace = true, default-features = false, features = ["std", "reth-codec", "arbitrary"] }
 reth-consensus.workspace = true
 reth-beacon-consensus.workspace = true
 reth-ethereum-consensus.workspace = true

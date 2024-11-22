@@ -14,14 +14,15 @@ use bytes::{BufMut, BytesMut};
 use itertools::Itertools;
 use rand::prelude::SliceRandom;
 use reth_chainspec::ChainSpec;
-use reth_primitives::{Block, SealedBlock, SealedHeader, public_key_to_address, bytes::Bytes};
-use reth_primitives_traits::Header;
-use reth_storage_api::{BlockReader, EvmEnvProvider, StateProviderFactory, HeaderProvider};
+use reth_primitives::{Block, SealedBlock, SealedHeader, public_key_to_address};
+use reth_primitives_traits::{BlockHeader, Header};
+use reth_provider::{BlockReader, EvmEnvProvider, StateProviderFactory, HeaderProvider, SnapshotProvider};
 use secp256k1::{ecdsa::{PublicKey, Message, RecoverableSignature, RecoveryId, SECP256K1}, Error as SecpError};
 use sha2::digest::consts::U2;
 use tracing::{info, debug, error};
 use n42_primitives::{APosConfig, Snapshot};
 use rlp::RlpStream;
+use reth_engine_primitives::EngineTypes;
 
 // 配置常量
 const CHECKPOINT_INTERVAL: u64 = 2048; // Number of blocks after which to save the vote snapshot to the database
@@ -175,7 +176,7 @@ pub fn recover_address(header: &Header) -> Result<Address, Box<dyn Error>> {
 // Ethereum testnet following the Ropsten attacks.
 pub struct APos<T, Provider>
 where
-    Provider: HeaderProvider + StateProviderFactory + BlockReader + EvmEnvProvider + Clone + Unpin + 'static,
+    Provider: HeaderProvider + StateProviderFactory + BlockReader + EvmEnvProvider + SnapshotProvider + Clone + Unpin + 'static,
 {
 
     config: Arc<APosConfig>,          // Consensus engine configuration parameters
@@ -203,25 +204,24 @@ impl<T, Provider> APos<T, Provider>
 where
     Provider: HeaderProvider + StateProviderFactory + BlockReader + EvmEnvProvider + Clone + Unpin + 'static,
 {
-    pub fn new(
-        	// Set any missing consensus parameters to their defaults
+    pub fn new<E>(
         config: APosConfig,
         chain_config: Arc<ChainConfig>,
-    ) -> Arc<dyn Engine> {
-        
+    ) -> Arc<E>
+    where
+        E: EngineTypes,
+    {
         let mut conf = config.clone();
         if conf.epoch == 0 {
             conf.epoch = EPOCH_LENGTH;
         }
 
-        // GenesisAlloc the snapshot caches and create the engine
-        let recents =schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SNAPSHOTS));
+        let recents = schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SNAPSHOTS));
         let signatures = schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SIGNATURES));
 
-        
         Arc::new(APos {
             config: Arc::new(conf),
-            chain_spec:chain_config,
+            chain_spec: chain_config,
             recents,
             signatures,
             proposals: Arc::new(RwLock::new(HashMap::new())),
@@ -241,23 +241,26 @@ where
         mut parents: Option(Vec<Header>),
     ) -> Result<Snapshot, Box<dyn Error>> {
         let mut headers: Vec<Header> = Vec::new();
-        let mut snap: Snapshot;
+        let mut snap: Option<Snapshot> = None;
 
         while snap.is_none() {
             //Attempt to retrieve a snapshot from memory
             if let Some(cached_snap) = self.recents.get(&hash) {
-                snap = cached_snap.clone();
+                snap = Option::from(cached_snap.clone());
                 break;
             }
 
-           //Attempt to obtain a snapshot from the disk
+            // Attempt to obtain a snapshot from the disk
             if number % CHECKPOINT_INTERVAL == 0 {
-                //Load snapshot using database transaction
-                if let Ok(s) = load_snapshot(&self.config, &self.signatures, &hash) {
+                let timestamp = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("Time went backwards")
+                    .as_secs();
+                if let Ok(Some(s)) = self.provider.load_snapshot(hash.into(), timestamp) {
                     snap = s;
                     break;
                 } else {
-
+                    debug!("Snapshot not found for hash: {}, at number: {}", hash, number);
                 }
             }
 
@@ -281,7 +284,7 @@ where
                     }
             
                    
-                    let new_snapshot = Snapshot::new_snapshot(self.config.clone(),  number, hash, signers,());
+                    // let new_snapshot = Snapshot::new_snapshot(self.config.clone(),  number, hash, signers);
 
                     // new_snapshot.store();
                     info!(
@@ -296,17 +299,22 @@ where
                     
 
             // No snapshot for this header, gather the header and move backward
-            let header = if let Some((ref mut parent_vec,)) = parents{
-                // If we have explicit parents, pick from there (enforced)
-                let Some(header) = parent_vec.pop();
-                if header.hash_slow() != hash || header.number != number {
-                    return Err(AposError::UnknownBlock);
+            let header = if let Some(ref mut parent_vec) = parents {
+                if let Some(header) = parent_vec.pop() {
+                    if header.hash_slow() != hash || header.number != number {
+                        return Err(AposError::UnknownBlock.into());
+                    }
+                    header
+                } else {
+                    return Err(AposError::UnknownBlock.into());
                 }
-                header
             } else {
-                //Without a clear parent node (or no more), retrieve from the database
-                let header = self.provider.header_by_hash_or_number(hash.into())?;
-                Some(header)
+                let header_opt = self.provider.header_by_hash_or_number(hash.into())?;
+                if let Some(header) = header_opt {
+                    header
+                } else {
+                    return Err(AposError::UnknownBlock.into());
+                }
             };
 
             headers.push(header);
@@ -320,12 +328,14 @@ where
             headers.swap(i, headers.len() - 1 - i);
         }
 
-        let snap = snap.apply(&headers)?;
-        self.recents.add(snap.hash, &snap);
+        let snap = snap.apply(headers, |header| {
+            Ok(header.beneficiary)
+        })?;
+        self.recents.insert(snap.hash, &snap);
 
         ///If a new checkpoint snapshot is generated, save it to disk
         if snap.number % CHECKPOINT_INTERVAL == 0 && !headers.is_empty() {
-            save_snapshot(&snap)?;
+            self.provider.save_snapshot(&snap)?;
             debug!(
                 "Stored voting snapshot to disk, number: {}, hash: {}",
                 snap.number,
@@ -560,7 +570,7 @@ where
             .unwrap();
 
         if block.difficulty == DIFF_NO_TURN {
-            let wiggle = Duration::from_millis((snap.signers.len() as u64 / 2 + 1) * WIGGLE_TIME);
+            let wiggle = Duration::from_millis((snap.signers.len() as u64 / 2 + 1) * WIGGLE_TIME.as_millis() as u64);
             let delay_with_wiggle = delay + Duration::from_millis(rand::random::<u64>() % wiggle.as_millis() as u64);
 
             println!(
@@ -575,7 +585,9 @@ where
         // }
 
         // Sign all the things!
-        let sighash = (self.sign_fn)(self.signer, seal_hash(&block.header))?;
+        let mime_type = "application/x-clique-header";
+        let header_bytes = seal_hash(&block.header).as_bytes();
+        let sighash = (self.sign_fn)(self.signer.to_string(), mime_type, header_bytes)?;
 
         block.extra_data[block.extra_data.len() - SIGNATURE_LENGTH..].copy_from_slice(&sighash);
 
@@ -616,17 +628,6 @@ where
 
     // APIs implements consensus.Engine, returning the user facing RPC API to allow
     // controlling the signer voting.
-    pub fn apis(&self, chain: Arc<dyn ChainReader>) -> Vec<OtherAPI> {
-        vec![OtherAPI {
-            namespace: "apos".to_string(),
-            service: Box::new(API {
-                namespace: "apos".to_string(),
-                service: Box::new(self.clone()),
-                authenticated: true,
-            }),
-            authenticated: true
-        }]
-    }
 }
 
 

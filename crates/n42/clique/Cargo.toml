@@ -62,8 +62,7 @@ reth-consensus.workspace = true
 reth-beacon-consensus.workspace = true
 reth-ethereum-consensus.workspace = true
 reth-chainspec.workspace = true
-
-
+reth-engine-primitives.workspace = true
 
 # arbitrary utils
 arbitrary = { workspace = true, features = ["derive"], optional = true }

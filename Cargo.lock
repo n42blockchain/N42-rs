@@ -1757,6 +1757,7 @@ dependencies = [
  "reth-blockchain-tree",
  "reth-chainspec",
  "reth-consensus",
+ "reth-engine-primitives",
  "reth-ethereum-consensus",
  "reth-exex-test-utils",
  "reth-primitives",

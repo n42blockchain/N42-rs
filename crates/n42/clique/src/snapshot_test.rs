@@ -1,34 +1,39 @@
 use secp256k1::{SecretKey, PublicKey, Message,Secp256k1};
-
+use secp256k1::ecdsa;
 use alloy_primitives::{Address,B256,Bytes};
 use alloy_genesis::{ChainConfig, Genesis,CliqueConfig};
 
-
+use crate::traits::Engine;
+use secp256k1::{ecdsa::{Signature}};
 use secp256k1::rand::rngs::OsRng;
 use reth_primitives::{Header,Block};
-use crate::apos::DIFF_IN_TURN;
 
+use crate::apos::{NONCE_AUTH_VOTE,NONCE_DROP_VOTE};
 
-use crate::apos::{NONCE_AUTH_VOTE,NONCE_DROP_VOTE,EXTRA_VANITY};
-
-use std::io::Read;
+use std::default;
+use std::marker::Tuple;
 use std::str::FromStr;
 // use bytes::{Bytes, BytesMut};
 use sha3::{Digest, Keccak256}; // Import the Keccak256 hasher and Digest trait
 use crate::apos::APos;
-use rast_primitives::Snapshot;
-
-use reth_provider::providers::BlockchainProvider;
+use n42_primitives::Snapshot;
+use reth_exex_test_utils::test_exex_context_with_chain_spec;
+use reth_provider::providers::{BlockchainProvider};
 use reth_provider::test_utils::create_test_provider_factory_with_chain_spec;
 use reth_blockchain_tree::noop::NoopBlockchainTree;
 
+// use web3::types::{Address, H256, U256};
+// use web3::transports::Http;
+// use web3::signing::SecretKeyRef;
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::sync::Arc;
-
+use reth_provider::OriginalValuesKnown::No;
+use tracing::dispatcher::set_default;
 use reth_chainspec::ChainSpec;
+use crate::error::Error::Block as BlockError;
 
 pub const EXTRA_SEAL: usize = 65;
-pub const ADDRESS_LENGTH: usize = 20;
 
 
 // TesterAccountPool is a pool to maintain currently active tester accounts
@@ -80,19 +85,12 @@ impl TesterAccountPool {
         let sig_bytes = sig.serialize_compact();
         let extra_len = header.extra_data.len();
 
-        // // Ensure there's enough space for the signature in extra_data
-        // if extra_len < sig_bytes.len() {
-        //     header.extra_data.resize(extra_len + sig_bytes.len(), 0);
-        // }
-
-        let mut extra_data_vec = header.extra_data.to_vec(); 
+        // Ensure there's enough space for the signature in extra_data
         if extra_len < sig_bytes.len() {
-            extra_data_vec.resize(extra_len + sig_bytes.len(), 0); 
+            header.extra_data.resize(extra_len + sig_bytes.len(), 0);
         }
-        extra_data_vec[extra_len - sig_bytes.len()..].copy_from_slice(&sig_bytes); 
-        header.extra_data = Bytes::from(extra_data_vec);
 
-        // header.extra_data[extra_len - sig_bytes.len()..].copy_from_slice(&sig_bytes);
+        header.extra_data[extra_len - sig_bytes.len()..].copy_from_slice(&sig_bytes);
     }
 
 
@@ -104,13 +102,22 @@ impl TesterAccountPool {
 
         auth_addresses.sort_by(|a, b| a.0.cmp(&b.0));
         for (i, address) in auth_addresses.iter().enumerate() {
-            header.extra_data[(EXTRA_VANITY + i * ADDRESS_LENGTH)..(EXTRA_VANITY + (i + 1) * ADDRESS_LENGTH)]
-            .copy_from_slice(address.bytes());
-
+            header.extra_data[i * Address.len()] = address.clone().into();
         }
     }
 
-  
+    // // Compute the hash for the header (equivalent of Go's SealHash function)
+    // fn seal_hash(&self, header: &Header) -> U256 {
+    //     // Normally, SealHash would compute a keccak256 hash of the RLP-encoded
+    //     // block header with some fields excluded (like extra-data signatures).
+    //     // Here, we'll just hash the header's fields for simplicity.
+    //     let mut hash_data = vec![];
+    //     hash_data.extend_from_slice(&header.parent_hash.as_bytes());
+    //     hash_data.extend_from_slice(&header.ommers_hash.as_bytes());
+    //     hash_data.extend_from_slice(&header.beneficiary.as_bytes());
+    //     // You can add more fields as needed.
+    //     U256::from(keccak256(&hash_data))
+    // }
 }
 
 // Compute the hash for the header (equivalent of Go's SealHash function)
@@ -120,9 +127,9 @@ fn seal_hash(header: &Header) -> [u8; 32] {
     // Here, we'll hash the header's fields for simplicity.
 
     let mut hasher = Keccak256::new();
-    hasher.update(header.parent_hash);
-    hasher.update(header.ommers_hash);
-    hasher.update(header.beneficiary);
+    hasher.update(header.parent_hash.as_bytes());
+    hasher.update(header.ommers_hash.as_bytes());
+    hasher.update(header.beneficiary.as_bytes());
     // Add more fields as needed based on your header structure.
 
     let result = hasher.finalize();
@@ -146,7 +153,7 @@ struct TesterVote {
 struct CliqueTest {
     epoch: u64,
     signers: Vec<String>,
-    votes: Vec<TesterVote>,
+    votes: Vec<TesterVote>, 
     results: Vec<String>,
     failure: Option<String>,
 }
@@ -176,17 +183,17 @@ impl CliqueTest {
         for (j, signer) in signers.iter().enumerate() {
             let start = EXTRA_VANITY + j * Address::len_bytes();
             let end = start + Address::len_bytes();
-            genesis.extra_data[start..end].copy_from_slice(signer.as_ref());
+            genesis.extra_data[start..end].copy_from_slice(signer.as_bytes());
         }
 
         let config = ChainConfig {
             clique: Some(CliqueConfig {
-                period: Some(1),
+                period: 1,
                 epoch: Some(self.epoch),
             }),
             ..Default::default()
         };
-        genesis.config = config;
+        genesis.config = Some(config);
 
 
 
@@ -201,7 +208,8 @@ impl CliqueTest {
                 blocks.push(
                     Block{
                         header:Header{
-                            number: i as u64,
+                            parent_hash: genesis.extra_data.clone(),
+                            number: i,
                             nonce: NONCE_AUTH_VOTE,
 
                             ..Default::default()
@@ -218,7 +226,7 @@ impl CliqueTest {
                     Block{
                         header:Header{
                             parent_hash: blocks[i].header.ommers_hash.clone(),
-                            number: i as u64,
+                            number: i,
                             nonce: NONCE_AUTH_VOTE,
 
                             ..Default::default()
@@ -261,9 +269,9 @@ impl CliqueTest {
                 header.parent_hash = B256::from([0u8; 32]); // Replace with actual hash of previous block
             }
 
-            header.extra_data = vec![0; EXTRA_VANITY + EXTRA_SEAL].into();
+            header.extra_data = vec![0; EXTRA_VANITY + EXTRA_SEAL];
             if !vote.checkpoint.is_empty() {
-                header.extra_data = vec![0; EXTRA_VANITY + vote.checkpoint.len() * Address::len_bytes() + EXTRA_SEAL].into();
+                header.extra_data = vec![0; EXTRA_VANITY + vote.checkpoint.len() * Address::len_bytes() + EXTRA_SEAL];
                 accounts.checkpoint(&mut header, &vote.checkpoint);
             }
 
@@ -282,12 +290,12 @@ impl CliqueTest {
 
         let head = blocks[blocks.len()-1].clone();
 
-        let provider_factory = create_test_provider_factory_with_chain_spec(chainspce.into());
+        let provider_factory = create_test_provider_factory_with_chain_spec(chainspce);
 
         let provider =
-            BlockchainProvider::new(provider_factory.clone(), Arc::new(NoopBlockchainTree::default()));
+            BlockchainProvider::new(provider_factory.clone(), Arc::new(NoopBlockchainTree::default()))?;
 
-        let snap = APos::snapshot(provider,head.number, head.ommers_hash, head.parent_hash);
+        let snap = APos::snapshot(provider,head.number, head.ommers_hash, head.parent_hash)?;
 
         let result_signers: Vec<Address> = snap.singer();
 
@@ -303,11 +311,14 @@ impl CliqueTest {
     }
 }
 
+// Constants and other placeholders
+const EXTRA_VANITY: usize = 32; // Placeholder for extra vanity size
+// const EXTRA_SEAL: usize = 65;   // Placeholder for extra seal size
+const DIFF_IN_TURN: B256 = B256::from(1);    // Placeholder difficulty
 
-
-
-
-
+#[cfg(test)]
+mod tests {
+    #[test]
 fn main() {
     let tests = vec![
         CliqueTest {
@@ -315,19 +326,621 @@ fn main() {
             signers: vec!["A".to_string()],
             votes: vec![TesterVote {
                 signer: "A".to_string(),
-                voted: String::new(),
-                auth: false,
+                voted: B.to_string(),
+                auth: true,
                 checkpoint: vec![],
                 newbatch: false,
             }],
             results: vec!["A".to_string()],
             failure: None,
         },
+        CliqueTest {
+            epoch: 0,
+            signers: vec!["A".to_string(),“B”.to_string(),"C".to_string()],
+            votes: vec![TesterVote {
+                signer: "A".to_string(),
+                voted: "C".to_string(),
+                auth: false,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: "C".to_string(),
+                auth: false,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            ],
+            results: vec!["A".to_string(),"B".to_string()],
+            failure: None,
+        },
+
+        CliqueTest {
+            epoch: 0,
+            signers: vec!["A".to_string(),“B”.to_string()],
+            votes: vec![TesterVote {
+                signer: "A".to_string(),
+                voted: "B".to_string(),
+                auth: false,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: "B".to_string(),
+                auth: false,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            ],
+            results: vec!["A".to_string()],
+            failure: None,
+        },
+
+
+        CliqueTest {
+            epoch: 0,
+            signers: vec!["A".to_string(),“B”.to_string()],
+            votes: vec![TesterVote {
+                signer: "A".to_string(),
+                voted: "C".to_string(),
+                auth: true,
+                checkpoint: vec![],
+                newbatch: false,
+            },TesterVote{
+                signer: "B".to_string(),
+                voted: "C".to_string(),
+                auth: true,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote{
+                signer: "A".to_string(),
+                voted: "D".to_string(),
+                auth: true,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote{
+                signer: "B".to_string(),
+                voted: "D".to_string(),
+                auth: true,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote{
+                signer: "A".to_string(),
+                voted: "E".to_string(),
+                auth: true,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote{
+                signer: "B".to_string(),
+                voted: "E".to_string(),
+                auth: true,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            ],
+            results: vec!["A".to_string(),"B".to_string(),"C".to_string(),"D".to_string()],
+            failure: None,
+        },
+
+        CliqueTest {
+            epoch: 0,
+            signers: vec!["A".to_string(),"B".to_string()],
+            votes: vec![TesterVote {
+                signer: "A".to_string(),
+                voted: "C".to_string(),
+                auth: true,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                ..default()
+            },
+            TesterVote {
+                signer: "A".to_string(),
+                voted: "C".to_string(),
+                auth: true,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                ..default()
+            },
+            TesterVote {
+                signer: "A".to_string(),
+                voted: "C".to_string(),
+                auth: true,
+                checkpoint: vec![],
+                newbatch: false,
+            }
+            
+            
+            ],
+            results: vec!["A".to_string(),"B".to_string()],
+            failure: None,
+        },
+
+        CliqueTest {
+            epoch: 0,
+            signers: vec!["A".to_string(),"B".to_string()],
+            votes: vec![TesterVote {
+                signer: "A".to_string(),
+                voted: "C".to_string(),
+                auth: true,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+           
+            TesterVote {
+                signer: "A".to_string(),
+                voted: "D".to_string(),
+                auth: true,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+           
+            TesterVote {
+                signer: "B".to_string(),
+                voted: "C".to_string(),
+                auth: true,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: "D".to_string(),
+                auth: true,
+                checkpoint: vec![],
+                newbatch: false,
+            }
+            
+            ],
+            results: vec!["A".to_string(),"B".to_string(),"C".to_string(),"D".to_string()],
+            failure: None,
+        },
+
+        CliqueTest {
+            epoch: 0,
+            signers: vec!["A".to_string(),"B".to_string()],
+            votes: vec![TesterVote {
+                signer: "A".to_string(),
+                voted: "C".to_string(),
+                auth: true,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+           
+            TesterVote {
+                signer: "A".to_string(),
+                voted: "C".to_string(),
+                auth: true,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+           
+            TesterVote {
+                signer: "A".to_string(),
+                voted: "C".to_string(),
+                auth: true,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+          
+            
+            ],
+            results: vec!["A".to_string(),"B".to_string()],
+            failure: None,
+        },
+
+        CliqueTest {
+            epoch: 0,
+            signers: vec!["A".to_string(),"B".to_string(),"C".to_string(),"D".to_string()],
+            votes: vec![TesterVote {
+                signer: "A".to_string(),
+                voted: "C".to_string(),
+                auth: false,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: vec![],
+                auth: false,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "C".to_string(),
+                voted: vec![],
+                auth: false,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "A".to_string(),
+                voted: "D".to_string(),
+                auth: false,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: "C".to_string(),
+                auth: false,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: "D".to_string(),
+                auth: false,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "C".to_string(),
+                voted: "D".to_string(),
+                auth: false,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: "C".to_string(),
+                auth: ture,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            
+            
+            ],
+            results: vec!["A".to_string(),"B".to_string(),"C".to_string()],
+            failure: None,
+        },
+        CliqueTest {
+            epoch: 0,
+            signers: vec!["A".to_string(),"B".to_string(),"C".to_string(),"D".to_string()],
+            votes: vec![TesterVote {
+                signer: "A".to_string(),
+                voted: "C".to_string(),
+                auth: false,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: vec![],
+                auth: false,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "C".to_string(),
+                voted: vec![],
+                auth: false,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "A".to_string(),
+                voted: "D".to_string(),
+                auth: false,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: "C".to_string(),
+                auth: false,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: "D".to_string(),
+                auth: false,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "C".to_string(),
+                voted: "D".to_string(),
+                auth: false,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "C".to_string(),
+                voted: "C".to_string(),
+                auth: ture,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            
+            
+            ],
+            results: vec!["A".to_string(),"B".to_string()],
+            failure: None,
+        },
+
+        CliqueTest {
+            epoch: 0,
+            signers: vec!["A".to_string(),"B".to_string(),"C".to_string(),"D".to_string()],
+            votes: vec![TesterVote {
+                signer: "A".to_string(),
+                voted: "C".to_string(),
+                auth: false,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "A".to_string(),
+                voted: "D".to_string(),
+                auth: false,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: "C".to_string(),
+                auth: false,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: "D".to_string(),
+                auth: false,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "C".to_string(),
+                voted: "D".to_string(),
+                auth: false,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+
+
+            ],
+            results: vec!["A".to_string(),"B".to_string(),"C".to_string(),],
+            failure: None,
+        },
+
+
+
+        CliqueTest {
+            epoch: 0,
+            signers: vec!["A".to_string(),"B".to_string(),"C".to_string(),"D".to_string(),"E".to_string()],
+            votes: vec![TesterVote {
+                signer: "A".to_string(),
+                voted: "F".to_string(),
+                auth: true,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: "F".to_string(),
+                auth: true,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "C".to_string(),
+                voted: "F".to_string(),
+                auth: true,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "D".to_string(),
+                voted: "F".to_string(),
+                auth: false,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "E".to_string(),
+                voted: "F".to_string(),
+                auth: false,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: "F".to_string(),
+                auth: false,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "C".to_string(),
+                voted: "F".to_string(),
+                auth: false,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "D".to_string(),
+                voted: "F".to_string(),
+                auth: true,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "E".to_string(),
+                voted: "F".to_string(),
+                auth: true,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: "A".to_string(),
+                auth: false,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "C".to_string(),
+                voted: "A".to_string(),
+                auth: false,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "D".to_string(),
+                voted: "A".to_string(),
+                auth: false,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: "F".to_string(),
+                auth: ture,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            
+
+
+            ],
+            results: vec!["B".to_string(),"C".to_string(),"D".to_string(),"E".to_string(),"F".to_string()],
+            failure: None,
+        },
+
+
+
+
+
+
+        CliqueTest {
+            epoch: 3,
+            signers: vec!["A".to_string(),"B".to_string()],
+            votes: vec![TesterVote {
+                signer: "A".to_string(),
+                voted: "C".to_string(),
+                auth: true,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                ..default()
+            },
+            TesterVote {
+                signer: "A".to_string(),
+                voted: vec![],
+                auth: true,
+                checkpoint: vec!["A".to_string(),"B".to_string()],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: "C".to_string(),
+                auth: true,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            
+
+            ],
+            results: vec!["A".to_string(),"B".to_string()],
+            failure: None,
+        },
+        CliqueTest {
+            epoch: 3,
+            signers: vec!["A".to_string(),"B".to_string(),"C".to_string()],
+            votes: vec![TesterVote {
+                signer: "A".to_string(),
+                voted: vec![],
+                auth: true,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: vec![],
+                auth: true,
+                checkpoint: vec![],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "A".to_string(),
+                voted: vec![],
+                auth: true,
+                checkpoint: vec!["A".to_string(),"B".to_string(),"C".to_string()],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: vec![],
+                auth: true,
+                checkpoint: vec![],
+                newbatch: ture,
+            },
+            
+
+            ],
+            results: vec![],
+            failure: "recently signed",
+        },
+
+        CliqueTest {
+            epoch: 0,
+            signers: vec!["A".to_string()],
+            votes: vec![TesterVote {
+                signer: "A".to_string(),
+                voted: vec![],
+                auth: true,
+                checkpoint: vec![],
+                newbatch: false,
+            }],
+            results: vec![],
+            failure: "unauthorized signer",
+        },
+
+        CliqueTest {
+            epoch: 0,
+            signers: vec!["A".to_string(),"B".to_string(),"C".to_string()],
+            votes: vec![TesterVote {
+                signer: "A".to_string(),
+                voted: vec![],
+                auth: true,
+                checkpoint: vec!["A".to_string(),"B".to_string(),"C".to_string()],
+                newbatch: false,
+            },
+            TesterVote {
+                signer: "A".to_string(),
+                voted: vec![],
+                auth: true,
+                checkpoint: vec![],
+                newbatch: true,
+            }
+            
+            ],
+            results: vec![],
+            failure: "unauthorized signer",
+        },
+
+
+
+
         // Add more test cases here...
     ];
 
     for (i, test) in tests.iter().enumerate() {
-        if let e = test.run() {
+        if let Err(e) = test.run() {
             eprintln!("Test {} failed: {:?}", i, e);
         }
     }
@@ -337,4 +950,5 @@ fn main() {
     //     test.run();
     // }
 
+}
 }

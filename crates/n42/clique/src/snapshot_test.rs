@@ -1,32 +1,29 @@
-use secp256k1::{SecretKey, PublicKey, Message, Secp256k1, All};
+use secp256k1::{PublicKey, Message, Secp256k1};
 use alloy_primitives::{Address, B256, Bytes as AlloyBytes, B64, BlockNumber};
 use alloy_genesis::{ChainConfig, Genesis,CliqueConfig};
-
-// use crate::traits::Engine;
 use secp256k1::rand::rngs::OsRng;
 use reth_primitives::{Header,Block};
-
-use crate::apos::{NONCE_AUTH_VOTE,NONCE_DROP_VOTE};
-
-use std::default;
+use crate::apos::{NONCE_AUTH_VOTE};
 use std::str::FromStr;
 use bytes::{BytesMut};
-use sha3::{Digest, Keccak256}; // Import the Keccak256 hasher and Digest trait
+use sha3::{Digest, Keccak256};
 use crate::apos::APos;
-use reth_provider::providers::{BlockchainProvider};
-use reth_provider::test_utils::create_test_provider_factory_with_chain_spec;
+use reth_provider::{
+    test_utils::create_test_provider_factory_with_chain_spec,
+    providers::{BlockchainProvider, StaticFileProvider}, ProviderFactory
+};
 use reth_blockchain_tree::noop::NoopBlockchainTree;
-
-// use web3::types::{Address, H256, U256};
-// use web3::transports::Http;
-// use web3::signing::SecretKeyRef;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::Arc;
-use reth_provider::OriginalValuesKnown::No;
-use tracing::dispatcher::set_default;
 use reth_chainspec::ChainSpec;
-use crate::error::Error::{Block as BlockError, Ethkey};
+use reth_transaction_pool::test_utils::testing_pool;
+use reth_node_ethereum::EthEvmConfig;
+use reth_evm::test_utils::MockExecutorProvider;
+use reth_consensus::test_utils::TestConsensus;
+use reth_db::{test_utils::{create_test_rw_db, create_test_static_files_dir}};
+use reth_db_common::init::init_genesis;
+use reth_network::{config::SecretKey, NetworkConfigBuilder, NetworkManager};
 
 pub const EXTRA_SEAL: usize = 65;
 
@@ -157,8 +154,30 @@ struct CliqueTest {
 
 
 impl CliqueTest {
-    fn run(&self) {
+    async fn run(&self) -> eyre::Result<()> {
         let transaction_pool = testing_pool();
+        let evm_config = EthEvmConfig::new(chain_spec.clone());
+        let executor = MockExecutorProvider::default();
+        let consensus = Arc::new(TestConsensus::default());
+
+        let (static_dir, _) = create_test_static_files_dir();
+        let db = create_test_rw_db();
+        let provider_factory = ProviderFactory::new(
+            db,
+            chain_spec.clone(),
+            StaticFileProvider::read_write(static_dir.into_path()).expect("static file provider"),
+        );
+
+        let genesis_hash = init_genesis(&provider_factory)?;
+        let provider =
+            BlockchainProvider::new(provider_factory.clone(), Arc::new(NoopBlockchainTree::default()))?;
+
+        let network_manager = NetworkManager::new(
+            NetworkConfigBuilder::new(SecretKey::new(&mut rand::thread_rng()))
+                .with_unused_discovery_port()
+                .with_unused_listener_port()
+                .build(provider_factory.clone()),
+        ).await;
         let mut accounts = TesterAccountPool::new();
 
         // Generate the initial set of signers
@@ -184,7 +203,6 @@ impl CliqueTest {
             genesis,
             ..Default::default()
         };
-
 
         let config = ChainConfig {
             clique: Some(CliqueConfig {
@@ -245,10 +263,6 @@ impl CliqueTest {
 
         // Placeholder for blockchain and engine setup
         // Example: let engine = Engine::new(config, ...);
-
-
-
-
 
         // Iterate through the votes and create blocks accordingly
         for (j, vote) in self.votes.iter().enumerate() {
@@ -371,7 +385,6 @@ fn main() {
             results: vec!["A".to_string()],
             failure: None,
         },
-
 
         CliqueTest {
             epoch: 0,
@@ -576,6 +589,7 @@ fn main() {
             results: vec!["A".to_string(),"B".to_string(),"C".to_string()],
             failure: None,
         },
+
         CliqueTest {
             epoch: 0,
             signers: vec!["A".to_string(),"B".to_string(),"C".to_string(),"D".to_string()],
@@ -673,8 +687,6 @@ fn main() {
             failure: None,
         },
 
-
-
         CliqueTest {
             epoch: 0,
             signers: vec!["A".to_string(),"B".to_string(),"C".to_string(),"D".to_string(),"E".to_string()],
@@ -769,18 +781,10 @@ fn main() {
                 checkpoint: vec![],
                 newbatch: false,
             },
-            
-
-
             ],
             results: vec!["B".to_string(),"C".to_string(),"D".to_string(),"E".to_string(),"F".to_string()],
             failure: None,
         },
-
-
-
-
-
 
         CliqueTest {
             epoch: 3,
@@ -799,8 +803,6 @@ fn main() {
                 checkpoint: vec![],
                 newbatch: false,
             },
-            
-
             ],
             results: vec!["A".to_string(),"B".to_string()],
             failure: None,
@@ -842,15 +844,11 @@ fn main() {
             results: vec![],
             failure: Some("unauthorized signer".to_string()),
         },
-
-
-
-
         // Add more test cases here...
     ];
 
     for (i, test) in tests.iter().enumerate() {
-        if let Err(e) = test.run() {
+        if let Err(e) = test.run().await {
             eprintln!("Test {} failed: {:?}", i, e);
         }
     }
@@ -860,5 +858,5 @@ fn main() {
     //     test.run();
     // }
 
-}
+    }
 }

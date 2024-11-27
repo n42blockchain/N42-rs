@@ -1,23 +1,18 @@
-use secp256k1::{SecretKey, PublicKey, Message,Secp256k1};
-use secp256k1::ecdsa;
-use alloy_primitives::{Address,B256,Bytes};
+use secp256k1::{SecretKey, PublicKey, Message, Secp256k1, All};
+use alloy_primitives::{Address, B256, Bytes as AlloyBytes, B64, BlockNumber};
 use alloy_genesis::{ChainConfig, Genesis,CliqueConfig};
 
-use crate::traits::Engine;
-use secp256k1::{ecdsa::{Signature}};
+// use crate::traits::Engine;
 use secp256k1::rand::rngs::OsRng;
 use reth_primitives::{Header,Block};
 
 use crate::apos::{NONCE_AUTH_VOTE,NONCE_DROP_VOTE};
 
 use std::default;
-use std::marker::Tuple;
 use std::str::FromStr;
-// use bytes::{Bytes, BytesMut};
+use bytes::{BytesMut};
 use sha3::{Digest, Keccak256}; // Import the Keccak256 hasher and Digest trait
 use crate::apos::APos;
-use n42_primitives::Snapshot;
-use reth_exex_test_utils::test_exex_context_with_chain_spec;
 use reth_provider::providers::{BlockchainProvider};
 use reth_provider::test_utils::create_test_provider_factory_with_chain_spec;
 use reth_blockchain_tree::noop::NoopBlockchainTree;
@@ -31,7 +26,7 @@ use std::sync::Arc;
 use reth_provider::OriginalValuesKnown::No;
 use tracing::dispatcher::set_default;
 use reth_chainspec::ChainSpec;
-use crate::error::Error::Block as BlockError;
+use crate::error::Error::{Block as BlockError, Ethkey};
 
 pub const EXTRA_SEAL: usize = 65;
 
@@ -87,7 +82,9 @@ impl TesterAccountPool {
 
         // Ensure there's enough space for the signature in extra_data
         if extra_len < sig_bytes.len() {
-            header.extra_data.resize(extra_len + sig_bytes.len(), 0);
+            let mut extra_data_mut = BytesMut::from(&header.extra_data[..]);
+            extra_data_mut.resize((extra_len + sig_bytes.len()), 0);
+            header.extra_data = AlloyBytes::from(extra_data_mut.freeze());
         }
 
         header.extra_data[extra_len - sig_bytes.len()..].copy_from_slice(&sig_bytes);
@@ -161,6 +158,7 @@ struct CliqueTest {
 
 impl CliqueTest {
     fn run(&self) {
+        let transaction_pool = testing_pool();
         let mut accounts = TesterAccountPool::new();
 
         // Generate the initial set of signers
@@ -169,15 +167,9 @@ impl CliqueTest {
 
         // Create the genesis block with only the relevant fields for testing
         let mut genesis = Genesis {
-            base_fee_per_gas:Some(1_000_000_000u128),
-            extra_data: Bytes::from(vec![0u8; 32]),// Initialize with extra data of sufficient size
-            ..Default::default()          // Use the Default trait to fill in other fields with defaults
-        };
-
-        let mut chainspce = ChainSpec{
-            genesis,
-            ..Default::default()
-
+            base_fee_per_gas: Some(1_000_000_000u128),
+            extra_data: AlloyBytes::from(vec![0u8; 32]), // Initialize with extra data of sufficient size
+            ..Default::default() // Use the Default trait to fill in other fields with defaults
         };
 
         for (j, signer) in signers.iter().enumerate() {
@@ -186,48 +178,47 @@ impl CliqueTest {
             genesis.extra_data[start..end].copy_from_slice(signer.as_bytes());
         }
 
+        let extra_data = genesis.extra_data.clone();
+
+        let chainspce = ChainSpec {
+            genesis,
+            ..Default::default()
+        };
+
+
         let config = ChainConfig {
             clique: Some(CliqueConfig {
-                period: 1,
+                period: Some(1u64),
                 epoch: Some(self.epoch),
             }),
             ..Default::default()
         };
-        genesis.config = Some(config);
-
-
+        genesis.config = config;
 
         // let engine = APos::new(None,genesis.config.clique.unwrap());
-
 
         let mut blocks: Vec<Block> = Vec::new();
 
         for mut i in 1..self.votes.len(){
-
-            if i == 1{
+            if i == 1 {
                 blocks.push(
-                    Block{
-                        header:Header{
-                            parent_hash: genesis.extra_data.clone(),
-                            number: i,
-                            nonce: NONCE_AUTH_VOTE,
-
+                    Block {
+                        header: Header {
+                            parent_hash: B256::from_slice(&extra_data),
+                            number: i as BlockNumber,
+                            nonce: B64::from(NONCE_AUTH_VOTE),
                             ..Default::default()
                         },
                         ..Default::default()
-
-                    }
-
-                )
-
-            }
-            else {
+                    },
+                );
+            } else {
                 blocks.push(
                     Block{
                         header:Header{
                             parent_hash: blocks[i].header.ommers_hash.clone(),
-                            number: i,
-                            nonce: NONCE_AUTH_VOTE,
+                            number: i as BlockNumber,
+                            nonce: B64::from(NONCE_AUTH_VOTE),
 
                             ..Default::default()
                         },
@@ -237,8 +228,6 @@ impl CliqueTest {
 
                 )
             }
-
-
         }
 
         //
@@ -269,9 +258,12 @@ impl CliqueTest {
                 header.parent_hash = B256::from([0u8; 32]); // Replace with actual hash of previous block
             }
 
-            header.extra_data = vec![0; EXTRA_VANITY + EXTRA_SEAL];
+            header.extra_data = AlloyBytes::from(vec![0u8; EXTRA_VANITY + EXTRA_SEAL]);
             if !vote.checkpoint.is_empty() {
-                header.extra_data = vec![0; EXTRA_VANITY + vote.checkpoint.len() * Address::len_bytes() + EXTRA_SEAL];
+                header.extra_data = AlloyBytes::from(vec![
+                    0u8;
+                    EXTRA_VANITY + vote.checkpoint.len() * Address::len_bytes() + EXTRA_SEAL
+                ]);
                 accounts.checkpoint(&mut header, &vote.checkpoint);
             }
 
@@ -290,7 +282,7 @@ impl CliqueTest {
 
         let head = blocks[blocks.len()-1].clone();
 
-        let provider_factory = create_test_provider_factory_with_chain_spec(chainspce);
+        let provider_factory = create_test_provider_factory_with_chain_spec(Arc::from(chainspce));
 
         let provider =
             BlockchainProvider::new(provider_factory.clone(), Arc::new(NoopBlockchainTree::default()))?;

@@ -7,10 +7,7 @@ pub use rand::Rng;
 use rand::{
     distributions::uniform::SampleRange, rngs::StdRng, seq::SliceRandom, thread_rng, SeedableRng,
 };
-use reth_primitives::{
-    proofs, sign_message, Account, BlockBody, Header, Log, Receipt, SealedBlock, SealedHeader,
-    StorageEntry, Transaction, TransactionSigned, Withdrawals,
-};
+use reth_primitives::{proofs, sign_message, Account, BlockBody, Header, Log, Receipt, Rewards, SealedBlock, SealedHeader, StorageEntry, Transaction, TransactionSigned, Verifiers, Withdrawals};
 use secp256k1::{Keypair, Secp256k1};
 use std::{
     cmp::{max, min},
@@ -228,6 +225,8 @@ pub fn random_block<R: Rng>(rng: &mut R, number: u64, block_params: BlockParams)
 
     let (header, seal) = sealed.into_parts();
 
+    let verifiers=Some(Verifiers::default());
+    let rewards=Some(Rewards::default());
     SealedBlock {
         header: SealedHeader::new(header, seal),
         body: BlockBody { transactions, ommers, withdrawals: withdrawals.map(Withdrawals::new), verifiers, rewards},

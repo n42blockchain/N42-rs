@@ -192,7 +192,6 @@ where
 
     signer: Address, // Ethereum address of the signing key
     sign_fn: SignerFn,              // Signer function to authorize hashes with
-    lock: Arc<RwLock<()>>,               // Protects the signer and proposals fields
 
     //
     //  Provider,
@@ -208,28 +207,22 @@ where
     ChainSpec: EthChainSpec + EthereumHardforks
 {
     pub fn new(
-        config: APosConfig,
+        provider: Provider,
         chain_spec: Arc<ChainSpec>,
     ) -> Self
     {
-        let mut conf = config.clone();
-        if conf.epoch == 0 {
-            conf.epoch = EPOCH_LENGTH;
-        }
-
         let recents = schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SNAPSHOTS));
         let signatures = schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SIGNATURES));
 
         Self {
-            config: Arc::new(conf),
+            config: Arc::new(APosConfig::default()),
             chain_spec,
             recents,
             signatures,
             proposals: Arc::new(RwLock::new(HashMap::new())),
             signer: Default::default(),
             sign_fn: Default::default(),
-            lock: Arc::new(RwLock::new(())),
-            provider: Default::default(),
+            provider,
         }
     }
 

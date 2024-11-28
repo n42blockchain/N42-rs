@@ -174,6 +174,7 @@ pub fn recover_address(header: &Header) -> Result<Address, Box<dyn Error>> {
 
 // APos is the proof-of-authority consensus engine proposed to support the
 // Ethereum testnet following the Ropsten attacks.
+#[derive(Debug)]
 pub struct APos<Provider, ChainSpec>
 where
     Provider: HeaderProvider + StateProviderFactory + BlockReader + EvmEnvProvider + SnapshotProvider + Clone + Unpin + 'static,
@@ -238,7 +239,7 @@ where
         &mut self,
         mut number: u64,
         mut hash: B256,
-        mut parents: Option(Vec<Header>),
+        mut parents: Option<Vec<Header>>,
     ) -> Result<Snapshot, Box<dyn Error>> {
         let mut headers: Vec<Header> = Vec::new();
         let mut snap: Option<Snapshot> = None;
@@ -380,12 +381,12 @@ where
             }
         }
 
-       ///Ensure that the difficulty corresponds to the signer's round
+       //Ensure that the difficulty corresponds to the signer's round
         let in_turn = snap.inturn(header.number, &signer);
-        if in_turn && header.difficulty != *DIFF_IN_TURN {
+        if in_turn && header.difficulty != DIFF_IN_TURN {
             return Err(AposError::WrongDifficulty.into());
         }
-        if !in_turn && header.difficulty != *DIFF_IN_TURN {
+        if !in_turn && header.difficulty != DIFF_IN_TURN {
             return Err(AposError::WrongDifficulty.into());
         }
 
@@ -752,7 +753,7 @@ fn seal_hash(header: &Header) -> B256 {
 
     // Handle the extra field, excluding the last CRYPTO_SIGNATURE_LENGTH bytes
     if header.extra_data.len() > SIGNATURE_LENGTH {
-        sigHeader.extra_data = Bytes::from(header.extra_data[..header.extra_data.len() - SIGNATURE_LENGTH]);
+        sigHeader.extra_data = Bytes::from(header.extra_data[..header.extra_data.len() - SIGNATURE_LENGTH].to_vec());
     }
 
     keccak256(alloy_rlp::encode(&sigHeader))

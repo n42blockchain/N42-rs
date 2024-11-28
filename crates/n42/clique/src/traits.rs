@@ -1,9 +1,7 @@
 use std::fmt::{Debug, Formatter};
-use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 use reth_consensus::{Consensus, ConsensusError};
-use reth_chainspec::ChainSpec;
-use crate::apos::{AposError,APos,EXTRA_VANITY,NONCE_AUTH_VOTE,NONCE_DROP_VOTE,DIFF_IN_TURN,DIFF_NO_TURN,SIGNATURE_LENGTH};
+use crate::apos::{AposError,APos,EXTRA_VANITY,NONCE_AUTH_VOTE,NONCE_DROP_VOTE,DIFF_IN_TURN,DIFF_NO_TURN};
 use crate::snapshot_test::EXTRA_SEAL;
 use alloy_genesis::ChainConfig;
 use reth_primitives::{
@@ -12,23 +10,25 @@ use reth_primitives::{
 };
 // use alloy_eips::{eip1898::BlockHashOrNumber, eip7685::Requests};
 use alloy_primitives::{U256, BlockHash, hex, U32, Bloom, BlockNumber, keccak256, B64, B256, Address, Bytes};
+use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_evm::provider::EvmEnvProvider;
 use reth_storage_api::{BlockReader, HeaderProvider, SnapshotProvider, StateProviderFactory};
 
-#[derive(Debug)]
-pub struct APosConesense {
-    chain_spec: Arc<ChainSpec>
-}
-
-impl APosConesense {
-    pub const fn new(chain_spec: Arc<ChainSpec>) -> Self {
-        Self { chain_spec }
+impl<Provider, ChainSpec> Debug for APos<Provider, ChainSpec>
+where
+    ChainSpec: EthChainSpec + EthereumHardforks,
+    Provider: 'static + BlockReader + Clone + EvmEnvProvider + HeaderProvider + StateProviderFactory + Unpin,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        todo!()
     }
-
-    
 }
 
-impl Consensus for APosConesense{
+impl<Provider, ChainSpec> Consensus for APos<Provider, ChainSpec>
+where
+    Provider: HeaderProvider + StateProviderFactory + BlockReader + EvmEnvProvider + Clone + Unpin + 'static,
+    ChainSpec: EthChainSpec + EthereumHardforks
+{
 
     fn validate_header(&self,header: &SealedHeader) -> Result<(), ConsensusError>  {
         if header.number == 0 {
@@ -37,9 +37,14 @@ impl Consensus for APosConesense{
         let number = header.number;
     
         // Don't waste time checking blocks from the future
-        let current_time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        if header.timestamp> current_time {
-            return Err(AposError::InvalidTimestamp);
+        let present_timestamp =
+            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+
+        if header.exceeds_allowed_future_timestamp(present_timestamp) {
+            return Err(ConsensusError::TimestampIsInFuture {
+                timestamp: header.timestamp,
+                present_timestamp,
+            })
         }
     
         // Checkpoint blocks need to enforce zero beneficiary
@@ -145,8 +150,8 @@ impl Consensus for APosConesense{
         }
             }Ok(())
         }
-        
-       
+
+
         // fn validate_header_range(&self,headers: &[SealedHeader]) -> Result<(),HeaderConsensusError>{
         // if let Some((initial_header,remaining_headers)) = headers.split_first(){
         //     self.validate_header(initial_header).map_err(|e|HeaderConsensusError(e,initial_header.clone()))? ;

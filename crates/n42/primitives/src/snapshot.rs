@@ -61,7 +61,7 @@ pub struct Tally {
     pub votes: u32,
 }
 /// aposconfig
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, RlpEncodable, RlpDecodable,Arbitrary,Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, RlpEncodable, RlpDecodable,Arbitrary)]
 pub struct APosConfig {
     /// Number of seconds between blocks to enforce
     pub period: u64,
@@ -73,6 +73,18 @@ pub struct APosConfig {
     pub reward_limit: U256,
     /// Deposit contract
     pub deposit_contract: Address,
+}
+
+impl Default for APosConfig {
+    fn default() -> Self {
+        APosConfig {
+            period:8,
+            epoch: 3000,
+            reward_epoch: 10800,
+            reward_limit: U256::from(0x6F05B59D3B20000_u64),
+            deposit_contract: Address::ZERO,
+        }
+    }
 }
 
 /// snapshot

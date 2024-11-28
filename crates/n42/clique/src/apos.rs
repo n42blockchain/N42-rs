@@ -26,6 +26,7 @@ use reth_engine_primitives::EngineTypes;
 
 use reth_rpc_eth_api::helpers::EthSigner;
 use alloy_signer_local::PrivateKeySigner;
+use reth_storage_api::SnapshotProviderWriter;
 
 // 配置常量
 const CHECKPOINT_INTERVAL: u64 = 2048; // Number of blocks after which to save the vote snapshot to the database
@@ -174,7 +175,7 @@ pub fn recover_address(header: &Header) -> Result<Address, Box<dyn Error>> {
 #[derive(Debug)]
 pub struct APos<Provider, ChainSpec>
 where
-    Provider: HeaderProvider + StateProviderFactory + BlockReader + EvmEnvProvider + SnapshotProvider + Clone + Unpin + 'static,
+    Provider: HeaderProvider + SnapshotProvider + SnapshotProviderWriter + Clone + Unpin + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks
 {
 
@@ -191,7 +192,6 @@ where
     //
     eth_signer: Box<dyn EthSigner>,
 
-    //
     //  Provider,
     provider: Provider,
 }
@@ -201,7 +201,7 @@ where
 // signers set to the ones provided by the user.
 impl<Provider, ChainSpec> APos<Provider, ChainSpec>
 where
-    Provider: HeaderProvider + StateProviderFactory + BlockReader + EvmEnvProvider + Clone + Unpin + 'static,
+    Provider: HeaderProvider + SnapshotProvider + SnapshotProviderWriter + Clone + Unpin + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks
 {
     pub fn new(
@@ -224,7 +224,7 @@ where
             recents,
             signatures,
             proposals: Arc::new(RwLock::new(HashMap::new())),
-            signer: Default::default(),
+            signer: address,
             eth_signer: Box::new(EthSigner { addresses, accounts }) as Box<dyn EthSigner>,
             provider,
         }

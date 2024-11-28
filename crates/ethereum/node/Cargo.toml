@@ -11,6 +11,8 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+#n42
+n42-clique.workspace = true
 # reth
 reth-payload-builder.workspace = true
 reth-ethereum-engine-primitives.workspace = true

@@ -9,7 +9,7 @@ paths=$(sed -n '/^\[patch.'"'"'https:\/\/github.com\/paradigmxyz\/reth.git'"'"'\
 # reth路径
 reth_dir="../reth"
 patch_path="./patch"
-base_version="1.1.1"
+base_version="1.1.1v2"
 
 generate_patch() {
     local source=$1

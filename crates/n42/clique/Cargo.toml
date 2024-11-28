@@ -1,5 +1,5 @@
 [package]
-name = "clique"
+name = "n42-clique"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -53,7 +53,7 @@ tracing.workspace = true
 #reth
 reth-primitives-traits.workspace = true
 reth-testing-utils.workspace = true
-reth-exex-test-utils.workspace = true
+#reth-exex-test-utils.workspace = true
 reth-provider.workspace = true
 reth-blockchain-tree.workspace = true
 reth-storage-api.workspace=true
@@ -64,7 +64,7 @@ reth-ethereum-consensus.workspace = true
 reth-chainspec.workspace = true
 reth-engine-primitives.workspace = true
 reth-transaction-pool = { workspace = true, features = ["test-utils"] }
-reth-node-ethereum.workspace = true
+#reth-node-ethereum.workspace = true
 reth-evm = { workspace = true, features = ["test-utils"] }
 reth-db = { workspace = true, features = ["test-utils"] }
 reth-db-common.workspace = true

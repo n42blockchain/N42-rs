@@ -13,7 +13,7 @@ use blst::min_sig::{Signature, PublicKey as OtherPublicKey};
 use bytes::{BufMut, BytesMut};
 use itertools::Itertools;
 use rand::prelude::SliceRandom;
-use reth_chainspec::ChainSpec;
+use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks};
 use reth_primitives::{Block, SealedBlock, SealedHeader, public_key_to_address};
 use reth_primitives_traits::{BlockHeader, Header};
 use reth_provider::{BlockReader, EvmEnvProvider, StateProviderFactory, HeaderProvider, SnapshotProvider};
@@ -174,14 +174,15 @@ pub fn recover_address(header: &Header) -> Result<Address, Box<dyn Error>> {
 
 // APos is the proof-of-authority consensus engine proposed to support the
 // Ethereum testnet following the Ropsten attacks.
-pub struct APos<T, Provider>
+pub struct APos<Provider, ChainSpec>
 where
     Provider: HeaderProvider + StateProviderFactory + BlockReader + EvmEnvProvider + SnapshotProvider + Clone + Unpin + 'static,
+    ChainSpec: EthChainSpec + EthereumHardforks
 {
 
     config: Arc<APosConfig>,          // Consensus engine configuration parameters
     /// Chain spec
-    chain_spec: Arc<ChainConfig>,
+    chain_spec: Arc<ChainSpec>,
 
     recents: schnellru::LruMap<u64, Snapshot>,    // Snapshots for recent block to speed up reorgs
     signatures: schnellru::LruMap<u64, Vec<u8>>,    // Signatures of recent blocks to speed up mining
@@ -200,16 +201,15 @@ where
 
 // New creates a APos proof-of-authority consensus engine with the initial
 // signers set to the ones provided by the user.
-impl<T, Provider> APos<T, Provider>
+impl<Provider, ChainSpec> APos<Provider, ChainSpec>
 where
     Provider: HeaderProvider + StateProviderFactory + BlockReader + EvmEnvProvider + Clone + Unpin + 'static,
+    ChainSpec: EthChainSpec + EthereumHardforks
 {
-    pub fn new<E>(
+    pub fn new(
         config: APosConfig,
-        chain_config: Arc<ChainConfig>,
-    ) -> Arc<E>
-    where
-        E: EngineTypes,
+        chain_spec: Arc<ChainSpec>,
+    ) -> Self
     {
         let mut conf = config.clone();
         if conf.epoch == 0 {
@@ -219,9 +219,9 @@ where
         let recents = schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SNAPSHOTS));
         let signatures = schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SIGNATURES));
 
-        Arc::new(APos {
+        Self {
             config: Arc::new(conf),
-            chain_spec: chain_config,
+            chain_spec,
             recents,
             signatures,
             proposals: Arc::new(RwLock::new(HashMap::new())),
@@ -229,7 +229,7 @@ where
             sign_fn: Default::default(),
             lock: Arc::new(RwLock::new(())),
             provider: Default::default(),
-        })
+        }
     }
 
 
@@ -328,7 +328,7 @@ where
             headers.swap(i, headers.len() - 1 - i);
         }
 
-        let snap = snap.apply(headers, |header| {
+        let snap = snap?.apply(headers, |header| {
             Ok(header.beneficiary)
         })?;
         self.recents.insert(snap.hash, &snap);

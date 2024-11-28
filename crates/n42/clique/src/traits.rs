@@ -1,33 +1,24 @@
-pub const  SIGNATURE_LENGTH :usize = 96;
-pub type Signature = [u8; SIGNATURE_LENGTH];
-
-pub const ADDRESS_LENGTH :usize = 20;
-pub type Address = [u8; ADDRESS_LENGTH];
-pub const HASH_LENGTH :usize = 32;
-pub type Hash = [u8; HASH_LENGTH];
-
-pub const  PUBLIC_KEY_LENGTH :usize = 48;
-pub type PublicKey = [u8; PUBLIC_KEY_LENGTH];
-// Verify 结构体定义
-pub struct Verify {
-    pub address: Address,
-    pub public_key: PublicKey,
-}
-
-use reth_consensus::{Consensus,ConsensusError};
+use std::fmt::{Debug, Formatter};
+use reth_consensus::{Consensus, ConsensusError};
 use crate::apos::{AposError,APos,EXTRA_VANITY,NONCE_AUTH_VOTE,NONCE_DROP_VOTE,DIFF_IN_TURN,DIFF_NO_TURN};
 use crate::snapshot_test::EXTRA_SEAL;
 use alloy_genesis::ChainConfig;
-use reth_primitives::{ SealedBlock, SealedHeader};
-use alloy_consensus::Header;
+use reth_primitives::{
+    proofs, Block, BlockBody, BlockWithSenders, Header, SealedBlock, SealedHeader,
+    TransactionSigned, Withdrawals,
+};
+// use alloy_eips::{eip1898::BlockHashOrNumber, eip7685::Requests};
+use alloy_primitives::{U256, BlockHash, hex, U32, Bloom, BlockNumber, keccak256, B64, B256, Address, Bytes};
+use reth_evm::provider::EvmEnvProvider;
+use reth_storage_api::{BlockReader, HeaderProvider, SnapshotProvider, StateProviderFactory};
 
 
+impl<Provider: HeaderProvider + StateProviderFactory + BlockReader + EvmEnvProvider + SnapshotProvider + Clone + Unpin + 'static> Consensus for APos<Provider>
+{
 
-impl Consensus for APos{
-
-    fn validate_header(&self,header: &SealedHeader) -> Result<(),AposError>  {
+    fn validate_header(&self,header: &SealedHeader) -> Result<(), ConsensusError>  {
         if header.number == 0 {
-            return Err(AposError::UnknownBlock);
+            return Err(ConsensusError::ParentUnknown {});
         }
         let number = header.number;
     
@@ -135,4 +126,4 @@ impl Consensus for APos{
         //     }
         // }Ok(())
         // }
-    }
+}

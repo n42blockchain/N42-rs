@@ -18,7 +18,6 @@ use std::hash::Hash;
 use std::sync::Arc;
 use reth_chainspec::ChainSpec;
 use reth_transaction_pool::test_utils::testing_pool;
-use reth_node_ethereum::EthEvmConfig;
 use reth_evm::test_utils::MockExecutorProvider;
 use reth_consensus::test_utils::TestConsensus;
 use reth_db::{test_utils::{create_test_rw_db, create_test_static_files_dir}};

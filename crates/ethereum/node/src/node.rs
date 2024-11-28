@@ -38,6 +38,8 @@ use reth_trie_db::MerklePatriciaTrie;
 
 use crate::{EthEngineTypes, EthEvmConfig};
 
+use n42_clique::APos;
+
 /// Ethereum primitive types.
 #[derive(Debug)]
 pub struct EthPrimitives;
@@ -335,7 +337,8 @@ where
 
     async fn build_consensus(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::Consensus> {
         if ctx.is_dev() {
-            Ok(Arc::new(AutoSealConsensus::new(ctx.chain_spec())))
+            // Ok(Arc::new(AutoSealConsensus::new(ctx.chain_spec())))
+            Ok(Arc::new(APos::new(ctx.provider().clone(), ctx.chain_spec())))
         } else {
             Ok(Arc::new(EthBeaconConsensus::new(ctx.chain_spec())))
         }

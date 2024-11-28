@@ -215,7 +215,7 @@ alloy-genesis = { path = "./crates/alloy-genesis" }
 [workspace.dependencies]
 # for n42
 n42-primitives = { path = "crates/n42/primitives" }
-clique={path="crates/n42/clique"}
+n42-clique = {path="crates/n42/clique"}
 blst = "0.3.11"
 
 reth = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.1.1" }

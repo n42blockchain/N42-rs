@@ -9,10 +9,9 @@ repository.workspace = true
 exclude.workspace = true
 
 [dependencies]
-n42-clique = { path = "../clique"}
-bytes = "1.8.0"
-sha3 = "0.10.8"
-rand = "0.8.5"
+n42-clique.workspace = true
+bytes.workspace = true
+rand.workspace = true
 secp256k1  = { workspace = true, features = ["recovery"] }
 alloy-primitives.workspace = true
 alloy-genesis.workspace = true

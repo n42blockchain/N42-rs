@@ -1,25 +1,12 @@
 use secp256k1::{PublicKey, Message, Secp256k1};
-use alloy_primitives::{Address, B256, Bytes as AlloyBytes, B64, BlockNumber};
-use alloy_genesis::{ChainConfig, Genesis,CliqueConfig};
+use alloy_primitives::{Address, B256, Bytes as AlloyBytes, Keccak256};
 use secp256k1::rand::rngs::OsRng;
-use reth_primitives::{Header,Block};
+use reth_primitives::{Header};
 use std::str::FromStr;
 use bytes::{BytesMut};
-use sha3::{Digest, Keccak256};
-use reth_provider::{
-    test_utils::create_test_provider_factory_with_chain_spec,
-    providers::{BlockchainProvider, StaticFileProvider}, ProviderFactory
-};
-use reth_blockchain_tree::noop::NoopBlockchainTree;
 use std::collections::HashMap;
 use std::hash::Hash;
-use reth_chainspec::ChainSpec as chain_spec;
-use reth_transaction_pool::test_utils::testing_pool;
-use reth_evm::test_utils::MockExecutorProvider;
-use reth_consensus::test_utils::TestConsensus;
-use reth_db::{test_utils::{create_test_rw_db, create_test_static_files_dir}};
-use reth_db_common::init::init_genesis;
-use reth_network::{config::SecretKey, NetworkConfigBuilder, NetworkManager};
+use reth_network::{config::SecretKey};
 
 pub const EXTRA_VANITY: usize = 32; // Placeholder for extra vanity size
 pub const DIFF_IN_TURN: B256 = B256::from(1);    // Placeholder difficulty

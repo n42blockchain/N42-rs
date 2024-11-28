@@ -1,18 +1,13 @@
-use secp256k1::{PublicKey, Message, Secp256k1};
 use alloy_primitives::{Address, B256, Bytes as AlloyBytes, B64, BlockNumber};
 use alloy_genesis::{ChainConfig, Genesis,CliqueConfig};
-use secp256k1::rand::rngs::OsRng;
 use reth_primitives::{Header,Block};
 use n42_clique::{NONCE_AUTH_VOTE, APos};
-use std::str::FromStr;
-use bytes::{BytesMut};
-use sha3::{Digest, Keccak256};
+
 use reth_provider::{
     test_utils::create_test_provider_factory_with_chain_spec,
     providers::{BlockchainProvider, StaticFileProvider}, ProviderFactory
 };
 use reth_blockchain_tree::noop::NoopBlockchainTree;
-use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::Arc;
 use reth_chainspec::ChainSpec as chain_spec;

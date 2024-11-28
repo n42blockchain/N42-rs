@@ -1,4 +1,4 @@
-use n42_testing_util::{clique_test::{TesterVote, CliqueTest}, snapshot_test_utils};
+use n42_testing_util::{clique_test::{TesterVote, CliqueTest}};
 
 #[test]
 async fn main() {

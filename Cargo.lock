@@ -4731,7 +4731,6 @@ dependencies = [
  "reth-provider",
  "reth-transaction-pool",
  "secp256k1",
- "sha3",
 ]
 
 [[package]]

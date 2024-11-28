@@ -24,6 +24,9 @@ use n42_primitives::{APosConfig, Snapshot};
 use rlp::RlpStream;
 use reth_engine_primitives::EngineTypes;
 
+use reth_rpc_eth_api::helpers::EthSigner;
+use alloy_signer_local::PrivateKeySigner;
+
 // 配置常量
 const CHECKPOINT_INTERVAL: u64 = 2048; // Number of blocks after which to save the vote snapshot to the database
 const INMEMORY_SNAPSHOTS: u32 = 128; // Number of recent vote snapshots to keep in memory
@@ -106,11 +109,6 @@ impl std::fmt::Display for AposError {
 
 impl Error for AposError {}
 
-
-
-pub type SignerFn = fn(signer: String, mime_type: &str, message: &[u8]) -> Result<Vec<u8>, Box<dyn Error>>;
-
-
 #[derive(Debug)]
 pub enum RecoveryError {
     MissingSignature,
@@ -119,7 +117,6 @@ pub enum RecoveryError {
     InvalidSignatureFormat,
     FailedToRecoverPublicKey,
     EcdsaError(SecpError),
-
 }
 
 impl std::fmt::Display for RecoveryError {
@@ -191,7 +188,8 @@ where
     proposals: Arc<RwLock<HashMap<Address, bool>>>,   // Current list of proposals we are pushing
 
     signer: Address, // Ethereum address of the signing key
-    sign_fn: SignerFn,              // Signer function to authorize hashes with
+    //
+    eth_signer: Box<dyn EthSigner>,
 
     //
     //  Provider,
@@ -214,6 +212,12 @@ where
         let recents = schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SNAPSHOTS));
         let signatures = schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SIGNATURES));
 
+        // todo!
+        let sk = PrivateKeySigner::random();
+        let address = sk.address();
+        let addresses = vec![address];
+        let accounts = HashMap::from([(address, sk)]);
+
         Self {
             config: Arc::new(APosConfig::default()),
             chain_spec,
@@ -221,7 +225,7 @@ where
             signatures,
             proposals: Arc::new(RwLock::new(HashMap::new())),
             signer: Default::default(),
-            sign_fn: Default::default(),
+            eth_signer: Box::new(EthSigner { addresses, accounts }) as Box<dyn EthSigner>,
             provider,
         }
     }
@@ -579,9 +583,8 @@ where
         // }
 
         // Sign all the things!
-        let mime_type = "application/x-clique-header";
         let header_bytes = seal_hash(&block.header).as_bytes();
-        let sighash = (self.sign_fn)(self.signer.to_string(), mime_type, header_bytes)?;
+        let sighash = self.eth_signer.sign(self.eth_signer.accounts()[0], header_bytes);
 
         block.extra_data[block.extra_data.len() - SIGNATURE_LENGTH..].copy_from_slice(&sighash);
 

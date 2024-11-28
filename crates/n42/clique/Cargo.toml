@@ -31,6 +31,7 @@ rlp = "0.4"
 alloy-rlp.workspace = true
 alloy-genesis.workspace = true
 alloy-primitives.workspace = true
+alloy-signer-local.workspace = true
 rand.workspace = true
 blst.workspace = true
 secp256k1  = { workspace = true, features = ["recovery"] }
@@ -51,9 +52,9 @@ tracing.workspace = true
 #log = "0.4"
 
 #reth
+reth-rpc-eth-api.workspace = true
 reth-primitives-traits.workspace = true
 reth-testing-utils.workspace = true
-#reth-exex-test-utils.workspace = true
 reth-provider.workspace = true
 reth-blockchain-tree.workspace = true
 reth-storage-api.workspace=true
@@ -64,7 +65,6 @@ reth-ethereum-consensus.workspace = true
 reth-chainspec.workspace = true
 reth-engine-primitives.workspace = true
 reth-transaction-pool = { workspace = true, features = ["test-utils"] }
-#reth-node-ethereum.workspace = true
 reth-evm = { workspace = true, features = ["test-utils"] }
 reth-db = { workspace = true, features = ["test-utils"] }
 reth-db-common.workspace = true

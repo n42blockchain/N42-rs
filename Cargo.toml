@@ -13,6 +13,7 @@ members = [
     "crates/n42/primitives/",
     "crates/n42/clique/",
     "crates/n42/engine/",
+    "crates/n42/n42-testing-util",
     "crates/engine/invalid-block-hooks/",
     "crates/evm/",
     "crates/chainspec/",

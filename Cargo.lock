@@ -4708,6 +4708,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "n42-testing-util"
+version = "1.1.1"
+dependencies = [
+ "alloy-genesis",
+ "alloy-primitives",
+ "bytes",
+ "eyre",
+ "n42-clique",
+ "rand 0.8.5",
+ "reth-blockchain-tree",
+ "reth-chainspec",
+ "reth-consensus",
+ "reth-db",
+ "reth-db-common",
+ "reth-evm",
+ "reth-network",
+ "reth-node-ethereum",
+ "reth-primitives",
+ "reth-provider",
+ "reth-transaction-pool",
+ "secp256k1",
+ "sha3",
+]
+
+[[package]]
 name = "nix"
 version = "0.26.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

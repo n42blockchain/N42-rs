@@ -4,4 +4,4 @@ mod snapshot_test;
 mod error;
 
 mod apos;
-pub use apos::APos;
+pub use apos::*;

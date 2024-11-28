@@ -527,7 +527,7 @@ where
     //     self.sign_fn = Some(sign_fn);
     // }
 
-    async fn seal(
+    pub async fn seal(
         &mut self,
         block: &Block,
     ) -> Result<(), Box<dyn Error>> {

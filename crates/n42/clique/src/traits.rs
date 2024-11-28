@@ -1,6 +1,9 @@
 use std::fmt::{Debug, Formatter};
+use std::sync::Arc;
+use std::time::SystemTime;
 use reth_consensus::{Consensus, ConsensusError};
-use crate::apos::{AposError,APos,EXTRA_VANITY,NONCE_AUTH_VOTE,NONCE_DROP_VOTE,DIFF_IN_TURN,DIFF_NO_TURN};
+use reth_chainspec::ChainSpec;
+use crate::apos::{AposError,APos,EXTRA_VANITY,NONCE_AUTH_VOTE,NONCE_DROP_VOTE,DIFF_IN_TURN,DIFF_NO_TURN,SIGNATURE_LENGTH};
 use crate::snapshot_test::EXTRA_SEAL;
 use alloy_genesis::ChainConfig;
 use reth_primitives::{
@@ -12,13 +15,24 @@ use alloy_primitives::{U256, BlockHash, hex, U32, Bloom, BlockNumber, keccak256,
 use reth_evm::provider::EvmEnvProvider;
 use reth_storage_api::{BlockReader, HeaderProvider, SnapshotProvider, StateProviderFactory};
 
+#[derive(Debug)]
+pub struct APosConesense {
+    chain_spec: Arc<ChainSpec>
+}
 
-impl<Provider: HeaderProvider + StateProviderFactory + BlockReader + EvmEnvProvider + SnapshotProvider + Clone + Unpin + 'static> Consensus for APos<Provider>
-{
+impl APosConesense {
+    pub const fn new(chain_spec: Arc<ChainSpec>) -> Self {
+        Self { chain_spec }
+    }
+
+    
+}
+
+impl Consensus for APosConesense{
 
     fn validate_header(&self,header: &SealedHeader) -> Result<(), ConsensusError>  {
         if header.number == 0 {
-            return Err(ConsensusError::ParentUnknown {});
+            return Err(AposError::UnknownBlock);
         }
         let number = header.number;
     
@@ -53,7 +67,7 @@ impl<Provider: HeaderProvider + StateProviderFactory + BlockReader + EvmEnvProvi
         if !checkpoint && signers_bytes != 0 {
             return Err(AposError::ExtraSigners);
         }
-        if checkpoint && signers_bytes % ADDRESS_LENGTH != 0 {
+        if checkpoint && signers_bytes % SIGNATURE_LENGTH != 0 {
             return Err(AposError::InvalidCheckpointSigners);
         }
          // Ensure that the block's difficulty is meaningful (may not be correct at this point)
@@ -96,13 +110,13 @@ impl<Provider: HeaderProvider + StateProviderFactory + BlockReader + EvmEnvProvi
     
     
     fn validate_header_with_total_difficulty(&self,header: &Header,total_difficulty:U256,) -> Result<(),ConsensusError>  {
-            APos::calc_difficulty(&mut self, header.parent_hash);
+            APos::calc_difficulty(&mut self, header.clone());
             Ok(())
         }
     
     
     fn validate_block_pre_execution(&self,block: &SealedBlock) -> Result<(),ConsensusError>  {
-        APos::snapshot(&mut self,block.number,block.ommers_hash,block.parent_hash);
+        APos::snapshot(&mut self,block.number,block.ommers_hash,Some(block.parent_hash));
         APos::prepare(&mut self, &mut block.header);
         
         Ok(())
@@ -112,6 +126,24 @@ impl<Provider: HeaderProvider + StateProviderFactory + BlockReader + EvmEnvProvi
     fn validate_block_post_execution(&self,block: &BlockWithSenders,input:PostExecutionInput<'_> ,) -> Result<(),ConsensusError>  {
             APos::seal(&mut self,block);
             Ok(())
+        }
+        
+            #[doc = " Validates the given headers"]
+        #[doc = ""]
+        #[doc = " This ensures that the first header is valid on its own and all subsequent headers are valid"]
+        #[doc = " on its own and valid against its parent."]
+        #[doc = ""]
+        #[doc = " Note: this expects that the headers are in natural order (ascending block number)"]
+        fn validate_header_range(&self,headers: &[SealedHeader]) -> Result<(),HeaderConsensusError>{
+            if let Some((initial_header,remaining_headers)) = headers.split_first(){
+        self.validate_header(initial_header).map_err(|e|HeaderConsensusError(e,initial_header.clone()))? ;
+        let mut parent = initial_header;
+        for child in remaining_headers {
+            self.validate_header(child).map_err(|e|HeaderConsensusError(e,child.clone()))? ;
+            self.validate_header_against_parent(child,parent).map_err(|e|HeaderConsensusError(e,child.clone()))? ;
+            parent = child;
+        }
+            }Ok(())
         }
         
        

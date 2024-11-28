@@ -16,13 +16,14 @@ use reth_blockchain_tree::noop::NoopBlockchainTree;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::Arc;
-use reth_chainspec::ChainSpec;
+use reth_chainspec::ChainSpec as chain_spec;
 use reth_transaction_pool::test_utils::testing_pool;
 use reth_evm::test_utils::MockExecutorProvider;
 use reth_consensus::test_utils::TestConsensus;
 use reth_db::{test_utils::{create_test_rw_db, create_test_static_files_dir}};
 use reth_db_common::init::init_genesis;
 use reth_network::{config::SecretKey, NetworkConfigBuilder, NetworkManager};
+
 
 pub const EXTRA_SEAL: usize = 65;
 
@@ -198,7 +199,7 @@ impl CliqueTest {
 
         let extra_data = genesis.extra_data.clone();
 
-        let chainspce = ChainSpec {
+        let chainspce = chain_spec {
             genesis,
             ..Default::default()
         };
@@ -313,6 +314,7 @@ impl CliqueTest {
                 panic!("signer {} mismatch: have {:?}, want {:?}", j, signer, expected_signers[j]);
             }
         }
+        Ok(())
     }
 }
 

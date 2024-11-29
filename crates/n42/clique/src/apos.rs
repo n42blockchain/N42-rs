@@ -173,7 +173,7 @@ where
     /// Chain spec
     chain_spec: Arc<ChainSpec>,
     recents: schnellru::LruMap<B256, Snapshot>,    // Snapshots for recent block to speed up reorgs
-    signatures: schnellru::LruMap<u64, Vec<u8>>,    // Signatures of recent blocks to speed up mining
+    signatures: schnellru::LruMap<B256, Vec<u8>>,    // Signatures of recent blocks to speed up mining
     proposals: Arc<RwLock<HashMap<Address, bool>>>,   // Current list of proposals we are pushing
     signer: Address, // Ethereum address of the signing key
     eth_signer: Box<dyn EthSigner>,
@@ -207,6 +207,7 @@ where
             config: Arc::new(APosConfig::default()),
             chain_spec,
             recents,
+            signatures,
             proposals: Arc::new(RwLock::new(HashMap::new())),
             signer: address,
             eth_signer: Box::new(EthSigner { addresses, accounts }) as Box<dyn EthSigner>,

@@ -761,7 +761,7 @@ where
 
         let header = header.header();
         if header.number == 0 {
-            return Err(ConsensusError::ParentUnknown { hash: header.parent_hash});
+            return Err(ConsensusError::UnknownBlock);
         }
         let number = header.number;
 
@@ -785,39 +785,40 @@ where
 
         // Nonces must be 0x00..0 or 0xff..f, zeroes enforced on checkpoints
         if header.nonce != NONCE_AUTH_VOTE && header.nonce != NONCE_DROP_VOTE {
-            return Err(AposError::InvalidVote);
+            return Err(ConsensusError::InvalidVote);
         }
+
         if checkpoint && header.nonce != NONCE_DROP_VOTE {
-            return Err(AposError::InvalidCheckpointVote);
+            return Err(ConsensusError::InvalidCheckpointVote);
         }
 
         // Check that the extra-data contains both the vanity and signature
         if header.extra_data.len() < EXTRA_VANITY {
-            return Err(AposError::MissingVanity);
+            return Err(ConsensusError::MissingVanity);
         }
+
         if header.extra_data.len() < EXTRA_VANITY + EXTRA_SEAL {
-            return Err(AposError::MissingSignature);
+            return Err(ConsensusError::MissingSignature);
         }
+
         // Ensure that the extra-data contains a signer list on checkpoint, but none otherwise
         let signers_bytes = header.extra_data.len() - EXTRA_VANITY - EXTRA_SEAL;
         if !checkpoint && signers_bytes != 0 {
-            return Err(AposError::ExtraSigners);
+            return Err(ConsensusError::ErrExtraSigners);
         }
-        if checkpoint && signers_bytes % SIGNATURE_LENGTH != 0 {
-            return Err(AposError::InvalidCheckpointSigners);
+
+        //todo
+        if checkpoint && signers_bytes % 20 != 0 {
+            return Err(ConsensusError::InvalidCheckpointSigners);
         }
+
         // Ensure that the block's difficulty is meaningful (may not be correct at this point)
         if number > 0 {
             if header.difficulty.is_zero() ||
                 (header.difficulty != DIFF_IN_TURN && header.difficulty != DIFF_NO_TURN) {
-                return Err(AposError::InvalidDifficulty);
+                return Err(ConsensusError::InvalidDifficulty);
             }
         }
-        //  // Verify that the gas limit is <= 2^63-1
-        // if header.gas_limit > MAX_GAS_LIMIT {
-        //     return Err(format!("Invalid gasLimit: have {}, max {}", header.gas_limit, MAX_GAS_LIMIT).into());
-        // }
-
         Ok(())
 
     }

@@ -389,6 +389,43 @@ pub enum ConsensusError {
         /// The block's timestamp.
         timestamp: u64,
     },
+    // for N42
+    #[display(
+        "unknown block"
+    )]
+    UnknownBlock,
+    #[display(
+        "beneficiary in checkpoint block non-zero"
+    )]
+    InvalidCheckpointBeneficiary,
+    #[display(
+        "vote nonce not 0x00..0 or 0xff..f"
+    )]
+    InvalidVote,
+    #[display(
+        "vote nonce in checkpoint block non-zero"
+    )]
+    InvalidCheckpointVote,
+    #[display(
+        "extra-data 32 byte vanity prefix missing"
+    )]
+    MissingVanity,
+    #[display(
+        "extra-data 65 byte signature suffix missing"
+    )]
+    MissingSignature,
+    #[display(
+        "non-checkpoint block contains extra signer list"
+    )]
+    ErrExtraSigners,
+    #[display(
+        "invalid signer list on checkpoint block"
+    )]
+    InvalidCheckpointSigners,
+    #[display(
+        "invalid difficulty"
+    )]
+    InvalidDifficulty,
 }
 
 impl ConsensusError {

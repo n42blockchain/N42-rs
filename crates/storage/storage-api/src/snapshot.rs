@@ -6,7 +6,7 @@ use n42_primitives::Snapshot;
 /// ly
 pub trait SnapshotProvider{
     /// get snapshot by block id
-    fn load_snapshot(&self, id: BlockHashOrNumber, timestamp: u64) -> ProviderResult<Option<Snapshot>>;
+    fn load_snapshot(&self, id: BlockHashOrNumber) -> ProviderResult<Option<Snapshot>>;
 }
 
 pub trait SnapshotProviderWriter{

@@ -6,7 +6,7 @@ use std::sync::{Arc, RwLock, mpsc::{Sender, Receiver}};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::collections::HashMap;
 
-use alloy_primitives::{U256, hex, U32, Bloom, BlockNumber, keccak256, B64, B256, Address, Bytes};
+use alloy_primitives::{U256, hex, U32, Bloom, BlockNumber, keccak256, B64, B256, Address, Bytes, BlockHash};
 use alloy_genesis::ChainConfig;
 use alloy_rlp::{length_of_length, Decodable, Encodable, MaxEncodedLenAssoc};
 use blst::min_sig::{Signature, PublicKey as OtherPublicKey};
@@ -144,13 +144,6 @@ impl std::error::Error for RecoveryError {}
 
 // recover_address extracts the Ethereum account address from a signed header.
 pub fn recover_address(header: &Header) -> Result<Address, Box<dyn Error>> {
-    // If the signature's already cached, return that
-    // let hash = header.hash_slow();
-    // sigcache: &mut schnellru::LruMap<B256, Address>
-    // if let Some(address) = sigcache.get(&hash) {
-    //     return Ok(*address);
-    // }
-
     // Retrieve the signature from the header extra-data
     if header.extra_data.len() < SIGNATURE_LENGTH {
         return Err(Box::new(RecoveryError::MissingSignature));
@@ -165,33 +158,25 @@ pub fn recover_address(header: &Header) -> Result<Address, Box<dyn Error>> {
         RecoveryId::from_i32(signature[64] as i32)?,
     )?;
 
-
     Ok(public_key_to_address(SECP256K1.recover_ecdsa(&message, &signature)?))
 }
 
 
 // APos is the proof-of-authority consensus engine proposed to support the
 // Ethereum testnet following the Ropsten attacks.
-#[derive(Debug)]
 pub struct APos<Provider, ChainSpec>
 where
     Provider: HeaderProvider + SnapshotProvider + SnapshotProviderWriter + Clone + Unpin + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks
 {
-
     config: Arc<APosConfig>,          // Consensus engine configuration parameters
     /// Chain spec
     chain_spec: Arc<ChainSpec>,
-
-    recents: schnellru::LruMap<u64, Snapshot>,    // Snapshots for recent block to speed up reorgs
+    recents: schnellru::LruMap<B256, Snapshot>,    // Snapshots for recent block to speed up reorgs
     signatures: schnellru::LruMap<u64, Vec<u8>>,    // Signatures of recent blocks to speed up mining
-
     proposals: Arc<RwLock<HashMap<Address, bool>>>,   // Current list of proposals we are pushing
-
     signer: Address, // Ethereum address of the signing key
-    //
     eth_signer: Box<dyn EthSigner>,
-
     //  Provider,
     provider: Provider,
 }
@@ -222,7 +207,6 @@ where
             config: Arc::new(APosConfig::default()),
             chain_spec,
             recents,
-            signatures,
             proposals: Arc::new(RwLock::new(HashMap::new())),
             signer: address,
             eth_signer: Box::new(EthSigner { addresses, accounts }) as Box<dyn EthSigner>,
@@ -234,9 +218,9 @@ where
     /// snapshot retrieves the authorization snapshot at a given point in time.
     pub async fn snapshot(
         &mut self,
-        mut number: u64,
-        mut hash: B256,
-        mut parents: Option<Vec<Header>>,
+        number: u64,
+        hash: B256,
+        parents: Option<Vec<Header>>,
     ) -> Result<Snapshot, Box<dyn Error>> {
         let mut headers: Vec<Header> = Vec::new();
         let mut snap: Option<Snapshot> = None;
@@ -244,18 +228,14 @@ where
         while snap.is_none() {
             //Attempt to retrieve a snapshot from memory
             if let Some(cached_snap) = self.recents.get(&hash) {
-                snap = Option::from(cached_snap.clone());
+                snap = Some(cached_snap.clone());
                 break;
             }
 
             // Attempt to obtain a snapshot from the disk
             if number % CHECKPOINT_INTERVAL == 0 {
-                let timestamp = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .expect("Time went backwards")
-                    .as_secs();
-                if let Ok(Some(s)) = self.provider.load_snapshot(hash.into(), timestamp) {
-                    snap = s;
+                if let Ok(Some(s)) = self.provider.load_snapshot(hash.into()) {
+                    snap = Some(s);
                     break;
                 } else {
                     debug!("Snapshot not found for hash: {}, at number: {}", hash, number);

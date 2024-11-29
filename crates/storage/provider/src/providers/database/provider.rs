@@ -2072,7 +2072,7 @@ impl<TX: DbTx, N: NodeTypes<ChainSpec: EthereumHardforks>> RewardsProvider for D
 }
 
 impl<TX: DbTx, N: NodeTypes<ChainSpec: EthereumHardforks>> SnapshotProvider for DatabaseProvider<TX, N>{
-    fn load_snapshot(&self, id: BlockHashOrNumber, timestamp: u64) -> ProviderResult<Option<Snapshot>> {
+    fn load_snapshot(&self, id: BlockHashOrNumber) -> ProviderResult<Option<Snapshot>> {
         if let Some(number)=self.convert_hash_or_number(id)?{
             let snapshot=self.tx.get::<tables::Snapshots>(number)?.unwrap_or_default();
             return Ok(Some(snapshot))

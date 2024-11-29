@@ -14,7 +14,7 @@ use bytes::{BufMut, BytesMut};
 use itertools::Itertools;
 use rand::prelude::SliceRandom;
 use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks};
-use reth_primitives::{Block, SealedBlock, SealedHeader, public_key_to_address};
+use reth_primitives::{Block, SealedBlock, SealedHeader, BlockWithSenders, public_key_to_address};
 use reth_primitives_traits::{BlockHeader, Header};
 use reth_provider::{BlockReader, EvmEnvProvider, StateProviderFactory, HeaderProvider, SnapshotProvider};
 use secp256k1::{ecdsa::{PublicKey, Message, RecoverableSignature, RecoveryId, SECP256K1}, Error as SecpError};
@@ -26,7 +26,8 @@ use reth_engine_primitives::EngineTypes;
 
 use reth_rpc_eth_api::helpers::EthSigner;
 use alloy_signer_local::PrivateKeySigner;
-use reth_consensus::{Consensus, ConsensusError};
+use reth_consensus::{PostExecutionInput, Consensus, ConsensusError, HeaderConsensusError};
+use reth_rpc::eth::DevSigner;
 use reth_storage_api::SnapshotProviderWriter;
 
 // 配置常量
@@ -200,19 +201,15 @@ where
         let signatures = schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SIGNATURES));
 
         // todo!
-        let sk = PrivateKeySigner::random();
-        let address = sk.address();
-        let addresses = vec![address];
-        let accounts = HashMap::from([(address, sk)]);
-
+        let eth_signer = DevSigner::random();
         Self {
             config: Arc::new(APosConfig::default()),
             chain_spec,
             recents,
             signatures,
             proposals: Arc::new(RwLock::new(HashMap::new())),
-            signer: address,
-            eth_signer: Box::new(EthSigner { addresses, accounts }) as Box<dyn EthSigner>,
+            signer: eth_signer.accounts()[0],
+            eth_signer,
             provider,
         }
     }
@@ -225,8 +222,11 @@ where
         hash: B256,
         parents: Option<Vec<Header>>,
     ) -> Result<Snapshot, Box<dyn Error>> {
+
         let mut headers: Vec<Header> = Vec::new();
         let mut snap: Option<Snapshot> = None;
+        let mut hash = hash.clone();
+        let mut number = number;
 
         while snap.is_none() {
             //Attempt to retrieve a snapshot from memory
@@ -298,9 +298,10 @@ where
                 }
             };
 
+            hash = header.parent_hash.clone();
             headers.push(header);
             number -= 1;
-            hash = header.parent_hash.clone();
+
         }
 
         //Find the previous snapshot and apply any pending headers to it
@@ -312,11 +313,11 @@ where
         let snap = snap?.apply(headers, |header| {
             Ok(header.beneficiary)
         })?;
-        self.recents.insert(snap.hash, &snap);
+        self.recents.insert(snap.hash, snap.clone());
 
         ///If a new checkpoint snapshot is generated, save it to disk
         if snap.number % CHECKPOINT_INTERVAL == 0 && !headers.is_empty() {
-            self.provider.save_snapshot(&snap)?;
+            self.provider.save_snapshot(snap.number, snap.clone())?;
             debug!(
                 "Stored voting snapshot to disk, number: {}, hash: {}",
                 snap.number,
@@ -394,7 +395,7 @@ where
                 .filter(|(address, &authorize)| self.valid_vote(address, authorize))
                 .map(|(address, _)| *address)
                 .collect();
-            
+
             //If there are proposals to be voted on, proceed with the vote
             if !addresses.is_empty() {
                 // let mut rng = ;
@@ -435,7 +436,7 @@ where
 
         header.mix_hash = Default::default();
 
-      
+
         // Ensure the timestamp has the correct delay
         let parent = self.provider.header(&header.parent_hash)?.ok_or(Err("unknown ancestor".into()))?;
 
@@ -757,8 +758,10 @@ where
 {
 
     fn validate_header(&self,header: &SealedHeader) -> Result<(), ConsensusError>  {
+
+        let header = header.header();
         if header.number == 0 {
-            return Err(AposError::UnknownBlock);
+            return Err(ConsensusError::ParentUnknown { hash: header.parent_hash});
         }
         let number = header.number;
 
@@ -766,7 +769,7 @@ where
         let present_timestamp =
             SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
 
-        if header.exceeds_allowed_future_timestamp(present_timestamp) {
+        if header.timestamp > present_timestamp {
             return Err(ConsensusError::TimestampIsInFuture {
                 timestamp: header.timestamp,
                 present_timestamp,
@@ -775,9 +778,11 @@ where
 
         // Checkpoint blocks need to enforce zero beneficiary
         let checkpoint = (number % self.config.epoch) == 0;
-        if checkpoint  {
-            return Err(AposError::InvalidCheckpointBeneficiary);
+        if checkpoint && header.beneficiary != Address::ZERO {
+            return Err(ConsensusError::InvalidCheckpointBeneficiary);
         }
+
+
         // Nonces must be 0x00..0 or 0xff..f, zeroes enforced on checkpoints
         if header.nonce != NONCE_AUTH_VOTE && header.nonce != NONCE_DROP_VOTE {
             return Err(AposError::InvalidVote);
@@ -847,33 +852,20 @@ where
     #[doc = ""]
     #[doc = " Note: this expects that the headers are in natural order (ascending block number)"]
     fn validate_header_range(&self,headers: &[SealedHeader]) -> Result<(),HeaderConsensusError>{
-        if let Some((initial_header,remaining_headers)) = headers.split_first(){
-            self.validate_header(initial_header).map_err(|e|HeaderConsensusError(e,initial_header.clone()))? ;
-            let mut parent = initial_header;
-            for child in remaining_headers {
-                self.validate_header(child).map_err(|e|HeaderConsensusError(e,child.clone()))? ;
-                self.validate_header_against_parent(child,parent).map_err(|e|HeaderConsensusError(e,child.clone()))? ;
-                parent = child;
-            }
-        }Ok(())
+        Ok(())
     }
 
 
     fn validate_header_with_total_difficulty(&self,header: &Header,total_difficulty:U256,) -> Result<(),ConsensusError>  {
-        self.calc_difficulty(&mut self, header.clone());
         Ok(())
     }
 
 
     fn validate_block_pre_execution(&self,block: &SealedBlock) -> Result<(),ConsensusError>  {
-        self.snapshot(&mut self,block.number,block.ommers_hash,Some(block.parent_hash));
-        self.prepare(&mut self, &mut block.header);
-
         Ok(())
     }
 
     fn validate_block_post_execution(&self,block: &BlockWithSenders,input:PostExecutionInput<'_> ,) -> Result<(),ConsensusError>  {
-        APos::seal(&mut self,block);
         Ok(())
     }
 }

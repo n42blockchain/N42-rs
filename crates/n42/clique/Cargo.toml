@@ -52,6 +52,7 @@ tracing.workspace = true
 #log = "0.4"
 
 #reth
+reth-rpc.workspace = true
 reth-rpc-eth-api.workspace = true
 reth-primitives-traits.workspace = true
 reth-testing-utils.workspace = true

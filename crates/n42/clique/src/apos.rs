@@ -7,24 +7,27 @@ use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use alloy_primitives::{U256, hex, Bloom, BlockNumber, keccak256, B64, B256, Address, Bytes};
 use alloy_rlp::{length_of_length, Decodable, Encodable, MaxEncodedLenAssoc};
-use bytes::{BufMut};
+// use blst::min_sig::{Signature, PublicKey as OtherPublicKey};
+use bytes::{BufMut, BytesMut};
 use itertools::Itertools;
 use rand::prelude::SliceRandom;
 use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks};
 use reth_primitives::{Block, SealedBlock, SealedHeader, BlockWithSenders, public_key_to_address};
 use reth_primitives_traits::{BlockHeader, Header};
 use reth_provider::{BlockReader, EvmEnvProvider, StateProviderFactory, HeaderProvider, SnapshotProvider};
-use secp256k1::{ecdsa::{RecoverableSignature, RecoveryId}, Error as SecpError, Message, SECP256K1};
+use secp256k1::{PublicKey, Message, SECP256K1, Error as SecpError, ecdsa::{RecoverableSignature, RecoveryId}};
+use sha2::digest::consts::U2;
 use tracing::{info, debug, error};
 use n42_primitives::{APosConfig, Snapshot};
 use reth_engine_primitives::EngineTypes;
-use once_cell::sync::Lazy;
+
 use reth_rpc_eth_api::helpers::EthSigner;
+use alloy_signer_local::PrivateKeySigner;
 use reth_consensus::{PostExecutionInput, Consensus, ConsensusError, HeaderConsensusError};
 use reth_rpc::eth::DevSigner;
 use reth_storage_api::SnapshotProviderWriter;
 
-// 配置常量
+//
 const CHECKPOINT_INTERVAL: u64 = 2048; // Number of blocks after which to save the vote snapshot to the database
 const INMEMORY_SNAPSHOTS: u32 = 128; // Number of recent vote snapshots to keep in memory
 const INMEMORY_SIGNATURES: u32 = 4096; // Number of recent block signatures to keep in memory
@@ -45,12 +48,10 @@ pub const EXTRA_SEAL: usize = 65;
 pub const NONCE_AUTH_VOTE: [u8; 8] = hex!("ffffffffffffffff"); // Magic nonce number to vote on adding a new signer
 pub const NONCE_DROP_VOTE: [u8; 8] = hex!("0000000000000000"); // Magic nonce number to vote on removing a signer
 // Difficulty constants
-static DIFF_IN_TURN: Lazy<U256> = Lazy::new(|| U256::from(2));
-static DIFF_NO_TURN: Lazy<U256> = Lazy::new(|| U256::from(1));
+pub const DIFF_IN_TURN: U256 = U256::from_limbs([2u64, 0, 0, 0]);  // Block difficulty for in-turn signatures
+pub const DIFF_NO_TURN: U256 = U256::from_limbs([1u64, 0, 0, 0]);  // Block difficulty for out-of-turn signatures
 
 pub const FULL_IMMUTABILITY_THRESHOLD: usize= 90000;
-
-pub type BlockNonce = [u8; 8];
 
 
 
@@ -148,7 +149,7 @@ pub fn recover_address(header: &Header) -> Result<Address, Box<dyn Error>> {
     let signature = &header.extra_data[header.extra_data.len() - SIGNATURE_LENGTH..];
 
     // Recover the public key and the Ethereum address
-    let message = Message::from(seal_hash(header));
+    let message = Message::from_digest(seal_hash(header).into());
 
     let signature = RecoverableSignature::from_compact(
         &signature[..64],
@@ -210,7 +211,7 @@ where
 
 
     /// snapshot retrieves the authorization snapshot at a given point in time.
-    pub async fn snapshot(
+    pub fn snapshot(
         &mut self,
         number: u64,
         hash: B256,
@@ -221,6 +222,7 @@ where
         let mut snap: Option<Snapshot> = None;
         let mut hash = hash.clone();
         let mut number = number;
+        let mut parents = parents.clone();
 
         while snap.is_none() {
             //Attempt to retrieve a snapshot from memory
@@ -260,7 +262,6 @@ where
             
                    
                     // let new_snapshot = Snapshot::new_snapshot(self.config.clone(),  number, hash, signers);
-
                     // new_snapshot.store();
                     info!(
                         "Stored checkpoint snapshot to disk, number: {}, hash: {}",
@@ -299,18 +300,20 @@ where
         }
 
         //Find the previous snapshot and apply any pending headers to it
-        let half_len = headers.len() / 2;
+        let headers_len = headers.len();
+        let half_len = headers_len / 2;
         for i in 0..half_len {
             headers.swap(i, headers.len() - 1 - i);
         }
 
-        let snap = snap?.apply(headers, |header| {
+        let snap = snap.unwrap().apply(headers, |header| {
             Ok(header.beneficiary)
-        })?;
+        }).map_err(|_| AposError::WrongDifficulty)?;
+
         self.recents.insert(snap.hash, snap.clone());
 
         ///If a new checkpoint snapshot is generated, save it to disk
-        if snap.number % CHECKPOINT_INTERVAL == 0 && !headers.is_empty() {
+        if snap.number % CHECKPOINT_INTERVAL == 0 && !headers_len == 0 {
             self.provider.save_snapshot(snap.number, snap.clone())?;
             debug!(
                 "Stored voting snapshot to disk, number: {}, hash: {}",
@@ -358,10 +361,10 @@ where
 
        //Ensure that the difficulty corresponds to the signer's round
         let in_turn = snap.inturn(header.number, &signer);
-        if in_turn && header.difficulty != *DIFF_IN_TURN {
+        if in_turn && header.difficulty != DIFF_IN_TURN {
             return Err(AposError::WrongDifficulty.into());
         }
-        if !in_turn && header.difficulty != *DIFF_IN_TURN {
+        if !in_turn && header.difficulty != DIFF_IN_TURN {
             return Err(AposError::WrongDifficulty.into());
         }
 
@@ -370,7 +373,7 @@ where
 
     /// Prepare implements consensus.Engine, preparing all the consensus fields of the
     /// header for running the transactions on top.
-    pub async fn prepare(
+    pub fn prepare(
         &mut self,
         header: &mut Header,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -381,25 +384,24 @@ where
 
 
         //Assemble voting snapshots to check which votes are meaningful
-        let snap = self.snapshot(header.number - 1, header.parent_hash, None).await.unwrap();
+        let snap = self.snapshot(header.number - 1, header.parent_hash, None)?;
 
         if header.number %self.config.epoch != 0 {
             //Collect all proposals to be voted on
-            let mut addresses: Vec<Address> = self.proposals.iter()
-                .filter(|(address, &authorize)| self.valid_vote(address, authorize))
+            let proposals_lock = self.proposals.read().unwrap();
+            let mut addresses: Vec<Address> = proposals_lock.iter()
+                .filter(|(&address, &authorize)| snap.valid_vote(address, authorize))
                 .map(|(address, _)| *address)
                 .collect();
 
             //If there are proposals to be voted on, proceed with the vote
             if !addresses.is_empty() {
-                // let mut rng = ;
-                header.beneficiary = addresses.choose(&mut rand::thread_rng());
-
-                if let Some(&authorize) = self.proposals.get(header.beneficiary) {
+                header.beneficiary = addresses.choose(&mut rand::thread_rng()).unwrap().clone();
+                if let Some(&authorize) = proposals_lock.get(&header.beneficiary) {
                     if authorize {
-                        header.nonce = NONCE_AUTH_VOTE.clone();
+                        header.nonce = NONCE_AUTH_VOTE.clone().into();
                     } else {
-                        header.nonce = NONCE_DROP_VOTE.clone();
+                        header.nonce = NONCE_DROP_VOTE.clone().into();
                     }
                 }
             }
@@ -409,33 +411,27 @@ where
         let signer = self.signer.clone();
 
         //Set the correct difficulty level
-        header.difficulty = calc_difficulty(&snap, signer);
+        header.difficulty = calc_difficulty(&snap, &signer);
 
+        let mut extra_data_mut = BytesMut::from(&header.extra_data[..]);
         //Ensure that the additional data has all its components
-        if header.extra_data.len() < EXTRA_VANITY {
-            header.extra_data.extend(vec![0x00; EXTRA_VANITY - header.extra_data.len()]);
-        }
-        header.extra_data.truncate(EXTRA_VANITY);
+        extra_data_mut.resize(EXTRA_VANITY, 0x00);
 
         if header.number % self.config.epoch == 0 {
-            let mut extra_data: Vec<u8> = header.extra_data.to_vec();
             for signer in snap.signers {
-                header.extra_data.extend(&signer.0);
+                extra_data_mut.extend(signer.iter());
             }
-            header.extra_data = extra_data.into();
-
         }
-        header.extra_data.extend(vec![0x00; SIGNATURE_LENGTH]);
-
+        extra_data_mut.resize(extra_data_mut.len() + SIGNATURE_LENGTH, 0x00);
+        header.extra_data = Bytes::from(extra_data_mut.freeze());
 
         header.mix_hash = Default::default();
 
-
         // Ensure the timestamp has the correct delay
-        let parent = self.provider.header(&header.parent_hash)?.ok_or(Err("unknown ancestor".into()))?;
-
-        let parent_time = parent.timestamp;
-        header.timestamp = parent_time + self.config.period;
+        if let Ok(Some(parent)) = self.provider.header_by_hash_or_number(header.parent_hash.into()) {
+            let parent_time = parent.timestamp;
+            header.timestamp = parent_time + self.config.period;
+        }
 
         if header.timestamp < (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + MERGE_SIGN_MIN_TIME) {
             header.timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + MERGE_SIGN_MIN_TIME;
@@ -503,7 +499,7 @@ where
     //     self.sign_fn = Some(sign_fn);
     // }
 
-    pub async fn seal(
+    pub fn seal(
         &mut self,
         block: &Block,
     ) -> Result<(), Box<dyn Error>> {
@@ -515,13 +511,13 @@ where
         }
 
         // For 0-period chains, refuse to seal empty blocks (no reward but would spin sealing)
-        if self.config.period == 0 && block.body.is_empty() {
+        if self.config.period == 0 && block.body.transactions.is_empty() {
             return Err(AposError::UnTransion.into());
         }
 
 
         // Bail out if we're unauthorized to sign a block
-        let snap = self.snapshot(block.number - 1, block.parent_hash.clone(), None).await?;
+        let snap = self.snapshot(block.number - 1, block.parent_hash.clone(), None)?;
         if !snap.signers.contains(&self.signer) {
             error!(target: "consensus::engine", "err signer: {}", self.signer);
             return Err(AposError::UnauthorizedSigner.into())
@@ -545,7 +541,7 @@ where
             .duration_since(SystemTime::now())
             .unwrap();
 
-        if block.difficulty == *DIFF_NO_TURN {
+        if block.difficulty == DIFF_NO_TURN {
             let wiggle = Duration::from_millis((snap.signers.len() as u64 / 2 + 1) * WIGGLE_TIME.as_millis() as u64);
             let delay_with_wiggle = delay + Duration::from_millis(rand::random::<u64>() % wiggle.as_millis() as u64);
 
@@ -561,10 +557,13 @@ where
         // }
 
         // Sign all the things!
-        let header_bytes = seal_hash(&block.header).as_bytes();
-        let sighash = self.eth_signer.sign(self.eth_signer.accounts()[0], header_bytes);
+        let header_bytes = seal_hash(&block.header);
+        let sighash = self.eth_signer.sign(self.eth_signer.accounts()[0], header_bytes.into()).await?;
 
-        block.extra_data[block.extra_data.len() - SIGNATURE_LENGTH..].copy_from_slice(&sighash);
+
+        let mut extra_data_mut = BytesMut::from(&block.extra_data[..]);
+        extra_data_mut[extra_data_mut.len().saturating_sub(SIGNATURE_LENGTH)..].copy_from_slice(&sighash);
+        block.extra_data = Bytes::from(extra_data_mut.freeze());
 
         // Wait until sealing is terminated or delay timeout
         println!("Waiting for slot to sign and propagate, delay: {:?}", delay);
@@ -577,17 +576,17 @@ where
 // that a new block should have:
 // * DIFF_NOTURN(2) if BLOCK_NUMBER % SIGNER_COUNT != SIGNER_INDEX
 // * DIFF_INTURN(1) if BLOCK_NUMBER % SIGNER_COUNT == SIGNER_INDEX
-    pub async fn calc_difficulty(
+    pub fn calc_difficulty(
         &mut self,
         parent: Header,          // assuming IHeader is a trait
     ) -> U256 {
-        let snap = self.snapshot(
+        let Ok(snap) = self.snapshot(
             parent.number,
             parent.hash_slow(),
             None,
-        ).await;
+        ) else { todo!() };
 
-        calc_difficulty(&snap, self.signer)
+        calc_difficulty(&snap, &self.signer)
     }
 
 
@@ -608,7 +607,7 @@ where
 
  
 
-fn calc_difficulty<T>(snap: &Snapshot, signer: Address) -> U256 {
+fn calc_difficulty(snap: &Snapshot, signer: &Address) -> U256 {
     if snap.inturn(snap.number + 1, &signer) {
         DIFF_IN_TURN.clone()
     } else {
@@ -809,33 +808,19 @@ where
         // Ensure that the block's difficulty is meaningful (may not be correct at this point)
         if number > 0 {
             if header.difficulty.is_zero() ||
-                (header.difficulty != *DIFF_IN_TURN && header.difficulty != *DIFF_NO_TURN) {
+                (header.difficulty != DIFF_IN_TURN && header.difficulty != DIFF_NO_TURN) {
                 return Err(ConsensusError::InvalidDifficulty);
             }
         }
+
+        //todo All basic checks passed, verify cascading fields
         Ok(())
 
     }
 
 
     fn validate_header_against_parent(&self,header: &SealedHeader,parent: &SealedHeader,) -> Result<(),ConsensusError>  {
-        // The genesis block is the always valid dead-end
-        let number = header.number;
-        if number == 0 {
-            return Ok(());
-        }
-        // Verify that the gasUsed is <= gasLimit
-        if header.gas_used > header.gas_limit {
-            return Err(ConsensusError::HeaderGasUsedExceedsGasLimit { gas_used: header.gas_used, gas_limit: header.gas_limit })
-        }
-
-        if header.is_timestamp_in_past(parent.timestamp) {
-            return Err(ConsensusError::TimestampIsInPast {
-                parent_timestamp: parent.timestamp,
-                timestamp: header.timestamp,
-            })
-        }
-
+        self.validate_header(header)?;
         Ok(())
     }
 

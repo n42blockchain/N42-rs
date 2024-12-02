@@ -4659,6 +4659,7 @@ dependencies = [
  "lazy_static",
  "n42-primitives",
  "num-bigint",
+ "once_cell",
  "parking_lot 0.12.3",
  "primitive-types 0.3.0",
  "rand 0.8.5",

@@ -1,31 +1,25 @@
 use std::error::Error;
-use std::fmt;
 use std::hash::Hash;
-use std::io::{self, Write, Cursor};
-use std::sync::{Arc, RwLock, mpsc::{Sender, Receiver}};
+use std::io::Write;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
-use alloy_primitives::{U256, hex, U32, Bloom, BlockNumber, keccak256, B64, B256, Address, Bytes, BlockHash};
-use alloy_genesis::ChainConfig;
+use alloy_primitives::{U256, hex, Bloom, BlockNumber, keccak256, B64, B256, Address, Bytes};
 use alloy_rlp::{length_of_length, Decodable, Encodable, MaxEncodedLenAssoc};
-use blst::min_sig::{Signature, PublicKey as OtherPublicKey};
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut};
 use itertools::Itertools;
 use rand::prelude::SliceRandom;
 use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks};
 use reth_primitives::{Block, SealedBlock, SealedHeader, BlockWithSenders, public_key_to_address};
 use reth_primitives_traits::{BlockHeader, Header};
 use reth_provider::{BlockReader, EvmEnvProvider, StateProviderFactory, HeaderProvider, SnapshotProvider};
-use secp256k1::{ecdsa::{PublicKey, Message, RecoverableSignature, RecoveryId, SECP256K1}, Error as SecpError};
-use sha2::digest::consts::U2;
+use secp256k1::{ecdsa::{RecoverableSignature, RecoveryId}, Error as SecpError, Message, SECP256K1};
 use tracing::{info, debug, error};
 use n42_primitives::{APosConfig, Snapshot};
-use rlp::RlpStream;
 use reth_engine_primitives::EngineTypes;
-
+use once_cell::sync::Lazy;
 use reth_rpc_eth_api::helpers::EthSigner;
-use alloy_signer_local::PrivateKeySigner;
 use reth_consensus::{PostExecutionInput, Consensus, ConsensusError, HeaderConsensusError};
 use reth_rpc::eth::DevSigner;
 use reth_storage_api::SnapshotProviderWriter;
@@ -51,8 +45,8 @@ pub const EXTRA_SEAL: usize = 65;
 pub const NONCE_AUTH_VOTE: [u8; 8] = hex!("ffffffffffffffff"); // Magic nonce number to vote on adding a new signer
 pub const NONCE_DROP_VOTE: [u8; 8] = hex!("0000000000000000"); // Magic nonce number to vote on removing a signer
 // Difficulty constants
-pub const DIFF_IN_TURN: U256 = U256::from(2);  // Block difficulty for in-turn signatures
-pub const DIFF_NO_TURN: U256 = U256::from(1);  // Block difficulty for out-of-turn signatures
+static DIFF_IN_TURN: Lazy<U256> = Lazy::new(|| U256::from(2));
+static DIFF_NO_TURN: Lazy<U256> = Lazy::new(|| U256::from(1));
 
 pub const FULL_IMMUTABILITY_THRESHOLD: usize= 90000;
 
@@ -364,10 +358,10 @@ where
 
        //Ensure that the difficulty corresponds to the signer's round
         let in_turn = snap.inturn(header.number, &signer);
-        if in_turn && header.difficulty != DIFF_IN_TURN {
+        if in_turn && header.difficulty != *DIFF_IN_TURN {
             return Err(AposError::WrongDifficulty.into());
         }
-        if !in_turn && header.difficulty != DIFF_IN_TURN {
+        if !in_turn && header.difficulty != *DIFF_IN_TURN {
             return Err(AposError::WrongDifficulty.into());
         }
 
@@ -415,7 +409,7 @@ where
         let signer = self.signer.clone();
 
         //Set the correct difficulty level
-        header.difficulty = calc_difficulty(&snap, &signer);
+        header.difficulty = calc_difficulty(&snap, signer);
 
         //Ensure that the additional data has all its components
         if header.extra_data.len() < EXTRA_VANITY {
@@ -551,7 +545,7 @@ where
             .duration_since(SystemTime::now())
             .unwrap();
 
-        if block.difficulty == DIFF_NO_TURN {
+        if block.difficulty == *DIFF_NO_TURN {
             let wiggle = Duration::from_millis((snap.signers.len() as u64 / 2 + 1) * WIGGLE_TIME.as_millis() as u64);
             let delay_with_wiggle = delay + Duration::from_millis(rand::random::<u64>() % wiggle.as_millis() as u64);
 
@@ -815,7 +809,7 @@ where
         // Ensure that the block's difficulty is meaningful (may not be correct at this point)
         if number > 0 {
             if header.difficulty.is_zero() ||
-                (header.difficulty != DIFF_IN_TURN && header.difficulty != DIFF_NO_TURN) {
+                (header.difficulty != *DIFF_IN_TURN && header.difficulty != *DIFF_NO_TURN) {
                 return Err(ConsensusError::InvalidDifficulty);
             }
         }

@@ -8,9 +8,8 @@ use reth_provider::{
     providers::{BlockchainProvider, StaticFileProvider}, ProviderFactory
 };
 use reth_blockchain_tree::noop::NoopBlockchainTree;
-use std::hash::Hash;
 use std::sync::Arc;
-use reth_chainspec::ChainSpec as chain_spec;
+use reth_chainspec::ChainSpec;
 use reth_transaction_pool::test_utils::testing_pool;
 use reth_evm::test_utils::MockExecutorProvider;
 use reth_consensus::test_utils::TestConsensus;
@@ -41,7 +40,7 @@ pub struct CliqueTest {
 
 
 impl CliqueTest {
-    pub async fn run(&self) -> eyre::Result<()> {
+    pub async fn run(&self, chain_spec: Arc<ChainSpec>) -> eyre::Result<()> {
         let transaction_pool = testing_pool();
         let evm_config = EthEvmConfig::new(chain_spec.clone());
         let executor = MockExecutorProvider::default();
@@ -86,7 +85,7 @@ impl CliqueTest {
 
         let extra_data = genesis.extra_data.clone();
 
-        let chainspce = chain_spec {
+        let chainspce = ChainSpec {
             genesis,
             ..Default::default()
         };
@@ -188,9 +187,9 @@ impl CliqueTest {
         let provider =
             BlockchainProvider::new(provider_factory.clone(), Arc::new(NoopBlockchainTree::default()))?;
 
-        let snap = APos::snapshot(provider,head.number, head.ommers_hash, head.parent_hash)?;
+        let snap = APos::snapshot(provider,head.number, head.ommers_hash, None)?;
 
-        let result_signers: Vec<Address> = snap.singer();
+        let result_signers: Vec<Address> = snap.singers();
 
         if result_signers.len() != expected_signers.len() {
             panic!("signers mismatch: have {:?}, want {:?}", result_signers, expected_signers);

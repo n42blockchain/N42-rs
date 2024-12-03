@@ -325,7 +325,7 @@ impl Snapshot
     }
 
 	 // signers retrieves the list of authorized signers in ascending order.
-	 pub fn signers(&self) -> Vec<Address> {
+	 pub fn singers(&self) -> Vec<Address> {
         let mut sigs: Vec<Address> = self.signers.iter().cloned().collect();
         sigs.sort(); 
         sigs
@@ -333,7 +333,7 @@ impl Snapshot
 
     // inturn returns if a signer at a given block height is in-turn or not.
     pub fn inturn(&self, number: u64, signer: &Address) -> bool {
-        let signers = self.signers();
+        let signers = self.singers();
         let mut offset = 0;
 
         //Find the position of the given signer in the sorted list

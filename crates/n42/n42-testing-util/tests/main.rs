@@ -1,4 +1,5 @@
 use n42_testing_util::{clique_test::{TesterVote, CliqueTest}};
+use reth_chainspec::N42;
 
 #[test]
 async fn main() {
@@ -522,7 +523,7 @@ async fn main() {
     ];
 
     for (i, test) in tests.iter().enumerate() {
-        if let Err(e) = test.run().await {
+        if let Err(e) = test.run(N42.clone()).await {
             eprintln!("Test {} failed: {:?}", i, e);
         }
     }

@@ -29,7 +29,7 @@ use reth_primitives::{
 };
 use reth_prune_types::{PruneCheckpoint, PruneSegment};
 use reth_stages_types::{StageCheckpoint, StageId};
-use reth_storage_api::{DBProvider, StorageChangeSetReader};
+use reth_storage_api::{DBProvider, SnapshotProvider, SnapshotProviderWriter, StorageChangeSetReader};
 use reth_storage_errors::provider::ProviderResult;
 use revm::primitives::{BlockEnv, CfgEnvWithHandlerCfg};
 use std::{
@@ -38,8 +38,8 @@ use std::{
     time::Instant,
 };
 use tracing::trace;
-
-use crate::providers::ProviderNodeTypes;
+use n42_primitives::Snapshot;
+use crate::providers::{BlockchainProvider, ProviderNodeTypes};
 
 /// The main type for interacting with the blockchain.
 ///
@@ -697,6 +697,20 @@ impl<N: NodeTypesWithDB> CanonStateSubscriptions for BlockchainProvider2<N> {
         self.canonical_in_memory_state.subscribe_canon_state()
     }
 }
+
+
+impl<N: ProviderNodeTypes> SnapshotProvider for BlockchainProvider2<N> {
+    fn load_snapshot(&self, id: BlockHashOrNumber) -> ProviderResult<Option<Snapshot>> {
+        self.consistent_provider()?.load_snapshot(id)
+    }
+}
+
+impl<N: ProviderNodeTypes> SnapshotProviderWriter for BlockchainProvider2<N> {
+    fn save_snapshot(&self, id: BlockNumber, snapshot: Snapshot) -> ProviderResult<()> {
+        self.database_provider_rw()?.save_snapshot(id, snapshot)
+    }
+}
+
 
 impl<N: NodeTypesWithDB> ForkChoiceSubscriptions for BlockchainProvider2<N> {
     fn subscribe_safe_block(&self) -> ForkChoiceNotifications {

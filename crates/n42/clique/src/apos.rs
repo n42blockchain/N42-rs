@@ -22,7 +22,9 @@ use n42_primitives::{APosConfig, Snapshot};
 use reth_engine_primitives::EngineTypes;
 
 use reth_rpc_eth_api::helpers::EthSigner;
-use alloy_signer_local::PrivateKeySigner;
+use alloy_signer_local::{LocalSigner, PrivateKeySigner};
+use k256::ecdsa::SigningKey;
+use alloy_signer::SignerSync;
 use reth_consensus::{PostExecutionInput, Consensus, ConsensusError, HeaderConsensusError};
 use reth_rpc::eth::DevSigner;
 use reth_storage_api::SnapshotProviderWriter;
@@ -174,7 +176,7 @@ where
     signatures: schnellru::LruMap<B256, Vec<u8>>,    // Signatures of recent blocks to speed up mining
     proposals: Arc<RwLock<HashMap<Address, bool>>>,   // Current list of proposals we are pushing
     signer: Address, // Ethereum address of the signing key
-    eth_signer: Box<dyn EthSigner>,
+    eth_signer: LocalSigner<SigningKey>,
     //  Provider,
     provider: Provider,
 }
@@ -195,15 +197,16 @@ where
         let recents = schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SNAPSHOTS));
         let signatures = schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SIGNATURES));
 
-        // todo!
-        let eth_signer = DevSigner::random();
+        let eth_signer = PrivateKeySigner::random();
+        // signer_pk.sign_hash_sync();
+
         Self {
             config: Arc::new(APosConfig::default()),
             chain_spec,
             recents,
             signatures,
             proposals: Arc::new(RwLock::new(HashMap::new())),
-            signer: eth_signer.accounts()[0],
+            signer: eth_signer.address(),
             eth_signer,
             provider,
         }
@@ -303,7 +306,7 @@ where
         let headers_len = headers.len();
         let half_len = headers_len / 2;
         for i in 0..half_len {
-            headers.swap(i, headers.len() - 1 - i);
+            headers.swap(i, headers_len - 1 - i);
         }
 
         let snap = snap.unwrap().apply(headers, |header| {
@@ -501,23 +504,24 @@ where
 
     pub fn seal(
         &mut self,
-        block: &Block,
+        header: &mut Header,
     ) -> Result<(), Box<dyn Error>> {
         
 
         // Sealing the genesis block is not supported
-        if block.number == 0 {
+        if header.number == 0 {
             return Err(AposError::UnknownBlock.into());
         }
 
         // For 0-period chains, refuse to seal empty blocks (no reward but would spin sealing)
-        if self.config.period == 0 && block.body.transactions.is_empty() {
-            return Err(AposError::UnTransion.into());
-        }
+        // if self.config.period == 0 && header.body.transactions.is_empty() {
+        //     return Err(AposError::UnTransion.into());
+        // }
+        //todo
 
 
         // Bail out if we're unauthorized to sign a block
-        let snap = self.snapshot(block.number - 1, block.parent_hash.clone(), None)?;
+        let snap = self.snapshot(header.number - 1, header.parent_hash.clone(), None)?;
         if !snap.signers.contains(&self.signer) {
             error!(target: "consensus::engine", "err signer: {}", self.signer);
             return Err(AposError::UnauthorizedSigner.into())
@@ -527,8 +531,8 @@ where
         for (seen, recent) in snap.recents {
             if recent == self.signer {
                 let limit = (snap.signers.len() as u64 / 2) + 1;
-                if block.number < limit || seen > block.number - limit {
-                    error!(target: "consensus::engine", "Signed recently, must wait for others: limit: {}, seen: {}, number: {}, signer: {}", limit, seen, block.number, self.signer);
+                if header.number < limit || seen > header.number - limit {
+                    error!(target: "consensus::engine", "Signed recently, must wait for others: limit: {}, seen: {}, number: {}, signer: {}", limit, seen, header.number, self.signer);
                     return Err(AposError::UnauthorizedSigner.into());
                 }
             }
@@ -536,18 +540,18 @@ where
 
         // Sweet, the protocol permits us to sign the block, wait for our time
         let delay = UNIX_EPOCH
-            .checked_add(Duration::from_secs(block.timestamp as u64))
+            .checked_add(Duration::from_secs(header.timestamp as u64))
             .unwrap()
             .duration_since(SystemTime::now())
             .unwrap();
 
-        if block.difficulty == DIFF_NO_TURN {
+        if header.difficulty == DIFF_NO_TURN {
             let wiggle = Duration::from_millis((snap.signers.len() as u64 / 2 + 1) * WIGGLE_TIME.as_millis() as u64);
             let delay_with_wiggle = delay + Duration::from_millis(rand::random::<u64>() % wiggle.as_millis() as u64);
 
             println!(
                 "wiggle {:?}, time {:?}, number {}",
-                wiggle, delay_with_wiggle, block.number
+                wiggle, delay_with_wiggle, header.number
             );
         }
 
@@ -557,13 +561,13 @@ where
         // }
 
         // Sign all the things!
-        let header_bytes = seal_hash(&block.header);
-        let sighash = self.eth_signer.sign(self.eth_signer.accounts()[0], header_bytes.into()).await?;
+        let header_bytes = seal_hash(&header);
+        let sighash = self.eth_signer.sign_hash_sync(&header_bytes)?;
 
 
-        let mut extra_data_mut = BytesMut::from(&block.extra_data[..]);
-        extra_data_mut[extra_data_mut.len().saturating_sub(SIGNATURE_LENGTH)..].copy_from_slice(&sighash);
-        block.extra_data = Bytes::from(extra_data_mut.freeze());
+        let mut extra_data_mut = BytesMut::from(&header.extra_data[..]);
+        extra_data_mut[header.extra_data.len().saturating_sub(SIGNATURE_LENGTH)..].copy_from_slice(&sighash.as_bytes());
+        header.extra_data = Bytes::from(extra_data_mut.freeze());
 
         // Wait until sealing is terminated or delay timeout
         println!("Waiting for slot to sign and propagate, delay: {:?}", delay);

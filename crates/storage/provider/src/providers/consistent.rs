@@ -1,11 +1,5 @@
 use super::{DatabaseProviderRO, ProviderFactory, ProviderNodeTypes};
-use crate::{
-    providers::StaticFileProvider, AccountReader, BlockHashReader, BlockIdReader, BlockNumReader,
-    BlockReader, BlockReaderIdExt, BlockSource, ChainSpecProvider, ChangeSetReader, EvmEnvProvider,
-    HeaderProvider, ProviderError, PruneCheckpointReader, ReceiptProvider, ReceiptProviderIdExt,
-    StageCheckpointReader, StateReader, StaticFileProviderFactory, TransactionVariant,
-    TransactionsProvider, WithdrawalsProvider,
-};
+use crate::{providers::StaticFileProvider, AccountReader, BlockHashReader, BlockIdReader, BlockNumReader, BlockReader, BlockReaderIdExt, BlockSource, ChainSpecProvider, ChangeSetReader, EvmEnvProvider, HeaderProvider, ProviderError, PruneCheckpointReader, ReceiptProvider, ReceiptProviderIdExt, StageCheckpointReader, StateReader, StaticFileProviderFactory, TransactionVariant, TransactionsProvider, WithdrawalsProvider};
 use alloy_eips::{
     eip4895::Withdrawal, BlockHashOrNumber, BlockId, BlockNumHash, BlockNumberOrTag, HashOrNumber,
 };
@@ -23,7 +17,7 @@ use reth_primitives::{
 };
 use reth_prune_types::{PruneCheckpoint, PruneSegment};
 use reth_stages_types::{StageCheckpoint, StageId};
-use reth_storage_api::{DatabaseProviderFactory, StateProvider, StorageChangeSetReader};
+use reth_storage_api::{DatabaseProviderFactory, SnapshotProvider, SnapshotProviderWriter, StateProvider, StorageChangeSetReader};
 use reth_storage_errors::provider::ProviderResult;
 use revm::{
     db::states::PlainStorageRevert,
@@ -35,6 +29,7 @@ use std::{
     sync::Arc,
 };
 use tracing::trace;
+use n42_primitives::Snapshot;
 
 /// Type that interacts with a snapshot view of the blockchain (storage and in-memory) at time of
 /// instantiation, EXCEPT for pending, safe and finalized block which might change while holding
@@ -1426,6 +1421,19 @@ impl<N: ProviderNodeTypes> StorageChangeSetReader for ConsistentProvider<N> {
         }
     }
 }
+
+impl<N: ProviderNodeTypes> SnapshotProvider for ConsistentProvider<N>{
+    fn load_snapshot(&self, id: BlockHashOrNumber) -> ProviderResult<Option<Snapshot>> {
+        self.storage_provider.load_snapshot(id)
+    }
+}
+
+//
+// impl<N: ProviderNodeTypes> SnapshotProviderWriter for ConsistentProvider<N>{
+//     fn save_snapshot(&self, number: BlockNumber, snapshot: Snapshot) -> ProviderResult<()> {
+//         self.storage_provider.save_snapshot(number, snapshot)
+//     }
+// }
 
 impl<N: ProviderNodeTypes> ChangeSetReader for ConsistentProvider<N> {
     fn account_block_changeset(

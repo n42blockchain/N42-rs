@@ -33,6 +33,8 @@ alloy-rlp.workspace = true
 alloy-genesis.workspace = true
 alloy-primitives.workspace = true
 alloy-signer-local.workspace = true
+alloy-signer.workspace = true
+k256.workspace = true
 rand.workspace = true
 blst.workspace = true
 secp256k1  = { workspace = true, features = ["recovery"] }

@@ -62,6 +62,8 @@ pub use blockchain_provider::BlockchainProvider2;
 
 mod consistent;
 pub use consistent::ConsistentProvider;
+use n42_primitives::Snapshot;
+use reth_storage_api::{SnapshotProvider, SnapshotProviderWriter};
 
 /// Helper trait keeping common requirements of providers for [`NodeTypesWithDB`].
 pub trait ProviderNodeTypes: NodeTypesWithDB<ChainSpec: EthereumHardforks> {}
@@ -906,6 +908,18 @@ impl<N: ProviderNodeTypes> BlockchainTreePendingStateProvider for BlockchainProv
 impl<N: ProviderNodeTypes> CanonStateSubscriptions for BlockchainProvider<N> {
     fn subscribe_to_canonical_state(&self) -> CanonStateNotifications {
         self.tree.subscribe_to_canonical_state()
+    }
+}
+
+impl<N: ProviderNodeTypes> SnapshotProvider for BlockchainProvider<N> {
+    fn load_snapshot(&self, id: BlockHashOrNumber) -> ProviderResult<Option<Snapshot>> {
+        self.database.provider()?.load_snapshot(id)
+    }
+}
+
+impl<N: ProviderNodeTypes> SnapshotProviderWriter for BlockchainProvider<N> {
+    fn save_snapshot(&self, id: BlockNumber, snapshot: Snapshot) -> ProviderResult<()> {
+        self.database.database_provider_rw()?.save_snapshot(id, snapshot)
     }
 }
 

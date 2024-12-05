@@ -107,4 +107,3 @@ We extend our heartfelt thanks to the Rust community and all the contributors wh
 ---
 
 *Happy coding and welcome to the future of decentralized technology with Rust!*
-```

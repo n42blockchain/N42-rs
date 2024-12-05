@@ -4578,6 +4578,7 @@ dependencies = [
  "clap",
  "eyre",
  "futures",
+ "n42-engine-types",
  "num_cpus",
  "reth-basic-payload-builder",
  "reth-beacon-consensus",
@@ -4694,6 +4695,30 @@ dependencies = [
  "tracing",
  "uint 0.9.5",
  "unexpected",
+]
+
+[[package]]
+name = "n42-engine-types"
+version = "0.0.0"
+dependencies = [
+ "alloy-genesis",
+ "alloy-primitives",
+ "alloy-rpc-types",
+ "eyre",
+ "reth",
+ "reth-basic-payload-builder",
+ "reth-chainspec",
+ "reth-ethereum-payload-builder",
+ "reth-node-api",
+ "reth-node-core",
+ "reth-node-ethereum",
+ "reth-payload-builder",
+ "reth-primitives",
+ "reth-tracing",
+ "reth-trie-db",
+ "serde",
+ "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]

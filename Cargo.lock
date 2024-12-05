@@ -4735,6 +4735,7 @@ dependencies = [
  "reth-provider",
  "reth-transaction-pool",
  "secp256k1",
+ "zerocopy",
 ]
 
 [[package]]

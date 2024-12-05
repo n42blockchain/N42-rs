@@ -1,8 +1,7 @@
 use alloy_primitives::{Address, B256, Bytes as AlloyBytes, B64, BlockNumber};
 use alloy_genesis::{ChainConfig, Genesis,CliqueConfig};
 use reth_primitives::{Header,Block};
-use n42_clique::{NONCE_AUTH_VOTE, APos};
-
+use n42_clique::{NONCE_AUTH_VOTE, APos, DIFF_IN_TURN, EXTRA_VANITY, EXTRA_SEAL};
 use reth_provider::{
     test_utils::create_test_provider_factory_with_chain_spec,
     providers::{BlockchainProvider, StaticFileProvider}, ProviderFactory
@@ -17,7 +16,8 @@ use reth_db::{test_utils::{create_test_rw_db, create_test_static_files_dir}};
 use reth_db_common::init::init_genesis;
 use reth_network::{config::SecretKey, NetworkConfigBuilder, NetworkManager};
 use reth_node_ethereum::{EthEvmConfig};
-use crate::snapshot_test_utils::{EXTRA_SEAL, DIFF_IN_TURN, EXTRA_VANITY, TesterAccountPool};
+use crate::snapshot_test_utils::TesterAccountPool;
+use zerocopy::AsBytes;
 
 // Types representing tester votes and test structure
 #[derive(Debug)]

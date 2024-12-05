@@ -1,16 +1,11 @@
 use secp256k1::{PublicKey, Message, Secp256k1};
-use alloy_primitives::{Address, B256, Bytes as AlloyBytes, Keccak256};
+use alloy_primitives::{Address, Bytes, Keccak256};
 use secp256k1::rand::rngs::OsRng;
 use reth_primitives::{Header};
 use std::str::FromStr;
-use bytes::{BytesMut};
 use std::collections::HashMap;
-use std::hash::Hash;
 use reth_network::{config::SecretKey};
-
-pub const EXTRA_VANITY: usize = 32; // Placeholder for extra vanity size
-pub const DIFF_IN_TURN: B256 = B256::from(1);    // Placeholder difficulty
-pub const EXTRA_SEAL: usize = 65;
+use zerocopy::AsBytes;
 
 pub struct TesterAccountPool {
    pub accounts: HashMap<String, SecretKey>,
@@ -58,16 +53,17 @@ impl TesterAccountPool {
 
         // Serialize the signature to bytes and embed it in extra_data
         let sig_bytes = sig.serialize_compact();
-        let extra_len = header.extra_data.len();
+        let mut extra_data_mut = header.extra_data.to_vec();
 
         // Ensure there's enough space for the signature in extra_data
-        if extra_len < sig_bytes.len() {
-            let mut extra_data_mut = BytesMut::from(&header.extra_data[..]);
-            extra_data_mut.resize((extra_len + sig_bytes.len()), 0);
-            header.extra_data = AlloyBytes::from(extra_data_mut.freeze());
+        if extra_data_mut.len() < sig_bytes.len() {
+            extra_data_mut.resize(sig_bytes.len(), 0);
         }
 
-        header.extra_data[extra_len - sig_bytes.len()..].copy_from_slice(&sig_bytes);
+        let start_index = extra_data_mut.len() - sig_bytes.len();
+        extra_data_mut[start_index..].copy_from_slice(&sig_bytes);
+
+        header.extra_data = Bytes::from(extra_data_mut);
     }
 
 
@@ -78,9 +74,12 @@ impl TesterAccountPool {
             .collect();
 
         auth_addresses.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut extra_data = header.extra_data.to_vec();
         for (i, address) in auth_addresses.iter().enumerate() {
-            header.extra_data[i * Address.len()] = address.clone().into();
+            let start = i * 20;
+            extra_data[start..start + 20].copy_from_slice(&address.0.as_ref());
         }
+        header.extra_data = Bytes::from(extra_data);
     }
 
     // // Compute the hash for the header (equivalent of Go's SealHash function)
@@ -110,6 +109,6 @@ fn seal_hash(header: &Header) -> [u8; 32] {
 
     let result = hasher.finalize();
     let mut hash = [0u8; 32];
-    hash.copy_from_slice(&result);
+    hash.copy_from_slice(result.as_ref());
     hash
 }

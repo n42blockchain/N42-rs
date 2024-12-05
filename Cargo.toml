@@ -13,6 +13,7 @@ members = [
     "crates/n42/primitives/",
     "crates/n42/clique/",
     "crates/n42/engine/",
+    "crates/n42/engine-types/",
     "crates/n42/n42-testing-util",
     "crates/engine/invalid-block-hooks/",
     "crates/evm/",
@@ -219,6 +220,7 @@ alloy-genesis = { path = "./crates/alloy-genesis" }
 # for n42
 n42-primitives = { path = "crates/n42/primitives" }
 n42-clique = {path="crates/n42/clique"}
+n42-engine-types = {path="crates/n42/engine-types"}
 blst = "0.3.11"
 
 reth = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.1.1" }

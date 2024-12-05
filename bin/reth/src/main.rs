@@ -89,7 +89,7 @@ fn main() {
                 }
                 true => {
                     info!(target: "reth::cli", "Running with legacy engine");
-                    let handle = builder.launch_node(EthereumNode::default()).await?;
+                    let handle = builder.launch_node(N42Node::default()).await?;
                     handle.node_exit_future.await
                 }
             }

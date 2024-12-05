@@ -13,7 +13,9 @@ default-run = "n42"
 workspace = true
 
 [dependencies]
+#n42
 num_cpus = "1.16.0"
+n42-engine-types.workspace = true
 # reth
 reth-cli.workspace = true
 reth-ethereum-cli.workspace = true

@@ -2,7 +2,7 @@ use n42_testing_util::{clique_test::{TesterVote, CliqueTest}};
 use reth_chainspec::N42;
 
 #[test]
-async fn main() {
+fn main() {
     let tests = vec![
         CliqueTest {
             epoch: 0,
@@ -26,14 +26,13 @@ async fn main() {
                 auth: false,
                 checkpoint: vec![],
                 newbatch: false,
-            },
-                        TesterVote {
-                            signer: "B".to_string(),
-                            voted: "C".to_string(),
-                            auth: false,
-                            checkpoint: vec![],
-                            newbatch: false,
-                        },
+            }, TesterVote {
+                signer: "B".to_string(),
+                voted: "C".to_string(),
+                auth: false,
+                checkpoint: vec![],
+                newbatch: false,
+                },
             ],
             results: vec!["A".to_string(),"B".to_string()],
             failure: None,
@@ -523,7 +522,7 @@ async fn main() {
     ];
 
     for (i, test) in tests.iter().enumerate() {
-        if let Err(e) = test.run(N42.clone()).await {
+        if let Err(e) = test.run(N42.clone()) {
             eprintln!("Test {} failed: {:?}", i, e);
         }
     }

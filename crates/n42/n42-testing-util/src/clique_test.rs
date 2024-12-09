@@ -14,7 +14,6 @@ use reth_evm::test_utils::MockExecutorProvider;
 use reth_consensus::test_utils::TestConsensus;
 use reth_db::{test_utils::{create_test_rw_db, create_test_static_files_dir}};
 use reth_db_common::init::init_genesis;
-use reth_network::{config::SecretKey, NetworkConfigBuilder, NetworkManager};
 use reth_node_ethereum::{EthEvmConfig};
 use crate::snapshot_test_utils::TesterAccountPool;
 use zerocopy::AsBytes;
@@ -40,35 +39,36 @@ pub struct CliqueTest {
 
 
 impl CliqueTest {
-    pub async fn run(&self, chain_spec: Arc<ChainSpec>) -> eyre::Result<()> {
-        let transaction_pool = testing_pool();
-        let evm_config = EthEvmConfig::new(chain_spec.clone());
-        let executor = MockExecutorProvider::default();
-        let consensus = Arc::new(TestConsensus::default());
+    pub fn run(&self, chain_spec: Arc<ChainSpec>) -> eyre::Result<()> {
+        // let transaction_pool = testing_pool();
+        // let evm_config = EthEvmConfig::new(chain_spec.clone());
+        // let executor = MockExecutorProvider::default();
+        // let consensus = Arc::new(TestConsensus::default());
+        //
+        // let (static_dir, _) = create_test_static_files_dir();
+        // let db = create_test_rw_db();
+        // let provider_factory = ProviderFactory::new(
+        //     db,
+        //     chain_spec.clone(),
+        //     StaticFileProvider::read_write(static_dir.into_path()).expect("static file provider"),
+        // );
+        //
+        // let genesis_hash = init_genesis(&provider_factory)?;
+        // let provider =
+        //     BlockchainProvider::new(provider_factory.clone(), Arc::new(NoopBlockchainTree::default()))?;
 
-        let (static_dir, _) = create_test_static_files_dir();
-        let db = create_test_rw_db();
-        let provider_factory = ProviderFactory::new(
-            db,
-            chain_spec.clone(),
-            StaticFileProvider::read_write(static_dir.into_path()).expect("static file provider"),
-        );
-
-        let genesis_hash = init_genesis(&provider_factory)?;
-        let provider =
-            BlockchainProvider::new(provider_factory.clone(), Arc::new(NoopBlockchainTree::default()))?;
-
-        let network_manager = NetworkManager::new(
-            NetworkConfigBuilder::new(SecretKey::new(&mut rand::thread_rng()))
-                .with_unused_discovery_port()
-                .with_unused_listener_port()
-                .build(provider_factory.clone()),
-        ).await;
+        // let network_manager = NetworkManager::new(
+        //     NetworkConfigBuilder::new(SecretKey::new(&mut rand::thread_rng()))
+        //         .with_unused_discovery_port()
+        //         .with_unused_listener_port()
+        //         .build(provider_factory.clone()),
+        // ).await;
         let mut accounts = TesterAccountPool::new();
 
         // Generate the initial set of signers
         let mut signers: Vec<Address> = self.signers.iter().map(|s| accounts.address(s)).collect();
         signers.sort();
+        // println!("signers: {:?}", signers);
 
         // Create the genesis block with only the relevant fields for testing
         let mut genesis = Genesis {
@@ -77,39 +77,36 @@ impl CliqueTest {
             ..Default::default() // Use the Default trait to fill in other fields with defaults
         };
 
+        let mut extra_data = vec![0u8; EXTRA_VANITY + self.signers.len() * Address::len_bytes() + EXTRA_SEAL];
         for (j, signer) in signers.iter().enumerate() {
             let start = EXTRA_VANITY + j * Address::len_bytes();
             let end = start + Address::len_bytes();
-            genesis.extra_data[start..end].copy_from_slice(signer.as_bytes());
+            extra_data[start..end].copy_from_slice(signer.as_bytes());
         }
+        let extra_data_clone = extra_data.clone();
+        genesis.extra_data = extra_data.into();
 
-        let extra_data = genesis.extra_data.clone();
-
-        let chainspce = ChainSpec {
-            genesis,
-            ..Default::default()
-        };
-
-        let config = ChainConfig {
+        genesis.config = ChainConfig {
             clique: Some(CliqueConfig {
                 period: Some(1u64),
                 epoch: Some(self.epoch),
             }),
             ..Default::default()
         };
-        genesis.config = config;
 
-        // let engine = APos::new(None,genesis.config.clique.unwrap());
+        let chainspce = ChainSpec {
+            genesis,
+            ..Default::default()
+        };
 
         let mut blocks: Vec<Block> = Vec::new();
-
-        for mut i in 1..self.votes.len(){
-            if i == 1 {
+        for mut i in 0..self.votes.len(){
+            if i == 0 {
                 blocks.push(
                     Block {
                         header: Header {
-                            parent_hash: B256::from_slice(&extra_data),
-                            number: i as BlockNumber,
+                            parent_hash: B256::ZERO,
+                            number: 1 as BlockNumber,
                             nonce: B64::from(NONCE_AUTH_VOTE),
                             ..Default::default()
                         },
@@ -120,8 +117,8 @@ impl CliqueTest {
                 blocks.push(
                     Block{
                         header:Header{
-                            parent_hash: blocks[i].header.ommers_hash.clone(),
-                            number: i as BlockNumber,
+                            parent_hash: blocks[i-1].header.ommers_hash.clone(),
+                            number: (i + 1) as BlockNumber,
                             nonce: B64::from(NONCE_AUTH_VOTE),
 
                             ..Default::default()
@@ -133,22 +130,8 @@ impl CliqueTest {
                 )
             }
         }
-
-        //
-        // let blocks = Block{
-        //     header:Header{
-        //         parent_hash: genesis.extra_data.clone(),
-        //         number: 1,
-        //         nonce: NONCE_AUTH_VOTE,
-        //
-        //         ..Default::default()
-        //     },
-        //     ..Default::default()
-        //
-        // };
-
-        // Placeholder for blockchain and engine setup
-        // Example: let engine = Engine::new(config, ...);
+        // println!("{:?}", self);
+        // println!("{:?}", blocks);
 
         // Iterate through the votes and create blocks accordingly
         for (j, vote) in self.votes.iter().enumerate() {
@@ -184,10 +167,16 @@ impl CliqueTest {
 
         let provider_factory = create_test_provider_factory_with_chain_spec(Arc::from(chainspce));
 
-        let provider =
-            BlockchainProvider::new(provider_factory.clone(), Arc::new(NoopBlockchainTree::default()))?;
+        let provider = BlockchainProvider::new(provider_factory.clone(), Arc::new(NoopBlockchainTree::default()))?;
 
-        let snap = APos::snapshot(provider,head.number, head.ommers_hash, None)?;
+        let mut a_pos = APos::new(provider, chain_spec.clone());
+        let snap_result = a_pos.snapshot(head.number, head.ommers_hash, None);
+        let snap = match snap_result {
+            Ok(s) => s,
+            Err(e) => {
+                return Err(eyre::eyre!("Snapshot error: {}", e));
+            }
+        };
 
         let result_signers: Vec<Address> = snap.singers();
 

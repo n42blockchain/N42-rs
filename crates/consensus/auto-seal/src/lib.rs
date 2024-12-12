@@ -99,6 +99,10 @@ impl<ChainSpec: Send + Sync + Debug> Consensus for AutoSealConsensus<ChainSpec> 
     ) -> Result<(), ConsensusError> {
         Ok(())
     }
+
+    fn prepare(&self, header: &mut Header) -> Result<(), ConsensusError> {
+        Ok(())
+    }
 }
 
 /// Builder type for configuring the setup

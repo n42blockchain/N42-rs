@@ -39,4 +39,8 @@ impl Consensus for NoopConsensus {
     ) -> Result<(), ConsensusError> {
         Ok(())
     }
+
+    fn prepare(&self, header: &mut Header) -> Result<(), ConsensusError> {
+        Ok(())
+    }
 }

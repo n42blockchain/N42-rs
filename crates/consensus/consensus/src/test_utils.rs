@@ -80,4 +80,8 @@ impl Consensus for TestConsensus {
             Ok(())
         }
     }
+
+    fn prepare(&self, header: &mut Header) -> Result<(), ConsensusError> {
+        Ok(())
+    }
 }

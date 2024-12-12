@@ -374,76 +374,6 @@ where
         Ok(())
     }
 
-    /// Prepare implements consensus.Engine, preparing all the consensus fields of the
-    /// header for running the transactions on top.
-    pub fn prepare(
-        &mut self,
-        header: &mut Header,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-      
-       //If the block is not a checkpoint, vote randomly
-        header.beneficiary = Address::default();
-        header.nonce = B64::from(0u64);
-
-
-        //Assemble voting snapshots to check which votes are meaningful
-        let snap = self.snapshot(header.number - 1, header.parent_hash, None)?;
-
-        if header.number %self.config.epoch != 0 {
-            //Collect all proposals to be voted on
-            let proposals_lock = self.proposals.read().unwrap();
-            let mut addresses: Vec<Address> = proposals_lock.iter()
-                .filter(|(&address, &authorize)| snap.valid_vote(address, authorize))
-                .map(|(address, _)| *address)
-                .collect();
-
-            //If there are proposals to be voted on, proceed with the vote
-            if !addresses.is_empty() {
-                header.beneficiary = addresses.choose(&mut rand::thread_rng()).unwrap().clone();
-                if let Some(&authorize) = proposals_lock.get(&header.beneficiary) {
-                    if authorize {
-                        header.nonce = NONCE_AUTH_VOTE.clone().into();
-                    } else {
-                        header.nonce = NONCE_DROP_VOTE.clone().into();
-                    }
-                }
-            }
-        }
-
-        //Copy the signer to prevent data competition
-        let signer = self.signer.clone();
-
-        //Set the correct difficulty level
-        header.difficulty = calc_difficulty(&snap, &signer);
-
-        let mut extra_data_mut = BytesMut::from(&header.extra_data[..]);
-        //Ensure that the additional data has all its components
-        extra_data_mut.resize(EXTRA_VANITY, 0x00);
-
-        if header.number % self.config.epoch == 0 {
-            for signer in snap.signers {
-                extra_data_mut.extend(signer.iter());
-            }
-        }
-        extra_data_mut.resize(extra_data_mut.len() + SIGNATURE_LENGTH, 0x00);
-        header.extra_data = Bytes::from(extra_data_mut.freeze());
-
-        header.mix_hash = Default::default();
-
-        // Ensure the timestamp has the correct delay
-        if let Ok(Some(parent)) = self.provider.header_by_hash_or_number(header.parent_hash.into()) {
-            let parent_time = parent.timestamp;
-            header.timestamp = parent_time + self.config.period;
-        }
-
-        if header.timestamp < (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + MERGE_SIGN_MIN_TIME) {
-            header.timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + MERGE_SIGN_MIN_TIME;
-        }
-
-        Ok(())
-    }
-
-
     // fn finalize(
     //     &self,
     //     chain: &dyn ChainHeaderReader,
@@ -850,6 +780,72 @@ where
     }
 
     fn validate_block_post_execution(&self,block: &BlockWithSenders,input:PostExecutionInput<'_> ,) -> Result<(),ConsensusError>  {
+        Ok(())
+    }
+
+    /// Prepare implements consensus.Engine, preparing all the consensus fields of the
+    /// header for running the transactions on top.
+    fn prepare(&self, header: &mut Header) -> Result<(), ConsensusError> {
+
+        //If the block is not a checkpoint, vote randomly
+        header.beneficiary = Address::ZERO;
+        header.nonce = B64::from(0u64);
+
+
+        //Assemble voting snapshots to check which votes are meaningful
+        let snap = self.snapshot(header.number - 1, header.parent_hash, None).map_err(|_| ConsensusError::UnknownBlock)?;
+
+        if header.number %self.config.epoch != 0 {
+            //Collect all proposals to be voted on
+            let proposals_lock = self.proposals.read().unwrap();
+            let mut addresses: Vec<Address> = proposals_lock.iter()
+                .filter(|(&address, &authorize)| snap.valid_vote(address, authorize))
+                .map(|(address, _)| *address)
+                .collect();
+
+            //If there are proposals to be voted on, proceed with the vote
+            if !addresses.is_empty() {
+                header.beneficiary = addresses.choose(&mut rand::thread_rng()).unwrap().clone();
+                if let Some(&authorize) = proposals_lock.get(&header.beneficiary) {
+                    if authorize {
+                        header.nonce = NONCE_AUTH_VOTE.clone().into();
+                    } else {
+                        header.nonce = NONCE_DROP_VOTE.clone().into();
+                    }
+                }
+            }
+        }
+
+        //Copy the signer to prevent data competition
+        let signer = self.signer.clone();
+
+        //Set the correct difficulty level
+        header.difficulty = calc_difficulty(&snap, &signer);
+
+        let mut extra_data_mut = BytesMut::from(&header.extra_data[..]);
+        //Ensure that the additional data has all its components
+        extra_data_mut.resize(EXTRA_VANITY, 0x00);
+
+        if header.number % self.config.epoch == 0 {
+            for signer in snap.signers {
+                extra_data_mut.extend(signer.iter());
+            }
+        }
+        extra_data_mut.resize(extra_data_mut.len() + SIGNATURE_LENGTH, 0x00);
+        header.extra_data = Bytes::from(extra_data_mut.freeze());
+
+        header.mix_hash = Default::default();
+
+        // Ensure the timestamp has the correct delay
+        if let Ok(Some(parent)) = self.provider.header_by_hash_or_number(header.parent_hash.into()) {
+            let parent_time = parent.timestamp;
+            header.timestamp = parent_time + self.config.period;
+        }
+
+        if header.timestamp < (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + MERGE_SIGN_MIN_TIME) {
+            header.timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + MERGE_SIGN_MIN_TIME;
+        }
+
         Ok(())
     }
 }

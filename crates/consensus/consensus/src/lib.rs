@@ -120,6 +120,12 @@ pub trait Consensus: Debug + Send + Sync {
         block: &BlockWithSenders,
         input: PostExecutionInput<'_>,
     ) -> Result<(), ConsensusError>;
+
+    /// for N42
+    fn prepare(
+        &self,
+        header: &mut Header,
+    )-> Result<(), ConsensusError>;
 }
 
 /// Consensus Errors

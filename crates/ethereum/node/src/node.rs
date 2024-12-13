@@ -39,6 +39,7 @@ use reth_trie_db::MerklePatriciaTrie;
 use crate::{EthEngineTypes, EthEvmConfig};
 
 use n42_clique::APos;
+use reth_consensus::Consensus;
 
 /// Ethereum primitive types.
 #[derive(Debug)]
@@ -280,11 +281,12 @@ impl EthereumPayloadBuilder {
     }
 }
 
-impl<Types, Node, Pool> PayloadServiceBuilder<Node, Pool> for EthereumPayloadBuilder
+impl<Types, Node, Pool, Cons> PayloadServiceBuilder<Node, Pool, Cons> for EthereumPayloadBuilder
 where
     Types: NodeTypesWithEngine<ChainSpec = ChainSpec>,
     Node: FullNodeTypes<Types = Types>,
     Pool: TransactionPool + Unpin + 'static,
+    Cons: Consensus,
     Types::Engine: PayloadTypes<
         BuiltPayload = EthBuiltPayload,
         PayloadAttributes = EthPayloadAttributes,
@@ -295,6 +297,7 @@ where
         self,
         ctx: &BuilderContext<Node>,
         pool: Pool,
+        _: Cons,
     ) -> eyre::Result<PayloadBuilderHandle<Types::Engine>> {
         self.spawn(EthEvmConfig::new(ctx.chain_spec()), ctx, pool)
     }

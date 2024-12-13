@@ -223,10 +223,6 @@ impl<ChainSpec: Send + Sync + EthChainSpec + EthereumHardforks + Debug> Consensu
     ) -> Result<(), ConsensusError> {
         validate_block_post_execution(block, &self.chain_spec, input.receipts, input.requests)
     }
-
-    fn prepare(&self, header: &mut Header) -> Result<(), ConsensusError> {
-        Ok(())
-    }
 }
 
 #[cfg(test)]

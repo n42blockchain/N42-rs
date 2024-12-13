@@ -11,6 +11,7 @@ use reth::{
     providers::{CanonStateSubscriptions, StateProviderFactory},
     transaction_pool::TransactionPool,
 };
+use reth::consensus::Consensus;
 use reth_basic_payload_builder::{
     BasicPayloadJobGenerator, BasicPayloadJobGeneratorConfig, BuildArguments, BuildOutcome,
     PayloadBuilder, PayloadConfig,
@@ -85,7 +86,7 @@ where
 #[non_exhaustive]
 pub struct N42PayloadServiceBuilder;
 
-impl<Node, Pool> PayloadServiceBuilder<Node, Pool> for N42PayloadServiceBuilder
+impl<Node, Pool, Consensus> PayloadServiceBuilder<Node, Pool, Consensus> for N42PayloadServiceBuilder
 where
     Node: FullNodeTypes<
         Types: NodeTypesWithEngine<Engine =N42EngineTypes, ChainSpec = ChainSpec>,
@@ -96,6 +97,7 @@ where
         self,
         ctx: &BuilderContext<Node>,
         pool: Pool,
+        _: Consensus,
     ) -> eyre::Result<PayloadBuilderHandle<<Node::Types as NodeTypesWithEngine>::Engine>> {
         let payload_builder = N42PayloadBuilder::default();
         let conf = ctx.payload_builder_config();

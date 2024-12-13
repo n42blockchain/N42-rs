@@ -173,6 +173,7 @@ impl<Node, PoolB, PayloadB, NetworkB, ExecB, ConsB>
 where
     Node: FullNodeTypes,
     PoolB: PoolBuilder<Node>,
+    ConsB: ConsensusBuilder<Node>,
 {
     /// Configures the network builder.
     ///
@@ -212,7 +213,7 @@ where
         payload_builder: PB,
     ) -> ComponentsBuilder<Node, PoolB, PB, NetworkB, ExecB, ConsB>
     where
-        PB: PayloadServiceBuilder<Node, PoolB::Pool>,
+        PB: PayloadServiceBuilder<Node, PoolB::Pool, ConsB::Consensus>,
     {
         let Self {
             pool_builder,
@@ -298,7 +299,7 @@ where
     Node: FullNodeTypes,
     PoolB: PoolBuilder<Node>,
     NetworkB: NetworkBuilder<Node, PoolB::Pool>,
-    PayloadB: PayloadServiceBuilder<Node, PoolB::Pool>,
+    PayloadB: PayloadServiceBuilder<Node, PoolB::Pool, ConsB::Consensus>,
     ExecB: ExecutorBuilder<Node>,
     ConsB: ConsensusBuilder<Node>,
 {
@@ -320,8 +321,9 @@ where
         let (evm_config, executor) = evm_builder.build_evm(context).await?;
         let pool = pool_builder.build_pool(context).await?;
         let network = network_builder.build_network(context, pool.clone()).await?;
-        let payload_builder = payload_builder.spawn_payload_service(context, pool.clone()).await?;
         let consensus = consensus_builder.build_consensus(context).await?;
+        let payload_builder = payload_builder.spawn_payload_service(context, pool.clone(), consensus.clone()).await?;
+
 
         Ok(Components {
             transaction_pool: pool,

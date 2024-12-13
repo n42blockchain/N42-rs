@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::error::Error;
 use std::hash::Hash;
 use std::io::Write;
@@ -172,7 +173,7 @@ where
     config: Arc<APosConfig>,          // Consensus engine configuration parameters
     /// Chain spec
     chain_spec: Arc<ChainSpec>,
-    recents: schnellru::LruMap<B256, Snapshot>,    // Snapshots for recent block to speed up reorgs
+    recents: RwLock<schnellru::LruMap<B256, Snapshot>>,    // Snapshots for recent block to speed up reorgs
     signatures: schnellru::LruMap<B256, Vec<u8>>,    // Signatures of recent blocks to speed up mining
     proposals: Arc<RwLock<HashMap<Address, bool>>>,   // Current list of proposals we are pushing
     signer: Address, // Ethereum address of the signing key
@@ -194,7 +195,7 @@ where
         chain_spec: Arc<ChainSpec>,
     ) -> Self
     {
-        let recents = schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SNAPSHOTS));
+        let recents = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SNAPSHOTS)));
         let signatures = schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SIGNATURES));
 
         let eth_signer = PrivateKeySigner::random();
@@ -215,11 +216,11 @@ where
 
     /// snapshot retrieves the authorization snapshot at a given point in time.
     pub fn snapshot(
-        &mut self,
+        &self,
         number: u64,
         hash: B256,
         parents: Option<Vec<Header>>,
-    ) -> Result<Snapshot, Box<dyn Error>> {
+    ) -> Result<Snapshot, ConsensusError> {
 
         let mut headers: Vec<Header> = Vec::new();
         let mut snap: Option<Snapshot> = None;
@@ -227,9 +228,11 @@ where
         let mut number = number;
         let mut parents = parents.clone();
 
+        let mut recents = self.recents.write().unwrap(); //
+
         while snap.is_none() {
             //Attempt to retrieve a snapshot from memory
-            if let Some(cached_snap) = self.recents.get(&hash) {
+            if let Some(cached_snap) = recents.get(&hash) {
                 snap = Some(cached_snap.clone());
                 break;
             }
@@ -281,18 +284,18 @@ where
             let header = if let Some(ref mut parent_vec) = parents {
                 if let Some(header) = parent_vec.pop() {
                     if header.hash_slow() != hash || header.number != number {
-                        return Err(AposError::UnknownBlock.into());
+                        return Err(ConsensusError::UnknownBlock);
                     }
                     header
                 } else {
-                    return Err(AposError::UnknownBlock.into());
+                    return Err(ConsensusError::UnknownBlock);
                 }
             } else {
-                let header_opt = self.provider.header_by_hash_or_number(hash.into())?;
+                let header_opt = self.provider.header_by_hash_or_number(hash.into()).map_err(|_| ConsensusError::UnknownBlock)?;
                 if let Some(header) = header_opt {
                     header
                 } else {
-                    return Err(AposError::UnknownBlock.into());
+                    return Err(ConsensusError::UnknownBlock);
                 }
             };
 
@@ -311,13 +314,13 @@ where
 
         let snap = snap.unwrap().apply(headers, |header| {
             Ok(header.beneficiary)
-        }).map_err(|_| AposError::WrongDifficulty)?;
+        }).map_err(|_| ConsensusError::InvalidDifficulty)?;
 
-        self.recents.insert(snap.hash, snap.clone());
+        recents.insert(snap.hash, snap.clone());
 
         ///If a new checkpoint snapshot is generated, save it to disk
         if snap.number % CHECKPOINT_INTERVAL == 0 && !headers_len == 0 {
-            self.provider.save_snapshot(snap.number, snap.clone())?;
+            self.provider.save_snapshot(snap.number, snap.clone()).map_err(|_|ConsensusError::SaveSnapshotError)?;
             debug!(
                 "Stored voting snapshot to disk, number: {}, hash: {}",
                 snap.number,
@@ -431,80 +434,6 @@ where
     //     self.signer = signer;
     //     self.sign_fn = Some(sign_fn);
     // }
-
-    pub fn seal(
-        &mut self,
-        header: &mut Header,
-    ) -> Result<(), Box<dyn Error>> {
-        
-
-        // Sealing the genesis block is not supported
-        if header.number == 0 {
-            return Err(AposError::UnknownBlock.into());
-        }
-
-        // For 0-period chains, refuse to seal empty blocks (no reward but would spin sealing)
-        // if self.config.period == 0 && header.body.transactions.is_empty() {
-        //     return Err(AposError::UnTransion.into());
-        // }
-        //todo
-
-
-        // Bail out if we're unauthorized to sign a block
-        let snap = self.snapshot(header.number - 1, header.parent_hash.clone(), None)?;
-        if !snap.signers.contains(&self.signer) {
-            error!(target: "consensus::engine", "err signer: {}", self.signer);
-            return Err(AposError::UnauthorizedSigner.into())
-        }
-
-        // If we're amongst the recent signers, wait for the next block
-        for (seen, recent) in snap.recents {
-            if recent == self.signer {
-                let limit = (snap.signers.len() as u64 / 2) + 1;
-                if header.number < limit || seen > header.number - limit {
-                    error!(target: "consensus::engine", "Signed recently, must wait for others: limit: {}, seen: {}, number: {}, signer: {}", limit, seen, header.number, self.signer);
-                    return Err(AposError::UnauthorizedSigner.into());
-                }
-            }
-        }
-
-        // Sweet, the protocol permits us to sign the block, wait for our time
-        let delay = UNIX_EPOCH
-            .checked_add(Duration::from_secs(header.timestamp as u64))
-            .unwrap()
-            .duration_since(SystemTime::now())
-            .unwrap();
-
-        if header.difficulty == DIFF_NO_TURN {
-            let wiggle = Duration::from_millis((snap.signers.len() as u64 / 2 + 1) * WIGGLE_TIME.as_millis() as u64);
-            let delay_with_wiggle = delay + Duration::from_millis(rand::random::<u64>() % wiggle.as_millis() as u64);
-
-            println!(
-                "wiggle {:?}, time {:?}, number {}",
-                wiggle, delay_with_wiggle, header.number
-            );
-        }
-
-        // // Beijing hard fork logic (if applicable)
-        // if self.chain_spec.is_beijing_active_at_block(block.number) {
-        //
-        // }
-
-        // Sign all the things!
-        let header_bytes = seal_hash(&header);
-        let sighash = self.eth_signer.sign_hash_sync(&header_bytes)?;
-
-
-        let mut extra_data_mut = BytesMut::from(&header.extra_data[..]);
-        extra_data_mut[header.extra_data.len().saturating_sub(SIGNATURE_LENGTH)..].copy_from_slice(&sighash.as_bytes());
-        header.extra_data = Bytes::from(extra_data_mut.freeze());
-
-        // Wait until sealing is terminated or delay timeout
-        println!("Waiting for slot to sign and propagate, delay: {:?}", delay);
-        //
-
-        Ok(())
-    }
 
     // CalcDifficulty is the difficulty adjustment algorithm. It returns the difficulty
 // that a new block should have:
@@ -845,6 +774,76 @@ where
         if header.timestamp < (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + MERGE_SIGN_MIN_TIME) {
             header.timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + MERGE_SIGN_MIN_TIME;
         }
+
+        Ok(())
+    }
+
+    fn seal(&self, header: &mut Header) -> Result<(), ConsensusError> {
+
+        // Sealing the genesis block is not supported
+        if header.number == 0 {
+            return Err(ConsensusError::UnknownBlock);
+        }
+
+        // For 0-period chains, refuse to seal empty blocks (no reward but would spin sealing)
+        // if self.config.period == 0 && header.body.transactions.is_empty() {
+        //     return Err(AposError::UnTransion.into());
+        // }
+        //todo
+
+
+        // Bail out if we're unauthorized to sign a block
+        let snap = self.snapshot(header.number - 1, header.parent_hash.clone(), None)?;
+        if !snap.signers.contains(&self.signer) {
+            error!(target: "consensus::engine", "err signer: {}", self.signer);
+            return Err(ConsensusError::UnauthorizedSigner)
+        }
+
+        // If we're amongst the recent signers, wait for the next block
+        for (seen, recent) in snap.recents {
+            if recent == self.signer {
+                let limit = (snap.signers.len() as u64 / 2) + 1;
+                if header.number < limit || seen > header.number - limit {
+                    error!(target: "consensus::engine", "Signed recently, must wait for others: limit: {}, seen: {}, number: {}, signer: {}", limit, seen, header.number, self.signer);
+                    return Err(ConsensusError::UnauthorizedSigner);
+                }
+            }
+        }
+
+        // Sweet, the protocol permits us to sign the block, wait for our time
+        let delay = UNIX_EPOCH
+            .checked_add(Duration::from_secs(header.timestamp as u64))
+            .unwrap()
+            .duration_since(SystemTime::now())
+            .unwrap();
+
+        if header.difficulty == DIFF_NO_TURN {
+            let wiggle = Duration::from_millis((snap.signers.len() as u64 / 2 + 1) * WIGGLE_TIME.as_millis() as u64);
+            let delay_with_wiggle = delay + Duration::from_millis(rand::random::<u64>() % wiggle.as_millis() as u64);
+
+            println!(
+                "wiggle {:?}, time {:?}, number {}",
+                wiggle, delay_with_wiggle, header.number
+            );
+        }
+
+        // // Beijing hard fork logic (if applicable)
+        // if self.chain_spec.is_beijing_active_at_block(block.number) {
+        //
+        // }
+
+        // Sign all the things!
+        let header_bytes = seal_hash(&header);
+        let sighash = self.eth_signer.sign_hash_sync(&header_bytes).map_err(|_| ConsensusError::SignHeaderError)?;
+
+
+        let mut extra_data_mut = BytesMut::from(&header.extra_data[..]);
+        extra_data_mut[header.extra_data.len().saturating_sub(SIGNATURE_LENGTH)..].copy_from_slice(&sighash.as_bytes());
+        header.extra_data = Bytes::from(extra_data_mut.freeze());
+
+        // Wait until sealing is terminated or delay timeout
+        println!("Waiting for slot to sign and propagate, delay: {:?}", delay);
+        //
 
         Ok(())
     }

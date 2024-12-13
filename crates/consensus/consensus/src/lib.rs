@@ -125,7 +125,16 @@ pub trait Consensus: Debug + Send + Sync {
     fn prepare(
         &self,
         header: &mut Header,
-    )-> Result<(), ConsensusError>;
+    )-> Result<(), ConsensusError> {
+        Ok(())
+    }
+
+    fn seal(
+        &self,
+        header: &mut Header,
+    ) -> Result<(), ConsensusError> {
+        Ok(())
+    }
 }
 
 /// Consensus Errors
@@ -432,6 +441,18 @@ pub enum ConsensusError {
         "invalid difficulty"
     )]
     InvalidDifficulty,
+    #[display(
+        "unauthorized signer"
+    )]
+    UnauthorizedSigner,
+    #[display(
+        "sign header err"
+    )]
+    SignHeaderError,
+    #[display(
+        "save snapshot err"
+    )]
+    SaveSnapshotError,
 }
 
 impl ConsensusError {

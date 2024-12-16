@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::error::Error;
 use std::hash::Hash;
 use std::io::Write;
@@ -7,27 +6,23 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use alloy_primitives::{U256, hex, Bloom, BlockNumber, keccak256, B64, B256, Address, Bytes};
-use alloy_rlp::{length_of_length, Decodable, Encodable, MaxEncodedLenAssoc};
+use alloy_rlp::{length_of_length, Encodable};
 // use blst::min_sig::{Signature, PublicKey as OtherPublicKey};
 use bytes::{BufMut, BytesMut};
 use itertools::Itertools;
 use rand::prelude::SliceRandom;
-use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks};
-use reth_primitives::{Block, SealedBlock, SealedHeader, BlockWithSenders, public_key_to_address};
+use reth_chainspec::{EthChainSpec, EthereumHardforks};
+use reth_primitives::{SealedBlock, SealedHeader, BlockWithSenders, public_key_to_address};
 use reth_primitives_traits::{BlockHeader, Header};
-use reth_provider::{BlockReader, EvmEnvProvider, StateProviderFactory, HeaderProvider, SnapshotProvider};
-use secp256k1::{PublicKey, Message, SECP256K1, Error as SecpError, ecdsa::{RecoverableSignature, RecoveryId}};
-use sha2::digest::consts::U2;
+use reth_provider::{HeaderProvider, SnapshotProvider};
+use secp256k1::{Message, SECP256K1, Error as SecpError, ecdsa::{RecoverableSignature, RecoveryId}};
 use tracing::{info, debug, error};
 use n42_primitives::{APosConfig, Snapshot};
-use reth_engine_primitives::EngineTypes;
 
-use reth_rpc_eth_api::helpers::EthSigner;
 use alloy_signer_local::{LocalSigner, PrivateKeySigner};
 use k256::ecdsa::SigningKey;
 use alloy_signer::SignerSync;
 use reth_consensus::{PostExecutionInput, Consensus, ConsensusError, HeaderConsensusError};
-use reth_rpc::eth::DevSigner;
 use reth_storage_api::SnapshotProviderWriter;
 
 //
@@ -727,7 +722,7 @@ where
         if header.number %self.config.epoch != 0 {
             //Collect all proposals to be voted on
             let proposals_lock = self.proposals.read().unwrap();
-            let mut addresses: Vec<Address> = proposals_lock.iter()
+            let addresses: Vec<Address> = proposals_lock.iter()
                 .filter(|(&address, &authorize)| snap.valid_vote(address, authorize))
                 .map(|(address, _)| *address)
                 .collect();

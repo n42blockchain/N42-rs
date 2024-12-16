@@ -13,5 +13,5 @@ pub mod payload;
 pub mod service;
 
 pub use miner::MiningMode;
-pub use payload::LocalPayloadAttributesBuilder;
-pub use service::LocalEngineService;
+pub use payload::N42PayloadAttributesBuilder;
+pub use service::N42EngineService;

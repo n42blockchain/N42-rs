@@ -76,7 +76,7 @@ impl Future for MiningMode {
 
 /// Local miner advancing the chain/
 #[derive(Debug)]
-pub struct LocalMiner<EngineT: EngineTypes, Provider, B> {
+pub struct N42Miner<EngineT: EngineTypes, Provider, B> {
     /// Provider to read the current tip of the chain.
     provider: Provider,
     /// The payload attribute builder for the engine
@@ -93,13 +93,13 @@ pub struct LocalMiner<EngineT: EngineTypes, Provider, B> {
     last_block_hashes: Vec<B256>,
 }
 
-impl<EngineT, Provider, B> LocalMiner<EngineT, Provider, B>
+impl<EngineT, Provider, B> N42Miner<EngineT, Provider, B>
 where
     EngineT: EngineTypes,
     Provider: BlockReader + ChainSpecProvider<ChainSpec: EthereumHardforks> + 'static,
     B: PayloadAttributesBuilder<<EngineT as PayloadTypes>::PayloadAttributes>,
 {
-    /// Spawns a new [`LocalMiner`] with the given parameters.
+    /// Spawns a new [`N42Miner`] with the given parameters.
     pub fn spawn_new(
         provider: Provider,
         payload_attributes_builder: B,
@@ -124,7 +124,7 @@ where
         tokio::spawn(miner.run());
     }
 
-    /// Runs the [`LocalMiner`] in a loop, polling the miner and building payloads.
+    /// Runs the [`N42Miner`] in a loop, polling the miner and building payloads.
     async fn run(mut self) {
         let mut fcu_interval = tokio::time::interval(Duration::from_secs(1));
         loop {

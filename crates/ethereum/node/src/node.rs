@@ -238,17 +238,19 @@ pub struct EthereumPayloadBuilder;
 
 impl EthereumPayloadBuilder {
     /// A helper method initializing [`PayloadBuilderService`] with the given EVM config.
-    pub fn spawn<Types, Node, Evm, Pool>(
+    pub fn spawn<Types, Node, Evm, Pool, Cons>(
         self,
         evm_config: Evm,
         ctx: &BuilderContext<Node>,
         pool: Pool,
+        _: Cons
     ) -> eyre::Result<PayloadBuilderHandle<Types::Engine>>
     where
         Types: NodeTypesWithEngine<ChainSpec = ChainSpec>,
         Node: FullNodeTypes<Types = Types>,
         Evm: ConfigureEvm<Header = Header>,
         Pool: TransactionPool + Unpin + 'static,
+        Cons: Consensus + Unpin + 'static,
         Types::Engine: PayloadTypes<
             BuiltPayload = EthBuiltPayload,
             PayloadAttributes = EthPayloadAttributes,
@@ -286,7 +288,7 @@ where
     Types: NodeTypesWithEngine<ChainSpec = ChainSpec>,
     Node: FullNodeTypes<Types = Types>,
     Pool: TransactionPool + Unpin + 'static,
-    Cons: Consensus,
+    Cons: Consensus + Unpin + 'static,
     Types::Engine: PayloadTypes<
         BuiltPayload = EthBuiltPayload,
         PayloadAttributes = EthPayloadAttributes,
@@ -297,9 +299,9 @@ where
         self,
         ctx: &BuilderContext<Node>,
         pool: Pool,
-        _: Cons,
+        consensus: Cons,
     ) -> eyre::Result<PayloadBuilderHandle<Types::Engine>> {
-        self.spawn(EthEvmConfig::new(ctx.chain_spec()), ctx, pool)
+        self.spawn(EthEvmConfig::new(ctx.chain_spec()), ctx, pool, consensus)
     }
 }
 

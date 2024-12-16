@@ -1,6 +1,6 @@
 //! Provides a local dev service engine that can be used to run a dev chain.
 //!
-//! [`LocalEngineService`] polls the payload builder based on a mining mode
+//! [`N42EngineService`] polls the payload builder based on a mining mode
 //! which can be set to `Instant` or `Interval`. The `Instant` mode will
 //! constantly poll the payload builder and initiate block building
 //! with a single transaction. The `Interval` mode will initiate block
@@ -14,7 +14,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use crate::miner::{LocalMiner, MiningMode};
+use crate::miner::{N42Miner, MiningMode};
 use futures_util::{Stream, StreamExt};
 use reth_beacon_consensus::{BeaconConsensusEngineEvent, BeaconEngineMessage, EngineNodeTypes};
 use reth_chainspec::EthChainSpec;
@@ -44,7 +44,7 @@ use tracing::error;
 ///
 /// This service both produces and consumes [`BeaconEngineMessage`]s. This is done to allow
 /// modifications of the stream
-pub struct LocalEngineService<N>
+pub struct N42EngineService<N>
 where
     N: EngineNodeTypes,
 {
@@ -56,11 +56,11 @@ where
     incoming_requests: EngineMessageStream<N::Engine>,
 }
 
-impl<N> LocalEngineService<N>
+impl<N> N42EngineService<N>
 where
     N: EngineNodeTypes,
 {
-    /// Constructor for [`LocalEngineService`].
+    /// Constructor for [`N42EngineService`].
     #[allow(clippy::too_many_arguments)]
     pub fn new<B>(
         consensus: Arc<dyn Consensus>,
@@ -105,7 +105,7 @@ where
 
         let handler = EngineApiRequestHandler::new(to_tree_tx, from_tree);
 
-        LocalMiner::spawn_new(
+        N42Miner::spawn_new(
             blockchain_db,
             payload_attributes_builder,
             to_engine,
@@ -117,7 +117,7 @@ where
     }
 }
 
-impl<N> Stream for LocalEngineService<N>
+impl<N> Stream for N42EngineService<N>
 where
     N: EngineNodeTypes,
 {
@@ -152,7 +152,7 @@ where
     }
 }
 
-impl<N: EngineNodeTypes> Debug for LocalEngineService<N> {
+impl<N: EngineNodeTypes> Debug for N42EngineService<N> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("LocalEngineService").finish_non_exhaustive()
     }

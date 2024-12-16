@@ -8,7 +8,7 @@ use reth_beacon_consensus::{
 use reth_blockchain_tree::BlockchainTreeConfig;
 use reth_chainspec::EthChainSpec;
 use reth_consensus_debug_client::{DebugConsensusClient, EtherscanBlockProvider};
-use reth_engine_local::{LocalEngineService, LocalPayloadAttributesBuilder, MiningMode};
+use reth_engine_local::{N42EngineService, N42PayloadAttributesBuilder, MiningMode};
 use reth_engine_service::service::{ChainEvent, EngineService};
 use reth_engine_tree::{
     engine::{EngineApiRequest, EngineRequestHandler},
@@ -74,7 +74,7 @@ where
     T: FullNodeTypes<Types = Types, Provider = BlockchainProvider2<Types>>,
     CB: NodeComponentsBuilder<T>,
     AO: RethRpcAddOns<NodeAdapter<T, CB::Components>>,
-    LocalPayloadAttributesBuilder<Types::ChainSpec>: PayloadAttributesBuilder<
+    N42PayloadAttributesBuilder<Types::ChainSpec>: PayloadAttributesBuilder<
         <<Types as NodeTypesWithEngine>::Engine as PayloadTypes>::PayloadAttributes,
     >,
 {
@@ -213,7 +213,7 @@ where
             } else {
                 MiningMode::instant(ctx.components().pool().clone())
             };
-            let eth_service = LocalEngineService::new(
+            let eth_service = N42EngineService::new(
                 ctx.consensus(),
                 ctx.components().block_executor().clone(),
                 ctx.provider_factory().clone(),
@@ -226,7 +226,7 @@ where
                 consensus_engine_tx.clone(),
                 Box::pin(consensus_engine_stream),
                 mining_mode,
-                LocalPayloadAttributesBuilder::new(ctx.chain_spec()),
+                N42PayloadAttributesBuilder::new(ctx.chain_spec()),
             );
 
             Either::Left(eth_service)

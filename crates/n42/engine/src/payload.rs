@@ -1,5 +1,5 @@
 //! The implementation of the [`PayloadAttributesBuilder`] for the
-//! [`LocalEngineService`](super::service::LocalEngineService).
+//! [`LocalEngineService`](super::service::N42EngineService).
 
 use std::str::FromStr;
 use alloy_primitives::{Address, B256};
@@ -11,11 +11,11 @@ use std::sync::Arc;
 /// The attributes builder for local Ethereum payload.
 #[derive(Debug)]
 #[non_exhaustive]
-pub struct LocalPayloadAttributesBuilder<ChainSpec> {
+pub struct N42PayloadAttributesBuilder<ChainSpec> {
     chain_spec: Arc<ChainSpec>,
 }
 
-impl<ChainSpec> LocalPayloadAttributesBuilder<ChainSpec> {
+impl<ChainSpec> N42PayloadAttributesBuilder<ChainSpec> {
     /// Creates a new instance of the builder.
     pub const fn new(chain_spec: Arc<ChainSpec>) -> Self {
         Self { chain_spec }
@@ -23,7 +23,7 @@ impl<ChainSpec> LocalPayloadAttributesBuilder<ChainSpec> {
 }
 
 impl<ChainSpec> PayloadAttributesBuilder<EthPayloadAttributes>
-    for LocalPayloadAttributesBuilder<ChainSpec>
+    for N42PayloadAttributesBuilder<ChainSpec>
 where
     ChainSpec: Send + Sync + EthereumHardforks + 'static,
 {
@@ -46,7 +46,7 @@ where
 
 #[cfg(feature = "optimism")]
 impl<ChainSpec> PayloadAttributesBuilder<op_alloy_rpc_types_engine::OpPayloadAttributes>
-    for LocalPayloadAttributesBuilder<ChainSpec>
+    for N42PayloadAttributesBuilder<ChainSpec>
 where
     ChainSpec: Send + Sync + EthereumHardforks + 'static,
 {

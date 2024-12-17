@@ -14,6 +14,10 @@ mod node;
 pub use node::N42Node;
 
 mod payload;
+mod job_generator;
+mod job;
+mod metrics;
+
 pub use payload::N42PayloadBuilder;
 pub use payload::N42PayloadServiceBuilder;
 

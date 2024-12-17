@@ -46,7 +46,9 @@ use crate::job::{Cancelled, N42PayloadJob, N42PayloadJobGeneratorConfig, Pending
 
 /// The [`PayloadJobGenerator`] that creates [`BasicPayloadJob`]s.
 #[derive(Debug)]
-pub struct N42PayloadJobGenerator<Client, Pool, Tasks, Builder> {
+pub struct N42PayloadJobGenerator<Client, Pool, Consensus, Tasks, Builder> {
+    /// the Consensus that prepare header and seal header
+    consensus: Consensus,
     /// The client that can interact with the chain.
     client: Client,
     /// The transaction pool to pull transactions from.
@@ -67,12 +69,13 @@ pub struct N42PayloadJobGenerator<Client, Pool, Tasks, Builder> {
 
 // === impl BasicPayloadJobGenerator ===
 
-impl<Client, Pool, Tasks, Builder> N42PayloadJobGenerator<Client, Pool, Tasks, Builder> {
+impl<Client, Pool, Consensus, Tasks, Builder> N42PayloadJobGenerator<Client, Pool, Consensus, Tasks, Builder> {
     /// Creates a new [`N42PayloadJobGenerator`] with the given config and custom
     /// [`PayloadBuilder`]
     pub fn with_builder(
         client: Client,
         pool: Pool,
+        consensus: Consensus,
         executor: Tasks,
         config: N42PayloadJobGeneratorConfig,
         builder: Builder,
@@ -80,6 +83,7 @@ impl<Client, Pool, Tasks, Builder> N42PayloadJobGenerator<Client, Pool, Tasks, B
         Self {
             client,
             pool,
+            consensus,
             executor,
             payload_task_guard: PayloadTaskGuard::new(config.max_payload_tasks),
             config,
@@ -127,17 +131,18 @@ impl<Client, Pool, Tasks, Builder> N42PayloadJobGenerator<Client, Pool, Tasks, B
 
 // === impl BasicPayloadJobGenerator ===
 
-impl<Client, Pool, Tasks, Builder> PayloadJobGenerator
-for N42PayloadJobGenerator<Client, Pool, Tasks, Builder>
+impl<Client, Pool, Consensus, Tasks, Builder> PayloadJobGenerator
+for N42PayloadJobGenerator<Client, Pool, Consensus, Tasks, Builder>
 where
     Client: StateProviderFactory + BlockReaderIdExt + Clone + Unpin + 'static,
     Pool: TransactionPool + Unpin + 'static,
+    Consensus: reth::consensus::Consensus + Unpin + 'static,
     Tasks: TaskSpawner + Clone + Unpin + 'static,
-    Builder: PayloadBuilder<Pool, Client> + Unpin + 'static,
-    <Builder as PayloadBuilder<Pool, Client>>::Attributes: Unpin + Clone,
-    <Builder as PayloadBuilder<Pool, Client>>::BuiltPayload: Unpin + Clone,
+    Builder: PayloadBuilder<Pool, Consensus, Client> + Unpin + 'static,
+    <Builder as PayloadBuilder<Pool, Consensus, Client>>::Attributes: Unpin + Clone,
+    <Builder as PayloadBuilder<Pool, Consensus, Client>>::BuiltPayload: Unpin + Clone,
 {
-    type Job = N42PayloadJob<Client, Pool, Tasks, Builder>;
+    type Job = N42PayloadJob<Client, Pool, Consensus, Tasks, Builder>;
 
     fn new_payload_job(
         &self,
@@ -175,6 +180,7 @@ where
             config,
             client: self.client.clone(),
             pool: self.pool.clone(),
+            consensus: self.consensus.clone(),
             executor: self.executor.clone(),
             deadline,
             // ticks immediately
@@ -441,13 +447,15 @@ impl<Payload> BuildOutcome<Payload> {
 /// building process. It holds references to the Ethereum client, transaction pool, cached reads,
 /// payload configuration, cancellation status, and the best payload achieved so far.
 #[derive(Debug)]
-pub struct BuildArguments<Pool, Client, Attributes, Payload> {
+pub struct N42BuildArguments<Pool, Cons, Client, Attributes, Payload> {
     /// How to interact with the chain.
     pub client: Client,
     /// The transaction pool.
     ///
     /// Or the type that provides the transactions to build the payload.
     pub pool: Pool,
+    /// the Consensus that prepare header and seal header
+    pub consensus: Cons,
     /// Previously cached disk reads
     pub cached_reads: CachedReads,
     /// How to configure the payload.
@@ -458,24 +466,26 @@ pub struct BuildArguments<Pool, Client, Attributes, Payload> {
     pub best_payload: Option<Payload>,
 }
 
-impl<Pool, Client, Attributes, Payload> BuildArguments<Pool, Client, Attributes, Payload> {
+impl<Pool, Cons, Client, Attributes, Payload> N42BuildArguments<Pool, Cons, Client, Attributes, Payload> {
     /// Create new build arguments.
     pub const fn new(
         client: Client,
         pool: Pool,
+        consensus: Cons,
         cached_reads: CachedReads,
         config: PayloadConfig<Attributes>,
         cancel: Cancelled,
         best_payload: Option<Payload>,
     ) -> Self {
-        Self { client, pool, cached_reads, config, cancel, best_payload }
+        Self { client, pool, consensus, cached_reads, config, cancel, best_payload }
     }
 
     /// Maps the transaction pool to a new type.
-    pub fn with_pool<P>(self, pool: P) -> BuildArguments<P, Client, Attributes, Payload> {
-        BuildArguments {
+    pub fn with_pool<P>(self, pool: P) -> N42BuildArguments<P, Cons, Client, Attributes, Payload> {
+        N42BuildArguments {
             client: self.client,
             pool,
+            consensus: self.consensus,
             cached_reads: self.cached_reads,
             config: self.config,
             cancel: self.cancel,
@@ -484,13 +494,14 @@ impl<Pool, Client, Attributes, Payload> BuildArguments<Pool, Client, Attributes,
     }
 
     /// Maps the transaction pool to a new type using a closure with the current pool type as input.
-    pub fn map_pool<F, P>(self, f: F) -> BuildArguments<P, Client, Attributes, Payload>
+    pub fn map_pool<F, P>(self, f: F) -> N42BuildArguments<P, Cons, Client, Attributes, Payload>
     where
         F: FnOnce(Pool) -> P,
     {
-        BuildArguments {
+        N42BuildArguments {
             client: self.client,
             pool: f(self.pool),
+            consensus: self.consensus,
             cached_reads: self.cached_reads,
             config: self.config,
             cancel: self.cancel,
@@ -507,7 +518,7 @@ impl<Pool, Client, Attributes, Payload> BuildArguments<Pool, Client, Attributes,
 ///
 /// Generic parameters `Pool` and `Client` represent the transaction pool and
 /// Ethereum client types.
-pub trait PayloadBuilder<Pool, Client>: Send + Sync + Clone {
+pub trait PayloadBuilder<Pool, Client, Cons>: Send + Sync + Clone {
     /// The payload attributes type to accept for building.
     type Attributes: PayloadBuilderAttributes;
     /// The type of the built payload.
@@ -527,7 +538,7 @@ pub trait PayloadBuilder<Pool, Client>: Send + Sync + Clone {
     /// A `Result` indicating the build outcome or an error.
     fn try_build(
         &self,
-        args: BuildArguments<Pool, Client, Self::Attributes, Self::BuiltPayload>,
+        args: N42BuildArguments<Pool, Client, Cons, Self::Attributes, Self::BuiltPayload>,
     ) -> Result<BuildOutcome<Self::BuiltPayload>, PayloadBuilderError>;
 
     /// Invoked when the payload job is being resolved and there is no payload yet.
@@ -535,7 +546,7 @@ pub trait PayloadBuilder<Pool, Client>: Send + Sync + Clone {
     /// This can happen if the CL requests a payload before the first payload has been built.
     fn on_missing_payload(
         &self,
-        _args: BuildArguments<Pool, Client, Self::Attributes, Self::BuiltPayload>,
+        _args: N42BuildArguments<Pool, Cons, Client, Self::Attributes, Self::BuiltPayload>,
     ) -> MissingPayloadBehaviour<Self::BuiltPayload> {
         MissingPayloadBehaviour::RaceEmptyPayload
     }
@@ -543,8 +554,7 @@ pub trait PayloadBuilder<Pool, Client>: Send + Sync + Clone {
     /// Builds an empty payload without any transaction.
     fn build_empty_payload(
         &self,
-        client: &Client,
-        config: PayloadConfig<Self::Attributes>,
+        args: N42BuildArguments<Pool, Cons, Client, Self::Attributes, Self::BuiltPayload>,
     ) -> Result<Self::BuiltPayload, PayloadBuilderError>;
 }
 

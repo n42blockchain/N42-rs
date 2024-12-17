@@ -21,7 +21,7 @@ use reth_payload_primitives::{
 use reth::revm::cached::CachedReads;
 use reth::tasks::TaskSpawner;
 use reth_transaction_pool::TransactionPool;
-use crate::job_generator::{BuildArguments, BuildOutcome, MissingPayloadBehaviour, N42PayloadJobGenerator, PayloadBuilder, PayloadConfig, PayloadState, PayloadTaskGuard, PendingPayload, ResolveBestPayload};
+use crate::job_generator::{N42BuildArguments, BuildOutcome, MissingPayloadBehaviour, N42PayloadJobGenerator, PayloadBuilder, PayloadConfig, PayloadState, PayloadTaskGuard, PendingPayload, ResolveBestPayload};
 use crate::metrics::PayloadBuilderMetrics;
 
 
@@ -78,7 +78,7 @@ impl Drop for Cancelled {
 #[derive(Debug, Clone)]
 pub struct N42PayloadJobGeneratorConfig {
     /// Data to include in the block's extra data field.
-    extradata: Bytes,
+    pub(crate) extradata: Bytes,
     /// The interval at which the job should build a new payload after the last.
     pub(crate) interval: Duration,
     /// The deadline for when the payload builder job should resolve.
@@ -138,12 +138,14 @@ impl Default for N42PayloadJobGeneratorConfig {
 
 /// A basic payload job that continuously builds a payload with the best transactions from the pool.
 #[derive(Debug)]
-pub struct N42PayloadJob<Client, Pool, Tasks, Builder>
+pub struct N42PayloadJob<Client, Pool, Consensus, Tasks, Builder>
 where
-    Builder: PayloadBuilder<Pool, Client>,
+    Builder: PayloadBuilder<Pool, Consensus, Client>,
 {
     /// The configuration for how the payload will be created.
     pub(crate) config: PayloadConfig<Builder::Attributes>,
+    /// the Consensus that prepare header and seal header
+    pub(crate) consensus: Consensus,
     /// The client that can interact with the chain.
     pub(crate) client: Client,
     /// The transaction pool.
@@ -173,14 +175,15 @@ where
     pub(crate) builder: Builder,
 }
 
-impl<Client, Pool, Tasks, Builder> N42PayloadJob<Client, Pool, Tasks, Builder>
+impl<Client, Pool, Consensus, Tasks, Builder> N42PayloadJob<Client, Pool, Consensus, Tasks, Builder>
 where
     Client: StateProviderFactory + Clone + Unpin + 'static,
     Pool: TransactionPool + Unpin + 'static,
     Tasks: TaskSpawner + Clone + 'static,
-    Builder: PayloadBuilder<Pool, Client> + Unpin + 'static,
-    <Builder as PayloadBuilder<Pool, Client>>::Attributes: Unpin + Clone,
-    <Builder as PayloadBuilder<Pool, Client>>::BuiltPayload: Unpin + Clone,
+    Consensus: reth::consensus::Consensus + Clone + 'static,
+    Builder: PayloadBuilder<Pool, Consensus, Client> + Unpin + 'static,
+    <Builder as PayloadBuilder<Pool, Consensus, Client>>::Attributes: Unpin + Clone,
+    <Builder as PayloadBuilder<Pool, Consensus, Client>>::BuiltPayload: Unpin + Clone,
 {
     /// Spawns a new payload build task.
     pub(crate) fn spawn_build_job(&mut self) {
@@ -188,6 +191,7 @@ where
         let (tx, rx) = oneshot::channel();
         let client = self.client.clone();
         let pool = self.pool.clone();
+        let consensus = self.consensus.clone();
         let cancel = Cancelled::default();
         let _cancel = cancel.clone();
         let guard = self.payload_task_guard.clone();
@@ -199,9 +203,10 @@ where
         self.executor.spawn_blocking(Box::pin(async move {
             // acquire the permit for executing the task
             let _permit = guard.acquire().await;
-            let args = BuildArguments {
+            let args = N42BuildArguments {
                 client,
                 pool,
+                consensus,
                 cached_reads,
                 config: payload_config,
                 cancel,
@@ -215,14 +220,15 @@ where
     }
 }
 
-impl<Client, Pool, Tasks, Builder> Future for N42PayloadJob<Client, Pool, Tasks, Builder>
+impl<Client, Pool, Consensus, Tasks, Builder> Future for N42PayloadJob<Client, Pool, Consensus, Tasks, Builder>
 where
     Client: StateProviderFactory + Clone + Unpin + 'static,
     Pool: TransactionPool + Unpin + 'static,
+    Consensus: reth::consensus::Consensus + Unpin + 'static,
     Tasks: TaskSpawner + Clone + 'static,
-    Builder: PayloadBuilder<Pool, Client> + Unpin + 'static,
-    <Builder as PayloadBuilder<Pool, Client>>::Attributes: Unpin + Clone,
-    <Builder as PayloadBuilder<Pool, Client>>::BuiltPayload: Unpin + Clone,
+    Builder: PayloadBuilder<Pool, Consensus, Client> + Unpin + 'static,
+    <Builder as PayloadBuilder<Pool, Consensus, Client>>::Attributes: Unpin + Clone,
+    <Builder as PayloadBuilder<Pool, Consensus, Client>>::BuiltPayload: Unpin + Clone,
 {
     type Output = Result<(), PayloadBuilderError>;
 
@@ -280,14 +286,15 @@ where
     }
 }
 
-impl<Client, Pool, Tasks, Builder> PayloadJob for N42PayloadJob<Client, Pool, Tasks, Builder>
+impl<Client, Pool, Consensus, Tasks, Builder> PayloadJob for N42PayloadJob<Client, Pool, Consensus, Tasks, Builder>
 where
     Client: StateProviderFactory + Clone + Unpin + 'static,
     Pool: TransactionPool + Unpin + 'static,
+    Consensus: reth::consensus::Consensus + Clone + Unpin + 'static,
     Tasks: TaskSpawner + Clone + 'static,
-    Builder: PayloadBuilder<Pool, Client> + Unpin + 'static,
-    <Builder as PayloadBuilder<Pool, Client>>::Attributes: Unpin + Clone,
-    <Builder as PayloadBuilder<Pool, Client>>::BuiltPayload: Unpin + Clone,
+    Builder: PayloadBuilder<Pool, Consensus, Client> + Unpin + 'static,
+    <Builder as PayloadBuilder<Pool, Consensus, Client>>::Attributes: Unpin + Clone,
+    <Builder as PayloadBuilder<Pool, Consensus, Client>>::BuiltPayload: Unpin + Clone,
 {
     type PayloadAttributes = Builder::Attributes;
     type ResolvePayloadFuture = ResolveBestPayload<Self::BuiltPayload>;
@@ -303,8 +310,17 @@ where
             // Note: it is assumed that this is unlikely to happen, as the payload job is
             // started right away and the first full block should have been
             // built by the time CL is requesting the payload.
+            let args = N42BuildArguments {
+                client: self.client.clone(),
+                pool: self.pool.clone(),
+                consensus: self.consensus.clone(),
+                cached_reads: CachedReads::default(),
+                config: self.config.clone(),
+                cancel: Cancelled::default(),
+                best_payload: None,
+            };
             self.metrics.inc_requested_empty_payload();
-            self.builder.build_empty_payload(&self.client, self.config.clone())
+            self.builder.build_empty_payload(args)
         }
     }
 
@@ -328,9 +344,10 @@ where
         if best_payload.is_none() {
             debug!(target: "payload_builder", id=%self.config.payload_id(), "no best payload yet to resolve, building empty payload");
 
-            let args = BuildArguments {
+            let args = N42BuildArguments {
                 client: self.client.clone(),
                 pool: self.pool.clone(),
+                consensus: self.consensus.clone(),
                 cached_reads: self.cached_reads.take().unwrap_or_default(),
                 config: self.config.clone(),
                 cancel: Cancelled::default(),

@@ -121,9 +121,9 @@ where
 
         let pool = args.pool.clone();
 
-        let (cfg_env, block_env) = self
-            .cfg_and_block_env(&args.config, &args.config.parent_header)
-            .map_err(PayloadBuilderError::other)?;
+        // This reuses the default EthereumPayloadBuilder to build the payload
+        // but any custom logic can be implemented here
+        let (cfg_env, block_env) = evm_config.next_cfg_and_block_env(&args.config.parent_header, next_attributes).map_err(PayloadBuilderError::other)?;
 
         let pool = args.pool.clone();
 
@@ -153,7 +153,7 @@ where
         Types: NodeTypesWithEngine<Engine =N42EngineTypes, ChainSpec = ChainSpec>,
     >,
     Pool: TransactionPool + Unpin + 'static, 
-    Cons: reth::consensus::Consensus + Unpin + 'static,
+    Cons: Consensus + Unpin + Clone + 'static,
 {
     async fn spawn_payload_service(
         self,
@@ -496,7 +496,7 @@ where
     };
 
     // prepare
-    consensus.prepare(&header);
+    consensus.prepare(&mut header).map_err(|err| PayloadBuilderError::Internal(err.into()))?;
 
     // ly Simple generation.
     let verifiers=Some(Verifiers::default());

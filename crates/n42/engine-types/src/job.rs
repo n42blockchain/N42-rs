@@ -224,7 +224,7 @@ impl<Client, Pool, Consensus, Tasks, Builder> Future for N42PayloadJob<Client, P
 where
     Client: StateProviderFactory + Clone + Unpin + 'static,
     Pool: TransactionPool + Unpin + 'static,
-    Consensus: reth::consensus::Consensus + Unpin + 'static,
+    Consensus: reth::consensus::Consensus + Unpin + Clone + 'static,
     Tasks: TaskSpawner + Clone + 'static,
     Builder: PayloadBuilder<Pool, Client, Consensus> + Unpin + 'static,
     <Builder as PayloadBuilder<Pool, Client, Consensus>>::Attributes: Unpin + Clone,
@@ -365,11 +365,20 @@ where
                     self.metrics.inc_requested_empty_payload();
                     // no payload built yet, so we need to return an empty payload
                     let (tx, rx) = oneshot::channel();
-                    let client = self.client.clone();
-                    let config = self.config.clone();
                     let builder = self.builder.clone();
+
+                    let args = N42BuildArguments {
+                        client: self.client.clone(),
+                        pool: self.pool.clone(),
+                        consensus: self.consensus.clone(),
+                        cached_reads: self.cached_reads.take().unwrap_or_default(),
+                        config: self.config.clone(),
+                        cancel: Cancelled::default(),
+                        best_payload: None,
+                    };
+
                     self.executor.spawn_blocking(Box::pin(async move {
-                        let res = builder.build_empty_payload(&client, config);
+                        let res = builder.build_empty_payload(args);
                         let _ = tx.send(res);
                     }));
 

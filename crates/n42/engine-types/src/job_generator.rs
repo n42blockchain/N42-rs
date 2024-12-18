@@ -128,7 +128,7 @@ for N42PayloadJobGenerator<Client, Pool, Consensus, Tasks, Builder>
 where
     Client: StateProviderFactory + BlockReaderIdExt + Clone + Unpin + 'static,
     Pool: TransactionPool + Unpin + 'static,
-    Consensus: reth::consensus::Consensus + Unpin + 'static,
+    Consensus: reth::consensus::Consensus + Unpin + Clone + 'static,
     Tasks: TaskSpawner + Clone + Unpin + 'static,
     Builder: PayloadBuilder<Pool, Client, Consensus> + Unpin + 'static,
     <Builder as PayloadBuilder<Pool, Client, Consensus>>::Attributes: Unpin + Clone,

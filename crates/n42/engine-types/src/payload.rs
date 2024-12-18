@@ -70,18 +70,18 @@ type BestTransactionsIter<Pool> = Box<
 #[non_exhaustive]
 pub struct N42PayloadBuilder;
 
-impl<Pool, Consensus, Client> PayloadBuilder<Pool, Consensus, Client> for N42PayloadBuilder
+impl<Pool, Client, Cons> PayloadBuilder<Pool, Client, Cons> for N42PayloadBuilder
 where
     Client: StateProviderFactory + ChainSpecProvider<ChainSpec = ChainSpec>,
     Pool: TransactionPool,
-    Consensus: reth::consensus::Consensus,
+    Cons: reth::consensus::Consensus,
 {
     type Attributes = N42PayloadBuilderAttributes;
     type BuiltPayload = EthBuiltPayload;
 
     fn try_build(
         &self,
-        args: N42BuildArguments<Pool, Consensus, Client, Self::Attributes, Self::BuiltPayload>,
+        args: N42BuildArguments<Pool, Client, Cons, Self::Attributes, Self::BuiltPayload>,
     ) -> Result<BuildOutcome<Self::BuiltPayload>, PayloadBuilderError> {
 
         let chain_spec = args.client.chain_spec();
@@ -106,7 +106,7 @@ where
 
     fn build_empty_payload(
         &self,
-        args: N42BuildArguments<Pool, Consensus, Client, Self::Attributes, Self::BuiltPayload>,
+        args: N42BuildArguments<Pool, Client, Cons, Self::Attributes, Self::BuiltPayload>,
     ) -> Result<Self::BuiltPayload, PayloadBuilderError> {
 
 
@@ -147,18 +147,19 @@ where
 #[non_exhaustive]
 pub struct N42PayloadServiceBuilder;
 
-impl<Node, Pool, Consensus> PayloadServiceBuilder<Node, Pool, Consensus> for N42PayloadServiceBuilder
+impl<Node, Pool, Cons> PayloadServiceBuilder<Node, Pool, Cons> for N42PayloadServiceBuilder
 where
     Node: FullNodeTypes<
         Types: NodeTypesWithEngine<Engine =N42EngineTypes, ChainSpec = ChainSpec>,
     >,
-    Pool: TransactionPool + Unpin + 'static,
+    Pool: TransactionPool + Unpin + 'static, 
+    Cons: reth::consensus::Consensus + Unpin + 'static,
 {
     async fn spawn_payload_service(
         self,
         ctx: &BuilderContext<Node>,
         pool: Pool,
-        consensus: Consensus,
+        consensus: Cons,
     ) -> eyre::Result<PayloadBuilderHandle<<Node::Types as NodeTypesWithEngine>::Engine>> {
         let payload_builder = N42PayloadBuilder::default();
         let conf = ctx.payload_builder_config();

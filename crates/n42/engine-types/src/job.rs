@@ -21,7 +21,7 @@ use reth_payload_primitives::{
 use reth::revm::cached::CachedReads;
 use reth::tasks::TaskSpawner;
 use reth_transaction_pool::TransactionPool;
-use crate::job_generator::{N42BuildArguments, BuildOutcome, MissingPayloadBehaviour, N42PayloadJobGenerator, PayloadBuilder, PayloadConfig, PayloadState, PayloadTaskGuard, PendingPayload, ResolveBestPayload};
+use crate::job_generator::{N42BuildArguments, BuildOutcome, MissingPayloadBehaviour, N42PayloadJobGenerator, PayloadBuilder, PayloadConfig, PayloadState, PayloadTaskGuard, ResolveBestPayload};
 use crate::metrics::PayloadBuilderMetrics;
 
 
@@ -140,7 +140,7 @@ impl Default for N42PayloadJobGeneratorConfig {
 #[derive(Debug)]
 pub struct N42PayloadJob<Client, Pool, Consensus, Tasks, Builder>
 where
-    Builder: PayloadBuilder<Pool, Consensus, Client>,
+    Builder: PayloadBuilder<Pool, Client, Consensus>,
 {
     /// The configuration for how the payload will be created.
     pub(crate) config: PayloadConfig<Builder::Attributes>,
@@ -181,9 +181,9 @@ where
     Pool: TransactionPool + Unpin + 'static,
     Tasks: TaskSpawner + Clone + 'static,
     Consensus: reth::consensus::Consensus + Clone + 'static,
-    Builder: PayloadBuilder<Pool, Consensus, Client> + Unpin + 'static,
-    <Builder as PayloadBuilder<Pool, Consensus, Client>>::Attributes: Unpin + Clone,
-    <Builder as PayloadBuilder<Pool, Consensus, Client>>::BuiltPayload: Unpin + Clone,
+    Builder: PayloadBuilder<Pool, Client, Consensus> + Unpin + 'static,
+    <Builder as PayloadBuilder<Pool, Client, Consensus>>::Attributes: Unpin + Clone,
+    <Builder as PayloadBuilder<Pool, Client, Consensus>>::BuiltPayload: Unpin + Clone,
 {
     /// Spawns a new payload build task.
     pub(crate) fn spawn_build_job(&mut self) {
@@ -226,9 +226,9 @@ where
     Pool: TransactionPool + Unpin + 'static,
     Consensus: reth::consensus::Consensus + Unpin + 'static,
     Tasks: TaskSpawner + Clone + 'static,
-    Builder: PayloadBuilder<Pool, Consensus, Client> + Unpin + 'static,
-    <Builder as PayloadBuilder<Pool, Consensus, Client>>::Attributes: Unpin + Clone,
-    <Builder as PayloadBuilder<Pool, Consensus, Client>>::BuiltPayload: Unpin + Clone,
+    Builder: PayloadBuilder<Pool, Client, Consensus> + Unpin + 'static,
+    <Builder as PayloadBuilder<Pool, Client, Consensus>>::Attributes: Unpin + Clone,
+    <Builder as PayloadBuilder<Pool, Client, Consensus>>::BuiltPayload: Unpin + Clone,
 {
     type Output = Result<(), PayloadBuilderError>;
 
@@ -292,9 +292,9 @@ where
     Pool: TransactionPool + Unpin + 'static,
     Consensus: reth::consensus::Consensus + Clone + Unpin + 'static,
     Tasks: TaskSpawner + Clone + 'static,
-    Builder: PayloadBuilder<Pool, Consensus, Client> + Unpin + 'static,
-    <Builder as PayloadBuilder<Pool, Consensus, Client>>::Attributes: Unpin + Clone,
-    <Builder as PayloadBuilder<Pool, Consensus, Client>>::BuiltPayload: Unpin + Clone,
+    Builder: PayloadBuilder<Pool, Client, Consensus> + Unpin + 'static,
+    <Builder as PayloadBuilder<Pool, Client, Consensus>>::Attributes: Unpin + Clone,
+    <Builder as PayloadBuilder<Pool, Client, Consensus>>::BuiltPayload: Unpin + Clone,
 {
     type PayloadAttributes = Builder::Attributes;
     type ResolvePayloadFuture = ResolveBestPayload<Self::BuiltPayload>;

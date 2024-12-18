@@ -75,10 +75,10 @@ impl EthereumNode {
         ComponentsBuilder::default()
             .node_types::<Node>()
             .pool(EthereumPoolBuilder::default())
+            .consensus(EthereumConsensusBuilder::default())
             .payload(EthereumPayloadBuilder::default())
             .network(EthereumNetworkBuilder::default())
             .executor(EthereumExecutorBuilder::default())
-            .consensus(EthereumConsensusBuilder::default())
     }
 }
 

@@ -166,6 +166,36 @@ where
             _marker,
         }
     }
+
+    /// Configures the consensus builder.
+    ///
+    /// This accepts a [`ConsensusBuilder`] instance that will be used to create the node's
+    /// components for consensus.
+    pub fn consensus<CB>(
+        self,
+        consensus_builder: CB,
+    ) -> ComponentsBuilder<Node, PoolB, PayloadB, NetworkB, ExecB, CB>
+    where
+        CB: ConsensusBuilder<Node>,
+    {
+        let Self {
+            pool_builder,
+            payload_builder,
+            network_builder,
+            executor_builder,
+            consensus_builder: _,
+
+            _marker,
+        } = self;
+        ComponentsBuilder {
+            pool_builder,
+            payload_builder,
+            network_builder,
+            executor_builder,
+            consensus_builder,
+            _marker,
+        }
+    }
 }
 
 impl<Node, PoolB, PayloadB, NetworkB, ExecB, ConsB>
@@ -250,36 +280,6 @@ where
             network_builder,
             executor_builder: _,
             consensus_builder,
-            _marker,
-        } = self;
-        ComponentsBuilder {
-            pool_builder,
-            payload_builder,
-            network_builder,
-            executor_builder,
-            consensus_builder,
-            _marker,
-        }
-    }
-
-    /// Configures the consensus builder.
-    ///
-    /// This accepts a [`ConsensusBuilder`] instance that will be used to create the node's
-    /// components for consensus.
-    pub fn consensus<CB>(
-        self,
-        consensus_builder: CB,
-    ) -> ComponentsBuilder<Node, PoolB, PayloadB, NetworkB, ExecB, CB>
-    where
-        CB: ConsensusBuilder<Node>,
-    {
-        let Self {
-            pool_builder,
-            payload_builder,
-            network_builder,
-            executor_builder,
-            consensus_builder: _,
-
             _marker,
         } = self;
         ComponentsBuilder {

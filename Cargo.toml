@@ -224,6 +224,8 @@ n42-primitives = { path = "crates/n42/primitives" }
 n42-clique = {path="crates/n42/clique"}
 n42-engine-types = {path="crates/n42/engine-types"}
 blst = "0.3.11"
+tracing-subscriber = { version = "0.3.18", features = ["default", "fmt"] }
+tracing-journald = { version = "0.3.0" }
 
 reth = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.1.1" }
 reth-auto-seal-consensus = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.1.1" }

@@ -152,7 +152,7 @@ where
     Node: FullNodeTypes<
         Types: NodeTypesWithEngine<Engine =N42EngineTypes, ChainSpec = ChainSpec>,
     >,
-    Pool: TransactionPool + Unpin + 'static, 
+    Pool: TransactionPool + Unpin + 'static,
     Cons: Consensus + Unpin + Clone + 'static,
 {
     async fn spawn_payload_service(
@@ -244,6 +244,10 @@ where
     let block_number = initialized_block_env.number.to::<u64>();
 
     let mut system_caller = SystemCaller::new(evm_config.clone(), chain_spec.clone());
+
+    let mut header = Header::default();
+    // prepare
+    consensus.prepare(&mut header).map_err(|err| PayloadBuilderError::Internal(err.into()))?;
 
     // apply eip-4788 pre block contract call
     system_caller
@@ -471,32 +475,32 @@ where
         blob_gas_used = Some(sum_blob_gas_used);
     }
 
-    let mut header = Header {
-        parent_hash: parent_header.hash(),
-        ommers_hash: EMPTY_OMMER_ROOT_HASH,
-        beneficiary: initialized_block_env.coinbase,
-        state_root,
-        transactions_root,
-        receipts_root,
-        withdrawals_root,
-        logs_bloom,
-        timestamp: attributes.0.timestamp,
-        mix_hash: attributes.0.prev_randao,
-        nonce: BEACON_NONCE.into(),
-        base_fee_per_gas: Some(base_fee),
-        number: parent_header.number + 1,
-        gas_limit: block_gas_limit,
-        difficulty: U256::ZERO,
-        gas_used: cumulative_gas_used,
-        extra_data,
-        parent_beacon_block_root: attributes.0.parent_beacon_block_root,
-        blob_gas_used: blob_gas_used.map(Into::into),
-        excess_blob_gas: excess_blob_gas.map(Into::into),
-        requests_hash,
-    };
+    header.parent_hash = parent_header.hash();
+    header.ommers_hash = EMPTY_OMMER_ROOT_HASH;
+    header.beneficiary = initialized_block_env.coinbase;
+    header.number = parent_header.number + 1;
+    header.gas_limit = block_gas_limit;
+    // header.difficulty = U256::ZERO;
+    // header.extra_data = extra_data;
+    // roots
+    header.state_root = state_root;
+    header.transactions_root = transactions_root;
+    header.receipts_root = receipts_root;
+    header.withdrawals_root = withdrawals_root;
+    header.logs_bloom = logs_bloom;
+    header.requests_hash = requests_hash;
+    header.timestamp = attributes.0.timestamp;
+    header.mix_hash = attributes.0.prev_randao;
+    // header.nonce = BEACON_NONCE.into();
+    header.base_fee_per_gas = Some(base_fee);
+    //
+    header.parent_beacon_block_root = attributes.0.parent_beacon_block_root;
+    header.blob_gas_used = blob_gas_used.map(Into::into);
+    header.excess_blob_gas = excess_blob_gas.map(Into::into);
+    //
 
-    // prepare
-    consensus.prepare(&mut header).map_err(|err| PayloadBuilderError::Internal(err.into()))?;
+    // seal
+    consensus.seal(&mut header).map_err(|err| PayloadBuilderError::Internal(err.into()))?;
 
     // ly Simple generation.
     let verifiers=Some(Verifiers::default());

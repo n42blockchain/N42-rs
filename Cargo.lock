@@ -4750,6 +4750,55 @@ dependencies = [
 ]
 
 [[package]]
+name = "n42-testing"
+version = "1.1.1"
+dependencies = [
+ "alloy-consensus",
+ "alloy-contract",
+ "alloy-eips",
+ "alloy-genesis",
+ "alloy-primitives",
+ "alloy-provider",
+ "alloy-rpc-types-beacon",
+ "alloy-signer",
+ "alloy-sol-types",
+ "eyre",
+ "futures",
+ "n42-clique",
+ "n42-engine-types",
+ "rand 0.8.5",
+ "reth",
+ "reth-auto-seal-consensus",
+ "reth-basic-payload-builder",
+ "reth-beacon-consensus",
+ "reth-chainspec",
+ "reth-consensus",
+ "reth-db",
+ "reth-ethereum-engine-primitives",
+ "reth-ethereum-payload-builder",
+ "reth-evm",
+ "reth-evm-ethereum",
+ "reth-exex",
+ "reth-network",
+ "reth-node-api",
+ "reth-node-builder",
+ "reth-node-ethereum",
+ "reth-payload-builder",
+ "reth-payload-primitives",
+ "reth-primitives",
+ "reth-provider",
+ "reth-revm",
+ "reth-rpc",
+ "reth-tasks",
+ "reth-tracing",
+ "reth-transaction-pool",
+ "reth-trie-db",
+ "revm",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "n42-testing-util"
 version = "1.1.1"
 dependencies = [

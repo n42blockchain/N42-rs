@@ -209,7 +209,7 @@ impl<DB, ChainSpec: EthChainSpec> NodeBuilder<DB, ChainSpec> {
     }
 
     /// Creates an _ephemeral_ preconfigured node for testing purposes.
-    #[cfg(feature = "test-utils")]
+    //#[cfg(feature = "test-utils")]
     pub fn testing_node(
         mut self,
         task_executor: TaskExecutor,

@@ -1,4 +1,3 @@
-
 use reth::{
     api::PayloadTypes,
     builder::{
@@ -7,10 +6,10 @@ use reth::{
         FullNodeTypes, Node, NodeAdapter, NodeComponentsBuilder,
     },
 };
+use reth::payload::EthBuiltPayload;
 use reth_chainspec::{ChainSpec, ChainSpecProvider};
 use reth_node_api::{
-    EngineTypes,
-    FullNodeComponents, PayloadAttributes, PayloadBuilderAttributes,
+    FullNodeComponents
 };
 use reth_node_ethereum::{
     node::{
@@ -19,11 +18,40 @@ use reth_node_ethereum::{
     },
 };
 use reth_trie_db::MerklePatriciaTrie;
-use crate::{N42EngineTypes, N42NodeAddOns, N42PayloadServiceBuilder};
+use crate::{N42EngineTypes, N42NodeAddOns, N42PayloadAttributes, N42PayloadBuilder, N42PayloadBuilderAttributes, N42PayloadServiceBuilder};
 
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct N42Node;
+
+
+impl N42Node {
+    /// Returns a [`ComponentsBuilder`] configured for a regular Ethereum node.
+    pub fn components<Node>() -> ComponentsBuilder<
+        Node,
+        EthereumPoolBuilder,
+        N42PayloadServiceBuilder,
+        EthereumNetworkBuilder,
+        EthereumExecutorBuilder,
+        EthereumConsensusBuilder,
+    >
+    where
+        Node: FullNodeTypes<Types: NodeTypes<ChainSpec = ChainSpec>>,
+        <Node::Types as NodeTypesWithEngine>::Engine: PayloadTypes<
+            BuiltPayload = EthBuiltPayload,
+            PayloadAttributes = N42PayloadAttributes,
+            PayloadBuilderAttributes = N42PayloadBuilderAttributes,
+        >,
+    {
+        ComponentsBuilder::default()
+            .node_types::<Node>()
+            .pool(EthereumPoolBuilder::default())
+            .consensus(EthereumConsensusBuilder::default())
+            .payload(N42PayloadServiceBuilder::default())
+            .network(EthereumNetworkBuilder::default())
+            .executor(EthereumExecutorBuilder::default())
+    }
+}
 
 /// Configure the node types
 impl NodeTypes for N42Node {

@@ -75,9 +75,9 @@ fn main() {
                         .with_persistence_threshold(engine_args.persistence_threshold)
                         .with_memory_block_buffer_target(engine_args.memory_block_buffer_target);
                     let handle = builder
-                        .with_types_and_provider::<EthereumNode, BlockchainProvider2<_>>()
-                        .with_components(EthereumNode::components())
-                        .with_add_ons(EthereumAddOns::default())
+                        .with_types_and_provider::<N42Node, BlockchainProvider2<_>>()
+                        .with_components(N42Node::components())
+                        .with_add_ons(N42NodeAddOns::default())
                         .launch_with_fn(|builder| {
                             let launcher = EngineNodeLauncher::new(
                                 builder.task_executor().clone(),

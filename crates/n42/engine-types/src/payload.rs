@@ -59,7 +59,7 @@ use reth_provider::StateRootProvider;
 use crate::attributes::N42PayloadBuilderAttributes;
 use crate::job::N42PayloadJobGeneratorConfig;
 use crate::job_generator::{commit_withdrawals, is_better_payload, N42BuildArguments, BuildOutcome, N42PayloadJobGenerator, PayloadBuilder, PayloadConfig, WithdrawalsOutcome};
-use crate::N42EngineTypes;
+use crate::{N42EngineTypes, N42PayloadAttributes};
 
 type BestTransactionsIter<Pool> = Box<
     dyn BestTransactions<Item = Arc<ValidPoolTransaction<<Pool as TransactionPool>::Transaction>>>,
@@ -147,13 +147,17 @@ where
 #[non_exhaustive]
 pub struct N42PayloadServiceBuilder;
 
-impl<Node, Pool, Cons> PayloadServiceBuilder<Node, Pool, Cons> for N42PayloadServiceBuilder
+impl<Types, Node, Pool, Cons> PayloadServiceBuilder<Node, Pool, Cons> for N42PayloadServiceBuilder
 where
-    Node: FullNodeTypes<
-        Types: NodeTypesWithEngine<Engine =N42EngineTypes, ChainSpec = ChainSpec>,
-    >,
+    Types: NodeTypesWithEngine<ChainSpec = ChainSpec>,
+    Node: FullNodeTypes<Types = Types>,
     Pool: TransactionPool + Unpin + 'static,
     Cons: Consensus + Unpin + Clone + 'static,
+    Types::Engine: PayloadTypes<
+        BuiltPayload = EthBuiltPayload,
+        PayloadAttributes = N42PayloadAttributes,
+        PayloadBuilderAttributes = N42PayloadBuilderAttributes,
+    >,
 {
     async fn spawn_payload_service(
         self,

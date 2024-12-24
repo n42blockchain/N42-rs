@@ -9,7 +9,6 @@ license.workspace = true
 #n42
 
 #reth
-reth.workspace = true
 reth-evm.workspace = true
 reth-evm-ethereum.workspace = true
 reth-errors.workspace = true
@@ -19,7 +18,13 @@ reth-chain-state.workspace = true
 reth-chainspec.workspace = true
 reth-node-api.workspace = true
 reth-node-core.workspace = true
+reth-node-builder.workspace = true
+reth-network.workspace = true
+reth-rpc.workspace = true
 reth-transaction-pool.workspace = true
+reth-consensus.workspace = true
+reth-revm.workspace = true
+reth-tasks.workspace = true
 reth-primitives.workspace = true
 reth-payload-builder.workspace = true
 reth-payload-primitives.workspace = true

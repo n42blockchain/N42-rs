@@ -1,19 +1,12 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-
-use reth::{
-    api::PayloadTypes,
-    builder::{
-        rpc::{RpcAddOns},
-        FullNodeTypes
-    },
-    network::NetworkHandle,
-    rpc::eth::EthApi,
-};
-
-use reth_node_api::{
-    EngineTypes,
-    FullNodeComponents, PayloadAttributes, PayloadBuilderAttributes,
-};
+use reth_network::NetworkHandle;
+use reth_rpc::eth::EthApi;
+use reth_node_builder::
+    rpc::{
+        RpcAddOns
+    }
+;
+use reth_node_api::{FullNodeComponents,  FullNodeTypes};
 use crate::engine_validator::N42EngineValidatorBuilder;
 
 /// Custom addons configuring RPC types

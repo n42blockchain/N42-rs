@@ -16,12 +16,12 @@ use tracing::{debug, trace};
 use reth_primitives::constants::RETH_CLIENT_VERSION;
 
 use reth_payload_primitives::{
-    BuiltPayload, PayloadBuilderAttributes, PayloadBuilderError, PayloadKind,
+    BuiltPayload, PayloadBuilderError, PayloadKind,
 };
-use reth::revm::cached::CachedReads;
-use reth::tasks::TaskSpawner;
+use reth_revm::cached::CachedReads;
+use reth_tasks::TaskSpawner;
 use reth_transaction_pool::TransactionPool;
-use crate::job_generator::{N42BuildArguments, BuildOutcome, MissingPayloadBehaviour, N42PayloadJobGenerator, PayloadBuilder, PayloadConfig, PayloadState, PayloadTaskGuard, ResolveBestPayload};
+use crate::job_generator::{N42BuildArguments, BuildOutcome, MissingPayloadBehaviour, PayloadBuilder, PayloadConfig, PayloadState, PayloadTaskGuard, ResolveBestPayload};
 use crate::metrics::PayloadBuilderMetrics;
 
 
@@ -180,7 +180,7 @@ where
     Client: StateProviderFactory + Clone + Unpin + 'static,
     Pool: TransactionPool + Unpin + 'static,
     Tasks: TaskSpawner + Clone + 'static,
-    Consensus: reth::consensus::Consensus + Clone + 'static,
+    Consensus: reth_consensus::Consensus + Clone + 'static,
     Builder: PayloadBuilder<Pool, Client, Consensus> + Unpin + 'static,
     <Builder as PayloadBuilder<Pool, Client, Consensus>>::Attributes: Unpin + Clone,
     <Builder as PayloadBuilder<Pool, Client, Consensus>>::BuiltPayload: Unpin + Clone,
@@ -224,7 +224,7 @@ impl<Client, Pool, Consensus, Tasks, Builder> Future for N42PayloadJob<Client, P
 where
     Client: StateProviderFactory + Clone + Unpin + 'static,
     Pool: TransactionPool + Unpin + 'static,
-    Consensus: reth::consensus::Consensus + Unpin + Clone + 'static,
+    Consensus: reth_consensus::Consensus + Unpin + Clone + 'static,
     Tasks: TaskSpawner + Clone + 'static,
     Builder: PayloadBuilder<Pool, Client, Consensus> + Unpin + 'static,
     <Builder as PayloadBuilder<Pool, Client, Consensus>>::Attributes: Unpin + Clone,
@@ -290,7 +290,7 @@ impl<Client, Pool, Consensus, Tasks, Builder> PayloadJob for N42PayloadJob<Clien
 where
     Client: StateProviderFactory + Clone + Unpin + 'static,
     Pool: TransactionPool + Unpin + 'static,
-    Consensus: reth::consensus::Consensus + Clone + Unpin + 'static,
+    Consensus: reth_consensus::Consensus + Clone + Unpin + 'static,
     Tasks: TaskSpawner + Clone + 'static,
     Builder: PayloadBuilder<Pool, Client, Consensus> + Unpin + 'static,
     <Builder as PayloadBuilder<Pool, Client, Consensus>>::Attributes: Unpin + Clone,

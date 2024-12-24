@@ -1,23 +1,20 @@
 //! A basic payload generator for n42.
 
-use crate::metrics::PayloadBuilderMetrics;
 use alloy_consensus::constants::EMPTY_WITHDRAWALS;
-use alloy_eips::{merge::SLOT_DURATION, BlockNumberOrTag};
+use alloy_eips::{BlockNumberOrTag};
 use alloy_primitives::{Bytes, B256, U256};
-use futures_core::ready;
-use futures_util::FutureExt;
 use reth_chainspec::{ChainSpec, EthereumHardforks};
 use reth_evm::state_change::post_block_withdrawals_balance_increments;
-use reth_payload_builder::{KeepPayloadJobAlive, PayloadId, PayloadJob, PayloadJobGenerator};
+use reth_payload_builder::{PayloadId, PayloadJob, PayloadJobGenerator};
 use reth_payload_primitives::{
-    BuiltPayload, PayloadBuilderAttributes, PayloadBuilderError, PayloadKind,
+    BuiltPayload, PayloadBuilderAttributes, PayloadBuilderError,
 };
-use reth_primitives::{constants::RETH_CLIENT_VERSION, proofs, SealedHeader, Withdrawals};
+use reth_primitives::{ proofs, SealedHeader, Withdrawals};
 use reth_provider::{
     BlockReaderIdExt, BlockSource, CanonStateNotification, ProviderError, StateProviderFactory,
 };
-use reth::revm::cached::CachedReads;
-use reth::tasks::TaskSpawner;
+use reth_revm::cached::CachedReads;
+use reth_tasks::TaskSpawner;
 use reth_transaction_pool::TransactionPool;
 use revm::{Database, State};
 use std::{
@@ -25,15 +22,15 @@ use std::{
     future::Future,
     ops::Deref,
     pin::Pin,
-    sync::{atomic::AtomicBool, Arc},
+    sync::Arc,
     task::{Context, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     sync::{oneshot, Semaphore},
-    time::{Interval, Sleep},
+    time::Sleep,
 };
-use tracing::{debug, trace, warn};
+use tracing::{debug, warn};
 use crate::job::{Cancelled, N42PayloadJob, N42PayloadJobGeneratorConfig, PendingPayload};
 
 /// The [`PayloadJobGenerator`] that creates [`BasicPayloadJob`]s.
@@ -128,7 +125,7 @@ for N42PayloadJobGenerator<Client, Pool, Consensus, Tasks, Builder>
 where
     Client: StateProviderFactory + BlockReaderIdExt + Clone + Unpin + 'static,
     Pool: TransactionPool + Unpin + 'static,
-    Consensus: reth::consensus::Consensus + Unpin + Clone + 'static,
+    Consensus: reth_consensus::Consensus + Unpin + Clone + 'static,
     Tasks: TaskSpawner + Clone + Unpin + 'static,
     Builder: PayloadBuilder<Pool, Client, Consensus> + Unpin + 'static,
     <Builder as PayloadBuilder<Pool, Client, Consensus>>::Attributes: Unpin + Clone,

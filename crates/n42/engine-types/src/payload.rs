@@ -3,18 +3,8 @@
 use std::sync::Arc;
 use alloy_primitives::U256;
 use alloy_consensus::EMPTY_OMMER_ROOT_HASH;
-use reth::{
-    api::PayloadTypes,
-    builder::{
-        components::{PayloadServiceBuilder},
-        node::{NodeTypes, NodeTypesWithEngine},
-        BuilderContext, FullNodeTypes,
-        PayloadBuilderConfig,
-    },
-    providers::{CanonStateSubscriptions, StateProviderFactory},
-};
-use reth::consensus::Consensus;
-use reth::payload::EthPayloadBuilderAttributes;
+
+use reth_consensus::Consensus;
 
 use reth_primitives::{
     proofs::{self},
@@ -22,8 +12,8 @@ use reth_primitives::{
     Block, BlockBody, EthereumHardforks, Header, Receipt, Verifiers, Rewards
 };
 
-use reth::revm::primitives::calc_excess_blob_gas;
-use reth::revm::{
+use reth_revm::primitives::calc_excess_blob_gas;
+use reth_revm::{
     db::{states::bundle_state::BundleRetention, State},
     primitives::{EVMError, EnvWithHandlerCfg, InvalidTransaction, ResultAndState},
     {database::StateProviderDatabase},
@@ -35,31 +25,30 @@ use reth_evm_ethereum::{eip6110::parse_deposits_from_receipts, EthEvmConfig};
 use reth_execution_types::ExecutionOutcome;
 
 use reth_transaction_pool::{
-    noop::NoopTransactionPool, BestTransactions, BestTransactionsAttributes, TransactionPool,
+    BestTransactions, BestTransactionsAttributes, TransactionPool,
     ValidPoolTransaction,
 };
 use reth_trie::HashedPostState;
 
-use reth_chain_state::ExecutedBlock;
+use reth_chain_state::{CanonStateSubscriptions, ExecutedBlock};
 use reth_chainspec::{ChainSpec, ChainSpecProvider};
 use reth_errors::RethError;
-use reth_node_api::{
-    FullNodeComponents,
-};
+use reth_node_api::FullNodeTypes;
 
 use reth_payload_builder::{
     EthBuiltPayload, PayloadBuilderError, PayloadBuilderHandle,
     PayloadBuilderService,
 };
 use tracing::{debug, warn, trace};
-use alloy_eips::{eip4844::MAX_DATA_GAS_PER_BLOCK, eip7685::Requests, merge::BEACON_NONCE};
-use reth_payload_primitives::PayloadBuilderAttributes;
-use reth_ethereum_payload_builder::default_ethereum_payload;
-use reth_provider::StateRootProvider;
+use alloy_eips::{eip4844::MAX_DATA_GAS_PER_BLOCK, eip7685::Requests};
+use reth_payload_primitives::{PayloadBuilderAttributes, PayloadTypes};
+use reth_node_builder::components::PayloadServiceBuilder;
+use reth_node_builder::{BuilderContext, NodeTypesWithEngine, PayloadBuilderConfig};
+use reth_provider::{StateProviderFactory, StateRootProvider};
 use crate::attributes::N42PayloadBuilderAttributes;
 use crate::job::N42PayloadJobGeneratorConfig;
 use crate::job_generator::{commit_withdrawals, is_better_payload, N42BuildArguments, BuildOutcome, N42PayloadJobGenerator, PayloadBuilder, PayloadConfig, WithdrawalsOutcome};
-use crate::{N42EngineTypes, N42PayloadAttributes};
+use crate::N42PayloadAttributes;
 
 type BestTransactionsIter<Pool> = Box<
     dyn BestTransactions<Item = Arc<ValidPoolTransaction<<Pool as TransactionPool>::Transaction>>>,
@@ -74,7 +63,7 @@ impl<Pool, Client, Cons> PayloadBuilder<Pool, Client, Cons> for N42PayloadBuilde
 where
     Client: StateProviderFactory + ChainSpecProvider<ChainSpec = ChainSpec>,
     Pool: TransactionPool,
-    Cons: reth::consensus::Consensus,
+    Cons: Consensus,
 {
     type Attributes = N42PayloadBuilderAttributes;
     type BuiltPayload = EthBuiltPayload;
@@ -210,7 +199,7 @@ where
     EvmConfig: ConfigureEvm<Header = Header>,
     Client: StateProviderFactory + ChainSpecProvider<ChainSpec = ChainSpec>,
     Pool: TransactionPool,
-    Cons: reth::consensus::Consensus,
+    Cons: reth_consensus::Consensus,
     F: FnOnce(BestTransactionsAttributes) -> BestTransactionsIter<Pool>,
 {
     let N42BuildArguments {

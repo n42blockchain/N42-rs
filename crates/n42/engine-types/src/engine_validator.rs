@@ -1,20 +1,14 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 use std::{sync::Arc};
-
-use reth::{
-    api::PayloadTypes,
-    builder::{
-        node::{NodeTypes, NodeTypesWithEngine},
-        rpc::{EngineValidatorBuilder},
-    },
-};
-use reth_chainspec::{ChainSpec, ChainSpecProvider};
+use reth_chainspec::{ChainSpec};
 use reth_node_api::{
     payload::{EngineApiMessageVersion, EngineObjectValidationError, PayloadOrAttributes},
     validate_version_specific_fields, AddOnsContext, EngineTypes, EngineValidator,
-    FullNodeComponents, PayloadAttributes, PayloadBuilderAttributes,
+    FullNodeComponents
 };
+use reth_node_builder::NodeTypesWithEngine;
+use reth_node_builder::rpc::EngineValidatorBuilder;
 use crate::attributes::CustomError;
 use crate::{N42EngineTypes, N42PayloadAttributes};
 
@@ -62,7 +56,7 @@ pub struct N42EngineValidatorBuilder;
 impl<N> EngineValidatorBuilder<N> for N42EngineValidatorBuilder
 where
     N: FullNodeComponents<
-        Types: NodeTypesWithEngine<Engine =N42EngineTypes, ChainSpec = ChainSpec>,
+        Types: NodeTypesWithEngine<Engine = N42EngineTypes, ChainSpec = ChainSpec>,
     >,
 {
     type Validator = N42EngineValidator;

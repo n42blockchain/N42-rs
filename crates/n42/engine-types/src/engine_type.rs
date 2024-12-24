@@ -6,15 +6,13 @@ use alloy_rpc_types::{
         ExecutionPayloadV1
     },
 };
-use reth::{
-    api::PayloadTypes,
-};
 use reth_node_api::{
-    EngineTypes, PayloadAttributes, PayloadBuilderAttributes,
+    EngineTypes, PayloadBuilderAttributes,
 };
 use reth_payload_builder::{
     EthBuiltPayload
 };
+use reth_payload_primitives::PayloadTypes;
 use crate::attributes::N42PayloadBuilderAttributes;
 use crate::N42PayloadAttributes;
 

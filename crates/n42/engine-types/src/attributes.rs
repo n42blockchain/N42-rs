@@ -12,9 +12,6 @@ use alloy_rpc_types::{
     },
     Withdrawal,
 };
-use reth::{
-    api::PayloadTypes,
-};
 use reth_node_api::{
     PayloadAttributes, PayloadBuilderAttributes,
 };

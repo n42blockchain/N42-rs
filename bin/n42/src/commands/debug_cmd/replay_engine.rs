@@ -1,4 +1,4 @@
-use crate::args::NetworkArgs;
+use reth_node_core::args::NetworkArgs;
 use clap::Parser;
 use eyre::Context;
 use reth_basic_payload_builder::{BasicPayloadJobGenerator, BasicPayloadJobGeneratorConfig};

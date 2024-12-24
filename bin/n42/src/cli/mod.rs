@@ -1,10 +1,10 @@
 //! CLI definition and entrypoint to executable
 
 use crate::{
-    args::LogArgs,
     commands::debug_cmd,
-    version::{LONG_VERSION, SHORT_VERSION},
 };
+use reth_node_core::version::{LONG_VERSION, SHORT_VERSION};
+use reth_node_core::args::LogArgs;
 use clap::{value_parser, Parser, Subcommand};
 use reth_chainspec::ChainSpec;
 use reth_cli::chainspec::ChainSpecParser;
@@ -28,7 +28,7 @@ use tracing::info;
 /// This is re-exported because the types in `reth_node_core::cli` originally existed in
 /// `reth::cli` but were moved to the `reth_node_core` crate. This re-export avoids a breaking
 /// change.
-pub use crate::core::cli::*;
+pub use reth_node_core::cli::*;
 
 /// The main reth cli interface.
 ///

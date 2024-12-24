@@ -1,9 +1,7 @@
 //! Command for debugging in-memory merkle trie calculation.
 
-use crate::{
-    args::NetworkArgs,
-    utils::{get_single_body, get_single_header},
-};
+use reth_node_core::args::NetworkArgs;
+use reth_node_core::utils::{get_single_body, get_single_header};
 use alloy_eips::BlockHashOrNumber;
 use backon::{ConstantBuilder, Retryable};
 use clap::Parser;

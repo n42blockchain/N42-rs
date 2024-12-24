@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
-use alloy_primitives::{U256, hex, Bloom, BlockNumber, keccak256, B64, B256, Address, Bytes};
+use alloy_primitives::{hex, keccak256, Address, BlockNumber, Bloom, Bytes, FixedBytes, B256, B64, U256};
 use alloy_rlp::{length_of_length, Encodable};
 // use blst::min_sig::{Signature, PublicKey as OtherPublicKey};
 use bytes::{BufMut, BytesMut};
@@ -24,6 +24,7 @@ use k256::ecdsa::SigningKey;
 use alloy_signer::SignerSync;
 use reth_consensus::{PostExecutionInput, Consensus, ConsensusError, HeaderConsensusError};
 use reth_storage_api::SnapshotProviderWriter;
+use std::str::FromStr;
 
 //
 const CHECKPOINT_INTERVAL: u64 = 2048; // Number of blocks after which to save the vote snapshot to the database
@@ -193,7 +194,9 @@ where
         let recents = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SNAPSHOTS)));
         let signatures = schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SIGNATURES));
 
-        let eth_signer = PrivateKeySigner::random();
+        //let eth_signer = PrivateKeySigner::random();
+        let eth_signer = PrivateKeySigner::from_bytes(&FixedBytes::from_str("6f142508b4eea641e33cb2a0161221105086a84584c74245ca463a49effea30b").unwrap()).unwrap();
+
         // signer_pk.sign_hash_sync();
 
         Self {
@@ -233,7 +236,7 @@ where
             }
 
             // Attempt to obtain a snapshot from the disk
-            if number % CHECKPOINT_INTERVAL == 0 {
+            if number != 0 && number % CHECKPOINT_INTERVAL == 0 {
                 if let Ok(Some(s)) = self.provider.load_snapshot(hash.into()) {
                     snap = Some(s);
                     break;
@@ -262,8 +265,9 @@ where
                     }
             
                    
-                    // let new_snapshot = Snapshot::new_snapshot(self.config.clone(),  number, hash, signers);
-                    // new_snapshot.store();
+                    let new_snapshot = Snapshot::new_snapshot((*self.config).clone(),  number, hash, signers);
+                    //new_snapshot.store();
+                    snap = Some(new_snapshot);
                     info!(
                         "Stored checkpoint snapshot to disk, number: {}, hash: {}",
                         number,

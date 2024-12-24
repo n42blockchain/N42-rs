@@ -246,6 +246,7 @@ where
     let mut system_caller = SystemCaller::new(evm_config.clone(), chain_spec.clone());
 
     let mut header = Header::default();
+    header.number = block_number;
     // prepare
     consensus.prepare(&mut header).map_err(|err| PayloadBuilderError::Internal(err.into()))?;
 

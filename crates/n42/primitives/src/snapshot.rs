@@ -79,7 +79,8 @@ impl Default for APosConfig {
     fn default() -> Self {
         APosConfig {
             period:8,
-            epoch: 3000,
+            //epoch: 3000,
+            epoch: 1,
             reward_epoch: 10800,
             reward_limit: U256::from(0x6F05B59D3B20000_u64),
             deposit_contract: Address::ZERO,

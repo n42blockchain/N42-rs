@@ -14,6 +14,7 @@ members = [
     "crates/n42/clique/",
     "crates/n42/engine/",
     "crates/n42/engine-types/",
+    "crates/n42/engine-primitives/",
     "crates/n42/n42-testing",
     "crates/n42/n42-testing-util",
     "crates/engine/invalid-block-hooks/",
@@ -40,7 +41,7 @@ members = [
     "crates/storage/db-api/",
     "crates/storage/provider",
     "crates/storage/storage-api/",
-    "testing/testing-utils/",
+    "testing/testing-utils/", "crates/n42/engine-primitives",
 ]
 default-members = ["bin/n42"]
 
@@ -224,6 +225,8 @@ alloy-genesis = { path = "./crates/alloy-genesis" }
 n42-primitives = { path = "crates/n42/primitives" }
 n42-clique = {path="crates/n42/clique"}
 n42-engine-types = {path="crates/n42/engine-types"}
+n42-engine-primitives = {path="crates/n42/engine-primitives"}
+
 blst = "0.3.11"
 tracing-subscriber = { version = "0.3.18", features = ["default", "fmt"] }
 tracing-journald = { version = "0.3.0" }

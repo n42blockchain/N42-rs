@@ -1,22 +1,16 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 use std::{sync::Arc};
-
-use reth::{
-    api::PayloadTypes,
-    builder::{
-        node::{NodeTypes, NodeTypesWithEngine},
-        rpc::{EngineValidatorBuilder},
-    },
-};
-use reth_chainspec::{ChainSpec, ChainSpecProvider};
+use reth_chainspec::{ChainSpec};
 use reth_node_api::{
     payload::{EngineApiMessageVersion, EngineObjectValidationError, PayloadOrAttributes},
     validate_version_specific_fields, AddOnsContext, EngineTypes, EngineValidator,
-    FullNodeComponents, PayloadAttributes, PayloadBuilderAttributes,
+    FullNodeComponents
 };
-use crate::attributes::CustomError;
-use crate::{N42EngineTypes, N42PayloadAttributes};
+use n42_engine_primitives::N42PayloadAttributes;
+use reth_node_builder::NodeTypesWithEngine;
+use reth_node_builder::rpc::EngineValidatorBuilder;
+use crate::{N42EngineTypes};
 
 /// Custom engine validator
 #[derive(Debug, Clone)]
@@ -44,11 +38,11 @@ where
         validate_version_specific_fields(&self.chain_spec, version, attributes.into())?;
 
         // custom validation logic - ensure that the custom field is not zero
-        if attributes.custom == 0 {
-            return Err(EngineObjectValidationError::invalid_params(
-                CustomError::CustomFieldIsNotZero,
-            ))
-        }
+        // if attributes.custom == 0 {
+        //     return Err(EngineObjectValidationError::invalid_params(
+        //         CustomError::CustomFieldIsNotZero,
+        //     ))
+        // }
 
         Ok(())
     }
@@ -62,7 +56,7 @@ pub struct N42EngineValidatorBuilder;
 impl<N> EngineValidatorBuilder<N> for N42EngineValidatorBuilder
 where
     N: FullNodeComponents<
-        Types: NodeTypesWithEngine<Engine =N42EngineTypes, ChainSpec = ChainSpec>,
+        Types: NodeTypesWithEngine<Engine = N42EngineTypes, ChainSpec = ChainSpec>,
     >,
 {
     type Validator = N42EngineValidator;

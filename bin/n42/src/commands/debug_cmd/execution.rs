@@ -1,6 +1,7 @@
 //! Command for debugging execution.
 
-use crate::{args::NetworkArgs, utils::get_single_header};
+use reth_node_core::utils::get_single_header;
+use reth_node_core::args::NetworkArgs;
 use alloy_eips::BlockHashOrNumber;
 use alloy_primitives::{BlockNumber, B256};
 use clap::Parser;

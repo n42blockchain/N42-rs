@@ -6,17 +6,14 @@ use alloy_rpc_types::{
         ExecutionPayloadV1
     },
 };
-use reth::{
-    api::PayloadTypes,
-};
 use reth_node_api::{
-    EngineTypes, PayloadAttributes, PayloadBuilderAttributes,
+    EngineTypes,
 };
 use reth_payload_builder::{
     EthBuiltPayload
 };
-use crate::attributes::N42PayloadBuilderAttributes;
-use crate::N42PayloadAttributes;
+use reth_payload_primitives::PayloadTypes;
+use n42_engine_primitives::{N42PayloadAttributes, N42PayloadBuilderAttributes};
 
 /// Custom engine types - uses a custom payload attributes RPC type, but uses the default
 /// payload builder attributes type.

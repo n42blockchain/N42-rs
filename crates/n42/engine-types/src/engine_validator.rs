@@ -7,10 +7,10 @@ use reth_node_api::{
     validate_version_specific_fields, AddOnsContext, EngineTypes, EngineValidator,
     FullNodeComponents
 };
+use n42_engine_primitives::N42PayloadAttributes;
 use reth_node_builder::NodeTypesWithEngine;
 use reth_node_builder::rpc::EngineValidatorBuilder;
-use crate::attributes::CustomError;
-use crate::{N42EngineTypes, N42PayloadAttributes};
+use crate::{N42EngineTypes};
 
 /// Custom engine validator
 #[derive(Debug, Clone)]
@@ -38,11 +38,11 @@ where
         validate_version_specific_fields(&self.chain_spec, version, attributes.into())?;
 
         // custom validation logic - ensure that the custom field is not zero
-        if attributes.custom == 0 {
-            return Err(EngineObjectValidationError::invalid_params(
-                CustomError::CustomFieldIsNotZero,
-            ))
-        }
+        // if attributes.custom == 0 {
+        //     return Err(EngineObjectValidationError::invalid_params(
+        //         CustomError::CustomFieldIsNotZero,
+        //     ))
+        // }
 
         Ok(())
     }

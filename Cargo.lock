@@ -4691,6 +4691,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "n42-engine-primitives"
+version = "1.1.1"
+dependencies = [
+ "alloy-primitives",
+ "alloy-rpc-types",
+ "alloy-rpc-types-engine",
+ "eyre",
+ "reth-chainspec",
+ "reth-ethereum-engine-primitives",
+ "reth-node-api",
+ "reth-payload-primitives",
+ "reth-primitives",
+ "serde",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "n42-engine-types"
 version = "0.0.0"
 dependencies = [
@@ -4704,6 +4721,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "metrics",
+ "n42-engine-primitives",
  "reth-basic-payload-builder",
  "reth-chain-state",
  "reth-chainspec",
@@ -7547,6 +7565,7 @@ dependencies = [
  "fdlimit",
  "futures",
  "jsonrpsee",
+ "n42-engine-primitives",
  "rayon",
  "reth-auto-seal-consensus",
  "reth-beacon-consensus",

@@ -12,6 +12,8 @@ readme = "README.md"
 workspace = true
 
 [dependencies]
+## n42
+n42-engine-primitives.workspace = true
 ## reth
 reth-auto-seal-consensus.workspace = true
 reth-beacon-consensus.workspace = true

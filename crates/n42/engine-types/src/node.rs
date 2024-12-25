@@ -1,19 +1,14 @@
-use reth_node_builder::{
-    components::{ComponentsBuilder},
-    node::{NodeTypes, NodeTypesWithEngine},
-    FullNodeTypes, Node, NodeAdapter, NodeComponentsBuilder,
-};
+use reth_node_builder::{components::{ComponentsBuilder}, node::{NodeTypes, NodeTypesWithEngine}, EngineTypes, FullNodeTypes, Node, NodeAdapter, NodeComponentsBuilder, NodeTypesWithDB};
 use reth_payload_primitives::PayloadTypes;
 use reth_payload_builder::EthBuiltPayload;
 use reth_chainspec::ChainSpec;
-use reth_node_ethereum::{
-    node::{
-        EthereumConsensusBuilder, EthereumExecutorBuilder, EthereumNetworkBuilder,
-        EthereumPoolBuilder,
-    },
-};
+use reth_node_ethereum::{node::{
+    EthereumConsensusBuilder, EthereumExecutorBuilder, EthereumNetworkBuilder,
+    EthereumPoolBuilder,
+}};
 use reth_trie_db::MerklePatriciaTrie;
-use crate::{N42EngineTypes, N42NodeAddOns, N42PayloadAttributes, N42PayloadBuilderAttributes, N42PayloadServiceBuilder};
+use n42_engine_primitives::{N42PayloadAttributes, N42PayloadBuilderAttributes};
+use crate::{N42EngineTypes, N42NodeAddOns, N42PayloadServiceBuilder};
 
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
@@ -63,9 +58,10 @@ impl NodeTypesWithEngine for N42Node {
 /// Implement the Node trait for the custom node
 ///
 /// This provides a preset configuration for the node
-impl<N> Node<N> for N42Node
+impl<Types, N> Node<N> for N42Node
 where
-    N: FullNodeTypes<Types: NodeTypesWithEngine<Engine =N42EngineTypes, ChainSpec = ChainSpec>>,
+    Types: NodeTypesWithDB + NodeTypesWithEngine<Engine = N42EngineTypes, ChainSpec = ChainSpec>,
+    N: FullNodeTypes<Types = Types>
 {
     type ComponentsBuilder = ComponentsBuilder<
         N,

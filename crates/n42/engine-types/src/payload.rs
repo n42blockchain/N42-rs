@@ -42,13 +42,12 @@ use reth_payload_builder::{
 use tracing::{debug, warn, trace};
 use alloy_eips::{eip4844::MAX_DATA_GAS_PER_BLOCK, eip7685::Requests};
 use reth_payload_primitives::{PayloadBuilderAttributes, PayloadTypes};
+use n42_engine_primitives::{N42PayloadAttributes, N42PayloadBuilderAttributes};
 use reth_node_builder::components::PayloadServiceBuilder;
 use reth_node_builder::{BuilderContext, NodeTypesWithEngine, PayloadBuilderConfig};
 use reth_provider::{StateProviderFactory, StateRootProvider};
-use crate::attributes::N42PayloadBuilderAttributes;
 use crate::job::N42PayloadJobGeneratorConfig;
 use crate::job_generator::{commit_withdrawals, is_better_payload, N42BuildArguments, BuildOutcome, N42PayloadJobGenerator, PayloadBuilder, PayloadConfig, WithdrawalsOutcome};
-use crate::N42PayloadAttributes;
 
 type BestTransactionsIter<Pool> = Box<
     dyn BestTransactions<Item = Arc<ValidPoolTransaction<<Pool as TransactionPool>::Transaction>>>,

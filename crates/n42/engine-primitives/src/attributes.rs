@@ -1,7 +1,9 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
+use reth_payload_primitives::{PayloadAttributes, PayloadAttributesBuilder, PayloadBuilderAttributes};
+use reth_chainspec::EthereumHardforks;
 
 use std::{convert::Infallible};
-
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -12,13 +14,49 @@ use alloy_rpc_types::{
     },
     Withdrawal,
 };
-use reth_node_api::{
-    PayloadAttributes, PayloadBuilderAttributes,
-};
-use reth_payload_builder::{
-    EthPayloadBuilderAttributes,
-};
+use reth_ethereum_engine_primitives::EthPayloadBuilderAttributes;
 use reth_primitives::Withdrawals;
+
+/// The attributes builder for N42 Ethereum payload.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct N42PayloadAttributesBuilder<ChainSpec> {
+    chain_spec: Arc<ChainSpec>,
+}
+
+impl<ChainSpec> N42PayloadAttributesBuilder<ChainSpec> {
+    /// Creates a new instance of the builder.
+    pub const fn new(chain_spec: Arc<ChainSpec>) -> Self {
+        Self { chain_spec }
+    }
+}
+
+impl<ChainSpec> PayloadAttributesBuilder<N42PayloadAttributes>
+for N42PayloadAttributesBuilder<ChainSpec>
+where
+    ChainSpec: Send + Sync + EthereumHardforks + 'static,
+{
+    fn build(&self, timestamp: u64) -> N42PayloadAttributes {
+        let inner = EthPayloadAttributes {
+            timestamp,
+            prev_randao: B256::random(),
+            suggested_fee_recipient: Address::ZERO,
+            withdrawals: self
+                .chain_spec
+                .is_shanghai_active_at_timestamp(timestamp)
+                .then(Default::default),
+            parent_beacon_block_root: self
+                .chain_spec
+                .is_cancun_active_at_timestamp(timestamp)
+                .then(B256::random),
+        };
+
+        N42PayloadAttributes {
+            inner, custom: 0,
+        }
+    }
+}
+
 
 
 /// A custom payload attributes type.

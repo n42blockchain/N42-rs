@@ -8,7 +8,8 @@ use reth_beacon_consensus::{
 use reth_blockchain_tree::BlockchainTreeConfig;
 use reth_chainspec::EthChainSpec;
 use reth_consensus_debug_client::{DebugConsensusClient, EtherscanBlockProvider};
-use reth_engine_local::{N42EngineService, N42PayloadAttributesBuilder, MiningMode};
+use reth_engine_local::{N42EngineService, MiningMode};
+use n42_engine_primitives::N42PayloadAttributesBuilder;
 use reth_engine_service::service::{ChainEvent, EngineService};
 use reth_engine_tree::{
     engine::{EngineApiRequest, EngineRequestHandler},

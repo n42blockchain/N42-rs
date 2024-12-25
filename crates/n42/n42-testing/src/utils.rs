@@ -1,6 +1,6 @@
 use alloy_primitives::{Address, FixedBytes, B256};
 use reth::rpc::types::engine::PayloadAttributes;
-use n42_engine_types::N42PayloadBuilderAttributes;
+use n42_engine_primitives::N42PayloadBuilderAttributes;
 use reth_payload_builder::EthPayloadBuilderAttributes;
 use std::str::FromStr;
 /// Helper function to create a new n42 payload attributes

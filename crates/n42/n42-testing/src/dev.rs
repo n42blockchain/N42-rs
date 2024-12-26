@@ -1,6 +1,7 @@
+use reth_provider::{BlockReaderIdExt, BlockNumReader};
 use n42_clique::{EXTRA_VANITY, SIGNATURE_LENGTH};
 use crate::utils::n42_payload_attributes;
-use alloy_primitives::{Bytes, Address};
+use alloy_primitives::{Bytes, Address, FixedBytes, B256};
 use futures::StreamExt;
 use reth::args::DevArgs;
 //use reth_e2e_test_utils::setup;
@@ -10,11 +11,16 @@ use reth_node_builder::{
 use reth_tasks::TaskManager;
 use reth_chainspec::N42;
 use n42_engine_types::N42Node;
+use std::str::FromStr;
 
 use reth::builder::Node;
 use reth_payload_primitives::PayloadBuilder;
 use reth_provider::StateProviderFactory;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use reth_rpc_api::EngineApiClient;
+use reth::rpc::types::engine::ForkchoiceState;
+use reth_node_api::EngineTypes;
+use n42_engine_types::{N42EngineTypes, N42NodeAddOns, N42PayloadServiceBuilder};
 
 fn get_addresses_from_extra_data(extra_data: Bytes) -> Vec<Address> {
     let signers_count = (extra_data.len() - EXTRA_VANITY - SIGNATURE_LENGTH) /  Address::len_bytes();
@@ -52,26 +58,55 @@ async fn can_run_dev_node_new_engine() -> eyre::Result<()> {
     let payload_events = node.payload_builder.subscribe().await?;
     let mut payload_event_stream = payload_events.into_stream();
 
-    //let timestamp = 1710338135;
-    //let timestamp = 0x6159af19;
-    let timestamp = SystemTime::now().checked_add(Duration::new(1,0)).unwrap().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    let attributes = n42_payload_attributes(timestamp);
-    let payload_id = node.payload_builder.send_new_payload(attributes.clone()).await.unwrap()?;
-    println!("payload_id={}", payload_id);
-    let latest = node.provider.latest()?;
-    println!("latest block_hash(1)={:?}", latest.block_hash(1));
+    let new_block_future = || async {
+        println!("best_number={}", node.provider.chain_info().unwrap().best_number);
+        let parent_hash = node.provider.latest_header().unwrap().unwrap().hash();
+        println!("parent_hash={:?}", parent_hash);
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let attributes = n42_payload_attributes(timestamp, parent_hash);
+        let payload_id = node.payload_builder.send_new_payload(attributes.clone()).await.unwrap()?;
+        println!("payload_id={}", payload_id);
 
-    let payload_type = node.payload_builder.resolve(payload_id).await.unwrap().unwrap();
-    println!("payload_type={:?}", payload_type);
+        let payload_type = node.payload_builder.resolve(payload_id).await.unwrap().unwrap();
+        println!("payload_type={:?}", payload_type);
+        let extra_data = payload_type.block().header.extra_data.clone();
+        println!("header={:?}", payload_type.block().header);
+        println!("extra_data={:?}", extra_data);
+        let signer_addresses = get_addresses_from_extra_data(extra_data);
+        println!("signer_addresses={:?}", signer_addresses);
+
+        let payload = payload_type.clone();
+
+        let client = node.engine_http_client();
+        let submission = EngineApiClient::<N42EngineTypes>::new_payload_v1(
+            &client,
+            payload.into(),
+        )
+        .await?;
+        println!("submission={:?}", submission);
+
+        let current_head = parent_hash;
+        let new_head = payload_type.block().hash();
+        EngineApiClient::<N42EngineTypes>::fork_choice_updated_v1(
+                    &client,
+                ForkchoiceState {
+                    head_block_hash: new_head,
+                    safe_block_hash: current_head,
+                    finalized_block_hash: current_head,
+                },
+                None,
+            ).await?;
+        println!("latest block_hash={:?}", node.provider.latest_header().unwrap().unwrap().hash());
+        Ok(()) as eyre::Result<()>
+    };
+
+    new_block_future().await?;
+    new_block_future().await?;
 
     let first_event = payload_event_stream.next().await.unwrap()?;
     let second_event = payload_event_stream.next().await.unwrap()?;
     println!("first_event={:?}", first_event);
     println!("second_event={:?}", second_event);
-
-    let extra_data = payload_type.block().header.extra_data.clone();
-    println!("extra_data={:?}", extra_data);
-    let signer_addresses = get_addresses_from_extra_data(extra_data);
-    println!("signer_addresses={:?}", signer_addresses);
+    
     Ok(())
 }

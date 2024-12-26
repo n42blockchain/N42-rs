@@ -196,6 +196,7 @@ where
 
         //let eth_signer = PrivateKeySigner::random();
         let eth_signer = PrivateKeySigner::from_bytes(&FixedBytes::from_str("6f142508b4eea641e33cb2a0161221105086a84584c74245ca463a49effea30b").unwrap()).unwrap();
+        //let eth_signer = PrivateKeySigner::from_bytes(&FixedBytes::from_str("4f5c2b3e8d45f72c87c8c7d1d5e6f5b8e7f9d4e6c1a2b3c4d5e6f7a8f9a0b1c2").unwrap()).unwrap();
 
         // signer_pk.sign_hash_sync();
 
@@ -249,7 +250,8 @@ where
             // at a checkpoint block without a parent (light client CHT), or we have piled
             // up more headers than allowed to be reorged (chain reinit from a freezer),
             // consider the checkpoint trusted and snapshot it.
-            if number == 0 || (number % self.config.epoch == 0 && (headers.len() > FULL_IMMUTABILITY_THRESHOLD || self.provider.header_by_number(number -1).unwrap().is_none())) {
+            //if number == 0 || (number % self.config.epoch == 0 && (headers.len() > FULL_IMMUTABILITY_THRESHOLD || self.provider.header_by_number(number -1).unwrap().is_none())) {
+            if number == 0 || (number % self.config.epoch == 0) {
                 if let Ok(Some(checkpoint)) = self.provider.header_by_number(number) {
                     let hash = checkpoint.hash_slow();
             
@@ -810,11 +812,14 @@ where
         }
 
         // Sweet, the protocol permits us to sign the block, wait for our time
+        /*
         let delay = UNIX_EPOCH
             .checked_add(Duration::from_secs(header.timestamp as u64))
             .unwrap()
             .duration_since(SystemTime::now())
             .unwrap();
+        */
+        let delay = Duration::from_secs(1);
 
         if header.difficulty == DIFF_NO_TURN {
             let wiggle = Duration::from_millis((snap.signers.len() as u64 / 2 + 1) * WIGGLE_TIME.as_millis() as u64);

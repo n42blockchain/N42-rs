@@ -165,7 +165,7 @@ where
     Provider: HeaderProvider + SnapshotProvider + SnapshotProviderWriter + Clone + Unpin + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks
 {
-    config: Arc<APosConfig>,          // Consensus engine configuration parameters
+    config: APosConfig,          // Consensus engine configuration parameters
     /// Chain spec
     chain_spec: Arc<ChainSpec>,
     recents: RwLock<schnellru::LruMap<B256, Snapshot>>,    // Snapshots for recent block to speed up reorgs
@@ -193,11 +193,13 @@ where
         let recents = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SNAPSHOTS)));
         let signatures = schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SIGNATURES));
 
-        let eth_signer = PrivateKeySigner::random();
         // signer_pk.sign_hash_sync();
+        let eth_signer: PrivateKeySigner = "".parse().unwrap();
+
+        info!(target: "consensus::apos", "apos set signer address {}", eth_signer.address());
 
         Self {
-            config: Arc::new(APosConfig::default()),
+            config: APosConfig::default(),
             chain_spec,
             recents,
             signatures,
@@ -238,7 +240,7 @@ where
                     snap = Some(s);
                     break;
                 } else {
-                    debug!("Snapshot not found for hash: {}, at number: {}", hash, number);
+                    debug!(target: "consensus::apos", "Snapshot not found for hash: {}, at number: {}", hash, number);
                 }
             }
 
@@ -260,11 +262,14 @@ where
                         let end = start + Address::len_bytes();
                         signers.push(Address::from_slice(&checkpoint.extra_data[start..end]));
                     }
-            
-                   
-                    // let new_snapshot = Snapshot::new_snapshot(self.config.clone(),  number, hash, signers);
-                    // new_snapshot.store();
-                    info!(
+
+
+                    let s = Snapshot::new_snapshot(self.config.clone(), number, hash, signers);
+                    // todo
+                    self.provider.save_snapshot(number, s.clone()).map_err(|_| ConsensusError::UnknownBlock)?;
+                    snap = Option::from(s);
+
+                    info!(target: "consensus::apos",
                         "Stored checkpoint snapshot to disk, number: {}, hash: {}",
                         number,
                         hash
@@ -345,7 +350,7 @@ where
         //Analyze the signer and check if they are in the signer list
         let signer = recover_address(&header)?;
         if !snap.signers.contains(&signer) {
-            info!("err signer: {}", signer);
+            info!(target: "consensus::apos", "err signer: {}", signer);
             return Err(AposError::UnauthorizedSigner.into());
         }
 
@@ -709,15 +714,16 @@ where
 
     /// Prepare implements consensus.Engine, preparing all the consensus fields of the
     /// header for running the transactions on top.
-    fn prepare(&self, header: &mut Header) -> Result<(), ConsensusError> {
+    fn prepare(&self, parent_header: &SealedHeader) -> Result<Header, ConsensusError> {
 
+        let mut header = Header::default(); 
         //If the block is not a checkpoint, vote randomly
         header.beneficiary = Address::ZERO;
         header.nonce = B64::from(0u64);
 
 
         //Assemble voting snapshots to check which votes are meaningful
-        let snap = self.snapshot(header.number - 1, header.parent_hash, None).map_err(|_| ConsensusError::UnknownBlock)?;
+        let snap = self.snapshot(parent_header.number, parent_header.hash(), None).map_err(|_| ConsensusError::UnknownBlock)?;
 
         if header.number %self.config.epoch != 0 {
             //Collect all proposals to be voted on
@@ -770,7 +776,7 @@ where
             header.timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + MERGE_SIGN_MIN_TIME;
         }
 
-        Ok(())
+        Ok(header)
     }
 
     fn seal(&self, header: &mut Header) -> Result<(), ConsensusError> {
@@ -790,7 +796,7 @@ where
         // Bail out if we're unauthorized to sign a block
         let snap = self.snapshot(header.number - 1, header.parent_hash.clone(), None)?;
         if !snap.signers.contains(&self.signer) {
-            error!(target: "consensus::engine", "err signer: {}", self.signer);
+            error!(target: "consensus::apos", "err signer: {}", self.signer);
             return Err(ConsensusError::UnauthorizedSigner)
         }
 

@@ -237,9 +237,9 @@ where
 
     let mut system_caller = SystemCaller::new(evm_config.clone(), chain_spec.clone());
 
-    let mut header = Header::default();
+    // let mut header = Header::default();
     // prepare
-    consensus.prepare(&mut header).map_err(|err| PayloadBuilderError::Internal(err.into()))?;
+    let mut header = consensus.prepare(&parent_header).map_err(|err| PayloadBuilderError::Internal(err.into()))?;
 
     // apply eip-4788 pre block contract call
     system_caller

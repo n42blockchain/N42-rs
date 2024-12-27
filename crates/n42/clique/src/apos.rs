@@ -152,7 +152,7 @@ pub fn recover_address(header: &Header) -> Result<Address, Box<dyn Error>> {
 
     let signature = RecoverableSignature::from_compact(
         &signature[..64],
-        RecoveryId::from_i32(signature[64] as i32)?,
+        RecoveryId::from_i32(signature[64] as i32-27)?,
     )?;
 
     Ok(public_key_to_address(SECP256K1.recover_ecdsa(&message, &signature)?))
@@ -172,8 +172,8 @@ where
     recents: RwLock<schnellru::LruMap<B256, Snapshot>>,    // Snapshots for recent block to speed up reorgs
     signatures: schnellru::LruMap<B256, Vec<u8>>,    // Signatures of recent blocks to speed up mining
     proposals: Arc<RwLock<HashMap<Address, bool>>>,   // Current list of proposals we are pushing
-    signer: Address, // Ethereum address of the signing key
-    eth_signer: LocalSigner<SigningKey>,
+    signer: RwLock<Address>, // Ethereum address of the signing key
+    eth_signer: RwLock<LocalSigner<SigningKey>>,
     //  Provider,
     provider: Provider,
 }
@@ -196,7 +196,6 @@ where
 
         //let eth_signer = PrivateKeySigner::random();
         let eth_signer = PrivateKeySigner::from_bytes(&FixedBytes::from_str("6f142508b4eea641e33cb2a0161221105086a84584c74245ca463a49effea30b").unwrap()).unwrap();
-        //let eth_signer = PrivateKeySigner::from_bytes(&FixedBytes::from_str("4f5c2b3e8d45f72c87c8c7d1d5e6f5b8e7f9d4e6c1a2b3c4d5e6f7a8f9a0b1c2").unwrap()).unwrap();
 
         // signer_pk.sign_hash_sync();
 
@@ -206,12 +205,18 @@ where
             recents,
             signatures,
             proposals: Arc::new(RwLock::new(HashMap::new())),
-            signer: eth_signer.address(),
-            eth_signer,
+            signer: RwLock::new(eth_signer.address()),
+            eth_signer: RwLock::new(eth_signer),
             provider,
         }
     }
 
+    pub fn set_signer(&self, eth_signer: LocalSigner<SigningKey>) {
+        let mut signer_guard = self.signer.write().unwrap();
+        let mut eth_signer_guard = self.eth_signer.write().unwrap();
+        *signer_guard = eth_signer.address();
+        *eth_signer_guard = eth_signer;
+    }
 
     /// snapshot retrieves the authorization snapshot at a given point in time.
     pub fn snapshot(
@@ -337,7 +342,7 @@ where
     /// headers that aren't yet part of the local blockchain to generate the snapshots
     /// from.
     pub fn verify_seal(
-        self,
+        &self,
         snap: &Snapshot,
         header: Header,
         parents: Header,
@@ -347,6 +352,7 @@ where
         if header.number == 0 {
             return Err(AposError::UnknownBlock.into());
         }
+        println!("header number: {}", header.number);
 
         //Analyze the signer and check if they are in the signer list
         let signer = recover_address(&header)?;
@@ -354,6 +360,7 @@ where
             info!("err signer: {}", signer);
             return Err(AposError::UnauthorizedSigner.into());
         }
+        println!("recovered address: {}", signer);
 
        //Check the list of recent signatories
         for (seen, recent) in &snap.recents {
@@ -450,7 +457,9 @@ where
             None,
         ) else { todo!() };
 
-        calc_difficulty(&snap, &self.signer)
+        let signer_guard = self.signer.read().unwrap();
+        //calc_difficulty(&snap, &self.signer.get())
+        calc_difficulty(&snap, &signer_guard)
     }
 
 
@@ -716,6 +725,11 @@ where
     /// Prepare implements consensus.Engine, preparing all the consensus fields of the
     /// header for running the transactions on top.
     fn prepare(&self, header: &mut Header) -> Result<(), ConsensusError> {
+        // for test only, to be removed
+        if header.number % 2 == 0 {
+            let eth_signer = PrivateKeySigner::from_bytes(&FixedBytes::from_str("4f5c2b3e8d45f72c87c8c7d1d5e6f5b8e7f9d4e6c1a2b3c4d5e6f7a8f9a0b1c2").unwrap()).unwrap();
+            self.set_signer(eth_signer);
+        }
 
         //If the block is not a checkpoint, vote randomly
         header.beneficiary = Address::ZERO;
@@ -747,7 +761,9 @@ where
         }
 
         //Copy the signer to prevent data competition
-        let signer = self.signer.clone();
+        let signer_guard = self.signer.read().unwrap();
+        //let signer = self.signer.get().clone();
+        let signer = signer_guard.clone();
 
         //Set the correct difficulty level
         header.difficulty = calc_difficulty(&snap, &signer);
@@ -793,19 +809,24 @@ where
         //todo
 
 
+        let signer_guard = self.signer.read().unwrap();
         // Bail out if we're unauthorized to sign a block
         let snap = self.snapshot(header.number - 1, header.parent_hash.clone(), None)?;
-        if !snap.signers.contains(&self.signer) {
-            error!(target: "consensus::engine", "err signer: {}", self.signer);
+        //if !snap.signers.contains(&self.signer.get()) {
+        if !snap.signers.contains(&signer_guard) {
+            //error!(target: "consensus::engine", "err signer: {}", self.signer.get());
+            error!(target: "consensus::engine", "err signer: {}", signer_guard);
             return Err(ConsensusError::UnauthorizedSigner)
         }
 
         // If we're amongst the recent signers, wait for the next block
-        for (seen, recent) in snap.recents {
-            if recent == self.signer {
+        for (seen, recent) in &snap.recents {
+            //if recent == self.signer.get() {
+            if *recent == *signer_guard {
                 let limit = (snap.signers.len() as u64 / 2) + 1;
-                if header.number < limit || seen > header.number - limit {
-                    error!(target: "consensus::engine", "Signed recently, must wait for others: limit: {}, seen: {}, number: {}, signer: {}", limit, seen, header.number, self.signer);
+                if header.number < limit || *seen > header.number - limit {
+                    //error!(target: "consensus::engine", "Signed recently, must wait for others: limit: {}, seen: {}, number: {}, signer: {}", limit, seen, header.number, self.signer.get());
+                    error!(target: "consensus::engine", "Signed recently, must wait for others: limit: {}, seen: {}, number: {}, signer: {}", limit, seen, header.number, signer_guard);
                     return Err(ConsensusError::UnauthorizedSigner);
                 }
             }
@@ -836,9 +857,11 @@ where
         //
         // }
 
+        let eth_signer_guard = self.eth_signer.read().unwrap();
         // Sign all the things!
         let header_bytes = seal_hash(&header);
-        let sighash = self.eth_signer.sign_hash_sync(&header_bytes).map_err(|_| ConsensusError::SignHeaderError)?;
+        //let sighash = self.eth_signer.get().sign_hash_sync(&header_bytes).map_err(|_| ConsensusError::SignHeaderError)?;
+        let sighash = eth_signer_guard.sign_hash_sync(&header_bytes).map_err(|_| ConsensusError::SignHeaderError)?;
 
 
         let mut extra_data_mut = BytesMut::from(&header.extra_data[..]);
@@ -848,6 +871,9 @@ where
         // Wait until sealing is terminated or delay timeout
         println!("Waiting for slot to sign and propagate, delay: {:?}", delay);
         //
+
+        // for test only, to be removed
+        self.verify_seal(&snap, header.clone(), Header::default()).unwrap();
 
         Ok(())
     }

@@ -633,12 +633,13 @@ mod tests {
         tables,
         test_utils::{create_test_static_files_dir, ERROR_TEMPDIR},
     };
-    use reth_storage_api::SnapshotProvider;
+    use reth_storage_api::{SnapshotProvider, SnapshotProviderWriter};
     use reth_primitives::StaticFileSegment;
     use reth_prune_types::{PruneMode, PruneModes};
     use reth_storage_errors::provider::ProviderError;
     use reth_testing_utils::generators::{self, random_block, random_header, BlockParams};
     use std::{ops::RangeInclusive, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
+    use tempfile::tempdir;
     use tokio::sync::watch;
 
     #[test]
@@ -823,10 +824,10 @@ mod tests {
         snapshot.cast(address2, false); 
         snapshot.cast(address1, true);  
         snapshot.uncast(address2, false);
-        let block_id=BlockHashOrNumber::Hash(hash);
+        let block_id=BlockHashOrNumber::Number(number);
         let timestamp=SystemTime::now().duration_since(UNIX_EPOCH).expect("time went backwards").as_secs();
-        provider.save_snapshot(block_id.clone(), snapshot.copy()).expect("fail to save snapshot");
-        let loaded_snapshot=provider.load_snapshot(block_id, timestamp).expect("fail to load snapshot").expect("cannot find snapshot");
+        provider.save_snapshot(number, snapshot.clone()).expect("fail to save snapshot");
+        let loaded_snapshot=provider.load_snapshot(block_id).expect("fail to load snapshot").expect("cannot find snapshot");
         assert_eq!(snapshot.config,loaded_snapshot.config);
         assert_eq!(snapshot.number, loaded_snapshot.number);
         assert_eq!(snapshot.hash, loaded_snapshot.hash);
@@ -834,5 +835,9 @@ mod tests {
         assert_eq!(snapshot.recents, loaded_snapshot.recents);
         assert_eq!(snapshot.votes, loaded_snapshot.votes);
         assert_eq!(snapshot.tally, loaded_snapshot.tally);
+
+        println!("{:#?}", snapshot);
+        println!("{:#?}", loaded_snapshot);
+        
     }
 }

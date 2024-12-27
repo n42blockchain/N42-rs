@@ -481,7 +481,7 @@ where
     header.withdrawals_root = withdrawals_root;
     header.logs_bloom = logs_bloom;
     header.requests_hash = requests_hash;
-    header.timestamp = attributes.0.timestamp;
+    // header.timestamp = attributes.0.timestamp;
     header.mix_hash = attributes.0.prev_randao;
     // header.nonce = BEACON_NONCE.into();
     header.base_fee_per_gas = Some(base_fee);

@@ -236,7 +236,7 @@ where
 
             // Attempt to obtain a snapshot from the disk
             if number % CHECKPOINT_INTERVAL == 0 {
-                if let Ok(Some(s)) = self.provider.load_snapshot(hash.into()) {
+                if let Ok(Some(s)) = self.provider.load_snapshot(number.into()) {
                     snap = Some(s);
                     break;
                 } else {
@@ -812,11 +812,12 @@ where
         }
 
         // Sweet, the protocol permits us to sign the block, wait for our time
-        let delay = UNIX_EPOCH
-            .checked_add(Duration::from_secs(header.timestamp as u64))
-            .unwrap()
+        let delay = std::cmp::max(
+            UNIX_EPOCH + Duration::from_secs(header.timestamp as u64),
+            SystemTime::now() + Duration::from_secs(MERGE_SIGN_MIN_TIME),
+            )
             .duration_since(SystemTime::now())
-            .unwrap();
+            .unwrap_or(Duration::from_secs(0));
 
         if header.difficulty == DIFF_NO_TURN {
             let wiggle = Duration::from_millis((snap.signers.len() as u64 / 2 + 1) * WIGGLE_TIME.as_millis() as u64);

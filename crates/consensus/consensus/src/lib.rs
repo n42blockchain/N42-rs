@@ -135,6 +135,13 @@ pub trait Consensus: Debug + Send + Sync {
     ) -> Result<(), ConsensusError> {
         Ok(())
     }
+
+    fn set_eth_signer_by_key(
+        &self,
+        eth_signer_key: Option<String>,
+    ) -> Result<(), ConsensusError> {
+        Ok(())
+    }
 }
 
 /// Consensus Errors

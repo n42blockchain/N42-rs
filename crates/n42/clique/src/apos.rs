@@ -211,7 +211,8 @@ where
         }
     }
 
-    pub fn set_signer(&self, eth_signer: LocalSigner<SigningKey>) {
+    fn set_signer(&self, eth_signer: LocalSigner<SigningKey>) {
+        println!("set_signer, new signer={:?}", eth_signer.address());
         let mut signer_guard = self.signer.write().unwrap();
         let mut eth_signer_guard = self.eth_signer.write().unwrap();
         *signer_guard = eth_signer.address();
@@ -725,12 +726,6 @@ where
     /// Prepare implements consensus.Engine, preparing all the consensus fields of the
     /// header for running the transactions on top.
     fn prepare(&self, header: &mut Header) -> Result<(), ConsensusError> {
-        // for test only, to be removed
-        if header.number % 2 == 0 {
-            let eth_signer = PrivateKeySigner::from_bytes(&FixedBytes::from_str("4f5c2b3e8d45f72c87c8c7d1d5e6f5b8e7f9d4e6c1a2b3c4d5e6f7a8f9a0b1c2").unwrap()).unwrap();
-            self.set_signer(eth_signer);
-        }
-
         //If the block is not a checkpoint, vote randomly
         header.beneficiary = Address::ZERO;
         header.nonce = B64::from(0u64);
@@ -810,6 +805,7 @@ where
 
 
         let signer_guard = self.signer.read().unwrap();
+        println!("seal() signer_guard={:?}", signer_guard);
         // Bail out if we're unauthorized to sign a block
         let snap = self.snapshot(header.number - 1, header.parent_hash.clone(), None)?;
         //if !snap.signers.contains(&self.signer.get()) {
@@ -877,4 +873,13 @@ where
 
         Ok(())
     }
+
+    fn set_eth_signer_by_key(&self, eth_signer_key: Option<String>) -> Result<(), ConsensusError> {
+        if let Some(key) = eth_signer_key {
+            let eth_signer = PrivateKeySigner::from_bytes(&FixedBytes::from_str(&key).unwrap()).unwrap();
+            self.set_signer(eth_signer);
+        }
+        Ok(())
+    }
+
 }

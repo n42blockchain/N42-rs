@@ -58,12 +58,19 @@ async fn can_run_dev_node_new_engine() -> eyre::Result<()> {
     let payload_events = node.payload_builder.subscribe().await?;
     let mut payload_event_stream = payload_events.into_stream();
 
+    let eth_signer_keys:Vec<String> = vec![
+        "6f142508b4eea641e33cb2a0161221105086a84584c74245ca463a49effea30b",
+        "4f5c2b3e8d45f72c87c8c7d1d5e6f5b8e7f9d4e6c1a2b3c4d5e6f7a8f9a0b1c2",
+    ].iter().map(|v|v.to_string()).collect();
     let new_block_future = || async {
-        println!("best_number={}", node.provider.chain_info().unwrap().best_number);
+        let best_number = node.provider.chain_info().unwrap().best_number;
+        println!("best_number={}", best_number);
+        let eth_signer_key = &eth_signer_keys[(best_number % 2) as usize];
+        println!("eth_signer_key={:?}", eth_signer_key);
         let parent_hash = node.provider.latest_header().unwrap().unwrap().hash();
         println!("parent_hash={:?}", parent_hash);
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        let attributes = n42_payload_attributes(timestamp, parent_hash);
+        let attributes = n42_payload_attributes(timestamp, parent_hash, Some(eth_signer_key.clone()));
         let payload_id = node.payload_builder.send_new_payload(attributes.clone()).await.unwrap()?;
         println!("payload_id={}", payload_id);
 
@@ -101,6 +108,11 @@ async fn can_run_dev_node_new_engine() -> eyre::Result<()> {
     };
 
     new_block_future().await?;
+
+    new_block_future().await?;
+
+    new_block_future().await?;
+
     new_block_future().await?;
 
     let first_event = payload_event_stream.next().await.unwrap()?;

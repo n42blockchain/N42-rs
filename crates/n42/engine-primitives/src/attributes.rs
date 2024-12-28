@@ -92,7 +92,7 @@ impl PayloadAttributes for N42PayloadAttributes {
 
 /// New type around the payload builder attributes type
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct N42PayloadBuilderAttributes(pub EthPayloadBuilderAttributes);
+pub struct N42PayloadBuilderAttributes(pub EthPayloadBuilderAttributes, pub Option<String>);
 
 impl PayloadBuilderAttributes for N42PayloadBuilderAttributes {
     type RpcPayloadAttributes = N42PayloadAttributes;
@@ -103,7 +103,7 @@ impl PayloadBuilderAttributes for N42PayloadBuilderAttributes {
         attributes: N42PayloadAttributes,
         _version: u8,
     ) -> Result<Self, Infallible> {
-        Ok(Self(EthPayloadBuilderAttributes::new(parent, attributes.inner)))
+        Ok(Self(EthPayloadBuilderAttributes::new(parent, attributes.inner), None))
     }
 
     fn payload_id(&self) -> PayloadId {
@@ -132,5 +132,11 @@ impl PayloadBuilderAttributes for N42PayloadBuilderAttributes {
 
     fn withdrawals(&self) -> &Withdrawals {
         &self.0.withdrawals
+    }
+}
+
+impl N42PayloadBuilderAttributes {
+    pub fn eth_signer_key(&self) -> Option<String> {
+        self.1.clone()
     }
 }

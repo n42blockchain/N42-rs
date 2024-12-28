@@ -87,9 +87,10 @@ where
         // but any custom logic can be implemented here
         let (cfg_env, block_env) = evm_config.next_cfg_and_block_env(&args.config.parent_header, next_attributes).map_err(PayloadBuilderError::other)?;
 
+        let eth_signer_key = args.config.attributes.eth_signer_key();
         default_n42_payload(evm_config, args, cfg_env, block_env, |attributes| {
             pool.best_transactions_with_attributes(attributes)
-        })
+        }, eth_signer_key)
     }
 
     fn build_empty_payload(
@@ -120,9 +121,10 @@ where
         let (cfg_env, block_env) = evm_config.next_cfg_and_block_env(&args.config.parent_header, next_attributes).map_err(PayloadBuilderError::other)?;
 
 
+        let eth_signer_key = args.config.attributes.eth_signer_key();
         default_n42_payload(evm_config, args, cfg_env, block_env, |attributes| {
             pool.best_transactions_with_attributes(attributes)
-        })?
+        }, eth_signer_key)?
             .into_payload()
             .ok_or_else(|| PayloadBuilderError::MissingPayload)
     }
@@ -193,6 +195,7 @@ pub fn default_n42_payload<EvmConfig, Pool, Cons, Client, F>(
     initialized_cfg: CfgEnvWithHandlerCfg,
     initialized_block_env: BlockEnv,
     best_txs: F,
+    eth_signer_key: Option<String>
 ) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError>
 where
     EvmConfig: ConfigureEvm<Header = Header>,
@@ -240,6 +243,7 @@ where
     let mut header = Header::default();
     header.number = block_number;
     // prepare
+    consensus.set_eth_signer_by_key(eth_signer_key);
     consensus.prepare(&mut header).map_err(|err| PayloadBuilderError::Internal(err.into()))?;
 
     // apply eip-4788 pre block contract call

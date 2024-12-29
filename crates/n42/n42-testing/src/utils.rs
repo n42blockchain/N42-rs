@@ -1,10 +1,9 @@
-use alloy_primitives::{Address, FixedBytes, B256};
+use alloy_primitives::{Address, B256};
 use reth::rpc::types::engine::PayloadAttributes;
 use n42_engine_primitives::N42PayloadBuilderAttributes;
 use reth_payload_builder::EthPayloadBuilderAttributes;
-use std::str::FromStr;
 /// Helper function to create a new n42 payload attributes
-pub(crate) fn n42_payload_attributes(timestamp: u64, parent_hash: B256, new_eth_signer_key: Option<String>) -> N42PayloadBuilderAttributes {
+pub(crate) fn n42_payload_attributes(timestamp: u64, parent_hash: B256) -> N42PayloadBuilderAttributes {
     let attributes = PayloadAttributes {
         timestamp,
         prev_randao: B256::ZERO,
@@ -14,5 +13,5 @@ pub(crate) fn n42_payload_attributes(timestamp: u64, parent_hash: B256, new_eth_
         //parent_beacon_block_root: Some(B256::ZERO),
         parent_beacon_block_root: None,
     };
-    N42PayloadBuilderAttributes(EthPayloadBuilderAttributes::new(parent_hash, attributes), new_eth_signer_key)
+    N42PayloadBuilderAttributes(EthPayloadBuilderAttributes::new(parent_hash, attributes))
 }

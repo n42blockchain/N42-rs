@@ -1,7 +1,7 @@
 use reth_provider::{BlockReaderIdExt, BlockNumReader};
 use n42_clique::{EXTRA_VANITY, SIGNATURE_LENGTH};
 use crate::utils::n42_payload_attributes;
-use alloy_primitives::{Bytes, Address, FixedBytes, B256};
+use alloy_primitives::{Bytes, Address};
 use futures::StreamExt;
 use reth::args::DevArgs;
 //use reth_e2e_test_utils::setup;
@@ -11,16 +11,13 @@ use reth_node_builder::{
 use reth_tasks::TaskManager;
 use reth_chainspec::N42;
 use n42_engine_types::N42Node;
-use std::str::FromStr;
 
 use reth::builder::Node;
 use reth_payload_primitives::PayloadBuilder;
-use reth_provider::StateProviderFactory;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use reth_rpc_api::EngineApiClient;
 use reth::rpc::types::engine::ForkchoiceState;
-use reth_node_api::EngineTypes;
-use n42_engine_types::{N42EngineTypes, N42NodeAddOns, N42PayloadServiceBuilder};
+use n42_engine_types::N42EngineTypes;
 
 fn get_addresses_from_extra_data(extra_data: Bytes) -> Vec<Address> {
     let signers_count = (extra_data.len() - EXTRA_VANITY - SIGNATURE_LENGTH) /  Address::len_bytes();
@@ -70,7 +67,8 @@ async fn can_run_dev_node_new_engine() -> eyre::Result<()> {
         let parent_hash = node.provider.latest_header().unwrap().unwrap().hash();
         println!("parent_hash={:?}", parent_hash);
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        let attributes = n42_payload_attributes(timestamp, parent_hash, Some(eth_signer_key.clone()));
+        let attributes = n42_payload_attributes(timestamp, parent_hash);
+        node.consensus.set_eth_signer_by_key(Some(eth_signer_key.clone()))?;
         let payload_id = node.payload_builder.send_new_payload(attributes.clone()).await.unwrap()?;
         println!("payload_id={}", payload_id);
 

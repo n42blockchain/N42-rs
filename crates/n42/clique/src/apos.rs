@@ -379,7 +379,7 @@ where
         if in_turn && header.difficulty != DIFF_IN_TURN {
             return Err(AposError::WrongDifficulty.into());
         }
-        if !in_turn && header.difficulty != DIFF_IN_TURN {
+        if !in_turn && header.difficulty == DIFF_IN_TURN {
             return Err(AposError::WrongDifficulty.into());
         }
 

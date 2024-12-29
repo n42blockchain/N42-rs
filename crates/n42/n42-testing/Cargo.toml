@@ -46,6 +46,11 @@ reth-node-ethereum.workspace = true
 # misc
 eyre.workspace = true
 
+secp256k1  = { workspace = true, features = ["recovery"] }
+zerocopy = "0.7.35"
+hex = "0.4"
+tiny-keccak = "2.0"
+
 [dev-dependencies]
 reth.workspace = true
 reth-chainspec.workspace = true

@@ -335,7 +335,7 @@ impl Snapshot
     // inturn returns if a signer at a given block height is in-turn or not.
     pub fn inturn(&self, number: u64, signer: &Address) -> bool {
         let signers = self.singers();
-        let mut offset = 0;
+        let mut offset = 1;
 
         //Find the position of the given signer in the sorted list
         while offset < signers.len() && &signers[offset] != signer {

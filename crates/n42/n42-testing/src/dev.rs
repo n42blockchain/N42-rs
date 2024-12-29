@@ -3,7 +3,7 @@ use n42_clique::{EXTRA_VANITY, SIGNATURE_LENGTH};
 use crate::utils::n42_payload_attributes;
 use alloy_primitives::{Bytes, Address};
 use futures::StreamExt;
-use reth::args::DevArgs;
+use reth:: args::{DevArgs, DiscoveryArgs, NetworkArgs, RpcServerArgs};
 //use reth_e2e_test_utils::setup;
 use reth_node_builder::{
     NodeBuilder, NodeConfig, NodeHandle,
@@ -34,13 +34,31 @@ fn get_addresses_from_extra_data(extra_data: Bytes) -> Vec<Address> {
 }
 
 #[tokio::test]
-async fn can_run_dev_node_new_engine() -> eyre::Result<()> {
+async fn payload_builder_and_consensus_ok() -> eyre::Result<()> {
+    run().await
+}
+
+#[tokio::test]
+async fn payload_builder_and_consensus_2nd() -> eyre::Result<()> {
+    println!("Running a 2nd test concurrently");
+    //assert!(false);
+    run().await
+}
+
+async fn run() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
     let tasks = TaskManager::current();
     let exec = tasks.executor();
 
+    let network_config = NetworkArgs {
+        discovery: DiscoveryArgs { disable_discovery: true, ..DiscoveryArgs::default() },
+        ..NetworkArgs::default()
+    };
     let node_config = NodeConfig::new(N42.clone())
         //.with_chain(custom_chain())
+            .with_network(network_config.clone())
+            .with_unused_ports()
+            .with_rpc(RpcServerArgs::default().with_unused_ports().with_http())
         .with_dev(DevArgs { dev: true, ..Default::default() });
 
     let NodeHandle { node, .. } = NodeBuilder::new(node_config.clone())

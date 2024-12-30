@@ -11,5 +11,5 @@ pub trait SnapshotProvider{
 
 pub trait SnapshotProviderWriter{
     /// save snapshot
-    fn save_snapshot(&self, id: BlockNumber, snapshot: Snapshot) -> ProviderResult<()>;
+    fn save_snapshot(&self, id: BlockNumber, snapshot: Snapshot) -> ProviderResult<bool>;
 }

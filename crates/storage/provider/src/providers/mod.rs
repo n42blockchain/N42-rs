@@ -918,8 +918,10 @@ impl<N: ProviderNodeTypes> SnapshotProvider for BlockchainProvider<N> {
 }
 
 impl<N: ProviderNodeTypes> SnapshotProviderWriter for BlockchainProvider<N> {
-    fn save_snapshot(&self, id: BlockNumber, snapshot: Snapshot) -> ProviderResult<()> {
-        self.database.database_provider_rw()?.save_snapshot(id, snapshot)
+    fn save_snapshot(&self, id: BlockNumber, snapshot: Snapshot) -> ProviderResult<bool> {
+        let provider_rw = self.database.database_provider_rw()?;
+        provider_rw.save_snapshot(id, snapshot)?;
+        provider_rw.commit()
     }
 }
 

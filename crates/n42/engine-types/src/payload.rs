@@ -237,10 +237,9 @@ where
 
     let mut system_caller = SystemCaller::new(evm_config.clone(), chain_spec.clone());
 
-    let mut header = Header::default();
-    header.number = block_number;
+    // let mut header = Header::default();
     // prepare
-    consensus.prepare(&mut header).map_err(|err| PayloadBuilderError::Internal(err.into()))?;
+    let mut header = consensus.prepare(&parent_header).map_err(|err| PayloadBuilderError::Internal(err.into()))?;
 
     // apply eip-4788 pre block contract call
     system_caller
@@ -471,7 +470,7 @@ where
     header.parent_hash = parent_header.hash();
     header.ommers_hash = EMPTY_OMMER_ROOT_HASH;
     header.beneficiary = initialized_block_env.coinbase;
-    header.number = parent_header.number + 1;
+    // header.number = parent_header.number + 1;
     header.gas_limit = block_gas_limit;
     // header.difficulty = U256::ZERO;
     // header.extra_data = extra_data;
@@ -482,7 +481,7 @@ where
     header.withdrawals_root = withdrawals_root;
     header.logs_bloom = logs_bloom;
     header.requests_hash = requests_hash;
-    header.timestamp = attributes.0.timestamp;
+    // header.timestamp = attributes.0.timestamp;
     header.mix_hash = attributes.0.prev_randao;
     // header.nonce = BEACON_NONCE.into();
     header.base_fee_per_gas = Some(base_fee);

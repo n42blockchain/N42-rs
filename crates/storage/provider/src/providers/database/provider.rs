@@ -2073,9 +2073,8 @@ impl<TX: DbTx, N: NodeTypes<ChainSpec: EthereumHardforks>> RewardsProvider for D
 
 impl<TX: DbTx, N: NodeTypes<ChainSpec: EthereumHardforks>> SnapshotProvider for DatabaseProvider<TX, N>{
     fn load_snapshot(&self, id: BlockHashOrNumber) -> ProviderResult<Option<Snapshot>> {
-        if let Some(number)=self.convert_hash_or_number(id)?{
-            let snapshot=self.tx.get::<tables::Snapshots>(number)?.unwrap_or_default();
-            return Ok(Some(snapshot))
+        if let Some(number) = self.convert_hash_or_number(id)? {
+            return Ok(self.tx.get::<tables::Snapshots>(number)?)
         }
         Ok(None)
     }
@@ -2083,8 +2082,9 @@ impl<TX: DbTx, N: NodeTypes<ChainSpec: EthereumHardforks>> SnapshotProvider for 
 
 
 impl<TX: DbTxMut, N: NodeTypes<ChainSpec: EthereumHardforks>> SnapshotProviderWriter for DatabaseProvider<TX, N>{
-    fn save_snapshot(&self, number: BlockNumber, snapshot: Snapshot) -> ProviderResult<()> {
-        Ok(self.tx.put::<tables::Snapshots>(number, snapshot)?)
+    fn save_snapshot(&self, number: BlockNumber, snapshot: Snapshot) -> ProviderResult<bool> {
+        self.tx.put::<tables::Snapshots>(number, snapshot)?;
+        Ok(true)
     }
 }
 

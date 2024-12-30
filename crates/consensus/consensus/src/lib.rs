@@ -125,11 +125,12 @@ pub trait Consensus: Debug + Send + Sync {
     /// for N42
     fn prepare(
         &self,
-        header: &mut Header,
-    )-> Result<(), ConsensusError> {
-        Ok(())
+        parent_header: &SealedHeader,
+    )-> Result<Header, ConsensusError> {
+        Ok(Header::default())
     }
 
+    /// for N42
     fn seal(
         &self,
         header: &mut Header,

@@ -469,7 +469,8 @@ where
 
     header.parent_hash = parent_header.hash();
     header.ommers_hash = EMPTY_OMMER_ROOT_HASH;
-    header.beneficiary = initialized_block_env.coinbase;
+    header.timestamp = attributes.0.timestamp;
+    // header.beneficiary = initialized_block_env.coinbase;
     // header.number = parent_header.number + 1;
     header.gas_limit = block_gas_limit;
     // header.difficulty = U256::ZERO;

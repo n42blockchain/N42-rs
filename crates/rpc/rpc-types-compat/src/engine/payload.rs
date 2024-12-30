@@ -74,8 +74,9 @@ pub fn try_payload_v1_to_block(payload: ExecutionPayloadV1) -> Result<Block, Pay
         extra_data: payload.extra_data,
         // Defaults
         ommers_hash: EMPTY_OMMER_ROOT_HASH,
-        difficulty: Default::default(),
-        nonce: Default::default(),
+        // N42
+        difficulty: payload.difficulty,
+        nonce: payload.nonce
     };
 
     Ok(Block { header, body: BlockBody { transactions, ..Default::default() } })
@@ -138,6 +139,8 @@ pub fn block_to_payload_v1(value: SealedBlock) -> ExecutionPayloadV1 {
         extra_data: value.extra_data.clone(),
         base_fee_per_gas: U256::from(value.base_fee_per_gas.unwrap_or_default()),
         block_hash: value.hash(),
+        difficulty: value.difficulty,
+        nonce: value.nonce,
         transactions,
     }
 }
@@ -161,6 +164,8 @@ pub fn block_to_payload_v2(value: SealedBlock) -> ExecutionPayloadV2 {
             extra_data: value.extra_data.clone(),
             base_fee_per_gas: U256::from(value.base_fee_per_gas.unwrap_or_default()),
             block_hash: value.hash(),
+            difficulty: value.difficulty,
+            nonce: value.nonce,
             transactions,
         },
         withdrawals: value.body.withdrawals.unwrap_or_default().into_inner(),
@@ -188,6 +193,8 @@ pub fn block_to_payload_v3(value: SealedBlock) -> ExecutionPayloadV3 {
                 extra_data: value.extra_data.clone(),
                 base_fee_per_gas: U256::from(value.base_fee_per_gas.unwrap_or_default()),
                 block_hash: value.hash(),
+                difficulty: value.difficulty,
+                nonce: value.nonce,
                 transactions,
             },
             withdrawals: value.body.withdrawals.unwrap_or_default().into_inner(),
@@ -348,6 +355,8 @@ pub fn execution_payload_from_sealed_block(value: SealedBlock) -> ExecutionPaylo
         extra_data: value.extra_data.clone(),
         base_fee_per_gas: U256::from(value.base_fee_per_gas.unwrap_or_default()),
         block_hash: value.hash(),
+        difficulty: value.difficulty,
+        nonce: value.nonce,
         transactions,
     }
 }

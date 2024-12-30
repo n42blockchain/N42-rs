@@ -1,0 +1,69 @@
+[package]
+name = "alloy-rpc-types-engine"
+description = "Types for the `engine` Ethereum JSON-RPC namespace"
+
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+authors.workspace = true
+repository.workspace = true
+exclude.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# ethereum
+alloy-rlp = { workspace = true, features = ["arrayvec", "derive"] }
+alloy-primitives = { workspace = true, features = ["rlp", "serde"] }
+alloy-consensus = { workspace = true, features = ["serde"] }
+alloy-eips = { workspace = true, features = ["serde"] }
+
+# misc
+derive_more = { workspace = true, features = ["display"] }
+strum = { workspace = true, features = ["derive"] }
+
+# serde
+alloy-serde = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive"], optional = true }
+
+# ssz
+ethereum_ssz_derive = { workspace = true, optional = true }
+ethereum_ssz = { workspace = true, optional = true }
+
+# jsonrpsee
+jsonrpsee-types = { version = "0.24", optional = true }
+
+# jwt
+rand = { workspace = true, optional = true }
+jsonwebtoken = { workspace = true, optional = true }
+
+[features]
+default = ["jwt", "std", "serde"]
+std = ["alloy-consensus/std", "derive_more/std", "strum/std"]
+serde = ["dep:serde", "dep:alloy-serde"]
+jwt = ["dep:jsonwebtoken", "dep:rand"]
+jsonrpsee-types = ["dep:jsonrpsee-types"]
+ssz = ["std", "dep:ethereum_ssz", "dep:ethereum_ssz_derive", "alloy-eips/ssz"]
+kzg = ["alloy-consensus/kzg"]
+
+[dev-dependencies]
+alloy-primitives = { workspace = true, features = [
+    "rand",
+    "rlp",
+    "serde",
+    "arbitrary",
+] }
+
+arbitrary = { workspace = true, features = ["derive"] }
+rand.workspace = true
+serde_json.workspace = true
+similar-asserts.workspace = true
+tempfile.workspace = true
+assert_matches.workspace = true

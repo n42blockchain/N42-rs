@@ -5,6 +5,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
+use std::thread;
 use alloy_primitives::{U256, hex, Bloom, BlockNumber, keccak256, B64, B256, Address, Bytes};
 use alloy_rlp::{length_of_length, Encodable};
 // use blst::min_sig::{Signature, PublicKey as OtherPublicKey};
@@ -720,6 +721,7 @@ where
         //If the block is not a checkpoint, vote randomly
         header.beneficiary = Address::ZERO;
         header.nonce = B64::from(0u64);
+        header.number = parent_header.number + 1;
 
 
         //Assemble voting snapshots to check which votes are meaningful
@@ -844,8 +846,9 @@ where
         header.extra_data = Bytes::from(extra_data_mut.freeze());
 
         // Wait until sealing is terminated or delay timeout
-        println!("Waiting for slot to sign and propagate, delay: {:?}", delay);
+        info!(target: "consensus::apos", "Waiting for slot to sign and propagate, delay: {:?}", delay);
         //
+        thread::sleep(delay);
 
         Ok(())
     }

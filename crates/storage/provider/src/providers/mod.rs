@@ -922,7 +922,6 @@ impl<N: ProviderNodeTypes> SnapshotProviderWriter for BlockchainProvider<N> {
         let provider_rw = self.database.database_provider_rw()?;
         provider_rw.save_snapshot(id, snapshot)?;
         provider_rw.commit()
-            
     }
 }
 

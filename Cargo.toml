@@ -24,6 +24,7 @@ members = [
     "crates/node/builder/",
     "crates/consensus/auto-seal/",
     "crates/consensus/consensus/",
+    "crates/consensus/debug-client/",
     "crates/engine/util/",
     "crates/ethereum/cli/",
     "crates/ethereum/consensus",
@@ -210,6 +211,7 @@ reth-rpc-types-compat={path="crates/rpc/rpc-types-compat"}
 reth-ethereum-payload-builder={path="crates/ethereum/payload"}
 reth-auto-seal-consensus={path="crates/consensus/auto-seal"}
 reth-consensus = { path="crates/consensus/consensus"}
+reth-consensus-debug-client = { path="crates/consensus/debug-client"}
 reth-engine-util={path="crates/engine/util"}
 reth-rpc-eth-api={path="crates/rpc/rpc-eth-api"}
 reth-exex={path="crates/exex/exex"}
@@ -218,7 +220,9 @@ reth-testing-utils={path="testing/testing-utils"}
 reth-chain-state = { path = "crates/chain-state"}
 
 [patch.crates-io]
-alloy-genesis = { path = "./crates/alloy-genesis" }
+alloy-genesis = { path = "./crates/n42/alloy-genesis" }
+alloy-rpc-types-engine = { path = "./crates/n42/alloy-rpc-types-engine" }
+alloy-rpc-types-beacon = { path = "./crates/n42/alloy-rpc-types-beacon" }
 
 [workspace.dependencies]
 # for n42

@@ -256,10 +256,13 @@ where
             // at a checkpoint block without a parent (light client CHT), or we have piled
             // up more headers than allowed to be reorged (chain reinit from a freezer),
             // consider the checkpoint trusted and snapshot it.
-            //if number == 0 || (number % self.config.epoch == 0 && (headers.len() > FULL_IMMUTABILITY_THRESHOLD || self.provider.header_by_number(number -1).unwrap().is_none())) {
+            //if number == 0 || (number % self.config.epoch == 0 && (headers.len() > FULL_IMMUTABILITY_THRESHOLD || self.provider.header_by_number(number -1).unwrap().is_none())) 
             if number == 0 || (number % self.config.epoch == 0) {
                 if let Ok(Some(checkpoint)) = self.provider.header_by_number(number) {
+                    //println!("hash from function parameter={:?}", hash);
+                    //println!("checkpoint={:?}", checkpoint);
                     let hash = checkpoint.hash_slow();
+                    //println!("snapshot() : number={}, hash_slow hash={:?}", number, hash);
             
                     //Calculate the list of signatories
                     let signers_count = (checkpoint.extra_data.len() - EXTRA_VANITY - SIGNATURE_LENGTH) /  Address::len_bytes();
@@ -273,7 +276,7 @@ where
                     }
             
                    
-                    let new_snapshot = Snapshot::new_snapshot((*self.config).clone(),  number, hash, signers);
+                    let new_snapshot = Snapshot::new_snapshot((*self.config).clone(), number, hash, signers);
                     //new_snapshot.store();
                     snap = Some(new_snapshot);
                     info!(
@@ -320,7 +323,9 @@ where
         }
 
         let snap = snap.unwrap().apply(headers, |header| {
-            Ok(header.beneficiary)
+            //Ok(header.beneficiary)
+            let signer = recover_address(&header)?;
+            Ok(signer)
         }).map_err(|_| ConsensusError::InvalidDifficulty)?;
 
         recents.insert(snap.hash, snap.clone());
@@ -730,9 +735,13 @@ where
         header.beneficiary = Address::ZERO;
         header.nonce = B64::from(0u64);
 
+        let parent_number = header.number - 1;
+        if let Ok(Some(parent)) = self.provider.header_by_hash_or_number(parent_number.into()) {
+            header.parent_hash = parent.hash_slow();
+        }
 
         //Assemble voting snapshots to check which votes are meaningful
-        let snap = self.snapshot(header.number - 1, header.parent_hash, None).map_err(|_| ConsensusError::UnknownBlock)?;
+        let snap = self.snapshot(parent_number, header.parent_hash, None).map_err(|_| ConsensusError::UnknownBlock)?;
 
         if header.number %self.config.epoch != 0 {
             //Collect all proposals to be voted on

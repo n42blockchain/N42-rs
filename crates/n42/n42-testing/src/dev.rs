@@ -1,3 +1,5 @@
+use reth_provider::HeaderProvider;
+use reth_provider::BlockHashReader;
 use reth_ethereum_engine_primitives::ExecutionPayloadV1;
 use n42_engine_primitives::N42PayloadBuilderAttributes;
 use reth_payload_primitives::BuiltPayload;
@@ -67,7 +69,6 @@ fn get_addresses_from_extra_data(extra_data: Bytes) -> Vec<Address> {
 async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(node: &FullNode<Node, AddOns>, eth_signer_key: String) -> eyre::Result<()>
     where <<<Node as FullNodeTypes>::Types as NodeTypesWithEngine>::Engine as PayloadTypes>::PayloadBuilderAttributes: From<N42PayloadBuilderAttributes>,
     ExecutionPayloadV1: From<<<<Node as FullNodeTypes>::Types as NodeTypesWithEngine>::Engine as PayloadTypes>::BuiltPayload>
-
 {
 
             let best_number = node.provider.chain_info().unwrap().best_number;
@@ -76,6 +77,8 @@ async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(node: 
             println!("eth_signer_key={:?}", eth_signer_key);
             let parent_hash = node.provider.latest_header().unwrap().unwrap().hash();
             println!("parent_hash={:?}", parent_hash);
+            println!("header={:?}", node.provider.latest_header().unwrap().unwrap().header());
+            println!("header hash_slow={:?}", node.provider.latest_header().unwrap().unwrap().header().hash_slow());
             let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
             let attributes = n42_payload_attributes(timestamp, parent_hash);
             node.consensus.set_eth_signer_by_key(Some(eth_signer_key.clone()))?;
@@ -169,19 +172,25 @@ impl CliqueTest {
         let payload_events = node.payload_builder.subscribe().await?;
         let mut payload_event_stream = payload_events.into_stream();
 
-       let mut eth_signer_key = hex::encode(accounts.accounts.get(&"A".to_string()).unwrap().secret_bytes());
-        println!("'A' eth_signer_key ={:?}", eth_signer_key);
-        new_block(&node, eth_signer_key).await?;
-       eth_signer_key = hex::encode(accounts.accounts.get(&"B".to_string()).unwrap().secret_bytes());
-        println!("'B' eth_signer_key ={:?}", eth_signer_key);
-        new_block(&node, eth_signer_key).await?;
+       for signer in &self.signers {
+           let eth_signer_key = hex::encode(accounts.accounts.get(signer).unwrap().secret_bytes());
+           println!("signer {} eth_signer_key ={:?}", signer, eth_signer_key);
+            new_block(&node, eth_signer_key).await?;
+       }
+       let best_number = node.provider.chain_info().unwrap().best_number;
+       println!("best_number={}", best_number);
+       let block_hash = node.provider.block_hash(best_number).unwrap().unwrap();
+       println!("block_hash={}", block_hash);
 
-        let first_event = payload_event_stream.next().await.unwrap()?;
-        let second_event = payload_event_stream.next().await.unwrap()?;
-        println!("first_event={:?}", first_event);
-        println!("second_event={:?}", second_event);
+       let snapshot = node.consensus.snapshot(best_number, block_hash, None).unwrap();
+       println!("snapshot={:?}", snapshot);
 
-        Ok(())
+       let first_event = payload_event_stream.next().await.unwrap()?;
+       let second_event = payload_event_stream.next().await.unwrap()?;
+       println!("first_event={:?}", first_event);
+       println!("second_event={:?}", second_event);
+
+       Ok(())
     }
 }
 

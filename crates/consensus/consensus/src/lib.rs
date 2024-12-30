@@ -18,6 +18,7 @@ use reth_primitives::{
     constants::MINIMUM_GAS_LIMIT, BlockWithSenders, GotExpected, GotExpectedBoxed, Header,
     InvalidTransactionError, Receipt, SealedBlock, SealedHeader,
 };
+use n42_primitives::Snapshot;
 
 /// A consensus implementation that does nothing.
 pub mod noop;
@@ -141,6 +142,15 @@ pub trait Consensus: Debug + Send + Sync {
         eth_signer_key: Option<String>,
     ) -> Result<(), ConsensusError> {
         Ok(())
+    }
+
+    fn snapshot(
+        &self,
+        number: u64,
+        hash: B256,
+        parents: Option<Vec<Header>>,
+    ) -> Result<Snapshot, ConsensusError> {
+        Ok(Snapshot::default())
     }
 }
 

@@ -35,8 +35,8 @@ pub static N42: LazyLock<Arc<ChainSpec>> = LazyLock::new(|| {
         chain: Chain::from_id(94),
         genesis: serde_json::from_str(include_str!("../res/genesis/n42.json"))
             .expect("Can't deserialize N42 genesis json"),
-        genesis_hash: once_cell_set(N42_GENESIS_HASH),
-        genesis_header: Default::default(),
+        genesis_hash: OnceLock::new(),
+        genesis_header: OnceLock::new(),
         // <https://etherscan.io/block/15537394>
         paris_block_and_final_difficulty: Some((
             15537394,

@@ -123,7 +123,6 @@ impl CliqueTest {
 
         // Generate the initial set of signers
         let mut signers: Vec<Address> = self.signers.iter().map(|s| accounts.address(s)).collect();
-        signers.sort();
         // println!("signers: {:?}", signers);
 
         let mut chainspec = (**N42).clone();
@@ -184,6 +183,8 @@ impl CliqueTest {
 
        let snapshot = node.consensus.snapshot(best_number, block_hash, None).unwrap();
        println!("snapshot={:?}", snapshot);
+       let expected_signers: Vec<Address> = self.results.iter().map(|a| accounts.address(a)).collect();
+       assert_eq!(snapshot.signers, expected_signers);
 
        let first_event = payload_event_stream.next().await.unwrap()?;
        let second_event = payload_event_stream.next().await.unwrap()?;
@@ -235,4 +236,3 @@ async fn payload_builder_and_consensus_2nd() -> eyre::Result<()> {
         };
     test.run().await
 }
-

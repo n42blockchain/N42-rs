@@ -259,21 +259,244 @@ async fn test_single_signer__voting_to_add_two_others__only_accept_first__second
 }
 
 #[tokio::test]
-async fn payload_builder_and_consensus_2nd() -> eyre::Result<()> {
-    println!("Running a 2nd test concurrently");
-    //assert!(false);
+async fn test_two_signers__voting_to_add_three_others__only_accept_first_two__third_needs_3_votes_already() -> eyre::Result<()> {
     let test = CliqueTest {
-        signers: vec!["A".to_string(), "B".to_string()],
-        votes: vec![TesterVote {
-            signer: "A".to_string(),
-            ..Default::default()
-        },
-        TesterVote {
-            signer: "B".to_string(),
-            ..Default::default()
-        }
+        signers: vec![
+            "A".to_string(),
+            "B".to_string(),
         ],
-        results: vec!["A".to_string(), "B".to_string()],
+        votes: vec![
+            TesterVote {
+                signer: "A".to_string(),
+                voted: Some("C".to_string()),
+                auth: Some(true),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: Some("C".to_string()),
+                auth: Some(true),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "A".to_string(),
+                voted: Some("D".to_string()),
+                auth: Some(true),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: Some("D".to_string()),
+                auth: Some(true),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "C".to_string(),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "A".to_string(),
+                voted: Some("E".to_string()),
+                auth: Some(true),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: Some("E".to_string()),
+                auth: Some(true),
+                ..Default::default()
+            },
+        ],
+        results: vec![
+            "A".to_string(),
+            "B".to_string(),
+            "C".to_string(),
+            "D".to_string(),
+        ],
+        failure: None,
+        ..Default::default()
+    };
+    test.run().await
+}
+
+#[tokio::test]
+async fn test_single_signer__dropping_itself__weird__but_one_less_cornercase_by_explicitly_allowing_this() -> eyre::Result<()> {
+    let test = CliqueTest {
+        signers: vec![
+            "A".to_string(),
+        ],
+        votes: vec![
+            TesterVote {
+                signer: "A".to_string(),
+                voted: Some("A".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+        ],
+        results: vec![
+        ],
+        failure: None,
+        ..Default::default()
+    };
+    test.run().await
+}
+
+#[tokio::test]
+async fn test_two_signers__actually_needing_mutal_consent_to_drop_either_of_them__not_fulfilled() -> eyre::Result<()> {
+    let test = CliqueTest {
+        signers: vec![
+            "A".to_string(),
+            "B".to_string(),
+        ],
+        votes: vec![
+            TesterVote {
+                signer: "A".to_string(),
+                voted: Some("B".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+        ],
+        results: vec![
+            "A".to_string(),
+            "B".to_string(),
+        ],
+        failure: None,
+        ..Default::default()
+    };
+    test.run().await
+}
+
+#[tokio::test]
+async fn test_two_signers__actually_needing_mutal_consent_to_drop_either_of_them__fulfilled() -> eyre::Result<()> {
+    let test = CliqueTest {
+        signers: vec![
+            "A".to_string(),
+            "B".to_string(),
+        ],
+        votes: vec![
+            TesterVote {
+                signer: "A".to_string(),
+                voted: Some("B".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: Some("B".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+        ],
+        results: vec![
+            "A".to_string(),
+        ],
+        failure: None,
+        ..Default::default()
+    };
+    test.run().await
+}
+
+#[tokio::test]
+async fn test_three_signers__two_of_them_deciding_to_drop_the_third() -> eyre::Result<()> {
+    let test = CliqueTest {
+        signers: vec![
+            "A".to_string(),
+            "B".to_string(),
+            "C".to_string(),
+        ],
+        votes: vec![
+            TesterVote {
+                signer: "A".to_string(),
+                voted: Some("C".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: Some("C".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+        ],
+        results: vec![
+            "A".to_string(),
+            "B".to_string(),
+        ],
+        failure: None,
+        ..Default::default()
+    };
+    test.run().await
+}
+
+#[tokio::test]
+async fn test_four_signers__consensus_of_two_not_being_enough_to_drop_anyone() -> eyre::Result<()> {
+    let test = CliqueTest {
+        signers: vec![
+            "A".to_string(),
+            "B".to_string(),
+            "C".to_string(),
+            "D".to_string(),
+        ],
+        votes: vec![
+            TesterVote {
+                signer: "A".to_string(),
+                voted: Some("C".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: Some("C".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+        ],
+        results: vec![
+            "A".to_string(),
+            "B".to_string(),
+            "C".to_string(),
+            "D".to_string(),
+        ],
+        failure: None,
+        ..Default::default()
+    };
+    test.run().await
+}
+
+#[tokio::test]
+async fn test_four_signers__consensus_of_three_already_being_enough_to_drop_someone() -> eyre::Result<()> {
+    let test = CliqueTest {
+        signers: vec![
+            "A".to_string(),
+            "B".to_string(),
+            "C".to_string(),
+            "D".to_string(),
+        ],
+        votes: vec![
+            TesterVote {
+                signer: "A".to_string(),
+                voted: Some("D".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: Some("D".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "C".to_string(),
+                voted: Some("D".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+        ],
+        results: vec![
+            "A".to_string(),
+            "B".to_string(),
+            "C".to_string(),
+        ],
         failure: None,
         ..Default::default()
     };

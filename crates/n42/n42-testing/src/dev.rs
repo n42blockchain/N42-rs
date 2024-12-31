@@ -608,3 +608,48 @@ async fn test_authorizing_multiple_accounts_concurrently_is_permitted() -> eyre:
     };
     test.run().await
 }
+
+#[tokio::test]
+async fn test_deauthorizations_are_counted_once_per_signer_per_target() -> eyre::Result<()> {
+    let test = CliqueTest {
+        signers: vec![
+            "A".to_string(),
+            "B".to_string(),
+        ],
+        votes: vec![
+            TesterVote {
+                signer: "A".to_string(),
+                voted: Some("B".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "A".to_string(),
+                voted: Some("B".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "A".to_string(),
+                voted: Some("B".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+        ],
+        results: vec![
+            "A".to_string(),
+            "B".to_string(),
+        ],
+        failure: None,
+        ..Default::default()
+    };
+    test.run().await
+}

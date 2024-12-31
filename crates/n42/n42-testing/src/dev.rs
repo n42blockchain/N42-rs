@@ -502,3 +502,47 @@ async fn test_four_signers__consensus_of_three_already_being_enough_to_drop_some
     };
     test.run().await
 }
+#[tokio::test]
+async fn test_authorizations_are_counted_once_per_signer_per_target() -> eyre::Result<()> {
+    let test = CliqueTest {
+        signers: vec![
+            "A".to_string(),
+            "B".to_string(),
+        ],
+        votes: vec![
+            TesterVote {
+                signer: "A".to_string(),
+                voted: Some("C".to_string()),
+                auth: Some(true),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "A".to_string(),
+                voted: Some("C".to_string()),
+                auth: Some(true),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "A".to_string(),
+                voted: Some("C".to_string()),
+                auth: Some(true),
+                ..Default::default()
+            },
+        ],
+        results: vec![
+            "A".to_string(),
+            "B".to_string(),
+        ],
+        failure: None,
+        ..Default::default()
+    };
+    test.run().await
+}

@@ -253,7 +253,10 @@ impl Snapshot
             snap.recents.insert(number, signer.clone());
 
             //Discard any previous votes of the signer
-            snap.votes.retain(|vote| !(vote.signer == signer && vote.address == header.beneficiary));
+            if let Some(i) = snap.votes.iter().position(|vote| vote.signer == signer && vote.address == header.beneficiary) {
+                snap.uncast(snap.votes[i].address, snap.votes[i].authorize);
+                snap.votes.remove(i);
+            }
 
             //Count new votes
             let authorize = match header.nonce {

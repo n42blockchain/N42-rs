@@ -797,10 +797,6 @@ where
             header.timestamp = parent_time + self.config.period;
         }
 
-        if header.timestamp < (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + MERGE_SIGN_MIN_TIME) {
-            header.timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + MERGE_SIGN_MIN_TIME;
-        }
-
         Ok(header)
     }
 
@@ -882,7 +878,7 @@ where
         // Wait until sealing is terminated or delay timeout
         info!(target: "consensus::apos", "Waiting for slot to sign and propagate, delay: {:?}", delay);
         //
-        thread::sleep(delay);
+        // thread::sleep(delay);
 
         // for test only, to be removed
         self.verify_seal(&snap, header.clone(), Header::default()).unwrap();

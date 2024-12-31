@@ -13,7 +13,7 @@ extern crate alloc;
 
 use alloc::{fmt::Debug, vec::Vec};
 use alloy_eips::eip7685::Requests;
-use alloy_primitives::{BlockHash, BlockNumber, Bloom, B256, U256};
+use alloy_primitives::{BlockHash, BlockNumber, Bloom, B256, U256, Address};
 use reth_primitives::{
     constants::MINIMUM_GAS_LIMIT, BlockWithSenders, GotExpected, GotExpectedBoxed, Header,
     InvalidTransactionError, Receipt, SealedBlock, SealedHeader,
@@ -152,6 +152,21 @@ pub trait Consensus: Debug + Send + Sync {
         parents: Option<Vec<Header>>,
     ) -> Result<Snapshot, ConsensusError> {
         Ok(Snapshot::default())
+    }
+
+    fn propose(
+        &self,
+        address: Address,
+        auth: bool,
+    ) -> Result<(), ConsensusError> {
+        Ok(())
+    }
+
+    fn discard(
+        &self,
+        address: Address,
+    ) -> Result<(), ConsensusError> {
+        Ok(())
     }
 }
 

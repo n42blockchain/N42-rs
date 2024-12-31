@@ -895,4 +895,22 @@ where
         Ok(snap)
     }
 
+    fn propose(
+        &self,
+        address: Address,
+        auth: bool,
+    ) -> Result<(), ConsensusError> {
+        let mut proposals_guard = self.proposals.write().unwrap();
+        proposals_guard.insert(address, auth);
+        Ok(())
+    }
+
+    fn discard(
+        &self,
+        address: Address,
+    ) -> Result<(), ConsensusError> {
+        let mut proposals_guard = self.proposals.write().unwrap();
+        proposals_guard.remove(&address);
+        Ok(())
+    }
 }

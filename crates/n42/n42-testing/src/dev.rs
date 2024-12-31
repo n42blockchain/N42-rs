@@ -1,3 +1,4 @@
+#![allow(non_snake_case)]
 use reth_provider::HeaderProvider;
 use reth_provider::BlockHashReader;
 use reth_ethereum_engine_primitives::ExecutionPayloadV1;
@@ -8,7 +9,6 @@ use reth_node_api::{FullNodeComponents, FullNodeTypes, NodeTypesWithEngine,Paylo
 use std::sync::Arc;
 use zerocopy::AsBytes;
 use reth_chainspec::ChainSpec;
-use alloy_genesis::{ChainConfig, Genesis,CliqueConfig};
 use reth_provider::{BlockReaderIdExt, BlockNumReader};
 use crate::utils::n42_payload_attributes;
 use alloy_primitives::{Bytes, Address};
@@ -28,7 +28,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use reth_rpc_api::EngineApiClient;
 use reth::rpc::types::engine::ForkchoiceState;
 use n42_engine_types::N42EngineTypes;
-use n42_clique::{NONCE_AUTH_VOTE, APos, DIFF_IN_TURN, EXTRA_VANITY, EXTRA_SEAL, SIGNATURE_LENGTH};
+use n42_clique::{EXTRA_VANITY, EXTRA_SEAL, SIGNATURE_LENGTH};
 
 use crate::snapshot_test_utils::TesterAccountPool;
 
@@ -45,7 +45,7 @@ pub struct TesterVote {
 
 #[derive(Debug, Default)]
 pub struct CliqueTest {
-    pub epoch: u64,
+    pub epoch: Option<u64>,
     pub signers: Vec<String>,
     pub votes: Vec<TesterVote>,
     pub results: Vec<String>,
@@ -122,7 +122,7 @@ impl CliqueTest {
     fn gen_chainspec(&self, accounts: &mut TesterAccountPool) -> ChainSpec {
 
         // Generate the initial set of signers
-        let mut signers: Vec<Address> = self.signers.iter().map(|s| accounts.address(s)).collect();
+        let signers: Vec<Address> = self.signers.iter().map(|s| accounts.address(s)).collect();
         // println!("signers: {:?}", signers);
 
         let mut chainspec = (**N42).clone();
@@ -132,7 +132,6 @@ impl CliqueTest {
             let end = start + Address::len_bytes();
             extra_data[start..end].copy_from_slice(signer.as_bytes());
         }
-        let extra_data_clone = extra_data.clone();
         chainspec.genesis.extra_data = extra_data.into();
         //chainspec.genesis.config.clique.epoch = Some(self.epoch);
 
@@ -171,10 +170,19 @@ impl CliqueTest {
         let payload_events = node.payload_builder.subscribe().await?;
         let mut payload_event_stream = payload_events.into_stream();
 
-       for signer in &self.signers {
-           let eth_signer_key = hex::encode(accounts.accounts.get(signer).unwrap().secret_bytes());
-           println!("signer {} eth_signer_key ={:?}", signer, eth_signer_key);
-            new_block(&node, eth_signer_key).await?;
+       for vote in &self.votes {
+           let eth_signer_key = hex::encode(accounts.accounts.get(&vote.signer).unwrap().secret_bytes());
+           println!("signer {} eth_signer_key ={:?}", vote.signer, eth_signer_key);
+           if let Some(ref voted) = vote.voted {
+               if let Some(auth) = vote.auth {
+                   let voted_address = accounts.address(voted);
+                   node.consensus.propose(voted_address, auth)?;
+                   new_block(&node, eth_signer_key).await?;
+                   node.consensus.discard(voted_address)?;
+               }
+           } else {
+               new_block(&node, eth_signer_key).await?;
+           }
        }
        let best_number = node.provider.chain_info().unwrap().best_number;
        println!("best_number={}", best_number);
@@ -196,22 +204,57 @@ impl CliqueTest {
 }
 
 #[tokio::test]
-async fn payload_builder_and_consensus_ok() -> eyre::Result<()> {
+async fn test_single_signer__no_votes_cast() -> eyre::Result<()> {
     let test = CliqueTest {
-            epoch: 0,
-            signers: vec!["A".to_string(), "B".to_string()],
-            votes: vec![TesterVote {
+        signers: vec![
+            "A".to_string(),
+        ],
+        votes: vec![
+            TesterVote {
                 signer: "A".to_string(),
+                ..Default::default()
+            },
+        ],
+        results: vec![
+            "A".to_string(),
+        ],
+        failure: None,
+        ..Default::default()
+    };
+    test.run().await
+}
+
+#[tokio::test]
+async fn test_single_signer__voting_to_add_two_others__only_accept_first__second_needs_2_votes() -> eyre::Result<()> {
+    let test = CliqueTest {
+        signers: vec![
+            "A".to_string(),
+        ],
+        votes: vec![
+            TesterVote {
+                signer: "A".to_string(),
+                voted: Some("B".to_string()),
+                auth: Some(true),
                 ..Default::default()
             },
             TesterVote {
                 signer: "B".to_string(),
                 ..Default::default()
-            }
-            ],
-            results: vec!["A".to_string(), "B".to_string()],
-            failure: None,
-        };
+            },
+            TesterVote {
+                signer: "A".to_string(),
+                voted: Some("C".to_string()),
+                auth: Some(true),
+                ..Default::default()
+            },
+        ],
+        results: vec![
+            "A".to_string(),
+            "B".to_string(),
+        ],
+        failure: None,
+        ..Default::default()
+    };
     test.run().await
 }
 
@@ -220,19 +263,19 @@ async fn payload_builder_and_consensus_2nd() -> eyre::Result<()> {
     println!("Running a 2nd test concurrently");
     //assert!(false);
     let test = CliqueTest {
-            epoch: 0,
-            signers: vec!["A".to_string(), "B".to_string()],
-            votes: vec![TesterVote {
-                signer: "A".to_string(),
-                ..Default::default()
-            },
-            TesterVote {
-                signer: "B".to_string(),
-                ..Default::default()
-            }
-            ],
-            results: vec!["A".to_string(), "B".to_string()],
-            failure: None,
-        };
+        signers: vec!["A".to_string(), "B".to_string()],
+        votes: vec![TesterVote {
+            signer: "A".to_string(),
+            ..Default::default()
+        },
+        TesterVote {
+            signer: "B".to_string(),
+            ..Default::default()
+        }
+        ],
+        results: vec!["A".to_string(), "B".to_string()],
+        failure: None,
+        ..Default::default()
+    };
     test.run().await
 }

@@ -236,8 +236,9 @@ impl Snapshot
             }
 
             //Remove the oldest signer from the recent signer collection to allow them to sign again
-            if number >= (snap.signers.len() as u64 / 2 + 1) {
-                snap.recents.remove(&(number - snap.signers.len() as u64 / 2 + 1));
+            let limit = snap.signers.len() as u64 / 2 + 1;
+            if number >= limit {
+                snap.recents.remove(&(number - limit));
             }
 
             //Verify the signer and check if they are in the signer list

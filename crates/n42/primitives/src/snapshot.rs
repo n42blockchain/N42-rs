@@ -286,8 +286,9 @@ impl Snapshot
                         // snap.signers.remove(header.beneficiary);
 
                         //Reduce the signer list and delete any remaining recent cache
-                        if number >= snap.signers.len() as u64 / 2 + 1 {
-                            snap.recents.remove(&(number - snap.signers.len() as u64 / 2 + 1));
+                        let limit = snap.signers.len() as u64 / 2 + 1;
+                        if number >= limit {
+                            snap.recents.remove(&(number - limit));
                         }
 
                        //Discard any previous votes of the revoked authorized signatory

@@ -728,3 +728,47 @@ async fn test_deauthorizing_multiple_accounts_concurrently_is_permitted() -> eyr
     };
     test.run().await
 }
+
+#[tokio::test]
+async fn test_votes_from_deauthorized_signers_are_discarded_immediately__deauth_votes() -> eyre::Result<()> {
+    let test = CliqueTest {
+        signers: vec![
+            "A".to_string(),
+            "B".to_string(),
+            "C".to_string(),
+        ],
+        votes: vec![
+            TesterVote {
+                signer: "C".to_string(),
+                voted: Some("B".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "A".to_string(),
+                voted: Some("C".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: Some("C".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "A".to_string(),
+                voted: Some("B".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+        ],
+        results: vec![
+            "A".to_string(),
+            "B".to_string(),
+        ],
+        failure: None,
+        ..Default::default()
+    };
+    test.run().await
+}

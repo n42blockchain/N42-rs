@@ -253,7 +253,7 @@ impl Snapshot
             snap.recents.insert(number, signer.clone());
 
             //Discard any previous votes of the signer
-            if let Some(i) = snap.votes.iter().position(|vote| vote.signer == signer && vote.address == header.beneficiary) {
+            while let Some(i) = snap.votes.iter().position(|vote| vote.signer == signer && vote.address == header.beneficiary) {
                 snap.uncast(snap.votes[i].address, snap.votes[i].authorize);
                 snap.votes.remove(i);
             }
@@ -292,7 +292,10 @@ impl Snapshot
                         }
 
                        //Discard any previous votes of the revoked authorized signatory
-                        snap.votes.retain(|vote| vote.signer != header.beneficiary);
+                        while let Some(i) = snap.votes.iter().position(|vote| vote.signer == header.beneficiary) {
+                            snap.uncast(snap.votes[i].address, snap.votes[i].authorize);
+                            snap.votes.remove(i);
+                        }
                     }
 
                     //Discard any previous votes that have just changed the account

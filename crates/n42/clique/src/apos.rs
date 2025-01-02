@@ -718,7 +718,7 @@ where
                 if header.number < limit || *seen > header.number - limit {
                     //error!(target: "consensus::engine", "Signed recently, must wait for others: limit: {}, seen: {}, number: {}, signer: {}", limit, seen, header.number, self.signer.get());
                     error!(target: "consensus::engine", "Signed recently, must wait for others: limit: {}, seen: {}, number: {}, signer: {}", limit, seen, header.number, signer_guard);
-                    return Err(ConsensusError::UnauthorizedSigner);
+                    return Err(ConsensusError::RecentlySigned);
                 }
             }
         }

@@ -479,6 +479,10 @@ pub enum ConsensusError {
     )]
     UnauthorizedSigner,
     #[display(
+        "recently signed"
+    )]
+    RecentlySigned,
+    #[display(
         "sign header err"
     )]
     SignHeaderError,

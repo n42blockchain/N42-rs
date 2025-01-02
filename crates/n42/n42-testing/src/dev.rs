@@ -1202,7 +1202,7 @@ async fn test_epoch_transitions_reset_all_votes_to_allow_chain_checkpointing() -
 }
 
 #[tokio::test]
-async fn test_un_unauthorized_signer_should_not_be_able_to_sign_blocks() -> eyre::Result<()> {
+async fn test_an_unauthorized_signer_should_not_be_able_to_sign_blocks() -> eyre::Result<()> {
     let test = CliqueTest {
         signers: vec![
             "A".to_string(),
@@ -1214,6 +1214,29 @@ async fn test_un_unauthorized_signer_should_not_be_able_to_sign_blocks() -> eyre
             },
         ],
         failure: Some("unauthorized signer".to_string()),
+        ..Default::default()
+    };
+    test.run().await
+}
+
+#[tokio::test]
+async fn test_an_authorized_signer_that_signed_recently_should_not_be_able_to_sign_again() -> eyre::Result<()> {
+    let test = CliqueTest {
+        signers: vec![
+            "A".to_string(),
+            "B".to_string(),
+        ],
+        votes: vec![
+            TesterVote {
+                signer: "A".to_string(),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "A".to_string(),
+                ..Default::default()
+            },
+        ],
+        failure: Some("recently signed".to_string()),
         ..Default::default()
     };
     test.run().await

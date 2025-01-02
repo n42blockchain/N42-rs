@@ -383,7 +383,7 @@ impl EthereumHardfork {
     }
 
     /// AST mainnet list of hardforks.
-    pub const fn n42() -> [(Self, ForkCondition); 13] {
+    pub const fn n42() -> [(Self, ForkCondition); 14] {
         [
             (Self::Homestead, ForkCondition::Block(0)),
             (Self::Dao, ForkCondition::Never),
@@ -396,6 +396,13 @@ impl EthereumHardfork {
             (Self::London, ForkCondition::Block(0)),
             (Self::ArrowGlacier, ForkCondition::Block(0)),
             (Self::BeiJing, ForkCondition::Block(770000)),
+            (
+                Self::Paris,
+                ForkCondition::TTD {
+                    fork_block: None,
+                    total_difficulty: uint!(58_750_000_000_000_000_000_000_U256),
+                },
+            ),
             (Self::Shanghai, ForkCondition::Block(0)),
             (Self::Cancun, ForkCondition::Block(0)),
         ]

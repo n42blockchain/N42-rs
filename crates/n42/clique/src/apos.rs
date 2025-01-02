@@ -816,8 +816,7 @@ where
             // at a checkpoint block without a parent (light client CHT), or we have piled
             // up more headers than allowed to be reorged (chain reinit from a freezer),
             // consider the checkpoint trusted and snapshot it.
-            //if number == 0 || (number % self.config.epoch == 0 && (headers.len() > FULL_IMMUTABILITY_THRESHOLD || self.provider.header_by_number(number -1).unwrap().is_none())) 
-            if number == 0 || (number % self.config.epoch == 0) {
+            if number == 0 || (number % self.config.epoch == 0 && (headers.len() > FULL_IMMUTABILITY_THRESHOLD || self.provider.header_by_number(number -1).unwrap().is_none())) {
                 if let Ok(Some(checkpoint)) = self.provider.header_by_number(number) {
                     //println!("hash from function parameter={:?}", hash);
                     //println!("checkpoint={:?}", checkpoint);
@@ -848,8 +847,6 @@ where
                     break;
                 }
             }
-
-                    
 
             // No snapshot for this header, gather the header and move backward
             let header = if let Some(ref mut parent_vec) = parents {

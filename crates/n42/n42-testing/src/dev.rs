@@ -41,7 +41,7 @@ pub struct TesterVote {
     pub voted: Option<String>,
     pub auth: Option<bool>,
     //pub checkpoint: Option<Vec<String>>,
-    pub newbatch: Option<bool>,
+    //pub newbatch: Option<bool>,
 }
 
 #[derive(Debug, Default)]
@@ -1228,6 +1228,40 @@ async fn test_an_authorized_signer_that_signed_recently_should_not_be_able_to_si
         ],
         votes: vec![
             TesterVote {
+                signer: "A".to_string(),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "A".to_string(),
+                ..Default::default()
+            },
+        ],
+        failure: Some("recently signed".to_string()),
+        ..Default::default()
+    };
+    test.run().await
+}
+
+#[tokio::test]
+async fn test_recent_signatures_should_not_reset_on_checkpoint_blocks_imported() -> eyre::Result<()> {
+    let test = CliqueTest {
+        epoch: Some(3),
+        signers: vec![
+            "A".to_string(),
+            "B".to_string(),
+            "C".to_string(),
+        ],
+        votes: vec![
+            TesterVote {
+                signer: "A".to_string(),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                ..Default::default()
+            },
+            TesterVote {
+                // checkpoint is done on this block per epoch setting
                 signer: "A".to_string(),
                 ..Default::default()
             },

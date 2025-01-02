@@ -236,8 +236,9 @@ impl Snapshot
             }
 
             //Remove the oldest signer from the recent signer collection to allow them to sign again
-            if number >= (snap.signers.len() as u64 / 2 + 1) {
-                snap.recents.remove(&(number - snap.signers.len() as u64 / 2 + 1));
+            let limit = snap.signers.len() as u64 / 2 + 1;
+            if number >= limit {
+                snap.recents.remove(&(number - limit));
             }
 
             //Verify the signer and check if they are in the signer list
@@ -252,7 +253,10 @@ impl Snapshot
             snap.recents.insert(number, signer.clone());
 
             //Discard any previous votes of the signer
-            snap.votes.retain(|vote| !(vote.signer == signer && vote.address == header.beneficiary));
+            while let Some(i) = snap.votes.iter().position(|vote| vote.signer == signer && vote.address == header.beneficiary) {
+                snap.uncast(snap.votes[i].address, snap.votes[i].authorize);
+                snap.votes.remove(i);
+            }
 
             //Count new votes
             let authorize = match header.nonce {
@@ -282,12 +286,16 @@ impl Snapshot
                         // snap.signers.remove(header.beneficiary);
 
                         //Reduce the signer list and delete any remaining recent cache
-                        if number >= snap.signers.len() as u64 / 2 + 1 {
-                            snap.recents.remove(&(number - snap.signers.len() as u64 / 2 + 1));
+                        let limit = snap.signers.len() as u64 / 2 + 1;
+                        if number >= limit {
+                            snap.recents.remove(&(number - limit));
                         }
 
                        //Discard any previous votes of the revoked authorized signatory
-                        snap.votes.retain(|vote| vote.signer != header.beneficiary);
+                        while let Some(i) = snap.votes.iter().position(|vote| vote.signer == header.beneficiary) {
+                            snap.uncast(snap.votes[i].address, snap.votes[i].authorize);
+                            snap.votes.remove(i);
+                        }
                     }
 
                     //Discard any previous votes that have just changed the account
@@ -342,6 +350,6 @@ impl Snapshot
         }
 
         //Determine whether the signer of a given block height is an in turn signer
-        (number % signers.len() as u64) == offset as u64
+        ((number - 1) % signers.len() as u64) == offset as u64
     }
 }

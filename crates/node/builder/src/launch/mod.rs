@@ -389,6 +389,7 @@ where
         }
 
         let full_node = FullNode {
+            consensus: ctx.components().consensus().clone(),
             evm_config: ctx.components().evm_config().clone(),
             block_executor: ctx.components().block_executor().clone(),
             pool: ctx.components().pool().clone(),

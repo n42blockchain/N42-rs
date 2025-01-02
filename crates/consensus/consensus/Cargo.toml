@@ -22,6 +22,9 @@ alloy-primitives.workspace = true
 auto_impl.workspace = true
 derive_more.workspace = true
 
+# n42
+n42-primitives.workspace = true
+
 [features]
 default = ["std"]
 std = [

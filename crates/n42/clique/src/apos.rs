@@ -201,8 +201,17 @@ where
 
         info!(target: "consensus::apos", "apos set signer address {}", eth_signer.address());
 
+        let mut config = APosConfig::default();
+        if let Some(clique) = chain_spec.genesis().config.clique {
+            if let Some(period) = clique.period {
+                config.period = period;
+            }
+            if let Some(epoch) = clique.epoch {
+                config.epoch = epoch;
+            }
+        }
         Self {
-            config: APosConfig::default(),
+            config,
             chain_spec,
             recents,
             signatures,

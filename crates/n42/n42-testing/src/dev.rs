@@ -12,6 +12,7 @@ use reth_chainspec::ChainSpec;
 use reth_provider::{BlockReaderIdExt, BlockNumReader};
 use crate::utils::n42_payload_attributes;
 use alloy_primitives::{Bytes, Address};
+use alloy_genesis::CliqueConfig;
 use futures::StreamExt;
 use reth:: args::{DevArgs, DiscoveryArgs, NetworkArgs, RpcServerArgs};
 //use reth_e2e_test_utils::setup;
@@ -39,7 +40,7 @@ pub struct TesterVote {
     pub signer: String,
     pub voted: Option<String>,
     pub auth: Option<bool>,
-    pub checkpoint: Option<Vec<String>>,
+    //pub checkpoint: Option<Vec<String>>,
     pub newbatch: Option<bool>,
 }
 
@@ -133,7 +134,12 @@ impl CliqueTest {
             extra_data[start..end].copy_from_slice(signer.as_bytes());
         }
         chainspec.genesis.extra_data = extra_data.into();
-        //chainspec.genesis.config.clique.epoch = Some(self.epoch);
+        if let Some(epoch) = self.epoch {
+            chainspec.genesis.config.clique = Some(CliqueConfig {
+                epoch: Some(epoch),
+                period: None,
+            });
+        }
 
         chainspec
     }
@@ -1136,6 +1142,47 @@ async fn test_ensure_that_pending_votes_dont_survive_authorization_status_change
             "D".to_string(),
             "E".to_string(),
             "F".to_string(),
+        ],
+        failure: None,
+        ..Default::default()
+    };
+    test.run().await
+}
+
+#[tokio::test]
+async fn test_epoch_transitions_reset_all_votes_to_allow_chain_checkpointing() -> eyre::Result<()> {
+    let test = CliqueTest {
+        epoch: Some(3),
+        signers: vec![
+            "A".to_string(),
+            "B".to_string(),
+        ],
+        votes: vec![
+            TesterVote {
+                signer: "A".to_string(),
+                voted: Some("C".to_string()),
+                auth: Some(true),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                ..Default::default()
+            },
+            TesterVote {
+                // checkpoint is done on this block per epoch setting
+                signer: "A".to_string(),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: Some("C".to_string()),
+                auth: Some(true),
+                ..Default::default()
+            },
+        ],
+        results: vec![
+            "A".to_string(),
+            "B".to_string(),
         ],
         failure: None,
         ..Default::default()

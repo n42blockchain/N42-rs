@@ -656,7 +656,6 @@ where
 
         //Copy the signer to prevent data competition
         let signer_guard = self.signer.read().unwrap();
-        //let signer = self.signer.get().clone();
         let signer = signer_guard.clone();
 
         //Set the correct difficulty level
@@ -703,20 +702,16 @@ where
         println!("seal() signer_guard={:?}", signer_guard);
         // Bail out if we're unauthorized to sign a block
         let snap = self.snapshot(header.number - 1, header.parent_hash.clone(), None)?;
-        //if !snap.signers.contains(&self.signer.get()) 
         if !snap.signers.contains(&signer_guard) {
-            //error!(target: "consensus::engine", "err signer: {}", self.signer.get());
             error!(target: "consensus::pos", "err signer: {}", signer_guard);
             return Err(ConsensusError::UnauthorizedSigner)
         }
 
         // If we're amongst the recent signers, wait for the next block
         for (seen, recent) in &snap.recents {
-            //if recent == self.signer.get() {
             if *recent == *signer_guard {
                 let limit = (snap.signers.len() as u64 / 2) + 1;
                 if header.number < limit || *seen > header.number - limit {
-                    //error!(target: "consensus::engine", "Signed recently, must wait for others: limit: {}, seen: {}, number: {}, signer: {}", limit, seen, header.number, self.signer.get());
                     error!(target: "consensus::engine", "Signed recently, must wait for others: limit: {}, seen: {}, number: {}, signer: {}", limit, seen, header.number, signer_guard);
                     return Err(ConsensusError::RecentlySigned);
                 }
@@ -724,15 +719,12 @@ where
         }
 
         // Sweet, the protocol permits us to sign the block, wait for our time
-/*
         let delay = std::cmp::max(
             UNIX_EPOCH + Duration::from_secs(header.timestamp as u64),
             SystemTime::now() + Duration::from_secs(MERGE_SIGN_MIN_TIME),
             )
             .duration_since(SystemTime::now())
             .unwrap_or(Duration::from_secs(0));
-*/
-        let delay = Duration::from_secs(1);
 
         if header.difficulty == DIFF_NO_TURN {
             let wiggle = Duration::from_millis((snap.signers.len() as u64 / 2 + 1) * WIGGLE_TIME.as_millis() as u64);
@@ -752,7 +744,6 @@ where
         let eth_signer_guard = self.eth_signer.read().unwrap();
         // Sign all the things!
         let header_bytes = seal_hash(&header);
-        //let sighash = self.eth_signer.get().sign_hash_sync(&header_bytes).map_err(|_| ConsensusError::SignHeaderError)?;
         let sighash = eth_signer_guard.sign_hash_sync(&header_bytes).map_err(|_| ConsensusError::SignHeaderError)?;
 
 
@@ -764,9 +755,6 @@ where
         info!(target: "consensus::apos", "Waiting for slot to sign and propagate, delay: {:?}", delay);
         //
         // thread::sleep(delay);
-
-        // for test only, to be removed
-        self.verify_seal(&snap, header.clone(), Header::default()).unwrap();
 
         Ok(())
     }

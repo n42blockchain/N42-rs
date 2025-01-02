@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::task::{Context, Poll};
 use std::time::Duration;
-use alloy_eips::merge::SLOT_DURATION;
+use alloy_eips::merge::{SLOT_DURATION, SLOT_DURATION_SECS};
 use alloy_primitives::Bytes;
 use futures_core::ready;
 use futures_util::FutureExt;
@@ -130,7 +130,7 @@ impl Default for N42PayloadJobGeneratorConfig {
             extradata: alloy_rlp::encode(RETH_CLIENT_VERSION.as_bytes()).into(),
             interval: Duration::from_secs(1),
             // 12s slot time
-            deadline: SLOT_DURATION,
+            deadline: Duration::from_secs(8),
             max_payload_tasks: 3,
         }
     }

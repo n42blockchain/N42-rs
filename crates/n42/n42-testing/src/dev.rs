@@ -884,3 +884,261 @@ async fn test_cascading_changes_are_not_allowed__only_the_account_being_voted_on
     };
     test.run().await
 }
+
+#[tokio::test]
+async fn test_changes_reaching_consensus_out_of_bounds__via_a_deauth__execute_on_touch() -> eyre::Result<()> {
+    let test = CliqueTest {
+        signers: vec![
+            "A".to_string(),
+            "B".to_string(),
+            "C".to_string(),
+            "D".to_string(),
+        ],
+        votes: vec![
+            TesterVote {
+                signer: "A".to_string(),
+                voted: Some("C".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "C".to_string(),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "A".to_string(),
+                voted: Some("D".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: Some("C".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "C".to_string(),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "A".to_string(),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: Some("D".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "C".to_string(),
+                voted: Some("D".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "A".to_string(),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "C".to_string(),
+                voted: Some("C".to_string()),
+                auth: Some(true),
+                ..Default::default()
+            },
+        ],
+        results: vec![
+            "A".to_string(),
+            "B".to_string(),
+        ],
+        failure: None,
+        ..Default::default()
+    };
+    test.run().await
+}
+
+#[tokio::test]
+async fn test_changes_reaching_consensus_out_of_bounds__via_a_deauth__may_go_out_of_consensus_on_first_touch() -> eyre::Result<()> {
+    let test = CliqueTest {
+        signers: vec![
+            "A".to_string(),
+            "B".to_string(),
+            "C".to_string(),
+            "D".to_string(),
+        ],
+        votes: vec![
+            TesterVote {
+                signer: "A".to_string(),
+                voted: Some("C".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "C".to_string(),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "A".to_string(),
+                voted: Some("D".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: Some("C".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "C".to_string(),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "A".to_string(),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: Some("D".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "C".to_string(),
+                voted: Some("D".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "A".to_string(),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: Some("C".to_string()),
+                auth: Some(true),
+                ..Default::default()
+            },
+        ],
+        results: vec![
+            "A".to_string(),
+            "B".to_string(),
+            "C".to_string(),
+        ],
+        failure: None,
+        ..Default::default()
+    };
+    test.run().await
+}
+
+#[tokio::test]
+async fn test_ensure_that_pending_votes_dont_survive_authorization_status_changes() -> eyre::Result<()> {
+    let test = CliqueTest {
+        signers: vec![
+            "A".to_string(),
+            "B".to_string(),
+            "C".to_string(),
+            "D".to_string(),
+            "E".to_string(),
+        ],
+        votes: vec![
+            TesterVote {
+                signer: "A".to_string(),
+                voted: Some("F".to_string()),
+                auth: Some(true),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: Some("F".to_string()),
+                auth: Some(true),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "C".to_string(),
+                voted: Some("F".to_string()),
+                auth: Some(true),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "D".to_string(),
+                voted: Some("F".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "E".to_string(),
+                voted: Some("F".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: Some("F".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "C".to_string(),
+                voted: Some("F".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "D".to_string(),
+                voted: Some("F".to_string()),
+                auth: Some(true),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "E".to_string(),
+                voted: Some("F".to_string()),
+                auth: Some(true),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: Some("A".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "C".to_string(),
+                voted: Some("A".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "D".to_string(),
+                voted: Some("A".to_string()),
+                auth: Some(false),
+                ..Default::default()
+            },
+            TesterVote {
+                signer: "B".to_string(),
+                voted: Some("F".to_string()),
+                auth: Some(true),
+                ..Default::default()
+            },
+        ],
+        results: vec![
+            "B".to_string(),
+            "C".to_string(),
+            "D".to_string(),
+            "E".to_string(),
+            "F".to_string(),
+        ],
+        failure: None,
+        ..Default::default()
+    };
+    test.run().await
+}

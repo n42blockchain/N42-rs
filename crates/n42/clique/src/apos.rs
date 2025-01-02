@@ -628,7 +628,7 @@ where
             //Collect all proposals to be voted on
             let proposals_lock = self.proposals.read().unwrap();
             let addresses: Vec<Address> = proposals_lock.iter()
-                .filter(|(&address, &authorize)| snap.valid_vote(address, authorize))
+                //.filter(|(&address, &authorize)| snap.valid_vote(address, authorize))
                 .map(|(address, _)| *address)
                 .collect();
 

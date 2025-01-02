@@ -50,4 +50,12 @@ impl TesterAccountPool {
     Address::from_slice(address)
     }
 
+     pub fn secret_key(&mut self, account: &str) -> SecretKey {
+        if !self.accounts.contains_key(account) {
+            let secret_key = SecretKey::new(&mut secp256k1::rand::thread_rng());
+            self.accounts.insert(account.to_string(), secret_key);
+        }
+        *self.accounts.get(account).unwrap()
+     }
+
 }

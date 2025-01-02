@@ -86,7 +86,7 @@ async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(node: 
             let payload_id = node.payload_builder.send_new_payload(attributes.clone().into()).await.unwrap()?;
             println!("payload_id={}", payload_id);
 
-            let payload_type = node.payload_builder.resolve(payload_id).await.unwrap().unwrap();
+            let payload_type = node.payload_builder.resolve(payload_id).await.unwrap()?;
             println!("payload_type={:?}", payload_type);
             let extra_data = payload_type.block().header.extra_data.clone();
             println!("header={:?}", payload_type.block().header);
@@ -144,7 +144,7 @@ impl CliqueTest {
         chainspec
     }
 
-    async fn run(&self) -> eyre::Result<()> {
+    async fn happy_path(&self) -> eyre::Result<()> {
         reth_tracing::init_test_tracing();
         let tasks = TaskManager::current();
         let exec = tasks.executor();
@@ -177,7 +177,7 @@ impl CliqueTest {
         let mut payload_event_stream = payload_events.into_stream();
 
        for vote in &self.votes {
-           let eth_signer_key = hex::encode(accounts.accounts.get(&vote.signer).unwrap().secret_bytes());
+           let eth_signer_key = hex::encode(accounts.secret_key(&vote.signer).secret_bytes());
            println!("signer {} eth_signer_key ={:?}", vote.signer, eth_signer_key);
            if let Some(ref voted) = vote.voted {
                if let Some(auth) = vote.auth {
@@ -206,6 +206,17 @@ impl CliqueTest {
        println!("second_event={:?}", second_event);
 
        Ok(())
+    }
+
+    async fn run(&self) -> eyre::Result<()> {
+        match self.happy_path().await {
+            Ok(_) => (),
+            Err(e) => {
+                println!("error: {:?}", e);
+                assert_eq!(e.to_string(), self.failure.clone().unwrap());
+            },
+        }
+        Ok(())
     }
 }
 
@@ -1185,6 +1196,24 @@ async fn test_epoch_transitions_reset_all_votes_to_allow_chain_checkpointing() -
             "B".to_string(),
         ],
         failure: None,
+        ..Default::default()
+    };
+    test.run().await
+}
+
+#[tokio::test]
+async fn test_un_unauthorized_signer_should_not_be_able_to_sign_blocks() -> eyre::Result<()> {
+    let test = CliqueTest {
+        signers: vec![
+            "A".to_string(),
+        ],
+        votes: vec![
+            TesterVote {
+                signer: "B".to_string(),
+                ..Default::default()
+            },
+        ],
+        failure: Some("unauthorized signer".to_string()),
         ..Default::default()
     };
     test.run().await

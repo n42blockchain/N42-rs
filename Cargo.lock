@@ -461,8 +461,6 @@ dependencies = [
 [[package]]
 name = "alloy-rpc-types-beacon"
 version = "0.5.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45357a642081c8ce235c0ad990c4e9279f5f18a723545076b38cfcc05cc25234"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
@@ -485,8 +483,6 @@ dependencies = [
 [[package]]
 name = "alloy-rpc-types-engine"
 version = "0.5.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "886d22d41992287a235af2f3af4299b5ced2bcafb81eb835572ad35747476946"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -4787,7 +4783,9 @@ dependencies = [
  "alloy-sol-types",
  "eyre",
  "futures",
+ "hex",
  "n42-clique",
+ "n42-engine-primitives",
  "n42-engine-types",
  "rand 0.8.5",
  "reth",
@@ -4812,13 +4810,17 @@ dependencies = [
  "reth-provider",
  "reth-revm",
  "reth-rpc",
+ "reth-rpc-api",
  "reth-tasks",
  "reth-tracing",
  "reth-transaction-pool",
  "reth-trie-db",
  "revm",
+ "secp256k1",
  "serde_json",
+ "tiny-keccak",
  "tokio",
+ "zerocopy",
 ]
 
 [[package]]
@@ -6508,6 +6510,7 @@ dependencies = [
  "alloy-primitives",
  "auto_impl",
  "derive_more 1.0.0",
+ "n42-primitives",
  "reth-primitives",
 ]
 
@@ -6528,7 +6531,6 @@ dependencies = [
 [[package]]
 name = "reth-consensus-debug-client"
 version = "1.1.1"
-source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.1.1#15c230bac20e2b1b3532c8b0d470e815fbc0cc22"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",

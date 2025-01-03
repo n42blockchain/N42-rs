@@ -11,7 +11,7 @@ use zerocopy::AsBytes;
 use reth_chainspec::ChainSpec;
 use reth_provider::{BlockReaderIdExt, BlockNumReader};
 use crate::utils::n42_payload_attributes;
-use alloy_primitives::{Bytes, Address};
+use alloy_primitives::{Bytes, Address, B256};
 use alloy_genesis::CliqueConfig;
 use futures::StreamExt;
 use reth:: args::{DevArgs, DiscoveryArgs, NetworkArgs, RpcServerArgs};
@@ -162,7 +162,7 @@ impl CliqueTest {
                 .with_network(network_config.clone())
                 .with_unused_ports()
                 .with_rpc(RpcServerArgs::default().with_unused_ports().with_http())
-            .with_dev(DevArgs { dev: true, ..Default::default() });
+            .with_dev(DevArgs { dev: true, consensus_signer_private_key: B256::random(), ..Default::default() });
 
         let NodeHandle { node, .. } = NodeBuilder::new(node_config.clone())
             .testing_node(exec.clone())

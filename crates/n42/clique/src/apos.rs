@@ -190,13 +190,14 @@ where
     pub fn new(
         provider: Provider,
         chain_spec: Arc<ChainSpec>,
+        signer_private_key: String,
     ) -> Self
     {
         let recents = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SNAPSHOTS)));
         let signatures = schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SIGNATURES));
 
         // signer_pk.sign_hash_sync();
-        let eth_signer: PrivateKeySigner = "".parse().unwrap();
+        let eth_signer: PrivateKeySigner = signer_private_key.parse().unwrap();
         //let eth_signer = PrivateKeySigner::random();
 
         info!(target: "consensus::apos", "apos set signer address {}", eth_signer.address());

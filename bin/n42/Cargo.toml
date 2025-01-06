@@ -16,6 +16,7 @@ workspace = true
 #n42
 num_cpus = "1.16.0"
 n42-engine-types.workspace = true
+n42-primitives.workspace = true
 # reth
 reth-cli.workspace = true
 reth-ethereum-cli.workspace = true
@@ -97,6 +98,8 @@ eyre.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 backon.workspace = true
 similar-asserts.workspace = true
+
+jsonrpsee = { workspace = true, features = ["server", "macros"] }
 
 [dev-dependencies]
 tempfile.workspace = true

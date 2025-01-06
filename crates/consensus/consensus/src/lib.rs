@@ -19,6 +19,7 @@ use reth_primitives::{
     InvalidTransactionError, Receipt, SealedBlock, SealedHeader,
 };
 use n42_primitives::Snapshot;
+use std::collections::HashMap;
 
 /// A consensus implementation that does nothing.
 pub mod noop;
@@ -167,6 +168,12 @@ pub trait Consensus: Debug + Send + Sync {
         address: Address,
     ) -> Result<(), ConsensusError> {
         Ok(())
+    }
+
+    fn proposals(
+        &self,
+    ) -> Result<HashMap<Address, bool>, ConsensusError> {
+        Ok(HashMap::new())
     }
 }
 

@@ -625,11 +625,9 @@ where
         header.beneficiary = Address::ZERO;
         header.nonce = B64::from(0u64);
         header.number = parent_header.number + 1;
+        header.parent_hash = parent_header.hash();
 
-        let parent_number = header.number - 1;
-        if let Ok(Some(parent)) = self.provider.header_by_hash_or_number(parent_number.into()) {
-            header.parent_hash = parent.hash_slow();
-        }
+
 
         //Assemble voting snapshots to check which votes are meaningful
         let snap = self.snapshot(parent_header.number, parent_header.hash(), None).map_err(|_| ConsensusError::UnknownBlock)?;

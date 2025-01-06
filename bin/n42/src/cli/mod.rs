@@ -242,7 +242,7 @@ pub enum Commands<C: ChainSpecParser, Ext: clap::Args + fmt::Debug> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::args::ColorMode;
+    use reth_node_core::args::ColorMode;
     use clap::CommandFactory;
     use reth_ethereum_cli::chainspec::SUPPORTED_CHAINS;
 

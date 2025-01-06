@@ -299,6 +299,11 @@ where
     ) -> &PayloadBuilderHandle<<Node::Types as NodeTypesWithEngine>::Engine> {
         self.node.payload_builder()
     }
+
+    /// Returns the handle to the consensus
+    pub fn consensus(&self) -> &Node::Consensus {
+        self.node.consensus()
+    }
 }
 
 /// Handle to the launched RPC servers.

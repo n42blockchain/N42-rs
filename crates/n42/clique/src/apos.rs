@@ -895,6 +895,7 @@ where
         address: Address,
         auth: bool,
     ) -> Result<(), ConsensusError> {
+        info!(target: "consensus::apos", "propose(), address={}, auth={}", address, auth);
         let mut proposals_guard = self.proposals.write().unwrap();
         proposals_guard.insert(address, auth);
         Ok(())
@@ -904,8 +905,17 @@ where
         &self,
         address: Address,
     ) -> Result<(), ConsensusError> {
+        info!(target: "consensus::apos", "discard(), address={}", address);
         let mut proposals_guard = self.proposals.write().unwrap();
         proposals_guard.remove(&address);
         Ok(())
+    }
+
+    fn proposals(
+        &self,
+    ) -> Result<HashMap<Address, bool>, ConsensusError> {
+        info!(target: "consensus::apos", "proposals()");
+        let mut proposals_guard = self.proposals.read().unwrap();
+        Ok(proposals_guard.clone())
     }
 }

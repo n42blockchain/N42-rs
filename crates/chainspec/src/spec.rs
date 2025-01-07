@@ -45,7 +45,7 @@ pub static N42: LazyLock<Arc<ChainSpec>> = LazyLock::new(|| {
         hardforks: EthereumHardfork::n42().into(),
         deposit_contract: None,
         base_fee_params: Default::default(),
-        max_gas_limit: 0,
+        max_gas_limit: ETHEREUM_BLOCK_GAS_LIMIT,
         prune_delete_limit: 0,
     };
     spec.genesis.config.dao_fork_support = true;

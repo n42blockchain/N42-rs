@@ -1,8 +1,8 @@
 # Rust Blockchain Project
 
 ![Rust](https://img.shields.io/badge/rust-v1.5%2B-orange)
-![License](https://img.shields.io/github/license/yourusername/rust-blockchain)
-![Build Status](https://img.shields.io/github/workflow/status/yourusername/rust-blockchain/CI)
+![License](https://img.shields.io/github/license/n42/rust-blockchain)
+![Build Status](https://img.shields.io/github/workflow/status/n42/rust-blockchain/CI)
 
 ## Introduction
 
@@ -30,7 +30,7 @@
 Clone the repository:
 
 ```bash
-git clone https://github.com/astranetworld/rast.git
+git clone https://github.com/n42blockchain/N42-rs.git
 cd rast
 ```
 
@@ -99,7 +99,7 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 
 ## Contact
 
-For any inquiries or support, please reach out to us via email at [support@yourproject.com](mailto:support@astranet.world) or join our [Discord community](https://discord.gg/astranet).
+For any inquiries or support, please reach out to us via email at [support@n42.world](mailto:support@n42.world) or join our [Discord community](https://discord.gg/n42).
 
 ## Acknowledgments
 

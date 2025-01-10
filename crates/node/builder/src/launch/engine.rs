@@ -228,6 +228,7 @@ where
                 Box::pin(consensus_engine_stream),
                 mining_mode,
                 N42PayloadAttributesBuilder::new(ctx.chain_spec()),
+                ctx.components().network().clone(),
             );
 
             Either::Left(eth_service)

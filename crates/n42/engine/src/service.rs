@@ -29,6 +29,8 @@ use reth_engine_tree::{
     persistence::PersistenceHandle,
     tree::{EngineApiTreeHandler, InvalidBlockHook, TreeConfig},
 };
+use reth_network::{NetworkHandle, Peers, PeersInfo};
+use reth_network_api::FullNetwork;
 use reth_evm::execute::BlockExecutorProvider;
 use reth_payload_builder::PayloadBuilderHandle;
 use reth_payload_primitives::{PayloadAttributesBuilder, PayloadTypes};
@@ -76,6 +78,7 @@ where
         from_engine: EngineMessageStream<N::Engine>,
         mode: MiningMode,
         payload_attributes_builder: B,
+        network: NetworkHandle,
     ) -> Self
     where
         B: PayloadAttributesBuilder<<N::Engine as PayloadTypes>::PayloadAttributes>,
@@ -111,9 +114,10 @@ where
             to_engine,
             mode,
             payload_builder,
+            network,
         );
 
-        Self { handler, incoming_requests: from_engine }
+        Self { handler, incoming_requests: from_engine}
     }
 }
 

@@ -1,6 +1,6 @@
 //! Contains the implementation of the mining mode for the local engine.
 
-use alloy_primitives::{TxHash, B256};
+use alloy_primitives::{TxHash, B256, U128, U256};
 use alloy_rpc_types_engine::{CancunPayloadFields, ExecutionPayloadSidecar, ForkchoiceState};
 use eyre::OptionExt;
 use futures_util::{stream::Fuse, StreamExt};
@@ -20,6 +20,8 @@ use std::{
     task::{Context, Poll},
     time::{Duration, UNIX_EPOCH},
 };
+use reth_eth_wire_types::NewBlock;
+use reth_network::NetworkHandle;
 use tokio::{
     sync::{mpsc::UnboundedSender, oneshot},
     time::Interval,
@@ -91,6 +93,8 @@ pub struct N42Miner<EngineT: EngineTypes, Provider, B> {
     last_timestamp: u64,
     /// Stores latest mined blocks.
     last_block_hashes: Vec<B256>,
+    /// network handle for announce block
+    network_handle: NetworkHandle,
 }
 
 impl<EngineT, Provider, B> N42Miner<EngineT, Provider, B>
@@ -106,6 +110,7 @@ where
         to_engine: UnboundedSender<BeaconEngineMessage<EngineT>>,
         mode: MiningMode,
         payload_builder: PayloadBuilderHandle<EngineT>,
+        network_handle: NetworkHandle,
     ) {
         let latest_header =
             provider.sealed_header(provider.best_block_number().unwrap()).unwrap().unwrap();
@@ -118,6 +123,7 @@ where
             payload_builder,
             last_timestamp: latest_header.timestamp,
             last_block_hashes: vec![latest_header.hash()],
+            network_handle,
         };
 
         // Spawn the miner
@@ -251,6 +257,10 @@ where
             self.last_block_hashes =
                 self.last_block_hashes.split_off(self.last_block_hashes.len() - 64);
         }
+
+        //announce block
+        //todo td
+        self.network_handle.announce_block(NewBlock{block: block.clone().unseal(), td: U128::MAX}, block.hash());
 
         Ok(())
     }

@@ -9,6 +9,7 @@ use reth_node_ethereum::{node::{
 use reth_trie_db::MerklePatriciaTrie;
 use n42_engine_primitives::{N42PayloadAttributes, N42PayloadBuilderAttributes};
 use crate::{N42EngineTypes, N42NodeAddOns, N42PayloadServiceBuilder};
+use crate::network::N42NetworkBuilder;
 
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
@@ -17,14 +18,7 @@ pub struct N42Node;
 
 impl N42Node {
     /// Returns a [`ComponentsBuilder`] configured for a regular Ethereum node.
-    pub fn components<Node>() -> ComponentsBuilder<
-        Node,
-        EthereumPoolBuilder,
-        N42PayloadServiceBuilder,
-        EthereumNetworkBuilder,
-        EthereumExecutorBuilder,
-        EthereumConsensusBuilder,
-    >
+    pub fn components<Node>() -> ComponentsBuilder<Node, EthereumPoolBuilder, N42PayloadServiceBuilder, N42NetworkBuilder, EthereumExecutorBuilder, EthereumConsensusBuilder>
     where
         Node: FullNodeTypes<Types: NodeTypes<ChainSpec = ChainSpec>>,
         <Node::Types as NodeTypesWithEngine>::Engine: PayloadTypes<
@@ -38,7 +32,7 @@ impl N42Node {
             .pool(EthereumPoolBuilder::default())
             .consensus(EthereumConsensusBuilder::default())
             .payload(N42PayloadServiceBuilder::default())
-            .network(EthereumNetworkBuilder::default())
+            .network(N42NetworkBuilder::default())
             .executor(EthereumExecutorBuilder::default())
     }
 }
@@ -67,7 +61,7 @@ where
         N,
         EthereumPoolBuilder,
         N42PayloadServiceBuilder,
-        EthereumNetworkBuilder,
+        N42NetworkBuilder,
         EthereumExecutorBuilder,
         EthereumConsensusBuilder,
     >;
@@ -81,7 +75,7 @@ where
             .pool(EthereumPoolBuilder::default())
             .consensus(EthereumConsensusBuilder::default())
             .payload(N42PayloadServiceBuilder::default())
-            .network(EthereumNetworkBuilder::default())
+            .network(N42NetworkBuilder::default())
             .executor(EthereumExecutorBuilder::default())
     }
 

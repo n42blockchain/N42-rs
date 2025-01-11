@@ -78,7 +78,7 @@ impl Future for MiningMode {
 
 /// Local miner advancing the chain/
 #[derive(Debug)]
-pub struct N42Miner<EngineT: EngineTypes, Provider, B> {
+pub struct N42Miner<EngineT: EngineTypes, Provider, B, Network> {
     /// Provider to read the current tip of the chain.
     provider: Provider,
     /// The payload attribute builder for the engine
@@ -93,15 +93,16 @@ pub struct N42Miner<EngineT: EngineTypes, Provider, B> {
     last_timestamp: u64,
     /// Stores latest mined blocks.
     last_block_hashes: Vec<B256>,
-    /// network handle for announce block
-    network_handle: NetworkHandle,
+    /// full network  for announce block
+    network: Network,
 }
 
-impl<EngineT, Provider, B> N42Miner<EngineT, Provider, B>
+impl<EngineT, Provider, B, Network> N42Miner<EngineT, Provider, B, Network>
 where
     EngineT: EngineTypes,
     Provider: BlockReader + ChainSpecProvider<ChainSpec: EthereumHardforks> + 'static,
     B: PayloadAttributesBuilder<<EngineT as PayloadTypes>::PayloadAttributes>,
+    Network: reth_network_api::FullNetwork,
 {
     /// Spawns a new [`N42Miner`] with the given parameters.
     pub fn spawn_new(
@@ -110,7 +111,7 @@ where
         to_engine: UnboundedSender<BeaconEngineMessage<EngineT>>,
         mode: MiningMode,
         payload_builder: PayloadBuilderHandle<EngineT>,
-        network_handle: NetworkHandle,
+        network: Network,
     ) {
         let latest_header =
             provider.sealed_header(provider.best_block_number().unwrap()).unwrap().unwrap();
@@ -123,7 +124,7 @@ where
             payload_builder,
             last_timestamp: latest_header.timestamp,
             last_block_hashes: vec![latest_header.hash()],
-            network_handle,
+            network,
         };
 
         // Spawn the miner
@@ -260,7 +261,7 @@ where
 
         //announce block
         //todo td
-        self.network_handle.announce_block(NewBlock{block: block.clone().unseal(), td: U128::MAX}, block.hash());
+        self.network.announce_block(NewBlock{block: block.clone().unseal(), td: U128::MAX}, block.hash());
 
         Ok(())
     }

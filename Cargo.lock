@@ -7399,7 +7399,6 @@ dependencies = [
 [[package]]
 name = "reth-network"
 version = "1.1.1"
-source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.1.1#15c230bac20e2b1b3532c8b0d470e815fbc0cc22"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
@@ -7451,7 +7450,6 @@ dependencies = [
 [[package]]
 name = "reth-network-api"
 version = "1.1.1"
-source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.1.1#15c230bac20e2b1b3532c8b0d470e815fbc0cc22"
 dependencies = [
  "alloy-primitives",
  "alloy-rpc-types-admin",

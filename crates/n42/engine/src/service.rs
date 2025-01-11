@@ -64,7 +64,7 @@ where
 {
     /// Constructor for [`N42EngineService`].
     #[allow(clippy::too_many_arguments)]
-    pub fn new<B>(
+    pub fn new<B, Network>(
         consensus: Arc<dyn Consensus>,
         executor_factory: impl BlockExecutorProvider,
         provider: ProviderFactory<N>,
@@ -78,10 +78,11 @@ where
         from_engine: EngineMessageStream<N::Engine>,
         mode: MiningMode,
         payload_attributes_builder: B,
-        network: NetworkHandle,
+        network: Network,
     ) -> Self
     where
         B: PayloadAttributesBuilder<<N::Engine as PayloadTypes>::PayloadAttributes>,
+        Network: FullNetwork
     {
         let chain_spec = provider.chain_spec();
         let engine_kind =

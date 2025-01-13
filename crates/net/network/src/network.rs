@@ -61,6 +61,7 @@ impl NetworkHandle {
         discv5: Option<Discv5>,
         event_sender: EventSender<NetworkEvent>,
         nat: Option<NatResolver>,
+        block_sender: EventSender<NewBlock>,
     ) -> Self {
         let inner = NetworkInner {
             num_active_peers,
@@ -78,6 +79,7 @@ impl NetworkHandle {
             discv5,
             event_sender,
             nat,
+            block_sender,
         };
         Self { inner: Arc::new(inner) }
     }
@@ -113,6 +115,16 @@ impl NetworkHandle {
     /// Broadcasting new blocks is considered a protocol violation.
     pub fn announce_block(&self, block: NewBlock, hash: B256) {
         self.send_message(NetworkHandleMessage::AnnounceBlock(block, hash))
+    }
+
+    ///N42 subscribe_block
+    pub fn subscribe_block(&self) -> EventStream<NewBlock> {
+        self.inner.block_sender.new_listener()
+    }
+
+    ///N42 broadcast_block
+    pub fn broadcast_block(&self, block: NewBlock)  {
+        self.inner.block_sender.notify(block)
     }
 
     /// Sends a [`PeerRequest`] to the given peer's session.
@@ -406,6 +418,10 @@ impl BlockAnnounceProvider for NetworkHandle {
     fn announce_block(&self, block: NewBlock, hash: B256) {
         self.announce_block(block, hash);
     }
+
+    fn subscribe_block(&self) -> EventStream<NewBlock> {
+        self.inner.block_sender.new_listener()
+    }
 }
 
 #[derive(Debug)]
@@ -440,6 +456,8 @@ struct NetworkInner {
     event_sender: EventSender<NetworkEvent>,
     /// The NAT resolver
     nat: Option<NatResolver>,
+    ///n42 block
+    block_sender: EventSender<NewBlock>,
 }
 
 /// Provides access to modify the network's additional protocol handlers.

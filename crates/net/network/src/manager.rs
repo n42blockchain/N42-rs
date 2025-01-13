@@ -29,7 +29,7 @@ use std::{
 
 use futures::{Future, StreamExt};
 use parking_lot::Mutex;
-use reth_eth_wire::{capability::CapabilityMessage, Capabilities, DisconnectReason};
+use reth_eth_wire::{capability::CapabilityMessage, Capabilities, DisconnectReason, NewBlock};
 use reth_fs_util::{self as fs, FsPathError};
 use reth_metrics::common::mpsc::UnboundedMeteredSender;
 use reth_network_api::{
@@ -255,6 +255,8 @@ impl NetworkManager {
 
         let event_sender: EventSender<NetworkEvent> = Default::default();
 
+        let block_sender: EventSender<NewBlock> = Default::default();
+
         let handle = NetworkHandle::new(
             Arc::clone(&num_active_peers),
             Arc::new(Mutex::new(listener_addr)),
@@ -269,6 +271,7 @@ impl NetworkManager {
             discv5,
             event_sender.clone(),
             nat,
+            block_sender.clone(),
         );
 
         Ok(Self {
@@ -523,7 +526,9 @@ impl NetworkManager {
                 self.within_pow_or_disconnect(peer_id, move |this| {
                     this.swarm.state_mut().on_new_block(peer_id, block.hash);
                     // start block import process
-                    this.block_import.on_new_block(peer_id, block);
+                    this.block_import.on_new_block(peer_id, block.clone());
+                    // n42
+                    this.handle.broadcast_block((*block.block).clone());
                 });
             }
             PeerMessage::PooledTransactions(msg) => {
@@ -994,6 +999,7 @@ impl Future for NetworkManager {
         while let Poll::Ready(outcome) = this.block_import.poll(cx) {
             this.on_block_import_result(outcome);
         }
+
 
         // These loops drive the entire state of network and does a lot of work. Under heavy load
         // (many messages/events), data may arrive faster than it can be processed (incoming

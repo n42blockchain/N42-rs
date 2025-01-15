@@ -29,6 +29,7 @@ pub use reth_network_types::{PeerKind, Reputation, ReputationChangeKind};
 
 pub use downloaders::BlockDownloaderProvider;
 pub use block::BlockAnnounceProvider;
+pub use block::{N42BlockImportError, N42BlockImportOutcome};
 pub use error::NetworkError;
 pub use events::{
     DiscoveredEvent, DiscoveryEvent, NetworkEvent, NetworkEventListenerProvider, PeerRequest,

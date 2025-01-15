@@ -26,15 +26,13 @@ use std::{
     task::{Context, Poll},
     time::{Duration, Instant},
 };
-
+use std::collections::HashSet;
 use futures::{Future, StreamExt};
 use parking_lot::Mutex;
 use reth_eth_wire::{capability::CapabilityMessage, Capabilities, DisconnectReason, NewBlock};
 use reth_fs_util::{self as fs, FsPathError};
 use reth_metrics::common::mpsc::UnboundedMeteredSender;
-use reth_network_api::{
-    test_utils::PeersHandle, EthProtocolInfo, NetworkEvent, NetworkStatus, PeerInfo, PeerRequest,
-};
+use reth_network_api::{test_utils::PeersHandle, BlockAnnounceProvider, EthProtocolInfo, N42BlockImportOutcome, NetworkEvent, NetworkStatus, PeerInfo, PeerRequest};
 use reth_network_peers::{NodeRecord, PeerId};
 use reth_network_types::ReputationChangeKind;
 use reth_storage_api::BlockNumReader;
@@ -493,6 +491,28 @@ impl NetworkManager {
         }
     }
 
+
+    /// Invoked after a `NewBlock` message from the peer was validated
+    fn n42_on_block_import_result(&mut self,  peers: HashSet<PeerId>, outcome: N42BlockImportOutcome) {
+        let N42BlockImportOutcome { hash, result } = outcome;
+        match result {
+            Ok(block) => {
+                for peer in peers {
+                    self.swarm.state_mut().update_peer_block(&peer, hash, block.block.number.clone());
+                    self.swarm.state_mut().announce_new_block(NewBlockMessage{ hash, block: Arc::new(block.clone()) });
+                }
+            },
+            Err(_err) => {
+                for peer in peers {
+                    self.swarm
+                        .state_mut()
+                        .peers_mut()
+                        .apply_reputation_change(&peer, ReputationChangeKind::BadBlock);
+                }
+            }
+        }
+    }
+
     /// Enforces [EIP-3675](https://eips.ethereum.org/EIPS/eip-3675#devp2p) consensus rules for the network protocol
     ///
     /// Depending on the mode of the network:
@@ -528,7 +548,7 @@ impl NetworkManager {
                     // start block import process
                     this.block_import.on_new_block(peer_id, block.clone());
                     // n42
-                    this.handle.broadcast_block((*block.block).clone());
+                    this.handle.import_block(peer_id, (*block.block).clone());
                 });
             }
             PeerMessage::PooledTransactions(msg) => {
@@ -998,6 +1018,10 @@ impl Future for NetworkManager {
         // poll new block imports (expected to be a noop for POS)
         while let Poll::Ready(outcome) = this.block_import.poll(cx) {
             this.on_block_import_result(outcome);
+        }
+
+        while let Some((peers, outcome)) = this.handle.take_validated_block() {
+            this.n42_on_block_import_result(peers, outcome);
         }
 
 

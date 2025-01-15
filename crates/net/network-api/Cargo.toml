@@ -20,6 +20,8 @@ reth-network-p2p.workspace = true
 reth-eth-wire-types.workspace = true
 reth-tokio-util.workspace = true
 reth-ethereum-forks.workspace = true
+reth-consensus.workspace = true
+reth-errors.workspace = true
 
 # ethereum
 alloy-primitives.workspace = true

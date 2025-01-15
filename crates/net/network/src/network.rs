@@ -5,14 +5,18 @@ use std::{
         Arc,
     },
 };
-
-use alloy_primitives::B256;
+use std::collections::hash_map::Entry;
+use std::collections::{HashSet, VecDeque};
+use std::hash::Hash;
+use std::sync::RwLock;
+use alloy_primitives::{BlockHash, TxHash, B256};
+use alloy_primitives::map::HashMap;
 use enr::Enr;
 use parking_lot::Mutex;
 use reth_discv4::{Discv4, NatResolver};
 use reth_discv5::Discv5;
 use reth_eth_wire::{DisconnectReason, NewBlock, NewPooledTransactionHashes, SharedTransactions};
-use reth_network_api::{test_utils::{PeersHandle, PeersHandleProvider}, BlockAnnounceProvider, BlockDownloaderProvider, DiscoveryEvent, NetworkError, NetworkEvent, NetworkEventListenerProvider, NetworkInfo, NetworkStatus, PeerInfo, PeerRequest, Peers, PeersInfo};
+use reth_network_api::{test_utils::{PeersHandle, PeersHandleProvider}, BlockAnnounceProvider, BlockDownloaderProvider, N42BlockImportError, DiscoveryEvent, N42BlockImportOutcome, NetworkError, NetworkEvent, NetworkEventListenerProvider, NetworkInfo, NetworkStatus, PeerInfo, PeerRequest, Peers, PeersInfo};
 use reth_network_p2p::{
     sync::{NetworkSyncUpdater, SyncState, SyncStateProvider},
     BlockClient,
@@ -32,6 +36,10 @@ use crate::{
     config::NetworkMode, protocol::RlpxSubProtocol, swarm::NetworkConnectionState,
     transactions::TransactionsHandle, FetchClient,
 };
+use crate::cache::LruCache;
+use tracing::trace;
+use crate::import::{BlockImportOutcome, BlockValidation};
+use crate::transactions::PendingPoolImportsInfo;
 
 /// A _shareable_ network frontend. Used to interact with the network.
 ///
@@ -80,6 +88,9 @@ impl NetworkHandle {
             event_sender,
             nat,
             block_sender,
+            block_by_peers: Arc::new(RwLock::new(Default::default())),
+            bad_block_imports: LruCache::new(100),
+            validated_block: Arc::new(RwLock::new(VecDeque::new())),
         };
         Self { inner: Arc::new(inner) }
     }
@@ -122,9 +133,43 @@ impl NetworkHandle {
         self.inner.block_sender.new_listener()
     }
 
-    ///N42 broadcast_block
-    pub fn broadcast_block(&self, block: NewBlock)  {
-        self.inner.block_sender.notify(block)
+    ///N42 import_block
+    pub fn import_block(&self, peer_id: PeerId, block: NewBlock)  {
+        let block_hash = block.block.hash_slow();
+        let mut block_by_peers = self.inner.block_by_peers.write().unwrap();
+        match block_by_peers.entry(block_hash) {
+            Entry::Occupied(mut entry) => {
+                // block was already inserted
+                entry.get_mut().insert(peer_id);
+            }
+            Entry::Vacant(entry) => {
+                if self.inner.bad_block_imports.contains((&block_hash).into()) {
+                    trace!(target: "net::block",
+                                peer_id=format!("{peer_id:#}"),
+                                hash=%block_hash,
+                                "received a known bad block from peer"
+                            );
+                } else {
+                    entry.insert(HashSet::from([peer_id]));
+                    self.inner.block_sender.notify(block)
+                }
+            }
+        }
+    }
+    ///N42 import_block
+    pub fn take_validated_block(&self) -> Option<(HashSet<PeerId>, N42BlockImportOutcome)> {
+        let validated_block_clone = Arc::clone(&self.inner.validated_block);
+        let validated_block = validated_block_clone.read().unwrap();
+        if let Some(outcome) = validated_block.front() {
+            let block_hash = outcome.hash;
+            let mut block_by_peers = self.inner.block_by_peers.write().unwrap();
+            return if let Some(peers) = block_by_peers.remove(&block_hash) {
+                Some((peers, outcome.clone()))
+            } else {
+                None
+            }
+        }
+        None
     }
 
     /// Sends a [`PeerRequest`] to the given peer's session.
@@ -422,6 +467,12 @@ impl BlockAnnounceProvider for NetworkHandle {
     fn subscribe_block(&self) -> EventStream<NewBlock> {
         self.inner.block_sender.new_listener()
     }
+
+    fn validated_block(&self, result: N42BlockImportOutcome) {
+        let validated_block = Arc::clone(&self.inner.validated_block);
+        let mut queue = validated_block.write().unwrap();
+        queue.push_back(result);
+    }
 }
 
 #[derive(Debug)]
@@ -458,6 +509,16 @@ struct NetworkInner {
     nat: Option<NatResolver>,
     ///n42 block
     block_sender: EventSender<NewBlock>,
+
+    /// All currently pending blocks grouped by peers.
+    ///
+    /// This way we can track incoming blocks and prevent multiple block imports for the same
+    /// block
+    block_by_peers: Arc<RwLock<HashMap<BlockHash, HashSet<PeerId>>>>,
+    /// Bad imports.
+    bad_block_imports: LruCache<BlockHash>,
+    /// validated block
+    validated_block: Arc<RwLock<VecDeque<N42BlockImportOutcome>>>,
 }
 
 /// Provides access to modify the network's additional protocol handlers.

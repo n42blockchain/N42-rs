@@ -22,6 +22,7 @@ use std::{
 };
 use reth_eth_wire_types::NewBlock;
 use reth_network::NetworkHandle;
+use reth_tokio_util::EventStream;
 use tokio::{
     sync::{mpsc::UnboundedSender, oneshot},
     time::Interval,
@@ -95,6 +96,7 @@ pub struct N42Miner<EngineT: EngineTypes, Provider, B, Network> {
     last_block_hashes: Vec<B256>,
     /// full network  for announce block
     network: Network,
+    new_block_event_stream: EventStream<NewBlock>,
 }
 
 impl<EngineT, Provider, B, Network> N42Miner<EngineT, Provider, B, Network>
@@ -116,6 +118,7 @@ where
         let latest_header =
             provider.sealed_header(provider.best_block_number().unwrap()).unwrap().unwrap();
 
+        let new_block_event_stream = network.subscribe_block();
         let miner = Self {
             provider,
             payload_attributes_builder,
@@ -125,6 +128,7 @@ where
             last_timestamp: latest_header.timestamp,
             last_block_hashes: vec![latest_header.hash()],
             network,
+            new_block_event_stream,
         };
 
         // Spawn the miner
@@ -147,6 +151,9 @@ where
                     if let Err(e) = self.update_forkchoice_state().await {
                         error!(target: "engine::local", "Error updating fork choice: {:?}", e);
                     }
+                }
+                new_block_event = &mut self.new_block_event_stream.next() => {
+                    println!("new_block_event={:?}", new_block_event);
                 }
             }
         }

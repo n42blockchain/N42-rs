@@ -29,6 +29,7 @@ reth-stages-api.workspace = true
 reth-network.workspace = true
 reth-eth-wire-types.workspace = true
 reth-network-api.workspace = true
+reth-tokio-util.workspace = true
 
 # alloy
 alloy-primitives.workspace = true

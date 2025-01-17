@@ -343,7 +343,7 @@ where
     async fn build_consensus(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::Consensus> {
         if ctx.is_dev() {
             // Ok(Arc::new(AutoSealConsensus::new(ctx.chain_spec())))
-            Ok(Arc::new(APos::new(ctx.provider().clone(), ctx.chain_spec(), ctx.config().dev.consensus_signer_private_key.to_string())))
+            Ok(Arc::new(APos::new(ctx.provider().clone(), ctx.chain_spec(), ctx.config().dev.consensus_signer_private_key.map(|v|v.to_string()))))
         } else {
             Ok(Arc::new(EthBeaconConsensus::new(ctx.chain_spec())))
         }

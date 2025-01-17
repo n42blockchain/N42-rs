@@ -497,6 +497,10 @@ pub enum ConsensusError {
         "save snapshot err"
     )]
     SaveSnapshotError,
+    #[display(
+        "no signer set"
+    )]
+    NoSignerSet,
 }
 
 impl ConsensusError {

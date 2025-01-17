@@ -17,7 +17,7 @@ use reth_primitives::{SealedBlock, SealedHeader, BlockWithSenders, public_key_to
 use reth_primitives_traits::{BlockHeader, Header};
 use reth_provider::{HeaderProvider, SnapshotProvider};
 use secp256k1::{Message, SECP256K1, Error as SecpError, ecdsa::{RecoverableSignature, RecoveryId}};
-use tracing::{info, debug, error};
+use tracing::{info, warn, debug, error};
 use n42_primitives::{APosConfig, Snapshot};
 
 use alloy_signer_local::{LocalSigner, PrivateKeySigner};
@@ -173,8 +173,8 @@ where
     recents: RwLock<schnellru::LruMap<B256, Snapshot>>,    // Snapshots for recent block to speed up reorgs
     signatures: schnellru::LruMap<B256, Vec<u8>>,    // Signatures of recent blocks to speed up mining
     proposals: Arc<RwLock<HashMap<Address, bool>>>,   // Current list of proposals we are pushing
-    signer: RwLock<Address>, // Ethereum address of the signing key
-    eth_signer: RwLock<LocalSigner<SigningKey>>,
+    signer: RwLock<Option<Address>>, // Ethereum address of the signing key
+    eth_signer: RwLock<Option<LocalSigner<SigningKey>>>,
     //  Provider,
     provider: Provider,
 }
@@ -190,17 +190,18 @@ where
     pub fn new(
         provider: Provider,
         chain_spec: Arc<ChainSpec>,
-        signer_private_key: String,
+        signer_private_key: Option<String>,
     ) -> Self
     {
         let recents = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SNAPSHOTS)));
         let signatures = schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SIGNATURES));
 
         // signer_pk.sign_hash_sync();
-        let eth_signer: PrivateKeySigner = signer_private_key.parse().unwrap();
+        let eth_signer: Option<PrivateKeySigner> = signer_private_key.map(|key| { key.parse().unwrap() });
         //let eth_signer = PrivateKeySigner::random();
 
-        info!(target: "consensus::apos", "apos set signer address {}", eth_signer.address());
+        let eth_signer_address = eth_signer.clone().map(|signer| {signer.address()});
+        info!(target: "consensus::apos", "apos set signer address {:?}", eth_signer_address);
 
         let mut config = APosConfig::default();
         if let Some(clique) = chain_spec.genesis().config.clique {
@@ -217,17 +218,18 @@ where
             recents,
             signatures,
             proposals: Arc::new(RwLock::new(HashMap::new())),
-            signer: RwLock::new(eth_signer.address()),
+            signer: RwLock::new(eth_signer_address),
             eth_signer: RwLock::new(eth_signer),
             provider,
         }
     }
 
-    fn set_signer(&self, eth_signer: LocalSigner<SigningKey>) {
-        println!("set_signer, new signer={:?}", eth_signer.address());
+    fn set_signer(&self, eth_signer: Option<LocalSigner<SigningKey>>) {
+        let eth_signer_address = eth_signer.clone().map(|signer| {signer.address()});
+        println!("set_signer, new signer={:?}", eth_signer_address);
         let mut signer_guard = self.signer.write().unwrap();
         let mut eth_signer_guard = self.eth_signer.write().unwrap();
-        *signer_guard = eth_signer.address();
+        *signer_guard = eth_signer_address;
         *eth_signer_guard = eth_signer;
     }
 
@@ -353,7 +355,14 @@ where
 
         let signer_guard = self.signer.read().unwrap();
         //calc_difficulty(&snap, &self.signer.get())
-        calc_difficulty(&snap, &signer_guard)
+        if let Some(signer) = *signer_guard {
+            calc_difficulty(&snap, &signer)
+        } else {
+            warn!(target: "consensus::apos",
+                "calc_difficulty() called when no signer is set",
+            );
+            DIFF_NO_TURN.clone()
+        }
     }
 
 
@@ -655,10 +664,12 @@ where
 
         //Copy the signer to prevent data competition
         let signer_guard = self.signer.read().unwrap();
-        let signer = signer_guard.clone();
-
-        //Set the correct difficulty level
-        header.difficulty = calc_difficulty(&snap, &signer);
+        if let Some(signer) = signer_guard.clone() {
+            //Set the correct difficulty level
+            header.difficulty = calc_difficulty(&snap, &signer);
+        } else {
+            return Err(ConsensusError::NoSignerSet);
+        }
 
         let mut extra_data_mut = BytesMut::from(&header.extra_data[..]);
         //Ensure that the additional data has all its components
@@ -697,21 +708,21 @@ where
         //todo
 
 
-        let signer_guard = self.signer.read().unwrap();
-        println!("seal() signer_guard={:?}", signer_guard);
+        let signer = self.signer.read().unwrap().ok_or(ConsensusError::NoSignerSet)?;
+        println!("seal() signer={:?}", signer);
         // Bail out if we're unauthorized to sign a block
         let snap = self.snapshot(header.number - 1, header.parent_hash.clone(), None)?;
-        if !snap.signers.contains(&signer_guard) {
-            error!(target: "consensus::pos", "err signer: {}", signer_guard);
+        if !snap.signers.contains(&signer) {
+            error!(target: "consensus::pos", "err signer: {}", signer);
             return Err(ConsensusError::UnauthorizedSigner)
         }
 
         // If we're amongst the recent signers, wait for the next block
         for (seen, recent) in &snap.recents {
-            if *recent == *signer_guard {
+            if *recent == signer {
                 let limit = (snap.signers.len() as u64 / 2) + 1;
                 if header.number < limit || *seen > header.number - limit {
-                    error!(target: "consensus::engine", "Signed recently, must wait for others: limit: {}, seen: {}, number: {}, signer: {}", limit, seen, header.number, signer_guard);
+                    error!(target: "consensus::engine", "Signed recently, must wait for others: limit: {}, seen: {}, number: {}, signer: {}", limit, seen, header.number, signer);
                     return Err(ConsensusError::RecentlySigned);
                 }
             }
@@ -741,9 +752,10 @@ where
         // }
 
         let eth_signer_guard = self.eth_signer.read().unwrap();
+        let eth_signer = eth_signer_guard.as_ref().ok_or(ConsensusError::NoSignerSet)?;
         // Sign all the things!
         let header_bytes = seal_hash(&header);
-        let sighash = eth_signer_guard.sign_hash_sync(&header_bytes).map_err(|_| ConsensusError::SignHeaderError)?;
+        let sighash = eth_signer.sign_hash_sync(&header_bytes).map_err(|_| ConsensusError::SignHeaderError)?;
 
 
         let mut extra_data_mut = BytesMut::from(&header.extra_data[..]);
@@ -759,10 +771,10 @@ where
     }
 
     fn set_eth_signer_by_key(&self, eth_signer_key: Option<String>) -> Result<(), ConsensusError> {
-        if let Some(key) = eth_signer_key {
-            let eth_signer = PrivateKeySigner::from_bytes(&FixedBytes::from_str(&key).unwrap()).unwrap();
-            self.set_signer(eth_signer);
-        }
+        let eth_signer = eth_signer_key.map(|key| {
+            PrivateKeySigner::from_bytes(&FixedBytes::from_str(&key).unwrap()).unwrap()
+        });
+        self.set_signer(eth_signer);
         Ok(())
     }
 

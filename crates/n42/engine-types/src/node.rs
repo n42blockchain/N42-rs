@@ -9,6 +9,7 @@ use reth_node_ethereum::{node::{
 use reth_trie_db::MerklePatriciaTrie;
 use n42_engine_primitives::{N42PayloadAttributes, N42PayloadBuilderAttributes};
 use crate::{N42EngineTypes, N42NodeAddOns, N42PayloadServiceBuilder};
+use crate::consensus::N42ConsensusBuilder;
 use crate::network::N42NetworkBuilder;
 
 #[derive(Debug, Clone, Default)]
@@ -18,7 +19,7 @@ pub struct N42Node;
 
 impl N42Node {
     /// Returns a [`ComponentsBuilder`] configured for a regular Ethereum node.
-    pub fn components<Node>() -> ComponentsBuilder<Node, EthereumPoolBuilder, N42PayloadServiceBuilder, N42NetworkBuilder, EthereumExecutorBuilder, EthereumConsensusBuilder>
+    pub fn components<Node>() -> ComponentsBuilder<Node, EthereumPoolBuilder, N42PayloadServiceBuilder, N42NetworkBuilder, EthereumExecutorBuilder, N42ConsensusBuilder>
     where
         Node: FullNodeTypes<Types: NodeTypes<ChainSpec = ChainSpec>>,
         <Node::Types as NodeTypesWithEngine>::Engine: PayloadTypes<
@@ -30,7 +31,7 @@ impl N42Node {
         ComponentsBuilder::default()
             .node_types::<Node>()
             .pool(EthereumPoolBuilder::default())
-            .consensus(EthereumConsensusBuilder::default())
+            .consensus(N42ConsensusBuilder::default())
             .payload(N42PayloadServiceBuilder::default())
             .network(N42NetworkBuilder::default())
             .executor(EthereumExecutorBuilder::default())
@@ -63,7 +64,7 @@ where
         N42PayloadServiceBuilder,
         N42NetworkBuilder,
         EthereumExecutorBuilder,
-        EthereumConsensusBuilder,
+        N42ConsensusBuilder,
     >;
     type AddOns = N42NodeAddOns<
         NodeAdapter<N, <Self::ComponentsBuilder as NodeComponentsBuilder<N>>::Components>,
@@ -73,7 +74,7 @@ where
         ComponentsBuilder::default()
             .node_types::<N>()
             .pool(EthereumPoolBuilder::default())
-            .consensus(EthereumConsensusBuilder::default())
+            .consensus(N42ConsensusBuilder::default())
             .payload(N42PayloadServiceBuilder::default())
             .network(N42NetworkBuilder::default())
             .executor(EthereumExecutorBuilder::default())

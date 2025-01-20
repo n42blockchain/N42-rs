@@ -64,7 +64,7 @@ where
 {
     /// Constructor for [`N42EngineService`].
     #[allow(clippy::too_many_arguments)]
-    pub fn new<B, Network>(
+    pub fn  new<B, Network>(
         consensus: Arc<dyn Consensus>,
         executor_factory: impl BlockExecutorProvider,
         provider: ProviderFactory<N>,

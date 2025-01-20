@@ -19,6 +19,7 @@ mod job_generator;
 mod job;
 mod metrics;
 mod network;
+mod consensus;
 
 pub use payload::N42PayloadBuilder;
 pub use payload::N42PayloadServiceBuilder;

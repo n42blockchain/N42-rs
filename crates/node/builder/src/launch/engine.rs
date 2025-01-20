@@ -9,6 +9,7 @@ use reth_blockchain_tree::BlockchainTreeConfig;
 use reth_chainspec::EthChainSpec;
 use reth_consensus_debug_client::{DebugConsensusClient, EtherscanBlockProvider};
 use reth_engine_local::{N42EngineService, MiningMode};
+use consensus_client::miner::N42Miner;
 use n42_engine_primitives::N42PayloadAttributesBuilder;
 use reth_engine_service::service::{ChainEvent, EngineService};
 use reth_engine_tree::{
@@ -287,6 +288,7 @@ where
         // extract the jwt secret from the args if possible
         let jwt_secret = ctx.auth_jwt_secret()?;
 
+        let beacon_engine_handle_clone = beacon_engine_handle.clone();
         let add_ons_ctx = AddOnsContext {
             node: ctx.node_adapter().clone(),
             config: ctx.node_config(),
@@ -406,6 +408,20 @@ where
 
             let _ = exit.send(res);
         });
+
+        let mining_mode = if let Some(block_time) = ctx.node_config().dev.block_time {
+            consensus_client::miner::MiningMode::interval(block_time)
+        } else {
+            consensus_client::miner::MiningMode::instant(ctx.components().pool().clone())
+        };
+        N42Miner::spawn_new(
+            ctx.blockchain_db().clone(),
+            N42PayloadAttributesBuilder::new(ctx.chain_spec()),
+            beacon_engine_handle_clone,
+            mining_mode,
+            ctx.components().payload_builder().clone(),
+            ctx.components().network().clone(),
+        );
 
         let full_node = FullNode {
             consensus: ctx.components().consensus().clone(),

@@ -12,7 +12,6 @@ members = [
     "bin/n42/",
     "crates/n42/primitives/",
     "crates/n42/clique/",
-    "crates/n42/engine/",
     "crates/n42/engine-types/",
     "crates/n42/engine-primitives/",
     "crates/n42/n42-testing",
@@ -199,7 +198,6 @@ reth-node-core = { path = "crates/node/core" }
 reth-node-ethereum = { path = "crates/ethereum/node" }
 reth-provider = { path = "crates/storage/provider" }
 reth-db = {path = "crates/storage/db" }
-reth-engine-local = {path = "crates/n42/engine" }
 reth-ethereum-forks = { path = "crates/ethereum-forks"}
 reth-ethereum-cli = { path = "crates/ethereum/cli"}
 reth-ethereum-consensus = { path = "crates/ethereum/consensus"}

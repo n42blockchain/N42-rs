@@ -1838,6 +1838,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "consensus-client"
+version = "1.1.1"
+dependencies = [
+ "alloy-primitives",
+ "alloy-rpc-types-engine",
+ "eyre",
+ "futures-util",
+ "op-alloy-rpc-types-engine",
+ "reth-beacon-consensus",
+ "reth-chainspec",
+ "reth-consensus",
+ "reth-engine-primitives",
+ "reth-engine-service",
+ "reth-engine-tree",
+ "reth-eth-wire-types",
+ "reth-ethereum-engine-primitives",
+ "reth-evm",
+ "reth-network",
+ "reth-network-api",
+ "reth-node-api",
+ "reth-node-types",
+ "reth-payload-builder",
+ "reth-payload-primitives",
+ "reth-payload-validator",
+ "reth-provider",
+ "reth-prune",
+ "reth-rpc-types-compat",
+ "reth-stages-api",
+ "reth-tokio-util",
+ "reth-transaction-pool",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+]
+
+[[package]]
 name = "console"
 version = "0.15.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6846,23 +6882,20 @@ dependencies = [
 [[package]]
 name = "reth-engine-local"
 version = "1.1.1"
+source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.1.1#15c230bac20e2b1b3532c8b0d470e815fbc0cc22"
 dependencies = [
  "alloy-primitives",
  "alloy-rpc-types-engine",
  "eyre",
  "futures-util",
- "op-alloy-rpc-types-engine",
  "reth-beacon-consensus",
  "reth-chainspec",
  "reth-consensus",
  "reth-engine-primitives",
  "reth-engine-service",
  "reth-engine-tree",
- "reth-eth-wire-types",
  "reth-ethereum-engine-primitives",
  "reth-evm",
- "reth-network",
- "reth-network-api",
  "reth-payload-builder",
  "reth-payload-primitives",
  "reth-payload-validator",
@@ -6870,7 +6903,6 @@ dependencies = [
  "reth-prune",
  "reth-rpc-types-compat",
  "reth-stages-api",
- "reth-tokio-util",
  "reth-transaction-pool",
  "tokio",
  "tokio-stream",
@@ -7571,6 +7603,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-rpc-types",
  "aquamarine",
+ "consensus-client",
  "eyre",
  "fdlimit",
  "futures",

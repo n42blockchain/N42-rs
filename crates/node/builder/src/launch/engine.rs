@@ -8,7 +8,7 @@ use reth_beacon_consensus::{
 use reth_blockchain_tree::BlockchainTreeConfig;
 use reth_chainspec::EthChainSpec;
 use reth_consensus_debug_client::{DebugConsensusClient, EtherscanBlockProvider};
-use reth_engine_local::{N42EngineService, MiningMode};
+use reth_engine_local::{LocalEngineService, LocalPayloadAttributesBuilder, MiningMode};
 use consensus_client::miner::N42Miner;
 use n42_engine_primitives::N42PayloadAttributesBuilder;
 use reth_engine_service::service::{ChainEvent, EngineService};
@@ -215,7 +215,7 @@ where
             } else {
                 MiningMode::instant(ctx.components().pool().clone())
             };
-            let eth_service = N42EngineService::new(
+            let eth_service = LocalEngineService::new(
                 ctx.consensus(),
                 ctx.components().block_executor().clone(),
                 ctx.provider_factory().clone(),
@@ -229,7 +229,6 @@ where
                 Box::pin(consensus_engine_stream),
                 mining_mode,
                 N42PayloadAttributesBuilder::new(ctx.chain_spec()),
-                ctx.components().network().clone(),
             );
 
             Either::Left(eth_service)

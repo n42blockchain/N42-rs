@@ -408,10 +408,14 @@ where
             let _ = exit.send(res);
         });
 
-        let mining_mode = if let Some(block_time) = ctx.node_config().dev.block_time {
-            consensus_client::miner::MiningMode::interval(block_time)
+        let mining_mode = if let Some(_) = ctx.node_config().dev.consensus_signer_private_key {
+            if let Some(block_time) = ctx.node_config().dev.block_time {
+                consensus_client::miner::MiningMode::interval(block_time)
+            } else {
+                consensus_client::miner::MiningMode::instant(ctx.components().pool().clone())
+            }
         } else {
-            consensus_client::miner::MiningMode::instant(ctx.components().pool().clone())
+            consensus_client::miner::MiningMode::NoMining
         };
         N42Miner::spawn_new(
             ctx.blockchain_db().clone(),

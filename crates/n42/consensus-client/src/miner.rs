@@ -9,7 +9,7 @@ use alloy_primitives::{TxHash, B256, U128, U256};
 use alloy_rpc_types_engine::{CancunPayloadFields, ExecutionPayloadSidecar, ForkchoiceState};
 use eyre::OptionExt;
 use futures_util::{stream::Fuse, StreamExt};
-use reth_beacon_consensus::BeaconEngineMessage;
+use reth_beacon_consensus::{BeaconEngineMessage, ForkchoiceStatus};
 use reth_chainspec::EthereumHardforks;
 use reth_engine_primitives::{EngineApiMessageVersion, EngineTypes};
 use reth_payload_builder::PayloadBuilderHandle;
@@ -33,7 +33,7 @@ use tokio::{
     time::Interval,
 };
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::error;
+use tracing::{error, info};
 
 /// A mining mode for the local dev engine.
 #[derive(Debug)]
@@ -43,6 +43,7 @@ pub enum MiningMode {
     Instant(Fuse<ReceiverStream<TxHash>>),
     /// In this mode a block is built at a fixed interval.
     Interval(Interval),
+    NoMining,
 }
 
 impl MiningMode {
@@ -76,6 +77,9 @@ impl Future for MiningMode {
                 if interval.poll_tick(cx).is_ready() {
                     return Poll::Ready(())
                 }
+                Poll::Pending
+            }
+            Self::NoMining => {
                 Poll::Pending
             }
         }
@@ -149,17 +153,16 @@ where
                 // Wait for the interval or the pool to receive a transaction
                 _ = &mut self.mode => {
                     if let Err(e) = self.advance().await {
-                        error!(target: "engine::local", "Error advancing the chain: {:?}", e);
-                    }
-                }
-                // send FCU once in a while
-                _ = fcu_interval.tick() => {
-                    if let Err(e) = self.update_forkchoice_state().await {
-                        error!(target: "engine::local", "Error updating fork choice: {:?}", e);
+                        error!(target: "consensus-client", "Error advancing the chain: {:?}", e);
                     }
                 }
                 new_block_event = &mut self.new_block_event_stream.next() => {
-                    println!("new_block_event={:?}", new_block_event);
+                    info!(target: "consensus-client", "new_block_event={:?}", new_block_event);
+                    if let Some(new_block) = new_block_event {
+                        if let Err(e) = self.insert_block(new_block).await {
+                            error!(target: "consensus-client", "Error validating and inserting the block: {:?}", e);
+                        }
+                    }
                 }
             }
         }
@@ -181,17 +184,14 @@ where
     }
 
     /// Sends a FCU to the engine.
-    async fn update_forkchoice_state(&self) -> eyre::Result<()> {
+    async fn update_forkchoice_state(&self) -> eyre::Result<ForkchoiceStatus> {
         let res = self.beacon_engine_handle.fork_choice_updated(
             self.forkchoice_state(),
             None,
             EngineApiMessageVersion::default(),
         ).await?;
-        if !res.payload_status.is_valid() {
-            eyre::bail!("Invalid fork choice update")
-        }
 
-        Ok(())
+        Ok(res.payload_status.status.into())
     }
 
     /// Generates payload attributes for a new block, passes them to FCU and inserts built payload
@@ -260,6 +260,57 @@ where
         //announce block
         //todo td
         self.network.announce_block(NewBlock{block: block.clone().unseal(), td: U128::MAX}, block.hash());
+
+        Ok(())
+    }
+
+    fn forkchoice_state_with_head(&self, head_block_hash: B256) -> ForkchoiceState {
+        ForkchoiceState {
+            head_block_hash,
+            safe_block_hash: *self
+                .last_block_hashes
+                .get(self.last_block_hashes.len().saturating_sub(32))
+                .expect("at least 1 block exists"),
+            finalized_block_hash: *self
+                .last_block_hashes
+                .get(self.last_block_hashes.len().saturating_sub(64))
+                .expect("at least 1 block exists"),
+        }
+    }
+
+    async fn insert_block(&mut self, new_block: NewBlock) -> eyre::Result<()> {
+        let block = new_block.clone().block.seal_slow();
+        info!(target: "consensus-client", "new_block hash {:?}", block.header.hash());
+
+        match self.beacon_engine_handle.fork_choice_updated(
+            self.forkchoice_state_with_head(block.parent_hash),
+            None,
+            EngineApiMessageVersion::default(),
+        ).await {
+            Ok(v) => {
+                info!(target: "consensus-client", "forkchoice status {:?}", v);
+            }
+            Err(e) => {
+                error!(target: "consensus-client", "Error updating fork choice: {:?}", e);
+            }
+        }
+
+        let block = new_block.clone().block.seal_slow();
+        let cancun_fields =
+            self.provider.chain_spec().is_cancun_active_at_timestamp(block.timestamp).then(|| {
+                CancunPayloadFields {
+                    parent_beacon_block_root: block.parent_beacon_block_root.unwrap(),
+                    versioned_hashes: block.blob_versioned_hashes().into_iter().copied().collect(),
+                }
+            });
+
+        let res = self.beacon_engine_handle.new_payload(
+            block_to_payload(block),
+            cancun_fields
+                .map(ExecutionPayloadSidecar::v3)
+                .unwrap_or_else(ExecutionPayloadSidecar::none),
+        ).await?;
+        info!(target: "consensus-client", "new_payload res={:?}", res);
 
         Ok(())
     }

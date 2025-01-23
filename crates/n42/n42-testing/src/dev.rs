@@ -15,7 +15,6 @@ use alloy_primitives::{Bytes, Address, B256};
 use alloy_genesis::CliqueConfig;
 use futures::StreamExt;
 use reth:: args::{DevArgs, DiscoveryArgs, NetworkArgs, RpcServerArgs};
-//use reth_e2e_test_utils::setup;
 use reth_node_builder::{
     NodeBuilder, NodeConfig, NodeHandle,FullNode,rpc::RethRpcAddOns,
 };
@@ -54,7 +53,7 @@ pub struct CliqueTest {
 }
 
 fn get_addresses_from_extra_data(extra_data: Bytes) -> Vec<Address> {
-    let signers_count = (extra_data.len() - EXTRA_VANITY - SIGNATURE_LENGTH) /  Address::len_bytes();
+    let signers_count = (extra_data.len() - EXTRA_VANITY - SIGNATURE_LENGTH) / Address::len_bytes();
 
     let mut signers = Vec::with_capacity(signers_count);
 
@@ -71,52 +70,50 @@ async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(node: 
     where <<<Node as FullNodeTypes>::Types as NodeTypesWithEngine>::Engine as PayloadTypes>::PayloadBuilderAttributes: From<N42PayloadBuilderAttributes>,
     ExecutionPayloadV1: From<<<<Node as FullNodeTypes>::Types as NodeTypesWithEngine>::Engine as PayloadTypes>::BuiltPayload>
 {
+    let best_number = node.provider.chain_info().unwrap().best_number;
+    println!("best_number={}", best_number);
+    println!("eth_signer_key={:?}", eth_signer_key);
+    let parent_hash = node.provider.latest_header().unwrap().unwrap().hash();
+    println!("parent_hash={:?}", parent_hash);
+    println!("header={:?}", node.provider.latest_header().unwrap().unwrap().header());
+    println!("header hash_slow={:?}", node.provider.latest_header().unwrap().unwrap().header().hash_slow());
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let attributes = n42_payload_attributes(timestamp, parent_hash);
+    node.consensus.set_eth_signer_by_key(Some(eth_signer_key.clone()))?;
+    let payload_id = node.payload_builder.send_new_payload(attributes.clone().into()).await.unwrap()?;
+    println!("payload_id={}", payload_id);
 
-            let best_number = node.provider.chain_info().unwrap().best_number;
-            println!("best_number={}", best_number);
-            //let eth_signer_key = &eth_signer_keys[(best_number % 2) as usize];
-            println!("eth_signer_key={:?}", eth_signer_key);
-            let parent_hash = node.provider.latest_header().unwrap().unwrap().hash();
-            println!("parent_hash={:?}", parent_hash);
-            println!("header={:?}", node.provider.latest_header().unwrap().unwrap().header());
-            println!("header hash_slow={:?}", node.provider.latest_header().unwrap().unwrap().header().hash_slow());
-            let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-            let attributes = n42_payload_attributes(timestamp, parent_hash);
-            node.consensus.set_eth_signer_by_key(Some(eth_signer_key.clone()))?;
-            let payload_id = node.payload_builder.send_new_payload(attributes.clone().into()).await.unwrap()?;
-            println!("payload_id={}", payload_id);
+    let payload_type = node.payload_builder.resolve(payload_id).await.unwrap()?;
+    println!("payload_type={:?}", payload_type);
+    let extra_data = payload_type.block().header.extra_data.clone();
+    println!("header={:?}", payload_type.block().header);
+    println!("extra_data={:?}", extra_data);
+    let signer_addresses = get_addresses_from_extra_data(extra_data);
+    println!("signer_addresses={:?}", signer_addresses);
 
-            let payload_type = node.payload_builder.resolve(payload_id).await.unwrap()?;
-            println!("payload_type={:?}", payload_type);
-            let extra_data = payload_type.block().header.extra_data.clone();
-            println!("header={:?}", payload_type.block().header);
-            println!("extra_data={:?}", extra_data);
-            let signer_addresses = get_addresses_from_extra_data(extra_data);
-            println!("signer_addresses={:?}", signer_addresses);
+    let payload = payload_type.clone();
 
-            let payload = payload_type.clone();
+    let client = node.engine_http_client();
+    let submission = EngineApiClient::<N42EngineTypes>::new_payload_v1(
+        &client,
+        payload.into(),
+    )
+    .await?;
+    println!("submission={:?}", submission);
 
-            let client = node.engine_http_client();
-            let submission = EngineApiClient::<N42EngineTypes>::new_payload_v1(
+    let current_head = parent_hash;
+    let new_head = payload_type.block().hash();
+    EngineApiClient::<N42EngineTypes>::fork_choice_updated_v1(
                 &client,
-                payload.into(),
-            )
-            .await?;
-            println!("submission={:?}", submission);
-
-            let current_head = parent_hash;
-            let new_head = payload_type.block().hash();
-            EngineApiClient::<N42EngineTypes>::fork_choice_updated_v1(
-                        &client,
-                    ForkchoiceState {
-                        head_block_hash: new_head,
-                        safe_block_hash: current_head,
-                        finalized_block_hash: current_head,
-                    },
-                    None,
-                ).await?;
-            println!("latest block_hash={:?}", node.provider.latest_header().unwrap().unwrap().hash());
-            Ok(()) as eyre::Result<()>
+            ForkchoiceState {
+                head_block_hash: new_head,
+                safe_block_hash: current_head,
+                finalized_block_hash: current_head,
+            },
+            None,
+        ).await?;
+    println!("latest block_hash={:?}", node.provider.latest_header().unwrap().unwrap().hash());
+    Ok(()) as eyre::Result<()>
 }
 
 impl CliqueTest {
@@ -155,10 +152,8 @@ impl CliqueTest {
         };
         let mut accounts = TesterAccountPool::new();
         let chainspec= self.gen_chainspec(&mut accounts);
-        //println!("chainspec={:?}", chainspec);
 
         let node_config = NodeConfig::new(Arc::new(chainspec))
-            //.with_chain(custom_chain())
                 .with_network(network_config.clone())
                 .with_unused_ports()
                 .with_rpc(RpcServerArgs::default().with_unused_ports().with_http())

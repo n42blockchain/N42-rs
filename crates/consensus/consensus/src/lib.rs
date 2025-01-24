@@ -501,6 +501,12 @@ pub enum ConsensusError {
         "no signer set"
     )]
     NoSignerSet,
+    #[display(
+        "apos error detail {detail}"
+    )]
+    AposErrorDetail {
+        detail: String,
+    },
 }
 
 impl ConsensusError {

@@ -177,6 +177,7 @@ where
     eth_signer: RwLock<Option<LocalSigner<SigningKey>>>,
     //  Provider,
     provider: Provider,
+    recent_headers: RwLock<schnellru::LruMap<B256, Header>>,    // Recent headers for snapshot
 }
 
 
@@ -194,6 +195,7 @@ where
     ) -> Self
     {
         let recents = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SNAPSHOTS)));
+        let recent_headers = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new((CHECKPOINT_INTERVAL * 2).try_into().unwrap())));
         let signatures = schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SIGNATURES));
 
         // signer_pk.sign_hash_sync();
@@ -216,6 +218,7 @@ where
             config,
             chain_spec,
             recents,
+            recent_headers,
             signatures,
             proposals: Arc::new(RwLock::new(HashMap::new())),
             signer: RwLock::new(eth_signer_address),
@@ -240,8 +243,8 @@ where
     pub fn verify_seal(
         &self,
         snap: &Snapshot,
-        header: Header,
-        parents: Header,
+        header: &Header,
+        parents: Option<Vec<Header>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
 
         // Verifying the genesis block is not supported
@@ -526,7 +529,7 @@ where
     ChainSpec: EthChainSpec + EthereumHardforks
 {
 
-    fn validate_header(&self,header: &SealedHeader) -> Result<(), ConsensusError>  {
+    fn validate_header(&self,header: &SealedHeader) -> Result<(), ConsensusError> {
 
         let header = header.header();
         if header.number == 0 {
@@ -591,15 +594,40 @@ where
 
         //todo All basic checks passed, verify cascading fields
         Ok(())
-
     }
 
+    fn validate_header_against_parent(
+        &self,header: &SealedHeader,
+        parent: &SealedHeader,
+        ) -> Result<(),ConsensusError>  {
+        info!(target: "consensus::apos", ?header, "in validate_header_against_parent");
+        //self.validate_header(header)?;
+        let header_hash = header.hash();
+        let header = header.header();
+        let number = header.number;
+        if number == 0 {
+            return Ok(());
+        }
 
-    fn validate_header_against_parent(&self,header: &SealedHeader,parent: &SealedHeader,) -> Result<(),ConsensusError>  {
-        self.validate_header(header)?;
+        let snap = self.snapshot(number - 1, header.parent_hash,
+None)?;
+        if number % self.config.epoch == 0 {
+            let signers: Vec<u8> = snap.signers
+                .iter()
+                .flat_map(|signer| signer.as_slice().to_vec())
+                .collect();
+            let extra_suffix = header.extra_data.len() - EXTRA_SEAL;
+            if header.extra_data[EXTRA_VANITY..extra_suffix] != signers[..] {
+                return Err(ConsensusError::InvalidCheckpointSigners);
+            }
+        }
+
+        self.verify_seal(&snap, header, None).map_err(|e| {ConsensusError::AposErrorDetail {detail: e.to_string()}})?;
+        let mut recent_headers = self.recent_headers.write().unwrap();
+        recent_headers.insert(header_hash, header.clone());
+
         Ok(())
     }
-
 
     #[doc = " Validates the given headers"]
     #[doc = ""]
@@ -793,6 +821,7 @@ where
         let mut parents = parents.clone();
 
         let mut recents = self.recents.write().unwrap(); //
+        let mut recent_headers = self.recent_headers.write().unwrap();
 
         while snap.is_none() {
             //Attempt to retrieve a snapshot from memory
@@ -862,7 +891,12 @@ where
                 if let Some(header) = header_opt {
                     header
                 } else {
-                    return Err(ConsensusError::UnknownBlock);
+                    if let Some(v) = recent_headers.get(&hash) {
+                        v.clone()
+                    } else {
+                        println!("hash not found: {:?}", hash);
+                        return Err(ConsensusError::UnknownBlock);
+                    }
                 }
             };
 

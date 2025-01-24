@@ -1,0 +1,71 @@
+name: 'n42'
+
+services:
+  n42:
+    restart: unless-stopped
+    image: n42/chain:0.0.1
+    ports:
+      - '9001:9001' # metrics
+      - '30303:30303' # eth/66 peering
+      - '8545:8545' # rpc
+      - '8546:8546' # ws
+    volumes:
+      - n42_data:/root/.local/share/reth/94
+      - logs:/root/logs
+    pid: host
+    command: >
+      node
+      --chain n42
+      --metrics 0.0.0.0:9001
+      --log.file.directory /root/logs
+      --http --http.addr 0.0.0.0 --http.port 8545
+      --ws --ws.addr 0.0.0.0 --ws.port 8546
+      --ws.api "eth,net,web3"
+      --http.api "eth,net,web3"
+      --dev.consensus-signer-private-key   --dev.block-time 8s
+
+  prometheus:
+    restart: unless-stopped
+    image: prom/prometheus
+    depends_on:
+      - n42
+    ports:
+      - 9090:9090
+    volumes:
+      - ./prometheus/:/etc/prometheus/
+      - prometheusdata:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+
+  grafana:
+    restart: unless-stopped
+    image: grafana/grafana:latest
+    depends_on:
+      - n42
+      - prometheus
+    ports:
+      - 3000:3000
+    environment:
+      PROMETHEUS_URL: http://prometheus:9090
+    volumes:
+      - grafanadata:/var/lib/grafana
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources
+      - ./grafana/dashboards:/etc/grafana/provisioning_temp/dashboards
+    # 1. Copy dashboards from temp directory to prevent modifying original host files
+    # 2. Replace Prometheus datasource placeholder with the actual name
+    # 3. Run Grafana
+    entrypoint: >
+      sh -c "cp -r /etc/grafana/provisioning_temp/dashboards/. /etc/grafana/provisioning/dashboards &&
+             find /etc/grafana/provisioning/dashboards/ -name '*.json' -exec sed -i 's/$${DS_PROMETHEUS}/Prometheus/g' {} \+ &&
+             /run.sh"
+
+volumes:
+  n42_data:
+    driver: local
+  logs:
+    driver: local
+  prometheusdata:
+    driver: local
+  grafanadata:
+    driver: local

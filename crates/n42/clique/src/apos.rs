@@ -229,7 +229,7 @@ where
 
     fn set_signer(&self, eth_signer: Option<LocalSigner<SigningKey>>) {
         let eth_signer_address = eth_signer.clone().map(|signer| {signer.address()});
-        println!("set_signer, new signer={:?}", eth_signer_address);
+        info!(target: "consensus::apos", "set_signer, new signer={:?}", eth_signer_address);
         let mut signer_guard = self.signer.write().unwrap();
         let mut eth_signer_guard = self.eth_signer.write().unwrap();
         *signer_guard = eth_signer_address;
@@ -251,7 +251,7 @@ where
         if header.number == 0 {
             return Err(AposError::UnknownBlock.into());
         }
-        println!("header number: {}", header.number);
+        info!(target: "consensus::apos", "header number: {}", header.number);
 
         //Analyze the signer and check if they are in the signer list
         let signer = recover_address(&header)?;
@@ -259,7 +259,7 @@ where
             info!(target: "consensus::apos", "err signer: {}", signer);
             return Err(AposError::UnauthorizedSigner.into());
         }
-        println!("recovered address: {}", signer);
+        info!(target: "consensus::apos", "recovered address: {}", signer);
 
        //Check the list of recent signatories
         for (seen, recent) in &snap.recents {
@@ -737,7 +737,7 @@ None)?;
 
 
         let signer = self.signer.read().unwrap().ok_or(ConsensusError::NoSignerSet)?;
-        println!("seal() signer={:?}", signer);
+        info!(target: "consensus::apos", "seal() signer={:?}", signer);
         // Bail out if we're unauthorized to sign a block
         let snap = self.snapshot(header.number - 1, header.parent_hash.clone(), None)?;
         if !snap.signers.contains(&signer) {
@@ -768,7 +768,7 @@ None)?;
             let wiggle = Duration::from_millis((snap.signers.len() as u64 / 2 + 1) * WIGGLE_TIME.as_millis() as u64);
             let delay_with_wiggle = delay + Duration::from_millis(rand::random::<u64>() % wiggle.as_millis() as u64);
 
-            println!(
+            info!(target: "consensus::apos",
                 "wiggle {:?}, time {:?}, number {}",
                 wiggle, delay_with_wiggle, header.number
             );
@@ -846,10 +846,10 @@ None)?;
             // consider the checkpoint trusted and snapshot it.
             if number == 0 || (number % self.config.epoch == 0 && (headers.len() > FULL_IMMUTABILITY_THRESHOLD || self.provider.header_by_number(number -1).unwrap().is_none())) {
                 if let Ok(Some(checkpoint)) = self.provider.header_by_number(number) {
-                    //println!("hash from function parameter={:?}", hash);
-                    //println!("checkpoint={:?}", checkpoint);
+                    //info!(target: "consensus::apos", "hash from function parameter={:?}", hash);
+                    //info!(target: "consensus::apos", "checkpoint={:?}", checkpoint);
                     let hash = checkpoint.hash_slow();
-                    //println!("snapshot() : number={}, hash_slow hash={:?}", number, hash);
+                    //info!(target: "consensus::apos", "snapshot() : number={}, hash_slow hash={:?}", number, hash);
             
                     //Calculate the list of signatories
                     let signers_count = (checkpoint.extra_data.len() - EXTRA_VANITY - SIGNATURE_LENGTH) /  Address::len_bytes();
@@ -894,7 +894,7 @@ None)?;
                     if let Some(v) = recent_headers.get(&hash) {
                         v.clone()
                     } else {
-                        println!("hash not found: {:?}", hash);
+                        info!(target: "consensus::apos", "hash not found: {:?}", hash);
                         return Err(ConsensusError::UnknownBlock);
                     }
                 }

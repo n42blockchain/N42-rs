@@ -83,24 +83,24 @@ impl std::fmt::Display for AposError {
             f,
             "{}",
             match self {
-                AposError::UnknownBlock => "unknown block",
-                AposError::InvalidCheckpointBeneficiary => "beneficiary in checkpoint block non-zero",
-                AposError::InvalidVote => "vote nonce not 0x00..0 or 0xff..f",
-                AposError::InvalidCheckpointVote => "vote nonce in checkpoint block non-zero",
-                AposError::MissingVanity => "extra-data 32 byte vanity prefix missing",
-                AposError::MissingSignature => "extra-data 65 byte signature suffix missing",
-                AposError::ExtraSigners => "non-checkpoint block contains extra signer list",
-                AposError::InvalidCheckpointSigners => "invalid signer list on checkpoint block",
-                AposError::MismatchingCheckpointSigners => "mismatching signer list on checkpoint block",
-                AposError::InvalidMixDigest => "non-zero mix digest",
-                AposError::InvalidUncleHash => "non-empty uncle hash",
-                AposError::InvalidDifficulty => "invalid difficulty",
-                AposError::WrongDifficulty => "wrong difficulty",
-                AposError::InvalidTimestamp => "invalid timestamp",
-                AposError::InvalidVotingChain => "invalid voting chain",
-                AposError::UnauthorizedSigner => "unauthorized signer",
-                AposError::RecentlySigned => "recently signed",
-                AposError::UnTransion => "sealing paused while waiting for transactions",
+                Self::UnknownBlock => "unknown block",
+                Self::InvalidCheckpointBeneficiary => "beneficiary in checkpoint block non-zero",
+                Self::InvalidVote => "vote nonce not 0x00..0 or 0xff..f",
+                Self::InvalidCheckpointVote => "vote nonce in checkpoint block non-zero",
+                Self::MissingVanity => "extra-data 32 byte vanity prefix missing",
+                Self::MissingSignature => "extra-data 65 byte signature suffix missing",
+                Self::ExtraSigners => "non-checkpoint block contains extra signer list",
+                Self::InvalidCheckpointSigners => "invalid signer list on checkpoint block",
+                Self::MismatchingCheckpointSigners => "mismatching signer list on checkpoint block",
+                Self::InvalidMixDigest => "non-zero mix digest",
+                Self::InvalidUncleHash => "non-empty uncle hash",
+                Self::InvalidDifficulty => "invalid difficulty",
+                Self::WrongDifficulty => "wrong difficulty",
+                Self::InvalidTimestamp => "invalid timestamp",
+                Self::InvalidVotingChain => "invalid voting chain",
+                Self::UnauthorizedSigner => "unauthorized signer",
+                Self::RecentlySigned => "recently signed",
+                Self::UnTransion => "sealing paused while waiting for transactions",
             }
         )
     }
@@ -153,7 +153,7 @@ pub fn recover_address(header: &Header) -> Result<Address, Box<dyn Error>> {
 
     let signature = RecoverableSignature::from_compact(
         &signature[..64],
-        RecoveryId::from_i32(signature[64] as i32-27)?,
+        RecoveryId::from_i32(i32::from(signature[64]) - 27)?,
     )?;
 
     Ok(public_key_to_address(SECP256K1.recover_ecdsa(&message, &signature)?))
@@ -195,7 +195,7 @@ where
     ) -> Self
     {
         let recents = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SNAPSHOTS)));
-        let recent_headers = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new((CHECKPOINT_INTERVAL * 2).try_into().unwrap())));
+        let recent_headers = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new((CHECKPOINT_INTERVAL as u32 * 2))));
         let signatures = schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SIGNATURES));
 
         // signer_pk.sign_hash_sync();
@@ -635,7 +635,7 @@ None)?;
     #[doc = " on its own and valid against its parent."]
     #[doc = ""]
     #[doc = " Note: this expects that the headers are in natural order (ascending block number)"]
-    fn validate_header_range(&self,headers: &[SealedHeader]) -> Result<(),HeaderConsensusError>{
+    fn validate_header_range(&self, _headers: &[SealedHeader]) -> Result<(),HeaderConsensusError>{
         Ok(())
     }
 

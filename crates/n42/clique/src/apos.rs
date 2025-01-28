@@ -121,12 +121,12 @@ pub enum RecoveryError {
 impl std::fmt::Display for RecoveryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RecoveryError::MissingSignature => write!(f, "Missing signature"),
-            RecoveryError::InvalidMessage => write!(f, "Invalid message"),
-            RecoveryError::InvalidRecoveryId => write!(f, "Invalid recovery ID"),
-            RecoveryError::InvalidSignatureFormat => write!(f, "Invalid signature format"),
-            RecoveryError::FailedToRecoverPublicKey => write!(f, "Failed to recover public key"),
-            RecoveryError::EcdsaError(e) => write!(f, "ECDSA error: {}", e),
+            Self::MissingSignature => write!(f, "Missing signature"),
+            Self::InvalidMessage => write!(f, "Invalid message"),
+            Self::InvalidRecoveryId => write!(f, "Invalid recovery ID"),
+            Self::InvalidSignatureFormat => write!(f, "Invalid signature format"),
+            Self::FailedToRecoverPublicKey => write!(f, "Failed to recover public key"),
+            Self::EcdsaError(e) => write!(f, "ECDSA error: {}", e),
         }
     }
 }
@@ -195,7 +195,7 @@ where
     ) -> Self
     {
         let recents = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SNAPSHOTS)));
-        let recent_headers = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new((CHECKPOINT_INTERVAL as u32 * 2))));
+        let recent_headers = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(CHECKPOINT_INTERVAL as u32 * 2)));
         let signatures = schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SIGNATURES));
 
         // signer_pk.sign_hash_sync();
@@ -244,7 +244,7 @@ where
         &self,
         snap: &Snapshot,
         header: &Header,
-        parents: Option<Vec<Header>>,
+        _parents: Option<Vec<Header>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
 
         // Verifying the genesis block is not supported
@@ -518,7 +518,7 @@ where
     ChainSpec: EthChainSpec + EthereumHardforks,
     Provider: 'static + Clone + HeaderProvider + SnapshotProvider + SnapshotProviderWriter + Unpin,
 {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, _f: &mut Formatter<'_>) -> std::fmt::Result {
         todo!()
     }
 }
@@ -598,7 +598,7 @@ where
 
     fn validate_header_against_parent(
         &self,header: &SealedHeader,
-        parent: &SealedHeader,
+        _parent: &SealedHeader,
         ) -> Result<(),ConsensusError>  {
         info!(target: "consensus::apos", ?header, "in validate_header_against_parent");
         //self.validate_header(header)?;
@@ -640,16 +640,16 @@ None)?;
     }
 
 
-    fn validate_header_with_total_difficulty(&self,header: &Header,total_difficulty:U256,) -> Result<(),ConsensusError>  {
+    fn validate_header_with_total_difficulty(&self,header: &Header,_total_difficulty:U256,) -> Result<(),ConsensusError>  {
         Ok(())
     }
 
 
-    fn validate_block_pre_execution(&self,block: &SealedBlock) -> Result<(),ConsensusError>  {
+    fn validate_block_pre_execution(&self, _block: &SealedBlock) -> Result<(),ConsensusError>  {
         Ok(())
     }
 
-    fn validate_block_post_execution(&self,block: &BlockWithSenders,input:PostExecutionInput<'_> ,) -> Result<(),ConsensusError>  {
+    fn validate_block_post_execution(&self, _block: &BlockWithSenders,input:PostExecutionInput<'_> ,) -> Result<(),ConsensusError>  {
         Ok(())
     }
 

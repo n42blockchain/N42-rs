@@ -387,10 +387,10 @@ where
  
 
 fn calc_difficulty(snap: &Snapshot, signer: &Address) -> U256 {
-    if snap.inturn(snap.number + 1, &signer) {
-        DIFF_IN_TURN.clone()
+    if snap.inturn(snap.number + 1, signer) {
+        DIFF_IN_TURN
     } else {
-        DIFF_NO_TURN.clone()
+        DIFF_NO_TURN
     }
 }
 
@@ -679,12 +679,12 @@ None)?;
 
             //If there are proposals to be voted on, proceed with the vote
             if !addresses.is_empty() {
-                header.beneficiary = addresses.choose(&mut rand::thread_rng()).unwrap().clone();
+                header.beneficiary = *addresses.choose(&mut rand::thread_rng()).unwrap();
                 if let Some(&authorize) = proposals_lock.get(&header.beneficiary) {
                     if authorize {
-                        header.nonce = NONCE_AUTH_VOTE.clone().into();
+                        header.nonce = NONCE_AUTH_VOTE.into();
                     } else {
-                        header.nonce = NONCE_DROP_VOTE.clone().into();
+                        header.nonce = NONCE_DROP_VOTE.into();
                     }
                 }
             }
@@ -692,7 +692,7 @@ None)?;
 
         //Copy the signer to prevent data competition
         let signer_guard = self.signer.read().unwrap();
-        if let Some(signer) = signer_guard.clone() {
+        if let Some(signer) = *signer_guard {
             //Set the correct difficulty level
             header.difficulty = calc_difficulty(&snap, &signer);
         } else {
@@ -739,7 +739,7 @@ None)?;
         let signer = self.signer.read().unwrap().ok_or(ConsensusError::NoSignerSet)?;
         info!(target: "consensus::apos", "seal() signer={:?}", signer);
         // Bail out if we're unauthorized to sign a block
-        let snap = self.snapshot(header.number - 1, header.parent_hash.clone(), None)?;
+        let snap = self.snapshot(header.number - 1, header.parent_hash, None)?;
         if !snap.signers.contains(&signer) {
             error!(target: "consensus::pos", "err signer: {}", signer);
             return Err(ConsensusError::UnauthorizedSigner)
@@ -758,7 +758,7 @@ None)?;
 
         // Sweet, the protocol permits us to sign the block, wait for our time
         let delay = std::cmp::max(
-            UNIX_EPOCH + Duration::from_secs(header.timestamp as u64),
+            UNIX_EPOCH + Duration::from_secs(header.timestamp),
             SystemTime::now() + Duration::from_secs(MERGE_SIGN_MIN_TIME),
             )
             .duration_since(SystemTime::now())
@@ -782,7 +782,7 @@ None)?;
         let eth_signer_guard = self.eth_signer.read().unwrap();
         let eth_signer = eth_signer_guard.as_ref().ok_or(ConsensusError::NoSignerSet)?;
         // Sign all the things!
-        let header_bytes = seal_hash(&header);
+        let header_bytes = seal_hash(header);
         let sighash = eth_signer.sign_hash_sync(&header_bytes).map_err(|_| ConsensusError::SignHeaderError)?;
 
 
@@ -900,7 +900,7 @@ None)?;
                 }
             };
 
-            hash = header.parent_hash.clone();
+            hash = header.parent_hash;
             headers.push(header);
             number -= 1;
 

@@ -254,7 +254,7 @@ where
         info!(target: "consensus::apos", "header number: {}", header.number);
 
         //Analyze the signer and check if they are in the signer list
-        let signer = recover_address(&header)?;
+        let signer = recover_address(header)?;
         if !snap.signers.contains(&signer) {
             info!(target: "consensus::apos", "err signer: {}", signer);
             return Err(AposError::UnauthorizedSigner.into());
@@ -484,7 +484,7 @@ fn seal_hash(header: &Header) -> B256 {
     }
 
     // 初始化局部结构体
-    let mut sigHeader = LocalHeader {
+    let mut sig_header = LocalHeader {
         parent_hash: header.parent_hash,
         ommers_hash: header.ommers_hash,
         beneficiary: header.beneficiary,
@@ -505,10 +505,10 @@ fn seal_hash(header: &Header) -> B256 {
 
     // Handle the extra field, excluding the last CRYPTO_SIGNATURE_LENGTH bytes
     if header.extra_data.len() > SIGNATURE_LENGTH {
-        sigHeader.extra_data = Bytes::from(header.extra_data[..header.extra_data.len() - SIGNATURE_LENGTH].to_vec());
+        sig_header.extra_data = Bytes::from(header.extra_data[..header.extra_data.len() - SIGNATURE_LENGTH].to_vec());
     }
 
-    keccak256(alloy_rlp::encode(&sigHeader))
+    keccak256(alloy_rlp::encode(&sig_header))
 }
 
 
@@ -816,9 +816,9 @@ None)?;
 
         let mut headers: Vec<Header> = Vec::new();
         let mut snap: Option<Snapshot> = None;
-        let mut hash = hash.clone();
+        let mut hash = hash;
         let mut number = number;
-        let mut parents = parents.clone();
+        let mut parents = parents;
 
         let mut recents = self.recents.write().unwrap(); //
         let mut recent_headers = self.recent_headers.write().unwrap();

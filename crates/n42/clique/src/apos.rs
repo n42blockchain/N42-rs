@@ -132,7 +132,7 @@ impl std::fmt::Display for RecoveryError {
 }
 
 impl From<SecpError> for RecoveryError {
-    fn from(err: SecpError) -> RecoveryError {
+    fn from(err: SecpError) -> Self {
         RecoveryError::EcdsaError(err)
     }
 }

@@ -133,7 +133,7 @@ impl std::fmt::Display for RecoveryError {
 
 impl From<SecpError> for RecoveryError {
     fn from(err: SecpError) -> Self {
-        RecoveryError::EcdsaError(err)
+        Self::EcdsaError(err)
     }
 }
 
@@ -364,7 +364,7 @@ where
             warn!(target: "consensus::apos",
                 "calc_difficulty() called when no signer is set",
             );
-            DIFF_NO_TURN.clone()
+            DIFF_NO_TURN
         }
     }
 

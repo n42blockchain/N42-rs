@@ -335,7 +335,7 @@ impl Snapshot
 	 // signers retrieves the list of authorized signers in ascending order.
 	 pub fn singers(&self) -> Vec<Address> {
         let mut sigs: Vec<Address> = self.signers.iter().cloned().collect();
-        sigs.sort(); 
+        //sigs.sort(); 
         sigs
     }
 

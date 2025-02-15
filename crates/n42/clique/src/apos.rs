@@ -749,7 +749,7 @@ None)?;
         for (seen, recent) in &snap.recents {
             if *recent == signer {
                 let limit = (snap.signers.len() as u64 / 2) + 1;
-                if header.number < limit || *seen > header.number - limit {
+                if *seen > header.number - limit {
                     error!(target: "consensus::engine", "Signed recently, must wait for others: limit: {}, seen: {}, number: {}, signer: {}", limit, seen, header.number, signer);
                     return Err(ConsensusError::RecentlySigned);
                 }
@@ -763,10 +763,10 @@ None)?;
             )
             .duration_since(SystemTime::now())
             .unwrap_or(Duration::from_secs(0));
-
+        let mut delay_with_wiggle = delay;
         if header.difficulty == DIFF_NO_TURN {
             let wiggle = Duration::from_millis((snap.signers.len() as u64 / 2 + 1) * WIGGLE_TIME.as_millis() as u64);
-            let delay_with_wiggle = delay + Duration::from_millis(rand::random::<u64>() % wiggle.as_millis() as u64);
+            delay_with_wiggle = delay + Duration::from_millis(rand::random::<u64>() % wiggle.as_millis() as u64);
 
             info!(target: "consensus::apos",
                 "wiggle {:?}, time {:?}, number {}",
@@ -794,6 +794,8 @@ None)?;
         info!(target: "consensus::apos", "Waiting for slot to sign and propagate, delay: {:?}", delay);
         //
         // thread::sleep(delay);
+        tokio::task::block_in_place(|| { thread::sleep(delay_with_wiggle)});
+        //tokio::time::sleep(delay_with_wiggle);
 
         Ok(())
     }
@@ -861,6 +863,9 @@ None)?;
                         let end = start + Address::len_bytes();
                         signers.push(Address::from_slice(&checkpoint.extra_data[start..end]));
                     }
+                    info!(target: "consensus::apos", ?signers,
+                        "genesis signers:"
+                    );
                    
                     let s = Snapshot::new_snapshot(self.config.clone(), number, hash, signers);
                     // todo

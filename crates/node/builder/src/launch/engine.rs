@@ -408,6 +408,7 @@ where
             let _ = exit.send(res);
         });
 
+        /*
         let mining_mode = if let Some(_) = ctx.node_config().dev.consensus_signer_private_key {
             if let Some(block_time) = ctx.node_config().dev.block_time {
                 consensus_client::miner::MiningMode::interval(block_time)
@@ -417,6 +418,8 @@ where
         } else {
             consensus_client::miner::MiningMode::NoMining
         };
+        */
+        let mining_mode = consensus_client::miner::MiningMode::NoMining;
         N42Miner::spawn_new(
             ctx.blockchain_db().clone(),
             N42PayloadAttributesBuilder::new(ctx.chain_spec()),

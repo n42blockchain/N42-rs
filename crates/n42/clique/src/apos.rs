@@ -14,7 +14,7 @@ use itertools::Itertools;
 use rand::prelude::SliceRandom;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_primitives::{SealedBlock, SealedHeader, BlockWithSenders, public_key_to_address};
-use reth_primitives_traits::{BlockHeader, Header};
+use reth_primitives_traits::{Header};
 use reth_provider::{HeaderProvider, SnapshotProvider};
 use secp256k1::{Message, SECP256K1, Error as SecpError, ecdsa::{RecoverableSignature, RecoveryId}};
 use tracing::{info, warn, debug, error};

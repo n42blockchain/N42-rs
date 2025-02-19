@@ -649,7 +649,7 @@ None)?;
         Ok(())
     }
 
-    fn validate_block_post_execution(&self, _block: &BlockWithSenders,input:PostExecutionInput<'_> ,) -> Result<(),ConsensusError>  {
+    fn validate_block_post_execution(&self, _block: &BlockWithSenders,_input:PostExecutionInput<'_> ,) -> Result<(),ConsensusError>  {
         Ok(())
     }
 

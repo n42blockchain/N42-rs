@@ -11,6 +11,8 @@ pub use alloy_consensus::Header;
 
 use alloy_primitives::{Address, BlockNumber, B256, U256};
 
+pub mod clique_utils;
+
 /// Bincode-compatible header type serde implementations.
 #[cfg(feature = "serde-bincode-compat")]
 pub mod serde_bincode_compat {
@@ -46,7 +48,11 @@ pub trait BlockHeader {
 
 impl BlockHeader for Header {
     fn beneficiary(&self) -> Address {
-        self.beneficiary
+        if let Ok(beneficiary) = clique_utils::recover_address(self) {
+            beneficiary
+        } else {
+            self.beneficiary
+        }
     }
 
     fn difficulty(&self) -> U256 {

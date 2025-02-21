@@ -8,7 +8,6 @@ use std::fmt::{Debug, Formatter};
 use std::thread;
 use alloy_primitives::{U256, hex, Bloom, BlockNumber, keccak256, B64, B256, Address, Bytes, FixedBytes};
 use alloy_rlp::{length_of_length, Encodable};
-// use blst::min_sig::{Signature, PublicKey as OtherPublicKey};
 use bytes::{BufMut, BytesMut};
 use itertools::Itertools;
 use rand::prelude::SliceRandom;

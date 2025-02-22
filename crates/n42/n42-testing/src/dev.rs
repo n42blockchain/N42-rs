@@ -120,7 +120,6 @@ async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(node: 
 impl CliqueTest {
     fn gen_chainspec(&self, accounts: &mut TesterAccountPool) -> ChainSpec {
 
-        // Generate the initial set of signers
         let signers: Vec<Address> = self.signers.iter().map(|s| accounts.address(s)).collect();
         // println!("signers: {:?}", signers);
 

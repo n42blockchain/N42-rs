@@ -45,5 +45,5 @@ COPY --from=builder /app/n42 /usr/local/bin
 # Copy licenses
 COPY LICENSE-* ./
 
-EXPOSE 30303 30303/udp 9001 8545 8546
+EXPOSE 30303 30303/udp 9001 8545 8546 8551
 ENTRYPOINT ["/usr/local/bin/n42"]

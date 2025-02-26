@@ -1,9 +1,9 @@
-FROM lukemathwalker/cargo-chef:latest-rust-1 as chef
+FROM lukemathwalker/cargo-chef:latest-rust-1-slim-bookworm as chef
 WORKDIR /app
 
 # Install system dependencies
-RUN apt-get update && apt-get -y upgrade && apt-get install -y libclang-dev pkg-config
-
+RUN echo "deb http://ftp.cn.debian.org/debian/ bookworm main" > /etc/apt/sources.list
+RUN apt-get update && apt-get -y upgrade && apt-get install -y libclang-dev pkg-config build-essential
 ## Builds a cargo-chef plan
 #FROM chef AS planner
 #COPY . .

@@ -673,7 +673,6 @@ None)?;
             // consider the checkpoint trusted and snapshot it.
             if number == 0 || (number % self.config.epoch == 0 && (headers.len() > FULL_IMMUTABILITY_THRESHOLD || self.provider.header_by_number(number -1).unwrap().is_none())) {
                 if let Ok(Some(checkpoint)) = self.provider.header_by_number(number) {
-                    //info!(target: "consensus::apos", "hash from function parameter={:?}", hash);
                     //info!(target: "consensus::apos", "checkpoint={:?}", checkpoint);
                     let hash = checkpoint.hash_slow();
                     //info!(target: "consensus::apos", "snapshot() : number={}, hash_slow hash={:?}", number, hash);

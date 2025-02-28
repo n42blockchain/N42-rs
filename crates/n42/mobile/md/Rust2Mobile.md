@@ -112,3 +112,17 @@ pub unsafe extern "C" fn evm_test(){
 可以根据实际情况来增加或者减少目标平台
 `cargo lipo --all-features --release --targets x86_64-apple-ios aarch64-apple-ios`
 得到.a文件在target/universal/release
+
+生成头文件
+`cbindgen /Users/root1/Desktop/N42-rs/crates/n42/mobile/src/lib.rs -l c --output /Users/root1/Desktop/N42-rs/crates/n42/mobile/src/librust.h`
+
+
+另一个头文件Demo-Bridging-Header.h
+```
+#ifndef Demo_Bridging_Header_h
+#define Demo_Bridging_Header_h
+
+#import "librust.h"
+
+#endif
+```

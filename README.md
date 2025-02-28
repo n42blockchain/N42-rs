@@ -31,7 +31,7 @@ Clone the repository:
 
 ```bash
 git clone https://github.com/n42blockchain/N42-rs.git
-cd rast
+cd N42-rs
 ```
 
 Build the project:

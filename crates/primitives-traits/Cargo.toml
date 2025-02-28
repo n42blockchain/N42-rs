@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 reth-codecs.workspace = true
+secp256k1  = { workspace = true, features = ["recovery"] }
 
 alloy-consensus = { workspace = true, features = ["serde"] }
 alloy-eips.workspace = true

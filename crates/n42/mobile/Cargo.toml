@@ -1,0 +1,49 @@
+[package]
+name = "mobile"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+exclude.workspace = true
+
+
+
+[dependencies]
+# mobile.workspace = true
+jni = "0.21.1"
+ethers="2.0.14"
+# tokio="1.0.1"
+tokio = { version = "1", features = ["full"] }
+reth-chainspec.workspace = true
+reth-revm.workspace = true
+reth-revm.features =["test-utils"]
+# reth-evm={path="/Users/root1/Desktop/starlink/reth/crates/evm"}
+reth-evm.workspace = true
+# reth-evm.features =["test-utils"]
+reth-evm-ethereum.workspace = true
+revm-primitives.workspace = true
+alloy-consensus.workspace = true
+reth-primitives.workspace = true
+alloy-eips.workspace = true
+reth-consensus.workspace = true
+reth-ethereum-consensus.workspace = true
+alloy-primitives.workspace = true
+log = "0.4"
+android_logger = { version = "0.14.1" }
+
+[lints]
+workspace = true
+
+[lib]
+name="mobile"
+crate-type = ["cdylib","staticlib"]
+
+[[bin]]
+name = "mobile1"
+path = "src/lib.rs"
+
+
+[features]
+clib=[]

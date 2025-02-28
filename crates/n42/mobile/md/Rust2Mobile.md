@@ -1,18 +1,21 @@
 # android
 
-## 安装工具链
+## 安装工具
 
-`rustup target add aarch64-linux-android x86_64-linux-android`
-`cargo install cargo-apk cargo-ndk`
+```
+rustup target add aarch64-linux-android x86_64-linux-android
+cargo install cargo-apk cargo-ndk
+```
 
 ## 安装ndk
 
 下载ndk到某个目录
-
-`nano ~/.zshrc`
-`export ANDROID_NDK_HOME=/Users/root1/Library/Android/sdk/ndk/28.0.13004108`（ndk所在目录）
-`source ~/.zshrc`
-`echo $ANDROID_NDK_HOME`
+```
+nano ~/.zshrc
+export ANDROID_NDK_HOME=/Users/root1/Library/Android/sdk/ndk/28.0.13004108`（ndk所在目录）
+source ~/.zshrc
+echo $ANDROID_NDK_HOME
+```
 
 
 ## rust函数编写
@@ -87,4 +90,25 @@ public class LyTest {
 ```
 在as中make module，之后得到aar文件在rustlibrary/build/outputs/aar
 
-#ios
+# ios
+
+## 安装工具
+```
+cargo install cargo-lipo
+cargo install cbindgen
+```
+
+## rust函数编写
+
+eg.
+```
+#[no_mangle]
+pub unsafe extern "C" fn evm_test(){
+
+}
+```
+
+## 编译静态库
+可以根据实际情况来增加或者减少目标平台
+`cargo lipo --all-features --release --targets x86_64-apple-ios aarch64-apple-ios`
+得到.a文件在target/universal/release

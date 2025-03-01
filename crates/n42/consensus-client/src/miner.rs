@@ -110,7 +110,6 @@ pub struct N42Miner<EngineT: EngineTypes, Provider, B, Network> {
     network: Network,
     new_block_event_stream: EventStream<NewBlock>,
     network_event_stream: EventStream<NetworkEvent>,
-
     consensus: Arc<dyn Consensus>,
 }
 
@@ -211,6 +210,9 @@ where
                             _ => { },
                         }
                     }
+                }
+                network_event = &mut self.network_event_stream.next() => {
+                    info!(target: "consensus-client", "network_event={:?}", network_event);
                 }
             }
         }

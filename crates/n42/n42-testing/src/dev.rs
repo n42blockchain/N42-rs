@@ -121,7 +121,6 @@ impl CliqueTest {
     fn gen_chainspec(&self, accounts: &mut TesterAccountPool) -> ChainSpec {
 
         let signers: Vec<Address> = self.signers.iter().map(|s| accounts.address(s)).collect();
-        // println!("signers: {:?}", signers);
 
         let mut chainspec = (**N42).clone();
         let mut extra_data = vec![0u8; EXTRA_VANITY + self.signers.len() * Address::len_bytes() + EXTRA_SEAL];

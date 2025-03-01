@@ -344,6 +344,7 @@ where
         let terminate_after_backfill = ctx.terminate_after_initial_backfill();
 
         info!(target: "reth::cli", "Starting consensus engine");
+        let consensus = ctx.consensus().clone();
         ctx.task_executor().spawn_critical("consensus engine", async move {
             if let Some(initial_target) = initial_target {
                 debug!(target: "reth::cli", %initial_target,  "start backfill sync");
@@ -387,14 +388,19 @@ where
                             }
                             ChainEvent::Handler(ev) => {
                                 if let Some(head) = ev.canonical_header() {
+                                    let total_difficulty = consensus.total_difficulty(head.hash());
+                                    info!(target: "reth::cli", hash=?head.hash(), ?total_difficulty);
                                     let head_block = Head {
                                         number: head.number,
                                         hash: head.hash(),
                                         difficulty: head.difficulty,
                                         timestamp: head.timestamp,
+                                        total_difficulty,
+                                        /*
                                         total_difficulty: chainspec
                                             .final_paris_total_difficulty(head.number)
                                             .unwrap_or_default(),
+                                        */
                                     };
                                     network_handle.update_status(head_block);
                                 }

@@ -122,6 +122,7 @@ where
     //  Provider,
     provider: Provider,
     recent_headers: RwLock<schnellru::LruMap<B256, Header>>,    // Recent headers for snapshot
+    recent_tds: RwLock<schnellru::LruMap<B256, U256>>,    // Recent total difficulty per hash
 }
 
 
@@ -140,6 +141,7 @@ where
     {
         let recents = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SNAPSHOTS)));
         let recent_headers = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(CHECKPOINT_INTERVAL as u32 * 2)));
+        let recent_tds = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(CHECKPOINT_INTERVAL as u32 * 2)));
         let signatures = schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SIGNATURES));
 
         // signer_pk.sign_hash_sync();
@@ -163,6 +165,7 @@ where
             chain_spec,
             recents,
             recent_headers,
+            recent_tds,
             signatures,
             proposals: Arc::new(RwLock::new(HashMap::new())),
             signer: RwLock::new(eth_signer_address),
@@ -325,6 +328,21 @@ where
 
     // APIs implements consensus.Engine, returning the user facing RPC API to allow
     // controlling the signer voting.
+
+    fn save_total_difficulty(&self, header: &Header) {
+        let mut recent_tds = self.recent_tds.write().unwrap();
+        let total_difficulty = if header.number == 1 {
+            header.difficulty
+        } else {
+            if let Some(parent_td) = recent_tds.get(&header.parent_hash) {
+                *parent_td + header.difficulty
+            } else {
+                U256::from(0)
+            }
+        };
+        recent_tds.insert(header.hash_slow(), total_difficulty);
+        info!(target: "consensus::apos", "saved total_difficulty {}", total_difficulty);
+    }
 }
 
 
@@ -453,6 +471,8 @@ None)?;
         self.verify_seal(&snap, header, None).map_err(|e| {ConsensusError::AposErrorDetail {detail: e.to_string()}})?;
         let mut recent_headers = self.recent_headers.write().unwrap();
         recent_headers.insert(header_hash, header.clone());
+
+        self.save_total_difficulty(header);
 
         Ok(())
     }
@@ -625,6 +645,8 @@ None)?;
         tokio::task::block_in_place(|| { thread::sleep(delay_with_wiggle)});
         //tokio::time::sleep(delay_with_wiggle);
 
+        self.save_total_difficulty(header);
+
         Ok(())
     }
 
@@ -795,4 +817,19 @@ None)?;
         let mut proposals_guard = self.proposals.read().unwrap();
         Ok(proposals_guard.clone())
     }
+
+    fn total_difficulty(
+        &self,
+        hash: B256,
+    ) -> U256 {
+        let mut recent_tds = self.recent_tds.write().unwrap();
+        let total_difficulty = if let Some(td) = recent_tds.get(&hash) {
+            *td
+        } else {
+            U256::from(0)
+        };
+        info!(target: "consensus::apos", ?hash, ?total_difficulty, "get total_difficulty");
+        total_difficulty
+    }
+
 }

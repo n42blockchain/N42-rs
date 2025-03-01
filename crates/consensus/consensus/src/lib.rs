@@ -175,6 +175,13 @@ pub trait Consensus: Debug + Send + Sync {
     ) -> Result<HashMap<Address, bool>, ConsensusError> {
         Ok(HashMap::new())
     }
+
+    fn total_difficulty(
+        &self,
+        hash: B256,
+    ) -> U256 {
+        U256::from(0)
+    }
 }
 
 /// Consensus Errors

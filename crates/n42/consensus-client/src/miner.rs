@@ -27,6 +27,7 @@ use std::{
 };
 use reth_eth_wire_types::NewBlock;
 use reth_network::NetworkHandle;
+use reth_network_api::NetworkEvent;
 use reth_tokio_util::EventStream;
 use tokio::{
     sync::{mpsc::UnboundedSender, oneshot},
@@ -107,6 +108,7 @@ pub struct N42Miner<EngineT: EngineTypes, Provider, B, Network> {
     /// full network  for announce block
     network: Network,
     new_block_event_stream: EventStream<NewBlock>,
+    network_event_stream: EventStream<NetworkEvent>,
 }
 
 impl<EngineT, Provider, B, Network> N42Miner<EngineT, Provider, B, Network>
@@ -129,6 +131,7 @@ where
             provider.sealed_header(provider.best_block_number().unwrap()).unwrap().unwrap();
 
         let new_block_event_stream = network.subscribe_block();
+        let network_event_stream = network.event_listener();
         let miner = Self {
             provider,
             payload_attributes_builder,
@@ -139,6 +142,7 @@ where
             last_block_hashes: vec![latest_header.hash()],
             network,
             new_block_event_stream,
+            network_event_stream,
         };
 
         // Spawn the miner
@@ -147,6 +151,11 @@ where
 
     /// Runs the [`N42Miner`] in a loop, polling the miner and building payloads.
     async fn run(mut self) {
+        if let all_peers = self.network.get_all_peers().await {
+            info!(target: "consensus-client", "all_peers={:?}", all_peers);
+        }
+        if let fetch_client = self.network.fetch_client().await {
+        }
         let mut fcu_interval = tokio::time::interval(Duration::from_secs(1));
         loop {
             tokio::select! {
@@ -163,6 +172,9 @@ where
                             error!(target: "consensus-client", "Error validating and inserting the block: {:?}", e);
                         }
                     }
+                }
+                network_event = &mut self.network_event_stream.next() => {
+                    info!(target: "consensus-client", "network_event={:?}", network_event);
                 }
             }
         }

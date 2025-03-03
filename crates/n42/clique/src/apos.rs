@@ -28,7 +28,6 @@ use std::str::FromStr;
 //
 const CHECKPOINT_INTERVAL: u64 = 2048; // Number of blocks after which to save the vote snapshot to the database
 const INMEMORY_SNAPSHOTS: u32 = 128; // Number of recent vote snapshots to keep in memory
-const INMEMORY_SIGNATURES: u32 = 4096; // Number of recent block signatures to keep in memory
 
 const WIGGLE_TIME: Duration = Duration::from_millis(500); // Random delay (per signer) to allow concurrent signers
 const MERGE_SIGN_MIN_TIME: u64 = 4; // min time for merge sign
@@ -114,7 +113,6 @@ where
     /// Chain spec
     chain_spec: Arc<ChainSpec>,
     recents: RwLock<schnellru::LruMap<B256, Snapshot>>,    // Snapshots for recent block to speed up reorgs
-    signatures: schnellru::LruMap<B256, Vec<u8>>,    // Signatures of recent blocks to speed up mining
     proposals: Arc<RwLock<HashMap<Address, bool>>>,   // Current list of proposals we are pushing
     signer: RwLock<Option<Address>>, // Ethereum address of the signing key
     eth_signer: RwLock<Option<LocalSigner<SigningKey>>>,
@@ -141,7 +139,6 @@ where
         let recents = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SNAPSHOTS)));
         let recent_headers = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(CHECKPOINT_INTERVAL as u32 * 2)));
         let recent_tds = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(CHECKPOINT_INTERVAL as u32 * 2)));
-        let signatures = schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SIGNATURES));
 
         // signer_pk.sign_hash_sync();
         let eth_signer: Option<PrivateKeySigner> = signer_private_key.map(|key| { key.parse().unwrap() });
@@ -165,7 +162,6 @@ where
             recents,
             recent_headers,
             recent_tds,
-            signatures,
             proposals: Arc::new(RwLock::new(HashMap::new())),
             signer: RwLock::new(eth_signer_address),
             eth_signer: RwLock::new(eth_signer),
@@ -780,7 +776,6 @@ Some(vec![parent.header().clone()]))?;
         }
 
         let snap = snap.unwrap().apply(headers, |header| {
-            //Ok(header.beneficiary)
             let signer = recover_address(&header)?;
             Ok(signer)
         }).map_err(|_| ConsensusError::InvalidDifficulty)?;
@@ -788,7 +783,7 @@ Some(vec![parent.header().clone()]))?;
         recents.insert(snap.hash, snap.clone());
 
         ///If a new checkpoint snapshot is generated, save it to disk
-        if snap.number % CHECKPOINT_INTERVAL == 0 && !headers_len == 0 {
+        if snap.number % CHECKPOINT_INTERVAL == 0 && headers_len > 0 {
             self.provider.save_snapshot(snap.number, snap.clone()).map_err(|_|ConsensusError::SaveSnapshotError)?;
             debug!(
                 "Stored voting snapshot to disk, number: {}, hash: {}",

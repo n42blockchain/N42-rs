@@ -25,7 +25,7 @@ where
         pool: Pool,
     ) -> eyre::Result<NetworkHandle> {
         let network_config_builder = ctx.network_config_builder()?.network_mode(NetworkMode::Work);
-        let network_config = ctx.build_network_config(network_config_builder.block_import(Box::<ProofOfStakeBlockImport>::default()));
+        let network_config = ctx.build_network_config(network_config_builder);
         let network = NetworkManager::builder(network_config).await?;
 
         let handle = ctx.start_network(network, pool);

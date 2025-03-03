@@ -57,7 +57,7 @@ impl Default for BlockRangeParams {
     }
 }
 
-/// Returns a random number generator that can be seeded using the `SEED` environment variable.
+/// Returns a random number generator that initializes its seed from the `SEED` environment variable.
 ///
 /// If `SEED` is not set, a random seed is used.
 pub fn rng() -> StdRng {

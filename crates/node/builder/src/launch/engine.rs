@@ -430,6 +430,7 @@ where
             mining_mode,
             ctx.components().payload_builder().clone(),
             ctx.components().network().clone(),
+            ctx.consensus(),
         );
 
         let full_node = FullNode {

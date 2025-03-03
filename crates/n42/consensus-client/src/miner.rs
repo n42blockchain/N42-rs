@@ -4,6 +4,8 @@ use reth_beacon_consensus::{
     BeaconConsensusEngineHandle,
 };
 use reth_node_types::NodeTypesWithEngine;
+use reth_consensus::Consensus;
+use std::sync::Arc;
 use reth_node_api::{FullNodeComponents,  FullNodeTypes};
 use alloy_primitives::{TxHash, B256, U128, U256};
 use alloy_rpc_types_engine::{CancunPayloadFields, ExecutionPayloadSidecar, ForkchoiceState};
@@ -24,6 +26,8 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
     time::{Duration, UNIX_EPOCH},
+    thread,
+    hash::Hash,
 };
 use reth_eth_wire_types::NewBlock;
 use reth_network::NetworkHandle;
@@ -103,12 +107,15 @@ pub struct N42Miner<EngineT: EngineTypes, Provider, B, Network> {
     payload_builder: PayloadBuilderHandle<EngineT>,
     /// Timestamp for the next block.
     last_timestamp: u64,
-    /// Stores latest mined blocks.
-    last_block_hashes: Vec<B256>,
+    safe_block_hash: B256,
     /// full network  for announce block
     network: Network,
     new_block_event_stream: EventStream<NewBlock>,
     network_event_stream: EventStream<NetworkEvent>,
+    max_td: U256,
+    max_td_hash: B256,
+
+    consensus: Arc<dyn Consensus>,
 }
 
 impl<EngineT, Provider, B, Network> N42Miner<EngineT, Provider, B, Network>
@@ -126,9 +133,11 @@ where
         mode: MiningMode,
         payload_builder: PayloadBuilderHandle<EngineT>,
         network: Network,
+        consensus: Arc<dyn Consensus>,
     ) {
         let latest_header =
             provider.sealed_header(provider.best_block_number().unwrap()).unwrap().unwrap();
+        let latest_td = provider.header_td_by_number(provider.best_block_number().unwrap()).unwrap().unwrap();
 
         let new_block_event_stream = network.subscribe_block();
         let network_event_stream = network.event_listener();
@@ -139,10 +148,13 @@ where
             mode,
             payload_builder,
             last_timestamp: latest_header.timestamp,
-            last_block_hashes: vec![latest_header.hash()],
+            safe_block_hash: latest_header.hash(),
             network,
             new_block_event_stream,
             network_event_stream,
+            max_td: latest_td,
+            max_td_hash: latest_header.hash(),
+            consensus,
         };
 
         // Spawn the miner
@@ -151,8 +163,15 @@ where
 
     /// Runs the [`N42Miner`] in a loop, polling the miner and building payloads.
     async fn run(mut self) {
-        if let all_peers = self.network.get_all_peers().await {
+        if let Ok(all_peers) = self.network.get_all_peers().await {
             info!(target: "consensus-client", "all_peers={:?}", all_peers);
+            all_peers.iter().for_each(|peer|
+                if self.max_td < peer.status.total_difficulty {
+                    self.max_td = peer.status.total_difficulty;
+                    self.max_td_hash = peer.status.blockhash;
+                }
+            );
+            info!(target: "consensus-client", max_td=?self.max_td, max_td_hash=?self.max_td_hash);
         }
         if let fetch_client = self.network.fetch_client().await {
         }
@@ -168,13 +187,32 @@ where
                 new_block_event = &mut self.new_block_event_stream.next() => {
                     info!(target: "consensus-client", "new_block_event={:?}", new_block_event);
                     if let Some(new_block) = new_block_event {
-                        if let Err(e) = self.insert_block(new_block).await {
-                            error!(target: "consensus-client", "Error validating and inserting the block: {:?}", e);
+                        if self.max_td < U256::from(new_block.td) {
+                            match self.insert_block(&new_block).await {
+                                Ok(_) => {
+                                    self.max_td = U256::from(new_block.td);
+                                    self.max_td_hash = new_block.block.header.hash_slow();
+                                }
+                                Err(e) => {
+                                    error!(target: "consensus-client", "Error validating and inserting the block: {:?}", e);
+                                }
+                            }
                         }
                     }
                 }
                 network_event = &mut self.network_event_stream.next() => {
                     info!(target: "consensus-client", "network_event={:?}", network_event);
+                    if let Some(network_event) = network_event {
+                        match network_event {
+                            NetworkEvent::SessionEstablished {status, ..} => {
+                                if self.max_td < status.total_difficulty {
+                                    self.max_td = status.total_difficulty;
+                                    self.max_td_hash = status.blockhash;
+                                }
+                            },
+                            _ => { },
+                        }
+                    }
                 }
             }
         }
@@ -183,15 +221,9 @@ where
     /// Returns current forkchoice state.
     fn forkchoice_state(&self) -> ForkchoiceState {
         ForkchoiceState {
-            head_block_hash: *self.last_block_hashes.last().expect("at least 1 block exists"),
-            safe_block_hash: *self
-                .last_block_hashes
-                .get(self.last_block_hashes.len().saturating_sub(32))
-                .expect("at least 1 block exists"),
-            finalized_block_hash: *self
-                .last_block_hashes
-                .get(self.last_block_hashes.len().saturating_sub(64))
-                .expect("at least 1 block exists"),
+            head_block_hash: self.max_td_hash,
+            safe_block_hash: self.safe_block_hash,
+            finalized_block_hash: self.safe_block_hash,
         }
     }
 
@@ -217,13 +249,24 @@ where
                 .as_secs(),
         );
 
-        let res = self.beacon_engine_handle.fork_choice_updated(
-            self.forkchoice_state(),
-            Some(self.payload_attributes_builder.build(timestamp)),
-            EngineApiMessageVersion::default(),
-        ).await?;
-        if !res.payload_status.is_valid() {
-            eyre::bail!("Invalid payload status")
+        let mut res = self.beacon_engine_handle.fork_choice_updated(
+                self.forkchoice_state(),
+                Some(self.payload_attributes_builder.build(timestamp)),
+                EngineApiMessageVersion::default(),
+            ).await?;
+        while true {
+            if res.payload_status.is_valid() {
+                break;
+            } else {
+                info!(?res.payload_status, "Invalid payload status");
+                let delay = Duration::from_millis(1000);
+                tokio::task::block_in_place(|| { thread::sleep(delay)});
+                res = self.beacon_engine_handle.fork_choice_updated(
+                        self.forkchoice_state(),
+                        Some(self.payload_attributes_builder.build(timestamp)),
+                        EngineApiMessageVersion::default(),
+                    ).await?;
+            }
         }
         let payload_id = res.payload_id.ok_or_eyre("No payload id")?;
 
@@ -262,16 +305,11 @@ where
         }
 
         self.last_timestamp = timestamp;
-        self.last_block_hashes.push(block.hash());
-        // ensure we keep at most 64 blocks
-        if self.last_block_hashes.len() > 64 {
-            self.last_block_hashes =
-                self.last_block_hashes.split_off(self.last_block_hashes.len() - 64);
-        }
 
+        let total_difficulty = self.consensus.total_difficulty(block.hash());
         //announce block
         //todo td
-        self.network.announce_block(NewBlock{block: block.clone().unseal(), td: U128::MAX}, block.hash());
+        self.network.announce_block(NewBlock{block: block.clone().unseal(), td: U128::from(total_difficulty.to::<U128>())}, block.hash());
 
         Ok(())
     }
@@ -279,18 +317,12 @@ where
     fn forkchoice_state_with_head(&self, head_block_hash: B256) -> ForkchoiceState {
         ForkchoiceState {
             head_block_hash,
-            safe_block_hash: *self
-                .last_block_hashes
-                .get(self.last_block_hashes.len().saturating_sub(32))
-                .expect("at least 1 block exists"),
-            finalized_block_hash: *self
-                .last_block_hashes
-                .get(self.last_block_hashes.len().saturating_sub(64))
-                .expect("at least 1 block exists"),
+            safe_block_hash: self.safe_block_hash,
+            finalized_block_hash: self.safe_block_hash,
         }
     }
 
-    async fn insert_block(&mut self, new_block: NewBlock) -> eyre::Result<()> {
+    async fn insert_block(&mut self, new_block: &NewBlock) -> eyre::Result<()> {
         let block = new_block.clone().block.seal_slow();
         info!(target: "consensus-client", "new_block hash {:?}", block.header.hash());
 
@@ -300,14 +332,14 @@ where
             EngineApiMessageVersion::default(),
         ).await {
             Ok(v) => {
-                info!(target: "consensus-client", "forkchoice status {:?}", v);
+                info!(target: "consensus-client", "forkchoice(parent hash) status {:?}", v);
             }
             Err(e) => {
-                error!(target: "consensus-client", "Error updating fork choice: {:?}", e);
+                error!(target: "consensus-client", "Error updating fork choice(parent hash): {:?}", e);
             }
         }
 
-        let block = new_block.clone().block.seal_slow();
+        let block = new_block.block.clone().seal_slow();
         let cancun_fields =
             self.provider.chain_spec().is_cancun_active_at_timestamp(block.timestamp).then(|| {
                 CancunPayloadFields {
@@ -317,12 +349,25 @@ where
             });
 
         let res = self.beacon_engine_handle.new_payload(
-            block_to_payload(block),
+            block_to_payload(block.clone()),
             cancun_fields
                 .map(ExecutionPayloadSidecar::v3)
                 .unwrap_or_else(ExecutionPayloadSidecar::none),
         ).await?;
         info!(target: "consensus-client", "new_payload res={:?}", res);
+
+        match self.beacon_engine_handle.fork_choice_updated(
+            self.forkchoice_state_with_head(block.hash()),
+            None,
+            EngineApiMessageVersion::default(),
+        ).await {
+            Ok(v) => {
+                info!(target: "consensus-client", "forkchoice(block hash) status {:?}", v);
+            }
+            Err(e) => {
+                error!(target: "consensus-client", "Error updating fork choice(block hash): {:?}", e);
+            }
+        }
 
         Ok(())
     }

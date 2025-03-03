@@ -163,7 +163,7 @@ fn main() {
                             let ext = ConsensusExt { consensus, provider };
 
                             // now we merge our extension namespace into all configured transports
-                            ctx.modules.merge_configured(ext.into_rpc())?;
+                            ctx.auth_module.merge_auth_methods(ext.into_rpc())?;
 
                             println!("consensus rpc extension enabled");
 

@@ -1,4 +1,4 @@
-# Rust Blockchain Project
+# N42 Public Chain
 
 [![Rust](https://img.shields.io/badge/rust-1.50%2B-orange.svg)](https://www.rust-lang.org)
 [![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/n42blockchain/N42-rs/ci.yml?branch=main)](https://github.com/n42blockchain/N42-rs/actions)
@@ -10,7 +10,9 @@
 
 ## Introduction
 
-**Rust Blockchain Project** is a high-performance, decentralized public blockchain written in Rust. It leverages Rust's memory safety and performance capabilities to deliver a secure and scalable blockchain platform.
+N42 is a next-generation, permissionless public chain that redefines the balance between local control and global interoperability. By empowering developers to create customized execution environments while seamlessly connecting users and applications, N42 maximizes application sovereignty and enables infinite scalability. Its innovative architecture bridges the gap between centralized cloud platforms and decentralized systems, laying the groundwork for a secure, efficient, and globally interconnected digital ecosystem.
+
+The N42 blockchain is implemented in Rust, leveraging its memory safety and performance capabilities to deliver a secure and scalable platform.
 
 ## Features
 

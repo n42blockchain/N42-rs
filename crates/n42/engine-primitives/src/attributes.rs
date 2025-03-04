@@ -39,7 +39,7 @@ where
     fn build(&self, timestamp: u64) -> N42PayloadAttributes {
         let inner = EthPayloadAttributes {
             timestamp,
-            prev_randao: B256::random(),
+            prev_randao: B256::ZERO,
             suggested_fee_recipient: Address::ZERO,
             withdrawals: self
                 .chain_spec

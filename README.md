@@ -21,7 +21,10 @@ The N42 blockchain is implemented in Rust, leveraging its memory safety and perf
 - **High Throughput**: Designed for high transactions per second (TPS), making it ideal for large-scale applications.
 - **Interoperability**: Compatible with current blockchain ecosystems, facilitating cross-chain communication.
 - **Security**: Developed in Rust to ensure memory safety and guard against common vulnerabilities like buffer overflows.
-  
+- **Simplicity**: Connect to the network with just a few lines of code.
+- **Customizability**: Supports any programming language, ultra-low transaction latencies (as low as 1 millisecond), and flexible network bandwidth usage to keep operational costs low.
+- **Infinite Scalability**: Horizontal scaling by adding more computing nodes, parallel transaction processing enabled by a CRDT-based state model.
+
 ## Getting Started
 
 ### Prerequisites

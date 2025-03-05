@@ -159,7 +159,6 @@ impl CliqueTest {
 
         let NodeHandle { node, .. } = NodeBuilder::new(node_config.clone())
             .testing_node(exec.clone())
-            //.with_types_and_provider::<N42Node, BlockchainProvider2<_>>()
             .with_types::<N42Node>()
             .with_components(N42Node::default().components_builder())
             .with_add_ons(N42Node::default().add_ons())

@@ -259,7 +259,7 @@ where
                 break;
             } else {
                 info!(?res.payload_status, "Invalid payload status");
-                let delay = Duration::from_millis(1000);
+                let delay = Duration::from_millis(5000);
                 tokio::task::block_in_place(|| { thread::sleep(delay)});
                 res = self.beacon_engine_handle.fork_choice_updated(
                         self.forkchoice_state(),
@@ -285,24 +285,9 @@ where
         };
 
         let block = payload.block();
-
-        let cancun_fields =
-            self.provider.chain_spec().is_cancun_active_at_timestamp(block.timestamp).then(|| {
-                CancunPayloadFields {
-                    parent_beacon_block_root: block.parent_beacon_block_root.unwrap(),
-                    versioned_hashes: block.blob_versioned_hashes().into_iter().copied().collect(),
-                }
-            });
-
-        let res = self.beacon_engine_handle.new_payload(
-            block_to_payload(payload.block().clone()),
-            cancun_fields
-                .map(ExecutionPayloadSidecar::v3)
-                .unwrap_or_else(ExecutionPayloadSidecar::none),
-        ).await?;
-        if !res.is_valid() {
-            eyre::bail!("Invalid payload")
-        }
+        let total_difficulty = self.consensus.total_difficulty(block.hash());
+        self.max_td = total_difficulty;
+        self.max_td_hash = block.hash();
 
         self.last_timestamp = timestamp;
 
@@ -326,35 +311,28 @@ where
         let block = new_block.clone().block.seal_slow();
         info!(target: "consensus-client", "new_block hash {:?}", block.header.hash());
 
-        match self.beacon_engine_handle.fork_choice_updated(
-            self.forkchoice_state_with_head(block.parent_hash),
-            None,
-            EngineApiMessageVersion::default(),
-        ).await {
-            Ok(v) => {
-                info!(target: "consensus-client", "forkchoice(parent hash) status {:?}", v);
+        let mut try_count = 2;
+        while try_count > 0 {
+            let cancun_fields =
+                self.provider.chain_spec().is_cancun_active_at_timestamp(block.timestamp).then(|| {
+                    CancunPayloadFields {
+                        parent_beacon_block_root: block.parent_beacon_block_root.unwrap(),
+                        versioned_hashes: block.blob_versioned_hashes().into_iter().copied().collect(),
+                    }
+                });
+
+            let res = self.beacon_engine_handle.new_payload(
+                block_to_payload(block.clone()),
+                cancun_fields
+                    .map(ExecutionPayloadSidecar::v3)
+                    .unwrap_or_else(ExecutionPayloadSidecar::none),
+            ).await?;
+            info!(target: "consensus-client", "new_payload res={:?}", res);
+            if res.is_valid() {
+                break;
             }
-            Err(e) => {
-                error!(target: "consensus-client", "Error updating fork choice(parent hash): {:?}", e);
-            }
+            try_count -= 1;
         }
-
-        let block = new_block.block.clone().seal_slow();
-        let cancun_fields =
-            self.provider.chain_spec().is_cancun_active_at_timestamp(block.timestamp).then(|| {
-                CancunPayloadFields {
-                    parent_beacon_block_root: block.parent_beacon_block_root.unwrap(),
-                    versioned_hashes: block.blob_versioned_hashes().into_iter().copied().collect(),
-                }
-            });
-
-        let res = self.beacon_engine_handle.new_payload(
-            block_to_payload(block.clone()),
-            cancun_fields
-                .map(ExecutionPayloadSidecar::v3)
-                .unwrap_or_else(ExecutionPayloadSidecar::none),
-        ).await?;
-        info!(target: "consensus-client", "new_payload res={:?}", res);
 
         match self.beacon_engine_handle.fork_choice_updated(
             self.forkchoice_state_with_head(block.hash()),

@@ -26,6 +26,12 @@ By harnessing the power of Rust, the N42 blockchain provides advanced performanc
 - **Customizability**: Supports any programming language, ultra-low transaction latencies (as low as 1 millisecond), and flexible network bandwidth usage to keep operational costs low.
 - **Infinite Scalability**: Horizontal scaling by adding more computing nodes, parallel transaction processing enabled by a CRDT-based state model.
 
+## Use Cases & Ecosystem
+
+- **Decentralized Finance (DeFi):** By merging the strengths of traditional finance (TradFi) and decentralized finance (DeFi), N42 supports advanced financial applications that enable seamless asset flows, efficient trading, and innovative value creation.
+- **Interoperable dApps:** The minimal global state allows for atomic composability across domains, facilitating secure, trustless interactions between decentralized applications without the need for third-party bridges.
+- **Custom Execution Environments:** Developers can leverage the full flexibility of N42 to build bespoke execution environments that cater to specific business or application needs while benefiting from the global security and interoperability of the network.
+
 ## Getting Started
 
 ### Prerequisites

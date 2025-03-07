@@ -444,7 +444,7 @@ where
 
     fn validate_header_against_parent(
         &self,header: &SealedHeader,
-        _parent: &SealedHeader,
+        parent: &SealedHeader,
         ) -> Result<(),ConsensusError>  {
         info!(target: "consensus::apos", ?header, "in validate_header_against_parent");
         //self.validate_header(header)?;
@@ -456,7 +456,7 @@ where
         }
 
         let snap = self.snapshot(number - 1, header.parent_hash,
-None)?;
+Some(vec![parent.header().clone()]))?;
         if number % self.config.epoch == 0 {
             let signers: Vec<u8> = snap.signers
                 .iter()

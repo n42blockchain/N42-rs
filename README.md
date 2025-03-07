@@ -127,6 +127,10 @@ Use the command-line interface (CLI) or integrate with the blockchain via the JS
 
 ## Contributing
 
+Contributions are welcome! Please refer to our CONTRIBUTING.md for guidelines on how to get involved.
+
+### Contribution Process
+
 We're excited to welcome contributions to the Rust Blockchain Project! To get started, please follow these steps:
 
 1. Fork the repository.

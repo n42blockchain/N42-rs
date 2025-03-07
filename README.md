@@ -26,6 +26,33 @@ By harnessing the power of Rust, the N42 blockchain provides advanced performanc
 - **Customizability**: Supports any programming language, ultra-low transaction latencies (as low as 1 millisecond), and flexible network bandwidth usage to keep operational costs low.
 - **Infinite Scalability**: Horizontal scaling by adding more computing nodes, parallel transaction processing enabled by a CRDT-based state model.
 
+## Architecture
+
+### Domains
+
+**Execution Environment:** Each domain operates independently, hosting one or more applications. Users interact through a dedicated "vault" in every domain where their assets reside. While spending is restricted to the associated domain, assets can be received from any domain.
+
+**Local Customization:** Domains can be tailored to specific use cases, employing custom execution environments and smart contract engines (such as EVM or custom VMs) without compromising overall network security.
+
+### Validator Network
+
+**State Propagation & Verification:** Validators form a decentralized network responsible for propagating state updates, known as State Difference Lists (SDL), across domains. They verify these updates using zero-knowledge proofs (SNARKs), ensuring compliance with both global and local rules.
+
+**Consensus without Full Ordering:** Utilizing a leaderless, no-total-order consensus mechanism based on Byzantine Reliable Broadcast (BRB), N42 achieves high throughput and robust fault tolerance.
+
+### State Model & Settlement
+
+**CRDT-Based State Management:** The system employs Conflict-Free Replicated Data Types (CRDTs) to allow concurrent state updates without conflicts, enabling fast and deterministic merging of state changes.
+
+**Zero-Knowledge Settlement:** Domains generate zero-knowledge proofs to attest to the correctness of their state transitions. Validators verify these proofs to finalize settlements without needing to access the underlying transaction data.
+
+### Digital Asset Ownership
+
+**User Sovereignty:** N42 returns full control of digital assets—ranging from user-generated data to creative content—back to the individual. Assets are tokenized (e.g., via NFTs) and managed through smart contracts, ensuring clear and secure ownership.
+
+**Forced Migration:** In cases of censorship or downtime, users can forcefully migrate their vaults to another domain, preserving self-custody and maintaining uninterrupted access to their assets.
+
+
 ## Use Cases & Ecosystem
 
 - **Decentralized Finance (DeFi):** By merging the strengths of traditional finance (TradFi) and decentralized finance (DeFi), N42 supports advanced financial applications that enable seamless asset flows, efficient trading, and innovative value creation.

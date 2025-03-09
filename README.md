@@ -138,7 +138,7 @@ Kindly make sure your code complies with the project's coding standards and succ
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+N42 is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
 
 ## Contact
 

@@ -15,7 +15,7 @@ use rand::prelude::SliceRandom;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_primitives::{SealedBlock, SealedHeader, BlockWithSenders, public_key_to_address};
 use reth_primitives_traits::{Header, header::clique_utils::{recover_address, SIGNATURE_LENGTH, seal_hash}};
-use reth_provider::{HeaderProvider, SnapshotProvider};
+use reth_provider::{HeaderProvider, SnapshotProvider, TdProvider};
 use tracing::{info, warn, debug, error};
 use n42_primitives::{APosConfig, Snapshot};
 
@@ -23,7 +23,7 @@ use alloy_signer_local::{LocalSigner, PrivateKeySigner};
 use k256::ecdsa::SigningKey;
 use alloy_signer::SignerSync;
 use reth_consensus::{PostExecutionInput, Consensus, ConsensusError, HeaderConsensusError};
-use reth_storage_api::SnapshotProviderWriter;
+use reth_storage_api::{SnapshotProviderWriter, TdProviderWriter};
 use std::str::FromStr;
 
 //
@@ -108,7 +108,7 @@ impl Error for AposError {}
 // Ethereum testnet following the Ropsten attacks.
 pub struct APos<Provider, ChainSpec>
 where
-    Provider: HeaderProvider + SnapshotProvider + SnapshotProviderWriter + Clone + Unpin + 'static,
+    Provider: HeaderProvider + TdProvider + TdProviderWriter +SnapshotProvider + SnapshotProviderWriter + Clone + Unpin + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks
 {
     config: APosConfig,          // Consensus engine configuration parameters
@@ -130,7 +130,7 @@ where
 // signers set to the ones provided by the user.
 impl<Provider, ChainSpec> APos<Provider, ChainSpec>
 where
-    Provider: HeaderProvider + SnapshotProvider + SnapshotProviderWriter + Clone + Unpin + 'static,
+    Provider: HeaderProvider + TdProvider + TdProviderWriter +SnapshotProvider + SnapshotProviderWriter + Clone + Unpin + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks
 {
     pub fn new(
@@ -330,6 +330,21 @@ where
     // controlling the signer voting.
 
     fn save_total_difficulty(&self, header: &Header) {
+        let total_difficulty = if header.number == 1 {
+            header.difficulty
+        } else {
+            if let Ok(Some(parent_td)) = self.provider.load_td(&header.parent_hash) {
+                parent_td + header.difficulty
+            } else {
+                warn!(target: "consensus::apos", "td not found for hash {:?}", header.parent_hash);
+                U256::from(0)
+            }
+        };
+        self.provider.save_td(&header.hash_slow(), total_difficulty).unwrap();
+        info!(target: "consensus::apos", "saved total_difficulty {}", total_difficulty);
+    }
+    /*
+    fn save_total_difficulty(&self, header: &Header) {
         let mut recent_tds = self.recent_tds.write().unwrap();
         let total_difficulty = if header.number == 1 {
             header.difficulty
@@ -343,6 +358,7 @@ where
         recent_tds.insert(header.hash_slow(), total_difficulty);
         info!(target: "consensus::apos", "saved total_difficulty {}", total_difficulty);
     }
+    */
 }
 
 
@@ -362,7 +378,7 @@ fn calc_difficulty(snap: &Snapshot, signer: &Address) -> U256 {
 impl<Provider, ChainSpec> Debug for APos<Provider, ChainSpec>
 where
     ChainSpec: EthChainSpec + EthereumHardforks,
-    Provider: 'static + Clone + HeaderProvider + SnapshotProvider + SnapshotProviderWriter + Unpin,
+    Provider: 'static + Clone + HeaderProvider + TdProvider + TdProviderWriter + SnapshotProvider + SnapshotProviderWriter + Unpin,
 {
     fn fmt(&self, _f: &mut Formatter<'_>) -> std::fmt::Result {
         todo!()
@@ -371,7 +387,7 @@ where
 
 impl<Provider, ChainSpec> Consensus for APos<Provider, ChainSpec>
 where
-    Provider: HeaderProvider + SnapshotProvider + SnapshotProviderWriter + Clone + Unpin + 'static,
+    Provider: HeaderProvider + TdProvider + TdProviderWriter +SnapshotProvider + SnapshotProviderWriter + Clone + Unpin + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks
 {
 
@@ -822,6 +838,20 @@ Some(vec![parent.header().clone()]))?;
         &self,
         hash: B256,
     ) -> U256 {
+        let total_difficulty = if let Ok(Some(td)) = self.provider.load_td(&hash) {
+            td
+        } else {
+            warn!(target: "consensus::apos", "td not found for hash {:?}", hash);
+            U256::from(0)
+        };
+        info!(target: "consensus::apos", ?hash, ?total_difficulty, "get total_difficulty");
+        total_difficulty
+    }
+/*
+    fn total_difficulty(
+        &self,
+        hash: B256,
+    ) -> U256 {
         let mut recent_tds = self.recent_tds.write().unwrap();
         let total_difficulty = if let Some(td) = recent_tds.get(&hash) {
             *td
@@ -831,5 +861,6 @@ Some(vec![parent.header().clone()]))?;
         info!(target: "consensus::apos", ?hash, ?total_difficulty, "get total_difficulty");
         total_difficulty
     }
+*/
 
 }

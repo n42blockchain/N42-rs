@@ -29,7 +29,7 @@ use reth_primitives::{
 };
 use reth_prune_types::{PruneCheckpoint, PruneSegment};
 use reth_stages_types::{StageCheckpoint, StageId};
-use reth_storage_api::{DBProvider, SnapshotProvider, SnapshotProviderWriter, StorageChangeSetReader};
+use reth_storage_api::{DBProvider, TdProvider, TdProviderWriter, SnapshotProvider, SnapshotProviderWriter, StorageChangeSetReader};
 use reth_storage_errors::provider::ProviderResult;
 use revm::primitives::{BlockEnv, CfgEnvWithHandlerCfg};
 use std::{
@@ -713,6 +713,19 @@ impl<N: ProviderNodeTypes> SnapshotProviderWriter for BlockchainProvider2<N> {
     }
 }
 
+impl<N: ProviderNodeTypes> TdProvider for BlockchainProvider2<N> {
+    fn load_td(&self, block_hash: &BlockHash) -> ProviderResult<Option<U256>> {
+        self.database_provider_ro()?.load_td(block_hash)
+    }
+}
+
+impl<N: ProviderNodeTypes> TdProviderWriter for BlockchainProvider2<N> {
+    fn save_td(&self, block_hash: &BlockHash, td: U256) -> ProviderResult<()> {
+        let provider_rw = self.database_provider_rw()?;
+        provider_rw.save_td(block_hash, td)?;
+        provider_rw.commit().map(|_|())
+    }
+}
 
 impl<N: NodeTypesWithDB> ForkChoiceSubscriptions for BlockchainProvider2<N> {
     fn subscribe_safe_block(&self) -> ForkChoiceNotifications {

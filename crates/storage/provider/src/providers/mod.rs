@@ -64,6 +64,7 @@ mod consistent;
 pub use consistent::ConsistentProvider;
 use n42_primitives::Snapshot;
 use reth_storage_api::{SnapshotProvider, SnapshotProviderWriter};
+use reth_storage_api::{TdProvider, TdProviderWriter};
 
 /// Helper trait keeping common requirements of providers for [`NodeTypesWithDB`].
 pub trait ProviderNodeTypes: NodeTypesWithDB<ChainSpec: EthereumHardforks> {}
@@ -922,6 +923,20 @@ impl<N: ProviderNodeTypes> SnapshotProviderWriter for BlockchainProvider<N> {
         let provider_rw = self.database.database_provider_rw()?;
         provider_rw.save_snapshot(id, snapshot)?;
         provider_rw.commit()
+    }
+}
+
+impl<N: ProviderNodeTypes> TdProvider for BlockchainProvider<N> {
+    fn load_td(&self, block_hash: &BlockHash) -> ProviderResult<Option<U256>> {
+        self.database.provider()?.load_td(block_hash)
+    }
+}
+
+impl<N: ProviderNodeTypes> TdProviderWriter for BlockchainProvider<N> {
+    fn save_td(&self, block_hash: &BlockHash, td: U256) -> ProviderResult<()> {
+        let provider_rw = self.database.database_provider_rw()?;
+        provider_rw.save_td(block_hash, td)?;
+        provider_rw.commit().map(|_|())
     }
 }
 

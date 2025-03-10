@@ -286,6 +286,9 @@ tables! {
     /// Stores the total difficulty from a block header.
     table HeaderTerminalDifficulties<Key = BlockNumber, Value = CompactU256>;
 
+    /// Stores the total difficulty from a block header.
+    table HeaderTotalDifficulties<Key = HeaderHash, Value = CompactU256>;
+
     /// Stores the block number corresponding to a header.
     table HeaderNumbers<Key = BlockHash, Value = BlockNumber>;
 

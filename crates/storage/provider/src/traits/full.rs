@@ -9,6 +9,7 @@ use reth_chain_state::{CanonStateSubscriptions, ForkChoiceSubscriptions};
 use reth_chainspec::EthereumHardforks;
 use reth_node_types::NodeTypesWithDB;
 use reth_storage_api::{SnapshotProvider, SnapshotProviderWriter};
+use reth_storage_api::{TdProvider, TdProviderWriter};
 
 /// Helper trait to unify all provider traits for simplicity.
 pub trait FullProvider<N: NodeTypesWithDB>:
@@ -25,6 +26,8 @@ pub trait FullProvider<N: NodeTypesWithDB>:
     + StageCheckpointReader
     + SnapshotProvider
     + SnapshotProviderWriter
+    + TdProvider
+    + TdProviderWriter
     + Clone
     + Unpin
     + 'static
@@ -45,6 +48,8 @@ impl<T, N: NodeTypesWithDB> FullProvider<N> for T where
         + StageCheckpointReader
         + SnapshotProvider
         + SnapshotProviderWriter
+        + TdProvider
+        + TdProviderWriter
         + Clone
         + Unpin
         + 'static

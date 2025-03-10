@@ -18,7 +18,7 @@ use reth_payload_builder::PayloadBuilderHandle;
 use reth_payload_primitives::{
     BuiltPayload, PayloadAttributesBuilder, PayloadBuilder, PayloadKind, PayloadTypes,
 };
-use reth_provider::{BlockReader, ChainSpecProvider};
+use reth_provider::{TdProvider, BlockReader, ChainSpecProvider};
 use reth_rpc_types_compat::engine::payload::block_to_payload;
 use reth_transaction_pool::TransactionPool;
 use std::{
@@ -121,7 +121,7 @@ pub struct N42Miner<EngineT: EngineTypes, Provider, B, Network> {
 impl<EngineT, Provider, B, Network> N42Miner<EngineT, Provider, B, Network>
 where
     EngineT: EngineTypes,
-    Provider: BlockReader + ChainSpecProvider<ChainSpec: EthereumHardforks> + 'static,
+    Provider: TdProvider + BlockReader + ChainSpecProvider<ChainSpec: EthereumHardforks> + 'static,
     B: PayloadAttributesBuilder<<EngineT as PayloadTypes>::PayloadAttributes>,
     Network: reth_network_api::FullNetwork,
 {
@@ -137,7 +137,7 @@ where
     ) {
         let latest_header =
             provider.sealed_header(provider.best_block_number().unwrap()).unwrap().unwrap();
-        let latest_td = provider.header_td_by_number(provider.best_block_number().unwrap()).unwrap().unwrap();
+        let latest_td = consensus.total_difficulty(latest_header.hash_slow());
 
         let new_block_event_stream = network.subscribe_block();
         let network_event_stream = network.event_listener();
@@ -254,19 +254,8 @@ where
                 Some(self.payload_attributes_builder.build(timestamp)),
                 EngineApiMessageVersion::default(),
             ).await?;
-        while true {
-            if res.payload_status.is_valid() {
-                break;
-            } else {
-                info!(?res.payload_status, "Invalid payload status");
-                let delay = Duration::from_millis(5000);
-                tokio::task::block_in_place(|| { thread::sleep(delay)});
-                res = self.beacon_engine_handle.fork_choice_updated(
-                        self.forkchoice_state(),
-                        Some(self.payload_attributes_builder.build(timestamp)),
-                        EngineApiMessageVersion::default(),
-                    ).await?;
-            }
+        if !res.payload_status.is_valid() {
+            eyre::bail!("Error advancing the chain: fork_choice_updated with PayloadAttributes status is not valid: {:?}", res);
         }
         let payload_id = res.payload_id.ok_or_eyre("No payload id")?;
 

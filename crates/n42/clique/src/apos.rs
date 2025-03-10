@@ -748,15 +748,13 @@ Some(vec![parent.header().clone()]))?;
             }
 
             // No snapshot for this header, gather the header and move backward
-            let header = if let Some(ref mut parent_vec) = parents {
-                if let Some(header) = parent_vec.pop() {
-                    if header.hash_slow() != hash || header.number != number {
-                        return Err(ConsensusError::UnknownBlock);
-                    }
-                    header
-                } else {
+            let header = if parents.is_some() && !parents.as_ref().unwrap().is_empty() {
+                let header = parents.as_mut().unwrap().pop().unwrap();
+                if header.hash_slow() != hash || header.number != number {
+                    error!(target: "consensus::apos", "parent hash check failed: {:?}, {:?}, {:?}, {:?}", header.hash_slow(), hash, header.number, number);
                     return Err(ConsensusError::UnknownBlock);
                 }
+                header
             } else {
                 let header_opt = self.provider.header_by_hash_or_number(hash.into()).map_err(|_| ConsensusError::UnknownBlock)?;
                 if let Some(header) = header_opt {

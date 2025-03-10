@@ -1,8 +1,6 @@
 //! Contains the implementation of the mining mode for the local engine.
 
-use reth_beacon_consensus::{
-    BeaconConsensusEngineHandle,
-};
+use reth_beacon_consensus::BeaconConsensusEngineHandle;
 use reth_node_types::NodeTypesWithEngine;
 use reth_consensus::Consensus;
 use std::sync::Arc;
@@ -112,8 +110,6 @@ pub struct N42Miner<EngineT: EngineTypes, Provider, B, Network> {
     network: Network,
     new_block_event_stream: EventStream<NewBlock>,
     network_event_stream: EventStream<NetworkEvent>,
-    max_td: U256,
-    max_td_hash: B256,
 
     consensus: Arc<dyn Consensus>,
 }
@@ -152,8 +148,6 @@ where
             network,
             new_block_event_stream,
             network_event_stream,
-            max_td: latest_td,
-            max_td_hash: latest_header.hash(),
             consensus,
         };
 
@@ -165,13 +159,15 @@ where
     async fn run(mut self) {
         if let Ok(all_peers) = self.network.get_all_peers().await {
             info!(target: "consensus-client", "all_peers={:?}", all_peers);
+                /*
             all_peers.iter().for_each(|peer|
                 if self.max_td < peer.status.total_difficulty {
                     self.max_td = peer.status.total_difficulty;
                     self.max_td_hash = peer.status.blockhash;
                 }
             );
-            info!(target: "consensus-client", max_td=?self.max_td, max_td_hash=?self.max_td_hash);
+                */
+            //info!(target: "consensus-client", max_td=?self.max_td, max_td_hash=?self.max_td_hash);
         }
         if let fetch_client = self.network.fetch_client().await {
         }
@@ -187,11 +183,11 @@ where
                 new_block_event = &mut self.new_block_event_stream.next() => {
                     info!(target: "consensus-client", "new_block_event={:?}", new_block_event);
                     if let Some(new_block) = new_block_event {
-                        if self.max_td < U256::from(new_block.td) {
+                        let (max_td, _) = self.max_td_and_hash();
+                        info!(target: "consensus-client", ?max_td, new_block_td=?U256::from(new_block.td));
+                        if max_td < U256::from(new_block.td) {
                             match self.insert_block(&new_block).await {
                                 Ok(_) => {
-                                    self.max_td = U256::from(new_block.td);
-                                    self.max_td_hash = new_block.block.header.hash_slow();
                                 }
                                 Err(e) => {
                                     error!(target: "consensus-client", "Error validating and inserting the block: {:?}", e);
@@ -205,10 +201,12 @@ where
                     if let Some(network_event) = network_event {
                         match network_event {
                             NetworkEvent::SessionEstablished {status, ..} => {
+                                /*
                                 if self.max_td < status.total_difficulty {
                                     self.max_td = status.total_difficulty;
                                     self.max_td_hash = status.blockhash;
                                 }
+                                */
                             },
                             _ => { },
                         }
@@ -220,8 +218,9 @@ where
 
     /// Returns current forkchoice state.
     fn forkchoice_state(&self) -> ForkchoiceState {
+        let (_, max_td_hash) = self.max_td_and_hash();
         ForkchoiceState {
-            head_block_hash: self.max_td_hash,
+            head_block_hash: max_td_hash,
             safe_block_hash: self.safe_block_hash,
             finalized_block_hash: self.safe_block_hash,
         }
@@ -241,13 +240,11 @@ where
     /// Generates payload attributes for a new block, passes them to FCU and inserts built payload
     /// through newPayload.
     async fn advance(&mut self) -> eyre::Result<()> {
-        let timestamp = std::cmp::max(
-            self.last_timestamp + 1,
+        let timestamp =
             std::time::SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("cannot be earlier than UNIX_EPOCH")
-                .as_secs(),
-        );
+                .as_secs();
 
         let mut res = self.beacon_engine_handle.fork_choice_updated(
                 self.forkchoice_state(),
@@ -274,16 +271,12 @@ where
         };
 
         let block = payload.block();
-        let total_difficulty = self.consensus.total_difficulty(block.hash());
-        self.max_td = total_difficulty;
-        self.max_td_hash = block.hash();
+        let max_td = self.consensus.total_difficulty(block.header.hash());
+        info!(target: "consensus-client", ?max_td, "advance: new_block hash {:?}", block.header.hash());
 
         self.last_timestamp = timestamp;
 
-        let total_difficulty = self.consensus.total_difficulty(block.hash());
-        //announce block
-        //todo td
-        self.network.announce_block(NewBlock{block: block.clone().unseal(), td: U128::from(total_difficulty.to::<U128>())}, block.hash());
+        self.network.announce_block(NewBlock{block: block.clone().unseal(), td: max_td.to::<U128>()}, block.hash());
 
         Ok(())
     }
@@ -337,5 +330,13 @@ where
         }
 
         Ok(())
+    }
+
+    fn max_td_and_hash(&self) -> (U256, B256) {
+        let header =
+            self.provider.sealed_header(self.provider.best_block_number().unwrap()).unwrap().unwrap();
+        let td = self.consensus.total_difficulty(header.hash_slow());
+        info!(hash=?header.hash(), ?td, header.number, "max_td_and_hash");
+        (td, header.hash())
     }
 }

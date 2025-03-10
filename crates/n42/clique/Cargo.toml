@@ -9,15 +9,6 @@ repository.workspace = true
 exclude.workspace = true
 
 [dependencies]
-# async
-tokio = { workspace = true, features = [
-    "sync",
-    "macros",
-    "time",
-    "rt-multi-thread",
-] }
-futures.workspace = true
-
 once_cell.workspace = true
 unexpected = "0.1"
 

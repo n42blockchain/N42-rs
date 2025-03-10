@@ -658,7 +658,6 @@ Some(vec![parent.header().clone()]))?;
         info!(target: "consensus::apos", "Waiting for slot to sign and propagate, delay: {:?}", delay);
         //
         // thread::sleep(delay);
-        tokio::task::block_in_place(|| { thread::sleep(delay_with_wiggle)});
         //tokio::time::sleep(delay_with_wiggle);
 
         self.save_total_difficulty(header);

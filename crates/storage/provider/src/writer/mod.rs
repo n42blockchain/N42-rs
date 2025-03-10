@@ -234,10 +234,14 @@ where
             let header_writer =
                 self.static_file().get_writer(block.number, StaticFileSegment::Headers)?;
             let mut storage_writer = UnifiedStorageWriter::from(self.database(), header_writer);
-            let td = storage_writer.append_headers_from_blocks(
-                block.header().number,
-                std::iter::once(&(block.header(), block.hash())),
-            )?;
+            let td = if block.header().number == 0 {
+                block.difficulty
+            } else {
+                storage_writer.append_headers_from_blocks(
+                    block.header().number - 1,
+                    std::iter::once(&(block.header(), block.hash())),
+                )?
+            };
 
             debug!(target: "provider::storage_writer", block_num=block.number, "Updating transaction metadata after writing");
             self.database()

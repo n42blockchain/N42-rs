@@ -96,13 +96,49 @@ To run the tests, use the following command:
 cargo test
 ```
 
-### Documentation
+I'll help refine the documentation part of the N42 Public Chain GitHub README. Based on the information provided, here's an improved version of the documentation section:
 
-Generate the documentation locally:
+## Documentation
+
+N42 offers comprehensive documentation to help developers get started with the platform:
+
+### Official Documentation
+
+- **Developer Hub**: Visit our [official documentation portal](https://docs.n42.world) for in-depth guides, tutorials, and API references
+- **SDK Documentation**: Explore language-specific SDK documentation for seamless integration
+
+### Local Documentation
+
+Generate and view the documentation locally:
 
 ```bash
+# Generate documentation with examples and all features
+cargo doc --no-deps --all-features --document-private-items
+
+# Open the generated documentation in your browser
 cargo doc --open
 ```
+
+### Learning Resources
+
+- **Tutorials**: Step-by-step guides for building your first domain and applications
+- **Examples**: Browse our [examples repository](https://github.com/n42blockchain/examples) for reference implementations
+- **Architecture Deep Dives**: Technical papers explaining N42's consensus mechanism, CRDT-based state model, and zero-knowledge settlement system
+
+### API Reference
+
+- **RPC API**: Complete reference for interacting with the N42 network
+- **WebSocket API**: Real-time data stream documentation
+- **CLI Reference**: Comprehensive guide to the command-line interface tools
+
+### Support Resources
+
+- **Discord Community**: Join our active [Discord community](https://discord.com/invite/n42) for discussions and real-time support
+- **Developer Office Hours**: Weekly sessions with the core development team
+- **GitHub Discussions**: Post questions and participate in technical conversations
+- **FAQ**: Answers to commonly asked questions about development on N42
+
+Visit our [Developer Portal](https://developers.n42.world) for additional resources including sandbox environments, testing tools, and faucets for testnet tokens.
 
 ## Usage
 

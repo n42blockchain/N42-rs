@@ -215,9 +215,6 @@ where
                         }
                     }
                 }
-                network_event = &mut self.network_event_stream.next() => {
-                    info!(target: "consensus-client", "network_event={:?}", network_event);
-                }
             }
         }
     }

@@ -1,6 +1,8 @@
 //! Engine node related functionality.
 
 use futures::{future::Either, stream, stream_select, StreamExt};
+use alloy_primitives::Address;
+use alloy_signer_local::PrivateKeySigner;
 use reth_beacon_consensus::{
     hooks::{EngineHooks, StaticFileHook},
     BeaconConsensusEngineHandle,
@@ -423,9 +425,15 @@ where
         } else {
             consensus_client::miner::MiningMode::NoMining
         };
+        let signer_address = if let Some(signer_private_key) = ctx.node_config().dev.consensus_signer_private_key {
+            let eth_signer: PrivateKeySigner = signer_private_key.to_string().parse().unwrap();
+            Some(eth_signer.address())
+        } else {
+            None
+        };
         N42Miner::spawn_new(
             ctx.blockchain_db().clone(),
-            N42PayloadAttributesBuilder::new(ctx.chain_spec()),
+            N42PayloadAttributesBuilder::new_add_signer(ctx.chain_spec(), signer_address),
             beacon_engine_handle_clone,
             mining_mode,
             ctx.components().payload_builder().clone(),

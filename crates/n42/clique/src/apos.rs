@@ -119,7 +119,6 @@ where
     //  Provider,
     provider: Provider,
     recent_headers: RwLock<schnellru::LruMap<B256, Header>>,    // Recent headers for snapshot
-    recent_tds: RwLock<schnellru::LruMap<B256, U256>>,    // Recent total difficulty per hash
 }
 
 
@@ -138,7 +137,6 @@ where
     {
         let recents = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SNAPSHOTS)));
         let recent_headers = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(CHECKPOINT_INTERVAL as u32 * 2)));
-        let recent_tds = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(CHECKPOINT_INTERVAL as u32 * 2)));
 
         // signer_pk.sign_hash_sync();
         let eth_signer: Option<PrivateKeySigner> = signer_private_key.map(|key| { key.parse().unwrap() });
@@ -161,7 +159,6 @@ where
             chain_spec,
             recents,
             recent_headers,
-            recent_tds,
             proposals: Arc::new(RwLock::new(HashMap::new())),
             signer: RwLock::new(eth_signer_address),
             eth_signer: RwLock::new(eth_signer),
@@ -338,22 +335,6 @@ where
         self.provider.save_td(&header.hash_slow(), total_difficulty).unwrap();
         info!(target: "consensus::apos", "saved total_difficulty {}", total_difficulty);
     }
-    /*
-    fn save_total_difficulty(&self, header: &Header) {
-        let mut recent_tds = self.recent_tds.write().unwrap();
-        let total_difficulty = if header.number == 1 {
-            header.difficulty
-        } else {
-            if let Some(parent_td) = recent_tds.get(&header.parent_hash) {
-                *parent_td + header.difficulty
-            } else {
-                U256::from(0)
-            }
-        };
-        recent_tds.insert(header.hash_slow(), total_difficulty);
-        info!(target: "consensus::apos", "saved total_difficulty {}", total_difficulty);
-    }
-    */
 }
 
 
@@ -837,20 +818,4 @@ Some(vec![parent.header().clone()]))?;
         info!(target: "consensus::apos", ?hash, ?total_difficulty, "get total_difficulty");
         total_difficulty
     }
-/*
-    fn total_difficulty(
-        &self,
-        hash: B256,
-    ) -> U256 {
-        let mut recent_tds = self.recent_tds.write().unwrap();
-        let total_difficulty = if let Some(td) = recent_tds.get(&hash) {
-            *td
-        } else {
-            U256::from(0)
-        };
-        info!(target: "consensus::apos", ?hash, ?total_difficulty, "get total_difficulty");
-        total_difficulty
-    }
-*/
-
 }

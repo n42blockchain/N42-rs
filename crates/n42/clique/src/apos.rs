@@ -589,7 +589,7 @@ Some(vec![parent.header().clone()]))?;
         for (seen, recent) in &snap.recents {
             if *recent == signer {
                 let limit = (snap.signers.len() as u64 / 2) + 1;
-                if *seen > header.number - limit {
+                if header.number < limit || *seen > header.number - limit {
                     error!(target: "consensus::engine", "Signed recently, must wait for others: limit: {}, seen: {}, number: {}, signer: {}", limit, seen, header.number, signer);
                     return Err(ConsensusError::RecentlySigned);
                 }

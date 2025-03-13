@@ -102,8 +102,6 @@ pub struct N42Miner<EngineT: EngineTypes, Provider, B, Network> {
     mode: MiningMode,
     /// The payload builder for the engine
     payload_builder: PayloadBuilderHandle<EngineT>,
-    /// Timestamp for the next block.
-    safe_block_hash: B256,
     /// full network  for announce block
     network: Network,
     new_block_event_stream: EventStream<NewBlock>,
@@ -139,7 +137,6 @@ where
             beacon_engine_handle,
             mode,
             payload_builder,
-            safe_block_hash: latest_header.hash(),
             network,
             new_block_event_stream,
             network_event_stream,
@@ -228,13 +225,28 @@ where
         }
     }
 
+    fn get_safe_block_hash(&self) -> BlockHash {
+        let header =
+            self.provider.sealed_header(self.provider.best_block_number().unwrap()).unwrap().unwrap();
+        let snapshot = self.consensus.snapshot(header.number, header.hash_slow(), None).unwrap();
+        let num_signers = snapshot.signers.len();
+        let safe_block_number = header.number.saturating_sub(num_signers as u64 / 2 + 1);
+        let safe_block_header =
+            self.provider.sealed_header(safe_block_number).unwrap().unwrap();
+        let safe_block_hash = safe_block_header.hash_slow();
+
+        safe_block_hash
+    }
+
     /// Returns current forkchoice state.
     fn forkchoice_state(&self) -> ForkchoiceState {
         let (_, max_td_hash) = self.max_td_and_hash();
+
+        let safe_block_hash = self.get_safe_block_hash();
         ForkchoiceState {
             head_block_hash: max_td_hash,
-            safe_block_hash: self.safe_block_hash,
-            finalized_block_hash: self.safe_block_hash,
+            safe_block_hash,
+            finalized_block_hash: safe_block_hash,
         }
     }
 
@@ -310,10 +322,11 @@ where
     }
 
     fn forkchoice_state_with_head(&self, head_block_hash: B256) -> ForkchoiceState {
+        let safe_block_hash = self.get_safe_block_hash();
         ForkchoiceState {
             head_block_hash,
-            safe_block_hash: self.safe_block_hash,
-            finalized_block_hash: self.safe_block_hash,
+            safe_block_hash,
+            finalized_block_hash: safe_block_hash,
         }
     }
 

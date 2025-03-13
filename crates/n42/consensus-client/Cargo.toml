@@ -20,6 +20,7 @@ reth-evm.workspace = true
 reth-ethereum-engine-primitives.workspace = true
 reth-payload-builder.workspace = true
 reth-payload-primitives.workspace = true
+reth-primitives.workspace = true
 reth-payload-validator.workspace = true
 reth-provider.workspace = true
 reth-prune.workspace = true
@@ -32,6 +33,7 @@ reth-network-api.workspace = true
 reth-tokio-util.workspace = true
 reth-node-types.workspace = true
 reth-node-api.workspace = true
+reth-network-p2p.workspace = true
 
 # alloy
 alloy-primitives.workspace = true

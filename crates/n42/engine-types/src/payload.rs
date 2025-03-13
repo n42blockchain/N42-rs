@@ -56,7 +56,39 @@ type BestTransactionsIter<Pool> = Box<
 /// The type responsible for building custom payloads
 #[derive(Debug, Default, Clone)]
 #[non_exhaustive]
-pub struct N42PayloadBuilder;
+pub struct N42PayloadBuilder<EvmConfig = EthEvmConfig> {
+    /// The type responsible for creating the evm.
+    evm_config: EvmConfig,
+}
+
+impl<EvmConfig> N42PayloadBuilder<EvmConfig> {
+    /// `N42PayloadBuilder` constructor.
+    pub const fn new(evm_config: EvmConfig) -> Self {
+        Self { evm_config }
+    }
+}
+
+
+impl<EvmConfig> N42PayloadBuilder<EvmConfig>
+where
+    EvmConfig: ConfigureEvm<Header = Header>,
+{
+    /// Returns the configured [`CfgEnvWithHandlerCfg`] and [`BlockEnv`] for the targeted payload
+    /// (that has the `parent` as its parent).
+    fn cfg_and_block_env(
+        &self,
+        config: &PayloadConfig<N42PayloadBuilderAttributes>,
+        parent: &Header,
+    ) -> Result<(CfgEnvWithHandlerCfg, BlockEnv), EvmConfig::Error> {
+        let next_attributes = NextBlockEnvAttributes {
+            timestamp: config.attributes.timestamp(),
+            suggested_fee_recipient: config.attributes.suggested_fee_recipient(),
+            prev_randao: config.attributes.prev_randao(),
+        };
+        self.evm_config.next_cfg_and_block_env(parent, next_attributes)
+    }
+
+}
 
 impl<Pool, Client, Cons> PayloadBuilder<Pool, Client, Cons> for N42PayloadBuilder
 where
@@ -72,22 +104,12 @@ where
         args: N42BuildArguments<Pool, Client, Cons, Self::Attributes, Self::BuiltPayload>,
     ) -> Result<BuildOutcome<Self::BuiltPayload>, PayloadBuilderError> {
 
-        let chain_spec = args.client.chain_spec();
-
-        let evm_config = EthEvmConfig::new(chain_spec.clone());
-        let next_attributes = NextBlockEnvAttributes {
-            timestamp: args.config.attributes.timestamp(),
-            suggested_fee_recipient: args.config.attributes.suggested_fee_recipient(),
-            prev_randao: args.config.attributes.prev_randao(),
-        };
+        let (cfg_env, block_env) = self
+            .cfg_and_block_env(&args.config, &args.config.parent_header)
+            .map_err(PayloadBuilderError::other)?;
 
         let pool = args.pool.clone();
-
-        // This reuses the default EthereumPayloadBuilder to build the payload
-        // but any custom logic can be implemented here
-        let (cfg_env, block_env) = evm_config.next_cfg_and_block_env(&args.config.parent_header, next_attributes).map_err(PayloadBuilderError::other)?;
-
-        default_n42_payload(evm_config, args, cfg_env, block_env, |attributes| {
+        default_n42_payload(self.evm_config.clone(), args, cfg_env, block_env, |attributes| {
             pool.best_transactions_with_attributes(attributes)
         })
     }
@@ -97,30 +119,14 @@ where
         args: N42BuildArguments<Pool, Client, Cons, Self::Attributes, Self::BuiltPayload>,
     ) -> Result<Self::BuiltPayload, PayloadBuilderError> {
 
-
-        let chain_spec = args.client.chain_spec();
-
-        let evm_config = EthEvmConfig::new(chain_spec.clone());
-        let next_attributes = NextBlockEnvAttributes {
-            timestamp: args.config.attributes.timestamp(),
-            suggested_fee_recipient: args.config.attributes.suggested_fee_recipient(),
-            prev_randao: args.config.attributes.prev_randao(),
-        };
+        let (cfg_env, block_env) = self
+            .cfg_and_block_env(&args.config, &args.config.parent_header)
+            .map_err(PayloadBuilderError::other)?;
 
         let pool = args.pool.clone();
 
-        // This reuses the default EthereumPayloadBuilder to build the payload
-        // but any custom logic can be implemented here
-        let (cfg_env, block_env) = evm_config.next_cfg_and_block_env(&args.config.parent_header, next_attributes).map_err(PayloadBuilderError::other)?;
 
-        let pool = args.pool.clone();
-
-        // This reuses the default EthereumPayloadBuilder to build the payload
-        // but any custom logic can be implemented here
-        let (cfg_env, block_env) = evm_config.next_cfg_and_block_env(&args.config.parent_header, next_attributes).map_err(PayloadBuilderError::other)?;
-
-
-        default_n42_payload(evm_config, args, cfg_env, block_env, |attributes| {
+        default_n42_payload(self.evm_config.clone(), args, cfg_env, block_env, |attributes| {
             pool.best_transactions_with_attributes(attributes)
         })?
             .into_payload()
@@ -153,7 +159,9 @@ where
         pool: Pool,
         consensus: Cons,
     ) -> eyre::Result<PayloadBuilderHandle<<Node::Types as NodeTypesWithEngine>::Engine>> {
-        let payload_builder = N42PayloadBuilder::default();
+        let payload_builder = N42PayloadBuilder::new(
+            EthEvmConfig::new(ctx.chain_spec()),
+        );
         let conf = ctx.payload_builder_config();
 
         let payload_job_config = N42PayloadJobGeneratorConfig::default()

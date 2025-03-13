@@ -12,7 +12,7 @@ use reth_provider::StateProviderFactory;
 use reth_payload_builder::{KeepPayloadJobAlive, PayloadJob};
 use tokio::sync::oneshot;
 use tokio::time::{Interval, Sleep};
-use tracing::{debug, trace};
+use tracing::{debug, trace, error};
 use reth_primitives::constants::RETH_CLIENT_VERSION;
 
 use reth_payload_primitives::{
@@ -268,7 +268,8 @@ where
                         trace!(target: "payload_builder", worse_fees = %fees, "skipped payload build of worse block");
                     }
                     BuildOutcome::Cancelled => {
-                        unreachable!("the cancel signal never fired")
+                        debug!("Build task was cancelled");
+                        // unreachable!("the cancel signal never fired")
                     }
                 },
                 Poll::Ready(Err(error)) => {

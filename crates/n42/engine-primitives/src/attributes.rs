@@ -53,7 +53,7 @@ where
             parent_beacon_block_root: self
                 .chain_spec
                 .is_cancun_active_at_timestamp(timestamp)
-                .then(B256::random),
+                .then(Default::default),
         };
 
         N42PayloadAttributes {

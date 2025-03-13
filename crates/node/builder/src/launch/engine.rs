@@ -1,6 +1,8 @@
 //! Engine node related functionality.
 
 use futures::{future::Either, stream, stream_select, StreamExt};
+use alloy_primitives::Address;
+use alloy_signer_local::PrivateKeySigner;
 use reth_beacon_consensus::{
     hooks::{EngineHooks, StaticFileHook},
     BeaconConsensusEngineHandle,
@@ -344,6 +346,7 @@ where
         let terminate_after_backfill = ctx.terminate_after_initial_backfill();
 
         info!(target: "reth::cli", "Starting consensus engine");
+        let consensus = ctx.consensus().clone();
         ctx.task_executor().spawn_critical("consensus engine", async move {
             if let Some(initial_target) = initial_target {
                 debug!(target: "reth::cli", %initial_target,  "start backfill sync");
@@ -387,14 +390,19 @@ where
                             }
                             ChainEvent::Handler(ev) => {
                                 if let Some(head) = ev.canonical_header() {
+                                    let total_difficulty = consensus.total_difficulty(head.hash());
+                                    info!(target: "reth::cli", hash=?head.hash(), ?total_difficulty);
                                     let head_block = Head {
                                         number: head.number,
                                         hash: head.hash(),
                                         difficulty: head.difficulty,
                                         timestamp: head.timestamp,
+                                        total_difficulty,
+                                        /*
                                         total_difficulty: chainspec
                                             .final_paris_total_difficulty(head.number)
                                             .unwrap_or_default(),
+                                        */
                                     };
                                     network_handle.update_status(head_block);
                                 }
@@ -417,13 +425,20 @@ where
         } else {
             consensus_client::miner::MiningMode::NoMining
         };
+        let signer_address = if let Some(signer_private_key) = ctx.node_config().dev.consensus_signer_private_key {
+            let eth_signer: PrivateKeySigner = signer_private_key.to_string().parse().unwrap();
+            Some(eth_signer.address())
+        } else {
+            None
+        };
         N42Miner::spawn_new(
             ctx.blockchain_db().clone(),
-            N42PayloadAttributesBuilder::new(ctx.chain_spec()),
+            N42PayloadAttributesBuilder::new_add_signer(ctx.chain_spec(), signer_address),
             beacon_engine_handle_clone,
             mining_mode,
             ctx.components().payload_builder().clone(),
             ctx.components().network().clone(),
+            ctx.consensus(),
         );
 
         let full_node = FullNode {

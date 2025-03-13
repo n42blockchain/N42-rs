@@ -47,7 +47,7 @@ use reth_primitives::{
 };
 use reth_prune_types::{PruneCheckpoint, PruneModes, PruneSegment};
 use reth_stages_types::{StageCheckpoint, StageId};
-use reth_storage_api::{SnapshotProviderWriter, StateProvider, StorageChangeSetReader, TryIntoHistoricalStateProvider};
+use reth_storage_api::{TdProviderWriter, TdProvider, SnapshotProviderWriter, StateProvider, StorageChangeSetReader, TryIntoHistoricalStateProvider};
 use reth_storage_api::SnapshotProvider;
 use n42_primitives::Snapshot;
 use reth_storage_errors::provider::{ProviderResult, RootMismatch};
@@ -2068,6 +2068,18 @@ impl<TX: DbTx, N: NodeTypes<ChainSpec: EthereumHardforks>> RewardsProvider for D
             }
         }
         Ok(None)
+    }
+}
+
+impl<TX: DbTx, N: NodeTypes<ChainSpec: EthereumHardforks>> TdProvider for DatabaseProvider<TX, N>{
+    fn load_td(&self, block_hash: &BlockHash) -> ProviderResult<Option<U256>> {
+        Ok(self.tx.get::<tables::HeaderTotalDifficulties>(block_hash.clone())?.map(|td| td.0))
+    }
+}
+
+impl<TX: DbTxMut, N: NodeTypes<ChainSpec: EthereumHardforks>> TdProviderWriter for DatabaseProvider<TX, N>{
+    fn save_td(&self, block_hash: &BlockHash, td: U256) -> ProviderResult<()> {
+        Ok(self.tx.put::<tables::HeaderTotalDifficulties>(block_hash.clone(), td.into())?)
     }
 }
 

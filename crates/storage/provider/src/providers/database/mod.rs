@@ -634,6 +634,7 @@ mod tests {
         test_utils::{create_test_static_files_dir, ERROR_TEMPDIR},
     };
     use reth_storage_api::{SnapshotProvider, SnapshotProviderWriter};
+    use reth_storage_api::{TdProvider, TdProviderWriter};
     use reth_primitives::StaticFileSegment;
     use reth_prune_types::{PruneMode, PruneModes};
     use reth_storage_errors::provider::ProviderError;

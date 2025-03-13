@@ -22,12 +22,17 @@ use reth_primitives::Withdrawals;
 #[non_exhaustive]
 pub struct N42PayloadAttributesBuilder<ChainSpec> {
     chain_spec: Arc<ChainSpec>,
+    signer_address: Option<Address>,
 }
 
 impl<ChainSpec> N42PayloadAttributesBuilder<ChainSpec> {
     /// Creates a new instance of the builder.
     pub const fn new(chain_spec: Arc<ChainSpec>) -> Self {
-        Self { chain_spec }
+        Self { chain_spec, signer_address: None }
+    }
+
+    pub const fn new_add_signer(chain_spec: Arc<ChainSpec>, signer_address: Option<Address>) -> Self {
+        Self { chain_spec, signer_address }
     }
 }
 
@@ -40,7 +45,7 @@ where
         let inner = EthPayloadAttributes {
             timestamp,
             prev_randao: B256::ZERO,
-            suggested_fee_recipient: Address::ZERO,
+            suggested_fee_recipient: self.signer_address.unwrap_or(Address::ZERO),
             withdrawals: self
                 .chain_spec
                 .is_shanghai_active_at_timestamp(timestamp)

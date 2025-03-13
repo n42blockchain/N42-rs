@@ -49,6 +49,8 @@ pub static N42: LazyLock<Arc<ChainSpec>> = LazyLock::new(|| {
         prune_delete_limit: 0,
     };
     spec.genesis.config.dao_fork_support = true;
+    let state_root = state_root_ref_unhashed(&spec.genesis.alloc);
+    println!("Computed state_root from genesis alloc: state_root={}", state_root);
     spec.into()
 });
 

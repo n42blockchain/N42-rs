@@ -195,7 +195,7 @@ where
         //Analyze the signer and check if they are in the signer list
         let signer = recover_address(header)?;
         if !snap.signers.contains(&signer) {
-            info!(target: "consensus::apos", "err signer not in list: {}", signer);
+            error!(target: "consensus::apos", "err signer not in list: {:?}, signer: {}", snap.signers, signer);
             return Err(AposError::UnauthorizedSigner.into());
         }
         info!(target: "consensus::apos", "recovered address: {}", signer);
@@ -580,8 +580,9 @@ Some(vec![parent.header().clone()]))?;
         info!(target: "consensus::apos", "seal() signer={:?}", signer);
         // Bail out if we're unauthorized to sign a block
         let snap = self.snapshot(header.number - 1, header.parent_hash, None)?;
+        debug!(target: "consensus::apos", "signer list: {:?}, signer: {}", snap.signers, signer);
         if !snap.signers.contains(&signer) {
-            error!(target: "consensus::pos", "err signer not in list: {}", signer);
+            error!(target: "consensus::apos", "err signer not in list: {:?}, signer: {}", snap.signers, signer);
             return Err(ConsensusError::UnauthorizedSigner)
         }
 

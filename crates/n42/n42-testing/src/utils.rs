@@ -9,7 +9,6 @@ pub(crate) fn n42_payload_attributes(timestamp: u64, parent_hash: B256) -> N42Pa
         prev_randao: B256::ZERO,
         suggested_fee_recipient: Address::ZERO,
         withdrawals: None,
-        //parent_beacon_block_root: Some(B256::ZERO),
         parent_beacon_block_root: None,
     };
     N42PayloadBuilderAttributes(EthPayloadBuilderAttributes::new(parent_hash, attributes))

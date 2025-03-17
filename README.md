@@ -197,6 +197,4 @@ For any inquiries or support, please reach out to us via email at [support@n42.w
 ## Acknowledgments
 
 We extend our heartfelt thanks to the Rust community and all the contributors who have made this project a reality.
----
 
-*Happy coding and welcome to the future of decentralized technology with Rust!*

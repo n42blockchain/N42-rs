@@ -32,6 +32,10 @@ use tokio::{
 };
 use tracing::{debug, warn};
 use crate::job::{Cancelled, N42PayloadJob, N42PayloadJobGeneratorConfig, PendingPayload};
+use crate::{
+    minedblock::{MinedblockExtApiServer,MinedblockExt},
+    unverifiedblock::UnverifiedBlock,
+};
 
 /// The [`PayloadJobGenerator`] that creates [`BasicPayloadJob`]s.
 #[derive(Debug)]
@@ -202,6 +206,12 @@ where
                     acc.storage.iter().map(|(key, slot)| (*key, slot.present_value)).collect();
                 cached.insert_account(addr, info, storage);
             }
+        }
+
+        let minedblock_ext = MinedblockExt::instance();
+        let unvalidated_block = UnverifiedBlock::new(new_execution_outcome.first_block,cached.clone());
+        if let Err(err) = minedblock_ext.send_block(unvalidated_block) {
+            warn!(target: "payload_builder", "Failed to send unvalidated block: {:?}", err);
         }
 
         self.pre_cached = Some(PrecachedState { block: committed.tip().hash(), cached });

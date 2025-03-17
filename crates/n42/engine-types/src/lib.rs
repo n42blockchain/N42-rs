@@ -21,6 +21,9 @@ mod metrics;
 mod network;
 mod consensus;
 
+mod unverifiedblock;
+pub mod minedblock;
+
 pub use payload::N42PayloadBuilder;
 pub use payload::N42PayloadServiceBuilder;
 

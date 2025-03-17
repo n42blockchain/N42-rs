@@ -5467,6 +5467,8 @@ dependencies = [
  "eyre",
  "futures-core",
  "futures-util",
+ "jsonrpsee",
+ "lazy_static",
  "metrics",
  "n42-clique",
  "n42-engine-primitives",
@@ -8946,10 +8948,11 @@ dependencies = [
 [[package]]
 name = "reth-revm"
 version = "1.1.1"
-source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.1.1#15c230bac20e2b1b3532c8b0d470e815fbc0cc22"
 dependencies = [
+ "alloy-consensus",
  "alloy-eips",
  "alloy-primitives",
+ "reth-ethereum-forks",
  "reth-execution-errors",
  "reth-primitives",
  "reth-prune-types",
@@ -8957,6 +8960,7 @@ dependencies = [
  "reth-storage-errors",
  "reth-trie",
  "revm",
+ "serde",
 ]
 
 [[package]]

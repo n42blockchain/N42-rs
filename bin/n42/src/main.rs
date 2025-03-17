@@ -24,6 +24,8 @@ use reth_consensus::Consensus;
 use n42_primitives::Snapshot;
 use reth_provider::HeaderProvider;
 
+use n42_engine_types::minedblock::{MinedblockExt,MinedblockExtApiServer};
+
 /// Parameters for configuring the engine
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
 #[command(next_help_heading = "Engine")]
@@ -164,6 +166,10 @@ fn main() {
 
                             // now we merge our extension namespace into all configured transports
                             ctx.auth_module.merge_auth_methods(ext.into_rpc())?;
+
+                            // init minedblock rpc extension
+                            let minedblock_ext=MinedblockExt::instance();
+                            ctx.modules.merge_ws(minedblock_ext.into_rpc())?;
 
                             println!("consensus rpc extension enabled");
 

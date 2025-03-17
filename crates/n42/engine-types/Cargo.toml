@@ -6,6 +6,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+jsonrpsee.workspace = true
+lazy_static.workspace = true
 #n42
 n42-engine-primitives.workspace = true
 n42-clique.workspace = true

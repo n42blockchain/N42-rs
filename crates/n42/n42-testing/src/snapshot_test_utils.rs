@@ -27,7 +27,6 @@ impl TesterAccountPool {
             let secret_key = SecretKey::new(&mut secp256k1::rand::thread_rng());
             self.accounts.insert(account.to_string(), secret_key);
         }
-        // let public_key = PublicKey::from_secret_key(&self.accounts[account]);
         // Initialize secp256k1 context
         let secp = Secp256k1::new();
 

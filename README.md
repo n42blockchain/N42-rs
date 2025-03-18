@@ -2,8 +2,6 @@
 
 [![Rust](https://img.shields.io/badge/rust-1.50%2B-orange.svg)](https://www.rust-lang.org)
 [![GitHub License](https://img.shields.io/github/license/n42blockchain/N42-rs)](https://github.com/n42blockchain/N42-rs/blob/main/LICENSE)
-[![GitHub Issues](https://img.shields.io/github/issues/n42blockchain/N42-rs)](https://github.com/n42blockchain/N42-rs/issues)
-[![GitHub Pull Requests](https://img.shields.io/github/issues-pr/n42blockchain/N42-rs)](https://github.com/n42blockchain/N42-rs/pulls)
 [![GitHub Stars](https://img.shields.io/github/stars/n42blockchain/N42-rs)](https://github.com/n42blockchain/N42-rs/stargazers)
 [![GitHub Forks](https://img.shields.io/github/forks/n42blockchain/N42-rs)](https://github.com/n42blockchain/N42-rs/network/members)
 

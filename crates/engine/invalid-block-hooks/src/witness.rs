@@ -127,8 +127,8 @@ where
 
         // Grab all account proofs for the data accessed during block execution.
         //
-        // Note: We grab *all* accounts in the cache here, as the `BundleState` prunes
-        // referenced accounts + storage slots.
+        // Important: We retrieve all accounts from the cache here because BundleState removes
+        // referenced accounts and storage slots.
         let mut hashed_state = HashedPostState::from_bundle_state(&bundle_state.state);
 
         for (address, account) in db.cache.accounts {

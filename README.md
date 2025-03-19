@@ -60,7 +60,6 @@ By utilizing Rust, the N42 blockchain achieves advanced performance and security
 
 **Forced Migration:** In cases of censorship or downtime, users can forcefully migrate their vaults to another domain, preserving self-custody and maintaining uninterrupted access to their assets.
 
-
 ## Use Cases & Ecosystem
 
 - **Decentralized Finance (DeFi):** By merging the strengths of traditional finance (TradFi) and decentralized finance (DeFi), N42 supports advanced financial applications that enable seamless asset flows, efficient trading, and innovative value creation.
@@ -104,8 +103,6 @@ To run the tests, use the following command:
 ```bash
 cargo test
 ```
-
-I'll help refine the documentation part of the N42 Public Chain GitHub README. Based on the information provided, here's an improved version of the documentation section:
 
 ## Documentation
 
@@ -195,6 +192,3 @@ For any inquiries or support, please reach out to us via email at [support@n42.w
 ## Acknowledgments
 
 We extend our heartfelt thanks to the Rust community and all the contributors who have made this project a reality.
----
-
-*Happy coding and welcome to the future of decentralized technology with Rust!*

@@ -33,7 +33,6 @@ impl TesterAccountPool {
         // Get the corresponding public key
         let secret_key = self.accounts.get(account).unwrap();
         let public_key = PublicKey::from_secret_key(&secp, secret_key);
-        //Address::from_slice(&public_key.serialize()[1..21])
 
     // Serialize the public key in uncompressed format (65 bytes)
     let public_key_uncompressed = public_key.serialize_uncompressed();

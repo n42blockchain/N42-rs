@@ -1,6 +1,7 @@
 # N42 Public Chain
 
 [![Rust](https://img.shields.io/badge/rust-1.50%2B-orange.svg)](https://www.rust-lang.org)
+[![GitHub Actions](https://github.com/n42blockchain/N42-rs/actions/workflows/devskim.yml/badge.svg)](https://github.com/n42blockchain/N42-rs/actions/workflows/devskim.yml)
 [![GitHub License](https://img.shields.io/github/license/n42blockchain/N42-rs)](https://github.com/n42blockchain/N42-rs/blob/main/LICENSE)
 [![GitHub Stars](https://img.shields.io/github/stars/n42blockchain/N42-rs)](https://github.com/n42blockchain/N42-rs/stargazers)
 [![GitHub Forks](https://img.shields.io/github/forks/n42blockchain/N42-rs)](https://github.com/n42blockchain/N42-rs/network/members)

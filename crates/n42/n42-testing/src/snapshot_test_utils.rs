@@ -5,7 +5,7 @@ use secp256k1::rand::rngs::OsRng;
 use reth_primitives::{Header};
 use std::str::FromStr;
 use std::collections::HashMap;
-use reth_network::{config::SecretKey};
+use reth_network::config::SecretKey;
 
 pub struct TesterAccountPool {
    pub accounts: HashMap<String, SecretKey>,

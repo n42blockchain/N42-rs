@@ -3,8 +3,6 @@
 [![Rust](https://img.shields.io/badge/rust-1.50%2B-orange.svg)](https://www.rust-lang.org)
 [![GitHub Actions](https://github.com/n42blockchain/N42-rs/actions/workflows/devskim.yml/badge.svg)](https://github.com/n42blockchain/N42-rs/actions/workflows/devskim.yml)
 [![GitHub License](https://img.shields.io/github/license/n42blockchain/N42-rs)](https://github.com/n42blockchain/N42-rs/blob/main/LICENSE)
-[![GitHub Issues](https://img.shields.io/github/issues/n42blockchain/N42-rs)](https://github.com/n42blockchain/N42-rs/issues)
-[![GitHub Pull Requests](https://img.shields.io/github/issues-pr/n42blockchain/N42-rs)](https://github.com/n42blockchain/N42-rs/pulls)
 [![GitHub Stars](https://img.shields.io/github/stars/n42blockchain/N42-rs)](https://github.com/n42blockchain/N42-rs/stargazers)
 [![GitHub Forks](https://img.shields.io/github/forks/n42blockchain/N42-rs)](https://github.com/n42blockchain/N42-rs/network/members)
 
@@ -32,6 +30,8 @@ By utilizing Rust, the N42 blockchain achieves advanced performance and security
   - Multi-language development support
   - Ultra-low transaction latency (≤1ms)
   - Optimized network bandwidth utilization for reduced operational costs
+
+- **Customizability**: Supports any programming language, ultra-low transaction latencies (as low as 1 millisecond), and flexible network bandwidth usage to keep operational costs low.
 
 - **Unlimited Scalability:** Horizontal scaling through additional computing nodes, complemented by parallel transaction processing powered by our CRDT-based state model architecture.
 
@@ -196,6 +196,4 @@ For any inquiries or support, please reach out to us via email at [support@n42.w
 ## Acknowledgments
 
 We extend our heartfelt thanks to the Rust community and all the contributors who have made this project a reality.
----
 
-*Happy coding and welcome to the future of decentralized technology with Rust!*

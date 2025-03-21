@@ -176,7 +176,7 @@ Contributions are welcome! Please refer to our CONTRIBUTING.md for guidelines on
 
 ### Contribution Process
 
-We're excited to welcome contributions to the Rust Blockchain Project! To get started, please follow these steps:
+We're excited to welcome contributions! To get started, please follow the following steps:
 
 1. Fork the repository.
 2. Create a new branch for your feature or bug fix.
@@ -196,4 +196,3 @@ For any inquiries or support, please reach out to us via email at [support@n42.w
 ## Acknowledgments
 
 We extend our heartfelt thanks to the Rust community and all the contributors who have made this project a reality.
-

@@ -205,7 +205,7 @@ where
             if *recent == signer {
                 //If the signer is in the recent list, ensure that the current block can be removed
                 let limit = (snap.signers.len() as u64 / 2) + 1;
-                if *seen > header.number - limit {
+                if header.number < limit || *seen > header.number - limit {
                     return Err(AposError::RecentlySigned.into());
                 }
             }

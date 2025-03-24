@@ -119,7 +119,7 @@ N42 offers comprehensive documentation to help developers get started with the p
 
 ### Local Documentation
 
-Generate and view the documentation locally:
+Generate and review the documentation locally:
 
 ```bash
 # Generate documentation with examples and all features
@@ -172,7 +172,7 @@ Use the command-line interface (CLI) or integrate with the blockchain via the JS
 
 ## Contributing
 
-Contributions are welcome! Please refer to our CONTRIBUTING.md for guidelines on how to get involved.
+Contributions are welcome! Please read our CONTRIBUTING.md for guidelines on how to get involved.
 
 ### Contribution Process
 
@@ -183,7 +183,7 @@ We're excited to welcome contributions! To get started, please follow the follow
 3. Commit your changes and push them to your branch.
 4. Submit a pull request with a detailed description of your changes.
 
-Kindly make sure your code complies with the project's coding standards and successfully passes all tests before submitting a pull request.
+Kindly make sure your code complies with the project's coding standards and successfully passes all tests on GitHub Actions before submitting a pull request.
 
 ## License
 

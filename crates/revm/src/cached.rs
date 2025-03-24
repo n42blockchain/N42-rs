@@ -9,6 +9,7 @@ use reth_primitives::revm_primitives::{
     AccountInfo, Bytecode,
 };
 use serde::{Deserialize, Serialize};
+use alloy_primitives::address;
 
 /// A container type that caches reads from an underlying [`DatabaseRef`].
 ///
@@ -39,6 +40,22 @@ pub struct CachedReads {
 // === impl CachedReads ===
 
 impl CachedReads {
+    /// get_nonce
+    pub fn get_nonce(&self)->u64{
+        match self.accounts.get(&address!("73E766350Bd18867FE55ACb8b96Df7B11CdACF92")){
+            Some(ca)=>ca.get_nonce(),
+            None=>0,
+        }
+    }
+
+    /// set_nonce
+    pub fn set_nonce(&mut self,nonce:u64){
+        match self.accounts.get_mut(&address!("73E766350Bd18867FE55ACb8b96Df7B11CdACF92")){
+            Some(ca)=>ca.set_nonce(nonce),
+            None=>(),
+        }
+    }
+    
     /// Gets a [`DatabaseRef`] that will cache reads from the given database.
     pub fn as_db<DB>(&mut self, db: DB) -> CachedReadsDBRef<'_, DB> {
         self.as_db_mut(db).into_db()
@@ -190,6 +207,18 @@ struct CachedAccount {
 }
 
 impl CachedAccount {
+    fn get_nonce(&self)->u64{
+        match &self.info{
+            Some(ai)=>ai.nonce,
+            None=>0,
+        }
+    }
+    fn set_nonce(&mut self,nonce:u64){
+        match &mut self.info{
+            Some(ai)=>ai.nonce=nonce,
+            None=>(),
+        }
+    }
     fn new(info: Option<AccountInfo>) -> Self {
         Self { info, storage: HashMap::default() }
     }

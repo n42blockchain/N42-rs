@@ -1,17 +1,20 @@
 #![allow(missing_docs)]
-use reth_revm::{
-    test_utils::StateProviderTest,
-    database::StateProviderDatabase,
-    db::State,
+use n42_engine_types::unverifiedblock::UnverifiedBlock;
+use jsonrpsee::{
+    tokio,
+    ws_client::WsClientBuilder,
 };
-use android_logger::Config;
-use log::Level;
-use jni::objects::{JObject, JString};
-use jni::sys::{jstring, jlong};
-use jni::{JNIEnv};
+use reth_revm::{database::StateProviderDatabase, db::State};
 use std::sync::Arc;
+use lazy_static::lazy_static;
+use n42_engine_types::minedblock::{MinedblockExt,MinedblockExtApiClient,};
+use reth_provider::test_utils::MockEthProvider;
+lazy_static! {
+    static ref MINEDBLOCK_INSTANCE: Arc<MinedblockExt> = Arc::new(MinedblockExt::new());
+}
+use std::vec;
 use reth_chainspec::{
-    ChainSpec, ChainSpecBuilder, EthereumHardfork, EthereumHardforks, ForkCondition, MAINNET, MIN_TRANSACTION_GAS
+    ChainSpec, ChainSpecBuilder, EthereumHardfork, EthereumHardforks, ForkCondition, MAINNET,N42,
 };
 use reth_evm::{
     execute::{
@@ -22,25 +25,23 @@ use reth_evm::{
 };
 use reth_evm_ethereum::{
     EthEvmConfig,
-    eip6110,
     dao_fork::{
         DAO_HARDKFORK_ACCOUNTS,
         DAO_HARDFORK_BENEFICIARY,
     },
 };
-use alloy_consensus::{Header, Transaction as _, TxEip1559};
+use alloy_consensus::{Header, Transaction as _};
 use revm_primitives::{
     db::{Database,DatabaseCommit}, BlockEnv, CfgEnvWithHandlerCfg, EnvWithHandlerCfg, ResultAndState, B256, U256,
 };
 use core::fmt::Display;
 use reth_primitives::{
-    Block, BlockBody, BlockWithSenders, Receipt, TransactionSigned,Transaction,
+    Block, BlockWithSenders, Receipt, 
 };
 use alloy_eips::eip7685::Requests;
 use reth_consensus::ConsensusError;
 use reth_ethereum_consensus::validate_block_post_execution;
-use alloy_primitives::{Address,Signature,address,hex,Uint};
-
+use alloy_primitives::address;
 
 /// Block execution strategy for Ethereum.
 #[allow(missing_debug_implementations)]
@@ -57,8 +58,6 @@ where
     /// Utility to call system smart contracts.
     system_caller: SystemCaller<EvmConfig, ChainSpec>,
 }
-
-
 
 impl<DB, EvmConfig> EthExecutionStrategy<DB, EvmConfig>
 where
@@ -142,6 +141,7 @@ where
             }
 
             self.evm_config.fill_tx_env(evm.tx_mut(), transaction, *sender);
+            // evm.context
 
             // Execute transaction.
             let result_and_state = evm.transact().map_err(move |err| {
@@ -189,7 +189,7 @@ where
         let requests = if self.chain_spec.is_prague_active_at_timestamp(block.timestamp) {
             // Collect all EIP-6110 deposits
             let deposit_requests =
-                crate::eip6110::parse_deposits_from_receipts(&self.chain_spec, receipts)?;
+            reth_evm_ethereum::eip6110::parse_deposits_from_receipts(&self.chain_spec, receipts)?;
 
             let mut requests = Requests::new(vec![deposit_requests]);
             requests.extend(self.system_caller.apply_post_execution_changes(&mut evm)?);
@@ -246,8 +246,6 @@ where
 }
 
 
-
-
 /// Factory for [`EthExecutionStrategy`].
 #[derive(Debug, Clone)]
 pub struct EthExecutionStrategyFactory<EvmConfig = EthEvmConfig> {
@@ -294,105 +292,96 @@ where
     }
 }
 
-
 fn executor_provider(
     chain_spec: Arc<ChainSpec>,
 ) -> BasicBlockExecutorProvider<EthExecutionStrategyFactory> {
     let strategy_factory =
-        EthExecutionStrategyFactory::new(chain_spec.clone(), EthEvmConfig::new(chain_spec));
+        EthExecutionStrategyFactory::new(chain_spec.clone(),
+         EthEvmConfig::new(chain_spec));
 
     BasicBlockExecutorProvider::new(strategy_factory)
 }
-#[no_mangle]
-// pub extern "C" fn Java_com_example_rustlibrary_LyTest_lyFunction(
-//     env: JNIEnv<'_>,
-//     _: JObject<'_>,
-// ) -> jstring {
-//     let output = "Hello from Rust";
-    
-//     // 创建 Java 字符串
-//     match env.new_string(output) {
-//         Ok(java_str) => {
-//             // 正确转换 JString 到 jstring
-//             java_str.into_raw()
-//         }
-//         Err(_) => {
-//             // 返回空指针给 Java
-//             std::ptr::null_mut()
-//         }
-//     }
-// }
-
-#[no_mangle]
-// pub extern "C" fn Java_com_example_rustlibrary_LyTest_evmTest(mut env: JNIEnv<'_>, value_origin: jlong) {
-pub extern "C" fn evmTest(value_origin: u64) {
-
-    android_logger::init_once(Config::default().with_tag("rustdemo"));
-    log::set_max_level(log::LevelFilter::Debug);
-    
-    log::debug!("Hello from Rust");
-    log::debug!("value_origin:{}", value_origin);
-    //convert to u64
-    // let value_u64: u64 = value_origin as u64;
-    // let value=value_u64-140731582808552u64;
-    let value=value_origin;
-    // log::debug!("Converted value_origin to u64: {}", value);
-    // Uint<256, 4>
-    let wei_per_eth=1000000000000000000u64;
-    let mut db: StateProviderTest = StateProviderTest::default();
+fn verify(mut unverifiedblock:UnverifiedBlock){
+    let nonce1=unverifiedblock.db.get_nonce();
+    println!("nonce1:{}",nonce1);
+    if nonce1>0{
+        unverifiedblock.db.set_nonce(nonce1-1);
+    }
+    let nonce2=unverifiedblock.db.get_nonce();
+    println!("nonce2:{}",nonce2);
+    let provider_1=MockEthProvider::default();
+    let state=StateProviderDatabase::new(provider_1);
+    let mut db=State::builder().with_database(
+        unverifiedblock.db.as_db_mut(state)).with_bundle_update().build();
     let chain_spec = Arc::new(
-        ChainSpecBuilder::from(&*MAINNET)
+        ChainSpecBuilder::from(&*N42)
             .shanghai_activated()
-            .with_fork(EthereumHardfork::Cancun, ForkCondition::Timestamp(1))
+            .with_fork(
+                EthereumHardfork::Cancun, 
+                ForkCondition::Timestamp(1))
             .build(),
     );
-    let addr = address!("9b2AFf4ecC9f1e0c3813679B9079Af9836F1852a");
-    let tx=TransactionSigned::from_transaction_and_signature(Transaction::Eip1559(TxEip1559{
-        chain_id:chain_spec.chain.id(),
-        nonce:0,
-        gas_limit:MIN_TRANSACTION_GAS,
-        to:addr.into(),
-        value:U256::from(value)*U256::from(wei_per_eth),
-        // value:U256::ZERO,
-        ..Default::default()
-    }), Signature::test_signature(),);
+    let addr = address!("73E766350Bd18867FE55ACb8b96Df7B11CdACF92");
     let provider=executor_provider(chain_spec);
-    let mut executor = provider.batch_executor(StateProviderDatabase::new(&db));
-    let mut header=Header{timestamp:1,number:1,excess_blob_gas:Some(0),gas_limit:5000000,gas_used:21000,
-        // receipts_root:B256::from_slice(&hex::decode("f78dfb743fbd92ade140711c8bbc542b5e307f0ab7984eff35d751969fe57efa").unwrap()),
-        ..Header::default()};
+    let mut executor = provider.batch_executor(db);
+    let mut header=Header{gas_limit:21000,gas_used:21000,..Header::default()};
     header.parent_beacon_block_root=Some(B256::with_last_byte(0x69));
     match executor.execute_and_verify_one((
         &BlockWithSenders {
             block: Block {
                 header: header.clone(),
-                body: BlockBody {
-                    transactions: vec![tx],
-                    ..Default::default()
-                },
+                body: unverifiedblock.blockbody,
             },
             senders: vec![addr],
         },
-        U256::ZERO,
+        unverifiedblock.td,
     ).into()) {
-        Ok(_) => println!(""),
-        Err(e) =>println!("Error during execution: {:?}", e),
+        Ok(_) => println!("success"),
+        Err(e) => println!("Error during execution: {:?}", e),
         // println!("Error during execution: {:?}", e),
     }
-    log::debug!("success1");
     let temp=executor.finalize();
     let receipts=temp.receipts();
     if !receipts.receipt_vec.is_empty() && !receipts.receipt_vec[0].is_empty() {
         let txreceipt = receipts.receipt_vec[0][0].as_ref().unwrap();
         println!("{:?}", txreceipt);
-        log::debug!("success2");
-        log::debug!("{:?}", txreceipt);
     } else {
         println!("No receipts found");
-        log::debug!("success3");
     }
-    log::debug!("success4");
 }
-fn main(){
-    // Java_com_example_rustdemo_LyTest_evmTest(0);
+fn main() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let ws_url = "ws://127.0.0.1:8546".to_string();
+        println!("linking to the server: {}", ws_url);
+
+        let client = WsClientBuilder::default()
+            .build(&ws_url)
+            .await
+            .expect("failed to connect to the server");
+        println!("successfully connected to the server");
+
+        let mut subscription = MinedblockExtApiClient::subscribe_minedblock(&client)
+            .await
+            .expect("failed to subscribe to block data");
+        println!("successfully subscribed to block data");
+
+        println!("listening to the block data...");
+        loop {
+            println!("waiting for new block...");
+            match subscription.next().await {
+                Some(Ok(block)) => {
+                    println!("the new block: {:?}", block);
+                    verify(block);
+                }
+                Some(Err(e)) => {
+                    println!("failed to receive the new block data: {:?}", e);
+                }
+                None => {
+                    println!("link been cut");
+                    break;
+                }
+            }
+        }
+    });
 }

@@ -11,6 +11,10 @@ exclude.workspace = true
 
 
 [dependencies]
+reth-provider.workspace = true
+lazy_static.workspace = true
+jsonrpsee.workspace = true
+n42-engine-types.workspace = true
 # mobile.workspace = true
 jni = "0.21.1"
 ethers="2.0.14"

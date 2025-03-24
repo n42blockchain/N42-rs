@@ -167,9 +167,12 @@ fn main() {
                             // now we merge our extension namespace into all configured transports
                             ctx.auth_module.merge_auth_methods(ext.into_rpc())?;
 
-                            // init minedblock rpc extension
-                            let minedblock_ext=MinedblockExt::instance();
-                            ctx.modules.merge_ws(minedblock_ext.into_rpc())?;
+                            let minedblock_ext = MinedblockExt::instance();
+                            if let Ok(mut minedblock) = minedblock_ext.try_lock() {
+                                ctx.modules.merge_ws(<MinedblockExt as Clone>::clone(&minedblock).into_rpc())?;
+                            } else {
+                                println!("linyangerror");
+                            } 
 
                             println!("consensus rpc extension enabled");
 

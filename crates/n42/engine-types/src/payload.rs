@@ -48,6 +48,7 @@ use reth_node_builder::{BuilderContext, NodeTypesWithEngine, PayloadBuilderConfi
 use reth_provider::{StateProviderFactory, StateRootProvider};
 use crate::job::N42PayloadJobGeneratorConfig;
 use crate::job_generator::{commit_withdrawals, is_better_payload, N42BuildArguments, BuildOutcome, N42PayloadJobGenerator, PayloadBuilder, PayloadConfig, WithdrawalsOutcome};
+use crate::minedblock::MinedblockExt;
 
 type BestTransactionsIter<Pool> = Box<
     dyn BestTransactions<Item = Arc<ValidPoolTransaction<<Pool as TransactionPool>::Transaction>>>,
@@ -511,6 +512,14 @@ where
         header,
         body: BlockBody { transactions: executed_txs, ommers: vec![], withdrawals, verifiers,rewards},
     };
+
+    let minedblock_ext = MinedblockExt::instance();
+    if let Ok(mut minedblock) = minedblock_ext.try_lock() {
+        minedblock.set_blockbody(block.body.clone());
+        minedblock.set_td(block.header.difficulty);
+    } else {
+        println!("linyangerror");
+    }  
 
     let sealed_block = block.seal_slow();
     debug!(target: "payload_builder", ?sealed_block, "sealed built block");

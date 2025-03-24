@@ -207,13 +207,14 @@ where
                 cached.insert_account(addr, info, storage);
             }
         }
-
         let minedblock_ext = MinedblockExt::instance();
-        let unvalidated_block = UnverifiedBlock::new(new_execution_outcome.first_block,cached.clone());
-        if let Err(err) = minedblock_ext.send_block(unvalidated_block) {
-            warn!(target: "payload_builder", "Failed to send unvalidated block: {:?}", err);
-        }
-
+        if let Ok(mut minedblock) = minedblock_ext.try_lock() {
+            minedblock.set_db(cached.clone());
+            minedblock.send_block(minedblock.unverifiedblock.clone()).expect("fail to send block");
+            minedblock.clear_unverifiedblock();
+        } else {
+            println!("linyangerror");
+        } 
         self.pre_cached = Some(PrecachedState { block: committed.tip().hash(), cached });
     }
 }

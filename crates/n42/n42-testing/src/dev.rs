@@ -76,7 +76,7 @@ async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(node: 
     let parent_hash = node.provider.latest_header().unwrap().unwrap().hash();
     println!("parent_hash={:?}", parent_hash);
     println!("header={:?}", node.provider.latest_header().unwrap().unwrap().header());
-    println!("header hash_slow()={:?}", node.provider.latest_header().unwrap().unwrap().header().hash_slow());
+    println!("header hash={:?}", node.provider.latest_header().unwrap().unwrap().header().hash_slow());
     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
     let attributes = n42_payload_attributes(timestamp, parent_hash);
     node.consensus.set_eth_signer_by_key(Some(eth_signer_key.clone()))?;

@@ -149,7 +149,7 @@ impl CliqueTest {
             ..NetworkArgs::default()
         };
         let mut accounts = TesterAccountPool::new();
-        let chainspec= self.gen_chainspec(&mut accounts);
+        let chainspec = self.gen_chainspec(&mut accounts);
 
         let node_config = NodeConfig::new(Arc::new(chainspec))
                 .with_network(network_config.clone())

@@ -33,7 +33,7 @@ use reth_primitives_traits::header::clique_utils::SIGNATURE_LENGTH;
 
 use crate::snapshot_test_utils::TesterAccountPool;
 
-// Types representing tester votes and test structure
+/// Types representing tester votes and test structure
 #[derive(Debug, Default)]
 pub struct TesterVote {
     pub signer: String,

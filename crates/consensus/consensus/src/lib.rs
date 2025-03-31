@@ -20,6 +20,7 @@ use reth_primitives::{
 };
 use n42_primitives::Snapshot;
 use std::collections::HashMap;
+use std::time::Duration;
 
 /// A consensus implementation that does nothing.
 pub mod noop;
@@ -181,6 +182,15 @@ pub trait Consensus: Debug + Send + Sync {
         hash: B256,
     ) -> U256 {
         U256::from(0)
+    }
+
+    fn wiggle(
+        &self,
+        parent_number: u64,
+        parent_hash: BlockHash,
+        difficulty: U256,
+    ) -> Duration {
+        Duration::from_secs(0)
     }
 }
 

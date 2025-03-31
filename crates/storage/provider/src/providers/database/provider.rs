@@ -2090,6 +2090,10 @@ impl<TX: DbTx, N: NodeTypes<ChainSpec: EthereumHardforks>> SnapshotProvider for 
         }
         Ok(None)
     }
+
+    fn load_snapshot_by_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<Snapshot>> {
+        Ok(self.tx.get::<tables::SnapshotsByHash>(block_hash.clone())?)
+    }
 }
 
 
@@ -2097,6 +2101,14 @@ impl<TX: DbTxMut, N: NodeTypes<ChainSpec: EthereumHardforks>> SnapshotProviderWr
     fn save_snapshot(&self, number: BlockNumber, snapshot: Snapshot) -> ProviderResult<bool> {
         self.tx.put::<tables::Snapshots>(number, snapshot)?;
         Ok(true)
+    }
+
+    fn save_snapshot_by_hash(&self, block_hash: &BlockHash,  snapshot: Snapshot) -> ProviderResult<()> {
+        Ok(self.tx.put::<tables::SnapshotsByHash>(block_hash.clone(), snapshot)?)
+    }
+
+    fn save_signer_by_hash(&self, block_hash: &BlockHash,  signer: Address) -> ProviderResult<()> {
+        Ok(self.tx.put::<tables::SignersByHash>(block_hash.clone(), signer)?)
     }
 }
 

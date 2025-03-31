@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::thread;
-use alloy_primitives::{U256, hex, Bloom, BlockNumber, keccak256, B64, B256, Address, Bytes, FixedBytes};
+use alloy_primitives::{U256, hex, Bloom, BlockNumber, BlockHash, keccak256, B64, B256, Address, Bytes, FixedBytes};
 use alloy_rlp::{length_of_length, Encodable};
 use bytes::{BufMut, BytesMut};
 use itertools::Itertools;
@@ -44,10 +44,7 @@ pub const NONCE_DROP_VOTE: [u8; 8] = hex!("0000000000000000"); // Magic nonce nu
 // Difficulty constants
 pub const DIFF_IN_TURN: U256 = U256::from_limbs([2u64, 0, 0, 0]);  // Block difficulty for in-turn signatures
 pub const DIFF_NO_TURN: U256 = U256::from_limbs([1u64, 0, 0, 0]);  // Block difficulty for out-of-turn signatures
-
 pub const FULL_IMMUTABILITY_THRESHOLD: usize= 90000;
-
-
 
 #[derive(Debug, Clone)]
 pub enum AposError {
@@ -199,6 +196,7 @@ where
             return Err(AposError::UnauthorizedSigner.into());
         }
         info!(target: "consensus::apos", "recovered address: {}", signer);
+        self.provider.save_signer_by_hash(&header.hash_slow(), signer.clone()).map_err(|_| ConsensusError::UnknownBlock)?;
 
        //Check the list of recent signatories
         for (seen, recent) in &snap.recents {
@@ -281,10 +279,7 @@ where
     //     self.sign_fn = Some(sign_fn);
     // }
 
-    // CalcDifficulty is the difficulty adjustment algorithm. It returns the difficulty
-// that a new block should have:
-// * DIFF_NOTURN(2) if BLOCK_NUMBER % SIGNER_COUNT != SIGNER_INDEX
-// * DIFF_INTURN(1) if BLOCK_NUMBER % SIGNER_COUNT == SIGNER_INDEX
+    // CalcDifficulty is the difficulty adjustment algorithm. It returns the difficulty that a new block should have:
     pub fn calc_difficulty(
         &mut self,
         parent: Header,          // assuming IHeader is a trait
@@ -596,24 +591,6 @@ Some(vec![parent.header().clone()]))?;
             }
         }
 
-        // Sweet, the protocol permits us to sign the block, wait for our time
-        let delay = std::cmp::max(
-            UNIX_EPOCH + Duration::from_secs(header.timestamp),
-            SystemTime::now() + Duration::from_secs(MERGE_SIGN_MIN_TIME),
-            )
-            .duration_since(SystemTime::now())
-            .unwrap_or(Duration::from_secs(0));
-        let mut delay_with_wiggle = delay;
-        if header.difficulty == DIFF_NO_TURN {
-            let wiggle = Duration::from_millis((snap.signers.len() as u64 / 2 + 1) * WIGGLE_TIME.as_millis() as u64);
-            delay_with_wiggle = delay + Duration::from_millis(rand::random::<u64>() % wiggle.as_millis() as u64);
-
-            info!(target: "consensus::apos",
-                "wiggle {:?}, time {:?}, number {}",
-                wiggle, delay_with_wiggle, header.number
-            );
-        }
-
         // // Beijing hard fork logic (if applicable)
         // if self.chain_spec.is_beijing_active_at_block(block.number) 
         //
@@ -625,16 +602,9 @@ Some(vec![parent.header().clone()]))?;
         let header_bytes = seal_hash(header);
         let sighash = eth_signer.sign_hash_sync(&header_bytes).map_err(|_| ConsensusError::SignHeaderError)?;
 
-
         let mut extra_data_mut = BytesMut::from(&header.extra_data[..]);
         extra_data_mut[header.extra_data.len().saturating_sub(SIGNATURE_LENGTH)..].copy_from_slice(&sighash.as_bytes());
         header.extra_data = Bytes::from(extra_data_mut.freeze());
-
-        // Wait until sealing is terminated or delay timeout
-        info!(target: "consensus::apos", "Waiting for slot to sign and propagate, delay: {:?}", delay);
-        //
-        // thread::sleep(delay);
-        //tokio::time::sleep(delay_with_wiggle);
 
         self.save_total_difficulty(header);
 
@@ -675,7 +645,7 @@ Some(vec![parent.header().clone()]))?;
 
             // Attempt to obtain a snapshot from the disk
             if number != 0 && number % CHECKPOINT_INTERVAL == 0 {
-                if let Ok(Some(s)) = self.provider.load_snapshot(number.into()) {
+                if let Ok(Some(s)) = self.provider.load_snapshot_by_hash(&hash) {
                     snap = Some(s);
                     break;
                 } else {
@@ -709,7 +679,7 @@ Some(vec![parent.header().clone()]))?;
                    
                     let s = Snapshot::new_snapshot(self.config.clone(), number, hash, signers);
                     // todo
-                    self.provider.save_snapshot(number, s.clone()).map_err(|_| ConsensusError::UnknownBlock)?;
+                    self.provider.save_snapshot_by_hash(&hash, s.clone()).map_err(|_| ConsensusError::UnknownBlock)?;
                     snap = Option::from(s);
 
                     info!(target: "consensus::apos",
@@ -765,7 +735,7 @@ Some(vec![parent.header().clone()]))?;
 
         ///If a new checkpoint snapshot is generated, save it to disk
         if snap.number % CHECKPOINT_INTERVAL == 0 && headers_len > 0 {
-            self.provider.save_snapshot(snap.number, snap.clone()).map_err(|_|ConsensusError::SaveSnapshotError)?;
+            self.provider.save_snapshot_by_hash(&snap.hash, snap.clone()).map_err(|_|ConsensusError::SaveSnapshotError)?;
             debug!(
                 "Stored voting snapshot to disk, number: {}, hash: {}",
                 snap.number,
@@ -817,5 +787,22 @@ Some(vec![parent.header().clone()]))?;
         };
         info!(target: "consensus::apos", ?hash, ?total_difficulty, "get total_difficulty");
         total_difficulty
+    }
+
+    fn wiggle(
+        &self,
+        parent_number: u64,
+        parent_hash: BlockHash,
+        difficulty: U256,
+    ) -> Duration {
+        let mut wiggle = Duration::from_millis(0);
+        if let Ok(snapshot) = self.snapshot(parent_number, parent_hash, None) {
+            // https://eips.ethereum.org/EIPS/eip-225
+            // If the signer is out-of-turn, delay signing by rand(SIGNER_COUNT * 500ms)
+            if difficulty != DIFF_IN_TURN {
+                wiggle = Duration::from_millis((rand::random::<f64>() * snapshot.signers.len() as f64 * WIGGLE_TIME.as_millis() as f64) as u64)
+            }
+        }
+        wiggle
     }
 }

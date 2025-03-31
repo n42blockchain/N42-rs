@@ -34,10 +34,12 @@ reth-tokio-util.workspace = true
 reth-node-types.workspace = true
 reth-node-api.workspace = true
 reth-network-p2p.workspace = true
+reth-primitives-traits.workspace = true
 
 # alloy
 alloy-primitives.workspace = true
 alloy-rpc-types-engine.workspace = true
+alloy-eips.workspace = true
 
 # async
 tokio.workspace = true
@@ -47,6 +49,8 @@ futures-util.workspace = true
 # misc
 eyre.workspace = true
 tracing.workspace = true
+schnellru.workspace = true
+itertools.workspace = true
 
 op-alloy-rpc-types-engine = { workspace = true, optional = true }
 

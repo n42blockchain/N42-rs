@@ -1,7 +1,7 @@
 //! Engine node related functionality.
 
 use futures::{future::Either, stream, stream_select, StreamExt};
-use alloy_primitives::Address;
+use alloy_primitives::{Address, U256};
 use alloy_signer_local::PrivateKeySigner;
 use reth_beacon_consensus::{
     hooks::{EngineHooks, StaticFileHook},
@@ -34,6 +34,7 @@ use reth_node_events::{cl::ConsensusLayerHealthEvents, node};
 use reth_payload_primitives::PayloadBuilder;
 use reth_primitives::EthereumHardforks;
 use reth_provider::providers::{BlockchainProvider2, ProviderNodeTypes};
+use reth_provider::BlockReaderIdExt;
 use reth_tasks::TaskExecutor;
 use reth_tokio_util::EventSender;
 use reth_tracing::tracing::{debug, error, info};
@@ -347,6 +348,7 @@ where
 
         info!(target: "reth::cli", "Starting consensus engine");
         let consensus = ctx.consensus().clone();
+        let provider = ctx.node_adapter().provider.clone();
         ctx.task_executor().spawn_critical("consensus engine", async move {
             if let Some(initial_target) = initial_target {
                 debug!(target: "reth::cli", %initial_target,  "start backfill sync");
@@ -390,21 +392,19 @@ where
                             }
                             ChainEvent::Handler(ev) => {
                                 if let Some(head) = ev.canonical_header() {
-                                    let total_difficulty = consensus.total_difficulty(head.hash());
-                                    info!(target: "reth::cli", hash=?head.hash(), ?total_difficulty);
-                                    let head_block = Head {
-                                        number: head.number,
-                                        hash: head.hash(),
-                                        difficulty: head.difficulty,
-                                        timestamp: head.timestamp,
-                                        total_difficulty,
-                                        /*
-                                        total_difficulty: chainspec
-                                            .final_paris_total_difficulty(head.number)
-                                            .unwrap_or_default(),
-                                        */
-                                    };
-                                    network_handle.update_status(head_block);
+                                    if let Ok(Some(finalized_header)) = provider.finalized_header() {
+
+                    let finalized_td = consensus.total_difficulty(finalized_header.hash());
+                    info!(target: "reth::cli", hash=?finalized_header.hash(), ?finalized_td);
+                    let finalized_block = Head {
+                        number: finalized_header.number,
+                        hash: finalized_header.hash(),
+                        difficulty: finalized_header.difficulty,
+                        timestamp: finalized_header.timestamp,
+                        total_difficulty: finalized_td,
+                    };
+                    network_handle.update_status(finalized_block);
+                                    }
                                 }
                                 event_sender.notify(ev);
                             }

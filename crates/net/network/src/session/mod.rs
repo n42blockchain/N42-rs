@@ -13,6 +13,7 @@ pub use handle::{
 };
 
 pub use reth_network_api::{Direction, PeerInfo};
+use alloy_primitives::BlockHash;
 
 use std::{
     collections::HashMap,

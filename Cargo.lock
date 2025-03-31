@@ -1964,10 +1964,12 @@ dependencies = [
 name = "consensus-client"
 version = "1.1.1"
 dependencies = [
+ "alloy-eips",
  "alloy-primitives",
  "alloy-rpc-types-engine",
  "eyre",
  "futures-util",
+ "itertools 0.13.0",
  "op-alloy-rpc-types-engine",
  "reth-beacon-consensus",
  "reth-chainspec",
@@ -1987,12 +1989,14 @@ dependencies = [
  "reth-payload-primitives",
  "reth-payload-validator",
  "reth-primitives",
+ "reth-primitives-traits",
  "reth-provider",
  "reth-prune",
  "reth-rpc-types-compat",
  "reth-stages-api",
  "reth-tokio-util",
  "reth-transaction-pool",
+ "schnellru",
  "tokio",
  "tokio-stream",
  "tracing",

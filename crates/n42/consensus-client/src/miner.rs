@@ -108,8 +108,6 @@ pub struct N42Miner<EngineT: EngineTypes, Provider, B, Network> {
     payload_builder: PayloadBuilderHandle<EngineT>,
     /// full network  for announce block
     network: Network,
-    new_block_event_stream: EventStream<NewBlock>,
-    network_event_stream: EventStream<NetworkEvent>,
     consensus: Arc<dyn Consensus>,
     recent_blocks: schnellru::LruMap<B256, SealedBlock>,
     recent_num_to_td: schnellru::LruMap<u64, U256>,
@@ -127,7 +125,8 @@ pub struct N42Miner<EngineT: EngineTypes, Provider, B, Network> {
 const INMEMORY_BLOCKS: u32 = 256;
 const NUM_NUM_TO_TD: u32 = 256;
 const WAIT_FOR_PEERS_INTERVAL_SECS: u64 = 5;
-const WAIT_FOR_DOWNLOAD_INTERVAL_SECS: u64 = 5;
+const WAIT_FOR_DOWNLOAD_INTERVAL_MS: u64 = 100;
+const SYNC_DOWNLOAD_BLOCKS_UNIT: u64 = 512;
 
 impl<EngineT, Provider, B, Network> N42Miner<EngineT, Provider, B, Network>
 where
@@ -149,8 +148,6 @@ where
         let latest_header =
             provider.sealed_header(provider.best_block_number().unwrap()).unwrap().unwrap();
 
-        let new_block_event_stream = network.subscribe_block();
-        let network_event_stream = network.event_listener();
         let (new_block_tx, new_block_rx) = mpsc::channel::<(NewBlock, BlockHash)>(128);
         let mut miner = Self {
             provider,
@@ -159,8 +156,6 @@ where
             mode,
             payload_builder,
             network,
-            new_block_event_stream,
-            network_event_stream,
             consensus,
             recent_blocks: schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_BLOCKS)),
             recent_num_to_td: schnellru::LruMap::new(schnellru::ByLength::new(NUM_NUM_TO_TD)),
@@ -180,7 +175,6 @@ where
 
     /// Runs the [`N42Miner`] in a loop, polling the miner and building payloads.
     async fn run(mut self) -> eyre::Result<()> {
-        let mut event_listener = self.beacon_engine_handle.event_listener();
         loop {
             let mut status_counts = HashMap::new();
             loop {
@@ -196,16 +190,27 @@ where
                 sleep(Duration::from_secs(WAIT_FOR_PEERS_INTERVAL_SECS)).await;
             }
 
-            let (max_td, _) = self.max_td_and_hash();
+            let (max_td, max_td_hash) = self.max_td_and_hash();
             let (&(peer_finalized_td, peer_finalized_td_hash), _) = status_counts.iter().max_by_key(|&(_, count)| count).unwrap();
             info!(target: "consensus-client", ?peer_finalized_td, ?max_td, "Comparing peer_finalized_td with max_td");
+            info!(target: "consensus-client", ?peer_finalized_td_hash, ?max_td_hash,);
             if peer_finalized_td > max_td {
-                self.initial_sync_to_hash(peer_finalized_td, peer_finalized_td_hash).await?
+                match self.initial_sync_to_hash(peer_finalized_td, peer_finalized_td_hash).await {
+                    Ok(_) => {
+                        info!(target: "consensus-client", ?peer_finalized_td, ?peer_finalized_td_hash, "finished one sync attempt");
+                    }
+                    Err(err) => {
+                        info!(target: "consensus-client", ?err, "initial_sync_to_hash failed");
+                    }
+                }
             } else {
-                info!(target: "consensus-client", ?peer_finalized_td, "initial sync to peer finalized hash complete");
+                info!(target: "consensus-client", "head td is equal or greater than peer finalized td, no need to sync");
                 break;
             }
         }
+        let mut new_block_event_stream = self.network.subscribe_block();
+        let mut network_event_stream = self.network.event_listener();
+        let mut event_listener = self.beacon_engine_handle.event_listener();
 
         loop {
             tokio::select! {
@@ -217,7 +222,7 @@ where
                         error!(target: "consensus-client", "Error advancing the chain: {:?}", e);
                     }
                 }
-                new_block_event = &mut self.new_block_event_stream.next() => {
+                new_block_event = &mut new_block_event_stream.next() => {
                     info!(target: "consensus-client", "new_block_event={:?}", new_block_event);
                     if let Some(new_block) = new_block_event {
                     if let Err(e) = self.handle_new_block(new_block).await {
@@ -225,7 +230,7 @@ where
                     }
                     }
                 }
-                network_event = &mut self.network_event_stream.next() => {
+                network_event = &mut network_event_stream.next() => {
                     info!(target: "consensus-client", "network_event={:?}", network_event);
                 }
                 Some(event) = event_listener.next() => {
@@ -240,6 +245,9 @@ where
                         let block = new_block.clone().block.seal_slow();
                         self.recent_blocks.insert(block.hash(), block.clone());
                         let (max_td, _) = self.max_td_and_hash();
+       if max_td >= U256::from(new_block.td) {
+           return Ok(());
+       }
 
                         let mut is_fork = false;
                         let mut parent = block.hash();
@@ -563,10 +571,10 @@ where
         Ok(())
     }
 
-    async fn fcu_hash_finalized(&mut self, block_hash: BlockHash) -> eyre::Result<()> {
+    async fn fcu_hash_finalized(&mut self, finalized_hash: BlockHash, block_hash: BlockHash) -> eyre::Result<()> {
         let head_block_hash = block_hash;
-        let safe_block_hash = block_hash;
-        let finalized_block_hash = block_hash;
+        let safe_block_hash = finalized_hash;
+        let finalized_block_hash = finalized_hash;
         let forkchoice_state = ForkchoiceState {
             head_block_hash,
             safe_block_hash,
@@ -589,13 +597,15 @@ where
 
     /// On node init, sync head to specified hash
     async fn initial_sync_to_hash(&mut self, td: U256, block_hash: BlockHash) -> eyre::Result<()> {
+        let start = Instant::now();
         info!(target: "consensus-client", "initial_sync_to_hash hash {:?}", block_hash);
         let mut finalized_block_number = self.provider.finalized_block_number().unwrap_or(Some(0)).unwrap_or(0);
-        let mut best_block_number = self.provider.best_block_number().unwrap_or(0);
+        let best_block_number = self.provider.best_block_number().unwrap_or(0);
         info!(target: "consensus-client", ?finalized_block_number, ?best_block_number, "initial_sync_to_hash");
         for number in (finalized_block_number..=best_block_number).skip(1) {
             let block = self.provider.block_by_number(number).unwrap().unwrap();
             let hash = block.header.hash_slow();
+            debug!(target: "consensus-client", number, "initial_sync_to_hash, fetching header");
             let header_from_p2p = self.fetch_header(number.into()).await?;
             let header_hash_from_p2p = header_from_p2p.hash_slow();
             if hash != header_hash_from_p2p {
@@ -607,20 +617,50 @@ where
             }
         }
 
-        let finalized_header_from_p2p = self.fetch_header(block_hash.into()).await?;
-        self.fcu_hash(finalized_header_from_p2p.parent_hash).await?;
+        let finalized_block_from_p2p = self.fetch_block(block_hash.into()).await?.seal_slow();
+
+        //self.sync_to_hash_in_small_unit(finalized_block_from_p2p.header().parent_hash, MIN_BLOCKS_FOR_PIPELINE_RUN).await?;
+        self.sync_to_hash_in_small_unit(finalized_block_from_p2p.header().parent_hash, SYNC_DOWNLOAD_BLOCKS_UNIT).await?;
+        self.new_payload(&finalized_block_from_p2p).await?;
+        self.fcu_hash_finalized(block_hash, block_hash).await?;
+        let duration = start.elapsed();
+        info!(target: "consensus-client", ?duration, from=?best_block_number, to=?finalized_block_from_p2p.header().number, "time spent in syncing");
+        Ok(())
+    }
+
+    /// workaround for "stuck in downloading for large block ranges"
+    async fn sync_to_hash_in_small_unit(&mut self, block_hash: BlockHash, unit_size: u64) -> eyre::Result<()> {
+        let header_from_p2p = self.fetch_header(block_hash.into()).await?;
 
         loop {
-            let (max_td, _) = self.max_td_and_hash();
-            if td > max_td + finalized_header_from_p2p.difficulty {
-                info!(target: "consensus-client", peer_finalized_td=?td, ?max_td, finalized_block_difficulty=?finalized_header_from_p2p.difficulty, "Comparing peer_finalized_td");
-                sleep(Duration::from_secs(WAIT_FOR_DOWNLOAD_INTERVAL_SECS)).await;
-            } else {
-                self.fcu_hash_finalized(block_hash).await?;
+            let best_block_number = self.provider.best_block_number().unwrap();
+            if best_block_number == header_from_p2p.number {
                 break;
             }
+
+            let next_block_number = std::cmp::min(best_block_number + unit_size, header_from_p2p.number);
+
+            let next_header_from_p2p = self.fetch_header(next_block_number.into()).await?;
+            self.fcu_hash(next_header_from_p2p.hash_slow()).await?;
+            loop {
+                let block_number = self.provider.best_block_number().unwrap();
+                if block_number < next_block_number {
+                    sleep(Duration::from_millis(WAIT_FOR_DOWNLOAD_INTERVAL_MS)).await;
+                } else {
+                    info!(target: "consensus-client", ?block_number, "sync_to_hash_in_small_unit: synced to block");
+                    break;
+                }
+            }
         }
-        Ok(())
+
+        let header =
+        self.provider.sealed_header(self.provider.best_block_number().unwrap()).unwrap().unwrap();
+
+        if header.hash() == block_hash {
+            Ok(())
+        } else {
+            eyre::bail!("number={:?}, expected block_hash={:?}, got hash={:?}", header.header().number, block_hash, header.hash());
+        }
     }
 
     async fn fetch_header(&self, start: BlockHashOrNumber) -> eyre::Result<Header> {

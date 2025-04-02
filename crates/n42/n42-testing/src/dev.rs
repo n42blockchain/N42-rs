@@ -6,7 +6,6 @@ use n42_engine_primitives::N42PayloadBuilderAttributes;
 use reth_payload_primitives::BuiltPayload;
 use reth_consensus::Consensus;
 use reth_node_api::{FullNodeComponents, FullNodeTypes, NodeTypesWithEngine,PayloadTypes};
-use std::sync::Arc;
 use zerocopy::AsBytes;
 use reth_chainspec::ChainSpec;
 use reth_provider::{BlockReaderIdExt, BlockNumReader};
@@ -24,7 +23,10 @@ use n42_engine_types::N42Node;
 
 use reth::builder::Node;
 use reth_payload_primitives::PayloadBuilder;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use reth_rpc_api::EngineApiClient;
 use reth::rpc::types::engine::ForkchoiceState;
 use n42_engine_types::N42EngineTypes;

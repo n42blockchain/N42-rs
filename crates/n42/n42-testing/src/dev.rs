@@ -7,7 +7,7 @@ use reth_payload_primitives::BuiltPayload;
 use reth_consensus::Consensus;
 use reth_node_api::{FullNodeComponents, FullNodeTypes, NodeTypesWithEngine,PayloadTypes};
 use zerocopy::AsBytes;
-use reth_chainspec::ChainSpec;
+use reth_chainspec::{ChainSpec, N42};
 use reth_provider::{BlockReaderIdExt, BlockNumReader};
 use crate::utils::n42_payload_attributes;
 use alloy_primitives::{Bytes, Address, B256};
@@ -18,7 +18,6 @@ use reth_node_builder::{
     NodeBuilder, NodeConfig, NodeHandle,FullNode,rpc::RethRpcAddOns,
 };
 use reth_tasks::TaskManager;
-use reth_chainspec::N42;
 use n42_engine_types::N42Node;
 
 use reth::builder::Node;

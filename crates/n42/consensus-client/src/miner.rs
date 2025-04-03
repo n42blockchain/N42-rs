@@ -127,6 +127,7 @@ const NUM_NUM_TO_TD: u32 = 256;
 const WAIT_FOR_PEERS_INTERVAL_SECS: u64 = 5;
 const WAIT_FOR_DOWNLOAD_INTERVAL_MS: u64 = 100;
 const SYNC_DOWNLOAD_BLOCKS_UNIT: u64 = 512;
+const DIFFICULTY_DELTA_CLAMP: u64 = 50;
 
 impl<EngineT, Provider, B, Network> N42Miner<EngineT, Provider, B, Network>
 where
@@ -177,6 +178,15 @@ where
     async fn run(mut self) -> eyre::Result<()> {
         loop {
             let mut status_counts = HashMap::new();
+            if let Ok(all_peers) = self.network.get_all_peers().await {
+                // workaround for obsolete peer status
+                info!(target: "consensus-client", "disconnecting and removing peers to get the latest status");
+                for peer in all_peers {
+                    self.network.disconnect_peer(peer.remote_id);
+                    self.network.remove_peer(peer.remote_id, peer.kind);
+                    info!(target: "consensus-client", "Disconnected peer {}", peer_id=peer.remote_id);
+                }
+            }
             loop {
                 if let Ok(all_peers) = self.network.get_all_peers().await {
                     let num_signers = self.get_best_block_num_signers();
@@ -194,7 +204,7 @@ where
             let (&(peer_finalized_td, peer_finalized_td_hash), _) = status_counts.iter().max_by_key(|&(_, count)| count).unwrap();
             info!(target: "consensus-client", ?peer_finalized_td, ?max_td, "Comparing peer_finalized_td with max_td");
             info!(target: "consensus-client", ?peer_finalized_td_hash, ?max_td_hash,);
-            if peer_finalized_td > max_td {
+            if peer_finalized_td > max_td + U256::from(DIFFICULTY_DELTA_CLAMP) {
                 match self.initial_sync_to_hash(peer_finalized_td, peer_finalized_td_hash).await {
                     Ok(_) => {
                         info!(target: "consensus-client", ?peer_finalized_td, ?peer_finalized_td_hash, "finished one sync attempt");
@@ -204,7 +214,7 @@ where
                     }
                 }
             } else {
-                info!(target: "consensus-client", "head td is equal or greater than peer finalized td, no need to sync");
+                info!(target: "consensus-client", "head td is close to peer finalized td, no need to sync");
                 break;
             }
         }

@@ -600,10 +600,11 @@ Some(vec![parent.header().clone()]))?;
         let eth_signer = eth_signer_guard.as_ref().ok_or(ConsensusError::NoSignerSet)?;
         // Sign all the things!
         let header_bytes = seal_hash(header);
-        let sighash = eth_signer.sign_hash_sync(&header_bytes).map_err(|_| ConsensusError::SignHeaderError)?;
+        let mut sighash = eth_signer.sign_hash_sync(&header_bytes).map_err(|_| ConsensusError::SignHeaderError)?;
 
         let mut extra_data_mut = BytesMut::from(&header.extra_data[..]);
         extra_data_mut[header.extra_data.len().saturating_sub(SIGNATURE_LENGTH)..].copy_from_slice(&sighash.as_bytes());
+        *extra_data_mut.last_mut().unwrap() -= 27;
         header.extra_data = Bytes::from(extra_data_mut.freeze());
 
         self.save_total_difficulty(header);

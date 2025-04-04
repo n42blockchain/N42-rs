@@ -117,7 +117,7 @@ pub struct N42Miner<EngineT: EngineTypes, Provider, B, Network> {
     num_generated_blocks: u64,
     num_skipped_new_block: u64,
     num_should_skip_block_generation: u64,
-    num_later_than_a_period: u64,
+    num_long_delayed_blocks: u64,
     order_stats: HashMap<u64, bool>,
     distance_stats: HashMap<u64, u64>,
 }
@@ -163,7 +163,7 @@ where
     num_generated_blocks: 0,
     num_skipped_new_block: 0,
     num_should_skip_block_generation: 0,
-    num_later_than_a_period: 0,
+    num_long_delayed_blocks: 0,
     order_stats: HashMap::new(),
     distance_stats: HashMap::new(),
     new_block_tx,
@@ -225,6 +225,8 @@ where
         loop {
             tokio::select! {
                 Some((new_block, hash)) = self.new_block_rx.recv() => {
+                    let insert_ok = self.recent_num_to_td.insert(new_block.block.number, U256::from(new_block.td));
+                    debug!(target: "consensus-client", insert_ok, number=?new_block.block.number, "recent_num_to_td insert");
                     self.network.announce_block(new_block, hash);
                 }
                 _ = &mut self.mode => {
@@ -440,30 +442,34 @@ where
             _ => { return Ok(()) },
         };
         let block_time = interval.period().as_secs();
-        info!(target: "consensus-client", num_generated_blocks=self.num_generated_blocks, num_skipped_new_block=self.num_skipped_new_block, num_should_skip_block_generation=self.num_should_skip_block_generation, num_later_than_a_period=self.num_later_than_a_period, in_order_count, out_of_order_count, order_ratio, average_distance);
+        info!(target: "consensus-client", num_generated_blocks=self.num_generated_blocks, num_skipped_new_block=self.num_skipped_new_block, num_should_skip_block_generation=self.num_should_skip_block_generation, num_long_delayed_blocks=self.num_long_delayed_blocks, in_order_count, out_of_order_count, order_ratio, average_distance);
         let header =
             self.provider.sealed_header(self.provider.best_block_number().unwrap()).unwrap().unwrap();
-        if let Some(&mut v) = self.recent_num_to_td.get(&(header.number + 1)) {
-            info!(target: "consensus-client", number=header.number + 1, old_td=?v, "skip generating block, too late");
-                self.num_should_skip_block_generation += 1;
-                return Ok(());
-        }
         info!(target: "consensus-client", block_time, "advance");
         let now =
             std::time::SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("cannot be earlier than UNIX_EPOCH");
-        let timestamp = std::cmp::max(
-            Duration::from_secs(header.timestamp + block_time),
-            now,
-        );
-        if timestamp > now {
-            *interval = interval_at(Instant::now() + (timestamp - now), interval.period());
+        let expected_next_timestamp = Duration::from_secs(header.timestamp + block_time);
+        if expected_next_timestamp > now {
+            *interval = interval_at(Instant::now() + (expected_next_timestamp - now), interval.period());
             return Ok(());
         }
-        if timestamp + Duration::from_secs(block_time) <= now {
-            self.num_later_than_a_period += 1;
+
+        let num_signers = self.get_best_block_num_signers();
+        if expected_next_timestamp + Duration::from_secs(block_time * num_signers) <= now {
+            warn!(target: "consensus-client", number=header.number + 1, ?expected_next_timestamp, ?now, "not seeing new blocks for a long time, try generating a block again");
+            self.recent_num_to_td.remove(&(header.number + 1));
+            self.num_long_delayed_blocks += 1;
+        } else {
+            if self.recent_num_to_td.get(&(header.number + 1)).is_some() {
+                debug!(target: "consensus-client", number=header.number + 1, "skip generating block");
+                self.num_should_skip_block_generation += 1;
+                return Ok(());
+            }
         }
+
+        let timestamp = now;
         info!(target: "consensus-client", ?timestamp, "advance: PayloadAttributes timestamp");
 
         let forkchoice_state = self.forkchoice_state();
@@ -511,9 +517,6 @@ where
             new_block_tx.send((NewBlock{block: block_clone.unseal(), td: max_td.to::<U128>()}, block_hash)).await.unwrap();
         });
 
-        let td = self.consensus.total_difficulty(block.hash());
-        let insert_ok = self.recent_num_to_td.insert(block.number, td);
-        info!(target: "consensus-client", insert_ok, number=?block.number, "recent_num_to_td insert");
         self.num_generated_blocks += 1;
         Ok(())
     }

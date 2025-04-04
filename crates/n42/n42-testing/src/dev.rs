@@ -3,7 +3,7 @@ use reth_provider::HeaderProvider;
 use reth_provider::BlockHashReader;
 use reth_ethereum_engine_primitives::ExecutionPayloadV1;
 use n42_engine_primitives::N42PayloadBuilderAttributes;
-use reth_payload_primitives::BuiltPayload;
+use reth_payload_primitives::{BuiltPayload, PayloadBuilder};
 use reth_consensus::Consensus;
 use reth_node_api::{FullNodeComponents, FullNodeTypes, NodeTypesWithEngine,PayloadTypes};
 use zerocopy::AsBytes;
@@ -21,7 +21,6 @@ use reth_tasks::TaskManager;
 use n42_engine_types::N42Node;
 
 use reth::builder::Node;
-use reth_payload_primitives::PayloadBuilder;
 use std::{
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},

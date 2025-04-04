@@ -619,11 +619,10 @@ where
             let header_from_p2p = self.fetch_header(number.into()).await?;
             let header_hash_from_p2p = header_from_p2p.hash_slow();
             if hash != header_hash_from_p2p {
-                info!(target: "consensus-client", number, ?hash, ?header_hash_from_p2p, "found first different block");
-                let block_from_p2p = self.fetch_block(header_hash_from_p2p.into()).await?.seal_slow();
-                self.new_payload(&block_from_p2p).await?;
-                self.fcu_hash(header_hash_from_p2p).await?;
-                break;
+                warn!(target: "consensus-client", number, ?hash, ?header_hash_from_p2p, "found first different block");
+                warn!(target: "consensus-client", "please execute 'n42 stage unwind to-block {}', then run n42 node again", number - 1);
+                let _ = nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGINT);
+                sleep(Duration::from_secs(u64::MAX)).await;
             }
         }
 

@@ -128,9 +128,9 @@ cargo doc --open
 
 ### Learning Resources
 
-- **Tutorials**: Step-by-step guides for building your first domain and applications
+- **Tutorials**: Progressive guides for domain creation and application deployment
 - **Examples**: Browse our [examples repository](https://github.com/n42blockchain/examples) for reference implementations
-- **Architecture Deep Dives**: Technical papers explaining N42's consensus mechanism, CRDT-based state model, and zero-knowledge settlement system
+- **Architecture Deep Dives**: Technical papers detailing N42's consensus mechanism, CRDT-based state model, and zero-knowledge settlement system
 
 ### API Reference
 

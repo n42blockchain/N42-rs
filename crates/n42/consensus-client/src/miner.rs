@@ -118,6 +118,7 @@ pub struct N42Miner<EngineT: EngineTypes, Provider, B, Network> {
     num_skipped_new_block: u64,
     num_should_skip_block_generation: u64,
     num_long_delayed_blocks: u64,
+    num_fetched_blocks: u64,
     order_stats: HashMap<u64, bool>,
     distance_stats: HashMap<u64, u64>,
 }
@@ -164,6 +165,7 @@ where
     num_skipped_new_block: 0,
     num_should_skip_block_generation: 0,
     num_long_delayed_blocks: 0,
+    num_fetched_blocks: 0,
     order_stats: HashMap::new(),
     distance_stats: HashMap::new(),
     new_block_tx,
@@ -289,7 +291,9 @@ where
                                     parent_num = parent_block.header.number-1;
                                     difficulty = parent_block.header.difficulty;
                                     info!(target: "consensus-client", ?difficulty);
-                                    parents.push(parent_block.seal_slow());
+                                    let sealed_block = parent_block.seal_slow();
+                                    parents.push(sealed_block.clone());
+                                    self.recent_blocks.insert(sealed_block.hash(), sealed_block);
 
 
                                 },
@@ -442,7 +446,7 @@ where
             _ => { return Ok(()) },
         };
         let block_time = interval.period().as_secs();
-        info!(target: "consensus-client", num_generated_blocks=self.num_generated_blocks, num_skipped_new_block=self.num_skipped_new_block, num_should_skip_block_generation=self.num_should_skip_block_generation, num_long_delayed_blocks=self.num_long_delayed_blocks, in_order_count, out_of_order_count, order_ratio, average_distance);
+        info!(target: "consensus-client", num_generated_blocks=self.num_generated_blocks, num_skipped_new_block=self.num_skipped_new_block, num_should_skip_block_generation=self.num_should_skip_block_generation, num_long_delayed_blocks=self.num_long_delayed_blocks, num_fetched_blocks=self.num_fetched_blocks, in_order_count, out_of_order_count, order_ratio, average_distance);
         let header =
             self.provider.sealed_header(self.provider.best_block_number().unwrap()).unwrap().unwrap();
         info!(target: "consensus-client", block_time, "advance");
@@ -694,7 +698,8 @@ where
         Ok(header.unwrap())
     }
 
-    async fn fetch_block(&self, start: BlockHashOrNumber) -> eyre::Result<Block> {
+    async fn fetch_block(&mut self, start: BlockHashOrNumber) -> eyre::Result<Block> {
+        self.num_fetched_blocks += 1;
         let fetch_client = match self.network.fetch_client().await {
             Ok(c) => c,
             Err(err) => {

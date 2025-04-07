@@ -201,6 +201,9 @@ where
                 }
                 sleep(Duration::from_secs(WAIT_FOR_PEERS_INTERVAL_SECS)).await;
             }
+            if status_counts.is_empty() {
+                break;
+            }
 
             let (max_td, max_td_hash) = self.max_td_and_hash();
             let (&(peer_finalized_td, peer_finalized_td_hash), _) = status_counts.iter().max_by_key(|&(_, count)| count).unwrap();
@@ -522,6 +525,9 @@ where
         });
 
         self.num_generated_blocks += 1;
+        if num_signers == 1 {
+            self.fcu_hash(block_hash).await?;
+        }
         Ok(())
     }
 

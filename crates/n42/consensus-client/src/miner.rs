@@ -116,7 +116,6 @@ pub struct N42Miner<EngineT: EngineTypes, Provider, B, Network> {
     num_long_delayed_blocks: u64,
     num_fetched_blocks: u64,
     order_stats: HashMap<u64, bool>,
-    distance_stats: HashMap<u64, u64>,
 }
 
 const INMEMORY_BLOCKS: u32 = 256;
@@ -169,7 +168,6 @@ where
             num_long_delayed_blocks: 0,
             num_fetched_blocks: 0,
             order_stats: HashMap::new(),
-            distance_stats: HashMap::new(),
             new_block_tx,
             new_block_rx,
         };
@@ -281,8 +279,8 @@ where
         let mut parent = block.hash();
         let mut parent_num = block.header.number;
         let mut difficulty = block.header.difficulty;
+        let safe_block_num_hash = self.get_safe_block_num_hash_from_provider();
         while true {
-            let safe_block_num_hash = self.get_safe_block_num_hash();
             info!(target: "consensus-client", ?parent_num, ?parent, safe_number=?safe_block_num_hash.number, block_hash=?block.hash());
             if parent_num < safe_block_num_hash.number {
                 break;
@@ -373,7 +371,27 @@ where
         num_signers
     }
 
-    fn get_safe_block_num_hash(&mut self) -> BlockNumHash {
+    fn get_safe_block_num_hash_from_provider(&mut self) -> BlockNumHash {
+        let mut safe_block_number = self
+            .provider
+            .safe_block_number()
+            .unwrap_or(Some(0))
+            .unwrap_or(0);
+
+        let safe_block_header = self
+            .provider
+            .sealed_header(safe_block_number)
+            .unwrap()
+            .unwrap();
+        let safe_block_hash = safe_block_header.hash_slow();
+
+        BlockNumHash {
+            number: safe_block_header.number,
+            hash: safe_block_hash,
+        }
+    }
+
+    fn determine_safe_block(&mut self) -> BlockNumHash {
         let mut safe_block_number = self
             .provider
             .safe_block_number()
@@ -403,27 +421,33 @@ where
         active_signers.sort();
         active_signers.dedup();
         let num_active_signers: u64 = active_signers.len() as u64;
-        // if in NUM_CONFIRM_ROUNDS rounds, all active signers have signed a 2-difficulty block, then it is considered finalized
-        let order_in_round = (best_block_number.saturating_sub(NUM_CONFIRM_ROUNDS * num_signers)
-            ..best_block_number)
-            .filter(|&number| {
-                self.provider
-                    .sealed_header(number)
-                    .unwrap()
-                    .unwrap()
-                    .header()
-                    .difficulty
-                    == U256::from(2)
-            })
-            .count() as u64
-            == num_active_signers * NUM_CONFIRM_ROUNDS;
-        if order_in_round {
+        if num_active_signers != num_signers {
             safe_block_number = header
                 .number
-                .saturating_sub(num_signers * NUM_CONFIRM_ROUNDS + 1);
+                .saturating_sub(num_active_signers * 3 + 1);
+        } else {
+            // if in NUM_CONFIRM_ROUNDS rounds, all active signers have signed a 2-difficulty block, then it is considered finalized
+            let order_in_round = (best_block_number.saturating_sub(NUM_CONFIRM_ROUNDS * num_signers)
+                ..best_block_number)
+                .filter(|&number| {
+                    self.provider
+                        .sealed_header(number)
+                        .unwrap()
+                        .unwrap()
+                        .header()
+                        .difficulty
+                        == U256::from(2)
+                })
+                .count() as u64
+                == num_active_signers * NUM_CONFIRM_ROUNDS;
+            if order_in_round {
+                safe_block_number = header
+                    .number
+                    .saturating_sub(num_signers * NUM_CONFIRM_ROUNDS + 1);
+            }
+            self.order_stats.insert(header.number, order_in_round);
+            debug!(target: "consensus-client", number=?header.number, num_active_signers, order_in_round);
         }
-        self.order_stats.insert(header.number, order_in_round);
-        info!(target: "consensus-client", number=?header.number, num_active_signers, order_in_round);
         let safe_block_header = self
             .provider
             .sealed_header(safe_block_number)
@@ -439,10 +463,9 @@ where
 
     /// Returns current forkchoice state.
     fn forkchoice_state(&mut self) -> ForkchoiceState {
-        self.update_distance_stats();
         let (_, max_td_hash) = self.max_td_and_hash();
 
-        let safe_block_num_hash = self.get_safe_block_num_hash();
+        let safe_block_num_hash = self.determine_safe_block();
         let safe_block_hash = safe_block_num_hash.hash;
         ForkchoiceState {
             head_block_hash: max_td_hash,
@@ -461,16 +484,10 @@ where
         )
     }
 
-    fn get_average_distance(&self) -> f64 {
-        let total_distance: u64 = self.distance_stats.values().sum();
-        total_distance as f64 / self.distance_stats.len() as f64
-    }
-
     /// Generates payload attributes for a new block, passes them to FCU and inserts built payload
     /// through newPayload.
     async fn advance(&mut self) -> eyre::Result<()> {
         let (in_order_count, out_of_order_count, order_ratio) = self.get_order_stats();
-        let average_distance = self.get_average_distance();
         let interval;
         match self.mode {
             MiningMode::Instant(_) => {
@@ -480,7 +497,7 @@ where
             _ => return Ok(()),
         };
         let block_time = interval.period().as_secs();
-        info!(target: "consensus-client", num_generated_blocks=self.num_generated_blocks, num_skipped_new_block=self.num_skipped_new_block, num_should_skip_block_generation=self.num_should_skip_block_generation, num_long_delayed_blocks=self.num_long_delayed_blocks, num_fetched_blocks=self.num_fetched_blocks, in_order_count, out_of_order_count, order_ratio, average_distance);
+        info!(target: "consensus-client", num_generated_blocks=self.num_generated_blocks, num_skipped_new_block=self.num_skipped_new_block, num_should_skip_block_generation=self.num_should_skip_block_generation, num_long_delayed_blocks=self.num_long_delayed_blocks, num_fetched_blocks=self.num_fetched_blocks, in_order_count, out_of_order_count, order_ratio);
         let header = self
             .provider
             .sealed_header(self.provider.best_block_number().unwrap())
@@ -583,22 +600,8 @@ where
         Ok(())
     }
 
-    fn update_distance_stats(&mut self) {
-        let block = self
-            .provider
-            .block(HashOrNumber::Number(
-                self.provider.best_block_number().unwrap(),
-            ))
-            .unwrap()
-            .unwrap();
-        let safe_block_num_hash = self.get_safe_block_num_hash();
-        let distance = block.number - safe_block_num_hash.number;
-        self.distance_stats.insert(block.number, distance);
-    }
-
     fn forkchoice_state_with_head(&mut self, head_block_hash: B256) -> ForkchoiceState {
-        self.update_distance_stats();
-        let safe_block_num_hash = self.get_safe_block_num_hash();
+        let safe_block_num_hash = self.determine_safe_block();
         let safe_block_hash = safe_block_num_hash.hash;
         ForkchoiceState {
             head_block_hash,

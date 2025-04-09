@@ -14,6 +14,7 @@ use futures::StreamExt;
 use reth::{
     args::{DevArgs, DiscoveryArgs, NetworkArgs, RpcServerArgs},
     builder::Node,
+    rpc::types::engine::ForkchoiceState,
 };
 use reth_node_builder::{
     NodeBuilder, NodeConfig, NodeHandle,FullNode,rpc::RethRpcAddOns,
@@ -26,7 +27,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use reth_rpc_api::EngineApiClient;
-use reth::rpc::types::engine::ForkchoiceState;
 use n42_engine_types::N42EngineTypes;
 use n42_clique::{EXTRA_VANITY, EXTRA_SEAL};
 use reth_primitives_traits::header::clique_utils::SIGNATURE_LENGTH;

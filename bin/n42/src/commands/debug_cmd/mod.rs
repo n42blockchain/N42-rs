@@ -12,6 +12,7 @@ mod execution;
 mod in_memory_merkle;
 mod merkle;
 mod replay_engine;
+mod migrate;
 
 /// `reth debug` command
 #[derive(Debug, Parser)]
@@ -33,6 +34,8 @@ pub enum Subcommands<C: ChainSpecParser> {
     BuildBlock(build_block::Command<C>),
     /// Debug engine API by replaying stored messages.
     ReplayEngine(replay_engine::Command<C>),
+    /// Migrate chain transactions data.
+    Migrate(migrate::Command<C>),
 }
 
 impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
@@ -49,6 +52,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
             Subcommands::InMemoryMerkle(command) => command.execute::<N>(ctx).await,
             Subcommands::BuildBlock(command) => command.execute::<N>(ctx).await,
             Subcommands::ReplayEngine(command) => command.execute::<N>(ctx).await,
+            Subcommands::Migrate(command) => command.execute::<N>(ctx).await,
         }
     }
 }

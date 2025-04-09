@@ -317,6 +317,19 @@ impl<Tx: DbTx + DbTxMut + 'static, N: NodeTypes<ChainSpec: EthereumHardforks> + 
 
         self.insert_block(block)
     }
+
+    pub fn save_block_by_number(&self, number: BlockNumber, value: Vec<u8>) -> ProviderResult<()> {
+        self.tx.put::<tables::MigrateBlockByNumber>(number, value)?;
+        Ok(())
+    }
+
+    pub fn load_block_by_number(&self, number: BlockNumber) -> ProviderResult<Option<Vec<u8>>> {
+        Ok(self.tx.get::<tables::MigrateBlockByNumber>(number)?)
+    }
+
+    pub fn latest_block_number(&self) -> ProviderResult<Option<BlockNumber>> {
+        Ok(self.tx.cursor_read::<tables::MigrateBlockByNumber>()?.last()?.map(|(k, _)| { k }))
+    }
 }
 
 /// For a given key, unwind all history shards that are below the given block number.

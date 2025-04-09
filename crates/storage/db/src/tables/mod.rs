@@ -286,6 +286,9 @@ tables! {
     /// Stores the signer per hash
     table SignersByHash<Key = HeaderHash, Value = Address>;
 
+    /// Stores the block per number for migration
+    table MigrateBlockByNumber<Key = BlockNumber, Value = Vec<u8>>;
+
     /// Stores the header hashes belonging to the canonical chain.
     table CanonicalHeaders<Key = BlockNumber, Value = HeaderHash>;
 

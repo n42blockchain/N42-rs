@@ -20,14 +20,13 @@ use reth_node_builder::{
     NodeBuilder, NodeConfig, NodeHandle,FullNode,rpc::RethRpcAddOns,
 };
 use reth_tasks::TaskManager;
-use n42_engine_types::N42Node;
+use n42_engine_types::{N42Node, N42EngineTypes};
 
 use std::{
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 use reth_rpc_api::EngineApiClient;
-use n42_engine_types::N42EngineTypes;
 use n42_clique::{EXTRA_VANITY, EXTRA_SEAL};
 use reth_primitives_traits::header::clique_utils::SIGNATURE_LENGTH;
 

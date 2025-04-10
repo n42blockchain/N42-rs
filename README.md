@@ -39,9 +39,9 @@ Whether developing financial applications, interoperable dApps, or custom execut
 
 ### Domains
 
-**Execution Environment:** Each domain operates independently, hosting one or more applications. Users interact through a dedicated "vault" in every domain where their assets reside. While spending is restricted to the associated domain, assets can be received from any domain.
+**Execution Environment:** Each domain functions as an autonomous computational unit hosting one or more applications. Users interact through a dedicated "vault" within each domain where their assets reside. While expenditures are contained within the associated domain, assets can be received from any domain in the network.
 
-**Local Customization:** Domains can be tailored to specific use cases, employing custom execution environments and smart contract engines (such as EVM or custom VMs) without compromising overall network security.
+**Local Customization:** Domains can be optimized for specific use cases, implementing custom execution environments and smart contract engines (such as EVM or specialized VMs) without compromising the network's security model.
 
 ### Validator Network
 

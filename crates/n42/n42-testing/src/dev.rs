@@ -7,7 +7,7 @@ use reth_node_api::{FullNodeComponents, FullNodeTypes, NodeTypesWithEngine,Paylo
 use zerocopy::AsBytes;
 use reth_chainspec::{ChainSpec, N42};
 use reth_provider::{HeaderProvider, BlockHashReader, BlockReaderIdExt, BlockNumReader};
-use crate::utils::n42_payload_attributes;
+use crate::{utils::n42_payload_attributes, snapshot_test_utils::TesterAccountPool};
 use alloy_primitives::{Bytes, Address, B256};
 use alloy_genesis::CliqueConfig;
 use futures::StreamExt;
@@ -29,8 +29,6 @@ use std::{
 use reth_rpc_api::EngineApiClient;
 use n42_clique::{EXTRA_VANITY, EXTRA_SEAL};
 use reth_primitives_traits::header::clique_utils::SIGNATURE_LENGTH;
-
-use crate::snapshot_test_utils::TesterAccountPool;
 
 /// Types representing tester votes and test structure
 #[derive(Debug, Default)]

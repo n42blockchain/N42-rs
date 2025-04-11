@@ -27,13 +27,11 @@ Whether developing financial applications, interoperable dApps, or custom execut
 - **Developer-Friendly Integration:** Connect to the N42 network with minimal code implementation.
 
 - **Flexible Configuration:**
-  - Multi-language development support
-  - Ultra-low transaction latency (≤1ms)
-  - Optimized network bandwidth utilization for reduced operational costs
+  - Multi-language development support with idiomatic bindings
+  - Ultra-low transaction latency (≤1ms) through architectural optimizations
+  - Configurable network bandwidth utilization for efficient resource allocation
 
-- **Customizability**: Supports any programming language, ultra-low transaction latencies (as low as 1 millisecond), and flexible network bandwidth usage to keep operational costs low.
-
-- **Unlimited Scalability:** Horizontal scaling through additional computing nodes, complemented by parallel transaction processing powered by our CRDT-based state model architecture.
+- **Unlimited Scalability:** Horizontal scaling through dynamic node addition, complemented by concurrent transaction processing powered by our CRDT-based state model architecture.
 
 ## Architecture
 

@@ -45,15 +45,15 @@ Whether developing financial applications, interoperable dApps, or custom execut
 
 ### Validator Network
 
-**State Propagation & Verification:** Validators form a decentralized network responsible for propagating state updates, known as State Difference Lists (SDL), across domains. They verify these updates using zero-knowledge proofs (SNARKs), ensuring compliance with both global and local rules.
+**State Propagation & Verification:** Validators constitute a decentralized network responsible for propagating state updates, formalized as State Difference Lists (SDL), across domains. These updates are cryptographically verified using zero-knowledge proofs (SNARKs), ensuring compliance with both global protocol rules and domain-specific constraints.
 
-**Consensus without Full Ordering:** Utilizing a leaderless, no-total-order consensus mechanism based on Byzantine Reliable Broadcast (BRB), N42 achieves high throughput and robust fault tolerance.
+**Consensus without Full Ordering:** Implementing a leaderless, partial-ordering consensus mechanism based on Byzantine Reliable Broadcast (BRB), N42 achieves exceptional throughput and robust Byzantine fault tolerance.
 
 ### State Model & Settlement
 
-**CRDT-Based State Management:** The system employs Conflict-Free Replicated Data Types (CRDTs) to allow concurrent state updates without conflicts, enabling fast and deterministic merging of state changes.
+**CRDT-Based State Management:** The system employs Conflict-Free Replicated Data Types (CRDTs) to facilitate concurrent state updates without reconciliation conflicts, enabling deterministic and efficient merging of distributed state changes.
 
-**Zero-Knowledge Settlement:** Domains generate zero-knowledge proofs to attest to the correctness of their state transitions. Validators verify these proofs to finalize settlements without needing to access the underlying transaction data.
+**Zero-Knowledge Settlement:** Domains generate cryptographic zero-knowledge proofs attesting to the correctness of state transitions. Validators verify these proofs to finalize settlements without accessing the underlying transaction data, preserving privacy while ensuring correctness.
 
 ### Digital Asset Ownership
 

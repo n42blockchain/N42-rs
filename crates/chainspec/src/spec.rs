@@ -32,7 +32,7 @@ pub const N42_GENESIS_HASH: B256 =
 /// The Ethereum mainnet spec
 pub static N42: LazyLock<Arc<ChainSpec>> = LazyLock::new(|| {
     let mut spec = ChainSpec {
-        chain: Chain::from_id(94),
+        chain: Chain::from_id(1142),
         genesis: serde_json::from_str(include_str!("../res/genesis/n42.json"))
             .expect("Can't deserialize N42 genesis json"),
         genesis_hash: OnceLock::new(),

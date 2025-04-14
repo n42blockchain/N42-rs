@@ -12,6 +12,7 @@ use reth_chainspec::EthChainSpec;
 use reth_consensus_debug_client::{DebugConsensusClient, EtherscanBlockProvider};
 use reth_engine_local::{LocalEngineService, LocalPayloadAttributesBuilder, MiningMode};
 use consensus_client::miner::N42Miner;
+use consensus_client::migrate::N42Migrate;
 use n42_engine_primitives::N42PayloadAttributesBuilder;
 use reth_engine_service::service::{ChainEvent, EngineService};
 use reth_engine_tree::{
@@ -431,16 +432,29 @@ where
         } else {
             None
         };
-        N42Miner::spawn_new(
-            ctx.blockchain_db().clone(),
-            N42PayloadAttributesBuilder::new_add_signer(ctx.chain_spec(), signer_address),
-            beacon_engine_handle_clone,
-            mining_mode,
-            ctx.components().payload_builder().clone(),
-            ctx.components().network().clone(),
-            ctx.consensus(),
+        if let Some(migrate_from_db_path) = ctx.node_config().dev.migrate_old_chain_data_from_db.clone() {
+            N42Migrate::spawn_new(
+                ctx.blockchain_db().clone(),
+                N42PayloadAttributesBuilder::new_add_signer(ctx.chain_spec(), signer_address),
+                beacon_engine_handle_clone,
+                ctx.components().payload_builder().clone(),
+                // payload_builder
+                ctx.components().pool().clone(),
+                migrate_from_db_path,
+            );
+
+        } else {
+            N42Miner::spawn_new(
+                ctx.blockchain_db().clone(),
+                N42PayloadAttributesBuilder::new_add_signer(ctx.chain_spec(), signer_address),
+                beacon_engine_handle_clone,
+                mining_mode,
+                ctx.components().payload_builder().clone(),
+                ctx.components().network().clone(),
+                ctx.consensus(),
         );
 
+        }
         let full_node = FullNode {
             consensus: ctx.components().consensus().clone(),
             evm_config: ctx.components().evm_config().clone(),

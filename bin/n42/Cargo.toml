@@ -94,6 +94,7 @@ tokio = { workspace = true, features = [
 futures.workspace = true
 
 # misc
+sled.workspace = true
 aquamarine.workspace = true
 eyre.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }

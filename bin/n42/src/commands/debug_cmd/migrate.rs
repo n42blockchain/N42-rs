@@ -1,3 +1,4 @@
+use sled::{Db, IVec};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types::BlockTransactionsKind;
 use eyre::Result;
@@ -55,6 +56,10 @@ pub struct Command<C: ChainSpecParser> {
     #[arg(long = "from-rpc", value_name = "END_POINT")]
     from_rpc: String,
 
+    /// The database to write ethereum blocks to.
+    #[arg(long = "to-db-path", value_name = "DB_PATH")]
+    to_db_path: String,
+
     /// The number of milliseconds between Engine API messages.
     #[arg(long = "interval", default_value_t = 1_000)]
     interval: u64,
@@ -102,32 +107,39 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
         let rpc_provider = ProviderBuilder::new().on_http(rpc_url);
 
         // Get latest block number.
-        //let latest_block_number = rpc_provider.get_block_number().await?;
-        let latest_block_number = 20;
-        let mut latest_local_block_number = block_provider.latest_block_number()?.unwrap_or(0);
+        let latest_block_number = rpc_provider.get_block_number().await?;
+        //let latest_block_number = 20;
+        let to_db_path: String = self.to_db_path.parse()?;
+        let db: Db = sled::open(to_db_path)?;
+        let latest_local_block_number: u64 = db.iter().count() as u64;
+
         info!(target: "reth::cli", latest_block_number, latest_local_block_number);
         drop(block_provider);
         let mut block_number = latest_local_block_number;
         while latest_block_number > block_number {
             let block_provider = provider_factory.provider_rw()?;
+            if block_number > 0 && !db.contains_key(block_number.to_be_bytes())? {
+                eyre::bail!("expecting consecutive blocks, block {:?} not found, stop", block_number);
+            }
             block_number += 1;
             if let Some(block) = rpc_provider.get_block(block_number.into(), BlockTransactionsKind::Full).await? {
-                block_provider.save_block_by_number(block_number, serde_json::to_vec(&block)?)?;
+                db.insert(block_number.to_be_bytes(), serde_json::to_vec(&block)?)?;
                 info!(target: "reth::cli", "Latest committed block number: {block_number}");
-                block_provider.commit().map(|_|())?;
             } else {
                 break;
             }
         }
-        let block_provider = provider_factory.provider_rw()?;
-        latest_local_block_number = block_provider.latest_block_number()?.unwrap_or(0);
-        drop(block_provider);
-        block_number = 0;
-        while latest_local_block_number > block_number {
-            let block_provider = provider_factory.provider_rw()?;
+        let new_latest_local_block_number = db.iter().count() as u64;
+        block_number = latest_local_block_number;
+        while new_latest_local_block_number > block_number {
             block_number += 1;
-            let block: Block = serde_json::from_slice(&block_provider.load_block_by_number(block_number)?.unwrap())?;
-            info!(target: "reth::cli", ?block, "Read block");
+            let value = db.get(block_number.to_be_bytes())?.unwrap();
+            let block: Block = serde_json::from_slice(&value)?;
+            //info!(target: "reth::cli", ?block, "Read block");
+            if block_number != block.header.number {
+                info!(target: "reth::cli",  "block number mismatch, expected {:?}, got {:?}", block_number, block.header.number);
+                eyre::bail!("block number mismatch, expected {:?}, got {:?}", block_number, block.header.number);
+            }
         }
 
         // Configure blockchain tree

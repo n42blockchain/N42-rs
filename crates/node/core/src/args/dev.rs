@@ -7,7 +7,7 @@ use clap::Args;
 use humantime::parse_duration;
 
 /// Parameters for Dev testnet configuration
-#[derive(Debug, Args, PartialEq, Eq, Default, Clone, Copy)]
+#[derive(Debug, Args, PartialEq, Eq, Default, Clone)]
 #[command(next_help_heading = "Dev testnet")]
 pub struct DevArgs {
     /// Start the node in dev mode
@@ -49,6 +49,15 @@ pub struct DevArgs {
         verbatim_doc_comment,
     )]
     pub consensus_signer_private_key: Option<B256>,
+
+    /// migrate old chain data to this chain from db
+    #[arg(
+        long = "dev.migrate-old-chain-data-from-db",
+        env = "MIGRATE_OLD_CHAIN_DATA_FROM_DB",
+        value_name = "MIGRATE_OLD_CHAIN_DATA_FROM_DB",
+        verbatim_doc_comment,
+    )]
+    pub migrate_old_chain_data_from_db: Option<String>,
 }
 
 #[cfg(test)]

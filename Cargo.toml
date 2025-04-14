@@ -411,6 +411,7 @@ op-alloy-network = "0.5"
 op-alloy-consensus = "0.5"
 
 # misc
+sled = "0.34"
 aquamarine = "0.6"
 auto_impl = "1"
 backon = { version = "1.2", default-features = false, features = [

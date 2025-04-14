@@ -118,7 +118,8 @@ impl TryFrom<WithOtherFields<alloy_rpc_types::Transaction>> for Transaction {
                     to: tx.to.map_or(TxKind::Create, TxKind::Call),
                     value: tx.value,
                     input: tx.input,
-                    access_list: tx.access_list.ok_or(ConversionError::MissingAccessList)?,
+                    //access_list: tx.access_list.ok_or(ConversionError::MissingAccessList)?,
+                    access_list: tx.access_list.unwrap_or_default(),
                     gas_price: tx.gas_price.ok_or(ConversionError::MissingGasPrice)?,
                 }))
             }
@@ -136,7 +137,8 @@ impl TryFrom<WithOtherFields<alloy_rpc_types::Transaction>> for Transaction {
                     gas_limit: tx.gas,
                     to: tx.to.map_or(TxKind::Create, TxKind::Call),
                     value: tx.value,
-                    access_list: tx.access_list.ok_or(ConversionError::MissingAccessList)?,
+                    //access_list: tx.access_list.ok_or(ConversionError::MissingAccessList)?,
+                    access_list: tx.access_list.unwrap_or_default(),
                     input: tx.input,
                 }))
             }
@@ -154,7 +156,8 @@ impl TryFrom<WithOtherFields<alloy_rpc_types::Transaction>> for Transaction {
                     gas_limit: tx.gas,
                     to: tx.to.unwrap_or_default(),
                     value: tx.value,
-                    access_list: tx.access_list.ok_or(ConversionError::MissingAccessList)?,
+                    //access_list: tx.access_list.ok_or(ConversionError::MissingAccessList)?,
+                    access_list: tx.access_list.unwrap_or_default(),
                     input: tx.input,
                     blob_versioned_hashes: tx
                         .blob_versioned_hashes

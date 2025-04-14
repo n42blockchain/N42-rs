@@ -1,7 +1,6 @@
 use tiny_keccak::{Keccak, Hasher};
-use secp256k1::{PublicKey, Message, Secp256k1};
+use secp256k1::{PublicKey, Message, Secp256k1, rand::rngs::OsRng};
 use alloy_primitives::{Address, Bytes, Keccak256};
-use secp256k1::rand::rngs::OsRng;
 use reth_primitives::Header;
 use std::{str::FromStr, collections::HashMap};
 use reth_network::config::SecretKey;

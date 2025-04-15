@@ -99,7 +99,7 @@ cargo run --release -- --dev
 
 ### Running Tests
 
-To run the tests, use the following command:
+Execute the test suite with:
 
 ```bash
 cargo test
@@ -107,7 +107,7 @@ cargo test
 
 ## Documentation
 
-N42 offers comprehensive documentation to help developers get started with the platform:
+N42 provides comprehensive documentation to facilitate developer onboarding and platform adoption:
 
 ### Official Documentation
 

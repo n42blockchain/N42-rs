@@ -1,3 +1,4 @@
+use tokio::time::{interval_at, sleep, Instant, Interval};
 use sled::{Db, IVec};
 use reth_rpc_types_compat::engine::payload::block_to_payload;
 use alloy_rpc_types::Block;
@@ -75,6 +76,11 @@ where
 
     async fn run_inner(mut self) -> eyre::Result<()> {
         let db: Db = sled::open(&self.migrate_from_db_path)?;
+        let finalized_header = self
+            .provider
+            .sealed_header(0)
+            .unwrap()
+            .unwrap();
         let header = self
             .provider
             .sealed_header(self.provider.best_block_number().unwrap())
@@ -82,7 +88,13 @@ where
             .unwrap();
         let mut timestamp = header.timestamp;
         let mut block_number = self.provider.best_block_number().unwrap();
+        let mut start = std::time::Instant::now();;
         loop {
+            if block_number % 100 == 0 {
+                let duration = start.elapsed();
+                debug!(target: "consensus-client", ?duration, "blocks generation time");
+                start = std::time::Instant::now();
+            }
             block_number += 1;
             debug!(target: "consensus-client", ?block_number, "before reading from database");
             let block = db.get(block_number.to_be_bytes())?;
@@ -130,8 +142,8 @@ where
             let forkchoice_state =
             ForkchoiceState {
                 head_block_hash: header.hash(),
-                safe_block_hash: header.hash(),
-                finalized_block_hash: header.hash(),
+                safe_block_hash: finalized_header.hash(),
+                finalized_block_hash: finalized_header.hash(),
             };
             let res = self
                 .beacon_engine_handle
@@ -169,13 +181,14 @@ where
             }
 
             self.new_payload(block).await?;
+            //sleep(std::time::Duration::from_millis(1)).await;
 
             debug!(target: "consensus-client", ?block, "payload block");
             let forkchoice_state =
             ForkchoiceState {
                 head_block_hash: block.hash(),
-                safe_block_hash: block.hash(),
-                finalized_block_hash: block.hash(),
+                safe_block_hash: finalized_header.hash(),
+                finalized_block_hash: finalized_header.hash(),
             };
             match self
                 .beacon_engine_handle

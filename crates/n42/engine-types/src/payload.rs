@@ -218,7 +218,7 @@ where
         State::builder().with_database(cached_reads.as_db_mut(state)).with_bundle_update().build();
     let PayloadConfig { parent_header, extra_data, attributes } = config;
 
-    debug!(target: "payload_builder", id=%attributes.0.id, parent_header = ?parent_header.hash(), parent_number = parent_header.number, "building new payload");
+    debug!(target: "payload_builder", id=%attributes.0.id, parent_header = ?parent_header.hash(), parent_number = parent_header.number, ?initialized_cfg, ?initialized_block_env, "building new payload");
     let mut cumulative_gas_used = 0;
     let mut sum_blob_gas_used = 0;
     let block_gas_limit: u64 = initialized_block_env.gas_limit.to::<u64>();
@@ -310,6 +310,7 @@ where
             evm_config.tx_env(tx.as_signed(), tx.signer()),
         );
 
+        warn!(target: "payload_builder", ?env, "payloader_builder evm env");
         // Configure the environment for the block.
         let mut evm = evm_config.evm_with_env(&mut db, env);
 
@@ -337,8 +338,17 @@ where
                 }
             }
         };
+        warn!(target: "payload_builder",
+            ?result,
+            ?state,
+            "execute result state "
+        );
         // drop evm so db is released.
         drop(evm);
+        warn!(target: "payload_builder",
+            bundle_state=?state,
+            "state before db commit"
+        );
         // commit changes
         db.commit(state);
 
@@ -429,6 +439,11 @@ where
 
     // calculate the state root
     let hashed_state = HashedPostState::from_bundle_state(&execution_outcome.state().state);
+    warn!(target: "payload_builder",
+        ?hashed_state,
+        bundle_state=?execution_outcome.state().state,
+        "payload hashed_state"
+    );
     let (state_root, trie_output) = {
         db.database.inner().state_root_with_updates(hashed_state.clone()).inspect_err(|err| {
             warn!(target: "payload_builder",

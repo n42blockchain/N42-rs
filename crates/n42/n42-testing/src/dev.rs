@@ -110,7 +110,7 @@ async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(node: 
             None,
         ).await?;
     println!("latest block_hash={:?}", node.provider.latest_header().unwrap().unwrap().hash());
-    Ok(()) as eyre::Result<()>
+    Ok(())
 }
 
 impl CliqueTest {

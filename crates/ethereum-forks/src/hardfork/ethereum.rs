@@ -383,10 +383,12 @@ impl EthereumHardfork {
     }
 
     /// AST mainnet list of hardforks.
-    pub const fn n42() -> [(Self, ForkCondition); 15] {
+    pub const fn n42() -> [(Self, ForkCondition); 17] {
         [
+            (Self::Frontier, ForkCondition::Block(0)),
             (Self::Homestead, ForkCondition::Block(0)),
             (Self::Dao, ForkCondition::Never),
+            (Self::Tangerine, ForkCondition::Block(0)),
             (Self::SpuriousDragon, ForkCondition::Block(0)),
             (Self::Byzantium, ForkCondition::Block(0)),
             (Self::Constantinople, ForkCondition::Block(0)),

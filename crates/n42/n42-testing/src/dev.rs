@@ -78,7 +78,7 @@ async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(node: 
     let attributes = n42_payload_attributes(timestamp, parent_hash);
     node.consensus.set_eth_signer_by_key(Some(eth_signer_key.clone()))?;
     let payload_id = node.payload_builder.send_new_payload(attributes.clone().into()).await.unwrap()?;
-    println!("payload_id={}", payload_id);
+    println!("payload_id={payload_id}");
 
     let payload_type = node.payload_builder.resolve(payload_id).await.unwrap()?;
     println!("payload_type={:?}", payload_type);

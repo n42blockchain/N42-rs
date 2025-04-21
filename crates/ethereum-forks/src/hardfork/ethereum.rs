@@ -397,7 +397,13 @@ impl EthereumHardfork {
             (Self::London, ForkCondition::Block(0)),
             (Self::ArrowGlacier, ForkCondition::Block(0)),
             (Self::BeiJing, ForkCondition::Block(0)),
-            (Self::Paris, ForkCondition::Block(0)),
+            (
+                Self::Paris,
+                ForkCondition::TTD {
+                    fork_block: Some(0),
+                    total_difficulty: U256::ZERO,
+                },
+            ),
             (Self::Shanghai, ForkCondition::Timestamp(1681338455)),
             (Self::Cancun, ForkCondition::Timestamp(1710338135)),
         ]

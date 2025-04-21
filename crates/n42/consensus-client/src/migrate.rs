@@ -1,4 +1,6 @@
 use tokio::time::{interval_at, sleep, Instant, Interval};
+use alloy_provider::{Provider, ProviderBuilder};
+use alloy_rpc_types::BlockTransactionsKind;
 use sled::{Db, IVec};
 use reth_rpc_types_compat::engine::payload::block_to_payload;
 use alloy_rpc_types::Block;
@@ -28,7 +30,8 @@ pub struct N42Migrate<EngineT: EngineTypes, Provider, B, Pool: TransactionPool> 
     /// The payload builder for the engine
     payload_builder: PayloadBuilderHandle<EngineT>,
     pool: Pool,
-    migrate_from_db_path: String,
+    migrate_from_db_path: Option<String>,
+    migrate_from_db_rpc: Option<String>,
 }
 
 impl<EngineT, Provider, B, Pool> N42Migrate<EngineT, Provider, B, Pool>
@@ -49,7 +52,8 @@ where
         beacon_engine_handle: BeaconConsensusEngineHandle<EngineT>,
         payload_builder: PayloadBuilderHandle<EngineT>,
         pool: Pool,
-        migrate_from_db_path: String,
+        migrate_from_db_path: Option<String>,
+        migrate_from_db_rpc: Option<String>,
         ) {
         let migrate = Self {
             provider,
@@ -58,6 +62,7 @@ where
             payload_builder,
             pool,
             migrate_from_db_path,
+            migrate_from_db_rpc,
         };
         tokio::spawn(migrate.run());
     }
@@ -75,7 +80,18 @@ where
     }
 
     async fn run_inner(mut self) -> eyre::Result<()> {
-        let db: Db = sled::open(&self.migrate_from_db_path)?;
+        let db: Option<Db> = if self.migrate_from_db_path.is_some() {
+            Some(sled::open(&self.migrate_from_db_path.clone().unwrap())?)
+        } else {
+            None
+        };
+        let rpc_provider = if self.migrate_from_db_rpc.is_some() {
+            let rpc_url = self.migrate_from_db_rpc.clone().unwrap().parse()?;
+            Some(ProviderBuilder::new().on_http(rpc_url))
+        } else {
+            None
+        };
+
         let finalized_header = self
             .provider
             .sealed_header(0)
@@ -97,17 +113,35 @@ where
             }
             block_number += 1;
             debug!(target: "consensus-client", ?block_number, "before reading from database");
-            let block = db.get(block_number.to_be_bytes())?;
+            let mut block = if db.is_some() {
+                let value = db.as_ref().unwrap().get(block_number.to_be_bytes())?;
+                if value.is_some() {
+                    Some(serde_json::from_slice(&value.unwrap())?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             if block.is_none() {
-                eyre::bail!("block {:?} not found, stop", block_number);
+                if rpc_provider.is_some() {
+                    match rpc_provider.as_ref().unwrap().get_block(block_number.into(), BlockTransactionsKind::Full).await? {
+                        Some(v) => { block = Some(v) },
+                        _ => {
+                            eyre::bail!("block {:?} not found, stop", block_number);
+                        }
+                    }
+                } else {
+                    eyre::bail!("block {:?} not found, stop", block_number);
+                }
             }
-            let block: Block = serde_json::from_slice(&block.unwrap())?;
+            let block = block.unwrap();
             if timestamp < block.header.timestamp {
                 timestamp = block.header.timestamp;
             } else {
                 timestamp += 8;
             }
-            debug!(target: "consensus-client", ?block, "block of rpc from database");
+            debug!(target: "consensus-client", ?block, "block of input");
             let transactions = block.transactions.into_transactions();
 
             let txs = transactions

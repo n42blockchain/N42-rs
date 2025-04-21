@@ -38,6 +38,7 @@ reth-network-p2p.workspace = true
 reth-primitives-traits.workspace = true
 
 # alloy
+alloy-provider.workspace = true
 alloy-primitives.workspace = true
 alloy-rpc-types-engine.workspace = true
 alloy-rpc-types.workspace = true

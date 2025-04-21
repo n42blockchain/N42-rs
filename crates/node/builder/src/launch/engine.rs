@@ -432,7 +432,9 @@ where
         } else {
             None
         };
-        if let Some(migrate_from_db_path) = ctx.node_config().dev.migrate_old_chain_data_from_db.clone() {
+        if ctx.node_config().dev.migrate_old_chain_data_from_db.is_some() || ctx.node_config().dev.migrate_old_chain_data_from_rpc.is_some() {
+            let migrate_from_db_path = ctx.node_config().dev.migrate_old_chain_data_from_db.clone();
+            let migrate_from_db_rpc = ctx.node_config().dev.migrate_old_chain_data_from_rpc.clone();
             N42Migrate::spawn_new(
                 ctx.blockchain_db().clone(),
                 N42PayloadAttributesBuilder::new_add_signer(ctx.chain_spec(), signer_address),
@@ -441,6 +443,7 @@ where
                 // payload_builder
                 ctx.components().pool().clone(),
                 migrate_from_db_path,
+                migrate_from_db_rpc,
             );
 
         } else {

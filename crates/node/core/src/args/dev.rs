@@ -58,6 +58,15 @@ pub struct DevArgs {
         verbatim_doc_comment,
     )]
     pub migrate_old_chain_data_from_db: Option<String>,
+
+    /// migrate old chain data to this chain from rpc
+    #[arg(
+        long = "dev.migrate-old-chain-data-from-rpc",
+        env = "MIGRATE_OLD_CHAIN_DATA_FROM_RPC",
+        value_name = "MIGRATE_OLD_CHAIN_DATA_FROM_RPC",
+        verbatim_doc_comment,
+    )]
+    pub migrate_old_chain_data_from_rpc: Option<String>,
 }
 
 #[cfg(test)]

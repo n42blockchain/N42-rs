@@ -1,7 +1,7 @@
 //! Contains the implementation of the mining mode for the local engine.
 
 use alloy_eips::{BlockHashOrNumber, BlockNumHash, HashOrNumber};
-use alloy_primitives::{BlockHash, TxHash, B256, U128, U256};
+use alloy_primitives::{Address, BlockHash, TxHash, B256, U128, U256};
 use alloy_rpc_types_engine::{CancunPayloadFields, ExecutionPayloadSidecar, ForkchoiceState};
 use eyre::OptionExt;
 use futures_util::{stream::Fuse, StreamExt};
@@ -266,6 +266,39 @@ where
         }
     }
 
+    async fn exit_if_lagged_progress(&self, block: &SealedBlock) -> eyre::Result<()> {
+        const MAX_PROGRESS_GAP: u64 = 100;
+        const MIN_NO_BLOCK_TIMESTAMP_GAP: u64 = 300;
+
+        let best_block_number = self.provider.best_block_number().unwrap();
+        let latest_header = self.provider
+            .sealed_header(best_block_number)
+            .unwrap()
+            .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("cannot be earlier than UNIX_EPOCH");
+        debug!(target: "consensus-client", my_number=?best_block_number, received_number=?block.header().number, ?now, "exit_if_lagged_progress");
+        if block.header().number > best_block_number + MAX_PROGRESS_GAP {
+            let current_signers = self.get_best_block_signers();
+            let signer = match recover_address(&block.header()) {
+                Ok(v) => v,
+                Err(err) => {
+                    eyre::bail!("Error in recover_address: {:?}", err);
+                },
+            };
+            if current_signers.contains(&signer) && now.as_secs() > latest_header.timestamp + MIN_NO_BLOCK_TIMESTAMP_GAP {
+                warn!(target: "consensus-client", my_number=?best_block_number, received_number=?block.header().number, my_timestamp=?latest_header.timestamp, ?now, "exit for lagged progress");
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::this(),
+                    nix::sys::signal::Signal::SIGINT,
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     async fn handle_new_block(&mut self, new_block: NewBlock) -> eyre::Result<()> {
         let mut parents = Vec::new();
         let block = new_block.clone().block.seal_slow();
@@ -274,6 +307,7 @@ where
         if max_td >= U256::from(new_block.td) {
             return Ok(());
         }
+        let _ = self.exit_if_lagged_progress(&block).await;
 
         let mut is_fork = false;
         let mut parent = block.hash();
@@ -356,7 +390,7 @@ where
         Ok(())
     }
 
-    fn get_best_block_num_signers(&self) -> u64 {
+    fn get_best_block_signers(&self) -> Vec<Address> {
         let header = self
             .provider
             .sealed_header(self.provider.best_block_number().unwrap())
@@ -366,7 +400,13 @@ where
             .consensus
             .snapshot(header.number, header.hash_slow(), None)
             .unwrap();
-        let num_signers: u64 = snapshot.signers.len() as u64;
+        let signers = snapshot.signers;
+
+        signers
+    }
+
+    fn get_best_block_num_signers(&self) -> u64 {
+        let num_signers: u64 = self.get_best_block_signers().len() as u64;
 
         num_signers
     }

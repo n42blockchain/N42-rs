@@ -68,7 +68,7 @@ async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(node: 
     ExecutionPayloadV1: From<<<<Node as FullNodeTypes>::Types as NodeTypesWithEngine>::Engine as PayloadTypes>::BuiltPayload>
 {
     let best_number = node.provider.chain_info().unwrap().best_number;
-    println!("best_number={}", best_number);
+    println!("best_number={best_number}");
     println!("eth_signer_key={:?}", eth_signer_key);
     let parent_hash = node.provider.latest_header().unwrap().unwrap().hash();
     println!("parent_hash={:?}", parent_hash);

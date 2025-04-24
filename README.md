@@ -71,8 +71,8 @@ Whether developing financial applications, interoperable dApps, or custom execut
 
 - [Rust](https://www.rust-lang.org/tools/install) (v1.50 or later)
 - [Cargo](https://doc.rust-lang.org/cargo/getting-started/installation.html)
-- [Node.js](https://nodejs.org/en/) (optional, for front-end tools)
-- [Wasm-Pack](https://rustwasm.github.io/wasm-pack/installer/) (for smart contracts)
+- [Node.js](https://nodejs.org/en/) (optional, for front-end tooling)
+- [Wasm-Pack](https://rustwasm.github.io/wasm-pack/installer/) (for smart contract compilation)
 
 ### Installation
 

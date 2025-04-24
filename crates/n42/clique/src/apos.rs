@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::thread;
+use std::sync::atomic::{AtomicBool, Ordering};
 use alloy_primitives::{U256, hex, Bloom, BlockNumber, BlockHash, keccak256, B64, B256, Address, Bytes, FixedBytes};
 use alloy_rlp::{length_of_length, Encodable};
 use bytes::{BufMut, BytesMut};
@@ -14,7 +15,7 @@ use rand::prelude::SliceRandom;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_primitives::{SealedBlock, SealedHeader, BlockWithSenders, public_key_to_address};
 use reth_primitives_traits::{Header, header::clique_utils::{recover_address, SIGNATURE_LENGTH, seal_hash}};
-use reth_provider::{HeaderProvider, SnapshotProvider, TdProvider};
+use reth_provider::{BlockIdReader, BlockReaderIdExt, HeaderProvider, SnapshotProvider, TdProvider};
 use tracing::{info, warn, debug, error};
 use n42_primitives::{APosConfig, Snapshot};
 
@@ -28,6 +29,7 @@ use std::str::FromStr;
 //
 const CHECKPOINT_INTERVAL: u64 = 2048; // Number of blocks after which to save the vote snapshot to the database
 const INMEMORY_SNAPSHOTS: u32 = 128; // Number of recent vote snapshots to keep in memory
+const INMEMORY_TDS: u32 = 256; // Number of recent total difficulty records to keep in memory
 
 const WIGGLE_TIME: Duration = Duration::from_millis(500); // Random delay (per signer) to allow concurrent signers
 const MERGE_SIGN_MIN_TIME: u64 = 4; // min time for merge sign
@@ -103,7 +105,7 @@ impl Error for AposError {}
 // Ethereum testnet following the Ropsten attacks.
 pub struct APos<Provider, ChainSpec>
 where
-    Provider: HeaderProvider + TdProvider + TdProviderWriter +SnapshotProvider + SnapshotProviderWriter + Clone + Unpin + 'static,
+    Provider: HeaderProvider + TdProvider + TdProviderWriter +SnapshotProvider + SnapshotProviderWriter + BlockIdReader  + BlockReaderIdExt + Clone + Unpin + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks
 {
     config: APosConfig,          // Consensus engine configuration parameters
@@ -116,6 +118,8 @@ where
     //  Provider,
     provider: Provider,
     recent_headers: RwLock<schnellru::LruMap<B256, Header>>,    // Recent headers for snapshot
+    recent_tds: RwLock<schnellru::LruMap<B256, U256>>,
+    recent_tds_inited: AtomicBool,
 }
 
 
@@ -123,7 +127,7 @@ where
 // signers set to the ones provided by the user.
 impl<Provider, ChainSpec> APos<Provider, ChainSpec>
 where
-    Provider: HeaderProvider + TdProvider + TdProviderWriter +SnapshotProvider + SnapshotProviderWriter + Clone + Unpin + 'static,
+    Provider: HeaderProvider + TdProvider + TdProviderWriter +SnapshotProvider + SnapshotProviderWriter + BlockIdReader  + BlockReaderIdExt + Clone + Unpin + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks
 {
     pub fn new(
@@ -134,6 +138,8 @@ where
     {
         let recents = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SNAPSHOTS)));
         let recent_headers = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(CHECKPOINT_INTERVAL as u32 * 2)));
+        let recent_tds = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_TDS)));
+        let recent_tds_inited = AtomicBool::new(false);
 
         // signer_pk.sign_hash_sync();
         let eth_signer: Option<PrivateKeySigner> = signer_private_key.map(|key| { key.parse().unwrap() });
@@ -151,11 +157,14 @@ where
                 config.epoch = epoch;
             }
         }
+
         Self {
             config,
             chain_spec,
             recents,
             recent_headers,
+            recent_tds,
+            recent_tds_inited,
             proposals: Arc::new(RwLock::new(HashMap::new())),
             signer: RwLock::new(eth_signer_address),
             eth_signer: RwLock::new(eth_signer),
@@ -316,19 +325,49 @@ where
     // APIs implements consensus.Engine, returning the user facing RPC API to allow
     // controlling the signer voting.
 
-    fn save_total_difficulty(&self, header: &Header) {
-        let total_difficulty = if header.number == 1 {
-            header.difficulty
-        } else {
-            if let Ok(Some(parent_td)) = self.provider.load_td(&header.parent_hash) {
-                parent_td + header.difficulty
+    fn init_recent_tds(&self) {
+        if self.recent_tds_inited.load(Ordering::Relaxed) {
+            return;
+        }
+        let finalized_block_number = self.provider
+            .finalized_block_number()
+            .unwrap_or(Some(0))
+            .unwrap_or(0);
+        info!(target: "consensus::apos", ?finalized_block_number, "init_recent_tds");
+        let best_block_number = self.provider.best_block_number().unwrap();
+        info!(target: "consensus::apos", ?best_block_number, "init_recent_tds");
+        (finalized_block_number..= best_block_number).for_each(|block_number| {
+            debug!(target: "consensus::apos", ?block_number, "init_recent_tds");
+            let header = self.provider.header_by_number(block_number).unwrap().unwrap();
+            if block_number == finalized_block_number {
+                let finalized_td = self.provider.header_td_by_number(finalized_block_number)
+                    .unwrap_or(Some(U256::ZERO))
+                    .unwrap_or(U256::ZERO);
+                let mut recent_tds = self.recent_tds.write().unwrap();
+                recent_tds.insert(header.hash_slow(), finalized_td);
             } else {
-                warn!(target: "consensus::apos", "td not found for hash {:?}", header.parent_hash);
-                U256::from(0)
+                let mut recent_tds = self.recent_tds.write().unwrap();
+                let parent_td = *recent_tds.get(&header.parent_hash).unwrap();
+                recent_tds.insert(header.hash_slow(), parent_td + header.difficulty);
             }
+        }
+        );
+
+        self.recent_tds_inited.store(true, Ordering::Relaxed);
+    }
+
+    fn save_total_difficulty(&self, header: &Header) {
+        self.init_recent_tds();
+
+        let total_difficulty = {
+            let mut recent_tds = self.recent_tds.write().unwrap();
+            let parent_td = recent_tds.get(&header.parent_hash).expect(&format!("td not found for hash {:?}", header.parent_hash));
+            *parent_td + header.difficulty
         };
-        self.provider.save_td(&header.hash_slow(), total_difficulty).unwrap();
-        info!(target: "consensus::apos", "saved total_difficulty {}", total_difficulty);
+
+        let mut recent_tds = self.recent_tds.write().unwrap();
+        recent_tds.insert(header.hash_slow(), total_difficulty);
+        debug!(target: "consensus::apos", "saved total_difficulty {}", total_difficulty);
     }
 }
 
@@ -349,7 +388,7 @@ fn calc_difficulty(snap: &Snapshot, signer: &Address) -> U256 {
 impl<Provider, ChainSpec> Debug for APos<Provider, ChainSpec>
 where
     ChainSpec: EthChainSpec + EthereumHardforks,
-    Provider: 'static + Clone + HeaderProvider + TdProvider + TdProviderWriter + SnapshotProvider + SnapshotProviderWriter + Unpin,
+    Provider: 'static + Clone + HeaderProvider + TdProvider + TdProviderWriter + SnapshotProvider + SnapshotProviderWriter + BlockIdReader  + BlockReaderIdExt + Unpin,
 {
     fn fmt(&self, _f: &mut Formatter<'_>) -> std::fmt::Result {
         todo!()
@@ -358,7 +397,7 @@ where
 
 impl<Provider, ChainSpec> Consensus for APos<Provider, ChainSpec>
 where
-    Provider: HeaderProvider + TdProvider + TdProviderWriter +SnapshotProvider + SnapshotProviderWriter + Clone + Unpin + 'static,
+    Provider: HeaderProvider + TdProvider + TdProviderWriter +SnapshotProvider + SnapshotProviderWriter  + BlockIdReader  + BlockReaderIdExt + Clone + Unpin + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks
 {
 
@@ -780,13 +819,12 @@ Some(vec![parent.header().clone()]))?;
         &self,
         hash: B256,
     ) -> U256 {
-        let total_difficulty = if let Ok(Some(td)) = self.provider.load_td(&hash) {
-            td
-        } else {
-            warn!(target: "consensus::apos", "td not found for hash {:?}", hash);
-            U256::from(0)
-        };
-        info!(target: "consensus::apos", ?hash, ?total_difficulty, "get total_difficulty");
+        self.init_recent_tds();
+
+        let mut recent_tds = self.recent_tds.write().unwrap();
+        let total_difficulty = *recent_tds.get(&hash).expect(&format!("td not found for hash {:?}", hash));
+
+        debug!(target: "consensus::apos", ?hash, ?total_difficulty, "get total_difficulty");
         total_difficulty
     }
 

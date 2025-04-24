@@ -888,20 +888,4 @@ where
         info!(hash=?header.hash(), ?td, header.number, header.timestamp, average_td, "max_td_and_hash");
         (td, header.hash())
     }
-
-    fn finalized_td_and_hash(&self) -> (U256, B256) {
-        let mut finalized_block_number = self
-            .provider
-            .finalized_block_number()
-            .unwrap_or(Some(0))
-            .unwrap_or(0);
-        let header = self
-            .provider
-            .sealed_header(finalized_block_number)
-            .unwrap()
-            .unwrap();
-        let td = self.consensus.total_difficulty(header.hash_slow());
-        info!(hash=?header.hash(), ?td, header.number, header.timestamp, "finalized_td_and_hash");
-        (td, header.hash())
-    }
 }

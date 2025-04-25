@@ -141,9 +141,7 @@ where
         let recent_tds = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_TDS)));
         let recent_tds_inited = AtomicBool::new(false);
 
-        // signer_pk.sign_hash_sync();
         let eth_signer: Option<PrivateKeySigner> = signer_private_key.map(|key| { key.parse().unwrap() });
-        //let eth_signer = PrivateKeySigner::random();
 
         let eth_signer_address = eth_signer.clone().map(|signer| {signer.address()});
         info!(target: "consensus::apos", "apos set signer address {:?}", eth_signer_address);
@@ -234,64 +232,6 @@ where
         Ok(())
     }
 
-    // fn finalize(
-    //     &self,
-    //     chain: &dyn ChainHeaderReader,
-    //     header: &mut SealedHeader,
-    //     state: &mut IntraBlockState,
-    //     txs: Vec<Transaction>,
-    //     uncles: Vec<Box<dyn IHeader>>,
-    // ) -> Result<(Vec<Reward>, HashMap<Address, U256>), Box<dyn std::error::Error>> {
-    //     // No block rewards in PoA, so the state remains as is and uncles are dropped
-    //     // chain.config().is_eip158(header.number())
-    
-    //     let (rewards, unpay_map, err) = do_reward(self.chain_config.clone(), state, header, chain)?;
-    //     if err.is_some() {
-    //         return Err(err.unwrap().into());
-    //     }
-    
-    //     let raw_header = header;
-    //     raw_header.root = state.intermediate_root();
-    //     // Todo can not verify author
-    //     raw_header.mix_digest = state.before_state_root();
-    //     // Todo
-    //     // raw_header.uncle_hash = types::calc_uncle_hash(None);
-    
-    //     Ok((rewards, unpay_map))
-    // }
-    
-
-    // // FinalizeAndAssemble implements consensus.Engine, ensuring no uncles are set,
-    // // nor block rewards given, and returns the final block.
-    // fn finalize_and_assemble(
-    //     &self,
-    //     chain: &dyn ChainHeaderReader,
-    //     header: &mut SealedHeader,
-    //     state: &mut IntraBlockState,
-    //     txs: Vec<Transaction>,
-    //     uncles: Vec<Box<dyn IHeader>>,
-    //     receipts: Vec<Receipt>,
-    // ) -> Result<(Box<dyn IBlock>, Vec<Reward>, HashMap<Address, U256>), Box<dyn std::error::Error>> {
-    //     // Finalize block
-    //     let (rewards, unpay, err) = self.finalize(chain, header, state, txs.clone(), uncles.clone())?;
-    //     if err.is_some() {
-    //         return Err(err.unwrap().into());
-    //     }
-
-    //     // Assemble and return the final block for sealing
-    //     let block = Block::new_block_from_receipt(header, txs, uncles, receipts, rewards.clone());
-    //     Ok((Box::new(block), rewards, unpay))
-    // }
-
-    // // Authorize injects a private key into the consensus engine to mint new blocks
-    // // with.
-    // fn authorize(&mut self, signer: Address, sign_fn: SignerFn) {
-    //     let _lock = self.lock.lock().unwrap(); // Acquire the lock, automatically releases at the end of the scope
-
-    //     self.signer = signer;
-    //     self.sign_fn = Some(sign_fn);
-    // }
-
     // CalcDifficulty is the difficulty adjustment algorithm. It returns the difficulty that a new block should have:
     pub fn calc_difficulty(
         &mut self,
@@ -375,9 +315,6 @@ where
     }
 }
 
-
- 
-
 fn calc_difficulty(snap: &Snapshot, signer: &Address) -> U256 {
     if snap.inturn(snap.number + 1, signer) {
         DIFF_IN_TURN
@@ -385,9 +322,6 @@ fn calc_difficulty(snap: &Snapshot, signer: &Address) -> U256 {
         DIFF_NO_TURN
     }
 }
-
-
-
 
 impl<Provider, ChainSpec> Debug for APos<Provider, ChainSpec>
 where
@@ -477,7 +411,7 @@ where
         parent: &SealedHeader,
         ) -> Result<(),ConsensusError>  {
         info!(target: "consensus::apos", ?header, "in validate_header_against_parent");
-        //self.validate_header(header)?;
+
         let header_hash = header.hash();
         let header = header.header();
         let number = header.number;

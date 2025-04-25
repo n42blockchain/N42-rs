@@ -205,7 +205,11 @@ where
             return Err(AposError::UnauthorizedSigner.into());
         }
         info!(target: "consensus::apos", "recovered address: {}", signer);
-        self.provider.save_signer_by_hash(&header.hash_slow(), signer.clone()).map_err(|_| ConsensusError::UnknownBlock)?;
+
+        #[cfg(debug_block_signer)]
+        {
+            self.provider.save_signer_by_hash(&header.hash_slow(), signer.clone()).map_err(|_| ConsensusError::UnknownBlock)?;
+        }
 
        //Check the list of recent signatories
         for (seen, recent) in &snap.recents {

@@ -528,6 +528,7 @@ where
     /// through newPayload.
     async fn advance(&mut self) -> eyre::Result<()> {
         let (in_order_count, out_of_order_count, order_ratio) = self.get_order_stats();
+        let num_signers = self.get_best_block_num_signers();
         let interval;
         match self.mode {
             MiningMode::Instant(_) => {
@@ -556,11 +557,14 @@ where
             return Ok(());
         }
 
-        let num_signers = self.get_best_block_num_signers();
         if expected_next_timestamp + Duration::from_secs(block_time * num_signers) <= now {
             warn!(target: "consensus-client", number=header.number + 1, ?expected_next_timestamp, ?now, "not seeing new blocks for a long time, try generating a block again");
             self.recent_num_to_td.remove(&(header.number + 1));
             self.num_long_delayed_blocks += 1;
+            *interval = interval_at(
+                Instant::now() + Duration::from_secs(block_time),
+                interval.period(),
+            );
         } else {
             if self.recent_num_to_td.get(&(header.number + 1)).is_some() {
                 debug!(target: "consensus-client", number=header.number + 1, "skip generating block");

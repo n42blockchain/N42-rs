@@ -71,7 +71,7 @@ async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(node: 
     println!("best_number={best_number}");
     println!("eth_signer_key={eth_signer_key}");
     let parent_hash = node.provider.latest_header().unwrap().unwrap().hash();
-    println!("parent_hash={:?}", parent_hash);
+    println!("parent_hash={parent_hash:?}");
     println!("header={:?}", node.provider.latest_header().unwrap().unwrap().header());
     println!("header hash={:?}", node.provider.latest_header().unwrap().unwrap().header().hash_slow());
     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();

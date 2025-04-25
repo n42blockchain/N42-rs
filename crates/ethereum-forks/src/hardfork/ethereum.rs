@@ -406,8 +406,8 @@ impl EthereumHardfork {
                     total_difficulty: U256::ZERO,
                 },
             ),
-            (Self::Shanghai, ForkCondition::Timestamp(1681338455)),
-            (Self::Cancun, ForkCondition::Timestamp(1710338135)),
+            (Self::Shanghai, ForkCondition::Timestamp(1746576000)),
+            (Self::Cancun, ForkCondition::Timestamp(1746576000)),
         ]
     }
 

@@ -39,6 +39,7 @@ use reth_payload_builder::{
     EthBuiltPayload, PayloadBuilderError, PayloadBuilderHandle,
     PayloadBuilderService,
 };
+use revm::primitives::ExecutionResult;
 use tracing::{debug, warn, trace};
 use alloy_eips::{eip4844::MAX_DATA_GAS_PER_BLOCK, eip7685::Requests};
 use reth_payload_primitives::{PayloadBuilderAttributes, PayloadTypes};
@@ -343,6 +344,17 @@ where
             ?state,
             "execute result state "
         );
+        match result { // temporary workaround for migration tx result check
+            ExecutionResult::Halt { reason, gas_used } => {
+                warn!(target: "payload_builder",
+                    ?reason, ?gas_used,
+                    "ExecutionResult::Halt "
+                );
+                return Err(PayloadBuilderError::other(std::io::Error::new(std::io::ErrorKind::Other,"evm execution halt")));
+            },
+            _ => {
+            },
+        }
         // drop evm so db is released.
         drop(evm);
         warn!(target: "payload_builder",

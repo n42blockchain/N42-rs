@@ -646,6 +646,9 @@ Some(vec![parent.header().clone()]))?;
         *extra_data_mut.last_mut().unwrap() -= 27;
         header.extra_data = Bytes::from(extra_data_mut.freeze());
 
+        let mut recent_headers = self.recent_headers.write().unwrap();
+        recent_headers.insert(header.hash_slow(), header.clone());
+
         self.save_total_difficulty(header);
 
         Ok(())
@@ -740,12 +743,11 @@ Some(vec![parent.header().clone()]))?;
                 }
                 header
             } else {
-                let header_opt = self.provider.header_by_hash_or_number(hash.into()).map_err(|_| ConsensusError::UnknownBlock)?;
-                if let Some(header) = header_opt {
-                    header
+                if let Some(v) = recent_headers.get(&hash) {
+                    v.clone()
                 } else {
-                    if let Some(v) = recent_headers.get(&hash) {
-                        v.clone()
+                    if let Some(header) = self.provider.header_by_hash_or_number(hash.into()).map_err(|_| ConsensusError::UnknownBlock)? {
+                        header
                     } else {
                         info!(target: "consensus::apos", "hash not found: {:?}", hash);
                         return Err(ConsensusError::UnknownBlock);

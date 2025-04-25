@@ -29,7 +29,7 @@ use std::str::FromStr;
 //
 const CHECKPOINT_INTERVAL: u64 = 2048; // Number of blocks after which to save the vote snapshot to the database
 const INMEMORY_SNAPSHOTS: u32 = 128; // Number of recent vote snapshots to keep in memory
-const INMEMORY_TDS: u32 = 256; // Number of recent total difficulty records to keep in memory
+const INMEMORY_TDS: u32 = 1024; // Number of recent total difficulty records to keep in memory
 
 const WIGGLE_TIME: Duration = Duration::from_millis(500); // Random delay (per signer) to allow concurrent signers
 const MERGE_SIGN_MIN_TIME: u64 = 4; // min time for merge sign
@@ -361,7 +361,7 @@ where
 
         let total_difficulty = {
             let mut recent_tds = self.recent_tds.write().unwrap();
-            let parent_td = recent_tds.get(&header.parent_hash).expect(&format!("td not found for hash {:?}", header.parent_hash));
+            let parent_td = recent_tds.get(&header.parent_hash).expect(&format!("td not found for parent hash {:?}, current header={:?}", header.parent_hash, header));
             *parent_td + header.difficulty
         };
 

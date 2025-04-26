@@ -84,7 +84,7 @@ async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(node: 
     println!("payload_type={payload_type:?}");
     let extra_data = payload_type.block().header.extra_data.clone();
     println!("header={:?}", payload_type.block().header);
-    println!("extra_data={:?}", extra_data);
+    println!("extra_data={extra_data:?}");
     let signer_addresses = get_addresses_from_extra_data(extra_data);
     println!("signer_addresses={:?}", signer_addresses);
 

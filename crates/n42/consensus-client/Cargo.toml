@@ -51,6 +51,7 @@ tokio-stream.workspace = true
 futures-util.workspace = true
 
 # misc
+hex.workspace = true
 sled.workspace = true
 serde_json.workspace = true
 nix.workspace = true

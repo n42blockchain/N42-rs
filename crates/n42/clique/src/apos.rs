@@ -280,15 +280,24 @@ where
         info!(target: "consensus::apos", ?finalized_block_number, "init_recent_tds");
         let best_block_number = self.provider.best_block_number().unwrap();
         info!(target: "consensus::apos", ?best_block_number, "init_recent_tds");
-        (finalized_block_number..= best_block_number).for_each(|block_number| {
+        let num_blocks = best_block_number - finalized_block_number + 1;
+        let start_block_number = if num_blocks > INMEMORY_TDS.into() {
+            warn!(target: "consensus::apos", ?finalized_block_number, ?best_block_number, td_cache_size=?INMEMORY_TDS,
+                "the number of blocks from finalized block to best block is larger than td cache size, this may cause 'td not found' errors later",
+            );
+            best_block_number.saturating_sub(INMEMORY_TDS.saturating_sub(1) as u64)
+        } else {
+            finalized_block_number
+        };
+        (start_block_number..=best_block_number).for_each(|block_number| {
             debug!(target: "consensus::apos", ?block_number, "init_recent_tds");
             let header = self.provider.header_by_number(block_number).unwrap().unwrap();
-            if block_number == finalized_block_number {
-                let finalized_td = self.provider.header_td_by_number(finalized_block_number)
+            if block_number == start_block_number {
+                let start_td = self.provider.header_td_by_number(start_block_number)
                     .unwrap_or(Some(U256::ZERO))
                     .unwrap_or(U256::ZERO);
                 let mut recent_tds = self.recent_tds.write().unwrap();
-                recent_tds.insert(header.hash_slow(), finalized_td);
+                recent_tds.insert(header.hash_slow(), start_td);
             } else {
                 let mut recent_tds = self.recent_tds.write().unwrap();
                 let parent_td = *recent_tds.get(&header.parent_hash).unwrap();

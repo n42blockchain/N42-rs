@@ -178,6 +178,43 @@ where
 
     /// Runs the [`N42Miner`] in a loop, polling the miner and building payloads.
     async fn run(mut self) -> eyre::Result<()> {
+        self.initial_sync().await;
+
+        let mut new_block_event_stream = self.network.subscribe_block();
+        let mut network_event_stream = self.network.event_listener();
+        let mut event_listener = self.beacon_engine_handle.event_listener();
+
+        loop {
+            tokio::select! {
+                Some((new_block, hash)) = self.new_block_rx.recv() => {
+                    let insert_ok = self.recent_num_to_td.insert(new_block.block.number, U256::from(new_block.td));
+                    debug!(target: "consensus-client", insert_ok, number=?new_block.block.number, "recent_num_to_td insert");
+                    self.network.announce_block(new_block, hash);
+                }
+                _ = &mut self.mode => {
+                    if let Err(e) = self.advance().await {
+                        error!(target: "consensus-client", "Error advancing the chain: {:?}", e);
+                    }
+                }
+                new_block_event = &mut new_block_event_stream.next() => {
+                    debug!(target: "consensus-client", "new_block_event={:?}", new_block_event);
+                    if let Some(new_block) = new_block_event {
+                    if let Err(e) = self.handle_new_block(new_block).await {
+                        error!(target: "consensus-client", "Error handling the new block: {:?}", e);
+                    }
+                    }
+                }
+                network_event = &mut network_event_stream.next() => {
+                    debug!(target: "consensus-client", "network_event={:?}", network_event);
+                }
+                Some(event) = event_listener.next() => {
+                    debug!(target: "consensus-client", "beacon_engine_handle event={:?}", event);
+                },
+            }
+        }
+    }
+
+    async fn initial_sync(&mut self) {
         loop {
             let mut status_counts = HashMap::new();
             if let Ok(all_peers) = self.network.get_all_peers().await {
@@ -230,38 +267,6 @@ where
             } else {
                 info!(target: "consensus-client", "head td is close to peer finalized td, no need to sync");
                 break;
-            }
-        }
-        let mut new_block_event_stream = self.network.subscribe_block();
-        let mut network_event_stream = self.network.event_listener();
-        let mut event_listener = self.beacon_engine_handle.event_listener();
-
-        loop {
-            tokio::select! {
-                Some((new_block, hash)) = self.new_block_rx.recv() => {
-                    let insert_ok = self.recent_num_to_td.insert(new_block.block.number, U256::from(new_block.td));
-                    debug!(target: "consensus-client", insert_ok, number=?new_block.block.number, "recent_num_to_td insert");
-                    self.network.announce_block(new_block, hash);
-                }
-                _ = &mut self.mode => {
-                    if let Err(e) = self.advance().await {
-                        error!(target: "consensus-client", "Error advancing the chain: {:?}", e);
-                    }
-                }
-                new_block_event = &mut new_block_event_stream.next() => {
-                    info!(target: "consensus-client", "new_block_event={:?}", new_block_event);
-                    if let Some(new_block) = new_block_event {
-                    if let Err(e) = self.handle_new_block(new_block).await {
-                        error!(target: "consensus-client", "Error handling the new block: {:?}", e);
-                    }
-                    }
-                }
-                network_event = &mut network_event_stream.next() => {
-                    info!(target: "consensus-client", "network_event={:?}", network_event);
-                }
-                Some(event) = event_listener.next() => {
-                    info!(target: "consensus-client", "beacon_engine_handle event={:?}", event);
-                },
             }
         }
     }
@@ -323,7 +328,7 @@ where
         let mut difficulty = block.header.difficulty;
         let safe_block_num_hash = self.get_safe_block_num_hash_from_provider();
         while true {
-            info!(target: "consensus-client", ?parent_num, ?parent, safe_number=?safe_block_num_hash.number, block_hash=?block.hash());
+            debug!(target: "consensus-client", ?parent_num, ?parent, safe_number=?safe_block_num_hash.number, block_hash=?block.hash());
             if parent_num < safe_block_num_hash.number {
                 break;
             }
@@ -335,7 +340,7 @@ where
                     parent = block.header.parent_hash;
                     parent_num = block.header.number - 1;
                     difficulty = block.header.difficulty;
-                    info!(target: "consensus-client", ?difficulty);
+                    debug!(target: "consensus-client", ?difficulty);
                     parents.push(block.clone());
                     continue;
                 }
@@ -344,7 +349,7 @@ where
                         parent = parent_block.parent_hash;
                         parent_num = parent_block.header.number - 1;
                         difficulty = parent_block.header.difficulty;
-                        info!(target: "consensus-client", ?difficulty);
+                        debug!(target: "consensus-client", ?difficulty);
                         let sealed_block = parent_block.seal_slow();
                         parents.push(sealed_block.clone());
                         self.recent_blocks.insert(sealed_block.hash(), sealed_block);
@@ -772,7 +777,6 @@ where
 
         let finalized_block_from_p2p = self.fetch_block(block_hash.into()).await?.seal_slow();
 
-        //self.sync_to_hash_in_small_unit(finalized_block_from_p2p.header().parent_hash, MIN_BLOCKS_FOR_PIPELINE_RUN).await?;
         self.sync_to_hash_in_small_unit(
             finalized_block_from_p2p.header().parent_hash,
             SYNC_DOWNLOAD_BLOCKS_UNIT,

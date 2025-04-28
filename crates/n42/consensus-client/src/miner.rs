@@ -475,9 +475,9 @@ where
         active_signers.dedup();
         let num_active_signers: u64 = active_signers.len() as u64;
         if num_active_signers != num_signers {
-            safe_block_number = header
+            safe_block_number = safe_block_number.max(header
                 .number
-                .saturating_sub(num_active_signers * 3 + 1);
+                .saturating_sub(num_active_signers * 3 + 1));
         } else {
             // if in NUM_CONFIRM_ROUNDS rounds, all active signers have signed a 2-difficulty block, then it is considered finalized
             let order_in_round = (best_block_number.saturating_sub(NUM_CONFIRM_ROUNDS * num_signers)
@@ -494,9 +494,9 @@ where
                 .count() as u64
                 == num_active_signers * NUM_CONFIRM_ROUNDS;
             if order_in_round {
-                safe_block_number = header
+                safe_block_number = safe_block_number.max(header
                     .number
-                    .saturating_sub(num_signers * NUM_CONFIRM_ROUNDS + 1);
+                    .saturating_sub(num_signers * NUM_CONFIRM_ROUNDS + 1));
             }
             self.order_stats.insert(header.number, order_in_round);
             debug!(target: "consensus-client", number=?header.number, num_active_signers, order_in_round);

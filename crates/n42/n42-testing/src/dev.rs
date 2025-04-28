@@ -96,7 +96,7 @@ async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(node: 
         payload.into(),
     )
     .await?;
-    println!("submission={:?}", submission);
+    println!("submission={submission:?}");
 
     let current_head = parent_hash;
     let new_head = payload_type.block().hash();

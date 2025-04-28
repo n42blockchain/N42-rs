@@ -266,8 +266,7 @@ where
         }
     }
 
-    async fn exit_if_lagged_progress(&self, block: &SealedBlock) -> eyre::Result<()> {
-        const MAX_PROGRESS_GAP: u64 = 100;
+    fn long_time_no_block_generated(&self) -> bool {
         const MIN_NO_BLOCK_TIMESTAMP_GAP: u64 = 300;
 
         let best_block_number = self.provider.best_block_number().unwrap();
@@ -278,7 +277,19 @@ where
         let now = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("cannot be earlier than UNIX_EPOCH");
-        debug!(target: "consensus-client", my_number=?best_block_number, received_number=?block.header().number, ?now, "exit_if_lagged_progress");
+        if now.as_secs() > latest_header.timestamp + MIN_NO_BLOCK_TIMESTAMP_GAP {
+            warn!(target: "consensus-client", latest_header_timestamp=?latest_header.timestamp, ?now, "long_time_no_block_generated");
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn exit_if_lagged_progress(&self, block: &SealedBlock) -> eyre::Result<()> {
+        const MAX_PROGRESS_GAP: u64 = 100;
+
+        let best_block_number = self.provider.best_block_number().unwrap();
+        debug!(target: "consensus-client", my_number=?best_block_number, received_number=?block.header().number,"exit_if_lagged_progress");
         if block.header().number > best_block_number + MAX_PROGRESS_GAP {
             let current_signers = self.get_best_block_signers();
             let signer = match recover_address(&block.header()) {
@@ -287,12 +298,9 @@ where
                     eyre::bail!("Error in recover_address: {:?}", err);
                 },
             };
-            if current_signers.contains(&signer) && now.as_secs() > latest_header.timestamp + MIN_NO_BLOCK_TIMESTAMP_GAP {
-                warn!(target: "consensus-client", my_number=?best_block_number, received_number=?block.header().number, my_timestamp=?latest_header.timestamp, ?now, "exit for lagged progress");
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::this(),
-                    nix::sys::signal::Signal::SIGINT,
-                );
+            if current_signers.contains(&signer) && self.long_time_no_block_generated() {
+                warn!(target: "consensus-client", my_number=?best_block_number, received_number=?block.header().number, "exit for lagged progress");
+                exit_by_sigint();
             }
         }
 
@@ -597,9 +605,15 @@ where
         {
             Some(Ok(payload)) => payload,
             Some(Err(err)) => {
+                if self.long_time_no_block_generated() {
+                    exit_by_sigint();
+                }
                 eyre::bail!("Failed to resolve payload: {}", err);
             }
             None => {
+                if self.long_time_no_block_generated() {
+                    exit_by_sigint();
+                }
                 eyre::bail!("No payload");
             }
         };
@@ -751,10 +765,7 @@ where
             if hash != header_hash_from_p2p {
                 warn!(target: "consensus-client", number, ?hash, ?header_hash_from_p2p, "found first different block");
                 warn!(target: "consensus-client", "please execute 'n42 stage unwind to-block {}', then run n42 node again", number - 1);
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::this(),
-                    nix::sys::signal::Signal::SIGINT,
-                );
+                exit_by_sigint();
                 sleep(Duration::from_secs(u64::MAX)).await;
             }
         }
@@ -892,4 +903,11 @@ where
         info!(hash=?header.hash(), ?td, header.number, header.timestamp, average_td, "max_td_and_hash");
         (td, header.hash())
     }
+}
+
+fn exit_by_sigint() {
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::this(),
+        nix::sys::signal::Signal::SIGINT,
+    );
 }

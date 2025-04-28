@@ -8,7 +8,7 @@ use reth_consensus::Consensus;
 
 use reth_primitives::{
     proofs::{self},
-    revm_primitives::{BlockEnv, CfgEnvWithHandlerCfg},
+    revm_primitives::{HaltReason, BlockEnv, CfgEnvWithHandlerCfg},
     Block, BlockBody, EthereumHardforks, Header, Receipt, Verifiers, Rewards
 };
 
@@ -350,7 +350,9 @@ where
                     ?reason, ?gas_used,
                     "ExecutionResult::Halt "
                 );
-                return Err(PayloadBuilderError::other(std::io::Error::new(std::io::ErrorKind::Other,"evm execution halt")));
+                if reason != HaltReason::NotActivated {
+                    return Err(PayloadBuilderError::other(std::io::Error::new(std::io::ErrorKind::Other,"evm execution halt by reasons other than NotActivated")));
+                }
             },
             _ => {
             },

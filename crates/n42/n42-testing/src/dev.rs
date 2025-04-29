@@ -167,7 +167,7 @@ impl CliqueTest {
 
        for vote in &self.votes {
            let eth_signer_key = hex::encode(accounts.secret_key(&vote.signer).secret_bytes());
-           println!("signer={} eth_signer_key={:?}", vote.signer, eth_signer_key);
+           println!("signer={} eth_signer_key={eth_signer_key:?}", vote.signer);
            if let Some(ref voted) = vote.voted {
                if let Some(auth) = vote.auth {
                    let voted_address = accounts.address(voted);

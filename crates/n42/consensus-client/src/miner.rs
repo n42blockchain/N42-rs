@@ -178,7 +178,9 @@ where
 
     /// Runs the [`N42Miner`] in a loop, polling the miner and building payloads.
     async fn run(mut self) -> eyre::Result<()> {
-        self.initial_sync().await;
+        if !(self.get_best_block_num_signers() == 1 && self.is_among_signers()?) {
+            self.initial_sync().await;
+        }
 
         let mut new_block_event_stream = self.network.subscribe_block();
         let mut network_event_stream = self.network.event_listener();
@@ -228,11 +230,10 @@ where
             }
             loop {
                 sleep(Duration::from_secs(WAIT_FOR_PEERS_INTERVAL_SECS)).await;
+
                 if let Ok(all_peers) = self.network.get_all_peers().await {
-                    let num_signers = self.get_best_block_num_signers();
-                    if all_peers.len() < num_signers as usize / 2 {
-                        info!(target: "consensus-client", peers_count=all_peers.len(), num_signers, "Waiting for more peers(at least half of number of signers)");
-                    } else {
+                    info!(target: "consensus-client", peers_count=all_peers.len());
+                    if all_peers.len() > 0 {
                         status_counts = all_peers
                             .iter()
                             .map(|v| (v.status.total_difficulty, v.status.blockhash))

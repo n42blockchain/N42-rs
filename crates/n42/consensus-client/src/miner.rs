@@ -610,13 +610,13 @@ where
         {
             Some(Ok(payload)) => payload,
             Some(Err(err)) => {
-                if self.long_time_no_block_generated() {
+                if self.is_among_signers()? && self.long_time_no_block_generated() {
                     exit_by_sigint();
                 }
                 eyre::bail!("Failed to resolve payload: {}", err);
             }
             None => {
-                if self.long_time_no_block_generated() {
+                if self.is_among_signers()? && self.long_time_no_block_generated() {
                     exit_by_sigint();
                 }
                 eyre::bail!("No payload");
@@ -906,6 +906,14 @@ where
         let average_td = td.to::<u64>() as f64 / header.number as f64;
         info!(hash=?header.hash(), ?td, header.number, header.timestamp, average_td, "max_td_and_hash");
         (td, header.hash())
+    }
+
+    fn is_among_signers(&self) -> eyre::Result<bool> {
+        if let Some(address) = self.consensus.get_eth_signer_address()? {
+            Ok(self.get_best_block_signers().contains(&address))
+        } else {
+            Ok(false)
+        }
     }
 }
 

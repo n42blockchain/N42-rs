@@ -147,6 +147,12 @@ pub trait Consensus: Debug + Send + Sync {
         Ok(())
     }
 
+    fn get_eth_signer_address(
+        &self,
+    ) -> Result<Option<Address>, ConsensusError> {
+        Ok(Some(Address::ZERO))
+    }
+
     fn snapshot(
         &self,
         number: u64,

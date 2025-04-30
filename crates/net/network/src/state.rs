@@ -185,7 +185,8 @@ impl NetworkState {
     pub(crate) fn announce_new_block(&mut self, msg: NewBlockMessage) {
         // send a `NewBlock` message to a fraction of the connected peers (square root of the total
         // number of peers)
-        let num_propagate = (self.active_peers.len() as f64).sqrt() as u64 + 1;
+        //let num_propagate = (self.active_peers.len() as f64).sqrt() as u64 + 1;
+        let num_propagate = self.active_peers.len();
 
         let number = msg.block.block.header.number;
         let mut count = 0;

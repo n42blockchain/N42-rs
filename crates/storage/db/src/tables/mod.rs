@@ -280,6 +280,12 @@ tables! {
     /// apos snapshot
     table Snapshots<Key = BlockNumber,Value = Snapshot>;
 
+    /// Stores the snaphsot per hash
+    table SnapshotsByHash<Key = HeaderHash, Value = Snapshot>;
+
+    /// Stores the signer per hash
+    table SignersByHash<Key = HeaderHash, Value = Address>;
+
     /// Stores the header hashes belonging to the canonical chain.
     table CanonicalHeaders<Key = BlockNumber, Value = HeaderHash>;
 

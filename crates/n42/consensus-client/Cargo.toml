@@ -20,6 +20,7 @@ reth-evm.workspace = true
 reth-ethereum-engine-primitives.workspace = true
 reth-payload-builder.workspace = true
 reth-payload-primitives.workspace = true
+reth-primitives.workspace = true
 reth-payload-validator.workspace = true
 reth-provider.workspace = true
 reth-prune.workspace = true
@@ -32,10 +33,13 @@ reth-network-api.workspace = true
 reth-tokio-util.workspace = true
 reth-node-types.workspace = true
 reth-node-api.workspace = true
+reth-network-p2p.workspace = true
+reth-primitives-traits.workspace = true
 
 # alloy
 alloy-primitives.workspace = true
 alloy-rpc-types-engine.workspace = true
+alloy-eips.workspace = true
 
 # async
 tokio.workspace = true
@@ -43,8 +47,11 @@ tokio-stream.workspace = true
 futures-util.workspace = true
 
 # misc
+nix.workspace = true
 eyre.workspace = true
 tracing.workspace = true
+schnellru.workspace = true
+itertools.workspace = true
 
 op-alloy-rpc-types-engine = { workspace = true, optional = true }
 

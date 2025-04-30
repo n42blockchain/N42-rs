@@ -52,7 +52,7 @@ pub fn recover_address(header: &Header) -> Result<Address, Box<dyn Error>> {
 
     let signature = RecoverableSignature::from_compact(
         &signature[..64],
-        RecoveryId::from_i32(i32::from(signature[64]) - 27)?,
+        RecoveryId::from_i32(i32::from(signature[64]))?,
     )?;
 
     Ok(public_key_to_address(SECP256K1.recover_ecdsa(&message, &signature)?))

@@ -1426,6 +1426,10 @@ impl<N: ProviderNodeTypes> SnapshotProvider for ConsistentProvider<N>{
     fn load_snapshot(&self, id: BlockHashOrNumber) -> ProviderResult<Option<Snapshot>> {
         self.storage_provider.load_snapshot(id)
     }
+
+    fn load_snapshot_by_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<Snapshot>> {
+        self.storage_provider.load_snapshot_by_hash(block_hash)
+    }
 }
 
 //

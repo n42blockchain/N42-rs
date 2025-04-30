@@ -383,10 +383,13 @@ impl EthereumHardfork {
     }
 
     /// AST mainnet list of hardforks.
-    pub const fn n42() -> [(Self, ForkCondition); 14] {
+    pub const fn n42() -> [(Self, ForkCondition); 17] {
         [
+            (Self::Frontier, ForkCondition::Block(0)),
             (Self::Homestead, ForkCondition::Block(0)),
             (Self::Dao, ForkCondition::Never),
+            (Self::Tangerine, ForkCondition::Block(0)),
+            (Self::SpuriousDragon, ForkCondition::Block(0)),
             (Self::Byzantium, ForkCondition::Block(0)),
             (Self::Constantinople, ForkCondition::Block(0)),
             (Self::Petersburg, ForkCondition::Block(0)),
@@ -395,16 +398,16 @@ impl EthereumHardfork {
             (Self::Berlin, ForkCondition::Block(0)),
             (Self::London, ForkCondition::Block(0)),
             (Self::ArrowGlacier, ForkCondition::Block(0)),
-            (Self::BeiJing, ForkCondition::Block(770000)),
+            (Self::BeiJing, ForkCondition::Block(0)),
             (
                 Self::Paris,
                 ForkCondition::TTD {
-                    fork_block: None,
-                    total_difficulty: uint!(58_750_000_000_000_000_000_000_U256),
+                    fork_block: Some(0),
+                    total_difficulty: U256::ZERO,
                 },
             ),
-            (Self::Shanghai, ForkCondition::Block(0)),
-            (Self::Cancun, ForkCondition::Block(0)),
+            (Self::Shanghai, ForkCondition::Timestamp(1746576000)),
+            (Self::Cancun, ForkCondition::Timestamp(1746576000)),
         ]
     }
 

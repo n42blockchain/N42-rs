@@ -916,6 +916,10 @@ impl<N: ProviderNodeTypes> SnapshotProvider for BlockchainProvider<N> {
     fn load_snapshot(&self, id: BlockHashOrNumber) -> ProviderResult<Option<Snapshot>> {
         self.database.provider()?.load_snapshot(id)
     }
+
+    fn load_snapshot_by_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<Snapshot>> {
+        self.database.provider()?.load_snapshot_by_hash(block_hash)
+    }
 }
 
 impl<N: ProviderNodeTypes> SnapshotProviderWriter for BlockchainProvider<N> {
@@ -923,6 +927,18 @@ impl<N: ProviderNodeTypes> SnapshotProviderWriter for BlockchainProvider<N> {
         let provider_rw = self.database.database_provider_rw()?;
         provider_rw.save_snapshot(id, snapshot)?;
         provider_rw.commit()
+    }
+
+    fn save_snapshot_by_hash(&self, block_hash: &BlockHash,  snapshot: Snapshot) -> ProviderResult<()> {
+        let provider_rw = self.database.database_provider_rw()?;
+        provider_rw.save_snapshot_by_hash(block_hash, snapshot)?;
+        provider_rw.commit().map(|_|())
+    }
+
+    fn save_signer_by_hash(&self, block_hash: &BlockHash,  signer: Address) -> ProviderResult<()> {
+        let provider_rw = self.database.database_provider_rw()?;
+        provider_rw.save_signer_by_hash(block_hash, signer)?;
+        provider_rw.commit().map(|_|())
     }
 }
 

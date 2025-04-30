@@ -18,7 +18,7 @@ use reth_ethereum_forks::{
     ForkFilter, ForkFilterKey, ForkHash, ForkId, Hardfork, Hardforks, Head, DEV_HARDFORKS,
 };
 use reth_network_peers::{
-    base_nodes, base_testnet_nodes, holesky_nodes, mainnet_nodes, op_nodes, op_testnet_nodes,
+    base_nodes, base_testnet_nodes, holesky_nodes, n42_testnet_nodes, mainnet_nodes, op_nodes, op_testnet_nodes,
     sepolia_nodes, NodeRecord,
 };
 use reth_primitives_traits::{constants::HOLESKY_GENESIS_HASH, Header, SealedHeader};
@@ -29,10 +29,12 @@ use crate::{constants::MAINNET_DEPOSIT_CONTRACT, once_cell_set, EthChainSpec, La
 pub const N42_GENESIS_HASH: B256 =
     b256!("d4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3");
 
+pub const N42_TESTNET_CHAINID: u64 = 1142;
+
 /// The Ethereum mainnet spec
 pub static N42: LazyLock<Arc<ChainSpec>> = LazyLock::new(|| {
     let mut spec = ChainSpec {
-        chain: Chain::from_id(1142),
+        chain: Chain::from_id(N42_TESTNET_CHAINID),
         genesis: serde_json::from_str(include_str!("../res/genesis/n42.json"))
             .expect("Can't deserialize N42 genesis json"),
         genesis_hash: OnceLock::new(),
@@ -271,6 +273,12 @@ impl ChainSpec {
     #[inline]
     pub fn is_optimism_mainnet(&self) -> bool {
         self.chain == Chain::optimism_mainnet()
+    }
+
+    /// Returns `true` if this chain is n42 testnet.
+    #[inline]
+    pub fn is_n42_testnet(&self) -> bool {
+        self.chain == Chain::from_id(N42_TESTNET_CHAINID)
     }
 
     /// Get the genesis block specification.
@@ -586,6 +594,9 @@ impl ChainSpec {
 
     /// Returns the known bootnode records for the given chain.
     pub fn bootnodes(&self) -> Option<Vec<NodeRecord>> {
+        if self.is_n42_testnet() {
+            return Some(n42_testnet_nodes());
+        }
         use NamedChain as C;
         let chain = self.chain;
         match chain.try_into().ok()? {

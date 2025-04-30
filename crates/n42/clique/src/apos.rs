@@ -609,6 +609,14 @@ Some(vec![parent.header().clone()]))?;
         Ok(())
     }
 
+    fn get_eth_signer_address(
+        &self,
+    ) -> Result<Option<Address>, ConsensusError> {
+        Ok(*self.signer.read().map_err(|err| ConsensusError::AposErrorDetail {
+            detail: err.to_string()
+        })?)
+    }
+
     /// snapshot retrieves the authorization snapshot at a given point in time.
     fn snapshot(
         &self,

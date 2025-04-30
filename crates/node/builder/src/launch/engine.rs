@@ -38,7 +38,7 @@ use reth_provider::BlockReaderIdExt;
 use reth_tasks::TaskExecutor;
 use reth_tokio_util::EventSender;
 use reth_tracing::tracing::{debug, error, info};
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc::unbounded_channel, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
@@ -50,6 +50,8 @@ use crate::{
     AddOns, AddOnsContext, ExExLauncher, FullNode, LaunchContext, LaunchNode, NodeAdapter,
     NodeBuilderWithComponents, NodeComponents, NodeComponentsBuilder, NodeHandle, NodeTypesAdapter,
 };
+
+const DEFAULT_BLOCK_TIME_SECS: u64 = 8;
 
 /// The engine node launcher.
 #[derive(Debug)]
@@ -417,14 +419,12 @@ where
         });
 
         let mining_mode = if let Some(_) = ctx.node_config().dev.consensus_signer_private_key {
-            if let Some(block_time) = ctx.node_config().dev.block_time {
-                consensus_client::miner::MiningMode::interval(block_time)
-            } else {
-                consensus_client::miner::MiningMode::instant(ctx.components().pool().clone())
-            }
+            let block_time = ctx.node_config().dev.block_time.unwrap_or_else(|| Duration::from_secs(DEFAULT_BLOCK_TIME_SECS));
+            consensus_client::miner::MiningMode::interval(block_time)
         } else {
             consensus_client::miner::MiningMode::NoMining
         };
+        info!(target: "reth::cli", ?mining_mode);
         let signer_address = if let Some(signer_private_key) = ctx.node_config().dev.consensus_signer_private_key {
             let eth_signer: PrivateKeySigner = signer_private_key.to_string().parse().unwrap();
             Some(eth_signer.address())

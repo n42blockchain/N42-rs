@@ -34,7 +34,7 @@ use reth_network::{
 };
 use reth_network_peers::{mainnet_nodes, TrustedPeer};
 use secp256k1::SecretKey;
-use tracing::error;
+use tracing::{error, debug};
 
 use crate::version::P2P_CLIENT_VERSION;
 
@@ -207,6 +207,9 @@ impl NetworkArgs {
         let chain_bootnodes = self
             .resolved_bootnodes()
             .unwrap_or_else(|| chain_spec.bootnodes().unwrap_or_else(mainnet_nodes));
+        debug!(target: "reth::cli",
+                        ?chain_bootnodes,
+                    );
         let peers_file = self.peers_file.clone().unwrap_or(default_peers_file);
 
         // Configure peer connections

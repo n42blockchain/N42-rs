@@ -9,11 +9,16 @@ mod optimism;
 mod ast;
 
 pub use optimism::*;
-use crate::bootnodes::ast::N42_BOOTNODES;
+use crate::bootnodes::ast::{N42_BOOTNODES, N42_TESTNET_BOOTNODES};
 
 /// Returns parsed ast nodes
 pub fn n42_nodes() -> Vec<NodeRecord> {
     parse_nodes(&N42_BOOTNODES[..])
+}
+
+/// Returns parsed n42 testnet nodes
+pub fn n42_testnet_nodes() -> Vec<NodeRecord> {
+    parse_nodes(&N42_TESTNET_BOOTNODES[..])
 }
 
 /// Returns parsed mainnet nodes

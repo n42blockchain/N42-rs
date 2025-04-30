@@ -124,6 +124,7 @@ const WAIT_FOR_PEERS_INTERVAL_SECS: u64 = 5;
 const WAIT_FOR_DOWNLOAD_INTERVAL_MS: u64 = 100;
 const SYNC_DOWNLOAD_BLOCKS_UNIT: u64 = 512;
 const DIFFICULTY_DELTA_CLAMP: u64 = 50;
+const MAX_NUM_LOCAL_BLOCKS_TO_CHECK: u64 = 256;
 
 impl<EngineT, Provider, B, Network> N42Miner<EngineT, Provider, B, Network>
 where
@@ -762,7 +763,18 @@ where
             .unwrap_or(0);
         let best_block_number = self.provider.best_block_number().unwrap_or(0);
         info!(target: "consensus-client", ?finalized_block_number, ?best_block_number, "initial_sync_to_hash");
-        for number in (finalized_block_number..=best_block_number).skip(1) {
+
+        let num_blocks = best_block_number - finalized_block_number;
+        let start_block_number = if num_blocks > MAX_NUM_LOCAL_BLOCKS_TO_CHECK {
+            warn!(target: "consensus-client", ?finalized_block_number, ?best_block_number, MAX_NUM_LOCAL_BLOCKS_TO_CHECK=?MAX_NUM_LOCAL_BLOCKS_TO_CHECK,
+                "some of the blocks from finalized block to best block are not checked to see they are same as the blocks on the chain",
+            );
+            best_block_number.saturating_sub(MAX_NUM_LOCAL_BLOCKS_TO_CHECK)
+        } else {
+            finalized_block_number
+        };
+
+        for number in (start_block_number..=best_block_number).skip(1) {
             let block = self.provider.block_by_number(number).unwrap().unwrap();
             let hash = block.header.hash_slow();
             debug!(target: "consensus-client", number, "initial_sync_to_hash, fetching header");

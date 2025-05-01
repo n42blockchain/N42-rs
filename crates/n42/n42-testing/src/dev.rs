@@ -181,7 +181,7 @@ impl CliqueTest {
        }
        let best_number = node.provider.chain_info().unwrap().best_number;
        let block_hash = node.provider.block_hash(best_number).unwrap().unwrap();
-       println!("best_number={:?}, block_hash={:?}", best_number, block_hash);
+       println!("best_number={best_number:?}, block_hash={block_hash:?}");
 
        let snapshot = node.consensus.snapshot(best_number, block_hash, None).unwrap();
        println!("snapshot={:?}", snapshot);

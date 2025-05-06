@@ -31,6 +31,7 @@ impl<ChainSpec> N42PayloadAttributesBuilder<ChainSpec> {
         Self { chain_spec, signer_address: None }
     }
 
+    /// Creates a new instance of the builder with an optional signer address
     pub const fn new_add_signer(chain_spec: Arc<ChainSpec>, signer_address: Option<Address>) -> Self {
         Self { chain_spec, signer_address }
     }

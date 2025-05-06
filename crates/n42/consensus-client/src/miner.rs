@@ -30,7 +30,6 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
     time::{Duration, UNIX_EPOCH},
-    hash::Hash,
 };
 use tokio::sync::mpsc;
 use tokio::time::{interval_at, sleep, Instant, Interval};
@@ -45,6 +44,7 @@ pub enum MiningMode {
     Instant(Fuse<ReceiverStream<TxHash>>),
     /// In this mode a block is built at a fixed interval.
     Interval(Interval),
+    /// In this mode no block is built by the node.
     NoMining,
 }
 
@@ -145,11 +145,6 @@ where
         network: Network,
         consensus: Arc<dyn Consensus>,
     ) {
-        let latest_header = provider
-            .sealed_header(provider.best_block_number().unwrap())
-            .unwrap()
-            .unwrap();
-
         let (new_block_tx, new_block_rx) = mpsc::channel::<(NewBlock, BlockHash)>(128);
         let miner = Self {
             provider,
@@ -217,14 +212,14 @@ where
 
     async fn initial_sync(&mut self) {
         loop {
-            let mut status_counts = HashMap::new();
+            let mut status_counts;
             if let Ok(all_peers) = self.network.get_all_peers().await {
                 // workaround for obsolete peer status
                 info!(target: "consensus-client", "disconnecting and removing peers to get the latest status");
                 for peer in all_peers {
                     self.network.disconnect_peer(peer.remote_id);
                     self.network.remove_peer(peer.remote_id, peer.kind);
-                    info!(target: "consensus-client", "Disconnected peer {}", peer_id=peer.remote_id);
+                    info!(target: "consensus-client", "Disconnected peer {peer_id}", peer_id=peer.remote_id);
                 }
             }
             loop {
@@ -325,7 +320,7 @@ where
         let mut is_fork = false;
         let mut parent = block.hash();
         let mut parent_num = block.header.number;
-        let mut difficulty = block.header.difficulty;
+        let mut difficulty;
         let safe_block_num_hash = self.get_safe_block_num_hash_from_provider();
         loop {
             debug!(target: "consensus-client", ?parent_num, ?parent, safe_number=?safe_block_num_hash.number, block_hash=?block.hash());
@@ -748,7 +743,7 @@ where
     }
 
     /// On node init, sync head to specified hash
-    async fn initial_sync_to_hash(&mut self, td: U256, block_hash: BlockHash) -> eyre::Result<()> {
+    async fn initial_sync_to_hash(&mut self, _td: U256, block_hash: BlockHash) -> eyre::Result<()> {
         let start = Instant::now();
         info!(target: "consensus-client", "initial_sync_to_hash hash {:?}", block_hash);
         let finalized_block_number = self

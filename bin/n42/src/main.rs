@@ -93,6 +93,7 @@ pub trait ConsensusExtApi {
 }
 
 /// The type that implements the `consensus` rpc namespace trait
+#[derive(Debug)]
 pub struct ConsensusExt<Cons, Provider> {
     consensus: Cons,
     provider: Provider,

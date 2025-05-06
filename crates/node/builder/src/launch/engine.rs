@@ -1,7 +1,6 @@
 //! Engine node related functionality.
 
 use futures::{future::Either, stream, stream_select, StreamExt};
-use alloy_primitives::{Address, U256};
 use alloy_signer_local::PrivateKeySigner;
 use reth_beacon_consensus::{
     hooks::{EngineHooks, StaticFileHook},
@@ -10,7 +9,7 @@ use reth_beacon_consensus::{
 use reth_blockchain_tree::BlockchainTreeConfig;
 use reth_chainspec::EthChainSpec;
 use reth_consensus_debug_client::{DebugConsensusClient, EtherscanBlockProvider};
-use reth_engine_local::{LocalEngineService, LocalPayloadAttributesBuilder, MiningMode};
+use reth_engine_local::{LocalEngineService, MiningMode};
 use consensus_client::miner::N42Miner;
 use n42_engine_primitives::N42PayloadAttributesBuilder;
 use reth_engine_service::service::{ChainEvent, EngineService};
@@ -32,7 +31,6 @@ use reth_node_core::{
 };
 use reth_node_events::{cl::ConsensusLayerHealthEvents, node};
 use reth_payload_primitives::PayloadBuilder;
-use reth_primitives::EthereumHardforks;
 use reth_provider::providers::{BlockchainProvider2, ProviderNodeTypes};
 use reth_provider::BlockReaderIdExt;
 use reth_tasks::TaskExecutor;
@@ -344,7 +342,6 @@ where
             .map_err(|e| eyre::eyre!("Failed to subscribe to payload builder events: {:?}", e))?
             .into_built_payload_stream()
             .fuse();
-        let chainspec = ctx.chain_spec();
         let (exit, rx) = oneshot::channel();
         let terminate_after_backfill = ctx.terminate_after_initial_backfill();
 
@@ -393,7 +390,7 @@ where
                                 break
                             }
                             ChainEvent::Handler(ev) => {
-                                if let Some(head) = ev.canonical_header() {
+                                if let Some(_head) = ev.canonical_header() {
                                     if let Ok(Some(finalized_header)) = provider.finalized_header() {
 
                     let finalized_td = consensus.total_difficulty(finalized_header.hash());

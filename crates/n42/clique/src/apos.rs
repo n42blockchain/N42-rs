@@ -1,6 +1,4 @@
 use std::error::Error;
-use std::hash::Hash;
-use std::io::Write;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 use std::collections::HashMap;
@@ -8,7 +6,6 @@ use std::fmt::{Debug, Formatter};
 use std::sync::atomic::{AtomicBool, Ordering};
 use alloy_primitives::{U256, hex, BlockHash, B64, B256, Address, Bytes, FixedBytes};
 use bytes::BytesMut;
-use itertools::Itertools;
 use rand::prelude::SliceRandom;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_primitives::{SealedBlock, SealedHeader, BlockWithSenders};
@@ -30,41 +27,70 @@ const INMEMORY_SNAPSHOTS: u32 = 128; // Number of recent vote snapshots to keep 
 const INMEMORY_TDS: u32 = 1024; // Number of recent total difficulty records to keep in memory
 
 const WIGGLE_TIME: Duration = Duration::from_millis(500); // Random delay (per signer) to allow concurrent signers
-const MERGE_SIGN_MIN_TIME: u64 = 4; // min time for merge sign
 
 
 // APos proof-of-authority protocol constants
-pub const EPOCH_LENGTH: u64 = 30000; // Default number of blocks after which to checkpoint and reset the pending votes
 
-pub const EXTRA_VANITY: usize = 32; // Fixed number of extra-data prefix bytes reserved for signer vanity
+/// Default number of blocks after which to checkpoint and reset the pending votes
+pub const EPOCH_LENGTH: u64 = 30000;
+
+/// Fixed number of extra-data prefix bytes reserved for signer vanity
+pub const EXTRA_VANITY: usize = 32;
+/// Fixed number of extra-data prefix bytes reserved for seal
 pub const EXTRA_SEAL: usize = 65;
 
-pub const NONCE_AUTH_VOTE: [u8; 8] = hex!("ffffffffffffffff"); // Magic nonce number to vote on adding a new signer
-pub const NONCE_DROP_VOTE: [u8; 8] = hex!("0000000000000000"); // Magic nonce number to vote on removing a signer
+/// Magic nonce number to vote on adding a new signer
+pub const NONCE_AUTH_VOTE: [u8; 8] = hex!("ffffffffffffffff");
+
+/// Magic nonce number to vote on removing a signer
+pub const NONCE_DROP_VOTE: [u8; 8] = hex!("0000000000000000");
+
 // Difficulty constants
-pub const DIFF_IN_TURN: U256 = U256::from_limbs([2u64, 0, 0, 0]);  // Block difficulty for in-turn signatures
-pub const DIFF_NO_TURN: U256 = U256::from_limbs([1u64, 0, 0, 0]);  // Block difficulty for out-of-turn signatures
+/// Block difficulty for in-turn signatures
+pub const DIFF_IN_TURN: U256 = U256::from_limbs([2u64, 0, 0, 0]);
+/// Block difficulty for out-of-turn signatures
+pub const DIFF_NO_TURN: U256 = U256::from_limbs([1u64, 0, 0, 0]);
+/// full immutability threshold
 pub const FULL_IMMUTABILITY_THRESHOLD: usize= 90000;
 
+/// apos error
 #[derive(Debug, Clone)]
 pub enum AposError {
+    /// UnknownBlock,
     UnknownBlock,
+    /// InvalidCheckpointBeneficiary,
     InvalidCheckpointBeneficiary,
+    /// InvalidVote,
     InvalidVote,
+    /// InvalidCheckpointVote,
     InvalidCheckpointVote,
+    /// MissingVanity,
     MissingVanity,
+    /// MissingSignature,
     MissingSignature,
+    /// ExtraSigners,
     ExtraSigners,
+    /// InvalidCheckpointSigners,
     InvalidCheckpointSigners,
+    /// MismatchingCheckpointSigners,
     MismatchingCheckpointSigners,
+    /// InvalidMixDigest,
     InvalidMixDigest,
+    /// InvalidUncleHash,
     InvalidUncleHash,
+    /// InvalidDifficulty,
     InvalidDifficulty,
+    /// WrongDifficulty,
     WrongDifficulty,
+    /// InvalidTimestamp,
     InvalidTimestamp,
+    /// InvalidVotingChain,
     InvalidVotingChain,
+    /// UnauthorizedSigner,
     UnauthorizedSigner,
+    /// RecentlySigned,
     RecentlySigned,
+    /// UnTransion,
     UnTransion,
 }
 
@@ -99,8 +125,8 @@ impl std::fmt::Display for AposError {
 
 impl Error for AposError {}
 
-// APos is the proof-of-authority consensus engine proposed to support the
-// Ethereum testnet following the Ropsten attacks.
+/// APos is the proof-of-authority consensus engine proposed to support the
+/// Ethereum testnet following the Ropsten attacks.
 pub struct APos<Provider, ChainSpec>
 where
     Provider: HeaderProvider + TdProvider + TdProviderWriter +SnapshotProvider + SnapshotProviderWriter + BlockIdReader  + BlockReaderIdExt + Clone + Unpin + 'static,
@@ -128,6 +154,7 @@ where
     Provider: HeaderProvider + TdProvider + TdProviderWriter +SnapshotProvider + SnapshotProviderWriter + BlockIdReader  + BlockReaderIdExt + Clone + Unpin + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks
 {
+    /// new
     pub fn new(
         provider: Provider,
         chain_spec: Arc<ChainSpec>,
@@ -202,7 +229,7 @@ where
         }
         info!(target: "consensus::apos", "recovered address: {}", signer);
 
-        #[cfg(debug_block_signer)]
+        #[cfg(debug_assertions)]
         {
             self.provider.save_signer_by_hash(&header.hash_slow(), signer.clone()).map_err(|_| ConsensusError::UnknownBlock)?;
         }
@@ -230,7 +257,7 @@ where
         Ok(())
     }
 
-    // CalcDifficulty is the difficulty adjustment algorithm. It returns the difficulty that a new block should have:
+    /// CalcDifficulty is the difficulty adjustment algorithm. It returns the difficulty that a new block should have:
     pub fn calc_difficulty(
         &mut self,
         parent: Header,          // assuming IHeader is a trait
@@ -254,12 +281,12 @@ where
     }
 
 
-    // SealHash returns the hash of a block prior to it being sealed.
+    /// SealHash returns the hash of a block prior to it being sealed.
     pub fn seal_hash(&self, header: &Header) -> B256 {
         seal_hash(header)
     }
 
-     // Close implements consensus.Engine. It's a noop for Apoa as there are no background threads.
+    /// Close implements consensus.Engine. It's a noop for Apoa as there are no background threads.
     pub const fn close(&self) -> Result<(), ()> {
         Ok(())
     }
@@ -456,7 +483,7 @@ Some(vec![parent.header().clone()]))?;
     }
 
 
-    fn validate_header_with_total_difficulty(&self,header: &Header,_total_difficulty:U256,) -> Result<(),ConsensusError>  {
+    fn validate_header_with_total_difficulty(&self, _header: &Header,_total_difficulty:U256,) -> Result<(),ConsensusError>  {
         Ok(())
     }
 
@@ -721,7 +748,7 @@ Some(vec![parent.header().clone()]))?;
 
         recents.insert(snap.hash, snap.clone());
 
-        ///If a new checkpoint snapshot is generated, save it to disk
+        //If a new checkpoint snapshot is generated, save it to disk
         if snap.number % CHECKPOINT_INTERVAL == 0 && headers_len > 0 {
             self.provider.save_snapshot_by_hash(&snap.hash, snap.clone()).map_err(|_|ConsensusError::SaveSnapshotError)?;
             debug!(

@@ -166,7 +166,7 @@ impl Snapshot
         }
     }
 
-    // cast Add a new vote to the voting statistics
+    /// cast Add a new vote to the voting statistics
     pub fn cast(&mut self, address: Address, authorize: bool) -> bool {
         // Ensure the vote is meaningful
         if !self.valid_vote(address, authorize) {
@@ -181,7 +181,7 @@ impl Snapshot
         true
     }
 
-    // uncast removes a previously cast vote from the tally.
+    /// uncast removes a previously cast vote from the tally.
     pub fn uncast(&mut self, address: Address, authorize: bool) -> bool {
         if let Some(tally) = self.tally.get_mut(&address) {
             //Ensure that we only remove eligible votes
@@ -332,14 +332,14 @@ impl Snapshot
         Ok(snap)
     }
 
-	 // signers retrieves the list of authorized signers in ascending order.
+	 /// signers retrieves the list of authorized signers in ascending order.
 	 pub fn signers(&self) -> Vec<Address> {
-        let mut sigs: Vec<Address> = self.signers.iter().cloned().collect();
+        let sigs: Vec<Address> = self.signers.iter().cloned().collect();
         //sigs.sort(); 
         sigs
     }
 
-    // inturn returns if a signer at a given block height is in-turn or not.
+    /// inturn returns if a signer at a given block height is in-turn or not.
     pub fn inturn(&self, number: u64, signer: &Address) -> bool {
         let signers = self.signers();
         let mut offset = 0;

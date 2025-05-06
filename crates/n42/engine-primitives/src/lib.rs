@@ -1,3 +1,5 @@
+//! n42 engine primitives
+
 mod attributes;
 pub use attributes::N42PayloadAttributesBuilder;
 pub use attributes::N42PayloadAttributes;

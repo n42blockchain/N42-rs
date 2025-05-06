@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use reth_auto_seal_consensus::AutoSealConsensus;
+//use reth_auto_seal_consensus::AutoSealConsensus;
 use reth_basic_payload_builder::{BasicPayloadJobGenerator, BasicPayloadJobGeneratorConfig};
 use reth_beacon_consensus::EthBeaconConsensus;
 use reth_chainspec::ChainSpec;

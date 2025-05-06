@@ -2,18 +2,16 @@ use std::error::Error;
 use std::hash::Hash;
 use std::io::Write;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
-use std::thread;
 use std::sync::atomic::{AtomicBool, Ordering};
-use alloy_primitives::{U256, hex, Bloom, BlockNumber, BlockHash, keccak256, B64, B256, Address, Bytes, FixedBytes};
-use alloy_rlp::{length_of_length, Encodable};
-use bytes::{BufMut, BytesMut};
+use alloy_primitives::{U256, hex, BlockHash, B64, B256, Address, Bytes, FixedBytes};
+use bytes::BytesMut;
 use itertools::Itertools;
 use rand::prelude::SliceRandom;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
-use reth_primitives::{SealedBlock, SealedHeader, BlockWithSenders, public_key_to_address};
+use reth_primitives::{SealedBlock, SealedHeader, BlockWithSenders};
 use reth_primitives_traits::{Header, header::clique_utils::{recover_address, SIGNATURE_LENGTH, seal_hash}};
 use reth_provider::{BlockIdReader, BlockReaderIdExt, HeaderProvider, SnapshotProvider, TdProvider};
 use tracing::{info, warn, debug, error};
@@ -262,7 +260,7 @@ where
     }
 
      // Close implements consensus.Engine. It's a noop for Apoa as there are no background threads.
-    pub fn close(&self) -> Result<(), ()> {
+    pub const fn close(&self) -> Result<(), ()> {
         Ok(())
     }
 
@@ -314,7 +312,7 @@ where
 
         let total_difficulty = {
             let mut recent_tds = self.recent_tds.write().unwrap();
-            let parent_td = recent_tds.get(&header.parent_hash).expect(&format!("td not found for parent hash {:?}, current header={:?}", header.parent_hash, header));
+            let parent_td = recent_tds.get(&header.parent_hash).unwrap_or_else(|| panic!("td not found for parent hash {:?}, current header={:?}", header.parent_hash, header));
             *parent_td + header.difficulty
         };
 
@@ -404,11 +402,8 @@ where
         }
 
         // Ensure that the block's difficulty is meaningful (may not be correct at this point)
-        if number > 0 {
-            if header.difficulty.is_zero() ||
-                (header.difficulty != DIFF_IN_TURN && header.difficulty != DIFF_NO_TURN) {
-                return Err(ConsensusError::InvalidDifficulty);
-            }
+        if number > 0 && (header.difficulty.is_zero() || (header.difficulty != DIFF_IN_TURN && header.difficulty != DIFF_NO_TURN)) {
+            return Err(ConsensusError::InvalidDifficulty);
         }
 
         //todo All basic checks passed, verify cascading fields
@@ -587,7 +582,7 @@ Some(vec![parent.header().clone()]))?;
         let eth_signer = eth_signer_guard.as_ref().ok_or(ConsensusError::NoSignerSet)?;
         // Sign all the things!
         let header_bytes = seal_hash(header);
-        let mut sighash = eth_signer.sign_hash_sync(&header_bytes).map_err(|_| ConsensusError::SignHeaderError)?;
+        let sighash = eth_signer.sign_hash_sync(&header_bytes).map_err(|_| ConsensusError::SignHeaderError)?;
 
         let mut extra_data_mut = BytesMut::from(&header.extra_data[..]);
         extra_data_mut[header.extra_data.len().saturating_sub(SIGNATURE_LENGTH)..].copy_from_slice(&sighash.as_bytes());
@@ -647,9 +642,8 @@ Some(vec![parent.header().clone()]))?;
                 if let Ok(Some(s)) = self.provider.load_snapshot_by_hash(&hash) {
                     snap = Some(s);
                     break;
-                } else {
-                    debug!(target: "consensus::apos", "Snapshot not found for hash: {}, at number: {}", hash, number);
                 }
+                debug!(target: "consensus::apos", "Snapshot not found for hash: {}, at number: {}", hash, number);
             }
 
             // If we're at the genesis, snapshot the initial state. Alternatively if we're
@@ -698,17 +692,13 @@ Some(vec![parent.header().clone()]))?;
                     return Err(ConsensusError::UnknownBlock);
                 }
                 header
+            } else if let Some(v) = recent_headers.get(&hash) {
+                v.clone()
+            } else if let Some(header) = self.provider.header_by_hash_or_number(hash.into()).map_err(|_| ConsensusError::UnknownBlock)? {
+                header
             } else {
-                if let Some(v) = recent_headers.get(&hash) {
-                    v.clone()
-                } else {
-                    if let Some(header) = self.provider.header_by_hash_or_number(hash.into()).map_err(|_| ConsensusError::UnknownBlock)? {
-                        header
-                    } else {
-                        info!(target: "consensus::apos", "hash not found: {:?}", hash);
-                        return Err(ConsensusError::UnknownBlock);
-                    }
-                }
+                info!(target: "consensus::apos", "hash not found: {:?}", hash);
+                return Err(ConsensusError::UnknownBlock);
             };
 
             hash = header.parent_hash;
@@ -769,7 +759,7 @@ Some(vec![parent.header().clone()]))?;
         &self,
     ) -> Result<HashMap<Address, bool>, ConsensusError> {
         info!(target: "consensus::apos", "proposals()");
-        let mut proposals_guard = self.proposals.read().unwrap();
+        let proposals_guard = self.proposals.read().unwrap();
         Ok(proposals_guard.clone())
     }
 
@@ -780,7 +770,7 @@ Some(vec![parent.header().clone()]))?;
         self.init_recent_tds();
 
         let mut recent_tds = self.recent_tds.write().unwrap();
-        let total_difficulty = *recent_tds.get(&hash).expect(&format!("td not found for hash {:?}", hash));
+        let total_difficulty = *recent_tds.get(&hash).unwrap_or_else(|| panic!("td not found for hash {:?}", hash));
 
         debug!(target: "consensus::apos", ?hash, ?total_difficulty, "get total_difficulty");
         total_difficulty

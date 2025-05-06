@@ -1,18 +1,16 @@
 //! Contains the implementation of the mining mode for the local engine.
 
-use alloy_eips::{BlockHashOrNumber, BlockNumHash, HashOrNumber};
+use alloy_eips::{BlockHashOrNumber, BlockNumHash};
 use alloy_primitives::{Address, BlockHash, TxHash, B256, U128, U256};
 use alloy_rpc_types_engine::{CancunPayloadFields, ExecutionPayloadSidecar, ForkchoiceState};
 use eyre::OptionExt;
 use futures_util::{stream::Fuse, StreamExt};
 use itertools::Itertools;
 use reth_beacon_consensus::BeaconConsensusEngineHandle;
-use reth_beacon_consensus::ForkchoiceStatus;
 use reth_chainspec::EthereumHardforks;
 use reth_consensus::Consensus;
 use reth_engine_primitives::{EngineApiMessageVersion, EngineTypes};
 use reth_eth_wire_types::NewBlock;
-use reth_network_api::NetworkEvent;
 use reth_network_p2p::{
     bodies::client::BodiesClient, headers::client::HeadersClient, priority::Priority,
 };
@@ -24,7 +22,6 @@ use reth_primitives::{Block, Header, SealedBlock};
 use reth_primitives_traits::header::clique_utils::recover_address;
 use reth_provider::{BlockIdReader, BlockReader, ChainSpecProvider, TdProvider};
 use reth_rpc_types_compat::engine::payload::block_to_payload;
-use reth_tokio_util::EventStream;
 use reth_transaction_pool::TransactionPool;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -33,7 +30,6 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
     time::{Duration, UNIX_EPOCH},
-    thread,
     hash::Hash,
 };
 use tokio::sync::mpsc;
@@ -155,7 +151,7 @@ where
             .unwrap();
 
         let (new_block_tx, new_block_rx) = mpsc::channel::<(NewBlock, BlockHash)>(128);
-        let mut miner = Self {
+        let miner = Self {
             provider,
             payload_attributes_builder,
             beacon_engine_handle,
@@ -236,7 +232,7 @@ where
 
                 if let Ok(all_peers) = self.network.get_all_peers().await {
                     info!(target: "consensus-client", peers_count=all_peers.len());
-                    if all_peers.len() > 0 {
+                    if !all_peers.is_empty() {
                         status_counts = all_peers
                             .iter()
                             .map(|v| (v.status.total_difficulty, v.status.blockhash))
@@ -301,7 +297,7 @@ where
         debug!(target: "consensus-client", my_number=?best_block_number, received_number=?block.header().number,"exit_if_lagged_progress");
         if block.header().number > best_block_number + MAX_PROGRESS_GAP {
             let current_signers = self.get_best_block_signers();
-            let signer = match recover_address(&block.header()) {
+            let signer = match recover_address(block.header()) {
                 Ok(v) => v,
                 Err(err) => {
                     eyre::bail!("Error in recover_address: {:?}", err);
@@ -331,7 +327,7 @@ where
         let mut parent_num = block.header.number;
         let mut difficulty = block.header.difficulty;
         let safe_block_num_hash = self.get_safe_block_num_hash_from_provider();
-        while true {
+        loop {
             debug!(target: "consensus-client", ?parent_num, ?parent, safe_number=?safe_block_num_hash.number, block_hash=?block.hash());
             if parent_num < safe_block_num_hash.number {
                 break;
@@ -339,29 +335,28 @@ where
             if parent == safe_block_num_hash.hash {
                 is_fork = true;
                 break;
-            } else {
-                if let Some(block) = self.recent_blocks.get(&parent) {
-                    parent = block.header.parent_hash;
-                    parent_num = block.header.number - 1;
-                    difficulty = block.header.difficulty;
+            }
+            if let Some(block) = self.recent_blocks.get(&parent) {
+                parent = block.header.parent_hash;
+                parent_num = block.header.number - 1;
+                difficulty = block.header.difficulty;
+                debug!(target: "consensus-client", ?difficulty);
+                parents.push(block.clone());
+                continue;
+            }
+            match self.fetch_block(parent.into()).await {
+                Ok(parent_block) => {
+                    parent = parent_block.parent_hash;
+                    parent_num = parent_block.header.number - 1;
+                    difficulty = parent_block.header.difficulty;
                     debug!(target: "consensus-client", ?difficulty);
-                    parents.push(block.clone());
-                    continue;
+                    let sealed_block = parent_block.seal_slow();
+                    parents.push(sealed_block.clone());
+                    self.recent_blocks.insert(sealed_block.hash(), sealed_block);
                 }
-                match self.fetch_block(parent.into()).await {
-                    Ok(parent_block) => {
-                        parent = parent_block.parent_hash;
-                        parent_num = parent_block.header.number - 1;
-                        difficulty = parent_block.header.difficulty;
-                        debug!(target: "consensus-client", ?difficulty);
-                        let sealed_block = parent_block.seal_slow();
-                        parents.push(sealed_block.clone());
-                        self.recent_blocks.insert(sealed_block.hash(), sealed_block);
-                    }
-                    Err(e) => {
-                        error!(target: "consensus-client", "Error getting the block: {:?}", e);
-                        break;
-                    }
+                Err(e) => {
+                    error!(target: "consensus-client", "Error getting the block: {:?}", e);
+                    break;
                 }
             }
         }
@@ -378,7 +373,7 @@ where
         if is_fork && larger_td {
             let mut new_payload_ok = true;
             for parent in parents.iter().rev() {
-                match self.new_payload(&parent).await {
+                match self.new_payload(parent).await {
                     Ok(_) => {}
                     Err(e) => {
                         error!(target: "consensus-client", "Error validating the block: {:?}", e);
@@ -417,9 +412,9 @@ where
             .consensus
             .snapshot(header.number, header.hash_slow(), None)
             .unwrap();
-        let signers = snapshot.signers;
+        
 
-        signers
+        snapshot.signers
     }
 
     fn get_best_block_num_signers(&self) -> u64 {
@@ -429,7 +424,7 @@ where
     }
 
     fn get_safe_block_num_hash_from_provider(&mut self) -> BlockNumHash {
-        let mut safe_block_number = self
+        let safe_block_number = self
             .provider
             .safe_block_number()
             .unwrap_or(Some(0))
@@ -471,18 +466,14 @@ where
             .filter(|&n| n != 0)
             .map(|n| {
                 let sealed_header = self.provider.sealed_header(n).unwrap().unwrap();
-                let signer = recover_address(&sealed_header.header()).unwrap();
+                let signer = recover_address(sealed_header.header()).unwrap();
                 signer
             })
             .collect::<Vec<_>>();
         active_signers.sort();
         active_signers.dedup();
         let num_active_signers: u64 = active_signers.len() as u64;
-        if num_active_signers != num_signers {
-            safe_block_number = safe_block_number.max(header
-                .number
-                .saturating_sub(num_active_signers * 3 + 1));
-        } else {
+        if num_active_signers == num_signers {
             // if in NUM_CONFIRM_ROUNDS rounds, all active signers have signed a 2-difficulty block, then it is considered finalized
             let order_in_round = (best_block_number.saturating_sub(NUM_CONFIRM_ROUNDS * num_signers)
                 ..best_block_number)
@@ -504,6 +495,10 @@ where
             }
             self.order_stats.insert(header.number, order_in_round);
             debug!(target: "consensus-client", number=?header.number, num_active_signers, order_in_round);
+        } else {
+            safe_block_number = safe_block_number.max(header
+                .number
+                .saturating_sub(num_active_signers * 3 + 1));
         }
         let safe_block_header = self
             .provider
@@ -532,7 +527,7 @@ where
     }
 
     fn get_order_stats(&self) -> (u64, u64, f64) {
-        let in_order_count = self.order_stats.values().filter(|v| **v == true).count();
+        let in_order_count = self.order_stats.values().filter(|v| **v).count();
         let out_of_order_count = self.order_stats.len() - in_order_count;
         (
             in_order_count as u64,
@@ -546,12 +541,12 @@ where
     async fn advance(&mut self) -> eyre::Result<()> {
         let (in_order_count, out_of_order_count, order_ratio) = self.get_order_stats();
         let num_signers = self.get_best_block_num_signers();
-        let interval;
-        match self.mode {
+        
+        let interval = match self.mode {
             MiningMode::Instant(_) => {
                 unimplemented!("Add a separate flow if needed");
             }
-            MiningMode::Interval(ref mut v) => interval = v,
+            MiningMode::Interval(ref mut v) => v,
             _ => return Ok(()),
         };
         let block_time = interval.period().as_secs();
@@ -582,12 +577,10 @@ where
                 Instant::now() + Duration::from_secs(block_time),
                 interval.period(),
             );
-        } else {
-            if self.recent_num_to_td.get(&(header.number + 1)).is_some() {
-                debug!(target: "consensus-client", number=header.number + 1, "skip generating block");
-                self.num_should_skip_block_generation += 1;
-                return Ok(());
-            }
+        } else if self.recent_num_to_td.get(&(header.number + 1)).is_some() {
+            debug!(target: "consensus-client", number=header.number + 1, "skip generating block");
+            self.num_should_skip_block_generation += 1;
+            return Ok(());
         }
 
         let timestamp = now;
@@ -758,7 +751,7 @@ where
     async fn initial_sync_to_hash(&mut self, td: U256, block_hash: BlockHash) -> eyre::Result<()> {
         let start = Instant::now();
         info!(target: "consensus-client", "initial_sync_to_hash hash {:?}", block_hash);
-        let mut finalized_block_number = self
+        let finalized_block_number = self
             .provider
             .finalized_block_number()
             .unwrap_or(Some(0))

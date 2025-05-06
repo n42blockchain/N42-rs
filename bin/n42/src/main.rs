@@ -10,8 +10,7 @@ use n42::cli::Cli;
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_node_builder::{engine_tree_config::{
     TreeConfig, DEFAULT_MEMORY_BLOCK_BUFFER_TARGET, DEFAULT_PERSISTENCE_THRESHOLD,
-}, DefaultNodeLauncher, EngineNodeLauncher};
-use reth_node_ethereum::{node::EthereumAddOns, EthereumNode};
+}, EngineNodeLauncher};
 use reth_provider::providers::BlockchainProvider2;
 use reth_tracing::tracing::warn;
 use tracing::info;
@@ -108,13 +107,15 @@ where
         address: Address,
         auth: bool,
         ) -> RpcResult<()> {
-        Ok(self.consensus.propose(address, auth).unwrap_or_default())
+        self.consensus.propose(address, auth).unwrap_or_default();
+        Ok(())
     }
 
     fn discard(&self,
         address: Address,
         ) -> RpcResult<()> {
-        Ok(self.consensus.discard(address).unwrap_or_default())
+        self.consensus.discard(address).unwrap_or_default();
+        Ok(())
     }
 
     fn get_snapshot(&self,

@@ -411,6 +411,32 @@ impl EthereumHardfork {
         ]
     }
 
+    pub const fn n42_for_consensus_test() -> [(Self, ForkCondition); 15] {
+        [
+            (Self::Frontier, ForkCondition::Block(0)),
+            (Self::Homestead, ForkCondition::Block(0)),
+            (Self::Dao, ForkCondition::Never),
+            (Self::Tangerine, ForkCondition::Block(0)),
+            (Self::SpuriousDragon, ForkCondition::Block(0)),
+            (Self::Byzantium, ForkCondition::Block(0)),
+            (Self::Constantinople, ForkCondition::Block(0)),
+            (Self::Petersburg, ForkCondition::Block(0)),
+            (Self::Istanbul, ForkCondition::Block(0)),
+            (Self::MuirGlacier, ForkCondition::Block(0)),
+            (Self::Berlin, ForkCondition::Block(0)),
+            (Self::London, ForkCondition::Block(0)),
+            (Self::ArrowGlacier, ForkCondition::Block(0)),
+            (Self::BeiJing, ForkCondition::Block(0)),
+            (
+                Self::Paris,
+                ForkCondition::TTD {
+                    fork_block: Some(0),
+                    total_difficulty: U256::ZERO,
+                },
+            ),
+        ]
+    }
+
     /// Ethereum mainnet list of hardforks.
     pub const fn mainnet() -> [(Self, ForkCondition); 17] {
         [

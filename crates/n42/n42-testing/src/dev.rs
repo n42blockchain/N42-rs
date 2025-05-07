@@ -1,4 +1,5 @@
 #![allow(non_snake_case)]
+use reth_ethereum_forks::EthereumHardfork;
 use reth_ethereum_engine_primitives::ExecutionPayloadV1;
 use n42_engine_primitives::N42PayloadBuilderAttributes;
 use reth_payload_primitives::{BuiltPayload, PayloadBuilder};
@@ -133,6 +134,8 @@ impl CliqueTest {
             });
         }
 
+        let hardforks = EthereumHardfork::n42_for_consensus_test();
+        chainspec.hardforks = hardforks.into();
         chainspec
     }
 

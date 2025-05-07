@@ -15,6 +15,7 @@ n42-engine-types.workspace = true
 n42-engine-primitives.workspace = true
 
 # reth
+reth-ethereum-forks.workspace = true
 reth-primitives-traits.workspace = true
 reth-payload-primitives.workspace = true
 reth-payload-builder.workspace = true

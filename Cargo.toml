@@ -15,7 +15,6 @@ members = [
     "crates/n42/engine-types/",
     "crates/n42/engine-primitives/",
     "crates/n42/n42-testing",
-    "crates/n42/n42-testing-util",
     "crates/n42/mobile",
     "crates/engine/invalid-block-hooks/",
     "crates/evm/",

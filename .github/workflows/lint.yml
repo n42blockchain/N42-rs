@@ -16,9 +16,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-        with:
-          key: clippy # Add a key for the clippy cache
-          cache-path: ~/.cargo/bin/ # Specify the path to cache
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy

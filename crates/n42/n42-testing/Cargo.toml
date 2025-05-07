@@ -52,6 +52,24 @@ zerocopy = "0.7.35"
 hex = "0.4"
 tiny-keccak = "2.0"
 
+reth.workspace = true
+reth-db.workspace = true
+reth-exex.workspace = true
+reth-tasks.workspace = true
+futures.workspace = true
+alloy-primitives.workspace = true
+alloy-genesis.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+alloy-consensus.workspace = true
+alloy-provider.workspace = true
+rand.workspace = true
+alloy-signer.workspace = true
+alloy-eips.workspace = true
+alloy-sol-types.workspace = true
+alloy-contract.workspace = true
+alloy-rpc-types-beacon.workspace = true
+
 [dev-dependencies]
 reth.workspace = true
 reth-chainspec.workspace = true

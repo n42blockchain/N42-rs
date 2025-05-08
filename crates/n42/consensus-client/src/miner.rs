@@ -212,21 +212,21 @@ where
 
     async fn initial_sync(&mut self) {
         loop {
-            let mut status_counts;
+            let status_counts;
             if let Ok(all_peers) = self.network.get_all_peers().await {
                 // workaround for obsolete peer status
                 info!(target: "consensus-client", "disconnecting and removing peers to get the latest status");
                 for peer in all_peers {
                     self.network.disconnect_peer(peer.remote_id);
                     self.network.remove_peer(peer.remote_id, peer.kind);
-                    info!(target: "consensus-client", "Disconnected peer {peer_id}", peer_id=peer.remote_id);
+                    debug!(target: "consensus-client", "Disconnected peer {peer_id}", peer_id=peer.remote_id);
                 }
             }
             loop {
                 sleep(Duration::from_secs(WAIT_FOR_PEERS_INTERVAL_SECS)).await;
 
                 if let Ok(all_peers) = self.network.get_all_peers().await {
-                    info!(target: "consensus-client", peers_count=all_peers.len());
+                    debug!(target: "consensus-client", peers_count=all_peers.len());
                     if !all_peers.is_empty() {
                         status_counts = all_peers
                             .iter()
@@ -245,18 +245,18 @@ where
                 .iter()
                 .max_by_key(|&(_, count)| count)
                 .unwrap();
-            info!(target: "consensus-client", ?peer_finalized_td, ?max_td, "Comparing peer_finalized_td with max_td");
-            info!(target: "consensus-client", ?peer_finalized_td_hash, ?max_td_hash,);
+            debug!(target: "consensus-client", ?peer_finalized_td, ?max_td, "Comparing peer_finalized_td with max_td");
+            debug!(target: "consensus-client", ?peer_finalized_td_hash, ?max_td_hash,);
             if peer_finalized_td > max_td + U256::from(DIFFICULTY_DELTA_CLAMP) {
                 match self
                     .initial_sync_to_hash(peer_finalized_td, peer_finalized_td_hash)
                     .await
                 {
                     Ok(_) => {
-                        info!(target: "consensus-client", ?peer_finalized_td, ?peer_finalized_td_hash, "finished one sync attempt");
+                        debug!(target: "consensus-client", ?peer_finalized_td, ?peer_finalized_td_hash, "finished one sync attempt");
                     }
                     Err(err) => {
-                        info!(target: "consensus-client", ?err, "initial_sync_to_hash failed");
+                        warn!(target: "consensus-client", ?err, "initial_sync_to_hash failed");
                     }
                 }
             } else {
@@ -356,11 +356,11 @@ where
             }
         }
         let mut larger_td = max_td < U256::from(new_block.td);
-        info!(target: "consensus-client", is_fork, ?max_td, new_block_td=?U256::from(new_block.td));
+        debug!(target: "consensus-client", is_fork, ?max_td, new_block_td=?U256::from(new_block.td));
 
         if let Some(&mut v) = self.recent_num_to_td.get(&new_block.block.number) {
             if v >= U256::from(new_block.td) {
-                info!(target: "consensus-client", number=new_block.block.number, td=?U256::from(new_block.td), old_td=?v, "skip new block");
+                debug!(target: "consensus-client", number=new_block.block.number, td=?U256::from(new_block.td), old_td=?v, "skip new block");
                 self.num_skipped_new_block += 1;
                 larger_td = false;
             }
@@ -386,7 +386,7 @@ where
                     .await
                 {
                     Ok(v) => {
-                        info!(target: "consensus-client", "forkchoice(block hash) status {:?}", v);
+                        debug!(target: "consensus-client", "forkchoice(block hash) status {:?}", v);
                     }
                     Err(e) => {
                         error!(target: "consensus-client", "Error updating fork choice(block hash): {:?}", e);
@@ -551,7 +551,7 @@ where
             .sealed_header(self.provider.best_block_number().unwrap())
             .unwrap()
             .unwrap();
-        info!(target: "consensus-client", block_time, "advance");
+        debug!(target: "consensus-client", block_time, "advance");
         let now = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("cannot be earlier than UNIX_EPOCH");
@@ -579,7 +579,7 @@ where
         }
 
         let timestamp = now;
-        info!(target: "consensus-client", ?timestamp, "advance: PayloadAttributes timestamp");
+        debug!(target: "consensus-client", ?timestamp, "advance: PayloadAttributes timestamp");
 
         let forkchoice_state = self.forkchoice_state();
         let res = self
@@ -617,7 +617,7 @@ where
 
         let block = payload.block();
         let max_td = self.consensus.total_difficulty(block.header.hash());
-        info!(target: "consensus-client", ?max_td, "advance: new_block hash {:?}", block.header.hash());
+        debug!(target: "consensus-client", ?max_td, "advance: new_block hash {:?}", block.header.hash());
 
         self.recent_blocks.insert(block.hash(), block.clone());
 
@@ -626,7 +626,7 @@ where
             block.header().parent_hash,
             block.difficulty,
         );
-        info!(target: "consensus::apos",
+        debug!(target: "consensus::apos",
             "wiggle {:?}, timestamp {:?}, number {}",
             wiggle, timestamp, block.number
         );
@@ -666,7 +666,7 @@ where
     }
 
     async fn new_payload(&mut self, block: &SealedBlock) -> eyre::Result<()> {
-        info!(target: "consensus-client", "new_block hash {:?}", block.header.hash());
+        debug!(target: "consensus-client", "new_block hash {:?}", block.header.hash());
 
         let cancun_fields = self
             .provider
@@ -686,7 +686,7 @@ where
                     .unwrap_or_else(ExecutionPayloadSidecar::none),
             )
             .await?;
-        info!(target: "consensus-client", "new_payload res={:?}", res);
+        debug!(target: "consensus-client", "new_payload res={:?}", res);
         if res.is_invalid() {
             eyre::bail!("new block is invalid: {}", res);
         }
@@ -704,7 +704,7 @@ where
             .await
         {
             Ok(v) => {
-                info!(target: "consensus-client", "forkchoice(block hash) status {:?}", v);
+                debug!(target: "consensus-client", "forkchoice(block hash) status {:?}", v);
             }
             Err(e) => {
                 eyre::bail!("Error updating fork choice(block hash): {:?}", e);
@@ -733,7 +733,7 @@ where
             .await
         {
             Ok(v) => {
-                info!(target: "consensus-client", "forkchoice(block hash) status {:?}", v);
+                debug!(target: "consensus-client", "forkchoice(block hash) status {:?}", v);
             }
             Err(e) => {
                 eyre::bail!("Error updating fork choice(block hash): {:?}", e);

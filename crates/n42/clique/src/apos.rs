@@ -219,7 +219,7 @@ where
         if header.number == 0 {
             return Err(AposError::UnknownBlock.into());
         }
-        info!(target: "consensus::apos", "header number: {}", header.number);
+        debug!(target: "consensus::apos", "verify_seal() header number: {}", header.number);
 
         //Analyze the signer and check if they are in the signer list
         let signer = recover_address(header)?;
@@ -227,7 +227,7 @@ where
             info!(target: "consensus::apos", "err signer not in list: {}", signer);
             return Err(AposError::UnauthorizedSigner.into());
         }
-        info!(target: "consensus::apos", "recovered address: {}", signer);
+        debug!(target: "consensus::apos", "recovered address: {}", signer);
 
         #[cfg(debug_assertions)]
         {
@@ -441,7 +441,7 @@ where
         &self,header: &SealedHeader,
         parent: &SealedHeader,
         ) -> Result<(),ConsensusError>  {
-        info!(target: "consensus::apos", ?header, "in validate_header_against_parent");
+        debug!(target: "consensus::apos", ?header, "in validate_header_against_parent");
 
         let header_hash = header.hash();
         let header = header.header();
@@ -580,7 +580,7 @@ Some(vec![parent.header().clone()]))?;
 
 
         let signer = self.signer.read().unwrap().ok_or(ConsensusError::NoSignerSet)?;
-        info!(target: "consensus::apos", "seal() signer={:?}", signer);
+        debug!(target: "consensus::apos", "seal() signer={:?}", signer);
         // Bail out if we're unauthorized to sign a block
         let snap = self.snapshot(header.number - 1, header.parent_hash, None)?;
         debug!(target: "consensus::apos", "signer list: {:?}, signer: {}", snap.signers, signer);
@@ -693,7 +693,7 @@ Some(vec![parent.header().clone()]))?;
                         let end = start + Address::len_bytes();
                         signers.push(Address::from_slice(&checkpoint.extra_data[start..end]));
                     }
-                    info!(target: "consensus::apos", ?signers,
+                    debug!(target: "consensus::apos", ?signers,
                         "genesis signers:"
                     );
                    
@@ -724,7 +724,7 @@ Some(vec![parent.header().clone()]))?;
             } else if let Some(header) = self.provider.header_by_hash_or_number(hash.into()).map_err(|_| ConsensusError::UnknownBlock)? {
                 header
             } else {
-                info!(target: "consensus::apos", "hash not found: {:?}", hash);
+                error!(target: "consensus::apos", "hash not found: {:?}", hash);
                 return Err(ConsensusError::UnknownBlock);
             };
 

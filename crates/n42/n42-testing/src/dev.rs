@@ -8,7 +8,10 @@ use reth_node_api::{FullNodeComponents, FullNodeTypes, NodeTypesWithEngine,Paylo
 use zerocopy::AsBytes;
 use reth_chainspec::{ChainSpec, N42};
 use reth_provider::{BlockHashReader, BlockReaderIdExt, BlockNumReader};
+
+#[cfg(test)]
 use crate::{utils::n42_payload_attributes, snapshot_test_utils::TesterAccountPool};
+
 use alloy_primitives::{Bytes, Address, B256};
 use alloy_genesis::CliqueConfig;
 use futures::StreamExt;

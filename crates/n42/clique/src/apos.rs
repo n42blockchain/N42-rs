@@ -56,41 +56,41 @@ pub const FULL_IMMUTABILITY_THRESHOLD: usize= 90000;
 /// apos error
 #[derive(Debug, Clone)]
 pub enum AposError {
-    /// UnknownBlock,
+    /// `UnknownBlock`,
     UnknownBlock,
-    /// InvalidCheckpointBeneficiary,
+    /// `InvalidCheckpointBeneficiary`,
     InvalidCheckpointBeneficiary,
-    /// InvalidVote,
+    /// `InvalidVote`,
     InvalidVote,
-    /// InvalidCheckpointVote,
+    /// `InvalidCheckpointVote`,
     InvalidCheckpointVote,
-    /// MissingVanity,
+    /// `MissingVanity`,
     MissingVanity,
-    /// MissingSignature,
+    /// `MissingSignature`,
     MissingSignature,
-    /// ExtraSigners,
+    /// `ExtraSigners`,
     ExtraSigners,
-    /// InvalidCheckpointSigners,
+    /// `InvalidCheckpointSigners`,
     InvalidCheckpointSigners,
-    /// MismatchingCheckpointSigners,
+    /// `MismatchingCheckpointSigners`,
     MismatchingCheckpointSigners,
-    /// InvalidMixDigest,
+    /// `InvalidMixDigest`,
     InvalidMixDigest,
-    /// InvalidUncleHash,
+    /// `InvalidUncleHash`,
     InvalidUncleHash,
-    /// InvalidDifficulty,
+    /// `InvalidDifficulty`,
     InvalidDifficulty,
-    /// WrongDifficulty,
+    /// `WrongDifficulty`,
     WrongDifficulty,
-    /// InvalidTimestamp,
+    /// `InvalidTimestamp`,
     InvalidTimestamp,
-    /// InvalidVotingChain,
+    /// `InvalidVotingChain`,
     InvalidVotingChain,
-    /// UnauthorizedSigner,
+    /// `UnauthorizedSigner`,
     UnauthorizedSigner,
-    /// RecentlySigned,
+    /// `RecentlySigned`,
     RecentlySigned,
-    /// UnTransion,
+    /// `UnTransion`,
     UnTransion,
 }
 
@@ -125,7 +125,7 @@ impl std::fmt::Display for AposError {
 
 impl Error for AposError {}
 
-/// APos is the proof-of-authority consensus engine proposed to support the
+/// `APos` is the proof-of-authority consensus engine proposed to support the
 /// Ethereum testnet following the Ropsten attacks.
 pub struct APos<Provider, ChainSpec>
 where
@@ -231,7 +231,7 @@ where
 
         #[cfg(debug_assertions)]
         {
-            self.provider.save_signer_by_hash(&header.hash_slow(), signer.clone()).map_err(|_| ConsensusError::UnknownBlock)?;
+            self.provider.save_signer_by_hash(&header.hash_slow(), signer).map_err(|_| ConsensusError::UnknownBlock)?;
         }
 
        //Check the list of recent signatories
@@ -257,7 +257,7 @@ where
         Ok(())
     }
 
-    /// CalcDifficulty is the difficulty adjustment algorithm. It returns the difficulty that a new block should have:
+    /// `CalcDifficulty` is the difficulty adjustment algorithm. It returns the difficulty that a new block should have:
     pub fn calc_difficulty(
         &mut self,
         parent: Header,          // assuming IHeader is a trait
@@ -281,13 +281,13 @@ where
     }
 
 
-    /// SealHash returns the hash of a block prior to it being sealed.
+    /// `SealHash` returns the hash of a block prior to it being sealed.
     pub fn seal_hash(&self, header: &Header) -> B256 {
         seal_hash(header)
     }
 
     /// Close implements consensus.Engine. It's a noop for Apoa as there are no background threads.
-    pub const fn close(&self) -> Result<(), ()> {
+    pub const fn close(&self) -> Result<(), ConsensusError> {
         Ok(())
     }
 

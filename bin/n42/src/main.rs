@@ -222,8 +222,8 @@ mod tests {
         let server_addr = start_server().await;
         let uri = format!("http://{}", server_addr);
         let client = HttpClientBuilder::default().build(&uri).unwrap();
-        let result = ConsensusExtApiClient::propose(&client, Address::random(), true).await.unwrap();
-        assert_eq!(result, ());
+        let result = ConsensusExtApiClient::propose(&client, Address::random(), true).await;
+        assert!(result.is_ok());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -231,8 +231,8 @@ mod tests {
         let server_addr = start_server().await;
         let uri = format!("http://{}", server_addr);
         let client = HttpClientBuilder::default().build(&uri).unwrap();
-        let result = ConsensusExtApiClient::discard(&client, Address::random()).await.unwrap();
-        assert_eq!(result, ());
+        let result = ConsensusExtApiClient::discard(&client, Address::random()).await;
+        assert!(result.is_ok());
     }
 
     #[tokio::test(flavor = "multi_thread")]

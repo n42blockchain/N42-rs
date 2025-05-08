@@ -32,6 +32,7 @@ use n42_clique::{EXTRA_VANITY, EXTRA_SEAL};
 use reth_primitives_traits::header::clique_utils::SIGNATURE_LENGTH;
 
 /// Types representing tester votes and test structure
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub struct TesterVote {
     pub signer: String,
@@ -41,6 +42,7 @@ pub struct TesterVote {
     //pub newbatch: Option<bool>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub struct CliqueTest {
     pub epoch: Option<u64>,
@@ -50,6 +52,7 @@ pub struct CliqueTest {
     pub failure: Option<String>,
 }
 
+#[cfg(test)]
 fn get_addresses_from_extra_data(extra_data: Bytes) -> Vec<Address> {
     let signers_count = (extra_data.len() - EXTRA_VANITY - SIGNATURE_LENGTH) / Address::len_bytes();
 
@@ -61,9 +64,10 @@ fn get_addresses_from_extra_data(extra_data: Bytes) -> Vec<Address> {
         signers.push(Address::from_slice(&extra_data[start..end]));
     }
 
-    return signers;
+    signers
 }
 
+#[cfg(test)]
 async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(node: &FullNode<Node, AddOns>, eth_signer_key: String) -> eyre::Result<()>
     where <<<Node as FullNodeTypes>::Types as NodeTypesWithEngine>::Engine as PayloadTypes>::PayloadBuilderAttributes: From<N42PayloadBuilderAttributes>,
     ExecutionPayloadV1: From<<<<Node as FullNodeTypes>::Types as NodeTypesWithEngine>::Engine as PayloadTypes>::BuiltPayload>
@@ -114,6 +118,7 @@ async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(node: 
     Ok(())
 }
 
+#[cfg(test)]
 impl CliqueTest {
     fn gen_chainspec(&self, accounts: &mut TesterAccountPool) -> ChainSpec {
 

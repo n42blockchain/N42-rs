@@ -4,10 +4,12 @@ use alloy_primitives::Address;
 use std::{str::FromStr, collections::HashMap};
 use reth_network::config::SecretKey;
 
+#[cfg(test)]
 pub struct TesterAccountPool {
    pub accounts: HashMap<String, SecretKey>,
 }
 
+#[cfg(test)]
 impl TesterAccountPool {
     pub fn new() -> Self {
         Self {

@@ -415,7 +415,7 @@ where
             let _ = exit.send(res);
         });
 
-        let mining_mode = if let Some(_) = ctx.node_config().dev.consensus_signer_private_key {
+        let mining_mode = if ctx.node_config().dev.consensus_signer_private_key.is_some() {
             let block_time = ctx.node_config().dev.block_time.unwrap_or_else(|| Duration::from_secs(DEFAULT_BLOCK_TIME_SECS));
             consensus_client::miner::MiningMode::interval(block_time)
         } else {

@@ -26,10 +26,7 @@ use reth_trie_common::root::state_root_ref_unhashed;
 
 use crate::{constants::MAINNET_DEPOSIT_CONTRACT, once_cell_set, EthChainSpec, LazyLock, OnceLock};
 
-pub const N42_GENESIS_HASH: B256 =
-    b256!("d4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3");
-
-pub const N42_TESTNET_CHAINID: u64 = 1142;
+pub(crate) const N42_TESTNET_CHAINID: u64 = 1142;
 
 /// The Ethereum mainnet spec
 pub static N42: LazyLock<Arc<ChainSpec>> = LazyLock::new(|| {
@@ -334,8 +331,8 @@ impl ChainSpec {
             base_fee_per_gas: base_fee_per_gas.map(Into::into),
             withdrawals_root,
             parent_beacon_block_root,
-            blob_gas_used: blob_gas_used.map(Into::into),
-            excess_blob_gas: excess_blob_gas.map(Into::into),
+            blob_gas_used,
+            excess_blob_gas,
             requests_hash,
             ..Default::default()
         }

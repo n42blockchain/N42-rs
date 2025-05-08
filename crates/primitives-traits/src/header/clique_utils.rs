@@ -2,16 +2,23 @@ use alloy_rlp::{length_of_length, Encodable};
 use bytes::BufMut;
 use secp256k1::{Message, SECP256K1, Error as SecpError, ecdsa::{RecoverableSignature, RecoveryId}, PublicKey};
 use std::error::Error;
-use super::{BlockHeader, Header};
-use alloy_primitives::{U256, hex, Bloom, BlockNumber, keccak256, B64, B256, Address, Bytes, FixedBytes};
+use super::Header;
+use alloy_primitives::{U256, Bloom, BlockNumber, keccak256, B64, B256, Address, Bytes};
 
+/// recovery error
 #[derive(Debug)]
 pub enum RecoveryError {
+    /// missing signature
     MissingSignature,
+    /// invalid message
     InvalidMessage,
+    /// invalide recovery id
     InvalidRecoveryId,
+    /// invalid signature format
     InvalidSignatureFormat,
+    /// failed to recover public key
     FailedToRecoverPublicKey,
+    /// ecdsa error
     EcdsaError(SecpError),
 }
 
@@ -39,7 +46,7 @@ impl std::error::Error for RecoveryError {}
 ///  Fixed number of extra-data suffix bytes reserved for signer seal
 pub const SIGNATURE_LENGTH: usize = 64 + 1;
 
-// recover_address extracts the Ethereum account address from a signed header.
+/// recover_address extracts the Ethereum account address from a signed header.
 pub fn recover_address(header: &Header) -> Result<Address, Box<dyn Error>> {
     // Retrieve the signature from the header extra-data
     if header.extra_data.len() < SIGNATURE_LENGTH {
@@ -58,7 +65,7 @@ pub fn recover_address(header: &Header) -> Result<Address, Box<dyn Error>> {
     Ok(public_key_to_address(SECP256K1.recover_ecdsa(&message, &signature)?))
 }
 
-// SealHash returns the hash of a block prior to it being sealed.
+/// SealHash returns the hash of a block prior to it being sealed.
 pub fn seal_hash(header: &Header) -> B256 {
 
     struct LocalHeader {
@@ -176,7 +183,7 @@ pub fn seal_hash(header: &Header) -> B256 {
 }
 
 // Copied from crates/primitives/src/transaction/util.rs
-// reth-primitives crate can not be used here because of cyclic dependency
+/// reth-primitives crate can not be used here because of cyclic dependency
 pub fn public_key_to_address(public: PublicKey) -> Address {
     // strip out the first byte because that should be the SECP256K1_TAG_PUBKEY_UNCOMPRESSED
     // tag returned by libsecp's uncompressed pubkey serialization

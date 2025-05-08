@@ -11,6 +11,7 @@ pub use alloy_consensus::Header;
 
 use alloy_primitives::{Address, BlockNumber, B256, U256};
 
+/// clique utils
 pub mod clique_utils;
 
 /// Bincode-compatible header type serde implementations.

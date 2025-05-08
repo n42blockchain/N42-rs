@@ -32,11 +32,11 @@ pub enum VotingError {
 impl std::fmt::Display for VotingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            VotingError::InvalidVotingChain => write!(f, "Invalid voting chain"),
-            VotingError::UnauthorizedSigner => write!(f, "Unauthorized signer"),
-            VotingError::SignerRecentlySigned => write!(f, "Signer recently signed"),
-            VotingError::InvalidVote => write!(f, "Invalid vote"),
-            VotingError::RecoverError(e) => write!(f, "Recover signer error: {}", e),
+            Self::InvalidVotingChain => write!(f, "Invalid voting chain"),
+            Self::UnauthorizedSigner => write!(f, "Unauthorized signer"),
+            Self::SignerRecentlySigned => write!(f, "Signer recently signed"),
+            Self::InvalidVote => write!(f, "Invalid vote"),
+            Self::RecoverError(e) => write!(f, "Recover signer error: {}", e),
         }
     }
 }
@@ -77,7 +77,7 @@ pub struct APosConfig {
 
 impl Default for APosConfig {
     fn default() -> Self {
-        APosConfig {
+        Self {
             period:8,
             epoch: 3000,
             reward_epoch: 10800,
@@ -110,14 +110,14 @@ pub struct  Snapshot
 
 impl Snapshot
 {
-	/// 创建一个新的 Snapshot
+    /// create a new Snapshot
     pub fn new_snapshot(
         config: APosConfig,
         number: u64,
         hash: B256,
         signers: Vec<Address>,
     ) -> Self {
-        let mut snap = Snapshot {
+        let mut snap = Self {
             config,
             number,
             hash,
@@ -136,19 +136,18 @@ impl Snapshot
 
 	/// Create a deep copy of the snapshot
     pub fn copy(&self) -> Self {
-        let cpy = Self {
+        Self {
             config: self.config.clone(),
             number: self.number,
-            hash: self.hash.clone(), 
+            hash: self.hash,
             signers: self.signers.clone(),
             recents: self.recents.clone(),
             votes: self.votes.clone(),
             tally: self.tally.clone(),
-        };
+        }
         
         // No need for special handling for votes if Vec<T> implements Clone
         // Deep copy is handled by the clone method for each type.
-        cpy
     }
 
     /// ecrecover
@@ -156,7 +155,7 @@ impl Snapshot
     //     (self.ecrecover)(header)
     // }
 
-	/// valid_vote returns whether it makes sense to cast the specified vote in the
+	/// `valid_vote` returns whether it makes sense to cast the specified vote in the
     /// given snapshot context (e.g. don't try to add an already authorized signer).
 	pub fn valid_vote(&self, address: Address, authorize: bool) -> bool {
         if self.signers.iter().any(|x| x == &address) {
@@ -202,7 +201,7 @@ impl Snapshot
     }
 
 	 /// Create a new authorization snapshot using the given header information
-	 pub fn apply<F>(&self, headers: Vec<Header>,func:F) -> Result<Snapshot, VotingError> 
+	 pub fn apply<F>(&self, headers: Vec<Header>,func:F) -> Result<Self, VotingError>
      where F: Fn(Header) -> Result<Address, Box<dyn Error>>,
      {
         //If there is no header information, return the current snapshot directly
@@ -226,7 +225,7 @@ impl Snapshot
         let logged = Instant::now();
 
         for (i, i_header) in headers.iter().enumerate() {
-            let header = i_header.as_ref();
+            let header = i_header;
             let number = header.number;
 
             //If it is a checkpoint block, remove all votes
@@ -250,7 +249,7 @@ impl Snapshot
             if snap.recents.values().any(|&recent| recent == signer) {
                 return Err(VotingError::SignerRecentlySigned);
             }
-            snap.recents.insert(number, signer.clone());
+            snap.recents.insert(number, signer);
 
             //Discard any previous votes of the signer
             while let Some(i) = snap.votes.iter().position(|vote| vote.signer == signer && vote.address == header.beneficiary) {
@@ -334,7 +333,7 @@ impl Snapshot
 
 	 /// signers retrieves the list of authorized signers in ascending order.
 	 pub fn signers(&self) -> Vec<Address> {
-        let sigs: Vec<Address> = self.signers.iter().cloned().collect();
+        let sigs: Vec<Address> = self.signers.to_vec();
         //sigs.sort(); 
         sigs
     }

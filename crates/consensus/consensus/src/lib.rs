@@ -140,6 +140,7 @@ pub trait Consensus: Debug + Send + Sync {
         Ok(())
     }
 
+    /// set eth signer by key
     fn set_eth_signer_by_key(
         &self,
         eth_signer_key: Option<String>,
@@ -147,12 +148,14 @@ pub trait Consensus: Debug + Send + Sync {
         Ok(())
     }
 
+    /// get eth signer address
     fn get_eth_signer_address(
         &self,
     ) -> Result<Option<Address>, ConsensusError> {
         Ok(Some(Address::ZERO))
     }
 
+    /// snapshot
     fn snapshot(
         &self,
         number: u64,
@@ -162,6 +165,7 @@ pub trait Consensus: Debug + Send + Sync {
         Ok(Snapshot::default())
     }
 
+    /// propose a vote
     fn propose(
         &self,
         address: Address,
@@ -170,6 +174,7 @@ pub trait Consensus: Debug + Send + Sync {
         Ok(())
     }
 
+    /// discard a vote
     fn discard(
         &self,
         address: Address,
@@ -177,12 +182,14 @@ pub trait Consensus: Debug + Send + Sync {
         Ok(())
     }
 
+    /// get proposals
     fn proposals(
         &self,
     ) -> Result<HashMap<Address, bool>, ConsensusError> {
         Ok(HashMap::new())
     }
 
+    /// get total difficulty
     fn total_difficulty(
         &self,
         hash: B256,
@@ -190,6 +197,7 @@ pub trait Consensus: Debug + Send + Sync {
         U256::from(0)
     }
 
+    /// get wiggle time
     fn wiggle(
         &self,
         parent_number: u64,
@@ -468,62 +476,77 @@ pub enum ConsensusError {
         timestamp: u64,
     },
     // for N42
+    /// Error for unknown block
     #[display(
         "unknown block"
     )]
     UnknownBlock,
+    /// Error for invalid check-point beneficiary
     #[display(
         "beneficiary in checkpoint block non-zero"
     )]
     InvalidCheckpointBeneficiary,
+    /// Error for invalid vote
     #[display(
         "vote nonce not 0x00..0 or 0xff..f"
     )]
     InvalidVote,
+    /// Error for invalid check-point vote
     #[display(
         "vote nonce in checkpoint block non-zero"
     )]
     InvalidCheckpointVote,
+    /// Errror for missing vanity
     #[display(
         "extra-data 32 byte vanity prefix missing"
     )]
     MissingVanity,
+    /// Error for missing signature
     #[display(
         "extra-data 65 byte signature suffix missing"
     )]
     MissingSignature,
+    /// Error for extra signers
     #[display(
         "non-checkpoint block contains extra signer list"
     )]
     ErrExtraSigners,
+    /// Error for invalid check-point signers
     #[display(
         "invalid signer list on checkpoint block"
     )]
     InvalidCheckpointSigners,
+    /// Error for invalid difficulty
     #[display(
         "invalid difficulty"
     )]
     InvalidDifficulty,
+    /// Error for unauthorized signer
     #[display(
         "unauthorized signer"
     )]
     UnauthorizedSigner,
+    /// Error for recently signed
     #[display(
         "recently signed"
     )]
     RecentlySigned,
+    /// Error for sign header err
     #[display(
         "sign header err"
     )]
     SignHeaderError,
+    /// Error for save snapshot err
     #[display(
         "save snapshot err"
     )]
     SaveSnapshotError,
+    /// Error for no signer set
     #[display(
         "no signer set"
     )]
     NoSignerSet,
+    /// Error for apos error detail
     #[display(
         "apos error detail {detail}"
     )]

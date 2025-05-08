@@ -92,11 +92,6 @@ where
             None
         };
 
-        let finalized_header = self
-            .provider
-            .sealed_header(0)
-            .unwrap()
-            .unwrap();
         let header = self
             .provider
             .sealed_header(self.provider.best_block_number().unwrap())
@@ -192,8 +187,8 @@ where
             let forkchoice_state =
             ForkchoiceState {
                 head_block_hash: header.hash(),
-                safe_block_hash: finalized_header.hash(),
-                finalized_block_hash: finalized_header.hash(),
+                safe_block_hash: header.hash(),
+                finalized_block_hash: header.hash(),
             };
             let res = self
                 .beacon_engine_handle
@@ -237,8 +232,8 @@ where
             let forkchoice_state =
             ForkchoiceState {
                 head_block_hash: block.hash(),
-                safe_block_hash: finalized_header.hash(),
-                finalized_block_hash: finalized_header.hash(),
+                safe_block_hash: block.hash(),
+                finalized_block_hash: block.hash(),
             };
             match self
                 .beacon_engine_handle

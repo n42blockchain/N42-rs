@@ -211,7 +211,7 @@ impl CliqueTest {
         match self.happy_path().await {
             Ok(_) => (),
             Err(e) => {
-                println!("error: {:?}", e);
+                println!("error: {e:?}");
                 assert_eq!(e.to_string(), self.failure.clone().unwrap());
             },
         }

@@ -1,7 +1,6 @@
 //! Possible errors when interacting with the network.
 
-use std::{fmt, io, io::ErrorKind, net::SocketAddr};
-
+use crate::session::PendingSessionHandshakeError;
 use reth_dns_discovery::resolver::ResolveError;
 use reth_ecies::ECIESErrorImpl;
 use reth_eth_wire::{
@@ -9,8 +8,7 @@ use reth_eth_wire::{
     DisconnectReason,
 };
 use reth_network_types::BackoffKind;
-
-use crate::session::PendingSessionHandshakeError;
+use std::{fmt, io, io::ErrorKind, net::SocketAddr};
 
 /// Service kind.
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -218,7 +216,7 @@ impl SessionError for PendingSessionHandshakeError {
                     ECIESErrorImpl::Secp256k1(_) |
                     ECIESErrorImpl::InvalidHandshake { .. }
             ),
-            Self::Timeout => false,
+            Self::Timeout | Self::UnsupportedExtraCapability => false,
         }
     }
 
@@ -237,6 +235,7 @@ impl SessionError for PendingSessionHandshakeError {
                     ECIESErrorImpl::InvalidHandshake { .. }
             ),
             Self::Timeout => false,
+            Self::UnsupportedExtraCapability => true,
         }
     }
 
@@ -245,6 +244,7 @@ impl SessionError for PendingSessionHandshakeError {
             Self::Eth(eth) => eth.should_backoff(),
             Self::Ecies(_) => Some(BackoffKind::Low),
             Self::Timeout => Some(BackoffKind::Medium),
+            Self::UnsupportedExtraCapability => Some(BackoffKind::High),
         }
     }
 }

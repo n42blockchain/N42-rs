@@ -1,21 +1,15 @@
-use std::sync::Arc;
-
-use alloy_consensus::constants::MAINNET_GENESIS_HASH;
+use crate::utils::eth_payload_attributes;
 use alloy_genesis::Genesis;
-use reth::{
-    args::RpcServerArgs,
-    builder::{NodeBuilder, NodeConfig, NodeHandle},
-    rpc::types::engine::PayloadStatusEnum,
-    tasks::TaskManager,
-};
 use reth_chainspec::{ChainSpecBuilder, MAINNET};
 use reth_e2e_test_utils::{
     node::NodeTestContext, transaction::TransactionTestContext, wallet::Wallet,
 };
+use reth_node_builder::{NodeBuilder, NodeHandle};
+use reth_node_core::{args::RpcServerArgs, node_config::NodeConfig};
 use reth_node_ethereum::EthereumNode;
+use reth_tasks::TaskManager;
 use reth_transaction_pool::TransactionPool;
-
-use crate::utils::eth_payload_attributes;
+use std::sync::Arc;
 
 #[tokio::test]
 async fn can_handle_blobs() -> eyre::Result<()> {
@@ -31,6 +25,7 @@ async fn can_handle_blobs() -> eyre::Result<()> {
             .cancun_activated()
             .build(),
     );
+    let genesis_hash = chain_spec.genesis_hash();
     let node_config = NodeConfig::test()
         .with_chain(chain_spec)
         .with_unused_ports()
@@ -51,7 +46,7 @@ async fn can_handle_blobs() -> eyre::Result<()> {
     let raw_tx = TransactionTestContext::transfer_tx_bytes(1, second_wallet.clone()).await;
     let tx_hash = node.rpc.inject_tx(raw_tx).await?;
     // build payload with normal tx
-    let (payload, attributes) = node.new_payload().await?;
+    let payload = node.new_payload().await?;
 
     // clean the pool
     node.inner.pool.remove_transactions(vec![tx_hash]);
@@ -67,21 +62,16 @@ async fn can_handle_blobs() -> eyre::Result<()> {
     TransactionTestContext::validate_sidecar(envelope);
 
     // build a payload
-    let (blob_payload, blob_attr) = node.new_payload().await?;
+    let blob_payload = node.new_payload().await?;
 
     // submit the blob payload
-    let blob_block_hash =
-        node.engine_api.submit_payload(blob_payload, blob_attr, PayloadStatusEnum::Valid).await?;
+    let blob_block_hash = node.submit_payload(blob_payload).await?;
 
-    let (_, _) = tokio::join!(
-        // send fcu with blob hash
-        node.engine_api.update_forkchoice(MAINNET_GENESIS_HASH, blob_block_hash),
-        // send fcu with normal hash
-        node.engine_api.update_forkchoice(MAINNET_GENESIS_HASH, payload.block().hash())
-    );
+    node.update_forkchoice(genesis_hash, blob_block_hash).await?;
 
-    // submit normal payload
-    node.engine_api.submit_payload(payload, attributes, PayloadStatusEnum::Valid).await?;
+    // submit normal payload (reorg)
+    let block_hash = node.submit_payload(payload).await?;
+    node.update_forkchoice(genesis_hash, block_hash).await?;
 
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 

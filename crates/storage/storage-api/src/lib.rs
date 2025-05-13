@@ -7,6 +7,9 @@
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
 
 // Re-export used error types.
 pub use reth_storage_errors as errors;
@@ -21,6 +24,11 @@ pub use block_id::*;
 
 mod block_hash;
 pub use block_hash::*;
+
+#[cfg(feature = "db-api")]
+mod chain;
+#[cfg(feature = "db-api")]
+pub use chain::*;
 
 mod header;
 pub use header::*;
@@ -46,22 +54,45 @@ pub use transactions::*;
 mod trie;
 pub use trie::*;
 
+mod chain_info;
+pub use chain_info::*;
+
 mod withdrawals;
 pub use withdrawals::*;
 
+mod ommers;
+pub use ommers::*;
+
+#[cfg(feature = "db-api")]
 mod database_provider;
+#[cfg(feature = "db-api")]
 pub use database_provider::*;
 
 pub mod noop;
 
-mod verifiers;
-pub use verifiers::*;
+#[cfg(feature = "db-api")]
+mod history;
+#[cfg(feature = "db-api")]
+pub use history::*;
 
-mod rewards;
-pub use rewards::*;
+#[cfg(feature = "db-api")]
+mod hashing;
+#[cfg(feature = "db-api")]
+pub use hashing::*;
+
+#[cfg(feature = "db-api")]
+mod stats;
+#[cfg(feature = "db-api")]
+pub use stats::*;
 
 mod snapshot;
 pub use snapshot::*;
 
-mod td;
-pub use td::*;
+mod legacy;
+pub use legacy::*;
+
+mod primitives;
+pub use primitives::*;
+
+mod block_indices;
+pub use block_indices::*;

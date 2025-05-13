@@ -13,9 +13,9 @@ use alloy_rpc_types::{
         PayloadAttributes as EthPayloadAttributes, PayloadId,
     },
     Withdrawal,
+    Withdrawals,
 };
 use reth_ethereum_engine_primitives::EthPayloadBuilderAttributes;
-use reth_primitives::Withdrawals;
 
 /// The attributes builder for N42 Ethereum payload.
 #[derive(Debug)]

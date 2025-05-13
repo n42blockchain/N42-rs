@@ -1,11 +1,10 @@
 //! Ethereum protocol-related constants
 
-use alloy_primitives::{b256, B256};
-
 /// Gas units, for example [`GIGAGAS`].
 pub mod gas_units;
 pub use gas_units::{GIGAGAS, KILOGAS, MEGAGAS};
 
+use alloy_primitives::{b256, B256};
 /// n42 block gas limit
 pub const N42_BLOCK_GAS_LIMIT: u64 = 9_223_372_036_854_775_807;
 
@@ -20,9 +19,8 @@ pub const RETH_CLIENT_VERSION: &str = concat!("reth/v", env!("CARGO_PKG_VERSION"
 /// Minimum gas limit allowed for transactions.
 pub const MINIMUM_GAS_LIMIT: u64 = 5000;
 
-/// Holesky genesis hash: `0xb5f7f912443c940f21fd611f12828d75b534364ed9e95ca4e307729a4661bde4`
-pub const HOLESKY_GENESIS_HASH: B256 =
-    b256!("b5f7f912443c940f21fd611f12828d75b534364ed9e95ca4e307729a4661bde4");
+/// The bound divisor of the gas limit, used in update calculations.
+pub const GAS_LIMIT_BOUND_DIVISOR: u64 = 1024;
 
 /// The number of blocks to unwind during a reorg that already became a part of canonical chain.
 ///

@@ -19,6 +19,7 @@ pub mod error;
 pub mod events;
 /// Implementation of network traits for that does nothing.
 pub mod noop;
+
 pub mod test_utils;
 mod block;
 
@@ -52,7 +53,7 @@ pub trait FullNetwork:
     + NetworkEventListenerProvider
     + PeersInfo
     + Peers
-    + BlockAnnounceProvider
+    //+ BlockAnnounceProvider
     + Clone
     + 'static
 {
@@ -65,7 +66,7 @@ impl<T> FullNetwork for T where
         + NetworkEventListenerProvider
         + PeersInfo
         + Peers
-        + BlockAnnounceProvider
+        //+ BlockAnnounceProvider
         + Clone
         + 'static
 {

@@ -31,6 +31,12 @@ pub struct ForkchoiceState {
 }
 
 impl ForkchoiceState {
+    /// Creates a new [ForkchoiceState] with head, safe, and finalized block hashes set to the given
+    /// hash.
+    pub const fn same_hash(hash: B256) -> Self {
+        Self { head_block_hash: hash, safe_block_hash: hash, finalized_block_hash: hash }
+    }
+
     /// Returns the `head_block_hash`, only if it is not [`B256::ZERO`], otherwise this returns
     /// [`None`].
     #[inline]
@@ -85,8 +91,7 @@ pub enum ForkchoiceUpdateError {
     UnknownFinalBlock,
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for ForkchoiceUpdateError {}
+impl core::error::Error for ForkchoiceUpdateError {}
 
 #[cfg(feature = "jsonrpsee-types")]
 impl From<ForkchoiceUpdateError> for jsonrpsee_types::error::ErrorObject<'static> {

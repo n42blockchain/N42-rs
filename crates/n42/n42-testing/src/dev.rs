@@ -201,7 +201,7 @@ impl CliqueTest {
 
        let first_event = payload_event_stream.next().await.unwrap()?;
        let second_event = payload_event_stream.next().await.unwrap()?;
-       println!("first_event={:?}", first_event);
+       println!("first_event={first_event:?}");
        println!("second_event={second_event:?}");
 
        Ok(())

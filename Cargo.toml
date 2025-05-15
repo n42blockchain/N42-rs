@@ -45,7 +45,7 @@ members = [
     "testing/testing-utils/", 
     "crates/n42/engine-primitives", 
     "crates/n42/consensus-client",
-    "crates/revm"
+    "crates/revm",
 ]
 default-members = ["bin/n42"]
 

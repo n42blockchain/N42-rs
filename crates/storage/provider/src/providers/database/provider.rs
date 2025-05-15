@@ -14,6 +14,7 @@ use crate::{
     StageCheckpointReader, StateChangeWriter, StateProviderBox, StateReader, StateWriter,
     StaticFileProviderFactory, StatsReader, StorageReader, StorageTrieWriter, TransactionVariant,
     TransactionsProvider, TransactionsProviderExt, TrieWriter, WithdrawalsProvider, VerifiersProvider,RewardsProvider,
+    ValidatorChangeWriter,ValidatorReader
 };
 use alloy_eips::{eip4895::Withdrawal, BlockHashOrNumber};
 use alloy_primitives::{keccak256, Address, BlockHash, BlockNumber, TxHash, TxNumber, B256, U256};
@@ -49,7 +50,7 @@ use reth_prune_types::{PruneCheckpoint, PruneModes, PruneSegment};
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_storage_api::{TdProviderWriter, TdProvider, SnapshotProviderWriter, StateProvider, StorageChangeSetReader, TryIntoHistoricalStateProvider};
 use reth_storage_api::SnapshotProvider;
-use n42_primitives::Snapshot;
+use n42_primitives::{Snapshot,Validator,ValidatorBeforeTx,ValidatorChangeset};
 use reth_storage_errors::provider::{ProviderResult, RootMismatch};
 use reth_trie::{
     prefix_set::{PrefixSet, PrefixSetMut, TriePrefixSets},
@@ -3245,6 +3246,15 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes<ChainSpec: EthereumHardforks> + 
         // Unwind account history indices.
         self.unwind_account_history_indices(changed_accounts.iter())?;
 
+        // unwiund validator
+        let changed_validators=self
+            .tx
+            .cursor_read::<tables::ValidatorChangeSets>()?
+            .walk_range(range.clone())?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        self.unwind_validator_history_indices(changed_validators.iter())?;
+
         let storage_range = BlockNumberAddress::range(range.clone());
         let changed_storages = self
             .tx
@@ -3308,6 +3318,9 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes<ChainSpec: EthereumHardforks> + 
         // remove execution res
         self.remove_state(range.clone())?;
 
+        // remove validator
+        self.remove_validator(range.clone())?;
+
         // remove block bodies it is needed for both get block range and get block execution results
         // that is why it is deleted afterwards.
         self.remove::<tables::BlockBodyIndices>(range)?;
@@ -3318,6 +3331,92 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes<ChainSpec: EthereumHardforks> + 
         }
 
         Ok(())
+    }
+}
+
+impl<TX: DbTx, N: NodeTypes> ValidatorReader for DatabaseProvider<TX, N> {
+    fn basic_validator(&self,address:Address) -> ProviderResult<Option<Validator> > {
+        Ok(self.tx.get::<tables::PlainValidatorState>(address)?)
+    }
+}
+
+impl<TX: DbTxMut + DbTx, N: NodeTypes> ValidatorChangeWriter for DatabaseProvider<TX, N> {
+    fn unwind_validator_history_indices<'a>(&self, changesets: impl Iterator<Item = &'a (BlockNumber, ValidatorBeforeTx)>,) -> ProviderResult<usize> {
+        let mut last_indices = changesets
+            .into_iter()
+            .map(|(index, validator)| (validator.address, *index))
+            .collect::<Vec<_>>();
+        last_indices.sort_by_key(|(addr, _)| *addr);
+        
+        let mut cursor = self.tx.cursor_write::<tables::ValidatorsHistory>()?;
+        
+        for &(address, index) in &last_indices {
+            let partial_shard = unwind_history_shards::<_, tables::ValidatorsHistory, _>(
+                &mut cursor,
+                ShardedKey::last(address),
+                index,
+                |sharded_key| sharded_key.key == address,
+            )?;
+            if !partial_shard.is_empty() {
+                cursor.insert(
+                    ShardedKey::last(address),
+                    BlockNumberList::new_pre_sorted(partial_shard),
+                )?;
+            }
+        }
+        Ok(last_indices.len())
+    }
+    fn write_validator_changes(&self, mut changes: n42_primitives::ValidatorChangeset) -> ProviderResult<()> {
+        changes.validators.par_sort_by_key(|a|a.0);
+        let mut validators_cursor=self.tx_ref().cursor_write::<tables::PlainValidatorState>()?;
+        for (address,validator)in changes.validators{
+            if let Some(validator)=validator{
+                validators_cursor.upsert(address, validator.into())?;
+            }else if validators_cursor.seek_exact(address)?.is_some(){
+                validators_cursor.delete_current()?;
+            }
+        }
+        Ok(())
+    }
+    fn remove_validator(&self, range: RangeInclusive<BlockNumber>) -> ProviderResult<()> {
+        if range.is_empty() {
+            return Ok(());
+        }
+        let validator_changesets = self.take::<tables::ValidatorChangeSets>(range.clone())?;
+        let mut validator_cursor = self.tx.cursor_write::<tables::PlainValidatorState>()?;
+        let mut processed: HashSet<Address> = HashSet::new();
+        for (block_number, ValidatorBeforeTx { address, info: old_validator }) in validator_changesets {
+            if !processed.insert(address) {
+                continue;
+            }
+            let existing_entry = validator_cursor.seek_exact(address)?;
+            match old_validator {
+                Some(validator) => {
+                    validator_cursor.upsert(address, validator)?;
+                }
+                None => {
+                    if existing_entry.is_some() {
+                        validator_cursor.delete_current()?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    fn take_validator(&mut self, range: RangeInclusive<BlockNumber>) -> ProviderResult<ValidatorChangeset> {
+        // let tx = self.tx_mut();
+        // let mut cursor=tx.cursor_read::<tables::PlainValidatorState>()?;
+        // let mut validators=Vec::new();
+        // while let Some((address, validator))=cursor.next()?{
+        //     if range.contains(&validator.index){
+        //         validators.push(n42_primitives::ValidatorBeforeTx{
+        //             address,
+        //             info: Some(validator),
+        //         });
+        //     }
+        // }
+        // Ok(ValidatorChangeset{validators})
+        todo!()
     }
 }
 

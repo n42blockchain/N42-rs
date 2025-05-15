@@ -39,7 +39,7 @@ use reth_stages_types::StageCheckpoint;
 use reth_trie_common::{BranchNodeCompact, StorageTrieEntry, StoredNibbles, StoredNibblesSubKey};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use n42_primitives::Snapshot;
+use n42_primitives::{Snapshot,Validator,ValidatorBeforeTx};
 
 /// Enum for the types of tables present in libmdbx.
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -271,6 +271,15 @@ macro_rules! tables {
 }
 
 tables! {
+    /// current
+    table PlainValidatorState<Key = Address, Value = Validator>;
+
+    /// history
+    table ValidatorsHistory<Key = ShardedKey<Address>, Value = BlockNumberList>;
+
+    /// changesets
+    table ValidatorChangeSets<Key = BlockNumber, Value = ValidatorBeforeTx, SubKey = Address>;
+
     /// verify in the block
     table BlockVerifiers<Key = BlockNumber,Value = StoredBlockVerifiers>;
 

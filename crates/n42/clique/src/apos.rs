@@ -133,9 +133,8 @@ impl Error for AposError {}
 
 /// `APos` is the proof-of-authority consensus engine proposed to support the
 /// Ethereum testnet following the Ropsten attacks.
-pub struct APos<Provider, ChainSpec, H>
+pub struct APos<Provider, ChainSpec>
 where
-    H: BlockHeaderTrait,
     Provider: HeaderProvider + SnapshotProvider + SnapshotProviderWriter + BlockIdReader  + BlockReaderIdExt + Clone + Unpin + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks
 {
@@ -148,7 +147,7 @@ where
     eth_signer: RwLock<Option<LocalSigner<SigningKey>>>,
     //  Provider,
     provider: Provider,
-    recent_headers: RwLock<schnellru::LruMap<B256, H>>,    // Recent headers for snapshot
+    recent_headers: RwLock<schnellru::LruMap<B256, Header>>,    // Recent headers for snapshot
     recent_tds: RwLock<schnellru::LruMap<B256, U256>>,
     recent_tds_inited: AtomicBool,
 }
@@ -156,11 +155,10 @@ where
 
 // New creates a APos proof-of-authority consensus engine with the initial
 // signers set to the ones provided by the user.
-impl<Provider, ChainSpec, H> APos<Provider, ChainSpec, H>
+impl<Provider, ChainSpec> APos<Provider, ChainSpec>
 where
     Provider: HeaderProvider + SnapshotProvider + SnapshotProviderWriter + BlockIdReader  + BlockReaderIdExt + Clone + Unpin + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks,
-    H: BlockHeaderTrait,
 {
     /// new
     pub fn new(
@@ -373,9 +371,8 @@ fn calc_difficulty(snap: &Snapshot, signer: &Address) -> U256 {
     }
 }
 
-impl<Provider, ChainSpec, H> Debug for APos<Provider, ChainSpec, H>
+impl<Provider, ChainSpec> Debug for APos<Provider, ChainSpec>
 where
-    H: BlockHeaderTrait,
     ChainSpec: EthChainSpec + EthereumHardforks,
     Provider: 'static + Clone + HeaderProvider + SnapshotProvider + SnapshotProviderWriter + BlockIdReader  + BlockReaderIdExt + Unpin,
 {
@@ -384,12 +381,11 @@ where
     }
 }
 
-impl<Provider, ChainSpec, H, H0> HeaderValidator<H> for APos<Provider, ChainSpec, H0>
+impl<Provider, ChainSpec, H> HeaderValidator<H> for APos<Provider, ChainSpec>
 where
     ChainSpec: EthChainSpec + EthereumHardforks,
     Provider: 'static + Clone + HeaderProvider + SnapshotProvider + SnapshotProviderWriter + BlockIdReader  + BlockReaderIdExt + Unpin,
     H: BlockHeaderTrait,
-    H0: BlockHeaderTrait,
 {
     fn validate_header(&self, header: &SealedHeader<H>) -> Result<(), ConsensusError> {
 
@@ -518,12 +514,11 @@ where
 
 }
 
-impl<Provider, ChainSpec, H, N> FullConsensus<N> for APos<Provider, ChainSpec, H>
+impl<Provider, ChainSpec, N> FullConsensus<N> for APos<Provider, ChainSpec>
 where
     Provider: HeaderProvider +SnapshotProvider + SnapshotProviderWriter  + BlockIdReader  + BlockReaderIdExt + Clone + Unpin + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks,
     N: NodePrimitives,
-    H: BlockHeaderTrait,
 {
     fn validate_block_post_execution(
         &self,
@@ -535,12 +530,11 @@ where
 
 }
 
-impl<Provider, ChainSpec, H, B> Consensus<B> for APos<Provider, ChainSpec, H>
+impl<Provider, ChainSpec, B> Consensus<B> for APos<Provider, ChainSpec>
 where
     Provider: HeaderProvider +SnapshotProvider + SnapshotProviderWriter  + BlockIdReader  + BlockReaderIdExt + Clone + Unpin + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks,
     B: BlockTrait,
-    H: BlockHeaderTrait,
 {
     type Error = ConsensusError;
 

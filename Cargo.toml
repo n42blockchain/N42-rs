@@ -12,7 +12,7 @@ members = [
     "bin/n42/",
     "crates/n42/primitives/",
     "crates/n42/clique/",
-    #"crates/n42/engine-types/",
+    "crates/n42/engine-types/",
     "crates/n42/engine-primitives/",
     #"crates/n42/n42-testing",
     #"crates/n42/mobile",
@@ -231,7 +231,7 @@ alloy-rpc-types-beacon = { path = "./crates/n42/alloy-rpc-types-beacon" }
 # for n42
 n42-primitives = { path = "crates/n42/primitives" }
 n42-clique = {path="crates/n42/clique"}
-#n42-engine-types = {path="crates/n42/engine-types"}
+n42-engine-types = {path="crates/n42/engine-types"}
 n42-engine-primitives = {path="crates/n42/engine-primitives"}
 consensus-client = {path="crates/n42/consensus-client"}
 
@@ -322,6 +322,7 @@ reth-optimism-rpc = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1
 reth-optimism-storage = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.3.12" }
 reth-payload-builder = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.3.12" }
 reth-payload-primitives = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.3.12" }
+reth-payload-builder-primitives = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.3.12" }
 reth-payload-validator = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.3.12" }
 reth-primitives = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.3.12", default-features = false, features = ["std"] }
 reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.3.12", default-features = false }

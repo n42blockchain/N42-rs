@@ -83,7 +83,7 @@ where
     CB: NodeComponentsBuilder<T>,
     AO: RethRpcAddOns<NodeAdapter<T, CB::Components>>
         + EngineValidatorAddOn<NodeAdapter<T, CB::Components>>,
-    N42PayloadAttributesBuilder<Types::ChainSpec>: PayloadAttributesBuilder<
+    LocalPayloadAttributesBuilder<Types::ChainSpec>: PayloadAttributesBuilder<
         <<Types as NodeTypes>::Payload as PayloadTypes>::PayloadAttributes,
     >,
 {
@@ -236,7 +236,7 @@ where
                 consensus_engine_tx.clone(),
                 Box::pin(consensus_engine_stream),
                 ctx.dev_mining_mode(ctx.components().pool()),
-                N42PayloadAttributesBuilder::new(ctx.chain_spec()),
+                LocalPayloadAttributesBuilder::new(ctx.chain_spec()),
                 ctx.components().evm_config().clone(),
             );
 
@@ -392,6 +392,7 @@ where
             None
         };
         let consensus = Arc::new(ctx.components().consensus().clone());
+        /*
         N42Miner::spawn_new(
             ctx.blockchain_db().clone(),
             N42PayloadAttributesBuilder::new_add_signer(ctx.chain_spec(), signer_address),
@@ -401,6 +402,7 @@ where
             ctx.components().network().clone(),
             consensus,
         );
+        */
 
         let full_node = FullNode {
             consensus: ctx.components().consensus().clone(),

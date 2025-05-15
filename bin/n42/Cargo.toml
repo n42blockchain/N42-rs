@@ -7,12 +7,15 @@ license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 description = "Reth node implementation"
-default-run = "reth"
+default-run = "n42"
 
 [lints]
 workspace = true
 
 [dependencies]
+#n42
+n42-engine-types.workspace = true
+n42-primitives.workspace = true
 # reth
 reth-cli.workspace = true
 reth-ethereum-cli.workspace = true
@@ -129,5 +132,5 @@ min-debug-logs = ["tracing/release_max_level_debug"]
 min-trace-logs = ["tracing/release_max_level_trace"]
 
 [[bin]]
-name = "reth"
+name = "n42"
 path = "src/main.rs"

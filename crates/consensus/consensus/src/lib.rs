@@ -105,7 +105,7 @@ pub trait Consensus<B: Block>: AsHeaderValidator<B::Header> {
         &self,
         number: u64,
         hash: B256,
-        parents: Option<Vec<Header>>,
+        parents: Option<Vec<B::Header>>,
     ) -> Result<Snapshot, ConsensusError> {
         Ok(Snapshot::default())
     }

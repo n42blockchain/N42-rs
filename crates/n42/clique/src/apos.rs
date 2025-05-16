@@ -1,5 +1,5 @@
 use rand::prelude::IndexedRandom;
-use reth_primitives_traits::AlloyBlockHeader;
+use reth_primitives_traits::{AlloyBlockHeader};
 use alloy_primitives::Sealable;
 use reth_primitives_traits::{Block as BlockTrait, BlockHeader as BlockHeaderTrait, NodePrimitives, };
 use std::error::Error;
@@ -147,7 +147,7 @@ where
     eth_signer: RwLock<Option<LocalSigner<SigningKey>>>,
     //  Provider,
     provider: Provider,
-    recent_headers: RwLock<schnellru::LruMap<B256, Header>>,    // Recent headers for snapshot
+    recent_headers: RwLock<schnellru::LruMap<B256, Box<dyn AlloyBlockHeader + Send + Sync + 'static>>>,    // Recent headers for snapshot
     recent_tds: RwLock<schnellru::LruMap<B256, U256>>,
     recent_tds_inited: AtomicBool,
 }
@@ -214,13 +214,14 @@ where
     /// consensus protocol requirements. The method accepts an optional list of parent
     /// headers that aren't yet part of the local blockchain to generate the snapshots
     /// from.
-    /*
-    pub fn verify_seal(
+    pub fn verify_seal<H>(
         &self,
         snap: &Snapshot,
         header: &H,
         _parents: Option<Vec<H>>,
     ) -> Result<(), Box<dyn std::error::Error>>
+        where
+            H: BlockHeaderTrait,
     {
 
         // Verifying the genesis block is not supported
@@ -264,32 +265,6 @@ where
 
         Ok(())
     }
-    */
-
-    /// `CalcDifficulty` is the difficulty adjustment algorithm. It returns the difficulty that a new block should have:
-    /*
-    pub fn calc_difficulty(
-        &mut self,
-        parent: Header,          // assuming IHeader is a trait
-    ) -> U256 {
-        let Ok(snap) = self.snapshot(
-            parent.number,
-            parent.hash_slow(),
-            None,
-        ) else { todo!() };
-
-        let signer_guard = self.signer.read().unwrap();
-        //calc_difficulty(&snap, &self.signer.get())
-        if let Some(signer) = *signer_guard {
-            calc_difficulty(&snap, &signer)
-        } else {
-            warn!(target: "consensus::apos",
-                "calc_difficulty() called when no signer is set",
-            );
-            DIFF_NO_TURN
-        }
-    }
-    */
 
 
     /// `SealHash` returns the hash of a block prior to it being sealed.
@@ -345,8 +320,9 @@ where
         self.recent_tds_inited.store(true, Ordering::Relaxed);
     }
 
-    /*
-    fn save_total_difficulty(&self, header: &H)
+    fn save_total_difficulty<H>(&self, header: &H)
+        where
+            H: BlockHeaderTrait,
     {
         self.init_recent_tds();
 
@@ -360,7 +336,132 @@ where
         recent_tds.insert(header.hash_slow(), total_difficulty);
         debug!(target: "consensus::apos", "saved total_difficulty {}", total_difficulty);
     }
-    */
+
+    /// snapshot retrieves the authorization snapshot at a given point in time.
+    fn snapshot_inner<H>(
+        &self,
+        number: u64,
+        hash: B256,
+        parents: Option<Vec<H>>,
+    ) -> Result<Snapshot, ConsensusError>
+        where
+        H: BlockHeaderTrait,
+    {
+
+        let mut headers: Vec<H> = Vec::new();
+        let mut snap: Option<Snapshot> = None;
+        let mut hash = hash;
+        let mut number = number;
+        let mut parents = parents;
+
+        let mut recents = self.recents.write().unwrap(); //
+        let mut recent_headers = self.recent_headers.write().unwrap();
+
+        while snap.is_none() {
+            //Attempt to retrieve a snapshot from memory
+            if let Some(cached_snap) = recents.get(&hash) {
+                snap = Some(cached_snap.clone());
+                break;
+            }
+
+            // Attempt to obtain a snapshot from the disk
+            if number != 0 && number % CHECKPOINT_INTERVAL == 0 {
+                if let Ok(Some(s)) = self.provider.load_snapshot_by_hash(&hash) {
+                    snap = Some(s);
+                    break;
+                }
+                debug!(target: "consensus::apos", "Snapshot not found for hash: {}, at number: {}", hash, number);
+            }
+
+            // If we're at the genesis, snapshot the initial state. Alternatively if we're
+            // at a checkpoint block without a parent (light client CHT), or we have piled
+            // up more headers than allowed to be reorged (chain reinit from a freezer),
+            // consider the checkpoint trusted and snapshot it.
+            if number == 0 || (number % self.config.epoch == 0 && (headers.len() > FULL_IMMUTABILITY_THRESHOLD || self.provider.header_by_number(number -1).unwrap().is_none())) {
+                if let Ok(Some(checkpoint)) = self.provider.header_by_number(number) {
+                    debug!(target: "consensus::apos", "checkpoint={:?}", checkpoint);
+                    let hash = checkpoint.hash_slow();
+                    //info!(target: "consensus::apos", "snapshot() : number={}, hash_slow hash={:?}", number, hash);
+            
+                    //Calculate the list of signatories
+                    let signers_count = (checkpoint.extra_data().len() - EXTRA_VANITY - SIGNATURE_LENGTH) /  Address::len_bytes();
+
+                    let mut signers = Vec::with_capacity(signers_count);
+            
+                    for i in 0..signers_count {
+                        let start = EXTRA_VANITY + i * Address::len_bytes();
+                        let end = start + Address::len_bytes();
+                        signers.push(Address::from_slice(&checkpoint.extra_data()[start..end]));
+                    }
+                    debug!(target: "consensus::apos", ?signers,
+                        "genesis signers:"
+                    );
+                   
+                    let s = Snapshot::new_snapshot(self.config.clone(), number, hash, signers);
+                    // todo
+                    self.provider.save_snapshot_by_hash(&hash, s.clone()).map_err(|_| ConsensusError::UnknownBlock)?;
+                    snap = Option::from(s);
+
+                    info!(target: "consensus::apos",
+                        "Stored checkpoint snapshot to disk, number: {}, hash: {}",
+                        number,
+                        hash
+                    );
+                    break;
+                }
+            }
+
+            // No snapshot for this header, gather the header and move backward
+            let header = if parents.is_some() && !parents.as_ref().unwrap().is_empty() {
+                let header = parents.as_mut().unwrap().pop().unwrap();
+                if header.hash_slow() != hash || header.number() != number {
+                    error!(target: "consensus::apos", "parent hash check failed: {:?}, {:?}, {:?}, {:?}", header.hash_slow(), hash, header.number(), number);
+                    return Err(ConsensusError::UnknownBlock);
+                }
+                header
+            //} else if let Some(v) = recent_headers.get(&hash) {
+            //    v.clone()
+            //} else if let Some(header) = self.provider.header_by_hash_or_number(hash.into()).map_err(|_| ConsensusError::UnknownBlock)? {
+             //   header
+            } else {
+                error!(target: "consensus::apos", "hash not found: {:?}", hash);
+                return Err(ConsensusError::UnknownBlock);
+            };
+
+            hash = header.parent_hash();
+            headers.push(header);
+            number -= 1;
+
+        }
+
+        //Find the previous snapshot and apply any pending headers to it
+        let headers_len = headers.len();
+        let half_len = headers_len / 2;
+        for i in 0..half_len {
+            headers.swap(i, headers_len - 1 - i);
+        }
+
+        let snap = snap.unwrap().apply::<_, H>(headers, |header| {
+            let signer = recover_address_generic(&header)?;
+            Ok(signer)
+        }).map_err(|_| ConsensusError::InvalidDifficulty)?;
+
+        recents.insert(snap.hash, snap.clone());
+
+        //If a new checkpoint snapshot is generated, save it to disk
+        if snap.number % CHECKPOINT_INTERVAL == 0 && headers_len > 0 {
+            self.provider.save_snapshot_by_hash(&snap.hash, snap.clone()).map_err(|_|ConsensusError::SaveSnapshotError)?;
+            debug!(
+                "Stored voting snapshot to disk, number: {}, hash: {}",
+                snap.number,
+                snap.hash
+            );
+        }
+
+        Ok(snap)
+    }
+
+
 }
 
 fn calc_difficulty(snap: &Snapshot, signer: &Address) -> U256 {
@@ -465,8 +566,7 @@ where
             return Ok(());
         }
 
-        //let snap = self.snapshot(number - 1, header.parent_hash(), Some(vec![parent.header().clone()]))?;
-        let snap: Snapshot = Default::default();
+        let snap = self.snapshot_inner(number - 1, header.parent_hash(), Some(vec![parent.header().clone()]))?;
         if number % self.config.epoch == 0 {
             let signers: Vec<u8> = snap.signers
                 .iter()
@@ -478,11 +578,11 @@ where
             }
         }
 
-        //self.verify_seal(&snap, header, None).map_err(|e| {ConsensusError::AposErrorDetail {detail: e.to_string()}})?;
-        //let mut recent_headers = self.recent_headers.write().unwrap();
-        //recent_headers.insert(header_hash, header.clone());
+        self.verify_seal(&snap, header, None).map_err(|e| {ConsensusError::AposErrorDetail {detail: e.to_string()}})?;
+        let mut recent_headers = self.recent_headers.write().unwrap();
+        recent_headers.insert(header_hash, Box::new(header.clone()));
 
-        //self.save_total_difficulty(header);
+        self.save_total_difficulty(header);
 
         Ok(())
     }
@@ -564,8 +664,8 @@ where
 
 
         //Assemble voting snapshots to check which votes are meaningful
-        //let snap = self.snapshot(parent_header.number, parent_header.hash(), None).map_err(|_| ConsensusError::UnknownBlock)?;
-        let snap: Snapshot = Default::default();
+        let snap = <APos<Provider, ChainSpec> as Consensus<B>>::snapshot(
+            self, parent_header.number, parent_header.hash(), None).map_err(|_| ConsensusError::UnknownBlock)?;
 
         if header.number %self.config.epoch != 0 {
             //Collect all proposals to be voted on
@@ -637,8 +737,7 @@ where
         let signer = self.signer.read().unwrap().ok_or(ConsensusError::NoSignerSet)?;
         debug!(target: "consensus::apos", "seal() signer={:?}", signer);
         // Bail out if we're unauthorized to sign a block
-        //let snap = self.snapshot(header.number - 1, header.parent_hash, None)?;
-        let snap: Snapshot = Default::default();
+        let snap = <APos<Provider, ChainSpec> as Consensus<B>>::snapshot(self, header.number - 1, header.parent_hash, None)?;
         debug!(target: "consensus::apos", "signer list: {:?}, signer: {}", snap.signers, signer);
         if !snap.signers.contains(&signer) {
             error!(target: "consensus::apos", "err signer not in list: {:?}, signer: {}", snap.signers, signer);
@@ -672,10 +771,10 @@ where
         *extra_data_mut.last_mut().unwrap() -= 27;
         header.extra_data = Bytes::from(extra_data_mut.freeze());
 
-        //let mut recent_headers = self.recent_headers.write().unwrap();
-        //recent_headers.insert(header.hash_slow(), header.clone());
+        let mut recent_headers = self.recent_headers.write().unwrap();
+        recent_headers.insert(header.hash_slow(), Box::new(header.clone()));
 
-        //self.save_total_difficulty(header);
+        self.save_total_difficulty(header);
 
         Ok(())
     }
@@ -700,132 +799,10 @@ where
         &self,
         number: u64,
         hash: B256,
-        parents: Option<Vec<Header>>,
+        parents: Option<Vec<B::Header>>,
     ) -> Result<Snapshot, ConsensusError> {
-        Ok(Default::default())
+        self.snapshot_inner::<B::Header>(number, hash, parents)
     }
-    /// snapshot retrieves the authorization snapshot at a given point in time.
-    /*
-    fn snapshot(
-        &self,
-        number: u64,
-        hash: B256,
-        parents: Option<Vec<Header>>,
-    ) -> Result<Snapshot, ConsensusError> {
-
-        let mut headers: Vec<Header> = Vec::new();
-        let mut snap: Option<Snapshot> = None;
-        let mut hash = hash;
-        let mut number = number;
-        let mut parents = parents;
-
-        let mut recents = self.recents.write().unwrap(); //
-        //let mut recent_headers = self.recent_headers.write().unwrap();
-
-        while snap.is_none() {
-            //Attempt to retrieve a snapshot from memory
-            if let Some(cached_snap) = recents.get(&hash) {
-                snap = Some(cached_snap.clone());
-                break;
-            }
-
-            // Attempt to obtain a snapshot from the disk
-            if number != 0 && number % CHECKPOINT_INTERVAL == 0 {
-                if let Ok(Some(s)) = self.provider.load_snapshot_by_hash(&hash) {
-                    snap = Some(s);
-                    break;
-                }
-                debug!(target: "consensus::apos", "Snapshot not found for hash: {}, at number: {}", hash, number);
-            }
-
-            // If we're at the genesis, snapshot the initial state. Alternatively if we're
-            // at a checkpoint block without a parent (light client CHT), or we have piled
-            // up more headers than allowed to be reorged (chain reinit from a freezer),
-            // consider the checkpoint trusted and snapshot it.
-            if number == 0 || (number % self.config.epoch == 0 && (headers.len() > FULL_IMMUTABILITY_THRESHOLD || self.provider.header_by_number(number -1).unwrap().is_none())) {
-                if let Ok(Some(checkpoint)) = self.provider.header_by_number(number) {
-                    //info!(target: "consensus::apos", "checkpoint={:?}", checkpoint);
-                    let hash = checkpoint.hash_slow();
-                    //info!(target: "consensus::apos", "snapshot() : number={}, hash_slow hash={:?}", number, hash);
-            
-                    //Calculate the list of signatories
-                    let signers_count = (checkpoint.extra_data().len() - EXTRA_VANITY - SIGNATURE_LENGTH) /  Address::len_bytes();
-
-                    let mut signers = Vec::with_capacity(signers_count);
-            
-                    for i in 0..signers_count {
-                        let start = EXTRA_VANITY + i * Address::len_bytes();
-                        let end = start + Address::len_bytes();
-                        signers.push(Address::from_slice(&checkpoint.extra_data()[start..end]));
-                    }
-                    debug!(target: "consensus::apos", ?signers,
-                        "genesis signers:"
-                    );
-                   
-                    let s = Snapshot::new_snapshot(self.config.clone(), number, hash, signers);
-                    // todo
-                    self.provider.save_snapshot_by_hash(&hash, s.clone()).map_err(|_| ConsensusError::UnknownBlock)?;
-                    snap = Option::from(s);
-
-                    info!(target: "consensus::apos",
-                        "Stored checkpoint snapshot to disk, number: {}, hash: {}",
-                        number,
-                        hash
-                    );
-                    break;
-                }
-            }
-
-            // No snapshot for this header, gather the header and move backward
-            let header = if parents.is_some() && !parents.as_ref().unwrap().is_empty() {
-                let header = parents.as_mut().unwrap().pop().unwrap();
-                if header.hash_slow() != hash || header.number != number {
-                    error!(target: "consensus::apos", "parent hash check failed: {:?}, {:?}, {:?}, {:?}", header.hash_slow(), hash, header.number, number);
-                    return Err(ConsensusError::UnknownBlock);
-                }
-                header
-            //} else if let Some(v) = recent_headers.get(&hash) {
-                //v.clone()
-            //} else if let Some(header) = self.provider.header_by_hash_or_number(hash.into()).map_err(|_| ConsensusError::UnknownBlock)? {
-             //   header
-            } else {
-                error!(target: "consensus::apos", "hash not found: {:?}", hash);
-                return Err(ConsensusError::UnknownBlock);
-            };
-
-            hash = header.parent_hash;
-            headers.push(header);
-            number -= 1;
-
-        }
-
-        //Find the previous snapshot and apply any pending headers to it
-        let headers_len = headers.len();
-        let half_len = headers_len / 2;
-        for i in 0..half_len {
-            headers.swap(i, headers_len - 1 - i);
-        }
-
-        let snap = snap.unwrap().apply(headers, |header| {
-            let signer = recover_address_generic(&header)?;
-            Ok(signer)
-        }).map_err(|_| ConsensusError::InvalidDifficulty)?;
-
-        recents.insert(snap.hash, snap.clone());
-
-        //If a new checkpoint snapshot is generated, save it to disk
-        if snap.number % CHECKPOINT_INTERVAL == 0 && headers_len > 0 {
-            self.provider.save_snapshot_by_hash(&snap.hash, snap.clone()).map_err(|_|ConsensusError::SaveSnapshotError)?;
-            debug!(
-                "Stored voting snapshot to disk, number: {}, hash: {}",
-                snap.number,
-                snap.hash
-            );
-        }
-
-        Ok(snap)
-    }
-*/
 
     fn propose(
         &self,
@@ -876,15 +853,14 @@ where
         difficulty: U256,
     ) -> Duration {
         let mut wiggle = Duration::from_millis(0);
-        /*
-        if let Ok(snapshot) = self.snapshot(parent_number, parent_hash, None) {
+        if let Ok(snapshot) =
+            <APos<Provider, ChainSpec> as Consensus<B>>::snapshot(self, parent_number, parent_hash, None) {
             // https://eips.ethereum.org/EIPS/eip-225
             // If the signer is out-of-turn, delay signing by rand(SIGNER_COUNT * 500ms)
             if difficulty != DIFF_IN_TURN {
                 wiggle = Duration::from_millis((rand::random::<f64>() * snapshot.signers.len() as f64 * WIGGLE_TIME.as_millis() as f64) as u64)
             }
         }
-        */
         wiggle
     }
 }

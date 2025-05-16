@@ -1,6 +1,6 @@
 //! Ethereum Node types config.
 
-use n42_engine_primitives::{N42PayloadAttributes, N42PayloadBuilderAttributes};
+//use n42_engine_primitives::{N42PayloadAttributes, N42PayloadBuilderAttributes};
 pub use reth_node_ethereum::{payload::EthereumPayloadBuilder, EthereumEngineValidator};
 use reth_node_ethereum::{EthEngineTypes, EthEvmConfig};
 use alloy_eips::merge::EPOCH_SLOTS;

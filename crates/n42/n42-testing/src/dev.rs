@@ -195,7 +195,7 @@ impl CliqueTest {
        println!("best_number={best_number:?}, block_hash={block_hash:?}");
 
        let snapshot = node.consensus.snapshot(best_number, block_hash, None).unwrap();
-       println!("snapshot={:?}", snapshot);
+       println!("snapshot={snapshot:?}");
        let expected_signers: Vec<Address> = self.results.iter().map(|a| accounts.address(a)).collect();
        assert_eq!(snapshot.signers, expected_signers);
 

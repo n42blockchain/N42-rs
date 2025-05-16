@@ -1,7 +1,8 @@
 //! Contains the implementation of the mining mode for the local engine.
 
+use reth_ethereum_primitives::{EthPrimitives};
 use reth_primitives::TransactionSigned;
-use reth_primitives_traits::AlloyBlockHeader;
+use reth_primitives_traits::{AlloyBlockHeader, NodePrimitives};
 use alloy_primitives::Sealable;
 //use std::hash::Hash;
 use alloy_eips::{BlockHashOrNumber, BlockNumHash};
@@ -12,7 +13,7 @@ use futures_util::{stream::Fuse, StreamExt};
 use itertools::Itertools;
 use reth_engine_primitives::BeaconConsensusEngineHandle;
 use reth_chainspec::EthereumHardforks;
-use reth_consensus::{Consensus, ConsensusError};
+use reth_consensus::{FullConsensus, ConsensusError};
 //use reth_engine_primitives::{EngineTypes};
 use reth_payload_primitives::{EngineApiMessageVersion};
 use reth_eth_wire_types::NewBlock;
@@ -93,7 +94,7 @@ impl Future for MiningMode {
 
 /// Local miner advancing the chain/
 #[derive(Debug)]
-pub struct N42Miner<T: PayloadTypes, Provider, B, Network, Blc: BlockTrait> {
+pub struct N42Miner<T: PayloadTypes, Provider, B, Network, N: NodePrimitives> {
     /// Provider to read the current tip of the chain.
     provider: Provider,
     /// The payload attribute builder for the engine
@@ -107,7 +108,7 @@ pub struct N42Miner<T: PayloadTypes, Provider, B, Network, Blc: BlockTrait> {
     payload_builder: PayloadBuilderHandle<T>,
     /// full network  for announce block
     network: Network,
-    consensus: Arc<dyn Consensus<Blc, Error = ConsensusError>>,
+    consensus: Arc<dyn FullConsensus<N, Error = ConsensusError>>,
     //recent_blocks: schnellru::LruMap<B256, SealedBlock>,
     recent_num_to_td: schnellru::LruMap<u64, U256>,
     new_block_tx: mpsc::Sender<(NewBlock, BlockHash)>,
@@ -129,7 +130,7 @@ const SYNC_DOWNLOAD_BLOCKS_UNIT: u64 = 512;
 const DIFFICULTY_DELTA_CLAMP: u64 = 50;
 const MAX_NUM_LOCAL_BLOCKS_TO_CHECK: u64 = 256;
 
-impl<T, Provider, B, Network, Blc> N42Miner<T, Provider, B, Network, Blc>
+impl<T, Provider, B, Network, N> N42Miner<T, Provider, B, Network, N>
 where
     T: PayloadTypes,
     Provider: 
@@ -139,7 +140,7 @@ where
         + 'static,
     B: PayloadAttributesBuilder<<T as PayloadTypes>::PayloadAttributes>,
     Network: reth_network_api::FullNetwork,
-    Blc: BlockTrait + 'static,
+    N: NodePrimitives,
 {
     /// Spawns a new [`N42Miner`] with the given parameters.
     pub fn spawn_new(
@@ -149,7 +150,7 @@ where
         mode: MiningMode,
         payload_builder: PayloadBuilderHandle<T>,
         network: Network,
-        consensus: Arc<dyn Consensus<Blc, Error = ConsensusError>>,
+        consensus: Arc<dyn FullConsensus<N, Error = ConsensusError>>,
     ) {
         let (new_block_tx, new_block_rx) = mpsc::channel::<(NewBlock, BlockHash)>(128);
         let miner = Self {

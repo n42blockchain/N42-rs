@@ -25,7 +25,7 @@ members = [
     "crates/consensus/consensus/",
     #"crates/consensus/debug-client/",
     #"crates/engine/util/",
-    #"crates/ethereum/cli/",
+    "crates/ethereum/cli/",
     #"crates/ethereum/payload/",
     "crates/ethereum-forks/",
     "crates/net/peers/",
@@ -202,7 +202,7 @@ reth-node-ethereum = { path = "crates/ethereum/node" }
 reth-provider = { path = "crates/storage/provider" }
 reth-db = {path = "crates/storage/db", optional = true }
 reth-ethereum-forks = { path = "crates/ethereum-forks"}
-#reth-ethereum-cli = { path = "crates/ethereum/cli"}
+reth-ethereum-cli = { path = "crates/ethereum/cli"}
 #reth-ethereum-consensus = { path = "crates/ethereum/consensus"}
 #reth-evm = { path = "crates/evm"}
 #reth-invalid-block-hooks = { path = "crates/engine/invalid-block-hooks" }

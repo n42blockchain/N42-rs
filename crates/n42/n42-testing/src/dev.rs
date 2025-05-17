@@ -1187,7 +1187,6 @@ async fn test_epoch_transitions_reset_all_votes_to_allow_chain_checkpointing() -
                 signer: "B".to_string(),
                 voted: Some("C".to_string()),
                 auth: Some(true),
-                ..Default::default()
             },
         ],
         results: vec![

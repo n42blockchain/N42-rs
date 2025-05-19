@@ -28,6 +28,7 @@ use derive_more::From;
 use reth_ethereum_forks::{
     ChainHardforks, DisplayHardforks, EthereumHardfork, EthereumHardforks, ForkCondition,
     ForkFilter, ForkFilterKey, ForkHash, ForkId, Hardfork, Hardforks, Head, DEV_HARDFORKS,
+    N42_HARDFORKS,
 };
 use reth_network_peers::{
     holesky_nodes, hoodi_nodes, mainnet_nodes, op_nodes, op_testnet_nodes, sepolia_nodes,
@@ -96,20 +97,23 @@ pub const N42_TESTNET_CHAINID: u64 = 1142;
 
 /// The Ethereum mainnet spec
 pub static N42: LazyLock<Arc<ChainSpec>> = LazyLock::new(|| {
+    let genesis: Genesis = serde_json::from_str(include_str!("../res/genesis/n42.json")).expect("Can't deserialize N42 genesis json");
+    let hardforks = N42_HARDFORKS.clone();
+    //let genesis_hash = alloy_primitives::keccak256(alloy_rlp::encode(genesis.header()));
+    let genesis_header = SealedHeader::new_unhashed(
+            make_genesis_header(&genesis, &hardforks),
+            //genesis_hash,
+        );
     let mut spec = ChainSpec {
         chain: Chain::from_id(N42_TESTNET_CHAINID),
-        genesis: serde_json::from_str(include_str!("../res/genesis/n42.json"))
-            .expect("Can't deserialize N42 genesis json"),
-        //genesis_hash: OnceLock::new(),
-        //genesis_header: OnceLock::new(),
-            genesis_header: Default::default(),
+        genesis,
+        genesis_header,
         // <https://etherscan.io/block/15537394>
         paris_block_and_final_difficulty: Some((
-            15537394,
-            U256::from(58_750_003_716_598_352_816_469u128),
+            0,
+            U256::from(0),
         )),
-        //hardforks: EthereumHardfork::n42().into(),
-        hardforks: EthereumHardfork::mainnet().into(),
+        hardforks,
         deposit_contract: None,
         base_fee_params: Default::default(),
         //max_gas_limit: ETHEREUM_BLOCK_GAS_LIMIT,

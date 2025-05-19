@@ -1,6 +1,9 @@
 mod dev;
 pub use dev::DEV_HARDFORKS;
 
+mod n42;
+pub use n42::N42_HARDFORKS;
+
 use crate::{ForkCondition, ForkFilter, ForkId, Hardfork, Head};
 #[cfg(feature = "std")]
 use rustc_hash::FxHashMap;

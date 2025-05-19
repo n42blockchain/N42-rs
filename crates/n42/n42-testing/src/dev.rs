@@ -1172,7 +1172,6 @@ async fn test_epoch_transitions_reset_all_votes_to_allow_chain_checkpointing() -
                 signer: "A".to_string(),
                 voted: Some("C".to_string()),
                 auth: Some(true),
-                ..Default::default()
             },
             TesterVote {
                 signer: "B".to_string(),

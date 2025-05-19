@@ -94,7 +94,7 @@ impl Future for MiningMode {
 
 /// Local miner advancing the chain/
 #[derive(Debug)]
-pub struct N42Miner<T: PayloadTypes, Provider, B, Network, N: NodePrimitives> {
+pub struct N42Miner<T: PayloadTypes, Provider, B, Network> {
     /// Provider to read the current tip of the chain.
     provider: Provider,
     /// The payload attribute builder for the engine
@@ -108,7 +108,7 @@ pub struct N42Miner<T: PayloadTypes, Provider, B, Network, N: NodePrimitives> {
     payload_builder: PayloadBuilderHandle<T>,
     /// full network  for announce block
     network: Network,
-    consensus: Arc<dyn FullConsensus<N, Error = ConsensusError>>,
+    consensus: Arc<dyn FullConsensus<<T::BuiltPayload as BuiltPayload>::Primitives, Error = ConsensusError>>,
     //recent_blocks: schnellru::LruMap<B256, SealedBlock>,
     recent_num_to_td: schnellru::LruMap<u64, U256>,
     new_block_tx: mpsc::Sender<(NewBlock, BlockHash)>,
@@ -130,9 +130,10 @@ const SYNC_DOWNLOAD_BLOCKS_UNIT: u64 = 512;
 const DIFFICULTY_DELTA_CLAMP: u64 = 50;
 const MAX_NUM_LOCAL_BLOCKS_TO_CHECK: u64 = 256;
 
-impl<T, Provider, B, Network, N> N42Miner<T, Provider, B, Network, N>
+impl<T, Provider, B, Network> N42Miner<T, Provider, B, Network>
 where
     T: PayloadTypes,
+    <T::BuiltPayload as BuiltPayload>::Primitives: NodePrimitives,
     Provider: 
         BlockReader
         + BlockIdReader
@@ -140,7 +141,6 @@ where
         + 'static,
     B: PayloadAttributesBuilder<<T as PayloadTypes>::PayloadAttributes>,
     Network: reth_network_api::FullNetwork,
-    N: NodePrimitives,
 {
     /// Spawns a new [`N42Miner`] with the given parameters.
     pub fn spawn_new(
@@ -150,7 +150,7 @@ where
         mode: MiningMode,
         payload_builder: PayloadBuilderHandle<T>,
         network: Network,
-        consensus: Arc<dyn FullConsensus<N, Error = ConsensusError>>,
+        consensus: Arc<dyn FullConsensus<<T::BuiltPayload as BuiltPayload>::Primitives, Error = ConsensusError>>,
     ) {
         let (new_block_tx, new_block_rx) = mpsc::channel::<(NewBlock, BlockHash)>(128);
         let miner = Self {
@@ -356,9 +356,9 @@ where
             */
             match self.fetch_block(parent.into()).await {
                 Ok(parent_block) => {
-                    parent = parent_block.parent_hash;
-                    parent_num = parent_block.header().number - 1;
-                    difficulty = parent_block.header().difficulty;
+                    parent = parent_block.header().parent_hash();
+                    parent_num = parent_block.header().number() - 1;
+                    difficulty = parent_block.header().difficulty();
                     debug!(target: "consensus-client", ?difficulty);
                     let sealed_block = parent_block.seal_slow();
                     parents.push(sealed_block.clone());
@@ -383,7 +383,6 @@ where
         if is_fork && larger_td {
             let mut new_payload_ok = true;
             for parent in parents.iter().rev() {
-                /*
                 match self.new_payload(parent).await {
                     Ok(_) => {}
                     Err(e) => {
@@ -392,7 +391,6 @@ where
                         break;
                     }
                 }
-                */
             }
 
             if new_payload_ok {
@@ -687,29 +685,23 @@ where
         }
     }
 
-    /*
-    async fn new_payload(&mut self, block: &SealedBlock) -> eyre::Result<()> {
+    async fn new_payload(&mut self, block: &SealedBlock<<<T::BuiltPayload as BuiltPayload>::Primitives as NodePrimitives>::Block>) -> eyre::Result<()> {
         debug!(target: "consensus-client", "new_block hash {:?}", block.header().hash_slow());
 
         let cancun_fields = self
             .provider
             .chain_spec()
-            .is_cancun_active_at_timestamp(block.timestamp)
+            .is_cancun_active_at_timestamp(block.timestamp())
             .then(|| CancunPayloadFields {
-                parent_beacon_block_root: block.parent_beacon_block_root.unwrap(),
+                parent_beacon_block_root: block.parent_beacon_block_root().unwrap(),
                 versioned_hashes: block.blob_versioned_hashes_iter().copied().collect(),
             });
 
-        let execution_data = <EngineT as PayloadTypes>::block_to_payload(block.clone());
+        let execution_data = T::block_to_payload(block.clone());
         let res = self
             .beacon_engine_handle
             .new_payload(
                 execution_data,
-                /*
-                cancun_fields
-                    .map(ExecutionPayloadSidecar::v3)
-                    .unwrap_or_else(ExecutionPayloadSidecar::none),
-                */
             )
             .await?;
         debug!(target: "consensus-client", "new_payload res={:?}", res);
@@ -721,7 +713,6 @@ where
         }
         Ok(())
     }
-*/
 
     async fn fcu_hash(&mut self, block_hash: BlockHash) -> eyre::Result<()> {
         let forkchoice_state = self.forkchoice_state_with_head(block_hash);
@@ -808,14 +799,14 @@ where
         let finalized_block_from_p2p = self.fetch_block(block_hash.into()).await?.seal_slow();
 
         self.sync_to_hash_in_small_unit(
-            finalized_block_from_p2p.header().parent_hash,
+            finalized_block_from_p2p.header().parent_hash(),
             SYNC_DOWNLOAD_BLOCKS_UNIT,
         )
         .await?;
-        //self.new_payload(&finalized_block_from_p2p).await?;
+        self.new_payload(&finalized_block_from_p2p).await?;
         self.fcu_hash_finalized(block_hash, block_hash).await?;
         let duration = start.elapsed();
-        info!(target: "consensus-client", ?duration, from=?best_block_number, to=?finalized_block_from_p2p.header().number, "time spent in syncing");
+        info!(target: "consensus-client", ?duration, from=?best_block_number, to=?finalized_block_from_p2p.header().number(), "time spent in syncing");
         Ok(())
     }
 
@@ -890,7 +881,7 @@ where
         Ok(Default::default())
     }
 
-    async fn fetch_block(&mut self, start: BlockHashOrNumber) -> eyre::Result<Block> {
+    async fn fetch_block(&mut self, start: BlockHashOrNumber) -> eyre::Result<<<T::BuiltPayload as BuiltPayload>::Primitives as NodePrimitives>::Block> {
         self.num_fetched_blocks += 1;
         let fetch_client = match self.network.fetch_client().await {
             Ok(c) => c,

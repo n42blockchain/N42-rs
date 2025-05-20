@@ -2,12 +2,13 @@
 name = "alloy-rpc-types-engine"
 description = "Types for the `engine` Ethereum JSON-RPC namespace"
 
-version.workspace = true
+version = "0.14.0"
+#version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
-authors.workspace = true
+#authors.workspace = true
 repository.workspace = true
 exclude.workspace = true
 

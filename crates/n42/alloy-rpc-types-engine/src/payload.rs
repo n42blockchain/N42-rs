@@ -299,9 +299,11 @@ impl ExecutionPayloadV1 {
 
     /// Converts [`ExecutionPayloadV1`] to [`Block`]
     pub fn try_into_block<T: Decodable2718>(self) -> Result<Block<T>, PayloadError> {
+        /*
         if self.extra_data.len() > MAXIMUM_EXTRA_DATA_SIZE {
             return Err(PayloadError::ExtraData(self.extra_data));
         }
+        */
 
         if self.base_fee_per_gas.is_zero() {
             return Err(PayloadError::BaseFee(self.base_fee_per_gas));
@@ -358,8 +360,8 @@ impl ExecutionPayloadV1 {
             extra_data: self.extra_data,
             // Defaults
             ommers_hash: EMPTY_OMMER_ROOT_HASH,
-            difficulty: Default::default(),
-            nonce: Default::default(),
+            difficulty: self.difficulty,
+            nonce: self.nonce,
         };
 
         Ok(Block { header, body: BlockBody { transactions, ommers: vec![], withdrawals: None } })
@@ -399,6 +401,8 @@ impl ExecutionPayloadV1 {
             extra_data: block.header.extra_data().clone(),
             block_hash,
             transactions,
+            difficulty: block.difficulty(),
+            nonce: block.nonce().unwrap_or_default(),
         }
     }
 }
@@ -1204,6 +1208,8 @@ impl<'de> serde::Deserialize<'de> for ExecutionPayload {
                     // V3
                     BlobGasUsed,
                     ExcessBlobGas,
+                    Difficulty,
+                    Nonce,
                 }
 
                 let mut parent_hash = None;
@@ -1223,6 +1229,8 @@ impl<'de> serde::Deserialize<'de> for ExecutionPayload {
                 let mut withdrawals = None;
                 let mut blob_gas_used = None;
                 let mut excess_blob_gas = None;
+                let mut difficulty = None;
+                let mut nonce = None;
 
                 while let Some(key) = map.next_key()? {
                     match key {
@@ -1267,6 +1275,8 @@ impl<'de> serde::Deserialize<'de> for ExecutionPayload {
                             excess_blob_gas =
                                 Some(alloy_serde::quantity::deserialize(raw.into_deserializer())?);
                         }
+                        Fields::Difficulty => difficulty = Some(map.next_value()?),
+                        Fields::Nonce => nonce = Some(map.next_value()?),
                     }
                 }
 
@@ -1296,6 +1306,10 @@ impl<'de> serde::Deserialize<'de> for ExecutionPayload {
                     .ok_or_else(|| serde::de::Error::missing_field("baseFeePerGas"))?;
                 let block_hash =
                     block_hash.ok_or_else(|| serde::de::Error::missing_field("blockHash"))?;
+                let difficulty =
+                    difficulty.ok_or_else(|| serde::de::Error::missing_field("difficulty"))?;
+                let nonce =
+                    nonce.ok_or_else(|| serde::de::Error::missing_field("nonce"))?;
                 let transactions =
                     transactions.ok_or_else(|| serde::de::Error::missing_field("transactions"))?;
 
@@ -1314,6 +1328,8 @@ impl<'de> serde::Deserialize<'de> for ExecutionPayload {
                     base_fee_per_gas,
                     block_hash,
                     transactions,
+                    difficulty,
+                    nonce,
                 };
 
                 let Some(withdrawals) = withdrawals else {

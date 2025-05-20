@@ -21,7 +21,6 @@ use reth_node_api::{PayloadBuilderFor};
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_chain_state::CanonStateSubscriptions;
 use reth_basic_payload_builder::{BasicPayloadJobGenerator, BasicPayloadJobGeneratorConfig};
-use tokio::sync::mpsc;
 use reth_payload_builder::{PayloadBuilderHandle, PayloadBuilderService};
 use reth_consensus::{ConsensusError, FullConsensus};
 use reth_node_api::{PrimitivesTy};
@@ -491,43 +490,27 @@ where
             .map_err(PayloadBuilderError::other)?;
     }
 
-    /*
-    header.parent_hash = parent_header.hash();
-    header.ommers_hash = EMPTY_OMMER_ROOT_HASH;
-    header.timestamp = attributes.0.timestamp;
-    // header.beneficiary = initialized_block_env.coinbase;
-    // header.number = parent_header.number + 1;
-    header.gas_limit = block_gas_limit;
-    // header.difficulty = U256::ZERO;
-    // header.extra_data = extra_data;
-    // roots
-    header.state_root = state_root;
-    header.transactions_root = transactions_root;
-    header.receipts_root = receipts_root;
-    header.withdrawals_root = withdrawals_root;
-    header.logs_bloom = logs_bloom;
-    header.requests_hash = requests_hash;
-    // header.timestamp = attributes.0.timestamp;
-    header.mix_hash = attributes.0.prev_randao;
-    // header.nonce = BEACON_NONCE.into();
-    header.base_fee_per_gas = Some(base_fee);
-    //
-    header.parent_beacon_block_root = attributes.0.parent_beacon_block_root;
-    header.blob_gas_used = blob_gas_used.map(Into::into);
-    header.excess_blob_gas = excess_blob_gas.map(Into::into);
-    //
+    header.beneficiary =  block.header().beneficiary;
+    header.state_root =  block.header().state_root;
+    header.transactions_root =  block.header().transactions_root;
+    header.receipts_root =  block.header().receipts_root;
+    header.logs_bloom =  block.header().logs_bloom;
+    header.gas_limit =  block.header().gas_limit;
+    header.gas_used =  block.header().gas_used;
+    header.base_fee_per_gas =  block.header().base_fee_per_gas;
+    header.withdrawals_root =  block.header().withdrawals_root;
+    header.blob_gas_used =  block.header().blob_gas_used;
+    header.excess_blob_gas =  block.header().excess_blob_gas;
+    header.parent_beacon_block_root =  block.header().parent_beacon_block_root;
+    header.requests_hash =  block.header().requests_hash;
 
-    */
+    header.timestamp = attributes.timestamp;
+    header.mix_hash = attributes.prev_randao;
+
     // seal
     cons.seal(&mut header).map_err(|err| PayloadBuilderError::Internal(err.into()))?;
 
-    let block_part = block.clone().into_block();
-    //let sealed_block1 = Arc::new(x.sealed_block().clone());
-    let sealed_block = Arc::new(SealedBlock::seal_parts(header.clone(), block_part.body));
-   // let sealed_block = Arc::new(block.sealed_block().clone());
-   //let sealed_block_header: Arc<SealedHeader<Header>> = sealed_block.sealed_header();
-    //debug!(target: "payload_builder", id=%attributes.id, ?sealed_block_header, "sealed built block");
-    debug!(target: "payload_builder", id=%attributes.id, ?header, "sealed built block");
+    let sealed_block = Arc::new(SealedBlock::seal_parts(header, block.into_block().body));
 
     let mut payload = EthBuiltPayload::new(attributes.id, sealed_block, total_fees, requests);
 
@@ -604,10 +587,6 @@ where
         ctx.task_executor().spawn_critical("payload builder service", Box::pin(payload_service));
 
         Ok(payload_service_handle)
-            /*
-        let (service_tx, command_rx) = mpsc::unbounded_channel();
-        Ok(PayloadBuilderHandle::new(service_tx))
-            */
     }
 }
 

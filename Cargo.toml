@@ -224,7 +224,7 @@ reth-network-peers = { path = "crates/net/peers"}
 
 [patch.crates-io]
 #alloy-genesis = { path = "./crates/n42/alloy-genesis" }
-#alloy-rpc-types-engine = { path = "./crates/n42/alloy-rpc-types-engine" }
+alloy-rpc-types-engine = { path = "./crates/n42/alloy-rpc-types-engine" }
 alloy-rpc-types-beacon = { path = "./crates/n42/alloy-rpc-types-beacon" }
 
 [workspace.dependencies]

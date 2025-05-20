@@ -670,6 +670,7 @@ where
 
         self.num_generated_blocks += 1;
         if num_signers == 1 {
+            self.new_payload(&block).await?;
             self.fcu_hash(block_hash).await?;
         }
         Ok(())

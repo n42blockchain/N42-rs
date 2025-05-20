@@ -251,7 +251,6 @@ async fn test_single_signer__voting_to_add_two_others__only_accept_first__second
                 signer: "A".to_string(),
                 voted: Some("B".to_string()),
                 auth: Some(true),
-                ..Default::default()
             },
             TesterVote {
                 signer: "B".to_string(),

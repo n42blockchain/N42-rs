@@ -490,7 +490,6 @@ where
             .map_err(PayloadBuilderError::other)?;
     }
 
-    header.beneficiary =  block.header().beneficiary;
     header.state_root =  block.header().state_root;
     header.transactions_root =  block.header().transactions_root;
     header.receipts_root =  block.header().receipts_root;
@@ -501,11 +500,11 @@ where
     header.withdrawals_root =  block.header().withdrawals_root;
     header.blob_gas_used =  block.header().blob_gas_used;
     header.excess_blob_gas =  block.header().excess_blob_gas;
-    header.parent_beacon_block_root =  block.header().parent_beacon_block_root;
     header.requests_hash =  block.header().requests_hash;
 
     header.timestamp = attributes.timestamp;
     header.mix_hash = attributes.prev_randao;
+    header.parent_beacon_block_root = attributes.parent_beacon_block_root;
 
     // seal
     cons.seal(&mut header).map_err(|err| PayloadBuilderError::Internal(err.into()))?;

@@ -135,7 +135,7 @@ impl Error for AposError {}
 /// Ethereum testnet following the Ropsten attacks.
 pub struct APos<Provider, ChainSpec>
 where
-    Provider: HeaderProvider + SnapshotProvider + SnapshotProviderWriter + BlockIdReader  + BlockReaderIdExt + Clone + Unpin + 'static,
+    Provider: HeaderProvider<Header = reth_primitives_traits::Header> + SnapshotProvider + SnapshotProviderWriter + BlockIdReader  + BlockReaderIdExt + Clone + Unpin + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks
 {
     config: APosConfig,          // Consensus engine configuration parameters
@@ -147,7 +147,7 @@ where
     eth_signer: RwLock<Option<LocalSigner<SigningKey>>>,
     //  Provider,
     provider: Provider,
-    recent_headers: RwLock<schnellru::LruMap<B256, Box<dyn AlloyBlockHeader + Send + Sync + 'static>>>,    // Recent headers for snapshot
+    recent_headers: RwLock<schnellru::LruMap<B256, Provider::Header>>,    // Recent headers for snapshot
     recent_tds: RwLock<schnellru::LruMap<B256, U256>>,
     recent_tds_inited: AtomicBool,
 }
@@ -157,7 +157,7 @@ where
 // signers set to the ones provided by the user.
 impl<Provider, ChainSpec> APos<Provider, ChainSpec>
 where
-    Provider: HeaderProvider + SnapshotProvider + SnapshotProviderWriter + BlockIdReader  + BlockReaderIdExt + Clone + Unpin + 'static,
+    Provider: HeaderProvider<Header = reth_primitives_traits::Header> + SnapshotProvider + SnapshotProviderWriter + BlockIdReader  + BlockReaderIdExt + Clone + Unpin + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks,
 {
     /// new
@@ -338,17 +338,14 @@ where
     }
 
     /// snapshot retrieves the authorization snapshot at a given point in time.
-    fn snapshot_inner<H>(
+    fn snapshot_inner(
         &self,
         number: u64,
         hash: B256,
-        parents: Option<Vec<H>>,
-    ) -> Result<Snapshot, ConsensusError>
-        where
-        H: BlockHeaderTrait,
-    {
+        parents: Option<Vec<Provider::Header>>,
+    ) -> Result<Snapshot, ConsensusError> {
 
-        let mut headers: Vec<H> = Vec::new();
+        let mut headers: Vec<Provider::Header> = Vec::new();
         let mut snap: Option<Snapshot> = None;
         let mut hash = hash;
         let mut number = number;
@@ -402,7 +399,7 @@ where
                     self.provider.save_snapshot_by_hash(&hash, s.clone()).map_err(|_| ConsensusError::UnknownBlock)?;
                     snap = Option::from(s);
 
-                    info!(target: "consensus::apos",
+                    debug!(target: "consensus::apos", ?snap,
                         "Stored checkpoint snapshot to disk, number: {}, hash: {}",
                         number,
                         hash
@@ -419,10 +416,10 @@ where
                     return Err(ConsensusError::UnknownBlock);
                 }
                 header
-            //} else if let Some(v) = recent_headers.get(&hash) {
-            //    v.clone()
-            //} else if let Some(header) = self.provider.header_by_hash_or_number(hash.into()).map_err(|_| ConsensusError::UnknownBlock)? {
-             //   header
+            } else if let Some(v) = recent_headers.get(&hash) {
+                v.clone()
+            } else if let Some(header) = self.provider.header_by_hash_or_number(hash.into()).map_err(|_| ConsensusError::UnknownBlock)? {
+               header
             } else {
                 error!(target: "consensus::apos", "hash not found: {:?}", hash);
                 return Err(ConsensusError::UnknownBlock);
@@ -441,7 +438,7 @@ where
             headers.swap(i, headers_len - 1 - i);
         }
 
-        let snap = snap.unwrap().apply::<_, H>(headers, |header| {
+        let snap = snap.unwrap().apply::<_, Provider::Header>(headers, |header| {
             let signer = recover_address_generic(&header)?;
             Ok(signer)
         }).map_err(|_| ConsensusError::InvalidDifficulty)?;
@@ -475,20 +472,19 @@ fn calc_difficulty(snap: &Snapshot, signer: &Address) -> U256 {
 impl<Provider, ChainSpec> Debug for APos<Provider, ChainSpec>
 where
     ChainSpec: EthChainSpec + EthereumHardforks,
-    Provider: 'static + Clone + HeaderProvider + SnapshotProvider + SnapshotProviderWriter + BlockIdReader  + BlockReaderIdExt + Unpin,
+    Provider: 'static + Clone + HeaderProvider<Header = reth_primitives_traits::Header> + SnapshotProvider + SnapshotProviderWriter + BlockIdReader  + BlockReaderIdExt + Unpin,
 {
     fn fmt(&self, _f: &mut Formatter<'_>) -> std::fmt::Result {
         todo!()
     }
 }
 
-impl<Provider, ChainSpec, H> HeaderValidator<H> for APos<Provider, ChainSpec>
+impl<Provider, ChainSpec> HeaderValidator for APos<Provider, ChainSpec>
 where
     ChainSpec: EthChainSpec + EthereumHardforks,
-    Provider: 'static + Clone + HeaderProvider + SnapshotProvider + SnapshotProviderWriter + BlockIdReader  + BlockReaderIdExt + Unpin,
-    H: BlockHeaderTrait,
+    Provider: 'static + Clone + HeaderProvider<Header = reth_primitives_traits::Header> + SnapshotProvider + SnapshotProviderWriter + BlockIdReader  + BlockReaderIdExt + Unpin,
 {
-    fn validate_header(&self, header: &SealedHeader<H>) -> Result<(), ConsensusError> {
+    fn validate_header(&self, header: &SealedHeader) -> Result<(), ConsensusError> {
 
         let header = header.header();
         if header.number() == 0 {
@@ -554,8 +550,8 @@ where
 
     fn validate_header_against_parent(
         &self,
-        header: &SealedHeader<H>,
-        parent: &SealedHeader<H>,
+        header: &SealedHeader,
+        parent: &SealedHeader,
     ) -> Result<(), ConsensusError> {
         debug!(target: "consensus::apos", ?header, "in validate_header_against_parent");
 
@@ -580,7 +576,7 @@ where
 
         self.verify_seal(&snap, header, None).map_err(|e| {ConsensusError::AposErrorDetail {detail: e.to_string()}})?;
         let mut recent_headers = self.recent_headers.write().unwrap();
-        recent_headers.insert(header_hash, Box::new(header.clone()));
+        recent_headers.insert(header_hash, header.clone());
 
         self.save_total_difficulty(header);
 
@@ -595,18 +591,14 @@ where
     /// Note: this expects that the headers are in natural order (ascending block number)
     fn validate_header_range(
         &self,
-        headers: &[SealedHeader<H>],
-    ) -> Result<(), HeaderConsensusError<H>>
-        where
-            H: Clone
-    {
+        headers: &[SealedHeader],
+    ) -> Result<(), HeaderConsensusError<reth_primitives_traits::Header>> {
         Ok(())
     }
 
-
     fn validate_header_with_total_difficulty(
         &self,
-        header: &H,
+        header: &reth_primitives_traits::Header,
         _total_difficulty: U256,
     ) -> Result<(), ConsensusError> {
         Ok(())
@@ -616,9 +608,10 @@ where
 
 impl<Provider, ChainSpec, N> FullConsensus<N> for APos<Provider, ChainSpec>
 where
-    Provider: HeaderProvider +SnapshotProvider + SnapshotProviderWriter  + BlockIdReader  + BlockReaderIdExt + Clone + Unpin + 'static,
+    Provider: HeaderProvider<Header = reth_primitives_traits::Header> +SnapshotProvider + SnapshotProviderWriter  + BlockIdReader  + BlockReaderIdExt + Clone + Unpin + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks,
     N: NodePrimitives,
+    APos<Provider, ChainSpec>: HeaderValidator<<N as NodePrimitives>::BlockHeader>,
 {
     fn validate_block_post_execution(
         &self,
@@ -632,9 +625,10 @@ where
 
 impl<Provider, ChainSpec, B> Consensus<B> for APos<Provider, ChainSpec>
 where
-    Provider: HeaderProvider +SnapshotProvider + SnapshotProviderWriter  + BlockIdReader  + BlockReaderIdExt + Clone + Unpin + 'static,
+    Provider: HeaderProvider<Header = reth_primitives_traits::Header> +SnapshotProvider + SnapshotProviderWriter  + BlockIdReader  + BlockReaderIdExt + Clone + Unpin + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks,
     B: BlockTrait,
+    APos<Provider, ChainSpec>: HeaderValidator<<B as reth_primitives_traits::Block>::Header>,
 {
     type Error = ConsensusError;
 
@@ -664,8 +658,8 @@ where
 
 
         //Assemble voting snapshots to check which votes are meaningful
-        let snap = <APos<Provider, ChainSpec> as Consensus<B>>::snapshot(
-            self, parent_header.number, parent_header.hash(), None).map_err(|_| ConsensusError::UnknownBlock)?;
+        let snap = self.snapshot_inner(
+            parent_header.number, parent_header.hash(), None).map_err(|_| ConsensusError::UnknownBlock)?;
 
         if header.number %self.config.epoch != 0 {
             //Collect all proposals to be voted on
@@ -688,6 +682,7 @@ where
             }
         }
 
+        debug!(target: "consensus::apos", ?snap, "snap");
         //Copy the signer to prevent data competition
         let signer_guard = self.signer.read().unwrap();
         if let Some(signer) = *signer_guard {
@@ -737,7 +732,7 @@ where
         let signer = self.signer.read().unwrap().ok_or(ConsensusError::NoSignerSet)?;
         debug!(target: "consensus::apos", "seal() signer={:?}", signer);
         // Bail out if we're unauthorized to sign a block
-        let snap = <APos<Provider, ChainSpec> as Consensus<B>>::snapshot(self, header.number - 1, header.parent_hash, None)?;
+        let snap = self.snapshot_inner(header.number - 1, header.parent_hash, None)?;
         debug!(target: "consensus::apos", "signer list: {:?}, signer: {}", snap.signers, signer);
         if !snap.signers.contains(&signer) {
             error!(target: "consensus::apos", "err signer not in list: {:?}, signer: {}", snap.signers, signer);
@@ -772,7 +767,7 @@ where
         header.extra_data = Bytes::from(extra_data_mut.freeze());
 
         let mut recent_headers = self.recent_headers.write().unwrap();
-        recent_headers.insert(header.hash_slow(), Box::new(header.clone()));
+        recent_headers.insert(header.hash_slow(), header.clone());
 
         self.save_total_difficulty(header);
 
@@ -799,9 +794,9 @@ where
         &self,
         number: u64,
         hash: B256,
-        parents: Option<Vec<B::Header>>,
+        parents: Option<Vec<Header>>,
     ) -> Result<Snapshot, ConsensusError> {
-        self.snapshot_inner::<B::Header>(number, hash, parents)
+        self.snapshot_inner(number, hash, parents)
     }
 
     fn propose(
@@ -854,7 +849,7 @@ where
     ) -> Duration {
         let mut wiggle = Duration::from_millis(0);
         if let Ok(snapshot) =
-            <APos<Provider, ChainSpec> as Consensus<B>>::snapshot(self, parent_number, parent_hash, None) {
+            self.snapshot_inner(parent_number, parent_hash, None) {
             // https://eips.ethereum.org/EIPS/eip-225
             // If the signer is out-of-turn, delay signing by rand(SIGNER_COUNT * 500ms)
             if difficulty != DIFF_IN_TURN {

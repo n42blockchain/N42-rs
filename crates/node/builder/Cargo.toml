@@ -15,6 +15,7 @@ workspace = true
 ## n42
 n42-engine-primitives.workspace = true
 ## reth
+reth-ethereum-primitives.workspace = true
 reth-chain-state.workspace = true
 reth-chainspec.workspace = true
 reth-cli-util.workspace = true
@@ -43,6 +44,7 @@ reth-node-events.workspace = true
 reth-node-metrics.workspace = true
 reth-payload-builder.workspace = true
 reth-provider.workspace = true
+reth-primitives.workspace = true
 reth-prune.workspace = true
 reth-rpc.workspace = true
 reth-rpc-api.workspace = true

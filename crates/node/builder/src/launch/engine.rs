@@ -19,10 +19,11 @@ use reth_engine_tree::{
 use reth_engine_util::EngineMessageStreamExt;
 use reth_exex::ExExManagerHandle;
 use reth_network::{NetworkSyncUpdater, SyncState};
-use reth_network_api::BlockDownloaderProvider;
+use reth_network_api::{BlockAnnounceProvider, BlockDownloaderProvider};
 use reth_node_api::{
     BeaconConsensusEngineHandle, BuiltPayload, FullNodeTypes, NodeTypes, NodeTypesWithDBAdapter,
     PayloadAttributesBuilder, PayloadTypes,
+    NodePrimitives,
 };
 use reth_node_core::{
     dirs::{ChainPath, DataDirPath},
@@ -80,12 +81,14 @@ where
         DB = DB,
         Provider = BlockchainProvider<NodeTypesWithDBAdapter<Types, DB>>,
     >,
+    <T::Types as NodeTypes>::Primitives: NodePrimitives<Block = reth_ethereum_primitives::Block>,
     CB: NodeComponentsBuilder<T>,
     AO: RethRpcAddOns<NodeAdapter<T, CB::Components>>
         + EngineValidatorAddOn<NodeAdapter<T, CB::Components>>,
     N42PayloadAttributesBuilder<Types::ChainSpec>: PayloadAttributesBuilder<
         <<Types as NodeTypes>::Payload as PayloadTypes>::PayloadAttributes,
     >,
+    <<CB as NodeComponentsBuilder<T>>::Components as NodeComponents<T>>::Network: BlockAnnounceProvider<Block = reth_ethereum_primitives::Block>,
 {
     type Node = NodeHandle<NodeAdapter<T, CB::Components>, AO>;
 

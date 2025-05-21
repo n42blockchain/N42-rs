@@ -168,7 +168,7 @@ impl<N: NetworkPrimitives> NetworkHandle<N> {
         }
     }
     ///N42 import_block
-    pub fn take_validated_block(&self) -> Option<(HashSet<PeerId>, N42BlockImportOutcome)> {
+    pub fn take_validated_block(&self) -> Option<(HashSet<PeerId>, N42BlockImportOutcome<N::Block>)> {
         let validated_block_clone = Arc::clone(&self.inner.validated_block);
         let validated_block = validated_block_clone.read().unwrap();
         if let Some(outcome) = validated_block.front() {
@@ -490,16 +490,18 @@ impl<N: NetworkPrimitives> BlockDownloaderProvider for NetworkHandle<N> {
     }
 }
 
-impl BlockAnnounceProvider for NetworkHandle {
-    fn announce_block(&self, block: NewBlock, hash: B256) {
+impl<N: NetworkPrimitives> BlockAnnounceProvider for NetworkHandle<N> {
+    type Block = N::Block;
+
+    fn announce_block(&self, block: NewBlock<N::Block>, hash: B256) {
         self.announce_block(block, hash);
     }
 
-    fn subscribe_block(&self) -> EventStream<NewBlock> {
+    fn subscribe_block(&self) -> EventStream<NewBlock<N::Block>> {
         self.inner.block_sender.new_listener()
     }
 
-    fn validated_block(&self, result: N42BlockImportOutcome) {
+    fn validated_block(&self, result: N42BlockImportOutcome<N::Block>) {
         let validated_block = Arc::clone(&self.inner.validated_block);
         let mut queue = validated_block.write().unwrap();
         queue.push_back(result);
@@ -549,7 +551,7 @@ struct NetworkInner<N: NetworkPrimitives = EthNetworkPrimitives> {
     /// Bad imports.
     bad_block_imports: LruCache<BlockHash>,
     /// validated block
-    validated_block: Arc<RwLock<VecDeque<N42BlockImportOutcome>>>,
+    validated_block: Arc<RwLock<VecDeque<N42BlockImportOutcome<N::Block>>>>,
 }
 
 /// Provides access to modify the network's additional protocol handlers.

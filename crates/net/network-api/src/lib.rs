@@ -53,7 +53,7 @@ pub trait FullNetwork:
     + NetworkEventListenerProvider
     + PeersInfo
     + Peers
-    //+ BlockAnnounceProvider
+    + BlockAnnounceProvider
     + Clone
     + 'static
 {
@@ -66,7 +66,7 @@ impl<T> FullNetwork for T where
         + NetworkEventListenerProvider
         + PeersInfo
         + Peers
-        //+ BlockAnnounceProvider
+        + BlockAnnounceProvider
         + Clone
         + 'static
 {

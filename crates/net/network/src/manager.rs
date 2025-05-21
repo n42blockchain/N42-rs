@@ -53,6 +53,8 @@ use reth_network_types::ReputationChangeKind;
 use reth_storage_api::BlockNumReader;
 use reth_tasks::shutdown::GracefulShutdown;
 use reth_tokio_util::EventSender;
+use reth_primitives_traits::Block;
+use alloy_consensus::BlockHeader;
 use secp256k1::SecretKey;
 use std::{
     net::SocketAddr,
@@ -564,13 +566,13 @@ impl<N: NetworkPrimitives> NetworkManager<N> {
 
 
     /// Invoked after a `NewBlock` message from the peer was validated
-    fn n42_on_block_import_result(&mut self,  peers: HashSet<PeerId>, outcome: N42BlockImportOutcome) {
+    fn n42_on_block_import_result(&mut self,  peers: HashSet<PeerId>, outcome: N42BlockImportOutcome<N::Block>) {
         let N42BlockImportOutcome { hash, result } = outcome;
         match result {
             Ok(block) => {
                 for peer in peers {
-                    self.swarm.state_mut().update_peer_block(&peer, hash, block.block.number.clone());
-                    //self.swarm.state_mut().announce_new_block(NewBlockMessage{ hash, block: Arc::new(block.clone()) });
+                    self.swarm.state_mut().update_peer_block(&peer, hash, block.block.header().number().clone());
+                    self.swarm.state_mut().announce_new_block(NewBlockMessage{ hash, block: Arc::new(block.clone()) });
                 }
             },
             Err(_err) => {

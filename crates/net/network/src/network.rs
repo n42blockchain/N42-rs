@@ -29,6 +29,8 @@ use reth_network_api::{
 };
 use reth_network_p2p::sync::{NetworkSyncUpdater, SyncState, SyncStateProvider};
 use reth_network_peers::{NodeRecord, PeerId};
+use reth_primitives_traits::Block;
+use alloy_primitives::Sealable;
 use reth_network_types::{PeerAddr, PeerKind, Reputation, ReputationChangeKind};
 use reth_tokio_util::{EventSender, EventStream};
 use secp256k1::SecretKey;
@@ -145,8 +147,7 @@ impl<N: NetworkPrimitives> NetworkHandle<N> {
 
     ///N42 import_block
     pub fn import_block(&self, peer_id: PeerId, block: NewBlock<N::Block>)  {
-        //let block_hash = block.block.hash_slow();
-        let block_hash = Default::default();
+        let block_hash = block.block.header().hash_slow();
         let mut block_by_peers = self.inner.block_by_peers.write().unwrap();
         match block_by_peers.entry(block_hash) {
             Entry::Occupied(mut entry) => {

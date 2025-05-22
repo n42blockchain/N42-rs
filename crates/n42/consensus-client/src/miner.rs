@@ -39,7 +39,7 @@ use std::{
 use tokio::sync::mpsc;
 use tokio::time::{interval_at, sleep, Instant, Interval};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, error, info, warn};
+use tracing::{trace, debug, error, info, warn};
 
 /// A mining mode for the local dev engine.
 #[derive(Debug)]
@@ -314,6 +314,8 @@ where
     }
 
     async fn handle_new_block(&mut self, new_block: NewBlock<Network::Block>) -> eyre::Result<()> {
+        trace!(target: "consensus-client", ?new_block);
+
         let mut parents = Vec::new();
         let block = new_block.clone().block.seal_slow();
         self.recent_blocks.insert(block.hash(), block.clone());
@@ -626,6 +628,7 @@ where
         let block = payload.block();
         let max_td = self.consensus.total_difficulty(block.header().hash_slow());
         debug!(target: "consensus-client", ?max_td, "advance: new_block hash {:?}", block.header().hash_slow());
+        trace!(target: "consensus-client", ?block);
 
         self.recent_blocks.insert(block.hash_slow(), block.clone());
 

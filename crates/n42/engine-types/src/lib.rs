@@ -18,7 +18,7 @@ mod payload;
 //mod job_generator;
 //mod job;
 //mod metrics;
-//mod network;
+mod network;
 mod consensus;
 
 pub use payload::EthereumPayloadBuilderWrapper;

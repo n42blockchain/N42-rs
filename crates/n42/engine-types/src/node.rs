@@ -7,6 +7,7 @@ use alloy_eips::merge::EPOCH_SLOTS;
 use reth_chainspec::{ChainSpec, EthChainSpec};
 use reth_consensus::{ConsensusError, FullConsensus};
 use crate::consensus::{N42ConsensusBuilder};
+use crate::network::N42NetworkBuilder;
 //use crate::{N42EngineTypes, N42NodeAddOns, N42PayloadServiceBuilder};
 use crate::{EthereumPayloadBuilderWrapper, N42PayloadServiceBuilder};
 use reth_ethereum_engine_primitives::{
@@ -58,7 +59,7 @@ impl N42Node {
         Node,
         EthereumPoolBuilder,
         N42PayloadServiceBuilder<EthereumPayloadBuilderWrapper>,
-        EthereumNetworkBuilder,
+        N42NetworkBuilder,
         EthereumExecutorBuilder,
         N42ConsensusBuilder,
     >
@@ -75,7 +76,7 @@ impl N42Node {
             .pool(EthereumPoolBuilder::default())
             .consensus(N42ConsensusBuilder::default())
             .payload(N42PayloadServiceBuilder::default())
-            .network(EthereumNetworkBuilder::default())
+            .network(N42NetworkBuilder::default())
             .executor(EthereumExecutorBuilder::default())
     }
 
@@ -259,7 +260,7 @@ where
         N,
         EthereumPoolBuilder,
         N42PayloadServiceBuilder<EthereumPayloadBuilderWrapper>,
-        EthereumNetworkBuilder,
+        N42NetworkBuilder,
         EthereumExecutorBuilder,
         N42ConsensusBuilder,
     >;

@@ -10,6 +10,7 @@ use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_node_builder::NodeHandle;
 use reth_node_ethereum::EthereumNode;
 use tracing::info;
+use n42::consensus_ext::{ConsensusExtApiServer, ConsensusExt};
 
 fn main() {
     reth_cli_util::sigsegv_handler::install();
@@ -23,7 +24,22 @@ fn main() {
         Cli::<EthereumChainSpecParser, RessArgs>::parse().run(async move |builder, ress_args| {
             info!(target: "reth::cli", "Launching node");
             let NodeHandle { node, node_exit_future } =
-                builder.node(N42Node::default()).launch_with_debug_capabilities().await?;
+                builder.node(N42Node::default())
+                        .extend_rpc_modules(|ctx| {
+
+                            let consensus = ctx.consensus().clone();
+                            let provider = ctx.provider().clone();
+
+                            let ext = ConsensusExt { consensus, provider };
+
+                            // now we merge our extension namespace into all configured transports
+                            ctx.auth_module.merge_auth_methods(ext.into_rpc())?;
+
+                            println!("consensus rpc extension enabled");
+
+                            Ok(())
+                        })
+                .launch_with_debug_capabilities().await?;
 
             // Install ress subprotocol.
             if ress_args.enabled {

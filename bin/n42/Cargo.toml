@@ -93,6 +93,7 @@ eyre.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 backon.workspace = true
 similar-asserts.workspace = true
+jsonrpsee = { workspace = true, features = ["server", "macros"] }
 
 [dev-dependencies]
 tempfile.workspace = true

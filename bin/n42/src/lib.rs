@@ -30,6 +30,8 @@
 pub mod cli;
 pub mod commands;
 
+pub mod consensus_ext;
+
 /// Re-exported utils.
 pub mod utils {
     pub use reth_db::open_db_read_only;

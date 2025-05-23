@@ -14,7 +14,7 @@ members = [
     "crates/n42/clique/",
     "crates/n42/engine-types/",
     "crates/n42/engine-primitives/",
-    #"crates/n42/n42-testing",
+    "crates/n42/n42-testing",
     #"crates/n42/mobile",
     #"crates/engine/invalid-block-hooks/",
     #"crates/evm/",
@@ -193,6 +193,7 @@ lto = "fat"
 codegen-units = 1
 
 [patch.'https://github.com/paradigmxyz/reth.git']
+reth = { path = "bin/reth" }
 reth-evm-ethereum = { path = "crates/ethereum/evm" }
 reth-chainspec = { path = "crates/chainspec" }
 reth-node-builder = { path = "crates/node/builder" }

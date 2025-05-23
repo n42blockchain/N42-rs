@@ -260,7 +260,6 @@ async fn test_single_signer__voting_to_add_two_others__only_accept_first__second
                 signer: "A".to_string(),
                 voted: Some("C".to_string()),
                 auth: Some(true),
-                ..Default::default()
             },
         ],
         results: vec![

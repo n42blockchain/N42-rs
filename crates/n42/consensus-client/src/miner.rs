@@ -1,7 +1,7 @@
 //! Contains the implementation of the mining mode for the local engine.
 
 use alloy_primitives::Sealable;
-use reth_network_api::{FullNetwork, BlockDownloaderProvider, BlockAnnounceProvider};
+use reth_network_api::{FullNetwork, BlockDownloaderProvider, BlockAnnounceProvider, NetworkEventListenerProvider};
 use reth_ethereum_primitives::{EthPrimitives};
 use reth_primitives::TransactionSigned;
 use reth_primitives_traits::{AlloyBlockHeader, NodePrimitives, BlockBody};
@@ -15,7 +15,7 @@ use reth_engine_primitives::BeaconConsensusEngineHandle;
 use reth_chainspec::EthereumHardforks;
 use reth_consensus::{FullConsensus, ConsensusError};
 use reth_payload_primitives::{EngineApiMessageVersion};
-use reth_eth_wire_types::NewBlock;
+use reth_eth_wire_types::{NewBlock, NetworkPrimitives};
 use reth_network_p2p::{
     bodies::client::BodiesClient, headers::client::HeadersClient, priority::Priority,
     BlockClient,
@@ -144,6 +144,8 @@ where
     Network: BlockAnnounceProvider<Block = Block<TransactionSigned>>,
     <<Network as BlockDownloaderProvider>::Client as BlockClient>::Block: reth_primitives_traits::Block<Header = reth_primitives_traits::Header>,
     <<<Network as BlockDownloaderProvider>::Client as BlockClient>::Block as reth_primitives_traits::Block>::Body: BlockBody< Transaction = TransactionSigned>,
+    <<Network as NetworkEventListenerProvider>::Primitives as NetworkPrimitives>::Block: reth_primitives_traits::Block<Header = reth_primitives_traits::Header>,
+    <<Network as NetworkEventListenerProvider>::Primitives as NetworkPrimitives>::BlockBody: reth_primitives_traits::BlockBody<OmmerHeader = reth_primitives_traits::Header>,
 {
     /// Spawns a new [`N42Miner`] with the given parameters.
     pub fn spawn_new(

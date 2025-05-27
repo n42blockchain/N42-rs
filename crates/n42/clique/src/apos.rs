@@ -596,14 +596,6 @@ where
         Ok(())
     }
 
-    fn validate_header_with_total_difficulty(
-        &self,
-        header: &reth_primitives_traits::Header,
-        _total_difficulty: U256,
-    ) -> Result<(), ConsensusError> {
-        Ok(())
-    }
-
 }
 
 impl<Provider, ChainSpec, N> FullConsensus<N> for APos<Provider, ChainSpec>

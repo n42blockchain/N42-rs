@@ -29,13 +29,13 @@ where
         > + Unpin
         + 'static,
 {
-    type Primitives = EthNetworkPrimitives;
+    type Network = NetworkHandle<EthNetworkPrimitives>;
 
     async fn build_network(
         self,
         ctx: &BuilderContext<Node>,
         pool: Pool,
-    ) -> eyre::Result<NetworkHandle> {
+    ) -> eyre::Result<Self::Network> {
         let network_config_builder = ctx.network_config_builder()?.network_mode(NetworkMode::Work);
         let network_config = ctx.build_network_config(network_config_builder);
         let network = NetworkManager::builder(network_config).await?;

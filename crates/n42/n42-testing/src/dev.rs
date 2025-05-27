@@ -1,7 +1,8 @@
 #![allow(non_snake_case)]
 use std::str::FromStr;
+use alloy_rpc_types_engine::{ExecutionPayloadV3};
 use alloy_signer_local::{PrivateKeySigner};
-use reth_primitives_traits::{SealedHeader};
+use reth_primitives_traits::{SealedHeader, NodePrimitives,};
 use reth_chainspec::make_genesis_header;
 use alloy_primitives::{Sealable, FixedBytes};
 use reth_node_builder::{
@@ -83,7 +84,7 @@ fn get_addresses_from_extra_data(extra_data: Bytes) -> Vec<Address> {
 #[cfg(test)]
 async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(node: &FullNode<Node, AddOns>, eth_signer_key: String) -> eyre::Result<()>
     where <<<Node as FullNodeTypes>::Types as NodeTypes>::Payload as PayloadTypes>::PayloadBuilderAttributes: From<EthPayloadBuilderAttributes>,
-    ExecutionPayloadEnvelopeV3: From<<<<Node as FullNodeTypes>::Types as NodeTypes>::Payload as PayloadTypes>::BuiltPayload>,
+    <<Node as FullNodeTypes>::Types as NodeTypes>::Primitives : NodePrimitives<Block = reth_ethereum_primitives::Block>,
     <<Node as FullNodeTypes>::Types as NodeTypes>::Payload: EngineTypes,
 {
     let best_number = node.provider.chain_info().unwrap().best_number;
@@ -113,10 +114,12 @@ async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(node: 
     let payload = payload_type.clone();
 
     let client = node.engine_http_client();
-    let ep: ExecutionPayloadEnvelopeV3 = payload.into();
+    let execution_payload = ExecutionPayloadV3::from_block_slow(
+                  &payload.block().clone().into_block(),
+    );
     let submission = EngineApiClient::new_payload_v3(
         &client,
-        ep.execution_payload,
+        execution_payload,
         vec![],
         B256::ZERO,
     )

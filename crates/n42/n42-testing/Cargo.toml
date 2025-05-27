@@ -15,6 +15,7 @@ n42-engine-types.workspace = true
 n42-engine-primitives.workspace = true
 
 # reth
+reth-ethereum-primitives.workspace = true
 reth-ethereum-forks.workspace = true
 reth-primitives-traits.workspace = true
 reth-payload-primitives.workspace = true
@@ -58,6 +59,7 @@ reth-tasks.workspace = true
 futures.workspace = true
 alloy-primitives.workspace = true
 alloy-genesis.workspace = true
+alloy-rpc-types-engine.workspace = true
 alloy-signer-local.workspace = true
 tokio.workspace = true
 serde_json.workspace = true

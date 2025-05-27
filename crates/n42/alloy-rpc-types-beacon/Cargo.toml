@@ -2,7 +2,7 @@
 name = "alloy-rpc-types-beacon"
 description = "Types for the Ethereum Beacon Node API"
 #version.workspace = true
-version = "0.14.0"
+version = "1.0.5"
 edition.workspace = true
 rust-version.workspace = true
 #authors.workspace = true

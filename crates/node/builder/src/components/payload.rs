@@ -12,9 +12,13 @@ use reth_transaction_pool::TransactionPool;
 use std::future::Future;
 
 /// A type that knows how to spawn the payload service.
-pub trait PayloadServiceBuilder<Node: FullNodeTypes, Pool: TransactionPool,
+pub trait PayloadServiceBuilder<Node: FullNodeTypes, Pool: TransactionPool, 
+    EvmConfig,
     Cons:
-        FullConsensus<PrimitivesTy<Node::Types>, Error = ConsensusError> + Clone + Unpin + 'static>: Send + Sized {
+        FullConsensus<PrimitivesTy<Node::Types>, Error = ConsensusError> + Clone + Unpin + 'static,
+>:
+    Send + Sized
+{
     /// Spawns the [`PayloadBuilderService`] and returns the handle to it for use by the engine.
     ///
     /// We provide default implementation via [`BasicPayloadJobGenerator`] but it can be overridden
@@ -23,18 +27,19 @@ pub trait PayloadServiceBuilder<Node: FullNodeTypes, Pool: TransactionPool,
         self,
         ctx: &BuilderContext<Node>,
         pool: Pool,
+        evm_config: EvmConfig,
         consensus: Cons,
     ) -> impl Future<Output = eyre::Result<PayloadBuilderHandle<<Node::Types as NodeTypes>::Payload>>>
            + Send;
 }
 
-impl<Node, F, Fut, Pool, Cons> PayloadServiceBuilder<Node, Pool, Cons> for F
+impl<Node, F, Fut, Pool, EvmConfig, Cons> PayloadServiceBuilder<Node, Pool, EvmConfig, Cons> for F
 where
     Node: FullNodeTypes,
     Pool: TransactionPool,
     Cons:
         FullConsensus<PrimitivesTy<Node::Types>, Error = ConsensusError> + Clone + Unpin + 'static,
-    F: Fn(&BuilderContext<Node>, Pool, Cons) -> Fut + Send,
+    F: Fn(&BuilderContext<Node>, Pool, EvmConfig, Cons) -> Fut + Send,
     Fut: Future<Output = eyre::Result<PayloadBuilderHandle<<Node::Types as NodeTypes>::Payload>>>
         + Send,
 {
@@ -42,15 +47,18 @@ where
         self,
         ctx: &BuilderContext<Node>,
         pool: Pool,
+        evm_config: EvmConfig,
         cons: Cons,
     ) -> impl Future<Output = eyre::Result<PayloadBuilderHandle<<Node::Types as NodeTypes>::Payload>>>
     {
-        self(ctx, pool, cons)
+        self(ctx, pool, evm_config, cons)
     }
 }
 
 /// A type that knows how to build a payload builder to plug into [`BasicPayloadServiceBuilder`].
-pub trait PayloadBuilderBuilder<Node: FullNodeTypes, Pool: TransactionPool>: Send + Sized {
+pub trait PayloadBuilderBuilder<Node: FullNodeTypes, Pool: TransactionPool, EvmConfig>:
+    Send + Sized
+{
     /// Payload builder implementation.
     type PayloadBuilder: PayloadBuilderFor<Node::Types> + Unpin + 'static;
 
@@ -61,6 +69,7 @@ pub trait PayloadBuilderBuilder<Node: FullNodeTypes, Pool: TransactionPool>: Sen
         self,
         ctx: &BuilderContext<Node>,
         pool: Pool,
+        evm_config: EvmConfig,
     ) -> impl Future<Output = eyre::Result<Self::PayloadBuilder>> + Send;
 }
 
@@ -75,11 +84,13 @@ impl<PB> BasicPayloadServiceBuilder<PB> {
     }
 }
 
-impl<Node, Pool, PB, Cons> PayloadServiceBuilder<Node, Pool, Cons> for BasicPayloadServiceBuilder<PB>
+impl<Node, Pool, PB, EvmConfig, Cons> PayloadServiceBuilder<Node, Pool, EvmConfig, Cons>
+    for BasicPayloadServiceBuilder<PB>
 where
     Node: FullNodeTypes,
     Pool: TransactionPool,
-    PB: PayloadBuilderBuilder<Node, Pool>,
+    EvmConfig: Send,
+    PB: PayloadBuilderBuilder<Node, Pool, EvmConfig>,
     Cons:
         FullConsensus<PrimitivesTy<Node::Types>, Error = ConsensusError> + Clone + Unpin + 'static,
 {
@@ -87,9 +98,10 @@ where
         self,
         ctx: &BuilderContext<Node>,
         pool: Pool,
+        evm_config: EvmConfig,
         cons: Cons,
     ) -> eyre::Result<PayloadBuilderHandle<<Node::Types as NodeTypes>::Payload>> {
-        let payload_builder = self.0.build_payload_builder(ctx, pool).await?;
+        let payload_builder = self.0.build_payload_builder(ctx, pool, evm_config).await?;
 
         let conf = ctx.config().builder.clone();
 

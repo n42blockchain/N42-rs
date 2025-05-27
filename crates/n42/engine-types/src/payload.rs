@@ -11,6 +11,38 @@
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 #![allow(clippy::useless_let_if_seq)]
 
+use alloy_consensus::{Transaction, Typed2718};
+use alloy_primitives::U256;
+use reth_basic_payload_builder::{
+    is_better_payload, BuildArguments, BuildOutcome, MissingPayloadBehaviour, PayloadBuilder,
+    PayloadConfig,
+};
+use reth_chainspec::{ChainSpec, ChainSpecProvider, EthChainSpec, EthereumHardforks};
+use reth_errors::{BlockExecutionError, BlockValidationError};
+use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
+use reth_evm::{
+    execute::{BlockBuilder, BlockBuilderOutcome},
+    ConfigureEvm, Evm, NextBlockEnvAttributes,
+};
+use reth_evm_ethereum::EthEvmConfig;
+use reth_payload_builder::{EthBuiltPayload, EthPayloadBuilderAttributes};
+use reth_payload_builder_primitives::PayloadBuilderError;
+use reth_payload_primitives::PayloadBuilderAttributes;
+use reth_primitives_traits::transaction::error::InvalidTransactionError;
+use reth_revm::{database::StateProviderDatabase, db::State};
+use reth_storage_api::StateProviderFactory;
+use reth_transaction_pool::{
+    error::{Eip4844PoolTransactionError, InvalidPoolTransactionError},
+    BestTransactions, BestTransactionsAttributes, PoolTransaction, TransactionPool,
+    ValidPoolTransaction,
+};
+use revm::context_interface::Block as _;
+use std::sync::Arc;
+use tracing::{debug, trace, warn};
+
+//mod config;
+//pub use config::*;
+
 //pub mod validator;
 //pub use validator::EthereumExecutionPayloadValidator;
 
@@ -32,38 +64,7 @@ use reth_node_builder::{
     },
     node::{FullNodeTypes, NodeTypes},
 };
-use alloy_consensus::{Transaction, Typed2718};
-use alloy_primitives::U256;
-use reth_basic_payload_builder::{
-    is_better_payload, BuildArguments, BuildOutcome, MissingPayloadBehaviour, PayloadBuilder,
-    PayloadConfig,
-};
-use reth_chainspec::{ChainSpec, ChainSpecProvider, EthChainSpec, EthereumHardforks};
-use reth_errors::{BlockExecutionError, BlockValidationError};
-use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
-use reth_evm::{
-    execute::{BlockBuilder, BlockBuilderOutcome},
-    ConfigureEvm, Evm, NextBlockEnvAttributes,
-};
-use reth_evm_ethereum::EthEvmConfig;
-use reth_payload_builder::{EthBuiltPayload, EthPayloadBuilderAttributes};
-use reth_payload_builder_primitives::PayloadBuilderError;
-use reth_payload_primitives::PayloadBuilderAttributes;
-use reth_primitives_traits::SignedTransaction;
-use reth_revm::{database::StateProviderDatabase, db::State};
-use reth_storage_api::StateProviderFactory;
-use reth_transaction_pool::{
-    error::InvalidPoolTransactionError, BestTransactions, BestTransactionsAttributes,
-    PoolTransaction, TransactionPool, ValidPoolTransaction,
-};
-use revm::context_interface::Block as _;
-use std::sync::Arc;
-use tracing::{debug, trace, warn};
 
-//mod config;
-//pub use config::*;
-use reth_primitives_traits::transaction::error::InvalidTransactionError;
-use reth_transaction_pool::error::Eip4844PoolTransactionError;
 
 // wrapper
 
@@ -94,7 +95,7 @@ impl EthereumPayloadBuilderWrapper {
         pool: Pool,
         cons: Cons,
     ) -> eyre::Result<
-        N42PayloadBuilder<Pool, Node::Provider, Cons, Evm>,
+        N42PayloadBuilder<Pool, Node::Provider, Evm, Cons>,
     >
     where
         Types: NodeTypes<ChainSpec = ChainSpec, Primitives = EthPrimitives>,
@@ -110,17 +111,19 @@ impl EthereumPayloadBuilderWrapper {
         >,
     {
         let conf = ctx.payload_builder_config();
+        let chain = ctx.chain_spec().chain();
+        let gas_limit = conf.gas_limit_for(chain);
         Ok(N42PayloadBuilder::new(
             ctx.provider().clone(),
             pool,
             evm_config,
-            EthereumBuilderConfig::new().with_gas_limit(conf.gas_limit()),
+            EthereumBuilderConfig::new().with_gas_limit(gas_limit),
             cons,
         ))
     }
 }
 
-impl<Types, Node, Pool, Cons> N42PayloadBuilderBuilder<Node, Pool, Cons> for EthereumPayloadBuilderWrapper
+impl<Types, Node, Pool, Evm, Cons> N42PayloadBuilderBuilder<Node, Pool, Evm, Cons> for EthereumPayloadBuilderWrapper
 where
     Types: NodeTypes<ChainSpec = ChainSpec, Primitives = EthPrimitives>,
     Node: FullNodeTypes<Types = Types>,
@@ -132,16 +135,21 @@ where
         PayloadAttributes = EthPayloadAttributes,
         PayloadBuilderAttributes = EthPayloadBuilderAttributes,
     >,
+    Evm: ConfigureEvm<
+            Primitives = PrimitivesTy<Types>,
+            NextBlockEnvCtx = reth_evm::NextBlockEnvAttributes,
+        > + 'static,
     Cons:
         FullConsensus<PrimitivesTy<Node::Types>, Error = ConsensusError> + Clone + Unpin + 'static,
 {
     type PayloadBuilder =
-        N42PayloadBuilder<Pool, Node::Provider, Cons, EthEvmConfig>;
+        N42PayloadBuilder<Pool, Node::Provider, EthEvmConfig, Cons>;
 
     async fn build_payload_builder(
         self,
         ctx: &BuilderContext<Node>,
         pool: Pool,
+        evm_config: Evm,
         cons: Cons,
     ) -> eyre::Result<Self::PayloadBuilder> {
         self.build(EthEvmConfig::new(ctx.chain_spec()), ctx, pool, cons)
@@ -216,7 +224,8 @@ type BestTransactionsIter<Pool> = Box<
 
 /// Ethereum payload builder
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct N42PayloadBuilder<Pool, Client, Cons, EvmConfig = EthEvmConfig> {
+//pub struct N42PayloadBuilder<Pool, Client, EvmConfig = EthEvmConfig, Cons> 
+pub struct N42PayloadBuilder<Pool, Client, EvmConfig, Cons> {
     /// Client providing access to node state.
     client: Client,
     /// Transaction pool.
@@ -229,7 +238,7 @@ pub struct N42PayloadBuilder<Pool, Client, Cons, EvmConfig = EthEvmConfig> {
     cons: Cons,
 }
 
-impl<Pool, Client, Cons, EvmConfig> N42PayloadBuilder<Pool, Client, Cons, EvmConfig> {
+impl<Pool, Client, EvmConfig, Cons> N42PayloadBuilder<Pool, Client,  EvmConfig, Cons> {
     /// `N42PayloadBuilder` constructor.
     pub const fn new(
         client: Client,
@@ -243,10 +252,10 @@ impl<Pool, Client, Cons, EvmConfig> N42PayloadBuilder<Pool, Client, Cons, EvmCon
 }
 
 // Default implementation of [PayloadBuilder] for unit type
-impl<Pool, Client, Cons, EvmConfig> PayloadBuilder for N42PayloadBuilder<Pool, Client, Cons, EvmConfig>
+impl<Pool, Client, EvmConfig, Cons> PayloadBuilder for N42PayloadBuilder<Pool, Client, EvmConfig, Cons>
 where
     EvmConfig: ConfigureEvm<Primitives = EthPrimitives, NextBlockEnvCtx = NextBlockEnvAttributes>,
-    Client: StateProviderFactory + ChainSpecProvider<ChainSpec = ChainSpec> + Clone,
+    Client: StateProviderFactory + ChainSpecProvider<ChainSpec: EthereumHardforks> + Clone,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>,
     Cons:
         FullConsensus<EthPrimitives, Error = ConsensusError> + Clone + Unpin + 'static,
@@ -317,7 +326,7 @@ pub fn default_n42_payload<EvmConfig, Client, Pool, F, Cons>(
 ) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError>
 where
     EvmConfig: ConfigureEvm<Primitives = EthPrimitives, NextBlockEnvCtx = NextBlockEnvAttributes>,
-    Client: StateProviderFactory + ChainSpecProvider<ChainSpec = ChainSpec>,
+    Client: StateProviderFactory + ChainSpecProvider<ChainSpec: EthereumHardforks>,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>,
     F: FnOnce(BestTransactionsAttributes) -> BestTransactionsIter<Pool>,
     Cons:
@@ -395,7 +404,7 @@ where
         // There's only limited amount of blob space available per block, so we need to check if
         // the EIP-4844 can still fit in the block
         if let Some(blob_tx) = tx.as_eip4844() {
-            let tx_blob_count = blob_tx.blob_versioned_hashes.len() as u64;
+            let tx_blob_count = blob_tx.tx().blob_versioned_hashes.len() as u64;
 
             if block_blob_count + tx_blob_count > max_blob_count {
                 // we can't fit this _blob_ transaction into the block, so we mark it as
@@ -443,7 +452,7 @@ where
 
         // add to the total blob gas used if the transaction successfully executed
         if let Some(blob_tx) = tx.as_eip4844() {
-            block_blob_count += blob_tx.blob_versioned_hashes.len() as u64;
+            block_blob_count += blob_tx.tx().blob_versioned_hashes.len() as u64;
 
             // if we've reached the max blob count, we can skip blob txs entirely
             if block_blob_count == max_blob_count {
@@ -511,16 +520,17 @@ where
 
     let sealed_block = Arc::new(SealedBlock::seal_parts(header, block.into_block().body));
 
-    let mut payload = EthBuiltPayload::new(attributes.id, sealed_block, total_fees, requests);
 
-    // extend the payload with the blob sidecars from the executed txs
-    payload.extend_sidecars(blob_sidecars.into_iter().map(Arc::unwrap_or_clone));
+    let payload = EthBuiltPayload::new(attributes.id, sealed_block, total_fees, requests)
+        // add blob sidecars from the executed txs
+        .with_sidecars(blob_sidecars.into_iter().map(Arc::unwrap_or_clone).collect::<Vec<_>>());
 
     Ok(BuildOutcome::Better { payload, cached_reads })
 }
 
 /// A type that knows how to build a payload builder to plug into [`BasicPayloadServiceBuilder`].
 pub trait N42PayloadBuilderBuilder<Node: FullNodeTypes, Pool: TransactionPool,
+    EvmConfig,
     Cons:
         FullConsensus<PrimitivesTy<Node::Types>, Error = ConsensusError> + Clone + Unpin + 'static,
 >: Send + Sized {
@@ -534,6 +544,7 @@ pub trait N42PayloadBuilderBuilder<Node: FullNodeTypes, Pool: TransactionPool,
         self,
         ctx: &BuilderContext<Node>,
         pool: Pool,
+        evm_config: EvmConfig,
         cons: Cons,
     ) -> impl Future<Output = eyre::Result<Self::PayloadBuilder>> + Send;
 }
@@ -551,11 +562,13 @@ impl<PB> N42PayloadServiceBuilder<PB> {
     }
 }
 
-impl<Node, Pool, PB, Cons> PayloadServiceBuilder<Node, Pool, Cons> for N42PayloadServiceBuilder<PB>
+impl<Node, Pool, PB, EvmConfig, Cons> PayloadServiceBuilder<Node, Pool, EvmConfig, Cons> for N42PayloadServiceBuilder<PB>
 where
     Node: FullNodeTypes,
     Pool: TransactionPool,
-    PB: N42PayloadBuilderBuilder<Node, Pool, Cons>,
+    //EvmConfig: Send,
+    EvmConfig: ConfigureEvm<Primitives = EthPrimitives, NextBlockEnvCtx = NextBlockEnvAttributes>,
+    PB: N42PayloadBuilderBuilder<Node, Pool, EvmConfig, Cons>,
     Cons:
         FullConsensus<PrimitivesTy<Node::Types>, Error = ConsensusError> + Clone + Unpin + 'static,
 {
@@ -563,9 +576,10 @@ where
         self,
         ctx: &BuilderContext<Node>,
         pool: Pool,
+        evm_config: EvmConfig,
         cons: Cons,
     ) -> eyre::Result<PayloadBuilderHandle<<Node::Types as NodeTypes>::Payload>> {
-        let payload_builder = self.0.build_payload_builder(ctx, pool, cons).await?;
+        let payload_builder = self.0.build_payload_builder(ctx, pool,  evm_config, cons).await?;
 
         let conf = ctx.config().builder.clone();
 

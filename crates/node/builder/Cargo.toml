@@ -61,9 +61,10 @@ reth-transaction-pool.workspace = true
 reth-basic-payload-builder.workspace = true
 
 ## ethereum
+alloy-signer-local.workspace = true
 alloy-consensus.workspace = true
 alloy-primitives.workspace = true
-alloy-signer-local.workspace = true
+alloy-provider.workspace = true
 alloy-rpc-types = { workspace = true, features = ["engine"] }
 alloy-eips = { workspace = true, features = ["kzg"] }
 alloy-rpc-types-engine.workspace = true
@@ -82,6 +83,7 @@ eyre.workspace = true
 fdlimit.workspace = true
 jsonrpsee.workspace = true
 rayon.workspace = true
+serde_json.workspace = true
 
 # tracing
 tracing.workspace = true

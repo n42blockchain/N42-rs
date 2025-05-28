@@ -128,6 +128,7 @@ const WAIT_FOR_DOWNLOAD_INTERVAL_MS: u64 = 100;
 const SYNC_DOWNLOAD_BLOCKS_UNIT: u64 = 512;
 const DIFFICULTY_DELTA_CLAMP: u64 = 50;
 const MAX_NUM_LOCAL_BLOCKS_TO_CHECK: u64 = 256;
+const MIN_NO_BLOCK_TIMESTAMP_GAP: u64 = 300;
 
 impl<T, Provider, B, Network> N42Miner<T, Provider, B, Network>
 where
@@ -221,15 +222,6 @@ where
     async fn initial_sync(&mut self) {
         loop {
             let status_counts;
-            if let Ok(all_peers) = self.network.get_all_peers().await {
-                // workaround for obsolete peer status
-                info!(target: "consensus-client", "disconnecting and removing peers to get the latest status");
-                for peer in all_peers {
-                    self.network.disconnect_peer(peer.remote_id);
-                    self.network.remove_peer(peer.remote_id, peer.kind);
-                    debug!(target: "consensus-client", "Disconnected peer {peer_id}", peer_id=peer.remote_id);
-                }
-            }
             loop {
                 sleep(Duration::from_secs(WAIT_FOR_PEERS_INTERVAL_SECS)).await;
 
@@ -260,8 +252,11 @@ where
                     .initial_sync_to_hash(peer_finalized_td, peer_finalized_td_hash)
                     .await
                 {
-                    Ok(_) => {
+                    Ok(duration) => {
                         debug!(target: "consensus-client", ?peer_finalized_td, ?peer_finalized_td_hash, "finished one sync attempt");
+                        if duration.as_secs() < (MIN_NO_BLOCK_TIMESTAMP_GAP / 2) {
+                            break;
+                        }
                     }
                     Err(err) => {
                         warn!(target: "consensus-client", ?err, "initial_sync_to_hash failed");
@@ -271,11 +266,19 @@ where
                 info!(target: "consensus-client", "head td is close to peer finalized td, no need to sync");
                 break;
             }
+            if let Ok(all_peers) = self.network.get_all_peers().await {
+                // workaround for obsolete peer status
+                info!(target: "consensus-client", "disconnecting and removing peers to get the latest status");
+                for peer in all_peers {
+                    self.network.disconnect_peer(peer.remote_id);
+                    self.network.remove_peer(peer.remote_id, peer.kind);
+                    debug!(target: "consensus-client", "Disconnected peer {peer_id}", peer_id=peer.remote_id);
+                }
+            }
         }
     }
 
     fn long_time_no_block_generated(&self) -> bool {
-        const MIN_NO_BLOCK_TIMESTAMP_GAP: u64 = 300;
 
         let best_block_number = self.provider.best_block_number().unwrap();
         let latest_header = self.provider
@@ -755,7 +758,7 @@ where
     }
 
     /// On node init, sync head to specified hash
-    async fn initial_sync_to_hash(&mut self, _td: U256, block_hash: BlockHash) -> eyre::Result<()> {
+    async fn initial_sync_to_hash(&mut self, _td: U256, block_hash: BlockHash) -> eyre::Result<Duration> {
         let start = Instant::now();
         info!(target: "consensus-client", "initial_sync_to_hash hash {:?}", block_hash);
         let finalized_block_number = self
@@ -801,7 +804,7 @@ where
         self.fcu_hash_finalized(block_hash, block_hash).await?;
         let duration = start.elapsed();
         info!(target: "consensus-client", ?duration, from=?best_block_number, to=?finalized_block_from_p2p.header().number(), "time spent in syncing");
-        Ok(())
+        Ok(duration)
     }
 
     /// workaround for "stuck in downloading for large block ranges"

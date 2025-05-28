@@ -8,16 +8,20 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 #[macro_use]
-#[allow(unused_imports)]
 extern crate alloc;
 
 mod cancun;
 pub use cancun::*;
+mod prague;
+pub use prague::*;
 mod sidecar;
 pub use sidecar::*;
 
 mod forkchoice;
 pub use forkchoice::*;
+
+mod version;
+pub use version::ForkchoiceUpdateVersion;
 
 mod identification;
 pub use identification::*;

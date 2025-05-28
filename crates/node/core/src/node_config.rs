@@ -2,29 +2,45 @@
 
 use crate::{
     args::{
-        DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, NetworkArgs, PayloadBuilderArgs,
+        DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, NetworkArgs, PayloadBuilderArgs,
         PruningArgs, RpcServerArgs, TxPoolArgs,
     },
     dirs::{ChainPath, DataDirPath},
     utils::get_single_header,
 };
+use alloy_consensus::BlockHeader;
+use alloy_eips::BlockHashOrNumber;
+use alloy_primitives::{BlockNumber, B256};
 use eyre::eyre;
 use reth_chainspec::{ChainSpec, EthChainSpec, MAINNET};
 use reth_config::config::PruneConfig;
+use reth_ethereum_forks::Head;
 use reth_network_p2p::headers::client::HeadersClient;
-use serde::{de::DeserializeOwned, Serialize};
-use std::{fs, path::Path};
-
-use alloy_eips::BlockHashOrNumber;
-use alloy_primitives::{BlockNumber, B256};
-use reth_primitives::{Head, SealedHeader};
+use reth_primitives_traits::SealedHeader;
 use reth_stages_types::StageId;
 use reth_storage_api::{
     BlockHashReader, DatabaseProviderFactory, HeaderProvider, StageCheckpointReader,
 };
 use reth_storage_errors::provider::ProviderResult;
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use serde::{de::DeserializeOwned, Serialize};
+use std::{
+    fs,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tracing::*;
+
+pub use reth_engine_primitives::{
+    DEFAULT_MAX_PROOF_TASK_CONCURRENCY, DEFAULT_MEMORY_BLOCK_BUFFER_TARGET,
+    DEFAULT_RESERVED_CPU_CORES,
+};
+
+/// Triggers persistence when the number of canonical blocks in memory exceeds this threshold.
+pub const DEFAULT_PERSISTENCE_THRESHOLD: u64 = 2;
+
+/// Default size of cross-block cache in megabytes.
+pub const DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB: u64 = 4 * 1024;
 
 /// This includes all necessary configuration to launch the node.
 /// The individual configuration options can be overwritten before launching the node.
@@ -103,7 +119,8 @@ pub struct NodeConfig<ChainSpec> {
     /// - `AUTH_PORT`: default + `instance` * 100 - 100
     /// - `HTTP_RPC_PORT`: default - `instance` + 1
     /// - `WS_RPC_PORT`: default + `instance` * 2 - 2
-    pub instance: u16,
+    /// - `IPC_PATH`: default + `instance`
+    pub instance: Option<u16>,
 
     /// All networking related arguments
     pub network: NetworkArgs,
@@ -128,6 +145,9 @@ pub struct NodeConfig<ChainSpec> {
 
     /// All pruning related arguments
     pub pruning: PruningArgs,
+
+    /// All engine related arguments
+    pub engine: EngineArgs,
 }
 
 impl NodeConfig<ChainSpec> {
@@ -146,7 +166,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             config: None,
             chain,
             metrics: None,
-            instance: 1,
+            instance: None,
             network: NetworkArgs::default(),
             rpc: RpcServerArgs::default(),
             txpool: TxPoolArgs::default(),
@@ -156,6 +176,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             dev: DevArgs::default(),
             pruning: PruningArgs::default(),
             datadir: DatadirArgs::default(),
+            engine: EngineArgs::default(),
         }
     }
 
@@ -204,8 +225,13 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
 
     /// Set the instance for the node
     pub const fn with_instance(mut self, instance: u16) -> Self {
-        self.instance = instance;
+        self.instance = Some(instance);
         self
+    }
+
+    /// Returns the instance value, defaulting to 1 if not set.
+    pub fn get_instance(&self) -> u16 {
+        self.instance.unwrap_or(1)
     }
 
     /// Set the network args for the node
@@ -257,11 +283,8 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
     }
 
     /// Returns pruning configuration.
-    pub fn prune_config(&self) -> Option<PruneConfig>
-    where
-        ChainSpec: EthChainSpec,
-    {
-        self.pruning.prune_config(&self.chain)
+    pub fn prune_config(&self) -> Option<PruneConfig> {
+        self.pruning.prune_config()
     }
 
     /// Returns the max block that the node should run to, looking it up from the network if
@@ -273,7 +296,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
     ) -> eyre::Result<Option<BlockNumber>>
     where
         Provider: HeaderProvider,
-        Client: HeadersClient,
+        Client: HeadersClient<Header: reth_primitives_traits::BlockHeader>,
     {
         let max_block = if let Some(block) = self.debug.max_block {
             Some(block)
@@ -305,7 +328,9 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
 
         let total_difficulty = provider
             .header_td_by_number(head)?
-            .expect("the total difficulty for the latest block is missing, database is corrupt");
+            // total difficulty is effectively deprecated, but still required in some places, e.g.
+            // p2p
+            .unwrap_or_default();
 
         let hash = provider
             .block_hash(head)?
@@ -314,9 +339,9 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
         Ok(Head {
             number: head,
             hash,
-            difficulty: header.difficulty,
+            difficulty: header.difficulty(),
             total_difficulty,
-            timestamp: header.timestamp,
+            timestamp: header.timestamp(),
         })
     }
 
@@ -332,17 +357,17 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
     ) -> ProviderResult<u64>
     where
         Provider: HeaderProvider,
-        Client: HeadersClient,
+        Client: HeadersClient<Header: reth_primitives_traits::BlockHeader>,
     {
         let header = provider.header_by_hash_or_number(tip.into())?;
 
         // try to look up the header in the database
         if let Some(header) = header {
             info!(target: "reth::cli", ?tip, "Successfully looked up tip block in the database");
-            return Ok(header.number)
+            return Ok(header.number())
         }
 
-        Ok(self.fetch_tip_from_network(client, tip.into()).await.number)
+        Ok(self.fetch_tip_from_network(client, tip.into()).await.number())
     }
 
     /// Attempt to look up the block with the given number and return the header.
@@ -352,9 +377,9 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
         &self,
         client: Client,
         tip: BlockHashOrNumber,
-    ) -> SealedHeader
+    ) -> SealedHeader<Client::Header>
     where
-        Client: HeadersClient,
+        Client: HeadersClient<Header: reth_primitives_traits::BlockHeader>,
     {
         info!(target: "reth::cli", ?tip, "Fetching tip block from the network.");
         let mut fetch_failures = 0;
@@ -377,8 +402,8 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
     /// Change rpc port numbers based on the instance number, using the inner
     /// [`RpcServerArgs::adjust_instance_ports`] method.
     pub fn adjust_instance_ports(&mut self) {
-        self.rpc.adjust_instance_ports(self.instance);
         self.network.adjust_instance_ports(self.instance);
+        self.rpc.adjust_instance_ports(self.instance);
     }
 
     /// Sets networking and RPC ports to zero, causing the OS to choose random unused ports when
@@ -386,6 +411,15 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
     pub fn with_unused_ports(mut self) -> Self {
         self.rpc = self.rpc.with_unused_ports();
         self.network = self.network.with_unused_ports();
+        self
+    }
+
+    /// Effectively disables the RPC state cache by setting the cache sizes to `0`.
+    ///
+    /// By setting the cache sizes to 0, caching of newly executed or fetched blocks will be
+    /// effectively disabled.
+    pub const fn with_disabled_rpc_cache(mut self) -> Self {
+        self.rpc.rpc_state_cache.set_zero_lengths();
         self
     }
 
@@ -444,6 +478,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             db: self.db,
             dev: self.dev,
             pruning: self.pruning,
+            engine: self.engine,
         }
     }
 }
@@ -470,6 +505,7 @@ impl<ChainSpec> Clone for NodeConfig<ChainSpec> {
             dev: self.dev,
             pruning: self.pruning.clone(),
             datadir: self.datadir.clone(),
+            engine: self.engine.clone(),
         }
     }
 }

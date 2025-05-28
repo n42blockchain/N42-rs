@@ -8,12 +8,12 @@ use reth_consensus::ConsensusError;
 
 /// block import error.
 #[derive(Debug, Clone)]
-pub struct N42BlockImportOutcome {
+pub struct N42BlockImportOutcome<B> {
     /// The block hash that caused the error.
     pub hash: BlockHash,
 
     /// The result after validating the block
-    pub result: Result<NewBlock, N42BlockImportError>
+    pub result: Result<NewBlock<B>, N42BlockImportError>
 }
 
 
@@ -32,12 +32,13 @@ pub enum N42BlockImportError {
 /// Provides client for downloading blocks.
 #[auto_impl::auto_impl(&, Arc)]
 pub trait BlockAnnounceProvider {
+    type Block;
     /// Announce a block over devp2p
-    fn announce_block(&self, block: NewBlock, hash: B256);
+    fn announce_block(&self, block: NewBlock<Self::Block>, hash: B256);
 
     /// subscribe a new [`NewBlock`] listener channel.
-    fn subscribe_block(&self) -> EventStream<NewBlock>;
+    fn subscribe_block(&self) -> EventStream<NewBlock<Self::Block>>;
 
-    fn validated_block(&self, result: N42BlockImportOutcome);
+    fn validated_block(&self, result: N42BlockImportOutcome<Self::Block>);
 
 }

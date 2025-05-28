@@ -6,6 +6,9 @@ use reth_primitives::{arbitrary, Header};
 
 use std::time::{Duration, Instant};
 
+use reth_primitives_traits::{BlockHeader as BlockHeaderTrait};
+use reth_primitives_traits::AlloyBlockHeader;
+use alloy_primitives::Sealable;
 
 use alloy_primitives::{Address, B256, U256, hex};
 use alloy_rlp::{RlpDecodable, RlpEncodable};
@@ -201,8 +204,10 @@ impl Snapshot
     }
 
 	 /// Create a new authorization snapshot using the given header information
-	 pub fn apply<F>(&self, headers: Vec<Header>,func:F) -> Result<Self, VotingError>
-     where F: Fn(Header) -> Result<Address, Box<dyn Error>>,
+	 pub fn apply<F, H>(&self, headers: Vec<H>,func:F) -> Result<Self, VotingError>
+     where
+         F: Fn(H) -> Result<Address, Box<dyn Error>>,
+         H: BlockHeaderTrait,
      {
         //If there is no header information, return the current snapshot directly
         if headers.is_empty() {
@@ -211,11 +216,11 @@ impl Snapshot
 
         //Check the validity of header information
         for i in 0..headers.len() - 1 {
-            if headers[i + 1].number != headers[i].number + 1 {
+            if headers[i + 1].number() != headers[i].number() + 1 {
                 return Err(VotingError::InvalidVotingChain);
             }
         }
-        if headers[0].number != self.number + 1 {
+        if headers[0].number() != self.number + 1 {
             return Err(VotingError::InvalidVotingChain);
         }
 
@@ -226,7 +231,7 @@ impl Snapshot
 
         for (i, i_header) in headers.iter().enumerate() {
             let header = i_header;
-            let number = header.number;
+            let number = header.number();
 
             //If it is a checkpoint block, remove all votes
             if number % self.config.epoch == 0 {
@@ -252,34 +257,34 @@ impl Snapshot
             snap.recents.insert(number, signer);
 
             //Discard any previous votes of the signer
-            while let Some(i) = snap.votes.iter().position(|vote| vote.signer == signer && vote.address == header.beneficiary) {
+            while let Some(i) = snap.votes.iter().position(|vote| vote.signer == signer && vote.address == header.beneficiary()) {
                 snap.uncast(snap.votes[i].address, snap.votes[i].authorize);
                 snap.votes.remove(i);
             }
 
             //Count new votes
-            let authorize = match header.nonce {
+            let authorize = match header.nonce().unwrap() {
                 nonce if hex::encode(nonce) == hex::encode(NONCE_AUTH_VOTE) => true,
                 nonce if hex::encode(nonce) == hex::encode(NONCE_DROP_VOTE) => false,
                 _ => return Err(VotingError::InvalidVote),
             };
 
-            if snap.cast(header.beneficiary, authorize) {
+            if snap.cast(header.beneficiary(), authorize) {
                 snap.votes.push(Vote {
                     signer,
                     block: number,
-                    address: header.beneficiary,
+                    address: header.beneficiary(),
                     authorize,
                 });
             }
 
             //If the vote is passed, update the list of signatories
-            if let Some(tally) = snap.tally.get(&header.beneficiary) {
+            if let Some(tally) = snap.tally.get(&header.beneficiary()) {
                 if tally.votes > (snap.signers.len() / 2).try_into().unwrap() {
                     if tally.authorize {
-                        snap.signers.push(header.beneficiary);
+                        snap.signers.push(header.beneficiary());
                     } else {
-                        if let Some(pos) = snap.signers.iter().position(|x| *x == header.beneficiary) {
+                        if let Some(pos) = snap.signers.iter().position(|x| *x == header.beneficiary()) {
                             snap.signers.remove(pos);
                         }
                         // snap.signers.remove(header.beneficiary);
@@ -291,15 +296,15 @@ impl Snapshot
                         }
 
                        //Discard any previous votes of the revoked authorized signatory
-                        while let Some(i) = snap.votes.iter().position(|vote| vote.signer == header.beneficiary) {
+                        while let Some(i) = snap.votes.iter().position(|vote| vote.signer == header.beneficiary()) {
                             snap.uncast(snap.votes[i].address, snap.votes[i].authorize);
                             snap.votes.remove(i);
                         }
                     }
 
                     //Discard any previous votes that have just changed the account
-                    snap.votes.retain(|vote| vote.address != header.beneficiary);
-                    snap.tally.remove(&header.beneficiary);
+                    snap.votes.retain(|vote| vote.address != header.beneficiary());
+                    snap.tally.remove(&header.beneficiary());
                 }
             }
 
@@ -325,7 +330,7 @@ impl Snapshot
 			);
         }
 
-        snap.number = headers.last().unwrap().number;
+        snap.number = headers.last().unwrap().number();
         snap.hash = headers.last().unwrap().hash_slow();
 
         Ok(snap)

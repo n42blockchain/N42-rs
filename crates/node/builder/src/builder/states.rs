@@ -5,16 +5,6 @@
 //! The node builder process is essentially a state machine that transitions through various states
 //! before the node can be launched.
 
-use std::{fmt, future::Future};
-
-use reth_exex::ExExContext;
-use reth_node_api::{
-    FullNodeComponents, FullNodeTypes, NodeAddOns, NodeTypes, NodeTypesWithDB, NodeTypesWithEngine,
-};
-use reth_node_core::node_config::NodeConfig;
-use reth_payload_builder::PayloadBuilderHandle;
-use reth_tasks::TaskExecutor;
-
 use crate::{
     components::{NodeComponents, NodeComponentsBuilder},
     hooks::NodeHooks,
@@ -22,6 +12,12 @@ use crate::{
     rpc::{RethRpcAddOns, RethRpcServerHandles, RpcContext},
     AddOns, FullNode,
 };
+
+use reth_exex::ExExContext;
+use reth_node_api::{FullNodeComponents, FullNodeTypes, NodeAddOns, NodeTypes};
+use reth_node_core::node_config::NodeConfig;
+use reth_tasks::TaskExecutor;
+use std::{fmt, fmt::Debug, future::Future};
 
 /// A node builder that also has the configured types.
 pub struct NodeBuilderWithTypes<T: FullNodeTypes> {
@@ -35,7 +31,7 @@ impl<T: FullNodeTypes> NodeBuilderWithTypes<T> {
     /// Creates a new instance of the node builder with the given configuration and types.
     pub const fn new(
         config: NodeConfig<<T::Types as NodeTypes>::ChainSpec>,
-        database: <T::Types as NodeTypesWithDB>::DB,
+        database: T::DB,
     ) -> Self {
         Self { config, adapter: NodeTypesAdapter::new(database) }
     }
@@ -59,12 +55,12 @@ impl<T: FullNodeTypes> NodeBuilderWithTypes<T> {
 /// Container for the node's types and the database the node uses.
 pub struct NodeTypesAdapter<T: FullNodeTypes> {
     /// The database type used by the node.
-    pub database: <T::Types as NodeTypesWithDB>::DB,
+    pub database: T::DB,
 }
 
 impl<T: FullNodeTypes> NodeTypesAdapter<T> {
     /// Create a new adapter from the given node types.
-    pub(crate) const fn new(database: <T::Types as NodeTypesWithDB>::DB) -> Self {
+    pub(crate) const fn new(database: T::DB) -> Self {
         Self { database }
     }
 }
@@ -77,6 +73,7 @@ impl<T: FullNodeTypes> fmt::Debug for NodeTypesAdapter<T> {
 
 /// Container for the node's types and the components and other internals that can be used by
 /// addons of the node.
+#[derive(Debug)]
 pub struct NodeAdapter<T: FullNodeTypes, C: NodeComponents<T>> {
     /// The components of the node.
     pub components: C,
@@ -88,13 +85,13 @@ pub struct NodeAdapter<T: FullNodeTypes, C: NodeComponents<T>> {
 
 impl<T: FullNodeTypes, C: NodeComponents<T>> FullNodeTypes for NodeAdapter<T, C> {
     type Types = T::Types;
+    type DB = T::DB;
     type Provider = T::Provider;
 }
 
 impl<T: FullNodeTypes, C: NodeComponents<T>> FullNodeComponents for NodeAdapter<T, C> {
     type Pool = C::Pool;
     type Evm = C::Evm;
-    type Executor = C::Executor;
     type Consensus = C::Consensus;
     type Network = C::Network;
 
@@ -106,10 +103,6 @@ impl<T: FullNodeTypes, C: NodeComponents<T>> FullNodeComponents for NodeAdapter<
         self.components.evm_config()
     }
 
-    fn block_executor(&self) -> &Self::Executor {
-        self.components.block_executor()
-    }
-
     fn consensus(&self) -> &Self::Consensus {
         self.components.consensus()
     }
@@ -118,8 +111,12 @@ impl<T: FullNodeTypes, C: NodeComponents<T>> FullNodeComponents for NodeAdapter<
         self.components.network()
     }
 
-    fn payload_builder(&self) -> &PayloadBuilderHandle<<T::Types as NodeTypesWithEngine>::Engine> {
-        self.components.payload_builder()
+    fn payload_builder_handle(
+        &self,
+    ) -> &reth_payload_builder::PayloadBuilderHandle<
+        <Self::Types as reth_node_api::NodeTypes>::Payload,
+    > {
+        self.components.payload_builder_handle()
     }
 
     fn provider(&self) -> &Self::Provider {

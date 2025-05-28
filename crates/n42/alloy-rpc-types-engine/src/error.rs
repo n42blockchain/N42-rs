@@ -23,6 +23,9 @@ pub enum PayloadError {
     /// withdrawals missing in post-shanghai payload.
     #[display("withdrawals missing in post-shanghai payload")]
     PostShanghaiBlockWithoutWithdrawals,
+    /// parent beacon block root present in pre-cancun payload.
+    #[display("parent beacon block root present in pre-cancun payload")]
+    PreCancunBlockWithParentBeaconBlockRoot,
     /// blob transactions present in pre-cancun payload.
     #[display("blob transactions present in pre-cancun payload")]
     PreCancunBlockWithBlobTransactions,
@@ -35,9 +38,9 @@ pub enum PayloadError {
     /// cancun fields present in pre-cancun payload.
     #[display("cancun fields present in pre-cancun payload")]
     PreCancunWithCancunFields,
-    /// blob transactions missing in post-cancun payload.
-    #[display("blob transactions missing in post-cancun payload")]
-    PostCancunBlockWithoutBlobTransactions,
+    /// parent beacon block root missing in post-cancun payload.
+    #[display("parent beacon block root missing in post-cancun payload")]
+    PostCancunBlockWithoutParentBeaconBlockRoot,
     /// blob gas used missing in post-cancun payload.
     #[display("blob gas used missing in post-cancun payload")]
     PostCancunBlockWithoutBlobGasUsed,
@@ -54,7 +57,7 @@ pub enum PayloadError {
     #[display("requests present in pre-prague payload")]
     PrePragueBlockRequests,
     /// Invalid payload block hash.
-    #[display("block hash mismatch: want {consensus}, got {execution}")]
+    #[display("block hash mismatch: want {execution}, got {consensus}")]
     BlockHash {
         /// The block hash computed from the payload.
         execution: B256,
@@ -69,15 +72,7 @@ pub enum PayloadError {
     Decode(alloy_rlp::Error),
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for PayloadError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Decode(err) => Some(err),
-            _ => None,
-        }
-    }
-}
+impl core::error::Error for PayloadError {}
 
 impl From<alloy_rlp::Error> for PayloadError {
     fn from(value: alloy_rlp::Error) -> Self {
@@ -120,5 +115,4 @@ pub enum PayloadValidationError {
     },
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for PayloadValidationError {}
+impl core::error::Error for PayloadValidationError {}

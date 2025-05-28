@@ -18,7 +18,7 @@ impl Decompress for Snapshot{
 
 impl Compress for Snapshot{
     type Compressed = Vec<u8>;
-    fn compress_to_buf<B: bytes::BufMut + AsMut<[u8]>>(self, buf: &mut B) {
+    fn compress_to_buf<B: bytes::BufMut + AsMut<[u8]>>(&self, buf: &mut B) {
         let serialized = serde_json::to_vec(&self).expect("Serialization should not fail");
         buf.put_slice(&serialized);
     }

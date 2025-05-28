@@ -52,11 +52,19 @@
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(not(feature = "std"), no_std)]
 
+extern crate alloc;
+
+use alloc::{
+    format,
+    string::{String, ToString},
+};
 use alloy_primitives::B512;
-use std::str::FromStr;
+use core::str::FromStr;
 
 // Re-export PeerId for ease of use.
+#[cfg(feature = "secp256k1")]
 pub use enr::Enr;
 
 /// Alias for a peer identifier
@@ -108,8 +116,8 @@ pub fn id2pk(id: PeerId) -> Result<secp256k1::PublicKey, secp256k1::Error> {
 pub enum AnyNode {
     /// An "enode:" peer with full ip
     NodeRecord(NodeRecord),
-    #[cfg(feature = "secp256k1")]
     /// An "enr:" peer
+    #[cfg(feature = "secp256k1")]
     Enr(Enr<secp256k1::SecretKey>),
     /// An incomplete "enode" with only a peer id
     PeerId(PeerId),
@@ -137,8 +145,8 @@ impl AnyNode {
                 let node_record = NodeRecord {
                     address: enr
                         .ip4()
-                        .map(std::net::IpAddr::from)
-                        .or_else(|| enr.ip6().map(std::net::IpAddr::from))?,
+                        .map(core::net::IpAddr::from)
+                        .or_else(|| enr.ip6().map(core::net::IpAddr::from))?,
                     tcp_port: enr.tcp4().or_else(|| enr.tcp6())?,
                     udp_port: enr.udp4().or_else(|| enr.udp6())?,
                     id: pk2id(&enr.public_key()),
@@ -186,8 +194,8 @@ impl FromStr for AnyNode {
     }
 }
 
-impl std::fmt::Display for AnyNode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for AnyNode {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::NodeRecord(record) => write!(f, "{record}"),
             #[cfg(feature = "secp256k1")]
@@ -247,9 +255,29 @@ impl<T> WithPeerId<T> {
 }
 
 impl<T> WithPeerId<Option<T>> {
-    /// returns `None` if the inner value is `None`, otherwise returns `Some(WithPeerId<T>)`.
+    /// Returns `None` if the inner value is `None`, otherwise returns `Some(WithPeerId<T>)`.
     pub fn transpose(self) -> Option<WithPeerId<T>> {
         self.1.map(|v| WithPeerId(self.0, v))
+    }
+
+    /// Returns the contained Some value, consuming the self value.
+    ///
+    /// See also [`Option::unwrap`]
+    ///
+    /// # Panics
+    ///
+    /// Panics if the value is a None
+    pub fn unwrap(self) -> T {
+        self.1.unwrap()
+    }
+
+    /// Returns the transposed [`WithPeerId`] type with the contained Some value
+    ///
+    /// # Panics
+    ///
+    /// Panics if the value is a None
+    pub fn unwrapped(self) -> WithPeerId<T> {
+        self.transpose().unwrap()
     }
 }
 
@@ -301,7 +329,7 @@ mod tests {
     #[test]
     #[cfg(feature = "secp256k1")]
     fn pk2id2pk() {
-        let prikey = secp256k1::SecretKey::new(&mut rand::thread_rng());
+        let prikey = secp256k1::SecretKey::new(&mut rand_08::thread_rng());
         let pubkey = secp256k1::PublicKey::from_secret_key(secp256k1::SECP256K1, &prikey);
         assert_eq!(pubkey, id2pk(pk2id(&pubkey)).unwrap());
     }

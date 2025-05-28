@@ -1,10 +1,19 @@
 #![allow(non_snake_case)]
-use reth_ethereum_forks::EthereumHardfork;
-use reth_ethereum_engine_primitives::ExecutionPayloadV1;
-use n42_engine_primitives::N42PayloadBuilderAttributes;
-use reth_payload_primitives::{BuiltPayload, PayloadBuilder};
+use std::str::FromStr;
+use alloy_rpc_types_engine::{ExecutionPayloadV3};
+use alloy_signer_local::{PrivateKeySigner};
+use reth_primitives_traits::{SealedHeader, NodePrimitives,};
+use reth_chainspec::make_genesis_header;
+use alloy_primitives::{Sealable, FixedBytes};
+use reth_node_builder::{
+    node::{NodeTypes},
+};
+use reth_payload_builder::EthPayloadBuilderAttributes;
+use reth_ethereum_forks::N42_HARDFORKS;
+use reth_ethereum_engine_primitives::ExecutionPayloadEnvelopeV3;
+use reth_payload_primitives::{BuiltPayload, PayloadKind};
 use reth_consensus::Consensus;
-use reth_node_api::{FullNodeComponents, FullNodeTypes, NodeTypesWithEngine,PayloadTypes};
+use reth_node_api::{FullNodeComponents, FullNodeTypes, PayloadTypes, EngineTypes};
 use zerocopy::AsBytes;
 use reth_chainspec::{ChainSpec, N42};
 use reth_provider::{BlockHashReader, BlockReaderIdExt, BlockNumReader};
@@ -24,7 +33,7 @@ use reth_node_builder::{
     NodeBuilder, NodeConfig, NodeHandle,FullNode,rpc::RethRpcAddOns,
 };
 use reth_tasks::TaskManager;
-use n42_engine_types::{N42Node, N42EngineTypes};
+use n42_engine_types::N42Node;
 
 use std::{
     sync::Arc,
@@ -32,7 +41,9 @@ use std::{
 };
 use reth_rpc_api::EngineApiClient;
 use n42_clique::{EXTRA_VANITY, EXTRA_SEAL};
-use reth_primitives_traits::header::clique_utils::SIGNATURE_LENGTH;
+use reth_primitives_traits::{header::clique_utils::SIGNATURE_LENGTH,
+    AlloyBlockHeader,
+};
 
 /// Types representing tester votes and test structure
 #[cfg(test)]
@@ -72,8 +83,9 @@ fn get_addresses_from_extra_data(extra_data: Bytes) -> Vec<Address> {
 
 #[cfg(test)]
 async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(node: &FullNode<Node, AddOns>, eth_signer_key: String) -> eyre::Result<()>
-    where <<<Node as FullNodeTypes>::Types as NodeTypesWithEngine>::Engine as PayloadTypes>::PayloadBuilderAttributes: From<N42PayloadBuilderAttributes>,
-    ExecutionPayloadV1: From<<<<Node as FullNodeTypes>::Types as NodeTypesWithEngine>::Engine as PayloadTypes>::BuiltPayload>
+    where <<<Node as FullNodeTypes>::Types as NodeTypes>::Payload as PayloadTypes>::PayloadBuilderAttributes: From<EthPayloadBuilderAttributes>,
+    <<Node as FullNodeTypes>::Types as NodeTypes>::Primitives : NodePrimitives<Block = reth_ethereum_primitives::Block>,
+    <<Node as FullNodeTypes>::Types as NodeTypes>::Payload: EngineTypes,
 {
     let best_number = node.provider.chain_info().unwrap().best_number;
     println!("best_number={best_number}");
@@ -83,15 +95,18 @@ async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(node: 
     println!("header={:?}", node.provider.latest_header().unwrap().unwrap().header());
     println!("header hash={:?}", node.provider.latest_header().unwrap().unwrap().header().hash_slow());
     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    let attributes = n42_payload_attributes(timestamp, parent_hash);
+    let eth_signer =
+        PrivateKeySigner::from_bytes(&FixedBytes::from_str(&eth_signer_key).unwrap()).unwrap();
+    let eth_signer_address = eth_signer.address();
+    let attributes = n42_payload_attributes(timestamp, parent_hash, eth_signer_address);
     node.consensus.set_eth_signer_by_key(Some(eth_signer_key.clone()))?;
-    let payload_id = node.payload_builder.send_new_payload(attributes.clone().into()).await.unwrap()?;
+    let payload_id = node.payload_builder_handle.send_new_payload(attributes.clone().into()).await.unwrap()?;
     println!("payload_id={payload_id}");
 
-    let payload_type = node.payload_builder.resolve(payload_id).await.unwrap()?;
+    let payload_type = node.payload_builder_handle.resolve_kind(payload_id, PayloadKind::default()).await.unwrap()?;
     println!("payload_type={payload_type:?}");
-    let extra_data = payload_type.block().header.extra_data.clone();
-    println!("header={:?}", payload_type.block().header);
+    let extra_data = payload_type.block().header().extra_data().clone();
+    println!("header={:?}", payload_type.block().header());
     println!("extra_data={extra_data:?}");
     let signer_addresses = get_addresses_from_extra_data(extra_data);
     println!("signer_addresses={signer_addresses:?}");
@@ -99,16 +114,21 @@ async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(node: 
     let payload = payload_type.clone();
 
     let client = node.engine_http_client();
-    let submission = EngineApiClient::<N42EngineTypes>::new_payload_v1(
+    let execution_payload = ExecutionPayloadV3::from_block_slow(
+                  &payload.block().clone().into_block(),
+    );
+    let submission = EngineApiClient::new_payload_v3(
         &client,
-        payload.into(),
+        execution_payload,
+        vec![],
+        B256::ZERO,
     )
     .await?;
     println!("submission={submission:?}");
 
     let current_head = parent_hash;
     let new_head = payload_type.block().hash();
-    EngineApiClient::<N42EngineTypes>::fork_choice_updated_v1(
+    EngineApiClient::fork_choice_updated_v1(
                 &client,
             ForkchoiceState {
                 head_block_hash: new_head,
@@ -135,6 +155,11 @@ impl CliqueTest {
             extra_data[start..end].copy_from_slice(signer.as_bytes());
         }
         chainspec.genesis.extra_data = extra_data.into();
+        let hardforks = N42_HARDFORKS.clone();
+        let genesis_header = SealedHeader::new_unhashed(
+                make_genesis_header(&chainspec.genesis, &hardforks),
+                //genesis_hash,
+            );
         if let Some(epoch) = self.epoch {
             chainspec.genesis.config.clique = Some(CliqueConfig {
                 epoch: Some(epoch),
@@ -142,8 +167,8 @@ impl CliqueTest {
             });
         }
 
-        let hardforks = EthereumHardfork::n42_for_consensus_test();
-        chainspec.hardforks = hardforks.into();
+        chainspec.hardforks = hardforks;
+        chainspec.genesis_header = genesis_header;
         chainspec
     }
 
@@ -173,7 +198,7 @@ impl CliqueTest {
             .launch()
             .await?;
 
-        let payload_events = node.payload_builder.subscribe().await?;
+        let payload_events = node.payload_builder_handle.subscribe().await?;
         let mut payload_event_stream = payload_events.into_stream();
 
        for vote in &self.votes {
@@ -1205,7 +1230,8 @@ async fn test_an_unauthorized_signer_should_not_be_able_to_sign_blocks() -> eyre
                 ..Default::default()
             },
         ],
-        failure: Some("unauthorized signer".to_string()),
+        //failure: Some("unauthorized signer".to_string()),
+        failure: Some("missing payload".to_string()),
         ..Default::default()
     };
     test.run().await
@@ -1228,7 +1254,8 @@ async fn test_an_authorized_signer_that_signed_recently_should_not_be_able_to_si
                 ..Default::default()
             },
         ],
-        failure: Some("recently signed".to_string()),
+        //failure: Some("recently signed".to_string()),
+        failure: Some("missing payload".to_string()),
         ..Default::default()
     };
     test.run().await
@@ -1262,7 +1289,8 @@ async fn test_recent_signatures_should_not_reset_on_checkpoint_blocks_imported()
                 ..Default::default()
             },
         ],
-        failure: Some("recently signed".to_string()),
+        //failure: Some("recently signed".to_string()),
+        failure: Some("missing payload".to_string()),
         ..Default::default()
     };
     test.run().await

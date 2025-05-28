@@ -19,12 +19,12 @@ pub mod error;
 pub mod events;
 /// Implementation of network traits for that does nothing.
 pub mod noop;
+
 pub mod test_utils;
 mod block;
 
 pub use alloy_rpc_types_admin::EthProtocolInfo;
-use reth_network_p2p::sync::NetworkSyncUpdater;
-pub use reth_network_p2p::BlockClient;
+pub use reth_network_p2p::{BlockClient, HeadersClient};
 pub use reth_network_types::{PeerKind, Reputation, ReputationChangeKind};
 
 pub use downloaders::BlockDownloaderProvider;
@@ -36,37 +36,41 @@ pub use events::{
     PeerRequestSender,
 };
 
-use std::{future::Future, net::SocketAddr, sync::Arc, time::Instant};
-
-use reth_eth_wire_types::{capability::Capabilities, DisconnectReason, EthVersion, Status};
+use reth_eth_wire_types::{
+    capability::Capabilities, DisconnectReason, EthVersion, NetworkPrimitives, Status,
+};
+use reth_network_p2p::sync::NetworkSyncUpdater;
 use reth_network_peers::NodeRecord;
+use std::{future::Future, net::SocketAddr, sync::Arc, time::Instant};
 
 /// The `PeerId` type.
 pub type PeerId = alloy_primitives::B512;
 
 /// Helper trait that unifies network API needed to launch node.
 pub trait FullNetwork:
-    BlockDownloaderProvider
-    + NetworkSyncUpdater
+    BlockDownloaderProvider<
+        Client: BlockClient<Block = <Self::Primitives as NetworkPrimitives>::Block>,
+    > + NetworkSyncUpdater
     + NetworkInfo
     + NetworkEventListenerProvider
-    + PeersInfo
     + Peers
     + BlockAnnounceProvider
     + Clone
+    + Unpin
     + 'static
 {
 }
 
 impl<T> FullNetwork for T where
-    T: BlockDownloaderProvider
-        + NetworkSyncUpdater
+    T: BlockDownloaderProvider<
+            Client: BlockClient<Block = <Self::Primitives as NetworkPrimitives>::Block>,
+        > + NetworkSyncUpdater
         + NetworkInfo
         + NetworkEventListenerProvider
-        + PeersInfo
         + Peers
         + BlockAnnounceProvider
         + Clone
+        + Unpin
         + 'static
 {
 }

@@ -1,15 +1,13 @@
 use crate::utils::eth_payload_attributes;
 use alloy_genesis::Genesis;
-use reth::{
-    args::RpcServerArgs,
-    builder::{NodeBuilder, NodeConfig, NodeHandle},
-    tasks::TaskManager,
-};
 use reth_chainspec::{ChainSpecBuilder, MAINNET};
 use reth_e2e_test_utils::{
     node::NodeTestContext, setup, transaction::TransactionTestContext, wallet::Wallet,
 };
+use reth_node_builder::{NodeBuilder, NodeHandle};
+use reth_node_core::{args::RpcServerArgs, node_config::NodeConfig};
 use reth_node_ethereum::EthereumNode;
+use reth_tasks::TaskManager;
 use std::sync::Arc;
 
 #[tokio::test]
@@ -37,7 +35,7 @@ async fn can_run_eth_node() -> eyre::Result<()> {
     let tx_hash = node.rpc.inject_tx(raw_tx).await?;
 
     // make the node advance
-    let (payload, _) = node.advance_block().await?;
+    let payload = node.advance_block().await?;
 
     let block_hash = payload.block().hash();
     let block_number = payload.block().number;
@@ -85,7 +83,7 @@ async fn can_run_eth_node_with_auth_engine_api_over_ipc() -> eyre::Result<()> {
     let tx_hash = node.rpc.inject_tx(raw_tx).await?;
 
     // make the node advance
-    let (payload, _) = node.advance_block().await?;
+    let payload = node.advance_block().await?;
 
     let block_hash = payload.block().hash();
     let block_number = payload.block().number;

@@ -15,16 +15,14 @@ workspace = true
 ## n42
 n42-engine-primitives.workspace = true
 ## reth
-reth-auto-seal-consensus.workspace = true
-reth-beacon-consensus.workspace = true
-reth-blockchain-tree.workspace = true
+reth-ethereum-primitives.workspace = true
 reth-chain-state.workspace = true
 reth-chainspec.workspace = true
 reth-cli-util.workspace = true
 reth-config.workspace = true
 reth-consensus-debug-client.workspace = true
 reth-consensus.workspace = true
-reth-db = { workspace = true, features = ["mdbx"] }
+reth-db = { workspace = true, features = ["mdbx"], optional = true }
 reth-db-api.workspace = true
 reth-db-common.workspace = true
 reth-downloaders.workspace = true
@@ -45,12 +43,10 @@ reth-node-core.workspace = true
 reth-node-events.workspace = true
 reth-node-metrics.workspace = true
 reth-payload-builder.workspace = true
-reth-payload-primitives.workspace = true
-reth-payload-validator.workspace = true
-reth-primitives.workspace = true
 reth-provider.workspace = true
+reth-primitives.workspace = true
 reth-prune.workspace = true
-reth-rpc = { workspace = true, features = ["js-tracer"] }
+reth-rpc.workspace = true
 reth-rpc-api.workspace = true
 reth-rpc-builder.workspace = true
 reth-rpc-engine-api.workspace = true
@@ -62,28 +58,24 @@ reth-tasks.workspace = true
 reth-tokio-util.workspace = true
 reth-tracing.workspace = true
 reth-transaction-pool.workspace = true
+reth-basic-payload-builder.workspace = true
 
 ## ethereum
-alloy-primitives.workspace = true
 alloy-signer-local.workspace = true
+alloy-consensus.workspace = true
+alloy-primitives.workspace = true
+alloy-provider.workspace = true
 alloy-rpc-types = { workspace = true, features = ["engine"] }
+alloy-eips = { workspace = true, features = ["kzg"] }
+alloy-rpc-types-engine.workspace = true
 
 ## async
 futures.workspace = true
-tokio = { workspace = true, features = [
-    "sync",
-    "macros",
-    "time",
-    "rt-multi-thread",
-] }
+tokio = { workspace = true, features = ["sync", "macros", "time", "rt-multi-thread"] }
 tokio-stream.workspace = true
 
 ## crypto
-secp256k1 = { workspace = true, features = [
-    "global-context",
-    "rand-std",
-    "recovery",
-] }
+secp256k1 = { workspace = true, features = ["global-context", "std", "recovery"] }
 
 ## misc
 aquamarine.workspace = true
@@ -91,6 +83,7 @@ eyre.workspace = true
 fdlimit.workspace = true
 jsonrpsee.workspace = true
 rayon.workspace = true
+serde_json.workspace = true
 
 # tracing
 tracing.workspace = true
@@ -100,21 +93,27 @@ tempfile.workspace = true
 
 [features]
 default = []
+js-tracer = ["reth-rpc/js-tracer"]
 test-utils = [
-	"reth-db/test-utils",
-	"reth-blockchain-tree/test-utils",
-	"reth-chain-state/test-utils",
-	"reth-chainspec/test-utils",
-	"reth-consensus/test-utils",
-	"reth-engine-tree/test-utils",
-	"reth-evm/test-utils",
-	"reth-downloaders/test-utils",
-	"reth-network/test-utils",
-	"reth-network-p2p/test-utils",
-	"reth-payload-builder/test-utils",
-	"reth-primitives/test-utils",
-	"reth-stages/test-utils",
-	"reth-db-api/test-utils",
-	"reth-provider/test-utils",
-	"reth-transaction-pool/test-utils"
+    "dep:reth-db",
+    "reth-db/test-utils",
+    "reth-chain-state/test-utils",
+    "reth-chainspec/test-utils",
+    "reth-consensus/test-utils",
+    "reth-engine-tree/test-utils",
+    "reth-evm/test-utils",
+    "reth-downloaders/test-utils",
+    "reth-network/test-utils",
+    "reth-network-p2p/test-utils",
+    "reth-payload-builder/test-utils",
+    "reth-stages/test-utils",
+    "reth-db-api/test-utils",
+    "reth-provider/test-utils",
+    "reth-transaction-pool/test-utils",
 ]
+#op = [
+#    "reth-db?/op",
+#    "reth-db-api/op",
+#    "reth-engine-local/op",
+#    "reth-evm/op",
+#]

@@ -91,10 +91,9 @@ pub const N42_GENESIS_HASH: B256 =
     b256!("d4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3");
 
 pub const N42_TESTNET_CHAINID: u64 = 1142;
+pub const N42_DEVNET_CHAINID: u64 = 1143;
 
-/// The Ethereum mainnet spec
-pub static N42: LazyLock<Arc<ChainSpec>> = LazyLock::new(|| {
-    let genesis: Genesis = serde_json::from_str(include_str!("../res/genesis/n42.json")).expect("Can't deserialize N42 genesis json");
+fn make_chain_spec(genesis: Genesis, chain: Chain) -> ChainSpec {
     let hardforks = N42_HARDFORKS.clone();
     //let genesis_hash = alloy_primitives::keccak256(alloy_rlp::encode(genesis.header()));
     let genesis_header = SealedHeader::new_unhashed(
@@ -102,7 +101,7 @@ pub static N42: LazyLock<Arc<ChainSpec>> = LazyLock::new(|| {
             //genesis_hash,
         );
     let mut spec = ChainSpec {
-        chain: Chain::from_id(N42_TESTNET_CHAINID),
+        chain,
         genesis,
         genesis_header,
         // <https://etherscan.io/block/15537394>
@@ -121,6 +120,20 @@ pub static N42: LazyLock<Arc<ChainSpec>> = LazyLock::new(|| {
     let state_root = state_root_ref_unhashed(&spec.genesis.alloc);
     println!("Computed state_root from genesis alloc: state_root={}", state_root);
     spec.into()
+}
+
+/// The N42 mainnet spec
+pub static N42: LazyLock<Arc<ChainSpec>> = LazyLock::new(|| {
+    let genesis: Genesis = serde_json::from_str(include_str!("../res/genesis/n42.json")).expect("Can't deserialize N42 genesis json");
+    let chain = Chain::from_id(N42_TESTNET_CHAINID);
+    make_chain_spec(genesis, chain).into()
+});
+
+/// The N42 devnet spec
+pub static N42_DEVNET: LazyLock<Arc<ChainSpec>> = LazyLock::new(|| {
+    let genesis: Genesis = serde_json::from_str(include_str!("../res/genesis/n42_devnet.json")).expect("Can't deserialize N42 genesis json");
+    let chain = Chain::from_id(N42_DEVNET_CHAINID);
+    make_chain_spec(genesis, chain).into()
 });
 
 /// The Ethereum mainnet spec

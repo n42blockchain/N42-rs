@@ -33,6 +33,7 @@ pub use spec::{
     make_genesis_header, BaseFeeParams, BaseFeeParamsKind, ChainSpec, ChainSpecBuilder,
     ChainSpecProvider, DepositContract, ForkBaseFeeParams, DEV, HOLESKY, HOODI, MAINNET, SEPOLIA,
     N42,
+    N42_DEVNET,
 };
 
 use reth_primitives_traits::sync::OnceLock;

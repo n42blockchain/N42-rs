@@ -5593,6 +5593,7 @@ dependencies = [
  "ssz_types",
  "superstruct",
  "thiserror 2.0.12",
+ "tree_hash 0.8.0",
  "tree_hash_derive 0.8.0",
 ]
 
@@ -9686,6 +9687,14 @@ dependencies = [
  "revm-bytecode",
  "revm-primitives",
  "serde",
+]
+
+[[package]]
+name = "reward-punish"
+version = "1.4.3"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

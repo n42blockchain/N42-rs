@@ -42,7 +42,7 @@ members = [
     "crates/storage/storage-api/",
     #"testing/testing-utils/",
     "crates/n42/engine-primitives",
-    "crates/n42/consensus-client", "crates/n42/n42-withdrawal",
+    "crates/n42/consensus-client", "crates/n42/n42-withdrawal", "crates/n42/reward-punish",
 #    "bin/reth/",
 ]
 default-members = ["bin/n42"]

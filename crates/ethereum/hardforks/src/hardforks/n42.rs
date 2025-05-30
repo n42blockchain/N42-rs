@@ -36,5 +36,6 @@ pub static N42_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
         ),
         (EthereumHardfork::Shanghai.boxed(), ForkCondition::Timestamp(1746576000)),
         (EthereumHardfork::Cancun.boxed(), ForkCondition::Timestamp(1746576000)),
+        (EthereumHardfork::Prague.boxed(), ForkCondition::Timestamp(1748930400)),
     ])
 });

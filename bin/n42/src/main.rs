@@ -5,7 +5,7 @@ static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::ne
 
 use clap::Parser;
 use n42::{args::RessArgs, cli::Cli, ress::install_ress_subprotocol};
-use n42_engine_types::{N42Node};
+use n42_engine_types::{MinedblockExt, MinedblockExtApiServer, N42Node};
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_node_builder::NodeHandle;
 use reth_node_ethereum::EthereumNode;
@@ -34,6 +34,13 @@ fn main() {
 
                             // now we merge our extension namespace into all configured transports
                             ctx.auth_module.merge_auth_methods(ext.into_rpc())?;
+
+                            let minedblock_ext=MinedblockExt::instance();
+                            if let Ok(mut minedblock) = minedblock_ext.try_lock() {
+                                ctx.modules.merge_ws(<MinedblockExt as Clone>::clone(&*minedblock).into_rpc())?;                            
+                            } else {
+                                println!("minedblock rpc extension disabled");
+                            }
 
                             println!("consensus rpc extension enabled");
 

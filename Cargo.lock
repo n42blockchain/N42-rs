@@ -5245,6 +5245,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mobile"
+version = "1.4.3"
+dependencies = [
+ "jsonrpsee",
+ "lazy_static",
+ "n42-engine-types",
+ "reth-chainspec",
+ "reth-evm",
+ "reth-provider",
+ "reth-revm",
+]
+
+[[package]]
 name = "modular-bitfield"
 version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5462,6 +5475,8 @@ dependencies = [
  "eyre",
  "futures-core",
  "futures-util",
+ "jsonrpsee",
+ "lazy_static",
  "metrics",
  "n42-clique",
  "n42-engine-primitives",
@@ -5502,6 +5517,7 @@ dependencies = [
  "reth-trie-db",
  "revm",
  "serde",
+ "serde_json",
  "thiserror 2.0.12",
  "tokio",
  "tracing",
@@ -5514,6 +5530,7 @@ dependencies = [
  "alloy-primitives 1.1.2",
  "alloy-rlp",
  "bytes",
+ "parity-scale-codec",
  "reth-codecs",
  "reth-primitives",
  "reth-primitives-traits",
@@ -8808,14 +8825,16 @@ dependencies = [
 [[package]]
 name = "reth-revm"
 version = "1.4.3"
-source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.4.3#fe3653ffe602d4e85ad213e8bd9f06e7b710c0c5"
 dependencies = [
+ "alloy-consensus",
  "alloy-primitives 1.1.2",
+ "reth-ethereum-forks",
  "reth-primitives-traits",
  "reth-storage-api",
  "reth-storage-errors",
  "reth-trie",
  "revm",
+ "serde",
 ]
 
 [[package]]

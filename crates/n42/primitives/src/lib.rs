@@ -1,5 +1,7 @@
 //! n42 primitives
 
 mod snapshot;
-pub use snapshot::Snapshot;
-pub use snapshot::APosConfig;
+pub use snapshot::*;
+
+mod validator;
+pub use validator::*;

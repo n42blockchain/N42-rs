@@ -20,6 +20,10 @@ mod payload;
 //mod metrics;
 mod network;
 mod consensus;
+mod minedblock;
+pub use minedblock::*;
+mod unverifiedblock;
+pub use unverifiedblock::*;
 
 pub use payload::EthereumPayloadBuilderWrapper;
 pub use payload::N42PayloadServiceBuilder;

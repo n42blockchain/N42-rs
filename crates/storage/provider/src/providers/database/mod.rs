@@ -667,6 +667,8 @@ mod tests {
     use reth_storage_errors::provider::ProviderError;
     use reth_testing_utils::generators::{self, random_block, random_header, BlockParams};
     use std::{ops::RangeInclusive, sync::Arc};
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
 
     #[test]
     fn common_history_provider() {

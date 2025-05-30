@@ -42,7 +42,10 @@ members = [
     "crates/storage/storage-api/",
     #"testing/testing-utils/",
     "crates/n42/engine-primitives",
-    "crates/n42/consensus-client", "crates/n42/n42-withdrawal", "crates/n42/reward-punish",
+    "crates/n42/consensus-client",  "crates/n42/reward-punish",
+    "crates/n42/n42-withdrawal",
+    "crates/revm",
+    "crates/n42/mobile",
 #    "bin/reth/",
 ]
 default-members = ["bin/n42"]
@@ -195,6 +198,7 @@ lto = "fat"
 codegen-units = 1
 
 [workspace.dependencies]
+lazy_static="1.5.0"
 # for n42
 n42-primitives = { path = "crates/n42/primitives" }
 n42-clique = {path="crates/n42/clique"}
@@ -560,7 +564,7 @@ memmap2 = "0.9.4"
 mev-share-sse = { version = "0.5.0", default-features = false }
 num-traits = "0.2.15"
 page_size = "0.6.0"
-parity-scale-codec = "3.2.1"
+parity-scale-codec = {version = "3.2.1",features = ["derive"]}
 plain_hasher = "0.2"
 pretty_assertions = "1.4"
 ratatui = { version = "0.29", default-features = false }
@@ -617,6 +621,7 @@ reth-network-api = { path = "crates/net/network-api" }
 reth-network-peers = { path = "crates/net/peers"}
 #reth-testing-utils={path="testing/testing-utils"}
 #reth-chain-state = { path = "crates/chain-state"}
+reth-revm={path = "crates/revm"}
 
 [patch.crates-io]
 #alloy-genesis = { path = "./crates/n42/alloy-genesis" }

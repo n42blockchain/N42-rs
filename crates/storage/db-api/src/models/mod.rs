@@ -23,6 +23,7 @@ pub mod integer_list;
 pub mod sharded_key;
 pub mod storage_sharded_key;
 mod snapshot;
+mod validator;
 
 pub use accounts::*;
 pub use blocks::*;
@@ -240,13 +241,13 @@ impl_compression_for_compact!(
     GenesisAccount
 );
 
-#[cfg(feature = "op")]
-mod op {
-    use super::*;
-    use reth_optimism_primitives::{OpReceipt, OpTransactionSigned};
+// #[cfg(feature = "op")]
+// mod op {
+//     use super::*;
+//     use reth_optimism_primitives::{OpReceipt, OpTransactionSigned};
 
-    impl_compression_for_compact!(OpTransactionSigned, OpReceipt);
-}
+//     impl_compression_for_compact!(OpTransactionSigned, OpReceipt);
+// }
 
 macro_rules! impl_compression_fixed_compact {
     ($($name:tt),+) => {

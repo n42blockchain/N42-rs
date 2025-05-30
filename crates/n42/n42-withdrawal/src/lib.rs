@@ -1,6 +1,8 @@
 pub mod models;
 pub mod per_block_processing;
 pub mod error;
+pub mod beacon_state;
+pub mod crypto;
 
 pub type Hash256 = alloy_primitives::B256;
 

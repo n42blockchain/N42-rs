@@ -1,4 +1,6 @@
-use crate::models::{EthSpec, BeaconState, ChainSpec, Withdrawals, Withdrawal, SafeArith};
+use tree_hash::TreeHash;
+use crate::models::{EthSpec, ChainSpec, Withdrawals, Withdrawal, SafeArith, AbstractExecPayload, ExecPayload, SafeArithIter};
+use crate::beacon_state::BeaconState;
 use crate::error::{BlockProcessingError, Error as BeaconStateError};
 
 /// Compute the next batch of withdrawals which should be included in a block.
@@ -180,4 +182,17 @@ pub fn process_withdrawals<E: EthSpec, Payload: AbstractExecPayload<E>>(
         // these shouldn't even be encountered but they're here for completeness
         Ok(())
     }
+}
+
+pub fn decrease_balance<E: EthSpec>(
+    state: &mut BeaconState<E>,
+    index: usize,
+    delta: u64,
+) -> Result<(), BeaconStateError> {
+    decrease_balance_directly(state.get_balance_mut(index)?, delta)
+}
+
+pub fn decrease_balance_directly(balance: &mut u64, delta: u64) -> Result<(), BeaconStateError> {
+    *balance = balance.saturating_sub(delta);
+    Ok(())
 }

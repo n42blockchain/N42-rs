@@ -2,76 +2,19 @@ use alloy_primitives::{Address,
                        private::{
                            arbitrary,
                            serde::{Deserialize, Serialize}, }, };
-use ssz_derive::{Decode, Encode};
 use tree_hash_derive::TreeHash;
 pub use milhouse::{interface::Interface, List, Vector};
 use std::fmt::Debug;
+use std::hash::Hash;
 use ssz_types::typenum::Unsigned;
 use ssz_types::VariableList;
 use crate::Hash256;
-use superstruct::superstruct;
-use derivative::Derivative;
+use ssz_derive::{Decode, Encode};
+use crate::error::Error;
+use tree_hash::TreeHash;
 
 
-pub type ValidatorIndex = usize;
 pub type Withdrawals<E> = VariableList<Withdrawal, <E as EthSpec>::MaxWithdrawalsPerPayload>;
-
-#[superstruct(
-    variants(Base, Altair, Bellatrix, Capella, Deneb, Electra, Fulu),
-    variant_attributes(
-        derive(
-            Derivative,
-            Debug,
-            PartialEq,
-            Serialize,
-            Deserialize,
-            Encode,
-            Decode,
-            TreeHash,
-            // CompareFields,
-            arbitrary::Arbitrary,
-        ),
-        serde(bound = "E: EthSpec", deny_unknown_fields),
-        arbitrary(bound = "E: EthSpec"),
-        derivative(Clone),
-    ),
-    cast_error(ty = "Error", expr = "Error::IncorrectStateVariant"),
-    partial_getter_error(ty = "Error", expr = "Error::IncorrectStateVariant"),
-    map_ref_mut_into(BeaconStateRef)
-)]
-#[derive(Debug, PartialEq, Clone, Serialize, Deserialize, Encode, arbitrary::Arbitrary)]
-#[serde(untagged)]
-#[serde(bound = "E: EthSpec")]
-#[arbitrary(bound = "E: EthSpec")]
-#[ssz(enum_behaviour = "transparent")]
-pub struct BeaconState<E>
-where
-    E: EthSpec,
-{
-    #[compare_fields(as_iter)]
-    #[test_random(default)]
-    pub validators: List<Validator, E::ValidatorRegistryLimit>,
-    #[serde(with = "ssz_types::serde_utils::quoted_u64_var_list")]
-    #[compare_fields(as_iter)]
-    #[test_random(default)]
-    pub balances: List<u64, E::ValidatorRegistryLimit>,
-
-    // Capella
-    #[superstruct(only(Capella, Deneb, Electra, Fulu), partial_getter(copy))]
-    #[serde(with = "serde_utils::quoted_u64")]
-    #[metastruct(exclude_from(tree_lists))]
-    pub next_withdrawal_index: u64,
-    #[superstruct(only(Capella, Deneb, Electra, Fulu), partial_getter(copy))]
-    #[serde(with = "serde_utils::quoted_u64")]
-    #[metastruct(exclude_from(tree_lists))]
-    pub next_withdrawal_validator_index: u64,
-
-    #[compare_fields(as_iter)]
-    #[test_random(default)]
-    #[superstruct(only(Electra, Fulu))]
-    pub pending_partial_withdrawals: List<PendingPartialWithdrawal, E::PendingPartialWithdrawalsLimit>,
-
-}
 
 #[derive(
     arbitrary::Arbitrary, Debug, Clone, PartialEq, Eq,
@@ -177,12 +120,54 @@ macro_rules! assign_method {
 
 /// Trait providing safe arithmetic operations for built-in types.
 pub trait SafeArith<Rhs = Self>: Sized + Copy {
+    const ZERO: Self;
+    const ONE: Self;
 
     /// Safe variant of `+` that guards against overflow.
     fn safe_add(&self, other: Rhs) -> Result<Self>;
+    fn safe_rem(&self, other: Rhs) -> Result<Self>;
 
     assign_method!(safe_add_assign, safe_add, Rhs, "+=");
+    assign_method!(safe_rem_assign, safe_rem, Rhs, "%=");
 
+}
+
+macro_rules! impl_safe_arith {
+    ($typ:ty) => {
+        impl SafeArith for $typ {
+            const ZERO: Self = 0;
+            const ONE: Self = 1;
+
+            #[inline]
+            fn safe_add(&self, other: Self) -> Result<Self> {
+                self.checked_add(other).ok_or(ArithError::Overflow)
+            }
+
+            #[inline]
+            fn safe_rem(&self, other: Self) -> Result<Self> {
+                self.checked_rem(other).ok_or(ArithError::DivisionByZero)
+            }
+
+        }
+    };
+}
+
+impl_safe_arith!(u64);
+
+
+/// Extension trait for iterators, providing a safe replacement for `sum`.
+pub trait SafeArithIter<T> {
+    fn safe_sum(self) -> Result<T>;
+}
+
+impl<I, T> SafeArithIter<T> for I
+where
+    I: Iterator<Item = T> + Sized,
+    T: SafeArith,
+{
+    fn safe_sum(mut self) -> Result<T> {
+        self.try_fold(T::ZERO, |acc, x| acc.safe_add(x))
+    }
 }
 
 pub trait EthSpec:
@@ -191,8 +176,35 @@ pub trait EthSpec:
     type ValidatorRegistryLimit: Unsigned + Clone + Sync + Send + Debug + PartialEq;
     type PendingPartialWithdrawalsLimit: Unsigned + Clone + Sync + Send + Debug + PartialEq;
     type MaxWithdrawalsPerPayload: Unsigned + Clone + Sync + Send + Debug + PartialEq;
+    type SlotsPerEpoch: Unsigned + Clone + Sync + Send + Debug + PartialEq;
+
 
     fn max_withdrawals_per_payload() -> usize {
         Self::MaxWithdrawalsPerPayload::to_usize()
     }
+
+    /// Returns the `SLOTS_PER_EPOCH` constant for this specification.
+    ///
+    /// Spec v0.12.1
+    fn slots_per_epoch() -> u64 {
+        Self::SlotsPerEpoch::to_u64()
+    }
+}
+
+// ---------------
+pub trait AbstractExecPayload<E: EthSpec>:
+ExecPayload<E>
++ Sized
++ From<ExecutionPayload<E>>
++ TryFrom<ExecutionPayloadHeader<E>>
+{
+    type Ref<'a>: ExecPayload<E>
+    + Copy;
+}
+
+/// A trait representing behavior of an `ExecutionPayload` that either has a full list of transactions
+/// or a transaction hash in it's place.
+pub trait ExecPayload<E: EthSpec>: Debug + Clone + PartialEq + Hash + TreeHash + Send {
+    fn withdrawals_root(&self) -> std::result::Result<Hash256, Error>;
+
 }

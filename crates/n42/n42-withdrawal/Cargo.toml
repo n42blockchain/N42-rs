@@ -17,6 +17,8 @@ milhouse = "0.3"
 ssz_types = "0.8"
 superstruct = "0.8"
 derivative = "2"
+tree_hash = "0.8"
+
 
 
 

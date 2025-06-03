@@ -9,7 +9,7 @@ use reth_node_builder::{
     node::{NodeTypes},
 };
 use reth_payload_builder::EthPayloadBuilderAttributes;
-use reth_ethereum_forks::N42_HARDFORKS;
+use reth_ethereum_forks::N42_HARDFORKS_FOR_CLIQUE_TEST;
 use reth_ethereum_engine_primitives::ExecutionPayloadEnvelopeV3;
 use reth_payload_primitives::{BuiltPayload, PayloadKind};
 use reth_consensus::Consensus;
@@ -155,7 +155,7 @@ impl CliqueTest {
             extra_data[start..end].copy_from_slice(signer.as_bytes());
         }
         chainspec.genesis.extra_data = extra_data.into();
-        let hardforks = N42_HARDFORKS.clone();
+        let hardforks = N42_HARDFORKS_FOR_CLIQUE_TEST.clone();
         let genesis_header = SealedHeader::new_unhashed(
                 make_genesis_header(&chainspec.genesis, &hardforks),
                 //genesis_hash,

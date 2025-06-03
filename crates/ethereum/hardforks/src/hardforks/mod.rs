@@ -2,7 +2,7 @@ mod dev;
 pub use dev::DEV_HARDFORKS;
 
 mod n42;
-pub use n42::N42_HARDFORKS;
+pub use n42::{N42_HARDFORKS, N42_HARDFORKS_FOR_CLIQUE_TEST};
 
 use crate::{ForkCondition, ForkFilter, ForkId, Hardfork, Head};
 #[cfg(feature = "std")]

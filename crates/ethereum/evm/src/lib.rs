@@ -212,7 +212,7 @@ where
         // cancun now, we need to set the excess blob gas to the default value(0)
         let blob_excess_gas_and_price = parent
             .maybe_next_block_excess_blob_gas(blob_params)
-            .or_else(|| (spec_id == SpecId::CANCUN).then_some(0))
+            .or_else(|| (spec_id >= SpecId::CANCUN).then_some(0))
             .map(|excess_blob_gas| {
                 let blob_gasprice =
                     blob_params.unwrap_or_else(BlobParams::cancun).calc_blob_fee(excess_blob_gas);

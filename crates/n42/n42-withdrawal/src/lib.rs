@@ -3,6 +3,12 @@ pub mod per_block_processing;
 pub mod error;
 pub mod beacon_state;
 pub mod crypto;
+pub mod pending_partial_withdrawal;
+pub mod safe_aitrh;
+pub mod validators;
+pub mod chain_spec;
+pub mod payload;
+pub mod fork_name;
 
 pub type Hash256 = alloy_primitives::B256;
 

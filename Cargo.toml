@@ -44,6 +44,7 @@ members = [
     "crates/n42/engine-primitives",
     "crates/n42/consensus-client",  "crates/n42/reward-punish",
     "crates/n42/n42-withdrawal",
+    "crates/n42/n42-withdrawal/compare_fields_derive", "crates/n42/n42-withdrawal/test_random_derive",
     "crates/revm",
     "crates/n42/mobile",
 #    "bin/reth/",

@@ -1,7 +1,11 @@
 use tree_hash::TreeHash;
-use crate::models::{EthSpec, ChainSpec, Withdrawals, Withdrawal, SafeArith, AbstractExecPayload, ExecPayload, SafeArithIter};
-use crate::beacon_state::BeaconState;
+use crate::models::{EthSpec, Withdrawals, Withdrawal};
+use crate::beacon_state::{BeaconState,};
+use crate::chain_spec::ChainSpec;
 use crate::error::{BlockProcessingError, Error as BeaconStateError};
+use crate::payload::{AbstractExecPayload, ExecPayload};
+use crate::safe_aitrh::{SafeArith, SafeArithIter};
+
 
 /// Compute the next batch of withdrawals which should be included in a block.
 ///
@@ -21,7 +25,7 @@ pub fn get_expected_withdrawals<E: EthSpec>(
     let processed_partial_withdrawals_count =
         if let Ok(pending_partial_withdrawals) = state.pending_partial_withdrawals() {
             let mut processed_partial_withdrawals_count = 0;
-            for withdrawal in pending_partial_withdrawals {
+            for withdrawal in pending_partial_withdrawals.iter() {
                 if withdrawal.withdrawable_epoch > epoch
                     || withdrawals.len() == spec.max_pending_partials_per_withdrawals_sweep as usize
                 {

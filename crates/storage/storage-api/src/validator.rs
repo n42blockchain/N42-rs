@@ -10,6 +10,7 @@ pub trait ValidatorReader: Send + Sync {
     fn basic_validator(&self, address: Address) -> ProviderResult<Option<Validator>>;
 }
 pub trait ValidatorChangeWriter{
+    fn unwind_validator(&self, range: RangeInclusive<BlockNumber>) -> ProviderResult<()>;
     fn write_validator_changes(&self,changes: ValidatorChangeset) -> ProviderResult<()>;
     fn remove_validator(&self, range: RangeInclusive<BlockNumber>) -> ProviderResult<()>;
     fn take_validator(&mut self, range: RangeInclusive<BlockNumber>) -> ProviderResult<ValidatorChangeset>;

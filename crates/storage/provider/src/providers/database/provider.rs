@@ -158,6 +158,19 @@ impl<TX: DbTx, N: NodeTypes> ValidatorReader for DatabaseProvider<TX, N> {
 }
 
 impl<TX: DbTxMut + DbTx+'static, N: NodeTypes> ValidatorChangeWriter for DatabaseProvider<TX, N> {
+    fn unwind_validator(&self,range: RangeInclusive<BlockNumber>) -> ProviderResult<()> {
+        let changed_validators=self
+            .tx
+            .cursor_read::<tables::ValidatorChangeSets>()?
+            .walk_range(range.clone())?
+            .collect::<Result<Vec<_>,_>>()?;
+
+        self.unwind_validator_history_indices(changed_validators.iter())?;
+
+        self.remove_validator(range.clone())?;
+
+        Ok(())
+    }
     fn unwind_validator_history_indices<'a>(&self, changesets: impl Iterator<Item = &'a (BlockNumber, ValidatorBeforeTx)>,) -> ProviderResult<usize> {
         let mut last_indices = changesets
             .into_iter()
@@ -183,7 +196,7 @@ impl<TX: DbTxMut + DbTx+'static, N: NodeTypes> ValidatorChangeWriter for Databas
         }
         Ok(last_indices.len())
     }
-    fn write_validator_changes(&self, mut changes: n42_primitives::ValidatorChangeset) -> ProviderResult<()> {
+    fn write_validator_changes(&self, mut changes: ValidatorChangeset) -> ProviderResult<()> {
         changes.validators.par_sort_by_key(|a|a.0);
         let mut validators_cursor=self.tx_ref().cursor_write::<tables::PlainValidatorState>()?;
         for (address,validator)in changes.validators{
@@ -2895,10 +2908,12 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockExecu
     ) -> ProviderResult<()> {
         let range = block + 1..=self.last_block_number()?;
 
-        self.unwind_trie_state_range(range)?;
+        self.unwind_trie_state_range(range.clone())?;
 
         // remove execution res
         self.remove_state_above(block, remove_from)?;
+
+        self.unwind_validator(range.clone())?;
 
         // remove block bodies it is needed for both get block range and get block execution results
         // that is why it is deleted afterwards.

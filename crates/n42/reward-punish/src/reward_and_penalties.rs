@@ -1,5 +1,6 @@
-
 use types::{BeaconState, ChainSpec, EthSpec};
+use crate::per_epoch_processing::Delta;
+use crate::base::get_base_reward;
 
 /// Combination of several deltas for different components of an attestation reward.
 ///

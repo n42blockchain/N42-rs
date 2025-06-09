@@ -1,5 +1,5 @@
 use alloy_primitives::private::arbitrary;
-use crate::models::Epoch;
+use crate::slot_epoch::Epoch;
 
 #[derive(arbitrary::Arbitrary, PartialEq, Debug, Clone)]
 pub struct ChainSpec {
@@ -10,5 +10,6 @@ pub struct ChainSpec {
     pub eth1_address_withdrawal_prefix_byte: u8,
     pub max_effective_balance_electra: u64,
     pub max_effective_balance: u64,
+    pub compounding_withdrawal_prefix_byte: u8,
 
 }

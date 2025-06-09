@@ -21,6 +21,9 @@ superstruct = "0.8"
 derivative = "2"
 tree_hash = "0.8"
 metastruct = "0.1.0"
+serde = { version = "1.0.219", features = ["derive"] }
+ethereum_ssz = "0.7"
+
 
 
 
@@ -28,3 +31,7 @@ metastruct = "0.1.0"
 
 [lints]
 workspace = true
+
+
+[features]
+fake_crypto = []

@@ -9,7 +9,7 @@ use tree_hash::TreeHash;
 use tree_hash_derive::TreeHash;
 use test_random_derive::TestRandom;
 use crate::Hash256;
-use crate::models::EthSpec;
+use crate::withdrawal::EthSpec;
 use crate::beacon_state::Error;
 
 pub trait AbstractExecPayload<E: EthSpec>:

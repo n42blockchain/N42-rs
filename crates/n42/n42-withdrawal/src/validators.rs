@@ -4,8 +4,9 @@ use alloy_primitives::private::serde::{Deserialize, Serialize};
 use ssz_derive::{Decode, Encode};
 use tree_hash_derive::TreeHash;
 use crate::chain_spec::ChainSpec;
+use crate::crypto::PublicKeyBytes;
 use crate::Hash256;
-use crate::models::Epoch;
+use crate::slot_epoch::Epoch;
 use crate::fork_name::ForkName;
 
 #[derive(
@@ -72,6 +73,11 @@ impl Validator {
     pub fn has_execution_withdrawal_credential(&self, spec: &ChainSpec) -> bool {
         self.has_compounding_withdrawal_credential(spec)
             || self.has_eth1_withdrawal_credential(spec)
+    }
+
+    /// Check if ``validator`` has an 0x02 prefixed "compounding" withdrawal credential.
+    pub fn has_compounding_withdrawal_credential(&self, spec: &ChainSpec) -> bool {
+        is_compounding_withdrawal_credential(self.withdrawal_credentials, spec)
     }
 
     /// Returns `true` if the validator is fully withdrawable at some epoch.
@@ -145,4 +151,15 @@ impl Validator {
             spec.max_effective_balance
         }
     }
+}
+
+pub fn is_compounding_withdrawal_credential(
+    withdrawal_credentials: Hash256,
+    spec: &ChainSpec,
+) -> bool {
+    withdrawal_credentials
+        .as_slice()
+        .first()
+        .map(|prefix_byte| *prefix_byte == spec.compounding_withdrawal_prefix_byte)
+        .unwrap_or(false)
 }

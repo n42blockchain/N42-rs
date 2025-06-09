@@ -27,19 +27,3 @@ pub struct Withdrawal {
     #[serde(with = "serde_utils::quoted_u64")]
     pub amount: u64,
 }
-
-
-
-#[derive(
-    arbitrary::Arbitrary, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
-    Serialize, Deserialize,
-)]
-#[serde(transparent)]
-pub struct Epoch(#[serde(with = "serde_utils::quoted_u64")] u64);
-
-#[derive(
-    arbitrary::Arbitrary, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
-    Serialize, Deserialize,
-)]
-#[serde(transparent)]
-pub struct Slot(#[serde(with = "serde_utils::quoted_u64")] u64);

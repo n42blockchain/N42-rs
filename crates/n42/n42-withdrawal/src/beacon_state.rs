@@ -3,7 +3,6 @@ use alloy_primitives::private::arbitrary;
 use alloy_primitives::private::serde::{Deserialize, Serialize};
 use milhouse::List;
 use superstruct::superstruct;
-use crate::models::{Epoch, EthSpec};
 use crate::pending_partial_withdrawal::PendingPartialWithdrawal;
 use derivative::Derivative;
 use ssz_derive::{Decode, Encode};
@@ -14,6 +13,14 @@ use compare_fields_derive::CompareFields;
 use test_random_derive::TestRandom;
 use crate::validators::Validator;
 use crate::fork_name::ForkName;
+use crate::slot_epoch::{Epoch, Slot};
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum Error {
+    NonExecutionAddressWithdrawalCredential,
+    BalancesOutOfBounds(usize),
+    UnknownValidator(usize),
+}
 
 #[superstruct(
     variants(Base, Altair, Bellatrix, Capella, Deneb, Electra, Fulu),
@@ -48,6 +55,10 @@ pub struct BeaconState<E>
 where
     E: EthSpec,
 {
+
+    #[superstruct(getter(copy))]
+    #[metastruct(exclude_from(tree_lists))]
+    pub slot: Slot,
     #[compare_fields(as_iter)]
     #[test_random(default)]
     pub validators: List<Validator, E::ValidatorRegistryLimit>,
@@ -84,13 +95,13 @@ impl<E: EthSpec> BeaconState<E> {
     /// Does not check if `self` is consistent with the fork dictated by `self.slot()`.
     pub fn fork_name_unchecked(&self) -> ForkName {
         match self {
-            crate::models::BeaconState::Base { .. } => ForkName::Base,
-            crate::models::BeaconState::Altair { .. } => ForkName::Altair,
-            crate::models::BeaconState::Bellatrix { .. } => ForkName::Bellatrix,
-            crate::models::BeaconState::Capella { .. } => ForkName::Capella,
-            crate::models::BeaconState::Deneb { .. } => ForkName::Deneb,
-            crate::models::BeaconState::Electra { .. } => ForkName::Electra,
-            crate::models::BeaconState::Fulu { .. } => ForkName::Fulu,
+            BeaconState::Base { .. } => ForkName::Base,
+            BeaconState::Altair { .. } => ForkName::Altair,
+            BeaconState::Bellatrix { .. } => ForkName::Bellatrix,
+            BeaconState::Capella { .. } => ForkName::Capella,
+            BeaconState::Deneb { .. } => ForkName::Deneb,
+            BeaconState::Electra { .. } => ForkName::Electra,
+            BeaconState::Fulu { .. } => ForkName::Fulu,
         }
     }
 

@@ -1,4 +1,4 @@
-pub mod models;
+pub mod withdrawal;
 pub mod per_block_processing;
 pub mod error;
 pub mod beacon_state;
@@ -9,8 +9,10 @@ pub mod validators;
 pub mod chain_spec;
 pub mod payload;
 pub mod fork_name;
+pub mod slot_epoch;
 
-pub type Hash256 = alloy_primitives::B256;
+// pub type Hash256 = alloy_primitives::B256;
+pub use tree_hash::Hash256;
 
 
 

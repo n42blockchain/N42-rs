@@ -1,8 +1,8 @@
 use tree_hash::TreeHash;
-use crate::models::{EthSpec, Withdrawals, Withdrawal};
-use crate::beacon_state::{BeaconState,};
+use crate::withdrawal::{EthSpec, Withdrawals, Withdrawal};
+use crate::beacon_state::{BeaconState, Error as BeaconStateError};
 use crate::chain_spec::ChainSpec;
-use crate::error::{BlockProcessingError, Error as BeaconStateError};
+use crate::error::{BlockProcessingError};
 use crate::payload::{AbstractExecPayload, ExecPayload};
 use crate::safe_aitrh::{SafeArith, SafeArithIter};
 

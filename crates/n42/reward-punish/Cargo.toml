@@ -1,0 +1,42 @@
+[package]
+name = "reward-punish"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+exclude.workspace = true
+
+[dependencies]
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[lints]
+workspace = true
+
+
+[time]
+slots_per_epoch = 32
+seconds_per_slot = 12
+inactivity_leak_epochs = 4
+WithdrawalDelay = 356
+
+[rewards]
+base_reward_factor = 0.3
+proposer_weight = 8
+attestation_weights = [14, 26, 14]
+sync_committee_weight = 2
+weight_denominator = 64
+
+[penalties]
+min_slashing_penalty = "1000000000000000000"  # 1 ETH in wei
+slashing_penalty_quotient = 1048576           # 2^20
+inactivity_penalty_quotient = 16777216        # 2^24
+proportional_slashing_multiplier = 3
+
+[economics]
+max_effective_balance = "32000000000000000000" # 32 ETH
+inflation_rate_cap = 0.05                      # 5%
+transaction_fee_percentage = 0.8               # 80%

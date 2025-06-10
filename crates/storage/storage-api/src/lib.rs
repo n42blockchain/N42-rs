@@ -108,3 +108,6 @@ pub use header_sync_gap::HeaderSyncGapProvider;
 
 mod full;
 pub use full::*;
+
+mod validator;
+pub use validator::*;

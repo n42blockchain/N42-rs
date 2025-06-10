@@ -28,7 +28,7 @@ use reth_primitives::{Block, Header, SealedBlock};
 use reth_primitives_traits::{Block as BlockTrait, header::clique_utils::{recover_address, recover_address_generic}};
 use reth_provider::{BlockIdReader, BlockReader, ChainSpecProvider};
 use reth_transaction_pool::TransactionPool;
-use std::collections::HashMap;
+use std::collections::{HashMap, BTreeMap};
 use std::sync::Arc;
 use std::{
     future::Future,
@@ -40,6 +40,8 @@ use tokio::sync::mpsc;
 use tokio::time::{interval_at, sleep, Instant, Interval};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{trace, debug, error, info, warn};
+
+use crate::beacon::{BeaconBlock, BeaconState, Eth1BlockHash};
 
 /// A mining mode for the local dev engine.
 #[derive(Debug)]
@@ -119,6 +121,8 @@ pub struct N42Miner<T: PayloadTypes, Provider, B, Network> {
     num_long_delayed_blocks: u64,
     num_fetched_blocks: u64,
     order_stats: HashMap<u64, bool>,
+    beacon_state: BTreeMap<usize, BeaconState>,
+    beacon_blocks: HashMap<Eth1BlockHash, BeaconBlock>,
 }
 
 const INMEMORY_BLOCKS: u32 = 256;
@@ -177,6 +181,8 @@ where
             order_stats: HashMap::new(),
             new_block_tx,
             new_block_rx,
+            beacon_state: BTreeMap::new(),
+            beacon_blocks: HashMap::new(),
         };
 
         // Spawn the miner

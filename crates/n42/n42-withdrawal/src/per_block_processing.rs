@@ -1,6 +1,6 @@
 use tree_hash::TreeHash;
-use crate::withdrawal::{EthSpec, Withdrawals, Withdrawal};
-use crate::beacon_state::{BeaconState, Error as BeaconStateError};
+use crate::withdrawal::{Withdrawals, Withdrawal};
+use crate::beacon_state::{BeaconState, Error as BeaconStateError, EthSpec};
 use crate::chain_spec::ChainSpec;
 use crate::error::{BlockProcessingError};
 use crate::payload::{AbstractExecPayload, ExecPayload};

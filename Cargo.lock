@@ -381,6 +381,7 @@ dependencies = [
  "derive_arbitrary",
  "derive_more",
  "foldhash",
+ "getrandom 0.2.16",
  "hashbrown 0.15.3",
  "indexmap 2.9.0",
  "itoa",
@@ -5634,9 +5635,10 @@ dependencies = [
 name = "n42-withdrawals"
 version = "1.4.3"
 dependencies = [
- "alloy-primitives 1.1.2",
+ "alloy-primitives 0.8.25",
  "compare_fields_derive",
  "derivative",
+ "ethereum_serde_utils 0.7.0",
  "ethereum_ssz 0.7.1",
  "ethereum_ssz_derive 0.7.1",
  "metastruct",

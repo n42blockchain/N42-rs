@@ -41,7 +41,7 @@ pub trait ExecPayload<E: EthSpec>: Debug + Clone + PartialEq + Hash + TreeHash +
             Encode,
             Decode,
             TreeHash,
-            TestRandom,
+            // TestRandom,
             Derivative,
             arbitrary::Arbitrary
         ),
@@ -78,7 +78,7 @@ pub struct ExecutionPayload<E: EthSpec> {
             Encode,
             Decode,
             TreeHash,
-            TestRandom,
+            // TestRandom,
             Derivative,
             arbitrary::Arbitrary
         ),

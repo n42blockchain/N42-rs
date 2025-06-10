@@ -9,7 +9,7 @@ repository.workspace = true
 exclude.workspace = true
 
 [dependencies]
-alloy-primitives.workspace = true
+alloy-primitives = { version = "0.8", features = ["rlp", "getrandom"] }
 compare_fields_derive = { path = "compare_fields_derive"}
 test_random_derive = { path = "test_random_derive"}
 thiserror = "2.0.6"
@@ -23,6 +23,7 @@ tree_hash = "0.8"
 metastruct = "0.1.0"
 serde = { version = "1.0.219", features = ["derive"] }
 ethereum_ssz = "0.7"
+ethereum_serde_utils = "0.7"
 
 
 
@@ -34,4 +35,5 @@ workspace = true
 
 
 [features]
+default = ["fake_crypto"]
 fake_crypto = []

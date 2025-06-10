@@ -9,7 +9,7 @@ use ssz_derive::{Decode, Encode};
 use tree_hash_derive::TreeHash;
 use metastruct::metastruct;
 use ssz_types::typenum::Unsigned;
-use compare_fields_derive::CompareFields;
+// use compare_fields_derive::CompareFields;
 use test_random_derive::TestRandom;
 use crate::validators::Validator;
 use crate::fork_name::ForkName;
@@ -34,13 +34,113 @@ pub enum Error {
             Encode,
             Decode,
             TreeHash,
-            TestRandom,
-            CompareFields,
+            // TestRandom,
+            // CompareFields,
             arbitrary::Arbitrary,
         ),
         serde(bound = "E: EthSpec", deny_unknown_fields),
         arbitrary(bound = "E: EthSpec"),
         derivative(Clone),
+    ),
+    specific_variant_attributes(
+        Base(metastruct(
+            mappings(
+                map_beacon_state_base_fields(),
+                map_beacon_state_base_tree_list_fields(mutable, fallible, groups(tree_lists)),
+                map_beacon_state_base_tree_list_fields_immutable(groups(tree_lists)),
+            ),
+            bimappings(bimap_beacon_state_base_tree_list_fields(
+                other_type = "BeaconStateBase",
+                self_mutable,
+                fallible,
+                groups(tree_lists)
+            )),
+            num_fields(all()),
+        )),
+        Altair(metastruct(
+            mappings(
+                map_beacon_state_altair_fields(),
+                map_beacon_state_altair_tree_list_fields(mutable, fallible, groups(tree_lists)),
+                map_beacon_state_altair_tree_list_fields_immutable(groups(tree_lists)),
+            ),
+            bimappings(bimap_beacon_state_altair_tree_list_fields(
+                other_type = "BeaconStateAltair",
+                self_mutable,
+                fallible,
+                groups(tree_lists)
+            )),
+            num_fields(all()),
+        )),
+        Bellatrix(metastruct(
+            mappings(
+                map_beacon_state_bellatrix_fields(),
+                map_beacon_state_bellatrix_tree_list_fields(mutable, fallible, groups(tree_lists)),
+                map_beacon_state_bellatrix_tree_list_fields_immutable(groups(tree_lists)),
+            ),
+            bimappings(bimap_beacon_state_bellatrix_tree_list_fields(
+                other_type = "BeaconStateBellatrix",
+                self_mutable,
+                fallible,
+                groups(tree_lists)
+            )),
+            num_fields(all()),
+        )),
+        Capella(metastruct(
+            mappings(
+                map_beacon_state_capella_fields(),
+                map_beacon_state_capella_tree_list_fields(mutable, fallible, groups(tree_lists)),
+                map_beacon_state_capella_tree_list_fields_immutable(groups(tree_lists)),
+            ),
+            bimappings(bimap_beacon_state_capella_tree_list_fields(
+                other_type = "BeaconStateCapella",
+                self_mutable,
+                fallible,
+                groups(tree_lists)
+            )),
+            num_fields(all()),
+        )),
+        Deneb(metastruct(
+            mappings(
+                map_beacon_state_deneb_fields(),
+                map_beacon_state_deneb_tree_list_fields(mutable, fallible, groups(tree_lists)),
+                map_beacon_state_deneb_tree_list_fields_immutable(groups(tree_lists)),
+            ),
+            bimappings(bimap_beacon_state_deneb_tree_list_fields(
+                other_type = "BeaconStateDeneb",
+                self_mutable,
+                fallible,
+                groups(tree_lists)
+            )),
+            num_fields(all()),
+        )),
+        Electra(metastruct(
+            mappings(
+                map_beacon_state_electra_fields(),
+                map_beacon_state_electra_tree_list_fields(mutable, fallible, groups(tree_lists)),
+                map_beacon_state_electra_tree_list_fields_immutable(groups(tree_lists)),
+            ),
+            bimappings(bimap_beacon_state_electra_tree_list_fields(
+                other_type = "BeaconStateElectra",
+                self_mutable,
+                fallible,
+                groups(tree_lists)
+            )),
+            num_fields(all()),
+        )),
+        Fulu(metastruct(
+            mappings(
+                map_beacon_state_fulu_fields(),
+                map_beacon_state_fulu_tree_list_fields(mutable, fallible, groups(tree_lists)),
+                map_beacon_state_fulu_tree_list_fields_immutable(groups(tree_lists)),
+            ),
+            bimappings(bimap_beacon_state_fulu_tree_list_fields(
+                other_type = "BeaconStateFulu",
+                self_mutable,
+                fallible,
+                groups(tree_lists)
+            )),
+            num_fields(all()),
+        ))
     ),
     cast_error(ty = "Error", expr = "Error::IncorrectStateVariant"),
     partial_getter_error(ty = "Error", expr = "Error::IncorrectStateVariant"),
@@ -59,12 +159,12 @@ where
     #[superstruct(getter(copy))]
     #[metastruct(exclude_from(tree_lists))]
     pub slot: Slot,
-    #[compare_fields(as_iter)]
-    #[test_random(default)]
+    // #[compare_fields(as_iter)]
+    // #[test_random(default)]
     pub validators: List<Validator, E::ValidatorRegistryLimit>,
     #[serde(with = "ssz_types::serde_utils::quoted_u64_var_list")]
-    #[compare_fields(as_iter)]
-    #[test_random(default)]
+    // #[compare_fields(as_iter)]
+    // #[test_random(default)]
     pub balances: List<u64, E::ValidatorRegistryLimit>,
 
     // Capella
@@ -77,11 +177,10 @@ where
     #[metastruct(exclude_from(tree_lists))]
     pub next_withdrawal_validator_index: u64,
 
-    #[compare_fields(as_iter)]
-    #[test_random(default)]
+    // #[compare_fields(as_iter)]
+    // #[test_random(default)]
     #[superstruct(only(Electra, Fulu))]
     pub pending_partial_withdrawals: List<PendingPartialWithdrawal, E::PendingPartialWithdrawalsLimit>,
-
 }
 
 impl<E: EthSpec> BeaconState<E> {

@@ -28,7 +28,7 @@ use reth_primitives::{Block, Header, SealedBlock};
 use reth_primitives_traits::{Block as BlockTrait, header::clique_utils::{recover_address, recover_address_generic}};
 use reth_provider::{BlockIdReader, BlockReader, ChainSpecProvider};
 use reth_transaction_pool::TransactionPool;
-use std::collections::{HashMap, BTreeMap};
+use std::collections::{HashMap};
 use std::sync::Arc;
 use std::{
     future::Future,
@@ -41,7 +41,7 @@ use tokio::time::{interval_at, sleep, Instant, Interval};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{trace, debug, error, info, warn};
 
-use crate::beacon::{BeaconBlock, BeaconState, Eth1BlockHash};
+use crate::beacon::{Beacon, Eth1BlockHash, BeaconBlock};
 
 /// A mining mode for the local dev engine.
 #[derive(Debug)]
@@ -114,6 +114,8 @@ pub struct N42Miner<T: PayloadTypes, Provider, B, Network> {
     recent_num_to_td: schnellru::LruMap<u64, U256>,
     new_block_tx: mpsc::Sender<(NewBlock, BlockHash)>,
     new_block_rx: mpsc::Receiver<(NewBlock, BlockHash)>,
+    beacon: Beacon,
+    beacon_blocks: schnellru::LruMap<Eth1BlockHash, BeaconBlock>,
 
     num_generated_blocks: u64,
     num_skipped_new_block: u64,
@@ -121,11 +123,10 @@ pub struct N42Miner<T: PayloadTypes, Provider, B, Network> {
     num_long_delayed_blocks: u64,
     num_fetched_blocks: u64,
     order_stats: HashMap<u64, bool>,
-    beacon_state: BTreeMap<usize, BeaconState>,
-    beacon_blocks: HashMap<Eth1BlockHash, BeaconBlock>,
 }
 
 const INMEMORY_BLOCKS: u32 = 256;
+const INMEMORY_BEACON_BLOCKS: u32 = 256;
 const NUM_NUM_TO_TD: u32 = 256;
 const WAIT_FOR_PEERS_INTERVAL_SECS: u64 = 5;
 const WAIT_FOR_DOWNLOAD_INTERVAL_MS: u64 = 100;
@@ -181,8 +182,8 @@ where
             order_stats: HashMap::new(),
             new_block_tx,
             new_block_rx,
-            beacon_state: BTreeMap::new(),
-            beacon_blocks: HashMap::new(),
+            beacon: Beacon::new(),
+            beacon_blocks: schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_BEACON_BLOCKS)),
         };
 
         // Spawn the miner
@@ -395,6 +396,9 @@ where
                         break;
                     }
                 }
+
+                let new_beacon_block = self.beacon_blocks.get(&Eth1BlockHash(parent.hash())).unwrap();
+                self.beacon.state_transition(Eth1BlockHash(parent.parent_hash), &new_beacon_block)?;
             }
 
             if new_payload_ok {
@@ -640,6 +644,7 @@ where
         let max_td = self.consensus.total_difficulty(block.header().hash_slow());
         debug!(target: "consensus-client", ?max_td, "advance: new_block hash {:?}", block.header().hash_slow());
         trace!(target: "consensus-client", ?block);
+        let beacon_block = self.beacon.gen_beacon_block(block);
 
         self.recent_blocks.insert(block.hash_slow(), block.clone());
 
@@ -658,6 +663,9 @@ where
         let block_hash = block.hash_slow();
         tokio::spawn(async move {
             sleep(wiggle).await;
+
+            // TODO: broadcast beacon block
+
             new_block_tx
                 .send((
                     NewBlock {

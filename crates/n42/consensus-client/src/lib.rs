@@ -2,3 +2,4 @@
 
 pub mod miner;
 pub mod beacon;
+pub mod network;

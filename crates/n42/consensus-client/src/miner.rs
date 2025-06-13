@@ -13,6 +13,7 @@ use futures_util::{stream::Fuse, StreamExt};
 use itertools::Itertools;
 use reth_engine_primitives::BeaconConsensusEngineHandle;
 use reth_chainspec::EthereumHardforks;
+use reth_chainspec::EthChainSpec;
 use reth_consensus::{FullConsensus, ConsensusError};
 use reth_payload_primitives::{EngineApiMessageVersion};
 use reth_eth_wire_types::{NewBlock, NetworkPrimitives};
@@ -42,6 +43,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{trace, debug, error, info, warn};
 
 use crate::beacon::{Beacon, Eth1BlockHash, BeaconBlock};
+use crate::network::{fetch_beacon_block, broadcast_beacon_block};
 
 /// A mining mode for the local dev engine.
 #[derive(Debug)]
@@ -164,6 +166,7 @@ where
         consensus: Arc<dyn FullConsensus<<T::BuiltPayload as BuiltPayload>::Primitives, Error = ConsensusError>>,
     ) {
         let (new_block_tx, new_block_rx) = mpsc::channel::<(NewBlock, BlockHash)>(128);
+        let genesis_hash = provider.chain_spec().genesis_hash().clone();
         let miner = Self {
             provider,
             payload_attributes_builder,
@@ -182,7 +185,7 @@ where
             order_stats: HashMap::new(),
             new_block_tx,
             new_block_rx,
-            beacon: Beacon::new(),
+            beacon: Beacon::new(genesis_hash),
             beacon_blocks: schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_BEACON_BLOCKS)),
         };
 
@@ -397,7 +400,8 @@ where
                     }
                 }
 
-                let new_beacon_block = self.beacon_blocks.get(&Eth1BlockHash(parent.hash())).unwrap();
+                //let new_beacon_block = self.beacon_blocks.get(&Eth1BlockHash(parent.hash())).unwrap();
+                let new_beacon_block = fetch_beacon_block(parent.hash()).unwrap();
                 self.beacon.state_transition(Eth1BlockHash(parent.parent_hash), &new_beacon_block)?;
             }
 
@@ -644,7 +648,14 @@ where
         let max_td = self.consensus.total_difficulty(block.header().hash_slow());
         debug!(target: "consensus-client", ?max_td, "advance: new_block hash {:?}", block.header().hash_slow());
         trace!(target: "consensus-client", ?block);
-        let beacon_block = self.beacon.gen_beacon_block(block);
+        let parent_beacon_block_hash = if block.number == 1 {
+            self.provider.chain_spec().genesis_hash()
+        } else {
+            fetch_beacon_block(block.header().parent_hash).unwrap().hash_slow()
+        };
+        let attestations = Default::default();
+        let voluntary_exits = Default::default();
+        let beacon_block = self.beacon.gen_beacon_block(parent_beacon_block_hash, &attestations, &voluntary_exits, block)?;
 
         self.recent_blocks.insert(block.hash_slow(), block.clone());
 
@@ -665,6 +676,7 @@ where
             sleep(wiggle).await;
 
             // TODO: broadcast beacon block
+            broadcast_beacon_block(block_hash, &beacon_block).unwrap();
 
             new_block_tx
                 .send((

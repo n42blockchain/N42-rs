@@ -35,7 +35,7 @@ use reth_stages_types::StageCheckpoint;
 use reth_trie_common::{BranchNodeCompact, StorageTrieEntry, StoredNibbles, StoredNibblesSubKey};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use n42_primitives::Snapshot;
+use n42_primitives::{BeaconBlock, BeaconBlockBeforeBlock,BeaconState, BeaconStateBeforeBlock, Snapshot, Validator, ValidatorBeforeTx};
 
 /// Enum for the types of tables present in libmdbx.
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -301,6 +301,61 @@ macro_rules! tables {
 }
 
 tables! {
+    ///
+    table PlainBeaconState{
+        type Key = BlockHash;
+        type Value = BeaconState;
+    }
+
+    ///
+    table BeaconStateHistory{
+        type Key = ShardedKey<BlockHash>;
+        type Value = BlockNumberList;
+    }
+
+    ///
+    table BeaconStateChangesets{
+        type Key = BlockHash;
+        type Value = BeaconStateBeforeBlock;
+    }
+
+    ///
+    table PlainBeaconBlock{
+        type Key = BlockHash;
+        type Value = BeaconBlock;
+    }
+
+    ///
+    table BeaconBlockHistory{
+        type Key = ShardedKey<BlockHash>;
+        type Value = BlockNumberList;
+    }
+
+    ///
+    table BeaconBlockChangesets{
+        type Key = BlockHash;
+        type Value = BeaconBlockBeforeBlock;
+    }
+
+    /// current
+    table PlainValidatorState{
+        type Key = Address;
+        type Value = Validator;
+    }
+
+    /// history
+    table ValidatorsHistory{
+        type Key = ShardedKey<Address>;
+        type Value = BlockNumberList;
+    }
+
+    /// changesets
+    table ValidatorChangeSets{
+        type Key = BlockNumber;
+        type Value = ValidatorBeforeTx;
+        type SubKey = Address;
+    }
+
     /// apos snapshot
     table Snapshots {
         type Key = BlockNumber;

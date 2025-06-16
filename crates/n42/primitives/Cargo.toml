@@ -10,6 +10,8 @@ exclude.workspace = true
 
 [dependencies]
 serde_json.workspace=true
+parity-scale-codec.workspace=true
+eyre.workspace=true
 #reth
 reth-primitives = { workspace = true, default-features = false, features = ["std","arbitrary"] }
 reth-primitives-traits.workspace = true

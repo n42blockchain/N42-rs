@@ -49,7 +49,7 @@ members = [
     "crates/n42/n42-withdrawal/test_random_derive",
     "crates/revm",
     "crates/n42/mobile",
-    "crates/evm/evm",
+    # "crates/evm/evm",
 #    "bin/reth/",
 ]
 default-members = ["bin/n42"]
@@ -626,7 +626,7 @@ reth-network-peers = { path = "crates/net/peers"}
 #reth-testing-utils={path="testing/testing-utils"}
 #reth-chain-state = { path = "crates/chain-state"}
 reth-revm={path = "crates/revm"}
-reth-evm={path="crates/evm/evm"}
+# reth-evm={path="crates/evm/evm"}
 
 [patch.crates-io]
 #alloy-genesis = { path = "./crates/n42/alloy-genesis" }

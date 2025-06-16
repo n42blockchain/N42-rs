@@ -5188,9 +5188,7 @@ dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",
  "hashbrown 0.15.3",
- "indexmap 2.9.0",
  "metrics",
- "ordered-float",
  "quanta",
  "rand 0.9.1",
  "rand_xoshiro",
@@ -5963,15 +5961,6 @@ name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
-
-[[package]]
-name = "ordered-float"
-version = "4.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7bb71e1b3fa6ca1c61f383464aaf2bb0e2f8e772a1f01d486832464de363b951"
-dependencies = [
- "num-traits",
-]
 
 [[package]]
 name = "overload"
@@ -7968,6 +7957,7 @@ dependencies = [
 [[package]]
 name = "reth-evm"
 version = "1.4.3"
+source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.4.3#fe3653ffe602d4e85ad213e8bd9f06e7b710c0c5"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7977,9 +7967,6 @@ dependencies = [
  "derive_more",
  "futures-util",
  "metrics",
- "metrics-util",
- "reth-ethereum-forks",
- "reth-ethereum-primitives",
  "reth-execution-errors",
  "reth-execution-types",
  "reth-metrics",

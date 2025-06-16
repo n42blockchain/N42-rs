@@ -2,7 +2,7 @@ use reth_revm::cached::CachedReads;
 use serde::{Deserialize, Serialize};
 use reth_primitives::BlockBody;
 use alloy_primitives::U256;
-#[derive(Clone,Default,Deserialize,Serialize)]
+#[derive(Clone,Default,Deserialize,Serialize,Debug)]
 pub struct UnverifiedBlock{
     pub blockbody:BlockBody,
     pub db:CachedReads,

@@ -16,6 +16,17 @@ lazy_static.workspace=true
 reth-provider.workspace=true
 reth-chainspec.workspace=true
 reth-evm.workspace=true
+reth-evm-ethereum.workspace=true
+alloy-consensus.workspace=true
+revm-primitives.workspace=true
+reth-primitives.workspace=true
+alloy-eips.workspace=true
+reth-consensus.workspace=true
+reth-ethereum-consensus.workspace=true
+alloy-primitives.workspace=true
+tokio.workspace=true
+reth-primitives-traits.workspace=true
+reth-ethereum-primitives.workspace=true
 
 [lints]
 workspace = true

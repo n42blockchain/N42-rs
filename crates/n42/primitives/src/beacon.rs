@@ -34,7 +34,7 @@ impl Beacon {
     }
 }
 
-#[derive(Debug, Clone, Hash, Default,Serialize,Deserialize)]
+#[derive(Debug, Clone, Hash, Default,Serialize,Deserialize,PartialEq)]
 pub struct BeaconState {
     slot: u64,
     eth1_deposit_index: u64,
@@ -42,7 +42,7 @@ pub struct BeaconState {
     balances: BTreeMap<usize, Gwei>,
 }
 
-#[derive(Serialize,Deserialize,Debug)]
+#[derive(Serialize,Deserialize,Debug,PartialEq)]
 pub struct  BeaconStateBeforeBlock{
     pub address: BlockHash,
     pub info: Option<BeaconState>,
@@ -72,36 +72,36 @@ type BLSSignature = u64;
 //     withdrawable_epoch: Epoch,  // When validator can withdraw funds
 // }
 
-#[derive(Debug, Clone, Hash, Default,Serialize,Deserialize)]
+#[derive(Debug, Clone, Hash, Default,Serialize,Deserialize,PartialEq)]
 pub struct BeaconBlock {
     pub eth1_block_hash: BlockHash,
     pub state_root: B256,
     pub body: BeaconBlockBody,
 }
 
-#[derive(Debug,Serialize,Deserialize)]
+#[derive(Debug,Serialize,Deserialize,PartialEq)]
 pub struct  BeaconBlockBeforeBlock{
     pub address: BlockHash,
     pub info: Option<BeaconBlock>,
 }
 
-#[derive(Debug, Clone, Hash, Default,Serialize,Deserialize)]
+#[derive(Debug, Clone, Hash, Default,Serialize,Deserialize,PartialEq)]
 pub struct BeaconBlockBody {
     attestations: Vec<Attestation>,
     deposits: Vec<Deposit>,
     voluntary_exits: Vec<VoluntaryExit>,
 }
 
-#[derive(Debug, Clone, Hash, Default,Serialize,Deserialize)]
+#[derive(Debug, Clone, Hash, Default,Serialize,Deserialize,PartialEq)]
 pub struct Attestation {}
 
-#[derive(Debug, Clone, Hash, Default,Serialize,Deserialize)]
+#[derive(Debug, Clone, Hash, Default,Serialize,Deserialize,PartialEq)]
 pub struct Deposit {
     proof: Vec<B256>,
     data: DepositData,
 }
 
-#[derive(Debug, Clone, Hash, Default,Serialize,Deserialize)]
+#[derive(Debug, Clone, Hash, Default,Serialize,Deserialize,PartialEq)]
 pub struct DepositData {
     pubkey: BLSPubkey,
     withdrawal_credentials: B256,
@@ -109,7 +109,7 @@ pub struct DepositData {
     signature: BLSSignature,
 }
 
-#[derive(Debug, Clone, Hash, Default,Serialize,Deserialize)]
+#[derive(Debug, Clone, Hash, Default,Serialize,Deserialize,PartialEq)]
 pub struct VoluntaryExit {
     epoch: Epoch,
     validator_index: u64,

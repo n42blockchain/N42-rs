@@ -1,7 +1,7 @@
 #![allow(missing_docs)]
 use serde::{Deserialize, Serialize};
 use alloy_primitives::Address;
-#[derive(Serialize, Debug, Deserialize, Clone, PartialEq)]
+#[derive(Serialize, Debug, Deserialize, Clone, PartialEq,Hash)]
 pub struct Validator {
     pub index: u64,
     pub balance: u64,

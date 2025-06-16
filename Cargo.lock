@@ -5562,6 +5562,7 @@ dependencies = [
  "alloy-primitives 1.1.2",
  "alloy-rlp",
  "bytes",
+ "eyre",
  "parity-scale-codec",
  "reth-codecs",
  "reth-primitives",

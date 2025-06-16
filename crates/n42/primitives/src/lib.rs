@@ -5,3 +5,6 @@ pub use snapshot::*;
 
 mod validator;
 pub use validator::*;
+
+mod beacon;
+pub use beacon::*;

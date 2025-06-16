@@ -233,7 +233,7 @@ impl<TX: DbTxMut + DbTx+'static, N: NodeTypes> ValidatorChangeWriter for Databas
         }
         Ok(())
     }
-    fn take_validator(&mut self, range: RangeInclusive<BlockNumber>) -> ProviderResult<ValidatorChangeset> {
+    fn take_validator(&self, range: RangeInclusive<BlockNumber>) -> ProviderResult<ValidatorChangeset> {
         // let tx = self.tx_mut();
         // let mut cursor=tx.cursor_read::<tables::PlainValidatorState>()?;
         // let mut validators=Vec::new();

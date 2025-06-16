@@ -24,6 +24,7 @@ pub mod sharded_key;
 pub mod storage_sharded_key;
 mod snapshot;
 mod validator;
+mod beacon;
 
 pub use accounts::*;
 pub use blocks::*;

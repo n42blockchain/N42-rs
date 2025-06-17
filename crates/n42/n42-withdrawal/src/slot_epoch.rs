@@ -18,8 +18,9 @@ use std::hash::Hash;
 use alloy_primitives::private::arbitrary;
 
 
-#[cfg(feature = "legacy-arith")]
-use std::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Rem, Sub, SubAssign};
+// #[cfg(feature = "legacy-arith")]
+// use std::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Rem, Sub, SubAssign};
+// use tree_hash::TreeHash;
 
 #[derive(
     arbitrary::Arbitrary, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
@@ -35,15 +36,80 @@ pub struct Slot(#[serde(with = "serde_utils::quoted_u64")] u64);
 #[serde(transparent)]
 pub struct Epoch(#[serde(with = "serde_utils::quoted_u64")] u64);
 
+macro_rules! impl_from_into_u64 {
+    ($main: ident) => {
+        impl From<u64> for $main {
+            fn from(n: u64) -> $main {
+                $main(n)
+            }
+        }
+
+        impl From<$main> for u64 {
+            fn from(from: $main) -> u64 {
+                from.0
+            }
+        }
+
+        impl $main {
+            pub fn as_u64(&self) -> u64 {
+                self.0
+            }
+        }
+    };
+}
+
+macro_rules! impl_from_into_usize {
+    ($main: ident) => {
+        impl From<usize> for $main {
+            fn from(n: usize) -> $main {
+                $main(n as u64)
+            }
+        }
+
+        impl From<$main> for usize {
+            fn from(from: $main) -> usize {
+                from.0 as usize
+            }
+        }
+
+        impl $main {
+            pub fn as_usize(&self) -> usize {
+                self.0 as usize
+            }
+        }
+    };
+}
+
 macro_rules! impl_safe_arith {
     ($type: ident, $rhs_ty: ident) => {
         impl SafeArith<$rhs_ty> for $type {
             const ZERO: Self = $type::new(0);
             const ONE: Self = $type::new(1);
 
+            fn safe_add(&self, other: $rhs_ty) -> Result<Self> {
+                self.0
+                    .checked_add(other.into())
+                    .map(Self::new)
+                    .ok_or(ArithError::Overflow)
+            }
+
+            fn safe_sub(&self, other: $rhs_ty) -> Result<Self> {
+                self.0
+                    .checked_sub(other.into())
+                    .map(Self::new)
+                    .ok_or(ArithError::Overflow)
+            }
+
             fn safe_div(&self, other: $rhs_ty) -> Result<Self> {
                 self.0
                     .checked_div(other.into())
+                    .map(Self::new)
+                    .ok_or(ArithError::DivisionByZero)
+            }
+
+            fn safe_rem(&self, other: $rhs_ty) -> Result<Self> {
+                self.0
+                    .checked_rem(other.into())
                     .map(Self::new)
                     .ok_or(ArithError::DivisionByZero)
             }
@@ -61,11 +127,70 @@ macro_rules! impl_debug {
     };
 }
 
+macro_rules! impl_ssz {
+    ($type: ident) => {
+        impl Encode for $type {
+            fn is_ssz_fixed_len() -> bool {
+                <u64 as Encode>::is_ssz_fixed_len()
+            }
+
+            fn ssz_fixed_len() -> usize {
+                <u64 as Encode>::ssz_fixed_len()
+            }
+
+            fn ssz_bytes_len(&self) -> usize {
+                0_u64.ssz_bytes_len()
+            }
+
+            fn ssz_append(&self, buf: &mut Vec<u8>) {
+                self.0.ssz_append(buf)
+            }
+        }
+
+        impl Decode for $type {
+            fn is_ssz_fixed_len() -> bool {
+                <u64 as Decode>::is_ssz_fixed_len()
+            }
+
+            fn ssz_fixed_len() -> usize {
+                <u64 as Decode>::ssz_fixed_len()
+            }
+
+            fn from_ssz_bytes(bytes: &[u8]) -> core::result::Result<Self, DecodeError> {
+                Ok($type(u64::from_ssz_bytes(bytes)?))
+            }
+        }
+
+        impl tree_hash::TreeHash for $type {
+            fn tree_hash_type() -> tree_hash::TreeHashType {
+                tree_hash::TreeHashType::Basic
+            }
+
+            fn tree_hash_packed_encoding(&self) -> tree_hash::PackedEncoding {
+                self.0.tree_hash_packed_encoding()
+            }
+
+            fn tree_hash_packing_factor() -> usize {
+                32usize.wrapping_div(8)
+            }
+
+            fn tree_hash_root(&self) -> tree_hash::Hash256 {
+                tree_hash::Hash256::from_slice(&int_to_fixed_bytes32(self.0))
+            }
+        }
+
+        // impl SignedRoot for $type {}
+    };
+}
+
 macro_rules! impl_common {
     ($type: ident) => {
+        impl_from_into_u64!($type);
+        impl_from_into_usize!($type);
         impl_safe_arith!($type, $type);
         impl_safe_arith!($type, u64);
         impl_debug!($type);
+        impl_ssz!($type);
     };
 }
 
@@ -91,4 +216,10 @@ impl Epoch {
     }
 }
 
-
+/// Returns `int` as little-endian bytes with a length of 32.
+pub fn int_to_fixed_bytes32(int: u64) -> [u8; 32] {
+    let mut bytes = [0; 32];
+    let int_bytes = int.to_le_bytes();
+    bytes[0..int_bytes.len()].copy_from_slice(&int_bytes);
+    bytes
+}

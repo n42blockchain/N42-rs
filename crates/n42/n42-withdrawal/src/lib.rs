@@ -1,7 +1,12 @@
+#![allow(elided_lifetimes_in_paths)]
+#![allow(missing_docs)]
+
 pub mod withdrawal;
 pub mod per_block_processing;
 pub mod error;
 pub mod beacon_state;
+#[macro_use]
+pub mod macros;
 pub mod crypto;
 pub mod pending_partial_withdrawal;
 pub mod safe_aitrh;

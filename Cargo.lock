@@ -5648,11 +5648,14 @@ name = "n42-withdrawals"
 version = "1.4.3"
 dependencies = [
  "alloy-primitives 0.8.25",
+ "arbitrary",
+ "blst",
  "compare_fields_derive",
  "derivative",
  "ethereum_serde_utils 0.7.0",
  "ethereum_ssz 0.7.1",
  "ethereum_ssz_derive 0.7.1",
+ "hex",
  "metastruct",
  "milhouse",
  "serde",

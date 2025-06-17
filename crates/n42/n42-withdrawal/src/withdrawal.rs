@@ -6,7 +6,7 @@ use std::hash::Hash;
 use serde::{Deserialize, Serialize};
 use ssz_types::VariableList;
 use ssz_derive::{Decode, Encode};
-use tree_hash::TreeHash;
+// use tree_hash::TreeHash;
 use crate::beacon_state::EthSpec;
 
 pub type Withdrawals<E> = VariableList<Withdrawal, <E as EthSpec>::MaxWithdrawalsPerPayload>;

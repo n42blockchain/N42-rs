@@ -1,7 +1,5 @@
-// use crate::test_utils::TestRandom;
 use crate::slot_epoch::Epoch;
 use ssz_derive::{Decode, Encode};
-// use test_random_derive::TestRandom;
 use tree_hash_derive::TreeHash;
 use alloy_primitives::{
     private::{

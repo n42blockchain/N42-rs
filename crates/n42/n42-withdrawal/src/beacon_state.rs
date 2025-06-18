@@ -9,8 +9,6 @@ use ssz_derive::{Decode, Encode};
 use tree_hash_derive::TreeHash;
 use metastruct::metastruct;
 use ssz_types::typenum::Unsigned;
-// use compare_fields_derive::CompareFields;
-// use test_random_derive::TestRandom;
 use crate::validators::Validator;
 use crate::fork_name::ForkName;
 use crate::slot_epoch::{Epoch, Slot};
@@ -227,16 +225,6 @@ impl<E: EthSpec> BeaconState<E> {
             .ok_or(Error::BalancesOutOfBounds(validator_index))
     }
 }
-
-// /// Represents the "Beacon Chain" component of Ethereum 2.0. Allows import of blocks and block
-// /// operations and chooses a canonical head.
-// pub struct BeaconChain<T: BeaconChainTypes> {
-//
-// }
-//
-// pub trait BeaconChainTypes: Send + Sync + 'static {
-//     type EthSpec: EthSpec;
-// }
 
 pub trait EthSpec:
 'static + Default + Sync + Send + Clone + Debug + PartialEq + Eq + for<'a> arbitrary::Arbitrary<'a>

@@ -18,10 +18,6 @@ use std::hash::Hash;
 use alloy_primitives::private::arbitrary;
 
 
-// #[cfg(feature = "legacy-arith")]
-// use std::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Rem, Sub, SubAssign};
-// use tree_hash::TreeHash;
-
 #[derive(
     arbitrary::Arbitrary, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
     Serialize, Deserialize,

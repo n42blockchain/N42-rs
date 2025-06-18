@@ -3,7 +3,7 @@ use serde::de::{Deserialize, Deserializer};
 use serde::ser::{Serialize, Serializer};
 use std::fmt;
 use std::marker::PhantomData;
-use alloy_primitives::private::arbitrary;
+// use alloy_primitives::private::arbitrary;
 use ssz::{Decode, Encode};
 use tree_hash::TreeHash;
 use crate::error::Error;

@@ -2290,14 +2290,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "compare_fields_derive"
-version = "0.2.0"
-dependencies = [
- "quote",
- "syn 1.0.109",
-]
-
-[[package]]
 name = "concat-kdf"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5650,7 +5642,6 @@ dependencies = [
  "alloy-primitives 0.8.25",
  "arbitrary",
  "blst",
- "compare_fields_derive",
  "derivative",
  "ethereum_serde_utils 0.7.0",
  "ethereum_ssz 0.7.1",
@@ -5661,8 +5652,6 @@ dependencies = [
  "serde",
  "ssz_types",
  "superstruct",
- "test_random_derive",
- "thiserror 2.0.12",
  "tree_hash 0.8.0",
  "tree_hash_derive 0.8.0",
 ]
@@ -10889,14 +10878,6 @@ dependencies = [
  "serde",
  "sha1",
  "test-fuzz-internal",
-]
-
-[[package]]
-name = "test_random_derive"
-version = "0.2.0"
-dependencies = [
- "quote",
- "syn 1.0.109",
 ]
 
 [[package]]

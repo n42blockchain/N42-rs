@@ -1,12 +1,13 @@
 //! Contains the implementation of the mining mode for the local engine.
 
-use alloy_primitives::Sealable;
+use alloy_consensus::TxReceipt;
+use alloy_primitives::{Sealable, BlockNumber, Bytes};
 use reth_network_api::{FullNetwork, BlockDownloaderProvider, BlockAnnounceProvider, NetworkEventListenerProvider};
 use reth_ethereum_primitives::{EthPrimitives};
 use reth_primitives::TransactionSigned;
 use reth_primitives_traits::{AlloyBlockHeader, NodePrimitives, BlockBody};
 use alloy_eips::{BlockHashOrNumber, BlockNumHash};
-use alloy_primitives::{Address, BlockHash, TxHash, B256, U128, U256};
+use alloy_primitives::{keccak256, Address, BlockHash, TxHash, B256, U128, U256};
 use alloy_rpc_types_engine::{CancunPayloadFields, ExecutionPayloadSidecar, ForkchoiceState};
 use eyre::OptionExt;
 use futures_util::{stream::Fuse, StreamExt};
@@ -42,7 +43,7 @@ use tokio::time::{interval_at, sleep, Instant, Interval};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{trace, debug, error, info, warn};
 
-use crate::beacon::{Beacon, Eth1BlockHash, BeaconBlock};
+use crate::beacon::{Beacon, Eth1BlockHash, BeaconBlock, Deposit, parse_deposit_log};
 use crate::network::{fetch_beacon_block, broadcast_beacon_block};
 
 /// A mining mode for the local dev engine.
@@ -127,6 +128,7 @@ pub struct N42Miner<T: PayloadTypes, Provider, B, Network> {
     order_stats: HashMap<u64, bool>,
 }
 
+const DEPOSIT_GAP: u64 = 6;
 const INMEMORY_BLOCKS: u32 = 256;
 const INMEMORY_BEACON_BLOCKS: u32 = 256;
 const NUM_NUM_TO_TD: u32 = 256;
@@ -653,9 +655,10 @@ where
         } else {
             fetch_beacon_block(block.header().parent_hash).unwrap().hash_slow()
         };
+        let deposits = self.get_deposits(block.number.saturating_sub(DEPOSIT_GAP))?;
         let attestations = Default::default();
         let voluntary_exits = Default::default();
-        let beacon_block = self.beacon.gen_beacon_block(parent_beacon_block_hash, &attestations, &voluntary_exits, block)?;
+        let beacon_block = self.beacon.gen_beacon_block(parent_beacon_block_hash, &deposits, &attestations, &voluntary_exits, block)?;
 
         self.recent_blocks.insert(block.hash_slow(), block.clone());
 
@@ -959,6 +962,26 @@ where
             Ok(false)
         }
     }
+
+    fn get_deposits(&self, block_number: BlockNumber) -> eyre::Result<Vec<Deposit>> {
+        let mut deposits = Vec::new();
+        debug!(target: "consensus-client", ?block_number, "get_deposits");
+        if let Some(receipts) = self.provider.receipts_by_block(block_number.into())? {
+            for receipt in &receipts {
+                for log in receipt.logs() {
+                    debug!(target: "consensus-client", ?log);
+                    if let Some(deposit_event) = parse_deposit_log(&log) {
+                        debug!(target: "consensus-client", ?deposit_event);
+                        let mut deposit: Deposit = Default::default();
+                        deposit.data.amount = u64::from_le_bytes(deposit_event.amount.as_ref().try_into().unwrap());
+                        deposits.push(deposit);
+                    }
+                }
+            }
+        }
+        Ok(deposits)
+    }
+
 }
 
 fn exit_by_sigint() {

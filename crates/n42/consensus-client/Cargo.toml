@@ -57,6 +57,7 @@ eyre.workspace = true
 tracing.workspace = true
 schnellru.workspace = true
 itertools.workspace = true
+alloy-sol-types.workspace = true
 
 op-alloy-rpc-types-engine = { workspace = true, optional = true }
 

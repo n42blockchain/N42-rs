@@ -1,15 +1,28 @@
 use reth_primitives::{Block, Header, SealedBlock};
 
+use alloy_sol_types::{SolEnum, SolEvent, sol};
 use serde::{Deserialize, Serialize};
 use alloy_primitives::Sealable;
 use alloy_rlp::{Encodable, RlpEncodable,  RlpDecodable};
 use std::collections::{HashMap, BTreeMap};
-use alloy_primitives::{keccak256, BlockHash, B256};
+use alloy_primitives::{keccak256, BlockHash, B256, Log};
 use tracing::{trace, debug, error, info, warn};
 
 const INMEMORY_BEACON_STATES: u32 = 256;
 
 const SLOTS_PER_EPOCH: u64 = 32;
+
+/// Solidity-style struct for the DepositEvent
+sol! {
+    #[derive(Debug)]
+    event DepositEvent (
+        bytes pubkey,
+        bytes withdrawal_credentials,
+        bytes amount,
+        bytes signature,
+        bytes index,
+    );
+}
 
 #[derive(Debug)]
 pub struct Beacon {
@@ -32,13 +45,12 @@ impl Beacon {
         Ok(Default::default())
     }
 
-    pub fn gen_beacon_block(&mut self, parent_hash: BlockHash, attestations: &Vec<Attestation>, voluntary_exits: &Vec<VoluntaryExit>, eth1_sealed_block: &SealedBlock) -> eyre::Result<BeaconBlock> {
-        let deposits = Beacon::get_deposits_from_eth1_sealed_block(eth1_sealed_block)?;
+    pub fn gen_beacon_block(&mut self, parent_hash: BlockHash, deposits: &Vec<Deposit>, attestations: &Vec<Attestation>, voluntary_exits: &Vec<VoluntaryExit>, eth1_sealed_block: &SealedBlock) -> eyre::Result<BeaconBlock> {
         let mut beacon_block = BeaconBlock {
             parent_hash,
             eth1_block_hash: eth1_sealed_block.hash_slow(),
             body: BeaconBlockBody {
-                deposits,
+                deposits: deposits.clone(),
                 attestations: attestations.clone(),
                 voluntary_exits: voluntary_exits.clone(),
             },
@@ -127,22 +139,43 @@ pub struct Attestation {}
 
 #[derive(Debug, Clone, Hash, Default, RlpEncodable, RlpDecodable,  Serialize, Deserialize)]
 pub struct Deposit {
-    proof: Vec<B256>,
-    data: DepositData,
+    pub proof: Vec<B256>,
+    pub data: DepositData,
 }
 
 #[derive(Debug, Clone, Hash, Default, RlpEncodable, RlpDecodable,  Serialize, Deserialize)]
 pub struct DepositData {
-    pubkey: BLSPubkey,
-    withdrawal_credentials: B256,
-    amount: Gwei,
-    signature: BLSSignature,
+    pub pubkey: BLSPubkey,
+    pub withdrawal_credentials: B256,
+    pub amount: Gwei,
+    pub signature: BLSSignature,
 }
 
 #[derive(Debug, Clone, Hash, Default, RlpEncodable, RlpDecodable,  Serialize, Deserialize)]
 pub struct VoluntaryExit {
     epoch: Epoch,
     validator_index: u64,
+}
+
+pub fn parse_deposit_log(log: &Log) -> Option<DepositEvent> {
+    let deposit_event_sig = b"DepositEvent(bytes,bytes,bytes,bytes,bytes)";
+    let deposit_topic: B256 = keccak256(deposit_event_sig).into();
+    debug!(target: "consensus-client", ?deposit_topic, "parse_deposit_log");
+    if let Some(&topic) = log.topics().get(0) {
+        if topic == deposit_topic {
+            match DepositEvent::decode_log(&log) {
+                Ok(v) => Some(v.data),
+                Err(err) => {
+                    error!(target: "consensus-client", ?err, "parse_deposit_log failed");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    }
 }
 
 impl BeaconState {

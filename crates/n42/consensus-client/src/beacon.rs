@@ -10,6 +10,7 @@ use tracing::{trace, debug, error, info, warn};
 
 const INMEMORY_BEACON_STATES: u32 = 256;
 
+const REWARD_AMOUNT: u64 = 1;
 const SLOTS_PER_EPOCH: u64 = 32;
 
 /// Solidity-style struct for the DepositEvent
@@ -135,7 +136,9 @@ pub struct BeaconBlockBody {
 }
 
 #[derive(Debug, Clone, Hash, Default, RlpEncodable, RlpDecodable,  Serialize, Deserialize)]
-pub struct Attestation {}
+pub struct Attestation {
+    pub credentials: B256,
+}
 
 #[derive(Debug, Clone, Hash, Default, RlpEncodable, RlpDecodable,  Serialize, Deserialize)]
 pub struct Deposit {
@@ -153,8 +156,8 @@ pub struct DepositData {
 
 #[derive(Debug, Clone, Hash, Default, RlpEncodable, RlpDecodable,  Serialize, Deserialize)]
 pub struct VoluntaryExit {
-    epoch: Epoch,
-    validator_index: u64,
+    pub epoch: Epoch,
+    pub validator_index: u64,
 }
 
 pub fn parse_deposit_log(log: &Log) -> Option<DepositEvent> {
@@ -205,34 +208,89 @@ impl BeaconState {
         Ok(())
     }
 
-    pub fn process_block(&self, beacon_block: &BeaconBlock) -> eyre::Result<()> {
+    pub fn process_block(&mut self, beacon_block: &BeaconBlock) -> eyre::Result<()> {
         self.process_operations(&beacon_block.body)?;
         Ok(())
     }
 
-    pub fn process_operations(&self, beacon_block_body: &BeaconBlockBody) -> eyre::Result<()> {
-        self.process_deposit(beacon_block_body)?;
-        self.process_attestation(beacon_block_body)?;
-        self.process_voluntary_exit(beacon_block_body)?;
+    pub fn process_operations(&mut self, beacon_block_body: &BeaconBlockBody) -> eyre::Result<()> {
+        self.process_deposit(&beacon_block_body.deposits)?;
+        self.process_attestation(&beacon_block_body.attestations)?;
+        self.process_voluntary_exit(&beacon_block_body.voluntary_exits)?;
 
         Ok(())
     }
 
-    pub fn process_deposit(&self, beacon_block_body: &BeaconBlockBody) -> eyre::Result<()> {
+    pub fn process_deposit(&mut self, deposits: &Vec<Deposit>) -> eyre::Result<()> {
         // TODO: check deposits against eth1 block and beacon state
         // TODO: update state
+        for deposit in deposits {
+            let _ = self.process_one_deposit(deposit);
+        }
         Ok(())
     }
 
-    pub fn process_attestation(&self, beacon_block_body: &BeaconBlockBody) -> eyre::Result<()> {
+    pub fn process_one_deposit(&mut self, deposit: &Deposit) -> eyre::Result<()> {
+        let mut updated = false;
+        for (index, validator) in self.validators.iter_mut().enumerate() {
+            if validator.withdrawal_credentials == deposit.data.withdrawal_credentials {
+                validator.effective_balance += deposit.data.amount;
+                self.balances[index] += deposit.data.amount;
+                updated = true;
+            }
+        }
+
+        if !updated {
+            let validator = Validator {
+                withdrawal_credentials: deposit.data.withdrawal_credentials,
+                effective_balance: deposit.data.amount,
+                activation_epoch: self.slot % SLOTS_PER_EPOCH + 1,
+                ..Default::default()
+            };
+            self.validators.push(validator);
+            self.balances.push(deposit.data.amount);
+        }
+
+        Ok(())
+    }
+
+    pub fn process_attestation(&mut self, attestations: &Vec<Attestation>) -> eyre::Result<()> {
         // TODO: check attestations against beacon state
         // TODO: update state
+        for attestation in attestations {
+            let _ = self.process_one_attestation(attestation);
+        }
+
         Ok(())
     }
 
-    pub fn process_voluntary_exit(&self, beacon_block_body: &BeaconBlockBody) -> eyre::Result<()> {
+    pub fn process_one_attestation(&mut self, attestation: &Attestation) -> eyre::Result<()> {
+        for (index, validator) in self.validators.iter_mut().enumerate() {
+            if validator.withdrawal_credentials == attestation.credentials {
+                validator.effective_balance += REWARD_AMOUNT;
+                self.balances[index] += REWARD_AMOUNT;
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn process_voluntary_exit(&mut self, voluntary_exits: &Vec<VoluntaryExit>) -> eyre::Result<()> {
         // TODO: check voluntary exits against beacon state
         // TODO: update state
+        Ok(())
+    }
+
+    pub fn process_one_voluntary_exit(&mut self, voluntary_exit: &VoluntaryExit) -> eyre::Result<()> {
+        let validator_index: usize = voluntary_exit.validator_index as usize;
+        if validator_index >= self.validators.len() {
+            return Ok(());
+        }
+        if self.validators[validator_index].withdrawable_epoch != 0 {
+        self.validators[validator_index].withdrawable_epoch = self.slot % SLOTS_PER_EPOCH + 1;
+        }
+
         Ok(())
     }
 

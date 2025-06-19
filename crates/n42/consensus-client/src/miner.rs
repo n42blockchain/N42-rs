@@ -1,5 +1,6 @@
 //! Contains the implementation of the mining mode for the local engine.
 
+use std::str::FromStr;
 use alloy_consensus::TxReceipt;
 use alloy_primitives::{Sealable, BlockNumber, Bytes};
 use reth_network_api::{FullNetwork, BlockDownloaderProvider, BlockAnnounceProvider, NetworkEventListenerProvider};
@@ -43,7 +44,7 @@ use tokio::time::{interval_at, sleep, Instant, Interval};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{trace, debug, error, info, warn};
 
-use crate::beacon::{Beacon, Eth1BlockHash, BeaconBlock, Deposit, parse_deposit_log};
+use crate::beacon::{Beacon, Eth1BlockHash, BeaconBlock, Deposit, parse_deposit_log, Attestation, VoluntaryExit, };
 use crate::network::{fetch_beacon_block, broadcast_beacon_block};
 
 /// A mining mode for the local dev engine.
@@ -656,8 +657,16 @@ where
             fetch_beacon_block(block.header().parent_hash).unwrap().hash_slow()
         };
         let deposits = self.get_deposits(block.number.saturating_sub(DEPOSIT_GAP))?;
-        let attestations = Default::default();
-        let voluntary_exits = Default::default();
+        let attestations = vec![
+            Attestation { credentials: B256::from_str("0x010000000000000000000000a0ee7a142d267c1f36714e4a8f75612f20a79720").unwrap()},
+            Attestation { credentials: B256::ZERO, },
+        ];
+        let voluntary_exits = vec![
+            VoluntaryExit {
+                epoch: 2,
+                validator_index: 0,
+            },
+        ];
         let beacon_block = self.beacon.gen_beacon_block(parent_beacon_block_hash, &deposits, &attestations, &voluntary_exits, block)?;
 
         self.recent_blocks.insert(block.hash_slow(), block.clone());

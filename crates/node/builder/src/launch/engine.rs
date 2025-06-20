@@ -88,6 +88,7 @@ where
     N42PayloadAttributesBuilder<Types::ChainSpec>: PayloadAttributesBuilder<
         <<Types as NodeTypes>::Payload as PayloadTypes>::PayloadAttributes,
     >,
+    <Types as NodeTypes>::Payload: PayloadTypes<PayloadAttributes = alloy_rpc_types_engine::PayloadAttributes>,
     <<CB as NodeComponentsBuilder<T>>::Components as NodeComponents<T>>::Network: BlockAnnounceProvider<Block = reth_ethereum_primitives::Block>,
 {
     type Node = NodeHandle<NodeAdapter<T, CB::Components>, AO>;

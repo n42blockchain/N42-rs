@@ -1,5 +1,6 @@
 //! Contains the implementation of the mining mode for the local engine.
 
+use n42_engine_primitives::{PayloadAttributesBuilderExt};
 use std::str::FromStr;
 use alloy_consensus::TxReceipt;
 use alloy_primitives::{Sealable, BlockNumber, Bytes};
@@ -150,7 +151,7 @@ where
         + BlockIdReader
         + ChainSpecProvider<ChainSpec: EthereumHardforks>
         + 'static,
-    B: PayloadAttributesBuilder<<T as PayloadTypes>::PayloadAttributes>,
+    B: PayloadAttributesBuilderExt<<T as PayloadTypes>::PayloadAttributes>,
     Network: FullNetwork,
     Network: BlockAnnounceProvider<Block = Block<TransactionSigned>>,
     <<Network as BlockDownloaderProvider>::Client as BlockClient>::Block: reth_primitives_traits::Block<Header = reth_primitives_traits::Header>,
@@ -405,6 +406,7 @@ where
 
                 //let new_beacon_block = self.beacon_blocks.get(&Eth1BlockHash(parent.hash())).unwrap();
                 let new_beacon_block = fetch_beacon_block(parent.hash()).unwrap();
+                let _ = self.beacon.gen_withdrawals(Eth1BlockHash(parent.parent_hash));
                 self.beacon.state_transition(Eth1BlockHash(parent.parent_hash), &new_beacon_block)?;
             }
 
@@ -613,12 +615,16 @@ where
         let timestamp = now;
         debug!(target: "consensus-client", ?timestamp, "advance: PayloadAttributes timestamp");
 
+        let withdrawals = self.beacon.gen_withdrawals(Eth1BlockHash(header.hash()));
+        debug!(target: "consensus-client", ?withdrawals, "advance: PayloadAttributes withdrawals");
+
         let forkchoice_state = self.forkchoice_state();
+        let payload_attributes = self.payload_attributes_builder.build_ext(timestamp.as_secs(), withdrawals);
         let res = self
             .beacon_engine_handle
             .fork_choice_updated(
                 forkchoice_state,
-                Some(self.payload_attributes_builder.build(timestamp.as_secs())),
+                Some(payload_attributes),
                 EngineApiMessageVersion::default(),
             )
             .await?;
@@ -983,6 +989,7 @@ where
                         debug!(target: "consensus-client", ?deposit_event);
                         let mut deposit: Deposit = Default::default();
                         deposit.data.amount = u64::from_le_bytes(deposit_event.amount.as_ref().try_into().unwrap());
+                        deposit.data.withdrawal_credentials = B256::from_slice(&deposit_event.withdrawal_credentials);
                         deposits.push(deposit);
                     }
                 }

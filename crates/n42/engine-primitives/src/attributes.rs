@@ -5,6 +5,9 @@ use reth_chainspec::EthereumHardforks;
 use reth_ethereum_engine_primitives::EthPayloadAttributes;
 use reth_payload_primitives::PayloadAttributesBuilder;
 use std::sync::Arc;
+use alloy_eips::{
+    eip4895::{Withdrawal, Withdrawals},
+};
 
 /// The attributes builder for N42 Ethereum payload.
 #[derive(Debug)]
@@ -48,3 +51,19 @@ where
     }
 }
 
+pub trait PayloadAttributesBuilderExt<Attributes>: PayloadAttributesBuilder<Attributes> + Send + Sync + 'static {
+    fn build_ext(&self, timestamp: u64, withdrawals: Option<Vec<Withdrawal>>) -> Attributes;
+}
+
+impl<ChainSpec> PayloadAttributesBuilderExt<EthPayloadAttributes>
+    for N42PayloadAttributesBuilder<ChainSpec>
+where
+    ChainSpec: Send + Sync + EthereumHardforks + 'static,
+{
+    fn build_ext(&self, timestamp: u64, withdrawals: Option<Vec<Withdrawal>>) -> EthPayloadAttributes {
+        let mut payload_attributes = self.build(timestamp);
+        payload_attributes.withdrawals = withdrawals;
+
+        payload_attributes
+    }
+}

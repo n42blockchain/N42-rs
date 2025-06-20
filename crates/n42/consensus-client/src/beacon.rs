@@ -1,5 +1,9 @@
 use reth_primitives::{Block, Header, SealedBlock};
 
+use alloy_eips::{
+    eip4895::{Withdrawal, Withdrawals},
+};
+use alloy_primitives::{Address};
 use alloy_sol_types::{SolEnum, SolEvent, sol};
 use serde::{Deserialize, Serialize};
 use alloy_primitives::Sealable;
@@ -10,6 +14,7 @@ use tracing::{trace, debug, error, info, warn};
 
 const INMEMORY_BEACON_STATES: u32 = 256;
 
+const STAKING_AMOUNT: u64 = 32000000000;
 const REWARD_AMOUNT: u64 = 1;
 const SLOTS_PER_EPOCH: u64 = 32;
 
@@ -42,10 +47,6 @@ impl Beacon {
         beacon
     }
 
-    fn get_deposits_from_eth1_sealed_block(eth1_sealed_block: &SealedBlock) -> eyre::Result<Vec<Deposit>> {
-        Ok(Default::default())
-    }
-
     pub fn gen_beacon_block(&mut self, parent_hash: BlockHash, deposits: &Vec<Deposit>, attestations: &Vec<Attestation>, voluntary_exits: &Vec<VoluntaryExit>, eth1_sealed_block: &SealedBlock) -> eyre::Result<BeaconBlock> {
         let mut beacon_block = BeaconBlock {
             parent_hash,
@@ -67,9 +68,52 @@ impl Beacon {
         let beacon_state = self.beacon_states.get(&parent_eth1_block_hash).unwrap();
         let new_beacon_state = BeaconState::state_transition(beacon_state, beacon_block)?;
         self.beacon_states.insert(Eth1BlockHash(beacon_block.eth1_block_hash), new_beacon_state.clone());
+        debug!(target: "consensus-client", ?new_beacon_state, "state_transition");
 
         Ok(new_beacon_state)
     }
+
+    pub fn gen_withdrawals(&mut self, eth1_block_hash: Eth1BlockHash) -> Option<Vec<Withdrawal>> {
+        let mut withdrawals = Vec::new();
+        if let Some(mut beacon_state) = self.beacon_states.get(&eth1_block_hash) {
+            if (beacon_state.slot + 1) % SLOTS_PER_EPOCH == 0 {
+                for (index, validator) in beacon_state.validators.iter_mut().enumerate() {
+                    let epoch = beacon_state.slot / SLOTS_PER_EPOCH;
+                    if epoch >= validator.activation_epoch && (validator.exit_epoch == 0 || epoch < validator.exit_epoch) {
+                        if beacon_state.balances[index] > STAKING_AMOUNT {
+                            let extra = beacon_state.balances[index] - STAKING_AMOUNT;
+                            withdrawals.push(
+                                Withdrawal {
+                                    address: get_address(&validator.withdrawal_credentials),
+                                    amount: extra,
+                                    ..Default::default()
+                                }
+                            );
+                            validator.effective_balance = STAKING_AMOUNT;
+                            beacon_state.balances[index]= STAKING_AMOUNT;
+                        }
+                    } else if epoch == validator.withdrawable_epoch {
+                        withdrawals.push(
+                            Withdrawal {
+                                address: get_address(&validator.withdrawal_credentials),
+                                amount: beacon_state.balances[index],
+                                ..Default::default()
+                            }
+                        );
+                        validator.effective_balance = 0;
+                        beacon_state.balances[index]= 0;
+                    }
+                }
+            }
+        }
+
+        Some(withdrawals)
+    }
+}
+
+fn get_address(withdrawal_credentials: &B256) -> Address {
+    assert_eq!(withdrawal_credentials.as_slice()[0], 0x01);
+    Address::from_slice(&withdrawal_credentials.as_slice()[12..])
 }
 
 #[derive(Debug, Clone, Hash, Default, RlpEncodable, RlpDecodable)]
@@ -244,7 +288,7 @@ impl BeaconState {
             let validator = Validator {
                 withdrawal_credentials: deposit.data.withdrawal_credentials,
                 effective_balance: deposit.data.amount,
-                activation_epoch: self.slot % SLOTS_PER_EPOCH + 1,
+                activation_epoch: self.slot / SLOTS_PER_EPOCH + 1,
                 ..Default::default()
             };
             self.validators.push(validator);
@@ -279,6 +323,9 @@ impl BeaconState {
     pub fn process_voluntary_exit(&mut self, voluntary_exits: &Vec<VoluntaryExit>) -> eyre::Result<()> {
         // TODO: check voluntary exits against beacon state
         // TODO: update state
+        for voluntary_exit in voluntary_exits {
+            let _ = self.process_one_voluntary_exit(voluntary_exit);
+        }
         Ok(())
     }
 
@@ -287,8 +334,10 @@ impl BeaconState {
         if validator_index >= self.validators.len() {
             return Ok(());
         }
-        if self.validators[validator_index].withdrawable_epoch != 0 {
-        self.validators[validator_index].withdrawable_epoch = self.slot % SLOTS_PER_EPOCH + 1;
+        if self.validators[validator_index].withdrawable_epoch == 0 {
+            let exit_epoch = voluntary_exit.epoch;
+            self.validators[validator_index].exit_epoch = exit_epoch;
+            self.validators[validator_index].withdrawable_epoch = exit_epoch + 1;
         }
 
         Ok(())

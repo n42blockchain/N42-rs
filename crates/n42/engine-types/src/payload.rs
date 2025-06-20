@@ -39,6 +39,7 @@ use reth_transaction_pool::{
 use revm::context_interface::Block as _;
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
+use crate::{MinedblockExt,MinedblockExtApiServer};
 
 //mod config;
 //pub use config::*;
@@ -335,6 +336,13 @@ where
     let BuildArguments { mut cached_reads, config, cancel, best_payload } = args;
     let PayloadConfig { parent_header, attributes } = config;
 
+    let minedblock_ext=MinedblockExt::instance();
+    if let Ok(mut minedblock)=minedblock_ext.try_lock(){
+        minedblock.set_db(cached_reads.clone());
+    }else{
+        println!("minedblock lock failed");
+    }
+
     let state_provider = client.state_by_block_hash(parent_header.hash())?;
     let state = StateProviderDatabase::new(&state_provider);
     let mut db =
@@ -514,6 +522,15 @@ where
     header.timestamp = attributes.timestamp;
     header.mix_hash = attributes.prev_randao;
     header.parent_beacon_block_root = attributes.parent_beacon_block_root;
+
+    if let Ok(mut minedblock) = minedblock_ext.try_lock() {
+        minedblock.set_blockbody(block.clone().into_block().body.clone());
+        minedblock.set_td(header.difficulty);
+        minedblock.send_block(minedblock.unverifiedblock.clone()).expect("minedblock send_block failed");
+        minedblock.clear_unverifiedblock();
+    } else {
+        println!("minedblock lock failed");
+    } 
 
     // seal
     cons.seal(&mut header).map_err(|err| PayloadBuilderError::Internal(err.into()))?;

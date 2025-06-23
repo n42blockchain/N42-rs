@@ -3,7 +3,14 @@ use crate::{
         database::{chain::ChainStorage, metrics}, state::latest, static_file::StaticFileWriter, NodeTypesForProvider, StaticFileProvider
     }, to_range, traits::{
         AccountExtReader, BlockSource, ChangeSetReader, ReceiptProvider, StageCheckpointWriter,
-    }, AccountReader, BlockBodyWriter, BlockExecutionWriter, BlockHashReader, BlockNumReader, BlockReader, BlockWriter, BundleStateInit, ChainStateBlockReader, ChainStateBlockWriter, DBProvider, HashingWriter, HeaderProvider, HeaderSyncGapProvider, HistoricalStateProvider, HistoricalStateProviderRef, HistoryWriter, LatestStateProvider, LatestStateProviderRef, OriginalValuesKnown, ProviderError, PruneCheckpointReader, PruneCheckpointWriter, RevertsInit, StageCheckpointReader, StateCommitmentProvider, StateProviderBox, StateWriter, StaticFileProviderFactory, StatsReader, StorageLocation, StorageReader, StorageTrieWriter, TransactionVariant, TransactionsProvider, TransactionsProviderExt, TrieWriter, ValidatorChangeWriter, ValidatorReader, WithdrawalsProvider
+    }, AccountReader, BlockBodyWriter, BlockExecutionWriter, BlockHashReader, BlockNumReader, BlockReader, 
+    BlockWriter, BundleStateInit, ChainStateBlockReader, ChainStateBlockWriter, DBProvider, HashingWriter, 
+    HeaderProvider, HeaderSyncGapProvider, HistoricalStateProvider, HistoricalStateProviderRef, HistoryWriter, 
+    LatestStateProvider, LatestStateProviderRef, OriginalValuesKnown, ProviderError, PruneCheckpointReader, 
+    PruneCheckpointWriter, RevertsInit, StageCheckpointReader, StateCommitmentProvider, StateProviderBox, 
+    StateWriter, StaticFileProviderFactory, StatsReader, StorageLocation, StorageReader, StorageTrieWriter, 
+    TransactionVariant, TransactionsProvider, TransactionsProviderExt, TrieWriter, ValidatorChangeWriter, 
+    ValidatorReader, WithdrawalsProvider
 };
 use alloy_consensus::{
     transaction::{SignerRecoverable, TransactionMeta},
@@ -43,10 +50,11 @@ use reth_prune_types::{
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_static_file_types::StaticFileSegment;
 use reth_storage_api::{
-    BeaconStateReader, BeaconStateWriter,BlockBodyIndicesProvider, BlockBodyReader, NodePrimitivesProvider, OmmersProvider, 
+    BeaconReader, BeaconWriter,BlockBodyIndicesProvider, BlockBodyReader, NodePrimitivesProvider, OmmersProvider, 
     SnapshotProvider, SnapshotProviderWriter, StateProvider, StorageChangeSetReader, TryIntoHistoricalStateProvider
 };
-use n42_primitives::{Snapshot,Validator,ValidatorBeforeTx,ValidatorChangeset,BeaconState,BeaconStateChangeset};
+use n42_primitives::{Snapshot,Validator,ValidatorBeforeTx,ValidatorChangeset,
+    BeaconState,BeaconStateChangeset,BeaconBlock,BeaconBlockChangeset,ValidatorRevert};
 use reth_storage_errors::{any::AnyError, provider::{ProviderResult, RootMismatch}};
 use reth_trie::{
     prefix_set::{PrefixSet, PrefixSetMut, TriePrefixSets},
@@ -137,7 +145,7 @@ pub struct DatabaseProvider<TX, N: NodeTypes> {
     storage: Arc<N::Storage>,
 }
 
-impl<TX:DbTx,N:NodeTypes>BeaconStateReader for DatabaseProvider<TX,N>{
+impl<TX:DbTx,N:NodeTypes>BeaconReader for DatabaseProvider<TX,N>{
     fn get_beaconstate_by_blockhash(&self,blockhash:BlockHash) -> ProviderResult<Option<BeaconState> > {
         // let mut cursor=self.tx.cursor_read::<tables::BeaconStateRecord>()?;
         // while let Some((bh,_))=cursor.next()?{
@@ -145,24 +153,35 @@ impl<TX:DbTx,N:NodeTypes>BeaconStateReader for DatabaseProvider<TX,N>{
         // }
         Ok(self.tx.get::<tables::BeaconStateRecord>(blockhash)?)
     }
+    fn get_beaconblock_by_blockhash(&self,blockhash:BlockHash) -> ProviderResult<Option<BeaconBlock> > {
+        Ok(self.tx.get::<tables::BeaconBlockRecord>(blockhash)?)
+    }
 }
 
-impl<TX:DbTxMut+DbTx+'static,N:NodeTypes>BeaconStateWriter for DatabaseProvider<TX,N>{
-    fn unwind_beaconstate(&self,range:RangeInclusive<BlockNumber>) -> ProviderResult<()> {
-        let mut cursor = self.tx.cursor_read::<tables::HeaderNumbers>()?;
+impl<TX:DbTxMut+DbTx+'static,N:NodeTypes>BeaconWriter for DatabaseProvider<TX,N>{
+    fn unwind_beacon(&self,range:RangeInclusive<BlockNumber>) -> ProviderResult<()> {
+        if range.is_empty(){
+            return Ok(());
+        }
+
+        let mut cursor_r = self.tx.cursor_read::<tables::BeaconNum2Hash>()?;
         let mut blockhashes: Vec<BlockHash> = Vec::new();
-        let start=*range.start();
-        let end=*range.end();
-        let count=(end-start+1) as usize;
-        while let Some((blockhash, block_number)) = cursor.next()? {
-            if range.contains(&block_number) {
+        for blocknumber in range.clone(){
+            if let Some((_,blockhash))=cursor_r.seek_exact(blocknumber)?{
                 blockhashes.push(blockhash);
-                if blockhashes.len()==count{
-                    break;
-                }
             }
         }
-        self.remove_beaconstate(blockhashes)?;
+
+        self.remove_beaconstate(blockhashes.clone())?;
+        self.remove_beaconblock(blockhashes.clone())?;
+
+        let mut cursor_w=self.tx.cursor_write::<tables::BeaconNum2Hash>()?;
+        for blocknumber in range{
+            if cursor_w.seek_exact(blocknumber)?.is_some(){
+                cursor_w.delete_current()?;
+            }
+        }
+
         Ok(())
     }
     fn remove_beaconstate(&self, mut range: Vec<BlockHash>) -> ProviderResult<()> {
@@ -178,6 +197,7 @@ impl<TX:DbTxMut+DbTx+'static,N:NodeTypes>BeaconStateWriter for DatabaseProvider<
                     }else if bh<*next_bh{
                         continue;
                     }else{
+                        // impossible
                         range_iter.next();
                     }
                 }
@@ -193,15 +213,87 @@ impl<TX:DbTxMut+DbTx+'static,N:NodeTypes>BeaconStateWriter for DatabaseProvider<
         }
         Ok(())
     }
+    // fn unwind_beaconblock(&self,range:RangeInclusive<BlockNumber>) -> ProviderResult<()> {
+    //     let mut cursor=self.tx.cursor_read::<tables::BeaconNum2Hash>()?;
+    //     let mut blockhashes:Vec<BlockHash>=Vec::new();
+    //     for blocknumber in range{
+    //         if let Some((_,blockhash))=cursor.seek_exact(blocknumber)?{
+    //             blockhashes.push(blockhash);
+    //         }
+    //     }
+    //     self.remove_beaconblock(blockhashes)?;
+    //     Ok(())
+    // }
+    fn remove_beaconblock(&self,mut range:Vec<BlockHash>) -> ProviderResult<()> {
+        range.sort();
+        let mut cursor=self.tx.cursor_write::<tables::BeaconBlockRecord>()?;
+        let mut range_iter=range.into_iter().peekable();
+        while let Some((bh,_))=cursor.next()?{
+            match range_iter.peek(){
+                Some(next_bh)=>{
+                    if bh==*next_bh{
+                        cursor.delete_current()?;
+                        range_iter.next();
+                    }else if bh<*next_bh{
+                        continue;
+                    }else{
+                        // impossible
+                        range_iter.next();
+                    }
+                }
+                None=>break,
+            }
+        }
+        Ok(())
+    }
+    fn write_beaconblock(&self,changes:BeaconBlockChangeset) -> ProviderResult<()> {
+        let mut cursor=self.tx.cursor_write::<tables::BeaconBlockRecord>()?;
+        for(blockhash, beaconblock)in changes.beaconblocks{
+            cursor.insert(blockhash, &beaconblock)?;
+        }
+        Ok(())
+    }
 }
 
 impl<TX: DbTx, N: NodeTypes> ValidatorReader for DatabaseProvider<TX, N> {
     fn basic_validator(&self,address:Address) -> ProviderResult<Option<Validator> > {
         Ok(self.tx.get::<tables::PlainValidatorState>(address)?)
     }
+    fn changed_validators_and_blocks_with_range(&self,range:RangeInclusive<BlockNumber> ,) -> ProviderResult<BTreeMap<Address,Vec<BlockNumber> > > {
+        let mut changeset_cursor = self.tx.cursor_read::<tables::ValidatorChangeSets>()?;
+        let validator_transitions = changeset_cursor.walk_range(range)?.try_fold(
+            BTreeMap::new(),
+            |mut validators: BTreeMap<Address, Vec<u64>>, entry| -> ProviderResult<_> {
+                let (index, validator) = entry?;
+                validators.entry(validator.address).or_default().push(index);
+                Ok(validators)
+            },
+        )?;
+        Ok(validator_transitions)
+    }
 }
 
 impl<TX: DbTxMut + DbTx+'static, N: NodeTypes> ValidatorChangeWriter for DatabaseProvider<TX, N> {
+    fn write_validator_reverts(&self,first_block:BlockNumber,validator_reverts:ValidatorRevert,) -> ProviderResult<()> {
+        let mut validator_changeset_cursor =
+            self.tx_ref().cursor_dup_write::<tables::ValidatorChangeSets>()?;
+        for (block_index, mut validator_block_reverts) in validator_reverts.validators.into_iter().enumerate() {
+            let block_number=first_block+block_index as BlockNumber;
+            validator_block_reverts.par_sort_by_key(|a| a.0);
+
+            for (address, info) in validator_block_reverts {
+                validator_changeset_cursor.append_dup(
+                    block_number,
+                    ValidatorBeforeTx { address, info:info.map(Into::into) },
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+    fn insert_validator_history_index(&self,validator_transitions:impl IntoIterator<Item = (Address,impl IntoIterator<Item = BlockNumber>)> ,) -> ProviderResult<()> {
+        self.append_history_index::<_, tables::ValidatorsHistory>(validator_transitions,ShardedKey::new,)
+    }
     fn unwind_validator(&self,range: RangeInclusive<BlockNumber>) -> ProviderResult<()> {
         let changed_validators=self
             .tx
@@ -266,10 +358,12 @@ impl<TX: DbTxMut + DbTx+'static, N: NodeTypes> ValidatorChangeWriter for Databas
             let existing_entry = validator_cursor.seek_exact(address)?;
             match old_validator {
                 Some(validator) => {
+                    // add a new validator or update an existing one
                     validator_cursor.upsert(address, &validator)?;
                 }
                 None => {
                     if existing_entry.is_some() {
+                        // delete an existing validator
                         validator_cursor.delete_current()?;
                     }
                 }
@@ -278,18 +372,6 @@ impl<TX: DbTxMut + DbTx+'static, N: NodeTypes> ValidatorChangeWriter for Databas
         Ok(())
     }
     fn take_validator(&self, range: RangeInclusive<BlockNumber>) -> ProviderResult<ValidatorChangeset> {
-        // let tx = self.tx_mut();
-        // let mut cursor=tx.cursor_read::<tables::PlainValidatorState>()?;
-        // let mut validators=Vec::new();
-        // while let Some((address, validator))=cursor.next()?{
-        //     if range.contains(&validator.index){
-        //         validators.push(n42_primitives::ValidatorBeforeTx{
-        //             address,
-        //             info: Some(validator),
-        //         });
-        //     }
-        // }
-        // Ok(ValidatorChangeset{validators})
         todo!()
     }
 }
@@ -1971,6 +2053,8 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
         self.write_state_reverts(reverts, first_block)?;
         self.write_state_changes(plain_state)?;
 
+        // self.write_validator_reverts()?;
+
         // Fetch the first transaction number for each block in the range
         let block_indices: Vec<_> = self
             .block_body_indices_range(block_range)?
@@ -2910,8 +2994,13 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> HistoryWriter for DatabaseProvi
 
         // storage history stage
         {
-            let indices = self.changed_storages_and_blocks_with_range(range)?;
+            let indices = self.changed_storages_and_blocks_with_range(range.clone())?;
             self.insert_storage_history_index(indices)?;
+        }
+
+        {
+            let indices=self.changed_validators_and_blocks_with_range(range)?;
+            self.insert_validator_history_index(indices)?;
         }
 
         Ok(())
@@ -2958,6 +3047,8 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockExecu
         self.remove_state_above(block, remove_from)?;
 
         self.unwind_validator(range.clone())?;
+
+        self.unwind_beacon(range.clone())?;
 
         // remove block bodies it is needed for both get block range and get block execution results
         // that is why it is deleted afterwards.

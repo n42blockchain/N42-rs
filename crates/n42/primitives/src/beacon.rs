@@ -42,12 +42,6 @@ pub struct BeaconState {
     balances: BTreeMap<usize, Gwei>,
 }
 
-// #[derive(Serialize,Deserialize,Debug,PartialEq)]
-// pub struct  BeaconStateBeforeBlock{
-//     pub address: BlockHash,
-//     pub info: Option<BeaconState>,
-// }
-
 pub struct BeaconStateChangeset{
     pub beaconstates:Vec<(BlockHash,BeaconState)>,
 }
@@ -83,10 +77,8 @@ pub struct BeaconBlock {
     pub body: BeaconBlockBody,
 }
 
-#[derive(Debug,Serialize,Deserialize,PartialEq)]
-pub struct  BeaconBlockBeforeBlock{
-    pub address: BlockHash,
-    pub info: Option<BeaconBlock>,
+pub struct BeaconBlockChangeset{
+    pub beaconblocks:Vec<(BlockHash,BeaconBlock)>,
 }
 
 #[derive(Debug, Clone, Hash, Default,Serialize,Deserialize,PartialEq)]

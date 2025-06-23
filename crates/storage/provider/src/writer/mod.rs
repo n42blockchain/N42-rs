@@ -217,9 +217,6 @@ where
             .get_writer(block_number, StaticFileSegment::Headers)?
             .prune_headers(highest_static_file_block.saturating_sub(block_number))?;
 
-        // for validator
-        // self.database().unwind_validator(block_number+1..=self.database().last_block_number()?,)?;
-        // self.database().remove_block_and_execution_above(block, remove_from)
         Ok(())
     }
 }

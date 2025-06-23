@@ -12,6 +12,7 @@ exclude.workspace = true
 n42-engine-primitives.workspace = true
 # reth
 #reth-beacon-consensus.workspace = true
+reth-storage-errors.workspace = true
 reth-chainspec.workspace = true
 reth-consensus.workspace = true
 reth-engine-primitives.workspace = true

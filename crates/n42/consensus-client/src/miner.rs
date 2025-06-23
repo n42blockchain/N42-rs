@@ -1,5 +1,6 @@
 //! Contains the implementation of the mining mode for the local engine.
 
+use reth_storage_errors::provider::ProviderResult;
 use n42_engine_primitives::{PayloadAttributesBuilderExt};
 use std::str::FromStr;
 use alloy_consensus::TxReceipt;
@@ -406,6 +407,8 @@ where
 
                 //let new_beacon_block = self.beacon_blocks.get(&Eth1BlockHash(parent.hash())).unwrap();
                 let new_beacon_block = fetch_beacon_block(parent.hash()).unwrap();
+                let new_beacon_block_hash = new_beacon_block.hash_slow();
+                self.save_beacon_block_by_hash(&new_beacon_block_hash, &new_beacon_block)?;
                 let _ = self.beacon.gen_withdrawals(Eth1BlockHash(parent.parent_hash));
                 self.beacon.state_transition(Eth1BlockHash(parent.parent_hash), &new_beacon_block)?;
             }
@@ -664,16 +667,18 @@ where
         };
         let deposits = self.get_deposits(block.number.saturating_sub(DEPOSIT_GAP))?;
         let attestations = vec![
-            Attestation { credentials: B256::from_str("0x010000000000000000000000a0ee7a142d267c1f36714e4a8f75612f20a79720").unwrap()},
-            Attestation { credentials: B256::ZERO, },
+            Attestation { pubkey: Bytes::from_str("b758091fbfafd4bd5db58616a3db1725e8147c5c38dd62dd052db3d42b420ed47d2584ed219f9e42702da0a5c8864a5f").unwrap()},
+            Attestation { pubkey: Bytes::new(), },
         ];
         let voluntary_exits = vec![
             VoluntaryExit {
-                epoch: 2,
+                epoch: 8,
                 validator_index: 0,
             },
         ];
         let beacon_block = self.beacon.gen_beacon_block(parent_beacon_block_hash, &deposits, &attestations, &voluntary_exits, block)?;
+        let beacon_block_hash = beacon_block.hash_slow();
+        self.save_beacon_block_by_hash(&beacon_block_hash, &beacon_block)?;
 
         self.recent_blocks.insert(block.hash_slow(), block.clone());
 
@@ -990,6 +995,8 @@ where
                         let mut deposit: Deposit = Default::default();
                         deposit.data.amount = u64::from_le_bytes(deposit_event.amount.as_ref().try_into().unwrap());
                         deposit.data.withdrawal_credentials = B256::from_slice(&deposit_event.withdrawal_credentials);
+                        deposit.data.pubkey = deposit_event.pubkey.clone();
+                        deposit.data.signature = deposit_event.signature.clone();
                         deposits.push(deposit);
                     }
                 }
@@ -998,6 +1005,9 @@ where
         Ok(deposits)
     }
 
+    fn save_beacon_block_by_hash(&self, block_hash: &BlockHash,  beacon_block: &BeaconBlock) -> ProviderResult<()> {
+        Ok(())
+    }
 }
 
 fn exit_by_sigint() {

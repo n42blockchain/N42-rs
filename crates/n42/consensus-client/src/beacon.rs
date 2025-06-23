@@ -3,7 +3,7 @@ use reth_primitives::{Block, Header, SealedBlock};
 use alloy_eips::{
     eip4895::{Withdrawal, Withdrawals},
 };
-use alloy_primitives::{Address};
+use alloy_primitives::{Address, Bytes};
 use alloy_sol_types::{SolEnum, SolEvent, sol};
 use serde::{Deserialize, Serialize};
 use alloy_primitives::Sealable;
@@ -139,8 +139,8 @@ type Gwei = u64;
 type Epoch = u64;
 
 // mock
-type BLSPubkey = u64;
-type BLSSignature = u64;
+type BLSPubkey = Bytes;
+type BLSSignature = Bytes;
 
 #[derive(Debug, Clone, Hash, Default, RlpEncodable, RlpDecodable)]
 pub struct Validator {
@@ -181,7 +181,7 @@ pub struct BeaconBlockBody {
 
 #[derive(Debug, Clone, Hash, Default, RlpEncodable, RlpDecodable,  Serialize, Deserialize)]
 pub struct Attestation {
-    pub credentials: B256,
+    pub pubkey: Bytes,
 }
 
 #[derive(Debug, Clone, Hash, Default, RlpEncodable, RlpDecodable,  Serialize, Deserialize)]
@@ -277,7 +277,7 @@ impl BeaconState {
     pub fn process_one_deposit(&mut self, deposit: &Deposit) -> eyre::Result<()> {
         let mut updated = false;
         for (index, validator) in self.validators.iter_mut().enumerate() {
-            if validator.withdrawal_credentials == deposit.data.withdrawal_credentials {
+            if validator.pubkey == deposit.data.pubkey {
                 validator.effective_balance += deposit.data.amount;
                 self.balances[index] += deposit.data.amount;
                 updated = true;
@@ -286,6 +286,7 @@ impl BeaconState {
 
         if !updated {
             let validator = Validator {
+                pubkey: deposit.data.pubkey.clone(),
                 withdrawal_credentials: deposit.data.withdrawal_credentials,
                 effective_balance: deposit.data.amount,
                 activation_epoch: self.slot / SLOTS_PER_EPOCH + 1,
@@ -310,7 +311,7 @@ impl BeaconState {
 
     pub fn process_one_attestation(&mut self, attestation: &Attestation) -> eyre::Result<()> {
         for (index, validator) in self.validators.iter_mut().enumerate() {
-            if validator.withdrawal_credentials == attestation.credentials {
+            if validator.pubkey == attestation.pubkey {
                 validator.effective_balance += REWARD_AMOUNT;
                 self.balances[index] += REWARD_AMOUNT;
                 break;

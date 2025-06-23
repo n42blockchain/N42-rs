@@ -656,6 +656,7 @@ mod tests {
     };
     use alloy_primitives::{TxNumber, B256, U256};
     use assert_matches::assert_matches;
+    use rand::Rng;
     use reth_chainspec::ChainSpecBuilder;
     use reth_db::{
         mdbx::DatabaseArguments,
@@ -667,6 +668,228 @@ mod tests {
     use reth_storage_errors::provider::ProviderError;
     use reth_testing_utils::generators::{self, random_block, random_header, BlockParams};
     use std::{ops::RangeInclusive, sync::Arc};
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
+    use n42_primitives::{BeaconState, BeaconStateChangeset,Validator, ValidatorBeforeTx, ValidatorChangeset};
+    use reth_storage_api::ValidatorChangeWriter;
+    use reth_storage_api::ValidatorReader;
+    use reth_db_api::transaction::DbTxMut;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+    use reth_storage_api::BeaconReader;
+    use reth_storage_api::BeaconWriter;
+    use std::collections::HashMap;
+    
+    #[test]
+    // fn test_beaconstate_flow() -> ProviderResult<()> {
+    //     let factory=create_test_provider_factory();
+    //     let mut provider_rw=factory.provider_rw()?;
+    //     let mut changes = BeaconStateChangeset { beaconstates: vec![] };
+    //     let mut header_number_entries = vec![];
+    //     let mut blockhash_to_number = HashMap::new();
+    //     for i in 1..=5u64 {
+    //         let mut bytes = [0u8; 32];
+    //         bytes[24..].copy_from_slice(&i.to_be_bytes());
+    //         let blockhash = B256::new(bytes);
+    //         let beaconstate = BeaconState::default();
+    //         changes.beaconstates.push((blockhash, beaconstate));
+    //         header_number_entries.push((blockhash, i));
+    //         blockhash_to_number.insert(i, blockhash);
+    //     }
+    //     provider_rw.write_beaconstate(changes)?;
+    //     for (bh, num) in &header_number_entries {
+    //         provider_rw.tx_ref().put::<tables::HeaderNumbers>(*bh, *num)?;
+    //     }
+    //     provider_rw.commit()?;
+    //     for (_num, bh) in &blockhash_to_number {
+    //         let mut provider_ro=factory.provider()?;
+    //         assert!(provider_ro.get_beaconstate_by_blockhash(*bh)?.is_some());
+    //     }
+    //     let mut provider_rw=factory.provider_rw()?;
+    //     provider_rw.unwind_beaconstate(3..=5)?;
+    //     provider_rw.commit()?;
+    //     let mut provider_ro=factory.provider()?;
+    //     assert!(provider_ro.get_beaconstate_by_blockhash(blockhash_to_number[&3])?.is_none());
+    //     assert!(provider_ro.get_beaconstate_by_blockhash(blockhash_to_number[&5])?.is_none());
+    //     assert!(provider_ro.get_beaconstate_by_blockhash(blockhash_to_number[&1])?.is_some());
+    //     assert!(provider_ro.get_beaconstate_by_blockhash(blockhash_to_number[&2])?.is_some());
+    //     Ok(())
+    // }
+
+    #[test]
+    fn test_beaconstaterecord()->ProviderResult<()>{
+        let factory=create_test_provider_factory();
+        let mut provider_rw=factory.provider_rw()?;
+        let mut rng=StdRng::seed_from_u64(42);
+        let mut blockhash=B256::ZERO;
+        // let mut cursor=provider_rw.tx_mut().cursor_write::<tables::BeaconStateRecord>()?;
+        for i in 0..5{
+            let mut bytes=[0u8;32];
+            rng.fill(&mut bytes);
+            blockhash=B256::from_slice(&bytes);
+            println!("{:?}",blockhash);
+            let state=BeaconState::default();
+            provider_rw.tx_ref().put::<tables::BeaconStateRecord>(blockhash, state)?;
+        }
+        provider_rw.commit()?;
+        let provider_ro=factory.provider()?;
+        let res=provider_ro.get_beaconstate_by_blockhash(blockhash)?;
+        match res{
+            Some(bs)=>println!("{:?}",bs),
+            None=>println!("not found"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_basic_validator()->ProviderResult<()>{
+        let factory=create_test_provider_factory();
+        let mut provider_rw=factory.provider_rw()?;
+        let validator_address=Address::random();
+        let validator=Validator{
+            index:1,
+            balance:32000000000,
+            is_active:true,
+            is_slashed:false,
+            is_withdrawal_allowed:false,
+        };
+        let mut validators=Vec::new();
+        validators.push((validator_address,Some(validator.clone())));
+        let changeset =ValidatorChangeset{validators};
+        provider_rw.write_validator_changes(changeset)?;
+        provider_rw.commit()?;
+        let provider_ro=factory.provider()?;
+        let result=provider_ro.basic_validator(validator_address)?;
+        assert!(result.is_some(),"validator data");
+        let retrieved_validator=result.unwrap();
+        assert_eq!(validator.index, retrieved_validator.index);
+        assert_eq!(validator.balance, retrieved_validator.balance);
+        assert_eq!(validator.is_active, retrieved_validator.is_active);
+        assert_eq!(validator.is_slashed, retrieved_validator.is_slashed);
+        assert_eq!(validator.is_withdrawal_allowed, retrieved_validator.is_withdrawal_allowed);
+        let non_existent_address=Address::random();
+        let non_existent_result=provider_ro.basic_validator(non_existent_address)?;
+        assert!(non_existent_result.is_none(),"non-existent validator data");
+        Ok(())
+    }
+
+    #[test]
+    fn test_unwind_validator() -> ProviderResult<()> {
+        let factory = create_test_provider_factory();
+        let mut provider_rw = factory.provider_rw()?;
+        
+        let validator_address1 = Address::random();
+        let validator_address2 = Address::random();
+        
+        let validator1 = Validator {
+            index: 1,
+            balance: 32000000000,
+            is_active: true,
+            is_slashed: false,
+            is_withdrawal_allowed: false,
+        };
+        
+        let validator2 = Validator {
+            index: 2,
+            balance: 32000000000,
+            is_active: true,
+            is_slashed: false,
+            is_withdrawal_allowed: false,
+        };
+        
+        let mut validators = Vec::new();
+        validators.push((validator_address1, Some(validator1.clone())));
+        let changeset = ValidatorChangeset { validators };
+        provider_rw.write_validator_changes(changeset)?;
+        
+        provider_rw.tx_ref().put::<tables::ValidatorChangeSets>(
+            1, 
+            ValidatorBeforeTx {
+                address: validator_address1,
+                info: None, 
+            }
+        )?;
+        
+        provider_rw.commit()?;
+        
+        let mut provider_rw = factory.provider_rw()?;
+        let mut modified_validator1 = validator1.clone();
+        modified_validator1.balance = 33000000000; 
+        modified_validator1.is_slashed = true; 
+        
+        let mut validators = Vec::new();
+        validators.push((validator_address1, Some(modified_validator1.clone())));
+        validators.push((validator_address2, Some(validator2.clone())));
+        let changeset = ValidatorChangeset { validators };
+        provider_rw.write_validator_changes(changeset)?;
+        
+        provider_rw.tx_ref().put::<tables::ValidatorChangeSets>(
+            2, 
+            ValidatorBeforeTx {
+                address: validator_address1,
+                info: Some(validator1.clone()), 
+            }
+        )?;
+        
+        provider_rw.tx_ref().put::<tables::ValidatorChangeSets>(
+            2, 
+            ValidatorBeforeTx {
+                address: validator_address2,
+                info: None, 
+            }
+        )?;
+        
+        provider_rw.commit()?;
+        
+        let mut provider_rw = factory.provider_rw()?;
+        let mut modified_validator2 = validator2.clone();
+        modified_validator2.is_active = false; 
+        
+        let mut validators = Vec::new();
+        validators.push((validator_address2, Some(modified_validator2.clone())));
+        let changeset = ValidatorChangeset { validators };
+        provider_rw.write_validator_changes(changeset)?;
+        
+        provider_rw.tx_ref().put::<tables::ValidatorChangeSets>(
+            3, 
+            ValidatorBeforeTx {
+                address: validator_address2,
+                info: Some(validator2.clone()), 
+            }
+        )?;
+        
+        provider_rw.commit()?;
+        
+        let provider_ro = factory.provider()?;
+        
+        let result1 = provider_ro.basic_validator(validator_address1)?;
+        assert!(result1.is_some(), "validator1 data should exist");
+        let retrieved_validator1 = result1.unwrap();
+        assert_eq!(modified_validator1.balance, retrieved_validator1.balance);
+        assert_eq!(modified_validator1.is_slashed, retrieved_validator1.is_slashed);
+        
+        let result2 = provider_ro.basic_validator(validator_address2)?;
+        assert!(result2.is_some(), "validator2 data should exist");
+        let retrieved_validator2 = result2.unwrap();
+        assert_eq!(modified_validator2.is_active, retrieved_validator2.is_active);
+        
+        let mut provider_rw = factory.provider_rw()?;
+        provider_rw.unwind_validator(2..=3)?;
+        provider_rw.commit()?;
+        
+        let provider_ro = factory.provider()?;
+        
+        let result1 = provider_ro.basic_validator(validator_address1)?;
+        assert!(result1.is_some(), "validator1 data should exist after unwind");
+        let retrieved_validator1 = result1.unwrap();
+        assert_eq!(validator1.balance, retrieved_validator1.balance);
+        assert_eq!(validator1.is_slashed, retrieved_validator1.is_slashed);
+        
+        let result2 = provider_ro.basic_validator(validator_address2)?;
+        assert!(result2.is_none(), "validator2 data should not exist after unwind");
+        
+        Ok(())
+    }
 
     #[test]
     fn common_history_provider() {

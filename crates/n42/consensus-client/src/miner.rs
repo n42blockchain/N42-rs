@@ -46,8 +46,9 @@ use tokio::time::{interval_at, sleep, Instant, Interval};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{trace, debug, error, info, warn};
 
-use crate::beacon::{Beacon, Eth1BlockHash, BeaconBlock, Deposit, parse_deposit_log, Attestation, VoluntaryExit, };
+use crate::beacon::{Beacon, BeaconBlock, Deposit, parse_deposit_log, Attestation, VoluntaryExit, };
 use crate::network::{fetch_beacon_block, broadcast_beacon_block};
+use crate::storage::{Storage};
 
 /// A mining mode for the local dev engine.
 #[derive(Debug)]
@@ -121,7 +122,7 @@ pub struct N42Miner<T: PayloadTypes, Provider, B, Network> {
     new_block_tx: mpsc::Sender<(NewBlock, BlockHash)>,
     new_block_rx: mpsc::Receiver<(NewBlock, BlockHash)>,
     beacon: Beacon,
-    beacon_blocks: schnellru::LruMap<Eth1BlockHash, BeaconBlock>,
+    storage: Storage,
 
     num_generated_blocks: u64,
     num_skipped_new_block: u64,
@@ -172,6 +173,8 @@ where
     ) {
         let (new_block_tx, new_block_rx) = mpsc::channel::<(NewBlock, BlockHash)>(128);
         let genesis_hash = provider.chain_spec().genesis_hash().clone();
+        let storage_init_data = consensus.get_eth_signer_address().unwrap().unwrap().to_string();
+        let storage = Storage::new(storage_init_data, genesis_hash);
         let miner = Self {
             provider,
             payload_attributes_builder,
@@ -190,8 +193,8 @@ where
             order_stats: HashMap::new(),
             new_block_tx,
             new_block_rx,
-            beacon: Beacon::new(genesis_hash),
-            beacon_blocks: schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_BEACON_BLOCKS)),
+            beacon: Beacon::new(storage.clone()),
+            storage,
         };
 
         // Spawn the miner
@@ -405,12 +408,12 @@ where
                     }
                 }
 
-                //let new_beacon_block = self.beacon_blocks.get(&Eth1BlockHash(parent.hash())).unwrap();
                 let new_beacon_block = fetch_beacon_block(parent.hash()).unwrap();
                 let new_beacon_block_hash = new_beacon_block.hash_slow();
-                self.save_beacon_block_by_hash(&new_beacon_block_hash, &new_beacon_block)?;
-                let _ = self.beacon.gen_withdrawals(Eth1BlockHash(parent.parent_hash));
-                self.beacon.state_transition(Eth1BlockHash(parent.parent_hash), &new_beacon_block)?;
+                self.storage.save_beacon_block_by_hash(new_beacon_block_hash, new_beacon_block.clone())?;
+                self.storage.save_beacon_block_hash_by_eth1_hash(parent.hash(), new_beacon_block_hash)?;
+                let _ = self.beacon.gen_withdrawals(parent.parent_hash);
+                self.beacon.state_transition(&new_beacon_block)?;
             }
 
             if new_payload_ok {
@@ -618,7 +621,7 @@ where
         let timestamp = now;
         debug!(target: "consensus-client", ?timestamp, "advance: PayloadAttributes timestamp");
 
-        let withdrawals = self.beacon.gen_withdrawals(Eth1BlockHash(header.hash()));
+        let withdrawals = self.beacon.gen_withdrawals(header.hash());
         debug!(target: "consensus-client", ?withdrawals, "advance: PayloadAttributes withdrawals");
 
         let forkchoice_state = self.forkchoice_state();
@@ -678,7 +681,8 @@ where
         ];
         let beacon_block = self.beacon.gen_beacon_block(parent_beacon_block_hash, &deposits, &attestations, &voluntary_exits, block)?;
         let beacon_block_hash = beacon_block.hash_slow();
-        self.save_beacon_block_by_hash(&beacon_block_hash, &beacon_block)?;
+        self.storage.save_beacon_block_by_hash(beacon_block_hash, beacon_block.clone())?;
+        self.storage.save_beacon_block_hash_by_eth1_hash(block.hash(), beacon_block_hash)?;
 
         self.recent_blocks.insert(block.hash_slow(), block.clone());
 
@@ -1005,9 +1009,6 @@ where
         Ok(deposits)
     }
 
-    fn save_beacon_block_by_hash(&self, block_hash: &BlockHash,  beacon_block: &BeaconBlock) -> ProviderResult<()> {
-        Ok(())
-    }
 }
 
 fn exit_by_sigint() {

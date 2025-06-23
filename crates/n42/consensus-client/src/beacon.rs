@@ -10,6 +10,7 @@ use alloy_primitives::Sealable;
 use alloy_rlp::{Encodable, RlpEncodable,  RlpDecodable};
 use std::collections::{HashMap, BTreeMap};
 use alloy_primitives::{keccak256, BlockHash, B256, Log};
+use crate::storage::{Storage};
 use tracing::{trace, debug, error, info, warn};
 
 const INMEMORY_BEACON_STATES: u32 = 256;
@@ -32,19 +33,14 @@ sol! {
 
 #[derive(Debug)]
 pub struct Beacon {
-    eth1_genesis_hash: BlockHash,
-    beacon_states: schnellru::LruMap<Eth1BlockHash, BeaconState>,
+    storage: Storage,
 }
 
 impl Beacon {
-    pub fn new(eth1_genesis_hash: BlockHash) -> Self {
-        let mut beacon = Beacon {
-            eth1_genesis_hash,
-            beacon_states: schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_BEACON_STATES)),
-        };
-
-        beacon.beacon_states.insert(Eth1BlockHash(eth1_genesis_hash), Default::default());
-        beacon
+    pub fn new(storage: Storage) -> Self {
+        Self {
+            storage,
+        }
     }
 
     pub fn gen_beacon_block(&mut self, parent_hash: BlockHash, deposits: &Vec<Deposit>, attestations: &Vec<Attestation>, voluntary_exits: &Vec<VoluntaryExit>, eth1_sealed_block: &SealedBlock) -> eyre::Result<BeaconBlock> {
@@ -58,24 +54,27 @@ impl Beacon {
             },
             ..Default::default()
         };
-        let beacon_state = self.state_transition(Eth1BlockHash(eth1_sealed_block.header().parent_hash), &beacon_block)?;
+        let beacon_state = self.state_transition(&beacon_block)?;
         beacon_block.state_root = beacon_state.hash_slow();
         Ok(beacon_block)
     }
 
-    pub fn state_transition(&mut self, parent_eth1_block_hash: Eth1BlockHash, beacon_block: &BeaconBlock) -> eyre::Result<BeaconState> {
-        debug!(target: "consensus-client", ?parent_eth1_block_hash, ?beacon_block, "state_transition");
-        let beacon_state = self.beacon_states.get(&parent_eth1_block_hash).unwrap();
-        let new_beacon_state = BeaconState::state_transition(beacon_state, beacon_block)?;
-        self.beacon_states.insert(Eth1BlockHash(beacon_block.eth1_block_hash), new_beacon_state.clone());
+    pub fn state_transition(&mut self, beacon_block: &BeaconBlock) -> eyre::Result<BeaconState> {
+        debug!(target: "consensus-client", ?beacon_block, "state_transition");
+        let beacon_state = self.storage.get_beacon_state_by_beacon_hash(beacon_block.parent_hash)?;
+        let new_beacon_state = BeaconState::state_transition(&beacon_state, beacon_block)?;
+        self.storage.save_beacon_state_by_beacon_hash(beacon_block.hash_slow(), new_beacon_state.clone())?;
         debug!(target: "consensus-client", ?new_beacon_state, "state_transition");
 
         Ok(new_beacon_state)
     }
 
-    pub fn gen_withdrawals(&mut self, eth1_block_hash: Eth1BlockHash) -> Option<Vec<Withdrawal>> {
+    pub fn gen_withdrawals(&mut self, eth1_block_hash: BlockHash) -> Option<Vec<Withdrawal>> {
         let mut withdrawals = Vec::new();
-        if let Some(mut beacon_state) = self.beacon_states.get(&eth1_block_hash) {
+        let beacon_block_hash = self.storage.get_beacon_block_hash_by_eth1_hash(eth1_block_hash).unwrap();
+        debug!(target: "consensus-client", ?beacon_block_hash, "gen_withdrawals");
+        let mut beacon_state = self.storage.get_beacon_state_by_beacon_hash(beacon_block_hash).unwrap();
+
             if (beacon_state.slot + 1) % SLOTS_PER_EPOCH == 0 {
                 for (index, validator) in beacon_state.validators.iter_mut().enumerate() {
                     let epoch = beacon_state.slot / SLOTS_PER_EPOCH;
@@ -104,8 +103,9 @@ impl Beacon {
                         beacon_state.balances[index]= 0;
                     }
                 }
-            }
         }
+
+        self.storage.save_beacon_state_by_beacon_hash(beacon_block_hash, beacon_state).unwrap();
 
         Some(withdrawals)
     }
@@ -116,7 +116,7 @@ fn get_address(withdrawal_credentials: &B256) -> Address {
     Address::from_slice(&withdrawal_credentials.as_slice()[12..])
 }
 
-#[derive(Debug, Clone, Hash, Default, RlpEncodable, RlpDecodable)]
+#[derive(Debug, Clone, Hash, Default, RlpEncodable, RlpDecodable, Serialize, Deserialize)]
 pub struct BeaconState {
     slot: u64,
     eth1_deposit_index: u64,
@@ -132,9 +132,6 @@ impl Sealable for BeaconState {
     }
 }
 
-#[derive(Debug, Clone, Hash, Default, PartialEq)]
-pub struct Eth1BlockHash(pub BlockHash);
-
 type Gwei = u64;
 type Epoch = u64;
 
@@ -142,7 +139,7 @@ type Epoch = u64;
 type BLSPubkey = Bytes;
 type BLSSignature = Bytes;
 
-#[derive(Debug, Clone, Hash, Default, RlpEncodable, RlpDecodable)]
+#[derive(Debug, Clone, Hash, Default, RlpEncodable, RlpDecodable, Serialize, Deserialize)]
 pub struct Validator {
     pubkey: BLSPubkey,
     withdrawal_credentials: B256,  // Commitment to pubkey for withdrawals

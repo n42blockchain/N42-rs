@@ -171,9 +171,9 @@ impl Sealable for BeaconBlock {
 
 #[derive(Debug, Clone, Hash, Default, RlpEncodable, RlpDecodable,  Serialize, Deserialize)]
 pub struct BeaconBlockBody {
-    attestations: Vec<Attestation>,
-    deposits: Vec<Deposit>,
-    voluntary_exits: Vec<VoluntaryExit>,
+    pub attestations: Vec<Attestation>,
+    pub deposits: Vec<Deposit>,
+    pub voluntary_exits: Vec<VoluntaryExit>,
 }
 
 #[derive(Debug, Clone, Hash, Default, RlpEncodable, RlpDecodable,  Serialize, Deserialize)]
@@ -181,13 +181,13 @@ pub struct Attestation {
     pub pubkey: Bytes,
 }
 
-#[derive(Debug, Clone, Hash, Default, RlpEncodable, RlpDecodable,  Serialize, Deserialize)]
+#[derive(Debug, Clone, Hash, Default, PartialEq, RlpEncodable, RlpDecodable,  Serialize, Deserialize)]
 pub struct Deposit {
     pub proof: Vec<B256>,
     pub data: DepositData,
 }
 
-#[derive(Debug, Clone, Hash, Default, RlpEncodable, RlpDecodable,  Serialize, Deserialize)]
+#[derive(Debug, Clone, Hash, Default, PartialEq, RlpEncodable, RlpDecodable,  Serialize, Deserialize)]
 pub struct DepositData {
     pub pubkey: BLSPubkey,
     pub withdrawal_credentials: B256,

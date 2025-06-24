@@ -46,7 +46,7 @@ use tokio::time::{interval_at, sleep, Instant, Interval};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{trace, debug, error, info, warn};
 
-use crate::beacon::{Beacon, BeaconBlock, Deposit, parse_deposit_log, Attestation, VoluntaryExit, };
+use crate::beacon::{Beacon, Deposit, parse_deposit_log, Attestation, VoluntaryExit, };
 use crate::network::{fetch_beacon_block, broadcast_beacon_block};
 use crate::storage::{Storage};
 
@@ -410,10 +410,20 @@ where
 
                 let new_beacon_block = fetch_beacon_block(parent.hash()).unwrap();
                 let new_beacon_block_hash = new_beacon_block.hash_slow();
+
+                let deposits = self.get_deposits(parent.number.saturating_sub(DEPOSIT_GAP))?;
+                if deposits != new_beacon_block.body.deposits {
+                    return Err(eyre::eyre!("deposits mismatch between eth1 block and beacon block"));
+                }
+
+                let _ = self.beacon.gen_withdrawals(parent.parent_hash);
+                let new_beacon_state = self.beacon.state_transition(&new_beacon_block)?;
+                if new_beacon_state.hash_slow() != new_beacon_block.state_root {
+                    return Err(eyre::eyre!(format!("state root mismatch, new_beacon_state hash={:?}, new_beacon_block.state_root={:?}", new_beacon_state.hash_slow(), new_beacon_block.state_root)));
+                }
+
                 self.storage.save_beacon_block_by_hash(new_beacon_block_hash, new_beacon_block.clone())?;
                 self.storage.save_beacon_block_hash_by_eth1_hash(parent.hash(), new_beacon_block_hash)?;
-                let _ = self.beacon.gen_withdrawals(parent.parent_hash);
-                self.beacon.state_transition(&new_beacon_block)?;
             }
 
             if new_payload_ok {

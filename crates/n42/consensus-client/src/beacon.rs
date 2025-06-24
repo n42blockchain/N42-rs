@@ -43,7 +43,7 @@ impl Beacon {
         }
     }
 
-    pub fn gen_beacon_block(&mut self, parent_hash: BlockHash, deposits: &Vec<Deposit>, attestations: &Vec<Attestation>, voluntary_exits: &Vec<VoluntaryExit>, eth1_sealed_block: &SealedBlock) -> eyre::Result<BeaconBlock> {
+    pub fn gen_beacon_block(&mut self, old_beacon_state: Option<BeaconState>, parent_hash: BlockHash, deposits: &Vec<Deposit>, attestations: &Vec<Attestation>, voluntary_exits: &Vec<VoluntaryExit>, eth1_sealed_block: &SealedBlock) -> eyre::Result<BeaconBlock> {
         let mut beacon_block = BeaconBlock {
             parent_hash,
             eth1_block_hash: eth1_sealed_block.hash_slow(),
@@ -54,14 +54,18 @@ impl Beacon {
             },
             ..Default::default()
         };
-        let beacon_state = self.state_transition(&beacon_block)?;
+        let beacon_state = self.state_transition(old_beacon_state, &beacon_block)?;
         beacon_block.state_root = beacon_state.hash_slow();
         Ok(beacon_block)
     }
 
-    pub fn state_transition(&mut self, beacon_block: &BeaconBlock) -> eyre::Result<BeaconState> {
+    pub fn state_transition(&mut self, old_beacon_state: Option<BeaconState>, beacon_block: &BeaconBlock) -> eyre::Result<BeaconState> {
         debug!(target: "consensus-client", ?beacon_block, "state_transition");
-        let beacon_state = self.storage.get_beacon_state_by_beacon_hash(beacon_block.parent_hash)?;
+        let beacon_state = if old_beacon_state.is_none() {
+            self.storage.get_beacon_state_by_beacon_hash(beacon_block.parent_hash)?
+        } else {
+            old_beacon_state.unwrap()
+        };
         let new_beacon_state = BeaconState::state_transition(&beacon_state, beacon_block)?;
         self.storage.save_beacon_state_by_beacon_hash(beacon_block.hash_slow(), new_beacon_state.clone())?;
         debug!(target: "consensus-client", ?new_beacon_state, "state_transition");
@@ -69,45 +73,43 @@ impl Beacon {
         Ok(new_beacon_state)
     }
 
-    pub fn gen_withdrawals(&mut self, eth1_block_hash: BlockHash) -> Option<Vec<Withdrawal>> {
+    pub fn gen_withdrawals(&mut self, eth1_block_hash: BlockHash) -> eyre::Result<(Option<Vec<Withdrawal>>, BeaconState)> {
         let mut withdrawals = Vec::new();
-        let beacon_block_hash = self.storage.get_beacon_block_hash_by_eth1_hash(eth1_block_hash).unwrap();
+        let beacon_block_hash = self.storage.get_beacon_block_hash_by_eth1_hash(eth1_block_hash)?;
         debug!(target: "consensus-client", ?beacon_block_hash, "gen_withdrawals");
-        let mut beacon_state = self.storage.get_beacon_state_by_beacon_hash(beacon_block_hash).unwrap();
+        let mut beacon_state = self.storage.get_beacon_state_by_beacon_hash(beacon_block_hash)?;
 
-            if (beacon_state.slot + 1) % SLOTS_PER_EPOCH == 0 {
-                for (index, validator) in beacon_state.validators.iter_mut().enumerate() {
-                    let epoch = beacon_state.slot / SLOTS_PER_EPOCH;
-                    if epoch >= validator.activation_epoch && (validator.exit_epoch == 0 || epoch < validator.exit_epoch) {
-                        if beacon_state.balances[index] > STAKING_AMOUNT {
-                            let extra = beacon_state.balances[index] - STAKING_AMOUNT;
-                            withdrawals.push(
-                                Withdrawal {
-                                    address: get_address(&validator.withdrawal_credentials),
-                                    amount: extra,
-                                    ..Default::default()
-                                }
-                            );
-                            validator.effective_balance = STAKING_AMOUNT;
-                            beacon_state.balances[index]= STAKING_AMOUNT;
-                        }
-                    } else if epoch == validator.withdrawable_epoch {
+        if (beacon_state.slot + 1) % SLOTS_PER_EPOCH == 0 {
+            for (index, validator) in beacon_state.validators.iter_mut().enumerate() {
+                let epoch = beacon_state.slot / SLOTS_PER_EPOCH;
+                if epoch >= validator.activation_epoch && (validator.exit_epoch == 0 || epoch < validator.exit_epoch) {
+                    if beacon_state.balances[index] > STAKING_AMOUNT {
+                        let extra = beacon_state.balances[index] - STAKING_AMOUNT;
                         withdrawals.push(
                             Withdrawal {
                                 address: get_address(&validator.withdrawal_credentials),
-                                amount: beacon_state.balances[index],
+                                amount: extra,
                                 ..Default::default()
                             }
                         );
-                        validator.effective_balance = 0;
-                        beacon_state.balances[index]= 0;
+                        validator.effective_balance = STAKING_AMOUNT;
+                        beacon_state.balances[index]= STAKING_AMOUNT;
                     }
+                } else if epoch == validator.withdrawable_epoch {
+                    withdrawals.push(
+                        Withdrawal {
+                            address: get_address(&validator.withdrawal_credentials),
+                            amount: beacon_state.balances[index],
+                            ..Default::default()
+                        }
+                    );
+                    validator.effective_balance = 0;
+                    beacon_state.balances[index]= 0;
                 }
+            }
         }
 
-        self.storage.save_beacon_state_by_beacon_hash(beacon_block_hash, beacon_state).unwrap();
-
-        Some(withdrawals)
+        Ok((Some(withdrawals), beacon_state))
     }
 }
 

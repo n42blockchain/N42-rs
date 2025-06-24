@@ -416,8 +416,8 @@ where
                     return Err(eyre::eyre!("deposits mismatch between eth1 block and beacon block"));
                 }
 
-                let _ = self.beacon.gen_withdrawals(parent.parent_hash);
-                let new_beacon_state = self.beacon.state_transition(&new_beacon_block)?;
+                let (_, beacon_state_after_withdrawal) = self.beacon.gen_withdrawals(parent.parent_hash)?;
+                let new_beacon_state = self.beacon.state_transition(Some(beacon_state_after_withdrawal), &new_beacon_block)?;
                 if new_beacon_state.hash_slow() != new_beacon_block.state_root {
                     return Err(eyre::eyre!(format!("state root mismatch, new_beacon_state hash={:?}, new_beacon_block.state_root={:?}", new_beacon_state.hash_slow(), new_beacon_block.state_root)));
                 }
@@ -631,7 +631,7 @@ where
         let timestamp = now;
         debug!(target: "consensus-client", ?timestamp, "advance: PayloadAttributes timestamp");
 
-        let withdrawals = self.beacon.gen_withdrawals(header.hash());
+        let (withdrawals, beacon_state_after_withdrawal) = self.beacon.gen_withdrawals(header.hash())?;
         debug!(target: "consensus-client", ?withdrawals, "advance: PayloadAttributes withdrawals");
 
         let forkchoice_state = self.forkchoice_state();
@@ -689,7 +689,7 @@ where
                 validator_index: 0,
             },
         ];
-        let beacon_block = self.beacon.gen_beacon_block(parent_beacon_block_hash, &deposits, &attestations, &voluntary_exits, block)?;
+        let beacon_block = self.beacon.gen_beacon_block(Some(beacon_state_after_withdrawal), parent_beacon_block_hash, &deposits, &attestations, &voluntary_exits, block)?;
         let beacon_block_hash = beacon_block.hash_slow();
         self.storage.save_beacon_block_by_hash(beacon_block_hash, beacon_block.clone())?;
         self.storage.save_beacon_block_hash_by_eth1_hash(block.hash(), beacon_block_hash)?;

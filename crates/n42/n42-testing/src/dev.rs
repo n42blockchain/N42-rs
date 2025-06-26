@@ -1107,7 +1107,6 @@ async fn test_ensure_that_pending_votes_dont_survive_authorization_status_change
                 signer: "D".to_string(),
                 voted: Some("F".to_string()),
                 auth: Some(false),
-                ..Default::default()
             },
             TesterVote {
                 signer: "E".to_string(),

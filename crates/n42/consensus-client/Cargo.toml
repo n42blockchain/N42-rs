@@ -10,6 +10,7 @@ exclude.workspace = true
 
 [dependencies]
 n42-engine-primitives.workspace = true
+n42-primitives.workspace = true
 # reth
 #reth-beacon-consensus.workspace = true
 reth-storage-errors.workspace = true

@@ -7,9 +7,10 @@ use alloy_primitives::{Address, Bytes};
 use alloy_sol_types::{SolEnum, SolEvent, sol};
 use serde::{Deserialize, Serialize};
 use alloy_primitives::Sealable;
-use alloy_rlp::{Encodable, RlpEncodable,  RlpDecodable};
+use alloy_rlp::{Encodable, Decodable, RlpEncodable,  RlpDecodable};
 use std::collections::{HashMap, BTreeMap};
 use alloy_primitives::{keccak256, BlockHash, B256, Log};
+use n42_primitives::{Epoch, VoluntaryExit, VoluntaryExitWithSig};
 use crate::storage::{Storage};
 use tracing::{trace, debug, error, info, warn};
 
@@ -43,7 +44,7 @@ impl Beacon {
         }
     }
 
-    pub fn gen_beacon_block(&mut self, old_beacon_state: Option<BeaconState>, parent_hash: BlockHash, deposits: &Vec<Deposit>, attestations: &Vec<Attestation>, voluntary_exits: &Vec<VoluntaryExit>, eth1_sealed_block: &SealedBlock) -> eyre::Result<BeaconBlock> {
+    pub fn gen_beacon_block(&mut self, old_beacon_state: Option<BeaconState>, parent_hash: BlockHash, deposits: &Vec<Deposit>, attestations: &Vec<Attestation>, voluntary_exits: &Vec<VoluntaryExitWithSig>, eth1_sealed_block: &SealedBlock) -> eyre::Result<BeaconBlock> {
         let mut beacon_block = BeaconBlock {
             parent_hash,
             eth1_block_hash: eth1_sealed_block.hash_slow(),
@@ -111,6 +112,20 @@ impl Beacon {
 
         Ok((Some(withdrawals), beacon_state))
     }
+
+    pub fn is_valid_voluntary_exit(&mut self, eth1_block_hash: BlockHash, voluntary_exit: &VoluntaryExit, signature: &Bytes) -> eyre::Result<bool> {
+        let beacon_block_hash = self.storage.get_beacon_block_hash_by_eth1_hash(eth1_block_hash)?;
+        let beacon_state = self.storage.get_beacon_state_by_beacon_hash(beacon_block_hash)?;
+        if let Some(validator) = beacon_state.validators.get(voluntary_exit.validator_index as usize) {
+            if voluntary_exit.epoch > validator.activation_epoch && validator.exit_epoch == 0 {
+                // TODO: check signature
+
+                return Ok(true)
+            }
+        }
+
+        Ok(false)
+    }
 }
 
 fn get_address(withdrawal_credentials: &B256) -> Address {
@@ -120,10 +135,10 @@ fn get_address(withdrawal_credentials: &B256) -> Address {
 
 #[derive(Debug, Clone, Hash, Default, RlpEncodable, RlpDecodable, Serialize, Deserialize)]
 pub struct BeaconState {
-    slot: u64,
-    eth1_deposit_index: u64,
-    validators: Vec<Validator>,
-    balances: Vec<Gwei>,
+    pub slot: u64,
+    pub eth1_deposit_index: u64,
+    pub validators: Vec<Validator>,
+    pub balances: Vec<Gwei>,
 }
 
 impl Sealable for BeaconState {
@@ -135,7 +150,6 @@ impl Sealable for BeaconState {
 }
 
 type Gwei = u64;
-type Epoch = u64;
 
 // mock
 type BLSPubkey = Bytes;
@@ -143,16 +157,16 @@ type BLSSignature = Bytes;
 
 #[derive(Debug, Clone, Hash, Default, RlpEncodable, RlpDecodable, Serialize, Deserialize)]
 pub struct Validator {
-    pubkey: BLSPubkey,
-    withdrawal_credentials: B256,  // Commitment to pubkey for withdrawals
-    effective_balance: Gwei,  // Balance at stake
-    slashed: bool,
+    pub pubkey: BLSPubkey,
+    pub withdrawal_credentials: B256,  // Commitment to pubkey for withdrawals
+    pub effective_balance: Gwei,  // Balance at stake
+    pub slashed: bool,
 
     // Status epochs
-    activation_eligibility_epoch: Epoch,  // When criteria for activation were met
-    activation_epoch: Epoch,
-    exit_epoch: Epoch,
-    withdrawable_epoch: Epoch,  // When validator can withdraw funds
+    pub activation_eligibility_epoch: Epoch,  // When criteria for activation were met
+    pub activation_epoch: Epoch,
+    pub exit_epoch: Epoch,
+    pub withdrawable_epoch: Epoch,  // When validator can withdraw funds
 }
 
 #[derive(Debug, Clone, Hash, Default, RlpEncodable, RlpDecodable,  Serialize, Deserialize)]
@@ -175,7 +189,7 @@ impl Sealable for BeaconBlock {
 pub struct BeaconBlockBody {
     pub attestations: Vec<Attestation>,
     pub deposits: Vec<Deposit>,
-    pub voluntary_exits: Vec<VoluntaryExit>,
+    pub voluntary_exits: Vec<VoluntaryExitWithSig>,
 }
 
 #[derive(Debug, Clone, Hash, Default, RlpEncodable, RlpDecodable,  Serialize, Deserialize)]
@@ -195,12 +209,6 @@ pub struct DepositData {
     pub withdrawal_credentials: B256,
     pub amount: Gwei,
     pub signature: BLSSignature,
-}
-
-#[derive(Debug, Clone, Hash, Default, RlpEncodable, RlpDecodable,  Serialize, Deserialize)]
-pub struct VoluntaryExit {
-    pub epoch: Epoch,
-    pub validator_index: u64,
 }
 
 pub fn parse_deposit_log(log: &Log) -> Option<DepositEvent> {
@@ -309,8 +317,9 @@ impl BeaconState {
     }
 
     pub fn process_one_attestation(&mut self, attestation: &Attestation) -> eyre::Result<()> {
+        let epoch = self.slot / SLOTS_PER_EPOCH;
         for (index, validator) in self.validators.iter_mut().enumerate() {
-            if validator.pubkey == attestation.pubkey {
+            if validator.pubkey == attestation.pubkey && epoch >= validator.activation_epoch && (validator.exit_epoch == 0 || epoch < validator.exit_epoch) {
                 validator.effective_balance += REWARD_AMOUNT;
                 self.balances[index] += REWARD_AMOUNT;
                 break;
@@ -320,7 +329,7 @@ impl BeaconState {
         Ok(())
     }
 
-    pub fn process_voluntary_exit(&mut self, voluntary_exits: &Vec<VoluntaryExit>) -> eyre::Result<()> {
+    pub fn process_voluntary_exit(&mut self, voluntary_exits: &Vec<VoluntaryExitWithSig>) -> eyre::Result<()> {
         // TODO: check voluntary exits against beacon state
         // TODO: update state
         for voluntary_exit in voluntary_exits {
@@ -329,7 +338,8 @@ impl BeaconState {
         Ok(())
     }
 
-    pub fn process_one_voluntary_exit(&mut self, voluntary_exit: &VoluntaryExit) -> eyre::Result<()> {
+    pub fn process_one_voluntary_exit(&mut self, voluntary_exit: &VoluntaryExitWithSig) -> eyre::Result<()> {
+        let voluntary_exit = &voluntary_exit.voluntary_exit;
         let validator_index: usize = voluntary_exit.validator_index as usize;
         if validator_index >= self.validators.len() {
             return Ok(());
@@ -341,6 +351,15 @@ impl BeaconState {
         }
 
         Ok(())
+    }
+
+    pub fn valid_validators(&self) -> Vec<Validator> {
+        let mut validators = self.validators.clone();
+        validators.retain(|validator| {
+            let epoch = self.slot / SLOTS_PER_EPOCH;
+            epoch >= validator.activation_epoch && (validator.exit_epoch == 0 || epoch < validator.exit_epoch)
+        });
+        validators
     }
 
 }

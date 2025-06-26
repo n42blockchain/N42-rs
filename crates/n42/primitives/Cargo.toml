@@ -9,6 +9,7 @@ repository.workspace = true
 exclude.workspace = true
 
 [dependencies]
+eyre.workspace = true
 serde_json.workspace=true
 #reth
 reth-primitives = { workspace = true, default-features = false, features = ["std","arbitrary"] }

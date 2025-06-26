@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use reth_consensus::{ConsensusError, FullConsensus};
 use reth_ethereum_primitives::{EthPrimitives};
-use alloy_primitives::Sealable;
+use alloy_primitives::{Sealable, Bytes};
 use jsonrpsee::{core::RpcResult, proc_macros::rpc, types::{error::INVALID_PARAMS_CODE, ErrorObject}};
 use alloy_primitives::Address;
-use n42_primitives::Snapshot;
+use n42_primitives::{Snapshot, VoluntaryExit};
 use reth_provider::HeaderProvider;
 
 /// trait interface for a custom rpc namespace: `consensus`
@@ -77,6 +77,40 @@ where
         &self,
         ) -> RpcResult<HashMap<Address, bool>> {
         Ok(self.consensus.proposals().unwrap_or_default())
+    }
+}
+
+/// trait interface for a custom rpc namespace: `consensusBeaconExt`
+///
+/// This defines an additional namespace where all methods are configured as trait functions.
+#[cfg_attr(not(test), rpc(server, namespace = "consensusBeaconExt"))]
+#[cfg_attr(test, rpc(server, client, namespace = "consensusBeaconExt"))]
+pub trait ConsensusBeaconExtApi {
+    /// Voluntary exit in the clique consensus.
+    #[method(name = "voluntary_exit")]
+    fn voluntary_exit(&self,
+        message: VoluntaryExit,
+        signature: Bytes,
+        ) -> RpcResult<()>;
+}
+
+/// The type that implements the `consensusBeaconRpc` rpc namespace trait
+pub struct ConsensusBeaconExt<Cons, Provider> {
+    pub consensus: Cons,
+    pub provider: Provider,
+}
+
+impl<Cons, Provider> ConsensusBeaconExtApiServer for ConsensusBeaconExt<Cons, Provider>
+where
+    Cons:
+        FullConsensus<EthPrimitives, Error = ConsensusError> + Clone + Unpin + 'static,
+    Provider: HeaderProvider + Clone + 'static,
+{
+    fn voluntary_exit(&self,
+        message: VoluntaryExit,
+        signature: Bytes,
+        ) -> RpcResult<()> {
+        Ok(self.consensus.voluntary_exit(message, signature).unwrap_or_default())
     }
 }
 

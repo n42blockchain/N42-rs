@@ -1,3 +1,4 @@
+use tokio::sync::broadcast;
 use rand::prelude::IndexedRandom;
 use reth_primitives_traits::{AlloyBlockHeader};
 use alloy_primitives::Sealable;
@@ -17,7 +18,7 @@ use reth_execution_types::BlockExecutionResult;
 use reth_primitives_traits::{RecoveredBlock, Header, header::clique_utils::{recover_address_generic, SIGNATURE_LENGTH, seal_hash}};
 use reth_provider::{BlockIdReader, BlockReaderIdExt, HeaderProvider, SnapshotProvider};
 use tracing::{info, warn, debug, error};
-use n42_primitives::{APosConfig, Snapshot};
+use n42_primitives::{APosConfig, Snapshot, VoluntaryExit};
 
 use alloy_signer_local::{LocalSigner, PrivateKeySigner};
 use k256::ecdsa::SigningKey;
@@ -150,6 +151,8 @@ where
     recent_headers: RwLock<schnellru::LruMap<B256, Provider::Header>>,    // Recent headers for snapshot
     recent_tds: RwLock<schnellru::LruMap<B256, U256>>,
     recent_tds_inited: AtomicBool,
+    voluntary_exit_tx: broadcast::Sender<(VoluntaryExit, Bytes)>,
+    voluntary_exit_rx: broadcast::Receiver<(VoluntaryExit, Bytes)>,
 }
 
 
@@ -186,6 +189,7 @@ where
                 config.epoch = epoch;
             }
         }
+        let (voluntary_exit_tx, voluntary_exit_rx) = broadcast::channel::<(VoluntaryExit, Bytes)>(128);
 
         Self {
             config,
@@ -194,6 +198,8 @@ where
             recent_headers,
             recent_tds,
             recent_tds_inited,
+            voluntary_exit_tx,
+            voluntary_exit_rx,
             proposals: Arc::new(RwLock::new(HashMap::new())),
             signer: RwLock::new(eth_signer_address),
             eth_signer: RwLock::new(eth_signer),
@@ -849,5 +855,22 @@ where
             }
         }
         wiggle
+    }
+
+    fn get_voluntary_exit_rx(
+        &self,
+    ) -> Result<tokio::sync::broadcast::Receiver<(VoluntaryExit, Bytes)>, ConsensusError> {
+        let rx = self.voluntary_exit_tx.subscribe();
+        Ok(rx)
+    }
+
+    fn voluntary_exit(&self,
+        message: VoluntaryExit,
+        signature: Bytes,
+        ) -> Result<(), ConsensusError> {
+        debug!(target: "consensus::apos", ?message, ?signature, "voluntary_exit");
+        self.voluntary_exit_tx.send((message, signature)).map(|ret| ()).map_err(|err| ConsensusError::AposErrorDetail {
+            detail: err.to_string()
+        })
     }
 }

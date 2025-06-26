@@ -17,9 +17,9 @@
 	      "0x14dC79964da2C08b23698B3D3cc7Ca32193d9955":
 	      {"balance":"0x11111111ffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},
 	      "0x23618e81E3f5cdF7f54C3d65f7FBc0aBf5B21E8f":
-	      {"balance":"0x11111111ffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},
+	      {"balance":"0x0"},
 	      "0xa0Ee7A142d267C1f36714E4a8F75612F20a79720":
-	      {"balance":"0x11111111ffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}
+	      {"balance":"0x0"}
       },
       "parentHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
       "ommersHash": "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347",

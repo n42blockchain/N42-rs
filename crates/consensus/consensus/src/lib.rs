@@ -11,9 +11,10 @@
 
 extern crate alloc;
 
+use std::sync::Arc;
 use alloc::{fmt::Debug, string::String, vec::Vec};
 use alloy_consensus::Header;
-use alloy_primitives::{BlockHash, BlockNumber, Bloom, B256, U256, Address};
+use alloy_primitives::{BlockHash, BlockNumber, Bloom, B256, U256, Address, Bytes};
 use reth_execution_types::BlockExecutionResult;
 use reth_primitives_traits::{
     constants::{MAXIMUM_GAS_LIMIT_BLOCK, MINIMUM_GAS_LIMIT},
@@ -22,7 +23,7 @@ use reth_primitives_traits::{
     SealedHeader,
 };
 
-use n42_primitives::Snapshot;
+use n42_primitives::{Snapshot, VoluntaryExit};
 use std::collections::HashMap;
 use std::time::Duration;
  
@@ -148,6 +149,21 @@ pub trait Consensus<B: Block>: HeaderValidator<B::Header> {
     ) -> Duration {
         Duration::from_secs(0)
     }
+
+    fn voluntary_exit(&self,
+        message: VoluntaryExit,
+        signature: Bytes,
+        ) -> Result<(), ConsensusError> {
+        Ok(())
+    }
+
+    fn get_voluntary_exit_rx(
+        &self,
+    ) -> Result<tokio::sync::broadcast::Receiver<(VoluntaryExit, Bytes)>, ConsensusError> {
+        let (_, rx) = tokio::sync::broadcast::channel::<(VoluntaryExit, Bytes)>(128);
+        Ok(rx)
+    }
+
 }
 
 /// HeaderValidator is a protocol that validates headers and their relationships.

@@ -10,7 +10,7 @@ use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_node_builder::NodeHandle;
 use reth_node_ethereum::EthereumNode;
 use tracing::info;
-use n42::consensus_ext::{ConsensusExtApiServer, ConsensusExt};
+use n42::consensus_ext::{ConsensusExtApiServer, ConsensusExt, ConsensusBeaconExtApiServer, ConsensusBeaconExt};
 
 fn main() {
     reth_cli_util::sigsegv_handler::install();
@@ -30,10 +30,12 @@ fn main() {
                             let consensus = ctx.consensus().clone();
                             let provider = ctx.provider().clone();
 
+                            let beacon_ext = ConsensusBeaconExt { consensus: consensus.clone(), provider: provider.clone() };
                             let ext = ConsensusExt { consensus, provider };
 
                             // now we merge our extension namespace into all configured transports
                             ctx.auth_module.merge_auth_methods(ext.into_rpc())?;
+                            ctx.modules.merge_configured(beacon_ext.into_rpc())?;
 
                             println!("consensus rpc extension enabled");
 

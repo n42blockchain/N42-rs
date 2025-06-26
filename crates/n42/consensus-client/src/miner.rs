@@ -46,7 +46,8 @@ use tokio::time::{interval_at, sleep, Instant, Interval};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{trace, debug, error, info, warn};
 
-use crate::beacon::{Beacon, Deposit, parse_deposit_log, Attestation, VoluntaryExit, };
+use crate::beacon::{Beacon, Deposit, parse_deposit_log, Attestation};
+use n42_primitives::{VoluntaryExit, VoluntaryExitWithSig};
 use crate::network::{fetch_beacon_block, broadcast_beacon_block};
 use crate::storage::{Storage};
 
@@ -123,6 +124,7 @@ pub struct N42Miner<T: PayloadTypes, Provider, B, Network> {
     new_block_rx: mpsc::Receiver<(NewBlock, BlockHash)>,
     beacon: Beacon,
     storage: Storage,
+    voluntary_exits: Vec<VoluntaryExitWithSig>,
 
     num_generated_blocks: u64,
     num_skipped_new_block: u64,
@@ -175,6 +177,7 @@ where
         let genesis_hash = provider.chain_spec().genesis_hash().clone();
         let storage_init_data = consensus.get_eth_signer_address().unwrap().unwrap().to_string();
         let storage = Storage::new(storage_init_data, genesis_hash);
+        let beacon = Beacon::new(storage.clone());
         let miner = Self {
             provider,
             payload_attributes_builder,
@@ -193,8 +196,9 @@ where
             order_stats: HashMap::new(),
             new_block_tx,
             new_block_rx,
-            beacon: Beacon::new(storage.clone()),
+            beacon,
             storage,
+            voluntary_exits: Vec::new(),
         };
 
         // Spawn the miner
@@ -209,6 +213,7 @@ where
 
         let mut new_block_event_stream = self.network.subscribe_block();
         let mut network_event_stream = self.network.event_listener();
+        let mut voluntary_exit_rx = self.consensus.get_voluntary_exit_rx()?;
 
         loop {
             tokio::select! {
@@ -232,6 +237,21 @@ where
                 }
                 network_event = &mut network_event_stream.next() => {
                     debug!(target: "consensus-client", "network_event={:?}", network_event);
+                }
+                Ok((voluntary_exit, signature)) = voluntary_exit_rx.recv() => {
+                    debug!(target: "consensus-client", ?voluntary_exit, ?signature, "received voluntary_exit");
+
+                    let finalized_block_hash = self
+                        .provider
+                        .finalized_block_hash()
+                        .unwrap_or(Some(self.provider.chain_spec().genesis_hash()))
+                        .unwrap();
+                    let is_valid = self.beacon.is_valid_voluntary_exit(finalized_block_hash, &voluntary_exit, &signature)?;
+                    debug!(target: "consensus-client", ?is_valid, "check voluntary_exit");
+                    if is_valid {
+                        self.voluntary_exits.push(VoluntaryExitWithSig {voluntary_exit, signature});
+                    }
+
                 }
             }
         }
@@ -414,6 +434,19 @@ where
                 let deposits = self.get_deposits(parent.number.saturating_sub(DEPOSIT_GAP))?;
                 if deposits != new_beacon_block.body.deposits {
                     return Err(eyre::eyre!("deposits mismatch between eth1 block and beacon block"));
+                }
+
+                let finalized_block_hash = self
+                    .provider
+                    .finalized_block_hash()
+                    .unwrap_or(Some(self.provider.chain_spec().genesis_hash()))
+                    .unwrap();
+                for voluntary_exit in &new_beacon_block.body.voluntary_exits {
+                    let is_valid = self.beacon.is_valid_voluntary_exit(finalized_block_hash, &voluntary_exit.voluntary_exit, &voluntary_exit.signature)?;
+                    debug!(target: "consensus-client", ?is_valid, "check voluntary_exit");
+                    if !is_valid {
+                        return Err(eyre::eyre!(format!("voluntary_exit is not valid: {voluntary_exit:?}")));
+                    }
                 }
 
                 let (_, beacon_state_after_withdrawal) = self.beacon.gen_withdrawals(parent.parent_hash)?;
@@ -679,16 +712,22 @@ where
             fetch_beacon_block(block.header().parent_hash).unwrap().hash_slow()
         };
         let deposits = self.get_deposits(block.number.saturating_sub(DEPOSIT_GAP))?;
-        let attestations = vec![
-            Attestation { pubkey: Bytes::from_str("b758091fbfafd4bd5db58616a3db1725e8147c5c38dd62dd052db3d42b420ed47d2584ed219f9e42702da0a5c8864a5f").unwrap()},
-            Attestation { pubkey: Bytes::new(), },
-        ];
-        let voluntary_exits = vec![
-            VoluntaryExit {
-                epoch: 8,
-                validator_index: 0,
-            },
-        ];
+        let finalized_block_hash = self
+            .provider
+            .finalized_block_hash()
+            .unwrap_or(Some(self.provider.chain_spec().genesis_hash()))
+            .unwrap();
+        let finalized_beacon_block_hash = self.storage.get_beacon_block_hash_by_eth1_hash(finalized_block_hash)?;
+        let finalized_beacon_state = self.storage.get_beacon_state_by_beacon_hash(finalized_beacon_block_hash)?;
+        let attestations = finalized_beacon_state.valid_validators().into_iter().map(|validator| {
+            Attestation { pubkey: validator.pubkey, }
+        }).collect();
+        self.voluntary_exits.retain(|voluntary_exit|
+            {
+                let is_valid = self.beacon.is_valid_voluntary_exit(finalized_block_hash, &voluntary_exit.voluntary_exit, &voluntary_exit.signature).unwrap_or(false);
+                is_valid
+            });
+        let voluntary_exits = self.voluntary_exits.to_vec();
         let beacon_block = self.beacon.gen_beacon_block(Some(beacon_state_after_withdrawal), parent_beacon_block_hash, &deposits, &attestations, &voluntary_exits, block)?;
         let beacon_block_hash = beacon_block.hash_slow();
         self.storage.save_beacon_block_by_hash(beacon_block_hash, beacon_block.clone())?;

@@ -6,6 +6,7 @@ use alloy_primitives::{
 use core::cell::RefCell;
 use revm::{bytecode::Bytecode, state::AccountInfo, Database, DatabaseRef};
 use serde::{Deserialize, Serialize};
+use alloy_primitives::address;
 
 /// A container type that caches reads from an underlying [`DatabaseRef`].
 ///
@@ -41,6 +42,21 @@ pub struct CachedReads {
 // === impl CachedReads ===
 
 impl CachedReads {
+    pub fn set_nonce(&mut self,nonce:u64){
+        match self.accounts.get_mut(&address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266")){
+            Some(ca)=>ca.set_nonce(nonce),
+            None=>(),
+        }
+    }
+
+    ///
+    pub fn get_nonce(&self)->u64{
+        match self.accounts.get(&address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266")){
+            Some(ca)=>ca.get_nonce(),
+            None=>0,
+        }
+    }
+
     /// empty?
     pub fn is_empty(&self) -> bool {
         self.accounts.is_empty() && self.contracts.is_empty() && self.block_hashes.is_empty()
@@ -201,6 +217,18 @@ pub struct CachedAccount {
 }
 
 impl CachedAccount {
+    pub fn set_nonce(&mut self,nonce:u64){
+        match &mut self.info{
+            Some(ai)=>ai.nonce=nonce,
+            None=>(),
+        }
+    }
+    pub fn get_nonce(&self)->u64{
+        match &self.info{
+            Some(ai)=>ai.nonce,
+            None=>0,
+        }
+    }
     fn new(info: Option<AccountInfo>) -> Self {
         Self { info, storage: HashMap::default() }
     }

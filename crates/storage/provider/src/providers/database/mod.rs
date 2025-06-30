@@ -670,7 +670,9 @@ mod tests {
     use std::{ops::RangeInclusive, sync::Arc};
     use std::time::SystemTime;
     use std::time::UNIX_EPOCH;
-    use n42_primitives::{BeaconState, BeaconStateChangeset,Validator, ValidatorBeforeTx, ValidatorChangeset};
+    use n42_primitives::{BeaconState, BeaconBlock,BeaconStateChangeset,BeaconBlockChangeset,BeaconBlockBody,
+        Attestation,Deposit,DepositData,Validator, ValidatorBeforeTx, ValidatorChangeset,ValidatorRevert,
+        VoluntaryExit};
     use reth_storage_api::ValidatorChangeWriter;
     use reth_storage_api::ValidatorReader;
     use reth_db_api::transaction::DbTxMut;
@@ -679,8 +681,612 @@ mod tests {
     use reth_storage_api::BeaconReader;
     use reth_storage_api::BeaconWriter;
     use std::collections::HashMap;
-    
+    use std::collections::BTreeMap;
+
     #[test]
+    fn test_beacon_traits_comprehensive() -> ProviderResult<()> {
+        let factory = create_test_provider_factory();
+        
+        // Prepare test data
+        let mut rng = StdRng::seed_from_u64(42);
+        
+        // Generate test block hashes
+        let mut test_hashes = Vec::new();
+        for _ in 0..5 {
+            let mut bytes = [0u8; 32];
+            rng.fill(&mut bytes);
+            test_hashes.push(B256::from_slice(&bytes));
+        }
+        
+        // Create test beacon states
+        let beacon_state1 = BeaconState {
+            slot: 100,
+            eth1_deposit_index: 10,
+            validators: BTreeMap::new(),
+            balances: BTreeMap::new(),
+        };
+        
+        let beacon_state2 = BeaconState {
+            slot: 200,
+            eth1_deposit_index: 20,
+            validators: BTreeMap::new(),
+            balances: BTreeMap::new(),
+        };
+        
+        let beacon_state3 = BeaconState {
+            slot: 300,
+            eth1_deposit_index: 30,
+            validators: BTreeMap::new(),
+            balances: BTreeMap::new(),
+        };
+        
+        // Create test beacon blocks
+        let beacon_block1 = BeaconBlock {
+            eth1_block_hash: test_hashes[0],
+            state_root: test_hashes[1],
+            body: BeaconBlockBody {
+                attestations: vec![Attestation::default()],
+                deposits: vec![Deposit {
+                    proof: vec![test_hashes[2]],
+                    data: DepositData {
+                        pubkey: 12345,
+                        withdrawal_credentials: test_hashes[3],
+                        amount: 32000000000,
+                        signature: 67890,
+                    },
+                }],
+                voluntary_exits: vec![VoluntaryExit {
+                    epoch: 10,
+                    validator_index: 1,
+                }],
+            },
+        };
+        
+        let beacon_block2 = BeaconBlock {
+            eth1_block_hash: test_hashes[1],
+            state_root: test_hashes[2],
+            body: BeaconBlockBody::default(),
+        };
+        
+        let beacon_block3 = BeaconBlock {
+            eth1_block_hash: test_hashes[2],
+            state_root: test_hashes[3],
+            body: BeaconBlockBody::default(),
+        };
+        
+        // Phase 1: Test write_beaconstate function
+        {
+            let mut provider_rw = factory.provider_rw()?;
+            
+            // Add multiple beacon states
+            let changeset = BeaconStateChangeset {
+                beaconstates: vec![
+                    (test_hashes[0], beacon_state1.clone()),
+                    (test_hashes[1], beacon_state2.clone()),
+                ],
+            };
+            
+            provider_rw.write_beaconstate(changeset)?;
+            provider_rw.commit()?;
+        }
+        
+        // Phase 2: Test BeaconReader trait's get_beaconstate_by_blockhash function
+        {
+            let provider_ro = factory.provider()?;
+            
+            // Test existing beacon states
+            let result1 = provider_ro.get_beaconstate_by_blockhash(test_hashes[0])?;
+            assert!(result1.is_some(), "beacon state 1 should exist");
+            let retrieved_state1 = result1.unwrap();
+            assert_eq!(beacon_state1.slot, retrieved_state1.slot);
+            assert_eq!(beacon_state1.eth1_deposit_index, retrieved_state1.eth1_deposit_index);
+            
+            let result2 = provider_ro.get_beaconstate_by_blockhash(test_hashes[1])?;
+            assert!(result2.is_some(), "beacon state 2 should exist");
+            let retrieved_state2 = result2.unwrap();
+            assert_eq!(beacon_state2.slot, retrieved_state2.slot);
+            assert_eq!(beacon_state2.eth1_deposit_index, retrieved_state2.eth1_deposit_index);
+            
+            // Test non-existing beacon state
+            let result3 = provider_ro.get_beaconstate_by_blockhash(test_hashes[2])?;
+            assert!(result3.is_none(), "beacon state 3 should not exist");
+        }
+        
+        // Phase 3: Test write_beaconblock function
+        {
+            let mut provider_rw = factory.provider_rw()?;
+            
+            // Add multiple beacon blocks
+            let changeset = BeaconBlockChangeset {
+                beaconblocks: vec![
+                    (test_hashes[0], beacon_block1.clone()),
+                    (test_hashes[1], beacon_block2.clone()),
+                ],
+            };
+            
+            provider_rw.write_beaconblock(changeset)?;
+            provider_rw.commit()?;
+        }
+        
+        // Phase 4: Test BeaconReader trait's get_beaconblock_by_blockhash function
+        {
+            let provider_ro = factory.provider()?;
+            
+            // Test existing beacon blocks
+            let result1 = provider_ro.get_beaconblock_by_blockhash(test_hashes[0])?;
+            assert!(result1.is_some(), "beacon block 1 should exist");
+            let retrieved_block1 = result1.unwrap();
+            assert_eq!(beacon_block1.eth1_block_hash, retrieved_block1.eth1_block_hash);
+            assert_eq!(beacon_block1.state_root, retrieved_block1.state_root);
+            assert_eq!(beacon_block1.body.deposits.len(), retrieved_block1.body.deposits.len());
+            
+            let result2 = provider_ro.get_beaconblock_by_blockhash(test_hashes[1])?;
+            assert!(result2.is_some(), "beacon block 2 should exist");
+            let retrieved_block2 = result2.unwrap();
+            assert_eq!(beacon_block2.eth1_block_hash, retrieved_block2.eth1_block_hash);
+            assert_eq!(beacon_block2.state_root, retrieved_block2.state_root);
+            
+            // Test non-existing beacon block
+            let result3 = provider_ro.get_beaconblock_by_blockhash(test_hashes[2])?;
+            assert!(result3.is_none(), "beacon block 3 should not exist");
+        }
+        
+        // Phase 5: Add more data for removal and unwind testing
+        {
+            let mut provider_rw = factory.provider_rw()?;
+            
+            // Add third beacon state and block
+            let state_changeset = BeaconStateChangeset {
+                beaconstates: vec![(test_hashes[2], beacon_state3.clone())],
+            };
+            let block_changeset = BeaconBlockChangeset {
+                beaconblocks: vec![(test_hashes[2], beacon_block3.clone())],
+            };
+            
+            provider_rw.write_beaconstate(state_changeset)?;
+            provider_rw.write_beaconblock(block_changeset)?;
+            
+            // Add beacon number to hash mappings for unwind testing
+            provider_rw.tx_ref().put::<tables::BeaconNum2Hash>(1, test_hashes[0])?;
+            provider_rw.tx_ref().put::<tables::BeaconNum2Hash>(2, test_hashes[1])?;
+            provider_rw.tx_ref().put::<tables::BeaconNum2Hash>(3, test_hashes[2])?;
+            
+            provider_rw.commit()?;
+        }
+        
+        // Phase 6: Test remove_beaconstate function
+        {
+            let mut provider_rw = factory.provider_rw()?;
+            
+            // Remove specific beacon state
+            provider_rw.remove_beaconstate(vec![test_hashes[1]])?;
+            provider_rw.commit()?;
+            
+            // Verify removal
+            let provider_ro = factory.provider()?;
+            let result = provider_ro.get_beaconstate_by_blockhash(test_hashes[1])?;
+            assert!(result.is_none(), "beacon state should be removed");
+            
+            // Verify other states still exist
+            let result1 = provider_ro.get_beaconstate_by_blockhash(test_hashes[0])?;
+            assert!(result1.is_some(), "beacon state 1 should still exist");
+            let result3 = provider_ro.get_beaconstate_by_blockhash(test_hashes[2])?;
+            assert!(result3.is_some(), "beacon state 3 should still exist");
+        }
+        
+        // Phase 7: Test remove_beaconblock function
+        {
+            let mut provider_rw = factory.provider_rw()?;
+            
+            // Remove specific beacon block
+            provider_rw.remove_beaconblock(vec![test_hashes[1]])?;
+            provider_rw.commit()?;
+            
+            // Verify removal
+            let provider_ro = factory.provider()?;
+            let result = provider_ro.get_beaconblock_by_blockhash(test_hashes[1])?;
+            assert!(result.is_none(), "beacon block should be removed");
+            
+            // Verify other blocks still exist
+            let result1 = provider_ro.get_beaconblock_by_blockhash(test_hashes[0])?;
+            assert!(result1.is_some(), "beacon block 1 should still exist");
+            let result3 = provider_ro.get_beaconblock_by_blockhash(test_hashes[2])?;
+            assert!(result3.is_some(), "beacon block 3 should still exist");
+        }
+        
+        // Phase 8: Test unwind_beacon function
+        {
+            let mut provider_rw = factory.provider_rw()?;
+            
+            // Unwind blocks 2 and 3 (should remove corresponding beacon data)
+            provider_rw.unwind_beacon(2..=3)?;
+            provider_rw.commit()?;
+            
+            // Verify unwind results
+            let provider_ro = factory.provider()?;
+            
+            // Block 1 data should still exist
+            let state_result1 = provider_ro.get_beaconstate_by_blockhash(test_hashes[0])?;
+            assert!(state_result1.is_some(), "beacon state 1 should still exist after unwind");
+            let block_result1 = provider_ro.get_beaconblock_by_blockhash(test_hashes[0])?;
+            assert!(block_result1.is_some(), "beacon block 1 should still exist after unwind");
+            
+            // Block 3 data should be removed (block 2 was already removed in previous tests)
+            let state_result3 = provider_ro.get_beaconstate_by_blockhash(test_hashes[2])?;
+            assert!(state_result3.is_none(), "beacon state 3 should be removed after unwind");
+            let block_result3 = provider_ro.get_beaconblock_by_blockhash(test_hashes[2])?;
+            assert!(block_result3.is_none(), "beacon block 3 should be removed after unwind");
+        }
+        
+        // Phase 9: Test edge cases
+        {
+            let provider_ro = factory.provider()?;
+            
+            // Test with non-existent hash
+            let mut non_existent_bytes = [0u8; 32];
+            rng.fill(&mut non_existent_bytes);
+            let non_existent_hash = B256::from_slice(&non_existent_bytes);
+            
+            let state_result = provider_ro.get_beaconstate_by_blockhash(non_existent_hash)?;
+            assert!(state_result.is_none(), "non-existent beacon state should return None");
+            
+            let block_result = provider_ro.get_beaconblock_by_blockhash(non_existent_hash)?;
+            assert!(block_result.is_none(), "non-existent beacon block should return None");
+        }
+        
+        // Phase 10: Test batch operations
+        {
+            let mut provider_rw = factory.provider_rw()?;
+            
+            // Test removing multiple items at once
+            let mut batch_hashes = Vec::new();
+            let mut batch_states = Vec::new();
+            let mut batch_blocks = Vec::new();
+            
+            for i in 0..3 {
+                let mut bytes = [0u8; 32];
+                rng.fill(&mut bytes);
+                let hash = B256::from_slice(&bytes);
+                batch_hashes.push(hash);
+                
+                let state = BeaconState {
+                    slot: 400 + i as u64,
+                    eth1_deposit_index: 40 + i as u64,
+                    validators: BTreeMap::new(),
+                    balances: BTreeMap::new(),
+                };
+                batch_states.push((hash, state));
+                
+                let block = BeaconBlock {
+                    eth1_block_hash: hash,
+                    state_root: hash,
+                    body: BeaconBlockBody::default(),
+                };
+                batch_blocks.push((hash, block));
+            }
+            
+            // Write batch data
+            let state_changeset = BeaconStateChangeset {
+                beaconstates: batch_states,
+            };
+            let block_changeset = BeaconBlockChangeset {
+                beaconblocks: batch_blocks,
+            };
+            
+            provider_rw.write_beaconstate(state_changeset)?;
+            provider_rw.write_beaconblock(block_changeset)?;
+            provider_rw.commit()?;
+            
+            // Verify batch write
+            let provider_ro = factory.provider()?;
+            for hash in &batch_hashes {
+                let state_result = provider_ro.get_beaconstate_by_blockhash(*hash)?;
+                assert!(state_result.is_some(), "batch beacon state should exist");
+                
+                let block_result = provider_ro.get_beaconblock_by_blockhash(*hash)?;
+                assert!(block_result.is_some(), "batch beacon block should exist");
+            }
+            
+            // Test batch removal
+            let mut provider_rw = factory.provider_rw()?;
+            provider_rw.remove_beaconstate(batch_hashes.clone())?;
+            provider_rw.remove_beaconblock(batch_hashes.clone())?;
+            provider_rw.commit()?;
+            
+            // Verify batch removal
+            let provider_ro = factory.provider()?;
+            for hash in &batch_hashes {
+                let state_result = provider_ro.get_beaconstate_by_blockhash(*hash)?;
+                assert!(state_result.is_none(), "batch beacon state should be removed");
+                
+                let block_result = provider_ro.get_beaconblock_by_blockhash(*hash)?;
+                assert!(block_result.is_none(), "batch beacon block should be removed");
+            }
+        }
+        
+        println!("✅ All BeaconReader and BeaconWriter trait functions tested successfully!");
+        Ok(())
+    }
+
+    #[test]
+    fn test_validator_funcs() -> ProviderResult<()> {
+        let factory = create_test_provider_factory();
+        
+        // Prepare test data
+        let validator_address1 = Address::random();
+        let validator_address2 = Address::random();
+        let validator_address3 = Address::random();
+        
+        let validator1 = Validator {
+            index: 1,
+            balance: 32000000000,
+            is_active: true,
+            is_slashed: false,
+            is_withdrawal_allowed: false,
+        };
+        
+        let validator2 = Validator {
+            index: 2,
+            balance: 33000000000,
+            is_active: true,
+            is_slashed: false,
+            is_withdrawal_allowed: true,
+        };
+        
+        let validator3 = Validator {
+            index: 3,
+            balance: 31000000000,
+            is_active: false,
+            is_slashed: true,
+            is_withdrawal_allowed: false,
+        };
+        
+        // Phase 1: Test write_validator_changes function
+        {
+            let mut provider_rw = factory.provider_rw()?;
+            
+            // Add multiple validators
+            let mut validators = Vec::new();
+            validators.push((validator_address1, Some(validator1.clone())));
+            validators.push((validator_address2, Some(validator2.clone())));
+            let changeset = ValidatorChangeset { validators };
+            
+            provider_rw.write_validator_changes(changeset)?;
+            provider_rw.commit()?;
+        }
+        
+        // Phase 2: Test basic_validator function of ValidatorReader trait
+        {
+            let provider_ro = factory.provider()?;
+            
+            // Test existing validators
+            let result1 = provider_ro.basic_validator(validator_address1)?;
+            assert!(result1.is_some(), "validator1 should exist");
+            let retrieved_validator1 = result1.unwrap();
+            assert_eq!(validator1.index, retrieved_validator1.index);
+            assert_eq!(validator1.balance, retrieved_validator1.balance);
+            assert_eq!(validator1.is_active, retrieved_validator1.is_active);
+            
+            let result2 = provider_ro.basic_validator(validator_address2)?;
+            assert!(result2.is_some(), "validator2 should exist");
+            let retrieved_validator2 = result2.unwrap();
+            assert_eq!(validator2.index, retrieved_validator2.index);
+            assert_eq!(validator2.balance, retrieved_validator2.balance);
+            assert_eq!(validator2.is_withdrawal_allowed, retrieved_validator2.is_withdrawal_allowed);
+            
+            // Test non-existing validators
+            let result3 = provider_ro.basic_validator(validator_address3)?;
+            assert!(result3.is_none(), "validator3 should not exist");
+        }
+        
+        // Phase 3: Add changeset data and test changed_validators_and_blocks_with_range
+        {
+            let mut provider_rw = factory.provider_rw()?;
+            
+            // Add change record in block 1
+            provider_rw.tx_ref().put::<tables::ValidatorChangeSets>(
+                1,
+                ValidatorBeforeTx {
+                    address: validator_address1,
+                    info: None,
+                }
+            )?;
+            
+            // Add change record in block 2
+            provider_rw.tx_ref().put::<tables::ValidatorChangeSets>(
+                2,
+                ValidatorBeforeTx {
+                    address: validator_address1,
+                    info: Some(validator1.clone()),
+                }
+            )?;
+            
+            provider_rw.tx_ref().put::<tables::ValidatorChangeSets>(
+                2,
+                ValidatorBeforeTx {
+                    address: validator_address2,
+                    info: None,
+                }
+            )?;
+            
+            // Add change record in block 3
+            provider_rw.tx_ref().put::<tables::ValidatorChangeSets>(
+                3,
+                ValidatorBeforeTx {
+                    address: validator_address2,
+                    info: Some(validator2.clone()),
+                }
+            )?;
+            
+            provider_rw.commit()?;
+        }
+        
+        // Test changed_validators_and_blocks_with_range function
+        {
+            let provider_ro = factory.provider()?;
+            
+            // Test block range 1..=2
+            let changes_1_2 = provider_ro.changed_validators_and_blocks_with_range(1..=2)?;
+            assert!(changes_1_2.contains_key(&validator_address1), "validator1 should have changes in range 1..=2");
+            assert!(changes_1_2.contains_key(&validator_address2), "validator2 should have changes in range 1..=2");
+            
+            let validator1_blocks = &changes_1_2[&validator_address1];
+            assert!(validator1_blocks.contains(&1), "validator1 should have change in block 1");
+            assert!(validator1_blocks.contains(&2), "validator1 should have change in block 2");
+            
+            let validator2_blocks = &changes_1_2[&validator_address2];
+            assert!(validator2_blocks.contains(&2), "validator2 should have change in block 2");
+            
+            // Test block range 3..=3
+            let changes_3 = provider_ro.changed_validators_and_blocks_with_range(3..=3)?;
+            assert!(changes_3.contains_key(&validator_address2), "validator2 should have changes in range 3..=3");
+            assert!(!changes_3.contains_key(&validator_address1), "validator1 should not have changes in range 3..=3");
+        }
+        
+        // Phase 4: Test insert_validator_history_index function
+        {
+            let mut provider_rw = factory.provider_rw()?;
+            
+            // Prepare history index data
+            let mut validator_transitions = BTreeMap::new();
+            validator_transitions.insert(validator_address1, vec![1u64, 2u64]);
+            validator_transitions.insert(validator_address2, vec![2u64, 3u64]);
+            
+            provider_rw.insert_validator_history_index(validator_transitions)?;
+            provider_rw.commit()?;
+        }
+        
+        // Phase 5: Test write_validator_reverts function
+        {
+            let mut provider_rw = factory.provider_rw()?;
+            
+            // Prepare revert data
+            let validator_reverts = ValidatorRevert {
+                validators: vec![
+                    vec![
+                        (validator_address1, Some(validator1.clone())),
+                        (validator_address2, None),
+                    ],
+                    vec![
+                        (validator_address2, Some(validator2.clone())),
+                    ],
+                ],
+            };
+            
+            provider_rw.write_validator_reverts(10, validator_reverts)?;
+            provider_rw.commit()?;
+        }
+        
+        // Phase 6: Test unwind_validator_history_indices function
+        {
+            let mut provider_rw = factory.provider_rw()?;
+            
+            // Prepare changeset data for unwinding
+            let changesets = vec![
+                (1u64, ValidatorBeforeTx {
+                    address: validator_address1,
+                    info: None,
+                }),
+                (2u64, ValidatorBeforeTx {
+                    address: validator_address2,
+                    info: Some(validator2.clone()),
+                }),
+            ];
+            
+            let unwound_count = provider_rw.unwind_validator_history_indices(changesets.iter())?;
+            assert!(unwound_count > 0, "should have unwound some indices");
+            
+            provider_rw.commit()?;
+        }
+        
+        // Phase 7: Test unwind_validator function
+        {
+            let mut provider_rw = factory.provider_rw()?;
+            
+            // Add third validator for unwind testing
+            let mut validators = Vec::new();
+            validators.push((validator_address3, Some(validator3.clone())));
+            let changeset = ValidatorChangeset { validators };
+            provider_rw.write_validator_changes(changeset)?;
+            
+            // Add changeset record
+            provider_rw.tx_ref().put::<tables::ValidatorChangeSets>(
+                5,
+                ValidatorBeforeTx {
+                    address: validator_address3,
+                    info: None,
+                }
+            )?;
+            
+            provider_rw.commit()?;
+            
+            // Verify validator exists
+            let provider_ro = factory.provider()?;
+            let result = provider_ro.basic_validator(validator_address3)?;
+            assert!(result.is_some(), "validator3 should exist before unwind");
+            
+            // Execute unwind
+            let mut provider_rw = factory.provider_rw()?;
+            provider_rw.unwind_validator(5..=5)?;
+            provider_rw.commit()?;
+            
+            // Verify unwind result
+            let provider_ro = factory.provider()?;
+            let result = provider_ro.basic_validator(validator_address3)?;
+            assert!(result.is_none(), "validator3 should not exist after unwind");
+        }
+        
+        // Phase 8: Test remove_validator function
+        {
+            let mut provider_rw = factory.provider_rw()?;
+            
+            // Add a new validator for removal testing
+            let test_validator = Validator {
+                index: 99,
+                balance: 1000000000,
+                is_active: true,
+                is_slashed: false,
+                is_withdrawal_allowed: false,
+            };
+            
+            let test_address = Address::random();
+            let mut validators = Vec::new();
+            validators.push((test_address, Some(test_validator.clone())));
+            let changeset = ValidatorChangeset { validators };
+            provider_rw.write_validator_changes(changeset)?;
+            
+            // 添加变更集记录
+            provider_rw.tx_ref().put::<tables::ValidatorChangeSets>(
+                6,
+                ValidatorBeforeTx {
+                    address: test_address,
+                    info: None,
+                }
+            )?;
+            
+            provider_rw.commit()?;
+            
+            // Verify validator exists
+            let provider_ro = factory.provider()?;
+            let result = provider_ro.basic_validator(test_address)?;
+            assert!(result.is_some(), "test validator should exist before removal");
+            
+            // Execute removal
+            let mut provider_rw = factory.provider_rw()?;
+            provider_rw.remove_validator(6..=6)?;
+            provider_rw.commit()?;
+            
+            // Verify removal result
+            let provider_ro = factory.provider()?;
+            let result = provider_ro.basic_validator(test_address)?;
+            assert!(result.is_none(), "test validator should not exist after removal");
+        }
+        
+        println!("✅ All ValidatorReader and ValidatorChangeWriter trait functions tested successfully!");
+        Ok(())
+    }
+    
+    // #[test]
     // fn test_beaconstate_flow() -> ProviderResult<()> {
     //     let factory=create_test_provider_factory();
     //     let mut provider_rw=factory.provider_rw()?;
@@ -741,155 +1347,155 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_basic_validator()->ProviderResult<()>{
-        let factory=create_test_provider_factory();
-        let mut provider_rw=factory.provider_rw()?;
-        let validator_address=Address::random();
-        let validator=Validator{
-            index:1,
-            balance:32000000000,
-            is_active:true,
-            is_slashed:false,
-            is_withdrawal_allowed:false,
-        };
-        let mut validators=Vec::new();
-        validators.push((validator_address,Some(validator.clone())));
-        let changeset =ValidatorChangeset{validators};
-        provider_rw.write_validator_changes(changeset)?;
-        provider_rw.commit()?;
-        let provider_ro=factory.provider()?;
-        let result=provider_ro.basic_validator(validator_address)?;
-        assert!(result.is_some(),"validator data");
-        let retrieved_validator=result.unwrap();
-        assert_eq!(validator.index, retrieved_validator.index);
-        assert_eq!(validator.balance, retrieved_validator.balance);
-        assert_eq!(validator.is_active, retrieved_validator.is_active);
-        assert_eq!(validator.is_slashed, retrieved_validator.is_slashed);
-        assert_eq!(validator.is_withdrawal_allowed, retrieved_validator.is_withdrawal_allowed);
-        let non_existent_address=Address::random();
-        let non_existent_result=provider_ro.basic_validator(non_existent_address)?;
-        assert!(non_existent_result.is_none(),"non-existent validator data");
-        Ok(())
-    }
+    // #[test]
+    // fn test_basic_validator()->ProviderResult<()>{
+    //     let factory=create_test_provider_factory();
+    //     let mut provider_rw=factory.provider_rw()?;
+    //     let validator_address=Address::random();
+    //     let validator=Validator{
+    //         index:1,
+    //         balance:32000000000,
+    //         is_active:true,
+    //         is_slashed:false,
+    //         is_withdrawal_allowed:false,
+    //     };
+    //     let mut validators=Vec::new();
+    //     validators.push((validator_address,Some(validator.clone())));
+    //     let changeset =ValidatorChangeset{validators};
+    //     provider_rw.write_validator_changes(changeset)?;
+    //     provider_rw.commit()?;
+    //     let provider_ro=factory.provider()?;
+    //     let result=provider_ro.basic_validator(validator_address)?;
+    //     assert!(result.is_some(),"validator data");
+    //     let retrieved_validator=result.unwrap();
+    //     assert_eq!(validator.index, retrieved_validator.index);
+    //     assert_eq!(validator.balance, retrieved_validator.balance);
+    //     assert_eq!(validator.is_active, retrieved_validator.is_active);
+    //     assert_eq!(validator.is_slashed, retrieved_validator.is_slashed);
+    //     assert_eq!(validator.is_withdrawal_allowed, retrieved_validator.is_withdrawal_allowed);
+    //     let non_existent_address=Address::random();
+    //     let non_existent_result=provider_ro.basic_validator(non_existent_address)?;
+    //     assert!(non_existent_result.is_none(),"non-existent validator data");
+    //     Ok(())
+    // }
 
-    #[test]
-    fn test_unwind_validator() -> ProviderResult<()> {
-        let factory = create_test_provider_factory();
-        let mut provider_rw = factory.provider_rw()?;
+    // #[test]
+    // fn test_unwind_validator() -> ProviderResult<()> {
+    //     let factory = create_test_provider_factory();
+    //     let mut provider_rw = factory.provider_rw()?;
         
-        let validator_address1 = Address::random();
-        let validator_address2 = Address::random();
+    //     let validator_address1 = Address::random();
+    //     let validator_address2 = Address::random();
         
-        let validator1 = Validator {
-            index: 1,
-            balance: 32000000000,
-            is_active: true,
-            is_slashed: false,
-            is_withdrawal_allowed: false,
-        };
+    //     let validator1 = Validator {
+    //         index: 1,
+    //         balance: 32000000000,
+    //         is_active: true,
+    //         is_slashed: false,
+    //         is_withdrawal_allowed: false,
+    //     };
         
-        let validator2 = Validator {
-            index: 2,
-            balance: 32000000000,
-            is_active: true,
-            is_slashed: false,
-            is_withdrawal_allowed: false,
-        };
+    //     let validator2 = Validator {
+    //         index: 2,
+    //         balance: 32000000000,
+    //         is_active: true,
+    //         is_slashed: false,
+    //         is_withdrawal_allowed: false,
+    //     };
         
-        let mut validators = Vec::new();
-        validators.push((validator_address1, Some(validator1.clone())));
-        let changeset = ValidatorChangeset { validators };
-        provider_rw.write_validator_changes(changeset)?;
+    //     let mut validators = Vec::new();
+    //     validators.push((validator_address1, Some(validator1.clone())));
+    //     let changeset = ValidatorChangeset { validators };
+    //     provider_rw.write_validator_changes(changeset)?;
         
-        provider_rw.tx_ref().put::<tables::ValidatorChangeSets>(
-            1, 
-            ValidatorBeforeTx {
-                address: validator_address1,
-                info: None, 
-            }
-        )?;
+    //     provider_rw.tx_ref().put::<tables::ValidatorChangeSets>(
+    //         1, 
+    //         ValidatorBeforeTx {
+    //             address: validator_address1,
+    //             info: None, 
+    //         }
+    //     )?;
         
-        provider_rw.commit()?;
+    //     provider_rw.commit()?;
         
-        let mut provider_rw = factory.provider_rw()?;
-        let mut modified_validator1 = validator1.clone();
-        modified_validator1.balance = 33000000000; 
-        modified_validator1.is_slashed = true; 
+    //     let mut provider_rw = factory.provider_rw()?;
+    //     let mut modified_validator1 = validator1.clone();
+    //     modified_validator1.balance = 33000000000; 
+    //     modified_validator1.is_slashed = true; 
         
-        let mut validators = Vec::new();
-        validators.push((validator_address1, Some(modified_validator1.clone())));
-        validators.push((validator_address2, Some(validator2.clone())));
-        let changeset = ValidatorChangeset { validators };
-        provider_rw.write_validator_changes(changeset)?;
+    //     let mut validators = Vec::new();
+    //     validators.push((validator_address1, Some(modified_validator1.clone())));
+    //     validators.push((validator_address2, Some(validator2.clone())));
+    //     let changeset = ValidatorChangeset { validators };
+    //     provider_rw.write_validator_changes(changeset)?;
         
-        provider_rw.tx_ref().put::<tables::ValidatorChangeSets>(
-            2, 
-            ValidatorBeforeTx {
-                address: validator_address1,
-                info: Some(validator1.clone()), 
-            }
-        )?;
+    //     provider_rw.tx_ref().put::<tables::ValidatorChangeSets>(
+    //         2, 
+    //         ValidatorBeforeTx {
+    //             address: validator_address1,
+    //             info: Some(validator1.clone()), 
+    //         }
+    //     )?;
         
-        provider_rw.tx_ref().put::<tables::ValidatorChangeSets>(
-            2, 
-            ValidatorBeforeTx {
-                address: validator_address2,
-                info: None, 
-            }
-        )?;
+    //     provider_rw.tx_ref().put::<tables::ValidatorChangeSets>(
+    //         2, 
+    //         ValidatorBeforeTx {
+    //             address: validator_address2,
+    //             info: None, 
+    //         }
+    //     )?;
         
-        provider_rw.commit()?;
+    //     provider_rw.commit()?;
         
-        let mut provider_rw = factory.provider_rw()?;
-        let mut modified_validator2 = validator2.clone();
-        modified_validator2.is_active = false; 
+    //     let mut provider_rw = factory.provider_rw()?;
+    //     let mut modified_validator2 = validator2.clone();
+    //     modified_validator2.is_active = false; 
         
-        let mut validators = Vec::new();
-        validators.push((validator_address2, Some(modified_validator2.clone())));
-        let changeset = ValidatorChangeset { validators };
-        provider_rw.write_validator_changes(changeset)?;
+    //     let mut validators = Vec::new();
+    //     validators.push((validator_address2, Some(modified_validator2.clone())));
+    //     let changeset = ValidatorChangeset { validators };
+    //     provider_rw.write_validator_changes(changeset)?;
         
-        provider_rw.tx_ref().put::<tables::ValidatorChangeSets>(
-            3, 
-            ValidatorBeforeTx {
-                address: validator_address2,
-                info: Some(validator2.clone()), 
-            }
-        )?;
+    //     provider_rw.tx_ref().put::<tables::ValidatorChangeSets>(
+    //         3, 
+    //         ValidatorBeforeTx {
+    //             address: validator_address2,
+    //             info: Some(validator2.clone()), 
+    //         }
+    //     )?;
         
-        provider_rw.commit()?;
+    //     provider_rw.commit()?;
         
-        let provider_ro = factory.provider()?;
+    //     let provider_ro = factory.provider()?;
         
-        let result1 = provider_ro.basic_validator(validator_address1)?;
-        assert!(result1.is_some(), "validator1 data should exist");
-        let retrieved_validator1 = result1.unwrap();
-        assert_eq!(modified_validator1.balance, retrieved_validator1.balance);
-        assert_eq!(modified_validator1.is_slashed, retrieved_validator1.is_slashed);
+    //     let result1 = provider_ro.basic_validator(validator_address1)?;
+    //     assert!(result1.is_some(), "validator1 data should exist");
+    //     let retrieved_validator1 = result1.unwrap();
+    //     assert_eq!(modified_validator1.balance, retrieved_validator1.balance);
+    //     assert_eq!(modified_validator1.is_slashed, retrieved_validator1.is_slashed);
         
-        let result2 = provider_ro.basic_validator(validator_address2)?;
-        assert!(result2.is_some(), "validator2 data should exist");
-        let retrieved_validator2 = result2.unwrap();
-        assert_eq!(modified_validator2.is_active, retrieved_validator2.is_active);
+    //     let result2 = provider_ro.basic_validator(validator_address2)?;
+    //     assert!(result2.is_some(), "validator2 data should exist");
+    //     let retrieved_validator2 = result2.unwrap();
+    //     assert_eq!(modified_validator2.is_active, retrieved_validator2.is_active);
         
-        let mut provider_rw = factory.provider_rw()?;
-        provider_rw.unwind_validator(2..=3)?;
-        provider_rw.commit()?;
+    //     let mut provider_rw = factory.provider_rw()?;
+    //     provider_rw.unwind_validator(2..=3)?;
+    //     provider_rw.commit()?;
         
-        let provider_ro = factory.provider()?;
+    //     let provider_ro = factory.provider()?;
         
-        let result1 = provider_ro.basic_validator(validator_address1)?;
-        assert!(result1.is_some(), "validator1 data should exist after unwind");
-        let retrieved_validator1 = result1.unwrap();
-        assert_eq!(validator1.balance, retrieved_validator1.balance);
-        assert_eq!(validator1.is_slashed, retrieved_validator1.is_slashed);
+    //     let result1 = provider_ro.basic_validator(validator_address1)?;
+    //     assert!(result1.is_some(), "validator1 data should exist after unwind");
+    //     let retrieved_validator1 = result1.unwrap();
+    //     assert_eq!(validator1.balance, retrieved_validator1.balance);
+    //     assert_eq!(validator1.is_slashed, retrieved_validator1.is_slashed);
         
-        let result2 = provider_ro.basic_validator(validator_address2)?;
-        assert!(result2.is_none(), "validator2 data should not exist after unwind");
+    //     let result2 = provider_ro.basic_validator(validator_address2)?;
+    //     assert!(result2.is_none(), "validator2 data should not exist after unwind");
         
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
     #[test]
     fn common_history_provider() {

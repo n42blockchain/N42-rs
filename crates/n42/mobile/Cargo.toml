@@ -1,5 +1,5 @@
 [package]
-name = "mobile"
+name = "n42-mobile"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,8 +9,16 @@ repository.workspace = true
 exclude.workspace = true
 
 [dependencies]
+# tokio_tungstenite="1.0"
+tokio-tungstenite = "0.21"
+anyhow="1.0.98"
+serde_json="1.0.140"
 n42-engine-types.workspace=true
 jsonrpsee.workspace=true
+futures-util.workspace=true
+tracing.workspace=true
+tracing-subscriber.workspace=true
+tokio.workspace=true
 reth-revm.workspace=true
 lazy_static.workspace=true
 reth-provider.workspace=true
@@ -24,9 +32,12 @@ alloy-eips.workspace=true
 reth-consensus.workspace=true
 reth-ethereum-consensus.workspace=true
 alloy-primitives.workspace=true
-tokio.workspace=true
 reth-primitives-traits.workspace=true
 reth-ethereum-primitives.workspace=true
+
+[[bin]]
+name = "mobile"
+path = "src/main.rs"
 
 [lints]
 workspace = true

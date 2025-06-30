@@ -36,10 +36,10 @@ impl Beacon {
 
 #[derive(Debug, Clone, Hash, Default,Serialize,Deserialize,PartialEq)]
 pub struct BeaconState {
-    slot: u64,
-    eth1_deposit_index: u64,
-    validators: BTreeMap<usize, Validator>,
-    balances: BTreeMap<usize, Gwei>,
+    pub slot: u64,
+    pub eth1_deposit_index: u64,
+    pub validators: BTreeMap<usize, Validator>,
+    pub balances: BTreeMap<usize, Gwei>,
 }
 
 pub struct BeaconStateChangeset{
@@ -83,9 +83,9 @@ pub struct BeaconBlockChangeset{
 
 #[derive(Debug, Clone, Hash, Default,Serialize,Deserialize,PartialEq)]
 pub struct BeaconBlockBody {
-    attestations: Vec<Attestation>,
-    deposits: Vec<Deposit>,
-    voluntary_exits: Vec<VoluntaryExit>,
+    pub attestations: Vec<Attestation>,
+    pub deposits: Vec<Deposit>,
+    pub voluntary_exits: Vec<VoluntaryExit>,
 }
 
 #[derive(Debug, Clone, Hash, Default,Serialize,Deserialize,PartialEq)]
@@ -93,22 +93,22 @@ pub struct Attestation {}
 
 #[derive(Debug, Clone, Hash, Default,Serialize,Deserialize,PartialEq)]
 pub struct Deposit {
-    proof: Vec<B256>,
-    data: DepositData,
+    pub proof: Vec<B256>,
+    pub data: DepositData,
 }
 
 #[derive(Debug, Clone, Hash, Default,Serialize,Deserialize,PartialEq)]
 pub struct DepositData {
-    pubkey: BLSPubkey,
-    withdrawal_credentials: B256,
-    amount: Gwei,
-    signature: BLSSignature,
+    pub pubkey: BLSPubkey,
+    pub withdrawal_credentials: B256,
+    pub amount: Gwei,
+    pub signature: BLSSignature,
 }
 
 #[derive(Debug, Clone, Hash, Default,Serialize,Deserialize,PartialEq)]
 pub struct VoluntaryExit {
-    epoch: Epoch,
-    validator_index: u64,
+    pub epoch: Epoch,
+    pub validator_index: u64,
 }
 
 impl BeaconState {

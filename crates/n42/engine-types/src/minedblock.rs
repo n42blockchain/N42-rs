@@ -66,6 +66,11 @@ impl MinedblockExtApiServer for MinedblockExt {
         // Here we start an asynchronous task and return immediately.
         tokio::spawn(async move {
             if let Ok(sink) = pending.accept().await {
+                println!("✅ Successfully subscribed to minedblockExt_subscribeMinedblock");
+                println!("✅ Successfully subscribed to minedblockExt_subscribeMinedblock");
+                println!("✅ Successfully subscribed to minedblockExt_subscribeMinedblock");
+                println!("✅ Successfully subscribed to minedblockExt_subscribeMinedblock");
+                println!("✅ Successfully subscribed to minedblockExt_subscribeMinedblock");
                 let mut subs = subscribers.lock().await;
                 subs.push(sink);
             }
@@ -84,9 +89,14 @@ impl MinedblockExtApiServer for MinedblockExt {
             for (i,sub) in subs.iter_mut().enumerate() {
                 // Send block data to subscribers.
                 // let message = SubscriptionMessage::from_json(&block.clone()).unwrap();
-                let message=SubscriptionMessage::new("block", SubscriptionId::Num(i as u64), &block);
+                let message=SubscriptionMessage::new("subscribeMinedblock", SubscriptionId::Num(i as u64), &block);
                 match message{
                     Ok(message)=>{
+                        println!("✅ Successfully sent minedblockExt_subscribeMinedblock");
+                        println!("✅ Successfully sent minedblockExt_subscribeMinedblock");
+                        println!("✅ Successfully sent minedblockExt_subscribeMinedblock");
+                        println!("✅ Successfully sent minedblockExt_subscribeMinedblock");
+                        println!("✅ Successfully sent minedblockExt_subscribeMinedblock");
                         if let Err(e) =  sub.send(message).await{
                             println!("Error sending block to subscriber: {:?}", e);
                         }
@@ -136,9 +146,14 @@ impl MinedblockExtApiServer for Arc<MinedblockExt> {
             for (i,sub) in subs.iter_mut().enumerate() {
                 // Send block data to subscribers.
                 // let message = SubscriptionMessage::from_json(&block.clone()).unwrap();
-                let message=SubscriptionMessage::new("block", SubscriptionId::Num(i as u64), &block);
+                let message=SubscriptionMessage::new("subscribeMinedblock", SubscriptionId::Num(i as u64), &block);
                 match message{
                     Ok(message)=>{
+                        println!("✅ Successfully sent minedblockExt_subscribeMinedblock");
+                        println!("✅ Successfully sent minedblockExt_subscribeMinedblock");
+                        println!("✅ Successfully sent minedblockExt_subscribeMinedblock");
+                        println!("✅ Successfully sent minedblockExt_subscribeMinedblock");
+                        println!("✅ Successfully sent minedblockExt_subscribeMinedblock");
                         if let Err(e) =  sub.send(message).await{
                             println!("Error sending block to subscriber: {:?}", e);
                         }
@@ -153,3 +168,7 @@ impl MinedblockExtApiServer for Arc<MinedblockExt> {
         Ok(())
     }
 }
+
+
+
+

@@ -3,9 +3,6 @@
 use reth_consensus::Consensus;
 use alloy_consensus::BlockHeader;
 use futures::{future::Either, stream, stream_select, StreamExt};
-use alloy_primitives::{Address, U256};
-use alloy_signer_local::PrivateKeySigner;
-use consensus_client::miner::N42Miner;
 use n42_engine_primitives::N42PayloadAttributesBuilder;
 use reth_provider::BlockReaderIdExt;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
@@ -19,11 +16,10 @@ use reth_engine_tree::{
 use reth_engine_util::EngineMessageStreamExt;
 use reth_exex::ExExManagerHandle;
 use reth_network::{NetworkSyncUpdater, SyncState};
-use reth_network_api::{BlockAnnounceProvider, BlockDownloaderProvider};
+use reth_network_api::BlockDownloaderProvider;
 use reth_node_api::{
     BeaconConsensusEngineHandle, BuiltPayload, FullNodeTypes, NodeTypes, NodeTypesWithDBAdapter,
     PayloadAttributesBuilder, PayloadTypes,
-    NodePrimitives,
 };
 use reth_node_core::{
     dirs::{ChainPath, DataDirPath},
@@ -35,7 +31,7 @@ use reth_provider::providers::{BlockchainProvider, NodeTypesForProvider};
 use reth_tasks::TaskExecutor;
 use reth_tokio_util::EventSender;
 use reth_tracing::tracing::{debug, error, info};
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 use tokio::sync::{mpsc::unbounded_channel, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
@@ -47,8 +43,6 @@ use crate::{
     AddOns, AddOnsContext, ExExLauncher, FullNode, LaunchContext, LaunchNode, NodeAdapter,
     NodeBuilderWithComponents, NodeComponents, NodeComponentsBuilder, NodeHandle, NodeTypesAdapter,
 };
-
-const DEFAULT_BLOCK_TIME_SECS: u64 = 8;
 
 /// The engine node launcher.
 #[derive(Debug)]
@@ -81,15 +75,12 @@ where
         DB = DB,
         Provider = BlockchainProvider<NodeTypesWithDBAdapter<Types, DB>>,
     >,
-    <T::Types as NodeTypes>::Primitives: NodePrimitives<Block = reth_ethereum_primitives::Block, BlockBody=reth_ethereum_primitives::BlockBody>,
     CB: NodeComponentsBuilder<T>,
     AO: RethRpcAddOns<NodeAdapter<T, CB::Components>>
         + EngineValidatorAddOn<NodeAdapter<T, CB::Components>>,
     N42PayloadAttributesBuilder<Types::ChainSpec>: PayloadAttributesBuilder<
         <<Types as NodeTypes>::Payload as PayloadTypes>::PayloadAttributes,
     >,
-    <Types as NodeTypes>::Payload: PayloadTypes<PayloadAttributes = alloy_rpc_types_engine::PayloadAttributes>,
-    <<CB as NodeComponentsBuilder<T>>::Components as NodeComponents<T>>::Network: BlockAnnounceProvider<Block = reth_ethereum_primitives::Block>,
 {
     type Node = NodeHandle<NodeAdapter<T, CB::Components>, AO>;
 
@@ -200,7 +191,6 @@ where
         // extract the jwt secret from the args if possible
         let jwt_secret = ctx.auth_jwt_secret()?;
 
-        let beacon_engine_handle_clone = beacon_engine_handle.clone();
         let add_ons_ctx = AddOnsContext {
             node: ctx.node_adapter().clone(),
             config: ctx.node_config(),
@@ -380,29 +370,7 @@ where
             let _ = exit.send(res);
         });
 
-        let mining_mode = if let Some(_) = ctx.node_config().dev.consensus_signer_private_key {
-            let block_time = ctx.node_config().dev.block_time.unwrap_or_else(|| Duration::from_secs(DEFAULT_BLOCK_TIME_SECS));
-            consensus_client::miner::MiningMode::interval(block_time)
-        } else {
-            consensus_client::miner::MiningMode::NoMining
-        };
-        info!(target: "reth::cli", ?mining_mode);
-        let signer_address = if let Some(signer_private_key) = ctx.node_config().dev.consensus_signer_private_key {
-            let eth_signer: PrivateKeySigner = signer_private_key.to_string().parse().unwrap();
-            Some(eth_signer.address())
-        } else {
-            None
-        };
         let consensus = Arc::new(ctx.components().consensus().clone());
-        N42Miner::spawn_new(
-            ctx.blockchain_db().clone(),
-            N42PayloadAttributesBuilder::new_add_signer(ctx.chain_spec(), signer_address),
-            beacon_engine_handle_clone,
-            mining_mode,
-            ctx.components().payload_builder_handle().clone(),
-            ctx.components().network().clone(),
-            consensus,
-        );
 
         let full_node = FullNode {
             consensus: ctx.components().consensus().clone(),

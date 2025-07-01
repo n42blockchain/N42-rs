@@ -15,6 +15,7 @@ workspace = true
 [dependencies]
 #n42
 n42-engine-types.workspace = true
+n42-engine-primitives.workspace = true
 n42-primitives.workspace = true
 # reth
 reth-ethereum-cli.workspace = true
@@ -50,10 +51,12 @@ reth-consensus.workspace = true
 reth-tokio-util.workspace = true
 reth-ress-protocol.workspace = true
 reth-ress-provider.workspace = true
+consensus-client.workspace = true
 
 # alloy
 alloy-rpc-types = { workspace = true, features = ["engine"] }
 alloy-primitives = { workspace = true }
+alloy-signer-local.workspace = true
 
 # tracing
 tracing.workspace = true

@@ -3,6 +3,10 @@
 #[global_allocator]
 static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
 
+use std::{time::Duration};
+use alloy_signer_local::PrivateKeySigner;
+use consensus_client::miner::N42Miner;
+use n42_engine_primitives::N42PayloadAttributesBuilder;
 use clap::Parser;
 use n42::{args::RessArgs, cli::Cli, ress::install_ress_subprotocol};
 use n42_engine_types::{N42Node};
@@ -11,6 +15,8 @@ use reth_node_builder::NodeHandle;
 use reth_node_ethereum::EthereumNode;
 use tracing::info;
 use n42::consensus_ext::{ConsensusExtApiServer, ConsensusExt, ConsensusBeaconExtApiServer, ConsensusBeaconExt};
+
+const DEFAULT_BLOCK_TIME_SECS: u64 = 8;
 
 fn main() {
     reth_cli_util::sigsegv_handler::install();
@@ -42,6 +48,32 @@ fn main() {
                             Ok(())
                         })
                 .launch_with_debug_capabilities().await?;
+
+            let consensus_signer_private_key = node.config.clone().dev().dev.consensus_signer_private_key;
+            let signer_address = if let Some(signer_private_key) = &consensus_signer_private_key {
+                let eth_signer: PrivateKeySigner = signer_private_key.to_string().parse().unwrap();
+                Some(eth_signer.address())
+            } else {
+                None
+            };
+
+            let mining_mode = if let Some(_) = consensus_signer_private_key {
+                let block_time = node.config.clone().dev().dev.block_time.unwrap_or_else(|| Duration::from_secs(DEFAULT_BLOCK_TIME_SECS));
+                consensus_client::miner::MiningMode::interval(block_time)
+            } else {
+                consensus_client::miner::MiningMode::NoMining
+            };
+            info!(target: "reth::cli", ?mining_mode);
+
+            N42Miner::spawn_new(
+                node.provider.clone(),
+                N42PayloadAttributesBuilder::new_add_signer(node.chain_spec(), signer_address),
+                node.add_ons_handle.beacon_engine_handle.clone(),
+                mining_mode,
+                node.payload_builder_handle.clone(),
+                node.network.clone(),
+                node.consensus.clone(),
+            );
 
             // Install ress subprotocol.
             if ress_args.enabled {

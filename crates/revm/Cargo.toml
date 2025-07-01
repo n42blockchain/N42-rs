@@ -12,6 +12,7 @@ description = "reth specific revm utilities"
 workspace = true
 
 [dependencies]
+revm-database.workspace = true
 serde.workspace=true
 # reth
 reth-primitives-traits.workspace = true

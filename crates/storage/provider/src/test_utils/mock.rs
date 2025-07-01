@@ -172,9 +172,9 @@ impl Default for MockEthProvider {
 /// An extended account for local store
 #[derive(Debug, Clone)]
 pub struct ExtendedAccount {
-    account: Account,
-    bytecode: Option<Bytecode>,
-    storage: HashMap<StorageKey, StorageValue>,
+    pub account: Account,
+    pub bytecode: Option<Bytecode>,
+    pub storage: HashMap<StorageKey, StorageValue>,
 }
 
 impl ExtendedAccount {

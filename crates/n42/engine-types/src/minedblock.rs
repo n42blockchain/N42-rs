@@ -10,6 +10,7 @@ use reth_primitives::BlockBody;
 use reth_revm::cached::CachedReads;
 use alloy_primitives::U256;
 use std::error::Error;
+use alloy_primitives::B256;
 
 lazy_static! {
     static ref MINEDBLOCK_INSTANCE: Arc<Mutex<MinedblockExt>> = Arc::new(Mutex::new(MinedblockExt::new()));

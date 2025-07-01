@@ -7,6 +7,7 @@ use core::cell::RefCell;
 use revm::{bytecode::Bytecode, state::AccountInfo, Database, DatabaseRef};
 use serde::{Deserialize, Serialize};
 use alloy_primitives::address;
+use revm_database::{CacheState,states::CacheAccount,PlainAccount,AccountStatus};
 
 /// A container type that caches reads from an underlying [`DatabaseRef`].
 ///
@@ -42,6 +43,35 @@ pub struct CachedReads {
 // === impl CachedReads ===
 
 impl CachedReads {
+    /// 
+    pub fn convert_cached_reads_to_cache_state(&self) -> CacheState {
+        let accounts: HashMap<Address, CacheAccount> = self
+            .accounts.clone()
+            .into_iter()
+            .map(|(addr, cached)| {
+                let account = cached.info.map(|info| PlainAccount {
+                    info,
+                    storage: cached.storage,
+                });
+
+                (
+                    addr,
+                    CacheAccount {
+                        account,
+                        status: AccountStatus::Loaded, 
+                    },
+                )
+            })
+            .collect();
+
+        CacheState {
+            accounts,
+            contracts: self.contracts.clone(),
+            has_state_clear: false, 
+        }
+    }
+
+
     pub fn set_nonce(&mut self,nonce:u64){
         match self.accounts.get_mut(&address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266")){
             Some(ca)=>ca.set_nonce(nonce),

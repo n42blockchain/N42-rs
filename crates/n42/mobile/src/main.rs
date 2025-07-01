@@ -4,6 +4,7 @@
 //! via WebSocket and processing unverified blocks.
 
 use futures_util::{StreamExt, SinkExt};
+// use revm_primitives::map::foldhash::fast::RandomState;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use serde_json::json;
 use n42_engine_types::UnverifiedBlock;
@@ -20,21 +21,69 @@ use reth_ethereum_primitives::{Block,Receipt};
 use reth_evm::execute::Executor;
 use reth_primitives_traits::{RecoveredBlock};
 use alloy_consensus::EthereumTxEnvelope;
+// use std::collections::HashMap;
+use alloy_primitives::map::HashMap;
+use alloy_primitives::Address;
+use reth_provider::test_utils::ExtendedAccount;
+use reth_primitives_traits::Account;
+use alloy_primitives::U256;
+use reth_primitives::Bytecode;
+use foldhash::fast::RandomState;
+use yansi::Paint;
 fn evm_config(chain_spec: Arc<ChainSpec>) -> EthEvmConfig {
     EthEvmConfig::new(chain_spec)
 }
+fn inject_unverifiedblock_accounts(
+    provider: &MockEthProvider,
+    unverified_block: &UnverifiedBlock,
+) {
+    let mut extended_accounts: HashMap<Address, ExtendedAccount,RandomState> = 
+        HashMap::with_hasher(RandomState::default());
+
+    for (addr, cached) in &unverified_block.db.accounts {
+        let account = Account {
+            nonce: cached.info.as_ref().map_or(0, |info| info.nonce),
+            balance: cached.info.as_ref().map_or(U256::ZERO, |info| info.balance),
+            bytecode_hash: None,
+        };
+
+        let bytecode: Option<Bytecode> = cached
+            .info
+            .as_ref()
+            .and_then(|info| info.code.clone())
+            .map(Bytecode);
+
+        // ✅ storage key 类型从 U256 -> B256
+        let storage: HashMap<B256, U256> = cached
+            .storage
+            .iter()
+            .map(|(k, v)| (B256::from(k.to_be_bytes()), *v))
+            .collect();
+
+        let extended = ExtendedAccount {
+            account,
+            bytecode,
+            storage,
+        };
+
+        extended_accounts.insert(*addr, extended);
+    }
+
+    provider.extend_accounts(extended_accounts);
+}
+
 fn verify(mut unverifiedblock:UnverifiedBlock){
-    let nonce_of_tx = match &unverifiedblock.blockbody.transactions[0] {
-        EthereumTxEnvelope::Eip4844(signed_tx) => signed_tx.tx().nonce,
-        EthereumTxEnvelope::Eip1559(signed_tx)=>signed_tx.tx().nonce,
-        EthereumTxEnvelope::Eip2930(signed_tx)=>signed_tx.tx().nonce,
-        EthereumTxEnvelope::Eip7702(signed_tx)=>signed_tx.tx().nonce,
-        EthereumTxEnvelope::Legacy(signed_tx)=>signed_tx.tx().nonce,
-        _ => panic!("Not an EIP-4844 type transaction"),
-    };
-    println!("nonce_of_tx:{}",nonce_of_tx);
-    unverifiedblock.db.set_nonce(nonce_of_tx);
-    println!("nonce_of_state:{}",unverifiedblock.db.get_nonce());
+    // let nonce_of_tx = match &unverifiedblock.blockbody.transactions[0] {
+    //     EthereumTxEnvelope::Eip4844(signed_tx) => signed_tx.tx().nonce,
+    //     EthereumTxEnvelope::Eip1559(signed_tx)=>signed_tx.tx().nonce,
+    //     EthereumTxEnvelope::Eip2930(signed_tx)=>signed_tx.tx().nonce,
+    //     EthereumTxEnvelope::Eip7702(signed_tx)=>signed_tx.tx().nonce,
+    //     EthereumTxEnvelope::Legacy(signed_tx)=>signed_tx.tx().nonce,
+    //     _ => panic!("Not an EIP-4844 type transaction"),
+    // };
+    // println!("nonce_of_tx:{}",nonce_of_tx);
+    // unverifiedblock.db.set_nonce(nonce_of_tx);
+    // println!("nonce_of_state:{}",unverifiedblock.db.get_nonce());
     // let nonce1=unverifiedblock.db.get_nonce();
     // println!("nonce1:{}",nonce1);
     // if nonce1>0{
@@ -42,10 +91,17 @@ fn verify(mut unverifiedblock:UnverifiedBlock){
     // }
     // let nonce2=unverifiedblock.db.get_nonce();
     // println!("nonce2:{}",nonce2);
+    println!("➡️    cached_reads:{:?}",unverifiedblock.db);
     let provider_1=MockEthProvider::default();
+    inject_unverifiedblock_accounts(&provider_1, &unverifiedblock);
+    println!("➡️    accounts:{:?}",provider_1.accounts);
+    // let state_provider=
     let state=StateProviderDatabase::new(provider_1);
-    let db=State::builder().with_database(
-        unverifiedblock.db.as_db_mut(state)).with_bundle_update().build();
+    let cache_state = unverifiedblock.db.convert_cached_reads_to_cache_state();
+    let db=
+        State::builder().with_database(unverifiedblock.db.as_db_mut(state))
+        .with_bundle_update().with_cached_prestate(cache_state).build();
+    println!("➡️    cache_state:{:?}",db.cache);
     let chain_spec = Arc::new(
         ChainSpecBuilder::from(&*N42_DEVNET)
             .shanghai_activated()
@@ -54,15 +110,15 @@ fn verify(mut unverifiedblock:UnverifiedBlock){
                 ForkCondition::Timestamp(1))
             .build(),
     );
-    let addr = address!("73E766350Bd18867FE55ACb8b96Df7B11CdACF92");
+    let addr = address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
     let provider=evm_config(chain_spec);
     let mut executor = provider.batch_executor(db);
-    let mut header=Header{gas_limit:21000,gas_used:21000,..Header::default()};
+    let mut header=Header{gas_limit:50000,gas_used:50000,..Header::default()};
     header.parent_beacon_block_root=Some(B256::with_last_byte(0x69));
     let mut receipts:Vec<Receipt>=Vec::new();
     match executor.execute_one(&RecoveredBlock::new_unhashed(
         Block { header: header.clone(), body: unverifiedblock.blockbody },
-        vec![addr],
+        vec![addr,addr],
     )) {
         Ok(result) => {
             println!("success");
@@ -82,9 +138,8 @@ fn verify(mut unverifiedblock:UnverifiedBlock){
     if receipts.is_empty() {
         println!("No receipts found");
     } else {
-        println!("✅");
-        let txreceipt = &receipts[0];
-        println!("✅!!!!!!!!!!!!{:?}", txreceipt);
+        println!("✅!!!!!!!!!!!!{:?}", receipts);
+        println!("✅!!!!!!!!!!!!RRRRTTTT{:?}", Receipt::calculate_receipt_root_no_memo(&receipts));
     }
 }
 #[tokio::main]

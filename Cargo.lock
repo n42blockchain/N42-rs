@@ -5542,6 +5542,7 @@ dependencies = [
  "alloy-eips",
  "alloy-primitives 1.1.2",
  "anyhow",
+ "foldhash",
  "futures-util",
  "jsonrpsee",
  "lazy_static",
@@ -5562,6 +5563,7 @@ dependencies = [
  "tokio-tungstenite 0.21.0",
  "tracing",
  "tracing-subscriber 0.3.19",
+ "yansi",
 ]
 
 [[package]]
@@ -8883,6 +8885,7 @@ dependencies = [
  "reth-storage-errors",
  "reth-trie",
  "revm",
+ "revm-database",
  "serde",
 ]
 

@@ -109,6 +109,13 @@ macro_rules! impl_safe_arith {
                     .map(Self::new)
                     .ok_or(ArithError::DivisionByZero)
             }
+
+            fn safe_mul(&self, other: $rhs_ty) -> Result<Self> {
+                self.0
+                    .checked_mul(other.into())
+                    .map(Self::new)
+                    .ok_or(ArithError::Overflow)
+            }
         }
     };
 }

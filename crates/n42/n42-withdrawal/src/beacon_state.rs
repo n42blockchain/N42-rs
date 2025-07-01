@@ -9,9 +9,12 @@ use ssz_derive::{Decode, Encode};
 use tree_hash_derive::TreeHash;
 use metastruct::metastruct;
 use ssz_types::typenum::Unsigned;
+use crate::chain_spec::ChainSpec;
 use crate::validators::Validator;
 use crate::fork_name::ForkName;
 use crate::slot_epoch::{Epoch, Slot};
+use crate::exit_cache::ExitCache;
+use crate::safe_aitrh::{ArithError, SafeArith};
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Error {
@@ -19,6 +22,13 @@ pub enum Error {
     NonExecutionAddressWithdrawalCredential,
     BalancesOutOfBounds(usize),
     UnknownValidator(usize),
+    ExitCacheUninitialized,
+    ArithError(ArithError),
+    TotalActiveBalanceCacheUninitialized,
+    TotalActiveBalanceCacheInconsistent {
+        initialized_epoch: Epoch,
+        current_epoch: Epoch,
+    },
 }
 
 #[superstruct(
@@ -158,28 +168,43 @@ where
     #[superstruct(getter(copy))]
     #[metastruct(exclude_from(tree_lists))]
     pub slot: Slot,
-    // #[compare_fields(as_iter)]
-    // #[test_random(default)]
     pub validators: List<Validator, E::ValidatorRegistryLimit>,
     #[serde(with = "ssz_types::serde_utils::quoted_u64_var_list")]
-    // #[compare_fields(as_iter)]
-    // #[test_random(default)]
     pub balances: List<u64, E::ValidatorRegistryLimit>,
 
     // Capella
-    #[superstruct(only(Capella, Deneb, Electra, Fulu), partial_getter(copy))]
+    #[superstruct(only(Fulu), partial_getter(copy))]
     #[serde(with = "serde_utils::quoted_u64")]
     #[metastruct(exclude_from(tree_lists))]
     pub next_withdrawal_index: u64,
-    #[superstruct(only(Capella, Deneb, Electra, Fulu), partial_getter(copy))]
+    #[superstruct(only(Fulu), partial_getter(copy))]
     #[serde(with = "serde_utils::quoted_u64")]
     #[metastruct(exclude_from(tree_lists))]
     pub next_withdrawal_validator_index: u64,
 
-    // #[compare_fields(as_iter)]
-    // #[test_random(default)]
-    #[superstruct(only(Electra, Fulu))]
+    #[superstruct(only(Fulu))]
     pub pending_partial_withdrawals: List<PendingPartialWithdrawal, E::PendingPartialWithdrawalsLimit>,
+
+    #[serde(skip_serializing, skip_deserializing)]
+    #[ssz(skip_serializing, skip_deserializing)]
+    #[tree_hash(skip_hashing)]
+    #[metastruct(exclude)]
+    pub exit_cache: ExitCache,
+    #[superstruct(only(Electra, Fulu), partial_getter(copy))]
+    #[metastruct(exclude_from(tree_lists))]
+    pub earliest_exit_epoch: Epoch,
+
+    // Caching (not in the spec)
+    #[serde(skip_serializing, skip_deserializing)]
+    #[ssz(skip_serializing, skip_deserializing)]
+    #[tree_hash(skip_hashing)]
+    #[metastruct(exclude)]
+    pub total_active_balance: Option<(Epoch, u64)>,
+
+    #[superstruct(only(Electra, Fulu), partial_getter(copy))]
+    #[metastruct(exclude_from(tree_lists))]
+    #[serde(with = "serde_utils::quoted_u64")]
+    pub exit_balance_to_consume: u64,
 }
 
 impl<E: EthSpec> BeaconState<E> {
@@ -223,6 +248,144 @@ impl<E: EthSpec> BeaconState<E> {
         self.balances_mut()
             .get_mut(validator_index)
             .ok_or(Error::BalancesOutOfBounds(validator_index))
+    }
+
+    /// Safe copy-on-write accessor for the `validators` list.
+    pub fn get_validator_cow(
+        &mut self,
+        validator_index: usize,
+    ) -> Result<milhouse::Cow<Validator>, Error> {
+        self.validators_mut()
+            .get_cow(validator_index)
+            .ok_or(Error::UnknownValidator(validator_index))
+    }
+
+    /// Build the exit cache, if it needs to be built.
+    pub fn build_exit_cache(&mut self, spec: &ChainSpec) -> Result<(), Error> {
+        if self.exit_cache().check_initialized().is_err() { // 如果退出缓存没初始化
+            *self.exit_cache_mut() = ExitCache::new(self.validators(), spec)?;
+        }
+        Ok(())
+    }
+
+    /// Return the effective balance for a validator with the given `validator_index`.
+    pub fn get_effective_balance(&self, validator_index: usize) -> Result<u64, Error> {
+        self.get_validator(validator_index)
+            .map(|v| v.effective_balance)
+    }
+
+    /// Safe mutator for the `validators` list.
+    pub fn get_validator_mut(&mut self, validator_index: usize) -> Result<&mut Validator, Error> {
+        self.validators_mut()
+            .get_mut(validator_index)
+            .ok_or(Error::UnknownValidator(validator_index))
+    }
+
+    ///  Return the epoch at which an activation or exit triggered in ``epoch`` takes effect.
+    ///
+    ///  Spec v0.12.1
+    pub fn compute_activation_exit_epoch(
+        &self,
+        epoch: Epoch,
+        spec: &ChainSpec,
+    ) -> Result<Epoch, Error> {
+        Ok(spec.compute_activation_exit_epoch(epoch)?)
+    }
+
+    /// Return the churn limit for the current epoch dedicated to activations and exits.
+    pub fn get_activation_exit_churn_limit(&self, spec: &ChainSpec) -> Result<u64, Error> {
+        Ok(std::cmp::min(
+            spec.max_per_epoch_activation_exit_churn_limit,
+            self.get_balance_churn_limit(spec)?,
+        ))
+    }
+
+    /// Return the churn limit for the current epoch.
+    pub fn get_balance_churn_limit(&self, spec: &ChainSpec) -> Result<u64, Error> {
+        let total_active_balance = self.get_total_active_balance()?;
+        let churn = std::cmp::max(
+            spec.min_per_epoch_churn_limit_electra,
+            total_active_balance.safe_div(spec.churn_limit_quotient)?,
+        );
+
+        Ok(churn.safe_sub(churn.safe_rem(spec.effective_balance_increment)?)?)
+    }
+
+    /// Implementation of `get_total_active_balance`, matching the spec.
+    ///
+    /// Requires the total active balance cache to be initialised, which is initialised whenever
+    /// the current committee cache is.
+    ///
+    /// Returns minimum `EFFECTIVE_BALANCE_INCREMENT`, to avoid div by 0.
+    pub fn get_total_active_balance(&self) -> Result<u64, Error> {
+        self.get_total_active_balance_at_epoch(self.current_epoch())
+    }
+
+    /// Get the cached total active balance while checking that it is for the correct `epoch`.
+    pub fn get_total_active_balance_at_epoch(&self, epoch: Epoch) -> Result<u64, Error> {
+        let (initialized_epoch, balance) = self
+            .total_active_balance()
+            .ok_or(Error::TotalActiveBalanceCacheUninitialized)?;
+
+        if initialized_epoch == epoch {
+            Ok(balance)
+        } else {
+            Err(Error::TotalActiveBalanceCacheInconsistent {
+                initialized_epoch,
+                current_epoch: epoch,
+            })
+        }
+    }
+
+    pub fn compute_exit_epoch_and_update_churn(
+        &mut self,
+        exit_balance: u64,
+        spec: &ChainSpec,
+    ) -> Result<Epoch, Error> {
+        let mut earliest_exit_epoch = std::cmp::max(
+            self.earliest_exit_epoch()?,
+            self.compute_activation_exit_epoch(self.current_epoch(), spec)?,
+        );
+
+        let per_epoch_churn = self.get_activation_exit_churn_limit(spec)?;
+        // New epoch for exits
+        let mut exit_balance_to_consume = if self.earliest_exit_epoch()? < earliest_exit_epoch {
+            per_epoch_churn
+        } else {
+            self.exit_balance_to_consume()?
+        };
+
+        // Exit doesn't fit in the current earliest epoch
+        if exit_balance > exit_balance_to_consume {
+            let balance_to_process = exit_balance.safe_sub(exit_balance_to_consume)?;
+            let additional_epochs = balance_to_process
+                .safe_sub(1)?
+                .safe_div(per_epoch_churn)?
+                .safe_add(1)?;
+            earliest_exit_epoch.safe_add_assign(additional_epochs)?;
+            exit_balance_to_consume
+                .safe_add_assign(additional_epochs.safe_mul(per_epoch_churn)?)?;
+        }
+        match self {
+            BeaconState::Base(_)
+            | BeaconState::Altair(_)
+            | BeaconState::Bellatrix(_)
+            | BeaconState::Capella(_)
+            | BeaconState::Deneb(_) => Err(Error::IncorrectStateVariant),
+            BeaconState::Electra(_) | BeaconState::Fulu(_) => {
+                // Consume the balance and update state variables
+                *self.exit_balance_to_consume_mut()? =
+                    exit_balance_to_consume.safe_sub(exit_balance)?;
+                *self.earliest_exit_epoch_mut()? = earliest_exit_epoch;
+                self.earliest_exit_epoch()
+            }
+        }
+    }
+}
+
+impl From<ArithError> for Error {
+    fn from(e: ArithError) -> Error {
+        Error::ArithError(e)
     }
 }
 

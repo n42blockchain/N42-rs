@@ -6,6 +6,37 @@ use crate::error::{BlockProcessingError};
 use crate::payload::{AbstractExecPayload, ExecPayload};
 use crate::safe_aitrh::{SafeArith, SafeArithIter};
 
+/// Initiate the exit of the validator of the given `index`.
+pub fn initiate_validator_exit<E: EthSpec>(
+    state: &mut BeaconState<E>,
+    index: usize,
+    spec: &ChainSpec,
+) -> Result<(), BeaconStateError> {
+    let validator = state.get_validator_cow(index)?;// 只读
+
+    // Return if the validator already initiated exit
+    if validator.exit_epoch != spec.far_future_epoch {
+        return Ok(());
+    }
+
+    // Ensure the exit cache is built.第一次时调用，把已退出验证者加入缓存
+    state.build_exit_cache(spec)?;
+
+    // Compute exit queue epoch 用余额和churn计算
+    let effective_balance = state.get_effective_balance(index)?;
+    let exit_queue_epoch = state.compute_exit_epoch_and_update_churn(effective_balance, spec)?;
+
+    let validator = state.get_validator_mut(index)?;
+    validator.exit_epoch = exit_queue_epoch;
+    validator.withdrawable_epoch =
+        exit_queue_epoch.safe_add(spec.min_validator_withdrawability_delay)?;
+
+    state
+        .exit_cache_mut()
+        .record_validator_exit(exit_queue_epoch)?;
+
+    Ok(())
+}
 
 /// Compute the next batch of withdrawals which should be included in a block.
 ///

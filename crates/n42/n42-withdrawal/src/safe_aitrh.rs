@@ -55,10 +55,15 @@ pub trait SafeArith<Rhs = Self>: Sized + Copy {
     /// Safe variant of `/` that guards against division by 0.
     fn safe_div(&self, other: Rhs) -> Result<Self>;
 
+    /// Safe variant of `*` that guards against overflow.
+    fn safe_mul(&self, other: Rhs) -> Result<Self>;
+
     assign_method!(safe_add_assign, safe_add, Rhs, "+=");
     assign_method!(safe_sub_assign, safe_sub, Rhs, "-=");
     assign_method!(safe_rem_assign, safe_rem, Rhs, "%=");
     assign_method!(safe_div_assign, safe_div, Rhs, "/=");
+    assign_method!(safe_mul_assign, safe_mul, Rhs, "*=");
+
 }
 
 macro_rules! impl_safe_arith {
@@ -86,6 +91,12 @@ macro_rules! impl_safe_arith {
             fn safe_div(&self, other: Self) -> Result<Self> {
                 self.checked_div(other).ok_or(ArithError::DivisionByZero)
             }
+
+            #[inline]
+            fn safe_mul(&self, other: Self) -> Result<Self> {
+                self.checked_mul(other).ok_or(ArithError::Overflow)
+            }
+
         }
     };
 }

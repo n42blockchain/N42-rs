@@ -15,6 +15,7 @@ pub mod chain_spec;
 pub mod payload;
 pub mod fork_name;
 pub mod slot_epoch;
+pub mod exit_cache;
 
 // pub type Hash256 = alloy_primitives::B256;
 pub use tree_hash::Hash256;

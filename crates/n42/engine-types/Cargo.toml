@@ -59,7 +59,7 @@ futures-util = "0.3.31"
 tracing = "0.1.41"
 
 # ethereum
-alloy-rlp.workspace = true
+alloy-evm.workspace = true
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
 alloy-eips.workspace = true

@@ -6,6 +6,7 @@ use n42_clique::APos;
 use reth_chainspec::ChainSpec;
 use reth_node_builder::components::ConsensusBuilder;
 use reth_node_builder::{BuilderContext, NodeTypes};
+use crate::node::N42Primitives;
 
 /// A basic ethereum consensus builder.
 #[derive(Debug, Default, Clone, Copy)]
@@ -15,9 +16,9 @@ pub struct N42ConsensusBuilder {
 
 impl<Node> ConsensusBuilder<Node> for N42ConsensusBuilder
 where
-    Node: FullNodeTypes<Types: NodeTypes<ChainSpec = ChainSpec, Primitives = EthPrimitives>>,
+    Node: FullNodeTypes<Types: NodeTypes<ChainSpec = ChainSpec, Primitives = N42Primitives>>,
 {
-    type Consensus = Arc<dyn FullConsensus<EthPrimitives, Error = ConsensusError>>;
+    type Consensus = Arc<dyn FullConsensus<N42Primitives, Error = ConsensusError>>;
 
     async fn build_consensus(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::Consensus> {
         //Ok(Arc::new(EthBeaconConsensus::new(ctx.chain_spec())))

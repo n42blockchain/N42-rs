@@ -19,7 +19,7 @@ use reth_basic_payload_builder::{
 };
 use reth_chainspec::{ChainSpec, ChainSpecProvider, EthChainSpec, EthereumHardforks};
 use reth_errors::{BlockExecutionError, BlockValidationError};
-use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
+use reth_ethereum_primitives::{Block, EthPrimitives, TransactionSigned};
 use reth_evm::{
     execute::{BlockBuilder, BlockBuilderOutcome},
     ConfigureEvm, Evm, NextBlockEnvAttributes,
@@ -27,7 +27,7 @@ use reth_evm::{
 use reth_evm_ethereum::EthEvmConfig;
 use reth_payload_builder::{EthBuiltPayload, EthPayloadBuilderAttributes};
 use reth_payload_builder_primitives::PayloadBuilderError;
-use reth_payload_primitives::PayloadBuilderAttributes;
+use reth_payload_primitives::{BuiltPayload, PayloadBuilderAttributes};
 use reth_primitives_traits::transaction::error::InvalidTransactionError;
 use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_storage_api::StateProviderFactory;
@@ -46,12 +46,12 @@ use tracing::{debug, trace, warn};
 //pub mod validator;
 //pub use validator::EthereumExecutionPayloadValidator;
 
-use reth_primitives_traits::SealedBlock;
+use reth_primitives_traits::{NodePrimitives, SealedBlock};
 //use n42_engine_primitives::{N42PayloadAttributes, N42PayloadBuilderAttributes};
 use std::future::Future;
-use reth_node_api::{PayloadBuilderFor};
+use reth_node_api::{EngineTypes, PayloadBuilderFor};
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
-use reth_chain_state::CanonStateSubscriptions;
+use reth_chain_state::{CanonStateSubscriptions, ExecutedBlockWithTrieUpdates};
 use reth_basic_payload_builder::{BasicPayloadJobGenerator, BasicPayloadJobGeneratorConfig};
 use reth_payload_builder::{PayloadBuilderHandle, PayloadBuilderService};
 use reth_consensus::{ConsensusError, FullConsensus};
@@ -71,9 +71,7 @@ use reth_node_builder::{
 // Payload component configuration for the Ethereum node.
 
 //use reth_node_api::{FullNodeTypes, NodeTypes, PrimitivesTy, TxTy};
-use reth_ethereum_engine_primitives::{
-    EthPayloadAttributes,
-};
+use reth_ethereum_engine_primitives::{BlobSidecars, EthPayloadAttributes, ExecutionPayloadV1};
 use reth_node_api::{TxTy};
 use reth_node_builder::{
     PayloadBuilderConfig,
@@ -83,9 +81,9 @@ use reth_node_builder::{
 /// A basic ethereum payload service.
 #[derive(Clone, Default, Debug)]
 #[non_exhaustive]
-pub struct EthereumPayloadBuilderWrapper;
+pub struct N42PayloadBuilderWrapper;
 
-impl EthereumPayloadBuilderWrapper {
+impl N42PayloadBuilderWrapper {
     /// A helper method initializing [`reth_ethereum_payload_builder::EthereumPayloadBuilder`] with
     /// the given EVM config.
     pub fn build<Types, Node, Evm, Pool, Cons>(
@@ -98,14 +96,14 @@ impl EthereumPayloadBuilderWrapper {
         N42PayloadBuilder<Pool, Node::Provider, Evm, Cons>,
     >
     where
-        Types: NodeTypes<ChainSpec = ChainSpec, Primitives = EthPrimitives>,
+        Types: NodeTypes<ChainSpec = ChainSpec, Primitives = N42Primitives>,
         Node: FullNodeTypes<Types = Types>,
         Evm: ConfigureEvm<Primitives = PrimitivesTy<Types>>,
         Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TxTy<Node::Types>>>
             + Unpin
             + 'static,
         Types::Payload: PayloadTypes<
-            BuiltPayload = EthBuiltPayload,
+            BuiltPayload = N42BuiltPayload,
             PayloadAttributes = EthPayloadAttributes,
             PayloadBuilderAttributes = EthPayloadBuilderAttributes,
         >,
@@ -123,15 +121,15 @@ impl EthereumPayloadBuilderWrapper {
     }
 }
 
-impl<Types, Node, Pool, Evm, Cons> N42PayloadBuilderBuilder<Node, Pool, Evm, Cons> for EthereumPayloadBuilderWrapper
+impl<Types, Node, Pool, Evm, Cons> N42PayloadBuilderBuilder<Node, Pool, Evm, Cons> for N42PayloadBuilderWrapper
 where
-    Types: NodeTypes<ChainSpec = ChainSpec, Primitives = EthPrimitives>,
+    Types: NodeTypes<ChainSpec = ChainSpec, Primitives = N42Primitives>,
     Node: FullNodeTypes<Types = Types>,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TxTy<Node::Types>>>
         + Unpin
         + 'static,
     Types::Payload: PayloadTypes<
-        BuiltPayload = EthBuiltPayload,
+        BuiltPayload = N42BuiltPayload,
         PayloadAttributes = EthPayloadAttributes,
         PayloadBuilderAttributes = EthPayloadBuilderAttributes,
     >,
@@ -143,7 +141,7 @@ where
         FullConsensus<PrimitivesTy<Node::Types>, Error = ConsensusError> + Clone + Unpin + 'static,
 {
     type PayloadBuilder =
-        N42PayloadBuilder<Pool, Node::Provider, EthEvmConfig, Cons>;
+        N42PayloadBuilder<Pool, Node::Provider, N42EvmConfig, Cons>;
 
     async fn build_payload_builder(
         self,
@@ -152,15 +150,19 @@ where
         evm_config: Evm,
         cons: Cons,
     ) -> eyre::Result<Self::PayloadBuilder> {
-        self.build(EthEvmConfig::new(ctx.chain_spec()), ctx, pool, cons)
+        self.build(N42EvmConfig::new(ctx.chain_spec()), ctx, pool, cons)
     }
 }
 // wrapper
 
 // reth/crates/ethereum/payload/src/config.rs
 use alloy_eips::eip1559::ETHEREUM_BLOCK_GAS_LIMIT_30M;
+use alloy_eips::eip7685::Requests;
+use alloy_rpc_types::engine::{ExecutionData, ExecutionPayload, ExecutionPayloadEnvelopeV2, ExecutionPayloadEnvelopeV3, ExecutionPayloadEnvelopeV4, ExecutionPayloadEnvelopeV5, PayloadId};
+use serde::{Deserialize, Serialize};
 use reth_primitives_traits::constants::GAS_LIMIT_BOUND_DIVISOR;
-
+use crate::evm::N42EvmConfig;
+use crate::node::N42Primitives;
 /*
 /// Settings for the Ethereum builder.
 #[derive(PartialEq, Eq, Clone, Debug)]
@@ -254,19 +256,19 @@ impl<Pool, Client, EvmConfig, Cons> N42PayloadBuilder<Pool, Client,  EvmConfig, 
 // Default implementation of [PayloadBuilder] for unit type
 impl<Pool, Client, EvmConfig, Cons> PayloadBuilder for N42PayloadBuilder<Pool, Client, EvmConfig, Cons>
 where
-    EvmConfig: ConfigureEvm<Primitives = EthPrimitives, NextBlockEnvCtx = NextBlockEnvAttributes>,
+    EvmConfig: ConfigureEvm<Primitives = N42Primitives, NextBlockEnvCtx = NextBlockEnvAttributes>,
     Client: StateProviderFactory + ChainSpecProvider<ChainSpec: EthereumHardforks> + Clone,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>,
     Cons:
-        FullConsensus<EthPrimitives, Error = ConsensusError> + Clone + Unpin + 'static,
+        FullConsensus<N42Primitives, Error = ConsensusError> + Clone + Unpin + 'static,
 {
     type Attributes = EthPayloadBuilderAttributes;
-    type BuiltPayload = EthBuiltPayload;
+    type BuiltPayload = N42BuiltPayload;
 
     fn try_build(
         &self,
-        args: BuildArguments<EthPayloadBuilderAttributes, EthBuiltPayload>,
-    ) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError> {
+        args: BuildArguments<EthPayloadBuilderAttributes, N42BuiltPayload>,
+    ) -> Result<BuildOutcome<N42BuiltPayload>, PayloadBuilderError> {
         default_n42_payload(
             self.evm_config.clone(),
             self.client.clone(),
@@ -292,7 +294,7 @@ where
     fn build_empty_payload(
         &self,
         config: PayloadConfig<Self::Attributes>,
-    ) -> Result<EthBuiltPayload, PayloadBuilderError> {
+    ) -> Result<N42BuiltPayload, PayloadBuilderError> {
         let args = BuildArguments::new(Default::default(), config, Default::default(), None);
 
         default_n42_payload(
@@ -320,17 +322,17 @@ pub fn default_n42_payload<EvmConfig, Client, Pool, F, Cons>(
     client: Client,
     pool: Pool,
     builder_config: EthereumBuilderConfig,
-    args: BuildArguments<EthPayloadBuilderAttributes, EthBuiltPayload>,
+    args: BuildArguments<EthPayloadBuilderAttributes, N42BuiltPayload>,
     best_txs: F,
     cons: Cons,
-) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError>
+) -> Result<BuildOutcome<N42BuiltPayload>, PayloadBuilderError>
 where
-    EvmConfig: ConfigureEvm<Primitives = EthPrimitives, NextBlockEnvCtx = NextBlockEnvAttributes>,
+    EvmConfig: ConfigureEvm<Primitives = N42Primitives, NextBlockEnvCtx = NextBlockEnvAttributes>,
     Client: StateProviderFactory + ChainSpecProvider<ChainSpec: EthereumHardforks>,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>,
     F: FnOnce(BestTransactionsAttributes) -> BestTransactionsIter<Pool>,
     Cons:
-        FullConsensus<EthPrimitives, Error = ConsensusError> + Clone + Unpin + 'static,
+        FullConsensus<N42Primitives, Error = ConsensusError> + Clone + Unpin + 'static,
 {
     let BuildArguments { mut cached_reads, config, cancel, best_payload } = args;
     let PayloadConfig { parent_header, attributes } = config;
@@ -521,7 +523,7 @@ where
     let sealed_block = Arc::new(SealedBlock::seal_parts(header, block.into_block().body));
 
 
-    let payload = EthBuiltPayload::new(attributes.id, sealed_block, total_fees, requests)
+    let payload = N42BuiltPayload::new(attributes.id, sealed_block, total_fees, requests)
         // add blob sidecars from the executed txs
         .with_sidecars(blob_sidecars.into_iter().map(Arc::unwrap_or_clone).collect::<Vec<_>>());
 
@@ -567,7 +569,7 @@ where
     Node: FullNodeTypes,
     Pool: TransactionPool,
     //EvmConfig: Send,
-    EvmConfig: ConfigureEvm<Primitives = EthPrimitives, NextBlockEnvCtx = NextBlockEnvAttributes>,
+    EvmConfig: ConfigureEvm<Primitives = N42Primitives, NextBlockEnvCtx = NextBlockEnvAttributes>,
     PB: N42PayloadBuilderBuilder<Node, Pool, EvmConfig, Cons>,
     Cons:
         FullConsensus<PrimitivesTy<Node::Types>, Error = ConsensusError> + Clone + Unpin + 'static,
@@ -619,3 +621,74 @@ impl<EvmConfig> N42PayloadBuilder<EvmConfig> {
     }
 }
 */
+
+
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct N42PayloadTypes;
+
+impl PayloadTypes for N42PayloadTypes {
+    type ExecutionData = ExecutionData;
+    type BuiltPayload = N42BuiltPayload;
+    type PayloadAttributes = EthPayloadAttributes;
+    type PayloadBuilderAttributes = EthPayloadBuilderAttributes;
+
+    fn block_to_payload(
+        block: SealedBlock<
+            <<Self::BuiltPayload as BuiltPayload>::Primitives as NodePrimitives>::Block,
+        >,
+    ) -> Self::ExecutionData {
+        let (payload, sidecar) =
+            ExecutionPayload::from_block_unchecked(block.hash(), &block.into_block());
+        ExecutionData { payload, sidecar }
+    }
+}
+
+// impl EngineTypes for N42PayloadTypes {
+//     type ExecutionPayloadEnvelopeV1 = ExecutionPayloadV1;
+//     type ExecutionPayloadEnvelopeV2 = ExecutionPayloadEnvelopeV2;
+//     type ExecutionPayloadEnvelopeV3 = ExecutionPayloadEnvelopeV3;
+//     type ExecutionPayloadEnvelopeV4 = ExecutionPayloadEnvelopeV4;
+//     type ExecutionPayloadEnvelopeV5 = ExecutionPayloadEnvelopeV5;
+// }
+
+
+#[derive(Debug, Clone)]
+pub struct N42BuiltPayload(EthBuiltPayload);
+
+impl N42BuiltPayload {
+    pub fn new(
+        id: PayloadId,
+        block: Arc<SealedBlock<Block>>,
+        fees: U256,
+        requests: Option<Requests>,
+    ) -> Self {
+        Self(EthBuiltPayload::new(
+            id,
+            block,
+            fees,
+            requests,
+        ))
+    }
+
+    pub fn with_sidecars(mut self, sidecars: impl Into<BlobSidecars>) -> Self {
+        self.0 = self.0.with_sidecars(sidecars);
+        self
+    }
+}
+
+impl BuiltPayload for N42BuiltPayload {
+    type Primitives = N42Primitives;
+
+    fn block(&self) -> &SealedBlock<<Self::Primitives as NodePrimitives>::Block> {
+        self.0.block()
+    }
+
+    fn fees(&self) -> U256 {
+        self.0.fees()
+    }
+
+    fn requests(&self) -> Option<alloy_eips::eip7685::Requests> {
+        self.0.requests()
+    }
+}

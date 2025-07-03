@@ -20,8 +20,9 @@ mod payload;
 //mod metrics;
 mod network;
 mod consensus;
+mod evm;
 
-pub use payload::EthereumPayloadBuilderWrapper;
+pub use payload::N42PayloadBuilderWrapper;
 pub use payload::N42PayloadServiceBuilder;
 
 

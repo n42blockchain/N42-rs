@@ -1060,7 +1060,6 @@ async fn test_changes_reaching_consensus_out_of_bounds__via_a_deauth__may_go_out
                 signer: "B".to_string(),
                 voted: Some("C".to_string()),
                 auth: Some(true),
-                ..Default::default()
             },
         ],
         results: vec![

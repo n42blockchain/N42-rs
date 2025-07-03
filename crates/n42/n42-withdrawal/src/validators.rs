@@ -31,6 +31,25 @@ impl Validator {
         self.activation_epoch <= epoch && epoch < self.exit_epoch
     }
 
+    /// Returns `true` if the validator is eligible to join the activation queue.
+    ///
+    /// Calls the correct function depending on the provided `fork_name`.
+    pub fn is_eligible_for_activation_queue(
+        &self,
+        spec: &ChainSpec,
+        current_fork: ForkName,
+    ) -> bool {
+            self.is_eligible_for_activation_queue_electra(spec)
+    }
+
+    /// Returns `true` if the validator is eligible to join the activation queue.
+    ///
+    /// Modified in electra as part of EIP 7251.
+    fn is_eligible_for_activation_queue_electra(&self, spec: &ChainSpec) -> bool {
+        self.activation_eligibility_epoch == spec.far_future_epoch
+            && self.effective_balance >= spec.min_activation_balance
+    }
+
     /// Get the execution withdrawal address if this validator has one initialized.
     pub fn get_execution_withdrawal_address(&self, spec: &ChainSpec) -> Option<Address> {
         self.has_execution_withdrawal_credential(spec)

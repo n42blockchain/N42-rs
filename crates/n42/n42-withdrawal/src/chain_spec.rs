@@ -30,6 +30,9 @@ pub struct ChainSpec {
     pub effective_balance_increment: u64,
     pub full_exit_request_amount: u64,
     pub shard_committee_period: u64,
+    pub ejection_balance: u64,
+    pub max_per_epoch_activation_churn_limit: u64,
+    pub min_per_epoch_churn_limit: u64,
 
 }
 

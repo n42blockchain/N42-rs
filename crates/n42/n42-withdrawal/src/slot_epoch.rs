@@ -186,6 +186,24 @@ macro_rules! impl_ssz {
     };
 }
 
+macro_rules! impl_math {
+    ($type: ident) => {
+        impl $type {
+            pub fn saturating_sub<T: Into<$type>>(&self, other: T) -> $type {
+                $type::new(self.as_u64().saturating_sub(other.into().as_u64()))
+            }
+
+            pub fn saturating_add<T: Into<$type>>(&self, other: T) -> $type {
+                $type::new(self.as_u64().saturating_add(other.into().as_u64()))
+            }
+
+            pub fn is_power_of_two(&self) -> bool {
+                self.0.is_power_of_two()
+            }
+        }
+    };
+}
+
 macro_rules! impl_common {
     ($type: ident) => {
         impl_from_into_u64!($type);
@@ -194,6 +212,7 @@ macro_rules! impl_common {
         impl_safe_arith!($type, u64);
         impl_debug!($type);
         impl_ssz!($type);
+        impl_math!($type);
     };
 }
 

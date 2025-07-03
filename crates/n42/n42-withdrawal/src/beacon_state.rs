@@ -1,5 +1,6 @@
 use std::fmt::Debug;
 use std::mem;
+use std::sync::Arc;
 use alloy_primitives::private::arbitrary;
 use alloy_primitives::private::serde::{Deserialize, Serialize};
 use milhouse::List;
@@ -14,9 +15,13 @@ use crate::chain_spec::ChainSpec;
 use crate::validators::Validator;
 use crate::fork_name::ForkName;
 use crate::slot_epoch::{Epoch, Slot};
-use crate::exit_cache::ExitCache;
+use crate::exit_cache::{ExitCache, EpochCache, RelativeEpoch, CommitteeCache};
 use crate::safe_aitrh::{ArithError, SafeArith};
 use crate::exit_cache::PubkeyCache;
+use crate::withdrawal::Checkpoint;
+
+
+pub const CACHED_EPOCHS: usize = 3;
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Error {
@@ -33,6 +38,8 @@ pub enum Error {
     },
     PubkeyCacheInconsistent,
     MilhouseError(milhouse::Error),
+    CommitteeCacheUninitialized(Option<RelativeEpoch>),
+    CommitteeCachesOutOfBounds(usize),
 
 }
 
@@ -144,6 +151,22 @@ where
     #[tree_hash(skip_hashing)]
     #[metastruct(exclude)]
     pub pubkey_cache: PubkeyCache,
+
+    #[serde(skip_serializing, skip_deserializing)]
+    #[ssz(skip_serializing, skip_deserializing)]
+    #[tree_hash(skip_hashing)]
+    #[metastruct(exclude)]
+    pub epoch_cache: EpochCache,
+
+    #[superstruct(getter(copy))]
+    #[metastruct(exclude_from(tree_lists))]
+    pub finalized_checkpoint: Checkpoint,
+
+    #[serde(skip_serializing, skip_deserializing)]
+    #[ssz(skip_serializing, skip_deserializing)]
+    #[tree_hash(skip_hashing)]
+    #[metastruct(exclude)]
+    pub committee_caches: [Arc<CommitteeCache>; CACHED_EPOCHS],
 }
 
 impl<E: EthSpec> BeaconState<E> {
@@ -157,11 +180,6 @@ impl<E: EthSpec> BeaconState<E> {
     /// Does not check if `self` is consistent with the fork dictated by `self.slot()`.
     pub fn fork_name_unchecked(&self) -> ForkName {
         match self {
-            // BeaconState::Base { .. } => ForkName::Base,
-            // BeaconState::Altair { .. } => ForkName::Altair,
-            // BeaconState::Bellatrix { .. } => ForkName::Bellatrix,
-            // BeaconState::Capella { .. } => ForkName::Capella,
-            // BeaconState::Deneb { .. } => ForkName::Deneb,
             BeaconState::Electra { .. } => ForkName::Electra,
             BeaconState::Fulu { .. } => ForkName::Fulu,
         }
@@ -308,6 +326,66 @@ impl<E: EthSpec> BeaconState<E> {
         }
     }
 
+    /// Return the activation churn limit for the current epoch (number of validators who can enter per epoch).
+    ///
+    /// Uses the current epoch committee cache, and will error if it isn't initialized.
+    pub fn get_activation_churn_limit(&self, spec: &ChainSpec) -> Result<u64, Error> {
+        Ok(match self {
+            BeaconState::Electra(_) | BeaconState::Fulu(_) => {
+                std::cmp::min(
+                    spec.max_per_epoch_activation_churn_limit,
+                    self.get_validator_churn_limit(spec)?,
+                )
+            }
+        })
+    }
+
+    /// Return the churn limit for the current epoch (number of validators who can leave per epoch).
+    ///
+    /// Uses the current epoch committee cache, and will error if it isn't initialized.
+    pub fn get_validator_churn_limit(&self, spec: &ChainSpec) -> Result<u64, Error> {
+        Ok(std::cmp::max(
+            spec.min_per_epoch_churn_limit,
+            (self
+                .committee_cache(RelativeEpoch::Current)?
+                .active_validator_count() as u64)
+                .safe_div(spec.churn_limit_quotient)?,
+        ))
+    }
+
+    /// Returns the cache for some `RelativeEpoch`. Returns an error if the cache has not been
+    /// initialized.
+    pub fn committee_cache(
+        &self,
+        relative_epoch: RelativeEpoch,
+    ) -> Result<&Arc<CommitteeCache>, Error> {
+        let i = Self::committee_cache_index(relative_epoch);
+        let cache = self.committee_cache_at_index(i)?;
+
+        if cache.is_initialized_at(relative_epoch.into_epoch(self.current_epoch())) {
+            Ok(cache)
+        } else {
+            Err(Error::CommitteeCacheUninitialized(Some(relative_epoch)))
+        }
+    }
+
+    pub(crate) fn committee_cache_index(relative_epoch: RelativeEpoch) -> usize {
+        match relative_epoch {
+            RelativeEpoch::Previous => 0,
+            RelativeEpoch::Current => 1,
+            RelativeEpoch::Next => 2,
+        }
+    }
+
+    /// Get the committee cache at a given index.
+    fn committee_cache_at_index(&self, index: usize) -> Result<&Arc<CommitteeCache>, Error> {
+        self.committee_caches()
+            .get(index)
+            .ok_or(Error::CommitteeCachesOutOfBounds(index))
+    }
+
+
+
     pub fn compute_exit_epoch_and_update_churn(
         &mut self,
         exit_balance: u64,
@@ -338,11 +416,6 @@ impl<E: EthSpec> BeaconState<E> {
                 .safe_add_assign(additional_epochs.safe_mul(per_epoch_churn)?)?;
         }
         match self {
-            // BeaconState::Base(_)
-            // | BeaconState::Altair(_)
-            // | BeaconState::Bellatrix(_)
-            // | BeaconState::Capella(_)
-            // | BeaconState::Deneb(_) => Err(Error::IncorrectStateVariant),
             BeaconState::Electra(_) | BeaconState::Fulu(_) => {
                 // Consume the balance and update state variables
                 *self.exit_balance_to_consume_mut()? =

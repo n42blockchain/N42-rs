@@ -1,7 +1,6 @@
 use crate::Hash256;
-use crate::beacon_state::Error as BeaconStateError;
+use crate::beacon_state::{Error as BeaconStateError};
 use crate::safe_aitrh::ArithError;
-
 #[cfg(feature = "supranational")]
 use blst::BLST_ERROR as BlstError;
 
@@ -48,4 +47,35 @@ pub enum Error {
     InvalidInfinityPublicKey,
     /// The secret key is all zero bytes, which is invalid.
     InvalidZeroSecretKey,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum EpochProcessingError {
+    BeaconStateError(BeaconStateError),
+    ArithError(ArithError),
+    EpochCache(EpochCacheError),
+
+}
+
+impl From<BeaconStateError> for EpochProcessingError {
+    fn from(e: BeaconStateError) -> EpochProcessingError {
+        EpochProcessingError::BeaconStateError(e)
+    }
+}
+
+impl From<ArithError> for EpochProcessingError {
+    fn from(e: ArithError) -> EpochProcessingError {
+        EpochProcessingError::ArithError(e)
+    }
+}
+
+impl From<EpochCacheError> for EpochProcessingError {
+    fn from(e: EpochCacheError) -> Self {
+        EpochProcessingError::EpochCache(e)
+    }
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum EpochCacheError {
+    CacheNotInitialized,
 }

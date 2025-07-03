@@ -26,6 +26,11 @@ pub struct Validator {
 }
 
 impl Validator {
+    /// Returns `true` if the validator is considered active at some epoch.
+    pub fn is_active_at(&self, epoch: Epoch) -> bool {
+        self.activation_epoch <= epoch && epoch < self.exit_epoch
+    }
+
     /// Get the execution withdrawal address if this validator has one initialized.
     pub fn get_execution_withdrawal_address(&self, spec: &ChainSpec) -> Option<Address> {
         self.has_execution_withdrawal_credential(spec)

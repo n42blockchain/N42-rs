@@ -21,7 +21,7 @@ macro_rules! impl_tree_hash {
             // unnecessary copying and allocation (one Vec per byte)
             let values_per_chunk = tree_hash::BYTES_PER_CHUNK;
             let minimum_chunk_count = $byte_size.div_ceil(values_per_chunk);
-            tree_hash::merkle_root(&self.serialize(), minimum_chunk_count)
+            tree_hash::merkle_root(&self.as_ssz_bytes(), minimum_chunk_count)
         }
     };
 }
@@ -44,7 +44,7 @@ macro_rules! impl_ssz_encode {
         }
 
         fn ssz_append(&self, buf: &mut Vec<u8>) {
-            buf.extend_from_slice(&self.serialize())
+            buf.extend_from_slice(&self.as_ssz_bytes())
         }
     };
 }
@@ -69,7 +69,7 @@ macro_rules! impl_ssz_decode {
             if len != expected {
                 Err(ssz::DecodeError::InvalidByteLength { len, expected })
             } else {
-                Self::deserialize(bytes)
+                <Self as ssz::Decode>::from_ssz_bytes(bytes)
                     .map_err(|e| ssz::DecodeError::BytesInvalid(format!("{:?}", e)))
             }
         }
@@ -82,7 +82,7 @@ macro_rules! impl_ssz_decode {
 macro_rules! impl_display {
     () => {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "{}", hex_encode(self.serialize().to_vec()))
+            write!(f, "{}", hex_encode(&self.as_ssz_bytes().to_vec()))
         }
     };
 }
@@ -97,7 +97,7 @@ macro_rules! impl_from_str {
         fn from_str(s: &str) -> Result<Self, Self::Err> {
             if let Some(stripped) = s.strip_prefix("0x") {
                 let bytes = hex::decode(stripped).map_err(|e| e.to_string())?;
-                Self::deserialize(&bytes[..]).map_err(|e| format!("{:?}", e))
+                <Self as ssz::Decode>::from_ssz_bytes(&bytes).map_err(|e| format!("{:?}", e))
             } else {
                 Err("must start with 0x".to_string())
             }
@@ -157,7 +157,7 @@ macro_rules! impl_serde_deserialize {
 macro_rules! impl_debug {
     () => {
         fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            write!(f, "{}", hex_encode(&self.serialize().to_vec()))
+            write!(f, "{}", hex_encode(&self.as_ssz_bytes().to_vec()))
         }
     };
 }
@@ -171,7 +171,7 @@ macro_rules! impl_arbitrary {
         fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
             let mut bytes = [0u8; $byte_size];
             u.fill_buffer(&mut bytes)?;
-            Self::deserialize(&bytes).map_err(|_| arbitrary::Error::IncorrectFormat)
+            <Self as ssz::Decode>::from_ssz_bytes(&bytes).map_err(|_| arbitrary::Error::IncorrectFormat)
         }
     };
 }

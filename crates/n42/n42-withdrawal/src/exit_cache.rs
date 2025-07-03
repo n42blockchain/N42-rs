@@ -2,8 +2,11 @@ use std::cmp::Ordering;
 use crate::slot_epoch::Epoch;
 use crate::beacon_state::Error as BeaconStateError;
 use crate::chain_spec::ChainSpec;
+use crate::crypto::PublicKeyBytes;
 use crate::safe_aitrh::SafeArith;
 use crate::validators::Validator;
+use rpds::HashTrieMapSync as HashTrieMap;
+
 
 /// Map from exit epoch to the number of validators with that exit epoch.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -67,6 +70,56 @@ impl ExitCache {
 }
 
 impl arbitrary::Arbitrary<'_> for ExitCache {
+    fn arbitrary(_u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
+        Ok(Self::default())
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+type ValidatorIndex = usize;
+
+#[allow(clippy::len_without_is_empty)]
+#[derive(Debug, PartialEq, Clone, Default)]
+pub struct PubkeyCache {
+    /// Maintain the number of keys added to the map. It is not sufficient to just use the
+    /// HashTrieMap len, as it does not increase when duplicate keys are added. Duplicate keys are
+    /// used during testing.
+    len: usize,
+    map: HashTrieMap<PublicKeyBytes, ValidatorIndex>,
+}
+
+impl PubkeyCache {
+    /// Inserts a validator index into the map.
+    ///
+    /// The added index must equal the number of validators already added to the map. This ensures
+    /// that an index is never skipped.
+    pub fn insert(&mut self, pubkey: PublicKeyBytes, index: ValidatorIndex) -> bool {
+        if index == self.len {
+            self.map.insert_mut(pubkey, index);
+            self.len = self
+                .len
+                .checked_add(1)
+                .expect("map length cannot exceed usize");
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Looks up a validator index's by their public key.
+    pub fn get(&self, pubkey: &PublicKeyBytes) -> Option<ValidatorIndex> {
+        self.map.get(pubkey).copied()
+    }
+
+    /// Returns the number of validator indices added to the map so far.
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> ValidatorIndex {
+        self.len
+    }
+}
+
+impl arbitrary::Arbitrary<'_> for PubkeyCache {
     fn arbitrary(_u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
         Ok(Self::default())
     }

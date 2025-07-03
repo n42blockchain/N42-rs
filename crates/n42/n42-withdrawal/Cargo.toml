@@ -13,22 +13,18 @@ alloy-primitives = { version = "0.8", features = ["rlp", "getrandom"] }
 ethereum_ssz_derive = "0.7"
 tree_hash_derive = "0.8"
 milhouse = "0.3"
-ssz_types = "0.8"
+ssz_types = { version = "0.8.0", features = ["arbitrary"]}
 superstruct = "0.8"
 derivative = "2"
 tree_hash = "0.8"
 metastruct = "0.1.0"
-serde = { version = "1.0.219", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
 ethereum_ssz = "0.7"
 ethereum_serde_utils = "0.7"
 hex = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 blst = { version = "0.3.3", optional = true }
-
-
-
-
-
+rpds = "0.11"
 
 
 [lints]

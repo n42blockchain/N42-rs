@@ -2,15 +2,22 @@ use serde_utils::hex::encode as hex_encode;
 use serde::de::{Deserialize, Deserializer};
 use serde::ser::{Serialize, Serializer};
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 // use alloy_primitives::private::arbitrary;
 use ssz::{Decode, Encode};
 use tree_hash::TreeHash;
 use crate::error::Error;
 
+/// The byte-length of a BLS signature when serialized in compressed form.
+pub const SIGNATURE_BYTES_LEN: usize = 96;
+/// The byte-length of a BLS public key when serialized in compressed form.
+pub const PUBLIC_KEY_BYTES_LEN: usize = 48;
+
 /// Generic implementations which are only generally useful for docs.
 pub mod generics {
     pub use crate::crypto::GenericPublicKeyBytes;
+    pub use crate::crypto::GenericSignatureBytes;
 }
 
 /// Defines all the fundamental BLS points which should be exported by this crate by making
@@ -21,6 +28,8 @@ macro_rules! define_mod {
             use $mod as bls_variant;
             use crate::crypto::generics::*;
             pub type PublicKeyBytes = GenericPublicKeyBytes<bls_variant::PublicKey>;
+            pub type SignatureBytes =
+                GenericSignatureBytes<bls_variant::PublicKey, bls_variant::Signature>;
         }
     };
 }
@@ -37,13 +46,15 @@ pub use fake_crypto_implementations::*;
 /// Provides the externally-facing, core BLS types.
 pub mod types {
     pub use super::PublicKey;
+    pub use super::Signature;
 }
 
 #[derive(Clone)]
 pub struct PublicKey([u8; PUBLIC_KEY_BYTES_LEN]);
 
-/// The byte-length of a BLS public key when serialized in compressed form.
-pub const PUBLIC_KEY_BYTES_LEN: usize = 48;
+#[derive(Clone)]
+pub struct Signature([u8; SIGNATURE_BYTES_LEN]);
+
 
 pub struct GenericPublicKeyBytes<Pub> {
     bytes: [u8; PUBLIC_KEY_BYTES_LEN],
@@ -116,6 +127,12 @@ impl<Pub> PartialEq for GenericPublicKeyBytes<Pub> {
     }
 }
 
+impl<Pub> Hash for GenericPublicKeyBytes<Pub> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.bytes[..].hash(state);
+    }
+}
+
 impl<Pub> Encode for GenericPublicKeyBytes<Pub> {
     impl_ssz_encode!(PUBLIC_KEY_BYTES_LEN);
 }
@@ -151,4 +168,67 @@ impl<Pub> fmt::Debug for GenericPublicKeyBytes<Pub> {
 #[cfg(feature = "arbitrary")]
 impl<Pub: 'static> arbitrary::Arbitrary<'_> for GenericPublicKeyBytes<Pub> {
     impl_arbitrary!(PUBLIC_KEY_BYTES_LEN);
+}
+
+
+/// A wrapper around some bytes that may or may not be a `GenericSignature` in compressed form.
+///
+/// This struct is useful for two things:
+///
+/// - Lazily verifying a serialized signature.
+/// - Storing some bytes that are actually invalid (required in the case of a `Deposit` message).
+#[derive(Clone)]
+pub struct GenericSignatureBytes<Pub, Sig> {
+    bytes: [u8; SIGNATURE_BYTES_LEN],
+    _phantom_public_key: PhantomData<Pub>,
+    _phantom_signature: PhantomData<Sig>,
+}
+
+impl<Pub, Sig> PartialEq for GenericSignatureBytes<Pub, Sig> {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes[..] == other.bytes[..]
+    }
+}
+
+impl<Pub, Sig> Hash for GenericSignatureBytes<Pub, Sig> {
+    fn hash<H: Hasher>(&self, hasher: &mut H) {
+        self.bytes.hash(hasher);
+    }
+}
+
+impl<Pub, Sig> Encode for GenericSignatureBytes<Pub, Sig> {
+    impl_ssz_encode!(SIGNATURE_BYTES_LEN);
+}
+
+impl<Pub, Sig> Decode for GenericSignatureBytes<Pub, Sig> {
+    impl_ssz_decode!(SIGNATURE_BYTES_LEN);
+}
+
+impl<Pub, Sig> TreeHash for GenericSignatureBytes<Pub, Sig> {
+    impl_tree_hash!(SIGNATURE_BYTES_LEN);
+}
+
+impl<Pub, Sig> fmt::Display for GenericSignatureBytes<Pub, Sig> {
+    impl_display!();
+}
+
+impl<Pub, Sig> std::str::FromStr for GenericSignatureBytes<Pub, Sig> {
+    impl_from_str!();
+}
+
+impl<Pub, Sig> Serialize for GenericSignatureBytes<Pub, Sig> {
+    impl_serde_serialize!();
+}
+
+impl<'de, Pub, Sig> Deserialize<'de> for GenericSignatureBytes<Pub, Sig> {
+    impl_serde_deserialize!();
+}
+
+impl<Pub, Sig> fmt::Debug for GenericSignatureBytes<Pub, Sig> {
+    impl_debug!();
+}
+
+#[cfg(feature = "arbitrary")]
+impl<Pub: 'static, Sig: 'static> arbitrary::Arbitrary<'_> for GenericSignatureBytes<Pub, Sig> {
+    impl_arbitrary!(SIGNATURE_BYTES_LEN);
 }

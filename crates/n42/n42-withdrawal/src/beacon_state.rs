@@ -1,4 +1,5 @@
 use std::fmt::Debug;
+use std::mem;
 use alloy_primitives::private::arbitrary;
 use alloy_primitives::private::serde::{Deserialize, Serialize};
 use milhouse::List;
@@ -15,6 +16,7 @@ use crate::fork_name::ForkName;
 use crate::slot_epoch::{Epoch, Slot};
 use crate::exit_cache::ExitCache;
 use crate::safe_aitrh::{ArithError, SafeArith};
+use crate::exit_cache::PubkeyCache;
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Error {
@@ -29,10 +31,13 @@ pub enum Error {
         initialized_epoch: Epoch,
         current_epoch: Epoch,
     },
+    PubkeyCacheInconsistent,
+    MilhouseError(milhouse::Error),
+
 }
 
 #[superstruct(
-    variants(Base, Altair, Bellatrix, Capella, Deneb, Electra, Fulu),
+    variants(Electra, Fulu),
     variant_attributes(
         derive(
             Derivative,
@@ -43,8 +48,6 @@ pub enum Error {
             Encode,
             Decode,
             TreeHash,
-            // TestRandom,
-            // CompareFields,
             arbitrary::Arbitrary,
         ),
         serde(bound = "E: EthSpec", deny_unknown_fields),
@@ -52,76 +55,6 @@ pub enum Error {
         derivative(Clone),
     ),
     specific_variant_attributes(
-        Base(metastruct(
-            mappings(
-                map_beacon_state_base_fields(),
-                map_beacon_state_base_tree_list_fields(mutable, fallible, groups(tree_lists)),
-                map_beacon_state_base_tree_list_fields_immutable(groups(tree_lists)),
-            ),
-            bimappings(bimap_beacon_state_base_tree_list_fields(
-                other_type = "BeaconStateBase",
-                self_mutable,
-                fallible,
-                groups(tree_lists)
-            )),
-            num_fields(all()),
-        )),
-        Altair(metastruct(
-            mappings(
-                map_beacon_state_altair_fields(),
-                map_beacon_state_altair_tree_list_fields(mutable, fallible, groups(tree_lists)),
-                map_beacon_state_altair_tree_list_fields_immutable(groups(tree_lists)),
-            ),
-            bimappings(bimap_beacon_state_altair_tree_list_fields(
-                other_type = "BeaconStateAltair",
-                self_mutable,
-                fallible,
-                groups(tree_lists)
-            )),
-            num_fields(all()),
-        )),
-        Bellatrix(metastruct(
-            mappings(
-                map_beacon_state_bellatrix_fields(),
-                map_beacon_state_bellatrix_tree_list_fields(mutable, fallible, groups(tree_lists)),
-                map_beacon_state_bellatrix_tree_list_fields_immutable(groups(tree_lists)),
-            ),
-            bimappings(bimap_beacon_state_bellatrix_tree_list_fields(
-                other_type = "BeaconStateBellatrix",
-                self_mutable,
-                fallible,
-                groups(tree_lists)
-            )),
-            num_fields(all()),
-        )),
-        Capella(metastruct(
-            mappings(
-                map_beacon_state_capella_fields(),
-                map_beacon_state_capella_tree_list_fields(mutable, fallible, groups(tree_lists)),
-                map_beacon_state_capella_tree_list_fields_immutable(groups(tree_lists)),
-            ),
-            bimappings(bimap_beacon_state_capella_tree_list_fields(
-                other_type = "BeaconStateCapella",
-                self_mutable,
-                fallible,
-                groups(tree_lists)
-            )),
-            num_fields(all()),
-        )),
-        Deneb(metastruct(
-            mappings(
-                map_beacon_state_deneb_fields(),
-                map_beacon_state_deneb_tree_list_fields(mutable, fallible, groups(tree_lists)),
-                map_beacon_state_deneb_tree_list_fields_immutable(groups(tree_lists)),
-            ),
-            bimappings(bimap_beacon_state_deneb_tree_list_fields(
-                other_type = "BeaconStateDeneb",
-                self_mutable,
-                fallible,
-                groups(tree_lists)
-            )),
-            num_fields(all()),
-        )),
         Electra(metastruct(
             mappings(
                 map_beacon_state_electra_fields(),
@@ -190,7 +123,7 @@ where
     #[tree_hash(skip_hashing)]
     #[metastruct(exclude)]
     pub exit_cache: ExitCache,
-    #[superstruct(only(Electra, Fulu), partial_getter(copy))]
+    #[superstruct(only(Fulu), partial_getter(copy))]
     #[metastruct(exclude_from(tree_lists))]
     pub earliest_exit_epoch: Epoch,
 
@@ -201,10 +134,16 @@ where
     #[metastruct(exclude)]
     pub total_active_balance: Option<(Epoch, u64)>,
 
-    #[superstruct(only(Electra, Fulu), partial_getter(copy))]
+    #[superstruct(only(Fulu), partial_getter(copy))]
     #[metastruct(exclude_from(tree_lists))]
     #[serde(with = "serde_utils::quoted_u64")]
     pub exit_balance_to_consume: u64,
+
+    #[serde(skip_serializing, skip_deserializing)]
+    #[ssz(skip_serializing, skip_deserializing)]
+    #[tree_hash(skip_hashing)]
+    #[metastruct(exclude)]
+    pub pubkey_cache: PubkeyCache,
 }
 
 impl<E: EthSpec> BeaconState<E> {
@@ -218,11 +157,11 @@ impl<E: EthSpec> BeaconState<E> {
     /// Does not check if `self` is consistent with the fork dictated by `self.slot()`.
     pub fn fork_name_unchecked(&self) -> ForkName {
         match self {
-            BeaconState::Base { .. } => ForkName::Base,
-            BeaconState::Altair { .. } => ForkName::Altair,
-            BeaconState::Bellatrix { .. } => ForkName::Bellatrix,
-            BeaconState::Capella { .. } => ForkName::Capella,
-            BeaconState::Deneb { .. } => ForkName::Deneb,
+            // BeaconState::Base { .. } => ForkName::Base,
+            // BeaconState::Altair { .. } => ForkName::Altair,
+            // BeaconState::Bellatrix { .. } => ForkName::Bellatrix,
+            // BeaconState::Capella { .. } => ForkName::Capella,
+            // BeaconState::Deneb { .. } => ForkName::Deneb,
             BeaconState::Electra { .. } => ForkName::Electra,
             BeaconState::Fulu { .. } => ForkName::Fulu,
         }
@@ -258,6 +197,38 @@ impl<E: EthSpec> BeaconState<E> {
         self.validators_mut()
             .get_cow(validator_index)
             .ok_or(Error::UnknownValidator(validator_index))
+    }
+
+    pub fn get_pending_balance_to_withdraw(&self, validator_index: usize) -> Result<u64, Error> {
+        let mut pending_balance = 0;
+        for withdrawal in self
+            .pending_partial_withdrawals()?
+            .iter()
+            .filter(|withdrawal| withdrawal.validator_index as usize == validator_index)
+        {
+            pending_balance.safe_add_assign(withdrawal.amount)?;
+        }
+        Ok(pending_balance)
+    }
+
+    /// Updates the pubkey cache, if required.
+    ///
+    /// Adds all `pubkeys` from the `validators` which are not already in the cache. Will
+    /// never re-add a pubkey.
+    pub fn update_pubkey_cache(&mut self) -> Result<(), Error> {
+        let mut pubkey_cache = mem::take(self.pubkey_cache_mut());
+        let start_index = pubkey_cache.len();
+
+        for (i, validator) in self.validators().iter_from(start_index)?.enumerate() {
+            let index = start_index.safe_add(i)?;
+            let success = pubkey_cache.insert(validator.pubkey, index);
+            if !success {
+                return Err(Error::PubkeyCacheInconsistent);
+            }
+        }
+        *self.pubkey_cache_mut() = pubkey_cache;
+
+        Ok(())
     }
 
     /// Build the exit cache, if it needs to be built.
@@ -367,11 +338,11 @@ impl<E: EthSpec> BeaconState<E> {
                 .safe_add_assign(additional_epochs.safe_mul(per_epoch_churn)?)?;
         }
         match self {
-            BeaconState::Base(_)
-            | BeaconState::Altair(_)
-            | BeaconState::Bellatrix(_)
-            | BeaconState::Capella(_)
-            | BeaconState::Deneb(_) => Err(Error::IncorrectStateVariant),
+            // BeaconState::Base(_)
+            // | BeaconState::Altair(_)
+            // | BeaconState::Bellatrix(_)
+            // | BeaconState::Capella(_)
+            // | BeaconState::Deneb(_) => Err(Error::IncorrectStateVariant),
             BeaconState::Electra(_) | BeaconState::Fulu(_) => {
                 // Consume the balance and update state variables
                 *self.exit_balance_to_consume_mut()? =
@@ -389,6 +360,12 @@ impl From<ArithError> for Error {
     }
 }
 
+impl From<milhouse::Error> for Error {
+    fn from(e: milhouse::Error) -> Self {
+        Self::MilhouseError(e)
+    }
+}
+
 pub trait EthSpec:
 'static + Default + Sync + Send + Clone + Debug + PartialEq + Eq + for<'a> arbitrary::Arbitrary<'a>
 {
@@ -396,6 +373,10 @@ pub trait EthSpec:
     type PendingPartialWithdrawalsLimit: Unsigned + Clone + Sync + Send + Debug + PartialEq;
     type MaxWithdrawalsPerPayload: Unsigned + Clone + Sync + Send + Debug + PartialEq;
     type SlotsPerEpoch: Unsigned + Clone + Sync + Send + Debug + PartialEq;
+    type MaxDepositRequestsPerPayload: Unsigned + Clone + Sync + Send + Debug + PartialEq;
+    type MaxWithdrawalRequestsPerPayload: Unsigned + Clone + Sync + Send + Debug + PartialEq;
+    type MaxConsolidationRequestsPerPayload: Unsigned + Clone + Sync + Send + Debug + PartialEq;
+
 
 
     fn max_withdrawals_per_payload() -> usize {
@@ -407,5 +388,10 @@ pub trait EthSpec:
     /// Spec v0.12.1
     fn slots_per_epoch() -> u64 {
         Self::SlotsPerEpoch::to_u64()
+    }
+
+    /// Returns the `PENDING_PARTIAL_WITHDRAWALS_LIMIT` constant for this specification.
+    fn pending_partial_withdrawals_limit() -> usize {
+        Self::PendingPartialWithdrawalsLimit::to_usize()
     }
 }

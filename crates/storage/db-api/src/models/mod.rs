@@ -23,6 +23,7 @@ pub mod integer_list;
 pub mod sharded_key;
 pub mod storage_sharded_key;
 mod snapshot;
+mod beacon;
 
 pub use accounts::*;
 pub use blocks::*;

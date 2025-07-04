@@ -1,5 +1,5 @@
 use alloy_primitives::{BlockHash};
-use crate::beacon::{BeaconBlock, BeaconState};
+use n42_primitives::{BeaconBlock, BeaconState};
 
 #[derive(Debug, Clone, Hash, Default)]
 pub struct Storage {

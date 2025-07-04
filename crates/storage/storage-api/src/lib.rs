@@ -88,6 +88,9 @@ pub use stats::*;
 mod snapshot;
 pub use snapshot::*;
 
+mod beacon;
+pub use beacon::*;
+
 mod legacy;
 pub use legacy::*;
 

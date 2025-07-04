@@ -494,11 +494,12 @@ pub fn process_withdrawals<E: EthSpec, Payload: AbstractExecPayload<E>>(
                 .pop_front(processed_partial_withdrawals_count)?;
         }
 
-        // Update the next withdrawal index if this block contained withdrawals
+        // Update the next withdrawal index if this block contained withdrawals 有处理提现，最后提现id加1
         if let Some(latest_withdrawal) = expected_withdrawals.last() {
             *state.next_withdrawal_index_mut()? = latest_withdrawal.index.safe_add(1)?;
 
             // Update the next validator index to start the next withdrawal sweep
+            // 提现数等于最大payload值，下次扫描起点是本次末尾验证者id加1
             if expected_withdrawals.len() == E::max_withdrawals_per_payload() {
                 // Next sweep starts after the latest withdrawal's validator index
                 let next_validator_index = latest_withdrawal
@@ -510,6 +511,7 @@ pub fn process_withdrawals<E: EthSpec, Payload: AbstractExecPayload<E>>(
         }
 
         // Advance sweep by the max length of the sweep if there was not a full set of withdrawals
+        //  这一段validator提现都处理完成，下次扫描起点是上次起始索引加一大段，提现数小于payload最大值
         if expected_withdrawals.len() != E::max_withdrawals_per_payload() {
             let next_validator_index = state
                 .next_withdrawal_validator_index()?

@@ -31,19 +31,8 @@ pub struct Withdrawal {
 ///
 /// Spec v0.12.1
 #[derive(
-    arbitrary::Arbitrary,
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Default,
-    Hash,
-    Serialize,
-    Deserialize,
-    Encode,
-    Decode,
-    TreeHash,
+    arbitrary::Arbitrary, Debug, Clone, Copy, PartialEq, Eq, Default, Hash,
+    Serialize, Deserialize, Encode, Decode, TreeHash,
 )]
 pub struct Checkpoint {
     pub epoch: Epoch,

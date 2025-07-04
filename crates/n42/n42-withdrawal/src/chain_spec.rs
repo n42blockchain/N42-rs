@@ -22,16 +22,21 @@ pub struct ChainSpec {
     pub compounding_withdrawal_prefix_byte: u8,
     pub min_validator_withdrawability_delay: Epoch,
 
+    /// Compute activation and exit epochs
     pub max_seed_lookahead: Epoch,
 
     pub max_per_epoch_activation_exit_churn_limit: u64,
     pub min_per_epoch_churn_limit_electra: u64,
+    /// Calculate the denominator of the activation number
     pub churn_limit_quotient: u64,
     pub effective_balance_increment: u64,
     pub full_exit_request_amount: u64,
     pub shard_committee_period: u64,
+    /// if effective_balance < ejection_balance,Validator is forced to exit
     pub ejection_balance: u64,
+    /// maximum number of activations
     pub max_per_epoch_activation_churn_limit: u64,
+    /// minimum activation number
     pub min_per_epoch_churn_limit: u64,
 
 }

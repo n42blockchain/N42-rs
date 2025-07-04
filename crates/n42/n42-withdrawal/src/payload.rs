@@ -35,24 +35,9 @@ ExecPayload<E>
 {
     type Ref<'a>: ExecPayload<E>
     + Copy
-    // + From<&'a Self::Bellatrix>
-    // + From<&'a Self::Capella>
-    // + From<&'a Self::Deneb>
     + From<&'a Self::Electra>
     + From<&'a Self::Fulu>;
 
-    // type Bellatrix: OwnedExecPayload<E>
-    // + Into<Self>
-    // + for<'a> From<Cow<'a, ExecutionPayloadBellatrix<E>>>
-    // + TryFrom<ExecutionPayloadHeaderBellatrix<E>>;
-    // type Capella: OwnedExecPayload<E>
-    // + Into<Self>
-    // + for<'a> From<Cow<'a, ExecutionPayloadCapella<E>>>
-    // + TryFrom<ExecutionPayloadHeaderCapella<E>>;
-    // type Deneb: OwnedExecPayload<E>
-    // + Into<Self>
-    // + for<'a> From<Cow<'a, ExecutionPayloadDeneb<E>>>
-    // + TryFrom<ExecutionPayloadHeaderDeneb<E>>;
     type Electra: OwnedExecPayload<E>
     + Into<Self>
     + for<'a> From<Cow<'a, ExecutionPayloadElectra<E>>>
@@ -74,16 +59,7 @@ pub trait ExecPayload<E: EthSpec>: Debug + Clone + PartialEq + Hash + TreeHash +
     variants(Electra, Fulu),
     variant_attributes(
         derive(
-            Default,
-            Debug,
-            Clone,
-            Serialize,
-            Deserialize,
-            Encode,
-            Decode,
-            TreeHash,
-            Derivative,
-            arbitrary::Arbitrary
+            Default, Debug, Clone, Serialize, Deserialize, Encode, Decode, TreeHash, Derivative, arbitrary::Arbitrary
         ),
         derivative(PartialEq, Hash(bound = "E: EthSpec")),
         serde(bound = "E: EthSpec", deny_unknown_fields),
@@ -113,16 +89,7 @@ pub struct ExecutionPayload<E: EthSpec> {
     variants(Electra, Fulu),
     variant_attributes(
         derive(
-            Default,
-            Debug,
-            Clone,
-            Serialize,
-            Deserialize,
-            Encode,
-            Decode,
-            TreeHash,
-            Derivative,
-            arbitrary::Arbitrary
+            Default, Debug, Clone, Serialize, Deserialize, Encode, Decode, TreeHash, Derivative, arbitrary::Arbitrary
         ),
         derivative(PartialEq, Hash(bound = "E: EthSpec")),
         serde(bound = "E: EthSpec", deny_unknown_fields),
@@ -151,40 +118,6 @@ pub struct ExecutionPayloadHeader<E: EthSpec> {
     _phantom: PhantomData<E>,
 }
 
-// #[superstruct(
-//     variants(Electra, Fulu),
-//     variant_attributes(
-//         derive(
-//             Debug,
-//             Clone,
-//             Serialize,
-//             Deserialize,
-//             Encode,
-//             Decode,
-//             TreeHash,
-//             Derivative,
-//             arbitrary::Arbitrary,
-//         ),
-//         derivative(PartialEq, Hash(bound = "E: EthSpec")),
-//         serde(bound = "E: EthSpec", deny_unknown_fields),
-//         arbitrary(bound = "E: EthSpec"),
-//         ssz(struct_behaviour = "transparent"),
-//     ),
-//     ref_attributes(
-//         derive(Debug, Derivative, TreeHash),
-//         derivative(PartialEq, Hash(bound = "E: EthSpec")),
-//         tree_hash(enum_behaviour = "transparent"),
-//     ),
-//     map_into(ExecutionPayload),
-//     map_ref_into(ExecutionPayloadRef),
-//     cast_error(ty = "Error", expr = "BeaconStateError::IncorrectStateVariant"),
-//     partial_getter_error(ty = "Error", expr = "BeaconStateError::IncorrectStateVariant")
-// )]
-// #[derive(Debug, Clone, Serialize, Deserialize, TreeHash, Derivative, arbitrary::Arbitrary)]
-// #[derivative(PartialEq, Hash(bound = "E: EthSpec"))]
-// #[serde(bound = "E: EthSpec")]
-// #[arbitrary(bound = "E: EthSpec")]
-// #[tree_hash(enum_behaviour = "transparent")]
 pub struct FullPayload<E: EthSpec> {
     _phantom: PhantomData<E>,
 }

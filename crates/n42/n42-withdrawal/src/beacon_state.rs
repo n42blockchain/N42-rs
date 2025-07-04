@@ -47,15 +47,7 @@ pub enum Error {
     variants(Electra, Fulu),
     variant_attributes(
         derive(
-            Derivative,
-            Debug,
-            PartialEq,
-            Serialize,
-            Deserialize,
-            Encode,
-            Decode,
-            TreeHash,
-            arbitrary::Arbitrary,
+            Derivative, Debug, PartialEq, Serialize, Deserialize, Encode, Decode, TreeHash, arbitrary::Arbitrary,
         ),
         serde(bound = "E: EthSpec", deny_unknown_fields),
         arbitrary(bound = "E: EthSpec"),
@@ -112,7 +104,6 @@ where
     #[serde(with = "ssz_types::serde_utils::quoted_u64_var_list")]
     pub balances: List<u64, E::ValidatorRegistryLimit>,
 
-    // Capella
     #[superstruct(only(Fulu), partial_getter(copy))]
     #[serde(with = "serde_utils::quoted_u64")]
     #[metastruct(exclude_from(tree_lists))]

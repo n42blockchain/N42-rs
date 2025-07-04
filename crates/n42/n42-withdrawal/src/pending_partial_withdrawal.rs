@@ -7,18 +7,7 @@ use alloy_primitives::{
         serde::{Deserialize, Serialize}, }, };
 
 #[derive(
-    arbitrary::Arbitrary,
-    Debug,
-    PartialEq,
-    Eq,
-    Hash,
-    Clone,
-    Serialize,
-    Deserialize,
-    Encode,
-    Decode,
-    TreeHash,
-    // TestRandom,
+    arbitrary::Arbitrary, Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, Encode, Decode, TreeHash,
 )]
 pub struct PendingPartialWithdrawal {
     #[serde(with = "serde_utils::quoted_u64")]

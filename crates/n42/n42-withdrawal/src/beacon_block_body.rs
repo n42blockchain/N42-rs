@@ -16,17 +16,7 @@ use crate::crypto::{PublicKeyBytes, SignatureBytes};
 #[superstruct(
     variants(Electra, Fulu),
     variant_attributes(
-        derive(
-            Debug,
-            Clone,
-            Serialize,
-            Deserialize,
-            Encode,
-            Decode,
-            TreeHash,
-            Derivative,
-            arbitrary::Arbitrary
-        ),
+        derive( Debug, Clone, Serialize, Deserialize, Encode, Decode, TreeHash, Derivative, arbitrary::Arbitrary),
         derivative(PartialEq, Hash(bound = "E: EthSpec, Payload: AbstractExecPayload<E>")),
         serde(
             bound = "E: EthSpec, Payload: AbstractExecPayload<E>",
@@ -77,16 +67,8 @@ pub type ConsolidationRequests<E> =
     VariableList<ConsolidationRequest, <E as EthSpec>::MaxConsolidationRequestsPerPayload>;
 
 #[derive(
-    arbitrary::Arbitrary,
-    Debug,
-    PartialEq,
-    Hash,
-    Clone,
-    Serialize,
-    Deserialize,
-    Encode,
-    Decode,
-    TreeHash,
+    arbitrary::Arbitrary, Debug, PartialEq, Hash, Clone,
+    Serialize, Deserialize, Encode, Decode, TreeHash,
 )]
 pub struct DepositRequest {
     pub pubkey: PublicKeyBytes,
@@ -99,17 +81,8 @@ pub struct DepositRequest {
 }
 
 #[derive(
-    arbitrary::Arbitrary,
-    Debug,
-    PartialEq,
-    Eq,
-    Hash,
-    Clone,
-    Serialize,
-    Deserialize,
-    Encode,
-    Decode,
-    TreeHash,
+    arbitrary::Arbitrary, Debug, PartialEq, Eq, Hash, Clone,
+    Serialize, Deserialize, Encode, Decode, TreeHash,
 )]
 pub struct WithdrawalRequest {
     #[serde(with = "serde_utils::address_hex")]
@@ -120,17 +93,8 @@ pub struct WithdrawalRequest {
 }
 
 #[derive(
-    arbitrary::Arbitrary,
-    Debug,
-    PartialEq,
-    Eq,
-    Hash,
-    Clone,
-    Serialize,
-    Deserialize,
-    Encode,
-    Decode,
-    TreeHash,
+    arbitrary::Arbitrary, Debug, PartialEq, Eq, Hash, Clone,
+    Serialize, Deserialize, Encode, Decode, TreeHash,
 )]
 pub struct ConsolidationRequest {
     pub source_address: Address,
@@ -139,16 +103,8 @@ pub struct ConsolidationRequest {
 }
 
 #[derive(
-    arbitrary::Arbitrary,
-    Debug,
-    Derivative,
-    Default,
-    Clone,
-    Serialize,
-    Deserialize,
-    Encode,
-    Decode,
-    TreeHash,
+    arbitrary::Arbitrary, Debug, Derivative, Default, Clone,
+    Serialize, Deserialize, Encode, Decode, TreeHash,
 )]
 #[serde(bound = "E: EthSpec")]
 #[arbitrary(bound = "E: EthSpec")]
@@ -165,17 +121,7 @@ pub struct ExecutionRequests<E: EthSpec> {
 #[superstruct(
     variants(Electra, Fulu),
     variant_attributes(
-        derive(
-            Debug,
-            Clone,
-            Serialize,
-            Deserialize,
-            Encode,
-            Decode,
-            TreeHash,
-            Derivative,
-            arbitrary::Arbitrary
-        ),
+        derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, TreeHash, Derivative, arbitrary::Arbitrary),
         derivative(PartialEq, Hash(bound = "E: EthSpec")),
         serde(bound = "E: EthSpec, Payload: AbstractExecPayload<E>"),
         arbitrary(bound = "E: EthSpec, Payload: AbstractExecPayload<E>"),
@@ -218,15 +164,7 @@ impl<E: EthSpec, Payload: AbstractExecPayload<E>> SignedBeaconBlock<E, Payload> 
     variants(Electra, Fulu),
     variant_attributes(
         derive(
-            Debug,
-            Clone,
-            Serialize,
-            Deserialize,
-            Encode,
-            Decode,
-            TreeHash,
-            Derivative,
-            arbitrary::Arbitrary
+            Debug, Clone, Serialize, Deserialize, Encode, Decode, TreeHash, Derivative, arbitrary::Arbitrary
         ),
         derivative(PartialEq, Hash(bound = "E: EthSpec, Payload: AbstractExecPayload<E>")),
         serde(

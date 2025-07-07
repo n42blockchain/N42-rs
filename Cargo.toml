@@ -47,6 +47,7 @@ members = [
     "crates/n42/n42-withdrawal",
     "crates/revm",
     "crates/n42/mobile",
+    "crates/n42/keystore",
     # "crates/evm/evm",
 #    "bin/reth/",
 ]
@@ -207,6 +208,7 @@ n42-clique = {path="crates/n42/clique"}
 n42-engine-types = {path="crates/n42/engine-types"}
 n42-engine-primitives = {path="crates/n42/engine-primitives"}
 consensus-client = {path="crates/n42/consensus-client"}
+n42-withdrawals = { path = "crates/n42/n42-withdrawal"}
 
 blst = "0.3.11"
 

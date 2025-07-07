@@ -1,0 +1,33 @@
+[package]
+name = "keystore"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+exclude.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+zeroize = { version = "1", features = ["zeroize_derive", "serde"] }
+uuid = { version = "0.8", features = ["serde", "v4"] }
+sha2 = "0.9"
+unicode-normalization = "0.1.16"
+aes = { version = "0.7", features = ["ctr"] }
+pbkdf2 = { version = "0.8.0", default-features = false }
+hmac = "0.11.0"
+scrypt = { version = "0.7.0", default-features = false }
+rand = "0.8"
+n42-withdrawals = { workspace = true , features = ["fake_crypto"]}
+serde_repr = "0.1"
+ring = "0.17"
+num-bigint-dig = { version = "0.8.4", features = ["zeroize"] }
+serde_json = "1"
+hex = "0.4"
+
+
+
+
+[lints]
+workspace = true

@@ -1,4 +1,5 @@
-
+use crate::arith::SafeArith;
+use crate::beaconstate::Error;
 /// Used to track the changes to a validator's balance.
 #[derive(Default, Clone)]
 pub struct Delta {
@@ -20,7 +21,7 @@ impl Delta {
     }
 
     /// Combine two deltas.
-    fn combine(&mut self, other: Delta) -> Result<(), Error> {
+    pub fn combine(&mut self, other: Delta) -> Result<(), Error> {
         self.reward(other.rewards)?;
         self.penalize(other.penalties)
     }

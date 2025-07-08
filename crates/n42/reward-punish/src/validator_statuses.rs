@@ -1,10 +1,57 @@
+use crate::arith::SafeArith;
+use crate::spec::{EthSpec, Spec};
+use crate::beaconstate::{BeaconState};
+use crate::beaconstate::Error as BeaconStateError;
+use ssz_types::BitList;
+use ssz_derive::{Decode, Encode};
+
+
+/// Sets the boolean `var` on `self` to be true if it is true on `other`. Otherwise leaves `self`
+/// as is.
+macro_rules! set_self_if_other_is_true {
+    ($self_: ident, $other: ident, $var: ident) => {
+        if $other.$var {
+            $self_.$var = true;
+        }
+    };
+}
+
+pub struct InclusionInfo {
+    /// The distance between the attestation slot and the slot that attestation was included in a
+    /// block.
+    pub delay: u64,
+    /// The index of the proposer at the slot where the attestation was included.
+    pub proposer_index: usize,
+}
+
+impl Default for InclusionInfo {
+    /// Defaults to `delay` at its maximum value and `proposer_index` at zero.
+    fn default() -> Self {
+        Self {
+            delay: u64::MAX,
+            proposer_index: 0,
+        }
+    }
+}
+
+impl InclusionInfo {
+    /// Tests if some `other` `InclusionInfo` has a lower inclusion slot than `self`. If so,
+    /// replaces `self` with `other`.
+    pub fn update(&mut self, other: &Self) {
+        if other.delay < self.delay {
+            self.delay = other.delay;
+            self.proposer_index = other.proposer_index;
+        }
+    }
+}
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct ValidatorStatus {
     /// True if the validator has been slashed, ever.
     pub is_slashed: bool,
     /// True if the validator is eligible.
     pub is_eligible: bool,
-    /// True if the validator can withdraw in the current epoch.
-    pub is_withdrawable_in_current_epoch: bool,
+    // /// True if the validator can withdraw in the current epoch.
+    // pub is_withdrawable_in_current_epoch: bool,
     /// True if the validator was active in the state's _current_ epoch.
     pub is_active_in_current_epoch: bool,
     /// True if the validator was active in the state's _previous_ epoch.
@@ -14,21 +61,23 @@ pub struct ValidatorStatus {
 
     /// True if the validator had an attestation included in the _current_ epoch.
     pub is_current_epoch_attester: bool,
-    /// True if the validator's beacon block root attestation for the first slot of the _current_
-    /// epoch matches the block root known to the state.
-    pub is_current_epoch_target_attester: bool,
+    // /// True if the validator's beacon block root attestation for the first slot of the _current_
+    // /// epoch matches the block root known to the state.
+    // pub is_current_epoch_target_attester: bool,
     /// True if the validator had an attestation included in the _previous_ epoch.
     pub is_previous_epoch_attester: bool,
-    /// True if the validator's beacon block root attestation for the first slot of the _previous_
-    /// epoch matches the block root known to the state.
-    pub is_previous_epoch_target_attester: bool,
-    /// True if the validator's beacon block root attestation in the _previous_ epoch at the
-    /// attestation's slot (`attestation_data.slot`) matches the block root known to the state.
-    pub is_previous_epoch_head_attester: bool,
+    // /// True if the validator's beacon block root attestation for the first slot of the _previous_
+    // /// epoch matches the block root known to the state.
+    // pub is_previous_epoch_target_attester: bool,
+    // /// True if the validator's beacon block root attestation in the _previous_ epoch at the
+    // /// attestation's slot (`attestation_data.slot`) matches the block root known to the state.
+    // pub is_previous_epoch_head_attester: bool,
 
-    /// Information used to reward the block producer of this validators earliest-included
-    /// attestation.
-    pub inclusion_info: Option<InclusionInfo>,
+    // Information used to reward the block producer of this validators earliest-included
+    // attestation.
+    // pub inclusion_info: Option<InclusionInfo>,
+    /// True if the validator can withdraw in the current epoch.
+    pub is_withdrawable_in_current_epoch: bool,
 }
 
 impl ValidatorStatus {
@@ -43,22 +92,22 @@ impl ValidatorStatus {
         // `self` to false).
         set_self_if_other_is_true!(self, other, is_slashed);
         set_self_if_other_is_true!(self, other, is_eligible);
-        set_self_if_other_is_true!(self, other, is_withdrawable_in_current_epoch);
+        // set_self_if_other_is_true!(self, other, is_withdrawable_in_current_epoch);
         set_self_if_other_is_true!(self, other, is_active_in_current_epoch);
         set_self_if_other_is_true!(self, other, is_active_in_previous_epoch);
         set_self_if_other_is_true!(self, other, is_current_epoch_attester);
-        set_self_if_other_is_true!(self, other, is_current_epoch_target_attester);
+        // set_self_if_other_is_true!(self, other, is_current_epoch_target_attester);
         set_self_if_other_is_true!(self, other, is_previous_epoch_attester);
-        set_self_if_other_is_true!(self, other, is_previous_epoch_target_attester);
-        set_self_if_other_is_true!(self, other, is_previous_epoch_head_attester);
+        // set_self_if_other_is_true!(self, other, is_previous_epoch_target_attester);
+        // set_self_if_other_is_true!(self, other, is_previous_epoch_head_attester);
 
-        if let Some(other_info) = other.inclusion_info {
-            if let Some(self_info) = self.inclusion_info.as_mut() {
-                self_info.update(&other_info);
-            } else {
-                self.inclusion_info = other.inclusion_info;
-            }
-        }
+        // if let Some(other_info) = other.inclusion_info {
+        //     if let Some(self_info) = self.inclusion_info.as_mut() {
+        //         self_info.update(&other_info);
+        //     } else {
+        //         self.inclusion_info = other.inclusion_info;
+        //     }
+        // }
     }
 }
 
@@ -72,17 +121,17 @@ pub struct TotalBalances {
     previous_epoch: u64,
     /// The total effective balance of all validators who attested during the _current_ epoch.
     current_epoch_attesters: u64,
-    /// The total effective balance of all validators who attested during the _current_ epoch and
-    /// agreed with the state about the beacon block at the first slot of the _current_ epoch.
-    current_epoch_target_attesters: u64,
+    // / The total effective balance of all validators who attested during the _current_ epoch and
+    // / agreed with the state about the beacon block at the first slot of the _current_ epoch.
+    // current_epoch_target_attesters: u64,
     /// The total effective balance of all validators who attested during the _previous_ epoch.
     previous_epoch_attesters: u64,
-    /// The total effective balance of all validators who attested during the _previous_ epoch and
-    /// agreed with the state about the beacon block at the first slot of the _previous_ epoch.
-    previous_epoch_target_attesters: u64,
-    /// The total effective balance of all validators who attested during the _previous_ epoch and
-    /// agreed with the state about the beacon block at the time of attestation.
-    previous_epoch_head_attesters: u64,
+    // / The total effective balance of all validators who attested during the _previous_ epoch and
+    // / agreed with the state about the beacon block at the first slot of the _previous_ epoch.
+    // previous_epoch_target_attesters: u64,
+    // / The total effective balance of all validators who attested during the _previous_ epoch and
+    // / agreed with the state about the beacon block at the time of attestation.
+    // previous_epoch_head_attesters: u64,
 }
 
 // Generate a safe accessor for a balance in `TotalBalances`, as per spec `get_total_balance`.
@@ -95,26 +144,26 @@ macro_rules! balance_accessor {
 }
 
 impl TotalBalances {
-    pub fn new(spec: &ChainSpec) -> Self {
+    pub fn new(spec: &Spec) -> Self {
         Self {
             effective_balance_increment: spec.effective_balance_increment,
             current_epoch: 0,
             previous_epoch: 0,
             current_epoch_attesters: 0,
-            current_epoch_target_attesters: 0,
+            // current_epoch_target_attesters: 0,
             previous_epoch_attesters: 0,
-            previous_epoch_target_attesters: 0,
-            previous_epoch_head_attesters: 0,
+            // previous_epoch_target_attesters: 0,
+            // previous_epoch_head_attesters: 0,
         }
     }
 
     balance_accessor!(current_epoch);
     balance_accessor!(previous_epoch);
-    balance_accessor!(current_epoch_attesters);
-    balance_accessor!(current_epoch_target_attesters);
+    // balance_accessor!(current_epoch_attesters);
+    // balance_accessor!(current_epoch_target_attesters);
     balance_accessor!(previous_epoch_attesters);
-    balance_accessor!(previous_epoch_target_attesters);
-    balance_accessor!(previous_epoch_head_attesters);
+    // balance_accessor!(previous_epoch_target_attesters);
+    // balance_accessor!(previous_epoch_head_attesters);
 }
 
 pub struct ValidatorStatuses {
@@ -133,7 +182,7 @@ impl ValidatorStatuses {
     /// Spec v0.12.1
     pub fn new<E: EthSpec>(
         state: &BeaconState<E>,
-        spec: &ChainSpec,
+        spec: &Spec,
     ) -> Result<Self, BeaconStateError> {
         let mut statuses = Vec::with_capacity(state.validators().len());
         let mut total_balances = TotalBalances::new(spec);
@@ -173,96 +222,118 @@ impl ValidatorStatuses {
             total_balances,
         })
     }
-     /// Process some attestations from the given `state` updating the `statuses` and
-    /// `total_balances` fields.
-    ///
-    /// Spec v0.12.1
-    pub fn process_attestations<E: EthSpec>(
-        &mut self,
-        state: &BeaconState<E>,
-    ) -> Result<(), BeaconStateError> {
-        let base_state = state.as_base()?;
-        for a in base_state
-            .previous_epoch_attestations
-            .iter()
-            .chain(base_state.current_epoch_attestations.iter())
-        {
-            let committee = state.get_beacon_committee(a.data.slot, a.data.index)?;
-            let attesting_indices =
-                get_attesting_indices::<E>(committee.committee, &a.aggregation_bits)?;
 
-            let mut status = ValidatorStatus::default();
+    // pub fn process_attestations<E: EthSpec>(
+    //     &mut self,
+    //     state: &BeaconState<E>,
+    // ) -> Result<(), BeaconStateError> {
+    //     let base_state = state.as_base()?;
+    //     for a in base_state
+    //         .previous_epoch_attestations
+    //         .iter()
+    //         .chain(base_state.current_epoch_attestations.iter())
+    //     {
+    //         let committee = state.get_beacon_committee(a.data.slot, a.data.index)?;
+    //         let attesting_indices =
+    //             get_attesting_indices::<E>(committee.committee, &a.aggregation_bits)?;
+    //
+    //         let mut status = ValidatorStatus::default();
+    //
+    //         // Profile this attestation, updating the total balances and generating an
+    //         // `ValidatorStatus` object that applies to all participants in the attestation.
+    //         // if a.data.target.epoch == state.current_epoch() {
+    //         //     status.is_current_epoch_attester = true;
+    //         //
+    //         //     // if target_matches_epoch_start_block(a, state, state.current_epoch())? {
+    //         //     //     status.is_current_epoch_target_attester = true;
+    //         //     // }
+    //         // } else if a.data.target.epoch == state.previous_epoch() {
+    //         //     status.is_previous_epoch_attester = true;
+    //         //
+    //         //     // The inclusion delay and proposer index are only required for previous epoch
+    //         //     // attesters.
+    //         //     // status.inclusion_info = Some(InclusionInfo {
+    //         //     //     delay: a.inclusion_delay,
+    //         //     //     proposer_index: a.proposer_index as usize,
+    //         //     // });
+    //         //
+    //         //     // if target_matches_epoch_start_block(a, state, state.previous_epoch())? {
+    //         //     //     status.is_previous_epoch_target_attester = true;
+    //         //     //
+    //         //     //     if has_common_beacon_block_root(a, state)? {
+    //         //     //         status.is_previous_epoch_head_attester = true;
+    //         //     //     }
+    //         //     // }
+    //         // }
+    //
+    //         // Loop through the participating validator indices and update the status vec.
+    //         for validator_index in attesting_indices {
+    //             self.statuses
+    //                 .get_mut(validator_index as usize)
+    //                 .ok_or(BeaconStateError::UnknownValidator(validator_index as usize))?
+    //                 .update(&status);
+    //         }
+    //     }
+    //
+    //     // Compute the total balances
+    //     for v in self.statuses.iter() {
+    //         // According to the spec, we only count unslashed validators towards the totals.
+    //         if !v.is_slashed {
+    //             let validator_balance = v.current_epoch_effective_balance;
+    //
+    //             if v.is_current_epoch_attester {
+    //                 self.total_balances
+    //                     .current_epoch_attesters
+    //                     .safe_add_assign(validator_balance)?;
+    //             }
+    //             // if v.is_current_epoch_target_attester {
+    //             //     self.total_balances
+    //             //         .current_epoch_target_attesters
+    //             //         .safe_add_assign(validator_balance)?;
+    //             // }
+    //             if v.is_previous_epoch_attester {
+    //                 self.total_balances
+    //                     .previous_epoch_attesters
+    //                     .safe_add_assign(validator_balance)?;
+    //             }
+    //             // if v.is_previous_epoch_target_attester {
+    //             //     self.total_balances
+    //             //         .previous_epoch_target_attesters
+    //             //         .safe_add_assign(validator_balance)?;
+    //             // }
+    //             // if v.is_previous_epoch_head_attester {
+    //             //     self.total_balances
+    //             //         .previous_epoch_head_attesters
+    //             //         .safe_add_assign(validator_balance)?;
+    //             // }
+    //         }
+    //     }
+    //
+    //     Ok(())
+    // }
 
-            // Profile this attestation, updating the total balances and generating an
-            // `ValidatorStatus` object that applies to all participants in the attestation.
-            if a.data.target.epoch == state.current_epoch() {
-                status.is_current_epoch_attester = true;
 
-                if target_matches_epoch_start_block(a, state, state.current_epoch())? {
-                    status.is_current_epoch_target_attester = true;
-                }
-            } else if a.data.target.epoch == state.previous_epoch() {
-                status.is_previous_epoch_attester = true;
+}
 
-                // The inclusion delay and proposer index are only required for previous epoch
-                // attesters.
-                status.inclusion_info = Some(InclusionInfo {
-                    delay: a.inclusion_delay,
-                    proposer_index: a.proposer_index as usize,
-                });
 
-                if target_matches_epoch_start_block(a, state, state.previous_epoch())? {
-                    status.is_previous_epoch_target_attester = true;
-
-                    if has_common_beacon_block_root(a, state)? {
-                        status.is_previous_epoch_head_attester = true;
-                    }
-                }
-            }
-
-            // Loop through the participating validator indices and update the status vec.
-            for validator_index in attesting_indices {
-                self.statuses
-                    .get_mut(validator_index as usize)
-                    .ok_or(BeaconStateError::UnknownValidator(validator_index as usize))?
-                    .update(&status);
-            }
-        }
-
-        // Compute the total balances
-        for v in self.statuses.iter() {
-            // According to the spec, we only count unslashed validators towards the totals.
-            if !v.is_slashed {
-                let validator_balance = v.current_epoch_effective_balance;
-
-                if v.is_current_epoch_attester {
-                    self.total_balances
-                        .current_epoch_attesters
-                        .safe_add_assign(validator_balance)?;
-                }
-                if v.is_current_epoch_target_attester {
-                    self.total_balances
-                        .current_epoch_target_attesters
-                        .safe_add_assign(validator_balance)?;
-                }
-                if v.is_previous_epoch_attester {
-                    self.total_balances
-                        .previous_epoch_attesters
-                        .safe_add_assign(validator_balance)?;
-                }
-                if v.is_previous_epoch_target_attester {
-                    self.total_balances
-                        .previous_epoch_target_attesters
-                        .safe_add_assign(validator_balance)?;
-                }
-                if v.is_previous_epoch_head_attester {
-                    self.total_balances
-                        .previous_epoch_head_attesters
-                        .safe_add_assign(validator_balance)?;
-                }
-            }
-        }
-
-        Ok(())
+/// Returns validator indices which participated in the attestation, sorted by increasing index.
+pub fn get_attesting_indices<E: EthSpec>(
+    committee: &[usize],
+    bitlist: &BitList<E::MaxValidatorsPerCommittee>,
+) -> Result<Vec<u64>, BeaconStateError> {
+    if bitlist.len() != committee.len() {
+        return Err(BeaconStateError::InvalidBitfield);
     }
+
+    let mut indices = Vec::with_capacity(bitlist.num_set_bits());
+
+    for (i, validator_index) in committee.iter().enumerate() {
+        if let Ok(true) = bitlist.get(i) {
+            indices.push(*validator_index as u64)
+        }
+    }
+
+    indices.sort_unstable();
+
+    Ok(indices)
 }

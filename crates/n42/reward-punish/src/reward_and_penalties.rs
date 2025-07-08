@@ -1,16 +1,25 @@
-use types::{BeaconState, ChainSpec, EthSpec};
+use crate::arith::SafeArith;
 use crate::per_epoch_processing::Delta;
-use crate::base::get_base_reward;
+use crate::base::{get_base_reward,SqrtTotalActiveBalance};
+use crate::errors::EpochProcessingError as Error;
+use crate::validator_statuses::{ValidatorStatuses,TotalBalances,ValidatorStatus};
+use crate::base::{increase_balance,decrease_balance};
+use crate::spec::{Spec,EthSpec};
+use crate::beaconstate::BeaconState;
+
+
+
 
 /// Combination of several deltas for different components of an attestation reward.
 ///
 /// Exists only for compatibility with EF rewards tests.
 #[derive(Default, Clone)]
 pub struct AttestationDelta {
-    pub source_delta: Delta,
-    pub target_delta: Delta,
-    pub head_delta: Delta,
-    pub inclusion_delay_delta: Delta,
+    // pub source_delta: Delta,
+    // pub target_delta: Delta,
+    // pub head_delta: Delta,
+    // pub inclusion_delay_delta: Delta,
+    pub all_delta: Delta,
     pub inactivity_penalty_delta: Delta,
 }
 
@@ -18,18 +27,20 @@ impl AttestationDelta {
     /// Flatten into a single delta.
     pub fn flatten(self) -> Result<Delta, Error> {
         let AttestationDelta {
-            source_delta,
-            target_delta,
-            head_delta,
-            inclusion_delay_delta,
+            // source_delta,
+            // target_delta,
+            // head_delta,
+            // inclusion_delay_delta,
+            all_delta,
             inactivity_penalty_delta,
         } = self;
         let mut result = Delta::default();
         for delta in [
-            source_delta,
-            target_delta,
-            head_delta,
-            inclusion_delay_delta,
+            // source_delta,
+            // target_delta,
+            // head_delta,
+            // inclusion_delay_delta,
+            all_delta,
             inactivity_penalty_delta,
         ] {
             result.combine(delta)?;
@@ -48,7 +59,7 @@ pub enum ProposerRewardCalculation {
 pub fn process_rewards_and_penalties<E: EthSpec>(
     state: &mut BeaconState<E>,
     validator_statuses: &ValidatorStatuses,
-    spec: &ChainSpec,
+    spec: &Spec,
 ) -> Result<(), Error> {
     if state.current_epoch() == E::genesis_epoch() {
         return Ok(());
@@ -84,35 +95,35 @@ pub fn get_attestation_deltas_all<E: EthSpec>(
     state: &BeaconState<E>,
     validator_statuses: &ValidatorStatuses,
     proposer_reward: ProposerRewardCalculation,
-    spec: &ChainSpec,
+    spec: &Spec,
 ) -> Result<Vec<AttestationDelta>, Error> {
-    get_attestation_deltas(state, validator_statuses, proposer_reward, None, spec)
+    get_attestation_deltas(state, validator_statuses, proposer_reward, spec)
 }
 
-/// Apply rewards for participation in attestations during the previous epoch, and only compute
-/// rewards for a subset of validators.
-pub fn get_attestation_deltas_subset<E: EthSpec>(
-    state: &BeaconState<E>,
-    validator_statuses: &ValidatorStatuses,
-    proposer_reward: ProposerRewardCalculation,
-    validators_subset: &Vec<usize>,
-    spec: &ChainSpec,
-) -> Result<Vec<(usize, AttestationDelta)>, Error> {
-    get_attestation_deltas(
-        state,
-        validator_statuses,
-        proposer_reward,
-        Some(validators_subset),
-        spec,
-    )
-        .map(|deltas| {
-            deltas
-                .into_iter()
-                .enumerate()
-                .filter(|(index, _)| validators_subset.contains(index))
-                .collect()
-        })
-}
+// /// Apply rewards for participation in attestations during the previous epoch, and only compute
+// /// rewards for a subset of validators.
+// pub fn get_attestation_deltas_subset<E: EthSpec>(
+//     state: &BeaconState<E>,
+//     validator_statuses: &ValidatorStatuses,
+//     proposer_reward: ProposerRewardCalculation,
+//     validators_subset: &Vec<usize>,
+//     spec: &ChainSpec,
+// ) -> Result<Vec<(usize, AttestationDelta)>, Error> {
+//     get_attestation_deltas(
+//         state,
+//         validator_statuses,
+//         proposer_reward,
+//         Some(validators_subset),
+//         spec,
+//     )
+//         .map(|deltas| {
+//             deltas
+//                 .into_iter()
+//                 .enumerate()
+//                 .filter(|(index, _)| validators_subset.contains(index))
+//                 .collect()
+//         })
+// }
 
 /// Apply rewards for participation in attestations during the previous epoch.
 /// If `maybe_validators_subset` specified, only the deltas for the specified validator subset is
@@ -123,8 +134,8 @@ fn get_attestation_deltas<E: EthSpec>(
     state: &BeaconState<E>,
     validator_statuses: &ValidatorStatuses,
     proposer_reward: ProposerRewardCalculation,
-    maybe_validators_subset: Option<&Vec<usize>>,
-    spec: &ChainSpec,
+    // maybe_validators_subset: Option<&Vec<usize>>,
+    spec: &Spec,
 ) -> Result<Vec<AttestationDelta>, Error> {
     let finality_delay = state
         .previous_epoch()
@@ -136,12 +147,12 @@ fn get_attestation_deltas<E: EthSpec>(
     let total_balances = &validator_statuses.total_balances;
     let sqrt_total_active_balance = SqrtTotalActiveBalance::new(total_balances.current_epoch());
 
-    // Ignore validator if a subset is specified and validator is not in the subset
-    let include_validator_delta = |idx| match maybe_validators_subset.as_ref() {
-        None => true,
-        Some(validators_subset) if validators_subset.contains(&idx) => true,
-        Some(_) => false,
-    };
+    // // Ignore validator if a subset is specified and validator is not in the subset
+    // let include_validator_delta = |idx| match maybe_validators_subset.as_ref() {
+    //     None => true,
+    //     Some(validators_subset) if validators_subset.contains(&idx) => true,
+    //     Some(_) => false,
+    // };
 
     for (index, validator) in validator_statuses.statuses.iter().enumerate() {
         // Ignore ineligible validators. All sub-functions of the spec do this except for
@@ -158,42 +169,44 @@ fn get_attestation_deltas<E: EthSpec>(
             spec,
         )?;
 
-        let (inclusion_delay_delta, proposer_delta) =
-            get_inclusion_delay_delta(validator, base_reward, spec)?;
+        
 
-        if include_validator_delta(index) {
-            let source_delta =
-                get_source_delta(validator, base_reward, total_balances, finality_delay, spec)?;
-            let target_delta =
-                get_target_delta(validator, base_reward, total_balances, finality_delay, spec)?;
-            let head_delta =
-                get_head_delta(validator, base_reward, total_balances, finality_delay, spec)?;
+        // let (inclusion_delay_delta, proposer_delta) =
+        //     get_inclusion_delay_delta(validator, base_reward, spec)?;
+
+        // if include_validator_delta(index) {
+            let all_delta =
+                get_all_delta(validator, base_reward, total_balances, finality_delay, spec)?;
+            // let target_delta =
+            //     get_target_delta(validator, base_reward, total_balances, finality_delay, spec)?;
+            // let head_delta =
+            //     get_head_delta(validator, base_reward, total_balances, finality_delay, spec)?;
             let inactivity_penalty_delta =
                 get_inactivity_penalty_delta(validator, base_reward, finality_delay, spec)?;
 
             let delta = deltas
                 .get_mut(index)
                 .ok_or(Error::DeltaOutOfBounds(index))?;
-            delta.source_delta.combine(source_delta)?;
-            delta.target_delta.combine(target_delta)?;
-            delta.head_delta.combine(head_delta)?;
-            delta.inclusion_delay_delta.combine(inclusion_delay_delta)?;
+            delta.all_delta.combine(all_delta)?;
+            // delta.target_delta.combine(target_delta)?;
+            // delta.head_delta.combine(head_delta)?;
+            // delta.inclusion_delay_delta.combine(inclusion_delay_delta)?;
             delta
                 .inactivity_penalty_delta
                 .combine(inactivity_penalty_delta)?;
-        }
+        // }
 
-        if let ProposerRewardCalculation::Include = proposer_reward {
-            if let Some((proposer_index, proposer_delta)) = proposer_delta {
-                if include_validator_delta(proposer_index) {
-                    deltas
-                        .get_mut(proposer_index)
-                        .ok_or(Error::ValidatorStatusesInconsistent)?
-                        .inclusion_delay_delta
-                        .combine(proposer_delta)?;
-                }
-            }
-        }
+        // if let ProposerRewardCalculation::Include = proposer_reward {
+        //     if let Some((proposer_index, proposer_delta)) = proposer_delta {
+        //         if include_validator_delta(proposer_index) {
+        //             deltas
+        //                 .get_mut(proposer_index)
+        //                 .ok_or(Error::ValidatorStatusesInconsistent)?
+        //                 .inclusion_delay_delta
+        //                 .combine(proposer_delta)?;
+        //         }
+        //     }
+        // }
     }
 
     Ok(deltas)
@@ -205,7 +218,7 @@ pub fn get_attestation_component_delta(
     total_balances: &TotalBalances,
     base_reward: u64,
     finality_delay: u64,
-    spec: &ChainSpec,
+    spec: &Spec,
 ) -> Result<Delta, Error> {
     let mut delta = Delta::default();
 
@@ -231,12 +244,12 @@ pub fn get_attestation_component_delta(
     Ok(delta)
 }
 
-fn get_source_delta(
+fn get_all_delta(
     validator: &ValidatorStatus,
     base_reward: u64,
     total_balances: &TotalBalances,
     finality_delay: u64,
-    spec: &ChainSpec,
+    spec: &Spec,
 ) -> Result<Delta, Error> {
     get_attestation_component_delta(
         validator.is_previous_epoch_attester && !validator.is_slashed,
@@ -248,71 +261,71 @@ fn get_source_delta(
     )
 }
 
-fn get_target_delta(
-    validator: &ValidatorStatus,
-    base_reward: u64,
-    total_balances: &TotalBalances,
-    finality_delay: u64,
-    spec: &ChainSpec,
-) -> Result<Delta, Error> {
-    get_attestation_component_delta(
-        validator.is_previous_epoch_target_attester && !validator.is_slashed,
-        total_balances.previous_epoch_target_attesters(),
-        total_balances,
-        base_reward,
-        finality_delay,
-        spec,
-    )
-}
+// fn get_target_delta(
+//     validator: &ValidatorStatus,
+//     base_reward: u64,
+//     total_balances: &TotalBalances,
+//     finality_delay: u64,
+//     spec: &ChainSpec,
+// ) -> Result<Delta, Error> {
+//     get_attestation_component_delta(
+//         validator.is_previous_epoch_target_attester && !validator.is_slashed,
+//         total_balances.previous_epoch_target_attesters(),
+//         total_balances,
+//         base_reward,
+//         finality_delay,
+//         spec,
+//     )
+// }
 
-fn get_head_delta(
-    validator: &ValidatorStatus,
-    base_reward: u64,
-    total_balances: &TotalBalances,
-    finality_delay: u64,
-    spec: &ChainSpec,
-) -> Result<Delta, Error> {
-    get_attestation_component_delta(
-        validator.is_previous_epoch_head_attester && !validator.is_slashed,
-        total_balances.previous_epoch_head_attesters(),
-        total_balances,
-        base_reward,
-        finality_delay,
-        spec,
-    )
-}
+// fn get_head_delta(
+//     validator: &ValidatorStatus,
+//     base_reward: u64,
+//     total_balances: &TotalBalances,
+//     finality_delay: u64,
+//     spec: &ChainSpec,
+// ) -> Result<Delta, Error> {
+//     get_attestation_component_delta(
+//         validator.is_previous_epoch_head_attester && !validator.is_slashed,
+//         total_balances.previous_epoch_head_attesters(),
+//         total_balances,
+//         base_reward,
+//         finality_delay,
+//         spec,
+//     )
+// }
 
-pub fn get_inclusion_delay_delta(
-    validator: &ValidatorStatus,
-    base_reward: u64,
-    spec: &ChainSpec,
-) -> Result<(Delta, Option<(usize, Delta)>), Error> {
-    // Spec: `index in get_unslashed_attesting_indices(state, matching_source_attestations)`
-    if validator.is_previous_epoch_attester && !validator.is_slashed {
-        let mut delta = Delta::default();
-        let mut proposer_delta = Delta::default();
+// pub fn get_inclusion_delay_delta(
+//     validator: &ValidatorStatus,
+//     base_reward: u64,
+//     spec: &ChainSpec,
+// ) -> Result<(Delta, Option<(usize, Delta)>), Error> {
+//     // Spec: `index in get_unslashed_attesting_indices(state, matching_source_attestations)`
+//     if validator.is_previous_epoch_attester && !validator.is_slashed {
+//         let mut delta = Delta::default();
+//         let mut proposer_delta = Delta::default();
 
-        let inclusion_info = validator
-            .inclusion_info
-            .ok_or(Error::ValidatorStatusesInconsistent)?;
+//         let inclusion_info = validator
+//             .inclusion_info
+//             .ok_or(Error::ValidatorStatusesInconsistent)?;
 
-        let proposer_reward = get_proposer_reward(base_reward, spec)?;
-        proposer_delta.reward(proposer_reward)?;
-        let max_attester_reward = base_reward.safe_sub(proposer_reward)?;
-        delta.reward(max_attester_reward.safe_div(inclusion_info.delay)?)?;
+//         let proposer_reward = get_proposer_reward(base_reward, spec)?;
+//         proposer_delta.reward(proposer_reward)?;
+//         let max_attester_reward = base_reward.safe_sub(proposer_reward)?;
+//         delta.reward(max_attester_reward.safe_div(inclusion_info.delay)?)?;
 
-        let proposer_index = inclusion_info.proposer_index;
-        Ok((delta, Some((proposer_index, proposer_delta))))
-    } else {
-        Ok((Delta::default(), None))
-    }
-}
+//         let proposer_index = inclusion_info.proposer_index;
+//         Ok((delta, Some((proposer_index, proposer_delta))))
+//     } else {
+//         Ok((Delta::default(), None))
+//     }
+// }
 
 pub fn get_inactivity_penalty_delta(
     validator: &ValidatorStatus,
     base_reward: u64,
     finality_delay: u64,
-    spec: &ChainSpec,
+    spec: &Spec,
 ) -> Result<Delta, Error> {
     let mut delta = Delta::default();
 
@@ -328,7 +341,7 @@ pub fn get_inactivity_penalty_delta(
         // Additionally, all validators whose FFG target didn't match are penalized extra
         // This condition is equivalent to this condition from the spec:
         // `index not in get_unslashed_attesting_indices(state, matching_target_attestations)`
-        if validator.is_slashed || !validator.is_previous_epoch_target_attester {
+        if validator.is_slashed || !validator.is_previous_epoch_attester {
             delta.penalize(
                 validator
                     .current_epoch_effective_balance
@@ -344,6 +357,6 @@ pub fn get_inactivity_penalty_delta(
 /// Compute the reward awarded to a proposer for including an attestation from a validator.
 ///
 /// The `base_reward` param should be the `base_reward` of the attesting validator.
-fn get_proposer_reward(base_reward: u64, spec: &ChainSpec) -> Result<u64, Error> {
+fn get_proposer_reward(base_reward: u64, spec: &Spec) -> Result<u64, Error> {
     Ok(base_reward.safe_div(spec.proposer_reward_quotient)?)
 }

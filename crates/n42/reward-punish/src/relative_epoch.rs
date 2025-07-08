@@ -1,0 +1,45 @@
+// use crate::*;
+// use crate::arith::{ArithError, SafeArith};
+// use crate::slot_epoch::Epoch;
+//
+// #[derive(Debug, PartialEq, Clone, Copy, arbitrary::Arbitrary)]
+// pub enum RelativeEpoch {
+//     /// The prior epoch.
+//     Previous,
+//     /// The current epoch.
+//     Current,
+//     /// The next epoch.
+//     Next,
+// }
+//
+// impl RelativeEpoch {
+//     /// Returns the `epoch` that `self` refers to, with respect to the `base` epoch.
+//
+//
+//     /// Converts the `other` epoch into a `RelativeEpoch`, with respect to `base`
+//     ///
+//     /// ## Errors
+//     /// Returns an error when:
+//     /// - `EpochTooLow` when `other` is more than 1 prior to `base`.
+//     /// - `EpochTooHigh` when `other` is more than 1 after `base`.
+//     ///
+//     /// Spec v0.12.1
+//     pub fn from_epoch(base: Epoch, other: Epoch) -> Result<Self, Error> {
+//         if other == base {
+//             Ok(RelativeEpoch::Current)
+//         } else if other.safe_add(1)? == base {
+//             Ok(RelativeEpoch::Previous)
+//         } else if other == base.safe_add(1)? {
+//             Ok(RelativeEpoch::Next)
+//         } else if other < base {
+//             Err(Error::EpochTooLow { base, other })
+//         } else {
+//             Err(Error::EpochTooHigh { base, other })
+//         }
+//     }
+//
+//     /// Convenience function for `Self::from_epoch` where both slots are converted into epochs.
+//     pub fn from_slot(base: Slot, other: Slot, slots_per_epoch: u64) -> Result<Self, Error> {
+//         Self::from_epoch(base.epoch(slots_per_epoch), other.epoch(slots_per_epoch))
+//     }
+// }

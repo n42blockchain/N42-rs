@@ -1,11 +1,25 @@
-mod reward;
+// mod reward;
 mod reward_and_penalties;
 mod per_epoch_processing;
 mod validator_statuses;
-
+mod base;
+mod errors;
+mod arith;
+mod slashings;
+mod spec;
+mod beaconstate;
+mod slot_epoch_macros;
+mod slot_epoch;
+mod pending_attestation;
+mod attestation_data;
+mod signing_data;
+mod slot_data;
+mod relative_epoch;
+pub use tree_hash::Hash256;
 pub fn add(left: u64, right: u64) -> u64 {
     left + right
 }
+
 
 #[cfg(test)]
 mod tests {

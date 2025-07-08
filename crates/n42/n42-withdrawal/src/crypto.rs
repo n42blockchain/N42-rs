@@ -335,7 +335,8 @@ where
 {
     /// Returns `self.serialize()` as a `0x`-prefixed hex string.
     pub fn as_hex_string(&self) -> String {
-        format!("{:?}", self)
+        // format!("{:?}", self) 这里溢出
+        hex::encode(self.serialize())
     }
 
     pub fn serialize(&self) -> [u8; PUBLIC_KEY_BYTES_LEN] {

@@ -1,4 +1,4 @@
-use alloy_consensus::{Block, Header};
+use alloy_consensus::{proofs, Block, BlockBody, BlockHeader, Header, Transaction, TxReceipt, EMPTY_OMMER_ROOT_HASH};
 use alloy_evm::{block::{
     BlockExecutionError, BlockExecutionResult, BlockExecutor, BlockExecutorFactory,
     BlockExecutorFor, ExecutableTx, OnStateHook,
@@ -9,14 +9,15 @@ use revm::{
     database::State,
 };
 use std::sync::Arc;
+use alloy_eips::merge::BEACON_NONCE;
 use alloy_evm::eth::{EthBlockExecutionCtx, EthBlockExecutor};
-use alloy_primitives::Bytes;
-use reth_ethereum_primitives::{TransactionSigned, Receipt as EthReceipt};
+use alloy_primitives::{logs_bloom, Bytes};
+use reth_ethereum_primitives::{TransactionSigned, Receipt as EthReceipt, Receipt};
 use reth_evm_ethereum::{EthBlockAssembler, EthEvmConfig, RethReceiptBuilder};
 use reth_primitives::SealedBlock;
 use reth_revm::primitives::hardfork::SpecId;
-use reth_chainspec::{ChainSpec, N42};
-use reth_primitives_traits::SealedHeader;
+use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks, N42};
+use reth_primitives_traits::{SealedHeader, TxTy};
 use crate::node::N42Primitives;
 
 pub struct N42BlockExecutor<'a, Evm> {
@@ -63,25 +64,30 @@ where
     }
 }
 
+// todo copy from EthBlockAssembler
 #[derive(Clone, Debug)]
-pub struct N42BlockAssembler {
-    inner: EthBlockAssembler<ChainSpec>,
+pub struct N42BlockAssembler<ChainSpec = reth_chainspec::ChainSpec> {
+    /// The chainspec.
+    pub chain_spec: Arc<ChainSpec>,
+    /// Extra data to use for the blocks.
+    pub extra_data: Bytes,
 }
 
-impl N42BlockAssembler {
+impl<ChainSpec> N42BlockAssembler<ChainSpec> {
     /// Creates a new [`N42BlockAssembler`].
     pub fn new(chain_spec: Arc<ChainSpec>) -> Self {
-        Self { inner: EthBlockAssembler::new(chain_spec) }
+        Self { chain_spec, extra_data: Default::default() }
     }
 }
 
-impl<F> BlockAssembler<F> for N42BlockAssembler
+impl<F, ChainSpec> BlockAssembler<F> for N42BlockAssembler<ChainSpec>
 where
     F: for<'a> BlockExecutorFactory<
-        ExecutionCtx<'a> = EthBlockExecutionCtx<'a>,
+        ExecutionCtx<'a> = N42BlockExecutionCtx<'a, TxTy<N42Primitives>>,
         Transaction = TransactionSigned,
         Receipt =  EthReceipt,
     >,
+    ChainSpec: EthChainSpec + EthereumHardforks,
 {
     // TODO: use custom block here
     type Block = Block<TransactionSigned>;
@@ -90,9 +96,80 @@ where
         &self,
         input: BlockAssemblerInput<'_, '_, F>,
     ) -> Result<Self::Block, BlockExecutionError> {
-        let block = self.inner.assemble_block(input)?;
+        let BlockAssemblerInput {
+            evm_env,
+            execution_ctx: ctx,
+            parent,
+            transactions,
+            output: BlockExecutionResult { receipts, requests, gas_used },
+            state_root,
+            ..
+        } = input;
 
-        Ok(block)
+        let timestamp = evm_env.block_env.timestamp;
+
+        let transactions_root = proofs::calculate_transaction_root(&transactions);
+        let receipts_root = Receipt::calculate_receipt_root_no_memo(receipts);
+        let logs_bloom = logs_bloom(receipts.iter().flat_map(|r| r.logs()));
+
+        let withdrawals = self
+            .chain_spec
+            .is_shanghai_active_at_timestamp(timestamp)
+            .then(|| ctx.inner.withdrawals.map(|w| w.into_owned()).unwrap_or_default());
+
+        let withdrawals_root =
+            withdrawals.as_deref().map(|w| proofs::calculate_withdrawals_root(w));
+        let requests_hash = self
+            .chain_spec
+            .is_prague_active_at_timestamp(timestamp)
+            .then(|| requests.requests_hash());
+
+        let mut excess_blob_gas = None;
+        let mut blob_gas_used = None;
+
+        // only determine cancun fields when active
+        if self.chain_spec.is_cancun_active_at_timestamp(timestamp) {
+            blob_gas_used =
+                Some(transactions.iter().map(|tx| tx.blob_gas_used().unwrap_or_default()).sum());
+            excess_blob_gas = if self.chain_spec.is_cancun_active_at_timestamp(parent.timestamp) {
+                parent.maybe_next_block_excess_blob_gas(
+                    self.chain_spec.blob_params_at_timestamp(timestamp),
+                )
+            } else {
+                // for the first post-fork block, both parent.blob_gas_used and
+                // parent.excess_blob_gas are evaluated as 0
+                Some(alloy_eips::eip7840::BlobParams::cancun().next_block_excess_blob_gas(0, 0))
+            };
+        }
+
+        let header = Header {
+            parent_hash: ctx.inner.parent_hash,
+            ommers_hash: EMPTY_OMMER_ROOT_HASH,
+            beneficiary: evm_env.block_env.beneficiary,
+            state_root,
+            transactions_root,
+            receipts_root,
+            withdrawals_root,
+            logs_bloom,
+            timestamp,
+            mix_hash: evm_env.block_env.prevrandao.unwrap_or_default(),
+            nonce: BEACON_NONCE.into(),
+            base_fee_per_gas: Some(evm_env.block_env.basefee),
+            number: evm_env.block_env.number,
+            gas_limit: evm_env.block_env.gas_limit,
+            difficulty: evm_env.block_env.difficulty,
+            gas_used: *gas_used,
+            extra_data: self.extra_data.clone(),
+            parent_beacon_block_root: ctx.inner.parent_beacon_block_root,
+            blob_gas_used,
+            excess_blob_gas,
+            requests_hash,
+        };
+
+        Ok(Block {
+            header,
+            body: BlockBody { transactions, ommers: Default::default(), withdrawals },
+        })
     }
 }
 
@@ -115,7 +192,7 @@ impl N42EvmConfig {
 
     /// Sets the extra data for the block assembler.
     pub fn with_extra_data(mut self, extra_data: Bytes) -> Self {
-        self.block_assembler.inner.extra_data = extra_data;
+        self.block_assembler.extra_data = extra_data;
         self
     }
 }
@@ -131,7 +208,7 @@ impl N42EvmConfig {
 
 impl BlockExecutorFactory for N42EvmConfig {
     type EvmFactory = EthEvmFactory;
-    type ExecutionCtx<'a> = EthBlockExecutionCtx<'a>;
+    type ExecutionCtx<'a> = N42BlockExecutionCtx<'a, TxTy<N42Primitives>>;
     type Transaction = TransactionSigned;
     type Receipt = EthReceipt;
 
@@ -142,7 +219,7 @@ impl BlockExecutorFactory for N42EvmConfig {
     fn create_executor<'a, DB, I>(
         &'a self,
         evm: EthEvm<&'a mut State<DB>, I, PrecompilesMap>,
-        ctx: EthBlockExecutionCtx,
+        ctx: N42BlockExecutionCtx<TxTy<N42Primitives>>,
     ) -> impl BlockExecutorFor<'a, Self, DB, I>
     where
         DB: Database + 'a,
@@ -151,7 +228,7 @@ impl BlockExecutorFactory for N42EvmConfig {
         N42BlockExecutor {
             inner: EthBlockExecutor::new(
                 evm,
-                ctx,
+                ctx.inner,
                 self.inner.chain_spec().clone(),
                 *self.inner.executor_factory.receipt_builder(),
             ),
@@ -164,7 +241,7 @@ impl ConfigureEvm for N42EvmConfig {
     type Error = <EthEvmConfig as ConfigureEvm>::Error;
     type NextBlockEnvCtx = <EthEvmConfig as ConfigureEvm>::NextBlockEnvCtx;
     type BlockExecutorFactory = Self;
-    type BlockAssembler = N42BlockAssembler;
+    type BlockAssembler = N42BlockAssembler<ChainSpec>;
 
     fn block_executor_factory(&self) -> &Self::BlockExecutorFactory {
         self
@@ -186,15 +263,23 @@ impl ConfigureEvm for N42EvmConfig {
         self.inner.next_evm_env(parent, attributes)
     }
 
-    fn context_for_block<'a>(&self, block: &'a SealedBlock) -> EthBlockExecutionCtx<'a> {
-        self.inner.context_for_block(block)
+    fn context_for_block<'a>(&self, block: &'a SealedBlock) -> N42BlockExecutionCtx<'a, TxTy<N42Primitives>> {
+        N42BlockExecutionCtx{inner: self.inner.context_for_block(block), txs: Some(block.body().clone().transactions)}
     }
 
     fn context_for_next_block(
         &self,
         parent: &SealedHeader,
         attributes: Self::NextBlockEnvCtx,
-    ) -> EthBlockExecutionCtx {
-        self.inner.context_for_next_block(parent, attributes)
+    ) -> N42BlockExecutionCtx<TxTy<N42Primitives>> {
+        N42BlockExecutionCtx{inner:  self.inner.context_for_next_block(parent, attributes), txs: None}
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct N42BlockExecutionCtx<'a, T> {
+    /// Parent block hash.
+    pub inner: EthBlockExecutionCtx<'a>,
+    ///
+    pub txs: Option<Vec<T>>,
 }

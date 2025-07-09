@@ -26,6 +26,7 @@ pub struct SigningData {
     pub domain: Hash256,
 }
 
+
 pub trait SignedRoot: TreeHash {
     fn signing_root(&self, domain: Hash256) -> Hash256 {
         SigningData {

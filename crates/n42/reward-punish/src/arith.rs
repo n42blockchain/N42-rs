@@ -16,7 +16,7 @@ where
 }
 
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ArithError {
     Overflow,
     DivisionByZero,

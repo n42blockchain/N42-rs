@@ -223,94 +223,94 @@ impl ValidatorStatuses {
         })
     }
 
-    // pub fn process_attestations<E: EthSpec>(
-    //     &mut self,
-    //     state: &BeaconState<E>,
-    // ) -> Result<(), BeaconStateError> {
-    //     let base_state = state.as_base()?;
-    //     for a in base_state
-    //         .previous_epoch_attestations
-    //         .iter()
-    //         .chain(base_state.current_epoch_attestations.iter())
-    //     {
-    //         let committee = state.get_beacon_committee(a.data.slot, a.data.index)?;
-    //         let attesting_indices =
-    //             get_attesting_indices::<E>(committee.committee, &a.aggregation_bits)?;
-    //
-    //         let mut status = ValidatorStatus::default();
-    //
-    //         // Profile this attestation, updating the total balances and generating an
-    //         // `ValidatorStatus` object that applies to all participants in the attestation.
-    //         // if a.data.target.epoch == state.current_epoch() {
-    //         //     status.is_current_epoch_attester = true;
-    //         //
-    //         //     // if target_matches_epoch_start_block(a, state, state.current_epoch())? {
-    //         //     //     status.is_current_epoch_target_attester = true;
-    //         //     // }
-    //         // } else if a.data.target.epoch == state.previous_epoch() {
-    //         //     status.is_previous_epoch_attester = true;
-    //         //
-    //         //     // The inclusion delay and proposer index are only required for previous epoch
-    //         //     // attesters.
-    //         //     // status.inclusion_info = Some(InclusionInfo {
-    //         //     //     delay: a.inclusion_delay,
-    //         //     //     proposer_index: a.proposer_index as usize,
-    //         //     // });
-    //         //
-    //         //     // if target_matches_epoch_start_block(a, state, state.previous_epoch())? {
-    //         //     //     status.is_previous_epoch_target_attester = true;
-    //         //     //
-    //         //     //     if has_common_beacon_block_root(a, state)? {
-    //         //     //         status.is_previous_epoch_head_attester = true;
-    //         //     //     }
-    //         //     // }
-    //         // }
-    //
-    //         // Loop through the participating validator indices and update the status vec.
-    //         for validator_index in attesting_indices {
-    //             self.statuses
-    //                 .get_mut(validator_index as usize)
-    //                 .ok_or(BeaconStateError::UnknownValidator(validator_index as usize))?
-    //                 .update(&status);
-    //         }
-    //     }
-    //
-    //     // Compute the total balances
-    //     for v in self.statuses.iter() {
-    //         // According to the spec, we only count unslashed validators towards the totals.
-    //         if !v.is_slashed {
-    //             let validator_balance = v.current_epoch_effective_balance;
-    //
-    //             if v.is_current_epoch_attester {
-    //                 self.total_balances
-    //                     .current_epoch_attesters
-    //                     .safe_add_assign(validator_balance)?;
-    //             }
-    //             // if v.is_current_epoch_target_attester {
-    //             //     self.total_balances
-    //             //         .current_epoch_target_attesters
-    //             //         .safe_add_assign(validator_balance)?;
-    //             // }
-    //             if v.is_previous_epoch_attester {
-    //                 self.total_balances
-    //                     .previous_epoch_attesters
-    //                     .safe_add_assign(validator_balance)?;
-    //             }
-    //             // if v.is_previous_epoch_target_attester {
-    //             //     self.total_balances
-    //             //         .previous_epoch_target_attesters
-    //             //         .safe_add_assign(validator_balance)?;
-    //             // }
-    //             // if v.is_previous_epoch_head_attester {
-    //             //     self.total_balances
-    //             //         .previous_epoch_head_attesters
-    //             //         .safe_add_assign(validator_balance)?;
-    //             // }
-    //         }
-    //     }
-    //
-    //     Ok(())
-    // }
+    pub fn process_attestations<E: EthSpec>(
+        &mut self,
+        state: &BeaconState<E>,
+    ) -> Result<(), BeaconStateError> {
+        let base_state = state.as_base()?;
+        for a in base_state
+            .previous_epoch_attestations
+            .iter()
+            .chain(base_state.current_epoch_attestations.iter())
+        {
+            let committee = state.get_beacon_committee(a.data.slot, a.data.index)?;
+            let attesting_indices =
+                get_attesting_indices::<E>(committee.committee, &a.aggregation_bits)?;
+
+            let mut status = ValidatorStatus::default();
+
+            // Profile this attestation, updating the total balances and generating an
+            // `ValidatorStatus` object that applies to all participants in the attestation.
+            // if a.data.target.epoch == state.current_epoch() {
+            //     status.is_current_epoch_attester = true;
+            //
+            //     // if target_matches_epoch_start_block(a, state, state.current_epoch())? {
+            //     //     status.is_current_epoch_target_attester = true;
+            //     // }
+            // } else if a.data.target.epoch == state.previous_epoch() {
+            //     status.is_previous_epoch_attester = true;
+            //
+            //     // The inclusion delay and proposer index are only required for previous epoch
+            //     // attesters.
+            //     // status.inclusion_info = Some(InclusionInfo {
+            //     //     delay: a.inclusion_delay,
+            //     //     proposer_index: a.proposer_index as usize,
+            //     // });
+            //
+            //     // if target_matches_epoch_start_block(a, state, state.previous_epoch())? {
+            //     //     status.is_previous_epoch_target_attester = true;
+            //     //
+            //     //     if has_common_beacon_block_root(a, state)? {
+            //     //         status.is_previous_epoch_head_attester = true;
+            //     //     }
+            //     // }
+            // }
+
+            // Loop through the participating validator indices and update the status vec.
+            for validator_index in attesting_indices {
+                self.statuses
+                    .get_mut(validator_index as usize)
+                    .ok_or(BeaconStateError::UnknownValidator(validator_index as usize))?
+                    .update(&status);
+            }
+        }
+
+        // Compute the total balances
+        for v in self.statuses.iter() {
+            // According to the spec, we only count unslashed validators towards the totals.
+            if !v.is_slashed {
+                let validator_balance = v.current_epoch_effective_balance;
+
+                if v.is_current_epoch_attester {
+                    self.total_balances
+                        .current_epoch_attesters
+                        .safe_add_assign(validator_balance)?;
+                }
+                // if v.is_current_epoch_target_attester {
+                //     self.total_balances
+                //         .current_epoch_target_attesters
+                //         .safe_add_assign(validator_balance)?;
+                // }
+                if v.is_previous_epoch_attester {
+                    self.total_balances
+                        .previous_epoch_attesters
+                        .safe_add_assign(validator_balance)?;
+                }
+                // if v.is_previous_epoch_target_attester {
+                //     self.total_balances
+                //         .previous_epoch_target_attesters
+                //         .safe_add_assign(validator_balance)?;
+                // }
+                // if v.is_previous_epoch_head_attester {
+                //     self.total_balances
+                //         .previous_epoch_head_attesters
+                //         .safe_add_assign(validator_balance)?;
+                // }
+            }
+        }
+
+        Ok(())
+    }
 
 
 }

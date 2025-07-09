@@ -1,12 +1,19 @@
 use std::fmt;
 use serde::{Deserialize, Serialize};
 use std::hash::{Hash};
+use std::sync::Arc;
 use arbitrary;
 use milhouse::{List,Vector};
 use ssz_derive::{Decode, Encode};
 use ssz::{ssz_encode, Decode, DecodeError, Encode};
+use tree_hash::TreeHash;
 use tree_hash_derive::TreeHash;
 use derivative::Derivative;
+use crate::relative_epoch::RelativeEpoch;
+use crate::beacon_committee::BeaconCommittee;
+use crate::committee_cache::CommitteeCache;
+use crate::pending_attestation::PendingAttestation;
+use crate::relative_epoch::Error as RelativeEpochError;
 
 // use tree_hash::TreeHash;
 
@@ -18,9 +25,10 @@ use crate::slot_epoch::{Slot,Epoch};
 use superstruct::superstruct;
 use metastruct::{metastruct, NumFields};
 use typenum::Unsigned;
-// use crate::pending_attestation::PendingAttestation;
-pub type Validators<E> = List<Validator, <E as EthSpec>::ValidatorRegistryLimit>;
+
+// pub type Validators<E> = List<Validator, <E as EthSpec>::ValidatorRegistryLimit>;
 pub type CommitteeIndex = u64;
+pub const CACHED_EPOCHS: usize = 3;
 
 
 pub type Result<T, E = ArithError> = std::result::Result<T, E>;
@@ -28,8 +36,6 @@ pub type Result<T, E = ArithError> = std::result::Result<T, E>;
 #[derive(PartialEq, Clone)]
 pub enum Error {
     /// A state for a different hard-fork was required -- a severe logic error.
-    ///
-
     IncorrectStateVariant,
     EpochOutOfBounds,
     SlotOutOfBounds,
@@ -62,7 +68,7 @@ pub enum Error {
     InsufficientStateRoots,
     NoCommittee {
         slot: Slot,
-        index: u64,
+        index: CommitteeIndex,
     },
     ZeroSlotsPerEpoch,
     PubkeyCacheInconsistent,
@@ -77,7 +83,7 @@ pub enum Error {
         initialized_epoch: Epoch,
         current_epoch: Epoch,
     },
-    // RelativeEpochError(RelativeEpochError),
+    RelativeEpochError(RelativeEpochError),
     ExitCacheUninitialized,
     ExitCacheInvalidEpoch {
         max_exit_epoch: Epoch,
@@ -87,7 +93,7 @@ pub enum Error {
         initialized_slot: Option<Slot>,
         latest_block_slot: Slot,
     },
-    // CommitteeCacheUninitialized(Option<RelativeEpoch>),
+    CommitteeCacheUninitialized(Option<RelativeEpoch>),
     SyncCommitteeCacheUninitialized,
     // BlsError(bls::Error),
     SszTypesError(ssz_types::Error),
@@ -100,7 +106,7 @@ pub enum Error {
         state: Slot,
     },
     TreeHashError(tree_hash::Error),
-    // InvalidValidatorPubkey(ssz::DecodeError),
+    InvalidValidatorPubkey(ssz::DecodeError),
     ValidatorRegistryShrunk,
     TreeHashCacheInconsistent,
     InvalidDepositState {
@@ -120,7 +126,7 @@ pub enum Error {
         current_epoch: Epoch,
         epoch: Epoch,
     },
-    // MilhouseError(milhouse::Error),
+    MilhouseError(milhouse::Error),
     CommitteeCacheDiffInvalidEpoch {
         prev_current_epoch: Epoch,
         current_epoch: Epoch,
@@ -128,20 +134,19 @@ pub enum Error {
     CommitteeCacheDiffUninitialized {
         expected_epoch: Epoch,
     },
-    // DiffAcrossFork {
-    //     prev_fork: ForkName,
-    //     current_fork: ForkName,
-    // },
+    DiffAcrossFork {
+        prev_fork: ForkName,
+        current_fork: ForkName,
+    },
     TotalActiveBalanceDiffUninitialized,
     GeneralizedIndexNotSupported(usize),
     IndexNotSupported(usize),
     InvalidFlagIndex(usize),
-
     // MerkleTreeError(merkle_proof::MerkleTreeError),
     PartialWithdrawalCountInvalid(usize),
     NonExecutionAddressWithdrawalCredential,
-    // NoCommitteeFound(CommitteeIndex),
-    // InvalidCommitteeIndex(CommitteeIndex),
+    NoCommitteeFound(CommitteeIndex),
+    InvalidCommitteeIndex(CommitteeIndex),
     InvalidSelectionProof {
         aggregator_index: u64,
     },
@@ -197,10 +202,10 @@ impl From<ArithError> for Error {
             Encode,
             Decode,
             TreeHash,
-            arbitrary::Arbitrary,
+            // arbitrary::Arbitrary,
         ),
         serde(bound = "E: EthSpec", deny_unknown_fields),
-        arbitrary(bound = "E: EthSpec"),
+        // arbitrary(bound = "E: EthSpec"),
         derivative(Clone),
     ),
     specific_variant_attributes(
@@ -307,10 +312,10 @@ impl From<ArithError> for Error {
     partial_getter_error(ty = "Error", expr = "Error::IncorrectStateVariant"),
     map_ref_mut_into(BeaconStateRef)
 )]
-#[derive(Debug, PartialEq, Clone, Serialize, Deserialize, Encode, arbitrary::Arbitrary)]
+#[derive(Debug, PartialEq, Clone, Serialize, Deserialize, Encode)]
 #[serde(untagged)]
 #[serde(bound = "E: EthSpec")]
-#[arbitrary(bound = "E: EthSpec")]
+// #[arbitrary(bound = "E: EthSpec")]
 #[ssz(enum_behaviour = "transparent")]
 pub struct BeaconState<E>
 where
@@ -332,13 +337,21 @@ where
     pub slashings: Vector<u64, E::EpochsPerSlashingsVector>,
 
 
-    // // Attestations (genesis fork only)
-    // #[superstruct(only(Base))]
-    //
-    // pub previous_epoch_attestations: List<PendingAttestation<E>, E::MaxPendingAttestations>,
-    // #[superstruct(only(Base))]
-    //
-    // pub current_epoch_attestations: List<PendingAttestation<E>, E::MaxPendingAttestations>,
+    // Attestations (genesis fork only)
+    #[superstruct(only(Base))]
+    // #[test_random(default)]
+    pub previous_epoch_attestations: List<PendingAttestation<E>, E::MaxPendingAttestations>,
+    #[superstruct(only(Base))]
+    // #[test_random(default)]
+    pub current_epoch_attestations: List<PendingAttestation<E>, E::MaxPendingAttestations>,
+
+
+    #[serde(skip_serializing, skip_deserializing)]
+    #[ssz(skip_serializing, skip_deserializing)]
+    #[tree_hash(skip_hashing)]
+    #[metastruct(exclude)]
+    pub committee_caches: [Arc<CommitteeCache>; CACHED_EPOCHS],
+
 }
 
 #[derive(
@@ -436,7 +449,7 @@ impl<E: EthSpec> BeaconState<E>
     // }
 
     /// Safely obtain the index for `slashings`, given some `epoch`.
-    fn get_slashings_index(
+    pub fn get_slashings_index(
         &self,
         epoch: Epoch,
         allow_next_epoch: AllowNextEpoch,
@@ -456,7 +469,7 @@ impl<E: EthSpec> BeaconState<E>
     }
 
     /// Get the total slashed balances for some epoch.
-    pub fn get_slashings(&self, epoch: Epoch) -> std::result::Result<u64, Error> {
+    pub fn get_slashings(&self, epoch: Epoch) -> Result<u64, Error> {
         let i = self.get_slashings_index(epoch, AllowNextEpoch::False)?;
         self.slashings()
             .get(i)
@@ -498,27 +511,58 @@ impl<E: EthSpec> BeaconState<E>
             .ok_or(Error::BalancesOutOfBounds(validator_index))
     }
 
+    /// Get the Beacon committee at the given slot and index.
+    ///
+    /// Utilises the committee cache.
+    ///
+    /// Spec v0.12.1
+    pub fn get_beacon_committee(
+        &self,
+        slot: Slot,
+        index: CommitteeIndex,
+    ) -> std::result::Result<BeaconCommittee<'_>, Error> {
+        let epoch = slot.epoch(E::slots_per_epoch());
+        let relative_epoch = RelativeEpoch::from_epoch(self.current_epoch(), epoch)?;
+        let cache = self.committee_cache(relative_epoch)?;
 
-    // /// Get the Beacon committee at the given slot and index.
-    // ///
-    // /// Utilises the committee cache.
-    // ///
-    // /// Spec v0.12.1
-    // pub fn get_beacon_committee(
-    //     &self,
-    //     slot: Slot,
-    //     index: CommitteeIndex,
-    // ) -> std::result::Result<BeaconCommittee, Error> {
-    //     let epoch = slot.epoch(E::slots_per_epoch());
-    //     let relative_epoch = RelativeEpoch::from_epoch(self.current_epoch(), epoch)?;
-    //     let cache = self.committee_cache(relative_epoch)?;
-    //
-    //     cache
-    //         .get_beacon_committee(slot, index)
-    //         .ok_or(Error::NoCommittee { slot, index })
-    // }
-    //
-    //
+        cache
+            .get_beacon_committee(slot, index)
+            .ok_or(Error::NoCommittee { slot, index })
+    }
+
+    /// Returns the cache for some `RelativeEpoch`. Returns an error if the cache has not been
+    /// initialized.
+    pub fn committee_cache(
+        &self,
+        relative_epoch: RelativeEpoch,
+    ) -> std::result::Result<&Arc<CommitteeCache>, Error> {
+        let i = Self::committee_cache_index(relative_epoch);
+        let cache = self.committee_cache_at_index(i)?;
+
+        if cache.is_initialized_at(relative_epoch.into_epoch(self.current_epoch())) {
+            Ok(cache)
+        } else {
+            Err(Error::CommitteeCacheUninitialized(Some(relative_epoch)))
+        }
+    }
+
+    /// Get the committee cache at a given index.
+    fn committee_cache_at_index(&self, index: usize) -> std::result::Result<&Arc<CommitteeCache>, Error> {
+        self.committee_caches()
+            .get(index)
+            .ok_or(Error::CommitteeCachesOutOfBounds(index))
+    }
+
+    pub(crate) fn committee_cache_index(relative_epoch: RelativeEpoch) -> usize {
+        match relative_epoch {
+            RelativeEpoch::Previous => 0,
+            RelativeEpoch::Current => 1,
+            RelativeEpoch::Next => 2,
+        }
+    }
+
+
+
 
 
 }
@@ -538,6 +582,12 @@ impl AllowNextEpoch {
             AllowNextEpoch::True => Ok(current_epoch.safe_add(1)?),
             AllowNextEpoch::False => Ok(current_epoch),
         }
+    }
+}
+
+impl From<RelativeEpochError> for Error {
+    fn from(e: RelativeEpochError) -> Error {
+        Error::RelativeEpochError(e)
     }
 }
 

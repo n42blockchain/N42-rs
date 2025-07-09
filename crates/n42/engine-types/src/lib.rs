@@ -21,6 +21,7 @@ mod payload;
 mod network;
 mod consensus;
 mod evm;
+mod block;
 
 pub use payload::N42PayloadBuilderWrapper;
 pub use payload::N42PayloadServiceBuilder;

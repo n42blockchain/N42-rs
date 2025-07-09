@@ -1,9 +1,11 @@
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use reth_consensus::{ConsensusError, FullConsensus};
 use reth_ethereum_primitives::{EthPrimitives};
 use alloy_primitives::Sealable;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc, types::{error::INVALID_PARAMS_CODE, ErrorObject}};
 use alloy_primitives::Address;
+use reth_primitives::NodePrimitives;
 use n42_primitives::Snapshot;
 use reth_provider::HeaderProvider;
 
@@ -42,16 +44,35 @@ pub trait ConsensusExtApi {
 }
 
 /// The type that implements the `consensus` rpc namespace trait
-pub struct ConsensusExt<Cons, Provider> {
-    pub consensus: Cons,
-    pub provider: Provider,
+pub struct ConsensusExt<Cons, Provider, N> {
+    consensus: Cons,
+    provider: Provider,
+    /// Node data primitives.
+    _primitives: PhantomData<N>,
 }
 
-impl<Cons, Provider> ConsensusExtApiServer for ConsensusExt<Cons, Provider>
+impl<Cons, Provider, N> ConsensusExt<Cons, Provider, N>
 where
-    Cons:
-        FullConsensus<EthPrimitives, Error = ConsensusError> + Clone + Unpin + 'static,
+    N: NodePrimitives,
+    Cons: FullConsensus<N, Error = ConsensusError> + Clone + Unpin + 'static,
     Provider: HeaderProvider + Clone + 'static,
+{
+    /// Create a new instance of the builder
+    pub fn new(consensus: Cons, provider: Provider) -> Self {  // 修改1: 移除const，添加参数名
+        Self {
+            consensus,
+            provider,
+            _primitives: PhantomData,
+        }
+    }
+}
+
+
+impl<Cons, Provider, N> ConsensusExtApiServer for ConsensusExt<Cons, Provider, N>
+where
+    N: NodePrimitives,
+    Cons: FullConsensus<N, Error = ConsensusError>+ 'static,
+    Provider: HeaderProvider + 'static,
 {
     fn propose(&self,
         address: Address,
@@ -122,16 +143,16 @@ where
          assert_eq!(result, HashMap::default());
      }
 
-     async fn start_server() -> std::net::SocketAddr {
-         let server = ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
-         let addr = server.local_addr().unwrap();
-         let consensus = NoopConsensus::default();
-         let provider = NoopProvider::default();
-         let api = ConsensusExt { consensus, provider };
-         let server_handle = server.start(api.into_rpc());
-
-         tokio::spawn(server_handle.stopped());
-
-         addr
-     }
+     // async fn start_server() -> std::net::SocketAddr {
+     //     let server = ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
+     //     let addr = server.local_addr().unwrap();
+     //     let consensus = NoopConsensus::default();
+     //     let provider = NoopProvider::default();
+     //     let api = ConsensusExt::new(consensus, provider);
+     //     let server_handle = server.start(api.into_rpc());
+     //
+     //     tokio::spawn(server_handle.stopped());
+     //
+     //     addr
+     // }
  }

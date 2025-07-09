@@ -71,7 +71,7 @@ use reth_node_builder::{
 // Payload component configuration for the Ethereum node.
 
 //use reth_node_api::{FullNodeTypes, NodeTypes, PrimitivesTy, TxTy};
-use reth_ethereum_engine_primitives::{BlobSidecars, EthPayloadAttributes, ExecutionPayloadV1};
+use reth_ethereum_engine_primitives::{BlobSidecars, BuiltPayloadConversionError, EthPayloadAttributes, ExecutionPayloadV1};
 use reth_node_api::{TxTy};
 use reth_node_builder::{
     PayloadBuilderConfig,
@@ -158,7 +158,7 @@ where
 // reth/crates/ethereum/payload/src/config.rs
 use alloy_eips::eip1559::ETHEREUM_BLOCK_GAS_LIMIT_30M;
 use alloy_eips::eip7685::Requests;
-use alloy_rpc_types::engine::{ExecutionData, ExecutionPayload, ExecutionPayloadEnvelopeV2, ExecutionPayloadEnvelopeV3, ExecutionPayloadEnvelopeV4, ExecutionPayloadEnvelopeV5, PayloadId};
+use alloy_rpc_types::engine::{ExecutionData, ExecutionPayload, ExecutionPayloadEnvelopeV2, ExecutionPayloadEnvelopeV3, ExecutionPayloadEnvelopeV4, ExecutionPayloadEnvelopeV5, ExecutionPayloadFieldV2, PayloadId};
 use serde::{Deserialize, Serialize};
 use reth_primitives_traits::constants::GAS_LIMIT_BOUND_DIVISOR;
 use crate::evm::N42EvmConfig;
@@ -624,7 +624,8 @@ impl<EvmConfig> N42PayloadBuilder<EvmConfig> {
 
 
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[non_exhaustive]
 pub struct N42PayloadTypes;
 
 impl PayloadTypes for N42PayloadTypes {
@@ -644,13 +645,13 @@ impl PayloadTypes for N42PayloadTypes {
     }
 }
 
-// impl EngineTypes for N42PayloadTypes {
-//     type ExecutionPayloadEnvelopeV1 = ExecutionPayloadV1;
-//     type ExecutionPayloadEnvelopeV2 = ExecutionPayloadEnvelopeV2;
-//     type ExecutionPayloadEnvelopeV3 = ExecutionPayloadEnvelopeV3;
-//     type ExecutionPayloadEnvelopeV4 = ExecutionPayloadEnvelopeV4;
-//     type ExecutionPayloadEnvelopeV5 = ExecutionPayloadEnvelopeV5;
-// }
+impl EngineTypes for N42PayloadTypes {
+    type ExecutionPayloadEnvelopeV1 = ExecutionPayloadV1;
+    type ExecutionPayloadEnvelopeV2 = ExecutionPayloadEnvelopeV2;
+    type ExecutionPayloadEnvelopeV3 = ExecutionPayloadEnvelopeV3;
+    type ExecutionPayloadEnvelopeV4 = ExecutionPayloadEnvelopeV4;
+    type ExecutionPayloadEnvelopeV5 = ExecutionPayloadEnvelopeV5;
+}
 
 
 #[derive(Debug, Clone)]
@@ -690,5 +691,56 @@ impl BuiltPayload for N42BuiltPayload {
 
     fn requests(&self) -> Option<alloy_eips::eip7685::Requests> {
         self.0.requests()
+    }
+}
+
+
+// V1 engine_getPayloadV1 response
+impl From<N42BuiltPayload> for ExecutionPayloadV1 {
+    fn from(value: N42BuiltPayload) -> Self {
+        Self::from_block_unchecked(
+            value.block().hash(),
+            &Arc::unwrap_or_clone(value.block().clone().into()).into_block(), 
+        )
+    }
+}
+
+// V2 engine_getPayloadV2 response
+impl From<N42BuiltPayload> for ExecutionPayloadEnvelopeV2 {
+    fn from(value: N42BuiltPayload) -> Self {
+        let block = value.block();
+        let fees = value.fees();
+
+        Self {
+            block_value: fees,
+            execution_payload: ExecutionPayloadFieldV2::from_block_unchecked(
+                block.hash(),
+                &Arc::unwrap_or_clone(block.clone().into()).into_block(),
+            ),
+        }
+    }
+}
+
+impl TryFrom<N42BuiltPayload> for ExecutionPayloadEnvelopeV3 {
+    type Error = BuiltPayloadConversionError;
+
+    fn try_from(value: N42BuiltPayload) -> Result<Self, Self::Error> {
+        value.0.try_into_v3()
+    }
+}
+
+impl TryFrom<N42BuiltPayload> for ExecutionPayloadEnvelopeV4 {
+    type Error = BuiltPayloadConversionError;
+
+    fn try_from(value: N42BuiltPayload) -> Result<Self, Self::Error> {
+        value.0.try_into_v4()
+    }
+}
+
+impl TryFrom<N42BuiltPayload> for ExecutionPayloadEnvelopeV5 {
+    type Error = BuiltPayloadConversionError;
+
+    fn try_from(value: N42BuiltPayload) -> Result<Self, Self::Error> {
+        value.0.try_into_v5()
     }
 }

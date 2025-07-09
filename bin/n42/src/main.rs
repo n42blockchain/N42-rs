@@ -29,8 +29,7 @@ fn main() {
 
                             let consensus = ctx.consensus().clone();
                             let provider = ctx.provider().clone();
-
-                            let ext = ConsensusExt { consensus, provider };
+                            let ext = ConsensusExt::new(consensus, provider);
 
                             // now we merge our extension namespace into all configured transports
                             ctx.auth_module.merge_auth_methods(ext.into_rpc())?;
@@ -42,16 +41,16 @@ fn main() {
                 .launch_with_debug_capabilities().await?;
 
             // Install ress subprotocol.
-            if ress_args.enabled {
-                install_ress_subprotocol(
-                    ress_args,
-                    node.provider,
-                    node.evm_config,
-                    node.network,
-                    node.task_executor,
-                    node.add_ons_handle.engine_events.new_listener(),
-                )?;
-            }
+            // if ress_args.enabled {
+            //     install_ress_subprotocol(
+            //         ress_args,
+            //         node.provider,
+            //         node.evm_config,
+            //         node.network,
+            //         node.task_executor,
+            //         node.add_ons_handle.engine_events.new_listener(),
+            //     )?;
+            // }
 
             node_exit_future.await
         })

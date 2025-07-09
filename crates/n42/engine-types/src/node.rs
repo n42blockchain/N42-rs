@@ -52,6 +52,7 @@ use alloy_rpc_types::engine::ExecutionData;
 use reth_ethereum_payload_builder::EthereumExecutionPayloadValidator;
 use reth_payload_primitives::{validate_version_specific_fields, EngineApiMessageVersion, EngineObjectValidationError, NewPayloadError, PayloadOrAttributes};
 use reth_primitives_traits::{Block, RecoveredBlock};
+use crate::block::N42Block;
 use crate::evm::N42EvmConfig;
 use crate::payload::{N42BuiltPayload, N42PayloadTypes};
 

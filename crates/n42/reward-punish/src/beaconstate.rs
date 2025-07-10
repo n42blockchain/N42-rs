@@ -422,7 +422,7 @@ impl<E: EthSpec> BeaconState<E>
 
     /// The epoch corresponding to `self.slot()`.
     pub fn current_epoch(&self) -> Epoch {
-        self.slot().epoch(Spec::slots_per_epoch())
+        self.slot().epoch(E::slots_per_epoch())
     }
 
     /// Returns the name of the fork pertaining to `self`.

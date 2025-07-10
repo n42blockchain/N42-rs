@@ -29,9 +29,9 @@ pub struct Spec {
 }
 
 impl Spec {
-    pub fn slots_per_epoch() -> u64 {
-        64
-    }
+    // pub fn slots_per_epoch() -> u64 {
+    //     64
+    // }
 
     pub fn mainnet() -> Self {
 

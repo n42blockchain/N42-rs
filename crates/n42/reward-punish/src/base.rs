@@ -3,6 +3,7 @@ use crate::spec::Spec;
 use crate::beaconstate::BeaconState;
 // use integer_sqrt::IntegerSquareRoot;
 use crate::spec::EthSpec;
+use integer_sqrt::IntegerSquareRoot;
 
 
 use crate::beaconstate::Error as BeaconStateError;
@@ -11,7 +12,7 @@ pub struct SqrtTotalActiveBalance(u64);
 
 impl SqrtTotalActiveBalance {
     pub fn new(total_active_balance: u64) -> Self {
-        Self(total_active_balance.isqrt())
+        Self(total_active_balance.integer_sqrt())
     }
 
     pub fn as_u64(&self) -> u64 {

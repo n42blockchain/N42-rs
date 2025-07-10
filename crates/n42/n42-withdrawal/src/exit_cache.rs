@@ -1,20 +1,22 @@
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
+use std::ops::Range;
 use std::sync::Arc;
 use derivative::Derivative;
-use crate::slot_epoch::Epoch;
-use crate::beacon_state::Error as BeaconStateError;
+use crate::slot_epoch::{Epoch, Slot};
+use crate::beacon_state::{Error as BeaconStateError};
 use crate::chain_spec::ChainSpec;
 use crate::crypto::PublicKeyBytes;
-use crate::safe_aitrh::SafeArith;
+use crate::safe_aitrh::{ArithError, SafeArith};
 use crate::validators::Validator;
-use crate::Hash256;
+use crate::{CommitteeIndex, Hash256};
 use rpds::HashTrieMapSync as HashTrieMap;
 use ssz_derive::{Decode, Encode};
 use crate::error::EpochCacheError;
 use serde::{Deserialize, Serialize};
 use ssz::{four_byte_option_impl, Decode, DecodeError, Encode};
+use crate::signature::BeaconCommittee;
 
 /// Map from exit epoch to the number of validators with that exit epoch.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -207,10 +209,20 @@ impl ActivationQueue {
     }
 }
 
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum Error {
+    EpochTooLow { base: Epoch, other: Epoch },
+    EpochTooHigh { base: Epoch, other: Epoch },
+    ArithError(ArithError),
+}
+impl From<ArithError> for Error {
+    fn from(e: ArithError) -> Self {
+        Self::ArithError(e)
+    }
+}
+
 /// Defines the epochs relative to some epoch. Most useful when referring to the committees prior
 /// to and following some epoch.
-///
-/// Spec v0.12.1
 #[derive(Debug, PartialEq, Clone, Copy, arbitrary::Arbitrary)]
 pub enum RelativeEpoch {
     /// The prior epoch.
@@ -223,14 +235,32 @@ pub enum RelativeEpoch {
 
 impl RelativeEpoch {
     /// Returns the `epoch` that `self` refers to, with respect to the `base` epoch.
-    ///
-    /// Spec v0.12.1
     pub fn into_epoch(self, base: Epoch) -> Epoch {
         match self {
             // Due to saturating nature of epoch, check for current first.
             RelativeEpoch::Current => base,
             RelativeEpoch::Previous => base.saturating_sub(1u64),
             RelativeEpoch::Next => base.saturating_add(1u64),
+        }
+    }
+
+    /// Converts the `other` epoch into a `RelativeEpoch`, with respect to `base`
+    ///
+    /// ## Errors
+    /// Returns an error when:
+    /// - `EpochTooLow` when `other` is more than 1 prior to `base`.
+    /// - `EpochTooHigh` when `other` is more than 1 after `base`.
+    pub fn from_epoch(base: Epoch, other: Epoch) -> Result<Self, Error> {
+        if other == base {
+            Ok(RelativeEpoch::Current)
+        } else if other.safe_add(1)? == base {
+            Ok(RelativeEpoch::Previous)
+        } else if other == base.safe_add(1)? {
+            Ok(RelativeEpoch::Next)
+        } else if other < base {
+            Err(Error::EpochTooLow { base, other })
+        } else {
+            Err(Error::EpochTooHigh { base, other })
         }
     }
 }
@@ -296,12 +326,122 @@ impl CommitteeCache {
     pub fn active_validator_count(&self) -> usize {
         self.shuffling.len()
     }
+
+    /// Get all the Beacon committees at a given `slot`.
+    ///
+    /// Committees are sorted by ascending index order 0..committees_per_slot
+    pub fn get_beacon_committees_at_slot(&self, slot: Slot) -> Result<Vec<BeaconCommittee>, BeaconStateError> {
+        if self.initialized_epoch.is_none() {
+            return Err(BeaconStateError::CommitteeCacheUninitialized(None));
+        }
+
+        (0..self.committees_per_slot())
+            .map(|index| {
+                self.get_beacon_committee(slot, index)
+                    .ok_or(BeaconStateError::NoCommittee { slot, index })
+            })
+            .collect()
+    }
+
+    /// Returns the number of committees per slot for this cache's epoch.
+    pub fn committees_per_slot(&self) -> u64 {
+        self.committees_per_slot
+    }
+
+    /// Get the Beacon committee for the given `slot` and `index`.
+    ///
+    /// Return `None` if the cache is uninitialized, or the `slot` or `index` is out of range.
+    pub fn get_beacon_committee(
+        &self,
+        slot: Slot,
+        index: CommitteeIndex,
+    ) -> Option<BeaconCommittee> {
+        if self.initialized_epoch.is_none()
+            || !self.is_initialized_at(slot.epoch(self.slots_per_epoch))
+            || index >= self.committees_per_slot
+        {
+            return None;
+        }
+
+        let committee_index = compute_committee_index_in_epoch(
+            slot,
+            self.slots_per_epoch as usize,
+            self.committees_per_slot as usize,
+            index as usize,
+        );
+        let committee = self.compute_committee(committee_index)?;
+
+        Some(BeaconCommittee {
+            slot,
+            index,
+            committee,
+        })
+    }
+
+    /// Returns a slice of `self.shuffling` that represents the `index`'th committee in the epoch.
+    fn compute_committee(&self, index: usize) -> Option<&[usize]> {
+        self.shuffling.get(self.compute_committee_range(index)?)
+    }
+
+    /// Returns a range of `self.shuffling` that represents the `index`'th committee in the epoch.
+    /// To avoid a divide-by-zero, returns `None` if `self.committee_count` is zero.
+    /// Will also return `None` if the index is out of bounds.
+    fn compute_committee_range(&self, index: usize) -> Option<Range<usize>> {
+        compute_committee_range_in_epoch(self.epoch_committee_count(), index, self.shuffling.len())
+    }
+
+    /// Returns the total number of committees in the initialized epoch.
+    /// Always returns `usize::default()` for a non-initialized epoch.
+    pub fn epoch_committee_count(&self) -> usize {
+        epoch_committee_count(
+            self.committees_per_slot as usize,
+            self.slots_per_epoch as usize,
+        )
+    }
 }
 
 impl arbitrary::Arbitrary<'_> for CommitteeCache {
     fn arbitrary(_u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
         Ok(Self::default())
     }
+}
+
+/// Computes the position of the given `committee_index` with respect to all committees in the
+/// epoch.
+///
+/// The return result may be used to provide input to the `compute_committee_range_in_epoch`
+/// function.
+pub fn compute_committee_index_in_epoch(
+    slot: Slot,
+    slots_per_epoch: usize,
+    committees_per_slot: usize,
+    committee_index: usize,
+) -> usize {
+    (slot.as_usize() % slots_per_epoch) * committees_per_slot + committee_index
+}
+
+/// Returns the total number of committees in an epoch.
+pub fn epoch_committee_count(committees_per_slot: usize, slots_per_epoch: usize) -> usize {
+    committees_per_slot * slots_per_epoch
+}
+
+/// Computes the range for slicing the shuffled indices to determine the members of a committee.
+///
+/// The `index_in_epoch` parameter can be computed computed using
+/// `compute_committee_index_in_epoch`.
+pub fn compute_committee_range_in_epoch(
+    epoch_committee_count: usize,
+    index_in_epoch: usize,
+    shuffling_len: usize,
+) -> Option<Range<usize>> {
+    if epoch_committee_count == 0 || index_in_epoch >= epoch_committee_count {
+        return None;
+    }
+
+    let start = (shuffling_len * index_in_epoch) / epoch_committee_count;
+    let end = (shuffling_len * (index_in_epoch + 1)) / epoch_committee_count;
+
+    Some(start..end)
 }
 
 /// This is a shim struct to ensure that we can encode a `Vec<Option<NonZeroUsize>>` an SSZ union

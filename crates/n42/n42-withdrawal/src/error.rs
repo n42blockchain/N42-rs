@@ -3,6 +3,8 @@ use crate::beacon_state::{Error as BeaconStateError};
 use crate::safe_aitrh::ArithError;
 #[cfg(feature = "supranational")]
 use blst::BLST_ERROR as BlstError;
+use crate::slot_epoch::Epoch;
+use crate::signature_set::Error as SignatureSetError;
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum BlockProcessingError {
@@ -14,6 +16,22 @@ pub enum BlockProcessingError {
     BeaconStateError(BeaconStateError),
     ArithError(ArithError),
     MilhouseError(milhouse::Error),
+    DepositCountInvalid {
+        expected: usize,
+        found: usize,
+    },
+    DepositInvalid {
+        index: usize,
+        reason: DepositInvalid,
+    },
+    ExitInvalid {
+        index: usize,
+        reason: ExitInvalid,
+    },
+    BulkSignatureVerificationFailed,
+    SignatureSetError(SignatureSetError),
+    SszTypesError(ssz_types::Error),
+
 }
 
 impl From<BeaconStateError> for BlockProcessingError {
@@ -79,3 +97,109 @@ impl From<EpochCacheError> for EpochProcessingError {
 pub enum EpochCacheError {
     CacheNotInitialized,
 }
+
+/// Describes why an object is invalid.
+#[derive(Debug, PartialEq, Clone)]
+pub enum AttestationInvalid {
+
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum BlockOperationError<T> {
+    Invalid(T),
+    BeaconStateError(BeaconStateError),
+    SignatureSetError(SignatureSetError),
+    SszTypesError(ssz_types::Error),
+    ArithError(ArithError),
+}
+impl<T> BlockOperationError<T> {
+    pub fn invalid(reason: T) -> BlockOperationError<T> {
+        BlockOperationError::Invalid(reason)
+    }
+}
+impl<T> From<BeaconStateError> for BlockOperationError<T> {
+    fn from(e: BeaconStateError) -> Self {
+        BlockOperationError::BeaconStateError(e)
+    }
+}
+impl<T> From<SignatureSetError> for BlockOperationError<T> {
+    fn from(e: SignatureSetError) -> Self {
+        BlockOperationError::SignatureSetError(e)
+    }
+}
+
+impl<T> From<ssz_types::Error> for BlockOperationError<T> {
+    fn from(error: ssz_types::Error) -> Self {
+        BlockOperationError::SszTypesError(error)
+    }
+}
+impl<T> From<ArithError> for BlockOperationError<T> {
+    fn from(e: ArithError) -> Self {
+        BlockOperationError::ArithError(e)
+    }
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum DepositInvalid {
+    /// The signature (proof-of-possession) does not match the given pubkey.
+    BadSignature,
+    /// The signature or pubkey does not represent a valid BLS point.
+    BadBlsBytes,
+    /// The specified `branch` and `index` did not form a valid proof that the deposit is included
+    /// in the eth1 deposit root.
+    BadMerkleProof,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum ExitInvalid {
+    /// The specified validator is not active.
+    NotActive(u64),
+    /// The specified validator is not in the state's validator registry.
+    ValidatorUnknown(u64),
+    /// The specified validator has a non-maximum exit epoch.
+    AlreadyExited(u64),
+    /// The exit is for a future epoch.
+    FutureEpoch {
+        state: Epoch,
+        exit: Epoch,
+    },
+    /// The validator has not been active for long enough.
+    TooYoungToExit {
+        current_epoch: Epoch,
+        earliest_exit_epoch: Epoch,
+    },
+    /// The exit signature was not signed by the validator.
+    BadSignature,
+    PendingWithdrawalInQueue(u64),
+
+}
+
+pub trait IntoWithIndex<T>: Sized {
+    fn into_with_index(self, index: usize) -> T;
+}
+
+macro_rules! impl_into_block_processing_error_with_index {
+    ($($type: ident),*) => {
+        $(
+            impl IntoWithIndex<BlockProcessingError> for BlockOperationError<$type> {
+                fn into_with_index(self, index: usize) -> BlockProcessingError {
+                    match self {
+                        BlockOperationError::Invalid(reason) => BlockProcessingError::$type {
+                            index,
+                            reason
+                        },
+                        BlockOperationError::BeaconStateError(e) => BlockProcessingError::BeaconStateError(e),
+                        BlockOperationError::SignatureSetError(e) => BlockProcessingError::SignatureSetError(e),
+                        BlockOperationError::SszTypesError(e) => BlockProcessingError::SszTypesError(e),
+                        BlockOperationError::ArithError(e) => BlockProcessingError::ArithError(e),
+                    }
+                }
+            }
+        )*
+    };
+}
+
+impl_into_block_processing_error_with_index!(
+    DepositInvalid,
+    ExitInvalid
+);

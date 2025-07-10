@@ -4457,6 +4457,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "integer-sqrt"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "276ec31bcb4a9ee45f58bec6f9ec700ae4cf4f4f8f2fa7e06cb406bd5ffdd770"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "interprocess"
 version = "2.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5735,13 +5744,16 @@ dependencies = [
  "alloy-primitives 0.8.25",
  "arbitrary",
  "blst",
+ "bytes",
  "derivative",
+ "ethereum_hashing",
  "ethereum_serde_utils 0.7.0",
  "ethereum_ssz 0.7.1",
  "ethereum_ssz_derive 0.7.1",
  "hex",
  "metastruct",
  "milhouse",
+ "rayon",
  "rpds",
  "serde",
  "ssz_types",
@@ -9877,8 +9889,22 @@ dependencies = [
 name = "reward-punish"
 version = "1.4.3"
 dependencies = [
+ "alloy-primitives 1.1.2",
+ "arbitrary",
+ "derivative",
+ "ethereum_serde_utils 0.7.0",
+ "ethereum_ssz 0.7.1",
+ "ethereum_ssz_derive 0.7.1",
+ "integer-sqrt",
+ "metastruct",
+ "milhouse",
  "serde",
  "serde_json",
+ "ssz_types",
+ "superstruct",
+ "tree_hash 0.8.0",
+ "tree_hash_derive 0.8.0",
+ "typenum",
 ]
 
 [[package]]

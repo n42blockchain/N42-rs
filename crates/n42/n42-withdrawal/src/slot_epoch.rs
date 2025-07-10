@@ -16,7 +16,8 @@ use ssz::{Decode, DecodeError, Encode};
 use std::fmt;
 use std::hash::Hash;
 use alloy_primitives::private::arbitrary;
-
+use crate::chain_spec::ChainSpec;
+use crate::withdrawal::SignedRoot;
 
 #[derive(
     arbitrary::Arbitrary, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
@@ -182,7 +183,7 @@ macro_rules! impl_ssz {
             }
         }
 
-        // impl SignedRoot for $type {}
+        impl SignedRoot for $type {}
     };
 }
 
@@ -235,6 +236,13 @@ impl Slot {
 impl Epoch {
     pub const fn new(epoch: u64) -> Epoch {
         Epoch(epoch)
+    }
+
+    /// Compute the sync committee period for an epoch.
+    pub fn sync_committee_period(&self, spec: &ChainSpec) -> std::result::Result<u64, ArithError> {
+        Ok(self
+            .safe_div(spec.epochs_per_sync_committee_period)?
+            .as_u64())
     }
 }
 

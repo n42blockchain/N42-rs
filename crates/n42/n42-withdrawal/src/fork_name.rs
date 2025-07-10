@@ -3,6 +3,8 @@ use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 use alloy_primitives::private::serde::{Deserialize, Serialize};
 use ssz_derive::{Decode, Encode};
+use tree_hash_derive::TreeHash;
+use crate::Hash256;
 
 #[derive(
     Debug, Clone, Copy, Decode, Encode, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
@@ -58,4 +60,17 @@ impl FromStr for ForkName {
             _ => return Err(format!("unknown fork name: {}", fork_name)),
         })
     }
+}
+
+/// Specifies a fork of the `BeaconChain`, to prevent replay attacks.
+///
+/// Spec v0.12.1
+#[derive(
+    arbitrary::Arbitrary, Debug, Clone, PartialEq, Default,
+    Serialize, Deserialize, Encode, Decode, TreeHash,
+)]
+pub struct ForkData {
+    #[serde(with = "serde_utils::bytes_4_hex")]
+    pub current_version: [u8; 4],
+    pub genesis_validators_root: Hash256,
 }

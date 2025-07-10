@@ -1,27 +1,34 @@
+use std::cmp::max;
 use std::fmt::Debug;
 use std::mem;
 use std::sync::Arc;
 use alloy_primitives::private::arbitrary;
 use alloy_primitives::private::serde::{Deserialize, Serialize};
-use milhouse::List;
+use milhouse::{List, Vector};
 use superstruct::superstruct;
-use crate::pending_partial_withdrawal::PendingPartialWithdrawal;
+use crate::pending_partial_withdrawal::{PendingPartialWithdrawal, ParticipationFlags};
 use derivative::Derivative;
+use ethereum_hashing::{hash, Context, Sha256Context};
 use ssz_derive::{Decode, Encode};
 use tree_hash_derive::TreeHash;
 use metastruct::metastruct;
 use ssz_types::typenum::Unsigned;
-use crate::chain_spec::ChainSpec;
+use crate::chain_spec::{ChainSpec, Domain};
+use crate::crypto::PublicKeyBytes;
 use crate::validators::Validator;
 use crate::fork_name::ForkName;
 use crate::slot_epoch::{Epoch, Slot};
 use crate::exit_cache::{ExitCache, EpochCache, RelativeEpoch, CommitteeCache};
 use crate::safe_aitrh::{ArithError, SafeArith};
-use crate::exit_cache::PubkeyCache;
-use crate::withdrawal::Checkpoint;
-
+use crate::exit_cache::{PubkeyCache, Error as RelativeEpochError};
+use crate::withdrawal::{Checkpoint, Eth1Data, PendingDeposit, Fork, SyncCommittee};
+use crate::{CommitteeIndex, Hash256};
+use bytes::{BufMut, BytesMut};
+use crate::signature::BeaconCommittee;
 
 pub const CACHED_EPOCHS: usize = 3;
+const MAX_RANDOM_VALUE: u64 = (1 << 16) - 1;
+const MAX_RANDOM_BYTE: u64 = (1 << 8) - 1;
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Error {
@@ -40,7 +47,25 @@ pub enum Error {
     MilhouseError(milhouse::Error),
     CommitteeCacheUninitialized(Option<RelativeEpoch>),
     CommitteeCachesOutOfBounds(usize),
-
+    SlotOutOfBounds,
+    EpochOutOfBounds,
+    InsufficientValidators,
+    UnableToShuffle,
+    ShuffleIndexOutOfBounds(usize),
+    RandaoMixesOutOfBounds(usize),
+    NoCommitteeFound(CommitteeIndex),
+    InvalidCommitteeIndex(CommitteeIndex),
+    EmptyCommittee,
+    InvalidBitfield,
+    NoCommittee {
+        slot: Slot,
+        index: CommitteeIndex,
+    },
+    RelativeEpochError(RelativeEpochError),
+    SyncCommitteeNotKnown {
+        current_epoch: Epoch,
+        epoch: Epoch,
+    },
 }
 
 #[superstruct(
@@ -113,6 +138,10 @@ where
     #[metastruct(exclude_from(tree_lists))]
     pub next_withdrawal_validator_index: u64,
 
+    #[superstruct(only(Fulu), partial_getter(copy))]
+    #[metastruct(exclude_from(tree_lists))]
+    #[serde(with = "serde_utils::quoted_u64")]
+    pub deposit_requests_start_index: u64,
     #[superstruct(only(Fulu))]
     pub pending_partial_withdrawals: List<PendingPartialWithdrawal, E::PendingPartialWithdrawalsLimit>,
 
@@ -158,9 +187,53 @@ where
     #[tree_hash(skip_hashing)]
     #[metastruct(exclude)]
     pub committee_caches: [Arc<CommitteeCache>; CACHED_EPOCHS],
+
+    #[metastruct(exclude_from(tree_lists))]
+    pub eth1_data: Eth1Data,
+    #[superstruct(getter(copy))]
+    #[metastruct(exclude_from(tree_lists))]
+    #[serde(with = "serde_utils::quoted_u64")]
+    pub eth1_deposit_index: u64,
+
+    #[superstruct(only(Fulu))]
+    pub pending_deposits: List<PendingDeposit, E::PendingDepositsLimit>,
+
+    #[superstruct(only(Fulu))]
+    pub previous_epoch_participation: List<ParticipationFlags, E::ValidatorRegistryLimit>,
+    #[superstruct(only(Fulu))]
+    pub current_epoch_participation: List<ParticipationFlags, E::ValidatorRegistryLimit>,
+
+    #[serde(with = "ssz_types::serde_utils::quoted_u64_var_list")]
+    #[superstruct(only(Fulu))]
+    pub inactivity_scores: List<u64, E::ValidatorRegistryLimit>,
+
+    #[superstruct(getter(copy))]
+    #[metastruct(exclude_from(tree_lists))]
+    pub genesis_validators_root: Hash256,
+
+    #[superstruct(getter(copy))]
+    #[metastruct(exclude_from(tree_lists))]
+    pub fork: Fork,
+
+    pub randao_mixes: Vector<Hash256, E::EpochsPerHistoricalVector>,
+
+    #[superstruct(only(Fulu))]
+    #[metastruct(exclude_from(tree_lists))]
+    pub current_sync_committee: Arc<SyncCommittee<E>>,
+    #[superstruct(only(Fulu))]
+    #[metastruct(exclude_from(tree_lists))]
+    pub next_sync_committee: Arc<SyncCommittee<E>>,
 }
 
 impl<E: EthSpec> BeaconState<E> {
+
+    /// This method ensures the state's pubkey cache is fully up-to-date before checking if the validator
+    /// exists in the registry. If a validator pubkey exists in the validator registry, returns `Some(i)`,
+    /// otherwise returns `None`.
+    pub fn get_validator_index(&mut self, pubkey: &PublicKeyBytes) -> Result<Option<usize>, Error> {
+        self.update_pubkey_cache()?;
+        Ok(self.pubkey_cache().get(pubkey))
+    }
     /// The epoch corresponding to `self.slot()`.
     pub fn current_epoch(&self) -> Epoch {
         self.slot().epoch(E::slots_per_epoch())
@@ -416,8 +489,251 @@ impl<E: EthSpec> BeaconState<E> {
             }
         }
     }
+
+
+    /// Add a validator to the registry and return the validator index that was allocated for it.
+    pub fn add_validator_to_registry(
+        &mut self,
+        pubkey: PublicKeyBytes,
+        withdrawal_credentials: Hash256,
+        amount: u64,
+        spec: &ChainSpec,
+    ) -> Result<usize, Error> {
+        let index = self.validators().len();
+        let fork_name = self.fork_name_unchecked();
+        self.validators_mut().push(Validator::from_deposit(
+            pubkey,
+            withdrawal_credentials,
+            amount,
+            fork_name,
+            spec,
+        ))?;
+        self.balances_mut().push(amount)?;
+
+        // Altair or later initializations.
+        if let Ok(previous_epoch_participation) = self.previous_epoch_participation_mut() {
+            previous_epoch_participation.push(ParticipationFlags::default())?;
+        }
+        if let Ok(current_epoch_participation) = self.current_epoch_participation_mut() {
+            current_epoch_participation.push(ParticipationFlags::default())?;
+        }
+        if let Ok(inactivity_scores) = self.inactivity_scores_mut() {
+            inactivity_scores.push(0)?;
+        }
+
+        // Keep the pubkey cache up to date if it was up to date prior to this call.
+        //
+        // Doing this here while we know the pubkey and index is marginally quicker than doing it in
+        // a call to `update_pubkey_cache` later because we don't need to index into the validators
+        // tree again.
+        let pubkey_cache = self.pubkey_cache_mut();
+        if pubkey_cache.len() == index {
+            let success = pubkey_cache.insert(pubkey, index);
+            if !success {
+                return Err(Error::PubkeyCacheInconsistent);
+            }
+        }
+
+        Ok(index)
+    }
+
+    /// Returns the beacon proposer index for the `slot` in `self.current_epoch()`.
+    pub fn get_beacon_proposer_index(&self, slot: Slot, spec: &ChainSpec) -> Result<usize, Error> {
+        // Proposer indices are only known for the current epoch, due to the dependence on the
+        // effective balances of validators, which change at every epoch transition.
+        let epoch = slot.epoch(E::slots_per_epoch());
+        if epoch != self.current_epoch() {
+            return Err(Error::SlotOutOfBounds);
+        }
+
+        let seed = self.get_beacon_proposer_seed(slot, spec)?;
+        let indices = self.get_active_validator_indices(epoch, spec)?;
+
+        self.compute_proposer_index(&indices, &seed, spec)
+    }
+
+    /// Compute the seed to use for the beacon proposer selection at the given `slot`.
+    pub fn get_beacon_proposer_seed(&self, slot: Slot, spec: &ChainSpec) -> Result<Vec<u8>, Error> {
+        let epoch = slot.epoch(E::slots_per_epoch());
+        let mut preimage = self
+            .get_seed(epoch, Domain::BeaconProposer, spec)?
+            .as_slice()
+            .to_vec();
+        preimage.append(&mut int_to_bytes8(slot.as_u64()));
+        Ok(hash(&preimage))
+    }
+
+    /// Returns the active validator indices for the given epoch.
+    /// Does not utilize the cache, performs a full iteration over the validator registry.
+    pub fn get_active_validator_indices(
+        &self,
+        epoch: Epoch,
+        spec: &ChainSpec,
+    ) -> Result<Vec<usize>, Error> {
+        if epoch >= self.compute_activation_exit_epoch(self.current_epoch(), spec)? {
+            Err(Error::EpochOutOfBounds)
+        } else {
+            Ok(get_active_validator_indices(self.validators(), epoch))
+        }
+    }
+
+    /// Compute the proposer (not necessarily for the Beacon chain) from a list of indices.
+    pub fn compute_proposer_index(
+        &self,
+        indices: &[usize],
+        seed: &[u8],
+        spec: &ChainSpec,
+    ) -> Result<usize, Error> {
+        if indices.is_empty() {
+            return Err(Error::InsufficientValidators);
+        }
+
+        let max_effective_balance = spec.max_effective_balance_for_fork(self.fork_name_unchecked());
+        let max_random_value = if self.fork_name_unchecked().electra_enabled() {
+            MAX_RANDOM_VALUE
+        } else {
+            MAX_RANDOM_BYTE
+        };
+
+        let mut i = 0;
+        loop {
+            let shuffled_index = compute_shuffled_index(
+                i.safe_rem(indices.len())?,
+                indices.len(),
+                seed,
+                spec.shuffle_round_count,
+            )
+                .ok_or(Error::UnableToShuffle)?;
+            let candidate_index = *indices
+                .get(shuffled_index)
+                .ok_or(Error::ShuffleIndexOutOfBounds(shuffled_index))?;
+            let random_value = self.shuffling_random_value(i, seed)?;
+            let effective_balance = self.get_effective_balance(candidate_index)?;
+            if effective_balance.safe_mul(max_random_value)?
+                >= max_effective_balance.safe_mul(random_value)?
+            {
+                return Ok(candidate_index);
+            }
+            i.safe_add_assign(1)?;
+        }
+    }
+    /// Fork-aware abstraction for the shuffling.
+    ///
+    /// In Electra and later, the random value is a 16-bit integer stored in a `u64`.
+    ///
+    /// Prior to Electra, the random value is an 8-bit integer stored in a `u64`.
+    fn shuffling_random_value(&self, i: usize, seed: &[u8]) -> Result<u64, Error> {
+        if self.fork_name_unchecked().electra_enabled() {
+            Self::shuffling_random_u16_electra(i, seed).map(u64::from)
+        } else {
+            Self::shuffling_random_byte(i, seed).map(u64::from)
+        }
+    }
+    /// Get two random bytes from the given `seed`.
+    ///
+    /// This is used in place of `shuffling_random_byte` from Electra onwards.
+    fn shuffling_random_u16_electra(i: usize, seed: &[u8]) -> Result<u16, Error> {
+        let mut preimage = seed.to_vec();
+        preimage.append(&mut int_to_bytes8(i.safe_div(16)? as u64));
+        let offset = i.safe_rem(16)?.safe_mul(2)?;
+        hash(&preimage)
+            .get(offset..offset.safe_add(2)?)
+            .ok_or(Error::ShuffleIndexOutOfBounds(offset))?
+            .try_into()
+            .map(u16::from_le_bytes)
+            .map_err(|_| Error::ShuffleIndexOutOfBounds(offset))
+    }
+    /// Get a random byte from the given `seed`.
+    ///
+    /// Used by the proposer & sync committee selection functions.
+    fn shuffling_random_byte(i: usize, seed: &[u8]) -> Result<u8, Error> {
+        let mut preimage = seed.to_vec();
+        preimage.append(&mut int_to_bytes8(i.safe_div(32)? as u64));
+        let index = i.safe_rem(32)?;
+        hash(&preimage)
+            .get(index)
+            .copied()
+            .ok_or(Error::ShuffleIndexOutOfBounds(index))
+    }
+
+    /// Generate a seed for the given `epoch`.
+    pub fn get_seed(
+        &self,
+        epoch: Epoch,
+        domain_type: Domain,
+        spec: &ChainSpec,
+    ) -> Result<Hash256, Error> {
+        // Bypass the safe getter for RANDAO so we can gracefully handle the scenario where `epoch
+        // == 0`.
+        let mix = {
+            let i = epoch
+                .safe_add(E::EpochsPerHistoricalVector::to_u64())?
+                .safe_sub(spec.min_seed_lookahead)?
+                .safe_sub(1)?;
+            let i_mod = i.as_usize().safe_rem(self.randao_mixes().len())?;
+            self.randao_mixes()
+                .get(i_mod)
+                .ok_or(Error::RandaoMixesOutOfBounds(i_mod))?
+        };
+        let domain_bytes = int_to_bytes4(spec.get_domain_constant(domain_type));
+        let epoch_bytes = int_to_bytes8(epoch.as_u64());
+
+        const NUM_DOMAIN_BYTES: usize = 4;
+        const NUM_EPOCH_BYTES: usize = 8;
+        const MIX_OFFSET: usize = NUM_DOMAIN_BYTES + NUM_EPOCH_BYTES;
+        const NUM_MIX_BYTES: usize = 32;
+
+        let mut preimage = [0; NUM_DOMAIN_BYTES + NUM_EPOCH_BYTES + NUM_MIX_BYTES];
+        preimage[0..NUM_DOMAIN_BYTES].copy_from_slice(&domain_bytes);
+        preimage[NUM_DOMAIN_BYTES..MIX_OFFSET].copy_from_slice(&epoch_bytes);
+        preimage[MIX_OFFSET..].copy_from_slice(mix.as_slice());
+
+        Ok(Hash256::from_slice(&hash(&preimage)))
+    }
+
+    /// Get all of the Beacon committees at a given slot.
+    /// Utilises the committee cache.
+    pub fn get_beacon_committees_at_slot(&self, slot: Slot) -> Result<Vec<BeaconCommittee>, Error> {
+        let cache = self.committee_cache_at_slot(slot)?;
+        cache.get_beacon_committees_at_slot(slot)
+    }
+    /// Get the committee cache for some `slot`.
+    ///
+    /// Return an error if the cache for the slot's epoch is not initialized.
+    fn committee_cache_at_slot(&self, slot: Slot) -> Result<&Arc<CommitteeCache>, Error> {
+        let epoch = slot.epoch(E::slots_per_epoch());
+        let relative_epoch = RelativeEpoch::from_epoch(self.current_epoch(), epoch)?;
+        self.committee_cache(relative_epoch)
+    }
+
+    /// Get the already-built current or next sync committee from the state.
+    pub fn get_built_sync_committee(
+        &self,
+        epoch: Epoch,
+        spec: &ChainSpec,
+    ) -> Result<&Arc<SyncCommittee<E>>, Error> {
+        let sync_committee_period = epoch.sync_committee_period(spec)?;
+        let current_sync_committee_period = self.current_epoch().sync_committee_period(spec)?;
+        let next_sync_committee_period = current_sync_committee_period.safe_add(1)?;
+
+        if sync_committee_period == current_sync_committee_period {
+            self.current_sync_committee()
+        } else if sync_committee_period == next_sync_committee_period {
+            self.next_sync_committee()
+        } else {
+            Err(Error::SyncCommitteeNotKnown {
+                current_epoch: self.current_epoch(),
+                epoch,
+            })
+        }
+    }
 }
 
+impl From<RelativeEpochError> for Error {
+    fn from(e: RelativeEpochError) -> Error {
+        Error::RelativeEpochError(e)
+    }
+}
 impl From<ArithError> for Error {
     fn from(e: ArithError) -> Error {
         Error::ArithError(e)
@@ -440,7 +756,17 @@ pub trait EthSpec:
     type MaxDepositRequestsPerPayload: Unsigned + Clone + Sync + Send + Debug + PartialEq;
     type MaxWithdrawalRequestsPerPayload: Unsigned + Clone + Sync + Send + Debug + PartialEq;
     type MaxConsolidationRequestsPerPayload: Unsigned + Clone + Sync + Send + Debug + PartialEq;
-
+    type MaxDeposits: Unsigned + Clone + Sync + Send + Debug + PartialEq;
+    type MaxVoluntaryExits: Unsigned + Clone + Sync + Send + Debug + PartialEq;
+    type PendingDepositsLimit: Unsigned + Clone + Sync + Send + Debug + PartialEq;
+    type EpochsPerHistoricalVector: Unsigned + Clone + Sync + Send + Debug + PartialEq;
+    type SyncCommitteeSize: Unsigned + Clone + Sync + Send + Debug + PartialEq;
+    type MaxProposerSlashings: Unsigned + Clone + Sync + Send + Debug + PartialEq;
+    type MaxAttesterSlashingsElectra: Unsigned + Clone + Sync + Send + Debug + PartialEq;
+    type MaxAttestationsElectra: Unsigned + Clone + Sync + Send + Debug + PartialEq;
+    type MaxValidatorsPerSlot: Unsigned + Clone + Sync + Send + Debug + PartialEq + Eq;
+    type MaxCommitteesPerSlot: Unsigned + Clone + Sync + Send + Debug + PartialEq + Eq;
+    type MaxBlsToExecutionChanges: Unsigned + Clone + Sync + Send + Debug + PartialEq;
 
 
     fn max_withdrawals_per_payload() -> usize {
@@ -458,4 +784,101 @@ pub trait EthSpec:
     fn pending_partial_withdrawals_limit() -> usize {
         Self::PendingPartialWithdrawalsLimit::to_usize()
     }
+}
+
+/// Returns `int` as little-endian bytes with a length of 8.
+pub fn int_to_bytes8(int: u64) -> Vec<u8> {
+    let mut bytes = BytesMut::with_capacity(8);
+    bytes.put_u64_le(int);
+    bytes.to_vec()
+}
+
+
+/// Returns a list of all `validators` indices where the validator is active at the given
+
+pub fn get_active_validator_indices<'a, V, I>(validators: V, epoch: Epoch) -> Vec<usize>
+where
+    V: IntoIterator<Item = &'a Validator, IntoIter = I>,
+    I: ExactSizeIterator + Iterator<Item = &'a Validator>,
+{
+    let iter = validators.into_iter();
+
+    let mut active = Vec::with_capacity(iter.len());
+
+    for (index, validator) in iter.enumerate() {
+        if validator.is_active_at(epoch) {
+            active.push(index)
+        }
+    }
+
+    active
+}
+
+pub fn compute_shuffled_index(
+    index: usize,
+    list_size: usize,
+    seed: &[u8],
+    shuffle_round_count: u8,
+) -> Option<usize> {
+    if list_size == 0
+        || index >= list_size
+        || list_size > usize::MAX / 2
+        || list_size > 2_usize.pow(24)
+    {
+        return None;
+    }
+
+    let mut index = index;
+    for round in 0..shuffle_round_count {
+        let pivot = bytes_to_int64(&hash_with_round(seed, round)[..]) as usize % list_size;
+        index = do_round(seed, index, pivot, round, list_size);
+    }
+    Some(index)
+}
+
+fn bytes_to_int64(slice: &[u8]) -> u64 {
+    let mut bytes = [0; 8];
+    bytes.copy_from_slice(&slice[0..8]);
+    u64::from_le_bytes(bytes)
+}
+fn hash_with_round(seed: &[u8], round: u8) -> Hash256 {
+    let mut context = Context::new();
+
+    context.update(seed);
+    context.update(&[round]);
+
+    let digest = context.finalize();
+    Hash256::from_slice(digest.as_ref())
+}
+
+fn do_round(seed: &[u8], index: usize, pivot: usize, round: u8, list_size: usize) -> usize {
+    let flip = (pivot + (list_size - index)) % list_size;
+    let position = max(index, flip);
+    let source = hash_with_round_and_position(seed, round, position);
+    let byte = source[(position % 256) / 8];
+    let bit = (byte >> (position % 8)) % 2;
+    if bit == 1 {
+        flip
+    } else {
+        index
+    }
+}
+fn hash_with_round_and_position(seed: &[u8], round: u8, position: usize) -> Hash256 {
+    let mut context = Context::new();
+
+    context.update(seed);
+    context.update(&[round]);
+    /*
+     * Note: the specification has an implicit assertion in `int_to_bytes4` that `position / 256 <
+     * 2**24`. For efficiency, we do not check for that here as it is checked in `compute_shuffled_index`.
+     */
+    context.update(&(position / 256).to_le_bytes()[0..4]);
+
+    let digest = context.finalize();
+    Hash256::from_slice(digest.as_ref())
+}
+
+/// Returns `int` as little-endian bytes with a length of 4.
+pub fn int_to_bytes4(int: u32) -> [u8; 4] {
+    int.to_le_bytes()
 }

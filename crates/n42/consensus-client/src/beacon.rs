@@ -12,6 +12,8 @@ use std::collections::{HashMap, BTreeMap};
 use alloy_primitives::{keccak256, BlockHash, B256, Log};
 use n42_primitives::{Epoch, VoluntaryExit, VoluntaryExitWithSig};
 use crate::storage::{Storage};
+use crate::safe_aitrh::SafeArith;
+use crate::safe_aitrh::SafeArithIter;
 use tracing::{trace, debug, error, info, warn};
 
 const INMEMORY_BEACON_STATES: u32 = 256;
@@ -19,6 +21,16 @@ const INMEMORY_BEACON_STATES: u32 = 256;
 const STAKING_AMOUNT: u64 = 32000000000;
 const REWARD_AMOUNT: u64 = 1;
 const SLOTS_PER_EPOCH: u64 = 32;
+
+// EthSpec
+const max_withdrawals_per_payload: usize = 16;
+
+// chain_spec
+const max_pending_partials_per_withdrawals_sweep: u64 = 16; // ?
+const min_activation_balance: u64 = 32000000000;
+const far_future_epoch: u64 = u64::max_value();
+const max_validators_per_withdrawals_sweep: u64 = 16384;
+const max_effective_balance: u64 = 32000000000; //?
 
 /// Solidity-style struct for the DepositEvent
 sol! {
@@ -139,6 +151,11 @@ pub struct BeaconState {
     pub eth1_deposit_index: u64,
     pub validators: Vec<Validator>,
     pub balances: Vec<Gwei>,
+
+    pub next_withdrawal_index: u64,
+    pub next_withdrawal_validator_index: u64,
+    pub pending_partial_withdrawals: Vec<PendingPartialWithdrawal>,
+    pub earliest_exit_epoch: Epoch,
 }
 
 impl Sealable for BeaconState {
@@ -167,6 +184,32 @@ pub struct Validator {
     pub activation_epoch: Epoch,
     pub exit_epoch: Epoch,
     pub withdrawable_epoch: Epoch,  // When validator can withdraw funds
+}
+
+impl Validator {
+    pub fn is_partially_withdrawable_validator(
+        &self,
+        balance: u64,
+    ) -> bool {
+        self.effective_balance == max_effective_balance
+            && balance > max_effective_balance
+    }
+
+    pub fn is_fully_withdrawable_validator(
+        &self,
+        balance: u64,
+        epoch: Epoch,
+    ) -> bool {
+        self.withdrawable_epoch <= epoch && balance > 0
+    }
+
+    pub fn get_execution_withdrawal_address(&self) -> Option<Address> {
+        self.withdrawal_credentials
+            .as_slice()
+            .get(12..)
+            .map(Address::from_slice)
+    }
+
 }
 
 #[derive(Debug, Clone, Hash, Default, RlpEncodable, RlpDecodable,  Serialize, Deserialize)]
@@ -317,7 +360,7 @@ impl BeaconState {
     }
 
     pub fn process_one_attestation(&mut self, attestation: &Attestation) -> eyre::Result<()> {
-        let epoch = self.slot / SLOTS_PER_EPOCH;
+        let epoch = self.current_epoch();
         for (index, validator) in self.validators.iter_mut().enumerate() {
             if validator.pubkey == attestation.pubkey && epoch >= validator.activation_epoch && (validator.exit_epoch == 0 || epoch < validator.exit_epoch) {
                 validator.effective_balance += REWARD_AMOUNT;
@@ -356,10 +399,134 @@ impl BeaconState {
     pub fn valid_validators(&self) -> Vec<Validator> {
         let mut validators = self.validators.clone();
         validators.retain(|validator| {
-            let epoch = self.slot / SLOTS_PER_EPOCH;
+            let epoch = self.current_epoch();
             epoch >= validator.activation_epoch && (validator.exit_epoch == 0 || epoch < validator.exit_epoch)
         });
         validators
     }
 
+    pub fn get_expected_withdrawals(&self) -> eyre::Result<(Vec<Withdrawal>, Option<usize>)> {
+        let epoch = self.current_epoch();
+        let mut withdrawal_index = self.next_withdrawal_index;
+        let mut validator_index = self.next_withdrawal_validator_index;
+        let mut withdrawals = Vec::<Withdrawal>::with_capacity(max_withdrawals_per_payload);
+
+        let mut processed_partial_withdrawals_count = 0;
+
+            for withdrawal in self.pending_partial_withdrawals.iter() {
+                if withdrawal.withdrawable_epoch > epoch
+                    || withdrawals.len() == max_pending_partials_per_withdrawals_sweep as usize
+                {
+                    break;
+                }
+
+                let validator = self.get_validator(withdrawal.validator_index as usize)?;
+
+                let has_sufficient_effective_balance =
+                    validator.effective_balance >= min_activation_balance;
+                let total_withdrawn = withdrawals
+                    .iter()
+                    .filter_map(|w| {
+                        (w.validator_index == withdrawal.validator_index).then_some(w.amount)
+                    })
+                    .safe_sum()?;
+                let balance = self
+                    .get_balance(withdrawal.validator_index as usize)?
+                    .safe_sub(total_withdrawn)?;
+                let has_excess_balance = balance > min_activation_balance;
+
+                if validator.exit_epoch == far_future_epoch
+                    && has_sufficient_effective_balance
+                    && has_excess_balance
+                {
+                    let withdrawable_balance = std::cmp::min(
+                        balance.safe_sub(min_activation_balance)?,
+                        withdrawal.amount,
+                    );
+                    withdrawals.push(Withdrawal {
+                        index: withdrawal_index,
+                        validator_index: withdrawal.validator_index,
+                        address: validator
+                            .get_execution_withdrawal_address()
+                            .ok_or(eyre::eyre!("NonExecutionAddressWithdrawalCredential"))?,
+                        amount: withdrawable_balance,
+                    });
+                    withdrawal_index.safe_add_assign(1)?;
+                }
+                processed_partial_withdrawals_count.safe_add_assign(1)?;
+            }
+
+    let bound = std::cmp::min(
+        self.validators.len() as u64,
+        max_validators_per_withdrawals_sweep,
+    );
+    for _ in 0..bound {
+        let validator = self.get_validator(validator_index as usize)?;
+        let partially_withdrawn_balance = withdrawals
+            .iter()
+            .filter_map(|withdrawal| {
+                (withdrawal.validator_index == validator_index).then_some(withdrawal.amount)
+            })
+            .safe_sum()?;
+        let balance = self.get_balance(validator_index as usize)?
+            .safe_sub(partially_withdrawn_balance)?;
+        if validator.is_fully_withdrawable_validator(balance, epoch) {
+            withdrawals.push(Withdrawal {
+                index: withdrawal_index,
+                validator_index,
+                address: validator
+                    .get_execution_withdrawal_address()
+                    //.ok_or(BlockProcessingError::WithdrawalCredentialsInvalid)?,
+                    .ok_or(eyre::eyre!("WithdrawalCredentialsInvalid"))?,
+                amount: balance,
+            });
+            withdrawal_index.safe_add_assign(1)?;
+        } else if validator.is_partially_withdrawable_validator(balance) {
+            withdrawals.push(Withdrawal {
+                index: withdrawal_index,
+                validator_index,
+                address: validator
+                    .get_execution_withdrawal_address()
+                    //.ok_or(BlockProcessingError::WithdrawalCredentialsInvalid)?,
+                    .ok_or(eyre::eyre!("WithdrawalCredentialsInvalid"))?,
+                //amount: balance.safe_sub(validator.get_max_effective_balance(spec, fork_name))?,
+                amount: balance.safe_sub(max_effective_balance)?,
+            });
+            withdrawal_index.safe_add_assign(1)?;
+        }
+        if withdrawals.len() == max_withdrawals_per_payload {
+            break;
+        }
+        validator_index = validator_index
+            .safe_add(1)?
+            .safe_rem(self.validators.len() as u64)?;
+    }
+
+    Ok((withdrawals.into(), Some(processed_partial_withdrawals_count)))
+    }
+
+    pub fn current_epoch(&self) -> Epoch {
+        self.slot / SLOTS_PER_EPOCH
+    }
+
+    /// Safe indexer for the `validators` list.
+    pub fn get_validator(&self, validator_index: usize) -> eyre::Result<&Validator> {
+        self.validators
+            .get(validator_index)
+            .ok_or(eyre::eyre!(format!("UnknownValidator, {validator_index}")))
+    }
+
+    pub fn get_balance(&self, validator_index: usize) -> eyre::Result<u64> {
+        self.balances
+            .get(validator_index)
+            .ok_or(eyre::eyre!(format!("UnknownValidator, {validator_index}")))
+            .copied()
+    }
+}
+
+#[derive(Debug, Clone, Hash, Default, PartialEq, RlpEncodable, RlpDecodable,  Serialize, Deserialize)]
+pub struct PendingPartialWithdrawal {
+    pub validator_index: u64,
+    pub amount: u64,
+    pub withdrawable_epoch: Epoch,
 }

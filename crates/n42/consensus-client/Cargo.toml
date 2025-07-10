@@ -52,6 +52,7 @@ tokio-stream.workspace = true
 futures-util.workspace = true
 
 # misc
+thiserror.workspace = true
 alloy-rlp.workspace = true
 serde.workspace = true
 serde_json.workspace = true

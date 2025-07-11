@@ -1,14 +1,9 @@
-
 use crate::{BitList,spec::EthSpec};
 use serde::{Deserialize, Serialize};
 use ssz_derive::{Decode, Encode};
-use ssz_types::BitVector;
 use tree_hash_derive::TreeHash;
 use typenum::Bit;
 use crate::attestation_data::AttestationData;
-// use milhouse::List;
-use arbitrary::{Arbitrary, Unstructured};
-use ssz_types::VariableList;
 
 
 

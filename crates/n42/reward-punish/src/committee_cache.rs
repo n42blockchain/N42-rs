@@ -10,7 +10,6 @@ use crate::beaconstate::CommitteeIndex;
 use crate::beacon_committee::BeaconCommittee;
 
 
-
 // Define "legacy" implementations of `Option<Epoch>`, `Option<NonZeroUsize>` which use four bytes
 // for encoding the union selector.
 four_byte_option_impl!(four_byte_option_epoch, Epoch);

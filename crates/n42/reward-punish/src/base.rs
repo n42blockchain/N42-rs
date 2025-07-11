@@ -1,7 +1,6 @@
 use crate::arith::{ArithError, SafeArith};
 use crate::spec::Spec;
 use crate::beaconstate::BeaconState;
-// use integer_sqrt::IntegerSquareRoot;
 use crate::spec::EthSpec;
 use integer_sqrt::IntegerSquareRoot;
 

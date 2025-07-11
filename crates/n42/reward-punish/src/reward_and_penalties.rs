@@ -8,8 +8,6 @@ use crate::spec::{Spec,EthSpec};
 use crate::beaconstate::BeaconState;
 
 
-
-
 /// Combination of several deltas for different components of an attestation reward.
 ///
 /// Exists only for compatibility with EF rewards tests.

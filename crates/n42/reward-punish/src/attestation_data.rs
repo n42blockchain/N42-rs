@@ -1,13 +1,8 @@
-
-
 use crate::beaconstate::Checkpoint;
 use crate::slot_epoch::Slot;
 use crate::Hash256;
-
-
 use serde::{Deserialize, Serialize};
 use ssz_derive::{Decode, Encode};
-
 use tree_hash_derive::TreeHash;
 use crate::slot_data::SlotData;
 

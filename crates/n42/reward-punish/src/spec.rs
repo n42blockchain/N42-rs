@@ -1,6 +1,5 @@
 use std::fmt::Debug;
 use arbitrary;
-use serde::{Deserialize, Serialize};
 use ssz_derive::{Decode, Encode};
 use ssz_types::typenum::Unsigned;
 use crate::slot_epoch::Epoch;
@@ -23,16 +22,13 @@ pub struct Spec {
     pub proposer_reward_quotient: u64,
     pub base_reward_factor: u64,
     pub slots_per_epoch: u64,
+    pub slots_per_big_epoch: u64,
     pub proportional_slashing_multiplier: u64,
     pub proportional_slashing_multiplier_bellatrix: u64,
     pub proportional_slashing_multiplier_altair: u64,
 }
 
 impl Spec {
-    // pub fn slots_per_epoch() -> u64 {
-    //     64
-    // }
-
     pub fn mainnet() -> Self {
 
         Self{
@@ -42,13 +38,15 @@ impl Spec {
             })
                 .expect("calculation does not overflow"),
             inactivity_penalty_quotient: u64::checked_pow(2, 26).expect("pow does not overflow"),
-            base_rewards_per_epoch: 4,
-            proposer_reward_quotient: 8,
-            base_reward_factor: 64,
+            base_rewards_per_epoch: 2,
+            proposer_reward_quotient: 4,
+            base_reward_factor: 1/2,
             slots_per_epoch: 64,
+            slots_per_big_epoch: 10800,
             proportional_slashing_multiplier: 1,
             proportional_slashing_multiplier_bellatrix: 3,
             proportional_slashing_multiplier_altair: 2,
+
         }
     }
 

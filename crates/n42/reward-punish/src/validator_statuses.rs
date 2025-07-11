@@ -3,7 +3,6 @@ use crate::spec::{EthSpec, Spec};
 use crate::beaconstate::{BeaconState};
 use crate::beaconstate::Error as BeaconStateError;
 use ssz_types::BitList;
-use ssz_derive::{Decode, Encode};
 
 
 /// Sets the boolean `var` on `self` to be true if it is true on `other`. Otherwise leaves `self`

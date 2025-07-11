@@ -1,13 +1,8 @@
 use ssz_types::typenum::Unsigned;
-// use crate::common::decrease_balance;
-// use crate::per_epoch_processing::{
-//     single_pass::{process_epoch_single_pass, SinglePassConfig},
-//     Error,
-// };
 use crate::beaconstate::Error;
 use crate::base::{increase_balance,decrease_balance};
 use crate::arith::{SafeArith, SafeArithIter,};
-// use types::{BeaconState, ChainSpec, EthSpec, Unsigned};
+
 use crate::beaconstate::BeaconState;
 use crate::slot_epoch::Epoch;
 use crate::spec::{EthSpec, Spec};

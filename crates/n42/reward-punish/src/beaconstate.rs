@@ -15,9 +15,6 @@ use crate::committee_cache::CommitteeCache;
 use crate::pending_attestation::PendingAttestation;
 use crate::relative_epoch::Error as RelativeEpochError;
 
-// use tree_hash::TreeHash;
-
-// pub type Hash256 = alloy_primitives::B256;
 use crate::Hash256;
 use crate::spec::{Spec, EthSpec,ForkName};
 use crate::arith::{ArithError, SafeArith};
@@ -336,7 +333,6 @@ where
     #[serde(with = "ssz_types::serde_utils::quoted_u64_fixed_vec")]
     pub slashings: Vector<u64, E::EpochsPerSlashingsVector>,
 
-
     // Attestations (genesis fork only)
     #[superstruct(only(Base))]
     // #[test_random(default)]
@@ -344,7 +340,6 @@ where
     #[superstruct(only(Base))]
     // #[test_random(default)]
     pub current_epoch_attestations: List<PendingAttestation<E>, E::MaxPendingAttestations>,
-
 
     #[serde(skip_serializing, skip_deserializing)]
     #[ssz(skip_serializing, skip_deserializing)]

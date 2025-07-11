@@ -702,6 +702,7 @@ where
             }
         };
 
+        let execution_requests = payload.requests();
         let block = payload.block();
         let max_td = self.consensus.total_difficulty(block.header().hash_slow());
         debug!(target: "consensus-client", ?max_td, "advance: new_block hash {:?}", block.header().hash_slow());
@@ -728,7 +729,7 @@ where
                 is_valid
             });
         let voluntary_exits = self.voluntary_exits.to_vec();
-        let beacon_block = self.beacon.gen_beacon_block(Some(beacon_state_after_withdrawal), parent_beacon_block_hash, &deposits, &attestations, &voluntary_exits, block)?;
+        let beacon_block = self.beacon.gen_beacon_block(Some(beacon_state_after_withdrawal), parent_beacon_block_hash, &deposits, &attestations, &voluntary_exits, &execution_requests, block)?;
         let beacon_block_hash = beacon_block.hash_slow();
         self.storage.save_beacon_block_by_hash(beacon_block_hash, beacon_block.clone())?;
         self.storage.save_beacon_block_hash_by_eth1_hash(block.hash(), beacon_block_hash)?;

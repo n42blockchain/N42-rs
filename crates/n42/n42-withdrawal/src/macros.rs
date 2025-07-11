@@ -175,3 +175,19 @@ macro_rules! impl_arbitrary {
         }
     };
 }
+
+macro_rules! verify {
+    ($condition: expr, $result: expr) => {
+        if !$condition {
+            return Err(crate::error::BlockOperationError::invalid($result));
+        }
+    };
+}
+
+macro_rules! block_verify {
+    ($condition: expr, $result: expr) => {
+        if !$condition {
+            return Err($result);
+        }
+    };
+}

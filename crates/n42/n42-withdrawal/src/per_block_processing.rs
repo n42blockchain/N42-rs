@@ -1,13 +1,23 @@
+use ssz_types::FixedVector;
+use ssz_types::typenum::{Unsigned, U33};
 use tree_hash::TreeHash;
 use crate::beacon_block_body::{BeaconBlockBodyRef, SignedBeaconBlock, WithdrawalRequest};
-use crate::withdrawal::{Withdrawals, Withdrawal};
+use crate::withdrawal::{Withdrawals, Withdrawal, VerifySignatures, Deposit, DepositData, SignedVoluntaryExit, PendingDeposit, BlockSignatureStrategy};
 use crate::beacon_state::{BeaconState, Error as BeaconStateError, EthSpec};
 use crate::chain_spec::ChainSpec;
-use crate::error::{BlockProcessingError, EpochProcessingError as Error};
+use crate::error::{BlockProcessingError, EpochProcessingError as Error, IntoWithIndex};
+use crate::fork_name::ForkName;
 use crate::payload::{AbstractExecPayload, ExecPayload};
 use crate::pending_partial_withdrawal::PendingPartialWithdrawal;
 use crate::safe_aitrh::{SafeArith, SafeArithIter};
 use crate::validators::Validator;
+use crate::Hash256;
+use crate::signature::{BlockSignatureVerifier, ConsensusContext};
+use crate::verify_deposit::{get_existing_validator_index, is_valid_deposit_signature, verify_deposit_merkle_proof};
+use crate::verify_exit::{get_pubkey_from_state, verify_exit};
+use std::borrow::Cow;
+use rayon::prelude::*;
+
 
 /// Performs a validator registry update, if required.
 ///
@@ -77,9 +87,9 @@ pub fn process_registry_updates<E: EthSpec>(
 pub fn per_block_processing<E: EthSpec, Payload: AbstractExecPayload<E>>(
     state: &mut BeaconState<E>,
     signed_block: &SignedBeaconBlock<E, Payload>,
-    // block_signature_strategy: BlockSignatureStrategy,
+    block_signature_strategy: BlockSignatureStrategy,
     // verify_block_root: VerifyBlockRoot,
-    // ctxt: &mut ConsensusContext<E>,
+    ctxt: &mut ConsensusContext<E>,
     spec: &ChainSpec,
 ) -> Result<(), BlockProcessingError> {
     let block = signed_block.message();
@@ -99,27 +109,27 @@ pub fn per_block_processing<E: EthSpec, Payload: AbstractExecPayload<E>>(
     // initialize_progressive_balances_cache(state, spec)?;
     // state.build_slashings_cache()?;
     //
-    // let verify_signatures = match block_signature_strategy {
-    //     BlockSignatureStrategy::VerifyBulk => {
-    //         // Verify all signatures in the block at once.
-    //         block_verify!(
-    //             BlockSignatureVerifier::verify_entire_block(
-    //                 state,
-    //                 |i| get_pubkey_from_state(state, i),
-    //                 |pk_bytes| pk_bytes.decompress().ok().map(Cow::Owned),
-    //                 signed_block,
-    //                 ctxt,
-    //                 spec
-    //             )
-    //             .is_ok(),
-    //             BlockProcessingError::BulkSignatureVerificationFailed
-    //         );
-    //         VerifySignatures::False
-    //     }
-    //     BlockSignatureStrategy::VerifyIndividual => VerifySignatures::True,
-    //     BlockSignatureStrategy::NoVerification => VerifySignatures::False,
-    //     BlockSignatureStrategy::VerifyRandao => VerifySignatures::False,
-    // };
+    let verify_signatures = match block_signature_strategy {
+        BlockSignatureStrategy::VerifyBulk => {
+            // Verify all signatures in the block at once.
+            block_verify!(
+                BlockSignatureVerifier::verify_entire_block(
+                    state,
+                    |i| get_pubkey_from_state(state, i),
+                    |pk_bytes| pk_bytes.decompress().ok().map(Cow::Owned),
+                    signed_block,
+                    ctxt,
+                    spec
+                )
+                .is_ok(),
+                BlockProcessingError::BulkSignatureVerificationFailed
+            );
+            VerifySignatures::False
+        }
+        BlockSignatureStrategy::VerifyIndividual => VerifySignatures::True,
+        BlockSignatureStrategy::NoVerification => VerifySignatures::False,
+        BlockSignatureStrategy::VerifyRandao => VerifySignatures::False,
+    };
     //
     // let proposer_index = process_block_header(
     //     state,
@@ -154,7 +164,7 @@ pub fn per_block_processing<E: EthSpec, Payload: AbstractExecPayload<E>>(
     // process_randao(state, block, verify_randao, ctxt, spec)?;
     // process_eth1_data(state, block.body().eth1_data())?;
     // process_operations(state, block.body(), verify_signatures, ctxt, spec)?;
-    process_operations(state, block.body(), spec)?;
+    process_operations(state, block.body(), verify_signatures, spec)?;
 
     // if let Ok(sync_aggregate) = block.body().sync_aggregate() {
     //     process_sync_aggregate(
@@ -176,7 +186,7 @@ pub fn per_block_processing<E: EthSpec, Payload: AbstractExecPayload<E>>(
 pub fn process_operations<E: EthSpec, Payload: AbstractExecPayload<E>>(
     state: &mut BeaconState<E>,
     block_body: BeaconBlockBodyRef<E, Payload>,
-    // verify_signatures: VerifySignatures,
+    verify_signatures: VerifySignatures,
     // ctxt: &mut ConsensusContext<E>,
     spec: &ChainSpec,
 ) -> Result<(), BlockProcessingError> {
@@ -195,8 +205,8 @@ pub fn process_operations<E: EthSpec, Payload: AbstractExecPayload<E>>(
     //     spec,
     // )?;
     // process_attestations(state, block_body, verify_signatures, ctxt, spec)?;
-    // process_deposits(state, block_body.deposits(), spec)?;
-    // process_exits(state, block_body.voluntary_exits(), verify_signatures, spec)?;
+    process_deposits(state, block_body.deposits(), spec)?;
+    process_exits(state, block_body.voluntary_exits(), verify_signatures, spec)?;
 
     // if let Ok(bls_to_execution_changes) = block_body.bls_to_execution_changes() {
     //     process_bls_to_execution_changes(state, bls_to_execution_changes, verify_signatures, spec)?;
@@ -213,6 +223,166 @@ pub fn process_operations<E: EthSpec, Payload: AbstractExecPayload<E>>(
         // )?;
     // }
 
+    Ok(())
+}
+
+/// Validates each `Deposit` and updates the state, short-circuiting on an invalid object.
+///
+/// Returns `Ok(())` if the validation and state updates completed successfully, otherwise returns
+/// an `Err` describing the invalid object or cause of failure.
+pub fn process_deposits<E: EthSpec>(
+    state: &mut BeaconState<E>,
+    deposits: &[Deposit],
+    spec: &ChainSpec,
+) -> Result<(), BlockProcessingError> {
+    // [Modified in Electra:EIP6110]
+    // Disable former deposit mechanism once all prior deposits are processed
+    let deposit_requests_start_index = state.deposit_requests_start_index().unwrap_or(u64::MAX);
+    let eth1_deposit_index_limit = std::cmp::min(
+        deposit_requests_start_index,
+        state.eth1_data().deposit_count,
+    );
+
+    if state.eth1_deposit_index() < eth1_deposit_index_limit {
+        let expected_deposit_len = std::cmp::min(
+            E::MaxDeposits::to_u64(),
+            eth1_deposit_index_limit.safe_sub(state.eth1_deposit_index())?,
+        );
+        block_verify!(
+            deposits.len() as u64 == expected_deposit_len,
+            BlockProcessingError::DepositCountInvalid {
+                expected: expected_deposit_len as usize,
+                found: deposits.len(),
+            }
+        );
+    } else {
+        block_verify!(
+            deposits.len() as u64 == 0,
+            BlockProcessingError::DepositCountInvalid {
+                expected: 0,
+                found: deposits.len(),
+            }
+        );
+    }
+
+    // Verify merkle proofs in parallel.
+    deposits
+        .par_iter()
+        .enumerate()
+        .try_for_each(|(i, deposit)| {
+            verify_deposit_merkle_proof(
+                state,
+                deposit,
+                state.eth1_deposit_index().safe_add(i as u64)?,
+                spec,
+            )
+                .map_err(|e| e.into_with_index(i))
+        })?;
+
+    // Update the state in series.
+    for deposit in deposits {
+        apply_deposit(state, deposit.data.clone(), None, true, spec)?;
+    }
+
+    Ok(())
+}
+
+/// Process a single deposit, verifying its merkle proof if provided.
+pub fn apply_deposit<E: EthSpec>(
+    state: &mut BeaconState<E>,
+    deposit_data: DepositData,
+    proof: Option<FixedVector<Hash256, U33>>,
+    increment_eth1_deposit_index: bool,
+    spec: &ChainSpec,
+) -> Result<(), BlockProcessingError> {
+    let deposit_index = state.eth1_deposit_index() as usize;
+    if let Some(proof) = proof {
+        let deposit = Deposit {
+            proof,
+            data: deposit_data.clone(),
+        };
+        verify_deposit_merkle_proof(state, &deposit, state.eth1_deposit_index(), spec)
+            .map_err(|e| e.into_with_index(deposit_index))?;
+    }
+
+    if increment_eth1_deposit_index {
+        state.eth1_deposit_index_mut().safe_add_assign(1)?;
+    }
+
+    // Get an `Option<u64>` where `u64` is the validator index if this deposit public key
+    // already exists in the beacon_state.
+    let validator_index = get_existing_validator_index(state, &deposit_data.pubkey)
+        .map_err(|e| e.into_with_index(deposit_index))?;
+
+    let amount = deposit_data.amount;
+
+    if let Some(index) = validator_index {
+        // [Modified in Electra:EIP7251]
+        if let Ok(pending_deposits) = state.pending_deposits_mut() {
+            pending_deposits.push(PendingDeposit {
+                pubkey: deposit_data.pubkey,
+                withdrawal_credentials: deposit_data.withdrawal_credentials,
+                amount,
+                signature: deposit_data.signature,
+                slot: spec.genesis_slot, // Use `genesis_slot` to distinguish from a pending deposit request
+            })?;
+        } else {
+            // Update the existing validator balance.
+            increase_balance(state, index as usize, amount)?;
+        }
+    }
+    // New validator
+    else {
+        // The signature should be checked for new validators. Return early for a bad
+        // signature.
+        if is_valid_deposit_signature(&deposit_data, spec).is_err() {
+            return Ok(());
+        }
+
+        state.add_validator_to_registry(
+            deposit_data.pubkey,
+            deposit_data.withdrawal_credentials,
+            if state.fork_name_unchecked() >= ForkName::Electra {
+                0
+            } else {
+                amount
+            },
+            spec,
+        )?;
+
+        // [New in Electra:EIP7251]
+        if let Ok(pending_deposits) = state.pending_deposits_mut() {
+            pending_deposits.push(PendingDeposit {
+                pubkey: deposit_data.pubkey,
+                withdrawal_credentials: deposit_data.withdrawal_credentials,
+                amount,
+                signature: deposit_data.signature,
+                slot: spec.genesis_slot, // Use `genesis_slot` to distinguish from a pending deposit request
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Validates each `Exit` and updates the state, short-circuiting on an invalid object.
+///
+/// Returns `Ok(())` if the validation and state updates completed successfully, otherwise returns
+/// an `Err` describing the invalid object or cause of failure.
+pub fn process_exits<E: EthSpec>(
+    state: &mut BeaconState<E>,
+    voluntary_exits: &[SignedVoluntaryExit],
+    verify_signatures: VerifySignatures,
+    spec: &ChainSpec,
+) -> Result<(), BlockProcessingError> {
+    // Verify and apply each exit in series. We iterate in series because higher-index exits may
+    // become invalid due to the application of lower-index ones.
+    for (i, exit) in voluntary_exits.iter().enumerate() {
+        verify_exit(state, None, exit, verify_signatures, spec)
+            .map_err(|e| e.into_with_index(i))?;
+
+        initiate_validator_exit(state, exit.message.validator_index as usize, spec)?;
+    }
     Ok(())
 }
 
@@ -537,5 +707,20 @@ pub fn decrease_balance<E: EthSpec>(
 
 pub fn decrease_balance_directly(balance: &mut u64, delta: u64) -> Result<(), BeaconStateError> {
     *balance = balance.saturating_sub(delta);
+    Ok(())
+}
+
+/// Increase the balance of a validator, erroring upon overflow, as per the spec.
+pub fn increase_balance<E: EthSpec>(
+    state: &mut BeaconState<E>,
+    index: usize,
+    delta: u64,
+) -> Result<(), BeaconStateError> {
+    increase_balance_directly(state.get_balance_mut(index)?, delta)
+}
+
+/// Increase the balance of a validator, erroring upon overflow, as per the spec.
+pub fn increase_balance_directly(balance: &mut u64, delta: u64) -> Result<(), BeaconStateError> {
+    balance.safe_add_assign(delta)?;
     Ok(())
 }

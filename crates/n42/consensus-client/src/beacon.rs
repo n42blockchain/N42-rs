@@ -26,6 +26,7 @@ const SLOTS_PER_EPOCH: u64 = 32;
 // EthSpec
 const max_withdrawals_per_payload: usize = 16;
 const pending_partial_withdrawals_limit: usize = 16; // ?
+const MaxDeposits: u64 = 16;
 
 // chain_spec
 const max_pending_partials_per_withdrawals_sweep: u64 = 16; // ?
@@ -44,6 +45,15 @@ const churn_limit_quotient:u64 = 32;
 const effective_balance_increment:u64 = 1000000000;
 
 const min_validator_withdrawability_delay: u64 = 1;
+
+macro_rules! verify {
+    ($condition: expr, $result: expr) => {
+        if !$condition {
+            //return Err(eyre::eyre!("BlockOperationError {$result}"));
+            return Err(eyre::eyre!($result));
+        }
+    };
+}
 
 /// Solidity-style struct for the DepositEvent
 sol! {
@@ -179,6 +189,8 @@ pub struct BeaconState {
     pub earliest_exit_epoch: Epoch,
     pub exit_balance_to_consume: u64,
 
+    pub eth1_data: Eth1Data,
+
     pub total_active_balance: Option<TotalActiveBalance>,
 }
 
@@ -259,6 +271,35 @@ impl Validator {
     /// Returns `true` if the validator is considered active at some epoch.
     pub fn is_active_at(&self, epoch: Epoch) -> bool {
         self.activation_epoch <= epoch && epoch < self.exit_epoch
+    }
+
+    pub fn from_deposit(
+        //pubkey: PublicKeyBytes,
+        pubkey: Bytes,
+        withdrawal_credentials: B256,
+        amount: u64,
+        //fork_name: ForkName,
+        //spec: &ChainSpec,
+    ) -> Self {
+        let mut validator = Validator {
+            pubkey,
+            withdrawal_credentials,
+            activation_eligibility_epoch: far_future_epoch,
+            activation_epoch: far_future_epoch,
+            exit_epoch: far_future_epoch,
+            withdrawable_epoch: far_future_epoch,
+            effective_balance: 0,
+            slashed: false,
+        };
+
+        //let max_effective_balance = validator.get_max_effective_balance(spec, fork_name);
+        // safe math is unnecessary here since the spec.effective_balance_increment is never <= 0
+        validator.effective_balance = std::cmp::min(
+            amount - (amount % effective_balance_increment),
+            max_effective_balance,
+        );
+
+        validator
     }
 
 }
@@ -390,10 +431,12 @@ impl BeaconState {
     }
 
     pub fn process_operations(&mut self, beacon_block_body: &BeaconBlockBody) -> eyre::Result<()> {
-        self.process_deposit(&beacon_block_body.deposits)?;
+        //self.process_deposit(&beacon_block_body.deposits)?;
         self.process_attestation(&beacon_block_body.attestations)?;
-        self.process_voluntary_exit(&beacon_block_body.voluntary_exits)?;
+        //self.process_voluntary_exit(&beacon_block_body.voluntary_exits)?;
 
+        self.process_deposits(&beacon_block_body.deposits)?;
+        self.process_exits(&beacon_block_body.voluntary_exits)?;
         self.process_withdrawal_requests(&beacon_block_body.execution_requests.withdrawals)?;
 
         Ok(())
@@ -905,6 +948,322 @@ impl BeaconState {
         }
     }
 
+/// Validates each `Exit` and updates the state, short-circuiting on an invalid object.
+///
+/// Returns `Ok(())` if the validation and state updates completed successfully, otherwise returns
+/// an `Err` describing the invalid object or cause of failure.
+pub fn process_exits(
+    self: &mut Self,
+    voluntary_exits: &[VoluntaryExitWithSig],
+) -> eyre::Result<()> {
+    // Verify and apply each exit in series. We iterate in series because higher-index exits may
+    // become invalid due to the application of lower-index ones.
+    for (i, exit) in voluntary_exits.iter().enumerate() {
+        self.verify_exit(None, exit)
+            .map_err(|e| eyre::eyre!("verify_exit error {e}, index {i}"))?;
+
+        self.initiate_validator_exit(exit.voluntary_exit.validator_index as usize)?;
+    }
+    Ok(())
+}
+
+/// Indicates if an `Exit` is valid to be included in a block in the current epoch of the given
+/// state.
+///
+/// Returns `Ok(())` if the `Exit` is valid, otherwise indicates the reason for invalidity.
+///
+/// Spec v0.12.1
+pub fn verify_exit(
+    self: &mut Self,
+    current_epoch: Option<Epoch>,
+    signed_exit: &VoluntaryExitWithSig,
+    //verify_signatures: VerifySignatures,
+) -> eyre::Result<()> {
+    let current_epoch = current_epoch.unwrap_or(self.current_epoch());
+    let exit = &signed_exit.voluntary_exit;
+
+    let validator = self
+        .validators
+        .get(exit.validator_index as usize)
+        .ok_or_else(|| eyre::eyre!(format!("ExitInvalid::ValidatorUnknown({}", exit.validator_index)))?;
+
+    // Verify the validator is active.
+    verify!(
+        validator.is_active_at(current_epoch),
+        format!("ExitInvalid::NotActive({})", exit.validator_index)
+    );
+
+    // Verify that the validator has not yet exited.
+    verify!(
+        validator.exit_epoch == far_future_epoch,
+        format!("ExitInvalid::AlreadyExited({})", exit.validator_index)
+    );
+
+    // Exits must specify an epoch when they become valid; they are not valid before then.
+    verify!(
+        current_epoch >= exit.epoch,
+        /*
+        ExitInvalid::FutureEpoch {
+            state: current_epoch,
+            exit: exit.epoch
+        }
+        */
+        format!("ExitInvalid::FutureEpoch(state: {}, exit {})", current_epoch, exit.epoch)
+    );
+
+    // Verify the validator has been active long enough.
+    let earliest_exit_epoch = validator
+        .activation_epoch
+        .safe_add(shard_committee_period)?;
+    verify!(
+        current_epoch >= earliest_exit_epoch,
+        /*
+        ExitInvalid::TooYoungToExit {
+            current_epoch,
+            earliest_exit_epoch,
+        }
+        */
+        format!("ExitInvalid::TooYoungToExit (current_epoch: {}, earliest_exit_epoch {})", current_epoch, earliest_exit_epoch)
+    );
+
+    /*
+    if verify_signatures.is_true() {
+        verify!(
+            exit_signature_set(
+                self,
+                |i| get_pubkey_from_state(self, i),
+                signed_exit,
+            )?
+            .verify(),
+            ExitInvalid::BadSignature
+        );
+    }
+    */
+
+    // [New in Electra:EIP7251]
+    // Only exit validator if it has no pending withdrawals in the queue
+    if let Ok(pending_balance_to_withdraw) =
+        self.get_pending_balance_to_withdraw(exit.validator_index as usize)
+    {
+        verify!(
+            pending_balance_to_withdraw == 0,
+            format!("ExitInvalid::PendingWithdrawalInQueue({})", exit.validator_index)
+        );
+    }
+
+    Ok(())
+}
+
+/// Validates each `Deposit` and updates the state, short-circuiting on an invalid object.
+///
+/// Returns `Ok(())` if the validation and state updates completed successfully, otherwise returns
+/// an `Err` describing the invalid object or cause of failure.
+pub fn process_deposits(
+    self: &mut Self,
+    deposits: &[Deposit],
+) -> eyre::Result<()> {
+    // [Modified in Electra:EIP6110]
+    // Disable former deposit mechanism once all prior deposits are processed
+    //let deposit_requests_start_index = state.deposit_requests_start_index().unwrap_or(u64::MAX);
+    /*
+    let deposit_requests_start_index = self.deposit_requests_start_index;
+    let eth1_deposit_index_limit = std::cmp::min(
+        deposit_requests_start_index,
+        self.eth1_data.deposit_count,
+    );
+    */
+    let eth1_deposit_index_limit = self.eth1_data.deposit_count;
+
+    if self.eth1_deposit_index < eth1_deposit_index_limit {
+        let expected_deposit_len = std::cmp::min(
+            MaxDeposits,
+            eth1_deposit_index_limit.safe_sub(self.eth1_deposit_index)?,
+        );
+        verify!(
+            deposits.len() as u64 == expected_deposit_len,
+            /*
+            BlockProcessingError::DepositCountInvalid {
+                expected: expected_deposit_len as usize,
+                found: deposits.len(),
+            }
+            */
+            format!("BlockProcessingError::DepositCountInvalid(expected: {}, found {})", expected_deposit_len as usize, deposits.len())
+        );
+    } else {
+        verify!(
+            deposits.len() as u64 == 0,
+            /*
+            BlockProcessingError::DepositCountInvalid {
+                expected: 0,
+                found: deposits.len(),
+            }
+            */
+            format!("BlockProcessingError::DepositCountInvalid(expected: {}, found {})", 0, deposits.len())
+        );
+    }
+
+    /*
+    // Verify merkle proofs in parallel.
+    deposits
+        .par_iter()
+        .enumerate()
+        .try_for_each(|(i, deposit)| {
+            verify_deposit_merkle_proof(
+                state,
+                deposit,
+                state.eth1_deposit_index().safe_add(i as u64)?,
+                spec,
+            )
+            .map_err(|e| e.into_with_index(i))
+        })?;
+    */
+
+    // Update the state in series.
+    for deposit in deposits {
+        self.apply_deposit(deposit.data.clone(), None, true)?;
+    }
+
+    Ok(())
+}
+
+/// Process a single deposit, verifying its merkle proof if provided.
+pub fn apply_deposit(
+    self: &mut Self,
+    deposit_data: DepositData,
+    //proof: Option<FixedVector<Hash256, U33>>,
+    proof: Option<u8>, // for compile
+    increment_eth1_deposit_index: bool,
+) -> eyre::Result<()> {
+    let deposit_index = self.eth1_deposit_index as usize;
+    /*
+    if let Some(proof) = proof {
+        let deposit = Deposit {
+            proof,
+            data: deposit_data.clone(),
+        };
+        verify_deposit_merkle_proof(state, &deposit, state.eth1_deposit_index(), spec)
+            .map_err(|e| e.into_with_index(deposit_index))?;
+    }
+    */
+
+    if increment_eth1_deposit_index {
+        self.eth1_deposit_index.safe_add_assign(1)?;
+    }
+
+    // Get an `Option<u64>` where `u64` is the validator index if this deposit public key
+    // already exists in the beacon_state.
+    let validator_index = self.get_validator_index_from_pubkey(&deposit_data.pubkey);
+
+    let amount = deposit_data.amount;
+
+    if let Some(index) = validator_index {
+        /*
+        // [Modified in Electra:EIP7251]
+        if let Ok(pending_deposits) = state.pending_deposits_mut() {
+            pending_deposits.push(PendingDeposit {
+                pubkey: deposit_data.pubkey,
+                withdrawal_credentials: deposit_data.withdrawal_credentials,
+                amount,
+                signature: deposit_data.signature,
+                slot: spec.genesis_slot, // Use `genesis_slot` to distinguish from a pending deposit request
+            })?;
+        } else {
+            // Update the existing validator balance.
+            increase_balance(state, index as usize, amount)?;
+        }
+        */
+        increase_balance(self, index as usize, amount)?;
+    }
+    // New validator
+    else {
+        // The signature should be checked for new validators. Return early for a bad
+        // signature.
+        /*
+        if is_valid_deposit_signature(&deposit_data, spec).is_err() {
+            return Ok(());
+        }
+        */
+
+        self.add_validator_to_registry(
+            deposit_data.pubkey,
+            deposit_data.withdrawal_credentials,
+            /*
+            if state.fork_name_unchecked() >= ForkName::Electra {
+                0
+            } else {
+                amount
+            },
+            */
+                amount,
+        )?;
+
+        /*
+        // [New in Electra:EIP7251]
+        if let Ok(pending_deposits) = state.pending_deposits_mut() {
+            pending_deposits.push(PendingDeposit {
+                pubkey: deposit_data.pubkey,
+                withdrawal_credentials: deposit_data.withdrawal_credentials,
+                amount,
+                signature: deposit_data.signature,
+                slot: spec.genesis_slot, // Use `genesis_slot` to distinguish from a pending deposit request
+            })?;
+        }
+        */
+    }
+
+    Ok(())
+}
+
+    /// Add a validator to the registry and return the validator index that was allocated for it.
+    pub fn add_validator_to_registry(
+        &mut self,
+        //pubkey: PublicKeyBytes,
+        pubkey: Bytes,
+        withdrawal_credentials: B256,
+        amount: u64,
+        //spec: &ChainSpec,
+    ) -> eyre::Result<usize> {
+        let index = self.validators.len();
+        //let fork_name = self.fork_name_unchecked();
+        self.validators.push(Validator::from_deposit(
+            pubkey,
+            withdrawal_credentials,
+            amount,
+            //fork_name,
+        ));
+        self.balances.push(amount);
+
+        // Altair or later initializations.
+        /*
+        if let Ok(previous_epoch_participation) = self.previous_epoch_participation_mut() {
+            previous_epoch_participation.push(ParticipationFlags::default())?;
+        }
+        if let Ok(current_epoch_participation) = self.current_epoch_participation_mut() {
+            current_epoch_participation.push(ParticipationFlags::default())?;
+        }
+        if let Ok(inactivity_scores) = self.inactivity_scores_mut() {
+            inactivity_scores.push(0)?;
+        }
+        */
+
+        // Keep the pubkey cache up to date if it was up to date prior to this call.
+        //
+        // Doing this here while we know the pubkey and index is marginally quicker than doing it in
+        // a call to `update_pubkey_cache` later because we don't need to index into the validators
+        // tree again.
+        /*
+        let pubkey_cache = self.pubkey_cache_mut();
+        if pubkey_cache.len() == index {
+            let success = pubkey_cache.insert(pubkey, index);
+            if !success {
+                return Err(Error::PubkeyCacheInconsistent);
+            }
+        }
+        */
+
+        Ok(index)
+    }
+
 }
 
 #[derive(Debug, Clone, Hash, Default, PartialEq, RlpEncodable, RlpDecodable,  Serialize, Deserialize)]
@@ -912,6 +1271,21 @@ pub struct PendingPartialWithdrawal {
     pub validator_index: u64,
     pub amount: u64,
     pub withdrawable_epoch: Epoch,
+}
+
+/// Increase the balance of a validator, erroring upon overflow, as per the spec.
+pub fn increase_balance(
+    state: &mut BeaconState,
+    index: usize,
+    delta: u64,
+) -> eyre::Result<()> {
+    increase_balance_directly(state.get_balance_mut(index)?, delta)
+}
+
+/// Increase the balance of a validator, erroring upon overflow, as per the spec.
+pub fn increase_balance_directly(balance: &mut u64, delta: u64) -> eyre::Result<()> {
+    balance.safe_add_assign(delta)?;
+    Ok(())
 }
 
 pub fn decrease_balance(
@@ -940,3 +1314,39 @@ pub fn is_compounding_withdrawal_credential(
 fn parse_execution_requests(requests: &Option<Requests>) -> ExecutionRequests {
     todo!()
 }
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum ExitInvalid {
+    /// The specified validator is not active.
+    NotActive(u64),
+    /// The specified validator is not in the state's validator registry.
+    ValidatorUnknown(u64),
+    /// The specified validator has a non-maximum exit epoch.
+    AlreadyExited(u64),
+    /// The specified validator has already initiated exit.
+    AlreadyInitiatedExit(u64),
+    /// The exit is for a future epoch.
+    FutureEpoch {
+        state: Epoch,
+        exit: Epoch,
+    },
+    /// The validator has not been active for long enough.
+    TooYoungToExit {
+        current_epoch: Epoch,
+        earliest_exit_epoch: Epoch,
+    },
+    /// The exit signature was not signed by the validator.
+    BadSignature,
+    /// There was an error whilst attempting to get a set of signatures. The signatures may have
+    /// been invalid or an internal error occurred.
+    //SignatureSetError(SignatureSetError),
+    PendingWithdrawalInQueue(u64),
+}
+
+#[derive(Debug, Clone, Hash, Default, RlpEncodable, RlpDecodable, Serialize, Deserialize)]
+pub struct Eth1Data {
+    pub deposit_root: B256,
+    pub deposit_count: u64,
+    pub block_hash: B256,
+}
+

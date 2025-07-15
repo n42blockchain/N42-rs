@@ -48,6 +48,7 @@ members = [
     "crates/revm",
     "crates/n42/mobile",
     "crates/n42/keystore",
+    "crates/transaction-pool",
     # "crates/evm/evm",
 #    "bin/reth/",
 ]
@@ -627,8 +628,10 @@ reth-network-peers = { path = "crates/net/peers"}
 #reth-chain-state = { path = "crates/chain-state"}
 reth-revm={path = "crates/revm"}
 # reth-evm={path="crates/evm/evm"}
+reth-transaction-pool={path="crates/transaction-pool"}
 
 [patch.crates-io]
+# alloy-evm={path="/Users/root1/Desktop/starlink/evm-0.8.1/crates/evm"}
 #alloy-genesis = { path = "./crates/n42/alloy-genesis" }
 alloy-rpc-types-engine = { path = "./crates/n42/alloy-rpc-types-engine" }
 alloy-rpc-types-beacon = { path = "./crates/n42/alloy-rpc-types-beacon" }

@@ -1606,6 +1606,7 @@ version = "2.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c8214115b7bf84099f1309324e63141d4c5d7cc26862f97a0a857dbefe165bd"
 dependencies = [
+ "arbitrary",
  "serde",
 ]
 
@@ -9530,19 +9531,22 @@ dependencies = [
 [[package]]
 name = "reth-transaction-pool"
 version = "1.4.3"
-source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.4.3#fe3653ffe602d4e85ad213e8bd9f06e7b710c0c5"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
  "alloy-primitives 1.1.2",
  "alloy-rlp",
  "aquamarine",
+ "assert_matches",
  "auto_impl",
  "bitflags 2.9.0",
+ "codspeed-criterion-compat",
  "futures-util",
  "metrics",
  "parking_lot 0.12.3",
  "paste",
+ "proptest",
+ "proptest-arbitrary-interop",
  "rand 0.9.1",
  "reth-chain-state",
  "reth-chainspec",
@@ -9552,14 +9556,18 @@ dependencies = [
  "reth-fs-util",
  "reth-metrics",
  "reth-primitives-traits",
+ "reth-provider",
  "reth-storage-api",
  "reth-tasks",
+ "reth-tracing",
  "revm-interpreter",
  "revm-primitives",
  "rustc-hash 2.1.1",
  "schnellru",
  "serde",
+ "serde_json",
  "smallvec",
+ "tempfile",
  "thiserror 2.0.12",
  "tokio",
  "tokio-stream",

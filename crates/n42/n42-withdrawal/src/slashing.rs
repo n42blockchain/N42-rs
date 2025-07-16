@@ -6,7 +6,7 @@ use derivative::Derivative;
 use ssz_types::VariableList;
 use tree_hash_derive::TreeHash;
 use crate::beacon_state::EthSpec;
-use crate::crypto::fake_crypto_implementations::AggregateSignature;
+use crate::crypto::{BlsAggregateSignature as AggregateSignature};
 use crate::signature::AttestationData;
 
 

@@ -68,7 +68,7 @@ macro_rules! define_mod {
                 bls_variant::SecretKey,
                 bls_variant::Signature,
             >;
-            pub type AggregateSignature = GenericAggregateSignature<
+            pub type BlsAggregateSignature = GenericAggregateSignature< // 改成BlsAggregateSignature正确跳转
                 bls_variant::PublicKey,
                 bls_variant::AggregatePublicKey,
                 bls_variant::Signature,

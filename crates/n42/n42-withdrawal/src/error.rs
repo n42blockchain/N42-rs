@@ -66,6 +66,12 @@ pub enum Error {
     /// The secret key is all zero bytes, which is invalid.
     InvalidZeroSecretKey,
 }
+#[cfg(feature = "supranational")]
+impl From<BlstError> for Error {
+    fn from(e: BlstError) -> Error {
+        Error::BlstError(e)
+    }
+}
 
 #[derive(Debug, PartialEq)]
 pub enum EpochProcessingError {

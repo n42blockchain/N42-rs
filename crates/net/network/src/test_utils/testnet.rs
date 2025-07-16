@@ -33,7 +33,7 @@ use reth_tokio_util::EventStream;
 use reth_transaction_pool::{
     blobstore::InMemoryBlobStore,
     test_utils::{TestPool, TestPoolBuilder},
-    EthTransactionPool, PoolTransaction, TransactionPool, TransactionValidationTaskExecutor,
+    EthTransactionPool, N42TransactionPool, PoolTransaction, TransactionPool, TransactionValidationTaskExecutor,
 };
 use secp256k1::SecretKey;
 use std::{
@@ -228,6 +228,53 @@ where
 
             peer.map_transactions_manager_with(
                 EthTransactionPool::eth_pool(pool, blob_store, Default::default()),
+                tx_manager_config.clone(),
+                policy,
+            )
+        })
+    }
+
+    /// Installs an N42 pool on each peer
+    pub fn with_n42_pool(self) -> Testnet<C, N42TransactionPool<C, InMemoryBlobStore>> {
+        self.map_pool(|peer| {
+            let blob_store = InMemoryBlobStore::default();
+            let pool = TransactionValidationTaskExecutor::n42(
+                peer.client.clone(),
+                blob_store.clone(),
+                TokioTaskExecutor::default(),
+            );
+            peer.map_transactions_manager(N42TransactionPool::n42_pool(
+                pool,
+                blob_store,
+                Default::default(),
+            ))
+        })
+    }
+
+    /// Installs an N42 pool on each peer with custom transaction manager config
+    pub fn with_n42_pool_config(
+        self,
+        tx_manager_config: TransactionsManagerConfig,
+    ) -> Testnet<C, N42TransactionPool<C, InMemoryBlobStore>> {
+        self.with_n42_pool_config_and_policy(tx_manager_config, Default::default())
+    }
+
+    /// Installs an N42 pool on each peer with custom transaction manager config and policy.
+    pub fn with_n42_pool_config_and_policy(
+        self,
+        tx_manager_config: TransactionsManagerConfig,
+        policy: TransactionPropagationKind,
+    ) -> Testnet<C, N42TransactionPool<C, InMemoryBlobStore>> {
+        self.map_pool(|peer| {
+            let blob_store = InMemoryBlobStore::default();
+            let pool = TransactionValidationTaskExecutor::n42(
+                peer.client.clone(),
+                blob_store.clone(),
+                TokioTaskExecutor::default(),
+            );
+
+            peer.map_transactions_manager_with(
+                N42TransactionPool::n42_pool(pool, blob_store, Default::default()),
                 tx_manager_config.clone(),
                 policy,
             )

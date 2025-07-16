@@ -3,7 +3,6 @@ use std::fs::File;
 use std::io::Write;
 use deposit_sdk::{EthStakingSdk, SdkError, DepositData};
 use deposit_sdk::deposit::withdrawal_credentials;
-use n42_withdrawals::Address;
 use hex_literal::hex;
 use keystore::keystore::{keypair_from_secret, KeystoreBuilder, PlainText};
 
@@ -19,16 +18,16 @@ use keystore::keystore::{keypair_from_secret, KeystoreBuilder, PlainText};
 /// 运行命令 本crate下 cargo run --package deposit_sdk --example deposit_test
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 定义一个非0的密钥， 钱包解密而来
-    let secret = PlainText::from(vec![1u8; 32]);
+    let secret = PlainText::from(vec![2u8; 32]);
 
     // 生成 keypair
     let keypair = keypair_from_secret(secret.as_bytes()).expect("keypair_from_secret 失败");
 
     // 生成 keystore
-    let password = b"test-password";
+    let password = b"test-password123";
     // 密钥派生路径
     // let path = "m/12381/3600/0/0/0".to_string();
-    let path = "m/44/60/0/0/0".to_string();
+    let path = "m/12381/3600/0/0/0".to_string();
 
     let keystore = KeystoreBuilder::new(&keypair, password, path)
         .expect("KeystoreBuilder::new 失败")

@@ -3,8 +3,8 @@ use zeroize::Zeroize;
 use ring::hkdf::{KeyType, Prk, Salt, HKDF_SHA256};
 use num_bigint_dig::BigUint;
 use crate::keystore::{Error, SecretBytes, HASH_SIZE, MOD_R_L};
-use n42_withdrawals::crypto::ZeroizeHash;
-
+// use n42_withdrawals::crypto::ZeroizeHash;
+use crate::blst::ZeroizeHash;
 
 pub const LAMPORT_ARRAY_SIZE: u8 = 255;
 /// The order of the BLS 12-381 curve.

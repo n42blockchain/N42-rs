@@ -22,7 +22,7 @@ hex = "0.4"
 eyre = "0.6" # 用于更好的错误处理
 thiserror = "1.0"
 url = "2.5.4"
-n42-withdrawals = { workspace = true, default-features = false, features = ["supranational"] }
+#n42-withdrawals = { workspace = true, default-features = false, features = ["supranational"] }
 keystore = { path = "../keystore" }
 hex-literal = "0.4"
 

@@ -1,4 +1,4 @@
-use n42_withdrawals::crypto::{fake_crypto_implementations::{Keypair, SecretKey}, ZeroizeHash};
+// use n42_withdrawals::crypto::{fake_crypto_implementations::{Keypair, SecretKey}, ZeroizeHash};
 use std::{fmt,str};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
@@ -15,7 +15,9 @@ use rand::prelude::*;
 use serde_repr::*;
 use serde_json::{Map, Value};
 pub use uuid::Uuid;
+use crate::blst::{Keypair, ZeroizeHash, SecretKey};
 use crate::create::{Wallet};
+
 
 
 
@@ -239,7 +241,7 @@ pub enum Error {
     ScryptInvalidParams(InvalidParams),
     ScryptInvaidOutputLen(InvalidOutputLen),
     EmptyPassword,
-    InvalidSecretKeyBytes(n42_withdrawals::error::Error),
+    InvalidSecretKeyBytes(crate::blst::Error),
     InvalidSecretKeyLen { len: usize, expected: usize },
     PublicKeyMismatch,
 

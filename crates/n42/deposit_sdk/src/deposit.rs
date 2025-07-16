@@ -1,5 +1,5 @@
-use n42_withdrawals::{Address, Hash256};
 use crate::{EthStakingSdk, SdkError};
+use keystore::{Hash256, Address};
 
 #[tokio::main]
 async fn main() -> Result<(), SdkError> {

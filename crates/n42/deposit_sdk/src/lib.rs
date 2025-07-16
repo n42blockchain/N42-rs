@@ -19,8 +19,8 @@ use ethers::utils::WEI_IN_ETHER;
 use ethers_signers::{LocalWallet, WalletError};
 use serde::Deserialize;
 use crate::DepositContract;
-use n42_withdrawals::crypto::{PublicKeyBytes, SignatureBytes};
-use n42_withdrawals::Hash256;
+use keystore::blst::{PublicKeyBytes, SignatureBytes};
+use keystore::Hash256;
 
 // 读取指定的质押abi文件，创建一个叫DepositContract的rust模块，DepositContract::new(address, client) 来实例化它
 abigen

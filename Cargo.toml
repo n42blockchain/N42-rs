@@ -48,6 +48,7 @@ members = [
     "crates/revm",
     "crates/n42/mobile",
     "crates/n42/keystore",
+    "crates/n42/deposit_sdk",
     # "crates/evm/evm",
 #    "bin/reth/",
 ]

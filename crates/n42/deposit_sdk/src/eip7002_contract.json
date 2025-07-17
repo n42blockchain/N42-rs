@@ -1,0 +1,15 @@
+[
+  {
+    "type": "function",
+    "name": "withdrawValidator",
+    "inputs": [
+      {
+        "name": "validator_pubkey",
+        "type": "bytes48",
+        "internalType": "bytes48"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  }
+]

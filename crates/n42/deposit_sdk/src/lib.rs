@@ -27,13 +27,25 @@ use n42_withdrawals::chain_spec::ChainSpec;
 
 
 // 读取指定的质押abi文件，创建一个叫DepositContract的rust模块，DepositContract::new(address, client) 来实例化它
-abigen
-!(
+abigen!(
     DepositContract,
     "src/deposit.json",
     event_derives(serde::Deserialize, serde::Serialize)
 );
 
+abigen!(
+    Eip7002Contract,
+    "src/eip7002_contract.json",
+);
+
+/// 质押合约地址 公司的
+pub const DEPOSIT_CONTRACT_ADDRESS: &str = "0x29a625941FA7B43be23b4309CD76e4d1BE688429";
+/// 退出合约地址 公司的
+pub const EIP7002_CONTRACT_ADDRESS: &str = "0xEFf1e899B6460dC7aBca481798C52638993595D6";
+// /// 质押合约地址 eth的
+// pub const DEPOSIT_CONTRACT_ADDRESS: &str = "0x00000000219ab540356cbb839cbe05303d7705fa";
+// /// 退出合约地址 eth的
+// pub const EIP7002_CONTRACT_ADDRESS: &str = "0x00000961Ef480Eb55e80D19ad83579A64c007002";
 
 #[derive(Debug, Error)]
 pub enum SdkError {
@@ -110,7 +122,8 @@ impl SignedRoot for DepositMessage {}
 
 pub struct EthStakingSdk {
     client: Arc<SignerMiddleware<Provider<Http>, LocalWallet>>,
-    contract: DepositContract<SignerMiddleware<Provider<Http>, LocalWallet>>,
+    deposit_contract: DepositContract<SignerMiddleware<Provider<Http>, LocalWallet>>,
+    exit_contract: Eip7002Contract<SignerMiddleware<Provider<Http>, LocalWallet>>,
 }
 
 impl EthStakingSdk {
@@ -118,7 +131,7 @@ impl EthStakingSdk {
     pub async fn new(
         rpc_url: &str,
         private_key_hex: &str,
-        contract_address: &str,
+        deposit_contract_address: &str,
     ) -> Result<Self, SdkError> {
         // 解析url 连接到执行层节点
         let provider = Provider::<Http>::try_from(rpc_url)?;
@@ -133,14 +146,18 @@ impl EthStakingSdk {
         let client = SignerMiddleware::new(provider, wallet);
         let client = Arc::new(client);
 
-        // 解析合约地址
-        let address = Address::from_str(contract_address)
-            .map_err(|e| SdkError::Config(format!("合约地址解析失败: {}", e)))?;
+        // 解析质押合约地址
+        let deposit_address = Address::from_str(deposit_contract_address)
+            .map_err(|e| SdkError::Config(format!("存款合约地址解析失败: {}", e)))?;
+        let deposit_contract = DepositContract::new(deposit_address, client.clone());
 
-        // 生成合约实例
-        let contract = DepositContract::new(address, client.clone());
+        // 解析退出合约
+        let exit_address = Address::from_str(EIP7002_CONTRACT_ADDRESS)
+            .map_err(|e| SdkError::Config(format!("EIP-7002 合约地址解析失败: {}", e)))?;
+        let exit_contract = Eip7002Contract::new(exit_address, client.clone());
 
-        Ok(Self { client, contract })
+
+        Ok(Self { client, deposit_contract, exit_contract})
     }
 
     /// 向存款合约发送 32 ETH 完成质押
@@ -164,8 +181,8 @@ impl EthStakingSdk {
             .ok_or_else(|| SdkError::Config("价值计算溢出".into()))?;
 
         // 调用合约 deposit(...) 并发送 32 ETH
-        let mut call = self
-            .contract
+        let call = self
+            .deposit_contract
             .deposit(pubkey, creds, sig, root)
             .value(value);
 
@@ -175,6 +192,32 @@ impl EthStakingSdk {
         let receipt = pending_tx
             .await?
             .ok_or(SdkError::TransactionDropped)?;
+        Ok(receipt)
+    }
+    pub async fn request_exit(
+        &self,
+        validator_pubkey_hex: &str,
+    ) -> Result<TransactionReceipt, SdkError> {
+        println!("🚀 正在为验证者 {}... 发起退出请求", &validator_pubkey_hex[..10]);
+
+        // 1. 将公钥的十六进制字符串转换为 48 字节数组
+        let pubkey_bytes: [u8; 48] = hex::decode(validator_pubkey_hex)?
+            .try_into()
+            .map_err(|_| SdkError::Config("validator_pubkey 必须是 48 字节".into()))?;
+
+        // 2. 构建合约调用
+        let call = self.exit_contract.withdraw_validator(pubkey_bytes);
+
+        // 发送交易
+        let pending_tx = call.send().await?;
+        println!("交易已发送，等待确认... Tx Hash: {:?}", pending_tx.tx_hash());
+
+        let receipt = pending_tx
+            .await?
+            .ok_or(SdkError::TransactionDropped)?;
+
+        println!("✅ 退出请求已成功上链！Block: {}", receipt.block_number.unwrap_or_default());
+
         Ok(receipt)
     }
 }

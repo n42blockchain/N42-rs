@@ -1,3 +1,4 @@
+use std::hash::RandomState;
 use crate::{
     bundle_state::StorageRevertsIter,
     providers::{
@@ -18,6 +19,8 @@ use crate::{
     StaticFileProviderFactory, StatsReader, StorageLocation, StorageReader, StorageTrieWriter,
     TransactionVariant, TransactionsProvider, TransactionsProviderExt, TrieWriter,
     WithdrawalsProvider,
+ValidatorChangeWriter, 
+    ValidatorReader, 
 };
 use alloy_consensus::{
     transaction::{SignerRecoverable, TransactionMeta},
@@ -60,7 +63,7 @@ use reth_storage_api::{
     StateProvider, StorageChangeSetReader, TryIntoHistoricalStateProvider,
     SnapshotProvider, SnapshotProviderWriter
 };
-use n42_primitives::Snapshot;
+use n42_primitives::{Snapshot, Validator,ValidatorBeforeTx,ValidatorChangeset,ValidatorRevert};
 use reth_storage_errors::provider::{ProviderResult, RootMismatch};
 use reth_trie::{
     prefix_set::{PrefixSet, PrefixSetMut, TriePrefixSets},
@@ -79,6 +82,127 @@ use std::{
     sync::{mpsc, Arc},
 };
 use tracing::{debug, trace};
+
+impl<TX: DbTx, N: NodeTypes> ValidatorReader for DatabaseProvider<TX, N> {
+    fn basic_validator(&self,address:Address) -> ProviderResult<Option<Validator> > {
+        Ok(self.tx.get::<tables::PlainValidatorState>(address)?)
+    }
+    fn changed_validators_and_blocks_with_range(&self,range:RangeInclusive<BlockNumber> ,) -> ProviderResult<BTreeMap<Address,Vec<BlockNumber> > > {
+        let mut changeset_cursor = self.tx.cursor_read::<tables::ValidatorChangeSets>()?;
+        let validator_transitions = changeset_cursor.walk_range(range)?.try_fold(
+            BTreeMap::new(),
+            |mut validators: BTreeMap<Address, Vec<u64>>, entry| -> ProviderResult<_> {
+                let (index, validator) = entry?;
+                validators.entry(validator.address).or_default().push(index);
+                Ok(validators)
+            },
+        )?;
+        Ok(validator_transitions)
+    }
+}
+
+impl<TX: DbTxMut + DbTx+'static, N: NodeTypes> ValidatorChangeWriter for DatabaseProvider<TX, N> {
+    fn write_validator_reverts(&self,first_block:BlockNumber,validator_reverts:ValidatorRevert,) -> ProviderResult<()> {
+        let mut validator_changeset_cursor =
+            self.tx_ref().cursor_dup_write::<tables::ValidatorChangeSets>()?;
+        for (block_index, mut validator_block_reverts) in validator_reverts.validators.into_iter().enumerate() {
+            let block_number=first_block+block_index as BlockNumber;
+            validator_block_reverts.par_sort_by_key(|a| a.0);
+
+            for (address, info) in validator_block_reverts {
+                validator_changeset_cursor.append_dup(
+                    block_number,
+                    ValidatorBeforeTx { address, info:info.map(Into::into) },
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+    fn insert_validator_history_index(&self,validator_transitions:impl IntoIterator<Item = (Address,impl IntoIterator<Item = BlockNumber>)> ,) -> ProviderResult<()> {
+        self.append_history_index::<_, tables::ValidatorsHistory>(validator_transitions,ShardedKey::new,)
+    }
+    fn unwind_validator(&self,range: RangeInclusive<BlockNumber>) -> ProviderResult<()> {
+        let changed_validators=self
+            .tx
+            .cursor_read::<tables::ValidatorChangeSets>()?
+            .walk_range(range.clone())?
+            .collect::<Result<Vec<_>,_>>()?;
+
+        self.unwind_validator_history_indices(changed_validators.iter())?;
+
+        self.remove_validator(range.clone())?;
+
+        Ok(())
+    }
+    fn unwind_validator_history_indices<'a>(&self, changesets: impl Iterator<Item = &'a (BlockNumber, ValidatorBeforeTx)>,) -> ProviderResult<usize> {
+        let mut last_indices = changesets
+            .into_iter()
+            .map(|(index, validator)| (validator.address, *index))
+            .collect::<Vec<_>>();
+        last_indices.sort_by_key(|(addr, _)| *addr);
+        
+        let mut cursor = self.tx.cursor_write::<tables::ValidatorsHistory>()?;
+        
+        for &(address, index) in &last_indices {
+            let partial_shard = unwind_history_shards::<_, tables::ValidatorsHistory, _>(
+                &mut cursor,
+                ShardedKey::last(address),
+                index,
+                |sharded_key| sharded_key.key == address,
+            )?;
+            if !partial_shard.is_empty() {
+                cursor.insert(
+                    ShardedKey::last(address),
+                    &BlockNumberList::new_pre_sorted(partial_shard),
+                )?;
+            }
+        }
+        Ok(last_indices.len())
+    }
+    fn write_validator_changes(&self, mut changes: ValidatorChangeset) -> ProviderResult<()> {
+        changes.validators.par_sort_by_key(|a|a.0);
+        let mut validators_cursor=self.tx_ref().cursor_write::<tables::PlainValidatorState>()?;
+        for (address,validator)in changes.validators{
+            if let Some(validator)=validator{
+                validators_cursor.upsert(address, (&validator).into())?;
+            }else if validators_cursor.seek_exact(address)?.is_some(){
+                validators_cursor.delete_current()?;
+            }
+        }
+        Ok(())
+    }
+    fn remove_validator(&self, range: RangeInclusive<BlockNumber>) -> ProviderResult<()> {
+        if range.is_empty() {
+            return Ok(());
+        }
+        let validator_changesets = self.take::<tables::ValidatorChangeSets>(range.clone())?;
+        let mut validator_cursor = self.tx.cursor_write::<tables::PlainValidatorState>()?;
+        let mut processed: HashSet<Address, RandomState> = HashSet::new();
+        for (block_number, ValidatorBeforeTx { address, info: old_validator }) in validator_changesets {
+            if !processed.insert(address) {
+                continue;
+            }
+            let existing_entry = validator_cursor.seek_exact(address)?;
+            match old_validator {
+                Some(validator) => {
+                    // add a new validator or update an existing one
+                    validator_cursor.upsert(address, &validator)?;
+                }
+                None => {
+                    if existing_entry.is_some() {
+                        // delete an existing validator
+                        validator_cursor.delete_current()?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    fn take_validator(&self, range: RangeInclusive<BlockNumber>) -> ProviderResult<ValidatorChangeset> {
+        todo!()
+    }
+}
 
 /// A [`DatabaseProvider`] that holds a read-only database transaction.
 pub type DatabaseProviderRO<DB, N> = DatabaseProvider<<DB as Database>::TX, N>;

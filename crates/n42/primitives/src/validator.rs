@@ -1,0 +1,25 @@
+#![allow(missing_docs)]
+use serde::{Deserialize, Serialize};
+use alloy_primitives::Address;
+use alloy_primitives::BlockNumber;
+#[derive(Serialize, Debug, Deserialize, Clone, PartialEq,Hash)]
+pub struct Validator {
+    pub index: u64,
+    pub balance: u64,
+    pub is_active: bool,
+    pub is_slashed: bool,
+    pub is_withdrawal_allowed: bool,
+}
+#[derive(Serialize, Debug, Deserialize,PartialEq)]
+pub struct  ValidatorBeforeTx{
+    pub address: Address,
+    pub info: Option<Validator>,
+}
+#[derive(Debug)]
+pub struct ValidatorChangeset{
+    pub validators: Vec<(Address,Option<Validator>)>,
+}
+#[derive(Debug)]
+pub struct ValidatorRevert{
+    pub validators: Vec<Vec<(Address, Option<Validator>)>>,
+}

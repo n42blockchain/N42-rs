@@ -111,3 +111,6 @@ pub use full::*;
 
 mod validator;
 pub use validator::*;
+
+mod beacon;
+pub use beacon::*;

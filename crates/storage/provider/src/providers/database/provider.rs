@@ -21,6 +21,7 @@ use crate::{
     WithdrawalsProvider,
 ValidatorChangeWriter, 
     ValidatorReader, 
+BeaconReader, BeaconWriter,
 };
 use alloy_consensus::{
     transaction::{SignerRecoverable, TransactionMeta},
@@ -63,7 +64,9 @@ use reth_storage_api::{
     StateProvider, StorageChangeSetReader, TryIntoHistoricalStateProvider,
     SnapshotProvider, SnapshotProviderWriter
 };
-use n42_primitives::{Snapshot, Validator,ValidatorBeforeTx,ValidatorChangeset,ValidatorRevert};
+use n42_primitives::{
+    BeaconBlock, BeaconState, BeaconStateChangeset, BeaconBlockChangeset,
+    Snapshot, Validator,ValidatorBeforeTx,ValidatorChangeset,ValidatorRevert};
 use reth_storage_errors::provider::{ProviderResult, RootMismatch};
 use reth_trie::{
     prefix_set::{PrefixSet, PrefixSetMut, TriePrefixSets},
@@ -82,6 +85,116 @@ use std::{
     sync::{mpsc, Arc},
 };
 use tracing::{debug, trace};
+
+impl<TX:DbTx,N:NodeTypes>BeaconReader for DatabaseProvider<TX,N>{
+    fn get_beaconstate_by_blockhash(&self,blockhash:BlockHash) -> ProviderResult<Option<BeaconState> > {
+        // let mut cursor=self.tx.cursor_read::<tables::BeaconStateRecord>()?;
+        // while let Some((bh,_))=cursor.next()?{
+        //     println!("bh: {:?}",bh);
+        // }
+        Ok(self.tx.get::<tables::BeaconStateRecord>(blockhash)?)
+    }
+    fn get_beaconblock_by_blockhash(&self,blockhash:BlockHash) -> ProviderResult<Option<BeaconBlock> > {
+        Ok(self.tx.get::<tables::BeaconBlockRecord>(blockhash)?)
+    }
+}
+
+impl<TX:DbTxMut+DbTx+'static,N:NodeTypes>BeaconWriter for DatabaseProvider<TX,N>{
+    fn unwind_beacon(&self,range:RangeInclusive<BlockNumber>) -> ProviderResult<()> {
+        if range.is_empty(){
+            return Ok(());
+        }
+
+        let mut cursor_r = self.tx.cursor_read::<tables::BeaconNum2Hash>()?;
+        let mut blockhashes: Vec<BlockHash> = Vec::new();
+        for blocknumber in range.clone(){
+            if let Some((_,blockhash))=cursor_r.seek_exact(blocknumber)?{
+                blockhashes.push(blockhash);
+            }
+        }
+
+        self.remove_beaconstate(blockhashes.clone())?;
+        self.remove_beaconblock(blockhashes.clone())?;
+
+        let mut cursor_w=self.tx.cursor_write::<tables::BeaconNum2Hash>()?;
+        for blocknumber in range{
+            if cursor_w.seek_exact(blocknumber)?.is_some(){
+                cursor_w.delete_current()?;
+            }
+        }
+
+        Ok(())
+    }
+    fn remove_beaconstate(&self, mut range: Vec<BlockHash>) -> ProviderResult<()> {
+        range.sort();
+        let mut cursor=self.tx.cursor_write::<tables::BeaconStateRecord>()?;
+        let mut range_iter=range.into_iter().peekable();
+        while let Some((bh,_))=cursor.next()?{
+            match range_iter.peek(){
+                Some(next_bh)=>{
+                    if bh==*next_bh{
+                        cursor.delete_current()?;
+                        range_iter.next();
+                    }else if bh<*next_bh{
+                        continue;
+                    }else{
+                        // impossible
+                        range_iter.next();
+                    }
+                }
+                None=>break,
+            }
+        }
+        Ok(())
+    }
+    fn write_beaconstate(&self,mut changes:BeaconStateChangeset) -> ProviderResult<()> {
+        let mut cursor=self.tx.cursor_write::<tables::BeaconStateRecord>()?;
+        for (blockhash,beaconstate) in changes.beaconstates{
+            cursor.insert(blockhash, &beaconstate)?;
+        }
+        Ok(())
+    }
+    // fn unwind_beaconblock(&self,range:RangeInclusive<BlockNumber>) -> ProviderResult<()> {
+    //     let mut cursor=self.tx.cursor_read::<tables::BeaconNum2Hash>()?;
+    //     let mut blockhashes:Vec<BlockHash>=Vec::new();
+    //     for blocknumber in range{
+    //         if let Some((_,blockhash))=cursor.seek_exact(blocknumber)?{
+    //             blockhashes.push(blockhash);
+    //         }
+    //     }
+    //     self.remove_beaconblock(blockhashes)?;
+    //     Ok(())
+    // }
+    fn remove_beaconblock(&self,mut range:Vec<BlockHash>) -> ProviderResult<()> {
+        range.sort();
+        let mut cursor=self.tx.cursor_write::<tables::BeaconBlockRecord>()?;
+        let mut range_iter=range.into_iter().peekable();
+        while let Some((bh,_))=cursor.next()?{
+            match range_iter.peek(){
+                Some(next_bh)=>{
+                    if bh==*next_bh{
+                        cursor.delete_current()?;
+                        range_iter.next();
+                    }else if bh<*next_bh{
+                        continue;
+                    }else{
+                        // impossible
+                        range_iter.next();
+                    }
+                }
+                None=>break,
+            }
+        }
+        Ok(())
+    }
+    fn write_beaconblock(&self,changes:BeaconBlockChangeset) -> ProviderResult<()> {
+        let mut cursor=self.tx.cursor_write::<tables::BeaconBlockRecord>()?;
+        for(blockhash, beaconblock)in changes.beaconblocks{
+            cursor.insert(blockhash, &beaconblock)?;
+        }
+        Ok(())
+    }
+}
 
 impl<TX: DbTx, N: NodeTypes> ValidatorReader for DatabaseProvider<TX, N> {
     fn basic_validator(&self,address:Address) -> ProviderResult<Option<Validator> > {

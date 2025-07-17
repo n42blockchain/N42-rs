@@ -2943,16 +2943,20 @@ dependencies = [
 name = "deposit_sdk"
 version = "1.4.3"
 dependencies = [
+ "clap",
+ "ethereum_serde_utils 0.7.0",
  "ethers",
  "ethers-signers",
- "eyre",
  "hex",
  "hex-literal 0.4.1",
  "keystore",
+ "n42-withdrawals",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "tree_hash 0.8.0",
+ "tree_hash_derive 0.9.1",
  "url",
 ]
 
@@ -12766,6 +12770,18 @@ name = "tree_hash_derive"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b0857056ca4eb5de8c417309be42bcff6017b47e86fbaddde609b4633f66061e"
+dependencies = [
+ "darling 0.20.11",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.101",
+]
+
+[[package]]
+name = "tree_hash_derive"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "699e7fb6b3fdfe0c809916f251cf5132d64966858601695c3736630a87e7166a"
 dependencies = [
  "darling 0.20.11",
  "proc-macro2",

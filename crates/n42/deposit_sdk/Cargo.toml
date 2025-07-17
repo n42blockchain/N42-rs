@@ -19,12 +19,15 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 hex = "0.4"
-eyre = "0.6" # 用于更好的错误处理
 thiserror = "1.0"
 url = "2.5.4"
-#n42-withdrawals = { workspace = true, default-features = false, features = ["supranational"] }
+n42-withdrawals = { workspace = true }
 keystore = { path = "../keystore" }
 hex-literal = "0.4"
+tree_hash = "0.8"
+tree_hash_derive = "0.9"
+ethereum_serde_utils = "0.7"
+clap = { version = "4.5.23", features = ["derive"] }
 
 
 [lints]

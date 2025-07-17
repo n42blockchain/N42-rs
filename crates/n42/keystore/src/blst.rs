@@ -13,6 +13,8 @@ use blst::BLST_ERROR as BlstError;
 use ssz::{Decode, Encode};
 use tree_hash::TreeHash;
 use serde_utils::hex::encode as hex_encode;
+pub const NONE_SIGNATURE: [u8; SIGNATURE_BYTES_LEN] = [0; SIGNATURE_BYTES_LEN];
+
 
 
 
@@ -147,7 +149,7 @@ impl<Pub> GenericPublicKeyBytes<Pub> {
 
     /// Returns `self.serialize()` as a `0x`-prefixed hex string.
     pub fn as_hex_string(&self) -> String {
-        format!("{:?}", self)
+        hex::encode(self.serialize())
     }
 
     /// Instantiates `Self` from bytes.
@@ -228,6 +230,37 @@ pub struct GenericSignatureBytes<Pub, Sig> {
     _phantom_signature: PhantomData<Sig>,
 }
 
+impl<Pub, Sig> GenericSignatureBytes<Pub, Sig> {
+    pub fn as_hex_string(&self) -> String {
+        hex::encode(self.serialize())
+    }
+    pub fn serialize(&self) -> [u8; 96] {
+        self.bytes
+    }
+}
+
+impl<Pub, Sig> GenericSignatureBytes<Pub, Sig> {
+    pub fn empty() -> Self {
+        Self {
+            bytes: [0; SIGNATURE_BYTES_LEN],
+            _phantom_signature: PhantomData,
+            _phantom_public_key: PhantomData,
+        }
+    }
+}
+impl<Pub, Sig> From<GenericSignature<Pub, Sig>> for GenericSignatureBytes<Pub, Sig>
+where
+    Pub: TPublicKey,
+    Sig: TSignature<Pub>,
+{
+    fn from(sig: GenericSignature<Pub, Sig>) -> Self {
+        Self {
+            bytes: sig.serialize(),
+            _phantom_signature: PhantomData,
+            _phantom_public_key: PhantomData,
+        }
+    }
+}
 
 impl<Pub, Sig> PartialEq for GenericSignatureBytes<Pub, Sig> {
     fn eq(&self, other: &Self) -> bool {
@@ -285,6 +318,27 @@ pub struct GenericSignature<Pub, Sig> {
     /// True if this point is equal to the `INFINITY_SIGNATURE`.
     pub(crate) is_infinity: bool,
     _phantom: PhantomData<Pub>,
+}
+impl<Pub, Sig> GenericSignature<Pub, Sig>
+where
+    Sig: TSignature<Pub>,
+{
+    /// Serialize `self` as compressed bytes.
+    pub fn serialize(&self) -> [u8; SIGNATURE_BYTES_LEN] {
+        if let Some(point) = &self.point {
+            point.serialize()
+        } else {
+            NONE_SIGNATURE
+        }
+    }
+
+    pub fn from_point(point: Sig, is_infinity: bool) -> Self {
+        Self {
+            point: Some(point),
+            is_infinity,
+            _phantom: PhantomData,
+        }
+    }
 }
 
 /// A simple wrapper around `PublicKey` and `GenericSecretKey`.
@@ -441,6 +495,11 @@ where
         }
     }
 
+    pub fn sign(&self, msg: Hash256) -> GenericSignature<Pub, Sig> {
+        let is_infinity = false;
+        GenericSignature::from_point(self.point.sign(msg), is_infinity)
+    }
+
     pub fn public_key(&self) -> GenericPublicKey<Pub> {
         GenericPublicKey::from_point(self.point.public_key())
     }
@@ -478,6 +537,8 @@ pub trait TSecretKey<SignaturePoint, PublicKeyPoint>: Sized {
     fn serialize(&self) -> ZeroizeHash;
     fn deserialize(bytes: &[u8]) -> Result<Self, Error>;
     fn public_key(&self) -> PublicKeyPoint;
+    fn sign(&self, msg: Hash256) -> SignaturePoint;
+
 }
 pub trait TSignature<GenericPublicKey>: Sized + Clone {
     fn serialize(&self) -> [u8; SIGNATURE_BYTES_LEN];
@@ -562,12 +623,15 @@ impl TSecretKey<blst_core::Signature, blst_core::PublicKey> for blst_core::Secre
         self.sk_to_pk()
     }
 
-
     fn serialize(&self) -> ZeroizeHash {
         self.to_bytes().into()
     }
 
     fn deserialize(bytes: &[u8]) -> Result<Self, Error> {
         Self::from_bytes(bytes).map_err(Into::into)
+    }
+
+    fn sign(&self, msg: Hash256) -> blst_core::Signature {
+        self.sign(msg.as_slice(), DST, &[])
     }
 }

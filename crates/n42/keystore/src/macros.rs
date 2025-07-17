@@ -21,7 +21,8 @@ macro_rules! impl_tree_hash {
             // unnecessary copying and allocation (one Vec per byte)
             let values_per_chunk = tree_hash::BYTES_PER_CHUNK;
             let minimum_chunk_count = $byte_size.div_ceil(values_per_chunk);
-            tree_hash::merkle_root(&self.as_ssz_bytes(), minimum_chunk_count)
+            // tree_hash::merkle_root(&self.as_ssz_bytes(), minimum_chunk_count)
+            tree_hash::merkle_root(&self.serialize(), minimum_chunk_count)
         }
     };
 }
@@ -82,7 +83,8 @@ macro_rules! impl_ssz_decode {
 macro_rules! impl_display {
     () => {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "{}", hex_encode(&self.as_ssz_bytes().to_vec()))
+            // write!(f, "{}", hex_encode(&self.as_ssz_bytes().to_vec()))
+            write!(f, "{}", hex_encode(self.serialize().to_vec()))
         }
     };
 }
@@ -157,7 +159,8 @@ macro_rules! impl_serde_deserialize {
 macro_rules! impl_debug {
     () => {
         fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            write!(f, "{}", hex_encode(&self.as_ssz_bytes().to_vec()))
+            // write!(f, "{}", hex_encode(&self.as_ssz_bytes().to_vec()))
+            write!(f, "{}", hex_encode(&self.serialize().to_vec()))
         }
     };
 }

@@ -17,10 +17,14 @@ use thiserror::Error;
 use ethers::middleware::SignerMiddleware;
 use ethers::utils::WEI_IN_ETHER;
 use ethers_signers::{LocalWallet, WalletError};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use crate::DepositContract;
-use keystore::blst::{PublicKeyBytes, SignatureBytes};
+use keystore::blst::{PublicKeyBytes, SecretKey, SignatureBytes};
 use keystore::Hash256;
+use n42_withdrawals::withdrawal::SignedRoot;
+use tree_hash_derive::TreeHash;
+use n42_withdrawals::chain_spec::ChainSpec;
+
 
 // 读取指定的质押abi文件，创建一个叫DepositContract的rust模块，DepositContract::new(address, client) 来实例化它
 abigen
@@ -63,15 +67,46 @@ impl From<ContractError<SignerMiddleware<Provider<Http>, LocalWallet>>> for SdkE
 }
 
 // 序列化时字段名对应到json字段名
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, TreeHash)]
 pub struct DepositData {
     pub pubkey: PublicKeyBytes,
     #[serde(rename = "withdrawal_credentials")]
     pub withdrawal_credentials: Hash256,
     pub signature: SignatureBytes,
     #[serde(rename = "deposit_data_root")]
-    pub deposit_data_root: Hash256,
+    // pub deposit_data_root: Hash256,
+    pub amount: u64,
 }
+impl DepositData {
+    pub fn as_deposit_message(&self) -> DepositMessage {
+        DepositMessage {
+            pubkey: self.pubkey,
+            withdrawal_credentials: self.withdrawal_credentials,
+            amount: self.amount,
+        }
+    }
+
+    /// Generate the signature for a given DepositData details.
+    pub fn create_signature(&self, secret_key: &SecretKey, spec: &ChainSpec) -> SignatureBytes {
+        // println!("create_signature");
+        let domain = spec.get_deposit_domain();
+        // println!("domain: 0x{}", hex::encode(domain));
+        let msg = self.as_deposit_message().signing_root(domain);
+        // println!("signing_root: 0x{}", hex::encode(msg));
+        SignatureBytes::from(secret_key.sign(msg))
+    }
+}
+
+#[derive(TreeHash, Serialize, Deserialize,)]
+pub struct DepositMessage {
+    pub pubkey: PublicKeyBytes,
+    pub withdrawal_credentials: Hash256,
+    #[serde(with = "serde_utils::quoted_u64")]
+    pub amount: u64,
+}
+impl SignedRoot for DepositMessage {}
+
+
 
 pub struct EthStakingSdk {
     client: Arc<SignerMiddleware<Provider<Http>, LocalWallet>>,

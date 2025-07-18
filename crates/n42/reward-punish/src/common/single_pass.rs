@@ -241,7 +241,7 @@ pub fn process_epoch_single_pass<E: EthSpec>(
             0
         };
         let base_reward = base_reward_m.safe_mul(spec.base_reward_factor)?
-                                                    .safe_div(total_active_balance.integer_sqrt())?
+                                                    .safe_div(total_effective_balance.integer_sqrt())?
                                                     .safe_div(spec.base_rewards_per_epoch)?;
 
         let validator_info = &ValidatorInfo {
@@ -377,12 +377,14 @@ fn process_single_reward_and_penalty(
         state_ctxt: &StateContext,
         spec: &Spec,
     ) -> Result<(), Error> {
+
         // if !validator_info.is_unslashed_participating_index(TIMELY_TARGET_FLAG_INDEX)? {
 
             if *inactivity_score > spec.min_inactivity_epoch {
                 let base_reward = validator_info.base_reward;
-                let pealty_for_reawrd = base_reward.safe_mul(spec.min_big_epochs_to_inactivity_penalty)?;
-
+                let pealty_for_reawrd = base_reward
+                                        .safe_mul(spec.multiple_reward_for_inactivity_penalty)?;
+                delta.penalize(pealty_for_reawrd)?;
 
                 // let penalty_numerator = validator_info
                 //     .effective_balance;
@@ -427,9 +429,13 @@ fn process_single_inactivity_update(
         }
         inactivity_score.make_mut()?.safe_sub_assign(spec.inactivity_score_recovery_rate)?;
     } else {
-        inactivity_score
-            .make_mut()?
-            .safe_add_assign(spec.inactivity_score_bias)?;
+
+        if **inactivity_score < spec.max_inactivity_score {
+            inactivity_score
+                .make_mut()?
+                .safe_add_assign(spec.inactivity_score_bias)?;
+        }else { *inactivity_score.make_mut()? = spec.max_inactivity_score; }
+
     }
 
 

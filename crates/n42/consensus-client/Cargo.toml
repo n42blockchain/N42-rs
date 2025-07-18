@@ -52,6 +52,7 @@ tokio-stream.workspace = true
 futures-util.workspace = true
 
 # misc
+integer-sqrt.workspace = true
 thiserror.workspace = true
 alloy-rlp.workspace = true
 serde.workspace = true

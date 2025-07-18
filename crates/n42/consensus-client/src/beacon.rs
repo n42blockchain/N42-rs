@@ -11,6 +11,7 @@ use alloy_rlp::{Encodable, Decodable, RlpEncodable,  RlpDecodable};
 use std::collections::{HashMap, BTreeMap};
 use alloy_primitives::{keccak256, BlockHash, B256, Log};
 use n42_primitives::{Epoch, VoluntaryExit, VoluntaryExitWithSig};
+use integer_sqrt::IntegerSquareRoot;
 use crate::storage::{Storage};
 use crate::safe_aitrh::SafeArith;
 use crate::safe_aitrh::SafeArithIter;
@@ -27,6 +28,7 @@ const SLOTS_PER_EPOCH: u64 = 32;
 const max_withdrawals_per_payload: usize = 16;
 const pending_partial_withdrawals_limit: usize = 16; // ?
 const MaxDeposits: u64 = 16;
+const genesis_epoch : u64 = 0;
 
 // chain_spec
 const max_pending_partials_per_withdrawals_sweep: u64 = 16; // ?
@@ -43,6 +45,11 @@ const max_per_epoch_activation_exit_churn_limit:u64 = 256000000000;
 const min_per_epoch_churn_limit_electra:u64 = 128000000000;
 const churn_limit_quotient:u64 = 32;
 const effective_balance_increment:u64 = 1000000000;
+const base_rewards_per_epoch:u64 = 2;
+const base_reward_factor:u64 = 1/2;
+const min_epochs_to_inactivity_penalty :u64 = 4;
+const inactivity_penalty_quotient:u64 = 67108864; //?
+const proposer_reward_quotient:u64 = 4;
 
 const min_validator_withdrawability_delay: u64 = 1;
 
@@ -411,13 +418,13 @@ impl BeaconState {
         Ok(new_beacon_state)
     }
 
-    pub fn process_epoch(&self) -> eyre::Result<()> {
-        self.process_rewards_and_penalties()?;
+    pub fn process_epoch(&mut self) -> eyre::Result<()> {
+        let validator_statuses = ValidatorStatuses {
+            statuses: Vec::new(),
+            total_balances: TotalBalances::new(),
+        };
+        self.process_rewards_and_penalties(&validator_statuses)?;
         self.process_registry_updates()?;
-        Ok(())
-    }
-
-    pub fn process_rewards_and_penalties(&self) -> eyre::Result<()> {
         Ok(())
     }
 
@@ -1264,6 +1271,139 @@ pub fn apply_deposit(
         Ok(index)
     }
 
+    /// Apply attester and proposer rewards.
+    pub fn process_rewards_and_penalties(
+        self: &mut Self,
+        validator_statuses: &ValidatorStatuses,
+        //spec: &Spec,
+    ) -> eyre::Result<()> {
+        if self.current_epoch() == genesis_epoch {
+            return Ok(());
+        }
+
+        // Guard against an out-of-bounds during the validator balance update.
+        if validator_statuses.statuses.len() != self.balances.len()
+            || validator_statuses.statuses.len() != self.validators.len()
+        {
+            return Err(eyre::eyre!("ValidatorStatusesInconsistent"));
+        }
+
+        let deltas = self.get_attestation_deltas_all(
+            validator_statuses,
+            ProposerRewardCalculation::Include,
+        )?;
+
+        // Apply the deltas, erroring on overflow above but not on overflow below (saturating at 0
+        // instead).
+        for (i, delta) in deltas.into_iter().enumerate() {
+            let combined_delta = delta.flatten()?;
+            increase_balance(self, i, combined_delta.rewards)?;
+            decrease_balance(self, i, combined_delta.penalties)?;
+        }
+
+        Ok(())
+    }
+
+    /// Apply rewards for participation in attestations during the previous epoch.
+    pub fn get_attestation_deltas_all(
+        self: &Self,
+        validator_statuses: &ValidatorStatuses,
+        proposer_reward: ProposerRewardCalculation,
+        //spec: &Spec,
+    ) -> eyre::Result<Vec<AttestationDelta>> {
+        self.get_attestation_deltas(validator_statuses, proposer_reward)
+    }
+
+    /// Apply rewards for participation in attestations during the previous epoch.
+    /// If `maybe_validators_subset` specified, only the deltas for the specified validator subset is
+    /// returned, otherwise deltas for all validators are returned.
+    ///
+    /// Returns a vec of validator indices to `AttestationDelta`.
+    fn get_attestation_deltas(
+        self: &Self,
+        validator_statuses: &ValidatorStatuses,
+        proposer_reward: ProposerRewardCalculation,
+        // maybe_validators_subset: Option<&Vec<usize>>,
+        //spec: &Spec,
+    ) -> eyre::Result<Vec<AttestationDelta>> {
+        /*
+        let finality_delay = state
+            .previous_epoch()
+            .safe_sub(state.finalized_checkpoint().epoch)?
+            .as_u64();
+        */
+        let finality_delay = 0;
+
+        let mut deltas = vec![AttestationDelta::default(); self.validators.len()];
+
+        let total_balances = &validator_statuses.total_balances;
+        let sqrt_total_active_balance = SqrtTotalActiveBalance::new(total_balances.current_epoch());
+
+        // // Ignore validator if a subset is specified and validator is not in the subset
+        // let include_validator_delta = |idx| match maybe_validators_subset.as_ref() {
+        //     None => true,
+        //     Some(validators_subset) if validators_subset.contains(&idx) => true,
+        //     Some(_) => false,
+        // };
+
+        for (index, validator) in validator_statuses.statuses.iter().enumerate() {
+            // Ignore ineligible validators. All sub-functions of the spec do this except for
+            // `get_inclusion_delay_deltas`. It's safe to do so here because any validator that is in
+            // the unslashed indices of the matching source attestations is active, and therefore
+            // eligible.
+            if !validator.is_eligible {
+                continue;
+            }
+
+            let base_reward = get_base_reward(
+                validator.current_epoch_effective_balance,
+                sqrt_total_active_balance,
+            )?;
+
+            
+
+            // let (inclusion_delay_delta, proposer_delta) =
+            //     get_inclusion_delay_delta(validator, base_reward, spec)?;
+
+            // if include_validator_delta(index) {
+                let all_delta =
+                    get_all_delta(validator, base_reward, total_balances, finality_delay)?;
+                // let target_delta =
+                //     get_target_delta(validator, base_reward, total_balances, finality_delay, spec)?;
+                // let head_delta =
+                //     get_head_delta(validator, base_reward, total_balances, finality_delay, spec)?;
+                let inactivity_penalty_delta =
+                    get_inactivity_penalty_delta(validator, base_reward, finality_delay)?;
+
+                let delta = deltas
+                    .get_mut(index)
+                    //.ok_or(Error::DeltaOutOfBounds(index))?;
+                    .ok_or(eyre::eyre!(format!("DeltaOutOfBounds, {index}")))?;
+                delta.all_delta.combine(all_delta)?;
+                // delta.target_delta.combine(target_delta)?;
+                // delta.head_delta.combine(head_delta)?;
+                // delta.inclusion_delay_delta.combine(inclusion_delay_delta)?;
+                delta
+                    .inactivity_penalty_delta
+                    .combine(inactivity_penalty_delta)?;
+            // }
+
+            // if let ProposerRewardCalculation::Include = proposer_reward {
+            //     if let Some((proposer_index, proposer_delta)) = proposer_delta {
+            //         if include_validator_delta(proposer_index) {
+            //             deltas
+            //                 .get_mut(proposer_index)
+            //                 .ok_or(Error::ValidatorStatusesInconsistent)?
+            //                 .inclusion_delay_delta
+            //                 .combine(proposer_delta)?;
+            //         }
+            //     }
+            // }
+        }
+
+        Ok(deltas)
+    }
+
 }
 
 #[derive(Debug, Clone, Hash, Default, PartialEq, RlpEncodable, RlpDecodable,  Serialize, Deserialize)]
@@ -1350,3 +1490,325 @@ pub struct Eth1Data {
     pub block_hash: B256,
 }
 
+pub struct ValidatorStatuses {
+    /// Information about each individual validator from the state's validator registry.
+    pub statuses: Vec<ValidatorStatus>,
+    /// Summed balances for various sets of validators.
+    pub total_balances: TotalBalances,
+}
+
+
+#[derive(Debug)]
+pub enum ProposerRewardCalculation {
+    Include,
+    Exclude,
+}
+
+/// Combination of several deltas for different components of an attestation reward.
+///
+/// Exists only for compatibility with EF rewards tests.
+#[derive(Default, Clone)]
+pub struct AttestationDelta {
+    // pub source_delta: Delta,
+    // pub target_delta: Delta,
+    // pub head_delta: Delta,
+    // pub inclusion_delay_delta: Delta,
+    pub all_delta: Delta,
+    pub inactivity_penalty_delta: Delta,
+}
+
+impl AttestationDelta {
+    /// Flatten into a single delta.
+    pub fn flatten(self) -> eyre::Result<Delta> {
+        let AttestationDelta {
+            // source_delta,
+            // target_delta,
+            // head_delta,
+            // inclusion_delay_delta,
+            all_delta,
+            inactivity_penalty_delta,
+        } = self;
+        let mut result = Delta::default();
+        for delta in [
+            // source_delta,
+            // target_delta,
+            // head_delta,
+            // inclusion_delay_delta,
+            all_delta,
+            inactivity_penalty_delta,
+        ] {
+            result.combine(delta)?;
+        }
+        Ok(result)
+    }
+}
+
+/// Used to track the changes to a validator's balance.
+#[derive(Default, Clone)]
+pub struct Delta {
+    pub rewards: u64,
+    pub penalties: u64,
+}
+
+impl Delta {
+    /// Reward the validator with the `reward`.
+    pub fn reward(&mut self, reward: u64) -> eyre::Result<()> {
+        self.rewards = self.rewards.safe_add(reward)?;
+        Ok(())
+    }
+
+    /// Penalize the validator with the `penalty`.
+    pub fn penalize(&mut self, penalty: u64) -> eyre::Result<()> {
+        self.penalties = self.penalties.safe_add(penalty)?;
+        Ok(())
+    }
+
+    /// Combine two deltas.
+    pub fn combine(&mut self, other: Delta) -> eyre::Result<()> {
+        self.reward(other.rewards)?;
+        self.penalize(other.penalties)
+    }
+}
+
+#[derive(Copy, Clone)]
+pub struct SqrtTotalActiveBalance(u64);
+
+impl SqrtTotalActiveBalance {
+    pub fn new(total_active_balance: u64) -> Self {
+        Self(total_active_balance.integer_sqrt())
+    }
+
+    pub fn as_u64(&self) -> u64 {
+        self.0
+    }
+}
+
+/// Returns the base reward for some validator.
+pub fn get_base_reward(
+    validator_effective_balance: u64,
+    sqrt_total_active_balance: SqrtTotalActiveBalance,
+) -> eyre::Result<u64> {
+    Ok(validator_effective_balance
+        .safe_mul(base_reward_factor)?
+        .safe_div(sqrt_total_active_balance.as_u64())?
+        .safe_div(base_rewards_per_epoch)?)
+}
+
+fn get_all_delta(
+    validator: &ValidatorStatus,
+    base_reward: u64,
+    total_balances: &TotalBalances,
+    finality_delay: u64,
+) -> eyre::Result<Delta> {
+    get_attestation_component_delta(
+        validator.is_previous_epoch_attester && !validator.is_slashed,
+        total_balances.previous_epoch_attesters(),
+        total_balances,
+        base_reward,
+        finality_delay,
+        //spec,
+    )
+}
+
+pub fn get_inactivity_penalty_delta(
+    validator: &ValidatorStatus,
+    base_reward: u64,
+    finality_delay: u64,
+    //spec: &Spec,
+) -> eyre::Result<Delta> {
+    let mut delta = Delta::default();
+
+    // Inactivity penalty
+    if finality_delay > min_epochs_to_inactivity_penalty {
+        // If validator is performing optimally this cancels all rewards for a neutral balance
+        delta.penalize(
+            base_rewards_per_epoch
+                .safe_mul(base_reward)?
+                .safe_sub(get_proposer_reward(base_reward)?)?,
+        )?;
+
+        // Additionally, all validators whose FFG target didn't match are penalized extra
+        // This condition is equivalent to this condition from the spec:
+        // `index not in get_unslashed_attesting_indices(state, matching_target_attestations)`
+        if validator.is_slashed || !validator.is_previous_epoch_attester {
+            delta.penalize(
+                validator
+                    .current_epoch_effective_balance
+                    .safe_mul(finality_delay)?
+                    .safe_div(inactivity_penalty_quotient)?,
+            )?;
+        }
+    }
+
+    Ok(delta)
+}
+
+/// Sets the boolean `var` on `self` to be true if it is true on `other`. Otherwise leaves `self`
+/// as is.
+macro_rules! set_self_if_other_is_true {
+    ($self_: ident, $other: ident, $var: ident) => {
+        if $other.$var {
+            $self_.$var = true;
+        }
+    };
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct ValidatorStatus {
+    /// True if the validator has been slashed, ever.
+    pub is_slashed: bool,
+    /// True if the validator is eligible.
+    pub is_eligible: bool,
+    // /// True if the validator can withdraw in the current epoch.
+    // pub is_withdrawable_in_current_epoch: bool,
+    /// True if the validator was active in the state's _current_ epoch.
+    pub is_active_in_current_epoch: bool,
+    /// True if the validator was active in the state's _previous_ epoch.
+    pub is_active_in_previous_epoch: bool,
+    /// The validator's effective balance in the _current_ epoch.
+    pub current_epoch_effective_balance: u64,
+
+    /// True if the validator had an attestation included in the _current_ epoch.
+    pub is_current_epoch_attester: bool,
+    // /// True if the validator's beacon block root attestation for the first slot of the _current_
+    // /// epoch matches the block root known to the state.
+    // pub is_current_epoch_target_attester: bool,
+    /// True if the validator had an attestation included in the _previous_ epoch.
+    pub is_previous_epoch_attester: bool,
+    // /// True if the validator's beacon block root attestation for the first slot of the _previous_
+    // /// epoch matches the block root known to the state.
+    // pub is_previous_epoch_target_attester: bool,
+    // /// True if the validator's beacon block root attestation in the _previous_ epoch at the
+    // /// attestation's slot (`attestation_data.slot`) matches the block root known to the state.
+    // pub is_previous_epoch_head_attester: bool,
+
+    // Information used to reward the block producer of this validators earliest-included
+    // attestation.
+    // pub inclusion_info: Option<InclusionInfo>,
+    /// True if the validator can withdraw in the current epoch.
+    pub is_withdrawable_in_current_epoch: bool,
+}
+
+impl ValidatorStatus {
+    /// Accepts some `other` `ValidatorStatus` and updates `self` if required.
+    ///
+    /// Will never set one of the `bool` fields to `false`, it will only set it to `true` if other
+    /// contains a `true` field.
+    ///
+    /// Note: does not update the winning root info, this is done manually.
+    pub fn update(&mut self, other: &Self) {
+        // Update all the bool fields, only updating `self` if `other` is true (never setting
+        // `self` to false).
+        set_self_if_other_is_true!(self, other, is_slashed);
+        set_self_if_other_is_true!(self, other, is_eligible);
+        // set_self_if_other_is_true!(self, other, is_withdrawable_in_current_epoch);
+        set_self_if_other_is_true!(self, other, is_active_in_current_epoch);
+        set_self_if_other_is_true!(self, other, is_active_in_previous_epoch);
+        set_self_if_other_is_true!(self, other, is_current_epoch_attester);
+        // set_self_if_other_is_true!(self, other, is_current_epoch_target_attester);
+        set_self_if_other_is_true!(self, other, is_previous_epoch_attester);
+        // set_self_if_other_is_true!(self, other, is_previous_epoch_target_attester);
+        // set_self_if_other_is_true!(self, other, is_previous_epoch_head_attester);
+
+        // if let Some(other_info) = other.inclusion_info {
+        //     if let Some(self_info) = self.inclusion_info.as_mut() {
+        //         self_info.update(&other_info);
+        //     } else {
+        //         self.inclusion_info = other.inclusion_info;
+        //     }
+        // }
+    }
+}
+
+pub struct TotalBalances {
+    /// The effective balance increment from the spec.
+    effective_balance_increment: u64,
+    /// The total effective balance of all active validators during the _current_ epoch.
+    current_epoch: u64,
+    /// The total effective balance of all active validators during the _previous_ epoch.
+    previous_epoch: u64,
+    /// The total effective balance of all validators who attested during the _current_ epoch.
+    current_epoch_attesters: u64,
+    // / The total effective balance of all validators who attested during the _current_ epoch and
+    // / agreed with the state about the beacon block at the first slot of the _current_ epoch.
+    // current_epoch_target_attesters: u64,
+    /// The total effective balance of all validators who attested during the _previous_ epoch.
+    previous_epoch_attesters: u64,
+    // / The total effective balance of all validators who attested during the _previous_ epoch and
+    // / agreed with the state about the beacon block at the first slot of the _previous_ epoch.
+    // previous_epoch_target_attesters: u64,
+    // / The total effective balance of all validators who attested during the _previous_ epoch and
+    // / agreed with the state about the beacon block at the time of attestation.
+    // previous_epoch_head_attesters: u64,
+}
+
+// Generate a safe accessor for a balance in `TotalBalances`, as per spec `get_total_balance`.
+macro_rules! balance_accessor {
+    ($field_name:ident) => {
+        pub fn $field_name(&self) -> u64 {
+            std::cmp::max(self.effective_balance_increment, self.$field_name)
+        }
+    };
+}
+
+impl TotalBalances {
+    pub fn new() -> Self {
+        Self {
+            effective_balance_increment: effective_balance_increment,
+            current_epoch: 0,
+            previous_epoch: 0,
+            current_epoch_attesters: 0,
+            // current_epoch_target_attesters: 0,
+            previous_epoch_attesters: 0,
+            // previous_epoch_target_attesters: 0,
+            // previous_epoch_head_attesters: 0,
+        }
+    }
+
+    balance_accessor!(current_epoch);
+    balance_accessor!(previous_epoch);
+    // balance_accessor!(current_epoch_attesters);
+    // balance_accessor!(current_epoch_target_attesters);
+    balance_accessor!(previous_epoch_attesters);
+    // balance_accessor!(previous_epoch_target_attesters);
+    // balance_accessor!(previous_epoch_head_attesters);
+}
+
+pub fn get_attestation_component_delta(
+    index_in_unslashed_attesting_indices: bool,
+    attesting_balance: u64,
+    total_balances: &TotalBalances,
+    base_reward: u64,
+    finality_delay: u64,
+    //spec: &Spec,
+) -> eyre::Result<Delta> {
+    let mut delta = Delta::default();
+
+    let total_balance = total_balances.current_epoch();
+
+    if index_in_unslashed_attesting_indices {
+        if finality_delay > min_epochs_to_inactivity_penalty {
+            // Since full base reward will be canceled out by inactivity penalty deltas,
+            // optimal participation receives full base reward compensation here.
+            delta.reward(base_reward)?;
+        } else {
+            let reward_numerator = base_reward
+                .safe_mul(attesting_balance.safe_div(effective_balance_increment)?)?;
+            delta.reward(
+                reward_numerator
+                    .safe_div(total_balance.safe_div(effective_balance_increment)?)?,
+            )?;
+        }
+    } else {
+        delta.penalize(base_reward)?;
+    }
+
+    Ok(delta)
+}
+
+/// Compute the reward awarded to a proposer for including an attestation from a validator.
+///
+/// The `base_reward` param should be the `base_reward` of the attesting validator.
+fn get_proposer_reward(base_reward: u64) -> eyre::Result<u64> {
+    Ok(base_reward.safe_div(proposer_reward_quotient)?)
+}

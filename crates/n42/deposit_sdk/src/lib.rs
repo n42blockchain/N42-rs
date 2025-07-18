@@ -15,6 +15,7 @@ use url::ParseError;
 use hex::FromHexError;
 use thiserror::Error;
 use ethers::middleware::SignerMiddleware;
+use ethers::types::transaction::eip2718::TypedTransaction;
 use ethers::utils::WEI_IN_ETHER;
 use ethers_signers::{LocalWallet, WalletError};
 use serde::{Deserialize, Serialize};
@@ -26,6 +27,7 @@ use tree_hash_derive::TreeHash;
 use n42_withdrawals::chain_spec::ChainSpec;
 
 
+
 // 读取指定的质押abi文件，创建一个叫DepositContract的rust模块，DepositContract::new(address, client) 来实例化它
 abigen!(
     DepositContract,
@@ -34,18 +36,14 @@ abigen!(
 );
 
 abigen!(
-    Eip7002Contract,
-    "src/eip7002_contract.json",
+    ExitContract,
+    "src/exit_contract.json",
 );
 
 /// 质押合约地址 公司的
 pub const DEPOSIT_CONTRACT_ADDRESS: &str = "0x29a625941FA7B43be23b4309CD76e4d1BE688429";
 /// 退出合约地址 公司的
-pub const EIP7002_CONTRACT_ADDRESS: &str = "0xEFf1e899B6460dC7aBca481798C52638993595D6";
-// /// 质押合约地址 eth的
-// pub const DEPOSIT_CONTRACT_ADDRESS: &str = "0x00000000219ab540356cbb839cbe05303d7705fa";
-// /// 退出合约地址 eth的
-// pub const EIP7002_CONTRACT_ADDRESS: &str = "0x00000961Ef480Eb55e80D19ad83579A64c007002";
+pub const EIP7002_CONTRACT_ADDRESS: &str = "0x00000961Ef480Eb55e80D19ad83579A64c007002";
 
 #[derive(Debug, Error)]
 pub enum SdkError {
@@ -123,7 +121,7 @@ impl SignedRoot for DepositMessage {}
 pub struct EthStakingSdk {
     client: Arc<SignerMiddleware<Provider<Http>, LocalWallet>>,
     deposit_contract: DepositContract<SignerMiddleware<Provider<Http>, LocalWallet>>,
-    exit_contract: Eip7002Contract<SignerMiddleware<Provider<Http>, LocalWallet>>,
+    exit_contract: ExitContract<SignerMiddleware<Provider<Http>, LocalWallet>>,
 }
 
 impl EthStakingSdk {
@@ -151,11 +149,10 @@ impl EthStakingSdk {
             .map_err(|e| SdkError::Config(format!("存款合约地址解析失败: {}", e)))?;
         let deposit_contract = DepositContract::new(deposit_address, client.clone());
 
-        // 解析退出合约
+        // 退出合约
         let exit_address = Address::from_str(EIP7002_CONTRACT_ADDRESS)
-            .map_err(|e| SdkError::Config(format!("EIP-7002 合约地址解析失败: {}", e)))?;
-        let exit_contract = Eip7002Contract::new(exit_address, client.clone());
-
+            .map_err(|e| SdkError::Config(format!("退出合约地址解析失败: {}", e)))?;
+        let exit_contract = ExitContract::new(exit_address, client.clone());
 
         Ok(Self { client, deposit_contract, exit_contract})
     }
@@ -194,29 +191,75 @@ impl EthStakingSdk {
             .ok_or(SdkError::TransactionDropped)?;
         Ok(receipt)
     }
+
+    /// 手动发起一次空的 eth_call 来获取当前 fee
+    pub async fn get_exit_fee(&self) -> Result<U256, SdkError> {
+        // 构造一个 to=exit_contract.address(), data = empty
+        let tx_req = TransactionRequest {
+            to: Some(self.exit_contract.address().into()),
+            data: Some(Bytes::new()),
+            ..Default::default()
+        };
+
+        // 将 TransactionRequest 转成 TypedTransaction
+        let typed: TypedTransaction = tx_req.into();
+
+        // 发 eth_call
+        let raw = self
+            .client
+            .provider()
+            .call(&typed, None)  // 现在传入 &TypedTransaction
+            .await
+            .map_err(|e| SdkError::Contract(format!("fee call revert: {}", e)))?;
+
+        // 解析为 U256（BigEndian）
+        Ok(U256::from_big_endian(&raw.0))
+    }
+
+    /// 先查询费用，再提交请求
     pub async fn request_exit(
         &self,
         validator_pubkey_hex: &str,
     ) -> Result<TransactionReceipt, SdkError> {
-        println!("🚀 正在为验证者 {}... 发起退出请求", &validator_pubkey_hex[..10]);
+        println!("🚀 开始为验证者 {}... 发起退出流程", &validator_pubkey_hex[..10]);
 
-        // 1. 将公钥的十六进制字符串转换为 48 字节数组
+        println!("   1. 查询当前退出请求费用...");
+        let fee = self.get_exit_fee().await?;
+        println!("   ✅ 当前费用为: {} wei", fee);
+
+        println!("   2. 准备并发送退出交易...");
+
         let pubkey_bytes: [u8; 48] = hex::decode(validator_pubkey_hex)?
             .try_into()
             .map_err(|_| SdkError::Config("validator_pubkey 必须是 48 字节".into()))?;
 
-        // 2. 构建合约调用
-        let call = self.exit_contract.withdraw_validator(pubkey_bytes);
+        let mut data = Vec::with_capacity(56);
+        data.extend_from_slice(&pubkey_bytes);
+        data.extend_from_slice(&u64::MAX.to_be_bytes());
 
-        // 发送交易
-        let pending_tx = call.send().await?;
-        println!("交易已发送，等待确认... Tx Hash: {:?}", pending_tx.tx_hash());
+        // 2.3 构造并发送交易
+        let tx = TransactionRequest {
+            to: Some(self.exit_contract.address().into()),
+            data: Some(Bytes::from(data)),
+            value: Some(fee),
+            ..Default::default()
+        };
+
+        let pending_tx = self
+            .client
+            .send_transaction(tx, None)
+            .await
+            .map_err(|e| SdkError::Contract(format!("发送退出交易失败: {}", e)))?;
+        println!("   交易已发送，等待确认... Tx Hash: {:?}", pending_tx.tx_hash());
 
         let receipt = pending_tx
-            .await?
+            .await
+            .map_err(|e| SdkError::Contract(format!("等待交易确认失败: {}", e)))?
             .ok_or(SdkError::TransactionDropped)?;
-
-        println!("✅ 退出请求已成功上链！Block: {}", receipt.block_number.unwrap_or_default());
+        println!(
+            "   ✅ 退出请求已成功上链！Block: {}",
+            receipt.block_number.unwrap_or_default()
+        );
 
         Ok(receipt)
     }

@@ -9,7 +9,7 @@ repository.workspace = true
 exclude.workspace = true
 
 [dependencies]
-bls={path="/Users/root1/Desktop/starlink/lighthouse/crypto/bls"}
+# bls = { git = "https://github.com/sigp/lighthouse", package = "bls", version = "0.2.0" }
 keystore = { path = "../keystore" }
 n42-withdrawals.workspace=true
 rand.workspace=true

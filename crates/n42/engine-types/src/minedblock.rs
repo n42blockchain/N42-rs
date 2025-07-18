@@ -12,6 +12,7 @@ use alloy_primitives::U256;
 use std::error::Error;
 use alloy_primitives::B256;
 use bls::AggregateSignature;
+use alloy_primitives::hex::encode as hex_encode;
 
 lazy_static! {
     static ref MINEDBLOCK_INSTANCE: Arc<Mutex<MinedblockExt>> = Arc::new(Mutex::new(MinedblockExt::new()));
@@ -28,7 +29,7 @@ pub trait MinedblockExtApi {
     fn send_block(&self, block: UnverifiedBlock) -> RpcResult<()>;
     /// 客户端提交签名数据
     #[method(name = "submitSignature")]
-    fn submit_signature(&self, pubkey: Vec<u8>, signature: Vec<u8>) -> RpcResult<()>;
+    fn submit_signature(&self, pubkey: Vec<u8>, signature: Vec<u8>, receipt_root: Vec<u8>) -> RpcResult<()>;
 }
 
 pub struct MinedblockExt {
@@ -37,6 +38,7 @@ pub struct MinedblockExt {
     pub unverifiedblock:UnverifiedBlock,
     pub agg_signature: std::sync::RwLock<Option<AggregateSignature>>,
     pub signatures: std::sync::RwLock<Vec<(Vec<u8>, Vec<u8>)>>, // 新增字段存储(pubkey, signature)
+    pub sig_receipts: std::sync::RwLock<Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>>, // 新增字段存储(pubkey, signature, receipt_root)
 }
 
 impl Clone for MinedblockExt {
@@ -46,6 +48,7 @@ impl Clone for MinedblockExt {
             unverifiedblock: self.unverifiedblock.clone(),
             agg_signature: std::sync::RwLock::new(self.agg_signature.read().unwrap().clone()),
             signatures: std::sync::RwLock::new(self.signatures.read().unwrap().clone()),
+            sig_receipts: std::sync::RwLock::new(self.sig_receipts.read().unwrap().clone()),
         }
     }
 }
@@ -57,6 +60,7 @@ impl MinedblockExt {
             unverifiedblock: UnverifiedBlock::default(),
             agg_signature: std::sync::RwLock::new(None),
             signatures: std::sync::RwLock::new(Vec::new()),
+            sig_receipts: std::sync::RwLock::new(Vec::new()),
         }
     }
     // pub fn instance() -> Arc<MinedblockExt> {
@@ -152,15 +156,54 @@ impl MinedblockExtApiServer for MinedblockExt {
 
         Ok(()) // Return `RpcResult` synchronously.
     }
-    fn submit_signature(&self, pubkey: Vec<u8>, signature: Vec<u8>) -> RpcResult<()> {
-        println!("MinedblockExt 结构体地址: {:p}", self as *const _);
-        println!("收到客户端签名上报: pubkey={:?}, signature={:?}", pubkey, signature);
+    fn submit_signature(&self, pubkey: Vec<u8>, signature: Vec<u8>, receipt_root: Vec<u8>) -> RpcResult<()> {
+        // 1. 打印收到的receipt_root（16进制字符串）
+        println!("收到客户端签名上报: pubkey={:?}, signature={:?}", hex_encode(&pubkey), hex_encode(&signature));
+        println!("收到的receipt_root: 0x{}", hex_encode(&receipt_root));
+        // 缓存(pubkey, signature, receipt_root)
         {
-            let mut sigs = self.signatures.write().unwrap();
-            sigs.push((pubkey.clone(), signature.clone()));
-            println!("已保存(pubkey, signature)对, 当前数量: {}", sigs.len());
+            let mut sigs = self.sig_receipts.write().unwrap();
+            sigs.push((pubkey.clone(), signature.clone(), receipt_root.clone()));
         }
-        // self.print_signatures();
+        // 聚合签名
+        use bls::{PublicKey, Signature, AggregateSignature, Hash256};
+        let sigs = self.sig_receipts.read().unwrap();
+        let mut agg_sig = AggregateSignature::infinity();
+        let mut pubkeys = Vec::new();
+        let mut msgs = Vec::new();
+        for (pk_bytes, sig_bytes, root_bytes) in sigs.iter() {
+            // 反序列化公钥
+            let pk = match PublicKey::deserialize(&pk_bytes) {
+                Ok(pk) => pk,
+                Err(e) => {
+                    println!("公钥反序列化失败: {:?}", e);
+                    continue;
+                }
+            };
+            // 反序列化签名
+            let sig = match Signature::deserialize(&sig_bytes) {
+                Ok(sig) => sig,
+                Err(e) => {
+                    println!("签名反序列化失败: {:?}", e);
+                    continue;
+                }
+            };
+            // 组织消息
+            let msg = if root_bytes.len() == 32 {
+                Hash256::from_slice(&root_bytes)
+            } else {
+                println!("receipt_root长度错误: {}", root_bytes.len());
+                continue;
+            };
+            agg_sig.add_assign(&sig);
+            pubkeys.push(pk);
+            msgs.push(msg);
+        }
+        println!("当前聚合签名（序列化后）: 0x{}", hex_encode(&agg_sig.serialize()));
+        // 验证聚合签名
+        let pubkey_refs: Vec<_> = pubkeys.iter().collect();
+        let verify_result = agg_sig.aggregate_verify(&msgs, &pubkey_refs);
+        println!("聚合签名验证结果: {} (总签名数: {})", verify_result, sigs.len());
         Ok(())
     }
 }

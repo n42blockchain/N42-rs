@@ -257,12 +257,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             match generate_bls_keypair() {
                                                 Ok(keypair) => {
                                                     let pubkey_bytes = keypair.pk.serialize().to_vec();
+                                                    println!("pubkey_bytes: {:?}", hex::encode(&pubkey_bytes));
                                                     let signature_bytes = sign_with_keypair(&keypair, convert_receipt_root(receipt_root)).to_vec();
                                                     let submit_signature_msg = json!({
                                                         "jsonrpc": "2.0",
                                                         "id": 2 + i,
                                                         "method": "minedblockExt_submitSignature",
-                                                        "params": [pubkey_bytes, signature_bytes],
+                                                        "params": [pubkey_bytes, signature_bytes,convert_receipt_root(receipt_root).0.to_vec()],
                                                     }).to_string();
                                                     println!("提交签名 {}: {}", i + 1, submit_signature_msg);
                                                     let _ = write.send(Message::Text(submit_signature_msg)).await;

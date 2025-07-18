@@ -206,6 +206,9 @@ impl TSecretKey<Signature, PublicKey> for SecretKey {
     fn public_key(&self) -> PublicKey {
         PublicKey::infinity()
     }
+    fn sign(&self, _message: Hash256) -> Signature {
+        Signature::infinity()
+    }
 }
 
 impl TSignature<PublicKey> for Signature {
@@ -607,6 +610,10 @@ where
     Pub: TPublicKey,
     Sec: TSecretKey<Sig, Pub>,
 {
+    pub fn sign(&self, message: Hash256) -> Sig {
+        self.point.sign(message)
+    }
+
     pub fn serialize(&self) -> ZeroizeHash {
         self.point.serialize()
     }
@@ -647,7 +654,7 @@ pub trait TSecretKey<SignaturePoint, PublicKeyPoint>: Sized {
     fn serialize(&self) -> ZeroizeHash;
     fn deserialize(bytes: &[u8]) -> Result<Self, Error>;
     fn public_key(&self) -> PublicKeyPoint;
-
+    fn sign(&self, message: Hash256) -> SignaturePoint;
 }
 
 

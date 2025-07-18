@@ -9,6 +9,10 @@ repository.workspace = true
 exclude.workspace = true
 
 [dependencies]
+bls={path="/Users/root1/Desktop/starlink/lighthouse/crypto/bls"}
+keystore = { path = "../keystore" }
+n42-withdrawals.workspace=true
+rand.workspace=true
 yansi="1.0.1"
 foldhash="0.1.5"
 # tokio_tungstenite="1.0"
@@ -33,9 +37,12 @@ reth-primitives.workspace=true
 alloy-eips.workspace=true
 reth-consensus.workspace=true
 reth-ethereum-consensus.workspace=true
-alloy-primitives.workspace=true
+# alloy-primitives.workspace=true
+alloy-primitives-v0 = { package = "alloy-primitives", version = "0.8.25" }
+alloy-primitives-v1 = { package = "alloy-primitives", version = "1.1.2" }
 reth-primitives-traits.workspace=true
 reth-ethereum-primitives.workspace=true
+reqwest.workspace=true
 
 [[bin]]
 name = "mobile"

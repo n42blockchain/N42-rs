@@ -338,13 +338,6 @@ where
 
     // println!("➡️1cached_reads:{:?}",cached_reads);
 
-    let minedblock_ext=MinedblockExt::instance();
-    // if let Ok(mut minedblock)=minedblock_ext.try_lock(){
-    //     minedblock.set_db(cached_reads.clone());
-    // }else{
-    //     println!("minedblock lock failed");
-    // }
-
     let state_provider = client.state_by_block_hash(parent_header.hash())?;
     let state = StateProviderDatabase::new(&state_provider);
     let mut db =
@@ -526,16 +519,35 @@ where
     header.parent_beacon_block_root = attributes.parent_beacon_block_root;
 
     // println!("➡️2cached_reads:{:?}",cached_reads);
-
+    let minedblock_ext=MinedblockExt::instance();
+    println!("循环打印处实例地址: {:p}", Arc::as_ptr(&minedblock_ext));
     if let Ok(mut minedblock) = minedblock_ext.try_lock() {
+        println!("MinedblockExt 结构体地址: {:p}", &*minedblock as *const _);
         minedblock.set_db(cached_reads.clone());
         minedblock.set_blockbody(block.clone().into_block().body.clone());
         minedblock.set_td(header.difficulty);
         minedblock.send_block(minedblock.unverifiedblock.clone()).expect("minedblock send_block failed");
+        // 打印agg_signature
+        // {
+        //     let agg_sig_guard = minedblock.agg_signature.read().unwrap();
+        //     println!("当前agg_signature: {:?}", *agg_sig_guard);
+        // }
+        // 新增：判断订阅者数量并打印签名
+        {
+            let sub_count = minedblock.subscriber_count();
+            println!("当前订阅者数量: {}", sub_count);
+            if sub_count > 0 {
+                // let sigs=minedblock.get_signatures();
+                // println!("SSSSSSSiiiiiiggggsssss:{:?}",sigs);
+                minedblock.print_signatures();
+            }
+        }
         minedblock.clear_unverifiedblock();
+        // minedblock.clear_signatures();
     } else {
         println!("minedblock lock failed");
     } 
+
 
     println!("✅!!!!!!!!!!!!RRRRTTTT{:?}",header.receipts_root);
     // seal
@@ -549,6 +561,10 @@ where
         .with_sidecars(blob_sidecars.into_iter().map(Arc::unwrap_or_clone).collect::<Vec<_>>());
 
     // println!("➡️3cached_reads:{:?}",cached_reads);
+    let minedblock_ext = MinedblockExt::instance();
+    if let Ok(minedblock) = minedblock_ext.try_lock() {
+        minedblock.print_signatures();
+    }
 
     Ok(BuildOutcome::Better { payload, cached_reads })
 }

@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+bls={path="/Users/root1/Desktop/starlink/lighthouse/crypto/bls"}
 jsonrpsee.workspace = true
 lazy_static.workspace = true
 serde_json.workspace = true
@@ -71,5 +72,6 @@ revm.workspace = true
 # metrics
 reth-metrics.workspace = true
 metrics.workspace = true
+async-trait.workspace = true
 
 

@@ -1,5 +1,5 @@
 use arbitrary::Arbitrary;
-use safe_arith::{ArithError, SafeArith};
+use crate::arith::{ArithError,SafeArith};
 
 /// A balance which will never be below the specified `minimum`.
 ///

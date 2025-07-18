@@ -1,11 +1,13 @@
-use crate::{consts::altair::NUM_FLAG_INDICES, test_utils::TestRandom, Hash256};
-use safe_arith::{ArithError, SafeArith};
+// use crate::{consts::altair::NUM_FLAG_INDICES, test_utils::TestRandom, Hash256};
+use crate::arith::{ArithError, SafeArith};
 use serde::{Deserialize, Serialize};
 use ssz::{Decode, DecodeError, Encode};
-use test_random_derive::TestRandom;
+// use test_random_derive::TestRandom;
 use tree_hash::{PackedEncoding, TreeHash, TreeHashType};
+use crate::Hash256;
+use crate::common::NUM_FLAG_INDICES;
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Deserialize, Serialize, TestRandom)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Deserialize, Serialize)]
 #[serde(transparent)]
 #[derive(arbitrary::Arbitrary)]
 pub struct ParticipationFlags {

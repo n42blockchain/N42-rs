@@ -11,6 +11,7 @@ use reth_revm::cached::CachedReads;
 use alloy_primitives::U256;
 use std::error::Error;
 use alloy_primitives::B256;
+use bls::AggregateSignature;
 
 lazy_static! {
     static ref MINEDBLOCK_INSTANCE: Arc<Mutex<MinedblockExt>> = Arc::new(Mutex::new(MinedblockExt::new()));
@@ -25,12 +26,28 @@ pub trait MinedblockExtApi {
     /// Send block data
     #[method(name = "sendBlock")]
     fn send_block(&self, block: UnverifiedBlock) -> RpcResult<()>;
+    /// 客户端提交签名数据
+    #[method(name = "submitSignature")]
+    fn submit_signature(&self, pubkey: Vec<u8>, signature: Vec<u8>) -> RpcResult<()>;
 }
-#[derive(Clone)]
+
 pub struct MinedblockExt {
     // Add a channel to store subscribers
     subscribers: Arc<Mutex<Vec<SubscriptionSink>>>,
     pub unverifiedblock:UnverifiedBlock,
+    pub agg_signature: std::sync::RwLock<Option<AggregateSignature>>,
+    pub signatures: std::sync::RwLock<Vec<(Vec<u8>, Vec<u8>)>>, // 新增字段存储(pubkey, signature)
+}
+
+impl Clone for MinedblockExt {
+    fn clone(&self) -> Self {
+        MinedblockExt {
+            subscribers: self.subscribers.clone(),
+            unverifiedblock: self.unverifiedblock.clone(),
+            agg_signature: std::sync::RwLock::new(self.agg_signature.read().unwrap().clone()),
+            signatures: std::sync::RwLock::new(self.signatures.read().unwrap().clone()),
+        }
+    }
 }
 
 impl MinedblockExt {
@@ -38,6 +55,8 @@ impl MinedblockExt {
         Self {
             subscribers: Arc::new(Mutex::new(Vec::new())),
             unverifiedblock: UnverifiedBlock::default(),
+            agg_signature: std::sync::RwLock::new(None),
+            signatures: std::sync::RwLock::new(Vec::new()),
         }
     }
     // pub fn instance() -> Arc<MinedblockExt> {
@@ -57,6 +76,27 @@ impl MinedblockExt {
     }
     pub fn clear_unverifiedblock(&mut self) {
         self.unverifiedblock = UnverifiedBlock::default();
+    }
+    pub fn clear_signatures(&self) {
+        let mut sigs = self.signatures.write().unwrap();
+        sigs.clear();
+        println!("signatures 已清空");
+    }
+    pub fn subscriber_count(&self) -> usize {
+        // 由于subscribers是Arc<Mutex<>>，需要异步获取，但这里提供同步方法用于简单场景
+        // 实际调用时建议在异步环境下使用lock().await
+        match self.subscribers.try_lock() {
+            Ok(subs) => subs.len(),
+            Err(_) => 0 // 获取不到锁时返回0或可自定义处理
+        }
+    }
+    pub fn print_signatures(&self) {
+        let sigs = self.signatures.read().unwrap();
+        println!("当前signatures内容: {:?}", *sigs);
+    }
+    pub fn get_signatures(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let sigs = self.signatures.read().unwrap();
+        sigs.clone()
     }
 }
 
@@ -112,60 +152,15 @@ impl MinedblockExtApiServer for MinedblockExt {
 
         Ok(()) // Return `RpcResult` synchronously.
     }
-}
-
-impl MinedblockExtApiServer for Arc<MinedblockExt> {
-    fn subscribe_minedblock(&self, pending: PendingSubscriptionSink) -> SubscriptionResult {
-        let subscribers = self.subscribers.clone();
-        
-        tokio::spawn(async move {
-            if let Ok(sink) = pending.accept().await {
-                let mut subs = subscribers.lock().await;
-                subs.push(sink);
-            }
-        });
-
-        Ok(())
-    }
-
-    fn send_block(&self, block: UnverifiedBlock) -> RpcResult<()> {
-        let subscribers = self.subscribers.clone();
-
-        // tokio::spawn(async move {
-        //     let mut subs = subscribers.lock().await;
-        //     for mut sub in subs.iter_mut() {
-        //         let message = SubscriptionMessage::from_json(&block.clone()).unwrap();
-        //         if let Err(e) = sub.send(message).await {
-        //             println!("Error sending block to subscriber: {:?}", e);
-        //         }
-        //     }
-        // });
-
-        // Asynchronously handle sending messages to subscribers.
-        tokio::spawn(async move {
-            let mut subs = subscribers.lock().await;
-            for (i,sub) in subs.iter_mut().enumerate() {
-                // Send block data to subscribers.
-                // let message = SubscriptionMessage::from_json(&block.clone()).unwrap();
-                let message=SubscriptionMessage::new("subscribeMinedblock", SubscriptionId::Num(i as u64), &block);
-                match message{
-                    Ok(message)=>{
-                        println!("✅ Successfully sent minedblockExt_subscribeMinedblock");
-                        println!("✅ Successfully sent minedblockExt_subscribeMinedblock");
-                        println!("✅ Successfully sent minedblockExt_subscribeMinedblock");
-                        println!("✅ Successfully sent minedblockExt_subscribeMinedblock");
-                        println!("✅ Successfully sent minedblockExt_subscribeMinedblock");
-                        if let Err(e) =  sub.send(message).await{
-                            println!("Error sending block to subscriber: {:?}", e);
-                        }
-                    }
-                    Err(e)=>{
-                        println!("Error sending block to subscriber: {:?}", e);
-                    }
-                }
-            }
-        });
-
+    fn submit_signature(&self, pubkey: Vec<u8>, signature: Vec<u8>) -> RpcResult<()> {
+        println!("MinedblockExt 结构体地址: {:p}", self as *const _);
+        println!("收到客户端签名上报: pubkey={:?}, signature={:?}", pubkey, signature);
+        {
+            let mut sigs = self.signatures.write().unwrap();
+            sigs.push((pubkey.clone(), signature.clone()));
+            println!("已保存(pubkey, signature)对, 当前数量: {}", sigs.len());
+        }
+        // self.print_signatures();
         Ok(())
     }
 }

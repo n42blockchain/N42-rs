@@ -1704,6 +1704,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "bls"
+version = "0.2.0"
+dependencies = [
+ "alloy-primitives 0.8.25",
+ "arbitrary",
+ "blst",
+ "ethereum_hashing",
+ "ethereum_serde_utils 0.7.0",
+ "ethereum_ssz 0.7.1",
+ "fixed_bytes",
+ "hex",
+ "rand 0.8.5",
+ "safe_arith",
+ "serde",
+ "tree_hash 0.8.0",
+ "zeroize",
+]
+
+[[package]]
 name = "blst"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3992,6 +4011,14 @@ dependencies = [
  "rand 0.8.5",
  "rustc-hex",
  "static_assertions 1.1.0",
+]
+
+[[package]]
+name = "fixed_bytes"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives 0.8.25",
+ "safe_arith",
 ]
 
 [[package]]
@@ -6386,6 +6413,8 @@ dependencies = [
  "alloy-rlp",
  "alloy-rpc-types",
  "alloy-rpc-types-eth",
+ "async-trait",
+ "bls",
  "eyre",
  "futures",
  "futures-util",
@@ -6443,13 +6472,19 @@ version = "1.4.3"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
+ "alloy-primitives 0.8.25",
  "alloy-primitives 1.1.2",
  "anyhow",
+ "bls",
  "foldhash",
  "futures-util",
  "jsonrpsee",
+ "keystore",
  "lazy_static",
  "n42-engine-types",
+ "n42-withdrawals",
+ "rand 0.9.1",
+ "reqwest 0.12.15",
  "reth-chainspec",
  "reth-consensus",
  "reth-ethereum-consensus",
@@ -11278,6 +11313,10 @@ name = "ryu-js"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd29631678d6fb0903b69223673e122c32e9ae559d0960a38d574695ebc0ea15"
+
+[[package]]
+name = "safe_arith"
+version = "0.1.0"
 
 [[package]]
 name = "salsa20"

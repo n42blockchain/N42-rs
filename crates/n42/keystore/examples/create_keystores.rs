@@ -2,6 +2,7 @@ use keystore::keystore::{keypair_from_secret, KeystoreBuilder, PlainText};
 use std::fs::File;
 use std::io::Write;
 
+/// cargo run -p keystore --example create_keystores
 fn main() {
     // 定义一个非0的密钥， 钱包解密而来
     let secret = PlainText::from(vec![1u8; 32]);
@@ -24,6 +25,6 @@ fn main() {
     println!("{}", json);
 
     // 保存 keystore
-    let mut file = File::create("examples/keystore1.json").unwrap();
+    let mut file = File::create("crates/n42/keystore/examples/keystore1.json").unwrap();
     file.write_all(json.as_bytes()).unwrap();
 }

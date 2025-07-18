@@ -1,6 +1,7 @@
 use ssz::DecodeError;
 use crate::arith;
 use crate::beaconstate::Error as BeaconstateError;
+use crate::common::epoch_cache::EpochCacheError;
 
 #[derive( PartialEq)]
 pub enum EpochProcessingError {
@@ -26,12 +27,18 @@ pub enum EpochProcessingError {
     InvalidJustificationBit(ssz_types::Error),
     InvalidFlagIndex(usize),
     MilhouseError(milhouse::Error),
-    // EpochCache(EpochCacheError),
+    EpochCache(EpochCacheError),
     SinglePassMissingActivationQueue,
     MissingEarliestExitEpoch,
     MissingExitBalanceToConsume,
     PendingDepositsLogicError,
     SszDecodeError(ssz::DecodeError),
+}
+
+impl From<EpochCacheError> for EpochProcessingError {
+    fn from(e: EpochCacheError) -> Self {
+        EpochProcessingError::EpochCache(e)
+    }
 }
 
 impl From<InclusionError> for EpochProcessingError {

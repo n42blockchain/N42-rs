@@ -3,7 +3,7 @@ use crate::spec::{EthSpec, Spec};
 use crate::beaconstate::{BeaconState};
 use crate::beaconstate::Error as BeaconStateError;
 use ssz_types::BitList;
-
+use crate::slot_epoch::Epoch;
 
 /// Sets the boolean `var` on `self` to be true if it is true on `other`. Otherwise leaves `self`
 /// as is.
@@ -77,6 +77,8 @@ pub struct ValidatorStatus {
     // pub inclusion_info: Option<InclusionInfo>,
     /// True if the validator can withdraw in the current epoch.
     pub is_withdrawable_in_current_epoch: bool,
+
+    pub actual_work_epoch: Epoch,
 }
 
 impl ValidatorStatus {
@@ -97,6 +99,7 @@ impl ValidatorStatus {
         set_self_if_other_is_true!(self, other, is_current_epoch_attester);
         // set_self_if_other_is_true!(self, other, is_current_epoch_target_attester);
         set_self_if_other_is_true!(self, other, is_previous_epoch_attester);
+        // set_self_if_other_is_true!(self, other, actual_work_epoch);
         // set_self_if_other_is_true!(self, other, is_previous_epoch_target_attester);
         // set_self_if_other_is_true!(self, other, is_previous_epoch_head_attester);
 
@@ -110,7 +113,7 @@ impl ValidatorStatus {
     }
 }
 
-
+#[derive(Clone, Debug, PartialEq)]
 pub struct TotalBalances {
     /// The effective balance increment from the spec.
     effective_balance_increment: u64,
@@ -192,10 +195,13 @@ impl ValidatorStatuses {
         for validator in state.validators().iter() {
             let effective_balance = validator.effective_balance;
             let mut status = ValidatorStatus {
+                actual_work_epoch:validator.get_work_epoch(),
+
                 is_slashed: validator.slashed,
                 is_eligible: state.is_eligible_validator(previous_epoch, validator)?,
                 is_withdrawable_in_current_epoch: validator.is_withdrawable_at(current_epoch),
                 current_epoch_effective_balance: effective_balance,
+                // actual_work_epoch:
                 ..ValidatorStatus::default()
             };
 

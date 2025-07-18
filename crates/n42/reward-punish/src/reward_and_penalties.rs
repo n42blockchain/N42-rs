@@ -6,7 +6,7 @@ use crate::validator_statuses::{ValidatorStatuses,TotalBalances,ValidatorStatus}
 use crate::base::{increase_balance,decrease_balance};
 use crate::spec::{Spec,EthSpec};
 use crate::beaconstate::BeaconState;
-
+use crate::slot_epoch::Epoch;
 
 /// Combination of several deltas for different components of an attestation reward.
 ///
@@ -140,6 +140,12 @@ fn get_attestation_deltas<E: EthSpec>(
         .safe_sub(state.finalized_checkpoint().epoch)?
         .as_u64();
 
+    // let validators = state.validators();
+    //
+    // for validator in validators.iter() {
+    //     validator.get_work_epoch();
+    // }
+
     let mut deltas = vec![AttestationDelta::default(); state.validators().len()];
 
     let total_balances = &validator_statuses.total_balances;
@@ -167,6 +173,10 @@ fn get_attestation_deltas<E: EthSpec>(
             spec,
         )?;
 
+        let actual_work_epoch = validator.actual_work_epoch;
+
+
+
         
 
         // let (inclusion_delay_delta, proposer_delta) =
@@ -174,7 +184,7 @@ fn get_attestation_deltas<E: EthSpec>(
 
         // if include_validator_delta(index) {
             let all_delta =
-                get_all_delta(validator, base_reward, total_balances, finality_delay, spec)?;
+                get_all_delta(validator, base_reward, total_balances, finality_delay, spec, actual_work_epoch)?;
             // let target_delta =
             //     get_target_delta(validator, base_reward, total_balances, finality_delay, spec)?;
             // let head_delta =
@@ -217,6 +227,7 @@ pub fn get_attestation_component_delta(
     base_reward: u64,
     finality_delay: u64,
     spec: &Spec,
+    actual_work_epoch: Epoch,
 ) -> Result<Delta, Error> {
     let mut delta = Delta::default();
 
@@ -230,10 +241,21 @@ pub fn get_attestation_component_delta(
         } else {
             let reward_numerator = base_reward
                 .safe_mul(attesting_balance.safe_div(spec.effective_balance_increment)?)?;
-            delta.reward(
-                reward_numerator
-                    .safe_div(total_balance.safe_div(spec.effective_balance_increment)?)?,
-            )?;
+            reward_numerator
+                .safe_div(total_balance.safe_div(spec.effective_balance_increment)?)?;
+            delta.reward(reward_numerator)?;
+            // if(actual_work_epoch.as_u64() > spec.max_work_epoch){
+            //     delta.reward(reward_numerator)?;
+            // }else {
+            //     delta.reward(reward_numerator.
+            //         safe_mul(actual_work_epoch.as_u64().
+            //             safe_div(spec.max_work_epoch).unwrap()).unwrap())?;
+            // }
+
+            // delta.reward(
+            //     reward_numerator
+            //         .safe_div(total_balance.safe_div(spec.effective_balance_increment)?)?,
+            // )?;
         }
     } else {
         delta.penalize(base_reward)?;
@@ -248,6 +270,7 @@ fn get_all_delta(
     total_balances: &TotalBalances,
     finality_delay: u64,
     spec: &Spec,
+    actual_work_epoch: Epoch,
 ) -> Result<Delta, Error> {
     get_attestation_component_delta(
         validator.is_previous_epoch_attester && !validator.is_slashed,
@@ -256,6 +279,7 @@ fn get_all_delta(
         base_reward,
         finality_delay,
         spec,
+        actual_work_epoch
     )
 }
 

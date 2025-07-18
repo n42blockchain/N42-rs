@@ -19,15 +19,26 @@ pbkdf2 = { version = "0.8.0", default-features = false }
 hmac = "0.11.0"
 scrypt = { version = "0.7.0", default-features = false }
 rand = "0.8"
-n42-withdrawals = { workspace = true , features = ["fake_crypto"]}
+# n42-withdrawals = { workspace = true, default-features = false, features = ["supranational"] }
 serde_repr = "0.1"
 ring = "0.17"
 num-bigint-dig = { version = "0.8.4", features = ["zeroize"] }
 serde_json = "1"
 hex = "0.4"
+tree_hash = "0.8"
+blst = { version = "0.3.3", optional = true }
+ethereum_ssz = "0.7"
+arbitrary = { version = "1", features = ["derive"] }
+ethereum_serde_utils = "0.7"
+alloy-primitives = { version = "0.8", features = ["rlp", "getrandom"] }
 
 
 
 
 [lints]
 workspace = true
+
+[features]
+default = ["supranational", "arbitrary"]
+supranational = ["blst"]
+arbitrary = []

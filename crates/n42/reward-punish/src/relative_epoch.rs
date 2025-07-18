@@ -1,9 +1,6 @@
 use crate::arith::{ArithError, SafeArith};
 use crate::slot_epoch::{Epoch,Slot};
 
-
-
-
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum Error {
     EpochTooLow { base: Epoch, other: Epoch },

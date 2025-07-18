@@ -1,4 +1,4 @@
-use n42_withdrawals::crypto::{fake_crypto_implementations::{Keypair, SecretKey}, ZeroizeHash};
+// use n42_withdrawals::crypto::{fake_crypto_implementations::{Keypair, SecretKey}, ZeroizeHash};
 use std::{fmt,str};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
@@ -15,7 +15,9 @@ use rand::prelude::*;
 use serde_repr::*;
 use serde_json::{Map, Value};
 pub use uuid::Uuid;
+use crate::blst::{Keypair, ZeroizeHash, SecretKey};
 use crate::create::{Wallet};
+
 
 
 
@@ -28,6 +30,7 @@ pub const DKLEN: u32 = 32;
 pub const DEFAULT_PBKDF2_C: u32 = 262_144;
 pub const SALT_SIZE: usize = 32;
 pub const MOD_R_L: usize = 48;
+const SECRET_KEY_LEN: usize = 32;
 
 
 pub struct KeystoreBuilder<'a> {
@@ -160,6 +163,30 @@ impl Keystore {
             },
         })
     }
+
+    /// Regenerate a BLS12-381 `Keypair` from `self` and the correct password.
+    /// - The provided password is incorrect.
+    /// - The keystore is badly formed.
+    /// May panic if provided unreasonable crypto parameters.
+    pub fn decrypt_keypair(&self, password: &[u8]) -> Result<Keypair, Error> {
+        let plain_text = decrypt(password, &self.json.crypto)?;
+
+        // Verify that secret key material is correct length.
+        if plain_text.len() != SECRET_KEY_LEN {
+            return Err(Error::InvalidSecretKeyLen {
+                len: plain_text.len(),
+                expected: SECRET_KEY_LEN,
+            });
+        }
+
+        let keypair = keypair_from_secret(plain_text.as_bytes())?;
+        // Verify that the derived `PublicKey` matches `self`.
+        if keypair.pk.as_hex_string()[2..] != self.json.pubkey {
+            return Err(Error::PublicKeyMismatch);
+        }
+
+        Ok(keypair)
+    }
 }
 
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
@@ -214,7 +241,10 @@ pub enum Error {
     ScryptInvalidParams(InvalidParams),
     ScryptInvaidOutputLen(InvalidOutputLen),
     EmptyPassword,
-    InvalidSecretKeyBytes(n42_withdrawals::error::Error),
+    InvalidSecretKeyBytes(crate::blst::Error),
+    InvalidSecretKeyLen { len: usize, expected: usize },
+    PublicKeyMismatch,
+
 }
 
 
@@ -231,6 +261,11 @@ impl PlainText {
     /// Returns a mutable reference to the underlying bytes.
     pub fn as_mut_bytes(&mut self) -> &mut [u8] {
         &mut self.0
+    }
+
+    /// The byte-length of `self`
+    pub fn len(&self) -> usize {
+        self.0.len()
     }
 }
 

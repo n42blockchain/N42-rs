@@ -233,6 +233,8 @@ macro_rules! impl_ssz {
     };
 }
 
+
+
 macro_rules! impl_math {
     ($type: ident) => {
         impl $type {

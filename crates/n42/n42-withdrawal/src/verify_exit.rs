@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use crate::beacon_state::{BeaconState, EthSpec};
 use crate::chain_spec::ChainSpec;
+use crate::crypto::BlsPublicKey as PublicKey;
 use crate::error::{BlockOperationError, ExitInvalid};
 use crate::safe_aitrh::SafeArith;
 use crate::signature_set::exit_signature_set;
@@ -97,7 +98,7 @@ pub fn verify_exit<E: EthSpec>(
 pub fn get_pubkey_from_state<E>(
     state: &BeaconState<E>,
     validator_index: usize,
-) -> Option<Cow<crate::crypto::fake_crypto_implementations::BlsPublicKey>>
+) -> Option<Cow<'_, PublicKey>>
 where
     E: EthSpec,
 {
@@ -105,7 +106,7 @@ where
         .validators()
         .get(validator_index)
         .and_then(|v| {
-            let pk: Option<crate::crypto::fake_crypto_implementations::BlsPublicKey> = v.pubkey.decompress().ok();
+            let pk: Option<PublicKey> = v.pubkey.decompress().ok();
             pk
         })
         .map(Cow::Owned)

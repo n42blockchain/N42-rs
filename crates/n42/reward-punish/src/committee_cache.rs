@@ -1,5 +1,6 @@
 use std::num::NonZeroUsize;
 use std::ops::Range;
+use std::sync::Arc;
 use derivative::Derivative;
 use ssz_derive::{Decode, Encode};
 use crate::slot_epoch::Epoch;
@@ -8,6 +9,14 @@ use ssz::{four_byte_option_impl, Decode, DecodeError, Encode};
 use crate::slot_epoch::Slot;
 use crate::beaconstate::CommitteeIndex;
 use crate::beacon_committee::BeaconCommittee;
+use crate::beaconstate::Error;
+use crate::spec::EthSpec;
+use crate::beaconstate::BeaconState;
+use crate::spec::Spec;
+use crate::beaconstate::Validator;
+use crate::spec::Domain;
+use crate::shuffle_list::shuffle_list;
+use crate::arith::SafeArith;
 
 
 // Define "legacy" implementations of `Option<Epoch>`, `Option<NonZeroUsize>` which use four bytes
@@ -47,11 +56,108 @@ fn compare_shuffling_positions(xs: &Vec<NonZeroUsizeOption>, ys: &Vec<NonZeroUsi
 
 impl CommitteeCache {
 
+    /// Returns the number of active validators in the initialized epoch.
+    ///
+    /// Always returns `usize::default()` for a non-initialized epoch.
+    ///
+    /// Spec v0.12.1
+    pub fn active_validator_count(&self) -> usize {
+        self.shuffling.len()
+    }
+
+
+    /// Return a new, fully initialized cache.
+    ///
+    /// Spec v0.12.1
+    pub fn initialized<E: EthSpec>(
+        state: &BeaconState<E>,
+        epoch: Epoch,
+        spec: &Spec,
+    ) -> Result<Arc<CommitteeCache>, Error> {
+        // Check that the cache is being built for an in-range epoch.
+        //
+        // We allow caches to be constructed for historic epochs, per:
+        //
+        // https://github.com/sigp/lighthouse/issues/3270
+        let reqd_randao_epoch = epoch
+            .saturating_sub(spec.min_seed_lookahead)
+            .saturating_sub(1u64);
+
+        if reqd_randao_epoch < state.min_randao_epoch() || epoch > state.current_epoch().safe_add(1)?{
+            return Err(Error::EpochOutOfBounds);
+        }
+
+        // May cause divide-by-zero errors.
+        if E::slots_per_epoch() == 0 {
+            return Err(Error::ZeroSlotsPerEpoch);
+        }
+
+        // The use of `NonZeroUsize` reduces the maximum number of possible validators by one.
+        if state.validators().len() == usize::MAX {
+            return Err(Error::TooManyValidators);
+        }
+
+        let active_validator_indices = get_active_validator_indices(state.validators(), epoch);
+
+        if active_validator_indices.is_empty() {
+            return Err(Error::InsufficientValidators);
+        }
+
+        let committees_per_slot =
+            E::get_committee_count_per_slot(active_validator_indices.len(), spec)? as u64;
+
+        let seed = state.get_seed(epoch, Domain::BeaconAttester, spec)?;
+
+        let shuffling = shuffle_list(
+            active_validator_indices,
+            spec.shuffle_round_count,
+            &seed[..],
+            false,
+        )
+            .ok_or(Error::UnableToShuffle)?;
+
+        let mut shuffling_positions = vec![<_>::default(); state.validators().len()];
+        for (i, &v) in shuffling.iter().enumerate() {
+            *shuffling_positions
+                .get_mut(v)
+                .ok_or(Error::ShuffleIndexOutOfBounds(v))? = NonZeroUsize::new(i + 1).into();
+        }
+
+        Ok(Arc::new(CommitteeCache {
+            initialized_epoch: Some(epoch),
+            shuffling,
+            shuffling_positions,
+            committees_per_slot,
+            slots_per_epoch: E::slots_per_epoch(),
+        }))
+    }
+
     /// Returns `true` if the cache has been initialized at the supplied `epoch`.
     ///
     /// An non-initialized cache does not provide any useful information.
     pub fn is_initialized_at(&self, epoch: Epoch) -> bool {
         Some(epoch) == self.initialized_epoch
+    }
+
+    /// Get all the Beacon committees at a given `slot`.
+    ///
+    /// Committees are sorted by ascending index order 0..committees_per_slot
+    pub fn get_beacon_committees_at_slot(&self, slot: Slot) -> Result<Vec<BeaconCommittee<'_>>, Error> {
+        if self.initialized_epoch.is_none() {
+            return Err(Error::CommitteeCacheUninitialized(None));
+        }
+
+        (0..self.committees_per_slot())
+            .map(|index| {
+                self.get_beacon_committee(slot, index)
+                    .ok_or(Error::NoCommittee { slot, index })
+            })
+            .collect()
+    }
+
+    /// Returns the number of committees per slot for this cache's epoch.
+    pub fn committees_per_slot(&self) -> u64 {
+        self.committees_per_slot
     }
 
 
@@ -207,6 +313,28 @@ impl Decode for NonZeroUsizeOption {
     fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
         four_byte_option_non_zero_usize::decode::from_ssz_bytes(bytes).map(Self)
     }
+}
+
+/// Returns a list of all `validators` indices where the validator is active at the given
+/// `epoch`.
+///
+/// Spec v0.12.1
+pub fn get_active_validator_indices<'a, V, I>(validators: V, epoch: Epoch) -> Vec<usize>
+where
+    V: IntoIterator<Item = &'a Validator, IntoIter = I>,
+    I: ExactSizeIterator + Iterator<Item = &'a Validator>,
+{
+    let iter = validators.into_iter();
+
+    let mut active = Vec::with_capacity(iter.len());
+
+    for (index, validator) in iter.enumerate() {
+        if validator.is_active_at(epoch) {
+            active.push(index)
+        }
+    }
+
+    active
 }
 
 

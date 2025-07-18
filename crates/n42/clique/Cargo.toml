@@ -72,7 +72,7 @@ reth-chainspec.workspace = true
 #reth-transaction-pool = { workspace = true, features = ["test-utils"] }
 #reth-evm = { workspace = true, features = ["test-utils"] }
 #reth-db = { workspace = true, features = ["test-utils"] }
-#reth-db-common.workspace = true
+
 #reth-network.workspace = true
 eyre.workspace = true
 

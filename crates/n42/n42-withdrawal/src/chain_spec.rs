@@ -78,6 +78,47 @@ pub enum Domain {
 }
 
 impl ChainSpec {
+
+    pub fn n42() -> Self{
+        Self {
+            max_pending_partials_per_withdrawals_sweep: 16,
+            min_activation_balance: 1_000_000_000,
+            far_future_epoch: Epoch::new(u64::MAX),
+            max_validators_per_withdrawals_sweep: 16,
+            eth1_address_withdrawal_prefix_byte: 0x01,
+            max_effective_balance_electra: 32_000_000_000,
+            max_effective_balance: 32_000_000_000,
+            compounding_withdrawal_prefix_byte: 0x00,
+            min_validator_withdrawability_delay: Epoch::new(4),
+            max_seed_lookahead: Epoch::new(1),
+            max_per_epoch_activation_exit_churn_limit: 4,
+            min_per_epoch_churn_limit_electra: 1,
+            churn_limit_quotient: 65536,
+            effective_balance_increment: 1_000_000_000,
+            full_exit_request_amount: u64::MAX,
+            shard_committee_period: 256,
+            ejection_balance: 16_000_000_000,
+            max_per_epoch_activation_churn_limit: 4,
+            min_per_epoch_churn_limit: 1,
+            deposit_contract_tree_depth: 32,
+            capella_fork_version: [0, 0, 0, 2],
+            genesis_slot: Slot::new(0),
+            genesis_fork_version: [0, 0, 0, 0],
+            shuffle_round_count: 90,
+            min_seed_lookahead: Epoch::new(0),
+            fulu_fork_epoch: None,
+            electra_fork_epoch: Some(Epoch::new(0)),
+            epochs_per_sync_committee_period: Epoch::new(8192),
+            domain_beacon_proposer: 0,
+            domain_beacon_attester: 1,
+            domain_randao: 2,
+            domain_deposit: 3,
+            domain_voluntary_exit: 4,
+            domain_sync_committee: 5,
+            domain_bls_to_execution_change: 6,
+        }
+    }
+
     /// Compute the epoch used for activations prior to Deneb, and for exits under all forks.
     ///
     /// Spec: https://github.com/ethereum/consensus-specs/blob/dev/specs/phase0/beacon-chain.md#compute_activation_exit_epoch

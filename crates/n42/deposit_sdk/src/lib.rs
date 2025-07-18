@@ -249,7 +249,7 @@ impl EthStakingSdk {
             .client
             .send_transaction(tx, None)
             .await
-            .map_err(|e| SdkError::Contract(format!("发送退出交易失败: {}", e)))?;
+            .map_err(|e| SdkError::Contract(format!("发送退出交易失败")))?;
         println!("   交易已发送，等待确认... Tx Hash: {:?}", pending_tx.tx_hash());
 
         let receipt = pending_tx

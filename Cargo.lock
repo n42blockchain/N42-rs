@@ -1704,25 +1704,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bls"
-version = "0.2.0"
-dependencies = [
- "alloy-primitives 0.8.25",
- "arbitrary",
- "blst",
- "ethereum_hashing",
- "ethereum_serde_utils 0.7.0",
- "ethereum_ssz 0.7.1",
- "fixed_bytes",
- "hex",
- "rand 0.8.5",
- "safe_arith",
- "serde",
- "tree_hash 0.8.0",
- "zeroize",
-]
-
-[[package]]
 name = "blst"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4014,14 +3995,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fixed_bytes"
-version = "0.1.0"
-dependencies = [
- "alloy-primitives 0.8.25",
- "safe_arith",
-]
-
-[[package]]
 name = "fixedbitset"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6110,7 +6083,9 @@ dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",
  "hashbrown 0.15.3",
+ "indexmap 2.9.0",
  "metrics",
+ "ordered-float",
  "quanta",
  "rand 0.9.1",
  "rand_xoshiro",
@@ -6414,7 +6389,6 @@ dependencies = [
  "alloy-rpc-types",
  "alloy-rpc-types-eth",
  "async-trait",
- "bls",
  "eyre",
  "futures",
  "futures-util",
@@ -6475,7 +6449,6 @@ dependencies = [
  "alloy-primitives 0.8.25",
  "alloy-primitives 1.1.2",
  "anyhow",
- "bls",
  "foldhash",
  "futures-util",
  "jsonrpsee",
@@ -6965,6 +6938,15 @@ name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
+
+[[package]]
+name = "ordered-float"
+version = "4.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7bb71e1b3fa6ca1c61f383464aaf2bb0e2f8e772a1f01d486832464de363b951"
+dependencies = [
+ "num-traits",
+]
 
 [[package]]
 name = "overload"
@@ -9078,7 +9060,6 @@ dependencies = [
 [[package]]
 name = "reth-evm"
 version = "1.4.3"
-source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.4.3#fe3653ffe602d4e85ad213e8bd9f06e7b710c0c5"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -9088,6 +9069,9 @@ dependencies = [
  "derive_more 2.0.1",
  "futures-util",
  "metrics",
+ "metrics-util",
+ "reth-ethereum-forks",
+ "reth-ethereum-primitives",
  "reth-execution-errors",
  "reth-execution-types",
  "reth-metrics",
@@ -11313,10 +11297,6 @@ name = "ryu-js"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd29631678d6fb0903b69223673e122c32e9ae559d0960a38d574695ebc0ea15"
-
-[[package]]
-name = "safe_arith"
-version = "0.1.0"
 
 [[package]]
 name = "salsa20"

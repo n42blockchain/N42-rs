@@ -1706,20 +1706,19 @@ dependencies = [
 [[package]]
 name = "bls"
 version = "0.2.0"
-source = "git+https://github.com/sigp/lighthouse#cfb1f7331064b758c6786e4e1dc15507af5ff5d1"
 dependencies = [
  "alloy-primitives 0.8.25",
  "arbitrary",
  "blst",
  "ethereum_hashing",
  "ethereum_serde_utils 0.7.0",
- "ethereum_ssz 0.8.3",
+ "ethereum_ssz 0.7.1",
  "fixed_bytes",
  "hex",
  "rand 0.8.5",
  "safe_arith",
  "serde",
- "tree_hash 0.9.1",
+ "tree_hash 0.8.0",
  "zeroize",
 ]
 
@@ -3622,21 +3621,6 @@ dependencies = [
 
 [[package]]
 name = "ethereum_ssz"
-version = "0.8.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86da3096d1304f5f28476ce383005385459afeaf0eea08592b65ddbc9b258d16"
-dependencies = [
- "alloy-primitives 0.8.25",
- "ethereum_serde_utils 0.7.0",
- "itertools 0.13.0",
- "serde",
- "serde_derive",
- "smallvec",
- "typenum",
-]
-
-[[package]]
-name = "ethereum_ssz"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ca8ba45b63c389c6e115b095ca16381534fdcc03cf58176a3f8554db2dbe19b"
@@ -3817,6 +3801,7 @@ dependencies = [
  "auto_impl",
  "ethers-contract",
  "ethers-core",
+ "ethers-etherscan",
  "ethers-providers",
  "ethers-signers",
  "futures-channel",
@@ -4031,7 +4016,6 @@ dependencies = [
 [[package]]
 name = "fixed_bytes"
 version = "0.1.0"
-source = "git+https://github.com/sigp/lighthouse#cfb1f7331064b758c6786e4e1dc15507af5ff5d1"
 dependencies = [
  "alloy-primitives 0.8.25",
  "safe_arith",
@@ -6126,9 +6110,7 @@ dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",
  "hashbrown 0.15.3",
- "indexmap 2.9.0",
  "metrics",
- "ordered-float",
  "quanta",
  "rand 0.9.1",
  "rand_xoshiro",
@@ -6493,6 +6475,7 @@ dependencies = [
  "alloy-primitives 0.8.25",
  "alloy-primitives 1.1.2",
  "anyhow",
+ "bls",
  "foldhash",
  "futures-util",
  "jsonrpsee",
@@ -6982,15 +6965,6 @@ name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
-
-[[package]]
-name = "ordered-float"
-version = "4.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7bb71e1b3fa6ca1c61f383464aaf2bb0e2f8e772a1f01d486832464de363b951"
-dependencies = [
- "num-traits",
-]
 
 [[package]]
 name = "overload"
@@ -9104,6 +9078,7 @@ dependencies = [
 [[package]]
 name = "reth-evm"
 version = "1.4.3"
+source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.4.3#fe3653ffe602d4e85ad213e8bd9f06e7b710c0c5"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -9113,9 +9088,6 @@ dependencies = [
  "derive_more 2.0.1",
  "futures-util",
  "metrics",
- "metrics-util",
- "reth-ethereum-forks",
- "reth-ethereum-primitives",
  "reth-execution-errors",
  "reth-execution-types",
  "reth-metrics",
@@ -11345,7 +11317,6 @@ checksum = "dd29631678d6fb0903b69223673e122c32e9ae559d0960a38d574695ebc0ea15"
 [[package]]
 name = "safe_arith"
 version = "0.1.0"
-source = "git+https://github.com/sigp/lighthouse#cfb1f7331064b758c6786e4e1dc15507af5ff5d1"
 
 [[package]]
 name = "salsa20"
@@ -12889,19 +12860,6 @@ dependencies = [
  "alloy-primitives 0.8.25",
  "ethereum_hashing",
  "smallvec",
-]
-
-[[package]]
-name = "tree_hash"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c58eb0f518840670270d90d97ffee702d8662d9c5494870c9e1e9e0fa00f668"
-dependencies = [
- "alloy-primitives 0.8.25",
- "ethereum_hashing",
- "ethereum_ssz 0.8.3",
- "smallvec",
- "typenum",
 ]
 
 [[package]]

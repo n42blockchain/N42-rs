@@ -527,18 +527,10 @@ where
         minedblock.set_blockbody(block.clone().into_block().body.clone());
         minedblock.set_td(header.difficulty);
         minedblock.send_block(minedblock.unverifiedblock.clone()).expect("minedblock send_block failed");
-        // 打印agg_signature
-        // {
-        //     let agg_sig_guard = minedblock.agg_signature.read().unwrap();
-        //     println!("当前agg_signature: {:?}", *agg_sig_guard);
-        // }
-        // 新增：判断订阅者数量并打印签名
         {
             let sub_count = minedblock.subscriber_count();
             println!("当前订阅者数量: {}", sub_count);
             if sub_count > 0 {
-                // let sigs=minedblock.get_signatures();
-                // println!("SSSSSSSiiiiiiggggsssss:{:?}",sigs);
                 minedblock.print_signatures();
             }
         }

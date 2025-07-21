@@ -35,8 +35,8 @@ use keystore::blst::{Keypair, SecretKey};
 use n42_withdrawals::Hash256;
 use n42_withdrawals::crypto::TSignature;
 use alloy_primitives_v1::hex;
-use bls::AggregateSignature;
-/// 使用keystore中的方法生成BLS密钥对
+// use bls::AggregateSignature;
+/// Use keystore methods to generate BLS keypair
 fn keypair_from_secret(secret_bytes: &[u8]) -> Result<Keypair, Box<dyn std::error::Error>> {
     use keystore::keystore::keypair_from_secret as keystore_keypair_from_secret;
     use keystore::keystore::PlainText;
@@ -49,7 +49,7 @@ fn keypair_from_secret(secret_bytes: &[u8]) -> Result<Keypair, Box<dyn std::erro
     Ok(keypair)
 }
 
-/// 生成BLS密钥对
+/// Generate BLS keypair
 fn generate_bls_keypair() -> Result<Keypair, Box<dyn std::error::Error>> {
     use rand::rng;
     loop {
@@ -58,11 +58,11 @@ fn generate_bls_keypair() -> Result<Keypair, Box<dyn std::error::Error>> {
         if let Ok(keypair) = keypair_from_secret(&secret_bytes) {
             return Ok(keypair);
         }
-        // 若失败则继续循环，直到生成合法密钥对
+        // If failed, continue looping until a valid keypair is generated
     }
 }
 
-/// 使用BLS密钥对数据进行签名
+/// Use BLS keypair to sign data
 fn sign_with_keypair(keypair: &Keypair, data: Hash256) -> Vec<u8> {
     let signature = keypair.sk.sign(data);
     signature.serialize().to_vec()
@@ -93,7 +93,7 @@ fn inject_unverifiedblock_accounts(
             .and_then(|info| info.code.clone())
             .map(Bytecode);
 
-        // ✅ storage key 类型从 U256 -> B256
+        // ✅ storage key type from U256 -> B256
         let storage: HashMap<B256, U256> = cached
             .storage
             .iter()
@@ -203,13 +203,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Attempting to connect to WebSocket: {}", url);
 
-    // 连接到 WebSocket
+    // Connect to WebSocket
     let (ws_stream, _) = connect_async(url).await?;
     println!("Successfully connected to WebSocket!");
 
     let (mut write, mut read) = ws_stream.split();
 
-    // 构建订阅 newHeads 的 JSON-RPC 请求
+    // Build JSON-RPC request for subscribing newHeads
     let subscribe_message = json!({
         "jsonrpc": "2.0",
         "method": "minedblockExt_subscribeMinedblock",
@@ -219,11 +219,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Sending subscription message: {}", subscribe_message);
 
-    // 发送订阅消息
+    // Send subscription message
     write.send(Message::Text(subscribe_message)).await?;
     println!("Subscription message sent, starting to listen for new block headers...");
 
-    // 监听 WebSocket 消息
+    // Listen for WebSocket messages
     while let Some(message) = read.next().await {
         match message {
             Ok(msg) => {
@@ -243,16 +243,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // Try to parse UnverifiedBlock from JSON
                             match serde_json::from_value::<UnverifiedBlock>(result.clone()) {
                                 Ok(unverified_block) => {
-                                    // 无论区块是否有交易，都调用verify函数
+                                    // Regardless of whether the block has transactions, call verify function
                                     if !unverified_block.blockbody.transactions.is_empty() {
                                         println!("There are transactions inside");
                                     } else {
                                         println!("This block has no transactions, but still verifying");
                                     }
                                     
-                                    // 调用verify函数获取receipt root
+                                    // Call verify function to get receipt root
                                     if let Some(receipt_root) = verify(unverified_block) {
-                                        // 生成3个BLS密钥对
+                                        // Generate 3 BLS keypairs
                                         for i in 0..3 {
                                             match generate_bls_keypair() {
                                                 Ok(keypair) => {
@@ -265,9 +265,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                         "method": "minedblockExt_submitSignature",
                                                         "params": [pubkey_bytes, signature_bytes,convert_receipt_root(receipt_root).0.to_vec()],
                                                     }).to_string();
-                                                    println!("提交签名 {}: {}", i + 1, submit_signature_msg);
+                                                    println!("Submit signature {}: {}", i + 1, submit_signature_msg);
                                                     let _ = write.send(Message::Text(submit_signature_msg)).await;
-                                                    // 通过HTTP POST发送到8545端口
+                                                    // Send via HTTP POST to port 8545
                                                     // let client = reqwest::Client::new();
                                                     // let res = client.post("http://127.0.0.1:8545")
                                                     //     .header("Content-Type", "application/json")
@@ -276,20 +276,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     //     .await;
                                                     // match res {
                                                     //     Ok(response) => {
-                                                    //         println!("HTTP响应: {:?}", response.text().await);
+                                                    //         println!("HTTP response: {:?}", response.text().await);
                                                     //     }
                                                     //     Err(e) => {
-                                                    //         println!("HTTP发送失败: {}", e);
+                                                    //         println!("HTTP send failed: {}", e);
                                                     //     }
                                                     // }
                                                 }
                                                 Err(e) => {
-                                                    println!("生成第{}个密钥对失败: {}", i + 1, e);
+                                                    println!("Failed to generate keypair {}: {}", i + 1, e);
                                                 }
                                             }
                                         }
                                     } else {
-                                        println!("没有得到相关数据");
+                                        println!("No relevant data obtained");
                                     }
                                 },
                                 Err(e) => {

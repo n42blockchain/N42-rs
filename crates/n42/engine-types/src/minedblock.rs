@@ -27,7 +27,7 @@ pub trait MinedblockExtApi {
     /// Send block data
     #[method(name = "sendBlock")]
     fn send_block(&self, block: UnverifiedBlock) -> RpcResult<()>;
-    /// 客户端提交签名数据
+    /// Client submits signature data
     #[method(name = "submitSignature")]
     fn submit_signature(&self, pubkey: Vec<u8>, signature: Vec<u8>, receipt_root: Vec<u8>) -> RpcResult<()>;
 }
@@ -37,8 +37,8 @@ pub struct MinedblockExt {
     subscribers: Arc<Mutex<Vec<SubscriptionSink>>>,
     pub unverifiedblock:UnverifiedBlock,
     pub agg_signature: std::sync::RwLock<Option<AggregateSignature>>,
-    pub signatures: std::sync::RwLock<Vec<(Vec<u8>, Vec<u8>)>>, // 新增字段存储(pubkey, signature)
-    pub sig_receipts: std::sync::RwLock<Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>>, // 新增字段存储(pubkey, signature, receipt_root)
+    pub signatures: std::sync::RwLock<Vec<(Vec<u8>, Vec<u8>)>>, // New field to store (pubkey, signature)
+    pub sig_receipts: std::sync::RwLock<Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>>, // New field to store (pubkey, signature, receipt_root)
 }
 
 impl Clone for MinedblockExt {
@@ -84,19 +84,19 @@ impl MinedblockExt {
     pub fn clear_signatures(&self) {
         let mut sigs = self.signatures.write().unwrap();
         sigs.clear();
-        println!("signatures 已清空");
+        println!("signatures cleared");
     }
     pub fn subscriber_count(&self) -> usize {
-        // 由于subscribers是Arc<Mutex<>>，需要异步获取，但这里提供同步方法用于简单场景
-        // 实际调用时建议在异步环境下使用lock().await
+        // Since subscribers is Arc<Mutex<>>, asynchronous access is required, but here a synchronous method is provided for simple scenarios
+        // It is recommended to use lock().await in asynchronous environments
         match self.subscribers.try_lock() {
             Ok(subs) => subs.len(),
-            Err(_) => 0 // 获取不到锁时返回0或可自定义处理
+            Err(_) => 0 // If the lock cannot be obtained, return 0 or customize the handling
         }
     }
     pub fn print_signatures(&self) {
         let sigs = self.signatures.read().unwrap();
-        println!("当前signatures内容: {:?}", *sigs);
+        println!("Current signatures content: {:?}", *sigs);
     }
     pub fn get_signatures(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
         let sigs = self.signatures.read().unwrap();
@@ -157,53 +157,53 @@ impl MinedblockExtApiServer for MinedblockExt {
         Ok(()) // Return `RpcResult` synchronously.
     }
     fn submit_signature(&self, pubkey: Vec<u8>, signature: Vec<u8>, receipt_root: Vec<u8>) -> RpcResult<()> {
-        // 1. 打印收到的receipt_root（16进制字符串）
-        println!("收到客户端签名上报: pubkey={:?}, signature={:?}", hex_encode(&pubkey), hex_encode(&signature));
-        println!("收到的receipt_root: 0x{}", hex_encode(&receipt_root));
-        // 缓存(pubkey, signature, receipt_root)
+        // 1. Print the received receipt_root (hex string)
+        println!("Received client signature report: pubkey={:?}, signature={:?}", hex_encode(&pubkey), hex_encode(&signature));
+        println!("Received receipt_root: 0x{}", hex_encode(&receipt_root));
+        // Cache (pubkey, signature, receipt_root)
         {
             let mut sigs = self.sig_receipts.write().unwrap();
             sigs.push((pubkey.clone(), signature.clone(), receipt_root.clone()));
         }
-        // 聚合签名
+        // Aggregate signatures
         use bls::{PublicKey, Signature, AggregateSignature, Hash256};
         let sigs = self.sig_receipts.read().unwrap();
         let mut agg_sig = AggregateSignature::infinity();
         let mut pubkeys = Vec::new();
         let mut msgs = Vec::new();
         for (pk_bytes, sig_bytes, root_bytes) in sigs.iter() {
-            // 反序列化公钥
+            // Deserialize public key
             let pk = match PublicKey::deserialize(&pk_bytes) {
                 Ok(pk) => pk,
                 Err(e) => {
-                    println!("公钥反序列化失败: {:?}", e);
+                    println!("Public key deserialization failed: {:?}", e);
                     continue;
                 }
             };
-            // 反序列化签名
+            // Deserialize signature
             let sig = match Signature::deserialize(&sig_bytes) {
                 Ok(sig) => sig,
                 Err(e) => {
-                    println!("签名反序列化失败: {:?}", e);
+                    println!("Signature deserialization failed: {:?}", e);
                     continue;
                 }
             };
-            // 组织消息
+            // Organize message
             let msg = if root_bytes.len() == 32 {
                 Hash256::from_slice(&root_bytes)
             } else {
-                println!("receipt_root长度错误: {}", root_bytes.len());
+                println!("receipt_root length error: {}", root_bytes.len());
                 continue;
             };
             agg_sig.add_assign(&sig);
             pubkeys.push(pk);
             msgs.push(msg);
         }
-        println!("当前聚合签名（序列化后）: 0x{}", hex_encode(&agg_sig.serialize()));
-        // 验证聚合签名
+        println!("Current aggregate signature (after serialization): 0x{}", hex_encode(&agg_sig.serialize()));
+        // Verify aggregate signature
         let pubkey_refs: Vec<_> = pubkeys.iter().collect();
         let verify_result = agg_sig.aggregate_verify(&msgs, &pubkey_refs);
-        println!("聚合签名验证结果: {} (总签名数: {})", verify_result, sigs.len());
+        println!("Aggregate signature verification result: {} (total signatures: {})", verify_result, sigs.len());
         Ok(())
     }
 }

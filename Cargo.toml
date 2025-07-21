@@ -203,6 +203,7 @@ lto = "fat"
 codegen-units = 1
 
 [workspace.dependencies]
+ring = "0.14.6"
 lazy_static="1.5.0"
 # for n42
 n42-primitives = { path = "crates/n42/primitives" }

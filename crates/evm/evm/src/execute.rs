@@ -335,8 +335,6 @@ where
         if let Some(to_addr) = to{
             if is_on_the_whitelist(&sender){
                 if to_addr == STAKING_CONTRACT{
-                    // self.evm.db_mut().increment_balances(vec![(sender, 20)]);
-                    // let db=self.evm.db_mut();
                     let db=self.executor.evm_mut().db_mut();
                     let cached_account=db.load_cache_account(sender).unwrap();
                     match &mut cached_account.account{

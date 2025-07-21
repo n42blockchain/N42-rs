@@ -392,6 +392,7 @@ op-alloy-rpc-jsonrpsee = { version = "0.16.0", default-features = false }
 op-alloy-flz = { version = "0.13.0", default-features = false }
 
 # misc
+integer-sqrt = "0.1.5"
 aquamarine = "0.6"
 auto_impl = "1"
 backon = { version = "1.2", default-features = false, features = ["std-blocking-sleep", "tokio-sleep"] }

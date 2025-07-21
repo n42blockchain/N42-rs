@@ -72,7 +72,7 @@ pub struct StateContext {
     current_epoch: Epoch,
     next_epoch: Epoch,
     finalized_checkpoint: Checkpoint,
-    is_in_inactivity_leak: bool,
+    // is_in_inactivity_leak: bool,
     total_active_balance: u64,
     churn_limit: u64,
     fork_name: ForkName,
@@ -158,7 +158,7 @@ pub fn process_epoch_single_pass<E: EthSpec>(
     let current_epoch = state.current_epoch();
     let previous_epoch = state.previous_epoch();
     let next_epoch = state.next_epoch()?;
-    let is_in_inactivity_leak = state.is_in_inactivity_leak(previous_epoch, spec)?;
+    // let is_in_inactivity_leak = state.is_in_inactivity_leak(previous_epoch, spec)?;
     let total_active_balance = state.get_total_active_balance()?;
     let total_effective_balance = state.compute_total_effective_balance()?;
 
@@ -172,7 +172,7 @@ pub fn process_epoch_single_pass<E: EthSpec>(
         current_epoch,
         next_epoch,
         finalized_checkpoint,
-        is_in_inactivity_leak,
+        // is_in_inactivity_leak,
         total_active_balance,
         churn_limit,
         fork_name,

@@ -26,7 +26,7 @@ pub fn process_epoch<E: EthSpec>(
     // initialize_epoch_cache(state, spec)?;
     // initialize_progressive_balances_cache::<E>(state, spec)?;
 
-    let sync_committee = state.current_sync_committee()?.clone();
+    // let sync_committee = state.current_sync_committee()?.clone();
 
     // // Justification and finalization.
     // let justification_and_finalization_state = process_justification_and_finalization(state)?;
@@ -83,6 +83,6 @@ pub fn process_epoch<E: EthSpec>(
         progressive_balances: current_epoch_progressive_balances,
         current_epoch_total_active_balance,
         participation: participation_summary,
-        sync_committee,
+        // sync_committee,
     })
 }

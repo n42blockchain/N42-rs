@@ -1,7 +1,6 @@
 #![allow(missing_docs)]
 
 
-pub mod deposit;
 
 use ethers::{
     prelude::*,
@@ -82,10 +81,10 @@ pub struct DepositData {
     pub pubkey: PublicKeyBytes,
     #[serde(rename = "withdrawal_credentials")]
     pub withdrawal_credentials: Hash256,
-    pub signature: SignatureBytes,
-    #[serde(rename = "deposit_data_root")]
-    // pub deposit_data_root: Hash256,
     pub amount: u64,
+    pub signature: SignatureBytes,
+    // #[serde(rename = "deposit_data_root")]
+    // pub deposit_data_root: Hash256,
 }
 impl DepositData {
     pub fn as_deposit_message(&self) -> DepositMessage {
@@ -263,4 +262,12 @@ impl EthStakingSdk {
 
         Ok(receipt)
     }
+}
+
+// 提现凭证的生成
+pub fn withdrawal_credentials(withdrawal_address: keystore::Address) -> Hash256 {
+    let mut credentials = [0u8; 32];
+    credentials[0] = 0x01;
+    credentials[12..].copy_from_slice(withdrawal_address.as_slice());
+    Hash256::from(credentials)
 }

@@ -1,7 +1,6 @@
 use std::{fs};
 use std::path::PathBuf;
-use deposit_sdk::{EthStakingSdk, DepositData};
-use deposit_sdk::deposit::withdrawal_credentials;
+use deposit_sdk::{EthStakingSdk, DepositData, DEPOSIT_CONTRACT_ADDRESS, withdrawal_credentials};
 use tree_hash::TreeHash;
 use clap::Parser;
 use keystore::Address;
@@ -79,7 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pubkey,
         withdrawal_credentials: creds,
         signature: SignatureBytes::empty(),
-        amount: 32,
+        amount: 32_000_000_000,
     };
     let spec = ChainSpec::n42();
     deposit_data.signature = deposit_data.create_signature(&keypair.sk, &spec);
@@ -92,7 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 质押部分
     let rpc = "https://testrpc.n42.world";
     let private_key  = "006ae52779c5a935d02b2d7eab3e01ef9cba11fa068edbcb529a3e9673d8fb7e";
-    let deposit_contract_address = "0x29a625941FA7B43be23b4309CD76e4d1BE688429";
+    let deposit_contract_address = DEPOSIT_CONTRACT_ADDRESS;
     let sdk = EthStakingSdk::new(rpc, private_key, deposit_contract_address).await?;
 
     let pubkey_hex = deposit_data.pubkey.as_hex_string();

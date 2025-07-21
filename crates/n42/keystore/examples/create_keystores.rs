@@ -1,4 +1,4 @@
-use keystore::keystore::{keypair_from_secret, KeystoreBuilder, PlainText};
+use keystore::keystore::{keypair_from_secret, KeyType, KeystoreBuilder, PlainText, ValidatorPath};
 use std::fs::File;
 use std::io::Write;
 
@@ -13,7 +13,9 @@ fn main() {
     // 生成 keystore
     let password = b"test-password";
     // 密钥派生路径
-    let path = "m/12381/3600/0/0/0".to_string();
+    // let path = "m/12381/3600/0/0/0".to_string();
+    let idx = 0;
+    let path = ValidatorPath::new(idx, KeyType::Voting).to_string();
 
     let keystore = KeystoreBuilder::new(&keypair, password, path)
         .expect("KeystoreBuilder::new 失败")
@@ -25,6 +27,6 @@ fn main() {
     println!("{}", json);
 
     // 保存 keystore
-    let mut file = File::create("crates/n42/keystore/examples/keystore1.json").unwrap();
+    let mut file = File::create("examples/keystore.json").unwrap();
     file.write_all(json.as_bytes()).unwrap();
 }

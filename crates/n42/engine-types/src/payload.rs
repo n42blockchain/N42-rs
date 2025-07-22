@@ -520,16 +520,16 @@ where
 
     // println!("➡️2cached_reads:{:?}",cached_reads);
     let minedblock_ext=MinedblockExt::instance();
-    println!("循环打印处实例地址: {:p}", Arc::as_ptr(&minedblock_ext));
+    println!("Loop print instance address: {:p}", Arc::as_ptr(&minedblock_ext));
     if let Ok(mut minedblock) = minedblock_ext.try_lock() {
-        println!("MinedblockExt 结构体地址: {:p}", &*minedblock as *const _);
+        println!("MinedblockExt struct address: {:p}", &*minedblock as *const _);
         minedblock.set_db(cached_reads.clone());
         minedblock.set_blockbody(block.clone().into_block().body.clone());
         minedblock.set_td(header.difficulty);
         minedblock.send_block(minedblock.unverifiedblock.clone()).expect("minedblock send_block failed");
         {
             let sub_count = minedblock.subscriber_count();
-            println!("当前订阅者数量: {}", sub_count);
+            println!("Current subscriber count: {}", sub_count);
             if sub_count > 0 {
                 minedblock.print_signatures();
             }

@@ -127,7 +127,6 @@ impl MinedblockExtApiServer for MinedblockExt {
     // Make send_block a synchronous function instead of an async fn, and use tokio::spawn to execute the asynchronous task.
     fn send_block(&self, block: UnverifiedBlock) -> RpcResult<()> {
         let subscribers = self.subscribers.clone();
-
         // Asynchronously handle sending messages to subscribers.
         tokio::spawn(async move {
             let mut subs = subscribers.lock().await;
@@ -152,8 +151,6 @@ impl MinedblockExtApiServer for MinedblockExt {
                 }
             }
         });
-
-
         Ok(()) // Return `RpcResult` synchronously.
     }
     fn submit_signature(&self, pubkey: Vec<u8>, signature: Vec<u8>, receipt_root: Vec<u8>) -> RpcResult<()> {

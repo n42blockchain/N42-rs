@@ -6,7 +6,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-bls={path="/Users/root1/Desktop/starlink/lighthouse/crypto/bls"}
+# bls={path="/Users/root1/Desktop/starlink/lighthouse/crypto/bls"}
+bls={git="https://github.com/sigp/lighthouse",package="bls",version="0.2.0"}
 jsonrpsee.workspace = true
 lazy_static.workspace = true
 serde_json.workspace = true

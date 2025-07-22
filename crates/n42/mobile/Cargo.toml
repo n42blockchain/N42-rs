@@ -9,7 +9,7 @@ repository.workspace = true
 exclude.workspace = true
 
 [dependencies]
-bls={path="/Users/root1/Desktop/starlink/lighthouse/crypto/bls"}
+# bls={path="/Users/root1/Desktop/starlink/lighthouse/crypto/bls"}
 keystore = { path = "../keystore" }
 n42-withdrawals.workspace=true
 rand.workspace=true

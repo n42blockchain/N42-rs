@@ -1,5 +1,5 @@
 use alloy_primitives::{BlockHash};
-use crate::beacon::{BeaconBlock};
+use n42_primitives::BeaconBlock;
 
 pub fn fetch_beacon_block(block_hash: BlockHash) -> eyre::Result<BeaconBlock> {
     todo!()

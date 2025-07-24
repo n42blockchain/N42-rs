@@ -356,6 +356,30 @@ tables! {
         type Value = Address;
     }
     
+    /// Stores the beacon block per hash
+    table BeaconBlocksByHash {
+        type Key = BlockHash;
+        type Value = BeaconBlock;
+        }
+
+    /// Stores the beacon block per eth1 hash
+    table BeaconBlocksByEth1Hash {
+        type Key = BlockHash;
+        type Value = BeaconBlock;
+        }
+
+    /// Stores the beacon state per hash
+    table BeaconStatesByHash {
+        type Key = BlockHash;
+        type Value = BeaconState;
+        }
+
+    /// Stores the beacon block hash per eth1 hash
+    table BeaconBlockHashesByEth1Hash {
+        type Key = BlockHash;
+        type Value = BlockHash;
+        }
+
     /// Stores the header hashes belonging to the canonical chain.
     table CanonicalHeaders {
         type Key = BlockNumber;

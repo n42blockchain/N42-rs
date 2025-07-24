@@ -9,6 +9,11 @@ repository.workspace = true
 exclude.workspace = true
 
 [dependencies]
+arbitrary.workspace = true
+integer-sqrt.workspace = true
+thiserror.workspace = true
+alloy-eips.workspace = true
+alloy-sol-types.workspace = true
 eyre.workspace = true
 serde_json.workspace=true
 #reth

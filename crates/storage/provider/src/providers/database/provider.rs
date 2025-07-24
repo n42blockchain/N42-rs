@@ -62,7 +62,8 @@ use reth_static_file_types::StaticFileSegment;
 use reth_storage_api::{
     BlockBodyIndicesProvider, BlockBodyReader, NodePrimitivesProvider, OmmersProvider,
     StateProvider, StorageChangeSetReader, TryIntoHistoricalStateProvider,
-    SnapshotProvider, SnapshotProviderWriter
+    SnapshotProvider, SnapshotProviderWriter,
+    BeaconProvider, BeaconProviderWriter,
 };
 use n42_primitives::{
     BeaconBlock, BeaconState, BeaconStateChangeset, BeaconBlockChangeset,
@@ -1889,6 +1890,46 @@ impl<TX: DbTxMut, N: NodeTypes<ChainSpec: EthereumHardforks>> SnapshotProviderWr
         Ok(self.tx.put::<tables::SignersByHash>(block_hash.clone(), signer)?)
     }
 }
+
+impl<TX: DbTx + 'static, N: NodeTypes<ChainSpec: EthereumHardforks>> BeaconProvider for DatabaseProvider<TX, N>{
+
+    fn get_beacon_block_by_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BeaconBlock>> {
+        Ok(self.tx.get::<tables::BeaconBlocksByHash>(block_hash.clone())?)
+    }
+
+    fn get_beacon_block_by_eth1_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BeaconBlock>> {
+        Ok(self.tx.get::<tables::BeaconBlocksByEth1Hash>(block_hash.clone())?)
+    }
+
+    fn get_beacon_state_by_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BeaconState>> {
+        Ok(self.tx.get::<tables::BeaconStatesByHash>(block_hash.clone())?)
+    }
+
+    fn get_beacon_block_hash_by_eth1_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BlockHash>> {
+        Ok(self.tx.get::<tables::BeaconBlockHashesByEth1Hash>(block_hash.clone())?)
+    }
+}
+
+impl<TX: DbTxMut, N: NodeTypes<ChainSpec: EthereumHardforks>> BeaconProviderWriter for DatabaseProvider<TX, N>{
+
+    fn save_beacon_block_by_hash(&self, block_hash: &BlockHash, beacon_block: BeaconBlock) -> ProviderResult<()> {
+        Ok(self.tx.put::<tables::BeaconBlocksByHash>(block_hash.clone(), beacon_block)?)
+    }
+
+    fn save_beacon_block_by_eth1_hash(&self, block_hash: &BlockHash,  beacon_block: BeaconBlock) -> ProviderResult<()> {
+        Ok(self.tx.put::<tables::BeaconBlocksByEth1Hash>(block_hash.clone(), beacon_block)?)
+    }
+
+    fn save_beacon_state_by_hash(&self, block_hash: &BlockHash,  beacon_state: BeaconState) -> ProviderResult<()> {
+        Ok(self.tx.put::<tables::BeaconStatesByHash>(block_hash.clone(), beacon_state)?)
+    }
+
+    fn save_beacon_block_hash_by_eth1_hash(&self, eth1_block_hash: &BlockHash, beacon_block_hash: BlockHash) -> ProviderResult<()> {
+        Ok(self.tx.put::<tables::BeaconBlockHashesByEth1Hash>(eth1_block_hash.clone(), beacon_block_hash)?)
+    }
+
+}
+
 impl<TX: DbTx + 'static, N: NodeTypesForProvider> BlockBodyIndicesProvider
     for DatabaseProvider<TX, N>
 {

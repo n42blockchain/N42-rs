@@ -1,6 +1,5 @@
 //use crate::{ChainSpec, Epoch, Validator};
-use n42_primitives::Epoch;
-use crate::beacon::Validator;
+use crate::{Validator, Epoch};
 use std::collections::BTreeSet;
 
 /// Activation queue computed during epoch processing for use in the *next* epoch.

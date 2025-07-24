@@ -10,3 +10,6 @@ pub use validator::*;
 mod beacon;
 pub use beacon::*;
 //pub use beacon::{BeaconState, BeaconBlock, BeaconStateChangeset, BeaconBlockChangeset, VoluntaryExit, VoluntaryExitWithSig, Epoch};
+
+mod safe_aitrh;
+mod activation_queue;

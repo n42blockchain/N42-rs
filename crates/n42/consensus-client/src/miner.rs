@@ -31,7 +31,7 @@ use reth_payload_primitives::{
 };
 use reth_primitives::{Block, Header, SealedBlock};
 use reth_primitives_traits::{Block as BlockTrait, header::clique_utils::{recover_address, recover_address_generic}};
-use reth_provider::{BlockIdReader, BlockReader, ChainSpecProvider};
+use reth_provider::{BlockIdReader, BlockReader, ChainSpecProvider, BeaconProvider, BeaconProviderWriter};
 use reth_transaction_pool::TransactionPool;
 use std::collections::{HashMap};
 use std::sync::Arc;
@@ -46,10 +46,9 @@ use tokio::time::{interval_at, sleep, Instant, Interval};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{trace, debug, error, info, warn};
 
-use crate::beacon::{Beacon, Deposit, parse_deposit_log, Attestation};
-use n42_primitives::{VoluntaryExit, VoluntaryExitWithSig};
+use crate::beacon::{Beacon};
+use n42_primitives::{Attestation, BeaconBlock, Deposit, VoluntaryExit, VoluntaryExitWithSig, parse_deposit_log};
 use crate::network::{fetch_beacon_block, broadcast_beacon_block};
-use crate::storage::{Storage};
 
 /// A mining mode for the local dev engine.
 #[derive(Debug)]
@@ -122,8 +121,7 @@ pub struct N42Miner<T: PayloadTypes, Provider, B, Network> {
     recent_num_to_td: schnellru::LruMap<u64, U256>,
     new_block_tx: mpsc::Sender<(NewBlock, BlockHash)>,
     new_block_rx: mpsc::Receiver<(NewBlock, BlockHash)>,
-    beacon: Beacon,
-    storage: Storage,
+    beacon: Beacon<Provider>,
     voluntary_exits: Vec<VoluntaryExitWithSig>,
 
     num_generated_blocks: u64,
@@ -154,7 +152,9 @@ where
         BlockReader
         + BlockIdReader
         + ChainSpecProvider<ChainSpec: EthereumHardforks>
-        + 'static,
+        + BeaconProvider
+        + BeaconProviderWriter
+        + 'static + Clone,
     B: PayloadAttributesBuilderExt<<T as PayloadTypes>::PayloadAttributes>,
     Network: FullNetwork,
     Network: BlockAnnounceProvider<Block = Block<TransactionSigned>>,
@@ -174,11 +174,8 @@ where
         consensus: Arc<dyn FullConsensus<<T::BuiltPayload as BuiltPayload>::Primitives, Error = ConsensusError>>,
     ) {
         let (new_block_tx, new_block_rx) = mpsc::channel::<(NewBlock, BlockHash)>(128);
-        let genesis_hash = provider.chain_spec().genesis_hash().clone();
-        debug!(target: "consensus-client", ?genesis_hash, "spawn_new");
-        let storage_init_data = consensus.get_eth_signer_address().unwrap().unwrap().to_string();
-        let storage = Storage::new(storage_init_data, genesis_hash);
-        let beacon = Beacon::new(storage.clone());
+        let beacon = Beacon::new(provider.clone());
+
         let miner = Self {
             provider,
             payload_attributes_builder,
@@ -198,7 +195,6 @@ where
             new_block_tx,
             new_block_rx,
             beacon,
-            storage,
             voluntary_exits: Vec::new(),
         };
 
@@ -208,6 +204,9 @@ where
 
     /// Runs the [`N42Miner`] in a loop, polling the miner and building payloads.
     async fn run(mut self) -> eyre::Result<()> {
+        self.provider.save_beacon_block_hash_by_eth1_hash(&self.provider.chain_spec().genesis_hash(), self.provider.chain_spec().genesis_hash())?;
+        self.provider.save_beacon_state_by_hash(&self.provider.chain_spec().genesis_hash(), Default::default())?;
+
         if !(self.get_best_block_num_signers() == 1 && self.is_among_signers()?) {
             self.initial_sync().await;
         }
@@ -429,7 +428,9 @@ where
                     }
                 }
 
-                let new_beacon_block = fetch_beacon_block(parent.hash()).unwrap();
+                //let new_beacon_block = fetch_beacon_block(parent.hash()).await?;
+                // TODO
+                let new_beacon_block: BeaconBlock = Default::default();
                 let new_beacon_block_hash = new_beacon_block.hash_slow();
 
                 let deposits = self.get_deposits(parent.number.saturating_sub(DEPOSIT_GAP))?;
@@ -456,8 +457,8 @@ where
                     return Err(eyre::eyre!(format!("state root mismatch, new_beacon_state hash={:?}, new_beacon_block.state_root={:?}", new_beacon_state.hash_slow(), new_beacon_block.state_root)));
                 }
 
-                self.storage.save_beacon_block_by_hash(new_beacon_block_hash, new_beacon_block.clone())?;
-                self.storage.save_beacon_block_hash_by_eth1_hash(parent.hash(), new_beacon_block_hash)?;
+                self.provider.save_beacon_block_by_hash(&new_beacon_block_hash, new_beacon_block.clone())?;
+                self.provider.save_beacon_block_hash_by_eth1_hash(&parent.hash(), new_beacon_block_hash)?;
             }
 
             if new_payload_ok {
@@ -712,7 +713,7 @@ where
             self.provider.chain_spec().genesis_hash()
         } else {
             //fetch_beacon_block(block.header().parent_hash).unwrap().hash_slow()
-            self.storage.get_beacon_block_hash_by_eth1_hash(block.header().parent_hash).unwrap()
+            self.provider.get_beacon_block_hash_by_eth1_hash(&block.header().parent_hash)?.unwrap()
         };
         let deposits = self.get_deposits(block.number.saturating_sub(DEPOSIT_GAP))?;
         let finalized_block_hash = self
@@ -720,8 +721,8 @@ where
             .finalized_block_hash()
             .unwrap_or(Some(self.provider.chain_spec().genesis_hash()))
             .unwrap();
-        let finalized_beacon_block_hash = self.storage.get_beacon_block_hash_by_eth1_hash(finalized_block_hash)?;
-        let finalized_beacon_state = self.storage.get_beacon_state_by_beacon_hash(finalized_beacon_block_hash)?;
+        let finalized_beacon_block_hash = self.provider.get_beacon_block_hash_by_eth1_hash(&finalized_block_hash)?.unwrap();
+        let finalized_beacon_state = self.provider.get_beacon_state_by_hash(&finalized_beacon_block_hash)?.unwrap();
         let attestations = finalized_beacon_state.valid_validators().into_iter().map(|validator| {
             Attestation { pubkey: validator.pubkey, }
         }).collect();
@@ -729,8 +730,12 @@ where
         self.voluntary_exits.clear();
         let beacon_block = self.beacon.gen_beacon_block(Some(beacon_state_after_withdrawal), parent_beacon_block_hash, &deposits, &attestations, &voluntary_exits, &execution_requests, block)?;
         let beacon_block_hash = beacon_block.hash_slow();
-        self.storage.save_beacon_block_by_hash(beacon_block_hash, beacon_block.clone())?;
-        self.storage.save_beacon_block_hash_by_eth1_hash(block.hash(), beacon_block_hash)?;
+        self.provider.save_beacon_block_by_hash(&beacon_block_hash, beacon_block.clone())?;
+
+        //
+        self.provider.save_beacon_block_by_eth1_hash(&block.hash(), beacon_block.clone())?;
+
+        self.provider.save_beacon_block_hash_by_eth1_hash(&block.hash(), beacon_block_hash)?;
 
         self.recent_blocks.insert(block.hash_slow(), block.clone());
 
@@ -747,6 +752,9 @@ where
         let new_block_tx = self.new_block_tx.clone();
         let block_clone = block.clone();
         let block_hash = block.hash_slow();
+        self.provider.save_beacon_block_by_hash(&beacon_block.hash_slow(), beacon_block.clone()).unwrap();
+        self.provider.save_beacon_block_by_eth1_hash(&block_hash, beacon_block.clone()).unwrap();
+        self.provider.save_beacon_block_hash_by_eth1_hash(&block_hash, beacon_block.hash_slow()).unwrap();
         tokio::spawn(async move {
             sleep(wiggle).await;
 

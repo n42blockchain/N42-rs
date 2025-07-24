@@ -879,7 +879,6 @@ async fn test_cascading_changes_are_not_allowed__only_the_account_being_voted_on
                 signer: "A".to_string(),
                 voted: Some("D".to_string()),
                 auth: Some(false),
-                ..Default::default()
             },
             TesterVote {
                 signer: "B".to_string(),

@@ -12,7 +12,7 @@ use std::collections::{HashMap, BTreeMap};
 use alloy_primitives::{keccak256, BlockHash, B256, Log};
 use n42_primitives::{Epoch, VoluntaryExit, VoluntaryExitWithSig};
 use integer_sqrt::IntegerSquareRoot;
-use crate::storage::{Storage};
+use crate::{activation_queue::ActivationQueue, storage::Storage};
 use crate::safe_aitrh::SafeArith;
 use crate::safe_aitrh::SafeArithIter;
 use tracing::{trace, debug, error, info, warn};
@@ -33,6 +33,7 @@ const genesis_epoch : u64 = 0;
 // chain_spec
 const max_pending_partials_per_withdrawals_sweep: u64 = 16; // ?
 const min_activation_balance: u64 = 32000000000;
+const ejection_balance: u64 = 16000000000;
 const far_future_epoch: u64 = u64::max_value();
 const max_validators_per_withdrawals_sweep: u64 = 16384;
 const max_effective_balance: u64 = 32000000000; //?
@@ -45,11 +46,12 @@ const max_per_epoch_activation_exit_churn_limit:u64 = 256000000000;
 const min_per_epoch_churn_limit_electra:u64 = 128000000000;
 const churn_limit_quotient:u64 = 32;
 const effective_balance_increment:u64 = 1000000000;
-const base_rewards_per_epoch:u64 = 2;
-const base_reward_factor:u64 = 1/2;
+const base_rewards_per_epoch:u64 = 4;
+const base_reward_factor:u64 = 64;
 const min_epochs_to_inactivity_penalty :u64 = 4;
 const inactivity_penalty_quotient:u64 = 67108864; //?
 const proposer_reward_quotient:u64 = 4;
+const min_per_epoch_churn_limit:u64 = 4;
 
 const min_validator_withdrawability_delay: u64 = 1;
 
@@ -111,16 +113,20 @@ impl Beacon {
             old_beacon_state.unwrap()
         };
         let new_beacon_state = BeaconState::state_transition(&beacon_state, beacon_block)?;
-        self.storage.save_beacon_state_by_beacon_hash(beacon_block.hash_slow(), new_beacon_state.clone())?;
-        debug!(target: "consensus-client", ?new_beacon_state, "state_transition");
+        let beacon_block_with_root = BeaconBlock { state_root: new_beacon_state.hash_slow(), ..beacon_block.clone() };
+        let beacon_block_hash = beacon_block_with_root.hash_slow();
+        self.storage.save_beacon_state_by_beacon_hash(beacon_block_hash, new_beacon_state.clone())?;
+        debug!(target: "consensus-client", ?beacon_block_hash, ?new_beacon_state, "state_transition");
 
         Ok(new_beacon_state)
     }
 
     pub fn gen_withdrawals(&mut self, eth1_block_hash: BlockHash) -> eyre::Result<(Option<Vec<Withdrawal>>, BeaconState)> {
+        debug!(target: "consensus-client", ?eth1_block_hash, "gen_withdrawals");
         let beacon_block_hash = self.storage.get_beacon_block_hash_by_eth1_hash(eth1_block_hash)?;
         debug!(target: "consensus-client", ?beacon_block_hash, "gen_withdrawals");
         let mut beacon_state = self.storage.get_beacon_state_by_beacon_hash(beacon_block_hash)?;
+        debug!(target: "consensus-client", ?beacon_state, "gen_withdrawals");
 
         /*
         let mut withdrawals = Vec::new();
@@ -166,7 +172,7 @@ impl Beacon {
         let beacon_block_hash = self.storage.get_beacon_block_hash_by_eth1_hash(eth1_block_hash)?;
         let beacon_state = self.storage.get_beacon_state_by_beacon_hash(beacon_block_hash)?;
         if let Some(validator) = beacon_state.validators.get(voluntary_exit.validator_index as usize) {
-            if voluntary_exit.epoch > validator.activation_epoch && validator.exit_epoch == 0 {
+            if voluntary_exit.epoch > validator.activation_epoch && !validator.is_exited_set() {
                 // TODO: check signature
 
                 return Ok(true)
@@ -309,6 +315,53 @@ impl Validator {
         validator
     }
 
+    /// Returns `true` if the validator *could* be eligible for activation at `epoch`.
+    ///
+    /// Eligibility depends on finalization, so we assume best-possible finalization. This function
+    /// returning true is a necessary but *not sufficient* condition for a validator to activate in
+    /// the epoch transition at the end of `epoch`.
+    pub fn could_be_eligible_for_activation_at(&self, epoch: Epoch) -> bool {
+        // Has not yet been activated
+        self.activation_epoch == far_future_epoch
+        // Placement in queue could be finalized.
+        //
+        // NOTE: the epoch distance is 1 rather than 2 because we consider the activations that
+        // occur at the *end* of `epoch`, after `process_justification_and_finalization` has already
+        // updated the state's checkpoint.
+        && self.activation_eligibility_epoch < epoch
+    }
+
+    /// Returns `true` if the validator is eligible to join the activation queue.
+    ///
+    /// Calls the correct function depending on the provided `fork_name`.
+    pub fn is_eligible_for_activation_queue(
+        &self,
+    ) -> bool {
+        self.is_eligible_for_activation_queue_base()
+    }
+
+    /// Returns `true` if the validator is eligible to join the activation queue.
+    ///
+    /// Spec v0.12.1
+    fn is_eligible_for_activation_queue_base(&self) -> bool {
+        self.activation_eligibility_epoch == far_future_epoch
+            && self.effective_balance == max_effective_balance
+    }
+
+    /// Returns `true` if the validator is able to withdraw at some epoch.
+    pub fn is_withdrawable_at(&self, epoch: Epoch) -> bool {
+        epoch >= self.withdrawable_epoch
+    }
+
+    /// Returns `true` if the validator is considered exited at some epoch.
+    pub fn is_exited_at(&self, epoch: Epoch) -> bool {
+        self.exit_epoch <= epoch
+    }
+
+    pub fn is_exited_set(&self) -> bool {
+        self.exit_epoch != far_future_epoch
+    }
+
 }
 
 #[derive(Debug, Clone, Hash, Default, RlpEncodable, RlpDecodable,  Serialize, Deserialize)]
@@ -419,16 +472,68 @@ impl BeaconState {
     }
 
     pub fn process_epoch(&mut self) -> eyre::Result<()> {
-        let validator_statuses = ValidatorStatuses {
-            statuses: Vec::new(),
-            total_balances: TotalBalances::new(),
-        };
+        let validator_statuses = ValidatorStatuses::new(self)?;
         self.process_rewards_and_penalties(&validator_statuses)?;
         self.process_registry_updates()?;
         Ok(())
     }
 
-    pub fn process_registry_updates(&self) -> eyre::Result<()> {
+    pub fn process_registry_updates(&mut self) -> eyre::Result<()> {
+        // Process activation eligibility and ejections.
+        // Collect eligible and exiting validators (we need to avoid mutating the state while iterating).
+        // We assume it's safe to re-order the change in eligibility and `initiate_validator_exit`.
+        // Rest assured exiting validators will still be exited in the same order as in the spec.
+        let current_epoch = self.current_epoch();
+        let is_ejectable = |validator: &Validator| {
+            validator.is_active_at(current_epoch)
+                && validator.effective_balance <= ejection_balance
+        };
+        //let fork_name = state.fork_name_unchecked();
+        let indices_to_update: Vec<_> = self
+            .validators
+            .iter()
+            .enumerate()
+            .filter(|(_, validator)| {
+                validator.is_eligible_for_activation_queue() || is_ejectable(validator)
+            })
+            .map(|(idx, _)| idx)
+            .collect();
+
+        for index in indices_to_update {
+            let validator = self.get_validator_mut(index)?;
+            if validator.is_eligible_for_activation_queue() {
+                validator.activation_eligibility_epoch = current_epoch.safe_add(1)?;
+            }
+            if is_ejectable(validator) {
+                self.initiate_validator_exit(index)?;
+            }
+        }
+
+        // Queue validators eligible for activation and not dequeued for activation prior to finalized epoch
+        // Dequeue validators for activation up to churn limit
+        let churn_limit = self.get_activation_churn_limit()? as usize;
+
+        let next_epoch = self.next_epoch()?;
+        let mut full_activation_queue = ActivationQueue::default();
+
+        for (index, validator) in self.validators.iter().enumerate() {
+
+            // Add to speculative activation queue.
+            full_activation_queue
+                .add_if_could_be_eligible_for_activation(index, validator, next_epoch);
+        }
+
+        //let epoch_cache = state.epoch_cache();
+        let activation_queue =
+            full_activation_queue
+            .get_validators_eligible_for_activation(current_epoch, churn_limit);
+            //.get_validators_eligible_for_activation(state.finalized_checkpoint().epoch, churn_limit);
+
+        let delayed_activation_epoch = self.compute_activation_exit_epoch(current_epoch)?;
+        for index in activation_queue {
+            self.get_validator_mut(index)?.activation_epoch = delayed_activation_epoch;
+        }
+
         Ok(())
     }
 
@@ -439,7 +544,7 @@ impl BeaconState {
 
     pub fn process_operations(&mut self, beacon_block_body: &BeaconBlockBody) -> eyre::Result<()> {
         //self.process_deposit(&beacon_block_body.deposits)?;
-        self.process_attestation(&beacon_block_body.attestations)?;
+        //self.process_attestation(&beacon_block_body.attestations)?;
         //self.process_voluntary_exit(&beacon_block_body.voluntary_exits)?;
 
         self.process_deposits(&beacon_block_body.deposits)?;
@@ -687,6 +792,7 @@ impl BeaconState {
         self.validators.len() as u64,
         max_validators_per_withdrawals_sweep,
     );
+    debug!(target: "consensus-client", ?bound, "get_expected_withdrawals");
     for _ in 0..bound {
         let validator = self.get_validator(validator_index as usize)?;
         let partially_withdrawn_balance = withdrawals
@@ -773,7 +879,7 @@ impl BeaconState {
         }
 
         // Advance sweep by the max length of the sweep if there was not a full set of withdrawals
-        if expected_withdrawals.len() != max_withdrawals_per_payload {
+        if expected_withdrawals.len() != max_withdrawals_per_payload && !self.validators.is_empty() {
             let next_validator_index = self
                 .next_withdrawal_validator_index
                 .safe_add(max_validators_per_withdrawals_sweep)?
@@ -786,6 +892,10 @@ impl BeaconState {
 
     pub fn current_epoch(&self) -> Epoch {
         self.slot / SLOTS_PER_EPOCH
+    }
+
+    pub fn next_epoch(&self) -> eyre::Result<Epoch> {
+        Ok(self.current_epoch().safe_add(1)?)
     }
 
     /// Safe indexer for the `validators` list.
@@ -939,7 +1049,8 @@ impl BeaconState {
     ///
     /// Returns minimum `EFFECTIVE_BALANCE_INCREMENT`, to avoid div by 0.
     pub fn get_total_active_balance(&self) -> eyre::Result<u64> {
-        self.get_total_active_balance_at_epoch(self.current_epoch())
+        self.compute_total_active_balance_slow()
+        // self.get_total_active_balance_at_epoch(self.current_epoch())
     }
 
     /// Get the cached total active balance while checking that it is for the correct `epoch`.
@@ -1069,45 +1180,7 @@ pub fn process_deposits(
     self: &mut Self,
     deposits: &[Deposit],
 ) -> eyre::Result<()> {
-    // [Modified in Electra:EIP6110]
-    // Disable former deposit mechanism once all prior deposits are processed
-    //let deposit_requests_start_index = state.deposit_requests_start_index().unwrap_or(u64::MAX);
-    /*
-    let deposit_requests_start_index = self.deposit_requests_start_index;
-    let eth1_deposit_index_limit = std::cmp::min(
-        deposit_requests_start_index,
-        self.eth1_data.deposit_count,
-    );
-    */
-    let eth1_deposit_index_limit = self.eth1_data.deposit_count;
-
-    if self.eth1_deposit_index < eth1_deposit_index_limit {
-        let expected_deposit_len = std::cmp::min(
-            MaxDeposits,
-            eth1_deposit_index_limit.safe_sub(self.eth1_deposit_index)?,
-        );
-        verify!(
-            deposits.len() as u64 == expected_deposit_len,
-            /*
-            BlockProcessingError::DepositCountInvalid {
-                expected: expected_deposit_len as usize,
-                found: deposits.len(),
-            }
-            */
-            format!("BlockProcessingError::DepositCountInvalid(expected: {}, found {})", expected_deposit_len as usize, deposits.len())
-        );
-    } else {
-        verify!(
-            deposits.len() as u64 == 0,
-            /*
-            BlockProcessingError::DepositCountInvalid {
-                expected: 0,
-                found: deposits.len(),
-            }
-            */
-            format!("BlockProcessingError::DepositCountInvalid(expected: {}, found {})", 0, deposits.len())
-        );
-    }
+    debug!(target: "consensus-client", deposists_length=?deposits.len(), "process_deposits");
 
     /*
     // Verify merkle proofs in parallel.
@@ -1277,6 +1350,7 @@ pub fn apply_deposit(
         validator_statuses: &ValidatorStatuses,
         //spec: &Spec,
     ) -> eyre::Result<()> {
+        debug!(target: "consensus-client", ?validator_statuses, "process_rewards_and_penalties");
         if self.current_epoch() == genesis_epoch {
             return Ok(());
         }
@@ -1292,6 +1366,7 @@ pub fn apply_deposit(
             validator_statuses,
             ProposerRewardCalculation::Include,
         )?;
+        debug!(target: "consensus-client", ?deltas, "process_rewards_and_penalties");
 
         // Apply the deltas, erroring on overflow above but not on overflow below (saturating at 0
         // instead).
@@ -1360,8 +1435,8 @@ pub fn apply_deposit(
                 sqrt_total_active_balance,
             )?;
 
+            debug!(target: "consensus-client", ?base_reward, "get_attestation_deltas");
             
-
             // let (inclusion_delay_delta, proposer_delta) =
             //     get_inclusion_delay_delta(validator, base_reward, spec)?;
 
@@ -1402,6 +1477,70 @@ pub fn apply_deposit(
         }
 
         Ok(deltas)
+    }
+
+    /// Return the churn limit for the current epoch (number of validators who can leave per epoch).
+    ///
+    /// Uses the current epoch committee cache, and will error if it isn't initialized.
+    pub fn get_validator_churn_limit(&self, /* spec: &ChainSpec */) -> eyre::Result<u64> {
+        /*
+        Ok(std::cmp::max(
+            spec.min_per_epoch_churn_limit,
+            (self
+                .committee_cache(RelativeEpoch::Current)?
+                .active_validator_count() as u64)
+                .safe_div(spec.churn_limit_quotient)?,
+        ))
+        */
+        Ok(min_per_epoch_churn_limit)
+    }
+
+    pub fn get_activation_churn_limit(&self) -> eyre::Result<u64> {
+        self.get_validator_churn_limit()
+    }
+
+    /// Passing `previous_epoch` to this function rather than computing it internally provides
+    /// a tangible speed improvement in state processing.
+    pub fn is_eligible_validator(
+        &self,
+        previous_epoch: Epoch,
+        val: &Validator,
+    ) -> eyre::Result<bool> {
+        Ok(val.is_active_at(previous_epoch)
+            //|| (val.slashed && previous_epoch.safe_add(Epoch::new(1))? < val.withdrawable_epoch))
+            || (val.slashed && previous_epoch.safe_add(1)? < val.withdrawable_epoch))
+    }
+
+    /// The epoch prior to `self.current_epoch()`.
+    ///
+    /// If the current epoch is the genesis epoch, the genesis_epoch is returned.
+    pub fn previous_epoch(&self) -> Epoch {
+        let current_epoch = self.current_epoch();
+        if let Ok(prev_epoch) = current_epoch.safe_sub(1) {
+            prev_epoch
+        } else {
+            current_epoch
+        }
+    }
+
+    /// Compute the total active balance cache from scratch.
+    ///
+    /// This method should rarely be invoked because single-pass epoch processing keeps the total
+    /// active balance cache up to date.
+    pub fn compute_total_active_balance_slow(&self) -> eyre::Result<u64> {
+        let current_epoch = self.current_epoch();
+
+        let mut total_active_balance = 0;
+
+        for validator in &self.validators {
+            if validator.is_active_at(current_epoch) {
+                total_active_balance.safe_add_assign(validator.effective_balance)?;
+            }
+        }
+        Ok(std::cmp::max(
+            total_active_balance,
+            effective_balance_increment,
+        ))
     }
 
 }
@@ -1452,7 +1591,8 @@ pub fn is_compounding_withdrawal_credential(
 }
 
 fn parse_execution_requests(requests: &Option<Requests>) -> ExecutionRequests {
-    todo!()
+    //todo!()
+    Default::default()
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -1490,6 +1630,7 @@ pub struct Eth1Data {
     pub block_hash: B256,
 }
 
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct ValidatorStatuses {
     /// Information about each individual validator from the state's validator registry.
     pub statuses: Vec<ValidatorStatus>,
@@ -1497,6 +1638,62 @@ pub struct ValidatorStatuses {
     pub total_balances: TotalBalances,
 }
 
+impl ValidatorStatuses {
+    /// Initializes a new instance, determining:
+    ///
+    /// - Active validators
+    /// - Total balances for the current and previous epochs.
+    ///
+    /// Spec v0.12.1
+    pub fn new(
+        state: &BeaconState,
+        //spec: &ChainSpec,
+    ) -> eyre::Result<Self> {
+        // TODO: get validator status from rpc
+        let mut statuses = Vec::with_capacity(state.validators.len());
+        let mut total_balances = TotalBalances::new();
+
+        let current_epoch = state.current_epoch();
+        let previous_epoch = state.previous_epoch();
+
+        for validator in state.validators.iter() {
+            let effective_balance = validator.effective_balance;
+            let mut status = ValidatorStatus {
+                is_slashed: validator.slashed,
+                is_eligible: state.is_eligible_validator(previous_epoch, validator)?,
+                is_withdrawable_in_current_epoch: validator.is_withdrawable_at(current_epoch),
+                current_epoch_effective_balance: effective_balance,
+
+                //
+                is_previous_epoch_attester: true,
+
+                ..ValidatorStatus::default()
+            };
+
+            if validator.is_active_at(current_epoch) {
+                status.is_active_in_current_epoch = true;
+                total_balances
+                    .current_epoch
+                    .safe_add_assign(effective_balance)?;
+            }
+
+            if validator.is_active_at(previous_epoch) {
+                status.is_active_in_previous_epoch = true;
+                total_balances
+                    .previous_epoch
+                    .safe_add_assign(effective_balance)?;
+            }
+
+            statuses.push(status);
+        }
+
+        Ok(Self {
+            statuses,
+            total_balances,
+        })
+    }
+
+}
 
 #[derive(Debug)]
 pub enum ProposerRewardCalculation {
@@ -1507,7 +1704,7 @@ pub enum ProposerRewardCalculation {
 /// Combination of several deltas for different components of an attestation reward.
 ///
 /// Exists only for compatibility with EF rewards tests.
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug)]
 pub struct AttestationDelta {
     // pub source_delta: Delta,
     // pub target_delta: Delta,
@@ -1544,7 +1741,7 @@ impl AttestationDelta {
 }
 
 /// Used to track the changes to a validator's balance.
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug)]
 pub struct Delta {
     pub rewards: u64,
     pub penalties: u64,
@@ -1720,6 +1917,7 @@ impl ValidatorStatus {
     }
 }
 
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct TotalBalances {
     /// The effective balance increment from the spec.
     effective_balance_increment: u64,

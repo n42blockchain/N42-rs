@@ -175,6 +175,7 @@ where
     ) {
         let (new_block_tx, new_block_rx) = mpsc::channel::<(NewBlock, BlockHash)>(128);
         let genesis_hash = provider.chain_spec().genesis_hash().clone();
+        debug!(target: "consensus-client", ?genesis_hash, "spawn_new");
         let storage_init_data = consensus.get_eth_signer_address().unwrap().unwrap().to_string();
         let storage = Storage::new(storage_init_data, genesis_hash);
         let beacon = Beacon::new(storage.clone());
@@ -710,7 +711,8 @@ where
         let parent_beacon_block_hash = if block.number == 1 {
             self.provider.chain_spec().genesis_hash()
         } else {
-            fetch_beacon_block(block.header().parent_hash).unwrap().hash_slow()
+            //fetch_beacon_block(block.header().parent_hash).unwrap().hash_slow()
+            self.storage.get_beacon_block_hash_by_eth1_hash(block.header().parent_hash).unwrap()
         };
         let deposits = self.get_deposits(block.number.saturating_sub(DEPOSIT_GAP))?;
         let finalized_block_hash = self
@@ -723,12 +725,8 @@ where
         let attestations = finalized_beacon_state.valid_validators().into_iter().map(|validator| {
             Attestation { pubkey: validator.pubkey, }
         }).collect();
-        self.voluntary_exits.retain(|voluntary_exit|
-            {
-                let is_valid = self.beacon.is_valid_voluntary_exit(finalized_block_hash, &voluntary_exit.voluntary_exit, &voluntary_exit.signature).unwrap_or(false);
-                is_valid
-            });
         let voluntary_exits = self.voluntary_exits.to_vec();
+        self.voluntary_exits.clear();
         let beacon_block = self.beacon.gen_beacon_block(Some(beacon_state_after_withdrawal), parent_beacon_block_hash, &deposits, &attestations, &voluntary_exits, &execution_requests, block)?;
         let beacon_block_hash = beacon_block.hash_slow();
         self.storage.save_beacon_block_by_hash(beacon_block_hash, beacon_block.clone())?;
@@ -753,7 +751,7 @@ where
             sleep(wiggle).await;
 
             // TODO: broadcast beacon block
-            broadcast_beacon_block(block_hash, &beacon_block).unwrap();
+            //broadcast_beacon_block(block_hash, &beacon_block).unwrap();
 
             new_block_tx
                 .send((

@@ -9,6 +9,8 @@ repository.workspace = true
 exclude.workspace = true
 
 [dependencies]
+ethereum_ssz.workspace = true
+ethereum_ssz_derive.workspace = true
 arbitrary.workspace = true
 integer-sqrt.workspace = true
 thiserror.workspace = true

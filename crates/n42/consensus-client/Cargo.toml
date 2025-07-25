@@ -52,6 +52,8 @@ tokio-stream.workspace = true
 futures-util.workspace = true
 
 # misc
+ethereum_ssz.workspace = true
+ethereum_ssz_derive.workspace = true
 arbitrary.workspace = true
 integer-sqrt.workspace = true
 thiserror.workspace = true

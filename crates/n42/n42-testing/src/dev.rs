@@ -838,7 +838,6 @@ async fn test_votes_from_deauthorized_signers_are_discarded_immediately__auth_vo
                 signer: "A".to_string(),
                 voted: Some("D".to_string()),
                 auth: Some(true),
-                ..Default::default()
             },
         ],
         results: vec![

@@ -1,5 +1,6 @@
 //! Contains the implementation of the mining mode for the local engine.
 
+use alloy_primitives::FixedBytes;
 use reth_storage_errors::provider::ProviderResult;
 use n42_engine_primitives::{PayloadAttributesBuilderExt};
 use std::str::FromStr;
@@ -47,7 +48,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{trace, debug, error, info, warn};
 
 use crate::beacon::{Beacon};
-use n42_primitives::{Attestation, BeaconBlock, Deposit, VoluntaryExit, VoluntaryExitWithSig, parse_deposit_log};
+use n42_primitives::{Attestation, BeaconBlock, Deposit, VoluntaryExit, VoluntaryExitWithSig, parse_deposit_log, BLSPubkey};
 use crate::network::{fetch_beacon_block, broadcast_beacon_block};
 
 /// A mining mode for the local dev engine.
@@ -1055,7 +1056,8 @@ where
                         let mut deposit: Deposit = Default::default();
                         deposit.data.amount = u64::from_le_bytes(deposit_event.amount.as_ref().try_into().unwrap());
                         deposit.data.withdrawal_credentials = B256::from_slice(&deposit_event.withdrawal_credentials);
-                        deposit.data.pubkey = deposit_event.pubkey.clone();
+                        let pubkey: BLSPubkey = deposit_event.pubkey.as_ref().try_into()?;
+                        deposit.data.pubkey = pubkey;
                         deposit.data.signature = deposit_event.signature.clone();
                         deposits.push(deposit);
                     }

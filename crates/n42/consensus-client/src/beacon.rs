@@ -1,3 +1,4 @@
+use alloy_rpc_types_beacon::requests::ExecutionRequestsV4;
 use reth_chainspec::EthereumHardforks;
 use reth_provider::{BlockIdReader, BlockReader, ChainSpecProvider, BeaconProvider, BeaconProviderWriter};
 use alloy_primitives::Sealable;
@@ -47,7 +48,7 @@ where
                 deposits: deposits.clone(),
                 attestations: attestations.clone(),
                 voluntary_exits: voluntary_exits.clone(),
-                execution_requests: parse_execution_requests(execution_requests),
+                execution_requests: parse_execution_requests(execution_requests)?,
             },
             ..Default::default()
         };
@@ -139,7 +140,6 @@ fn get_address(withdrawal_credentials: &B256) -> Address {
     Address::from_slice(&withdrawal_credentials.as_slice()[12..])
 }
 
-fn parse_execution_requests(requests: &Option<Requests>) -> ExecutionRequests {
-    //todo!()
-    Default::default()
+fn parse_execution_requests(requests: &Option<Requests>) -> eyre::Result<ExecutionRequestsV4> {
+    Ok(requests.clone().unwrap_or_default().try_into()?)
 }

@@ -58,6 +58,7 @@ arbitrary.workspace = true
 integer-sqrt.workspace = true
 thiserror.workspace = true
 alloy-rlp.workspace = true
+alloy-rpc-types-beacon.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 nix.workspace = true

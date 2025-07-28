@@ -1,12 +1,13 @@
+use alloy_rpc_types_beacon::requests::ExecutionRequestsV4;
 use ssz_derive::{Encode, Decode};
 use ssz::{Encode, Decode};
 //use tree_hash_derive::TreeHash;
 use integer_sqrt::IntegerSquareRoot;
 use alloy_eips::{
-    eip4895::{Withdrawal, Withdrawals}, eip7685::Requests,
+    eip4895::{Withdrawal, Withdrawals}, eip7002::WithdrawalRequest, eip7685::Requests
 };
 use serde::{Deserialize, Serialize};
-use alloy_primitives::Sealable;
+use alloy_primitives::{FixedBytes, Sealable};
 use alloy_primitives::{Address, Bytes, keccak256, BlockHash, B256, Log};
 use alloy_sol_types::{SolEnum, SolEvent, sol};
 use tracing::{trace, debug, error, info, warn};
@@ -75,13 +76,13 @@ sol! {
 
 pub type Epoch = u64;
 
-#[derive(Debug, Clone, Hash, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct VoluntaryExit {
     pub epoch: Epoch,
     pub validator_index: u64,
 }
 
-#[derive(Debug, Clone, Hash, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct VoluntaryExitWithSig {
     pub voluntary_exit: VoluntaryExit,
     pub signature: Bytes,
@@ -95,7 +96,7 @@ pub struct BeaconBlockChangeset{
     pub beaconblocks:Vec<(BlockHash,BeaconBlock)>,
 }
 
-#[derive(Debug, Clone, Hash, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct BeaconState {
     pub slot: u64,
     pub eth1_deposit_index: u64,
@@ -128,10 +129,10 @@ impl Sealable for BeaconState {
 pub type Gwei = u64;
 
 // mock
-pub type BLSPubkey = Bytes;
+pub type BLSPubkey = FixedBytes<48>;
 pub type BLSSignature = Bytes;
 
-#[derive(Debug, Clone, Hash, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct BeaconBlock {
     pub eth1_block_hash: BlockHash,
     pub parent_hash: BlockHash,
@@ -146,15 +147,15 @@ impl Sealable for BeaconBlock {
     }
 }
 
-#[derive(Debug, Clone, Hash, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct BeaconBlockBody {
     pub attestations: Vec<Attestation>,
     pub deposits: Vec<Deposit>,
     pub voluntary_exits: Vec<VoluntaryExitWithSig>,
-    pub execution_requests: ExecutionRequests,
+    pub execution_requests: ExecutionRequestsV4,
 }
 
-#[derive(Debug, Clone, Hash, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct ExecutionRequests {
     pub deposits: Vec<DepositRequest>,
     pub withdrawals: Vec<WithdrawalRequest>,
@@ -170,32 +171,34 @@ pub struct DepositRequest {
     pub index: u64,
 }
 
-#[derive(Debug, Clone, Hash, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+/*
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct WithdrawalRequest {
     pub source_address: Address,
     pub validator_pubkey: Bytes,
     pub amount: u64,
 }
+*/
 
-#[derive(Debug, Clone, Hash, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct ConsolidationRequest {
     pub source_address: Address,
     pub source_pubkey: Bytes,
     pub target_pubkey: Bytes,
 }
 
-#[derive(Debug, Clone, Hash, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct Attestation {
-    pub pubkey: Bytes,
+    pub pubkey: BLSPubkey,
 }
 
-#[derive(Debug, Clone, Hash, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct Deposit {
     pub proof: Vec<B256>,
     pub data: DepositData,
 }
 
-#[derive(Debug, Clone, Hash, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct DepositData {
     pub pubkey: BLSPubkey,
     pub withdrawal_credentials: B256,
@@ -746,7 +749,7 @@ impl BeaconState {
                 Ok(self.earliest_exit_epoch)
     }
 
-    pub fn get_validator_index_from_pubkey(&self, pubkey: &Bytes) -> Option<usize> {
+    pub fn get_validator_index_from_pubkey(&self, pubkey: &BLSPubkey) -> Option<usize> {
         self.validators.iter().position(|validator| validator.pubkey == *pubkey)
     }
 
@@ -1067,7 +1070,7 @@ pub fn apply_deposit(
     pub fn add_validator_to_registry(
         &mut self,
         //pubkey: PublicKeyBytes,
-        pubkey: Bytes,
+        pubkey: BLSPubkey,
         withdrawal_credentials: B256,
         amount: u64,
         //spec: &ChainSpec,
@@ -1314,7 +1317,7 @@ pub fn apply_deposit(
 
 }
 
-#[derive(Debug, Clone, Hash, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct PendingPartialWithdrawal {
     pub validator_index: u64,
     pub amount: u64,
@@ -1387,7 +1390,7 @@ pub enum ExitInvalid {
     PendingWithdrawalInQueue(u64),
 }
 
-#[derive(Debug, Clone, Hash, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct Eth1Data {
     pub deposit_root: B256,
     pub deposit_count: u64,

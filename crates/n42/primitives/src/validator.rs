@@ -92,7 +92,7 @@ impl Validator {
 
     pub fn from_deposit(
         //pubkey: PublicKeyBytes,
-        pubkey: Bytes,
+        pubkey: BLSPubkey,
         withdrawal_credentials: B256,
         amount: u64,
         //fork_name: ForkName,

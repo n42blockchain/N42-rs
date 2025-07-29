@@ -832,7 +832,6 @@ async fn test_votes_from_deauthorized_signers_are_discarded_immediately__auth_vo
                 signer: "B".to_string(),
                 voted: Some("C".to_string()),
                 auth: Some(false),
-                ..Default::default()
             },
             TesterVote {
                 signer: "A".to_string(),

@@ -434,7 +434,8 @@ where
                 let new_beacon_block: BeaconBlock = Default::default();
                 let new_beacon_block_hash = new_beacon_block.hash_slow();
 
-                let deposits = self.get_deposits(parent.number.saturating_sub(DEPOSIT_GAP))?;
+                //let deposits = self.get_deposits(parent.number.saturating_sub(DEPOSIT_GAP))?;
+                let deposits: Vec<Deposit> = Default::default();
                 if deposits != new_beacon_block.body.deposits {
                     return Err(eyre::eyre!("deposits mismatch between eth1 block and beacon block"));
                 }
@@ -716,7 +717,8 @@ where
             //fetch_beacon_block(block.header().parent_hash).unwrap().hash_slow()
             self.provider.get_beacon_block_hash_by_eth1_hash(&block.header().parent_hash)?.unwrap()
         };
-        let deposits = self.get_deposits(block.number.saturating_sub(DEPOSIT_GAP))?;
+        //let deposits = self.get_deposits(block.number.saturating_sub(DEPOSIT_GAP))?;
+        let deposits: Vec<Deposit> = Default::default();
         let finalized_block_hash = self
             .provider
             .finalized_block_hash()
@@ -1058,7 +1060,7 @@ where
                         deposit.data.withdrawal_credentials = B256::from_slice(&deposit_event.withdrawal_credentials);
                         let pubkey: BLSPubkey = deposit_event.pubkey.as_ref().try_into()?;
                         deposit.data.pubkey = pubkey;
-                        deposit.data.signature = deposit_event.signature.clone();
+                        //deposit.data.signature = deposit_event.signature.clone();
                         deposits.push(deposit);
                     }
                 }

@@ -2,7 +2,7 @@ pub use alloy_eips::eip1559::BaseFeeParams;
 use alloy_evm::eth::spec::EthExecutorSpec;
 
 use crate::{
-    constants::{MAINNET_DEPOSIT_CONTRACT, MAINNET_PRUNE_DELETE_LIMIT},
+    constants::{MAINNET_DEPOSIT_CONTRACT, MAINNET_PRUNE_DELETE_LIMIT, N42_DEVNET_DEPOSIT_CONTRACT},
     EthChainSpec,
 };
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
@@ -93,7 +93,7 @@ pub const N42_GENESIS_HASH: B256 =
 pub const N42_TESTNET_CHAINID: u64 = 1142;
 pub const N42_DEVNET_CHAINID: u64 = 1143;
 
-fn make_chain_spec(genesis: Genesis, chain: Chain) -> ChainSpec {
+fn make_chain_spec(genesis: Genesis, chain: Chain, deposit_contract: Option<DepositContract>) -> ChainSpec {
     let hardforks = N42_HARDFORKS.clone();
     //let genesis_hash = alloy_primitives::keccak256(alloy_rlp::encode(genesis.header()));
     let genesis_header = SealedHeader::new_unhashed(
@@ -110,7 +110,8 @@ fn make_chain_spec(genesis: Genesis, chain: Chain) -> ChainSpec {
             U256::from(0),
         )),
         hardforks,
-        deposit_contract: None,
+        //deposit_contract: None,
+        deposit_contract,
         base_fee_params: Default::default(),
         //max_gas_limit: ETHEREUM_BLOCK_GAS_LIMIT,
         prune_delete_limit: 0,
@@ -126,14 +127,14 @@ fn make_chain_spec(genesis: Genesis, chain: Chain) -> ChainSpec {
 pub static N42: LazyLock<Arc<ChainSpec>> = LazyLock::new(|| {
     let genesis: Genesis = serde_json::from_str(include_str!("../res/genesis/n42.json")).expect("Can't deserialize N42 genesis json");
     let chain = Chain::from_id(N42_TESTNET_CHAINID);
-    make_chain_spec(genesis, chain).into()
+    make_chain_spec(genesis, chain, None /* TODO: set deposit contract address */).into()
 });
 
 /// The N42 devnet spec
 pub static N42_DEVNET: LazyLock<Arc<ChainSpec>> = LazyLock::new(|| {
     let genesis: Genesis = serde_json::from_str(include_str!("../res/genesis/n42_devnet.json")).expect("Can't deserialize N42 genesis json");
     let chain = Chain::from_id(N42_DEVNET_CHAINID);
-    make_chain_spec(genesis, chain).into()
+    make_chain_spec(genesis, chain, Some(N42_DEVNET_DEPOSIT_CONTRACT)).into()
 });
 
 /// The Ethereum mainnet spec

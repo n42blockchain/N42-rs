@@ -33,7 +33,7 @@ pub const ejection_balance: u64 = 16000000000;
 pub const far_future_epoch: u64 = u64::max_value();
 pub const max_validators_per_withdrawals_sweep: u64 = 16384;
 pub const max_effective_balance: u64 = 32000000000; //?
-pub const full_exit_request_amount: u64 = 32000000000; //?
+pub const full_exit_request_amount: u64 = 0;
 pub const shard_committee_period: u64 = 1; //?
 pub const compounding_withdrawal_prefix_byte: u8 = 0x02;
 pub const eth1_address_withdrawal_prefix_byte: u8 = 0x01;
@@ -130,7 +130,7 @@ pub type Gwei = u64;
 
 // mock
 pub type BLSPubkey = FixedBytes<48>;
-pub type BLSSignature = Bytes;
+pub type BLSSignature = FixedBytes<96>;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct BeaconBlock {
@@ -316,7 +316,19 @@ impl BeaconState {
         //self.process_attestation(&beacon_block_body.attestations)?;
         //self.process_voluntary_exit(&beacon_block_body.voluntary_exits)?;
 
-        self.process_deposits(&beacon_block_body.deposits)?;
+        let deposits: Vec<Deposit> = beacon_block_body.execution_requests.deposits.clone().iter().map(|deposit_request| {
+            Deposit {
+                proof: Default::default(),
+                data: DepositData {
+                    pubkey: deposit_request.pubkey,
+                    withdrawal_credentials: deposit_request.withdrawal_credentials,
+                    amount: deposit_request.amount,
+                    signature: deposit_request.signature,
+                }
+            }
+
+        }).collect();
+        self.process_deposits(&deposits)?;
         self.process_exits(&beacon_block_body.voluntary_exits)?;
         self.process_withdrawal_requests(&beacon_block_body.execution_requests.withdrawals)?;
 

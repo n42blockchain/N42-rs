@@ -392,6 +392,8 @@ op-alloy-rpc-jsonrpsee = { version = "0.16.0", default-features = false }
 op-alloy-flz = { version = "0.13.0", default-features = false }
 
 # misc
+derivative = "2"
+ethereum_hashing = "0.7.0"
 integer-sqrt = "0.1.5"
 aquamarine = "0.6"
 auto_impl = "1"

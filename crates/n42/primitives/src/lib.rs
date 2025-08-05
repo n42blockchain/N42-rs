@@ -13,3 +13,11 @@ pub use beacon::*;
 
 mod safe_aitrh;
 mod activation_queue;
+mod committee_cache;
+mod shuffle_list;
+mod beacon_committee;
+mod attestation_duty;
+
+pub type Hash256 = alloy_primitives::B256;
+pub type Slot = u64;
+pub type CommitteeIndex = u64;

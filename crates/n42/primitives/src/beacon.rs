@@ -13,9 +13,12 @@ use alloy_sol_types::{SolEnum, SolEvent, sol};
 use tracing::{trace, debug, error, info, warn};
 
 use std::collections::{HashMap, BTreeMap};
-use crate::{activation_queue::ActivationQueue, Validator};
+use crate::{activation_queue::ActivationQueue, beacon_committee::BeaconCommittee, committee_cache::get_active_validator_indices, Hash256, Slot, Validator};
 use crate::safe_aitrh::SafeArith;
 use crate::safe_aitrh::SafeArithIter;
+use std::sync::Arc;
+use crate::committee_cache::CommitteeCache;
+use ethereum_hashing::hash;
 
 pub const SLOTS_PER_EPOCH: u64 = 5;
 const REWARD_AMOUNT: u64 = 1;
@@ -48,9 +51,14 @@ pub const min_epochs_to_inactivity_penalty :u64 = 4;
 pub const inactivity_penalty_quotient:u64 = 67108864; //?
 pub const proposer_reward_quotient:u64 = 4;
 pub const min_per_epoch_churn_limit:u64 = 4;
+pub const max_committees_per_slot: usize = 4;
+pub const target_committee_size: usize = 4;
+pub const min_seed_lookahead: u64 = 1;
+pub const shuffle_round_count: u8 = 10;
 
 pub const min_validator_withdrawability_delay: u64 = 1;
 
+pub const CACHED_EPOCHS: usize = 3;
 
 macro_rules! verify {
     ($condition: expr, $result: expr) => {
@@ -112,6 +120,8 @@ pub struct BeaconState {
     pub eth1_data: Eth1Data,
 
     //pub total_active_balance: Option<TotalActiveBalance>,
+
+    pub committee_caches: Vec<CommitteeCache>,
 }
 
 /*
@@ -228,22 +238,37 @@ pub fn parse_deposit_log(log: &Log) -> Option<DepositEvent> {
 }
 
 impl BeaconState {
+    pub fn new() -> Self {
+        Self {
+            committee_caches: vec![Default::default(); 3],
+            ..Default::default()
+        }
+    }
+
     pub fn state_transition(old_beacon_state: &BeaconState, beacon_block: &BeaconBlock) -> eyre::Result<Self> {
         debug!(target: "consensus-client", ?old_beacon_state, ?beacon_block, "state_transition");
         let mut new_beacon_state = old_beacon_state.clone();
-        if (new_beacon_state.slot + 1) % SLOTS_PER_EPOCH == 0 {
+        new_beacon_state.slot += 1;
+        if (new_beacon_state.slot) % SLOTS_PER_EPOCH == 0 {
             new_beacon_state.process_epoch()?;
         }
-        new_beacon_state.slot += 1;
         new_beacon_state.process_block(&beacon_block)?;
 
         Ok(new_beacon_state)
     }
 
     pub fn process_epoch(&mut self) -> eyre::Result<()> {
+        // workaround empty validators
+        let epoch = self.current_epoch();
+        let active_validator_indices = get_active_validator_indices(&self.validators, epoch);
+        if !active_validator_indices.is_empty() {
+            self.build_all_committee_caches()?;
+        }
+
         let validator_statuses = ValidatorStatuses::new(self)?;
         self.process_rewards_and_penalties(&validator_statuses)?;
         self.process_registry_updates()?;
+
         Ok(())
     }
 
@@ -677,6 +702,18 @@ impl BeaconState {
 
     pub fn next_epoch(&self) -> eyre::Result<Epoch> {
         Ok(self.current_epoch().safe_add(1)?)
+    }
+
+    /// The epoch prior to `self.current_epoch()`.
+    ///
+    /// If the current epoch is the genesis epoch, the genesis_epoch is returned.
+    pub fn previous_epoch(&self) -> Epoch {
+        let current_epoch = self.current_epoch();
+        if let Ok(prev_epoch) = current_epoch.safe_sub(1) {
+            prev_epoch
+        } else {
+            current_epoch
+        }
     }
 
     /// Safe indexer for the `validators` list.
@@ -1295,18 +1332,6 @@ pub fn apply_deposit(
             || (val.slashed && previous_epoch.safe_add(1)? < val.withdrawable_epoch))
     }
 
-    /// The epoch prior to `self.current_epoch()`.
-    ///
-    /// If the current epoch is the genesis epoch, the genesis_epoch is returned.
-    pub fn previous_epoch(&self) -> Epoch {
-        let current_epoch = self.current_epoch();
-        if let Ok(prev_epoch) = current_epoch.safe_sub(1) {
-            prev_epoch
-        } else {
-            current_epoch
-        }
-    }
-
     /// Compute the total active balance cache from scratch.
     ///
     /// This method should rarely be invoked because single-pass epoch processing keeps the total
@@ -1325,6 +1350,135 @@ pub fn apply_deposit(
             total_active_balance,
             effective_balance_increment,
         ))
+    }
+
+    pub fn get_seed(
+        &self,
+        epoch: Epoch,
+    ) -> eyre::Result<Hash256> {
+        let mut preimage = epoch.to_le_bytes();
+        Ok(Hash256::from_slice(&hash(&preimage)))
+    }
+
+    /// Build all committee caches, if they need to be built.
+    pub fn build_all_committee_caches(&mut self,) -> eyre::Result<()> {
+        //self.build_committee_cache(RelativeEpoch::Previous)?;
+        self.build_committee_cache(RelativeEpoch::Current)?;
+        //self.build_committee_cache(RelativeEpoch::Next)?;
+        Ok(())
+    }
+
+    /// Build a committee cache, unless it is has already been built.
+    pub fn build_committee_cache(
+        &mut self,
+        relative_epoch: RelativeEpoch,
+        //spec: &ChainSpec,
+    ) -> eyre::Result<()> {
+        let i = Self::committee_cache_index(relative_epoch);
+        let is_initialized = self
+            .committee_cache_at_index(i)?
+            .is_initialized_at(relative_epoch.into_epoch(self.current_epoch()));
+
+        if !is_initialized {
+            //self.force_build_committee_cache(relative_epoch, spec)?;
+            self.force_build_committee_cache(relative_epoch)?;
+        }
+
+        /*
+        if self.total_active_balance().is_none() && relative_epoch == RelativeEpoch::Current {
+            self.build_total_active_balance_cache(spec)?;
+        }
+        */
+        Ok(())
+    }
+
+    /// Get the committee cache at a given index.
+    fn committee_cache_at_index(&self, index: usize) -> eyre::Result<&CommitteeCache> {
+        self.committee_caches
+            .get(index)
+            .ok_or(eyre::eyre!(format!("Error::CommitteeCachesOutOfBounds, {index}")))
+    }
+
+    /// Get a mutable reference to the committee cache at a given index.
+    fn committee_cache_at_index_mut(
+        &mut self,
+        index: usize,
+    ) -> eyre::Result<&mut CommitteeCache> {
+        self.committee_caches
+            .get_mut(index)
+            .ok_or(eyre::eyre!(format!("Error::CommitteeCachesOutOfBounds, {index}")))
+    }
+
+    pub(crate) fn committee_cache_index(relative_epoch: RelativeEpoch) -> usize {
+        match relative_epoch {
+            RelativeEpoch::Previous => 0,
+            RelativeEpoch::Current => 1,
+            RelativeEpoch::Next => 2,
+        }
+    }
+
+    /// Always builds the requested committee cache, even if it is already initialized.
+    pub fn force_build_committee_cache(
+        &mut self,
+        relative_epoch: RelativeEpoch,
+        //spec: &ChainSpec,
+    ) -> eyre::Result<()> {
+        let epoch = relative_epoch.into_epoch(self.current_epoch());
+        let i = Self::committee_cache_index(relative_epoch);
+
+        //*self.committee_cache_at_index_mut(i)? = self.initialize_committee_cache(epoch, spec)?;
+        *self.committee_cache_at_index_mut(i)? = self.initialize_committee_cache(epoch)?;
+        Ok(())
+    }
+
+    /// Initializes a new committee cache for the given `epoch`, regardless of whether one already
+    /// exists. Returns the committee cache without attaching it to `self`.
+    ///
+    /// To build a cache and store it on `self`, use `Self::build_committee_cache`.
+    pub fn initialize_committee_cache(
+        &self,
+        epoch: Epoch,
+        //spec: &ChainSpec,
+    ) -> eyre::Result<CommitteeCache> {
+        //CommitteeCache::initialized(self, epoch, spec)
+        CommitteeCache::initialized(self, epoch)
+    }
+
+    /// Get all of the Beacon committees at a given relative epoch.
+    ///
+    /// Utilises the committee cache.
+    ///
+    /// Spec v0.12.1
+    pub fn get_beacon_committees_at_epoch(
+        &self,
+        relative_epoch: RelativeEpoch,
+    ) -> eyre::Result<Vec<BeaconCommittee<'_>>> {
+        // workaround empty validators
+        let epoch = relative_epoch.into_epoch(self.current_epoch());
+        let active_validator_indices = get_active_validator_indices(&self.validators, epoch);
+        if active_validator_indices.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let cache = self.committee_cache(relative_epoch)?;
+        cache.get_all_beacon_committees()
+    }
+
+    /// Returns the cache for some `RelativeEpoch`. Returns an error if the cache has not been
+    /// initialized.
+    pub fn committee_cache(
+        &self,
+        relative_epoch: RelativeEpoch,
+    ) -> eyre::Result<&CommitteeCache> {
+        let i = Self::committee_cache_index(relative_epoch);
+        let cache = self.committee_cache_at_index(i)?;
+        debug!(target: "consensus-client", ?i, ?cache, "committee_cache");
+
+        if cache.is_initialized_at(relative_epoch.into_epoch(self.current_epoch())) {
+            Ok(cache)
+        } else {
+            Err(eyre::eyre!(format!("Error::CommitteeCacheUninitialized, relative_epoch: {relative_epoch:?}")))
+        }
     }
 
 }
@@ -1789,3 +1943,32 @@ pub fn get_attestation_component_delta(
 fn get_proposer_reward(base_reward: u64) -> eyre::Result<u64> {
     Ok(base_reward.safe_div(proposer_reward_quotient)?)
 }
+
+/// Defines the epochs relative to some epoch. Most useful when referring to the committees prior
+/// to and following some epoch.
+///
+/// Spec v0.12.1
+#[derive(Debug, PartialEq, Clone, Copy, arbitrary::Arbitrary)]
+pub enum RelativeEpoch {
+    /// The prior epoch.
+    Previous,
+    /// The current epoch.
+    Current,
+    /// The next epoch.
+    Next,
+}
+
+impl RelativeEpoch {
+    /// Returns the `epoch` that `self` refers to, with respect to the `base` epoch.
+    ///
+    /// Spec v0.12.1
+    pub fn into_epoch(self, base: Epoch) -> Epoch {
+        match self {
+            // Due to saturating nature of epoch, check for current first.
+            RelativeEpoch::Current => base,
+            RelativeEpoch::Previous => base.saturating_sub(1u64),
+            RelativeEpoch::Next => base.saturating_add(1u64),
+        }
+    }
+}
+

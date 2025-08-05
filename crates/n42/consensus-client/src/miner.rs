@@ -48,7 +48,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{trace, debug, error, info, warn};
 
 use crate::beacon::{Beacon};
-use n42_primitives::{Attestation, BeaconBlock, Deposit, VoluntaryExit, VoluntaryExitWithSig, parse_deposit_log, BLSPubkey};
+use n42_primitives::{RelativeEpoch, Attestation, BeaconState, BeaconBlock, Deposit, VoluntaryExit, VoluntaryExitWithSig, parse_deposit_log, BLSPubkey};
 use crate::network::{fetch_beacon_block, broadcast_beacon_block};
 
 /// A mining mode for the local dev engine.
@@ -206,7 +206,7 @@ where
     /// Runs the [`N42Miner`] in a loop, polling the miner and building payloads.
     async fn run(mut self) -> eyre::Result<()> {
         self.provider.save_beacon_block_hash_by_eth1_hash(&self.provider.chain_spec().genesis_hash(), self.provider.chain_spec().genesis_hash())?;
-        self.provider.save_beacon_state_by_hash(&self.provider.chain_spec().genesis_hash(), Default::default())?;
+        self.provider.save_beacon_state_by_hash(&self.provider.chain_spec().genesis_hash(), BeaconState::new())?;
 
         if !(self.get_best_block_num_signers() == 1 && self.is_among_signers()?) {
             self.initial_sync().await;
@@ -739,6 +739,10 @@ where
         self.provider.save_beacon_block_by_eth1_hash(&block.hash(), beacon_block.clone())?;
 
         self.provider.save_beacon_block_hash_by_eth1_hash(&block.hash(), beacon_block_hash)?;
+
+        let new_beacon_state = self.provider.get_beacon_state_by_hash(&beacon_block_hash)?.unwrap();
+        let all_beacon_committees = new_beacon_state.get_beacon_committees_at_epoch(RelativeEpoch::Current)?;
+        debug!(target: "consensus-client", ?all_beacon_committees, "advance");
 
         self.recent_blocks.insert(block.hash_slow(), block.clone());
 

@@ -46,7 +46,7 @@ use std::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
-    time::{Duration, UNIX_EPOCH},
+    time::{Duration, UNIX_EPOCH, SystemTime},
 };
 use tokio::sync::{mpsc, broadcast};
 use tokio::time::{interval_at, sleep, Instant, Interval};
@@ -134,6 +134,7 @@ pub struct N42Miner<T: PayloadTypes, Provider, B, Network> {
     broadcast_unverified_block_tx: broadcast::Sender<(UnverifiedBlock, Arc<Vec<BLSPubkey>>)>,
     block_verify_result_rx: mpsc::Receiver<BlockVerifyResult>,
     pending_block_data: Option<PendingBlockData>,
+    start_timestamp: u64,
 
     num_generated_blocks: u64,
     num_skipped_new_block: u64,
@@ -205,6 +206,8 @@ where
         };
         let block_time = mode_interval.period().as_secs();
 
+        let start_timestamp =
+            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
         let miner = Self {
             provider,
             payload_attributes_builder,
@@ -228,6 +231,7 @@ where
             broadcast_unverified_block_tx,
             block_verify_result_rx,
             pending_block_data: None,
+            start_timestamp,
         };
 
         // Spawn the miner
@@ -356,7 +360,8 @@ where
 .ok_or(eyre::eyre!("sealed_header not found, block_number={:?}", best_block_number))?;
         let now = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)?;
-        if now.as_secs() > latest_header.timestamp() + MIN_NO_BLOCK_TIMESTAMP_GAP {
+        if now.as_secs() > self.start_timestamp + MIN_NO_BLOCK_TIMESTAMP_GAP &&
+            now.as_secs() > latest_header.timestamp() + MIN_NO_BLOCK_TIMESTAMP_GAP {
             warn!(target: "consensus-client", latest_header_timestamp=?latest_header.timestamp(), ?now, "long_time_no_block_generated");
             Ok(true)
         } else {

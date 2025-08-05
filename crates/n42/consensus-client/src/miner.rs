@@ -26,7 +26,7 @@ use reth_payload_primitives::{
 };
 use reth_primitives::{Block, Header, SealedBlock};
 use reth_primitives_traits::{Block as BlockTrait, header::clique_utils::{recover_address, recover_address_generic}};
-use reth_provider::{BlockIdReader, BlockReader, ChainSpecProvider};
+use reth_provider::{BlockIdReader, BlockReader, ChainSpecProvider, DatabaseProviderFactory, ChainStateBlockReader};
 use reth_transaction_pool::TransactionPool;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -140,6 +140,7 @@ where
         BlockReader
         + BlockIdReader
         + ChainSpecProvider<ChainSpec: EthereumHardforks>
+        + DatabaseProviderFactory <Provider: ChainStateBlockReader>
         + 'static,
     B: PayloadAttributesBuilder<<T as PayloadTypes>::PayloadAttributes>,
     Network: FullNetwork,
@@ -436,11 +437,17 @@ where
     }
 
     fn get_safe_block_num_hash_from_provider(&mut self) -> BlockNumHash {
-        let safe_block_number = self
+        let mut safe_block_number = self
             .provider
             .safe_block_number()
             .unwrap_or(Some(0))
             .unwrap_or(0);
+        if safe_block_number == 0 {
+            safe_block_number = self
+                .provider.database_provider_ro().unwrap().last_safe_block_number()
+                .unwrap()
+                .unwrap();
+        }
 
         let safe_block_header = self
             .provider

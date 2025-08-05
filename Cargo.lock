@@ -3007,6 +3007,7 @@ dependencies = [
 name = "deposit_sdk"
 version = "1.4.3"
 dependencies = [
+ "blst",
  "clap",
  "ethereum_serde_utils 0.7.0",
  "ethers",
@@ -3015,6 +3016,7 @@ dependencies = [
  "hex-literal 0.4.1",
  "keystore",
  "n42-withdrawals",
+ "rand 0.8.5",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -8930,6 +8932,7 @@ dependencies = [
  "arbitrary",
  "bytes",
  "derive_more 2.0.1",
+ "hex",
  "proptest",
  "proptest-arbitrary-interop",
  "reth-chainspec",
@@ -8938,6 +8941,7 @@ dependencies = [
  "reth-primitives-traits",
  "serde",
  "thiserror 2.0.12",
+ "tracing",
 ]
 
 [[package]]

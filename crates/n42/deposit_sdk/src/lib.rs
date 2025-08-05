@@ -40,7 +40,8 @@ abigen!(
 );
 
 /// 质押合约地址 公司的
-pub const DEPOSIT_CONTRACT_ADDRESS: &str = "0x29a625941FA7B43be23b4309CD76e4d1BE688429";
+//pub const DEPOSIT_CONTRACT_ADDRESS: &str = "0x29a625941FA7B43be23b4309CD76e4d1BE688429";
+pub const DEPOSIT_CONTRACT_ADDRESS: &str = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
 /// 退出合约地址 公司的
 pub const EIP7002_CONTRACT_ADDRESS: &str = "0x00000961Ef480Eb55e80D19ad83579A64c007002";
 
@@ -181,14 +182,28 @@ impl EthStakingSdk {
             .deposit_contract
             .deposit(pubkey, creds, sig, root)
             .value(value);
+        let result = call.call().await;
+        println!("simulation {result:?}");
 
         let pending_tx = call.send().await?;
+        println!("{pending_tx:?}");
 
         // 等待区块确认
         let receipt = pending_tx
             .await?
             .ok_or(SdkError::TransactionDropped)?;
-        Ok(receipt)
+        match receipt.status {
+            Some(v) => {
+                if v == U64::from(1) {
+                    Ok(receipt)
+                } else {
+                    Err(SdkError::TransactionDropped)
+                }
+            },
+            None => {
+                Err(SdkError::TransactionDropped)
+            }
+        }
     }
 
     /// 手动发起一次空的 eth_call 来获取当前 fee
@@ -234,7 +249,7 @@ impl EthStakingSdk {
 
         let mut data = Vec::with_capacity(56);
         data.extend_from_slice(&pubkey_bytes);
-        data.extend_from_slice(&u64::MAX.to_be_bytes());
+        data.extend_from_slice(&u64::min_value().to_be_bytes());
 
         // 2.3 构造并发送交易
         let tx = TransactionRequest {
@@ -248,7 +263,7 @@ impl EthStakingSdk {
             .client
             .send_transaction(tx, None)
             .await
-            .map_err(|e| SdkError::Contract(format!("发送退出交易失败")))?;
+            .map_err(|e| SdkError::Contract(format!("发送退出交易失败 {e:?}")))?;
         println!("   交易已发送，等待确认... Tx Hash: {:?}", pending_tx.tx_hash());
 
         let receipt = pending_tx
@@ -256,8 +271,9 @@ impl EthStakingSdk {
             .map_err(|e| SdkError::Contract(format!("等待交易确认失败: {}", e)))?
             .ok_or(SdkError::TransactionDropped)?;
         println!(
-            "   ✅ 退出请求已成功上链！Block: {}",
-            receipt.block_number.unwrap_or_default()
+            "   ✅ 退出请求已成功上链！Block: {}, gas_used: {}",
+            receipt.block_number.unwrap_or_default(),
+            receipt.gas_used.unwrap_or_default(),
         );
 
         Ok(receipt)

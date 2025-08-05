@@ -28,6 +28,8 @@ tree_hash = "0.8"
 tree_hash_derive = "0.9"
 ethereum_serde_utils = "0.7"
 clap = { version = "4.5.23", features = ["derive"] }
+blst = { version = "0.3.3" }
+rand = "0.8"
 
 
 [patch.crates-io]

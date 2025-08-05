@@ -34,7 +34,7 @@ use std::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
-    time::{Duration, UNIX_EPOCH},
+    time::{Duration, UNIX_EPOCH, SystemTime},
 };
 use tokio::sync::mpsc;
 use tokio::time::{interval_at, sleep, Instant, Interval};
@@ -112,6 +112,7 @@ pub struct N42Miner<T: PayloadTypes, Provider, B, Network> {
     recent_num_to_td: schnellru::LruMap<u64, U256>,
     new_block_tx: mpsc::Sender<(NewBlock, BlockHash)>,
     new_block_rx: mpsc::Receiver<(NewBlock, BlockHash)>,
+    start_timestamp: u64,
 
     num_generated_blocks: u64,
     num_skipped_new_block: u64,
@@ -159,6 +160,8 @@ where
         consensus: Arc<dyn FullConsensus<<T::BuiltPayload as BuiltPayload>::Primitives, Error = ConsensusError>>,
     ) {
         let (new_block_tx, new_block_rx) = mpsc::channel::<(NewBlock, BlockHash)>(128);
+        let start_timestamp =
+            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
         let miner = Self {
             provider,
             payload_attributes_builder,
@@ -177,6 +180,7 @@ where
             order_stats: HashMap::new(),
             new_block_tx,
             new_block_rx,
+            start_timestamp,
         };
 
         // Spawn the miner
@@ -279,16 +283,16 @@ where
     }
 
     fn long_time_no_block_generated(&self) -> bool {
-
         let best_block_number = self.provider.best_block_number().unwrap();
         let latest_header = self.provider
             .sealed_header(best_block_number)
             .unwrap()
             .unwrap();
-        let now = std::time::SystemTime::now()
+        let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("cannot be earlier than UNIX_EPOCH");
-        if now.as_secs() > latest_header.timestamp() + MIN_NO_BLOCK_TIMESTAMP_GAP {
+            .expect("cannot be earlier than UNIX_EPOCH").as_secs();
+        if now > self.start_timestamp + MIN_NO_BLOCK_TIMESTAMP_GAP &&
+            now > latest_header.timestamp() + MIN_NO_BLOCK_TIMESTAMP_GAP {
             warn!(target: "consensus-client", latest_header_timestamp=?latest_header.timestamp(), ?now, "long_time_no_block_generated");
             true
         } else {
@@ -567,7 +571,7 @@ where
             .unwrap()
             .unwrap();
         debug!(target: "consensus-client", block_time, "advance");
-        let now = std::time::SystemTime::now()
+        let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("cannot be earlier than UNIX_EPOCH");
         let expected_next_timestamp = Duration::from_secs(header.header().timestamp() + block_time);

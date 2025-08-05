@@ -496,7 +496,7 @@ where
         let present_timestamp =
             SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
 
-        if header.timestamp() > present_timestamp {
+        if header.timestamp() > present_timestamp + alloy_eips::merge::ALLOWED_FUTURE_BLOCK_TIME_SECONDS {
             return Err(ConsensusError::TimestampIsInFuture {
                 timestamp: header.timestamp(),
                 present_timestamp,

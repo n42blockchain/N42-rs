@@ -28,6 +28,7 @@ sled = "0.34.7"
 
 
 rlp = "0.4"
+alloy-eips.workspace = true
 alloy-rlp.workspace = true
 alloy-genesis.workspace = true
 alloy-primitives.workspace = true

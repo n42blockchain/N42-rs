@@ -489,11 +489,11 @@ where
                 signer
             })
             .collect::<Vec<_>>();
-        let mut active_signers: Vec<Address> = vec![];
 
         active_signers.sort();
         active_signers.dedup();
         let num_active_signers: u64 = active_signers.len() as u64;
+        debug!(target: "consensus-client", num_signers, num_active_signers, "determine_safe_block");
         if num_active_signers == num_signers {
             // if in NUM_CONFIRM_ROUNDS rounds, all active signers have signed a 2-difficulty block, then it is considered finalized
             let order_in_round = (best_block_number.saturating_sub(NUM_CONFIRM_ROUNDS * num_signers)
@@ -519,7 +519,7 @@ where
         } else {
             safe_block_number = safe_block_number.max(header
                 .number()
-                .saturating_sub(num_active_signers * 3 + 1));
+                .saturating_sub(num_active_signers * 2 + num_signers + 1));
         }
         let safe_block_header = self
             .provider

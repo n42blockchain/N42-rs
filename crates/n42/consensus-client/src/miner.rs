@@ -530,7 +530,7 @@ where
     }
 
     fn get_safe_block_num_hash_from_provider(&mut self) -> eyre::Result<BlockNumHash> {
-        let safe_block_number = self
+        let mut safe_block_number = self
             .provider
             .safe_block_number()
             .unwrap_or(Some(0))
@@ -538,8 +538,8 @@ where
         if safe_block_number == 0 {
             safe_block_number = self
                 .provider.database_provider_ro().unwrap().last_safe_block_number()
-                .unwrap()
-                .unwrap();
+            .unwrap_or(Some(0))
+            .unwrap_or(0);
         }
 
         let safe_block_header = self

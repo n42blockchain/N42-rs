@@ -1,6 +1,6 @@
 #![allow(non_snake_case)]
 use std::str::FromStr;
-use alloy_rpc_types_engine::{ExecutionPayloadV3};
+use alloy_rpc_types_engine::ExecutionPayloadV3;
 use alloy_signer_local::PrivateKeySigner;
 use reth_primitives_traits::{SealedHeader, NodePrimitives,};
 use reth_chainspec::make_genesis_header;

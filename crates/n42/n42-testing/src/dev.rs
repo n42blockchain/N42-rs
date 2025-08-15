@@ -363,7 +363,6 @@ async fn test_single_signer__dropping_itself__weird__but_one_less_cornercase_by_
                 signer: "A".to_string(),
                 voted: Some("A".to_string()),
                 auth: Some(false),
-                ..Default::default()
             },
         ],
         results: vec![

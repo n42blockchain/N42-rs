@@ -13,7 +13,8 @@ use n42_engine_types::{N42Node};
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_node_builder::NodeHandle;
 use reth_node_ethereum::EthereumNode;
-use tracing::info;
+use tokio::sync::{broadcast, mpsc};
+use tracing::{info, error};
 use n42::consensus_ext::{ConsensusExtApiServer, ConsensusExt, ConsensusBeaconExtApiServer, ConsensusBeaconExt};
 
 const DEFAULT_BLOCK_TIME_SECS: u64 = 8;
@@ -26,6 +27,13 @@ fn main() {
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
     }
 
+    let (verification_tx, verification_rx) = mpsc::channel(100);
+    let (broadcast_tx, _broadcast_rx) = broadcast::channel(100);
+    let broadcast_tx_clone = broadcast_tx.clone();
+    let broadcast_tx_clone_for_message_producer = broadcast_tx.clone();
+    let broadcast_tx_clone_for_miner = broadcast_tx.clone();
+
+
     if let Err(err) =
         Cli::<EthereumChainSpecParser, RessArgs>::parse().run(async move |builder, ress_args| {
             info!(target: "reth::cli", "Launching node");
@@ -36,14 +44,14 @@ fn main() {
                             let consensus = ctx.consensus().clone();
                             let provider = ctx.provider().clone();
 
-                            let beacon_ext = ConsensusBeaconExt { consensus: consensus.clone(), provider: provider.clone() };
+                            let beacon_ext = ConsensusBeaconExt { consensus: consensus.clone(), provider: provider.clone(), verification_tx, broadcast_tx: broadcast_tx_clone };
                             let ext = ConsensusExt { consensus, provider };
 
                             // now we merge our extension namespace into all configured transports
                             ctx.auth_module.merge_auth_methods(ext.into_rpc())?;
                             ctx.modules.merge_configured(beacon_ext.into_rpc())?;
 
-                            println!("consensus rpc extension enabled");
+                            info!(target: "reth::cli", "consensus rpc extension enabled");
 
                             Ok(())
                         })
@@ -73,6 +81,8 @@ fn main() {
                 node.payload_builder_handle.clone(),
                 node.network.clone(),
                 node.consensus.clone(),
+                broadcast_tx_clone_for_miner,
+                verification_rx,
             );
 
             // Install ress subprotocol.
@@ -90,7 +100,8 @@ fn main() {
             node_exit_future.await
         })
     {
-        eprintln!("Error: {err:?}");
+        error!(target: "reth::cli", "Error: {err:?}");
         std::process::exit(1);
     }
 }
+

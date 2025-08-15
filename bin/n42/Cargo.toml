@@ -17,6 +17,7 @@ workspace = true
 n42-engine-types.workspace = true
 n42-engine-primitives.workspace = true
 n42-primitives.workspace = true
+n42-clique.workspace = true
 # reth
 reth-ethereum-cli.workspace = true
 reth-chainspec.workspace = true

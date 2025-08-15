@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+use blst::min_pk::{AggregateSignature, Signature};
 use alloy_rpc_types_beacon::requests::ExecutionRequestsV4;
 use ssz_derive::{Encode, Decode};
 use ssz::{Encode, Decode};
@@ -158,11 +160,26 @@ impl Sealable for BeaconBlock {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct BlockVerifyResultAggregate {
+    pub validator_indexes: BTreeSet<u64>,
+    pub block_aggregate_signature: Option<FixedBytes<96>>,
+}
+
+pub fn agg_sig_to_fixed(sig: &AggregateSignature) -> FixedBytes<96> {
+    FixedBytes::from(sig.to_signature().to_bytes())
+}
+
+pub fn fixed_to_agg_sig(bytes: &FixedBytes<96>) -> AggregateSignature {
+    AggregateSignature::from_signature(&Signature::from_bytes(bytes.as_ref()).unwrap())
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct BeaconBlockBody {
     pub attestations: Vec<Attestation>,
     pub deposits: Vec<Deposit>,
     pub voluntary_exits: Vec<VoluntaryExitWithSig>,
     pub execution_requests: ExecutionRequestsV4,
+    pub block_verification: BlockVerifyResultAggregate,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]

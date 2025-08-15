@@ -39,6 +39,7 @@ tracing.workspace = true
 schnellru.workspace = true
 
 bytes.workspace=true
+blst.workspace = true
 
 secp256k1.workspace=true
 [lints]

@@ -1,3 +1,5 @@
+use reth_primitives_traits::AlloyBlockHeader;
+use blst::min_pk::PublicKey;
 use alloy_rpc_types_beacon::requests::ExecutionRequestsV4;
 use reth_chainspec::EthereumHardforks;
 use reth_provider::{BlockIdReader, BlockReader, ChainSpecProvider, BeaconProvider, BeaconProviderWriter};
@@ -12,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use alloy_rlp::{Encodable, Decodable, RlpEncodable,  RlpDecodable};
 use std::collections::{HashMap, BTreeMap};
 use alloy_primitives::{keccak256, BlockHash, B256, Log};
-use n42_primitives::{Attestation, BeaconBlock, BeaconBlockBody, BeaconState, Deposit, DepositData, Epoch, ExecutionRequests, Validator, VoluntaryExit, VoluntaryExitWithSig, SLOTS_PER_EPOCH };
+use n42_primitives::{Attestation, BeaconBlock, BeaconBlockBody, BeaconState, BlockVerifyResultAggregate, Deposit, DepositData, Epoch, ExecutionRequests, Validator, VoluntaryExit, VoluntaryExitWithSig, SLOTS_PER_EPOCH };
 use tracing::{trace, debug, error, info, warn};
 
 const INMEMORY_BEACON_STATES: u32 = 256;
@@ -40,7 +42,7 @@ where
         }
     }
 
-    pub fn gen_beacon_block(&mut self, old_beacon_state: Option<BeaconState>, parent_hash: BlockHash, deposits: &Vec<Deposit>, attestations: &Vec<Attestation>, voluntary_exits: &Vec<VoluntaryExitWithSig>, execution_requests: &Option<Requests>, eth1_sealed_block: &SealedBlock) -> eyre::Result<BeaconBlock> {
+    pub fn gen_beacon_block(&mut self, old_beacon_state: Option<BeaconState>, parent_hash: BlockHash, deposits: &Vec<Deposit>, attestations: &Vec<Attestation>, voluntary_exits: &Vec<VoluntaryExitWithSig>, execution_requests: &Option<Requests>, eth1_sealed_block: &SealedBlock, block_verification: BlockVerifyResultAggregate) -> eyre::Result<BeaconBlock> {
         let mut beacon_block = BeaconBlock {
             parent_hash,
             eth1_block_hash: eth1_sealed_block.hash_slow(),
@@ -49,6 +51,7 @@ where
                 attestations: attestations.clone(),
                 voluntary_exits: voluntary_exits.clone(),
                 execution_requests: parse_execution_requests(execution_requests)?,
+                block_verification,
             },
             ..Default::default()
         };
@@ -132,6 +135,35 @@ where
         }
 
         Ok(false)
+    }
+
+    fn get_beacon_state_from_block_hash(&self, block_hash: B256) -> eyre::Result<BeaconState> {
+        let beacon_block = self.provider.get_beacon_block_by_eth1_hash(&block_hash)?.ok_or(eyre::eyre!("beacon block not found, block_hash={:?}", block_hash))?;
+        let beacon_block_hash = beacon_block.hash_slow();
+
+        let beacon_state = self.provider.get_beacon_state_by_hash(&beacon_block_hash)?.ok_or(eyre::eyre!("beacon state not found, beacon_block_hash={:?}", beacon_block_hash))?;
+
+        Ok(beacon_state)
+    }
+
+    pub fn get_validator_index_from_beacon_state(&self, block_hash: B256, pubkey: PublicKey) -> eyre::Result<Option<u64>> {
+        let beacon_state = self.get_beacon_state_from_block_hash(block_hash)?;
+
+        for (i, validator) in beacon_state.validators.into_iter().enumerate() {
+            if pubkey == PublicKey::from_bytes(&validator.pubkey.as_slice()).unwrap() {
+                return Ok(Some(i as u64));
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub fn get_validator_pubkey_from_beacon_state(&self, block_hash: B256, validator_index: u64) -> eyre::Result<Option<PublicKey>> {
+        let beacon_state = self.get_beacon_state_from_block_hash(block_hash)?;
+
+        let validator = beacon_state.get_validator(validator_index as usize)?;
+        let pubkey = PublicKey::from_bytes(validator.pubkey.as_ref()).unwrap();
+        Ok(Some(pubkey))
     }
 }
 

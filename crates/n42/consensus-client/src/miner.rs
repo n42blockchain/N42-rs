@@ -1,6 +1,12 @@
 //! Contains the implementation of the mining mode for the local engine.
 
+use alloy_eips::{
+    eip7685::Requests,
+};
+use blst::min_pk::{AggregateSignature, Signature};
+use blst::min_pk::PublicKey;
 use alloy_primitives::FixedBytes;
+use n42_clique::{BlockVerifyResult, UnverifiedBlock, BLS_DST};
 use reth_storage_errors::provider::ProviderResult;
 use n42_engine_primitives::{PayloadAttributesBuilderExt};
 use std::str::FromStr;
@@ -42,13 +48,13 @@ use std::{
     task::{Context, Poll},
     time::{Duration, UNIX_EPOCH},
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, broadcast};
 use tokio::time::{interval_at, sleep, Instant, Interval};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{trace, debug, error, info, warn};
 
 use crate::beacon::{Beacon};
-use n42_primitives::{RelativeEpoch, Attestation, BeaconState, BeaconBlock, Deposit, VoluntaryExit, VoluntaryExitWithSig, parse_deposit_log, BLSPubkey};
+use n42_primitives::{RelativeEpoch, Attestation, BeaconState, BeaconBlock, Deposit, VoluntaryExit, VoluntaryExitWithSig, parse_deposit_log, BLSPubkey, BlockVerifyResultAggregate, agg_sig_to_fixed, fixed_to_agg_sig};
 use crate::network::{fetch_beacon_block, broadcast_beacon_block};
 
 /// A mining mode for the local dev engine.
@@ -113,6 +119,8 @@ pub struct N42Miner<T: PayloadTypes, Provider, B, Network> {
     beacon_engine_handle: BeaconConsensusEngineHandle<T>,
     /// The mining mode for the engine
     mode: MiningMode,
+    /// The timer for preparing block
+    interval_prepare_block: Interval,
     /// The payload builder for the engine
     payload_builder: PayloadBuilderHandle<T>,
     /// full network  for announce block
@@ -124,6 +132,9 @@ pub struct N42Miner<T: PayloadTypes, Provider, B, Network> {
     new_block_rx: mpsc::Receiver<(NewBlock, BlockHash)>,
     beacon: Beacon<Provider>,
     voluntary_exits: Vec<VoluntaryExitWithSig>,
+    broadcast_unverified_block_tx: broadcast::Sender<UnverifiedBlock>,
+    block_verify_result_rx: mpsc::Receiver<BlockVerifyResult>,
+    pending_block_data: Option<PendingBlockData>,
 
     num_generated_blocks: u64,
     num_skipped_new_block: u64,
@@ -131,6 +142,14 @@ pub struct N42Miner<T: PayloadTypes, Provider, B, Network> {
     num_long_delayed_blocks: u64,
     num_fetched_blocks: u64,
     order_stats: HashMap<u64, bool>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingBlockData {
+    block: SealedBlock,
+    beacon_state_after_withdrawal: BeaconState,
+    execution_requests: Option<Requests>,
+    block_verification: BlockVerifyResultAggregate,
 }
 
 const DEPOSIT_GAP: u64 = 6;
@@ -173,15 +192,27 @@ where
         payload_builder: PayloadBuilderHandle<T>,
         network: Network,
         consensus: Arc<dyn FullConsensus<<T::BuiltPayload as BuiltPayload>::Primitives, Error = ConsensusError>>,
+        broadcast_unverified_block_tx: broadcast::Sender<UnverifiedBlock>,
+        block_verify_result_rx: mpsc::Receiver<BlockVerifyResult>,
     ) {
         let (new_block_tx, new_block_rx) = mpsc::channel::<(NewBlock, BlockHash)>(128);
         let beacon = Beacon::new(provider.clone());
+
+        let mode_interval = match mode {
+            MiningMode::Instant(_) => {
+                unimplemented!("Add a separate flow if needed");
+            }
+            MiningMode::Interval(ref v) => v,
+            _ => return (),
+        };
+        let block_time = mode_interval.period().as_secs();
 
         let miner = Self {
             provider,
             payload_attributes_builder,
             beacon_engine_handle,
             mode,
+            interval_prepare_block: tokio::time::interval(Duration::from_secs(block_time)),
             payload_builder,
             network,
             consensus,
@@ -197,6 +228,9 @@ where
             new_block_rx,
             beacon,
             voluntary_exits: Vec::new(),
+            broadcast_unverified_block_tx,
+            block_verify_result_rx,
+            pending_block_data: None,
         };
 
         // Spawn the miner
@@ -218,6 +252,12 @@ where
 
         loop {
             tokio::select! {
+                Some(verification_result) = self.block_verify_result_rx.recv() => {
+                    debug!(target: "consensus-client", ?verification_result, "verification_rx");
+                    if let Err(e) = self.handle_verification_result(verification_result) {
+                        error!(target: "consensus-client", "Error handling verification_result: {:?}", e);
+                    }
+                }
                 Some((new_block, hash)) = self.new_block_rx.recv() => {
                     let insert_ok = self.recent_num_to_td.insert(new_block.block.number, U256::from(new_block.td));
                     debug!(target: "consensus-client", insert_ok, number=?new_block.block.number, "recent_num_to_td insert");
@@ -226,6 +266,11 @@ where
                 _ = &mut self.mode => {
                     if let Err(e) = self.advance().await {
                         error!(target: "consensus-client", "Error advancing the chain: {:?}", e);
+                    }
+                }
+                _ = self.interval_prepare_block.tick() => {
+                    if let Err(e) = self.prepare_block().await {
+                        error!(target: "consensus-client", "Error preparing the block: {:?}", e);
                     }
                 }
                 new_block_event = &mut new_block_event_stream.next() => {
@@ -449,14 +494,14 @@ where
                     let is_valid = self.beacon.is_valid_voluntary_exit(finalized_block_hash, &voluntary_exit.voluntary_exit, &voluntary_exit.signature)?;
                     debug!(target: "consensus-client", ?is_valid, "check voluntary_exit");
                     if !is_valid {
-                        return Err(eyre::eyre!(format!("voluntary_exit is not valid: {voluntary_exit:?}")));
+                        return Err(eyre::eyre!("voluntary_exit is not valid: {voluntary_exit:?}"));
                     }
                 }
 
                 let (_, beacon_state_after_withdrawal) = self.beacon.gen_withdrawals(parent.parent_hash)?;
                 let new_beacon_state = self.beacon.state_transition(Some(beacon_state_after_withdrawal), &new_beacon_block)?;
                 if new_beacon_state.hash_slow() != new_beacon_block.state_root {
-                    return Err(eyre::eyre!(format!("state root mismatch, new_beacon_state hash={:?}, new_beacon_block.state_root={:?}", new_beacon_state.hash_slow(), new_beacon_block.state_root)));
+                    return Err(eyre::eyre!("state root mismatch, new_beacon_state hash={:?}, new_beacon_block.state_root={:?}", new_beacon_state.hash_slow(), new_beacon_block.state_root));
                 }
 
                 self.provider.save_beacon_block_by_hash(&new_beacon_block_hash, new_beacon_block.clone())?;
@@ -618,12 +663,99 @@ where
         )
     }
 
-    /// Generates payload attributes for a new block, passes them to FCU and inserts built payload
-    /// through newPayload.
+    fn handle_verification_result(&mut self, verification_result: BlockVerifyResult) -> eyre::Result<()> {
+        let pending_block_data = match &self.pending_block_data {
+            Some(v) => v.clone(),
+            None => {
+                debug!(target: "consensus-client", "handle_verification_result: waiting for pending block data");
+                return Ok(())
+            },
+        };
+        let block = pending_block_data.block;
+        let mut block_verification = pending_block_data.block_verification;
+
+        let BlockVerifyResult {
+            pubkey,
+            signature,
+            receipts_root,
+            block_hash,
+        } = verification_result.clone();
+
+        if block.hash() != block_hash {
+            return Err(eyre::eyre!("verification result block hash mismatch: block_hash={block_hash:?}, pending block hash={:?}", block.hash()));
+        }
+
+        let signature = Signature::from_bytes(&hex::decode(signature)?).map_err(|e| eyre::eyre!("{e:?}"))?;
+
+        let pubkey = PublicKey::from_bytes(&hex::decode(pubkey)?).map_err(|e| eyre::eyre!("{e:?}"))?;
+
+        let validator_index = self.beacon.get_validator_index_from_beacon_state(block.parent_hash(), pubkey)?.ok_or(eyre::eyre!("validator not found, block_hash={block_hash:?}, pubkey={pubkey:?}"))?;
+
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&hex::decode(receipts_root)?);
+        let receipts_root = FixedBytes::from(arr);
+
+        let err = signature.verify(true, receipts_root.as_ref(), BLS_DST, &[], &pubkey, true);
+        if err != blst::BLST_ERROR::BLST_SUCCESS {
+            return Err(eyre::eyre!("{verification_result:?}"));
+        }
+        debug!(target: "consensus-client", "sig verify result: {:?}", err);
+
+        match block_verification.block_aggregate_signature {
+            Some(ref mut v) => {
+                let mut sig = fixed_to_agg_sig(v);
+                sig.add_signature(&signature, false).unwrap();
+                *v = agg_sig_to_fixed(&sig);
+            },
+            None => {
+                block_verification.block_aggregate_signature = Some(agg_sig_to_fixed(&AggregateSignature::from_signature(&signature)));
+            },
+        }
+        block_verification.validator_indexes.insert(validator_index);
+        self.pending_block_data.as_mut().map(|v| { v.block_verification = block_verification.clone(); });
+
+        // TODO: move to beacon block verification
+        let _ = self.verify_aggregate_signature(&block, &block_verification, receipts_root);
+
+        Ok(())
+    }
+
+    fn verify_aggregate_signature(&self, block: &SealedBlock, block_verification: &BlockVerifyResultAggregate, receipts_root: FixedBytes<32>) -> eyre::Result<bool> {
+        let block_hash = block.hash();
+        let mut pubkeys = Vec::new();
+        for validator_index in &block_verification.validator_indexes {
+            pubkeys.push(self.beacon.get_validator_pubkey_from_beacon_state(block.parent_hash(), *validator_index)?
+.ok_or(eyre::eyre!("validator not found, block_hash={block_hash:?}, validator_index={validator_index:?}"))?);
+        }
+        let pubkeys: Vec<&PublicKey> = pubkeys.iter().collect();
+        let sig = fixed_to_agg_sig(&block_verification.block_aggregate_signature.unwrap());
+        let aggregate_sig_verify_result = sig.to_signature().fast_aggregate_verify(true, receipts_root.as_ref(), BLS_DST, &pubkeys.as_slice());
+        debug!(target: "consensus-client", ?block_hash, pubkeys_len=?pubkeys.len(), ?aggregate_sig_verify_result);
+
+        if aggregate_sig_verify_result == blst::BLST_ERROR::BLST_SUCCESS {
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Generates a new beacon block, broadcast eth1 block to peers
     async fn advance(&mut self) -> eyre::Result<()> {
-        let (in_order_count, out_of_order_count, order_ratio) = self.get_order_stats();
+        let pending_block_data = match self.pending_block_data {
+            Some(ref v) => v.clone(),
+            None => {
+                debug!(target: "consensus-client", "advance: waiting for pending block data");
+                return Ok(())
+            },
+        };
+        let PendingBlockData { block, beacon_state_after_withdrawal, execution_requests, block_verification } = pending_block_data;
+        let max_td = self.consensus.total_difficulty(block.hash());
         let num_signers = self.get_best_block_num_signers();
-        
+        let header = self
+            .provider
+            .sealed_header(self.provider.best_block_number().unwrap())
+            .unwrap()
+            .unwrap();
         let interval = match self.mode {
             MiningMode::Instant(_) => {
                 unimplemented!("Add a separate flow if needed");
@@ -632,12 +764,6 @@ where
             _ => return Ok(()),
         };
         let block_time = interval.period().as_secs();
-        info!(target: "consensus-client", num_generated_blocks=self.num_generated_blocks, num_skipped_new_block=self.num_skipped_new_block, num_should_skip_block_generation=self.num_should_skip_block_generation, num_long_delayed_blocks=self.num_long_delayed_blocks, num_fetched_blocks=self.num_fetched_blocks, in_order_count, out_of_order_count, order_ratio);
-        let header = self
-            .provider
-            .sealed_header(self.provider.best_block_number().unwrap())
-            .unwrap()
-            .unwrap();
         debug!(target: "consensus-client", block_time, "advance");
         let now = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -651,13 +777,116 @@ where
             return Ok(());
         }
 
+        let parent_beacon_block_hash = if block.number == 1 {
+            self.provider.chain_spec().genesis_hash()
+        } else {
+            //fetch_beacon_block(block.header().parent_hash).unwrap().hash_slow()
+            self.provider.get_beacon_block_hash_by_eth1_hash(&block.header().parent_hash)?.unwrap()
+        };
+        //let deposits = self.get_deposits(block.number.saturating_sub(DEPOSIT_GAP))?;
+        let deposits: Vec<Deposit> = Default::default();
+        let finalized_block_hash = self
+            .provider
+            .finalized_block_hash()
+            .unwrap_or(Some(self.provider.chain_spec().genesis_hash()))
+            .unwrap();
+        let finalized_beacon_block_hash = self.provider.get_beacon_block_hash_by_eth1_hash(&finalized_block_hash)?.unwrap();
+        let finalized_beacon_state = self.provider.get_beacon_state_by_hash(&finalized_beacon_block_hash)?.unwrap();
+        let attestations = finalized_beacon_state.valid_validators().into_iter().map(|validator| {
+            Attestation { pubkey: validator.pubkey, }
+        }).collect();
+        let voluntary_exits = self.voluntary_exits.to_vec();
+        self.voluntary_exits.clear();
+        let beacon_block = self.beacon.gen_beacon_block(Some(beacon_state_after_withdrawal), parent_beacon_block_hash, &deposits, &attestations, &voluntary_exits, &execution_requests, &block, block_verification.clone())?;
+        let beacon_block_hash = beacon_block.hash_slow();
+        self.provider.save_beacon_block_by_hash(&beacon_block_hash, beacon_block.clone())?;
+
+        //
+        self.provider.save_beacon_block_by_eth1_hash(&block.hash(), beacon_block.clone())?;
+
+        self.provider.save_beacon_block_hash_by_eth1_hash(&block.hash(), beacon_block_hash)?;
+
+        let new_beacon_state = self.provider.get_beacon_state_by_hash(&beacon_block_hash)?.unwrap();
+        let all_beacon_committees = new_beacon_state.get_beacon_committees_at_epoch(RelativeEpoch::Current)?;
+        debug!(target: "consensus-client", ?all_beacon_committees, "advance");
+
+        self.recent_blocks.insert(block.hash_slow(), block.clone());
+
+        let wiggle = self.consensus.wiggle(
+            block.header().number() - 1,
+            block.header().parent_hash(),
+            block.header().difficulty(),
+        );
+        debug!(target: "consensus::apos",
+            "wiggle {:?}, timestamp {:?}, number {}",
+            wiggle, block.timestamp(), block.number()
+        );
+
+        let new_block_tx = self.new_block_tx.clone();
+        let block_clone = block.clone();
+        let block_hash = block.hash_slow();
+        self.provider.save_beacon_block_by_hash(&beacon_block.hash_slow(), beacon_block.clone()).unwrap();
+        self.provider.save_beacon_block_by_eth1_hash(&block_hash, beacon_block.clone()).unwrap();
+        self.provider.save_beacon_block_hash_by_eth1_hash(&block_hash, beacon_block.hash_slow()).unwrap();
+        tokio::spawn(async move {
+            sleep(wiggle).await;
+
+            // TODO: broadcast beacon block
+            //broadcast_beacon_block(block_hash, &beacon_block).unwrap();
+
+            new_block_tx
+                .send((
+                    NewBlock {
+                        block: block_clone.unseal(),
+                        td: max_td.to::<U128>(),
+                    },
+                    block_hash,
+                ))
+                .await
+                .unwrap();
+        });
+
+        self.num_generated_blocks += 1;
+        if num_signers == 1 {
+            self.new_payload(&block).await?;
+            self.fcu_hash(block_hash).await?;
+        }
+        Ok(())
+    }
+
+
+    /// Generates a new block, broadcast it to validators
+    async fn prepare_block(&mut self) -> eyre::Result<()> {
+        let (in_order_count, out_of_order_count, order_ratio) = self.get_order_stats();
+        let num_signers = self.get_best_block_num_signers();
+
+        let block_time = self.interval_prepare_block.period().as_secs();
+        info!(target: "consensus-client", num_generated_blocks=self.num_generated_blocks, num_skipped_new_block=self.num_skipped_new_block, num_should_skip_block_generation=self.num_should_skip_block_generation, num_long_delayed_blocks=self.num_long_delayed_blocks, num_fetched_blocks=self.num_fetched_blocks, in_order_count, out_of_order_count, order_ratio);
+        let header = self
+            .provider
+            .sealed_header(self.provider.best_block_number().unwrap())
+            .unwrap()
+            .unwrap();
+        debug!(target: "consensus-client", block_time, "prepare_block");
+        let now = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("cannot be earlier than UNIX_EPOCH");
+        let expected_next_timestamp = Duration::from_secs(header.header().timestamp() + block_time / 2);
+        if expected_next_timestamp > now {
+            self.interval_prepare_block = interval_at(
+                Instant::now() + (expected_next_timestamp - now),
+                self.interval_prepare_block.period(),
+            );
+            return Ok(());
+        }
+
         if expected_next_timestamp + Duration::from_secs(block_time * num_signers) <= now {
             warn!(target: "consensus-client", number=header.number() + 1, ?expected_next_timestamp, ?now, "not seeing new blocks for a long time, try generating a block again");
             self.recent_num_to_td.remove(&(header.header().number() + 1));
             self.num_long_delayed_blocks += 1;
-            *interval = interval_at(
+            self.interval_prepare_block = interval_at(
                 Instant::now() + Duration::from_secs(block_time),
-                interval.period(),
+                self.interval_prepare_block.period(),
             );
         } else if self.recent_num_to_td.get(&(header.header().number() + 1)).is_some() {
             debug!(target: "consensus-client", number=header.header().number() + 1, "skip generating block");
@@ -665,11 +894,11 @@ where
             return Ok(());
         }
 
-        let timestamp = now;
-        debug!(target: "consensus-client", ?timestamp, "advance: PayloadAttributes timestamp");
+        let timestamp = now + Duration::from_secs(block_time - block_time / 2);
+        debug!(target: "consensus-client", ?timestamp, "prepare_block: PayloadAttributes timestamp");
 
         let (withdrawals, beacon_state_after_withdrawal) = self.beacon.gen_withdrawals(header.hash())?;
-        debug!(target: "consensus-client", ?withdrawals, "advance: PayloadAttributes withdrawals");
+        debug!(target: "consensus-client", ?withdrawals, "prepare_block: PayloadAttributes withdrawals");
 
         let forkchoice_state = self.forkchoice_state();
         let payload_attributes = self.payload_attributes_builder.build_ext(timestamp.as_secs(), withdrawals);
@@ -708,83 +937,27 @@ where
 
         let execution_requests = payload.requests();
         let block = payload.block();
-        let max_td = self.consensus.total_difficulty(block.header().hash_slow());
-        debug!(target: "consensus-client", ?max_td, "advance: new_block hash {:?}", block.header().hash_slow());
-        trace!(target: "consensus-client", ?block);
-        let parent_beacon_block_hash = if block.number == 1 {
-            self.provider.chain_spec().genesis_hash()
-        } else {
-            //fetch_beacon_block(block.header().parent_hash).unwrap().hash_slow()
-            self.provider.get_beacon_block_hash_by_eth1_hash(&block.header().parent_hash)?.unwrap()
+
+        let pending_block_data = PendingBlockData {
+            block: payload.block().clone(),
+            beacon_state_after_withdrawal: beacon_state_after_withdrawal.clone(),
+            execution_requests: execution_requests.clone(),
+            block_verification: Default::default(),
         };
-        //let deposits = self.get_deposits(block.number.saturating_sub(DEPOSIT_GAP))?;
-        let deposits: Vec<Deposit> = Default::default();
-        let finalized_block_hash = self
-            .provider
-            .finalized_block_hash()
-            .unwrap_or(Some(self.provider.chain_spec().genesis_hash()))
-            .unwrap();
-        let finalized_beacon_block_hash = self.provider.get_beacon_block_hash_by_eth1_hash(&finalized_block_hash)?.unwrap();
-        let finalized_beacon_state = self.provider.get_beacon_state_by_hash(&finalized_beacon_block_hash)?.unwrap();
-        let attestations = finalized_beacon_state.valid_validators().into_iter().map(|validator| {
-            Attestation { pubkey: validator.pubkey, }
-        }).collect();
-        let voluntary_exits = self.voluntary_exits.to_vec();
-        self.voluntary_exits.clear();
-        let beacon_block = self.beacon.gen_beacon_block(Some(beacon_state_after_withdrawal), parent_beacon_block_hash, &deposits, &attestations, &voluntary_exits, &execution_requests, block)?;
-        let beacon_block_hash = beacon_block.hash_slow();
-        self.provider.save_beacon_block_by_hash(&beacon_block_hash, beacon_block.clone())?;
+        self.pending_block_data.replace(pending_block_data);
 
-        //
-        self.provider.save_beacon_block_by_eth1_hash(&block.hash(), beacon_block.clone())?;
+        let max_td = self.consensus.total_difficulty(block.header().hash_slow());
+        debug!(target: "consensus-client", ?max_td, "prepare_block: new_block hash {:?}", block.header().hash_slow());
+        trace!(target: "consensus-client", ?block);
 
-        self.provider.save_beacon_block_hash_by_eth1_hash(&block.hash(), beacon_block_hash)?;
-
-        let new_beacon_state = self.provider.get_beacon_state_by_hash(&beacon_block_hash)?.unwrap();
-        let all_beacon_committees = new_beacon_state.get_beacon_committees_at_epoch(RelativeEpoch::Current)?;
-        debug!(target: "consensus-client", ?all_beacon_committees, "advance");
-
-        self.recent_blocks.insert(block.hash_slow(), block.clone());
-
-        let wiggle = self.consensus.wiggle(
-            block.header().number() - 1,
-            block.header().parent_hash(),
-            block.header().difficulty(),
-        );
-        debug!(target: "consensus::apos",
-            "wiggle {:?}, timestamp {:?}, number {}",
-            wiggle, timestamp, block.number()
-        );
-
-        let new_block_tx = self.new_block_tx.clone();
-        let block_clone = block.clone();
-        let block_hash = block.hash_slow();
-        self.provider.save_beacon_block_by_hash(&beacon_block.hash_slow(), beacon_block.clone()).unwrap();
-        self.provider.save_beacon_block_by_eth1_hash(&block_hash, beacon_block.clone()).unwrap();
-        self.provider.save_beacon_block_hash_by_eth1_hash(&block_hash, beacon_block.hash_slow()).unwrap();
-        tokio::spawn(async move {
-            sleep(wiggle).await;
-
-            // TODO: broadcast beacon block
-            //broadcast_beacon_block(block_hash, &beacon_block).unwrap();
-
-            new_block_tx
-                .send((
-                    NewBlock {
-                        block: block_clone.unseal(),
-                        td: max_td.to::<U128>(),
-                    },
-                    block_hash,
-                ))
-                .await
-                .unwrap();
-        });
-
-        self.num_generated_blocks += 1;
-        if num_signers == 1 {
-            self.new_payload(&block).await?;
-            self.fcu_hash(block_hash).await?;
-        }
+        let cached_reads = self.consensus.get_cached_reads(block.hash())?.ok_or(eyre::eyre!("cached_reads not found, block_hash={:?}", block.hash()))?;
+        let mut header = block.header().clone();
+        header.receipts_root = Default::default();
+        let body = block.body().clone();
+        let sealed_block_modified = SealedBlock::from_parts_unhashed(header, body);
+        trace!(target: "consensus-client", ?sealed_block_modified);
+        let unverified_block = UnverifiedBlock::new(sealed_block_modified, cached_reads, max_td);
+        let _ = self.broadcast_unverified_block_tx.send(unverified_block);
         Ok(())
     }
 

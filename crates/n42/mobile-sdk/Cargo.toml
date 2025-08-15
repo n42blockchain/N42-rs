@@ -1,0 +1,32 @@
+[package]
+name = "mobile-sdk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+exclude.workspace = true
+
+[dependencies]
+n42-clique.workspace = true
+revm-primitives.workspace = true
+reth-provider = { workspace = true, features = ["test-utils"] }
+reth-revm.workspace = true
+reth-chainspec.workspace = true
+reth-ethereum-primitives.workspace = true
+reth-evm-ethereum.workspace = true
+reth-evm.workspace=true
+reth-primitives-traits.workspace = true
+rand.workspace=true
+jsonrpsee = {workspace=true, features = ["server", "ws-client"]}
+tokio = { version = "1", features = ["full"] }
+anyhow = "1.0"
+futures-util = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+blst = { version = "0.3.3" }
+hex = "0.4"
+clap = { version = "4.5.23", features = ["derive"] }
+
+[lints]
+workspace = true

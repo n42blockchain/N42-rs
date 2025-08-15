@@ -520,6 +520,8 @@ where
 
     let sealed_block = Arc::new(SealedBlock::seal_parts(header, block.into_block().body));
 
+    let block_hash = SealedBlock::hash(&sealed_block);
+    let _ = cons.set_cached_reads(block_hash, cached_reads.clone());
 
     let payload = EthBuiltPayload::new(attributes.id, sealed_block, total_fees, requests)
         // add blob sidecars from the executed txs

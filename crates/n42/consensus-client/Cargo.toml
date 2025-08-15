@@ -11,6 +11,7 @@ exclude.workspace = true
 [dependencies]
 n42-engine-primitives.workspace = true
 n42-primitives.workspace = true
+n42-clique.workspace = true
 # reth
 #reth-beacon-consensus.workspace = true
 reth-storage-errors.workspace = true
@@ -52,6 +53,7 @@ tokio-stream.workspace = true
 futures-util.workspace = true
 
 # misc
+hex.workspace = true
 ethereum_ssz.workspace = true
 ethereum_ssz_derive.workspace = true
 arbitrary.workspace = true
@@ -67,6 +69,7 @@ tracing.workspace = true
 schnellru.workspace = true
 itertools.workspace = true
 alloy-sol-types.workspace = true
+blst.workspace = true
 
 op-alloy-rpc-types-engine = { workspace = true, optional = true }
 

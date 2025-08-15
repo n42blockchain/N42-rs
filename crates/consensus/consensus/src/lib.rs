@@ -24,6 +24,7 @@ use reth_primitives_traits::{
 };
 
 use n42_primitives::{Snapshot, VoluntaryExit};
+use reth_revm::cached::CachedReads;
 use std::collections::HashMap;
 use std::time::Duration;
  
@@ -148,6 +149,21 @@ pub trait Consensus<B: Block>: HeaderValidator<B::Header> {
         difficulty: U256,
     ) -> Duration {
         Duration::from_secs(0)
+    }
+
+    fn set_cached_reads(
+        &self,
+        block_hash: BlockHash,
+        cached_reads: CachedReads
+        ) -> Result<(), ConsensusError> {
+        Ok(())
+    }
+
+    fn get_cached_reads(
+        &self,
+        block_hash: BlockHash,
+    ) -> Result<Option<CachedReads>, ConsensusError> {
+        Ok(None)
     }
 
     fn voluntary_exit(&self,

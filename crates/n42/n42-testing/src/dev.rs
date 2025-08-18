@@ -1,5 +1,4 @@
 #![allow(non_snake_case)]
-use std::str::FromStr;
 use alloy_rpc_types_engine::ExecutionPayloadV3;
 use alloy_signer_local::PrivateKeySigner;
 use reth_primitives_traits::{SealedHeader, NodePrimitives};
@@ -36,6 +35,7 @@ use reth_tasks::TaskManager;
 use n42_engine_types::N42Node;
 
 use std::{
+    str::FromStr,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };

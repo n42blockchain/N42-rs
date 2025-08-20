@@ -4,9 +4,7 @@ use alloy_signer_local::PrivateKeySigner;
 use reth_primitives_traits::{SealedHeader, NodePrimitives};
 use reth_chainspec::make_genesis_header;
 use alloy_primitives::{Sealable, FixedBytes};
-use reth_node_builder::{
-    node::NodeTypes
-};
+use reth_node_builder::node::NodeTypes;
 use reth_payload_builder::EthPayloadBuilderAttributes;
 use reth_ethereum_forks::N42_HARDFORKS_FOR_CLIQUE_TEST;
 use reth_ethereum_engine_primitives::ExecutionPayloadEnvelopeV3;

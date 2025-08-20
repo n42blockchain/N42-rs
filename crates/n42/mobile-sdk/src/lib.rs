@@ -1,3 +1,4 @@
+use reth_primitives_traits::AlloyBlockHeader;
 use blst::min_pk::SecretKey;
 use reth_evm::execute::Executor;
 use revm_primitives::B256;
@@ -18,7 +19,8 @@ use jsonrpsee::ws_client::WsClientBuilder;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::time::sleep;
-use n42_clique::{BlockVerifyResult, UnverifiedBlock, BLS_DST};
+use n42_clique::{BlockVerifyResult, UnverifiedBlock};
+use n42_primitives::{AttestationData, BLS_DST};
 
 const MAX_RETRIES: usize = 5;
 const RETRY_INTERVAL_SECS: u64 = 5;
@@ -56,8 +58,9 @@ async fn try_run_client(ws_url: &str, sk: &SecretKey) -> anyhow::Result<()> {
 
     println!("Connected to {}", ws_url);
 
+    let pk = sk.sk_to_pk();
     let mut subscription: Subscription<UnverifiedBlock> = ws_client
-        .subscribe("consensusBeaconExt_subscribeToVerificationRequest", rpc_params![],
+        .subscribe("consensusBeaconExt_subscribeToVerificationRequest", rpc_params![hex::encode(pk.to_bytes())],
 "")
         .await
         .context("Failed to subscribe")?;
@@ -72,8 +75,18 @@ async fn try_run_client(ws_url: &str, sk: &SecretKey) -> anyhow::Result<()> {
                 if let Ok(receipts_root) = verify(block.clone()) {
                     println!("receipts_root: {:?}", receipts_root);
 
+                    let attestation_data = AttestationData {
+                        slot: block.blockbody.header().number(),
+                        committee_index: block.committee_index,
+                        receipts_root,
+                    };
+
                     let pk = sk.sk_to_pk();
-                    let msg = receipts_root.as_ref();
+
+                    let bytes: Vec<u8> = serde_json::to_vec(&attestation_data)?;
+                    let bytes_slice: &[u8] = &bytes;
+
+                    let msg = bytes_slice;
                     let sig = sk.sign(msg, BLS_DST, &[]);
 
                     let err = sig.verify(true, msg, BLS_DST, &[], &pk, true);
@@ -85,7 +98,7 @@ async fn try_run_client(ws_url: &str, sk: &SecretKey) -> anyhow::Result<()> {
                     let sealed_block_recovered: SealedBlock<Block> = SealedBlock::from_parts_unhashed(header, body);
 
                     let recovered_block_hash = SealedBlock::hash(&sealed_block_recovered);
-                    let params = [hex::encode(pk.to_bytes()), hex::encode(sig.to_bytes()), hex::encode(receipts_root.as_slice()), hex::encode(recovered_block_hash.as_slice())];
+                    let params = rpc_params![hex::encode(pk.to_bytes()), hex::encode(sig.to_bytes()), attestation_data, hex::encode(recovered_block_hash.as_slice())];
                     let result = ws_client
                         .request("consensusBeaconExt_submitVerification", params)
                         .await?;

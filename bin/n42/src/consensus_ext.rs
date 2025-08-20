@@ -1,11 +1,11 @@
 use n42_clique::{BlockVerifyResult, UnverifiedBlock};
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 use reth_consensus::{ConsensusError, FullConsensus};
 use reth_ethereum_primitives::{EthPrimitives};
 use alloy_primitives::{Bytes, Sealable, B256};
 use jsonrpsee::{core::{RpcResult, SubscriptionResult}, proc_macros::rpc, types::{error::INVALID_PARAMS_CODE, ErrorObject, SubscriptionId}, PendingSubscriptionSink, SubscriptionMessage};
 use alloy_primitives::Address;
-use n42_primitives::{Snapshot, VoluntaryExit};
+use n42_primitives::{AttestationData, BLSPubkey, Snapshot, VoluntaryExit};
 use reth_provider::HeaderProvider;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{trace, debug, error, info, warn};
@@ -97,11 +97,11 @@ pub trait ConsensusBeaconExtApi {
         ) -> RpcResult<()>;
 
     #[subscription(name = "subscribeToVerificationRequest", item = String)]
-    fn subscribe_to_verification_request(&self) -> SubscriptionResult;
+    fn subscribe_to_verification_request(&self, pubkey: BLSPubkey) -> SubscriptionResult;
 
     #[method(name = "submitVerification")]
     fn submit_verification(&self, pubkey: String,
-        signature: String, receipts_root: String, block_hash: B256,
+        signature: String, attestation_data: AttestationData, block_hash: B256,
         ) -> RpcResult<()>;
 }
 
@@ -110,7 +110,7 @@ pub struct ConsensusBeaconExt<Cons, Provider> {
     pub consensus: Cons,
     pub provider: Provider,
     pub verification_tx: mpsc::Sender<BlockVerifyResult>,
-    pub broadcast_tx: broadcast::Sender<UnverifiedBlock>,
+    pub broadcast_tx: broadcast::Sender<(UnverifiedBlock, Arc<Vec<BLSPubkey>>)>,
 }
 
 impl<Cons, Provider> ConsensusBeaconExtApiServer for ConsensusBeaconExt<Cons, Provider>
@@ -126,14 +126,17 @@ where
         Ok(self.consensus.voluntary_exit(message, signature).unwrap_or_default())
     }
 
-    fn subscribe_to_verification_request(&self, pending: PendingSubscriptionSink) -> SubscriptionResult {
+    fn subscribe_to_verification_request(&self, pending: PendingSubscriptionSink, pubkey: BLSPubkey) -> SubscriptionResult {
         let mut rx = self.broadcast_tx.subscribe();
-        debug!(target: "reth::cli", "subscribe_to_verification_request New client subscribed");
+        debug!(target: "reth::cli", ?pubkey, "subscribe_to_verification_request New client subscribed");
 
         tokio::spawn(async move {
             if let Ok(sink) = pending.accept().await {
                 let subscription_id = sink.subscription_id();
-                while let Ok(data_to_be_verified) = rx.recv().await {
+                while let Ok((data_to_be_verified, target_committee_pubkeys)) = rx.recv().await {
+                    if !target_committee_pubkeys.contains(&pubkey) {
+                        continue;
+                    }
                     if sink.is_closed() {
                         debug!(target: "reth::cli", ?subscription_id, "subscribe_to_verification_request client disconnected");
                         break;
@@ -150,9 +153,9 @@ where
     }
 
     fn submit_verification(&self, pubkey: String,
-        signature: String, receipts_root: String, block_hash: B256,
+        signature: String, attestation_data: AttestationData, block_hash: B256,
         ) -> RpcResult<()> {
-        let v = BlockVerifyResult {pubkey, signature, receipts_root, block_hash};
+        let v = BlockVerifyResult {pubkey, signature, attestation_data, block_hash};
         let _ = self.verification_tx.try_send(v);
         Ok(())
     }

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use alloy_rlp::{Encodable, Decodable, RlpEncodable,  RlpDecodable};
 use std::collections::{HashMap, BTreeMap};
 use alloy_primitives::{keccak256, BlockHash, B256, Log};
-use n42_primitives::{Attestation, BeaconBlock, BeaconBlockBody, BeaconState, BlockVerifyResultAggregate, Deposit, DepositData, Epoch, ExecutionRequests, Validator, VoluntaryExit, VoluntaryExitWithSig, SLOTS_PER_EPOCH };
+use n42_primitives::{Attestation, BeaconBlock, BeaconBlockBody, BeaconState, BlockVerifyResultAggregate, CommitteeIndex, Deposit, DepositData, Epoch, ExecutionRequests, Validator, VoluntaryExit, VoluntaryExitWithSig, SLOTS_PER_EPOCH };
 use tracing::{trace, debug, error, info, warn};
 
 const INMEMORY_BEACON_STATES: u32 = 256;
@@ -42,7 +42,7 @@ where
         }
     }
 
-    pub fn gen_beacon_block(&mut self, old_beacon_state: Option<BeaconState>, parent_hash: BlockHash, deposits: &Vec<Deposit>, attestations: &Vec<Attestation>, voluntary_exits: &Vec<VoluntaryExitWithSig>, execution_requests: &Option<Requests>, eth1_sealed_block: &SealedBlock, block_verification: BlockVerifyResultAggregate) -> eyre::Result<BeaconBlock> {
+    pub fn gen_beacon_block(&mut self, old_beacon_state: Option<BeaconState>, parent_hash: BlockHash, deposits: &Vec<Deposit>, attestations: &Vec<Attestation>, voluntary_exits: &Vec<VoluntaryExitWithSig>, execution_requests: &Option<Requests>, eth1_sealed_block: &SealedBlock) -> eyre::Result<BeaconBlock> {
         let mut beacon_block = BeaconBlock {
             parent_hash,
             eth1_block_hash: eth1_sealed_block.hash_slow(),
@@ -51,7 +51,6 @@ where
                 attestations: attestations.clone(),
                 voluntary_exits: voluntary_exits.clone(),
                 execution_requests: parse_execution_requests(execution_requests)?,
-                block_verification,
             },
             ..Default::default()
         };

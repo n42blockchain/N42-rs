@@ -1,3 +1,4 @@
+use blst::min_pk::PublicKey;
 use std::collections::BTreeSet;
 use blst::min_pk::{AggregateSignature, Signature};
 use alloy_rpc_types_beacon::requests::ExecutionRequestsV4;
@@ -15,12 +16,14 @@ use alloy_sol_types::{SolEnum, SolEvent, sol};
 use tracing::{trace, debug, error, info, warn};
 
 use std::collections::{HashMap, BTreeMap};
-use crate::{activation_queue::ActivationQueue, beacon_committee::BeaconCommittee, committee_cache::get_active_validator_indices, Hash256, Slot, Validator};
+use crate::{activation_queue::ActivationQueue, beacon_committee::BeaconCommittee, committee_cache::get_active_validator_indices, Hash256, Slot, Validator, CommitteeIndex};
 use crate::safe_aitrh::SafeArith;
 use crate::safe_aitrh::SafeArithIter;
 use std::sync::Arc;
 use crate::committee_cache::CommitteeCache;
 use ethereum_hashing::hash;
+
+pub const BLS_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_";
 
 pub const SLOTS_PER_EPOCH: u64 = 5;
 const REWARD_AMOUNT: u64 = 1;
@@ -124,6 +127,7 @@ pub struct BeaconState {
     //pub total_active_balance: Option<TotalActiveBalance>,
 
     pub committee_caches: Vec<CommitteeCache>,
+    pub epoch_attester_indexes: BTreeSet<u64>,
 }
 
 /*
@@ -179,7 +183,6 @@ pub struct BeaconBlockBody {
     pub deposits: Vec<Deposit>,
     pub voluntary_exits: Vec<VoluntaryExitWithSig>,
     pub execution_requests: ExecutionRequestsV4,
-    pub block_verification: BlockVerifyResultAggregate,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
@@ -216,7 +219,16 @@ pub struct ConsolidationRequest {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct Attestation {
-    pub pubkey: BLSPubkey,
+    pub validator_indexes: BTreeSet<u64>,
+    pub data: AttestationData,
+    pub block_aggregate_signature: Option<FixedBytes<96>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct AttestationData {
+    pub slot: Slot,
+    pub committee_index: CommitteeIndex,
+    pub receipts_root: B256,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
@@ -276,13 +288,16 @@ impl BeaconState {
 
     pub fn process_epoch(&mut self) -> eyre::Result<()> {
         // workaround empty validators
-        let epoch = self.current_epoch();
-        let active_validator_indices = get_active_validator_indices(&self.validators, epoch);
-        if !active_validator_indices.is_empty() {
-            self.build_all_committee_caches()?;
+        if self.has_active_validators(RelativeEpoch::Current) {
+            self.build_committee_cache(RelativeEpoch::Current)?;
+        }
+        if self.has_active_validators(RelativeEpoch::Next) {
+            self.build_committee_cache(RelativeEpoch::Next)?;
         }
 
         let validator_statuses = ValidatorStatuses::new(self)?;
+        self.epoch_attester_indexes.clear();
+
         self.process_rewards_and_penalties(&validator_statuses)?;
         self.process_registry_updates()?;
 
@@ -355,7 +370,7 @@ impl BeaconState {
 
     pub fn process_operations(&mut self, beacon_block_body: &BeaconBlockBody) -> eyre::Result<()> {
         //self.process_deposit(&beacon_block_body.deposits)?;
-        //self.process_attestation(&beacon_block_body.attestations)?;
+        self.process_attestation(&beacon_block_body.attestations)?;
         //self.process_voluntary_exit(&beacon_block_body.voluntary_exits)?;
 
         let deposits: Vec<Deposit> = beacon_block_body.execution_requests.deposits.clone().iter().map(|deposit_request| {
@@ -504,26 +519,45 @@ impl BeaconState {
     }
 
     pub fn process_attestation(&mut self, attestations: &Vec<Attestation>) -> eyre::Result<()> {
-        // TODO: check attestations against beacon state
-        // TODO: update state
         for attestation in attestations {
-            let _ = self.process_one_attestation(attestation);
+            let _ = self.process_one_attestation(attestation)?;
         }
 
         Ok(())
     }
 
     pub fn process_one_attestation(&mut self, attestation: &Attestation) -> eyre::Result<()> {
-        let epoch = self.current_epoch();
-        for (index, validator) in self.validators.iter_mut().enumerate() {
-            if validator.pubkey == attestation.pubkey && epoch >= validator.activation_epoch && (validator.exit_epoch == 0 || epoch < validator.exit_epoch) {
-                validator.effective_balance += REWARD_AMOUNT;
-                self.balances[index] += REWARD_AMOUNT;
-                break;
-            }
-        }
+
+        self.verify_aggregate_signature(&attestation)?;
+        self.epoch_attester_indexes.extend(attestation.validator_indexes.iter());
 
         Ok(())
+    }
+
+    fn verify_aggregate_signature(&self, attestation: &Attestation) -> eyre::Result<()> {
+        let sig = match attestation.block_aggregate_signature {
+            Some(ref v) => v,
+            None => {
+                return Ok(());
+            }
+        };
+        let sig = fixed_to_agg_sig(sig);
+        let mut pubkeys = Vec::new();
+        for validator_index in &attestation.validator_indexes {
+            let validator = self.get_validator(*validator_index as usize)?;
+            pubkeys.push(PublicKey::from_bytes(&validator.pubkey.as_slice()).unwrap());
+        }
+        let pubkeys: Vec<&PublicKey> = pubkeys.iter().collect();
+        let bytes: Vec<u8> = serde_json::to_vec(&attestation.data)?;
+        let bytes_slice: &[u8] = &bytes;
+        let aggregate_sig_verify_result = sig.to_signature().fast_aggregate_verify(true, bytes_slice, BLS_DST, &pubkeys.as_slice());
+        debug!(target: "consensus-client", slot=?attestation.data.slot, pubkeys_len=?pubkeys.len(), ?aggregate_sig_verify_result);
+
+        if aggregate_sig_verify_result == blst::BLST_ERROR::BLST_SUCCESS {
+            Ok(())
+        } else {
+            Err(eyre::eyre!("failed: {aggregate_sig_verify_result:?}"))
+        }
     }
 
     pub fn process_voluntary_exit(&mut self, voluntary_exits: &Vec<VoluntaryExitWithSig>) -> eyre::Result<()> {
@@ -1188,7 +1222,7 @@ pub fn apply_deposit(
         validator_statuses: &ValidatorStatuses,
         //spec: &Spec,
     ) -> eyre::Result<()> {
-        debug!(target: "consensus-client", ?validator_statuses, "process_rewards_and_penalties");
+        debug!(target: "consensus-client", slot=?self.slot, ?validator_statuses, "process_rewards_and_penalties");
         if self.current_epoch() == genesis_epoch {
             return Ok(());
         }
@@ -1461,6 +1495,16 @@ pub fn apply_deposit(
         CommitteeCache::initialized(self, epoch)
     }
 
+    pub fn has_active_validators(
+        &self,
+        relative_epoch: RelativeEpoch,
+    ) -> bool {
+        let epoch = relative_epoch.into_epoch(self.current_epoch());
+        let active_validator_indices = get_active_validator_indices(&self.validators, epoch);
+
+        !active_validator_indices.is_empty()
+    }
+
     /// Get all of the Beacon committees at a given relative epoch.
     ///
     /// Utilises the committee cache.
@@ -1471,9 +1515,7 @@ pub fn apply_deposit(
         relative_epoch: RelativeEpoch,
     ) -> eyre::Result<Vec<BeaconCommittee<'_>>> {
         // workaround empty validators
-        let epoch = relative_epoch.into_epoch(self.current_epoch());
-        let active_validator_indices = get_active_validator_indices(&self.validators, epoch);
-        if active_validator_indices.is_empty() {
+        if !self.has_active_validators(RelativeEpoch::Current) {
             return Ok(Vec::new());
         }
 
@@ -1599,14 +1641,13 @@ impl ValidatorStatuses {
         state: &BeaconState,
         //spec: &ChainSpec,
     ) -> eyre::Result<Self> {
-        // TODO: get validator status from rpc
         let mut statuses = Vec::with_capacity(state.validators.len());
         let mut total_balances = TotalBalances::new();
 
         let current_epoch = state.current_epoch();
         let previous_epoch = state.previous_epoch();
 
-        for validator in state.validators.iter() {
+        for (validator_index, validator) in state.validators.iter().enumerate() {
             let effective_balance = validator.effective_balance;
             let mut status = ValidatorStatus {
                 is_slashed: validator.slashed,
@@ -1615,7 +1656,7 @@ impl ValidatorStatuses {
                 current_epoch_effective_balance: effective_balance,
 
                 //
-                is_previous_epoch_attester: true,
+                is_previous_epoch_attester: state.epoch_attester_indexes.contains(&(validator_index as u64)),
 
                 ..ValidatorStatus::default()
             };

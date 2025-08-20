@@ -6,7 +6,7 @@ use alloy_eips::{
 use blst::min_pk::{AggregateSignature, Signature};
 use blst::min_pk::PublicKey;
 use alloy_primitives::FixedBytes;
-use n42_clique::{BlockVerifyResult, UnverifiedBlock, BLS_DST};
+use n42_clique::{BlockVerifyResult, UnverifiedBlock};
 use reth_storage_errors::provider::ProviderResult;
 use n42_engine_primitives::{PayloadAttributesBuilderExt};
 use std::str::FromStr;
@@ -54,7 +54,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{trace, debug, error, info, warn};
 
 use crate::beacon::{Beacon};
-use n42_primitives::{RelativeEpoch, Attestation, BeaconState, BeaconBlock, Deposit, VoluntaryExit, VoluntaryExitWithSig, parse_deposit_log, BLSPubkey, BlockVerifyResultAggregate, agg_sig_to_fixed, fixed_to_agg_sig};
+use n42_primitives::{RelativeEpoch, Attestation, BeaconState, BeaconBlock, Deposit, VoluntaryExit, VoluntaryExitWithSig, parse_deposit_log, BLSPubkey, BlockVerifyResultAggregate, agg_sig_to_fixed, fixed_to_agg_sig, SLOTS_PER_EPOCH, CommitteeIndex, AttestationData, BLS_DST};
 use crate::network::{fetch_beacon_block, broadcast_beacon_block};
 
 /// A mining mode for the local dev engine.
@@ -132,7 +132,7 @@ pub struct N42Miner<T: PayloadTypes, Provider, B, Network> {
     new_block_rx: mpsc::Receiver<(NewBlock, BlockHash)>,
     beacon: Beacon<Provider>,
     voluntary_exits: Vec<VoluntaryExitWithSig>,
-    broadcast_unverified_block_tx: broadcast::Sender<UnverifiedBlock>,
+    broadcast_unverified_block_tx: broadcast::Sender<(UnverifiedBlock, Arc<Vec<BLSPubkey>>)>,
     block_verify_result_rx: mpsc::Receiver<BlockVerifyResult>,
     pending_block_data: Option<PendingBlockData>,
 
@@ -149,7 +149,7 @@ struct PendingBlockData {
     block: SealedBlock,
     beacon_state_after_withdrawal: BeaconState,
     execution_requests: Option<Requests>,
-    block_verification: BlockVerifyResultAggregate,
+    attestations: HashMap<CommitteeIndex, Attestation>,
 }
 
 const DEPOSIT_GAP: u64 = 6;
@@ -192,7 +192,7 @@ where
         payload_builder: PayloadBuilderHandle<T>,
         network: Network,
         consensus: Arc<dyn FullConsensus<<T::BuiltPayload as BuiltPayload>::Primitives, Error = ConsensusError>>,
-        broadcast_unverified_block_tx: broadcast::Sender<UnverifiedBlock>,
+        broadcast_unverified_block_tx: broadcast::Sender<(UnverifiedBlock, Arc<Vec<BLSPubkey>>)>,
         block_verify_result_rx: mpsc::Receiver<BlockVerifyResult>,
     ) {
         let (new_block_tx, new_block_rx) = mpsc::channel::<(NewBlock, BlockHash)>(128);
@@ -664,7 +664,7 @@ where
     }
 
     fn handle_verification_result(&mut self, verification_result: BlockVerifyResult) -> eyre::Result<()> {
-        let pending_block_data = match &self.pending_block_data {
+        let mut pending_block_data = match &self.pending_block_data {
             Some(v) => v.clone(),
             None => {
                 debug!(target: "consensus-client", "handle_verification_result: waiting for pending block data");
@@ -672,12 +672,11 @@ where
             },
         };
         let block = pending_block_data.block;
-        let mut block_verification = pending_block_data.block_verification;
 
         let BlockVerifyResult {
             pubkey,
             signature,
-            receipts_root,
+            attestation_data,
             block_hash,
         } = verification_result.clone();
 
@@ -685,58 +684,41 @@ where
             return Err(eyre::eyre!("verification result block hash mismatch: block_hash={block_hash:?}, pending block hash={:?}", block.hash()));
         }
 
+        let mut attestation = pending_block_data.attestations.get_mut(&attestation_data.committee_index)
+.ok_or(eyre::eyre!("attestation not found, block_hash={block_hash:?}, committee index={:?}", attestation_data.committee_index))?;
+
         let signature = Signature::from_bytes(&hex::decode(signature)?).map_err(|e| eyre::eyre!("{e:?}"))?;
 
         let pubkey = PublicKey::from_bytes(&hex::decode(pubkey)?).map_err(|e| eyre::eyre!("{e:?}"))?;
 
         let validator_index = self.beacon.get_validator_index_from_beacon_state(block.parent_hash(), pubkey)?.ok_or(eyre::eyre!("validator not found, block_hash={block_hash:?}, pubkey={pubkey:?}"))?;
 
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&hex::decode(receipts_root)?);
-        let receipts_root = FixedBytes::from(arr);
+        if attestation_data.receipts_root != attestation.data.receipts_root {
+            return Err(eyre::eyre!("mismatch receipts_root, expected={:?}, got={:?}", attestation.data.receipts_root, attestation_data.receipts_root));
+        }
 
-        let err = signature.verify(true, receipts_root.as_ref(), BLS_DST, &[], &pubkey, true);
+        let bytes: Vec<u8> = serde_json::to_vec(&attestation_data)?;
+        let bytes_slice: &[u8] = &bytes;
+        let err = signature.verify(true, bytes_slice, BLS_DST, &[], &pubkey, true);
         if err != blst::BLST_ERROR::BLST_SUCCESS {
             return Err(eyre::eyre!("{verification_result:?}"));
         }
         debug!(target: "consensus-client", "sig verify result: {:?}", err);
 
-        match block_verification.block_aggregate_signature {
+        match attestation.block_aggregate_signature {
             Some(ref mut v) => {
                 let mut sig = fixed_to_agg_sig(v);
                 sig.add_signature(&signature, false).unwrap();
                 *v = agg_sig_to_fixed(&sig);
             },
             None => {
-                block_verification.block_aggregate_signature = Some(agg_sig_to_fixed(&AggregateSignature::from_signature(&signature)));
+                attestation.block_aggregate_signature = Some(agg_sig_to_fixed(&AggregateSignature::from_signature(&signature)));
             },
         }
-        block_verification.validator_indexes.insert(validator_index);
-        self.pending_block_data.as_mut().map(|v| { v.block_verification = block_verification.clone(); });
-
-        // TODO: move to beacon block verification
-        let _ = self.verify_aggregate_signature(&block, &block_verification, receipts_root);
+        attestation.validator_indexes.insert(validator_index);
+        self.pending_block_data.as_mut().map(|v| { *v.attestations.get_mut(&attestation_data.committee_index).unwrap() = attestation.clone(); });
 
         Ok(())
-    }
-
-    fn verify_aggregate_signature(&self, block: &SealedBlock, block_verification: &BlockVerifyResultAggregate, receipts_root: FixedBytes<32>) -> eyre::Result<bool> {
-        let block_hash = block.hash();
-        let mut pubkeys = Vec::new();
-        for validator_index in &block_verification.validator_indexes {
-            pubkeys.push(self.beacon.get_validator_pubkey_from_beacon_state(block.parent_hash(), *validator_index)?
-.ok_or(eyre::eyre!("validator not found, block_hash={block_hash:?}, validator_index={validator_index:?}"))?);
-        }
-        let pubkeys: Vec<&PublicKey> = pubkeys.iter().collect();
-        let sig = fixed_to_agg_sig(&block_verification.block_aggregate_signature.unwrap());
-        let aggregate_sig_verify_result = sig.to_signature().fast_aggregate_verify(true, receipts_root.as_ref(), BLS_DST, &pubkeys.as_slice());
-        debug!(target: "consensus-client", ?block_hash, pubkeys_len=?pubkeys.len(), ?aggregate_sig_verify_result);
-
-        if aggregate_sig_verify_result == blst::BLST_ERROR::BLST_SUCCESS {
-            Ok(true)
-        } else {
-            Ok(false)
-        }
     }
 
     /// Generates a new beacon block, broadcast eth1 block to peers
@@ -748,7 +730,7 @@ where
                 return Ok(())
             },
         };
-        let PendingBlockData { block, beacon_state_after_withdrawal, execution_requests, block_verification } = pending_block_data;
+        let PendingBlockData { block, beacon_state_after_withdrawal, execution_requests, attestations } = pending_block_data;
         let max_td = self.consensus.total_difficulty(block.hash());
         let num_signers = self.get_best_block_num_signers();
         let header = self
@@ -792,12 +774,9 @@ where
             .unwrap();
         let finalized_beacon_block_hash = self.provider.get_beacon_block_hash_by_eth1_hash(&finalized_block_hash)?.unwrap();
         let finalized_beacon_state = self.provider.get_beacon_state_by_hash(&finalized_beacon_block_hash)?.unwrap();
-        let attestations = finalized_beacon_state.valid_validators().into_iter().map(|validator| {
-            Attestation { pubkey: validator.pubkey, }
-        }).collect();
         let voluntary_exits = self.voluntary_exits.to_vec();
         self.voluntary_exits.clear();
-        let beacon_block = self.beacon.gen_beacon_block(Some(beacon_state_after_withdrawal), parent_beacon_block_hash, &deposits, &attestations, &voluntary_exits, &execution_requests, &block, block_verification.clone())?;
+        let beacon_block = self.beacon.gen_beacon_block(Some(beacon_state_after_withdrawal), parent_beacon_block_hash, &deposits, &attestations.values().cloned().collect(), &voluntary_exits, &execution_requests, &block)?;
         let beacon_block_hash = beacon_block.hash_slow();
         self.provider.save_beacon_block_by_hash(&beacon_block_hash, beacon_block.clone())?;
 
@@ -807,8 +786,6 @@ where
         self.provider.save_beacon_block_hash_by_eth1_hash(&block.hash(), beacon_block_hash)?;
 
         let new_beacon_state = self.provider.get_beacon_state_by_hash(&beacon_block_hash)?.unwrap();
-        let all_beacon_committees = new_beacon_state.get_beacon_committees_at_epoch(RelativeEpoch::Current)?;
-        debug!(target: "consensus-client", ?all_beacon_committees, "advance");
 
         self.recent_blocks.insert(block.hash_slow(), block.clone());
 
@@ -942,7 +919,7 @@ where
             block: payload.block().clone(),
             beacon_state_after_withdrawal: beacon_state_after_withdrawal.clone(),
             execution_requests: execution_requests.clone(),
-            block_verification: Default::default(),
+            attestations: Default::default(),
         };
         self.pending_block_data.replace(pending_block_data);
 
@@ -950,14 +927,46 @@ where
         debug!(target: "consensus-client", ?max_td, "prepare_block: new_block hash {:?}", block.header().hash_slow());
         trace!(target: "consensus-client", ?block);
 
+        let committee_cache = if block.number % SLOTS_PER_EPOCH == 0 {
+            // committee_cache init requires non-empty validators
+            if !beacon_state_after_withdrawal.has_active_validators(RelativeEpoch::Next) {
+                return Ok(());
+            }
+            beacon_state_after_withdrawal.committee_cache(RelativeEpoch::Next)?
+        } else {
+            // committee_cache init requires non-empty validators
+            if !beacon_state_after_withdrawal.has_active_validators(RelativeEpoch::Current) {
+                return Ok(());
+            }
+            beacon_state_after_withdrawal.committee_cache(RelativeEpoch::Current)?
+        };
+
+        let beacon_committees = committee_cache.get_beacon_committees_at_slot(block.number)?;
+
         let cached_reads = self.consensus.get_cached_reads(block.hash())?.ok_or(eyre::eyre!("cached_reads not found, block_hash={:?}", block.hash()))?;
         let mut header = block.header().clone();
         header.receipts_root = Default::default();
         let body = block.body().clone();
         let sealed_block_modified = SealedBlock::from_parts_unhashed(header, body);
         trace!(target: "consensus-client", ?sealed_block_modified);
-        let unverified_block = UnverifiedBlock::new(sealed_block_modified, cached_reads, max_td);
-        let _ = self.broadcast_unverified_block_tx.send(unverified_block);
+        let mut unverified_block = UnverifiedBlock::new(sealed_block_modified, cached_reads, max_td, 0);
+        for beacon_committee in &beacon_committees {
+            let attestation = Attestation {
+                data: AttestationData {
+                    slot: block.number,
+                    committee_index: beacon_committee.index,
+                    receipts_root: block.header().receipts_root,
+                },
+                ..Default::default()
+            };
+            self.pending_block_data.as_mut().ok_or(eyre::eyre!("pending_block_data not found, block_number={:?}", block.number))?.attestations.insert(beacon_committee.index, attestation);
+            let mut target_committee_pubkeys = Vec::new();
+            for validator_index in beacon_committee.committee {
+                target_committee_pubkeys.push(beacon_state_after_withdrawal.get_validator(*validator_index)?.pubkey);
+            }
+            unverified_block.committee_index = beacon_committee.index;
+            let _ = self.broadcast_unverified_block_tx.send((unverified_block.clone(), Arc::new(target_committee_pubkeys)));
+        }
         Ok(())
     }
 

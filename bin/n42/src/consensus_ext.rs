@@ -3,10 +3,11 @@ use std::{collections::HashMap, sync::Arc};
 use reth_consensus::{ConsensusError, FullConsensus};
 use reth_ethereum_primitives::{EthPrimitives};
 use alloy_primitives::{Bytes, Sealable, B256};
-use jsonrpsee::{core::{RpcResult, SubscriptionResult}, proc_macros::rpc, types::{error::INVALID_PARAMS_CODE, ErrorObject, SubscriptionId}, PendingSubscriptionSink, SubscriptionMessage};
+use jsonrpsee::{core::{RpcResult, SubscriptionResult}, proc_macros::rpc, types::{error::{INTERNAL_ERROR_CODE, INVALID_PARAMS_CODE}, ErrorObject, SubscriptionId}, PendingSubscriptionSink, SubscriptionMessage};
+use jsonrpsee::types::ErrorObjectOwned;
 use alloy_primitives::Address;
-use n42_primitives::{AttestationData, BLSPubkey, Snapshot, VoluntaryExit};
-use reth_provider::HeaderProvider;
+use n42_primitives::{AttestationData, BLSPubkey, BeaconBlock, BeaconState, Snapshot, VoluntaryExit};
+use reth_provider::{BeaconProvider, HeaderProvider};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{trace, debug, error, info, warn};
 
@@ -103,6 +104,24 @@ pub trait ConsensusBeaconExtApi {
     fn submit_verification(&self, pubkey: String,
         signature: String, attestation_data: AttestationData, block_hash: B256,
         ) -> RpcResult<()>;
+
+    /// get_beacon_block_hash_by_eth1_hash
+    #[method(name = "get_beacon_block_hash_by_eth1_hash")]
+    fn get_beacon_block_hash_by_eth1_hash(&self,
+        eth1_hash: B256,
+        ) -> RpcResult<Option<B256>>;
+
+    /// get_beacon_block_by_hash
+    #[method(name = "get_beacon_block_by_hash")]
+    fn get_beacon_block_by_hash(&self,
+        beacon_block_hash: B256,
+        ) -> RpcResult<Option<BeaconBlock>>;
+
+    /// get_beacon_state_by_beacon_block_hash
+    #[method(name = "get_beacon_state_by_beacon_block_hash")]
+    fn get_beacon_state_by_beacon_block_hash(&self,
+        beacon_block_hash: B256,
+        ) -> RpcResult<Option<BeaconState>>;
 }
 
 /// The type that implements the `consensusBeaconRpc` rpc namespace trait
@@ -117,7 +136,7 @@ impl<Cons, Provider> ConsensusBeaconExtApiServer for ConsensusBeaconExt<Cons, Pr
 where
     Cons:
         FullConsensus<EthPrimitives, Error = ConsensusError> + Clone + Unpin + 'static,
-    Provider: HeaderProvider + Clone + 'static,
+    Provider: HeaderProvider + BeaconProvider + Clone + 'static,
 {
     fn voluntary_exit(&self,
         message: VoluntaryExit,
@@ -158,6 +177,24 @@ where
         let v = BlockVerifyResult {pubkey, signature, attestation_data, block_hash};
         let _ = self.verification_tx.try_send(v);
         Ok(())
+    }
+
+    fn get_beacon_block_hash_by_eth1_hash(&self,
+        eth1_hash: B256,
+        ) -> RpcResult<Option<B256>> {
+        self.provider.get_beacon_block_hash_by_eth1_hash(&eth1_hash).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))
+    }
+
+    fn get_beacon_block_by_hash(&self,
+        beacon_block_hash: B256,
+        ) -> RpcResult<Option<BeaconBlock>> {
+        self.provider.get_beacon_block_by_hash(&beacon_block_hash).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))
+    }
+
+    fn get_beacon_state_by_beacon_block_hash(&self,
+        beacon_block_hash: B256,
+        ) -> RpcResult<Option<BeaconState>> {
+        self.provider.get_beacon_state_by_hash(&beacon_block_hash).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))
     }
 }
 

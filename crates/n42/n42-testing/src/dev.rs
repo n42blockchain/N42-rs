@@ -82,7 +82,7 @@ fn get_addresses_from_extra_data(extra_data: Bytes) -> Vec<Address> {
 #[cfg(test)]
 async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(node: &FullNode<Node, AddOns>, eth_signer_key: String) -> eyre::Result<()>
     where <<<Node as FullNodeTypes>::Types as NodeTypes>::Payload as PayloadTypes>::PayloadBuilderAttributes: From<EthPayloadBuilderAttributes>,
-    <<Node as FullNodeTypes>::Types as NodeTypes>::Primitives : NodePrimitives<Block = reth_ethereum_primitives::Block>,
+    <<Node as FullNodeTypes>::Types as NodeTypes>::Primitives: NodePrimitives<Block = reth_ethereum_primitives::Block>,
     <<Node as FullNodeTypes>::Types as NodeTypes>::Payload: EngineTypes,
 {
     let best_number = node.provider.chain_info().unwrap().best_number;

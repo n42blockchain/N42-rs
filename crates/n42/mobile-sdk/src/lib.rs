@@ -11,7 +11,6 @@ use reth_chainspec::{ChainSpecBuilder,N42_DEVNET,EthereumHardfork,ForkCondition,
 use reth_evm::ConfigureEvm;
 use std::sync::Arc;
 use jsonrpsee::core::client::{SubscriptionClientT, ClientT};
-use anyhow::Context;
 use futures_util::StreamExt;
 use jsonrpsee::core::client::Subscription;
 use jsonrpsee::rpc_params;
@@ -20,12 +19,14 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::time::sleep;
 use n42_clique::{BlockVerifyResult, UnverifiedBlock};
-use n42_primitives::{AttestationData, BLS_DST};
+use n42_primitives::{AttestationData};
+
+pub mod deposit_exit;
 
 const MAX_RETRIES: usize = 5;
 const RETRY_INTERVAL_SECS: u64 = 5;
 
-pub async fn run_client(ws_url: &str, sk: &SecretKey) -> anyhow::Result<()> {
+pub async fn run_client(ws_url: &str, sk: &SecretKey) -> eyre::Result<()> {
     let mut retry_count = 0;
 
     loop {
@@ -50,11 +51,10 @@ pub async fn run_client(ws_url: &str, sk: &SecretKey) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn try_run_client(ws_url: &str, sk: &SecretKey) -> anyhow::Result<()> {
+async fn try_run_client(ws_url: &str, sk: &SecretKey) -> eyre::Result<()> {
     let ws_client = WsClientBuilder::default()
         .build(ws_url)
-        .await
-        .context("Failed to build WebSocket client")?;
+        .await?;
 
     println!("Connected to {}", ws_url);
 
@@ -62,8 +62,7 @@ async fn try_run_client(ws_url: &str, sk: &SecretKey) -> anyhow::Result<()> {
     let mut subscription: Subscription<UnverifiedBlock> = ws_client
         .subscribe("consensusBeaconExt_subscribeToVerificationRequest", rpc_params![hex::encode(pk.to_bytes())],
 "")
-        .await
-        .context("Failed to subscribe")?;
+        .await?;
 
     println!("Subscribed to 'subscribeToVerificationRequest'");
 
@@ -87,9 +86,9 @@ async fn try_run_client(ws_url: &str, sk: &SecretKey) -> anyhow::Result<()> {
                     let bytes_slice: &[u8] = &bytes;
 
                     let msg = bytes_slice;
-                    let sig = sk.sign(msg, BLS_DST, &[]);
+                    let sig = sk.sign(msg, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[]);
 
-                    let err = sig.verify(true, msg, BLS_DST, &[], &pk, true);
+                    let err = sig.verify(true, msg, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[], &pk, true);
                     println!("sig verify result: {:?}", err);
 
                     let mut header = block.blockbody.header().clone();
@@ -121,7 +120,7 @@ async fn try_run_client(ws_url: &str, sk: &SecretKey) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn verify(mut unverifiedblock:UnverifiedBlock) -> anyhow::Result<B256> {
+fn verify(mut unverifiedblock:UnverifiedBlock) -> eyre::Result<B256> {
     println!("verify, {unverifiedblock:?}");
     let provider_1=MockEthProvider::default();
     let state=StateProviderDatabase::new(provider_1);
@@ -157,7 +156,7 @@ fn verify(mut unverifiedblock:UnverifiedBlock) -> anyhow::Result<B256> {
     // for test
     if sealed_block_receipts_root != B256::ZERO {
         if receipts_root != sealed_block_receipts_root {
-            return Err(anyhow::anyhow!("receipts_root={:?}, expected={:?}", receipts_root, sealed_block_receipts_root));
+            return Err(eyre::eyre!("receipts_root={:?}, expected={:?}", receipts_root, sealed_block_receipts_root));
         }
     }
 

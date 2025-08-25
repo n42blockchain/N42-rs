@@ -23,8 +23,6 @@ use std::sync::Arc;
 use crate::committee_cache::CommitteeCache;
 use ethereum_hashing::hash;
 
-pub const BLS_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_";
-
 pub const SLOTS_PER_EPOCH: u64 = 5;
 const REWARD_AMOUNT: u64 = 1;
 
@@ -550,7 +548,7 @@ impl BeaconState {
         let pubkeys: Vec<&PublicKey> = pubkeys.iter().collect();
         let bytes: Vec<u8> = serde_json::to_vec(&attestation.data)?;
         let bytes_slice: &[u8] = &bytes;
-        let aggregate_sig_verify_result = sig.to_signature().fast_aggregate_verify(true, bytes_slice, BLS_DST, &pubkeys.as_slice());
+        let aggregate_sig_verify_result = sig.to_signature().fast_aggregate_verify(true, bytes_slice, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &pubkeys.as_slice());
         debug!(target: "consensus-client", slot=?attestation.data.slot, pubkeys_len=?pubkeys.len(), ?aggregate_sig_verify_result);
 
         if aggregate_sig_verify_result == blst::BLST_ERROR::BLST_SUCCESS {

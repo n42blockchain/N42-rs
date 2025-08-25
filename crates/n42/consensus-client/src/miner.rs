@@ -54,7 +54,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{trace, debug, error, info, warn};
 
 use crate::beacon::{Beacon};
-use n42_primitives::{RelativeEpoch, Attestation, BeaconState, BeaconBlock, Deposit, VoluntaryExit, VoluntaryExitWithSig, parse_deposit_log, BLSPubkey, BlockVerifyResultAggregate, agg_sig_to_fixed, fixed_to_agg_sig, SLOTS_PER_EPOCH, CommitteeIndex, AttestationData, BLS_DST};
+use n42_primitives::{RelativeEpoch, Attestation, BeaconState, BeaconBlock, Deposit, VoluntaryExit, VoluntaryExitWithSig, parse_deposit_log, BLSPubkey, BlockVerifyResultAggregate, agg_sig_to_fixed, fixed_to_agg_sig, SLOTS_PER_EPOCH, CommitteeIndex, AttestationData};
 use crate::network::{fetch_beacon_block, broadcast_beacon_block};
 
 /// A mining mode for the local dev engine.
@@ -699,7 +699,7 @@ where
 
         let bytes: Vec<u8> = serde_json::to_vec(&attestation_data)?;
         let bytes_slice: &[u8] = &bytes;
-        let err = signature.verify(true, bytes_slice, BLS_DST, &[], &pubkey, true);
+        let err = signature.verify(true, bytes_slice, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[], &pubkey, true);
         if err != blst::BLST_ERROR::BLST_SUCCESS {
             return Err(eyre::eyre!("{verification_result:?}"));
         }

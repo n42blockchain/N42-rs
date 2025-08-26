@@ -733,11 +733,6 @@ where
         let PendingBlockData { block, beacon_state_after_withdrawal, execution_requests, attestations } = pending_block_data;
         let max_td = self.consensus.total_difficulty(block.hash());
         let num_signers = self.get_best_block_num_signers();
-        let header = self
-            .provider
-            .sealed_header(self.provider.best_block_number().unwrap())
-            .unwrap()
-            .unwrap();
         let interval = match self.mode {
             MiningMode::Instant(_) => {
                 unimplemented!("Add a separate flow if needed");
@@ -750,7 +745,7 @@ where
         let now = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("cannot be earlier than UNIX_EPOCH");
-        let expected_next_timestamp = Duration::from_secs(header.header().timestamp() + block_time);
+        let expected_next_timestamp = Duration::from_secs(block.timestamp());
         if expected_next_timestamp > now {
             *interval = interval_at(
                 Instant::now() + (expected_next_timestamp - now),

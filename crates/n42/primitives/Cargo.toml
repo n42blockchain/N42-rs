@@ -9,6 +9,11 @@ repository.workspace = true
 exclude.workspace = true
 
 [dependencies]
+ethereum_serde_utils = "0.7"
+hex-literal = "0.3"
+hex = "0.4"
+tree_hash.workspace = true
+tree_hash_derive.workspace = true
 derivative.workspace = true
 ethereum_hashing.workspace = true
 ethereum_ssz.workspace = true

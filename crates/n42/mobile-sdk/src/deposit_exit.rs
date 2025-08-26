@@ -3,6 +3,7 @@ use ethers::{
 };
 use alloy_primitives::Address;
 use hex::FromHex;
+use n42_primitives::{DepositData, DEPOSIT_AMOUNT};
 use ssz_derive::{Decode, Encode};
 use tree_hash::Hash256;
 use tree_hash_derive::TreeHash;
@@ -21,72 +22,6 @@ use tracing::debug;
 pub const DEVNET_DEPOSIT_CONTRACT_ADDRESS: &str = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
 
 pub const EIP7002_CONTRACT_ADDRESS: &str = "0x00000961Ef480Eb55e80D19ad83579A64c007002";
-
-#[derive(Deserialize, Debug, TreeHash)]
-pub struct DepositData {
-    pub pubkey: FixedBytes<48>,
-    #[serde(rename = "withdrawal_credentials")]
-    pub withdrawal_credentials: B256,
-    pub amount: u64,
-    pub signature: FixedBytes<96>,
-    // #[serde(rename = "deposit_data_root")]
-    // pub deposit_data_root: Hash256,
-}
-
-impl DepositData {
-    pub fn as_deposit_message(&self) -> DepositMessage {
-        DepositMessage {
-            pubkey: self.pubkey,
-            withdrawal_credentials: self.withdrawal_credentials,
-            amount: self.amount,
-        }
-    }
-
-    /// Generate the signature for a given DepositData details.
-    pub fn create_signature(&self, secret_key: &SecretKey,
-       // spec: &ChainSpec
-        ) -> FixedBytes<96> {
-        //let domain = spec.get_deposit_domain();
-
-        // lighthouse: consensus/types/src/chain_spec.rs, get_deposit_domain()
-        // genesis_fork_version: [0, 0, 0, 0]
-        let DOMAIN_DEPOSIT = hex_literal::hex!("03000000f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a9");
-        debug!("domain: 0x{}", hex::encode(DOMAIN_DEPOSIT));
-
-        let msg = self.as_deposit_message().signing_root(FixedBytes::from_slice(&DOMAIN_DEPOSIT));
-        debug!("signing_root: 0x{}", hex::encode(msg));
-        //SignatureBytes::from(secret_key.sign(msg))
-        FixedBytes(secret_key.sign(msg.as_ref(),
-                alloy_rpc_types_beacon::constants::BLS_DST_SIG,
-                &[]).to_bytes())
-    }
-}
-
-#[derive(TreeHash, Serialize, Deserialize,)]
-pub struct DepositMessage {
-    pub pubkey: FixedBytes<48>,
-    pub withdrawal_credentials: B256,
-    #[serde(with = "serde_utils::quoted_u64")]
-    pub amount: u64,
-}
-
-impl SignedRoot for DepositMessage {}
-
-      //arbitrary::Arbitrary,
-#[derive(Debug, PartialEq, Clone,Serialize, Deserialize, Encode, Decode, TreeHash,)]
-pub struct SigningData {
-      pub object_root: B256,
-      pub domain:B256,
-}
-
-pub trait SignedRoot: tree_hash::TreeHash {
-    fn signing_root(&self, domain: Hash256) -> Hash256 {
-        SigningData {
-            object_root: self.tree_hash_root(),
-            domain,
-        }.tree_hash_root()
-    }
-}
 
 pub fn create_deposit_unsigned_tx(
     deposit_contract_address: String,
@@ -119,7 +54,7 @@ pub fn create_deposit_unsigned_tx(
         withdrawal_credentials: creds,
         //signature: SignatureBytes::empty(),
         signature: Default::default(),
-        amount: 32_000_000_000,
+        amount: DEPOSIT_AMOUNT,
     };
     //let spec = ChainSpec::n42();
     //deposit_data.signature = deposit_data.create_signature(&GenericSecretKey::deserialize(&sk.serialize()).unwrap(),

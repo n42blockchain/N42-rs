@@ -1,4 +1,8 @@
+use hex::FromHex;
+use tree_hash_derive::TreeHash;
+use tree_hash::TreeHash;
 use blst::min_pk::PublicKey;
+use blst::min_pk::SecretKey;
 use std::collections::BTreeSet;
 use blst::min_pk::{AggregateSignature, Signature};
 use alloy_rpc_types_beacon::requests::ExecutionRequestsV4;
@@ -62,6 +66,12 @@ pub const shuffle_round_count: u8 = 10;
 pub const min_validator_withdrawability_delay: u64 = 1;
 
 pub const CACHED_EPOCHS: usize = 3;
+
+pub const DEPOSIT_AMOUNT: u64 = 32_000_000_000;
+
+// lighthouse: consensus/types/src/chain_spec.rs, get_deposit_domain()
+// genesis_fork_version: [0, 0, 0, 0]
+const DOMAIN_DEPOSIT: [u8; 32] = hex_literal::hex!("03000000f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a9");
 
 macro_rules! verify {
     ($condition: expr, $result: expr) => {
@@ -235,12 +245,82 @@ pub struct Deposit {
     pub data: DepositData,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+/// Used by deposit data signing and verifying, do not modify field data types
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode, TreeHash)]
 pub struct DepositData {
-    pub pubkey: BLSPubkey,
+    pub pubkey: FixedBytes<48>,
+    #[serde(rename = "withdrawal_credentials")]
     pub withdrawal_credentials: B256,
-    pub amount: Gwei,
-    pub signature: BLSSignature,
+    pub amount: u64,
+    pub signature: FixedBytes<96>,
+}
+
+impl DepositData {
+    pub fn as_deposit_message(&self) -> DepositMessage {
+        DepositMessage {
+            pubkey: self.pubkey,
+            withdrawal_credentials: self.withdrawal_credentials,
+            amount: self.amount,
+        }
+    }
+
+    /// Generate the signature for a given DepositData details.
+    pub fn create_signature(&self, secret_key: &SecretKey,
+       // spec: &ChainSpec
+        ) -> FixedBytes<96> {
+        //let domain = spec.get_deposit_domain();
+
+        debug!("domain: 0x{}", hex::encode(DOMAIN_DEPOSIT));
+
+        let msg = self.as_deposit_message().signing_root(FixedBytes::from_slice(&DOMAIN_DEPOSIT));
+        debug!("signing_root: 0x{}", hex::encode(msg));
+        //SignatureBytes::from(secret_key.sign(msg))
+        FixedBytes(secret_key.sign(msg.as_ref(),
+                alloy_rpc_types_beacon::constants::BLS_DST_SIG,
+                &[]).to_bytes())
+    }
+
+    pub fn verify_signature(&self) -> bool {
+        let signature = match Signature::from_bytes(self.signature.as_ref()) {
+            Ok(v) => v,
+            _ => return false,
+        };
+
+        let pubkey = match PublicKey::from_bytes(self.pubkey.as_ref()) {
+            Ok(v) => v,
+            _ => return false,
+        };
+
+        let msg = self.as_deposit_message().signing_root(FixedBytes::from_slice(&DOMAIN_DEPOSIT));
+        let err = signature.verify(true, msg.as_ref(), alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[], &pubkey, true);
+        err == blst::BLST_ERROR::BLST_SUCCESS
+    }
+}
+
+#[derive(TreeHash, Serialize, Deserialize,)]
+pub struct DepositMessage {
+    pub pubkey: FixedBytes<48>,
+    pub withdrawal_credentials: B256,
+    #[serde(with = "serde_utils::quoted_u64")]
+    pub amount: u64,
+}
+
+impl SignedRoot for DepositMessage {}
+
+      //arbitrary::Arbitrary,
+#[derive(Debug, PartialEq, Clone,Serialize, Deserialize, Encode, Decode, TreeHash,)]
+pub struct SigningData {
+      pub object_root: B256,
+      pub domain:B256,
+}
+
+pub trait SignedRoot: tree_hash::TreeHash {
+    fn signing_root(&self, domain: Hash256) -> Hash256 {
+        SigningData {
+            object_root: self.tree_hash_root(),
+            domain,
+        }.tree_hash_root()
+    }
 }
 
 pub fn parse_deposit_log(log: &Log) -> Option<DepositEvent> {
@@ -2027,4 +2107,3 @@ impl RelativeEpoch {
         }
     }
 }
-

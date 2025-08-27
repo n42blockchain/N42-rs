@@ -63,6 +63,27 @@ pub const target_committee_size: usize = 4;
 pub const min_seed_lookahead: u64 = 1;
 pub const shuffle_round_count: u8 = 10;
 
+/*
+pub const inactivity_score_bias: u64 = 1;
+pub const inactivity_score_recovery_rate: u64 = 48;
+pub const max_inactivity_score: u64 = 51840;
+pub const trigger_punish_inactivity_score: u64 = 17280;
+pub const multiple_reward_for_inactivity_penalty: u64 = 3;
+
+pub const reward_quota_consume_rate: u64 = 1;
+pub const reward_quota_produce_rate: u64 = 48;
+pub const reward_quota_max: u64 = 4320;
+*/
+pub const inactivity_score_bias: u64 = 1;
+pub const inactivity_score_recovery_rate: u64 = 5;
+pub const max_inactivity_score: u64 = 15;
+pub const trigger_punish_inactivity_score: u64 = 15;
+pub const multiple_reward_for_inactivity_penalty: u64 = 3;
+
+pub const reward_quota_consume_rate: u64 = 1;
+pub const reward_quota_produce_rate: u64 = 5;
+pub const reward_quota_max: u64 = 15;
+
 pub const min_validator_withdrawability_delay: u64 = 1;
 
 pub const CACHED_EPOCHS: usize = 3;
@@ -123,6 +144,8 @@ pub struct BeaconState {
     pub eth1_deposit_index: u64,
     pub validators: Vec<Validator>,
     pub balances: Vec<Gwei>,
+    pub inactivity_scores: Vec<u64>,
+    pub reward_quotas: Vec<u64>,
 
     pub next_withdrawal_index: u64,
     pub next_withdrawal_validator_index: u64,
@@ -373,7 +396,33 @@ impl BeaconState {
             self.build_committee_cache(RelativeEpoch::Next)?;
         }
 
+        for validator_index in 0..self.validators.len() {
+            let is_active = self.epoch_attester_indexes.contains(&(validator_index as u64));
+            let inactivity_score = self.get_inactivity_score_mut(validator_index)?;
+            if is_active {
+                *inactivity_score = inactivity_score.saturating_sub(inactivity_score_recovery_rate);
+            } else {
+                if *inactivity_score < max_inactivity_score {
+                    *inactivity_score = inactivity_score.saturating_add(inactivity_score_bias);
+                }
+            }
+        }
         let validator_statuses = ValidatorStatuses::new(self)?;
+
+        for (index, validator) in validator_statuses.statuses.iter().enumerate() {
+            let reward_quota = self.get_reward_quota_mut(index)?;
+            if validator.is_rewardable {
+                *reward_quota = reward_quota.saturating_sub(reward_quota_consume_rate);
+            }
+        }
+        for validator_index in 0..self.validators.len() {
+            let is_active = self.epoch_attester_indexes.contains(&(validator_index as u64));
+            let reward_quota = self.get_reward_quota_mut(validator_index)?;
+            if is_active && *reward_quota < reward_quota_max {
+                *reward_quota = reward_quota.saturating_add(reward_quota_produce_rate);
+            }
+        }
+
         self.epoch_attester_indexes.clear();
 
         self.process_rewards_and_penalties(&validator_statuses)?;
@@ -873,6 +922,34 @@ impl BeaconState {
             .ok_or(eyre::eyre!(format!("BalancesOutOfBounds, {validator_index}")))
     }
 
+    pub fn get_inactivity_score(&self, validator_index: usize) -> eyre::Result<u64> {
+        self.inactivity_scores
+            .get(validator_index)
+            .ok_or(eyre::eyre!(format!("UnknownValidator, {validator_index}")))
+            .copied()
+    }
+
+    /// Get a mutable reference to the inactivity_score of a single validator.
+    pub fn get_inactivity_score_mut(&mut self, validator_index: usize) -> eyre::Result<&mut u64> {
+        self.inactivity_scores
+            .get_mut(validator_index)
+            .ok_or(eyre::eyre!(format!("InactivityScoreOutOfBounds, {validator_index}")))
+    }
+
+    pub fn get_reward_quota(&self, validator_index: usize) -> eyre::Result<u64> {
+        self.reward_quotas
+            .get(validator_index)
+            .ok_or(eyre::eyre!(format!("UnknownValidator, {validator_index}")))
+            .copied()
+    }
+
+    /// Get a mutable reference to the reward_quota of a single validator.
+    pub fn get_reward_quota_mut(&mut self, validator_index: usize) -> eyre::Result<&mut u64> {
+        self.reward_quotas
+            .get_mut(validator_index)
+            .ok_or(eyre::eyre!(format!("RewardQuotaOutOfBounds, {validator_index}")))
+    }
+
     pub fn get_pending_balance_to_withdraw(&self, validator_index: usize) -> eyre::Result<u64> {
         let mut pending_balance = 0;
         for withdrawal in self
@@ -1262,6 +1339,8 @@ pub fn apply_deposit(
             //fork_name,
         ));
         self.balances.push(amount);
+        self.inactivity_scores.push(0);
+        self.reward_quotas.push(0);
 
         // Altair or later initializations.
         /*
@@ -1424,6 +1503,7 @@ pub fn apply_deposit(
             //         }
             //     }
             // }
+            debug!(target: "consensus-client", ?index, ?delta, "get_attestation_deltas");
         }
 
         Ok(deltas)
@@ -1727,6 +1807,10 @@ impl ValidatorStatuses {
 
         for (validator_index, validator) in state.validators.iter().enumerate() {
             let effective_balance = validator.effective_balance;
+            let inactivity_score = state.get_inactivity_score(validator_index)?;
+            let is_punishable = inactivity_score >= trigger_punish_inactivity_score;
+            let reward_quota = state.get_reward_quota(validator_index)?;
+            let is_rewardable = inactivity_score >= 0 && inactivity_score < trigger_punish_inactivity_score && reward_quota > 0;
             let mut status = ValidatorStatus {
                 is_slashed: validator.slashed,
                 is_eligible: state.is_eligible_validator(previous_epoch, validator)?,
@@ -1735,6 +1819,8 @@ impl ValidatorStatuses {
 
                 //
                 is_previous_epoch_attester: state.epoch_attester_indexes.contains(&(validator_index as u64)),
+                is_rewardable,
+                is_punishable,
 
                 ..ValidatorStatus::default()
             };
@@ -1873,6 +1959,8 @@ fn get_all_delta(
         base_reward,
         finality_delay,
         //spec,
+        validator.is_rewardable,
+        validator.is_punishable,
     )
 }
 
@@ -1884,6 +1972,7 @@ pub fn get_inactivity_penalty_delta(
 ) -> eyre::Result<Delta> {
     let mut delta = Delta::default();
 
+    debug!(?finality_delay, "get_inactivity_penalty_delta");
     // Inactivity penalty
     if finality_delay > min_epochs_to_inactivity_penalty {
         // If validator is performing optimally this cancels all rewards for a neutral balance
@@ -1953,6 +2042,9 @@ pub struct ValidatorStatus {
     // pub inclusion_info: Option<InclusionInfo>,
     /// True if the validator can withdraw in the current epoch.
     pub is_withdrawable_in_current_epoch: bool,
+
+    pub is_rewardable: bool,
+    pub is_punishable: bool,
 }
 
 impl ValidatorStatus {
@@ -2048,17 +2140,21 @@ pub fn get_attestation_component_delta(
     base_reward: u64,
     finality_delay: u64,
     //spec: &Spec,
+    is_rewardable: bool,
+    is_punishable: bool,
 ) -> eyre::Result<Delta> {
     let mut delta = Delta::default();
 
     let total_balance = total_balances.current_epoch();
 
-    if index_in_unslashed_attesting_indices {
+    //if index_in_unslashed_attesting_indices {
+    if is_rewardable {
         if finality_delay > min_epochs_to_inactivity_penalty {
             // Since full base reward will be canceled out by inactivity penalty deltas,
             // optimal participation receives full base reward compensation here.
             delta.reward(base_reward)?;
         } else {
+            debug!(?index_in_unslashed_attesting_indices, "get_attestation_component_delta reward");
             let reward_numerator = base_reward
                 .safe_mul(attesting_balance.safe_div(effective_balance_increment)?)?;
             delta.reward(
@@ -2066,8 +2162,9 @@ pub fn get_attestation_component_delta(
                     .safe_div(total_balance.safe_div(effective_balance_increment)?)?,
             )?;
         }
-    } else {
-        delta.penalize(base_reward)?;
+    } else if is_punishable {
+        debug!(?index_in_unslashed_attesting_indices, ?is_punishable, "get_attestation_component_delta penalize");
+        delta.penalize(base_reward * multiple_reward_for_inactivity_penalty)?;
     }
 
     Ok(delta)

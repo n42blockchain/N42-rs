@@ -390,6 +390,14 @@ impl BeaconState {
             self.build_committee_cache(RelativeEpoch::Previous)?;
         }
 
+        for (index, validator) in self.validators.iter_mut().enumerate() {
+            let balance = self.balances[index].min(max_effective_balance);
+            let new_effective_balance = round_down(balance, effective_balance_increment);
+            if new_effective_balance != validator.effective_balance {
+                validator.effective_balance = new_effective_balance;
+            }
+        }
+
         let epoch = self.previous_epoch();
         let active_validator_indices = get_active_validator_indices(&self.validators, epoch);
         for validator_index in active_validator_indices {
@@ -2141,4 +2149,8 @@ impl RelativeEpoch {
             RelativeEpoch::Next => base.saturating_add(1u64),
         }
     }
+}
+
+pub fn round_down(n: u64, step: u64) -> u64 {
+    n - (n % step)
 }

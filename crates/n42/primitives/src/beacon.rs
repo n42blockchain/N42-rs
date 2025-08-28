@@ -52,8 +52,8 @@ pub const max_per_epoch_activation_exit_churn_limit:u64 = 256000000000;
 pub const min_per_epoch_churn_limit_electra:u64 = 128000000000;
 pub const churn_limit_quotient:u64 = 32;
 pub const effective_balance_increment:u64 = 1000000000;
-pub const base_rewards_per_epoch:u64 = 4;
-pub const base_reward_factor:u64 = 64;
+pub const base_rewards_per_epoch:u64 = 1;
+pub const base_reward_factor:u64 = 2;
 pub const min_epochs_to_inactivity_penalty :u64 = 4;
 pub const inactivity_penalty_quotient:u64 = 67108864; //?
 pub const proposer_reward_quotient:u64 = 4;
@@ -1443,8 +1443,10 @@ pub fn apply_deposit(
                 //     get_target_delta(validator, base_reward, total_balances, finality_delay, spec)?;
                 // let head_delta =
                 //     get_head_delta(validator, base_reward, total_balances, finality_delay, spec)?;
+                /*
                 let inactivity_penalty_delta =
                     get_inactivity_penalty_delta(validator, base_reward, finality_delay)?;
+                */
 
                 let delta = deltas
                     .get_mut(index)
@@ -1454,9 +1456,11 @@ pub fn apply_deposit(
                 // delta.target_delta.combine(target_delta)?;
                 // delta.head_delta.combine(head_delta)?;
                 // delta.inclusion_delay_delta.combine(inclusion_delay_delta)?;
+                /*
                 delta
                     .inactivity_penalty_delta
                     .combine(inactivity_penalty_delta)?;
+                */
             // }
 
             // if let ProposerRewardCalculation::Include = proposer_reward {
@@ -1916,15 +1920,24 @@ fn get_all_delta(
     total_balances: &TotalBalances,
     finality_delay: u64,
 ) -> eyre::Result<Delta> {
-    get_attestation_component_delta(
-        validator.is_previous_epoch_attester && !validator.is_slashed,
-        total_balances.previous_epoch_attesters(),
-        total_balances,
+    get_attestation_component_delta_n42(
         base_reward,
-        finality_delay,
-        //spec,
         validator.is_punishable,
     )
+}
+
+pub fn get_attestation_component_delta_n42(
+    base_reward: u64,
+    is_punishable: bool,
+) -> eyre::Result<Delta> {
+    let mut delta = Delta::default();
+
+    delta.reward(base_reward)?;
+    if is_punishable {
+        delta.penalize(base_reward * multiple_reward_for_inactivity_penalty)?;
+    }
+
+    Ok(delta)
 }
 
 pub fn get_inactivity_penalty_delta(
@@ -2093,42 +2106,6 @@ impl TotalBalances {
     balance_accessor!(previous_epoch_attesters);
     // balance_accessor!(previous_epoch_target_attesters);
     // balance_accessor!(previous_epoch_head_attesters);
-}
-
-pub fn get_attestation_component_delta(
-    index_in_unslashed_attesting_indices: bool,
-    attesting_balance: u64,
-    total_balances: &TotalBalances,
-    base_reward: u64,
-    finality_delay: u64,
-    //spec: &Spec,
-    is_punishable: bool,
-) -> eyre::Result<Delta> {
-    let mut delta = Delta::default();
-
-    let total_balance = total_balances.current_epoch();
-
-    //if index_in_unslashed_attesting_indices {
-    if !is_punishable {
-        if finality_delay > min_epochs_to_inactivity_penalty {
-            // Since full base reward will be canceled out by inactivity penalty deltas,
-            // optimal participation receives full base reward compensation here.
-            delta.reward(base_reward)?;
-        } else {
-            debug!(?index_in_unslashed_attesting_indices, "get_attestation_component_delta reward");
-            let reward_numerator = base_reward
-                .safe_mul(attesting_balance.safe_div(effective_balance_increment)?)?;
-            delta.reward(
-                reward_numerator
-                    .safe_div(total_balance.safe_div(effective_balance_increment)?)?,
-            )?;
-        }
-    } else {
-        debug!(?index_in_unslashed_attesting_indices, ?is_punishable, "get_attestation_component_delta penalize");
-        delta.penalize(base_reward * multiple_reward_for_inactivity_penalty)?;
-    }
-
-    Ok(delta)
 }
 
 /// Compute the reward awarded to a proposer for including an attestation from a validator.

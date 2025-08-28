@@ -386,8 +386,13 @@ impl BeaconState {
         if self.has_active_validators(RelativeEpoch::Next) {
             self.build_committee_cache(RelativeEpoch::Next)?;
         }
+        if self.has_active_validators(RelativeEpoch::Previous) {
+            self.build_committee_cache(RelativeEpoch::Previous)?;
+        }
 
-        for validator_index in 0..self.validators.len() {
+        let epoch = self.previous_epoch();
+        let active_validator_indices = get_active_validator_indices(&self.validators, epoch);
+        for validator_index in active_validator_indices {
             let is_active = self.epoch_attester_indexes.contains(&(validator_index as u64));
             let inactivity_score = self.get_inactivity_score_mut(validator_index)?;
             if is_active {

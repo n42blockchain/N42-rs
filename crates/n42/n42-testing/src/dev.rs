@@ -113,7 +113,7 @@ async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(node: 
 
     let client = node.engine_http_client();
     let execution_payload = ExecutionPayloadV3::from_block_slow(
-              &payload.block().clone().into_block(),
+          &payload.block().clone().into_block(),
     );
     let submission = EngineApiClient::new_payload_v3(
         &client,

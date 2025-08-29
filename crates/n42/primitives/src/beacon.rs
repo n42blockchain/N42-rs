@@ -392,7 +392,7 @@ impl BeaconState {
 
         for (index, validator) in self.validators.iter_mut().enumerate() {
             let balance = self.balances[index].min(max_effective_balance);
-            let new_effective_balance = round_down(balance, effective_balance_increment);
+            let new_effective_balance = round_to_nearest(balance, effective_balance_increment);
             if new_effective_balance != validator.effective_balance {
                 validator.effective_balance = new_effective_balance;
             }
@@ -2153,4 +2153,8 @@ impl RelativeEpoch {
 
 pub fn round_down(n: u64, step: u64) -> u64 {
     n - (n % step)
+}
+
+fn round_to_nearest(n: u64, step: u64) -> u64 {
+    ((n + step / 2) / step) * step
 }

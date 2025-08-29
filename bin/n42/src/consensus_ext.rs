@@ -6,7 +6,7 @@ use alloy_primitives::{Bytes, Sealable, B256};
 use jsonrpsee::{core::{RpcResult, SubscriptionResult}, proc_macros::rpc, types::{error::{INTERNAL_ERROR_CODE, INVALID_PARAMS_CODE}, ErrorObject, SubscriptionId}, PendingSubscriptionSink, SubscriptionMessage};
 use jsonrpsee::types::ErrorObjectOwned;
 use alloy_primitives::Address;
-use n42_primitives::{AttestationData, BLSPubkey, BeaconBlock, BeaconState, Snapshot, VoluntaryExit};
+use n42_primitives::{AttestationData, BLSPubkey, BeaconBlock, BeaconState, Snapshot};
 use reth_provider::{BeaconProvider, HeaderProvider};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{trace, debug, error, info, warn};
@@ -90,13 +90,6 @@ where
 #[cfg_attr(not(test), rpc(server, namespace = "consensusBeaconExt"))]
 #[cfg_attr(test, rpc(server, client, namespace = "consensusBeaconExt"))]
 pub trait ConsensusBeaconExtApi {
-    /// Voluntary exit in the clique consensus.
-    #[method(name = "voluntary_exit")]
-    fn voluntary_exit(&self,
-        message: VoluntaryExit,
-        signature: Bytes,
-        ) -> RpcResult<()>;
-
     #[subscription(name = "subscribeToVerificationRequest", item = String)]
     fn subscribe_to_verification_request(&self, pubkey: BLSPubkey) -> SubscriptionResult;
 
@@ -138,13 +131,6 @@ where
         FullConsensus<EthPrimitives, Error = ConsensusError> + Clone + Unpin + 'static,
     Provider: HeaderProvider + BeaconProvider + Clone + 'static,
 {
-    fn voluntary_exit(&self,
-        message: VoluntaryExit,
-        signature: Bytes,
-        ) -> RpcResult<()> {
-        Ok(self.consensus.voluntary_exit(message, signature).unwrap_or_default())
-    }
-
     fn subscribe_to_verification_request(&self, pending: PendingSubscriptionSink, pubkey: BLSPubkey) -> SubscriptionResult {
         let mut rx = self.broadcast_tx.subscribe();
         debug!(target: "reth::cli", ?pubkey, "subscribe_to_verification_request New client subscribed");

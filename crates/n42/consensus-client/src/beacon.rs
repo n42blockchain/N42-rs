@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use alloy_rlp::{Encodable, Decodable, RlpEncodable,  RlpDecodable};
 use std::collections::{HashMap, BTreeMap};
 use alloy_primitives::{keccak256, BlockHash, B256, Log};
-use n42_primitives::{Attestation, BeaconBlock, BeaconBlockBody, BeaconState, BlockVerifyResultAggregate, CommitteeIndex, Deposit, DepositData, Epoch, ExecutionRequests, Validator, VoluntaryExit, VoluntaryExitWithSig, DEPOSIT_AMOUNT, SLOTS_PER_EPOCH};
+use n42_primitives::{Attestation, BeaconBlock, BeaconBlockBody, BeaconState, BlockVerifyResultAggregate, CommitteeIndex, Deposit, DepositData, Epoch, ExecutionRequests, Validator, VoluntaryExitWithSig, DEPOSIT_AMOUNT, SLOTS_PER_EPOCH};
 use tracing::{trace, debug, error, info, warn};
 
 const INMEMORY_BEACON_STATES: u32 = 256;
@@ -137,20 +137,6 @@ where
         beacon_state.process_withdrawals()?;
         Ok((Some(expected_withdrawals), beacon_state))
 
-    }
-
-    pub fn is_valid_voluntary_exit(&mut self, eth1_block_hash: BlockHash, voluntary_exit: &VoluntaryExit, signature: &Bytes) -> eyre::Result<bool> {
-        let beacon_block_hash = self.provider.get_beacon_block_hash_by_eth1_hash(&eth1_block_hash)?.unwrap();
-        let beacon_state = self.provider.get_beacon_state_by_hash(&beacon_block_hash)?.unwrap();
-        if let Some(validator) = beacon_state.validators.get(voluntary_exit.validator_index as usize) {
-            if voluntary_exit.epoch > validator.activation_epoch && !validator.is_exited_set() {
-                // TODO: check signature
-
-                return Ok(true)
-            }
-        }
-
-        Ok(false)
     }
 
     fn get_beacon_state_from_block_hash(&self, block_hash: B256) -> eyre::Result<BeaconState> {

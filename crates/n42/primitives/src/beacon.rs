@@ -601,40 +601,6 @@ impl BeaconState {
         Ok(())
     }
 
-    pub fn process_deposit(&mut self, deposits: &Vec<Deposit>) -> eyre::Result<()> {
-        // TODO: check deposits against eth1 block and beacon state
-        // TODO: update state
-        for deposit in deposits {
-            let _ = self.process_one_deposit(deposit);
-        }
-        Ok(())
-    }
-
-    pub fn process_one_deposit(&mut self, deposit: &Deposit) -> eyre::Result<()> {
-        let mut updated = false;
-        for (index, validator) in self.validators.iter_mut().enumerate() {
-            if validator.pubkey == deposit.data.pubkey {
-                validator.effective_balance += deposit.data.amount;
-                self.balances[index] += deposit.data.amount;
-                updated = true;
-            }
-        }
-
-        if !updated {
-            let validator = Validator {
-                pubkey: deposit.data.pubkey.clone(),
-                withdrawal_credentials: deposit.data.withdrawal_credentials,
-                effective_balance: deposit.data.amount,
-                activation_epoch: self.slot / SLOTS_PER_EPOCH + 1,
-                ..Default::default()
-            };
-            self.validators.push(validator);
-            self.balances.push(deposit.data.amount);
-        }
-
-        Ok(())
-    }
-
     pub fn process_attestation(&mut self, attestations: &Vec<Attestation>) -> eyre::Result<()> {
         for attestation in attestations {
             let _ = self.process_one_attestation(attestation)?;
@@ -675,39 +641,6 @@ impl BeaconState {
         } else {
             Err(eyre::eyre!("failed: {aggregate_sig_verify_result:?}"))
         }
-    }
-
-    pub fn process_voluntary_exit(&mut self, voluntary_exits: &Vec<VoluntaryExitWithSig>) -> eyre::Result<()> {
-        // TODO: check voluntary exits against beacon state
-        // TODO: update state
-        for voluntary_exit in voluntary_exits {
-            let _ = self.process_one_voluntary_exit(voluntary_exit);
-        }
-        Ok(())
-    }
-
-    pub fn process_one_voluntary_exit(&mut self, voluntary_exit: &VoluntaryExitWithSig) -> eyre::Result<()> {
-        let voluntary_exit = &voluntary_exit.voluntary_exit;
-        let validator_index: usize = voluntary_exit.validator_index as usize;
-        if validator_index >= self.validators.len() {
-            return Ok(());
-        }
-        if self.validators[validator_index].withdrawable_epoch == 0 {
-            let exit_epoch = voluntary_exit.epoch;
-            self.validators[validator_index].exit_epoch = exit_epoch;
-            self.validators[validator_index].withdrawable_epoch = exit_epoch + 1;
-        }
-
-        Ok(())
-    }
-
-    pub fn valid_validators(&self) -> Vec<Validator> {
-        let mut validators = self.validators.clone();
-        validators.retain(|validator| {
-            let epoch = self.current_epoch();
-            epoch >= validator.activation_epoch && (validator.exit_epoch == 0 || epoch < validator.exit_epoch)
-        });
-        validators
     }
 
     pub fn get_expected_withdrawals(&self) -> eyre::Result<(Vec<Withdrawal>, Option<usize>)> {

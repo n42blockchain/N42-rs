@@ -54,7 +54,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{trace, debug, error, info, warn};
 
 use crate::beacon::{Beacon};
-use n42_primitives::{RelativeEpoch, Attestation, BeaconState, BeaconBlock, Deposit, VoluntaryExit, VoluntaryExitWithSig, parse_deposit_log, BLSPubkey, BlockVerifyResultAggregate, agg_sig_to_fixed, fixed_to_agg_sig, SLOTS_PER_EPOCH, CommitteeIndex, AttestationData};
+use n42_primitives::{RelativeEpoch, Attestation, BeaconState, BeaconBlock, Deposit, VoluntaryExitWithSig, parse_deposit_log, BLSPubkey, BlockVerifyResultAggregate, agg_sig_to_fixed, fixed_to_agg_sig, SLOTS_PER_EPOCH, CommitteeIndex, AttestationData};
 use crate::network::{fetch_beacon_block, broadcast_beacon_block};
 
 /// A mining mode for the local dev engine.
@@ -131,7 +131,6 @@ pub struct N42Miner<T: PayloadTypes, Provider, B, Network> {
     new_block_tx: mpsc::Sender<(NewBlock, BlockHash)>,
     new_block_rx: mpsc::Receiver<(NewBlock, BlockHash)>,
     beacon: Beacon<Provider>,
-    voluntary_exits: Vec<VoluntaryExitWithSig>,
     broadcast_unverified_block_tx: broadcast::Sender<(UnverifiedBlock, Arc<Vec<BLSPubkey>>)>,
     block_verify_result_rx: mpsc::Receiver<BlockVerifyResult>,
     pending_block_data: Option<PendingBlockData>,
@@ -227,7 +226,6 @@ where
             new_block_tx,
             new_block_rx,
             beacon,
-            voluntary_exits: Vec::new(),
             broadcast_unverified_block_tx,
             block_verify_result_rx,
             pending_block_data: None,
@@ -248,7 +246,6 @@ where
 
         let mut new_block_event_stream = self.network.subscribe_block();
         let mut network_event_stream = self.network.event_listener();
-        let mut voluntary_exit_rx = self.consensus.get_voluntary_exit_rx()?;
 
         loop {
             tokio::select! {
@@ -283,21 +280,6 @@ where
                 }
                 network_event = &mut network_event_stream.next() => {
                     debug!(target: "consensus-client", "network_event={:?}", network_event);
-                }
-                Ok((voluntary_exit, signature)) = voluntary_exit_rx.recv() => {
-                    debug!(target: "consensus-client", ?voluntary_exit, ?signature, "received voluntary_exit");
-
-                    let finalized_block_hash = self
-                        .provider
-                        .finalized_block_hash()
-                        .unwrap_or(Some(self.provider.chain_spec().genesis_hash()))
-                        .unwrap();
-                    let is_valid = self.beacon.is_valid_voluntary_exit(finalized_block_hash, &voluntary_exit, &signature)?;
-                    debug!(target: "consensus-client", ?is_valid, "check voluntary_exit");
-                    if is_valid {
-                        self.voluntary_exits.push(VoluntaryExitWithSig {voluntary_exit, signature});
-                    }
-
                 }
             }
         }
@@ -483,19 +465,6 @@ where
                 let deposits: Vec<Deposit> = Default::default();
                 if deposits != new_beacon_block.body.deposits {
                     return Err(eyre::eyre!("deposits mismatch between eth1 block and beacon block"));
-                }
-
-                let finalized_block_hash = self
-                    .provider
-                    .finalized_block_hash()
-                    .unwrap_or(Some(self.provider.chain_spec().genesis_hash()))
-                    .unwrap();
-                for voluntary_exit in &new_beacon_block.body.voluntary_exits {
-                    let is_valid = self.beacon.is_valid_voluntary_exit(finalized_block_hash, &voluntary_exit.voluntary_exit, &voluntary_exit.signature)?;
-                    debug!(target: "consensus-client", ?is_valid, "check voluntary_exit");
-                    if !is_valid {
-                        return Err(eyre::eyre!("voluntary_exit is not valid: {voluntary_exit:?}"));
-                    }
                 }
 
                 let (_, beacon_state_after_withdrawal) = self.beacon.gen_withdrawals(parent.parent_hash)?;
@@ -762,6 +731,7 @@ where
         };
         //let deposits = self.get_deposits(block.number.saturating_sub(DEPOSIT_GAP))?;
         let deposits: Vec<Deposit> = Default::default();
+        let voluntary_exits: Vec<VoluntaryExitWithSig> = Default::default();
         let finalized_block_hash = self
             .provider
             .finalized_block_hash()
@@ -769,8 +739,6 @@ where
             .unwrap();
         let finalized_beacon_block_hash = self.provider.get_beacon_block_hash_by_eth1_hash(&finalized_block_hash)?.unwrap();
         let finalized_beacon_state = self.provider.get_beacon_state_by_hash(&finalized_beacon_block_hash)?.unwrap();
-        let voluntary_exits = self.voluntary_exits.to_vec();
-        self.voluntary_exits.clear();
         let beacon_block = self.beacon.gen_beacon_block(Some(beacon_state_after_withdrawal), parent_beacon_block_hash, &deposits, &attestations.values().cloned().collect(), &voluntary_exits, &execution_requests, &block)?;
         let beacon_block_hash = beacon_block.hash_slow();
         self.provider.save_beacon_block_by_hash(&beacon_block_hash, beacon_block.clone())?;

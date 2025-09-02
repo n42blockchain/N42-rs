@@ -127,7 +127,7 @@ async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(node: 
     let current_head = parent_hash;
     let new_head = payload_type.block().hash();
     EngineApiClient::fork_choice_updated_v1(
-                &client,
+        &client,
             ForkchoiceState {
                 head_block_hash: new_head,
                 safe_block_hash: current_head,

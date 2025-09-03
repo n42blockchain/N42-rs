@@ -155,7 +155,7 @@ impl CliqueTest {
         chainspec.genesis.extra_data = extra_data.into();
         let hardforks = N42_HARDFORKS_FOR_CLIQUE_TEST.clone();
         let genesis_header = SealedHeader::new_unhashed(
-                make_genesis_header(&chainspec.genesis, &hardforks),
+            make_genesis_header(&chainspec.genesis, &hardforks),
                 //genesis_hash,
             );
         if let Some(epoch) = self.epoch {

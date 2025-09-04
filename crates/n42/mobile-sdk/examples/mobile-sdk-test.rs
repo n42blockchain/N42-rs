@@ -9,7 +9,8 @@ use hex::FromHex;
 use mobile_sdk::{deposit_exit::{self, create_deposit_unsigned_tx, create_get_exit_fee_unsigned_tx, create_exit_unsigned_tx}, run_client};
 use blst::min_pk::SecretKey;
 use ::rand::RngCore;
-use tracing::info;
+
+use tracing::{debug, info, Level};
 
 abigen!(
     DepositContract,
@@ -76,7 +77,10 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
+    tracing_subscriber::fmt::init();
+
     let args = Cli::parse();
+    debug!("args {args:?}");
 
     match args.command {
         Commands::Deposit {

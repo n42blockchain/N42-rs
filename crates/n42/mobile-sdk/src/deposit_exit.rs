@@ -27,6 +27,7 @@ pub fn create_deposit_unsigned_tx(
     deposit_contract_address: String,
     validator_private_key: String,
     withdrawal_address: String,
+    deposit_value_in_wei: U256,
     ) -> eyre::Result<TransactionRequest> {
 
     let addr_hex = withdrawal_address
@@ -54,7 +55,7 @@ pub fn create_deposit_unsigned_tx(
         withdrawal_credentials: creds,
         //signature: SignatureBytes::empty(),
         signature: Default::default(),
-        amount: DEPOSIT_AMOUNT,
+        amount: (deposit_value_in_wei / U256::exp10(9)).as_u64(),
     };
     //let spec = ChainSpec::n42();
     //deposit_data.signature = deposit_data.create_signature(&GenericSecretKey::deserialize(&sk.serialize()).unwrap(),
@@ -86,10 +87,11 @@ deposit_contract_address
         .parse()
         .unwrap();
 
+    debug!("deposit_value_in_wei: {deposit_value_in_wei:?}");
     let tx = TransactionRequest {
         to: Some(NameOrAddress::Address(contract_address)),
         data: Some(calldata.into()),
-        value: Some(U256::from(32u64) * U256::exp10(18)),
+        value: Some(deposit_value_in_wei),
         ..Default::default()
     };
 

@@ -9,7 +9,6 @@ use hex::FromHex;
 use mobile_sdk::{deposit_exit::{self, create_deposit_unsigned_tx, create_get_exit_fee_unsigned_tx, create_exit_unsigned_tx}, run_client};
 use blst::min_pk::SecretKey;
 use ::rand::RngCore;
-
 use tracing::{debug, info, Level};
 
 abigen!(
@@ -53,6 +52,8 @@ enum Commands {
         withdrawal_address: String,
         #[arg(short, long, default_value = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")]
         deposit_private_key: String,
+        #[arg(long, default_value = "0x1bc16d674ec800000")] // 32 ETH in wei in hex
+        deposit_value_wei_in_hex: U256,
     },
     Exit {
         #[command(flatten)]
@@ -87,9 +88,10 @@ async fn main() -> eyre::Result<()> {
             validator_private_key,
             withdrawal_address,
             deposit_private_key,
+            deposit_value_wei_in_hex,
             common,
         }=> {
-            deposit(validator_private_key, withdrawal_address, deposit_private_key, common.rpc_url).await?;
+            deposit(validator_private_key, withdrawal_address, deposit_private_key, deposit_value_wei_in_hex, common.rpc_url).await?;
         },
         Commands::Exit {
             withdrawal_private_key,
@@ -114,6 +116,7 @@ async fn deposit(
     validator_private_key: Option<String>,
     withdrawal_address: String,
     deposit_private_key: String,
+    deposit_value_wei_in_hex: U256,
     rpc_url: String,
     ) -> eyre::Result<()> {
     let sk = match validator_private_key {
@@ -132,7 +135,7 @@ async fn deposit(
     };
 
     let deposit_contract_address = deposit_exit::DEVNET_DEPOSIT_CONTRACT_ADDRESS;
-    let unsigned_tx = create_deposit_unsigned_tx(deposit_contract_address.to_owned(), hex::encode(&sk.to_bytes()), withdrawal_address)?;
+    let unsigned_tx = create_deposit_unsigned_tx(deposit_contract_address.to_owned(), hex::encode(&sk.to_bytes()), withdrawal_address, deposit_value_wei_in_hex)?;
 
     let provider = Provider::<Http>::try_from(rpc_url)?;
     let chain_id = provider.get_chainid().await?.as_u64();
@@ -164,7 +167,7 @@ async fn deposit(
             return Err(eyre::eyre!("TransactionDropped"));
         }
     };
-    info!("deposit transaction_receipt {transaction_receipt:?}");
+    debug!("deposit transaction_receipt {transaction_receipt:?}");
 
     Ok(())
 }
@@ -217,7 +220,7 @@ async fn exit(
             return Err(eyre::eyre!("TransactionDropped"));
         }
     };
-    info!("exit transaction_receipt {transaction_receipt:?}");
+    debug!("exit transaction_receipt {transaction_receipt:?}");
 
     Ok(())
 }

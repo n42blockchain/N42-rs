@@ -142,7 +142,6 @@ async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(node: 
 #[cfg(test)]
 impl CliqueTest {
     fn gen_chainspec(&self, accounts: &mut TesterAccountPool) -> ChainSpec {
-
         let signers: Vec<Address> = self.signers.iter().map(|s| accounts.address(s)).collect();
 
         let mut chainspec = (**N42).clone();

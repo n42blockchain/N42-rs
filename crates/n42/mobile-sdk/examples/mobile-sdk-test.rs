@@ -154,17 +154,17 @@ async fn deposit(
 
     let receipt = pending_tx
         .await?
-        .ok_or(eyre::eyre!("TransactionDropped"))?;
+        .ok_or(eyre::eyre!("pending tx is None"))?;
     let transaction_receipt = match receipt.status {
         Some(v) => {
             if v == U64::from(1) {
                 receipt
             } else {
-                return Err(eyre::eyre!("TransactionDropped"));
+                return Err(eyre::eyre!("receipt status={v:?}"));
             }
         },
         None => {
-            return Err(eyre::eyre!("TransactionDropped"));
+            return Err(eyre::eyre!("receipt status is None"));
         }
     };
     debug!("deposit transaction_receipt {transaction_receipt:?}");
@@ -207,17 +207,17 @@ async fn exit(
 
     let receipt = pending_tx
         .await?
-        .ok_or(eyre::eyre!("TransactionDropped"))?;
+        .ok_or(eyre::eyre!("pending tx is None"))?;
     let transaction_receipt = match receipt.status {
         Some(v) => {
             if v == U64::from(1) {
                 receipt
             } else {
-                return Err(eyre::eyre!("TransactionDropped"));
+                return Err(eyre::eyre!("receipt status={v:?}"));
             }
         },
         None => {
-            return Err(eyre::eyre!("TransactionDropped"));
+            return Err(eyre::eyre!("receipt status is None"));
         }
     };
     debug!("exit transaction_receipt {transaction_receipt:?}");

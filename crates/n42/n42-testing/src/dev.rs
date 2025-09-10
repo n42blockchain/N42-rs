@@ -129,7 +129,7 @@ async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(node: 
     EngineApiClient::fork_choice_updated_v1(
         &client,
         ForkchoiceState {
-                head_block_hash: new_head,
+            head_block_hash: new_head,
                 safe_block_hash: current_head,
                 finalized_block_hash: current_head,
             },

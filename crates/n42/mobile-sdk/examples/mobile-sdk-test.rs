@@ -229,20 +229,15 @@ async fn validate(
     validator_private_key: Option<String>,
     rpc_url: String,
     ) -> eyre::Result<()> {
-    let sk = match validator_private_key {
-        Some(validator_private_key) => {
-            let sk = SecretKey::from_bytes(&Vec::from_hex(&validator_private_key).unwrap()).unwrap();
-            sk
-        },
-        None => {
+    let validator_private_key = validator_private_key.unwrap_or_else(
+        || {
             let mut rng = ::rand::thread_rng();
             let mut ikm = [0u8; 32];
             rng.fill_bytes(&mut ikm);
 
             let sk = SecretKey::key_gen(&ikm, &[]).unwrap();
-            sk
-        }
-    };
-    run_client(&rpc_url, &sk).await?;
+            hex::encode(sk.to_bytes())
+        });
+    run_client(&rpc_url, &validator_private_key).await?;
     Ok(())
 }

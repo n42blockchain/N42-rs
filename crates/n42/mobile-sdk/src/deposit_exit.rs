@@ -129,7 +129,12 @@ pub fn create_exit_unsigned_tx(
     let contract_address: ethers::types::Address = EIP7002_CONTRACT_ADDRESS
         .parse()
         .unwrap();
-    let pubkey_bytes = hex::decode(validator_public_key)?;
+
+    let pubkey_hex = validator_public_key
+        .strip_prefix("0x")
+        .unwrap_or(&validator_public_key);
+    let pubkey_bytes = hex::decode(pubkey_hex)
+        .map_err(|e| eyre::eyre!("invalid validator_public_key: {}", e))?;
 
     let mut data = Vec::with_capacity(56);
     data.extend_from_slice(&pubkey_bytes);

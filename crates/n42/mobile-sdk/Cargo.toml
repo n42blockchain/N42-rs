@@ -12,6 +12,8 @@ exclude.workspace = true
 crate-type = ["lib", "cdylib"]
 
 [dependencies]
+jni = "0.21"
+once_cell = "1.21"
 hex-literal = "0.3"
 ethereum_ssz.workspace = true
 ethereum_ssz_derive.workspace = true

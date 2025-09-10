@@ -1,3 +1,4 @@
+use hex::FromHex;
 use reth_primitives_traits::AlloyBlockHeader;
 use blst::min_pk::SecretKey;
 use reth_evm::execute::Executor;
@@ -16,42 +17,20 @@ use jsonrpsee::core::client::Subscription;
 use jsonrpsee::rpc_params;
 use jsonrpsee::ws_client::WsClientBuilder;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
-use tokio::time::sleep;
 use n42_clique::{BlockVerifyResult, UnverifiedBlock};
 use n42_primitives::{AttestationData};
 
 pub mod deposit_exit;
+pub mod jni;
 
-const MAX_RETRIES: usize = 5;
-const RETRY_INTERVAL_SECS: u64 = 5;
+async fn run_client(
+    ws_url: &str,
+    validator_private_key: &String,
+    ) -> eyre::Result<()> {
+    let validator_private_key_vec = Vec::from_hex(&validator_private_key)?;
+    let sk = SecretKey::from_bytes(&validator_private_key_vec)
+        .map_err(|e| eyre::eyre!("SecretKey error: {e:?}"))?;
 
-pub async fn run_client(ws_url: &str, sk: &SecretKey) -> eyre::Result<()> {
-    let mut retry_count = 0;
-
-    loop {
-        match try_run_client(ws_url, &sk).await {
-            Ok(_) => {
-                println!("WebSocket client exited normally.");
-                break;
-            }
-            Err(e) => {
-                eprintln!("Connection error: {:?}", e);
-                retry_count += 1;
-                if retry_count >= MAX_RETRIES {
-                    eprintln!("Max retries reached, exiting.");
-                    break;
-                }
-                println!("Retrying in {} seconds...", RETRY_INTERVAL_SECS);
-                sleep(Duration::from_secs(RETRY_INTERVAL_SECS)).await;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-async fn try_run_client(ws_url: &str, sk: &SecretKey) -> eyre::Result<()> {
     let ws_client = WsClientBuilder::default()
         .build(ws_url)
         .await?;

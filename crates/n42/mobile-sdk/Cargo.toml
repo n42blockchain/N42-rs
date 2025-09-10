@@ -8,6 +8,9 @@ homepage.workspace = true
 repository.workspace = true
 exclude.workspace = true
 
+[lib]
+crate-type = ["lib", "cdylib"]
+
 [dependencies]
 hex-literal = "0.3"
 ethereum_ssz.workspace = true

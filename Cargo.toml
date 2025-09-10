@@ -603,6 +603,8 @@ reth-primitives-traits = { path = "crates/primitives-traits" }
 reth-node-core = { path = "crates/node/core" }
 reth-node-ethereum = { path = "crates/ethereum/node" }
 reth-provider = { path = "crates/storage/provider" }
+reth-libmdbx = { path = "crates/storage/libmdbx-rs" }
+reth-mdbx-sys = { path = "crates/storage/libmdbx-rs/mdbx-sys" }
 reth-db = {path = "crates/storage/db", optional = true }
 reth-ethereum-forks = { path = "crates/ethereum/hardforks"}
 reth-ethereum-cli = { path = "crates/ethereum/cli"}

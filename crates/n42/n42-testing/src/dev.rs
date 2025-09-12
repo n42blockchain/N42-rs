@@ -184,7 +184,7 @@ impl CliqueTest {
         let node_config = NodeConfig::new(Arc::new(chainspec))
             .with_network(network_config.clone())
             .with_unused_ports()
-                .with_rpc(RpcServerArgs::default().with_unused_ports().with_http())
+            .with_rpc(RpcServerArgs::default().with_unused_ports().with_http())
             .with_dev(DevArgs { dev: false, consensus_signer_private_key: Some(B256::random()), ..Default::default() });
 
         let NodeHandle { node, .. } = NodeBuilder::new(node_config.clone())

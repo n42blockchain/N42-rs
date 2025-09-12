@@ -21,7 +21,11 @@ use n42_clique::{BlockVerifyResult, UnverifiedBlock};
 use n42_primitives::{AttestationData};
 
 pub mod deposit_exit;
+
+/// cbindgen:ignore
 pub mod jni;
+
+pub mod c_ffi;
 
 async fn run_client(
     ws_url: &str,

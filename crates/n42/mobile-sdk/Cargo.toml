@@ -9,7 +9,7 @@ repository.workspace = true
 exclude.workspace = true
 
 [lib]
-crate-type = ["lib", "cdylib"]
+crate-type = ["lib", "staticlib"]
 
 [dependencies]
 jni = "0.21"

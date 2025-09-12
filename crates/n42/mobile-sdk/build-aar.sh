@@ -21,6 +21,12 @@ JNI_SRC="src/jni.rs"           # Rust file with all JNI functions
 rm -rf "$WORKDIR"
 mkdir -p "$JNILIBS_DIR" "$JAVA_DIR"
 
+# Backup Cargo.toml
+cp Cargo.toml Cargo.toml.bak
+
+# Modify Cargo.toml for Android
+sed -i '' 's/^crate-type = \[\(.*\)\]/crate-type = [\1, "cdylib"]/' Cargo.toml
+
 # -------------------------
 # Build Rust crate for Android ABIs
 # -------------------------
@@ -28,6 +34,8 @@ echo "Building Rust crate for Android..."
 #cargo ndk -t armeabi-v7a -t arm64-v8a -t x86_64 \
 cargo ndk -t arm64-v8a -t x86_64 \
     -o "$JNILIBS_DIR" build --release -p "$CRATE_NAME"
+
+mv Cargo.toml.bak Cargo.toml
 
 # -------------------------
 # Create Android library skeleton

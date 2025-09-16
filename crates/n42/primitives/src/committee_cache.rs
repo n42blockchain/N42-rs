@@ -116,7 +116,7 @@ impl CommitteeCache {
         for (i, &v) in shuffling.iter().enumerate() {
             *shuffling_positions
                 .get_mut(v)
-                .ok_or(eyre::eyre!(format!("Error::ShuffleIndexOutOfBounds, v={v}")))? = NonZeroUsize::new(i + 1).into();
+                .ok_or(eyre::eyre!("Error::ShuffleIndexOutOfBounds, v={v}"))? = NonZeroUsize::new(i + 1).into();
         }
 
         Ok(CommitteeCache {
@@ -197,7 +197,7 @@ impl CommitteeCache {
         (0..self.committees_per_slot())
             .map(|index| {
                 self.get_beacon_committee(slot, index)
-                    .ok_or(eyre::eyre!(format!("Error::NoCommittee, slot={slot}, index={index}")))
+                    .ok_or(eyre::eyre!("Error::NoCommittee, slot={slot}, index={index}"))
             })
             .collect()
     }

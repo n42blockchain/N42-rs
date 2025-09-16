@@ -821,20 +821,20 @@ impl BeaconState {
     pub fn get_validator(&self, validator_index: usize) -> eyre::Result<&Validator> {
         self.validators
             .get(validator_index)
-            .ok_or(eyre::eyre!(format!("UnknownValidator, {validator_index}")))
+            .ok_or(eyre::eyre!("UnknownValidator, {validator_index}"))
     }
 
     /// Safe mutator for the `validators` list.
     pub fn get_validator_mut(&mut self, validator_index: usize) -> eyre::Result<&mut Validator> {
         self.validators
             .get_mut(validator_index)
-            .ok_or(eyre::eyre!(format!("UnknownValidator, {validator_index}")))
+            .ok_or(eyre::eyre!("UnknownValidator, {validator_index}"))
     }
 
     pub fn get_balance(&self, validator_index: usize) -> eyre::Result<u64> {
         self.balances
             .get(validator_index)
-            .ok_or(eyre::eyre!(format!("UnknownValidator, {validator_index}")))
+            .ok_or(eyre::eyre!("UnknownValidator, {validator_index}"))
             .copied()
     }
 
@@ -842,13 +842,13 @@ impl BeaconState {
     pub fn get_balance_mut(&mut self, validator_index: usize) -> eyre::Result<&mut u64> {
         self.balances
             .get_mut(validator_index)
-            .ok_or(eyre::eyre!(format!("BalancesOutOfBounds, {validator_index}")))
+            .ok_or(eyre::eyre!("BalancesOutOfBounds, {validator_index}"))
     }
 
     pub fn get_inactivity_score(&self, validator_index: usize) -> eyre::Result<u64> {
         self.inactivity_scores
             .get(validator_index)
-            .ok_or(eyre::eyre!(format!("UnknownValidator, {validator_index}")))
+            .ok_or(eyre::eyre!("UnknownValidator, {validator_index}"))
             .copied()
     }
 
@@ -856,7 +856,7 @@ impl BeaconState {
     pub fn get_inactivity_score_mut(&mut self, validator_index: usize) -> eyre::Result<&mut u64> {
         self.inactivity_scores
             .get_mut(validator_index)
-            .ok_or(eyre::eyre!(format!("InactivityScoreOutOfBounds, {validator_index}")))
+            .ok_or(eyre::eyre!("InactivityScoreOutOfBounds, {validator_index}"))
     }
 
     pub fn get_pending_balance_to_withdraw(&self, validator_index: usize) -> eyre::Result<u64> {
@@ -997,7 +997,7 @@ impl BeaconState {
         if initialized_epoch == epoch {
             Ok(balance)
         } else {
-            Err(eyre::eyre!(format!("TotalActiveBalanceCacheInconsistent , initialized_epoch={initialized_epoch}, current_epoch={epoch}")))
+            Err(eyre::eyre!("TotalActiveBalanceCacheInconsistent , initialized_epoch={initialized_epoch}, current_epoch={epoch}"))
         }
         */
     }
@@ -1039,7 +1039,7 @@ pub fn verify_exit(
     let validator = self
         .validators
         .get(exit.validator_index as usize)
-        .ok_or_else(|| eyre::eyre!(format!("ExitInvalid::ValidatorUnknown({}", exit.validator_index)))?;
+        .ok_or_else(|| eyre::eyre!("ExitInvalid::ValidatorUnknown({}", exit.validator_index))?;
 
     // Verify the validator is active.
     verify!(
@@ -1392,7 +1392,7 @@ pub fn apply_deposit(
                 let delta = deltas
                     .get_mut(index)
                     //.ok_or(Error::DeltaOutOfBounds(index))?;
-                    .ok_or(eyre::eyre!(format!("DeltaOutOfBounds, {index}")))?;
+                    .ok_or(eyre::eyre!("DeltaOutOfBounds, {index}"))?;
                 delta.all_delta.combine(all_delta)?;
                 // delta.target_delta.combine(target_delta)?;
                 // delta.head_delta.combine(head_delta)?;
@@ -1517,7 +1517,7 @@ pub fn apply_deposit(
     fn committee_cache_at_index(&self, index: usize) -> eyre::Result<&CommitteeCache> {
         self.committee_caches
             .get(index)
-            .ok_or(eyre::eyre!(format!("Error::CommitteeCachesOutOfBounds, {index}")))
+            .ok_or(eyre::eyre!("Error::CommitteeCachesOutOfBounds, {index}"))
     }
 
     /// Get a mutable reference to the committee cache at a given index.
@@ -1527,7 +1527,7 @@ pub fn apply_deposit(
     ) -> eyre::Result<&mut CommitteeCache> {
         self.committee_caches
             .get_mut(index)
-            .ok_or(eyre::eyre!(format!("Error::CommitteeCachesOutOfBounds, {index}")))
+            .ok_or(eyre::eyre!("Error::CommitteeCachesOutOfBounds, {index}"))
     }
 
     pub(crate) fn committee_cache_index(relative_epoch: RelativeEpoch) -> usize {
@@ -1606,7 +1606,7 @@ pub fn apply_deposit(
         if cache.is_initialized_at(relative_epoch.into_epoch(self.current_epoch())) {
             Ok(cache)
         } else {
-            Err(eyre::eyre!(format!("Error::CommitteeCacheUninitialized, relative_epoch: {relative_epoch:?}")))
+            Err(eyre::eyre!("Error::CommitteeCacheUninitialized, relative_epoch: {relative_epoch:?}"))
         }
     }
 

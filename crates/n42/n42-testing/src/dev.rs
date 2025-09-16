@@ -131,7 +131,7 @@ async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(node: 
         ForkchoiceState {
             head_block_hash: new_head,
             safe_block_hash: current_head,
-                finalized_block_hash: current_head,
+            finalized_block_hash: current_head,
             },
             None,
         ).await?;

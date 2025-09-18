@@ -27,11 +27,11 @@ echo "Generating C header with cbindgen..."
 # ---------------- BUILD RUST STATIC LIBRARIES ----------------
 export RUSTFLAGS="-C link-arg=-miphoneos-version-min=$IOS_MIN_VERSION"
 
-echo "Building Rust library for device (arm64)..."
-cargo build --release --target aarch64-apple-ios
-
-echo "Building Rust library for simulator (x86_64)..."
-cargo build --release --target x86_64-apple-ios
+(cd "$IOS_DIR/../" && cp Cargo.toml Cargo.toml.bak.ios &&
+sed -i '' 's/^crate-type = \[\(.*\)\]/crate-type = ["staticlib"]/' Cargo.toml
+)
+cargo lipo --release --targets aarch64-apple-ios,x86_64-apple-ios
+(cd "$IOS_DIR/../" && mv Cargo.toml.bak.ios Cargo.toml)
 
 LIB_DEVICE="$IOS_DIR/../../../../target/aarch64-apple-ios/release/lib${LIB_NAME}.a"
 LIB_SIM="$IOS_DIR/../../../../target/x86_64-apple-ios/release/lib${LIB_NAME}.a"

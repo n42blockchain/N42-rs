@@ -28,8 +28,10 @@ mobile-sdk-release.aar
 ### prerequisites
 1. Xcode + iOS SDK
 2. cbindgen
+3. cargo-lipo
 ```shell
 cargo install cbindgen
+cargo install cargo-lipo
 ```
 ### build commands
 ```shell

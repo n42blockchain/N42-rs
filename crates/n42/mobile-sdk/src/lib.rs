@@ -27,7 +27,7 @@ pub mod jni;
 
 pub mod c_ffi;
 
-async fn run_client(
+pub async fn run_client(
     ws_url: &str,
     validator_private_key: &String,
     ) -> eyre::Result<()> {

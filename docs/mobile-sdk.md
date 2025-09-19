@@ -77,8 +77,10 @@ public class MobileSdkTest {
         );
         Log.i("RustLib", "tx: " + tx);
 
-        String fee_wei_in_hex = "0x1"; // should query the value from the exit
-contract
+        String getExitFeeTx = Api.createGetExitFeeUnsignedTx();
+        Log.i("RustLib", "getExitFeeTx: " + getExitFeeTx);
+
+        String fee_wei_in_hex = "0x1"; // should query the value by sending getExitFee Tx(as it is, no signing needed) to the exit contract
 
         String exitTx = Api.createExitUnsignedTx(
                 validatorPublicKey,
@@ -165,10 +167,19 @@ struct ContentView: View {
             }
             print("createDepositUnsignedTx result", result)
 
+            result = MobileSdk.createGetExitFeeUnsignedTx()
+            switch result {
+            case .success(let txJson):
+                self.resultText = "TX JSON: \(txJson)"
+            case .failure(let error):
+                self.resultText = "Error: \(error)"
+            }
+            print("createGetExitFeeUnsignedTx result", result)
+
             let validatorPublicKey =   "8a2470d8ccb2e43b3b5295cfee71508f8808e166e5f152d5af9fe022d95e300dc7c5814f2c9eb71e2da8412beb61c53a"
             result = MobileSdk.createExitUnsignedTx(
                 validatorPublicKey: validatorPublicKey,
-                feeInWeiOrEmpty: "0x1"  // should query the value from the exit
+                feeInWeiOrEmpty: "0x1"  // should query the value by sending getExitFee Tx(as it is, no signing needed) to the exit contract
             )
             switch result {
             case .success(let txJson):

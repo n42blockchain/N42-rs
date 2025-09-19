@@ -43,6 +43,18 @@ result in
     }
 
     @objc
+    func createGetExitFeeUnsignedTx(_ resolver: @escaping RCTPromiseResolveBlock,
+                              rejecter: @escaping RCTPromiseRejectBlock) {
+        let result = MobileSdk.createGetExitFeeUnsignedTx()
+        switch result {
+        case .success(let json):
+            resolver(json)
+        case .failure(let error):
+            rejecter("RUST_ERROR", "\(error)", nil)
+        }
+    }
+
+    @objc
     func createExitUnsignedTx(_ validatorPublicKey: String,
                               feeInWeiOrEmpty: String?,
                               resolver: @escaping RCTPromiseResolveBlock,

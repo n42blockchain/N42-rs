@@ -128,6 +128,8 @@ class NativeBindings {
             String deposit_value_wei_in_hex
     );
 
+    public static native String createGetExitFeeUnsignedTx();
+
     public static native String createExitUnsignedTx(
             String validator_public_key,
             String fee_wei_in_hex
@@ -168,6 +170,10 @@ public class $JAVA_CLASS {
 		    withdrawal_address,
 		    deposit_value_wei_in_hex
 		);
+    }
+
+    public static String createGetExitFeeUnsignedTx() {
+	return NativeBindings.createGetExitFeeUnsignedTx();
     }
 
     public static String createExitUnsignedTx(

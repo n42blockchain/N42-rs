@@ -45,6 +45,20 @@ completion(.failure(.rustError(msg))) }
         return .success(String(cString: jsonPtr))
     }
 
+    public static func createGetExitFeeUnsignedTx(
+    ) -> Result<String, MobileSdkError> {
+        var errorPtr: UnsafeMutablePointer<CChar>? = nil
+        guard let jsonPtr = create_get_exit_fee_unsigned_tx_c(
+            &errorPtr
+        ) else {
+            defer { if let err = errorPtr { rust_free_string(err) } }
+            let msg = errorPtr.flatMap { String(cString: $0) } ?? "Unknown Rust error"
+            return .failure(.rustError(msg))
+        }
+        defer { rust_free_string(jsonPtr) }
+        return .success(String(cString: jsonPtr))
+    }
+
     public static func createExitUnsignedTx(
         validatorPublicKey: String,
         feeInWeiOrEmpty: String?

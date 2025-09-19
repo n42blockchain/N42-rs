@@ -6,7 +6,7 @@ use ethers::types::{TransactionRequest, U256};
 use eyre::Result;
 use serde_json;
 
-use crate::{deposit_exit::{create_deposit_unsigned_tx, create_exit_unsigned_tx}, run_client};
+use crate::{deposit_exit::{create_deposit_unsigned_tx, create_get_exit_fee_unsigned_tx, create_exit_unsigned_tx}, run_client};
 
 // ---------------- Helpers ----------------
 fn cstr_to_string(c: *const c_char) -> Result<String, String> {
@@ -83,6 +83,23 @@ Err(e) => { set_error(e); return ptr::null_mut(); } };
 set_error("invalid deposit value".into()); return ptr::null_mut(); } };
 
     match create_deposit_unsigned_tx(addr, pk, wd, value) {
+        Ok(tx) => make_c_string(serde_json::to_string(&tx).unwrap()),
+        Err(e) => { set_error(format!("{}", e)); ptr::null_mut() }
+    }
+}
+
+// ---------------- create_get_exit_fee_unsigned_tx ----------------
+#[no_mangle]
+pub extern "C" fn create_get_exit_fee_unsigned_tx_c(
+    out_error: *mut *mut c_char,
+) -> *mut c_char {
+    let mut set_error = |msg: String| {
+        if !out_error.is_null() {
+            unsafe { *out_error = make_c_string(msg); }
+        }
+    };
+
+    match create_get_exit_fee_unsigned_tx() {
         Ok(tx) => make_c_string(serde_json::to_string(&tx).unwrap()),
         Err(e) => { set_error(format!("{}", e)); ptr::null_mut() }
     }

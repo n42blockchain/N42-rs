@@ -18,6 +18,8 @@ char *create_deposit_unsigned_tx_c(const char *deposit_contract_address,
                                    const char *deposit_value_in_wei,
                                    char **out_error);
 
+char *create_get_exit_fee_unsigned_tx_c(char **out_error);
+
 char *create_exit_unsigned_tx_c(const char *validator_public_key,
                                 const char *fee_in_wei_or_empty,
                                 char **out_error);

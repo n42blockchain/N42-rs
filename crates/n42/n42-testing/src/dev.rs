@@ -133,7 +133,7 @@ async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(node: 
             safe_block_hash: current_head,
             finalized_block_hash: current_head,
         },
-            None,
+        None,
         ).await?;
     println!("latest block_hash={:?}", node.provider.latest_header().unwrap().unwrap().hash());
     Ok(())

@@ -35,8 +35,14 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_createDepositUnsignedTx(
     let deposit_value_wei_in_hex: String = env.get_string(&deposit_value_wei_in_hex)
             .expect("Couldn't get Java string from deposit_value_wei_in_hex!")
             .into();
-    let deposit_value_wei = U256::from_str_radix(&deposit_value_wei_in_hex, 16)
-                .expect("Failed to parse deposit_value_wei_in_hex as U256");
+    let deposit_value_wei = match deposit_value_wei_in_hex.parse::<U256>() {
+        Ok(v) => v,
+        Err(e) => {
+            env.throw_new("java/lang/Exception", e.to_string())
+                                .expect("Failed to throw exception");
+            return Default::default();
+        }
+    };
 
     let transaction_request = match create_deposit_unsigned_tx(
         deposit_contract_address,
@@ -48,11 +54,18 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_createDepositUnsignedTx(
         Err(e) => {
             env.throw_new("java/lang/Exception", e.to_string())
                                 .expect("Failed to throw exception");
-            Default::default()
+            return Default::default();
         }
     };
 
-    let json_string = serde_json::to_string(&transaction_request).expect("Failed to serialize transaction_request struct to JSON");
+    let json_string = match serde_json::to_string(&transaction_request) {
+        Ok(v) => v,
+        Err(e) => {
+            env.throw_new("java/lang/Exception", e.to_string())
+                                .expect("Failed to throw exception");
+            return Default::default();
+        }
+    };
 
     env.new_string(&json_string)
         .expect("Couldn't create Java string!")
@@ -69,11 +82,18 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_generateBls12381Keypair(
         Err(e) => {
             env.throw_new("java/lang/Exception", e.to_string())
                                 .expect("Failed to throw exception");
-            Default::default()
+            return Default::default();
         }
     };
 
-    let json_string = serde_json::to_string(&key_pair).expect("Failed to serialize keypair to JSON");
+    let json_string = match serde_json::to_string(&key_pair) {
+        Ok(v) => v,
+        Err(e) => {
+            env.throw_new("java/lang/Exception", e.to_string())
+                                .expect("Failed to throw exception");
+            return Default::default();
+        }
+    };
 
     env.new_string(&json_string)
         .expect("Couldn't create Java string!")
@@ -90,11 +110,18 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_createGetExitFeeUnsignedTx(
         Err(e) => {
             env.throw_new("java/lang/Exception", e.to_string())
                                 .expect("Failed to throw exception");
-            Default::default()
+            return Default::default();
         }
     };
 
-    let json_string = serde_json::to_string(&transaction_request).expect("Failed to serialize transaction_request struct to JSON");
+    let json_string = match serde_json::to_string(&transaction_request) {
+        Ok(v) => v,
+        Err(e) => {
+            env.throw_new("java/lang/Exception", e.to_string())
+                                .expect("Failed to throw exception");
+            return Default::default();
+        }
+    };
 
     env.new_string(&json_string)
         .expect("Couldn't create Java string!")
@@ -106,17 +133,26 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_createExitUnsignedTx(
     mut env: jni::JNIEnv<'_>,
     class: jni::objects::JClass<'_>,
     validator_public_key: JString<'_>,
-    fee_wei_in_hex: JString<'_>,
+    exit_fee_in_wei_in_hex: JString<'_>,
 ) -> jstring {
     let validator_public_key: String = env.get_string(&validator_public_key)
             .expect("Couldn't get Java string from validator_public_key!")
             .into();
-    let fee = if !fee_wei_in_hex.is_null() {
-        let fee_wei_in_hex: String = env.get_string(&fee_wei_in_hex)
-            .expect("Couldn't get Java string from fee_wei_in_hex!")
+    let fee = if !exit_fee_in_wei_in_hex.is_null() {
+        let exit_fee_in_wei_in_hex: String = env.get_string(&exit_fee_in_wei_in_hex)
+            .expect("Couldn't get Java string from exit_fee_in_wei_in_hex!")
             .into();
-        Some(U256::from_str_radix(&fee_wei_in_hex, 16)
-            .expect("Failed to parse fee_wei_in_hex as U256"))
+
+        let exit_fee_in_wei = match exit_fee_in_wei_in_hex.parse::<U256>() {
+            Ok(v) => v,
+            Err(e) => {
+                env.throw_new("java/lang/Exception", e.to_string())
+                                    .expect("Failed to throw exception");
+                return Default::default();
+            }
+        };
+
+        Some(exit_fee_in_wei)
     } else {
         None
     };
@@ -129,11 +165,18 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_createExitUnsignedTx(
         Err(e) => {
             env.throw_new("java/lang/Exception", e.to_string())
                                 .expect("Failed to throw exception");
-            Default::default()
+            return Default::default();
         }
     };
 
-    let json_string = serde_json::to_string(&transaction_request).expect("Failed to serialize transaction_request struct to JSON");
+    let json_string = match serde_json::to_string(&transaction_request) {
+        Ok(v) => v,
+        Err(e) => {
+            env.throw_new("java/lang/Exception", e.to_string())
+                                .expect("Failed to throw exception");
+            return Default::default();
+        }
+    };
 
     env.new_string(&json_string)
         .expect("Couldn't create Java string!")

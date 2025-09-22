@@ -16,3 +16,27 @@ pub fn generate_bls12_381_keypair() -> eyre::Result<(String, String)> {
 
     Ok((privkey_hex, pubkey_hex))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hex::FromHex;
+
+    #[test]
+    fn test_generate_bls12_381_keypair_ok() {
+        let result = generate_bls12_381_keypair();
+        assert!(result.is_ok());
+        let (privkey_hex, pubkey_hex) = result.unwrap();
+
+        let result = Vec::from_hex(privkey_hex);
+        assert!(result.is_ok());
+
+        let result = SecretKey::from_bytes(&result.unwrap());
+        assert!(result.is_ok());
+        let sk = result.unwrap();
+
+        let pk = sk.sk_to_pk();
+        let result = hex::encode(pk.to_bytes());
+        assert_eq!(result, pubkey_hex);
+    }
+}

@@ -33,6 +33,7 @@ pub async fn run_client(
     ws_url: &str,
     validator_private_key: &String,
     ) -> eyre::Result<()> {
+    let validator_private_key = validator_private_key.strip_prefix("0x").unwrap_or(validator_private_key);
     let validator_private_key_vec = Vec::from_hex(&validator_private_key)?;
     let sk = SecretKey::from_bytes(&validator_private_key_vec)
         .map_err(|e| eyre::eyre!("SecretKey error: {e:?}"))?;
@@ -126,7 +127,7 @@ fn verify(mut unverifiedblock:UnverifiedBlock) -> eyre::Result<B256> {
     // for test
     let sealed_block_receipts_root = unverifiedblock.blockbody.header().receipts_root;
 
-    let recovered = RecoveredBlock::try_recover_sealed(unverifiedblock.blockbody).unwrap();
+    let recovered = RecoveredBlock::try_recover_sealed(unverifiedblock.blockbody)?;
     match executor.execute_one(&recovered) {
         Ok(result) => {
             println!("success, {result:?}");

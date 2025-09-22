@@ -69,7 +69,17 @@ pub extern "C" fn generate_bls12_381_keypair_c (
     };
 
     match generate_bls12_381_keypair() {
-        Ok(tx) => make_c_string(serde_json::to_string(&tx).unwrap()),
+        Ok(tx) => {
+            let json_string = match serde_json::to_string(&tx) {
+                Ok(v) => v,
+                Err(e) => {
+                    set_error(format!("{}", e));
+                    return ptr::null_mut();
+                }
+            };
+
+            make_c_string(json_string)
+        },
         Err(e) => { set_error(format!("{}", e)); ptr::null_mut() }
     }
 }
@@ -101,7 +111,17 @@ Err(e) => { set_error(e); return ptr::null_mut(); } };
 set_error("invalid deposit value".into()); return ptr::null_mut(); } };
 
     match create_deposit_unsigned_tx(addr, pk, wd, value) {
-        Ok(tx) => make_c_string(serde_json::to_string(&tx).unwrap()),
+        Ok(tx) => {
+            let json_string = match serde_json::to_string(&tx) {
+                Ok(v) => v,
+                Err(e) => {
+                    set_error(format!("{}", e));
+                    return ptr::null_mut();
+                }
+            };
+
+            make_c_string(json_string)
+        },
         Err(e) => { set_error(format!("{}", e)); ptr::null_mut() }
     }
 }
@@ -118,7 +138,17 @@ pub extern "C" fn create_get_exit_fee_unsigned_tx_c(
     };
 
     match create_get_exit_fee_unsigned_tx() {
-        Ok(tx) => make_c_string(serde_json::to_string(&tx).unwrap()),
+        Ok(tx) => {
+            let json_string = match serde_json::to_string(&tx) {
+                Ok(v) => v,
+                Err(e) => {
+                    set_error(format!("{}", e));
+                    return ptr::null_mut();
+                }
+            };
+
+            make_c_string(json_string)
+        },
         Err(e) => { set_error(format!("{}", e)); ptr::null_mut() }
     }
 }
@@ -151,7 +181,17 @@ set_error("invalid fee".into()); U256::zero() })),
     };
 
     match create_exit_unsigned_tx(pubkey, fee_opt) {
-        Ok(tx) => make_c_string(serde_json::to_string(&tx).unwrap()),
+        Ok(tx) => {
+            let json_string = match serde_json::to_string(&tx) {
+                Ok(v) => v,
+                Err(e) => {
+                    set_error(format!("{}", e));
+                    return ptr::null_mut();
+                }
+            };
+
+            make_c_string(json_string)
+        },
         Err(e) => { set_error(format!("{}", e)); ptr::null_mut() }
     }
 }

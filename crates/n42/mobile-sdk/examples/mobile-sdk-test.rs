@@ -3,6 +3,7 @@ use ethers::{
 };
 use ethers::middleware::SignerMiddleware;
 use ethers_signers::{LocalWallet, WalletError};
+use mobile_sdk::blst_utils::generate_bls12_381_keypair;
 use std::{str::FromStr, sync::Arc};
 use clap::{Command, Parser, Subcommand};
 use hex::FromHex;
@@ -74,6 +75,8 @@ enum Commands {
         #[arg(short, long, default_value = "ws://127.0.0.1:8546")]
         ws_rpc_url: String,
     },
+    GenerateBLS12381Keypair {
+    },
 }
 
 #[tokio::main]
@@ -106,6 +109,11 @@ async fn main() -> eyre::Result<()> {
             common,
         }=> {
             validate(validator_private_key, ws_rpc_url).await?;
+        },
+        Commands::GenerateBLS12381Keypair {
+        }=> {
+            let keypair = generate_bls12_381_keypair()?;
+            info!("keypair: {keypair:?}");
         }
     }
 

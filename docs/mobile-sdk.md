@@ -57,14 +57,33 @@ package com.example.test_mobile_sdk_aar;
 import android.util.Log;
 
 import com.mobileSdk.Api;
+import org.json.JSONArray;
+import org.json.JSONException;
 
 public class MobileSdkTest {
     public static void test() {
         //String wsUrl = "ws://127.0.0.1:8546";
         String wsUrl = "ws://10.0.2.2:8546";
 
-        String validatorPrivateKey = "6be6c38a5986be6c7094e92017af0d15da0af6857362e2ba0c2103c3eb893eec";
-        String validatorPublicKey = "8a2470d8ccb2e43b3b5295cfee71508f8808e166e5f152d5af9fe022d95e300dc7c5814f2c9eb71e2da8412beb61c53a";
+        String validatorKeyPair = Api.generateBls12381Keypair();
+        Log.i("RustLib", "validatorKeyPair: " + validatorKeyPair);
+        String validatorPrivateKey = "";
+        String validatorPublicKey = "";
+
+        try {
+            // Parse the JSON array string
+            JSONArray jsonArray = new JSONArray(validatorKeyPair);
+
+            // Access elements by index
+            validatorPrivateKey = jsonArray.getString(0);
+            validatorPublicKey = jsonArray.getString(1);
+        } catch (JSONException e) {
+            e.printStackTrace();
+        }
+        Log.i("RustLib", "validatorPrivateKey: " + validatorPrivateKey);
+        Log.i("RustLib", "validatorPublicKey: " + validatorPublicKey);
+        //String validatorPrivateKey = "6be6c38a5986be6c7094e92017af0d15da0af6857362e2ba0c2103c3eb893eec";
+        //String validatorPublicKey = "8a2470d8ccb2e43b3b5295cfee71508f8808e166e5f152d5af9fe022d95e300dc7c5814f2c9eb71e2da8412beb61c53a";
 
         String withdrawalAddress = "0xa0Ee7A142d267C1f36714E4a8F75612F20a79720";
         String depositContractAddress = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
@@ -133,6 +152,7 @@ This tells Swift to include the C header when compiling Swift files.
 sdk api example:
 ```swift
 import SwiftUI
+import Foundation
 
 struct ContentView: View {
     @State private var message = "Waiting..."
@@ -149,11 +169,34 @@ struct ContentView: View {
 
         Button("Run Rust Client") {
             let depositContractAddress = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
-            let validatorPrivateKey = "6be6c38a5986be6c7094e92017af0d15da0af6857362e2ba0c2103c3eb893eec"
+            //let validatorPrivateKey = "6be6c38a5986be6c7094e92017af0d15da0af6857362e2ba0c2103c3eb893eec"
+            var validatorPublicKey = ""
+            var validatorPrivateKey = ""
             let withdrawalAddress = "0xa0Ee7A142d267C1f36714E4a8F75612F20a79720"
             let depositValueInWei = "0x1bc16d674ec800000"
 
-            var result = MobileSdk.createDepositUnsignedTx(
+            var result = MobileSdk.generateBls12381Keypair()
+            switch result {
+            case .success(let txJson):
+                self.resultText = "TX JSON: \(txJson)"
+                let jsonData = Data(txJson.utf8)
+                do {
+                    let keys = try JSONDecoder().decode([String].self, from: jsonData)
+                    validatorPrivateKey = keys[0]
+                    validatorPublicKey = keys[1]
+
+                    print("validatorPrivateKey:", validatorPrivateKey)
+                    print("validatorPublicKey:", validatorPublicKey)
+                } catch {
+                    print("Failed to decode:", error)
+                }
+
+            case .failure(let error):
+                self.resultText = "Error: \(error)"
+            }
+            print("generateBls12381Keypair result", result)
+
+            result = MobileSdk.createDepositUnsignedTx(
                 depositContractAddress: depositContractAddress,
                 validatorPrivateKey: validatorPrivateKey,
                 withdrawalAddress: withdrawalAddress,
@@ -176,7 +219,7 @@ struct ContentView: View {
             }
             print("createGetExitFeeUnsignedTx result", result)
 
-            let validatorPublicKey =   "8a2470d8ccb2e43b3b5295cfee71508f8808e166e5f152d5af9fe022d95e300dc7c5814f2c9eb71e2da8412beb61c53a"
+            //let validatorPublicKey =   "8a2470d8ccb2e43b3b5295cfee71508f8808e166e5f152d5af9fe022d95e300dc7c5814f2c9eb71e2da8412beb61c53a"
             result = MobileSdk.createExitUnsignedTx(
                 validatorPublicKey: validatorPublicKey,
                 feeInWeiOrEmpty: "0x1"  // should query the value by sending getExitFee Tx(as it is, no signing needed) to the exit contract
@@ -202,7 +245,7 @@ struct ContentView: View {
                     }
                 }
             )
-
+ 
 
         }
     }

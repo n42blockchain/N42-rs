@@ -6,6 +6,7 @@ use jni::sys::jobject;
 use once_cell::sync::Lazy;
 use tokio::runtime::Runtime;
 
+use crate::blst_utils::generate_bls12_381_keypair;
 use crate::deposit_exit::{create_deposit_unsigned_tx, create_exit_unsigned_tx, create_get_exit_fee_unsigned_tx};
 use crate::run_client;
 
@@ -52,6 +53,27 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_createDepositUnsignedTx(
     };
 
     let json_string = serde_json::to_string(&transaction_request).expect("Failed to serialize transaction_request struct to JSON");
+
+    env.new_string(&json_string)
+        .expect("Couldn't create Java string!")
+        .into_raw()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_mobileSdk_NativeBindings_generateBls12381Keypair(
+    mut env: jni::JNIEnv<'_>,
+    class: jni::objects::JClass<'_>,
+) -> jstring {
+    let key_pair = match generate_bls12_381_keypair() {
+        Ok(v) => v,
+        Err(e) => {
+            env.throw_new("java/lang/Exception", e.to_string())
+                                .expect("Failed to throw exception");
+            Default::default()
+        }
+    };
+
+    let json_string = serde_json::to_string(&key_pair).expect("Failed to serialize keypair to JSON");
 
     env.new_string(&json_string)
         .expect("Couldn't create Java string!")

@@ -22,6 +22,18 @@ result in
     }
 
     @objc
+    func generateBls12381Keypair(_ resolver: @escaping RCTPromiseResolveBlock,
+                              rejecter: @escaping RCTPromiseRejectBlock) {
+        let result = MobileSdk.generateBls12381Keypair()
+        switch result {
+        case .success(let json):
+            resolver(json)
+        case .failure(let error):
+            rejecter("RUST_ERROR", "\(error)", nil)
+        }
+    }
+
+    @objc
     func createDepositUnsignedTx(_ depositContractAddress: String,
                                  validatorPrivateKey: String,
                                  withdrawalAddress: String,

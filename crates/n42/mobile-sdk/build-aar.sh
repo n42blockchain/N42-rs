@@ -121,6 +121,8 @@ class NativeBindings {
     // Java_com_mobileSdk_NativeBindings_callAsyncResult(...)
     //public static native CompletableFuture<Void> callAsyncResult();
 
+    public static native String generateBls12381Keypair();
+
     public static native String createDepositUnsignedTx(
             String deposit_contract_address,
             String validator_private_key,
@@ -157,6 +159,10 @@ public class $JAVA_CLASS {
     //public static CompletableFuture<Void> runAsyncTask() {
     //    return NativeBindings.callAsyncResult();
     //}
+
+    public static String generateBls12381Keypair() {
+	return NativeBindings.generateBls12381Keypair();
+    }
 
     public static String createDepositUnsignedTx(
             String deposit_contract_address,

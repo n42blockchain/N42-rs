@@ -27,6 +27,8 @@ pub mod jni;
 
 pub mod c_ffi;
 
+pub mod blst_utils;
+
 pub async fn run_client(
     ws_url: &str,
     validator_private_key: &String,

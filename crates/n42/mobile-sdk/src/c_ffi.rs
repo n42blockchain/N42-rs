@@ -6,6 +6,7 @@ use ethers::types::{TransactionRequest, U256};
 use eyre::Result;
 use serde_json;
 
+use crate::blst_utils::generate_bls12_381_keypair;
 use crate::{deposit_exit::{create_deposit_unsigned_tx, create_get_exit_fee_unsigned_tx, create_exit_unsigned_tx}, run_client};
 
 // ---------------- Helpers ----------------
@@ -53,6 +54,23 @@ set_error(e); return -1; } };
     match res {
         Ok(()) => 0, // success
         Err(e) => { set_error(format!("{}", e)); -1 }
+    }
+}
+
+// ---------------- generate_bls12_381_keypair ----------------
+#[no_mangle]
+pub extern "C" fn generate_bls12_381_keypair_c (
+    out_error: *mut *mut c_char,
+) -> *mut c_char {
+    let mut set_error = |msg: String| {
+        if !out_error.is_null() {
+            unsafe { *out_error = make_c_string(msg); }
+        }
+    };
+
+    match generate_bls12_381_keypair() {
+        Ok(tx) => make_c_string(serde_json::to_string(&tx).unwrap()),
+        Err(e) => { set_error(format!("{}", e)); ptr::null_mut() }
     }
 }
 

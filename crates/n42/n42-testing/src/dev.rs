@@ -195,7 +195,7 @@ impl CliqueTest {
             .launch()
             .await?;
 
-        let payload_events = node.payload_builder_handle.subscribe().await?;
+       let payload_events = node.payload_builder_handle.subscribe().await?;
         let mut payload_event_stream = payload_events.into_stream();
 
        for vote in &self.votes {

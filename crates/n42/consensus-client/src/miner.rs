@@ -240,7 +240,7 @@ where
         self.provider.save_beacon_block_hash_by_eth1_hash(&self.provider.chain_spec().genesis_hash(), self.provider.chain_spec().genesis_hash())?;
         self.provider.save_beacon_state_by_hash(&self.provider.chain_spec().genesis_hash(), BeaconState::new())?;
 
-        if !(self.get_best_block_num_signers() == 1 && self.is_among_signers()?) {
+        if !(self.get_best_block_num_signers()? == 1 && self.is_among_signers()?) {
             self.initial_sync().await;
         }
 
@@ -302,15 +302,17 @@ where
                     }
                 }
             }
-            if status_counts.is_empty() {
-                break;
-            }
+            let (&(peer_finalized_td, peer_finalized_td_hash), _) = {
+                if status_counts.is_empty() {
+                    break;
+                }
+                status_counts
+                    .iter()
+                    .max_by_key(|&(_, count)| count)
+                    .unwrap()
+            };
 
             let (max_td, max_td_hash) = self.max_td_and_hash();
-            let (&(peer_finalized_td, peer_finalized_td_hash), _) = status_counts
-                .iter()
-                .max_by_key(|&(_, count)| count)
-                .unwrap();
             debug!(target: "consensus-client", ?peer_finalized_td, ?max_td, "Comparing peer_finalized_td with max_td");
             debug!(target: "consensus-client", ?peer_finalized_td_hash, ?max_td_hash,);
             if peer_finalized_td > max_td + U256::from(DIFFICULTY_DELTA_CLAMP) {
@@ -344,38 +346,37 @@ where
         }
     }
 
-    fn long_time_no_block_generated(&self) -> bool {
+    fn long_time_no_block_generated(&self) -> eyre::Result<bool> {
 
-        let best_block_number = self.provider.best_block_number().unwrap();
+        let best_block_number = self.provider.best_block_number()?;
         let latest_header = self.provider
-            .sealed_header(best_block_number)
-            .unwrap()
-            .unwrap();
+            .sealed_header(best_block_number)?
+.ok_or(eyre::eyre!("sealed_header not found, block_number={:?}", best_block_number))?;
         let now = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("cannot be earlier than UNIX_EPOCH");
         if now.as_secs() > latest_header.timestamp() + MIN_NO_BLOCK_TIMESTAMP_GAP {
             warn!(target: "consensus-client", latest_header_timestamp=?latest_header.timestamp(), ?now, "long_time_no_block_generated");
-            true
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
 
     async fn exit_if_lagged_progress(&self, block: &SealedBlock) -> eyre::Result<()> {
         const MAX_PROGRESS_GAP: u64 = 100;
 
-        let best_block_number = self.provider.best_block_number().unwrap();
+        let best_block_number = self.provider.best_block_number()?;
         debug!(target: "consensus-client", my_number=?best_block_number, received_number=?block.header().number,"exit_if_lagged_progress");
         if block.header().number > best_block_number + MAX_PROGRESS_GAP {
-            let current_signers = self.get_best_block_signers();
+            let current_signers = self.get_best_block_signers()?;
             let signer = match recover_address(block.header()) {
                 Ok(v) => v,
                 Err(err) => {
                     eyre::bail!("Error in recover_address: {:?}", err);
                 },
             };
-            if current_signers.contains(&signer) && self.long_time_no_block_generated() {
+            if current_signers.contains(&signer) && self.long_time_no_block_generated()? {
                 warn!(target: "consensus-client", my_number=?best_block_number, received_number=?block.header().number, "exit for lagged progress");
                 exit_by_sigint();
             }
@@ -478,7 +479,7 @@ where
             }
 
             if new_payload_ok {
-                let forkchoice_state = self.forkchoice_state_with_head(block.hash());
+                let forkchoice_state = self.forkchoice_state_with_head(block.hash())?;
                 match self
                     .beacon_engine_handle
                     .fork_choice_updated(forkchoice_state, None, EngineApiMessageVersion::default())
@@ -496,25 +497,24 @@ where
         Ok(())
     }
 
-    fn get_best_block_signers(&self) -> Vec<Address> {
+    fn get_best_block_signers(&self) -> eyre::Result<Vec<Address>> {
+        let best_block_number = self.provider.best_block_number()?;
         let header = self
             .provider
-            .sealed_header(self.provider.best_block_number().unwrap())
-            .unwrap()
-            .unwrap();
+            .sealed_header(best_block_number)?
+            .ok_or(eyre::eyre!("sealed_header not found, block_number={:?}", best_block_number))?;
         let snapshot = self
             .consensus
-            .snapshot(header.number(), header.hash_slow(), None)
-            .unwrap();
+            .snapshot(header.number(), header.hash_slow(), None)?;
         
 
-        snapshot.signers
+        Ok(snapshot.signers)
     }
 
-    fn get_best_block_num_signers(&self) -> u64 {
-        let num_signers: u64 = self.get_best_block_signers().len() as u64;
+    fn get_best_block_num_signers(&self) -> eyre::Result<u64> {
+        let num_signers: u64 = self.get_best_block_signers()?.len() as u64;
 
-        num_signers
+        Ok(num_signers)
     }
 
     fn get_safe_block_num_hash_from_provider(&mut self) -> BlockNumHash {
@@ -537,7 +537,7 @@ where
         }
     }
 
-    fn determine_safe_block(&mut self) -> BlockNumHash {
+    fn determine_safe_block(&mut self) -> eyre::Result<BlockNumHash> {
         let mut safe_block_number = self
             .provider
             .safe_block_number()
@@ -553,7 +553,7 @@ where
         const NUM_SAMPLE_ROUNDS: u64 = 2;
         const NUM_CONFIRM_ROUNDS: u64 = 1;
 
-        let num_signers = self.get_best_block_num_signers();
+        let num_signers = self.get_best_block_num_signers()?;
         let best_block_number = self.provider.best_block_number().unwrap();
         let mut active_signers = (best_block_number.saturating_sub(NUM_SAMPLE_ROUNDS * num_signers)
             ..best_block_number)
@@ -603,23 +603,23 @@ where
             .unwrap();
         let safe_block_hash = safe_block_header.hash_slow();
 
-        BlockNumHash {
+        Ok(BlockNumHash {
             number: safe_block_header.number(),
             hash: safe_block_hash,
-        }
+        })
     }
 
     /// Returns current forkchoice state.
-    fn forkchoice_state(&mut self) -> ForkchoiceState {
+    fn forkchoice_state(&mut self) -> eyre::Result<ForkchoiceState> {
         let (_, max_td_hash) = self.max_td_and_hash();
 
-        let safe_block_num_hash = self.determine_safe_block();
+        let safe_block_num_hash = self.determine_safe_block()?;
         let safe_block_hash = safe_block_num_hash.hash;
-        ForkchoiceState {
+        Ok(ForkchoiceState {
             head_block_hash: max_td_hash,
             safe_block_hash,
             finalized_block_hash: safe_block_hash,
-        }
+        })
     }
 
     fn get_order_stats(&self) -> (u64, u64, f64) {
@@ -701,7 +701,7 @@ where
         };
         let PendingBlockData { block, beacon_state_after_withdrawal, execution_requests, attestations } = pending_block_data;
         let max_td = self.consensus.total_difficulty(block.hash());
-        let num_signers = self.get_best_block_num_signers();
+        let num_signers = self.get_best_block_num_signers()?;
         let interval = match self.mode {
             MiningMode::Instant(_) => {
                 unimplemented!("Add a separate flow if needed");
@@ -798,7 +798,7 @@ where
     /// Generates a new block, broadcast it to validators
     async fn prepare_block(&mut self) -> eyre::Result<()> {
         let (in_order_count, out_of_order_count, order_ratio) = self.get_order_stats();
-        let num_signers = self.get_best_block_num_signers();
+        let num_signers = self.get_best_block_num_signers()?;
 
         let block_time = self.interval_prepare_block.period().as_secs();
         info!(target: "consensus-client", num_generated_blocks=self.num_generated_blocks, num_skipped_new_block=self.num_skipped_new_block, num_should_skip_block_generation=self.num_should_skip_block_generation, num_long_delayed_blocks=self.num_long_delayed_blocks, num_fetched_blocks=self.num_fetched_blocks, in_order_count, out_of_order_count, order_ratio);
@@ -840,7 +840,7 @@ where
         let (withdrawals, beacon_state_after_withdrawal) = self.beacon.gen_withdrawals(header.hash())?;
         debug!(target: "consensus-client", ?withdrawals, "prepare_block: PayloadAttributes withdrawals");
 
-        let forkchoice_state = self.forkchoice_state();
+        let forkchoice_state = self.forkchoice_state()?;
         let payload_attributes = self.payload_attributes_builder.build_ext(timestamp.as_secs(), withdrawals);
         let res = self
             .beacon_engine_handle
@@ -862,13 +862,13 @@ where
         {
             Some(Ok(payload)) => payload,
             Some(Err(err)) => {
-                if self.is_among_signers()? && self.long_time_no_block_generated() {
+                if self.is_among_signers()? && self.long_time_no_block_generated()? {
                     exit_by_sigint();
                 }
                 eyre::bail!("Failed to resolve payload: {}", err);
             }
             None => {
-                if self.is_among_signers()? && self.long_time_no_block_generated() {
+                if self.is_among_signers()? && self.long_time_no_block_generated()? {
                     exit_by_sigint();
                 }
                 eyre::bail!("No payload");
@@ -933,14 +933,14 @@ where
         Ok(())
     }
 
-    fn forkchoice_state_with_head(&mut self, head_block_hash: B256) -> ForkchoiceState {
-        let safe_block_num_hash = self.determine_safe_block();
+    fn forkchoice_state_with_head(&mut self, head_block_hash: B256) -> eyre::Result<ForkchoiceState> {
+        let safe_block_num_hash = self.determine_safe_block()?;
         let safe_block_hash = safe_block_num_hash.hash;
-        ForkchoiceState {
+        Ok(ForkchoiceState {
             head_block_hash,
             safe_block_hash,
             finalized_block_hash: safe_block_hash,
-        }
+        })
     }
 
     async fn new_payload(&mut self, block: &SealedBlock<<<T::BuiltPayload as BuiltPayload>::Primitives as NodePrimitives>::Block>) -> eyre::Result<()> {
@@ -973,7 +973,7 @@ where
     }
 
     async fn fcu_hash(&mut self, block_hash: BlockHash) -> eyre::Result<()> {
-        let forkchoice_state = self.forkchoice_state_with_head(block_hash);
+        let forkchoice_state = self.forkchoice_state_with_head(block_hash)?;
         match self
             .beacon_engine_handle
             .fork_choice_updated(forkchoice_state, None, EngineApiMessageVersion::default())
@@ -1189,7 +1189,7 @@ where
 
     fn is_among_signers(&self) -> eyre::Result<bool> {
         if let Some(address) = self.consensus.get_eth_signer_address()? {
-            Ok(self.get_best_block_signers().contains(&address))
+            Ok(self.get_best_block_signers()?.contains(&address))
         } else {
             Ok(false)
         }

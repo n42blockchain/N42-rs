@@ -78,10 +78,9 @@ where
 
     pub fn state_transition(&mut self, old_beacon_state: Option<BeaconState>, beacon_block: &BeaconBlock) -> eyre::Result<BeaconState> {
         debug!(target: "consensus-client", ?beacon_block, "state_transition");
-        let beacon_state = if old_beacon_state.is_none() {
-            self.provider.get_beacon_state_by_hash(&beacon_block.parent_hash)?.unwrap()
-        } else {
-            old_beacon_state.unwrap()
+        let beacon_state = match old_beacon_state {
+            Some(v) => v,
+            None => self.provider.get_beacon_state_by_hash(&beacon_block.parent_hash)?.ok_or(eyre::eyre!("beacon_state not found by hash, {:?}", beacon_block.parent_hash))?
         };
         let new_beacon_state = BeaconState::state_transition(&beacon_state, beacon_block)?;
         let beacon_block_with_root = BeaconBlock { state_root: new_beacon_state.hash_slow(), ..beacon_block.clone() };
@@ -94,9 +93,10 @@ where
 
     pub fn gen_withdrawals(&mut self, eth1_block_hash: BlockHash) -> eyre::Result<(Option<Vec<Withdrawal>>, BeaconState)> {
         debug!(target: "consensus-client", ?eth1_block_hash, "gen_withdrawals");
-        let beacon_block_hash = self.provider.get_beacon_block_hash_by_eth1_hash(&eth1_block_hash)?.unwrap();
+        let beacon_block_hash = self.provider.get_beacon_block_hash_by_eth1_hash(&eth1_block_hash)?.ok_or(eyre::eyre!("beacon block hash not found, eth1_block_hash={:?}", eth1_block_hash))?;
+
         debug!(target: "consensus-client", ?beacon_block_hash, "gen_withdrawals");
-        let mut beacon_state = self.provider.get_beacon_state_by_hash(&beacon_block_hash)?.unwrap();
+        let mut beacon_state = self.provider.get_beacon_state_by_hash(&beacon_block_hash)?.ok_or(eyre::eyre!("beacon_state not found by hash, beacon_block_hash={:?}", beacon_block_hash))?;
         debug!(target: "consensus-client", ?beacon_state, "gen_withdrawals");
 
         /*
@@ -152,7 +152,9 @@ where
         let beacon_state = self.get_beacon_state_from_block_hash(block_hash)?;
 
         for (i, validator) in beacon_state.validators.into_iter().enumerate() {
-            if pubkey == PublicKey::from_bytes(&validator.pubkey.as_slice()).unwrap() {
+            if pubkey == PublicKey::from_bytes(&validator.pubkey.as_slice())
+                .map_err(|e| eyre::eyre!("PublicKey::from_bytes error {e:?}"))?
+                 {
                 return Ok(Some(i as u64));
             }
         }
@@ -164,7 +166,8 @@ where
         let beacon_state = self.get_beacon_state_from_block_hash(block_hash)?;
 
         let validator = beacon_state.get_validator(validator_index as usize)?;
-        let pubkey = PublicKey::from_bytes(validator.pubkey.as_ref()).unwrap();
+        let pubkey = PublicKey::from_bytes(validator.pubkey.as_ref())
+            .map_err(|e| eyre::eyre!("PublicKey::from_bytes error {e:?}"))?;
         Ok(Some(pubkey))
     }
 }

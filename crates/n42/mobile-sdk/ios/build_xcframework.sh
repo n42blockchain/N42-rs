@@ -7,6 +7,7 @@ LIB_NAME="${CRATE_NAME//-/_}"
 IOS_DIR="$(cd "$(dirname "$0")" && pwd)"
 OUT_DIR="$IOS_DIR/build"
 INCLUDE_DIR="$IOS_DIR/include"
+SWIFT_DIR="$IOS_DIR/Swift"
 XCFRAMEWORK="$OUT_DIR/MobileSdk.xcframework"
 
 IOS_MIN_VERSION=11.0
@@ -47,3 +48,15 @@ xcodebuild -create-xcframework \
 
 echo "✅ XCFramework built at: $XCFRAMEWORK"
 echo "Swift wrapper files remain in ios/Swift/ for reference."
+
+tarname=mobile-sdk-ios
+tarworkdir=$(mktemp -d /tmp/tardir.$tarname.XXXXX)
+tardir="$tarworkdir/$tarname"
+mkdir $tardir
+cp -r $XCFRAMEWORK $tardir/
+cp -r $SWIFT_DIR $tardir/
+cp -r $INCLUDE_DIR $tardir/
+(cd $tarworkdir && tar -cvzf $tarname.tar.gz $tarname)
+cp "$tarworkdir/$tarname.tar.gz" .
+rm -rf $tarworkdir
+echo "✅ $tarname tarball at: $tarname.tar.gz"

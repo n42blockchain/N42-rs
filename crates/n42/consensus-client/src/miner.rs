@@ -241,7 +241,7 @@ where
         self.provider.save_beacon_state_by_hash(&self.provider.chain_spec().genesis_hash(), BeaconState::new())?;
 
         if !(self.get_best_block_num_signers()? == 1 && self.is_among_signers()?) {
-            self.initial_sync().await;
+            self.initial_sync().await?;
         }
 
         let mut new_block_event_stream = self.network.subscribe_block();
@@ -285,7 +285,7 @@ where
         }
     }
 
-    async fn initial_sync(&mut self) {
+    async fn initial_sync(&mut self) -> eyre::Result<()> {
         loop {
             let status_counts;
             loop {
@@ -312,7 +312,7 @@ where
                     .unwrap()
             };
 
-            let (max_td, max_td_hash) = self.max_td_and_hash();
+            let (max_td, max_td_hash) = self.max_td_and_hash()?;
             debug!(target: "consensus-client", ?peer_finalized_td, ?max_td, "Comparing peer_finalized_td with max_td");
             debug!(target: "consensus-client", ?peer_finalized_td_hash, ?max_td_hash,);
             if peer_finalized_td > max_td + U256::from(DIFFICULTY_DELTA_CLAMP) {
@@ -344,6 +344,8 @@ where
                 }
             }
         }
+
+        Ok(())
     }
 
     fn long_time_no_block_generated(&self) -> eyre::Result<bool> {
@@ -353,8 +355,7 @@ where
             .sealed_header(best_block_number)?
 .ok_or(eyre::eyre!("sealed_header not found, block_number={:?}", best_block_number))?;
         let now = std::time::SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("cannot be earlier than UNIX_EPOCH");
+            .duration_since(UNIX_EPOCH)?;
         if now.as_secs() > latest_header.timestamp() + MIN_NO_BLOCK_TIMESTAMP_GAP {
             warn!(target: "consensus-client", latest_header_timestamp=?latest_header.timestamp(), ?now, "long_time_no_block_generated");
             Ok(true)
@@ -391,7 +392,7 @@ where
         let mut parents = Vec::new();
         let block = new_block.clone().block.seal_slow();
         self.recent_blocks.insert(block.hash(), block.clone());
-        let (max_td, _) = self.max_td_and_hash();
+        let (max_td, _) = self.max_td_and_hash()?;
         if max_td >= U256::from(new_block.td) {
             return Ok(());
         }
@@ -401,7 +402,7 @@ where
         let mut parent = block.hash();
         let mut parent_num = block.header().number;
         let mut difficulty;
-        let safe_block_num_hash = self.get_safe_block_num_hash_from_provider();
+        let safe_block_num_hash = self.get_safe_block_num_hash_from_provider()?;
         loop {
             debug!(target: "consensus-client", ?parent_num, ?parent, safe_number=?safe_block_num_hash.number, block_hash=?block.hash());
             if parent_num < safe_block_num_hash.number {
@@ -517,7 +518,7 @@ where
         Ok(num_signers)
     }
 
-    fn get_safe_block_num_hash_from_provider(&mut self) -> BlockNumHash {
+    fn get_safe_block_num_hash_from_provider(&mut self) -> eyre::Result<BlockNumHash> {
         let safe_block_number = self
             .provider
             .safe_block_number()
@@ -526,15 +527,14 @@ where
 
         let safe_block_header = self
             .provider
-            .sealed_header(safe_block_number)
-            .unwrap()
-            .unwrap();
+            .sealed_header(safe_block_number)?
+            .ok_or(eyre::eyre!("sealed_header not found, block_number={:?}", safe_block_number))?;
         let safe_block_hash = safe_block_header.hash_slow();
 
-        BlockNumHash {
+        Ok(BlockNumHash {
             number: safe_block_header.number(),
             hash: safe_block_hash,
-        }
+        })
     }
 
     fn determine_safe_block(&mut self) -> eyre::Result<BlockNumHash> {
@@ -544,26 +544,27 @@ where
             .unwrap_or(Some(0))
             .unwrap_or(0);
 
+        let best_block_number = self.provider.best_block_number()?;
         let header = self
             .provider
-            .sealed_header(self.provider.best_block_number().unwrap())
-            .unwrap()
-            .unwrap();
+            .sealed_header(best_block_number)?
+            .ok_or(eyre::eyre!("sealed_header not found, block_number={:?}", best_block_number))?;
 
         const NUM_SAMPLE_ROUNDS: u64 = 2;
         const NUM_CONFIRM_ROUNDS: u64 = 1;
 
         let num_signers = self.get_best_block_num_signers()?;
-        let best_block_number = self.provider.best_block_number().unwrap();
-        let mut active_signers = (best_block_number.saturating_sub(NUM_SAMPLE_ROUNDS * num_signers)
-            ..best_block_number)
-            .filter(|&n| n != 0)
-            .map(|n| {
-                let sealed_header = self.provider.sealed_header(n).unwrap().unwrap();
-                let signer = recover_address_generic(sealed_header.header()).unwrap();
-                signer
-            })
-            .collect::<Vec<_>>();
+        let best_block_number = self.provider.best_block_number()?;
+        let mut active_signers: Vec<Address> = Vec::new();
+        for i in (best_block_number.saturating_sub(NUM_SAMPLE_ROUNDS * num_signers) ..best_block_number) {
+            if (i > 0) {
+                let sealed_header = self.provider.sealed_header(i)?
+                    .ok_or(eyre::eyre!("sealed_header not found, block_number={:?}", i))?;
+                let signer = recover_address_generic(sealed_header.header())
+                    .map_err(|e| eyre::eyre!("{e:?}"))?;
+                active_signers.push(signer);
+            }
+        }
 
         active_signers.sort();
         active_signers.dedup();
@@ -571,19 +572,19 @@ where
         debug!(target: "consensus-client", num_signers, num_active_signers, "determine_safe_block");
         if num_active_signers == num_signers {
             // if in NUM_CONFIRM_ROUNDS rounds, all active signers have signed a 2-difficulty block, then it is considered finalized
-            let order_in_round = (best_block_number.saturating_sub(NUM_CONFIRM_ROUNDS * num_signers)
-                ..best_block_number)
-                .filter(|&number| {
-                    self.provider
-                        .sealed_header(number)
-                        .unwrap()
-                        .unwrap()
+            let mut num_recent_signers_in_order: u64 = 0;
+            for i in (best_block_number.saturating_sub(NUM_CONFIRM_ROUNDS * num_signers)..best_block_number) {
+                let sealed_header = self.provider.sealed_header(i)?
+                    .ok_or(eyre::eyre!("sealed_header not found, block_number={:?}", i))?;
+                if sealed_header
                         .header()
                         .difficulty()
-                        == U256::from(2)
-                })
-                .count() as u64
-                == num_active_signers * NUM_CONFIRM_ROUNDS;
+                        == U256::from(2) {
+                    num_recent_signers_in_order += 1;
+                }
+            }
+
+            let order_in_round = num_recent_signers_in_order == num_active_signers * NUM_CONFIRM_ROUNDS;
             if order_in_round {
                 safe_block_number = safe_block_number.max(header
                     .number()
@@ -598,9 +599,8 @@ where
         }
         let safe_block_header = self
             .provider
-            .sealed_header(safe_block_number)
-            .unwrap()
-            .unwrap();
+            .sealed_header(safe_block_number)?
+            .ok_or(eyre::eyre!("sealed_header not found, block_number={:?}", safe_block_number))?;
         let safe_block_hash = safe_block_header.hash_slow();
 
         Ok(BlockNumHash {
@@ -611,7 +611,7 @@ where
 
     /// Returns current forkchoice state.
     fn forkchoice_state(&mut self) -> eyre::Result<ForkchoiceState> {
-        let (_, max_td_hash) = self.max_td_and_hash();
+        let (_, max_td_hash) = self.max_td_and_hash()?;
 
         let safe_block_num_hash = self.determine_safe_block()?;
         let safe_block_hash = safe_block_num_hash.hash;
@@ -676,8 +676,9 @@ where
 
         match attestation.block_aggregate_signature {
             Some(ref mut v) => {
-                let mut sig = fixed_to_agg_sig(v);
-                sig.add_signature(&signature, false).unwrap();
+                let mut sig = fixed_to_agg_sig(v)?;
+                sig.add_signature(&signature, false)
+                    .map_err(|e| eyre::eyre!("add_signature error: {e:?}"))?;
                 *v = agg_sig_to_fixed(&sig);
             },
             None => {
@@ -712,8 +713,7 @@ where
         let block_time = interval.period().as_secs();
         debug!(target: "consensus-client", block_time, "advance");
         let now = std::time::SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("cannot be earlier than UNIX_EPOCH");
+            .duration_since(UNIX_EPOCH)?;
         let expected_next_timestamp = Duration::from_secs(block.timestamp());
         if expected_next_timestamp > now {
             *interval = interval_at(
@@ -727,7 +727,8 @@ where
             self.provider.chain_spec().genesis_hash()
         } else {
             //fetch_beacon_block(block.header().parent_hash).unwrap().hash_slow()
-            self.provider.get_beacon_block_hash_by_eth1_hash(&block.header().parent_hash)?.unwrap()
+            self.provider.get_beacon_block_hash_by_eth1_hash(&block.header().parent_hash)?
+            .ok_or(eyre::eyre!("get_beacon_block_hash_by_eth1_hash failed, hash={:?}", block.header().parent_hash))?
         };
         //let deposits = self.get_deposits(block.number.saturating_sub(DEPOSIT_GAP))?;
         let deposits: Vec<Deposit> = Default::default();
@@ -737,8 +738,10 @@ where
             .finalized_block_hash()
             .unwrap_or(Some(self.provider.chain_spec().genesis_hash()))
             .unwrap();
-        let finalized_beacon_block_hash = self.provider.get_beacon_block_hash_by_eth1_hash(&finalized_block_hash)?.unwrap();
-        let finalized_beacon_state = self.provider.get_beacon_state_by_hash(&finalized_beacon_block_hash)?.unwrap();
+        let finalized_beacon_block_hash = self.provider.get_beacon_block_hash_by_eth1_hash(&finalized_block_hash)?
+            .ok_or(eyre::eyre!("get_beacon_block_hash_by_eth1_hash failed, hash={:?}", finalized_block_hash))?;
+        let finalized_beacon_state = self.provider.get_beacon_state_by_hash(&finalized_beacon_block_hash)?
+            .ok_or(eyre::eyre!("get_beacon_state_by_hash failed, hash={:?}", finalized_beacon_block_hash))?;
         let beacon_block = self.beacon.gen_beacon_block(Some(beacon_state_after_withdrawal), parent_beacon_block_hash, &deposits, &attestations.values().cloned().collect(), &voluntary_exits, &execution_requests, &block)?;
         let beacon_block_hash = beacon_block.hash_slow();
         self.provider.save_beacon_block_by_hash(&beacon_block_hash, beacon_block.clone())?;
@@ -748,7 +751,8 @@ where
 
         self.provider.save_beacon_block_hash_by_eth1_hash(&block.hash(), beacon_block_hash)?;
 
-        let new_beacon_state = self.provider.get_beacon_state_by_hash(&beacon_block_hash)?.unwrap();
+        let new_beacon_state = self.provider.get_beacon_state_by_hash(&beacon_block_hash)?
+            .ok_or(eyre::eyre!("get_beacon_state_by_hash failed, hash={:?}", beacon_block_hash))?;
 
         self.recent_blocks.insert(block.hash_slow(), block.clone());
 
@@ -765,9 +769,9 @@ where
         let new_block_tx = self.new_block_tx.clone();
         let block_clone = block.clone();
         let block_hash = block.hash_slow();
-        self.provider.save_beacon_block_by_hash(&beacon_block.hash_slow(), beacon_block.clone()).unwrap();
-        self.provider.save_beacon_block_by_eth1_hash(&block_hash, beacon_block.clone()).unwrap();
-        self.provider.save_beacon_block_hash_by_eth1_hash(&block_hash, beacon_block.hash_slow()).unwrap();
+        self.provider.save_beacon_block_by_hash(&beacon_block.hash_slow(), beacon_block.clone())?;
+        self.provider.save_beacon_block_by_eth1_hash(&block_hash, beacon_block.clone())?;
+        self.provider.save_beacon_block_hash_by_eth1_hash(&block_hash, beacon_block.hash_slow())?;
         tokio::spawn(async move {
             sleep(wiggle).await;
 
@@ -802,15 +806,15 @@ where
 
         let block_time = self.interval_prepare_block.period().as_secs();
         info!(target: "consensus-client", num_generated_blocks=self.num_generated_blocks, num_skipped_new_block=self.num_skipped_new_block, num_should_skip_block_generation=self.num_should_skip_block_generation, num_long_delayed_blocks=self.num_long_delayed_blocks, num_fetched_blocks=self.num_fetched_blocks, in_order_count, out_of_order_count, order_ratio);
+
+        let best_block_number = self.provider.best_block_number()?;
         let header = self
             .provider
-            .sealed_header(self.provider.best_block_number().unwrap())
-            .unwrap()
-            .unwrap();
+            .sealed_header(best_block_number)?
+            .ok_or(eyre::eyre!("sealed_header not found, block_number={:?}", best_block_number))?;
         debug!(target: "consensus-client", block_time, "prepare_block");
         let now = std::time::SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("cannot be earlier than UNIX_EPOCH");
+            .duration_since(UNIX_EPOCH)?;
         let expected_next_timestamp = Duration::from_secs(header.header().timestamp() + block_time / 2);
         if expected_next_timestamp > now {
             self.interval_prepare_block = interval_at(
@@ -1041,7 +1045,9 @@ where
         };
 
         for number in (start_block_number..=best_block_number).skip(1) {
-            let block = self.provider.block_by_number(number).unwrap().unwrap();
+            let block = self.provider.block_by_number(number)?
+                .ok_or(eyre::eyre!("block_by_number failed, block_number={:?}", number))?;
+
             let hash = block.header().hash_slow();
             debug!(target: "consensus-client", number, "initial_sync_to_hash, fetching header");
             let header_from_p2p = self.fetch_header(number.into()).await?;
@@ -1077,7 +1083,7 @@ where
         let header_from_p2p = self.fetch_header(block_hash.into()).await?;
 
         loop {
-            let best_block_number = self.provider.best_block_number().unwrap();
+            let best_block_number = self.provider.best_block_number()?;
             if best_block_number == header_from_p2p.number {
                 break;
             }
@@ -1088,7 +1094,7 @@ where
             let next_header_from_p2p = self.fetch_header(next_block_number.into()).await?;
             self.fcu_hash(next_header_from_p2p.hash_slow()).await?;
             loop {
-                let block_number = self.provider.best_block_number().unwrap();
+                let block_number = self.provider.best_block_number()?;
                 if block_number < next_block_number {
                     sleep(Duration::from_millis(WAIT_FOR_DOWNLOAD_INTERVAL_MS)).await;
                 } else {
@@ -1098,11 +1104,11 @@ where
             }
         }
 
+        let best_block_number = self.provider.best_block_number()?;
         let header = self
             .provider
-            .sealed_header(self.provider.best_block_number().unwrap())
-            .unwrap()
-            .unwrap();
+            .sealed_header(best_block_number)?
+            .ok_or(eyre::eyre!("sealed_header not found, block_number={:?}", best_block_number))?;
 
         if header.hash() == block_hash {
             Ok(())
@@ -1175,16 +1181,16 @@ where
         Ok(block)
     }
 
-    fn max_td_and_hash(&self) -> (U256, B256) {
+    fn max_td_and_hash(&self) -> eyre::Result<(U256, B256)> {
+        let best_block_number = self.provider.best_block_number()?;
         let header = self
             .provider
-            .sealed_header(self.provider.best_block_number().unwrap())
-            .unwrap()
-            .unwrap();
+            .sealed_header(best_block_number)?
+            .ok_or(eyre::eyre!("sealed_header not found, block_number={:?}", best_block_number))?;
         let td = self.consensus.total_difficulty(header.hash_slow());
         let average_td = td.to::<u64>() as f64 / header.number() as f64;
         info!(hash=?header.hash(), ?td, header_number=header.number(), header_timestamp=header.timestamp(), average_td, "max_td_and_hash");
-        (td, header.hash())
+        Ok((td, header.hash()))
     }
 
     fn is_among_signers(&self) -> eyre::Result<bool> {
@@ -1205,7 +1211,7 @@ where
                     if let Some(deposit_event) = parse_deposit_log(&log) {
                         debug!(target: "consensus-client", ?deposit_event);
                         let mut deposit: Deposit = Default::default();
-                        deposit.data.amount = u64::from_le_bytes(deposit_event.amount.as_ref().try_into().unwrap());
+                        deposit.data.amount = u64::from_le_bytes(deposit_event.amount.as_ref().try_into()?);
                         deposit.data.withdrawal_credentials = B256::from_slice(&deposit_event.withdrawal_credentials);
                         let pubkey: BLSPubkey = deposit_event.pubkey.as_ref().try_into()?;
                         deposit.data.pubkey = pubkey;

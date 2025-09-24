@@ -195,8 +195,13 @@ pub fn agg_sig_to_fixed(sig: &AggregateSignature) -> FixedBytes<96> {
     FixedBytes::from(sig.to_signature().to_bytes())
 }
 
-pub fn fixed_to_agg_sig(bytes: &FixedBytes<96>) -> AggregateSignature {
-    AggregateSignature::from_signature(&Signature::from_bytes(bytes.as_ref()).unwrap())
+pub fn fixed_to_agg_sig(bytes: &FixedBytes<96>) -> eyre::Result<AggregateSignature> {
+    Ok(
+        AggregateSignature::from_signature(
+        &Signature::from_bytes(bytes.as_ref())
+            .map_err(|e| eyre::eyre!("Signature::from_bytes error: {e:?}"))?
+        )
+    )
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
@@ -624,7 +629,7 @@ impl BeaconState {
                 return Ok(());
             }
         };
-        let sig = fixed_to_agg_sig(sig);
+        let sig = fixed_to_agg_sig(sig)?;
         let mut pubkeys = Vec::new();
         for validator_index in &attestation.validator_indexes {
             let validator = self.get_validator(*validator_index as usize)?;

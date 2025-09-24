@@ -41,6 +41,15 @@ cd crates/n42/mobile-sdk/ios/
 
 Run build_xcframework.sh → produces mobile_sdk.xcframework and headers.
 
+## linux, mac
+### build commands
+```shell
+cargo build -p mobile-sdk --example mobile-sdk-test
+```
+
+output:
+target/debug/examples/mobile-sdk-test
+
 # integration into an app
 ## for android apps that use mobile-sdk aar
 
@@ -254,4 +263,62 @@ struct ContentView: View {
 #Preview {
     ContentView()
 }
+```
+
+## linux, mac
+```shell
+./target/debug/examples/mobile-sdk-test help
+deposit, exit, validate
+
+Usage: mobile-sdk-test <COMMAND>
+
+Commands:
+  deposit
+  exit
+  validate
+  generate-bls12381-keypair
+  help                       Print this message or the help of the given
+subcommand(s)
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
+```
+
+### prerequisites
+We have an ethereum EOA private key for paying for the
+deposit(--deposit-private-key), example:
+0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+
+We have an ethereum EOA private key and its public address to be used as withdrawal private key and withadrawal public address, example:
+
+0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6,
+0xa0Ee7A142d267C1f36714E4a8F75612F20a79720
+
+1. generate bls12381 keypair (privkey, pubkey)
+```shell
+./target/debug/examples/mobile-sdk-test generate-bls12381-keypair
+keypair: ("3c86f39ef84ea79bb632e56d6c2e6d9fb410ae681deaf4a1a87688a901852d54",
+"af4a49ca1cc5ad0348bde8222a00bbab5d71c538abb23f91e1807932d02a3258cae1d718f16d9e0cf8be555fdd4800cd")
+```
+
+2. deposit
+```shell
+./target/debug/examples/mobile-sdk-test deposit -v
+3c86f39ef84ea79bb632e56d6c2e6d9fb410ae681deaf4a1a87688a901852d54 -w
+0xa0Ee7A142d267C1f36714E4a8F75612F20a79720 -d
+0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+```
+
+3. validate
+```shell
+RUST_LOG=debug ./target/debug/examples/mobile-sdk-test validate -v
+3c86f39ef84ea79bb632e56d6c2e6d9fb410ae681deaf4a1a87688a901852d54
+```
+
+4. exit
+```shell
+./target/debug/examples/mobile-sdk-test exit -w
+0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6 -v
+af4a49ca1cc5ad0348bde8222a00bbab5d71c538abb23f91e1807932d02a3258cae1d718f16d9e0cf8be555fdd4800cd
 ```

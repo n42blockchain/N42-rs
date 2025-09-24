@@ -47,12 +47,15 @@ enum Commands {
         #[command(flatten)]
         common: CommonArgs,
 
+        /// Optional validator_private_key [default: random if not supplied].
         #[arg(short, long)]
         validator_private_key: Option<String>,
         #[arg(short, long)]
         withdrawal_address: String,
-        #[arg(short, long, default_value = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")]
+        #[arg(short, long)]
         deposit_private_key: String,
+
+        /// Optional deposit_value_wei_in_hex [default: 32ETH if not supplied].
         #[arg(long, default_value = "0x1bc16d674ec800000")] // 32 ETH in wei in hex
         deposit_value_wei_in_hex: U256,
     },
@@ -60,9 +63,9 @@ enum Commands {
         #[command(flatten)]
         common: CommonArgs,
 
-        #[arg(short, long, default_value = "0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6")]
+        #[arg(short, long)]
         withdrawal_private_key: String,
-        #[arg(short, long, default_value = "b758091fbfafd4bd5db58616a3db1725e8147c5c38dd62dd052db3d42b420ed47d2584ed219f9e42702da0a5c8864a5f")]
+        #[arg(short, long)]
         validator_public_key: String,
     },
     Validate {
@@ -113,7 +116,7 @@ async fn main() -> eyre::Result<()> {
         Commands::GenerateBLS12381Keypair {
         }=> {
             let keypair = generate_bls12_381_keypair()?;
-            info!("keypair: {keypair:?}");
+            println!("keypair: {keypair:?}");
         }
     }
 
@@ -138,6 +141,7 @@ async fn deposit(
             rng.fill_bytes(&mut ikm);
 
             let sk = SecretKey::key_gen(&ikm, &[]).unwrap();
+            println!("generated validator_private_key: {sk:?}");
             sk
         }
     };

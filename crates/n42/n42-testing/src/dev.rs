@@ -93,8 +93,7 @@ async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(node: 
     println!("header={:?}", node.provider.latest_header().unwrap().unwrap().header());
     println!("header hash={:?}", node.provider.latest_header().unwrap().unwrap().header().hash_slow());
     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    let eth_signer =
-        PrivateKeySigner::from_bytes(&FixedBytes::from_str(&eth_signer_key).unwrap()).unwrap();
+    let eth_signer = PrivateKeySigner::from_bytes(&FixedBytes::from_str(&eth_signer_key).unwrap()).unwrap();
     let eth_signer_address = eth_signer.address();
     let attributes = n42_payload_attributes(timestamp, parent_hash, eth_signer_address);
     node.consensus.set_eth_signer_by_key(Some(eth_signer_key.clone()))?;

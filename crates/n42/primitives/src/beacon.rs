@@ -633,7 +633,9 @@ impl BeaconState {
         let mut pubkeys = Vec::new();
         for validator_index in &attestation.validator_indexes {
             let validator = self.get_validator(*validator_index as usize)?;
-            pubkeys.push(PublicKey::from_bytes(&validator.pubkey.as_slice()).unwrap());
+            pubkeys.push(PublicKey::from_bytes(&validator.pubkey.as_slice())
+                .map_err(|e| eyre::eyre!("PublicKey::from_bytes error {e:?}"))?
+                );
         }
         let pubkeys: Vec<&PublicKey> = pubkeys.iter().collect();
         let bytes: Vec<u8> = serde_json::to_vec(&attestation.data)?;

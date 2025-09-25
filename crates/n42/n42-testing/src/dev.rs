@@ -157,7 +157,8 @@ impl CliqueTest {
             //genesis_hash,
             );
         if let Some(epoch) = self.epoch {
-            chainspec.genesis.config.clique = Some(CliqueConfig {
+            chainspec.genesis.config.clique = Some(
+                CliqueConfig {
                 epoch: Some(epoch),
                 period: None,
             });

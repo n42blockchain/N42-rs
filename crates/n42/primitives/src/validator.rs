@@ -8,10 +8,7 @@ use alloy_primitives::{Address, BlockNumber, B256, Bytes};
 use crate::{
     Epoch, BLSPubkey, Gwei,
     is_compounding_withdrawal_credential,
-    far_future_epoch,
-max_effective_balance,
-effective_balance_increment,
-eth1_address_withdrawal_prefix_byte,
+    ChainSpec,
 };
 
 #[derive(Serialize, Debug, Deserialize,PartialEq)]
@@ -46,9 +43,10 @@ impl Validator {
     pub fn is_partially_withdrawable_validator(
         &self,
         balance: u64,
+        spec: &ChainSpec,
     ) -> bool {
-        self.effective_balance == max_effective_balance
-            && balance > max_effective_balance
+        self.effective_balance == spec.max_effective_balance
+            && balance > spec.max_effective_balance
     }
 
     pub fn is_fully_withdrawable_validator(
@@ -67,21 +65,27 @@ impl Validator {
     }
 
     /// Check if ``validator`` has an 0x02 prefixed "compounding" withdrawal credential.
-    pub fn has_compounding_withdrawal_credential(&self) -> bool {
-        is_compounding_withdrawal_credential(self.withdrawal_credentials)
+    pub fn has_compounding_withdrawal_credential(&self,
+        spec: &ChainSpec,
+        ) -> bool {
+        is_compounding_withdrawal_credential(self.withdrawal_credentials, spec)
     }
 
-    pub fn has_execution_withdrawal_credential(&self) -> bool {
-        self.has_compounding_withdrawal_credential()
-            || self.has_eth1_withdrawal_credential()
+    pub fn has_execution_withdrawal_credential(&self,
+        spec: &ChainSpec,
+        ) -> bool {
+        self.has_compounding_withdrawal_credential(spec)
+            || self.has_eth1_withdrawal_credential(spec)
     }
 
     /// Returns `true` if the validator has eth1 withdrawal credential.
-    pub fn has_eth1_withdrawal_credential(&self) -> bool {
+    pub fn has_eth1_withdrawal_credential(&self,
+        spec: &ChainSpec,
+        ) -> bool {
         self.withdrawal_credentials
             .as_slice()
             .first()
-            .map(|byte| *byte == eth1_address_withdrawal_prefix_byte)
+            .map(|byte| *byte == spec.eth1_address_withdrawal_prefix_byte)
             .unwrap_or(false)
     }
 
@@ -96,15 +100,15 @@ impl Validator {
         withdrawal_credentials: B256,
         amount: u64,
         //fork_name: ForkName,
-        //spec: &ChainSpec,
+        spec: &ChainSpec,
     ) -> Self {
         let mut validator = Validator {
             pubkey,
             withdrawal_credentials,
-            activation_eligibility_epoch: far_future_epoch,
-            activation_epoch: far_future_epoch,
-            exit_epoch: far_future_epoch,
-            withdrawable_epoch: far_future_epoch,
+            activation_eligibility_epoch: spec.far_future_epoch,
+            activation_epoch: spec.far_future_epoch,
+            exit_epoch: spec.far_future_epoch,
+            withdrawable_epoch: spec.far_future_epoch,
             effective_balance: 0,
             slashed: false,
         };
@@ -112,8 +116,8 @@ impl Validator {
         //let max_effective_balance = validator.get_max_effective_balance(spec, fork_name);
         // safe math is unnecessary here since the spec.effective_balance_increment is never <= 0
         validator.effective_balance = std::cmp::min(
-            amount - (amount % effective_balance_increment),
-            max_effective_balance,
+            amount - (amount % spec.effective_balance_increment),
+            spec.max_effective_balance,
         );
 
         validator
@@ -124,9 +128,11 @@ impl Validator {
     /// Eligibility depends on finalization, so we assume best-possible finalization. This function
     /// returning true is a necessary but *not sufficient* condition for a validator to activate in
     /// the epoch transition at the end of `epoch`.
-    pub fn could_be_eligible_for_activation_at(&self, epoch: Epoch) -> bool {
+    pub fn could_be_eligible_for_activation_at(&self, epoch: Epoch,
+        spec: &ChainSpec,
+        ) -> bool {
         // Has not yet been activated
-        self.activation_epoch == far_future_epoch
+        self.activation_epoch == spec.far_future_epoch
         // Placement in queue could be finalized.
         //
         // NOTE: the epoch distance is 1 rather than 2 because we consider the activations that
@@ -140,16 +146,19 @@ impl Validator {
     /// Calls the correct function depending on the provided `fork_name`.
     pub fn is_eligible_for_activation_queue(
         &self,
+        spec: &ChainSpec,
     ) -> bool {
-        self.is_eligible_for_activation_queue_base()
+        self.is_eligible_for_activation_queue_base(spec)
     }
 
     /// Returns `true` if the validator is eligible to join the activation queue.
     ///
     /// Spec v0.12.1
-    fn is_eligible_for_activation_queue_base(&self) -> bool {
-        self.activation_eligibility_epoch == far_future_epoch
-            && self.effective_balance == max_effective_balance
+    fn is_eligible_for_activation_queue_base(&self,
+        spec: &ChainSpec,
+        ) -> bool {
+        self.activation_eligibility_epoch == spec.far_future_epoch
+            && self.effective_balance == spec.max_effective_balance
     }
 
     /// Returns `true` if the validator is able to withdraw at some epoch.
@@ -162,8 +171,10 @@ impl Validator {
         self.exit_epoch <= epoch
     }
 
-    pub fn is_exited_set(&self) -> bool {
-        self.exit_epoch != far_future_epoch
+    pub fn js_exited_set(&self,
+        spec: &ChainSpec,
+        ) -> bool {
+        self.exit_epoch != spec.far_future_epoch
     }
 
 }

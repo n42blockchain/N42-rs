@@ -36,32 +36,80 @@ pub const pending_partial_withdrawals_limit: usize = 16; // ?
 pub const MaxDeposits: u64 = 16;
 pub const genesis_epoch : u64 = 0;
 
-// chain_spec
-pub const max_pending_partials_per_withdrawals_sweep: u64 = 16; // ?
-pub const min_activation_balance: u64 = 32000000000;
-pub const ejection_balance: u64 = 16000000000;
-pub const far_future_epoch: u64 = u64::max_value();
-pub const max_validators_per_withdrawals_sweep: u64 = 16384;
-pub const max_effective_balance: u64 = 32000000000; //?
-pub const full_exit_request_amount: u64 = 0;
-pub const shard_committee_period: u64 = 1; //?
-pub const compounding_withdrawal_prefix_byte: u8 = 0x02;
-pub const eth1_address_withdrawal_prefix_byte: u8 = 0x01;
-pub const max_seed_lookahead: u64 = 4;
-pub const max_per_epoch_activation_exit_churn_limit:u64 = 256000000000;
-pub const min_per_epoch_churn_limit_electra:u64 = 128000000000;
-pub const churn_limit_quotient:u64 = 32;
-pub const effective_balance_increment:u64 = 1000000000;
-pub const base_rewards_per_epoch:u64 = 1;
-pub const base_reward_factor:u64 = 2;
-pub const min_epochs_to_inactivity_penalty :u64 = 4;
-pub const inactivity_penalty_quotient:u64 = 67108864; //?
-pub const proposer_reward_quotient:u64 = 4;
-pub const min_per_epoch_churn_limit:u64 = 4;
-pub const max_committees_per_slot: usize = 4;
-pub const target_committee_size: usize = 4;
-pub const min_seed_lookahead: u64 = 1;
-pub const shuffle_round_count: u8 = 10;
+#[derive(Debug, Default)]
+pub struct ChainSpec {
+    pub max_pending_partials_per_withdrawals_sweep: u64,
+    pub min_activation_balance: u64,
+    pub ejection_balance: u64,
+    pub far_future_epoch: u64,
+    pub max_validators_per_withdrawals_sweep: u64,
+    pub max_effective_balance: u64,
+    pub full_exit_request_amount: u64,
+    pub shard_committee_period: u64, //?
+    pub compounding_withdrawal_prefix_byte: u8,
+    pub eth1_address_withdrawal_prefix_byte: u8,
+    pub max_seed_lookahead: u64,
+    pub max_per_epoch_activation_exit_churn_limit:u64,
+    pub min_per_epoch_churn_limit_electra:u64,
+    pub churn_limit_quotient:u64,
+    pub effective_balance_increment:u64,
+    pub base_rewards_per_epoch:u64,
+    pub base_reward_factor:u64,
+    pub min_epochs_to_inactivity_penalty :u64,
+    pub inactivity_penalty_quotient:u64, //?
+    pub proposer_reward_quotient:u64,
+    pub min_per_epoch_churn_limit:u64,
+    pub max_committees_per_slot: usize,
+    pub target_committee_size: usize,
+    pub min_seed_lookahead: u64,
+    pub shuffle_round_count: u8,
+
+    pub inactivity_score_bias: u64,
+    pub inactivity_score_recovery_rate: u64,
+    pub max_inactivity_score: u64,
+    pub trigger_punish_inactivity_score: u64,
+    pub multiple_reward_for_inactivity_penalty: u64,
+
+    pub min_validator_withdrawability_delay: u64,
+}
+
+pub fn beacon_chain_spec() -> ChainSpec {
+    ChainSpec {
+        max_pending_partials_per_withdrawals_sweep: 16,
+        min_activation_balance: 32000000000,
+        ejection_balance: 16000000000,
+        far_future_epoch: u64::max_value(),
+        max_validators_per_withdrawals_sweep: 16384,
+        max_effective_balance: 32000000000,
+        full_exit_request_amount: 0,
+        shard_committee_period: 1,
+        compounding_withdrawal_prefix_byte: 0x02,
+        eth1_address_withdrawal_prefix_byte: 0x01,
+        max_seed_lookahead: 4,
+        max_per_epoch_activation_exit_churn_limit: 256000000000,
+        min_per_epoch_churn_limit_electra: 128000000000,
+        churn_limit_quotient: 32,
+        effective_balance_increment: 1000000000,
+        base_rewards_per_epoch: 1,
+        base_reward_factor: 2,
+        min_epochs_to_inactivity_penalty: 4,
+        inactivity_penalty_quotient: 67108864,
+        proposer_reward_quotient: 4,
+        min_per_epoch_churn_limit: 4,
+        max_committees_per_slot: 4,
+        target_committee_size: 4,
+        min_seed_lookahead: 1,
+        shuffle_round_count: 10,
+
+        inactivity_score_bias: 1,
+        inactivity_score_recovery_rate: 5,
+        max_inactivity_score: 15,
+        trigger_punish_inactivity_score: 15,
+        multiple_reward_for_inactivity_penalty: 3,
+
+        min_validator_withdrawability_delay: 1,
+    }
+}
 
 /*
 pub const inactivity_score_bias: u64 = 1;
@@ -70,6 +118,7 @@ pub const max_inactivity_score: u64 = 51840;
 pub const trigger_punish_inactivity_score: u64 = 17280;
 pub const multiple_reward_for_inactivity_penalty: u64 = 3;
 */
+/*
 pub const inactivity_score_bias: u64 = 1;
 pub const inactivity_score_recovery_rate: u64 = 5;
 pub const max_inactivity_score: u64 = 15;
@@ -77,6 +126,7 @@ pub const trigger_punish_inactivity_score: u64 = 15;
 pub const multiple_reward_for_inactivity_penalty: u64 = 3;
 
 pub const min_validator_withdrawability_delay: u64 = 1;
+*/
 
 pub const CACHED_EPOCHS: usize = 3;
 
@@ -373,31 +423,34 @@ impl BeaconState {
 
     pub fn state_transition(old_beacon_state: &BeaconState, beacon_block: &BeaconBlock) -> eyre::Result<Self> {
         debug!(target: "consensus-client", ?old_beacon_state, ?beacon_block, "state_transition");
+        let spec = beacon_chain_spec();
         let mut new_beacon_state = old_beacon_state.clone();
         new_beacon_state.slot += 1;
         if (new_beacon_state.slot) % SLOTS_PER_EPOCH == 0 {
-            new_beacon_state.process_epoch()?;
+            new_beacon_state.process_epoch(&spec)?;
         }
-        new_beacon_state.process_block(&beacon_block)?;
+        new_beacon_state.process_block(&beacon_block, &spec)?;
 
         Ok(new_beacon_state)
     }
 
-    pub fn process_epoch(&mut self) -> eyre::Result<()> {
+    pub fn process_epoch(&mut self,
+        spec: &ChainSpec,
+        ) -> eyre::Result<()> {
         // workaround empty validators
         if self.has_active_validators(RelativeEpoch::Current) {
-            self.build_committee_cache(RelativeEpoch::Current)?;
+            self.build_committee_cache(RelativeEpoch::Current, spec)?;
         }
         if self.has_active_validators(RelativeEpoch::Next) {
-            self.build_committee_cache(RelativeEpoch::Next)?;
+            self.build_committee_cache(RelativeEpoch::Next, spec)?;
         }
         if self.has_active_validators(RelativeEpoch::Previous) {
-            self.build_committee_cache(RelativeEpoch::Previous)?;
+            self.build_committee_cache(RelativeEpoch::Previous, spec)?;
         }
 
         for (index, validator) in self.validators.iter_mut().enumerate() {
-            let balance = self.balances[index].min(max_effective_balance);
-            let new_effective_balance = round_to_nearest(balance, effective_balance_increment);
+            let balance = self.balances[index].min(spec.max_effective_balance);
+            let new_effective_balance = round_to_nearest(balance, spec.effective_balance_increment);
             if new_effective_balance != validator.effective_balance {
                 validator.effective_balance = new_effective_balance;
             }
@@ -409,24 +462,26 @@ impl BeaconState {
             let is_active = self.epoch_attester_indexes.contains(&(validator_index as u64));
             let inactivity_score = self.get_inactivity_score_mut(validator_index)?;
             if is_active {
-                *inactivity_score = inactivity_score.saturating_sub(inactivity_score_recovery_rate);
+                *inactivity_score = inactivity_score.saturating_sub(spec.inactivity_score_recovery_rate);
             } else {
-                if *inactivity_score < max_inactivity_score {
-                    *inactivity_score = inactivity_score.saturating_add(inactivity_score_bias);
+                if *inactivity_score < spec.max_inactivity_score {
+                    *inactivity_score = inactivity_score.saturating_add(spec.inactivity_score_bias);
                 }
             }
         }
-        let validator_statuses = ValidatorStatuses::new(self)?;
+        let validator_statuses = ValidatorStatuses::new(self, spec)?;
 
         self.epoch_attester_indexes.clear();
 
-        self.process_rewards_and_penalties(&validator_statuses)?;
-        self.process_registry_updates()?;
+        self.process_rewards_and_penalties(&validator_statuses, spec)?;
+        self.process_registry_updates(spec)?;
 
         Ok(())
     }
 
-    pub fn process_registry_updates(&mut self) -> eyre::Result<()> {
+    pub fn process_registry_updates(&mut self,
+        spec: &ChainSpec,
+        ) -> eyre::Result<()> {
         // Process activation eligibility and ejections.
         // Collect eligible and exiting validators (we need to avoid mutating the state while iterating).
         // We assume it's safe to re-order the change in eligibility and `initiate_validator_exit`.
@@ -434,7 +489,7 @@ impl BeaconState {
         let current_epoch = self.current_epoch();
         let is_ejectable = |validator: &Validator| {
             validator.is_active_at(current_epoch)
-                && validator.effective_balance <= ejection_balance
+                && validator.effective_balance <= spec.ejection_balance
         };
         //let fork_name = state.fork_name_unchecked();
         let indices_to_update: Vec<_> = self
@@ -442,24 +497,24 @@ impl BeaconState {
             .iter()
             .enumerate()
             .filter(|(_, validator)| {
-                validator.is_eligible_for_activation_queue() || is_ejectable(validator)
+                validator.is_eligible_for_activation_queue(spec) || is_ejectable(validator)
             })
             .map(|(idx, _)| idx)
             .collect();
 
         for index in indices_to_update {
             let validator = self.get_validator_mut(index)?;
-            if validator.is_eligible_for_activation_queue() {
+            if validator.is_eligible_for_activation_queue(spec) {
                 validator.activation_eligibility_epoch = current_epoch.safe_add(1)?;
             }
             if is_ejectable(validator) {
-                self.initiate_validator_exit(index)?;
+                self.initiate_validator_exit(index, spec)?;
             }
         }
 
         // Queue validators eligible for activation and not dequeued for activation prior to finalized epoch
         // Dequeue validators for activation up to churn limit
-        let churn_limit = self.get_activation_churn_limit()? as usize;
+        let churn_limit = self.get_activation_churn_limit(spec)? as usize;
 
         let next_epoch = self.next_epoch()?;
         let mut full_activation_queue = ActivationQueue::default();
@@ -468,7 +523,7 @@ impl BeaconState {
 
             // Add to speculative activation queue.
             full_activation_queue
-                .add_if_could_be_eligible_for_activation(index, validator, next_epoch);
+                .add_if_could_be_eligible_for_activation(index, validator, next_epoch, spec);
         }
 
         //let epoch_cache = state.epoch_cache();
@@ -477,7 +532,7 @@ impl BeaconState {
             .get_validators_eligible_for_activation(current_epoch, churn_limit);
             //.get_validators_eligible_for_activation(state.finalized_checkpoint().epoch, churn_limit);
 
-        let delayed_activation_epoch = self.compute_activation_exit_epoch(current_epoch)?;
+        let delayed_activation_epoch = self.compute_activation_exit_epoch(current_epoch, spec)?;
         for index in activation_queue {
             self.get_validator_mut(index)?.activation_epoch = delayed_activation_epoch;
         }
@@ -485,12 +540,16 @@ impl BeaconState {
         Ok(())
     }
 
-    pub fn process_block(&mut self, beacon_block: &BeaconBlock) -> eyre::Result<()> {
-        self.process_operations(&beacon_block.body)?;
+    pub fn process_block(&mut self, beacon_block: &BeaconBlock,
+        spec: &ChainSpec,
+        ) -> eyre::Result<()> {
+        self.process_operations(&beacon_block.body, spec)?;
         Ok(())
     }
 
-    pub fn process_operations(&mut self, beacon_block_body: &BeaconBlockBody) -> eyre::Result<()> {
+    pub fn process_operations(&mut self, beacon_block_body: &BeaconBlockBody,
+        spec: &ChainSpec,
+        ) -> eyre::Result<()> {
         //self.process_deposit(&beacon_block_body.deposits)?;
         self.process_attestation(&beacon_block_body.attestations)?;
         //self.process_voluntary_exit(&beacon_block_body.voluntary_exits)?;
@@ -507,17 +566,19 @@ impl BeaconState {
             }
 
         }).collect();
-        self.process_deposits(&deposits)?;
-        self.process_exits(&beacon_block_body.voluntary_exits)?;
-        self.process_withdrawal_requests(&beacon_block_body.execution_requests.withdrawals)?;
+        self.process_deposits(&deposits, spec)?;
+        self.process_exits(&beacon_block_body.voluntary_exits, spec)?;
+        self.process_withdrawal_requests(&beacon_block_body.execution_requests.withdrawals, spec)?;
 
         Ok(())
     }
 
-    pub fn process_withdrawal_requests(&mut self, requests: &[WithdrawalRequest]) -> eyre::Result<()> {
+    pub fn process_withdrawal_requests(&mut self, requests: &[WithdrawalRequest],
+        spec: &ChainSpec,
+        ) -> eyre::Result<()> {
         for request in requests {
             let amount = request.amount;
-            let is_full_exit_request = amount == full_exit_request_amount;
+            let is_full_exit_request = amount == spec.full_exit_request_amount;
 
             // If partial withdrawal queue is full, only full exits are processed
             if self.pending_partial_withdrawals.len() == pending_partial_withdrawals_limit
@@ -533,7 +594,7 @@ impl BeaconState {
 
             let validator = self.get_validator(validator_index)?;
             // Verify withdrawal credentials
-            let has_correct_credential = validator.has_execution_withdrawal_credential();
+            let has_correct_credential = validator.has_execution_withdrawal_credential(spec);
             let is_correct_source_address = validator
                 .get_execution_withdrawal_address()
                 .map(|addr| addr == request.source_address)
@@ -549,7 +610,7 @@ impl BeaconState {
             }
 
             // Verify exit has not been initiated
-            if validator.exit_epoch != far_future_epoch {
+            if validator.exit_epoch != spec.far_future_epoch {
                 continue;
             }
 
@@ -557,7 +618,7 @@ impl BeaconState {
             if self.current_epoch()
                 < validator
                 .activation_epoch
-                .safe_add(shard_committee_period)?
+                .safe_add(spec.shard_committee_period)?
             {
                 continue;
             }
@@ -566,33 +627,33 @@ impl BeaconState {
             if is_full_exit_request {
                 // Only exit validator if it has no pending withdrawals in the queue
                 if pending_balance_to_withdraw == 0 {
-                    self.initiate_validator_exit(validator_index)?
+                    self.initiate_validator_exit(validator_index, spec)?
                 }
                 continue;
             }
 
             let balance = self.get_balance(validator_index)?;
             let has_sufficient_effective_balance =
-                validator.effective_balance >= min_activation_balance;
+                validator.effective_balance >= spec.min_activation_balance;
             let has_excess_balance = balance
                 > 
-                min_activation_balance
+                spec.min_activation_balance
                 .safe_add(pending_balance_to_withdraw)?;
 
             // Only allow partial withdrawals with compounding withdrawal credentials
-            if validator.has_compounding_withdrawal_credential()
+            if validator.has_compounding_withdrawal_credential(spec)
                 && has_sufficient_effective_balance
                 && has_excess_balance
             {
                 let to_withdraw = std::cmp::min(
                     balance
-                        .safe_sub(min_activation_balance)?
+                        .safe_sub(spec.min_activation_balance)?
                         .safe_sub(pending_balance_to_withdraw)?,
                     amount,
                 );
-                let exit_queue_epoch = self.compute_exit_epoch_and_update_churn(to_withdraw)?;
+                let exit_queue_epoch = self.compute_exit_epoch_and_update_churn(to_withdraw, spec)?;
                 let withdrawable_epoch =
-                    exit_queue_epoch.safe_add(min_validator_withdrawability_delay)?;
+                    exit_queue_epoch.safe_add(spec.min_validator_withdrawability_delay)?;
                 self
                     //.pending_partial_withdrawals_mut()?
                     .pending_partial_withdrawals
@@ -650,7 +711,9 @@ impl BeaconState {
         }
     }
 
-    pub fn get_expected_withdrawals(&self) -> eyre::Result<(Vec<Withdrawal>, Option<usize>)> {
+    pub fn get_expected_withdrawals(&self,
+        spec: &ChainSpec,
+        ) -> eyre::Result<(Vec<Withdrawal>, Option<usize>)> {
         debug!(target: "consensus-client", "get_expected_withdrawals");
         let epoch = self.current_epoch();
         let mut withdrawal_index = self.next_withdrawal_index;
@@ -661,7 +724,7 @@ impl BeaconState {
 
             for withdrawal in self.pending_partial_withdrawals.iter() {
                 if withdrawal.withdrawable_epoch > epoch
-                    || withdrawals.len() == max_pending_partials_per_withdrawals_sweep as usize
+                    || withdrawals.len() == spec.max_pending_partials_per_withdrawals_sweep as usize
                 {
                     break;
                 }
@@ -669,7 +732,7 @@ impl BeaconState {
                 let validator = self.get_validator(withdrawal.validator_index as usize)?;
 
                 let has_sufficient_effective_balance =
-                    validator.effective_balance >= min_activation_balance;
+                    validator.effective_balance >= spec.min_activation_balance;
                 let total_withdrawn = withdrawals
                     .iter()
                     .filter_map(|w| {
@@ -679,14 +742,14 @@ impl BeaconState {
                 let balance = self
                     .get_balance(withdrawal.validator_index as usize)?
                     .safe_sub(total_withdrawn)?;
-                let has_excess_balance = balance > min_activation_balance;
+                let has_excess_balance = balance > spec.min_activation_balance;
 
-                if validator.exit_epoch == far_future_epoch
+                if validator.exit_epoch == spec.far_future_epoch
                     && has_sufficient_effective_balance
                     && has_excess_balance
                 {
                     let withdrawable_balance = std::cmp::min(
-                        balance.safe_sub(min_activation_balance)?,
+                        balance.safe_sub(spec.min_activation_balance)?,
                         withdrawal.amount,
                     );
                     withdrawals.push(Withdrawal {
@@ -704,7 +767,7 @@ impl BeaconState {
 
     let bound = std::cmp::min(
         self.validators.len() as u64,
-        max_validators_per_withdrawals_sweep,
+        spec.max_validators_per_withdrawals_sweep,
     );
     debug!(target: "consensus-client", ?bound, "get_expected_withdrawals");
     for _ in 0..bound {
@@ -728,7 +791,7 @@ impl BeaconState {
                 amount: balance,
             });
             withdrawal_index.safe_add_assign(1)?;
-        } else if validator.is_partially_withdrawable_validator(balance) {
+        } else if validator.is_partially_withdrawable_validator(balance, spec) {
             withdrawals.push(Withdrawal {
                 index: withdrawal_index,
                 validator_index,
@@ -737,7 +800,7 @@ impl BeaconState {
                     //.ok_or(BlockProcessingError::WithdrawalCredentialsInvalid)?,
                     .ok_or(eyre::eyre!("WithdrawalCredentialsInvalid"))?,
                 //amount: balance.safe_sub(validator.get_max_effective_balance(spec, fork_name))?,
-                amount: balance.safe_sub(max_effective_balance)?,
+                amount: balance.safe_sub(spec.max_effective_balance)?,
             });
             withdrawal_index.safe_add_assign(1)?;
         }
@@ -753,9 +816,11 @@ impl BeaconState {
     Ok((withdrawals, Some(processed_partial_withdrawals_count)))
     }
 
-    pub fn process_withdrawals(&mut self) -> eyre::Result<(Vec<Withdrawal>, Option<usize>)> {
+    pub fn process_withdrawals(&mut self,
+        ) -> eyre::Result<(Vec<Withdrawal>, Option<usize>)> {
+        let spec = beacon_chain_spec();
         let (expected_withdrawals, processed_partial_withdrawals_count) =
-            self.get_expected_withdrawals()?;
+            self.get_expected_withdrawals(&spec)?;
 
         // TODO: check expected_withdrawals hash root against execution payload withdrawals root
 
@@ -796,7 +861,7 @@ impl BeaconState {
         if expected_withdrawals.len() != max_withdrawals_per_payload && !self.validators.is_empty() {
             let next_validator_index = self
                 .next_withdrawal_validator_index
-                .safe_add(max_validators_per_withdrawals_sweep)?
+                .safe_add(spec.max_validators_per_withdrawals_sweep)?
                 .safe_rem(self.validators.len() as u64)?;
             self.next_withdrawal_validator_index = next_validator_index;
         }
@@ -881,20 +946,22 @@ impl BeaconState {
     pub fn compute_activation_exit_epoch(
         &self,
         epoch: Epoch,
+        spec: &ChainSpec,
     ) -> eyre::Result<Epoch> {
-        Ok(epoch.safe_add(1)?.safe_add(max_seed_lookahead)?)
+        Ok(epoch.safe_add(1)?.safe_add(spec.max_seed_lookahead)?)
     }
 
     pub fn compute_exit_epoch_and_update_churn(
         &mut self,
         exit_balance: u64,
+        spec: &ChainSpec,
     ) -> eyre::Result<Epoch> {
         let mut earliest_exit_epoch = std::cmp::max(
             self.earliest_exit_epoch,
-            self.compute_activation_exit_epoch(self.current_epoch())?,
+            self.compute_activation_exit_epoch(self.current_epoch(), spec)?,
         );
 
-        let per_epoch_churn = self.get_activation_exit_churn_limit()?;
+        let per_epoch_churn = self.get_activation_exit_churn_limit(spec)?;
         // New epoch for exits
         let mut exit_balance_to_consume = if self.earliest_exit_epoch < earliest_exit_epoch {
             per_epoch_churn
@@ -934,11 +1001,12 @@ impl BeaconState {
     pub fn initiate_validator_exit(
         &mut self,
         index: usize,
+        spec: &ChainSpec,
     ) -> eyre::Result<()> {
         let validator = self.get_validator(index)?;
 
         // Return if the validator already initiated exit
-        if validator.exit_epoch != far_future_epoch {
+        if validator.exit_epoch != spec.far_future_epoch {
             return Ok(());
         }
 
@@ -947,12 +1015,12 @@ impl BeaconState {
 
         // Compute exit queue epoch
         let effective_balance = self.get_effective_balance(index)?;
-        let exit_queue_epoch = self.compute_exit_epoch_and_update_churn(effective_balance)?;
+        let exit_queue_epoch = self.compute_exit_epoch_and_update_churn(effective_balance, spec)?;
 
         let validator = self.get_validator_mut(index)?;
         validator.exit_epoch = exit_queue_epoch;
         validator.withdrawable_epoch =
-            exit_queue_epoch.safe_add(min_validator_withdrawability_delay)?;
+            exit_queue_epoch.safe_add(spec.min_validator_withdrawability_delay)?;
 
         /*
         state
@@ -964,22 +1032,26 @@ impl BeaconState {
     }
 
     /// Return the churn limit for the current epoch dedicated to activations and exits.
-    pub fn get_activation_exit_churn_limit(&self) -> eyre::Result<u64> {
+    pub fn get_activation_exit_churn_limit(&self,
+        spec: &ChainSpec,
+        ) -> eyre::Result<u64> {
         Ok(std::cmp::min(
-            max_per_epoch_activation_exit_churn_limit,
-            self.get_balance_churn_limit()?,
+            spec.max_per_epoch_activation_exit_churn_limit,
+            self.get_balance_churn_limit(spec)?,
         ))
     }
 
     /// Return the churn limit for the current epoch.
-    pub fn get_balance_churn_limit(&self) -> eyre::Result<u64> {
-        let total_active_balance = self.get_total_active_balance()?;
+    pub fn get_balance_churn_limit(&self,
+        spec: &ChainSpec,
+        ) -> eyre::Result<u64> {
+        let total_active_balance = self.get_total_active_balance(spec)?;
         let churn = std::cmp::max(
-            min_per_epoch_churn_limit_electra,
-            total_active_balance.safe_div(churn_limit_quotient)?,
+            spec.min_per_epoch_churn_limit_electra,
+            total_active_balance.safe_div(spec.churn_limit_quotient)?,
         );
 
-        Ok(churn.safe_sub(churn.safe_rem(effective_balance_increment)?)?)
+        Ok(churn.safe_sub(churn.safe_rem(spec.effective_balance_increment)?)?)
     }
 
     /// Implementation of `get_total_active_balance`, matching the spec.
@@ -988,8 +1060,10 @@ impl BeaconState {
     /// the current committee cache is.
     ///
     /// Returns minimum `EFFECTIVE_BALANCE_INCREMENT`, to avoid div by 0.
-    pub fn get_total_active_balance(&self) -> eyre::Result<u64> {
-        self.compute_total_active_balance_slow()
+    pub fn get_total_active_balance(&self,
+        spec: &ChainSpec,
+        ) -> eyre::Result<u64> {
+        self.compute_total_active_balance_slow(spec)
         // self.get_total_active_balance_at_epoch(self.current_epoch())
     }
 
@@ -1016,14 +1090,15 @@ impl BeaconState {
 pub fn process_exits(
     self: &mut Self,
     voluntary_exits: &[VoluntaryExitWithSig],
+        spec: &ChainSpec,
 ) -> eyre::Result<()> {
     // Verify and apply each exit in series. We iterate in series because higher-index exits may
     // become invalid due to the application of lower-index ones.
     for (i, exit) in voluntary_exits.iter().enumerate() {
-        self.verify_exit(None, exit)
+        self.verify_exit(None, exit, spec)
             .map_err(|e| eyre::eyre!("verify_exit error {e}, index {i}"))?;
 
-        self.initiate_validator_exit(exit.voluntary_exit.validator_index as usize)?;
+        self.initiate_validator_exit(exit.voluntary_exit.validator_index as usize, spec)?;
     }
     Ok(())
 }
@@ -1039,6 +1114,7 @@ pub fn verify_exit(
     current_epoch: Option<Epoch>,
     signed_exit: &VoluntaryExitWithSig,
     //verify_signatures: VerifySignatures,
+        spec: &ChainSpec,
 ) -> eyre::Result<()> {
     let current_epoch = current_epoch.unwrap_or(self.current_epoch());
     let exit = &signed_exit.voluntary_exit;
@@ -1056,7 +1132,7 @@ pub fn verify_exit(
 
     // Verify that the validator has not yet exited.
     verify!(
-        validator.exit_epoch == far_future_epoch,
+        validator.exit_epoch == spec.far_future_epoch,
         format!("ExitInvalid::AlreadyExited({})", exit.validator_index)
     );
 
@@ -1075,7 +1151,7 @@ pub fn verify_exit(
     // Verify the validator has been active long enough.
     let earliest_exit_epoch = validator
         .activation_epoch
-        .safe_add(shard_committee_period)?;
+        .safe_add(spec.shard_committee_period)?;
     verify!(
         current_epoch >= earliest_exit_epoch,
         /*
@@ -1122,6 +1198,7 @@ pub fn verify_exit(
 pub fn process_deposits(
     self: &mut Self,
     deposits: &[Deposit],
+        spec: &ChainSpec,
 ) -> eyre::Result<()> {
     debug!(target: "consensus-client", deposists_length=?deposits.len(), "process_deposits");
 
@@ -1143,7 +1220,7 @@ pub fn process_deposits(
 
     // Update the state in series.
     for deposit in deposits {
-        self.apply_deposit(deposit.data.clone(), None, true)?;
+        self.apply_deposit(deposit.data.clone(), None, true, spec)?;
     }
 
     Ok(())
@@ -1156,6 +1233,7 @@ pub fn apply_deposit(
     //proof: Option<FixedVector<Hash256, U33>>,
     proof: Option<u8>, // for compile
     increment_eth1_deposit_index: bool,
+        spec: &ChainSpec,
 ) -> eyre::Result<()> {
     let deposit_index = self.eth1_deposit_index as usize;
     /*
@@ -1218,6 +1296,7 @@ pub fn apply_deposit(
             },
             */
                 amount,
+                spec,
         )?;
 
         /*
@@ -1244,7 +1323,7 @@ pub fn apply_deposit(
         pubkey: BLSPubkey,
         withdrawal_credentials: B256,
         amount: u64,
-        //spec: &ChainSpec,
+        spec: &ChainSpec,
     ) -> eyre::Result<usize> {
         let index = self.validators.len();
         //let fork_name = self.fork_name_unchecked();
@@ -1253,6 +1332,7 @@ pub fn apply_deposit(
             withdrawal_credentials,
             amount,
             //fork_name,
+            spec,
         ));
         self.balances.push(amount);
         self.inactivity_scores.push(0);
@@ -1292,7 +1372,7 @@ pub fn apply_deposit(
     pub fn process_rewards_and_penalties(
         self: &mut Self,
         validator_statuses: &ValidatorStatuses,
-        //spec: &Spec,
+        spec: &ChainSpec,
     ) -> eyre::Result<()> {
         debug!(target: "consensus-client", slot=?self.slot, ?validator_statuses, "process_rewards_and_penalties");
         if self.current_epoch() == genesis_epoch {
@@ -1309,6 +1389,7 @@ pub fn apply_deposit(
         let deltas = self.get_attestation_deltas_all(
             validator_statuses,
             ProposerRewardCalculation::Include,
+            spec,
         )?;
         debug!(target: "consensus-client", ?deltas, "process_rewards_and_penalties");
 
@@ -1328,9 +1409,9 @@ pub fn apply_deposit(
         self: &Self,
         validator_statuses: &ValidatorStatuses,
         proposer_reward: ProposerRewardCalculation,
-        //spec: &Spec,
+        spec: &ChainSpec,
     ) -> eyre::Result<Vec<AttestationDelta>> {
-        self.get_attestation_deltas(validator_statuses, proposer_reward)
+        self.get_attestation_deltas(validator_statuses, proposer_reward, spec)
     }
 
     /// Apply rewards for participation in attestations during the previous epoch.
@@ -1343,7 +1424,7 @@ pub fn apply_deposit(
         validator_statuses: &ValidatorStatuses,
         proposer_reward: ProposerRewardCalculation,
         // maybe_validators_subset: Option<&Vec<usize>>,
-        //spec: &Spec,
+        spec: &ChainSpec,
     ) -> eyre::Result<Vec<AttestationDelta>> {
         /*
         let finality_delay = state
@@ -1377,6 +1458,7 @@ pub fn apply_deposit(
             let base_reward = get_base_reward(
                 validator.current_epoch_effective_balance,
                 sqrt_total_active_balance,
+                spec,
             )?;
 
             debug!(target: "consensus-client", ?base_reward, "get_attestation_deltas");
@@ -1386,7 +1468,7 @@ pub fn apply_deposit(
 
             // if include_validator_delta(index) {
                 let all_delta =
-                    get_all_delta(validator, base_reward, total_balances, finality_delay)?;
+                    get_all_delta(validator, base_reward, total_balances, finality_delay, spec)?;
                 // let target_delta =
                 //     get_target_delta(validator, base_reward, total_balances, finality_delay, spec)?;
                 // let head_delta =
@@ -1431,7 +1513,7 @@ pub fn apply_deposit(
     /// Return the churn limit for the current epoch (number of validators who can leave per epoch).
     ///
     /// Uses the current epoch committee cache, and will error if it isn't initialized.
-    pub fn get_validator_churn_limit(&self, /* spec: &ChainSpec */) -> eyre::Result<u64> {
+    pub fn get_validator_churn_limit(&self, spec: &ChainSpec) -> eyre::Result<u64> {
         /*
         Ok(std::cmp::max(
             spec.min_per_epoch_churn_limit,
@@ -1441,11 +1523,13 @@ pub fn apply_deposit(
                 .safe_div(spec.churn_limit_quotient)?,
         ))
         */
-        Ok(min_per_epoch_churn_limit)
+        Ok(spec.min_per_epoch_churn_limit)
     }
 
-    pub fn get_activation_churn_limit(&self) -> eyre::Result<u64> {
-        self.get_validator_churn_limit()
+    pub fn get_activation_churn_limit(&self,
+        spec: &ChainSpec,
+        ) -> eyre::Result<u64> {
+        self.get_validator_churn_limit(spec)
     }
 
     /// Passing `previous_epoch` to this function rather than computing it internally provides
@@ -1464,7 +1548,9 @@ pub fn apply_deposit(
     ///
     /// This method should rarely be invoked because single-pass epoch processing keeps the total
     /// active balance cache up to date.
-    pub fn compute_total_active_balance_slow(&self) -> eyre::Result<u64> {
+    pub fn compute_total_active_balance_slow(&self,
+        spec: &ChainSpec,
+        ) -> eyre::Result<u64> {
         let current_epoch = self.current_epoch();
 
         let mut total_active_balance = 0;
@@ -1476,7 +1562,7 @@ pub fn apply_deposit(
         }
         Ok(std::cmp::max(
             total_active_balance,
-            effective_balance_increment,
+            spec.effective_balance_increment,
         ))
     }
 
@@ -1489,9 +1575,11 @@ pub fn apply_deposit(
     }
 
     /// Build all committee caches, if they need to be built.
-    pub fn build_all_committee_caches(&mut self,) -> eyre::Result<()> {
+    pub fn build_all_committee_caches(&mut self,
+        spec: &ChainSpec,
+        ) -> eyre::Result<()> {
         //self.build_committee_cache(RelativeEpoch::Previous)?;
-        self.build_committee_cache(RelativeEpoch::Current)?;
+        self.build_committee_cache(RelativeEpoch::Current, spec)?;
         //self.build_committee_cache(RelativeEpoch::Next)?;
         Ok(())
     }
@@ -1500,7 +1588,7 @@ pub fn apply_deposit(
     pub fn build_committee_cache(
         &mut self,
         relative_epoch: RelativeEpoch,
-        //spec: &ChainSpec,
+        spec: &ChainSpec,
     ) -> eyre::Result<()> {
         let i = Self::committee_cache_index(relative_epoch);
         let is_initialized = self
@@ -1508,8 +1596,7 @@ pub fn apply_deposit(
             .is_initialized_at(relative_epoch.into_epoch(self.current_epoch()));
 
         if !is_initialized {
-            //self.force_build_committee_cache(relative_epoch, spec)?;
-            self.force_build_committee_cache(relative_epoch)?;
+            self.force_build_committee_cache(relative_epoch, spec)?;
         }
 
         /*
@@ -1549,13 +1636,12 @@ pub fn apply_deposit(
     pub fn force_build_committee_cache(
         &mut self,
         relative_epoch: RelativeEpoch,
-        //spec: &ChainSpec,
+        spec: &ChainSpec,
     ) -> eyre::Result<()> {
         let epoch = relative_epoch.into_epoch(self.current_epoch());
         let i = Self::committee_cache_index(relative_epoch);
 
-        //*self.committee_cache_at_index_mut(i)? = self.initialize_committee_cache(epoch, spec)?;
-        *self.committee_cache_at_index_mut(i)? = self.initialize_committee_cache(epoch)?;
+        *self.committee_cache_at_index_mut(i)? = self.initialize_committee_cache(epoch, spec)?;
         Ok(())
     }
 
@@ -1566,10 +1652,9 @@ pub fn apply_deposit(
     pub fn initialize_committee_cache(
         &self,
         epoch: Epoch,
-        //spec: &ChainSpec,
+        spec: &ChainSpec,
     ) -> eyre::Result<CommitteeCache> {
-        //CommitteeCache::initialized(self, epoch, spec)
-        CommitteeCache::initialized(self, epoch)
+        CommitteeCache::initialized(self, epoch, spec)
     }
 
     pub fn has_active_validators(
@@ -1656,11 +1741,12 @@ pub fn decrease_balance_directly(balance: &mut u64, delta: u64) -> eyre::Result<
 
 pub fn is_compounding_withdrawal_credential(
     withdrawal_credentials: B256,
+        spec: &ChainSpec,
 ) -> bool {
     withdrawal_credentials
         .as_slice()
         .first()
-        .map(|prefix_byte| *prefix_byte == compounding_withdrawal_prefix_byte)
+        .map(|prefix_byte| *prefix_byte == spec.compounding_withdrawal_prefix_byte)
         .unwrap_or(false)
 }
 
@@ -1716,10 +1802,10 @@ impl ValidatorStatuses {
     /// Spec v0.12.1
     pub fn new(
         state: &BeaconState,
-        //spec: &ChainSpec,
+        spec: &ChainSpec,
     ) -> eyre::Result<Self> {
         let mut statuses = Vec::with_capacity(state.validators.len());
-        let mut total_balances = TotalBalances::new();
+        let mut total_balances = TotalBalances::new(spec);
 
         let current_epoch = state.current_epoch();
         let previous_epoch = state.previous_epoch();
@@ -1727,7 +1813,7 @@ impl ValidatorStatuses {
         for (validator_index, validator) in state.validators.iter().enumerate() {
             let effective_balance = validator.effective_balance;
             let inactivity_score = state.get_inactivity_score(validator_index)?;
-            let is_punishable = inactivity_score >= trigger_punish_inactivity_score;
+            let is_punishable = inactivity_score >= spec.trigger_punish_inactivity_score;
             let mut status = ValidatorStatus {
                 is_slashed: validator.slashed,
                 is_eligible: state.is_eligible_validator(previous_epoch, validator)?,
@@ -1855,11 +1941,12 @@ impl SqrtTotalActiveBalance {
 pub fn get_base_reward(
     validator_effective_balance: u64,
     sqrt_total_active_balance: SqrtTotalActiveBalance,
+        spec: &ChainSpec,
 ) -> eyre::Result<u64> {
     Ok(validator_effective_balance
-        .safe_mul(base_reward_factor)?
+        .safe_mul(spec.base_reward_factor)?
         .safe_div(sqrt_total_active_balance.as_u64())?
-        .safe_div(base_rewards_per_epoch)?)
+        .safe_div(spec.base_rewards_per_epoch)?)
 }
 
 fn get_all_delta(
@@ -1867,22 +1954,25 @@ fn get_all_delta(
     base_reward: u64,
     total_balances: &TotalBalances,
     finality_delay: u64,
+        spec: &ChainSpec,
 ) -> eyre::Result<Delta> {
     get_attestation_component_delta_n42(
         base_reward,
         validator.is_punishable,
+        spec,
     )
 }
 
 pub fn get_attestation_component_delta_n42(
     base_reward: u64,
     is_punishable: bool,
+        spec: &ChainSpec,
 ) -> eyre::Result<Delta> {
     let mut delta = Delta::default();
 
     delta.reward(base_reward)?;
     if is_punishable {
-        delta.penalize(base_reward * multiple_reward_for_inactivity_penalty)?;
+        delta.penalize(base_reward * spec.multiple_reward_for_inactivity_penalty)?;
     }
 
     Ok(delta)
@@ -1892,18 +1982,18 @@ pub fn get_inactivity_penalty_delta(
     validator: &ValidatorStatus,
     base_reward: u64,
     finality_delay: u64,
-    //spec: &Spec,
+    spec: &ChainSpec,
 ) -> eyre::Result<Delta> {
     let mut delta = Delta::default();
 
     debug!(?finality_delay, "get_inactivity_penalty_delta");
     // Inactivity penalty
-    if finality_delay > min_epochs_to_inactivity_penalty {
+    if finality_delay > spec.min_epochs_to_inactivity_penalty {
         // If validator is performing optimally this cancels all rewards for a neutral balance
         delta.penalize(
-            base_rewards_per_epoch
+            spec.base_rewards_per_epoch
                 .safe_mul(base_reward)?
-                .safe_sub(get_proposer_reward(base_reward)?)?,
+                .safe_sub(get_proposer_reward(base_reward, spec)?)?,
         )?;
 
         // Additionally, all validators whose FFG target didn't match are penalized extra
@@ -1914,7 +2004,7 @@ pub fn get_inactivity_penalty_delta(
                 validator
                     .current_epoch_effective_balance
                     .safe_mul(finality_delay)?
-                    .safe_div(inactivity_penalty_quotient)?,
+                    .safe_div(spec.inactivity_penalty_quotient)?,
             )?;
         }
     }
@@ -2034,9 +2124,11 @@ macro_rules! balance_accessor {
 }
 
 impl TotalBalances {
-    pub fn new() -> Self {
+    pub fn new(
+        spec: &ChainSpec,
+        ) -> Self {
         Self {
-            effective_balance_increment: effective_balance_increment,
+            effective_balance_increment: spec.effective_balance_increment,
             current_epoch: 0,
             previous_epoch: 0,
             current_epoch_attesters: 0,
@@ -2059,8 +2151,10 @@ impl TotalBalances {
 /// Compute the reward awarded to a proposer for including an attestation from a validator.
 ///
 /// The `base_reward` param should be the `base_reward` of the attesting validator.
-fn get_proposer_reward(base_reward: u64) -> eyre::Result<u64> {
-    Ok(base_reward.safe_div(proposer_reward_quotient)?)
+fn get_proposer_reward(base_reward: u64,
+        spec: &ChainSpec,
+    ) -> eyre::Result<u64> {
+    Ok(base_reward.safe_div(spec.proposer_reward_quotient)?)
 }
 
 /// Defines the epochs relative to some epoch. Most useful when referring to the committees prior

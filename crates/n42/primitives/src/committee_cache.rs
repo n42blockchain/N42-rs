@@ -11,7 +11,7 @@ use ssz_derive::{Decode, Encode};
 use std::ops::Range;
 use std::sync::Arc;
 use crate::shuffle_list::shuffle_list;
-use crate::{SLOTS_PER_EPOCH, max_committees_per_slot, target_committee_size, min_seed_lookahead, shuffle_round_count};
+use crate::{SLOTS_PER_EPOCH, ChainSpec};
 use crate::beacon_committee::BeaconCommittee;
 
 // Define "legacy" implementations of `Option<Epoch>`, `Option<NonZeroUsize>` which use four bytes
@@ -66,7 +66,7 @@ impl CommitteeCache {
     pub fn initialized(
         state: &BeaconState,
         epoch: Epoch,
-        //spec: &ChainSpec,
+        spec: &ChainSpec,
     ) -> eyre::Result<CommitteeCache> {
         // Check that the cache is being built for an in-range epoch.
         //
@@ -74,7 +74,7 @@ impl CommitteeCache {
         //
         // https://github.com/sigp/lighthouse/issues/3270
         let reqd_randao_epoch = epoch
-            .saturating_sub(min_seed_lookahead)
+            .saturating_sub(spec.min_seed_lookahead)
             .saturating_sub(1u64);
 
         //if reqd_randao_epoch < state.min_randao_epoch() || epoch > state.current_epoch() + 1 {
@@ -99,14 +99,14 @@ impl CommitteeCache {
         }
 
         let committees_per_slot =
-            get_committee_count_per_slot(active_validator_indices.len())? as u64;
+            get_committee_count_per_slot(active_validator_indices.len(), spec)? as u64;
 
         //let seed = state.get_seed(epoch, Domain::BeaconAttester)?;
         let seed = state.get_seed(epoch)?;
 
         let shuffling = shuffle_list(
             active_validator_indices,
-            shuffle_round_count,
+            spec.shuffle_round_count,
             &seed[..],
             false,
         )
@@ -440,12 +440,12 @@ impl Decode for NonZeroUsizeOption {
     /// Spec v0.12.1
     fn get_committee_count_per_slot(
         active_validator_count: usize,
-        //spec: &ChainSpec,
+        spec: &ChainSpec,
     ) -> eyre::Result<usize> {
         get_committee_count_per_slot_with(
             active_validator_count,
-            max_committees_per_slot,
-            target_committee_size,
+            spec.max_committees_per_slot,
+            spec.target_committee_size,
         )
     }
 

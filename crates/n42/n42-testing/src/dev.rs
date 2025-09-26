@@ -175,7 +175,8 @@ impl CliqueTest {
         let exec = tasks.executor();
 
         let network_config = NetworkArgs {
-            discovery: DiscoveryArgs { disable_discovery: true, ..DiscoveryArgs::default() },
+            discovery: DiscoveryArgs { disable_discovery: true, ..DiscoveryArgs::default()
+            },
             ..NetworkArgs::default()
         };
         let mut accounts = TesterAccountPool::new();

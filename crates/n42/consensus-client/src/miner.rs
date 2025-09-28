@@ -468,6 +468,10 @@ where
                 if deposits != new_beacon_block.body.deposits {
                     return Err(eyre::eyre!("deposits mismatch between eth1 block and beacon block"));
                 }
+                let request_hash = new_beacon_block.body.execution_requests.to_requests().requests_hash();
+                if Some(request_hash) != parent.requests_hash() {
+                    return Err(eyre::eyre!("requests_hash mismatch between beacon block and eth1 block, beacon requests_hash: {:?}, eth1 requests_hash: {:?}", Some(request_hash), parent.requests_hash()));
+                }
 
                 let (_, beacon_state_after_withdrawal) = self.beacon.gen_withdrawals(parent.parent_hash)?;
                 let new_beacon_state = self.beacon.state_transition(Some(beacon_state_after_withdrawal), &new_beacon_block)?;

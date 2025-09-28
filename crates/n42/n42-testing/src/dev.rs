@@ -219,7 +219,8 @@ impl CliqueTest {
 
        let snapshot = node.consensus.snapshot(best_number, block_hash, None).unwrap();
        println!("snapshot={snapshot:?}");
-       let expected_signers: Vec<Address> = self.results.iter().map(|a| accounts.address(a)).collect();
+       let expected_signers: Vec<Address> = self.results.iter()
+           .map(|a| accounts.address(a)).collect();
        assert_eq!(snapshot.signers, expected_signers);
 
        let first_event = payload_event_stream.next().await.unwrap()?;

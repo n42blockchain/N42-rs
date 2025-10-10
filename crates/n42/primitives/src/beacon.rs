@@ -1,4 +1,5 @@
 use hex::FromHex;
+use tree_hash::PackedEncoding;
 use tree_hash_derive::TreeHash;
 use tree_hash::TreeHash;
 use blst::min_pk::PublicKey;
@@ -8,7 +9,6 @@ use blst::min_pk::{AggregateSignature, Signature};
 use alloy_rpc_types_beacon::requests::ExecutionRequestsV4;
 use ssz_derive::{Encode, Decode};
 use ssz::{Encode, Decode};
-//use tree_hash_derive::TreeHash;
 use integer_sqrt::IntegerSquareRoot;
 use alloy_eips::{
     eip4895::{Withdrawal, Withdrawals}, eip7002::WithdrawalRequest, eip7685::Requests
@@ -220,7 +220,7 @@ pub type Gwei = u64;
 pub type BLSPubkey = FixedBytes<48>;
 pub type BLSSignature = FixedBytes<96>;
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode, TreeHash)]
 pub struct BeaconBlock {
     pub eth1_block_hash: BlockHash,
     pub parent_hash: BlockHash,
@@ -228,8 +228,20 @@ pub struct BeaconBlock {
     pub body: BeaconBlockBody,
 }
 
-impl Sealable for BeaconBlock {
-    fn hash_slow(&self) -> B256 {
+impl TreeHash for BeaconBlockBody {
+    fn tree_hash_type() -> tree_hash::TreeHashType {
+        tree_hash::TreeHashType::Container
+    }
+
+    fn tree_hash_packed_encoding(&self) -> PackedEncoding {
+        unreachable!("BeaconBlockBody should never be packed.")
+    }
+
+    fn tree_hash_packing_factor() -> usize {
+        unreachable!("BeaconBlockBody should never be packed.")
+    }
+
+    fn tree_hash_root(&self) -> Hash256 {
         let out = self.as_ssz_bytes();
         keccak256(&out)
     }

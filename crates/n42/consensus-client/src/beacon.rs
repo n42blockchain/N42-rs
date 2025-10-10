@@ -1,3 +1,5 @@
+use tree_hash_derive::TreeHash;
+use tree_hash::TreeHash;
 use reth_primitives_traits::AlloyBlockHeader;
 use blst::min_pk::{PublicKey, Signature};
 use alloy_rpc_types_beacon::requests::ExecutionRequestsV4;
@@ -84,7 +86,7 @@ where
         };
         let new_beacon_state = BeaconState::state_transition(&beacon_state, beacon_block)?;
         let beacon_block_with_root = BeaconBlock { state_root: new_beacon_state.hash_slow(), ..beacon_block.clone() };
-        let beacon_block_hash = beacon_block_with_root.hash_slow();
+        let beacon_block_hash = beacon_block_with_root.tree_hash_root();
         self.provider.save_beacon_state_by_hash(&beacon_block_hash, new_beacon_state.clone())?;
         debug!(target: "consensus-client", ?beacon_block_hash, ?new_beacon_state, "state_transition");
 
@@ -141,7 +143,7 @@ where
 
     fn get_beacon_state_from_block_hash(&self, block_hash: B256) -> eyre::Result<BeaconState> {
         let beacon_block = self.provider.get_beacon_block_by_eth1_hash(&block_hash)?.ok_or(eyre::eyre!("beacon block not found, block_hash={:?}", block_hash))?;
-        let beacon_block_hash = beacon_block.hash_slow();
+        let beacon_block_hash = beacon_block.tree_hash_root();
 
         let beacon_state = self.provider.get_beacon_state_by_hash(&beacon_block_hash)?.ok_or(eyre::eyre!("beacon state not found, beacon_block_hash={:?}", beacon_block_hash))?;
 

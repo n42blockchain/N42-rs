@@ -1,5 +1,7 @@
 //! Contains the implementation of the mining mode for the local engine.
 
+use tree_hash_derive::TreeHash;
+use tree_hash::TreeHash;
 use alloy_eips::{
     eip7685::Requests,
 };
@@ -461,7 +463,7 @@ where
                 //let new_beacon_block = fetch_beacon_block(parent.hash()).await?;
                 // TODO
                 let new_beacon_block: BeaconBlock = Default::default();
-                let new_beacon_block_hash = new_beacon_block.hash_slow();
+                let new_beacon_block_hash = new_beacon_block.tree_hash_root();
 
                 //let deposits = self.get_deposits(parent.number.saturating_sub(DEPOSIT_GAP))?;
                 let deposits: Vec<Deposit> = Default::default();
@@ -747,7 +749,7 @@ where
         let finalized_beacon_state = self.provider.get_beacon_state_by_hash(&finalized_beacon_block_hash)?
             .ok_or(eyre::eyre!("get_beacon_state_by_hash failed, hash={:?}", finalized_beacon_block_hash))?;
         let beacon_block = self.beacon.gen_beacon_block(Some(beacon_state_after_withdrawal), parent_beacon_block_hash, &deposits, &attestations.values().cloned().collect(), &voluntary_exits, &execution_requests, &block)?;
-        let beacon_block_hash = beacon_block.hash_slow();
+        let beacon_block_hash = beacon_block.tree_hash_root();
         self.provider.save_beacon_block_by_hash(&beacon_block_hash, beacon_block.clone())?;
 
         //
@@ -773,9 +775,9 @@ where
         let new_block_tx = self.new_block_tx.clone();
         let block_clone = block.clone();
         let block_hash = block.hash_slow();
-        self.provider.save_beacon_block_by_hash(&beacon_block.hash_slow(), beacon_block.clone())?;
+        self.provider.save_beacon_block_by_hash(&beacon_block.tree_hash_root(), beacon_block.clone())?;
         self.provider.save_beacon_block_by_eth1_hash(&block_hash, beacon_block.clone())?;
-        self.provider.save_beacon_block_hash_by_eth1_hash(&block_hash, beacon_block.hash_slow())?;
+        self.provider.save_beacon_block_hash_by_eth1_hash(&block_hash, beacon_block.tree_hash_root())?;
         tokio::spawn(async move {
             sleep(wiggle).await;
 

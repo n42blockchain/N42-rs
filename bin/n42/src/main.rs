@@ -6,6 +6,7 @@ static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::ne
 use std::{time::Duration};
 use alloy_signer_local::PrivateKeySigner;
 use consensus_client::miner::N42Miner;
+use consensus_client::migrate::N42Migrate;
 use n42_engine_primitives::N42PayloadAttributesBuilder;
 use clap::Parser;
 use n42::{args::RessArgs, cli::Cli, ress::install_ress_subprotocol};
@@ -57,7 +58,8 @@ fn main() {
                         })
                 .launch_with_debug_capabilities().await?;
 
-            let consensus_signer_private_key = node.config.clone().dev().dev.consensus_signer_private_key;
+            let node_config_dev = node.config.clone().dev();
+            let consensus_signer_private_key = node_config_dev.dev.consensus_signer_private_key;
             let signer_address = if let Some(signer_private_key) = &consensus_signer_private_key {
                 let eth_signer: PrivateKeySigner = signer_private_key.to_string().parse().unwrap();
                 Some(eth_signer.address())
@@ -66,24 +68,40 @@ fn main() {
             };
 
             let mining_mode = if let Some(_) = consensus_signer_private_key {
-                let block_time = node.config.clone().dev().dev.block_time.unwrap_or_else(|| Duration::from_secs(DEFAULT_BLOCK_TIME_SECS));
+                let block_time = node_config_dev.dev.block_time.unwrap_or_else(|| Duration::from_secs(DEFAULT_BLOCK_TIME_SECS));
                 consensus_client::miner::MiningMode::interval(block_time)
             } else {
                 consensus_client::miner::MiningMode::NoMining
             };
             info!(target: "reth::cli", ?mining_mode);
 
-            N42Miner::spawn_new(
+            if node_config_dev.dev.migrate_old_chain_data_from_db.is_some() || node_config_dev.dev.migrate_old_chain_data_from_rpc.is_some() {
+            let migrate_from_db_path =
+                node_config_dev.dev.migrate_old_chain_data_from_db.clone();
+            let migrate_from_db_rpc =
+                node_config_dev.dev.migrate_old_chain_data_from_rpc.clone();
+            N42Migrate::spawn_new(
                 node.provider.clone(),
                 N42PayloadAttributesBuilder::new_add_signer(node.chain_spec(), signer_address),
                 node.add_ons_handle.beacon_engine_handle.clone(),
-                mining_mode,
                 node.payload_builder_handle.clone(),
-                node.network.clone(),
-                node.consensus.clone(),
-                broadcast_tx_clone_for_miner,
-                verification_rx,
+                node.pool.clone(),
+                migrate_from_db_path,
+                migrate_from_db_rpc,
             );
+            } else {
+                N42Miner::spawn_new(
+                    node.provider.clone(),
+                    N42PayloadAttributesBuilder::new_add_signer(node.chain_spec(), signer_address),
+                    node.add_ons_handle.beacon_engine_handle.clone(),
+                    mining_mode,
+                    node.payload_builder_handle.clone(),
+                    node.network.clone(),
+                    node.consensus.clone(),
+                    broadcast_tx_clone_for_miner,
+                    verification_rx,
+                );
+            }
 
             // Install ress subprotocol.
             if ress_args.enabled {

@@ -30,6 +30,7 @@ reth-payload-validator.workspace = true
 reth-provider.workspace = true
 reth-prune.workspace = true
 reth-rpc-types-compat.workspace = true
+reth-rpc.workspace = true
 reth-transaction-pool.workspace = true
 reth-stages-api.workspace = true
 reth-network.workspace = true
@@ -42,6 +43,9 @@ reth-network-p2p.workspace = true
 reth-primitives-traits.workspace = true
 
 # alloy
+alloy-provider.workspace = true
+alloy-rpc-types.workspace = true
+alloy-serde.workspace = true
 alloy-primitives.workspace = true
 alloy-rpc-types-engine.workspace = true
 alloy-eips.workspace = true
@@ -54,6 +58,8 @@ futures-util.workspace = true
 
 # misc
 hex.workspace = true
+sled.workspace = true
+serde_json.workspace = true
 ethereum_ssz.workspace = true
 ethereum_ssz_derive.workspace = true
 arbitrary.workspace = true
@@ -62,7 +68,6 @@ thiserror.workspace = true
 alloy-rlp.workspace = true
 alloy-rpc-types-beacon.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 nix.workspace = true
 eyre.workspace = true
 tracing.workspace = true

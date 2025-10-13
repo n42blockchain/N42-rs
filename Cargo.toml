@@ -395,6 +395,7 @@ op-alloy-flz = { version = "0.13.0", default-features = false }
 
 # misc
 hex = "0.4"
+sled = "0.34"
 derivative = "2"
 ethereum_hashing = "0.7.0"
 integer-sqrt = "0.1.5"

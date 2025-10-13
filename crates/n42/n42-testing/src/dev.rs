@@ -102,7 +102,8 @@ async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(
     let payload_id = node.payload_builder_handle.send_new_payload(attributes.clone().into()).await.unwrap()?;
     println!("payload_id={payload_id}");
 
-    let payload_type = node.payload_builder_handle.resolve_kind(payload_id, PayloadKind::default()).await.unwrap()?;
+    let payload_type = node.payload_builder_handle.resolve_kind(payload_id,
+        PayloadKind::default()).await.unwrap()?;
     println!("payload_type={payload_type:?}");
     let extra_data = payload_type.block().header().extra_data().clone();
     println!("header={:?}", payload_type.block().header());

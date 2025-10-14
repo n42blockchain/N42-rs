@@ -6,7 +6,9 @@ use alloy_rpc_types::Transaction as RpcTransaction;
 use alloy_rpc_types_engine::{CancunPayloadFields, ExecutionPayloadSidecar, ForkchoiceState};
 use eyre::OptionExt;
 use n42_engine_primitives::PayloadAttributesBuilderExt;
+use n42_primitives::{RelativeEpoch, Attestation, BeaconState, BeaconBlock, Deposit, VoluntaryExitWithSig, parse_deposit_log, BLSPubkey, BlockVerifyResultAggregate, agg_sig_to_fixed, fixed_to_agg_sig, SLOTS_PER_EPOCH, CommitteeIndex, AttestationData};
 use reth_chainspec::EthereumHardforks;
+use reth_chainspec::EthChainSpec;
 use reth_engine_primitives::BeaconConsensusEngineHandle;
 use reth_engine_primitives::EngineTypes;
 use reth_payload_builder::{PayloadBuilderHandle, PayloadBuilderService};
@@ -23,6 +25,8 @@ use reth_transaction_pool::{TransactionOrigin, TransactionPool};
 use sled::{Db, IVec};
 use tokio::time::{interval_at, sleep, Instant, Interval};
 use tracing::{debug, error, info, warn};
+use crate::beacon::{Beacon};
+use alloy_primitives::{Sealable, BlockNumber, Bytes};
 
 pub struct N42Migrate<T: PayloadTypes, Provider, B, Pool: TransactionPool> {
     provider: Provider,
@@ -33,6 +37,7 @@ pub struct N42Migrate<T: PayloadTypes, Provider, B, Pool: TransactionPool> {
     /// The payload builder for the engine
     payload_builder: PayloadBuilderHandle<T>,
     pool: Pool,
+    beacon: Beacon<Provider>,
     migrate_from_db_path: Option<String>,
     migrage_from_rpc: Option<String>,
 }
@@ -63,12 +68,14 @@ where
         migrate_from_db_path: Option<String>,
         migrage_from_rpc: Option<String>,
     ) {
+        let beacon = Beacon::new(provider.clone());
         let migrate = Self {
             provider,
             payload_attributes_builder,
             beacon_engine_handle,
             payload_builder,
             pool,
+            beacon,
             migrate_from_db_path,
             migrage_from_rpc,
         };
@@ -88,6 +95,9 @@ where
     }
 
     async fn run_inner(mut self) -> eyre::Result<()> {
+        self.provider.save_beacon_block_hash_by_eth1_hash(&self.provider.chain_spec().genesis_hash(), self.provider.chain_spec().genesis_hash())?;
+        self.provider.save_beacon_state_by_hash(&self.provider.chain_spec().genesis_hash(), BeaconState::new())?;
+
         let db: Option<Db> = if self.migrate_from_db_path.is_some() {
             Some(sled::open(&self.migrate_from_db_path.clone().unwrap())?)
         } else {
@@ -149,6 +159,9 @@ where
             } else {
                 timestamp += 8;
             }
+
+            let (_, beacon_state_after_withdrawal) = self.beacon.gen_withdrawals(header.hash())?;
+
             debug!(target: "consensus-client", ?block, "block of input");
             let transactions = block.transactions.into_transactions();
             let mut txs = transactions
@@ -263,6 +276,24 @@ where
 
             let pool_size = self.pool.pool_size();
             debug!(target: "consensus-client", ?pool_size, "after final fcu");
+
+            let parent_beacon_block_hash = if block.number == 1 {
+                self.provider.chain_spec().genesis_hash()
+            } else {
+                //fetch_beacon_block(block.header().parent_hash).unwrap().hash_slow()
+                self.provider.get_beacon_block_hash_by_eth1_hash(&block.header().parent_hash)?
+                .ok_or(eyre::eyre!("get_beacon_block_hash_by_eth1_hash failed, hash={:?}", block.header().parent_hash))?
+            };
+            let deposits: Vec<Deposit> = Default::default();
+            let voluntary_exits: Vec<VoluntaryExitWithSig> = Default::default();
+            let beacon_block = self.beacon.gen_beacon_block(Some(beacon_state_after_withdrawal), parent_beacon_block_hash, &deposits, &Default::default(), &voluntary_exits, &Default::default(), &block)?;
+            let beacon_block_hash = beacon_block.hash_slow();
+            self.provider.save_beacon_block_by_hash(&beacon_block_hash, beacon_block.clone())?;
+
+            //
+            self.provider.save_beacon_block_by_eth1_hash(&block.hash(), beacon_block.clone())?;
+
+            self.provider.save_beacon_block_hash_by_eth1_hash(&block.hash(), beacon_block_hash)?;
         }
     }
 

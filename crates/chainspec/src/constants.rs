@@ -21,3 +21,9 @@ pub(crate) const N42_DEVNET_DEPOSIT_CONTRACT: DepositContract = DepositContract:
     0,
     b256!("0x649bbc62d0e31342afea4e5cd82d4049e7e1ee912fc0889aa790803be39038c5"),
 );
+
+pub(crate) const N42_TESTNET_DEPOSIT_CONTRACT: DepositContract = DepositContract::new(
+    address!("0x0dcAE65dDB5df8f1817D35286beAC32b8994962B"),
+    0,
+    b256!("0x649bbc62d0e31342afea4e5cd82d4049e7e1ee912fc0889aa790803be39038c5"),
+);

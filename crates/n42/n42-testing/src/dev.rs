@@ -206,7 +206,8 @@ impl CliqueTest {
        let mut payload_event_stream = payload_events.into_stream();
 
        for vote in &self.votes {
-           let eth_signer_key = hex::encode(accounts.secret_key(&vote.signer).secret_bytes());
+           let eth_signer_key =
+               hex::encode(accounts.secret_key(&vote.signer).secret_bytes());
            println!("signer={} eth_signer_key={eth_signer_key:?}", vote.signer);
            if let Some(ref voted) = vote.voted {
                if let Some(auth) = vote.auth {

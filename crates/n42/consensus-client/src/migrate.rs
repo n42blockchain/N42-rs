@@ -164,7 +164,7 @@ where
 
             debug!(target: "consensus-client", ?block, "block of input");
             let transactions = block.transactions.into_transactions();
-            let mut txs = transactions
+            let txs = transactions
                 .into_iter()
                 .map(|rpc_tx: RpcTransaction| {
                     debug!(target: "consensus-client", ?rpc_tx);
@@ -176,22 +176,6 @@ where
                     Pool::Transaction::from_pooled(recovered.try_into().unwrap())
                 })
                 .collect::<Vec<_>>();
-
-            if block.header.number == 1131832 {
-                let tx = {
-                    let raw_tx = "0xf86e01843b9aca07825208940baefc7ff20fe19f8f3e822148f371c179d65fac890ad78ebc5ac620000080820910a05614f3d927ba547f5cc0c07da583d073f163dcfa5e3c17123ed1e10edba6cdc6a04a60889f37290f34a6284cffae0b54a89327878640e03846c0caf30d8bb52b63";
-                    let raw_tx = raw_tx.strip_prefix("0x").unwrap();
-                    let raw_bytes = hex::decode(raw_tx).unwrap();
-                    let tx_signed: TransactionSigned =
-                        TransactionSigned::fallback_decode(&mut &raw_bytes[..]).unwrap();
-
-                    let pooled_transaction: PooledTransaction = tx_signed.try_into().unwrap();
-                    let recovered = pooled_transaction.try_into_recovered().unwrap();
-                    Pool::Transaction::from_pooled(recovered.into())
-                };
-
-                txs.push(tx);
-            }
 
             let num_input_txs = txs.len();
 

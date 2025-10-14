@@ -2,7 +2,10 @@ pub use alloy_eips::eip1559::BaseFeeParams;
 use alloy_evm::eth::spec::EthExecutorSpec;
 
 use crate::{
-    constants::{MAINNET_DEPOSIT_CONTRACT, MAINNET_PRUNE_DELETE_LIMIT, N42_DEVNET_DEPOSIT_CONTRACT},
+    constants::{MAINNET_DEPOSIT_CONTRACT, MAINNET_PRUNE_DELETE_LIMIT,
+        N42_DEVNET_DEPOSIT_CONTRACT,
+        N42_TESTNET_DEPOSIT_CONTRACT,
+    },
     EthChainSpec,
 };
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
@@ -127,7 +130,7 @@ fn make_chain_spec(genesis: Genesis, chain: Chain, deposit_contract: Option<Depo
 pub static N42: LazyLock<Arc<ChainSpec>> = LazyLock::new(|| {
     let genesis: Genesis = serde_json::from_str(include_str!("../res/genesis/n42.json")).expect("Can't deserialize N42 genesis json");
     let chain = Chain::from_id(N42_TESTNET_CHAINID);
-    make_chain_spec(genesis, chain, None /* TODO: set deposit contract address */).into()
+    make_chain_spec(genesis, chain, Some(N42_TESTNET_DEPOSIT_CONTRACT)).into()
 });
 
 /// The N42 devnet spec

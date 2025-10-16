@@ -67,7 +67,8 @@ pub struct CliqueTest {
 
 #[cfg(test)]
 fn get_addresses_from_extra_data(extra_data: Bytes) -> Vec<Address> {
-    let signers_count = (extra_data.len() - EXTRA_VANITY - SIGNATURE_LENGTH) / Address::len_bytes();
+    let signers_count = (extra_data.len() - EXTRA_VANITY
+        - SIGNATURE_LENGTH) / Address::len_bytes();
 
     let mut signers = Vec::with_capacity(signers_count);
 

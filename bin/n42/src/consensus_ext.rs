@@ -1,3 +1,4 @@
+use alloy_rpc_types::{BlockId, BlockNumberOrTag};
 use n42_clique::{BlockVerifyResult, UnverifiedBlock};
 use std::{collections::HashMap, sync::Arc};
 use reth_consensus::{ConsensusError, FullConsensus};
@@ -7,7 +8,7 @@ use jsonrpsee::{core::{RpcResult, SubscriptionResult}, proc_macros::rpc, types::
 use jsonrpsee::types::ErrorObjectOwned;
 use alloy_primitives::Address;
 use n42_primitives::{AttestationData, BLSPubkey, BeaconBlock, BeaconState, Snapshot};
-use reth_provider::{BeaconProvider, HeaderProvider};
+use reth_provider::{BeaconProvider, BlockIdReader, HeaderProvider};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{trace, debug, error, info, warn};
 
@@ -110,11 +111,24 @@ pub trait ConsensusBeaconExtApi {
         beacon_block_hash: B256,
         ) -> RpcResult<Option<BeaconBlock>>;
 
+    /// get_beacon_block_by_number
+    #[method(name = "get_beacon_block_by_number")]
+    fn get_beacon_block_by_number(&self,
+        block_id: BlockId,
+        ) -> RpcResult<Option<BeaconBlock>>;
+
     /// get_beacon_state_by_beacon_block_hash
     #[method(name = "get_beacon_state_by_beacon_block_hash")]
     fn get_beacon_state_by_beacon_block_hash(&self,
         beacon_block_hash: B256,
         ) -> RpcResult<Option<BeaconState>>;
+
+    /// get_beacon_state_by_number
+    #[method(name = "get_beacon_state_by_number")]
+    fn get_beacon_state_by_number(&self,
+        state_id: BlockId,
+        ) -> RpcResult<Option<BeaconState>>;
+
 }
 
 /// The type that implements the `consensusBeaconRpc` rpc namespace trait
@@ -129,7 +143,7 @@ impl<Cons, Provider> ConsensusBeaconExtApiServer for ConsensusBeaconExt<Cons, Pr
 where
     Cons:
         FullConsensus<EthPrimitives, Error = ConsensusError> + Clone + Unpin + 'static,
-    Provider: HeaderProvider + BeaconProvider + Clone + 'static,
+    Provider: HeaderProvider + BeaconProvider + BlockIdReader + Clone + 'static,
 {
     fn subscribe_to_verification_request(&self, pending: PendingSubscriptionSink, pubkey: BLSPubkey) -> SubscriptionResult {
         let mut rx = self.broadcast_tx.subscribe();
@@ -177,9 +191,49 @@ where
         self.provider.get_beacon_block_by_hash(&beacon_block_hash).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))
     }
 
+    fn get_beacon_block_by_number(&self,
+        block_id: BlockId,
+        ) -> RpcResult<Option<BeaconBlock>> {
+        let eth1_hash = match self.provider.block_hash_for_id(block_id).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))? {
+            Some(v) => v,
+            None => {
+                return Ok(None);
+            }
+        };
+
+        let beacon_block_hash = match self.provider.get_beacon_block_hash_by_eth1_hash(&eth1_hash).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))? {
+            Some(v) => v,
+            None => {
+                return Ok(None);
+            }
+        };
+
+        self.provider.get_beacon_block_by_hash(&beacon_block_hash).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))
+    }
+
     fn get_beacon_state_by_beacon_block_hash(&self,
         beacon_block_hash: B256,
         ) -> RpcResult<Option<BeaconState>> {
+        self.provider.get_beacon_state_by_hash(&beacon_block_hash).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))
+    }
+
+    fn get_beacon_state_by_number(&self,
+        block_id: BlockId,
+        ) -> RpcResult<Option<BeaconState>> {
+        let eth1_hash = match self.provider.block_hash_for_id(block_id).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))? {
+            Some(v) => v,
+            None => {
+                return Ok(None);
+            }
+        };
+
+        let beacon_block_hash = match self.provider.get_beacon_block_hash_by_eth1_hash(&eth1_hash).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))? {
+            Some(v) => v,
+            None => {
+                return Ok(None);
+            }
+        };
+
         self.provider.get_beacon_state_by_hash(&beacon_block_hash).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))
     }
 }

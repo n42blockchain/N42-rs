@@ -37,3 +37,23 @@
     "id":1
 }
 ```
+
+The block number in hexadecimal format or the string latest, safe or finalized
+```json
+{
+     "jsonrpc":"2.0",
+     "method":"consensusBeaconExt_get_beacon_state_by_number",
+     "params":["latest"],
+     "id":1
+}
+```
+
+The block number in hexadecimal format or the string latest, safe or finalized
+```json
+{
+     "jsonrpc":"2.0",
+     "method":"consensusBeaconExt_get_beacon_block_by_number",
+     "params":["0x11"],
+    "id":1
+}
+```

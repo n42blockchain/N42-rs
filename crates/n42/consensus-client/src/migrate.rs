@@ -136,22 +136,25 @@ where
             } else {
                 None
             };
-            if block.is_none() {
-                if rpc_provider.is_some() {
-                    match rpc_provider
-                        .as_ref()
-                        .unwrap()
-                        .get_block(block_number.into())
-                        .await?
-                    {
-                        Some(v) => block = Some(v),
-                        _ => {
-                            eyre::bail!("block {:?} not found, stop", block_number);
+            if rpc_provider.is_some() {
+                while block.is_none() {
+                        match rpc_provider
+                            .as_ref()
+                            .unwrap()
+                            .get_block(block_number.into())
+                            .await?
+                        {
+                            Some(v) => block = Some(v),
+                            _ => {
+                                //eyre::bail!("block {:?} not found, stop", block_number);
+                                debug!(target: "consensus-client", "block {:?} not found from rpc, try again", block_number);
+                                sleep(std::time::Duration::from_millis(500)).await;
+                            }
                         }
-                    }
-                } else {
-                    eyre::bail!("block {:?} not found, stop", block_number);
                 }
+            }
+            if block.is_none() {
+                eyre::bail!("block {:?} not found, stop", block_number);
             }
             let block = block.unwrap();
             if timestamp < block.header.timestamp {

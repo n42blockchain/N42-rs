@@ -27,8 +27,7 @@ use std::sync::Arc;
 use crate::committee_cache::CommitteeCache;
 use ethereum_hashing::hash;
 
-pub const SLOTS_PER_EPOCH: u64 = 5;
-const REWARD_AMOUNT: u64 = 1;
+pub const SLOTS_PER_EPOCH: u64 = 32;
 
 // EthSpec
 pub const max_withdrawals_per_payload: usize = 16;
@@ -91,7 +90,7 @@ pub fn beacon_chain_spec() -> ChainSpec {
         churn_limit_quotient: 32,
         effective_balance_increment: 1000000000,
         base_rewards_per_epoch: 1,
-        base_reward_factor: 2,
+        base_reward_factor: 1,
         min_epochs_to_inactivity_penalty: 4,
         inactivity_penalty_quotient: 67108864,
         proposer_reward_quotient: 4,
@@ -102,22 +101,15 @@ pub fn beacon_chain_spec() -> ChainSpec {
         shuffle_round_count: 10,
 
         inactivity_score_bias: 1,
-        inactivity_score_recovery_rate: 5,
-        max_inactivity_score: 15,
-        trigger_punish_inactivity_score: 15,
+        inactivity_score_recovery_rate: 48,
+        max_inactivity_score: 8100,
+        trigger_punish_inactivity_score: 2700,
         multiple_reward_for_inactivity_penalty: 3,
 
         min_validator_withdrawability_delay: 1,
     }
 }
 
-/*
-pub const inactivity_score_bias: u64 = 1;
-pub const inactivity_score_recovery_rate: u64 = 48;
-pub const max_inactivity_score: u64 = 51840;
-pub const trigger_punish_inactivity_score: u64 = 17280;
-pub const multiple_reward_for_inactivity_penalty: u64 = 3;
-*/
 /*
 pub const inactivity_score_bias: u64 = 1;
 pub const inactivity_score_recovery_rate: u64 = 5;
@@ -129,8 +121,6 @@ pub const min_validator_withdrawability_delay: u64 = 1;
 */
 
 pub const CACHED_EPOCHS: usize = 3;
-
-pub const DEPOSIT_AMOUNT: u64 = 32_000_000_000;
 
 // lighthouse: consensus/types/src/chain_spec.rs, get_deposit_domain()
 // genesis_fork_version: [0, 0, 0, 0]

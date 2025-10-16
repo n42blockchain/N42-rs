@@ -3,7 +3,7 @@ use ethers::{
 };
 use alloy_primitives::Address;
 use hex::FromHex;
-use n42_primitives::{DepositData, DEPOSIT_AMOUNT};
+use n42_primitives::{DepositData};
 use ssz_derive::{Decode, Encode};
 use tree_hash::Hash256;
 use tree_hash_derive::TreeHash;

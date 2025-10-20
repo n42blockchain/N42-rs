@@ -26,6 +26,14 @@ pub struct ValidatorRevert{
 }
 
 #[derive(Debug, Clone, Hash, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct ValidatorInfo {
+    pub activation_timestamp: u64,
+    pub exit_timestamp: u64,
+    pub balance_in_beacon: u64,
+    pub inactivity_score: u64,
+}
+
+#[derive(Debug, Clone, Hash, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct Validator {
     pub pubkey: BLSPubkey,
     pub withdrawal_credentials: B256,  // Commitment to pubkey for withdrawals

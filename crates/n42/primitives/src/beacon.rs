@@ -150,6 +150,10 @@ sol! {
 
 pub type Epoch = u64;
 
+pub fn epoch_to_block_number(epoch: Epoch) -> u64 {
+    epoch.saturating_mul(SLOTS_PER_EPOCH)
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct VoluntaryExit {
     pub epoch: Epoch,

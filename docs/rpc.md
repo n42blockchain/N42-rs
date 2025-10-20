@@ -57,3 +57,25 @@ The block number in hexadecimal format or the string latest, safe or finalized
     "id":1
 }
 ```
+
+params: [bls_pubkey_hex_str]
+{
+     "jsonrpc":"2.0",
+     "method":"consensusBeaconExt_get_beacon_validator_by_pubkey",
+     "params":
+["0x96f841a5e6a8f2ff7015f599fcde19961e31c3b7d32c417d256f14c044d54406152d7db65a1dbbbb2142a87c0214e2e9"],
+    "id":1
+}
+
+response:
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "activation_timestamp": 1760691561,
+    "exit_timestamp": 0,
+    "balance_in_beacon": 32000000000,
+    "inactivity_score": 0
+  }
+}
+This validator is activated at timestamp 1760691561 and has not exited; its balance in beacon is 32ETH; it is actively validating blocks.

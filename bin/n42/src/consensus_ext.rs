@@ -1,5 +1,6 @@
 use alloy_rpc_types::{BlockId, BlockNumberOrTag};
 use n42_clique::{BlockVerifyResult, UnverifiedBlock};
+use reth_node_core::primitives::AlloyBlockHeader;
 use std::{collections::HashMap, sync::Arc};
 use reth_consensus::{ConsensusError, FullConsensus};
 use reth_ethereum_primitives::{EthPrimitives};
@@ -7,8 +8,8 @@ use alloy_primitives::{Bytes, Sealable, B256};
 use jsonrpsee::{core::{RpcResult, SubscriptionResult}, proc_macros::rpc, types::{error::{INTERNAL_ERROR_CODE, INVALID_PARAMS_CODE}, ErrorObject, SubscriptionId}, PendingSubscriptionSink, SubscriptionMessage};
 use jsonrpsee::types::ErrorObjectOwned;
 use alloy_primitives::Address;
-use n42_primitives::{AttestationData, BLSPubkey, BeaconBlock, BeaconState, Snapshot};
-use reth_provider::{BeaconProvider, BlockIdReader, HeaderProvider};
+use n42_primitives::{epoch_to_block_number, AttestationData, BLSPubkey, BeaconBlock, BeaconState, Snapshot, ValidatorInfo};
+use reth_provider::{BeaconProvider, BlockIdReader, BlockReader, HeaderProvider};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{trace, debug, error, info, warn};
 
@@ -129,6 +130,12 @@ pub trait ConsensusBeaconExtApi {
         state_id: BlockId,
         ) -> RpcResult<Option<BeaconState>>;
 
+    /// get_beacon_validator_by_pubkey
+    #[method(name = "get_beacon_validator_by_pubkey")]
+    fn get_beacon_validator_by_pubkey(&self,
+        pubkey: BLSPubkey,
+        ) -> RpcResult<Option<ValidatorInfo>>;
+
 }
 
 /// The type that implements the `consensusBeaconRpc` rpc namespace trait
@@ -143,7 +150,7 @@ impl<Cons, Provider> ConsensusBeaconExtApiServer for ConsensusBeaconExt<Cons, Pr
 where
     Cons:
         FullConsensus<EthPrimitives, Error = ConsensusError> + Clone + Unpin + 'static,
-    Provider: HeaderProvider + BeaconProvider + BlockIdReader + Clone + 'static,
+    Provider: HeaderProvider + BeaconProvider + BlockIdReader + BlockReader + Clone + 'static,
 {
     fn subscribe_to_verification_request(&self, pending: PendingSubscriptionSink, pubkey: BLSPubkey) -> SubscriptionResult {
         let mut rx = self.broadcast_tx.subscribe();
@@ -236,6 +243,45 @@ where
 
         self.provider.get_beacon_state_by_hash(&beacon_block_hash).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))
     }
+
+    fn get_beacon_validator_by_pubkey(&self,
+        pubkey: BLSPubkey,
+        ) -> RpcResult<Option<ValidatorInfo>> {
+        let beacon_state = match self.get_beacon_state_by_number(BlockId::latest())? {
+            Some(v) => v,
+            None => {
+                return Ok(None);
+            }
+        };
+        let validator_index = match beacon_state.get_validator_index_from_pubkey(&pubkey) {
+            Some(v) => v,
+            None => {
+                return Ok(None);
+            }
+        };
+        let validator = beacon_state.get_validator(validator_index).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))?;
+        let balance_in_beacon = beacon_state.get_balance(validator_index).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))?;
+        let inactivity_score = beacon_state.get_inactivity_score(validator_index).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))?;
+        let activation_block_number = epoch_to_block_number(validator.activation_epoch);
+        let activation_timestamp = match self.provider.header_by_number(activation_block_number).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))? {
+            Some(v) => v.timestamp(),
+            None => 0,
+        };
+        let exit_block_number = epoch_to_block_number(validator.exit_epoch);
+        let exit_timestamp = match self.provider.header_by_number(exit_block_number).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))? {
+            Some(v) => v.timestamp(),
+            None => 0,
+        };
+
+        let validator_info = ValidatorInfo {
+            activation_timestamp,
+            exit_timestamp,
+            balance_in_beacon,
+            inactivity_score,
+        };
+        Ok(Some(validator_info))
+    }
+
 }
 
  mod tests {

@@ -163,6 +163,12 @@ where
                 timestamp += 8;
             }
 
+            let header = self
+                .provider
+                .sealed_header(self.provider.best_block_number().unwrap())
+                .unwrap()
+                .unwrap();
+
             let (_, beacon_state_after_withdrawal) = self.beacon.gen_withdrawals(header.hash())?;
 
             debug!(target: "consensus-client", ?block, "block of input");
@@ -193,11 +199,6 @@ where
             debug!(target: "consensus-client", ?pool_size, "add_external_transactions");
 
             debug!(target: "consensus-client", "before first fcu");
-            let header = self
-                .provider
-                .sealed_header(self.provider.best_block_number().unwrap())
-                .unwrap()
-                .unwrap();
             let forkchoice_state = ForkchoiceState {
                 head_block_hash: header.hash(),
                 safe_block_hash: header.hash(),

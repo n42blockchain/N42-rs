@@ -10,7 +10,8 @@ use reth_ethereum_forks::N42_HARDFORKS_FOR_CLIQUE_TEST;
 use reth_ethereum_engine_primitives::ExecutionPayloadEnvelopeV3;
 use reth_payload_primitives::{BuiltPayload, PayloadKind};
 use reth_consensus::Consensus;
-use reth_node_api::{FullNodeComponents, FullNodeTypes, PayloadTypes, EngineTypes};
+use reth_node_api::{
+    FullNodeComponents, FullNodeTypes, PayloadTypes, EngineTypes};
 use zerocopy::AsBytes;
 use reth_chainspec::{ChainSpec, N42};
 use reth_provider::{BlockHashReader, BlockReaderIdExt, BlockNumReader};

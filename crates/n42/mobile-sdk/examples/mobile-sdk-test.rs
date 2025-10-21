@@ -7,7 +7,9 @@ use mobile_sdk::blst_utils::generate_bls12_381_keypair;
 use std::{str::FromStr, sync::Arc};
 use clap::{Command, Parser, Subcommand};
 use hex::FromHex;
-use mobile_sdk::{deposit_exit::{self, create_deposit_unsigned_tx, create_get_exit_fee_unsigned_tx, create_exit_unsigned_tx}, run_client};
+use mobile_sdk::{deposit_exit::{self, create_deposit_unsigned_tx, create_get_exit_fee_unsigned_tx, create_exit_unsigned_tx,
+DEVNET_DEPOSIT_CONTRACT_ADDRESS,
+}, run_client};
 use blst::min_pk::SecretKey;
 use ::rand::RngCore;
 use tracing::{debug, info, Level};
@@ -58,6 +60,10 @@ enum Commands {
         /// Optional deposit_value_wei_in_hex [default: 32ETH if not supplied].
         #[arg(long, default_value = "0x1bc16d674ec800000")] // 32 ETH in wei in hex
         deposit_value_wei_in_hex: U256,
+
+        /// Optional deposit_contract_address [default: devnet deposit contract address].
+        #[arg(long, default_value_t = DEVNET_DEPOSIT_CONTRACT_ADDRESS.to_string())]
+        deposit_contract_address: String,
     },
     Exit {
         #[command(flatten)]
@@ -95,9 +101,10 @@ async fn main() -> eyre::Result<()> {
             withdrawal_address,
             deposit_private_key,
             deposit_value_wei_in_hex,
+            deposit_contract_address,
             common,
         }=> {
-            deposit(validator_private_key, withdrawal_address, deposit_private_key, deposit_value_wei_in_hex, common.rpc_url).await?;
+            deposit(deposit_contract_address, validator_private_key, withdrawal_address, deposit_private_key, deposit_value_wei_in_hex, common.rpc_url).await?;
         },
         Commands::Exit {
             withdrawal_private_key,
@@ -124,6 +131,7 @@ async fn main() -> eyre::Result<()> {
 }
 
 async fn deposit(
+    deposit_contract_address: String,
     validator_private_key: Option<String>,
     withdrawal_address: String,
     deposit_private_key: String,
@@ -146,7 +154,6 @@ async fn deposit(
         }
     };
 
-    let deposit_contract_address = deposit_exit::DEVNET_DEPOSIT_CONTRACT_ADDRESS.to_string();
     let unsigned_tx = create_deposit_unsigned_tx(deposit_contract_address.to_owned(), hex::encode(&sk.to_bytes()), withdrawal_address, deposit_value_wei_in_hex)?;
 
     let provider = Provider::<Http>::try_from(rpc_url)?;

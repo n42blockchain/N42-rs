@@ -19,7 +19,10 @@ use ethers::utils::keccak256;
 use ethers::utils::WEI_IN_ETHER;
 use tracing::debug;
 
-pub const DEVNET_DEPOSIT_CONTRACT_ADDRESS: &str = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
+pub use reth_chainspec::{
+    DEVNET_DEPOSIT_CONTRACT_ADDRESS,
+    TESTNET_DEPOSIT_CONTRACT_ADDRESS,
+};
 
 pub const EIP7002_CONTRACT_ADDRESS: &str = "0x00000961Ef480Eb55e80D19ad83579A64c007002";
 
@@ -155,7 +158,7 @@ mod tests {
 
     #[test]
     fn test_create_deposit_unsigned_tx_0x_prefix_hex_inputs_ok() {
-        let deposit_contract_address = "0x5FbDB2315678afecb367f032d93F642f64180aa3".to_string();
+        let deposit_contract_address = DEVNET_DEPOSIT_CONTRACT_ADDRESS.to_string();
         let validator_private_key = "0x6be6c38a5986be6c7094e92017af0d15da0af6857362e2ba0c2103c3eb893eec".to_string();
         let withdrawal_address = "0xa0Ee7A142d267C1f36714E4a8F75612F20a79720".to_string();
         let deposit_value_in_wei: U256 = "0x1bc16d674ec800000".parse::<U256>().unwrap();

@@ -146,7 +146,7 @@ async fn deposit(
         }
     };
 
-    let deposit_contract_address = deposit_exit::DEVNET_DEPOSIT_CONTRACT_ADDRESS;
+    let deposit_contract_address = deposit_exit::DEVNET_DEPOSIT_CONTRACT_ADDRESS.to_string();
     let unsigned_tx = create_deposit_unsigned_tx(deposit_contract_address.to_owned(), hex::encode(&sk.to_bytes()), withdrawal_address, deposit_value_wei_in_hex)?;
 
     let provider = Provider::<Http>::try_from(rpc_url)?;
@@ -158,7 +158,7 @@ async fn deposit(
     let client = SignerMiddleware::new(provider, wallet);
     let client = Arc::new(client);
 
-    let deposit_address = Address::from_str(deposit_contract_address)?;
+    let deposit_address = Address::from_str(&deposit_contract_address)?;
 
     let deposit_contract = DepositContract::new(deposit_address, client.clone());
 

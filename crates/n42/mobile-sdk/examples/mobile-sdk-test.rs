@@ -4,6 +4,8 @@ use ethers::{
 use ethers::middleware::SignerMiddleware;
 use ethers_signers::{LocalWallet, WalletError};
 use mobile_sdk::blst_utils::generate_bls12_381_keypair;
+use tokio::time::sleep;
+use std::time::Duration;
 use std::{str::FromStr, sync::Arc};
 use clap::{Command, Parser, Subcommand};
 use hex::FromHex;
@@ -257,6 +259,9 @@ async fn validate(
             let sk = SecretKey::key_gen(&ikm, &[]).unwrap();
             hex::encode(sk.to_bytes())
         });
-    run_client(&rpc_url, &validator_private_key).await?;
+    while let Err(e) = run_client(&rpc_url, &validator_private_key).await {
+        info!("run_client error: {e}, retrying...");
+        sleep(Duration::from_secs(5)).await;
+    }
     Ok(())
 }

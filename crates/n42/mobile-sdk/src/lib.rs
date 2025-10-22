@@ -10,7 +10,8 @@ use reth_provider::test_utils::MockEthProvider;
 use reth_revm::{database::StateProviderDatabase,db::State};
 use reth_chainspec::{ChainSpecBuilder,N42_DEVNET,EthereumHardfork,ForkCondition,ChainSpec};
 use reth_evm::ConfigureEvm;
-use std::sync::Arc;
+use tokio::time::timeout;
+use std::{sync::Arc, time::Duration};
 use jsonrpsee::core::client::{SubscriptionClientT, ClientT};
 use futures_util::StreamExt;
 use jsonrpsee::core::client::Subscription;
@@ -37,72 +38,76 @@ pub async fn run_client(
     let validator_private_key_vec = Vec::from_hex(&validator_private_key)?;
     let sk = SecretKey::from_bytes(&validator_private_key_vec)
         .map_err(|e| eyre::eyre!("SecretKey error: {e:?}"))?;
-
-    let ws_client = WsClientBuilder::default()
-        .build(ws_url)
-        .await?;
-
-    println!("Connected to {}", ws_url);
-
     let pk = sk.sk_to_pk();
-    let mut subscription: Subscription<UnverifiedBlock> = ws_client
-        .subscribe("consensusBeaconExt_subscribeToVerificationRequest", rpc_params![hex::encode(pk.to_bytes())],
-"")
-        .await?;
 
-    println!("Subscribed to 'subscribeToVerificationRequest'");
+    let message_timeout_secs = 300;
+    loop {
+        let ws_client = WsClientBuilder::default()
+            .build(ws_url)
+            .await?;
 
-    while let Some(msg) = subscription.next().await {
-        match msg {
-            Ok(block) => {
-                println!("Received block: {:?}", block);
+        println!("Connected to {}", ws_url);
 
-                if let Ok(receipts_root) = verify(block.clone()) {
-                    println!("receipts_root: {:?}", receipts_root);
+        let mut subscription: Subscription<UnverifiedBlock> = ws_client
+            .subscribe("consensusBeaconExt_subscribeToVerificationRequest", rpc_params![hex::encode(pk.to_bytes())],
+    "")
+            .await?;
 
-                    let attestation_data = AttestationData {
-                        slot: block.blockbody.header().number(),
-                        committee_index: block.committee_index,
-                        receipts_root,
-                    };
+        println!("Subscribed to 'subscribeToVerificationRequest'");
 
-                    let pk = sk.sk_to_pk();
+        while let Ok(Some(msg)) = timeout(Duration::from_secs(message_timeout_secs ), subscription.next()).await {
+            match msg {
+                Ok(block) => {
+                    println!("Received block: {:?}", block);
 
-                    let bytes: Vec<u8> = serde_json::to_vec(&attestation_data)?;
-                    let bytes_slice: &[u8] = &bytes;
+                    if let Ok(receipts_root) = verify(block.clone()) {
+                        println!("receipts_root: {:?}", receipts_root);
 
-                    let msg = bytes_slice;
-                    let sig = sk.sign(msg, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[]);
+                        let attestation_data = AttestationData {
+                            slot: block.blockbody.header().number(),
+                            committee_index: block.committee_index,
+                            receipts_root,
+                        };
 
-                    let err = sig.verify(true, msg, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[], &pk, true);
-                    println!("sig verify result: {:?}", err);
+                        let bytes: Vec<u8> = serde_json::to_vec(&attestation_data)?;
+                        let bytes_slice: &[u8] = &bytes;
 
-                    let mut header = block.blockbody.header().clone();
-                    header.receipts_root = receipts_root;
-                    let body = block.blockbody.body().clone();
-                    let sealed_block_recovered: SealedBlock<Block> = SealedBlock::from_parts_unhashed(header, body);
+                        let msg = bytes_slice;
+                        let sig = sk.sign(msg, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[]);
 
-                    let recovered_block_hash = SealedBlock::hash(&sealed_block_recovered);
-                    let params = rpc_params![hex::encode(pk.to_bytes()), hex::encode(sig.to_bytes()), attestation_data, hex::encode(recovered_block_hash.as_slice())];
-                    let result = ws_client
-                        .request("consensusBeaconExt_submitVerification", params)
-                        .await?;
-                    println!("request result: {:?}", result);
+                        let err = sig.verify(true, msg, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[], &pk, true);
+                        println!("sig verify result: {:?}", err);
 
-                } else {
-                    println!("verify failed");
-                    break;
+                        let mut header = block.blockbody.header().clone();
+                        header.receipts_root = receipts_root;
+                        let body = block.blockbody.body().clone();
+                        let sealed_block_recovered: SealedBlock<Block> = SealedBlock::from_parts_unhashed(header, body);
+
+                        let recovered_block_hash = SealedBlock::hash(&sealed_block_recovered);
+                        let params = rpc_params![hex::encode(pk.to_bytes()), hex::encode(sig.to_bytes()), attestation_data, hex::encode(recovered_block_hash.as_slice())];
+                        let result = ws_client
+                            .request("consensusBeaconExt_submitVerification", params)
+                            .await?;
+                        println!("request result: {:?}", result);
+
+                    } else {
+                        println!("verify failed");
+                        return Err(eyre::eyre!("verify failed: block number: {:?}", block.blockbody.number));
+                    }
+
                 }
-
-            }
-            Err(e) => {
-                eprintln!("Subscription error: {:?}", e);
-                return Err(e.into());
+                Err(e) => {
+                    eprintln!("Subscription error: {:?}", e);
+                    return Err(e.into());
+                }
             }
         }
+
+        eprintln!("No update in {message_timeout_secs:?} seconds — closing and reconnecting...");
+
+        tokio::time::sleep(Duration::from_secs(5)).await;
     }
 
-    println!("Subscription closed by server.");
     Ok(())
 }
 

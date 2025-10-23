@@ -110,7 +110,7 @@ Err(e) => { set_error(e); return ptr::null_mut(); } };
     let value = match val_str.parse::<U256>() { Ok(v) => v, Err(_) => {
 set_error("invalid deposit value".into()); return ptr::null_mut(); } };
 
-    match create_deposit_unsigned_tx(addr, pk, wd, value) {
+    match create_deposit_unsigned_tx(&addr, &pk, &wd, &value) {
         Ok(tx) => {
             let json_string = match serde_json::to_string(&tx) {
                 Ok(v) => v,
@@ -180,7 +180,7 @@ set_error("invalid fee".into()); U256::zero() })),
         }
     };
 
-    match create_exit_unsigned_tx(pubkey, fee_opt) {
+    match create_exit_unsigned_tx(&pubkey, &fee_opt) {
         Ok(tx) => {
             let json_string = match serde_json::to_string(&tx) {
                 Ok(v) => v,

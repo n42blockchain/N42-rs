@@ -106,21 +106,21 @@ async fn main() -> eyre::Result<()> {
             deposit_contract_address,
             common,
         }=> {
-            deposit(deposit_contract_address, validator_private_key, withdrawal_address, deposit_private_key, deposit_value_wei_in_hex, common.rpc_url).await?;
+            deposit(&deposit_contract_address, validator_private_key, &withdrawal_address, &deposit_private_key, &deposit_value_wei_in_hex, &common.rpc_url).await?;
         },
         Commands::Exit {
             withdrawal_private_key,
             common,
             validator_public_key,
         }=> {
-            exit(withdrawal_private_key, common.rpc_url, validator_public_key).await?;
+            exit(&withdrawal_private_key, &common.rpc_url, &validator_public_key).await?;
         },
         Commands::Validate {
             validator_private_key,
             ws_rpc_url,
             common,
         }=> {
-            validate(validator_private_key, ws_rpc_url).await?;
+            validate(validator_private_key, &ws_rpc_url).await?;
         },
         Commands::GenerateBLS12381Keypair {
         }=> {
@@ -133,12 +133,12 @@ async fn main() -> eyre::Result<()> {
 }
 
 async fn deposit(
-    deposit_contract_address: String,
+    deposit_contract_address: &str,
     validator_private_key: Option<String>,
-    withdrawal_address: String,
-    deposit_private_key: String,
-    deposit_value_wei_in_hex: U256,
-    rpc_url: String,
+    withdrawal_address: &str,
+    deposit_private_key: &str,
+    deposit_value_wei_in_hex: &U256,
+    rpc_url: &str,
     ) -> eyre::Result<()> {
     let sk = match validator_private_key {
         Some(validator_private_key) => {
@@ -156,7 +156,7 @@ async fn deposit(
         }
     };
 
-    let unsigned_tx = create_deposit_unsigned_tx(deposit_contract_address.to_owned(), hex::encode(&sk.to_bytes()), withdrawal_address, deposit_value_wei_in_hex)?;
+    let unsigned_tx = create_deposit_unsigned_tx(deposit_contract_address, &hex::encode(&sk.to_bytes()), withdrawal_address, deposit_value_wei_in_hex)?;
 
     let provider = Provider::<Http>::try_from(rpc_url)?;
     let chain_id = provider.get_chainid().await?.as_u64();
@@ -194,9 +194,9 @@ async fn deposit(
 }
 
 async fn exit(
-        withdrawal_private_key: String,
-        rpc_url: String,
-        validator_public_key: String,
+        withdrawal_private_key: &str,
+        rpc_url: &str,
+        validator_public_key: &str,
     ) -> eyre::Result<()> {
     let provider = Provider::<Http>::try_from(rpc_url)?;
     let chain_id = provider.get_chainid().await?.as_u64();
@@ -219,7 +219,7 @@ async fn exit(
 
     let fee = U256::from_big_endian(&raw.0);
 
-    let unsigned_tx = create_exit_unsigned_tx(validator_public_key, Some(fee))?;
+    let unsigned_tx = create_exit_unsigned_tx(validator_public_key, &Some(fee))?;
 
     let pending_tx =
         client
@@ -248,7 +248,7 @@ async fn exit(
 
 async fn validate(
     validator_private_key: Option<String>,
-    rpc_url: String,
+    rpc_url: &str,
     ) -> eyre::Result<()> {
     let validator_private_key = validator_private_key.unwrap_or_else(
         || {

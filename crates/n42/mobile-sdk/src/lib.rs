@@ -32,7 +32,7 @@ pub mod blst_utils;
 
 pub async fn run_client(
     ws_url: &str,
-    validator_private_key: &String,
+    validator_private_key: &str,
     ) -> eyre::Result<()> {
     let validator_private_key = validator_private_key.strip_prefix("0x").unwrap_or(validator_private_key);
     let validator_private_key_vec = Vec::from_hex(&validator_private_key)?;

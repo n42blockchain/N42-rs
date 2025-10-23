@@ -27,10 +27,10 @@ pub use reth_chainspec::{
 pub const EIP7002_CONTRACT_ADDRESS: &str = "0x00000961Ef480Eb55e80D19ad83579A64c007002";
 
 pub fn create_deposit_unsigned_tx(
-    deposit_contract_address: String,
-    validator_private_key: String,
-    withdrawal_address: String,
-    deposit_value_in_wei: U256,
+    deposit_contract_address: &str,
+    validator_private_key: &str,
+    withdrawal_address: &str,
+    deposit_value_in_wei: &U256,
     ) -> eyre::Result<TransactionRequest> {
 
     let addr_hex = withdrawal_address
@@ -43,7 +43,7 @@ pub fn create_deposit_unsigned_tx(
     }
     let addr = Address::from_slice(&addr_bytes);
 
-    let creds = withdrawal_credentials(addr);
+    let creds = withdrawal_credentials(&addr);
     debug!("withdrawal_credentials: 0x{}", hex::encode(&creds));
 
     let validator_private_key = validator_private_key.strip_prefix("0x").unwrap_or(&validator_private_key);
@@ -93,7 +93,7 @@ deposit_contract_address
     let tx = TransactionRequest {
         to: Some(NameOrAddress::Address(contract_address)),
         data: Some(calldata.into()),
-        value: Some(deposit_value_in_wei),
+        value: Some(deposit_value_in_wei.clone()),
         ..Default::default()
     };
 
@@ -102,7 +102,7 @@ deposit_contract_address
     Ok(tx)
 }
 
-fn withdrawal_credentials(withdrawal_address: alloy_primitives::Address) -> B256 {
+fn withdrawal_credentials(withdrawal_address: &alloy_primitives::Address) -> B256 {
     let mut credentials = [0u8; 32];
     credentials[0] = 0x01;
     credentials[12..].copy_from_slice(withdrawal_address.as_slice());
@@ -124,8 +124,8 @@ pub fn create_get_exit_fee_unsigned_tx() -> eyre::Result<TransactionRequest> {
 }
 
 pub fn create_exit_unsigned_tx(
-        validator_public_key: String,
-        fee: Option<U256>,
+        validator_public_key: &str,
+        fee: &Option<U256>,
     ) -> eyre::Result<TransactionRequest> {
     let contract_address: ethers::types::Address = EIP7002_CONTRACT_ADDRESS
         .parse()?;
@@ -159,51 +159,51 @@ mod tests {
     #[test]
     fn test_create_deposit_unsigned_tx_0x_prefix_hex_inputs_ok() {
         let deposit_contract_address = DEVNET_DEPOSIT_CONTRACT_ADDRESS.to_string();
-        let validator_private_key = "0x6be6c38a5986be6c7094e92017af0d15da0af6857362e2ba0c2103c3eb893eec".to_string();
-        let withdrawal_address = "0xa0Ee7A142d267C1f36714E4a8F75612F20a79720".to_string();
+        let validator_private_key = "0x6be6c38a5986be6c7094e92017af0d15da0af6857362e2ba0c2103c3eb893eec";
+        let withdrawal_address = "0xa0Ee7A142d267C1f36714E4a8F75612F20a79720";
         let deposit_value_in_wei: U256 = "0x1bc16d674ec800000".parse::<U256>().unwrap();
         let result = create_deposit_unsigned_tx(
-            deposit_contract_address,
+            &deposit_contract_address,
             validator_private_key,
             withdrawal_address,
-            deposit_value_in_wei,
+            &deposit_value_in_wei,
         );
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_create_exit_unsigned_tx_0x_prefix_hex_inputs_ok() {
-        let validator_public_key = "0x8a2470d8ccb2e43b3b5295cfee71508f8808e166e5f152d5af9fe022d95e300dc7c5814f2c9eb71e2da8412beb61c53a".to_string();
+        let validator_public_key = "0x8a2470d8ccb2e43b3b5295cfee71508f8808e166e5f152d5af9fe022d95e300dc7c5814f2c9eb71e2da8412beb61c53a";
         let exit_fee_in_wei: U256 = "0x1".parse::<U256>().unwrap();
         let result = create_exit_unsigned_tx(
             validator_public_key,
-            Some(exit_fee_in_wei),
+            &Some(exit_fee_in_wei),
         );
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_create_deposit_unsigned_tx_no_0x_prefix_hex_inputs_ok() {
-        let deposit_contract_address = "5FbDB2315678afecb367f032d93F642f64180aa3".to_string();
-        let validator_private_key = "6be6c38a5986be6c7094e92017af0d15da0af6857362e2ba0c2103c3eb893eec".to_string();
-        let withdrawal_address = "a0Ee7A142d267C1f36714E4a8F75612F20a79720".to_string();
+        let deposit_contract_address = "5FbDB2315678afecb367f032d93F642f64180aa3";
+        let validator_private_key = "6be6c38a5986be6c7094e92017af0d15da0af6857362e2ba0c2103c3eb893eec";
+        let withdrawal_address = "a0Ee7A142d267C1f36714E4a8F75612F20a79720";
         let deposit_value_in_wei: U256 = "1bc16d674ec800000".parse::<U256>().unwrap();
         let result = create_deposit_unsigned_tx(
             deposit_contract_address,
             validator_private_key,
             withdrawal_address,
-            deposit_value_in_wei,
+            &deposit_value_in_wei,
         );
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_create_exit_unsigned_tx_no_0x_prefix_hex_inputs_ok() {
-        let validator_public_key = "8a2470d8ccb2e43b3b5295cfee71508f8808e166e5f152d5af9fe022d95e300dc7c5814f2c9eb71e2da8412beb61c53a".to_string();
+        let validator_public_key = "8a2470d8ccb2e43b3b5295cfee71508f8808e166e5f152d5af9fe022d95e300dc7c5814f2c9eb71e2da8412beb61c53a";
         let exit_fee_in_wei: U256 = "1".parse::<U256>().unwrap();
         let result = create_exit_unsigned_tx(
             validator_public_key,
-            Some(exit_fee_in_wei),
+            &Some(exit_fee_in_wei),
         );
         assert!(result.is_ok());
     }
@@ -211,26 +211,26 @@ mod tests {
     #[test]
     fn test_create_deposit_invalid_inputs_no_panic() {
         let result = create_deposit_unsigned_tx(
-            "x".to_string(),
+            "x",
             Default::default(),
             Default::default(),
-            Default::default(),
+            &Default::default(),
         );
         assert!(result.is_err());
 
         let result = create_deposit_unsigned_tx(
             Default::default(),
-            "x".to_string(),
+            "x",
             Default::default(),
-            Default::default(),
+            &Default::default(),
         );
 
         assert!(result.is_err());
         let result = create_deposit_unsigned_tx(
             Default::default(),
             Default::default(),
-            "x".to_string(),
-            Default::default(),
+            "x",
+            &Default::default(),
         );
         assert!(result.is_err());
     }
@@ -238,8 +238,8 @@ mod tests {
     #[test]
     fn test_create_exit_unsigned_tx_invalid_inputs_no_panic() {
         let result = create_exit_unsigned_tx(
-            "x".to_string(),
-            Default::default(),
+            "x",
+            &Default::default(),
         );
         assert!(result.is_err());
     }

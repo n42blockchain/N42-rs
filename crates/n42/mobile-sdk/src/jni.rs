@@ -45,10 +45,10 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_createDepositUnsignedTx(
     };
 
     let transaction_request = match create_deposit_unsigned_tx(
-        deposit_contract_address,
-        validator_private_key,
-        withdrawal_address,
-        deposit_value_wei,
+        &deposit_contract_address,
+        &validator_private_key,
+        &withdrawal_address,
+        &deposit_value_wei,
     ) {
         Ok(v) => v,
         Err(e) => {
@@ -158,8 +158,8 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_createExitUnsignedTx(
     };
 
     let transaction_request = match create_exit_unsigned_tx(
-        validator_public_key,
-        fee
+        &validator_public_key,
+        &fee
     ) {
         Ok(v) => v,
         Err(e) => {

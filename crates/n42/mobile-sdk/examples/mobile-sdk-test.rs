@@ -5,6 +5,8 @@ use ethers::middleware::SignerMiddleware;
 use ethers_signers::{LocalWallet, WalletError};
 use mobile_sdk::blst_utils::generate_bls12_381_keypair;
 use serde::{Deserialize, Serialize};
+use tokio::fs;
+use tokio::io::{self, AsyncReadExt};
 use tokio::time::sleep;
 use std::time::Duration;
 use std::{str::FromStr, sync::Arc};
@@ -13,8 +15,8 @@ use hex::FromHex;
 use mobile_sdk::{deposit_exit::{self, create_deposit_unsigned_tx, create_get_exit_fee_unsigned_tx, create_exit_unsigned_tx,
 DEVNET_DEPOSIT_CONTRACT_ADDRESS,
 }, run_client};
-use blst::min_pk::{PublicKey, SecretKey};
-use ::rand::{RngCore};
+use blst::min_pk::SecretKey;
+use ::rand::RngCore;
 use tracing::{debug, info, Level};
 
 abigen!(
@@ -28,8 +30,10 @@ abigen!(
     "src/exit_contract.json",
 );
 
+const _32eth_hex_in_wei: &str = "0x1bc16d674ec800000";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct ValidatorCredentials {
+struct ValidatorCredential {
     validator_private_key: String,
     validator_public_key: String,
     withdrawal_private_key: String,
@@ -69,7 +73,7 @@ enum Commands {
         deposit_private_key: String,
 
         /// Optional deposit_value_wei_in_hex [default: 32ETH if not supplied].
-        #[arg(long, default_value = "0x1bc16d674ec800000")] // 32 ETH in wei in hex
+        #[arg(long, default_value = _32eth_hex_in_wei)] // 32 ETH in wei in hex
         deposit_value_wei_in_hex: U256,
 
         /// Optional deposit_contract_address [default: devnet deposit contract address].
@@ -101,6 +105,20 @@ enum Commands {
         #[arg(short, long)]
         number_of_validators: u64,
     },
+    DepositForValidators {
+        #[command(flatten)]
+        common: CommonArgs,
+
+        #[arg(short, long)]
+        deposit_private_key: String,
+
+        /// Optional deposit_contract_address [default: devnet deposit contract address].
+        #[arg(long, default_value_t = DEVNET_DEPOSIT_CONTRACT_ADDRESS.to_string())]
+        deposit_contract_address: String,
+
+        #[arg(short, long)]
+        validator_credentials_file: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -119,7 +137,7 @@ async fn main() -> eyre::Result<()> {
             deposit_contract_address,
             common,
         }=> {
-            deposit(&deposit_contract_address, validator_private_key, &withdrawal_address, &deposit_private_key, &deposit_value_wei_in_hex, &common.rpc_url).await?;
+            deposit(&deposit_contract_address, validator_private_key.as_deref(), &withdrawal_address, &deposit_private_key, &deposit_value_wei_in_hex, &common.rpc_url).await?;
         },
         Commands::Exit {
             withdrawal_private_key,
@@ -133,7 +151,7 @@ async fn main() -> eyre::Result<()> {
             ws_rpc_url,
             common,
         }=> {
-            validate(validator_private_key, &ws_rpc_url).await?;
+            validate(validator_private_key.as_deref(), &ws_rpc_url).await?;
         },
         Commands::GenerateBLS12381Keypair {
         }=> {
@@ -145,6 +163,23 @@ async fn main() -> eyre::Result<()> {
         } => {
             generate_credentials(number_of_validators)?;
         },
+        Commands::DepositForValidators {
+            deposit_private_key,
+            deposit_contract_address,
+            validator_credentials_file,
+            common,
+        }=> {
+            let validator_credentials_str = if let Some(file) = validator_credentials_file {
+                fs::read_to_string(file).await?
+            } else {
+                let mut buffer = String::new();
+                io::stdin().read_to_string(&mut buffer).await?;
+                buffer
+            };
+            let validator_credentials: Vec<ValidatorCredential> = serde_json::from_str(&validator_credentials_str)?;
+            println!("number of validators: {}", validator_credentials.len());
+            let _ = deposit_for_validators(&common.rpc_url, &deposit_contract_address, &deposit_private_key, &validator_credentials).await?;
+        },
     }
 
     Ok(())
@@ -152,7 +187,7 @@ async fn main() -> eyre::Result<()> {
 
 async fn deposit(
     deposit_contract_address: &str,
-    validator_private_key: Option<String>,
+    validator_private_key: Option<&str>,
     withdrawal_address: &str,
     deposit_private_key: &str,
     deposit_value_wei_in_hex: &U256,
@@ -274,7 +309,7 @@ fn generate_credentials(
 }
 
 fn generate_credential(
-    ) -> ValidatorCredentials {
+    ) -> ValidatorCredential {
     let mut rng = ::rand::thread_rng();
     let mut ikm = [0u8; 32];
     rng.fill_bytes(&mut ikm);
@@ -286,7 +321,7 @@ fn generate_credential(
     let withdrawal_private_key = hex::encode(wallet.signer().to_bytes());
     let withdrawal_address = hex::encode(wallet.address().to_fixed_bytes());
 
-    ValidatorCredentials {
+    ValidatorCredential {
         validator_private_key: hex::encode(validator_private_key.to_bytes()),
         validator_public_key,
         withdrawal_private_key,
@@ -294,19 +329,57 @@ fn generate_credential(
     }
 }
 
+async fn deposit_for_validators(
+    rpc_url: &str,
+    deposit_contract_address: &str,
+    deposit_private_key: &str,
+    validator_credentials: &[ValidatorCredential],
+    ) -> eyre::Result<u64> {
+    let mut num_successes = 0;
+    for validator_credential in validator_credentials {
+        let ValidatorCredential {
+            validator_private_key,
+            validator_public_key,
+            withdrawal_private_key,
+            withdrawal_address,
+        } = validator_credential;
+        match deposit(
+            deposit_contract_address,
+            Some(validator_private_key),
+            withdrawal_address,
+            deposit_private_key,
+            &_32eth_hex_in_wei.into(),
+            rpc_url,
+            ).await {
+            Ok(_) => {
+                num_successes += 1;
+                println!("deposited for {num_successes} validators");
+            }
+            Err(e) => {
+                info!("deposit_for_validators error: {e}");
+                break;
+            }
+        }
+    }
+
+    Ok(num_successes)
+}
+
 async fn validate(
-    validator_private_key: Option<String>,
+    validator_private_key: Option<&str>,
     rpc_url: &str,
     ) -> eyre::Result<()> {
-    let validator_private_key = validator_private_key.unwrap_or_else(
-        || {
+    let validator_private_key = match validator_private_key {
+        Some(v) => v.to_owned(),
+        None => {
             let mut rng = ::rand::thread_rng();
             let mut ikm = [0u8; 32];
             rng.fill_bytes(&mut ikm);
 
             let sk = SecretKey::key_gen(&ikm, &[]).unwrap();
             hex::encode(sk.to_bytes())
-        });
+        }
+    };
     while let Err(e) = run_client(&rpc_url, &validator_private_key).await {
         info!("run_client error: {e}, retrying...");
         sleep(Duration::from_secs(5)).await;

@@ -4,6 +4,7 @@ use ethers::{
 use ethers::middleware::SignerMiddleware;
 use ethers_signers::{LocalWallet, WalletError};
 use mobile_sdk::blst_utils::generate_bls12_381_keypair;
+use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 use std::time::Duration;
 use std::{str::FromStr, sync::Arc};
@@ -12,8 +13,8 @@ use hex::FromHex;
 use mobile_sdk::{deposit_exit::{self, create_deposit_unsigned_tx, create_get_exit_fee_unsigned_tx, create_exit_unsigned_tx,
 DEVNET_DEPOSIT_CONTRACT_ADDRESS,
 }, run_client};
-use blst::min_pk::SecretKey;
-use ::rand::RngCore;
+use blst::min_pk::{PublicKey, SecretKey};
+use ::rand::{RngCore};
 use tracing::{debug, info, Level};
 
 abigen!(
@@ -26,6 +27,14 @@ abigen!(
     ExitContract,
     "src/exit_contract.json",
 );
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ValidatorCredentials {
+    validator_private_key: String,
+    validator_public_key: String,
+    withdrawal_private_key: String,
+    withdrawal_address: String,
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -88,6 +97,10 @@ enum Commands {
     },
     GenerateBLS12381Keypair {
     },
+    GenerateCredentials {
+        #[arg(short, long)]
+        number_of_validators: u64,
+    },
 }
 
 #[tokio::main]
@@ -127,6 +140,11 @@ async fn main() -> eyre::Result<()> {
             let keypair = generate_bls12_381_keypair()?;
             println!("keypair: {keypair:?}");
         }
+        Commands::GenerateCredentials {
+            number_of_validators,
+        } => {
+            generate_credentials(number_of_validators)?;
+        },
     }
 
     Ok(())
@@ -244,6 +262,36 @@ async fn exit(
     debug!("exit transaction_receipt {transaction_receipt:?}");
 
     Ok(())
+}
+
+fn generate_credentials(
+        number_of_validators: u64,
+    ) -> eyre::Result<()> {
+    let validator_credentials = (0..number_of_validators).map(|_| generate_credential()).collect::<Vec<_>>();
+    let json = serde_json::to_string_pretty(&validator_credentials)?;
+    println!("{}", json);
+    Ok(())
+}
+
+fn generate_credential(
+    ) -> ValidatorCredentials {
+    let mut rng = ::rand::thread_rng();
+    let mut ikm = [0u8; 32];
+    rng.fill_bytes(&mut ikm);
+
+    let validator_private_key = SecretKey::key_gen(&ikm, &[]).unwrap();
+    let validator_public_key = hex::encode(validator_private_key.sk_to_pk().to_bytes());
+
+    let wallet = LocalWallet::new(&mut ethers::core::rand::thread_rng());
+    let withdrawal_private_key = hex::encode(wallet.signer().to_bytes());
+    let withdrawal_address = hex::encode(wallet.address().to_fixed_bytes());
+
+    ValidatorCredentials {
+        validator_private_key: hex::encode(validator_private_key.to_bytes()),
+        validator_public_key,
+        withdrawal_private_key,
+        withdrawal_address,
+    }
 }
 
 async fn validate(

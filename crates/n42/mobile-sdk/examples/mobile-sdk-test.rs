@@ -3,6 +3,7 @@ use ethers::{
 };
 use ethers::middleware::SignerMiddleware;
 use ethers_signers::{LocalWallet, WalletError};
+use futures_util::future::join_all;
 use mobile_sdk::blst_utils::generate_bls12_381_keypair;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
@@ -119,6 +120,16 @@ enum Commands {
         #[arg(short, long)]
         validator_credentials_file: Option<String>,
     },
+    ValidateForValidators {
+        #[command(flatten)]
+        common: CommonArgs,
+
+        #[arg(short, long)]
+        validator_credentials_file: Option<String>,
+
+        #[arg(short, long, default_value = "ws://127.0.0.1:8546")]
+        ws_rpc_url: String,
+    },
 }
 
 #[tokio::main]
@@ -179,6 +190,21 @@ async fn main() -> eyre::Result<()> {
             let validator_credentials: Vec<ValidatorCredential> = serde_json::from_str(&validator_credentials_str)?;
             println!("number of validators: {}", validator_credentials.len());
             let _ = deposit_for_validators(&common.rpc_url, &deposit_contract_address, &deposit_private_key, &validator_credentials).await?;
+        },
+        Commands::ValidateForValidators {
+            validator_credentials_file,
+            common,
+            ws_rpc_url,
+        }=> {
+            let validator_credentials_str = if let Some(file) = validator_credentials_file {
+                fs::read_to_string(file).await?
+            } else {
+                let mut buffer = String::new();
+                io::stdin().read_to_string(&mut buffer).await?;
+                buffer
+            };
+            let validator_credentials: Vec<ValidatorCredential> = serde_json::from_str(&validator_credentials_str)?;
+            validate_for_validators(&ws_rpc_url, &validator_credentials).await?;
         },
     }
 
@@ -384,5 +410,24 @@ async fn validate(
         info!("run_client error: {e}, retrying...");
         sleep(Duration::from_secs(5)).await;
     }
+    Ok(())
+}
+
+async fn validate_for_validators(
+    ws_rpc_url: &str,
+    validator_credentials: &[ValidatorCredential],
+    ) -> eyre::Result<()> {
+    let tasks = validator_credentials.iter().map(
+        move |validator_credential| {
+            let validator_private_key = &validator_credential.validator_private_key;
+            async move {
+                while let Err(e) = run_client(&ws_rpc_url, &validator_private_key).await {
+                    info!("run_client error: {e}, retrying...");
+                    sleep(Duration::from_secs(5)).await;
+                }
+            }
+        }
+    );
+    join_all(tasks).await;
     Ok(())
 }

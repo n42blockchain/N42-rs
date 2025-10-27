@@ -704,7 +704,10 @@ where
                 return Ok(())
             },
         };
-        let PendingBlockData { block, beacon_state_after_withdrawal, execution_requests, attestations } = pending_block_data;
+        let PendingBlockData { block, beacon_state_after_withdrawal, execution_requests, mut attestations } = pending_block_data;
+        attestations.retain(|_, attestation| {
+            attestation.block_aggregate_signature.is_some()
+        });
         let max_td = self.consensus.total_difficulty(block.hash());
         let num_signers = self.get_best_block_num_signers()?;
         let interval = match self.mode {

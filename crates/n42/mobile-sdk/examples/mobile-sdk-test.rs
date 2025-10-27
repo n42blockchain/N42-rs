@@ -130,6 +130,13 @@ enum Commands {
         #[arg(short, long, default_value = "ws://127.0.0.1:8546")]
         ws_rpc_url: String,
     },
+    ExitForValidators {
+        #[command(flatten)]
+        common: CommonArgs,
+
+        #[arg(short, long)]
+        validator_credentials_file: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -180,14 +187,7 @@ async fn main() -> eyre::Result<()> {
             validator_credentials_file,
             common,
         }=> {
-            let validator_credentials_str = if let Some(file) = validator_credentials_file {
-                fs::read_to_string(file).await?
-            } else {
-                let mut buffer = String::new();
-                io::stdin().read_to_string(&mut buffer).await?;
-                buffer
-            };
-            let validator_credentials: Vec<ValidatorCredential> = serde_json::from_str(&validator_credentials_str)?;
+            let validator_credentials = get_validator_credentials(validator_credentials_file).await?;
             println!("number of validators: {}", validator_credentials.len());
             let _ = deposit_for_validators(&common.rpc_url, &deposit_contract_address, &deposit_private_key, &validator_credentials).await?;
         },
@@ -196,15 +196,17 @@ async fn main() -> eyre::Result<()> {
             common,
             ws_rpc_url,
         }=> {
-            let validator_credentials_str = if let Some(file) = validator_credentials_file {
-                fs::read_to_string(file).await?
-            } else {
-                let mut buffer = String::new();
-                io::stdin().read_to_string(&mut buffer).await?;
-                buffer
-            };
-            let validator_credentials: Vec<ValidatorCredential> = serde_json::from_str(&validator_credentials_str)?;
+            let validator_credentials = get_validator_credentials(validator_credentials_file).await?;
+            println!("number of validators: {}", validator_credentials.len());
             validate_for_validators(&ws_rpc_url, &validator_credentials).await?;
+        },
+        Commands::ExitForValidators {
+            validator_credentials_file,
+            common,
+        }=> {
+            let validator_credentials = get_validator_credentials(validator_credentials_file).await?;
+            println!("number of validators: {}", validator_credentials.len());
+            let _ = exit_for_validators(&common.rpc_url, &validator_credentials).await?;
         },
     }
 
@@ -430,4 +432,48 @@ async fn validate_for_validators(
     );
     join_all(tasks).await;
     Ok(())
+}
+
+async fn exit_for_validators(
+    rpc_url: &str,
+    validator_credentials: &[ValidatorCredential],
+    ) -> eyre::Result<u64> {
+    let mut num_successes = 0;
+    for validator_credential in validator_credentials {
+        let ValidatorCredential {
+            validator_private_key,
+            validator_public_key,
+            withdrawal_private_key,
+            withdrawal_address,
+        } = validator_credential;
+        match exit(
+            withdrawal_private_key,
+            rpc_url,
+            validator_public_key,
+            ).await {
+            Ok(_) => {
+                num_successes += 1;
+                println!("exited for {num_successes} validators");
+            }
+            Err(e) => {
+                info!("exit_for_validators error: {e}");
+                break;
+            }
+        }
+    }
+
+    Ok(num_successes)
+}
+async fn get_validator_credentials(
+        validator_credentials_file: Option<String>,
+    ) -> eyre::Result<Vec<ValidatorCredential>> {
+    let validator_credentials_str = if let Some(file) = validator_credentials_file {
+        fs::read_to_string(file).await?
+    } else {
+        let mut buffer = String::new();
+        io::stdin().read_to_string(&mut buffer).await?;
+        buffer
+    };
+    let validator_credentials: Vec<ValidatorCredential> = serde_json::from_str(&validator_credentials_str)?;
+    Ok(validator_credentials)
 }

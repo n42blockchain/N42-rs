@@ -6,7 +6,7 @@ use alloy_eips::{eip1559::BaseFeeParams, eip7840::BlobParams};
 use alloy_genesis::Genesis;
 use alloy_primitives::{B256, U256};
 use core::fmt::{Debug, Display};
-use reth_ethereum_forks::EthereumHardforks;
+use reth_ethereum_forks::{EthereumHardforks, beijing_fork, Hardfork};
 use reth_network_peers::NodeRecord;
 
 /// Trait representing type configuring a chain spec.
@@ -65,6 +65,12 @@ pub trait EthChainSpec: Send + Sync + Unpin + Debug {
 
     /// Returns the final total difficulty if the Paris hardfork is known.
     fn final_paris_total_difficulty(&self) -> Option<U256>;
+
+    /// Returns `true` if n42 attestation is mandatory
+    fn is_n42_attestation_mandatory(&self, timestamp: u64) -> bool {
+        false
+    }
+
 }
 
 impl EthChainSpec for ChainSpec {
@@ -130,5 +136,9 @@ impl EthChainSpec for ChainSpec {
 
     fn final_paris_total_difficulty(&self) -> Option<U256> {
         self.paris_block_and_final_difficulty.map(|(_, final_difficulty)| final_difficulty)
+    }
+
+    fn is_n42_attestation_mandatory(&self, timestamp: u64) -> bool {
+        self.fork(beijing_fork).active_at_timestamp(timestamp)
     }
 }

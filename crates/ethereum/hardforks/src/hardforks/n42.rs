@@ -10,6 +10,17 @@ use std::sync::LazyLock;
 
 use crate::{ChainHardforks, EthereumHardfork, ForkCondition, Hardfork};
 
+#[derive(Debug, Clone, Default)]
+pub struct BeijingFork;
+
+pub const beijing_fork: BeijingFork = BeijingFork {};
+
+impl Hardfork for BeijingFork {
+    fn name(&self) -> &'static str {
+        "beijing"
+    }
+}
+
 /// N42 hardforks
 pub static N42_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
     ChainHardforks::new(vec![
@@ -25,7 +36,8 @@ pub static N42_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
         (EthereumHardfork::Berlin.boxed(), ForkCondition::Block(0)),
         (EthereumHardfork::London.boxed(), ForkCondition::Block(0)),
         (EthereumHardfork::ArrowGlacier.boxed(), ForkCondition::Block(0)),
-        //(EthereumHardfork::Beijing.boxed(), ForkCondition::Block(0)),
+        //(beijing_fork.boxed(), ForkCondition::Timestamp(1761621577)),
+        (beijing_fork.boxed(), ForkCondition::Never),
         (
             EthereumHardfork::Paris.boxed(),
             ForkCondition::TTD {

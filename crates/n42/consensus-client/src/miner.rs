@@ -708,6 +708,12 @@ where
         attestations.retain(|_, attestation| {
             attestation.block_aggregate_signature.is_some()
         });
+        if self.provider.chain_spec().is_n42_attestation_mandatory(block.timestamp) {
+            debug!(target: "consensus-client", "advance: checking if attestations is empty");
+            if attestations.is_empty() {
+                eyre::bail!("Error advancing the chain: no attestations");
+            }
+        }
         let max_td = self.consensus.total_difficulty(block.hash());
         let num_signers = self.get_best_block_num_signers()?;
         let interval = match self.mode {

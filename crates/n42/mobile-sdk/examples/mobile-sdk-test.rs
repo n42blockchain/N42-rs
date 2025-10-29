@@ -18,6 +18,7 @@ DEVNET_DEPOSIT_CONTRACT_ADDRESS,
 }, run_client};
 use blst::min_pk::SecretKey;
 use ::rand::RngCore;
+use tracing_subscriber::{fmt, EnvFilter};
 use tracing::{debug, info, Level};
 
 abigen!(
@@ -141,7 +142,13 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
-    tracing_subscriber::fmt::init();
+    // Default level = info, but can be overridden by RUST_LOG
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+
+    fmt()
+        .with_env_filter(filter)
+        .init();
 
     let args = Cli::parse();
     debug!("args {args:?}");

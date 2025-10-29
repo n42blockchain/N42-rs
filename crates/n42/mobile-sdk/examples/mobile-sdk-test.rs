@@ -237,10 +237,15 @@ async fn deposit(
         }
     };
 
-    let unsigned_tx = create_deposit_unsigned_tx(deposit_contract_address, &hex::encode(&sk.to_bytes()), withdrawal_address, deposit_value_wei_in_hex)?;
-
     let provider = Provider::<Http>::try_from(rpc_url)?;
     let chain_id = provider.get_chainid().await?.as_u64();
+
+    let code = provider.get_code(deposit_contract_address, None).await?;
+    if code.is_empty() {
+        return Err(eyre::eyre!("deposit contract is not deployed at {deposit_contract_address}"));
+    }
+
+    let unsigned_tx = create_deposit_unsigned_tx(deposit_contract_address, &hex::encode(&sk.to_bytes()), withdrawal_address, deposit_value_wei_in_hex)?;
 
     let wallet = LocalWallet::from_str(&deposit_private_key)?
         .with_chain_id(chain_id);
@@ -282,13 +287,18 @@ async fn exit(
     let provider = Provider::<Http>::try_from(rpc_url)?;
     let chain_id = provider.get_chainid().await?.as_u64();
 
+    let exit_contract_address = Address::from_str(deposit_exit::EIP7002_CONTRACT_ADDRESS)?;
+
+    let code = provider.get_code(exit_contract_address, None).await?;
+    if code.is_empty() {
+        return Err(eyre::eyre!("exit contract is not deployed at {exit_contract_address}"));
+    }
+
     let wallet = LocalWallet::from_str(&withdrawal_private_key)?
         .with_chain_id(chain_id);
 
     let client = SignerMiddleware::new(provider, wallet);
     let client = Arc::new(client);
-
-    let exit_contract_address = Address::from_str(deposit_exit::EIP7002_CONTRACT_ADDRESS)?;
 
     let unsigned_tx = create_get_exit_fee_unsigned_tx()?;
 

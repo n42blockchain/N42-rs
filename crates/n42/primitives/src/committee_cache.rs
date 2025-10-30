@@ -102,7 +102,7 @@ impl CommitteeCache {
             get_committee_count_per_slot(active_validator_indices.len(), spec)? as u64;
 
         //let seed = state.get_seed(epoch, Domain::BeaconAttester)?;
-        let seed = state.get_seed(epoch)?;
+        let seed = state.get_seed(epoch, DOMAIN_CONSTANT_BEACON_ATTESTER)?;
 
         let shuffling = shuffle_list(
             active_validator_indices,

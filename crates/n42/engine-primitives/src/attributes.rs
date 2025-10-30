@@ -52,7 +52,7 @@ where
 }
 
 pub trait PayloadAttributesBuilderExt<Attributes>: PayloadAttributesBuilder<Attributes> + Send + Sync + 'static {
-    fn build_ext(&self, timestamp: u64, withdrawals: Option<Vec<Withdrawal>>) -> Attributes;
+    fn build_ext(&self, timestamp: u64, withdrawals: Option<Vec<Withdrawal>>, prev_randao: B256) -> Attributes;
 }
 
 impl<ChainSpec> PayloadAttributesBuilderExt<EthPayloadAttributes>
@@ -60,9 +60,10 @@ impl<ChainSpec> PayloadAttributesBuilderExt<EthPayloadAttributes>
 where
     ChainSpec: Send + Sync + EthereumHardforks + 'static,
 {
-    fn build_ext(&self, timestamp: u64, withdrawals: Option<Vec<Withdrawal>>) -> EthPayloadAttributes {
+    fn build_ext(&self, timestamp: u64, withdrawals: Option<Vec<Withdrawal>>, prev_randao: B256) -> EthPayloadAttributes {
         let mut payload_attributes = self.build(timestamp);
         payload_attributes.withdrawals = withdrawals;
+        payload_attributes.prev_randao = prev_randao;
 
         payload_attributes
     }

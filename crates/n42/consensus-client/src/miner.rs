@@ -858,7 +858,7 @@ where
         debug!(target: "consensus-client", ?withdrawals, "prepare_block: PayloadAttributes withdrawals");
 
         let forkchoice_state = self.forkchoice_state()?;
-        let payload_attributes = self.payload_attributes_builder.build_ext(timestamp.as_secs(), withdrawals);
+        let payload_attributes = self.payload_attributes_builder.build_ext(timestamp.as_secs(), withdrawals, beacon_state_after_withdrawal.randao_mix);
         let res = self
             .beacon_engine_handle
             .fork_choice_updated(

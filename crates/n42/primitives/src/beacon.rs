@@ -29,6 +29,8 @@ use ethereum_hashing::hash;
 
 pub const SLOTS_PER_EPOCH: u64 = 32;
 
+pub const DOMAIN_CONSTANT_BEACON_ATTESTER: u32 = 1;
+
 // EthSpec
 pub const max_withdrawals_per_payload: usize = 16;
 pub const pending_partial_withdrawals_limit: usize = 16; // ?
@@ -181,6 +183,7 @@ pub struct BeaconState {
     pub validators: Vec<Validator>,
     pub balances: Vec<Gwei>,
     pub inactivity_scores: Vec<u64>,
+    pub randao_mix: B256,
 
     pub next_withdrawal_index: u64,
     pub next_withdrawal_validator_index: u64,
@@ -537,7 +540,25 @@ impl BeaconState {
     pub fn process_block(&mut self, beacon_block: &BeaconBlock,
         spec: &ChainSpec,
         ) -> eyre::Result<()> {
+        self.process_randao(&beacon_block.body, spec)?;
         self.process_operations(&beacon_block.body, spec)?;
+        Ok(())
+    }
+
+    pub fn process_randao(&mut self, beacon_block_body: &BeaconBlockBody,
+        spec: &ChainSpec,
+        ) -> eyre::Result<()> {
+        for attestation in &beacon_block_body.attestations {
+            self.verify_aggregate_signature(attestation)?;
+        }
+
+        let mut mix = self.randao_mix;
+        for attestation in &beacon_block_body.attestations {
+            mix = mix ^ keccak256(attestation.block_aggregate_signature.unwrap());
+        }
+
+        self.randao_mix = mix;
+
         Ok(())
     }
 
@@ -677,11 +698,11 @@ impl BeaconState {
         Ok(())
     }
 
-    fn verify_aggregate_signature(&self, attestation: &Attestation) -> eyre::Result<()> {
+    pub fn verify_aggregate_signature(&self, attestation: &Attestation) -> eyre::Result<()> {
         let sig = match attestation.block_aggregate_signature {
             Some(ref v) => v,
             None => {
-                return Ok(());
+                return Err(eyre::eyre!("aggregate signature is empty"));
             }
         };
         let sig = fixed_to_agg_sig(sig)?;
@@ -1563,8 +1584,23 @@ pub fn apply_deposit(
     pub fn get_seed(
         &self,
         epoch: Epoch,
+        domain_constant: u32,
     ) -> eyre::Result<Hash256> {
-        let mut preimage = epoch.to_le_bytes();
+        let mix = self.randao_mix;
+
+        let domain_bytes = domain_constant.to_le_bytes();
+        let epoch_bytes = epoch.to_le_bytes();
+
+        const NUM_DOMAIN_BYTES: usize = 4;
+        const NUM_EPOCH_BYTES: usize = 8;
+        const MIX_OFFSET: usize = NUM_DOMAIN_BYTES + NUM_EPOCH_BYTES;
+        const NUM_MIX_BYTES: usize = 32;
+
+        let mut preimage = [0; NUM_DOMAIN_BYTES + NUM_EPOCH_BYTES + NUM_MIX_BYTES];
+        preimage[0..NUM_DOMAIN_BYTES].copy_from_slice(&domain_bytes);
+        preimage[NUM_DOMAIN_BYTES..MIX_OFFSET].copy_from_slice(&epoch_bytes);
+        preimage[MIX_OFFSET..].copy_from_slice(mix.as_slice());
+
         Ok(Hash256::from_slice(&hash(&preimage)))
     }
 

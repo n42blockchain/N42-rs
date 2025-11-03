@@ -8,7 +8,7 @@ use alloy_primitives::{Bytes, Sealable, B256};
 use jsonrpsee::{core::{RpcResult, SubscriptionResult}, proc_macros::rpc, types::{error::{INTERNAL_ERROR_CODE, INVALID_PARAMS_CODE}, ErrorObject, SubscriptionId}, PendingSubscriptionSink, SubscriptionMessage};
 use jsonrpsee::types::ErrorObjectOwned;
 use alloy_primitives::Address;
-use n42_primitives::{epoch_to_block_number, AttestationData, BLSPubkey, BeaconBlock, BeaconState, Snapshot, ValidatorInfo};
+use n42_primitives::{beacon_chain_spec, epoch_to_block_number, AttestationData, BLSPubkey, BeaconBlock, BeaconState, Snapshot, ValidatorInfo};
 use reth_provider::{BeaconProvider, BlockIdReader, BlockReader, HeaderProvider};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{trace, debug, error, info, warn};
@@ -135,6 +135,11 @@ pub trait ConsensusBeaconExtApi {
     fn get_beacon_validator_by_pubkey(&self,
         pubkey: BLSPubkey,
         ) -> RpcResult<Option<ValidatorInfo>>;
+
+    /// get_total_effective_balance
+    #[method(name = "get_total_effective_balance")]
+    fn get_total_effective_balance(&self,
+        ) -> RpcResult<u64>;
 
 }
 
@@ -282,6 +287,19 @@ where
         Ok(Some(validator_info))
     }
 
+    fn get_total_effective_balance(&self,
+        ) -> RpcResult<u64> {
+        let beacon_state = match self.get_beacon_state_by_number(BlockId::latest())? {
+            Some(v) => v,
+            None => {
+                return Err(ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("beacon state not found"), None::<()>));
+            }
+        };
+        let spec = beacon_chain_spec();
+        let total_active_balance = beacon_state.get_total_active_balance(&spec).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))?;
+
+        Ok(total_active_balance)
+    }
 }
 
  mod tests {

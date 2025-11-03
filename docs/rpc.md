@@ -79,3 +79,12 @@ response:
   }
 }
 This validator is activated at timestamp 1760691561 and has not exited; its balance in beacon is 32ETH; it is actively validating blocks.
+
+```json
+{
+    "jsonrpc":"2.0",
+    "method":"consensusBeaconExt_get_total_effective_balance",
+    "params":[],
+    "id":1
+}
+```

@@ -61,6 +61,7 @@ where
         );
 
         let mut beacon_block = BeaconBlock {
+            slot: old_beacon_state.slot + 1,
             parent_hash,
             eth1_block_hash: eth1_sealed_block.hash_slow(),
             body: BeaconBlockBody {

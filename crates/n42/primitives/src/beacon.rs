@@ -219,6 +219,7 @@ pub type BLSSignature = FixedBytes<96>;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct BeaconBlock {
+    pub slot: Slot,
     pub eth1_block_hash: BlockHash,
     pub parent_hash: BlockHash,
     pub state_root: B256,

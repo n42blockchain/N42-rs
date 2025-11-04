@@ -755,7 +755,7 @@ where
             .ok_or(eyre::eyre!("get_beacon_block_hash_by_eth1_hash failed, hash={:?}", finalized_block_hash))?;
         let finalized_beacon_state = self.provider.get_beacon_state_by_hash(&finalized_beacon_block_hash)?
             .ok_or(eyre::eyre!("get_beacon_state_by_hash failed, hash={:?}", finalized_beacon_block_hash))?;
-        let beacon_block = self.beacon.gen_beacon_block(Some(beacon_state_after_withdrawal), parent_beacon_block_hash, &deposits, &attestations.values().cloned().collect(), &voluntary_exits, &execution_requests, &block)?;
+        let beacon_block = self.beacon.gen_beacon_block(beacon_state_after_withdrawal, parent_beacon_block_hash, &deposits, &attestations.values().cloned().collect(), &voluntary_exits, &execution_requests, &block)?;
         let beacon_block_hash = beacon_block.hash_slow();
         self.provider.save_beacon_block_by_hash(&beacon_block_hash, beacon_block.clone())?;
 

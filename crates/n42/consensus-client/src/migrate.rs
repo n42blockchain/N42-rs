@@ -270,7 +270,7 @@ where
             };
             let deposits: Vec<Deposit> = Default::default();
             let voluntary_exits: Vec<VoluntaryExitWithSig> = Default::default();
-            let beacon_block = self.beacon.gen_beacon_block(Some(beacon_state_after_withdrawal), parent_beacon_block_hash, &deposits, &Default::default(), &voluntary_exits, &Default::default(), &block)?;
+            let beacon_block = self.beacon.gen_beacon_block(beacon_state_after_withdrawal, parent_beacon_block_hash, &deposits, &Default::default(), &voluntary_exits, &Default::default(), &block)?;
             let beacon_block_hash = beacon_block.hash_slow();
             self.provider.save_beacon_block_by_hash(&beacon_block_hash, beacon_block.clone())?;
 

@@ -266,6 +266,7 @@ where
         };
         let validator = beacon_state.get_validator(validator_index).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))?;
         let balance_in_beacon = beacon_state.get_balance(validator_index).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))?;
+        let effective_balance = beacon_state.get_effective_balance(validator_index).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))?;
         let inactivity_score = beacon_state.get_inactivity_score(validator_index).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))?;
         let activation_block_number = epoch_to_block_number(validator.activation_epoch);
         let activation_timestamp = match self.provider.header_by_number(activation_block_number).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))? {
@@ -282,6 +283,7 @@ where
             activation_timestamp,
             exit_timestamp,
             balance_in_beacon,
+            effective_balance,
             inactivity_score,
         };
         Ok(Some(validator_info))

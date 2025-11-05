@@ -30,6 +30,7 @@ pub struct ValidatorInfo {
     pub activation_timestamp: u64,
     pub exit_timestamp: u64,
     pub balance_in_beacon: u64,
+    pub effective_balance: u64,
     pub inactivity_score: u64,
 }
 

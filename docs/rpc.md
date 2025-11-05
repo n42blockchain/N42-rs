@@ -75,10 +75,11 @@ response:
     "activation_timestamp": 1760691561,
     "exit_timestamp": 0,
     "balance_in_beacon": 32000000000,
+    "effective_balance": 32000000000,
     "inactivity_score": 0
   }
 }
-This validator is activated at timestamp 1760691561 and has not exited; its balance in beacon is 32ETH; it is actively validating blocks.
+This validator is activated at timestamp 1760691561 and has not exited; its balance in beacon is 32ETH, its effective balance in beacon is 32ETH; it is actively validating blocks.
 
 ```json
 {

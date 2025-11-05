@@ -21,7 +21,8 @@ use reth_payload_primitives::{
 use reth_consensus::Consensus;
 use reth_node_api::{
     FullNodeComponents,
-    FullNodeTypes, PayloadTypes, EngineTypes};
+    FullNodeTypes,
+    PayloadTypes, EngineTypes};
 use zerocopy::AsBytes;
 use reth_chainspec::{ChainSpec, N42};
 use reth_provider::{BlockHashReader, BlockReaderIdExt, BlockNumReader};

@@ -40,7 +40,7 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_createDepositUnsignedTx(
         Err(e) => {
             env.throw_new("java/lang/Exception", e.to_string())
                                 .expect("Failed to throw exception");
-            return Default::default();
+            return std::ptr::null_mut();
         }
     };
 
@@ -54,7 +54,7 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_createDepositUnsignedTx(
         Err(e) => {
             env.throw_new("java/lang/Exception", e.to_string())
                                 .expect("Failed to throw exception");
-            return Default::default();
+            return std::ptr::null_mut();
         }
     };
 
@@ -63,7 +63,7 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_createDepositUnsignedTx(
         Err(e) => {
             env.throw_new("java/lang/Exception", e.to_string())
                                 .expect("Failed to throw exception");
-            return Default::default();
+            return std::ptr::null_mut();
         }
     };
 
@@ -82,7 +82,7 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_generateBls12381Keypair(
         Err(e) => {
             env.throw_new("java/lang/Exception", e.to_string())
                                 .expect("Failed to throw exception");
-            return Default::default();
+            return std::ptr::null_mut();
         }
     };
 
@@ -91,7 +91,7 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_generateBls12381Keypair(
         Err(e) => {
             env.throw_new("java/lang/Exception", e.to_string())
                                 .expect("Failed to throw exception");
-            return Default::default();
+            return std::ptr::null_mut();
         }
     };
 
@@ -110,7 +110,7 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_createGetExitFeeUnsignedTx(
         Err(e) => {
             env.throw_new("java/lang/Exception", e.to_string())
                                 .expect("Failed to throw exception");
-            return Default::default();
+            return std::ptr::null_mut();
         }
     };
 
@@ -119,7 +119,7 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_createGetExitFeeUnsignedTx(
         Err(e) => {
             env.throw_new("java/lang/Exception", e.to_string())
                                 .expect("Failed to throw exception");
-            return Default::default();
+            return std::ptr::null_mut();
         }
     };
 
@@ -148,7 +148,7 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_createExitUnsignedTx(
             Err(e) => {
                 env.throw_new("java/lang/Exception", e.to_string())
                                     .expect("Failed to throw exception");
-                return Default::default();
+                return std::ptr::null_mut();
             }
         };
 
@@ -165,7 +165,7 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_createExitUnsignedTx(
         Err(e) => {
             env.throw_new("java/lang/Exception", e.to_string())
                                 .expect("Failed to throw exception");
-            return Default::default();
+            return std::ptr::null_mut();
         }
     };
 
@@ -174,7 +174,7 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_createExitUnsignedTx(
         Err(e) => {
             env.throw_new("java/lang/Exception", e.to_string())
                                 .expect("Failed to throw exception");
-            return Default::default();
+            return std::ptr::null_mut();
         }
     };
 

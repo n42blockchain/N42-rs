@@ -21,4 +21,5 @@ jobs:
           components: clippy
       - name: Run Clippy
         #run: cargo clippy --workspace --all-targets -- -D warnings
-        run: cargo clippy --workspace --lib --bins --all-features
+        #run: cargo clippy --workspace --lib --bins --all-features
+        run: cargo clippy --workspace --lib --bins --examples

@@ -49,7 +49,7 @@ jobs:
       run: cargo build --release
     - name: Compress artifacts (tar.xz)
       run: |
-        tar -cJf ${{ github.ref_name }}.tar.xz target/release/
+        tar -cJf ${{ github.ref_name }}.tar.xz target/release/n42
     - name: Upload binary via SCP
       uses: appleboy/scp-action@v0.1.5
       with:

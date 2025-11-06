@@ -41,6 +41,9 @@ jobs:
       uses: Swatinem/rust-cache@v2
     - name: Build release binary
       run: cargo build --release
+    - name: Compress artifacts (tar.xz)
+      run: |
+        tar -cJf ${{ github.ref_name }}.tar.xz target/release/
     - name: Upload binary via SCP
       uses: appleboy/scp-action@v0.1.5
       with:
@@ -48,7 +51,7 @@ jobs:
         username: ${{ secrets.SERVER_USER }}
         key: ${{ secrets.SERVER_SSH_KEY }}
         port: 22
-        source: "target/release/n42"
+        source: ${{ github.ref_name }}.tar.xz
         target: "n42-releases/${{ github.ref_name }}/"
     - name: Create GitHub Release
       uses: softprops/action-gh-release@v2
@@ -56,6 +59,6 @@ jobs:
         name: ${{ github.ref_name }}
         tag_name: ${{ github.ref_name }}
         files: |
-          target/release/n42
+          ${{ github.ref_name }}.tar.xz
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

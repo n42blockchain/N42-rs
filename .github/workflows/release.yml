@@ -3,7 +3,7 @@ name: Release on Tag
 on:
   push:
     tags:
-      - "v*.*.*"  # triggers only for tags like v1.2.3
+      - "n42-v*.*.*"
 
 env:
   CARGO_TERM_COLOR: always

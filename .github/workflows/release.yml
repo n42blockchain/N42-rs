@@ -22,9 +22,9 @@ jobs:
         toolchain: stable
     - name: Cache dependencies
       uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "rust-build-cache"
-          cache-targets: true
+      with:
+        shared-key: "rust-build-cache"
+        cache-targets: true
     - name: Run cargo check
       run: cargo check --verbose
     - name: Run tests
@@ -42,9 +42,9 @@ jobs:
         toolchain: stable
     - name: Cache dependencies
       uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "rust-build-cache"
-          cache-targets: true
+      with:
+        shared-key: "rust-build-cache"
+        cache-targets: true
     - name: Build release binary
       run: cargo build --release
     - name: Compress artifacts (tar.xz)

@@ -8,6 +8,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: write  # required for creating releases
+
 jobs:
   test:
     runs-on: ubuntu-latest

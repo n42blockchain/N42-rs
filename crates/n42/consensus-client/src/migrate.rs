@@ -141,7 +141,7 @@ where
                         match rpc_provider
                             .as_ref()
                             .unwrap()
-                            .get_block(block_number.into())
+                            .get_block(block_number.into()).full()
                             .await?
                         {
                             Some(v) => block = Some(v),

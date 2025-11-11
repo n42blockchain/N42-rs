@@ -28,8 +28,10 @@ jobs:
         shared-key: "rust-build-cache"
         cache-targets: true
 
-    - name: Install cbindgen
-      run: cargo install cbindgen
+    - name: Install tools
+      run: |
+        cargo install cargo-lipo
+        cargo install cbindgen
 
     - name: Run build_xcframework.sh
       working-directory: crates/n42/mobile-sdk/ios/

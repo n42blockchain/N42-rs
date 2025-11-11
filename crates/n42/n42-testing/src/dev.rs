@@ -23,7 +23,8 @@ use reth_node_api::{
     FullNodeComponents,
     FullNodeTypes,
     PayloadTypes,
-    EngineTypes};
+    EngineTypes
+};
 use zerocopy::AsBytes;
 use reth_chainspec::{ChainSpec, N42};
 use reth_provider::{BlockHashReader, BlockReaderIdExt, BlockNumReader};

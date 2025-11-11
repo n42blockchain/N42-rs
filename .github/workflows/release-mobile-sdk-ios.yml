@@ -37,17 +37,20 @@ jobs:
       working-directory: crates/n42/mobile-sdk/ios/
       run: ./build_xcframework.sh
 
-    - name: Upload binary via SCP
-      uses: appleboy/scp-action@v0.1.5
+    - name: Start ssh-agent
+      uses: webfactory/ssh-agent@v0.8.0
       with:
-        host: ${{ secrets.SERVER_HOST }}
-        username: ${{ secrets.SERVER_USER }}
-        key: ${{ secrets.SERVER_SSH_KEY }}
-        port: 22
-        source: |
-          crates/n42/mobile-sdk/ios/mobile-sdk-ios.tar.gz
-          crates/n42/mobile-sdk/ios/mobile-sdk-sim-x86_64-apple-ios.tar.gz
-        target: "mobile-sdk-releases/${{ github.ref_name }}/"
+        ssh-private-key: ${{ secrets.SERVER_SSH_KEY }}
+
+    - name: Add server to known_hosts
+      run: ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts
+
+    - name: Upload to server
+      run: |
+        scp \
+          crates/n42/mobile-sdk/ios/mobile-sdk-ios.tar.gz \
+          crates/n42/mobile-sdk/ios/mobile-sdk-sim-x86_64-apple-ios.tar.gz \
+          ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:mobile-sdk-releases/${{ github.ref_name }}/
 
     - name: Create GitHub Release
       uses: softprops/action-gh-release@v2

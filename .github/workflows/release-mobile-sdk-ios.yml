@@ -1,0 +1,56 @@
+name: Build mobile-sdk ios xcframework
+
+on:
+  push:
+    tags:
+      - "mobile-sdk-v*.*.*"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write  # required for creating releases
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: stable
+    - name: Cache dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: "rust-build-cache"
+        cache-targets: true
+
+    - name: Run build_xcframework.sh
+      working-directory: crates/n42/mobile-sdk/ios/
+      run: ./build_xcframework.sh
+
+    - name: Upload binary via SCP
+      uses: appleboy/scp-action@v0.1.5
+      with:
+        host: ${{ secrets.SERVER_HOST }}
+        username: ${{ secrets.SERVER_USER }}
+        key: ${{ secrets.SERVER_SSH_KEY }}
+        port: 22
+        source: |
+          crates/n42/mobile-sdk/ios/mobile-sdk-ios.tar.gz
+          crates/n42/mobile-sdk/ios/mobile-sdk-sim-x86_64-apple-ios.tar.gz
+        target: "mobile-sdk-releases/${{ github.ref_name }}/"
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        name: ${{ github.ref_name }}
+        tag_name: ${{ github.ref_name }}
+        files: |
+          crates/n42/mobile-sdk/ios/mobile-sdk-ios.tar.gz
+          crates/n42/mobile-sdk/ios/mobile-sdk-sim-x86_64-apple-ios.tar.gz
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

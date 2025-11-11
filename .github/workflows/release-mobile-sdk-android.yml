@@ -6,6 +6,12 @@ on:
       - "mobile-sdk-v*.*.*"
   workflow_dispatch:
 
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write  # required for creating releases
+
 jobs:
   build-android:
     runs-on: ubuntu-latest
@@ -61,6 +67,16 @@ jobs:
     - name: Run build-aar.sh
       working-directory: crates/n42/mobile-sdk
       run: ./build-aar.sh
+
+    - name: Upload binary via SCP
+      uses: appleboy/scp-action@v0.1.5
+      with:
+        host: ${{ secrets.SERVER_HOST }}
+        username: ${{ secrets.SERVER_USER }}
+        key: ${{ secrets.SERVER_SSH_KEY }}
+        port: 22
+        source: crates/n42/mobile-sdk/mobile-sdk-release.aar
+        target: "mobile-sdk-releases/${{ github.ref_name }}/"
 
     - name: Create GitHub Release
       uses: softprops/action-gh-release@v2

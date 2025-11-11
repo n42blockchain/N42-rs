@@ -62,12 +62,11 @@ jobs:
         run: ./build-aar.sh
 
       - name: Create GitHub Release
-        working-directory: crates/n42/mobile-sdk
         uses: softprops/action-gh-release@v2
         with:
           name: ${{ github.ref_name }}
           tag_name: ${{ github.ref_name }}
           files: |
-            mobile-sdk-release.aar
+            crates/n42/mobile-sdk/mobile-sdk-release.aar
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -22,52 +22,52 @@ jobs:
         shared-key: "rust-build-cache"
         cache-targets: true
 
-      # 2️⃣ Set up JDK 17 (with JAVA_HOME + PATH)
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 17
+    # 2️⃣ Set up JDK 17 (with JAVA_HOME + PATH)
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: 17
 
-      # 3️⃣ Verify Java setup
-      - name: Verify Java setup
-        run: |
-          echo "JAVA_HOME=$JAVA_HOME"
-          java -version
-          javac -version
+    # 3️⃣ Verify Java setup
+    - name: Verify Java setup
+      run: |
+        echo "JAVA_HOME=$JAVA_HOME"
+        java -version
+        javac -version
 
-      # 4️⃣ Set up Gradle
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v3
+    # 4️⃣ Set up Gradle
+    - name: Set up Gradle
+      uses: gradle/actions/setup-gradle@v3
 
-      # 6️⃣ Install Android NDK
-      - name: Install Android NDK
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r26d
+    # 6️⃣ Install Android NDK
+    - name: Install Android NDK
+      uses: nttld/setup-ndk@v1
+      with:
+        ndk-version: r26d
 
-      # 7️⃣ Add Android Rust targets
-      - name: Add Android targets
-        run: |
-          rustup target add \
-            aarch64-linux-android \
-            armv7-linux-androideabi \
-            x86_64-linux-android
+    # 7️⃣ Add Android Rust targets
+    - name: Add Android targets
+      run: |
+        rustup target add \
+          aarch64-linux-android \
+          armv7-linux-androideabi \
+          x86_64-linux-android
 
-      # 8️⃣ Install cargo-ndk
-      - name: Install cargo-ndk
-        run: cargo install cargo-ndk
+    # 8️⃣ Install cargo-ndk
+    - name: Install cargo-ndk
+      run: cargo install cargo-ndk
 
-      - name: Run build-aar.sh
-        working-directory: crates/n42/mobile-sdk
-        run: ./build-aar.sh
+    - name: Run build-aar.sh
+      working-directory: crates/n42/mobile-sdk
+      run: ./build-aar.sh
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          name: ${{ github.ref_name }}
-          tag_name: ${{ github.ref_name }}
-          files: |
-            crates/n42/mobile-sdk/mobile-sdk-release.aar
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        name: ${{ github.ref_name }}
+        tag_name: ${{ github.ref_name }}
+        files: |
+          crates/n42/mobile-sdk/mobile-sdk-release.aar
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

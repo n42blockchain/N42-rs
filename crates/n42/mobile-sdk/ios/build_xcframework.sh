@@ -9,7 +9,6 @@ OUT_DIR="$IOS_DIR/build"
 INCLUDE_DIR="$IOS_DIR/include"
 SWIFT_DIR="$IOS_DIR/Swift"
 XCFRAMEWORK="$OUT_DIR/MobileSdk.xcframework"
-XCFRAMEWORK_SIM="$OUT_DIR/MobileSdk-Sim.xcframework"
 
 IOS_MIN_VERSION=11.0
 
@@ -62,19 +61,20 @@ echo "✅ $tarname tarball at: $tarname.tar.gz"
 
 # ---------------- CREATE XCFRAMEWORK ----------------
 echo "Creating XCFramework for sim x86_64-apple-ios..."
+rm -rf "$XCFRAMEWORK"
 xcodebuild -create-xcframework \
   -library "$LIB_SIM" \
   -headers "$INCLUDE_DIR" \
-  -output "$XCFRAMEWORK_SIM"
+  -output "$XCFRAMEWORK"
 
-echo "✅ XCFramework built at: $XCFRAMEWORK_SIM"
+echo "✅ XCFramework built at: $XCFRAMEWORK"
 echo "Swift wrapper files remain in ios/Swift/ for reference."
 
 tarname=mobile-sdk-sim-x86_64-apple-ios
 tarworkdir=$(mktemp -d /tmp/tardir.$tarname.XXXXX)
 tardir="$tarworkdir/$tarname"
 mkdir $tardir
-cp -r $XCFRAMEWORK_SIM $tardir/
+cp -r $XCFRAMEWORK $tardir/
 cp -r $SWIFT_DIR $tardir/
 cp -r $INCLUDE_DIR $tardir/
 (cd $tarworkdir && tar -cvzf $tarname.tar.gz $tarname)

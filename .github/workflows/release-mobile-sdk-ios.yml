@@ -13,8 +13,8 @@ permissions:
   contents: write  # required for creating releases
 
 jobs:
-  build-android:
-    runs-on: ubuntu-latest
+  build-ios:
+    runs-on: macos-latest
 
     steps:
     - uses: actions/checkout@v4
@@ -27,6 +27,9 @@ jobs:
       with:
         shared-key: "rust-build-cache"
         cache-targets: true
+
+    - name: Install cbindgen
+      run: cargo install cbindgen
 
     - name: Run build_xcframework.sh
       working-directory: crates/n42/mobile-sdk/ios/

@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "$OSTYPE" == "darwin"* ]]; then
+  SED_INPLACE="sed -i ''"
+else
+  SED_INPLACE="sed -i"
+fi
+
 # -------------------------
 # Configuration
 # -------------------------
@@ -25,7 +31,7 @@ mkdir -p "$JNILIBS_DIR" "$JAVA_DIR"
 cp Cargo.toml Cargo.toml.bak
 
 # Modify Cargo.toml for Android
-sed -i '' 's/^crate-type = \[\(.*\)\]/crate-type = [\1, "cdylib"]/' Cargo.toml
+$SED_INPLACE 's/^crate-type = \[\(.*\)\]/crate-type = [\1, "cdylib"]/' Cargo.toml
 
 # -------------------------
 # Build Rust crate for Android ABIs

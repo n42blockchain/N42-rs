@@ -1,4 +1,4 @@
-name: Build Android AAR
+name: Build mobile-sdk Android AAR
 
 on:
   push:
@@ -50,7 +50,7 @@ jobs:
     - name: Install Android NDK
       uses: nttld/setup-ndk@v1
       with:
-        ndk-version: r26d
+        ndk-version: r29
 
     # 7️⃣ Add Android Rust targets
     - name: Add Android targets

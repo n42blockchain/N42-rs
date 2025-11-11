@@ -11,9 +11,16 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1️⃣ Checkout your source code
-      - name: Checkout source
-        uses: actions/checkout@v4
+    - uses: actions/checkout@v4
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: stable
+    - name: Cache dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: "rust-build-cache"
+        cache-targets: true
 
       # 2️⃣ Set up JDK 17 (with JAVA_HOME + PATH)
       - name: Set up JDK 17
@@ -32,12 +39,6 @@ jobs:
       # 4️⃣ Set up Gradle
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v3
-
-      # 5️⃣ Set up Rust
-      - name: Set up Rust
-        uses: actions/setup-rust@v2
-        with:
-          rust-version: stable
 
       # 6️⃣ Install Android NDK
       - name: Install Android NDK

@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "n42-v*.*.*"
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always

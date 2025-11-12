@@ -14,7 +14,7 @@ CRATE_NAME="mobile-sdk"
 LIB_NAME="${CRATE_NAME//-/_}"
 JAVA_PKG="com/mobileSdk"      # folder path
 JAVA_CLASS="Api"               # public wrapper class
-AAR_NAME="mobile-sdk-release.aar"
+AAR_NAME="mobile-sdk-android.aar"
 
 WORKDIR="$(pwd)/aar-build"
 JNILIBS_DIR="$WORKDIR/src/main/jniLibs"

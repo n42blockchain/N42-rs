@@ -87,9 +87,9 @@ jobs:
         with:
           name: build-artifact
       - run: |
-        mkdir -p target/release
-        mv n42 target/release/
-        mkdir -p target/release/examples/
-        mv mobile-sdk-test target/release/examples/
-        chmod +x target/release/n42 target/release/examples/mobile-sdk-test
-        bash tests/e2e.sh
+          mkdir -p target/release
+          mv n42 target/release/
+          mkdir -p target/release/examples/
+          mv mobile-sdk-test target/release/examples/
+          chmod +x target/release/n42 target/release/examples/mobile-sdk-test
+          bash tests/e2e.sh

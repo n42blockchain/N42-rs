@@ -47,11 +47,16 @@ jobs:
         shared-key: "rust-build-cache"
         cache-targets: true
     - name: Build release binary
-      run: cargo build --release
+      run: |
+        cargo build --release
+        cargo build --release -p mobile-sdk --example mobile-sdk-test
     - uses: actions/upload-artifact@v4
       with:
         name: build-artifact
-        path: target/release/n42
+        path: |
+          target/release/n42
+          target/release/examples/mobile-sdk-test
+          tests/
     - name: Compress artifacts (tar.xz)
       run: |
         tar -cJf ${{ github.ref_name }}.tar.xz target/release/n42
@@ -81,4 +86,10 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: build-artifact
-      - run: ./n42 --version
+      - run: |
+        mkdir -p target/release
+        mv n42 target/release/
+        mkdir -p target/release/examples/
+        mv mobile-sdk-test target/release/examples/
+        chmod +x target/release/n42 target/release/examples/mobile-sdk-test
+        bash tests/e2e.sh

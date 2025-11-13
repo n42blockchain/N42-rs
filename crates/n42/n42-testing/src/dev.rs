@@ -27,7 +27,8 @@ use reth_node_api::{
 };
 use zerocopy::AsBytes;
 use reth_chainspec::{
-    ChainSpec, N42};
+    ChainSpec,
+    N42};
 use reth_provider::{BlockHashReader, BlockReaderIdExt, BlockNumReader};
 
 #[cfg(test)]

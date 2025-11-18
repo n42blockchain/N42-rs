@@ -302,14 +302,13 @@ where
                     }
                 }
             }
-            let (&(peer_finalized_td, peer_finalized_td_hash), _) = {
-                if status_counts.is_empty() {
-                    break;
-                }
-                status_counts
-                    .iter()
-                    .max_by_key(|&(_, count)| count)
-                    .unwrap()
+            let (peer_finalized_td, peer_finalized_td_hash) = if let Some((&(td, hash), _)) = status_counts
+                .iter()
+                .max_by_key(|&(_, count)| count)
+            {
+                (td, hash)
+            } else {
+                break; // No peers or empty status
             };
 
             let (max_td, max_td_hash) = self.max_td_and_hash()?;
@@ -791,16 +790,19 @@ where
             // TODO: broadcast beacon block
             //broadcast_beacon_block(block_hash, &beacon_block).unwrap();
 
-            new_block_tx
-                .send((
+            if let Err(e) = new_block_tx.send((
                     NewBlock {
                         block: block_clone.unseal(),
                         td: max_td.to::<U128>(),
                     },
                     block_hash,
                 ))
-                .await
-                .unwrap();
+                .await {
+                    warn!(
+                        target: "consensus-client",
+                        "Failed to send new block for broadcast: {e:?}.",
+                    );
+                };
         });
 
         self.num_generated_blocks += 1;
@@ -1136,61 +1138,40 @@ where
     }
 
     async fn fetch_header(&self, start: BlockHashOrNumber) -> eyre::Result<Header> {
-        let fetch_client = match self.network.fetch_client().await {
-            Ok(c) => c,
-            Err(err) => {
-                eyre::bail!("Failed to get fetch_client: {}, {:?}", err, start);
-            }
-        };
-        let header = match fetch_client
+        let fetch_client = self.network.fetch_client().await
+            .map_err(|err| eyre::eyre!("Failed to get fetch_client: {}, {:?}", err, start))?;
+
+        let header = fetch_client
             .get_header_with_priority(start, Priority::High)
             .await
-        {
-            Ok(h) => h.into_data(),
-            Err(err) => {
-                eyre::bail!("Failed to get header: {}, {:?}", err, start);
-            }
-        };
-        if header.is_none() {
-            eyre::bail!("Failed to get header: header is None, {:?}", start);
-        }
-        Ok(header.unwrap())
+            .map_err(|err| eyre::eyre!("Failed to get header: {}, {:?}", err, start))?
+            .into_data()
+            .ok_or_else(|| eyre::eyre!("Header not found for: {:?}", start))?;
+
+        Ok(header)
     }
 
     async fn fetch_block(&mut self, start: BlockHashOrNumber) -> eyre::Result<<<T::BuiltPayload as BuiltPayload>::Primitives as NodePrimitives>::Block> {
         self.num_fetched_blocks += 1;
-        let fetch_client = match self.network.fetch_client().await {
-            Ok(c) => c,
-            Err(err) => {
-                eyre::bail!("Failed to get fetch_client: {}, {:?}", err, start);
-            }
-        };
-        let header = match fetch_client
+
+        let fetch_client = self.network.fetch_client().await
+            .map_err(|err| eyre::eyre!("Failed to get fetch_client: {}, {:?}", err, start))?;
+
+        let header = fetch_client
             .get_header_with_priority(start, Priority::High)
             .await
-        {
-            Ok(h) => h.into_data(),
-            Err(err) => {
-                eyre::bail!("Failed to get header: {}, {:?}", err, start);
-            }
-        };
-        if header.is_none() {
-            eyre::bail!("Failed to get header: header is None, {:?}", start);
-        }
-        let header = header.unwrap();
-        let body = match fetch_client
+            .map_err(|err| eyre::eyre!("Failed to get header: {}, {:?}", err, start))?
+            .into_data()
+            .ok_or_else(|| eyre::eyre!("Header not found for: {:?}", start))?;
+
+        let body = fetch_client
             .get_block_body_with_priority(header.hash_slow(), Priority::High)
             .await
-        {
-            Ok(b) => b.into_data(),
-            Err(err) => {
-                eyre::bail!("Failed to get body: {}, {:?}", err, start);
-            }
-        };
-        if body.is_none() {
-            eyre::bail!("Failed to get body: body is None, {:?}", start);
-        }
-        let block = body.unwrap().into_ethereum_body().into_block(header);
+            .map_err(|err| eyre::eyre!("Failed to get body: {}, {:?}", err, start))?
+            .into_data()
+            .ok_or_else(|| eyre::eyre!("Body not found for header: {:?}", header.hash_slow()))?;
+
+        let block = body.into_ethereum_body().into_block(header);
         Ok(block)
     }
 

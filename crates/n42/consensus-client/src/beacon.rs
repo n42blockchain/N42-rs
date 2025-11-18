@@ -17,10 +17,6 @@ use alloy_primitives::{keccak256, BlockHash, B256, Log};
 use n42_primitives::{Attestation, BeaconBlock, BeaconBlockBody, BeaconState, BlockVerifyResultAggregate, CommitteeIndex, Deposit, DepositData, Epoch, ExecutionRequests, Validator, VoluntaryExitWithSig, SLOTS_PER_EPOCH};
 use tracing::{trace, debug, error, info, warn};
 
-const INMEMORY_BEACON_STATES: u32 = 256;
-
-const STAKING_AMOUNT: u64 = 32000000000;
-
 #[derive(Debug)]
 pub struct Beacon<Provider> {
     provider: Provider,
@@ -100,40 +96,6 @@ where
         let mut beacon_state = self.provider.get_beacon_state_by_hash(&beacon_block_hash)?.ok_or(eyre::eyre!("beacon_state not found by hash, beacon_block_hash={:?}", beacon_block_hash))?;
         debug!(target: "consensus-client", ?beacon_state, "gen_withdrawals");
 
-        /*
-        let mut withdrawals = Vec::new();
-        if (beacon_state.slot + 1) % SLOTS_PER_EPOCH == 0 {
-            for (index, validator) in beacon_state.validators.iter_mut().enumerate() {
-                let epoch = beacon_state.slot / SLOTS_PER_EPOCH;
-                if epoch >= validator.activation_epoch && (validator.exit_epoch == 0 || epoch < validator.exit_epoch) {
-                    if beacon_state.balances[index] > STAKING_AMOUNT {
-                        let extra = beacon_state.balances[index] - STAKING_AMOUNT;
-                        withdrawals.push(
-                            Withdrawal {
-                                address: get_address(&validator.withdrawal_credentials),
-                                amount: extra,
-                                ..Default::default()
-                            }
-                        );
-                        validator.effective_balance = STAKING_AMOUNT;
-                        beacon_state.balances[index]= STAKING_AMOUNT;
-                    }
-                } else if epoch == validator.withdrawable_epoch {
-                    withdrawals.push(
-                        Withdrawal {
-                            address: get_address(&validator.withdrawal_credentials),
-                            amount: beacon_state.balances[index],
-                            ..Default::default()
-                        }
-                    );
-                    validator.effective_balance = 0;
-                    beacon_state.balances[index]= 0;
-                }
-            }
-        }
-        Ok((Some(withdrawals), beacon_state))
-        */
-
         let (expected_withdrawals, processed_partial_withdrawals_count) =
         beacon_state.process_withdrawals()?;
         Ok((Some(expected_withdrawals), beacon_state))
@@ -171,11 +133,6 @@ where
             .map_err(|e| eyre::eyre!("PublicKey::from_bytes error {e:?}"))?;
         Ok(Some(pubkey))
     }
-}
-
-fn get_address(withdrawal_credentials: &B256) -> Address {
-    assert_eq!(withdrawal_credentials.as_slice()[0], 0x01);
-    Address::from_slice(&withdrawal_credentials.as_slice()[12..])
 }
 
 fn parse_execution_requests(requests: &Option<Requests>) -> eyre::Result<ExecutionRequestsV4> {

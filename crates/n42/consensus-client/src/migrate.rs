@@ -39,7 +39,7 @@ pub struct N42Migrate<T: PayloadTypes, Provider, B, Pool: TransactionPool> {
     pool: Pool,
     beacon: Beacon<Provider>,
     migrate_from_db_path: Option<String>,
-    migrage_from_rpc: Option<String>,
+    migrate_from_rpc: Option<String>,
 }
 
 impl<T, Provider, B, Pool> N42Migrate<T, Provider, B, Pool>
@@ -66,7 +66,7 @@ where
         payload_builder: PayloadBuilderHandle<T>,
         pool: Pool,
         migrate_from_db_path: Option<String>,
-        migrage_from_rpc: Option<String>,
+        migrate_from_rpc: Option<String>,
     ) {
         let beacon = Beacon::new(provider.clone());
         let migrate = Self {
@@ -77,7 +77,7 @@ where
             pool,
             beacon,
             migrate_from_db_path,
-            migrage_from_rpc,
+            migrate_from_rpc,
         };
         tokio::spawn(migrate.run());
     }
@@ -103,8 +103,8 @@ where
         } else {
             None
         };
-        let rpc_provider = if self.migrage_from_rpc.is_some() {
-            let rpc_url = self.migrage_from_rpc.clone().unwrap().parse()?;
+        let rpc_provider = if self.migrate_from_rpc.is_some() {
+            let rpc_url = self.migrate_from_rpc.clone().unwrap().parse()?;
             Some(ProviderBuilder::new().on_http(rpc_url))
         } else {
             None

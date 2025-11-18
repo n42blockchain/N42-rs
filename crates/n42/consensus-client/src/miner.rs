@@ -158,7 +158,6 @@ const NUM_NUM_TO_TD: u32 = 256;
 const WAIT_FOR_PEERS_INTERVAL_SECS: u64 = 5;
 const WAIT_FOR_DOWNLOAD_INTERVAL_MS: u64 = 100;
 const SYNC_DOWNLOAD_BLOCKS_UNIT: u64 = 512;
-const DIFFICULTY_DELTA_CLAMP: u64 = 50;
 const MAX_NUM_LOCAL_BLOCKS_TO_CHECK: u64 = 256;
 const MIN_NO_BLOCK_TIMESTAMP_GAP: u64 = 300;
 
@@ -286,6 +285,7 @@ where
     }
 
     async fn initial_sync(&mut self) -> eyre::Result<()> {
+        let block_time = self.interval_prepare_block.period().as_secs();
         loop {
             let status_counts;
             loop {
@@ -314,7 +314,8 @@ where
             let (max_td, max_td_hash) = self.max_td_and_hash()?;
             debug!(target: "consensus-client", ?peer_finalized_td, ?max_td, "Comparing peer_finalized_td with max_td");
             debug!(target: "consensus-client", ?peer_finalized_td_hash, ?max_td_hash,);
-            if peer_finalized_td > max_td + U256::from(DIFFICULTY_DELTA_CLAMP) {
+            let difficulty_delta_clamp = MIN_NO_BLOCK_TIMESTAMP_GAP / 2 / block_time;
+            if peer_finalized_td > max_td + U256::from(difficulty_delta_clamp) {
                 match self
                     .initial_sync_to_hash(peer_finalized_td, peer_finalized_td_hash)
                     .await

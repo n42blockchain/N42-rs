@@ -364,11 +364,12 @@ where
     }
 
     async fn exit_if_lagged_progress(&self, block: &SealedBlock) -> eyre::Result<()> {
-        const MAX_PROGRESS_GAP: u64 = 100;
+        let block_time = self.interval_prepare_block.period().as_secs();
+        let max_progress_gap: u64 = MIN_NO_BLOCK_TIMESTAMP_GAP / block_time;
 
         let best_block_number = self.provider.best_block_number()?;
         debug!(target: "consensus-client", my_number=?best_block_number, received_number=?block.header().number,"exit_if_lagged_progress");
-        if block.header().number > best_block_number + MAX_PROGRESS_GAP {
+        if block.header().number > best_block_number + max_progress_gap {
             let current_signers = self.get_best_block_signers()?;
             let signer = match recover_address(block.header()) {
                 Ok(v) => v,

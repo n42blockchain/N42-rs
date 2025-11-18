@@ -40,7 +40,8 @@ use alloy_primitives::{Bytes, Address, B256};
 use alloy_genesis::CliqueConfig;
 use futures::StreamExt;
 use reth::{
-    args::{DevArgs, DiscoveryArgs, NetworkArgs, RpcServerArgs},
+    args::{
+        DevArgs, DiscoveryArgs, NetworkArgs, RpcServerArgs},
     builder::Node,
     rpc::types::engine::ForkchoiceState,
 };

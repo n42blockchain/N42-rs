@@ -41,7 +41,8 @@ use alloy_genesis::CliqueConfig;
 use futures::StreamExt;
 use reth::{
     args::{
-        DevArgs, DiscoveryArgs, NetworkArgs, RpcServerArgs},
+        DevArgs,
+        DiscoveryArgs, NetworkArgs, RpcServerArgs},
     builder::Node,
     rpc::types::engine::ForkchoiceState,
 };

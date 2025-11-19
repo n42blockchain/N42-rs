@@ -21,3 +21,5 @@ mod attestation_duty;
 pub type Hash256 = alloy_primitives::B256;
 pub type Slot = u64;
 pub type CommitteeIndex = u64;
+
+pub const N42_MIN_BASE_FEE: u64 = 0x5f5e100; // 0.1 Gwei

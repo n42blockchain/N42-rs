@@ -2,6 +2,7 @@
 
 use crate::cli::config::RethTransactionPoolConfig;
 use alloy_eips::eip1559::{ETHEREUM_BLOCK_GAS_LIMIT_30M, MIN_PROTOCOL_BASE_FEE};
+use n42_primitives::N42_MIN_BASE_FEE;
 use alloy_primitives::Address;
 use clap::Args;
 use reth_cli_util::parse_duration_from_secs_or_ms;
@@ -62,7 +63,7 @@ pub struct TxPoolArgs {
     pub price_bump: u128,
 
     /// Minimum base fee required by the protocol.
-    #[arg(long = "txpool.minimal-protocol-fee", default_value_t = MIN_PROTOCOL_BASE_FEE)]
+    #[arg(long = "txpool.minimal-protocol-fee", default_value_t = N42_MIN_BASE_FEE)]
     pub minimal_protocol_basefee: u64,
 
     /// The default enforced gas limit for transactions entering the pool
@@ -138,7 +139,7 @@ impl Default for TxPoolArgs {
             blob_cache_size: None,
             max_account_slots: TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER,
             price_bump: DEFAULT_PRICE_BUMP,
-            minimal_protocol_basefee: MIN_PROTOCOL_BASE_FEE,
+            minimal_protocol_basefee: N42_MIN_BASE_FEE,
             enforced_gas_limit: ETHEREUM_BLOCK_GAS_LIMIT_30M,
             blob_transaction_price_bump: REPLACE_BLOB_PRICE_BUMP,
             max_tx_input_bytes: DEFAULT_MAX_TX_INPUT_BYTES,

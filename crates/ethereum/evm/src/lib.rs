@@ -44,6 +44,7 @@ mod config;
 use alloy_eips::{eip1559::INITIAL_BASE_FEE, eip7840::BlobParams};
 pub use config::{revm_spec, revm_spec_by_timestamp_and_block_number};
 use reth_ethereum_forks::EthereumHardfork;
+use n42_primitives::N42_MIN_BASE_FEE;
 
 pub mod execute;
 
@@ -222,6 +223,12 @@ where
         let mut basefee = parent.next_block_base_fee(
             self.chain_spec().base_fee_params_at_timestamp(attributes.timestamp),
         );
+        let min_basefee = N42_MIN_BASE_FEE;
+        if let Some(v) = basefee {
+            if v < min_basefee {
+                basefee = Some(min_basefee);
+            }
+        }
 
         let mut gas_limit = attributes.gas_limit;
 

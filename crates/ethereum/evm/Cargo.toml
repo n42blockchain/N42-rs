@@ -30,6 +30,8 @@ alloy-consensus.workspace = true
 parking_lot = { workspace = true, optional = true }
 derive_more = { workspace = true, optional = true }
 
+n42-primitives.workspace = true
+
 [dev-dependencies]
 reth-testing-utils.workspace = true
 reth-evm = { workspace = true, features = ["test-utils"] }

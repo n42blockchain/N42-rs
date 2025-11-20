@@ -759,8 +759,6 @@ where
         let beacon_block = self.beacon.gen_beacon_block(beacon_state_after_withdrawal, parent_beacon_block_hash, &deposits, &attestations.values().cloned().collect(), &voluntary_exits, &execution_requests, &block)?;
         let beacon_block_hash = beacon_block.hash_slow();
         self.provider.save_beacon_block_by_hash(&beacon_block_hash, beacon_block.clone())?;
-
-        //
         self.provider.save_beacon_block_hash_by_eth1_hash(&block.hash(), beacon_block_hash)?;
 
         let new_beacon_state = self.provider.get_beacon_state_by_hash(&beacon_block_hash)?
@@ -781,8 +779,6 @@ where
         let new_block_tx = self.new_block_tx.clone();
         let block_clone = block.clone();
         let block_hash = block.hash_slow();
-        self.provider.save_beacon_block_by_hash(&beacon_block.hash_slow(), beacon_block.clone())?;
-        self.provider.save_beacon_block_hash_by_eth1_hash(&block_hash, beacon_block.hash_slow())?;
         tokio::spawn(async move {
             sleep(wiggle).await;
 

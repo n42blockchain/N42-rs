@@ -740,10 +740,6 @@ impl<N: ProviderNodeTypes> BeaconProvider for BlockchainProvider<N> {
         self.database_provider_ro()?.get_beacon_block_by_hash(block_hash)
     }
 
-    fn get_beacon_block_by_eth1_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BeaconBlock>> {
-        self.database_provider_ro()?.get_beacon_block_by_eth1_hash(block_hash)
-    }
-
     fn get_beacon_state_by_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BeaconState>> {
         self.database_provider_ro()?.get_beacon_state_by_hash(block_hash)
     }
@@ -757,12 +753,6 @@ impl<N: ProviderNodeTypes> BeaconProviderWriter for BlockchainProvider<N> {
     fn save_beacon_block_by_hash(&self, block_hash: &BlockHash,  beacon_block: BeaconBlock) -> ProviderResult<()> {
         let provider_rw = self.database_provider_rw()?;
         provider_rw.save_beacon_block_by_hash(block_hash, beacon_block)?;
-        provider_rw.commit().map(|_|())
-    }
-
-    fn save_beacon_block_by_eth1_hash(&self, block_hash: &BlockHash,  beacon_block: BeaconBlock) -> ProviderResult<()> {
-        let provider_rw = self.database_provider_rw()?;
-        provider_rw.save_beacon_block_by_eth1_hash(block_hash, beacon_block)?;
         provider_rw.commit().map(|_|())
     }
 

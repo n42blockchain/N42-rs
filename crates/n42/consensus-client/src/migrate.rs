@@ -278,9 +278,6 @@ where
             let beacon_block_hash = beacon_block.hash_slow();
             self.provider.save_beacon_block_by_hash(&beacon_block_hash, beacon_block.clone())?;
 
-            //
-            self.provider.save_beacon_block_by_eth1_hash(&block.hash(), beacon_block.clone())?;
-
             self.provider.save_beacon_block_hash_by_eth1_hash(&block.hash(), beacon_block_hash)?;
         }
     }

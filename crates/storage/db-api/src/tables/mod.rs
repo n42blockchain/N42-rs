@@ -362,12 +362,6 @@ tables! {
         type Value = BeaconBlock;
         }
 
-    /// Stores the beacon block per eth1 hash
-    table BeaconBlocksByEth1Hash {
-        type Key = BlockHash;
-        type Value = BeaconBlock;
-        }
-
     /// Stores the beacon state per hash
     table BeaconStatesByHash {
         type Key = BlockHash;

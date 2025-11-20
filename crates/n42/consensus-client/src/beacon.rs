@@ -103,8 +103,7 @@ where
     }
 
     fn get_beacon_state_from_block_hash(&self, block_hash: B256) -> eyre::Result<BeaconState> {
-        let beacon_block = self.provider.get_beacon_block_by_eth1_hash(&block_hash)?.ok_or(eyre::eyre!("beacon block not found, block_hash={:?}", block_hash))?;
-        let beacon_block_hash = beacon_block.hash_slow();
+        let beacon_block_hash = self.provider.get_beacon_block_hash_by_eth1_hash(&block_hash)?.ok_or(eyre::eyre!("beacon block hash not found, block_hash={:?}", block_hash))?;
 
         let beacon_state = self.provider.get_beacon_state_by_hash(&beacon_block_hash)?.ok_or(eyre::eyre!("beacon state not found, beacon_block_hash={:?}", beacon_block_hash))?;
 

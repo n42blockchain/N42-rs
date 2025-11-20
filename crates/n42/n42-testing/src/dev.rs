@@ -42,7 +42,8 @@ use futures::StreamExt;
 use reth::{
     args::{
         DevArgs,
-        DiscoveryArgs, NetworkArgs, RpcServerArgs},
+        DiscoveryArgs,
+        NetworkArgs, RpcServerArgs},
     builder::Node,
     rpc::types::engine::ForkchoiceState,
 };

@@ -38,7 +38,7 @@ where
         }
     }
 
-    pub fn gen_beacon_block(&mut self, old_beacon_state: BeaconState, parent_hash: BlockHash, deposits: &Vec<Deposit>, attestations: &Vec<Attestation>, voluntary_exits: &Vec<VoluntaryExitWithSig>, execution_requests: &Option<Requests>, eth1_sealed_block: &SealedBlock) -> eyre::Result<BeaconBlock> {
+    pub fn gen_beacon_block(&mut self, old_beacon_state: BeaconState, parent_hash: BlockHash, attestations: &Vec<Attestation>, execution_requests: &Option<Requests>, eth1_sealed_block: &SealedBlock) -> eyre::Result<BeaconBlock> {
         let mut execution_requests = parse_execution_requests(execution_requests)?;
 
         execution_requests.deposits.retain(|deposit|
@@ -61,9 +61,9 @@ where
             parent_hash,
             eth1_block_hash: eth1_sealed_block.hash_slow(),
             body: BeaconBlockBody {
-                deposits: deposits.clone(),
+                deposits: Default::default(),
                 attestations: attestations.clone(),
-                voluntary_exits: voluntary_exits.clone(),
+                voluntary_exits: Default::default(),
                 execution_requests,
             },
             ..Default::default()

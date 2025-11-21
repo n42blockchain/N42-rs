@@ -31,7 +31,8 @@ use reth_chainspec::{
     N42
 };
 use reth_provider::{
-    BlockHashReader, BlockReaderIdExt, BlockNumReader};
+    BlockHashReader,
+    BlockReaderIdExt, BlockNumReader};
 
 #[cfg(test)]
 use crate::{utils::n42_payload_attributes, snapshot_test_utils::TesterAccountPool};

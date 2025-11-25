@@ -35,7 +35,7 @@ use reth_stages_types::StageCheckpoint;
 use reth_trie_common::{BranchNodeCompact, StorageTrieEntry, StoredNibbles, StoredNibblesSubKey};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use n42_primitives::{BeaconBlock,BeaconState, Snapshot, Validator, ValidatorBeforeTx};
+use n42_primitives::{BeaconBlock, BeaconState, BeaconStatePerEpoch, BeaconStatePerSlot, Snapshot, Validator, ValidatorBeforeTx};
 
 /// Enum for the types of tables present in libmdbx.
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -366,6 +366,18 @@ tables! {
     table BeaconStatesByHash {
         type Key = BlockHash;
         type Value = BeaconState;
+        }
+
+    /// Stores the beacon state(per slot part)per hash
+    table BeaconStatePerSlotByHash {
+        type Key = BlockHash;
+        type Value = BeaconStatePerSlot;
+        }
+
+    /// Stores the beacon state(per epoch part)per hash
+    table BeaconStatePerEpochByHash {
+        type Key = BlockHash;
+        type Value = BeaconStatePerEpoch;
         }
 
     /// Stores the beacon block hash per eth1 hash

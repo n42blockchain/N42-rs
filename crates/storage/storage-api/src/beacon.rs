@@ -1,7 +1,7 @@
 use std::ops::RangeInclusive;
 use alloy_primitives::{Address, BlockNumber, BlockHash};
 use auto_impl::auto_impl;
-use n42_primitives::{BeaconBlock, BeaconState, BeaconStateChangeset,BeaconBlockChangeset};
+use n42_primitives::{BeaconBlock, BeaconBlockChangeset, BeaconState, BeaconStateChangeset, BeaconStatePerEpoch, BeaconStatePerSlot};
 use reth_storage_errors::ProviderResult;
 
 #[auto_impl(&, Arc, Box)]
@@ -27,6 +27,10 @@ pub trait BeaconProvider{
     fn get_beacon_state_by_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BeaconState>>;
 
     fn get_beacon_block_hash_by_eth1_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BlockHash>>;
+
+    fn get_beacon_state_per_slot_by_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BeaconStatePerSlot>>;
+
+    fn get_beacon_state_per_epoch_by_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BeaconStatePerEpoch>>;
 }
 
 pub trait BeaconProviderWriter {
@@ -34,6 +38,10 @@ pub trait BeaconProviderWriter {
     fn save_beacon_block_by_hash(&self, block_hash: &BlockHash,  beacon_block: BeaconBlock) -> ProviderResult<()>;
 
     fn save_beacon_state_by_hash(&self, block_hash: &BlockHash,  beacon_state: BeaconState) -> ProviderResult<()>;
+
+    fn save_beacon_state_per_slot_by_hash(&self, block_hash: &BlockHash,  beacon_state_per_slot: BeaconStatePerSlot) -> ProviderResult<()>;
+
+    fn save_beacon_state_per_epoch_by_hash(&self, block_hash: &BlockHash,  beacon_state_per_epoch: BeaconStatePerEpoch) -> ProviderResult<()>;
 
     fn save_beacon_block_hash_by_eth1_hash(&self, eth1_block_hash: &BlockHash, beacon_block_hash: BlockHash) -> ProviderResult<()>;
 

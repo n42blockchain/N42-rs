@@ -96,7 +96,8 @@ where
 
     async fn run_inner(mut self) -> eyre::Result<()> {
         self.provider.save_beacon_block_hash_by_eth1_hash(&self.provider.chain_spec().genesis_hash(), self.provider.chain_spec().genesis_hash())?;
-        self.provider.save_beacon_state_by_hash(&self.provider.chain_spec().genesis_hash(), BeaconState::new())?;
+        self.provider.save_beacon_block_by_hash(&self.provider.chain_spec().genesis_hash(), Default::default())?;
+        self.beacon.save_beacon_state_by_hash(&self.provider.chain_spec().genesis_hash(), BeaconState::new())?;
 
         let db: Option<Db> = if self.migrate_from_db_path.is_some() {
             Some(sled::open(&self.migrate_from_db_path.clone().unwrap())?)

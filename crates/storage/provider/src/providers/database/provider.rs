@@ -66,7 +66,7 @@ use reth_storage_api::{
     BeaconProvider, BeaconProviderWriter,
 };
 use n42_primitives::{
-    BeaconBlock, BeaconState, BeaconStateChangeset, BeaconBlockChangeset,
+    BeaconBlock, BeaconState, BeaconStatePerSlot, BeaconStatePerEpoch, BeaconStateChangeset, BeaconBlockChangeset,
     Snapshot, Validator,ValidatorBeforeTx,ValidatorChangeset,ValidatorRevert};
 use reth_storage_errors::provider::{ProviderResult, RootMismatch};
 use reth_trie::{
@@ -1901,6 +1901,14 @@ impl<TX: DbTx + 'static, N: NodeTypes<ChainSpec: EthereumHardforks>> BeaconProvi
         Ok(self.tx.get::<tables::BeaconStatesByHash>(block_hash.clone())?)
     }
 
+    fn get_beacon_state_per_slot_by_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BeaconStatePerSlot>> {
+        Ok(self.tx.get::<tables::BeaconStatePerSlotByHash>(block_hash.clone())?)
+    }
+
+    fn get_beacon_state_per_epoch_by_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BeaconStatePerEpoch>> {
+        Ok(self.tx.get::<tables::BeaconStatePerEpochByHash>(block_hash.clone())?)
+    }
+
     fn get_beacon_block_hash_by_eth1_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BlockHash>> {
         Ok(self.tx.get::<tables::BeaconBlockHashesByEth1Hash>(block_hash.clone())?)
     }
@@ -1914,6 +1922,14 @@ impl<TX: DbTxMut, N: NodeTypes<ChainSpec: EthereumHardforks>> BeaconProviderWrit
 
     fn save_beacon_state_by_hash(&self, block_hash: &BlockHash,  beacon_state: BeaconState) -> ProviderResult<()> {
         Ok(self.tx.put::<tables::BeaconStatesByHash>(block_hash.clone(), beacon_state)?)
+    }
+
+    fn save_beacon_state_per_slot_by_hash(&self, block_hash: &BlockHash,  beacon_state_per_slot: BeaconStatePerSlot) -> ProviderResult<()> {
+        Ok(self.tx.put::<tables::BeaconStatePerSlotByHash>(block_hash.clone(), beacon_state_per_slot)?)
+    }
+
+    fn save_beacon_state_per_epoch_by_hash(&self, block_hash: &BlockHash,  beacon_state_per_epoch: BeaconStatePerEpoch) -> ProviderResult<()> {
+        Ok(self.tx.put::<tables::BeaconStatePerEpochByHash>(block_hash.clone(), beacon_state_per_epoch)?)
     }
 
     fn save_beacon_block_hash_by_eth1_hash(&self, eth1_block_hash: &BlockHash, beacon_block_hash: BlockHash) -> ProviderResult<()> {

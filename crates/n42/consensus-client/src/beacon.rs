@@ -14,12 +14,13 @@ use serde::{Deserialize, Serialize};
 use alloy_rlp::{Encodable, Decodable, RlpEncodable,  RlpDecodable};
 use std::collections::{HashMap, BTreeMap};
 use alloy_primitives::{keccak256, BlockHash, B256, Log};
-use n42_primitives::{Attestation, BeaconBlock, BeaconBlockBody, BeaconState, BlockVerifyResultAggregate, CommitteeIndex, Deposit, DepositData, Epoch, ExecutionRequests, Validator, VoluntaryExitWithSig, SLOTS_PER_EPOCH};
+use n42_primitives::{Attestation, BeaconBlock, BeaconBlockBody, BeaconState, BeaconStatePerEpoch, BeaconStatePerSlot, BlockVerifyResultAggregate, CommitteeIndex, Deposit, DepositData, Epoch, ExecutionRequests, Validator, VoluntaryExitWithSig, SLOTS_PER_EPOCH};
 use tracing::{trace, debug, error, info, warn};
 
 #[derive(Debug)]
 pub struct Beacon<Provider> {
     provider: Provider,
+    recent_beacon_state_per_epoch: schnellru::LruMap<BlockHash, BeaconStatePerEpoch>,
 }
 
 impl<Provider> Beacon<Provider>
@@ -35,6 +36,7 @@ where
     pub fn new(provider: Provider) -> Self {
         Self {
             provider,
+            recent_beacon_state_per_epoch: schnellru::LruMap::new(schnellru::ByLength::new((SLOTS_PER_EPOCH * 2)as u32)),
         }
     }
 
@@ -77,12 +79,12 @@ where
         debug!(target: "consensus-client", ?beacon_block, "state_transition");
         let beacon_state = match old_beacon_state {
             Some(v) => v,
-            None => self.provider.get_beacon_state_by_hash(&beacon_block.parent_hash)?.ok_or(eyre::eyre!("beacon_state not found by hash, {:?}", beacon_block.parent_hash))?
+            None => self.get_beacon_state_by_hash(&beacon_block.parent_hash)?.ok_or(eyre::eyre!("beacon_state not found by hash, {:?}", beacon_block.parent_hash))?
         };
         let new_beacon_state = BeaconState::state_transition(&beacon_state, beacon_block)?;
         let beacon_block_with_root = BeaconBlock { state_root: new_beacon_state.hash_slow(), ..beacon_block.clone() };
         let beacon_block_hash = beacon_block_with_root.hash_slow();
-        self.provider.save_beacon_state_by_hash(&beacon_block_hash, new_beacon_state.clone())?;
+        self.save_beacon_state_by_hash(&beacon_block_hash, new_beacon_state.clone())?;
         debug!(target: "consensus-client", ?beacon_block_hash, ?new_beacon_state, "state_transition");
 
         Ok(new_beacon_state)
@@ -93,7 +95,7 @@ where
         let beacon_block_hash = self.provider.get_beacon_block_hash_by_eth1_hash(&eth1_block_hash)?.ok_or(eyre::eyre!("beacon block hash not found, eth1_block_hash={:?}", eth1_block_hash))?;
 
         debug!(target: "consensus-client", ?beacon_block_hash, "gen_withdrawals");
-        let mut beacon_state = self.provider.get_beacon_state_by_hash(&beacon_block_hash)?.ok_or(eyre::eyre!("beacon_state not found by hash, beacon_block_hash={:?}", beacon_block_hash))?;
+        let mut beacon_state = self.get_beacon_state_by_hash(&beacon_block_hash)?.ok_or(eyre::eyre!("beacon_state not found by hash, beacon_block_hash={:?}", beacon_block_hash))?;
         debug!(target: "consensus-client", ?beacon_state, "gen_withdrawals");
 
         let (expected_withdrawals, processed_partial_withdrawals_count) =
@@ -102,15 +104,15 @@ where
 
     }
 
-    fn get_beacon_state_from_block_hash(&self, block_hash: B256) -> eyre::Result<BeaconState> {
+    fn get_beacon_state_from_block_hash(&mut self, block_hash: B256) -> eyre::Result<BeaconState> {
         let beacon_block_hash = self.provider.get_beacon_block_hash_by_eth1_hash(&block_hash)?.ok_or(eyre::eyre!("beacon block hash not found, block_hash={:?}", block_hash))?;
 
-        let beacon_state = self.provider.get_beacon_state_by_hash(&beacon_block_hash)?.ok_or(eyre::eyre!("beacon state not found, beacon_block_hash={:?}", beacon_block_hash))?;
+        let beacon_state = self.get_beacon_state_by_hash(&beacon_block_hash)?.ok_or(eyre::eyre!("beacon state not found, beacon_block_hash={:?}", beacon_block_hash))?;
 
         Ok(beacon_state)
     }
 
-    pub fn get_validator_index_from_beacon_state(&self, block_hash: B256, pubkey: PublicKey) -> eyre::Result<Option<u64>> {
+    pub fn get_validator_index_from_beacon_state(&mut self, block_hash: B256, pubkey: PublicKey) -> eyre::Result<Option<u64>> {
         let beacon_state = self.get_beacon_state_from_block_hash(block_hash)?;
 
         for (i, validator) in beacon_state.validators.into_iter().enumerate() {
@@ -124,7 +126,7 @@ where
         Ok(None)
     }
 
-    pub fn get_validator_pubkey_from_beacon_state(&self, block_hash: B256, validator_index: u64) -> eyre::Result<Option<PublicKey>> {
+    pub fn get_validator_pubkey_from_beacon_state(&mut self, block_hash: B256, validator_index: u64) -> eyre::Result<Option<PublicKey>> {
         let beacon_state = self.get_beacon_state_from_block_hash(block_hash)?;
 
         let validator = beacon_state.get_validator(validator_index as usize)?;
@@ -132,6 +134,43 @@ where
             .map_err(|e| eyre::eyre!("PublicKey::from_bytes error {e:?}"))?;
         Ok(Some(pubkey))
     }
+
+    pub fn get_beacon_state_by_hash(&mut self, block_hash: &BlockHash) -> eyre::Result<Option<BeaconState>> {
+        let mut beacon_block_hash = *block_hash;
+        let mut beacon_block_hashes = Vec::new();
+        beacon_block_hashes.push(*block_hash);
+        let beacon_state_per_epoch = loop {
+            match self.recent_beacon_state_per_epoch.get(&beacon_block_hash) {
+                Some(v) => { break v.clone(); }
+                None => {
+                    let beacon_block = self.provider.get_beacon_block_by_hash(&beacon_block_hash)?.ok_or(eyre::eyre!("beacon block not found, block_hash={:?}", beacon_block_hash))?;
+                    if beacon_block.slot % SLOTS_PER_EPOCH == 0 {
+                        break self.provider.get_beacon_state_per_epoch_by_hash(&beacon_block_hash)?.ok_or(eyre::eyre!("beacon state per epoch not found, block_hash={:?}", beacon_block_hash))?;
+                    } else {
+                        beacon_block_hash = beacon_block.parent_hash;
+                        beacon_block_hashes.push(beacon_block_hash);
+                    }
+                }
+            }
+        };
+        while let Some(v) = beacon_block_hashes.pop() {
+            self.recent_beacon_state_per_epoch.insert(v, beacon_state_per_epoch.clone());
+        }
+
+        let beacon_state_per_slot = self.provider.get_beacon_state_per_slot_by_hash(&block_hash)?.ok_or(eyre::eyre!("beacon state per slot not found, block_hash={:?}", block_hash))?;
+
+        Ok(Some((beacon_state_per_slot, beacon_state_per_epoch).into()))
+    }
+
+    pub fn save_beacon_state_by_hash(&self, block_hash: &BlockHash,  beacon_state: BeaconState) -> eyre::Result<()> {
+        let beacon_state_per_slot: BeaconStatePerSlot = beacon_state.clone().into();
+        let beacon_state_per_epoch: BeaconStatePerEpoch = beacon_state.into();
+        if beacon_state_per_slot.slot % SLOTS_PER_EPOCH == 0 {
+            self.provider.save_beacon_state_per_epoch_by_hash(&block_hash, beacon_state_per_epoch)?
+        }
+        Ok(self.provider.save_beacon_state_per_slot_by_hash(&block_hash, beacon_state_per_slot)?)
+    }
+
 }
 
 fn parse_execution_requests(requests: &Option<Requests>) -> eyre::Result<ExecutionRequestsV4> {

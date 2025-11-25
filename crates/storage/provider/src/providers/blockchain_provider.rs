@@ -52,7 +52,7 @@ use std::{
 };
 use tracing::trace;
 use n42_primitives::Snapshot;
-use n42_primitives::{BeaconBlock, BeaconState};
+use n42_primitives::{BeaconBlock, BeaconState, BeaconStatePerSlot, BeaconStatePerEpoch, };
 
 /// The main type for interacting with the blockchain.
 ///
@@ -747,6 +747,15 @@ impl<N: ProviderNodeTypes> BeaconProvider for BlockchainProvider<N> {
     fn get_beacon_block_hash_by_eth1_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BlockHash>> {
         self.database_provider_ro()?.get_beacon_block_hash_by_eth1_hash(block_hash)
     }
+
+    fn get_beacon_state_per_slot_by_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BeaconStatePerSlot>> {
+        self.database_provider_ro()?.get_beacon_state_per_slot_by_hash(block_hash)
+    }
+
+    fn get_beacon_state_per_epoch_by_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BeaconStatePerEpoch>> {
+        self.database_provider_ro()?.get_beacon_state_per_epoch_by_hash(block_hash)
+    }
+
 }
 
 impl<N: ProviderNodeTypes> BeaconProviderWriter for BlockchainProvider<N> {
@@ -759,6 +768,18 @@ impl<N: ProviderNodeTypes> BeaconProviderWriter for BlockchainProvider<N> {
     fn save_beacon_state_by_hash(&self, block_hash: &BlockHash,  beacon_state: BeaconState) -> ProviderResult<()> {
         let provider_rw = self.database_provider_rw()?;
         provider_rw.save_beacon_state_by_hash(block_hash, beacon_state)?;
+        provider_rw.commit().map(|_|())
+    }
+
+    fn save_beacon_state_per_slot_by_hash(&self, block_hash: &BlockHash,  beacon_state_per_slot: BeaconStatePerSlot) -> ProviderResult<()> {
+        let provider_rw = self.database_provider_rw()?;
+        provider_rw.save_beacon_state_per_slot_by_hash(block_hash, beacon_state_per_slot)?;
+        provider_rw.commit().map(|_|())
+    }
+
+    fn save_beacon_state_per_epoch_by_hash(&self, block_hash: &BlockHash,  beacon_state_per_epoch: BeaconStatePerEpoch) -> ProviderResult<()> {
+        let provider_rw = self.database_provider_rw()?;
+        provider_rw.save_beacon_state_per_epoch_by_hash(block_hash, beacon_state_per_epoch)?;
         provider_rw.commit().map(|_|())
     }
 

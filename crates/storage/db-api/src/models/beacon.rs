@@ -1,4 +1,4 @@
-use n42_primitives::{BeaconState,BeaconBlock};
+use n42_primitives::{BeaconBlock, BeaconState, BeaconStatePerEpoch, BeaconStatePerSlot};
 use crate::{
     table::{Compress, Decompress},
     DatabaseError,
@@ -18,6 +18,40 @@ impl Compress for BeaconState {
     fn compress_to_buf<B: BufMut + AsMut<[u8]>>(&self, buf: &mut B) {
         let json_bytes = serde_json::to_vec(self)
             .expect("BeaconState serialization should not fail");
+        buf.put_slice(&json_bytes);
+    }
+}
+
+impl Decompress for BeaconStatePerSlot {
+    fn decompress(value: &[u8]) -> Result<Self, DatabaseError> {
+        serde_json::from_slice(value)
+            .map_err(|e| DatabaseError::Other(format!("serde_json deserialize error: {e}")))
+    }
+}
+
+impl Compress for BeaconStatePerSlot {
+    type Compressed = Vec<u8>;
+
+    fn compress_to_buf<B: BufMut + AsMut<[u8]>>(&self, buf: &mut B) {
+        let json_bytes = serde_json::to_vec(self)
+            .expect("BeaconStatePerSlot serialization should not fail");
+        buf.put_slice(&json_bytes);
+    }
+}
+
+impl Decompress for BeaconStatePerEpoch {
+    fn decompress(value: &[u8]) -> Result<Self, DatabaseError> {
+        serde_json::from_slice(value)
+            .map_err(|e| DatabaseError::Other(format!("serde_json deserialize error: {e}")))
+    }
+}
+
+impl Compress for BeaconStatePerEpoch {
+    type Compressed = Vec<u8>;
+
+    fn compress_to_buf<B: BufMut + AsMut<[u8]>>(&self, buf: &mut B) {
+        let json_bytes = serde_json::to_vec(self)
+            .expect("BeaconStatePerEpoch serialization should not fail");
         buf.put_slice(&json_bytes);
     }
 }

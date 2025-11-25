@@ -199,6 +199,78 @@ pub struct BeaconState {
     pub epoch_attester_indexes: BTreeSet<u64>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct BeaconStatePerSlot {
+    pub slot: u64,
+    pub eth1_deposit_index: u64,
+    pub next_withdrawal_index: u64,
+    pub next_withdrawal_validator_index: u64,
+    pub pending_partial_withdrawals: Vec<PendingPartialWithdrawal>,
+    pub earliest_exit_epoch: Epoch,
+    pub exit_balance_to_consume: u64,
+    pub epoch_attester_indexes: BTreeSet<u64>,
+    pub randao_mix: B256,
+    pub balances: Vec<Gwei>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+pub struct BeaconStatePerEpoch {
+    pub validators: Vec<Validator>,
+    pub inactivity_scores: Vec<u64>,
+    pub committee_caches: Vec<CommitteeCache>,
+}
+
+impl From<BeaconState> for BeaconStatePerSlot {
+    fn from(beacon_state: BeaconState) -> Self {
+        BeaconStatePerSlot {
+            slot: beacon_state.slot,
+            eth1_deposit_index: beacon_state.eth1_deposit_index,
+            next_withdrawal_index: beacon_state.next_withdrawal_index,
+            next_withdrawal_validator_index: beacon_state.next_withdrawal_validator_index,
+            pending_partial_withdrawals: beacon_state.pending_partial_withdrawals,
+            earliest_exit_epoch: beacon_state.earliest_exit_epoch,
+            exit_balance_to_consume: beacon_state.exit_balance_to_consume,
+            epoch_attester_indexes: beacon_state.epoch_attester_indexes,
+            randao_mix: beacon_state.randao_mix,
+            balances: beacon_state.balances,
+        }
+    }
+}
+
+impl From<(BeaconStatePerSlot, BeaconStatePerEpoch)> for BeaconState {
+    fn from((beacon_state_per_slot, beacon_state_per_epoch): (BeaconStatePerSlot, BeaconStatePerEpoch)) -> Self {
+        BeaconState {
+
+            slot: beacon_state_per_slot.slot,
+            eth1_deposit_index: beacon_state_per_slot.eth1_deposit_index,
+            next_withdrawal_index: beacon_state_per_slot.next_withdrawal_index,
+            next_withdrawal_validator_index: beacon_state_per_slot.next_withdrawal_validator_index,
+            pending_partial_withdrawals: beacon_state_per_slot.pending_partial_withdrawals,
+            earliest_exit_epoch: beacon_state_per_slot.earliest_exit_epoch,
+            exit_balance_to_consume: beacon_state_per_slot.exit_balance_to_consume,
+            epoch_attester_indexes: beacon_state_per_slot.epoch_attester_indexes,
+            randao_mix: beacon_state_per_slot.randao_mix,
+            balances: beacon_state_per_slot.balances,
+
+            validators: beacon_state_per_epoch.validators,
+            inactivity_scores: beacon_state_per_epoch.inactivity_scores,
+            committee_caches: beacon_state_per_epoch.committee_caches,
+
+            eth1_data: Default::default()
+        }
+    }
+}
+
+impl From<BeaconState> for BeaconStatePerEpoch {
+    fn from(beacon_state: BeaconState) -> Self {
+        BeaconStatePerEpoch {
+            validators: beacon_state.validators,
+            inactivity_scores: beacon_state.inactivity_scores,
+            committee_caches: beacon_state.committee_caches,
+        }
+    }
+}
+
 /*
 #[derive(Debug, Clone, Hash, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
 pub struct TotalActiveBalance(Epoch, u64);

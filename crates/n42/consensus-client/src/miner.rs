@@ -237,7 +237,8 @@ where
     /// Runs the [`N42Miner`] in a loop, polling the miner and building payloads.
     async fn run(mut self) -> eyre::Result<()> {
         self.provider.save_beacon_block_hash_by_eth1_hash(&self.provider.chain_spec().genesis_hash(), self.provider.chain_spec().genesis_hash())?;
-        self.provider.save_beacon_state_by_hash(&self.provider.chain_spec().genesis_hash(), BeaconState::new())?;
+        self.provider.save_beacon_block_by_hash(&self.provider.chain_spec().genesis_hash(), Default::default())?;
+        self.beacon.save_beacon_state_by_hash(&self.provider.chain_spec().genesis_hash(), BeaconState::new())?;
 
         if !(self.get_best_block_num_signers()? == 1 && self.is_among_signers()?) {
             self.initial_sync().await?;
@@ -749,7 +750,7 @@ where
         self.provider.save_beacon_block_by_hash(&beacon_block_hash, beacon_block.clone())?;
         self.provider.save_beacon_block_hash_by_eth1_hash(&block.hash(), beacon_block_hash)?;
 
-        let new_beacon_state = self.provider.get_beacon_state_by_hash(&beacon_block_hash)?
+        let new_beacon_state = self.beacon.get_beacon_state_by_hash(&beacon_block_hash)?
             .ok_or(eyre::eyre!("get_beacon_state_by_hash failed, hash={:?}", beacon_block_hash))?;
 
         self.recent_blocks.insert(block.hash_slow(), block.clone());

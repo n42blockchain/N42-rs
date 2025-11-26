@@ -251,7 +251,7 @@ where
                 Some(verification_result) = self.block_verify_result_rx.recv() => {
                     debug!(target: "consensus-client", ?verification_result, "verification_rx");
                     if let Err(e) = self.handle_verification_result(verification_result) {
-                        error!(target: "consensus-client", "Error handling verification_result: {:?}", e);
+                        warn!(target: "consensus-client", "Error handling verification_result: {:?}", e);
                     }
                 }
                 Some((new_block, hash)) = self.new_block_rx.recv() => {
@@ -663,9 +663,13 @@ where
 
         let signature = Signature::from_bytes(&hex::decode(signature)?).map_err(|e| eyre::eyre!("{e:?}"))?;
 
+        let pubkey_str = pubkey.clone();
         let pubkey = PublicKey::from_bytes(&hex::decode(pubkey)?).map_err(|e| eyre::eyre!("{e:?}"))?;
 
-        let validator_index = self.beacon.get_validator_index_from_beacon_state(block.parent_hash(), pubkey)?.ok_or(eyre::eyre!("validator not found, block_hash={block_hash:?}, pubkey={pubkey:?}"))?;
+        let validator_index = self.beacon.get_validator_index_from_beacon_state(block.parent_hash(), pubkey)?.ok_or(eyre::eyre!("validator not found, block_hash={block_hash:?}, pubkey={pubkey_str:?}"))?;
+        if attestation.validator_indexes.contains(&validator_index) {
+            return Err(eyre::eyre!("duplicate attestations for validator, pubkey={pubkey_str:?}"));
+        }
 
         if attestation_data.receipts_root != attestation.data.receipts_root {
             return Err(eyre::eyre!("mismatch receipts_root, expected={:?}, got={:?}", attestation.data.receipts_root, attestation_data.receipts_root));

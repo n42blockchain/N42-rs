@@ -33,7 +33,8 @@ use reth_chainspec::{
 use reth_provider::{
     BlockHashReader,
     BlockReaderIdExt,
-    BlockNumReader};
+    BlockNumReader
+};
 
 #[cfg(test)]
 use crate::{utils::n42_payload_attributes, snapshot_test_utils::TesterAccountPool};

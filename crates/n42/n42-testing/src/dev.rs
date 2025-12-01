@@ -46,7 +46,8 @@ use reth::{
     args::{
         DevArgs,
         DiscoveryArgs,
-        NetworkArgs, RpcServerArgs},
+        NetworkArgs,
+        RpcServerArgs},
     builder::Node,
     rpc::types::engine::ForkchoiceState,
 };

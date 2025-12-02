@@ -47,7 +47,8 @@ use reth::{
         DevArgs,
         DiscoveryArgs,
         NetworkArgs,
-        RpcServerArgs},
+        RpcServerArgs
+    },
     builder::Node,
     rpc::types::engine::ForkchoiceState,
 };

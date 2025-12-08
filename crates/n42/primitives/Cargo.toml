@@ -47,5 +47,9 @@ bytes.workspace=true
 blst.workspace = true
 
 secp256k1.workspace=true
+
+typenum.workspace=true
+merkle_db_rs.workspace=true
+
 [lints]
 workspace = true

@@ -35,6 +35,7 @@ alloy-rpc-types-engine.workspace = true
 auto_impl.workspace = true
 
 n42-primitives.workspace = true
+merkle_db_rs.workspace=true
 
 [features]
 default = ["std"]

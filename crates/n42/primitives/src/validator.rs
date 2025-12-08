@@ -1,8 +1,7 @@
 #![allow(missing_docs)]
 use ssz_derive::{Encode, Decode};
 use ssz::{Encode, Decode};
-//use ssz_derive::{Encode, Decode};
-//use tree_hash_derive::TreeHash;
+use tree_hash_derive::TreeHash;
 use serde::{Deserialize, Serialize};
 use alloy_primitives::{Address, BlockNumber, B256, Bytes};
 use crate::{
@@ -34,7 +33,7 @@ pub struct ValidatorInfo {
     pub inactivity_score: u64,
 }
 
-#[derive(Debug, Clone, Hash, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Hash, Default, PartialEq, Serialize, Deserialize, Encode, Decode, TreeHash)]
 pub struct Validator {
     pub pubkey: BLSPubkey,
     pub withdrawal_credentials: B256,  // Commitment to pubkey for withdrawals

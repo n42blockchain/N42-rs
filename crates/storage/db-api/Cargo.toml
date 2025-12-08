@@ -44,6 +44,7 @@ derive_more.workspace = true
 bytes.workspace = true
 n42-primitives.workspace = true
 serde_json.workspace = true
+merkle_db_rs.workspace=true
 
 # arbitrary utils
 arbitrary = { workspace = true, features = ["derive"], optional = true }

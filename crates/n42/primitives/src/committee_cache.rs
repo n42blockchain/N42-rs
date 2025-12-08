@@ -88,11 +88,12 @@ impl CommitteeCache {
         }
 
         // The use of `NonZeroUsize` reduces the maximum number of possible validators by one.
-        if state.validators.len() == usize::MAX {
+        if state.validators_store.len() == usize::MAX {
             return Err(eyre::eyre!("Error::TooManyValidators"));
         }
 
-        let active_validator_indices = get_active_validator_indices(&state.validators, epoch);
+        //let active_validator_indices = get_active_validator_indices(&state.validators, epoch);
+        let active_validator_indices = state.get_active_validator_indices(epoch);
 
         if active_validator_indices.is_empty() {
             return Err(eyre::eyre!("Error::InsufficientValidators"));
@@ -112,7 +113,7 @@ impl CommitteeCache {
         )
         .ok_or(eyre::eyre!("Error::UnableToShuffle"))?;
 
-        let mut shuffling_positions = vec![<_>::default(); state.validators.len()];
+        let mut shuffling_positions = vec![<_>::default(); state.validators_store.len()];
         for (i, &v) in shuffling.iter().enumerate() {
             *shuffling_positions
                 .get_mut(v)

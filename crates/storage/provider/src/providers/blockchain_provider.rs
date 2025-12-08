@@ -16,6 +16,8 @@ use alloy_eips::{
 };
 use alloy_primitives::{Address, BlockHash, BlockNumber, Sealable, TxHash, TxNumber, B256, U256};
 use alloy_rpc_types_engine::ForkchoiceState;
+use merkle_db_rs::tree::{Tree, VecTree};
+use crate::errors::any::AnyError;
 use reth_chain_state::{
     BlockState, CanonicalInMemoryState, ForkChoiceNotifications, ForkChoiceSubscriptions,
     MemoryOverlayStateProvider,
@@ -51,7 +53,7 @@ use std::{
     time::Instant,
 };
 use tracing::trace;
-use n42_primitives::Snapshot;
+use n42_primitives::{Snapshot, Validator};
 use n42_primitives::{BeaconBlock, BeaconState};
 
 /// The main type for interacting with the blockchain.
@@ -741,11 +743,24 @@ impl<N: ProviderNodeTypes> BeaconProvider for BlockchainProvider<N> {
     }
 
     fn get_beacon_state_by_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BeaconState>> {
-        self.database_provider_ro()?.get_beacon_state_by_hash(block_hash)
+        let mut beacon_state = match self.database_provider_ro()?.get_beacon_state_by_hash(block_hash)? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        let validators_store = VecTree::restore(beacon_state.validators, beacon_state.validators_len, |tree_hash| {
+            self.get_tree_by_hash_for_validator(&tree_hash).unwrap_or(None)
+        }).map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+        beacon_state.validators_store = validators_store;
+        Ok(Some(beacon_state))
     }
 
     fn get_beacon_block_hash_by_eth1_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BlockHash>> {
         self.database_provider_ro()?.get_beacon_block_hash_by_eth1_hash(block_hash)
+    }
+
+    fn get_tree_by_hash_for_validator(&self, tree_hash: &B256) -> ProviderResult<Option<merkle_db_rs::tree::Tree<Validator>>> {
+        self.database_provider_ro()?.get_tree_by_hash_for_validator(tree_hash)
     }
 }
 
@@ -757,14 +772,36 @@ impl<N: ProviderNodeTypes> BeaconProviderWriter for BlockchainProvider<N> {
     }
 
     fn save_beacon_state_by_hash(&self, block_hash: &BlockHash,  beacon_state: BeaconState) -> ProviderResult<()> {
+        beacon_state.validators_store.diff_save(|tree_hash, tree: &Tree<Validator>| {
+            self.save_tree_by_hash_for_validator(tree_hash, tree.clone())
+        },
+        |tree_hash| {
+            self.get_tree_by_hash_for_validator(&tree_hash).unwrap_or(None).is_some()
+        }).map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+        let beacon_state_updated = BeaconState {
+            validators: beacon_state.validators_store.root(),
+            validators_len: beacon_state.validators_store.len() as u64,
+
+            // to prevent unnecessary copying from beacon_state
+            validators_store: Default::default(),
+
+            ..beacon_state
+        };
+
         let provider_rw = self.database_provider_rw()?;
-        provider_rw.save_beacon_state_by_hash(block_hash, beacon_state)?;
+        provider_rw.save_beacon_state_by_hash(block_hash, beacon_state_updated)?;
         provider_rw.commit().map(|_|())
     }
 
     fn save_beacon_block_hash_by_eth1_hash(&self, eth1_block_hash: &BlockHash, beacon_block_hash: BlockHash) -> ProviderResult<()> {
         let provider_rw = self.database_provider_rw()?;
         provider_rw.save_beacon_block_hash_by_eth1_hash(eth1_block_hash, beacon_block_hash)?;
+        provider_rw.commit().map(|_|())
+    }
+
+    fn save_tree_by_hash_for_validator(&self, tree_hash: &B256,  tree: merkle_db_rs::tree::Tree<Validator>) -> ProviderResult<()> {
+        let provider_rw = self.database_provider_rw()?;
+        provider_rw.save_tree_by_hash_for_validator(tree_hash, tree)?;
         provider_rw.commit().map(|_|())
     }
 

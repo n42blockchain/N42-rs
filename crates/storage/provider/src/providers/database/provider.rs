@@ -1904,6 +1904,10 @@ impl<TX: DbTx + 'static, N: NodeTypes<ChainSpec: EthereumHardforks>> BeaconProvi
     fn get_beacon_block_hash_by_eth1_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BlockHash>> {
         Ok(self.tx.get::<tables::BeaconBlockHashesByEth1Hash>(block_hash.clone())?)
     }
+
+    fn get_tree_by_hash_for_validator(&self, tree_hash: &B256) -> ProviderResult<Option<merkle_db_rs::tree::Tree<Validator>>> {
+        Ok(self.tx.get::<tables::TreeByHashForValidator>(tree_hash.clone())?)
+    }
 }
 
 impl<TX: DbTxMut, N: NodeTypes<ChainSpec: EthereumHardforks>> BeaconProviderWriter for DatabaseProvider<TX, N>{
@@ -1920,6 +1924,9 @@ impl<TX: DbTxMut, N: NodeTypes<ChainSpec: EthereumHardforks>> BeaconProviderWrit
         Ok(self.tx.put::<tables::BeaconBlockHashesByEth1Hash>(eth1_block_hash.clone(), beacon_block_hash)?)
     }
 
+    fn save_tree_by_hash_for_validator(&self, tree_hash: &B256,  tree: merkle_db_rs::tree::Tree<Validator>) -> ProviderResult<()> {
+        Ok(self.tx.put::<tables::TreeByHashForValidator>(tree_hash.clone(), tree)?)
+    }
 }
 
 impl<TX: DbTx + 'static, N: NodeTypesForProvider> BlockBodyIndicesProvider

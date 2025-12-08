@@ -752,6 +752,12 @@ impl<N: ProviderNodeTypes> BeaconProvider for BlockchainProvider<N> {
             self.get_tree_by_hash_for_validator(&tree_hash).unwrap_or(None)
         }).map_err(|e| ProviderError::Other(AnyError::new(e)))?;
         beacon_state.validators_store = validators_store;
+
+        let inactivity_scores_store = VecTree::restore(beacon_state.inactivity_scores, beacon_state.inactivity_scores_len, |tree_hash| {
+            self.get_tree_by_hash_for_u64(&tree_hash).unwrap_or(None)
+        }).map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+        beacon_state.inactivity_scores_store = inactivity_scores_store;
+
         Ok(Some(beacon_state))
     }
 
@@ -761,6 +767,10 @@ impl<N: ProviderNodeTypes> BeaconProvider for BlockchainProvider<N> {
 
     fn get_tree_by_hash_for_validator(&self, tree_hash: &B256) -> ProviderResult<Option<merkle_db_rs::tree::Tree<Validator>>> {
         self.database_provider_ro()?.get_tree_by_hash_for_validator(tree_hash)
+    }
+
+    fn get_tree_by_hash_for_u64(&self, tree_hash: &B256) -> ProviderResult<Option<merkle_db_rs::tree::Tree<u64>>> {
+        self.database_provider_ro()?.get_tree_by_hash_for_u64(tree_hash)
     }
 }
 
@@ -778,12 +788,23 @@ impl<N: ProviderNodeTypes> BeaconProviderWriter for BlockchainProvider<N> {
         |tree_hash| {
             self.get_tree_by_hash_for_validator(&tree_hash).unwrap_or(None).is_some()
         }).map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+
+        beacon_state.inactivity_scores_store.diff_save(|tree_hash, tree: &Tree<u64>| {
+            self.save_tree_by_hash_for_u64(tree_hash, tree.clone())
+        },
+        |tree_hash| {
+            self.get_tree_by_hash_for_u64(&tree_hash).unwrap_or(None).is_some()
+        }).map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+
         let beacon_state_updated = BeaconState {
             validators: beacon_state.validators_store.root(),
             validators_len: beacon_state.validators_store.len() as u64,
+            inactivity_scores: beacon_state.inactivity_scores_store.root(),
+            inactivity_scores_len: beacon_state.inactivity_scores_store.len() as u64,
 
             // to prevent unnecessary copying from beacon_state
             validators_store: Default::default(),
+            inactivity_scores_store: Default::default(),
 
             ..beacon_state
         };
@@ -802,6 +823,12 @@ impl<N: ProviderNodeTypes> BeaconProviderWriter for BlockchainProvider<N> {
     fn save_tree_by_hash_for_validator(&self, tree_hash: &B256,  tree: merkle_db_rs::tree::Tree<Validator>) -> ProviderResult<()> {
         let provider_rw = self.database_provider_rw()?;
         provider_rw.save_tree_by_hash_for_validator(tree_hash, tree)?;
+        provider_rw.commit().map(|_|())
+    }
+
+    fn save_tree_by_hash_for_u64(&self, tree_hash: &B256,  tree: merkle_db_rs::tree::Tree<u64>) -> ProviderResult<()> {
+        let provider_rw = self.database_provider_rw()?;
+        provider_rw.save_tree_by_hash_for_u64(tree_hash, tree)?;
         provider_rw.commit().map(|_|())
     }
 

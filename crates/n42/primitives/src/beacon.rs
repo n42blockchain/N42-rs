@@ -192,7 +192,15 @@ pub struct BeaconState {
     pub validators_store: VecTree<Validator, U100000>,
 
     pub balances: Vec<Gwei>,
-    pub inactivity_scores: Vec<u64>,
+
+    //pub inactivity_scores: Vec<u64>,
+    pub inactivity_scores: Hash256,
+    pub inactivity_scores_len: u64,
+
+    #[serde(skip_serializing, skip_deserializing)]
+    #[ssz(skip_serializing, skip_deserializing)]
+    pub inactivity_scores_store: VecTree<u64, U100000>,
+
     pub randao_mix: B256,
 
     pub next_withdrawal_index: u64,
@@ -425,11 +433,16 @@ impl BeaconState {
     pub fn new() -> Self {
         let validators_len = 0;
         let validators_store = VecTree::try_new(validators_len).unwrap();
+        let inactivity_scores_len = 0;
+        let inactivity_scores_store = VecTree::try_new(inactivity_scores_len).unwrap();
         Self {
             committee_caches: vec![Default::default(); 3],
             validators: validators_store.root(),
             validators_store,
             validators_len,
+            inactivity_scores: inactivity_scores_store.root(),
+            inactivity_scores_store,
+            inactivity_scores_len,
             ..Default::default()
         }
     }
@@ -485,6 +498,16 @@ impl BeaconState {
         let active_validator_indices = self.get_active_validator_indices(epoch);
         for validator_index in active_validator_indices {
             let is_active = self.epoch_attester_indexes.contains(&(validator_index as u64));
+            let mut inactivity_score = self.inactivity_scores_store.get(validator_index).ok_or(eyre::eyre!("InactivityScoreNotfound"))?.clone();
+            if is_active {
+                inactivity_score = inactivity_score.saturating_sub(spec.inactivity_score_recovery_rate);
+            } else {
+                if inactivity_score < spec.max_inactivity_score {
+                    inactivity_score = inactivity_score.saturating_add(spec.inactivity_score_bias);
+                }
+            }
+            self.inactivity_scores_store.set(validator_index, inactivity_score)?;
+            /*
             let inactivity_score = self.get_inactivity_score_mut(validator_index)?;
             if is_active {
                 *inactivity_score = inactivity_score.saturating_sub(spec.inactivity_score_recovery_rate);
@@ -493,6 +516,7 @@ impl BeaconState {
                     *inactivity_score = inactivity_score.saturating_add(spec.inactivity_score_bias);
                 }
             }
+            */
         }
         let validator_statuses = ValidatorStatuses::new(self, spec)?;
 
@@ -976,18 +1000,20 @@ impl BeaconState {
     }
 
     pub fn get_inactivity_score(&self, validator_index: usize) -> eyre::Result<u64> {
-        self.inactivity_scores
+        self.inactivity_scores_store
             .get(validator_index)
             .ok_or(eyre::eyre!("UnknownValidator, {validator_index}"))
             .copied()
     }
 
+    /*
     /// Get a mutable reference to the inactivity_score of a single validator.
     pub fn get_inactivity_score_mut(&mut self, validator_index: usize) -> eyre::Result<&mut u64> {
         self.inactivity_scores
             .get_mut(validator_index)
             .ok_or(eyre::eyre!("InactivityScoreOutOfBounds, {validator_index}"))
     }
+    */
 
     pub fn get_pending_balance_to_withdraw(&self, validator_index: usize) -> eyre::Result<u64> {
         let mut pending_balance = 0;
@@ -1400,7 +1426,7 @@ pub fn apply_deposit(
             spec,
         ))?;
         self.balances.push(amount);
-        self.inactivity_scores.push(0);
+        self.inactivity_scores_store.push(0)?;
 
         // Altair or later initializations.
         /*

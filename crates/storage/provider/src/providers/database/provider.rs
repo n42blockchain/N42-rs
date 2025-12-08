@@ -1908,6 +1908,10 @@ impl<TX: DbTx + 'static, N: NodeTypes<ChainSpec: EthereumHardforks>> BeaconProvi
     fn get_tree_by_hash_for_validator(&self, tree_hash: &B256) -> ProviderResult<Option<merkle_db_rs::tree::Tree<Validator>>> {
         Ok(self.tx.get::<tables::TreeByHashForValidator>(tree_hash.clone())?)
     }
+
+    fn get_tree_by_hash_for_u64(&self, tree_hash: &B256) -> ProviderResult<Option<merkle_db_rs::tree::Tree<u64>>> {
+        Ok(self.tx.get::<tables::TreeByHashForU64>(tree_hash.clone())?)
+    }
 }
 
 impl<TX: DbTxMut, N: NodeTypes<ChainSpec: EthereumHardforks>> BeaconProviderWriter for DatabaseProvider<TX, N>{
@@ -1926,6 +1930,10 @@ impl<TX: DbTxMut, N: NodeTypes<ChainSpec: EthereumHardforks>> BeaconProviderWrit
 
     fn save_tree_by_hash_for_validator(&self, tree_hash: &B256,  tree: merkle_db_rs::tree::Tree<Validator>) -> ProviderResult<()> {
         Ok(self.tx.put::<tables::TreeByHashForValidator>(tree_hash.clone(), tree)?)
+    }
+
+    fn save_tree_by_hash_for_u64(&self, tree_hash: &B256,  tree: merkle_db_rs::tree::Tree<u64>) -> ProviderResult<()> {
+        Ok(self.tx.put::<tables::TreeByHashForU64>(tree_hash.clone(), tree)?)
     }
 }
 

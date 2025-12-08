@@ -380,6 +380,12 @@ tables! {
         type Value = merkle_db_rs::tree::Tree<Validator>;
         }
 
+    /// Stores the Tree node per tree node hash for u64
+    table TreeByHashForU64 {
+        type Key = B256;
+        type Value = merkle_db_rs::tree::Tree<u64>;
+        }
+
     /// Stores the header hashes belonging to the canonical chain.
     table CanonicalHeaders {
         type Key = BlockNumber;

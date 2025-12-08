@@ -29,6 +29,8 @@ pub trait BeaconProvider{
     fn get_beacon_block_hash_by_eth1_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BlockHash>>;
 
     fn get_tree_by_hash_for_validator(&self, tree_hash: &B256) -> ProviderResult<Option<merkle_db_rs::tree::Tree<Validator>>>;
+
+    fn get_tree_by_hash_for_u64(&self, tree_hash: &B256) -> ProviderResult<Option<merkle_db_rs::tree::Tree<u64>>>;
 }
 
 pub trait BeaconProviderWriter {
@@ -40,4 +42,6 @@ pub trait BeaconProviderWriter {
     fn save_beacon_block_hash_by_eth1_hash(&self, eth1_block_hash: &BlockHash, beacon_block_hash: BlockHash) -> ProviderResult<()>;
 
     fn save_tree_by_hash_for_validator(&self, tree_hash: &B256,  tree: merkle_db_rs::tree::Tree<Validator>) -> ProviderResult<()>;
+
+    fn save_tree_by_hash_for_u64(&self, tree_hash: &B256,  tree: merkle_db_rs::tree::Tree<u64>) -> ProviderResult<()>;
 }

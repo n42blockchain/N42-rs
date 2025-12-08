@@ -10,6 +10,7 @@ exclude.workspace = true
 
 [dependencies]
 n42-engine-primitives.workspace = true
+merkle_db_rs.workspace=true
 n42-primitives.workspace = true
 n42-clique.workspace = true
 # reth

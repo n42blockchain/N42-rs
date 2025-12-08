@@ -20,12 +20,14 @@ use alloy_sol_types::{SolEnum, SolEvent, sol};
 use tracing::{trace, debug, error, info, warn};
 
 use std::collections::{HashMap, BTreeMap};
-use crate::{activation_queue::ActivationQueue, beacon_committee::BeaconCommittee, committee_cache::get_active_validator_indices, Hash256, Slot, Validator, CommitteeIndex};
+use crate::{activation_queue::ActivationQueue, beacon_committee::BeaconCommittee, Hash256, Slot, Validator, CommitteeIndex};
 use crate::safe_aitrh::SafeArith;
 use crate::safe_aitrh::SafeArithIter;
 use std::sync::Arc;
 use crate::committee_cache::CommitteeCache;
 use ethereum_hashing::hash;
+use merkle_db_rs::tree::VecTree;
+use typenum::{U100000};
 
 pub const SLOTS_PER_EPOCH: u64 = 32;
 
@@ -180,7 +182,15 @@ pub struct BeaconBlockChangeset{
 pub struct BeaconState {
     pub slot: u64,
     pub eth1_deposit_index: u64,
-    pub validators: Vec<Validator>,
+    //pub validators: Vec<Validator>,
+
+    pub validators: Hash256,
+    pub validators_len: u64,
+
+    #[serde(skip_serializing, skip_deserializing)]
+    #[ssz(skip_serializing, skip_deserializing)]
+    pub validators_store: VecTree<Validator, U100000>,
+
     pub balances: Vec<Gwei>,
     pub inactivity_scores: Vec<u64>,
     pub randao_mix: B256,
@@ -413,8 +423,13 @@ pub fn parse_deposit_log(log: &Log) -> Option<DepositEvent> {
 
 impl BeaconState {
     pub fn new() -> Self {
+        let validators_len = 0;
+        let validators_store = VecTree::try_new(validators_len).unwrap();
         Self {
             committee_caches: vec![Default::default(); 3],
+            validators: validators_store.root(),
+            validators_store,
+            validators_len,
             ..Default::default()
         }
     }
@@ -446,6 +461,17 @@ impl BeaconState {
             self.build_committee_cache(RelativeEpoch::Previous, spec)?;
         }
 
+        for index in (0..self.balances.len()) {
+            let balance = self.balances[index].min(spec.max_effective_balance);
+            let new_effective_balance = round_to_nearest(balance, spec.effective_balance_increment);
+            let mut validator = self.validators_store.get(index).ok_or(eyre::eyre!("ValidatorNotfound"))?.clone();
+            if new_effective_balance != validator.effective_balance {
+                validator.effective_balance = new_effective_balance;
+                self.validators_store.set(index, validator)?;
+            }
+        }
+
+        /*
         for (index, validator) in self.validators.iter_mut().enumerate() {
             let balance = self.balances[index].min(spec.max_effective_balance);
             let new_effective_balance = round_to_nearest(balance, spec.effective_balance_increment);
@@ -453,9 +479,10 @@ impl BeaconState {
                 validator.effective_balance = new_effective_balance;
             }
         }
+        */
 
         let epoch = self.previous_epoch();
-        let active_validator_indices = get_active_validator_indices(&self.validators, epoch);
+        let active_validator_indices = self.get_active_validator_indices(epoch);
         for validator_index in active_validator_indices {
             let is_active = self.epoch_attester_indexes.contains(&(validator_index as u64));
             let inactivity_score = self.get_inactivity_score_mut(validator_index)?;
@@ -491,7 +518,7 @@ impl BeaconState {
         };
         //let fork_name = state.fork_name_unchecked();
         let indices_to_update: Vec<_> = self
-            .validators
+            .validators_store
             .iter()
             .enumerate()
             .filter(|(_, validator)| {
@@ -501,11 +528,21 @@ impl BeaconState {
             .collect();
 
         for index in indices_to_update {
+            /*
             let validator = self.get_validator_mut(index)?;
             if validator.is_eligible_for_activation_queue(spec) {
                 validator.activation_eligibility_epoch = current_epoch.safe_add(1)?;
             }
             if is_ejectable(validator) {
+                self.initiate_validator_exit(index, spec)?;
+            }
+            */
+            let mut validator = self.validators_store.get(index).ok_or(eyre::eyre!("ValidatorNotfound"))?.clone();
+            if validator.is_eligible_for_activation_queue(spec) {
+                validator.activation_eligibility_epoch = current_epoch.safe_add(1)?;
+                self.validators_store.set(index, validator.clone())?;
+            }
+            if is_ejectable(&validator) {
                 self.initiate_validator_exit(index, spec)?;
             }
         }
@@ -517,7 +554,7 @@ impl BeaconState {
         let next_epoch = self.next_epoch()?;
         let mut full_activation_queue = ActivationQueue::default();
 
-        for (index, validator) in self.validators.iter().enumerate() {
+        for (index, validator) in self.validators_store.iter().enumerate() {
 
             // Add to speculative activation queue.
             full_activation_queue
@@ -532,7 +569,10 @@ impl BeaconState {
 
         let delayed_activation_epoch = self.compute_activation_exit_epoch(current_epoch, spec)?;
         for index in activation_queue {
-            self.get_validator_mut(index)?.activation_epoch = delayed_activation_epoch;
+            //self.get_validator_mut(index)?.activation_epoch = delayed_activation_epoch;
+            let mut validator = self.validators_store.get(index).ok_or(eyre::eyre!("ValidatorNotfound"))?.clone();
+            validator.activation_epoch = delayed_activation_epoch;
+            self.validators_store.set(index, validator)?;
         }
 
         Ok(())
@@ -782,7 +822,7 @@ impl BeaconState {
             }
 
     let bound = std::cmp::min(
-        self.validators.len() as u64,
+        self.validators_store.len() as u64,
         spec.max_validators_per_withdrawals_sweep,
     );
     debug!(target: "consensus-client", ?bound, "get_expected_withdrawals");
@@ -825,7 +865,7 @@ impl BeaconState {
         }
         validator_index = validator_index
             .safe_add(1)?
-            .safe_rem(self.validators.len() as u64)?;
+            .safe_rem(self.validators_store.len() as u64)?;
     }
 
     debug!(target: "consensus-client", ?withdrawals, processed_partial_withdrawals_count, "get_expected_withdrawals");
@@ -868,17 +908,17 @@ impl BeaconState {
                 let next_validator_index = latest_withdrawal
                     .validator_index
                     .safe_add(1)?
-                    .safe_rem(self.validators.len() as u64)?;
+                    .safe_rem(self.validators_store.len() as u64)?;
                 self.next_withdrawal_validator_index = next_validator_index;
             }
         }
 
         // Advance sweep by the max length of the sweep if there was not a full set of withdrawals
-        if expected_withdrawals.len() != max_withdrawals_per_payload && !self.validators.is_empty() {
+        if expected_withdrawals.len() != max_withdrawals_per_payload && !self.validators_store.is_empty() {
             let next_validator_index = self
                 .next_withdrawal_validator_index
                 .safe_add(spec.max_validators_per_withdrawals_sweep)?
-                .safe_rem(self.validators.len() as u64)?;
+                .safe_rem(self.validators_store.len() as u64)?;
             self.next_withdrawal_validator_index = next_validator_index;
         }
 
@@ -907,17 +947,19 @@ impl BeaconState {
 
     /// Safe indexer for the `validators` list.
     pub fn get_validator(&self, validator_index: usize) -> eyre::Result<&Validator> {
-        self.validators
+        self.validators_store
             .get(validator_index)
             .ok_or(eyre::eyre!("UnknownValidator, {validator_index}"))
     }
 
+    /*
     /// Safe mutator for the `validators` list.
     pub fn get_validator_mut(&mut self, validator_index: usize) -> eyre::Result<&mut Validator> {
         self.validators
             .get_mut(validator_index)
             .ok_or(eyre::eyre!("UnknownValidator, {validator_index}"))
     }
+    */
 
     pub fn get_balance(&self, validator_index: usize) -> eyre::Result<u64> {
         self.balances
@@ -1004,7 +1046,7 @@ impl BeaconState {
     }
 
     pub fn get_validator_index_from_pubkey(&self, pubkey: &BLSPubkey) -> Option<usize> {
-        self.validators.iter().position(|validator| validator.pubkey == *pubkey)
+        self.validators_store.iter().position(|validator| validator.pubkey == *pubkey)
     }
 
     /// Return the effective balance for a validator with the given `validator_index`.
@@ -1033,10 +1075,17 @@ impl BeaconState {
         let effective_balance = self.get_effective_balance(index)?;
         let exit_queue_epoch = self.compute_exit_epoch_and_update_churn(effective_balance, spec)?;
 
+        /*
         let validator = self.get_validator_mut(index)?;
         validator.exit_epoch = exit_queue_epoch;
         validator.withdrawable_epoch =
             exit_queue_epoch.safe_add(spec.min_validator_withdrawability_delay)?;
+        */
+        let mut validator = self.validators_store.get(index).ok_or(eyre::eyre!("ValidatorNotfound"))?.clone();
+        validator.exit_epoch = exit_queue_epoch;
+        validator.withdrawable_epoch =
+            exit_queue_epoch.safe_add(spec.min_validator_withdrawability_delay)?;
+        self.validators_store.set(index, validator)?;
 
         /*
         state
@@ -1136,7 +1185,7 @@ pub fn verify_exit(
     let exit = &signed_exit.voluntary_exit;
 
     let validator = self
-        .validators
+        .validators_store
         .get(exit.validator_index as usize)
         .ok_or_else(|| eyre::eyre!("ExitInvalid::ValidatorUnknown({}", exit.validator_index))?;
 
@@ -1341,15 +1390,15 @@ pub fn apply_deposit(
         amount: u64,
         spec: &ChainSpec,
     ) -> eyre::Result<usize> {
-        let index = self.validators.len();
+        let index = self.validators_store.len();
         //let fork_name = self.fork_name_unchecked();
-        self.validators.push(Validator::from_deposit(
+        self.validators_store.push(Validator::from_deposit(
             pubkey,
             withdrawal_credentials,
             amount,
             //fork_name,
             spec,
-        ));
+        ))?;
         self.balances.push(amount);
         self.inactivity_scores.push(0);
 
@@ -1397,7 +1446,7 @@ pub fn apply_deposit(
 
         // Guard against an out-of-bounds during the validator balance update.
         if validator_statuses.statuses.len() != self.balances.len()
-            || validator_statuses.statuses.len() != self.validators.len()
+            || validator_statuses.statuses.len() != self.validators_store.len()
         {
             return Err(eyre::eyre!("ValidatorStatusesInconsistent"));
         }
@@ -1450,7 +1499,7 @@ pub fn apply_deposit(
         */
         let finality_delay = 0;
 
-        let mut deltas = vec![AttestationDelta::default(); self.validators.len()];
+        let mut deltas = vec![AttestationDelta::default(); self.validators_store.len()];
 
         let total_balances = &validator_statuses.total_balances;
         let sqrt_total_active_balance = SqrtTotalActiveBalance::new(total_balances.current_epoch());
@@ -1571,7 +1620,7 @@ pub fn apply_deposit(
 
         let mut total_active_balance = 0;
 
-        for validator in &self.validators {
+        for validator in self.validators_store.iter() {
             if validator.is_active_at(current_epoch) {
                 total_active_balance.safe_add_assign(validator.effective_balance)?;
             }
@@ -1693,9 +1742,20 @@ pub fn apply_deposit(
         relative_epoch: RelativeEpoch,
     ) -> bool {
         let epoch = relative_epoch.into_epoch(self.current_epoch());
-        let active_validator_indices = get_active_validator_indices(&self.validators, epoch);
+        let active_validator_indices = self.get_active_validator_indices(epoch);
 
         !active_validator_indices.is_empty()
+    }
+
+    pub fn get_active_validator_indices(&self, epoch: Epoch) -> Vec<usize> {
+        let mut active = Vec::with_capacity(self.validators_store.len());
+        for (index, validator) in self.validators_store.iter().enumerate() {
+            if validator.is_active_at(epoch) {
+                active.push(index)
+            }
+        }
+
+        active
     }
 
     /// Get all of the Beacon committees at a given relative epoch.
@@ -1835,13 +1895,13 @@ impl ValidatorStatuses {
         state: &BeaconState,
         spec: &ChainSpec,
     ) -> eyre::Result<Self> {
-        let mut statuses = Vec::with_capacity(state.validators.len());
+        let mut statuses = Vec::with_capacity(state.validators_store.len());
         let mut total_balances = TotalBalances::new(spec);
 
         let current_epoch = state.current_epoch();
         let previous_epoch = state.previous_epoch();
 
-        for (validator_index, validator) in state.validators.iter().enumerate() {
+        for (validator_index, validator) in state.validators_store.iter().enumerate() {
             let effective_balance = validator.effective_balance;
             let inactivity_score = state.get_inactivity_score(validator_index)?;
             let is_punishable = inactivity_score >= spec.trigger_punish_inactivity_score;

@@ -1,7 +1,7 @@
 use std::ops::RangeInclusive;
-use alloy_primitives::{Address, BlockNumber, BlockHash};
+use alloy_primitives::{Address, BlockHash, BlockNumber, B256};
 use auto_impl::auto_impl;
-use n42_primitives::{BeaconBlock, BeaconState, BeaconStateChangeset,BeaconBlockChangeset};
+use n42_primitives::{BeaconBlock, BeaconBlockChangeset, BeaconState, BeaconStateChangeset, Validator};
 use reth_storage_errors::ProviderResult;
 
 #[auto_impl(&, Arc, Box)]
@@ -27,6 +27,8 @@ pub trait BeaconProvider{
     fn get_beacon_state_by_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BeaconState>>;
 
     fn get_beacon_block_hash_by_eth1_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BlockHash>>;
+
+    fn get_tree_by_hash_for_validator(&self, tree_hash: &B256) -> ProviderResult<Option<merkle_db_rs::tree::Tree<Validator>>>;
 }
 
 pub trait BeaconProviderWriter {
@@ -37,4 +39,5 @@ pub trait BeaconProviderWriter {
 
     fn save_beacon_block_hash_by_eth1_hash(&self, eth1_block_hash: &BlockHash, beacon_block_hash: BlockHash) -> ProviderResult<()>;
 
+    fn save_tree_by_hash_for_validator(&self, tree_hash: &B256,  tree: merkle_db_rs::tree::Tree<Validator>) -> ProviderResult<()>;
 }

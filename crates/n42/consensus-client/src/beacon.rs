@@ -5,6 +5,7 @@ use reth_chainspec::EthereumHardforks;
 use reth_provider::{BlockIdReader, BlockReader, ChainSpecProvider, BeaconProvider, BeaconProviderWriter};
 use alloy_primitives::Sealable;
 use reth_primitives::{Block, Header, SealedBlock};
+use merkle_db_rs::tree::{Tree, VecTree};
 
 use alloy_eips::{
     eip4895::{Withdrawal, Withdrawals}, eip7685::Requests,
@@ -113,7 +114,7 @@ where
     pub fn get_validator_index_from_beacon_state(&self, block_hash: B256, pubkey: PublicKey) -> eyre::Result<Option<u64>> {
         let beacon_state = self.get_beacon_state_from_block_hash(block_hash)?;
 
-        for (i, validator) in beacon_state.validators.into_iter().enumerate() {
+        for (i, validator) in beacon_state.validators_store.iter().enumerate() {
             if pubkey == PublicKey::from_bytes(&validator.pubkey.as_slice())
                 .map_err(|e| eyre::eyre!("PublicKey::from_bytes error {e:?}"))?
                  {
@@ -132,6 +133,7 @@ where
             .map_err(|e| eyre::eyre!("PublicKey::from_bytes error {e:?}"))?;
         Ok(Some(pubkey))
     }
+
 }
 
 fn parse_execution_requests(requests: &Option<Requests>) -> eyre::Result<ExecutionRequestsV4> {

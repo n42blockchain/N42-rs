@@ -220,7 +220,17 @@ pub struct BeaconState {
     //pub total_active_balance: Option<TotalActiveBalance>,
 
     pub committee_caches: Vec<CommitteeCache>,
-    pub epoch_attester_indexes: BTreeSet<u64>,
+
+    pub epoch_attester_indexes: Hash256,
+    pub epoch_attester_indexes_len: u64,
+
+    #[serde(skip_serializing, skip_deserializing)]
+    #[ssz(skip_serializing, skip_deserializing)]
+    pub epoch_attester_indexes_store: VecTree<u64, U100000>,
+
+    #[serde(skip_serializing, skip_deserializing)]
+    #[ssz(skip_serializing, skip_deserializing)]
+    pub epoch_attester_indexes_set: BTreeSet<u64>,
 }
 
 /*
@@ -443,6 +453,8 @@ impl BeaconState {
         let inactivity_scores_store = VecTree::try_new(inactivity_scores_len).unwrap();
         let balances_len = 0;
         let balances_store = VecTree::try_new(balances_len).unwrap();
+        let epoch_attester_indexes_len = 0;
+        let epoch_attester_indexes_store = VecTree::try_new(epoch_attester_indexes_len).unwrap();
         Self {
             committee_caches: vec![Default::default(); 3],
             validators: validators_store.root(),
@@ -454,6 +466,9 @@ impl BeaconState {
             balances: balances_store.root(),
             balances_store,
             balances_len,
+            epoch_attester_indexes: epoch_attester_indexes_store.root(),
+            epoch_attester_indexes_store,
+            epoch_attester_indexes_len,
             ..Default::default()
         }
     }
@@ -509,7 +524,7 @@ impl BeaconState {
         let epoch = self.previous_epoch();
         let active_validator_indices = self.get_active_validator_indices(epoch);
         for validator_index in active_validator_indices {
-            let is_active = self.epoch_attester_indexes.contains(&(validator_index as u64));
+            let is_active = self.epoch_attester_indexes_set.contains(&(validator_index as u64));
             let mut inactivity_score = self.inactivity_scores_store.get(validator_index).ok_or(eyre::eyre!("InactivityScoreNotfound"))?.clone();
             if is_active {
                 inactivity_score = inactivity_score.saturating_sub(spec.inactivity_score_recovery_rate);
@@ -532,7 +547,8 @@ impl BeaconState {
         }
         let validator_statuses = ValidatorStatuses::new(self, spec)?;
 
-        self.epoch_attester_indexes.clear();
+        self.epoch_attester_indexes_store.clear();
+        self.epoch_attester_indexes_set.clear();
 
         self.process_rewards_and_penalties(&validator_statuses, spec)?;
         self.process_registry_updates(spec)?;
@@ -770,7 +786,10 @@ impl BeaconState {
     pub fn process_one_attestation(&mut self, attestation: &Attestation) -> eyre::Result<()> {
 
         self.verify_aggregate_signature(&attestation)?;
-        self.epoch_attester_indexes.extend(attestation.validator_indexes.iter());
+        //self.epoch_attester_indexes.extend(attestation.validator_indexes.iter());
+        for validator_index in attestation.validator_indexes.iter() {
+            self.epoch_attester_indexes_store.push(*validator_index)?;
+        }
 
         Ok(())
     }
@@ -1960,7 +1979,7 @@ impl ValidatorStatuses {
                 current_epoch_effective_balance: effective_balance,
 
                 //
-                is_previous_epoch_attester: state.epoch_attester_indexes.contains(&(validator_index as u64)),
+                is_previous_epoch_attester: state.epoch_attester_indexes_set.contains(&(validator_index as u64)),
                 is_punishable,
 
                 ..ValidatorStatus::default()

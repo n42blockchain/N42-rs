@@ -763,6 +763,12 @@ impl<N: ProviderNodeTypes> BeaconProvider for BlockchainProvider<N> {
         }).map_err(|e| ProviderError::Other(AnyError::new(e)))?;
         beacon_state.balances_store = balances_store;
 
+        let epoch_attester_indexes_store = VecTree::restore(beacon_state.epoch_attester_indexes, beacon_state.epoch_attester_indexes_len, |tree_hash| {
+            self.get_tree_by_hash_for_u64(&tree_hash).unwrap_or(None)
+        }).map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+        beacon_state.epoch_attester_indexes_set = epoch_attester_indexes_store.iter().copied().collect();
+        beacon_state.epoch_attester_indexes_store = epoch_attester_indexes_store;
+
         Ok(Some(beacon_state))
     }
 
@@ -808,6 +814,13 @@ impl<N: ProviderNodeTypes> BeaconProviderWriter for BlockchainProvider<N> {
             self.get_tree_by_hash_for_u64(&tree_hash).unwrap_or(None).is_some()
         }).map_err(|e| ProviderError::Other(AnyError::new(e)))?;
 
+        beacon_state.epoch_attester_indexes_store.diff_save(|tree_hash, tree: &Tree<u64>| {
+            self.save_tree_by_hash_for_u64(tree_hash, tree.clone())
+        },
+        |tree_hash| {
+            self.get_tree_by_hash_for_u64(&tree_hash).unwrap_or(None).is_some()
+        }).map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+
         let beacon_state_updated = BeaconState {
             validators: beacon_state.validators_store.root(),
             validators_len: beacon_state.validators_store.len() as u64,
@@ -815,11 +828,15 @@ impl<N: ProviderNodeTypes> BeaconProviderWriter for BlockchainProvider<N> {
             inactivity_scores_len: beacon_state.inactivity_scores_store.len() as u64,
             balances: beacon_state.balances_store.root(),
             balances_len: beacon_state.balances_store.len() as u64,
+            epoch_attester_indexes: beacon_state.epoch_attester_indexes_store.root(),
+            epoch_attester_indexes_len: beacon_state.epoch_attester_indexes_store.len() as u64,
 
             // to prevent unnecessary copying from beacon_state
             validators_store: Default::default(),
             inactivity_scores_store: Default::default(),
             balances_store: Default::default(),
+            epoch_attester_indexes_store: Default::default(),
+            epoch_attester_indexes_set: Default::default(),
 
             ..beacon_state
         };

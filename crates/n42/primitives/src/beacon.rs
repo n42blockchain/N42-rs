@@ -191,7 +191,13 @@ pub struct BeaconState {
     #[ssz(skip_serializing, skip_deserializing)]
     pub validators_store: VecTree<Validator, U100000>,
 
-    pub balances: Vec<Gwei>,
+    //pub balances: Vec<Gwei>,
+    pub balances: Hash256,
+    pub balances_len: u64,
+
+    #[serde(skip_serializing, skip_deserializing)]
+    #[ssz(skip_serializing, skip_deserializing)]
+    pub balances_store: VecTree<Gwei, U100000>,
 
     //pub inactivity_scores: Vec<u64>,
     pub inactivity_scores: Hash256,
@@ -435,6 +441,8 @@ impl BeaconState {
         let validators_store = VecTree::try_new(validators_len).unwrap();
         let inactivity_scores_len = 0;
         let inactivity_scores_store = VecTree::try_new(inactivity_scores_len).unwrap();
+        let balances_len = 0;
+        let balances_store = VecTree::try_new(balances_len).unwrap();
         Self {
             committee_caches: vec![Default::default(); 3],
             validators: validators_store.root(),
@@ -443,6 +451,9 @@ impl BeaconState {
             inactivity_scores: inactivity_scores_store.root(),
             inactivity_scores_store,
             inactivity_scores_len,
+            balances: balances_store.root(),
+            balances_store,
+            balances_len,
             ..Default::default()
         }
     }
@@ -474,9 +485,10 @@ impl BeaconState {
             self.build_committee_cache(RelativeEpoch::Previous, spec)?;
         }
 
-        for index in (0..self.balances.len()) {
-            let balance = self.balances[index].min(spec.max_effective_balance);
-            let new_effective_balance = round_to_nearest(balance, spec.effective_balance_increment);
+        for index in (0..self.balances_store.len()) {
+            //let balance = self.balances[index].min(spec.max_effective_balance);
+            let balance = self.balances_store.get(index).ok_or(eyre::eyre!("BalanceNotfound"))?.min(&spec.max_effective_balance);
+            let new_effective_balance = round_to_nearest(*balance, spec.effective_balance_increment);
             let mut validator = self.validators_store.get(index).ok_or(eyre::eyre!("ValidatorNotfound"))?.clone();
             if new_effective_balance != validator.effective_balance {
                 validator.effective_balance = new_effective_balance;
@@ -986,18 +998,20 @@ impl BeaconState {
     */
 
     pub fn get_balance(&self, validator_index: usize) -> eyre::Result<u64> {
-        self.balances
+        self.balances_store
             .get(validator_index)
             .ok_or(eyre::eyre!("UnknownValidator, {validator_index}"))
             .copied()
     }
 
+    /*
     /// Get a mutable reference to the balance of a single validator.
     pub fn get_balance_mut(&mut self, validator_index: usize) -> eyre::Result<&mut u64> {
         self.balances
             .get_mut(validator_index)
             .ok_or(eyre::eyre!("BalancesOutOfBounds, {validator_index}"))
     }
+    */
 
     pub fn get_inactivity_score(&self, validator_index: usize) -> eyre::Result<u64> {
         self.inactivity_scores_store
@@ -1425,7 +1439,7 @@ pub fn apply_deposit(
             //fork_name,
             spec,
         ))?;
-        self.balances.push(amount);
+        self.balances_store.push(amount)?;
         self.inactivity_scores_store.push(0)?;
 
         // Altair or later initializations.
@@ -1471,7 +1485,7 @@ pub fn apply_deposit(
         }
 
         // Guard against an out-of-bounds during the validator balance update.
-        if validator_statuses.statuses.len() != self.balances.len()
+        if validator_statuses.statuses.len() != self.balances_store.len()
             || validator_statuses.statuses.len() != self.validators_store.len()
         {
             return Err(eyre::eyre!("ValidatorStatusesInconsistent"));
@@ -1834,27 +1848,35 @@ pub fn increase_balance(
     index: usize,
     delta: u64,
 ) -> eyre::Result<()> {
-    increase_balance_directly(state.get_balance_mut(index)?, delta)
+    //increase_balance_directly(state.get_balance_mut(index)?, delta)
+    let balance = state.balances_store.get(index).ok_or(eyre::eyre!("BalanceNotfound"))?;
+    Ok(state.balances_store.set(index, balance.saturating_add(delta))?)
 }
 
+/*
 /// Increase the balance of a validator, erroring upon overflow, as per the spec.
 pub fn increase_balance_directly(balance: &mut u64, delta: u64) -> eyre::Result<()> {
     balance.safe_add_assign(delta)?;
     Ok(())
 }
+*/
 
 pub fn decrease_balance(
     state: &mut BeaconState,
     index: usize,
     delta: u64,
 ) -> eyre::Result<()> {
-    decrease_balance_directly(state.get_balance_mut(index)?, delta)
+    //decrease_balance_directly(state.get_balance_mut(index)?, delta)
+    let balance = state.balances_store.get(index).ok_or(eyre::eyre!("BalanceNotfound"))?;
+    Ok(state.balances_store.set(index, balance.saturating_sub(delta))?)
 }
 
+/*
 pub fn decrease_balance_directly(balance: &mut u64, delta: u64) -> eyre::Result<()> {
     *balance = balance.saturating_sub(delta);
     Ok(())
 }
+*/
 
 pub fn is_compounding_withdrawal_credential(
     withdrawal_credentials: B256,

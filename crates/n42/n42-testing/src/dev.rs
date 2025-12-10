@@ -56,7 +56,8 @@ use reth_node_builder::{
     NodeBuilder,
     NodeConfig,
     NodeHandle,
-    FullNode, rpc::RethRpcAddOns,
+    FullNode,
+    rpc::RethRpcAddOns,
 };
 use reth_tasks::TaskManager;
 use n42_engine_types::N42Node;

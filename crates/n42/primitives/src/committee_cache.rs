@@ -73,9 +73,11 @@ impl CommitteeCache {
         // We allow caches to be constructed for historic epochs, per:
         //
         // https://github.com/sigp/lighthouse/issues/3270
+        /*
         let reqd_randao_epoch = epoch
             .saturating_sub(spec.min_seed_lookahead)
             .saturating_sub(1u64);
+        */
 
         //if reqd_randao_epoch < state.min_randao_epoch() || epoch > state.current_epoch() + 1 {
         if epoch > state.current_epoch() + 1 {

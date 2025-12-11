@@ -13,7 +13,10 @@ pub use beacon::*;
 
 mod safe_aitrh;
 mod activation_queue;
+
 mod committee_cache;
+pub use committee_cache::CommitteeCache;
+
 mod shuffle_list;
 mod beacon_committee;
 mod attestation_duty;

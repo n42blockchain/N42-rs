@@ -151,7 +151,7 @@ struct PendingBlockData {
     beacon_state_after_withdrawal: BeaconState,
     execution_requests: Option<Requests>,
     attestations: HashMap<CommitteeIndex, Attestation>,
-    committee_cache: Arc<CommitteeCache>,
+    committee_cache: Option<Arc<CommitteeCache>>,
 }
 
 const DEPOSIT_GAP: u64 = 6;
@@ -757,8 +757,10 @@ where
         };
         let beacon_block = self.beacon.gen_beacon_block(beacon_state_after_withdrawal, parent_beacon_block_hash, &attestations.values().cloned().collect(), &execution_requests, &block)?;
         let beacon_block_hash = beacon_block.hash_slow();
-        debug!(target: "consensus-client", "inserting committee_cache into lru for block hash {:?}", beacon_block_hash);
-        self.recent_committee_caches.insert(beacon_block_hash, committee_cache);
+        if let Some(v) = committee_cache {
+            debug!(target: "consensus-client", "inserting committee_cache into lru for block hash {:?}", beacon_block_hash);
+            self.recent_committee_caches.insert(beacon_block_hash, v);
+        }
         self.provider.save_beacon_block_by_hash(&beacon_block_hash, beacon_block.clone())?;
         self.provider.save_beacon_block_hash_by_eth1_hash(&block.hash(), beacon_block_hash)?;
 
@@ -899,7 +901,7 @@ where
             beacon_state_after_withdrawal: beacon_state_after_withdrawal.clone(),
             execution_requests: execution_requests.clone(),
             attestations: Default::default(),
-            committee_cache: Default::default(),
+            committee_cache: None,
         };
         self.pending_block_data.replace(pending_block_data);
 
@@ -956,7 +958,7 @@ where
         let beacon_committees = committee_cache.get_beacon_committees_at_slot(block.number)?;
         debug!(target: "consensus-client", "{beacon_committees:?}");
 
-        self.pending_block_data.as_mut().ok_or(eyre::eyre!("pending_block_data not found, block_number={:?}", block.number))?.committee_cache = committee_cache.clone();
+        self.pending_block_data.as_mut().ok_or(eyre::eyre!("pending_block_data not found, block_number={:?}", block.number))?.committee_cache = Some(committee_cache.clone());
 
         let cached_reads = self.consensus.get_cached_reads(block.hash())?.ok_or(eyre::eyre!("cached_reads not found, block_hash={:?}", block.hash()))?;
         let mut header = block.header().clone();

@@ -28,6 +28,7 @@ use crate::committee_cache::CommitteeCache;
 use ethereum_hashing::hash;
 use merkle_db_rs::tree::VecTree;
 use typenum::{U100000};
+use derivative::Derivative;
 
 pub const SLOTS_PER_EPOCH: u64 = 32;
 
@@ -178,7 +179,8 @@ pub struct BeaconBlockChangeset{
     pub beaconblocks:Vec<(BlockHash,BeaconBlock)>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Derivative, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[derivative(Debug)]
 pub struct BeaconState {
     pub slot: u64,
     pub eth1_deposit_index: u64,
@@ -189,6 +191,7 @@ pub struct BeaconState {
 
     #[serde(skip_serializing, skip_deserializing)]
     #[ssz(skip_serializing, skip_deserializing)]
+    #[derivative(Debug="ignore")]
     pub validators_store: VecTree<Validator, U100000>,
 
     //pub balances: Vec<Gwei>,
@@ -197,6 +200,7 @@ pub struct BeaconState {
 
     #[serde(skip_serializing, skip_deserializing)]
     #[ssz(skip_serializing, skip_deserializing)]
+    #[derivative(Debug="ignore")]
     pub balances_store: VecTree<Gwei, U100000>,
 
     //pub inactivity_scores: Vec<u64>,
@@ -205,6 +209,7 @@ pub struct BeaconState {
 
     #[serde(skip_serializing, skip_deserializing)]
     #[ssz(skip_serializing, skip_deserializing)]
+    #[derivative(Debug="ignore")]
     pub inactivity_scores_store: VecTree<u64, U100000>,
 
     pub randao_mix: B256,
@@ -219,17 +224,19 @@ pub struct BeaconState {
 
     //pub total_active_balance: Option<TotalActiveBalance>,
 
-    pub committee_caches: Vec<CommitteeCache>,
+    //pub committee_caches: Vec<CommitteeCache>,
 
     pub epoch_attester_indexes: Hash256,
     pub epoch_attester_indexes_len: u64,
 
     #[serde(skip_serializing, skip_deserializing)]
     #[ssz(skip_serializing, skip_deserializing)]
+    #[derivative(Debug="ignore")]
     pub epoch_attester_indexes_store: VecTree<u64, U100000>,
 
     #[serde(skip_serializing, skip_deserializing)]
     #[ssz(skip_serializing, skip_deserializing)]
+    #[derivative(Debug="ignore")]
     pub epoch_attester_indexes_set: BTreeSet<u64>,
 }
 
@@ -456,7 +463,7 @@ impl BeaconState {
         let epoch_attester_indexes_len = 0;
         let epoch_attester_indexes_store = VecTree::try_new(epoch_attester_indexes_len).unwrap();
         Self {
-            committee_caches: vec![Default::default(); 3],
+            //committee_caches: vec![Default::default(); 3],
             validators: validators_store.root(),
             validators_store,
             validators_len,
@@ -489,6 +496,7 @@ impl BeaconState {
     pub fn process_epoch(&mut self,
         spec: &ChainSpec,
         ) -> eyre::Result<()> {
+        /*
         // workaround empty validators
         if self.has_active_validators(RelativeEpoch::Current) {
             self.build_committee_cache(RelativeEpoch::Current, spec)?;
@@ -499,6 +507,7 @@ impl BeaconState {
         if self.has_active_validators(RelativeEpoch::Previous) {
             self.build_committee_cache(RelativeEpoch::Previous, spec)?;
         }
+        */
 
         for index in (0..self.balances_store.len()) {
             //let balance = self.balances[index].min(spec.max_effective_balance);
@@ -923,7 +932,7 @@ impl BeaconState {
             .safe_rem(self.validators_store.len() as u64)?;
     }
 
-    debug!(target: "consensus-client", ?withdrawals, processed_partial_withdrawals_count, "get_expected_withdrawals");
+    //debug!(target: "consensus-client", ?withdrawals, processed_partial_withdrawals_count, "get_expected_withdrawals");
     Ok((withdrawals, Some(processed_partial_withdrawals_count)))
     }
 
@@ -1498,7 +1507,7 @@ pub fn apply_deposit(
         validator_statuses: &ValidatorStatuses,
         spec: &ChainSpec,
     ) -> eyre::Result<()> {
-        debug!(target: "consensus-client", slot=?self.slot, ?validator_statuses, "process_rewards_and_penalties");
+        //debug!(target: "consensus-client", slot=?self.slot, ?validator_statuses, "process_rewards_and_penalties");
         if self.current_epoch() == genesis_epoch {
             return Ok(());
         }
@@ -1515,7 +1524,7 @@ pub fn apply_deposit(
             ProposerRewardCalculation::Include,
             spec,
         )?;
-        debug!(target: "consensus-client", ?deltas, "process_rewards_and_penalties");
+        //debug!(target: "consensus-client", ?deltas, "process_rewards_and_penalties");
 
         // Apply the deltas, erroring on overflow above but not on overflow below (saturating at 0
         // instead).
@@ -1585,7 +1594,7 @@ pub fn apply_deposit(
                 spec,
             )?;
 
-            debug!(target: "consensus-client", ?base_reward, "get_attestation_deltas");
+            //debug!(target: "consensus-client", ?base_reward, "get_attestation_deltas");
             
             // let (inclusion_delay_delta, proposer_delta) =
             //     get_inclusion_delay_delta(validator, base_reward, spec)?;
@@ -1628,7 +1637,7 @@ pub fn apply_deposit(
             //         }
             //     }
             // }
-            debug!(target: "consensus-client", ?index, ?delta, "get_attestation_deltas");
+            //debug!(target: "consensus-client", ?index, ?delta, "get_attestation_deltas");
         }
 
         Ok(deltas)
@@ -1713,6 +1722,7 @@ pub fn apply_deposit(
         Ok(Hash256::from_slice(&hash(&preimage)))
     }
 
+/*
     /// Build all committee caches, if they need to be built.
     pub fn build_all_committee_caches(&mut self,
         spec: &ChainSpec,
@@ -1795,6 +1805,7 @@ pub fn apply_deposit(
     ) -> eyre::Result<CommitteeCache> {
         CommitteeCache::initialized(self, epoch, spec)
     }
+*/
 
     pub fn has_active_validators(
         &self,
@@ -1817,6 +1828,7 @@ pub fn apply_deposit(
         active
     }
 
+/*
     /// Get all of the Beacon committees at a given relative epoch.
     ///
     /// Utilises the committee cache.
@@ -1850,6 +1862,15 @@ pub fn apply_deposit(
         } else {
             Err(eyre::eyre!("Error::CommitteeCacheUninitialized, relative_epoch: {relative_epoch:?}"))
         }
+    }
+*/
+    pub fn gen_committee_cache(
+        &self,
+        relative_epoch: RelativeEpoch,
+    ) -> eyre::Result<CommitteeCache> {
+        let epoch = relative_epoch.into_epoch(self.current_epoch());
+        let spec = beacon_chain_spec();
+        CommitteeCache::initialized(self, epoch, &spec)
     }
 
 }

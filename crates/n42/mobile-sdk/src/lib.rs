@@ -58,9 +58,10 @@ pub async fn run_client(
         while let Ok(Some(msg)) = timeout(Duration::from_secs(message_timeout_secs ), subscription.next()).await {
             match msg {
                 Ok(block) => {
-                    println!("Received block: {:?}", block);
+                    println!("Received block: {:?}, pk: {:?}, thread-id: {:?}", block.blockbody.header().number(), hex::encode(pk.to_bytes()), std::thread::current().id());
+                    let block_clone = block.clone();
 
-                    if let Ok(receipts_root) = verify(block.clone()) {
+                    if let Ok(receipts_root) = tokio::task::spawn_blocking(||verify(block_clone)).await? {
                         println!("receipts_root: {:?}", receipts_root);
 
                         let attestation_data = AttestationData {
@@ -95,6 +96,7 @@ pub async fn run_client(
                         return Err(eyre::eyre!("verify failed: block number: {:?}", block.blockbody.number));
                     }
 
+                    println!("Finished block: {:?}, pk: {:?}, thread-id: {:?}", block.blockbody.header().number(), hex::encode(pk.to_bytes()), std::thread::current().id());
                 }
                 Err(e) => {
                     eprintln!("Subscription error: {:?}", e);

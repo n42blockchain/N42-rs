@@ -66,7 +66,8 @@ use std::{
     str::FromStr,
     sync::Arc,
     time::{
-        SystemTime, UNIX_EPOCH},
+        SystemTime,
+        UNIX_EPOCH},
 };
 use reth_rpc_api::EngineApiClient;
 use n42_clique::{EXTRA_VANITY, EXTRA_SEAL};

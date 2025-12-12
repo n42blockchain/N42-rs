@@ -438,13 +438,14 @@ async fn validate_for_validators(
     ) -> eyre::Result<()> {
     let tasks = validator_credentials.iter().map(
         move |validator_credential| {
-            let validator_private_key = &validator_credential.validator_private_key;
-            async move {
-                while let Err(e) = run_client(&ws_rpc_url, &validator_private_key).await {
+            let ws_rpc_url_clone = ws_rpc_url.to_owned();
+            let validator_private_key = validator_credential.validator_private_key.clone();
+            tokio::spawn(async move {
+                while let Err(e) = run_client(&ws_rpc_url_clone, &validator_private_key).await {
                     info!("run_client error: {e}, retrying...");
                     sleep(Duration::from_secs(5)).await;
                 }
-            }
+            })
         }
     );
     join_all(tasks).await;

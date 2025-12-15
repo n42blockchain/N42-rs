@@ -645,6 +645,7 @@ where
     }
 
     fn handle_verification_result(&mut self, verification_result: BlockVerifyResult) -> eyre::Result<()> {
+        debug!(target: "consensus-client", "handle_verification_result start: {verification_result:?}");
         let mut pending_block_data = match &self.pending_block_data {
             Some(v) => v.clone(),
             None => {
@@ -708,6 +709,7 @@ where
         attestation.validator_indexes.insert(validator_index);
         self.pending_block_data.as_mut().map(|v| { *v.attestations.get_mut(&attestation_data.committee_index).unwrap() = attestation.clone(); });
 
+        debug!(target: "consensus-client", "handle_verification_result finish: {verification_result:?}");
         Ok(())
     }
 

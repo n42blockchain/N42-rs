@@ -168,6 +168,7 @@ where
                     if !target_committee_pubkeys.contains(&pubkey) {
                         continue;
                     }
+                    debug!(target: "reth::cli", ?pubkey, "start broadcasting, block hash {:?}", data_to_be_verified.blockbody.header().number());
                     if sink.is_closed() {
                         debug!(target: "reth::cli", ?subscription_id, "subscribe_to_verification_request client disconnected");
                         break;
@@ -177,6 +178,7 @@ where
                         debug!(target: "reth::cli", ?subscription_id, ?e, "subscribe_to_verification_request Error sending to client");
                         break;
                     }
+                    debug!(target: "reth::cli", ?pubkey, "finish broadcasting, block hash {:?}", data_to_be_verified.blockbody.header().number());
                 }
             }
         });
@@ -186,6 +188,7 @@ where
     fn submit_verification(&self, pubkey: String,
         signature: String, attestation_data: AttestationData, block_hash: B256,
         ) -> RpcResult<()> {
+        debug!(target: "reth::cli", ?pubkey, "received verification from rpc, slot={:?}", attestation_data.slot);
         let v = BlockVerifyResult {pubkey, signature, attestation_data, block_hash};
         let _ = self.verification_tx.try_send(v);
         Ok(())

@@ -20,6 +20,7 @@ use jsonrpsee::ws_client::WsClientBuilder;
 use serde::{Deserialize, Serialize};
 use n42_clique::{BlockVerifyResult, UnverifiedBlock};
 use n42_primitives::{AttestationData};
+use tracing::{debug, info, warn, Level};
 
 pub mod deposit_exit;
 
@@ -46,23 +47,23 @@ pub async fn run_client(
             .build(ws_url)
             .await?;
 
-        println!("Connected to {}", ws_url);
+        info!("Connected to {}", ws_url);
 
         let mut subscription: Subscription<UnverifiedBlock> = ws_client
             .subscribe("consensusBeaconExt_subscribeToVerificationRequest", rpc_params![hex::encode(pk.to_bytes())],
     "")
             .await?;
 
-        println!("Subscribed to 'subscribeToVerificationRequest'");
+        info!("Subscribed to 'subscribeToVerificationRequest'");
 
         while let Ok(Some(msg)) = timeout(Duration::from_secs(message_timeout_secs ), subscription.next()).await {
             match msg {
                 Ok(block) => {
-                    println!("Received block: {:?}, pk: {:?}, thread-id: {:?}", block.blockbody.header().number(), hex::encode(pk.to_bytes()), std::thread::current().id());
+                    debug!("Received block: {:?}, pk: {:?}, thread-id: {:?}", block.blockbody.header().number(), hex::encode(pk.to_bytes()), std::thread::current().id());
                     let block_clone = block.clone();
 
                     if let Ok(receipts_root) = tokio::task::spawn_blocking(||verify(block_clone)).await? {
-                        println!("receipts_root: {:?}", receipts_root);
+                        debug!("receipts_root: {:?}", receipts_root);
 
                         let attestation_data = AttestationData {
                             slot: block.blockbody.header().number(),
@@ -77,7 +78,7 @@ pub async fn run_client(
                         let sig = sk.sign(msg, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[]);
 
                         let err = sig.verify(true, msg, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[], &pk, true);
-                        println!("sig verify result: {:?}", err);
+                        debug!("sig verify result: {:?}", err);
 
                         let mut header = block.blockbody.header().clone();
                         header.receipts_root = receipts_root;
@@ -89,23 +90,23 @@ pub async fn run_client(
                         let result = ws_client
                             .request("consensusBeaconExt_submitVerification", params)
                             .await?;
-                        println!("request result: {:?}", result);
+                        debug!("request result: {:?}", result);
 
                     } else {
-                        println!("verify failed");
+                        warn!("verify failed");
                         return Err(eyre::eyre!("verify failed: block number: {:?}", block.blockbody.number));
                     }
 
-                    println!("Finished block: {:?}, pk: {:?}, thread-id: {:?}", block.blockbody.header().number(), hex::encode(pk.to_bytes()), std::thread::current().id());
+                    debug!("Finished block: {:?}, pk: {:?}, thread-id: {:?}", block.blockbody.header().number(), hex::encode(pk.to_bytes()), std::thread::current().id());
                 }
                 Err(e) => {
-                    eprintln!("Subscription error: {:?}", e);
+                    warn!("Subscription error: {:?}", e);
                     return Err(e.into());
                 }
             }
         }
 
-        eprintln!("No update in {message_timeout_secs:?} seconds — closing and reconnecting...");
+        warn!("No update in {message_timeout_secs:?} seconds — closing and reconnecting...");
 
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
@@ -114,7 +115,7 @@ pub async fn run_client(
 }
 
 fn verify(mut unverifiedblock:UnverifiedBlock) -> eyre::Result<B256> {
-    println!("verify, {unverifiedblock:?}");
+    debug!("verify, {unverifiedblock:?}");
     let provider_1=MockEthProvider::default();
     let state=StateProviderDatabase::new(provider_1);
     let db=
@@ -137,14 +138,14 @@ fn verify(mut unverifiedblock:UnverifiedBlock) -> eyre::Result<B256> {
     let recovered = RecoveredBlock::try_recover_sealed(unverifiedblock.blockbody)?;
     match executor.execute_one(&recovered) {
         Ok(result) => {
-            println!("success, {result:?}");
+            debug!("success, {result:?}");
             receipts=result.receipts;
         }
-        Err(e) => println!("Error during execution: {:?}", e),
+        Err(e) => warn!("Error during execution: {:?}", e),
     }
-    println!("{receipts:?}");
+    debug!("{receipts:?}");
     let receipts_root = Receipt::calculate_receipt_root_no_memo(&receipts);
-    println!("computed {receipts_root:?}");
+    debug!("computed {receipts_root:?}");
 
     // for test
     if sealed_block_receipts_root != B256::ZERO {

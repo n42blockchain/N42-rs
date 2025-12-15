@@ -20,6 +20,7 @@ use blst::min_pk::SecretKey;
 use ::rand::RngCore;
 use tracing_subscriber::{fmt, EnvFilter};
 use tracing::{debug, info, Level};
+use tracing_appender::non_blocking;
 
 abigen!(
     DepositContract,
@@ -146,7 +147,9 @@ async fn main() -> eyre::Result<()> {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
+    let (non_blocking, _guard) = non_blocking(std::io::stderr());
     fmt()
+        .with_writer(non_blocking)
         .with_env_filter(filter)
         .init();
 
@@ -195,7 +198,7 @@ async fn main() -> eyre::Result<()> {
             common,
         }=> {
             let validator_credentials = get_validator_credentials(validator_credentials_file).await?;
-            println!("number of validators: {}", validator_credentials.len());
+            info!("number of validators: {}", validator_credentials.len());
             let _ = deposit_for_validators(&common.rpc_url, &deposit_contract_address, &deposit_private_key, &validator_credentials).await?;
         },
         Commands::ValidateForValidators {
@@ -204,7 +207,7 @@ async fn main() -> eyre::Result<()> {
             ws_rpc_url,
         }=> {
             let validator_credentials = get_validator_credentials(validator_credentials_file).await?;
-            println!("number of validators: {}", validator_credentials.len());
+            info!("number of validators: {}", validator_credentials.len());
             validate_for_validators(&ws_rpc_url, &validator_credentials).await?;
         },
         Commands::ExitForValidators {
@@ -212,7 +215,7 @@ async fn main() -> eyre::Result<()> {
             common,
         }=> {
             let validator_credentials = get_validator_credentials(validator_credentials_file).await?;
-            println!("number of validators: {}", validator_credentials.len());
+            info!("number of validators: {}", validator_credentials.len());
             let _ = exit_for_validators(&common.rpc_url, &validator_credentials).await?;
         },
     }
@@ -239,7 +242,7 @@ async fn deposit(
             rng.fill_bytes(&mut ikm);
 
             let sk = SecretKey::key_gen(&ikm, &[]).unwrap();
-            println!("generated validator_private_key: {sk:?}");
+            info!("generated validator_private_key: {sk:?}");
             sk
         }
     };
@@ -398,7 +401,7 @@ async fn deposit_for_validators(
             ).await {
             Ok(_) => {
                 num_successes += 1;
-                println!("deposited for {num_successes} validators");
+                info!("deposited for {num_successes} validators");
             }
             Err(e) => {
                 info!("deposit_for_validators error: {e}");
@@ -471,7 +474,7 @@ async fn exit_for_validators(
             ).await {
             Ok(_) => {
                 num_successes += 1;
-                println!("exited for {num_successes} validators");
+                info!("exited for {num_successes} validators");
             }
             Err(e) => {
                 info!("exit_for_validators error: {e}");

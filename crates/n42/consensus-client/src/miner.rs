@@ -671,9 +671,13 @@ where
         let signature = Signature::from_bytes(&hex::decode(signature)?).map_err(|e| eyre::eyre!("{e:?}"))?;
 
         let pubkey_str = pubkey.clone();
-        let pubkey = PublicKey::from_bytes(&hex::decode(pubkey)?).map_err(|e| eyre::eyre!("{e:?}"))?;
+        let pubkey_bytes = hex::decode(pubkey)?;
+        let pubkey = PublicKey::from_bytes(&pubkey_bytes).map_err(|e| eyre::eyre!("{e:?}"))?;
 
-        let validator_index = self.beacon.get_validator_index_from_beacon_state(block.parent_hash(), pubkey)?.ok_or(eyre::eyre!("validator not found, block_hash={block_hash:?}, pubkey={pubkey_str:?}"))?;
+        let pubkey_fixed_bytes: BLSPubkey = pubkey_bytes.as_slice().try_into().map_err(|_| eyre::eyre!("pubkey must be exactly 48 bytes"))?;
+        let validator_index =
+            pending_block_data.beacon_state_after_withdrawal.get_validator_index_from_pubkey(&pubkey_fixed_bytes).ok_or(eyre::eyre!("validator not found, block_hash={block_hash:?}, pubkey={pubkey_str:?}"))? as u64;
+
         if attestation.validator_indexes.contains(&validator_index) {
             return Err(eyre::eyre!("duplicate attestations for validator, pubkey={pubkey_str:?}"));
         }

@@ -220,8 +220,6 @@ pub struct BeaconState {
     pub earliest_exit_epoch: Epoch,
     pub exit_balance_to_consume: u64,
 
-    pub eth1_data: Eth1Data,
-
     //pub total_active_balance: Option<TotalActiveBalance>,
 
     //pub committee_caches: Vec<CommitteeCache>,

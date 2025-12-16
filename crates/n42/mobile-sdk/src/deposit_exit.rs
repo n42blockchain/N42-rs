@@ -94,6 +94,9 @@ deposit_contract_address
         to: Some(NameOrAddress::Address(contract_address)),
         data: Some(calldata.into()),
         value: Some(deposit_value_in_wei.clone()),
+        // Use a safe fixed gas value for validator deposit tx;
+        // this works for validator numbers up to at least 1M+ validators(ethereum mainnet)
+        gas: Some(300_000u64.into()),
         ..Default::default()
     };
 

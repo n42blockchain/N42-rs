@@ -67,7 +67,8 @@ use std::{
     sync::Arc,
     time::{
         SystemTime,
-        UNIX_EPOCH},
+        UNIX_EPOCH
+    },
 };
 use reth_rpc_api::EngineApiClient;
 use n42_clique::{

@@ -199,7 +199,8 @@ async fn main() -> eyre::Result<()> {
         }=> {
             let validator_credentials = get_validator_credentials(validator_credentials_file).await?;
             info!("number of validators: {}", validator_credentials.len());
-            let _ = deposit_for_validators(&common.rpc_url, &deposit_contract_address, &deposit_private_key, &validator_credentials).await?;
+            let num_successes = deposit_for_validators(&common.rpc_url, &deposit_contract_address, &deposit_private_key, &validator_credentials).await?;
+            info!("deposited for {num_successes:?} validators");
         },
         Commands::ValidateForValidators {
             validator_credentials_file,
@@ -263,10 +264,6 @@ async fn deposit(
     let client = SignerMiddleware::new(provider, wallet);
     let client = Arc::new(client);
 
-    let deposit_address = Address::from_str(&deposit_contract_address)?;
-
-    let deposit_contract = DepositContract::new(deposit_address, client.clone());
-
     let pending_tx = client.send_transaction(unsigned_tx, None).await?;
 
     let receipt = pending_tx
@@ -285,6 +282,66 @@ async fn deposit(
         }
     };
     debug!("deposit transaction_receipt {transaction_receipt:?}");
+
+    Ok(())
+}
+
+async fn deposit_multiple(
+    deposit_contract_address: &str,
+    credentials: &[(
+        /* withdrawal_address: */&str,
+        /* validator_private_key: */&str)],
+    deposit_private_key: &str,
+    deposit_value_wei_in_hex: &U256,
+    rpc_url: &str,
+    ) -> eyre::Result<()> {
+    let provider = Provider::<Http>::try_from(rpc_url)?;
+    let chain_id = provider.get_chainid().await?.as_u64();
+
+    let code = provider.get_code(deposit_contract_address, None).await?;
+    if code.is_empty() {
+        return Err(eyre::eyre!("deposit contract is not deployed at {deposit_contract_address}"));
+    }
+
+    let wallet = LocalWallet::from_str(&deposit_private_key)?
+        .with_chain_id(chain_id);
+    let wallet_address = wallet.address();
+
+    let client = SignerMiddleware::new(provider, wallet);
+    let client = Arc::new(client);
+
+    let mut last_pending = None;
+    let mut nonce = client
+        .get_transaction_count(wallet_address, Some(BlockNumber::Pending.into()))
+        .await?;
+    for (withdrawal_address, validator_private_key) in credentials {
+        let sk = SecretKey::from_bytes(&Vec::from_hex(&validator_private_key).unwrap()).unwrap();
+        let mut unsigned_tx = create_deposit_unsigned_tx(deposit_contract_address, &hex::encode(&sk.to_bytes()), withdrawal_address, deposit_value_wei_in_hex)?;
+        unsigned_tx.nonce = Some(nonce.into());
+        nonce += 1u64.into();
+
+        let pending = client.send_transaction(unsigned_tx, None).await?;
+        debug!("deposit send_transaction pending {pending:?}");
+        last_pending = Some(pending);
+    }
+
+    if let Some(pending) = last_pending {
+        let receipt = pending.await?
+        .ok_or(eyre::eyre!("pending tx is None"))?;
+    let transaction_receipt = match receipt.status {
+        Some(v) => {
+            if v == U64::from(1) {
+                receipt
+            } else {
+                return Err(eyre::eyre!("receipt status={v:?}"));
+            }
+        },
+        None => {
+            return Err(eyre::eyre!("receipt status is None"));
+        }
+    };
+    debug!("deposit transaction_receipt {transaction_receipt:?}");
+    };
 
     Ok(())
 }
@@ -383,34 +440,24 @@ async fn deposit_for_validators(
     deposit_private_key: &str,
     validator_credentials: &[ValidatorCredential],
     ) -> eyre::Result<u64> {
-    let mut num_successes = 0;
-    for validator_credential in validator_credentials {
-        let ValidatorCredential {
-            validator_private_key,
-            validator_public_key,
-            withdrawal_private_key,
-            withdrawal_address,
-        } = validator_credential;
-        match deposit(
+    let credentials = validator_credentials.iter().map(
+        | v | {
+            (v.withdrawal_address.as_str(), v.validator_private_key.as_str())
+        }
+    ).collect::<Vec<_>>();
+    let chunk_size = 256;
+    for (i, credentials_chunk) in credentials.chunks(chunk_size).enumerate() {
+        debug!("Depositing for validators from {:?} to {:?}", chunk_size * i, chunk_size * (i+1)-1);
+        deposit_multiple(
             deposit_contract_address,
-            Some(validator_private_key),
-            withdrawal_address,
+            credentials_chunk,
             deposit_private_key,
             &_32eth_hex_in_wei.into(),
             rpc_url,
-            ).await {
-            Ok(_) => {
-                num_successes += 1;
-                info!("deposited for {num_successes} validators");
-            }
-            Err(e) => {
-                info!("deposit_for_validators error: {e}");
-                break;
-            }
-        }
+        ).await?;
     }
 
-    Ok(num_successes)
+    Ok(validator_credentials.len() as u64)
 }
 
 async fn validate(

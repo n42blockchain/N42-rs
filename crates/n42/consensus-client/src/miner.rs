@@ -257,7 +257,7 @@ where
             tokio::select! {
                 Some(verification_result) = self.block_verify_result_rx.recv() => {
                     debug!(target: "consensus-client", ?verification_result, "verification_rx");
-                    if let Err(e) = self.handle_verification_result(verification_result) {
+                    if let Err(e) = self.handle_verification_result(verification_result).await {
                         warn!(target: "consensus-client", "Error handling verification_result: {:?}", e);
                     }
                 }
@@ -644,7 +644,7 @@ where
         )
     }
 
-    fn handle_verification_result(&mut self, verification_result: BlockVerifyResult) -> eyre::Result<()> {
+    async fn handle_verification_result(&mut self, verification_result: BlockVerifyResult) -> eyre::Result<()> {
         debug!(target: "consensus-client", "handle_verification_result start: {verification_result:?}");
         let mut pending_block_data = match &self.pending_block_data {
             Some(v) => v.clone(),
@@ -687,9 +687,9 @@ where
             return Err(eyre::eyre!("mismatch receipts_root, expected={:?}, got={:?}", attestation.data.receipts_root, attestation_data.receipts_root));
         }
 
+        debug!(target: "consensus-client", "sig verify start:");
         let bytes: Vec<u8> = serde_json::to_vec(&attestation_data)?;
-        let bytes_slice: &[u8] = &bytes;
-        let err = signature.verify(true, bytes_slice, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[], &pubkey, true);
+        let err = tokio::task::spawn_blocking(move || signature.verify(true, &bytes, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[], &pubkey, true)).await?;
         if err != blst::BLST_ERROR::BLST_SUCCESS {
             return Err(eyre::eyre!("{verification_result:?}"));
         }

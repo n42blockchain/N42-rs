@@ -834,7 +834,7 @@ where
         debug!(target: "consensus-client", block_time, "prepare_block");
         let now = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)?;
-        let time_for_tx_gathering = block_time / 2;
+        let time_for_tx_gathering = 1;
         let time_for_attestatation_gathering = block_time - time_for_tx_gathering;
         let expected_next_timestamp = Duration::from_secs(header.header().timestamp() + time_for_tx_gathering);
         if expected_next_timestamp > now {

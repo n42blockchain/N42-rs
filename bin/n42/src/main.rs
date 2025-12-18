@@ -7,10 +7,12 @@ use std::{time::Duration};
 use alloy_signer_local::PrivateKeySigner;
 use consensus_client::miner::N42Miner;
 use consensus_client::migrate::N42Migrate;
+use n42_clique::UnverifiedBlock;
 use n42_engine_primitives::N42PayloadAttributesBuilder;
 use clap::Parser;
 use n42::{args::RessArgs, cli::Cli, ress::install_ress_subprotocol};
 use n42_engine_types::{N42Node};
+use pubsub_mem::{router_loop, RouterMsg};
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_node_builder::NodeHandle;
 use reth_node_ethereum::EthereumNode;
@@ -29,15 +31,16 @@ fn main() {
     }
 
     let (verification_tx, verification_rx) = mpsc::channel(100);
-    let (broadcast_tx, _broadcast_rx) = broadcast::channel(100);
-    let broadcast_tx_clone = broadcast_tx.clone();
-    let broadcast_tx_clone_for_message_producer = broadcast_tx.clone();
-    let broadcast_tx_clone_for_miner = broadcast_tx.clone();
-
 
     if let Err(err) =
         Cli::<EthereumChainSpecParser, RessArgs>::parse().run(async move |builder, ress_args| {
             info!(target: "reth::cli", "Launching node");
+
+            // Create router control channel
+            let (router_tx, router_rx) = mpsc::channel::<RouterMsg<UnverifiedBlock>>(128);
+            let router_tx_clone = router_tx.clone();
+            let router_tx_clone_for_miner = router_tx.clone();
+
             let NodeHandle { node, node_exit_future } =
                 builder.node(N42Node::default())
                         .extend_rpc_modules(|ctx| {
@@ -45,7 +48,7 @@ fn main() {
                             let consensus = ctx.consensus().clone();
                             let provider = ctx.provider().clone();
 
-                            let beacon_ext = ConsensusBeaconExt { consensus: consensus.clone(), provider: provider.clone(), verification_tx, broadcast_tx: broadcast_tx_clone };
+                            let beacon_ext = ConsensusBeaconExt { consensus: consensus.clone(), provider: provider.clone(), verification_tx, router_tx: router_tx_clone };
                             let ext = ConsensusExt { consensus, provider };
 
                             // now we merge our extension namespace into all configured transports
@@ -57,6 +60,9 @@ fn main() {
                             Ok(())
                         })
                 .launch_with_debug_capabilities().await?;
+
+            // Spawn router loop task
+            tokio::spawn(router_loop(router_rx));
 
             let node_config_dev = node.config.clone().dev();
             let consensus_signer_private_key = node_config_dev.dev.consensus_signer_private_key;
@@ -98,7 +104,7 @@ fn main() {
                     node.payload_builder_handle.clone(),
                     node.network.clone(),
                     node.consensus.clone(),
-                    broadcast_tx_clone_for_miner,
+                    router_tx_clone_for_miner,
                     verification_rx,
                 );
             }

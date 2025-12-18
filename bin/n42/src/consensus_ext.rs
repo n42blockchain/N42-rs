@@ -12,6 +12,7 @@ use n42_primitives::{beacon_chain_spec, epoch_to_block_number, AttestationData, 
 use reth_provider::{BeaconProvider, BlockIdReader, BlockReader, HeaderProvider};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{trace, debug, error, info, warn};
+use pubsub_mem::{RouterMsg, Event, subscribe};
 
 /// trait interface for a custom rpc namespace: `consensus`
 ///
@@ -148,7 +149,7 @@ pub struct ConsensusBeaconExt<Cons, Provider> {
     pub consensus: Cons,
     pub provider: Provider,
     pub verification_tx: mpsc::Sender<BlockVerifyResult>,
-    pub broadcast_tx: broadcast::Sender<(UnverifiedBlock, Arc<Vec<BLSPubkey>>)>,
+    pub router_tx: mpsc::Sender<RouterMsg<UnverifiedBlock>>,
 }
 
 impl<Cons, Provider> ConsensusBeaconExtApiServer for ConsensusBeaconExt<Cons, Provider>
@@ -158,17 +159,22 @@ where
     Provider: HeaderProvider + BeaconProvider + BlockIdReader + BlockReader + Clone + 'static,
 {
     fn subscribe_to_verification_request(&self, pending: PendingSubscriptionSink, pubkey: BLSPubkey) -> SubscriptionResult {
-        let mut rx = self.broadcast_tx.subscribe();
-        debug!(target: "reth::cli", ?pubkey, "subscribe_to_verification_request New client subscribed");
+        let router_tx_clone = self.router_tx.clone();
 
         tokio::spawn(async move {
+            let (_id, mut rx) = match subscribe(router_tx_clone, hex::encode(&pubkey)).await {
+                Ok(v) => v,
+                Err(err) => {
+                    debug!(target: "reth::cli", ?pubkey, ?err, "subscribe_to_verification_request failed");
+                    return;
+                }
+            };
+            debug!(target: "reth::cli", ?pubkey, "subscribe_to_verification_request New client subscribed");
             if let Ok(sink) = pending.accept().await {
                 let subscription_id = sink.subscription_id();
-                while let Ok((data_to_be_verified, target_committee_pubkeys)) = rx.recv().await {
-                    if !target_committee_pubkeys.contains(&pubkey) {
-                        continue;
-                    }
-                    debug!(target: "reth::cli", ?pubkey, "start broadcasting, block hash {:?}", data_to_be_verified.blockbody.header().number());
+                while let Some(event) = rx.recv().await {
+                    let data_to_be_verified = event.payload;
+                    debug!(target: "reth::cli", ?pubkey, "start broadcasting, block number {:?}", data_to_be_verified.blockbody.header().number());
                     if sink.is_closed() {
                         debug!(target: "reth::cli", ?subscription_id, "subscribe_to_verification_request client disconnected");
                         break;
@@ -178,7 +184,7 @@ where
                         debug!(target: "reth::cli", ?subscription_id, ?e, "subscribe_to_verification_request Error sending to client");
                         break;
                     }
-                    debug!(target: "reth::cli", ?pubkey, "finish broadcasting, block hash {:?}", data_to_be_verified.blockbody.header().number());
+                    debug!(target: "reth::cli", ?pubkey, "finish broadcasting, block number {:?}", data_to_be_verified.blockbody.header().number());
                 }
             }
         });

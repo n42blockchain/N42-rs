@@ -14,6 +14,7 @@ workspace = true
 
 [dependencies]
 #n42
+pubsub-mem.workspace = true
 n42-engine-types.workspace = true
 n42-engine-primitives.workspace = true
 n42-primitives.workspace = true
@@ -66,6 +67,7 @@ tracing.workspace = true
 tokio = { workspace = true, features = ["sync", "macros", "time", "rt-multi-thread"] }
 
 # misc
+hex.workspace = true
 aquamarine.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 eyre.workspace = true

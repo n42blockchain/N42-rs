@@ -45,6 +45,7 @@ members = [
     "crates/n42/consensus-client",
     "crates/n42/mobile-sdk",
     "crates/n42/merkle_db_rs",
+    "crates/n42/pubsub-mem",
 #    "bin/reth/",
 ]
 default-members = ["bin/n42"]
@@ -205,6 +206,7 @@ n42-engine-primitives = {path="crates/n42/engine-primitives"}
 consensus-client = {path="crates/n42/consensus-client"}
 mobile-sdk = {path="crates/n42/mobile-sdk"}
 merkle_db_rs = {path="crates/n42/merkle_db_rs"}
+pubsub-mem = {path="crates/n42/pubsub-mem"}
 
 blst = "0.3.11"
 

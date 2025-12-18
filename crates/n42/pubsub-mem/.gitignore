@@ -1,0 +1,5 @@
+/target
+
+# Vim temporary files
+**/.*.swp
+**/.*.swo

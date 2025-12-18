@@ -57,6 +57,7 @@ use crate::beacon::{Beacon};
 use n42_primitives::{RelativeEpoch, Attestation, BeaconState, BeaconBlock, Deposit, VoluntaryExitWithSig, parse_deposit_log, BLSPubkey, BlockVerifyResultAggregate, agg_sig_to_fixed, fixed_to_agg_sig, SLOTS_PER_EPOCH, CommitteeIndex, AttestationData};
 use n42_primitives::CommitteeCache;
 use crate::network::{fetch_beacon_block, broadcast_beacon_block};
+use pubsub_mem::{RouterMsg, Event, publish};
 
 /// A mining mode for the local dev engine.
 #[derive(Debug)]
@@ -132,7 +133,7 @@ pub struct N42Miner<T: PayloadTypes, Provider, B, Network> {
     new_block_tx: mpsc::Sender<(NewBlock, BlockHash)>,
     new_block_rx: mpsc::Receiver<(NewBlock, BlockHash)>,
     beacon: Beacon<Provider>,
-    broadcast_unverified_block_tx: broadcast::Sender<(UnverifiedBlock, Arc<Vec<BLSPubkey>>)>,
+    broadcast_unverified_block_tx: mpsc::Sender<RouterMsg<UnverifiedBlock>>,
     block_verify_result_rx: mpsc::Receiver<BlockVerifyResult>,
     pending_block_data: Option<PendingBlockData>,
     recent_committee_caches: schnellru::LruMap<BlockHash, Arc<CommitteeCache>>,
@@ -193,7 +194,7 @@ where
         payload_builder: PayloadBuilderHandle<T>,
         network: Network,
         consensus: Arc<dyn FullConsensus<<T::BuiltPayload as BuiltPayload>::Primitives, Error = ConsensusError>>,
-        broadcast_unverified_block_tx: broadcast::Sender<(UnverifiedBlock, Arc<Vec<BLSPubkey>>)>,
+        broadcast_unverified_block_tx: mpsc::Sender<RouterMsg<UnverifiedBlock>>,
         block_verify_result_rx: mpsc::Receiver<BlockVerifyResult>,
     ) {
         let (new_block_tx, new_block_rx) = mpsc::channel::<(NewBlock, BlockHash)>(128);
@@ -919,7 +920,8 @@ where
             debug!(target: "consensus-client", "generating committee_cache for  block number {:?}", block.header().number());
             match beacon_state_after_withdrawal.gen_committee_cache(RelativeEpoch::Next) {
                 Ok(v) => Arc::new(v),
-                Err(_) => {
+                Err(e) => {
+                    debug!(target: "consensus-client", ?e, "gen_committee_cache failed");
                     return Ok(());
                 }
             }
@@ -937,13 +939,15 @@ where
                     None => {
                         let beacon_block = self.provider.get_beacon_block_by_hash(&beacon_block_hash)?.ok_or(eyre::eyre!("beacon block not found, beacon_block_hash={:?}", beacon_block_hash))?;
                         if beacon_block.slot == 0 {
+                            debug!(target: "consensus-client", "searching for beacon block reached slot 0");
                             return Ok(());
                         }
                         if beacon_block.slot % SLOTS_PER_EPOCH == 0 {
                             let parent_beacon_state = self.provider.get_beacon_state_by_hash(&beacon_block.parent_hash)?.ok_or(eyre::eyre!("beacon state not found, beacon_block_hash={:?}", beacon_block.parent_hash))?;
                             match parent_beacon_state.gen_committee_cache(RelativeEpoch::Next) {
                                 Ok(v) => break Arc::new(v),
-                                Err(_) => {
+                                Err(e) => {
+                                    debug!(target: "consensus-client", ?e, "gen_committee_cache failed");
                                     return Ok(());
                                 }
                             }
@@ -983,12 +987,13 @@ where
                 ..Default::default()
             };
             self.pending_block_data.as_mut().ok_or(eyre::eyre!("pending_block_data not found, block_number={:?}", block.number))?.attestations.insert(beacon_committee.index, attestation);
-            let mut target_committee_pubkeys = Vec::new();
-            for validator_index in beacon_committee.committee {
-                target_committee_pubkeys.push(beacon_state_after_withdrawal.get_validator(*validator_index)?.pubkey);
-            }
             unverified_block.committee_index = beacon_committee.index;
-            let _ = self.broadcast_unverified_block_tx.send((unverified_block.clone(), Arc::new(target_committee_pubkeys)));
+            for validator_index in beacon_committee.committee {
+                let pubkey = beacon_state_after_withdrawal.get_validator(*validator_index)?.pubkey;
+                let pubkey = hex::encode(&pubkey);
+                let event = Event { topic: pubkey, payload: unverified_block.clone()};
+                publish(&self.broadcast_unverified_block_tx, event).await;
+            }
         }
         Ok(())
     }

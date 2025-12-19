@@ -103,37 +103,6 @@ where
 
     }
 
-    fn get_beacon_state_from_block_hash(&self, block_hash: B256) -> eyre::Result<BeaconState> {
-        let beacon_block_hash = self.provider.get_beacon_block_hash_by_eth1_hash(&block_hash)?.ok_or(eyre::eyre!("beacon block hash not found, block_hash={:?}", block_hash))?;
-
-        let beacon_state = self.provider.get_beacon_state_by_hash(&beacon_block_hash)?.ok_or(eyre::eyre!("beacon state not found, beacon_block_hash={:?}", beacon_block_hash))?;
-
-        Ok(beacon_state)
-    }
-
-    pub fn get_validator_index_from_beacon_state(&self, block_hash: B256, pubkey: PublicKey) -> eyre::Result<Option<u64>> {
-        let beacon_state = self.get_beacon_state_from_block_hash(block_hash)?;
-
-        for (i, validator) in beacon_state.validators_store.iter().enumerate() {
-            if pubkey == PublicKey::from_bytes(&validator.pubkey.as_slice())
-                .map_err(|e| eyre::eyre!("PublicKey::from_bytes error {e:?}"))?
-                 {
-                return Ok(Some(i as u64));
-            }
-        }
-
-        Ok(None)
-    }
-
-    pub fn get_validator_pubkey_from_beacon_state(&self, block_hash: B256, validator_index: u64) -> eyre::Result<Option<PublicKey>> {
-        let beacon_state = self.get_beacon_state_from_block_hash(block_hash)?;
-
-        let validator = beacon_state.get_validator(validator_index as usize)?;
-        let pubkey = PublicKey::from_bytes(validator.pubkey.as_ref())
-            .map_err(|e| eyre::eyre!("PublicKey::from_bytes error {e:?}"))?;
-        Ok(Some(pubkey))
-    }
-
 }
 
 fn parse_execution_requests(requests: &Option<Requests>) -> eyre::Result<ExecutionRequestsV4> {

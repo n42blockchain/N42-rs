@@ -58,6 +58,10 @@ tokio.workspace = true
 tokio-stream.workspace = true
 futures-util.workspace = true
 
+# metrics
+reth-metrics = { workspace = true }
+metrics = { workspace = true }
+
 # misc
 hex.workspace = true
 sled.workspace = true

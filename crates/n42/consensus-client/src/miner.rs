@@ -54,6 +54,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{trace, debug, error, info, warn};
 
 use crate::beacon::{Beacon};
+use crate::metrics::MinerMetrics;
 use n42_primitives::{RelativeEpoch, Attestation, BeaconState, BeaconBlock, Deposit, VoluntaryExitWithSig, parse_deposit_log, BLSPubkey, BlockVerifyResultAggregate, agg_sig_to_fixed, fixed_to_agg_sig, SLOTS_PER_EPOCH, CommitteeIndex, AttestationData};
 use n42_primitives::CommitteeCache;
 use crate::network::{fetch_beacon_block, broadcast_beacon_block};
@@ -144,6 +145,8 @@ pub struct N42Miner<T: PayloadTypes, Provider, B, Network> {
     num_long_delayed_blocks: u64,
     num_fetched_blocks: u64,
     order_stats: HashMap<u64, bool>,
+
+    metrics: MinerMetrics,
 }
 
 #[derive(Debug, Clone)]
@@ -233,6 +236,8 @@ where
             block_verify_result_rx,
             pending_block_data: None,
             recent_committee_caches: schnellru::LruMap::new(schnellru::ByLength::new((SLOTS_PER_EPOCH * 2)as u32)),
+
+            metrics: Default::default(),
         };
 
         // Spawn the miner
@@ -647,6 +652,7 @@ where
 
     async fn handle_verification_result(&mut self, verification_result: BlockVerifyResult) -> eyre::Result<()> {
         debug!(target: "consensus-client", "handle_verification_result start: {verification_result:?}");
+        self.metrics.num_verification_submission.increment(1);
         let mut pending_block_data = match &self.pending_block_data {
             Some(v) => v.clone(),
             None => {
@@ -664,6 +670,7 @@ where
         } = verification_result.clone();
 
         if block.hash() != block_hash {
+            self.metrics.num_verification_block_hash_mismatch.increment(1);
             return Err(eyre::eyre!("verification result block hash mismatch: block_hash={block_hash:?}, pending block hash={:?}", block.hash()));
         }
 

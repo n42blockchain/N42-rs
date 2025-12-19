@@ -23,6 +23,7 @@ mod consistent_view;
 pub use consistent_view::{ConsistentDbView, ConsistentViewError};
 
 mod blockchain_provider;
+mod metrics;
 pub use blockchain_provider::BlockchainProvider;
 
 mod consistent;

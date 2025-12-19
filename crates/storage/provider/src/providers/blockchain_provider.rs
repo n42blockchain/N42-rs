@@ -1,4 +1,5 @@
 #![allow(unused)]
+use super::metrics::BlockchainProviderMetrics;
 use crate::{
     providers::{ConsistentProvider, ProviderNodeTypes, StaticFileProvider},
     AccountReader, BlockHashReader, BlockIdReader, BlockNumReader, BlockReader, BlockReaderIdExt,
@@ -68,6 +69,7 @@ pub struct BlockchainProvider<N: NodeTypesWithDB> {
     /// Tracks the chain info wrt forkchoice updates and in memory canonical
     /// state.
     pub(crate) canonical_in_memory_state: CanonicalInMemoryState<N::Primitives>,
+    metrics: BlockchainProviderMetrics,
 }
 
 impl<N: NodeTypesWithDB> Clone for BlockchainProvider<N> {
@@ -75,6 +77,7 @@ impl<N: NodeTypesWithDB> Clone for BlockchainProvider<N> {
         Self {
             database: self.database.clone(),
             canonical_in_memory_state: self.canonical_in_memory_state.clone(),
+            metrics: Default::default(),
         }
     }
 }
@@ -126,6 +129,7 @@ impl<N: ProviderNodeTypes> BlockchainProvider<N> {
                 finalized_header,
                 safe_header,
             ),
+            metrics: Default::default(),
         })
     }
 
@@ -739,16 +743,21 @@ impl<N: ProviderNodeTypes> SnapshotProviderWriter for BlockchainProvider<N> {
 
 impl<N: ProviderNodeTypes> BeaconProvider for BlockchainProvider<N> {
     fn get_beacon_block_by_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BeaconBlock>> {
-        self.database_provider_ro()?.get_beacon_block_by_hash(block_hash)
+        let start = Instant::now();
+        let result = self.database_provider_ro()?.get_beacon_block_by_hash(block_hash)?;
+        self.metrics.get_beacon_block_by_hash_duration.record(start.elapsed().as_secs_f64());
+        Ok(result)
     }
 
     fn get_beacon_state_by_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BeaconState>> {
+        let start = Instant::now();
         let mut beacon_state = match self.database_provider_ro()?.get_beacon_state_by_hash(block_hash)? {
             Some(v) => v,
             None => return Ok(None),
         };
 
         let validators_store = VecTree::restore(beacon_state.validators, beacon_state.validators_len, |tree_hash| {
+            self.metrics.num_get_tree_by_hash_for_validator_in_getting_a_beacon_state.increment(1);
             self.get_tree_by_hash_for_validator(&tree_hash).unwrap_or(None)
         }).map_err(|e| ProviderError::Other(AnyError::new(e)))?;
         beacon_state.validators_store = validators_store;
@@ -769,6 +778,7 @@ impl<N: ProviderNodeTypes> BeaconProvider for BlockchainProvider<N> {
         beacon_state.epoch_attester_indexes_set = epoch_attester_indexes_store.iter().copied().collect();
         beacon_state.epoch_attester_indexes_store = epoch_attester_indexes_store;
 
+        self.metrics.get_beacon_state_by_hash_duration.record(start.elapsed().as_secs_f64());
         Ok(Some(beacon_state))
     }
 

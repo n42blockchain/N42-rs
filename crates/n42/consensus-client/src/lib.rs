@@ -5,3 +5,4 @@ pub mod beacon;
 pub mod network;
 pub mod storage;
 pub mod migrate;
+pub mod metrics;

@@ -81,6 +81,9 @@ eyre.workspace = true
 arbitrary = { workspace = true, features = ["derive"], optional = true }
 hex = "0.4.3"
 
+[dev-dependencies]
+serde_json.workspace = true
+
 [lints]
 workspace = true
 

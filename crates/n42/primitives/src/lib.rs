@@ -6,6 +6,8 @@
 mod snapshot;
 pub use snapshot::APosConfig;
 pub use snapshot::Snapshot;
+pub use snapshot::Tally;
+pub use snapshot::Vote;
 
 mod validator;
 pub use validator::*;

@@ -265,7 +265,8 @@ async fn deposit(
             rng.fill_bytes(&mut ikm);
 
             let sk = SecretKey::key_gen(&ikm, &[]).unwrap();
-            info!("generated validator_private_key: {sk:?}");
+            // Note: Private key not logged for security reasons
+            info!("generated new validator private key");
             sk
         }
     };

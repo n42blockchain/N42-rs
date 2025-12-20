@@ -8,3 +8,9 @@ pub use apos::*;
 
 mod unverifiedblock;
 pub use unverifiedblock::*;
+
+#[cfg(test)]
+mod integration_tests;
+
+#[cfg(test)]
+mod fuzz_tests;

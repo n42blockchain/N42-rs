@@ -22,8 +22,6 @@ use n42_primitives::Snapshot;
 
 pub mod accounts;
 mod beacon;
-#[cfg(test)]
-mod beacon_tests;
 pub mod blocks;
 pub mod integer_list;
 pub mod sharded_key;

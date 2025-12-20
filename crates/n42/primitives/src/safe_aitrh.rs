@@ -1,5 +1,5 @@
 // Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 /// Extension trait for iterators, providing a safe replacement for `sum`.
 pub trait SafeArithIter<T> {

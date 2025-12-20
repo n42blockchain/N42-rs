@@ -1,5 +1,5 @@
 // Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Interaction with `reth_network::PeersManager`, for integration testing. Otherwise
 //! `reth_network::NetworkManager` manages `reth_network::PeersManager`.

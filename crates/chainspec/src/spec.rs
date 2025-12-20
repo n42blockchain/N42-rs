@@ -1,5 +1,5 @@
 // Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 pub use alloy_eips::eip1559::BaseFeeParams;
 use alloy_evm::eth::spec::EthExecutorSpec;

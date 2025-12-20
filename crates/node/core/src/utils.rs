@@ -1,5 +1,5 @@
 // Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Utility functions for node startup and shutdown, for example path parsing and retrieving single
 //! blocks from the network.

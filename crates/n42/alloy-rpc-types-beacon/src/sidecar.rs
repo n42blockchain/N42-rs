@@ -1,5 +1,5 @@
 // Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::header::Header;
 use alloy_eips::eip4844::{deserialize_blob, Blob, BlobTransactionSidecar, Bytes48};

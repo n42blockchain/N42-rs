@@ -1,5 +1,5 @@
 // Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::primitives::alloy_primitives::{BlockNumber, StorageKey, StorageValue};
 use alloy_primitives::{Address, B256, U256};

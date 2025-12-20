@@ -1,5 +1,5 @@
 // Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 use reth_chainspec::{ChainSpec, DEV, HOLESKY, HOODI, MAINNET, N42, N42_DEVNET, SEPOLIA};
 use reth_cli::chainspec::{parse_genesis, ChainSpecParser};

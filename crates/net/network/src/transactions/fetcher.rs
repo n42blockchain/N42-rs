@@ -1,5 +1,5 @@
 // Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! `TransactionFetcher` is responsible for rate limiting and retry logic for fetching
 //! transactions. Upon receiving an announcement, functionality of the `TransactionFetcher` is

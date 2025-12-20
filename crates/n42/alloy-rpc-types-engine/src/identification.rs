@@ -1,5 +1,5 @@
 // Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Client identification: <https://github.com/ethereum/execution-apis/blob/main/src/engine/identification.md>
 

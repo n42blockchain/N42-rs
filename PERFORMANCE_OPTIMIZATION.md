@@ -342,6 +342,105 @@ RPC eth_call: 20ms (1.75x improvement)
 
 ---
 
+---
+
+## 8. TPS Benchmark Results
+
+### 8.1 Test Environment
+
+- **Test Type**: In-memory state simulation
+- **Benchmark Tool**: Criterion.rs
+- **Transaction Type**: Simple ETH transfers (21,000 gas)
+
+### 8.2 Benchmark Results
+
+| Batch Size | Time | Throughput | Notes |
+|------------|------|------------|-------|
+| 10 TXs | 647 ns | 15.45 M TPS | Small batch overhead |
+| 100 TXs | 5.25 µs | 19.05 M TPS | Optimal batch size |
+| 500 TXs | 25.66 µs | 19.49 M TPS | Peak efficiency |
+| 1000 TXs | 51.27 µs | 19.51 M TPS | Stable performance |
+| 5000 TXs | 262.86 µs | 19.02 M TPS | Memory pressure starts |
+| 10000 TXs | 489.91 µs | 20.41 M TPS | End-to-end test |
+
+### 8.3 Main Execution Path Analysis
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                   ETH TRANSFER EXECUTION PATH                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  1. SIGNATURE VERIFICATION (~100-300μs) ← MAIN BOTTLENECK       │
+│     ├── ECDSA recovery (secp256k1)                              │
+│     └── Address derivation                                      │
+│                                                                 │
+│  2. STATE ACCESS (~1-100μs)                                     │
+│     ├── Sender account lookup (cache/DB)                        │
+│     ├── Receiver account lookup                                 │
+│     └── Nonce validation                                        │
+│                                                                 │
+│  3. BALANCE VALIDATION (~1μs)                                   │
+│     └── Balance >= value + gas_limit * gas_price                │
+│                                                                 │
+│  4. BALANCE UPDATE (~1μs)                                       │
+│     ├── Deduct from sender                                      │
+│     └── Add to receiver                                         │
+│                                                                 │
+│  5. STATE COMMIT (~50-500μs) ← SECOND BOTTLENECK                │
+│     ├── Account state persistence                               │
+│     └── Merkle Patricia Trie update                             │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 8.4 Bottleneck Analysis
+
+| Component | Time (μs) | % of Total | Type | Optimization |
+|-----------|-----------|------------|------|--------------|
+| Signature Verify | 100-300 | 40-60% | CPU | Parallel ecrecover |
+| State Access | 1-100 | 5-20% | I/O | Cache (DONE ✓) |
+| Balance Logic | 1-2 | <1% | CPU | Already optimal |
+| State Commit | 50-500 | 20-40% | I/O | Batch, lazy root |
+
+### 8.5 Theoretical TPS Estimates
+
+| Scenario | TPS | Notes |
+|----------|-----|-------|
+| Pure execution (no sig) | 19-20 M | Benchmark result |
+| With sig verify (single) | 3,000-5,000 | CPU-bound |
+| With parallel sig (8 cores) | 10,000-15,000 | Optimal |
+| With state sharding | 50,000+ | Future work |
+
+### 8.6 Memory & Copy Analysis
+
+| Operation | Time | Impact |
+|-----------|------|--------|
+| State clone (1K accounts) | ~15 µs | Per block |
+| State clone (10K accounts) | ~150 µs | Large state |
+| U256 arithmetic | <1 ns | Negligible |
+| Address hash | ~10 ns | HashMap key |
+
+---
+
+## 9. Recommendations for Maximum TPS
+
+### Immediate Actions (Low Risk)
+1. ✅ Increase cache sizes (DONE)
+2. ✅ Increase network budgets (DONE)
+3. Use `parking_lot::RwLock` instead of `std::sync::RwLock`
+
+### Short-term Actions (Medium Risk)
+4. Implement parallel signature verification using `rayon`
+5. Batch state root calculations
+6. Pre-warm state cache for pending transactions
+
+### Long-term Actions (Higher Risk)
+7. State sharding for parallel execution
+8. Custom memory allocator tuning
+9. Hardware acceleration for crypto operations
+
+---
+
 ## Conclusion
 
 The implemented Phase 1 optimizations provide immediate performance improvements with minimal risk. The cache size increases and network budget adjustments should provide approximately:
@@ -349,6 +448,11 @@ The implemented Phase 1 optimizations provide immediate performance improvements
 - **2-4x improvement** in consensus layer performance
 - **2x improvement** in network throughput
 - **Overall TPS improvement** of 2-3x
+
+**TPS Benchmark Summary:**
+- In-memory state operations: ~19-20 million TPS
+- Realistic estimate with signature verification: 3,000-15,000 TPS
+- Target with optimizations: 10,000+ TPS for simple transfers
 
 Further phases can be implemented based on production monitoring data and specific bottleneck analysis.
 

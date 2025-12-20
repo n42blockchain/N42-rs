@@ -90,3 +90,94 @@ where
         payload_attributes
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reth_chainspec::ChainSpec;
+
+    #[test]
+    fn test_builder_new() {
+        let chain_spec = Arc::new(ChainSpec::default());
+        let builder = N42PayloadAttributesBuilder::new(chain_spec.clone());
+        assert!(builder.signer_address.is_none());
+    }
+
+    #[test]
+    fn test_builder_new_with_signer() {
+        let chain_spec = Arc::new(ChainSpec::default());
+        let signer = Address::from_slice(&[0x42; 20]);
+        let builder = N42PayloadAttributesBuilder::new_add_signer(chain_spec.clone(), Some(signer));
+        assert_eq!(builder.signer_address, Some(signer));
+    }
+
+    #[test]
+    fn test_builder_new_with_no_signer() {
+        let chain_spec = Arc::new(ChainSpec::default());
+        let builder = N42PayloadAttributesBuilder::new_add_signer(chain_spec.clone(), None);
+        assert!(builder.signer_address.is_none());
+    }
+
+    #[test]
+    fn test_build_payload_attributes() {
+        let chain_spec = Arc::new(ChainSpec::default());
+        let signer = Address::from_slice(&[0x42; 20]);
+        let builder = N42PayloadAttributesBuilder::new_add_signer(chain_spec, Some(signer));
+
+        let timestamp = 1700000000u64;
+        let attrs = builder.build(timestamp);
+
+        assert_eq!(attrs.timestamp, timestamp);
+        assert_eq!(attrs.prev_randao, B256::ZERO);
+        assert_eq!(attrs.suggested_fee_recipient, signer);
+    }
+
+    #[test]
+    fn test_build_payload_attributes_no_signer() {
+        let chain_spec = Arc::new(ChainSpec::default());
+        let builder = N42PayloadAttributesBuilder::new(chain_spec);
+
+        let timestamp = 1700000000u64;
+        let attrs = builder.build(timestamp);
+
+        assert_eq!(attrs.timestamp, timestamp);
+        assert_eq!(attrs.suggested_fee_recipient, Address::ZERO);
+    }
+
+    #[test]
+    fn test_build_ext_with_withdrawals() {
+        let chain_spec = Arc::new(ChainSpec::default());
+        let signer = Address::from_slice(&[0x42; 20]);
+        let builder = N42PayloadAttributesBuilder::new_add_signer(chain_spec, Some(signer));
+
+        let timestamp = 1700000000u64;
+        let prev_randao = B256::repeat_byte(0xAB);
+        let withdrawals = Some(vec![Withdrawal {
+            index: 0,
+            validator_index: 1,
+            address: Address::ZERO,
+            amount: 1000,
+        }]);
+
+        let attrs = builder.build_ext(timestamp, withdrawals.clone(), prev_randao);
+
+        assert_eq!(attrs.timestamp, timestamp);
+        assert_eq!(attrs.prev_randao, prev_randao);
+        assert_eq!(attrs.withdrawals, withdrawals);
+    }
+
+    #[test]
+    fn test_build_ext_without_withdrawals() {
+        let chain_spec = Arc::new(ChainSpec::default());
+        let builder = N42PayloadAttributesBuilder::new(chain_spec);
+
+        let timestamp = 1700000000u64;
+        let prev_randao = B256::repeat_byte(0xCD);
+
+        let attrs = builder.build_ext(timestamp, None, prev_randao);
+
+        assert_eq!(attrs.timestamp, timestamp);
+        assert_eq!(attrs.prev_randao, prev_randao);
+        assert!(attrs.withdrawals.is_none());
+    }
+}

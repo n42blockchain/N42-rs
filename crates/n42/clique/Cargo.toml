@@ -83,6 +83,16 @@ hex = "0.4.3"
 
 [dev-dependencies]
 serde_json.workspace = true
+criterion = { version = "0.5", features = ["html_reports"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[[bench]]
+name = "consensus_benchmarks"
+harness = false
+
+[[bench]]
+name = "tps_benchmarks"
+harness = false
 
 [lints]
 workspace = true

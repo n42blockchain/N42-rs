@@ -28,5 +28,8 @@ eyre.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 
+[dev-dependencies]
+# reth-chainspec already in dependencies
+
 [lints]
 workspace = true

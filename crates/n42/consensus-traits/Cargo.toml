@@ -1,0 +1,37 @@
+[package]
+name = "n42-consensus-traits"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "N42 APoS consensus trait extensions"
+
+[lints]
+workspace = true
+
+[dependencies]
+# N42
+n42-primitives.workspace = true
+
+# Alloy
+alloy-consensus.workspace = true
+alloy-primitives.workspace = true
+
+# reth (interfaces only)
+reth-consensus = { workspace = true, features = ["std"] }
+reth-primitives-traits = { workspace = true, features = ["std"] }
+
+# Macros
+auto_impl.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Collections
+hashbrown = "0.15"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+

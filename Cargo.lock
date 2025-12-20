@@ -5981,6 +5981,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "n42-consensus-traits"
+version = "1.8.4"
+dependencies = [
+ "alloy-consensus",
+ "alloy-primitives 1.2.1",
+ "auto_impl",
+ "hashbrown 0.15.4",
+ "n42-primitives",
+ "reth-consensus",
+ "reth-primitives-traits",
+ "thiserror 2.0.12",
+ "tokio",
+]
+
+[[package]]
 name = "n42-engine-primitives"
 version = "1.8.4"
 dependencies = [

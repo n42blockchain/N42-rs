@@ -263,7 +263,9 @@ impl Snapshot
             }
 
             //Count new votes
-            let authorize = match header.nonce().unwrap() {
+            let authorize = match header.nonce()
+                .ok_or(VotingError::InvalidVotingChain)?
+            {
                 nonce if hex::encode(nonce) == hex::encode(NONCE_AUTH_VOTE) => true,
                 nonce if hex::encode(nonce) == hex::encode(NONCE_DROP_VOTE) => false,
                 _ => return Err(VotingError::InvalidVote),
@@ -280,7 +282,9 @@ impl Snapshot
 
             //If the vote is passed, update the list of signatories
             if let Some(tally) = snap.tally.get(&header.beneficiary()) {
-                if tally.votes > (snap.signers.len() / 2).try_into().unwrap() {
+                if tally.votes > (snap.signers.len() / 2).try_into()
+                    .map_err(|_|VotingError::InvalidVotingChain)?
+                {
                     if tally.authorize {
                         snap.signers.push(header.beneficiary());
                     } else {
@@ -330,8 +334,12 @@ impl Snapshot
 			);
         }
 
-        snap.number = headers.last().unwrap().number();
-        snap.hash = headers.last().unwrap().hash_slow();
+        snap.number = headers.last()
+            .ok_or(VotingError::InvalidVotingChain)?
+            .number();
+        snap.hash = headers.last()
+            .ok_or(VotingError::InvalidVotingChain)?
+            .hash_slow();
 
         Ok(snap)
     }

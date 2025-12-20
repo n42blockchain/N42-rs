@@ -1,11 +1,17 @@
-use std::collections::HashMap;
+use alloy_rpc_types::{BlockId, BlockNumberOrTag};
+use n42_clique::{BlockVerifyResult, UnverifiedBlock};
+use reth_node_core::primitives::AlloyBlockHeader;
+use std::{collections::HashMap, sync::Arc};
 use reth_consensus::{ConsensusError, FullConsensus};
 use reth_ethereum_primitives::{EthPrimitives};
-use alloy_primitives::Sealable;
-use jsonrpsee::{core::RpcResult, proc_macros::rpc, types::{error::INVALID_PARAMS_CODE, ErrorObject}};
+use alloy_primitives::{Bytes, Sealable, B256};
+use jsonrpsee::{core::{RpcResult, SubscriptionResult}, proc_macros::rpc, types::{error::{INTERNAL_ERROR_CODE, INVALID_PARAMS_CODE}, ErrorObject, SubscriptionId}, PendingSubscriptionSink, SubscriptionMessage};
+use jsonrpsee::types::ErrorObjectOwned;
 use alloy_primitives::Address;
-use n42_primitives::Snapshot;
-use reth_provider::HeaderProvider;
+use n42_primitives::{beacon_chain_spec, epoch_to_block_number, AttestationData, BLSPubkey, BeaconBlock, BeaconState, Snapshot, ValidatorInfo};
+use reth_provider::{BeaconProvider, BlockIdReader, BlockReader, HeaderProvider};
+use tokio::sync::{broadcast, mpsc};
+use tracing::{trace, debug, error, info, warn};
 
 /// trait interface for a custom rpc namespace: `consensus`
 ///
@@ -77,6 +83,224 @@ where
         &self,
         ) -> RpcResult<HashMap<Address, bool>> {
         Ok(self.consensus.proposals().unwrap_or_default())
+    }
+}
+
+/// trait interface for a custom rpc namespace: `consensusBeaconExt`
+///
+/// This defines an additional namespace where all methods are configured as trait functions.
+#[cfg_attr(not(test), rpc(server, namespace = "consensusBeaconExt"))]
+#[cfg_attr(test, rpc(server, client, namespace = "consensusBeaconExt"))]
+pub trait ConsensusBeaconExtApi {
+    #[subscription(name = "subscribeToVerificationRequest", item = String)]
+    fn subscribe_to_verification_request(&self, pubkey: BLSPubkey) -> SubscriptionResult;
+
+    #[method(name = "submitVerification")]
+    fn submit_verification(&self, pubkey: String,
+        signature: String, attestation_data: AttestationData, block_hash: B256,
+        ) -> RpcResult<()>;
+
+    /// get_beacon_block_hash_by_eth1_hash
+    #[method(name = "get_beacon_block_hash_by_eth1_hash")]
+    fn get_beacon_block_hash_by_eth1_hash(&self,
+        eth1_hash: B256,
+        ) -> RpcResult<Option<B256>>;
+
+    /// get_beacon_block_by_hash
+    #[method(name = "get_beacon_block_by_hash")]
+    fn get_beacon_block_by_hash(&self,
+        beacon_block_hash: B256,
+        ) -> RpcResult<Option<BeaconBlock>>;
+
+    /// get_beacon_block_by_number
+    #[method(name = "get_beacon_block_by_number")]
+    fn get_beacon_block_by_number(&self,
+        block_id: BlockId,
+        ) -> RpcResult<Option<BeaconBlock>>;
+
+    /// get_beacon_state_by_beacon_block_hash
+    #[method(name = "get_beacon_state_by_beacon_block_hash")]
+    fn get_beacon_state_by_beacon_block_hash(&self,
+        beacon_block_hash: B256,
+        ) -> RpcResult<Option<BeaconState>>;
+
+    /// get_beacon_state_by_number
+    #[method(name = "get_beacon_state_by_number")]
+    fn get_beacon_state_by_number(&self,
+        state_id: BlockId,
+        ) -> RpcResult<Option<BeaconState>>;
+
+    /// get_beacon_validator_by_pubkey
+    #[method(name = "get_beacon_validator_by_pubkey")]
+    fn get_beacon_validator_by_pubkey(&self,
+        pubkey: BLSPubkey,
+        ) -> RpcResult<Option<ValidatorInfo>>;
+
+    /// get_total_effective_balance
+    #[method(name = "get_total_effective_balance")]
+    fn get_total_effective_balance(&self,
+        ) -> RpcResult<u64>;
+
+}
+
+/// The type that implements the `consensusBeaconRpc` rpc namespace trait
+pub struct ConsensusBeaconExt<Cons, Provider> {
+    pub consensus: Cons,
+    pub provider: Provider,
+    pub verification_tx: mpsc::Sender<BlockVerifyResult>,
+    pub broadcast_tx: broadcast::Sender<(UnverifiedBlock, Arc<Vec<BLSPubkey>>)>,
+}
+
+impl<Cons, Provider> ConsensusBeaconExtApiServer for ConsensusBeaconExt<Cons, Provider>
+where
+    Cons:
+        FullConsensus<EthPrimitives, Error = ConsensusError> + Clone + Unpin + 'static,
+    Provider: HeaderProvider + BeaconProvider + BlockIdReader + BlockReader + Clone + 'static,
+{
+    fn subscribe_to_verification_request(&self, pending: PendingSubscriptionSink, pubkey: BLSPubkey) -> SubscriptionResult {
+        let mut rx = self.broadcast_tx.subscribe();
+        debug!(target: "reth::cli", ?pubkey, "subscribe_to_verification_request New client subscribed");
+
+        tokio::spawn(async move {
+            if let Ok(sink) = pending.accept().await {
+                let subscription_id = sink.subscription_id();
+                while let Ok((data_to_be_verified, target_committee_pubkeys)) = rx.recv().await {
+                    if !target_committee_pubkeys.contains(&pubkey) {
+                        continue;
+                    }
+                    if sink.is_closed() {
+                        debug!(target: "reth::cli", ?subscription_id, "subscribe_to_verification_request client disconnected");
+                        break;
+                    }
+                    let message = SubscriptionMessage::new("subscribeToVerificationRequest", subscription_id.clone(), &data_to_be_verified).unwrap();
+                    if let Err(e) = sink.send(message).await {
+                        debug!(target: "reth::cli", ?subscription_id, ?e, "subscribe_to_verification_request Error sending to client");
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(())
+    }
+
+    fn submit_verification(&self, pubkey: String,
+        signature: String, attestation_data: AttestationData, block_hash: B256,
+        ) -> RpcResult<()> {
+        let v = BlockVerifyResult {pubkey, signature, attestation_data, block_hash};
+        let _ = self.verification_tx.try_send(v);
+        Ok(())
+    }
+
+    fn get_beacon_block_hash_by_eth1_hash(&self,
+        eth1_hash: B256,
+        ) -> RpcResult<Option<B256>> {
+        self.provider.get_beacon_block_hash_by_eth1_hash(&eth1_hash).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))
+    }
+
+    fn get_beacon_block_by_hash(&self,
+        beacon_block_hash: B256,
+        ) -> RpcResult<Option<BeaconBlock>> {
+        self.provider.get_beacon_block_by_hash(&beacon_block_hash).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))
+    }
+
+    fn get_beacon_block_by_number(&self,
+        block_id: BlockId,
+        ) -> RpcResult<Option<BeaconBlock>> {
+        let eth1_hash = match self.provider.block_hash_for_id(block_id).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))? {
+            Some(v) => v,
+            None => {
+                return Ok(None);
+            }
+        };
+
+        let beacon_block_hash = match self.provider.get_beacon_block_hash_by_eth1_hash(&eth1_hash).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))? {
+            Some(v) => v,
+            None => {
+                return Ok(None);
+            }
+        };
+
+        self.provider.get_beacon_block_by_hash(&beacon_block_hash).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))
+    }
+
+    fn get_beacon_state_by_beacon_block_hash(&self,
+        beacon_block_hash: B256,
+        ) -> RpcResult<Option<BeaconState>> {
+        self.provider.get_beacon_state_by_hash(&beacon_block_hash).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))
+    }
+
+    fn get_beacon_state_by_number(&self,
+        block_id: BlockId,
+        ) -> RpcResult<Option<BeaconState>> {
+        let eth1_hash = match self.provider.block_hash_for_id(block_id).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))? {
+            Some(v) => v,
+            None => {
+                return Ok(None);
+            }
+        };
+
+        let beacon_block_hash = match self.provider.get_beacon_block_hash_by_eth1_hash(&eth1_hash).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))? {
+            Some(v) => v,
+            None => {
+                return Ok(None);
+            }
+        };
+
+        self.provider.get_beacon_state_by_hash(&beacon_block_hash).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))
+    }
+
+    fn get_beacon_validator_by_pubkey(&self,
+        pubkey: BLSPubkey,
+        ) -> RpcResult<Option<ValidatorInfo>> {
+        let beacon_state = match self.get_beacon_state_by_number(BlockId::latest())? {
+            Some(v) => v,
+            None => {
+                return Ok(None);
+            }
+        };
+        let validator_index = match beacon_state.get_validator_index_from_pubkey(&pubkey) {
+            Some(v) => v,
+            None => {
+                return Ok(None);
+            }
+        };
+        let validator = beacon_state.get_validator(validator_index).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))?;
+        let balance_in_beacon = beacon_state.get_balance(validator_index).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))?;
+        let effective_balance = beacon_state.get_effective_balance(validator_index).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))?;
+        let inactivity_score = beacon_state.get_inactivity_score(validator_index).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))?;
+        let activation_block_number = epoch_to_block_number(validator.activation_epoch);
+        let activation_timestamp = match self.provider.header_by_number(activation_block_number).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))? {
+            Some(v) => v.timestamp(),
+            None => 0,
+        };
+        let exit_block_number = epoch_to_block_number(validator.exit_epoch);
+        let exit_timestamp = match self.provider.header_by_number(exit_block_number).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))? {
+            Some(v) => v.timestamp(),
+            None => 0,
+        };
+
+        let validator_info = ValidatorInfo {
+            activation_timestamp,
+            exit_timestamp,
+            balance_in_beacon,
+            effective_balance,
+            inactivity_score,
+        };
+        Ok(Some(validator_info))
+    }
+
+    fn get_total_effective_balance(&self,
+        ) -> RpcResult<u64> {
+        let beacon_state = match self.get_beacon_state_by_number(BlockId::latest())? {
+            Some(v) => v,
+            None => {
+                return Err(ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("beacon state not found"), None::<()>));
+            }
+        };
+        let spec = beacon_chain_spec();
+        let total_active_balance = beacon_state.get_total_active_balance(&spec).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))?;
+
+        Ok(total_active_balance)
     }
 }
 

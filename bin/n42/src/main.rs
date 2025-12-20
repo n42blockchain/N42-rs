@@ -3,14 +3,22 @@
 #[global_allocator]
 static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
 
+use std::{time::Duration};
+use alloy_signer_local::PrivateKeySigner;
+use consensus_client::miner::N42Miner;
+use consensus_client::migrate::N42Migrate;
+use n42_engine_primitives::N42PayloadAttributesBuilder;
 use clap::Parser;
 use n42::{args::RessArgs, cli::Cli, ress::install_ress_subprotocol};
 use n42_engine_types::{N42Node};
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_node_builder::NodeHandle;
 use reth_node_ethereum::EthereumNode;
-use tracing::info;
-use n42::consensus_ext::{ConsensusExtApiServer, ConsensusExt};
+use tokio::sync::{broadcast, mpsc};
+use tracing::{info, error};
+use n42::consensus_ext::{ConsensusExtApiServer, ConsensusExt, ConsensusBeaconExtApiServer, ConsensusBeaconExt};
+
+const DEFAULT_BLOCK_TIME_SECS: u64 = 8;
 
 fn main() {
     reth_cli_util::sigsegv_handler::install();
@@ -19,6 +27,13 @@ fn main() {
     if std::env::var_os("RUST_BACKTRACE").is_none() {
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
     }
+
+    let (verification_tx, verification_rx) = mpsc::channel(100);
+    let (broadcast_tx, _broadcast_rx) = broadcast::channel(100);
+    let broadcast_tx_clone = broadcast_tx.clone();
+    let broadcast_tx_clone_for_message_producer = broadcast_tx.clone();
+    let broadcast_tx_clone_for_miner = broadcast_tx.clone();
+
 
     if let Err(err) =
         Cli::<EthereumChainSpecParser, RessArgs>::parse().run(async move |builder, ress_args| {
@@ -30,16 +45,63 @@ fn main() {
                             let consensus = ctx.consensus().clone();
                             let provider = ctx.provider().clone();
 
+                            let beacon_ext = ConsensusBeaconExt { consensus: consensus.clone(), provider: provider.clone(), verification_tx, broadcast_tx: broadcast_tx_clone };
                             let ext = ConsensusExt { consensus, provider };
 
                             // now we merge our extension namespace into all configured transports
                             ctx.auth_module.merge_auth_methods(ext.into_rpc())?;
+                            ctx.modules.merge_configured(beacon_ext.into_rpc())?;
 
-                            println!("consensus rpc extension enabled");
+                            info!(target: "reth::cli", "consensus rpc extension enabled");
 
                             Ok(())
                         })
                 .launch_with_debug_capabilities().await?;
+
+            let node_config_dev = node.config.clone().dev();
+            let consensus_signer_private_key = node_config_dev.dev.consensus_signer_private_key;
+            let signer_address = if let Some(signer_private_key) = &consensus_signer_private_key {
+                let eth_signer: PrivateKeySigner = signer_private_key.to_string().parse().unwrap();
+                Some(eth_signer.address())
+            } else {
+                None
+            };
+
+            let mining_mode = if let Some(_) = consensus_signer_private_key {
+                let block_time = node_config_dev.dev.block_time.unwrap_or_else(|| Duration::from_secs(DEFAULT_BLOCK_TIME_SECS));
+                consensus_client::miner::MiningMode::interval(block_time)
+            } else {
+                consensus_client::miner::MiningMode::NoMining
+            };
+            info!(target: "reth::cli", ?mining_mode);
+
+            if node_config_dev.dev.migrate_old_chain_data_from_db.is_some() || node_config_dev.dev.migrate_old_chain_data_from_rpc.is_some() {
+            let migrate_from_db_path =
+                node_config_dev.dev.migrate_old_chain_data_from_db.clone();
+            let migrate_from_db_rpc =
+                node_config_dev.dev.migrate_old_chain_data_from_rpc.clone();
+            N42Migrate::spawn_new(
+                node.provider.clone(),
+                N42PayloadAttributesBuilder::new_add_signer(node.chain_spec(), signer_address),
+                node.add_ons_handle.beacon_engine_handle.clone(),
+                node.payload_builder_handle.clone(),
+                node.pool.clone(),
+                migrate_from_db_path,
+                migrate_from_db_rpc,
+            );
+            } else {
+                N42Miner::spawn_new(
+                    node.provider.clone(),
+                    N42PayloadAttributesBuilder::new_add_signer(node.chain_spec(), signer_address),
+                    node.add_ons_handle.beacon_engine_handle.clone(),
+                    mining_mode,
+                    node.payload_builder_handle.clone(),
+                    node.network.clone(),
+                    node.consensus.clone(),
+                    broadcast_tx_clone_for_miner,
+                    verification_rx,
+                );
+            }
 
             // Install ress subprotocol.
             if ress_args.enabled {
@@ -56,7 +118,8 @@ fn main() {
             node_exit_future.await
         })
     {
-        eprintln!("Error: {err:?}");
+        error!(target: "reth::cli", "Error: {err:?}");
         std::process::exit(1);
     }
 }
+

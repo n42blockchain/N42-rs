@@ -1,0 +1,324 @@
+# build
+## android
+### prerequisites
+1. gradle
+2. jdk17, set JAVA_HOME and PATH
+3. cargo-ndk
+example:
+```shell
+brew install gradle
+brew install openjdk@17
+
+export JAVA_HOME="/usr//local/opt/openjdk@17"
+export PATH="$JAVA_HOME/bin:$PATH"
+
+cargo install cargo-ndk
+```
+
+### build commands
+```shell
+cd crates/n42/mobile-sdk
+./build-aar.sh
+```
+
+output:
+mobile-sdk-release.aar
+
+## ios
+### prerequisites
+1. Xcode + iOS SDK
+2. cbindgen
+3. cargo-lipo
+```shell
+cargo install cbindgen
+cargo install cargo-lipo
+```
+### build commands
+```shell
+cd crates/n42/mobile-sdk/ios/
+./build_xcframework.sh
+```
+
+Run build_xcframework.sh → produces mobile_sdk.xcframework and headers.
+
+## linux, mac
+### build commands
+```shell
+cargo build -p mobile-sdk --example mobile-sdk-test
+```
+
+output:
+target/debug/examples/mobile-sdk-test
+
+# integration into an app
+## for android apps that use mobile-sdk aar
+
+Add the following to your app’s app/src/main/AndroidManifest.xml
+```xml
+<uses-permission android:name="android.permission.INTERNET"/>
+<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+```
+
+sdk api example:
+```java
+package com.example.test_mobile_sdk_aar;
+
+import android.util.Log;
+
+import com.mobileSdk.Api;
+import org.json.JSONArray;
+import org.json.JSONException;
+
+public class MobileSdkTest {
+    public static void test() {
+        //String wsUrl = "ws://127.0.0.1:8546";
+        String wsUrl = "ws://10.0.2.2:8546";
+
+        String validatorKeyPair = Api.generateBls12381Keypair();
+        Log.i("RustLib", "validatorKeyPair: " + validatorKeyPair);
+        String validatorPrivateKey = "";
+        String validatorPublicKey = "";
+
+        try {
+            // Parse the JSON array string
+            JSONArray jsonArray = new JSONArray(validatorKeyPair);
+
+            // Access elements by index
+            validatorPrivateKey = jsonArray.getString(0);
+            validatorPublicKey = jsonArray.getString(1);
+        } catch (JSONException e) {
+            e.printStackTrace();
+        }
+        Log.i("RustLib", "validatorPrivateKey: " + validatorPrivateKey);
+        Log.i("RustLib", "validatorPublicKey: " + validatorPublicKey);
+        //String validatorPrivateKey = "6be6c38a5986be6c7094e92017af0d15da0af6857362e2ba0c2103c3eb893eec";
+        //String validatorPublicKey = "8a2470d8ccb2e43b3b5295cfee71508f8808e166e5f152d5af9fe022d95e300dc7c5814f2c9eb71e2da8412beb61c53a";
+
+        String withdrawalAddress = "0xa0Ee7A142d267C1f36714E4a8F75612F20a79720";
+        String depositContractAddress = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
+        String depositValueWeiInHex = "0x1bc16d674ec800000";
+        String tx = Api.createDepositUnsignedTx(
+                depositContractAddress,
+                validatorPrivateKey,
+                withdrawalAddress,
+                depositValueWeiInHex
+        );
+        Log.i("RustLib", "tx: " + tx);
+
+        String getExitFeeTx = Api.createGetExitFeeUnsignedTx();
+        Log.i("RustLib", "getExitFeeTx: " + getExitFeeTx);
+
+        String fee_wei_in_hex = "0x1"; // should query the value by sending getExitFee Tx(as it is, no signing needed) to the exit contract
+
+        String exitTx = Api.createExitUnsignedTx(
+                validatorPublicKey,
+                fee_wei_in_hex
+        );
+        Log.i("RustLib", "exitTx: " + exitTx);
+
+        Api.runClient(wsUrl, validatorPrivateKey).thenRun(() -> Log.d("APP", "Rust async done")).exceptionally(ex -> {
+            System.err.println("Rust error: " + ex.getMessage());
+            return null;
+        });;
+    }
+}
+```
+
+## for ios apps developed in swift
+
+1. Drag mobile_sdk.xcframework into your Xcode project.
+
+2. Add mobile_sdk.h, MobileSdk.swift to your project.
+
+3. Configure the bridging header for FFI.
+
+### the Bridging Header
+1. Create the Bridging Header
+
+In Xcode, go to File → New → File → Header File.
+
+Name it e.g., YourApp-Bridging-Header.h.
+
+Add your Rust header:
+
+// YourApp-Bridging-Header.h
+#include "mobile_sdk.h"
+
+2. Tell Xcode to use it
+
+Select your project in the navigator → Build Settings.
+
+Search for Objective-C Bridging Header (type it in the search bar).
+
+If it’s not visible, make sure you select All instead of Basic settings.
+
+Set the path relative to your project, for example:
+
+ios/include/YourApp-Bridging-Header.h
+
+This tells Swift to include the C header when compiling Swift files.
+
+sdk api example:
+```swift
+import SwiftUI
+import Foundation
+
+struct ContentView: View {
+    @State private var message = "Waiting..."
+    @State private var resultText: String = "result"
+
+    var body: some View {
+        VStack {
+            Image(systemName: "globe")
+                .imageScale(.large)
+                .foregroundStyle(.tint)
+            Text(resultText)
+        }
+        .padding()
+
+        Button("Run Rust Client") {
+            let depositContractAddress = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
+            //let validatorPrivateKey = "6be6c38a5986be6c7094e92017af0d15da0af6857362e2ba0c2103c3eb893eec"
+            var validatorPublicKey = ""
+            var validatorPrivateKey = ""
+            let withdrawalAddress = "0xa0Ee7A142d267C1f36714E4a8F75612F20a79720"
+            let depositValueInWei = "0x1bc16d674ec800000"
+
+            var result = MobileSdk.generateBls12381Keypair()
+            switch result {
+            case .success(let txJson):
+                self.resultText = "TX JSON: \(txJson)"
+                let jsonData = Data(txJson.utf8)
+                do {
+                    let keys = try JSONDecoder().decode([String].self, from: jsonData)
+                    validatorPrivateKey = keys[0]
+                    validatorPublicKey = keys[1]
+
+                    print("validatorPrivateKey:", validatorPrivateKey)
+                    print("validatorPublicKey:", validatorPublicKey)
+                } catch {
+                    print("Failed to decode:", error)
+                }
+
+            case .failure(let error):
+                self.resultText = "Error: \(error)"
+            }
+            print("generateBls12381Keypair result", result)
+
+            result = MobileSdk.createDepositUnsignedTx(
+                depositContractAddress: depositContractAddress,
+                validatorPrivateKey: validatorPrivateKey,
+                withdrawalAddress: withdrawalAddress,
+                depositValueInWei: depositValueInWei
+            )
+            switch result {
+            case .success(let txJson):
+                self.resultText = "TX JSON: \(txJson)"
+            case .failure(let error):
+                self.resultText = "Error: \(error)"
+            }
+            print("createDepositUnsignedTx result", result)
+
+            result = MobileSdk.createGetExitFeeUnsignedTx()
+            switch result {
+            case .success(let txJson):
+                self.resultText = "TX JSON: \(txJson)"
+            case .failure(let error):
+                self.resultText = "Error: \(error)"
+            }
+            print("createGetExitFeeUnsignedTx result", result)
+
+            //let validatorPublicKey =   "8a2470d8ccb2e43b3b5295cfee71508f8808e166e5f152d5af9fe022d95e300dc7c5814f2c9eb71e2da8412beb61c53a"
+            result = MobileSdk.createExitUnsignedTx(
+                validatorPublicKey: validatorPublicKey,
+                feeInWeiOrEmpty: "0x1"  // should query the value by sending getExitFee Tx(as it is, no signing needed) to the exit contract
+            )
+            switch result {
+            case .success(let txJson):
+                self.resultText = "TX JSON: \(txJson)"
+            case .failure(let error):
+                self.resultText = "Error: \(error)"
+            }
+            print("createExitUnsignedTx result", result)
+
+            let wsUrl = "ws://127.0.0.1:8546"
+            MobileSdk.runClient(
+                wsUrl: wsUrl,
+                validatorPrivateKey: validatorPrivateKey,
+                completion: { result in
+                    switch result {
+                    case .success:
+                        self.resultText = "Client started successfully"
+                    case .failure(let err):
+                        self.resultText = "Error: \(err)"
+                    }
+                }
+            )
+ 
+
+        }
+    }
+}
+
+#Preview {
+    ContentView()
+}
+```
+
+## linux, mac
+```shell
+./target/debug/examples/mobile-sdk-test help
+deposit, exit, validate
+
+Usage: mobile-sdk-test <COMMAND>
+
+Commands:
+  deposit
+  exit
+  validate
+  generate-bls12381-keypair
+  help                       Print this message or the help of the given
+subcommand(s)
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
+```
+
+### prerequisites
+We have an ethereum EOA private key for paying for the
+deposit(--deposit-private-key), example:
+0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+
+We have an ethereum EOA private key and its public address to be used as withdrawal private key and withadrawal public address, example:
+
+0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6,
+0xa0Ee7A142d267C1f36714E4a8F75612F20a79720
+
+1. generate bls12381 keypair (privkey, pubkey)
+```shell
+./target/debug/examples/mobile-sdk-test generate-bls12381-keypair
+keypair: ("3c86f39ef84ea79bb632e56d6c2e6d9fb410ae681deaf4a1a87688a901852d54",
+"af4a49ca1cc5ad0348bde8222a00bbab5d71c538abb23f91e1807932d02a3258cae1d718f16d9e0cf8be555fdd4800cd")
+```
+
+2. deposit
+```shell
+./target/debug/examples/mobile-sdk-test deposit -v
+3c86f39ef84ea79bb632e56d6c2e6d9fb410ae681deaf4a1a87688a901852d54 -w
+0xa0Ee7A142d267C1f36714E4a8F75612F20a79720 -d
+0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+```
+
+3. validate
+```shell
+RUST_LOG=debug ./target/debug/examples/mobile-sdk-test validate -v
+3c86f39ef84ea79bb632e56d6c2e6d9fb410ae681deaf4a1a87688a901852d54
+```
+
+4. exit
+```shell
+./target/debug/examples/mobile-sdk-test exit -w
+0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6 -v
+af4a49ca1cc5ad0348bde8222a00bbab5d71c538abb23f91e1807932d02a3258cae1d718f16d9e0cf8be555fdd4800cd
+```

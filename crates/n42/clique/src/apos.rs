@@ -1,3 +1,4 @@
+use reth_revm::cached::CachedReads;
 use rand::prelude::IndexedRandom;
 use reth_primitives_traits::{AlloyBlockHeader};
 use alloy_primitives::Sealable;
@@ -31,6 +32,7 @@ use std::str::FromStr;
 const CHECKPOINT_INTERVAL: u64 = 2048; // Number of blocks after which to save the vote snapshot to the database
 const INMEMORY_SNAPSHOTS: u32 = 128; // Number of recent vote snapshots to keep in memory
 const INMEMORY_TDS: u32 = 1024; // Number of recent total difficulty records to keep in memory
+const INMEMORY_CACHED_READS: u32 = 32; // Number of recent cached reads records to keep in memory
 
 const WIGGLE_TIME: Duration = Duration::from_millis(500); // Random delay (per signer) to allow concurrent signers
 
@@ -150,6 +152,7 @@ where
     recent_headers: RwLock<schnellru::LruMap<B256, Provider::Header>>,    // Recent headers for snapshot
     recent_tds: RwLock<schnellru::LruMap<B256, U256>>,
     recent_tds_inited: AtomicBool,
+    recent_cached_reads: RwLock<schnellru::LruMap<B256, CachedReads>>,
 }
 
 
@@ -171,6 +174,7 @@ where
         let recent_headers = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(CHECKPOINT_INTERVAL as u32 * 2)));
         let recent_tds = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_TDS)));
         let recent_tds_inited = AtomicBool::new(false);
+        let recent_cached_reads = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_CACHED_READS)));
 
         let eth_signer: Option<PrivateKeySigner> = signer_private_key.map(|key| { key.parse().unwrap() });
 
@@ -194,6 +198,7 @@ where
             recent_headers,
             recent_tds,
             recent_tds_inited,
+            recent_cached_reads,
             proposals: Arc::new(RwLock::new(HashMap::new())),
             signer: RwLock::new(eth_signer_address),
             eth_signer: RwLock::new(eth_signer),
@@ -849,5 +854,23 @@ where
             }
         }
         wiggle
+    }
+
+    fn set_cached_reads(
+        &self,
+        block_hash: BlockHash,
+        cached_reads: CachedReads
+        ) -> Result<(), ConsensusError> {
+        let mut recent_cached_reads = self.recent_cached_reads.write().unwrap();
+        recent_cached_reads.insert(block_hash, cached_reads);
+        Ok(())
+    }
+
+    fn get_cached_reads(
+        &self,
+        block_hash: BlockHash,
+    ) -> Result<Option<CachedReads>, ConsensusError> {
+        let mut recent_cached_reads = self.recent_cached_reads.write().unwrap();
+        Ok(recent_cached_reads.get(&block_hash).cloned())
     }
 }

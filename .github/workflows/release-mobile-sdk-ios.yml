@@ -1,0 +1,64 @@
+name: Build mobile-sdk ios xcframework
+
+on:
+  push:
+    tags:
+      - "mobile-sdk-v*.*.*"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write  # required for creating releases
+
+jobs:
+  build-ios:
+    runs-on: macos-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: stable
+    - name: Cache dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: "rust-build-cache"
+        cache-targets: true
+
+    - name: Install tools
+      run: |
+        cargo install cargo-lipo
+        cargo install cbindgen
+
+    - name: Run build_xcframework.sh
+      working-directory: crates/n42/mobile-sdk/ios/
+      run: ./build_xcframework.sh
+
+    - name: Start ssh-agent
+      uses: webfactory/ssh-agent@v0.8.0
+      with:
+        ssh-private-key: ${{ secrets.SERVER_SSH_KEY }}
+
+    - name: Add server to known_hosts
+      run: ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts
+
+    - name: Upload to server
+      run: |
+        scp \
+          crates/n42/mobile-sdk/ios/mobile-sdk-ios.tar.gz \
+          crates/n42/mobile-sdk/ios/mobile-sdk-sim-x86_64-apple-ios.tar.gz \
+          ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:mobile-sdk-releases/${{ github.ref_name }}/
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        name: ${{ github.ref_name }}
+        tag_name: ${{ github.ref_name }}
+        files: |
+          crates/n42/mobile-sdk/ios/mobile-sdk-ios.tar.gz
+          crates/n42/mobile-sdk/ios/mobile-sdk-sim-x86_64-apple-ios.tar.gz
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -11,6 +11,7 @@
 
 extern crate alloc;
 
+use std::sync::Arc;
 use alloc::{fmt::Debug, string::String, vec::Vec};
 use alloy_consensus::Header;
 use alloy_primitives::{BlockHash, BlockNumber, Bloom, B256, U256, Address};
@@ -22,7 +23,8 @@ use reth_primitives_traits::{
     SealedHeader,
 };
 
-use n42_primitives::Snapshot;
+use n42_primitives::{Snapshot};
+use reth_revm::cached::CachedReads;
 use std::collections::HashMap;
 use std::time::Duration;
  
@@ -148,6 +150,22 @@ pub trait Consensus<B: Block>: HeaderValidator<B::Header> {
     ) -> Duration {
         Duration::from_secs(0)
     }
+
+    fn set_cached_reads(
+        &self,
+        block_hash: BlockHash,
+        cached_reads: CachedReads
+        ) -> Result<(), ConsensusError> {
+        Ok(())
+    }
+
+    fn get_cached_reads(
+        &self,
+        block_hash: BlockHash,
+    ) -> Result<Option<CachedReads>, ConsensusError> {
+        Ok(None)
+    }
+
 }
 
 /// HeaderValidator is a protocol that validates headers and their relationships.

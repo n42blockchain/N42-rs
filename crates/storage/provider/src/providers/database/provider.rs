@@ -1,3 +1,4 @@
+use std::hash::RandomState;
 use crate::{
     bundle_state::StorageRevertsIter,
     providers::{
@@ -18,6 +19,9 @@ use crate::{
     StaticFileProviderFactory, StatsReader, StorageLocation, StorageReader, StorageTrieWriter,
     TransactionVariant, TransactionsProvider, TransactionsProviderExt, TrieWriter,
     WithdrawalsProvider,
+ValidatorChangeWriter, 
+    ValidatorReader, 
+BeaconReader, BeaconWriter,
 };
 use alloy_consensus::{
     transaction::{SignerRecoverable, TransactionMeta},
@@ -58,9 +62,12 @@ use reth_static_file_types::StaticFileSegment;
 use reth_storage_api::{
     BlockBodyIndicesProvider, BlockBodyReader, NodePrimitivesProvider, OmmersProvider,
     StateProvider, StorageChangeSetReader, TryIntoHistoricalStateProvider,
-    SnapshotProvider, SnapshotProviderWriter
+    SnapshotProvider, SnapshotProviderWriter,
+    BeaconProvider, BeaconProviderWriter,
 };
-use n42_primitives::Snapshot;
+use n42_primitives::{
+    BeaconBlock, BeaconState, BeaconStateChangeset, BeaconBlockChangeset,
+    Snapshot, Validator,ValidatorBeforeTx,ValidatorChangeset,ValidatorRevert};
 use reth_storage_errors::provider::{ProviderResult, RootMismatch};
 use reth_trie::{
     prefix_set::{PrefixSet, PrefixSetMut, TriePrefixSets},
@@ -79,6 +86,237 @@ use std::{
     sync::{mpsc, Arc},
 };
 use tracing::{debug, trace};
+
+impl<TX:DbTx,N:NodeTypes>BeaconReader for DatabaseProvider<TX,N>{
+    fn get_beaconstate_by_blockhash(&self,blockhash:BlockHash) -> ProviderResult<Option<BeaconState> > {
+        // let mut cursor=self.tx.cursor_read::<tables::BeaconStateRecord>()?;
+        // while let Some((bh,_))=cursor.next()?{
+        //     println!("bh: {:?}",bh);
+        // }
+        Ok(self.tx.get::<tables::BeaconStateRecord>(blockhash)?)
+    }
+    fn get_beaconblock_by_blockhash(&self,blockhash:BlockHash) -> ProviderResult<Option<BeaconBlock> > {
+        Ok(self.tx.get::<tables::BeaconBlockRecord>(blockhash)?)
+    }
+}
+
+impl<TX:DbTxMut+DbTx+'static,N:NodeTypes>BeaconWriter for DatabaseProvider<TX,N>{
+    fn unwind_beacon(&self,range:RangeInclusive<BlockNumber>) -> ProviderResult<()> {
+        if range.is_empty(){
+            return Ok(());
+        }
+
+        let mut cursor_r = self.tx.cursor_read::<tables::BeaconNum2Hash>()?;
+        let mut blockhashes: Vec<BlockHash> = Vec::new();
+        for blocknumber in range.clone(){
+            if let Some((_,blockhash))=cursor_r.seek_exact(blocknumber)?{
+                blockhashes.push(blockhash);
+            }
+        }
+
+        self.remove_beaconstate(blockhashes.clone())?;
+        self.remove_beaconblock(blockhashes.clone())?;
+
+        let mut cursor_w=self.tx.cursor_write::<tables::BeaconNum2Hash>()?;
+        for blocknumber in range{
+            if cursor_w.seek_exact(blocknumber)?.is_some(){
+                cursor_w.delete_current()?;
+            }
+        }
+
+        Ok(())
+    }
+    fn remove_beaconstate(&self, mut range: Vec<BlockHash>) -> ProviderResult<()> {
+        range.sort();
+        let mut cursor=self.tx.cursor_write::<tables::BeaconStateRecord>()?;
+        let mut range_iter=range.into_iter().peekable();
+        while let Some((bh,_))=cursor.next()?{
+            match range_iter.peek(){
+                Some(next_bh)=>{
+                    if bh==*next_bh{
+                        cursor.delete_current()?;
+                        range_iter.next();
+                    }else if bh<*next_bh{
+                        continue;
+                    }else{
+                        // impossible
+                        range_iter.next();
+                    }
+                }
+                None=>break,
+            }
+        }
+        Ok(())
+    }
+    fn write_beaconstate(&self,mut changes:BeaconStateChangeset) -> ProviderResult<()> {
+        let mut cursor=self.tx.cursor_write::<tables::BeaconStateRecord>()?;
+        for (blockhash,beaconstate) in changes.beaconstates{
+            cursor.insert(blockhash, &beaconstate)?;
+        }
+        Ok(())
+    }
+    // fn unwind_beaconblock(&self,range:RangeInclusive<BlockNumber>) -> ProviderResult<()> {
+    //     let mut cursor=self.tx.cursor_read::<tables::BeaconNum2Hash>()?;
+    //     let mut blockhashes:Vec<BlockHash>=Vec::new();
+    //     for blocknumber in range{
+    //         if let Some((_,blockhash))=cursor.seek_exact(blocknumber)?{
+    //             blockhashes.push(blockhash);
+    //         }
+    //     }
+    //     self.remove_beaconblock(blockhashes)?;
+    //     Ok(())
+    // }
+    fn remove_beaconblock(&self,mut range:Vec<BlockHash>) -> ProviderResult<()> {
+        range.sort();
+        let mut cursor=self.tx.cursor_write::<tables::BeaconBlockRecord>()?;
+        let mut range_iter=range.into_iter().peekable();
+        while let Some((bh,_))=cursor.next()?{
+            match range_iter.peek(){
+                Some(next_bh)=>{
+                    if bh==*next_bh{
+                        cursor.delete_current()?;
+                        range_iter.next();
+                    }else if bh<*next_bh{
+                        continue;
+                    }else{
+                        // impossible
+                        range_iter.next();
+                    }
+                }
+                None=>break,
+            }
+        }
+        Ok(())
+    }
+    fn write_beaconblock(&self,changes:BeaconBlockChangeset) -> ProviderResult<()> {
+        let mut cursor=self.tx.cursor_write::<tables::BeaconBlockRecord>()?;
+        for(blockhash, beaconblock)in changes.beaconblocks{
+            cursor.insert(blockhash, &beaconblock)?;
+        }
+        Ok(())
+    }
+}
+
+impl<TX: DbTx, N: NodeTypes> ValidatorReader for DatabaseProvider<TX, N> {
+    fn basic_validator(&self,address:Address) -> ProviderResult<Option<Validator> > {
+        Ok(self.tx.get::<tables::PlainValidatorState>(address)?)
+    }
+    fn changed_validators_and_blocks_with_range(&self,range:RangeInclusive<BlockNumber> ,) -> ProviderResult<BTreeMap<Address,Vec<BlockNumber> > > {
+        let mut changeset_cursor = self.tx.cursor_read::<tables::ValidatorChangeSets>()?;
+        let validator_transitions = changeset_cursor.walk_range(range)?.try_fold(
+            BTreeMap::new(),
+            |mut validators: BTreeMap<Address, Vec<u64>>, entry| -> ProviderResult<_> {
+                let (index, validator) = entry?;
+                validators.entry(validator.address).or_default().push(index);
+                Ok(validators)
+            },
+        )?;
+        Ok(validator_transitions)
+    }
+}
+
+impl<TX: DbTxMut + DbTx+'static, N: NodeTypes> ValidatorChangeWriter for DatabaseProvider<TX, N> {
+    fn write_validator_reverts(&self,first_block:BlockNumber,validator_reverts:ValidatorRevert,) -> ProviderResult<()> {
+        let mut validator_changeset_cursor =
+            self.tx_ref().cursor_dup_write::<tables::ValidatorChangeSets>()?;
+        for (block_index, mut validator_block_reverts) in validator_reverts.validators.into_iter().enumerate() {
+            let block_number=first_block+block_index as BlockNumber;
+            validator_block_reverts.par_sort_by_key(|a| a.0);
+
+            for (address, info) in validator_block_reverts {
+                validator_changeset_cursor.append_dup(
+                    block_number,
+                    ValidatorBeforeTx { address, info:info.map(Into::into) },
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+    fn insert_validator_history_index(&self,validator_transitions:impl IntoIterator<Item = (Address,impl IntoIterator<Item = BlockNumber>)> ,) -> ProviderResult<()> {
+        self.append_history_index::<_, tables::ValidatorsHistory>(validator_transitions,ShardedKey::new,)
+    }
+    fn unwind_validator(&self,range: RangeInclusive<BlockNumber>) -> ProviderResult<()> {
+        let changed_validators=self
+            .tx
+            .cursor_read::<tables::ValidatorChangeSets>()?
+            .walk_range(range.clone())?
+            .collect::<Result<Vec<_>,_>>()?;
+
+        self.unwind_validator_history_indices(changed_validators.iter())?;
+
+        self.remove_validator(range.clone())?;
+
+        Ok(())
+    }
+    fn unwind_validator_history_indices<'a>(&self, changesets: impl Iterator<Item = &'a (BlockNumber, ValidatorBeforeTx)>,) -> ProviderResult<usize> {
+        let mut last_indices = changesets
+            .into_iter()
+            .map(|(index, validator)| (validator.address, *index))
+            .collect::<Vec<_>>();
+        last_indices.sort_by_key(|(addr, _)| *addr);
+        
+        let mut cursor = self.tx.cursor_write::<tables::ValidatorsHistory>()?;
+        
+        for &(address, index) in &last_indices {
+            let partial_shard = unwind_history_shards::<_, tables::ValidatorsHistory, _>(
+                &mut cursor,
+                ShardedKey::last(address),
+                index,
+                |sharded_key| sharded_key.key == address,
+            )?;
+            if !partial_shard.is_empty() {
+                cursor.insert(
+                    ShardedKey::last(address),
+                    &BlockNumberList::new_pre_sorted(partial_shard),
+                )?;
+            }
+        }
+        Ok(last_indices.len())
+    }
+    fn write_validator_changes(&self, mut changes: ValidatorChangeset) -> ProviderResult<()> {
+        changes.validators.par_sort_by_key(|a|a.0);
+        let mut validators_cursor=self.tx_ref().cursor_write::<tables::PlainValidatorState>()?;
+        for (address,validator)in changes.validators{
+            if let Some(validator)=validator{
+                validators_cursor.upsert(address, (&validator).into())?;
+            }else if validators_cursor.seek_exact(address)?.is_some(){
+                validators_cursor.delete_current()?;
+            }
+        }
+        Ok(())
+    }
+    fn remove_validator(&self, range: RangeInclusive<BlockNumber>) -> ProviderResult<()> {
+        if range.is_empty() {
+            return Ok(());
+        }
+        let validator_changesets = self.take::<tables::ValidatorChangeSets>(range.clone())?;
+        let mut validator_cursor = self.tx.cursor_write::<tables::PlainValidatorState>()?;
+        let mut processed: HashSet<Address, RandomState> = HashSet::new();
+        for (block_number, ValidatorBeforeTx { address, info: old_validator }) in validator_changesets {
+            if !processed.insert(address) {
+                continue;
+            }
+            let existing_entry = validator_cursor.seek_exact(address)?;
+            match old_validator {
+                Some(validator) => {
+                    // add a new validator or update an existing one
+                    validator_cursor.upsert(address, &validator)?;
+                }
+                None => {
+                    if existing_entry.is_some() {
+                        // delete an existing validator
+                        validator_cursor.delete_current()?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    fn take_validator(&self, range: RangeInclusive<BlockNumber>) -> ProviderResult<ValidatorChangeset> {
+        todo!()
+    }
+}
 
 /// A [`DatabaseProvider`] that holds a read-only database transaction.
 pub type DatabaseProviderRO<DB, N> = DatabaseProvider<<DB as Database>::TX, N>;
@@ -1652,6 +1890,38 @@ impl<TX: DbTxMut, N: NodeTypes<ChainSpec: EthereumHardforks>> SnapshotProviderWr
         Ok(self.tx.put::<tables::SignersByHash>(block_hash.clone(), signer)?)
     }
 }
+
+impl<TX: DbTx + 'static, N: NodeTypes<ChainSpec: EthereumHardforks>> BeaconProvider for DatabaseProvider<TX, N>{
+
+    fn get_beacon_block_by_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BeaconBlock>> {
+        Ok(self.tx.get::<tables::BeaconBlocksByHash>(block_hash.clone())?)
+    }
+
+    fn get_beacon_state_by_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BeaconState>> {
+        Ok(self.tx.get::<tables::BeaconStatesByHash>(block_hash.clone())?)
+    }
+
+    fn get_beacon_block_hash_by_eth1_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BlockHash>> {
+        Ok(self.tx.get::<tables::BeaconBlockHashesByEth1Hash>(block_hash.clone())?)
+    }
+}
+
+impl<TX: DbTxMut, N: NodeTypes<ChainSpec: EthereumHardforks>> BeaconProviderWriter for DatabaseProvider<TX, N>{
+
+    fn save_beacon_block_by_hash(&self, block_hash: &BlockHash, beacon_block: BeaconBlock) -> ProviderResult<()> {
+        Ok(self.tx.put::<tables::BeaconBlocksByHash>(block_hash.clone(), beacon_block)?)
+    }
+
+    fn save_beacon_state_by_hash(&self, block_hash: &BlockHash,  beacon_state: BeaconState) -> ProviderResult<()> {
+        Ok(self.tx.put::<tables::BeaconStatesByHash>(block_hash.clone(), beacon_state)?)
+    }
+
+    fn save_beacon_block_hash_by_eth1_hash(&self, eth1_block_hash: &BlockHash, beacon_block_hash: BlockHash) -> ProviderResult<()> {
+        Ok(self.tx.put::<tables::BeaconBlockHashesByEth1Hash>(eth1_block_hash.clone(), beacon_block_hash)?)
+    }
+
+}
+
 impl<TX: DbTx + 'static, N: NodeTypesForProvider> BlockBodyIndicesProvider
     for DatabaseProvider<TX, N>
 {

@@ -224,17 +224,15 @@ pub fn validate_4844_header_standalone<H: BlockHeader>(
 ///
 /// From yellow paper: extraData: An arbitrary byte array containing data relevant to this block.
 /// This must be 32 bytes or fewer; formally Hx.
+/// SEC-006: Re-enabled extra data validation to prevent DoS attacks
 #[inline]
 pub fn validate_header_extra_data<H: BlockHeader>(header: &H) -> Result<(), ConsensusError> {
-    /*
     let extra_data_len = header.extra_data().len();
     if extra_data_len > MAXIMUM_EXTRA_DATA_SIZE {
         Err(ConsensusError::ExtraDataExceedsMax { len: extra_data_len })
     } else {
         Ok(())
     }
-    */
-    Ok(())
 }
 
 /// Validates against the parent hash and number.

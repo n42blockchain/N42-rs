@@ -203,8 +203,9 @@ where
         gas_used: header.gas_used(),
         timestamp: header.timestamp(),
         extra_data: Bytes::new(),
-        mix_hash: header.mix_hash().unwrap(),
-        nonce: u64::from(header.nonce().unwrap()),
+        // SEC-002: Safe handling of optional mix_hash and nonce
+        mix_hash: header.mix_hash().unwrap_or_default(),
+        nonce: u64::from(header.nonce().unwrap_or_default()),
         base_fee_per_gas: header.base_fee_per_gas(),
     };
 

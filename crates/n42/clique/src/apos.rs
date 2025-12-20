@@ -16,7 +16,7 @@ use reth_primitives_traits::{
     Header, RecoveredBlock,
 };
 use reth_primitives_traits::{
-    Block as BlockTrait, BlockHeader as BlockHeaderTrait, NodePrimitives,
+    Block as BlockTrait, BlockBody, BlockHeader as BlockHeaderTrait, NodePrimitives,
 };
 use reth_provider::{BlockIdReader, BlockReaderIdExt, HeaderProvider, SnapshotProvider};
 use reth_revm::cached::CachedReads;
@@ -205,8 +205,12 @@ where
             INMEMORY_CACHED_READS,
         )));
 
-        let eth_signer: Option<PrivateKeySigner> =
-            signer_private_key.map(|key| key.parse().unwrap());
+        // SEC-001: Safe private key parsing - avoid panic on invalid key
+        let eth_signer: Option<PrivateKeySigner> = signer_private_key.and_then(|key| {
+            key.parse().map_err(|e| {
+                error!(target: "consensus::apos", "Failed to parse signer private key: {:?}", e);
+            }).ok()
+        });
 
         let eth_signer_address = eth_signer.clone().map(|signer| signer.address());
         info!(target: "consensus::apos", "apos set signer address {:?}", eth_signer_address);
@@ -315,6 +319,7 @@ where
     // APIs implements consensus.Engine, returning the user facing RPC API to allow
     // controlling the signer voting.
 
+    /// SEC-009: Safe initialization of recent TDs with proper error handling
     fn init_recent_tds(&self) {
         if self.recent_tds_inited.load(Ordering::Relaxed) {
             return;
@@ -325,9 +330,18 @@ where
             .unwrap_or(Some(0))
             .unwrap_or(0);
         info!(target: "consensus::apos", ?finalized_block_number, "init_recent_tds");
-        let best_block_number = self.provider.best_block_number().unwrap();
+
+        let best_block_number = match self.provider.best_block_number() {
+            Ok(n) => n,
+            Err(e) => {
+                error!(target: "consensus::apos", "Failed to get best block number: {:?}", e);
+                return;
+            }
+        };
         info!(target: "consensus::apos", ?best_block_number, "init_recent_tds");
-        let num_blocks = best_block_number - finalized_block_number + 1;
+
+        // SEC-009: Use saturating arithmetic to prevent underflow
+        let num_blocks = best_block_number.saturating_sub(finalized_block_number).saturating_add(1);
         let start_block_number = if num_blocks > INMEMORY_TDS.into() {
             warn!(target: "consensus::apos", ?finalized_block_number, ?best_block_number, td_cache_size=?INMEMORY_TDS,
                 "the number of blocks from finalized block to best block is larger than td cache size, this may cause 'td not found' errors later",
@@ -336,27 +350,40 @@ where
         } else {
             finalized_block_number
         };
-        (start_block_number..=best_block_number).for_each(|block_number| {
+
+        for block_number in start_block_number..=best_block_number {
             debug!(target: "consensus::apos", ?block_number, "init_recent_tds");
-            let header = self
-                .provider
-                .header_by_number(block_number)
-                .unwrap()
-                .unwrap();
+            let header = match self.provider.header_by_number(block_number) {
+                Ok(Some(h)) => h,
+                Ok(None) => {
+                    warn!(target: "consensus::apos", ?block_number, "Header not found");
+                    continue;
+                }
+                Err(e) => {
+                    error!(target: "consensus::apos", ?block_number, "Failed to get header: {:?}", e);
+                    continue;
+                }
+            };
+
             if block_number == start_block_number {
                 let start_td = self
                     .provider
                     .header_td_by_number(start_block_number)
                     .unwrap_or(Some(U256::ZERO))
                     .unwrap_or(U256::ZERO);
-                let mut recent_tds = self.recent_tds.write().unwrap();
-                recent_tds.insert(header.hash_slow(), start_td);
+                if let Ok(mut recent_tds) = self.recent_tds.write() {
+                    recent_tds.insert(header.hash_slow(), start_td);
+                }
             } else {
-                let mut recent_tds = self.recent_tds.write().unwrap();
-                let parent_td = *recent_tds.get(&header.parent_hash()).unwrap();
-                recent_tds.insert(header.hash_slow(), parent_td + header.difficulty());
+                if let Ok(mut recent_tds) = self.recent_tds.write() {
+                    let parent_td = recent_tds
+                        .get(&header.parent_hash())
+                        .copied()
+                        .unwrap_or(U256::ZERO);
+                    recent_tds.insert(header.hash_slow(), parent_td + header.difficulty());
+                }
             }
-        });
+        }
 
         self.recent_tds_inited.store(true, Ordering::Relaxed);
     }
@@ -678,10 +705,26 @@ where
     /// on its own and valid against its parent.
     ///
     /// Note: this expects that the headers are in natural order (ascending block number)
+    /// SEC-003: Implement proper header range validation
     fn validate_header_range(
         &self,
         headers: &[SealedHeader],
     ) -> Result<(), HeaderConsensusError<reth_primitives_traits::Header>> {
+        if let Some((initial_header, remaining_headers)) = headers.split_first() {
+            // Validate the first header
+            self.validate_header(initial_header)
+                .map_err(|e| HeaderConsensusError(e, initial_header.clone()))?;
+
+            // Validate each subsequent header against its parent
+            let mut parent = initial_header;
+            for child in remaining_headers {
+                self.validate_header(child)
+                    .map_err(|e| HeaderConsensusError(e, child.clone()))?;
+                self.validate_header_against_parent(child, parent)
+                    .map_err(|e| HeaderConsensusError(e, child.clone()))?;
+                parent = child;
+            }
+        }
         Ok(())
     }
 }
@@ -725,11 +768,52 @@ where
 {
     type Error = ConsensusError;
 
+    /// SEC-005: Implement body against header validation
     fn validate_body_against_header(
         &self,
         body: &B::Body,
         header: &SealedHeader<B::Header>,
     ) -> Result<(), Self::Error> {
+        // Validate transaction root
+        let tx_root = body.calculate_tx_root();
+        if header.transactions_root() != tx_root {
+            return Err(ConsensusError::BodyTransactionRootDiff(
+                reth_primitives_traits::GotExpected {
+                    got: tx_root,
+                    expected: header.transactions_root(),
+                }
+                .into(),
+            ));
+        }
+
+        // Validate ommers hash
+        if let Some(ommers_hash) = body.calculate_ommers_root() {
+            if header.ommers_hash() != ommers_hash {
+                return Err(ConsensusError::BodyOmmersHashDiff(
+                    reth_primitives_traits::GotExpected {
+                        got: ommers_hash,
+                        expected: header.ommers_hash(),
+                    }
+                    .into(),
+                ));
+            }
+        }
+
+        // Validate withdrawals root if present
+        if let (Some(header_root), Some(body_root)) =
+            (header.withdrawals_root(), body.calculate_withdrawals_root())
+        {
+            if header_root != body_root {
+                return Err(ConsensusError::BodyWithdrawalsRootDiff(
+                    reth_primitives_traits::GotExpected {
+                        got: body_root,
+                        expected: header_root,
+                    }
+                    .into(),
+                ));
+            }
+        }
+
         Ok(())
     }
 

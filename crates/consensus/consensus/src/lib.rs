@@ -530,4 +530,4 @@ impl From<InvalidTransactionError> for ConsensusError {
 /// `HeaderConsensusError` combines a `ConsensusError` with the `SealedHeader` it relates to.
 #[derive(thiserror::Error, Debug)]
 #[error("Consensus error: {0}, Invalid header: {1:?}")]
-pub struct HeaderConsensusError<H>(ConsensusError, SealedHeader<H>);
+pub struct HeaderConsensusError<H>(pub ConsensusError, pub SealedHeader<H>);

@@ -22,10 +22,10 @@ use reth_provider::{BlockIdReader, BlockReaderIdExt, HeaderProvider, SnapshotPro
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Debug, Formatter};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime};
-use tracing::{debug, error, info, warn};
+use std::time::{Duration, Instant, SystemTime};
+use tracing::{debug, error, info, trace, warn};
 
 use alloy_signer::SignerSync;
 use alloy_signer_local::{LocalSigner, PrivateKeySigner};
@@ -34,10 +34,11 @@ use reth_consensus::{Consensus, ConsensusError, FullConsensus, HeaderValidator};
 use reth_storage_api::SnapshotProviderWriter;
 use std::str::FromStr;
 
-//
+// Performance-tuned constants
+// PERF: Increased cache sizes for better hit rates and reduced DB lookups
 const CHECKPOINT_INTERVAL: u64 = 2048; // Number of blocks after which to save the vote snapshot to the database
-const INMEMORY_SNAPSHOTS: u32 = 128; // Number of recent vote snapshots to keep in memory
-const INMEMORY_TDS: u32 = 1024; // Number of recent total difficulty records to keep in memory
+const INMEMORY_SNAPSHOTS: u32 = 512; // PERF: Increased from 128 to 512 for better cache hit rate
+const INMEMORY_TDS: u32 = 4096; // PERF: Increased from 1024 to 4096 for better TD lookup performance
 
 const WIGGLE_TIME: Duration = Duration::from_millis(500); // Random delay (per signer) to allow concurrent signers
 
@@ -163,6 +164,11 @@ where
     recent_headers: RwLock<schnellru::LruMap<B256, Provider::Header>>, // Recent headers for snapshot
     recent_tds: RwLock<schnellru::LruMap<B256, U256>>,
     recent_tds_inited: AtomicBool,
+    // PERF: Performance counters for monitoring cache effectiveness
+    snapshot_cache_hits: AtomicU64,
+    snapshot_cache_misses: AtomicU64,
+    header_cache_hits: AtomicU64,
+    header_cache_misses: AtomicU64,
 }
 
 // New creates a APos proof-of-authority consensus engine with the initial
@@ -231,6 +237,37 @@ where
             signer: RwLock::new(eth_signer_address),
             eth_signer: RwLock::new(eth_signer),
             provider,
+            // PERF: Initialize performance counters
+            snapshot_cache_hits: AtomicU64::new(0),
+            snapshot_cache_misses: AtomicU64::new(0),
+            header_cache_hits: AtomicU64::new(0),
+            header_cache_misses: AtomicU64::new(0),
+        }
+    }
+
+    /// PERF: Get cache hit rate for snapshots (for monitoring)
+    #[inline]
+    pub fn snapshot_cache_hit_rate(&self) -> f64 {
+        let hits = self.snapshot_cache_hits.load(Ordering::Relaxed);
+        let misses = self.snapshot_cache_misses.load(Ordering::Relaxed);
+        let total = hits + misses;
+        if total == 0 {
+            0.0
+        } else {
+            hits as f64 / total as f64
+        }
+    }
+
+    /// PERF: Get cache hit rate for headers (for monitoring)
+    #[inline]
+    pub fn header_cache_hit_rate(&self) -> f64 {
+        let hits = self.header_cache_hits.load(Ordering::Relaxed);
+        let misses = self.header_cache_misses.load(Ordering::Relaxed);
+        let total = hits + misses;
+        if total == 0 {
+            0.0
+        } else {
+            hits as f64 / total as f64
         }
     }
 
@@ -409,6 +446,9 @@ where
         hash: B256,
         parents: Option<Vec<Provider::Header>>,
     ) -> Result<Snapshot, ConsensusError> {
+        // PERF: Track snapshot lookup time
+        let start = Instant::now();
+        
         let mut headers: Vec<Provider::Header> = Vec::new();
         let mut snap: Option<Snapshot> = None;
         let mut hash = hash;
@@ -422,6 +462,9 @@ where
             //Attempt to retrieve a snapshot from memory
             if let Some(cached_snap) = recents.get(&hash) {
                 snap = Some(cached_snap.clone());
+                // PERF: Record cache hit
+                self.snapshot_cache_hits.fetch_add(1, Ordering::Relaxed);
+                trace!(target: "consensus::apos::perf", elapsed_us = ?start.elapsed().as_micros(), "snapshot cache HIT");
                 break;
             }
 

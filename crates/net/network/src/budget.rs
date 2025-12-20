@@ -3,18 +3,18 @@
 
 /// Default budget to try and drain streams.
 ///
-/// Default is 10 iterations.
-pub const DEFAULT_BUDGET_TRY_DRAIN_STREAM: u32 = 10;
+/// PERF: Increased from 10 to 20 for higher throughput.
+pub const DEFAULT_BUDGET_TRY_DRAIN_STREAM: u32 = 20;
 
 /// Default budget to try and drain headers and bodies download streams.
 ///
-/// Default is 2 iterations.
-pub const DEFAULT_BUDGET_TRY_DRAIN_DOWNLOADERS: u32 = 2;
+/// PERF: Increased from 2 to 4 for faster sync.
+pub const DEFAULT_BUDGET_TRY_DRAIN_DOWNLOADERS: u32 = 4;
 
 /// Default budget to try and drain [`Swarm`](crate::swarm::Swarm).
 ///
-/// Default is 10 [`SwarmEvent`](crate::swarm::SwarmEvent)s.
-pub const DEFAULT_BUDGET_TRY_DRAIN_SWARM: u32 = 10;
+/// PERF: Increased from 10 to 20 for more messages per poll.
+pub const DEFAULT_BUDGET_TRY_DRAIN_SWARM: u32 = 20;
 
 /// Default budget to try and drain pending messages from [`NetworkHandle`](crate::NetworkHandle)
 /// channel. Polling the [`TransactionsManager`](crate::transactions::TransactionsManager) future

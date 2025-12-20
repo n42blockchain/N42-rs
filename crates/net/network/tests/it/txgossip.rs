@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! Testing gossiping of transactions.
 use alloy_consensus::TxLegacy;
 use alloy_primitives::{Signature, U256};

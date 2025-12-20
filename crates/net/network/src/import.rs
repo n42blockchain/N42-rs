@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! This module provides an abstraction over block import in the form of the `BlockImport` trait.
 
 use crate::message::NewBlockMessage;

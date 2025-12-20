@@ -1,7 +1,10 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! clap [Args](clap::Args) for Dev testnet configuration
 
-use std::time::Duration;
 use alloy_primitives::B256;
+use std::time::Duration;
 
 use clap::Args;
 use humantime::parse_duration;
@@ -17,7 +20,12 @@ pub struct DevArgs {
     /// Disables network discovery and enables local http server.
     /// Prefunds 20 accounts derived by mnemonic "test test test test test test test test test test
     /// test junk" with 10 000 ETH each.
-    #[arg(long = "dev", alias = "auto-mine", help_heading = "Dev testnet", verbatim_doc_comment)]
+    #[arg(
+        long = "dev",
+        alias = "auto-mine",
+        help_heading = "Dev testnet",
+        verbatim_doc_comment
+    )]
     pub dev: bool,
 
     /// How many transactions to mine per block.
@@ -46,7 +54,7 @@ pub struct DevArgs {
         long = "dev.consensus-signer-private-key",
         env = "CONSENSUS_SIGNER_PRIVATE_KEY",
         value_name = "CONSENSUS_SIGNER_PRIVATE_KEY",
-        verbatim_doc_comment,
+        verbatim_doc_comment
     )]
     pub consensus_signer_private_key: Option<B256>,
 }
@@ -55,7 +63,8 @@ pub struct DevArgs {
 mod tests {
     use super::*;
     use clap::Parser;
-    const SIGNER_PRIVATE_KEY_ALL_ZERO: &str = "0x0000000000000000000000000000000000000000000000000000000000000000";
+    const SIGNER_PRIVATE_KEY_ALL_ZERO: &str =
+        "0x0000000000000000000000000000000000000000000000000000000000000000";
 
     /// A helper type to parse Args more easily
     #[derive(Parser)]
@@ -67,13 +76,37 @@ mod tests {
     #[test]
     fn test_parse_dev_args() {
         let args = CommandParser::<DevArgs>::parse_from(["reth"]).args;
-        assert_eq!(args, DevArgs { dev: false, block_max_transactions: None, block_time: None, consensus_signer_private_key: None });
+        assert_eq!(
+            args,
+            DevArgs {
+                dev: false,
+                block_max_transactions: None,
+                block_time: None,
+                consensus_signer_private_key: None
+            }
+        );
 
         let args = CommandParser::<DevArgs>::parse_from(["reth", "--dev"]).args;
-        assert_eq!(args, DevArgs { dev: true, block_max_transactions: None, block_time: None, consensus_signer_private_key: None });
+        assert_eq!(
+            args,
+            DevArgs {
+                dev: true,
+                block_max_transactions: None,
+                block_time: None,
+                consensus_signer_private_key: None
+            }
+        );
 
         let args = CommandParser::<DevArgs>::parse_from(["reth", "--auto-mine"]).args;
-        assert_eq!(args, DevArgs { dev: true, block_max_transactions: None, block_time: None, consensus_signer_private_key: None });
+        assert_eq!(
+            args,
+            DevArgs {
+                dev: true,
+                block_max_transactions: None,
+                block_time: None,
+                consensus_signer_private_key: None
+            }
+        );
 
         let args = CommandParser::<DevArgs>::parse_from([
             "reth",
@@ -82,7 +115,15 @@ mod tests {
             "2",
         ])
         .args;
-        assert_eq!(args, DevArgs { dev: true, block_max_transactions: Some(2), block_time: None, consensus_signer_private_key: None });
+        assert_eq!(
+            args,
+            DevArgs {
+                dev: true,
+                block_max_transactions: Some(2),
+                block_time: None,
+                consensus_signer_private_key: None
+            }
+        );
 
         let args =
             CommandParser::<DevArgs>::parse_from(["reth", "--dev", "--dev.block-time", "1s"]).args;
@@ -120,8 +161,15 @@ mod tests {
     #[test]
     fn test_parse_arg_consensus_signer_private_key() {
         let signer_private_key = SIGNER_PRIVATE_KEY_ALL_ZERO.to_string();
-        let cmd = CommandParser::<DevArgs>::parse_from(["reth", "--dev.consensus-signer-private-key", &signer_private_key]);
-        assert_eq!(cmd.args.consensus_signer_private_key.unwrap().to_string(), signer_private_key);
+        let cmd = CommandParser::<DevArgs>::parse_from([
+            "reth",
+            "--dev.consensus-signer-private-key",
+            &signer_private_key,
+        ]);
+        assert_eq!(
+            cmd.args.consensus_signer_private_key.unwrap().to_string(),
+            signer_private_key
+        );
     }
 
     #[ignore]
@@ -130,7 +178,10 @@ mod tests {
         let signer_private_key = SIGNER_PRIVATE_KEY_ALL_ZERO.to_string();
         std::env::set_var("CONSENSUS_SIGNER_PRIVATE_KEY", signer_private_key.clone());
         let cmd = CommandParser::<DevArgs>::parse_from(["reth"]);
-        assert_eq!(cmd.args.consensus_signer_private_key.unwrap().to_string(), signer_private_key);
+        assert_eq!(
+            cmd.args.consensus_signer_private_key.unwrap().to_string(),
+            signer_private_key
+        );
         std::env::remove_var("CONSENSUS_SIGNER_PRIVATE_KEY");
     }
 }

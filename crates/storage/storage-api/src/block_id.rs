@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use crate::BlockHashReader;
 use alloy_eips::{BlockHashOrNumber, BlockId, BlockNumberOrTag};
 use alloy_primitives::{BlockNumber, B256};
@@ -63,12 +66,12 @@ pub trait BlockIdReader: BlockNumReader + Send + Sync {
                     .map(|res_opt| res_opt.map(|num_hash| num_hash.number))
             }
             BlockNumberOrTag::Number(num) => num,
-            BlockNumberOrTag::Finalized => {
-                self.finalized_block_number()?.ok_or(ProviderError::FinalizedBlockNotFound)?
-            }
-            BlockNumberOrTag::Safe => {
-                self.safe_block_number()?.ok_or(ProviderError::SafeBlockNotFound)?
-            }
+            BlockNumberOrTag::Finalized => self
+                .finalized_block_number()?
+                .ok_or(ProviderError::FinalizedBlockNotFound)?,
+            BlockNumberOrTag::Safe => self
+                .safe_block_number()?
+                .ok_or(ProviderError::SafeBlockNotFound)?,
         };
         Ok(Some(num))
     }
@@ -109,22 +112,26 @@ pub trait BlockIdReader: BlockNumReader + Send + Sync {
 
     /// Get the safe block number.
     fn safe_block_number(&self) -> ProviderResult<Option<BlockNumber>> {
-        self.safe_block_num_hash().map(|res_opt| res_opt.map(|num_hash| num_hash.number))
+        self.safe_block_num_hash()
+            .map(|res_opt| res_opt.map(|num_hash| num_hash.number))
     }
 
     /// Get the finalized block number.
     fn finalized_block_number(&self) -> ProviderResult<Option<BlockNumber>> {
-        self.finalized_block_num_hash().map(|res_opt| res_opt.map(|num_hash| num_hash.number))
+        self.finalized_block_num_hash()
+            .map(|res_opt| res_opt.map(|num_hash| num_hash.number))
     }
 
     /// Get the safe block hash.
     fn safe_block_hash(&self) -> ProviderResult<Option<B256>> {
-        self.safe_block_num_hash().map(|res_opt| res_opt.map(|num_hash| num_hash.hash))
+        self.safe_block_num_hash()
+            .map(|res_opt| res_opt.map(|num_hash| num_hash.hash))
     }
 
     /// Get the finalized block hash.
     fn finalized_block_hash(&self) -> ProviderResult<Option<B256>> {
-        self.finalized_block_num_hash().map(|res_opt| res_opt.map(|num_hash| num_hash.hash))
+        self.finalized_block_num_hash()
+            .map(|res_opt| res_opt.map(|num_hash| num_hash.hash))
     }
 }
 

@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use crate::HeaderProvider;
 use alloc::{sync::Arc, vec::Vec};
 use alloy_eips::BlockHashOrNumber;

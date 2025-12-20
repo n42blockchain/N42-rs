@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! Helper functions for initializing and opening a database.
 
 use crate::{is_database_empty, TableSet, Tables};

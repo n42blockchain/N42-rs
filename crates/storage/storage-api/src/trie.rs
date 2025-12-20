@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use alloc::vec::Vec;
 use alloy_primitives::{map::B256Map, Address, Bytes, B256};
 use reth_storage_errors::provider::ProviderResult;

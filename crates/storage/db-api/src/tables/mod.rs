@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! Tables and data models.
 //!
 //! # Overview
@@ -28,6 +31,7 @@ use crate::{
 };
 use alloy_consensus::Header;
 use alloy_primitives::{Address, BlockHash, BlockNumber, TxHash, TxNumber, B256};
+use n42_primitives::Snapshot;
 use reth_ethereum_primitives::{Receipt, TransactionSigned};
 use reth_primitives_traits::{Account, Bytecode, StorageEntry};
 use reth_prune_types::{PruneCheckpoint, PruneSegment};
@@ -35,7 +39,6 @@ use reth_stages_types::StageCheckpoint;
 use reth_trie_common::{BranchNodeCompact, StorageTrieEntry, StoredNibbles, StoredNibblesSubKey};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use n42_primitives::Snapshot;
 
 /// Enum for the types of tables present in libmdbx.
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -318,7 +321,7 @@ tables! {
         type Key = HeaderHash;
         type Value = Address;
     }
-    
+
     /// Stores the header hashes belonging to the canonical chain.
     table CanonicalHeaders {
         type Key = BlockNumber;

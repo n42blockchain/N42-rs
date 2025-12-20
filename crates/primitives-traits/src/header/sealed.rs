@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use crate::{sync::OnceLock, InMemorySize, NodePrimitives};
 pub use alloy_consensus::Header;
 use alloy_consensus::Sealed;
@@ -20,7 +23,10 @@ pub type SealedHeaderFor<N> = SealedHeader<<N as NodePrimitives>::BlockHeader>;
 /// [`SealedHeader::hash`] computes the hash if it has not been computed yet.
 #[derive(Debug, Clone, AsRef, Deref)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(any(test, feature = "reth-codec"), reth_codecs::add_arbitrary_tests(rlp))]
+#[cfg_attr(
+    any(test, feature = "reth-codec"),
+    reth_codecs::add_arbitrary_tests(rlp)
+)]
 pub struct SealedHeader<H = Header> {
     /// Block hash
     #[cfg_attr(feature = "serde", serde(skip))]
@@ -35,13 +41,19 @@ impl<H> SealedHeader<H> {
     /// Creates the sealed header without hashing the header.
     #[inline]
     pub fn new_unhashed(header: H) -> Self {
-        Self { header, hash: Default::default() }
+        Self {
+            header,
+            hash: Default::default(),
+        }
     }
 
     /// Creates the sealed header with the corresponding block hash.
     #[inline]
     pub fn new(header: H, hash: BlockHash) -> Self {
-        Self { header, hash: hash.into() }
+        Self {
+            header,
+            hash: hash.into(),
+        }
     }
 
     /// Returns the sealed Header fields.
@@ -70,7 +82,10 @@ impl<H> SealedHeader<H> {
 
     /// Converts from &`SealedHeader<H>` to `SealedHeader<&H>`.
     pub fn sealed_ref(&self) -> SealedHeader<&H> {
-        SealedHeader { hash: self.hash.clone(), header: &self.header }
+        SealedHeader {
+            hash: self.hash.clone(),
+            header: &self.header,
+        }
     }
 }
 
@@ -113,7 +128,10 @@ impl<H: Sealable> SealedHeader<&H> {
         H: Clone,
     {
         let Self { hash, header } = self;
-        SealedHeader { hash, header: header.clone() }
+        SealedHeader {
+            hash,
+            header: header.clone(),
+        }
     }
 }
 
@@ -125,7 +143,10 @@ impl<H: alloy_consensus::BlockHeader + Sealable> SealedHeader<H> {
 
     /// Return a [`BlockWithParent`] for this header.
     pub fn block_with_parent(&self) -> BlockWithParent {
-        BlockWithParent { parent: self.parent_hash(), block: self.num_hash() }
+        BlockWithParent {
+            parent: self.parent_hash(),
+            block: self.num_hash(),
+        }
     }
 }
 
@@ -273,7 +294,10 @@ pub(super) mod serde_bincode_compat {
         for SealedHeader<'a, H>
     {
         fn from(value: &'a super::SealedHeader<H>) -> Self {
-            Self { hash: value.hash(), header: value.header.as_repr() }
+            Self {
+                hash: value.hash(),
+                header: value.header.as_repr(),
+            }
         }
     }
 

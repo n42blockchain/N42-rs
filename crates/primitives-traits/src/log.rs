@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 #[cfg(test)]
 mod tests {
     use alloy_primitives::{Address, Bytes, Log as AlloyLog, B256};

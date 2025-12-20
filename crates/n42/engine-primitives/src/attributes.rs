@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! The implementation of the [`PayloadAttributesBuilder`] for the N42 engine service
 
 use alloy_primitives::{Address, B256};
@@ -17,12 +20,21 @@ pub struct N42PayloadAttributesBuilder<ChainSpec> {
 impl<ChainSpec> N42PayloadAttributesBuilder<ChainSpec> {
     /// Creates a new instance of the builder.
     pub const fn new(chain_spec: Arc<ChainSpec>) -> Self {
-        Self { chain_spec, signer_address: None }
+        Self {
+            chain_spec,
+            signer_address: None,
+        }
     }
 
     /// Creates a new instance of the builder with an optional signer address
-    pub const fn new_add_signer(chain_spec: Arc<ChainSpec>, signer_address: Option<Address>) -> Self {
-        Self { chain_spec, signer_address }
+    pub const fn new_add_signer(
+        chain_spec: Arc<ChainSpec>,
+        signer_address: Option<Address>,
+    ) -> Self {
+        Self {
+            chain_spec,
+            signer_address,
+        }
     }
 }
 
@@ -47,4 +59,3 @@ where
         }
     }
 }
-

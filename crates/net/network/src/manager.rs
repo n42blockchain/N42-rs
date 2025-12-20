@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! High level network management.
 //!
 //! The [`NetworkManager`] contains the state of the network as a whole. It controls how connections

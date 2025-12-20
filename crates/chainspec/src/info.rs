@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use alloy_eips::BlockNumHash;
 use alloy_primitives::{BlockNumber, B256};
 
@@ -12,6 +15,9 @@ pub struct ChainInfo {
 
 impl From<ChainInfo> for BlockNumHash {
     fn from(value: ChainInfo) -> Self {
-        Self { number: value.best_number, hash: value.best_hash }
+        Self {
+            number: value.best_number,
+            hash: value.best_hash,
+        }
     }
 }

@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! Transaction wrapper for libmdbx-sys.
 
 use super::{cursor::Cursor, utils::*};
@@ -55,7 +58,9 @@ impl<K: TransactionKind> Tx<K> {
         let metrics_handler = env_metrics
             .map(|env_metrics| {
                 let handler = MetricsHandler::<K>::new(inner.id()?, env_metrics);
-                handler.env_metrics.record_opened_transaction(handler.transaction_mode());
+                handler
+                    .env_metrics
+                    .record_opened_transaction(handler.transaction_mode());
                 handler.log_transaction_opened();
                 Ok(handler)
             })
@@ -65,12 +70,17 @@ impl<K: TransactionKind> Tx<K> {
 
     #[inline]
     const fn new_inner(inner: Transaction<K>, metrics_handler: Option<MetricsHandler<K>>) -> Self {
-        Self { inner, metrics_handler }
+        Self {
+            inner,
+            metrics_handler,
+        }
     }
 
     /// Gets this transaction ID.
     pub fn id(&self) -> reth_libmdbx::Result<u64> {
-        self.metrics_handler.as_ref().map_or_else(|| self.inner.id(), |handler| Ok(handler.txn_id))
+        self.metrics_handler
+            .as_ref()
+            .map_or_else(|| self.inner.id(), |handler| Ok(handler.txn_id))
     }
 
     /// Gets a table database handle if it exists, otherwise creates it.
@@ -231,9 +241,9 @@ impl<K: TransactionKind> MetricsHandler<K> {
     /// NOTE: Backtrace is recorded using [`Backtrace::force_capture`], so `RUST_BACKTRACE` env var
     /// is not needed.
     fn log_backtrace_on_long_read_transaction(&self) {
-        if self.record_backtrace &&
-            !self.backtrace_recorded.load(Ordering::Relaxed) &&
-            self.transaction_mode().is_read_only()
+        if self.record_backtrace
+            && !self.backtrace_recorded.load(Ordering::Relaxed)
+            && self.transaction_mode().is_read_only()
         {
             let open_duration = self.start.elapsed();
             if open_duration >= self.long_transaction_duration {
@@ -299,7 +309,11 @@ impl<K: TransactionKind> DbTx for Tx<K> {
 
     fn commit(self) -> Result<bool, DatabaseError> {
         self.execute_with_close_transaction_metric(TransactionOutcome::Commit, |this| {
-            match this.inner.commit().map_err(|e| DatabaseError::Commit(e.into())) {
+            match this
+                .inner
+                .commit()
+                .map_err(|e| DatabaseError::Commit(e.into()))
+            {
                 Ok((v, latency)) => (Ok(v), Some(latency)),
                 Err(e) => (Err(e), None),
             }
@@ -353,7 +367,13 @@ impl DbTxMut for Tx<RW> {
             Operation::Put,
             Some(value.as_ref().len()),
             |tx| {
-                tx.put(self.get_dbi::<T>()?, key.as_ref(), value, WriteFlags::UPSERT).map_err(|e| {
+                tx.put(
+                    self.get_dbi::<T>()?,
+                    key.as_ref(),
+                    value,
+                    WriteFlags::UPSERT,
+                )
+                .map_err(|e| {
                     DatabaseWriteError {
                         info: e.into(),
                         operation: DatabaseWriteOperation::Put,
@@ -385,7 +405,9 @@ impl DbTxMut for Tx<RW> {
     }
 
     fn clear<T: Table>(&self) -> Result<(), DatabaseError> {
-        self.inner.clear_db(self.get_dbi::<T>()?).map_err(|e| DatabaseError::Delete(e.into()))?;
+        self.inner
+            .clear_db(self.get_dbi::<T>()?)
+            .map_err(|e| DatabaseError::Delete(e.into()))?;
 
         Ok(())
     }
@@ -417,10 +439,15 @@ mod tests {
             .with_max_read_transaction_duration(Some(MaxReadTransactionDuration::Set(
                 MAX_DURATION,
             )));
-        let db = DatabaseEnv::open(dir.path(), DatabaseEnvKind::RW, args).unwrap().with_metrics();
+        let db = DatabaseEnv::open(dir.path(), DatabaseEnvKind::RW, args)
+            .unwrap()
+            .with_metrics();
 
         let mut tx = db.tx().unwrap();
-        tx.metrics_handler.as_mut().unwrap().long_transaction_duration = MAX_DURATION;
+        tx.metrics_handler
+            .as_mut()
+            .unwrap()
+            .long_transaction_duration = MAX_DURATION;
         tx.disable_long_read_transaction_safety();
         // Give the `TxnManager` some time to time out the transaction.
         sleep(MAX_DURATION + Duration::from_millis(100));
@@ -431,7 +458,11 @@ mod tests {
             Err(DatabaseError::Open(reth_libmdbx::Error::NotFound.into()))
         );
         // Backtrace is not recorded.
-        assert!(!tx.metrics_handler.unwrap().backtrace_recorded.load(Ordering::Relaxed));
+        assert!(!tx
+            .metrics_handler
+            .unwrap()
+            .backtrace_recorded
+            .load(Ordering::Relaxed));
     }
 
     #[test]
@@ -443,19 +474,30 @@ mod tests {
             .with_max_read_transaction_duration(Some(MaxReadTransactionDuration::Set(
                 MAX_DURATION,
             )));
-        let db = DatabaseEnv::open(dir.path(), DatabaseEnvKind::RW, args).unwrap().with_metrics();
+        let db = DatabaseEnv::open(dir.path(), DatabaseEnvKind::RW, args)
+            .unwrap()
+            .with_metrics();
 
         let mut tx = db.tx().unwrap();
-        tx.metrics_handler.as_mut().unwrap().long_transaction_duration = MAX_DURATION;
+        tx.metrics_handler
+            .as_mut()
+            .unwrap()
+            .long_transaction_duration = MAX_DURATION;
         // Give the `TxnManager` some time to time out the transaction.
         sleep(MAX_DURATION + Duration::from_millis(100));
 
         // Transaction has timed out.
         assert_eq!(
             tx.get::<tables::Transactions>(0),
-            Err(DatabaseError::Open(reth_libmdbx::Error::ReadTransactionTimeout.into()))
+            Err(DatabaseError::Open(
+                reth_libmdbx::Error::ReadTransactionTimeout.into()
+            ))
         );
         // Backtrace is recorded.
-        assert!(tx.metrics_handler.unwrap().backtrace_recorded.load(Ordering::Relaxed));
+        assert!(tx
+            .metrics_handler
+            .unwrap()
+            .backtrace_recorded
+            .load(Ordering::Relaxed));
     }
 }

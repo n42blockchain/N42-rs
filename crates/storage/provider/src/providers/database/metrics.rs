@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use metrics::Histogram;
 use reth_metrics::Metrics;
 use std::time::{Duration, Instant};

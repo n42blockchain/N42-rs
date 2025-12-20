@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! Helper types for waiting for the node to exit.
 
 use futures::{future::BoxFuture, FutureExt};
@@ -33,7 +36,10 @@ impl NodeExitFuture {
     where
         F: Future<Output = eyre::Result<()>> + 'static + Send,
     {
-        Self { consensus_engine_fut: Some(Box::pin(consensus_engine_fut)), terminate }
+        Self {
+            consensus_engine_fut: Some(Box::pin(consensus_engine_fut)),
+            terminate,
+        }
     }
 }
 

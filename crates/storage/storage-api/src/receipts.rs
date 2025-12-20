@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use crate::BlockIdReader;
 use alloc::vec::Vec;
 use alloy_eips::{BlockHashOrNumber, BlockId, BlockNumberOrTag};
@@ -59,7 +62,7 @@ pub trait ReceiptProviderIdExt: ReceiptProvider + BlockIdReader {
                 if let Some(num) = self.convert_block_number(num_tag)? {
                     BlockHashOrNumber::Number(num)
                 } else {
-                    return Ok(None)
+                    return Ok(None);
                 }
             }
         };

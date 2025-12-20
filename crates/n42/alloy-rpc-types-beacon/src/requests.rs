@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 #[cfg(feature = "ssz")]
 use alloy_eips::eip7685::Requests;
 use alloy_eips::{

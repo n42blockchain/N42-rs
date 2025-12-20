@@ -1,19 +1,20 @@
-use reth_network::config::NetworkMode;
-use reth_network::{EthNetworkPrimitives, NetworkManager, NetworkHandle, PeersInfo};
-use reth_node_api::{AddOnsContext, FullNodeComponents, NodeAddOns, TxTy};
-use reth_ethereum_primitives::{EthPrimitives, PooledTransaction};
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use reth_chainspec::{ChainSpec, EthChainSpec};
+use reth_ethereum_primitives::{EthPrimitives, PooledTransaction};
+use reth_network::config::NetworkMode;
+use reth_network::{EthNetworkPrimitives, NetworkHandle, NetworkManager, PeersInfo};
+use reth_node_api::{AddOnsContext, FullNodeComponents, NodeAddOns, TxTy};
 use reth_node_builder::{
-    components::{
-        NetworkBuilder, PoolBuilder,
-    },
+    components::{NetworkBuilder, PoolBuilder},
     node::{FullNodeTypes, NodeTypes},
     BuilderContext,
 };
+use reth_tracing::tracing::{debug, info};
 use reth_transaction_pool::{
     EthTransactionPool, PoolTransaction, TransactionPool, TransactionValidationTaskExecutor,
 };
-use reth_tracing::tracing::{debug, info};
 
 /// A basic ethereum payload service.
 #[derive(Debug, Default, Clone, Copy)]
@@ -36,7 +37,9 @@ where
         ctx: &BuilderContext<Node>,
         pool: Pool,
     ) -> eyre::Result<Self::Network> {
-        let network_config_builder = ctx.network_config_builder()?.network_mode(NetworkMode::Work);
+        let network_config_builder = ctx
+            .network_config_builder()?
+            .network_mode(NetworkMode::Work);
         let network_config = ctx.build_network_config(network_config_builder);
         let network = NetworkManager::builder(network_config).await?;
         let handle = ctx.start_network(network, pool);

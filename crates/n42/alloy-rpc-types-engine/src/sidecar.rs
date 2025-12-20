@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! Contains helpers for dealing with additional parameters of `newPayload` requests.
 
 use crate::{

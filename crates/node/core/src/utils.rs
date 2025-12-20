@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! Utility functions for node startup and shutdown, for example path parsing and retrieving single
 //! blocks from the network.
 
@@ -41,7 +44,10 @@ pub async fn get_single_header<Client>(
 where
     Client: HeadersClient<Header: reth_primitives_traits::BlockHeader>,
 {
-    let (peer_id, response) = client.get_header_with_priority(id, Priority::High).await?.split();
+    let (peer_id, response) = client
+        .get_header_with_priority(id, Priority::High)
+        .await?
+        .split();
 
     let Some(header) = response else {
         client.report_bad_message(peer_id);

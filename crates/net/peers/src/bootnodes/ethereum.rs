@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! Ethereum bootnodes come from <https://github.com/ledgerwatch/erigon/blob/devel/params/bootnodes.go>
 
 /// Ethereum Foundation Go Bootnodes

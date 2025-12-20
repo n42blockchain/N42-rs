@@ -1,30 +1,40 @@
-use rand::prelude::IndexedRandom;
-use reth_primitives_traits::{AlloyBlockHeader};
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use alloy_primitives::Sealable;
-use reth_primitives_traits::{Block as BlockTrait, BlockHeader as BlockHeaderTrait, NodePrimitives, };
-use std::error::Error;
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime};
-use std::collections::HashMap;
-use std::fmt::{Debug, Formatter};
-use std::sync::atomic::{AtomicBool, Ordering};
-use alloy_primitives::{U256, hex, BlockHash, B64, B256, Address, Bytes, FixedBytes};
+use alloy_primitives::{hex, Address, BlockHash, Bytes, FixedBytes, B256, B64, U256};
 use bytes::BytesMut;
+use n42_primitives::{APosConfig, Snapshot};
+use rand::prelude::IndexedRandom;
 use rand::prelude::SliceRandom;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
-use reth_primitives::{SealedBlock, SealedHeader, BlockWithSenders};
 use reth_execution_types::BlockExecutionResult;
-use reth_primitives_traits::{RecoveredBlock, Header, header::clique_utils::{recover_address_generic, SIGNATURE_LENGTH, seal_hash}};
+use reth_primitives::{BlockWithSenders, SealedBlock, SealedHeader};
+use reth_primitives_traits::AlloyBlockHeader;
+use reth_primitives_traits::{
+    header::clique_utils::{recover_address_generic, seal_hash, SIGNATURE_LENGTH},
+    Header, RecoveredBlock,
+};
+use reth_primitives_traits::{
+    Block as BlockTrait, BlockHeader as BlockHeaderTrait, NodePrimitives,
+};
 use reth_provider::{BlockIdReader, BlockReaderIdExt, HeaderProvider, SnapshotProvider};
-use tracing::{info, warn, debug, error};
-use n42_primitives::{APosConfig, Snapshot};
+use std::collections::HashMap;
+use std::error::Error;
+use std::fmt::{Debug, Formatter};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, SystemTime};
+use tracing::{debug, error, info, warn};
 
+use alloy_signer::SignerSync;
 use alloy_signer_local::{LocalSigner, PrivateKeySigner};
 use k256::ecdsa::SigningKey;
-use alloy_signer::SignerSync;
-use reth_consensus::{FullConsensus, HeaderValidator, Consensus, ConsensusError, HeaderConsensusError};
-use reth_storage_api::{SnapshotProviderWriter, };
+use reth_consensus::{
+    Consensus, ConsensusError, FullConsensus, HeaderConsensusError, HeaderValidator,
+};
 use reth_node_api::{FullNodeTypes, PrimitivesTy};
+use reth_storage_api::SnapshotProviderWriter;
 use std::str::FromStr;
 
 //
@@ -33,7 +43,6 @@ const INMEMORY_SNAPSHOTS: u32 = 128; // Number of recent vote snapshots to keep 
 const INMEMORY_TDS: u32 = 1024; // Number of recent total difficulty records to keep in memory
 
 const WIGGLE_TIME: Duration = Duration::from_millis(500); // Random delay (per signer) to allow concurrent signers
-
 
 // APos proof-of-authority protocol constants
 
@@ -57,7 +66,7 @@ pub const DIFF_IN_TURN: U256 = U256::from_limbs([2u64, 0, 0, 0]);
 /// Block difficulty for out-of-turn signatures
 pub const DIFF_NO_TURN: U256 = U256::from_limbs([1u64, 0, 0, 0]);
 /// full immutability threshold
-pub const FULL_IMMUTABILITY_THRESHOLD: usize= 90000;
+pub const FULL_IMMUTABILITY_THRESHOLD: usize = 90000;
 
 /// apos error
 #[derive(Debug, Clone)]
@@ -135,29 +144,42 @@ impl Error for AposError {}
 /// Ethereum testnet following the Ropsten attacks.
 pub struct APos<Provider, ChainSpec>
 where
-    Provider: HeaderProvider<Header = reth_primitives_traits::Header> + SnapshotProvider + SnapshotProviderWriter + BlockIdReader  + BlockReaderIdExt + Clone + Unpin + 'static,
-    ChainSpec: EthChainSpec + EthereumHardforks
+    Provider: HeaderProvider<Header = reth_primitives_traits::Header>
+        + SnapshotProvider
+        + SnapshotProviderWriter
+        + BlockIdReader
+        + BlockReaderIdExt
+        + Clone
+        + Unpin
+        + 'static,
+    ChainSpec: EthChainSpec + EthereumHardforks,
 {
-    config: APosConfig,          // Consensus engine configuration parameters
+    config: APosConfig, // Consensus engine configuration parameters
     /// Chain spec
     chain_spec: Arc<ChainSpec>,
-    recents: RwLock<schnellru::LruMap<B256, Snapshot>>,    // Snapshots for recent block to speed up reorgs
-    proposals: Arc<RwLock<HashMap<Address, bool>>>,   // Current list of proposals we are pushing
-    signer: RwLock<Option<Address>>, // Ethereum address of the signing key
+    recents: RwLock<schnellru::LruMap<B256, Snapshot>>, // Snapshots for recent block to speed up reorgs
+    proposals: Arc<RwLock<HashMap<Address, bool>>>,     // Current list of proposals we are pushing
+    signer: RwLock<Option<Address>>,                    // Ethereum address of the signing key
     eth_signer: RwLock<Option<LocalSigner<SigningKey>>>,
     //  Provider,
     provider: Provider,
-    recent_headers: RwLock<schnellru::LruMap<B256, Provider::Header>>,    // Recent headers for snapshot
+    recent_headers: RwLock<schnellru::LruMap<B256, Provider::Header>>, // Recent headers for snapshot
     recent_tds: RwLock<schnellru::LruMap<B256, U256>>,
     recent_tds_inited: AtomicBool,
 }
-
 
 // New creates a APos proof-of-authority consensus engine with the initial
 // signers set to the ones provided by the user.
 impl<Provider, ChainSpec> APos<Provider, ChainSpec>
 where
-    Provider: HeaderProvider<Header = reth_primitives_traits::Header> + SnapshotProvider + SnapshotProviderWriter + BlockIdReader  + BlockReaderIdExt + Clone + Unpin + 'static,
+    Provider: HeaderProvider<Header = reth_primitives_traits::Header>
+        + SnapshotProvider
+        + SnapshotProviderWriter
+        + BlockIdReader
+        + BlockReaderIdExt
+        + Clone
+        + Unpin
+        + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks,
 {
     /// new
@@ -165,16 +187,22 @@ where
         provider: Provider,
         chain_spec: Arc<ChainSpec>,
         signer_private_key: Option<String>,
-    ) -> Self
-    {
-        let recents = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SNAPSHOTS)));
-        let recent_headers = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(CHECKPOINT_INTERVAL as u32 * 2)));
-        let recent_tds = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_TDS)));
+    ) -> Self {
+        let recents = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(
+            INMEMORY_SNAPSHOTS,
+        )));
+        let recent_headers = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(
+            CHECKPOINT_INTERVAL as u32 * 2,
+        )));
+        let recent_tds = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(
+            INMEMORY_TDS,
+        )));
         let recent_tds_inited = AtomicBool::new(false);
 
-        let eth_signer: Option<PrivateKeySigner> = signer_private_key.map(|key| { key.parse().unwrap() });
+        let eth_signer: Option<PrivateKeySigner> =
+            signer_private_key.map(|key| key.parse().unwrap());
 
-        let eth_signer_address = eth_signer.clone().map(|signer| {signer.address()});
+        let eth_signer_address = eth_signer.clone().map(|signer| signer.address());
         info!(target: "consensus::apos", "apos set signer address {:?}", eth_signer_address);
 
         let mut config = APosConfig::default();
@@ -202,7 +230,7 @@ where
     }
 
     fn set_signer(&self, eth_signer: Option<LocalSigner<SigningKey>>) {
-        let eth_signer_address = eth_signer.clone().map(|signer| {signer.address()});
+        let eth_signer_address = eth_signer.clone().map(|signer| signer.address());
         info!(target: "consensus::apos", "set_signer, new signer={:?}", eth_signer_address);
         let mut signer_guard = self.signer.write().unwrap();
         let mut eth_signer_guard = self.eth_signer.write().unwrap();
@@ -220,10 +248,9 @@ where
         header: &H,
         _parents: Option<Vec<H>>,
     ) -> Result<(), Box<dyn std::error::Error>>
-        where
-            H: BlockHeaderTrait,
+    where
+        H: BlockHeaderTrait,
     {
-
         // Verifying the genesis block is not supported
         if header.number() == 0 {
             return Err(AposError::UnknownBlock.into());
@@ -240,10 +267,12 @@ where
 
         #[cfg(debug_assertions)]
         {
-            self.provider.save_signer_by_hash(&header.hash_slow(), signer).map_err(|_| ConsensusError::UnknownBlock)?;
+            self.provider
+                .save_signer_by_hash(&header.hash_slow(), signer)
+                .map_err(|_| ConsensusError::UnknownBlock)?;
         }
 
-       //Check the list of recent signatories
+        //Check the list of recent signatories
         for (seen, recent) in &snap.recents {
             if *recent == signer {
                 //If the signer is in the recent list, ensure that the current block can be removed
@@ -254,7 +283,7 @@ where
             }
         }
 
-       //Ensure that the difficulty corresponds to the signer's round
+        //Ensure that the difficulty corresponds to the signer's round
         let in_turn = snap.inturn(header.number(), &signer);
         if in_turn && header.difficulty() != DIFF_IN_TURN {
             return Err(AposError::WrongDifficulty.into());
@@ -265,7 +294,6 @@ where
 
         Ok(())
     }
-
 
     /// `SealHash` returns the hash of a block prior to it being sealed.
     pub fn seal_hash(&self, header: &Header) -> B256 {
@@ -284,7 +312,8 @@ where
         if self.recent_tds_inited.load(Ordering::Relaxed) {
             return;
         }
-        let finalized_block_number = self.provider
+        let finalized_block_number = self
+            .provider
             .finalized_block_number()
             .unwrap_or(Some(0))
             .unwrap_or(0);
@@ -302,9 +331,15 @@ where
         };
         (start_block_number..=best_block_number).for_each(|block_number| {
             debug!(target: "consensus::apos", ?block_number, "init_recent_tds");
-            let header = self.provider.header_by_number(block_number).unwrap().unwrap();
+            let header = self
+                .provider
+                .header_by_number(block_number)
+                .unwrap()
+                .unwrap();
             if block_number == start_block_number {
-                let start_td = self.provider.header_td_by_number(start_block_number)
+                let start_td = self
+                    .provider
+                    .header_td_by_number(start_block_number)
                     .unwrap_or(Some(U256::ZERO))
                     .unwrap_or(U256::ZERO);
                 let mut recent_tds = self.recent_tds.write().unwrap();
@@ -314,21 +349,26 @@ where
                 let parent_td = *recent_tds.get(&header.parent_hash()).unwrap();
                 recent_tds.insert(header.hash_slow(), parent_td + header.difficulty());
             }
-        }
-        );
+        });
 
         self.recent_tds_inited.store(true, Ordering::Relaxed);
     }
 
     fn save_total_difficulty<H>(&self, header: &H)
-        where
-            H: BlockHeaderTrait,
+    where
+        H: BlockHeaderTrait,
     {
         self.init_recent_tds();
 
         let total_difficulty = {
             let mut recent_tds = self.recent_tds.write().unwrap();
-            let parent_td = recent_tds.get(&header.parent_hash()).unwrap_or_else(|| panic!("td not found for parent hash {:?}, current header={:?}", header.parent_hash(), header));
+            let parent_td = recent_tds.get(&header.parent_hash()).unwrap_or_else(|| {
+                panic!(
+                    "td not found for parent hash {:?}, current header={:?}",
+                    header.parent_hash(),
+                    header
+                )
+            });
             *parent_td + header.difficulty()
         };
 
@@ -344,7 +384,6 @@ where
         hash: B256,
         parents: Option<Vec<Provider::Header>>,
     ) -> Result<Snapshot, ConsensusError> {
-
         let mut headers: Vec<Provider::Header> = Vec::new();
         let mut snap: Option<Snapshot> = None;
         let mut hash = hash;
@@ -374,17 +413,27 @@ where
             // at a checkpoint block without a parent (light client CHT), or we have piled
             // up more headers than allowed to be reorged (chain reinit from a freezer),
             // consider the checkpoint trusted and snapshot it.
-            if number == 0 || (number % self.config.epoch == 0 && (headers.len() > FULL_IMMUTABILITY_THRESHOLD || self.provider.header_by_number(number -1).unwrap().is_none())) {
+            if number == 0
+                || (number % self.config.epoch == 0
+                    && (headers.len() > FULL_IMMUTABILITY_THRESHOLD
+                        || self
+                            .provider
+                            .header_by_number(number - 1)
+                            .unwrap()
+                            .is_none()))
+            {
                 if let Ok(Some(checkpoint)) = self.provider.header_by_number(number) {
                     debug!(target: "consensus::apos", "checkpoint={:?}", checkpoint);
                     let hash = checkpoint.hash_slow();
                     //info!(target: "consensus::apos", "snapshot() : number={}, hash_slow hash={:?}", number, hash);
-            
+
                     //Calculate the list of signatories
-                    let signers_count = (checkpoint.extra_data().len() - EXTRA_VANITY - SIGNATURE_LENGTH) /  Address::len_bytes();
+                    let signers_count =
+                        (checkpoint.extra_data().len() - EXTRA_VANITY - SIGNATURE_LENGTH)
+                            / Address::len_bytes();
 
                     let mut signers = Vec::with_capacity(signers_count);
-            
+
                     for i in 0..signers_count {
                         let start = EXTRA_VANITY + i * Address::len_bytes();
                         let end = start + Address::len_bytes();
@@ -393,10 +442,12 @@ where
                     debug!(target: "consensus::apos", ?signers,
                         "genesis signers:"
                     );
-                   
+
                     let s = Snapshot::new_snapshot(self.config.clone(), number, hash, signers);
                     // todo
-                    self.provider.save_snapshot_by_hash(&hash, s.clone()).map_err(|_| ConsensusError::UnknownBlock)?;
+                    self.provider
+                        .save_snapshot_by_hash(&hash, s.clone())
+                        .map_err(|_| ConsensusError::UnknownBlock)?;
                     snap = Option::from(s);
 
                     debug!(target: "consensus::apos", ?snap,
@@ -418,8 +469,12 @@ where
                 header
             } else if let Some(v) = recent_headers.get(&hash) {
                 v.clone()
-            } else if let Some(header) = self.provider.header_by_hash_or_number(hash.into()).map_err(|_| ConsensusError::UnknownBlock)? {
-               header
+            } else if let Some(header) = self
+                .provider
+                .header_by_hash_or_number(hash.into())
+                .map_err(|_| ConsensusError::UnknownBlock)?
+            {
+                header
             } else {
                 error!(target: "consensus::apos", "hash not found: {:?}", hash);
                 return Err(ConsensusError::UnknownBlock);
@@ -428,7 +483,6 @@ where
             hash = header.parent_hash();
             headers.push(header);
             number -= 1;
-
         }
 
         //Find the previous snapshot and apply any pending headers to it
@@ -438,27 +492,29 @@ where
             headers.swap(i, headers_len - 1 - i);
         }
 
-        let snap = snap.unwrap().apply::<_, Provider::Header>(headers, |header| {
-            let signer = recover_address_generic(&header)?;
-            Ok(signer)
-        }).map_err(|_| ConsensusError::InvalidDifficulty)?;
+        let snap = snap
+            .unwrap()
+            .apply::<_, Provider::Header>(headers, |header| {
+                let signer = recover_address_generic(&header)?;
+                Ok(signer)
+            })
+            .map_err(|_| ConsensusError::InvalidDifficulty)?;
 
         recents.insert(snap.hash, snap.clone());
 
         //If a new checkpoint snapshot is generated, save it to disk
         if snap.number % CHECKPOINT_INTERVAL == 0 && headers_len > 0 {
-            self.provider.save_snapshot_by_hash(&snap.hash, snap.clone()).map_err(|_|ConsensusError::SaveSnapshotError)?;
+            self.provider
+                .save_snapshot_by_hash(&snap.hash, snap.clone())
+                .map_err(|_| ConsensusError::SaveSnapshotError)?;
             debug!(
                 "Stored voting snapshot to disk, number: {}, hash: {}",
-                snap.number,
-                snap.hash
+                snap.number, snap.hash
             );
         }
 
         Ok(snap)
     }
-
-
 }
 
 fn calc_difficulty(snap: &Snapshot, signer: &Address) -> U256 {
@@ -472,7 +528,14 @@ fn calc_difficulty(snap: &Snapshot, signer: &Address) -> U256 {
 impl<Provider, ChainSpec> Debug for APos<Provider, ChainSpec>
 where
     ChainSpec: EthChainSpec + EthereumHardforks,
-    Provider: 'static + Clone + HeaderProvider<Header = reth_primitives_traits::Header> + SnapshotProvider + SnapshotProviderWriter + BlockIdReader  + BlockReaderIdExt + Unpin,
+    Provider: 'static
+        + Clone
+        + HeaderProvider<Header = reth_primitives_traits::Header>
+        + SnapshotProvider
+        + SnapshotProviderWriter
+        + BlockIdReader
+        + BlockReaderIdExt
+        + Unpin,
 {
     fn fmt(&self, _f: &mut Formatter<'_>) -> std::fmt::Result {
         todo!()
@@ -482,10 +545,16 @@ where
 impl<Provider, ChainSpec> HeaderValidator for APos<Provider, ChainSpec>
 where
     ChainSpec: EthChainSpec + EthereumHardforks,
-    Provider: 'static + Clone + HeaderProvider<Header = reth_primitives_traits::Header> + SnapshotProvider + SnapshotProviderWriter + BlockIdReader  + BlockReaderIdExt + Unpin,
+    Provider: 'static
+        + Clone
+        + HeaderProvider<Header = reth_primitives_traits::Header>
+        + SnapshotProvider
+        + SnapshotProviderWriter
+        + BlockIdReader
+        + BlockReaderIdExt
+        + Unpin,
 {
     fn validate_header(&self, header: &SealedHeader) -> Result<(), ConsensusError> {
-
         let header = header.header();
         if header.number() == 0 {
             return Err(ConsensusError::UnknownBlock);
@@ -493,14 +562,18 @@ where
         let number = header.number();
 
         // Don't waste time checking blocks from the future
-        let present_timestamp =
-            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+        let present_timestamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
 
-        if header.timestamp() > present_timestamp + alloy_eips::merge::ALLOWED_FUTURE_BLOCK_TIME_SECONDS {
+        if header.timestamp()
+            > present_timestamp + alloy_eips::merge::ALLOWED_FUTURE_BLOCK_TIME_SECONDS
+        {
             return Err(ConsensusError::TimestampIsInFuture {
                 timestamp: header.timestamp(),
                 present_timestamp,
-            })
+            });
         }
 
         // Checkpoint blocks need to enforce zero beneficiary
@@ -509,9 +582,9 @@ where
             return Err(ConsensusError::InvalidCheckpointBeneficiary);
         }
 
-
         // Nonces must be 0x00..0 or 0xff..f, zeroes enforced on checkpoints
-        if header.nonce().unwrap() != NONCE_AUTH_VOTE && header.nonce().unwrap() != NONCE_DROP_VOTE {
+        if header.nonce().unwrap() != NONCE_AUTH_VOTE && header.nonce().unwrap() != NONCE_DROP_VOTE
+        {
             return Err(ConsensusError::InvalidVote);
         }
 
@@ -540,7 +613,10 @@ where
         }
 
         // Ensure that the block's difficulty is meaningful (may not be correct at this point)
-        if number > 0 && (header.difficulty().is_zero() || (header.difficulty() != DIFF_IN_TURN && header.difficulty() != DIFF_NO_TURN)) {
+        if number > 0
+            && (header.difficulty().is_zero()
+                || (header.difficulty() != DIFF_IN_TURN && header.difficulty() != DIFF_NO_TURN))
+        {
             return Err(ConsensusError::InvalidDifficulty);
         }
 
@@ -562,9 +638,14 @@ where
             return Ok(());
         }
 
-        let snap = self.snapshot_inner(number - 1, header.parent_hash(), Some(vec![parent.header().clone()]))?;
+        let snap = self.snapshot_inner(
+            number - 1,
+            header.parent_hash(),
+            Some(vec![parent.header().clone()]),
+        )?;
         if number % self.config.epoch == 0 {
-            let signers: Vec<u8> = snap.signers
+            let signers: Vec<u8> = snap
+                .signers
                 .iter()
                 .flat_map(|signer| signer.as_slice().to_vec())
                 .collect();
@@ -574,7 +655,10 @@ where
             }
         }
 
-        self.verify_seal(&snap, header, None).map_err(|e| {ConsensusError::AposErrorDetail {detail: e.to_string()}})?;
+        self.verify_seal(&snap, header, None)
+            .map_err(|e| ConsensusError::AposErrorDetail {
+                detail: e.to_string(),
+            })?;
         let mut recent_headers = self.recent_headers.write().unwrap();
         recent_headers.insert(header_hash, header.clone());
 
@@ -595,12 +679,18 @@ where
     ) -> Result<(), HeaderConsensusError<reth_primitives_traits::Header>> {
         Ok(())
     }
-
 }
 
 impl<Provider, ChainSpec, N> FullConsensus<N> for APos<Provider, ChainSpec>
 where
-    Provider: HeaderProvider<Header = reth_primitives_traits::Header> +SnapshotProvider + SnapshotProviderWriter  + BlockIdReader  + BlockReaderIdExt + Clone + Unpin + 'static,
+    Provider: HeaderProvider<Header = reth_primitives_traits::Header>
+        + SnapshotProvider
+        + SnapshotProviderWriter
+        + BlockIdReader
+        + BlockReaderIdExt
+        + Clone
+        + Unpin
+        + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks,
     N: NodePrimitives,
     APos<Provider, ChainSpec>: HeaderValidator<<N as NodePrimitives>::BlockHeader>,
@@ -612,12 +702,18 @@ where
     ) -> Result<(), ConsensusError> {
         Ok(())
     }
-
 }
 
 impl<Provider, ChainSpec, B> Consensus<B> for APos<Provider, ChainSpec>
 where
-    Provider: HeaderProvider<Header = reth_primitives_traits::Header> +SnapshotProvider + SnapshotProviderWriter  + BlockIdReader  + BlockReaderIdExt + Clone + Unpin + 'static,
+    Provider: HeaderProvider<Header = reth_primitives_traits::Header>
+        + SnapshotProvider
+        + SnapshotProviderWriter
+        + BlockIdReader
+        + BlockReaderIdExt
+        + Clone
+        + Unpin
+        + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks,
     B: BlockTrait,
     APos<Provider, ChainSpec>: HeaderValidator<<B as reth_primitives_traits::Block>::Header>,
@@ -639,24 +735,23 @@ where
     /// Prepare implements consensus.Engine, preparing all the consensus fields of the
     /// header for running the transactions on top.
     fn prepare(&self, parent_header: &SealedHeader) -> Result<Header, ConsensusError> {
-
-        let mut header = Header::default(); 
+        let mut header = Header::default();
         //If the block is not a checkpoint, vote randomly
         header.beneficiary = Address::ZERO;
         header.nonce = B64::from(0u64);
         header.number = parent_header.number + 1;
         header.parent_hash = parent_header.hash();
 
-
-
         //Assemble voting snapshots to check which votes are meaningful
-        let snap = self.snapshot_inner(
-            parent_header.number, parent_header.hash(), None).map_err(|_| ConsensusError::UnknownBlock)?;
+        let snap = self
+            .snapshot_inner(parent_header.number, parent_header.hash(), None)
+            .map_err(|_| ConsensusError::UnknownBlock)?;
 
-        if header.number %self.config.epoch != 0 {
+        if header.number % self.config.epoch != 0 {
             //Collect all proposals to be voted on
             let proposals_lock = self.proposals.read().unwrap();
-            let addresses: Vec<Address> = proposals_lock.iter()
+            let addresses: Vec<Address> = proposals_lock
+                .iter()
                 //.filter(|(&address, &authorize)| snap.valid_vote(address, authorize))
                 .map(|(address, _)| *address)
                 .collect();
@@ -699,7 +794,10 @@ where
         header.mix_hash = Default::default();
 
         // Ensure the timestamp has the correct delay
-        if let Ok(Some(parent)) = self.provider.header_by_hash_or_number(header.parent_hash.into()) {
+        if let Ok(Some(parent)) = self
+            .provider
+            .header_by_hash_or_number(header.parent_hash.into())
+        {
             let parent_time = parent.timestamp();
             header.timestamp = parent_time + self.config.period;
         }
@@ -708,7 +806,6 @@ where
     }
 
     fn seal(&self, header: &mut Header) -> Result<(), ConsensusError> {
-
         // Sealing the genesis block is not supported
         if header.number == 0 {
             return Err(ConsensusError::UnknownBlock);
@@ -720,15 +817,18 @@ where
         // }
         //todo
 
-
-        let signer = self.signer.read().unwrap().ok_or(ConsensusError::NoSignerSet)?;
+        let signer = self
+            .signer
+            .read()
+            .unwrap()
+            .ok_or(ConsensusError::NoSignerSet)?;
         debug!(target: "consensus::apos", "seal() signer={:?}", signer);
         // Bail out if we're unauthorized to sign a block
         let snap = self.snapshot_inner(header.number - 1, header.parent_hash, None)?;
         debug!(target: "consensus::apos", "signer list: {:?}, signer: {}", snap.signers, signer);
         if !snap.signers.contains(&signer) {
             error!(target: "consensus::apos", "err signer not in list: {:?}, signer: {}", snap.signers, signer);
-            return Err(ConsensusError::UnauthorizedSigner)
+            return Err(ConsensusError::UnauthorizedSigner);
         }
 
         // If we're amongst the recent signers, wait for the next block
@@ -743,18 +843,23 @@ where
         }
 
         // // Beijing hard fork logic (if applicable)
-        // if self.chain_spec.is_beijing_active_at_block(block.number) 
+        // if self.chain_spec.is_beijing_active_at_block(block.number)
         //
         // }
 
         let eth_signer_guard = self.eth_signer.read().unwrap();
-        let eth_signer = eth_signer_guard.as_ref().ok_or(ConsensusError::NoSignerSet)?;
+        let eth_signer = eth_signer_guard
+            .as_ref()
+            .ok_or(ConsensusError::NoSignerSet)?;
         // Sign all the things!
         let header_bytes = seal_hash(header);
-        let sighash = eth_signer.sign_hash_sync(&header_bytes).map_err(|_| ConsensusError::SignHeaderError)?;
+        let sighash = eth_signer
+            .sign_hash_sync(&header_bytes)
+            .map_err(|_| ConsensusError::SignHeaderError)?;
 
         let mut extra_data_mut = BytesMut::from(&header.extra_data[..]);
-        extra_data_mut[header.extra_data.len().saturating_sub(SIGNATURE_LENGTH)..].copy_from_slice(&sighash.as_bytes());
+        extra_data_mut[header.extra_data.len().saturating_sub(SIGNATURE_LENGTH)..]
+            .copy_from_slice(&sighash.as_bytes());
         *extra_data_mut.last_mut().unwrap() -= 27;
         header.extra_data = Bytes::from(extra_data_mut.freeze());
 
@@ -767,19 +872,19 @@ where
     }
 
     fn set_eth_signer_by_key(&self, eth_signer_key: Option<String>) -> Result<(), ConsensusError> {
-        let eth_signer = eth_signer_key.map(|key| {
-            PrivateKeySigner::from_bytes(&FixedBytes::from_str(&key).unwrap()).unwrap()
-        });
+        let eth_signer = eth_signer_key
+            .map(|key| PrivateKeySigner::from_bytes(&FixedBytes::from_str(&key).unwrap()).unwrap());
         self.set_signer(eth_signer);
         Ok(())
     }
 
-    fn get_eth_signer_address(
-        &self,
-    ) -> Result<Option<Address>, ConsensusError> {
-        Ok(*self.signer.read().map_err(|err| ConsensusError::AposErrorDetail {
-            detail: err.to_string()
-        })?)
+    fn get_eth_signer_address(&self) -> Result<Option<Address>, ConsensusError> {
+        Ok(*self
+            .signer
+            .read()
+            .map_err(|err| ConsensusError::AposErrorDetail {
+                detail: err.to_string(),
+            })?)
     }
 
     fn snapshot(
@@ -791,61 +896,49 @@ where
         self.snapshot_inner(number, hash, parents)
     }
 
-    fn propose(
-        &self,
-        address: Address,
-        auth: bool,
-    ) -> Result<(), ConsensusError> {
+    fn propose(&self, address: Address, auth: bool) -> Result<(), ConsensusError> {
         info!(target: "consensus::apos", "propose(), address={}, auth={}", address, auth);
         let mut proposals_guard = self.proposals.write().unwrap();
         proposals_guard.insert(address, auth);
         Ok(())
     }
 
-    fn discard(
-        &self,
-        address: Address,
-    ) -> Result<(), ConsensusError> {
+    fn discard(&self, address: Address) -> Result<(), ConsensusError> {
         info!(target: "consensus::apos", "discard(), address={}", address);
         let mut proposals_guard = self.proposals.write().unwrap();
         proposals_guard.remove(&address);
         Ok(())
     }
 
-    fn proposals(
-        &self,
-    ) -> Result<HashMap<Address, bool>, ConsensusError> {
+    fn proposals(&self) -> Result<HashMap<Address, bool>, ConsensusError> {
         info!(target: "consensus::apos", "proposals()");
         let proposals_guard = self.proposals.read().unwrap();
         Ok(proposals_guard.clone())
     }
 
-    fn total_difficulty(
-        &self,
-        hash: B256,
-    ) -> U256 {
+    fn total_difficulty(&self, hash: B256) -> U256 {
         self.init_recent_tds();
 
         let mut recent_tds = self.recent_tds.write().unwrap();
-        let total_difficulty = *recent_tds.get(&hash).unwrap_or_else(|| panic!("td not found for hash {:?}", hash));
+        let total_difficulty = *recent_tds
+            .get(&hash)
+            .unwrap_or_else(|| panic!("td not found for hash {:?}", hash));
 
         debug!(target: "consensus::apos", ?hash, ?total_difficulty, "get total_difficulty");
         total_difficulty
     }
 
-    fn wiggle(
-        &self,
-        parent_number: u64,
-        parent_hash: BlockHash,
-        difficulty: U256,
-    ) -> Duration {
+    fn wiggle(&self, parent_number: u64, parent_hash: BlockHash, difficulty: U256) -> Duration {
         let mut wiggle = Duration::from_millis(0);
-        if let Ok(snapshot) =
-            self.snapshot_inner(parent_number, parent_hash, None) {
+        if let Ok(snapshot) = self.snapshot_inner(parent_number, parent_hash, None) {
             // https://eips.ethereum.org/EIPS/eip-225
             // If the signer is out-of-turn, delay signing by rand(SIGNER_COUNT * 500ms)
             if difficulty != DIFF_IN_TURN {
-                wiggle = Duration::from_millis((rand::random::<f64>() * snapshot.signers.len() as f64 * WIGGLE_TIME.as_millis() as f64) as u64)
+                wiggle = Duration::from_millis(
+                    (rand::random::<f64>()
+                        * snapshot.signers.len() as f64
+                        * WIGGLE_TIME.as_millis() as f64) as u64,
+                )
             }
         }
         wiggle

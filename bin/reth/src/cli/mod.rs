@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! CLI definition and entrypoint to executable
 
 /// Re-export of the [`reth_node_core`] types specifically in the `cli` module.

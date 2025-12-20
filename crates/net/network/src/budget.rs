@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 /// Default budget to try and drain streams.
 ///
 /// Default is 10 iterations.

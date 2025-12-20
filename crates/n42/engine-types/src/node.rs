@@ -1,16 +1,19 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! Ethereum Node types config.
 
 //pub use crate::{payload::EthereumPayloadBuilder, EthereumEngineValidator};
 //use crate::{EthEngineTypes, EthEvmConfig};
 //use n42_engine_primitives::{N42PayloadAttributes, N42PayloadBuilderAttributes};
-use reth_node_ethereum::node::EthereumConsensusBuilder;
-pub use reth_node_ethereum::{payload::EthereumPayloadBuilder, EthereumEngineValidator};
-use reth_node_ethereum::{EthEngineTypes, EthEvmConfig};
 use alloy_eips::{eip7840::BlobParams, merge::EPOCH_SLOTS};
 use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks};
 use reth_consensus::{ConsensusError, FullConsensus};
+use reth_node_ethereum::node::EthereumConsensusBuilder;
+pub use reth_node_ethereum::{payload::EthereumPayloadBuilder, EthereumEngineValidator};
+use reth_node_ethereum::{EthEngineTypes, EthEvmConfig};
 //use reth_ethereum_consensus::EthBeaconConsensus;
-use crate::consensus::{N42ConsensusBuilder};
+use crate::consensus::N42ConsensusBuilder;
 use crate::network::N42NetworkBuilder;
 //use crate::{N42EngineTypes, N42NodeAddOns, N42PayloadServiceBuilder};
 use crate::{EthereumPayloadBuilderWrapper, N42PayloadServiceBuilder};
@@ -170,7 +173,9 @@ where
     EthApiFor<N>: FullEthApiServer<Provider = N::Provider, Pool = N::Pool>,
 {
     fn default() -> Self {
-        Self { inner: Default::default() }
+        Self {
+            inner: Default::default(),
+        }
     }
 }
 
@@ -283,7 +288,12 @@ impl<N: FullNodeComponents<Types = Self>> DebugNode<N> for N42Node {
     type RpcBlock = alloy_rpc_types_eth::Block;
 
     fn rpc_to_primitive_block(rpc_block: Self::RpcBlock) -> reth_ethereum_primitives::Block {
-        let alloy_rpc_types_eth::Block { header, transactions, withdrawals, .. } = rpc_block;
+        let alloy_rpc_types_eth::Block {
+            header,
+            transactions,
+            withdrawals,
+            ..
+        } = rpc_block;
         reth_ethereum_primitives::Block {
             header: header.inner,
             body: reth_ethereum_primitives::BlockBody {
@@ -346,8 +356,9 @@ where
         } else {
             // get the current blob params for the current timestamp, fallback to default Cancun
             // params
-            let current_timestamp =
-                SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
+            let current_timestamp = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_secs();
             let blob_params = ctx
                 .chain_spec()
                 .blob_params_at_timestamp(current_timestamp)
@@ -392,16 +403,17 @@ where
                 let transactions_backup_config =
                     reth_transaction_pool::maintain::LocalTransactionBackupConfig::with_local_txs_backup(transactions_path);
 
-                ctx.task_executor().spawn_critical_with_graceful_shutdown_signal(
-                    "local transactions backup task",
-                    |shutdown| {
-                        reth_transaction_pool::maintain::backup_local_transactions_task(
-                            shutdown,
-                            pool.clone(),
-                            transactions_backup_config,
-                        )
-                    },
-                );
+                ctx.task_executor()
+                    .spawn_critical_with_graceful_shutdown_signal(
+                        "local transactions backup task",
+                        |shutdown| {
+                            reth_transaction_pool::maintain::backup_local_transactions_task(
+                                shutdown,
+                                pool.clone(),
+                                transactions_backup_config,
+                            )
+                        },
+                    );
             }
 
             // spawn the maintenance task

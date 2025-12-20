@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! Client identification: <https://github.com/ethereum/execution-apis/blob/main/src/engine/identification.md>
 
 use alloc::string::String;

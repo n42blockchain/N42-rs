@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 #![allow(missing_docs)]
 
 use alloy_primitives::{B256, U256};

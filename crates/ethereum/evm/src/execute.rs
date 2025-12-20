@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! Ethereum block execution strategy.
 
 /// Helper type with backwards compatible methods to obtain Ethereum executor

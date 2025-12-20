@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use alloy_consensus::Header;
 use reth_chainspec::{ChainSpec, EthereumHardforks};
 use reth_ethereum_forks::EthereumHardfork;

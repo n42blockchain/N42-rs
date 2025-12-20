@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! Pruning and full node arguments
 
 use crate::args::error::ReceiptsLogError;
@@ -128,8 +131,11 @@ impl PruningArgs {
         if let Some(mode) = self.storage_history_prune_mode() {
             config.segments.storage_history = Some(mode);
         }
-        if let Some(receipt_logs) =
-            self.receipts_log_filter.as_ref().filter(|c| !c.is_empty()).cloned()
+        if let Some(receipt_logs) = self
+            .receipts_log_filter
+            .as_ref()
+            .filter(|c| !c.is_empty())
+            .cloned()
         {
             config.segments.receipts_log_filter = receipt_logs;
             // need to remove the receipts segment filter entirely because that takes precedence
@@ -225,16 +231,18 @@ pub(crate) fn parse_receipts_log_filter(
                 if parts.len() < 3 {
                     return Err(ReceiptsLogError::InvalidFilterFormat(filter.to_string()));
                 }
-                let distance =
-                    parts[2].parse::<u64>().map_err(ReceiptsLogError::InvalidDistance)?;
+                let distance = parts[2]
+                    .parse::<u64>()
+                    .map_err(ReceiptsLogError::InvalidDistance)?;
                 PruneMode::Distance(distance)
             }
             s if s.starts_with("before") => {
                 if parts.len() < 3 {
                     return Err(ReceiptsLogError::InvalidFilterFormat(filter.to_string()));
                 }
-                let block_number =
-                    parts[2].parse::<u64>().map_err(ReceiptsLogError::InvalidBlockNumber)?;
+                let block_number = parts[2]
+                    .parse::<u64>()
+                    .map_err(ReceiptsLogError::InvalidBlockNumber)?;
                 PruneMode::Before(block_number)
             }
             _ => return Err(ReceiptsLogError::InvalidPruneMode(parts[1].to_string())),
@@ -294,9 +302,15 @@ mod tests {
         assert_eq!(config.0.len(), 3);
 
         // Check that the args were parsed correctly.
-        let addr1: Address = "0x0000000000000000000000000000000000000001".parse().unwrap();
-        let addr2: Address = "0x0000000000000000000000000000000000000002".parse().unwrap();
-        let addr3: Address = "0x0000000000000000000000000000000000000003".parse().unwrap();
+        let addr1: Address = "0x0000000000000000000000000000000000000001"
+            .parse()
+            .unwrap();
+        let addr2: Address = "0x0000000000000000000000000000000000000002"
+            .parse()
+            .unwrap();
+        let addr3: Address = "0x0000000000000000000000000000000000000003"
+            .parse()
+            .unwrap();
 
         assert_eq!(config.0.get(&addr1), Some(&PruneMode::Full));
         assert_eq!(config.0.get(&addr2), Some(&PruneMode::Distance(1000)));
@@ -306,7 +320,10 @@ mod tests {
     #[test]
     fn test_parse_receipts_log_filter_invalid_filter_format() {
         let result = parse_receipts_log_filter("invalid_format");
-        assert!(matches!(result, Err(ReceiptsLogError::InvalidFilterFormat(_))));
+        assert!(matches!(
+            result,
+            Err(ReceiptsLogError::InvalidFilterFormat(_))
+        ));
     }
 
     #[test]
@@ -335,6 +352,9 @@ mod tests {
         let result = parse_receipts_log_filter(
             "0x0000000000000000000000000000000000000000:before:invalid_block",
         );
-        assert!(matches!(result, Err(ReceiptsLogError::InvalidBlockNumber(_))));
+        assert!(matches!(
+            result,
+            Err(ReceiptsLogError::InvalidBlockNumber(_))
+        ));
     }
 }

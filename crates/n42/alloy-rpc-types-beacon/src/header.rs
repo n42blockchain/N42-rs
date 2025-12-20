@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! Beacon block header types.
 //!
 //! See also <https://ethereum.github.io/beacon-APIs/#/Beacon/getBlockHeaders>

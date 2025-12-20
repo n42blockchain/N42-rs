@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! Helper trait for full rpc provider
 
 use reth_chainspec::{ChainSpecProvider, EthereumHardforks};

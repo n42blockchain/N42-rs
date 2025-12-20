@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use alloc::vec;
 
 use alloy_primitives::U256;
@@ -17,10 +20,19 @@ pub static DEV_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
         (EthereumHardfork::Homestead.boxed(), ForkCondition::Block(0)),
         (EthereumHardfork::Dao.boxed(), ForkCondition::Block(0)),
         (EthereumHardfork::Tangerine.boxed(), ForkCondition::Block(0)),
-        (EthereumHardfork::SpuriousDragon.boxed(), ForkCondition::Block(0)),
+        (
+            EthereumHardfork::SpuriousDragon.boxed(),
+            ForkCondition::Block(0),
+        ),
         (EthereumHardfork::Byzantium.boxed(), ForkCondition::Block(0)),
-        (EthereumHardfork::Constantinople.boxed(), ForkCondition::Block(0)),
-        (EthereumHardfork::Petersburg.boxed(), ForkCondition::Block(0)),
+        (
+            EthereumHardfork::Constantinople.boxed(),
+            ForkCondition::Block(0),
+        ),
+        (
+            EthereumHardfork::Petersburg.boxed(),
+            ForkCondition::Block(0),
+        ),
         (EthereumHardfork::Istanbul.boxed(), ForkCondition::Block(0)),
         (EthereumHardfork::Berlin.boxed(), ForkCondition::Block(0)),
         (EthereumHardfork::London.boxed(), ForkCondition::Block(0)),
@@ -32,8 +44,17 @@ pub static DEV_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
                 total_difficulty: U256::ZERO,
             },
         ),
-        (EthereumHardfork::Shanghai.boxed(), ForkCondition::Timestamp(0)),
-        (EthereumHardfork::Cancun.boxed(), ForkCondition::Timestamp(0)),
-        (EthereumHardfork::Prague.boxed(), ForkCondition::Timestamp(0)),
+        (
+            EthereumHardfork::Shanghai.boxed(),
+            ForkCondition::Timestamp(0),
+        ),
+        (
+            EthereumHardfork::Cancun.boxed(),
+            ForkCondition::Timestamp(0),
+        ),
+        (
+            EthereumHardfork::Prague.boxed(),
+            ForkCondition::Timestamp(0),
+        ),
     ])
 });

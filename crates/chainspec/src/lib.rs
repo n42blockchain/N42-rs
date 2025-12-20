@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! The spec of an Ethereum network
 
 #![doc(
@@ -31,9 +34,8 @@ pub use info::ChainInfo;
 pub use spec::test_fork_ids;
 pub use spec::{
     make_genesis_header, BaseFeeParams, BaseFeeParamsKind, ChainSpec, ChainSpecBuilder,
-    ChainSpecProvider, DepositContract, ForkBaseFeeParams, DEV, HOLESKY, HOODI, MAINNET, SEPOLIA,
-    N42,
-    N42_DEVNET,
+    ChainSpecProvider, DepositContract, ForkBaseFeeParams, DEV, HOLESKY, HOODI, MAINNET, N42,
+    N42_DEVNET, SEPOLIA,
 };
 
 use reth_primitives_traits::sync::OnceLock;

@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! Parameters for configuring the rpc more granularity via CLI
 
 /// NetworkArg struct for configuring the network

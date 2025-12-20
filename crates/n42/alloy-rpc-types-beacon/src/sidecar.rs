@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use crate::header::Header;
 use alloy_eips::eip4844::{deserialize_blob, Blob, BlobTransactionSidecar, Bytes48};
 use alloy_primitives::B256;

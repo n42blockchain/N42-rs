@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use super::LaunchNode;
 use crate::{rpc::RethRpcAddOns, EngineNodeLauncher, Node, NodeHandle};
 use alloy_provider::network::AnyNetwork;
@@ -61,9 +64,12 @@ where
                 Arc::new(block_provider),
             );
 
-            handle.node.task_executor.spawn_critical("rpc-ws consensus client", async move {
-                rpc_consensus_client.run().await
-            });
+            handle
+                .node
+                .task_executor
+                .spawn_critical("rpc-ws consensus client", async move {
+                    rpc_consensus_client.run().await
+                });
         }
 
         // TODO: migrate to devmode with https://github.com/paradigmxyz/reth/issues/10104
@@ -92,9 +98,12 @@ where
                 handle.node.add_ons_handle.beacon_engine_handle.clone(),
                 Arc::new(block_provider),
             );
-            handle.node.task_executor.spawn_critical("etherscan consensus client", async move {
-                rpc_consensus_client.run().await
-            });
+            handle
+                .node
+                .task_executor
+                .spawn_critical("etherscan consensus client", async move {
+                    rpc_consensus_client.run().await
+                });
         }
 
         Ok(handle)

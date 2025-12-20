@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use crate::{
     config::NetworkMode, message::PeerMessage, protocol::RlpxSubProtocol,
     swarm::NetworkConnectionState, transactions::TransactionsHandle, FetchClient,

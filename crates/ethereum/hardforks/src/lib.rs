@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! Ethereum fork types used in reth.
 //!
 //! This crate contains Ethereum fork types and helper functions.

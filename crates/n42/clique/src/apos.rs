@@ -967,3 +967,241 @@ where
         Ok(recent_cached_reads.get(&block_hash).cloned())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::address;
+
+    // ==================== Constants Tests ====================
+
+    #[test]
+    fn test_epoch_length_constant() {
+        assert_eq!(EPOCH_LENGTH, 30000);
+    }
+
+    #[test]
+    fn test_extra_vanity_constant() {
+        assert_eq!(EXTRA_VANITY, 32);
+    }
+
+    #[test]
+    fn test_extra_seal_constant() {
+        assert_eq!(EXTRA_SEAL, 65);
+    }
+
+    #[test]
+    fn test_nonce_auth_vote_constant() {
+        assert_eq!(NONCE_AUTH_VOTE, [0xff; 8]);
+    }
+
+    #[test]
+    fn test_nonce_drop_vote_constant() {
+        assert_eq!(NONCE_DROP_VOTE, [0x00; 8]);
+    }
+
+    #[test]
+    fn test_diff_in_turn_constant() {
+        assert_eq!(DIFF_IN_TURN, U256::from(2u64));
+    }
+
+    #[test]
+    fn test_diff_no_turn_constant() {
+        assert_eq!(DIFF_NO_TURN, U256::from(1u64));
+    }
+
+    #[test]
+    fn test_full_immutability_threshold() {
+        assert_eq!(FULL_IMMUTABILITY_THRESHOLD, 90000);
+    }
+
+    #[test]
+    fn test_checkpoint_interval() {
+        assert_eq!(CHECKPOINT_INTERVAL, 2048);
+    }
+
+    #[test]
+    fn test_inmemory_snapshots() {
+        assert_eq!(INMEMORY_SNAPSHOTS, 128);
+    }
+
+    #[test]
+    fn test_inmemory_tds() {
+        assert_eq!(INMEMORY_TDS, 1024);
+    }
+
+    #[test]
+    fn test_wiggle_time() {
+        assert_eq!(WIGGLE_TIME, Duration::from_millis(500));
+    }
+
+    // ==================== AposError Tests ====================
+
+    #[test]
+    fn test_apos_error_unknown_block() {
+        let err = AposError::UnknownBlock;
+        assert_eq!(format!("{}", err), "unknown block");
+    }
+
+    #[test]
+    fn test_apos_error_invalid_checkpoint_beneficiary() {
+        let err = AposError::InvalidCheckpointBeneficiary;
+        assert_eq!(format!("{}", err), "beneficiary in checkpoint block non-zero");
+    }
+
+    #[test]
+    fn test_apos_error_invalid_vote() {
+        let err = AposError::InvalidVote;
+        assert_eq!(format!("{}", err), "vote nonce not 0x00..0 or 0xff..f");
+    }
+
+    #[test]
+    fn test_apos_error_invalid_checkpoint_vote() {
+        let err = AposError::InvalidCheckpointVote;
+        assert_eq!(format!("{}", err), "vote nonce in checkpoint block non-zero");
+    }
+
+    #[test]
+    fn test_apos_error_missing_vanity() {
+        let err = AposError::MissingVanity;
+        assert_eq!(format!("{}", err), "extra-data 32 byte vanity prefix missing");
+    }
+
+    #[test]
+    fn test_apos_error_missing_signature() {
+        let err = AposError::MissingSignature;
+        assert_eq!(format!("{}", err), "extra-data 65 byte signature suffix missing");
+    }
+
+    #[test]
+    fn test_apos_error_extra_signers() {
+        let err = AposError::ExtraSigners;
+        assert_eq!(format!("{}", err), "non-checkpoint block contains extra signer list");
+    }
+
+    #[test]
+    fn test_apos_error_invalid_checkpoint_signers() {
+        let err = AposError::InvalidCheckpointSigners;
+        assert_eq!(format!("{}", err), "invalid signer list on checkpoint block");
+    }
+
+    #[test]
+    fn test_apos_error_mismatching_checkpoint_signers() {
+        let err = AposError::MismatchingCheckpointSigners;
+        assert_eq!(format!("{}", err), "mismatching signer list on checkpoint block");
+    }
+
+    #[test]
+    fn test_apos_error_invalid_mix_digest() {
+        let err = AposError::InvalidMixDigest;
+        assert_eq!(format!("{}", err), "non-zero mix digest");
+    }
+
+    #[test]
+    fn test_apos_error_invalid_uncle_hash() {
+        let err = AposError::InvalidUncleHash;
+        assert_eq!(format!("{}", err), "non-empty uncle hash");
+    }
+
+    #[test]
+    fn test_apos_error_invalid_difficulty() {
+        let err = AposError::InvalidDifficulty;
+        assert_eq!(format!("{}", err), "invalid difficulty");
+    }
+
+    #[test]
+    fn test_apos_error_wrong_difficulty() {
+        let err = AposError::WrongDifficulty;
+        assert_eq!(format!("{}", err), "wrong difficulty");
+    }
+
+    #[test]
+    fn test_apos_error_invalid_timestamp() {
+        let err = AposError::InvalidTimestamp;
+        assert_eq!(format!("{}", err), "invalid timestamp");
+    }
+
+    #[test]
+    fn test_apos_error_invalid_voting_chain() {
+        let err = AposError::InvalidVotingChain;
+        assert_eq!(format!("{}", err), "invalid voting chain");
+    }
+
+    #[test]
+    fn test_apos_error_unauthorized_signer() {
+        let err = AposError::UnauthorizedSigner;
+        assert_eq!(format!("{}", err), "unauthorized signer");
+    }
+
+    #[test]
+    fn test_apos_error_recently_signed() {
+        let err = AposError::RecentlySigned;
+        assert_eq!(format!("{}", err), "recently signed");
+    }
+
+    #[test]
+    fn test_apos_error_un_transion() {
+        let err = AposError::UnTransion;
+        assert_eq!(format!("{}", err), "sealing paused while waiting for transactions");
+    }
+
+    #[test]
+    fn test_apos_error_is_error_trait() {
+        let err: Box<dyn std::error::Error> = Box::new(AposError::UnknownBlock);
+        assert!(err.to_string().contains("unknown block"));
+    }
+
+    #[test]
+    fn test_apos_error_clone() {
+        let err = AposError::InvalidVote;
+        let cloned = err.clone();
+        assert_eq!(format!("{}", err), format!("{}", cloned));
+    }
+
+    #[test]
+    fn test_apos_error_debug() {
+        let err = AposError::UnknownBlock;
+        let debug_str = format!("{:?}", err);
+        assert!(debug_str.contains("UnknownBlock"));
+    }
+
+    // ==================== Difficulty Calculation Tests ====================
+
+    #[test]
+    fn test_difficulty_values() {
+        // In-turn difficulty should be 2
+        assert!(DIFF_IN_TURN > DIFF_NO_TURN);
+        assert_eq!(DIFF_IN_TURN - DIFF_NO_TURN, U256::from(1u64));
+    }
+
+    #[test]
+    fn test_nonce_vote_patterns() {
+        // Auth vote should be all 0xFF
+        for byte in NONCE_AUTH_VOTE {
+            assert_eq!(byte, 0xff);
+        }
+
+        // Drop vote should be all 0x00
+        for byte in NONCE_DROP_VOTE {
+            assert_eq!(byte, 0x00);
+        }
+    }
+
+    // ==================== Extra Data Layout Tests ====================
+
+    #[test]
+    fn test_extra_data_layout() {
+        // Total extra data should be vanity + seal
+        let min_extra_data = EXTRA_VANITY + EXTRA_SEAL;
+        assert_eq!(min_extra_data, 97);
+    }
+
+    #[test]
+    fn test_checkpoint_extra_data_layout() {
+        // At checkpoint, extra data includes signer addresses
+        // Each address is 20 bytes
+        let signers_count = 5;
+        let checkpoint_extra_data = EXTRA_VANITY + (signers_count * 20) + EXTRA_SEAL;
+        assert_eq!(checkpoint_extra_data, 32 + 100 + 65);
+    }
+}

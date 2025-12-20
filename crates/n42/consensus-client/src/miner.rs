@@ -320,10 +320,12 @@ where
                 if let Ok(all_peers) = self.network.get_all_peers().await {
                     debug!(target: "consensus-client", peers_count=all_peers.len());
                     if !all_peers.is_empty() {
-                        status_counts = all_peers
-                            .iter()
-                            .map(|v| (v.status.total_difficulty, v.status.blockhash))
-                            .counts();
+                        // Manual implementation of counts() to avoid itertools dependency issues
+                        let mut counts_map: HashMap<_, usize> = HashMap::new();
+                        for (td, hash) in all_peers.iter().map(|v| (v.status.total_difficulty, v.status.blockhash)) {
+                            *counts_map.entry((td, hash)).or_insert(0) += 1;
+                        }
+                        status_counts = counts_map;
                         break;
                     }
                 }
@@ -1287,4 +1289,220 @@ where
 
 fn exit_by_sigint() {
     let _ = nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGINT);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ==================== MiningMode Tests ====================
+
+    #[tokio::test]
+    async fn test_mining_mode_interval_creation() {
+        let duration = Duration::from_secs(1);
+        let mode = MiningMode::interval(duration);
+        match mode {
+            MiningMode::Interval(interval) => {
+                assert_eq!(interval.period(), duration);
+            }
+            _ => panic!("Expected Interval mining mode"),
+        }
+    }
+
+    #[test]
+    fn test_mining_mode_no_mining() {
+        let mode = MiningMode::NoMining;
+        match mode {
+            MiningMode::NoMining => {}
+            _ => panic!("Expected NoMining mode"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mining_mode_debug() {
+        let mode = MiningMode::NoMining;
+        let debug_str = format!("{:?}", mode);
+        assert!(debug_str.contains("NoMining"));
+
+        let mode = MiningMode::interval(Duration::from_secs(1));
+        let debug_str = format!("{:?}", mode);
+        assert!(debug_str.contains("Interval"));
+    }
+
+    // ==================== Duration Constants Tests ====================
+
+    #[test]
+    fn test_duration_calculations() {
+        // Test typical block time calculations
+        let block_time = Duration::from_secs(12);
+        let epoch_duration = block_time * 32; // 32 slots per epoch
+        assert_eq!(epoch_duration.as_secs(), 384);
+    }
+
+    // ==================== Helper Function Tests ====================
+
+    #[test]
+    fn test_keccak256_consistency() {
+        // Test that keccak256 produces consistent results
+        let data = b"test data";
+        let hash1 = keccak256(data);
+        let hash2 = keccak256(data);
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_b256_from_slice() {
+        let bytes = [0u8; 32];
+        let b256 = B256::from_slice(&bytes);
+        assert_eq!(b256, B256::ZERO);
+    }
+
+    #[test]
+    fn test_address_from_str() {
+        let addr_str = "0x0000000000000000000000000000000000000001";
+        let addr = Address::from_str(addr_str).unwrap();
+        assert!(!addr.is_zero());
+    }
+
+    // ==================== Unix Epoch Time Tests ====================
+
+    #[test]
+    fn test_unix_epoch() {
+        let now = std::time::SystemTime::now();
+        let duration = now.duration_since(UNIX_EPOCH).unwrap();
+        assert!(duration.as_secs() > 0);
+    }
+
+    #[test]
+    fn test_timestamp_calculation() {
+        // Simulate timestamp calculation for a block
+        let base_timestamp = 1700000000u64;
+        let slot = 10u64;
+        let slot_duration = 12u64;
+        let expected_timestamp = base_timestamp + slot * slot_duration;
+        assert_eq!(expected_timestamp, 1700000120);
+    }
+
+    // ==================== Block Number Tests ====================
+
+    #[test]
+    fn test_block_number_arithmetic() {
+        let block_number: BlockNumber = 100;
+        let parent_number = block_number.saturating_sub(1);
+        assert_eq!(parent_number, 99);
+
+        // Test at genesis
+        let genesis: BlockNumber = 0;
+        let parent_of_genesis = genesis.saturating_sub(1);
+        assert_eq!(parent_of_genesis, 0);
+    }
+
+    // ==================== U256 Tests ====================
+
+    #[test]
+    fn test_u256_total_difficulty() {
+        let td1 = U256::from(1000u64);
+        let td2 = U256::from(2000u64);
+        assert!(td2 > td1);
+
+        let diff = td2 - td1;
+        assert_eq!(diff, U256::from(1000u64));
+    }
+
+    #[test]
+    fn test_u256_average() {
+        let total = U256::from(1000u64);
+        let count = 10u64;
+        let average = total.to::<u64>() / count;
+        assert_eq!(average, 100);
+    }
+
+    // ==================== HashMap Tests for Status Counts ====================
+
+    #[test]
+    fn test_status_counts_manual() {
+        // Simulate the manual counting logic that replaces itertools::counts()
+        let items = vec![
+            (U256::from(100u64), B256::ZERO),
+            (U256::from(100u64), B256::ZERO),
+            (U256::from(200u64), B256::repeat_byte(1)),
+        ];
+
+        let mut counts_map: HashMap<_, usize> = HashMap::new();
+        for item in items.iter() {
+            *counts_map.entry(item.clone()).or_insert(0) += 1;
+        }
+
+        assert_eq!(counts_map.get(&(U256::from(100u64), B256::ZERO)), Some(&2));
+        assert_eq!(
+            counts_map.get(&(U256::from(200u64), B256::repeat_byte(1))),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn test_find_max_count() {
+        let mut counts: HashMap<(U256, B256), usize> = HashMap::new();
+        counts.insert((U256::from(100u64), B256::ZERO), 5);
+        counts.insert((U256::from(200u64), B256::repeat_byte(1)), 3);
+        counts.insert((U256::from(150u64), B256::repeat_byte(2)), 7);
+
+        let max_entry = counts.iter().max_by_key(|(_, &count)| count);
+        assert!(max_entry.is_some());
+        let ((td, _hash), count) = max_entry.unwrap();
+        assert_eq!(*td, U256::from(150u64));
+        assert_eq!(*count, 7);
+    }
+
+    // ==================== Slots Per Epoch Tests ====================
+
+    #[test]
+    fn test_slots_per_epoch_constant() {
+        // SLOTS_PER_EPOCH should be defined
+        assert!(SLOTS_PER_EPOCH > 0);
+    }
+
+    #[test]
+    fn test_epoch_calculation() {
+        let slot = 100u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+        assert!(epoch <= slot);
+    }
+
+    // ==================== BlockHashOrNumber Tests ====================
+
+    #[test]
+    fn test_block_hash_or_number_from_number() {
+        let block_num: BlockNumber = 100;
+        let hash_or_num: BlockHashOrNumber = block_num.into();
+        match hash_or_num {
+            BlockHashOrNumber::Number(n) => assert_eq!(n, 100),
+            _ => panic!("Expected Number variant"),
+        }
+    }
+
+    #[test]
+    fn test_block_hash_or_number_from_hash() {
+        let hash = B256::ZERO;
+        let hash_or_num: BlockHashOrNumber = hash.into();
+        match hash_or_num {
+            BlockHashOrNumber::Hash(h) => assert_eq!(h, B256::ZERO),
+            _ => panic!("Expected Hash variant"),
+        }
+    }
+
+    // ==================== FixedBytes Tests ====================
+
+    #[test]
+    fn test_fixed_bytes_zero() {
+        let zero: FixedBytes<32> = FixedBytes::ZERO;
+        assert!(zero.is_zero());
+    }
+
+    #[test]
+    fn test_fixed_bytes_comparison() {
+        let a: FixedBytes<32> = FixedBytes::ZERO;
+        let b: FixedBytes<32> = FixedBytes::repeat_byte(1);
+        assert_ne!(a, b);
+    }
 }

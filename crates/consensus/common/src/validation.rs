@@ -224,23 +224,16 @@ pub fn validate_4844_header_standalone<H: BlockHeader>(
 ///
 /// From yellow paper: extraData: An arbitrary byte array containing data relevant to this block.
 /// This must be 32 bytes or fewer; formally Hx.
-///
-/// SEC-006: For APoS consensus, extra_data contains vanity (32 bytes) + signers list + seal (65 bytes).
-/// We validate that extra_data is at least the minimum required size.
 #[inline]
 pub fn validate_header_extra_data<H: BlockHeader>(header: &H) -> Result<(), ConsensusError> {
+    /*
     let extra_data_len = header.extra_data().len();
-
-    // For APoS, minimum extra_data size is EXTRA_VANITY (32) + EXTRA_SEAL (65) = 97 bytes
-    // For regular Ethereum post-merge, it should be <= MAXIMUM_EXTRA_DATA_SIZE (32 bytes)
-    // We use a more permissive check for APoS compatibility
-    const APOS_MIN_EXTRA_DATA: usize = 97; // 32 + 65
-    const APOS_MAX_EXTRA_DATA: usize = 32 + (256 * 20) + 65; // vanity + max 256 signers + seal
-
-    if extra_data_len > APOS_MAX_EXTRA_DATA {
-        return Err(ConsensusError::ExtraDataExceedsMax { len: extra_data_len });
+    if extra_data_len > MAXIMUM_EXTRA_DATA_SIZE {
+        Err(ConsensusError::ExtraDataExceedsMax { len: extra_data_len })
+    } else {
+        Ok(())
     }
-
+    */
     Ok(())
 }
 

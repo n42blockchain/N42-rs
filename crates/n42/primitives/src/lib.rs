@@ -7,6 +7,3 @@
 mod snapshot;
 pub use snapshot::APosConfig;
 pub use snapshot::Snapshot;
-pub use snapshot::Tally;
-pub use snapshot::Vote;
-pub use snapshot::VotingError;

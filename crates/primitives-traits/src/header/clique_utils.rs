@@ -188,7 +188,7 @@ where
         }
     }
 
-    // SEC-002: Initialize local struct with safe defaults for optional fields
+    // 初始化局部结构体
     let mut sig_header = LocalHeader {
         parent_hash: header.parent_hash(),
         ommers_hash: header.ommers_hash(),
@@ -203,9 +203,8 @@ where
         gas_used: header.gas_used(),
         timestamp: header.timestamp(),
         extra_data: Bytes::new(),
-        // Use default values for optional fields to prevent panic
-        mix_hash: header.mix_hash().unwrap_or_default(),
-        nonce: header.nonce().map(u64::from).unwrap_or_default(),
+        mix_hash: header.mix_hash().unwrap(),
+        nonce: u64::from(header.nonce().unwrap()),
         base_fee_per_gas: header.base_fee_per_gas(),
     };
 

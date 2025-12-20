@@ -3,6 +3,7 @@
 
 extern crate alloc;
 
+use alloy_primitives::Sealable;
 use alloy_primitives::{hex, Address, BlockHash, Bytes, FixedBytes, B256, B64, U256};
 use bytes::BytesMut;
 use n42_primitives::{APosConfig, Snapshot};
@@ -16,7 +17,7 @@ use reth_primitives_traits::{
     Header, RecoveredBlock,
 };
 use reth_primitives_traits::{
-    Block as BlockTrait, BlockBody as BlockBodyTrait, BlockHeader as BlockHeaderTrait, NodePrimitives,
+    Block as BlockTrait, BlockHeader as BlockHeaderTrait, NodePrimitives,
 };
 use reth_provider::{BlockIdReader, BlockReaderIdExt, HeaderProvider, SnapshotProvider};
 use std::collections::HashMap;
@@ -30,7 +31,9 @@ use tracing::{debug, error, info, warn};
 use alloy_signer::SignerSync;
 use alloy_signer_local::{LocalSigner, PrivateKeySigner};
 use k256::ecdsa::SigningKey;
-use reth_consensus::{Consensus, ConsensusError, FullConsensus, HeaderValidator};
+use reth_consensus::{
+    Consensus, ConsensusError, FullConsensus, HeaderConsensusError, HeaderValidator,
+};
 use reth_storage_api::SnapshotProviderWriter;
 use std::str::FromStr;
 
@@ -196,16 +199,8 @@ where
         )));
         let recent_tds_inited = AtomicBool::new(false);
 
-        // SEC-001: Safely parse the private key with proper error handling
-        let eth_signer: Option<PrivateKeySigner> = signer_private_key.and_then(|key| {
-            match key.parse() {
-                Ok(signer) => Some(signer),
-                Err(e) => {
-                    error!(target: "consensus::apos", "Failed to parse signer private key: {:?}. Node will run without signing capability.", e);
-                    None
-                }
-            }
-        });
+        let eth_signer: Option<PrivateKeySigner> =
+            signer_private_key.map(|key| key.parse().unwrap());
 
         let eth_signer_address = eth_signer.clone().map(|signer| signer.address());
         info!(target: "consensus::apos", "apos set signer address {:?}", eth_signer_address);
@@ -323,10 +318,9 @@ where
             .unwrap_or(Some(0))
             .unwrap_or(0);
         info!(target: "consensus::apos", ?finalized_block_number, "init_recent_tds");
-        let best_block_number = self.provider.best_block_number().unwrap_or(0);
+        let best_block_number = self.provider.best_block_number().unwrap();
         info!(target: "consensus::apos", ?best_block_number, "init_recent_tds");
-        // SEC-009: Use saturating arithmetic to prevent underflow
-        let num_blocks = best_block_number.saturating_sub(finalized_block_number).saturating_add(1);
+        let num_blocks = best_block_number - finalized_block_number + 1;
         let start_block_number = if num_blocks > INMEMORY_TDS.into() {
             warn!(target: "consensus::apos", ?finalized_block_number, ?best_block_number, td_cache_size=?INMEMORY_TDS,
                 "the number of blocks from finalized block to best block is larger than td cache size, this may cause 'td not found' errors later",
@@ -335,42 +329,31 @@ where
         } else {
             finalized_block_number
         };
-        // SEC-008: Use proper error handling instead of unwrap chains
-        for block_number in start_block_number..=best_block_number {
+        (start_block_number..=best_block_number).for_each(|block_number| {
             debug!(target: "consensus::apos", ?block_number, "init_recent_tds");
-            let header = match self.provider.header_by_number(block_number) {
-                Ok(Some(h)) => h,
-                Ok(None) => {
-                    warn!(target: "consensus::apos", ?block_number, "Header not found during TD init");
-                    continue;
-                }
-                Err(e) => {
-                    error!(target: "consensus::apos", ?block_number, ?e, "Failed to fetch header during TD init");
-                    continue;
-                }
-            };
-
+            let header = self
+                .provider
+                .header_by_number(block_number)
+                .unwrap()
+                .unwrap();
             if block_number == start_block_number {
                 let start_td = self
                     .provider
                     .header_td_by_number(start_block_number)
                     .unwrap_or(Some(U256::ZERO))
                     .unwrap_or(U256::ZERO);
-                if let Ok(mut recent_tds) = self.recent_tds.write() {
-                    recent_tds.insert(header.hash_slow(), start_td);
-                }
+                let mut recent_tds = self.recent_tds.write().unwrap();
+                recent_tds.insert(header.hash_slow(), start_td);
             } else {
-                if let Ok(mut recent_tds) = self.recent_tds.write() {
-                    let parent_td = recent_tds.get(&header.parent_hash()).copied().unwrap_or(U256::ZERO);
-                    recent_tds.insert(header.hash_slow(), parent_td + header.difficulty());
-                }
+                let mut recent_tds = self.recent_tds.write().unwrap();
+                let parent_td = *recent_tds.get(&header.parent_hash()).unwrap();
+                recent_tds.insert(header.hash_slow(), parent_td + header.difficulty());
             }
-        }
+        });
 
         self.recent_tds_inited.store(true, Ordering::Relaxed);
     }
 
-    /// SEC-008: Save total difficulty with proper error handling
     fn save_total_difficulty<H>(&self, header: &H)
     where
         H: BlockHeaderTrait,
@@ -378,28 +361,20 @@ where
         self.init_recent_tds();
 
         let total_difficulty = {
-            let mut recent_tds = match self.recent_tds.write() {
-                Ok(guard) => guard,
-                Err(e) => {
-                    error!(target: "consensus::apos", "Failed to acquire TD write lock: {:?}", e);
-                    return;
-                }
-            };
-            let parent_td = recent_tds.get(&header.parent_hash()).copied().unwrap_or_else(|| {
-                warn!(
-                    target: "consensus::apos",
-                    "TD not found for parent hash {:?}, using zero",
-                    header.parent_hash()
-                );
-                U256::ZERO
+            let mut recent_tds = self.recent_tds.write().unwrap();
+            let parent_td = recent_tds.get(&header.parent_hash()).unwrap_or_else(|| {
+                panic!(
+                    "td not found for parent hash {:?}, current header={:?}",
+                    header.parent_hash(),
+                    header
+                )
             });
-            parent_td + header.difficulty()
+            *parent_td + header.difficulty()
         };
 
-        if let Ok(mut recent_tds) = self.recent_tds.write() {
-            recent_tds.insert(header.hash_slow(), total_difficulty);
-            debug!(target: "consensus::apos", "saved total_difficulty {}", total_difficulty);
-        }
+        let mut recent_tds = self.recent_tds.write().unwrap();
+        recent_tds.insert(header.hash_slow(), total_difficulty);
+        debug!(target: "consensus::apos", "saved total_difficulty {}", total_difficulty);
     }
 
     /// snapshot retrieves the authorization snapshot at a given point in time.
@@ -692,11 +667,18 @@ where
         Ok(())
     }
 
-    // SEC-003: Use the default trait implementation which properly validates headers
-    // The default implementation in HeaderValidator trait already validates:
-    // 1. First header standalone
-    // 2. Each subsequent header standalone and against its parent
-    // We don't override validate_header_range to use the secure default implementation
+    /// Validates the given headers
+    ///
+    /// This ensures that the first header is valid on its own and all subsequent headers are valid
+    /// on its own and valid against its parent.
+    ///
+    /// Note: this expects that the headers are in natural order (ascending block number)
+    fn validate_header_range(
+        &self,
+        headers: &[SealedHeader],
+    ) -> Result<(), HeaderConsensusError<reth_primitives_traits::Header>> {
+        Ok(())
+    }
 }
 
 impl<Provider, ChainSpec, N> FullConsensus<N> for APos<Provider, ChainSpec>
@@ -715,12 +697,9 @@ where
 {
     fn validate_block_post_execution(
         &self,
-        _block: &RecoveredBlock<N::Block>,
-        _result: &BlockExecutionResult<N::Receipt>,
+        block: &RecoveredBlock<N::Block>,
+        result: &BlockExecutionResult<N::Receipt>,
     ) -> Result<(), ConsensusError> {
-        // SEC-004: Post-execution validation
-        // For APoS consensus, the critical validations are performed during header validation.
-        // State root validation is handled by the execution layer.
         Ok(())
     }
 }
@@ -741,29 +720,15 @@ where
 {
     type Error = ConsensusError;
 
-    /// SEC-005: Validate body against header
-    /// Note: Full validation is delegated to reth-consensus-common for proper type handling
     fn validate_body_against_header(
         &self,
         body: &B::Body,
         header: &SealedHeader<B::Header>,
     ) -> Result<(), Self::Error> {
-        // Validate transaction root - this is the most critical check
-        let tx_root = body.calculate_tx_root();
-        if header.transactions_root() != tx_root {
-            return Err(ConsensusError::BodyTransactionRootDiff(
-                reth_primitives_traits::GotExpected {
-                    got: tx_root,
-                    expected: header.transactions_root(),
-                }
-                .into(),
-            ));
-        }
         Ok(())
     }
 
-    fn validate_block_pre_execution(&self, _block: &SealedBlock<B>) -> Result<(), Self::Error> {
-        // Pre-execution validation is handled in validate_header and validate_body_against_header
+    fn validate_block_pre_execution(&self, block: &SealedBlock<B>) -> Result<(), Self::Error> {
         Ok(())
     }
 

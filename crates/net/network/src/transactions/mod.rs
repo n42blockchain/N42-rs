@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! Transactions management for the p2p network.
 
 /// Aggregation on configurable parameters for [`TransactionsManager`].

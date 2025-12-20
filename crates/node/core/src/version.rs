@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! Version information for reth.
 use alloy_primitives::Bytes;
 use alloy_rpc_types_engine::ClientCode;
@@ -33,13 +36,17 @@ pub const SHORT_VERSION: &str = env!("RETH_SHORT_VERSION");
 /// The long version information for reth.
 pub const LONG_VERSION: &str = concat!(
     env!("RETH_LONG_VERSION_0"),
-    "\n",
+    "
+",
     env!("RETH_LONG_VERSION_1"),
-    "\n",
+    "
+",
     env!("RETH_LONG_VERSION_2"),
-    "\n",
+    "
+",
     env!("RETH_LONG_VERSION_3"),
-    "\n",
+    "
+",
     env!("RETH_LONG_VERSION_4")
 );
 
@@ -70,7 +77,11 @@ pub(crate) const P2P_CLIENT_VERSION: &str = env!("RETH_P2P_CLIENT_VERSION");
 /// reth/v{major}.{minor}.{patch}/{OS}
 /// ```
 pub fn default_extra_data() -> String {
-    format!("reth/v{}/{}", env!("CARGO_PKG_VERSION"), std::env::consts::OS)
+    format!(
+        "reth/v{}/{}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS
+    )
 }
 
 /// The default extra data in bytes.
@@ -95,6 +106,9 @@ mod tests {
     #[test]
     fn assert_extra_data_less_32bytes() {
         let extra_data = default_extra_data();
-        assert!(extra_data.len() <= 32, "extra data must be less than 32 bytes: {extra_data}")
+        assert!(
+            extra_data.len() <= 32,
+            "extra data must be less than 32 bytes: {extra_data}"
+        )
     }
 }

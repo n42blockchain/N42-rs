@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! MDBX implementation for reth's database abstraction layer.
 //!
 //! This crate is an implementation of [`reth-db-api`] for MDBX, as well as a few other common
@@ -78,7 +81,10 @@ pub mod test_utils {
 
     impl<DB: std::fmt::Debug> std::fmt::Debug for TempDatabase<DB> {
         fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-            f.debug_struct("TempDatabase").field("db", &self.db).field("path", &self.path).finish()
+            f.debug_struct("TempDatabase")
+                .field("db", &self.db)
+                .field("path", &self.path)
+                .finish()
         }
     }
 
@@ -161,7 +167,10 @@ pub mod test_utils {
 
     /// Get a temporary directory path to use for the database
     pub fn tempdir_path() -> PathBuf {
-        let builder = tempfile::Builder::new().prefix("reth-test-").rand_bytes(8).tempdir();
+        let builder = tempfile::Builder::new()
+            .prefix("reth-test-")
+            .rand_bytes(8)
+            .tempdir();
         builder.expect(ERROR_TEMPDIR).keep()
     }
 
@@ -246,8 +255,11 @@ mod tests {
 
         // Database is not empty, version file is malformed
         {
-            reth_fs_util::write(path.path().join(db_version_file_path(&path)), "invalid-version")
-                .unwrap();
+            reth_fs_util::write(
+                path.path().join(db_version_file_path(&path)),
+                "invalid-version",
+            )
+            .unwrap();
             let db = init_db(&path, args.clone());
             assert!(db.is_err());
             assert_matches!(
@@ -281,7 +293,10 @@ mod tests {
         }
 
         // Client version is recorded
-        let first_version = ClientVersion { version: String::from("v1"), ..Default::default() };
+        let first_version = ClientVersion {
+            version: String::from("v1"),
+            ..Default::default()
+        };
         {
             let db = init_db(&path, DatabaseArguments::new(first_version.clone())).unwrap();
             let tx = db.tx().unwrap();
@@ -315,7 +330,10 @@ mod tests {
 
         // Different client version is recorded
         std::thread::sleep(Duration::from_secs(1));
-        let second_version = ClientVersion { version: String::from("v2"), ..Default::default() };
+        let second_version = ClientVersion {
+            version: String::from("v2"),
+            ..Default::default()
+        };
         {
             let db = init_db(&path, DatabaseArguments::new(second_version.clone())).unwrap();
             let tx = db.tx().unwrap();
@@ -333,7 +351,10 @@ mod tests {
 
         // Different client version is recorded on db open.
         std::thread::sleep(Duration::from_secs(1));
-        let third_version = ClientVersion { version: String::from("v3"), ..Default::default() };
+        let third_version = ClientVersion {
+            version: String::from("v3"),
+            ..Default::default()
+        };
         {
             let db = open_db(path.path(), DatabaseArguments::new(third_version.clone())).unwrap();
             let tx = db.tx().unwrap();

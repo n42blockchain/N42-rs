@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use crate::{providers::NodeTypesForProvider, DatabaseProvider};
 use reth_db_api::transaction::{DbTx, DbTxMut};
 use reth_node_types::FullNodePrimitives;

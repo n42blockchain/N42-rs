@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! Commonly used types and traits in Reth.
 //!
 //! This crate contains various primitive traits used across reth's components.

@@ -1,24 +1,29 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 #![allow(missing_docs)]
 
 #[global_allocator]
 static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
 
-use std::{time::Duration};
 use alloy_signer_local::PrivateKeySigner;
-use consensus_client::miner::N42Miner;
+use clap::Parser;
 use consensus_client::migrate::N42Migrate;
+use consensus_client::miner::N42Miner;
+use n42::consensus_ext::{
+    ConsensusBeaconExt, ConsensusBeaconExtApiServer, ConsensusExt, ConsensusExtApiServer,
+};
+use n42::{args::RessArgs, cli::Cli, ress::install_ress_subprotocol};
 use n42_clique::UnverifiedBlock;
 use n42_engine_primitives::N42PayloadAttributesBuilder;
-use clap::Parser;
-use n42::{args::RessArgs, cli::Cli, ress::install_ress_subprotocol};
-use n42_engine_types::{N42Node};
+use n42_engine_types::N42Node;
 use pubsub_mem::{router_loop, RouterMsg};
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_node_builder::NodeHandle;
 use reth_node_ethereum::EthereumNode;
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
-use tracing::{info, error};
-use n42::consensus_ext::{ConsensusExtApiServer, ConsensusExt, ConsensusBeaconExtApiServer, ConsensusBeaconExt};
+use tracing::{error, info};
 
 const DEFAULT_BLOCK_TIME_SECS: u64 = 8;
 
@@ -41,25 +46,36 @@ fn main() {
             let router_tx_clone = router_tx.clone();
             let router_tx_clone_for_miner = router_tx.clone();
 
-            let NodeHandle { node, node_exit_future } =
-                builder.node(N42Node::default())
-                        .extend_rpc_modules(|ctx| {
+            let NodeHandle {
+                node,
+                node_exit_future,
+            } = builder
+                .node(N42Node::default())
+                .extend_rpc_modules(|ctx| {
+                    let consensus = ctx.consensus().clone();
+                    let provider = ctx.provider().clone();
 
-                            let consensus = ctx.consensus().clone();
-                            let provider = ctx.provider().clone();
+                    let beacon_ext = ConsensusBeaconExt {
+                        consensus: consensus.clone(),
+                        provider: provider.clone(),
+                        verification_tx,
+                        router_tx: router_tx_clone,
+                    };
+                    let ext = ConsensusExt {
+                        consensus,
+                        provider,
+                    };
 
-                            let beacon_ext = ConsensusBeaconExt { consensus: consensus.clone(), provider: provider.clone(), verification_tx, router_tx: router_tx_clone };
-                            let ext = ConsensusExt { consensus, provider };
+                    // now we merge our extension namespace into all configured transports
+                    ctx.auth_module.merge_auth_methods(ext.into_rpc())?;
+                    ctx.modules.merge_configured(beacon_ext.into_rpc())?;
 
-                            // now we merge our extension namespace into all configured transports
-                            ctx.auth_module.merge_auth_methods(ext.into_rpc())?;
-                            ctx.modules.merge_configured(beacon_ext.into_rpc())?;
+                    info!(target: "reth::cli", "consensus rpc extension enabled");
 
-                            info!(target: "reth::cli", "consensus rpc extension enabled");
-
-                            Ok(())
-                        })
-                .launch_with_debug_capabilities().await?;
+                    Ok(())
+                })
+                .launch_with_debug_capabilities()
+                .await?;
 
             // Spawn router loop task
             tokio::spawn(router_loop(router_rx));
@@ -74,27 +90,35 @@ fn main() {
             };
 
             let mining_mode = if let Some(_) = consensus_signer_private_key {
-                let block_time = node_config_dev.dev.block_time.unwrap_or_else(|| Duration::from_secs(DEFAULT_BLOCK_TIME_SECS));
+                let block_time = node_config_dev
+                    .dev
+                    .block_time
+                    .unwrap_or_else(|| Duration::from_secs(DEFAULT_BLOCK_TIME_SECS));
                 consensus_client::miner::MiningMode::interval(block_time)
             } else {
                 consensus_client::miner::MiningMode::NoMining
             };
             info!(target: "reth::cli", ?mining_mode);
 
-            if node_config_dev.dev.migrate_old_chain_data_from_db.is_some() || node_config_dev.dev.migrate_old_chain_data_from_rpc.is_some() {
-            let migrate_from_db_path =
-                node_config_dev.dev.migrate_old_chain_data_from_db.clone();
-            let migrate_from_db_rpc =
-                node_config_dev.dev.migrate_old_chain_data_from_rpc.clone();
-            N42Migrate::spawn_new(
-                node.provider.clone(),
-                N42PayloadAttributesBuilder::new_add_signer(node.chain_spec(), signer_address),
-                node.add_ons_handle.beacon_engine_handle.clone(),
-                node.payload_builder_handle.clone(),
-                node.pool.clone(),
-                migrate_from_db_path,
-                migrate_from_db_rpc,
-            );
+            if node_config_dev.dev.migrate_old_chain_data_from_db.is_some()
+                || node_config_dev
+                    .dev
+                    .migrate_old_chain_data_from_rpc
+                    .is_some()
+            {
+                let migrate_from_db_path =
+                    node_config_dev.dev.migrate_old_chain_data_from_db.clone();
+                let migrate_from_db_rpc =
+                    node_config_dev.dev.migrate_old_chain_data_from_rpc.clone();
+                N42Migrate::spawn_new(
+                    node.provider.clone(),
+                    N42PayloadAttributesBuilder::new_add_signer(node.chain_spec(), signer_address),
+                    node.add_ons_handle.beacon_engine_handle.clone(),
+                    node.payload_builder_handle.clone(),
+                    node.pool.clone(),
+                    migrate_from_db_path,
+                    migrate_from_db_rpc,
+                );
             } else {
                 N42Miner::spawn_new(
                     node.provider.clone(),
@@ -128,4 +152,3 @@ fn main() {
         std::process::exit(1);
     }
 }
-

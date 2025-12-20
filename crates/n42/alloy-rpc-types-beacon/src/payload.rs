@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! Payload support for the beacon API.
 //!
 //! Internal helper module to deserialize/serialize the payload attributes for the beacon API, which

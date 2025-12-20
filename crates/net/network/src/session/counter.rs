@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use super::ExceedsSessionLimit;
 use reth_network_api::Direction;
 use reth_network_types::SessionLimits;

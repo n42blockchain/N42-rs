@@ -1,13 +1,14 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! The implementation of the [`PayloadAttributesBuilder`] for the N42 engine service
 
+use alloy_eips::eip4895::{Withdrawal, Withdrawals};
 use alloy_primitives::{Address, B256};
 use reth_chainspec::EthereumHardforks;
 use reth_ethereum_engine_primitives::EthPayloadAttributes;
 use reth_payload_primitives::PayloadAttributesBuilder;
 use std::sync::Arc;
-use alloy_eips::{
-    eip4895::{Withdrawal, Withdrawals},
-};
 
 /// The attributes builder for N42 Ethereum payload.
 #[derive(Debug)]
@@ -20,12 +21,21 @@ pub struct N42PayloadAttributesBuilder<ChainSpec> {
 impl<ChainSpec> N42PayloadAttributesBuilder<ChainSpec> {
     /// Creates a new instance of the builder.
     pub const fn new(chain_spec: Arc<ChainSpec>) -> Self {
-        Self { chain_spec, signer_address: None }
+        Self {
+            chain_spec,
+            signer_address: None,
+        }
     }
 
     /// Creates a new instance of the builder with an optional signer address
-    pub const fn new_add_signer(chain_spec: Arc<ChainSpec>, signer_address: Option<Address>) -> Self {
-        Self { chain_spec, signer_address }
+    pub const fn new_add_signer(
+        chain_spec: Arc<ChainSpec>,
+        signer_address: Option<Address>,
+    ) -> Self {
+        Self {
+            chain_spec,
+            signer_address,
+        }
     }
 }
 
@@ -51,8 +61,15 @@ where
     }
 }
 
-pub trait PayloadAttributesBuilderExt<Attributes>: PayloadAttributesBuilder<Attributes> + Send + Sync + 'static {
-    fn build_ext(&self, timestamp: u64, withdrawals: Option<Vec<Withdrawal>>, prev_randao: B256) -> Attributes;
+pub trait PayloadAttributesBuilderExt<Attributes>:
+    PayloadAttributesBuilder<Attributes> + Send + Sync + 'static
+{
+    fn build_ext(
+        &self,
+        timestamp: u64,
+        withdrawals: Option<Vec<Withdrawal>>,
+        prev_randao: B256,
+    ) -> Attributes;
 }
 
 impl<ChainSpec> PayloadAttributesBuilderExt<EthPayloadAttributes>
@@ -60,7 +77,12 @@ impl<ChainSpec> PayloadAttributesBuilderExt<EthPayloadAttributes>
 where
     ChainSpec: Send + Sync + EthereumHardforks + 'static,
 {
-    fn build_ext(&self, timestamp: u64, withdrawals: Option<Vec<Withdrawal>>, prev_randao: B256) -> EthPayloadAttributes {
+    fn build_ext(
+        &self,
+        timestamp: u64,
+        withdrawals: Option<Vec<Withdrawal>>,
+        prev_randao: B256,
+    ) -> EthPayloadAttributes {
         let mut payload_attributes = self.build(timestamp);
         payload_attributes.withdrawals = withdrawals;
         payload_attributes.prev_randao = prev_randao;

@@ -1,9 +1,12 @@
-use n42_primitives::{Validator,ValidatorBeforeTx};
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use crate::{
     table::{Compress, Decompress},
     DatabaseError,
 };
 use bytes::{BufMut, BytesMut};
+use n42_primitives::{Validator, ValidatorBeforeTx};
 
 impl Decompress for Validator {
     fn decompress(value: &[u8]) -> Result<Self, DatabaseError> {
@@ -24,8 +27,6 @@ impl Compress for Validator {
         buf.put(serialized.as_slice());
     }
 }
-
-
 
 impl Decompress for ValidatorBeforeTx {
     fn decompress(value: &[u8]) -> Result<Self, DatabaseError> {

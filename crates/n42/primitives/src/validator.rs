@@ -1,26 +1,25 @@
-#![allow(missing_docs)]
-use ssz_derive::{Encode, Decode};
-use ssz::{Encode, Decode};
-use tree_hash_derive::TreeHash;
-use serde::{Deserialize, Serialize};
-use alloy_primitives::{Address, BlockNumber, B256, Bytes};
-use crate::{
-    Epoch, BLSPubkey, Gwei,
-    is_compounding_withdrawal_credential,
-    ChainSpec,
-};
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
 
-#[derive(Serialize, Debug, Deserialize,PartialEq)]
-pub struct  ValidatorBeforeTx{
+#![allow(missing_docs)]
+use crate::{is_compounding_withdrawal_credential, BLSPubkey, ChainSpec, Epoch, Gwei};
+use alloy_primitives::{Address, BlockNumber, Bytes, B256};
+use serde::{Deserialize, Serialize};
+use ssz::{Decode, Encode};
+use ssz_derive::{Decode, Encode};
+use tree_hash_derive::TreeHash;
+
+#[derive(Serialize, Debug, Deserialize, PartialEq)]
+pub struct ValidatorBeforeTx {
     pub address: Address,
     pub info: Option<Validator>,
 }
 #[derive(Debug)]
-pub struct ValidatorChangeset{
-    pub validators: Vec<(Address,Option<Validator>)>,
+pub struct ValidatorChangeset {
+    pub validators: Vec<(Address, Option<Validator>)>,
 }
 #[derive(Debug)]
-pub struct ValidatorRevert{
+pub struct ValidatorRevert {
     pub validators: Vec<Vec<(Address, Option<Validator>)>>,
 }
 
@@ -33,35 +32,28 @@ pub struct ValidatorInfo {
     pub inactivity_score: u64,
 }
 
-#[derive(Debug, Clone, Hash, Default, PartialEq, Serialize, Deserialize, Encode, Decode, TreeHash)]
+#[derive(
+    Debug, Clone, Hash, Default, PartialEq, Serialize, Deserialize, Encode, Decode, TreeHash,
+)]
 pub struct Validator {
     pub pubkey: BLSPubkey,
-    pub withdrawal_credentials: B256,  // Commitment to pubkey for withdrawals
-    pub effective_balance: Gwei,  // Balance at stake
+    pub withdrawal_credentials: B256, // Commitment to pubkey for withdrawals
+    pub effective_balance: Gwei,      // Balance at stake
     pub slashed: bool,
 
     // Status epochs
-    pub activation_eligibility_epoch: Epoch,  // When criteria for activation were met
+    pub activation_eligibility_epoch: Epoch, // When criteria for activation were met
     pub activation_epoch: Epoch,
     pub exit_epoch: Epoch,
-    pub withdrawable_epoch: Epoch,  // When validator can withdraw funds
+    pub withdrawable_epoch: Epoch, // When validator can withdraw funds
 }
 
 impl Validator {
-    pub fn is_partially_withdrawable_validator(
-        &self,
-        balance: u64,
-        spec: &ChainSpec,
-    ) -> bool {
-        self.effective_balance == spec.max_effective_balance
-            && balance > spec.max_effective_balance
+    pub fn is_partially_withdrawable_validator(&self, balance: u64, spec: &ChainSpec) -> bool {
+        self.effective_balance == spec.max_effective_balance && balance > spec.max_effective_balance
     }
 
-    pub fn is_fully_withdrawable_validator(
-        &self,
-        balance: u64,
-        epoch: Epoch,
-    ) -> bool {
+    pub fn is_fully_withdrawable_validator(&self, balance: u64, epoch: Epoch) -> bool {
         self.withdrawable_epoch <= epoch && balance > 0
     }
 
@@ -73,23 +65,17 @@ impl Validator {
     }
 
     /// Check if ``validator`` has an 0x02 prefixed "compounding" withdrawal credential.
-    pub fn has_compounding_withdrawal_credential(&self,
-        spec: &ChainSpec,
-        ) -> bool {
+    pub fn has_compounding_withdrawal_credential(&self, spec: &ChainSpec) -> bool {
         is_compounding_withdrawal_credential(self.withdrawal_credentials, spec)
     }
 
-    pub fn has_execution_withdrawal_credential(&self,
-        spec: &ChainSpec,
-        ) -> bool {
+    pub fn has_execution_withdrawal_credential(&self, spec: &ChainSpec) -> bool {
         self.has_compounding_withdrawal_credential(spec)
             || self.has_eth1_withdrawal_credential(spec)
     }
 
     /// Returns `true` if the validator has eth1 withdrawal credential.
-    pub fn has_eth1_withdrawal_credential(&self,
-        spec: &ChainSpec,
-        ) -> bool {
+    pub fn has_eth1_withdrawal_credential(&self, spec: &ChainSpec) -> bool {
         self.withdrawal_credentials
             .as_slice()
             .first()
@@ -136,9 +122,7 @@ impl Validator {
     /// Eligibility depends on finalization, so we assume best-possible finalization. This function
     /// returning true is a necessary but *not sufficient* condition for a validator to activate in
     /// the epoch transition at the end of `epoch`.
-    pub fn could_be_eligible_for_activation_at(&self, epoch: Epoch,
-        spec: &ChainSpec,
-        ) -> bool {
+    pub fn could_be_eligible_for_activation_at(&self, epoch: Epoch, spec: &ChainSpec) -> bool {
         // Has not yet been activated
         self.activation_epoch == spec.far_future_epoch
         // Placement in queue could be finalized.
@@ -152,19 +136,14 @@ impl Validator {
     /// Returns `true` if the validator is eligible to join the activation queue.
     ///
     /// Calls the correct function depending on the provided `fork_name`.
-    pub fn is_eligible_for_activation_queue(
-        &self,
-        spec: &ChainSpec,
-    ) -> bool {
+    pub fn is_eligible_for_activation_queue(&self, spec: &ChainSpec) -> bool {
         self.is_eligible_for_activation_queue_base(spec)
     }
 
     /// Returns `true` if the validator is eligible to join the activation queue.
     ///
     /// Spec v0.12.1
-    fn is_eligible_for_activation_queue_base(&self,
-        spec: &ChainSpec,
-        ) -> bool {
+    fn is_eligible_for_activation_queue_base(&self, spec: &ChainSpec) -> bool {
         self.activation_eligibility_epoch == spec.far_future_epoch
             && self.effective_balance == spec.max_effective_balance
     }
@@ -179,11 +158,7 @@ impl Validator {
         self.exit_epoch <= epoch
     }
 
-    pub fn js_exited_set(&self,
-        spec: &ChainSpec,
-        ) -> bool {
+    pub fn js_exited_set(&self, spec: &ChainSpec) -> bool {
         self.exit_epoch != spec.far_future_epoch
     }
-
 }
-

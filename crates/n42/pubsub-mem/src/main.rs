@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use pubsub_mem::{Event, RouterMsg, publish, router_loop, subscribe};
 use std::time::Duration;
 use tokio::sync::mpsc;

@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! A generic [`NodeComponentsBuilder`]
 
 use crate::{
@@ -333,7 +336,12 @@ where
         let network = network_builder.build_network(context, pool.clone()).await?;
         let consensus = consensus_builder.build_consensus(context).await?;
         let payload_builder_handle = payload_builder
-            .spawn_payload_builder_service(context, pool.clone(), evm_config.clone(), consensus.clone())
+            .spawn_payload_builder_service(
+                context,
+                pool.clone(),
+                evm_config.clone(),
+                consensus.clone(),
+            )
             .await?;
 
         Ok(Components {
@@ -389,7 +397,7 @@ where
     >,
     Node: FullNodeTypes,
     F: FnOnce(&BuilderContext<Node>) -> Fut + Send,
-    Fut: Future<Output = eyre::Result<Components<Node, Net, Pool, EVM, Cons >>> + Send,
+    Fut: Future<Output = eyre::Result<Components<Node, Net, Pool, EVM, Cons>>> + Send,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TxTy<Node::Types>>>
         + Unpin
         + 'static,

@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! Database version utils.
 
 use std::{
@@ -48,7 +51,7 @@ pub enum DatabaseVersionError {
 pub fn check_db_version_file<P: AsRef<Path>>(db_path: P) -> Result<(), DatabaseVersionError> {
     let version = get_db_version(db_path)?;
     if version != DB_VERSION {
-        return Err(DatabaseVersionError::VersionMismatch { version })
+        return Err(DatabaseVersionError::VersionMismatch { version });
     }
 
     Ok(())
@@ -61,11 +64,14 @@ pub fn check_db_version_file<P: AsRef<Path>>(db_path: P) -> Result<(), DatabaseV
 pub fn get_db_version<P: AsRef<Path>>(db_path: P) -> Result<u64, DatabaseVersionError> {
     let version_file_path = db_version_file_path(db_path);
     match fs::read_to_string(&version_file_path) {
-        Ok(raw_version) => {
-            Ok(raw_version.parse::<u64>().map_err(|_| DatabaseVersionError::MalformedFile)?)
-        }
+        Ok(raw_version) => Ok(raw_version
+            .parse::<u64>()
+            .map_err(|_| DatabaseVersionError::MalformedFile)?),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Err(DatabaseVersionError::MissingFile),
-        Err(err) => Err(DatabaseVersionError::IORead { err, path: version_file_path }),
+        Err(err) => Err(DatabaseVersionError::IORead {
+            err,
+            path: version_file_path,
+        }),
     }
 }
 
@@ -113,6 +119,9 @@ mod tests {
         fs::write(db_version_file_path(&dir), "0").unwrap();
 
         let result = check_db_version_file(&dir);
-        assert_matches!(result, Err(DatabaseVersionError::VersionMismatch { version: 0 }));
+        assert_matches!(
+            result,
+            Err(DatabaseVersionError::VersionMismatch { version: 0 })
+        );
     }
 }

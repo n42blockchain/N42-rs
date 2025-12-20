@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use crate::{
     providers::state::macros::delegate_provider_impls, AccountReader, BlockHashReader,
     HashedPostStateProvider, StateProvider, StateRootProvider,
@@ -41,7 +44,9 @@ impl<'b, Provider: DBProvider> LatestStateProviderRef<'b, Provider> {
 impl<Provider: DBProvider> AccountReader for LatestStateProviderRef<'_, Provider> {
     /// Get basic account information.
     fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
-        self.tx().get_by_encoded_key::<tables::PlainAccountState>(address).map_err(Into::into)
+        self.tx()
+            .get_by_encoded_key::<tables::PlainAccountState>(address)
+            .map_err(Into::into)
     }
 }
 
@@ -172,7 +177,7 @@ impl<Provider: DBProvider + BlockHashReader + StateCommitmentProvider> StateProv
         let mut cursor = self.tx().cursor_dup_read::<tables::PlainStorageState>()?;
         if let Some(entry) = cursor.seek_by_key_subkey(account, storage_key)? {
             if entry.key == storage_key {
-                return Ok(Some(entry.value))
+                return Ok(Some(entry.value));
             }
         }
         Ok(None)
@@ -180,7 +185,9 @@ impl<Provider: DBProvider + BlockHashReader + StateCommitmentProvider> StateProv
 
     /// Get account code by its hash
     fn bytecode_by_hash(&self, code_hash: &B256) -> ProviderResult<Option<Bytecode>> {
-        self.tx().get_by_encoded_key::<tables::Bytecodes>(code_hash).map_err(Into::into)
+        self.tx()
+            .get_by_encoded_key::<tables::Bytecodes>(code_hash)
+            .map_err(Into::into)
     }
 }
 

@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! Builder support for rpc components.
 
 use crate::{BeaconConsensusEngineEvent, BeaconConsensusEngineHandle};
@@ -58,7 +61,10 @@ where
     EthApi: EthApiTypes,
 {
     fn default() -> Self {
-        Self { on_rpc_started: Box::<()>::default(), extend_rpc_modules: Box::<()>::default() }
+        Self {
+            on_rpc_started: Box::<()>::default(),
+            extend_rpc_modules: Box::<()>::default(),
+        }
     }
 }
 
@@ -412,8 +418,18 @@ where
 
     /// Maps the [`EngineApiBuilder`] builder type.
     pub fn with_engine_api<T>(self, engine_api_builder: T) -> RpcAddOns<Node, EthB, EV, T> {
-        let Self { hooks, eth_api_builder, engine_validator_builder, .. } = self;
-        RpcAddOns { hooks, eth_api_builder, engine_validator_builder, engine_api_builder }
+        let Self {
+            hooks,
+            eth_api_builder,
+            engine_validator_builder,
+            ..
+        } = self;
+        RpcAddOns {
+            hooks,
+            eth_api_builder,
+            engine_validator_builder,
+            engine_api_builder,
+        }
     }
 
     /// Maps the [`EngineValidatorBuilder`] builder type.
@@ -421,8 +437,18 @@ where
         self,
         engine_validator_builder: T,
     ) -> RpcAddOns<Node, EthB, T, EB> {
-        let Self { hooks, eth_api_builder, engine_api_builder, .. } = self;
-        RpcAddOns { hooks, eth_api_builder, engine_validator_builder, engine_api_builder }
+        let Self {
+            hooks,
+            eth_api_builder,
+            engine_api_builder,
+            ..
+        } = self;
+        RpcAddOns {
+            hooks,
+            eth_api_builder,
+            engine_validator_builder,
+            engine_api_builder,
+        }
     }
 
     /// Sets the hook that is run once the rpc server is started.
@@ -480,10 +506,21 @@ where
             &mut RpcRegistry<N, EthB::EthApi>,
         ) -> eyre::Result<()>,
     {
-        let Self { eth_api_builder, engine_api_builder, hooks, .. } = self;
+        let Self {
+            eth_api_builder,
+            engine_api_builder,
+            hooks,
+            ..
+        } = self;
 
         let engine_api = engine_api_builder.build_engine_api(&ctx).await?;
-        let AddOnsContext { node, config, beacon_engine_handle, jwt_secret, engine_events } = ctx;
+        let AddOnsContext {
+            node,
+            config,
+            beacon_engine_handle,
+            jwt_secret,
+            engine_events,
+        } = ctx;
 
         info!(target: "reth::cli", "Engine API handler initialized");
 
@@ -502,7 +539,11 @@ where
             }),
         );
 
-        let ctx = EthApiCtx { components: &node, config: config.rpc.eth_config(), cache };
+        let ctx = EthApiCtx {
+            components: &node,
+            config: config.rpc.eth_config(),
+            cache,
+        };
         let eth_api = eth_api_builder.build_eth_api(ctx).await?;
 
         let auth_config = config.rpc.auth_server_config(jwt_secret)?;
@@ -532,7 +573,10 @@ where
             auth_module: &mut auth_module,
         };
 
-        let RpcHooks { on_rpc_started, extend_rpc_modules } = hooks;
+        let RpcHooks {
+            on_rpc_started,
+            extend_rpc_modules,
+        } = hooks;
 
         ext(ctx.modules, ctx.auth_module, ctx.registry)?;
         extend_rpc_modules.extend_rpc_modules(ctx)?;
@@ -762,7 +806,9 @@ where
     >;
 
     async fn build_engine_api(self, ctx: &AddOnsContext<'_, N>) -> eyre::Result<Self::EngineApi> {
-        let Self { engine_validator_builder } = self;
+        let Self {
+            engine_validator_builder,
+        } = self;
 
         let engine_validator = engine_validator_builder.build(ctx).await?;
         let client = ClientVersionV1 {

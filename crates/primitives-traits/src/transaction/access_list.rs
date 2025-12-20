@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //!  [EIP-2930](https://eips.ethereum.org/EIPS/eip-2930): Access List types
 
 #[cfg(test)]

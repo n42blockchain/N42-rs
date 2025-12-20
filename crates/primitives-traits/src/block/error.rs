@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! Error types for the `block` module.
 
 use crate::transaction::signed::RecoveryError;

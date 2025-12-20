@@ -1,12 +1,21 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use std::fmt::{Display, Error as FmtError, Formatter};
 use tree_hash::Hash256;
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Error {
-    VecLenTooLarge { vec_len: u64, limit: u64 },
-    OutOfBoundsUpdate { index: u64, len: u64 },
+    VecLenTooLarge {
+        vec_len: u64,
+        limit: u64,
+    },
+    OutOfBoundsUpdate {
+        index: u64,
+        len: u64,
+    },
 
-        /// Found a `Tree::Zero` node with an unexpected height.
+    /// Found a `Tree::Zero` node with an unexpected height.
     /// This indicates an inconsistent or corrupt tree state.
     InconsistentTreeZeroHeightMismatch {
         expected: usize,
@@ -31,7 +40,9 @@ pub enum Error {
 
     /// Called `try_pop` on a non-empty `VecTree` but the popped
     /// leaf was a `Zero` (empty) slot.
-    PoppedEmptySlot { index: u64 },
+    PoppedEmptySlot {
+        index: u64,
+    },
 }
 
 impl Display for Error {

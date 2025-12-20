@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::ptr;
@@ -7,15 +10,24 @@ use eyre::Result;
 use serde_json;
 
 use crate::blst_utils::generate_bls12_381_keypair;
-use crate::{deposit_exit::{create_deposit_unsigned_tx, create_get_exit_fee_unsigned_tx, create_exit_unsigned_tx}, run_client};
+use crate::{
+    deposit_exit::{
+        create_deposit_unsigned_tx, create_exit_unsigned_tx, create_get_exit_fee_unsigned_tx,
+    },
+    run_client,
+};
 
 // ---------------- Helpers ----------------
 fn cstr_to_string(c: *const c_char) -> Result<String, String> {
     if c.is_null() {
         return Err("null pointer".into());
     }
-    unsafe { CStr::from_ptr(c).to_str().map(|s| s.to_owned()).map_err(|e|
-format!("utf8 error: {}", e)) }
+    unsafe {
+        CStr::from_ptr(c)
+            .to_str()
+            .map(|s| s.to_owned())
+            .map_err(|e| format!("utf8 error: {}", e))
+    }
 }
 
 fn make_c_string(s: String) -> *mut c_char {
@@ -24,8 +36,12 @@ fn make_c_string(s: String) -> *mut c_char {
 
 #[no_mangle]
 pub extern "C" fn rust_free_string(s: *mut c_char) {
-    if s.is_null() { return; }
-    unsafe { drop(CString::from_raw(s)); }
+    if s.is_null() {
+        return;
+    }
+    unsafe {
+        drop(CString::from_raw(s));
+    }
 }
 
 // ---------------- run_client ----------------
@@ -37,14 +53,26 @@ pub extern "C" fn run_client_c(
 ) -> i32 {
     let mut set_error = |msg: String| {
         if !out_error.is_null() {
-            unsafe { *out_error = make_c_string(msg); }
+            unsafe {
+                *out_error = make_c_string(msg);
+            }
         }
     };
 
-    let ws = match cstr_to_string(ws_url) { Ok(s) => s, Err(e) => {
-set_error(e); return -1; } };
-    let pk = match cstr_to_string(validator_private_key) { Ok(s) => s, Err(e)
-=> { set_error(e); return -1; } };
+    let ws = match cstr_to_string(ws_url) {
+        Ok(s) => s,
+        Err(e) => {
+            set_error(e);
+            return -1;
+        }
+    };
+    let pk = match cstr_to_string(validator_private_key) {
+        Ok(s) => s,
+        Err(e) => {
+            set_error(e);
+            return -1;
+        }
+    };
 
     // run the async function blocking
     let res = tokio::runtime::Runtime::new()
@@ -53,18 +81,21 @@ set_error(e); return -1; } };
 
     match res {
         Ok(()) => 0, // success
-        Err(e) => { set_error(format!("{}", e)); -1 }
+        Err(e) => {
+            set_error(format!("{}", e));
+            -1
+        }
     }
 }
 
 // ---------------- generate_bls12_381_keypair ----------------
 #[no_mangle]
-pub extern "C" fn generate_bls12_381_keypair_c (
-    out_error: *mut *mut c_char,
-) -> *mut c_char {
+pub extern "C" fn generate_bls12_381_keypair_c(out_error: *mut *mut c_char) -> *mut c_char {
     let mut set_error = |msg: String| {
         if !out_error.is_null() {
-            unsafe { *out_error = make_c_string(msg); }
+            unsafe {
+                *out_error = make_c_string(msg);
+            }
         }
     };
 
@@ -79,8 +110,11 @@ pub extern "C" fn generate_bls12_381_keypair_c (
             };
 
             make_c_string(json_string)
-        },
-        Err(e) => { set_error(format!("{}", e)); ptr::null_mut() }
+        }
+        Err(e) => {
+            set_error(format!("{}", e));
+            ptr::null_mut()
+        }
     }
 }
 
@@ -95,20 +129,47 @@ pub extern "C" fn create_deposit_unsigned_tx_c(
 ) -> *mut c_char {
     let mut set_error = |msg: String| {
         if !out_error.is_null() {
-            unsafe { *out_error = make_c_string(msg); }
+            unsafe {
+                *out_error = make_c_string(msg);
+            }
         }
     };
 
-    let addr = match cstr_to_string(deposit_contract_address) { Ok(s) => s,
-Err(e) => { set_error(e); return ptr::null_mut(); } };
-    let pk = match cstr_to_string(validator_private_key) { Ok(s) => s, Err(e)
-=> { set_error(e); return ptr::null_mut(); } };
-    let wd = match cstr_to_string(withdrawal_address) { Ok(s) => s, Err(e) =>
-{ set_error(e); return ptr::null_mut(); } };
-    let val_str = match cstr_to_string(deposit_value_in_wei) { Ok(s) => s,
-Err(e) => { set_error(e); return ptr::null_mut(); } };
-    let value = match val_str.parse::<U256>() { Ok(v) => v, Err(_) => {
-set_error("invalid deposit value".into()); return ptr::null_mut(); } };
+    let addr = match cstr_to_string(deposit_contract_address) {
+        Ok(s) => s,
+        Err(e) => {
+            set_error(e);
+            return ptr::null_mut();
+        }
+    };
+    let pk = match cstr_to_string(validator_private_key) {
+        Ok(s) => s,
+        Err(e) => {
+            set_error(e);
+            return ptr::null_mut();
+        }
+    };
+    let wd = match cstr_to_string(withdrawal_address) {
+        Ok(s) => s,
+        Err(e) => {
+            set_error(e);
+            return ptr::null_mut();
+        }
+    };
+    let val_str = match cstr_to_string(deposit_value_in_wei) {
+        Ok(s) => s,
+        Err(e) => {
+            set_error(e);
+            return ptr::null_mut();
+        }
+    };
+    let value = match val_str.parse::<U256>() {
+        Ok(v) => v,
+        Err(_) => {
+            set_error("invalid deposit value".into());
+            return ptr::null_mut();
+        }
+    };
 
     match create_deposit_unsigned_tx(&addr, &pk, &wd, &value) {
         Ok(tx) => {
@@ -121,19 +182,22 @@ set_error("invalid deposit value".into()); return ptr::null_mut(); } };
             };
 
             make_c_string(json_string)
-        },
-        Err(e) => { set_error(format!("{}", e)); ptr::null_mut() }
+        }
+        Err(e) => {
+            set_error(format!("{}", e));
+            ptr::null_mut()
+        }
     }
 }
 
 // ---------------- create_get_exit_fee_unsigned_tx ----------------
 #[no_mangle]
-pub extern "C" fn create_get_exit_fee_unsigned_tx_c(
-    out_error: *mut *mut c_char,
-) -> *mut c_char {
+pub extern "C" fn create_get_exit_fee_unsigned_tx_c(out_error: *mut *mut c_char) -> *mut c_char {
     let mut set_error = |msg: String| {
         if !out_error.is_null() {
-            unsafe { *out_error = make_c_string(msg); }
+            unsafe {
+                *out_error = make_c_string(msg);
+            }
         }
     };
 
@@ -148,8 +212,11 @@ pub extern "C" fn create_get_exit_fee_unsigned_tx_c(
             };
 
             make_c_string(json_string)
-        },
-        Err(e) => { set_error(format!("{}", e)); ptr::null_mut() }
+        }
+        Err(e) => {
+            set_error(format!("{}", e));
+            ptr::null_mut()
+        }
     }
 }
 
@@ -162,12 +229,19 @@ pub extern "C" fn create_exit_unsigned_tx_c(
 ) -> *mut c_char {
     let mut set_error = |msg: String| {
         if !out_error.is_null() {
-            unsafe { *out_error = make_c_string(msg); }
+            unsafe {
+                *out_error = make_c_string(msg);
+            }
         }
     };
 
-    let pubkey = match cstr_to_string(validator_public_key) { Ok(s) => s,
-Err(e) => { set_error(e); return ptr::null_mut(); } };
+    let pubkey = match cstr_to_string(validator_public_key) {
+        Ok(s) => s,
+        Err(e) => {
+            set_error(e);
+            return ptr::null_mut();
+        }
+    };
 
     let fee_opt = if fee_in_wei_or_empty.is_null() {
         None
@@ -175,8 +249,13 @@ Err(e) => { set_error(e); return ptr::null_mut(); } };
         match cstr_to_string(fee_in_wei_or_empty) {
             Ok(s) if s.is_empty() => None,
             Ok(s) => Some(s.parse::<U256>().unwrap_or_else(|_| {
-set_error("invalid fee".into()); U256::zero() })),
-            Err(e) => { set_error(e); return ptr::null_mut(); }
+                set_error("invalid fee".into());
+                U256::zero()
+            })),
+            Err(e) => {
+                set_error(e);
+                return ptr::null_mut();
+            }
         }
     };
 
@@ -191,7 +270,10 @@ set_error("invalid fee".into()); U256::zero() })),
             };
 
             make_c_string(json_string)
-        },
-        Err(e) => { set_error(format!("{}", e)); ptr::null_mut() }
+        }
+        Err(e) => {
+            set_error(format!("{}", e));
+            ptr::null_mut()
+        }
     }
 }

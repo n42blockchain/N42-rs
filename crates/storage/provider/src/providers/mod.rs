@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! Contains the main provider types and traits for interacting with the blockchain's storage.
 
 use reth_chainspec::EthereumHardforks;
@@ -30,7 +33,6 @@ mod consistent;
 pub use consistent::ConsistentProvider;
 //use n42_primitives::Snapshot;
 //use reth_storage_api::{SnapshotProvider, SnapshotProviderWriter};
-
 
 /// Helper trait to bound [`NodeTypes`] so that combined with database they satisfy
 /// [`ProviderNodeTypes`].

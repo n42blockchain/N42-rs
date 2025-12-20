@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use crate::{Error, TransactionKind};
 use derive_more::{Debug, Deref, DerefMut};
 use std::{borrow::Cow, slice};

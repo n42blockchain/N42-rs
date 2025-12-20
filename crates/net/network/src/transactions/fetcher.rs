@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! `TransactionFetcher` is responsible for rate limiting and retry logic for fetching
 //! transactions. Upon receiving an announcement, functionality of the `TransactionFetcher` is
 //! used for filtering out hashes 1) for which the tx is already known and 2) unknown but the hash

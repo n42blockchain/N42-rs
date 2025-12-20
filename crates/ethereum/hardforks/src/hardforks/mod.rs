@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 mod dev;
 pub use dev::DEV_HARDFORKS;
 
@@ -62,7 +65,10 @@ impl ChainHardforks {
     ///
     /// Equivalent Ethereum hardforks **must be included** as well.
     pub fn new(forks: Vec<(Box<dyn Hardfork>, ForkCondition)>) -> Self {
-        let map = forks.iter().map(|(fork, condition)| (fork.name(), *condition)).collect();
+        let map = forks
+            .iter()
+            .map(|(fork, condition)| (fork.name(), *condition))
+            .collect();
 
         Self { forks, map }
     }
@@ -123,8 +129,10 @@ impl ChainHardforks {
         match self.map.entry(fork.name()) {
             Entry::Occupied(mut entry) => {
                 *entry.get_mut() = condition;
-                if let Some((_, inner)) =
-                    self.forks.iter_mut().find(|(inner, _)| inner.name() == fork.name())
+                if let Some((_, inner)) = self
+                    .forks
+                    .iter_mut()
+                    .find(|(inner, _)| inner.name() == fork.name())
                 {
                     *inner = condition;
                 }
@@ -138,7 +146,8 @@ impl ChainHardforks {
 
     /// Removes `fork` from list.
     pub fn remove<H: Hardfork>(&mut self, fork: H) {
-        self.forks.retain(|(inner_fork, _)| inner_fork.name() != fork.name());
+        self.forks
+            .retain(|(inner_fork, _)| inner_fork.name() != fork.name());
         self.map.remove(fork.name());
     }
 }
@@ -146,7 +155,13 @@ impl ChainHardforks {
 impl core::fmt::Debug for ChainHardforks {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ChainHardforks")
-            .field("0", &self.forks_iter().map(|(hf, cond)| (hf.name(), cond)).collect::<Vec<_>>())
+            .field(
+                "0",
+                &self
+                    .forks_iter()
+                    .map(|(hf, cond)| (hf.name(), cond))
+                    .collect::<Vec<_>>(),
+            )
             .finish()
     }
 }

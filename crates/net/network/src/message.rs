@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! Capability messaging
 //!
 //! An `RLPx` stream is multiplexed via the prepended message-id of a framed message.

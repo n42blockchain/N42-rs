@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
     #[test]
     fn test_clear() {
         let mut tree = VecTree::<u64, U8>::try_new(0).unwrap();

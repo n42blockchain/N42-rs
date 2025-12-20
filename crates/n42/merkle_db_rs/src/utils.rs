@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use sha2::{Digest, Sha256};
 use tree_hash::Hash256;
 
@@ -10,7 +13,7 @@ pub fn tree_height(n_leaves: usize) -> usize {
     let mut size = 1;
 
     while size < n_leaves {
-        size <<= 1;    // multiply by 2
+        size <<= 1; // multiply by 2
         height += 1;
     }
 

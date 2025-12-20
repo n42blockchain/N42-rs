@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use blst::min_pk::SecretKey;
 use rand::RngCore;
 

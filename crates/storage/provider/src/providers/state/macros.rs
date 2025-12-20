@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! Helper macros for implementing traits for various [`StateProvider`](crate::StateProvider)
 //! implementations
 

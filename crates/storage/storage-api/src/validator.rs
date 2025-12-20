@@ -1,10 +1,13 @@
-use auto_impl::auto_impl;
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use alloy_primitives::Address;
-use reth_storage_errors::provider::ProviderResult;
-use n42_primitives::{Validator,ValidatorChangeset,ValidatorBeforeTx,ValidatorRevert};
-use std::ops::RangeInclusive;
 use alloy_primitives::BlockNumber;
+use auto_impl::auto_impl;
+use n42_primitives::{Validator, ValidatorBeforeTx, ValidatorChangeset, ValidatorRevert};
+use reth_storage_errors::provider::ProviderResult;
 use std::collections::BTreeMap;
+use std::ops::RangeInclusive;
 /// Validator reader
 #[auto_impl(&, Arc, Box)]
 pub trait ValidatorReader: Send + Sync {
@@ -16,12 +19,27 @@ pub trait ValidatorReader: Send + Sync {
 }
 
 #[auto_impl(&, Arc, Box)]
-pub trait ValidatorChangeWriter{
-    fn write_validator_reverts(&self,first_block:BlockNumber,validator_reverts:ValidatorRevert,)->ProviderResult<()>;
-    fn insert_validator_history_index(&self,validator_transitions:impl IntoIterator<Item=(Address,impl IntoIterator<Item=BlockNumber>)>,) -> ProviderResult<()>;
+pub trait ValidatorChangeWriter {
+    fn write_validator_reverts(
+        &self,
+        first_block: BlockNumber,
+        validator_reverts: ValidatorRevert,
+    ) -> ProviderResult<()>;
+    fn insert_validator_history_index(
+        &self,
+        validator_transitions: impl IntoIterator<
+            Item = (Address, impl IntoIterator<Item = BlockNumber>),
+        >,
+    ) -> ProviderResult<()>;
     fn unwind_validator(&self, range: RangeInclusive<BlockNumber>) -> ProviderResult<()>;
-    fn write_validator_changes(&self,changes: ValidatorChangeset) -> ProviderResult<()>;
+    fn write_validator_changes(&self, changes: ValidatorChangeset) -> ProviderResult<()>;
     fn remove_validator(&self, range: RangeInclusive<BlockNumber>) -> ProviderResult<()>;
-    fn take_validator(&self, range: RangeInclusive<BlockNumber>) -> ProviderResult<ValidatorChangeset>;
-    fn unwind_validator_history_indices<'a>(&self, changesets: impl Iterator<Item = &'a (BlockNumber, ValidatorBeforeTx)>,) -> ProviderResult<usize>;
+    fn take_validator(
+        &self,
+        range: RangeInclusive<BlockNumber>,
+    ) -> ProviderResult<ValidatorChangeset>;
+    fn unwind_validator_history_indices<'a>(
+        &self,
+        changesets: impl Iterator<Item = &'a (BlockNumber, ValidatorBeforeTx)>,
+    ) -> ProviderResult<usize>;
 }

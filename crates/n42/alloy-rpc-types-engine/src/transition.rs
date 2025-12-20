@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use alloy_primitives::{B256, U256};
 
 /// This structure contains configurable settings of the transition process.

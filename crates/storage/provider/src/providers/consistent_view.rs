@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use crate::{BlockNumReader, DatabaseProviderFactory, HeaderProvider};
 use alloy_primitives::B256;
 use reth_storage_api::StateCommitmentProvider;
@@ -39,7 +42,9 @@ where
     pub fn new_with_latest_tip(provider: Factory) -> ProviderResult<Self> {
         let provider_ro = provider.database_provider_ro()?;
         let last_num = provider_ro.last_block_number()?;
-        let tip = provider_ro.sealed_header(last_num)?.map(|h| (h.hash(), last_num));
+        let tip = provider_ro
+            .sealed_header(last_num)?
+            .map(|h| (h.hash(), last_num));
         Ok(Self::new(provider, tip))
     }
 
@@ -70,8 +75,11 @@ where
         // To ensure this doesn't happen, we just have to make sure that we fetch from the same
         // data source that we used during initialization. In this case, that is static files
         if let Some((hash, number)) = self.tip {
-            if provider_ro.sealed_header(number)?.is_none_or(|header| header.hash() != hash) {
-                return Err(ConsistentViewError::Reorged { block: hash }.into())
+            if provider_ro
+                .sealed_header(number)?
+                .is_none_or(|header| header.hash() != hash)
+            {
+                return Err(ConsistentViewError::Reorged { block: hash }.into());
             }
         }
 
@@ -109,7 +117,9 @@ mod tests {
 
         // insert the block
         let provider_rw = provider_factory.provider_rw().unwrap();
-        provider_rw.insert_block(genesis_block, StorageLocation::StaticFiles).unwrap();
+        provider_rw
+            .insert_block(genesis_block, StorageLocation::StaticFiles)
+            .unwrap();
         provider_rw.commit().unwrap();
 
         // create a consistent view provider and check that a ro provider can be made
@@ -127,7 +137,9 @@ mod tests {
 
         // insert the block
         let provider_rw = provider_factory.provider_rw().unwrap();
-        provider_rw.insert_block(recovered_block, StorageLocation::StaticFiles).unwrap();
+        provider_rw
+            .insert_block(recovered_block, StorageLocation::StaticFiles)
+            .unwrap();
         provider_rw.commit().unwrap();
 
         // ensure successful creation of a read-only provider, based on this new db state.
@@ -142,7 +154,9 @@ mod tests {
 
         // insert the block
         let provider_rw = provider_factory.provider_rw().unwrap();
-        provider_rw.insert_block(recovered_block, StorageLocation::StaticFiles).unwrap();
+        provider_rw
+            .insert_block(recovered_block, StorageLocation::StaticFiles)
+            .unwrap();
         provider_rw.commit().unwrap();
 
         // check that creation of a read-only provider still works
@@ -161,7 +175,9 @@ mod tests {
 
         // insert the block
         let provider_rw = provider_factory.provider_rw().unwrap();
-        provider_rw.insert_block(genesis_block, StorageLocation::Both).unwrap();
+        provider_rw
+            .insert_block(genesis_block, StorageLocation::Both)
+            .unwrap();
         provider_rw.0.static_file_provider().commit().unwrap();
         provider_rw.commit().unwrap();
 
@@ -180,7 +196,9 @@ mod tests {
 
         // insert the block
         let provider_rw = provider_factory.provider_rw().unwrap();
-        provider_rw.insert_block(recovered_block, StorageLocation::Both).unwrap();
+        provider_rw
+            .insert_block(recovered_block, StorageLocation::Both)
+            .unwrap();
         provider_rw.0.static_file_provider().commit().unwrap();
         provider_rw.commit().unwrap();
 
@@ -193,9 +211,15 @@ mod tests {
 
         // remove the block above the genesis block
         let provider_rw = provider_factory.provider_rw().unwrap();
-        provider_rw.remove_blocks_above(0, StorageLocation::Both).unwrap();
+        provider_rw
+            .remove_blocks_above(0, StorageLocation::Both)
+            .unwrap();
         let sf_provider = provider_rw.0.static_file_provider();
-        sf_provider.get_writer(1, StaticFileSegment::Headers).unwrap().prune_headers(1).unwrap();
+        sf_provider
+            .get_writer(1, StaticFileSegment::Headers)
+            .unwrap()
+            .prune_headers(1)
+            .unwrap();
         sf_provider.commit().unwrap();
         provider_rw.commit().unwrap();
 
@@ -205,7 +229,12 @@ mod tests {
             panic!("expected reorged consistent view error, got success");
         };
         let unboxed = *boxed_consistent_view_err;
-        assert_eq!(unboxed, ConsistentViewError::Reorged { block: initial_tip_hash });
+        assert_eq!(
+            unboxed,
+            ConsistentViewError::Reorged {
+                block: initial_tip_hash
+            }
+        );
 
         // generate a block that extends the genesis with a different hash
         let mut block = Block::default();
@@ -218,7 +247,9 @@ mod tests {
 
         // reinsert the block at the same height, but with a different hash
         let provider_rw = provider_factory.provider_rw().unwrap();
-        provider_rw.insert_block(recovered_block, StorageLocation::Both).unwrap();
+        provider_rw
+            .insert_block(recovered_block, StorageLocation::Both)
+            .unwrap();
         provider_rw.0.static_file_provider().commit().unwrap();
         provider_rw.commit().unwrap();
 
@@ -228,6 +259,11 @@ mod tests {
             panic!("expected reorged consistent view error, got success");
         };
         let unboxed = *boxed_consistent_view_err;
-        assert_eq!(unboxed, ConsistentViewError::Reorged { block: initial_tip_hash });
+        assert_eq!(
+            unboxed,
+            ConsistentViewError::Reorged {
+                block: initial_tip_hash
+            }
+        );
     }
 }

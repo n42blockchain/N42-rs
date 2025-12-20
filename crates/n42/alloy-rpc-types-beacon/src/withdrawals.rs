@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use alloy_eips::eip4895::Withdrawal;
 use alloy_primitives::Address;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};

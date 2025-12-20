@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! A client implementation that can interact with the network and download data.
 
 use crate::{fetch::DownloadRequest, flattened_response::FlattenedResponse};

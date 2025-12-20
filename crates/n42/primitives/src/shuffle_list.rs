@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use crate::Hash256;
 use ethereum_hashing::hash_fixed;
 use std::mem;

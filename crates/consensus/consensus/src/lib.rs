@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! Consensus protocol functions
 
 #![doc(
@@ -11,10 +14,9 @@
 
 extern crate alloc;
 
-use std::sync::Arc;
 use alloc::{fmt::Debug, string::String, vec::Vec};
 use alloy_consensus::Header;
-use alloy_primitives::{BlockHash, BlockNumber, Bloom, B256, U256, Address};
+use alloy_primitives::{Address, BlockHash, BlockNumber, Bloom, B256, U256};
 use reth_execution_types::BlockExecutionResult;
 use reth_primitives_traits::{
     constants::{MAXIMUM_GAS_LIMIT_BLOCK, MINIMUM_GAS_LIMIT},
@@ -22,12 +24,13 @@ use reth_primitives_traits::{
     Block, GotExpected, GotExpectedBoxed, NodePrimitives, RecoveredBlock, SealedBlock,
     SealedHeader,
 };
+use std::sync::Arc;
 
-use n42_primitives::{Snapshot};
+use n42_primitives::Snapshot;
 use reth_revm::cached::CachedReads;
 use std::collections::HashMap;
 use std::time::Duration;
- 
+
 /// A consensus implementation that does nothing.
 pub mod noop;
 
@@ -77,31 +80,20 @@ pub trait Consensus<B: Block>: HeaderValidator<B::Header> {
     fn validate_block_pre_execution(&self, block: &SealedBlock<B>) -> Result<(), Self::Error>;
 
     /// for N42
-    fn prepare(
-        &self,
-        parent_header: &SealedHeader,
-    )-> Result<Header, ConsensusError> {
+    fn prepare(&self, parent_header: &SealedHeader) -> Result<Header, ConsensusError> {
         Ok(Header::default())
     }
 
     /// for N42
-    fn seal(
-        &self,
-        header: &mut Header,
-    ) -> Result<(), ConsensusError> {
+    fn seal(&self, header: &mut Header) -> Result<(), ConsensusError> {
         Ok(())
     }
 
-    fn set_eth_signer_by_key(
-        &self,
-        eth_signer_key: Option<String>,
-    ) -> Result<(), ConsensusError> {
+    fn set_eth_signer_by_key(&self, eth_signer_key: Option<String>) -> Result<(), ConsensusError> {
         Ok(())
     }
 
-    fn get_eth_signer_address(
-        &self,
-    ) -> Result<Option<Address>, ConsensusError> {
+    fn get_eth_signer_address(&self) -> Result<Option<Address>, ConsensusError> {
         Ok(Some(Address::ZERO))
     }
 
@@ -114,48 +106,31 @@ pub trait Consensus<B: Block>: HeaderValidator<B::Header> {
         Ok(Snapshot::default())
     }
 
-    fn propose(
-        &self,
-        address: Address,
-        auth: bool,
-    ) -> Result<(), ConsensusError> {
+    fn propose(&self, address: Address, auth: bool) -> Result<(), ConsensusError> {
         Ok(())
     }
 
-    fn discard(
-        &self,
-        address: Address,
-    ) -> Result<(), ConsensusError> {
+    fn discard(&self, address: Address) -> Result<(), ConsensusError> {
         Ok(())
     }
 
-    fn proposals(
-        &self,
-    ) -> Result<HashMap<Address, bool>, ConsensusError> {
+    fn proposals(&self) -> Result<HashMap<Address, bool>, ConsensusError> {
         Ok(HashMap::new())
     }
 
-    fn total_difficulty(
-        &self,
-        hash: B256,
-    ) -> U256 {
+    fn total_difficulty(&self, hash: B256) -> U256 {
         U256::from(0)
     }
 
-    fn wiggle(
-        &self,
-        parent_number: u64,
-        parent_hash: BlockHash,
-        difficulty: U256,
-    ) -> Duration {
+    fn wiggle(&self, parent_number: u64, parent_hash: BlockHash, difficulty: U256) -> Duration {
         Duration::from_secs(0)
     }
 
     fn set_cached_reads(
         &self,
         block_hash: BlockHash,
-        cached_reads: CachedReads
-        ) -> Result<(), ConsensusError> {
+        cached_reads: CachedReads,
+    ) -> Result<(), ConsensusError> {
         Ok(())
     }
 
@@ -165,7 +140,6 @@ pub trait Consensus<B: Block>: HeaderValidator<B::Header> {
     ) -> Result<Option<CachedReads>, ConsensusError> {
         Ok(None)
     }
-
 }
 
 /// HeaderValidator is a protocol that validates headers and their relationships.
@@ -210,7 +184,8 @@ pub trait HeaderValidator<H = Header>: Debug + Send + Sync {
                 .map_err(|e| HeaderConsensusError(e, initial_header.clone()))?;
             let mut parent = initial_header;
             for child in remaining_headers {
-                self.validate_header(child).map_err(|e| HeaderConsensusError(e, child.clone()))?;
+                self.validate_header(child)
+                    .map_err(|e| HeaderConsensusError(e, child.clone()))?;
                 self.validate_header_against_parent(child, parent)
                     .map_err(|e| HeaderConsensusError(e, child.clone()))?;
                 parent = child;
@@ -504,68 +479,36 @@ pub enum ConsensusError {
         timestamp: u64,
     },
     // for N42
-    #[error(
-        "unknown block"
-    )]
+    #[error("unknown block")]
     UnknownBlock,
-    #[error(
-        "beneficiary in checkpoint block non-zero"
-    )]
+    #[error("beneficiary in checkpoint block non-zero")]
     InvalidCheckpointBeneficiary,
-    #[error(
-        "vote nonce not 0x00..0 or 0xff..f"
-    )]
+    #[error("vote nonce not 0x00..0 or 0xff..f")]
     InvalidVote,
-    #[error(
-        "vote nonce in checkpoint block non-zero"
-    )]
+    #[error("vote nonce in checkpoint block non-zero")]
     InvalidCheckpointVote,
-    #[error(
-        "extra-data 32 byte vanity prefix missing"
-    )]
+    #[error("extra-data 32 byte vanity prefix missing")]
     MissingVanity,
-    #[error(
-        "extra-data 65 byte signature suffix missing"
-    )]
+    #[error("extra-data 65 byte signature suffix missing")]
     MissingSignature,
-    #[error(
-        "non-checkpoint block contains extra signer list"
-    )]
+    #[error("non-checkpoint block contains extra signer list")]
     ErrExtraSigners,
-    #[error(
-        "invalid signer list on checkpoint block"
-    )]
+    #[error("invalid signer list on checkpoint block")]
     InvalidCheckpointSigners,
-    #[error(
-        "invalid difficulty"
-    )]
+    #[error("invalid difficulty")]
     InvalidDifficulty,
-    #[error(
-        "unauthorized signer"
-    )]
+    #[error("unauthorized signer")]
     UnauthorizedSigner,
-    #[error(
-        "recently signed"
-    )]
+    #[error("recently signed")]
     RecentlySigned,
-    #[error(
-        "sign header err"
-    )]
+    #[error("sign header err")]
     SignHeaderError,
-    #[error(
-        "save snapshot err"
-    )]
+    #[error("save snapshot err")]
     SaveSnapshotError,
-    #[error(
-        "no signer set"
-    )]
+    #[error("no signer set")]
     NoSignerSet,
-    #[error(
-        "apos error detail {detail}"
-    )]
-    AposErrorDetail {
-        detail: String,
-    },
+    #[error("apos error detail {detail}")]
+    AposErrorDetail { detail: String },
     /// Other, likely an injected L2 error.
     #[error("{0}")]
     Other(String),

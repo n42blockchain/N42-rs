@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use alloy_primitives::{Address, B256, U256};
 use revm::{bytecode::Bytecode, state::AccountInfo, Database};
 

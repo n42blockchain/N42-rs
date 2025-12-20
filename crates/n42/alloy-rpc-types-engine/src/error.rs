@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! Error variants when validating an execution payload.
 
 use alloy_primitives::{Bytes, B256, U256};

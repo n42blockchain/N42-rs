@@ -1,9 +1,16 @@
-use std::{collections::HashMap, marker::PhantomData};
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use std::collections::HashSet;
+use std::{collections::HashMap, marker::PhantomData};
 
 use tree_hash::Hash256;
 
-use crate::{error::Error, utils::{tree_height, zero_tree_root}, Value};
+use crate::{
+    Value,
+    error::Error,
+    utils::{tree_height, zero_tree_root},
+};
 
 use typenum::Unsigned;
 
@@ -14,10 +21,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Tree<T: Value> {
     Leaf(T),
-    Node {
-        left: Hash256,
-        right: Hash256,
-    },
+    Node { left: Hash256, right: Hash256 },
     Zero(usize),
 }
 
@@ -62,11 +66,7 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
     }
 
     /// Convenience wrapper for `diff_restore` with an empty memory map.
-    pub fn restore<F>(
-        root: Hash256,
-        vec_len: u64,
-        db_get: F,
-    ) -> Result<Self, Error>
+    pub fn restore<F>(root: Hash256, vec_len: u64, db_get: F) -> Result<Self, Error>
     where
         F: Fn(&Hash256) -> Option<Tree<T>>,
     {
@@ -131,7 +131,9 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
                         None => {
                             // Implicit zero node handling
                             if current_hash == zero_tree_root(current_height) {
-                                if current_height == 0 && default_val.tree_hash_root() == zero_tree_root(0) {
+                                if current_height == 0
+                                    && default_val.tree_hash_root() == zero_tree_root(0)
+                                {
                                     Tree::Leaf(T::default())
                                 } else {
                                     Tree::Zero(current_height)
@@ -169,7 +171,7 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
                 }
                 Tree::Zero(h) => {
                     if *h != current_height {
-                         return Err(Error::InconsistentTreeZeroHeightMismatch {
+                        return Err(Error::InconsistentTreeZeroHeightMismatch {
                             expected: current_height,
                             found: *h,
                             hash: current_hash,
@@ -188,7 +190,6 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
             _phantom: PhantomData,
         })
     }
-
 
     pub fn save<F, E>(&self, mut db_put: F) -> Result<(), E>
     where
@@ -310,7 +311,11 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
                     }
 
                     // If it's None and NOT a zero root, the tree is corrupted.
-                    panic!("Inconsistent tree: missing node for hash {:?} at height {}", current_hash, h + 1);
+                    panic!(
+                        "Inconsistent tree: missing node for hash {:?} at height {}",
+                        current_hash,
+                        h + 1
+                    );
                 }
                 Some(Tree::Leaf(_)) => {
                     panic!("Inconsistent tree: found Leaf node at height {}", h + 1);
@@ -333,7 +338,10 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
                     }
                     None
                 } else {
-                    panic!("Inconsistent tree: missing node for leaf hash {:?}", current_hash);
+                    panic!(
+                        "Inconsistent tree: missing node for leaf hash {:?}",
+                        current_hash
+                    );
                 }
             }
             Some(Tree::Node { .. }) | Some(Tree::Zero(_)) => {
@@ -355,7 +363,8 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
     }
 
     pub fn push(&mut self, value: T) -> Result<(), Error>
-    where T: Clone
+    where
+        T: Clone,
     {
         let index = self.len();
         if index >= N::to_usize() {
@@ -395,9 +404,9 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
         // If Hash(Default) != Hash(Zero) (e.g. complex struct):
         //    We MUST insert Zero(0) (None) to ensure the padding hash is correct.
         let old_value_opt = if default_hash == zero_hash {
-             self.update_leaf(index, Some(default_val))
+            self.update_leaf(index, Some(default_val))
         } else {
-             self.update_leaf(index, None)
+            self.update_leaf(index, None)
         };
 
         Some(old_value_opt.unwrap_or_default())
@@ -415,7 +424,8 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
     ///   but the leaf being popped was already a `Zero` node (an empty slot).
     ///   This is the "zero case" – `pop()` would have returned `Some(T::default())`.
     pub fn try_pop(&mut self) -> Result<Option<T>, Error>
-    where T: Clone
+    where
+        T: Clone,
     {
         if self.is_empty() {
             return Ok(None);
@@ -428,7 +438,9 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
 
         match old_value_opt {
             Some(value) => Ok(Some(value)),
-            None => Err(Error::PoppedEmptySlot { index: index as u64 }),
+            None => Err(Error::PoppedEmptySlot {
+                index: index as u64,
+            }),
         }
     }
 
@@ -437,7 +449,8 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
     /// It has NO bounds checks and will panic on internal tree corruption.
     /// It returns the *old* value that was at that leaf.
     fn update_leaf(&mut self, index: usize, new_value: Option<T>) -> Option<T>
-    where T: Clone
+    where
+        T: Clone,
     {
         let height = self.height;
         let mut siblings: Vec<Hash256> = Vec::with_capacity(height);
@@ -447,12 +460,16 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
             let (left_hash, right_hash) = match self.kv.get(&current_hash) {
                 Some(Tree::Node { left, right }) => (*left, *right),
                 Some(Tree::Zero(h_zero)) => {
-                    if *h_zero != h { panic!("Inconsistent tree height"); }
+                    if *h_zero != h {
+                        panic!("Inconsistent tree height");
+                    }
                     (zero_tree_root(h - 1), zero_tree_root(h - 1))
                 }
                 Some(Tree::Leaf(_)) => panic!("Found Leaf at height {}", h),
                 None => {
-                    if current_hash != zero_tree_root(h) { panic!("Missing node"); }
+                    if current_hash != zero_tree_root(h) {
+                        panic!("Missing node");
+                    }
                     (zero_tree_root(h - 1), zero_tree_root(h - 1))
                 }
             };
@@ -510,14 +527,19 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
             if new_node_hash == zero_tree_root(current_height) {
                 self.kv.insert(new_node_hash, Tree::Zero(current_height));
             } else {
-                self.kv.insert(new_node_hash, Tree::Node { left: left_hash, right: right_hash });
+                self.kv.insert(
+                    new_node_hash,
+                    Tree::Node {
+                        left: left_hash,
+                        right: right_hash,
+                    },
+                );
             }
         }
 
         self.root = new_node_hash;
         old_value
     }
-
 
     pub fn clear(&mut self) {
         self.vec_len = 0;
@@ -536,7 +558,10 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
     }
 
     pub fn iter(&self) -> VecTreeIter<T, N> {
-        VecTreeIter { tree: self, index: 0 }
+        VecTreeIter {
+            tree: self,
+            index: 0,
+        }
     }
 }
 
@@ -565,7 +590,7 @@ mod tests {
     use super::*;
     use crate::utils::tree_height;
     use tree_hash::TreeHash;
-    use typenum::{U1, U16, U8}; // Import some type numbers
+    use typenum::{U1, U8, U16}; // Import some type numbers
 
     // Note: `u64` implements `Value` via the blanket impl in `lib.rs`
     // because `ssz` provides `Encode`, `Decode`, and `TreeHash` for `u64`.
@@ -999,9 +1024,15 @@ mod tests {
         tree.push(0u64).unwrap(); // Leaf(0)
 
         let mut db = HashMap::new();
-        tree.save(|h, n| { db.insert(*h, n.clone()); Ok::<(),()>(()) }).unwrap();
+        tree.save(|h, n| {
+            db.insert(*h, n.clone());
+            Ok::<(), ()>(())
+        })
+        .unwrap();
 
-        let restored = VecTree::<u64, U8>::restore(tree.root, tree.len() as u64, |h| db.get(h).cloned()).unwrap();
+        let restored =
+            VecTree::<u64, U8>::restore(tree.root, tree.len() as u64, |h| db.get(h).cloned())
+                .unwrap();
         assert_eq!(restored.get(0), Some(&0u64));
     }
 
@@ -1057,17 +1088,17 @@ mod tests {
         let mut db: HashMap<Hash256, Tree<u64>> = HashMap::new();
 
         // Save using the new save method
-        original.save(|hash, node| {
-            db.insert(*hash, node.clone());
-            Ok::<(), ()>(())
-        }).unwrap();
+        original
+            .save(|hash, node| {
+                db.insert(*hash, node.clone());
+                Ok::<(), ()>(())
+            })
+            .unwrap();
 
         // Restore using the restore method
-        let restored = VecTree::<u64, U8>::restore(
-            original.root,
-            original.vec_len,
-            |h| db.get(h).cloned()
-        ).unwrap();
+        let restored =
+            VecTree::<u64, U8>::restore(original.root, original.vec_len, |h| db.get(h).cloned())
+                .unwrap();
 
         assert_eq!(original.root, restored.root);
         assert_eq!(original.len(), restored.len());
@@ -1076,7 +1107,7 @@ mod tests {
         assert_eq!(original.get(2), restored.get(2)); // Check zero handling
     }
 
-        #[test]
+    #[test]
     fn test_diff_save_full_overlap() {
         // Scenario: Tree is fully persisted. diff_save should write nothing.
         let mut tree = VecTree::<u64, U8>::try_new(0).unwrap();
@@ -1085,16 +1116,27 @@ mod tests {
 
         let mut db = HashMap::new();
         // Initial full save
-        tree.save(|h, n| { db.insert(*h, n.clone()); Ok::<(),()>(()) }).unwrap();
+        tree.save(|h, n| {
+            db.insert(*h, n.clone());
+            Ok::<(), ()>(())
+        })
+        .unwrap();
 
         // Count writes for the second save
         let mut write_count = 0;
         tree.diff_save(
-            |_h, _n| { write_count += 1; Ok::<(),()>(()) },
-            |h| db.contains_key(h)
-        ).unwrap();
+            |_h, _n| {
+                write_count += 1;
+                Ok::<(), ()>(())
+            },
+            |h| db.contains_key(h),
+        )
+        .unwrap();
 
-        assert_eq!(write_count, 0, "diff_save should write nothing if DB contains all nodes");
+        assert_eq!(
+            write_count, 0,
+            "diff_save should write nothing if DB contains all nodes"
+        );
     }
 
     #[test]
@@ -1105,9 +1147,13 @@ mod tests {
 
         let mut write_count = 0;
         tree.diff_save(
-            |_h, _n| { write_count += 1; Ok::<(),()>(()) },
-            |_h| false // DB contains nothing
-        ).unwrap();
+            |_h, _n| {
+                write_count += 1;
+                Ok::<(), ()>(())
+            },
+            |_h| false, // DB contains nothing
+        )
+        .unwrap();
 
         // Should write Leaf(10) and path to root
         assert!(write_count > 0);
@@ -1123,7 +1169,11 @@ mod tests {
         tree.push(40).unwrap();
 
         let mut db_base = HashMap::new();
-        tree.save(|h, n| { db_base.insert(*h, n.clone()); Ok::<(),()>(()) }).unwrap();
+        tree.save(|h, n| {
+            db_base.insert(*h, n.clone());
+            Ok::<(), ()>(())
+        })
+        .unwrap();
 
         // 2. Modify Tree: Update index 2 (30 -> 300)
         tree.set(2, 300).unwrap();
@@ -1135,25 +1185,28 @@ mod tests {
             |h, n| {
                 db_patch.insert(*h, n.clone());
                 writes += 1;
-                Ok::<(),()>(())
+                Ok::<(), ()>(())
             },
-            |h| db_base.contains_key(h)
-        ).unwrap();
+            |h| db_base.contains_key(h),
+        )
+        .unwrap();
 
         // 4. Verify Patch
         assert!(writes > 0);
         let leaf_10_hash = 10u64.tree_hash_root();
-        assert!(!db_patch.contains_key(&leaf_10_hash), "Unmodified leaf should not be in patch");
+        assert!(
+            !db_patch.contains_key(&leaf_10_hash),
+            "Unmodified leaf should not be in patch"
+        );
 
         // 5. Diff Restore
         let existing_kv = db_base.clone();
 
-        let restored = VecTree::<u64, U8>::diff_restore(
-            tree.root,
-            tree.vec_len,
-            &existing_kv,
-            |h| db_patch.get(h).cloned()
-        ).unwrap();
+        let restored =
+            VecTree::<u64, U8>::diff_restore(tree.root, tree.vec_len, &existing_kv, |h| {
+                db_patch.get(h).cloned()
+            })
+            .unwrap();
 
         assert_eq!(restored.get(0), Some(&10));
         assert_eq!(restored.get(2), Some(&300));

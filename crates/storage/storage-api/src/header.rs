@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use alloc::vec::Vec;
 use alloy_eips::BlockHashOrNumber;
 use alloy_primitives::{BlockHash, BlockNumber, U256};
@@ -27,7 +30,9 @@ pub trait HeaderProvider: Send + Sync {
         &self,
         block_hash: BlockHash,
     ) -> ProviderResult<Option<SealedHeader<Self::Header>>> {
-        Ok(self.header(&block_hash)?.map(|header| SealedHeader::new(header, block_hash)))
+        Ok(self
+            .header(&block_hash)?
+            .map(|header| SealedHeader::new(header, block_hash)))
     }
 
     /// Get header by block number

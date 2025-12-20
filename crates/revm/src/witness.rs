@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use alloc::vec::Vec;
 use alloy_primitives::{keccak256, Bytes, B256};
 use reth_trie::{HashedPostState, HashedStorage};

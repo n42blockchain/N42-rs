@@ -1,11 +1,13 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! Engine node related functionality.
 
-use reth_consensus::Consensus;
 use alloy_consensus::BlockHeader;
 use futures::{future::Either, stream, stream_select, StreamExt};
 use n42_engine_primitives::N42PayloadAttributesBuilder;
-use reth_provider::BlockReaderIdExt;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
+use reth_consensus::Consensus;
 use reth_db_api::{database_metrics::DatabaseMetrics, Database};
 use reth_engine_local::{LocalEngineService, LocalPayloadAttributesBuilder};
 use reth_engine_service::service::{ChainEvent, EngineService};
@@ -28,6 +30,7 @@ use reth_node_core::{
 };
 use reth_node_events::{cl::ConsensusLayerHealthEvents, node};
 use reth_provider::providers::{BlockchainProvider, NodeTypesForProvider};
+use reth_provider::BlockReaderIdExt;
 use reth_tasks::TaskExecutor;
 use reth_tokio_util::EventSender;
 use reth_tracing::tracing::{debug, error, info};
@@ -62,7 +65,10 @@ impl EngineNodeLauncher {
         data_dir: ChainPath<DataDirPath>,
         engine_tree_config: TreeConfig,
     ) -> Self {
-        Self { ctx: LaunchContext::new(task_executor, data_dir), engine_tree_config }
+        Self {
+            ctx: LaunchContext::new(task_executor, data_dir),
+            engine_tree_config,
+        }
     }
 }
 
@@ -88,14 +94,26 @@ where
         self,
         target: NodeBuilderWithComponents<T, CB, AO>,
     ) -> eyre::Result<Self::Node> {
-        let Self { ctx, engine_tree_config } = self;
+        let Self {
+            ctx,
+            engine_tree_config,
+        } = self;
         let NodeBuilderWithComponents {
             adapter: NodeTypesAdapter { database },
             components_builder,
-            add_ons: AddOns { hooks, exexs: installed_exex, add_ons },
+            add_ons:
+                AddOns {
+                    hooks,
+                    exexs: installed_exex,
+                    add_ons,
+                },
             config,
         } = target;
-        let NodeHooks { on_component_initialized, on_node_started, .. } = hooks;
+        let NodeHooks {
+            on_component_initialized,
+            on_node_started,
+            ..
+        } = hooks;
 
         // setup the launch context
         let ctx = ctx
@@ -119,7 +137,8 @@ where
             })
             .with_genesis()?
             .inspect(|this: &LaunchContextWith<Attached<WithConfigs<Types::ChainSpec>, _>>| {
-                info!(target: "reth::cli", "\n{}", this.chain_spec().display_hardforks());
+                info!(target: "reth::cli", "
+{}", this.chain_spec().display_hardforks());
             })
             .with_metrics_task()
             // passing FullNodeTypes as type parameter here so that we can build
@@ -154,8 +173,9 @@ where
         let consensus = Arc::new(ctx.components().consensus().clone());
 
         // Configure the pipeline
-        let pipeline_exex_handle =
-            exex_manager_handle.clone().unwrap_or_else(ExExManagerHandle::empty);
+        let pipeline_exex_handle = exex_manager_handle
+            .clone()
+            .unwrap_or_else(ExExManagerHandle::empty);
         let pipeline = build_networked_pipeline(
             &ctx.toml_config().stages,
             network_client.clone(),
@@ -282,8 +302,12 @@ where
             ),
         );
 
-        let RpcHandle { rpc_server_handles, rpc_registry, engine_events, beacon_engine_handle } =
-            add_ons.launch_add_ons(add_ons_ctx).await?;
+        let RpcHandle {
+            rpc_server_handles,
+            rpc_registry,
+            engine_events,
+            beacon_engine_handle,
+        } = add_ons.launch_add_ons(add_ons_ctx).await?;
 
         // Run consensus engine to completion
         let initial_target = ctx.initial_backfill_target()?;

@@ -1,4 +1,7 @@
-use alloy_primitives::{BlockHash};
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
+use alloy_primitives::BlockHash;
 use n42_primitives::{BeaconBlock, BeaconState};
 
 #[derive(Debug, Clone, Hash, Default)]
@@ -19,30 +22,47 @@ impl Storage {
         todo!()
     }
 
-    pub fn save_beacon_block_by_hash(&self, block_hash: BlockHash, beacon_block: BeaconBlock) -> eyre::Result<()> {
+    pub fn save_beacon_block_by_hash(
+        &self,
+        block_hash: BlockHash,
+        beacon_block: BeaconBlock,
+    ) -> eyre::Result<()> {
         todo!()
     }
 
-    pub fn get_beacon_block_hash_by_eth1_hash(&self, block_hash: BlockHash) -> eyre::Result<BlockHash> {
+    pub fn get_beacon_block_hash_by_eth1_hash(
+        &self,
+        block_hash: BlockHash,
+    ) -> eyre::Result<BlockHash> {
         if block_hash == self.genesis_hash {
-            return Ok(self.genesis_hash)
+            return Ok(self.genesis_hash);
         }
         todo!()
     }
 
-    pub fn save_beacon_block_hash_by_eth1_hash(&self, eth1_block_hash: BlockHash, beacon_block_hash: BlockHash) -> eyre::Result<()> {
+    pub fn save_beacon_block_hash_by_eth1_hash(
+        &self,
+        eth1_block_hash: BlockHash,
+        beacon_block_hash: BlockHash,
+    ) -> eyre::Result<()> {
         todo!()
     }
 
-    pub fn get_beacon_state_by_beacon_hash(&self, block_hash: BlockHash) -> eyre::Result<BeaconState> {
+    pub fn get_beacon_state_by_beacon_hash(
+        &self,
+        block_hash: BlockHash,
+    ) -> eyre::Result<BeaconState> {
         if block_hash == self.genesis_hash {
-            return Ok(Default::default())
+            return Ok(Default::default());
         }
         todo!()
     }
 
-    pub fn save_beacon_state_by_beacon_hash(&self, block_hash: BlockHash, beacon_state: BeaconState) -> eyre::Result<()> {
+    pub fn save_beacon_state_by_beacon_hash(
+        &self,
+        block_hash: BlockHash,
+        beacon_state: BeaconState,
+    ) -> eyre::Result<()> {
         todo!()
     }
-
 }

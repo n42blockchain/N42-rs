@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use crate::{ChainSpec, DepositContract};
 use alloc::{boxed::Box, vec::Vec};
 use alloy_chains::Chain;
@@ -6,7 +9,7 @@ use alloy_eips::{eip1559::BaseFeeParams, eip7840::BlobParams};
 use alloy_genesis::Genesis;
 use alloy_primitives::{B256, U256};
 use core::fmt::{Debug, Display};
-use reth_ethereum_forks::{EthereumHardforks, beijing_fork, Hardfork};
+use reth_ethereum_forks::{beijing_fork, EthereumHardforks, Hardfork};
 use reth_network_peers::NodeRecord;
 
 /// Trait representing type configuring a chain spec.
@@ -70,7 +73,6 @@ pub trait EthChainSpec: Send + Sync + Unpin + Debug {
     fn is_n42_attestation_mandatory(&self, timestamp: u64) -> bool {
         false
     }
-
 }
 
 impl EthChainSpec for ChainSpec {
@@ -89,7 +91,10 @@ impl EthChainSpec for ChainSpec {
     }
 
     fn blob_params_at_timestamp(&self, timestamp: u64) -> Option<BlobParams> {
-        if let Some(blob_param) = self.blob_params.active_scheduled_params_at_timestamp(timestamp) {
+        if let Some(blob_param) = self
+            .blob_params
+            .active_scheduled_params_at_timestamp(timestamp)
+        {
             Some(*blob_param)
         } else if self.is_osaka_active_at_timestamp(timestamp) {
             Some(self.blob_params.osaka)
@@ -135,7 +140,8 @@ impl EthChainSpec for ChainSpec {
     }
 
     fn final_paris_total_difficulty(&self) -> Option<U256> {
-        self.paris_block_and_final_difficulty.map(|(_, final_difficulty)| final_difficulty)
+        self.paris_block_and_final_difficulty
+            .map(|(_, final_difficulty)| final_difficulty)
     }
 
     fn is_n42_attestation_mandatory(&self, timestamp: u64) -> bool {

@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use crate::{
     providers::{state::latest::LatestStateProvider, StaticFileProvider},
     to_range,
@@ -7,13 +10,15 @@ use crate::{
     PruneCheckpointReader, StageCheckpointReader, StateProviderBox, StaticFileProviderFactory,
     TransactionVariant, TransactionsProvider, WithdrawalsProvider,
 };
-use n42_primitives::{APosConfig, Snapshot, BeaconState, BeaconBlock,BeaconStateChangeset,BeaconBlockChangeset,BeaconBlockBody,VoluntaryExit,
-        Attestation,Deposit,DepositData, Validator, ValidatorBeforeTx, ValidatorChangeset,ValidatorRevert};
-use reth_storage_api::{SnapshotProvider, SnapshotProviderWriter};
 use alloy_consensus::transaction::TransactionMeta;
 use alloy_eips::{eip4895::Withdrawals, BlockHashOrNumber};
 use alloy_primitives::{Address, BlockHash, BlockNumber, TxHash, TxNumber, B256, U256};
 use core::fmt;
+use n42_primitives::{
+    APosConfig, Attestation, BeaconBlock, BeaconBlockBody, BeaconBlockChangeset, BeaconState,
+    BeaconStateChangeset, Deposit, DepositData, Snapshot, Validator, ValidatorBeforeTx,
+    ValidatorChangeset, ValidatorRevert, VoluntaryExit,
+};
 use reth_chainspec::ChainInfo;
 use reth_db::{init_db, mdbx::DatabaseArguments, DatabaseEnv};
 use reth_db_api::{database::Database, models::StoredBlockBodyIndices};
@@ -29,6 +34,7 @@ use reth_storage_api::{
     BlockBodyIndicesProvider, NodePrimitivesProvider, OmmersProvider, StateCommitmentProvider,
     TryIntoHistoricalStateProvider,
 };
+use reth_storage_api::{SnapshotProvider, SnapshotProviderWriter};
 use reth_storage_errors::provider::ProviderResult;
 use reth_trie::HashedPostState;
 use reth_trie_db::StateCommitment;
@@ -173,7 +179,9 @@ impl<N: ProviderNodeTypes> ProviderFactory<N> {
     #[track_caller]
     pub fn latest(&self) -> ProviderResult<StateProviderBox> {
         trace!(target: "providers::db", "Returning latest state provider");
-        Ok(Box::new(LatestStateProvider::new(self.database_provider_ro()?)))
+        Ok(Box::new(LatestStateProvider::new(
+            self.database_provider_ro()?,
+        )))
     }
 
     /// Storage provider for state at that given block
@@ -235,7 +243,8 @@ impl<N: ProviderNodeTypes> HeaderSyncGapProvider for ProviderFactory<N> {
         &self,
         highest_uninterrupted_block: BlockNumber,
     ) -> ProviderResult<SealedHeader<Self::Header>> {
-        self.provider()?.local_tip_header(highest_uninterrupted_block)
+        self.provider()?
+            .local_tip_header(highest_uninterrupted_block)
     }
 }
 
@@ -267,13 +276,14 @@ impl<N: ProviderNodeTypes> HeaderProvider for ProviderFactory<N> {
         &self,
         range: impl RangeBounds<BlockNumber>,
     ) -> ProviderResult<Vec<Self::Header>> {
-        self.static_file_provider.get_range_with_static_file_or_database(
-            StaticFileSegment::Headers,
-            to_range(range),
-            |static_file, range, _| static_file.headers_range(range),
-            |range, _| self.provider()?.headers_range(range),
-            |_| true,
-        )
+        self.static_file_provider
+            .get_range_with_static_file_or_database(
+                StaticFileSegment::Headers,
+                to_range(range),
+                |static_file, range, _| static_file.headers_range(range),
+                |range, _| self.provider()?.headers_range(range),
+                |_| true,
+            )
     }
 
     fn sealed_header(
@@ -300,13 +310,14 @@ impl<N: ProviderNodeTypes> HeaderProvider for ProviderFactory<N> {
         range: impl RangeBounds<BlockNumber>,
         predicate: impl FnMut(&SealedHeader<Self::Header>) -> bool,
     ) -> ProviderResult<Vec<SealedHeader<Self::Header>>> {
-        self.static_file_provider.get_range_with_static_file_or_database(
-            StaticFileSegment::Headers,
-            to_range(range),
-            |static_file, range, predicate| static_file.sealed_headers_while(range, predicate),
-            |range, predicate| self.provider()?.sealed_headers_while(range, predicate),
-            predicate,
-        )
+        self.static_file_provider
+            .get_range_with_static_file_or_database(
+                StaticFileSegment::Headers,
+                to_range(range),
+                |static_file, range, predicate| static_file.sealed_headers_while(range, predicate),
+                |range, predicate| self.provider()?.sealed_headers_while(range, predicate),
+                predicate,
+            )
     }
 }
 
@@ -325,13 +336,17 @@ impl<N: ProviderNodeTypes> BlockHashReader for ProviderFactory<N> {
         start: BlockNumber,
         end: BlockNumber,
     ) -> ProviderResult<Vec<B256>> {
-        self.static_file_provider.get_range_with_static_file_or_database(
-            StaticFileSegment::Headers,
-            start..end,
-            |static_file, range, _| static_file.canonical_hashes_range(range.start, range.end),
-            |range, _| self.provider()?.canonical_hashes_range(range.start, range.end),
-            |_| true,
-        )
+        self.static_file_provider
+            .get_range_with_static_file_or_database(
+                StaticFileSegment::Headers,
+                start..end,
+                |static_file, range, _| static_file.canonical_hashes_range(range.start, range.end),
+                |range, _| {
+                    self.provider()?
+                        .canonical_hashes_range(range.start, range.end)
+                },
+                |_| true,
+            )
     }
 }
 
@@ -395,7 +410,8 @@ impl<N: ProviderNodeTypes> BlockReader for ProviderFactory<N> {
         id: BlockHashOrNumber,
         transaction_kind: TransactionVariant,
     ) -> ProviderResult<Option<RecoveredBlock<Self::Block>>> {
-        self.provider()?.sealed_block_with_senders(id, transaction_kind)
+        self.provider()?
+            .sealed_block_with_senders(id, transaction_kind)
     }
 
     fn block_range(&self, range: RangeInclusive<BlockNumber>) -> ProviderResult<Vec<Self::Block>> {
@@ -519,13 +535,14 @@ impl<N: ProviderNodeTypes> ReceiptProvider for ProviderFactory<N> {
         &self,
         range: impl RangeBounds<TxNumber>,
     ) -> ProviderResult<Vec<Self::Receipt>> {
-        self.static_file_provider.get_range_with_static_file_or_database(
-            StaticFileSegment::Receipts,
-            to_range(range),
-            |static_file, range, _| static_file.receipts_by_tx_range(range),
-            |range, _| self.provider()?.receipts_by_tx_range(range),
-            |_| true,
-        )
+        self.static_file_provider
+            .get_range_with_static_file_or_database(
+                StaticFileSegment::Receipts,
+                to_range(range),
+                |static_file, range, _| static_file.receipts_by_tx_range(range),
+                |range, _| self.provider()?.receipts_by_tx_range(range),
+                |_| true,
+            )
     }
 }
 
@@ -562,17 +579,19 @@ impl<N: ProviderNodeTypes> BlockBodyIndicesProvider for ProviderFactory<N> {
         &self,
         range: RangeInclusive<BlockNumber>,
     ) -> ProviderResult<Vec<StoredBlockBodyIndices>> {
-        self.static_file_provider.get_range_with_static_file_or_database(
-            StaticFileSegment::BlockMeta,
-            *range.start()..*range.end() + 1,
-            |static_file, range, _| {
-                static_file.block_body_indices_range(range.start..=range.end.saturating_sub(1))
-            },
-            |range, _| {
-                self.provider()?.block_body_indices_range(range.start..=range.end.saturating_sub(1))
-            },
-            |_| true,
-        )
+        self.static_file_provider
+            .get_range_with_static_file_or_database(
+                StaticFileSegment::BlockMeta,
+                *range.start()..*range.end() + 1,
+                |static_file, range, _| {
+                    static_file.block_body_indices_range(range.start..=range.end.saturating_sub(1))
+                },
+                |range, _| {
+                    self.provider()?
+                        .block_body_indices_range(range.start..=range.end.saturating_sub(1))
+                },
+                |_| true,
+            )
     }
 }
 
@@ -623,7 +642,13 @@ where
     N: NodeTypesWithDB<DB: fmt::Debug, ChainSpec: fmt::Debug, Storage: fmt::Debug>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self { db, chain_spec, static_file_provider, prune_modes, storage } = self;
+        let Self {
+            db,
+            chain_spec,
+            static_file_provider,
+            prune_modes,
+            storage,
+        } = self;
         f.debug_struct("ProviderFactory")
             .field("db", &db)
             .field("chain_spec", &chain_spec)
@@ -657,36 +682,36 @@ mod tests {
     };
     use alloy_primitives::{TxNumber, B256, U256};
     use assert_matches::assert_matches;
+    use rand::rngs::StdRng;
+    use rand::Rng;
+    use rand::SeedableRng;
     use reth_chainspec::ChainSpecBuilder;
     use reth_db::{
         mdbx::DatabaseArguments,
         test_utils::{create_test_static_files_dir, ERROR_TEMPDIR},
     };
     use reth_db_api::tables;
+    use reth_db_api::transaction::DbTxMut;
     use reth_primitives_traits::SignerRecoverable;
     use reth_prune_types::{PruneMode, PruneModes};
-    use reth_storage_errors::provider::ProviderError;
-    use reth_testing_utils::generators::{self, random_block, random_header, BlockParams};
-    use std::{ops::RangeInclusive, sync::Arc};
-    use reth_db_api::transaction::DbTxMut;
-    use reth_storage_api::ValidatorChangeWriter;
-    use reth_storage_api::ValidatorReader;
-    use std::time::SystemTime;
-    use std::time::UNIX_EPOCH;
-    use std::collections::BTreeMap;
-    use rand::Rng;
-    use rand::rngs::StdRng;
-    use rand::SeedableRng;
     use reth_storage_api::BeaconReader;
     use reth_storage_api::BeaconWriter;
+    use reth_storage_api::ValidatorChangeWriter;
+    use reth_storage_api::ValidatorReader;
+    use reth_storage_errors::provider::ProviderError;
+    use reth_testing_utils::generators::{self, random_block, random_header, BlockParams};
+    use std::collections::BTreeMap;
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
+    use std::{ops::RangeInclusive, sync::Arc};
 
     #[test]
     fn test_beacon_traits_comprehensive() -> ProviderResult<()> {
         let factory = create_test_provider_factory();
-        
+
         // Prepare test data
         let mut rng = StdRng::seed_from_u64(42);
-        
+
         // Generate test block hashes
         let mut test_hashes = Vec::new();
         for _ in 0..5 {
@@ -694,7 +719,7 @@ mod tests {
             rng.fill(&mut bytes);
             test_hashes.push(B256::from_slice(&bytes));
         }
-        
+
         // Create test beacon states
         let beacon_state1 = BeaconState {
             slot: 100,
@@ -702,21 +727,21 @@ mod tests {
             validators: BTreeMap::new(),
             balances: BTreeMap::new(),
         };
-        
+
         let beacon_state2 = BeaconState {
             slot: 200,
             eth1_deposit_index: 20,
             validators: BTreeMap::new(),
             balances: BTreeMap::new(),
         };
-        
+
         let beacon_state3 = BeaconState {
             slot: 300,
             eth1_deposit_index: 30,
             validators: BTreeMap::new(),
             balances: BTreeMap::new(),
         };
-        
+
         // Create test beacon blocks
         let beacon_block1 = BeaconBlock {
             eth1_block_hash: test_hashes[0],
@@ -738,23 +763,23 @@ mod tests {
                 }],
             },
         };
-        
+
         let beacon_block2 = BeaconBlock {
             eth1_block_hash: test_hashes[1],
             state_root: test_hashes[2],
             body: BeaconBlockBody::default(),
         };
-        
+
         let beacon_block3 = BeaconBlock {
             eth1_block_hash: test_hashes[2],
             state_root: test_hashes[3],
             body: BeaconBlockBody::default(),
         };
-        
+
         // Phase 1: Test write_beaconstate function
         {
             let mut provider_rw = factory.provider_rw()?;
-            
+
             // Add multiple beacon states
             let changeset = BeaconStateChangeset {
                 beaconstates: vec![
@@ -762,37 +787,43 @@ mod tests {
                     (test_hashes[1], beacon_state2.clone()),
                 ],
             };
-            
+
             provider_rw.write_beaconstate(changeset)?;
             provider_rw.commit()?;
         }
-        
+
         // Phase 2: Test BeaconReader trait's get_beaconstate_by_blockhash function
         {
             let provider_ro = factory.provider()?;
-            
+
             // Test existing beacon states
             let result1 = provider_ro.get_beaconstate_by_blockhash(test_hashes[0])?;
             assert!(result1.is_some(), "beacon state 1 should exist");
             let retrieved_state1 = result1.unwrap();
             assert_eq!(beacon_state1.slot, retrieved_state1.slot);
-            assert_eq!(beacon_state1.eth1_deposit_index, retrieved_state1.eth1_deposit_index);
-            
+            assert_eq!(
+                beacon_state1.eth1_deposit_index,
+                retrieved_state1.eth1_deposit_index
+            );
+
             let result2 = provider_ro.get_beaconstate_by_blockhash(test_hashes[1])?;
             assert!(result2.is_some(), "beacon state 2 should exist");
             let retrieved_state2 = result2.unwrap();
             assert_eq!(beacon_state2.slot, retrieved_state2.slot);
-            assert_eq!(beacon_state2.eth1_deposit_index, retrieved_state2.eth1_deposit_index);
-            
+            assert_eq!(
+                beacon_state2.eth1_deposit_index,
+                retrieved_state2.eth1_deposit_index
+            );
+
             // Test non-existing beacon state
             let result3 = provider_ro.get_beaconstate_by_blockhash(test_hashes[2])?;
             assert!(result3.is_none(), "beacon state 3 should not exist");
         }
-        
+
         // Phase 3: Test write_beaconblock function
         {
             let mut provider_rw = factory.provider_rw()?;
-            
+
             // Add multiple beacon blocks
             let changeset = BeaconBlockChangeset {
                 beaconblocks: vec![
@@ -800,38 +831,47 @@ mod tests {
                     (test_hashes[1], beacon_block2.clone()),
                 ],
             };
-            
+
             provider_rw.write_beaconblock(changeset)?;
             provider_rw.commit()?;
         }
-        
+
         // Phase 4: Test BeaconReader trait's get_beaconblock_by_blockhash function
         {
             let provider_ro = factory.provider()?;
-            
+
             // Test existing beacon blocks
             let result1 = provider_ro.get_beaconblock_by_blockhash(test_hashes[0])?;
             assert!(result1.is_some(), "beacon block 1 should exist");
             let retrieved_block1 = result1.unwrap();
-            assert_eq!(beacon_block1.eth1_block_hash, retrieved_block1.eth1_block_hash);
+            assert_eq!(
+                beacon_block1.eth1_block_hash,
+                retrieved_block1.eth1_block_hash
+            );
             assert_eq!(beacon_block1.state_root, retrieved_block1.state_root);
-            assert_eq!(beacon_block1.body.deposits.len(), retrieved_block1.body.deposits.len());
-            
+            assert_eq!(
+                beacon_block1.body.deposits.len(),
+                retrieved_block1.body.deposits.len()
+            );
+
             let result2 = provider_ro.get_beaconblock_by_blockhash(test_hashes[1])?;
             assert!(result2.is_some(), "beacon block 2 should exist");
             let retrieved_block2 = result2.unwrap();
-            assert_eq!(beacon_block2.eth1_block_hash, retrieved_block2.eth1_block_hash);
+            assert_eq!(
+                beacon_block2.eth1_block_hash,
+                retrieved_block2.eth1_block_hash
+            );
             assert_eq!(beacon_block2.state_root, retrieved_block2.state_root);
-            
+
             // Test non-existing beacon block
             let result3 = provider_ro.get_beaconblock_by_blockhash(test_hashes[2])?;
             assert!(result3.is_none(), "beacon block 3 should not exist");
         }
-        
+
         // Phase 5: Add more data for removal and unwind testing
         {
             let mut provider_rw = factory.provider_rw()?;
-            
+
             // Add third beacon state and block
             let state_changeset = BeaconStateChangeset {
                 beaconstates: vec![(test_hashes[2], beacon_state3.clone())],
@@ -839,113 +879,137 @@ mod tests {
             let block_changeset = BeaconBlockChangeset {
                 beaconblocks: vec![(test_hashes[2], beacon_block3.clone())],
             };
-            
+
             provider_rw.write_beaconstate(state_changeset)?;
             provider_rw.write_beaconblock(block_changeset)?;
-            
+
             // Add beacon number to hash mappings for unwind testing
-            provider_rw.tx_ref().put::<tables::BeaconNum2Hash>(1, test_hashes[0])?;
-            provider_rw.tx_ref().put::<tables::BeaconNum2Hash>(2, test_hashes[1])?;
-            provider_rw.tx_ref().put::<tables::BeaconNum2Hash>(3, test_hashes[2])?;
-            
+            provider_rw
+                .tx_ref()
+                .put::<tables::BeaconNum2Hash>(1, test_hashes[0])?;
+            provider_rw
+                .tx_ref()
+                .put::<tables::BeaconNum2Hash>(2, test_hashes[1])?;
+            provider_rw
+                .tx_ref()
+                .put::<tables::BeaconNum2Hash>(3, test_hashes[2])?;
+
             provider_rw.commit()?;
         }
-        
+
         // Phase 6: Test remove_beaconstate function
         {
             let mut provider_rw = factory.provider_rw()?;
-            
+
             // Remove specific beacon state
             provider_rw.remove_beaconstate(vec![test_hashes[1]])?;
             provider_rw.commit()?;
-            
+
             // Verify removal
             let provider_ro = factory.provider()?;
             let result = provider_ro.get_beaconstate_by_blockhash(test_hashes[1])?;
             assert!(result.is_none(), "beacon state should be removed");
-            
+
             // Verify other states still exist
             let result1 = provider_ro.get_beaconstate_by_blockhash(test_hashes[0])?;
             assert!(result1.is_some(), "beacon state 1 should still exist");
             let result3 = provider_ro.get_beaconstate_by_blockhash(test_hashes[2])?;
             assert!(result3.is_some(), "beacon state 3 should still exist");
         }
-        
+
         // Phase 7: Test remove_beaconblock function
         {
             let mut provider_rw = factory.provider_rw()?;
-            
+
             // Remove specific beacon block
             provider_rw.remove_beaconblock(vec![test_hashes[1]])?;
             provider_rw.commit()?;
-            
+
             // Verify removal
             let provider_ro = factory.provider()?;
             let result = provider_ro.get_beaconblock_by_blockhash(test_hashes[1])?;
             assert!(result.is_none(), "beacon block should be removed");
-            
+
             // Verify other blocks still exist
             let result1 = provider_ro.get_beaconblock_by_blockhash(test_hashes[0])?;
             assert!(result1.is_some(), "beacon block 1 should still exist");
             let result3 = provider_ro.get_beaconblock_by_blockhash(test_hashes[2])?;
             assert!(result3.is_some(), "beacon block 3 should still exist");
         }
-        
+
         // Phase 8: Test unwind_beacon function
         {
             let mut provider_rw = factory.provider_rw()?;
-            
+
             // Unwind blocks 2 and 3 (should remove corresponding beacon data)
             provider_rw.unwind_beacon(2..=3)?;
             provider_rw.commit()?;
-            
+
             // Verify unwind results
             let provider_ro = factory.provider()?;
-            
+
             // Block 1 data should still exist
             let state_result1 = provider_ro.get_beaconstate_by_blockhash(test_hashes[0])?;
-            assert!(state_result1.is_some(), "beacon state 1 should still exist after unwind");
+            assert!(
+                state_result1.is_some(),
+                "beacon state 1 should still exist after unwind"
+            );
             let block_result1 = provider_ro.get_beaconblock_by_blockhash(test_hashes[0])?;
-            assert!(block_result1.is_some(), "beacon block 1 should still exist after unwind");
-            
+            assert!(
+                block_result1.is_some(),
+                "beacon block 1 should still exist after unwind"
+            );
+
             // Block 3 data should be removed (block 2 was already removed in previous tests)
             let state_result3 = provider_ro.get_beaconstate_by_blockhash(test_hashes[2])?;
-            assert!(state_result3.is_none(), "beacon state 3 should be removed after unwind");
+            assert!(
+                state_result3.is_none(),
+                "beacon state 3 should be removed after unwind"
+            );
             let block_result3 = provider_ro.get_beaconblock_by_blockhash(test_hashes[2])?;
-            assert!(block_result3.is_none(), "beacon block 3 should be removed after unwind");
+            assert!(
+                block_result3.is_none(),
+                "beacon block 3 should be removed after unwind"
+            );
         }
-        
+
         // Phase 9: Test edge cases
         {
             let provider_ro = factory.provider()?;
-            
+
             // Test with non-existent hash
             let mut non_existent_bytes = [0u8; 32];
             rng.fill(&mut non_existent_bytes);
             let non_existent_hash = B256::from_slice(&non_existent_bytes);
-            
+
             let state_result = provider_ro.get_beaconstate_by_blockhash(non_existent_hash)?;
-            assert!(state_result.is_none(), "non-existent beacon state should return None");
-            
+            assert!(
+                state_result.is_none(),
+                "non-existent beacon state should return None"
+            );
+
             let block_result = provider_ro.get_beaconblock_by_blockhash(non_existent_hash)?;
-            assert!(block_result.is_none(), "non-existent beacon block should return None");
+            assert!(
+                block_result.is_none(),
+                "non-existent beacon block should return None"
+            );
         }
-        
+
         // Phase 10: Test batch operations
         {
             let mut provider_rw = factory.provider_rw()?;
-            
+
             // Test removing multiple items at once
             let mut batch_hashes = Vec::new();
             let mut batch_states = Vec::new();
             let mut batch_blocks = Vec::new();
-            
+
             for i in 0..3 {
                 let mut bytes = [0u8; 32];
                 rng.fill(&mut bytes);
                 let hash = B256::from_slice(&bytes);
                 batch_hashes.push(hash);
-                
+
                 let state = BeaconState {
                     slot: 400 + i as u64,
                     eth1_deposit_index: 40 + i as u64,
@@ -953,7 +1017,7 @@ mod tests {
                     balances: BTreeMap::new(),
                 };
                 batch_states.push((hash, state));
-                
+
                 let block = BeaconBlock {
                     eth1_block_hash: hash,
                     state_root: hash,
@@ -961,7 +1025,7 @@ mod tests {
                 };
                 batch_blocks.push((hash, block));
             }
-            
+
             // Write batch data
             let state_changeset = BeaconStateChangeset {
                 beaconstates: batch_states,
@@ -969,63 +1033,71 @@ mod tests {
             let block_changeset = BeaconBlockChangeset {
                 beaconblocks: batch_blocks,
             };
-            
+
             provider_rw.write_beaconstate(state_changeset)?;
             provider_rw.write_beaconblock(block_changeset)?;
             provider_rw.commit()?;
-            
+
             // Verify batch write
             let provider_ro = factory.provider()?;
             for hash in &batch_hashes {
                 let state_result = provider_ro.get_beaconstate_by_blockhash(*hash)?;
                 assert!(state_result.is_some(), "batch beacon state should exist");
-                
+
                 let block_result = provider_ro.get_beaconblock_by_blockhash(*hash)?;
                 assert!(block_result.is_some(), "batch beacon block should exist");
             }
-            
+
             // Test batch removal
             let mut provider_rw = factory.provider_rw()?;
             provider_rw.remove_beaconstate(batch_hashes.clone())?;
             provider_rw.remove_beaconblock(batch_hashes.clone())?;
             provider_rw.commit()?;
-            
+
             // Verify batch removal
             let provider_ro = factory.provider()?;
             for hash in &batch_hashes {
                 let state_result = provider_ro.get_beaconstate_by_blockhash(*hash)?;
-                assert!(state_result.is_none(), "batch beacon state should be removed");
-                
+                assert!(
+                    state_result.is_none(),
+                    "batch beacon state should be removed"
+                );
+
                 let block_result = provider_ro.get_beaconblock_by_blockhash(*hash)?;
-                assert!(block_result.is_none(), "batch beacon block should be removed");
+                assert!(
+                    block_result.is_none(),
+                    "batch beacon block should be removed"
+                );
             }
         }
-        
+
         println!("✅ All BeaconReader and BeaconWriter trait functions tested successfully!");
         Ok(())
     }
 
     #[test]
-    fn test_beaconstaterecord()->ProviderResult<()>{
-        let factory=create_test_provider_factory();
-        let mut provider_rw=factory.provider_rw()?;
-        let mut rng=StdRng::seed_from_u64(42);
-        let mut blockhash=B256::ZERO;
+    fn test_beaconstaterecord() -> ProviderResult<()> {
+        let factory = create_test_provider_factory();
+        let mut provider_rw = factory.provider_rw()?;
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut blockhash = B256::ZERO;
         // let mut cursor=provider_rw.tx_mut().cursor_write::<tables::BeaconStateRecord>()?;
-        for i in 0..5{
-            let mut bytes=[0u8;32];
+        for i in 0..5 {
+            let mut bytes = [0u8; 32];
             rng.fill(&mut bytes);
-            blockhash=B256::from_slice(&bytes);
-            println!("{:?}",blockhash);
-            let state=BeaconState::default();
-            provider_rw.tx_ref().put::<tables::BeaconStateRecord>(blockhash, state)?;
+            blockhash = B256::from_slice(&bytes);
+            println!("{:?}", blockhash);
+            let state = BeaconState::default();
+            provider_rw
+                .tx_ref()
+                .put::<tables::BeaconStateRecord>(blockhash, state)?;
         }
         provider_rw.commit()?;
-        let provider_ro=factory.provider()?;
-        let res=provider_ro.get_beaconstate_by_blockhash(blockhash)?;
-        match res{
-            Some(bs)=>println!("{:?}",bs),
-            None=>println!("not found"),
+        let provider_ro = factory.provider()?;
+        let res = provider_ro.get_beaconstate_by_blockhash(blockhash)?;
+        match res {
+            Some(bs) => println!("{:?}", bs),
+            None => println!("not found"),
         }
         Ok(())
     }
@@ -1033,12 +1105,12 @@ mod tests {
     #[test]
     fn test_validator_funcs() -> ProviderResult<()> {
         let factory = create_test_provider_factory();
-        
+
         // Prepare test data
         let validator_address1 = Address::random();
         let validator_address2 = Address::random();
         let validator_address3 = Address::random();
-        
+
         let validator1 = Validator {
             index: 1,
             balance: 32000000000,
@@ -1046,7 +1118,7 @@ mod tests {
             is_slashed: false,
             is_withdrawal_allowed: false,
         };
-        
+
         let validator2 = Validator {
             index: 2,
             balance: 33000000000,
@@ -1054,7 +1126,7 @@ mod tests {
             is_slashed: false,
             is_withdrawal_allowed: true,
         };
-        
+
         let validator3 = Validator {
             index: 3,
             balance: 31000000000,
@@ -1062,25 +1134,25 @@ mod tests {
             is_slashed: true,
             is_withdrawal_allowed: false,
         };
-        
+
         // Phase 1: Test write_validator_changes function
         {
             let mut provider_rw = factory.provider_rw()?;
-            
+
             // Add multiple validators
             let mut validators = Vec::new();
             validators.push((validator_address1, Some(validator1.clone())));
             validators.push((validator_address2, Some(validator2.clone())));
             let changeset = ValidatorChangeset { validators };
-            
+
             provider_rw.write_validator_changes(changeset)?;
             provider_rw.commit()?;
         }
-        
+
         // Phase 2: Test basic_validator function of ValidatorReader trait
         {
             let provider_ro = factory.provider()?;
-            
+
             // Test existing validators
             let result1 = provider_ro.basic_validator(validator_address1)?;
             assert!(result1.is_some(), "validator1 should exist");
@@ -1088,100 +1160,124 @@ mod tests {
             assert_eq!(validator1.index, retrieved_validator1.index);
             assert_eq!(validator1.balance, retrieved_validator1.balance);
             assert_eq!(validator1.is_active, retrieved_validator1.is_active);
-            
+
             let result2 = provider_ro.basic_validator(validator_address2)?;
             assert!(result2.is_some(), "validator2 should exist");
             let retrieved_validator2 = result2.unwrap();
             assert_eq!(validator2.index, retrieved_validator2.index);
             assert_eq!(validator2.balance, retrieved_validator2.balance);
-            assert_eq!(validator2.is_withdrawal_allowed, retrieved_validator2.is_withdrawal_allowed);
-            
+            assert_eq!(
+                validator2.is_withdrawal_allowed,
+                retrieved_validator2.is_withdrawal_allowed
+            );
+
             // Test non-existing validators
             let result3 = provider_ro.basic_validator(validator_address3)?;
             assert!(result3.is_none(), "validator3 should not exist");
         }
-        
+
         // Phase 3: Add changeset data and test changed_validators_and_blocks_with_range
         {
             let mut provider_rw = factory.provider_rw()?;
-            
+
             // Add change record in block 1
             provider_rw.tx_ref().put::<tables::ValidatorChangeSets>(
                 1,
                 ValidatorBeforeTx {
                     address: validator_address1,
                     info: None,
-                }
+                },
             )?;
-            
+
             // Add change record in block 2
             provider_rw.tx_ref().put::<tables::ValidatorChangeSets>(
                 2,
                 ValidatorBeforeTx {
                     address: validator_address1,
                     info: Some(validator1.clone()),
-                }
+                },
             )?;
-            
+
             provider_rw.tx_ref().put::<tables::ValidatorChangeSets>(
                 2,
                 ValidatorBeforeTx {
                     address: validator_address2,
                     info: None,
-                }
+                },
             )?;
-            
+
             // Add change record in block 3
             provider_rw.tx_ref().put::<tables::ValidatorChangeSets>(
                 3,
                 ValidatorBeforeTx {
                     address: validator_address2,
                     info: Some(validator2.clone()),
-                }
+                },
             )?;
-            
+
             provider_rw.commit()?;
         }
-        
+
         // Test changed_validators_and_blocks_with_range function
         {
             let provider_ro = factory.provider()?;
-            
+
             // Test block range 1..=2
             let changes_1_2 = provider_ro.changed_validators_and_blocks_with_range(1..=2)?;
-            assert!(changes_1_2.contains_key(&validator_address1), "validator1 should have changes in range 1..=2");
-            assert!(changes_1_2.contains_key(&validator_address2), "validator2 should have changes in range 1..=2");
-            
+            assert!(
+                changes_1_2.contains_key(&validator_address1),
+                "validator1 should have changes in range 1..=2"
+            );
+            assert!(
+                changes_1_2.contains_key(&validator_address2),
+                "validator2 should have changes in range 1..=2"
+            );
+
             let validator1_blocks = &changes_1_2[&validator_address1];
-            assert!(validator1_blocks.contains(&1), "validator1 should have change in block 1");
-            assert!(validator1_blocks.contains(&2), "validator1 should have change in block 2");
-            
+            assert!(
+                validator1_blocks.contains(&1),
+                "validator1 should have change in block 1"
+            );
+            assert!(
+                validator1_blocks.contains(&2),
+                "validator1 should have change in block 2"
+            );
+
             let validator2_blocks = &changes_1_2[&validator_address2];
-            assert!(validator2_blocks.contains(&2), "validator2 should have change in block 2");
-            
+            assert!(
+                validator2_blocks.contains(&2),
+                "validator2 should have change in block 2"
+            );
+
             // Test block range 3..=3
             let changes_3 = provider_ro.changed_validators_and_blocks_with_range(3..=3)?;
-            assert!(changes_3.contains_key(&validator_address2), "validator2 should have changes in range 3..=3");
-            assert!(!changes_3.contains_key(&validator_address1), "validator1 should not have changes in range 3..=3");
+            assert!(
+                changes_3.contains_key(&validator_address2),
+                "validator2 should have changes in range 3..=3"
+            );
+            assert!(
+                !changes_3.contains_key(&validator_address1),
+                "validator1 should not have changes in range 3..=3"
+            );
         }
-        
+
         // Phase 4: Test insert_validator_history_index function
         {
             let mut provider_rw = factory.provider_rw()?;
-            
+
             // Prepare history index data
             let mut validator_transitions = BTreeMap::new();
             validator_transitions.insert(validator_address1, vec![1u64, 2u64]);
             validator_transitions.insert(validator_address2, vec![2u64, 3u64]);
-            
+
             provider_rw.insert_validator_history_index(validator_transitions)?;
             provider_rw.commit()?;
         }
-        
+
         // Phase 5: Test write_validator_reverts function
         {
             let mut provider_rw = factory.provider_rw()?;
-            
+
             // Prepare revert data
             let validator_reverts = ValidatorRevert {
                 validators: vec![
@@ -1189,79 +1285,83 @@ mod tests {
                         (validator_address1, Some(validator1.clone())),
                         (validator_address2, None),
                     ],
-                    vec![
-                        (validator_address2, Some(validator2.clone())),
-                    ],
+                    vec![(validator_address2, Some(validator2.clone()))],
                 ],
             };
-            
+
             provider_rw.write_validator_reverts(10, validator_reverts)?;
             provider_rw.commit()?;
         }
-        
+
         // Phase 6: Test unwind_validator_history_indices function
         {
             let mut provider_rw = factory.provider_rw()?;
-            
+
             // Prepare changeset data for unwinding
             let changesets = vec![
-                (1u64, ValidatorBeforeTx {
-                    address: validator_address1,
-                    info: None,
-                }),
-                (2u64, ValidatorBeforeTx {
-                    address: validator_address2,
-                    info: Some(validator2.clone()),
-                }),
+                (
+                    1u64,
+                    ValidatorBeforeTx {
+                        address: validator_address1,
+                        info: None,
+                    },
+                ),
+                (
+                    2u64,
+                    ValidatorBeforeTx {
+                        address: validator_address2,
+                        info: Some(validator2.clone()),
+                    },
+                ),
             ];
-            
+
             let unwound_count = provider_rw.unwind_validator_history_indices(changesets.iter())?;
             assert!(unwound_count > 0, "should have unwound some indices");
-            
+
             provider_rw.commit()?;
         }
-        
+
         // Phase 7: Test unwind_validator function
         {
             let mut provider_rw = factory.provider_rw()?;
-            
+
             // Add third validator for unwind testing
             let mut validators = Vec::new();
             validators.push((validator_address3, Some(validator3.clone())));
             let changeset = ValidatorChangeset { validators };
             provider_rw.write_validator_changes(changeset)?;
-            
+
             // Add changeset record
             provider_rw.tx_ref().put::<tables::ValidatorChangeSets>(
                 5,
                 ValidatorBeforeTx {
                     address: validator_address3,
                     info: None,
-                }
+                },
             )?;
-            
+
             provider_rw.commit()?;
-            
+
             // Verify validator exists
             let provider_ro = factory.provider()?;
             let result = provider_ro.basic_validator(validator_address3)?;
             assert!(result.is_some(), "validator3 should exist before unwind");
-            
+
             // Execute unwind
             let mut provider_rw = factory.provider_rw()?;
             provider_rw.unwind_validator(5..=5)?;
             provider_rw.commit()?;
-            
+
             // Verify unwind result
             let provider_ro = factory.provider()?;
             let result = provider_ro.basic_validator(validator_address3)?;
             assert!(result.is_none(), "validator3 should not exist after unwind");
         }
-        
+
         // Phase 8: Test remove_validator function
         {
             let mut provider_rw = factory.provider_rw()?;
-            
+
             // Add a new validator for removal testing
             let test_validator = Validator {
                 index: 99,
@@ -1270,41 +1370,49 @@ mod tests {
                 is_slashed: false,
                 is_withdrawal_allowed: false,
             };
-            
+
             let test_address = Address::random();
             let mut validators = Vec::new();
             validators.push((test_address, Some(test_validator.clone())));
             let changeset = ValidatorChangeset { validators };
             provider_rw.write_validator_changes(changeset)?;
-            
+
             // 添加变更集记录
             provider_rw.tx_ref().put::<tables::ValidatorChangeSets>(
                 6,
                 ValidatorBeforeTx {
                     address: test_address,
                     info: None,
-                }
+                },
             )?;
-            
+
             provider_rw.commit()?;
-            
+
             // Verify validator exists
             let provider_ro = factory.provider()?;
             let result = provider_ro.basic_validator(test_address)?;
-            assert!(result.is_some(), "test validator should exist before removal");
-            
+            assert!(
+                result.is_some(),
+                "test validator should exist before removal"
+            );
+
             // Execute removal
             let mut provider_rw = factory.provider_rw()?;
             provider_rw.remove_validator(6..=6)?;
             provider_rw.commit()?;
-            
+
             // Verify removal result
             let provider_ro = factory.provider()?;
             let result = provider_ro.basic_validator(test_address)?;
-            assert!(result.is_none(), "test validator should not exist after removal");
+            assert!(
+                result.is_none(),
+                "test validator should not exist after removal"
+            );
         }
-        
-        println!("✅ All ValidatorReader and ValidatorChangeWriter trait functions tested successfully!");
+
+        println!(
+            "✅ All ValidatorReader and ValidatorChangeWriter trait functions tested successfully!"
+        );
         Ok(())
     }
     #[test]
@@ -1360,8 +1468,10 @@ mod tests {
         {
             let provider = factory.provider_rw().unwrap();
             assert_matches!(
-                provider
-                    .insert_block(block.clone().try_recover().unwrap(), StorageLocation::Database),
+                provider.insert_block(
+                    block.clone().try_recover().unwrap(),
+                    StorageLocation::Database
+                ),
                 Ok(_)
             );
             assert_matches!(
@@ -1382,8 +1492,10 @@ mod tests {
             };
             let provider = factory.with_prune_modes(prune_modes).provider_rw().unwrap();
             assert_matches!(
-                provider
-                    .insert_block(block.clone().try_recover().unwrap(), StorageLocation::Database),
+                provider.insert_block(
+                    block.clone().try_recover().unwrap(),
+                    StorageLocation::Database
+                ),
                 Ok(_)
             );
             assert_matches!(provider.transaction_sender(0), Ok(None));
@@ -1399,16 +1511,24 @@ mod tests {
         let factory = create_test_provider_factory();
 
         let mut rng = generators::rng();
-        let block =
-            random_block(&mut rng, 0, BlockParams { tx_count: Some(3), ..Default::default() });
+        let block = random_block(
+            &mut rng,
+            0,
+            BlockParams {
+                tx_count: Some(3),
+                ..Default::default()
+            },
+        );
 
         let tx_ranges: Vec<RangeInclusive<TxNumber>> = vec![0..=0, 1..=1, 2..=2, 0..=1, 1..=2];
         for range in tx_ranges {
             let provider = factory.provider_rw().unwrap();
 
             assert_matches!(
-                provider
-                    .insert_block(block.clone().try_recover().unwrap(), StorageLocation::Database),
+                provider.insert_block(
+                    block.clone().try_recover().unwrap(),
+                    StorageLocation::Database
+                ),
                 Ok(_)
             );
 
@@ -1419,7 +1539,9 @@ mod tests {
                     .clone()
                     .map(|tx_number| (
                         tx_number,
-                        block.body().transactions[tx_number as usize].recover_signer().unwrap()
+                        block.body().transactions[tx_number as usize]
+                            .recover_signer()
+                            .unwrap()
                     ))
                     .collect())
             );
@@ -1449,9 +1571,12 @@ mod tests {
 
         // Checkpoint and no gap
         let static_file_provider = provider.static_file_provider();
-        let mut static_file_writer =
-            static_file_provider.latest_writer(StaticFileSegment::Headers).unwrap();
-        static_file_writer.append_header(head.header(), U256::ZERO, &head.hash()).unwrap();
+        let mut static_file_writer = static_file_provider
+            .latest_writer(StaticFileSegment::Headers)
+            .unwrap();
+        static_file_writer
+            .append_header(head.header(), U256::ZERO, &head.hash())
+            .unwrap();
         static_file_writer.commit().unwrap();
         drop(static_file_writer);
 
@@ -1461,31 +1586,54 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_test(){
-        let factory=create_test_provider_factory();
-        let provider=factory.provider_rw().unwrap();
+    fn snapshot_test() {
+        let factory = create_test_provider_factory();
+        let provider = factory.provider_rw().unwrap();
         let config = APosConfig {
-            period: 10, 
-            epoch: 100, 
-            reward_epoch: 1000, 
-            reward_limit: U256::from(1000), 
-            deposit_contract: "0x0000000000000000000000000000000000000000".parse::<Address>().unwrap(),
+            period: 10,
+            epoch: 100,
+            reward_epoch: 1000,
+            reward_limit: U256::from(1000),
+            deposit_contract: "0x0000000000000000000000000000000000000000"
+                .parse::<Address>()
+                .unwrap(),
         };
-        let number=1;
-        let hash: B256 = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".parse().unwrap();
-        let signers: Vec<Address> = vec!["0x1111111111111111111111111111111111111111".parse().unwrap(),"0x2222222222222222222222222222222222222222".parse().unwrap(),];
-        let mut snapshot=Snapshot::new_snapshot(config, number, hash, signers);
-        let address1: Address = "0x3333333333333333333333333333333333333333".parse().unwrap();
-        let address2: Address = "0x4444444444444444444444444444444444444444".parse().unwrap();
-        snapshot.cast(address1, true); 
-        snapshot.cast(address2, false); 
-        snapshot.cast(address1, true);  
+        let number = 1;
+        let hash: B256 = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+            .parse()
+            .unwrap();
+        let signers: Vec<Address> = vec![
+            "0x1111111111111111111111111111111111111111"
+                .parse()
+                .unwrap(),
+            "0x2222222222222222222222222222222222222222"
+                .parse()
+                .unwrap(),
+        ];
+        let mut snapshot = Snapshot::new_snapshot(config, number, hash, signers);
+        let address1: Address = "0x3333333333333333333333333333333333333333"
+            .parse()
+            .unwrap();
+        let address2: Address = "0x4444444444444444444444444444444444444444"
+            .parse()
+            .unwrap();
+        snapshot.cast(address1, true);
+        snapshot.cast(address2, false);
+        snapshot.cast(address1, true);
         snapshot.uncast(address2, false);
-        let block_id=BlockHashOrNumber::Number(number);
-        let timestamp=SystemTime::now().duration_since(UNIX_EPOCH).expect("time went backwards").as_secs();
-        provider.save_snapshot(number, snapshot.clone()).expect("fail to save snapshot");
-        let loaded_snapshot=provider.load_snapshot(block_id).expect("fail to load snapshot").expect("cannot find snapshot");
-        assert_eq!(snapshot.config,loaded_snapshot.config);
+        let block_id = BlockHashOrNumber::Number(number);
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_secs();
+        provider
+            .save_snapshot(number, snapshot.clone())
+            .expect("fail to save snapshot");
+        let loaded_snapshot = provider
+            .load_snapshot(block_id)
+            .expect("fail to load snapshot")
+            .expect("cannot find snapshot");
+        assert_eq!(snapshot.config, loaded_snapshot.config);
         assert_eq!(snapshot.number, loaded_snapshot.number);
         assert_eq!(snapshot.hash, loaded_snapshot.hash);
         assert_eq!(snapshot.signers, loaded_snapshot.signers);
@@ -1495,6 +1643,5 @@ mod tests {
 
         println!("{:#?}", snapshot);
         println!("{:#?}", loaded_snapshot);
-        
     }
 }

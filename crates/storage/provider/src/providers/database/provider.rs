@@ -1,4 +1,6 @@
-use std::hash::RandomState;
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use crate::{
     bundle_state::StorageRevertsIter,
     providers::{
@@ -10,18 +12,16 @@ use crate::{
     traits::{
         AccountExtReader, BlockSource, ChangeSetReader, ReceiptProvider, StageCheckpointWriter,
     },
-    AccountReader, BlockBodyWriter, BlockExecutionWriter, BlockHashReader, BlockNumReader,
-    BlockReader, BlockWriter, BundleStateInit, ChainStateBlockReader, ChainStateBlockWriter,
-    DBProvider, HashingWriter, HeaderProvider, HeaderSyncGapProvider, HistoricalStateProvider,
-    HistoricalStateProviderRef, HistoryWriter, LatestStateProvider, LatestStateProviderRef,
-    OriginalValuesKnown, ProviderError, PruneCheckpointReader, PruneCheckpointWriter, RevertsInit,
-    StageCheckpointReader, StateCommitmentProvider, StateProviderBox, StateWriter,
-    StaticFileProviderFactory, StatsReader, StorageLocation, StorageReader, StorageTrieWriter,
-    TransactionVariant, TransactionsProvider, TransactionsProviderExt, TrieWriter,
+    AccountReader, BeaconReader, BeaconWriter, BlockBodyWriter, BlockExecutionWriter,
+    BlockHashReader, BlockNumReader, BlockReader, BlockWriter, BundleStateInit,
+    ChainStateBlockReader, ChainStateBlockWriter, DBProvider, HashingWriter, HeaderProvider,
+    HeaderSyncGapProvider, HistoricalStateProvider, HistoricalStateProviderRef, HistoryWriter,
+    LatestStateProvider, LatestStateProviderRef, OriginalValuesKnown, ProviderError,
+    PruneCheckpointReader, PruneCheckpointWriter, RevertsInit, StageCheckpointReader,
+    StateCommitmentProvider, StateProviderBox, StateWriter, StaticFileProviderFactory, StatsReader,
+    StorageLocation, StorageReader, StorageTrieWriter, TransactionVariant, TransactionsProvider,
+    TransactionsProviderExt, TrieWriter, ValidatorChangeWriter, ValidatorReader,
     WithdrawalsProvider,
-ValidatorChangeWriter, 
-    ValidatorReader, 
-BeaconReader, BeaconWriter,
 };
 use alloy_consensus::{
     transaction::{SignerRecoverable, TransactionMeta},
@@ -34,6 +34,10 @@ use alloy_primitives::{
     Address, BlockHash, BlockNumber, TxHash, TxNumber, B256, U256,
 };
 use itertools::Itertools;
+use n42_primitives::{
+    BeaconBlock, BeaconBlockChangeset, BeaconState, BeaconStateChangeset, Snapshot, Validator,
+    ValidatorBeforeTx, ValidatorChangeset, ValidatorRevert,
+};
 use rayon::slice::ParallelSliceMut;
 use reth_chainspec::{ChainInfo, ChainSpecProvider, EthChainSpec, EthereumHardforks};
 use reth_db_api::{
@@ -60,14 +64,10 @@ use reth_prune_types::{
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_static_file_types::StaticFileSegment;
 use reth_storage_api::{
-    BlockBodyIndicesProvider, BlockBodyReader, NodePrimitivesProvider, OmmersProvider,
+    BeaconProvider, BeaconProviderWriter, BlockBodyIndicesProvider, BlockBodyReader,
+    NodePrimitivesProvider, OmmersProvider, SnapshotProvider, SnapshotProviderWriter,
     StateProvider, StorageChangeSetReader, TryIntoHistoricalStateProvider,
-    SnapshotProvider, SnapshotProviderWriter,
-    BeaconProvider, BeaconProviderWriter,
 };
-use n42_primitives::{
-    BeaconBlock, BeaconState, BeaconStateChangeset, BeaconBlockChangeset,
-    Snapshot, Validator,ValidatorBeforeTx,ValidatorChangeset,ValidatorRevert};
 use reth_storage_errors::provider::{ProviderResult, RootMismatch};
 use reth_trie::{
     prefix_set::{PrefixSet, PrefixSetMut, TriePrefixSets},
@@ -78,6 +78,7 @@ use reth_trie_db::{DatabaseStateRoot, DatabaseStorageTrieCursor};
 use revm_database::states::{
     PlainStateReverts, PlainStorageChangeset, PlainStorageRevert, StateChangeset,
 };
+use std::hash::RandomState;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
@@ -87,29 +88,35 @@ use std::{
 };
 use tracing::{debug, trace};
 
-impl<TX:DbTx,N:NodeTypes>BeaconReader for DatabaseProvider<TX,N>{
-    fn get_beaconstate_by_blockhash(&self,blockhash:BlockHash) -> ProviderResult<Option<BeaconState> > {
+impl<TX: DbTx, N: NodeTypes> BeaconReader for DatabaseProvider<TX, N> {
+    fn get_beaconstate_by_blockhash(
+        &self,
+        blockhash: BlockHash,
+    ) -> ProviderResult<Option<BeaconState>> {
         // let mut cursor=self.tx.cursor_read::<tables::BeaconStateRecord>()?;
         // while let Some((bh,_))=cursor.next()?{
         //     println!("bh: {:?}",bh);
         // }
         Ok(self.tx.get::<tables::BeaconStateRecord>(blockhash)?)
     }
-    fn get_beaconblock_by_blockhash(&self,blockhash:BlockHash) -> ProviderResult<Option<BeaconBlock> > {
+    fn get_beaconblock_by_blockhash(
+        &self,
+        blockhash: BlockHash,
+    ) -> ProviderResult<Option<BeaconBlock>> {
         Ok(self.tx.get::<tables::BeaconBlockRecord>(blockhash)?)
     }
 }
 
-impl<TX:DbTxMut+DbTx+'static,N:NodeTypes>BeaconWriter for DatabaseProvider<TX,N>{
-    fn unwind_beacon(&self,range:RangeInclusive<BlockNumber>) -> ProviderResult<()> {
-        if range.is_empty(){
+impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> BeaconWriter for DatabaseProvider<TX, N> {
+    fn unwind_beacon(&self, range: RangeInclusive<BlockNumber>) -> ProviderResult<()> {
+        if range.is_empty() {
             return Ok(());
         }
 
         let mut cursor_r = self.tx.cursor_read::<tables::BeaconNum2Hash>()?;
         let mut blockhashes: Vec<BlockHash> = Vec::new();
-        for blocknumber in range.clone(){
-            if let Some((_,blockhash))=cursor_r.seek_exact(blocknumber)?{
+        for blocknumber in range.clone() {
+            if let Some((_, blockhash)) = cursor_r.seek_exact(blocknumber)? {
                 blockhashes.push(blockhash);
             }
         }
@@ -117,9 +124,9 @@ impl<TX:DbTxMut+DbTx+'static,N:NodeTypes>BeaconWriter for DatabaseProvider<TX,N>
         self.remove_beaconstate(blockhashes.clone())?;
         self.remove_beaconblock(blockhashes.clone())?;
 
-        let mut cursor_w=self.tx.cursor_write::<tables::BeaconNum2Hash>()?;
-        for blocknumber in range{
-            if cursor_w.seek_exact(blocknumber)?.is_some(){
+        let mut cursor_w = self.tx.cursor_write::<tables::BeaconNum2Hash>()?;
+        for blocknumber in range {
+            if cursor_w.seek_exact(blocknumber)?.is_some() {
                 cursor_w.delete_current()?;
             }
         }
@@ -128,29 +135,29 @@ impl<TX:DbTxMut+DbTx+'static,N:NodeTypes>BeaconWriter for DatabaseProvider<TX,N>
     }
     fn remove_beaconstate(&self, mut range: Vec<BlockHash>) -> ProviderResult<()> {
         range.sort();
-        let mut cursor=self.tx.cursor_write::<tables::BeaconStateRecord>()?;
-        let mut range_iter=range.into_iter().peekable();
-        while let Some((bh,_))=cursor.next()?{
-            match range_iter.peek(){
-                Some(next_bh)=>{
-                    if bh==*next_bh{
+        let mut cursor = self.tx.cursor_write::<tables::BeaconStateRecord>()?;
+        let mut range_iter = range.into_iter().peekable();
+        while let Some((bh, _)) = cursor.next()? {
+            match range_iter.peek() {
+                Some(next_bh) => {
+                    if bh == *next_bh {
                         cursor.delete_current()?;
                         range_iter.next();
-                    }else if bh<*next_bh{
+                    } else if bh < *next_bh {
                         continue;
-                    }else{
+                    } else {
                         // impossible
                         range_iter.next();
                     }
                 }
-                None=>break,
+                None => break,
             }
         }
         Ok(())
     }
-    fn write_beaconstate(&self,mut changes:BeaconStateChangeset) -> ProviderResult<()> {
-        let mut cursor=self.tx.cursor_write::<tables::BeaconStateRecord>()?;
-        for (blockhash,beaconstate) in changes.beaconstates{
+    fn write_beaconstate(&self, mut changes: BeaconStateChangeset) -> ProviderResult<()> {
+        let mut cursor = self.tx.cursor_write::<tables::BeaconStateRecord>()?;
+        for (blockhash, beaconstate) in changes.beaconstates {
             cursor.insert(blockhash, &beaconstate)?;
         }
         Ok(())
@@ -166,31 +173,31 @@ impl<TX:DbTxMut+DbTx+'static,N:NodeTypes>BeaconWriter for DatabaseProvider<TX,N>
     //     self.remove_beaconblock(blockhashes)?;
     //     Ok(())
     // }
-    fn remove_beaconblock(&self,mut range:Vec<BlockHash>) -> ProviderResult<()> {
+    fn remove_beaconblock(&self, mut range: Vec<BlockHash>) -> ProviderResult<()> {
         range.sort();
-        let mut cursor=self.tx.cursor_write::<tables::BeaconBlockRecord>()?;
-        let mut range_iter=range.into_iter().peekable();
-        while let Some((bh,_))=cursor.next()?{
-            match range_iter.peek(){
-                Some(next_bh)=>{
-                    if bh==*next_bh{
+        let mut cursor = self.tx.cursor_write::<tables::BeaconBlockRecord>()?;
+        let mut range_iter = range.into_iter().peekable();
+        while let Some((bh, _)) = cursor.next()? {
+            match range_iter.peek() {
+                Some(next_bh) => {
+                    if bh == *next_bh {
                         cursor.delete_current()?;
                         range_iter.next();
-                    }else if bh<*next_bh{
+                    } else if bh < *next_bh {
                         continue;
-                    }else{
+                    } else {
                         // impossible
                         range_iter.next();
                     }
                 }
-                None=>break,
+                None => break,
             }
         }
         Ok(())
     }
-    fn write_beaconblock(&self,changes:BeaconBlockChangeset) -> ProviderResult<()> {
-        let mut cursor=self.tx.cursor_write::<tables::BeaconBlockRecord>()?;
-        for(blockhash, beaconblock)in changes.beaconblocks{
+    fn write_beaconblock(&self, changes: BeaconBlockChangeset) -> ProviderResult<()> {
+        let mut cursor = self.tx.cursor_write::<tables::BeaconBlockRecord>()?;
+        for (blockhash, beaconblock) in changes.beaconblocks {
             cursor.insert(blockhash, &beaconblock)?;
         }
         Ok(())
@@ -198,10 +205,13 @@ impl<TX:DbTxMut+DbTx+'static,N:NodeTypes>BeaconWriter for DatabaseProvider<TX,N>
 }
 
 impl<TX: DbTx, N: NodeTypes> ValidatorReader for DatabaseProvider<TX, N> {
-    fn basic_validator(&self,address:Address) -> ProviderResult<Option<Validator> > {
+    fn basic_validator(&self, address: Address) -> ProviderResult<Option<Validator>> {
         Ok(self.tx.get::<tables::PlainValidatorState>(address)?)
     }
-    fn changed_validators_and_blocks_with_range(&self,range:RangeInclusive<BlockNumber> ,) -> ProviderResult<BTreeMap<Address,Vec<BlockNumber> > > {
+    fn changed_validators_and_blocks_with_range(
+        &self,
+        range: RangeInclusive<BlockNumber>,
+    ) -> ProviderResult<BTreeMap<Address, Vec<BlockNumber>>> {
         let mut changeset_cursor = self.tx.cursor_read::<tables::ValidatorChangeSets>()?;
         let validator_transitions = changeset_cursor.walk_range(range)?.try_fold(
             BTreeMap::new(),
@@ -215,33 +225,51 @@ impl<TX: DbTx, N: NodeTypes> ValidatorReader for DatabaseProvider<TX, N> {
     }
 }
 
-impl<TX: DbTxMut + DbTx+'static, N: NodeTypes> ValidatorChangeWriter for DatabaseProvider<TX, N> {
-    fn write_validator_reverts(&self,first_block:BlockNumber,validator_reverts:ValidatorRevert,) -> ProviderResult<()> {
-        let mut validator_changeset_cursor =
-            self.tx_ref().cursor_dup_write::<tables::ValidatorChangeSets>()?;
-        for (block_index, mut validator_block_reverts) in validator_reverts.validators.into_iter().enumerate() {
-            let block_number=first_block+block_index as BlockNumber;
+impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> ValidatorChangeWriter for DatabaseProvider<TX, N> {
+    fn write_validator_reverts(
+        &self,
+        first_block: BlockNumber,
+        validator_reverts: ValidatorRevert,
+    ) -> ProviderResult<()> {
+        let mut validator_changeset_cursor = self
+            .tx_ref()
+            .cursor_dup_write::<tables::ValidatorChangeSets>()?;
+        for (block_index, mut validator_block_reverts) in
+            validator_reverts.validators.into_iter().enumerate()
+        {
+            let block_number = first_block + block_index as BlockNumber;
             validator_block_reverts.par_sort_by_key(|a| a.0);
 
             for (address, info) in validator_block_reverts {
                 validator_changeset_cursor.append_dup(
                     block_number,
-                    ValidatorBeforeTx { address, info:info.map(Into::into) },
+                    ValidatorBeforeTx {
+                        address,
+                        info: info.map(Into::into),
+                    },
                 )?;
             }
         }
 
         Ok(())
     }
-    fn insert_validator_history_index(&self,validator_transitions:impl IntoIterator<Item = (Address,impl IntoIterator<Item = BlockNumber>)> ,) -> ProviderResult<()> {
-        self.append_history_index::<_, tables::ValidatorsHistory>(validator_transitions,ShardedKey::new,)
+    fn insert_validator_history_index(
+        &self,
+        validator_transitions: impl IntoIterator<
+            Item = (Address, impl IntoIterator<Item = BlockNumber>),
+        >,
+    ) -> ProviderResult<()> {
+        self.append_history_index::<_, tables::ValidatorsHistory>(
+            validator_transitions,
+            ShardedKey::new,
+        )
     }
-    fn unwind_validator(&self,range: RangeInclusive<BlockNumber>) -> ProviderResult<()> {
-        let changed_validators=self
+    fn unwind_validator(&self, range: RangeInclusive<BlockNumber>) -> ProviderResult<()> {
+        let changed_validators = self
             .tx
             .cursor_read::<tables::ValidatorChangeSets>()?
             .walk_range(range.clone())?
-            .collect::<Result<Vec<_>,_>>()?;
+            .collect::<Result<Vec<_>, _>>()?;
 
         self.unwind_validator_history_indices(changed_validators.iter())?;
 
@@ -249,15 +277,18 @@ impl<TX: DbTxMut + DbTx+'static, N: NodeTypes> ValidatorChangeWriter for Databas
 
         Ok(())
     }
-    fn unwind_validator_history_indices<'a>(&self, changesets: impl Iterator<Item = &'a (BlockNumber, ValidatorBeforeTx)>,) -> ProviderResult<usize> {
+    fn unwind_validator_history_indices<'a>(
+        &self,
+        changesets: impl Iterator<Item = &'a (BlockNumber, ValidatorBeforeTx)>,
+    ) -> ProviderResult<usize> {
         let mut last_indices = changesets
             .into_iter()
             .map(|(index, validator)| (validator.address, *index))
             .collect::<Vec<_>>();
         last_indices.sort_by_key(|(addr, _)| *addr);
-        
+
         let mut cursor = self.tx.cursor_write::<tables::ValidatorsHistory>()?;
-        
+
         for &(address, index) in &last_indices {
             let partial_shard = unwind_history_shards::<_, tables::ValidatorsHistory, _>(
                 &mut cursor,
@@ -275,12 +306,14 @@ impl<TX: DbTxMut + DbTx+'static, N: NodeTypes> ValidatorChangeWriter for Databas
         Ok(last_indices.len())
     }
     fn write_validator_changes(&self, mut changes: ValidatorChangeset) -> ProviderResult<()> {
-        changes.validators.par_sort_by_key(|a|a.0);
-        let mut validators_cursor=self.tx_ref().cursor_write::<tables::PlainValidatorState>()?;
-        for (address,validator)in changes.validators{
-            if let Some(validator)=validator{
+        changes.validators.par_sort_by_key(|a| a.0);
+        let mut validators_cursor = self
+            .tx_ref()
+            .cursor_write::<tables::PlainValidatorState>()?;
+        for (address, validator) in changes.validators {
+            if let Some(validator) = validator {
                 validators_cursor.upsert(address, (&validator).into())?;
-            }else if validators_cursor.seek_exact(address)?.is_some(){
+            } else if validators_cursor.seek_exact(address)?.is_some() {
                 validators_cursor.delete_current()?;
             }
         }
@@ -293,7 +326,14 @@ impl<TX: DbTxMut + DbTx+'static, N: NodeTypes> ValidatorChangeWriter for Databas
         let validator_changesets = self.take::<tables::ValidatorChangeSets>(range.clone())?;
         let mut validator_cursor = self.tx.cursor_write::<tables::PlainValidatorState>()?;
         let mut processed: HashSet<Address, RandomState> = HashSet::new();
-        for (block_number, ValidatorBeforeTx { address, info: old_validator }) in validator_changesets {
+        for (
+            block_number,
+            ValidatorBeforeTx {
+                address,
+                info: old_validator,
+            },
+        ) in validator_changesets
+        {
             if !processed.insert(address) {
                 continue;
             }
@@ -313,7 +353,10 @@ impl<TX: DbTxMut + DbTx+'static, N: NodeTypes> ValidatorChangeWriter for Databas
         }
         Ok(())
     }
-    fn take_validator(&self, range: RangeInclusive<BlockNumber>) -> ProviderResult<ValidatorChangeset> {
+    fn take_validator(
+        &self,
+        range: RangeInclusive<BlockNumber>,
+    ) -> ProviderResult<ValidatorChangeset> {
         todo!()
     }
 }
@@ -407,12 +450,13 @@ impl<TX: DbTx + 'static, N: NodeTypes> DatabaseProvider<TX, N> {
         &'a self,
         block_hash: BlockHash,
     ) -> ProviderResult<Box<dyn StateProvider + 'a>> {
-        let mut block_number =
-            self.block_number(block_hash)?.ok_or(ProviderError::BlockHashNotFound(block_hash))?;
-        if block_number == self.best_block_number().unwrap_or_default() &&
-            block_number == self.last_block_number().unwrap_or_default()
+        let mut block_number = self
+            .block_number(block_hash)?
+            .ok_or(ProviderError::BlockHashNotFound(block_hash))?;
+        if block_number == self.best_block_number().unwrap_or_default()
+            && block_number == self.last_block_number().unwrap_or_default()
         {
-            return Ok(Box::new(LatestStateProviderRef::new(self)))
+            return Ok(Box::new(LatestStateProviderRef::new(self)));
         }
 
         // +1 as the changeset that we want is the one that was applied after this block.
@@ -482,7 +526,13 @@ impl<TX: DbTxMut, N: NodeTypes> DatabaseProvider<TX, N> {
         prune_modes: PruneModes,
         storage: Arc<N::Storage>,
     ) -> Self {
-        Self { tx, chain_spec, static_file_provider, prune_modes, storage }
+        Self {
+            tx,
+            chain_spec,
+            static_file_provider,
+            prune_modes,
+            storage,
+        }
     }
 }
 
@@ -569,11 +619,16 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
             let parent_hash = self
                 .block_hash(parent_number)?
                 .ok_or_else(|| ProviderError::HeaderNotFound(parent_number.into()))?;
-            return Err(ProviderError::UnwindStateRootMismatch(Box::new(RootMismatch {
-                root: GotExpected { got: new_state_root, expected: parent_state_root },
-                block_number: parent_number,
-                block_hash: parent_hash,
-            })))
+            return Err(ProviderError::UnwindStateRootMismatch(Box::new(
+                RootMismatch {
+                    root: GotExpected {
+                        got: new_state_root,
+                        expected: parent_state_root,
+                    },
+                    block_number: parent_number,
+                    block_hash: parent_hash,
+                },
+            )));
         }
         self.write_trie_updates(&trie_updates)?;
 
@@ -593,8 +648,9 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         }
 
         if remove_from.static_files() && !self.prune_modes.has_receipts_pruning() {
-            let static_file_receipt_num =
-                self.static_file_provider.get_highest_static_file_tx(StaticFileSegment::Receipts);
+            let static_file_receipt_num = self
+                .static_file_provider
+                .get_highest_static_file_tx(StaticFileSegment::Receipts);
 
             let to_delete = static_file_receipt_num
                 .map(|static_num| (static_num + 1).saturating_sub(from_tx))
@@ -617,7 +673,7 @@ impl<TX: DbTx + 'static, N: NodeTypes> TryIntoHistoricalStateProvider for Databa
         // if the block number is the same as the currently best block number on disk we can use the
         // latest state provider here
         if block_number == self.best_block_number().unwrap_or_default() {
-            return Ok(Box::new(LatestStateProvider::new(self)))
+            return Ok(Box::new(LatestStateProvider::new(self)));
         }
 
         // +1 as the changeset that we want is the one that was applied after this block.
@@ -671,11 +727,15 @@ impl<
             block.header().difficulty()
         } else {
             let parent_block_number = block.number() - 1;
-            let parent_ttd = self.header_td_by_number(parent_block_number)?.unwrap_or_default();
+            let parent_ttd = self
+                .header_td_by_number(parent_block_number)?
+                .unwrap_or_default();
             parent_ttd + block.header().difficulty()
         };
 
-        let mut writer = self.static_file_provider.latest_writer(StaticFileSegment::Headers)?;
+        let mut writer = self
+            .static_file_provider
+            .latest_writer(StaticFileSegment::Headers)?;
 
         // Backfill: some tests start at a forward block number, but static files require no gaps.
         let segment_header = writer.user_header();
@@ -720,7 +780,7 @@ where
     while let Some((sharded_key, list)) = item {
         // If the shard does not belong to the key, break.
         if !shard_belongs_to_key(&sharded_key) {
-            break
+            break;
         }
         cursor.delete_current()?;
 
@@ -729,12 +789,15 @@ where
         let first = list.iter().next().expect("List can't be empty");
         if first >= block_number {
             item = cursor.prev()?;
-            continue
+            continue;
         } else if block_number <= sharded_key.as_ref().highest_block_number {
             // Filter out all elements greater than block number.
-            return Ok(list.iter().take_while(|i| *i < block_number).collect::<Vec<_>>())
+            return Ok(list
+                .iter()
+                .take_while(|i| *i < block_number)
+                .collect::<Vec<_>>());
         }
-        return Ok(list.iter().collect::<Vec<_>>())
+        return Ok(list.iter().collect::<Vec<_>>());
     }
 
     Ok(Vec::new())
@@ -749,7 +812,13 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
         prune_modes: PruneModes,
         storage: Arc<N::Storage>,
     ) -> Self {
-        Self { tx, chain_spec, static_file_provider, prune_modes, storage }
+        Self {
+            tx,
+            chain_spec,
+            static_file_provider,
+            prune_modes,
+            storage,
+        }
     }
 
     /// Consume `DbTx` or `DbTxMut`.
@@ -782,13 +851,14 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
     where
         C: DbCursorRO<tables::Transactions<TxTy<N>>>,
     {
-        self.static_file_provider.get_range_with_static_file_or_database(
-            StaticFileSegment::Transactions,
-            to_range(range),
-            |static_file, range, _| static_file.transactions_by_tx_range(range),
-            |range, _| self.cursor_collect(cursor, range),
-            |_| true,
-        )
+        self.static_file_provider
+            .get_range_with_static_file_or_database(
+                StaticFileSegment::Transactions,
+                to_range(range),
+                |static_file, range, _| static_file.transactions_by_tx_range(range),
+                |range, _| self.cursor_collect(cursor, range),
+                |_| true,
+            )
     }
 
     fn recovered_block<H, HF, B, BF>(
@@ -803,8 +873,12 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
         HF: FnOnce(BlockNumber) -> ProviderResult<Option<H>>,
         BF: FnOnce(H, BodyTy<N>, Vec<Address>) -> ProviderResult<Option<B>>,
     {
-        let Some(block_number) = self.convert_hash_or_number(id)? else { return Ok(None) };
-        let Some(header) = header_by_number(block_number)? else { return Ok(None) };
+        let Some(block_number) = self.convert_hash_or_number(id)? else {
+            return Ok(None);
+        };
+        let Some(header) = header_by_number(block_number)? else {
+            return Ok(None);
+        };
 
         // Get the block body
         //
@@ -812,14 +886,19 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
         // in the database yet, or they do exit but are not indexed. If they exist but are not
         // indexed, we don't have enough information to return the block anyways, so we return
         // `None`.
-        let Some(body) = self.block_body_indices(block_number)? else { return Ok(None) };
+        let Some(body) = self.block_body_indices(block_number)? else {
+            return Ok(None);
+        };
 
         let tx_range = body.tx_num_range();
 
         let (transactions, senders) = if tx_range.is_empty() {
             (vec![], vec![])
         } else {
-            (self.transactions_by_tx_range(tx_range.clone())?, self.senders_by_tx_range(tx_range)?)
+            (
+                self.transactions_by_tx_range(tx_range.clone())?,
+                self.senders_by_tx_range(tx_range)?,
+            )
         };
 
         let body = self
@@ -853,7 +932,7 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
         F: FnMut(H, BodyTy<N>, Range<TxNumber>) -> ProviderResult<R>,
     {
         if range.is_empty() {
-            return Ok(Vec::new())
+            return Ok(Vec::new());
         }
 
         let len = range.end().saturating_sub(*range.start()) as usize;
@@ -922,10 +1001,9 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
                 Vec::new()
             } else {
                 // fetch senders from the senders table
-                let known_senders =
-                    senders_cursor
-                        .walk_range(tx_range.clone())?
-                        .collect::<Result<HashMap<_, _>, _>>()?;
+                let known_senders = senders_cursor
+                    .walk_range(tx_range.clone())?
+                    .collect::<Result<HashMap<_, _>, _>>()?;
 
                 let mut senders = Vec::with_capacity(body.transactions().len());
                 for (tx_num, tx) in tx_range.zip(body.transactions()) {
@@ -974,7 +1052,10 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
 
         // add account changeset changes
         for (block_number, account_before) in account_changeset.into_iter().rev() {
-            let AccountBeforeTx { info: old_info, address } = account_before;
+            let AccountBeforeTx {
+                info: old_info,
+                address,
+            } = account_before;
             match state.entry(address) {
                 hash_map::Entry::Vacant(entry) => {
                     let new_info = plain_accounts_cursor.seek_exact(address)?.map(|kv| kv.1);
@@ -986,7 +1067,12 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
                 }
             }
             // insert old info into reverts.
-            reverts.entry(block_number).or_default().entry(address).or_default().0 = Some(old_info);
+            reverts
+                .entry(block_number)
+                .or_default()
+                .entry(address)
+                .or_default()
+                .0 = Some(old_info);
         }
 
         // add storage changeset changes
@@ -1048,7 +1134,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> DatabaseProvider<TX, N> {
             // delete old shard so new one can be inserted.
             cursor.delete_current()?;
             let list = list.iter().collect::<Vec<_>>();
-            return Ok(list)
+            return Ok(list);
         }
         Ok(Vec::new())
     }
@@ -1075,7 +1161,9 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> DatabaseProvider<TX, N> {
                 self.take_shard::<T>(&mut cursor, sharded_key_factory(partial_key, u64::MAX))?;
             last_shard.extend(indices);
             // Chunk indices and insert them in shards of N size.
-            let mut chunks = last_shard.chunks(sharded_key::NUM_OF_INDICES_IN_SHARD).peekable();
+            let mut chunks = last_shard
+                .chunks(sharded_key::NUM_OF_INDICES_IN_SHARD)
+                .peekable();
             while let Some(list) = chunks.next() {
                 let highest_block_number = if chunks.peek().is_some() {
                     *list.last().expect("`chunks` does not return empty list")
@@ -1095,7 +1183,9 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> DatabaseProvider<TX, N> {
 
 impl<TX: DbTx, N: NodeTypes> AccountReader for DatabaseProvider<TX, N> {
     fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
-        Ok(self.tx.get_by_encoded_key::<tables::PlainAccountState>(address)?)
+        Ok(self
+            .tx
+            .get_by_encoded_key::<tables::PlainAccountState>(address)?)
     }
 }
 
@@ -1108,7 +1198,9 @@ impl<TX: DbTx, N: NodeTypes> AccountExtReader for DatabaseProvider<TX, N> {
             .cursor_read::<tables::AccountChangeSets>()?
             .walk_range(range)?
             .map(|entry| {
-                entry.map(|(_, account_before)| account_before.address).map_err(Into::into)
+                entry
+                    .map(|(_, account_before)| account_before.address)
+                    .map_err(Into::into)
             })
             .collect()
     }
@@ -1120,7 +1212,11 @@ impl<TX: DbTx, N: NodeTypes> AccountExtReader for DatabaseProvider<TX, N> {
         let mut plain_accounts = self.tx.cursor_read::<tables::PlainAccountState>()?;
         Ok(iter
             .into_iter()
-            .map(|address| plain_accounts.seek_exact(address).map(|a| (address, a.map(|(_, v)| v))))
+            .map(|address| {
+                plain_accounts
+                    .seek_exact(address)
+                    .map(|a| (address, a.map(|(_, v)| v)))
+            })
             .collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -1207,7 +1303,9 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> HeaderSyncGapProvider
             }
             Ordering::Less => {
                 // There's either missing or corrupted files.
-                return Err(ProviderError::HeaderNotFound(next_static_file_block_num.into()))
+                return Err(ProviderError::HeaderNotFound(
+                    next_static_file_block_num.into(),
+                ));
             }
             Ordering::Equal => {}
         }
@@ -1263,7 +1361,12 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> HeaderProvider for DatabasePro
             StaticFileSegment::Headers,
             number,
             |static_file| static_file.header_td_by_number(number),
-            || Ok(self.tx.get::<tables::HeaderTerminalDifficulties>(number)?.map(|td| td.0)),
+            || {
+                Ok(self
+                    .tx
+                    .get::<tables::HeaderTerminalDifficulties>(number)?
+                    .map(|td| td.0))
+            },
         )
     }
 
@@ -1271,13 +1374,14 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> HeaderProvider for DatabasePro
         &self,
         range: impl RangeBounds<BlockNumber>,
     ) -> ProviderResult<Vec<Self::Header>> {
-        self.static_file_provider.get_range_with_static_file_or_database(
-            StaticFileSegment::Headers,
-            to_range(range),
-            |static_file, range, _| static_file.headers_range(range),
-            |range, _| self.cursor_read_collect::<tables::Headers<Self::Header>>(range),
-            |_| true,
-        )
+        self.static_file_provider
+            .get_range_with_static_file_or_database(
+                StaticFileSegment::Headers,
+                to_range(range),
+                |static_file, range, _| static_file.headers_range(range),
+                |range, _| self.cursor_read_collect::<tables::Headers<Self::Header>>(range),
+                |_| true,
+            )
     }
 
     fn sealed_header(
@@ -1306,29 +1410,32 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> HeaderProvider for DatabasePro
         range: impl RangeBounds<BlockNumber>,
         predicate: impl FnMut(&SealedHeader<Self::Header>) -> bool,
     ) -> ProviderResult<Vec<SealedHeader<Self::Header>>> {
-        self.static_file_provider.get_range_with_static_file_or_database(
-            StaticFileSegment::Headers,
-            to_range(range),
-            |static_file, range, predicate| static_file.sealed_headers_while(range, predicate),
-            |range, mut predicate| {
-                let mut headers = vec![];
-                for entry in
-                    self.tx.cursor_read::<tables::Headers<Self::Header>>()?.walk_range(range)?
-                {
-                    let (number, header) = entry?;
-                    let hash = self
-                        .block_hash(number)?
-                        .ok_or_else(|| ProviderError::HeaderNotFound(number.into()))?;
-                    let sealed = SealedHeader::new(header, hash);
-                    if !predicate(&sealed) {
-                        break
+        self.static_file_provider
+            .get_range_with_static_file_or_database(
+                StaticFileSegment::Headers,
+                to_range(range),
+                |static_file, range, predicate| static_file.sealed_headers_while(range, predicate),
+                |range, mut predicate| {
+                    let mut headers = vec![];
+                    for entry in self
+                        .tx
+                        .cursor_read::<tables::Headers<Self::Header>>()?
+                        .walk_range(range)?
+                    {
+                        let (number, header) = entry?;
+                        let hash = self
+                            .block_hash(number)?
+                            .ok_or_else(|| ProviderError::HeaderNotFound(number.into()))?;
+                        let sealed = SealedHeader::new(header, hash);
+                        if !predicate(&sealed) {
+                            break;
+                        }
+                        headers.push(sealed);
                     }
-                    headers.push(sealed);
-                }
-                Ok(headers)
-            },
-            predicate,
-        )
+                    Ok(headers)
+                },
+                predicate,
+            )
     }
 }
 
@@ -1347,13 +1454,14 @@ impl<TX: DbTx + 'static, N: NodeTypes> BlockHashReader for DatabaseProvider<TX, 
         start: BlockNumber,
         end: BlockNumber,
     ) -> ProviderResult<Vec<B256>> {
-        self.static_file_provider.get_range_with_static_file_or_database(
-            StaticFileSegment::Headers,
-            start..end,
-            |static_file, range, _| static_file.canonical_hashes_range(range.start, range.end),
-            |range, _| self.cursor_read_collect::<tables::CanonicalHeaders>(range),
-            |_| true,
-        )
+        self.static_file_provider
+            .get_range_with_static_file_or_database(
+                StaticFileSegment::Headers,
+                start..end,
+                |static_file, range, _| static_file.canonical_hashes_range(range.start, range.end),
+                |range, _| self.cursor_read_collect::<tables::CanonicalHeaders>(range),
+                |_| true,
+            )
     }
 }
 
@@ -1361,7 +1469,10 @@ impl<TX: DbTx + 'static, N: NodeTypes> BlockNumReader for DatabaseProvider<TX, N
     fn chain_info(&self) -> ProviderResult<ChainInfo> {
         let best_number = self.best_block_number()?;
         let best_hash = self.block_hash(best_number)?.unwrap_or_default();
-        Ok(ChainInfo { best_hash, best_number })
+        Ok(ChainInfo {
+            best_hash,
+            best_number,
+        })
     }
 
     fn best_block_number(&self) -> ProviderResult<BlockNumber> {
@@ -1380,7 +1491,8 @@ impl<TX: DbTx + 'static, N: NodeTypes> BlockNumReader for DatabaseProvider<TX, N
             .last()?
             .map(|(num, _)| num)
             .max(
-                self.static_file_provider.get_highest_static_file_block(StaticFileSegment::Headers),
+                self.static_file_provider
+                    .get_highest_static_file_block(StaticFileSegment::Headers),
             )
             .unwrap_or_default())
     }
@@ -1418,7 +1530,7 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> BlockReader for DatabaseProvid
                 // If they exist but are not indexed, we don't have enough
                 // information to return the block anyways, so we return `None`.
                 let Some(transactions) = self.transactions_by_block(number.into())? else {
-                    return Ok(None)
+                    return Ok(None);
                 };
 
                 let body = self
@@ -1428,7 +1540,7 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> BlockReader for DatabaseProvid
                     .pop()
                     .ok_or(ProviderError::InvalidStorageOutput)?;
 
-                return Ok(Some(Self::Block::new(header, body)))
+                return Ok(Some(Self::Block::new(header, body)));
             }
         }
 
@@ -1547,66 +1659,67 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> TransactionsProviderExt
         &self,
         tx_range: Range<TxNumber>,
     ) -> ProviderResult<Vec<(TxHash, TxNumber)>> {
-        self.static_file_provider.get_range_with_static_file_or_database(
-            StaticFileSegment::Transactions,
-            tx_range,
-            |static_file, range, _| static_file.transaction_hashes_by_range(range),
-            |tx_range, _| {
-                let mut tx_cursor = self.tx.cursor_read::<tables::Transactions<TxTy<N>>>()?;
-                let tx_range_size = tx_range.clone().count();
-                let tx_walker = tx_cursor.walk_range(tx_range)?;
+        self.static_file_provider
+            .get_range_with_static_file_or_database(
+                StaticFileSegment::Transactions,
+                tx_range,
+                |static_file, range, _| static_file.transaction_hashes_by_range(range),
+                |tx_range, _| {
+                    let mut tx_cursor = self.tx.cursor_read::<tables::Transactions<TxTy<N>>>()?;
+                    let tx_range_size = tx_range.clone().count();
+                    let tx_walker = tx_cursor.walk_range(tx_range)?;
 
-                let chunk_size = (tx_range_size / rayon::current_num_threads()).max(1);
-                let mut channels = Vec::with_capacity(chunk_size);
-                let mut transaction_count = 0;
+                    let chunk_size = (tx_range_size / rayon::current_num_threads()).max(1);
+                    let mut channels = Vec::with_capacity(chunk_size);
+                    let mut transaction_count = 0;
 
-                #[inline]
-                fn calculate_hash<T>(
-                    entry: Result<(TxNumber, T), DatabaseError>,
-                    rlp_buf: &mut Vec<u8>,
-                ) -> Result<(B256, TxNumber), Box<ProviderError>>
-                where
-                    T: Encodable2718,
-                {
-                    let (tx_id, tx) = entry.map_err(|e| Box::new(e.into()))?;
-                    tx.encode_2718(rlp_buf);
-                    Ok((keccak256(rlp_buf), tx_id))
-                }
-
-                for chunk in &tx_walker.chunks(chunk_size) {
-                    let (tx, rx) = mpsc::channel();
-                    channels.push(rx);
-
-                    // Note: Unfortunate side-effect of how chunk is designed in itertools (it is
-                    // not Send)
-                    let chunk: Vec<_> = chunk.collect();
-                    transaction_count += chunk.len();
-
-                    // Spawn the task onto the global rayon pool
-                    // This task will send the results through the channel after it has calculated
-                    // the hash.
-                    rayon::spawn(move || {
-                        let mut rlp_buf = Vec::with_capacity(128);
-                        for entry in chunk {
-                            rlp_buf.clear();
-                            let _ = tx.send(calculate_hash(entry, &mut rlp_buf));
-                        }
-                    });
-                }
-                let mut tx_list = Vec::with_capacity(transaction_count);
-
-                // Iterate over channels and append the tx hashes unsorted
-                for channel in channels {
-                    while let Ok(tx) = channel.recv() {
-                        let (tx_hash, tx_id) = tx.map_err(|boxed| *boxed)?;
-                        tx_list.push((tx_hash, tx_id));
+                    #[inline]
+                    fn calculate_hash<T>(
+                        entry: Result<(TxNumber, T), DatabaseError>,
+                        rlp_buf: &mut Vec<u8>,
+                    ) -> Result<(B256, TxNumber), Box<ProviderError>>
+                    where
+                        T: Encodable2718,
+                    {
+                        let (tx_id, tx) = entry.map_err(|e| Box::new(e.into()))?;
+                        tx.encode_2718(rlp_buf);
+                        Ok((keccak256(rlp_buf), tx_id))
                     }
-                }
 
-                Ok(tx_list)
-            },
-            |_| true,
-        )
+                    for chunk in &tx_walker.chunks(chunk_size) {
+                        let (tx, rx) = mpsc::channel();
+                        channels.push(rx);
+
+                        // Note: Unfortunate side-effect of how chunk is designed in itertools (it is
+                        // not Send)
+                        let chunk: Vec<_> = chunk.collect();
+                        transaction_count += chunk.len();
+
+                        // Spawn the task onto the global rayon pool
+                        // This task will send the results through the channel after it has calculated
+                        // the hash.
+                        rayon::spawn(move || {
+                            let mut rlp_buf = Vec::with_capacity(128);
+                            for entry in chunk {
+                                rlp_buf.clear();
+                                let _ = tx.send(calculate_hash(entry, &mut rlp_buf));
+                            }
+                        });
+                    }
+                    let mut tx_list = Vec::with_capacity(transaction_count);
+
+                    // Iterate over channels and append the tx hashes unsorted
+                    for channel in channels {
+                        while let Ok(tx) = channel.recv() {
+                            let (tx_hash, tx_id) = tx.map_err(|boxed| *boxed)?;
+                            tx_list.push((tx_hash, tx_id));
+                        }
+                    }
+
+                    Ok(tx_list)
+                },
+                |_| true,
+            )
     }
 }
 
@@ -1654,8 +1767,9 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> TransactionsProvider for Datab
         let mut transaction_cursor = self.tx.cursor_read::<tables::TransactionBlocks>()?;
         if let Some(transaction_id) = self.transaction_id(tx_hash)? {
             if let Some(transaction) = self.transaction_by_id_unhashed(transaction_id)? {
-                if let Some(block_number) =
-                    transaction_cursor.seek(transaction_id).map(|b| b.map(|(_, bn)| bn))?
+                if let Some(block_number) = transaction_cursor
+                    .seek(transaction_id)
+                    .map(|b| b.map(|(_, bn)| bn))?
                 {
                     if let Some(sealed_header) = self.sealed_header(block_number)? {
                         let (header, block_hash) = sealed_header.split();
@@ -1676,7 +1790,7 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> TransactionsProvider for Datab
                                 timestamp: header.timestamp(),
                             };
 
-                            return Ok(Some((transaction, meta)))
+                            return Ok(Some((transaction, meta)));
                         }
                     }
                 }
@@ -1695,7 +1809,9 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> TransactionsProvider for Datab
         &self,
         id: BlockHashOrNumber,
     ) -> ProviderResult<Option<Vec<Self::Transaction>>> {
-        let mut tx_cursor = self.tx.cursor_read::<tables::Transactions<Self::Transaction>>()?;
+        let mut tx_cursor = self
+            .tx
+            .cursor_read::<tables::Transactions<Self::Transaction>>()?;
 
         if let Some(block_number) = self.convert_hash_or_number(id)? {
             if let Some(body) = self.block_body_indices(block_number)? {
@@ -1703,8 +1819,11 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> TransactionsProvider for Datab
                 return if tx_range.is_empty() {
                     Ok(Some(Vec::new()))
                 } else {
-                    Ok(Some(self.transactions_by_tx_range_with_cursor(tx_range, &mut tx_cursor)?))
-                }
+                    Ok(Some(self.transactions_by_tx_range_with_cursor(
+                        tx_range,
+                        &mut tx_cursor,
+                    )?))
+                };
             }
         }
         Ok(None)
@@ -1715,7 +1834,9 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> TransactionsProvider for Datab
         range: impl RangeBounds<BlockNumber>,
     ) -> ProviderResult<Vec<Vec<Self::Transaction>>> {
         let range = to_range(range);
-        let mut tx_cursor = self.tx.cursor_read::<tables::Transactions<Self::Transaction>>()?;
+        let mut tx_cursor = self
+            .tx
+            .cursor_read::<tables::Transactions<Self::Transaction>>()?;
 
         self.block_body_indices_range(range.start..=range.end.saturating_sub(1))?
             .into_iter()
@@ -1786,7 +1907,7 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> ReceiptProvider for DatabasePr
                     Ok(Some(Vec::new()))
                 } else {
                     self.receipts_by_tx_range(tx_range).map(Some)
-                }
+                };
             }
         }
         Ok(None)
@@ -1796,13 +1917,14 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> ReceiptProvider for DatabasePr
         &self,
         range: impl RangeBounds<TxNumber>,
     ) -> ProviderResult<Vec<Self::Receipt>> {
-        self.static_file_provider.get_range_with_static_file_or_database(
-            StaticFileSegment::Receipts,
-            to_range(range),
-            |static_file, range, _| static_file.receipts_by_tx_range(range),
-            |range, _| self.cursor_read_collect::<tables::Receipts<Self::Receipt>>(range),
-            |_| true,
-        )
+        self.static_file_provider
+            .get_range_with_static_file_or_database(
+                StaticFileSegment::Receipts,
+                to_range(range),
+                |static_file, range, _| static_file.receipts_by_tx_range(range),
+                |range, _| self.cursor_read_collect::<tables::Receipts<Self::Receipt>>(range),
+                |_| true,
+            )
     }
 }
 
@@ -1830,7 +1952,7 @@ impl<TX: DbTx + 'static, N: NodeTypes<ChainSpec: EthereumHardforks>> Withdrawals
                             .unwrap_or_default();
                         Ok(Some(withdrawals))
                     },
-                )
+                );
             }
         }
         Ok(None)
@@ -1847,25 +1969,32 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> OmmersProvider for DatabasePro
             // If the Paris (Merge) hardfork block is known and block is after it, return empty
             // ommers.
             if self.chain_spec.is_paris_active_at_block(number) {
-                return Ok(Some(Vec::new()))
+                return Ok(Some(Vec::new()));
             }
 
             return self.static_file_provider.get_with_static_file_or_database(
                 StaticFileSegment::BlockMeta,
                 number,
                 |static_file| static_file.ommers(id),
-                || Ok(self.tx.get::<tables::BlockOmmers<Self::Header>>(number)?.map(|o| o.ommers)),
-            )
+                || {
+                    Ok(self
+                        .tx
+                        .get::<tables::BlockOmmers<Self::Header>>(number)?
+                        .map(|o| o.ommers))
+                },
+            );
         }
 
         Ok(None)
     }
 }
 
-impl<TX: DbTx + 'static, N: NodeTypes<ChainSpec: EthereumHardforks>> SnapshotProvider for DatabaseProvider<TX, N>{
+impl<TX: DbTx + 'static, N: NodeTypes<ChainSpec: EthereumHardforks>> SnapshotProvider
+    for DatabaseProvider<TX, N>
+{
     fn load_snapshot(&self, id: BlockHashOrNumber) -> ProviderResult<Option<Snapshot>> {
         if let Some(number) = self.convert_hash_or_number(id)? {
-            return Ok(self.tx.get::<tables::Snapshots>(number)?)
+            return Ok(self.tx.get::<tables::Snapshots>(number)?);
         }
         Ok(None)
     }
@@ -1875,65 +2004,130 @@ impl<TX: DbTx + 'static, N: NodeTypes<ChainSpec: EthereumHardforks>> SnapshotPro
     }
 }
 
-
-impl<TX: DbTxMut, N: NodeTypes<ChainSpec: EthereumHardforks>> SnapshotProviderWriter for DatabaseProvider<TX, N>{
+impl<TX: DbTxMut, N: NodeTypes<ChainSpec: EthereumHardforks>> SnapshotProviderWriter
+    for DatabaseProvider<TX, N>
+{
     fn save_snapshot(&self, number: BlockNumber, snapshot: Snapshot) -> ProviderResult<bool> {
         self.tx.put::<tables::Snapshots>(number, snapshot)?;
         Ok(true)
     }
 
-    fn save_snapshot_by_hash(&self, block_hash: &BlockHash,  snapshot: Snapshot) -> ProviderResult<()> {
-        Ok(self.tx.put::<tables::SnapshotsByHash>(block_hash.clone(), snapshot)?)
+    fn save_snapshot_by_hash(
+        &self,
+        block_hash: &BlockHash,
+        snapshot: Snapshot,
+    ) -> ProviderResult<()> {
+        Ok(self
+            .tx
+            .put::<tables::SnapshotsByHash>(block_hash.clone(), snapshot)?)
     }
 
-    fn save_signer_by_hash(&self, block_hash: &BlockHash,  signer: Address) -> ProviderResult<()> {
-        Ok(self.tx.put::<tables::SignersByHash>(block_hash.clone(), signer)?)
+    fn save_signer_by_hash(&self, block_hash: &BlockHash, signer: Address) -> ProviderResult<()> {
+        Ok(self
+            .tx
+            .put::<tables::SignersByHash>(block_hash.clone(), signer)?)
     }
 }
 
-impl<TX: DbTx + 'static, N: NodeTypes<ChainSpec: EthereumHardforks>> BeaconProvider for DatabaseProvider<TX, N>{
-
-    fn get_beacon_block_by_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BeaconBlock>> {
-        Ok(self.tx.get::<tables::BeaconBlocksByHash>(block_hash.clone())?)
+impl<TX: DbTx + 'static, N: NodeTypes<ChainSpec: EthereumHardforks>> BeaconProvider
+    for DatabaseProvider<TX, N>
+{
+    fn get_beacon_block_by_hash(
+        &self,
+        block_hash: &BlockHash,
+    ) -> ProviderResult<Option<BeaconBlock>> {
+        Ok(self
+            .tx
+            .get::<tables::BeaconBlocksByHash>(block_hash.clone())?)
     }
 
-    fn get_beacon_state_by_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BeaconState>> {
-        Ok(self.tx.get::<tables::BeaconStatesByHash>(block_hash.clone())?)
+    fn get_beacon_state_by_hash(
+        &self,
+        block_hash: &BlockHash,
+    ) -> ProviderResult<Option<BeaconState>> {
+        Ok(self
+            .tx
+            .get::<tables::BeaconStatesByHash>(block_hash.clone())?)
     }
 
-    fn get_beacon_block_hash_by_eth1_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BlockHash>> {
-        Ok(self.tx.get::<tables::BeaconBlockHashesByEth1Hash>(block_hash.clone())?)
+    fn get_beacon_block_hash_by_eth1_hash(
+        &self,
+        block_hash: &BlockHash,
+    ) -> ProviderResult<Option<BlockHash>> {
+        Ok(self
+            .tx
+            .get::<tables::BeaconBlockHashesByEth1Hash>(block_hash.clone())?)
     }
 
-    fn get_tree_by_hash_for_validator(&self, tree_hash: &B256) -> ProviderResult<Option<merkle_db_rs::tree::Tree<Validator>>> {
-        Ok(self.tx.get::<tables::TreeByHashForValidator>(tree_hash.clone())?)
+    fn get_tree_by_hash_for_validator(
+        &self,
+        tree_hash: &B256,
+    ) -> ProviderResult<Option<merkle_db_rs::tree::Tree<Validator>>> {
+        Ok(self
+            .tx
+            .get::<tables::TreeByHashForValidator>(tree_hash.clone())?)
     }
 
-    fn get_tree_by_hash_for_u64(&self, tree_hash: &B256) -> ProviderResult<Option<merkle_db_rs::tree::Tree<u64>>> {
+    fn get_tree_by_hash_for_u64(
+        &self,
+        tree_hash: &B256,
+    ) -> ProviderResult<Option<merkle_db_rs::tree::Tree<u64>>> {
         Ok(self.tx.get::<tables::TreeByHashForU64>(tree_hash.clone())?)
     }
 }
 
-impl<TX: DbTxMut, N: NodeTypes<ChainSpec: EthereumHardforks>> BeaconProviderWriter for DatabaseProvider<TX, N>{
-
-    fn save_beacon_block_by_hash(&self, block_hash: &BlockHash, beacon_block: BeaconBlock) -> ProviderResult<()> {
-        Ok(self.tx.put::<tables::BeaconBlocksByHash>(block_hash.clone(), beacon_block)?)
+impl<TX: DbTxMut, N: NodeTypes<ChainSpec: EthereumHardforks>> BeaconProviderWriter
+    for DatabaseProvider<TX, N>
+{
+    fn save_beacon_block_by_hash(
+        &self,
+        block_hash: &BlockHash,
+        beacon_block: BeaconBlock,
+    ) -> ProviderResult<()> {
+        Ok(self
+            .tx
+            .put::<tables::BeaconBlocksByHash>(block_hash.clone(), beacon_block)?)
     }
 
-    fn save_beacon_state_by_hash(&self, block_hash: &BlockHash,  beacon_state: BeaconState) -> ProviderResult<()> {
-        Ok(self.tx.put::<tables::BeaconStatesByHash>(block_hash.clone(), beacon_state)?)
+    fn save_beacon_state_by_hash(
+        &self,
+        block_hash: &BlockHash,
+        beacon_state: BeaconState,
+    ) -> ProviderResult<()> {
+        Ok(self
+            .tx
+            .put::<tables::BeaconStatesByHash>(block_hash.clone(), beacon_state)?)
     }
 
-    fn save_beacon_block_hash_by_eth1_hash(&self, eth1_block_hash: &BlockHash, beacon_block_hash: BlockHash) -> ProviderResult<()> {
-        Ok(self.tx.put::<tables::BeaconBlockHashesByEth1Hash>(eth1_block_hash.clone(), beacon_block_hash)?)
+    fn save_beacon_block_hash_by_eth1_hash(
+        &self,
+        eth1_block_hash: &BlockHash,
+        beacon_block_hash: BlockHash,
+    ) -> ProviderResult<()> {
+        Ok(self.tx.put::<tables::BeaconBlockHashesByEth1Hash>(
+            eth1_block_hash.clone(),
+            beacon_block_hash,
+        )?)
     }
 
-    fn save_tree_by_hash_for_validator(&self, tree_hash: &B256,  tree: merkle_db_rs::tree::Tree<Validator>) -> ProviderResult<()> {
-        Ok(self.tx.put::<tables::TreeByHashForValidator>(tree_hash.clone(), tree)?)
+    fn save_tree_by_hash_for_validator(
+        &self,
+        tree_hash: &B256,
+        tree: merkle_db_rs::tree::Tree<Validator>,
+    ) -> ProviderResult<()> {
+        Ok(self
+            .tx
+            .put::<tables::TreeByHashForValidator>(tree_hash.clone(), tree)?)
     }
 
-    fn save_tree_by_hash_for_u64(&self, tree_hash: &B256,  tree: merkle_db_rs::tree::Tree<u64>) -> ProviderResult<()> {
-        Ok(self.tx.put::<tables::TreeByHashForU64>(tree_hash.clone(), tree)?)
+    fn save_tree_by_hash_for_u64(
+        &self,
+        tree_hash: &B256,
+        tree: merkle_db_rs::tree::Tree<u64>,
+    ) -> ProviderResult<()> {
+        Ok(self
+            .tx
+            .put::<tables::TreeByHashForU64>(tree_hash.clone(), tree)?)
     }
 }
 
@@ -1953,15 +2147,16 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> BlockBodyIndicesProvider
         &self,
         range: RangeInclusive<BlockNumber>,
     ) -> ProviderResult<Vec<StoredBlockBodyIndices>> {
-        self.static_file_provider.get_range_with_static_file_or_database(
-            StaticFileSegment::BlockMeta,
-            *range.start()..*range.end() + 1,
-            |static_file, range, _| {
-                static_file.block_body_indices_range(range.start..=range.end.saturating_sub(1))
-            },
-            |range, _| self.cursor_read_collect::<tables::BlockBodyIndices>(range),
-            |_| true,
-        )
+        self.static_file_provider
+            .get_range_with_static_file_or_database(
+                StaticFileSegment::BlockMeta,
+                *range.start()..*range.end() + 1,
+                |static_file, range, _| {
+                    static_file.block_body_indices_range(range.start..=range.end.saturating_sub(1))
+                },
+                |range, _| self.cursor_read_collect::<tables::BlockBodyIndices>(range),
+                |_| true,
+            )
     }
 }
 
@@ -1972,7 +2167,9 @@ impl<TX: DbTx, N: NodeTypes> StageCheckpointReader for DatabaseProvider<TX, N> {
 
     /// Get stage checkpoint progress.
     fn get_stage_checkpoint_progress(&self, id: StageId) -> ProviderResult<Option<Vec<u8>>> {
-        Ok(self.tx.get::<tables::StageCheckpointProgresses>(id.to_string())?)
+        Ok(self
+            .tx
+            .get::<tables::StageCheckpointProgresses>(id.to_string())?)
     }
 
     fn get_all_checkpoints(&self) -> ProviderResult<Vec<(String, StageCheckpoint)>> {
@@ -1991,7 +2188,9 @@ impl<TX: DbTxMut, N: NodeTypes> StageCheckpointWriter for DatabaseProvider<TX, N
         id: StageId,
         checkpoint: StageCheckpoint,
     ) -> ProviderResult<()> {
-        Ok(self.tx.put::<tables::StageCheckpoints>(id.to_string(), checkpoint)?)
+        Ok(self
+            .tx
+            .put::<tables::StageCheckpoints>(id.to_string(), checkpoint)?)
     }
 
     /// Save stage checkpoint progress.
@@ -2000,7 +2199,9 @@ impl<TX: DbTxMut, N: NodeTypes> StageCheckpointWriter for DatabaseProvider<TX, N
         id: StageId,
         checkpoint: Vec<u8>,
     ) -> ProviderResult<()> {
-        Ok(self.tx.put::<tables::StageCheckpointProgresses>(id.to_string(), checkpoint)?)
+        Ok(self
+            .tx
+            .put::<tables::StageCheckpointProgresses>(id.to_string(), checkpoint)?)
     }
 
     fn update_pipeline_stages(
@@ -2016,7 +2217,11 @@ impl<TX: DbTxMut, N: NodeTypes> StageCheckpointWriter for DatabaseProvider<TX, N
                 stage_id.to_string(),
                 &StageCheckpoint {
                     block_number,
-                    ..if drop_stage_checkpoint { Default::default() } else { checkpoint }
+                    ..if drop_stage_checkpoint {
+                        Default::default()
+                    } else {
+                        checkpoint
+                    }
                 },
             )?;
         }
@@ -2041,7 +2246,10 @@ impl<TX: DbTx + 'static, N: NodeTypes> StorageReader for DatabaseProvider<TX, N>
                         Ok(plain_storage
                             .seek_by_key_subkey(address, key)?
                             .filter(|v| v.key == key)
-                            .unwrap_or_else(|| StorageEntry { key, value: Default::default() }))
+                            .unwrap_or_else(|| StorageEntry {
+                                key,
+                                value: Default::default(),
+                            }))
                     })
                     .collect::<ProviderResult<Vec<_>>>()
                     .map(|storage| (address, storage))
@@ -2058,11 +2266,17 @@ impl<TX: DbTx + 'static, N: NodeTypes> StorageReader for DatabaseProvider<TX, N>
             .walk_range(BlockNumberAddress::range(range))?
             // fold all storages and save its old state so we can remove it from HashedStorage
             // it is needed as it is dup table.
-            .try_fold(BTreeMap::new(), |mut accounts: BTreeMap<Address, BTreeSet<B256>>, entry| {
-                let (BlockNumberAddress((_, address)), storage_entry) = entry?;
-                accounts.entry(address).or_default().insert(storage_entry.key);
-                Ok(accounts)
-            })
+            .try_fold(
+                BTreeMap::new(),
+                |mut accounts: BTreeMap<Address, BTreeSet<B256>>, entry| {
+                    let (BlockNumberAddress((_, address)), storage_entry) = entry?;
+                    accounts
+                        .entry(address)
+                        .or_default()
+                        .insert(storage_entry.key);
+                    Ok(accounts)
+                },
+            )
     }
 
     fn changed_storages_and_blocks_with_range(
@@ -2071,8 +2285,9 @@ impl<TX: DbTx + 'static, N: NodeTypes> StorageReader for DatabaseProvider<TX, N>
     ) -> ProviderResult<BTreeMap<(Address, B256), Vec<u64>>> {
         let mut changeset_cursor = self.tx.cursor_read::<tables::StorageChangeSets>()?;
 
-        let storage_changeset_lists =
-            changeset_cursor.walk_range(BlockNumberAddress::range(range))?.try_fold(
+        let storage_changeset_lists = changeset_cursor
+            .walk_range(BlockNumberAddress::range(range))?
+            .try_fold(
                 BTreeMap::new(),
                 |mut storages: BTreeMap<(Address, B256), Vec<u64>>, entry| -> ProviderResult<_> {
                     let (index, storage) = entry?;
@@ -2106,8 +2321,9 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
 
         let tip = self.last_block_number()?.max(last_block);
 
-        let (plain_state, reverts) =
-            execution_outcome.bundle.to_plain_state_and_reverts(is_value_known);
+        let (plain_state, reverts) = execution_outcome
+            .bundle
+            .to_plain_state_and_reverts(is_value_known);
 
         self.write_state_reverts(reverts, first_block)?;
         self.write_state_changes(plain_state)?;
@@ -2140,13 +2356,19 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
         // Prepare receipts static writer if we are going to write receipts to static files
         //
         // We are writing to static files if requested and if there's no receipt pruning configured
-        let mut receipts_static_writer = (write_receipts_to.static_files() &&
-            !has_receipts_pruning)
-            .then(|| self.static_file_provider.get_writer(first_block, StaticFileSegment::Receipts))
+        let mut receipts_static_writer = (write_receipts_to.static_files()
+            && !has_receipts_pruning)
+            .then(|| {
+                self.static_file_provider
+                    .get_writer(first_block, StaticFileSegment::Receipts)
+            })
             .transpose()?;
 
         let has_contract_log_filter = !self.prune_modes.receipts_log_filter.is_empty();
-        let contract_log_pruner = self.prune_modes.receipts_log_filter.group_by_block(tip, None)?;
+        let contract_log_pruner = self
+            .prune_modes
+            .receipts_log_filter
+            .group_by_block(tip, None)?;
 
         // All receipts from the last 128 blocks are required for blockchain tree, even with
         // [`PruneSegment::ContractLogs`].
@@ -2159,8 +2381,11 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
             allowed_addresses.extend(addresses.iter().copied());
         }
 
-        for (idx, (receipts, first_tx_index)) in
-            execution_outcome.receipts.iter().zip(block_indices).enumerate()
+        for (idx, (receipts, first_tx_index)) in execution_outcome
+            .receipts
+            .iter()
+            .zip(block_indices)
+            .enumerate()
         {
             let block_number = first_block + idx as u64;
 
@@ -2170,12 +2395,13 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
             }
 
             // Skip writing receipts if pruning configuration requires us to.
-            if prunable_receipts &&
-                self.prune_modes
+            if prunable_receipts
+                && self
+                    .prune_modes
                     .receipts
                     .is_some_and(|mode| mode.should_prune(block_number, tip))
             {
-                continue
+                continue;
             }
 
             // If there are new addresses to retain after this block number, track them
@@ -2187,11 +2413,14 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
                 let receipt_idx = first_tx_index + idx as u64;
                 // Skip writing receipt if log filter is active and it does not have any logs to
                 // retain
-                if prunable_receipts &&
-                    has_contract_log_filter &&
-                    !receipt.logs().iter().any(|log| allowed_addresses.contains(&log.address))
+                if prunable_receipts
+                    && has_contract_log_filter
+                    && !receipt
+                        .logs()
+                        .iter()
+                        .any(|log| allowed_addresses.contains(&log.address))
                 {
-                    continue
+                    continue;
                 }
 
                 if let Some(writer) = &mut receipts_static_writer {
@@ -2214,16 +2443,24 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
     ) -> ProviderResult<()> {
         // Write storage changes
         tracing::trace!("Writing storage changes");
-        let mut storages_cursor = self.tx_ref().cursor_dup_write::<tables::PlainStorageState>()?;
-        let mut storage_changeset_cursor =
-            self.tx_ref().cursor_dup_write::<tables::StorageChangeSets>()?;
+        let mut storages_cursor = self
+            .tx_ref()
+            .cursor_dup_write::<tables::PlainStorageState>()?;
+        let mut storage_changeset_cursor = self
+            .tx_ref()
+            .cursor_dup_write::<tables::StorageChangeSets>()?;
         for (block_index, mut storage_changes) in reverts.storage.into_iter().enumerate() {
             let block_number = first_block + block_index as BlockNumber;
 
             tracing::trace!(block_number, "Writing block change");
             // sort changes by address.
             storage_changes.par_sort_unstable_by_key(|a| a.address);
-            for PlainStorageRevert { address, wiped, storage_revert } in storage_changes {
+            for PlainStorageRevert {
+                address,
+                wiped,
+                storage_revert,
+            } in storage_changes
+            {
                 let storage_id = BlockNumberAddress((block_number, address));
 
                 let mut storage = storage_revert
@@ -2256,8 +2493,9 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
 
         // Write account changes
         tracing::trace!("Writing account changes");
-        let mut account_changeset_cursor =
-            self.tx_ref().cursor_dup_write::<tables::AccountChangeSets>()?;
+        let mut account_changeset_cursor = self
+            .tx_ref()
+            .cursor_dup_write::<tables::AccountChangeSets>()?;
 
         for (block_index, mut account_block_reverts) in reverts.accounts.into_iter().enumerate() {
             let block_number = first_block + block_index as BlockNumber;
@@ -2267,7 +2505,10 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
             for (address, info) in account_block_reverts {
                 account_changeset_cursor.append_dup(
                     block_number,
-                    AccountBeforeTx { address, info: info.map(Into::into) },
+                    AccountBeforeTx {
+                        address,
+                        info: info.map(Into::into),
+                    },
                 )?;
             }
         }
@@ -2305,8 +2546,15 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
 
         // Write new storage state and wipe storage if needed.
         tracing::trace!(len = changes.storage.len(), "Writing new storage state");
-        let mut storages_cursor = self.tx_ref().cursor_dup_write::<tables::PlainStorageState>()?;
-        for PlainStorageChangeset { address, wipe_storage, storage } in changes.storage {
+        let mut storages_cursor = self
+            .tx_ref()
+            .cursor_dup_write::<tables::PlainStorageState>()?;
+        for PlainStorageChangeset {
+            address,
+            wipe_storage,
+            storage,
+        } in changes.storage
+        {
             // Wiping of storage.
             if wipe_storage && storages_cursor.seek_exact(address)?.is_some() {
                 storages_cursor.delete_current_duplicates()?;
@@ -2314,7 +2562,10 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
             // cast storages to B256.
             let mut storage = storage
                 .into_iter()
-                .map(|(k, value)| StorageEntry { key: k.into(), value })
+                .map(|(k, value)| StorageEntry {
+                    key: k.into(),
+                    value,
+                })
                 .collect::<Vec<_>>();
             // sort storage slots by key.
             storage.par_sort_unstable_by_key(|a| a.key);
@@ -2348,7 +2599,10 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
         }
 
         // Write hashed storage changes.
-        let sorted_storages = hashed_state.account_storages().iter().sorted_by_key(|(key, _)| *key);
+        let sorted_storages = hashed_state
+            .account_storages()
+            .iter()
+            .sorted_by_key(|(key, _)| *key);
         let mut hashed_storage_cursor =
             self.tx_ref().cursor_dup_write::<tables::HashedStorages>()?;
         for (hashed_address, storage) in sorted_storages {
@@ -2357,7 +2611,10 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
             }
 
             for (hashed_slot, value) in storage.storage_slots_sorted() {
-                let entry = StorageEntry { key: hashed_slot, value };
+                let entry = StorageEntry {
+                    key: hashed_slot,
+                    value,
+                };
                 if let Some(db_entry) =
                     hashed_storage_cursor.seek_by_key_subkey(*hashed_address, entry.key)?
                 {
@@ -2411,8 +2668,10 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
         let block_bodies = self.block_body_indices_range(range.clone())?;
 
         // get transaction receipts
-        let from_transaction_num =
-            block_bodies.first().expect("already checked if there are blocks").first_tx_num();
+        let from_transaction_num = block_bodies
+            .first()
+            .expect("already checked if there are blocks")
+            .first_tx_num();
 
         let storage_range = BlockNumberAddress::range(range.clone());
 
@@ -2447,7 +2706,10 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
 
             // revert storages
             for (storage_key, (old_storage_value, _new_storage_value)) in storage {
-                let storage_entry = StorageEntry { key: *storage_key, value: *old_storage_value };
+                let storage_entry = StorageEntry {
+                    key: *storage_key,
+                    value: *old_storage_value,
+                };
                 // delete previous value
                 // TODO: This does not use dupsort features
                 if plain_storage_cursor
@@ -2499,7 +2761,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
         let range = block + 1..=self.last_block_number()?;
 
         if range.is_empty() {
-            return Ok(ExecutionOutcome::default())
+            return Ok(ExecutionOutcome::default());
         }
         let start_block_number = *range.start();
 
@@ -2507,10 +2769,14 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
         let block_bodies = self.block_body_indices_range(range.clone())?;
 
         // get transaction receipts
-        let from_transaction_num =
-            block_bodies.first().expect("already checked if there are blocks").first_tx_num();
-        let to_transaction_num =
-            block_bodies.last().expect("already checked if there are blocks").last_tx_num();
+        let from_transaction_num = block_bodies
+            .first()
+            .expect("already checked if there are blocks")
+            .first_tx_num();
+        let to_transaction_num = block_bodies
+            .last()
+            .expect("already checked if there are blocks")
+            .last_tx_num();
 
         let storage_range = BlockNumberAddress::range(range.clone());
 
@@ -2547,7 +2813,10 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
 
             // revert storages
             for (storage_key, (old_storage_value, _new_storage_value)) in storage {
-                let storage_entry = StorageEntry { key: *storage_key, value: *old_storage_value };
+                let storage_entry = StorageEntry {
+                    key: *storage_key,
+                    value: *old_storage_value,
+                };
                 // delete previous value
                 // TODO: This does not use dupsort features
                 if plain_storage_cursor
@@ -2617,7 +2886,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> TrieWriter for DatabaseProvider
     /// Writes trie updates. Returns the number of entries modified.
     fn write_trie_updates(&self, trie_updates: &TrieUpdates) -> ProviderResult<usize> {
         if trie_updates.is_empty() {
-            return Ok(0)
+            return Ok(0);
         }
 
         // Track the number of inserted entries.
@@ -2632,7 +2901,10 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> TrieWriter for DatabaseProvider
             })
             .collect::<Vec<_>>();
         account_updates.extend(
-            trie_updates.account_nodes_ref().iter().map(|(nibbles, node)| (nibbles, Some(node))),
+            trie_updates
+                .account_nodes_ref()
+                .iter()
+                .map(|(nibbles, node)| (nibbles, Some(node))),
         );
         // Sort trie node updates.
         account_updates.sort_unstable_by(|a, b| a.0.cmp(b.0));
@@ -2691,7 +2963,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> StorageTrieWriter for DatabaseP
         updates: &StorageTrieUpdates,
     ) -> ProviderResult<usize> {
         if updates.is_empty() {
-            return Ok(0)
+            return Ok(0);
         }
 
         let cursor = self.tx_ref().cursor_dup_write::<tables::StoragesTrie>()?;
@@ -2721,7 +2993,10 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> HashingWriter for DatabaseProvi
         for (hashed_address, account) in &hashed_accounts {
             if let Some(account) = account {
                 hashed_accounts_cursor.upsert(*hashed_address, account)?;
-            } else if hashed_accounts_cursor.seek_exact(*hashed_address)?.is_some() {
+            } else if hashed_accounts_cursor
+                .seek_exact(*hashed_address)?
+                .is_some()
+            {
                 hashed_accounts_cursor.delete_current()?;
             }
         }
@@ -2746,12 +3021,17 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> HashingWriter for DatabaseProvi
         changesets: impl IntoIterator<Item = (Address, Option<Account>)>,
     ) -> ProviderResult<BTreeMap<B256, Option<Account>>> {
         let mut hashed_accounts_cursor = self.tx.cursor_write::<tables::HashedAccounts>()?;
-        let hashed_accounts =
-            changesets.into_iter().map(|(ad, ac)| (keccak256(ad), ac)).collect::<BTreeMap<_, _>>();
+        let hashed_accounts = changesets
+            .into_iter()
+            .map(|(ad, ac)| (keccak256(ad), ac))
+            .collect::<BTreeMap<_, _>>();
         for (hashed_address, account) in &hashed_accounts {
             if let Some(account) = account {
                 hashed_accounts_cursor.upsert(*hashed_address, account)?;
-            } else if hashed_accounts_cursor.seek_exact(*hashed_address)?.is_some() {
+            } else if hashed_accounts_cursor
+                .seek_exact(*hashed_address)?
+                .is_some()
+            {
                 hashed_accounts_cursor.delete_current()?;
             }
         }
@@ -2766,7 +3046,11 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> HashingWriter for DatabaseProvi
         let mut hashed_storages = changesets
             .into_iter()
             .map(|(BlockNumberAddress((_, address)), storage_entry)| {
-                (keccak256(address), keccak256(storage_entry.key), storage_entry.value)
+                (
+                    keccak256(address),
+                    keccak256(storage_entry.key),
+                    storage_entry.value,
+                )
             })
             .collect::<Vec<_>>();
         hashed_storages.sort_by_key(|(ha, hk, _)| (*ha, *hk));
@@ -2776,7 +3060,10 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> HashingWriter for DatabaseProvi
             HashMap::with_capacity_and_hasher(hashed_storages.len(), Default::default());
         let mut hashed_storage = self.tx.cursor_dup_write::<tables::HashedStorages>()?;
         for (hashed_address, key, value) in hashed_storages.into_iter().rev() {
-            hashed_storage_keys.entry(hashed_address).or_default().insert(key);
+            hashed_storage_keys
+                .entry(hashed_address)
+                .or_default()
+                .insert(key);
 
             if hashed_storage
                 .seek_by_key_subkey(hashed_address, key)?
@@ -2811,14 +3098,16 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> HashingWriter for DatabaseProvi
     ) -> ProviderResult<HashMap<B256, BTreeSet<B256>>> {
         // hash values
         let hashed_storages =
-            storages.into_iter().fold(BTreeMap::new(), |mut map, (address, storage)| {
-                let storage = storage.into_iter().fold(BTreeMap::new(), |mut map, entry| {
-                    map.insert(keccak256(entry.key), entry.value);
+            storages
+                .into_iter()
+                .fold(BTreeMap::new(), |mut map, (address, storage)| {
+                    let storage = storage.into_iter().fold(BTreeMap::new(), |mut map, entry| {
+                        map.insert(keccak256(entry.key), entry.value);
+                        map
+                    });
+                    map.insert(keccak256(address), storage);
                     map
                 });
-                map.insert(keccak256(address), storage);
-                map
-            });
 
         let hashed_storage_keys = hashed_storages
             .iter()
@@ -2828,22 +3117,27 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> HashingWriter for DatabaseProvi
         let mut hashed_storage_cursor = self.tx.cursor_dup_write::<tables::HashedStorages>()?;
         // Hash the address and key and apply them to HashedStorage (if Storage is None
         // just remove it);
-        hashed_storages.into_iter().try_for_each(|(hashed_address, storage)| {
-            storage.into_iter().try_for_each(|(key, value)| -> ProviderResult<()> {
-                if hashed_storage_cursor
-                    .seek_by_key_subkey(hashed_address, key)?
-                    .filter(|entry| entry.key == key)
-                    .is_some()
-                {
-                    hashed_storage_cursor.delete_current()?;
-                }
+        hashed_storages
+            .into_iter()
+            .try_for_each(|(hashed_address, storage)| {
+                storage
+                    .into_iter()
+                    .try_for_each(|(key, value)| -> ProviderResult<()> {
+                        if hashed_storage_cursor
+                            .seek_by_key_subkey(hashed_address, key)?
+                            .filter(|entry| entry.key == key)
+                            .is_some()
+                        {
+                            hashed_storage_cursor.delete_current()?;
+                        }
 
-                if !value.is_zero() {
-                    hashed_storage_cursor.upsert(hashed_address, &StorageEntry { key, value })?;
-                }
-                Ok(())
-            })
-        })?;
+                        if !value.is_zero() {
+                            hashed_storage_cursor
+                                .upsert(hashed_address, &StorageEntry { key, value })?;
+                        }
+                        Ok(())
+                    })
+            })?;
 
         Ok(hashed_storage_keys)
     }
@@ -2910,10 +3204,13 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> HashingWriter for DatabaseProvi
                 .map_err(reth_db_api::DatabaseError::from)?;
             if state_root != expected_state_root {
                 return Err(ProviderError::StateRootMismatch(Box::new(RootMismatch {
-                    root: GotExpected { got: state_root, expected: expected_state_root },
+                    root: GotExpected {
+                        got: state_root,
+                        expected: expected_state_root,
+                    },
                     block_number: *range.end(),
                     block_hash: end_block_hash,
-                })))
+                })));
             }
             self.write_trie_updates(&trie_updates)?;
         }
@@ -2999,8 +3296,8 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> HistoryWriter for DatabaseProvi
                 StorageShardedKey::last(address, storage_key),
                 rem_index,
                 |storage_sharded_key| {
-                    storage_sharded_key.address == address &&
-                        storage_sharded_key.sharded_key.key == storage_key
+                    storage_sharded_key.address == address
+                        && storage_sharded_key.sharded_key.key == storage_key
                 },
             )?;
 
@@ -3149,30 +3446,37 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
             block.header().difficulty()
         } else {
             let parent_block_number = block_number - 1;
-            let parent_ttd = self.header_td_by_number(parent_block_number)?.unwrap_or_default();
+            let parent_ttd = self
+                .header_td_by_number(parent_block_number)?
+                .unwrap_or_default();
             durations_recorder.record_relative(metrics::Action::GetParentTD);
             parent_ttd + block.header().difficulty()
         };
 
         if write_to.database() {
-            self.tx.put::<tables::CanonicalHeaders>(block_number, block.hash())?;
+            self.tx
+                .put::<tables::CanonicalHeaders>(block_number, block.hash())?;
             durations_recorder.record_relative(metrics::Action::InsertCanonicalHeaders);
 
             // Put header with canonical hashes.
-            self.tx.put::<tables::Headers<HeaderTy<N>>>(block_number, block.header().clone())?;
+            self.tx
+                .put::<tables::Headers<HeaderTy<N>>>(block_number, block.header().clone())?;
             durations_recorder.record_relative(metrics::Action::InsertHeaders);
 
-            self.tx.put::<tables::HeaderTerminalDifficulties>(block_number, ttd.into())?;
+            self.tx
+                .put::<tables::HeaderTerminalDifficulties>(block_number, ttd.into())?;
             durations_recorder.record_relative(metrics::Action::InsertHeaderTerminalDifficulties);
         }
 
         if write_to.static_files() {
-            let mut writer =
-                self.static_file_provider.get_writer(block_number, StaticFileSegment::Headers)?;
+            let mut writer = self
+                .static_file_provider
+                .get_writer(block_number, StaticFileSegment::Headers)?;
             writer.append_header(block.header(), ttd, &block.hash())?;
         }
 
-        self.tx.put::<tables::HeaderNumbers>(block.hash(), block_number)?;
+        self.tx
+            .put::<tables::HeaderNumbers>(block.hash(), block_number)?;
         durations_recorder.record_relative(metrics::Action::InsertHeaderNumbers);
 
         let mut next_tx_num = self
@@ -3190,12 +3494,23 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
         for (transaction, sender) in block.body().transactions_iter().zip(block.senders_iter()) {
             let hash = transaction.tx_hash();
 
-            if self.prune_modes.sender_recovery.as_ref().is_none_or(|m| !m.is_full()) {
-                self.tx.put::<tables::TransactionSenders>(next_tx_num, *sender)?;
+            if self
+                .prune_modes
+                .sender_recovery
+                .as_ref()
+                .is_none_or(|m| !m.is_full())
+            {
+                self.tx
+                    .put::<tables::TransactionSenders>(next_tx_num, *sender)?;
             }
 
-            if self.prune_modes.transaction_lookup.is_none_or(|m| !m.is_full()) {
-                self.tx.put::<tables::TransactionHashNumbers>(*hash, next_tx_num)?;
+            if self
+                .prune_modes
+                .transaction_lookup
+                .is_none_or(|m| !m.is_full())
+            {
+                self.tx
+                    .put::<tables::TransactionHashNumbers>(*hash, next_tx_num)?;
             }
             next_tx_num += 1;
         }
@@ -3209,7 +3524,10 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
             "Inserted block"
         );
 
-        Ok(StoredBlockBodyIndices { first_tx_num, tx_count })
+        Ok(StoredBlockBodyIndices {
+            first_tx_num,
+            tx_count,
+        })
     }
 
     fn append_block_bodies(
@@ -3217,13 +3535,16 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
         bodies: Vec<(BlockNumber, Option<BodyTy<N>>)>,
         write_to: StorageLocation,
     ) -> ProviderResult<()> {
-        let Some(from_block) = bodies.first().map(|(block, _)| *block) else { return Ok(()) };
+        let Some(from_block) = bodies.first().map(|(block, _)| *block) else {
+            return Ok(());
+        };
 
         // Initialize writer if we will be writing transactions to staticfiles
         let mut tx_static_writer = write_to
             .static_files()
             .then(|| {
-                self.static_file_provider.get_writer(from_block, StaticFileSegment::Transactions)
+                self.static_file_provider
+                    .get_writer(from_block, StaticFileSegment::Transactions)
             })
             .transpose()?;
 
@@ -3237,7 +3558,10 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
             .transpose()?;
 
         // Get id for the next tx_num or zero if there are no transactions.
-        let mut next_tx_num = tx_block_cursor.last()?.map(|(id, _)| id + 1).unwrap_or_default();
+        let mut next_tx_num = tx_block_cursor
+            .last()?
+            .map(|(id, _)| id + 1)
+            .unwrap_or_default();
 
         for (block_number, body) in &bodies {
             // Increment block on static file header.
@@ -3245,8 +3569,14 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
                 writer.increment_block(*block_number)?;
             }
 
-            let tx_count = body.as_ref().map(|b| b.transactions().len() as u64).unwrap_or_default();
-            let block_indices = StoredBlockBodyIndices { first_tx_num: next_tx_num, tx_count };
+            let tx_count = body
+                .as_ref()
+                .map(|b| b.transactions().len() as u64)
+                .unwrap_or_default();
+            let block_indices = StoredBlockBodyIndices {
+                first_tx_num: next_tx_num,
+                tx_count,
+            };
 
             let mut durations_recorder = metrics::DurationsRecorder::default();
 
@@ -3284,7 +3614,9 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
             );
         }
 
-        self.storage.writer().write_block_bodies(self, bodies, write_to)?;
+        self.storage
+            .writer()
+            .write_block_bodies(self, bodies, write_to)?;
 
         Ok(())
     }
@@ -3322,7 +3654,8 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
 
         if unwind_tx_from <= unwind_tx_to {
             for (hash, _) in self.transaction_hashes_by_range(unwind_tx_from..(unwind_tx_to + 1))? {
-                self.tx.delete::<tables::TransactionHashNumbers>(hash, None)?;
+                self.tx
+                    .delete::<tables::TransactionHashNumbers>(hash, None)?;
             }
         }
 
@@ -3338,7 +3671,9 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
         block: BlockNumber,
         remove_from: StorageLocation,
     ) -> ProviderResult<()> {
-        self.storage.writer().remove_block_bodies_above(self, block, remove_from)?;
+        self.storage
+            .writer()
+            .remove_block_bodies_above(self, block, remove_from)?;
 
         // First transaction to be removed
         let unwind_tx_from = self
@@ -3380,7 +3715,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
     ) -> ProviderResult<()> {
         if blocks.is_empty() {
             debug!(target: "providers::db", "Attempted to append empty block range");
-            return Ok(())
+            return Ok(());
         }
 
         let first_number = blocks.first().unwrap().number();
@@ -3396,7 +3731,11 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
             durations_recorder.record_relative(metrics::Action::InsertBlock);
         }
 
-        self.write_state(execution_outcome, OriginalValuesKnown::No, StorageLocation::Database)?;
+        self.write_state(
+            execution_outcome,
+            OriginalValuesKnown::No,
+            StorageLocation::Database,
+        )?;
         durations_recorder.record_relative(metrics::Action::InsertState);
 
         // insert hashes and intermediate merkle nodes
@@ -3440,7 +3779,9 @@ impl<TX: DbTxMut, N: NodeTypes> PruneCheckpointWriter for DatabaseProvider<TX, N
         segment: PruneSegment,
         checkpoint: PruneCheckpoint,
     ) -> ProviderResult<()> {
-        Ok(self.tx.put::<tables::PruneCheckpoints>(segment, checkpoint)?)
+        Ok(self
+            .tx
+            .put::<tables::PruneCheckpoints>(segment, checkpoint)?)
     }
 }
 

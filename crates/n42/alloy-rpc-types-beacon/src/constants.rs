@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 /// The Domain Separation Tag for hash_to_point in Ethereum beacon chain BLS12-381 signatures.
 ///
 /// This is also the name of the ciphersuite that defines beacon chain BLS signatures.

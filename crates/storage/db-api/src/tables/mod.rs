@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! Tables and data models.
 //!
 //! # Overview
@@ -28,6 +31,7 @@ use crate::{
 };
 use alloy_consensus::Header;
 use alloy_primitives::{Address, BlockHash, BlockNumber, TxHash, TxNumber, B256};
+use n42_primitives::{BeaconBlock, BeaconState, Snapshot, Validator, ValidatorBeforeTx};
 use reth_ethereum_primitives::{Receipt, TransactionSigned};
 use reth_primitives_traits::{Account, Bytecode, StorageEntry};
 use reth_prune_types::{PruneCheckpoint, PruneSegment};
@@ -35,7 +39,6 @@ use reth_stages_types::StageCheckpoint;
 use reth_trie_common::{BranchNodeCompact, StorageTrieEntry, StoredNibbles, StoredNibblesSubKey};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use n42_primitives::{BeaconBlock,BeaconState, Snapshot, Validator, ValidatorBeforeTx};
 
 /// Enum for the types of tables present in libmdbx.
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -129,7 +132,9 @@ macro_rules! tables {
             ///
             #[doc = concat!("Marker type representing a database table mapping [`", stringify!($key), "`] to ", tables!(@value_doc $key, $value, $($($generic),*)?), ".")]
             $(
-                #[doc = concat!("\n\nThis table's `DUPSORT` subkey is [`", stringify!($subkey), "`].")]
+                #[doc = concat!("
+
+This table's `DUPSORT` subkey is [`", stringify!($subkey), "`].")]
             )?
             pub struct $name$(<$($generic $( = $default)?),*>)? {
                 _private: std::marker::PhantomData<($($($generic,)*)?)>,
@@ -312,7 +317,7 @@ tables! {
         type Key = BlockHash;
         type Value = BeaconBlock;
     }
-    
+
     ///
     table BeaconNum2Hash{
         type Key = BlockNumber;
@@ -355,7 +360,7 @@ tables! {
         type Key = HeaderHash;
         type Value = Address;
     }
-    
+
     /// Stores the beacon block per hash
     table BeaconBlocksByHash {
         type Key = BlockHash;

@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use alloy_primitives::BlockNumber;
 use reth_execution_types::ExecutionOutcome;
 use reth_storage_errors::provider::ProviderResult;

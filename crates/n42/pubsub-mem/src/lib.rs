@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 pub mod error;
 use error::SubscribeError;
 
@@ -148,10 +151,7 @@ where
         .await
         .map_err(|_| SubscribeError::SendFailed)?;
 
-    let id = reply_rx
-        .recv()
-        .await
-        .ok_or(SubscribeError::RouterDropped)?;
+    let id = reply_rx.recv().await.ok_or(SubscribeError::RouterDropped)?;
     Ok((id, rx))
 }
 

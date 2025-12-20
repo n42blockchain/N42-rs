@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 use alloy_eips::eip2718::Encodable2718;
 use alloy_genesis::Genesis;
 use alloy_primitives::{b256, hex};
@@ -22,7 +25,10 @@ async fn can_run_dev_node() -> eyre::Result<()> {
 
     let node_config = NodeConfig::test()
         .with_chain(custom_chain())
-        .with_dev(DevArgs { dev: true, ..Default::default() });
+        .with_dev(DevArgs {
+            dev: true,
+            ..Default::default()
+        });
     let NodeHandle { node, .. } = NodeBuilder::new(node_config.clone())
         .testing_node(exec.clone())
         .with_types_and_provider::<EthereumNode, BlockchainProvider<_>>()

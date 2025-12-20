@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT
+
 //! OP bootnodes come from <https://github.com/ethereum-optimism/op-geth/blob/optimism/params/bootnodes.go>
 
 /// OP stack mainnet boot nodes.

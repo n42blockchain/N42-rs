@@ -74,8 +74,10 @@ where
     }
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
+    use jsonrpsee::http_client::HttpClientBuilder;
     use jsonrpsee::server::ServerBuilder;
     use reth_consensus::noop::NoopConsensus;
     use reth_provider::test_utils::NoopProvider;

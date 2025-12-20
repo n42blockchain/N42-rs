@@ -91,9 +91,9 @@ impl N42Node {
     /// See also: [`ProviderFactoryBuilder`] and
     /// [`ReadOnlyConfig`](reth_provider::providers::ReadOnlyConfig).
     ///
-    /// ```no_run
+    /// ```ignore
     /// use reth_chainspec::MAINNET;
-    /// use reth_node_ethereum::N42Node;
+    /// use n42_engine_types::N42Node;
     ///
     /// let factory = N42Node::provider_factory_builder()
     ///     .open_read_only(MAINNET.clone(), "datadir")
@@ -102,10 +102,10 @@ impl N42Node {
     ///
     /// # Open a Providerfactory manually with all required components
     ///
-    /// ```no_run
+    /// ```ignore
     /// use reth_chainspec::ChainSpecBuilder;
     /// use reth_db::open_db_read_only;
-    /// use reth_node_ethereum::N42Node;
+    /// use n42_engine_types::N42Node;
     /// use reth_provider::providers::StaticFileProvider;
     /// use std::sync::Arc;
     ///

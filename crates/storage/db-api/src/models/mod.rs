@@ -18,8 +18,6 @@ use reth_stages_types::StageCheckpoint;
 use reth_trie_common::{StoredNibbles, StoredNibblesSubKey, *};
 use serde::{Deserialize, Serialize};
 
-use n42_primitives::Snapshot;
-
 pub mod accounts;
 pub mod blocks;
 pub mod integer_list;

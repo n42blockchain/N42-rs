@@ -5281,6 +5281,7 @@ dependencies = [
 name = "n42-clique"
 version = "1.4.3"
 dependencies = [
+ "alloy-eips",
  "alloy-genesis",
  "alloy-primitives",
  "alloy-rlp",

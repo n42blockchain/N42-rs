@@ -1,15 +1,11 @@
 // Copyright (c) 2017-2025 N42 Contributors
 // SPDX-License-Identifier: MIT
 
-// use ethcore::snapshot::{ManifestData, SnapshotService};
-use reth_primitives::{arbitrary, Header};
 use std::collections::HashMap;
 use std::error::Error;
-
 use std::time::{Duration, Instant};
 
-use alloy_primitives::Sealable;
-use reth_primitives_traits::AlloyBlockHeader;
+use reth_primitives::arbitrary;
 use reth_primitives_traits::BlockHeader as BlockHeaderTrait;
 
 use alloy_primitives::{hex, Address, B256, U256};

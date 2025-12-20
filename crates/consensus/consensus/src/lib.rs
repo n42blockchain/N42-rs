@@ -25,9 +25,9 @@ use reth_primitives_traits::{
     SealedHeader,
 };
 
+use alloc::collections::BTreeMap;
+use core::time::Duration;
 use n42_primitives::Snapshot;
-use std::collections::HashMap;
-use std::time::Duration;
 
 /// A consensus implementation that does nothing.
 pub mod noop;
@@ -112,8 +112,8 @@ pub trait Consensus<B: Block>: HeaderValidator<B::Header> {
         Ok(())
     }
 
-    fn proposals(&self) -> Result<HashMap<Address, bool>, ConsensusError> {
-        Ok(HashMap::new())
+    fn proposals(&self) -> Result<BTreeMap<Address, bool>, ConsensusError> {
+        Ok(BTreeMap::new())
     }
 
     fn total_difficulty(&self, hash: B256) -> U256 {

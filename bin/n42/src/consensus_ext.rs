@@ -69,13 +69,14 @@ where
     }
 
     fn proposals(&self) -> RpcResult<HashMap<Address, bool>> {
-        Ok(self.consensus.proposals().unwrap_or_default())
+        let btree = self.consensus.proposals().unwrap_or_default();
+        Ok(btree.into_iter().collect())
     }
 }
 
 mod tests {
     use super::*;
-    use jsonrpsee::{http_client::HttpClientBuilder, server::ServerBuilder};
+    use jsonrpsee::server::ServerBuilder;
     use reth_consensus::noop::NoopConsensus;
     use reth_provider::test_utils::NoopProvider;
 

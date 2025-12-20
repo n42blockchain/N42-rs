@@ -5,3 +5,9 @@
 
 mod apos;
 pub use apos::*;
+
+#[cfg(test)]
+mod integration_tests;
+
+#[cfg(test)]
+mod fuzz_tests;

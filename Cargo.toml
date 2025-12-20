@@ -43,6 +43,8 @@ members = [
     #"testing/testing-utils/",
     "crates/n42/engine-primitives",
     "crates/n42/consensus-traits",
+    "crates/n42/consensus-core",
+    "crates/n42/storage",
     "crates/n42/consensus-client",
     "crates/n42/mobile-sdk",
     "crates/n42/merkle_db_rs",
@@ -202,6 +204,8 @@ codegen-units = 1
 # for n42
 n42-primitives = { path = "crates/n42/primitives" }
 n42-consensus-traits = { path = "crates/n42/consensus-traits" }
+n42-consensus-core = { path = "crates/n42/consensus-core" }
+n42-storage = { path = "crates/n42/storage" }
 n42-clique = {path="crates/n42/clique"}
 n42-engine-types = {path="crates/n42/engine-types"}
 n42-engine-primitives = {path="crates/n42/engine-primitives"}

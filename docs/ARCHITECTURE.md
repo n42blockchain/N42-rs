@@ -32,346 +32,198 @@
 └───────────────┘      └─────────────────┘      └─────────────────┘
 ```
 
-## 模块职责分析
+## 实施进度
 
-### 1. 核心层 (Core Layer)
+### Phase 1: 共识 Trait 提取 ✅ 已完成
 
-| 模块 | 职责 | 问题 |
-|------|------|------|
-| `n42-primitives` | Beacon 链原语、SSZ 编码、验证器 | ✅ 独立性好 |
-| `merkle_db_rs` | Merkle 树实现 | ✅ 独立性好 |
-| `pubsub-mem` | 内存 Pub/Sub | ✅ 独立性好 |
+**目标:** 将 N42 特定的共识方法从 `reth-consensus` 分离
 
-### 2. 共识层 (Consensus Layer)
+**新 Crate:** `n42-consensus-traits`
 
-| 模块 | 职责 | 问题 |
-|------|------|------|
-| `n42-clique` | APoS 共识实现 | ⚠️ 直接依赖 reth-provider |
-| `consensus-client` | 共识客户端 | ⚠️ 职责过重，混合了多种功能 |
-| `reth-consensus` | 共识 trait 扩展 | ⚠️ N42 方法侵入 upstream trait |
+```
+crates/n42/consensus-traits/
+├── Cargo.toml
+└── src/
+    ├── lib.rs
+    ├── error.rs      # AposError 枚举
+    ├── traits.rs     # N42 特定 trait
+    └── tests.rs      # 7 个单元测试
+```
 
-### 3. 引擎层 (Engine Layer)
+**已定义 Trait:**
+- `SignerManager`: 以太坊密钥管理
+- `VotingManager`: 验证器投票提案
+- `AposConsensus`: 核心 APoS 共识操作
+- `AposConsensusExt`: 扩展 APoS 操作
+- `FullAposConsensus`: 组合 trait 别名
 
-| 模块 | 职责 | 问题 |
-|------|------|------|
-| `n42-engine-types` | 节点类型定义 | ✅ 独立性好 |
-| `n42-engine-primitives` | Payload 构建 | ✅ 独立性好 |
+### Phase 2: 存储层提取 ✅ 已完成
 
-### 4. 存储层 (Storage Layer)
+**目标:** 将 N42 beacon 存储从 `reth-db-api` 分离
 
-| 模块 | 职责 | 问题 |
-|------|------|------|
-| `reth-db-api` | 数据库 API | ⚠️ beacon 表混入通用模块 |
-| `reth-provider` | 状态提供者 | ✅ fork 自 reth |
+**新 Crate:** `n42-storage`
+
+```
+crates/n42/storage/
+├── Cargo.toml
+└── src/
+    ├── lib.rs
+    ├── tables.rs     # N42 表定义 (名称, ID)
+    ├── codecs.rs     # 编码/解码工具
+    ├── error.rs      # 存储错误类型
+    └── tests.rs      # 10 个单元测试
+```
+
+**功能:**
+- `StorageError`: 丰富的存储操作错误枚举
+- `N42TableId`: 程序化表访问的枚举
+- beacon 链存储的表名常量
+- beacon 类型的 JSON 编码/解码
+
+### Phase 3: 共识核心提取 ✅ 已完成
+
+**目标:** 将核心共识逻辑提取为独立模块
+
+**新 Crate:** `n42-consensus-core`
+
+```
+crates/n42/consensus-core/
+├── Cargo.toml
+└── src/
+    ├── lib.rs
+    ├── state.rs       # 状态转换 trait 和工具
+    ├── validation.rs  # 区块/头部验证
+    ├── error.rs       # 共识错误类型
+    └── tests.rs       # 16 个单元测试
+```
+
+**功能:**
+- `StateTransition` trait: 通用状态转换接口
+- `ConsensusError`: 丰富的共识操作错误枚举
+- Slot/epoch 工具函数
+- 区块和证明验证
+
+### Phase 4: 清理与文档 ✅ 进行中
+
+- [x] 更新架构文档
+- [x] 添加模块间集成测试
+- [ ] 更新 crate 文档中的依赖图
+- [ ] 为新模块添加示例
 
 ---
 
-## 架构问题与优化建议
+## 模块依赖图
 
-### 问题 1: `consensus-client` 职责过重
-
-**现状:**
 ```
-consensus-client/
-├── beacon.rs      # Beacon 链处理
-├── metrics.rs     # 指标收集
-├── migrate.rs     # 数据迁移
-├── miner.rs       # 出块逻辑
-├── network.rs     # P2P 通信
-└── storage.rs     # 存储操作
-```
-
-**问题:** 单一模块包含 6 种不同职责，违反单一职责原则。
-
-**优化方案:**
-```
-crates/n42/
-├── consensus-core/          # 核心共识逻辑
-│   ├── src/
-│   │   ├── lib.rs
-│   │   ├── beacon.rs        # Beacon 链核心
-│   │   └── state.rs         # 状态管理
-│   └── Cargo.toml
-│
-├── consensus-miner/         # 出块模块 (独立)
-│   ├── src/
-│   │   ├── lib.rs
-│   │   ├── block_producer.rs
-│   │   └── proposer.rs
-│   └── Cargo.toml
-│
-├── consensus-network/       # 共识 P2P (独立)
-│   ├── src/
-│   │   ├── lib.rs
-│   │   ├── gossip.rs
-│   │   └── sync.rs
-│   └── Cargo.toml
-│
-└── consensus-storage/       # 共识存储 (独立)
-    ├── src/
-    │   ├── lib.rs
-    │   ├── beacon_db.rs
-    │   └── validator_db.rs
-    └── Cargo.toml
-```
-
----
-
-### 问题 2: N42 方法侵入 `reth-consensus` Trait
-
-**现状:**
-```rust
-// crates/consensus/consensus/src/lib.rs
-pub trait Consensus<B: Block>: HeaderValidator<B::Header> {
-    // reth 原有方法
-    fn validate_body_against_header(...);
-    fn validate_block_pre_execution(...);
-
-    // N42 侵入方法 ⚠️
-    fn prepare(&self, parent_header: &SealedHeader) -> Result<Header, ConsensusError>;
-    fn seal(&self, header: &mut Header) -> Result<(), ConsensusError>;
-    fn snapshot(...) -> Result<Snapshot, ConsensusError>;
-    fn propose(...) -> Result<(), ConsensusError>;
-    fn discard(...) -> Result<(), ConsensusError>;
-    fn proposals(...) -> Result<HashMap<Address, bool>, ConsensusError>;
-    fn total_difficulty(...) -> U256;
-    fn wiggle(...) -> Duration;
-    // ... 更多 N42 特有方法
-}
-```
-
-**问题:** 
-- 升级 reth 时冲突风险高
-- 破坏了 trait 的单一职责
-- 使用者被迫实现所有 N42 方法
-
-**优化方案:** 使用 Trait 扩展模式
-
-```rust
-// crates/n42/consensus-traits/src/lib.rs
-
-/// N42 APoS 共识扩展 (独立 crate)
-pub trait AposConsensus: reth_consensus::Consensus<EthereumBlock> {
-    /// 准备区块头
-    fn prepare(&self, parent: &SealedHeader) -> Result<Header, AposError>;
-    
-    /// 签名封装
-    fn seal(&self, header: &mut Header) -> Result<(), AposError>;
-    
-    /// 快照管理
-    fn snapshot(&self, number: u64, hash: B256) -> Result<Snapshot, AposError>;
-    
-    /// 投票提案
-    fn propose(&self, address: Address, auth: bool) -> Result<(), AposError>;
-    
-    /// 撤销提案
-    fn discard(&self, address: Address) -> Result<(), AposError>;
-    
-    /// 获取提案
-    fn proposals(&self) -> Result<HashMap<Address, bool>, AposError>;
-}
-
-/// 签名者管理扩展
-pub trait SignerManager {
-    fn set_signer(&self, key: Option<String>) -> Result<(), AposError>;
-    fn get_signer_address(&self) -> Result<Option<Address>, AposError>;
-}
-
-/// 难度计算扩展
-pub trait DifficultyCalculator {
-    fn total_difficulty(&self, hash: B256) -> U256;
-    fn wiggle(&self, parent_number: u64, parent_hash: B256, difficulty: U256) -> Duration;
-}
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Application Layer                            │
+│                      (n42, n42-node, etc.)                           │
+└─────────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                      n42-consensus-client                            │
+│                (orchestration, miner, network)                       │
+└─────────────────────────────────────────────────────────────────────┘
+            │                     │                     │
+            ▼                     ▼                     ▼
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│ n42-consensus-  │     │   n42-clique    │     │   n42-storage   │
+│      core       │     │  (APoS impl)    │     │ (beacon tables) │
+│ (16 tests)      │     │                 │     │ (10 tests)      │
+└─────────────────┘     └─────────────────┘     └─────────────────┘
+            │                     │                     │
+            └─────────────────────┼─────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                      n42-consensus-traits                            │
+│            (AposConsensus, SignerManager, VotingManager)             │
+│                          (7 tests)                                   │
+└─────────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                         n42-primitives                               │
+│           (BeaconState, BeaconBlock, Validator, etc.)                │
+└─────────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                         reth-* (upstream)                            │
+│          (minimal coupling via traits and primitive types)           │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-### 问题 3: Beacon 表混入 `reth-db-api`
+## 已实现收益
 
-**现状:**
-```rust
-// crates/storage/db-api/src/tables/mod.rs
-tables! {
-    // reth 原有表...
-    table Headers { ... }
-    table Transactions { ... }
-    
-    // N42 beacon 表 ⚠️ (混入)
-    table BeaconStateRecord { ... }
-    table BeaconBlockRecord { ... }
-    table BeaconNum2Hash { ... }
-    table PlainValidatorState { ... }
-    table ValidatorsHistory { ... }
-}
-```
+1. **更易升级**: N42 代码与 reth 变更隔离
+2. **更好的测试**: 每个模块可独立测试
+   - `n42-consensus-traits`: 7 个测试
+   - `n42-consensus-core`: 16 个测试
+   - `n42-storage`: 10 个测试
+3. **更清晰的职责**: 单一用途模块
+4. **改进的文档**: 自包含的 crate 文档
+5. **减少编译时间**: 更小的依赖图
 
-**问题:** 升级 reth 时需要手动合并表定义。
+---
 
-**优化方案:** 使用扩展表模式
+## 开发者指南
+
+### 添加 N42 特定功能
+
+1. **检查正确的 crate:**
+   - 共识 trait → `n42-consensus-traits`
+   - 状态转换逻辑 → `n42-consensus-core`
+   - 存储类型 → `n42-storage`
+   - APoS 实现 → `n42-clique`
+
+2. **使用 trait 扩展模式添加新功能**
+
+3. **保持 reth-consensus 作为"透传"层**
+
+4. **在 N42 crate 中编写测试，而非 reth crate**
+
+### 添加新存储表
 
 ```rust
-// crates/n42/storage/src/tables.rs
-
-use reth_db_api::tables;
-
-/// N42 Beacon 链专用表
-tables! {
-    /// Beacon 状态记录
-    table BeaconStateRecord {
-        type Key = BlockHash;
-        type Value = BeaconState;
-    }
-
-    /// Beacon 区块记录
-    table BeaconBlockRecord {
-        type Key = BlockHash;
-        type Value = BeaconBlock;
-    }
-
-    /// 区块号到哈希映射
-    table BeaconNum2Hash {
-        type Key = BlockNumber;
-        type Value = BlockHash;
-    }
-
-    /// 验证器当前状态
-    table PlainValidatorState {
-        type Key = Address;
-        type Value = Validator;
-    }
-
-    /// 验证器历史
-    table ValidatorsHistory {
-        type Key = ShardedKey<Address>;
-        type Value = BlockNumberList;
-    }
+// 在 n42-storage/src/tables.rs
+pub mod names {
+    pub const MY_NEW_TABLE: &str = "MyNewTable";
 }
 
-/// 扩展数据库 trait
-pub trait N42Database: reth_db_api::Database {
-    fn beacon_state_provider(&self) -> impl BeaconStateProvider;
-    fn validator_provider(&self) -> impl ValidatorProvider;
+// 添加到 N42TableId 枚举
+pub enum N42TableId {
+    // ...
+    MyNewTable = 6,
+}
+```
+
+### 添加新共识 Trait
+
+```rust
+// 在 n42-consensus-traits/src/traits.rs
+#[auto_impl(&, Box, Arc)]
+pub trait MyNewTrait {
+    fn my_method(&self) -> Result<(), AposError>;
 }
 ```
 
 ---
 
-### 问题 4: `alloy-rpc-types-*` 版本锁定
+## 未来改进
 
-**现状:**
-```toml
-# crates/n42/alloy-rpc-types-engine/Cargo.toml
-version = "1.0.5"  # 与 reth 绑定
-```
+1. **进一步模块化**: 考虑将 `n42-consensus-client` 拆分为:
+   - `n42-miner`: 区块生产
+   - `n42-beacon-network`: P2P 消息处理
 
-**问题:** 版本与 reth 强耦合，升级困难。
+2. **性能**: 在 `n42-storage` 中添加缓存层
 
-**优化方案:**
-```toml
-# 使用 workspace 版本
-version.workspace = true
+3. **指标**: 为每个模块添加可观测性
 
-# 或重命名为 n42 专用
-[package]
-name = "n42-rpc-types-engine"  # 避免与 alloy 冲突
-```
-
----
-
-## 推荐目录结构
-
-```
-crates/
-├── n42/
-│   ├── primitives/              # ✅ 保持不变
-│   ├── clique/                  # ✅ 保持不变
-│   ├── engine-types/            # ✅ 保持不变
-│   ├── engine-primitives/       # ✅ 保持不变
-│   │
-│   ├── consensus-traits/        # 🆕 共识 trait 扩展
-│   ├── consensus-core/          # 🆕 从 consensus-client 拆分
-│   ├── consensus-miner/         # 🆕 从 consensus-client 拆分
-│   ├── consensus-network/       # 🆕 从 consensus-client 拆分
-│   ├── consensus-storage/       # 🆕 从 consensus-client 拆分
-│   │
-│   ├── storage/                 # 🆕 N42 专用存储
-│   │   ├── beacon-db/
-│   │   └── validator-db/
-│   │
-│   ├── rpc/                     # 🆕 N42 RPC 扩展
-│   │   ├── types/
-│   │   └── api/
-│   │
-│   ├── merkle_db_rs/            # ✅ 保持不变
-│   ├── pubsub-mem/              # ✅ 保持不变
-│   └── mobile-sdk/              # ✅ 保持不变
-│
-├── reth-fork/                   # 🆕 reth fork 隔离层
-│   ├── primitives-traits/       # 带 N42 扩展
-│   ├── consensus/               # 带 N42 扩展
-│   ├── db-api/                  # 带 N42 表
-│   └── chainspec/               # 带 N42 配置
-│
-└── ethereum/                    # ✅ 保持不变
-```
-
----
-
-## 依赖关系优化
-
-### 当前依赖 (问题)
-```
-consensus-client
-    ├── n42-clique
-    │   └── reth-provider (重复依赖)
-    ├── n42-primitives
-    ├── reth-provider
-    └── reth-engine-tree
-```
-
-### 优化后依赖
-```
-consensus-core
-    └── n42-primitives (纯粹)
-
-consensus-miner
-    ├── consensus-core
-    └── consensus-traits
-
-consensus-storage
-    ├── n42-primitives
-    └── reth-db-api (仅接口)
-
-consensus-client (轻量组装层)
-    ├── consensus-core
-    ├── consensus-miner
-    ├── consensus-storage
-    └── consensus-network
-```
-
----
-
-## 实施路径
-
-### Phase 1: 低风险重构 (1-2 周)
-1. 创建 `n42/consensus-traits` crate
-2. 将 N42 方法从 `reth-consensus` 提取到扩展 trait
-3. 添加测试确保行为一致
-
-### Phase 2: 存储解耦 (1-2 周)
-1. 创建 `n42/storage` crate
-2. 将 beacon 表定义迁移出 `reth-db-api`
-3. 实现 `N42Database` 扩展 trait
-
-### Phase 3: 共识模块拆分 (2-3 周)
-1. 拆分 `consensus-client` 为 4 个子模块
-2. 明确各模块边界和接口
-3. 更新依赖关系
-
-### Phase 4: 清理与文档 (1 周)
-1. 移除冗余代码
-2. 更新架构文档
-3. 添加集成测试
+4. **Feature Flags**: 允许禁用未使用的模块
 
 ---
 
@@ -384,4 +236,3 @@ consensus-client (轻量组装层)
 | 新开发者上手 | 困难 | 容易 |
 | 编译时间 | 较长 | 缩短 (并行编译) |
 | 代码复用 | 低 | 高 |
-

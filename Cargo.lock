@@ -5981,6 +5981,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "n42-consensus-core"
+version = "1.8.4"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-primitives 1.2.1",
+ "eyre",
+ "n42-consensus-traits",
+ "n42-primitives",
+ "thiserror 2.0.12",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "n42-consensus-traits"
 version = "1.8.4"
 dependencies = [
@@ -6108,6 +6123,18 @@ dependencies = [
  "tree_hash",
  "tree_hash_derive",
  "typenum",
+]
+
+[[package]]
+name = "n42-storage"
+version = "1.8.4"
+dependencies = [
+ "alloy-primitives 1.2.1",
+ "n42-primitives",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.12",
+ "tokio",
 ]
 
 [[package]]

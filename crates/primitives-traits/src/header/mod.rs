@@ -12,6 +12,9 @@ pub mod test_utils;
 
 pub mod clique_utils;
 
+#[cfg(test)]
+mod clique_utils_tests;
+
 /// Bincode-compatible header type serde implementations.
 #[cfg(feature = "serde-bincode-compat")]
 pub mod serde_bincode_compat {

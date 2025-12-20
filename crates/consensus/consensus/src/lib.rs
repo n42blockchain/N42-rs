@@ -38,6 +38,9 @@ pub mod noop;
 /// test helpers for mocking consensus
 pub mod test_utils;
 
+#[cfg(test)]
+mod n42_tests;
+
 /// [`Consensus`] implementation which knows full node primitives and is able to validation block's
 /// execution outcome.
 #[auto_impl::auto_impl(&, Arc)]

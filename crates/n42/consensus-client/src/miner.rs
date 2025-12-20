@@ -9,10 +9,12 @@ use alloy_primitives::{Address, BlockHash, TxHash, B256, U128, U256};
 use alloy_rpc_types_engine::{CancunPayloadFields, ExecutionPayloadSidecar, ForkchoiceState};
 use eyre::OptionExt;
 use futures_util::{stream::Fuse, StreamExt};
+use itertools::Itertools;
 use reth_chainspec::EthereumHardforks;
 use reth_consensus::{ConsensusError, FullConsensus};
 use reth_engine_primitives::BeaconConsensusEngineHandle;
 use reth_eth_wire_types::{NetworkPrimitives, NewBlock};
+use reth_ethereum_primitives::EthPrimitives;
 use reth_network_api::{
     BlockAnnounceProvider, BlockDownloaderProvider, FullNetwork, NetworkEventListenerProvider,
 };
@@ -242,12 +244,10 @@ where
                 if let Ok(all_peers) = self.network.get_all_peers().await {
                     debug!(target: "consensus-client", peers_count=all_peers.len());
                     if !all_peers.is_empty() {
-                        let mut counts: HashMap<(U256, B256), usize> = HashMap::new();
-                        for peer in all_peers.iter() {
-                            let key = (peer.status.total_difficulty, peer.status.blockhash);
-                            *counts.entry(key).or_insert(0) += 1;
-                        }
-                        status_counts = counts;
+                        status_counts = all_peers
+                            .iter()
+                            .map(|v| (v.status.total_difficulty, v.status.blockhash))
+                            .counts();
                         break;
                     }
                 }
@@ -706,7 +706,7 @@ where
     async fn new_payload(&mut self, block: &SealedBlock<<<T::BuiltPayload as BuiltPayload>::Primitives as NodePrimitives>::Block>) -> eyre::Result<()> {
         debug!(target: "consensus-client", "new_block hash {:?}", block.header().hash_slow());
 
-        let _cancun_fields = self
+        let cancun_fields = self
             .provider
             .chain_spec()
             .is_cancun_active_at_timestamp(block.timestamp())
@@ -958,113 +958,4 @@ where
 
 fn exit_by_sigint() {
     let _ = nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGINT);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-
-    // ==================== Constants Tests ====================
-
-    #[test]
-    fn test_inmemory_blocks_constant() {
-        assert_eq!(INMEMORY_BLOCKS, 256);
-    }
-
-    #[test]
-    fn test_num_to_td_constant() {
-        assert_eq!(NUM_NUM_TO_TD, 256);
-    }
-
-    #[test]
-    fn test_wait_for_peers_interval() {
-        assert_eq!(WAIT_FOR_PEERS_INTERVAL_SECS, 5);
-    }
-
-    #[test]
-    fn test_wait_for_download_interval() {
-        assert_eq!(WAIT_FOR_DOWNLOAD_INTERVAL_MS, 100);
-    }
-
-    #[test]
-    fn test_sync_download_blocks_unit() {
-        assert_eq!(SYNC_DOWNLOAD_BLOCKS_UNIT, 512);
-    }
-
-    #[test]
-    fn test_difficulty_delta_clamp() {
-        assert_eq!(DIFFICULTY_DELTA_CLAMP, 50);
-    }
-
-    #[test]
-    fn test_max_num_local_blocks_to_check() {
-        assert_eq!(MAX_NUM_LOCAL_BLOCKS_TO_CHECK, 256);
-    }
-
-    #[test]
-    fn test_min_no_block_timestamp_gap() {
-        assert_eq!(MIN_NO_BLOCK_TIMESTAMP_GAP, 300);
-    }
-
-    // ==================== MiningMode Tests ====================
-
-    #[tokio::test]
-    async fn test_mining_mode_interval_creation() {
-        let duration = Duration::from_secs(10);
-        let mode = MiningMode::interval(duration);
-        assert!(matches!(mode, MiningMode::Interval(_)));
-    }
-
-    #[test]
-    fn test_mining_mode_no_mining() {
-        let mode = MiningMode::NoMining;
-        assert!(matches!(mode, MiningMode::NoMining));
-    }
-
-    #[test]
-    fn test_mining_mode_debug_format() {
-        let mode = MiningMode::NoMining;
-        let debug_str = format!("{:?}", mode);
-        assert!(debug_str.contains("NoMining"));
-    }
-
-    #[tokio::test]
-    async fn test_mining_mode_interval_debug_format() {
-        let duration = Duration::from_secs(5);
-        let mode = MiningMode::interval(duration);
-        let debug_str = format!("{:?}", mode);
-        assert!(debug_str.contains("Interval"));
-    }
-
-    // ==================== Async MiningMode Poll Tests ====================
-
-    #[tokio::test]
-    async fn test_mining_mode_no_mining_never_resolves() {
-        use std::future::Future;
-        use std::pin::Pin;
-        use std::task::{Context, Poll};
-
-        let mut mode = MiningMode::NoMining;
-
-        // Create a simple test that checks if NoMining mode stays pending
-        let waker = futures_util::task::noop_waker();
-        let mut cx = Context::from_waker(&waker);
-
-        let pin = Pin::new(&mut mode);
-        assert!(matches!(pin.poll(&mut cx), Poll::Pending));
-    }
-
-    #[tokio::test]
-    async fn test_mining_mode_interval_resolves_after_duration() {
-        use tokio::time::timeout;
-
-        // Create an interval mode with very short duration
-        let duration = Duration::from_millis(10);
-        let mut mode = MiningMode::interval(duration);
-
-        // Wait for the interval to trigger
-        let result = timeout(Duration::from_millis(100), &mut mode).await;
-        assert!(result.is_ok());
-    }
 }

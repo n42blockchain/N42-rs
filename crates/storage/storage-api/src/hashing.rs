@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloy_primitives::{map::HashMap, Address, BlockNumber, B256};
 use auto_impl::auto_impl;

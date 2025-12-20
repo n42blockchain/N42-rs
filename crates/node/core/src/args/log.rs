@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! clap [Args](clap::Args) for logging configuration.
 
 use crate::dirs::{LogsDir, PlatformPath};
@@ -23,12 +20,7 @@ pub struct LogArgs {
     pub log_stdout_format: LogFormat,
 
     /// The filter to use for logs written to stdout.
-    #[arg(
-        long = "log.stdout.filter",
-        value_name = "FILTER",
-        global = true,
-        default_value = ""
-    )]
+    #[arg(long = "log.stdout.filter", value_name = "FILTER", global = true, default_value = "")]
     pub log_stdout_filter: String,
 
     /// The format to use for logs written to the log file.
@@ -36,40 +28,20 @@ pub struct LogArgs {
     pub log_file_format: LogFormat,
 
     /// The filter to use for logs written to the log file.
-    #[arg(
-        long = "log.file.filter",
-        value_name = "FILTER",
-        global = true,
-        default_value = "debug"
-    )]
+    #[arg(long = "log.file.filter", value_name = "FILTER", global = true, default_value = "debug")]
     pub log_file_filter: String,
 
     /// The path to put log files in.
-    #[arg(
-        long = "log.file.directory",
-        value_name = "PATH",
-        global = true,
-        default_value_t
-    )]
+    #[arg(long = "log.file.directory", value_name = "PATH", global = true, default_value_t)]
     pub log_file_directory: PlatformPath<LogsDir>,
 
     /// The maximum size (in MB) of one log file.
-    #[arg(
-        long = "log.file.max-size",
-        value_name = "SIZE",
-        global = true,
-        default_value_t = 200
-    )]
+    #[arg(long = "log.file.max-size", value_name = "SIZE", global = true, default_value_t = 200)]
     pub log_file_max_size: u64,
 
     /// The maximum amount of log files that will be stored. If set to 0, background file logging
     /// is disabled.
-    #[arg(
-        long = "log.file.max-files",
-        value_name = "COUNT",
-        global = true,
-        default_value_t = 5
-    )]
+    #[arg(long = "log.file.max-files", value_name = "COUNT", global = true, default_value_t = 5)]
     pub log_file_max_files: usize,
 
     /// Write logs to journald.
@@ -179,13 +151,7 @@ pub struct Verbosity {
     verbosity: u8,
 
     /// Silence all log output.
-    #[arg(
-        long,
-        alias = "silent",
-        short = 'q',
-        global = true,
-        help_heading = "Display"
-    )]
+    #[arg(long, alias = "silent", short = 'q', global = true, help_heading = "Display")]
     quiet: bool,
 }
 

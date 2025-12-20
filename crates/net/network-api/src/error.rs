@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 

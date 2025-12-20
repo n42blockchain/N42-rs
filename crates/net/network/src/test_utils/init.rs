@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 use enr::{k256::ecdsa::SigningKey, Enr, EnrPublicKey};
 use reth_network_peers::PeerId;
 use std::net::SocketAddr;

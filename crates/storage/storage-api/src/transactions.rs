@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 use crate::{BlockNumReader, BlockReader};
 use alloc::vec::Vec;
 use alloy_consensus::transaction::TransactionMeta;

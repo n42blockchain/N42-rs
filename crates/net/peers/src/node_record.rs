@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! Commonly used `NodeRecord` type for peers.
 
 use crate::PeerId;
@@ -69,7 +66,7 @@ impl NodeRecord {
         if let IpAddr::V6(v6) = self.address {
             if let Some(v4) = v6.to_ipv4_mapped() {
                 self.address = v4.into();
-                return true;
+                return true
             }
         }
         false
@@ -95,12 +92,7 @@ impl NodeRecord {
 
     /// Creates a new record from a socket addr and peer id.
     pub const fn new(addr: SocketAddr, id: PeerId) -> Self {
-        Self {
-            address: addr.ip(),
-            tcp_port: addr.port(),
-            udp_port: addr.port(),
-            id,
-        }
+        Self { address: addr.ip(), tcp_port: addr.port(), udp_port: addr.port(), id }
     }
 
     /// Creates a new record from an ip address and ports.
@@ -111,12 +103,7 @@ impl NodeRecord {
         id: PeerId,
     ) -> Self {
         let udp_port = udp_port.unwrap_or(tcp_port);
-        Self {
-            address: ip_addr,
-            tcp_port,
-            udp_port,
-            id,
-        }
+        Self { address: ip_addr, tcp_port, udp_port, id }
     }
 
     /// The TCP socket address of this node
@@ -188,11 +175,7 @@ impl FromStr for NodeRecord {
                 Ipv4Addr::from_str(ip)
                     .map_err(|e| NodeRecordParseError::InvalidUrl(e.to_string()))?,
             ),
-            _ => {
-                return Err(NodeRecordParseError::InvalidUrl(format!(
-                    "invalid host: {url:?}"
-                )))
-            }
+            _ => return Err(NodeRecordParseError::InvalidUrl(format!("invalid host: {url:?}"))),
         };
         let port = url
             .port()
@@ -202,9 +185,7 @@ impl FromStr for NodeRecord {
             .query_pairs()
             .find_map(|(maybe_disc, port)| (maybe_disc.as_ref() == "discport").then_some(port))
         {
-            discovery_port
-                .parse::<u16>()
-                .map_err(NodeRecordParseError::Discport)?
+            discovery_port.parse::<u16>().map_err(NodeRecordParseError::Discport)?
         } else {
             port
         };
@@ -214,12 +195,7 @@ impl FromStr for NodeRecord {
             .parse::<PeerId>()
             .map_err(|e| NodeRecordParseError::InvalidId(e.to_string()))?;
 
-        Ok(Self {
-            address,
-            id,
-            tcp_port: port,
-            udp_port,
-        })
+        Ok(Self { address, id, tcp_port: port, udp_port })
     }
 }
 
@@ -237,35 +213,22 @@ impl TryFrom<&Enr<secp256k1::SecretKey>> for NodeRecord {
     type Error = NodeRecordParseError;
 
     fn try_from(enr: &Enr<secp256k1::SecretKey>) -> Result<Self, Self::Error> {
-        let Some(address) = enr
-            .ip4()
-            .map(IpAddr::from)
-            .or_else(|| enr.ip6().map(IpAddr::from))
+        let Some(address) = enr.ip4().map(IpAddr::from).or_else(|| enr.ip6().map(IpAddr::from))
         else {
-            return Err(NodeRecordParseError::InvalidUrl("ip missing".to_string()));
+            return Err(NodeRecordParseError::InvalidUrl("ip missing".to_string()))
         };
 
         let Some(udp_port) = enr.udp4().or_else(|| enr.udp6()) else {
-            return Err(NodeRecordParseError::InvalidUrl(
-                "udp port missing".to_string(),
-            ));
+            return Err(NodeRecordParseError::InvalidUrl("udp port missing".to_string()))
         };
 
         let Some(tcp_port) = enr.tcp4().or_else(|| enr.tcp6()) else {
-            return Err(NodeRecordParseError::InvalidUrl(
-                "tcp port missing".to_string(),
-            ));
+            return Err(NodeRecordParseError::InvalidUrl("tcp port missing".to_string()))
         };
 
         let id = crate::pk2id(&enr.public_key());
 
-        Ok(Self {
-            address,
-            tcp_port,
-            udp_port,
-            id,
-        }
-        .into_ipv4_mapped())
+        Ok(Self { address, tcp_port, udp_port, id }.into_ipv4_mapped())
     }
 }
 

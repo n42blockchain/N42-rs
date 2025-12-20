@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 use crate::{
     providers::{state::latest::LatestStateProvider, StaticFileProvider},
     to_range,
@@ -10,11 +7,12 @@ use crate::{
     PruneCheckpointReader, StageCheckpointReader, StateProviderBox, StaticFileProviderFactory,
     TransactionVariant, TransactionsProvider, WithdrawalsProvider,
 };
+use n42_primitives::{APosConfig, Snapshot};
+use reth_storage_api::{SnapshotProvider, SnapshotProviderWriter};
 use alloy_consensus::transaction::TransactionMeta;
 use alloy_eips::{eip4895::Withdrawals, BlockHashOrNumber};
 use alloy_primitives::{Address, BlockHash, BlockNumber, TxHash, TxNumber, B256, U256};
 use core::fmt;
-use n42_primitives::{APosConfig, Snapshot};
 use reth_chainspec::ChainInfo;
 use reth_db::{init_db, mdbx::DatabaseArguments, DatabaseEnv};
 use reth_db_api::{database::Database, models::StoredBlockBodyIndices};
@@ -30,7 +28,6 @@ use reth_storage_api::{
     BlockBodyIndicesProvider, NodePrimitivesProvider, OmmersProvider, StateCommitmentProvider,
     TryIntoHistoricalStateProvider,
 };
-use reth_storage_api::{SnapshotProvider, SnapshotProviderWriter};
 use reth_storage_errors::provider::ProviderResult;
 use reth_trie::HashedPostState;
 use reth_trie_db::StateCommitment;
@@ -175,9 +172,7 @@ impl<N: ProviderNodeTypes> ProviderFactory<N> {
     #[track_caller]
     pub fn latest(&self) -> ProviderResult<StateProviderBox> {
         trace!(target: "providers::db", "Returning latest state provider");
-        Ok(Box::new(LatestStateProvider::new(
-            self.database_provider_ro()?,
-        )))
+        Ok(Box::new(LatestStateProvider::new(self.database_provider_ro()?)))
     }
 
     /// Storage provider for state at that given block
@@ -239,8 +234,7 @@ impl<N: ProviderNodeTypes> HeaderSyncGapProvider for ProviderFactory<N> {
         &self,
         highest_uninterrupted_block: BlockNumber,
     ) -> ProviderResult<SealedHeader<Self::Header>> {
-        self.provider()?
-            .local_tip_header(highest_uninterrupted_block)
+        self.provider()?.local_tip_header(highest_uninterrupted_block)
     }
 }
 
@@ -272,14 +266,13 @@ impl<N: ProviderNodeTypes> HeaderProvider for ProviderFactory<N> {
         &self,
         range: impl RangeBounds<BlockNumber>,
     ) -> ProviderResult<Vec<Self::Header>> {
-        self.static_file_provider
-            .get_range_with_static_file_or_database(
-                StaticFileSegment::Headers,
-                to_range(range),
-                |static_file, range, _| static_file.headers_range(range),
-                |range, _| self.provider()?.headers_range(range),
-                |_| true,
-            )
+        self.static_file_provider.get_range_with_static_file_or_database(
+            StaticFileSegment::Headers,
+            to_range(range),
+            |static_file, range, _| static_file.headers_range(range),
+            |range, _| self.provider()?.headers_range(range),
+            |_| true,
+        )
     }
 
     fn sealed_header(
@@ -306,14 +299,13 @@ impl<N: ProviderNodeTypes> HeaderProvider for ProviderFactory<N> {
         range: impl RangeBounds<BlockNumber>,
         predicate: impl FnMut(&SealedHeader<Self::Header>) -> bool,
     ) -> ProviderResult<Vec<SealedHeader<Self::Header>>> {
-        self.static_file_provider
-            .get_range_with_static_file_or_database(
-                StaticFileSegment::Headers,
-                to_range(range),
-                |static_file, range, predicate| static_file.sealed_headers_while(range, predicate),
-                |range, predicate| self.provider()?.sealed_headers_while(range, predicate),
-                predicate,
-            )
+        self.static_file_provider.get_range_with_static_file_or_database(
+            StaticFileSegment::Headers,
+            to_range(range),
+            |static_file, range, predicate| static_file.sealed_headers_while(range, predicate),
+            |range, predicate| self.provider()?.sealed_headers_while(range, predicate),
+            predicate,
+        )
     }
 }
 
@@ -332,17 +324,13 @@ impl<N: ProviderNodeTypes> BlockHashReader for ProviderFactory<N> {
         start: BlockNumber,
         end: BlockNumber,
     ) -> ProviderResult<Vec<B256>> {
-        self.static_file_provider
-            .get_range_with_static_file_or_database(
-                StaticFileSegment::Headers,
-                start..end,
-                |static_file, range, _| static_file.canonical_hashes_range(range.start, range.end),
-                |range, _| {
-                    self.provider()?
-                        .canonical_hashes_range(range.start, range.end)
-                },
-                |_| true,
-            )
+        self.static_file_provider.get_range_with_static_file_or_database(
+            StaticFileSegment::Headers,
+            start..end,
+            |static_file, range, _| static_file.canonical_hashes_range(range.start, range.end),
+            |range, _| self.provider()?.canonical_hashes_range(range.start, range.end),
+            |_| true,
+        )
     }
 }
 
@@ -406,8 +394,7 @@ impl<N: ProviderNodeTypes> BlockReader for ProviderFactory<N> {
         id: BlockHashOrNumber,
         transaction_kind: TransactionVariant,
     ) -> ProviderResult<Option<RecoveredBlock<Self::Block>>> {
-        self.provider()?
-            .sealed_block_with_senders(id, transaction_kind)
+        self.provider()?.sealed_block_with_senders(id, transaction_kind)
     }
 
     fn block_range(&self, range: RangeInclusive<BlockNumber>) -> ProviderResult<Vec<Self::Block>> {
@@ -531,14 +518,13 @@ impl<N: ProviderNodeTypes> ReceiptProvider for ProviderFactory<N> {
         &self,
         range: impl RangeBounds<TxNumber>,
     ) -> ProviderResult<Vec<Self::Receipt>> {
-        self.static_file_provider
-            .get_range_with_static_file_or_database(
-                StaticFileSegment::Receipts,
-                to_range(range),
-                |static_file, range, _| static_file.receipts_by_tx_range(range),
-                |range, _| self.provider()?.receipts_by_tx_range(range),
-                |_| true,
-            )
+        self.static_file_provider.get_range_with_static_file_or_database(
+            StaticFileSegment::Receipts,
+            to_range(range),
+            |static_file, range, _| static_file.receipts_by_tx_range(range),
+            |range, _| self.provider()?.receipts_by_tx_range(range),
+            |_| true,
+        )
     }
 }
 
@@ -575,19 +561,17 @@ impl<N: ProviderNodeTypes> BlockBodyIndicesProvider for ProviderFactory<N> {
         &self,
         range: RangeInclusive<BlockNumber>,
     ) -> ProviderResult<Vec<StoredBlockBodyIndices>> {
-        self.static_file_provider
-            .get_range_with_static_file_or_database(
-                StaticFileSegment::BlockMeta,
-                *range.start()..*range.end() + 1,
-                |static_file, range, _| {
-                    static_file.block_body_indices_range(range.start..=range.end.saturating_sub(1))
-                },
-                |range, _| {
-                    self.provider()?
-                        .block_body_indices_range(range.start..=range.end.saturating_sub(1))
-                },
-                |_| true,
-            )
+        self.static_file_provider.get_range_with_static_file_or_database(
+            StaticFileSegment::BlockMeta,
+            *range.start()..*range.end() + 1,
+            |static_file, range, _| {
+                static_file.block_body_indices_range(range.start..=range.end.saturating_sub(1))
+            },
+            |range, _| {
+                self.provider()?.block_body_indices_range(range.start..=range.end.saturating_sub(1))
+            },
+            |_| true,
+        )
     }
 }
 
@@ -638,13 +622,7 @@ where
     N: NodeTypesWithDB<DB: fmt::Debug, ChainSpec: fmt::Debug, Storage: fmt::Debug>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self {
-            db,
-            chain_spec,
-            static_file_provider,
-            prune_modes,
-            storage,
-        } = self;
+        let Self { db, chain_spec, static_file_provider, prune_modes, storage } = self;
         f.debug_struct("ProviderFactory")
             .field("db", &db)
             .field("chain_spec", &chain_spec)
@@ -743,10 +721,8 @@ mod tests {
         {
             let provider = factory.provider_rw().unwrap();
             assert_matches!(
-                provider.insert_block(
-                    block.clone().try_recover().unwrap(),
-                    StorageLocation::Database
-                ),
+                provider
+                    .insert_block(block.clone().try_recover().unwrap(), StorageLocation::Database),
                 Ok(_)
             );
             assert_matches!(
@@ -767,10 +743,8 @@ mod tests {
             };
             let provider = factory.with_prune_modes(prune_modes).provider_rw().unwrap();
             assert_matches!(
-                provider.insert_block(
-                    block.clone().try_recover().unwrap(),
-                    StorageLocation::Database
-                ),
+                provider
+                    .insert_block(block.clone().try_recover().unwrap(), StorageLocation::Database),
                 Ok(_)
             );
             assert_matches!(provider.transaction_sender(0), Ok(None));
@@ -786,24 +760,16 @@ mod tests {
         let factory = create_test_provider_factory();
 
         let mut rng = generators::rng();
-        let block = random_block(
-            &mut rng,
-            0,
-            BlockParams {
-                tx_count: Some(3),
-                ..Default::default()
-            },
-        );
+        let block =
+            random_block(&mut rng, 0, BlockParams { tx_count: Some(3), ..Default::default() });
 
         let tx_ranges: Vec<RangeInclusive<TxNumber>> = vec![0..=0, 1..=1, 2..=2, 0..=1, 1..=2];
         for range in tx_ranges {
             let provider = factory.provider_rw().unwrap();
 
             assert_matches!(
-                provider.insert_block(
-                    block.clone().try_recover().unwrap(),
-                    StorageLocation::Database
-                ),
+                provider
+                    .insert_block(block.clone().try_recover().unwrap(), StorageLocation::Database),
                 Ok(_)
             );
 
@@ -814,9 +780,7 @@ mod tests {
                     .clone()
                     .map(|tx_number| (
                         tx_number,
-                        block.body().transactions[tx_number as usize]
-                            .recover_signer()
-                            .unwrap()
+                        block.body().transactions[tx_number as usize].recover_signer().unwrap()
                     ))
                     .collect())
             );
@@ -846,12 +810,9 @@ mod tests {
 
         // Checkpoint and no gap
         let static_file_provider = provider.static_file_provider();
-        let mut static_file_writer = static_file_provider
-            .latest_writer(StaticFileSegment::Headers)
-            .unwrap();
-        static_file_writer
-            .append_header(head.header(), U256::ZERO, &head.hash())
-            .unwrap();
+        let mut static_file_writer =
+            static_file_provider.latest_writer(StaticFileSegment::Headers).unwrap();
+        static_file_writer.append_header(head.header(), U256::ZERO, &head.hash()).unwrap();
         static_file_writer.commit().unwrap();
         drop(static_file_writer);
 
@@ -861,54 +822,31 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_test() {
-        let factory = create_test_provider_factory();
-        let provider = factory.provider_rw().unwrap();
+    fn snapshot_test(){
+        let factory=create_test_provider_factory();
+        let provider=factory.provider_rw().unwrap();
         let config = APosConfig {
-            period: 10,
-            epoch: 100,
-            reward_epoch: 1000,
-            reward_limit: U256::from(1000),
-            deposit_contract: "0x0000000000000000000000000000000000000000"
-                .parse::<Address>()
-                .unwrap(),
+            period: 10, 
+            epoch: 100, 
+            reward_epoch: 1000, 
+            reward_limit: U256::from(1000), 
+            deposit_contract: "0x0000000000000000000000000000000000000000".parse::<Address>().unwrap(),
         };
-        let number = 1;
-        let hash: B256 = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
-            .parse()
-            .unwrap();
-        let signers: Vec<Address> = vec![
-            "0x1111111111111111111111111111111111111111"
-                .parse()
-                .unwrap(),
-            "0x2222222222222222222222222222222222222222"
-                .parse()
-                .unwrap(),
-        ];
-        let mut snapshot = Snapshot::new_snapshot(config, number, hash, signers);
-        let address1: Address = "0x3333333333333333333333333333333333333333"
-            .parse()
-            .unwrap();
-        let address2: Address = "0x4444444444444444444444444444444444444444"
-            .parse()
-            .unwrap();
-        snapshot.cast(address1, true);
-        snapshot.cast(address2, false);
-        snapshot.cast(address1, true);
+        let number=1;
+        let hash: B256 = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".parse().unwrap();
+        let signers: Vec<Address> = vec!["0x1111111111111111111111111111111111111111".parse().unwrap(),"0x2222222222222222222222222222222222222222".parse().unwrap(),];
+        let mut snapshot=Snapshot::new_snapshot(config, number, hash, signers);
+        let address1: Address = "0x3333333333333333333333333333333333333333".parse().unwrap();
+        let address2: Address = "0x4444444444444444444444444444444444444444".parse().unwrap();
+        snapshot.cast(address1, true); 
+        snapshot.cast(address2, false); 
+        snapshot.cast(address1, true);  
         snapshot.uncast(address2, false);
-        let block_id = BlockHashOrNumber::Number(number);
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time went backwards")
-            .as_secs();
-        provider
-            .save_snapshot(number, snapshot.clone())
-            .expect("fail to save snapshot");
-        let loaded_snapshot = provider
-            .load_snapshot(block_id)
-            .expect("fail to load snapshot")
-            .expect("cannot find snapshot");
-        assert_eq!(snapshot.config, loaded_snapshot.config);
+        let block_id=BlockHashOrNumber::Number(number);
+        let timestamp=SystemTime::now().duration_since(UNIX_EPOCH).expect("time went backwards").as_secs();
+        provider.save_snapshot(number, snapshot.clone()).expect("fail to save snapshot");
+        let loaded_snapshot=provider.load_snapshot(block_id).expect("fail to load snapshot").expect("cannot find snapshot");
+        assert_eq!(snapshot.config,loaded_snapshot.config);
         assert_eq!(snapshot.number, loaded_snapshot.number);
         assert_eq!(snapshot.hash, loaded_snapshot.hash);
         assert_eq!(snapshot.signers, loaded_snapshot.signers);
@@ -918,5 +856,6 @@ mod tests {
 
         println!("{:#?}", snapshot);
         println!("{:#?}", loaded_snapshot);
+        
     }
 }

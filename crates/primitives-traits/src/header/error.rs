@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 /// Errors that can occur during header sanity checks.
 #[derive(Debug, PartialEq, Eq)]
 pub enum HeaderError {

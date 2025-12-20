@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! Helpers for recovering signers from a set of transactions
 
 #[cfg(feature = "rayon")]
@@ -36,9 +33,7 @@ mod rayon {
         T: SignedTransaction,
         I: IntoParallelIterator<Item = &'a T> + IntoIterator<Item = &'a T> + Send,
     {
-        txes.into_par_iter()
-            .map(|tx| tx.recover_signer_unchecked())
-            .collect()
+        txes.into_par_iter().map(|tx| tx.recover_signer_unchecked()).collect()
     }
 }
 
@@ -68,8 +63,6 @@ mod iter {
         T: SignedTransaction,
         I: IntoIterator<Item = &'a T>,
     {
-        txes.into_iter()
-            .map(|tx| tx.recover_signer_unchecked())
-            .collect()
+        txes.into_iter().map(|tx| tx.recover_signer_unchecked()).collect()
     }
 }

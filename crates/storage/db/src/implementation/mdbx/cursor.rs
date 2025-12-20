@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! Cursor wrapper for libmdbx-sys.
 
 use super::utils::*;
@@ -43,12 +40,7 @@ impl<K: TransactionKind, T: Table> Cursor<K, T> {
         inner: reth_libmdbx::Cursor<K>,
         metrics: Option<Arc<DatabaseEnvMetrics>>,
     ) -> Self {
-        Self {
-            inner,
-            buf: Vec::new(),
-            metrics,
-            _dbi: PhantomData,
-        }
+        Self { inner, buf: Vec::new(), metrics, _dbi: PhantomData }
     }
 
     /// If `self.metrics` is `Some(...)`, record a metric with the provided operation and value
@@ -79,9 +71,7 @@ where
     T::Key: Decode,
     T::Value: Decompress,
 {
-    res.map_err(|e| DatabaseError::Read(e.into()))?
-        .map(decoder::<T>)
-        .transpose()
+    res.map_err(|e| DatabaseError::Read(e.into()))?.map(decoder::<T>).transpose()
 }
 
 /// Some types don't support compression (eg. B256), and we don't want to be copying them to the
@@ -239,10 +229,7 @@ impl<K: TransactionKind, T: DupSort> DbDupCursorRO<T> for Cursor<K, T> {
             (None, None) => self.first().transpose(),
         };
 
-        Ok(DupWalker::<'_, T, Self> {
-            cursor: self,
-            start,
-        })
+        Ok(DupWalker::<'_, T, Self> { cursor: self, start })
     }
 }
 
@@ -284,11 +271,7 @@ impl<T: Table> DbCursorRW<T> for Cursor<RW, T> {
             Some(value.unwrap_or(&self.buf).len()),
             |this| {
                 this.inner
-                    .put(
-                        key.as_ref(),
-                        value.unwrap_or(&this.buf),
-                        WriteFlags::NO_OVERWRITE,
-                    )
+                    .put(key.as_ref(), value.unwrap_or(&this.buf), WriteFlags::NO_OVERWRITE)
                     .map_err(|e| {
                         DatabaseWriteError {
                             info: e.into(),
@@ -328,9 +311,7 @@ impl<T: Table> DbCursorRW<T> for Cursor<RW, T> {
 
     fn delete_current(&mut self) -> Result<(), DatabaseError> {
         self.execute_with_operation_metric(Operation::CursorDeleteCurrent, None, |this| {
-            this.inner
-                .del(WriteFlags::CURRENT)
-                .map_err(|e| DatabaseError::Delete(e.into()))
+            this.inner.del(WriteFlags::CURRENT).map_err(|e| DatabaseError::Delete(e.into()))
         })
     }
 }
@@ -338,9 +319,7 @@ impl<T: Table> DbCursorRW<T> for Cursor<RW, T> {
 impl<T: DupSort> DbDupCursorRW<T> for Cursor<RW, T> {
     fn delete_current_duplicates(&mut self) -> Result<(), DatabaseError> {
         self.execute_with_operation_metric(Operation::CursorDeleteCurrentDuplicates, None, |this| {
-            this.inner
-                .del(WriteFlags::NO_DUP_DATA)
-                .map_err(|e| DatabaseError::Delete(e.into()))
+            this.inner.del(WriteFlags::NO_DUP_DATA).map_err(|e| DatabaseError::Delete(e.into()))
         })
     }
 
@@ -352,11 +331,7 @@ impl<T: DupSort> DbDupCursorRW<T> for Cursor<RW, T> {
             Some(value.unwrap_or(&self.buf).len()),
             |this| {
                 this.inner
-                    .put(
-                        key.as_ref(),
-                        value.unwrap_or(&this.buf),
-                        WriteFlags::APPEND_DUP,
-                    )
+                    .put(key.as_ref(), value.unwrap_or(&this.buf), WriteFlags::APPEND_DUP)
                     .map_err(|e| {
                         DatabaseWriteError {
                             info: e.into(),

@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! Payload component configuration for the Ethereum node.
 
 use reth_chainspec::{EthChainSpec, EthereumHardforks};

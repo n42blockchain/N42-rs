@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 use alloy_primitives::{Signature, B256};
 use reth_eth_wire::{GetPooledTransactions, PooledTransactions};
 use reth_ethereum_primitives::TransactionSigned;

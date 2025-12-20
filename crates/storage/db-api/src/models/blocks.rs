@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! Block related models and types.
 
 use alloy_consensus::Header;
@@ -50,10 +47,7 @@ mod tests {
         let mut ommer = StoredBlockOmmers::default();
         ommer.ommers.push(Header::default());
         ommer.ommers.push(Header::default());
-        assert_eq!(
-            ommer.clone(),
-            StoredBlockOmmers::decompress(&ommer.compress()).unwrap()
-        );
+        assert_eq!(ommer.clone(), StoredBlockOmmers::decompress(&ommer.compress()).unwrap());
     }
 
     #[test]

@@ -1,19 +1,16 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 #![allow(missing_docs)]
 
 #[global_allocator]
 static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
 
 use clap::Parser;
-use n42::consensus_ext::{ConsensusExt, ConsensusExtApiServer};
 use n42::{args::RessArgs, cli::Cli, ress::install_ress_subprotocol};
-use n42_engine_types::N42Node;
+use n42_engine_types::{N42Node};
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_node_builder::NodeHandle;
 use reth_node_ethereum::EthereumNode;
 use tracing::info;
+use n42::consensus_ext::{ConsensusExtApiServer, ConsensusExt};
 
 fn main() {
     reth_cli_util::sigsegv_handler::install();
@@ -26,29 +23,23 @@ fn main() {
     if let Err(err) =
         Cli::<EthereumChainSpecParser, RessArgs>::parse().run(async move |builder, ress_args| {
             info!(target: "reth::cli", "Launching node");
-            let NodeHandle {
-                node,
-                node_exit_future,
-            } = builder
-                .node(N42Node::default())
-                .extend_rpc_modules(|ctx| {
-                    let consensus = ctx.consensus().clone();
-                    let provider = ctx.provider().clone();
+            let NodeHandle { node, node_exit_future } =
+                builder.node(N42Node::default())
+                        .extend_rpc_modules(|ctx| {
 
-                    let ext = ConsensusExt {
-                        consensus,
-                        provider,
-                    };
+                            let consensus = ctx.consensus().clone();
+                            let provider = ctx.provider().clone();
 
-                    // now we merge our extension namespace into all configured transports
-                    ctx.auth_module.merge_auth_methods(ext.into_rpc())?;
+                            let ext = ConsensusExt { consensus, provider };
 
-                    println!("consensus rpc extension enabled");
+                            // now we merge our extension namespace into all configured transports
+                            ctx.auth_module.merge_auth_methods(ext.into_rpc())?;
 
-                    Ok(())
-                })
-                .launch_with_debug_capabilities()
-                .await?;
+                            println!("consensus rpc extension enabled");
+
+                            Ok(())
+                        })
+                .launch_with_debug_capabilities().await?;
 
             // Install ress subprotocol.
             if ress_args.enabled {

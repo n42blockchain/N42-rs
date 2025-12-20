@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! Possible errors when interacting with the network.
 
 use crate::session::PendingSessionHandshakeError;

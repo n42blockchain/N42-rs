@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! `reth debug` command. Collection of various debugging routines.
 
 use clap::{Parser, Subcommand};

@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 // re-export the node api types
 pub use reth_node_api::{FullNodeTypes, NodeTypes};
 

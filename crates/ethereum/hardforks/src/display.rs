@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 use crate::ForkCondition;
 use alloc::{
     format,
@@ -42,9 +39,7 @@ impl core::fmt::Display for DisplayFork {
             ForkCondition::Block(at) | ForkCondition::Timestamp(at) => {
                 write!(f, "{name_with_eip:32} @{at}")?;
             }
-            ForkCondition::TTD {
-                total_difficulty, ..
-            } => {
+            ForkCondition::TTD { total_difficulty, .. } => {
                 // All networks that have merged are finalized.
                 write!(
                     f,
@@ -134,21 +129,11 @@ impl core::fmt::Display for DisplayHardforks {
                 writeln!(f)?;
             }
         } else {
-            format(
-                "Merge hard forks",
-                &self.with_merge,
-                self.post_merge.is_empty(),
-                f,
-            )?;
+            format("Merge hard forks", &self.with_merge, self.post_merge.is_empty(), f)?;
         }
 
         if !self.post_merge.is_empty() {
-            format(
-                "Post-merge hard forks (timestamp based)",
-                &self.post_merge,
-                true,
-                f,
-            )?;
+            format("Post-merge hard forks (timestamp based)", &self.post_merge, true, f)?;
         }
 
         Ok(())
@@ -166,21 +151,14 @@ impl DisplayHardforks {
         let mut post_merge = Vec::new();
 
         for (fork, condition) in hardforks {
-            let mut display_fork = DisplayFork {
-                name: fork.name().to_string(),
-                activated_at: condition,
-                eip: None,
-            };
+            let mut display_fork =
+                DisplayFork { name: fork.name().to_string(), activated_at: condition, eip: None };
 
             match condition {
                 ForkCondition::Block(_) => {
                     pre_merge.push(display_fork);
                 }
-                ForkCondition::TTD {
-                    activation_block_number,
-                    total_difficulty,
-                    fork_block,
-                } => {
+                ForkCondition::TTD { activation_block_number, total_difficulty, fork_block } => {
                     display_fork.activated_at = ForkCondition::TTD {
                         activation_block_number,
                         fork_block,
@@ -195,10 +173,6 @@ impl DisplayHardforks {
             }
         }
 
-        Self {
-            pre_merge,
-            with_merge,
-            post_merge,
-        }
+        Self { pre_merge, with_merge, post_merge }
     }
 }

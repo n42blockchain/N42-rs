@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 use std::fmt::{Debug, Formatter};
 use std::time::{SystemTime};
 use reth_consensus::{Consensus, ConsensusError};

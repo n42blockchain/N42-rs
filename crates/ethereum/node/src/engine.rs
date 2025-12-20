@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! Validates execution payload wrt Ethereum Execution Engine API version.
 
 use alloy_rpc_types_engine::ExecutionData;
@@ -29,9 +26,7 @@ pub struct EthereumEngineValidator {
 impl EthereumEngineValidator {
     /// Instantiates a new validator.
     pub const fn new(chain_spec: Arc<ChainSpec>) -> Self {
-        Self {
-            inner: EthereumExecutionPayloadValidator::new(chain_spec),
-        }
+        Self { inner: EthereumExecutionPayloadValidator::new(chain_spec) }
     }
 
     /// Returns the chain spec used by the validator.
@@ -50,9 +45,7 @@ impl PayloadValidator for EthereumEngineValidator {
         payload: ExecutionData,
     ) -> Result<RecoveredBlock<Self::Block>, NewPayloadError> {
         let sealed_block = self.inner.ensure_well_formed_payload(payload)?;
-        sealed_block
-            .try_recover()
-            .map_err(|e| NewPayloadError::Other(e.into()))
+        sealed_block.try_recover().map_err(|e| NewPayloadError::Other(e.into()))
     }
 }
 

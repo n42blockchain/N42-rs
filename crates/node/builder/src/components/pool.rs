@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! Pool component for the node builder.
 
 use alloy_primitives::Address;
@@ -96,10 +93,7 @@ impl PoolBuilderConfigOverrides {
         if let Some(minimal_protocol_basefee) = minimal_protocol_basefee {
             config.minimal_protocol_basefee = minimal_protocol_basefee;
         }
-        config
-            .local_transactions_config
-            .local_addresses
-            .extend(local_addresses);
+        config.local_transactions_config.local_addresses.extend(local_addresses);
 
         config
     }

@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! clap [Args](clap::Args) for RPC related arguments.
 
 use std::{
@@ -111,12 +108,7 @@ pub struct RpcServerArgs {
     ///
     /// If no path is provided, a secret will be generated and stored in the datadir under
     /// `<DIR>/<CHAIN_ID>/jwt.hex`. For mainnet this would be `~/.reth/mainnet/jwt.hex` by default.
-    #[arg(
-        long = "authrpc.jwtsecret",
-        value_name = "PATH",
-        global = true,
-        required = false
-    )]
+    #[arg(long = "authrpc.jwtsecret", value_name = "PATH", global = true, required = false)]
     pub auth_jwtsecret: Option<PathBuf>,
 
     /// Enable auth engine API over IPC
@@ -132,12 +124,7 @@ pub struct RpcServerArgs {
     ///
     /// This is __not__ used for the authenticated engine-API RPC server, see
     /// `--authrpc.jwtsecret`.
-    #[arg(
-        long = "rpc.jwtsecret",
-        value_name = "HEX",
-        global = true,
-        required = false
-    )]
+    #[arg(long = "rpc.jwtsecret", value_name = "HEX", global = true, required = false)]
     pub rpc_jwtsecret: Option<JwtSecret>,
 
     /// Set the maximum RPC request payload size for both HTTP and WS in megabytes.
@@ -310,11 +297,8 @@ impl RpcServerArgs {
     /// Append a random string to the ipc path, to prevent possible collisions when multiple nodes
     /// are being run on the same machine.
     pub fn with_ipc_random_path(mut self) -> Self {
-        let random_string: String = rand::rng()
-            .sample_iter(rand::distr::Alphanumeric)
-            .take(8)
-            .map(char::from)
-            .collect();
+        let random_string: String =
+            rand::rng().sample_iter(rand::distr::Alphanumeric).take(8).map(char::from).collect();
         self.ipcpath = format!("{}-{}", self.ipcpath, random_string);
         self
     }
@@ -386,13 +370,10 @@ impl TypedValueParser for RpcModuleSelectionValueParser {
         arg: Option<&Arg>,
         value: &OsStr,
     ) -> Result<Self::Value, clap::Error> {
-        let val = value
-            .to_str()
-            .ok_or_else(|| clap::Error::new(clap::error::ErrorKind::InvalidUtf8))?;
+        let val =
+            value.to_str().ok_or_else(|| clap::Error::new(clap::error::ErrorKind::InvalidUtf8))?;
         val.parse::<RpcModuleSelection>().map_err(|err| {
-            let arg = arg
-                .map(|a| a.to_string())
-                .unwrap_or_else(|| "...".to_owned());
+            let arg = arg.map(|a| a.to_string()).unwrap_or_else(|| "...".to_owned());
             let possible_values = RethRpcModule::all_variant_names().to_vec().join(",");
             let msg = format!(
                 "Invalid value '{val}' for {arg}: {err}.\n    [possible values: {possible_values}]"
@@ -402,9 +383,7 @@ impl TypedValueParser for RpcModuleSelectionValueParser {
     }
 
     fn possible_values(&self) -> Option<Box<dyn Iterator<Item = PossibleValue> + '_>> {
-        let values = RethRpcModule::all_variant_names()
-            .iter()
-            .map(PossibleValue::new);
+        let values = RethRpcModule::all_variant_names().iter().map(PossibleValue::new);
         Some(Box::new(values))
     }
 }

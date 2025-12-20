@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! Reth compatibility and utils for RPC types
 //!
 //! This crate various helper functions to convert between reth primitive types and rpc types.

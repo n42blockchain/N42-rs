@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 use super::{
     metrics::{StaticFileProviderMetrics, StaticFileProviderOperation},
     LoadedJarRef,
@@ -105,8 +102,7 @@ impl<N: NodePrimitives<BlockHeader: Value>> HeaderProvider for StaticFileJarProv
     }
 
     fn header_by_number(&self, num: BlockNumber) -> ProviderResult<Option<Self::Header>> {
-        self.cursor()?
-            .get_one::<HeaderMask<Self::Header>>(num.into())
+        self.cursor()?.get_one::<HeaderMask<Self::Header>>(num.into())
     }
 
     fn header_td(&self, block_hash: &BlockHash) -> ProviderResult<Option<U256>> {
@@ -118,10 +114,7 @@ impl<N: NodePrimitives<BlockHeader: Value>> HeaderProvider for StaticFileJarProv
     }
 
     fn header_td_by_number(&self, num: BlockNumber) -> ProviderResult<Option<U256>> {
-        Ok(self
-            .cursor()?
-            .get_one::<TotalDifficultyMask>(num.into())?
-            .map(Into::into))
+        Ok(self.cursor()?.get_one::<TotalDifficultyMask>(num.into())?.map(Into::into))
     }
 
     fn headers_range(
@@ -168,7 +161,7 @@ impl<N: NodePrimitives<BlockHeader: Value>> HeaderProvider for StaticFileJarProv
             {
                 let sealed = SealedHeader::new(header, hash);
                 if !predicate(&sealed) {
-                    break;
+                    break
                 }
                 headers.push(sealed);
             }
@@ -238,21 +231,18 @@ impl<N: NodePrimitives<SignedTx: Decompress + SignedTransaction>> TransactionsPr
     }
 
     fn transaction_by_id(&self, num: TxNumber) -> ProviderResult<Option<Self::Transaction>> {
-        self.cursor()?
-            .get_one::<TransactionMask<Self::Transaction>>(num.into())
+        self.cursor()?.get_one::<TransactionMask<Self::Transaction>>(num.into())
     }
 
     fn transaction_by_id_unhashed(
         &self,
         num: TxNumber,
     ) -> ProviderResult<Option<Self::Transaction>> {
-        self.cursor()?
-            .get_one::<TransactionMask<Self::Transaction>>(num.into())
+        self.cursor()?.get_one::<TransactionMask<Self::Transaction>>(num.into())
     }
 
     fn transaction_by_hash(&self, hash: TxHash) -> ProviderResult<Option<Self::Transaction>> {
-        self.cursor()?
-            .get_one::<TransactionMask<Self::Transaction>>((&hash).into())
+        self.cursor()?.get_one::<TransactionMask<Self::Transaction>>((&hash).into())
     }
 
     fn transaction_by_hash_with_meta(
@@ -324,14 +314,13 @@ impl<N: NodePrimitives<SignedTx: Decompress + SignedTransaction, Receipt: Decomp
     type Receipt = N::Receipt;
 
     fn receipt(&self, num: TxNumber) -> ProviderResult<Option<Self::Receipt>> {
-        self.cursor()?
-            .get_one::<ReceiptMask<Self::Receipt>>(num.into())
+        self.cursor()?.get_one::<ReceiptMask<Self::Receipt>>(num.into())
     }
 
     fn receipt_by_hash(&self, hash: TxHash) -> ProviderResult<Option<Self::Receipt>> {
         if let Some(tx_static_file) = &self.auxiliary_jar {
             if let Some(num) = tx_static_file.transaction_id(hash)? {
-                return self.receipt(num);
+                return self.receipt(num)
             }
         }
         Ok(None)
@@ -373,7 +362,7 @@ impl<N: NodePrimitives> WithdrawalsProvider for StaticFileJarProvider<'_, N> {
             return Ok(self
                 .cursor()?
                 .get_one::<WithdrawalsMask>(num.into())?
-                .and_then(|s| s.withdrawals));
+                .and_then(|s| s.withdrawals))
         }
         // Only accepts block number queries
         Err(ProviderError::UnsupportedProvider)
@@ -386,7 +375,7 @@ impl<N: FullNodePrimitives<BlockHeader: Value>> OmmersProvider for StaticFileJar
             return Ok(self
                 .cursor()?
                 .get_one::<OmmersMask<Self::Header>>(num.into())?
-                .map(|s| s.ommers));
+                .map(|s| s.ommers))
         }
         // Only accepts block number queries
         Err(ProviderError::UnsupportedProvider)

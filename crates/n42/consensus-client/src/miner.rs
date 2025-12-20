@@ -1,39 +1,32 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! Contains the implementation of the mining mode for the local engine.
 
-use alloy_eips::{BlockHashOrNumber, BlockNumHash};
 use alloy_primitives::Sealable;
+use reth_network_api::{FullNetwork, BlockDownloaderProvider, BlockAnnounceProvider, NetworkEventListenerProvider};
+use reth_ethereum_primitives::{EthPrimitives};
+use reth_primitives::TransactionSigned;
+use reth_primitives_traits::{AlloyBlockHeader, NodePrimitives, BlockBody};
+use alloy_eips::{BlockHashOrNumber, BlockNumHash};
 use alloy_primitives::{Address, BlockHash, TxHash, B256, U128, U256};
 use alloy_rpc_types_engine::{CancunPayloadFields, ExecutionPayloadSidecar, ForkchoiceState};
 use eyre::OptionExt;
 use futures_util::{stream::Fuse, StreamExt};
 use itertools::Itertools;
-use reth_chainspec::EthereumHardforks;
-use reth_consensus::{ConsensusError, FullConsensus};
 use reth_engine_primitives::BeaconConsensusEngineHandle;
-use reth_eth_wire_types::{NetworkPrimitives, NewBlock};
-use reth_ethereum_primitives::EthPrimitives;
-use reth_network_api::{
-    BlockAnnounceProvider, BlockDownloaderProvider, FullNetwork, NetworkEventListenerProvider,
-};
+use reth_chainspec::EthereumHardforks;
+use reth_consensus::{FullConsensus, ConsensusError};
+use reth_payload_primitives::{EngineApiMessageVersion};
+use reth_eth_wire_types::{NewBlock, NetworkPrimitives};
 use reth_network_p2p::{
-    bodies::client::BodiesClient, headers::client::HeadersClient, priority::Priority, BlockClient,
+    bodies::client::BodiesClient, headers::client::HeadersClient, priority::Priority,
+    BlockClient,
 };
 use reth_payload_builder::PayloadBuilderHandle;
-use reth_payload_primitives::EngineApiMessageVersion;
-use reth_payload_primitives::{BuiltPayload, PayloadAttributesBuilder, PayloadKind, PayloadTypes};
-use reth_primitives::TransactionSigned;
+use reth_payload_primitives::{
+    BuiltPayload, PayloadAttributesBuilder, PayloadKind, PayloadTypes,
+};
 use reth_primitives::{Block, Header, SealedBlock};
-use reth_primitives_traits::{
-    header::clique_utils::{recover_address, recover_address_generic},
-    Block as BlockTrait,
-};
-use reth_primitives_traits::{AlloyBlockHeader, BlockBody, NodePrimitives};
-use reth_provider::{
-    BlockIdReader, BlockReader, ChainSpecProvider, ChainStateBlockReader, DatabaseProviderFactory,
-};
+use reth_primitives_traits::{Block as BlockTrait, header::clique_utils::{recover_address, recover_address_generic}};
+use reth_provider::{BlockIdReader, BlockReader, ChainSpecProvider, DatabaseProviderFactory, ChainStateBlockReader};
 use reth_transaction_pool::TransactionPool;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -41,12 +34,12 @@ use std::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, UNIX_EPOCH, SystemTime},
 };
 use tokio::sync::mpsc;
 use tokio::time::{interval_at, sleep, Instant, Interval};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{trace, debug, error, info, warn};
 
 /// A mining mode for the local dev engine.
 #[derive(Debug)]
@@ -114,13 +107,8 @@ pub struct N42Miner<T: PayloadTypes, Provider, B, Network> {
     payload_builder: PayloadBuilderHandle<T>,
     /// full network  for announce block
     network: Network,
-    consensus: Arc<
-        dyn FullConsensus<<T::BuiltPayload as BuiltPayload>::Primitives, Error = ConsensusError>,
-    >,
-    recent_blocks: schnellru::LruMap<
-        B256,
-        SealedBlock<<<T::BuiltPayload as BuiltPayload>::Primitives as NodePrimitives>::Block>,
-    >,
+    consensus: Arc<dyn FullConsensus<<T::BuiltPayload as BuiltPayload>::Primitives, Error = ConsensusError>>,
+    recent_blocks: schnellru::LruMap<B256, SealedBlock<<<T::BuiltPayload as BuiltPayload>::Primitives as NodePrimitives>::Block>>,
     recent_num_to_td: schnellru::LruMap<u64, U256>,
     new_block_tx: mpsc::Sender<(NewBlock, BlockHash)>,
     new_block_rx: mpsc::Receiver<(NewBlock, BlockHash)>,
@@ -148,7 +136,8 @@ where
     T: PayloadTypes,
     <T::BuiltPayload as BuiltPayload>::Primitives: NodePrimitives,
     <T::BuiltPayload as BuiltPayload>::Primitives: NodePrimitives<Block = reth_ethereum_primitives::Block>,
-    Provider: BlockReader
+    Provider: 
+        BlockReader
         + BlockIdReader
         + ChainSpecProvider<ChainSpec: EthereumHardforks>
         + DatabaseProviderFactory <Provider: ChainStateBlockReader>
@@ -436,6 +425,7 @@ where
             .consensus
             .snapshot(header.number(), header.hash_slow(), None)
             .unwrap();
+        
 
         snapshot.signers
     }
@@ -572,7 +562,7 @@ where
     async fn advance(&mut self) -> eyre::Result<()> {
         let (in_order_count, out_of_order_count, order_ratio) = self.get_order_stats();
         let num_signers = self.get_best_block_num_signers();
-
+        
         let interval = match self.mode {
             MiningMode::Instant(_) => {
                 unimplemented!("Add a separate flow if needed");
@@ -957,5 +947,8 @@ where
 }
 
 fn exit_by_sigint() {
-    let _ = nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGINT);
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::this(),
+        nix::sys::signal::Signal::SIGINT,
+    );
 }

@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 /* ==================== BROADCAST ==================== */
 
 /// Soft limit for the number of hashes in a

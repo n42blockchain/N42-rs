@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! Ethereum Node types config.
 
 pub use crate::{payload::EthereumPayloadBuilder, EthereumEngineValidator};
@@ -165,9 +162,7 @@ where
     EthApiFor<N>: FullEthApiServer<Provider = N::Provider, Pool = N::Pool>,
 {
     fn default() -> Self {
-        Self {
-            inner: Default::default(),
-        }
+        Self { inner: Default::default() }
     }
 }
 
@@ -280,12 +275,7 @@ impl<N: FullNodeComponents<Types = Self>> DebugNode<N> for EthereumNode {
     type RpcBlock = alloy_rpc_types_eth::Block;
 
     fn rpc_to_primitive_block(rpc_block: Self::RpcBlock) -> reth_ethereum_primitives::Block {
-        let alloy_rpc_types_eth::Block {
-            header,
-            transactions,
-            withdrawals,
-            ..
-        } = rpc_block;
+        let alloy_rpc_types_eth::Block { header, transactions, withdrawals, .. } = rpc_block;
         reth_ethereum_primitives::Block {
             header: header.inner,
             body: reth_ethereum_primitives::BlockBody {
@@ -348,9 +338,8 @@ where
         } else {
             // get the current blob params for the current timestamp, fallback to default Cancun
             // params
-            let current_timestamp = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)?
-                .as_secs();
+            let current_timestamp =
+                SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
             let blob_params = ctx
                 .chain_spec()
                 .blob_params_at_timestamp(current_timestamp)
@@ -395,17 +384,16 @@ where
                 let transactions_backup_config =
                     reth_transaction_pool::maintain::LocalTransactionBackupConfig::with_local_txs_backup(transactions_path);
 
-                ctx.task_executor()
-                    .spawn_critical_with_graceful_shutdown_signal(
-                        "local transactions backup task",
-                        |shutdown| {
-                            reth_transaction_pool::maintain::backup_local_transactions_task(
-                                shutdown,
-                                pool.clone(),
-                                transactions_backup_config,
-                            )
-                        },
-                    );
+                ctx.task_executor().spawn_critical_with_graceful_shutdown_signal(
+                    "local transactions backup task",
+                    |shutdown| {
+                        reth_transaction_pool::maintain::backup_local_transactions_task(
+                            shutdown,
+                            pool.clone(),
+                            transactions_backup_config,
+                        )
+                    },
+                );
             }
 
             // spawn the maintenance task

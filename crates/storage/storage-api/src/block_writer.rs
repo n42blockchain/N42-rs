@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 use crate::{NodePrimitivesProvider, StorageLocation};
 use alloc::vec::Vec;
 use alloy_primitives::BlockNumber;

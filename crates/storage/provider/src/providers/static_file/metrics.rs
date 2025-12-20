@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 use std::{collections::HashMap, time::Duration};
 
 use itertools::Itertools;
@@ -54,16 +51,8 @@ impl StaticFileProviderMetrics {
         files: usize,
         entries: usize,
     ) {
-        self.segments
-            .get(&segment)
-            .expect("segment metrics should exist")
-            .size
-            .set(size as f64);
-        self.segments
-            .get(&segment)
-            .expect("segment metrics should exist")
-            .files
-            .set(files as f64);
+        self.segments.get(&segment).expect("segment metrics should exist").size.set(size as f64);
+        self.segments.get(&segment).expect("segment metrics should exist").files.set(files as f64);
         self.segments
             .get(&segment)
             .expect("segment metrics should exist")

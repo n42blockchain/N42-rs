@@ -1,18 +1,16 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
 
 // use ethcore::snapshot::{ManifestData, SnapshotService};
-use reth_primitives::{arbitrary, Header};
 use std::collections::HashMap;
 use std::error::Error;
+use reth_primitives::{arbitrary, Header};
 
 use std::time::{Duration, Instant};
 
-use alloy_primitives::Sealable;
+use reth_primitives_traits::{BlockHeader as BlockHeaderTrait};
 use reth_primitives_traits::AlloyBlockHeader;
-use reth_primitives_traits::BlockHeader as BlockHeaderTrait;
+use alloy_primitives::Sealable;
 
-use alloy_primitives::{hex, Address, B256, U256};
+use alloy_primitives::{Address, B256, U256, hex};
 use alloy_rlp::{RlpDecodable, RlpEncodable};
 use arbitrary::Arbitrary;
 use serde::{Deserialize, Serialize};
@@ -21,6 +19,7 @@ use tracing::info;
 
 const NONCE_AUTH_VOTE: [u8; 8] = hex!("ffffffffffffffff"); // Magic nonce number to vote on adding a new signer
 const NONCE_DROP_VOTE: [u8; 8] = hex!("0000000000000000"); // Magic nonce number to vote on removing a signer
+
 
 #[derive(Debug)]
 pub enum VotingError {
@@ -45,18 +44,7 @@ impl std::fmt::Display for VotingError {
     }
 }
 
-#[derive(
-    Clone,
-    Debug,
-    PartialEq,
-    Eq,
-    Serialize,
-    Deserialize,
-    RlpEncodable,
-    RlpDecodable,
-    Arbitrary,
-    Default,
-)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, RlpEncodable, RlpDecodable,Arbitrary,Default)]
 pub struct Vote {
     /// Authorized signer that cast this vote
     pub signer: Address,
@@ -68,18 +56,7 @@ pub struct Vote {
     pub authorize: bool,
 }
 
-#[derive(
-    Clone,
-    Debug,
-    PartialEq,
-    Eq,
-    Serialize,
-    Deserialize,
-    RlpEncodable,
-    RlpDecodable,
-    Arbitrary,
-    Default,
-)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, RlpEncodable, RlpDecodable,Arbitrary,Default)]
 pub struct Tally {
     /// Whether the vote is about authorizing or kicking someone
     pub authorize: bool,
@@ -87,9 +64,7 @@ pub struct Tally {
     pub votes: u32,
 }
 /// aposconfig
-#[derive(
-    Clone, Debug, PartialEq, Eq, Serialize, Deserialize, RlpEncodable, RlpDecodable, Arbitrary,
-)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, RlpEncodable, RlpDecodable,Arbitrary)]
 pub struct APosConfig {
     /// Number of seconds between blocks to enforce
     pub period: u64,
@@ -106,7 +81,7 @@ pub struct APosConfig {
 impl Default for APosConfig {
     fn default() -> Self {
         Self {
-            period: 8,
+            period:8,
             epoch: 3000,
             reward_epoch: 10800,
             reward_limit: U256::from(0x6F05B59D3B20000_u64),
@@ -116,8 +91,9 @@ impl Default for APosConfig {
 }
 
 /// snapshot
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Arbitrary, Default)]
-pub struct Snapshot {
+#[derive(Clone, Debug, PartialEq, Eq, Serialize,Deserialize,Arbitrary,Default)]
+pub struct  Snapshot
+{
     /// Consensus engine parameters to fine tune behavior
     pub config: APosConfig,
     /// Block number where the snapshot was created
@@ -127,14 +103,16 @@ pub struct Snapshot {
     /// Set of authorized signers at this moment
     pub signers: Vec<Address>,
     /// Set of recent signers for spam protections
-    pub recents: HashMap<u64, Address>,
+    pub recents: HashMap<u64,Address>,
     /// List of votes cast in chronological order
     pub votes: Vec<Vote>,
     /// Current vote tally to avoid recalculating
-    pub tally: HashMap<Address, Tally>,
+    pub tally: HashMap<Address,Tally>,
 }
 
-impl Snapshot {
+
+impl Snapshot
+{
     /// create a new Snapshot
     pub fn new_snapshot(
         config: APosConfig,
@@ -158,7 +136,8 @@ impl Snapshot {
         snap
     }
 
-    /// Create a deep copy of the snapshot
+
+	/// Create a deep copy of the snapshot
     pub fn copy(&self) -> Self {
         Self {
             config: self.config.clone(),
@@ -169,7 +148,7 @@ impl Snapshot {
             votes: self.votes.clone(),
             tally: self.tally.clone(),
         }
-
+        
         // No need for special handling for votes if Vec<T> implements Clone
         // Deep copy is handled by the clone method for each type.
     }
@@ -179,9 +158,9 @@ impl Snapshot {
     //     (self.ecrecover)(header)
     // }
 
-    /// `valid_vote` returns whether it makes sense to cast the specified vote in the
+	/// `valid_vote` returns whether it makes sense to cast the specified vote in the
     /// given snapshot context (e.g. don't try to add an already authorized signer).
-    pub fn valid_vote(&self, address: Address, authorize: bool) -> bool {
+	pub fn valid_vote(&self, address: Address, authorize: bool) -> bool {
         if self.signers.iter().any(|x| x == &address) {
             !authorize
         } else {
@@ -199,13 +178,7 @@ impl Snapshot {
         if let Some(tally) = self.tally.get_mut(&address) {
             tally.votes += 1;
         } else {
-            self.tally.insert(
-                address,
-                Tally {
-                    authorize,
-                    votes: 1,
-                },
-            );
+            self.tally.insert(address, Tally { authorize, votes: 1 });
         }
         true
     }
@@ -230,12 +203,12 @@ impl Snapshot {
         }
     }
 
-    /// Create a new authorization snapshot using the given header information
-    pub fn apply<F, H>(&self, headers: Vec<H>, func: F) -> Result<Self, VotingError>
-    where
-        F: Fn(H) -> Result<Address, Box<dyn Error>>,
-        H: BlockHeaderTrait,
-    {
+	 /// Create a new authorization snapshot using the given header information
+	 pub fn apply<F, H>(&self, headers: Vec<H>,func:F) -> Result<Self, VotingError>
+     where
+         F: Fn(H) -> Result<Address, Box<dyn Error>>,
+         H: BlockHeaderTrait,
+     {
         //If there is no header information, return the current snapshot directly
         if headers.is_empty() {
             return Ok(self.clone());
@@ -273,8 +246,7 @@ impl Snapshot {
             }
 
             //Verify the signer and check if they are in the signer list
-            let signer =
-                func(header.clone()).map_err(|e| VotingError::RecoverError(e.to_string()))?;
+            let signer = func(header.clone()).map_err(|e| VotingError::RecoverError(e.to_string()))?;
             if !snap.signers.contains(&signer) {
                 return Err(VotingError::UnauthorizedSigner);
             }
@@ -285,11 +257,7 @@ impl Snapshot {
             snap.recents.insert(number, signer);
 
             //Discard any previous votes of the signer
-            while let Some(i) = snap
-                .votes
-                .iter()
-                .position(|vote| vote.signer == signer && vote.address == header.beneficiary())
-            {
+            while let Some(i) = snap.votes.iter().position(|vote| vote.signer == signer && vote.address == header.beneficiary()) {
                 snap.uncast(snap.votes[i].address, snap.votes[i].authorize);
                 snap.votes.remove(i);
             }
@@ -316,9 +284,7 @@ impl Snapshot {
                     if tally.authorize {
                         snap.signers.push(header.beneficiary());
                     } else {
-                        if let Some(pos) =
-                            snap.signers.iter().position(|x| *x == header.beneficiary())
-                        {
+                        if let Some(pos) = snap.signers.iter().position(|x| *x == header.beneficiary()) {
                             snap.signers.remove(pos);
                         }
                         // snap.signers.remove(header.beneficiary);
@@ -329,43 +295,39 @@ impl Snapshot {
                             snap.recents.remove(&(number - limit));
                         }
 
-                        //Discard any previous votes of the revoked authorized signatory
-                        while let Some(i) = snap
-                            .votes
-                            .iter()
-                            .position(|vote| vote.signer == header.beneficiary())
-                        {
+                       //Discard any previous votes of the revoked authorized signatory
+                        while let Some(i) = snap.votes.iter().position(|vote| vote.signer == header.beneficiary()) {
                             snap.uncast(snap.votes[i].address, snap.votes[i].authorize);
                             snap.votes.remove(i);
                         }
                     }
 
                     //Discard any previous votes that have just changed the account
-                    snap.votes
-                        .retain(|vote| vote.address != header.beneficiary());
+                    snap.votes.retain(|vote| vote.address != header.beneficiary());
                     snap.tally.remove(&header.beneficiary());
                 }
             }
 
             //If the operation takes too long, notify the user regularly
             if logged.elapsed() > Duration::from_secs(8) {
+                
                 info!(
                     target: "Apos",
-                    "Reconstructing voting history: i={}, headers.len()={}, elapsed={:?}",
-                    i,
-                    headers.len(),
-                    start.elapsed()
-                );
+					"Reconstructing voting history: i={}, headers.len()={}, elapsed={:?}",
+					i,
+					headers.len(),
+					start.elapsed()
+				);
             }
         }
 
         if start.elapsed() > Duration::from_secs(8) {
             info!(
                 target: "Apos",
-                "Reconstructed voting history: headers.len()={}, elapsed={:?}",
-                headers.len(),
-                start.elapsed()
-            );
+				"Reconstructed voting history: headers.len()={}, elapsed={:?}",
+				headers.len(),
+				start.elapsed()
+			);
         }
 
         snap.number = headers.last().unwrap().number();
@@ -374,10 +336,10 @@ impl Snapshot {
         Ok(snap)
     }
 
-    /// signers retrieves the list of authorized signers in ascending order.
-    pub fn signers(&self) -> Vec<Address> {
+	 /// signers retrieves the list of authorized signers in ascending order.
+	 pub fn signers(&self) -> Vec<Address> {
         let sigs: Vec<Address> = self.signers.to_vec();
-        //sigs.sort();
+        //sigs.sort(); 
         sigs
     }
 

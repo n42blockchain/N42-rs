@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 #[macro_export]
 /// Implements the `Arbitrary` trait for types with fixed array types.
 macro_rules! impl_fixed_arbitrary {

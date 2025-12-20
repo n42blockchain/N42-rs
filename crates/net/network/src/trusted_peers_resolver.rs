@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! Periodically resolves DNS records for a set of trusted peers and emits updates as they complete
 
 use futures::{future::BoxFuture, ready, stream::FuturesUnordered, FutureExt, StreamExt};

@@ -1,15 +1,14 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! Implements [`Compress`] and [`Decompress`] for [`Snapshot`]
 
+use n42_primitives::Snapshot;
 use crate::{
     table::{Compress, Decompress},
     DatabaseError,
 };
-use n42_primitives::Snapshot;
 
-impl Decompress for Snapshot {
+
+
+impl Decompress for Snapshot{
     fn decompress(value: &[u8]) -> Result<Self, DatabaseError> {
         let bytes = value.as_ref();
         let snapshot: Result<Snapshot, _> = serde_json::from_slice(bytes);
@@ -17,7 +16,7 @@ impl Decompress for Snapshot {
     }
 }
 
-impl Compress for Snapshot {
+impl Compress for Snapshot{
     type Compressed = Vec<u8>;
     fn compress_to_buf<B: bytes::BufMut + AsMut<[u8]>>(&self, buf: &mut B) {
         let serialized = serde_json::to_vec(&self).expect("Serialization should not fail");

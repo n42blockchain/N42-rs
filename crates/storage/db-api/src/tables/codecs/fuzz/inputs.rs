@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! Curates the input coming from the fuzzer for certain types.
 
 use crate::models::IntegerList;

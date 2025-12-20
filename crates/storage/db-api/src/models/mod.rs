@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! Implements data structures specific to the database
 
 use crate::{
@@ -24,8 +21,8 @@ pub mod accounts;
 pub mod blocks;
 pub mod integer_list;
 pub mod sharded_key;
-mod snapshot;
 pub mod storage_sharded_key;
+mod snapshot;
 
 pub use accounts::*;
 pub use blocks::*;
@@ -105,9 +102,7 @@ impl Encode for B256 {
 
 impl Decode for B256 {
     fn decode(value: &[u8]) -> Result<Self, DatabaseError> {
-        Ok(Self::new(
-            value.try_into().map_err(|_| DatabaseError::Decode)?,
-        ))
+        Ok(Self::new(value.try_into().map_err(|_| DatabaseError::Decode)?))
     }
 }
 

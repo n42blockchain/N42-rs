@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! Traits used by the legacy execution engine.
 //!
 //! This module is scheduled for removal in the future.

@@ -1,16 +1,9 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 use alloy_primitives::{Address, B256};
 use reth::rpc::types::engine::PayloadAttributes;
 use reth_payload_builder::EthPayloadBuilderAttributes;
 
 #[cfg(test)]
-pub(crate) fn n42_payload_attributes(
-    timestamp: u64,
-    parent_hash: B256,
-    eth_signer_address: Address,
-) -> EthPayloadBuilderAttributes {
+pub(crate) fn n42_payload_attributes(timestamp: u64, parent_hash: B256, eth_signer_address: Address) -> EthPayloadBuilderAttributes {
     let attributes = PayloadAttributes {
         timestamp,
         prev_randao: B256::ZERO,

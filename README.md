@@ -1,247 +1,195 @@
-<div align="center">
+# N42 Public Chain
 
-# N42
+[![Rust](https://img.shields.io/badge/rust-1.50%2B-orange.svg)](https://www.rust-lang.org)
+[![GitHub Actions](https://github.com/n42blockchain/N42-rs/actions/workflows/devskim.yml/badge.svg)](https://github.com/n42blockchain/N42-rs/actions/workflows/devskim.yml)
+[![License](https://img.shields.io/github/license/n42blockchain/N42-rs)](https://github.com/n42blockchain/N42-rs/blob/main/LICENSE)
 
-**A modular, high-performance blockchain client built in Rust**
+## Introduction
 
-[![Rust](https://img.shields.io/badge/rust-1.86%2B-orange.svg)](https://www.rust-lang.org)
-[![Build Status](https://github.com/n42blockchain/N42-rs/actions/workflows/devskim.yml/badge.svg)](https://github.com/n42blockchain/N42-rs/actions)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Discord](https://img.shields.io/discord/n42?label=Discord&logo=discord)](https://discord.gg/n42)
+N42 is a high-performance blockchain platform implemented in Rust, engineered to provide developers with unparalleled autonomy and interoperability across diverse digital ecosystems. Our architecture combines Rust's memory-safe programming paradigm, modular design principles, and innovative consensus mechanisms to establish a robust foundation for next-generation decentralized applications.
 
-[Website](https://n42.world) | [Documentation](https://docs.n42.world) | [Developer Portal](https://developers.n42.world)
+Leveraging Rust's security properties and our proprietary sharded domain architecture, N42 delivers enterprise-grade performance without compromising decentralization principles. The platform facilitates seamless cross-domain communication, concurrent transaction processing, and customizable execution environments—all secured by zero-knowledge proofs that ensure data integrity throughout the network.
 
-</div>
+Whether developing financial applications, interoperable dApps, or custom execution environments, N42 provides the infrastructure necessary to create secure, scalable, and interconnected blockchain solutions for the evolving digital landscape.
 
----
+## Key Features
 
-## Overview
+- **Decentralized Consensus:** Implements an energy-efficient Proof of Stake (PoS) mechanism that ensures network-wide security and transaction validation integrity.
 
-N42 is a next-generation blockchain execution client implemented in Rust, designed for high performance, modularity, and security. Built on top of [reth](https://github.com/paradigmxyz/reth), N42 extends the Ethereum execution layer with custom consensus mechanisms and domain-specific optimizations.
+- **WebAssembly Smart Contracts:** Supports smart contract development through WebAssembly (Wasm), enabling language-agnostic contract implementation with near-native performance.
 
-### Key Features
+- **Enterprise-Grade Performance:** Engineered for high transaction throughput with optimized data structures and processing algorithms to support demanding enterprise workloads.
 
-- **APoS Consensus**: Authority Proof of Stake consensus mechanism based on Clique
-- **Modular Architecture**: Composable components for flexible deployment scenarios
-- **High Performance**: Optimized for throughput with efficient state management
-- **EVM Compatible**: Full Ethereum Virtual Machine compatibility
-- **Cross-Chain Ready**: Designed for interoperability across blockchain ecosystems
+- **Cross-Chain Compatibility:** Integrates seamlessly with existing blockchain ecosystems through standardized interoperability protocols and cross-chain messaging.
 
-## Installation
+- **Enhanced Security:** Built with Rust's memory safety guarantees, eliminating entire classes of vulnerabilities including buffer overflows, use-after-free errors, and memory leaks.
 
-### Requirements
+- **Developer-Friendly Integration:** Connect to the N42 network with lightweight client libraries and comprehensive SDKs that minimize implementation overhead.
 
-- [Rust](https://www.rust-lang.org/tools/install) 1.86+
-- Clang/LLVM (for building dependencies)
-- Linux / macOS / Windows (WSL)
+- **Flexible Configuration:**
+  - Multi-language development support with idiomatic bindings
+  - Ultra-low transaction latency (≤1ms) through architectural optimizations
+  - Configurable network bandwidth utilization for efficient resource allocation
 
-### Building from Source
+- **Unlimited Scalability:** Horizontal scaling through dynamic node addition, complemented by concurrent transaction processing powered by our CRDT-based state model architecture.
+
+## Architecture
+
+### Domains
+
+**Execution Environment:** Each domain functions as an autonomous computational unit hosting one or more applications. Users interact through a dedicated "vault" within each domain where their assets reside. While expenditures are contained within the associated domain, assets can be received from any domain in the network.
+
+**Local Customization:** Domains can be optimized for specific use cases, implementing custom execution environments and smart contract engines (such as EVM or specialized VMs) without compromising the network's security model.
+
+### Validator Network
+
+**State Propagation & Verification:** Validators constitute a decentralized network responsible for propagating state updates, formalized as State Difference Lists (SDL), across domains. These updates are cryptographically verified using zero-knowledge proofs (SNARKs), ensuring compliance with both global protocol rules and domain-specific constraints.
+
+**Consensus without Full Ordering:** Implementing a leaderless, partial-ordering consensus mechanism based on Byzantine Reliable Broadcast (BRB), N42 achieves exceptional throughput and robust Byzantine fault tolerance.
+
+### State Model & Settlement
+
+**CRDT-Based State Management:** The system employs Conflict-Free Replicated Data Types (CRDTs) to facilitate concurrent state updates without reconciliation conflicts, enabling deterministic and efficient merging of distributed state changes.
+
+**Zero-Knowledge Settlement:** Domains generate cryptographic zero-knowledge proofs attesting to the correctness of state transitions. Validators verify these proofs to finalize settlements without accessing the underlying transaction data, preserving privacy while ensuring correctness.
+
+### Digital Asset Ownership
+
+**User Sovereignty:** N42 establishes comprehensive control of digital assets—from user-generated data to creative content—at the individual level. Assets are tokenized (e.g., via NFTs) and managed through smart contracts with cryptographic attestation of ownership.
+
+**Forced Migration:** In cases of domain censorship or operational disruption, users can initiate secure migration of their vaults to alternative domains, preserving self-custody principles and ensuring continuous access to digital assets.
+
+## Use Cases & Ecosystem
+
+- **Decentralized Finance (DeFi):** By integrating traditional finance (TradFi) capabilities with decentralized finance (DeFi) innovations, N42 supports sophisticated financial applications enabling frictionless asset transfers, efficient market mechanisms, and novel value creation models.
+
+- **Interoperable dApps:** The minimalist global state architecture enables atomic composability across domains, facilitating secure, trustless interactions between decentralized applications without reliance on third-party bridging infrastructure.
+
+- **Custom Execution Environments:** Developers can leverage N42's extensible architecture to implement domain-specific execution environments tailored to particular business requirements while benefiting from the network's global security guarantees and interoperability framework.
+
+## Getting Started
+
+### Prerequisites
+
+- [Rust](https://www.rust-lang.org/tools/install) (v1.50 or later)
+- [Cargo](https://doc.rust-lang.org/cargo/getting-started/installation.html)
+- [Node.js](https://nodejs.org/en/) (optional, for front-end tooling)
+- [Wasm-Pack](https://rustwasm.github.io/wasm-pack/installer/) (for smart contract compilation)
+
+### Installation
+
+Clone the repository:
 
 ```bash
-# Clone the repository
 git clone https://github.com/n42blockchain/N42-rs.git
 cd N42-rs
+```
 
-# Build in release mode
+Build the project:
+
+```bash
 cargo build --release
 ```
 
-The binary will be available at `target/release/n42`.
-
-### Docker
+Run a local node:
 
 ```bash
-docker pull n42blockchain/n42:latest
-docker run -d n42blockchain/n42 node --chain mainnet
+cargo run --release -- --dev
 ```
 
-## Quick Start
+### Running Tests
 
-### Running a Node
+Execute the test suite with:
 
 ```bash
-# Run a mainnet node
-./target/release/n42 node --chain mainnet
-
-# Run a development node
-./target/release/n42 node --dev
-
-# Run with custom data directory
-./target/release/n42 node --chain mainnet --datadir /path/to/data
-```
-
-### Configuration
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--chain` | Chain specification (mainnet, testnet, dev) | `mainnet` |
-| `--datadir` | Data directory for the node | Platform default |
-| `--http` | Enable HTTP-RPC server | Disabled |
-| `--ws` | Enable WebSocket-RPC server | Disabled |
-| `--port` | Network listening port | `30303` |
-
-For a complete list of options:
-
-```bash
-./target/release/n42 node --help
-```
-
-## Project Structure
-
-```
-N42-rs/
-├── bin/
-│   └── n42/                    # Main node binary
-├── crates/
-│   ├── chainspec/              # Chain specification definitions
-│   ├── consensus/              # Consensus implementations
-│   ├── ethereum/               # Ethereum compatibility layer
-│   │   ├── cli/                # CLI commands
-│   │   ├── evm/                # EVM execution
-│   │   ├── hardforks/          # Hardfork configurations
-│   │   └── node/               # Node implementation
-│   ├── n42/                    # N42-specific modules
-│   │   ├── clique/             # APoS consensus (Clique-based)
-│   │   ├── consensus-client/   # Consensus client
-│   │   ├── engine-primitives/  # Engine API primitives
-│   │   ├── engine-types/       # Engine types
-│   │   └── primitives/         # Core primitives
-│   ├── net/                    # Networking
-│   │   ├── network/            # P2P network implementation
-│   │   ├── network-api/        # Network API
-│   │   └── peers/              # Peer discovery
-│   ├── node/                   # Node builder
-│   ├── primitives-traits/      # Primitive trait definitions
-│   ├── rpc/                    # RPC interfaces
-│   └── storage/                # Storage layer
-│       ├── db/                 # Database implementation (MDBX)
-│       ├── db-api/             # Database API
-│       ├── provider/           # Data providers
-│       └── storage-api/        # Storage API
-├── Cargo.toml                  # Workspace configuration
-└── LICENSE                     # MIT License
+cargo test
 ```
 
 ## Documentation
 
-- **[User Guide](https://docs.n42.world/guide)**: Getting started with N42
-- **[API Reference](https://docs.n42.world/api)**: JSON-RPC API documentation
-- **[Architecture](https://docs.n42.world/architecture)**: Technical design documentation
+N42 provides comprehensive documentation to facilitate developer onboarding and platform adoption:
 
-### Generate Local Documentation
+### Official Documentation
 
-```bash
-cargo doc --no-deps --all-features --document-private-items --open
-```
+- **Developer Hub**: Access our [official documentation portal](https://docs.n42.world) for in-depth technical guides, tutorials, and API references
+- **SDK Documentation**: Explore language-specific SDK documentation for seamless integration with existing applications
 
-## Development
+### Local Documentation
 
-### Running Tests
+Generate and access documentation locally:
 
 ```bash
-# Run all tests
-cargo test --workspace
+# Generate comprehensive documentation with examples and all features
+cargo doc --no-deps --all-features --document-private-items
 
-# Run specific crate tests
-cargo test -p n42-clique
-
-# Run with logging
-RUST_LOG=debug cargo test
+# Open the generated documentation in your browser
+cargo doc --open
 ```
 
-### Code Formatting
+### Learning Resources
 
-```bash
-cargo fmt --all
-```
+- **Tutorials**: Progressive guides for domain creation and application deployment
+- **Examples**: Browse our [examples repository](https://github.com/n42blockchain/examples) for reference implementations
+- **Architecture Deep Dives**: Technical papers detailing N42's consensus mechanism, CRDT-based state model, and zero-knowledge settlement system
 
-### Linting
+### API Reference
 
-```bash
-cargo clippy --workspace --all-features
-```
+- **RPC API**: Comprehensive reference for programmatic interaction with the N42 network
+- **WebSocket API**: Real-time data stream specifications and implementation guidelines
+- **CLI Reference**: Detailed guide to command-line interface tools and automation capabilities
 
-## Networks
+### Support Resources
 
-| Network | Chain ID | Status |
-|---------|----------|--------|
-| Mainnet | 42 | Production |
-| Testnet | 4242 | Testing |
-| Devnet | 424242 | Development |
+- **Discord Community**: Join our active [Discord community](https://discord.com/invite/n42) for technical discussions and peer support
+- **Developer Office Hours**: Scheduled sessions with the core development team for direct assistance
+- **GitHub Discussions**: Participate in technical conversations and knowledge sharing
+- **FAQ**: Structured answers to frequently asked implementation questions
 
-### Bootnodes
+Visit our [Developer Portal](https://developers.n42.world) for additional resources including sandbox environments, testing frameworks, and testnet token faucets.
 
-Mainnet bootnodes are included in the default configuration. For custom networks, specify bootnodes via the `--bootnodes` flag.
+## Usage
 
-## RPC Endpoints
+### Setting Up a Node
 
-N42 supports standard Ethereum JSON-RPC methods:
+To deploy a full node, follow these steps:
 
-- `eth_*` - Ethereum namespace
-- `net_*` - Network namespace
-- `web3_*` - Web3 namespace
-- `debug_*` - Debug namespace (optional)
-- `trace_*` - Trace namespace (optional)
+1. **Install Rust and Cargo** according to the official documentation.
+2. **Build the Project** following the compilation instructions above.
+3. **Configure and Run the Node** with appropriate network parameters.
 
-### Engine API
+### Interacting with the Blockchain
 
-The Engine API is available for consensus layer communication:
+Interact with the network via the command-line interface (CLI) or integrate programmatically through the JSON-RPC API.
 
-```bash
-./target/release/n42 node --authrpc.port 8551 --authrpc.jwtsecret /path/to/jwt.hex
-```
+### Deploying Smart Contracts
+
+1. Develop your smart contract in Rust or any Wasm-compatible language.
+2. Compile the contract to Wasm using `wasm-pack` or language-specific tooling.
+3. Deploy the compiled Wasm binary to the blockchain using the provided deployment utilities.
 
 ## Contributing
 
-We welcome contributions from the community. Please read our [Contributing Guidelines](CONTRIBUTING.md) before submitting a pull request.
+Contributions are welcome! Please refer to our CONTRIBUTING.md for comprehensive guidelines on participation.
 
-### Development Process
+### Contribution Process
 
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+We welcome community contributions through the following process:
 
-### Code of Conduct
+1. Fork the repository.
+2. Create a feature or bugfix branch with descriptive naming.
+3. Implement changes with appropriate test coverage.
+4. Submit a pull request with detailed documentation of modifications.
 
-This project adheres to the [Contributor Covenant Code of Conduct](CODE_OF_CONDUCT.md).
-
-## Security
-
-If you discover a security vulnerability, please report it via our [Security Policy](SECURITY.md). Do not open a public issue.
+Please ensure all contributions adhere to the project's coding standards and pass the continuous integration test suite.
 
 ## License
 
-N42 is licensed under the [MIT License](LICENSE).
+N42 is licensed under the MIT License. See the [LICENSE](LICENSE) file for complete terms.
 
-```
-Copyright (c) 2017-2025 N42 Contributors
+## Contact
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
-```
+For inquiries or technical support, please contact us via email at [support@n42.world](mailto:support@n42.world) or join our [Discord community](https://discord.gg/n42).
 
 ## Acknowledgments
 
-N42 is built on the shoulders of giants. We extend our gratitude to:
-
-- [Reth](https://github.com/paradigmxyz/reth) - The modular Ethereum execution client
-- [Alloy](https://github.com/alloy-rs/alloy) - Ethereum library suite
-- [Revm](https://github.com/bluealloy/revm) - Rust EVM implementation
-- The Ethereum community and all open-source contributors
-
----
-
-<div align="center">
-
-**[Website](https://n42.world)** · **[Discord](https://discord.gg/n42)** · **[Twitter](https://twitter.com/n42blockchain)**
-
-</div>
+We extend our appreciation to the Rust community and all contributors whose expertise and dedication have advanced this project.

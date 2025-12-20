@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 use alloc::vec::Vec;
 use reth_prune_types::{PruneCheckpoint, PruneSegment};
 use reth_storage_errors::provider::ProviderResult;

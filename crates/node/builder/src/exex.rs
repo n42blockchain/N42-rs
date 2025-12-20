@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! Types for launching execution extensions (ExEx).
 
 use std::future::Future;

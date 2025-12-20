@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 use reth_network::NetworkPrimitives;
 use reth_node_api::BlockBody;
 use reth_provider::BlockReader;

@@ -1,26 +1,23 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! Payload service component for the node builder.
 
+use reth_node_api::PrimitivesTy; 
+use reth_consensus::{ConsensusError, FullConsensus};
+use reth_consensus::Consensus;
 use crate::{BuilderContext, FullNodeTypes};
 use reth_basic_payload_builder::{BasicPayloadJobGenerator, BasicPayloadJobGeneratorConfig};
 use reth_chain_state::CanonStateSubscriptions;
-use reth_consensus::Consensus;
-use reth_consensus::{ConsensusError, FullConsensus};
-use reth_node_api::PrimitivesTy;
 use reth_node_api::{NodeTypes, PayloadBuilderFor};
 use reth_payload_builder::{PayloadBuilderHandle, PayloadBuilderService};
 use reth_transaction_pool::TransactionPool;
 use std::future::Future;
 
 /// A type that knows how to spawn the payload service.
-pub trait PayloadServiceBuilder<
-    Node: FullNodeTypes,
-    Pool: TransactionPool,
+pub trait PayloadServiceBuilder<Node: FullNodeTypes, Pool: TransactionPool, 
     EvmConfig,
-    Cons: FullConsensus<PrimitivesTy<Node::Types>, Error = ConsensusError> + Clone + Unpin + 'static,
->: Send + Sized
+    Cons:
+        FullConsensus<PrimitivesTy<Node::Types>, Error = ConsensusError> + Clone + Unpin + 'static,
+>:
+    Send + Sized
 {
     /// Spawns the [`PayloadBuilderService`] and returns the handle to it for use by the engine.
     ///
@@ -122,8 +119,7 @@ where
         let (payload_service, payload_service_handle) =
             PayloadBuilderService::new(payload_generator, ctx.provider().canonical_state_stream());
 
-        ctx.task_executor()
-            .spawn_critical("payload builder service", Box::pin(payload_service));
+        ctx.task_executor().spawn_critical("payload builder service", Box::pin(payload_service));
 
         Ok(payload_service_handle)
     }

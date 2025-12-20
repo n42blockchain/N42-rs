@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},

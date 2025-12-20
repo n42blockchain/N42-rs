@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! clap [Args](clap::Args) for network related arguments.
 
 use std::{
@@ -38,7 +35,7 @@ use reth_network::{
 };
 use reth_network_peers::{mainnet_nodes, TrustedPeer};
 use secp256k1::SecretKey;
-use tracing::{debug, error};
+use tracing::{error, debug};
 
 use crate::version::P2P_CLIENT_VERSION;
 
@@ -73,12 +70,7 @@ pub struct NetworkArgs {
 
     /// The path to the known peers file. Connected peers are dumped to this file on nodes
     /// shutdown, and read on startup. Cannot be used with `--no-persist-peers`.
-    #[arg(
-        long,
-        value_name = "FILE",
-        verbatim_doc_comment,
-        conflicts_with = "no_persist_peers"
-    )]
+    #[arg(long, value_name = "FILE", verbatim_doc_comment, conflicts_with = "no_persist_peers")]
     pub peers_file: Option<PathBuf>,
 
     /// Custom node identity
@@ -161,11 +153,7 @@ pub struct NetworkArgs {
     /// Name of network interface used to communicate with peers.
     ///
     /// If flag is set, but no value is passed, the default interface for docker `eth0` is tried.
-    #[arg(
-        long = "net-if.experimental",
-        conflicts_with = "addr",
-        value_name = "IF_NAME"
-    )]
+    #[arg(long = "net-if.experimental", conflicts_with = "addr", value_name = "IF_NAME")]
     pub net_if: Option<String>,
 
     /// Transaction Propagation Policy
@@ -179,11 +167,7 @@ impl NetworkArgs {
     /// Returns the resolved IP address.
     pub fn resolved_addr(&self) -> IpAddr {
         if let Some(ref if_name) = self.net_if {
-            let if_name = if if_name.is_empty() {
-                DEFAULT_NET_IF_NAME
-            } else {
-                if_name
-            };
+            let if_name = if if_name.is_empty() { DEFAULT_NET_IF_NAME } else { if_name };
             return match reth_net_nat::net_if::resolve_net_if_ip(if_name) {
                 Ok(addr) => addr,
                 Err(err) => {
@@ -204,10 +188,7 @@ impl NetworkArgs {
     /// Returns the resolved bootnodes if any are provided.
     pub fn resolved_bootnodes(&self) -> Option<Vec<NodeRecord>> {
         self.bootnodes.clone().map(|bootnodes| {
-            bootnodes
-                .into_iter()
-                .filter_map(|node| node.resolve_blocking().ok())
-                .collect()
+            bootnodes.into_iter().filter_map(|node| node.resolve_blocking().ok()).collect()
         })
     }
     /// Configures and returns a `TransactionsManagerConfig` based on the current settings.
@@ -248,8 +229,8 @@ impl NetworkArgs {
             .resolved_bootnodes()
             .unwrap_or_else(|| chain_spec.bootnodes().unwrap_or_else(mainnet_nodes));
         debug!(target: "reth::cli",
-            ?chain_bootnodes,
-        );
+                        ?chain_bootnodes,
+                    );
         let peers_file = self.peers_file.clone().unwrap_or(default_peers_file);
 
         // Configure peer connections
@@ -283,8 +264,7 @@ impl NetworkArgs {
             // apply discovery settings
             .apply(|builder| {
                 let rlpx_socket = (addr, self.port).into();
-                self.discovery
-                    .apply_to_builder(builder, rlpx_socket, chain_bootnodes)
+                self.discovery.apply_to_builder(builder, rlpx_socket, chain_bootnodes)
             })
             .listener_addr(SocketAddr::new(
                 addr, // set discovery port based on instance number
@@ -333,9 +313,7 @@ impl NetworkArgs {
     /// Resolve all trusted peers at once
     pub async fn resolve_trusted_peers(&self) -> Result<Vec<NodeRecord>, std::io::Error> {
         futures::future::try_join_all(
-            self.trusted_peers
-                .iter()
-                .map(|peer| async move { peer.resolve().await }),
+            self.trusted_peers.iter().map(|peer| async move { peer.resolve().await }),
         )
         .await
     }
@@ -574,10 +552,7 @@ mod tests {
 
         let args =
             CommandParser::<NetworkArgs>::parse_from(["reth", "--nat", "extip:0.0.0.0"]).args;
-        assert_eq!(
-            args.nat,
-            NatResolver::ExternalIp("0.0.0.0".parse().unwrap())
-        );
+        assert_eq!(args.nat, NatResolver::ExternalIp("0.0.0.0".parse().unwrap()));
     }
 
     #[test]

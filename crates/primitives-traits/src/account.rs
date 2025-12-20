@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_genesis::GenesisAccount;
 use alloy_primitives::{keccak256, Bytes, B256, U256};
@@ -29,17 +26,11 @@ pub mod compact_ids {
 }
 
 /// An Ethereum account.
-#[cfg_attr(
-    any(test, feature = "serde"),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(any(test, feature = "serde"), derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[cfg_attr(any(test, feature = "arbitrary"), derive(arbitrary::Arbitrary))]
 #[cfg_attr(any(test, feature = "reth-codec"), derive(reth_codecs::Compact))]
-#[cfg_attr(
-    any(test, feature = "reth-codec"),
-    reth_codecs::add_arbitrary_tests(compact)
-)]
+#[cfg_attr(any(test, feature = "reth-codec"), reth_codecs::add_arbitrary_tests(compact))]
 pub struct Account {
     /// Account nonce.
     pub nonce: u64,
@@ -58,9 +49,9 @@ impl Account {
     /// After `SpuriousDragon` empty account is defined as account with nonce == 0 && balance == 0
     /// && bytecode = None (or hash is [`KECCAK_EMPTY`]).
     pub fn is_empty(&self) -> bool {
-        self.nonce == 0
-            && self.balance.is_zero()
-            && self.bytecode_hash.is_none_or(|hash| hash == KECCAK_EMPTY)
+        self.nonce == 0 &&
+            self.balance.is_zero() &&
+            self.bytecode_hash.is_none_or(|hash| hash == KECCAK_EMPTY)
     }
 
     /// Returns an account bytecode's hash.
@@ -71,11 +62,7 @@ impl Account {
 
     /// Converts the account into a trie account with the given storage root.
     pub fn into_trie_account(self, storage_root: B256) -> TrieAccount {
-        let Self {
-            nonce,
-            balance,
-            bytecode_hash,
-        } = self;
+        let Self { nonce, balance, bytecode_hash } = self;
         TrieAccount {
             nonce,
             balance,
@@ -178,9 +165,8 @@ impl reth_codecs::Compact for Bytecode {
 
         use compact_ids::*;
 
-        let len = buf
-            .read_u32::<byteorder::BigEndian>()
-            .expect("could not read bytecode length") as usize;
+        let len = buf.read_u32::<byteorder::BigEndian>().expect("could not read bytecode length")
+            as usize;
         let bytes = Bytes::from(buf.copy_to_bytes(len));
         let variant = buf.read_u8().expect("could not read bytecode variant");
         let decoded = match variant {
@@ -282,11 +268,7 @@ mod tests {
 
     #[test]
     fn test_empty_account() {
-        let mut acc = Account {
-            nonce: 0,
-            balance: U256::ZERO,
-            bytecode_hash: None,
-        };
+        let mut acc = Account { nonce: 0, balance: U256::ZERO, bytecode_hash: None };
         // Nonce 0, balance 0, and bytecode hash set to None is considered empty.
         assert!(acc.is_empty());
 
@@ -338,26 +320,13 @@ mod tests {
     #[test]
     fn test_account_has_bytecode() {
         // Account with no bytecode (None)
-        let acc_no_bytecode = Account {
-            nonce: 1,
-            balance: U256::from(1000),
-            bytecode_hash: None,
-        };
-        assert!(
-            !acc_no_bytecode.has_bytecode(),
-            "Account should not have bytecode"
-        );
+        let acc_no_bytecode = Account { nonce: 1, balance: U256::from(1000), bytecode_hash: None };
+        assert!(!acc_no_bytecode.has_bytecode(), "Account should not have bytecode");
 
         // Account with bytecode hash set to KECCAK_EMPTY (should have bytecode)
-        let acc_empty_bytecode = Account {
-            nonce: 1,
-            balance: U256::from(1000),
-            bytecode_hash: Some(KECCAK_EMPTY),
-        };
-        assert!(
-            acc_empty_bytecode.has_bytecode(),
-            "Account should have bytecode"
-        );
+        let acc_empty_bytecode =
+            Account { nonce: 1, balance: U256::from(1000), bytecode_hash: Some(KECCAK_EMPTY) };
+        assert!(acc_empty_bytecode.has_bytecode(), "Account should have bytecode");
 
         // Account with a non-empty bytecode hash
         let acc_with_bytecode = Account {
@@ -365,32 +334,18 @@ mod tests {
             balance: U256::from(1000),
             bytecode_hash: Some(B256::from_slice(&[0x11u8; 32])),
         };
-        assert!(
-            acc_with_bytecode.has_bytecode(),
-            "Account should have bytecode"
-        );
+        assert!(acc_with_bytecode.has_bytecode(), "Account should have bytecode");
     }
 
     #[test]
     fn test_account_get_bytecode_hash() {
         // Account with no bytecode (should return KECCAK_EMPTY)
-        let acc_no_bytecode = Account {
-            nonce: 0,
-            balance: U256::ZERO,
-            bytecode_hash: None,
-        };
-        assert_eq!(
-            acc_no_bytecode.get_bytecode_hash(),
-            KECCAK_EMPTY,
-            "Should return KECCAK_EMPTY"
-        );
+        let acc_no_bytecode = Account { nonce: 0, balance: U256::ZERO, bytecode_hash: None };
+        assert_eq!(acc_no_bytecode.get_bytecode_hash(), KECCAK_EMPTY, "Should return KECCAK_EMPTY");
 
         // Account with bytecode hash set to KECCAK_EMPTY
-        let acc_empty_bytecode = Account {
-            nonce: 1,
-            balance: U256::from(1000),
-            bytecode_hash: Some(KECCAK_EMPTY),
-        };
+        let acc_empty_bytecode =
+            Account { nonce: 1, balance: U256::from(1000), bytecode_hash: Some(KECCAK_EMPTY) };
         assert_eq!(
             acc_empty_bytecode.get_bytecode_hash(),
             KECCAK_EMPTY,
@@ -399,11 +354,8 @@ mod tests {
 
         // Account with a valid bytecode hash
         let bytecode_hash = B256::from_slice(&[0x11u8; 32]);
-        let acc_with_bytecode = Account {
-            nonce: 1,
-            balance: U256::from(1000),
-            bytecode_hash: Some(bytecode_hash),
-        };
+        let acc_with_bytecode =
+            Account { nonce: 1, balance: U256::from(1000), bytecode_hash: Some(bytecode_hash) };
         assert_eq!(
             acc_with_bytecode.get_bytecode_hash(),
             bytecode_hash,

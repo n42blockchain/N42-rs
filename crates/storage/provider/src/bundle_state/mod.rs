@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! Bundle state module.
 //! This module contains all the logic related to bundle state.
 

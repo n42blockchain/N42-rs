@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! Consensus component for the node builder.
 use reth_consensus::{ConsensusError, FullConsensus};
 use reth_node_api::PrimitivesTy;

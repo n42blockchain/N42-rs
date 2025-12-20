@@ -1,16 +1,14 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! Engine node related functionality.
 
+use reth_consensus::Consensus;
 use alloy_consensus::BlockHeader;
+use futures::{future::Either, stream, stream_select, StreamExt};
 use alloy_primitives::{Address, U256};
 use alloy_signer_local::PrivateKeySigner;
 use consensus_client::miner::N42Miner;
-use futures::{future::Either, stream, stream_select, StreamExt};
 use n42_engine_primitives::N42PayloadAttributesBuilder;
+use reth_provider::BlockReaderIdExt;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
-use reth_consensus::Consensus;
 use reth_db_api::{database_metrics::DatabaseMetrics, Database};
 use reth_engine_local::{LocalEngineService, LocalPayloadAttributesBuilder};
 use reth_engine_service::service::{ChainEvent, EngineService};
@@ -23,8 +21,9 @@ use reth_exex::ExExManagerHandle;
 use reth_network::{NetworkSyncUpdater, SyncState};
 use reth_network_api::{BlockAnnounceProvider, BlockDownloaderProvider};
 use reth_node_api::{
-    BeaconConsensusEngineHandle, BuiltPayload, FullNodeTypes, NodePrimitives, NodeTypes,
-    NodeTypesWithDBAdapter, PayloadAttributesBuilder, PayloadTypes,
+    BeaconConsensusEngineHandle, BuiltPayload, FullNodeTypes, NodeTypes, NodeTypesWithDBAdapter,
+    PayloadAttributesBuilder, PayloadTypes,
+    NodePrimitives,
 };
 use reth_node_core::{
     dirs::{ChainPath, DataDirPath},
@@ -33,7 +32,6 @@ use reth_node_core::{
 };
 use reth_node_events::{cl::ConsensusLayerHealthEvents, node};
 use reth_provider::providers::{BlockchainProvider, NodeTypesForProvider};
-use reth_provider::BlockReaderIdExt;
 use reth_tasks::TaskExecutor;
 use reth_tokio_util::EventSender;
 use reth_tracing::tracing::{debug, error, info};
@@ -70,10 +68,7 @@ impl EngineNodeLauncher {
         data_dir: ChainPath<DataDirPath>,
         engine_tree_config: TreeConfig,
     ) -> Self {
-        Self {
-            ctx: LaunchContext::new(task_executor, data_dir),
-            engine_tree_config,
-        }
+        Self { ctx: LaunchContext::new(task_executor, data_dir), engine_tree_config }
     }
 }
 
@@ -86,18 +81,14 @@ where
         DB = DB,
         Provider = BlockchainProvider<NodeTypesWithDBAdapter<Types, DB>>,
     >,
-    <T::Types as NodeTypes>::Primitives: NodePrimitives<
-        Block = reth_ethereum_primitives::Block,
-        BlockBody = reth_ethereum_primitives::BlockBody,
-    >,
+    <T::Types as NodeTypes>::Primitives: NodePrimitives<Block = reth_ethereum_primitives::Block, BlockBody=reth_ethereum_primitives::BlockBody>,
     CB: NodeComponentsBuilder<T>,
     AO: RethRpcAddOns<NodeAdapter<T, CB::Components>>
         + EngineValidatorAddOn<NodeAdapter<T, CB::Components>>,
     N42PayloadAttributesBuilder<Types::ChainSpec>: PayloadAttributesBuilder<
         <<Types as NodeTypes>::Payload as PayloadTypes>::PayloadAttributes,
     >,
-    <<CB as NodeComponentsBuilder<T>>::Components as NodeComponents<T>>::Network:
-        BlockAnnounceProvider<Block = reth_ethereum_primitives::Block>,
+    <<CB as NodeComponentsBuilder<T>>::Components as NodeComponents<T>>::Network: BlockAnnounceProvider<Block = reth_ethereum_primitives::Block>,
 {
     type Node = NodeHandle<NodeAdapter<T, CB::Components>, AO>;
 
@@ -105,26 +96,14 @@ where
         self,
         target: NodeBuilderWithComponents<T, CB, AO>,
     ) -> eyre::Result<Self::Node> {
-        let Self {
-            ctx,
-            engine_tree_config,
-        } = self;
+        let Self { ctx, engine_tree_config } = self;
         let NodeBuilderWithComponents {
             adapter: NodeTypesAdapter { database },
             components_builder,
-            add_ons:
-                AddOns {
-                    hooks,
-                    exexs: installed_exex,
-                    add_ons,
-                },
+            add_ons: AddOns { hooks, exexs: installed_exex, add_ons },
             config,
         } = target;
-        let NodeHooks {
-            on_component_initialized,
-            on_node_started,
-            ..
-        } = hooks;
+        let NodeHooks { on_component_initialized, on_node_started, .. } = hooks;
 
         // setup the launch context
         let ctx = ctx
@@ -183,9 +162,8 @@ where
         let consensus = Arc::new(ctx.components().consensus().clone());
 
         // Configure the pipeline
-        let pipeline_exex_handle = exex_manager_handle
-            .clone()
-            .unwrap_or_else(ExExManagerHandle::empty);
+        let pipeline_exex_handle =
+            exex_manager_handle.clone().unwrap_or_else(ExExManagerHandle::empty);
         let pipeline = build_networked_pipeline(
             &ctx.toml_config().stages,
             network_client.clone(),
@@ -313,12 +291,8 @@ where
             ),
         );
 
-        let RpcHandle {
-            rpc_server_handles,
-            rpc_registry,
-            engine_events,
-            beacon_engine_handle,
-        } = add_ons.launch_add_ons(add_ons_ctx).await?;
+        let RpcHandle { rpc_server_handles, rpc_registry, engine_events, beacon_engine_handle } =
+            add_ons.launch_add_ons(add_ons_ctx).await?;
 
         // Run consensus engine to completion
         let initial_target = ctx.initial_backfill_target()?;
@@ -406,23 +380,18 @@ where
         });
 
         let mining_mode = if let Some(_) = ctx.node_config().dev.consensus_signer_private_key {
-            let block_time = ctx
-                .node_config()
-                .dev
-                .block_time
-                .unwrap_or_else(|| Duration::from_secs(DEFAULT_BLOCK_TIME_SECS));
+            let block_time = ctx.node_config().dev.block_time.unwrap_or_else(|| Duration::from_secs(DEFAULT_BLOCK_TIME_SECS));
             consensus_client::miner::MiningMode::interval(block_time)
         } else {
             consensus_client::miner::MiningMode::NoMining
         };
         info!(target: "reth::cli", ?mining_mode);
-        let signer_address =
-            if let Some(signer_private_key) = ctx.node_config().dev.consensus_signer_private_key {
-                let eth_signer: PrivateKeySigner = signer_private_key.to_string().parse().unwrap();
-                Some(eth_signer.address())
-            } else {
-                None
-            };
+        let signer_address = if let Some(signer_private_key) = ctx.node_config().dev.consensus_signer_private_key {
+            let eth_signer: PrivateKeySigner = signer_private_key.to_string().parse().unwrap();
+            Some(eth_signer.address())
+        } else {
+            None
+        };
         let consensus = Arc::new(ctx.components().consensus().clone());
         N42Miner::spawn_new(
             ctx.blockchain_db().clone(),

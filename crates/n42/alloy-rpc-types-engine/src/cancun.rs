@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! Contains types related to the Cancun hardfork that will be used by RPC to communicate with the
 //! beacon consensus engine.
 

@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! clap [Args](clap::Args) for datadir config
 
 use crate::dirs::{ChainPath, DataDirPath, MaybePlatformPath};

@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 use alloc::vec::Vec;
 use core::ops::{Bound, RangeBounds};
 use reth_db_api::{
@@ -64,10 +61,7 @@ pub trait DBProvider: Sized {
         &self,
         range: impl RangeBounds<T::Key>,
     ) -> Result<Vec<KeyValue<T>>, DatabaseError> {
-        self.tx_ref()
-            .cursor_read::<T>()?
-            .walk_range(range)?
-            .collect::<Result<Vec<_>, _>>()
+        self.tx_ref().cursor_read::<T>()?.walk_range(range)?.collect::<Result<Vec<_>, _>>()
     }
 
     /// Iterates over read only values in the given table and collects them into a vector.

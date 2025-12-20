@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! Compatibility functions for rpc `Transaction` type.
 
 use alloy_consensus::transaction::Recovered;

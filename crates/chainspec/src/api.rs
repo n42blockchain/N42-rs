@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 use crate::{ChainSpec, DepositContract};
 use alloc::{boxed::Box, vec::Vec};
 use alloy_chains::Chain;
@@ -86,10 +83,7 @@ impl EthChainSpec for ChainSpec {
     }
 
     fn blob_params_at_timestamp(&self, timestamp: u64) -> Option<BlobParams> {
-        if let Some(blob_param) = self
-            .blob_params
-            .active_scheduled_params_at_timestamp(timestamp)
-        {
+        if let Some(blob_param) = self.blob_params.active_scheduled_params_at_timestamp(timestamp) {
             Some(*blob_param)
         } else if self.is_osaka_active_at_timestamp(timestamp) {
             Some(self.blob_params.osaka)
@@ -135,7 +129,6 @@ impl EthChainSpec for ChainSpec {
     }
 
     fn final_paris_total_difficulty(&self) -> Option<U256> {
-        self.paris_block_and_final_difficulty
-            .map(|(_, final_difficulty)| final_difficulty)
+        self.paris_block_and_final_difficulty.map(|(_, final_difficulty)| final_difficulty)
     }
 }

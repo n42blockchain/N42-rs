@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! Config traits for various node components.
 
 use alloy_eips::eip1559::ETHEREUM_BLOCK_GAS_LIMIT_36M;

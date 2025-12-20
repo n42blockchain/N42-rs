@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 #![allow(missing_docs)]
 #![cfg(feature = "test-utils")]
 
@@ -29,11 +26,8 @@ where
     T::Key: Clone + for<'de> serde::Deserialize<'de>,
     T::Value: Clone + for<'de> serde::Deserialize<'de>,
 {
-    let path = format!(
-        "{}/../../../testdata/micro/db/{}.json",
-        env!("CARGO_MANIFEST_DIR"),
-        T::NAME
-    );
+    let path =
+        format!("{}/../../../testdata/micro/db/{}.json", env!("CARGO_MANIFEST_DIR"), T::NAME);
     let list: Vec<TableRow<T>> = serde_json::from_reader(std::io::BufReader::new(
         std::fs::File::open(&path)
             .unwrap_or_else(|_| panic!("Test vectors not found. They can be generated from the workspace by calling `cargo run --bin reth --features dev -- test-vectors tables`: {path:?}"))

@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! Support for configuring the components of a node.
 //!
 //! Customizable components of the node include:

@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! Node builder states and helper traits.
 //!
 //! Keeps track of the current state of the node builder.
@@ -36,10 +33,7 @@ impl<T: FullNodeTypes> NodeBuilderWithTypes<T> {
         config: NodeConfig<<T::Types as NodeTypes>::ChainSpec>,
         database: T::DB,
     ) -> Self {
-        Self {
-            config,
-            adapter: NodeTypesAdapter::new(database),
-        }
+        Self { config, adapter: NodeTypesAdapter::new(database) }
     }
 
     /// Advances the state of the node builder to the next state where all components are configured
@@ -53,11 +47,7 @@ impl<T: FullNodeTypes> NodeBuilderWithTypes<T> {
             config,
             adapter,
             components_builder,
-            add_ons: AddOns {
-                hooks: NodeHooks::default(),
-                exexs: Vec::new(),
-                add_ons: (),
-            },
+            add_ons: AddOns { hooks: NodeHooks::default(), exexs: Vec::new(), add_ons: () },
         }
     }
 }
@@ -77,10 +67,7 @@ impl<T: FullNodeTypes> NodeTypesAdapter<T> {
 
 impl<T: FullNodeTypes> fmt::Debug for NodeTypesAdapter<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("NodeTypesAdapter")
-            .field("db", &"...")
-            .field("types", &"...")
-            .finish()
+        f.debug_struct("NodeTypesAdapter").field("db", &"...").field("types", &"...").finish()
     }
 }
 
@@ -180,22 +167,13 @@ where
     where
         AO: NodeAddOns<NodeAdapter<T, CB::Components>>,
     {
-        let Self {
-            config,
-            adapter,
-            components_builder,
-            ..
-        } = self;
+        let Self { config, adapter, components_builder, .. } = self;
 
         NodeBuilderWithComponents {
             config,
             adapter,
             components_builder,
-            add_ons: AddOns {
-                hooks: NodeHooks::default(),
-                exexs: Vec::new(),
-                add_ons,
-            },
+            add_ons: AddOns { hooks: NodeHooks::default(), exexs: Vec::new(), add_ons },
         }
     }
 }

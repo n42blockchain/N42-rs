@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 use alloc::{string::String, vec::Vec};
 use alloy_primitives::BlockNumber;
 use reth_stages_types::{StageCheckpoint, StageId};

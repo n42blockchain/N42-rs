@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! EVM config for vanilla ethereum.
 //!
 //! # Revm features

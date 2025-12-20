@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 #![allow(missing_docs)]
 
 use std::{path::Path, sync::Arc};
@@ -152,10 +149,7 @@ where
             || {
                 // Reset DB
                 let _ = fs::remove_dir_all(bench_db_path);
-                (
-                    input,
-                    Arc::try_unwrap(create_test_rw_db_with_path(bench_db_path)).unwrap(),
-                )
+                (input, Arc::try_unwrap(create_test_rw_db_with_path(bench_db_path)).unwrap())
             },
             |(input, db)| {
                 // Create TX
@@ -193,9 +187,7 @@ where
             let tx = db.tx().expect("tx");
             for index in RANDOM_INDEXES {
                 let mut cursor = tx.cursor_read::<T>().expect("cursor");
-                cursor
-                    .seek_exact(input.get(index).unwrap().0.clone())
-                    .unwrap();
+                cursor.seek_exact(input.get(index).unwrap().0.clone()).unwrap();
             }
         })
     });
@@ -240,10 +232,7 @@ where
                 // Reset DB
                 let _ = fs::remove_dir_all(bench_db_path);
 
-                (
-                    input,
-                    Arc::try_unwrap(create_test_rw_db_with_path(bench_db_path)).unwrap(),
-                )
+                (input, Arc::try_unwrap(create_test_rw_db_with_path(bench_db_path)).unwrap())
             },
             |(input, db)| {
                 // Create TX

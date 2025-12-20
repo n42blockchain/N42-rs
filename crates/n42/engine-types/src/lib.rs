@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //mod addons;
 //pub use addons::N42NodeAddOns;
 
@@ -21,11 +18,15 @@ mod payload;
 //mod job_generator;
 //mod job;
 //mod metrics;
-mod consensus;
 mod network;
+mod consensus;
 
 pub use payload::EthereumPayloadBuilderWrapper;
 pub use payload::N42PayloadServiceBuilder;
+
+
+
+
 
 //
 // #[tokio::main]

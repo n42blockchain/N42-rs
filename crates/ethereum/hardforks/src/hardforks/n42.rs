@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 use alloc::vec;
 
 use alloy_primitives::U256;
@@ -20,26 +17,14 @@ pub static N42_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
         (EthereumHardfork::Homestead.boxed(), ForkCondition::Block(0)),
         (EthereumHardfork::Dao.boxed(), ForkCondition::Block(0)),
         (EthereumHardfork::Tangerine.boxed(), ForkCondition::Block(0)),
-        (
-            EthereumHardfork::SpuriousDragon.boxed(),
-            ForkCondition::Block(0),
-        ),
+        (EthereumHardfork::SpuriousDragon.boxed(), ForkCondition::Block(0)),
         (EthereumHardfork::Byzantium.boxed(), ForkCondition::Block(0)),
-        (
-            EthereumHardfork::Constantinople.boxed(),
-            ForkCondition::Block(0),
-        ),
-        (
-            EthereumHardfork::Petersburg.boxed(),
-            ForkCondition::Block(0),
-        ),
+        (EthereumHardfork::Constantinople.boxed(), ForkCondition::Block(0)),
+        (EthereumHardfork::Petersburg.boxed(), ForkCondition::Block(0)),
         (EthereumHardfork::Istanbul.boxed(), ForkCondition::Block(0)),
         (EthereumHardfork::Berlin.boxed(), ForkCondition::Block(0)),
         (EthereumHardfork::London.boxed(), ForkCondition::Block(0)),
-        (
-            EthereumHardfork::ArrowGlacier.boxed(),
-            ForkCondition::Block(0),
-        ),
+        (EthereumHardfork::ArrowGlacier.boxed(), ForkCondition::Block(0)),
         //(EthereumHardfork::Beijing.boxed(), ForkCondition::Block(0)),
         (
             EthereumHardfork::Paris.boxed(),
@@ -49,18 +34,9 @@ pub static N42_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
                 total_difficulty: U256::ZERO,
             },
         ),
-        (
-            EthereumHardfork::Shanghai.boxed(),
-            ForkCondition::Timestamp(1746576000),
-        ),
-        (
-            EthereumHardfork::Cancun.boxed(),
-            ForkCondition::Timestamp(1746576000),
-        ),
-        (
-            EthereumHardfork::Prague.boxed(),
-            ForkCondition::Timestamp(1748930400),
-        ),
+        (EthereumHardfork::Shanghai.boxed(), ForkCondition::Timestamp(1746576000)),
+        (EthereumHardfork::Cancun.boxed(), ForkCondition::Timestamp(1746576000)),
+        (EthereumHardfork::Prague.boxed(), ForkCondition::Timestamp(1748930400)),
     ])
 });
 
@@ -70,26 +46,14 @@ pub static N42_HARDFORKS_FOR_CLIQUE_TEST: LazyLock<ChainHardforks> = LazyLock::n
         (EthereumHardfork::Homestead.boxed(), ForkCondition::Block(0)),
         (EthereumHardfork::Dao.boxed(), ForkCondition::Block(0)),
         (EthereumHardfork::Tangerine.boxed(), ForkCondition::Block(0)),
-        (
-            EthereumHardfork::SpuriousDragon.boxed(),
-            ForkCondition::Block(0),
-        ),
+        (EthereumHardfork::SpuriousDragon.boxed(), ForkCondition::Block(0)),
         (EthereumHardfork::Byzantium.boxed(), ForkCondition::Block(0)),
-        (
-            EthereumHardfork::Constantinople.boxed(),
-            ForkCondition::Block(0),
-        ),
-        (
-            EthereumHardfork::Petersburg.boxed(),
-            ForkCondition::Block(0),
-        ),
+        (EthereumHardfork::Constantinople.boxed(), ForkCondition::Block(0)),
+        (EthereumHardfork::Petersburg.boxed(), ForkCondition::Block(0)),
         (EthereumHardfork::Istanbul.boxed(), ForkCondition::Block(0)),
         (EthereumHardfork::Berlin.boxed(), ForkCondition::Block(0)),
         (EthereumHardfork::London.boxed(), ForkCondition::Block(0)),
-        (
-            EthereumHardfork::ArrowGlacier.boxed(),
-            ForkCondition::Block(0),
-        ),
+        (EthereumHardfork::ArrowGlacier.boxed(), ForkCondition::Block(0)),
         //(EthereumHardfork::Beijing.boxed(), ForkCondition::Block(0)),
         (
             EthereumHardfork::Paris.boxed(),
@@ -99,13 +63,7 @@ pub static N42_HARDFORKS_FOR_CLIQUE_TEST: LazyLock<ChainHardforks> = LazyLock::n
                 total_difficulty: U256::ZERO,
             },
         ),
-        (
-            EthereumHardfork::Shanghai.boxed(),
-            ForkCondition::Timestamp(1746576000),
-        ),
-        (
-            EthereumHardfork::Cancun.boxed(),
-            ForkCondition::Timestamp(1746576000),
-        ),
+        (EthereumHardfork::Shanghai.boxed(), ForkCondition::Timestamp(1746576000)),
+        (EthereumHardfork::Cancun.boxed(), ForkCondition::Timestamp(1746576000)),
     ])
 });

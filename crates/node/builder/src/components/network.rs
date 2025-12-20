@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! Network component for the node builder.
 
 use crate::{BuilderContext, FullNodeTypes};

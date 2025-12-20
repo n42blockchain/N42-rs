@@ -1,16 +1,10 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
-use super::Header;
-use crate::BlockHeader as BlockHeaderTrait;
-use alloy_primitives::{keccak256, Address, BlockNumber, Bloom, Bytes, B256, B64, U256};
 use alloy_rlp::{length_of_length, Encodable};
 use bytes::BufMut;
-use secp256k1::{
-    ecdsa::{RecoverableSignature, RecoveryId},
-    Error as SecpError, Message, PublicKey, SECP256K1,
-};
+use secp256k1::{Message, SECP256K1, Error as SecpError, ecdsa::{RecoverableSignature, RecoveryId}, PublicKey};
 use std::error::Error;
+use super::Header;
+use alloy_primitives::{U256, Bloom, BlockNumber, keccak256, B64, B256, Address, Bytes};
+use crate::{BlockHeader as BlockHeaderTrait};
 
 /// recovery error
 #[derive(Debug)]
@@ -69,9 +63,7 @@ pub fn recover_address(header: &Header) -> Result<Address, Box<dyn Error>> {
         RecoveryId::try_from(i32::from(signature[64]))?,
     )?;
 
-    Ok(public_key_to_address(
-        SECP256K1.recover_ecdsa(&message, &signature)?,
-    ))
+    Ok(public_key_to_address(SECP256K1.recover_ecdsa(&message, &signature)?))
 }
 
 pub fn recover_address_generic<H>(header: &H) -> Result<Address, Box<dyn Error>>
@@ -92,15 +84,14 @@ where
         RecoveryId::try_from(i32::from(signature[64]))?,
     )?;
 
-    Ok(public_key_to_address(
-        SECP256K1.recover_ecdsa(&message, &signature)?,
-    ))
+    Ok(public_key_to_address(SECP256K1.recover_ecdsa(&message, &signature)?))
 }
 
 pub fn seal_hash_generic<H>(header: &H) -> B256
 where
     H: BlockHeaderTrait,
 {
+
     struct LocalHeader {
         parent_hash: B256,
         ommers_hash: B256,
@@ -147,14 +138,13 @@ where
         }
     }
 
+
     impl Encodable for LocalHeader {
         fn encode(&self, out: &mut dyn BufMut) {
             // Create a header indicating the encoded content is a list with the payload length computed
             // from the header's payload calculation function.
-            let list_header = alloy_rlp::Header {
-                list: true,
-                payload_length: self.header_payload_length(),
-            };
+            let list_header =
+                alloy_rlp::Header { list: true, payload_length: self.header_payload_length() };
             list_header.encode(out);
 
             // Encode each header field sequentially
@@ -210,16 +200,16 @@ where
 
     // Handle the extra field, excluding the last CRYPTO_SIGNATURE_LENGTH bytes
     if header.extra_data().len() > SIGNATURE_LENGTH {
-        sig_header.extra_data = Bytes::from(
-            header.extra_data()[..header.extra_data().len() - SIGNATURE_LENGTH].to_vec(),
-        );
+        sig_header.extra_data = Bytes::from(header.extra_data()[..header.extra_data().len() - SIGNATURE_LENGTH].to_vec());
     }
 
     keccak256(alloy_rlp::encode(&sig_header))
 }
 
+
 /// SealHash returns the hash of a block prior to it being sealed.
 pub fn seal_hash(header: &Header) -> B256 {
+
     struct LocalHeader {
         parent_hash: B256,
         ommers_hash: B256,
@@ -266,14 +256,13 @@ pub fn seal_hash(header: &Header) -> B256 {
         }
     }
 
+
     impl Encodable for LocalHeader {
         fn encode(&self, out: &mut dyn BufMut) {
             // Create a header indicating the encoded content is a list with the payload length computed
             // from the header's payload calculation function.
-            let list_header = alloy_rlp::Header {
-                list: true,
-                payload_length: self.header_payload_length(),
-            };
+            let list_header =
+                alloy_rlp::Header { list: true, payload_length: self.header_payload_length() };
             list_header.encode(out);
 
             // Encode each header field sequentially
@@ -329,8 +318,7 @@ pub fn seal_hash(header: &Header) -> B256 {
 
     // Handle the extra field, excluding the last CRYPTO_SIGNATURE_LENGTH bytes
     if header.extra_data.len() > SIGNATURE_LENGTH {
-        sig_header.extra_data =
-            Bytes::from(header.extra_data[..header.extra_data.len() - SIGNATURE_LENGTH].to_vec());
+        sig_header.extra_data = Bytes::from(header.extra_data[..header.extra_data.len() - SIGNATURE_LENGTH].to_vec());
     }
 
     keccak256(alloy_rlp::encode(&sig_header))

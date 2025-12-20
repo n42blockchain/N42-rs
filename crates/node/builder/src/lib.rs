@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! Standalone crate for Reth configuration and builder types.
 //!
 //! # features

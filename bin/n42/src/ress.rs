@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 use crate::network::PeersHandleProvider;
 use reth_ethereum_primitives::EthPrimitives;
 use reth_evm::ConfigureEvm;

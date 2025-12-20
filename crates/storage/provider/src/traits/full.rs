@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! Helper provider traits to encapsulate all provider traits for simplicity.
 
 use crate::{
@@ -9,8 +6,8 @@ use crate::{
 };
 use reth_chain_state::{CanonStateSubscriptions, ForkChoiceSubscriptions};
 use reth_node_types::{BlockTy, HeaderTy, NodeTypesWithDB, ReceiptTy, TxTy};
-use reth_storage_api::NodePrimitivesProvider;
 use reth_storage_api::{SnapshotProvider, SnapshotProviderWriter};
+use reth_storage_api::NodePrimitivesProvider;
 use std::fmt::Debug;
 
 /// Helper trait to unify all provider traits for simplicity.

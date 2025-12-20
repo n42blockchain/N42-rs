@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 use crate::utils::eth_payload_attributes;
 use alloy_genesis::Genesis;
 use reth_chainspec::{ChainSpecBuilder, MAINNET};
@@ -33,10 +30,7 @@ async fn can_handle_blobs() -> eyre::Result<()> {
         .with_chain(chain_spec)
         .with_unused_ports()
         .with_rpc(RpcServerArgs::default().with_unused_ports().with_http());
-    let NodeHandle {
-        node,
-        node_exit_future: _,
-    } = NodeBuilder::new(node_config.clone())
+    let NodeHandle { node, node_exit_future: _ } = NodeBuilder::new(node_config.clone())
         .testing_node(exec.clone())
         .node(EthereumNode::default())
         .launch()
@@ -73,8 +67,7 @@ async fn can_handle_blobs() -> eyre::Result<()> {
     // submit the blob payload
     let blob_block_hash = node.submit_payload(blob_payload).await?;
 
-    node.update_forkchoice(genesis_hash, blob_block_hash)
-        .await?;
+    node.update_forkchoice(genesis_hash, blob_block_hash).await?;
 
     // submit normal payload (reorg)
     let block_hash = node.submit_payload(payload).await?;

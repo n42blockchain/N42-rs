@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT
-
 //! Helpers for setting up parts of the node.
 
 use std::sync::Arc;

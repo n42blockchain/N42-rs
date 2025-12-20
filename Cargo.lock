@@ -6080,6 +6080,7 @@ dependencies = [
  "hex-literal",
  "integer-sqrt",
  "merkle_db_rs",
+ "once_cell",
  "reth-codecs",
  "reth-primitives",
  "reth-primitives-traits",

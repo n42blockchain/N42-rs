@@ -12,9 +12,8 @@ pub use snapshot::Vote;
 mod validator;
 pub use validator::*;
 
-mod beacon;
+pub mod beacon;
 pub use beacon::*;
-//pub use beacon::{BeaconState, BeaconBlock, BeaconStateChangeset, BeaconBlockChangeset, VoluntaryExit, VoluntaryExitWithSig, Epoch};
 
 mod activation_queue;
 mod safe_aitrh;
@@ -24,7 +23,7 @@ pub use committee_cache::CommitteeCache;
 
 mod attestation_duty;
 mod beacon_committee;
-mod shuffle_list;
+pub mod shuffle_list;
 
 pub type Hash256 = alloy_primitives::B256;
 pub type Slot = u64;

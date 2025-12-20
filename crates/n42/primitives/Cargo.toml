@@ -51,11 +51,18 @@ secp256k1.workspace=true
 typenum.workspace=true
 merkle_db_rs.workspace=true
 
+# Performance optimization
+once_cell.workspace = true
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]
 name = "primitives_benchmarks"
+harness = false
+
+[[bench]]
+name = "beacon_benchmarks"
 harness = false
 
 [lints]

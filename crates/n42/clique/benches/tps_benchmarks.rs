@@ -46,9 +46,7 @@
 //! | EVM Execution | 20-50 | CPU | Already fast |
 //! | State Commit | 50-500 | IO/CPU | Lazy root, batch |
 
-use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 use alloy_primitives::{Address, B256, U256};
 use n42_clique::{DIFF_IN_TURN, DIFF_NO_TURN};
@@ -76,7 +74,7 @@ impl SimulatedTx {
             to,
             value,
             nonce,
-            gas_limit: 21_000, // Standard ETH transfer
+            gas_limit: 21_000,                       // Standard ETH transfer
             gas_price: U256::from(1_000_000_000u64), // 1 Gwei
         }
     }
@@ -455,4 +453,3 @@ criterion_group!(
 );
 
 criterion_main!(benches);
-

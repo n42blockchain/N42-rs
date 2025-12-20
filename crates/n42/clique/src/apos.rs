@@ -344,7 +344,9 @@ where
         info!(target: "consensus::apos", ?best_block_number, "init_recent_tds");
 
         // SEC-009: Use saturating arithmetic to prevent underflow
-        let num_blocks = best_block_number.saturating_sub(finalized_block_number).saturating_add(1);
+        let num_blocks = best_block_number
+            .saturating_sub(finalized_block_number)
+            .saturating_add(1);
         let start_block_number = if num_blocks > INMEMORY_TDS.into() {
             warn!(target: "consensus::apos", ?finalized_block_number, ?best_block_number, td_cache_size=?INMEMORY_TDS,
                 "the number of blocks from finalized block to best block is larger than td cache size, this may cause 'td not found' errors later",
@@ -1135,7 +1137,10 @@ mod tests {
     #[test]
     fn test_apos_error_invalid_checkpoint_beneficiary() {
         let err = AposError::InvalidCheckpointBeneficiary;
-        assert_eq!(format!("{}", err), "beneficiary in checkpoint block non-zero");
+        assert_eq!(
+            format!("{}", err),
+            "beneficiary in checkpoint block non-zero"
+        );
     }
 
     #[test]
@@ -1147,37 +1152,55 @@ mod tests {
     #[test]
     fn test_apos_error_invalid_checkpoint_vote() {
         let err = AposError::InvalidCheckpointVote;
-        assert_eq!(format!("{}", err), "vote nonce in checkpoint block non-zero");
+        assert_eq!(
+            format!("{}", err),
+            "vote nonce in checkpoint block non-zero"
+        );
     }
 
     #[test]
     fn test_apos_error_missing_vanity() {
         let err = AposError::MissingVanity;
-        assert_eq!(format!("{}", err), "extra-data 32 byte vanity prefix missing");
+        assert_eq!(
+            format!("{}", err),
+            "extra-data 32 byte vanity prefix missing"
+        );
     }
 
     #[test]
     fn test_apos_error_missing_signature() {
         let err = AposError::MissingSignature;
-        assert_eq!(format!("{}", err), "extra-data 65 byte signature suffix missing");
+        assert_eq!(
+            format!("{}", err),
+            "extra-data 65 byte signature suffix missing"
+        );
     }
 
     #[test]
     fn test_apos_error_extra_signers() {
         let err = AposError::ExtraSigners;
-        assert_eq!(format!("{}", err), "non-checkpoint block contains extra signer list");
+        assert_eq!(
+            format!("{}", err),
+            "non-checkpoint block contains extra signer list"
+        );
     }
 
     #[test]
     fn test_apos_error_invalid_checkpoint_signers() {
         let err = AposError::InvalidCheckpointSigners;
-        assert_eq!(format!("{}", err), "invalid signer list on checkpoint block");
+        assert_eq!(
+            format!("{}", err),
+            "invalid signer list on checkpoint block"
+        );
     }
 
     #[test]
     fn test_apos_error_mismatching_checkpoint_signers() {
         let err = AposError::MismatchingCheckpointSigners;
-        assert_eq!(format!("{}", err), "mismatching signer list on checkpoint block");
+        assert_eq!(
+            format!("{}", err),
+            "mismatching signer list on checkpoint block"
+        );
     }
 
     #[test]
@@ -1231,7 +1254,10 @@ mod tests {
     #[test]
     fn test_apos_error_un_transion() {
         let err = AposError::UnTransion;
-        assert_eq!(format!("{}", err), "sealing paused while waiting for transactions");
+        assert_eq!(
+            format!("{}", err),
+            "sealing paused while waiting for transactions"
+        );
     }
 
     #[test]

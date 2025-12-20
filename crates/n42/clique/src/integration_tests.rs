@@ -160,16 +160,11 @@ mod consensus_boundary_tests {
 
         // 1 vote is not enough
         snap.cast(new_signer, true);
-        assert!(
-            snap.tally.get(&new_signer).unwrap().votes
-                <= (snap.signers.len() / 2) as u32
-        );
+        assert!(snap.tally.get(&new_signer).unwrap().votes <= (snap.signers.len() / 2) as u32);
 
         // 2 votes should pass
         snap.cast(new_signer, true);
-        assert!(
-            snap.tally.get(&new_signer).unwrap().votes > (snap.signers.len() / 2) as u32
-        );
+        assert!(snap.tally.get(&new_signer).unwrap().votes > (snap.signers.len() / 2) as u32);
     }
 
     // ==================== Recent Signer Boundary Tests ====================
@@ -336,4 +331,3 @@ mod consensus_boundary_tests {
         }
     }
 }
-

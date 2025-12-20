@@ -571,7 +571,8 @@ mod tests {
         let mut snap = Snapshot::new_snapshot(default_config(), 100, B256::ZERO, signers);
 
         // Add some state
-        snap.recents.insert(99, address!("0000000000000000000000000000000000000001"));
+        snap.recents
+            .insert(99, address!("0000000000000000000000000000000000000001"));
         snap.votes.push(Vote {
             signer: address!("0000000000000000000000000000000000000001"),
             block: 100,
@@ -738,7 +739,8 @@ mod tests {
     fn test_snapshot_serialization() {
         let signers = test_signers();
         let mut snap = Snapshot::new_snapshot(default_config(), 100, B256::ZERO, signers);
-        snap.recents.insert(99, address!("0000000000000000000000000000000000000001"));
+        snap.recents
+            .insert(99, address!("0000000000000000000000000000000000000001"));
 
         let json = serde_json::to_string(&snap).unwrap();
         let deserialized: Snapshot = serde_json::from_str(&json).unwrap();

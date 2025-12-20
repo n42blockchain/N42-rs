@@ -390,7 +390,7 @@ mod tests {
         // Set up withdrawal credentials with an address in bytes 12-32
         let mut credentials = [0u8; 32];
         credentials[0] = 0x01; // ETH1 prefix
-        // Set address bytes (12-32)
+                               // Set address bytes (12-32)
         for i in 12..32 {
             credentials[i] = (i - 12) as u8;
         }

@@ -85,7 +85,7 @@ pub async fn run_client(
 
                         let recovered_block_hash = SealedBlock::hash(&sealed_block_recovered);
                         let params = rpc_params![hex::encode(pk.to_bytes()), hex::encode(sig.to_bytes()), attestation_data, hex::encode(recovered_block_hash.as_slice())];
-                        let result = ws_client
+                        let result: () = ws_client
                             .request("consensusBeaconExt_submitVerification", params)
                             .await?;
                         println!("request result: {:?}", result);

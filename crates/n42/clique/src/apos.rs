@@ -40,9 +40,12 @@ use std::str::FromStr;
 
 //
 const CHECKPOINT_INTERVAL: u64 = 2048; // Number of blocks after which to save the vote snapshot to the database
-const INMEMORY_SNAPSHOTS: u32 = 128; // Number of recent vote snapshots to keep in memory
-const INMEMORY_TDS: u32 = 1024; // Number of recent total difficulty records to keep in memory
-const INMEMORY_CACHED_READS: u32 = 32; // Number of recent cached reads records to keep in memory
+
+// Performance-optimized cache sizes for high TPS
+// Increased from defaults to reduce database lookups
+const INMEMORY_SNAPSHOTS: u32 = 512; // Increased from 128 for better snapshot hit rate
+const INMEMORY_TDS: u32 = 4096; // Increased from 1024 for better TD lookup performance
+const INMEMORY_CACHED_READS: u32 = 128; // Increased from 32 for better state cache hit rate
 
 const WIGGLE_TIME: Duration = Duration::from_millis(500); // Random delay (per signer) to allow concurrent signers
 
@@ -1106,12 +1109,14 @@ mod tests {
 
     #[test]
     fn test_inmemory_snapshots() {
-        assert_eq!(INMEMORY_SNAPSHOTS, 128);
+        // Performance-optimized: increased from 128 to 512
+        assert_eq!(INMEMORY_SNAPSHOTS, 512);
     }
 
     #[test]
     fn test_inmemory_tds() {
-        assert_eq!(INMEMORY_TDS, 1024);
+        // Performance-optimized: increased from 1024 to 4096
+        assert_eq!(INMEMORY_TDS, 4096);
     }
 
     #[test]

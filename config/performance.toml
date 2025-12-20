@@ -1,0 +1,105 @@
+# N42 Performance-Optimized Configuration
+# 
+# This configuration file contains recommended settings for
+# production environments requiring high TPS and fast RPC responses.
+#
+# Usage: n42 --config config/performance.toml
+
+[rpc]
+# RPC State Cache Configuration
+# Larger caches reduce database lookups for recent data
+
+# Max number of blocks to cache (default: 500)
+# Increase for better eth_getBlockByNumber performance
+max_blocks = 2000
+
+# Max number of receipts to cache (default: 1000)
+# Increase for better eth_getTransactionReceipt performance
+max_receipts = 4000
+
+# Max number of headers to cache (default: 500)
+# Increase for better header lookup performance
+max_headers = 2000
+
+# Max concurrent database requests (default: 512)
+# Increase for higher RPC throughput under load
+max_concurrent_db_requests = 1024
+
+[rpc.server]
+# WebSocket configuration for real-time subscriptions
+ws_max_connections = 500
+ws_frame_size = 65536
+
+# HTTP server configuration
+http_threads = 8
+http_max_connections = 1000
+
+[txpool]
+# Transaction Pool Configuration
+# Larger pools handle more pending transactions
+
+# Max pending transactions per account (default: 16)
+max_account_slots = 32
+
+# Max total pending transactions (default: 4096)
+max_pending = 8192
+
+# Max queued transactions (default: 2048)
+max_queued = 4096
+
+# Price bump percentage for replacement transactions
+price_bump = 10
+
+[network]
+# P2P Network Configuration
+# More peers improve block propagation speed
+
+# Maximum number of connected peers (default: 50)
+max_peers = 100
+
+# Maximum pending peer connections (default: 30)
+max_pending_peers = 50
+
+# DNS discovery refresh interval in seconds
+dns_discovery_lookup_interval = 30
+
+# Session timeout in seconds
+session_timeout = 60
+
+[sync]
+# Synchronization Configuration
+
+# Number of concurrent block downloads
+concurrent_downloads = 8
+
+# Number of concurrent state downloads
+concurrent_state_downloads = 16
+
+# Download timeout in seconds
+download_timeout = 30
+
+[db]
+# Database (MDBX) Configuration
+
+# Maximum database size
+max_size = "4TB"
+
+# Database growth step
+growth_step = "4GB"
+
+# Enable metrics collection
+enable_metrics = true
+
+[metrics]
+# Prometheus metrics endpoint
+enabled = true
+addr = "127.0.0.1"
+port = 9090
+
+[logging]
+# Logging Configuration for Production
+# Use "info" or "warn" to reduce I/O overhead
+
+level = "info"
+format = "json"
+

@@ -12,6 +12,7 @@ use n42::{args::RessArgs, cli::Cli, ress::install_ress_subprotocol};
 use n42_engine_types::N42Node;
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_node_builder::NodeHandle;
+use reth_node_ethereum::EthereumNode;
 use tracing::info;
 
 fn main() {

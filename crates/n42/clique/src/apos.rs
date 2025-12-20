@@ -1,16 +1,15 @@
 // Copyright (c) 2017-2025 N42 Contributors
 // SPDX-License-Identifier: MIT
 
-extern crate alloc;
-
 use alloy_primitives::Sealable;
 use alloy_primitives::{hex, Address, BlockHash, Bytes, FixedBytes, B256, B64, U256};
 use bytes::BytesMut;
 use n42_primitives::{APosConfig, Snapshot};
 use rand::prelude::IndexedRandom;
+use rand::prelude::SliceRandom;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_execution_types::BlockExecutionResult;
-use reth_primitives::{SealedBlock, SealedHeader};
+use reth_primitives::{BlockWithSenders, SealedBlock, SealedHeader};
 use reth_primitives_traits::AlloyBlockHeader;
 use reth_primitives_traits::{
     header::clique_utils::{recover_address_generic, seal_hash, SIGNATURE_LENGTH},
@@ -34,6 +33,7 @@ use k256::ecdsa::SigningKey;
 use reth_consensus::{
     Consensus, ConsensusError, FullConsensus, HeaderConsensusError, HeaderValidator,
 };
+use reth_node_api::{FullNodeTypes, PrimitivesTy};
 use reth_storage_api::SnapshotProviderWriter;
 use std::str::FromStr;
 
@@ -910,10 +910,10 @@ where
         Ok(())
     }
 
-    fn proposals(&self) -> Result<alloc::collections::BTreeMap<Address, bool>, ConsensusError> {
+    fn proposals(&self) -> Result<HashMap<Address, bool>, ConsensusError> {
         info!(target: "consensus::apos", "proposals()");
         let proposals_guard = self.proposals.read().unwrap();
-        Ok(proposals_guard.iter().map(|(k, v)| (*k, *v)).collect())
+        Ok(proposals_guard.clone())
     }
 
     fn total_difficulty(&self, hash: B256) -> U256 {

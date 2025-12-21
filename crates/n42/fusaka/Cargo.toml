@@ -21,6 +21,11 @@ thiserror.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
 hex.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "fusaka_benchmarks"
+harness = false
 
 [features]
 default = ["std"]

@@ -27,6 +27,11 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
+criterion.workspace = true
+
+[[bench]]
+name = "storage_benchmarks"
+harness = false
 
 [features]
 default = ["std"]

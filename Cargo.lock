@@ -5987,6 +5987,7 @@ dependencies = [
  "alloy-consensus",
  "alloy-eips",
  "alloy-primitives 1.2.1",
+ "codspeed-criterion-compat",
  "eyre",
  "n42-consensus-traits",
  "n42-primitives",
@@ -6092,6 +6093,7 @@ name = "n42-fusaka"
 version = "1.8.4"
 dependencies = [
  "alloy-primitives 1.2.1",
+ "codspeed-criterion-compat",
  "hex",
  "thiserror 2.0.12",
  "tokio",
@@ -6140,6 +6142,7 @@ name = "n42-storage"
 version = "1.8.4"
 dependencies = [
  "alloy-primitives 1.2.1",
+ "codspeed-criterion-compat",
  "n42-primitives",
  "serde",
  "serde_json",

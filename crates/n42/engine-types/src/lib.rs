@@ -26,6 +26,10 @@ mod network;
 
 pub use payload::EthereumPayloadBuilderWrapper;
 pub use payload::N42PayloadServiceBuilder;
+pub use consensus::N42ConsensusBuilder;
+
+#[cfg(test)]
+mod tests;
 
 //
 // #[tokio::main]

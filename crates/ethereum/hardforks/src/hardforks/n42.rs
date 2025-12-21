@@ -24,6 +24,22 @@ impl Hardfork for BeijingFork {
     }
 }
 
+/// N42 Fusaka hardfork timestamps
+/// 
+/// Fusaka = Prague (EL) + Osaka (CL)
+/// 
+/// Timeline (N42 Mainnet):
+/// - Shanghai: 2025-05-07 00:00:00 UTC (1746576000)
+/// - Cancun:   2025-05-07 00:00:00 UTC (1746576000)
+/// - Prague:   2025-06-03 06:00:00 UTC (1748930400)
+/// - Osaka:    2025-07-01 00:00:00 UTC (1751328000) - Fusaka CL upgrade
+///
+/// Note: Osaka enables:
+/// - EIP-2537: BLS12-381 precompiles
+/// - EIP-7594: PeerDAS (data availability sampling)
+/// - Increased blob capacity (target: 6, max: 9)
+pub const N42_OSAKA_TIMESTAMP: u64 = 1751328000;
+
 /// N42 hardforks
 pub static N42_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
     ChainHardforks::new(vec![
@@ -72,6 +88,11 @@ pub static N42_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
         (
             EthereumHardfork::Prague.boxed(),
             ForkCondition::Timestamp(1748930400),
+        ),
+        // Osaka (Fusaka CL) - enables BLS precompiles (EIP-2537) and PeerDAS (EIP-7594)
+        (
+            EthereumHardfork::Osaka.boxed(),
+            ForkCondition::Timestamp(N42_OSAKA_TIMESTAMP),
         ),
     ])
 });

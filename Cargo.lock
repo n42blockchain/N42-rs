@@ -6088,6 +6088,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "n42-fusaka"
+version = "1.8.4"
+dependencies = [
+ "alloy-primitives 1.2.1",
+ "hex",
+ "thiserror 2.0.12",
+ "tokio",
+]
+
+[[package]]
 name = "n42-primitives"
 version = "1.8.4"
 dependencies = [

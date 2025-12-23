@@ -83,9 +83,41 @@ cd reth-144-clean && cargo check -p reth-chainspec
 
 ## 核心阻塞因素
 
-~~1. **alloy-rpc-types-engine patch**: 需要同步到 v1.0.9+ API~~
-~~2. **alloy-rpc-types-beacon patch**: 需要同步到 v1.0.9+ API~~
-3. **Fork crate 复杂依赖**: storage/db-api 等有 N42 特有依赖（merkle_db_rs）
+~~1. **alloy-rpc-types-engine patch**: 需要同步到 v1.0.9+ API~~ ✅ 已完成
+~~2. **alloy-rpc-types-beacon patch**: 需要同步到 v1.0.9+ API~~ ✅ 已完成  
+~~3. **Fork crate 复杂依赖**: storage/db-api 等有 N42 特有依赖~~ ✅ 不需要（上游变化很小）
+4. **⚠️ 依赖版本解析冲突**: Cargo 会拉入更高版本的 alloy 包，导致与 alloy-trie 0.8.1 不兼容
+
+### v1.4.3 → v1.4.5 上游变化（极小）
+
+只有 7 个文件变化，大部分是注释格式修复：
+- `recovered.rs`: +1 新方法 `recovered_transaction()`
+- `extended.rs`: +4 From 实现
+- `access_list.rs`: 注释格式（反引号）
+- `consensus/lib.rs`: 注释格式
+- `log.rs`: +1 新方法 `init_tracing_with_layers()` + 重命名
+- `config.rs`: +Hoodi 链支持
+- `masks.rs`: 注释格式
+
+### 依赖版本冲突详解
+
+```
+问题链:
+1. reth v1.4.5 需要 alloy-trie 0.8.1
+2. alloy-trie 0.8.1 期望 alloy-genesis 实现 Into<TrieAccount>
+3. 但 Cargo 解析了 alloy-genesis 1.1.3（而非 1.0.9）
+4. alloy-genesis 1.1.3 的 GenesisAccount 与 alloy-trie 0.8.1 不兼容
+```
+
+上游 v1.4.5 使用的版本：
+- alloy-genesis: 1.0.9
+- alloy-trie: 0.8.1
+- alloy-eips: 1.0.9
+
+我们解析的版本：
+- alloy-genesis: 1.1.3 ❌
+- alloy-trie: 0.8.1 ✅
+- alloy-eips: 1.1.3 ❌
 
 ## 已完成的升级准备工作
 
@@ -117,19 +149,33 @@ cd reth-144-clean && cargo check -p reth-chainspec
 
 1. ✅ 更新 `n42/alloy-rpc-types-engine` 到 v1.0.9 API
 2. ✅ 更新 `n42/alloy-rpc-types-beacon` 到 v1.0.9 API
-3. 🔶 手动合并 fork crate 修改（保留 N42 依赖）
-4. 🔲 修复编译错误
+3. ✅ 手动合并 fork crate 修改（只有 7 个文件）
+4. ⚠️ 修复依赖版本冲突（需要锁定 alloy 版本）
 5. 🔲 测试验证
+
+### 解决方案选项
+
+**方案 1: 等待 alloy 生态稳定**
+- 当 alloy 1.0.x 系列稳定后，版本冲突会减少
+- 风险：不确定时间
+
+**方案 2: 复制上游 Cargo.lock**
+- 使用上游 v1.4.5 的 Cargo.lock 作为基础
+- 需要处理 N42 特有依赖
+
+**方案 3: 使用 [patch.crates-io] 锁定版本**
+- 在 Cargo.toml 中 patch alloy-genesis 和 alloy-eips
+- 复杂且难以维护
 
 ### 估计工作量
 
 | 任务 | 时间估计 | 状态 |
 |------|---------|------|
 | 更新 alloy patch | 2-4 小时 | ✅ 完成 |
-| 手动合并 fork crate | 4-8 小时 | 🔶 进行中 |
-| 修复编译错误 | 2-4 小时 | 🔲 待开始 |
+| 手动合并 fork crate | 1 小时 | ✅ 完成（只有 7 文件）|
+| 解决依赖冲突 | 4-8 小时 | ⚠️ 阻塞中 |
 | 测试验证 | 1-2 小时 | 🔲 待开始 |
-| **总计** | **2-3 天** | |
+| **总计** | **1-2 天** | |
 
 ## 推荐策略
 

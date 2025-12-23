@@ -35,7 +35,7 @@ use reth_network::{
 };
 use reth_network_peers::{mainnet_nodes, TrustedPeer};
 use secp256k1::SecretKey;
-use tracing::{error, debug};
+use tracing::error;
 
 use crate::version::P2P_CLIENT_VERSION;
 
@@ -228,9 +228,6 @@ impl NetworkArgs {
         let chain_bootnodes = self
             .resolved_bootnodes()
             .unwrap_or_else(|| chain_spec.bootnodes().unwrap_or_else(mainnet_nodes));
-        debug!(target: "reth::cli",
-                        ?chain_bootnodes,
-                    );
         let peers_file = self.peers_file.clone().unwrap_or(default_peers_file);
 
         // Configure peer connections
@@ -444,7 +441,7 @@ impl DiscoveryArgs {
             network_config_builder = network_config_builder.disable_nat();
         }
 
-        if !self.disable_discovery && self.enable_discv5_discovery {
+        if self.should_enable_discv5() {
             network_config_builder = network_config_builder
                 .discovery_v5(self.discovery_v5_builder(rlpx_tcp_socket, boot_nodes));
         }
@@ -491,6 +488,17 @@ impl DiscoveryArgs {
             .lookup_interval(*discv5_lookup_interval)
             .bootstrap_lookup_interval(*discv5_bootstrap_lookup_interval)
             .bootstrap_lookup_countdown(*discv5_bootstrap_lookup_countdown)
+    }
+
+    /// Returns true if discv5 discovery should be configured
+    const fn should_enable_discv5(&self) -> bool {
+        if self.disable_discovery {
+            return false;
+        }
+
+        self.enable_discv5_discovery ||
+            self.discv5_addr.is_some() ||
+            self.discv5_addr_ipv6.is_some()
     }
 
     /// Set the discovery port to zero, to allow the OS to assign a random unused port when

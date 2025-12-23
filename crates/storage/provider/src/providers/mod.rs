@@ -27,9 +27,6 @@ pub use blockchain_provider::BlockchainProvider;
 
 mod consistent;
 pub use consistent::ConsistentProvider;
-//use n42_primitives::Snapshot;
-//use reth_storage_api::{SnapshotProvider, SnapshotProviderWriter};
-
 
 /// Helper trait to bound [`NodeTypes`] so that combined with database they satisfy
 /// [`ProviderNodeTypes`].
@@ -59,35 +56,3 @@ where
 {
 }
 impl<T> ProviderNodeTypes for T where T: NodeTypesForProvider + NodeTypesWithDB {}
-
-/*
-impl<N: ProviderNodeTypes> SnapshotProvider for BlockchainProvider<N> {
-    fn load_snapshot(&self, id: BlockHashOrNumber) -> ProviderResult<Option<Snapshot>> {
-        self.database.provider()?.load_snapshot(id)
-    }
-
-    fn load_snapshot_by_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<Snapshot>> {
-        self.database.provider()?.load_snapshot_by_hash(block_hash)
-    }
-}
-
-impl<N: ProviderNodeTypes> SnapshotProviderWriter for BlockchainProvider<N> {
-    fn save_snapshot(&self, id: BlockNumber, snapshot: Snapshot) -> ProviderResult<bool> {
-        let provider_rw = self.database.database_provider_rw()?;
-        provider_rw.save_snapshot(id, snapshot)?;
-        provider_rw.commit()
-    }
-
-    fn save_snapshot_by_hash(&self, block_hash: &BlockHash,  snapshot: Snapshot) -> ProviderResult<()> {
-        let provider_rw = self.database.database_provider_rw()?;
-        provider_rw.save_snapshot_by_hash(block_hash, snapshot)?;
-        provider_rw.commit().map(|_|())
-    }
-
-    fn save_signer_by_hash(&self, block_hash: &BlockHash,  signer: Address) -> ProviderResult<()> {
-        let provider_rw = self.database.database_provider_rw()?;
-        provider_rw.save_signer_by_hash(block_hash, signer)?;
-        provider_rw.commit().map(|_|())
-    }
-}
-*/

@@ -1,4 +1,3 @@
-use std::hash::RandomState;
 use crate::{
     bundle_state::StorageRevertsIter,
     providers::{
@@ -18,16 +17,12 @@ use crate::{
     StageCheckpointReader, StateCommitmentProvider, StateProviderBox, StateWriter,
     StaticFileProviderFactory, StatsReader, StorageLocation, StorageReader, StorageTrieWriter,
     TransactionVariant, TransactionsProvider, TransactionsProviderExt, TrieWriter,
-    WithdrawalsProvider,
-ValidatorChangeWriter, 
-    ValidatorReader, 
-BeaconReader, BeaconWriter,
 };
 use alloy_consensus::{
     transaction::{SignerRecoverable, TransactionMeta},
     BlockHeader, Header, TxReceipt,
 };
-use alloy_eips::{eip2718::Encodable2718, eip4895::Withdrawals, BlockHashOrNumber};
+use alloy_eips::{eip2718::Encodable2718, BlockHashOrNumber};
 use alloy_primitives::{
     keccak256,
     map::{hash_map, B256Map, HashMap, HashSet},
@@ -60,14 +55,9 @@ use reth_prune_types::{
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_static_file_types::StaticFileSegment;
 use reth_storage_api::{
-    BlockBodyIndicesProvider, BlockBodyReader, NodePrimitivesProvider, OmmersProvider,
-    StateProvider, StorageChangeSetReader, TryIntoHistoricalStateProvider,
-    SnapshotProvider, SnapshotProviderWriter,
-    BeaconProvider, BeaconProviderWriter,
+    BlockBodyIndicesProvider, BlockBodyReader, NodePrimitivesProvider, StateProvider,
+    StorageChangeSetReader, TryIntoHistoricalStateProvider,
 };
-use n42_primitives::{
-    BeaconBlock, BeaconState, BeaconStateChangeset, BeaconBlockChangeset,
-    Snapshot, Validator,ValidatorBeforeTx,ValidatorChangeset,ValidatorRevert};
 use reth_storage_errors::provider::{ProviderResult, RootMismatch};
 use reth_trie::{
     prefix_set::{PrefixSet, PrefixSetMut, TriePrefixSets},
@@ -86,237 +76,6 @@ use std::{
     sync::{mpsc, Arc},
 };
 use tracing::{debug, trace};
-
-impl<TX:DbTx,N:NodeTypes>BeaconReader for DatabaseProvider<TX,N>{
-    fn get_beaconstate_by_blockhash(&self,blockhash:BlockHash) -> ProviderResult<Option<BeaconState> > {
-        // let mut cursor=self.tx.cursor_read::<tables::BeaconStateRecord>()?;
-        // while let Some((bh,_))=cursor.next()?{
-        //     println!("bh: {:?}",bh);
-        // }
-        Ok(self.tx.get::<tables::BeaconStateRecord>(blockhash)?)
-    }
-    fn get_beaconblock_by_blockhash(&self,blockhash:BlockHash) -> ProviderResult<Option<BeaconBlock> > {
-        Ok(self.tx.get::<tables::BeaconBlockRecord>(blockhash)?)
-    }
-}
-
-impl<TX:DbTxMut+DbTx+'static,N:NodeTypes>BeaconWriter for DatabaseProvider<TX,N>{
-    fn unwind_beacon(&self,range:RangeInclusive<BlockNumber>) -> ProviderResult<()> {
-        if range.is_empty(){
-            return Ok(());
-        }
-
-        let mut cursor_r = self.tx.cursor_read::<tables::BeaconNum2Hash>()?;
-        let mut blockhashes: Vec<BlockHash> = Vec::new();
-        for blocknumber in range.clone(){
-            if let Some((_,blockhash))=cursor_r.seek_exact(blocknumber)?{
-                blockhashes.push(blockhash);
-            }
-        }
-
-        self.remove_beaconstate(blockhashes.clone())?;
-        self.remove_beaconblock(blockhashes.clone())?;
-
-        let mut cursor_w=self.tx.cursor_write::<tables::BeaconNum2Hash>()?;
-        for blocknumber in range{
-            if cursor_w.seek_exact(blocknumber)?.is_some(){
-                cursor_w.delete_current()?;
-            }
-        }
-
-        Ok(())
-    }
-    fn remove_beaconstate(&self, mut range: Vec<BlockHash>) -> ProviderResult<()> {
-        range.sort();
-        let mut cursor=self.tx.cursor_write::<tables::BeaconStateRecord>()?;
-        let mut range_iter=range.into_iter().peekable();
-        while let Some((bh,_))=cursor.next()?{
-            match range_iter.peek(){
-                Some(next_bh)=>{
-                    if bh==*next_bh{
-                        cursor.delete_current()?;
-                        range_iter.next();
-                    }else if bh<*next_bh{
-                        continue;
-                    }else{
-                        // impossible
-                        range_iter.next();
-                    }
-                }
-                None=>break,
-            }
-        }
-        Ok(())
-    }
-    fn write_beaconstate(&self,mut changes:BeaconStateChangeset) -> ProviderResult<()> {
-        let mut cursor=self.tx.cursor_write::<tables::BeaconStateRecord>()?;
-        for (blockhash,beaconstate) in changes.beaconstates{
-            cursor.insert(blockhash, &beaconstate)?;
-        }
-        Ok(())
-    }
-    // fn unwind_beaconblock(&self,range:RangeInclusive<BlockNumber>) -> ProviderResult<()> {
-    //     let mut cursor=self.tx.cursor_read::<tables::BeaconNum2Hash>()?;
-    //     let mut blockhashes:Vec<BlockHash>=Vec::new();
-    //     for blocknumber in range{
-    //         if let Some((_,blockhash))=cursor.seek_exact(blocknumber)?{
-    //             blockhashes.push(blockhash);
-    //         }
-    //     }
-    //     self.remove_beaconblock(blockhashes)?;
-    //     Ok(())
-    // }
-    fn remove_beaconblock(&self,mut range:Vec<BlockHash>) -> ProviderResult<()> {
-        range.sort();
-        let mut cursor=self.tx.cursor_write::<tables::BeaconBlockRecord>()?;
-        let mut range_iter=range.into_iter().peekable();
-        while let Some((bh,_))=cursor.next()?{
-            match range_iter.peek(){
-                Some(next_bh)=>{
-                    if bh==*next_bh{
-                        cursor.delete_current()?;
-                        range_iter.next();
-                    }else if bh<*next_bh{
-                        continue;
-                    }else{
-                        // impossible
-                        range_iter.next();
-                    }
-                }
-                None=>break,
-            }
-        }
-        Ok(())
-    }
-    fn write_beaconblock(&self,changes:BeaconBlockChangeset) -> ProviderResult<()> {
-        let mut cursor=self.tx.cursor_write::<tables::BeaconBlockRecord>()?;
-        for(blockhash, beaconblock)in changes.beaconblocks{
-            cursor.insert(blockhash, &beaconblock)?;
-        }
-        Ok(())
-    }
-}
-
-impl<TX: DbTx, N: NodeTypes> ValidatorReader for DatabaseProvider<TX, N> {
-    fn basic_validator(&self,address:Address) -> ProviderResult<Option<Validator> > {
-        Ok(self.tx.get::<tables::PlainValidatorState>(address)?)
-    }
-    fn changed_validators_and_blocks_with_range(&self,range:RangeInclusive<BlockNumber> ,) -> ProviderResult<BTreeMap<Address,Vec<BlockNumber> > > {
-        let mut changeset_cursor = self.tx.cursor_read::<tables::ValidatorChangeSets>()?;
-        let validator_transitions = changeset_cursor.walk_range(range)?.try_fold(
-            BTreeMap::new(),
-            |mut validators: BTreeMap<Address, Vec<u64>>, entry| -> ProviderResult<_> {
-                let (index, validator) = entry?;
-                validators.entry(validator.address).or_default().push(index);
-                Ok(validators)
-            },
-        )?;
-        Ok(validator_transitions)
-    }
-}
-
-impl<TX: DbTxMut + DbTx+'static, N: NodeTypes> ValidatorChangeWriter for DatabaseProvider<TX, N> {
-    fn write_validator_reverts(&self,first_block:BlockNumber,validator_reverts:ValidatorRevert,) -> ProviderResult<()> {
-        let mut validator_changeset_cursor =
-            self.tx_ref().cursor_dup_write::<tables::ValidatorChangeSets>()?;
-        for (block_index, mut validator_block_reverts) in validator_reverts.validators.into_iter().enumerate() {
-            let block_number=first_block+block_index as BlockNumber;
-            validator_block_reverts.par_sort_by_key(|a| a.0);
-
-            for (address, info) in validator_block_reverts {
-                validator_changeset_cursor.append_dup(
-                    block_number,
-                    ValidatorBeforeTx { address, info:info.map(Into::into) },
-                )?;
-            }
-        }
-
-        Ok(())
-    }
-    fn insert_validator_history_index(&self,validator_transitions:impl IntoIterator<Item = (Address,impl IntoIterator<Item = BlockNumber>)> ,) -> ProviderResult<()> {
-        self.append_history_index::<_, tables::ValidatorsHistory>(validator_transitions,ShardedKey::new,)
-    }
-    fn unwind_validator(&self,range: RangeInclusive<BlockNumber>) -> ProviderResult<()> {
-        let changed_validators=self
-            .tx
-            .cursor_read::<tables::ValidatorChangeSets>()?
-            .walk_range(range.clone())?
-            .collect::<Result<Vec<_>,_>>()?;
-
-        self.unwind_validator_history_indices(changed_validators.iter())?;
-
-        self.remove_validator(range.clone())?;
-
-        Ok(())
-    }
-    fn unwind_validator_history_indices<'a>(&self, changesets: impl Iterator<Item = &'a (BlockNumber, ValidatorBeforeTx)>,) -> ProviderResult<usize> {
-        let mut last_indices = changesets
-            .into_iter()
-            .map(|(index, validator)| (validator.address, *index))
-            .collect::<Vec<_>>();
-        last_indices.sort_by_key(|(addr, _)| *addr);
-        
-        let mut cursor = self.tx.cursor_write::<tables::ValidatorsHistory>()?;
-        
-        for &(address, index) in &last_indices {
-            let partial_shard = unwind_history_shards::<_, tables::ValidatorsHistory, _>(
-                &mut cursor,
-                ShardedKey::last(address),
-                index,
-                |sharded_key| sharded_key.key == address,
-            )?;
-            if !partial_shard.is_empty() {
-                cursor.insert(
-                    ShardedKey::last(address),
-                    &BlockNumberList::new_pre_sorted(partial_shard),
-                )?;
-            }
-        }
-        Ok(last_indices.len())
-    }
-    fn write_validator_changes(&self, mut changes: ValidatorChangeset) -> ProviderResult<()> {
-        changes.validators.par_sort_by_key(|a|a.0);
-        let mut validators_cursor=self.tx_ref().cursor_write::<tables::PlainValidatorState>()?;
-        for (address,validator)in changes.validators{
-            if let Some(validator)=validator{
-                validators_cursor.upsert(address, (&validator).into())?;
-            }else if validators_cursor.seek_exact(address)?.is_some(){
-                validators_cursor.delete_current()?;
-            }
-        }
-        Ok(())
-    }
-    fn remove_validator(&self, range: RangeInclusive<BlockNumber>) -> ProviderResult<()> {
-        if range.is_empty() {
-            return Ok(());
-        }
-        let validator_changesets = self.take::<tables::ValidatorChangeSets>(range.clone())?;
-        let mut validator_cursor = self.tx.cursor_write::<tables::PlainValidatorState>()?;
-        let mut processed: HashSet<Address, RandomState> = HashSet::new();
-        for (block_number, ValidatorBeforeTx { address, info: old_validator }) in validator_changesets {
-            if !processed.insert(address) {
-                continue;
-            }
-            let existing_entry = validator_cursor.seek_exact(address)?;
-            match old_validator {
-                Some(validator) => {
-                    // add a new validator or update an existing one
-                    validator_cursor.upsert(address, &validator)?;
-                }
-                None => {
-                    if existing_entry.is_some() {
-                        // delete an existing validator
-                        validator_cursor.delete_current()?;
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-    fn take_validator(&self, range: RangeInclusive<BlockNumber>) -> ProviderResult<ValidatorChangeset> {
-        todo!()
-    }
-}
 
 /// A [`DatabaseProvider`] that holds a read-only database transaction.
 pub type DatabaseProviderRO<DB, N> = DatabaseProvider<<DB as Database>::TX, N>;
@@ -693,18 +452,20 @@ impl<
     }
 }
 
-/// For a given key, unwind all history shards that are below the given block number.
+/// For a given key, unwind all history shards that contain block numbers at or above the given
+/// block number.
 ///
 /// S - Sharded key subtype.
 /// T - Table to walk over.
 /// C - Cursor implementation.
 ///
 /// This function walks the entries from the given start key and deletes all shards that belong to
-/// the key and are below the given block number.
+/// the key and contain block numbers at or above the given block number. Shards entirely below
+/// the block number are preserved.
 ///
-/// The boundary shard (the shard is split by the block number) is removed from the database. Any
-/// indices that are above the block number are filtered out. The boundary shard is returned for
-/// reinsertion (if it's not empty).
+/// The boundary shard (the shard that spans across the block number) is removed from the database.
+/// Any indices that are below the block number are filtered out and returned for reinsertion.
+/// The boundary shard is returned for reinsertion (if it's not empty).
 fn unwind_history_shards<S, T, C>(
     cursor: &mut C,
     start_key: T::Key,
@@ -716,27 +477,41 @@ where
     T::Key: AsRef<ShardedKey<S>>,
     C: DbCursorRO<T> + DbCursorRW<T>,
 {
+    // Start from the given key and iterate through shards
     let mut item = cursor.seek_exact(start_key)?;
     while let Some((sharded_key, list)) = item {
         // If the shard does not belong to the key, break.
         if !shard_belongs_to_key(&sharded_key) {
             break
         }
+
+        // Always delete the current shard from the database first
+        // We'll decide later what (if anything) to reinsert
         cursor.delete_current()?;
 
-        // Check the first item.
-        // If it is greater or eq to the block number, delete it.
+        // Get the first (lowest) block number in this shard
+        // All block numbers in a shard are sorted in ascending order
         let first = list.iter().next().expect("List can't be empty");
+
+        // Case 1: Entire shard is at or above the unwinding point
+        // Keep it deleted (don't return anything for reinsertion)
         if first >= block_number {
             item = cursor.prev()?;
             continue
-        } else if block_number <= sharded_key.as_ref().highest_block_number {
-            // Filter out all elements greater than block number.
+        }
+        // Case 2: This is a boundary shard (spans across the unwinding point)
+        // The shard contains some blocks below and some at/above the unwinding point
+        else if block_number <= sharded_key.as_ref().highest_block_number {
+            // Return only the block numbers that are below the unwinding point
+            // These will be reinserted to preserve the historical data
             return Ok(list.iter().take_while(|i| *i < block_number).collect::<Vec<_>>())
         }
+        // Case 3: Entire shard is below the unwinding point
+        // Return all block numbers for reinsertion (preserve entire shard)
         return Ok(list.iter().collect::<Vec<_>>())
     }
 
+    // No shards found or all processed
     Ok(Vec::new())
 }
 
@@ -1249,7 +1024,6 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> HeaderProvider for DatabasePro
     }
 
     fn header_td_by_number(&self, number: BlockNumber) -> ProviderResult<Option<U256>> {
-        /*
         if self.chain_spec.is_paris_active_at_block(number) {
             if let Some(td) = self.chain_spec.final_paris_total_difficulty() {
                 // if this block is higher than the final paris(merge) block, return the final paris
@@ -1257,7 +1031,6 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> HeaderProvider for DatabasePro
                 return Ok(Some(td))
             }
         }
-        */
 
         self.static_file_provider.get_with_static_file_or_database(
             StaticFileSegment::Headers,
@@ -1434,12 +1207,7 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> BlockReader for DatabaseProvid
 
         Ok(None)
     }
-
-    fn pending_block(&self) -> ProviderResult<Option<SealedBlock<Self::Block>>> {
-        Ok(None)
-    }
-
-    fn pending_block_with_senders(&self) -> ProviderResult<Option<RecoveredBlock<Self::Block>>> {
+    fn pending_block(&self) -> ProviderResult<Option<RecoveredBlock<Self::Block>>> {
         Ok(None)
     }
 
@@ -1804,122 +1572,61 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> ReceiptProvider for DatabasePr
             |_| true,
         )
     }
-}
 
-impl<TX: DbTx + 'static, N: NodeTypes<ChainSpec: EthereumHardforks>> WithdrawalsProvider
-    for DatabaseProvider<TX, N>
-{
-    fn withdrawals_by_block(
+    fn receipts_by_block_range(
         &self,
-        id: BlockHashOrNumber,
-        timestamp: u64,
-    ) -> ProviderResult<Option<Withdrawals>> {
-        if self.chain_spec.is_shanghai_active_at_timestamp(timestamp) {
-            if let Some(number) = self.convert_hash_or_number(id)? {
-                return self.static_file_provider.get_with_static_file_or_database(
-                    StaticFileSegment::BlockMeta,
-                    number,
-                    |static_file| static_file.withdrawals_by_block(number.into(), timestamp),
-                    || {
-                        // If we are past shanghai, then all blocks should have a withdrawal list,
-                        // even if empty
-                        let withdrawals = self
-                            .tx
-                            .get::<tables::BlockWithdrawals>(number)
-                            .map(|w| w.map(|w| w.withdrawals))?
-                            .unwrap_or_default();
-                        Ok(Some(withdrawals))
-                    },
-                )
+        block_range: RangeInclusive<BlockNumber>,
+    ) -> ProviderResult<Vec<Vec<Self::Receipt>>> {
+        if block_range.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // collect block body indices for each block in the range
+        let mut block_body_indices = Vec::new();
+        for block_num in block_range {
+            if let Some(indices) = self.block_body_indices(block_num)? {
+                block_body_indices.push(indices);
+            } else {
+                // use default indices for missing blocks (empty block)
+                block_body_indices.push(StoredBlockBodyIndices::default());
             }
         }
-        Ok(None)
-    }
-}
 
-impl<TX: DbTx + 'static, N: NodeTypesForProvider> OmmersProvider for DatabaseProvider<TX, N> {
-    /// Returns the ommers for the block with matching id from the database.
-    ///
-    /// If the block is not found, this returns `None`.
-    /// If the block exists, but doesn't contain ommers, this returns `None`.
-    fn ommers(&self, id: BlockHashOrNumber) -> ProviderResult<Option<Vec<Self::Header>>> {
-        if let Some(number) = self.convert_hash_or_number(id)? {
-            // If the Paris (Merge) hardfork block is known and block is after it, return empty
-            // ommers.
-            if self.chain_spec.is_paris_active_at_block(number) {
-                return Ok(Some(Vec::new()))
+        if block_body_indices.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // find blocks with transactions to determine transaction range
+        let non_empty_blocks: Vec<_> =
+            block_body_indices.iter().filter(|indices| indices.tx_count > 0).collect();
+
+        if non_empty_blocks.is_empty() {
+            // all blocks are empty
+            return Ok(vec![Vec::new(); block_body_indices.len()]);
+        }
+
+        // calculate the overall transaction range
+        let first_tx = non_empty_blocks[0].first_tx_num();
+        let last_tx = non_empty_blocks[non_empty_blocks.len() - 1].last_tx_num();
+
+        // fetch all receipts in the transaction range
+        let all_receipts = self.receipts_by_tx_range(first_tx..=last_tx)?;
+        let mut receipts_iter = all_receipts.into_iter();
+
+        // distribute receipts to their respective blocks
+        let mut result = Vec::with_capacity(block_body_indices.len());
+        for indices in &block_body_indices {
+            if indices.tx_count == 0 {
+                result.push(Vec::new());
+            } else {
+                let block_receipts =
+                    receipts_iter.by_ref().take(indices.tx_count as usize).collect();
+                result.push(block_receipts);
             }
-
-            return self.static_file_provider.get_with_static_file_or_database(
-                StaticFileSegment::BlockMeta,
-                number,
-                |static_file| static_file.ommers(id),
-                || Ok(self.tx.get::<tables::BlockOmmers<Self::Header>>(number)?.map(|o| o.ommers)),
-            )
         }
 
-        Ok(None)
+        Ok(result)
     }
-}
-
-impl<TX: DbTx + 'static, N: NodeTypes<ChainSpec: EthereumHardforks>> SnapshotProvider for DatabaseProvider<TX, N>{
-    fn load_snapshot(&self, id: BlockHashOrNumber) -> ProviderResult<Option<Snapshot>> {
-        if let Some(number) = self.convert_hash_or_number(id)? {
-            return Ok(self.tx.get::<tables::Snapshots>(number)?)
-        }
-        Ok(None)
-    }
-
-    fn load_snapshot_by_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<Snapshot>> {
-        Ok(self.tx.get::<tables::SnapshotsByHash>(block_hash.clone())?)
-    }
-}
-
-
-impl<TX: DbTxMut, N: NodeTypes<ChainSpec: EthereumHardforks>> SnapshotProviderWriter for DatabaseProvider<TX, N>{
-    fn save_snapshot(&self, number: BlockNumber, snapshot: Snapshot) -> ProviderResult<bool> {
-        self.tx.put::<tables::Snapshots>(number, snapshot)?;
-        Ok(true)
-    }
-
-    fn save_snapshot_by_hash(&self, block_hash: &BlockHash,  snapshot: Snapshot) -> ProviderResult<()> {
-        Ok(self.tx.put::<tables::SnapshotsByHash>(block_hash.clone(), snapshot)?)
-    }
-
-    fn save_signer_by_hash(&self, block_hash: &BlockHash,  signer: Address) -> ProviderResult<()> {
-        Ok(self.tx.put::<tables::SignersByHash>(block_hash.clone(), signer)?)
-    }
-}
-
-impl<TX: DbTx + 'static, N: NodeTypes<ChainSpec: EthereumHardforks>> BeaconProvider for DatabaseProvider<TX, N>{
-
-    fn get_beacon_block_by_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BeaconBlock>> {
-        Ok(self.tx.get::<tables::BeaconBlocksByHash>(block_hash.clone())?)
-    }
-
-    fn get_beacon_state_by_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BeaconState>> {
-        Ok(self.tx.get::<tables::BeaconStatesByHash>(block_hash.clone())?)
-    }
-
-    fn get_beacon_block_hash_by_eth1_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BlockHash>> {
-        Ok(self.tx.get::<tables::BeaconBlockHashesByEth1Hash>(block_hash.clone())?)
-    }
-}
-
-impl<TX: DbTxMut, N: NodeTypes<ChainSpec: EthereumHardforks>> BeaconProviderWriter for DatabaseProvider<TX, N>{
-
-    fn save_beacon_block_by_hash(&self, block_hash: &BlockHash, beacon_block: BeaconBlock) -> ProviderResult<()> {
-        Ok(self.tx.put::<tables::BeaconBlocksByHash>(block_hash.clone(), beacon_block)?)
-    }
-
-    fn save_beacon_state_by_hash(&self, block_hash: &BlockHash,  beacon_state: BeaconState) -> ProviderResult<()> {
-        Ok(self.tx.put::<tables::BeaconStatesByHash>(block_hash.clone(), beacon_state)?)
-    }
-
-    fn save_beacon_block_hash_by_eth1_hash(&self, eth1_block_hash: &BlockHash, beacon_block_hash: BlockHash) -> ProviderResult<()> {
-        Ok(self.tx.put::<tables::BeaconBlockHashesByEth1Hash>(eth1_block_hash.clone(), beacon_block_hash)?)
-    }
-
 }
 
 impl<TX: DbTx + 'static, N: NodeTypesForProvider> BlockBodyIndicesProvider
@@ -2625,7 +2332,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> TrieWriter for DatabaseProvider
         let tx = self.tx_ref();
         let mut account_trie_cursor = tx.cursor_write::<tables::AccountsTrie>()?;
         for (key, updated_node) in account_updates {
-            let nibbles = StoredNibbles(key.clone());
+            let nibbles = StoredNibbles(*key);
             match updated_node {
                 Some(node) => {
                     if !nibbles.0.is_empty() {
@@ -3260,13 +2967,6 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
                 // Increment transaction id for each transaction.
                 next_tx_num += 1;
             }
-
-            debug!(
-                target: "providers::db",
-                ?block_number,
-                actions = ?durations_recorder.actions,
-                "Inserted block body"
-            );
         }
 
         self.storage.writer().write_block_bodies(self, bodies, write_to)?;
@@ -3499,5 +3199,259 @@ impl<TX: DbTx + 'static, N: NodeTypes + 'static> DBProvider for DatabaseProvider
 
     fn prune_modes_ref(&self) -> &PruneModes {
         self.prune_modes_ref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        test_utils::{blocks::BlockchainTestData, create_test_provider_factory},
+        BlockWriter,
+    };
+    use reth_testing_utils::generators::{self, random_block, BlockParams};
+
+    #[test]
+    fn test_receipts_by_block_range_empty_range() {
+        let factory = create_test_provider_factory();
+        let provider = factory.provider().unwrap();
+
+        // empty range should return empty vec
+        let start = 10u64;
+        let end = 9u64;
+        let result = provider.receipts_by_block_range(start..=end).unwrap();
+        assert_eq!(result, Vec::<Vec<reth_ethereum_primitives::Receipt>>::new());
+    }
+
+    #[test]
+    fn test_receipts_by_block_range_nonexistent_blocks() {
+        let factory = create_test_provider_factory();
+        let provider = factory.provider().unwrap();
+
+        // non-existent blocks should return empty vecs for each block
+        let result = provider.receipts_by_block_range(10..=12).unwrap();
+        assert_eq!(result, vec![vec![], vec![], vec![]]);
+    }
+
+    #[test]
+    fn test_receipts_by_block_range_single_block() {
+        let factory = create_test_provider_factory();
+        let data = BlockchainTestData::default();
+
+        let provider_rw = factory.provider_rw().unwrap();
+        provider_rw
+            .insert_block(
+                data.genesis.clone().try_recover().unwrap(),
+                crate::StorageLocation::Database,
+            )
+            .unwrap();
+        provider_rw
+            .insert_block(data.blocks[0].0.clone(), crate::StorageLocation::Database)
+            .unwrap();
+        provider_rw
+            .write_state(
+                &data.blocks[0].1,
+                crate::OriginalValuesKnown::No,
+                crate::StorageLocation::Database,
+            )
+            .unwrap();
+        provider_rw.commit().unwrap();
+
+        let provider = factory.provider().unwrap();
+        let result = provider.receipts_by_block_range(1..=1).unwrap();
+
+        // should have one vec with one receipt
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 1);
+        assert_eq!(result[0][0], data.blocks[0].1.receipts()[0][0]);
+    }
+
+    #[test]
+    fn test_receipts_by_block_range_multiple_blocks() {
+        let factory = create_test_provider_factory();
+        let data = BlockchainTestData::default();
+
+        let provider_rw = factory.provider_rw().unwrap();
+        provider_rw
+            .insert_block(
+                data.genesis.clone().try_recover().unwrap(),
+                crate::StorageLocation::Database,
+            )
+            .unwrap();
+        for i in 0..3 {
+            provider_rw
+                .insert_block(data.blocks[i].0.clone(), crate::StorageLocation::Database)
+                .unwrap();
+            provider_rw
+                .write_state(
+                    &data.blocks[i].1,
+                    crate::OriginalValuesKnown::No,
+                    crate::StorageLocation::Database,
+                )
+                .unwrap();
+        }
+        provider_rw.commit().unwrap();
+
+        let provider = factory.provider().unwrap();
+        let result = provider.receipts_by_block_range(1..=3).unwrap();
+
+        // should have 3 vecs, each with one receipt
+        assert_eq!(result.len(), 3);
+        for (i, block_receipts) in result.iter().enumerate() {
+            assert_eq!(block_receipts.len(), 1);
+            assert_eq!(block_receipts[0], data.blocks[i].1.receipts()[0][0]);
+        }
+    }
+
+    #[test]
+    fn test_receipts_by_block_range_blocks_with_varying_tx_counts() {
+        let factory = create_test_provider_factory();
+        let data = BlockchainTestData::default();
+
+        let provider_rw = factory.provider_rw().unwrap();
+        provider_rw
+            .insert_block(
+                data.genesis.clone().try_recover().unwrap(),
+                crate::StorageLocation::Database,
+            )
+            .unwrap();
+
+        // insert blocks 1-3 with receipts
+        for i in 0..3 {
+            provider_rw
+                .insert_block(data.blocks[i].0.clone(), crate::StorageLocation::Database)
+                .unwrap();
+            provider_rw
+                .write_state(
+                    &data.blocks[i].1,
+                    crate::OriginalValuesKnown::No,
+                    crate::StorageLocation::Database,
+                )
+                .unwrap();
+        }
+        provider_rw.commit().unwrap();
+
+        let provider = factory.provider().unwrap();
+        let result = provider.receipts_by_block_range(1..=3).unwrap();
+
+        // verify each block has one receipt
+        assert_eq!(result.len(), 3);
+        for block_receipts in &result {
+            assert_eq!(block_receipts.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_receipts_by_block_range_partial_range() {
+        let factory = create_test_provider_factory();
+        let data = BlockchainTestData::default();
+
+        let provider_rw = factory.provider_rw().unwrap();
+        provider_rw
+            .insert_block(
+                data.genesis.clone().try_recover().unwrap(),
+                crate::StorageLocation::Database,
+            )
+            .unwrap();
+        for i in 0..3 {
+            provider_rw
+                .insert_block(data.blocks[i].0.clone(), crate::StorageLocation::Database)
+                .unwrap();
+            provider_rw
+                .write_state(
+                    &data.blocks[i].1,
+                    crate::OriginalValuesKnown::No,
+                    crate::StorageLocation::Database,
+                )
+                .unwrap();
+        }
+        provider_rw.commit().unwrap();
+
+        let provider = factory.provider().unwrap();
+
+        // request range that includes both existing and non-existing blocks
+        let result = provider.receipts_by_block_range(2..=5).unwrap();
+        assert_eq!(result.len(), 4);
+
+        // blocks 2-3 should have receipts, blocks 4-5 should be empty
+        assert_eq!(result[0].len(), 1); // block 2
+        assert_eq!(result[1].len(), 1); // block 3
+        assert_eq!(result[2].len(), 0); // block 4 (doesn't exist)
+        assert_eq!(result[3].len(), 0); // block 5 (doesn't exist)
+
+        assert_eq!(result[0][0], data.blocks[1].1.receipts()[0][0]);
+        assert_eq!(result[1][0], data.blocks[2].1.receipts()[0][0]);
+    }
+
+    #[test]
+    fn test_receipts_by_block_range_all_empty_blocks() {
+        let factory = create_test_provider_factory();
+        let mut rng = generators::rng();
+
+        // create blocks with no transactions
+        let mut blocks = Vec::new();
+        for i in 1..=3 {
+            let block =
+                random_block(&mut rng, i, BlockParams { tx_count: Some(0), ..Default::default() });
+            blocks.push(block);
+        }
+
+        let provider_rw = factory.provider_rw().unwrap();
+        for block in blocks {
+            provider_rw
+                .insert_block(block.try_recover().unwrap(), crate::StorageLocation::Database)
+                .unwrap();
+        }
+        provider_rw.commit().unwrap();
+
+        let provider = factory.provider().unwrap();
+        let result = provider.receipts_by_block_range(1..=3).unwrap();
+
+        assert_eq!(result.len(), 3);
+        for block_receipts in result {
+            assert_eq!(block_receipts.len(), 0);
+        }
+    }
+
+    #[test]
+    fn test_receipts_by_block_range_consistency_with_individual_calls() {
+        let factory = create_test_provider_factory();
+        let data = BlockchainTestData::default();
+
+        let provider_rw = factory.provider_rw().unwrap();
+        provider_rw
+            .insert_block(
+                data.genesis.clone().try_recover().unwrap(),
+                crate::StorageLocation::Database,
+            )
+            .unwrap();
+        for i in 0..3 {
+            provider_rw
+                .insert_block(data.blocks[i].0.clone(), crate::StorageLocation::Database)
+                .unwrap();
+            provider_rw
+                .write_state(
+                    &data.blocks[i].1,
+                    crate::OriginalValuesKnown::No,
+                    crate::StorageLocation::Database,
+                )
+                .unwrap();
+        }
+        provider_rw.commit().unwrap();
+
+        let provider = factory.provider().unwrap();
+
+        // get receipts using block range method
+        let range_result = provider.receipts_by_block_range(1..=3).unwrap();
+
+        // get receipts using individual block calls
+        let mut individual_results = Vec::new();
+        for block_num in 1..=3 {
+            let receipts =
+                provider.receipts_by_block(block_num.into()).unwrap().unwrap_or_default();
+            individual_results.push(receipts);
+        }
+
+        assert_eq!(range_result, individual_results);
     }
 }

@@ -101,7 +101,7 @@ where
             mix_hash: evm_env.block_env.prevrandao.unwrap_or_default(),
             nonce: BEACON_NONCE.into(),
             base_fee_per_gas: Some(evm_env.block_env.basefee),
-            number: evm_env.block_env.number,
+            number: evm_env.block_env.number.to(),
             gas_limit: evm_env.block_env.gas_limit,
             difficulty: evm_env.block_env.difficulty,
             gas_used: *gas_used,

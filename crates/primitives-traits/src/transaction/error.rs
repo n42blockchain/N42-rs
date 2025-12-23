@@ -51,6 +51,9 @@ pub enum InvalidTransactionError {
     /// The transaction gas exceeds the limit
     #[error("intrinsic gas too high")]
     GasTooHigh,
+    /// The transaction gas limit exceeds the maximum allowed after Osaka hardfork.
+    #[error("gas limit too high")]
+    GasLimitTooHigh,
     /// Thrown to ensure no one is able to specify a transaction with a tip higher than the total
     /// fee cap.
     #[error("max priority fee per gas higher than max fee per gas")]

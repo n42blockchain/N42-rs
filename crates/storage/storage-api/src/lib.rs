@@ -57,12 +57,6 @@ pub use trie::*;
 mod chain_info;
 pub use chain_info::*;
 
-mod withdrawals;
-pub use withdrawals::*;
-
-mod ommers;
-pub use ommers::*;
-
 #[cfg(feature = "db-api")]
 mod database_provider;
 #[cfg(feature = "db-api")]
@@ -85,12 +79,6 @@ mod stats;
 #[cfg(feature = "db-api")]
 pub use stats::*;
 
-mod snapshot;
-pub use snapshot::*;
-
-mod legacy;
-pub use legacy::*;
-
 mod primitives;
 pub use primitives::*;
 
@@ -109,8 +97,6 @@ pub use header_sync_gap::HeaderSyncGapProvider;
 mod full;
 pub use full::*;
 
-mod validator;
-pub use validator::*;
-
+// N42-specific beacon storage traits
 mod beacon;
 pub use beacon::*;

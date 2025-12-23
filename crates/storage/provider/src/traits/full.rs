@@ -6,8 +6,6 @@ use crate::{
 };
 use reth_chain_state::{CanonStateSubscriptions, ForkChoiceSubscriptions};
 use reth_node_types::{BlockTy, HeaderTy, NodeTypesWithDB, ReceiptTy, TxTy};
-use reth_storage_api::{SnapshotProvider, SnapshotProviderWriter};
-use reth_storage_api::{BeaconProvider, BeaconProviderWriter};
 use reth_storage_api::NodePrimitivesProvider;
 use std::fmt::Debug;
 
@@ -28,10 +26,6 @@ pub trait FullProvider<N: NodeTypesWithDB>:
     + CanonStateSubscriptions
     + ForkChoiceSubscriptions<Header = HeaderTy<N>>
     + StageCheckpointReader
-    + SnapshotProvider
-    + SnapshotProviderWriter
-    + BeaconProvider
-    + BeaconProviderWriter
     + Clone
     + Debug
     + Unpin
@@ -55,10 +49,6 @@ impl<T, N: NodeTypesWithDB> FullProvider<N> for T where
         + CanonStateSubscriptions
         + ForkChoiceSubscriptions<Header = HeaderTy<N>>
         + StageCheckpointReader
-        + SnapshotProvider
-        + SnapshotProviderWriter
-        + BeaconProvider
-        + BeaconProviderWriter
         + Clone
         + Debug
         + Unpin

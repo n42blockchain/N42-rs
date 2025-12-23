@@ -8,5 +8,5 @@ use reth_primitives::{
 use alloy_primitives::{U256};
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_evm::provider::EvmEnvProvider;
-use reth_storage_api::{BlockReader, HeaderProvider, SnapshotProvider, SnapshotProviderWriter, StateProviderFactory};
+use reth_storage_api::{BlockReader, HeaderProvider, StateProviderFactory};
 

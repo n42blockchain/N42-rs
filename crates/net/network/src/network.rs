@@ -2,19 +2,14 @@ use crate::{
     config::NetworkMode, message::PeerMessage, protocol::RlpxSubProtocol,
     swarm::NetworkConnectionState, transactions::TransactionsHandle, FetchClient,
 };
-use std::collections::hash_map::Entry;
-use std::collections::{HashSet, VecDeque};
-use std::hash::Hash;
-use std::sync::RwLock;
-use alloy_primitives::{BlockHash, TxHash, B256};
-use alloy_primitives::map::HashMap;
+use alloy_primitives::B256;
 use enr::Enr;
 use futures::StreamExt;
 use parking_lot::Mutex;
 use reth_discv4::{Discv4, NatResolver};
 use reth_discv5::Discv5;
 use reth_eth_wire::{
-    DisconnectReason, EthNetworkPrimitives, NetworkPrimitives, NewBlock,
+    BlockRangeUpdate, DisconnectReason, EthNetworkPrimitives, NetworkPrimitives,
     NewPooledTransactionHashes, SharedTransactions,
 };
 use reth_ethereum_forks::Head;
@@ -24,13 +19,9 @@ use reth_network_api::{
     BlockDownloaderProvider, DiscoveryEvent, NetworkError, NetworkEvent,
     NetworkEventListenerProvider, NetworkInfo, NetworkStatus, PeerInfo, PeerRequest, Peers,
     PeersInfo,
-    BlockAnnounceProvider,
-    N42BlockImportError, N42BlockImportOutcome, 
 };
 use reth_network_p2p::sync::{NetworkSyncUpdater, SyncState, SyncStateProvider};
 use reth_network_peers::{NodeRecord, PeerId};
-use reth_primitives_traits::Block;
-use alloy_primitives::Sealable;
 use reth_network_types::{PeerAddr, PeerKind, Reputation, ReputationChangeKind};
 use reth_tokio_util::{EventSender, EventStream};
 use secp256k1::SecretKey;
@@ -46,12 +37,6 @@ use tokio::sync::{
     oneshot,
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
-
-
-use crate::cache::LruCache;
-use tracing::trace;
-use crate::import::{BlockImportOutcome, BlockValidation};
-use crate::transactions::PendingPoolImportsInfo;
 
 /// A _shareable_ network frontend. Used to interact with the network.
 ///
@@ -81,7 +66,6 @@ impl<N: NetworkPrimitives> NetworkHandle<N> {
         discv5: Option<Discv5>,
         event_sender: EventSender<NetworkEvent<PeerRequest<N>>>,
         nat: Option<NatResolver>,
-        block_sender: EventSender<NewBlock<N::Block>>,
     ) -> Self {
         let inner = NetworkInner {
             num_active_peers,
@@ -99,10 +83,6 @@ impl<N: NetworkPrimitives> NetworkHandle<N> {
             discv5,
             event_sender,
             nat,
-            block_sender,
-            block_by_peers: Arc::new(RwLock::new(Default::default())),
-            bad_block_imports: LruCache::new(100),
-            validated_block: Arc::new(RwLock::new(VecDeque::new())),
         };
         Self { inner: Arc::new(inner) }
     }
@@ -136,52 +116,8 @@ impl<N: NetworkPrimitives> NetworkHandle<N> {
     /// Caution: in `PoS` this is a noop because new blocks are no longer announced over devp2p.
     /// Instead they are sent to the node by CL and can be requested over devp2p.
     /// Broadcasting new blocks is considered a protocol violation.
-    pub fn announce_block(&self, block: NewBlock<N::Block>, hash: B256) {
+    pub fn announce_block(&self, block: N::NewBlockPayload, hash: B256) {
         self.send_message(NetworkHandleMessage::AnnounceBlock(block, hash))
-    }
-
-    ///N42 subscribe_block
-    pub fn subscribe_block(&self) -> EventStream<NewBlock<N::Block>> {
-        self.inner.block_sender.new_listener()
-    }
-
-    ///N42 import_block
-    pub fn import_block(&self, peer_id: PeerId, block: NewBlock<N::Block>)  {
-        let block_hash = block.block.header().hash_slow();
-        let mut block_by_peers = self.inner.block_by_peers.write().unwrap();
-        match block_by_peers.entry(block_hash) {
-            Entry::Occupied(mut entry) => {
-                // block was already inserted
-                entry.get_mut().insert(peer_id);
-            }
-            Entry::Vacant(entry) => {
-                if self.inner.bad_block_imports.contains((&block_hash).into()) {
-                    trace!(target: "net::block",
-                                peer_id=format!("{peer_id:#}"),
-                                hash=%block_hash,
-                                "received a known bad block from peer"
-                            );
-                } else {
-                    entry.insert(HashSet::from([peer_id]));
-                    self.inner.block_sender.notify(block)
-                }
-            }
-        }
-    }
-    ///N42 import_block
-    pub fn take_validated_block(&self) -> Option<(HashSet<PeerId>, N42BlockImportOutcome<N::Block>)> {
-        let validated_block_clone = Arc::clone(&self.inner.validated_block);
-        let validated_block = validated_block_clone.read().unwrap();
-        if let Some(outcome) = validated_block.front() {
-            let block_hash = outcome.hash;
-            let mut block_by_peers = self.inner.block_by_peers.write().unwrap();
-            return if let Some(peers) = block_by_peers.remove(&block_hash) {
-                Some((peers, outcome.clone()))
-            } else {
-                None
-            }
-        }
-        None
     }
 
     /// Sends a [`PeerRequest`] to the given peer's session.
@@ -479,6 +415,11 @@ impl<N: NetworkPrimitives> NetworkSyncUpdater for NetworkHandle<N> {
     fn update_status(&self, head: Head) {
         self.send_message(NetworkHandleMessage::StatusUpdate { head });
     }
+
+    /// Updates the advertised block range.
+    fn update_block_range(&self, update: reth_eth_wire::BlockRangeUpdate) {
+        self.send_message(NetworkHandleMessage::InternalBlockRangeUpdate(update));
+    }
 }
 
 impl<N: NetworkPrimitives> BlockDownloaderProvider for NetworkHandle<N> {
@@ -488,24 +429,6 @@ impl<N: NetworkPrimitives> BlockDownloaderProvider for NetworkHandle<N> {
         let (tx, rx) = oneshot::channel();
         let _ = self.manager().send(NetworkHandleMessage::FetchClient(tx));
         rx.await
-    }
-}
-
-impl<N: NetworkPrimitives> BlockAnnounceProvider for NetworkHandle<N> {
-    type Block = N::Block;
-
-    fn announce_block(&self, block: NewBlock<N::Block>, hash: B256) {
-        self.announce_block(block, hash);
-    }
-
-    fn subscribe_block(&self) -> EventStream<NewBlock<N::Block>> {
-        self.inner.block_sender.new_listener()
-    }
-
-    fn validated_block(&self, result: N42BlockImportOutcome<N::Block>) {
-        let validated_block = Arc::clone(&self.inner.validated_block);
-        let mut queue = validated_block.write().unwrap();
-        queue.push_back(result);
     }
 }
 
@@ -541,18 +464,6 @@ struct NetworkInner<N: NetworkPrimitives = EthNetworkPrimitives> {
     event_sender: EventSender<NetworkEvent<PeerRequest<N>>>,
     /// The NAT resolver
     nat: Option<NatResolver>,
-    ///n42 block
-    block_sender: EventSender<NewBlock<N::Block>>,
-
-    /// All currently pending blocks grouped by peers.
-    ///
-    /// This way we can track incoming blocks and prevent multiple block imports for the same
-    /// block
-    block_by_peers: Arc<RwLock<HashMap<BlockHash, HashSet<PeerId>>>>,
-    /// Bad imports.
-    bad_block_imports: LruCache<BlockHash>,
-    /// validated block
-    validated_block: Arc<RwLock<VecDeque<N42BlockImportOutcome<N::Block>>>>,
 }
 
 /// Provides access to modify the network's additional protocol handlers.
@@ -573,7 +484,7 @@ pub(crate) enum NetworkHandleMessage<N: NetworkPrimitives = EthNetworkPrimitives
     /// Disconnects a connection to a peer if it exists, optionally providing a disconnect reason.
     DisconnectPeer(PeerId, Option<DisconnectReason>),
     /// Broadcasts an event to announce a new block to all nodes.
-    AnnounceBlock(NewBlock<N::Block>, B256),
+    AnnounceBlock(N::NewBlockPayload, B256),
     /// Sends a list of transactions to the given peer.
     SendTransaction {
         /// The ID of the peer to which the transactions are sent.
@@ -635,4 +546,6 @@ pub(crate) enum NetworkHandleMessage<N: NetworkPrimitives = EthNetworkPrimitives
     AddRlpxSubProtocol(RlpxSubProtocol),
     /// Connect to the given peer.
     ConnectPeer(PeerId, PeerKind, PeerAddr),
+    /// Message to update the node's advertised block range information.
+    InternalBlockRangeUpdate(BlockRangeUpdate),
 }

@@ -99,8 +99,6 @@ where
 /// This can be used to interact with the launched node.
 #[derive(Debug)]
 pub struct FullNode<Node: FullNodeComponents, AddOns: NodeAddOns<Node>> {
-    /// The consensus.
-    pub consensus: Node::Consensus,
     /// The evm configuration.
     pub evm_config: Node::Evm,
     /// The node's transaction pool.
@@ -124,7 +122,6 @@ pub struct FullNode<Node: FullNodeComponents, AddOns: NodeAddOns<Node>> {
 impl<Node: FullNodeComponents, AddOns: NodeAddOns<Node>> Clone for FullNode<Node, AddOns> {
     fn clone(&self) -> Self {
         Self {
-            consensus: self.consensus.clone(),
             evm_config: self.evm_config.clone(),
             pool: self.pool.clone(),
             network: self.network.clone(),

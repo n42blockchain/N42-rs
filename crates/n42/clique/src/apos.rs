@@ -16,7 +16,7 @@ use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_primitives::{SealedBlock, SealedHeader, BlockWithSenders};
 use reth_execution_types::BlockExecutionResult;
 use reth_primitives_traits::{RecoveredBlock, Header, header::clique_utils::{recover_address_generic, SIGNATURE_LENGTH, seal_hash}};
-use reth_provider::{BlockIdReader, BlockReaderIdExt, HeaderProvider, SnapshotProvider};
+use reth_provider::{BlockIdReader, BlockReaderIdExt, HeaderProvider};
 use tracing::{info, warn, debug, error};
 use n42_primitives::{APosConfig, Snapshot};
 
@@ -24,7 +24,7 @@ use alloy_signer_local::{LocalSigner, PrivateKeySigner};
 use k256::ecdsa::SigningKey;
 use alloy_signer::SignerSync;
 use reth_consensus::{FullConsensus, HeaderValidator, Consensus, ConsensusError, HeaderConsensusError};
-use reth_storage_api::{SnapshotProviderWriter, };
+// SnapshotProviderWriter removed in reth v1.5.0
 use reth_node_api::{FullNodeTypes, PrimitivesTy};
 use std::str::FromStr;
 
@@ -137,7 +137,7 @@ impl Error for AposError {}
 /// Ethereum testnet following the Ropsten attacks.
 pub struct APos<Provider, ChainSpec>
 where
-    Provider: HeaderProvider<Header = reth_primitives_traits::Header> + SnapshotProvider + SnapshotProviderWriter + BlockIdReader  + BlockReaderIdExt + Clone + Unpin + 'static,
+    Provider: HeaderProvider<Header = reth_primitives_traits::Header> + BlockIdReader + BlockReaderIdExt + Clone + Unpin + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks
 {
     config: APosConfig,          // Consensus engine configuration parameters
@@ -160,7 +160,7 @@ where
 // signers set to the ones provided by the user.
 impl<Provider, ChainSpec> APos<Provider, ChainSpec>
 where
-    Provider: HeaderProvider<Header = reth_primitives_traits::Header> + SnapshotProvider + SnapshotProviderWriter + BlockIdReader  + BlockReaderIdExt + Clone + Unpin + 'static,
+    Provider: HeaderProvider<Header = reth_primitives_traits::Header> + BlockIdReader + BlockReaderIdExt + Clone + Unpin + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks,
 {
     /// new
@@ -243,10 +243,11 @@ where
         }
         debug!(target: "consensus::apos", "recovered address: {}", signer);
 
-        #[cfg(debug_assertions)]
-        {
-            self.provider.save_signer_by_hash(&header.hash_slow(), signer).map_err(|_| ConsensusError::UnknownBlock)?;
-        }
+        // TODO: SnapshotProvider removed in reth v1.5.0 - need to implement alternative storage
+        // #[cfg(debug_assertions)]
+        // {
+        //     self.provider.save_signer_by_hash(&header.hash_slow(), signer).map_err(|_| ConsensusError::UnknownBlock)?;
+        // }
 
        //Check the list of recent signatories
         for (seen, recent) in &snap.recents {
@@ -366,14 +367,15 @@ where
                 break;
             }
 
+            // TODO: SnapshotProvider removed in reth v1.5.0 - need to implement alternative storage
             // Attempt to obtain a snapshot from the disk
-            if number != 0 && number % CHECKPOINT_INTERVAL == 0 {
-                if let Ok(Some(s)) = self.provider.load_snapshot_by_hash(&hash) {
-                    snap = Some(s);
-                    break;
-                }
-                debug!(target: "consensus::apos", "Snapshot not found for hash: {}, at number: {}", hash, number);
-            }
+            // if number != 0 && number % CHECKPOINT_INTERVAL == 0 {
+            //     if let Ok(Some(s)) = self.provider.load_snapshot_by_hash(&hash) {
+            //         snap = Some(s);
+            //         break;
+            //     }
+            //     debug!(target: "consensus::apos", "Snapshot not found for hash: {}, at number: {}", hash, number);
+            // }
 
             // If we're at the genesis, snapshot the initial state. Alternatively if we're
             // at a checkpoint block without a parent (light client CHT), or we have piled
@@ -400,8 +402,8 @@ where
                     );
                    
                     let s = Snapshot::new_snapshot(self.config.clone(), number, hash, signers);
-                    // todo
-                    self.provider.save_snapshot_by_hash(&hash, s.clone()).map_err(|_| ConsensusError::UnknownBlock)?;
+                    // TODO: SnapshotProvider removed in reth v1.5.0 - need to implement alternative storage
+                    // self.provider.save_snapshot_by_hash(&hash, s.clone()).map_err(|_| ConsensusError::UnknownBlock)?;
                     snap = Option::from(s);
 
                     debug!(target: "consensus::apos", ?snap,
@@ -450,15 +452,16 @@ where
 
         recents.insert(snap.hash, snap.clone());
 
-        //If a new checkpoint snapshot is generated, save it to disk
-        if snap.number % CHECKPOINT_INTERVAL == 0 && headers_len > 0 {
-            self.provider.save_snapshot_by_hash(&snap.hash, snap.clone()).map_err(|_|ConsensusError::SaveSnapshotError)?;
-            debug!(
-                "Stored voting snapshot to disk, number: {}, hash: {}",
-                snap.number,
-                snap.hash
-            );
-        }
+        // TODO: SnapshotProvider removed in reth v1.5.0 - need to implement alternative storage
+        // If a new checkpoint snapshot is generated, save it to disk
+        // if snap.number % CHECKPOINT_INTERVAL == 0 && headers_len > 0 {
+        //     self.provider.save_snapshot_by_hash(&snap.hash, snap.clone()).map_err(|_|ConsensusError::SaveSnapshotError)?;
+        //     debug!(
+        //         "Stored voting snapshot to disk, number: {}, hash: {}",
+        //         snap.number,
+        //         snap.hash
+        //     );
+        // }
 
         Ok(snap)
     }
@@ -477,7 +480,7 @@ fn calc_difficulty(snap: &Snapshot, signer: &Address) -> U256 {
 impl<Provider, ChainSpec> Debug for APos<Provider, ChainSpec>
 where
     ChainSpec: EthChainSpec + EthereumHardforks,
-    Provider: 'static + Clone + HeaderProvider<Header = reth_primitives_traits::Header> + SnapshotProvider + SnapshotProviderWriter + BlockIdReader  + BlockReaderIdExt + Unpin,
+    Provider: 'static + Clone + HeaderProvider<Header = reth_primitives_traits::Header> + BlockIdReader  + BlockReaderIdExt + Unpin,
 {
     fn fmt(&self, _f: &mut Formatter<'_>) -> std::fmt::Result {
         todo!()
@@ -487,7 +490,7 @@ where
 impl<Provider, ChainSpec> HeaderValidator for APos<Provider, ChainSpec>
 where
     ChainSpec: EthChainSpec + EthereumHardforks,
-    Provider: 'static + Clone + HeaderProvider<Header = reth_primitives_traits::Header> + SnapshotProvider + SnapshotProviderWriter + BlockIdReader  + BlockReaderIdExt + Unpin,
+    Provider: 'static + Clone + HeaderProvider<Header = reth_primitives_traits::Header> + BlockIdReader  + BlockReaderIdExt + Unpin,
 {
     fn validate_header(&self, header: &SealedHeader) -> Result<(), ConsensusError> {
 
@@ -605,7 +608,7 @@ where
 
 impl<Provider, ChainSpec, N> FullConsensus<N> for APos<Provider, ChainSpec>
 where
-    Provider: HeaderProvider<Header = reth_primitives_traits::Header> +SnapshotProvider + SnapshotProviderWriter  + BlockIdReader  + BlockReaderIdExt + Clone + Unpin + 'static,
+    Provider: HeaderProvider<Header = reth_primitives_traits::Header> + BlockIdReader  + BlockReaderIdExt + Clone + Unpin + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks,
     N: NodePrimitives,
     APos<Provider, ChainSpec>: HeaderValidator<<N as NodePrimitives>::BlockHeader>,
@@ -622,7 +625,7 @@ where
 
 impl<Provider, ChainSpec, B> Consensus<B> for APos<Provider, ChainSpec>
 where
-    Provider: HeaderProvider<Header = reth_primitives_traits::Header> +SnapshotProvider + SnapshotProviderWriter  + BlockIdReader  + BlockReaderIdExt + Clone + Unpin + 'static,
+    Provider: HeaderProvider<Header = reth_primitives_traits::Header> + BlockIdReader  + BlockReaderIdExt + Clone + Unpin + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks,
     B: BlockTrait,
     APos<Provider, ChainSpec>: HeaderValidator<<B as reth_primitives_traits::Block>::Header>,

@@ -301,7 +301,7 @@ where
                     if !all_peers.is_empty() {
                         status_counts = all_peers
                             .iter()
-                            .map(|v| (v.status.total_difficulty, v.status.blockhash))
+                            .map(|v| (v.status.total_difficulty.unwrap_or_default(), v.status.blockhash))
                             .counts();
                         break;
                     }

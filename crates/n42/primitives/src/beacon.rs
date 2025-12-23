@@ -2523,3 +2523,207 @@ pub fn round_down(n: u64, step: u64) -> u64 {
 fn round_to_nearest(n: u64, step: u64) -> u64 {
     ((n + step / 2) / step) * step
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::B256;
+
+    #[test]
+    fn test_round_down() {
+        assert_eq!(round_down(10, 3), 9);
+        assert_eq!(round_down(9, 3), 9);
+        assert_eq!(round_down(8, 3), 6);
+        assert_eq!(round_down(0, 3), 0);
+        assert_eq!(round_down(100, 10), 100);
+        assert_eq!(round_down(105, 10), 100);
+    }
+
+    #[test]
+    fn test_round_to_nearest() {
+        assert_eq!(round_to_nearest(10, 3), 9);
+        assert_eq!(round_to_nearest(11, 3), 12);
+        assert_eq!(round_to_nearest(5, 3), 6);
+        assert_eq!(round_to_nearest(4, 3), 3);
+    }
+
+    #[test]
+    fn test_beacon_chain_spec_defaults() {
+        let spec = beacon_chain_spec();
+        assert_eq!(spec.min_activation_balance, 32000000000);
+        assert_eq!(spec.ejection_balance, 16000000000);
+        assert_eq!(spec.max_effective_balance, 32000000000);
+        assert_eq!(spec.effective_balance_increment, 1000000000);
+        assert_eq!(spec.max_committees_per_slot, 4);
+        assert_eq!(spec.target_committee_size, 4);
+    }
+
+    #[test]
+    fn test_relative_epoch_into_epoch() {
+        let base_epoch: u64 = 10;
+        
+        assert_eq!(RelativeEpoch::Current.into_epoch(base_epoch), 10);
+        assert_eq!(RelativeEpoch::Previous.into_epoch(base_epoch), 9);
+        assert_eq!(RelativeEpoch::Next.into_epoch(base_epoch), 11);
+        
+        // Test edge case with epoch 0
+        assert_eq!(RelativeEpoch::Previous.into_epoch(0), 0); // saturating_sub
+        assert_eq!(RelativeEpoch::Current.into_epoch(0), 0);
+        assert_eq!(RelativeEpoch::Next.into_epoch(0), 1);
+    }
+
+    #[test]
+    fn test_total_balances() {
+        let spec = beacon_chain_spec();
+        let balances = TotalBalances::new(&spec);
+        
+        // Should return effective_balance_increment as minimum
+        assert_eq!(balances.current_epoch(), spec.effective_balance_increment);
+        assert_eq!(balances.previous_epoch(), spec.effective_balance_increment);
+        assert_eq!(balances.previous_epoch_attesters(), spec.effective_balance_increment);
+    }
+
+    #[test]
+    fn test_validator_status_default() {
+        let status = ValidatorStatus::default();
+        assert!(!status.is_slashed);
+        assert!(!status.is_eligible);
+        assert!(!status.is_active_in_current_epoch);
+        assert!(!status.is_active_in_previous_epoch);
+        assert!(!status.is_current_epoch_attester);
+        assert!(!status.is_previous_epoch_attester);
+    }
+
+    #[test]
+    fn test_validator_status_update() {
+        let mut status1 = ValidatorStatus::default();
+        let mut status2 = ValidatorStatus::default();
+        
+        status2.is_slashed = true;
+        status2.is_eligible = true;
+        status2.is_active_in_current_epoch = true;
+        
+        status1.update(&status2);
+        
+        assert!(status1.is_slashed);
+        assert!(status1.is_eligible);
+        assert!(status1.is_active_in_current_epoch);
+        assert!(!status1.is_previous_epoch_attester); // Should remain false
+    }
+
+    #[test]
+    fn test_slots_per_epoch_constant() {
+        assert_eq!(SLOTS_PER_EPOCH, 32);
+    }
+
+    #[test]
+    fn test_domain_constant() {
+        assert_eq!(DOMAIN_CONSTANT_BEACON_ATTESTER, 1);
+    }
+
+    #[test]
+    fn test_cached_epochs_constant() {
+        assert_eq!(CACHED_EPOCHS, 3);
+    }
+
+    #[test]
+    fn test_pubkey_cache_operations() {
+        // Clear cache first
+        if let Ok(mut cache) = PUBKEY_CACHE.write() {
+            cache.clear();
+        }
+        
+        // Generate a valid test pubkey (48 bytes)
+        let pubkey_bytes = FixedBytes::<48>::ZERO;
+        
+        // This should fail because zero bytes is not a valid public key
+        // but it tests the cache mechanism
+        let result = get_cached_pubkey(&pubkey_bytes);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_shuffle_cache_initialization() {
+        // Verify the cache is properly initialized
+        let cache_result = SHUFFLE_CACHE.read();
+        assert!(cache_result.is_ok());
+    }
+
+    #[test]
+    fn test_beacon_state_new() {
+        let state = BeaconState::new();
+        assert_eq!(state.validators_len, 0);
+        assert_eq!(state.balances_len, 0);
+        assert_eq!(state.slot, 0);
+    }
+
+    #[test]
+    fn test_beacon_block_default() {
+        let block = BeaconBlock::default();
+        assert_eq!(block.slot, 0);
+        assert_eq!(block.eth1_block_hash, B256::ZERO);
+        assert_eq!(block.parent_hash, B256::ZERO);
+        assert_eq!(block.state_root, B256::ZERO);
+    }
+
+    #[test]
+    fn test_attestation_data_default() {
+        let data = AttestationData::default();
+        assert_eq!(data.slot, 0);
+        assert_eq!(data.committee_index, 0);
+        assert_eq!(data.receipts_root, B256::ZERO);
+    }
+
+    #[test]
+    fn test_deposit_data_default() {
+        let data = DepositData::default();
+        assert_eq!(data.pubkey, BLSPubkey::default());
+        assert_eq!(data.amount, 0);
+    }
+
+    #[test]
+    fn test_voluntary_exit_default() {
+        let exit = VoluntaryExit::default();
+        assert_eq!(exit.epoch, 0);
+        assert_eq!(exit.validator_index, 0);
+    }
+
+    #[test]
+    fn test_epoch_to_block_number() {
+        assert_eq!(epoch_to_block_number(0), 0);
+        assert_eq!(epoch_to_block_number(1), 32);
+        assert_eq!(epoch_to_block_number(2), 64);
+        assert_eq!(epoch_to_block_number(10), 320);
+    }
+
+    #[test]
+    fn test_voluntary_exit_with_sig_default() {
+        let exit_with_sig = VoluntaryExitWithSig::default();
+        assert_eq!(exit_with_sig.voluntary_exit.epoch, 0);
+        assert_eq!(exit_with_sig.voluntary_exit.validator_index, 0);
+    }
+
+    #[test]
+    fn test_attestation_default() {
+        let attestation = Attestation::default();
+        assert!(attestation.validator_indexes.is_empty());
+        assert_eq!(attestation.data.slot, 0);
+        assert!(attestation.block_aggregate_signature.is_none());
+    }
+
+    #[test]
+    fn test_beacon_block_body_default() {
+        let body = BeaconBlockBody::default();
+        assert!(body.deposits.is_empty());
+        assert!(body.voluntary_exits.is_empty());
+    }
+
+    #[test]
+    fn test_beacon_block_hash_slow() {
+        let block = BeaconBlock::default();
+        let hash = block.hash_slow();
+        // Hash should be deterministic for same input
+        let hash2 = block.hash_slow();
+        assert_eq!(hash, hash2);
+    }
+}

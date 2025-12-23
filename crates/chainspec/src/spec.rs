@@ -3422,4 +3422,97 @@ Post-merge hard forks (timestamp based):
         assert_eq!(params.update_fraction, 3338477);
         assert_eq!(params.max_blobs_per_tx, 6);
     }
+
+    // ========== N42 Chain Specification Tests ==========
+
+    #[test]
+    fn test_n42_chain_id() {
+        assert_eq!(N42_TESTNET_CHAINID, 1142);
+        assert_eq!(N42_DEVNET_CHAINID, 1143);
+    }
+
+    #[test]
+    fn test_n42_spec_initialization() {
+        // Verify N42 spec is properly initialized
+        let n42_spec = &*N42;
+        assert_eq!(n42_spec.chain.id(), N42_TESTNET_CHAINID);
+    }
+
+    #[test]
+    fn test_n42_devnet_spec_initialization() {
+        // Verify N42 devnet spec is properly initialized
+        let n42_devnet_spec = &*N42_DEVNET;
+        assert_eq!(n42_devnet_spec.chain.id(), N42_DEVNET_CHAINID);
+    }
+
+    #[test]
+    fn test_n42_chain_is_n42() {
+        let n42_spec = &*N42;
+        // Check using chain ID comparison
+        assert_eq!(n42_spec.chain.id(), N42_TESTNET_CHAINID);
+        
+        // Mainnet should have different chain ID
+        let mainnet_spec = &*MAINNET;
+        assert_ne!(mainnet_spec.chain.id(), N42_TESTNET_CHAINID);
+    }
+
+    #[test]
+    fn test_n42_genesis_hash_constant() {
+        // Verify the N42 genesis hash constant is defined
+        assert_ne!(N42_GENESIS_HASH, B256::ZERO);
+    }
+
+    #[test]
+    fn test_n42_hardforks() {
+        let n42_spec = &*N42;
+        
+        // Verify hardforks are configured (not necessarily active at timestamp 0)
+        // Check that the chain spec has hardforks
+        assert!(n42_spec.hardforks.len() > 0);
+        
+        // Verify Shanghai and Cancun hardforks will eventually be active
+        // (they may require specific timestamps)
+        let far_future_timestamp = u64::MAX / 2;
+        assert!(n42_spec.is_shanghai_active_at_timestamp(far_future_timestamp));
+        assert!(n42_spec.is_cancun_active_at_timestamp(far_future_timestamp));
+    }
+
+    #[test]
+    fn test_n42_deposit_contract() {
+        let n42_spec = &*N42;
+        
+        // N42 should have a deposit contract configured
+        assert!(n42_spec.deposit_contract().is_some());
+    }
+
+    #[test]
+    fn test_n42_devnet_deposit_contract() {
+        let n42_devnet_spec = &*N42_DEVNET;
+        
+        // N42 devnet should have a deposit contract configured
+        assert!(n42_devnet_spec.deposit_contract().is_some());
+    }
+
+    #[test]
+    fn test_n42_vs_devnet_chain_ids_differ() {
+        // Verify testnet and devnet have different chain IDs
+        assert_ne!(N42_TESTNET_CHAINID, N42_DEVNET_CHAINID);
+        
+        let n42_spec = &*N42;
+        let n42_devnet_spec = &*N42_DEVNET;
+        assert_ne!(n42_spec.chain.id(), n42_devnet_spec.chain.id());
+    }
+
+    #[test]
+    fn test_make_chain_spec_creates_valid_spec() {
+        // Test that make_chain_spec produces a valid chain spec
+        let n42_spec = &*N42;
+        
+        // Should have a valid genesis header
+        let genesis_header = n42_spec.genesis_header();
+        assert_eq!(genesis_header.number, 0);
+        
+        // Should have hardforks configured (use the field directly)
+        assert!(n42_spec.hardforks.len() > 0);
+    }
 }

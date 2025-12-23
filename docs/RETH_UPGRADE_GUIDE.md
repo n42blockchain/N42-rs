@@ -83,29 +83,53 @@ cd reth-144-clean && cargo check -p reth-chainspec
 
 ## 核心阻塞因素
 
-1. **alloy-rpc-types-engine patch**: 需要同步到 v1.0.9+ API
-2. **alloy-rpc-types-beacon patch**: 需要同步到 v1.0.9+ API  
-3. **依赖解析**: Cargo 会拉入更新的兼容版本，导致 API 不匹配
+~~1. **alloy-rpc-types-engine patch**: 需要同步到 v1.0.9+ API~~
+~~2. **alloy-rpc-types-beacon patch**: 需要同步到 v1.0.9+ API~~
+3. **Fork crate 复杂依赖**: storage/db-api 等有 N42 特有依赖（merkle_db_rs）
+
+## 已完成的升级准备工作
+
+### alloy patch 更新进度 ✅
+
+已成功更新 alloy patch 到 v1.0.9 API：
+
+**alloy-rpc-types-engine 修改**:
+- 在 `ExecutionPayloadV1` 中添加 `difficulty: U256` 和 `nonce: B64` 字段
+- 更新 `try_into_block()` 使用这些字段
+- 更新 `from_block_unchecked()` 填充这些字段
+- 更新 SSZ 解码（ExecutionPayloadV2 和 V3）
+- 更新 serde 反序列化（Fields enum + 处理逻辑）
+- 禁用 extra_data 大小检查（N42 APoS 需要）
+
+**alloy-rpc-types-beacon 修改**:
+- 在 `BeaconExecutionPayloadV1` 中添加 `difficulty` 和 `nonce` 字段
+- 更新 From/Into 实现
+
+### 升级阻塞因素
+
+当前阻塞升级到 v1.4.5 的主要问题是 **fork crate 之间的复杂依赖**：
+- `storage/db-api` 依赖 `merkle_db_rs`（N42 特有）
+- 直接替换整个 fork crate 会破坏这些依赖
 
 ## 升级所需工作
 
 ### 最小升级路径 (v1.4.5)
 
-1. 更新 `n42/alloy-rpc-types-engine` 到 v1.0.9 API
-   - 移除 `ExecutionPayloadV1.difficulty` 和 `nonce` 字段处理
-2. 更新 `n42/alloy-rpc-types-beacon` 到 v1.0.9 API
-3. 重新生成并应用补丁
-4. 修复格式化冲突（仅影响测试代码）
+1. ✅ 更新 `n42/alloy-rpc-types-engine` 到 v1.0.9 API
+2. ✅ 更新 `n42/alloy-rpc-types-beacon` 到 v1.0.9 API
+3. 🔶 手动合并 fork crate 修改（保留 N42 依赖）
+4. 🔲 修复编译错误
+5. 🔲 测试验证
 
 ### 估计工作量
 
-| 任务 | 时间估计 |
-|------|---------|
-| 更新 alloy patch | 2-4 小时 |
-| 应用补丁 | 30 分钟 |
-| 修复编译错误 | 2-4 小时 |
-| 测试验证 | 1-2 小时 |
-| **总计** | **1-2 天** |
+| 任务 | 时间估计 | 状态 |
+|------|---------|------|
+| 更新 alloy patch | 2-4 小时 | ✅ 完成 |
+| 手动合并 fork crate | 4-8 小时 | 🔶 进行中 |
+| 修复编译错误 | 2-4 小时 | 🔲 待开始 |
+| 测试验证 | 1-2 小时 | 🔲 待开始 |
+| **总计** | **2-3 天** | |
 
 ## 推荐策略
 

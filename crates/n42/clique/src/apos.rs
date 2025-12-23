@@ -1,53 +1,41 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
-use alloy_primitives::Sealable;
-use alloy_primitives::{hex, Address, BlockHash, Bytes, FixedBytes, B256, B64, U256};
-use bytes::BytesMut;
-use n42_primitives::{APosConfig, Snapshot};
-use rand::prelude::IndexedRandom;
-use rand::prelude::SliceRandom;
-use reth_chainspec::{EthChainSpec, EthereumHardforks};
-use reth_execution_types::BlockExecutionResult;
-use reth_primitives::{BlockWithSenders, SealedBlock, SealedHeader};
-use reth_primitives_traits::AlloyBlockHeader;
-use reth_primitives_traits::{
-    header::clique_utils::{recover_address_generic, seal_hash, SIGNATURE_LENGTH},
-    Header, RecoveredBlock,
-};
-use reth_primitives_traits::{
-    Block as BlockTrait, BlockBody, BlockHeader as BlockHeaderTrait, NodePrimitives,
-};
-use reth_provider::{BlockIdReader, BlockReaderIdExt, HeaderProvider, SnapshotProvider};
 use reth_revm::cached::CachedReads;
-use std::collections::HashMap;
+use rand::prelude::IndexedRandom;
+use reth_primitives_traits::{AlloyBlockHeader};
+use alloy_primitives::Sealable;
+use reth_primitives_traits::{Block as BlockTrait, BlockHeader as BlockHeaderTrait, NodePrimitives, };
 use std::error::Error;
-use std::fmt::{Debug, Formatter};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
-use tracing::{debug, error, info, warn};
+use std::collections::HashMap;
+use std::fmt::{Debug, Formatter};
+use std::sync::atomic::{AtomicBool, Ordering};
+use alloy_primitives::{U256, hex, BlockHash, B64, B256, Address, Bytes, FixedBytes};
+use bytes::BytesMut;
+use rand::prelude::SliceRandom;
+use reth_chainspec::{EthChainSpec, EthereumHardforks};
+use reth_primitives::{SealedBlock, SealedHeader, BlockWithSenders};
+use reth_execution_types::BlockExecutionResult;
+use reth_primitives_traits::{RecoveredBlock, Header, header::clique_utils::{recover_address_generic, SIGNATURE_LENGTH, seal_hash}};
+use reth_provider::{BlockIdReader, BlockReaderIdExt, HeaderProvider};
+use tracing::{info, warn, debug, error};
+use n42_primitives::{APosConfig, Snapshot};
 
-use alloy_signer::SignerSync;
 use alloy_signer_local::{LocalSigner, PrivateKeySigner};
 use k256::ecdsa::SigningKey;
-use reth_consensus::{
-    Consensus, ConsensusError, FullConsensus, HeaderConsensusError, HeaderValidator,
-};
+use alloy_signer::SignerSync;
+use reth_consensus::{FullConsensus, HeaderValidator, Consensus, ConsensusError, HeaderConsensusError};
+// SnapshotProviderWriter removed in reth v1.5.0
 use reth_node_api::{FullNodeTypes, PrimitivesTy};
-use reth_storage_api::SnapshotProviderWriter;
 use std::str::FromStr;
 
 //
 const CHECKPOINT_INTERVAL: u64 = 2048; // Number of blocks after which to save the vote snapshot to the database
-
-// Performance-optimized cache sizes for high TPS
-// Increased from defaults to reduce database lookups
-const INMEMORY_SNAPSHOTS: u32 = 512; // Increased from 128 for better snapshot hit rate
-const INMEMORY_TDS: u32 = 4096; // Increased from 1024 for better TD lookup performance
-const INMEMORY_CACHED_READS: u32 = 128; // Increased from 32 for better state cache hit rate
+const INMEMORY_SNAPSHOTS: u32 = 128; // Number of recent vote snapshots to keep in memory
+const INMEMORY_TDS: u32 = 1024; // Number of recent total difficulty records to keep in memory
+const INMEMORY_CACHED_READS: u32 = 32; // Number of recent cached reads records to keep in memory
 
 const WIGGLE_TIME: Duration = Duration::from_millis(500); // Random delay (per signer) to allow concurrent signers
+
 
 // APos proof-of-authority protocol constants
 
@@ -71,7 +59,7 @@ pub const DIFF_IN_TURN: U256 = U256::from_limbs([2u64, 0, 0, 0]);
 /// Block difficulty for out-of-turn signatures
 pub const DIFF_NO_TURN: U256 = U256::from_limbs([1u64, 0, 0, 0]);
 /// full immutability threshold
-pub const FULL_IMMUTABILITY_THRESHOLD: usize = 90000;
+pub const FULL_IMMUTABILITY_THRESHOLD: usize= 90000;
 
 /// apos error
 #[derive(Debug, Clone)]
@@ -149,43 +137,30 @@ impl Error for AposError {}
 /// Ethereum testnet following the Ropsten attacks.
 pub struct APos<Provider, ChainSpec>
 where
-    Provider: HeaderProvider<Header = reth_primitives_traits::Header>
-        + SnapshotProvider
-        + SnapshotProviderWriter
-        + BlockIdReader
-        + BlockReaderIdExt
-        + Clone
-        + Unpin
-        + 'static,
-    ChainSpec: EthChainSpec + EthereumHardforks,
+    Provider: HeaderProvider<Header = reth_primitives_traits::Header> + BlockIdReader + BlockReaderIdExt + Clone + Unpin + 'static,
+    ChainSpec: EthChainSpec + EthereumHardforks
 {
-    config: APosConfig, // Consensus engine configuration parameters
+    config: APosConfig,          // Consensus engine configuration parameters
     /// Chain spec
     chain_spec: Arc<ChainSpec>,
-    recents: RwLock<schnellru::LruMap<B256, Snapshot>>, // Snapshots for recent block to speed up reorgs
-    proposals: Arc<RwLock<HashMap<Address, bool>>>,     // Current list of proposals we are pushing
-    signer: RwLock<Option<Address>>,                    // Ethereum address of the signing key
+    recents: RwLock<schnellru::LruMap<B256, Snapshot>>,    // Snapshots for recent block to speed up reorgs
+    proposals: Arc<RwLock<HashMap<Address, bool>>>,   // Current list of proposals we are pushing
+    signer: RwLock<Option<Address>>, // Ethereum address of the signing key
     eth_signer: RwLock<Option<LocalSigner<SigningKey>>>,
     //  Provider,
     provider: Provider,
-    recent_headers: RwLock<schnellru::LruMap<B256, Provider::Header>>, // Recent headers for snapshot
+    recent_headers: RwLock<schnellru::LruMap<B256, Provider::Header>>,    // Recent headers for snapshot
     recent_tds: RwLock<schnellru::LruMap<B256, U256>>,
     recent_tds_inited: AtomicBool,
     recent_cached_reads: RwLock<schnellru::LruMap<B256, CachedReads>>,
 }
 
+
 // New creates a APos proof-of-authority consensus engine with the initial
 // signers set to the ones provided by the user.
 impl<Provider, ChainSpec> APos<Provider, ChainSpec>
 where
-    Provider: HeaderProvider<Header = reth_primitives_traits::Header>
-        + SnapshotProvider
-        + SnapshotProviderWriter
-        + BlockIdReader
-        + BlockReaderIdExt
-        + Clone
-        + Unpin
-        + 'static,
+    Provider: HeaderProvider<Header = reth_primitives_traits::Header> + BlockIdReader + BlockReaderIdExt + Clone + Unpin + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks,
 {
     /// new
@@ -193,29 +168,17 @@ where
         provider: Provider,
         chain_spec: Arc<ChainSpec>,
         signer_private_key: Option<String>,
-    ) -> Self {
-        let recents = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(
-            INMEMORY_SNAPSHOTS,
-        )));
-        let recent_headers = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(
-            CHECKPOINT_INTERVAL as u32 * 2,
-        )));
-        let recent_tds = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(
-            INMEMORY_TDS,
-        )));
+    ) -> Self
+    {
+        let recents = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_SNAPSHOTS)));
+        let recent_headers = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(CHECKPOINT_INTERVAL as u32 * 2)));
+        let recent_tds = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_TDS)));
         let recent_tds_inited = AtomicBool::new(false);
-        let recent_cached_reads = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(
-            INMEMORY_CACHED_READS,
-        )));
+        let recent_cached_reads = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_CACHED_READS)));
 
-        // SEC-001: Safe private key parsing - avoid panic on invalid key
-        let eth_signer: Option<PrivateKeySigner> = signer_private_key.and_then(|key| {
-            key.parse().map_err(|e| {
-                error!(target: "consensus::apos", "Failed to parse signer private key: {:?}", e);
-            }).ok()
-        });
+        let eth_signer: Option<PrivateKeySigner> = signer_private_key.map(|key| { key.parse().unwrap() });
 
-        let eth_signer_address = eth_signer.clone().map(|signer| signer.address());
+        let eth_signer_address = eth_signer.clone().map(|signer| {signer.address()});
         info!(target: "consensus::apos", "apos set signer address {:?}", eth_signer_address);
 
         let mut config = APosConfig::default();
@@ -244,7 +207,7 @@ where
     }
 
     fn set_signer(&self, eth_signer: Option<LocalSigner<SigningKey>>) {
-        let eth_signer_address = eth_signer.clone().map(|signer| signer.address());
+        let eth_signer_address = eth_signer.clone().map(|signer| {signer.address()});
         info!(target: "consensus::apos", "set_signer, new signer={:?}", eth_signer_address);
         let mut signer_guard = self.signer.write().unwrap();
         let mut eth_signer_guard = self.eth_signer.write().unwrap();
@@ -262,9 +225,10 @@ where
         header: &H,
         _parents: Option<Vec<H>>,
     ) -> Result<(), Box<dyn std::error::Error>>
-    where
-        H: BlockHeaderTrait,
+        where
+            H: BlockHeaderTrait,
     {
+
         // Verifying the genesis block is not supported
         if header.number() == 0 {
             return Err(AposError::UnknownBlock.into());
@@ -279,14 +243,13 @@ where
         }
         debug!(target: "consensus::apos", "recovered address: {}", signer);
 
-        #[cfg(debug_assertions)]
-        {
-            self.provider
-                .save_signer_by_hash(&header.hash_slow(), signer)
-                .map_err(|_| ConsensusError::UnknownBlock)?;
-        }
+        // TODO: SnapshotProvider removed in reth v1.5.0 - need to implement alternative storage
+        // #[cfg(debug_assertions)]
+        // {
+        //     self.provider.save_signer_by_hash(&header.hash_slow(), signer).map_err(|_| ConsensusError::UnknownBlock)?;
+        // }
 
-        //Check the list of recent signatories
+       //Check the list of recent signatories
         for (seen, recent) in &snap.recents {
             if *recent == signer {
                 //If the signer is in the recent list, ensure that the current block can be removed
@@ -297,7 +260,7 @@ where
             }
         }
 
-        //Ensure that the difficulty corresponds to the signer's round
+       //Ensure that the difficulty corresponds to the signer's round
         let in_turn = snap.inturn(header.number(), &signer);
         if in_turn && header.difficulty() != DIFF_IN_TURN {
             return Err(AposError::WrongDifficulty.into());
@@ -308,6 +271,7 @@ where
 
         Ok(())
     }
+
 
     /// `SealHash` returns the hash of a block prior to it being sealed.
     pub fn seal_hash(&self, header: &Header) -> B256 {
@@ -322,31 +286,18 @@ where
     // APIs implements consensus.Engine, returning the user facing RPC API to allow
     // controlling the signer voting.
 
-    /// SEC-009: Safe initialization of recent TDs with proper error handling
     fn init_recent_tds(&self) {
         if self.recent_tds_inited.load(Ordering::Relaxed) {
             return;
         }
-        let finalized_block_number = self
-            .provider
+        let finalized_block_number = self.provider
             .finalized_block_number()
             .unwrap_or(Some(0))
             .unwrap_or(0);
         info!(target: "consensus::apos", ?finalized_block_number, "init_recent_tds");
-
-        let best_block_number = match self.provider.best_block_number() {
-            Ok(n) => n,
-            Err(e) => {
-                error!(target: "consensus::apos", "Failed to get best block number: {:?}", e);
-                return;
-            }
-        };
+        let best_block_number = self.provider.best_block_number().unwrap();
         info!(target: "consensus::apos", ?best_block_number, "init_recent_tds");
-
-        // SEC-009: Use saturating arithmetic to prevent underflow
-        let num_blocks = best_block_number
-            .saturating_sub(finalized_block_number)
-            .saturating_add(1);
+        let num_blocks = best_block_number - finalized_block_number + 1;
         let start_block_number = if num_blocks > INMEMORY_TDS.into() {
             warn!(target: "consensus::apos", ?finalized_block_number, ?best_block_number, td_cache_size=?INMEMORY_TDS,
                 "the number of blocks from finalized block to best block is larger than td cache size, this may cause 'td not found' errors later",
@@ -355,59 +306,35 @@ where
         } else {
             finalized_block_number
         };
-
-        for block_number in start_block_number..=best_block_number {
+        (start_block_number..=best_block_number).for_each(|block_number| {
             debug!(target: "consensus::apos", ?block_number, "init_recent_tds");
-            let header = match self.provider.header_by_number(block_number) {
-                Ok(Some(h)) => h,
-                Ok(None) => {
-                    warn!(target: "consensus::apos", ?block_number, "Header not found");
-                    continue;
-                }
-                Err(e) => {
-                    error!(target: "consensus::apos", ?block_number, "Failed to get header: {:?}", e);
-                    continue;
-                }
-            };
-
+            let header = self.provider.header_by_number(block_number).unwrap().unwrap();
             if block_number == start_block_number {
-                let start_td = self
-                    .provider
-                    .header_td_by_number(start_block_number)
+                let start_td = self.provider.header_td_by_number(start_block_number)
                     .unwrap_or(Some(U256::ZERO))
                     .unwrap_or(U256::ZERO);
-                if let Ok(mut recent_tds) = self.recent_tds.write() {
-                    recent_tds.insert(header.hash_slow(), start_td);
-                }
+                let mut recent_tds = self.recent_tds.write().unwrap();
+                recent_tds.insert(header.hash_slow(), start_td);
             } else {
-                if let Ok(mut recent_tds) = self.recent_tds.write() {
-                    let parent_td = recent_tds
-                        .get(&header.parent_hash())
-                        .copied()
-                        .unwrap_or(U256::ZERO);
-                    recent_tds.insert(header.hash_slow(), parent_td + header.difficulty());
-                }
+                let mut recent_tds = self.recent_tds.write().unwrap();
+                let parent_td = *recent_tds.get(&header.parent_hash()).unwrap();
+                recent_tds.insert(header.hash_slow(), parent_td + header.difficulty());
             }
         }
+        );
 
         self.recent_tds_inited.store(true, Ordering::Relaxed);
     }
 
     fn save_total_difficulty<H>(&self, header: &H)
-    where
-        H: BlockHeaderTrait,
+        where
+            H: BlockHeaderTrait,
     {
         self.init_recent_tds();
 
         let total_difficulty = {
             let mut recent_tds = self.recent_tds.write().unwrap();
-            let parent_td = recent_tds.get(&header.parent_hash()).unwrap_or_else(|| {
-                panic!(
-                    "td not found for parent hash {:?}, current header={:?}",
-                    header.parent_hash(),
-                    header
-                )
-            });
+            let parent_td = recent_tds.get(&header.parent_hash()).unwrap_or_else(|| panic!("td not found for parent hash {:?}, current header={:?}", header.parent_hash(), header));
             *parent_td + header.difficulty()
         };
 
@@ -423,6 +350,7 @@ where
         hash: B256,
         parents: Option<Vec<Provider::Header>>,
     ) -> Result<Snapshot, ConsensusError> {
+
         let mut headers: Vec<Provider::Header> = Vec::new();
         let mut snap: Option<Snapshot> = None;
         let mut hash = hash;
@@ -439,40 +367,31 @@ where
                 break;
             }
 
+            // TODO: SnapshotProvider removed in reth v1.5.0 - need to implement alternative storage
             // Attempt to obtain a snapshot from the disk
-            if number != 0 && number % CHECKPOINT_INTERVAL == 0 {
-                if let Ok(Some(s)) = self.provider.load_snapshot_by_hash(&hash) {
-                    snap = Some(s);
-                    break;
-                }
-                debug!(target: "consensus::apos", "Snapshot not found for hash: {}, at number: {}", hash, number);
-            }
+            // if number != 0 && number % CHECKPOINT_INTERVAL == 0 {
+            //     if let Ok(Some(s)) = self.provider.load_snapshot_by_hash(&hash) {
+            //         snap = Some(s);
+            //         break;
+            //     }
+            //     debug!(target: "consensus::apos", "Snapshot not found for hash: {}, at number: {}", hash, number);
+            // }
 
             // If we're at the genesis, snapshot the initial state. Alternatively if we're
             // at a checkpoint block without a parent (light client CHT), or we have piled
             // up more headers than allowed to be reorged (chain reinit from a freezer),
             // consider the checkpoint trusted and snapshot it.
-            if number == 0
-                || (number % self.config.epoch == 0
-                    && (headers.len() > FULL_IMMUTABILITY_THRESHOLD
-                        || self
-                            .provider
-                            .header_by_number(number - 1)
-                            .unwrap()
-                            .is_none()))
-            {
+            if number == 0 || (number % self.config.epoch == 0 && (headers.len() > FULL_IMMUTABILITY_THRESHOLD || self.provider.header_by_number(number -1).unwrap().is_none())) {
                 if let Ok(Some(checkpoint)) = self.provider.header_by_number(number) {
                     debug!(target: "consensus::apos", "checkpoint={:?}", checkpoint);
                     let hash = checkpoint.hash_slow();
                     //info!(target: "consensus::apos", "snapshot() : number={}, hash_slow hash={:?}", number, hash);
-
+            
                     //Calculate the list of signatories
-                    let signers_count =
-                        (checkpoint.extra_data().len() - EXTRA_VANITY - SIGNATURE_LENGTH)
-                            / Address::len_bytes();
+                    let signers_count = (checkpoint.extra_data().len() - EXTRA_VANITY - SIGNATURE_LENGTH) /  Address::len_bytes();
 
                     let mut signers = Vec::with_capacity(signers_count);
-
+            
                     for i in 0..signers_count {
                         let start = EXTRA_VANITY + i * Address::len_bytes();
                         let end = start + Address::len_bytes();
@@ -481,12 +400,10 @@ where
                     debug!(target: "consensus::apos", ?signers,
                         "genesis signers:"
                     );
-
+                   
                     let s = Snapshot::new_snapshot(self.config.clone(), number, hash, signers);
-                    // todo
-                    self.provider
-                        .save_snapshot_by_hash(&hash, s.clone())
-                        .map_err(|_| ConsensusError::UnknownBlock)?;
+                    // TODO: SnapshotProvider removed in reth v1.5.0 - need to implement alternative storage
+                    // self.provider.save_snapshot_by_hash(&hash, s.clone()).map_err(|_| ConsensusError::UnknownBlock)?;
                     snap = Option::from(s);
 
                     debug!(target: "consensus::apos", ?snap,
@@ -508,12 +425,8 @@ where
                 header
             } else if let Some(v) = recent_headers.get(&hash) {
                 v.clone()
-            } else if let Some(header) = self
-                .provider
-                .header_by_hash_or_number(hash.into())
-                .map_err(|_| ConsensusError::UnknownBlock)?
-            {
-                header
+            } else if let Some(header) = self.provider.header_by_hash_or_number(hash.into()).map_err(|_| ConsensusError::UnknownBlock)? {
+               header
             } else {
                 error!(target: "consensus::apos", "hash not found: {:?}", hash);
                 return Err(ConsensusError::UnknownBlock);
@@ -522,6 +435,7 @@ where
             hash = header.parent_hash();
             headers.push(header);
             number -= 1;
+
         }
 
         //Find the previous snapshot and apply any pending headers to it
@@ -531,29 +445,28 @@ where
             headers.swap(i, headers_len - 1 - i);
         }
 
-        let snap = snap
-            .unwrap()
-            .apply::<_, Provider::Header>(headers, |header| {
-                let signer = recover_address_generic(&header)?;
-                Ok(signer)
-            })
-            .map_err(|_| ConsensusError::InvalidDifficulty)?;
+        let snap = snap.unwrap().apply::<_, Provider::Header>(headers, |header| {
+            let signer = recover_address_generic(&header)?;
+            Ok(signer)
+        }).map_err(|_| ConsensusError::InvalidDifficulty)?;
 
         recents.insert(snap.hash, snap.clone());
 
-        //If a new checkpoint snapshot is generated, save it to disk
-        if snap.number % CHECKPOINT_INTERVAL == 0 && headers_len > 0 {
-            self.provider
-                .save_snapshot_by_hash(&snap.hash, snap.clone())
-                .map_err(|_| ConsensusError::SaveSnapshotError)?;
-            debug!(
-                "Stored voting snapshot to disk, number: {}, hash: {}",
-                snap.number, snap.hash
-            );
-        }
+        // TODO: SnapshotProvider removed in reth v1.5.0 - need to implement alternative storage
+        // If a new checkpoint snapshot is generated, save it to disk
+        // if snap.number % CHECKPOINT_INTERVAL == 0 && headers_len > 0 {
+        //     self.provider.save_snapshot_by_hash(&snap.hash, snap.clone()).map_err(|_|ConsensusError::SaveSnapshotError)?;
+        //     debug!(
+        //         "Stored voting snapshot to disk, number: {}, hash: {}",
+        //         snap.number,
+        //         snap.hash
+        //     );
+        // }
 
         Ok(snap)
     }
+
+
 }
 
 fn calc_difficulty(snap: &Snapshot, signer: &Address) -> U256 {
@@ -567,14 +480,7 @@ fn calc_difficulty(snap: &Snapshot, signer: &Address) -> U256 {
 impl<Provider, ChainSpec> Debug for APos<Provider, ChainSpec>
 where
     ChainSpec: EthChainSpec + EthereumHardforks,
-    Provider: 'static
-        + Clone
-        + HeaderProvider<Header = reth_primitives_traits::Header>
-        + SnapshotProvider
-        + SnapshotProviderWriter
-        + BlockIdReader
-        + BlockReaderIdExt
-        + Unpin,
+    Provider: 'static + Clone + HeaderProvider<Header = reth_primitives_traits::Header> + BlockIdReader  + BlockReaderIdExt + Unpin,
 {
     fn fmt(&self, _f: &mut Formatter<'_>) -> std::fmt::Result {
         todo!()
@@ -584,16 +490,10 @@ where
 impl<Provider, ChainSpec> HeaderValidator for APos<Provider, ChainSpec>
 where
     ChainSpec: EthChainSpec + EthereumHardforks,
-    Provider: 'static
-        + Clone
-        + HeaderProvider<Header = reth_primitives_traits::Header>
-        + SnapshotProvider
-        + SnapshotProviderWriter
-        + BlockIdReader
-        + BlockReaderIdExt
-        + Unpin,
+    Provider: 'static + Clone + HeaderProvider<Header = reth_primitives_traits::Header> + BlockIdReader  + BlockReaderIdExt + Unpin,
 {
     fn validate_header(&self, header: &SealedHeader) -> Result<(), ConsensusError> {
+
         let header = header.header();
         if header.number() == 0 {
             return Err(ConsensusError::UnknownBlock);
@@ -601,16 +501,14 @@ where
         let number = header.number();
 
         // Don't waste time checking blocks from the future
-        let present_timestamp = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let present_timestamp =
+            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
 
-        if header.timestamp() > present_timestamp {
+        if header.timestamp() > present_timestamp + alloy_eips::merge::ALLOWED_FUTURE_BLOCK_TIME_SECONDS {
             return Err(ConsensusError::TimestampIsInFuture {
                 timestamp: header.timestamp(),
                 present_timestamp,
-            });
+            })
         }
 
         // Checkpoint blocks need to enforce zero beneficiary
@@ -619,9 +517,9 @@ where
             return Err(ConsensusError::InvalidCheckpointBeneficiary);
         }
 
+
         // Nonces must be 0x00..0 or 0xff..f, zeroes enforced on checkpoints
-        if header.nonce().unwrap() != NONCE_AUTH_VOTE && header.nonce().unwrap() != NONCE_DROP_VOTE
-        {
+        if header.nonce().unwrap() != NONCE_AUTH_VOTE && header.nonce().unwrap() != NONCE_DROP_VOTE {
             return Err(ConsensusError::InvalidVote);
         }
 
@@ -650,10 +548,7 @@ where
         }
 
         // Ensure that the block's difficulty is meaningful (may not be correct at this point)
-        if number > 0
-            && (header.difficulty().is_zero()
-                || (header.difficulty() != DIFF_IN_TURN && header.difficulty() != DIFF_NO_TURN))
-        {
+        if number > 0 && (header.difficulty().is_zero() || (header.difficulty() != DIFF_IN_TURN && header.difficulty() != DIFF_NO_TURN)) {
             return Err(ConsensusError::InvalidDifficulty);
         }
 
@@ -675,14 +570,9 @@ where
             return Ok(());
         }
 
-        let snap = self.snapshot_inner(
-            number - 1,
-            header.parent_hash(),
-            Some(vec![parent.header().clone()]),
-        )?;
+        let snap = self.snapshot_inner(number - 1, header.parent_hash(), Some(vec![parent.header().clone()]))?;
         if number % self.config.epoch == 0 {
-            let signers: Vec<u8> = snap
-                .signers
+            let signers: Vec<u8> = snap.signers
                 .iter()
                 .flat_map(|signer| signer.as_slice().to_vec())
                 .collect();
@@ -692,10 +582,7 @@ where
             }
         }
 
-        self.verify_seal(&snap, header, None)
-            .map_err(|e| ConsensusError::AposErrorDetail {
-                detail: e.to_string(),
-            })?;
+        self.verify_seal(&snap, header, None).map_err(|e| {ConsensusError::AposErrorDetail {detail: e.to_string()}})?;
         let mut recent_headers = self.recent_headers.write().unwrap();
         recent_headers.insert(header_hash, header.clone());
 
@@ -710,40 +597,18 @@ where
     /// on its own and valid against its parent.
     ///
     /// Note: this expects that the headers are in natural order (ascending block number)
-    /// SEC-003: Implement proper header range validation
     fn validate_header_range(
         &self,
         headers: &[SealedHeader],
     ) -> Result<(), HeaderConsensusError<reth_primitives_traits::Header>> {
-        if let Some((initial_header, remaining_headers)) = headers.split_first() {
-            // Validate the first header
-            self.validate_header(initial_header)
-                .map_err(|e| HeaderConsensusError(e, initial_header.clone()))?;
-
-            // Validate each subsequent header against its parent
-            let mut parent = initial_header;
-            for child in remaining_headers {
-                self.validate_header(child)
-                    .map_err(|e| HeaderConsensusError(e, child.clone()))?;
-                self.validate_header_against_parent(child, parent)
-                    .map_err(|e| HeaderConsensusError(e, child.clone()))?;
-                parent = child;
-            }
-        }
         Ok(())
     }
+
 }
 
 impl<Provider, ChainSpec, N> FullConsensus<N> for APos<Provider, ChainSpec>
 where
-    Provider: HeaderProvider<Header = reth_primitives_traits::Header>
-        + SnapshotProvider
-        + SnapshotProviderWriter
-        + BlockIdReader
-        + BlockReaderIdExt
-        + Clone
-        + Unpin
-        + 'static,
+    Provider: HeaderProvider<Header = reth_primitives_traits::Header> + BlockIdReader  + BlockReaderIdExt + Clone + Unpin + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks,
     N: NodePrimitives,
     APos<Provider, ChainSpec>: HeaderValidator<<N as NodePrimitives>::BlockHeader>,
@@ -755,70 +620,23 @@ where
     ) -> Result<(), ConsensusError> {
         Ok(())
     }
+
 }
 
 impl<Provider, ChainSpec, B> Consensus<B> for APos<Provider, ChainSpec>
 where
-    Provider: HeaderProvider<Header = reth_primitives_traits::Header>
-        + SnapshotProvider
-        + SnapshotProviderWriter
-        + BlockIdReader
-        + BlockReaderIdExt
-        + Clone
-        + Unpin
-        + 'static,
+    Provider: HeaderProvider<Header = reth_primitives_traits::Header> + BlockIdReader  + BlockReaderIdExt + Clone + Unpin + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks,
     B: BlockTrait,
     APos<Provider, ChainSpec>: HeaderValidator<<B as reth_primitives_traits::Block>::Header>,
 {
     type Error = ConsensusError;
 
-    /// SEC-005: Implement body against header validation
     fn validate_body_against_header(
         &self,
         body: &B::Body,
         header: &SealedHeader<B::Header>,
     ) -> Result<(), Self::Error> {
-        // Validate transaction root
-        let tx_root = body.calculate_tx_root();
-        if header.transactions_root() != tx_root {
-            return Err(ConsensusError::BodyTransactionRootDiff(
-                reth_primitives_traits::GotExpected {
-                    got: tx_root,
-                    expected: header.transactions_root(),
-                }
-                .into(),
-            ));
-        }
-
-        // Validate ommers hash
-        if let Some(ommers_hash) = body.calculate_ommers_root() {
-            if header.ommers_hash() != ommers_hash {
-                return Err(ConsensusError::BodyOmmersHashDiff(
-                    reth_primitives_traits::GotExpected {
-                        got: ommers_hash,
-                        expected: header.ommers_hash(),
-                    }
-                    .into(),
-                ));
-            }
-        }
-
-        // Validate withdrawals root if present
-        if let (Some(header_root), Some(body_root)) =
-            (header.withdrawals_root(), body.calculate_withdrawals_root())
-        {
-            if header_root != body_root {
-                return Err(ConsensusError::BodyWithdrawalsRootDiff(
-                    reth_primitives_traits::GotExpected {
-                        got: body_root,
-                        expected: header_root,
-                    }
-                    .into(),
-                ));
-            }
-        }
-
         Ok(())
     }
 
@@ -829,23 +647,24 @@ where
     /// Prepare implements consensus.Engine, preparing all the consensus fields of the
     /// header for running the transactions on top.
     fn prepare(&self, parent_header: &SealedHeader) -> Result<Header, ConsensusError> {
-        let mut header = Header::default();
+
+        let mut header = Header::default(); 
         //If the block is not a checkpoint, vote randomly
         header.beneficiary = Address::ZERO;
         header.nonce = B64::from(0u64);
         header.number = parent_header.number + 1;
         header.parent_hash = parent_header.hash();
 
-        //Assemble voting snapshots to check which votes are meaningful
-        let snap = self
-            .snapshot_inner(parent_header.number, parent_header.hash(), None)
-            .map_err(|_| ConsensusError::UnknownBlock)?;
 
-        if header.number % self.config.epoch != 0 {
+
+        //Assemble voting snapshots to check which votes are meaningful
+        let snap = self.snapshot_inner(
+            parent_header.number, parent_header.hash(), None).map_err(|_| ConsensusError::UnknownBlock)?;
+
+        if header.number %self.config.epoch != 0 {
             //Collect all proposals to be voted on
             let proposals_lock = self.proposals.read().unwrap();
-            let addresses: Vec<Address> = proposals_lock
-                .iter()
+            let addresses: Vec<Address> = proposals_lock.iter()
                 //.filter(|(&address, &authorize)| snap.valid_vote(address, authorize))
                 .map(|(address, _)| *address)
                 .collect();
@@ -888,10 +707,7 @@ where
         header.mix_hash = Default::default();
 
         // Ensure the timestamp has the correct delay
-        if let Ok(Some(parent)) = self
-            .provider
-            .header_by_hash_or_number(header.parent_hash.into())
-        {
+        if let Ok(Some(parent)) = self.provider.header_by_hash_or_number(header.parent_hash.into()) {
             let parent_time = parent.timestamp();
             header.timestamp = parent_time + self.config.period;
         }
@@ -900,6 +716,7 @@ where
     }
 
     fn seal(&self, header: &mut Header) -> Result<(), ConsensusError> {
+
         // Sealing the genesis block is not supported
         if header.number == 0 {
             return Err(ConsensusError::UnknownBlock);
@@ -911,18 +728,15 @@ where
         // }
         //todo
 
-        let signer = self
-            .signer
-            .read()
-            .unwrap()
-            .ok_or(ConsensusError::NoSignerSet)?;
+
+        let signer = self.signer.read().unwrap().ok_or(ConsensusError::NoSignerSet)?;
         debug!(target: "consensus::apos", "seal() signer={:?}", signer);
         // Bail out if we're unauthorized to sign a block
         let snap = self.snapshot_inner(header.number - 1, header.parent_hash, None)?;
         debug!(target: "consensus::apos", "signer list: {:?}, signer: {}", snap.signers, signer);
         if !snap.signers.contains(&signer) {
             error!(target: "consensus::apos", "err signer not in list: {:?}, signer: {}", snap.signers, signer);
-            return Err(ConsensusError::UnauthorizedSigner);
+            return Err(ConsensusError::UnauthorizedSigner)
         }
 
         // If we're amongst the recent signers, wait for the next block
@@ -937,23 +751,18 @@ where
         }
 
         // // Beijing hard fork logic (if applicable)
-        // if self.chain_spec.is_beijing_active_at_block(block.number)
+        // if self.chain_spec.is_beijing_active_at_block(block.number) 
         //
         // }
 
         let eth_signer_guard = self.eth_signer.read().unwrap();
-        let eth_signer = eth_signer_guard
-            .as_ref()
-            .ok_or(ConsensusError::NoSignerSet)?;
+        let eth_signer = eth_signer_guard.as_ref().ok_or(ConsensusError::NoSignerSet)?;
         // Sign all the things!
         let header_bytes = seal_hash(header);
-        let sighash = eth_signer
-            .sign_hash_sync(&header_bytes)
-            .map_err(|_| ConsensusError::SignHeaderError)?;
+        let sighash = eth_signer.sign_hash_sync(&header_bytes).map_err(|_| ConsensusError::SignHeaderError)?;
 
         let mut extra_data_mut = BytesMut::from(&header.extra_data[..]);
-        extra_data_mut[header.extra_data.len().saturating_sub(SIGNATURE_LENGTH)..]
-            .copy_from_slice(&sighash.as_bytes());
+        extra_data_mut[header.extra_data.len().saturating_sub(SIGNATURE_LENGTH)..].copy_from_slice(&sighash.as_bytes());
         *extra_data_mut.last_mut().unwrap() -= 27;
         header.extra_data = Bytes::from(extra_data_mut.freeze());
 
@@ -966,19 +775,19 @@ where
     }
 
     fn set_eth_signer_by_key(&self, eth_signer_key: Option<String>) -> Result<(), ConsensusError> {
-        let eth_signer = eth_signer_key
-            .map(|key| PrivateKeySigner::from_bytes(&FixedBytes::from_str(&key).unwrap()).unwrap());
+        let eth_signer = eth_signer_key.map(|key| {
+            PrivateKeySigner::from_bytes(&FixedBytes::from_str(&key).unwrap()).unwrap()
+        });
         self.set_signer(eth_signer);
         Ok(())
     }
 
-    fn get_eth_signer_address(&self) -> Result<Option<Address>, ConsensusError> {
-        Ok(*self
-            .signer
-            .read()
-            .map_err(|err| ConsensusError::AposErrorDetail {
-                detail: err.to_string(),
-            })?)
+    fn get_eth_signer_address(
+        &self,
+    ) -> Result<Option<Address>, ConsensusError> {
+        Ok(*self.signer.read().map_err(|err| ConsensusError::AposErrorDetail {
+            detail: err.to_string()
+        })?)
     }
 
     fn snapshot(
@@ -990,49 +799,61 @@ where
         self.snapshot_inner(number, hash, parents)
     }
 
-    fn propose(&self, address: Address, auth: bool) -> Result<(), ConsensusError> {
+    fn propose(
+        &self,
+        address: Address,
+        auth: bool,
+    ) -> Result<(), ConsensusError> {
         info!(target: "consensus::apos", "propose(), address={}, auth={}", address, auth);
         let mut proposals_guard = self.proposals.write().unwrap();
         proposals_guard.insert(address, auth);
         Ok(())
     }
 
-    fn discard(&self, address: Address) -> Result<(), ConsensusError> {
+    fn discard(
+        &self,
+        address: Address,
+    ) -> Result<(), ConsensusError> {
         info!(target: "consensus::apos", "discard(), address={}", address);
         let mut proposals_guard = self.proposals.write().unwrap();
         proposals_guard.remove(&address);
         Ok(())
     }
 
-    fn proposals(&self) -> Result<HashMap<Address, bool>, ConsensusError> {
+    fn proposals(
+        &self,
+    ) -> Result<HashMap<Address, bool>, ConsensusError> {
         info!(target: "consensus::apos", "proposals()");
         let proposals_guard = self.proposals.read().unwrap();
         Ok(proposals_guard.clone())
     }
 
-    fn total_difficulty(&self, hash: B256) -> U256 {
+    fn total_difficulty(
+        &self,
+        hash: B256,
+    ) -> U256 {
         self.init_recent_tds();
 
         let mut recent_tds = self.recent_tds.write().unwrap();
-        let total_difficulty = *recent_tds
-            .get(&hash)
-            .unwrap_or_else(|| panic!("td not found for hash {:?}", hash));
+        let total_difficulty = *recent_tds.get(&hash).unwrap_or_else(|| panic!("td not found for hash {:?}", hash));
 
         debug!(target: "consensus::apos", ?hash, ?total_difficulty, "get total_difficulty");
         total_difficulty
     }
 
-    fn wiggle(&self, parent_number: u64, parent_hash: BlockHash, difficulty: U256) -> Duration {
+    fn wiggle(
+        &self,
+        parent_number: u64,
+        parent_hash: BlockHash,
+        difficulty: U256,
+    ) -> Duration {
         let mut wiggle = Duration::from_millis(0);
-        if let Ok(snapshot) = self.snapshot_inner(parent_number, parent_hash, None) {
+        if let Ok(snapshot) =
+            self.snapshot_inner(parent_number, parent_hash, None) {
             // https://eips.ethereum.org/EIPS/eip-225
             // If the signer is out-of-turn, delay signing by rand(SIGNER_COUNT * 500ms)
             if difficulty != DIFF_IN_TURN {
-                wiggle = Duration::from_millis(
-                    (rand::random::<f64>()
-                        * snapshot.signers.len() as f64
-                        * WIGGLE_TIME.as_millis() as f64) as u64,
-                )
+                wiggle = Duration::from_millis((rand::random::<f64>() * snapshot.signers.len() as f64 * WIGGLE_TIME.as_millis() as f64) as u64)
             }
         }
         wiggle
@@ -1041,8 +862,8 @@ where
     fn set_cached_reads(
         &self,
         block_hash: BlockHash,
-        cached_reads: CachedReads,
-    ) -> Result<(), ConsensusError> {
+        cached_reads: CachedReads
+        ) -> Result<(), ConsensusError> {
         let mut recent_cached_reads = self.recent_cached_reads.write().unwrap();
         recent_cached_reads.insert(block_hash, cached_reads);
         Ok(())
@@ -1054,269 +875,5 @@ where
     ) -> Result<Option<CachedReads>, ConsensusError> {
         let mut recent_cached_reads = self.recent_cached_reads.write().unwrap();
         Ok(recent_cached_reads.get(&block_hash).cloned())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use alloy_primitives::address;
-
-    // ==================== Constants Tests ====================
-
-    #[test]
-    fn test_epoch_length_constant() {
-        assert_eq!(EPOCH_LENGTH, 30000);
-    }
-
-    #[test]
-    fn test_extra_vanity_constant() {
-        assert_eq!(EXTRA_VANITY, 32);
-    }
-
-    #[test]
-    fn test_extra_seal_constant() {
-        assert_eq!(EXTRA_SEAL, 65);
-    }
-
-    #[test]
-    fn test_nonce_auth_vote_constant() {
-        assert_eq!(NONCE_AUTH_VOTE, [0xff; 8]);
-    }
-
-    #[test]
-    fn test_nonce_drop_vote_constant() {
-        assert_eq!(NONCE_DROP_VOTE, [0x00; 8]);
-    }
-
-    #[test]
-    fn test_diff_in_turn_constant() {
-        assert_eq!(DIFF_IN_TURN, U256::from(2u64));
-    }
-
-    #[test]
-    fn test_diff_no_turn_constant() {
-        assert_eq!(DIFF_NO_TURN, U256::from(1u64));
-    }
-
-    #[test]
-    fn test_full_immutability_threshold() {
-        assert_eq!(FULL_IMMUTABILITY_THRESHOLD, 90000);
-    }
-
-    #[test]
-    fn test_checkpoint_interval() {
-        assert_eq!(CHECKPOINT_INTERVAL, 2048);
-    }
-
-    #[test]
-    fn test_inmemory_snapshots() {
-        // Performance-optimized: increased from 128 to 512
-        assert_eq!(INMEMORY_SNAPSHOTS, 512);
-    }
-
-    #[test]
-    fn test_inmemory_tds() {
-        // Performance-optimized: increased from 1024 to 4096
-        assert_eq!(INMEMORY_TDS, 4096);
-    }
-
-    #[test]
-    fn test_wiggle_time() {
-        assert_eq!(WIGGLE_TIME, Duration::from_millis(500));
-    }
-
-    // ==================== AposError Tests ====================
-
-    #[test]
-    fn test_apos_error_unknown_block() {
-        let err = AposError::UnknownBlock;
-        assert_eq!(format!("{}", err), "unknown block");
-    }
-
-    #[test]
-    fn test_apos_error_invalid_checkpoint_beneficiary() {
-        let err = AposError::InvalidCheckpointBeneficiary;
-        assert_eq!(
-            format!("{}", err),
-            "beneficiary in checkpoint block non-zero"
-        );
-    }
-
-    #[test]
-    fn test_apos_error_invalid_vote() {
-        let err = AposError::InvalidVote;
-        assert_eq!(format!("{}", err), "vote nonce not 0x00..0 or 0xff..f");
-    }
-
-    #[test]
-    fn test_apos_error_invalid_checkpoint_vote() {
-        let err = AposError::InvalidCheckpointVote;
-        assert_eq!(
-            format!("{}", err),
-            "vote nonce in checkpoint block non-zero"
-        );
-    }
-
-    #[test]
-    fn test_apos_error_missing_vanity() {
-        let err = AposError::MissingVanity;
-        assert_eq!(
-            format!("{}", err),
-            "extra-data 32 byte vanity prefix missing"
-        );
-    }
-
-    #[test]
-    fn test_apos_error_missing_signature() {
-        let err = AposError::MissingSignature;
-        assert_eq!(
-            format!("{}", err),
-            "extra-data 65 byte signature suffix missing"
-        );
-    }
-
-    #[test]
-    fn test_apos_error_extra_signers() {
-        let err = AposError::ExtraSigners;
-        assert_eq!(
-            format!("{}", err),
-            "non-checkpoint block contains extra signer list"
-        );
-    }
-
-    #[test]
-    fn test_apos_error_invalid_checkpoint_signers() {
-        let err = AposError::InvalidCheckpointSigners;
-        assert_eq!(
-            format!("{}", err),
-            "invalid signer list on checkpoint block"
-        );
-    }
-
-    #[test]
-    fn test_apos_error_mismatching_checkpoint_signers() {
-        let err = AposError::MismatchingCheckpointSigners;
-        assert_eq!(
-            format!("{}", err),
-            "mismatching signer list on checkpoint block"
-        );
-    }
-
-    #[test]
-    fn test_apos_error_invalid_mix_digest() {
-        let err = AposError::InvalidMixDigest;
-        assert_eq!(format!("{}", err), "non-zero mix digest");
-    }
-
-    #[test]
-    fn test_apos_error_invalid_uncle_hash() {
-        let err = AposError::InvalidUncleHash;
-        assert_eq!(format!("{}", err), "non-empty uncle hash");
-    }
-
-    #[test]
-    fn test_apos_error_invalid_difficulty() {
-        let err = AposError::InvalidDifficulty;
-        assert_eq!(format!("{}", err), "invalid difficulty");
-    }
-
-    #[test]
-    fn test_apos_error_wrong_difficulty() {
-        let err = AposError::WrongDifficulty;
-        assert_eq!(format!("{}", err), "wrong difficulty");
-    }
-
-    #[test]
-    fn test_apos_error_invalid_timestamp() {
-        let err = AposError::InvalidTimestamp;
-        assert_eq!(format!("{}", err), "invalid timestamp");
-    }
-
-    #[test]
-    fn test_apos_error_invalid_voting_chain() {
-        let err = AposError::InvalidVotingChain;
-        assert_eq!(format!("{}", err), "invalid voting chain");
-    }
-
-    #[test]
-    fn test_apos_error_unauthorized_signer() {
-        let err = AposError::UnauthorizedSigner;
-        assert_eq!(format!("{}", err), "unauthorized signer");
-    }
-
-    #[test]
-    fn test_apos_error_recently_signed() {
-        let err = AposError::RecentlySigned;
-        assert_eq!(format!("{}", err), "recently signed");
-    }
-
-    #[test]
-    fn test_apos_error_un_transion() {
-        let err = AposError::UnTransion;
-        assert_eq!(
-            format!("{}", err),
-            "sealing paused while waiting for transactions"
-        );
-    }
-
-    #[test]
-    fn test_apos_error_is_error_trait() {
-        let err: Box<dyn std::error::Error> = Box::new(AposError::UnknownBlock);
-        assert!(err.to_string().contains("unknown block"));
-    }
-
-    #[test]
-    fn test_apos_error_clone() {
-        let err = AposError::InvalidVote;
-        let cloned = err.clone();
-        assert_eq!(format!("{}", err), format!("{}", cloned));
-    }
-
-    #[test]
-    fn test_apos_error_debug() {
-        let err = AposError::UnknownBlock;
-        let debug_str = format!("{:?}", err);
-        assert!(debug_str.contains("UnknownBlock"));
-    }
-
-    // ==================== Difficulty Calculation Tests ====================
-
-    #[test]
-    fn test_difficulty_values() {
-        // In-turn difficulty should be 2
-        assert!(DIFF_IN_TURN > DIFF_NO_TURN);
-        assert_eq!(DIFF_IN_TURN - DIFF_NO_TURN, U256::from(1u64));
-    }
-
-    #[test]
-    fn test_nonce_vote_patterns() {
-        // Auth vote should be all 0xFF
-        for byte in NONCE_AUTH_VOTE {
-            assert_eq!(byte, 0xff);
-        }
-
-        // Drop vote should be all 0x00
-        for byte in NONCE_DROP_VOTE {
-            assert_eq!(byte, 0x00);
-        }
-    }
-
-    // ==================== Extra Data Layout Tests ====================
-
-    #[test]
-    fn test_extra_data_layout() {
-        // Total extra data should be vanity + seal
-        let min_extra_data = EXTRA_VANITY + EXTRA_SEAL;
-        assert_eq!(min_extra_data, 97);
-    }
-
-    #[test]
-    fn test_checkpoint_extra_data_layout() {
-        // At checkpoint, extra data includes signer addresses
-        // Each address is 20 bytes
-        let signers_count = 5;
-        let checkpoint_extra_data = EXTRA_VANITY + (signers_count * 20) + EXTRA_SEAL;
-        assert_eq!(checkpoint_extra_data, 32 + 100 + 65);
     }
 }

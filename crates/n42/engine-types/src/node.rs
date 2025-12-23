@@ -16,14 +16,14 @@ use reth_node_ethereum::{EthEngineTypes, EthEvmConfig};
 use crate::consensus::N42ConsensusBuilder;
 use crate::network::N42NetworkBuilder;
 //use crate::{N42EngineTypes, N42NodeAddOns, N42PayloadServiceBuilder};
-use crate::{EthereumPayloadBuilderWrapper, N42PayloadServiceBuilder};
+use crate::N42PayloadServiceBuilder;
 use reth_ethereum_engine_primitives::{
     EthBuiltPayload, EthPayloadAttributes, EthPayloadBuilderAttributes,
 };
 use reth_ethereum_primitives::{EthPrimitives, PooledTransaction, TransactionSigned};
 use reth_evm::{ConfigureEvm, EvmFactory, EvmFactoryFor, NextBlockEnvAttributes};
 use reth_network::{EthNetworkPrimitives, NetworkHandle, PeersInfo};
-use reth_node_api::{AddOnsContext, FullNodeComponents, NodeAddOns, NodePrimitives, TxTy};
+use reth_node_api::{AddOnsContext, FullNodeComponents, NodeAddOns, NodePrimitives, PrimitivesTy, TxTy};
 use reth_node_builder::{
     components::{
         BasicPayloadServiceBuilder, ComponentsBuilder, ConsensusBuilder, ExecutorBuilder,
@@ -62,7 +62,7 @@ impl N42Node {
     pub fn components<Node>() -> ComponentsBuilder<
         Node,
         EthereumPoolBuilder,
-        N42PayloadServiceBuilder<EthereumPayloadBuilderWrapper>,
+        N42PayloadServiceBuilder<N42ConsensusBuilder>,
         N42NetworkBuilder,
         EthereumExecutorBuilder,
         N42ConsensusBuilder,
@@ -80,7 +80,7 @@ impl N42Node {
             .pool(EthereumPoolBuilder::default())
             .executor(EthereumExecutorBuilder::default())
             .consensus(N42ConsensusBuilder::default())
-            .payload(N42PayloadServiceBuilder::default())
+            .payload(N42PayloadServiceBuilder::new(N42ConsensusBuilder::default()))
             .network(N42NetworkBuilder::default())
     }
 
@@ -208,8 +208,8 @@ where
         );
 
         self.inner
-            .launch_add_ons_with(ctx, move |modules, _, _| {
-                modules.merge_if_module_configured(
+            .launch_add_ons_with(ctx, move |container| {
+                container.modules.merge_if_module_configured(
                     RethRpcModule::Flashbots,
                     validation_api.into_rpc(),
                 )?;
@@ -265,7 +265,7 @@ where
     type ComponentsBuilder = ComponentsBuilder<
         N,
         EthereumPoolBuilder,
-        N42PayloadServiceBuilder<EthereumPayloadBuilderWrapper>,
+        N42PayloadServiceBuilder<N42ConsensusBuilder>,
         N42NetworkBuilder,
         EthereumExecutorBuilder,
         N42ConsensusBuilder,
@@ -441,7 +441,7 @@ where
     }
 }
 
-/// A basic ethereum payload service.
+/// A basic ethereum network builder.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct EthereumNetworkBuilder {
     // TODO add closure to modify network
@@ -449,13 +449,12 @@ pub struct EthereumNetworkBuilder {
 
 impl<Node, Pool> NetworkBuilder<Node, Pool> for EthereumNetworkBuilder
 where
-    Node: FullNodeTypes<Types: NodeTypes<ChainSpec = ChainSpec, Primitives = EthPrimitives>>,
-    Pool: TransactionPool<
-            Transaction: PoolTransaction<Consensus = TxTy<Node::Types>, Pooled = PooledTransaction>,
-        > + Unpin
+    Node: FullNodeTypes<Types: NodeTypes<ChainSpec: reth_chainspec::Hardforks>>,
+    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TxTy<Node::Types>>>
+        + Unpin
         + 'static,
 {
-    type Network = NetworkHandle<EthNetworkPrimitives>;
+    type Network = NetworkHandle<reth_eth_wire_types::BasicNetworkPrimitives<PrimitivesTy<Node::Types>, reth_transaction_pool::PoolPooledTx<Pool>>>;
 
     async fn build_network(
         self,

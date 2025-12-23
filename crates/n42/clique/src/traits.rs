@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use std::fmt::{Debug, Formatter};
 use std::time::{SystemTime};
 use reth_consensus::{Consensus, ConsensusError};
@@ -11,4 +8,5 @@ use reth_primitives::{
 use alloy_primitives::{U256};
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_evm::provider::EvmEnvProvider;
-use reth_storage_api::{BlockReader, HeaderProvider, SnapshotProvider, SnapshotProviderWriter, StateProviderFactory};
+use reth_storage_api::{BlockReader, HeaderProvider, StateProviderFactory};
+

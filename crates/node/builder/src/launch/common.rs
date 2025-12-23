@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! Helper types that can be used by launchers.
 
 use crate::{
@@ -8,11 +5,12 @@ use crate::{
     hooks::OnComponentInitializedHook,
     BuilderContext, NodeAdapter,
 };
+use alloy_consensus::BlockHeader as _;
 use alloy_eips::eip2124::Head;
 use alloy_primitives::{BlockNumber, B256};
 use eyre::{Context, OptionExt};
 use rayon::ThreadPoolBuilder;
-use reth_chainspec::{Chain, EthChainSpec, EthereumHardforks};
+use reth_chainspec::{Chain, EthChainSpec, EthereumHardfork, EthereumHardforks};
 use reth_config::{config::EtlConfig, PruneConfig};
 use reth_consensus::noop::NoopConsensus;
 use reth_db_api::{database::Database, database_metrics::DatabaseMetrics};
@@ -44,8 +42,9 @@ use reth_node_metrics::{
 };
 use reth_provider::{
     providers::{NodeTypesForProvider, ProviderNodeTypes, StaticFileProvider},
-    BlockHashReader, BlockNumReader, ChainSpecProvider, ProviderError, ProviderFactory,
-    ProviderResult, StageCheckpointReader, StateProviderFactory, StaticFileProviderFactory,
+    BlockHashReader, BlockNumReader, BlockReaderIdExt, ChainSpecProvider, ProviderError,
+    ProviderFactory, ProviderResult, StageCheckpointReader, StateProviderFactory,
+    StaticFileProviderFactory,
 };
 use reth_prune::{PruneModes, PrunerBuilder};
 use reth_rpc_api::clients::EthApiClient;
@@ -76,47 +75,41 @@ pub struct LaunchContext {
 impl LaunchContext {
     /// Create a new instance of the default node launcher.
     pub const fn new(task_executor: TaskExecutor, data_dir: ChainPath<DataDirPath>) -> Self {
-        Self {
-            task_executor,
-            data_dir,
-        }
+        Self { task_executor, data_dir }
     }
 
     /// Create launch context with attachment.
     pub const fn with<T>(self, attachment: T) -> LaunchContextWith<T> {
-        LaunchContextWith {
-            inner: self,
-            attachment,
-        }
+        LaunchContextWith { inner: self, attachment }
     }
 
     /// Loads the reth config with the configured `data_dir` and overrides settings according to the
     /// `config`.
     ///
     /// Attaches both the `NodeConfig` and the loaded `reth.toml` config to the launch context.
-    pub fn with_loaded_toml_config<ChainSpec: EthChainSpec>(
+    pub fn with_loaded_toml_config<ChainSpec>(
         self,
         config: NodeConfig<ChainSpec>,
-    ) -> eyre::Result<LaunchContextWith<WithConfigs<ChainSpec>>> {
+    ) -> eyre::Result<LaunchContextWith<WithConfigs<ChainSpec>>>
+    where
+        ChainSpec: EthChainSpec + reth_chainspec::EthereumHardforks,
+    {
         let toml_config = self.load_toml_config(&config)?;
-        Ok(self.with(WithConfigs {
-            config,
-            toml_config,
-        }))
+        Ok(self.with(WithConfigs { config, toml_config }))
     }
 
     /// Loads the reth config with the configured `data_dir` and overrides settings according to the
     /// `config`.
     ///
     /// This is async because the trusted peers may have to be resolved.
-    pub fn load_toml_config<ChainSpec: EthChainSpec>(
+    pub fn load_toml_config<ChainSpec>(
         &self,
         config: &NodeConfig<ChainSpec>,
-    ) -> eyre::Result<reth_config::Config> {
-        let config_path = config
-            .config
-            .clone()
-            .unwrap_or_else(|| self.data_dir.config());
+    ) -> eyre::Result<reth_config::Config>
+    where
+        ChainSpec: EthChainSpec + reth_chainspec::EthereumHardforks,
+    {
+        let config_path = config.config.clone().unwrap_or_else(|| self.data_dir.config());
 
         let mut toml_config = reth_config::Config::from_path(&config_path)
             .wrap_err_with(|| format!("Could not load config file {config_path:?}"))?;
@@ -132,11 +125,14 @@ impl LaunchContext {
     }
 
     /// Save prune config to the toml file if node is a full node.
-    fn save_pruning_config_if_full_node<ChainSpec: EthChainSpec>(
+    fn save_pruning_config_if_full_node<ChainSpec>(
         reth_config: &mut reth_config::Config,
         config: &NodeConfig<ChainSpec>,
         config_path: impl AsRef<std::path::Path>,
-    ) -> eyre::Result<()> {
+    ) -> eyre::Result<()>
+    where
+        ChainSpec: EthChainSpec + reth_chainspec::EthereumHardforks,
+    {
         if reth_config.prune.is_none() {
             if let Some(prune_config) = config.prune_config() {
                 reth_config.update_prune_config(prune_config);
@@ -206,8 +202,7 @@ impl<T> LaunchContextWith<T> {
     /// - Raising the file descriptor limit
     /// - Configuring the global rayon thread pool
     pub fn configure_globals(&self, reserved_cpu_cores: u64) {
-        self.inner
-            .configure_globals(reserved_cpu_cores.try_into().unwrap());
+        self.inner.configure_globals(reserved_cpu_cores.try_into().unwrap());
     }
 
     /// Returns the data directory.
@@ -289,8 +284,14 @@ impl<R, ChainSpec: EthChainSpec> LaunchContextWith<Attached<WithConfigs<ChainSpe
     /// Make sure ETL doesn't default to /tmp/, but to whatever datadir is set to
     pub fn ensure_etl_datadir(mut self) -> Self {
         if self.toml_config_mut().stages.etl.dir.is_none() {
-            self.toml_config_mut().stages.etl.dir =
-                Some(EtlConfig::from_datadir(self.data_dir().data_dir()))
+            let etl_path = EtlConfig::from_datadir(self.data_dir().data_dir());
+            if etl_path.exists() {
+                // Remove etl-path files on launch
+                if let Err(err) = fs::remove_dir_all(&etl_path) {
+                    warn!(target: "reth::cli", ?etl_path, %err, "Failed to remove ETL path on launch");
+                }
+            }
+            self.toml_config_mut().stages.etl.dir = Some(etl_path);
         }
 
         self
@@ -350,7 +351,10 @@ impl<R, ChainSpec: EthChainSpec> LaunchContextWith<Attached<WithConfigs<ChainSpe
     /// Returns the configured [`PruneConfig`]
     ///
     /// Any configuration set in CLI will take precedence over those set in toml
-    pub fn prune_config(&self) -> Option<PruneConfig> {
+    pub fn prune_config(&self) -> Option<PruneConfig>
+    where
+        ChainSpec: reth_chainspec::EthereumHardforks,
+    {
         let Some(mut node_prune_config) = self.node_config().prune_config() else {
             // No CLI config is set, use the toml config.
             return self.toml_config().prune.clone();
@@ -362,14 +366,18 @@ impl<R, ChainSpec: EthChainSpec> LaunchContextWith<Attached<WithConfigs<ChainSpe
     }
 
     /// Returns the configured [`PruneModes`], returning the default if no config was available.
-    pub fn prune_modes(&self) -> PruneModes {
-        self.prune_config()
-            .map(|config| config.segments)
-            .unwrap_or_default()
+    pub fn prune_modes(&self) -> PruneModes
+    where
+        ChainSpec: reth_chainspec::EthereumHardforks,
+    {
+        self.prune_config().map(|config| config.segments).unwrap_or_default()
     }
 
     /// Returns an initialized [`PrunerBuilder`] based on the configured [`PruneConfig`]
-    pub fn pruner_builder(&self) -> PrunerBuilder {
+    pub fn pruner_builder(&self) -> PrunerBuilder
+    where
+        ChainSpec: reth_chainspec::EthereumHardforks,
+    {
         PrunerBuilder::new(self.prune_config().unwrap_or_default())
             .delete_limit(self.chain_spec().prune_delete_limit())
             .timeout(PrunerBuilder::DEFAULT_TIMEOUT)
@@ -413,11 +421,8 @@ where
         .with_prune_modes(self.prune_modes())
         .with_static_files_metrics();
 
-        let has_receipt_pruning = self
-            .toml_config()
-            .prune
-            .as_ref()
-            .is_some_and(|a| a.has_receipts_pruning());
+        let has_receipt_pruning =
+            self.toml_config().prune.as_ref().is_some_and(|a| a.has_receipts_pruning());
 
         // Check for consistency between database and static files. If it fails, it unwinds to
         // the first block that's consistent between database and static files.
@@ -448,6 +453,7 @@ where
                     NoopEvmConfig::<Evm>::default(),
                     self.toml_config().stages.clone(),
                     self.prune_modes(),
+                    None,
                 ))
                 .build(
                     factory.clone(),
@@ -581,15 +587,12 @@ where
     ) -> LaunchContextWith<Attached<WithConfigs<T::ChainSpec>, WithMeteredProvider<T>>> {
         let (metrics_sender, metrics_receiver) = unbounded_channel();
 
-        let with_metrics = WithMeteredProvider {
-            provider_factory: self.right().clone(),
-            metrics_sender,
-        };
+        let with_metrics =
+            WithMeteredProvider { provider_factory: self.right().clone(), metrics_sender };
 
         debug!(target: "reth::cli", "Spawning stages metrics listener task");
         let sync_metrics_listener = reth_stages::MetricsListener::new(metrics_receiver);
-        self.task_executor()
-            .spawn_critical("stages metrics listener task", sync_metrics_listener);
+        self.task_executor().spawn_critical("stages metrics listener task", sync_metrics_listener);
 
         LaunchContextWith {
             inner: self.inner,
@@ -761,9 +764,7 @@ where
     where
         C: HeadersClient<Header: BlockHeader>,
     {
-        self.node_config()
-            .max_block(client, self.provider_factory().clone())
-            .await
+        self.node_config().max_block(client, self.provider_factory().clone()).await
     }
 
     /// Returns the static file provider to interact with the static files.
@@ -827,9 +828,9 @@ where
     /// This checks for OP-Mainnet and ensures we have all the necessary data to progress (past
     /// bedrock height)
     fn ensure_chain_specific_db_checks(&self) -> ProviderResult<()> {
-        if self.chain_spec().is_optimism()
-            && !self.is_dev()
-            && self.chain_id() == Chain::optimism_mainnet()
+        if self.chain_spec().is_optimism() &&
+            !self.is_dev() &&
+            self.chain_id() == Chain::optimism_mainnet()
         {
             let latest = self.blockchain_db().last_block_number()?;
             // bedrock height
@@ -837,7 +838,7 @@ where
                 error!(
                     "Op-mainnet has been launched without importing the pre-Bedrock state. The chain can't progress without this. See also https://reth.rs/run/sync-op-mainnet.html?minimal-bootstrap-recommended"
                 );
-                return Err(ProviderError::BestBlockNotFound);
+                return Err(ProviderError::BestBlockNotFound)
             }
         }
 
@@ -892,6 +893,36 @@ where
         Ok(None)
     }
 
+    /// Expire the pre-merge transactions if the node is configured to do so and the chain has a
+    /// merge block.
+    ///
+    /// If the node is configured to prune pre-merge transactions and it has synced past the merge
+    /// block, it will delete the pre-merge transaction static files if they still exist.
+    pub fn expire_pre_merge_transactions(&self) -> eyre::Result<()>
+    where
+        T: FullNodeTypes<Provider: StaticFileProviderFactory>,
+    {
+        if self.node_config().pruning.bodies_pre_merge {
+            if let Some(merge_block) =
+                self.chain_spec().ethereum_fork_activation(EthereumHardfork::Paris).block_number()
+            {
+                // Ensure we only expire transactions after we synced past the merge block.
+                let Some(latest) = self.blockchain_db().latest_header()? else { return Ok(()) };
+                if latest.number() > merge_block {
+                    let provider = self.blockchain_db().static_file_provider();
+                    if provider.get_lowest_transaction_static_file_block() < Some(merge_block) {
+                        info!(target: "reth::cli", merge_block, "Expiring pre-merge transactions");
+                        provider.delete_transactions_below(merge_block)?;
+                    } else {
+                        debug!(target: "reth::cli", merge_block, "No pre-merge transactions to expire");
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Returns the metrics sender.
     pub fn sync_metrics_tx(&self) -> UnboundedSender<MetricEvent> {
         self.right().db_provider_container.metrics_sender.clone()
@@ -919,7 +950,7 @@ where
         &self,
     ) -> eyre::Result<Box<dyn InvalidBlockHook<<T::Types as NodeTypes>::Primitives>>> {
         let Some(ref hook) = self.node_config().debug.invalid_block_hook else {
-            return Ok(Box::new(NoopInvalidBlockHook::default()));
+            return Ok(Box::new(NoopInvalidBlockHook::default()))
         };
         let healthy_node_rpc_client = self.get_healthy_node_client()?;
 
@@ -960,6 +991,7 @@ where
                 // Verify that the healthy node is running the same chain as the current node.
                 let chain_id = futures::executor::block_on(async {
                     EthApiClient::<
+                        alloy_rpc_types::TransactionRequest,
                         alloy_rpc_types::Transaction,
                         alloy_rpc_types::Block,
                         alloy_rpc_types::Receipt,
@@ -1040,10 +1072,7 @@ pub struct WithConfigs<ChainSpec> {
 
 impl<ChainSpec> Clone for WithConfigs<ChainSpec> {
     fn clone(&self) -> Self {
-        Self {
-            config: self.config.clone(),
-            toml_config: self.toml_config.clone(),
-        }
+        Self { config: self.config.clone(), toml_config: self.toml_config.clone() }
     }
 }
 
@@ -1116,7 +1145,10 @@ mod tests {
                     storage_history_full: false,
                     storage_history_distance: None,
                     storage_history_before: None,
+                    bodies_pre_merge: false,
+                    bodies_distance: None,
                     receipts_log_filter: None,
+                    bodies_before: None,
                 },
                 ..NodeConfig::test()
             };

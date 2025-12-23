@@ -1,0 +1,806 @@
+diff -ruN reth-145/crates/storage/db-api/Cargo.toml /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/Cargo.toml
+--- reth-145/crates/storage/db-api/Cargo.toml	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/Cargo.toml	2025-12-20 01:41:12
+@@ -42,6 +42,9 @@
+ # misc
+ derive_more.workspace = true
+ bytes.workspace = true
++n42-primitives.workspace = true
++serde_json.workspace = true
++merkle_db_rs.workspace=true
+ 
+ # arbitrary utils
+ arbitrary = { workspace = true, features = ["derive"], optional = true }
+diff -ruN reth-145/crates/storage/db-api/src/common.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/common.rs
+--- reth-145/crates/storage/db-api/src/common.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/common.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use crate::{table::*, DatabaseError};
+ 
+ /// A key-value pair for table `T`.
+diff -ruN reth-145/crates/storage/db-api/src/cursor.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/cursor.rs
+--- reth-145/crates/storage/db-api/src/cursor.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/cursor.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use std::{
+     fmt,
+     ops::{Bound, RangeBounds},
+@@ -144,7 +147,10 @@
+     CURSOR: DbCursorRO<T> + fmt::Debug,
+ {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        f.debug_struct("Walker").field("cursor", &self.cursor).field("start", &self.start).finish()
++        f.debug_struct("Walker")
++            .field("cursor", &self.cursor)
++            .field("start", &self.start)
++            .finish()
+     }
+ }
+ 
+@@ -225,7 +231,7 @@
+     fn next(&mut self) -> Option<Self::Item> {
+         let start = self.start.take();
+         if start.is_some() {
+-            return start
++            return start;
+         }
+ 
+         self.cursor.prev().transpose()
+@@ -265,7 +271,7 @@
+ 
+     fn next(&mut self) -> Option<Self::Item> {
+         if self.is_done {
+-            return None
++            return None;
+         }
+ 
+         let next_item = self.start.take().or_else(|| self.cursor.next().transpose());
+@@ -306,7 +312,12 @@
+             None => true,
+             _ => false,
+         };
+-        Self { cursor, start, end_key, is_done }
++        Self {
++            cursor,
++            start,
++            end_key,
++            is_done,
++        }
+     }
+ }
+ 
+@@ -356,7 +367,7 @@
+     fn next(&mut self) -> Option<Self::Item> {
+         let start = self.start.take();
+         if start.is_some() {
+-            return start
++            return start;
+         }
+         self.cursor.next_dup().transpose()
+     }
+diff -ruN reth-145/crates/storage/db-api/src/database.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/database.rs
+--- reth-145/crates/storage/db-api/src/database.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/database.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use crate::{
+     table::TableImporter,
+     transaction::{DbTx, DbTxMut},
+diff -ruN reth-145/crates/storage/db-api/src/database_metrics.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/database_metrics.rs
+--- reth-145/crates/storage/db-api/src/database_metrics.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/database_metrics.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use metrics::{counter, gauge, histogram, Label};
+ use std::sync::Arc;
+ 
+diff -ruN reth-145/crates/storage/db-api/src/lib.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/lib.rs
+--- reth-145/crates/storage/db-api/src/lib.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/lib.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! reth's database abstraction layer.
+ //!
+ //! The database abstraction assumes that the underlying store is a KV store subdivided into tables.
+diff -ruN reth-145/crates/storage/db-api/src/mock.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/mock.rs
+--- reth-145/crates/storage/db-api/src/mock.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/mock.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Mock database
+ 
+ use crate::{
+@@ -212,7 +215,10 @@
+         _key: Option<<T>::Key>,
+         _subkey: Option<<T as DupSort>::SubKey>,
+     ) -> Result<DupWalker<'_, T, Self>, DatabaseError> {
+-        Ok(DupWalker { cursor: self, start: None })
++        Ok(DupWalker {
++            cursor: self,
++            start: None,
++        })
+     }
+ }
+ 
+diff -ruN reth-145/crates/storage/db-api/src/models/accounts.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/models/accounts.rs
+--- reth-145/crates/storage/db-api/src/models/accounts.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/models/accounts.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Account related models and types.
+ 
+ use std::ops::{Range, RangeInclusive};
+diff -ruN reth-145/crates/storage/db-api/src/models/beacon.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/models/beacon.rs
+--- reth-145/crates/storage/db-api/src/models/beacon.rs	1969-12-31 19:00:00
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/models/beacon.rs	2025-12-20 16:08:23
+@@ -0,0 +1,72 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
++use crate::{
++    table::{Compress, Decompress},
++    DatabaseError,
++};
++use bytes::{BufMut, BytesMut};
++use n42_primitives::{BeaconBlock, BeaconState};
++
++impl Decompress for BeaconState {
++    fn decompress(value: &[u8]) -> Result<Self, DatabaseError> {
++        serde_json::from_slice(value)
++            .map_err(|e| DatabaseError::Other(format!("serde_json deserialize error: {e}")))
++    }
++}
++
++impl Compress for BeaconState {
++    type Compressed = Vec<u8>;
++
++    fn compress_to_buf<B: BufMut + AsMut<[u8]>>(&self, buf: &mut B) {
++        let json_bytes =
++            serde_json::to_vec(self).expect("BeaconState serialization should not fail");
++        buf.put_slice(&json_bytes);
++    }
++}
++
++impl Compress for BeaconBlock {
++    type Compressed = Vec<u8>;
++
++    fn compress_to_buf<B: BufMut + AsMut<[u8]>>(&self, buf: &mut B) {
++        let json_bytes = serde_json::to_vec(self).expect("BeaconBlock serialization failed");
++        buf.put_slice(&json_bytes);
++    }
++}
++
++impl Decompress for BeaconBlock {
++    fn decompress(value: &[u8]) -> Result<Self, DatabaseError> {
++        serde_json::from_slice(value)
++            .map_err(|e| DatabaseError::Other(format!("Decompression failed: {}", e)))
++    }
++}
++
++impl<
++        T: merkle_db_rs::Value
++            + std::fmt::Debug
++            + std::marker::Sync
++            + std::marker::Send
++            + serde::de::DeserializeOwned,
++    > Decompress for merkle_db_rs::tree::Tree<T>
++{
++    fn decompress(value: &[u8]) -> Result<Self, DatabaseError> {
++        serde_json::from_slice(value)
++            .map_err(|e| DatabaseError::Other(format!("serde_json deserialize error: {e}")))
++    }
++}
++
++impl<
++        T: merkle_db_rs::Value
++            + std::fmt::Debug
++            + std::marker::Sync
++            + std::marker::Send
++            + serde::Serialize,
++    > Compress for merkle_db_rs::tree::Tree<T>
++{
++    type Compressed = Vec<u8>;
++
++    fn compress_to_buf<B: BufMut + AsMut<[u8]>>(&self, buf: &mut B) {
++        let json_bytes = serde_json::to_vec(self).expect("Tree serialization should not fail");
++        buf.put_slice(&json_bytes);
++    }
++}
+diff -ruN reth-145/crates/storage/db-api/src/models/blocks.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/models/blocks.rs
+--- reth-145/crates/storage/db-api/src/models/blocks.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/models/blocks.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Block related models and types.
+ 
+ use alloy_consensus::Header;
+@@ -47,7 +50,10 @@
+         let mut ommer = StoredBlockOmmers::default();
+         ommer.ommers.push(Header::default());
+         ommer.ommers.push(Header::default());
+-        assert_eq!(ommer.clone(), StoredBlockOmmers::decompress(&ommer.compress()).unwrap());
++        assert_eq!(
++            ommer.clone(),
++            StoredBlockOmmers::decompress(&ommer.compress()).unwrap()
++        );
+     }
+ 
+     #[test]
+diff -ruN reth-145/crates/storage/db-api/src/models/integer_list.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/models/integer_list.rs
+--- reth-145/crates/storage/db-api/src/models/integer_list.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/models/integer_list.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Implements [`Compress`] and [`Decompress`] for [`IntegerList`]
+ 
+ use crate::{
+@@ -57,12 +60,17 @@
+ 
+     /// Appends a list of integers to the current list.
+     pub fn append(&mut self, list: impl IntoIterator<Item = u64>) -> Result<u64, IntegerListError> {
+-        self.0.append(list).map_err(|_| IntegerListError::UnsortedInput)
++        self.0
++            .append(list)
++            .map_err(|_| IntegerListError::UnsortedInput)
+     }
+ 
+     /// Pushes a new integer to the list.
+     pub fn push(&mut self, value: u64) -> Result<(), IntegerListError> {
+-        self.0.push(value).then_some(()).ok_or(IntegerListError::UnsortedInput)
++        self.0
++            .push(value)
++            .then_some(())
++            .ok_or(IntegerListError::UnsortedInput)
+     }
+ 
+     /// Clears the list.
+@@ -73,7 +81,9 @@
+     /// Serializes a [`IntegerList`] into a sequence of bytes.
+     pub fn to_bytes(&self) -> Vec<u8> {
+         let mut vec = Vec::with_capacity(self.0.serialized_size());
+-        self.0.serialize_into(&mut vec).expect("not able to encode IntegerList");
++        self.0
++            .serialize_into(&mut vec)
++            .expect("not able to encode IntegerList");
+         vec
+     }
+ 
+diff -ruN reth-145/crates/storage/db-api/src/models/mod.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/models/mod.rs
+--- reth-145/crates/storage/db-api/src/models/mod.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/models/mod.rs	2025-12-23 02:14:49
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Implements data structures specific to the database
+ 
+ use crate::{
+@@ -15,11 +18,16 @@
+ use reth_trie_common::{StoredNibbles, StoredNibblesSubKey, *};
+ use serde::{Deserialize, Serialize};
+ 
++use n42_primitives::Snapshot;
++
+ pub mod accounts;
++mod beacon;
+ pub mod blocks;
+ pub mod integer_list;
+ pub mod sharded_key;
++mod snapshot;
+ pub mod storage_sharded_key;
++mod validator;
+ 
+ pub use accounts::*;
+ pub use blocks::*;
+@@ -99,7 +107,9 @@
+ 
+ impl Decode for B256 {
+     fn decode(value: &[u8]) -> Result<Self, DatabaseError> {
+-        Ok(Self::new(value.try_into().map_err(|_| DatabaseError::Decode)?))
++        Ok(Self::new(
++            value.try_into().map_err(|_| DatabaseError::Decode)?,
++        ))
+     }
+ }
+ 
+diff -ruN reth-145/crates/storage/db-api/src/models/sharded_key.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/models/sharded_key.rs
+--- reth-145/crates/storage/db-api/src/models/sharded_key.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/models/sharded_key.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Sharded key
+ use crate::{
+     table::{Decode, Encode},
+@@ -33,13 +36,19 @@
+ impl<T> ShardedKey<T> {
+     /// Creates a new `ShardedKey<T>`.
+     pub const fn new(key: T, highest_block_number: BlockNumber) -> Self {
+-        Self { key, highest_block_number }
++        Self {
++            key,
++            highest_block_number,
++        }
+     }
+ 
+     /// Creates a new key with the highest block number set to maximum.
+     /// This is useful when we want to search the last value for a given key.
+     pub const fn last(key: T) -> Self {
+-        Self { key, highest_block_number: u64::MAX }
++        Self {
++            key,
++            highest_block_number: u64::MAX,
++        }
+     }
+ }
+ 
+diff -ruN reth-145/crates/storage/db-api/src/models/snapshot.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/models/snapshot.rs
+--- reth-145/crates/storage/db-api/src/models/snapshot.rs	1969-12-31 19:00:00
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/models/snapshot.rs	2025-12-20 16:08:23
+@@ -0,0 +1,26 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
++//! Implements [`Compress`] and [`Decompress`] for [`Snapshot`]
++
++use crate::{
++    table::{Compress, Decompress},
++    DatabaseError,
++};
++use n42_primitives::Snapshot;
++
++impl Decompress for Snapshot {
++    fn decompress(value: &[u8]) -> Result<Self, DatabaseError> {
++        let bytes = value.as_ref();
++        let snapshot: Result<Snapshot, _> = serde_json::from_slice(bytes);
++        snapshot.map_err(|e| DatabaseError::Other(e.to_string()))
++    }
++}
++
++impl Compress for Snapshot {
++    type Compressed = Vec<u8>;
++    fn compress_to_buf<B: bytes::BufMut + AsMut<[u8]>>(&self, buf: &mut B) {
++        let serialized = serde_json::to_vec(&self).expect("Serialization should not fail");
++        buf.put_slice(&serialized);
++    }
++}
+diff -ruN reth-145/crates/storage/db-api/src/models/storage_sharded_key.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/models/storage_sharded_key.rs
+--- reth-145/crates/storage/db-api/src/models/storage_sharded_key.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/models/storage_sharded_key.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Storage sharded key
+ use crate::{
+     table::{Decode, Encode},
+@@ -40,7 +43,13 @@
+         storage_key: B256,
+         highest_block_number: BlockNumber,
+     ) -> Self {
+-        Self { address, sharded_key: ShardedKey { key: storage_key, highest_block_number } }
++        Self {
++            address,
++            sharded_key: ShardedKey {
++                key: storage_key,
++                highest_block_number,
++            },
++        }
+     }
+ 
+     /// Creates a new key with the highest block number set to maximum.
+@@ -48,7 +57,10 @@
+     pub const fn last(address: Address, storage_key: B256) -> Self {
+         Self {
+             address,
+-            sharded_key: ShardedKey { key: storage_key, highest_block_number: u64::MAX },
++            sharded_key: ShardedKey {
++                key: storage_key,
++                highest_block_number: u64::MAX,
++            },
+         }
+     }
+ }
+@@ -68,16 +80,21 @@
+ impl Decode for StorageShardedKey {
+     fn decode(value: &[u8]) -> Result<Self, DatabaseError> {
+         if value.len() != STORAGE_SHARD_KEY_BYTES_SIZE {
+-            return Err(DatabaseError::Decode)
++            return Err(DatabaseError::Decode);
+         }
+         let tx_num_index = value.len() - 8;
+ 
+         let highest_tx_number = u64::from_be_bytes(
+-            value[tx_num_index..].try_into().map_err(|_| DatabaseError::Decode)?,
++            value[tx_num_index..]
++                .try_into()
++                .map_err(|_| DatabaseError::Decode)?,
+         );
+         let address = Address::decode(&value[..20])?;
+         let storage_key = B256::decode(&value[20..52])?;
+ 
+-        Ok(Self { address, sharded_key: ShardedKey::new(storage_key, highest_tx_number) })
++        Ok(Self {
++            address,
++            sharded_key: ShardedKey::new(storage_key, highest_tx_number),
++        })
+     }
+ }
+diff -ruN reth-145/crates/storage/db-api/src/models/validator.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/models/validator.rs
+--- reth-145/crates/storage/db-api/src/models/validator.rs	1969-12-31 19:00:00
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/models/validator.rs	2025-12-20 16:08:23
+@@ -0,0 +1,50 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
++use crate::{
++    table::{Compress, Decompress},
++    DatabaseError,
++};
++use bytes::{BufMut, BytesMut};
++use n42_primitives::{Validator, ValidatorBeforeTx};
++
++impl Decompress for Validator {
++    fn decompress(value: &[u8]) -> Result<Self, DatabaseError> {
++        serde_json::from_slice(value).map_err(|_| DatabaseError::Decode)
++    }
++}
++impl Compress for Validator {
++    type Compressed = BytesMut;
++
++    fn compress(self) -> Self::Compressed {
++        let mut buf = BytesMut::new();
++        self.compress_to_buf(&mut buf);
++        buf
++    }
++
++    fn compress_to_buf<B: BufMut + AsMut<[u8]>>(&self, buf: &mut B) {
++        let serialized = serde_json::to_vec(&self).expect("Serialization should not fail");
++        buf.put(serialized.as_slice());
++    }
++}
++
++impl Decompress for ValidatorBeforeTx {
++    fn decompress(value: &[u8]) -> Result<Self, DatabaseError> {
++        serde_json::from_slice(value).map_err(|_| DatabaseError::Decode)
++    }
++}
++
++impl Compress for ValidatorBeforeTx {
++    type Compressed = BytesMut;
++
++    fn compress(self) -> Self::Compressed {
++        let mut buf = BytesMut::new();
++        self.compress_to_buf(&mut buf);
++        buf
++    }
++
++    fn compress_to_buf<B: BufMut + AsMut<[u8]>>(&self, buf: &mut B) {
++        let serialized = serde_json::to_vec(&self).expect("Serialization should not fail");
++        buf.put(serialized.as_slice());
++    }
++}
+diff -ruN reth-145/crates/storage/db-api/src/scale.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/scale.rs
+--- reth-145/crates/storage/db-api/src/scale.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/scale.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use crate::{
+     table::{Compress, Decompress},
+     DatabaseError,
+diff -ruN reth-145/crates/storage/db-api/src/table.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/table.rs
+--- reth-145/crates/storage/db-api/src/table.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/table.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use crate::{
+     cursor::{DbCursorRO, DbCursorRW, DbDupCursorRO, DbDupCursorRW},
+     transaction::{DbTx, DbTxMut},
+diff -ruN reth-145/crates/storage/db-api/src/tables/codecs/fuzz/inputs.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/tables/codecs/fuzz/inputs.rs
+--- reth-145/crates/storage/db-api/src/tables/codecs/fuzz/inputs.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/tables/codecs/fuzz/inputs.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Curates the input coming from the fuzzer for certain types.
+ 
+ use crate::models::IntegerList;
+diff -ruN reth-145/crates/storage/db-api/src/tables/codecs/fuzz/mod.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/tables/codecs/fuzz/mod.rs
+--- reth-145/crates/storage/db-api/src/tables/codecs/fuzz/mod.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/tables/codecs/fuzz/mod.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Implements fuzzing targets to be used by test-fuzz
+ 
+ mod inputs;
+diff -ruN reth-145/crates/storage/db-api/src/tables/codecs/mod.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/tables/codecs/mod.rs
+--- reth-145/crates/storage/db-api/src/tables/codecs/mod.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/tables/codecs/mod.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Integrates different codecs into `table::Encode` and `table::Decode`.
+ 
+ pub mod fuzz;
+diff -ruN reth-145/crates/storage/db-api/src/tables/mod.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/tables/mod.rs
+--- reth-145/crates/storage/db-api/src/tables/mod.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/tables/mod.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Tables and data models.
+ //!
+ //! # Overview
+@@ -28,6 +31,7 @@
+ };
+ use alloy_consensus::Header;
+ use alloy_primitives::{Address, BlockHash, BlockNumber, TxHash, TxNumber, B256};
++use n42_primitives::{BeaconBlock, BeaconState, Snapshot, Validator, ValidatorBeforeTx};
+ use reth_ethereum_primitives::{Receipt, TransactionSigned};
+ use reth_primitives_traits::{Account, Bytecode, StorageEntry};
+ use reth_prune_types::{PruneCheckpoint, PruneSegment};
+@@ -128,7 +132,9 @@
+             ///
+             #[doc = concat!("Marker type representing a database table mapping [`", stringify!($key), "`] to ", tables!(@value_doc $key, $value, $($($generic),*)?), ".")]
+             $(
+-                #[doc = concat!("\n\nThis table's `DUPSORT` subkey is [`", stringify!($subkey), "`].")]
++                #[doc = concat!("
++
++This table's `DUPSORT` subkey is [`", stringify!($subkey), "`].")]
+             )?
+             pub struct $name$(<$($generic $( = $default)?),*>)? {
+                 _private: std::marker::PhantomData<($($($generic,)*)?)>,
+@@ -300,6 +306,91 @@
+ }
+ 
+ tables! {
++    ///
++    table BeaconStateRecord{
++        type Key = BlockHash;
++        type Value = BeaconState;
++    }
++
++    ///
++    table BeaconBlockRecord{
++        type Key = BlockHash;
++        type Value = BeaconBlock;
++    }
++
++    ///
++    table BeaconNum2Hash{
++        type Key = BlockNumber;
++        type Value = BlockHash;
++    }
++
++    /// current
++    table PlainValidatorState{
++        type Key = Address;
++        type Value = Validator;
++    }
++
++    /// history
++    table ValidatorsHistory{
++        type Key = ShardedKey<Address>;
++        type Value = BlockNumberList;
++    }
++
++    /// changesets
++    table ValidatorChangeSets{
++        type Key = BlockNumber;
++        type Value = ValidatorBeforeTx;
++        type SubKey = Address;
++    }
++
++    /// apos snapshot
++    table Snapshots {
++        type Key = BlockNumber;
++        type Value = Snapshot;
++        }
++
++    /// Stores the snaphsot per hash
++    table SnapshotsByHash {
++        type Key = HeaderHash;
++        type Value = Snapshot;
++        }
++
++    /// Stores the signer per hash
++    table SignersByHash {
++        type Key = HeaderHash;
++        type Value = Address;
++    }
++
++    /// Stores the beacon block per hash
++    table BeaconBlocksByHash {
++        type Key = BlockHash;
++        type Value = BeaconBlock;
++        }
++
++    /// Stores the beacon state per hash
++    table BeaconStatesByHash {
++        type Key = BlockHash;
++        type Value = BeaconState;
++        }
++
++    /// Stores the beacon block hash per eth1 hash
++    table BeaconBlockHashesByEth1Hash {
++        type Key = BlockHash;
++        type Value = BlockHash;
++        }
++
++    /// Stores the Tree node per tree node hash for validator
++    table TreeByHashForValidator {
++        type Key = B256;
++        type Value = merkle_db_rs::tree::Tree<Validator>;
++        }
++
++    /// Stores the Tree node per tree node hash for u64
++    table TreeByHashForU64 {
++        type Key = B256;
++        type Value = merkle_db_rs::tree::Tree<u64>;
++        }
++
+     /// Stores the header hashes belonging to the canonical chain.
+     table CanonicalHeaders {
+         type Key = BlockNumber;
+diff -ruN reth-145/crates/storage/db-api/src/tables/raw.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/tables/raw.rs
+--- reth-145/crates/storage/db-api/src/tables/raw.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/tables/raw.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use crate::{
+     table::{Compress, Decode, Decompress, DupSort, Encode, Key, Table, Value},
+     DatabaseError,
+@@ -52,13 +55,19 @@
+ impl<K: Key> RawKey<K> {
+     /// Create new raw key.
+     pub fn new(key: K) -> Self {
+-        Self { key: K::encode(key).into(), _phantom: std::marker::PhantomData }
++        Self {
++            key: K::encode(key).into(),
++            _phantom: std::marker::PhantomData,
++        }
+     }
+ 
+     /// Creates a raw key from an existing `Vec`. Useful when we already have the encoded
+     /// key.
+     pub const fn from_vec(vec: Vec<u8>) -> Self {
+-        Self { key: vec, _phantom: std::marker::PhantomData }
++        Self {
++            key: vec,
++            _phantom: std::marker::PhantomData,
++        }
+     }
+ 
+     /// Returns the decoded value.
+@@ -101,11 +110,17 @@
+ // Decode
+ impl<K: Key> Decode for RawKey<K> {
+     fn decode(value: &[u8]) -> Result<Self, DatabaseError> {
+-        Ok(Self { key: value.to_vec(), _phantom: std::marker::PhantomData })
++        Ok(Self {
++            key: value.to_vec(),
++            _phantom: std::marker::PhantomData,
++        })
+     }
+ 
+     fn decode_owned(value: Vec<u8>) -> Result<Self, DatabaseError> {
+-        Ok(Self { key: value, _phantom: std::marker::PhantomData })
++        Ok(Self {
++            key: value,
++            _phantom: std::marker::PhantomData,
++        })
+     }
+ }
+ 
+@@ -121,13 +136,19 @@
+ impl<V: Value> RawValue<V> {
+     /// Create new raw value.
+     pub fn new(value: V) -> Self {
+-        Self { value: V::compress(value).into(), _phantom: std::marker::PhantomData }
++        Self {
++            value: V::compress(value).into(),
++            _phantom: std::marker::PhantomData,
++        }
+     }
+ 
+     /// Creates a raw value from an existing `Vec`. Useful when we already have the encoded
+     /// value.
+     pub const fn from_vec(vec: Vec<u8>) -> Self {
+-        Self { value: vec, _phantom: std::marker::PhantomData }
++        Self {
++            value: vec,
++            _phantom: std::marker::PhantomData,
++        }
+     }
+ 
+     /// Returns the decompressed value.
+@@ -177,10 +198,16 @@
+ 
+ impl<V: Value> Decompress for RawValue<V> {
+     fn decompress(value: &[u8]) -> Result<Self, DatabaseError> {
+-        Ok(Self { value: value.to_vec(), _phantom: std::marker::PhantomData })
++        Ok(Self {
++            value: value.to_vec(),
++            _phantom: std::marker::PhantomData,
++        })
+     }
+ 
+     fn decompress_owned(value: Vec<u8>) -> Result<Self, DatabaseError> {
+-        Ok(Self { value, _phantom: std::marker::PhantomData })
++        Ok(Self {
++            value,
++            _phantom: std::marker::PhantomData,
++        })
+     }
+ }
+diff -ruN reth-145/crates/storage/db-api/src/transaction.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/transaction.rs
+--- reth-145/crates/storage/db-api/src/transaction.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/transaction.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use crate::{
+     cursor::{DbCursorRO, DbCursorRW, DbDupCursorRO, DbDupCursorRW},
+     table::{DupSort, Encode, Table},
+diff -ruN reth-145/crates/storage/db-api/src/unwind.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/unwind.rs
+--- reth-145/crates/storage/db-api/src/unwind.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/unwind.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use crate::{cursor::DbCursorRO, table::Table, transaction::DbTxMut};
+ use reth_storage_errors::db::DatabaseError;
+ use std::ops::RangeBounds;
+@@ -31,7 +34,7 @@
+ 
+         while let Some(Ok((entry_key, _))) = reverse_walker.next() {
+             if selector(entry_key.clone()) <= key {
+-                break
++                break;
+             }
+             reverse_walker.delete_current()?;
+             deleted += 1;
+diff -ruN reth-145/crates/storage/db-api/src/utils.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/utils.rs
+--- reth-145/crates/storage/db-api/src/utils.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db-api/src/utils.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ #[macro_export]
+ /// Implements the `Arbitrary` trait for types with fixed array types.
+ macro_rules! impl_fixed_arbitrary {

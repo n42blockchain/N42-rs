@@ -1,14 +1,11 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
-use n42_clique::APos;
-use reth_chainspec::ChainSpec;
 use reth_consensus::{ConsensusError, FullConsensus};
 use reth_ethereum_primitives::{EthPrimitives, PooledTransaction};
+use std::sync::Arc;
 use reth_node_api::FullNodeTypes;
+use n42_clique::APos;
+use reth_chainspec::ChainSpec;
 use reth_node_builder::components::ConsensusBuilder;
 use reth_node_builder::{BuilderContext, NodeTypes};
-use std::sync::Arc;
 
 /// A basic ethereum consensus builder.
 #[derive(Debug, Default, Clone, Copy)]
@@ -27,10 +24,8 @@ where
         Ok(Arc::new(APos::new(
             ctx.provider().clone(),
             ctx.chain_spec(),
-            ctx.config()
-                .dev
-                .consensus_signer_private_key
-                .map(|v| v.to_string()),
+            ctx.config().dev.consensus_signer_private_key.clone()
         )))
     }
 }
+

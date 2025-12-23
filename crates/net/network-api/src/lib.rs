@@ -20,19 +20,20 @@ pub mod downloaders;
 /// Network Error
 pub mod error;
 pub mod events;
+/// N42-specific block announce provider
+mod block;
+pub use block::{BlockAnnounceProvider, N42BlockImportOutcome, N42BlockImportError};
 /// Implementation of network traits for that does nothing.
 pub mod noop;
 
 pub mod test_utils;
-mod block;
+use test_utils::PeersHandleProvider;
 
 pub use alloy_rpc_types_admin::EthProtocolInfo;
 pub use reth_network_p2p::{BlockClient, HeadersClient};
 pub use reth_network_types::{PeerKind, Reputation, ReputationChangeKind};
 
 pub use downloaders::BlockDownloaderProvider;
-pub use block::BlockAnnounceProvider;
-pub use block::{N42BlockImportError, N42BlockImportOutcome};
 pub use error::NetworkError;
 pub use events::{
     DiscoveredEvent, DiscoveryEvent, NetworkEvent, NetworkEventListenerProvider, PeerRequest,
@@ -40,7 +41,7 @@ pub use events::{
 };
 
 use reth_eth_wire_types::{
-    capability::Capabilities, DisconnectReason, EthVersion, NetworkPrimitives, Status,
+    capability::Capabilities, DisconnectReason, EthVersion, NetworkPrimitives, UnifiedStatus,
 };
 use reth_network_p2p::sync::NetworkSyncUpdater;
 use reth_network_peers::NodeRecord;
@@ -57,7 +58,7 @@ pub trait FullNetwork:
     + NetworkInfo
     + NetworkEventListenerProvider
     + Peers
-    + BlockAnnounceProvider
+    + PeersHandleProvider
     + Clone
     + Unpin
     + 'static
@@ -71,7 +72,7 @@ impl<T> FullNetwork for T where
         + NetworkInfo
         + NetworkEventListenerProvider
         + Peers
-        + BlockAnnounceProvider
+        + PeersHandleProvider
         + Clone
         + Unpin
         + 'static
@@ -243,7 +244,7 @@ pub struct PeerInfo {
     /// The negotiated eth version.
     pub eth_version: EthVersion,
     /// The Status message the peer sent for the `eth` handshake
-    pub status: Arc<Status>,
+    pub status: Arc<UnifiedStatus>,
     /// The timestamp when the session to that peer has been established.
     pub session_established: Instant,
     /// The peer's connection kind

@@ -1,29 +1,22 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 #![allow(missing_docs)]
 
 #[global_allocator]
 static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
 
+use std::{time::Duration};
 use alloy_signer_local::PrivateKeySigner;
-use clap::Parser;
-use consensus_client::migrate::N42Migrate;
 use consensus_client::miner::N42Miner;
-use n42::consensus_ext::{
-    ConsensusBeaconExt, ConsensusBeaconExtApiServer, ConsensusExt, ConsensusExtApiServer,
-};
-use n42::{args::RessArgs, cli::Cli, ress::install_ress_subprotocol};
-use n42_clique::UnverifiedBlock;
+use consensus_client::migrate::N42Migrate;
 use n42_engine_primitives::N42PayloadAttributesBuilder;
-use n42_engine_types::N42Node;
-use pubsub_mem::{router_loop, RouterMsg};
+use clap::Parser;
+use n42::{args::RessArgs, cli::Cli, ress::install_ress_subprotocol};
+use n42_engine_types::{N42Node};
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
-use reth_node_builder::NodeHandle;
+use reth_node_builder::{NodeHandle, FullNodeComponents};
 use reth_node_ethereum::EthereumNode;
-use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
-use tracing::{error, info};
+use tracing::{info, error};
+use n42::consensus_ext::{ConsensusExtApiServer, ConsensusExt, ConsensusBeaconExtApiServer, ConsensusBeaconExt};
 
 const DEFAULT_BLOCK_TIME_SECS: u64 = 8;
 
@@ -36,49 +29,44 @@ fn main() {
     }
 
     let (verification_tx, verification_rx) = mpsc::channel(100);
+    let (broadcast_tx, _broadcast_rx) = broadcast::channel(100);
+    let broadcast_tx_clone = broadcast_tx.clone();
+    let broadcast_tx_clone_for_message_producer = broadcast_tx.clone();
+    let broadcast_tx_clone_for_miner = broadcast_tx.clone();
 
+
+    // Shared consensus instance holder
+    let consensus_holder: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn reth_consensus::FullConsensus<reth_ethereum_primitives::EthPrimitives, Error = reth_consensus::ConsensusError> + Send + Sync>>>> = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let consensus_holder_clone = consensus_holder.clone();
+    
     if let Err(err) =
         Cli::<EthereumChainSpecParser, RessArgs>::parse().run(async move |builder, ress_args| {
             info!(target: "reth::cli", "Launching node");
+            let NodeHandle { node, node_exit_future } =
+                builder.node(N42Node::default())
+                        .extend_rpc_modules(move |ctx| {
 
-            // Create router control channel
-            let (router_tx, router_rx) = mpsc::channel::<RouterMsg<UnverifiedBlock>>(128);
-            let router_tx_clone = router_tx.clone();
-            let router_tx_clone_for_miner = router_tx.clone();
+                            let consensus = ctx.node().consensus().clone();
+                            let provider = ctx.provider().clone();
+                            
+                            // Store consensus reference for later use
+                            *consensus_holder_clone.lock().unwrap() = Some(std::sync::Arc::new(consensus.clone()));
 
-            let NodeHandle {
-                node,
-                node_exit_future,
-            } = builder
-                .node(N42Node::default())
-                .extend_rpc_modules(|ctx| {
-                    let consensus = ctx.consensus().clone();
-                    let provider = ctx.provider().clone();
+                            let beacon_ext = ConsensusBeaconExt { consensus: consensus.clone(), provider: provider.clone(), verification_tx, broadcast_tx: broadcast_tx_clone };
+                            let ext = ConsensusExt { consensus, provider };
 
-                    let beacon_ext = ConsensusBeaconExt {
-                        consensus: consensus.clone(),
-                        provider: provider.clone(),
-                        verification_tx,
-                        router_tx: router_tx_clone,
-                    };
-                    let ext = ConsensusExt {
-                        consensus,
-                        provider,
-                    };
+                            // now we merge our extension namespace into all configured transports
+                            ctx.auth_module.merge_auth_methods(ext.into_rpc())?;
+                            ctx.modules.merge_configured(beacon_ext.into_rpc())?;
 
-                    // now we merge our extension namespace into all configured transports
-                    ctx.auth_module.merge_auth_methods(ext.into_rpc())?;
-                    ctx.modules.merge_configured(beacon_ext.into_rpc())?;
+                            info!(target: "reth::cli", "consensus rpc extension enabled");
 
-                    info!(target: "reth::cli", "consensus rpc extension enabled");
-
-                    Ok(())
-                })
-                .launch_with_debug_capabilities()
-                .await?;
-
-            // Spawn router loop task
-            tokio::spawn(router_loop(router_rx));
+                            Ok(())
+                        })
+                .launch_with_debug_capabilities().await?;
+            
+            // Get the stored consensus instance
+            let consensus = consensus_holder.lock().unwrap().clone().expect("consensus should be set");
 
             let node_config_dev = node.config.clone().dev();
             let consensus_signer_private_key = node_config_dev.dev.consensus_signer_private_key;
@@ -90,35 +78,27 @@ fn main() {
             };
 
             let mining_mode = if let Some(_) = consensus_signer_private_key {
-                let block_time = node_config_dev
-                    .dev
-                    .block_time
-                    .unwrap_or_else(|| Duration::from_secs(DEFAULT_BLOCK_TIME_SECS));
+                let block_time = node_config_dev.dev.block_time.unwrap_or_else(|| Duration::from_secs(DEFAULT_BLOCK_TIME_SECS));
                 consensus_client::miner::MiningMode::interval(block_time)
             } else {
                 consensus_client::miner::MiningMode::NoMining
             };
             info!(target: "reth::cli", ?mining_mode);
 
-            if node_config_dev.dev.migrate_old_chain_data_from_db.is_some()
-                || node_config_dev
-                    .dev
-                    .migrate_old_chain_data_from_rpc
-                    .is_some()
-            {
-                let migrate_from_db_path =
-                    node_config_dev.dev.migrate_old_chain_data_from_db.clone();
-                let migrate_from_db_rpc =
-                    node_config_dev.dev.migrate_old_chain_data_from_rpc.clone();
-                N42Migrate::spawn_new(
-                    node.provider.clone(),
-                    N42PayloadAttributesBuilder::new_add_signer(node.chain_spec(), signer_address),
-                    node.add_ons_handle.beacon_engine_handle.clone(),
-                    node.payload_builder_handle.clone(),
-                    node.pool.clone(),
-                    migrate_from_db_path,
-                    migrate_from_db_rpc,
-                );
+            if node_config_dev.dev.migrate_old_chain_data_from_db.is_some() || node_config_dev.dev.migrate_old_chain_data_from_rpc.is_some() {
+            let migrate_from_db_path =
+                node_config_dev.dev.migrate_old_chain_data_from_db.clone();
+            let migrate_from_db_rpc =
+                node_config_dev.dev.migrate_old_chain_data_from_rpc.clone();
+            N42Migrate::spawn_new(
+                node.provider.clone(),
+                N42PayloadAttributesBuilder::new_add_signer(node.chain_spec(), signer_address),
+                node.add_ons_handle.beacon_engine_handle.clone(),
+                node.payload_builder_handle.clone(),
+                node.pool.clone(),
+                migrate_from_db_path,
+                migrate_from_db_rpc,
+            );
             } else {
                 N42Miner::spawn_new(
                     node.provider.clone(),
@@ -127,8 +107,8 @@ fn main() {
                     mining_mode,
                     node.payload_builder_handle.clone(),
                     node.network.clone(),
-                    node.consensus.clone(),
-                    router_tx_clone_for_miner,
+                    consensus,
+                    broadcast_tx_clone_for_miner,
                     verification_rx,
                 );
             }
@@ -152,3 +132,4 @@ fn main() {
         std::process::exit(1);
     }
 }
+

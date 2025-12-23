@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! CLI definition and entrypoint to executable
 
 use crate::{chainspec::EthereumChainSpecParser, debug_cmd};
@@ -20,7 +17,7 @@ use reth_node_core::{
     args::LogArgs,
     version::{LONG_VERSION, SHORT_VERSION},
 };
-use reth_node_ethereum::{consensus::EthBeaconConsensus, EthExecutorProvider, EthereumNode};
+use reth_node_ethereum::{consensus::EthBeaconConsensus, EthEvmConfig, EthereumNode};
 use reth_node_metrics::recorder::install_prometheus_recorder;
 use reth_tracing::FileWorkerGuard;
 use std::{ffi::OsString, fmt, future::Future, sync::Arc};
@@ -141,10 +138,8 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>, Ext: clap::Args + fmt::Debug> Cl
     {
         // Add network name if available to the logs dir
         if let Some(chain_spec) = self.command.chain_spec() {
-            self.logs.log_file_directory = self
-                .logs
-                .log_file_directory
-                .join(chain_spec.chain.to_string());
+            self.logs.log_file_directory =
+                self.logs.log_file_directory.join(chain_spec.chain.to_string());
         }
         let _guard = self.init_tracing()?;
         info!(target: "reth::cli", "Initialized tracing, debug log directory: {}", self.logs.log_file_directory);
@@ -153,15 +148,12 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>, Ext: clap::Args + fmt::Debug> Cl
         let _ = install_prometheus_recorder();
 
         let components = |spec: Arc<C::ChainSpec>| {
-            (
-                EthExecutorProvider::ethereum(spec.clone()),
-                EthBeaconConsensus::new(spec),
-            )
+            (EthEvmConfig::ethereum(spec.clone()), EthBeaconConsensus::new(spec))
         };
         match self.command {
-            Commands::Node(command) => {
-                runner.run_command_until_exit(|ctx| command.execute(ctx, launcher))
-            }
+            Commands::Node(command) => runner.run_command_until_exit(|ctx| {
+                command.execute(ctx, reth_cli_commands::launcher::FnLauncher::new::<C, Ext>(launcher))
+            }),
             Commands::Init(command) => {
                 runner.run_blocking_until_ctrl_c(command.execute::<EthereumNode>())
             }
@@ -323,10 +315,8 @@ mod tests {
     fn parse_logs_path_node() {
         let mut reth = Cli::try_parse_args_from(["reth", "node"]).unwrap();
         if let Some(chain_spec) = reth.command.chain_spec() {
-            reth.logs.log_file_directory = reth
-                .logs
-                .log_file_directory
-                .join(chain_spec.chain.to_string());
+            reth.logs.log_file_directory =
+                reth.logs.log_file_directory.join(chain_spec.chain.to_string());
         }
         let log_dir = reth.logs.log_file_directory;
         let end = format!("reth/logs/{}", SUPPORTED_CHAINS[0]);
@@ -336,11 +326,8 @@ mod tests {
         iter.next();
         for chain in iter {
             let mut reth = Cli::try_parse_args_from(["reth", "node", "--chain", chain]).unwrap();
-            let chain = reth
-                .command
-                .chain_spec()
-                .map(|c| c.chain.to_string())
-                .unwrap_or(String::new());
+            let chain =
+                reth.command.chain_spec().map(|c| c.chain.to_string()).unwrap_or(String::new());
             reth.logs.log_file_directory = reth.logs.log_file_directory.join(chain.clone());
             let log_dir = reth.logs.log_file_directory;
             let end = format!("reth/logs/{chain}");
@@ -354,10 +341,8 @@ mod tests {
     fn parse_logs_path_init() {
         let mut reth = Cli::try_parse_args_from(["reth", "init"]).unwrap();
         if let Some(chain_spec) = reth.command.chain_spec() {
-            reth.logs.log_file_directory = reth
-                .logs
-                .log_file_directory
-                .join(chain_spec.chain.to_string());
+            reth.logs.log_file_directory =
+                reth.logs.log_file_directory.join(chain_spec.chain.to_string());
         }
         let log_dir = reth.logs.log_file_directory;
         let end = format!("reth/logs/{}", SUPPORTED_CHAINS[0]);
@@ -370,10 +355,8 @@ mod tests {
     fn parse_empty_logs_path() {
         let mut reth = Cli::try_parse_args_from(["reth", "config"]).unwrap();
         if let Some(chain_spec) = reth.command.chain_spec() {
-            reth.logs.log_file_directory = reth
-                .logs
-                .log_file_directory
-                .join(chain_spec.chain.to_string());
+            reth.logs.log_file_directory =
+                reth.logs.log_file_directory.join(chain_spec.chain.to_string());
         }
         let log_dir = reth.logs.log_file_directory;
         let end = "reth/logs".to_string();

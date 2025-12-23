@@ -1,0 +1,1448 @@
+diff -ruN reth-145/crates/storage/db/benches/criterion.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/benches/criterion.rs
+--- reth-145/crates/storage/db/benches/criterion.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/benches/criterion.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ #![allow(missing_docs)]
+ 
+ use std::{path::Path, sync::Arc};
+@@ -149,7 +152,10 @@
+             || {
+                 // Reset DB
+                 let _ = fs::remove_dir_all(bench_db_path);
+-                (input, Arc::try_unwrap(create_test_rw_db_with_path(bench_db_path)).unwrap())
++                (
++                    input,
++                    Arc::try_unwrap(create_test_rw_db_with_path(bench_db_path)).unwrap(),
++                )
+             },
+             |(input, db)| {
+                 // Create TX
+@@ -187,7 +193,9 @@
+             let tx = db.tx().expect("tx");
+             for index in RANDOM_INDEXES {
+                 let mut cursor = tx.cursor_read::<T>().expect("cursor");
+-                cursor.seek_exact(input.get(index).unwrap().0.clone()).unwrap();
++                cursor
++                    .seek_exact(input.get(index).unwrap().0.clone())
++                    .unwrap();
+             }
+         })
+     });
+@@ -232,7 +240,10 @@
+                 // Reset DB
+                 let _ = fs::remove_dir_all(bench_db_path);
+ 
+-                (input, Arc::try_unwrap(create_test_rw_db_with_path(bench_db_path)).unwrap())
++                (
++                    input,
++                    Arc::try_unwrap(create_test_rw_db_with_path(bench_db_path)).unwrap(),
++                )
+             },
+             |(input, db)| {
+                 // Create TX
+diff -ruN reth-145/crates/storage/db/benches/get.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/benches/get.rs
+--- reth-145/crates/storage/db/benches/get.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/benches/get.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ #![allow(missing_docs)]
+ 
+ use alloy_primitives::TxHash;
+@@ -44,7 +47,8 @@
+     group.bench_function("get_by_encoded_key", |b| {
+         b.iter(|| {
+             for key in &keys {
+-                tx.get_by_encoded_key::<TransactionHashNumbers>(key).unwrap();
++                tx.get_by_encoded_key::<TransactionHashNumbers>(key)
++                    .unwrap();
+             }
+         })
+     });
+diff -ruN reth-145/crates/storage/db/benches/hash_keys.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/benches/hash_keys.rs
+--- reth-145/crates/storage/db/benches/hash_keys.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/benches/hash_keys.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ #![allow(missing_docs)]
+ 
+ use std::{collections::HashSet, path::Path, sync::Arc};
+@@ -243,10 +246,15 @@
+     T: Table,
+ {
+     db.view(|tx| {
+-        let table_db = tx.inner.open_db(Some(T::NAME)).map_err(|_| "Could not open db.").unwrap();
++        let table_db = tx
++            .inner
++            .open_db(Some(T::NAME))
++            .map_err(|_| "Could not open db.")
++            .unwrap();
+ 
+         println!(
+-            "{:?}\n",
++            "{:?}
++",
+             tx.inner
+                 .db_stat(&table_db)
+                 .map_err(|_| format!("Could not find table: {}", T::NAME))
+diff -ruN reth-145/crates/storage/db/benches/utils.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/benches/utils.rs
+--- reth-145/crates/storage/db/benches/utils.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/benches/utils.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ #![allow(missing_docs)]
+ #![cfg(feature = "test-utils")]
+ 
+@@ -26,8 +29,11 @@
+     T::Key: Clone + for<'de> serde::Deserialize<'de>,
+     T::Value: Clone + for<'de> serde::Deserialize<'de>,
+ {
+-    let path =
+-        format!("{}/../../../testdata/micro/db/{}.json", env!("CARGO_MANIFEST_DIR"), T::NAME);
++    let path = format!(
++        "{}/../../../testdata/micro/db/{}.json",
++        env!("CARGO_MANIFEST_DIR"),
++        T::NAME
++    );
+     let list: Vec<TableRow<T>> = serde_json::from_reader(std::io::BufReader::new(
+         std::fs::File::open(&path)
+             .unwrap_or_else(|_| panic!("Test vectors not found. They can be generated from the workspace by calling `cargo run --bin reth --features dev -- test-vectors tables`: {path:?}"))
+diff -ruN reth-145/crates/storage/db/src/implementation/mdbx/cursor.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/src/implementation/mdbx/cursor.rs
+--- reth-145/crates/storage/db/src/implementation/mdbx/cursor.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/src/implementation/mdbx/cursor.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Cursor wrapper for libmdbx-sys.
+ 
+ use super::utils::*;
+@@ -40,7 +43,12 @@
+         inner: reth_libmdbx::Cursor<K>,
+         metrics: Option<Arc<DatabaseEnvMetrics>>,
+     ) -> Self {
+-        Self { inner, buf: Vec::new(), metrics, _dbi: PhantomData }
++        Self {
++            inner,
++            buf: Vec::new(),
++            metrics,
++            _dbi: PhantomData,
++        }
+     }
+ 
+     /// If `self.metrics` is `Some(...)`, record a metric with the provided operation and value
+@@ -71,7 +79,9 @@
+     T::Key: Decode,
+     T::Value: Decompress,
+ {
+-    res.map_err(|e| DatabaseError::Read(e.into()))?.map(decoder::<T>).transpose()
++    res.map_err(|e| DatabaseError::Read(e.into()))?
++        .map(decoder::<T>)
++        .transpose()
+ }
+ 
+ /// Some types don't support compression (eg. B256), and we don't want to be copying them to the
+@@ -229,7 +239,10 @@
+             (None, None) => self.first().transpose(),
+         };
+ 
+-        Ok(DupWalker::<'_, T, Self> { cursor: self, start })
++        Ok(DupWalker::<'_, T, Self> {
++            cursor: self,
++            start,
++        })
+     }
+ }
+ 
+@@ -271,7 +284,11 @@
+             Some(value.unwrap_or(&self.buf).len()),
+             |this| {
+                 this.inner
+-                    .put(key.as_ref(), value.unwrap_or(&this.buf), WriteFlags::NO_OVERWRITE)
++                    .put(
++                        key.as_ref(),
++                        value.unwrap_or(&this.buf),
++                        WriteFlags::NO_OVERWRITE,
++                    )
+                     .map_err(|e| {
+                         DatabaseWriteError {
+                             info: e.into(),
+@@ -311,7 +328,9 @@
+ 
+     fn delete_current(&mut self) -> Result<(), DatabaseError> {
+         self.execute_with_operation_metric(Operation::CursorDeleteCurrent, None, |this| {
+-            this.inner.del(WriteFlags::CURRENT).map_err(|e| DatabaseError::Delete(e.into()))
++            this.inner
++                .del(WriteFlags::CURRENT)
++                .map_err(|e| DatabaseError::Delete(e.into()))
+         })
+     }
+ }
+@@ -319,7 +338,9 @@
+ impl<T: DupSort> DbDupCursorRW<T> for Cursor<RW, T> {
+     fn delete_current_duplicates(&mut self) -> Result<(), DatabaseError> {
+         self.execute_with_operation_metric(Operation::CursorDeleteCurrentDuplicates, None, |this| {
+-            this.inner.del(WriteFlags::NO_DUP_DATA).map_err(|e| DatabaseError::Delete(e.into()))
++            this.inner
++                .del(WriteFlags::NO_DUP_DATA)
++                .map_err(|e| DatabaseError::Delete(e.into()))
+         })
+     }
+ 
+@@ -331,7 +352,11 @@
+             Some(value.unwrap_or(&self.buf).len()),
+             |this| {
+                 this.inner
+-                    .put(key.as_ref(), value.unwrap_or(&this.buf), WriteFlags::APPEND_DUP)
++                    .put(
++                        key.as_ref(),
++                        value.unwrap_or(&this.buf),
++                        WriteFlags::APPEND_DUP,
++                    )
+                     .map_err(|e| {
+                         DatabaseWriteError {
+                             info: e.into(),
+diff -ruN reth-145/crates/storage/db/src/implementation/mdbx/mod.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/src/implementation/mdbx/mod.rs
+--- reth-145/crates/storage/db/src/implementation/mdbx/mod.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/src/implementation/mdbx/mod.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Module that interacts with MDBX.
+ 
+ use crate::{
+@@ -184,7 +187,9 @@
+ 
+     fn tx(&self) -> Result<Self::TX, DatabaseError> {
+         Tx::new_with_metrics(
+-            self.inner.begin_ro_txn().map_err(|e| DatabaseError::InitTx(e.into()))?,
++            self.inner
++                .begin_ro_txn()
++                .map_err(|e| DatabaseError::InitTx(e.into()))?,
+             self.metrics.clone(),
+         )
+         .map_err(|e| DatabaseError::InitTx(e.into()))
+@@ -192,7 +197,9 @@
+ 
+     fn tx_mut(&self) -> Result<Self::TXMut, DatabaseError> {
+         Tx::new_with_metrics(
+-            self.inner.begin_rw_txn().map_err(|e| DatabaseError::InitTx(e.into()))?,
++            self.inner
++                .begin_rw_txn()
++                .map_err(|e| DatabaseError::InitTx(e.into()))?,
+             self.metrics.clone(),
+         )
+         .map_err(|e| DatabaseError::InitTx(e.into()))
+@@ -212,7 +219,10 @@
+         let _ = self
+             .view(|tx| {
+                 for table in Tables::ALL.iter().map(Tables::name) {
+-                    let table_db = tx.inner.open_db(Some(table)).wrap_err("Could not open db.")?;
++                    let table_db = tx
++                        .inner
++                        .open_db(Some(table))
++                        .wrap_err("Could not open db.")?;
+ 
+                     let stats = tx
+                         .inner
+@@ -258,13 +268,17 @@
+             })
+             .map_err(|error| error!(%error, "Failed to read db table stats"));
+ 
+-        if let Ok(freelist) =
+-            self.freelist().map_err(|error| error!(%error, "Failed to read db.freelist"))
++        if let Ok(freelist) = self
++            .freelist()
++            .map_err(|error| error!(%error, "Failed to read db.freelist"))
+         {
+             metrics.push(("db.freelist", freelist as f64, vec![]));
+         }
+ 
+-        if let Ok(stat) = self.stat().map_err(|error| error!(%error, "Failed to read db.stat")) {
++        if let Ok(stat) = self
++            .stat()
++            .map_err(|error| error!(%error, "Failed to read db.stat"))
++        {
+             metrics.push(("db.page_size", stat.page_size() as f64, vec![]));
+         }
+ 
+@@ -302,7 +316,9 @@
+             DatabaseEnvKind::RW => {
+                 // enable writemap mode in RW mode
+                 inner_env.write_map();
+-                Mode::ReadWrite { sync_mode: SyncMode::Durable }
++                Mode::ReadWrite {
++                    sync_mode: SyncMode::Durable,
++                }
+             }
+         };
+ 
+@@ -417,7 +433,7 @@
+                     LogLevel::Extra => 7,
+                 });
+             } else {
+-                return Err(DatabaseError::LogLevelUnavailable(log_level))
++                return Err(DatabaseError::LogLevelUnavailable(log_level));
+             }
+         }
+ 
+@@ -426,7 +442,9 @@
+         }
+ 
+         let env = Self {
+-            inner: inner_env.open(path).map_err(|e| DatabaseError::Open(e.into()))?,
++            inner: inner_env
++                .open(path)
++                .map_err(|e| DatabaseError::Open(e.into()))?,
+             metrics: None,
+             _lock_file,
+         };
+@@ -447,11 +465,17 @@
+ 
+     /// Creates all the tables defined in the given [`TableSet`], if necessary.
+     pub fn create_tables_for<TS: TableSet>(&self) -> Result<(), DatabaseError> {
+-        let tx = self.inner.begin_rw_txn().map_err(|e| DatabaseError::InitTx(e.into()))?;
++        let tx = self
++            .inner
++            .begin_rw_txn()
++            .map_err(|e| DatabaseError::InitTx(e.into()))?;
+ 
+         for table in TS::tables() {
+-            let flags =
+-                if table.is_dupsort() { DatabaseFlags::DUP_SORT } else { DatabaseFlags::default() };
++            let flags = if table.is_dupsort() {
++                DatabaseFlags::DUP_SORT
++            } else {
++                DatabaseFlags::default()
++            };
+ 
+             tx.create_db(Some(table.name()), flags)
+                 .map_err(|e| DatabaseError::CreateTable(e.into()))?;
+@@ -465,7 +489,7 @@
+     /// Records version that accesses the database with write privileges.
+     pub fn record_client_version(&self, version: ClientVersion) -> Result<(), DatabaseError> {
+         if version.is_empty() {
+-            return Ok(())
++            return Ok(());
+         }
+ 
+         let tx = self.tx_mut()?;
+@@ -474,7 +498,10 @@
+         let last_version = version_cursor.last()?.map(|(_, v)| v);
+         if Some(&version) != last_version.as_ref() {
+             version_cursor.upsert(
+-                SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
++                SystemTime::now()
++                    .duration_since(UNIX_EPOCH)
++                    .unwrap_or_default()
++                    .as_secs(),
+                 &version,
+             )?;
+             tx.commit()?;
+@@ -573,21 +600,40 @@
+ 
+         let mut dup_cursor = tx.cursor_dup_write::<PlainStorageState>().unwrap();
+ 
+-        let entry_0 = StorageEntry { key: B256::with_last_byte(1), value: U256::from(0) };
+-        let entry_1 = StorageEntry { key: B256::with_last_byte(1), value: U256::from(1) };
++        let entry_0 = StorageEntry {
++            key: B256::with_last_byte(1),
++            value: U256::from(0),
++        };
++        let entry_1 = StorageEntry {
++            key: B256::with_last_byte(1),
++            value: U256::from(1),
++        };
+ 
+-        dup_cursor.upsert(Address::with_last_byte(1), &entry_0).expect(ERROR_UPSERT);
+-        dup_cursor.upsert(Address::with_last_byte(1), &entry_1).expect(ERROR_UPSERT);
++        dup_cursor
++            .upsert(Address::with_last_byte(1), &entry_0)
++            .expect(ERROR_UPSERT);
++        dup_cursor
++            .upsert(Address::with_last_byte(1), &entry_1)
++            .expect(ERROR_UPSERT);
+ 
+         assert_eq!(
+-            dup_cursor.walk(None).unwrap().collect::<Result<Vec<_>, _>>(),
+-            Ok(vec![(Address::with_last_byte(1), entry_0), (Address::with_last_byte(1), entry_1),])
++            dup_cursor
++                .walk(None)
++                .unwrap()
++                .collect::<Result<Vec<_>, _>>(),
++            Ok(vec![
++                (Address::with_last_byte(1), entry_0),
++                (Address::with_last_byte(1), entry_1),
++            ])
+         );
+ 
+         let mut walker = dup_cursor.walk(None).unwrap();
+         walker.delete_current().expect(ERROR_DEL);
+ 
+-        assert_eq!(walker.next(), Some(Ok((Address::with_last_byte(1), entry_1))));
++        assert_eq!(
++            walker.next(),
++            Some(Ok((Address::with_last_byte(1), entry_1)))
++        );
+ 
+         // Check the tx view - it correctly holds entry_1
+         assert_eq!(
+@@ -703,35 +749,135 @@
+         let address2 = Address::with_last_byte(2);
+ 
+         let tx = db.tx_mut().expect(ERROR_INIT_TX);
+-        tx.put::<AccountChangeSets>(0, AccountBeforeTx { address: address0, info: None })
+-            .expect(ERROR_PUT);
+-        tx.put::<AccountChangeSets>(0, AccountBeforeTx { address: address1, info: None })
+-            .expect(ERROR_PUT);
+-        tx.put::<AccountChangeSets>(0, AccountBeforeTx { address: address2, info: None })
+-            .expect(ERROR_PUT);
+-        tx.put::<AccountChangeSets>(1, AccountBeforeTx { address: address0, info: None })
+-            .expect(ERROR_PUT);
+-        tx.put::<AccountChangeSets>(1, AccountBeforeTx { address: address1, info: None })
+-            .expect(ERROR_PUT);
+-        tx.put::<AccountChangeSets>(1, AccountBeforeTx { address: address2, info: None })
+-            .expect(ERROR_PUT);
+-        tx.put::<AccountChangeSets>(2, AccountBeforeTx { address: address0, info: None }) // <- should not be returned by the walker
+-            .expect(ERROR_PUT);
++        tx.put::<AccountChangeSets>(
++            0,
++            AccountBeforeTx {
++                address: address0,
++                info: None,
++            },
++        )
++        .expect(ERROR_PUT);
++        tx.put::<AccountChangeSets>(
++            0,
++            AccountBeforeTx {
++                address: address1,
++                info: None,
++            },
++        )
++        .expect(ERROR_PUT);
++        tx.put::<AccountChangeSets>(
++            0,
++            AccountBeforeTx {
++                address: address2,
++                info: None,
++            },
++        )
++        .expect(ERROR_PUT);
++        tx.put::<AccountChangeSets>(
++            1,
++            AccountBeforeTx {
++                address: address0,
++                info: None,
++            },
++        )
++        .expect(ERROR_PUT);
++        tx.put::<AccountChangeSets>(
++            1,
++            AccountBeforeTx {
++                address: address1,
++                info: None,
++            },
++        )
++        .expect(ERROR_PUT);
++        tx.put::<AccountChangeSets>(
++            1,
++            AccountBeforeTx {
++                address: address2,
++                info: None,
++            },
++        )
++        .expect(ERROR_PUT);
++        tx.put::<AccountChangeSets>(
++            2,
++            AccountBeforeTx {
++                address: address0,
++                info: None,
++            },
++        ) // <- should not be returned by the walker
++        .expect(ERROR_PUT);
+         tx.commit().expect(ERROR_COMMIT);
+ 
+         let tx = db.tx().expect(ERROR_INIT_TX);
+         let mut cursor = tx.cursor_read::<AccountChangeSets>().unwrap();
+ 
+-        let entries = cursor.walk_range(..).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
++        let entries = cursor
++            .walk_range(..)
++            .unwrap()
++            .collect::<Result<Vec<_>, _>>()
++            .unwrap();
+         assert_eq!(entries.len(), 7);
+ 
+         let mut walker = cursor.walk_range(0..=1).unwrap();
+-        assert_eq!(walker.next(), Some(Ok((0, AccountBeforeTx { address: address0, info: None }))));
+-        assert_eq!(walker.next(), Some(Ok((0, AccountBeforeTx { address: address1, info: None }))));
+-        assert_eq!(walker.next(), Some(Ok((0, AccountBeforeTx { address: address2, info: None }))));
+-        assert_eq!(walker.next(), Some(Ok((1, AccountBeforeTx { address: address0, info: None }))));
+-        assert_eq!(walker.next(), Some(Ok((1, AccountBeforeTx { address: address1, info: None }))));
+-        assert_eq!(walker.next(), Some(Ok((1, AccountBeforeTx { address: address2, info: None }))));
++        assert_eq!(
++            walker.next(),
++            Some(Ok((
++                0,
++                AccountBeforeTx {
++                    address: address0,
++                    info: None
++                }
++            )))
++        );
++        assert_eq!(
++            walker.next(),
++            Some(Ok((
++                0,
++                AccountBeforeTx {
++                    address: address1,
++                    info: None
++                }
++            )))
++        );
++        assert_eq!(
++            walker.next(),
++            Some(Ok((
++                0,
++                AccountBeforeTx {
++                    address: address2,
++                    info: None
++                }
++            )))
++        );
++        assert_eq!(
++            walker.next(),
++            Some(Ok((
++                1,
++                AccountBeforeTx {
++                    address: address0,
++                    info: None
++                }
++            )))
++        );
++        assert_eq!(
++            walker.next(),
++            Some(Ok((
++                1,
++                AccountBeforeTx {
++                    address: address1,
++                    info: None
++                }
++            )))
++        );
++        assert_eq!(
++            walker.next(),
++            Some(Ok((
++                1,
++                AccountBeforeTx {
++                    address: address2,
++                    info: None
++                }
++            )))
++        );
+         assert_eq!(walker.next(), None);
+     }
+ 
+@@ -925,7 +1071,11 @@
+         // Confirm the result
+         let tx = db.tx().expect(ERROR_INIT_TX);
+         let mut cursor = tx.cursor_read::<CanonicalHeaders>().unwrap();
+-        let res = cursor.walk(None).unwrap().map(|res| res.unwrap().0).collect::<Vec<_>>();
++        let res = cursor
++            .walk(None)
++            .unwrap()
++            .map(|res| res.unwrap().0)
++            .collect::<Vec<_>>();
+         assert_eq!(res, vec![0, 1, 2, 3, 4, 5]);
+         tx.commit().expect(ERROR_COMMIT);
+     }
+@@ -940,11 +1090,17 @@
+         let subkey1 = B256::random();
+         let subkey2 = B256::random();
+ 
+-        let entry1 = StorageEntry { key: subkey1, value: U256::ZERO };
++        let entry1 = StorageEntry {
++            key: subkey1,
++            value: U256::ZERO,
++        };
+         assert!(dup_cursor.insert(key, &entry1).is_ok());
+ 
+         // Can't insert
+-        let entry2 = StorageEntry { key: subkey2, value: U256::ZERO };
++        let entry2 = StorageEntry {
++            key: subkey2,
++            value: U256::ZERO,
++        };
+         assert!(dup_cursor.insert(key, &entry2).is_err());
+     }
+ 
+@@ -974,9 +1130,15 @@
+             Err(DatabaseError::Delete(reth_libmdbx::Error::NoData.into()))
+         );
+         // Assert that key1 is still there
+-        assert_eq!(cursor.seek_exact(key1), Ok(Some((key1, Account::default()))));
++        assert_eq!(
++            cursor.seek_exact(key1),
++            Ok(Some((key1, Account::default())))
++        );
+         // Assert that key3 is still there
+-        assert_eq!(cursor.seek_exact(key3), Ok(Some((key3, Account::default()))));
++        assert_eq!(
++            cursor.seek_exact(key3),
++            Ok(Some((key3, Account::default())))
++        );
+     }
+ 
+     #[test]
+@@ -1007,7 +1169,11 @@
+         // Confirm the result
+         let tx = db.tx().expect(ERROR_INIT_TX);
+         let mut cursor = tx.cursor_read::<CanonicalHeaders>().unwrap();
+-        let res = cursor.walk(None).unwrap().map(|res| res.unwrap().0).collect::<Vec<_>>();
++        let res = cursor
++            .walk(None)
++            .unwrap()
++            .map(|res| res.unwrap().0)
++            .collect::<Vec<_>>();
+         assert_eq!(res, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+         tx.commit().expect(ERROR_COMMIT);
+     }
+@@ -1034,7 +1200,11 @@
+         // Confirm the result
+         let tx = db.tx().expect(ERROR_INIT_TX);
+         let mut cursor = tx.cursor_read::<CanonicalHeaders>().unwrap();
+-        let res = cursor.walk(None).unwrap().map(|res| res.unwrap().0).collect::<Vec<_>>();
++        let res = cursor
++            .walk(None)
++            .unwrap()
++            .map(|res| res.unwrap().0)
++            .collect::<Vec<_>>();
+         assert_eq!(res, vec![0, 1, 2, 3, 4, 5]);
+         tx.commit().expect(ERROR_COMMIT);
+     }
+@@ -1071,7 +1241,11 @@
+         // Confirm the result
+         let tx = db.tx().expect(ERROR_INIT_TX);
+         let mut cursor = tx.cursor_read::<CanonicalHeaders>().unwrap();
+-        let res = cursor.walk(None).unwrap().map(|res| res.unwrap().0).collect::<Vec<_>>();
++        let res = cursor
++            .walk(None)
++            .unwrap()
++            .map(|res| res.unwrap().0)
++            .collect::<Vec<_>>();
+         assert_eq!(res, vec![0, 1, 3, 4, 5]);
+         tx.commit().expect(ERROR_COMMIT);
+     }
+@@ -1088,11 +1262,17 @@
+         cursor.upsert(key, &account).expect(ERROR_UPSERT);
+         assert_eq!(cursor.seek_exact(key), Ok(Some((key, account))));
+ 
+-        let account = Account { nonce: 1, ..Default::default() };
++        let account = Account {
++            nonce: 1,
++            ..Default::default()
++        };
+         cursor.upsert(key, &account).expect(ERROR_UPSERT);
+         assert_eq!(cursor.seek_exact(key), Ok(Some((key, account))));
+ 
+-        let account = Account { nonce: 2, ..Default::default() };
++        let account = Account {
++            nonce: 2,
++            ..Default::default()
++        };
+         cursor.upsert(key, &account).expect(ERROR_UPSERT);
+         assert_eq!(cursor.seek_exact(key), Ok(Some((key, account))));
+ 
+@@ -1124,7 +1304,10 @@
+             .try_for_each(|val| {
+                 cursor.append(
+                     transition_id,
+-                    &AccountBeforeTx { address: Address::with_last_byte(val), info: None },
++                    &AccountBeforeTx {
++                        address: Address::with_last_byte(val),
++                        info: None,
++                    },
+                 )
+             })
+             .expect(ERROR_APPEND);
+@@ -1137,7 +1320,10 @@
+         assert_eq!(
+             cursor.append_dup(
+                 transition_id,
+-                AccountBeforeTx { address: Address::with_last_byte(subkey_to_append), info: None }
++                AccountBeforeTx {
++                    address: Address::with_last_byte(subkey_to_append),
++                    info: None
++                }
+             ),
+             Err(DatabaseWriteError {
+                 info: Error::KeyMismatch.into(),
+@@ -1150,7 +1336,10 @@
+         assert_eq!(
+             cursor.append(
+                 transition_id - 1,
+-                &AccountBeforeTx { address: Address::with_last_byte(subkey_to_append), info: None }
++                &AccountBeforeTx {
++                    address: Address::with_last_byte(subkey_to_append),
++                    info: None
++                }
+             ),
+             Err(DatabaseWriteError {
+                 info: Error::KeyMismatch.into(),
+@@ -1163,7 +1352,10 @@
+         assert_eq!(
+             cursor.append(
+                 transition_id,
+-                &AccountBeforeTx { address: Address::with_last_byte(subkey_to_append), info: None }
++                &AccountBeforeTx {
++                    address: Address::with_last_byte(subkey_to_append),
++                    info: None
++                }
+             ),
+             Ok(())
+         );
+@@ -1200,8 +1392,9 @@
+         .expect(ERROR_DB_CREATION);
+ 
+         // GET
+-        let result =
+-            env.view(|tx| tx.get::<PlainAccountState>(key).expect(ERROR_GET)).expect(ERROR_GET);
++        let result = env
++            .view(|tx| tx.get::<PlainAccountState>(key).expect(ERROR_GET))
++            .expect(ERROR_GET);
+ 
+         assert_eq!(result, Some(value))
+     }
+@@ -1214,15 +1407,24 @@
+ 
+         // PUT (0,0)
+         let value00 = StorageEntry::default();
+-        env.update(|tx| tx.put::<PlainStorageState>(key, value00).expect(ERROR_PUT)).unwrap();
++        env.update(|tx| tx.put::<PlainStorageState>(key, value00).expect(ERROR_PUT))
++            .unwrap();
+ 
+         // PUT (2,2)
+-        let value22 = StorageEntry { key: B256::with_last_byte(2), value: U256::from(2) };
+-        env.update(|tx| tx.put::<PlainStorageState>(key, value22).expect(ERROR_PUT)).unwrap();
++        let value22 = StorageEntry {
++            key: B256::with_last_byte(2),
++            value: U256::from(2),
++        };
++        env.update(|tx| tx.put::<PlainStorageState>(key, value22).expect(ERROR_PUT))
++            .unwrap();
+ 
+         // PUT (1,1)
+-        let value11 = StorageEntry { key: B256::with_last_byte(1), value: U256::from(1) };
+-        env.update(|tx| tx.put::<PlainStorageState>(key, value11).expect(ERROR_PUT)).unwrap();
++        let value11 = StorageEntry {
++            key: B256::with_last_byte(1),
++            value: U256::from(1),
++        };
++        env.update(|tx| tx.put::<PlainStorageState>(key, value11).expect(ERROR_PUT))
++            .unwrap();
+ 
+         // Iterate with cursor
+         {
+@@ -1239,7 +1441,9 @@
+         {
+             let tx = env.tx().expect(ERROR_INIT_TX);
+             let mut cursor = tx.cursor_dup_read::<PlainStorageState>().unwrap();
+-            let mut walker = cursor.walk_dup(Some(key), Some(B256::with_last_byte(1))).unwrap();
++            let mut walker = cursor
++                .walk_dup(Some(key), Some(B256::with_last_byte(1)))
++                .unwrap();
+             assert_eq!(
+                 (key, value11),
+                 walker
+@@ -1260,15 +1464,24 @@
+ 
+         // PUT key1 (0,0)
+         let value00 = StorageEntry::default();
+-        env.update(|tx| tx.put::<PlainStorageState>(key1, value00).expect(ERROR_PUT)).unwrap();
++        env.update(|tx| tx.put::<PlainStorageState>(key1, value00).expect(ERROR_PUT))
++            .unwrap();
+ 
+         // PUT key1 (1,1)
+-        let value11 = StorageEntry { key: B256::with_last_byte(1), value: U256::from(1) };
+-        env.update(|tx| tx.put::<PlainStorageState>(key1, value11).expect(ERROR_PUT)).unwrap();
++        let value11 = StorageEntry {
++            key: B256::with_last_byte(1),
++            value: U256::from(1),
++        };
++        env.update(|tx| tx.put::<PlainStorageState>(key1, value11).expect(ERROR_PUT))
++            .unwrap();
+ 
+         // PUT key2 (2,2)
+-        let value22 = StorageEntry { key: B256::with_last_byte(2), value: U256::from(2) };
+-        env.update(|tx| tx.put::<PlainStorageState>(key2, value22).expect(ERROR_PUT)).unwrap();
++        let value22 = StorageEntry {
++            key: B256::with_last_byte(2),
++            value: U256::from(2),
++        };
++        env.update(|tx| tx.put::<PlainStorageState>(key2, value22).expect(ERROR_PUT))
++            .unwrap();
+ 
+         // Iterate with walk_dup
+         {
+@@ -1303,16 +1516,25 @@
+         let key2 = Address::new([0x22; 20]);
+ 
+         // PUT key1 (0,1)
+-        let value01 = StorageEntry { key: B256::with_last_byte(0), value: U256::from(1) };
+-        env.update(|tx| tx.put::<PlainStorageState>(key1, value01).expect(ERROR_PUT)).unwrap();
++        let value01 = StorageEntry {
++            key: B256::with_last_byte(0),
++            value: U256::from(1),
++        };
++        env.update(|tx| tx.put::<PlainStorageState>(key1, value01).expect(ERROR_PUT))
++            .unwrap();
+ 
+         // PUT key1 (0,0)
+         let value00 = StorageEntry::default();
+-        env.update(|tx| tx.put::<PlainStorageState>(key1, value00).expect(ERROR_PUT)).unwrap();
++        env.update(|tx| tx.put::<PlainStorageState>(key1, value00).expect(ERROR_PUT))
++            .unwrap();
+ 
+         // PUT key2 (2,2)
+-        let value22 = StorageEntry { key: B256::with_last_byte(2), value: U256::from(2) };
+-        env.update(|tx| tx.put::<PlainStorageState>(key2, value22).expect(ERROR_PUT)).unwrap();
++        let value22 = StorageEntry {
++            key: B256::with_last_byte(2),
++            value: U256::from(2),
++        };
++        env.update(|tx| tx.put::<PlainStorageState>(key2, value22).expect(ERROR_PUT))
++            .unwrap();
+ 
+         // Iterate with walk
+         {
+@@ -1333,7 +1555,10 @@
+             let mut cursor = tx.cursor_dup_read::<PlainStorageState>().unwrap();
+ 
+             // NOTE: There are two values with same SubKey but only first one is shown
+-            assert_eq!(Ok(Some(value00)), cursor.seek_by_key_subkey(key1, value00.key));
++            assert_eq!(
++                Ok(Some(value00)),
++                cursor.seek_by_key_subkey(key1, value00.key)
++            );
+             // key1 but value is greater than the one in the DB
+             assert_eq!(Ok(None), cursor.seek_by_key_subkey(key1, value22.key));
+         }
+@@ -1349,8 +1574,11 @@
+             let key = ShardedKey::new(real_key, if i == shards { u64::MAX } else { i * 100 });
+             let list = IntegerList::new_pre_sorted([i * 100u64]);
+ 
+-            db.update(|tx| tx.put::<AccountsHistory>(key.clone(), list.clone()).expect(""))
+-                .unwrap();
++            db.update(|tx| {
++                tx.put::<AccountsHistory>(key.clone(), list.clone())
++                    .expect("")
++            })
++            .unwrap();
+         }
+ 
+         // Seek value with non existing key.
+@@ -1378,7 +1606,9 @@
+ 
+             // It will seek the MAX value of transition index and try to use prev to get first
+             // biggers.
+-            let _unknown = cursor.seek_exact(ShardedKey::new(real_key, u64::MAX)).unwrap();
++            let _unknown = cursor
++                .seek_exact(ShardedKey::new(real_key, u64::MAX))
++                .unwrap();
+             let (key, list) = cursor
+                 .prev()
+                 .expect("element should exist.")
+diff -ruN reth-145/crates/storage/db/src/implementation/mdbx/tx.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/src/implementation/mdbx/tx.rs
+--- reth-145/crates/storage/db/src/implementation/mdbx/tx.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/src/implementation/mdbx/tx.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Transaction wrapper for libmdbx-sys.
+ 
+ use super::{cursor::Cursor, utils::*};
+@@ -55,7 +58,9 @@
+         let metrics_handler = env_metrics
+             .map(|env_metrics| {
+                 let handler = MetricsHandler::<K>::new(inner.id()?, env_metrics);
+-                handler.env_metrics.record_opened_transaction(handler.transaction_mode());
++                handler
++                    .env_metrics
++                    .record_opened_transaction(handler.transaction_mode());
+                 handler.log_transaction_opened();
+                 Ok(handler)
+             })
+@@ -65,12 +70,17 @@
+ 
+     #[inline]
+     const fn new_inner(inner: Transaction<K>, metrics_handler: Option<MetricsHandler<K>>) -> Self {
+-        Self { inner, metrics_handler }
++        Self {
++            inner,
++            metrics_handler,
++        }
+     }
+ 
+     /// Gets this transaction ID.
+     pub fn id(&self) -> reth_libmdbx::Result<u64> {
+-        self.metrics_handler.as_ref().map_or_else(|| self.inner.id(), |handler| Ok(handler.txn_id))
++        self.metrics_handler
++            .as_ref()
++            .map_or_else(|| self.inner.id(), |handler| Ok(handler.txn_id))
+     }
+ 
+     /// Gets a table database handle if it exists, otherwise creates it.
+@@ -231,22 +241,27 @@
+     /// NOTE: Backtrace is recorded using [`Backtrace::force_capture`], so `RUST_BACKTRACE` env var
+     /// is not needed.
+     fn log_backtrace_on_long_read_transaction(&self) {
+-        if self.record_backtrace &&
+-            !self.backtrace_recorded.load(Ordering::Relaxed) &&
+-            self.transaction_mode().is_read_only()
++        if self.record_backtrace
++            && !self.backtrace_recorded.load(Ordering::Relaxed)
++            && self.transaction_mode().is_read_only()
+         {
+             let open_duration = self.start.elapsed();
+             if open_duration >= self.long_transaction_duration {
+                 self.backtrace_recorded.store(true, Ordering::Relaxed);
+                 #[cfg(debug_assertions)]
+                 let message = format!(
+-                    "The database read transaction has been open for too long. Open backtrace:\n{}\n\nCurrent backtrace:\n{}",
++                    "The database read transaction has been open for too long. Open backtrace:
++{}
++
++Current backtrace:
++{}",
+                     self.open_backtrace,
+                     Backtrace::force_capture()
+                 );
+                 #[cfg(not(debug_assertions))]
+                 let message = format!(
+-                    "The database read transaction has been open for too long. Backtrace:\n{}",
++                    "The database read transaction has been open for too long. Backtrace:
++{}",
+                     Backtrace::force_capture()
+                 );
+                 warn!(
+@@ -299,7 +314,11 @@
+ 
+     fn commit(self) -> Result<bool, DatabaseError> {
+         self.execute_with_close_transaction_metric(TransactionOutcome::Commit, |this| {
+-            match this.inner.commit().map_err(|e| DatabaseError::Commit(e.into())) {
++            match this
++                .inner
++                .commit()
++                .map_err(|e| DatabaseError::Commit(e.into()))
++            {
+                 Ok((v, latency)) => (Ok(v), Some(latency)),
+                 Err(e) => (Err(e), None),
+             }
+@@ -353,7 +372,13 @@
+             Operation::Put,
+             Some(value.as_ref().len()),
+             |tx| {
+-                tx.put(self.get_dbi::<T>()?, key.as_ref(), value, WriteFlags::UPSERT).map_err(|e| {
++                tx.put(
++                    self.get_dbi::<T>()?,
++                    key.as_ref(),
++                    value,
++                    WriteFlags::UPSERT,
++                )
++                .map_err(|e| {
+                     DatabaseWriteError {
+                         info: e.into(),
+                         operation: DatabaseWriteOperation::Put,
+@@ -385,7 +410,9 @@
+     }
+ 
+     fn clear<T: Table>(&self) -> Result<(), DatabaseError> {
+-        self.inner.clear_db(self.get_dbi::<T>()?).map_err(|e| DatabaseError::Delete(e.into()))?;
++        self.inner
++            .clear_db(self.get_dbi::<T>()?)
++            .map_err(|e| DatabaseError::Delete(e.into()))?;
+ 
+         Ok(())
+     }
+@@ -417,10 +444,15 @@
+             .with_max_read_transaction_duration(Some(MaxReadTransactionDuration::Set(
+                 MAX_DURATION,
+             )));
+-        let db = DatabaseEnv::open(dir.path(), DatabaseEnvKind::RW, args).unwrap().with_metrics();
++        let db = DatabaseEnv::open(dir.path(), DatabaseEnvKind::RW, args)
++            .unwrap()
++            .with_metrics();
+ 
+         let mut tx = db.tx().unwrap();
+-        tx.metrics_handler.as_mut().unwrap().long_transaction_duration = MAX_DURATION;
++        tx.metrics_handler
++            .as_mut()
++            .unwrap()
++            .long_transaction_duration = MAX_DURATION;
+         tx.disable_long_read_transaction_safety();
+         // Give the `TxnManager` some time to time out the transaction.
+         sleep(MAX_DURATION + Duration::from_millis(100));
+@@ -431,7 +463,11 @@
+             Err(DatabaseError::Open(reth_libmdbx::Error::NotFound.into()))
+         );
+         // Backtrace is not recorded.
+-        assert!(!tx.metrics_handler.unwrap().backtrace_recorded.load(Ordering::Relaxed));
++        assert!(!tx
++            .metrics_handler
++            .unwrap()
++            .backtrace_recorded
++            .load(Ordering::Relaxed));
+     }
+ 
+     #[test]
+@@ -443,19 +479,30 @@
+             .with_max_read_transaction_duration(Some(MaxReadTransactionDuration::Set(
+                 MAX_DURATION,
+             )));
+-        let db = DatabaseEnv::open(dir.path(), DatabaseEnvKind::RW, args).unwrap().with_metrics();
++        let db = DatabaseEnv::open(dir.path(), DatabaseEnvKind::RW, args)
++            .unwrap()
++            .with_metrics();
+ 
+         let mut tx = db.tx().unwrap();
+-        tx.metrics_handler.as_mut().unwrap().long_transaction_duration = MAX_DURATION;
++        tx.metrics_handler
++            .as_mut()
++            .unwrap()
++            .long_transaction_duration = MAX_DURATION;
+         // Give the `TxnManager` some time to time out the transaction.
+         sleep(MAX_DURATION + Duration::from_millis(100));
+ 
+         // Transaction has timed out.
+         assert_eq!(
+             tx.get::<tables::Transactions>(0),
+-            Err(DatabaseError::Open(reth_libmdbx::Error::ReadTransactionTimeout.into()))
++            Err(DatabaseError::Open(
++                reth_libmdbx::Error::ReadTransactionTimeout.into()
++            ))
+         );
+         // Backtrace is recorded.
+-        assert!(tx.metrics_handler.unwrap().backtrace_recorded.load(Ordering::Relaxed));
++        assert!(tx
++            .metrics_handler
++            .unwrap()
++            .backtrace_recorded
++            .load(Ordering::Relaxed));
+     }
+ }
+diff -ruN reth-145/crates/storage/db/src/implementation/mdbx/utils.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/src/implementation/mdbx/utils.rs
+--- reth-145/crates/storage/db/src/implementation/mdbx/utils.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/src/implementation/mdbx/utils.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Small database table utilities and helper functions.
+ 
+ use crate::{
+diff -ruN reth-145/crates/storage/db/src/implementation/mod.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/src/implementation/mod.rs
+--- reth-145/crates/storage/db/src/implementation/mod.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/src/implementation/mod.rs	2025-12-20 16:08:23
+@@ -1,2 +1,5 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ #[cfg(feature = "mdbx")]
+ pub(crate) mod mdbx;
+diff -ruN reth-145/crates/storage/db/src/lib.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/src/lib.rs
+--- reth-145/crates/storage/db/src/lib.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/src/lib.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! MDBX implementation for reth's database abstraction layer.
+ //!
+ //! This crate is an implementation of [`reth-db-api`] for MDBX, as well as a few other common
+@@ -78,7 +81,10 @@
+ 
+     impl<DB: std::fmt::Debug> std::fmt::Debug for TempDatabase<DB> {
+         fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+-            f.debug_struct("TempDatabase").field("db", &self.db).field("path", &self.path).finish()
++            f.debug_struct("TempDatabase")
++                .field("db", &self.db)
++                .field("path", &self.path)
++                .finish()
+         }
+     }
+ 
+@@ -161,7 +167,10 @@
+ 
+     /// Get a temporary directory path to use for the database
+     pub fn tempdir_path() -> PathBuf {
+-        let builder = tempfile::Builder::new().prefix("reth-test-").rand_bytes(8).tempdir();
++        let builder = tempfile::Builder::new()
++            .prefix("reth-test-")
++            .rand_bytes(8)
++            .tempdir();
+         builder.expect(ERROR_TEMPDIR).keep()
+     }
+ 
+@@ -246,8 +255,11 @@
+ 
+         // Database is not empty, version file is malformed
+         {
+-            reth_fs_util::write(path.path().join(db_version_file_path(&path)), "invalid-version")
+-                .unwrap();
++            reth_fs_util::write(
++                path.path().join(db_version_file_path(&path)),
++                "invalid-version",
++            )
++            .unwrap();
+             let db = init_db(&path, args.clone());
+             assert!(db.is_err());
+             assert_matches!(
+@@ -281,7 +293,10 @@
+         }
+ 
+         // Client version is recorded
+-        let first_version = ClientVersion { version: String::from("v1"), ..Default::default() };
++        let first_version = ClientVersion {
++            version: String::from("v1"),
++            ..Default::default()
++        };
+         {
+             let db = init_db(&path, DatabaseArguments::new(first_version.clone())).unwrap();
+             let tx = db.tx().unwrap();
+@@ -315,7 +330,10 @@
+ 
+         // Different client version is recorded
+         std::thread::sleep(Duration::from_secs(1));
+-        let second_version = ClientVersion { version: String::from("v2"), ..Default::default() };
++        let second_version = ClientVersion {
++            version: String::from("v2"),
++            ..Default::default()
++        };
+         {
+             let db = init_db(&path, DatabaseArguments::new(second_version.clone())).unwrap();
+             let tx = db.tx().unwrap();
+@@ -333,7 +351,10 @@
+ 
+         // Different client version is recorded on db open.
+         std::thread::sleep(Duration::from_secs(1));
+-        let third_version = ClientVersion { version: String::from("v3"), ..Default::default() };
++        let third_version = ClientVersion {
++            version: String::from("v3"),
++            ..Default::default()
++        };
+         {
+             let db = open_db(path.path(), DatabaseArguments::new(third_version.clone())).unwrap();
+             let tx = db.tx().unwrap();
+diff -ruN reth-145/crates/storage/db/src/lockfile.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/src/lockfile.rs
+--- reth-145/crates/storage/db/src/lockfile.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/src/lockfile.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Storage lock utils.
+ 
+ #![cfg_attr(feature = "disable-lock", allow(dead_code))]
+@@ -53,7 +56,7 @@
+                     start_time = process_lock.start_time,
+                     "Storage lock already taken."
+                 );
+-                return Err(StorageLockError::Taken(process_lock.pid))
++                return Err(StorageLockError::Taken(process_lock.pid));
+             }
+         }
+ 
+@@ -114,13 +117,18 @@
+             true,
+             ProcessRefreshKind::nothing(),
+         );
+-        system.process(pid2).map(|process| Self { pid, start_time: process.start_time() })
++        system.process(pid2).map(|process| Self {
++            pid,
++            start_time: process.start_time(),
++        })
+     }
+ 
+     /// Creates [`Self`] from own process.
+     fn own() -> Self {
+         static CACHE: OnceLock<ProcessUID> = OnceLock::new();
+-        CACHE.get_or_init(|| Self::new(process::id() as usize).expect("own process")).clone()
++        CACHE
++            .get_or_init(|| Self::new(process::id() as usize).expect("own process"))
++            .clone()
+     }
+ 
+     /// Parses [`Self`] from a file.
+@@ -150,8 +158,15 @@
+ 
+     /// Writes `pid` and `start_time` to a file.
+     fn write(&self, path: &Path) -> Result<(), StorageLockError> {
+-        reth_fs_util::write(path, format!("{}\n{}", self.pid, self.start_time))
+-            .map_err(StorageLockError::other)
++        reth_fs_util::write(
++            path,
++            format!(
++                "{}
++{}",
++                self.pid, self.start_time
++            ),
++        )
++        .map_err(StorageLockError::other)
+     }
+ }
+ 
+@@ -176,7 +191,10 @@
+         let lock = StorageLock::try_acquire_file_lock(temp_dir.path()).unwrap();
+ 
+         // Same process can re-acquire the lock
+-        assert_eq!(Ok(lock.clone()), StorageLock::try_acquire_file_lock(temp_dir.path()));
++        assert_eq!(
++            Ok(lock.clone()),
++            StorageLock::try_acquire_file_lock(temp_dir.path())
++        );
+ 
+         // A lock of a non existent PID can be acquired.
+         let lock_file = temp_dir.path().join(LOCKFILE_NAME);
+@@ -185,8 +203,16 @@
+         while system.process(fake_pid.into()).is_some() {
+             fake_pid += 1;
+         }
+-        ProcessUID { pid: fake_pid, start_time: u64::MAX }.write(&lock_file).unwrap();
+-        assert_eq!(Ok(lock.clone()), StorageLock::try_acquire_file_lock(temp_dir.path()));
++        ProcessUID {
++            pid: fake_pid,
++            start_time: u64::MAX,
++        }
++        .write(&lock_file)
++        .unwrap();
++        assert_eq!(
++            Ok(lock.clone()),
++            StorageLock::try_acquire_file_lock(temp_dir.path())
++        );
+ 
+         let mut pid_1 = ProcessUID::new(1).unwrap();
+ 
+@@ -200,7 +226,10 @@
+         // A lock of a different but existing PID can be acquired ONLY IF the start_time differs.
+         pid_1.start_time += 1;
+         pid_1.write(&lock_file).unwrap();
+-        assert_eq!(Ok(lock), StorageLock::try_acquire_file_lock(temp_dir.path()));
++        assert_eq!(
++            Ok(lock),
++            StorageLock::try_acquire_file_lock(temp_dir.path())
++        );
+     }
+ 
+     #[test]
+diff -ruN reth-145/crates/storage/db/src/mdbx.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/src/mdbx.rs
+--- reth-145/crates/storage/db/src/mdbx.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/src/mdbx.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Helper functions for initializing and opening a database.
+ 
+ use crate::{is_database_empty, TableSet, Tables};
+diff -ruN reth-145/crates/storage/db/src/metrics.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/src/metrics.rs
+--- reth-145/crates/storage/db/src/metrics.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/src/metrics.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use crate::Tables;
+ use metrics::Histogram;
+ use reth_metrics::{metrics::Counter, Metrics};
+@@ -318,14 +321,22 @@
+         }
+ 
+         if let Some(commit_latency) = commit_latency {
+-            self.commit_preparation_duration_seconds.record(commit_latency.preparation());
+-            self.commit_gc_wallclock_duration_seconds.record(commit_latency.gc_wallclock());
+-            self.commit_audit_duration_seconds.record(commit_latency.audit());
+-            self.commit_write_duration_seconds.record(commit_latency.write());
+-            self.commit_sync_duration_seconds.record(commit_latency.sync());
+-            self.commit_ending_duration_seconds.record(commit_latency.ending());
+-            self.commit_whole_duration_seconds.record(commit_latency.whole());
+-            self.commit_gc_cputime_duration_seconds.record(commit_latency.gc_cputime());
++            self.commit_preparation_duration_seconds
++                .record(commit_latency.preparation());
++            self.commit_gc_wallclock_duration_seconds
++                .record(commit_latency.gc_wallclock());
++            self.commit_audit_duration_seconds
++                .record(commit_latency.audit());
++            self.commit_write_duration_seconds
++                .record(commit_latency.write());
++            self.commit_sync_duration_seconds
++                .record(commit_latency.sync());
++            self.commit_ending_duration_seconds
++                .record(commit_latency.ending());
++            self.commit_whole_duration_seconds
++                .record(commit_latency.whole());
++            self.commit_gc_cputime_duration_seconds
++                .record(commit_latency.gc_cputime());
+         }
+     }
+ }
+diff -ruN reth-145/crates/storage/db/src/static_file/cursor.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/src/static_file/cursor.rs
+--- reth-145/crates/storage/db/src/static_file/cursor.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/src/static_file/cursor.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use super::mask::{ColumnSelectorOne, ColumnSelectorThree, ColumnSelectorTwo};
+ use alloy_primitives::B256;
+ use derive_more::{Deref, DerefMut};
+@@ -17,13 +20,18 @@
+ impl<'a> StaticFileCursor<'a> {
+     /// Returns a new [`StaticFileCursor`].
+     pub fn new(jar: &'a NippyJar<SegmentHeader>, reader: Arc<DataReader>) -> ProviderResult<Self> {
+-        Ok(Self(NippyJarCursor::with_reader(jar, reader).map_err(ProviderError::other)?))
++        Ok(Self(
++            NippyJarCursor::with_reader(jar, reader).map_err(ProviderError::other)?,
++        ))
+     }
+ 
+     /// Returns the current `BlockNumber` or `TxNumber` of the cursor depending on the kind of
+     /// static file segment.
+     pub fn number(&self) -> Option<u64> {
+-        self.jar().user_header().start().map(|start| self.row_index() + start)
++        self.jar()
++            .user_header()
++            .start()
++            .map(|start| self.row_index() + start)
+     }
+ 
+     /// Gets a row of values.
+@@ -33,7 +41,7 @@
+         mask: usize,
+     ) -> ProviderResult<Option<Vec<&'_ [u8]>>> {
+         if self.jar().rows() == 0 {
+-            return Ok(None)
++            return Ok(None);
+         }
+ 
+         let row = match key_or_num {
+@@ -41,7 +49,7 @@
+             KeyOrNumber::Number(n) => match self.jar().user_header().start() {
+                 Some(offset) => {
+                     if offset > n {
+-                        return Ok(None)
++                        return Ok(None);
+                     }
+                     self.row_by_number_with_cols((n - offset) as usize, mask)
+                 }
+@@ -74,7 +82,10 @@
+         let row = self.get(key_or_num, M::MASK)?;
+ 
+         match row {
+-            Some(row) => Ok(Some((M::FIRST::decompress(row[0])?, M::SECOND::decompress(row[1])?))),
++            Some(row) => Ok(Some((
++                M::FIRST::decompress(row[0])?,
++                M::SECOND::decompress(row[1])?,
++            ))),
+             None => Ok(None),
+         }
+     }
+diff -ruN reth-145/crates/storage/db/src/static_file/mask.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/src/static_file/mask.rs
+--- reth-145/crates/storage/db/src/static_file/mask.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/src/static_file/mask.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use reth_db_api::table::Decompress;
+ 
+ ///  Trait for specifying a mask to select one column value.
+diff -ruN reth-145/crates/storage/db/src/static_file/masks.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/src/static_file/masks.rs
+--- reth-145/crates/storage/db/src/static_file/masks.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/src/static_file/masks.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use crate::{
+     add_static_file_mask,
+     static_file::mask::{ColumnSelectorOne, ColumnSelectorTwo},
+diff -ruN reth-145/crates/storage/db/src/static_file/mod.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/src/static_file/mod.rs
+--- reth-145/crates/storage/db/src/static_file/mod.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/src/static_file/mod.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! reth's static file database table import and access
+ 
+ use std::{
+diff -ruN reth-145/crates/storage/db/src/utils.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/src/utils.rs
+--- reth-145/crates/storage/db/src/utils.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/src/utils.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Utils crate for `db`.
+ 
+ use std::path::Path;
+diff -ruN reth-145/crates/storage/db/src/version.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/src/version.rs
+--- reth-145/crates/storage/db/src/version.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/db/src/version.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Database version utils.
+ 
+ use std::{
+@@ -48,7 +51,7 @@
+ pub fn check_db_version_file<P: AsRef<Path>>(db_path: P) -> Result<(), DatabaseVersionError> {
+     let version = get_db_version(db_path)?;
+     if version != DB_VERSION {
+-        return Err(DatabaseVersionError::VersionMismatch { version })
++        return Err(DatabaseVersionError::VersionMismatch { version });
+     }
+ 
+     Ok(())
+@@ -61,11 +64,14 @@
+ pub fn get_db_version<P: AsRef<Path>>(db_path: P) -> Result<u64, DatabaseVersionError> {
+     let version_file_path = db_version_file_path(db_path);
+     match fs::read_to_string(&version_file_path) {
+-        Ok(raw_version) => {
+-            Ok(raw_version.parse::<u64>().map_err(|_| DatabaseVersionError::MalformedFile)?)
+-        }
++        Ok(raw_version) => Ok(raw_version
++            .parse::<u64>()
++            .map_err(|_| DatabaseVersionError::MalformedFile)?),
+         Err(err) if err.kind() == io::ErrorKind::NotFound => Err(DatabaseVersionError::MissingFile),
+-        Err(err) => Err(DatabaseVersionError::IORead { err, path: version_file_path }),
++        Err(err) => Err(DatabaseVersionError::IORead {
++            err,
++            path: version_file_path,
++        }),
+     }
+ }
+ 
+@@ -113,6 +119,9 @@
+         fs::write(db_version_file_path(&dir), "0").unwrap();
+ 
+         let result = check_db_version_file(&dir);
+-        assert_matches!(result, Err(DatabaseVersionError::VersionMismatch { version: 0 }));
++        assert_matches!(
++            result,
++            Err(DatabaseVersionError::VersionMismatch { version: 0 })
++        );
+     }
+ }

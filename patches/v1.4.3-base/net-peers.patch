@@ -1,0 +1,337 @@
+diff -ruN reth-145/crates/net/peers/src/bootnodes/ast.rs /Users/jieliu/Documents/n42/N42-rs/crates/net/peers/src/bootnodes/ast.rs
+--- reth-145/crates/net/peers/src/bootnodes/ast.rs	1969-12-31 19:00:00
++++ /Users/jieliu/Documents/n42/N42-rs/crates/net/peers/src/bootnodes/ast.rs	2025-12-20 16:08:23
+@@ -0,0 +1,11 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
++pub(super) static N42_BOOTNODES : [&str; 1] = [
++    "enode://9342cbfe9c986eb17487ffff7d138890c7de3e06f56c2ac335ee14f6dd481db8edc6038139fab38c5cf25dcbe78ae58f3f119c8fa67a8b0b1a8ae1f7c46923c4@127.0.0.1:12345",
++];
++
++pub(super) static N42_TESTNET_BOOTNODES : [&str; 2] = [
++"enode://6f7655869fe8be864b1621f7df44334235845fb0b4c9113716b1373e7d7130cc0ff4d1296f742824eb5ecb75b5d50d04aed0d8677fa433be796fa36666395331@5.161.199.154:30303",
++"enode://e0a232e3cf5d4cd17f4296b85da907dc475a0e7c27d52245f6d8863f46de321955cf286804cd2f14b35623697417925719589ad6d947cbae549c96332cf65cdc@188.245.191.239:30303",
++];
+diff -ruN reth-145/crates/net/peers/src/bootnodes/ethereum.rs /Users/jieliu/Documents/n42/N42-rs/crates/net/peers/src/bootnodes/ethereum.rs
+--- reth-145/crates/net/peers/src/bootnodes/ethereum.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/net/peers/src/bootnodes/ethereum.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Ethereum bootnodes come from <https://github.com/ledgerwatch/erigon/blob/devel/params/bootnodes.go>
+ 
+ /// Ethereum Foundation Go Bootnodes
+diff -ruN reth-145/crates/net/peers/src/bootnodes/mod.rs /Users/jieliu/Documents/n42/N42-rs/crates/net/peers/src/bootnodes/mod.rs
+--- reth-145/crates/net/peers/src/bootnodes/mod.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/net/peers/src/bootnodes/mod.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Bootnodes for the network
+ 
+ use crate::NodeRecord;
+@@ -6,9 +9,22 @@
+ mod ethereum;
+ pub use ethereum::*;
+ 
++mod ast;
+ mod optimism;
++
++use crate::bootnodes::ast::{N42_BOOTNODES, N42_TESTNET_BOOTNODES};
+ pub use optimism::*;
+ 
++/// Returns parsed ast nodes
++pub fn n42_nodes() -> Vec<NodeRecord> {
++    parse_nodes(&N42_BOOTNODES[..])
++}
++
++/// Returns parsed n42 testnet nodes
++pub fn n42_testnet_nodes() -> Vec<NodeRecord> {
++    parse_nodes(&N42_TESTNET_BOOTNODES[..])
++}
++
+ /// Returns parsed mainnet nodes
+ pub fn mainnet_nodes() -> Vec<NodeRecord> {
+     parse_nodes(&MAINNET_BOOTNODES[..])
+@@ -51,5 +67,8 @@
+ 
+ /// Parses all the nodes
+ pub fn parse_nodes(nodes: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<NodeRecord> {
+-    nodes.into_iter().map(|s| s.as_ref().parse().unwrap()).collect()
++    nodes
++        .into_iter()
++        .map(|s| s.as_ref().parse().unwrap())
++        .collect()
+ }
+diff -ruN reth-145/crates/net/peers/src/bootnodes/optimism.rs /Users/jieliu/Documents/n42/N42-rs/crates/net/peers/src/bootnodes/optimism.rs
+--- reth-145/crates/net/peers/src/bootnodes/optimism.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/net/peers/src/bootnodes/optimism.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! OP bootnodes come from <https://github.com/ethereum-optimism/op-geth/blob/optimism/params/bootnodes.go>
+ 
+ /// OP stack mainnet boot nodes.
+diff -ruN reth-145/crates/net/peers/src/lib.rs /Users/jieliu/Documents/n42/N42-rs/crates/net/peers/src/lib.rs
+--- reth-145/crates/net/peers/src/lib.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/net/peers/src/lib.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Network Types and Utilities.
+ //!
+ //! This crate manages and converts Ethereum network entities such as node records, peer IDs, and
+@@ -178,17 +181,17 @@
+     fn from_str(s: &str) -> Result<Self, Self::Err> {
+         if let Some(rem) = s.strip_prefix("enode://") {
+             if let Ok(record) = NodeRecord::from_str(s) {
+-                return Ok(Self::NodeRecord(record))
++                return Ok(Self::NodeRecord(record));
+             }
+             // incomplete enode
+             if let Ok(peer_id) = PeerId::from_str(rem) {
+-                return Ok(Self::PeerId(peer_id))
++                return Ok(Self::PeerId(peer_id));
+             }
+-            return Err(format!("invalid public key: {rem}"))
++            return Err(format!("invalid public key: {rem}"));
+         }
+         #[cfg(feature = "secp256k1")]
+         if s.starts_with("enr:") {
+-            return Enr::from_str(s).map(AnyNode::Enr)
++            return Enr::from_str(s).map(AnyNode::Enr);
+         }
+         Err("missing 'enr:' prefix for base64-encoded record".to_string())
+     }
+@@ -201,7 +204,11 @@
+             #[cfg(feature = "secp256k1")]
+             Self::Enr(enr) => write!(f, "{enr}"),
+             Self::PeerId(peer_id) => {
+-                write!(f, "enode://{}", alloy_primitives::hex::encode(peer_id.as_slice()))
++                write!(
++                    f,
++                    "enode://{}",
++                    alloy_primitives::hex::encode(peer_id.as_slice())
++                )
+             }
+         }
+     }
+diff -ruN reth-145/crates/net/peers/src/node_record.rs /Users/jieliu/Documents/n42/N42-rs/crates/net/peers/src/node_record.rs
+--- reth-145/crates/net/peers/src/node_record.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/net/peers/src/node_record.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Commonly used `NodeRecord` type for peers.
+ 
+ use crate::PeerId;
+@@ -66,7 +69,7 @@
+         if let IpAddr::V6(v6) = self.address {
+             if let Some(v4) = v6.to_ipv4_mapped() {
+                 self.address = v4.into();
+-                return true
++                return true;
+             }
+         }
+         false
+@@ -92,7 +95,12 @@
+ 
+     /// Creates a new record from a socket addr and peer id.
+     pub const fn new(addr: SocketAddr, id: PeerId) -> Self {
+-        Self { address: addr.ip(), tcp_port: addr.port(), udp_port: addr.port(), id }
++        Self {
++            address: addr.ip(),
++            tcp_port: addr.port(),
++            udp_port: addr.port(),
++            id,
++        }
+     }
+ 
+     /// Creates a new record from an ip address and ports.
+@@ -103,7 +111,12 @@
+         id: PeerId,
+     ) -> Self {
+         let udp_port = udp_port.unwrap_or(tcp_port);
+-        Self { address: ip_addr, tcp_port, udp_port, id }
++        Self {
++            address: ip_addr,
++            tcp_port,
++            udp_port,
++            id,
++        }
+     }
+ 
+     /// The TCP socket address of this node
+@@ -175,7 +188,11 @@
+                 Ipv4Addr::from_str(ip)
+                     .map_err(|e| NodeRecordParseError::InvalidUrl(e.to_string()))?,
+             ),
+-            _ => return Err(NodeRecordParseError::InvalidUrl(format!("invalid host: {url:?}"))),
++            _ => {
++                return Err(NodeRecordParseError::InvalidUrl(format!(
++                    "invalid host: {url:?}"
++                )))
++            }
+         };
+         let port = url
+             .port()
+@@ -185,7 +202,9 @@
+             .query_pairs()
+             .find_map(|(maybe_disc, port)| (maybe_disc.as_ref() == "discport").then_some(port))
+         {
+-            discovery_port.parse::<u16>().map_err(NodeRecordParseError::Discport)?
++            discovery_port
++                .parse::<u16>()
++                .map_err(NodeRecordParseError::Discport)?
+         } else {
+             port
+         };
+@@ -195,7 +214,12 @@
+             .parse::<PeerId>()
+             .map_err(|e| NodeRecordParseError::InvalidId(e.to_string()))?;
+ 
+-        Ok(Self { address, id, tcp_port: port, udp_port })
++        Ok(Self {
++            address,
++            id,
++            tcp_port: port,
++            udp_port,
++        })
+     }
+ }
+ 
+@@ -213,22 +237,35 @@
+     type Error = NodeRecordParseError;
+ 
+     fn try_from(enr: &Enr<secp256k1::SecretKey>) -> Result<Self, Self::Error> {
+-        let Some(address) = enr.ip4().map(IpAddr::from).or_else(|| enr.ip6().map(IpAddr::from))
++        let Some(address) = enr
++            .ip4()
++            .map(IpAddr::from)
++            .or_else(|| enr.ip6().map(IpAddr::from))
+         else {
+-            return Err(NodeRecordParseError::InvalidUrl("ip missing".to_string()))
++            return Err(NodeRecordParseError::InvalidUrl("ip missing".to_string()));
+         };
+ 
+         let Some(udp_port) = enr.udp4().or_else(|| enr.udp6()) else {
+-            return Err(NodeRecordParseError::InvalidUrl("udp port missing".to_string()))
++            return Err(NodeRecordParseError::InvalidUrl(
++                "udp port missing".to_string(),
++            ));
+         };
+ 
+         let Some(tcp_port) = enr.tcp4().or_else(|| enr.tcp6()) else {
+-            return Err(NodeRecordParseError::InvalidUrl("tcp port missing".to_string()))
++            return Err(NodeRecordParseError::InvalidUrl(
++                "tcp port missing".to_string(),
++            ));
+         };
+ 
+         let id = crate::pk2id(&enr.public_key());
+ 
+-        Ok(Self { address, tcp_port, udp_port, id }.into_ipv4_mapped())
++        Ok(Self {
++            address,
++            tcp_port,
++            udp_port,
++            id,
++        }
++        .into_ipv4_mapped())
+     }
+ }
+ 
+diff -ruN reth-145/crates/net/peers/src/trusted_peer.rs /Users/jieliu/Documents/n42/N42-rs/crates/net/peers/src/trusted_peer.rs
+--- reth-145/crates/net/peers/src/trusted_peer.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/net/peers/src/trusted_peer.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! `NodeRecord` type that uses a domain instead of an IP.
+ 
+ use crate::{NodeRecord, PeerId};
+@@ -42,12 +45,22 @@
+ 
+     /// Creates a new record from a socket addr and peer id.
+     pub const fn new(host: Host, port: u16, id: PeerId) -> Self {
+-        Self { host, tcp_port: port, udp_port: port, id }
++        Self {
++            host,
++            tcp_port: port,
++            udp_port: port,
++            id,
++        }
+     }
+ 
+     #[cfg(any(test, feature = "std"))]
+     const fn to_node_record(&self, ip: IpAddr) -> NodeRecord {
+-        NodeRecord { address: ip, id: self.id, tcp_port: self.tcp_port, udp_port: self.udp_port }
++        NodeRecord {
++            address: ip,
++            id: self.id,
++            tcp_port: self.tcp_port,
++            udp_port: self.udp_port,
++        }
+     }
+ 
+     /// Tries to resolve directly to a [`NodeRecord`] if the host is an IP address.
+@@ -152,7 +165,9 @@
+             .query_pairs()
+             .find_map(|(maybe_disc, port)| (maybe_disc.as_ref() == "discport").then_some(port))
+         {
+-            discovery_port.parse::<u16>().map_err(NodeRecordParseError::Discport)?
++            discovery_port
++                .parse::<u16>()
++                .map_err(NodeRecordParseError::Discport)?
+         } else {
+             port
+         };
+@@ -162,7 +177,12 @@
+             .parse::<PeerId>()
+             .map_err(|e| NodeRecordParseError::InvalidId(e.to_string()))?;
+ 
+-        Ok(Self { host, id, tcp_port: port, udp_port })
++        Ok(Self {
++            host,
++            id,
++            tcp_port: port,
++            udp_port,
++        })
+     }
+ }
+ 
+@@ -173,7 +193,12 @@
+             IpAddr::V6(ip) => Host::Ipv6(ip),
+         };
+ 
+-        Self { host, tcp_port: record.tcp_port, udp_port: record.udp_port, id: record.id }
++        Self {
++            host,
++            tcp_port: record.tcp_port,
++            udp_port: record.udp_port,
++            id: record.id,
++        }
+     }
+ }
+ 
+@@ -298,8 +323,11 @@
+         // Run tests
+         for domain in tests {
+             // Construct record
+-            let rec =
+-                TrustedPeer::new(url::Host::Domain(domain.to_owned()), 30300, PeerId::random());
++            let rec = TrustedPeer::new(
++                url::Host::Domain(domain.to_owned()),
++                30300,
++                PeerId::random(),
++            );
+ 
+             // Resolve domain and validate
+             let ensure = |rec: NodeRecord| match rec.address {

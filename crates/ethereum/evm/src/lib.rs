@@ -155,33 +155,34 @@ where
     }
 
     fn evm_env(&self, header: &Header) -> EvmEnv {
+        let blob_params = self.chain_spec().blob_params_at_timestamp(header.timestamp);
         let spec = config::revm_spec(self.chain_spec(), header);
 
         // configure evm env based on parent block
-        let cfg_env = CfgEnv::new()
-            .with_chain_id(self.chain_spec().chain().id())
-            .with_spec(spec)
-            .with_blob_max_and_target_count(self.blob_max_and_target_count_by_hardfork());
+        let mut cfg_env =
+            CfgEnv::new().with_chain_id(self.chain_spec().chain().id()).with_spec(spec);
+
+        if let Some(blob_params) = &blob_params {
+            cfg_env.set_max_blobs_per_tx(blob_params.max_blobs_per_tx);
+        }
 
         // derive the EIP-4844 blob fees from the header's `excess_blob_gas` and the current
         // blobparams
-        let blob_excess_gas_and_price = header
-            .excess_blob_gas
-            .zip(self.chain_spec().blob_params_at_timestamp(header.timestamp))
-            .map(|(excess_blob_gas, params)| {
+        let blob_excess_gas_and_price =
+            header.excess_blob_gas.zip(blob_params).map(|(excess_blob_gas, params)| {
                 let blob_gasprice = params.calc_blob_fee(excess_blob_gas);
                 BlobExcessGasAndPrice { excess_blob_gas, blob_gasprice }
             });
 
         let block_env = BlockEnv {
-            number: header.number(),
+            number: U256::from(header.number()),
             //beneficiary: header.beneficiary(),
             beneficiary: if let Ok(b) = recover_address(header) {
                 b
             } else {
                 header.beneficiary()
             },
-            timestamp: header.timestamp(),
+            timestamp: U256::from(header.timestamp()),
             difficulty: if spec >= SpecId::MERGE { U256::ZERO } else { header.difficulty() },
             prevrandao: if spec >= SpecId::MERGE { header.mix_hash() } else { None },
             gas_limit: header.gas_limit(),
@@ -198,24 +199,27 @@ where
         attributes: &NextBlockEnvAttributes,
     ) -> Result<EvmEnv, Self::Error> {
         // ensure we're not missing any timestamp based hardforks
+        let chain_spec = self.chain_spec();
+        let blob_params = chain_spec.blob_params_at_timestamp(attributes.timestamp);
         let spec_id = revm_spec_by_timestamp_and_block_number(
-            self.chain_spec(),
+            chain_spec,
             attributes.timestamp,
             parent.number() + 1,
         );
 
         // configure evm env based on parent block
-        let cfg = CfgEnv::new()
-            .with_chain_id(self.chain_spec().chain().id())
-            .with_spec(spec_id)
-            .with_blob_max_and_target_count(self.blob_max_and_target_count_by_hardfork());
+        let mut cfg =
+            CfgEnv::new().with_chain_id(self.chain_spec().chain().id()).with_spec(spec_id);
 
-        let blob_params = self.chain_spec().blob_params_at_timestamp(attributes.timestamp);
+        if let Some(blob_params) = &blob_params {
+            cfg.set_max_blobs_per_tx(blob_params.max_blobs_per_tx);
+        }
+
         // if the parent block did not have excess blob gas (i.e. it was pre-cancun), but it is
         // cancun now, we need to set the excess blob gas to the default value(0)
         let blob_excess_gas_and_price = parent
             .maybe_next_block_excess_blob_gas(blob_params)
-            .or_else(|| (spec_id >= SpecId::CANCUN).then_some(0))
+            .or_else(|| (spec_id == SpecId::CANCUN).then_some(0))
             .map(|excess_blob_gas| {
                 let blob_gasprice =
                     blob_params.unwrap_or_else(BlobParams::cancun).calc_blob_fee(excess_blob_gas);
@@ -245,9 +249,9 @@ where
         }
 
         let block_env = BlockEnv {
-            number: parent.number + 1,
+            number: U256::from(parent.number + 1),
             beneficiary: attributes.suggested_fee_recipient,
-            timestamp: attributes.timestamp,
+            timestamp: U256::from(attributes.timestamp),
             difficulty: U256::ZERO,
             prevrandao: Some(attributes.prev_randao),
             gas_limit,

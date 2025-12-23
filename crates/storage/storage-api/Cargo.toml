@@ -60,3 +60,15 @@ db-api = [
     "dep:reth-db-api",
     "dep:reth-trie-db",
 ]
+
+serde = [
+    "reth-ethereum-primitives/serde",
+    "reth-db-models/serde",
+    "reth-execution-types/serde",
+    "reth-primitives-traits/serde",
+    "reth-prune-types/serde",
+    "reth-stages-types/serde",
+    "alloy-consensus/serde",
+    "alloy-eips/serde",
+    "alloy-primitives/serde",
+]

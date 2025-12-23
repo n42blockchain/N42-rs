@@ -7,7 +7,7 @@ use reth_eth_wire_types::{
     message::RequestPair, BlockBodies, BlockHeaders, Capabilities, DisconnectReason, EthMessage,
     EthNetworkPrimitives, EthVersion, GetBlockBodies, GetBlockHeaders, GetNodeData,
     GetPooledTransactions, GetReceipts, NetworkPrimitives, NodeData, PooledTransactions, Receipts,
-    Status,
+    Receipts69, UnifiedStatus,
 };
 use reth_ethereum_forks::ForkId;
 use reth_network_p2p::error::{RequestError, RequestResult};
@@ -66,7 +66,7 @@ pub struct SessionInfo {
     /// Capabilities the peer announced.
     pub capabilities: Arc<Capabilities>,
     /// The status of the peer to which a session was established.
-    pub status: Arc<Status>,
+    pub status: Arc<UnifiedStatus>,
     /// Negotiated eth version of the session.
     pub version: EthVersion,
     /// The kind of peer this session represents
@@ -232,6 +232,15 @@ pub enum PeerRequest<N: NetworkPrimitives = EthNetworkPrimitives> {
         /// The channel to send the response for receipts.
         response: oneshot::Sender<RequestResult<Receipts<N::Receipt>>>,
     },
+    /// Requests receipts from the peer without bloom filter.
+    ///
+    /// The response should be sent through the channel.
+    GetReceipts69 {
+        /// The request for receipts.
+        request: GetReceipts,
+        /// The channel to send the response for receipts.
+        response: oneshot::Sender<RequestResult<Receipts69<N::Receipt>>>,
+    },
 }
 
 // === impl PeerRequest ===
@@ -250,6 +259,7 @@ impl<N: NetworkPrimitives> PeerRequest<N> {
             Self::GetPooledTransactions { response, .. } => response.send(Err(err)).ok(),
             Self::GetNodeData { response, .. } => response.send(Err(err)).ok(),
             Self::GetReceipts { response, .. } => response.send(Err(err)).ok(),
+            Self::GetReceipts69 { response, .. } => response.send(Err(err)).ok(),
         };
     }
 
@@ -271,7 +281,7 @@ impl<N: NetworkPrimitives> PeerRequest<N> {
             Self::GetNodeData { request, .. } => {
                 EthMessage::GetNodeData(RequestPair { request_id, message: request.clone() })
             }
-            Self::GetReceipts { request, .. } => {
+            Self::GetReceipts { request, .. } | Self::GetReceipts69 { request, .. } => {
                 EthMessage::GetReceipts(RequestPair { request_id, message: request.clone() })
             }
         }

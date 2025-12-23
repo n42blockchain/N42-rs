@@ -22,6 +22,9 @@ pub const RETH_CLIENT_VERSION: &str = concat!("reth/v", env!("CARGO_PKG_VERSION"
 /// Minimum gas limit allowed for transactions.
 pub const MINIMUM_GAS_LIMIT: u64 = 5000;
 
+/// Maximum gas limit allowed for transactions after Osaka hardfork.
+pub const MAX_TX_GAS_LIMIT_OSAKA: u64 = 30_000_000;
+
 /// Maximum gas limit allowed for block.
 /// In hex this number is `0x7fffffffffffffff`
 pub const MAXIMUM_GAS_LIMIT_BLOCK: u64 = 2u64.pow(63) - 1;

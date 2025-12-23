@@ -1,7 +1,4 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
-use crate::{DBProvider, OmmersProvider, StorageLocation};
+use crate::{DBProvider, StorageLocation};
 use alloc::vec::Vec;
 use alloy_consensus::Header;
 use alloy_primitives::BlockNumber;
@@ -56,10 +53,8 @@ impl<T, Provider, Primitives: FullNodePrimitives> ChainStorageWriter<Provider, P
 
 /// Input for reading a block body. Contains a header of block being read and a list of pre-fetched
 /// transactions.
-pub type ReadBodyInput<'a, B> = (
-    &'a <B as Block>::Header,
-    Vec<<<B as Block>::Body as BlockBody>::Transaction>,
-);
+pub type ReadBodyInput<'a, B> =
+    (&'a <B as Block>::Header, Vec<<<B as Block>::Body as BlockBody>::Transaction>);
 
 /// Trait that implements how block bodies are read from the storage.
 ///
@@ -113,21 +108,15 @@ where
         _write_to: StorageLocation,
     ) -> ProviderResult<()> {
         let mut ommers_cursor = provider.tx_ref().cursor_write::<tables::BlockOmmers<H>>()?;
-        let mut withdrawals_cursor = provider
-            .tx_ref()
-            .cursor_write::<tables::BlockWithdrawals>()?;
+        let mut withdrawals_cursor =
+            provider.tx_ref().cursor_write::<tables::BlockWithdrawals>()?;
 
         for (block_number, body) in bodies {
             let Some(body) = body else { continue };
 
             // Write ommers if any
             if !body.ommers.is_empty() {
-                ommers_cursor.append(
-                    block_number,
-                    &StoredBlockOmmers {
-                        ommers: body.ommers,
-                    },
-                )?;
+                ommers_cursor.append(block_number, &StoredBlockOmmers { ommers: body.ommers })?;
             }
 
             // Write withdrawals if any
@@ -148,12 +137,8 @@ where
         block: BlockNumber,
         _remove_from: StorageLocation,
     ) -> ProviderResult<()> {
-        provider
-            .tx_ref()
-            .unwind_table_by_num::<tables::BlockWithdrawals>(block)?;
-        provider
-            .tx_ref()
-            .unwind_table_by_num::<tables::BlockOmmers>(block)?;
+        provider.tx_ref().unwind_table_by_num::<tables::BlockWithdrawals>(block)?;
+        provider.tx_ref().unwind_table_by_num::<tables::BlockOmmers>(block)?;
 
         Ok(())
     }
@@ -161,8 +146,7 @@ where
 
 impl<Provider, T, H> BlockBodyReader<Provider> for EthStorage<T, H>
 where
-    Provider:
-        DBProvider + ChainSpecProvider<ChainSpec: EthereumHardforks> + OmmersProvider<Header = H>,
+    Provider: DBProvider + ChainSpecProvider<ChainSpec: EthereumHardforks>,
     T: SignedTransaction,
     H: FullBlockHeader,
 {
@@ -176,9 +160,7 @@ where
         // TODO: Ideally storage should hold its own copy of chain spec
         let chain_spec = provider.chain_spec();
 
-        let mut withdrawals_cursor = provider
-            .tx_ref()
-            .cursor_read::<tables::BlockWithdrawals>()?;
+        let mut withdrawals_cursor = provider.tx_ref().cursor_read::<tables::BlockWithdrawals>()?;
 
         let mut bodies = Vec::with_capacity(inputs.len());
 
@@ -197,14 +179,15 @@ where
             let ommers = if chain_spec.is_paris_active_at_block(header.number()) {
                 Vec::new()
             } else {
-                provider.ommers(header.number().into())?.unwrap_or_default()
+                // Pre-merge: fetch ommers from database using direct database access
+                provider
+                    .tx_ref()
+                    .cursor_read::<tables::BlockOmmers<H>>()?
+                    .seek_exact(header.number())?
+                    .map(|(_, stored_ommers)| stored_ommers.ommers)
+                    .unwrap_or_default()
             };
-
-            bodies.push(alloy_consensus::BlockBody {
-                transactions,
-                ommers,
-                withdrawals,
-            });
+            bodies.push(alloy_consensus::BlockBody { transactions, ommers, withdrawals });
         }
 
         Ok(bodies)

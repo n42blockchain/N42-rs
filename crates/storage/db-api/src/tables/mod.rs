@@ -324,6 +324,12 @@ tables! {
         type Value = BlockHash;
     }
 
+    /// Maps eth1 block hash to beacon block hash
+    table Eth1HashToBeaconBlockHash{
+        type Key = BlockHash;
+        type Value = BlockHash;
+    }
+
     /// current
     table PlainValidatorState{
         type Key = Address;

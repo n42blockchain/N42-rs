@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! clap [Args](clap::Args) for benchmark configuration
 
 use clap::Args;
@@ -25,7 +22,8 @@ pub struct BenchmarkArgs {
     /// If no path is provided, a secret will be generated and stored in the datadir under
     /// `<DIR>/<CHAIN_ID>/jwt.hex`. For mainnet this would be `~/.reth/mainnet/jwt.hex` by default.
     #[arg(
-        long = "jwtsecret",
+        long = "jwt-secret",
+        alias = "jwtsecret",
         value_name = "PATH",
         global = true,
         required = false

@@ -170,7 +170,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
                     let encoded_length = pooled.encode_2718_len();
 
                     // insert the blob into the store
-                    blob_store.insert(*transaction.tx_hash(), sidecar)?;
+                    blob_store.insert(*transaction.tx_hash(), alloy_eips::eip7594::BlobTransactionSidecarVariant::Eip4844(sidecar))?;
 
                     encoded_length
                 }

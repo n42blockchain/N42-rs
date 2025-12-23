@@ -51,6 +51,9 @@ proptest = { workspace = true, optional = true }
 proptest-arbitrary-interop = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
 
+# rpc-compat
+alloy-rpc-types-eth = { workspace = true, optional = true }
+
 [dev-dependencies]
 reth-codecs.workspace = true
 reth-chainspec = { workspace = true, features = ["arbitrary"] }
@@ -73,6 +76,7 @@ modular-bitfield.workspace = true
 
 [features]
 default = ["std"]
+rpc-compat = ["alloy-rpc-types-eth"]
 std = [
     "alloy-consensus/std",
     "alloy-eips/std",

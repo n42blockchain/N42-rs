@@ -1,0 +1,1147 @@
+diff -ruN reth-145/crates/node/core/Cargo.toml /Users/jieliu/Documents/n42/N42-rs/crates/node/core/Cargo.toml
+--- reth-145/crates/node/core/Cargo.toml	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/node/core/Cargo.toml	2025-11-04 13:17:48
+@@ -44,7 +44,7 @@
+ 
+ # misc
+ eyre.workspace = true
+-clap = { workspace = true, features = ["derive"] }
++clap = { workspace = true, features = ["derive", "env"] }
+ humantime.workspace = true
+ rand.workspace = true
+ derive_more.workspace = true
+diff -ruN reth-145/crates/node/core/build.rs /Users/jieliu/Documents/n42/N42-rs/crates/node/core/build.rs
+--- reth-145/crates/node/core/build.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/node/core/build.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ #![allow(missing_docs)]
+ 
+ use std::{env, error::Error};
+@@ -11,12 +14,18 @@
+ 
+     emitter.add_instructions(&build_builder)?;
+ 
+-    let cargo_builder = CargoBuilder::default().features(true).target_triple(true).build()?;
++    let cargo_builder = CargoBuilder::default()
++        .features(true)
++        .target_triple(true)
++        .build()?;
+ 
+     emitter.add_instructions(&cargo_builder)?;
+ 
+-    let git_builder =
+-        Git2Builder::default().describe(false, true, None).dirty(true).sha(false).build()?;
++    let git_builder = Git2Builder::default()
++        .describe(false, true, None)
++        .dirty(true)
++        .sha(false)
++        .build()?;
+ 
+     emitter.add_instructions(&git_builder)?;
+ 
+@@ -86,7 +95,10 @@
+     // Example: reth/v0.1.0-alpha.1-428a6dc2f/aarch64-apple-darwin
+     println!(
+         "cargo:rustc-env=RETH_P2P_CLIENT_VERSION={}",
+-        format_args!("reth/v{pkg_version}-{sha_short}/{}", env::var("VERGEN_CARGO_TARGET_TRIPLE")?)
++        format_args!(
++            "reth/v{pkg_version}-{sha_short}/{}",
++            env::var("VERGEN_CARGO_TARGET_TRIPLE")?
++        )
+     );
+ 
+     Ok(())
+diff -ruN reth-145/crates/node/core/src/args/benchmark_args.rs /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/benchmark_args.rs
+--- reth-145/crates/node/core/src/args/benchmark_args.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/benchmark_args.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! clap [Args](clap::Args) for benchmark configuration
+ 
+ use clap::Args;
+@@ -21,7 +24,12 @@
+     ///
+     /// If no path is provided, a secret will be generated and stored in the datadir under
+     /// `<DIR>/<CHAIN_ID>/jwt.hex`. For mainnet this would be `~/.reth/mainnet/jwt.hex` by default.
+-    #[arg(long = "jwtsecret", value_name = "PATH", global = true, required = false)]
++    #[arg(
++        long = "jwtsecret",
++        value_name = "PATH",
++        global = true,
++        required = false
++    )]
+     pub auth_jwtsecret: Option<PathBuf>,
+ 
+     /// The RPC url to use for sending engine requests.
+diff -ruN reth-145/crates/node/core/src/args/database.rs /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/database.rs
+--- reth-145/crates/node/core/src/args/database.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/database.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! clap [Args](clap::Args) for database configuration
+ 
+ use std::{fmt, str::FromStr, time::Duration};
+@@ -74,18 +77,26 @@
+         arg: Option<&Arg>,
+         value: &std::ffi::OsStr,
+     ) -> Result<Self::Value, Error> {
+-        let val =
+-            value.to_str().ok_or_else(|| Error::raw(ErrorKind::InvalidUtf8, "Invalid UTF-8"))?;
++        let val = value
++            .to_str()
++            .ok_or_else(|| Error::raw(ErrorKind::InvalidUtf8, "Invalid UTF-8"))?;
+ 
+         val.parse::<LogLevel>().map_err(|err| {
+-            let arg = arg.map(|a| a.to_string()).unwrap_or_else(|| "...".to_owned());
++            let arg = arg
++                .map(|a| a.to_string())
++                .unwrap_or_else(|| "...".to_owned());
+             let possible_values = LogLevel::value_variants()
+                 .iter()
+                 .map(|v| format!("- {:?}: {}", v, v.help_message()))
+                 .collect::<Vec<_>>()
+-                .join("\n");
++                .join(
++                    "
++",
++                );
+             let msg = format!(
+-                "Invalid value '{val}' for {arg}: {err}.\n    Possible values:\n{possible_values}"
++                "Invalid value '{val}' for {arg}: {err}.
++    Possible values:
++{possible_values}"
+             );
+             clap::Error::raw(clap::error::ErrorKind::InvalidValue, msg)
+         })
+diff -ruN reth-145/crates/node/core/src/args/datadir_args.rs /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/datadir_args.rs
+--- reth-145/crates/node/core/src/args/datadir_args.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/datadir_args.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! clap [Args](clap::Args) for datadir config
+ 
+ use crate::dirs::{ChainPath, DataDirPath, MaybePlatformPath};
+diff -ruN reth-145/crates/node/core/src/args/debug.rs /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/debug.rs
+--- reth-145/crates/node/core/src/args/debug.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/debug.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! clap [Args](clap::Args) for debugging purposes
+ 
+ use alloy_primitives::B256;
+@@ -59,13 +62,21 @@
+     pub reorg_frequency: Option<usize>,
+ 
+     /// The reorg depth for chain reorgs.
+-    #[arg(long = "debug.reorg-depth", requires = "reorg_frequency", help_heading = "Debug")]
++    #[arg(
++        long = "debug.reorg-depth",
++        requires = "reorg_frequency",
++        help_heading = "Debug"
++    )]
+     pub reorg_depth: Option<usize>,
+ 
+     /// The path to store engine API messages at.
+     /// If specified, all of the intercepted engine API messages
+     /// will be written to specified location.
+-    #[arg(long = "debug.engine-api-store", help_heading = "Debug", value_name = "PATH")]
++    #[arg(
++        long = "debug.engine-api-store",
++        help_heading = "Debug",
++        value_name = "PATH"
++    )]
+     pub engine_api_store: Option<PathBuf>,
+ 
+     /// Determines which type of invalid block hook to install
+@@ -213,7 +224,7 @@
+ 
+     fn from_str(s: &str) -> Result<Self, Self::Err> {
+         if s.is_empty() {
+-            return Ok(Self(Default::default()))
++            return Ok(Self(Default::default()));
+         }
+         let hooks = s.split(',').map(str::trim).peekable();
+         Self::try_from_selection(hooks)
+@@ -222,7 +233,15 @@
+ 
+ impl fmt::Display for InvalidBlockSelection {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        write!(f, "[{}]", self.0.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", "))
++        write!(
++            f,
++            "[{}]",
++            self.0
++                .iter()
++                .map(|s| s.to_string())
++                .collect::<Vec<_>>()
++                .join(", ")
++        )
+     }
+ }
+ 
+@@ -240,20 +259,26 @@
+         arg: Option<&Arg>,
+         value: &OsStr,
+     ) -> Result<Self::Value, clap::Error> {
+-        let val =
+-            value.to_str().ok_or_else(|| clap::Error::new(clap::error::ErrorKind::InvalidUtf8))?;
++        let val = value
++            .to_str()
++            .ok_or_else(|| clap::Error::new(clap::error::ErrorKind::InvalidUtf8))?;
+         val.parse::<InvalidBlockSelection>().map_err(|err| {
+-            let arg = arg.map(|a| a.to_string()).unwrap_or_else(|| "...".to_owned());
++            let arg = arg
++                .map(|a| a.to_string())
++                .unwrap_or_else(|| "...".to_owned());
+             let possible_values = InvalidBlockHookType::all_variant_names().to_vec().join(",");
+             let msg = format!(
+-                "Invalid value '{val}' for {arg}: {err}.\n    [possible values: {possible_values}]"
++                "Invalid value '{val}' for {arg}: {err}.
++    [possible values: {possible_values}]"
+             );
+             clap::Error::raw(clap::error::ErrorKind::InvalidValue, msg)
+         })
+     }
+ 
+     fn possible_values(&self) -> Option<Box<dyn Iterator<Item = PossibleValue> + '_>> {
+-        let values = InvalidBlockHookType::all_variant_names().iter().map(PossibleValue::new);
++        let values = InvalidBlockHookType::all_variant_names()
++            .iter()
++            .map(PossibleValue::new);
+         Some(Box::new(values))
+     }
+ }
+diff -ruN reth-145/crates/node/core/src/args/dev.rs /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/dev.rs
+--- reth-145/crates/node/core/src/args/dev.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/dev.rs	2025-12-20 16:08:23
+@@ -1,12 +1,16 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! clap [Args](clap::Args) for Dev testnet configuration
+ 
++use alloy_primitives::B256;
+ use std::time::Duration;
+ 
+ use clap::Args;
+ use humantime::parse_duration;
+ 
+ /// Parameters for Dev testnet configuration
+-#[derive(Debug, Args, PartialEq, Eq, Default, Clone, Copy)]
++#[derive(Debug, Args, PartialEq, Eq, Default, Clone)]
+ #[command(next_help_heading = "Dev testnet")]
+ pub struct DevArgs {
+     /// Start the node in dev mode
+@@ -16,7 +20,12 @@
+     /// Disables network discovery and enables local http server.
+     /// Prefunds 20 accounts derived by mnemonic "test test test test test test test test test test
+     /// test junk" with 10 000 ETH each.
+-    #[arg(long = "dev", alias = "auto-mine", help_heading = "Dev testnet", verbatim_doc_comment)]
++    #[arg(
++        long = "dev",
++        alias = "auto-mine",
++        help_heading = "Dev testnet",
++        verbatim_doc_comment
++    )]
+     pub dev: bool,
+ 
+     /// How many transactions to mine per block.
+@@ -39,12 +48,41 @@
+         verbatim_doc_comment
+     )]
+     pub block_time: Option<Duration>,
++
++    /// The signer private key to use for signing for the node in consensus.
++    #[arg(
++        long = "dev.consensus-signer-private-key",
++        env = "CONSENSUS_SIGNER_PRIVATE_KEY",
++        value_name = "CONSENSUS_SIGNER_PRIVATE_KEY",
++        verbatim_doc_comment
++    )]
++    pub consensus_signer_private_key: Option<B256>,
++
++    /// migrate old chain data to this chain from db
++    #[arg(
++        long = "dev.migrate-old-chain-data-from-db",
++        env = "MIGRATE_OLD_CHAIN_DATA_FROM_DB",
++        value_name = "MIGRATE_OLD_CHAIN_DATA_FROM_DB",
++        verbatim_doc_comment
++    )]
++    pub migrate_old_chain_data_from_db: Option<String>,
++
++    /// migrate old chain data to this chain from rpc
++    #[arg(
++        long = "dev.migrate-old-chain-data-from-rpc",
++        env = "MIGRATE_OLD_CHAIN_DATA_FROM_RPC",
++        value_name = "MIGRATE_OLD_CHAIN_DATA_FROM_RPC",
++        verbatim_doc_comment
++    )]
++    pub migrate_old_chain_data_from_rpc: Option<String>,
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+     use clap::Parser;
++    const SIGNER_PRIVATE_KEY_ALL_ZERO: &str =
++        "0x0000000000000000000000000000000000000000000000000000000000000000";
+ 
+     /// A helper type to parse Args more easily
+     #[derive(Parser)]
+@@ -56,13 +94,37 @@
+     #[test]
+     fn test_parse_dev_args() {
+         let args = CommandParser::<DevArgs>::parse_from(["reth"]).args;
+-        assert_eq!(args, DevArgs { dev: false, block_max_transactions: None, block_time: None });
++        assert_eq!(
++            args,
++            DevArgs {
++                dev: false,
++                block_max_transactions: None,
++                block_time: None,
++                consensus_signer_private_key: None
++            }
++        );
+ 
+         let args = CommandParser::<DevArgs>::parse_from(["reth", "--dev"]).args;
+-        assert_eq!(args, DevArgs { dev: true, block_max_transactions: None, block_time: None });
++        assert_eq!(
++            args,
++            DevArgs {
++                dev: true,
++                block_max_transactions: None,
++                block_time: None,
++                consensus_signer_private_key: None
++            }
++        );
+ 
+         let args = CommandParser::<DevArgs>::parse_from(["reth", "--auto-mine"]).args;
+-        assert_eq!(args, DevArgs { dev: true, block_max_transactions: None, block_time: None });
++        assert_eq!(
++            args,
++            DevArgs {
++                dev: true,
++                block_max_transactions: None,
++                block_time: None,
++                consensus_signer_private_key: None
++            }
++        );
+ 
+         let args = CommandParser::<DevArgs>::parse_from([
+             "reth",
+@@ -71,13 +133,22 @@
+             "2",
+         ])
+         .args;
+-        assert_eq!(args, DevArgs { dev: true, block_max_transactions: Some(2), block_time: None });
++        assert_eq!(
++            args,
++            DevArgs {
++                dev: true,
++                block_max_transactions: Some(2),
++                block_time: None,
++                consensus_signer_private_key: None
++            }
++        );
+ 
+         let args =
+             CommandParser::<DevArgs>::parse_from(["reth", "--dev", "--dev.block-time", "1s"]).args;
+         assert_eq!(
+             args,
+             DevArgs {
++                consensus_signer_private_key: None,
+                 dev: true,
+                 block_max_transactions: None,
+                 block_time: Some(std::time::Duration::from_secs(1))
+@@ -103,5 +174,32 @@
+         let default_args = DevArgs::default();
+         let args = CommandParser::<DevArgs>::parse_from(["reth"]).args;
+         assert_eq!(args, default_args);
++    }
++
++    #[test]
++    fn test_parse_arg_consensus_signer_private_key() {
++        let signer_private_key = SIGNER_PRIVATE_KEY_ALL_ZERO.to_string();
++        let cmd = CommandParser::<DevArgs>::parse_from([
++            "reth",
++            "--dev.consensus-signer-private-key",
++            &signer_private_key,
++        ]);
++        assert_eq!(
++            cmd.args.consensus_signer_private_key.unwrap().to_string(),
++            signer_private_key
++        );
++    }
++
++    #[ignore]
++    #[test]
++    fn test_parse_arg_signer_private_key_from_env() {
++        let signer_private_key = SIGNER_PRIVATE_KEY_ALL_ZERO.to_string();
++        std::env::set_var("CONSENSUS_SIGNER_PRIVATE_KEY", signer_private_key.clone());
++        let cmd = CommandParser::<DevArgs>::parse_from(["reth"]);
++        assert_eq!(
++            cmd.args.consensus_signer_private_key.unwrap().to_string(),
++            signer_private_key
++        );
++        std::env::remove_var("CONSENSUS_SIGNER_PRIVATE_KEY");
+     }
+ }
+diff -ruN reth-145/crates/node/core/src/args/engine.rs /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/engine.rs
+--- reth-145/crates/node/core/src/args/engine.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/engine.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! clap [Args](clap::Args) for engine purposes
+ 
+ use clap::Args;
+diff -ruN reth-145/crates/node/core/src/args/error.rs /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/error.rs
+--- reth-145/crates/node/core/src/args/error.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/error.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use std::num::ParseIntError;
+ 
+ /// Error while parsing a `ReceiptsLogPruneConfig`
+diff -ruN reth-145/crates/node/core/src/args/gas_price_oracle.rs /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/gas_price_oracle.rs
+--- reth-145/crates/node/core/src/args/gas_price_oracle.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/gas_price_oracle.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use alloy_primitives::U256;
+ use clap::Args;
+ use reth_rpc_eth_types::GasPriceOracleConfig;
+@@ -30,7 +33,12 @@
+ impl GasPriceOracleArgs {
+     /// Returns a [`GasPriceOracleConfig`] from the arguments.
+     pub fn gas_price_oracle_config(&self) -> GasPriceOracleConfig {
+-        let Self { blocks, ignore_price, max_price, percentile } = self;
++        let Self {
++            blocks,
++            ignore_price,
++            max_price,
++            percentile,
++        } = self;
+         GasPriceOracleConfig {
+             max_price: Some(U256::from(*max_price)),
+             ignore_price: Some(U256::from(*ignore_price)),
+diff -ruN reth-145/crates/node/core/src/args/log.rs /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/log.rs
+--- reth-145/crates/node/core/src/args/log.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/log.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! clap [Args](clap::Args) for logging configuration.
+ 
+ use crate::dirs::{LogsDir, PlatformPath};
+@@ -20,7 +23,12 @@
+     pub log_stdout_format: LogFormat,
+ 
+     /// The filter to use for logs written to stdout.
+-    #[arg(long = "log.stdout.filter", value_name = "FILTER", global = true, default_value = "")]
++    #[arg(
++        long = "log.stdout.filter",
++        value_name = "FILTER",
++        global = true,
++        default_value = ""
++    )]
+     pub log_stdout_filter: String,
+ 
+     /// The format to use for logs written to the log file.
+@@ -28,20 +36,40 @@
+     pub log_file_format: LogFormat,
+ 
+     /// The filter to use for logs written to the log file.
+-    #[arg(long = "log.file.filter", value_name = "FILTER", global = true, default_value = "debug")]
++    #[arg(
++        long = "log.file.filter",
++        value_name = "FILTER",
++        global = true,
++        default_value = "debug"
++    )]
+     pub log_file_filter: String,
+ 
+     /// The path to put log files in.
+-    #[arg(long = "log.file.directory", value_name = "PATH", global = true, default_value_t)]
++    #[arg(
++        long = "log.file.directory",
++        value_name = "PATH",
++        global = true,
++        default_value_t
++    )]
+     pub log_file_directory: PlatformPath<LogsDir>,
+ 
+     /// The maximum size (in MB) of one log file.
+-    #[arg(long = "log.file.max-size", value_name = "SIZE", global = true, default_value_t = 200)]
++    #[arg(
++        long = "log.file.max-size",
++        value_name = "SIZE",
++        global = true,
++        default_value_t = 200
++    )]
+     pub log_file_max_size: u64,
+ 
+     /// The maximum amount of log files that will be stored. If set to 0, background file logging
+     /// is disabled.
+-    #[arg(long = "log.file.max-files", value_name = "COUNT", global = true, default_value_t = 5)]
++    #[arg(
++        long = "log.file.max-files",
++        value_name = "COUNT",
++        global = true,
++        default_value_t = 5
++    )]
+     pub log_file_max_files: usize,
+ 
+     /// Write logs to journald.
+@@ -151,7 +179,13 @@
+     verbosity: u8,
+ 
+     /// Silence all log output.
+-    #[arg(long, alias = "silent", short = 'q', global = true, help_heading = "Display")]
++    #[arg(
++        long,
++        alias = "silent",
++        short = 'q',
++        global = true,
++        help_heading = "Display"
++    )]
+     quiet: bool,
+ }
+ 
+diff -ruN reth-145/crates/node/core/src/args/mod.rs /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/mod.rs
+--- reth-145/crates/node/core/src/args/mod.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/mod.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Parameters for configuring the rpc more granularity via CLI
+ 
+ /// NetworkArg struct for configuring the network
+diff -ruN reth-145/crates/node/core/src/args/network.rs /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/network.rs
+--- reth-145/crates/node/core/src/args/network.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/network.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! clap [Args](clap::Args) for network related arguments.
+ 
+ use std::{
+@@ -35,7 +38,7 @@
+ };
+ use reth_network_peers::{mainnet_nodes, TrustedPeer};
+ use secp256k1::SecretKey;
+-use tracing::error;
++use tracing::{debug, error};
+ 
+ use crate::version::P2P_CLIENT_VERSION;
+ 
+@@ -70,7 +73,12 @@
+ 
+     /// The path to the known peers file. Connected peers are dumped to this file on nodes
+     /// shutdown, and read on startup. Cannot be used with `--no-persist-peers`.
+-    #[arg(long, value_name = "FILE", verbatim_doc_comment, conflicts_with = "no_persist_peers")]
++    #[arg(
++        long,
++        value_name = "FILE",
++        verbatim_doc_comment,
++        conflicts_with = "no_persist_peers"
++    )]
+     pub peers_file: Option<PathBuf>,
+ 
+     /// Custom node identity
+@@ -153,7 +161,11 @@
+     /// Name of network interface used to communicate with peers.
+     ///
+     /// If flag is set, but no value is passed, the default interface for docker `eth0` is tried.
+-    #[arg(long = "net-if.experimental", conflicts_with = "addr", value_name = "IF_NAME")]
++    #[arg(
++        long = "net-if.experimental",
++        conflicts_with = "addr",
++        value_name = "IF_NAME"
++    )]
+     pub net_if: Option<String>,
+ 
+     /// Transaction Propagation Policy
+@@ -167,7 +179,11 @@
+     /// Returns the resolved IP address.
+     pub fn resolved_addr(&self) -> IpAddr {
+         if let Some(ref if_name) = self.net_if {
+-            let if_name = if if_name.is_empty() { DEFAULT_NET_IF_NAME } else { if_name };
++            let if_name = if if_name.is_empty() {
++                DEFAULT_NET_IF_NAME
++            } else {
++                if_name
++            };
+             return match reth_net_nat::net_if::resolve_net_if_ip(if_name) {
+                 Ok(addr) => addr,
+                 Err(err) => {
+@@ -188,7 +204,10 @@
+     /// Returns the resolved bootnodes if any are provided.
+     pub fn resolved_bootnodes(&self) -> Option<Vec<NodeRecord>> {
+         self.bootnodes.clone().map(|bootnodes| {
+-            bootnodes.into_iter().filter_map(|node| node.resolve_blocking().ok()).collect()
++            bootnodes
++                .into_iter()
++                .filter_map(|node| node.resolve_blocking().ok())
++                .collect()
+         })
+     }
+     /// Configures and returns a `TransactionsManagerConfig` based on the current settings.
+@@ -228,6 +247,9 @@
+         let chain_bootnodes = self
+             .resolved_bootnodes()
+             .unwrap_or_else(|| chain_spec.bootnodes().unwrap_or_else(mainnet_nodes));
++        debug!(target: "reth::cli",
++            ?chain_bootnodes,
++        );
+         let peers_file = self.peers_file.clone().unwrap_or(default_peers_file);
+ 
+         // Configure peer connections
+@@ -261,7 +283,8 @@
+             // apply discovery settings
+             .apply(|builder| {
+                 let rlpx_socket = (addr, self.port).into();
+-                self.discovery.apply_to_builder(builder, rlpx_socket, chain_bootnodes)
++                self.discovery
++                    .apply_to_builder(builder, rlpx_socket, chain_bootnodes)
+             })
+             .listener_addr(SocketAddr::new(
+                 addr, // set discovery port based on instance number
+@@ -310,7 +333,9 @@
+     /// Resolve all trusted peers at once
+     pub async fn resolve_trusted_peers(&self) -> Result<Vec<NodeRecord>, std::io::Error> {
+         futures::future::try_join_all(
+-            self.trusted_peers.iter().map(|peer| async move { peer.resolve().await }),
++            self.trusted_peers
++                .iter()
++                .map(|peer| async move { peer.resolve().await }),
+         )
+         .await
+     }
+@@ -549,7 +574,10 @@
+ 
+         let args =
+             CommandParser::<NetworkArgs>::parse_from(["reth", "--nat", "extip:0.0.0.0"]).args;
+-        assert_eq!(args.nat, NatResolver::ExternalIp("0.0.0.0".parse().unwrap()));
++        assert_eq!(
++            args.nat,
++            NatResolver::ExternalIp("0.0.0.0".parse().unwrap())
++        );
+     }
+ 
+     #[test]
+diff -ruN reth-145/crates/node/core/src/args/payload_builder.rs /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/payload_builder.rs
+--- reth-145/crates/node/core/src/args/payload_builder.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/payload_builder.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use crate::{cli::config::PayloadBuilderConfig, version::default_extra_data};
+ use alloy_consensus::constants::MAXIMUM_EXTRA_DATA_SIZE;
+ use alloy_eips::merge::SLOT_DURATION;
+@@ -84,15 +87,16 @@
+         _arg: Option<&Arg>,
+         value: &OsStr,
+     ) -> Result<Self::Value, clap::Error> {
+-        let val =
+-            value.to_str().ok_or_else(|| clap::Error::new(clap::error::ErrorKind::InvalidUtf8))?;
++        let val = value
++            .to_str()
++            .ok_or_else(|| clap::Error::new(clap::error::ErrorKind::InvalidUtf8))?;
+         if val.len() > MAXIMUM_EXTRA_DATA_SIZE {
+             return Err(clap::Error::raw(
+                 clap::error::ErrorKind::InvalidValue,
+                 format!(
+                     "Payload builder extradata size exceeds {MAXIMUM_EXTRA_DATA_SIZE}-byte limit"
+                 ),
+-            ))
++            ));
+         }
+         Ok(val.to_string())
+     }
+diff -ruN reth-145/crates/node/core/src/args/pruning.rs /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/pruning.rs
+--- reth-145/crates/node/core/src/args/pruning.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/pruning.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Pruning and full node arguments
+ 
+ use crate::args::error::ReceiptsLogError;
+@@ -128,8 +131,11 @@
+         if let Some(mode) = self.storage_history_prune_mode() {
+             config.segments.storage_history = Some(mode);
+         }
+-        if let Some(receipt_logs) =
+-            self.receipts_log_filter.as_ref().filter(|c| !c.is_empty()).cloned()
++        if let Some(receipt_logs) = self
++            .receipts_log_filter
++            .as_ref()
++            .filter(|c| !c.is_empty())
++            .cloned()
+         {
+             config.segments.receipts_log_filter = receipt_logs;
+             // need to remove the receipts segment filter entirely because that takes precedence
+@@ -225,16 +231,18 @@
+                 if parts.len() < 3 {
+                     return Err(ReceiptsLogError::InvalidFilterFormat(filter.to_string()));
+                 }
+-                let distance =
+-                    parts[2].parse::<u64>().map_err(ReceiptsLogError::InvalidDistance)?;
++                let distance = parts[2]
++                    .parse::<u64>()
++                    .map_err(ReceiptsLogError::InvalidDistance)?;
+                 PruneMode::Distance(distance)
+             }
+             s if s.starts_with("before") => {
+                 if parts.len() < 3 {
+                     return Err(ReceiptsLogError::InvalidFilterFormat(filter.to_string()));
+                 }
+-                let block_number =
+-                    parts[2].parse::<u64>().map_err(ReceiptsLogError::InvalidBlockNumber)?;
++                let block_number = parts[2]
++                    .parse::<u64>()
++                    .map_err(ReceiptsLogError::InvalidBlockNumber)?;
+                 PruneMode::Before(block_number)
+             }
+             _ => return Err(ReceiptsLogError::InvalidPruneMode(parts[1].to_string())),
+@@ -294,9 +302,15 @@
+         assert_eq!(config.0.len(), 3);
+ 
+         // Check that the args were parsed correctly.
+-        let addr1: Address = "0x0000000000000000000000000000000000000001".parse().unwrap();
+-        let addr2: Address = "0x0000000000000000000000000000000000000002".parse().unwrap();
+-        let addr3: Address = "0x0000000000000000000000000000000000000003".parse().unwrap();
++        let addr1: Address = "0x0000000000000000000000000000000000000001"
++            .parse()
++            .unwrap();
++        let addr2: Address = "0x0000000000000000000000000000000000000002"
++            .parse()
++            .unwrap();
++        let addr3: Address = "0x0000000000000000000000000000000000000003"
++            .parse()
++            .unwrap();
+ 
+         assert_eq!(config.0.get(&addr1), Some(&PruneMode::Full));
+         assert_eq!(config.0.get(&addr2), Some(&PruneMode::Distance(1000)));
+@@ -306,7 +320,10 @@
+     #[test]
+     fn test_parse_receipts_log_filter_invalid_filter_format() {
+         let result = parse_receipts_log_filter("invalid_format");
+-        assert!(matches!(result, Err(ReceiptsLogError::InvalidFilterFormat(_))));
++        assert!(matches!(
++            result,
++            Err(ReceiptsLogError::InvalidFilterFormat(_))
++        ));
+     }
+ 
+     #[test]
+@@ -335,6 +352,9 @@
+         let result = parse_receipts_log_filter(
+             "0x0000000000000000000000000000000000000000:before:invalid_block",
+         );
+-        assert!(matches!(result, Err(ReceiptsLogError::InvalidBlockNumber(_))));
++        assert!(matches!(
++            result,
++            Err(ReceiptsLogError::InvalidBlockNumber(_))
++        ));
+     }
+ }
+diff -ruN reth-145/crates/node/core/src/args/ress_args.rs /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/ress_args.rs
+--- reth-145/crates/node/core/src/args/ress_args.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/ress_args.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use clap::Args;
+ 
+ /// The default number of maximum active connections.
+diff -ruN reth-145/crates/node/core/src/args/rpc_server.rs /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/rpc_server.rs
+--- reth-145/crates/node/core/src/args/rpc_server.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/rpc_server.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! clap [Args](clap::Args) for RPC related arguments.
+ 
+ use std::{
+@@ -108,7 +111,12 @@
+     ///
+     /// If no path is provided, a secret will be generated and stored in the datadir under
+     /// `<DIR>/<CHAIN_ID>/jwt.hex`. For mainnet this would be `~/.reth/mainnet/jwt.hex` by default.
+-    #[arg(long = "authrpc.jwtsecret", value_name = "PATH", global = true, required = false)]
++    #[arg(
++        long = "authrpc.jwtsecret",
++        value_name = "PATH",
++        global = true,
++        required = false
++    )]
+     pub auth_jwtsecret: Option<PathBuf>,
+ 
+     /// Enable auth engine API over IPC
+@@ -124,7 +132,12 @@
+     ///
+     /// This is __not__ used for the authenticated engine-API RPC server, see
+     /// `--authrpc.jwtsecret`.
+-    #[arg(long = "rpc.jwtsecret", value_name = "HEX", global = true, required = false)]
++    #[arg(
++        long = "rpc.jwtsecret",
++        value_name = "HEX",
++        global = true,
++        required = false
++    )]
+     pub rpc_jwtsecret: Option<JwtSecret>,
+ 
+     /// Set the maximum RPC request payload size for both HTTP and WS in megabytes.
+@@ -297,8 +310,11 @@
+     /// Append a random string to the ipc path, to prevent possible collisions when multiple nodes
+     /// are being run on the same machine.
+     pub fn with_ipc_random_path(mut self) -> Self {
+-        let random_string: String =
+-            rand::rng().sample_iter(rand::distr::Alphanumeric).take(8).map(char::from).collect();
++        let random_string: String = rand::rng()
++            .sample_iter(rand::distr::Alphanumeric)
++            .take(8)
++            .map(char::from)
++            .collect();
+         self.ipcpath = format!("{}-{}", self.ipcpath, random_string);
+         self
+     }
+@@ -370,20 +386,26 @@
+         arg: Option<&Arg>,
+         value: &OsStr,
+     ) -> Result<Self::Value, clap::Error> {
+-        let val =
+-            value.to_str().ok_or_else(|| clap::Error::new(clap::error::ErrorKind::InvalidUtf8))?;
++        let val = value
++            .to_str()
++            .ok_or_else(|| clap::Error::new(clap::error::ErrorKind::InvalidUtf8))?;
+         val.parse::<RpcModuleSelection>().map_err(|err| {
+-            let arg = arg.map(|a| a.to_string()).unwrap_or_else(|| "...".to_owned());
++            let arg = arg
++                .map(|a| a.to_string())
++                .unwrap_or_else(|| "...".to_owned());
+             let possible_values = RethRpcModule::all_variant_names().to_vec().join(",");
+             let msg = format!(
+-                "Invalid value '{val}' for {arg}: {err}.\n    [possible values: {possible_values}]"
++                "Invalid value '{val}' for {arg}: {err}.
++    [possible values: {possible_values}]"
+             );
+             clap::Error::raw(clap::error::ErrorKind::InvalidValue, msg)
+         })
+     }
+ 
+     fn possible_values(&self) -> Option<Box<dyn Iterator<Item = PossibleValue> + '_>> {
+-        let values = RethRpcModule::all_variant_names().iter().map(PossibleValue::new);
++        let values = RethRpcModule::all_variant_names()
++            .iter()
++            .map(PossibleValue::new);
+         Some(Box::new(values))
+     }
+ }
+diff -ruN reth-145/crates/node/core/src/args/rpc_state_cache.rs /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/rpc_state_cache.rs
+--- reth-145/crates/node/core/src/args/rpc_state_cache.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/rpc_state_cache.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use clap::Args;
+ use reth_rpc_server_types::constants::cache::{
+     DEFAULT_BLOCK_CACHE_MAX_LEN, DEFAULT_CONCURRENT_DB_REQUESTS, DEFAULT_HEADER_CACHE_MAX_LEN,
+diff -ruN reth-145/crates/node/core/src/args/stage.rs /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/stage.rs
+--- reth-145/crates/node/core/src/args/stage.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/stage.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Shared arguments related to stages
+ use derive_more::Display;
+ 
+diff -ruN reth-145/crates/node/core/src/args/txpool.rs /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/txpool.rs
+--- reth-145/crates/node/core/src/args/txpool.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/txpool.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Transaction pool arguments
+ 
+ use crate::cli::config::RethTransactionPoolConfig;
+@@ -112,7 +115,11 @@
+     pub max_queued_lifetime: Duration,
+ 
+     /// Path to store the local transaction backup at, to survive node restarts.
+-    #[arg(long = "txpool.transactions-backup", alias = "txpool.journal", value_name = "PATH")]
++    #[arg(
++        long = "txpool.transactions-backup",
++        alias = "txpool.journal",
++        value_name = "PATH"
++    )]
+     pub transactions_backup_path: Option<std::path::PathBuf>,
+ 
+     /// Disables transaction backup to disk on node shutdown.
+diff -ruN reth-145/crates/node/core/src/args/types.rs /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/types.rs
+--- reth-145/crates/node/core/src/args/types.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/args/types.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Additional helper types for CLI parsing.
+ 
+ use std::{fmt, num::ParseIntError, str::FromStr};
+@@ -126,7 +129,11 @@
+         arg: Option<&clap::Arg>,
+         value: &std::ffi::OsStr,
+     ) -> Result<Self::Value, clap::Error> {
+-        if value.to_str().map(|s| s.eq_ignore_ascii_case("max")).unwrap_or(false) {
++        if value
++            .to_str()
++            .map(|s| s.eq_ignore_ascii_case("max"))
++            .unwrap_or(false)
++        {
+             Ok(u64::MAX)
+         } else {
+             self.inner.parse_ref(cmd, arg, value).map(Into::into)
+diff -ruN reth-145/crates/node/core/src/cli/config.rs /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/cli/config.rs
+--- reth-145/crates/node/core/src/cli/config.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/cli/config.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Config traits for various node components.
+ 
+ use alloy_eips::eip1559::ETHEREUM_BLOCK_GAS_LIMIT_36M;
+diff -ruN reth-145/crates/node/core/src/cli/mod.rs /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/cli/mod.rs
+--- reth-145/crates/node/core/src/cli/mod.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/cli/mod.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Additional CLI configuration support.
+ 
+ pub mod config;
+diff -ruN reth-145/crates/node/core/src/dirs.rs /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/dirs.rs
+--- reth-145/crates/node/core/src/dirs.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/dirs.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! reth data directories.
+ 
+ use crate::{args::DatadirArgs, utils::parse_path};
+diff -ruN reth-145/crates/node/core/src/exit.rs /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/exit.rs
+--- reth-145/crates/node/core/src/exit.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/exit.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Helper types for waiting for the node to exit.
+ 
+ use futures::{future::BoxFuture, FutureExt};
+@@ -33,7 +36,10 @@
+     where
+         F: Future<Output = eyre::Result<()>> + 'static + Send,
+     {
+-        Self { consensus_engine_fut: Some(Box::pin(consensus_engine_fut)), terminate }
++        Self {
++            consensus_engine_fut: Some(Box::pin(consensus_engine_fut)),
++            terminate,
++        }
+     }
+ }
+ 
+diff -ruN reth-145/crates/node/core/src/lib.rs /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/lib.rs
+--- reth-145/crates/node/core/src/lib.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/lib.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! The core of the Ethereum node. Collection of utilities and libraries that are used by the node.
+ 
+ #![doc(
+diff -ruN reth-145/crates/node/core/src/node_config.rs /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/node_config.rs
+--- reth-145/crates/node/core/src/node_config.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/node_config.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Support for customizing the node
+ 
+ use crate::{
+@@ -271,7 +274,7 @@
+     }
+ 
+     /// Set the dev args for the node
+-    pub const fn with_dev(mut self, dev: DevArgs) -> Self {
++    pub fn with_dev(mut self, dev: DevArgs) -> Self {
+         self.dev = dev;
+         self
+     }
+@@ -301,7 +304,10 @@
+         let max_block = if let Some(block) = self.debug.max_block {
+             Some(block)
+         } else if let Some(tip) = self.debug.tip {
+-            Some(self.lookup_or_fetch_tip(provider, network_client, tip).await?)
++            Some(
++                self.lookup_or_fetch_tip(provider, network_client, tip)
++                    .await?,
++            )
+         } else {
+             None
+         };
+@@ -320,7 +326,10 @@
+     {
+         let provider = factory.database_provider_ro()?;
+ 
+-        let head = provider.get_stage_checkpoint(StageId::Finish)?.unwrap_or_default().block_number;
++        let head = provider
++            .get_stage_checkpoint(StageId::Finish)?
++            .unwrap_or_default()
++            .block_number;
+ 
+         let header = provider
+             .header_by_number(head)?
+@@ -364,10 +373,13 @@
+         // try to look up the header in the database
+         if let Some(header) = header {
+             info!(target: "reth::cli", ?tip, "Successfully looked up tip block in the database");
+-            return Ok(header.number())
++            return Ok(header.number());
+         }
+ 
+-        Ok(self.fetch_tip_from_network(client, tip.into()).await.number())
++        Ok(self
++            .fetch_tip_from_network(client, tip.into())
++            .await
++            .number())
+     }
+ 
+     /// Attempt to look up the block with the given number and return the header.
+@@ -387,7 +399,7 @@
+             match get_single_header(&client, tip).await {
+                 Ok(tip_header) => {
+                     info!(target: "reth::cli", ?tip, "Successfully fetched tip");
+-                    return tip_header
++                    return tip_header;
+                 }
+                 Err(error) => {
+                     fetch_failures += 1;
+@@ -502,7 +514,7 @@
+             builder: self.builder.clone(),
+             debug: self.debug.clone(),
+             db: self.db,
+-            dev: self.dev,
++            dev: self.dev.clone(),
+             pruning: self.pruning.clone(),
+             datadir: self.datadir.clone(),
+             engine: self.engine.clone(),
+diff -ruN reth-145/crates/node/core/src/utils.rs /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/utils.rs
+--- reth-145/crates/node/core/src/utils.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/utils.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Utility functions for node startup and shutdown, for example path parsing and retrieving single
+ //! blocks from the network.
+ 
+@@ -41,7 +44,10 @@
+ where
+     Client: HeadersClient<Header: reth_primitives_traits::BlockHeader>,
+ {
+-    let (peer_id, response) = client.get_header_with_priority(id, Priority::High).await?.split();
++    let (peer_id, response) = client
++        .get_header_with_priority(id, Priority::High)
++        .await?
++        .split();
+ 
+     let Some(header) = response else {
+         client.report_bad_message(peer_id);
+diff -ruN reth-145/crates/node/core/src/version.rs /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/version.rs
+--- reth-145/crates/node/core/src/version.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/node/core/src/version.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Version information for reth.
+ use alloy_primitives::Bytes;
+ use alloy_rpc_types_engine::ClientCode;
+@@ -33,13 +36,17 @@
+ /// The long version information for reth.
+ pub const LONG_VERSION: &str = concat!(
+     env!("RETH_LONG_VERSION_0"),
+-    "\n",
++    "
++",
+     env!("RETH_LONG_VERSION_1"),
+-    "\n",
++    "
++",
+     env!("RETH_LONG_VERSION_2"),
+-    "\n",
++    "
++",
+     env!("RETH_LONG_VERSION_3"),
+-    "\n",
++    "
++",
+     env!("RETH_LONG_VERSION_4")
+ );
+ 
+@@ -70,7 +77,11 @@
+ /// reth/v{major}.{minor}.{patch}/{OS}
+ /// ```
+ pub fn default_extra_data() -> String {
+-    format!("reth/v{}/{}", env!("CARGO_PKG_VERSION"), std::env::consts::OS)
++    format!(
++        "reth/v{}/{}",
++        env!("CARGO_PKG_VERSION"),
++        std::env::consts::OS
++    )
+ }
+ 
+ /// The default extra data in bytes.
+@@ -95,6 +106,9 @@
+     #[test]
+     fn assert_extra_data_less_32bytes() {
+         let extra_data = default_extra_data();
+-        assert!(extra_data.len() <= 32, "extra data must be less than 32 bytes: {extra_data}")
++        assert!(
++            extra_data.len() <= 32,
++            "extra data must be less than 32 bytes: {extra_data}"
++        )
+     }
+ }

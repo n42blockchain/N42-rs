@@ -1,0 +1,360 @@
+diff -ruN reth-145/crates/ethereum/hardforks/src/display.rs /Users/jieliu/Documents/n42/N42-rs/crates/ethereum/hardforks/src/display.rs
+--- reth-145/crates/ethereum/hardforks/src/display.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/ethereum/hardforks/src/display.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use crate::ForkCondition;
+ use alloc::{
+     format,
+@@ -39,7 +42,9 @@
+             ForkCondition::Block(at) | ForkCondition::Timestamp(at) => {
+                 write!(f, "{name_with_eip:32} @{at}")?;
+             }
+-            ForkCondition::TTD { total_difficulty, .. } => {
++            ForkCondition::TTD {
++                total_difficulty, ..
++            } => {
+                 // All networks that have merged are finalized.
+                 write!(
+                     f,
+@@ -129,11 +134,21 @@
+                 writeln!(f)?;
+             }
+         } else {
+-            format("Merge hard forks", &self.with_merge, self.post_merge.is_empty(), f)?;
++            format(
++                "Merge hard forks",
++                &self.with_merge,
++                self.post_merge.is_empty(),
++                f,
++            )?;
+         }
+ 
+         if !self.post_merge.is_empty() {
+-            format("Post-merge hard forks (timestamp based)", &self.post_merge, true, f)?;
++            format(
++                "Post-merge hard forks (timestamp based)",
++                &self.post_merge,
++                true,
++                f,
++            )?;
+         }
+ 
+         Ok(())
+@@ -151,14 +166,21 @@
+         let mut post_merge = Vec::new();
+ 
+         for (fork, condition) in hardforks {
+-            let mut display_fork =
+-                DisplayFork { name: fork.name().to_string(), activated_at: condition, eip: None };
++            let mut display_fork = DisplayFork {
++                name: fork.name().to_string(),
++                activated_at: condition,
++                eip: None,
++            };
+ 
+             match condition {
+                 ForkCondition::Block(_) => {
+                     pre_merge.push(display_fork);
+                 }
+-                ForkCondition::TTD { activation_block_number, total_difficulty, fork_block } => {
++                ForkCondition::TTD {
++                    activation_block_number,
++                    total_difficulty,
++                    fork_block,
++                } => {
+                     display_fork.activated_at = ForkCondition::TTD {
+                         activation_block_number,
+                         fork_block,
+@@ -173,6 +195,10 @@
+             }
+         }
+ 
+-        Self { pre_merge, with_merge, post_merge }
++        Self {
++            pre_merge,
++            with_merge,
++            post_merge,
++        }
+     }
+ }
+diff -ruN reth-145/crates/ethereum/hardforks/src/hardforks/dev.rs /Users/jieliu/Documents/n42/N42-rs/crates/ethereum/hardforks/src/hardforks/dev.rs
+--- reth-145/crates/ethereum/hardforks/src/hardforks/dev.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/ethereum/hardforks/src/hardforks/dev.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use alloc::vec;
+ 
+ use alloy_primitives::U256;
+@@ -17,10 +20,19 @@
+         (EthereumHardfork::Homestead.boxed(), ForkCondition::Block(0)),
+         (EthereumHardfork::Dao.boxed(), ForkCondition::Block(0)),
+         (EthereumHardfork::Tangerine.boxed(), ForkCondition::Block(0)),
+-        (EthereumHardfork::SpuriousDragon.boxed(), ForkCondition::Block(0)),
++        (
++            EthereumHardfork::SpuriousDragon.boxed(),
++            ForkCondition::Block(0),
++        ),
+         (EthereumHardfork::Byzantium.boxed(), ForkCondition::Block(0)),
+-        (EthereumHardfork::Constantinople.boxed(), ForkCondition::Block(0)),
+-        (EthereumHardfork::Petersburg.boxed(), ForkCondition::Block(0)),
++        (
++            EthereumHardfork::Constantinople.boxed(),
++            ForkCondition::Block(0),
++        ),
++        (
++            EthereumHardfork::Petersburg.boxed(),
++            ForkCondition::Block(0),
++        ),
+         (EthereumHardfork::Istanbul.boxed(), ForkCondition::Block(0)),
+         (EthereumHardfork::Berlin.boxed(), ForkCondition::Block(0)),
+         (EthereumHardfork::London.boxed(), ForkCondition::Block(0)),
+@@ -32,8 +44,17 @@
+                 total_difficulty: U256::ZERO,
+             },
+         ),
+-        (EthereumHardfork::Shanghai.boxed(), ForkCondition::Timestamp(0)),
+-        (EthereumHardfork::Cancun.boxed(), ForkCondition::Timestamp(0)),
+-        (EthereumHardfork::Prague.boxed(), ForkCondition::Timestamp(0)),
++        (
++            EthereumHardfork::Shanghai.boxed(),
++            ForkCondition::Timestamp(0),
++        ),
++        (
++            EthereumHardfork::Cancun.boxed(),
++            ForkCondition::Timestamp(0),
++        ),
++        (
++            EthereumHardfork::Prague.boxed(),
++            ForkCondition::Timestamp(0),
++        ),
+     ])
+ });
+diff -ruN reth-145/crates/ethereum/hardforks/src/hardforks/mod.rs /Users/jieliu/Documents/n42/N42-rs/crates/ethereum/hardforks/src/hardforks/mod.rs
+--- reth-145/crates/ethereum/hardforks/src/hardforks/mod.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/ethereum/hardforks/src/hardforks/mod.rs	2025-12-20 16:08:23
+@@ -1,6 +1,12 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ mod dev;
+ pub use dev::DEV_HARDFORKS;
+ 
++mod n42;
++pub use n42::{beijing_fork, N42_HARDFORKS, N42_HARDFORKS_FOR_CLIQUE_TEST};
++
+ use crate::{ForkCondition, ForkFilter, ForkId, Hardfork, Head};
+ #[cfg(feature = "std")]
+ use rustc_hash::FxHashMap;
+@@ -59,7 +65,10 @@
+     ///
+     /// Equivalent Ethereum hardforks **must be included** as well.
+     pub fn new(forks: Vec<(Box<dyn Hardfork>, ForkCondition)>) -> Self {
+-        let map = forks.iter().map(|(fork, condition)| (fork.name(), *condition)).collect();
++        let map = forks
++            .iter()
++            .map(|(fork, condition)| (fork.name(), *condition))
++            .collect();
+ 
+         Self { forks, map }
+     }
+@@ -120,8 +129,10 @@
+         match self.map.entry(fork.name()) {
+             Entry::Occupied(mut entry) => {
+                 *entry.get_mut() = condition;
+-                if let Some((_, inner)) =
+-                    self.forks.iter_mut().find(|(inner, _)| inner.name() == fork.name())
++                if let Some((_, inner)) = self
++                    .forks
++                    .iter_mut()
++                    .find(|(inner, _)| inner.name() == fork.name())
+                 {
+                     *inner = condition;
+                 }
+@@ -135,7 +146,8 @@
+ 
+     /// Removes `fork` from list.
+     pub fn remove<H: Hardfork>(&mut self, fork: H) {
+-        self.forks.retain(|(inner_fork, _)| inner_fork.name() != fork.name());
++        self.forks
++            .retain(|(inner_fork, _)| inner_fork.name() != fork.name());
+         self.map.remove(fork.name());
+     }
+ }
+@@ -143,7 +155,13 @@
+ impl core::fmt::Debug for ChainHardforks {
+     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+         f.debug_struct("ChainHardforks")
+-            .field("0", &self.forks_iter().map(|(hf, cond)| (hf.name(), cond)).collect::<Vec<_>>())
++            .field(
++                "0",
++                &self
++                    .forks_iter()
++                    .map(|(hf, cond)| (hf.name(), cond))
++                    .collect::<Vec<_>>(),
++            )
+             .finish()
+     }
+ }
+diff -ruN reth-145/crates/ethereum/hardforks/src/hardforks/n42.rs /Users/jieliu/Documents/n42/N42-rs/crates/ethereum/hardforks/src/hardforks/n42.rs
+--- reth-145/crates/ethereum/hardforks/src/hardforks/n42.rs	1969-12-31 19:00:00
++++ /Users/jieliu/Documents/n42/N42-rs/crates/ethereum/hardforks/src/hardforks/n42.rs	2025-12-20 19:09:14
+@@ -0,0 +1,144 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
++use alloc::vec;
++
++use alloy_primitives::U256;
++
++use once_cell as _;
++#[cfg(not(feature = "std"))]
++use once_cell::sync::Lazy as LazyLock;
++#[cfg(feature = "std")]
++use std::sync::LazyLock;
++
++use crate::{ChainHardforks, EthereumHardfork, ForkCondition, Hardfork};
++
++#[derive(Debug, Clone, Default)]
++pub struct BeijingFork;
++
++pub const beijing_fork: BeijingFork = BeijingFork {};
++
++impl Hardfork for BeijingFork {
++    fn name(&self) -> &'static str {
++        "beijing"
++    }
++}
++
++/// N42 Fusaka hardfork timestamps
++/// 
++/// Fusaka = Prague (EL) + Osaka (CL)
++/// 
++/// Timeline (N42 Mainnet):
++/// - Shanghai: 2025-05-07 00:00:00 UTC (1746576000)
++/// - Cancun:   2025-05-07 00:00:00 UTC (1746576000)
++/// - Prague:   2025-06-03 06:00:00 UTC (1748930400)
++/// - Osaka:    2025-07-01 00:00:00 UTC (1751328000) - Fusaka CL upgrade
++///
++/// Note: Osaka enables:
++/// - EIP-2537: BLS12-381 precompiles
++/// - EIP-7594: PeerDAS (data availability sampling)
++/// - Increased blob capacity (target: 6, max: 9)
++pub const N42_OSAKA_TIMESTAMP: u64 = 1751328000;
++
++/// N42 hardforks
++pub static N42_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
++    ChainHardforks::new(vec![
++        (EthereumHardfork::Frontier.boxed(), ForkCondition::Block(0)),
++        (EthereumHardfork::Homestead.boxed(), ForkCondition::Block(0)),
++        (EthereumHardfork::Dao.boxed(), ForkCondition::Block(0)),
++        (EthereumHardfork::Tangerine.boxed(), ForkCondition::Block(0)),
++        (
++            EthereumHardfork::SpuriousDragon.boxed(),
++            ForkCondition::Block(0),
++        ),
++        (EthereumHardfork::Byzantium.boxed(), ForkCondition::Block(0)),
++        (
++            EthereumHardfork::Constantinople.boxed(),
++            ForkCondition::Block(0),
++        ),
++        (
++            EthereumHardfork::Petersburg.boxed(),
++            ForkCondition::Block(0),
++        ),
++        (EthereumHardfork::Istanbul.boxed(), ForkCondition::Block(0)),
++        (EthereumHardfork::Berlin.boxed(), ForkCondition::Block(0)),
++        (EthereumHardfork::London.boxed(), ForkCondition::Block(0)),
++        (
++            EthereumHardfork::ArrowGlacier.boxed(),
++            ForkCondition::Block(0),
++        ),
++        //(beijing_fork.boxed(), ForkCondition::Timestamp(1761621577)),
++        (beijing_fork.boxed(), ForkCondition::Never),
++        (
++            EthereumHardfork::Paris.boxed(),
++            ForkCondition::TTD {
++                activation_block_number: 0,
++                fork_block: Some(0),
++                total_difficulty: U256::ZERO,
++            },
++        ),
++        (
++            EthereumHardfork::Shanghai.boxed(),
++            ForkCondition::Timestamp(1746576000),
++        ),
++        (
++            EthereumHardfork::Cancun.boxed(),
++            ForkCondition::Timestamp(1746576000),
++        ),
++        (
++            EthereumHardfork::Prague.boxed(),
++            ForkCondition::Timestamp(1748930400),
++        ),
++        // Osaka (Fusaka CL) - enables BLS precompiles (EIP-2537) and PeerDAS (EIP-7594)
++        (
++            EthereumHardfork::Osaka.boxed(),
++            ForkCondition::Timestamp(N42_OSAKA_TIMESTAMP),
++        ),
++    ])
++});
++
++pub static N42_HARDFORKS_FOR_CLIQUE_TEST: LazyLock<ChainHardforks> = LazyLock::new(|| {
++    ChainHardforks::new(vec![
++        (EthereumHardfork::Frontier.boxed(), ForkCondition::Block(0)),
++        (EthereumHardfork::Homestead.boxed(), ForkCondition::Block(0)),
++        (EthereumHardfork::Dao.boxed(), ForkCondition::Block(0)),
++        (EthereumHardfork::Tangerine.boxed(), ForkCondition::Block(0)),
++        (
++            EthereumHardfork::SpuriousDragon.boxed(),
++            ForkCondition::Block(0),
++        ),
++        (EthereumHardfork::Byzantium.boxed(), ForkCondition::Block(0)),
++        (
++            EthereumHardfork::Constantinople.boxed(),
++            ForkCondition::Block(0),
++        ),
++        (
++            EthereumHardfork::Petersburg.boxed(),
++            ForkCondition::Block(0),
++        ),
++        (EthereumHardfork::Istanbul.boxed(), ForkCondition::Block(0)),
++        (EthereumHardfork::Berlin.boxed(), ForkCondition::Block(0)),
++        (EthereumHardfork::London.boxed(), ForkCondition::Block(0)),
++        (
++            EthereumHardfork::ArrowGlacier.boxed(),
++            ForkCondition::Block(0),
++        ),
++        //(EthereumHardfork::Beijing.boxed(), ForkCondition::Block(0)),
++        (
++            EthereumHardfork::Paris.boxed(),
++            ForkCondition::TTD {
++                activation_block_number: 0,
++                fork_block: Some(0),
++                total_difficulty: U256::ZERO,
++            },
++        ),
++        (
++            EthereumHardfork::Shanghai.boxed(),
++            ForkCondition::Timestamp(1746576000),
++        ),
++        (
++            EthereumHardfork::Cancun.boxed(),
++            ForkCondition::Timestamp(1746576000),
++        ),
++    ])
++});
+diff -ruN reth-145/crates/ethereum/hardforks/src/lib.rs /Users/jieliu/Documents/n42/N42-rs/crates/ethereum/hardforks/src/lib.rs
+--- reth-145/crates/ethereum/hardforks/src/lib.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/ethereum/hardforks/src/lib.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Ethereum fork types used in reth.
+ //!
+ //! This crate contains Ethereum fork types and helper functions.

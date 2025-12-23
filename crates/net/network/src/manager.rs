@@ -18,7 +18,6 @@
 //! (IP+port) of our node is published via discovery, remote peers can initiate inbound connections
 //! to the local node. Once a (tcp) connection is established, both peers start to authenticate a [RLPx session](https://github.com/ethereum/devp2p/blob/master/rlpx.md) via a handshake. If the handshake was successful, both peers announce their capabilities and are now ready to exchange sub-protocol messages via the `RLPx` session.
 
-use std::collections::HashSet;
 use crate::{
     budget::{DEFAULT_BUDGET_TRY_DRAIN_NETWORK_HANDLE_CHANNEL, DEFAULT_BUDGET_TRY_DRAIN_SWARM},
     config::NetworkConfig,
@@ -41,23 +40,20 @@ use crate::{
 };
 use futures::{Future, StreamExt};
 use parking_lot::Mutex;
-use reth_eth_wire::{DisconnectReason, EthNetworkPrimitives, NetworkPrimitives, NewBlock};
+use reth_chainspec::EnrForkIdEntry;
+use reth_eth_wire::{DisconnectReason, EthNetworkPrimitives, NetworkPrimitives};
 use reth_fs_util::{self as fs, FsPathError};
 use reth_metrics::common::mpsc::UnboundedMeteredSender;
 use reth_network_api::{
     events::{PeerEvent, SessionInfo},
     test_utils::PeersHandle,
     EthProtocolInfo, NetworkEvent, NetworkStatus, PeerInfo, PeerRequest,
-    BlockAnnounceProvider,
-    N42BlockImportError, N42BlockImportOutcome, 
 };
 use reth_network_peers::{NodeRecord, PeerId};
 use reth_network_types::ReputationChangeKind;
 use reth_storage_api::BlockNumReader;
 use reth_tasks::shutdown::GracefulShutdown;
 use reth_tokio_util::EventSender;
-use reth_primitives_traits::Block;
-use alloy_consensus::BlockHeader;
 use secp256k1::SecretKey;
 use std::{
     net::SocketAddr,
@@ -116,7 +112,7 @@ pub struct NetworkManager<N: NetworkPrimitives = EthNetworkPrimitives> {
     /// Receiver half of the command channel set up between this type and the [`NetworkHandle`]
     from_handle_rx: UnboundedReceiverStream<NetworkHandleMessage<N>>,
     /// Handles block imports according to the `eth` protocol.
-    block_import: Box<dyn BlockImport<N::Block>>,
+    block_import: Box<dyn BlockImport<N::NewBlockPayload>>,
     /// Sender for high level network events.
     event_sender: EventSender<NetworkEvent<PeerRequest<N>>>,
     /// Sender half to send events to the
@@ -276,7 +272,9 @@ impl<N: NetworkPrimitives> NetworkManager<N> {
         if let Some(disc_config) = discovery_v4_config.as_mut() {
             // merge configured boot nodes
             disc_config.bootstrap_nodes.extend(resolved_boot_nodes.clone());
-            disc_config.add_eip868_pair("eth", status.forkid);
+            // add the forkid entry for EIP-868, but wrap it in an `EnrForkIdEntry` for proper
+            // encoding
+            disc_config.add_eip868_pair("eth", EnrForkIdEntry::from(status.forkid));
         }
 
         if let Some(discv5) = discovery_v5_config.as_mut() {
@@ -323,7 +321,6 @@ impl<N: NetworkPrimitives> NetworkManager<N> {
         let (to_manager_tx, from_handle_rx) = mpsc::unbounded_channel();
 
         let event_sender: EventSender<NetworkEvent<PeerRequest<N>>> = Default::default();
-        let block_sender: EventSender<NewBlock<N::Block>> = Default::default();
 
         let handle = NetworkHandle::new(
             Arc::clone(&num_active_peers),
@@ -339,7 +336,6 @@ impl<N: NetworkPrimitives> NetworkManager<N> {
             discv5,
             event_sender.clone(),
             nat,
-            block_sender.clone(),
         );
 
         Ok(Self {
@@ -458,7 +454,7 @@ impl<N: NetworkPrimitives> NetworkManager<N> {
             client_version: hello_message.client_version,
             protocol_version: hello_message.protocol_version as u64,
             eth_protocol_info: EthProtocolInfo {
-                difficulty: Some(status.total_difficulty),
+                difficulty: None,
                 head: status.blockhash,
                 network: status.chain.id(),
                 genesis: status.genesis,
@@ -519,6 +515,13 @@ impl<N: NetworkPrimitives> NetworkManager<N> {
                     response,
                 })
             }
+            PeerRequest::GetReceipts69 { request, response } => {
+                self.delegate_eth_request(IncomingEthRequest::GetReceipts69 {
+                    peer_id,
+                    request,
+                    response,
+                })
+            }
             PeerRequest::GetPooledTransactions { request, response } => {
                 self.notify_tx_manager(NetworkTransactionEvent::GetPooledTransactions {
                     peer_id,
@@ -530,7 +533,7 @@ impl<N: NetworkPrimitives> NetworkManager<N> {
     }
 
     /// Invoked after a `NewBlock` message from the peer was validated
-    fn on_block_import_result(&mut self, event: BlockImportEvent<N::Block>) {
+    fn on_block_import_result(&mut self, event: BlockImportEvent<N::NewBlockPayload>) {
         match event {
             BlockImportEvent::Announcement(validation) => match validation {
                 BlockValidation::ValidHeader { block } => {
@@ -562,28 +565,6 @@ impl<N: NetworkPrimitives> NetworkManager<N> {
                             .peers_mut()
                             .apply_reputation_change(&peer, ReputationChangeKind::BadBlock);
                     }
-        }
-    }
-        }
-    }
-
-
-    /// Invoked after a `NewBlock` message from the peer was validated
-    fn n42_on_block_import_result(&mut self,  peers: HashSet<PeerId>, outcome: N42BlockImportOutcome<N::Block>) {
-        let N42BlockImportOutcome { hash, result } = outcome;
-        match result {
-            Ok(block) => {
-                for peer in peers {
-                    self.swarm.state_mut().update_peer_block(&peer, hash, block.block.header().number().clone());
-                    self.swarm.state_mut().announce_new_block(NewBlockMessage{ hash, block: Arc::new(block.clone()) });
-                }
-            },
-            Err(_err) => {
-                for peer in peers {
-                    self.swarm
-                        .state_mut()
-                        .peers_mut()
-                        .apply_reputation_change(&peer, ReputationChangeKind::BadBlock);
                 }
             }
         }
@@ -624,9 +605,7 @@ impl<N: NetworkPrimitives> NetworkManager<N> {
                 self.within_pow_or_disconnect(peer_id, move |this| {
                     this.swarm.state_mut().on_new_block(peer_id, block.hash);
                     // start block import process
-                    this.block_import.on_new_block(peer_id, NewBlockEvent::Block(block.clone()));
-                    // n42
-                    this.handle.import_block(peer_id, (*block.block).clone());
+                    this.block_import.on_new_block(peer_id, NewBlockEvent::Block(block));
                 });
             }
             PeerMessage::PooledTransactions(msg) => {
@@ -647,6 +626,7 @@ impl<N: NetworkPrimitives> NetworkManager<N> {
             PeerMessage::SendTransactions(_) => {
                 unreachable!("Not emitted by session")
             }
+            PeerMessage::BlockRangeUpdated(_) => {}
             PeerMessage::Other(other) => {
                 debug!(target: "net", message_id=%other.id, "Ignoring unsupported message");
             }
@@ -745,6 +725,9 @@ impl<N: NetworkPrimitives> NetworkManager<N> {
                 } else {
                     let _ = tx.send(None);
                 }
+            }
+            NetworkHandleMessage::InternalBlockRangeUpdate(block_range_update) => {
+                self.swarm.sessions_mut().update_advertised_block_range(block_range_update);
             }
             NetworkHandleMessage::EthMessage { peer_id, message } => {
                 self.swarm.sessions_mut().send_message(&peer_id, message)
@@ -1107,11 +1090,6 @@ impl<N: NetworkPrimitives> Future for NetworkManager<N> {
         while let Poll::Ready(outcome) = this.block_import.poll(cx) {
             this.on_block_import_result(outcome);
         }
-
-        while let Some((peers, outcome)) = this.handle.take_validated_block() {
-            this.n42_on_block_import_result(peers, outcome);
-        }
-
 
         // These loops drive the entire state of network and does a lot of work. Under heavy load
         // (many messages/events), data may arrive faster than it can be processed (incoming

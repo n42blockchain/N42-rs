@@ -12,7 +12,7 @@ use crate::{
 use futures::Stream;
 use reth_eth_wire::{
     errors::EthStreamError, Capabilities, DisconnectReason, EthNetworkPrimitives, EthVersion,
-    NetworkPrimitives, Status,
+    NetworkPrimitives, UnifiedStatus,
 };
 use reth_network_api::{PeerRequest, PeerRequestSender};
 use reth_network_peers::PeerId;
@@ -125,6 +125,7 @@ impl<N: NetworkPrimitives> Swarm<N> {
                 messages,
                 direction,
                 timeout,
+                range_info,
             } => {
                 self.state.on_session_activated(
                     peer_id,
@@ -132,6 +133,7 @@ impl<N: NetworkPrimitives> Swarm<N> {
                     status.clone(),
                     messages.clone(),
                     timeout,
+                    range_info,
                 );
                 Some(SwarmEvent::SessionEstablished {
                     peer_id,
@@ -385,7 +387,7 @@ pub(crate) enum SwarmEvent<N: NetworkPrimitives = EthNetworkPrimitives> {
         /// negotiated eth version
         version: EthVersion,
         messages: PeerRequestSender<PeerRequest<N>>,
-        status: Arc<Status>,
+        status: Arc<UnifiedStatus>,
         direction: Direction,
     },
     SessionClosed {

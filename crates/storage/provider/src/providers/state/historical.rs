@@ -17,7 +17,8 @@ use reth_db_api::{
 };
 use reth_primitives_traits::{Account, Bytecode};
 use reth_storage_api::{
-    BlockNumReader, DBProvider, StateCommitmentProvider, StateProofProvider, StorageRootProvider,
+    BlockNumReader, BytecodeReader, DBProvider, StateCommitmentProvider, StateProofProvider,
+    StorageRootProvider,
 };
 use reth_storage_errors::provider::ProviderResult;
 use reth_trie::{
@@ -467,7 +468,11 @@ impl<Provider: DBProvider + BlockNumReader + BlockHashReader + StateCommitmentPr
                 .or(Some(StorageValue::ZERO))),
         }
     }
+}
 
+impl<Provider: DBProvider + BlockNumReader + StateCommitmentProvider> BytecodeReader
+    for HistoricalStateProviderRef<'_, Provider>
+{
     /// Get account code by its hash
     fn bytecode_by_hash(&self, code_hash: &B256) -> ProviderResult<Option<Bytecode>> {
         self.tx()

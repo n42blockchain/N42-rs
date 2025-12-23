@@ -31,10 +31,6 @@ pub trait FullProvider<N: NodeTypesWithDB>:
     + CanonStateSubscriptions
     + ForkChoiceSubscriptions<Header = HeaderTy<N>>
     + StageCheckpointReader
-    + SnapshotProvider
-    + SnapshotProviderWriter
-    + BeaconProvider
-    + BeaconProviderWriter
     + Clone
     + Debug
     + Unpin
@@ -58,10 +54,6 @@ impl<T, N: NodeTypesWithDB> FullProvider<N> for T where
         + CanonStateSubscriptions
         + ForkChoiceSubscriptions<Header = HeaderTy<N>>
         + StageCheckpointReader
-        + SnapshotProvider
-        + SnapshotProviderWriter
-        + BeaconProvider
-        + BeaconProviderWriter
         + Clone
         + Debug
         + Unpin

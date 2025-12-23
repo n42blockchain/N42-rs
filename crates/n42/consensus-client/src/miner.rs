@@ -1,73 +1,61 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! Contains the implementation of the mining mode for the local engine.
 
-use alloy_consensus::TxReceipt;
-use alloy_eips::eip7685::Requests;
-use alloy_eips::{BlockHashOrNumber, BlockNumHash};
-use alloy_primitives::FixedBytes;
-use alloy_primitives::{keccak256, Address, BlockHash, TxHash, B256, U128, U256};
-use alloy_primitives::{BlockNumber, Bytes, Sealable};
-use alloy_rpc_types_engine::{CancunPayloadFields, ExecutionPayloadSidecar, ForkchoiceState};
-use blst::min_pk::PublicKey;
+use alloy_eips::{
+    eip7685::Requests,
+};
 use blst::min_pk::{AggregateSignature, Signature};
+use blst::min_pk::PublicKey;
+use alloy_primitives::FixedBytes;
+use n42_clique::{BlockVerifyResult, UnverifiedBlock};
+use reth_storage_errors::provider::ProviderResult;
+use n42_engine_primitives::{PayloadAttributesBuilderExt};
+use std::str::FromStr;
+use alloy_consensus::TxReceipt;
+use alloy_primitives::{Sealable, BlockNumber, Bytes};
+use reth_network_api::{FullNetwork, BlockDownloaderProvider, BlockAnnounceProvider, NetworkEventListenerProvider};
+use reth_ethereum_primitives::{EthPrimitives};
+use reth_primitives::TransactionSigned;
+use reth_primitives_traits::{AlloyBlockHeader, NodePrimitives, BlockBody};
+use alloy_eips::{BlockHashOrNumber, BlockNumHash};
+use alloy_primitives::{keccak256, Address, BlockHash, TxHash, B256, U128, U256};
+use alloy_rpc_types_engine::{CancunPayloadFields, ExecutionPayloadSidecar, ForkchoiceState};
 use eyre::OptionExt;
 use futures_util::{stream::Fuse, StreamExt};
 use itertools::Itertools;
-use n42_clique::{BlockVerifyResult, UnverifiedBlock};
-use n42_engine_primitives::PayloadAttributesBuilderExt;
-use reth_chainspec::EthChainSpec;
-use reth_chainspec::EthereumHardforks;
-use reth_consensus::{ConsensusError, FullConsensus};
 use reth_engine_primitives::BeaconConsensusEngineHandle;
-use reth_eth_wire_types::{NetworkPrimitives, NewBlock};
-use reth_ethereum_primitives::EthPrimitives;
-use reth_network_api::{
-    BlockAnnounceProvider, BlockDownloaderProvider, FullNetwork, NetworkEventListenerProvider,
-};
+use reth_chainspec::EthereumHardforks;
+use reth_chainspec::EthChainSpec;
+use reth_consensus::{FullConsensus, ConsensusError};
+use reth_payload_primitives::{EngineApiMessageVersion};
+use reth_eth_wire_types::{NewBlock, NetworkPrimitives};
 use reth_network_p2p::{
-    bodies::client::BodiesClient, headers::client::HeadersClient, priority::Priority, BlockClient,
+    bodies::client::BodiesClient, headers::client::HeadersClient, priority::Priority,
+    BlockClient,
 };
 use reth_payload_builder::PayloadBuilderHandle;
-use reth_payload_primitives::EngineApiMessageVersion;
-use reth_payload_primitives::{BuiltPayload, PayloadAttributesBuilder, PayloadKind, PayloadTypes};
-use reth_primitives::TransactionSigned;
+use reth_payload_primitives::{
+    BuiltPayload, PayloadAttributesBuilder, PayloadKind, PayloadTypes,
+};
 use reth_primitives::{Block, Header, SealedBlock};
-use reth_primitives_traits::{
-    header::clique_utils::{recover_address, recover_address_generic},
-    Block as BlockTrait,
-};
-use reth_primitives_traits::{AlloyBlockHeader, BlockBody, NodePrimitives};
-use reth_provider::{
-    BeaconProvider, BeaconProviderWriter, BlockIdReader, BlockReader, ChainSpecProvider,
-};
-use reth_storage_errors::provider::ProviderResult;
+use reth_primitives_traits::{Block as BlockTrait, header::clique_utils::{recover_address, recover_address_generic}};
+use reth_provider::{BlockIdReader, BlockReader, ChainSpecProvider, BeaconProvider, BeaconProviderWriter, DatabaseProviderFactory, ChainStateBlockReader};
 use reth_transaction_pool::TransactionPool;
-use std::collections::HashMap;
-use std::str::FromStr;
+use std::collections::{HashMap};
 use std::sync::Arc;
 use std::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
-    time::{Duration, UNIX_EPOCH},
+    time::{Duration, UNIX_EPOCH, SystemTime},
 };
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{mpsc, broadcast};
 use tokio::time::{interval_at, sleep, Instant, Interval};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{trace, debug, error, info, warn};
 
-use crate::beacon::Beacon;
-use crate::metrics::MinerMetrics;
-use crate::network::{broadcast_beacon_block, fetch_beacon_block};
-use n42_primitives::CommitteeCache;
-use n42_primitives::{
-    agg_sig_to_fixed, fixed_to_agg_sig, parse_deposit_log, Attestation, AttestationData, BLSPubkey,
-    BeaconBlock, BeaconState, BlockVerifyResultAggregate, CommitteeIndex, Deposit, RelativeEpoch,
-    VoluntaryExitWithSig, SLOTS_PER_EPOCH,
-};
-use pubsub_mem::{publish, Event, RouterMsg};
+use crate::beacon::{Beacon};
+use n42_primitives::{RelativeEpoch, Attestation, BeaconState, BeaconBlock, Deposit, VoluntaryExitWithSig, parse_deposit_log, BLSPubkey, BlockVerifyResultAggregate, agg_sig_to_fixed, fixed_to_agg_sig, SLOTS_PER_EPOCH, CommitteeIndex, AttestationData};
+use crate::network::{fetch_beacon_block, broadcast_beacon_block};
 
 /// A mining mode for the local dev engine.
 #[derive(Debug)]
@@ -137,21 +125,16 @@ pub struct N42Miner<T: PayloadTypes, Provider, B, Network> {
     payload_builder: PayloadBuilderHandle<T>,
     /// full network  for announce block
     network: Network,
-    consensus: Arc<
-        dyn FullConsensus<<T::BuiltPayload as BuiltPayload>::Primitives, Error = ConsensusError>,
-    >,
-    recent_blocks: schnellru::LruMap<
-        B256,
-        SealedBlock<<<T::BuiltPayload as BuiltPayload>::Primitives as NodePrimitives>::Block>,
-    >,
+    consensus: Arc<dyn FullConsensus<<T::BuiltPayload as BuiltPayload>::Primitives, Error = ConsensusError>>,
+    recent_blocks: schnellru::LruMap<B256, SealedBlock<<<T::BuiltPayload as BuiltPayload>::Primitives as NodePrimitives>::Block>>,
     recent_num_to_td: schnellru::LruMap<u64, U256>,
     new_block_tx: mpsc::Sender<(NewBlock, BlockHash)>,
     new_block_rx: mpsc::Receiver<(NewBlock, BlockHash)>,
     beacon: Beacon<Provider>,
-    broadcast_unverified_block_tx: mpsc::Sender<RouterMsg<UnverifiedBlock>>,
+    broadcast_unverified_block_tx: broadcast::Sender<(UnverifiedBlock, Arc<Vec<BLSPubkey>>)>,
     block_verify_result_rx: mpsc::Receiver<BlockVerifyResult>,
     pending_block_data: Option<PendingBlockData>,
-    recent_committee_caches: schnellru::LruMap<BlockHash, Arc<CommitteeCache>>,
+    start_timestamp: u64,
 
     num_generated_blocks: u64,
     num_skipped_new_block: u64,
@@ -159,8 +142,6 @@ pub struct N42Miner<T: PayloadTypes, Provider, B, Network> {
     num_long_delayed_blocks: u64,
     num_fetched_blocks: u64,
     order_stats: HashMap<u64, bool>,
-
-    metrics: MinerMetrics,
 }
 
 #[derive(Debug, Clone)]
@@ -169,7 +150,6 @@ struct PendingBlockData {
     beacon_state_after_withdrawal: BeaconState,
     execution_requests: Option<Requests>,
     attestations: HashMap<CommitteeIndex, Attestation>,
-    committee_cache: Option<Arc<CommitteeCache>>,
 }
 
 const DEPOSIT_GAP: u64 = 6;
@@ -187,9 +167,11 @@ where
     T: PayloadTypes,
     <T::BuiltPayload as BuiltPayload>::Primitives: NodePrimitives,
     <T::BuiltPayload as BuiltPayload>::Primitives: NodePrimitives<Block = reth_ethereum_primitives::Block>,
-    Provider: BlockReader
+    Provider: 
+        BlockReader
         + BlockIdReader
         + ChainSpecProvider<ChainSpec: EthereumHardforks>
+        + DatabaseProviderFactory <Provider: ChainStateBlockReader>
         + BeaconProvider
         + BeaconProviderWriter
         + 'static + Clone,
@@ -210,7 +192,7 @@ where
         payload_builder: PayloadBuilderHandle<T>,
         network: Network,
         consensus: Arc<dyn FullConsensus<<T::BuiltPayload as BuiltPayload>::Primitives, Error = ConsensusError>>,
-        broadcast_unverified_block_tx: mpsc::Sender<RouterMsg<UnverifiedBlock>>,
+        broadcast_unverified_block_tx: broadcast::Sender<(UnverifiedBlock, Arc<Vec<BLSPubkey>>)>,
         block_verify_result_rx: mpsc::Receiver<BlockVerifyResult>,
     ) {
         let (new_block_tx, new_block_rx) = mpsc::channel::<(NewBlock, BlockHash)>(128);
@@ -225,6 +207,8 @@ where
         };
         let block_time = mode_interval.period().as_secs();
 
+        let start_timestamp =
+            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
         let miner = Self {
             provider,
             payload_attributes_builder,
@@ -248,9 +232,7 @@ where
             broadcast_unverified_block_tx,
             block_verify_result_rx,
             pending_block_data: None,
-            recent_committee_caches: schnellru::LruMap::new(schnellru::ByLength::new((SLOTS_PER_EPOCH * 2)as u32)),
-
-            metrics: Default::default(),
+            start_timestamp,
         };
 
         // Spawn the miner
@@ -259,11 +241,8 @@ where
 
     /// Runs the [`N42Miner`] in a loop, polling the miner and building payloads.
     async fn run(mut self) -> eyre::Result<()> {
-        let beacon_state = BeaconState::new();
-        let beacon_block = BeaconBlock {state_root: beacon_state.hash_slow(), ..Default::default()};
         self.provider.save_beacon_block_hash_by_eth1_hash(&self.provider.chain_spec().genesis_hash(), self.provider.chain_spec().genesis_hash())?;
-        self.provider.save_beacon_block_by_hash(&self.provider.chain_spec().genesis_hash(), beacon_block)?;
-        self.provider.save_beacon_state_by_hash(&self.provider.chain_spec().genesis_hash(), beacon_state)?;
+        self.provider.save_beacon_state_by_hash(&self.provider.chain_spec().genesis_hash(), BeaconState::new())?;
 
         if !(self.get_best_block_num_signers()? == 1 && self.is_among_signers()?) {
             self.initial_sync().await?;
@@ -276,7 +255,7 @@ where
             tokio::select! {
                 Some(verification_result) = self.block_verify_result_rx.recv() => {
                     debug!(target: "consensus-client", ?verification_result, "verification_rx");
-                    if let Err(e) = self.handle_verification_result(verification_result).await {
+                    if let Err(e) = self.handle_verification_result(verification_result) {
                         warn!(target: "consensus-client", "Error handling verification_result: {:?}", e);
                     }
                 }
@@ -320,12 +299,10 @@ where
                 if let Ok(all_peers) = self.network.get_all_peers().await {
                     debug!(target: "consensus-client", peers_count=all_peers.len());
                     if !all_peers.is_empty() {
-                        // Manual implementation of counts() to avoid itertools dependency issues
-                        let mut counts_map: HashMap<_, usize> = HashMap::new();
-                        for (td, hash) in all_peers.iter().map(|v| (v.status.total_difficulty, v.status.blockhash)) {
-                            *counts_map.entry((td, hash)).or_insert(0) += 1;
-                        }
-                        status_counts = counts_map;
+                        status_counts = all_peers
+                            .iter()
+                            .map(|v| (v.status.total_difficulty.unwrap_or_default(), v.status.blockhash))
+                            .counts();
                         break;
                     }
                 }
@@ -384,7 +361,8 @@ where
 .ok_or(eyre::eyre!("sealed_header not found, block_number={:?}", best_block_number))?;
         let now = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)?;
-        if now.as_secs() > latest_header.timestamp() + MIN_NO_BLOCK_TIMESTAMP_GAP {
+        if now.as_secs() > self.start_timestamp + MIN_NO_BLOCK_TIMESTAMP_GAP &&
+            now.as_secs() > latest_header.timestamp() + MIN_NO_BLOCK_TIMESTAMP_GAP {
             warn!(target: "consensus-client", latest_header_timestamp=?latest_header.timestamp(), ?now, "long_time_no_block_generated");
             Ok(true)
         } else {
@@ -540,6 +518,7 @@ where
         let snapshot = self
             .consensus
             .snapshot(header.number(), header.hash_slow(), None)?;
+        
 
         Ok(snapshot.signers)
     }
@@ -551,11 +530,17 @@ where
     }
 
     fn get_safe_block_num_hash_from_provider(&mut self) -> eyre::Result<BlockNumHash> {
-        let safe_block_number = self
+        let mut safe_block_number = self
             .provider
             .safe_block_number()
             .unwrap_or(Some(0))
             .unwrap_or(0);
+        if safe_block_number == 0 {
+            safe_block_number = self
+                .provider.database_provider_ro().unwrap().last_safe_block_number()
+            .unwrap_or(Some(0))
+            .unwrap_or(0);
+        }
 
         let safe_block_header = self
             .provider
@@ -664,9 +649,7 @@ where
         )
     }
 
-    async fn handle_verification_result(&mut self, verification_result: BlockVerifyResult) -> eyre::Result<()> {
-        debug!(target: "consensus-client", "handle_verification_result start: {verification_result:?}");
-        self.metrics.num_verification_submission.increment(1);
+    fn handle_verification_result(&mut self, verification_result: BlockVerifyResult) -> eyre::Result<()> {
         let mut pending_block_data = match &self.pending_block_data {
             Some(v) => v.clone(),
             None => {
@@ -684,7 +667,6 @@ where
         } = verification_result.clone();
 
         if block.hash() != block_hash {
-            self.metrics.num_verification_block_hash_mismatch.increment(1);
             return Err(eyre::eyre!("verification result block hash mismatch: block_hash={block_hash:?}, pending block hash={:?}", block.hash()));
         }
 
@@ -694,13 +676,9 @@ where
         let signature = Signature::from_bytes(&hex::decode(signature)?).map_err(|e| eyre::eyre!("{e:?}"))?;
 
         let pubkey_str = pubkey.clone();
-        let pubkey_bytes = hex::decode(pubkey)?;
-        let pubkey = PublicKey::from_bytes(&pubkey_bytes).map_err(|e| eyre::eyre!("{e:?}"))?;
+        let pubkey = PublicKey::from_bytes(&hex::decode(pubkey)?).map_err(|e| eyre::eyre!("{e:?}"))?;
 
-        let pubkey_fixed_bytes: BLSPubkey = pubkey_bytes.as_slice().try_into().map_err(|_| eyre::eyre!("pubkey must be exactly 48 bytes"))?;
-        let validator_index =
-            pending_block_data.beacon_state_after_withdrawal.get_validator_index_from_pubkey(&pubkey_fixed_bytes).ok_or(eyre::eyre!("validator not found, block_hash={block_hash:?}, pubkey={pubkey_str:?}"))? as u64;
-
+        let validator_index = self.beacon.get_validator_index_from_beacon_state(block.parent_hash(), pubkey)?.ok_or(eyre::eyre!("validator not found, block_hash={block_hash:?}, pubkey={pubkey_str:?}"))?;
         if attestation.validator_indexes.contains(&validator_index) {
             return Err(eyre::eyre!("duplicate attestations for validator, pubkey={pubkey_str:?}"));
         }
@@ -709,9 +687,9 @@ where
             return Err(eyre::eyre!("mismatch receipts_root, expected={:?}, got={:?}", attestation.data.receipts_root, attestation_data.receipts_root));
         }
 
-        debug!(target: "consensus-client", "sig verify start:");
         let bytes: Vec<u8> = serde_json::to_vec(&attestation_data)?;
-        let err = tokio::task::spawn_blocking(move || signature.verify(true, &bytes, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[], &pubkey, true)).await?;
+        let bytes_slice: &[u8] = &bytes;
+        let err = signature.verify(true, bytes_slice, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[], &pubkey, true);
         if err != blst::BLST_ERROR::BLST_SUCCESS {
             return Err(eyre::eyre!("{verification_result:?}"));
         }
@@ -731,7 +709,6 @@ where
         attestation.validator_indexes.insert(validator_index);
         self.pending_block_data.as_mut().map(|v| { *v.attestations.get_mut(&attestation_data.committee_index).unwrap() = attestation.clone(); });
 
-        debug!(target: "consensus-client", "handle_verification_result finish: {verification_result:?}");
         Ok(())
     }
 
@@ -744,7 +721,7 @@ where
                 return Ok(())
             },
         };
-        let PendingBlockData { block, beacon_state_after_withdrawal, execution_requests, mut attestations, committee_cache } = pending_block_data;
+        let PendingBlockData { block, beacon_state_after_withdrawal, execution_requests, mut attestations } = pending_block_data;
         attestations.retain(|_, attestation| {
             attestation.block_aggregate_signature.is_some()
         });
@@ -785,10 +762,6 @@ where
         };
         let beacon_block = self.beacon.gen_beacon_block(beacon_state_after_withdrawal, parent_beacon_block_hash, &attestations.values().cloned().collect(), &execution_requests, &block)?;
         let beacon_block_hash = beacon_block.hash_slow();
-        if let Some(v) = committee_cache {
-            debug!(target: "consensus-client", "inserting committee_cache into lru for block hash {:?}", beacon_block_hash);
-            self.recent_committee_caches.insert(beacon_block_hash, v);
-        }
         self.provider.save_beacon_block_by_hash(&beacon_block_hash, beacon_block.clone())?;
         self.provider.save_beacon_block_hash_by_eth1_hash(&block.hash(), beacon_block_hash)?;
 
@@ -856,7 +829,7 @@ where
         debug!(target: "consensus-client", block_time, "prepare_block");
         let now = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)?;
-        let time_for_tx_gathering = 1;
+        let time_for_tx_gathering = block_time / 2;
         let time_for_attestatation_gathering = block_time - time_for_tx_gathering;
         let expected_next_timestamp = Duration::from_secs(header.header().timestamp() + time_for_tx_gathering);
         if expected_next_timestamp > now {
@@ -885,6 +858,7 @@ where
         debug!(target: "consensus-client", ?timestamp, "prepare_block: PayloadAttributes timestamp");
 
         let (withdrawals, beacon_state_after_withdrawal) = self.beacon.gen_withdrawals(header.hash())?;
+        debug!(target: "consensus-client", ?withdrawals, "prepare_block: PayloadAttributes withdrawals");
 
         let forkchoice_state = self.forkchoice_state()?;
         let payload_attributes = self.payload_attributes_builder.build_ext(timestamp.as_secs(), withdrawals, beacon_state_after_withdrawal.randao_mix);
@@ -929,7 +903,6 @@ where
             beacon_state_after_withdrawal: beacon_state_after_withdrawal.clone(),
             execution_requests: execution_requests.clone(),
             attestations: Default::default(),
-            committee_cache: None,
         };
         self.pending_block_data.replace(pending_block_data);
 
@@ -937,59 +910,21 @@ where
         debug!(target: "consensus-client", ?max_td, "prepare_block: new_block hash {:?}", block.header().hash_slow());
         trace!(target: "consensus-client", ?block);
 
-        let committee_cache = if block.header().number() % SLOTS_PER_EPOCH == 0 {
-            debug!(target: "consensus-client", "generating committee_cache for  block number {:?}", block.header().number());
-            match beacon_state_after_withdrawal.gen_committee_cache(RelativeEpoch::Next) {
-                Ok(v) => Arc::new(v),
-                Err(e) => {
-                    debug!(target: "consensus-client", ?e, "gen_committee_cache failed");
-                    return Ok(());
-                }
+        let committee_cache = if block.number % SLOTS_PER_EPOCH == 0 {
+            // committee_cache init requires non-empty validators
+            if !beacon_state_after_withdrawal.has_active_validators(RelativeEpoch::Next) {
+                return Ok(());
             }
+            beacon_state_after_withdrawal.committee_cache(RelativeEpoch::Next)?
         } else {
-            let mut beacon_block_hash = self.provider.get_beacon_block_hash_by_eth1_hash(&block.header().parent_hash())?.ok_or(eyre::eyre!("beacon block hash not found, eth1_block_hash={:?}", block.header().parent_hash()))?;
-
-            let mut beacon_block_hashes = Vec::new();
-            beacon_block_hashes.push(beacon_block_hash);
-            let committee_cache = loop {
-                match self.recent_committee_caches.get(&beacon_block_hash) {
-                    Some(v) => {
-                        debug!(target: "consensus-client", "getting committee_cache from lru for block hash {:?}", beacon_block_hash);
-                        break (*v).clone();
-                    }
-                    None => {
-                        let beacon_block = self.provider.get_beacon_block_by_hash(&beacon_block_hash)?.ok_or(eyre::eyre!("beacon block not found, beacon_block_hash={:?}", beacon_block_hash))?;
-                        if beacon_block.slot == 0 {
-                            debug!(target: "consensus-client", "searching for beacon block reached slot 0");
-                            return Ok(());
-                        }
-                        if beacon_block.slot % SLOTS_PER_EPOCH == 0 {
-                            let parent_beacon_state = self.provider.get_beacon_state_by_hash(&beacon_block.parent_hash)?.ok_or(eyre::eyre!("beacon state not found, beacon_block_hash={:?}", beacon_block.parent_hash))?;
-                            match parent_beacon_state.gen_committee_cache(RelativeEpoch::Next) {
-                                Ok(v) => break Arc::new(v),
-                                Err(e) => {
-                                    debug!(target: "consensus-client", ?e, "gen_committee_cache failed");
-                                    return Ok(());
-                                }
-                            }
-                        } else {
-                            beacon_block_hash = beacon_block.parent_hash;
-                            beacon_block_hashes.push(beacon_block_hash);
-                        }
-                    }
-                }
-            };
-            while let Some(v) = beacon_block_hashes.pop() {
-                self.recent_committee_caches.insert(v, committee_cache.clone());
+            // committee_cache init requires non-empty validators
+            if !beacon_state_after_withdrawal.has_active_validators(RelativeEpoch::Current) {
+                return Ok(());
             }
-            committee_cache
+            beacon_state_after_withdrawal.committee_cache(RelativeEpoch::Current)?
         };
-        //debug!(target: "consensus-client", "{committee_cache:?}");
 
         let beacon_committees = committee_cache.get_beacon_committees_at_slot(block.number)?;
-        debug!(target: "consensus-client", "{beacon_committees:?}");
-
-        self.pending_block_data.as_mut().ok_or(eyre::eyre!("pending_block_data not found, block_number={:?}", block.number))?.committee_cache = Some(committee_cache.clone());
 
         let cached_reads = self.consensus.get_cached_reads(block.hash())?.ok_or(eyre::eyre!("cached_reads not found, block_hash={:?}", block.hash()))?;
         let mut header = block.header().clone();
@@ -1008,13 +943,12 @@ where
                 ..Default::default()
             };
             self.pending_block_data.as_mut().ok_or(eyre::eyre!("pending_block_data not found, block_number={:?}", block.number))?.attestations.insert(beacon_committee.index, attestation);
-            unverified_block.committee_index = beacon_committee.index;
+            let mut target_committee_pubkeys = Vec::new();
             for validator_index in beacon_committee.committee {
-                let pubkey = beacon_state_after_withdrawal.get_validator(*validator_index)?.pubkey;
-                let pubkey = hex::encode(&pubkey);
-                let event = Event { topic: pubkey, payload: unverified_block.clone()};
-                publish(&self.broadcast_unverified_block_tx, event).await;
+                target_committee_pubkeys.push(beacon_state_after_withdrawal.get_validator(*validator_index)?.pubkey);
             }
+            unverified_block.committee_index = beacon_committee.index;
+            let _ = self.broadcast_unverified_block_tx.send((unverified_block.clone(), Arc::new(target_committee_pubkeys)));
         }
         Ok(())
     }
@@ -1288,221 +1222,8 @@ where
 }
 
 fn exit_by_sigint() {
-    let _ = nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGINT);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ==================== MiningMode Tests ====================
-
-    #[tokio::test]
-    async fn test_mining_mode_interval_creation() {
-        let duration = Duration::from_secs(1);
-        let mode = MiningMode::interval(duration);
-        match mode {
-            MiningMode::Interval(interval) => {
-                assert_eq!(interval.period(), duration);
-            }
-            _ => panic!("Expected Interval mining mode"),
-        }
-    }
-
-    #[test]
-    fn test_mining_mode_no_mining() {
-        let mode = MiningMode::NoMining;
-        match mode {
-            MiningMode::NoMining => {}
-            _ => panic!("Expected NoMining mode"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_mining_mode_debug() {
-        let mode = MiningMode::NoMining;
-        let debug_str = format!("{:?}", mode);
-        assert!(debug_str.contains("NoMining"));
-
-        let mode = MiningMode::interval(Duration::from_secs(1));
-        let debug_str = format!("{:?}", mode);
-        assert!(debug_str.contains("Interval"));
-    }
-
-    // ==================== Duration Constants Tests ====================
-
-    #[test]
-    fn test_duration_calculations() {
-        // Test typical block time calculations
-        let block_time = Duration::from_secs(12);
-        let epoch_duration = block_time * 32; // 32 slots per epoch
-        assert_eq!(epoch_duration.as_secs(), 384);
-    }
-
-    // ==================== Helper Function Tests ====================
-
-    #[test]
-    fn test_keccak256_consistency() {
-        // Test that keccak256 produces consistent results
-        let data = b"test data";
-        let hash1 = keccak256(data);
-        let hash2 = keccak256(data);
-        assert_eq!(hash1, hash2);
-    }
-
-    #[test]
-    fn test_b256_from_slice() {
-        let bytes = [0u8; 32];
-        let b256 = B256::from_slice(&bytes);
-        assert_eq!(b256, B256::ZERO);
-    }
-
-    #[test]
-    fn test_address_from_str() {
-        let addr_str = "0x0000000000000000000000000000000000000001";
-        let addr = Address::from_str(addr_str).unwrap();
-        assert!(!addr.is_zero());
-    }
-
-    // ==================== Unix Epoch Time Tests ====================
-
-    #[test]
-    fn test_unix_epoch() {
-        let now = std::time::SystemTime::now();
-        let duration = now.duration_since(UNIX_EPOCH).unwrap();
-        assert!(duration.as_secs() > 0);
-    }
-
-    #[test]
-    fn test_timestamp_calculation() {
-        // Simulate timestamp calculation for a block
-        let base_timestamp = 1700000000u64;
-        let slot = 10u64;
-        let slot_duration = 12u64;
-        let expected_timestamp = base_timestamp + slot * slot_duration;
-        assert_eq!(expected_timestamp, 1700000120);
-    }
-
-    // ==================== Block Number Tests ====================
-
-    #[test]
-    fn test_block_number_arithmetic() {
-        let block_number: BlockNumber = 100;
-        let parent_number = block_number.saturating_sub(1);
-        assert_eq!(parent_number, 99);
-
-        // Test at genesis
-        let genesis: BlockNumber = 0;
-        let parent_of_genesis = genesis.saturating_sub(1);
-        assert_eq!(parent_of_genesis, 0);
-    }
-
-    // ==================== U256 Tests ====================
-
-    #[test]
-    fn test_u256_total_difficulty() {
-        let td1 = U256::from(1000u64);
-        let td2 = U256::from(2000u64);
-        assert!(td2 > td1);
-
-        let diff = td2 - td1;
-        assert_eq!(diff, U256::from(1000u64));
-    }
-
-    #[test]
-    fn test_u256_average() {
-        let total = U256::from(1000u64);
-        let count = 10u64;
-        let average = total.to::<u64>() / count;
-        assert_eq!(average, 100);
-    }
-
-    // ==================== HashMap Tests for Status Counts ====================
-
-    #[test]
-    fn test_status_counts_manual() {
-        // Simulate the manual counting logic that replaces itertools::counts()
-        let items = vec![
-            (U256::from(100u64), B256::ZERO),
-            (U256::from(100u64), B256::ZERO),
-            (U256::from(200u64), B256::repeat_byte(1)),
-        ];
-
-        let mut counts_map: HashMap<_, usize> = HashMap::new();
-        for item in items.iter() {
-            *counts_map.entry(item.clone()).or_insert(0) += 1;
-        }
-
-        assert_eq!(counts_map.get(&(U256::from(100u64), B256::ZERO)), Some(&2));
-        assert_eq!(
-            counts_map.get(&(U256::from(200u64), B256::repeat_byte(1))),
-            Some(&1)
-        );
-    }
-
-    #[test]
-    fn test_find_max_count() {
-        let mut counts: HashMap<(U256, B256), usize> = HashMap::new();
-        counts.insert((U256::from(100u64), B256::ZERO), 5);
-        counts.insert((U256::from(200u64), B256::repeat_byte(1)), 3);
-        counts.insert((U256::from(150u64), B256::repeat_byte(2)), 7);
-
-        let max_entry = counts.iter().max_by_key(|(_, &count)| count);
-        assert!(max_entry.is_some());
-        let ((td, _hash), count) = max_entry.unwrap();
-        assert_eq!(*td, U256::from(150u64));
-        assert_eq!(*count, 7);
-    }
-
-    // ==================== Slots Per Epoch Tests ====================
-
-    #[test]
-    fn test_slots_per_epoch_constant() {
-        // SLOTS_PER_EPOCH should be defined
-        assert!(SLOTS_PER_EPOCH > 0);
-    }
-
-    #[test]
-    fn test_epoch_calculation() {
-        let slot = 100u64;
-        let epoch = slot / SLOTS_PER_EPOCH;
-        assert!(epoch <= slot);
-    }
-
-    // ==================== BlockHashOrNumber Tests ====================
-
-    #[test]
-    fn test_block_hash_or_number_from_number() {
-        let block_num: BlockNumber = 100;
-        let hash_or_num: BlockHashOrNumber = block_num.into();
-        match hash_or_num {
-            BlockHashOrNumber::Number(n) => assert_eq!(n, 100),
-            _ => panic!("Expected Number variant"),
-        }
-    }
-
-    #[test]
-    fn test_block_hash_or_number_from_hash() {
-        let hash = B256::ZERO;
-        let hash_or_num: BlockHashOrNumber = hash.into();
-        match hash_or_num {
-            BlockHashOrNumber::Hash(h) => assert_eq!(h, B256::ZERO),
-            _ => panic!("Expected Hash variant"),
-        }
-    }
-
-    // ==================== FixedBytes Tests ====================
-
-    #[test]
-    fn test_fixed_bytes_zero() {
-        let zero: FixedBytes<32> = FixedBytes::ZERO;
-        assert!(zero.is_zero());
-    }
-
-    #[test]
-    fn test_fixed_bytes_comparison() {
-        let a: FixedBytes<32> = FixedBytes::ZERO;
-        let b: FixedBytes<32> = FixedBytes::repeat_byte(1);
-        assert_ne!(a, b);
-    }
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::this(),
+        nix::sys::signal::Signal::SIGINT,
+    );
 }

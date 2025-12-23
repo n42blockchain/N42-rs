@@ -1,0 +1,786 @@
+diff -ruN reth-145/crates/storage/storage-api/Cargo.toml /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/Cargo.toml
+--- reth-145/crates/storage/storage-api/Cargo.toml	2025-12-23 02:32:18
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/Cargo.toml	2025-12-23 02:14:49
+@@ -34,6 +34,9 @@
+ 
+ auto_impl.workspace = true
+ 
++n42-primitives.workspace = true
++merkle_db_rs.workspace=true
++
+ [features]
+ default = ["std"]
+ std = [
+diff -ruN reth-145/crates/storage/storage-api/src/account.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/account.rs
+--- reth-145/crates/storage/storage-api/src/account.rs	2025-12-23 02:32:18
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/account.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use alloc::{
+     collections::{BTreeMap, BTreeSet},
+     vec::Vec,
+diff -ruN reth-145/crates/storage/storage-api/src/beacon.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/beacon.rs
+--- reth-145/crates/storage/storage-api/src/beacon.rs	1969-12-31 19:00:00
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/beacon.rs	2025-12-20 16:08:23
+@@ -0,0 +1,93 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
++use alloy_primitives::{Address, BlockHash, BlockNumber, B256};
++use auto_impl::auto_impl;
++use n42_primitives::{
++    BeaconBlock, BeaconBlockChangeset, BeaconState, BeaconStateChangeset, Validator,
++};
++use reth_storage_errors::ProviderResult;
++use std::ops::RangeInclusive;
++
++#[auto_impl(&, Arc, Box)]
++pub trait BeaconReader {
++    fn get_beaconstate_by_blockhash(
++        &self,
++        blockhash: BlockHash,
++    ) -> ProviderResult<Option<BeaconState>>;
++    fn get_beaconblock_by_blockhash(
++        &self,
++        blockhash: BlockHash,
++    ) -> ProviderResult<Option<BeaconBlock>>;
++}
++
++#[auto_impl(&, Arc, Box)]
++pub trait BeaconWriter {
++    fn unwind_beacon(&self, range: RangeInclusive<BlockNumber>) -> ProviderResult<()>;
++    fn write_beaconstate(&self, changes: BeaconStateChangeset) -> ProviderResult<()>;
++    fn remove_beaconstate(&self, range: Vec<BlockHash>) -> ProviderResult<()>;
++    // fn unwind_beaconblock(&self,range:RangeInclusive<BlockNumber>)->ProviderResult<()>;
++    fn write_beaconblock(&self, changes: BeaconBlockChangeset) -> ProviderResult<()>;
++    fn remove_beaconblock(&self, range: Vec<BlockHash>) -> ProviderResult<()>;
++}
++
++pub trait BeaconProvider {
++    /// get beacon block by block hash
++    fn get_beacon_block_by_hash(
++        &self,
++        block_hash: &BlockHash,
++    ) -> ProviderResult<Option<BeaconBlock>>;
++
++    fn get_beacon_state_by_hash(
++        &self,
++        block_hash: &BlockHash,
++    ) -> ProviderResult<Option<BeaconState>>;
++
++    fn get_beacon_block_hash_by_eth1_hash(
++        &self,
++        block_hash: &BlockHash,
++    ) -> ProviderResult<Option<BlockHash>>;
++
++    fn get_tree_by_hash_for_validator(
++        &self,
++        tree_hash: &B256,
++    ) -> ProviderResult<Option<merkle_db_rs::tree::Tree<Validator>>>;
++
++    fn get_tree_by_hash_for_u64(
++        &self,
++        tree_hash: &B256,
++    ) -> ProviderResult<Option<merkle_db_rs::tree::Tree<u64>>>;
++}
++
++pub trait BeaconProviderWriter {
++    /// save beacon block by hash
++    fn save_beacon_block_by_hash(
++        &self,
++        block_hash: &BlockHash,
++        beacon_block: BeaconBlock,
++    ) -> ProviderResult<()>;
++
++    fn save_beacon_state_by_hash(
++        &self,
++        block_hash: &BlockHash,
++        beacon_state: BeaconState,
++    ) -> ProviderResult<()>;
++
++    fn save_beacon_block_hash_by_eth1_hash(
++        &self,
++        eth1_block_hash: &BlockHash,
++        beacon_block_hash: BlockHash,
++    ) -> ProviderResult<()>;
++
++    fn save_tree_by_hash_for_validator(
++        &self,
++        tree_hash: &B256,
++        tree: merkle_db_rs::tree::Tree<Validator>,
++    ) -> ProviderResult<()>;
++
++    fn save_tree_by_hash_for_u64(
++        &self,
++        tree_hash: &B256,
++        tree: merkle_db_rs::tree::Tree<u64>,
++    ) -> ProviderResult<()>;
++}
+diff -ruN reth-145/crates/storage/storage-api/src/block.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/block.rs
+--- reth-145/crates/storage/storage-api/src/block.rs	2025-12-23 02:32:18
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/block.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use crate::{
+     BlockBodyIndicesProvider, BlockNumReader, HeaderProvider, OmmersProvider, ReceiptProvider,
+     ReceiptProviderIdExt, TransactionVariant, TransactionsProvider, WithdrawalsProvider,
+@@ -291,7 +294,8 @@
+     ///
+     /// Returns `None` if block is not found.
+     fn block_by_number_or_tag(&self, id: BlockNumberOrTag) -> ProviderResult<Option<Self::Block>> {
+-        self.convert_block_number(id)?.map_or_else(|| Ok(None), |num| self.block(num.into()))
++        self.convert_block_number(id)?
++            .map_or_else(|| Ok(None), |num| self.block(num.into()))
+     }
+ 
+     /// Returns the pending block header if available
+@@ -343,9 +347,10 @@
+     ) -> ProviderResult<Option<RecoveredBlock<Self::Block>>> {
+         match id {
+             BlockId::Hash(hash) => self.recovered_block(hash.block_hash.into(), transaction_kind),
+-            BlockId::Number(num) => self
+-                .convert_block_number(num)?
+-                .map_or_else(|| Ok(None), |num| self.recovered_block(num.into(), transaction_kind)),
++            BlockId::Number(num) => self.convert_block_number(num)?.map_or_else(
++                || Ok(None),
++                |num| self.recovered_block(num.into(), transaction_kind),
++            ),
+         }
+     }
+ 
+@@ -390,7 +395,8 @@
+         &self,
+         id: BlockNumberOrTag,
+     ) -> ProviderResult<Option<Vec<Self::Header>>> {
+-        self.convert_block_number(id)?.map_or_else(|| Ok(None), |num| self.ommers(num.into()))
++        self.convert_block_number(id)?
++            .map_or_else(|| Ok(None), |num| self.ommers(num.into()))
+     }
+ 
+     /// Returns the ommers with the matching `BlockId` from the database.
+diff -ruN reth-145/crates/storage/storage-api/src/block_hash.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/block_hash.rs
+--- reth-145/crates/storage/storage-api/src/block_hash.rs	2025-12-23 02:32:18
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/block_hash.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use alloc::vec::Vec;
+ use alloy_eips::BlockHashOrNumber;
+ use alloy_primitives::{BlockNumber, B256};
+diff -ruN reth-145/crates/storage/storage-api/src/block_id.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/block_id.rs
+--- reth-145/crates/storage/storage-api/src/block_id.rs	2025-12-23 02:32:18
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/block_id.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use crate::BlockHashReader;
+ use alloy_eips::{BlockHashOrNumber, BlockId, BlockNumberOrTag};
+ use alloy_primitives::{BlockNumber, B256};
+@@ -63,12 +66,12 @@
+                     .map(|res_opt| res_opt.map(|num_hash| num_hash.number))
+             }
+             BlockNumberOrTag::Number(num) => num,
+-            BlockNumberOrTag::Finalized => {
+-                self.finalized_block_number()?.ok_or(ProviderError::FinalizedBlockNotFound)?
+-            }
+-            BlockNumberOrTag::Safe => {
+-                self.safe_block_number()?.ok_or(ProviderError::SafeBlockNotFound)?
+-            }
++            BlockNumberOrTag::Finalized => self
++                .finalized_block_number()?
++                .ok_or(ProviderError::FinalizedBlockNotFound)?,
++            BlockNumberOrTag::Safe => self
++                .safe_block_number()?
++                .ok_or(ProviderError::SafeBlockNotFound)?,
+         };
+         Ok(Some(num))
+     }
+@@ -109,22 +112,26 @@
+ 
+     /// Get the safe block number.
+     fn safe_block_number(&self) -> ProviderResult<Option<BlockNumber>> {
+-        self.safe_block_num_hash().map(|res_opt| res_opt.map(|num_hash| num_hash.number))
++        self.safe_block_num_hash()
++            .map(|res_opt| res_opt.map(|num_hash| num_hash.number))
+     }
+ 
+     /// Get the finalized block number.
+     fn finalized_block_number(&self) -> ProviderResult<Option<BlockNumber>> {
+-        self.finalized_block_num_hash().map(|res_opt| res_opt.map(|num_hash| num_hash.number))
++        self.finalized_block_num_hash()
++            .map(|res_opt| res_opt.map(|num_hash| num_hash.number))
+     }
+ 
+     /// Get the safe block hash.
+     fn safe_block_hash(&self) -> ProviderResult<Option<B256>> {
+-        self.safe_block_num_hash().map(|res_opt| res_opt.map(|num_hash| num_hash.hash))
++        self.safe_block_num_hash()
++            .map(|res_opt| res_opt.map(|num_hash| num_hash.hash))
+     }
+ 
+     /// Get the finalized block hash.
+     fn finalized_block_hash(&self) -> ProviderResult<Option<B256>> {
+-        self.finalized_block_num_hash().map(|res_opt| res_opt.map(|num_hash| num_hash.hash))
++        self.finalized_block_num_hash()
++            .map(|res_opt| res_opt.map(|num_hash| num_hash.hash))
+     }
+ }
+ 
+diff -ruN reth-145/crates/storage/storage-api/src/block_indices.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/block_indices.rs
+--- reth-145/crates/storage/storage-api/src/block_indices.rs	2025-12-23 02:32:18
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/block_indices.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use alloc::vec::Vec;
+ use alloy_primitives::BlockNumber;
+ use core::ops::RangeInclusive;
+diff -ruN reth-145/crates/storage/storage-api/src/block_writer.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/block_writer.rs
+--- reth-145/crates/storage/storage-api/src/block_writer.rs	2025-12-23 02:32:18
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/block_writer.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use crate::{NodePrimitivesProvider, StorageLocation};
+ use alloc::vec::Vec;
+ use alloy_primitives::BlockNumber;
+diff -ruN reth-145/crates/storage/storage-api/src/chain.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/chain.rs
+--- reth-145/crates/storage/storage-api/src/chain.rs	2025-12-23 02:32:18
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/chain.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use crate::{DBProvider, OmmersProvider, StorageLocation};
+ use alloc::vec::Vec;
+ use alloy_consensus::Header;
+@@ -53,8 +56,10 @@
+ 
+ /// Input for reading a block body. Contains a header of block being read and a list of pre-fetched
+ /// transactions.
+-pub type ReadBodyInput<'a, B> =
+-    (&'a <B as Block>::Header, Vec<<<B as Block>::Body as BlockBody>::Transaction>);
++pub type ReadBodyInput<'a, B> = (
++    &'a <B as Block>::Header,
++    Vec<<<B as Block>::Body as BlockBody>::Transaction>,
++);
+ 
+ /// Trait that implements how block bodies are read from the storage.
+ ///
+@@ -108,15 +113,21 @@
+         _write_to: StorageLocation,
+     ) -> ProviderResult<()> {
+         let mut ommers_cursor = provider.tx_ref().cursor_write::<tables::BlockOmmers<H>>()?;
+-        let mut withdrawals_cursor =
+-            provider.tx_ref().cursor_write::<tables::BlockWithdrawals>()?;
++        let mut withdrawals_cursor = provider
++            .tx_ref()
++            .cursor_write::<tables::BlockWithdrawals>()?;
+ 
+         for (block_number, body) in bodies {
+             let Some(body) = body else { continue };
+ 
+             // Write ommers if any
+             if !body.ommers.is_empty() {
+-                ommers_cursor.append(block_number, &StoredBlockOmmers { ommers: body.ommers })?;
++                ommers_cursor.append(
++                    block_number,
++                    &StoredBlockOmmers {
++                        ommers: body.ommers,
++                    },
++                )?;
+             }
+ 
+             // Write withdrawals if any
+@@ -137,8 +148,12 @@
+         block: BlockNumber,
+         _remove_from: StorageLocation,
+     ) -> ProviderResult<()> {
+-        provider.tx_ref().unwind_table_by_num::<tables::BlockWithdrawals>(block)?;
+-        provider.tx_ref().unwind_table_by_num::<tables::BlockOmmers>(block)?;
++        provider
++            .tx_ref()
++            .unwind_table_by_num::<tables::BlockWithdrawals>(block)?;
++        provider
++            .tx_ref()
++            .unwind_table_by_num::<tables::BlockOmmers>(block)?;
+ 
+         Ok(())
+     }
+@@ -161,7 +176,9 @@
+         // TODO: Ideally storage should hold its own copy of chain spec
+         let chain_spec = provider.chain_spec();
+ 
+-        let mut withdrawals_cursor = provider.tx_ref().cursor_read::<tables::BlockWithdrawals>()?;
++        let mut withdrawals_cursor = provider
++            .tx_ref()
++            .cursor_read::<tables::BlockWithdrawals>()?;
+ 
+         let mut bodies = Vec::with_capacity(inputs.len());
+ 
+@@ -183,7 +200,11 @@
+                 provider.ommers(header.number().into())?.unwrap_or_default()
+             };
+ 
+-            bodies.push(alloy_consensus::BlockBody { transactions, ommers, withdrawals });
++            bodies.push(alloy_consensus::BlockBody {
++                transactions,
++                ommers,
++                withdrawals,
++            });
+         }
+ 
+         Ok(bodies)
+diff -ruN reth-145/crates/storage/storage-api/src/chain_info.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/chain_info.rs
+--- reth-145/crates/storage/storage-api/src/chain_info.rs	2025-12-23 02:32:18
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/chain_info.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use alloy_rpc_types_engine::ForkchoiceState;
+ use reth_primitives_traits::SealedHeader;
+ 
+diff -ruN reth-145/crates/storage/storage-api/src/database_provider.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/database_provider.rs
+--- reth-145/crates/storage/storage-api/src/database_provider.rs	2025-12-23 02:32:18
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/database_provider.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use alloc::vec::Vec;
+ use core::ops::{Bound, RangeBounds};
+ use reth_db_api::{
+@@ -61,7 +64,10 @@
+         &self,
+         range: impl RangeBounds<T::Key>,
+     ) -> Result<Vec<KeyValue<T>>, DatabaseError> {
+-        self.tx_ref().cursor_read::<T>()?.walk_range(range)?.collect::<Result<Vec<_>, _>>()
++        self.tx_ref()
++            .cursor_read::<T>()?
++            .walk_range(range)?
++            .collect::<Result<Vec<_>, _>>()
+     }
+ 
+     /// Iterates over read only values in the given table and collects them into a vector.
+diff -ruN reth-145/crates/storage/storage-api/src/full.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/full.rs
+--- reth-145/crates/storage/storage-api/src/full.rs	2025-12-23 02:32:18
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/full.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Helper trait for full rpc provider
+ 
+ use reth_chainspec::{ChainSpecProvider, EthereumHardforks};
+diff -ruN reth-145/crates/storage/storage-api/src/hashing.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/hashing.rs
+--- reth-145/crates/storage/storage-api/src/hashing.rs	2025-12-23 02:32:18
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/hashing.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use alloc::collections::{BTreeMap, BTreeSet};
+ use alloy_primitives::{map::HashMap, Address, BlockNumber, B256};
+ use auto_impl::auto_impl;
+diff -ruN reth-145/crates/storage/storage-api/src/header.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/header.rs
+--- reth-145/crates/storage/storage-api/src/header.rs	2025-12-23 02:32:18
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/header.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use alloc::vec::Vec;
+ use alloy_eips::BlockHashOrNumber;
+ use alloy_primitives::{BlockHash, BlockNumber, U256};
+@@ -27,7 +30,9 @@
+         &self,
+         block_hash: BlockHash,
+     ) -> ProviderResult<Option<SealedHeader<Self::Header>>> {
+-        Ok(self.header(&block_hash)?.map(|header| SealedHeader::new(header, block_hash)))
++        Ok(self
++            .header(&block_hash)?
++            .map(|header| SealedHeader::new(header, block_hash)))
+     }
+ 
+     /// Get header by block number
+diff -ruN reth-145/crates/storage/storage-api/src/header_sync_gap.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/header_sync_gap.rs
+--- reth-145/crates/storage/storage-api/src/header_sync_gap.rs	2025-12-23 02:32:18
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/header_sync_gap.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use alloy_primitives::BlockNumber;
+ use reth_primitives_traits::{BlockHeader, SealedHeader};
+ use reth_storage_errors::provider::ProviderResult;
+diff -ruN reth-145/crates/storage/storage-api/src/history.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/history.rs
+--- reth-145/crates/storage/storage-api/src/history.rs	2025-12-23 02:32:18
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/history.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use alloy_primitives::{Address, BlockNumber, B256};
+ use auto_impl::auto_impl;
+ use core::ops::{RangeBounds, RangeInclusive};
+diff -ruN reth-145/crates/storage/storage-api/src/legacy.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/legacy.rs
+--- reth-145/crates/storage/storage-api/src/legacy.rs	2025-12-23 02:32:18
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/legacy.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Traits used by the legacy execution engine.
+ //!
+ //! This module is scheduled for removal in the future.
+diff -ruN reth-145/crates/storage/storage-api/src/lib.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/lib.rs
+--- reth-145/crates/storage/storage-api/src/lib.rs	2025-12-23 02:32:18
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/lib.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Collection of traits and types for common storage access.
+ 
+ #![doc(
+@@ -85,6 +88,9 @@
+ #[cfg(feature = "db-api")]
+ pub use stats::*;
+ 
++mod snapshot;
++pub use snapshot::*;
++
+ mod legacy;
+ pub use legacy::*;
+ 
+@@ -105,3 +111,9 @@
+ 
+ mod full;
+ pub use full::*;
++
++mod validator;
++pub use validator::*;
++
++mod beacon;
++pub use beacon::*;
+diff -ruN reth-145/crates/storage/storage-api/src/noop.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/noop.rs
+--- reth-145/crates/storage/storage-api/src/noop.rs	2025-12-23 02:32:18
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/noop.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Various noop implementations for traits.
+ 
+ use crate::{
+@@ -44,14 +47,20 @@
+ impl<ChainSpec, N> NoopProvider<ChainSpec, N> {
+     /// Create a new instance for specific primitive types.
+     pub fn new(chain_spec: Arc<ChainSpec>) -> Self {
+-        Self { chain_spec, _phantom: Default::default() }
++        Self {
++            chain_spec,
++            _phantom: Default::default(),
++        }
+     }
+ }
+ 
+ impl<ChainSpec> NoopProvider<ChainSpec> {
+     /// Create a new instance of the `NoopBlockReader`.
+     pub fn eth(chain_spec: Arc<ChainSpec>) -> Self {
+-        Self { chain_spec, _phantom: Default::default() }
++        Self {
++            chain_spec,
++            _phantom: Default::default(),
++        }
+     }
+ }
+ 
+@@ -70,7 +79,10 @@
+ 
+ impl<ChainSpec, N> Clone for NoopProvider<ChainSpec, N> {
+     fn clone(&self) -> Self {
+-        Self { chain_spec: Arc::clone(&self.chain_spec), _phantom: Default::default() }
++        Self {
++            chain_spec: Arc::clone(&self.chain_spec),
++            _phantom: Default::default(),
++        }
+     }
+ }
+ 
+@@ -475,15 +487,18 @@
+             BlockNumberOrTag::Latest => self.latest(),
+             BlockNumberOrTag::Finalized => {
+                 // we can only get the finalized state by hash, not by num
+-                let hash =
+-                    self.finalized_block_hash()?.ok_or(ProviderError::FinalizedBlockNotFound)?;
++                let hash = self
++                    .finalized_block_hash()?
++                    .ok_or(ProviderError::FinalizedBlockNotFound)?;
+ 
+                 // only look at historical state
+                 self.history_by_block_hash(hash)
+             }
+             BlockNumberOrTag::Safe => {
+                 // we can only get the safe state by hash, not by num
+-                let hash = self.safe_block_hash()?.ok_or(ProviderError::SafeBlockNotFound)?;
++                let hash = self
++                    .safe_block_hash()?
++                    .ok_or(ProviderError::SafeBlockNotFound)?;
+ 
+                 self.history_by_block_hash(hash)
+             }
+diff -ruN reth-145/crates/storage/storage-api/src/ommers.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/ommers.rs
+--- reth-145/crates/storage/storage-api/src/ommers.rs	2025-12-23 02:32:18
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/ommers.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use crate::HeaderProvider;
+ use alloc::{sync::Arc, vec::Vec};
+ use alloy_eips::BlockHashOrNumber;
+diff -ruN reth-145/crates/storage/storage-api/src/primitives.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/primitives.rs
+--- reth-145/crates/storage/storage-api/src/primitives.rs	2025-12-23 02:32:18
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/primitives.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use reth_primitives_traits::NodePrimitives;
+ 
+ /// Provider implementation that knows configured [`NodePrimitives`].
+diff -ruN reth-145/crates/storage/storage-api/src/prune_checkpoint.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/prune_checkpoint.rs
+--- reth-145/crates/storage/storage-api/src/prune_checkpoint.rs	2025-12-23 02:32:18
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/prune_checkpoint.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use alloc::vec::Vec;
+ use reth_prune_types::{PruneCheckpoint, PruneSegment};
+ use reth_storage_errors::provider::ProviderResult;
+diff -ruN reth-145/crates/storage/storage-api/src/receipts.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/receipts.rs
+--- reth-145/crates/storage/storage-api/src/receipts.rs	2025-12-23 02:32:18
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/receipts.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use crate::BlockIdReader;
+ use alloc::vec::Vec;
+ use alloy_eips::{BlockHashOrNumber, BlockId, BlockNumberOrTag};
+@@ -59,7 +62,7 @@
+                 if let Some(num) = self.convert_block_number(num_tag)? {
+                     BlockHashOrNumber::Number(num)
+                 } else {
+-                    return Ok(None)
++                    return Ok(None);
+                 }
+             }
+         };
+diff -ruN reth-145/crates/storage/storage-api/src/snapshot.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/snapshot.rs
+--- reth-145/crates/storage/storage-api/src/snapshot.rs	1969-12-31 19:00:00
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/snapshot.rs	2025-12-20 16:08:23
+@@ -0,0 +1,30 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
++use alloy_eips::BlockHashOrNumber;
++use alloy_primitives::{Address, BlockHash, BlockNumber};
++use n42_primitives::Snapshot;
++use reth_storage_errors::provider::ProviderResult;
++
++/// ly
++pub trait SnapshotProvider {
++    /// get snapshot by block id
++    fn load_snapshot(&self, id: BlockHashOrNumber) -> ProviderResult<Option<Snapshot>>;
++
++    /// get snapshot by block hash
++    fn load_snapshot_by_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<Snapshot>>;
++}
++
++pub trait SnapshotProviderWriter {
++    /// save snapshot
++    fn save_snapshot(&self, id: BlockNumber, snapshot: Snapshot) -> ProviderResult<bool>;
++
++    /// save snapshot by hash
++    fn save_snapshot_by_hash(
++        &self,
++        block_hash: &BlockHash,
++        snapshot: Snapshot,
++    ) -> ProviderResult<()>;
++
++    fn save_signer_by_hash(&self, block_hash: &BlockHash, signer: Address) -> ProviderResult<()>;
++}
+diff -ruN reth-145/crates/storage/storage-api/src/stage_checkpoint.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/stage_checkpoint.rs
+--- reth-145/crates/storage/storage-api/src/stage_checkpoint.rs	2025-12-23 02:32:18
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/stage_checkpoint.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use alloc::{string::String, vec::Vec};
+ use alloy_primitives::BlockNumber;
+ use reth_stages_types::{StageCheckpoint, StageId};
+diff -ruN reth-145/crates/storage/storage-api/src/state.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/state.rs
+--- reth-145/crates/storage/storage-api/src/state.rs	2025-12-23 02:32:18
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/state.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use super::{
+     AccountReader, BlockHashReader, BlockIdReader, StateProofProvider, StateRootProvider,
+     StorageRootProvider,
+@@ -64,10 +67,10 @@
+ 
+         if let Some(code_hash) = acc.bytecode_hash {
+             if code_hash == KECCAK_EMPTY {
+-                return Ok(None)
++                return Ok(None);
+             }
+             // Get the code from the code hash
+-            return self.bytecode_by_hash(&code_hash)
++            return self.bytecode_by_hash(&code_hash);
+         }
+ 
+         // Return `None` if no code hash is set
+@@ -81,7 +84,8 @@
+         // Get basic account information
+         // Returns None if acc doesn't exist
+ 
+-        self.basic_account(addr)?.map_or_else(|| Ok(None), |acc| Ok(Some(acc.balance)))
++        self.basic_account(addr)?
++            .map_or_else(|| Ok(None), |acc| Ok(Some(acc.balance)))
+     }
+ 
+     /// Get account nonce by its address.
+@@ -90,7 +94,8 @@
+     fn account_nonce(&self, addr: &Address) -> ProviderResult<Option<u64>> {
+         // Get basic account information
+         // Returns None if acc doesn't exist
+-        self.basic_account(addr)?.map_or_else(|| Ok(None), |acc| Ok(Some(acc.nonce)))
++        self.basic_account(addr)?
++            .map_or_else(|| Ok(None), |acc| Ok(Some(acc.nonce)))
+     }
+ }
+ 
+diff -ruN reth-145/crates/storage/storage-api/src/state_writer.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/state_writer.rs
+--- reth-145/crates/storage/storage-api/src/state_writer.rs	2025-12-23 02:32:18
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/state_writer.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use alloy_primitives::BlockNumber;
+ use reth_execution_types::ExecutionOutcome;
+ use reth_storage_errors::provider::ProviderResult;
+diff -ruN reth-145/crates/storage/storage-api/src/stats.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/stats.rs
+--- reth-145/crates/storage/storage-api/src/stats.rs	2025-12-23 02:32:18
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/stats.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use reth_db_api::table::Table;
+ 
+ /// The trait for fetching provider statistics.
+diff -ruN reth-145/crates/storage/storage-api/src/storage.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/storage.rs
+--- reth-145/crates/storage/storage-api/src/storage.rs	2025-12-23 02:32:18
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/storage.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use alloc::{
+     collections::{BTreeMap, BTreeSet},
+     vec::Vec,
+diff -ruN reth-145/crates/storage/storage-api/src/transactions.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/transactions.rs
+--- reth-145/crates/storage/storage-api/src/transactions.rs	2025-12-23 02:32:18
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/transactions.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use crate::{BlockNumReader, BlockReader};
+ use alloc::vec::Vec;
+ use alloy_consensus::transaction::TransactionMeta;
+diff -ruN reth-145/crates/storage/storage-api/src/trie.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/trie.rs
+--- reth-145/crates/storage/storage-api/src/trie.rs	2025-12-23 02:32:18
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/trie.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use alloc::vec::Vec;
+ use alloy_primitives::{map::B256Map, Address, Bytes, B256};
+ use reth_storage_errors::provider::ProviderResult;
+diff -ruN reth-145/crates/storage/storage-api/src/validator.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/validator.rs
+--- reth-145/crates/storage/storage-api/src/validator.rs	1969-12-31 19:00:00
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/validator.rs	2025-12-20 16:08:23
+@@ -0,0 +1,45 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
++use alloy_primitives::Address;
++use alloy_primitives::BlockNumber;
++use auto_impl::auto_impl;
++use n42_primitives::{Validator, ValidatorBeforeTx, ValidatorChangeset, ValidatorRevert};
++use reth_storage_errors::provider::ProviderResult;
++use std::collections::BTreeMap;
++use std::ops::RangeInclusive;
++/// Validator reader
++#[auto_impl(&, Arc, Box)]
++pub trait ValidatorReader: Send + Sync {
++    fn basic_validator(&self, address: Address) -> ProviderResult<Option<Validator>>;
++    fn changed_validators_and_blocks_with_range(
++        &self,
++        range: RangeInclusive<BlockNumber>,
++    ) -> ProviderResult<BTreeMap<Address, Vec<BlockNumber>>>;
++}
++
++#[auto_impl(&, Arc, Box)]
++pub trait ValidatorChangeWriter {
++    fn write_validator_reverts(
++        &self,
++        first_block: BlockNumber,
++        validator_reverts: ValidatorRevert,
++    ) -> ProviderResult<()>;
++    fn insert_validator_history_index(
++        &self,
++        validator_transitions: impl IntoIterator<
++            Item = (Address, impl IntoIterator<Item = BlockNumber>),
++        >,
++    ) -> ProviderResult<()>;
++    fn unwind_validator(&self, range: RangeInclusive<BlockNumber>) -> ProviderResult<()>;
++    fn write_validator_changes(&self, changes: ValidatorChangeset) -> ProviderResult<()>;
++    fn remove_validator(&self, range: RangeInclusive<BlockNumber>) -> ProviderResult<()>;
++    fn take_validator(
++        &self,
++        range: RangeInclusive<BlockNumber>,
++    ) -> ProviderResult<ValidatorChangeset>;
++    fn unwind_validator_history_indices<'a>(
++        &self,
++        changesets: impl Iterator<Item = &'a (BlockNumber, ValidatorBeforeTx)>,
++    ) -> ProviderResult<usize>;
++}
+diff -ruN reth-145/crates/storage/storage-api/src/withdrawals.rs /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/withdrawals.rs
+--- reth-145/crates/storage/storage-api/src/withdrawals.rs	2025-12-23 02:32:18
++++ /Users/jieliu/Documents/n42/N42-rs/crates/storage/storage-api/src/withdrawals.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use alloy_eips::{eip4895::Withdrawals, BlockHashOrNumber};
+ use reth_storage_errors::provider::ProviderResult;
+ 

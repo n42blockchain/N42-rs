@@ -1,0 +1,1699 @@
+diff -ruN reth-145/crates/primitives-traits/Cargo.toml /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/Cargo.toml
+--- reth-145/crates/primitives-traits/Cargo.toml	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/Cargo.toml	2025-12-23 02:14:49
+@@ -30,7 +30,7 @@
+ op-alloy-consensus = { workspace = true, optional = true, features = ["k256"] }
+ 
+ # crypto
+-secp256k1 = { workspace = true, features = ["recovery"], optional = true }
++secp256k1 = { workspace = true, features = ["recovery"] }
+ 
+ # misc
+ auto_impl.workspace = true
+@@ -85,7 +85,7 @@
+     "bytes/std",
+     "derive_more/std",
+     "once_cell/std",
+-    "secp256k1?/std",
++    "secp256k1/std",
+     "thiserror/std",
+     "alloy-trie/std",
+     "op-alloy-consensus?/std",
+@@ -110,8 +110,8 @@
+     "alloy-eips/arbitrary",
+     "revm-primitives/arbitrary",
+     "reth-codecs?/arbitrary",
+-    "secp256k1?/global-context",
+-    "secp256k1?/rand",
++    "secp256k1/global-context",
++    "secp256k1/rand",
+     "op-alloy-consensus?/arbitrary",
+     "alloy-trie/arbitrary",
+     "reth-chainspec/arbitrary",
+@@ -135,7 +135,7 @@
+     "revm-primitives/serde",
+     "revm-primitives/serde",
+     "op-alloy-consensus?/serde",
+-    "secp256k1?/serde",
++    "secp256k1/serde",
+     "alloy-trie/serde",
+     "revm-bytecode/serde",
+     "revm-state/serde",
+diff -ruN reth-145/crates/primitives-traits/src/account.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/account.rs
+--- reth-145/crates/primitives-traits/src/account.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/account.rs	2025-12-23 02:14:49
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use alloy_consensus::constants::KECCAK_EMPTY;
+ use alloy_genesis::GenesisAccount;
+ use alloy_primitives::{keccak256, Bytes, B256, U256};
+@@ -26,11 +29,17 @@
+ }
+ 
+ /// An Ethereum account.
+-#[cfg_attr(any(test, feature = "serde"), derive(serde::Serialize, serde::Deserialize))]
++#[cfg_attr(
++    any(test, feature = "serde"),
++    derive(serde::Serialize, serde::Deserialize)
++)]
+ #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+ #[cfg_attr(any(test, feature = "arbitrary"), derive(arbitrary::Arbitrary))]
+ #[cfg_attr(any(test, feature = "reth-codec"), derive(reth_codecs::Compact))]
+-#[cfg_attr(any(test, feature = "reth-codec"), reth_codecs::add_arbitrary_tests(compact))]
++#[cfg_attr(
++    any(test, feature = "reth-codec"),
++    reth_codecs::add_arbitrary_tests(compact)
++)]
+ pub struct Account {
+     /// Account nonce.
+     pub nonce: u64,
+@@ -49,9 +58,9 @@
+     /// After `SpuriousDragon` empty account is defined as account with nonce == 0 && balance == 0
+     /// && bytecode = None (or hash is [`KECCAK_EMPTY`]).
+     pub fn is_empty(&self) -> bool {
+-        self.nonce == 0 &&
+-            self.balance.is_zero() &&
+-            self.bytecode_hash.is_none_or(|hash| hash == KECCAK_EMPTY)
++        self.nonce == 0
++            && self.balance.is_zero()
++            && self.bytecode_hash.is_none_or(|hash| hash == KECCAK_EMPTY)
+     }
+ 
+     /// Returns an account bytecode's hash.
+@@ -62,7 +71,11 @@
+ 
+     /// Converts the account into a trie account with the given storage root.
+     pub fn into_trie_account(self, storage_root: B256) -> TrieAccount {
+-        let Self { nonce, balance, bytecode_hash } = self;
++        let Self {
++            nonce,
++            balance,
++            bytecode_hash,
++        } = self;
+         TrieAccount {
+             nonce,
+             balance,
+@@ -165,8 +178,9 @@
+ 
+         use compact_ids::*;
+ 
+-        let len = buf.read_u32::<byteorder::BigEndian>().expect("could not read bytecode length")
+-            as usize;
++        let len = buf
++            .read_u32::<byteorder::BigEndian>()
++            .expect("could not read bytecode length") as usize;
+         let bytes = Bytes::from(buf.copy_to_bytes(len));
+         let variant = buf.read_u8().expect("could not read bytecode variant");
+         let decoded = match variant {
+@@ -268,7 +282,11 @@
+ 
+     #[test]
+     fn test_empty_account() {
+-        let mut acc = Account { nonce: 0, balance: U256::ZERO, bytecode_hash: None };
++        let mut acc = Account {
++            nonce: 0,
++            balance: U256::ZERO,
++            bytecode_hash: None,
++        };
+         // Nonce 0, balance 0, and bytecode hash set to None is considered empty.
+         assert!(acc.is_empty());
+ 
+@@ -320,13 +338,26 @@
+     #[test]
+     fn test_account_has_bytecode() {
+         // Account with no bytecode (None)
+-        let acc_no_bytecode = Account { nonce: 1, balance: U256::from(1000), bytecode_hash: None };
+-        assert!(!acc_no_bytecode.has_bytecode(), "Account should not have bytecode");
++        let acc_no_bytecode = Account {
++            nonce: 1,
++            balance: U256::from(1000),
++            bytecode_hash: None,
++        };
++        assert!(
++            !acc_no_bytecode.has_bytecode(),
++            "Account should not have bytecode"
++        );
+ 
+         // Account with bytecode hash set to KECCAK_EMPTY (should have bytecode)
+-        let acc_empty_bytecode =
+-            Account { nonce: 1, balance: U256::from(1000), bytecode_hash: Some(KECCAK_EMPTY) };
+-        assert!(acc_empty_bytecode.has_bytecode(), "Account should have bytecode");
++        let acc_empty_bytecode = Account {
++            nonce: 1,
++            balance: U256::from(1000),
++            bytecode_hash: Some(KECCAK_EMPTY),
++        };
++        assert!(
++            acc_empty_bytecode.has_bytecode(),
++            "Account should have bytecode"
++        );
+ 
+         // Account with a non-empty bytecode hash
+         let acc_with_bytecode = Account {
+@@ -334,18 +365,32 @@
+             balance: U256::from(1000),
+             bytecode_hash: Some(B256::from_slice(&[0x11u8; 32])),
+         };
+-        assert!(acc_with_bytecode.has_bytecode(), "Account should have bytecode");
++        assert!(
++            acc_with_bytecode.has_bytecode(),
++            "Account should have bytecode"
++        );
+     }
+ 
+     #[test]
+     fn test_account_get_bytecode_hash() {
+         // Account with no bytecode (should return KECCAK_EMPTY)
+-        let acc_no_bytecode = Account { nonce: 0, balance: U256::ZERO, bytecode_hash: None };
+-        assert_eq!(acc_no_bytecode.get_bytecode_hash(), KECCAK_EMPTY, "Should return KECCAK_EMPTY");
++        let acc_no_bytecode = Account {
++            nonce: 0,
++            balance: U256::ZERO,
++            bytecode_hash: None,
++        };
++        assert_eq!(
++            acc_no_bytecode.get_bytecode_hash(),
++            KECCAK_EMPTY,
++            "Should return KECCAK_EMPTY"
++        );
+ 
+         // Account with bytecode hash set to KECCAK_EMPTY
+-        let acc_empty_bytecode =
+-            Account { nonce: 1, balance: U256::from(1000), bytecode_hash: Some(KECCAK_EMPTY) };
++        let acc_empty_bytecode = Account {
++            nonce: 1,
++            balance: U256::from(1000),
++            bytecode_hash: Some(KECCAK_EMPTY),
++        };
+         assert_eq!(
+             acc_empty_bytecode.get_bytecode_hash(),
+             KECCAK_EMPTY,
+@@ -354,8 +399,11 @@
+ 
+         // Account with a valid bytecode hash
+         let bytecode_hash = B256::from_slice(&[0x11u8; 32]);
+-        let acc_with_bytecode =
+-            Account { nonce: 1, balance: U256::from(1000), bytecode_hash: Some(bytecode_hash) };
++        let acc_with_bytecode = Account {
++            nonce: 1,
++            balance: U256::from(1000),
++            bytecode_hash: Some(bytecode_hash),
++        };
+         assert_eq!(
+             acc_with_bytecode.get_bytecode_hash(),
+             bytecode_hash,
+diff -ruN reth-145/crates/primitives-traits/src/block/body.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/block/body.rs
+--- reth-145/crates/primitives-traits/src/block/body.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/block/body.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Block body abstraction.
+ 
+ use crate::{
+@@ -116,17 +119,22 @@
+     ///
+     /// Returns `RecoveryError` if there are no ommers in the block.
+     fn calculate_ommers_root(&self) -> Option<B256> {
+-        self.ommers().map(alloy_consensus::proofs::calculate_ommers_root)
++        self.ommers()
++            .map(alloy_consensus::proofs::calculate_ommers_root)
+     }
+ 
+     /// Calculates the total blob gas used by _all_ EIP-4844 transactions in the block.
+     fn blob_gas_used(&self) -> u64 {
+-        self.transactions_iter().filter_map(|tx| tx.blob_gas_used()).sum()
++        self.transactions_iter()
++            .filter_map(|tx| tx.blob_gas_used())
++            .sum()
+     }
+ 
+     /// Returns an iterator over all blob versioned hashes in the block body.
+     fn blob_versioned_hashes_iter(&self) -> impl Iterator<Item = &B256> + '_ {
+-        self.transactions_iter().filter_map(|tx| tx.blob_versioned_hashes()).flatten()
++        self.transactions_iter()
++            .filter_map(|tx| tx.blob_versioned_hashes())
++            .flatten()
+     }
+ 
+     /// Returns an iterator over the encoded 2718 transactions.
+@@ -146,7 +154,9 @@
+     /// See also [`Encodable2718`].
+     #[doc(alias = "raw_transactions")]
+     fn encoded_2718_transactions(&self) -> Vec<Bytes> {
+-        self.encoded_2718_transactions_iter().map(Into::into).collect()
++        self.encoded_2718_transactions_iter()
++            .map(Into::into)
++            .collect()
+     }
+ 
+     /// Recover signer addresses for all transactions in the block body.
+diff -ruN reth-145/crates/primitives-traits/src/block/error.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/block/error.rs
+--- reth-145/crates/primitives-traits/src/block/error.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/block/error.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Error types for the `block` module.
+ 
+ use crate::transaction::signed::RecoveryError;
+diff -ruN reth-145/crates/primitives-traits/src/block/header.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/block/header.rs
+--- reth-145/crates/primitives-traits/src/block/header.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/block/header.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Block header data primitive.
+ 
+ use crate::{InMemorySize, MaybeCompact, MaybeSerde, MaybeSerdeBincodeCompat};
+diff -ruN reth-145/crates/primitives-traits/src/block/mod.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/block/mod.rs
+--- reth-145/crates/primitives-traits/src/block/mod.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/block/mod.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Block abstraction.
+ 
+ pub(crate) mod sealed;
+@@ -147,7 +150,7 @@
+         } else {
+             // Fall back to recovery if lengths don't match
+             let Ok(senders) = self.body().recover_signers_unchecked() else {
+-                return Err(BlockRecoveryError::new(self))
++                return Err(BlockRecoveryError::new(self));
+             };
+             senders
+         };
+@@ -173,7 +176,7 @@
+         <Self::Body as BlockBody>::Transaction: SignedTransaction,
+     {
+         let Ok(signers) = self.body().recover_signers() else {
+-            return Err(BlockRecoveryError::new(self))
++            return Err(BlockRecoveryError::new(self));
+         };
+         Ok(RecoveredBlock::new_unhashed(self, signers))
+     }
+diff -ruN reth-145/crates/primitives-traits/src/block/recovered.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/block/recovered.rs
+--- reth-145/crates/primitives-traits/src/block/recovered.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/block/recovered.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Recovered Block variant.
+ 
+ use crate::{
+@@ -47,14 +50,20 @@
+     ///
+     /// Note: This expects that the given senders match the transactions in the block.
+     pub fn new(block: B, senders: Vec<Address>, hash: BlockHash) -> Self {
+-        Self { block: SealedBlock::new_unchecked(block, hash), senders }
++        Self {
++            block: SealedBlock::new_unchecked(block, hash),
++            senders,
++        }
+     }
+ 
+     /// Creates a new recovered block instance with the given senders as provided.
+     ///
+     /// Note: This expects that the given senders match the transactions in the block.
+     pub fn new_unhashed(block: B, senders: Vec<Address>) -> Self {
+-        Self { block: SealedBlock::new_unhashed(block), senders }
++        Self {
++            block: SealedBlock::new_unhashed(block),
++            senders,
++        }
+     }
+ 
+     /// Returns the recovered senders.
+@@ -96,7 +105,9 @@
+             senders
+         } else {
+             let Ok(senders) = block.body().try_recover_signers() else {
+-                return Err(SealedBlockRecoveryError::new(SealedBlock::new_unchecked(block, hash)));
++                return Err(SealedBlockRecoveryError::new(SealedBlock::new_unchecked(
++                    block, hash,
++                )));
+             };
+             senders
+         };
+@@ -116,7 +127,9 @@
+             senders
+         } else {
+             let Ok(senders) = block.body().try_recover_signers_unchecked() else {
+-                return Err(SealedBlockRecoveryError::new(SealedBlock::new_unchecked(block, hash)));
++                return Err(SealedBlockRecoveryError::new(SealedBlock::new_unchecked(
++                    block, hash,
++                )));
+             };
+             senders
+         };
+@@ -239,7 +252,10 @@
+ 
+     /// Return a [`BlockWithParent`] for this header.
+     pub fn block_with_parent(&self) -> BlockWithParent {
+-        BlockWithParent { parent: self.header().parent_hash(), block: self.num_hash() }
++        BlockWithParent {
++            parent: self.header().parent_hash(),
++            block: self.num_hash(),
++        }
+     }
+ 
+     /// Clone the header.
+@@ -305,7 +321,8 @@
+     pub fn transactions_recovered(
+         &self,
+     ) -> impl Iterator<Item = Recovered<&'_ <B::Body as BlockBody>::Transaction>> + '_ {
+-        self.transactions_with_sender().map(|(sender, tx)| Recovered::new_unchecked(tx, *sender))
++        self.transactions_with_sender()
++            .map(|(sender, tx)| Recovered::new_unchecked(tx, *sender))
+     }
+ 
+     /// Consumes the type and returns an iterator over all [`Recovered`] transactions in the block.
+@@ -420,9 +437,9 @@
+ 
+ impl<B: Block> PartialEq for RecoveredBlock<B> {
+     fn eq(&self, other: &Self) -> bool {
+-        self.hash_ref().eq(other.hash_ref()) &&
+-            self.block.eq(&other.block) &&
+-            self.senders.eq(&other.senders)
++        self.hash_ref().eq(other.hash_ref())
++            && self.block.eq(&other.block)
++            && self.senders.eq(&other.senders)
+     }
+ }
+ 
+@@ -571,7 +588,10 @@
+         From<&'a super::RecoveredBlock<T>> for RecoveredBlock<'a, T>
+     {
+         fn from(value: &'a super::RecoveredBlock<T>) -> Self {
+-            Self { block: (&value.block).into(), senders: Cow::Borrowed(&value.senders) }
++            Self {
++                block: (&value.block).into(),
++                senders: Cow::Borrowed(&value.senders),
++            }
+         }
+     }
+ 
+diff -ruN reth-145/crates/primitives-traits/src/block/sealed.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/block/sealed.rs
+--- reth-145/crates/primitives-traits/src/block/sealed.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/block/sealed.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Sealed block types
+ 
+ use crate::{
+@@ -42,13 +45,19 @@
+     #[inline]
+     pub fn new_unchecked(block: B, hash: BlockHash) -> Self {
+         let (header, body) = block.split();
+-        Self { header: SealedHeader::new(header, hash), body }
++        Self {
++            header: SealedHeader::new(header, hash),
++            body,
++        }
+     }
+ 
+     /// Creates a `SealedBlock` from the block without the available hash
+     pub fn new_unhashed(block: B) -> Self {
+         let (header, body) = block.split();
+-        Self { header: SealedHeader::new_unhashed(header), body }
++        Self {
++            header: SealedHeader::new_unhashed(header),
++            body,
++        }
+     }
+ 
+     /// Creates the [`SealedBlock`] from the block's parts by hashing the header.
+@@ -191,7 +200,10 @@
+ 
+     /// Return a [`BlockWithParent`] for this header.
+     pub fn block_with_parent(&self) -> BlockWithParent {
+-        BlockWithParent { parent: self.parent_hash(), block: self.num_hash() }
++        BlockWithParent {
++            parent: self.parent_hash(),
++            block: self.num_hash(),
++        }
+     }
+ 
+     /// Returns the Sealed header.
+@@ -266,7 +278,7 @@
+             return Err(GotExpected {
+                 got: calculated_root,
+                 expected: self.header().transactions_root(),
+-            })
++            });
+         }
+ 
+         Ok(())
+@@ -421,7 +433,10 @@
+         From<&'a super::SealedBlock<T>> for SealedBlock<'a, T>
+     {
+         fn from(value: &'a super::SealedBlock<T>) -> Self {
+-            Self { header: value.header.as_repr(), body: value.body.as_repr() }
++            Self {
++                header: value.header.as_repr(),
++                body: value.body.as_repr(),
++            }
+         }
+     }
+ 
+@@ -429,7 +444,10 @@
+         From<SealedBlock<'a, T>> for super::SealedBlock<T>
+     {
+         fn from(value: SealedBlock<'a, T>) -> Self {
+-            Self::from_sealed_parts(value.header.into(), SerdeBincodeCompat::from_repr(value.body))
++            Self::from_sealed_parts(
++                value.header.into(),
++                SerdeBincodeCompat::from_repr(value.body),
++            )
+         }
+     }
+ 
+diff -ruN reth-145/crates/primitives-traits/src/constants/gas_units.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/constants/gas_units.rs
+--- reth-145/crates/primitives-traits/src/constants/gas_units.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/constants/gas_units.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use alloc::string::String;
+ use core::time::Duration;
+ 
+diff -ruN reth-145/crates/primitives-traits/src/constants/mod.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/constants/mod.rs
+--- reth-145/crates/primitives-traits/src/constants/mod.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/constants/mod.rs	2025-12-20 16:08:23
+@@ -1,8 +1,20 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Ethereum protocol-related constants
+ 
+ /// Gas units, for example [`GIGAGAS`].
+ pub mod gas_units;
+ pub use gas_units::{GIGAGAS, KILOGAS, MEGAGAS};
++
++use alloy_primitives::{b256, B256};
++/// n42 block gas limit
++pub const N42_BLOCK_GAS_LIMIT: u64 = 9_223_372_036_854_775_807;
++
++/// The n42 mainnet genesis hash:
++/// `0x138734b7044254e5ecbabf8056f5c2b73cd0847aaa5acac7345507cbeab387b8`
++pub const N42_GENESIS_HASH: B256 =
++    b256!("138734b7044254e5ecbabf8056f5c2b73cd0847aaa5acac7345507cbeab387b8");
+ 
+ /// The client version: `reth/v{major}.{minor}.{patch}`
+ pub const RETH_CLIENT_VERSION: &str = concat!("reth/v", env!("CARGO_PKG_VERSION"));
+diff -ruN reth-145/crates/primitives-traits/src/crypto.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/crypto.rs
+--- reth-145/crates/primitives-traits/src/crypto.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/crypto.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Crypto utilities.
+ 
+ pub use alloy_consensus::crypto::*;
+diff -ruN reth-145/crates/primitives-traits/src/error.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/error.rs
+--- reth-145/crates/primitives-traits/src/error.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/error.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use alloc::boxed::Box;
+ use core::ops::{Deref, DerefMut};
+ 
+diff -ruN reth-145/crates/primitives-traits/src/extended.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/extended.rs
+--- reth-145/crates/primitives-traits/src/extended.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/extended.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use crate::{
+     size::InMemorySize,
+     transaction::signed::{RecoveryError, SignedTransaction},
+diff -ruN reth-145/crates/primitives-traits/src/header/clique_utils.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/header/clique_utils.rs
+--- reth-145/crates/primitives-traits/src/header/clique_utils.rs	1969-12-31 19:00:00
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/header/clique_utils.rs	2025-12-20 16:08:23
+@@ -0,0 +1,347 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
++use super::Header;
++use crate::BlockHeader as BlockHeaderTrait;
++use alloy_primitives::{keccak256, Address, BlockNumber, Bloom, Bytes, B256, B64, U256};
++use alloy_rlp::{length_of_length, Encodable};
++use bytes::BufMut;
++use secp256k1::{
++    ecdsa::{RecoverableSignature, RecoveryId},
++    Error as SecpError, Message, PublicKey, SECP256K1,
++};
++use std::error::Error;
++
++/// recovery error
++#[derive(Debug)]
++pub enum RecoveryError {
++    /// missing signature
++    MissingSignature,
++    /// invalid message
++    InvalidMessage,
++    /// invalide recovery id
++    InvalidRecoveryId,
++    /// invalid signature format
++    InvalidSignatureFormat,
++    /// failed to recover public key
++    FailedToRecoverPublicKey,
++    /// ecdsa error
++    EcdsaError(SecpError),
++}
++
++impl std::fmt::Display for RecoveryError {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            Self::MissingSignature => write!(f, "Missing signature"),
++            Self::InvalidMessage => write!(f, "Invalid message"),
++            Self::InvalidRecoveryId => write!(f, "Invalid recovery ID"),
++            Self::InvalidSignatureFormat => write!(f, "Invalid signature format"),
++            Self::FailedToRecoverPublicKey => write!(f, "Failed to recover public key"),
++            Self::EcdsaError(e) => write!(f, "ECDSA error: {}", e),
++        }
++    }
++}
++
++impl From<SecpError> for RecoveryError {
++    fn from(err: SecpError) -> Self {
++        Self::EcdsaError(err)
++    }
++}
++
++impl std::error::Error for RecoveryError {}
++///  indicates the byte length required to carry a signature with recovery id.
++///  Fixed number of extra-data suffix bytes reserved for signer seal
++pub const SIGNATURE_LENGTH: usize = 64 + 1;
++
++/// recover_address extracts the Ethereum account address from a signed header.
++pub fn recover_address(header: &Header) -> Result<Address, Box<dyn Error>> {
++    // Retrieve the signature from the header extra-data
++    if header.extra_data.len() < SIGNATURE_LENGTH {
++        return Err(Box::new(RecoveryError::MissingSignature));
++    }
++    let signature = &header.extra_data[header.extra_data.len() - SIGNATURE_LENGTH..];
++
++    // Recover the public key and the Ethereum address
++    let message = Message::from_digest(seal_hash(header).into());
++
++    let signature = RecoverableSignature::from_compact(
++        &signature[..64],
++        RecoveryId::try_from(i32::from(signature[64]))?,
++    )?;
++
++    Ok(public_key_to_address(
++        SECP256K1.recover_ecdsa(&message, &signature)?,
++    ))
++}
++
++pub fn recover_address_generic<H>(header: &H) -> Result<Address, Box<dyn Error>>
++where
++    H: BlockHeaderTrait,
++{
++    // Retrieve the signature from the header extra-data
++    if header.extra_data().len() < SIGNATURE_LENGTH {
++        return Err(Box::new(RecoveryError::MissingSignature));
++    }
++    let signature = &header.extra_data()[header.extra_data().len() - SIGNATURE_LENGTH..];
++
++    // Recover the public key and the Ethereum address
++    let message = Message::from_digest(seal_hash_generic(header).into());
++
++    let signature = RecoverableSignature::from_compact(
++        &signature[..64],
++        RecoveryId::try_from(i32::from(signature[64]))?,
++    )?;
++
++    Ok(public_key_to_address(
++        SECP256K1.recover_ecdsa(&message, &signature)?,
++    ))
++}
++
++pub fn seal_hash_generic<H>(header: &H) -> B256
++where
++    H: BlockHeaderTrait,
++{
++    struct LocalHeader {
++        parent_hash: B256,
++        ommers_hash: B256,
++        beneficiary: Address,
++        state_root: B256,
++        transactions_root: B256,
++        receipts_root: B256,
++        logs_bloom: Bloom,
++        difficulty: U256,
++        number: BlockNumber,
++        gas_limit: u64,
++        gas_used: u64,
++        timestamp: u64,
++        extra_data: Bytes,
++        mix_hash: B256,
++        nonce: u64,
++        base_fee_per_gas: Option<u64>,
++    }
++
++    impl LocalHeader {
++        fn header_payload_length(&self) -> usize {
++            let mut length = 0;
++            length += self.parent_hash.length(); // Hash of the previous block.
++            length += self.ommers_hash.length(); // Hash of uncle blocks.
++            length += self.beneficiary.length(); // Address that receives rewards.
++            length += self.state_root.length(); // Root hash of the state object.
++            length += self.transactions_root.length(); // Root hash of transactions in the block.
++            length += self.receipts_root.length(); // Hash of transaction receipts.
++            length += self.logs_bloom.length(); // Data structure containing event logs.
++            length += self.difficulty.length(); // Difficulty value of the block.
++            length += U256::from(self.number).length(); // Block number.
++            length += U256::from(self.gas_limit).length(); // Maximum gas allowed.
++            length += U256::from(self.gas_used).length(); // Actual gas used.
++            length += self.timestamp.length(); // Block timestamp.
++            length += self.extra_data.length(); // Additional arbitrary data.
++            length += self.mix_hash.length(); // Hash used for mining.
++            length += B64::new(self.nonce.to_be_bytes()).length(); // Nonce for mining.
++
++            if let Some(base_fee) = self.base_fee_per_gas {
++                // Adding base fee length if it exists.
++                length += U256::from(base_fee).length();
++            }
++            length
++        }
++    }
++
++    impl Encodable for LocalHeader {
++        fn encode(&self, out: &mut dyn BufMut) {
++            // Create a header indicating the encoded content is a list with the payload length computed
++            // from the header's payload calculation function.
++            let list_header = alloy_rlp::Header {
++                list: true,
++                payload_length: self.header_payload_length(),
++            };
++            list_header.encode(out);
++
++            // Encode each header field sequentially
++            self.parent_hash.encode(out); // Encode parent hash.
++            self.ommers_hash.encode(out); // Encode ommer's hash.
++            self.beneficiary.encode(out); // Encode beneficiary.
++            self.state_root.encode(out); // Encode state root.
++            self.transactions_root.encode(out); // Encode transactions root.
++            self.receipts_root.encode(out); // Encode receipts root.
++            self.logs_bloom.encode(out); // Encode logs bloom.
++            self.difficulty.encode(out); // Encode difficulty.
++            U256::from(self.number).encode(out); // Encode block number.
++            U256::from(self.gas_limit).encode(out); // Encode gas limit.
++            U256::from(self.gas_used).encode(out); // Encode gas used.
++            self.timestamp.encode(out); // Encode timestamp.
++            self.extra_data.encode(out); // Encode extra data.
++            self.mix_hash.encode(out); // Encode mix hash.
++            B64::new(self.nonce.to_be_bytes()).encode(out); // Encode nonce.
++
++            // Encode base fee.
++            if let Some(ref base_fee) = self.base_fee_per_gas {
++                U256::from(*base_fee).encode(out);
++            }
++        }
++
++        fn length(&self) -> usize {
++            let mut length = 0;
++            length += self.header_payload_length();
++            length += length_of_length(length);
++            length
++        }
++    }
++
++    // 初始化局部结构体
++    let mut sig_header = LocalHeader {
++        parent_hash: header.parent_hash(),
++        ommers_hash: header.ommers_hash(),
++        beneficiary: header.beneficiary(),
++        state_root: header.state_root(),
++        transactions_root: header.transactions_root(),
++        receipts_root: header.receipts_root(),
++        logs_bloom: header.logs_bloom(),
++        difficulty: header.difficulty(),
++        number: header.number(),
++        gas_limit: header.gas_limit(),
++        gas_used: header.gas_used(),
++        timestamp: header.timestamp(),
++        extra_data: Bytes::new(),
++        // SEC-002: Safe handling of optional mix_hash and nonce
++        mix_hash: header.mix_hash().unwrap_or_default(),
++        nonce: u64::from(header.nonce().unwrap_or_default()),
++        base_fee_per_gas: header.base_fee_per_gas(),
++    };
++
++    // Handle the extra field, excluding the last CRYPTO_SIGNATURE_LENGTH bytes
++    if header.extra_data().len() > SIGNATURE_LENGTH {
++        sig_header.extra_data = Bytes::from(
++            header.extra_data()[..header.extra_data().len() - SIGNATURE_LENGTH].to_vec(),
++        );
++    }
++
++    keccak256(alloy_rlp::encode(&sig_header))
++}
++
++/// SealHash returns the hash of a block prior to it being sealed.
++pub fn seal_hash(header: &Header) -> B256 {
++    struct LocalHeader {
++        parent_hash: B256,
++        ommers_hash: B256,
++        beneficiary: Address,
++        state_root: B256,
++        transactions_root: B256,
++        receipts_root: B256,
++        logs_bloom: Bloom,
++        difficulty: U256,
++        number: BlockNumber,
++        gas_limit: u64,
++        gas_used: u64,
++        timestamp: u64,
++        extra_data: Bytes,
++        mix_hash: B256,
++        nonce: u64,
++        base_fee_per_gas: Option<u64>,
++    }
++
++    impl LocalHeader {
++        fn header_payload_length(&self) -> usize {
++            let mut length = 0;
++            length += self.parent_hash.length(); // Hash of the previous block.
++            length += self.ommers_hash.length(); // Hash of uncle blocks.
++            length += self.beneficiary.length(); // Address that receives rewards.
++            length += self.state_root.length(); // Root hash of the state object.
++            length += self.transactions_root.length(); // Root hash of transactions in the block.
++            length += self.receipts_root.length(); // Hash of transaction receipts.
++            length += self.logs_bloom.length(); // Data structure containing event logs.
++            length += self.difficulty.length(); // Difficulty value of the block.
++            length += U256::from(self.number).length(); // Block number.
++            length += U256::from(self.gas_limit).length(); // Maximum gas allowed.
++            length += U256::from(self.gas_used).length(); // Actual gas used.
++            length += self.timestamp.length(); // Block timestamp.
++            length += self.extra_data.length(); // Additional arbitrary data.
++            length += self.mix_hash.length(); // Hash used for mining.
++            length += B64::new(self.nonce.to_be_bytes()).length(); // Nonce for mining.
++
++            if let Some(base_fee) = self.base_fee_per_gas {
++                // Adding base fee length if it exists.
++                length += U256::from(base_fee).length();
++            }
++            length
++        }
++    }
++
++    impl Encodable for LocalHeader {
++        fn encode(&self, out: &mut dyn BufMut) {
++            // Create a header indicating the encoded content is a list with the payload length computed
++            // from the header's payload calculation function.
++            let list_header = alloy_rlp::Header {
++                list: true,
++                payload_length: self.header_payload_length(),
++            };
++            list_header.encode(out);
++
++            // Encode each header field sequentially
++            self.parent_hash.encode(out); // Encode parent hash.
++            self.ommers_hash.encode(out); // Encode ommer's hash.
++            self.beneficiary.encode(out); // Encode beneficiary.
++            self.state_root.encode(out); // Encode state root.
++            self.transactions_root.encode(out); // Encode transactions root.
++            self.receipts_root.encode(out); // Encode receipts root.
++            self.logs_bloom.encode(out); // Encode logs bloom.
++            self.difficulty.encode(out); // Encode difficulty.
++            U256::from(self.number).encode(out); // Encode block number.
++            U256::from(self.gas_limit).encode(out); // Encode gas limit.
++            U256::from(self.gas_used).encode(out); // Encode gas used.
++            self.timestamp.encode(out); // Encode timestamp.
++            self.extra_data.encode(out); // Encode extra data.
++            self.mix_hash.encode(out); // Encode mix hash.
++            B64::new(self.nonce.to_be_bytes()).encode(out); // Encode nonce.
++
++            // Encode base fee.
++            if let Some(ref base_fee) = self.base_fee_per_gas {
++                U256::from(*base_fee).encode(out);
++            }
++        }
++
++        fn length(&self) -> usize {
++            let mut length = 0;
++            length += self.header_payload_length();
++            length += length_of_length(length);
++            length
++        }
++    }
++
++    // 初始化局部结构体
++    let mut sig_header = LocalHeader {
++        parent_hash: header.parent_hash,
++        ommers_hash: header.ommers_hash,
++        beneficiary: header.beneficiary,
++        state_root: header.state_root,
++        transactions_root: header.transactions_root,
++        receipts_root: header.receipts_root,
++        logs_bloom: header.logs_bloom,
++        difficulty: header.difficulty,
++        number: header.number,
++        gas_limit: header.gas_limit,
++        gas_used: header.gas_used,
++        timestamp: header.timestamp,
++        extra_data: Bytes::new(),
++        mix_hash: header.mix_hash,
++        nonce: u64::from(header.nonce),
++        base_fee_per_gas: header.base_fee_per_gas,
++    };
++
++    // Handle the extra field, excluding the last CRYPTO_SIGNATURE_LENGTH bytes
++    if header.extra_data.len() > SIGNATURE_LENGTH {
++        sig_header.extra_data =
++            Bytes::from(header.extra_data[..header.extra_data.len() - SIGNATURE_LENGTH].to_vec());
++    }
++
++    keccak256(alloy_rlp::encode(&sig_header))
++}
++
++// Copied from crates/primitives/src/transaction/util.rs
++/// reth-primitives crate can not be used here because of cyclic dependency
++pub fn public_key_to_address(public: PublicKey) -> Address {
++    // strip out the first byte because that should be the SECP256K1_TAG_PUBKEY_UNCOMPRESSED
++    // tag returned by libsecp's uncompressed pubkey serialization
++    let hash = keccak256(&public.serialize_uncompressed()[1..]);
++    Address::from_slice(&hash[12..])
++}
+diff -ruN reth-145/crates/primitives-traits/src/header/clique_utils_tests.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/header/clique_utils_tests.rs
+--- reth-145/crates/primitives-traits/src/header/clique_utils_tests.rs	1969-12-31 19:00:00
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/header/clique_utils_tests.rs	2025-12-20 16:08:23
+@@ -0,0 +1,315 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
++//! Tests for clique_utils module - signature recovery and seal hash computation
++
++use super::clique_utils::{
++    public_key_to_address, recover_address, recover_address_generic, seal_hash, seal_hash_generic,
++    RecoveryError, SIGNATURE_LENGTH,
++};
++use super::Header;
++use alloy_primitives::{keccak256, Address, Bloom, Bytes, B256, B64, U256};
++use secp256k1::{ecdsa::RecoveryId, Message, PublicKey, SecretKey, SECP256K1};
++
++/// Create a test header with default values
++fn create_test_header() -> Header {
++    Header {
++        parent_hash: B256::ZERO,
++        ommers_hash: B256::ZERO,
++        beneficiary: Address::ZERO,
++        state_root: B256::ZERO,
++        transactions_root: B256::ZERO,
++        receipts_root: B256::ZERO,
++        logs_bloom: Bloom::ZERO,
++        difficulty: U256::ZERO,
++        number: 1,
++        gas_limit: 8_000_000,
++        gas_used: 21000,
++        timestamp: 1600000000,
++        extra_data: Bytes::new(),
++        mix_hash: B256::ZERO,
++        nonce: B64::ZERO,
++        base_fee_per_gas: Some(1000000000),
++        withdrawals_root: None,
++        blob_gas_used: None,
++        excess_blob_gas: None,
++        parent_beacon_block_root: None,
++        requests_hash: None,
++    }
++}
++
++/// Sign a header with given secret key
++fn sign_header(header: &mut Header, secret_key: &SecretKey) {
++    // Set initial vanity (32 bytes) + placeholder for signature
++    header.extra_data = Bytes::from(vec![0u8; 32 + SIGNATURE_LENGTH]);
++
++    // Compute seal hash (which excludes the signature portion)
++    let hash = seal_hash(header);
++
++    // Create message and sign
++    let message = Message::from_digest(hash.into());
++    let (recovery_id, sig) = SECP256K1
++        .sign_ecdsa_recoverable(&message, secret_key)
++        .serialize_compact();
++
++    // Build extra_data: 32 bytes vanity + signature (64 + 1)
++    let mut extra_data = vec![0u8; 32]; // 32 byte vanity
++    extra_data.extend_from_slice(&sig);
++    extra_data.push(i32::from(recovery_id) as u8);
++
++    header.extra_data = Bytes::from(extra_data);
++}
++
++#[test]
++fn test_signature_length_constant() {
++    assert_eq!(SIGNATURE_LENGTH, 65, "Signature length should be 64 + 1");
++}
++
++#[test]
++fn test_recovery_error_display() {
++    assert_eq!(
++        format!("{}", RecoveryError::MissingSignature),
++        "Missing signature"
++    );
++    assert_eq!(
++        format!("{}", RecoveryError::InvalidMessage),
++        "Invalid message"
++    );
++    assert_eq!(
++        format!("{}", RecoveryError::InvalidRecoveryId),
++        "Invalid recovery ID"
++    );
++    assert_eq!(
++        format!("{}", RecoveryError::InvalidSignatureFormat),
++        "Invalid signature format"
++    );
++    assert_eq!(
++        format!("{}", RecoveryError::FailedToRecoverPublicKey),
++        "Failed to recover public key"
++    );
++}
++
++#[test]
++fn test_seal_hash_deterministic() {
++    let header = create_test_header();
++    let hash1 = seal_hash(&header);
++    let hash2 = seal_hash(&header);
++    assert_eq!(hash1, hash2, "seal_hash should be deterministic");
++}
++
++#[test]
++fn test_seal_hash_changes_with_header_fields() {
++    let header1 = create_test_header();
++    let mut header2 = create_test_header();
++    header2.number = 2;
++
++    let hash1 = seal_hash(&header1);
++    let hash2 = seal_hash(&header2);
++
++    assert_ne!(
++        hash1, hash2,
++        "Different block numbers should produce different hashes"
++    );
++}
++
++#[test]
++fn test_seal_hash_excludes_signature() {
++    let mut header = create_test_header();
++
++    // Set extra_data with vanity + signature placeholder
++    let mut extra_with_sig1 = vec![0u8; 32];
++    extra_with_sig1.extend_from_slice(&[0xaa; SIGNATURE_LENGTH]);
++    header.extra_data = Bytes::from(extra_with_sig1);
++    let hash1 = seal_hash(&header);
++
++    // Change the signature portion
++    let mut extra_with_sig2 = vec![0u8; 32];
++    extra_with_sig2.extend_from_slice(&[0xbb; SIGNATURE_LENGTH]);
++    header.extra_data = Bytes::from(extra_with_sig2);
++    let hash2 = seal_hash(&header);
++
++    assert_eq!(
++        hash1, hash2,
++        "Seal hash should exclude signature from extra_data"
++    );
++}
++
++#[test]
++fn test_recover_address_missing_signature() {
++    let header = create_test_header();
++    let result = recover_address(&header);
++    assert!(result.is_err(), "Should fail with missing signature");
++}
++
++#[test]
++fn test_recover_address_short_extra_data() {
++    let mut header = create_test_header();
++    header.extra_data = Bytes::from(vec![0u8; SIGNATURE_LENGTH - 1]);
++
++    let result = recover_address(&header);
++    assert!(result.is_err(), "Should fail with short extra_data");
++}
++
++#[test]
++fn test_sign_and_recover_address() {
++    let secret_key = SecretKey::from_slice(&[0x01; 32]).expect("valid key");
++    let public_key = PublicKey::from_secret_key(SECP256K1, &secret_key);
++    let expected_address = public_key_to_address(public_key);
++
++    let mut header = create_test_header();
++    sign_header(&mut header, &secret_key);
++
++    let recovered = recover_address(&header).expect("should recover address");
++    assert_eq!(
++        recovered, expected_address,
++        "Recovered address should match signer"
++    );
++}
++
++#[test]
++fn test_recover_address_generic_consistency() {
++    let secret_key = SecretKey::from_slice(&[0x02; 32]).expect("valid key");
++
++    let mut header = create_test_header();
++    sign_header(&mut header, &secret_key);
++
++    let addr1 = recover_address(&header).expect("should recover");
++    let addr2 = recover_address_generic(&header).expect("should recover generic");
++
++    assert_eq!(addr1, addr2, "Both functions should return same address");
++}
++
++#[test]
++fn test_seal_hash_generic_consistency() {
++    let header = create_test_header();
++
++    let hash1 = seal_hash(&header);
++    let hash2 = seal_hash_generic(&header);
++
++    assert_eq!(
++        hash1, hash2,
++        "seal_hash and seal_hash_generic should produce same result"
++    );
++}
++
++#[test]
++fn test_public_key_to_address() {
++    // Use a known test vector
++    let secret_key = SecretKey::from_slice(&[
++        0xac, 0x03, 0x74, 0x67, 0x3e, 0xe4, 0x13, 0x56, 0x1f, 0x8e, 0xf5, 0x7d, 0x87, 0x8a, 0x4b,
++        0x5d, 0x71, 0x82, 0x25, 0x2d, 0x86, 0x67, 0x77, 0x90, 0x5e, 0x1d, 0x8d, 0x15, 0x4a, 0x19,
++        0x8f, 0x3c,
++    ])
++    .expect("valid key");
++
++    let public_key = PublicKey::from_secret_key(SECP256K1, &secret_key);
++    let address = public_key_to_address(public_key);
++
++    // Address should be 20 bytes
++    assert_eq!(address.len(), 20);
++
++    // Address should be derived from last 20 bytes of keccak256(public_key_uncompressed[1..])
++    let pubkey_bytes = public_key.serialize_uncompressed();
++    let hash = keccak256(&pubkey_bytes[1..]);
++    let expected_address = Address::from_slice(&hash[12..]);
++
++    assert_eq!(address, expected_address);
++}
++
++#[test]
++fn test_seal_hash_with_base_fee() {
++    let mut header1 = create_test_header();
++    header1.base_fee_per_gas = Some(1000000000);
++
++    let mut header2 = create_test_header();
++    header2.base_fee_per_gas = Some(2000000000);
++
++    let hash1 = seal_hash(&header1);
++    let hash2 = seal_hash(&header2);
++
++    assert_ne!(
++        hash1, hash2,
++        "Different base fees should produce different hashes"
++    );
++}
++
++#[test]
++fn test_seal_hash_without_base_fee() {
++    let mut header1 = create_test_header();
++    header1.base_fee_per_gas = None;
++
++    let mut header2 = create_test_header();
++    header2.base_fee_per_gas = Some(1000000000);
++
++    let hash1 = seal_hash(&header1);
++    let hash2 = seal_hash(&header2);
++
++    assert_ne!(
++        hash1, hash2,
++        "With/without base fee should produce different hashes"
++    );
++}
++
++#[test]
++fn test_multiple_signers() {
++    let keys: Vec<SecretKey> = (1..=5u8)
++        .map(|i| SecretKey::from_slice(&[i; 32]).expect("valid key"))
++        .collect();
++
++    for key in &keys {
++        let public_key = PublicKey::from_secret_key(SECP256K1, key);
++        let expected_address = public_key_to_address(public_key);
++
++        let mut header = create_test_header();
++        sign_header(&mut header, key);
++
++        let recovered = recover_address(&header).expect("should recover");
++        assert_eq!(recovered, expected_address);
++    }
++}
++
++#[test]
++fn test_header_with_various_extra_data_lengths() {
++    let secret_key = SecretKey::from_slice(&[0x03; 32]).expect("valid key");
++
++    // Test with different vanity lengths (before signature)
++    for vanity_len in [32, 64, 128] {
++        let mut header = create_test_header();
++
++        // Compute seal hash before signing
++        let hash = seal_hash(&header);
++        let message = Message::from_digest(hash.into());
++        let (recovery_id, sig) = SECP256K1
++            .sign_ecdsa_recoverable(&message, &secret_key)
++            .serialize_compact();
++
++        // Build extra_data with varying vanity length
++        let mut extra_data = vec![0u8; vanity_len];
++        extra_data.extend_from_slice(&sig);
++        extra_data.push(i32::from(recovery_id) as u8);
++        header.extra_data = Bytes::from(extra_data);
++
++        let result = recover_address(&header);
++        assert!(
++            result.is_ok(),
++            "Should recover address with vanity_len={}",
++            vanity_len
++        );
++    }
++}
++
++#[test]
++fn test_invalid_recovery_id() {
++    let mut header = create_test_header();
++
++    // Build extra_data with invalid recovery id (> 3)
++    let mut extra_data = vec![0u8; 32]; // vanity
++    extra_data.extend_from_slice(&[0x00; 64]); // fake signature
++    extra_data.push(255); // invalid recovery id
++
++    header.extra_data = Bytes::from(extra_data);
++
++    let result = recover_address(&header);
++    assert!(result.is_err(), "Should fail with invalid recovery id");
++}
++
+diff -ruN reth-145/crates/primitives-traits/src/header/error.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/header/error.rs
+--- reth-145/crates/primitives-traits/src/header/error.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/header/error.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ /// Errors that can occur during header sanity checks.
+ #[derive(Debug, PartialEq, Eq)]
+ pub enum HeaderError {
+diff -ruN reth-145/crates/primitives-traits/src/header/mod.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/header/mod.rs
+--- reth-145/crates/primitives-traits/src/header/mod.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/header/mod.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ mod sealed;
+ pub use sealed::{Header, SealedHeader, SealedHeaderFor};
+ 
+@@ -6,6 +9,11 @@
+ 
+ #[cfg(any(test, feature = "test-utils", feature = "arbitrary"))]
+ pub mod test_utils;
++
++pub mod clique_utils;
++
++#[cfg(test)]
++mod clique_utils_tests;
+ 
+ /// Bincode-compatible header type serde implementations.
+ #[cfg(feature = "serde-bincode-compat")]
+diff -ruN reth-145/crates/primitives-traits/src/header/sealed.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/header/sealed.rs
+--- reth-145/crates/primitives-traits/src/header/sealed.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/header/sealed.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use crate::{sync::OnceLock, InMemorySize, NodePrimitives};
+ pub use alloy_consensus::Header;
+ use alloy_consensus::Sealed;
+@@ -20,7 +23,10 @@
+ /// [`SealedHeader::hash`] computes the hash if it has not been computed yet.
+ #[derive(Debug, Clone, AsRef, Deref)]
+ #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+-#[cfg_attr(any(test, feature = "reth-codec"), reth_codecs::add_arbitrary_tests(rlp))]
++#[cfg_attr(
++    any(test, feature = "reth-codec"),
++    reth_codecs::add_arbitrary_tests(rlp)
++)]
+ pub struct SealedHeader<H = Header> {
+     /// Block hash
+     #[cfg_attr(feature = "serde", serde(skip))]
+@@ -35,13 +41,19 @@
+     /// Creates the sealed header without hashing the header.
+     #[inline]
+     pub fn new_unhashed(header: H) -> Self {
+-        Self { header, hash: Default::default() }
++        Self {
++            header,
++            hash: Default::default(),
++        }
+     }
+ 
+     /// Creates the sealed header with the corresponding block hash.
+     #[inline]
+     pub fn new(header: H, hash: BlockHash) -> Self {
+-        Self { header, hash: hash.into() }
++        Self {
++            header,
++            hash: hash.into(),
++        }
+     }
+ 
+     /// Returns the sealed Header fields.
+@@ -70,7 +82,10 @@
+ 
+     /// Converts from &`SealedHeader<H>` to `SealedHeader<&H>`.
+     pub fn sealed_ref(&self) -> SealedHeader<&H> {
+-        SealedHeader { hash: self.hash.clone(), header: &self.header }
++        SealedHeader {
++            hash: self.hash.clone(),
++            header: &self.header,
++        }
+     }
+ }
+ 
+@@ -113,7 +128,10 @@
+         H: Clone,
+     {
+         let Self { hash, header } = self;
+-        SealedHeader { hash, header: header.clone() }
++        SealedHeader {
++            hash,
++            header: header.clone(),
++        }
+     }
+ }
+ 
+@@ -125,7 +143,10 @@
+ 
+     /// Return a [`BlockWithParent`] for this header.
+     pub fn block_with_parent(&self) -> BlockWithParent {
+-        BlockWithParent { parent: self.parent_hash(), block: self.num_hash() }
++        BlockWithParent {
++            parent: self.parent_hash(),
++            block: self.num_hash(),
++        }
+     }
+ }
+ 
+@@ -273,7 +294,10 @@
+         for SealedHeader<'a, H>
+     {
+         fn from(value: &'a super::SealedHeader<H>) -> Self {
+-            Self { hash: value.hash(), header: value.header.as_repr() }
++            Self {
++                hash: value.hash(),
++                header: value.header.as_repr(),
++            }
+         }
+     }
+ 
+diff -ruN reth-145/crates/primitives-traits/src/header/test_utils.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/header/test_utils.rs
+--- reth-145/crates/primitives-traits/src/header/test_utils.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/header/test_utils.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Test utilities for the block header.
+ 
+ use crate::BlockHeader;
+diff -ruN reth-145/crates/primitives-traits/src/lib.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/lib.rs
+--- reth-145/crates/primitives-traits/src/lib.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/lib.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Commonly used types and traits in Reth.
+ //!
+ //! This crate contains various primitive traits used across reth's components.
+diff -ruN reth-145/crates/primitives-traits/src/log.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/log.rs
+--- reth-145/crates/primitives-traits/src/log.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/log.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ #[cfg(test)]
+ mod tests {
+     use alloy_primitives::{Address, Bytes, Log as AlloyLog, B256};
+diff -ruN reth-145/crates/primitives-traits/src/node.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/node.rs
+--- reth-145/crates/primitives-traits/src/node.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/node.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use crate::{
+     Block, FullBlock, FullBlockBody, FullBlockHeader, FullReceipt, FullSignedTx,
+     MaybeSerdeBincodeCompat, Receipt,
+diff -ruN reth-145/crates/primitives-traits/src/proofs.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/proofs.rs
+--- reth-145/crates/primitives-traits/src/proofs.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/proofs.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Helper function for calculating Merkle proofs and hashes.
+ pub use alloy_trie::root::ordered_trie_root_with_encoder;
+ 
+@@ -52,8 +55,13 @@
+ 
+         for (test_addr, expected_root) in fixtures {
+             let mut genesis_alloc = HashMap::new();
+-            genesis_alloc
+-                .insert(test_addr, GenesisAccount { balance: U256::MAX, ..Default::default() });
++            genesis_alloc.insert(
++                test_addr,
++                GenesisAccount {
++                    balance: U256::MAX,
++                    ..Default::default()
++                },
++            );
+ 
+             let root = state_root_unhashed(genesis_alloc);
+ 
+diff -ruN reth-145/crates/primitives-traits/src/receipt.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/receipt.rs
+--- reth-145/crates/primitives-traits/src/receipt.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/receipt.rs	2025-12-23 02:14:49
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Receipt abstraction
+ 
+ use crate::{InMemorySize, MaybeCompact, MaybeSerde, MaybeSerdeBincodeCompat};
+diff -ruN reth-145/crates/primitives-traits/src/serde_bincode_compat.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/serde_bincode_compat.rs
+--- reth-145/crates/primitives-traits/src/serde_bincode_compat.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/serde_bincode_compat.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use core::fmt::Debug;
+ use serde::{de::DeserializeOwned, Serialize};
+ 
+@@ -75,7 +78,10 @@
+         for Block<'a, T, H>
+     {
+         fn from(value: &'a alloy_consensus::Block<T, H>) -> Self {
+-            Self { header: value.header.as_repr(), body: (&value.body).into() }
++            Self {
++                header: value.header.as_repr(),
++                body: (&value.body).into(),
++            }
+         }
+     }
+ 
+@@ -83,7 +89,10 @@
+         for alloy_consensus::Block<T, H>
+     {
+         fn from(value: Block<'a, T, H>) -> Self {
+-            Self { header: SerdeBincodeCompat::from_repr(value.header), body: value.body.into() }
++            Self {
++                header: SerdeBincodeCompat::from_repr(value.header),
++                body: value.body.into(),
++            }
+         }
+     }
+ 
+@@ -171,7 +180,11 @@
+                     .into_iter()
+                     .map(SerdeBincodeCompat::from_repr)
+                     .collect(),
+-                ommers: value.ommers.into_iter().map(SerdeBincodeCompat::from_repr).collect(),
++                ommers: value
++                    .ommers
++                    .into_iter()
++                    .map(SerdeBincodeCompat::from_repr)
++                    .collect(),
+                 withdrawals: value.withdrawals.into_owned(),
+             }
+         }
+diff -ruN reth-145/crates/primitives-traits/src/size.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/size.rs
+--- reth-145/crates/primitives-traits/src/size.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/size.rs	2025-12-23 02:14:49
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use alloc::vec::Vec;
+ use alloy_consensus::{
+     transaction::TxEip4844Sidecar, EthereumTxEnvelope, Header, TxEip1559, TxEip2930, TxEip4844,
+@@ -71,10 +74,14 @@
+ 
+ impl InMemorySize for alloy_consensus::Receipt {
+     fn size(&self) -> usize {
+-        let Self { status, cumulative_gas_used, logs } = self;
+-        core::mem::size_of_val(status) +
+-            core::mem::size_of_val(cumulative_gas_used) +
+-            logs.capacity() * core::mem::size_of::<Log>()
++        let Self {
++            status,
++            cumulative_gas_used,
++            logs,
++        } = self;
++        core::mem::size_of_val(status)
++            + core::mem::size_of_val(cumulative_gas_used)
++            + logs.capacity() * core::mem::size_of::<Log>()
+     }
+ }
+ 
+@@ -94,13 +101,14 @@
+     /// Calculates a heuristic for the in-memory size of the block body
+     #[inline]
+     fn size(&self) -> usize {
+-        self.transactions.iter().map(T::size).sum::<usize>() +
+-            self.transactions.capacity() * core::mem::size_of::<T>() +
+-            self.ommers.iter().map(H::size).sum::<usize>() +
+-            self.ommers.capacity() * core::mem::size_of::<Header>() +
+-            self.withdrawals
+-                .as_ref()
+-                .map_or(core::mem::size_of::<Option<Withdrawals>>(), Withdrawals::total_size)
++        self.transactions.iter().map(T::size).sum::<usize>()
++            + self.transactions.capacity() * core::mem::size_of::<T>()
++            + self.ommers.iter().map(H::size).sum::<usize>()
++            + self.ommers.capacity() * core::mem::size_of::<Header>()
++            + self.withdrawals.as_ref().map_or(
++                core::mem::size_of::<Option<Withdrawals>>(),
++                Withdrawals::total_size,
++            )
+     }
+ }
+ 
+@@ -131,10 +139,14 @@
+ 
+     impl InMemorySize for op_alloy_consensus::OpDepositReceipt {
+         fn size(&self) -> usize {
+-            let Self { inner, deposit_nonce, deposit_receipt_version } = self;
+-            inner.size() +
+-                core::mem::size_of_val(deposit_nonce) +
+-                core::mem::size_of_val(deposit_receipt_version)
++            let Self {
++                inner,
++                deposit_nonce,
++                deposit_receipt_version,
++            } = self;
++            inner.size()
++                + core::mem::size_of_val(deposit_nonce)
++                + core::mem::size_of_val(deposit_receipt_version)
+         }
+     }
+ 
+diff -ruN reth-145/crates/primitives-traits/src/storage.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/storage.rs
+--- reth-145/crates/primitives-traits/src/storage.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/storage.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ use alloy_primitives::{B256, U256};
+ 
+ /// Account storage entry.
+@@ -6,7 +9,10 @@
+ #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+ #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ #[cfg_attr(any(test, feature = "arbitrary"), derive(arbitrary::Arbitrary))]
+-#[cfg_attr(any(test, feature = "reth-codec"), reth_codecs::add_arbitrary_tests(compact))]
++#[cfg_attr(
++    any(test, feature = "reth-codec"),
++    reth_codecs::add_arbitrary_tests(compact)
++)]
+ pub struct StorageEntry {
+     /// Storage key.
+     pub key: B256,
+diff -ruN reth-145/crates/primitives-traits/src/sync.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/sync.rs
+--- reth-145/crates/primitives-traits/src/sync.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/sync.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Lock synchronization primitives
+ 
+ use once_cell as _;
+diff -ruN reth-145/crates/primitives-traits/src/transaction/access_list.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/transaction/access_list.rs
+--- reth-145/crates/primitives-traits/src/transaction/access_list.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/transaction/access_list.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //!  [EIP-2930](https://eips.ethereum.org/EIPS/eip-2930): Access List types
+ 
+ #[cfg(test)]
+diff -ruN reth-145/crates/primitives-traits/src/transaction/error.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/transaction/error.rs
+--- reth-145/crates/primitives-traits/src/transaction/error.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/transaction/error.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Various error variants that can happen when working with transactions.
+ 
+ use crate::GotExpectedBoxed;
+diff -ruN reth-145/crates/primitives-traits/src/transaction/execute.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/transaction/execute.rs
+--- reth-145/crates/primitives-traits/src/transaction/execute.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/transaction/execute.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Abstraction of an executable transaction.
+ 
+ use alloy_primitives::Address;
+diff -ruN reth-145/crates/primitives-traits/src/transaction/mod.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/transaction/mod.rs
+--- reth-145/crates/primitives-traits/src/transaction/mod.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/transaction/mod.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Transaction abstraction
+ 
+ pub mod execute;
+diff -ruN reth-145/crates/primitives-traits/src/transaction/recover.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/transaction/recover.rs
+--- reth-145/crates/primitives-traits/src/transaction/recover.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/transaction/recover.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Helpers for recovering signers from a set of transactions
+ 
+ #[cfg(feature = "rayon")]
+@@ -33,7 +36,9 @@
+         T: SignedTransaction,
+         I: IntoParallelIterator<Item = &'a T> + IntoIterator<Item = &'a T> + Send,
+     {
+-        txes.into_par_iter().map(|tx| tx.recover_signer_unchecked()).collect()
++        txes.into_par_iter()
++            .map(|tx| tx.recover_signer_unchecked())
++            .collect()
+     }
+ }
+ 
+@@ -63,6 +68,8 @@
+         T: SignedTransaction,
+         I: IntoIterator<Item = &'a T>,
+     {
+-        txes.into_iter().map(|tx| tx.recover_signer_unchecked()).collect()
++        txes.into_iter()
++            .map(|tx| tx.recover_signer_unchecked())
++            .collect()
+     }
+ }
+diff -ruN reth-145/crates/primitives-traits/src/transaction/signature.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/transaction/signature.rs
+--- reth-145/crates/primitives-traits/src/transaction/signature.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/transaction/signature.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! Signature types and helpers
+ 
+ /// Re-exported signature type
+diff -ruN reth-145/crates/primitives-traits/src/transaction/signed.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/transaction/signed.rs
+--- reth-145/crates/primitives-traits/src/transaction/signed.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/transaction/signed.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! API of a signed transaction.
+ 
+ use crate::{
+@@ -85,7 +88,8 @@
+     /// Tries to recover signer and return [`Recovered`] by cloning the type.
+     #[auto_impl(keep_default_for(&, Arc))]
+     fn try_clone_into_recovered(&self) -> Result<Recovered<Self>, RecoveryError> {
+-        self.recover_signer().map(|signer| Recovered::new_unchecked(self.clone(), signer))
++        self.recover_signer()
++            .map(|signer| Recovered::new_unchecked(self.clone(), signer))
+     }
+ 
+     /// Tries to recover signer and return [`Recovered`].
+@@ -107,7 +111,8 @@
+     #[deprecated(note = "Use try_into_recovered_unchecked instead")]
+     #[auto_impl(keep_default_for(&, Arc))]
+     fn into_recovered_unchecked(self) -> Result<Recovered<Self>, RecoveryError> {
+-        self.recover_signer_unchecked().map(|signer| Recovered::new_unchecked(self, signer))
++        self.recover_signer_unchecked()
++            .map(|signer| Recovered::new_unchecked(self, signer))
+     }
+ 
+     /// Returns the [`Recovered`] transaction with the given sender.
+diff -ruN reth-145/crates/primitives-traits/src/withdrawal.rs /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/withdrawal.rs
+--- reth-145/crates/primitives-traits/src/withdrawal.rs	2025-12-23 02:32:17
++++ /Users/jieliu/Documents/n42/N42-rs/crates/primitives-traits/src/withdrawal.rs	2025-12-20 16:08:23
+@@ -1,3 +1,6 @@
++// Copyright (c) 2017-2025 N42 Contributors
++// SPDX-License-Identifier: MIT OR Apache-2.0
++
+ //! [EIP-4895](https://eips.ethereum.org/EIPS/eip-4895) Withdrawal types.
+ 
+ #[cfg(test)]
+@@ -40,10 +43,10 @@
+ 
+     impl PartialEq<Withdrawal> for RethWithdrawal {
+         fn eq(&self, other: &Withdrawal) -> bool {
+-            self.index == other.index &&
+-                self.validator_index == other.validator_index &&
+-                self.address == other.address &&
+-                self.amount == other.amount
++            self.index == other.index
++                && self.validator_index == other.validator_index
++                && self.address == other.address
++                && self.amount == other.amount
+         }
+     }
+ 

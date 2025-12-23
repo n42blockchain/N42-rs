@@ -6019,6 +6019,7 @@ dependencies = [
  "reth-chainspec",
  "reth-consensus",
  "reth-errors",
+ "reth-eth-wire-types",
  "reth-ethereum-engine-primitives",
  "reth-ethereum-payload-builder",
  "reth-ethereum-primitives",

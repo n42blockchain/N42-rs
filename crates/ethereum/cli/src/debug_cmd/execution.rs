@@ -100,6 +100,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
                     executor.clone(),
                     stage_conf.clone(),
                     prune_modes,
+                    None, // era_import_source
                 )
                 .set(ExecutionStage::new(
                     executor,

@@ -59,6 +59,7 @@ use reth_node_api::{PrimitivesTy};
 use reth_node_builder::{
     BuilderContext,
     components::{
+        ConsensusBuilder,
         PayloadBuilderBuilder,
         PayloadServiceBuilder,
     },
@@ -80,79 +81,17 @@ use reth_node_builder::{
     PayloadTypes,
 };
 
-/// A basic ethereum payload service.
-#[derive(Clone, Default, Debug)]
-#[non_exhaustive]
+/// A basic ethereum payload service builder marker.
+/// 
+/// Note: In v1.5.0, consensus is built separately and shared via NodeComponents.
+/// The actual consensus instance will be passed through the N42PayloadServiceBuilder.
+#[derive(Clone, Debug, Default)]
 pub struct EthereumPayloadBuilderWrapper;
 
 impl EthereumPayloadBuilderWrapper {
-    /// A helper method initializing [`reth_ethereum_payload_builder::EthereumPayloadBuilder`] with
-    /// the given EVM config.
-    pub fn build<Types, Node, Evm, Pool, Cons>(
-        self,
-        evm_config: Evm,
-        ctx: &BuilderContext<Node>,
-        pool: Pool,
-        cons: Cons,
-    ) -> eyre::Result<
-        N42PayloadBuilder<Pool, Node::Provider, Evm, Cons>,
-    >
-    where
-        Types: NodeTypes<ChainSpec = ChainSpec, Primitives = EthPrimitives>,
-        Node: FullNodeTypes<Types = Types>,
-        Evm: ConfigureEvm<Primitives = PrimitivesTy<Types>>,
-        Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TxTy<Node::Types>>>
-            + Unpin
-            + 'static,
-        Types::Payload: PayloadTypes<
-            BuiltPayload = EthBuiltPayload,
-            PayloadAttributes = EthPayloadAttributes,
-            PayloadBuilderAttributes = EthPayloadBuilderAttributes,
-        >,
-    {
-        let conf = ctx.payload_builder_config();
-        let chain = ctx.chain_spec().chain();
-        let gas_limit = conf.gas_limit_for(chain);
-        Ok(N42PayloadBuilder::new(
-            ctx.provider().clone(),
-            pool,
-            evm_config,
-            EthereumBuilderConfig::new().with_gas_limit(gas_limit),
-            cons,
-        ))
-    }
-}
-
-impl<Types, Node, Pool, Evm, Cons> N42PayloadBuilderBuilder<Node, Pool, Evm, Cons> for EthereumPayloadBuilderWrapper
-where
-    Types: NodeTypes<ChainSpec = ChainSpec, Primitives = EthPrimitives>,
-    Node: FullNodeTypes<Types = Types>,
-    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TxTy<Node::Types>>>
-        + Unpin
-        + 'static,
-    Types::Payload: PayloadTypes<
-        BuiltPayload = EthBuiltPayload,
-        PayloadAttributes = EthPayloadAttributes,
-        PayloadBuilderAttributes = EthPayloadBuilderAttributes,
-    >,
-    Evm: ConfigureEvm<
-            Primitives = PrimitivesTy<Types>,
-            NextBlockEnvCtx = reth_evm::NextBlockEnvAttributes,
-        > + 'static,
-    Cons:
-        FullConsensus<PrimitivesTy<Node::Types>, Error = ConsensusError> + Clone + Unpin + 'static,
-{
-    type PayloadBuilder =
-        N42PayloadBuilder<Pool, Node::Provider, EthEvmConfig, Cons>;
-
-    async fn build_payload_builder(
-        self,
-        ctx: &BuilderContext<Node>,
-        pool: Pool,
-        evm_config: Evm,
-        cons: Cons,
-    ) -> eyre::Result<Self::PayloadBuilder> {
-        self.build(EthEvmConfig::new(ctx.chain_spec()), ctx, pool, cons)
+    /// Create a new wrapper.
+    pub fn new() -> Self {
+        Self
     }
 }
 // wrapper
@@ -482,12 +421,12 @@ where
         .then_some(execution_result.requests);
 
     // initialize empty blob sidecars at first. If cancun is active then this will
-    let mut blob_sidecars = Vec::new();
+    let mut blob_sidecars: Vec<alloy_consensus::BlobTransactionSidecar> = Vec::new();
 
     // only determine cancun fields when active
     if chain_spec.is_cancun_active_at_timestamp(attributes.timestamp) {
         // grab the blob sidecars from the executed txs
-        blob_sidecars = pool
+        let raw_sidecars = pool
             .get_all_blobs_exact(
                 block
                     .body()
@@ -497,6 +436,16 @@ where
                     .collect(),
             )
             .map_err(PayloadBuilderError::other)?;
+        
+        // Convert BlobTransactionSidecarVariant to BlobTransactionSidecar
+        blob_sidecars = raw_sidecars
+            .into_iter()
+            .filter_map(|arc_sidecar| {
+                let sidecar = Arc::unwrap_or_clone(arc_sidecar);
+                // BlobTransactionSidecarVariant can be converted via into_eip4844()
+                sidecar.into_eip4844()
+            })
+            .collect();
     }
 
     header.state_root =  block.header().state_root;
@@ -525,70 +474,75 @@ where
 
     let payload = EthBuiltPayload::new(attributes.id, sealed_block, total_fees, requests)
         // add blob sidecars from the executed txs
-        .with_sidecars(blob_sidecars.into_iter().map(Arc::unwrap_or_clone).collect::<Vec<_>>());
+        .with_sidecars(blob_sidecars);
 
     Ok(BuildOutcome::Better { payload, cached_reads })
 }
 
-/// A type that knows how to build a payload builder to plug into [`BasicPayloadServiceBuilder`].
-pub trait N42PayloadBuilderBuilder<Node: FullNodeTypes, Pool: TransactionPool,
-    EvmConfig,
-    Cons:
-        FullConsensus<PrimitivesTy<Node::Types>, Error = ConsensusError> + Clone + Unpin + 'static,
->: Send + Sized {
-    /// Payload builder implementation.
-    type PayloadBuilder: PayloadBuilderFor<Node::Types> + Unpin + 'static;
-
-    /// Spawns the payload service and returns the handle to it.
-    ///
-    /// The [`BuilderContext`] is provided to allow access to the node's configuration.
-    fn build_payload_builder(
-        self,
-        ctx: &BuilderContext<Node>,
-        pool: Pool,
-        evm_config: EvmConfig,
-        cons: Cons,
-    ) -> impl Future<Output = eyre::Result<Self::PayloadBuilder>> + Send;
+/// A custom payload service builder that supports the custom engine types
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct N42PayloadServiceBuilder<CB> {
+    /// The consensus builder to create consensus instances.
+    consensus_builder: CB,
 }
 
-
-/// A custom payload service builder that supports the custom engine types
-#[derive(Debug, Default, Clone)]
-#[non_exhaustive]
-pub struct N42PayloadServiceBuilder<PB>(PB);
-
-impl<PB> N42PayloadServiceBuilder<PB> {
-    /// Create a new [`N42PayloadServiceBuilder`].
-    pub const fn new(payload_builder_builder: PB) -> Self {
-        Self(payload_builder_builder)
+impl<CB: Default> Default for N42PayloadServiceBuilder<CB> {
+    fn default() -> Self {
+        Self {
+            consensus_builder: CB::default(),
+        }
     }
 }
 
-impl<Node, Pool, PB, EvmConfig, Cons> PayloadServiceBuilder<Node, Pool, EvmConfig, Cons> for N42PayloadServiceBuilder<PB>
+impl<CB> N42PayloadServiceBuilder<CB> {
+    /// Create a new [`N42PayloadServiceBuilder`] with a consensus builder.
+    pub const fn new(consensus_builder: CB) -> Self {
+        Self { consensus_builder }
+    }
+}
+
+impl<Node, Pool, EvmConfig, CB> PayloadServiceBuilder<Node, Pool, EvmConfig> for N42PayloadServiceBuilder<CB>
 where
-    Node: FullNodeTypes,
-    Pool: TransactionPool,
-    //EvmConfig: Send,
+    Node: FullNodeTypes<Types: NodeTypes<ChainSpec = ChainSpec, Primitives = EthPrimitives>>,
+    <Node::Types as NodeTypes>::Payload: PayloadTypes<
+        BuiltPayload = EthBuiltPayload,
+        PayloadAttributes = EthPayloadAttributes,
+        PayloadBuilderAttributes = EthPayloadBuilderAttributes,
+    >,
+    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TxTy<Node::Types>>> + Unpin + 'static,
     EvmConfig: ConfigureEvm<Primitives = EthPrimitives, NextBlockEnvCtx = NextBlockEnvAttributes>,
-    PB: N42PayloadBuilderBuilder<Node, Pool, EvmConfig, Cons>,
-    Cons:
-        FullConsensus<PrimitivesTy<Node::Types>, Error = ConsensusError> + Clone + Unpin + 'static,
+    CB: ConsensusBuilder<Node> + Clone + Send + Sync,
+    CB::Consensus: FullConsensus<EthPrimitives, Error = ConsensusError> + Clone + Unpin + 'static,
 {
     async fn spawn_payload_builder_service(
         self,
         ctx: &BuilderContext<Node>,
         pool: Pool,
         evm_config: EvmConfig,
-        cons: Cons,
     ) -> eyre::Result<PayloadBuilderHandle<<Node::Types as NodeTypes>::Payload>> {
-        let payload_builder = self.0.build_payload_builder(ctx, pool,  evm_config, cons).await?;
+        // Build consensus using the consensus builder
+        let consensus = self.consensus_builder.clone().build_consensus(ctx).await?;
+        
+        // Build payload builder with consensus
+        let conf = ctx.payload_builder_config();
+        let chain = ctx.chain_spec().chain();
+        let gas_limit = conf.gas_limit_for(chain);
+        
+        let payload_builder = N42PayloadBuilder::new(
+            ctx.provider().clone(),
+            pool.clone(),
+            EthEvmConfig::new(ctx.chain_spec()),
+            EthereumBuilderConfig::new().with_gas_limit(gas_limit),
+            consensus,
+        );
 
-        let conf = ctx.config().builder.clone();
+        let builder_conf = ctx.config().builder.clone();
 
         let payload_job_config = BasicPayloadJobGeneratorConfig::default()
-            .interval(conf.interval)
-            .deadline(conf.deadline)
-            .max_payload_tasks(conf.max_payload_tasks);
+            .interval(builder_conf.interval)
+            .deadline(builder_conf.deadline)
+            .max_payload_tasks(builder_conf.max_payload_tasks);
 
         let payload_generator = BasicPayloadJobGenerator::with_builder(
             ctx.provider().clone(),

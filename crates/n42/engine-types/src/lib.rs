@@ -21,7 +21,6 @@ mod payload;
 mod network;
 mod consensus;
 
-pub use payload::EthereumPayloadBuilderWrapper;
 pub use payload::N42PayloadServiceBuilder;
 
 

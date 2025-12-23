@@ -1,4 +1,4 @@
-use alloy_eips::eip2718::Decodable2718;
+use alloy_eips::eip2718::{Decodable2718, Encodable2718};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types::Block;
 use alloy_rpc_types::BlockTransactionsKind;
@@ -15,7 +15,8 @@ use reth_payload_builder::{PayloadBuilderHandle, PayloadBuilderService};
 use reth_payload_primitives::{
     BuiltPayload, EngineApiMessageVersion, PayloadAttributesBuilder, PayloadKind, PayloadTypes,
 };
-use reth_primitives::{PooledTransaction, Recovered, SealedBlock, TransactionSigned};
+use reth_primitives::{Recovered, SealedBlock, TransactionSigned};
+use reth_transaction_pool::EthPooledTransaction;
 use reth_primitives_traits::{AlloyBlockHeader, BlockBody, NodePrimitives, SignedTransaction};
 use reth_provider::{
     BeaconProvider, BeaconProviderWriter, BlockIdReader, BlockReader, ChainSpecProvider,
@@ -55,9 +56,7 @@ where
         + 'static
         + Clone,
     B: PayloadAttributesBuilderExt<<T as PayloadTypes>::PayloadAttributes>,
-    Pool: TransactionPool + 'static,
-    Recovered<<<Pool as TransactionPool>::Transaction as PoolTransaction>::Pooled>:
-        From<Recovered<alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844WithSidecar>>>,
+    Pool: TransactionPool<Transaction = EthPooledTransaction> + 'static,
 {
     pub fn spawn_new(
         provider: Provider,
@@ -179,10 +178,10 @@ where
                     debug!(target: "consensus-client", ?rpc_tx);
 
                     let tx_signed: TransactionSigned = rpc_tx.try_into().unwrap();
-                    let pooled_transaction: PooledTransaction = tx_signed.try_into().unwrap();
-
-                    let recovered = pooled_transaction.try_into_recovered().unwrap();
-                    Pool::Transaction::from_pooled(recovered.try_into().unwrap())
+                    // Calculate encoded length for pool transaction (using EIP-2718 encoding)
+                    let encoded_length = tx_signed.encode_2718_len();
+                    let recovered = tx_signed.try_into_recovered().unwrap();
+                    EthPooledTransaction::new(recovered, encoded_length)
                 })
                 .collect::<Vec<_>>();
 

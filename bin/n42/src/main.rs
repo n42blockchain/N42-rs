@@ -12,7 +12,7 @@ use clap::Parser;
 use n42::{args::RessArgs, cli::Cli, ress::install_ress_subprotocol};
 use n42_engine_types::{N42Node};
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
-use reth_node_builder::NodeHandle;
+use reth_node_builder::{NodeHandle, FullNodeComponents};
 use reth_node_ethereum::EthereumNode;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{info, error};
@@ -35,15 +35,22 @@ fn main() {
     let broadcast_tx_clone_for_miner = broadcast_tx.clone();
 
 
+    // Shared consensus instance holder
+    let consensus_holder: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn reth_consensus::FullConsensus<reth_ethereum_primitives::EthPrimitives, Error = reth_consensus::ConsensusError> + Send + Sync>>>> = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let consensus_holder_clone = consensus_holder.clone();
+    
     if let Err(err) =
         Cli::<EthereumChainSpecParser, RessArgs>::parse().run(async move |builder, ress_args| {
             info!(target: "reth::cli", "Launching node");
             let NodeHandle { node, node_exit_future } =
                 builder.node(N42Node::default())
-                        .extend_rpc_modules(|ctx| {
+                        .extend_rpc_modules(move |ctx| {
 
-                            let consensus = ctx.consensus().clone();
+                            let consensus = ctx.node().consensus().clone();
                             let provider = ctx.provider().clone();
+                            
+                            // Store consensus reference for later use
+                            *consensus_holder_clone.lock().unwrap() = Some(std::sync::Arc::new(consensus.clone()));
 
                             let beacon_ext = ConsensusBeaconExt { consensus: consensus.clone(), provider: provider.clone(), verification_tx, broadcast_tx: broadcast_tx_clone };
                             let ext = ConsensusExt { consensus, provider };
@@ -57,6 +64,9 @@ fn main() {
                             Ok(())
                         })
                 .launch_with_debug_capabilities().await?;
+            
+            // Get the stored consensus instance
+            let consensus = consensus_holder.lock().unwrap().clone().expect("consensus should be set");
 
             let node_config_dev = node.config.clone().dev();
             let consensus_signer_private_key = node_config_dev.dev.consensus_signer_private_key;
@@ -97,7 +107,7 @@ fn main() {
                     mining_mode,
                     node.payload_builder_handle.clone(),
                     node.network.clone(),
-                    node.consensus.clone(),
+                    consensus,
                     broadcast_tx_clone_for_miner,
                     verification_rx,
                 );

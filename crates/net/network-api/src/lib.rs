@@ -19,7 +19,7 @@ pub mod error;
 pub mod events;
 /// N42-specific block announce provider
 mod block;
-pub use block::BlockAnnounceProvider;
+pub use block::{BlockAnnounceProvider, N42BlockImportOutcome, N42BlockImportError};
 /// Implementation of network traits for that does nothing.
 pub mod noop;
 

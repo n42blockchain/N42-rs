@@ -2604,3 +2604,46 @@ mod tests {
         Ok(())
     }
 }
+
+// N42-specific trait implementations
+use reth_storage_api::{BeaconProvider, BeaconProviderWriter};
+use n42_primitives::{BeaconBlock, BeaconState};
+use reth_db_api::tables::{BeaconStateRecord, BeaconBlockRecord, Eth1HashToBeaconBlockHash};
+use reth_db_api::transaction::DbTxMut;
+
+impl<N: ProviderNodeTypes> BeaconProvider for BlockchainProvider<N> {
+    fn get_beacon_block_by_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BeaconBlock>> {
+        self.database.provider()?.tx_ref().get::<BeaconBlockRecord>(*block_hash).map_err(Into::into)
+    }
+
+    fn get_beacon_state_by_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BeaconState>> {
+        self.database.provider()?.tx_ref().get::<BeaconStateRecord>(*block_hash).map_err(Into::into)
+    }
+
+    fn get_beacon_block_hash_by_eth1_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BlockHash>> {
+        self.database.provider()?.tx_ref().get::<Eth1HashToBeaconBlockHash>(*block_hash).map_err(Into::into)
+    }
+}
+
+impl<N: ProviderNodeTypes> BeaconProviderWriter for BlockchainProvider<N> {
+    fn save_beacon_block_by_hash(&self, block_hash: &BlockHash, beacon_block: BeaconBlock) -> ProviderResult<()> {
+        let provider = self.database.provider_rw()?;
+        provider.tx_ref().put::<BeaconBlockRecord>(*block_hash, beacon_block)?;
+        provider.commit()?;
+        Ok(())
+    }
+
+    fn save_beacon_state_by_hash(&self, block_hash: &BlockHash, beacon_state: BeaconState) -> ProviderResult<()> {
+        let provider = self.database.provider_rw()?;
+        provider.tx_ref().put::<BeaconStateRecord>(*block_hash, beacon_state)?;
+        provider.commit()?;
+        Ok(())
+    }
+
+    fn save_beacon_block_hash_by_eth1_hash(&self, eth1_block_hash: &BlockHash, beacon_block_hash: BlockHash) -> ProviderResult<()> {
+        let provider = self.database.provider_rw()?;
+        provider.tx_ref().put::<Eth1HashToBeaconBlockHash>(*eth1_block_hash, beacon_block_hash)?;
+        provider.commit()?;
+        Ok(())
+    }
+}

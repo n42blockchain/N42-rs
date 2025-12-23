@@ -1,8 +1,9 @@
 use reth_network::config::NetworkMode;
-use reth_network::{EthNetworkPrimitives, NetworkManager, NetworkHandle, PeersInfo};
-use reth_node_api::{AddOnsContext, FullNodeComponents, NodeAddOns, TxTy};
-use reth_ethereum_primitives::{EthPrimitives, PooledTransaction};
-use reth_chainspec::{ChainSpec, EthChainSpec};
+use reth_network::{NetworkManager, NetworkHandle, PeersInfo};
+use reth_eth_wire_types::BasicNetworkPrimitives;
+use reth_node_api::{AddOnsContext, FullNodeComponents, NodeAddOns, PrimitivesTy, TxTy};
+use reth_ethereum_primitives::EthPrimitives;
+use reth_chainspec::{ChainSpec, EthChainSpec, Hardforks};
 use reth_node_builder::{
     components::{
         NetworkBuilder, PoolBuilder,
@@ -11,11 +12,11 @@ use reth_node_builder::{
     BuilderContext,
 };
 use reth_transaction_pool::{
-    EthTransactionPool, PoolTransaction, TransactionPool, TransactionValidationTaskExecutor,
+    EthTransactionPool, PoolPooledTx, PoolTransaction, TransactionPool, TransactionValidationTaskExecutor,
 };
 use reth_tracing::tracing::{debug, info};
 
-/// A basic ethereum payload service.
+/// A basic N42 network builder.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct N42NetworkBuilder {
     // TODO add closure to modify network
@@ -23,13 +24,12 @@ pub struct N42NetworkBuilder {
 
 impl<Node, Pool> NetworkBuilder<Node, Pool> for N42NetworkBuilder
 where
-    Node: FullNodeTypes<Types: NodeTypes<ChainSpec = ChainSpec, Primitives = EthPrimitives>>,
-    Pool: TransactionPool<
-            Transaction: PoolTransaction<Consensus = TxTy<Node::Types>, Pooled = PooledTransaction>,
-        > + Unpin
+    Node: FullNodeTypes<Types: NodeTypes<ChainSpec: Hardforks>>,
+    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TxTy<Node::Types>>>
+        + Unpin
         + 'static,
 {
-    type Network = NetworkHandle<EthNetworkPrimitives>;
+    type Network = NetworkHandle<BasicNetworkPrimitives<PrimitivesTy<Node::Types>, PoolPooledTx<Pool>>>;
 
     async fn build_network(
         self,

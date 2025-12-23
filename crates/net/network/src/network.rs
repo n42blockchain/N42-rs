@@ -549,3 +549,31 @@ pub(crate) enum NetworkHandleMessage<N: NetworkPrimitives = EthNetworkPrimitives
     /// Message to update the node's advertised block range information.
     InternalBlockRangeUpdate(BlockRangeUpdate),
 }
+
+use reth_network_api::{BlockAnnounceProvider, N42BlockImportOutcome};
+use reth_eth_wire_types::NewBlock;
+
+impl<N: NetworkPrimitives> BlockAnnounceProvider for NetworkHandle<N> 
+where 
+    N::Block: Send + Sync + Clone + 'static,
+    N::NewBlockPayload: From<NewBlock<N::Block>>,
+{
+    type Block = N::Block;
+
+    fn announce_block(&self, block: NewBlock<Self::Block>, hash: B256) {
+        // Convert NewBlock<Block> to N::NewBlockPayload
+        self.send_message(NetworkHandleMessage::AnnounceBlock(block.into(), hash))
+    }
+
+    fn subscribe_block(&self) -> EventStream<NewBlock<Self::Block>> {
+        // Create a broadcast channel for block events
+        let (_tx, rx) = tokio::sync::broadcast::channel(16);
+        // Note: In production, this should be properly connected to block announcement events
+        // For now, we return an empty stream that can be extended later
+        EventStream::new(rx)
+    }
+
+    fn validated_block(&self, _result: N42BlockImportOutcome<Self::Block>) {
+        // Block validation is handled internally, this is a no-op for now
+    }
+}

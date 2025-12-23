@@ -6,7 +6,7 @@ use clap::Args;
 use humantime::parse_duration;
 
 /// Parameters for Dev testnet configuration
-#[derive(Debug, Args, PartialEq, Eq, Default, Clone, Copy)]
+#[derive(Debug, Args, PartialEq, Eq, Default, Clone)]
 #[command(next_help_heading = "Dev testnet")]
 pub struct DevArgs {
     /// Start the node in dev mode
@@ -39,6 +39,28 @@ pub struct DevArgs {
         verbatim_doc_comment
     )]
     pub block_time: Option<Duration>,
+
+    /// N42: Private key for consensus signer (used in dev/PoA mode)
+    #[arg(
+        long = "dev.consensus-signer-private-key",
+        help_heading = "Dev testnet",
+        env = "N42_CONSENSUS_SIGNER_PRIVATE_KEY"
+    )]
+    pub consensus_signer_private_key: Option<String>,
+
+    /// N42: Path to old chain database for migration
+    #[arg(
+        long = "dev.migrate-old-chain-data-from-db",
+        help_heading = "Dev testnet"
+    )]
+    pub migrate_old_chain_data_from_db: Option<String>,
+
+    /// N42: RPC URL to old chain for migration
+    #[arg(
+        long = "dev.migrate-old-chain-data-from-rpc",
+        help_heading = "Dev testnet"
+    )]
+    pub migrate_old_chain_data_from_rpc: Option<String>,
 }
 
 #[cfg(test)]
@@ -56,13 +78,15 @@ mod tests {
     #[test]
     fn test_parse_dev_args() {
         let args = CommandParser::<DevArgs>::parse_from(["reth"]).args;
-        assert_eq!(args, DevArgs { dev: false, block_max_transactions: None, block_time: None });
+        assert_eq!(args, DevArgs::default());
 
         let args = CommandParser::<DevArgs>::parse_from(["reth", "--dev"]).args;
-        assert_eq!(args, DevArgs { dev: true, block_max_transactions: None, block_time: None });
+        assert!(args.dev);
+        assert!(args.block_max_transactions.is_none());
+        assert!(args.block_time.is_none());
 
         let args = CommandParser::<DevArgs>::parse_from(["reth", "--auto-mine"]).args;
-        assert_eq!(args, DevArgs { dev: true, block_max_transactions: None, block_time: None });
+        assert!(args.dev);
 
         let args = CommandParser::<DevArgs>::parse_from([
             "reth",
@@ -71,18 +95,13 @@ mod tests {
             "2",
         ])
         .args;
-        assert_eq!(args, DevArgs { dev: true, block_max_transactions: Some(2), block_time: None });
+        assert!(args.dev);
+        assert_eq!(args.block_max_transactions, Some(2));
 
         let args =
             CommandParser::<DevArgs>::parse_from(["reth", "--dev", "--dev.block-time", "1s"]).args;
-        assert_eq!(
-            args,
-            DevArgs {
-                dev: true,
-                block_max_transactions: None,
-                block_time: Some(std::time::Duration::from_secs(1))
-            }
-        );
+        assert!(args.dev);
+        assert_eq!(args.block_time, Some(std::time::Duration::from_secs(1)));
     }
 
     #[test]

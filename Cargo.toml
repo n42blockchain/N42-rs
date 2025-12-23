@@ -222,7 +222,7 @@ reth-cli-util = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.5.0
 reth-codecs = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.5.0" }
 reth-codecs-derive = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.5.0" }
 reth-config = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.5.0" }
-reth-consensus = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.5.0", default-features = false }
+reth-consensus = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.5.0" }
 reth-consensus-common = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.5.0" }
 reth-consensus-debug-client = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.5.0" }
 reth-db = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.5.0", default-features = false }

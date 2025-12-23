@@ -749,6 +749,10 @@ impl<N: ProviderNodeTypes> BeaconProvider for BlockchainProvider<N> {
         Ok(result)
     }
 
+    fn get_partial_beacon_state_by_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BeaconState>> {
+        self.database_provider_ro()?.get_partial_beacon_state_by_hash(block_hash)
+    }
+
     fn get_beacon_state_by_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BeaconState>> {
         let start = Instant::now();
         let mut beacon_state = match self.database_provider_ro()?.get_beacon_state_by_hash(block_hash)? {

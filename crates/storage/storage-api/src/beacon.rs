@@ -26,6 +26,8 @@ pub trait BeaconProvider{
 
     fn get_beacon_state_by_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BeaconState>>;
 
+    fn get_partial_beacon_state_by_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BeaconState>>;
+
     fn get_beacon_block_hash_by_eth1_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BlockHash>>;
 
     fn get_tree_by_hash_for_validator(&self, tree_hash: &B256) -> ProviderResult<Option<merkle_db_rs::tree::Tree<Validator>>>;

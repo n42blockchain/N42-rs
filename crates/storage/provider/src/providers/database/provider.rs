@@ -1901,6 +1901,10 @@ impl<TX: DbTx + 'static, N: NodeTypes<ChainSpec: EthereumHardforks>> BeaconProvi
         Ok(self.tx.get::<tables::BeaconStatesByHash>(block_hash.clone())?)
     }
 
+    fn get_partial_beacon_state_by_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BeaconState>> {
+        Ok(self.tx.get::<tables::BeaconStatesByHash>(block_hash.clone())?)
+    }
+
     fn get_beacon_block_hash_by_eth1_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BlockHash>> {
         Ok(self.tx.get::<tables::BeaconBlockHashesByEth1Hash>(block_hash.clone())?)
     }

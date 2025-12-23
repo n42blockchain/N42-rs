@@ -235,7 +235,7 @@ where
     fn get_beacon_state_by_beacon_block_hash(&self,
         beacon_block_hash: B256,
         ) -> RpcResult<Option<BeaconState>> {
-        self.provider.get_beacon_state_by_hash(&beacon_block_hash).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))
+        self.provider.get_partial_beacon_state_by_hash(&beacon_block_hash).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))
     }
 
     fn get_beacon_state_by_number(&self,
@@ -255,7 +255,7 @@ where
             }
         };
 
-        self.provider.get_beacon_state_by_hash(&beacon_block_hash).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))
+        self.get_beacon_state_by_beacon_block_hash(beacon_block_hash)
     }
 
     fn get_beacon_validator_by_pubkey(&self,

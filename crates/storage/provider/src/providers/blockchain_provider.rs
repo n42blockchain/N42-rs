@@ -2607,7 +2607,7 @@ mod tests {
 
 // N42-specific trait implementations
 use reth_storage_api::{BeaconProvider, BeaconProviderWriter};
-use n42_primitives::{BeaconBlock, BeaconState};
+use n42_primitives::{BeaconBlock, BeaconState, Validator};
 use reth_db_api::tables::{BeaconStateRecord, BeaconBlockRecord, Eth1HashToBeaconBlockHash};
 use reth_db_api::transaction::DbTxMut;
 
@@ -2622,6 +2622,16 @@ impl<N: ProviderNodeTypes> BeaconProvider for BlockchainProvider<N> {
 
     fn get_beacon_block_hash_by_eth1_hash(&self, block_hash: &BlockHash) -> ProviderResult<Option<BlockHash>> {
         self.database.provider()?.tx_ref().get::<Eth1HashToBeaconBlockHash>(*block_hash).map_err(Into::into)
+    }
+
+    fn get_tree_by_hash_for_validator(&self, _tree_hash: &B256) -> ProviderResult<Option<merkle_db_rs::tree::Tree<Validator>>> {
+        // TODO: Implement tree storage for validators
+        Ok(None)
+    }
+
+    fn get_tree_by_hash_for_u64(&self, _tree_hash: &B256) -> ProviderResult<Option<merkle_db_rs::tree::Tree<u64>>> {
+        // TODO: Implement tree storage for u64
+        Ok(None)
     }
 }
 
@@ -2644,6 +2654,16 @@ impl<N: ProviderNodeTypes> BeaconProviderWriter for BlockchainProvider<N> {
         let provider = self.database.provider_rw()?;
         provider.tx_ref().put::<Eth1HashToBeaconBlockHash>(*eth1_block_hash, beacon_block_hash)?;
         provider.commit()?;
+        Ok(())
+    }
+
+    fn save_tree_by_hash_for_validator(&self, _tree_hash: &B256, _tree: merkle_db_rs::tree::Tree<Validator>) -> ProviderResult<()> {
+        // TODO: Implement tree storage for validators
+        Ok(())
+    }
+
+    fn save_tree_by_hash_for_u64(&self, _tree_hash: &B256, _tree: merkle_db_rs::tree::Tree<u64>) -> ProviderResult<()> {
+        // TODO: Implement tree storage for u64
         Ok(())
     }
 }

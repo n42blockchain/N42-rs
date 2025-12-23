@@ -15,6 +15,14 @@ members = [
     "crates/n42/engine-types/",
     "crates/n42/engine-primitives/",
     "crates/n42/n42-testing",
+    "crates/n42/pubsub-mem",
+    "crates/n42/alloy-rpc-types-beacon",
+    "crates/n42/alloy-rpc-types-engine",
+    "crates/n42/consensus-core",
+    "crates/n42/consensus-traits",
+    "crates/n42/fusaka",
+    "crates/n42/merkle_db_rs",
+    "crates/n42/storage",
     #"crates/n42/mobile",
     #"crates/engine/invalid-block-hooks/",
     #"crates/evm/",
@@ -203,6 +211,12 @@ n42-engine-types = {path="crates/n42/engine-types"}
 n42-engine-primitives = {path="crates/n42/engine-primitives"}
 consensus-client = {path="crates/n42/consensus-client"}
 mobile-sdk = {path="crates/n42/mobile-sdk"}
+pubsub-mem = {path="crates/n42/pubsub-mem"}
+merkle_db_rs = {path="crates/n42/merkle_db_rs"}
+n42-consensus-traits = {path="crates/n42/consensus-traits"}
+n42-consensus-core = {path="crates/n42/consensus-core"}
+n42-storage = {path="crates/n42/storage"}
+n42-fusaka = {path="crates/n42/fusaka"}
 
 blst = "0.3.11"
 

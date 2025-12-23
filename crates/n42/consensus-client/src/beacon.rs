@@ -145,6 +145,37 @@ where
             beacon_state.process_withdrawals()?;
         Ok((Some(expected_withdrawals), beacon_state))
     }
+
+    /// Get validator index from beacon state by pubkey
+    pub fn get_validator_index_from_beacon_state(
+        &self,
+        block_hash: BlockHash,
+        pubkey: blst::min_pk::PublicKey,
+    ) -> eyre::Result<Option<u64>> {
+        let beacon_block_hash = self
+            .provider
+            .get_beacon_block_hash_by_eth1_hash(&block_hash)?
+            .ok_or(eyre::eyre!(
+                "beacon_block_hash not found by eth1_hash, {:?}",
+                block_hash
+            ))?;
+        let beacon_state = self
+            .provider
+            .get_beacon_state_by_hash(&beacon_block_hash)?
+            .ok_or(eyre::eyre!(
+                "beacon_state not found by hash, {:?}",
+                beacon_block_hash
+            ))?;
+        
+        // Search for validator by pubkey using validators_store
+        let pubkey_bytes: [u8; 48] = pubkey.to_bytes();
+        for (index, validator) in beacon_state.validators_store.iter().enumerate() {
+            if validator.pubkey.0 == pubkey_bytes {
+                return Ok(Some(index as u64));
+            }
+        }
+        Ok(None)
+    }
 }
 
 fn parse_execution_requests(requests: &Option<Requests>) -> eyre::Result<ExecutionRequestsV4> {

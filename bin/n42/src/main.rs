@@ -13,10 +13,11 @@ use n42::{args::RessArgs, cli::Cli, ress::install_ress_subprotocol};
 use n42_engine_types::{N42Node};
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_node_builder::{NodeHandle, FullNodeComponents};
-use reth_node_ethereum::EthereumNode;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{info, error};
 use n42::consensus_ext::{ConsensusExtApiServer, ConsensusExt, ConsensusBeaconExtApiServer, ConsensusBeaconExt};
+use pubsub_mem::RouterMsg;
+use n42_clique::UnverifiedBlock;
 
 const DEFAULT_BLOCK_TIME_SECS: u64 = 8;
 
@@ -30,9 +31,12 @@ fn main() {
 
     let (verification_tx, verification_rx) = mpsc::channel(100);
     let (broadcast_tx, _broadcast_rx) = broadcast::channel(100);
-    let broadcast_tx_clone = broadcast_tx.clone();
-    let broadcast_tx_clone_for_message_producer = broadcast_tx.clone();
+    let _broadcast_tx_clone_for_message_producer = broadcast_tx.clone();
     let broadcast_tx_clone_for_miner = broadcast_tx.clone();
+    
+    // Create router channel for pubsub
+    let (router_tx, _router_rx) = mpsc::channel::<RouterMsg<UnverifiedBlock>>(100);
+    let router_tx_clone = router_tx.clone();
 
 
     // Shared consensus instance holder
@@ -52,7 +56,7 @@ fn main() {
                             // Store consensus reference for later use
                             *consensus_holder_clone.lock().unwrap() = Some(std::sync::Arc::new(consensus.clone()));
 
-                            let beacon_ext = ConsensusBeaconExt { consensus: consensus.clone(), provider: provider.clone(), verification_tx, broadcast_tx: broadcast_tx_clone };
+                            let beacon_ext = ConsensusBeaconExt { consensus: consensus.clone(), provider: provider.clone(), verification_tx, router_tx: router_tx_clone };
                             let ext = ConsensusExt { consensus, provider };
 
                             // now we merge our extension namespace into all configured transports

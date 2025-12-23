@@ -103,3 +103,7 @@ pub use full::*;
 // N42-specific beacon storage traits
 mod beacon;
 pub use beacon::*;
+
+// N42-specific snapshot storage traits
+mod snapshot;
+pub use snapshot::*;

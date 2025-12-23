@@ -915,13 +915,13 @@ where
             if !beacon_state_after_withdrawal.has_active_validators(RelativeEpoch::Next) {
                 return Ok(());
             }
-            beacon_state_after_withdrawal.committee_cache(RelativeEpoch::Next)?
+            beacon_state_after_withdrawal.gen_committee_cache(RelativeEpoch::Next)?
         } else {
             // committee_cache init requires non-empty validators
             if !beacon_state_after_withdrawal.has_active_validators(RelativeEpoch::Current) {
                 return Ok(());
             }
-            beacon_state_after_withdrawal.committee_cache(RelativeEpoch::Current)?
+            beacon_state_after_withdrawal.gen_committee_cache(RelativeEpoch::Current)?
         };
 
         let beacon_committees = committee_cache.get_beacon_committees_at_slot(block.number)?;

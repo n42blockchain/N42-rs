@@ -103,21 +103,34 @@ cd reth-144-clean && cargo check -p reth-chainspec
 
 ```
 问题链:
-1. reth v1.4.5 需要 alloy-trie 0.8.1
+1. reth v1.4.5-v1.4.8 需要 alloy-trie 0.8.1
 2. alloy-trie 0.8.1 期望 alloy-genesis 实现 Into<TrieAccount>
 3. 但 Cargo 解析了 alloy-genesis 1.1.3（而非 1.0.9）
 4. alloy-genesis 1.1.3 的 GenesisAccount 与 alloy-trie 0.8.1 不兼容
 ```
 
-上游 v1.4.5 使用的版本：
+上游使用的版本：
 - alloy-genesis: 1.0.9
 - alloy-trie: 0.8.1
 - alloy-eips: 1.0.9
 
 我们解析的版本：
-- alloy-genesis: 1.1.3 ❌
+- alloy-genesis: 1.1.3 ❌ (Cargo 拉入更高版本)
 - alloy-trie: 0.8.1 ✅
 - alloy-eips: 1.1.3 ❌
+
+### 已尝试的版本
+
+| 版本 | 结果 | 阻塞原因 |
+|------|------|----------|
+| v1.4.4 | ❌ | 上游 bug (alloy-trie/genesis 不兼容) |
+| v1.4.5 | ❌ | alloy 版本冲突 |
+| v1.4.6 | ❌ | alloy 版本冲突 |
+| v1.4.8 | ❌ | alloy 版本冲突 + revm-inspectors Debug issue |
+
+### alloy patch 1.1.3 更新已完成
+
+已成功更新 `alloy-rpc-types-engine` 和 `alloy-rpc-types-beacon` 到 1.1.3 基础代码，添加了 N42 的 difficulty/nonce 字段。但由于依赖冲突未能编译通过。
 
 ## 已完成的升级准备工作
 

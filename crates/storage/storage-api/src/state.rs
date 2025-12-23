@@ -34,6 +34,7 @@ pub type StateProviderBox = Box<dyn StateProvider>;
 pub trait StateProvider:
     BlockHashReader
     + AccountReader
+    + BytecodeReader
     + StateRootProvider
     + StorageRootProvider
     + StateProofProvider
@@ -47,9 +48,6 @@ pub trait StateProvider:
         account: Address,
         storage_key: StorageKey,
     ) -> ProviderResult<Option<StorageValue>>;
-
-    /// Get account code by its hash
-    fn bytecode_by_hash(&self, code_hash: &B256) -> ProviderResult<Option<Bytecode>>;
 
     /// Get account code by its address.
     ///
@@ -92,6 +90,17 @@ pub trait StateProvider:
         // Returns None if acc doesn't exist
         self.basic_account(addr)?.map_or_else(|| Ok(None), |acc| Ok(Some(acc.nonce)))
     }
+}
+
+/// Minimal requirements to read a full account, for example, to validate its new transactions
+pub trait AccountInfoReader: AccountReader + BytecodeReader {}
+impl<T: AccountReader + BytecodeReader> AccountInfoReader for T {}
+
+/// Trait for reading bytecode associated with a given code hash.
+#[auto_impl(&, Arc, Box)]
+pub trait BytecodeReader: Send + Sync {
+    /// Get account code by its hash
+    fn bytecode_by_hash(&self, code_hash: &B256) -> ProviderResult<Option<Bytecode>>;
 }
 
 /// Trait implemented for database providers that can provide the [`reth_trie_db::StateCommitment`]

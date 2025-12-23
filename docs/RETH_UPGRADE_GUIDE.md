@@ -127,6 +127,38 @@ cd reth-144-clean && cargo check -p reth-chainspec
 | v1.4.5 | ❌ | alloy 版本冲突 |
 | v1.4.6 | ❌ | alloy 版本冲突 |
 | v1.4.8 | ❌ | alloy 版本冲突 + revm-inspectors Debug issue |
+| **v1.5.0** | 🚧 进行中 | 需要大量 API 迁移 |
+
+### v1.4.3 → v1.5.0 🚧 进行中
+
+**依赖版本**: 上游 v1.5.0 使用 `alloy 1.0.13`, `alloy-trie 0.9.0`, `revm 26.0.1`
+
+**已完成的修复**:
+1. ✅ 更新 `alloy-rpc-types-engine/beacon` patch 到 1.1.3
+2. ✅ 添加 `BytecodeReader` trait 到 `storage-api`
+3. ✅ 更新 `BlockEnv.number/timestamp` 从 `u64` 到 `U256`
+4. ✅ 添加 `execute_transaction_with_commit_condition` 方法
+5. ✅ 添加 `update_block_range` 到 `NetworkSyncUpdater`
+6. ✅ 移除 `RevmBytecode::Eof` 处理（revm v26 移除了 EOF）
+7. ✅ 更新 `Nibbles` 编码（`to_vec()` 替代 `into()`）
+8. ✅ 更新 `Receipt` trait 添加 `Encodable + Decodable`
+
+**剩余问题** (~19 个错误):
+- `BytecodeReader` trait 未被上游 provider crate 正确识别
+- `MAX_TX_GAS_LIMIT_OSAKA` 常量缺失
+- `GasLimitTooHigh` 错误变体缺失
+
+**v1.5.0 主要 API 变化**:
+| 变化 | 影响范围 |
+|------|----------|
+| `BytecodeReader` 从 `StateProvider` 分离 | storage-api, revm, provider |
+| `BlockEnv.number/timestamp` 改为 `U256` | ethereum/evm |
+| `execute_transaction_with_commit_condition` 新增 | evm/test_utils |
+| `update_block_range` 新增 | network-api |
+| `Receipt` trait 添加 `Encodable + Decodable` | primitives-traits |
+| EOF bytecode 支持移除 | primitives-traits |
+| `MAX_TX_GAS_LIMIT_OSAKA` 新增 | primitives-traits |
+| `GasLimitTooHigh` 新增 | transaction-pool |
 
 ### alloy patch 1.1.3 更新已完成
 

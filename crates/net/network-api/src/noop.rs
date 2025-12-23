@@ -9,7 +9,7 @@ use std::net::{IpAddr, SocketAddr};
 use alloy_rpc_types_admin::EthProtocolInfo;
 use enr::{secp256k1::SecretKey, Enr};
 use reth_eth_wire_types::{
-    DisconnectReason, EthNetworkPrimitives, NetworkPrimitives, ProtocolVersion,
+    BlockRangeUpdate, DisconnectReason, EthNetworkPrimitives, NetworkPrimitives, ProtocolVersion,
 };
 use reth_network_p2p::{sync::NetworkSyncUpdater, NoopFullBlockClient};
 use reth_network_peers::NodeRecord;
@@ -179,6 +179,8 @@ where
     fn update_status(&self, _head: reth_ethereum_forks::Head) {}
 
     fn update_sync_state(&self, _state: reth_network_p2p::sync::SyncState) {}
+
+    fn update_block_range(&self, _range: BlockRangeUpdate) {}
 }
 
 impl<Net> NetworkEventListenerProvider for NoopNetwork<Net>

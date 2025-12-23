@@ -132,8 +132,8 @@ impl Encode for StoredNibbles {
     // Delegate to the Compact implementation
     fn encode(self) -> Self::Encoded {
         // NOTE: This used to be `to_compact`, but all it does is append the bytes to the buffer,
-        // so we can just use the implementation of `Into<Vec<u8>>` to reuse the buffer.
-        self.0.into()
+        // Convert Nibbles to Vec<u8> using to_vec() as From<Nibbles> is no longer available.
+        self.0.to_vec()
     }
 }
 

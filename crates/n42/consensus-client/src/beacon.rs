@@ -39,7 +39,7 @@ where
         }
     }
 
-    pub fn gen_beacon_block(&mut self, old_beacon_state: BeaconState, parent_hash: BlockHash, attestations: &Vec<Attestation>, execution_requests: &Option<Requests>, eth1_sealed_block: &SealedBlock) -> eyre::Result<BeaconBlock> {
+    pub fn gen_beacon_block(&mut self, old_beacon_state: BeaconState, parent_hash: BlockHash, attestations: &Vec<Attestation>, execution_requests: &Option<Requests>, eth1_sealed_block: &SealedBlock) -> eyre::Result<(BeaconBlock, BeaconState)> {
         let mut execution_requests = parse_execution_requests(execution_requests)?;
 
         execution_requests.deposits.retain(|deposit|
@@ -69,17 +69,13 @@ where
             },
             ..Default::default()
         };
-        let beacon_state = self.state_transition(Some(old_beacon_state), &beacon_block)?;
+        let beacon_state = self.state_transition(old_beacon_state, &beacon_block)?;
         beacon_block.state_root = beacon_state.hash_slow();
-        Ok(beacon_block)
+        Ok((beacon_block, beacon_state))
     }
 
-    pub fn state_transition(&mut self, old_beacon_state: Option<BeaconState>, beacon_block: &BeaconBlock) -> eyre::Result<BeaconState> {
+    pub fn state_transition(&mut self, beacon_state: BeaconState, beacon_block: &BeaconBlock) -> eyre::Result<BeaconState> {
         debug!(target: "consensus-client", ?beacon_block, "state_transition");
-        let beacon_state = match old_beacon_state {
-            Some(v) => v,
-            None => self.provider.get_beacon_state_by_hash(&beacon_block.parent_hash)?.ok_or(eyre::eyre!("beacon_state not found by hash, {:?}", beacon_block.parent_hash))?
-        };
         let new_beacon_state = BeaconState::state_transition(&beacon_state, beacon_block)?;
         let beacon_block_with_root = BeaconBlock { state_root: new_beacon_state.hash_slow(), ..beacon_block.clone() };
         let beacon_block_hash = beacon_block_with_root.hash_slow();
@@ -87,20 +83,6 @@ where
         debug!(target: "consensus-client", ?beacon_block_hash, ?new_beacon_state, "state_transition");
 
         Ok(new_beacon_state)
-    }
-
-    pub fn gen_withdrawals(&mut self, eth1_block_hash: BlockHash) -> eyre::Result<(Option<Vec<Withdrawal>>, BeaconState)> {
-        debug!(target: "consensus-client", ?eth1_block_hash, "gen_withdrawals");
-        let beacon_block_hash = self.provider.get_beacon_block_hash_by_eth1_hash(&eth1_block_hash)?.ok_or(eyre::eyre!("beacon block hash not found, eth1_block_hash={:?}", eth1_block_hash))?;
-
-        debug!(target: "consensus-client", ?beacon_block_hash, "gen_withdrawals");
-        let mut beacon_state = self.provider.get_beacon_state_by_hash(&beacon_block_hash)?.ok_or(eyre::eyre!("beacon_state not found by hash, beacon_block_hash={:?}", beacon_block_hash))?;
-        debug!(target: "consensus-client", ?beacon_state, "gen_withdrawals");
-
-        let (expected_withdrawals, processed_partial_withdrawals_count) =
-        beacon_state.process_withdrawals()?;
-        Ok((Some(expected_withdrawals), beacon_state))
-
     }
 
 }

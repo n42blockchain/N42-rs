@@ -1,8 +1,10 @@
 use alloy_eips::eip2718::Decodable2718;
+use alloy_primitives::BlockHash;
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types::Block;
 use alloy_rpc_types::BlockTransactionsKind;
 use alloy_rpc_types::Transaction as RpcTransaction;
+use alloy_rpc_types::Withdrawal;
 use alloy_rpc_types_engine::{CancunPayloadFields, ExecutionPayloadSidecar, ForkchoiceState};
 use eyre::OptionExt;
 use n42_engine_primitives::PayloadAttributesBuilderExt;
@@ -169,7 +171,7 @@ where
                 .unwrap()
                 .unwrap();
 
-            let (_, beacon_state_after_withdrawal) = self.beacon.gen_withdrawals(header.hash())?;
+            let (_, beacon_state_after_withdrawal) = self.gen_withdrawals(header.hash())?;
 
             debug!(target: "consensus-client", ?block, "block of input");
             let transactions = block.transactions.into_transactions();
@@ -272,7 +274,7 @@ where
                 self.provider.get_beacon_block_hash_by_eth1_hash(&block.header().parent_hash)?
                 .ok_or(eyre::eyre!("get_beacon_block_hash_by_eth1_hash failed, hash={:?}", block.header().parent_hash))?
             };
-            let beacon_block = self.beacon.gen_beacon_block(beacon_state_after_withdrawal, parent_beacon_block_hash, &Default::default(), &Default::default(), &block)?;
+            let (beacon_block, _) = self.beacon.gen_beacon_block(beacon_state_after_withdrawal, parent_beacon_block_hash, &Default::default(), &Default::default(), &block)?;
             let beacon_block_hash = beacon_block.hash_slow();
             self.provider.save_beacon_block_by_hash(&beacon_block_hash, beacon_block.clone())?;
 
@@ -310,5 +312,21 @@ where
             warn!(target: "consensus-client", "if all blocks are available, should not get syncing, new_payload res={:?}", res);
         }
         Ok(())
+    }
+
+    // Assumption: get_beacon_state_by_hash is fast since there are no validators during migration;
+    // if not, refactor gen_withdrawals() to get beacon state in memory
+    pub fn gen_withdrawals(&mut self, eth1_block_hash: BlockHash) -> eyre::Result<(Option<Vec<Withdrawal>>, BeaconState)> {
+        debug!(target: "consensus-client", ?eth1_block_hash, "gen_withdrawals");
+        let beacon_block_hash = self.provider.get_beacon_block_hash_by_eth1_hash(&eth1_block_hash)?.ok_or(eyre::eyre!("beacon block hash not found, eth1_block_hash={:?}", eth1_block_hash))?;
+
+        debug!(target: "consensus-client", ?beacon_block_hash, "gen_withdrawals");
+        let mut beacon_state = self.provider.get_beacon_state_by_hash(&beacon_block_hash)?.ok_or(eyre::eyre!("beacon_state not found by hash, beacon_block_hash={:?}", beacon_block_hash))?;
+        debug!(target: "consensus-client", ?beacon_state, "gen_withdrawals");
+
+        let (expected_withdrawals, processed_partial_withdrawals_count) =
+        beacon_state.process_withdrawals()?;
+        Ok((Some(expected_withdrawals), beacon_state))
+
     }
 }

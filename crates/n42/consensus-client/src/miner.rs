@@ -3,6 +3,7 @@
 use alloy_eips::{
     eip7685::Requests,
 };
+use alloy_rpc_types::Withdrawal;
 use blst::min_pk::{AggregateSignature, Signature};
 use blst::min_pk::PublicKey;
 use alloy_primitives::FixedBytes;
@@ -139,6 +140,7 @@ pub struct N42Miner<T: PayloadTypes, Provider, B, Network> {
     pending_block_data: Option<PendingBlockData>,
     start_timestamp: u64,
     recent_committee_caches: schnellru::LruMap<BlockHash, Arc<CommitteeCache>>,
+    recent_beacon_states: schnellru::LruMap<BlockHash, BeaconState>,
 
     num_generated_blocks: u64,
     num_skipped_new_block: u64,
@@ -241,6 +243,7 @@ where
             pending_block_data: None,
             start_timestamp,
             recent_committee_caches: schnellru::LruMap::new(schnellru::ByLength::new((SLOTS_PER_EPOCH * 2)as u32)),
+            recent_beacon_states: schnellru::LruMap::new(schnellru::ByLength::new((SLOTS_PER_EPOCH * 2)as u32)),
 
             metrics: Default::default(),
         };
@@ -493,11 +496,12 @@ where
                     return Err(eyre::eyre!("requests_hash mismatch between beacon block and eth1 block, beacon requests_hash: {:?}, eth1 requests_hash: {:?}", Some(request_hash), parent.requests_hash()));
                 }
 
-                let (_, beacon_state_after_withdrawal) = self.beacon.gen_withdrawals(parent.parent_hash)?;
-                let new_beacon_state = self.beacon.state_transition(Some(beacon_state_after_withdrawal), &new_beacon_block)?;
+                let (_, beacon_state_after_withdrawal) = self.gen_withdrawals(parent.parent_hash)?;
+                let new_beacon_state = self.beacon.state_transition(beacon_state_after_withdrawal, &new_beacon_block)?;
                 if new_beacon_state.hash_slow() != new_beacon_block.state_root {
                     return Err(eyre::eyre!("state root mismatch, new_beacon_state hash={:?}, new_beacon_block.state_root={:?}", new_beacon_state.hash_slow(), new_beacon_block.state_root));
                 }
+            self.recent_beacon_states.insert(new_beacon_block_hash, new_beacon_state);
 
                 self.provider.save_beacon_block_by_hash(&new_beacon_block_hash, new_beacon_block.clone())?;
                 self.provider.save_beacon_block_hash_by_eth1_hash(&parent.hash(), new_beacon_block_hash)?;
@@ -781,17 +785,15 @@ where
             self.provider.get_beacon_block_hash_by_eth1_hash(&block.header().parent_hash)?
             .ok_or(eyre::eyre!("get_beacon_block_hash_by_eth1_hash failed, hash={:?}", block.header().parent_hash))?
         };
-        let beacon_block = self.beacon.gen_beacon_block(beacon_state_after_withdrawal, parent_beacon_block_hash, &attestations.values().cloned().collect(), &execution_requests, &block)?;
+        let (beacon_block, new_beacon_state) = self.beacon.gen_beacon_block(beacon_state_after_withdrawal, parent_beacon_block_hash, &attestations.values().cloned().collect(), &execution_requests, &block)?;
         let beacon_block_hash = beacon_block.hash_slow();
+        self.recent_beacon_states.insert(beacon_block_hash, new_beacon_state);
         if let Some(v) = committee_cache {
             debug!(target: "consensus-client", "inserting committee_cache into lru for block hash {:?}", beacon_block_hash);
             self.recent_committee_caches.insert(beacon_block_hash, v);
         }
         self.provider.save_beacon_block_by_hash(&beacon_block_hash, beacon_block.clone())?;
         self.provider.save_beacon_block_hash_by_eth1_hash(&block.hash(), beacon_block_hash)?;
-
-        let new_beacon_state = self.provider.get_beacon_state_by_hash(&beacon_block_hash)?
-            .ok_or(eyre::eyre!("get_beacon_state_by_hash failed, hash={:?}", beacon_block_hash))?;
 
         self.recent_blocks.insert(block.hash_slow(), block.clone());
 
@@ -882,7 +884,7 @@ where
         let timestamp = now + Duration::from_secs(time_for_attestatation_gathering);
         debug!(target: "consensus-client", ?timestamp, "prepare_block: PayloadAttributes timestamp");
 
-        let (withdrawals, beacon_state_after_withdrawal) = self.beacon.gen_withdrawals(header.hash())?;
+        let (withdrawals, beacon_state_after_withdrawal) = self.gen_withdrawals(header.hash())?;
 
         let forkchoice_state = self.forkchoice_state()?;
         let payload_attributes = self.payload_attributes_builder.build_ext(timestamp.as_secs(), withdrawals, beacon_state_after_withdrawal.randao_mix);
@@ -962,7 +964,14 @@ where
                             return Ok(());
                         }
                         if beacon_block.slot % SLOTS_PER_EPOCH == 0 {
-                            let parent_beacon_state = self.provider.get_beacon_state_by_hash(&beacon_block.parent_hash)?.ok_or(eyre::eyre!("beacon state not found, beacon_block_hash={:?}", beacon_block.parent_hash))?;
+
+                            let mut parent_beacon_state = match self.recent_beacon_states.get(&beacon_block.parent_hash) {
+                                Some (v) => v.clone(),
+                                None => {
+                                    self.provider.get_beacon_state_by_hash(&beacon_block.parent_hash)?.ok_or(eyre::eyre!("beacon state not found, beacon_block_hash={:?}", beacon_block.parent_hash))?
+                                }
+                            };
+
                             match parent_beacon_state.gen_committee_cache(RelativeEpoch::Next) {
                                 Ok(v) => break Arc::new(v),
                                 Err(e) => {
@@ -1281,6 +1290,25 @@ where
             }
         }
         Ok(deposits)
+    }
+
+    pub fn gen_withdrawals(&mut self, eth1_block_hash: BlockHash) -> eyre::Result<(Option<Vec<Withdrawal>>, BeaconState)> {
+        debug!(target: "consensus-client", ?eth1_block_hash, "gen_withdrawals");
+        let beacon_block_hash = self.provider.get_beacon_block_hash_by_eth1_hash(&eth1_block_hash)?.ok_or(eyre::eyre!("beacon block hash not found, eth1_block_hash={:?}", eth1_block_hash))?;
+
+        debug!(target: "consensus-client", ?beacon_block_hash, "gen_withdrawals");
+        let mut beacon_state = match self.recent_beacon_states.get(&beacon_block_hash) {
+            Some (v) => v.clone(),
+            None => {
+                self.provider.get_beacon_state_by_hash(&beacon_block_hash)?.ok_or(eyre::eyre!("beacon_state not found by hash, beacon_block_hash={:?}", beacon_block_hash))?
+            }
+        };
+        debug!(target: "consensus-client", ?beacon_state, "gen_withdrawals");
+
+        let (expected_withdrawals, processed_partial_withdrawals_count) =
+        beacon_state.process_withdrawals()?;
+        Ok((Some(expected_withdrawals), beacon_state))
+
     }
 
 }

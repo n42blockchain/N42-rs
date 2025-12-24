@@ -297,7 +297,7 @@ impl<ChainSpec: EthChainSpec + Send + Sync + 'static> HeaderProvider
 
     fn header(&self, block_hash: BlockHash) -> ProviderResult<Option<Header>> {
         let lock = self.headers.lock();
-        Ok(lock.get(block_hash).cloned())
+        Ok(lock.get(&block_hash).cloned())
     }
 
     fn header_by_number(&self, num: u64) -> ProviderResult<Option<Header>> {

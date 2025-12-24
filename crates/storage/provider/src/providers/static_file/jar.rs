@@ -96,8 +96,8 @@ impl<N: NodePrimitives<BlockHeader: Value>> HeaderProvider for StaticFileJarProv
     fn header(&self, block_hash: BlockHash) -> ProviderResult<Option<Self::Header>> {
         Ok(self
             .cursor()?
-            .get_two::<HeaderWithHashMask<Self::Header>>(block_hash.into())?
-            .filter(|(_, hash)| hash == block_hash)
+            .get_two::<HeaderWithHashMask<Self::Header>>((&block_hash).into())?
+            .filter(|(_, hash)| hash == &block_hash)
             .map(|(header, _)| header))
     }
 

@@ -126,6 +126,7 @@ impl<'a, DB: Database, I: Inspector<EthEvmContext<&'a mut State<DB>>>> BlockExec
                 reqs
             }),
             gas_used: 0,
+            blob_gas_used: 0,
         };
 
         evm.db_mut().bundle_state = bundle;

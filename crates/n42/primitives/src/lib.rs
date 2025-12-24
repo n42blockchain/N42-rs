@@ -16,7 +16,7 @@ pub mod beacon;
 pub use beacon::*;
 
 mod activation_queue;
-mod safe_aitrh;
+mod safe_arith;
 
 mod committee_cache;
 pub use committee_cache::CommitteeCache;

@@ -98,8 +98,8 @@ pub enum AposError {
     UnauthorizedSigner,
     /// `RecentlySigned`,
     RecentlySigned,
-    /// `UnTransion`,
-    UnTransion,
+    /// `NoTransactions`,
+    NoTransactions,
 }
 
 impl std::fmt::Display for AposError {
@@ -125,7 +125,7 @@ impl std::fmt::Display for AposError {
                 Self::InvalidVotingChain => "invalid voting chain",
                 Self::UnauthorizedSigner => "unauthorized signer",
                 Self::RecentlySigned => "recently signed",
-                Self::UnTransion => "sealing paused while waiting for transactions",
+                Self::NoTransactions => "sealing paused while waiting for transactions",
             }
         )
     }

@@ -106,3 +106,4 @@ macro_rules! impl_safe_arith {
 
 impl_safe_arith!(u64);
 impl_safe_arith!(usize);
+

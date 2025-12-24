@@ -3,7 +3,7 @@
 
 //! Account related models and types.
 
-use std::ops::{Range, RangeInclusive};
+use std::ops::{Bound, Range, RangeBounds, RangeInclusive};
 
 use crate::{
     impl_fixed_arbitrary,
@@ -71,6 +71,50 @@ impl Decode for BlockNumberAddress {
         let num = u64::from_be_bytes(value[..8].try_into().map_err(|_| DatabaseError::Decode)?);
         let hash = Address::from_slice(&value[8..]);
         Ok(Self((num, hash)))
+    }
+}
+
+/// A [`RangeBounds`] over a range of [`BlockNumberAddress`]s. Used to conveniently convert from a
+/// range of block numbers to a range of [`BlockNumberAddress`]s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockNumberAddressRange {
+    /// The start of the range.
+    pub start: Bound<BlockNumberAddress>,
+    /// The end of the range.
+    pub end: Bound<BlockNumberAddress>,
+}
+
+impl RangeBounds<BlockNumberAddress> for BlockNumberAddressRange {
+    fn start_bound(&self) -> Bound<&BlockNumberAddress> {
+        match &self.start {
+            Bound::Included(v) => Bound::Included(v),
+            Bound::Excluded(v) => Bound::Excluded(v),
+            Bound::Unbounded => Bound::Unbounded,
+        }
+    }
+
+    fn end_bound(&self) -> Bound<&BlockNumberAddress> {
+        match &self.end {
+            Bound::Included(v) => Bound::Included(v),
+            Bound::Excluded(v) => Bound::Excluded(v),
+            Bound::Unbounded => Bound::Unbounded,
+        }
+    }
+}
+
+impl<R: RangeBounds<BlockNumber>> From<R> for BlockNumberAddressRange {
+    fn from(range: R) -> Self {
+        let start = match range.start_bound() {
+            Bound::Included(n) => Bound::Included(BlockNumberAddress((*n, Address::ZERO))),
+            Bound::Excluded(n) => Bound::Included(BlockNumberAddress((n + 1, Address::ZERO))),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        let end = match range.end_bound() {
+            Bound::Included(n) => Bound::Excluded(BlockNumberAddress((n + 1, Address::ZERO))),
+            Bound::Excluded(n) => Bound::Excluded(BlockNumberAddress((*n, Address::ZERO))),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        Self { start, end }
     }
 }
 

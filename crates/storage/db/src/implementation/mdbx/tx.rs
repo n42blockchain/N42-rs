@@ -381,7 +381,7 @@ impl DbTxMut for Tx<RW> {
                 .map_err(|e| {
                     DatabaseWriteError {
                         info: e.into(),
-                        operation: DatabaseWriteOperation::Put,
+                        operation: DatabaseWriteOperation::PutUpsert,
                         table_name: T::NAME,
                         key: key.into(),
                     }

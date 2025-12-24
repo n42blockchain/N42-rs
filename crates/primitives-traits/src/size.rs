@@ -7,8 +7,7 @@ use alloy_consensus::{
     TxEip4844Variant, TxEip4844WithSidecar, TxEip7702, TxLegacy, TxType,
 };
 use alloy_eips::eip4895::Withdrawals;
-use alloy_primitives::{Signature, TxHash, B256};
-use revm_primitives::Log;
+use alloy_primitives::{Log, LogData, Signature, TxHash, B256};
 
 /// Trait for calculating a heuristic for the in-memory size of a struct.
 #[auto_impl::auto_impl(&, Arc, Box)]
@@ -71,6 +70,18 @@ impl<T: TxEip4844Sidecar> InMemorySize for TxEip4844WithSidecar<T> {
 
 #[cfg(feature = "op")]
 impl_in_mem_size_size_of!(op_alloy_consensus::OpTxType);
+
+impl InMemorySize for LogData {
+    fn size(&self) -> usize {
+        self.data.len() + core::mem::size_of_val(self.topics())
+    }
+}
+
+impl<T: InMemorySize> InMemorySize for Log<T> {
+    fn size(&self) -> usize {
+        core::mem::size_of_val(&self.address) + self.data.size()
+    }
+}
 
 impl InMemorySize for alloy_consensus::Receipt {
     fn size(&self) -> usize {

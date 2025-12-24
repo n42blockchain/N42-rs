@@ -344,14 +344,11 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         &self,
         from_tx: TxNumber,
         last_block: BlockNumber,
-        remove_from: StorageLocation,
     ) -> ProviderResult<()> {
-        if remove_from.database() {
-            // iterate over block body and remove receipts
-            self.remove::<tables::Receipts<ReceiptTy<N>>>(from_tx..)?;
-        }
+        // iterate over block body and remove receipts
+        self.remove::<tables::Receipts<ReceiptTy<N>>>(from_tx..)?;
 
-        if remove_from.static_files() && !self.prune_modes.has_receipts_pruning() {
+        if !self.prune_modes.has_receipts_pruning() {
             let static_file_receipt_num =
                 self.static_file_provider.get_highest_static_file_tx(StaticFileSegment::Receipts);
 
@@ -1772,7 +1769,6 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
         &self,
         execution_outcome: &ExecutionOutcome<Self::Receipt>,
         is_value_known: OriginalValuesKnown,
-        write_receipts_to: StorageLocation,
     ) -> ProviderResult<()> {
         let first_block = execution_outcome.first_block();
         let block_count = execution_outcome.len() as u64;
@@ -1808,9 +1804,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
         //
         // We are writing to database if requested or if there's any kind of receipt pruning
         // configured
-        let mut receipts_cursor = (write_receipts_to.database() || has_receipts_pruning)
-            .then(|| self.tx.cursor_write::<tables::Receipts<Self::Receipt>>())
-            .transpose()?;
+        let mut receipts_cursor = self.tx.cursor_write::<tables::Receipts<Self::Receipt>>()?;
 
         // Prepare receipts static writer if we are going to write receipts to static files
         //
@@ -1848,8 +1842,8 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
 
                 if let Some(writer) = &mut receipts_static_writer {
                     writer.append_receipt(receipt_idx, receipt)?;
-                } else if let Some(cursor) = &mut receipts_cursor {
-                    cursor.append(receipt_idx, receipt)?;
+                } else {
+                    receipts_cursor.append(receipt_idx, receipt)?;
                 }
             }
         }
@@ -2046,11 +2040,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
     ///     1. Take the old value from the changeset
     ///     2. Take the new value from the local state
     ///     3. Set the local state to the value in the changeset
-    fn remove_state_above(
-        &self,
-        block: BlockNumber,
-        remove_receipts_from: StorageLocation,
-    ) -> ProviderResult<()> {
+    fn remove_state_above(&self, block: BlockNumber) -> ProviderResult<()> {
         let range = block + 1..=self.last_block_number()?;
 
         if range.is_empty() {
@@ -2099,7 +2089,6 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
             for (storage_key, (old_storage_value, _new_storage_value)) in storage {
                 let storage_entry = StorageEntry { key: *storage_key, value: *old_storage_value };
                 // delete previous value
-                // TODO: This does not use dupsort features
                 if plain_storage_cursor
                     .seek_by_key_subkey(*address, *storage_key)?
                     .filter(|s| s.key == *storage_key)
@@ -2115,7 +2104,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
             }
         }
 
-        self.remove_receipts_from(from_transaction_num, block, remove_receipts_from)?;
+        self.remove_receipts_from(from_transaction_num, block)?;
 
         Ok(())
     }
@@ -2144,7 +2133,6 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
     fn take_state_above(
         &self,
         block: BlockNumber,
-        remove_receipts_from: StorageLocation,
     ) -> ProviderResult<ExecutionOutcome<Self::Receipt>> {
         let range = block + 1..=self.last_block_number()?;
 
@@ -2250,7 +2238,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
             receipts.push(block_receipts);
         }
 
-        self.remove_receipts_from(from_transaction_num, block, remove_receipts_from)?;
+        self.remove_receipts_from(from_transaction_num, block)?;
 
         Ok(ExecutionOutcome::new_init(
             state,

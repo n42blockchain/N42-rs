@@ -948,8 +948,10 @@ pub trait EthApiBuilder<N: FullNodeComponents>: Default + Send + 'static {
 /// Helper trait that provides the validator for the engine API
 pub trait EngineValidatorAddOn<Node: FullNodeComponents>: Send {
     /// The Validator type to use for the engine API.
-    type Validator: EngineValidator<<Node::Types as NodeTypes>::Payload, Block = BlockTy<Node::Types>>
-        + Clone;
+    type Validator: EngineValidator<
+            <Node::Types as NodeTypes>::Payload,
+            <Node::Types as NodeTypes>::Primitives,
+        > + Clone;
 
     /// Creates the engine validator for an engine API based node.
     fn engine_validator(
@@ -975,8 +977,10 @@ where
 /// A type that knows how to build the engine validator.
 pub trait EngineValidatorBuilder<Node: FullNodeComponents>: Send + Sync + Clone {
     /// The consensus implementation to build.
-    type Validator: EngineValidator<<Node::Types as NodeTypes>::Payload, Block = BlockTy<Node::Types>>
-        + Clone;
+    type Validator: EngineValidator<
+            <Node::Types as NodeTypes>::Payload,
+            <Node::Types as NodeTypes>::Primitives,
+        > + Clone;
 
     /// Creates the engine validator.
     fn build(
@@ -988,8 +992,10 @@ pub trait EngineValidatorBuilder<Node: FullNodeComponents>: Send + Sync + Clone 
 impl<Node, F, Fut, Validator> EngineValidatorBuilder<Node> for F
 where
     Node: FullNodeComponents,
-    Validator: EngineValidator<<Node::Types as NodeTypes>::Payload, Block = BlockTy<Node::Types>>
-        + Clone
+    Validator: EngineValidator<
+            <Node::Types as NodeTypes>::Payload,
+            <Node::Types as NodeTypes>::Primitives,
+        > + Clone
         + Unpin
         + 'static,
     F: FnOnce(&AddOnsContext<'_, Node>) -> Fut + Send + Sync + Clone,

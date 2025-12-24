@@ -2307,7 +2307,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> TrieWriter for DatabaseProvider
             }
         }
 
-        num_entries += self.write_storage_trie_updates(trie_updates.storage_tries_ref())?;
+        num_entries += self.write_storage_trie_updates_sorted(trie_updates.storage_tries_ref())?;
 
         Ok(num_entries)
     }
@@ -2328,7 +2328,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> StorageTrieWriter for DatabaseP
             let mut db_storage_trie_cursor =
                 DatabaseStorageTrieCursor::new(cursor, *hashed_address);
             num_entries +=
-                db_storage_trie_cursor.write_storage_trie_updates(storage_trie_updates)?;
+                db_storage_trie_cursor.write_storage_trie_updates_sorted(storage_trie_updates)?;
             cursor = db_storage_trie_cursor.cursor;
         }
 
@@ -2346,7 +2346,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> StorageTrieWriter for DatabaseP
 
         let cursor = self.tx_ref().cursor_dup_write::<tables::StoragesTrie>()?;
         let mut trie_db_cursor = DatabaseStorageTrieCursor::new(cursor, hashed_address);
-        Ok(trie_db_cursor.write_storage_trie_updates(updates)?)
+        Ok(trie_db_cursor.write_storage_trie_updates_sorted(updates)?)
     }
 }
 

@@ -6,7 +6,7 @@ use alloy_genesis::Genesis;
 use alloy_primitives::{b256, hex};
 use futures::StreamExt;
 use reth_chainspec::ChainSpec;
-use reth_node_api::{BlockBody, FullNodeComponents, FullNodePrimitives, NodeTypes};
+use reth_node_api::{BlockBody, FullNodeComponents, NodeTypes};
 use reth_node_builder::{
     rpc::RethRpcAddOns, EngineNodeLauncher, FullNode, NodeBuilder, NodeConfig, NodeHandle,
 };
@@ -53,7 +53,6 @@ async fn assert_chain_advances<N, AddOns>(node: FullNode<N, AddOns>)
 where
     N: FullNodeComponents<Provider: CanonStateSubscriptions>,
     AddOns: RethRpcAddOns<N, EthApi: EthTransactions>,
-    N::Types: NodeTypes<Primitives: FullNodePrimitives>,
 {
     let mut notifications = node.provider.canonical_state_stream();
 

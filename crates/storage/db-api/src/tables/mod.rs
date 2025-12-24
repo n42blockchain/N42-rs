@@ -36,7 +36,8 @@ use reth_ethereum_primitives::{Receipt, TransactionSigned};
 use reth_primitives_traits::{Account, Bytecode, StorageEntry};
 use reth_prune_types::{PruneCheckpoint, PruneSegment};
 use reth_stages_types::StageCheckpoint;
-use reth_trie_common::{BranchNodeCompact, StorageTrieEntry, StoredNibbles, StoredNibblesSubKey};
+use reth_trie_common::{BranchNodeCompact, StorageTrieEntry, StoredNibbles, StoredNibblesSubKey, TrieChangeSetsEntry};
+use crate::models::BlockNumberHashedAddress;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -582,6 +583,20 @@ tables! {
     table StoragesTrie {
         type Key = B256;
         type Value = StorageTrieEntry;
+        type SubKey = StoredNibblesSubKey;
+    }
+
+    /// Stores the state of a node in the accounts trie prior to a particular block being executed.
+    table AccountsTrieChangeSets {
+        type Key = BlockNumber;
+        type Value = TrieChangeSetsEntry;
+        type SubKey = StoredNibblesSubKey;
+    }
+
+    /// Stores the state of a node in a storage trie prior to a particular block being executed.
+    table StoragesTrieChangeSets {
+        type Key = BlockNumberHashedAddress;
+        type Value = TrieChangeSetsEntry;
         type SubKey = StoredNibblesSubKey;
     }
 

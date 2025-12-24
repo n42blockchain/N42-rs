@@ -435,11 +435,11 @@ impl<
             for block_number in 0..block.number() {
                 let mut prev = block.clone_header();
                 prev.number = block_number;
-                writer.append_header(&prev, U256::ZERO, &B256::ZERO)?;
+                writer.append_header_with_td(&prev, U256::ZERO, &B256::ZERO)?;
             }
         }
 
-        writer.append_header(block.header(), ttd, &block.hash())?;
+        writer.append_header_with_td(block.header(), ttd, &block.hash())?;
 
         self.insert_block(block, StorageLocation::Database)
     }
@@ -2811,7 +2811,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
         if write_to.static_files() {
             let mut writer =
                 self.static_file_provider.get_writer(block_number, StaticFileSegment::Headers)?;
-            writer.append_header(block.header(), ttd, &block.hash())?;
+            writer.append_header_with_td(block.header(), ttd, &block.hash())?;
         }
 
         self.tx.put::<tables::HeaderNumbers>(block.hash(), block_number)?;

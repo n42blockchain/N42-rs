@@ -229,6 +229,7 @@ impl_compression_for_compact!(
     TxType,
     StorageEntry,
     BranchNodeCompact,
+    TrieChangeSetsEntry,
     StoredNibbles,
     StoredNibblesSubKey,
     StorageTrieEntry,

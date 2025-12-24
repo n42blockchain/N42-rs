@@ -6,7 +6,7 @@
 use crate::attestation_duty::AttestationDuty;
 use crate::beacon::SHUFFLE_CACHE;
 use crate::beacon_committee::BeaconCommittee;
-use crate::safe_aitrh::SafeArith;
+use crate::safe_arith::SafeArith;
 use crate::shuffle_list::shuffle_list;
 use crate::*;
 use crate::{ChainSpec, SLOTS_PER_EPOCH};

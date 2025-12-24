@@ -542,6 +542,20 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
     pub fn append_header(
         &mut self,
         header: &N::BlockHeader,
+        hash: &BlockHash,
+    ) -> ProviderResult<()>
+    where
+        N::BlockHeader: Compact,
+    {
+        self.append_header_with_td(header, U256::ZERO, hash)
+    }
+
+    /// Appends header with total difficulty to static files.
+    ///
+    /// Returns the current [`BlockNumber`] as seen in the static file.
+    pub fn append_header_with_td(
+        &mut self,
+        header: &N::BlockHeader,
         total_difficulty: U256,
         hash: &BlockHash,
     ) -> ProviderResult<()>

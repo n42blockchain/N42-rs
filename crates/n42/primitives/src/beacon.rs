@@ -27,8 +27,8 @@ use tree_hash::TreeHash;
 use tree_hash_derive::TreeHash;
 
 use crate::committee_cache::CommitteeCache;
-use crate::safe_aitrh::SafeArith;
-use crate::safe_aitrh::SafeArithIter;
+use crate::safe_arith::SafeArith;
+use crate::safe_arith::SafeArithIter;
 use crate::{
     activation_queue::ActivationQueue, beacon_committee::BeaconCommittee, CommitteeIndex, Hash256,
     Slot, Validator,

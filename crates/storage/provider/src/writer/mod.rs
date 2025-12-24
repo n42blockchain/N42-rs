@@ -7,13 +7,12 @@ use crate::{
     StorageLocation, TrieWriter,
 };
 use alloy_consensus::BlockHeader;
-use reth_chain_state::{ExecutedBlock, ExecutedBlockWithTrieUpdates};
+use reth_chain_state::ExecutedBlock;
 use reth_db_api::transaction::{DbTx, DbTxMut};
 use reth_errors::{ProviderError, ProviderResult};
 use reth_primitives_traits::{NodePrimitives, SignedTransaction};
 use reth_static_file_types::StaticFileSegment;
 use reth_storage_api::{DBProvider, StageCheckpointWriter, TransactionsProviderExt};
-use reth_storage_errors::writer::UnifiedStorageWriterError;
 use revm_database::OriginalValuesKnown;
 use std::sync::Arc;
 use tracing::debug;
@@ -76,11 +75,11 @@ impl<'a, ProviderDB, ProviderSF> UnifiedStorageWriter<'a, ProviderDB, ProviderSF
     ///
     /// # Returns
     /// - `Ok(())` if the static file instance is set.
-    /// - `Err(StorageWriterError::MissingStaticFileWriter)` if the static file instance is not set.
+    /// - `Err(ProviderError)` if the static file instance is not set.
     #[expect(unused)]
-    const fn ensure_static_file(&self) -> Result<(), UnifiedStorageWriterError> {
+    const fn ensure_static_file(&self) -> ProviderResult<()> {
         if self.static_file.is_none() {
-            return Err(UnifiedStorageWriterError::MissingStaticFileWriter);
+            return Err(ProviderError::UnsupportedProvider);
         }
         Ok(())
     }
@@ -138,7 +137,7 @@ where
         + StaticFileProviderFactory,
 {
     /// Writes executed blocks and receipts to storage.
-    pub fn save_blocks<N>(&self, blocks: Vec<ExecutedBlockWithTrieUpdates<N>>) -> ProviderResult<()>
+    pub fn save_blocks<N>(&self, blocks: Vec<ExecutedBlock<N>>) -> ProviderResult<()>
     where
         N: NodePrimitives<SignedTx: SignedTransaction>,
         ProviderDB: BlockWriter<Block = N::Block> + StateWriter<Receipt = N::Receipt>,
@@ -166,14 +165,11 @@ where
         //  * trie updates (cannot naively extend, need helper)
         //  * indices (already done basically)
         // Insert the blocks
-        for ExecutedBlockWithTrieUpdates {
-            block:
-                ExecutedBlock {
-                    recovered_block,
-                    execution_output,
-                    hashed_state,
-                },
-            trie,
+        for ExecutedBlock {
+            recovered_block,
+            execution_output,
+            hashed_state,
+            trie_updates: trie,
         } in blocks
         {
             let block_hash = recovered_block.hash();

@@ -3335,37 +3335,6 @@ dependencies = [
 
 [[package]]
 name = "discv5"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4b4e7798d2ff74e29cee344dc490af947ae657d6ab5273dde35d58ce06a4d71"
-dependencies = [
- "aes",
- "aes-gcm",
- "alloy-rlp",
- "arrayvec 0.7.6",
- "ctr",
- "delay_map",
- "enr 0.13.0",
- "fnv",
- "futures",
- "hashlink",
- "hex",
- "hkdf",
- "lazy_static",
- "lru 0.12.5",
- "more-asserts",
- "parking_lot 0.12.5",
- "rand 0.8.5",
- "smallvec",
- "socket2 0.5.10",
- "tokio",
- "tracing",
- "uint 0.10.0",
- "zeroize",
-]
-
-[[package]]
-name = "discv5"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f170f4f6ed0e1df52bf43b403899f0081917ecf1500bfe312505cc3b515a8899"
@@ -8710,7 +8679,7 @@ source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.9.1#3afe69a5738459a
 dependencies = [
  "alloy-primitives 1.4.1",
  "alloy-rlp",
- "discv5 0.10.2",
+ "discv5",
  "enr 0.13.0",
  "itertools 0.14.0",
  "parking_lot 0.12.5",
@@ -8736,7 +8705,7 @@ dependencies = [
  "alloy-primitives 1.4.1",
  "alloy-rlp",
  "derive_more 2.1.1",
- "discv5 0.10.2",
+ "discv5",
  "enr 0.13.0",
  "futures",
  "itertools 0.14.0",
@@ -9586,7 +9555,7 @@ dependencies = [
  "aquamarine",
  "auto_impl",
  "derive_more 2.1.1",
- "discv5 0.9.1",
+ "discv5",
  "enr 0.13.0",
  "futures",
  "itertools 0.14.0",

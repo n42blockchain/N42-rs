@@ -136,7 +136,7 @@ impl<'b, Provider: DBProvider + BlockNumReader> HistoricalStateProviderRef<'b, P
             );
         }
 
-        Ok(HashedPostState::from_reverts::<KeccakKeyHasher>(self.tx(), self.block_number)?)
+        Ok(HashedPostState::from_reverts::<KeccakKeyHasher>(self.tx(), self.block_number..)?)
     }
 
     /// Retrieve revert hashed storage for this history provider and target address.
@@ -371,7 +371,8 @@ impl<Provider: DBProvider + BlockNumReader> StateProofProvider
         slots: &[B256],
     ) -> ProviderResult<AccountProof> {
         input.prepend(self.revert_state()?);
-        Proof::overlay_account_proof(self.tx(), input, address, slots).map_err(ProviderError::from)
+        let proof = <Proof<_, _> as DatabaseProof>::from_tx(self.tx());
+        proof.overlay_account_proof(input, address, slots).map_err(ProviderError::from)
     }
 
     fn multiproof(
@@ -380,7 +381,8 @@ impl<Provider: DBProvider + BlockNumReader> StateProofProvider
         targets: MultiProofTargets,
     ) -> ProviderResult<MultiProof> {
         input.prepend(self.revert_state()?);
-        Proof::overlay_multiproof(self.tx(), input, targets).map_err(ProviderError::from)
+        let proof = <Proof<_, _> as DatabaseProof>::from_tx(self.tx());
+        proof.overlay_multiproof(input, targets).map_err(ProviderError::from)
     }
 
     fn witness(&self, mut input: TrieInput, target: HashedPostState) -> ProviderResult<Vec<Bytes>> {

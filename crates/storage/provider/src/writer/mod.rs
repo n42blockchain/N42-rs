@@ -181,7 +181,6 @@ where
             self.database().write_state(
                 &execution_output,
                 OriginalValuesKnown::No,
-                StorageLocation::StaticFiles,
             )?;
 
             // insert hashes and intermediate merkle nodes

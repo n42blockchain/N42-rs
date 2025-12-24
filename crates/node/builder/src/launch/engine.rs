@@ -249,7 +249,6 @@ where
             ctx.components().payload_builder_handle().clone(),
             engine_payload_validator,
             engine_tree_config,
-            ctx.invalid_block_hook()?,
             ctx.sync_metrics_tx(),
             ctx.components().evm_config().clone(),
         );

@@ -19,11 +19,9 @@ use reth_downloaders::{bodies::noop::NoopBodiesDownloader, headers::noop::NoopHe
 use reth_engine_local::MiningMode;
 use reth_evm::{noop::NoopEvmConfig, ConfigureEvm};
 use reth_fs_util as fs;
-use reth_invalid_block_hooks::InvalidBlockWitnessHook;
 use reth_network_p2p::headers::client::HeadersClient;
 use reth_node_api::{FullNodeTypes, NodeTypes, NodeTypesWithDB, NodeTypesWithDBAdapter};
 use reth_node_core::{
-    args::InvalidBlockHookType,
     dirs::{ChainPath, DataDirPath},
     node_config::NodeConfig,
     primitives::BlockHeader,
@@ -390,11 +388,14 @@ impl<R, ChainSpec: EthChainSpec> LaunchContextWith<Attached<WithConfigs<ChainSpe
     }
 
     /// Returns the [`MiningMode`] intended for --dev mode.
-    pub fn dev_mining_mode(&self, pool: impl TransactionPool) -> MiningMode {
+    pub fn dev_mining_mode<Pool>(&self, pool: Pool) -> MiningMode<Pool>
+    where
+        Pool: TransactionPool + Unpin,
+    {
         if let Some(interval) = self.node_config().dev.block_time {
             MiningMode::interval(interval)
         } else {
-            MiningMode::instant(pool)
+            MiningMode::instant(pool, self.node_config().dev.block_max_transactions)
         }
     }
 }
@@ -944,39 +945,9 @@ where
     >,
     CB: NodeComponentsBuilder<T>,
 {
-    /// Returns the [`InvalidBlockHook`] to use for the node.
-    pub fn invalid_block_hook(
-        &self,
-    ) -> eyre::Result<Box<dyn InvalidBlockHook<<T::Types as NodeTypes>::Primitives>>> {
-        let Some(ref hook) = self.node_config().debug.invalid_block_hook else {
-            return Ok(Box::new(NoopInvalidBlockHook::default()))
-        };
-        let healthy_node_rpc_client = self.get_healthy_node_client()?;
-
-        let output_directory = self.data_dir().invalid_block_hooks();
-        let hooks = hook
-            .iter()
-            .copied()
-            .map(|hook| {
-                let output_directory = output_directory.join(hook.to_string());
-                fs::create_dir_all(&output_directory)?;
-
-                Ok(match hook {
-                    InvalidBlockHookType::Witness => Box::new(InvalidBlockWitnessHook::new(
-                        self.blockchain_db().clone(),
-                        self.components().evm_config().clone(),
-                        output_directory,
-                        healthy_node_rpc_client.clone(),
-                    )),
-                    InvalidBlockHookType::PreState | InvalidBlockHookType::Opcode => {
-                        eyre::bail!("invalid block hook {hook:?} is not implemented yet")
-                    }
-                } as Box<dyn InvalidBlockHook<_>>)
-            })
-            .collect::<Result<_, _>>()?;
-
-        Ok(Box::new(InvalidBlockHooks(hooks)))
-    }
+    // TODO: InvalidBlockHook is not available in reth v1.8.4
+    // This feature requires reth v1.9.0+
+    // pub fn invalid_block_hook(&self) -> eyre::Result<Box<dyn InvalidBlockHook<...>>> { ... }
 
     /// Returns an RPC client for the healthy node, if configured in the node config.
     fn get_healthy_node_client(&self) -> eyre::Result<Option<jsonrpsee::http_client::HttpClient>> {

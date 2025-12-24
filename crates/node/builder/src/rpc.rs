@@ -1,6 +1,7 @@
 //! Builder support for rpc components.
 
 pub use jsonrpsee::server::middleware::rpc::{RpcService, RpcServiceBuilder};
+pub use reth_engine_tree::tree::{BasicEngineValidator, EngineValidator};
 pub use reth_rpc_builder::{middleware::RethRpcMiddleware, Identity};
 
 use crate::{BeaconConsensusEngineEvent, BeaconConsensusEngineHandle};
@@ -8,10 +9,10 @@ use alloy_rpc_types::engine::ClientVersionV1;
 use alloy_rpc_types_engine::ExecutionData;
 use jsonrpsee::{core::middleware::layer::Either, RpcModule};
 use reth_chain_state::CanonStateSubscriptions;
-use reth_chainspec::{ChainSpecProvider, EthereumHardforks};
+use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks, Hardforks};
 use reth_node_api::{
-    AddOnsContext, BlockTy, EngineTypes, EngineValidator, FullNodeComponents, FullNodeTypes,
-    NodeAddOns, NodeTypes, PayloadTypes, ReceiptTy,
+    AddOnsContext, BlockTy, EngineApiValidator, EngineTypes, FullNodeComponents, FullNodeTypes,
+    NodeAddOns, NodeTypes, PayloadTypes, PayloadValidator, PrimitivesTy, ReceiptTy, TreeConfig,
 };
 use reth_node_core::{
     node_config::NodeConfig,
@@ -925,7 +926,7 @@ pub struct EthApiCtx<'a, N: FullNodeTypes> {
     /// Eth API configuration
     pub config: EthConfig,
     /// Cache for eth state
-    pub cache: EthStateCache<BlockTy<N::Types>, ReceiptTy<N::Types>>,
+    pub cache: EthStateCache<PrimitivesTy<N::Types>>,
 }
 
 /// A `EthApi` that knows how to build `eth` namespace API from [`FullNodeComponents`].

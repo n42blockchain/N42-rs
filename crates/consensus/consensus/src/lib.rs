@@ -513,6 +513,19 @@ pub enum ConsensusError {
     NoSignerSet,
     #[error("apos error detail {detail}")]
     AposErrorDetail { detail: String },
+    /// Error when a transaction's gas limit exceeds the maximum allowed.
+    #[error("transaction gas limit too high: tx_hash={}, gas_limit={}, max_allowed={}", .0.tx_hash, .0.gas_limit, .0.max_allowed)]
+    TransactionGasLimitTooHigh(Box<TxGasLimitTooHighErr>),
+
+    /// Error when the block is too large.
+    #[error("block is too large: rlp_length={rlp_length}, max_rlp_length={max_rlp_length}")]
+    BlockTooLarge {
+        /// The actual RLP length of the block.
+        rlp_length: usize,
+        /// The maximum allowed RLP length.
+        max_rlp_length: usize,
+    },
+
     /// Other, likely an injected L2 error.
     #[error("{0}")]
     Other(String),
@@ -535,3 +548,20 @@ impl From<InvalidTransactionError> for ConsensusError {
 #[derive(thiserror::Error, Debug)]
 #[error("Consensus error: {0}, Invalid header: {1:?}")]
 pub struct HeaderConsensusError<H>(pub ConsensusError, pub SealedHeader<H>);
+
+/// Error when a transaction's gas limit exceeds the maximum allowed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxGasLimitTooHighErr {
+    /// Hash of the transaction that violates the rule
+    pub tx_hash: B256,
+    /// The gas limit of the transaction
+    pub gas_limit: u64,
+    /// The maximum allowed gas limit
+    pub max_allowed: u64,
+}
+
+impl From<TxGasLimitTooHighErr> for ConsensusError {
+    fn from(value: TxGasLimitTooHighErr) -> Self {
+        Self::TransactionGasLimitTooHigh(Box::new(value))
+    }
+}

@@ -23,6 +23,8 @@ pub use alloy_consensus::crypto::RecoveryError;
 pub trait FullSignedTx: SignedTransaction + MaybeCompact + MaybeSerdeBincodeCompat {}
 impl<T> FullSignedTx for T where T: SignedTransaction + MaybeCompact + MaybeSerdeBincodeCompat {}
 
+use alloy_consensus::transaction::TxHashRef;
+
 /// A signed transaction.
 #[auto_impl::auto_impl(&, Arc)]
 pub trait SignedTransaction:
@@ -42,10 +44,8 @@ pub trait SignedTransaction:
     + MaybeSerde
     + InMemorySize
     + SignerRecoverable
+    + TxHashRef
 {
-    /// Returns reference to transaction hash.
-    fn tx_hash(&self) -> &TxHash;
-
     /// Returns whether this transaction type can be __broadcasted__ as full transaction over the
     /// network.
     ///
@@ -135,18 +135,8 @@ pub trait SignedTransaction:
 impl<T> SignedTransaction for EthereumTxEnvelope<T>
 where
     T: RlpEcdsaEncodableTx + SignableTransaction<Signature> + Unpin,
-    Self: Clone + PartialEq + Eq + Decodable + Decodable2718 + MaybeSerde + InMemorySize,
+    Self: Clone + PartialEq + Eq + Decodable + Decodable2718 + MaybeSerde + InMemorySize + TxHashRef,
 {
-    fn tx_hash(&self) -> &TxHash {
-        match self {
-            Self::Legacy(tx) => tx.hash(),
-            Self::Eip2930(tx) => tx.hash(),
-            Self::Eip1559(tx) => tx.hash(),
-            Self::Eip7702(tx) => tx.hash(),
-            Self::Eip4844(tx) => tx.hash(),
-        }
-    }
-
     fn recover_signer_unchecked_with_buf(
         &self,
         buf: &mut Vec<u8>,

@@ -34,14 +34,13 @@ use reth_stages_types::{StageCheckpoint, StageId};
 use reth_storage_api::{
     BlockBodyIndicesProvider, BytecodeReader, DBProvider, DatabaseProviderFactory,
     HashedPostStateProvider, NodePrimitivesProvider, StageCheckpointReader,
-    StateCommitmentProvider, StateProofProvider, StorageRootProvider,
+    StateProofProvider, StorageRootProvider,
 };
 use reth_storage_errors::provider::{ConsistentViewError, ProviderError, ProviderResult};
 use reth_trie::{
     updates::TrieUpdates, AccountProof, HashedPostState, HashedStorage, MultiProof,
     MultiProofTargets, StorageMultiProof, StorageProof, TrieInput,
 };
-use reth_trie_db::MerklePatriciaTrie;
 use std::{
     collections::BTreeMap,
     fmt::Debug,
@@ -237,17 +236,8 @@ pub struct MockNode;
 impl NodeTypes for MockNode {
     type Primitives = EthPrimitives;
     type ChainSpec = reth_chainspec::ChainSpec;
-    type StateCommitment = MerklePatriciaTrie;
     type Storage = EthStorage;
     type Payload = EthEngineTypes;
-}
-
-impl<T, ChainSpec> StateCommitmentProvider for MockEthProvider<T, ChainSpec>
-where
-    T: NodePrimitives,
-    ChainSpec: EthChainSpec + Send + Sync + 'static,
-{
-    type StateCommitment = <MockNode as NodeTypes>::StateCommitment;
 }
 
 impl<T: NodePrimitives, ChainSpec: EthChainSpec + Clone + 'static> DatabaseProviderFactory
@@ -709,7 +699,7 @@ impl<ChainSpec: EthChainSpec + Send + Sync + 'static> BlockReader
 
     fn pending_block_and_receipts(
         &self,
-    ) -> ProviderResult<Option<(SealedBlock<Self::Block>, Vec<Receipt>)>> {
+    ) -> ProviderResult<Option<(RecoveredBlock<Self::Block>, Vec<Receipt>)>> {
         Ok(None)
     }
 

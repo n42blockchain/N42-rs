@@ -18,7 +18,9 @@ use clap::{
 };
 use rand::Rng;
 use reth_cli_util::parse_ether_value;
+use reth_rpc_eth_types::builder::config::PendingBlockKind;
 use reth_rpc_server_types::{constants, RethRpcModule, RpcModuleSelection};
+use url::Url;
 
 use crate::args::{
     types::{MaxU32, ZeroAsNoneU64},
@@ -96,6 +98,12 @@ pub struct RpcServerArgs {
     /// Filename for IPC socket/pipe within the datadir
     #[arg(long, default_value_t = constants::DEFAULT_IPC_ENDPOINT.to_string())]
     pub ipcpath: String,
+
+    /// Set the permissions for the IPC socket file, in octal format.
+    ///
+    /// If not specified, the permissions will be set by the system's umask.
+    #[arg(long = "ipc.permissions")]
+    pub ipc_socket_permissions: Option<String>,
 
     /// Auth server address to listen on
     #[arg(long = "authrpc.addr", default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST))]
@@ -218,6 +226,17 @@ pub struct RpcServerArgs {
     /// Maximum number of concurrent getproof requests.
     #[arg(long = "rpc.proof-permits", alias = "rpc-proof-permits", value_name = "COUNT", default_value_t = constants::DEFAULT_PROOF_PERMITS)]
     pub rpc_proof_permits: usize,
+
+    /// Configures the pending block behavior for RPC responses.
+    ///
+    /// Options: full (include all transactions), empty (header only), none (disable pending
+    /// blocks).
+    #[arg(long = "rpc.pending-block", default_value = "full", value_name = "KIND")]
+    pub rpc_pending_block: PendingBlockKind,
+
+    /// Endpoint to forward transactions to.
+    #[arg(long = "rpc.forwarder", alias = "rpc-forwarder", value_name = "FORWARDER")]
+    pub rpc_forwarder: Option<Url>,
 
     /// Path to file containing disallowed addresses, json-encoded list of strings. Block
     /// validation API will reject blocks containing transactions from these addresses.
@@ -346,6 +365,7 @@ impl Default for RpcServerArgs {
             ws_api: None,
             ipcdisable: false,
             ipcpath: constants::DEFAULT_IPC_ENDPOINT.to_string(),
+            ipc_socket_permissions: None,
             auth_addr: Ipv4Addr::LOCALHOST.into(),
             auth_port: constants::DEFAULT_AUTH_PORT,
             auth_jwtsecret: None,
@@ -367,6 +387,8 @@ impl Default for RpcServerArgs {
             gas_price_oracle: GasPriceOracleArgs::default(),
             rpc_state_cache: RpcStateCacheArgs::default(),
             rpc_proof_permits: constants::DEFAULT_PROOF_PERMITS,
+            rpc_pending_block: PendingBlockKind::Full,
+            rpc_forwarder: None,
             builder_disallow: Default::default(),
         }
     }

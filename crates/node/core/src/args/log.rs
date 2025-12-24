@@ -53,6 +53,10 @@ pub struct LogArgs {
     )]
     pub log_file_directory: PlatformPath<LogsDir>,
 
+    /// The prefix name of the log files.
+    #[arg(long = "log.file.name", value_name = "NAME", global = true, default_value = "reth.log")]
+    pub log_file_name: String,
+
     /// The maximum size (in MB) of one log file.
     #[arg(
         long = "log.file.max-size",
@@ -114,6 +118,7 @@ impl LogArgs {
     fn file_info(&self) -> FileInfo {
         FileInfo::new(
             self.log_file_directory.clone().into(),
+            self.log_file_name.clone(),
             self.log_file_max_size * MB_TO_BYTES,
             self.log_file_max_files,
         )

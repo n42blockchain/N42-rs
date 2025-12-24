@@ -97,13 +97,14 @@ pub use alloy_consensus::{
 pub use transaction::{
     execute::FillTxEnv,
     signed::{FullSignedTx, SignedTransaction},
-    FullTransaction, SignerRecoverable, Transaction,
+    FullTransaction, SignerRecoverable, Transaction, TxHashRef,
 };
 
 pub mod block;
 pub use block::{
     body::{BlockBody, FullBlockBody},
     header::{AlloyBlockHeader, BlockHeader, FullBlockHeader},
+    recovered::IndexedTx,
     Block, FullBlock, RecoveredBlock, SealedBlock,
 };
 

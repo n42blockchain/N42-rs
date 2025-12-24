@@ -62,6 +62,9 @@ futures-util.workspace = true
 reth-metrics = { workspace = true }
 metrics = { workspace = true }
 
+# http
+reqwest.workspace = true
+
 # misc
 hex.workspace = true
 sled.workspace = true

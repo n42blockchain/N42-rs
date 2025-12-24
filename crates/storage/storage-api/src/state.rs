@@ -32,6 +32,20 @@ pub trait StateReader: Send + Sync {
 /// Type alias of boxed [`StateProvider`].
 pub type StateProviderBox = Box<dyn StateProvider>;
 
+// Manual Debug implementation for dyn StateProvider to satisfy revm's Database trait bound
+impl core::fmt::Debug for dyn StateProvider {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StateProvider").finish_non_exhaustive()
+    }
+}
+
+// Debug implementation for dyn StateProvider + Sync + Send to satisfy revm's Database trait bound
+impl core::fmt::Debug for dyn StateProvider + Sync + Send {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StateProvider").finish_non_exhaustive()
+    }
+}
+
 /// An abstraction for a type that provides state data.
 #[auto_impl(&, Arc, Box)]
 pub trait StateProvider:
@@ -100,15 +114,6 @@ pub trait StateProvider:
 /// Minimal requirements to read a full account, for example, to validate its new transactions
 pub trait AccountInfoReader: AccountReader + BytecodeReader {}
 impl<T: AccountReader + BytecodeReader> AccountInfoReader for T {}
-
-/// Trait implemented for database providers that can provide the [`reth_trie_db::StateCommitment`]
-/// type.
-#[cfg(feature = "db-api")]
-pub trait StateCommitmentProvider: Send + Sync {
-    /// The [`reth_trie_db::StateCommitment`] type that can be used to perform state commitment
-    /// operations.
-    type StateCommitment: reth_trie_db::StateCommitment;
-}
 
 /// Trait that provides the hashed state from various sources.
 #[auto_impl(&, Arc, Box)]

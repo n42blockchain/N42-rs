@@ -103,8 +103,8 @@ where
             None
         };
         let rpc_provider = if self.migrate_from_rpc.is_some() {
-            let rpc_url = self.migrate_from_rpc.clone().unwrap().parse()?;
-            Some(ProviderBuilder::new().on_http(rpc_url))
+            let rpc_url: reqwest::Url = self.migrate_from_rpc.clone().unwrap().parse()?;
+            Some(ProviderBuilder::new().connect_http(rpc_url))
         } else {
             None
         };

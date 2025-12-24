@@ -3,14 +3,15 @@
 
 use super::Header;
 use crate::BlockHeader as BlockHeaderTrait;
+use alloc::boxed::Box;
 use alloy_primitives::{keccak256, Address, BlockNumber, Bloom, Bytes, B256, B64, U256};
 use alloy_rlp::{length_of_length, Encodable};
 use bytes::BufMut;
+use core::error::Error;
 use secp256k1::{
     ecdsa::{RecoverableSignature, RecoveryId},
     Error as SecpError, Message, PublicKey, SECP256K1,
 };
-use std::error::Error;
 
 /// recovery error
 #[derive(Debug)]
@@ -29,8 +30,8 @@ pub enum RecoveryError {
     EcdsaError(SecpError),
 }
 
-impl std::fmt::Display for RecoveryError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for RecoveryError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::MissingSignature => write!(f, "Missing signature"),
             Self::InvalidMessage => write!(f, "Invalid message"),
@@ -48,7 +49,7 @@ impl From<SecpError> for RecoveryError {
     }
 }
 
-impl std::error::Error for RecoveryError {}
+impl core::error::Error for RecoveryError {}
 ///  indicates the byte length required to carry a signature with recovery id.
 ///  Fixed number of extra-data suffix bytes reserved for signer seal
 pub const SIGNATURE_LENGTH: usize = 64 + 1;

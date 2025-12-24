@@ -64,8 +64,15 @@ impl<T: StateProvider> EvmStateProvider for T {
 
 /// A [Database] and [`DatabaseRef`] implementation that uses [`EvmStateProvider`] as the underlying
 /// data source.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct StateProviderDatabase<DB>(pub DB);
+
+// Manual Debug implementation that doesn't require DB: Debug
+impl<DB> core::fmt::Debug for StateProviderDatabase<DB> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StateProviderDatabase").finish_non_exhaustive()
+    }
+}
 
 impl<DB> StateProviderDatabase<DB> {
     /// Create new State with generic `StateProvider`.

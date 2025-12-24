@@ -93,7 +93,7 @@ impl<'a, N: NodePrimitives> StaticFileJarProvider<'a, N> {
 impl<N: NodePrimitives<BlockHeader: Value>> HeaderProvider for StaticFileJarProvider<'_, N> {
     type Header = N::BlockHeader;
 
-    fn header(&self, block_hash: &BlockHash) -> ProviderResult<Option<Self::Header>> {
+    fn header(&self, block_hash: BlockHash) -> ProviderResult<Option<Self::Header>> {
         Ok(self
             .cursor()?
             .get_two::<HeaderWithHashMask<Self::Header>>(block_hash.into())?

@@ -161,7 +161,7 @@ impl ConfigureEvm for MockEvmConfig {
         self.inner.block_assembler()
     }
 
-    fn evm_env(&self, header: &Header) -> Result<EvmEnvFor<Self>, Self::Error> {
+    fn evm_env(&self, header: &Header) -> EvmEnvFor<Self> {
         self.inner.evm_env(header)
     }
 
@@ -176,7 +176,7 @@ impl ConfigureEvm for MockEvmConfig {
     fn context_for_block<'a>(
         &self,
         block: &'a SealedBlock<BlockTy<Self::Primitives>>,
-    ) -> Result<reth_evm::ExecutionCtxFor<'a, Self>, Self::Error> {
+    ) -> reth_evm::ExecutionCtxFor<'a, Self> {
         self.inner.context_for_block(block)
     }
 
@@ -184,7 +184,7 @@ impl ConfigureEvm for MockEvmConfig {
         &self,
         parent: &SealedHeader,
         attributes: Self::NextBlockEnvCtx,
-    ) -> Result<reth_evm::ExecutionCtxFor<'_, Self>, Self::Error> {
+    ) -> reth_evm::ExecutionCtxFor<'_, Self> {
         self.inner.context_for_next_block(parent, attributes)
     }
 }

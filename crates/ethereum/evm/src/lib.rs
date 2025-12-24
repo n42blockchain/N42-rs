@@ -132,6 +132,7 @@ where
                     + FromRecoveredTx<TransactionSigned>
                     + FromTxWithEncoded<TransactionSigned>,
             Spec = SpecId,
+            BlockEnv = BlockEnv,
             Precompiles = PrecompilesMap,
         > + Clone
         + Debug
@@ -154,13 +155,13 @@ where
         &self.block_assembler
     }
 
-    fn evm_env(&self, header: &Header) -> Result<EvmEnv, Self::Error> {
+    fn evm_env(&self, header: &Header) -> Result<EvmEnv<SpecId>, Self::Error> {
         let blob_params = self.chain_spec().blob_params_at_timestamp(header.timestamp);
         let spec = config::revm_spec(self.chain_spec(), header);
 
         // configure evm env based on parent block
         let mut cfg_env =
-            CfgEnv::new().with_chain_id(self.chain_spec().chain().id()).with_spec(spec);
+            CfgEnv::new_with_spec(spec).with_chain_id(self.chain_spec().chain().id());
 
         if let Some(blob_params) = &blob_params {
             cfg_env.set_max_blobs_per_tx(blob_params.max_blobs_per_tx);
@@ -190,7 +191,7 @@ where
             blob_excess_gas_and_price,
         };
 
-        Ok(EvmEnv { cfg_env, block_env })
+        Ok(EvmEnv::new(cfg_env, block_env))
     }
 
     fn next_evm_env(
@@ -209,7 +210,7 @@ where
 
         // configure evm env based on parent block
         let mut cfg =
-            CfgEnv::new().with_chain_id(self.chain_spec().chain().id()).with_spec(spec_id);
+            CfgEnv::new_with_spec(spec_id).with_chain_id(self.chain_spec().chain().id());
 
         if let Some(blob_params) = &blob_params {
             cfg.set_max_blobs_per_tx(blob_params.max_blobs_per_tx);
@@ -261,7 +262,7 @@ where
             blob_excess_gas_and_price,
         };
 
-        Ok((cfg, block_env).into())
+        Ok(EvmEnv::new(cfg, block_env))
     }
 
     fn context_for_block<'a>(&self, block: &'a SealedBlock<Block>) -> Result<EthBlockExecutionCtx<'a>, Self::Error> {

@@ -324,7 +324,7 @@ impl<C: Send + Sync, N: NodePrimitives> ReceiptProviderIdExt for NoopProvider<C,
 impl<C: Send + Sync, N: NodePrimitives> HeaderProvider for NoopProvider<C, N> {
     type Header = N::BlockHeader;
 
-    fn header(&self, _block_hash: &BlockHash) -> ProviderResult<Option<Self::Header>> {
+    fn header(&self, _block_hash: BlockHash) -> ProviderResult<Option<Self::Header>> {
         Ok(None)
     }
 

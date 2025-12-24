@@ -61,7 +61,7 @@ use reth_storage_api::{
 use reth_storage_errors::provider::{ProviderResult, RootMismatch};
 use reth_trie::{
     prefix_set::{PrefixSet, PrefixSetMut, TriePrefixSets},
-    updates::{StorageTrieUpdates, TrieUpdates},
+    updates::{StorageTrieUpdates, StorageTrieUpdatesSorted, TrieUpdates, TrieUpdatesSorted},
     HashedPostStateSorted, Nibbles, StateRoot, StoredNibbles,
 };
 use reth_trie_db::{DatabaseStateRoot, DatabaseStorageTrieCursor};
@@ -334,7 +334,7 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                 block_hash: parent_hash,
             })))
         }
-        self.write_trie_updates(&trie_updates)?;
+        self.write_trie_updates(trie_updates)?;
 
         Ok(())
     }
@@ -2264,8 +2264,8 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
 }
 
 impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> TrieWriter for DatabaseProvider<TX, N> {
-    /// Writes trie updates. Returns the number of entries modified.
-    fn write_trie_updates(&self, trie_updates: &TrieUpdates) -> ProviderResult<usize> {
+    /// Writes trie updates to the database with already sorted updates.
+    fn write_trie_updates_sorted(&self, trie_updates: &TrieUpdatesSorted) -> ProviderResult<usize> {
         if trie_updates.is_empty() {
             return Ok(0)
         }
@@ -2273,23 +2273,11 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> TrieWriter for DatabaseProvider
         // Track the number of inserted entries.
         let mut num_entries = 0;
 
-        // Merge updated and removed nodes. Updated nodes must take precedence.
-        let mut account_updates = trie_updates
-            .removed_nodes_ref()
-            .iter()
-            .filter_map(|n| {
-                (!trie_updates.account_nodes_ref().contains_key(n)).then_some((n, None))
-            })
-            .collect::<Vec<_>>();
-        account_updates.extend(
-            trie_updates.account_nodes_ref().iter().map(|(nibbles, node)| (nibbles, Some(node))),
-        );
-        // Sort trie node updates.
-        account_updates.sort_unstable_by(|a, b| a.0.cmp(b.0));
-
         let tx = self.tx_ref();
         let mut account_trie_cursor = tx.cursor_write::<tables::AccountsTrie>()?;
-        for (key, updated_node) in account_updates {
+
+        // Process sorted account nodes
+        for (key, updated_node) in trie_updates.account_nodes_ref() {
             let nibbles = StoredNibbles(*key);
             match updated_node {
                 Some(node) => {
@@ -2307,21 +2295,41 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> TrieWriter for DatabaseProvider
             }
         }
 
-        num_entries += self.write_storage_trie_updates_sorted(trie_updates.storage_tries_ref())?;
+        num_entries +=
+            self.write_storage_trie_updates_sorted(trie_updates.storage_tries_ref().iter())?;
 
         Ok(num_entries)
+    }
+
+    fn write_trie_changesets(
+        &self,
+        _block_number: BlockNumber,
+        _trie_updates: &TrieUpdatesSorted,
+        _updates_overlay: Option<&TrieUpdatesSorted>,
+    ) -> ProviderResult<usize> {
+        // TODO: Implement trie changesets writing
+        Ok(0)
+    }
+
+    fn clear_trie_changesets(&self) -> ProviderResult<()> {
+        // TODO: Implement clearing trie changesets
+        Ok(())
+    }
+
+    fn clear_trie_changesets_from(&self, _from: BlockNumber) -> ProviderResult<()> {
+        // TODO: Implement clearing trie changesets from block
+        Ok(())
     }
 }
 
 impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> StorageTrieWriter for DatabaseProvider<TX, N> {
-    /// Writes storage trie updates from the given storage trie map. First sorts the storage trie
-    /// updates by the hashed address, writing in sorted order.
-    fn write_storage_trie_updates(
+    /// Writes storage trie updates from the given storage trie map with already sorted updates.
+    fn write_storage_trie_updates_sorted<'a>(
         &self,
-        storage_tries: &B256Map<StorageTrieUpdates>,
+        storage_tries: impl Iterator<Item = (&'a B256, &'a StorageTrieUpdatesSorted)>,
     ) -> ProviderResult<usize> {
         let mut num_entries = 0;
-        let mut storage_tries = Vec::from_iter(storage_tries);
+        let mut storage_tries = storage_tries.collect::<Vec<_>>();
         storage_tries.sort_unstable_by(|a, b| a.0.cmp(b.0));
         let mut cursor = self.tx_ref().cursor_dup_write::<tables::StoragesTrie>()?;
         for (hashed_address, storage_trie_updates) in storage_tries {
@@ -2335,18 +2343,14 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> StorageTrieWriter for DatabaseP
         Ok(num_entries)
     }
 
-    fn write_individual_storage_trie_updates(
+    fn write_storage_trie_changesets<'a>(
         &self,
-        hashed_address: B256,
-        updates: &StorageTrieUpdates,
+        _block_number: BlockNumber,
+        _storage_tries: impl Iterator<Item = (&'a B256, &'a StorageTrieUpdatesSorted)>,
+        _updates_overlay: Option<&TrieUpdatesSorted>,
     ) -> ProviderResult<usize> {
-        if updates.is_empty() {
-            return Ok(0)
-        }
-
-        let cursor = self.tx_ref().cursor_dup_write::<tables::StoragesTrie>()?;
-        let mut trie_db_cursor = DatabaseStorageTrieCursor::new(cursor, hashed_address);
-        Ok(trie_db_cursor.write_storage_trie_updates_sorted(updates)?)
+        // TODO: Implement storage trie changesets writing
+        Ok(0)
     }
 }
 
@@ -2565,7 +2569,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> HashingWriter for DatabaseProvi
                     block_hash: end_block_hash,
                 })))
             }
-            self.write_trie_updates(&trie_updates)?;
+            self.write_trie_updates(trie_updates)?;
         }
         durations_recorder.record_relative(metrics::Action::InsertMerkleTree);
 
@@ -3044,7 +3048,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
 
         // insert hashes and intermediate merkle nodes
         self.write_hashed_state(&hashed_state)?;
-        self.write_trie_updates(&trie_updates)?;
+        self.write_trie_updates(trie_updates)?;
         durations_recorder.record_relative(metrics::Action::InsertHashes);
 
         self.update_history_indices(first_number..=last_block_number)?;

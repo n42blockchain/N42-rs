@@ -19,11 +19,11 @@ pub trait HeaderProvider: Send + Sync {
 
     /// Check if block is known
     fn is_known(&self, block_hash: &BlockHash) -> ProviderResult<bool> {
-        self.header(block_hash).map(|header| header.is_some())
+        self.header(*block_hash).map(|header| header.is_some())
     }
 
     /// Get header by block hash
-    fn header(&self, block_hash: &BlockHash) -> ProviderResult<Option<Self::Header>>;
+    fn header(&self, block_hash: BlockHash) -> ProviderResult<Option<Self::Header>>;
 
     /// Retrieves the header sealed by the given block hash.
     fn sealed_header_by_hash(
@@ -31,7 +31,7 @@ pub trait HeaderProvider: Send + Sync {
         block_hash: BlockHash,
     ) -> ProviderResult<Option<SealedHeader<Self::Header>>> {
         Ok(self
-            .header(&block_hash)?
+            .header(block_hash)?
             .map(|header| SealedHeader::new(header, block_hash)))
     }
 
@@ -44,7 +44,7 @@ pub trait HeaderProvider: Send + Sync {
         hash_or_num: BlockHashOrNumber,
     ) -> ProviderResult<Option<Self::Header>> {
         match hash_or_num {
-            BlockHashOrNumber::Hash(hash) => self.header(&hash),
+            BlockHashOrNumber::Hash(hash) => self.header(hash),
             BlockHashOrNumber::Number(num) => self.header_by_number(num),
         }
     }

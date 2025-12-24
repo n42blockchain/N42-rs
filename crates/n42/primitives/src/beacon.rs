@@ -1526,11 +1526,16 @@ pub fn apply_deposit(
 
         // Apply the deltas, erroring on overflow above but not on overflow below (saturating at 0
         // instead).
+        // bulk update of balances to reduce number of tree node updates
+        let mut balances_vec: Vec<_> = self.balances_store.iter().cloned().collect();
         for (i, delta) in deltas.into_iter().enumerate() {
             let combined_delta = delta.flatten()?;
-            increase_balance(self, i, combined_delta.rewards)?;
-            decrease_balance(self, i, combined_delta.penalties)?;
+            let balance = balances_vec.get_mut(i)
+            .ok_or(eyre::eyre!("BalancesOutOfBounds, {i}"))?;
+            increase_balance_directly(balance, combined_delta.rewards)?;
+            decrease_balance_directly(balance, combined_delta.penalties)?;
         }
+        self.balances_store = VecTree::from_vec(balances_vec)?;
 
         Ok(())
     }
@@ -1891,13 +1896,11 @@ pub fn increase_balance(
     Ok(state.balances_store.set(index, balance.saturating_add(delta))?)
 }
 
-/*
 /// Increase the balance of a validator, erroring upon overflow, as per the spec.
 pub fn increase_balance_directly(balance: &mut u64, delta: u64) -> eyre::Result<()> {
     balance.safe_add_assign(delta)?;
     Ok(())
 }
-*/
 
 pub fn decrease_balance(
     state: &mut BeaconState,
@@ -1909,12 +1912,10 @@ pub fn decrease_balance(
     Ok(state.balances_store.set(index, balance.saturating_sub(delta))?)
 }
 
-/*
 pub fn decrease_balance_directly(balance: &mut u64, delta: u64) -> eyre::Result<()> {
     *balance = balance.saturating_sub(delta);
     Ok(())
 }
-*/
 
 pub fn is_compounding_withdrawal_credential(
     withdrawal_credentials: B256,

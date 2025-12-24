@@ -61,6 +61,88 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
         })
     }
 
+    /// Creates a new VecTree from an existing Vec, building the Merkle tree.
+    pub fn from_vec(elements: Vec<T>) -> Result<Self, Error> {
+        let vec_len = elements.len() as u64;
+
+        // 1. Capacity Guard
+        if vec_len > N::to_u64() {
+            return Err(Error::VecLenTooLarge {
+                vec_len,
+                limit: N::to_u64(),
+            });
+        }
+
+        let height = tree_height(N::to_usize());
+        let mut kv = HashMap::new();
+
+        // 2. Recursive Builder
+        fn build_recursive<T: Value>(
+            elements: &[T],
+            height: usize,
+            kv: &mut HashMap<Hash256, Tree<T>>,
+        ) -> Hash256 {
+            // CASE A: The current branch is empty (Padding/Sparse)
+            if elements.is_empty() {
+                let root = zero_tree_root(height);
+
+                if height == 0 {
+                    // Special Handling for Height 0 (The Leaf Level)
+                    // We check for collision just like in `try_new`.
+                    let default_val = T::default();
+                    if default_val.tree_hash_root() == root {
+                        kv.insert(root, Tree::Leaf(default_val));
+                    } else {
+                        kv.insert(root, Tree::Zero(0));
+                    }
+                } else {
+                    // Internal nodes that are empty are stored as Zero subtrees
+                    kv.insert(root, Tree::Zero(height));
+                }
+                return root;
+            }
+
+            // CASE B: The branch has data and we've reached a Leaf
+            if height == 0 {
+                // Elements is guaranteed to have the value because CASE A was skipped
+                let leaf_val = elements[0].clone();
+                let root = leaf_val.tree_hash_root();
+                kv.insert(root, Tree::Leaf(leaf_val));
+                return root;
+            }
+
+            // CASE C: Internal Node with data (Split and Hash)
+            let capacity_at_height = 1usize << (height - 1);
+            let (left_slice, right_slice) = if elements.len() <= capacity_at_height {
+                (elements, &[][..])
+            } else {
+                elements.split_at(capacity_at_height)
+            };
+
+            let left = build_recursive(left_slice, height - 1, kv);
+            let right = build_recursive(right_slice, height - 1, kv);
+
+            // Compute parent hash: SHA256(left || right)
+            let mut hasher = Sha256::new();
+            hasher.update(left.as_slice());
+            hasher.update(right.as_slice());
+            let root = Hash256::from_slice(&hasher.finalize());
+
+            kv.insert(root, Tree::Node { left, right });
+            root
+        }
+
+        let root = build_recursive(&elements, height, &mut kv);
+
+        Ok(Self {
+            root,
+            kv,
+            vec_len,
+            height,
+            _phantom: PhantomData,
+        })
+    }
+
     /// Convenience wrapper for `diff_restore` with an empty memory map.
     pub fn restore<F>(
         root: Hash256,
@@ -1158,5 +1240,61 @@ mod tests {
         assert_eq!(restored.get(0), Some(&10));
         assert_eq!(restored.get(2), Some(&300));
         assert_eq!(restored.root, tree.root);
+    }
+
+    #[test]
+    fn test_from_vec_basic() {
+        // CASE: Standard initialization with data
+        let elements = vec![10u64, 20u64, 30u64];
+        let tree = VecTree::<u64, U8>::from_vec(elements).expect("Should create tree");
+
+        assert_eq!(tree.vec_len, 3);
+        assert_eq!(tree.height, 3); // log2(8)
+        assert!(tree.kv.contains_key(&tree.root));
+    }
+
+    #[test]
+    fn test_from_vec_full_capacity() {
+        // CASE: Filling exactly to N
+        let elements = vec![1u64; 8];
+        let tree = VecTree::<u64, U8>::from_vec(elements).expect("Should support full capacity");
+        assert_eq!(tree.vec_len, 8);
+    }
+
+    #[test]
+    fn test_from_vec_overflow() {
+        // CASE: Safety check for length > N
+        let elements = vec![1u64; 9];
+        let result = VecTree::<u64, U8>::from_vec(elements);
+        assert!(result.is_err(), "Should error when vec length exceeds typenum capacity");
+    }
+
+    #[test]
+    fn test_empty_vec_is_zero_root() {
+        // CASE: Empty vector must match precomputed zero_tree_root
+        let tree = VecTree::<u64, U8>::from_vec(vec![]).unwrap();
+        let expected_root = zero_tree_root(3); // Height of U8 is 3
+        assert_eq!(tree.root, expected_root, "Empty tree must have zero_tree_root(height)");
+    }
+
+    #[test]
+    fn test_sparse_optimization() {
+        // CASE: Only 1 element. Indices 4-7 should be a Zero(2) node
+        let elements = vec![99u64];
+        let tree = VecTree::<u64, U8>::from_vec(elements).unwrap();
+
+        let zero_h2 = zero_tree_root(2);
+        assert!(tree.kv.contains_key(&zero_h2), "Tree should utilize Zero(2) for the empty right half");
+    }
+
+    #[test]
+    fn test_ssz_default_collision() {
+        // CASE: SSZ Compatibility check
+        // If 0u64's hash matches zero_tree_root(0), it must be explicitly in the map
+        let elements = vec![0u64];
+        let tree = VecTree::<u64, U8>::from_vec(elements).unwrap();
+
+        let leaf_root = 0u64.tree_hash_root();
+        assert!(tree.kv.contains_key(&leaf_root), "Leaf(0) must exist in KV store for SSZ compatibility");
     }
 }

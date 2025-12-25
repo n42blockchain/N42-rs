@@ -970,17 +970,20 @@ where
 
 /// A type that knows how to build the engine validator.
 pub trait EngineValidatorBuilder<Node: FullNodeComponents>: Send + Sync + Clone {
-    /// The consensus implementation to build.
-    type Validator: EngineValidator<
+    /// The tree validator type that will be used by the consensus engine.
+    type EngineValidator: EngineValidator<
             <Node::Types as NodeTypes>::Payload,
             <Node::Types as NodeTypes>::Primitives,
         > + Clone;
 
-    /// Creates the engine validator.
-    fn build(
+    /// Builds the tree validator for the consensus engine.
+    ///
+    /// Returns a validator that handles block execution, state validation, and fork handling.
+    fn build_tree_validator(
         self,
         ctx: &AddOnsContext<'_, Node>,
-    ) -> impl Future<Output = eyre::Result<Self::Validator>> + Send;
+        tree_config: TreeConfig,
+    ) -> impl Future<Output = eyre::Result<Self::EngineValidator>> + Send;
 }
 
 impl<Node, F, Fut, Validator> EngineValidatorBuilder<Node> for F
@@ -992,16 +995,17 @@ where
         > + Clone
         + Unpin
         + 'static,
-    F: FnOnce(&AddOnsContext<'_, Node>) -> Fut + Send + Sync + Clone,
+    F: FnOnce(&AddOnsContext<'_, Node>, TreeConfig) -> Fut + Send + Sync + Clone,
     Fut: Future<Output = eyre::Result<Validator>> + Send,
 {
-    type Validator = Validator;
+    type EngineValidator = Validator;
 
-    fn build(
+    fn build_tree_validator(
         self,
         ctx: &AddOnsContext<'_, Node>,
-    ) -> impl Future<Output = eyre::Result<Self::Validator>> {
-        self(ctx)
+        tree_config: TreeConfig,
+    ) -> impl Future<Output = eyre::Result<Self::EngineValidator>> {
+        self(ctx, tree_config)
     }
 }
 
@@ -1049,14 +1053,14 @@ where
         N::Provider,
         <N::Types as NodeTypes>::Payload,
         N::Pool,
-        EV::Validator,
+        EV::EngineValidator,
         <N::Types as NodeTypes>::ChainSpec,
     >;
 
     async fn build_engine_api(self, ctx: &AddOnsContext<'_, N>) -> eyre::Result<Self::EngineApi> {
         let Self { engine_validator_builder } = self;
 
-        let engine_validator = engine_validator_builder.build(ctx).await?;
+        let engine_validator = engine_validator_builder.build_tree_validator(ctx, TreeConfig::default()).await?;
         let client = ClientVersionV1 {
             code: CLIENT_CODE,
             name: NAME_CLIENT.to_string(),

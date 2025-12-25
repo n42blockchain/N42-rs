@@ -219,18 +219,26 @@ where
             jwt_secret,
             engine_events: event_sender.clone(),
         };
-        let engine_payload_validator = add_ons.engine_validator_builder().build(&add_ons_ctx).await?;
+        let validator_builder = add_ons.engine_validator_builder();
 
+        // Build the engine validator with all required components
+        let engine_validator = validator_builder
+            .clone()
+            .build_tree_validator(&add_ons_ctx, engine_tree_config.clone())
+            .await?;
+
+        // Create the consensus engine stream with optional reorg
         let consensus_engine_stream = UnboundedReceiverStream::from(consensus_engine_rx)
             .maybe_skip_fcu(node_config.debug.skip_fcu)
             .maybe_skip_new_payload(node_config.debug.skip_new_payload)
             .maybe_reorg(
                 ctx.blockchain_db().clone(),
                 ctx.components().evm_config().clone(),
-                engine_payload_validator.clone(),
+                || validator_builder.clone().build_tree_validator(&add_ons_ctx, engine_tree_config.clone()),
                 node_config.debug.reorg_frequency,
                 node_config.debug.reorg_depth,
             )
+            .await?
             // Store messages _after_ skipping so that `replay-engine` command
             // would replay only the messages that were observed by the engine
             // during this run.
@@ -247,7 +255,7 @@ where
             ctx.blockchain_db().clone(),
             pruner,
             ctx.components().payload_builder_handle().clone(),
-            engine_payload_validator,
+            engine_validator,
             engine_tree_config,
             ctx.sync_metrics_tx(),
             ctx.components().evm_config().clone(),

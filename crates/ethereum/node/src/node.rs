@@ -15,7 +15,7 @@ use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
 use reth_evm::{ConfigureEvm, EvmFactory, EvmFactoryFor, NextBlockEnvAttributes};
 use reth_network::{primitives::BasicNetworkPrimitives, NetworkHandle, PeersInfo};
 use reth_node_api::{
-    AddOnsContext, FullNodeComponents, NodeAddOns, NodePrimitives, PrimitivesTy, TxTy,
+    AddOnsContext, FullNodeComponents, NodeAddOns, NodePrimitives, PrimitivesTy, TreeConfig, TxTy,
 };
 use reth_node_builder::{
     components::{
@@ -288,10 +288,10 @@ where
     EthApiError: FromEvmError<N::Evm>,
     EvmFactoryFor<N::Evm>: EvmFactory<Tx = TxEnv>,
 {
-    type Validator = EV::Validator;
+    type ValidatorBuilder = EV;
 
-    async fn engine_validator(&self, ctx: &AddOnsContext<'_, N>) -> eyre::Result<Self::Validator> {
-        self.inner.engine_validator(ctx).await
+    fn engine_validator_builder(&self) -> Self::ValidatorBuilder {
+        self.inner.engine_validator_builder()
     }
 }
 
@@ -479,9 +479,13 @@ where
     Node: FullNodeComponents<Types = Types>,
     ChainSpec: EthChainSpec + EthereumHardforks + Clone + 'static,
 {
-    type Validator = EthereumEngineValidator<ChainSpec>;
+    type EngineValidator = EthereumEngineValidator<ChainSpec>;
 
-    async fn build(self, ctx: &AddOnsContext<'_, Node>) -> eyre::Result<Self::Validator> {
+    async fn build_tree_validator(
+        self,
+        ctx: &AddOnsContext<'_, Node>,
+        _tree_config: TreeConfig,
+    ) -> eyre::Result<Self::EngineValidator> {
         Ok(EthereumEngineValidator::new(ctx.config.chain.clone()))
     }
 }

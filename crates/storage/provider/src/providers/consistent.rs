@@ -27,8 +27,9 @@ use reth_prune_types::{PruneCheckpoint, PruneSegment};
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_storage_api::{
     BlockBodyIndicesProvider, DatabaseProviderFactory, NodePrimitivesProvider, StateProvider,
-    StorageChangeSetReader, TryIntoHistoricalStateProvider,
+    StorageChangeSetReader, TrieReader, TryIntoHistoricalStateProvider,
 };
+use reth_trie::updates::TrieUpdatesSorted;
 use reth_storage_errors::provider::ProviderResult;
 use revm_database::states::PlainStorageRevert;
 use std::{
@@ -1453,6 +1454,19 @@ impl<N: ProviderNodeTypes> StateReader for ConsistentProvider<N> {
         } else {
             Self::get_state(self, block..=block)
         }
+    }
+}
+
+impl<N: ProviderNodeTypes> TrieReader for ConsistentProvider<N> {
+    fn trie_reverts(&self, from: BlockNumber) -> ProviderResult<TrieUpdatesSorted> {
+        self.storage_provider.trie_reverts(from)
+    }
+
+    fn get_block_trie_updates(
+        &self,
+        block_number: BlockNumber,
+    ) -> ProviderResult<TrieUpdatesSorted> {
+        self.storage_provider.get_block_trie_updates(block_number)
     }
 }
 

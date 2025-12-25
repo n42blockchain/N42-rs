@@ -640,7 +640,7 @@ reth-consensus = { path="crates/consensus/consensus"}
 reth-network = { path = "crates/net/network" }
 reth-network-api = { path = "crates/net/network-api" }
 reth-network-peers = { path = "crates/net/peers"}
-reth-rpc = { path = "crates/n42/reth-rpc" }
+# reth-rpc = { path = "crates/n42/reth-rpc" }  # Disabled: use upstream reth-rpc v1.9.3
 #reth-testing-utils={path="testing/testing-utils"}
 #reth-chain-state = { path = "crates/chain-state"}
 

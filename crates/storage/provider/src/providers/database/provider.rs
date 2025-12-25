@@ -16,7 +16,7 @@ use crate::{
     OriginalValuesKnown, ProviderError, PruneCheckpointReader, PruneCheckpointWriter, RevertsInit,
     StageCheckpointReader, StateProviderBox, StateWriter,
     StaticFileProviderFactory, StatsReader, StorageLocation, StorageReader, StorageTrieWriter,
-    TransactionVariant, TransactionsProvider, TransactionsProviderExt, TrieWriter,
+    TransactionVariant, TransactionsProvider, TransactionsProviderExt, TrieReader, TrieWriter,
 };
 use alloy_consensus::{
     transaction::{SignerRecoverable, TransactionMeta},
@@ -36,6 +36,7 @@ use reth_db_api::{
     database::Database,
     models::{
         sharded_key, storage_sharded_key::StorageShardedKey, AccountBeforeTx, BlockNumberAddress,
+        BlockNumberHashedAddress,
         ShardedKey, StoredBlockBodyIndices,
     },
     table::Table,
@@ -43,6 +44,7 @@ use reth_db_api::{
     transaction::{DbTx, DbTxMut},
     BlockNumberList, DatabaseError, PlainAccountState, PlainStorageState,
 };
+use reth_chain_state::ExecutedBlock;
 use reth_execution_types::{Chain, ExecutionOutcome};
 use reth_node_types::{BlockTy, BodyTy, HeaderTy, NodeTypes, ReceiptTy, TxTy};
 use reth_primitives_traits::{
@@ -62,9 +64,13 @@ use reth_storage_errors::provider::{ProviderResult, RootMismatch};
 use reth_trie::{
     prefix_set::{PrefixSet, PrefixSetMut, TriePrefixSets},
     updates::{StorageTrieUpdates, StorageTrieUpdatesSorted, TrieUpdates, TrieUpdatesSorted},
-    HashedPostStateSorted, Nibbles, StateRoot, StoredNibbles,
+    HashedPostStateSorted, Nibbles, StateRoot, StoredNibbles, StoredNibblesSubKey,
+    TrieChangeSetsEntry,
 };
-use reth_trie_db::{DatabaseStateRoot, DatabaseStorageTrieCursor};
+use reth_trie_db::{
+    DatabaseStateRoot, DatabaseStorageTrieCursor, DatabaseTrieCursorFactory,
+};
+use reth_trie::trie_cursor::{InMemoryTrieCursorFactory, TrieCursor, TrieCursorFactory};
 use revm_database::states::{
     PlainStateReverts, PlainStorageChangeset, PlainStorageRevert, StateChangeset,
 };
@@ -360,6 +366,101 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
                 .latest_writer(StaticFileSegment::Receipts)?
                 .prune_receipts(to_delete, last_block)?;
         }
+
+        Ok(())
+    }
+
+    /// Writes executed blocks and state to storage.
+    pub fn save_blocks(
+        &self,
+        blocks: Vec<ExecutedBlock<N::Primitives>>,
+    ) -> ProviderResult<()> {
+        if blocks.is_empty() {
+            debug!(target: "providers::db", "Attempted to write empty block range");
+            return Ok(())
+        }
+
+        // NOTE: checked non-empty above
+        let first_block = blocks.first().unwrap().recovered_block();
+
+        let last_block = blocks.last().unwrap().recovered_block();
+        let first_number = first_block.number();
+        let last_block_number = last_block.number();
+
+        debug!(target: "providers::db", block_count = %blocks.len(), "Writing blocks and execution data to storage");
+
+        // TODO: Do performant / batched writes for each type of object
+        // instead of a loop over all blocks,
+        // meaning:
+        //  * blocks
+        //  * state
+        //  * hashed state
+        //  * trie updates (cannot naively extend, need helper)
+        //  * indices (already done basically)
+        // Insert the blocks
+        for ExecutedBlock { recovered_block, execution_output, hashed_state, trie_updates } in
+            blocks
+        {
+            let block_number = recovered_block.number();
+            self.insert_block(Arc::unwrap_or_clone(recovered_block))?;
+
+            // Write state and changesets to the database.
+            // Must be written after blocks because of the receipt lookup.
+            self.write_state(&execution_output, OriginalValuesKnown::No)?;
+
+            // insert hashes and intermediate merkle nodes
+            self.write_hashed_state(&Arc::unwrap_or_clone(hashed_state).into_sorted())?;
+
+            // sort trie updates and insert changesets
+            let trie_updates_sorted = (*trie_updates).clone().into_sorted();
+            self.write_trie_changesets(block_number, &trie_updates_sorted, None)?;
+            self.write_trie_updates_sorted(&trie_updates_sorted)?;
+        }
+
+        // update history indices
+        self.update_history_indices(first_number..=last_block_number)?;
+
+        // Update pipeline progress
+        self.update_pipeline_stages(last_block_number, false)?;
+
+        debug!(target: "providers::db", range = ?first_number..=last_block_number, "Appended block data");
+
+        Ok(())
+    }
+
+    /// Unwinds trie state starting at and including the given block.
+    ///
+    /// This includes calculating the resulted state root and comparing it with the parent block
+    /// state root.
+    pub fn unwind_trie_state_from(&self, from: BlockNumber) -> ProviderResult<()> {
+        let changed_accounts = self
+            .tx
+            .cursor_read::<tables::AccountChangeSets>()?
+            .walk_range(from..)?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Unwind account hashes.
+        self.unwind_account_hashing(changed_accounts.iter())?;
+
+        // Unwind account history indices.
+        self.unwind_account_history_indices(changed_accounts.iter())?;
+
+        let storage_start = BlockNumberAddress((from, Address::ZERO));
+        let changed_storages = self
+            .tx
+            .cursor_read::<tables::StorageChangeSets>()?
+            .walk_range(storage_start..)?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Unwind storage hashes.
+        self.unwind_storage_hashing(changed_storages.iter().copied())?;
+
+        // Unwind storage history indices.
+        self.unwind_storage_history_indices(changed_storages.iter().copied())?;
+
+        // Unwind accounts/storages trie tables using the revert.
+        let trie_revert = self.trie_reverts(from)?;
+        self.write_trie_updates_sorted(&trie_revert)?;
 
         Ok(())
     }
@@ -2256,6 +2357,127 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
             start_block_number,
             Vec::new(),
         ))
+    }
+}
+
+impl<TX: DbTx + 'static, N: NodeTypes> TrieReader for DatabaseProvider<TX, N> {
+    fn trie_reverts(&self, from: BlockNumber) -> ProviderResult<TrieUpdatesSorted> {
+        let tx = self.tx_ref();
+
+        // Read account trie changes directly into a Vec - data is already sorted by nibbles
+        // within each block, and we want the oldest (first) version of each node sorted by path.
+        let mut account_nodes = Vec::new();
+        let mut seen_account_keys = HashSet::new();
+        let mut accounts_cursor = tx.cursor_dup_read::<tables::AccountsTrieChangeSets>()?;
+
+        for entry in accounts_cursor.walk_range(from..)? {
+            let (_, TrieChangeSetsEntry { nibbles, node }) = entry?;
+            // Only keep the first (oldest) version of each node
+            if seen_account_keys.insert(nibbles.0) {
+                account_nodes.push((nibbles.0, node));
+            }
+        }
+
+        account_nodes.sort_by_key(|(path, _)| *path);
+
+        // Read storage trie changes - data is sorted by (block, hashed_address, nibbles)
+        // Keep track of seen (address, nibbles) pairs to only keep the oldest version per address,
+        // sorted by path.
+        let mut storage_tries = B256Map::<Vec<_>>::default();
+        let mut seen_storage_keys = HashSet::new();
+        let mut storages_cursor = tx.cursor_dup_read::<tables::StoragesTrieChangeSets>()?;
+
+        // Create storage range starting from `from` block
+        let storage_range_start = BlockNumberHashedAddress((from, B256::ZERO));
+
+        for entry in storages_cursor.walk_range(storage_range_start..)? {
+            let (
+                BlockNumberHashedAddress((_, hashed_address)),
+                TrieChangeSetsEntry { nibbles, node },
+            ) = entry?;
+
+            // Only keep the first (oldest) version of each node for this address
+            if seen_storage_keys.insert((hashed_address, nibbles.0)) {
+                storage_tries.entry(hashed_address).or_default().push((nibbles.0, node));
+            }
+        }
+
+        // Convert to StorageTrieUpdatesSorted
+        let storage_tries = storage_tries
+            .into_iter()
+            .map(|(address, mut nodes)| {
+                nodes.sort_by_key(|(path, _)| *path);
+                (address, StorageTrieUpdatesSorted { storage_nodes: nodes, is_deleted: false })
+            })
+            .collect();
+
+        Ok(TrieUpdatesSorted::new(account_nodes, storage_tries))
+    }
+
+    fn get_block_trie_updates(
+        &self,
+        block_number: BlockNumber,
+    ) -> ProviderResult<TrieUpdatesSorted> {
+        let tx = self.tx_ref();
+
+        // Step 1: Get the trie reverts for the state after the target block
+        let reverts = self.trie_reverts(block_number + 1)?;
+
+        // Step 2: Create an InMemoryTrieCursorFactory with the reverts
+        // This gives us the trie state as it was after the target block was processed
+        let db_cursor_factory = DatabaseTrieCursorFactory::new(tx);
+        let cursor_factory = InMemoryTrieCursorFactory::new(db_cursor_factory, &reverts);
+
+        // Step 3: Collect all account trie nodes that changed in the target block
+        let mut account_nodes = Vec::new();
+
+        // Walk through all account trie changes for this block
+        let mut accounts_trie_cursor = tx.cursor_dup_read::<tables::AccountsTrieChangeSets>()?;
+        let mut account_cursor = cursor_factory.account_trie_cursor()?;
+
+        for entry in accounts_trie_cursor.walk_dup(Some(block_number), None)? {
+            let (_, TrieChangeSetsEntry { nibbles, .. }) = entry?;
+            // Look up the current value of this trie node using the overlay cursor
+            let node_value = account_cursor.seek_exact(nibbles.0)?.map(|(_, node)| node);
+            account_nodes.push((nibbles.0, node_value));
+        }
+
+        // Step 4: Collect all storage trie nodes that changed in the target block
+        let mut storage_tries = B256Map::default();
+        let mut storages_trie_cursor = tx.cursor_dup_read::<tables::StoragesTrieChangeSets>()?;
+        let storage_range_start = BlockNumberHashedAddress((block_number, B256::ZERO));
+        let storage_range_end = BlockNumberHashedAddress((block_number + 1, B256::ZERO));
+
+        let mut current_hashed_address = None;
+        let mut storage_cursor = None;
+
+        for entry in storages_trie_cursor.walk_range(storage_range_start..storage_range_end)? {
+            let (
+                BlockNumberHashedAddress((_, hashed_address)),
+                TrieChangeSetsEntry { nibbles, .. },
+            ) = entry?;
+
+            // Check if we need to create a new storage cursor for a different account
+            if current_hashed_address != Some(hashed_address) {
+                storage_cursor = Some(cursor_factory.storage_trie_cursor(hashed_address)?);
+                current_hashed_address = Some(hashed_address);
+            }
+
+            // Look up the current value of this storage trie node
+            let cursor =
+                storage_cursor.as_mut().expect("storage_cursor was just initialized above");
+            let node_value = cursor.seek_exact(nibbles.0)?.map(|(_, node)| node);
+            storage_tries
+                .entry(hashed_address)
+                .or_insert_with(|| StorageTrieUpdatesSorted {
+                    storage_nodes: Vec::new(),
+                    is_deleted: false,
+                })
+                .storage_nodes
+                .push((nibbles.0, node_value));
+        }
+
+        Ok(TrieUpdatesSorted::new(account_nodes, storage_tries))
     }
 }
 

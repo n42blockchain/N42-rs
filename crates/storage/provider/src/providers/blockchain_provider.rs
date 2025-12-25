@@ -37,8 +37,9 @@ use reth_prune_types::{PruneCheckpoint, PruneSegment};
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_storage_api::{
     BlockBodyIndicesProvider, DBProvider, NodePrimitivesProvider,
-    StorageChangeSetReader,
+    StorageChangeSetReader, TrieReader,
 };
+use reth_trie::updates::TrieUpdatesSorted;
 use reth_storage_errors::provider::ProviderResult;
 use reth_trie::HashedPostState;
 use revm_database::BundleState;
@@ -735,6 +736,19 @@ impl<N: ProviderNodeTypes> StateReader for BlockchainProvider<N> {
         block: BlockNumber,
     ) -> ProviderResult<Option<ExecutionOutcome<Self::Receipt>>> {
         StateReader::get_state(&self.consistent_provider()?, block)
+    }
+}
+
+impl<N: ProviderNodeTypes> TrieReader for BlockchainProvider<N> {
+    fn trie_reverts(&self, from: BlockNumber) -> ProviderResult<TrieUpdatesSorted> {
+        self.consistent_provider()?.trie_reverts(from)
+    }
+
+    fn get_block_trie_updates(
+        &self,
+        block_number: BlockNumber,
+    ) -> ProviderResult<TrieUpdatesSorted> {
+        self.consistent_provider()?.get_block_trie_updates(block_number)
     }
 }
 

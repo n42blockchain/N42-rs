@@ -183,7 +183,7 @@ where
             ctx.provider_factory().clone(),
             ctx.task_executor(),
             ctx.sync_metrics_tx(),
-            ctx.prune_config(),
+            Some(ctx.prune_config()),
             max_block,
             static_file_producer,
             ctx.components().evm_config().clone(),
@@ -203,7 +203,7 @@ where
         }
         let pruner = pruner_builder.build_with_provider_factory(ctx.provider_factory().clone());
         let pruner_events = pruner.events();
-        info!(target: "reth::cli", prune_config=?ctx.prune_config().unwrap_or_default(), "Pruner initialized");
+        info!(target: "reth::cli", prune_config=?ctx.prune_config(), "Pruner initialized");
 
         let event_sender = EventSender::default();
 
@@ -219,7 +219,7 @@ where
             jwt_secret,
             engine_events: event_sender.clone(),
         };
-        let engine_payload_validator = add_ons.engine_validator(&add_ons_ctx).await?;
+        let engine_payload_validator = add_ons.engine_validator_builder().build(&add_ons_ctx).await?;
 
         let consensus_engine_stream = UnboundedReceiverStream::from(consensus_engine_rx)
             .maybe_skip_fcu(node_config.debug.skip_fcu)

@@ -130,14 +130,14 @@ impl LaunchContext {
     where
         ChainSpec: EthChainSpec + reth_chainspec::EthereumHardforks,
     {
-        if reth_config.prune.is_none() {
-            if let Some(prune_config) = config.prune_config() {
-                reth_config.update_prune_config(prune_config);
+        if let Some(prune_config) = config.prune_config() {
+            if reth_config.prune != prune_config {
+                reth_config.set_prune_config(prune_config);
                 info!(target: "reth::cli", "Saving prune config to toml file");
                 reth_config.save(config_path.as_ref())?;
             }
-        } else if config.prune_config().is_none() {
-            warn!(target: "reth::cli", "Prune configs present in config file but --full not provided. Running as a Full node");
+        } else if !reth_config.prune.is_default() {
+            warn!(target: "reth::cli", "Pruning configuration is present in the config file, but no CLI arguments are provided. Using config from file.");
         }
         Ok(())
     }
@@ -348,7 +348,7 @@ impl<R, ChainSpec: EthChainSpec> LaunchContextWith<Attached<WithConfigs<ChainSpe
     /// Returns the configured [`PruneConfig`]
     ///
     /// Any configuration set in CLI will take precedence over those set in toml
-    pub fn prune_config(&self) -> Option<PruneConfig>
+    pub fn prune_config(&self) -> PruneConfig
     where
         ChainSpec: reth_chainspec::EthereumHardforks,
     {
@@ -359,7 +359,7 @@ impl<R, ChainSpec: EthChainSpec> LaunchContextWith<Attached<WithConfigs<ChainSpe
 
         // Otherwise, use the CLI configuration and merge with toml config.
         node_prune_config.merge(self.toml_config().prune.clone());
-        Some(node_prune_config)
+        node_prune_config
     }
 
     /// Returns the configured [`PruneModes`], returning the default if no config was available.
@@ -367,7 +367,7 @@ impl<R, ChainSpec: EthChainSpec> LaunchContextWith<Attached<WithConfigs<ChainSpe
     where
         ChainSpec: reth_chainspec::EthereumHardforks,
     {
-        self.prune_config().map(|config| config.segments).unwrap_or_default()
+        self.prune_config().segments
     }
 
     /// Returns an initialized [`PrunerBuilder`] based on the configured [`PruneConfig`]
@@ -375,9 +375,7 @@ impl<R, ChainSpec: EthChainSpec> LaunchContextWith<Attached<WithConfigs<ChainSpe
     where
         ChainSpec: reth_chainspec::EthereumHardforks,
     {
-        PrunerBuilder::new(self.prune_config().unwrap_or_default())
-            .delete_limit(self.chain_spec().prune_delete_limit())
-            .timeout(PrunerBuilder::DEFAULT_TIMEOUT)
+        PrunerBuilder::new(self.prune_config())
     }
 
     /// Loads the JWT secret for the engine API
@@ -421,8 +419,7 @@ where
         .with_prune_modes(self.prune_modes())
         .with_static_files_metrics();
 
-        let has_receipt_pruning =
-            self.toml_config().prune.as_ref().is_some_and(|a| a.has_receipts_pruning());
+        let has_receipt_pruning = self.prune_config().has_receipts_pruning();
 
         // Check for consistency between database and static files. If it fails, it unwinds to
         // the first block that's consistent between database and static files.

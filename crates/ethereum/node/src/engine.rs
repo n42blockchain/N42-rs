@@ -9,7 +9,7 @@ pub use alloy_rpc_types_engine::{
     ExecutionPayloadV1, PayloadAttributes as EthPayloadAttributes,
 };
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
-use reth_engine_primitives::{EngineValidator, PayloadValidator};
+use reth_engine_primitives::{EngineApiValidator, PayloadValidator};
 use reth_ethereum_payload_builder::EthereumExecutionPayloadValidator;
 use reth_ethereum_primitives::Block;
 use reth_node_api::PayloadTypes;
@@ -41,12 +41,12 @@ impl<ChainSpec> EthereumEngineValidator<ChainSpec> {
     }
 }
 
-impl<ChainSpec> PayloadValidator for EthereumEngineValidator<ChainSpec>
+impl<ChainSpec, Types> PayloadValidator<Types> for EthereumEngineValidator<ChainSpec>
 where
     ChainSpec: EthChainSpec + EthereumHardforks + 'static,
+    Types: PayloadTypes<ExecutionData = ExecutionData>,
 {
     type Block = Block;
-    type ExecutionData = ExecutionData;
 
     fn ensure_well_formed_payload(
         &self,
@@ -59,7 +59,7 @@ where
     }
 }
 
-impl<ChainSpec, Types> EngineValidator<Types> for EthereumEngineValidator<ChainSpec>
+impl<ChainSpec, Types> EngineApiValidator<Types> for EthereumEngineValidator<ChainSpec>
 where
     ChainSpec: EthChainSpec + EthereumHardforks + 'static,
     Types: PayloadTypes<PayloadAttributes = EthPayloadAttributes, ExecutionData = ExecutionData>,
@@ -67,7 +67,7 @@ where
     fn validate_version_specific_fields(
         &self,
         version: EngineApiMessageVersion,
-        payload_or_attrs: PayloadOrAttributes<'_, Self::ExecutionData, EthPayloadAttributes>,
+        payload_or_attrs: PayloadOrAttributes<'_, Types::ExecutionData, EthPayloadAttributes>,
     ) -> Result<(), EngineObjectValidationError> {
         payload_or_attrs
             .execution_requests()
@@ -85,7 +85,7 @@ where
         validate_version_specific_fields(
             self.chain_spec(),
             version,
-            PayloadOrAttributes::<Self::ExecutionData, EthPayloadAttributes>::PayloadAttributes(
+            PayloadOrAttributes::<Types::ExecutionData, EthPayloadAttributes>::PayloadAttributes(
                 attributes,
             ),
         )

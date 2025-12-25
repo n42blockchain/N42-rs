@@ -5,7 +5,8 @@
 
 use alloy_primitives::Address;
 use reth_chain_state::CanonStateSubscriptions;
-use reth_node_api::TxTy;
+use reth_chainspec::EthereumHardforks;
+use reth_node_api::{NodeTypes, TxTy};
 use reth_transaction_pool::{
     blobstore::DiskFileBlobStore, CoinbaseTipOrdering, PoolConfig, PoolTransaction, SubPoolLimit,
     TransactionPool, TransactionValidationTaskExecutor, TransactionValidator,
@@ -137,6 +138,7 @@ where
     V: TransactionValidator + Clone + 'static,
     V::Transaction:
         PoolTransaction<Consensus = TxTy<Node::Types>> + reth_transaction_pool::EthPoolTransaction,
+    <Node::Types as NodeTypes>::ChainSpec: EthereumHardforks,
 {
     /// Build the transaction pool and spawn its maintenance tasks.
     /// This method creates the blob store, builds the pool, and spawns maintenance tasks.
@@ -237,6 +239,7 @@ fn spawn_pool_maintenance_task<Node, Pool>(
 ) -> eyre::Result<()>
 where
     Node: FullNodeTypes,
+    <Node::Types as NodeTypes>::ChainSpec: EthereumHardforks,
     Pool: reth_transaction_pool::TransactionPoolExt + Clone + 'static,
     Pool::Transaction: PoolTransaction<Consensus = TxTy<Node::Types>>,
 {
@@ -269,6 +272,7 @@ fn spawn_maintenance_tasks<Node, Pool>(
 ) -> eyre::Result<()>
 where
     Node: FullNodeTypes,
+    <Node::Types as NodeTypes>::ChainSpec: EthereumHardforks,
     Pool: reth_transaction_pool::TransactionPoolExt + Clone + 'static,
     Pool::Transaction: PoolTransaction<Consensus = TxTy<Node::Types>>,
 {

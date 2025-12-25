@@ -262,13 +262,14 @@ where
         );
 
         if ctx.is_dev() {
+            let pool = ctx.components().pool().clone();
             ctx.task_executor().spawn_critical(
                 "local engine",
                 LocalMiner::new(
                     ctx.blockchain_db().clone(),
                     LocalPayloadAttributesBuilder::new(ctx.chain_spec()),
                     beacon_engine_handle.clone(),
-                    ctx.dev_mining_mode(ctx.components().pool()),
+                    ctx.dev_mining_mode(pool),
                     ctx.components().payload_builder_handle().clone(),
                 )
                 .run(),

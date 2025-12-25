@@ -974,7 +974,8 @@ pub trait EngineValidatorBuilder<Node: FullNodeComponents>: Send + Sync + Clone 
     type EngineValidator: EngineValidator<
             <Node::Types as NodeTypes>::Payload,
             <Node::Types as NodeTypes>::Primitives,
-        > + Clone;
+        > + EngineApiValidator<<Node::Types as NodeTypes>::Payload>
+        + Clone;
 
     /// Builds the tree validator for the consensus engine.
     ///
@@ -992,7 +993,8 @@ where
     Validator: EngineValidator<
             <Node::Types as NodeTypes>::Payload,
             <Node::Types as NodeTypes>::Primitives,
-        > + Clone
+        > + EngineApiValidator<<Node::Types as NodeTypes>::Payload>
+        + Clone
         + Unpin
         + 'static,
     F: FnOnce(&AddOnsContext<'_, Node>, TreeConfig) -> Fut + Send + Sync + Clone,

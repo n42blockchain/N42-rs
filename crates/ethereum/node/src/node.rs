@@ -3,6 +3,7 @@
 pub use crate::{payload::EthereumPayloadBuilder, EthereumEngineValidator};
 use crate::{EthEngineTypes, EthEvmConfig};
 use alloy_eips::{eip7840::BlobParams, merge::EPOCH_SLOTS};
+use alloy_network::Ethereum;
 use alloy_rpc_types_engine::ExecutionData;
 use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks, Hardforks};
 use reth_consensus::{ConsensusError, FullConsensus};
@@ -12,10 +13,13 @@ use reth_ethereum_engine_primitives::{
     EthBuiltPayload, EthPayloadAttributes, EthPayloadBuilderAttributes,
 };
 use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
-use reth_evm::{ConfigureEvm, EvmFactory, EvmFactoryFor, NextBlockEnvAttributes};
+use reth_evm::{
+    eth::spec::EthExecutorSpec, ConfigureEvm, EvmFactory, EvmFactoryFor, NextBlockEnvAttributes,
+};
 use reth_network::{primitives::BasicNetworkPrimitives, NetworkHandle, PeersInfo};
 use reth_node_api::{
-    AddOnsContext, FullNodeComponents, NodeAddOns, NodePrimitives, PrimitivesTy, TreeConfig, TxTy,
+    AddOnsContext, FullNodeComponents, HeaderTy, NodeAddOns, NodePrimitives, PrimitivesTy,
+    TreeConfig, TxTy,
 };
 use reth_node_builder::{
     components::{
@@ -31,9 +35,16 @@ use reth_node_builder::{
     PayloadTypes,
 };
 use reth_provider::{providers::ProviderFactoryBuilder, EthStorage};
-use reth_rpc::{eth::core::EthApiFor, ValidationApi};
+use reth_rpc::{
+    eth::core::{EthApiFor, EthRpcConverterFor},
+    ValidationApi,
+};
 use reth_rpc_api::{eth::FullEthApiServer, servers::BlockSubmissionValidationApiServer};
 use reth_rpc_builder::config::RethRpcServerConfig;
+use reth_rpc_eth_api::{
+    helpers::pending_block::BuildPendingEnv,
+    RpcConvert, RpcTypes, SignableTxRequest,
+};
 use reth_rpc_eth_types::{error::FromEvmError, EthApiError};
 use reth_rpc_server_types::RethRpcModule;
 use reth_tracing::tracing::{debug, info};
@@ -120,32 +131,36 @@ impl NodeTypes for EthereumNode {
 }
 
 /// Builds [`EthApi`](reth_rpc::EthApi) for Ethereum.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct EthereumEthApiBuilder;
 
 impl<N> EthApiBuilder<N> for EthereumEthApiBuilder
 where
-    N: FullNodeComponents,
-    EthApiFor<N>: FullEthApiServer<Provider = N::Provider, Pool = N::Pool>,
+    N: FullNodeComponents<
+        Types: NodeTypes<ChainSpec: Hardforks + EthereumHardforks>,
+        Evm: ConfigureEvm<NextBlockEnvCtx: BuildPendingEnv<HeaderTy<N::Types>>>,
+    >,
+    EthRpcConverterFor<N>: RpcConvert<
+        Primitives = PrimitivesTy<N::Types>,
+        Error = EthApiError,
+        Network = Ethereum,
+        Evm = N::Evm,
+    >,
+    EthApiError: FromEvmError<N::Evm>,
 {
     type EthApi = EthApiFor<N>;
 
     async fn build_eth_api(self, ctx: EthApiCtx<'_, N>) -> eyre::Result<Self::EthApi> {
-        let api = reth_rpc::EthApiBuilder::new(
-            ctx.components.provider().clone(),
-            ctx.components.pool().clone(),
-            ctx.components.network().clone(),
-            ctx.components.evm_config().clone(),
-        )
-        .eth_cache(ctx.cache)
-        .task_spawner(ctx.components.task_executor().clone())
-        .gas_cap(ctx.config.rpc_gas_cap.into())
-        .max_simulate_blocks(ctx.config.rpc_max_simulate_blocks)
-        .eth_proof_window(ctx.config.eth_proof_window)
-        .fee_history_cache_config(ctx.config.fee_history_cache)
-        .proof_permits(ctx.config.proof_permits)
-        .gas_oracle_config(ctx.config.gas_oracle)
-        .build();
+        let api = reth_rpc::EthApiBuilder::new_with_components(ctx.components.clone())
+            .eth_cache(ctx.cache)
+            .task_spawner(ctx.components.task_executor().clone())
+            .gas_cap(ctx.config.rpc_gas_cap.into())
+            .max_simulate_blocks(ctx.config.rpc_max_simulate_blocks)
+            .eth_proof_window(ctx.config.eth_proof_window)
+            .fee_history_cache_config(ctx.config.fee_history_cache)
+            .proof_permits(ctx.config.proof_permits)
+            .gas_oracle_config(ctx.config.gas_oracle)
+            .build();
         Ok(api)
     }
 }

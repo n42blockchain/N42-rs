@@ -9481,6 +9481,7 @@ dependencies = [
  "alloy-contract",
  "alloy-eips",
  "alloy-genesis",
+ "alloy-network",
  "alloy-primitives 1.4.1",
  "alloy-provider",
  "alloy-rpc-types-beacon",

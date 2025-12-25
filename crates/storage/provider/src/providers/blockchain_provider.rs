@@ -343,6 +343,10 @@ impl<N: ProviderNodeTypes> BlockReader for BlockchainProvider<N> {
     ) -> ProviderResult<Vec<RecoveredBlock<Self::Block>>> {
         self.consistent_provider()?.recovered_block_range(range)
     }
+
+    fn block_by_transaction_id(&self, id: TxNumber) -> ProviderResult<Option<BlockNumber>> {
+        self.consistent_provider()?.block_by_transaction_id(id)
+    }
 }
 
 impl<N: ProviderNodeTypes> TransactionsProvider for BlockchainProvider<N> {

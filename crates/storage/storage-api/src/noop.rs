@@ -218,6 +218,10 @@ impl<C: Send + Sync, N: NodePrimitives> BlockReader for NoopProvider<C, N> {
     ) -> ProviderResult<Vec<RecoveredBlock<Self::Block>>> {
         Ok(Vec::new())
     }
+
+    fn block_by_transaction_id(&self, _id: TxNumber) -> ProviderResult<Option<BlockNumber>> {
+        Ok(None)
+    }
 }
 
 impl<C: Send + Sync, N: NodePrimitives> TransactionsProvider for NoopProvider<C, N> {

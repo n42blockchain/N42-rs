@@ -172,9 +172,9 @@ where
             trie_updates: trie,
         } in blocks
         {
-            let block_hash = recovered_block.hash();
+            let _block_hash = recovered_block.hash();
             self.database()
-                .insert_block(Arc::unwrap_or_clone(recovered_block), StorageLocation::Both)?;
+                .insert_block(Arc::unwrap_or_clone(recovered_block))?;
 
             // Write state and changesets to the database.
             // Must be written after blocks because of the receipt lookup.
@@ -209,7 +209,7 @@ where
         // IMPORTANT: we use `block_number+1` to make sure we remove only what is ABOVE the block
         debug!(target: "provider::storage_writer", ?block_number, "Removing blocks from database above block_number");
         self.database()
-            .remove_block_and_execution_above(block_number, StorageLocation::Both)?;
+            .remove_block_and_execution_above(block_number)?;
 
         // Get highest static file block for the total block range
         let highest_static_file_block = self

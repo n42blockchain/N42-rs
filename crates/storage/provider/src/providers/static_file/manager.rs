@@ -1055,6 +1055,67 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         }
     }
 
+    /// Gets the lowest static file's range if it exists for a static file segment.
+    pub fn get_lowest_range(&self, segment: StaticFileSegment) -> Option<SegmentRangeInclusive> {
+        // Get the lowest block for the segment
+        let min_block = *self.static_files_min_block.read().get(&segment)?;
+        // Calculate the range start from the end block
+        let start = min_block.saturating_sub(self.blocks_per_file - 1);
+        Some(SegmentRangeInclusive::new(start, min_block))
+    }
+
+    /// Delete all static files for the given segment below the given block number.
+    ///
+    /// Returns the headers of all deleted jars.
+    pub fn delete_segment_below_block(
+        &self,
+        segment: StaticFileSegment,
+        block: BlockNumber,
+    ) -> ProviderResult<Vec<SegmentHeader>> {
+        // Nothing to delete if block is 0.
+        if block == 0 {
+            return Ok(Vec::new())
+        }
+
+        let highest_block = self.get_highest_static_file_block(segment);
+        let mut deleted_headers = Vec::new();
+
+        loop {
+            let Some(block_height) = self.get_lowest_static_file_block(segment) else {
+                return Ok(deleted_headers)
+            };
+
+            // Stop if we've reached the target block or the highest static file
+            if block_height >= block || Some(block_height) == highest_block {
+                return Ok(deleted_headers)
+            }
+
+            debug!(
+                target: "provider::static_file",
+                ?segment,
+                ?block_height,
+                "Deleting static file below block"
+            );
+
+            // Get the segment header before deleting
+            let fixed_block_range = self.find_fixed_range(block_height);
+            let file = self.path.join(segment.filename(&fixed_block_range));
+            let header = NippyJar::<SegmentHeader>::load(&file)
+                .map(|jar| jar.user_header().clone())
+                .ok();
+
+            // now we need to wipe the static file, this will take care of updating the index and
+            // advance the lowest tracked block height for the segment.
+            self.delete_jar(segment, block_height).inspect_err(|err| {
+                warn!( target: "provider::static_file", ?segment, %block_height, ?err, "Failed to delete static file below block")
+            })?;
+
+            if let Some(h) = header {
+                deleted_headers.push(h);
+            }
+        }
+    }
+
     /// Iterates through segment `static_files` in reverse order, executing a function until it
     /// returns some object. Useful for finding objects by [`TxHash`] or [`BlockHash`].
     pub fn find_static_file<T>(
@@ -1780,6 +1841,10 @@ impl<N: NodePrimitives<SignedTx: Value, Receipt: Value, BlockHeader: Value>> Blo
         &self,
         _range: RangeInclusive<BlockNumber>,
     ) -> ProviderResult<Vec<RecoveredBlock<Self::Block>>> {
+        Err(ProviderError::UnsupportedProvider)
+    }
+
+    fn block_by_transaction_id(&self, _id: TxNumber) -> ProviderResult<Option<BlockNumber>> {
         Err(ProviderError::UnsupportedProvider)
     }
 }

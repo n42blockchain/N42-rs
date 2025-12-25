@@ -18,8 +18,8 @@ pub trait HeaderProvider: Send + Sync {
     type Header: BlockHeader;
 
     /// Check if block is known
-    fn is_known(&self, block_hash: &BlockHash) -> ProviderResult<bool> {
-        self.header(*block_hash).map(|header| header.is_some())
+    fn is_known(&self, block_hash: BlockHash) -> ProviderResult<bool> {
+        self.header(block_hash).map(|header| header.is_some())
     }
 
     /// Get header by block hash

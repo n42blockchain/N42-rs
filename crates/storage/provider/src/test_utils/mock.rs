@@ -745,6 +745,10 @@ impl<ChainSpec: EthChainSpec + Send + Sync + 'static> BlockReader
     ) -> ProviderResult<Vec<RecoveredBlock<Self::Block>>> {
         Ok(vec![])
     }
+
+    fn block_by_transaction_id(&self, _id: TxNumber) -> ProviderResult<Option<BlockNumber>> {
+        Ok(None)
+    }
 }
 
 impl<ChainSpec> BlockReaderIdExt

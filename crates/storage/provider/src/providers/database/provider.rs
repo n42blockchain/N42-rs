@@ -441,7 +441,7 @@ impl<
 
         writer.append_header_with_td(block.header(), ttd, &block.hash())?;
 
-        self.insert_block(block, StorageLocation::Database)
+        self.insert_block(block)
     }
 }
 
@@ -1296,6 +1296,14 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> BlockReader for DatabaseProvid
                     .map_err(|_| ProviderError::SenderRecoveryError)
             },
         )
+    }
+
+    fn block_by_transaction_id(&self, id: TxNumber) -> ProviderResult<Option<BlockNumber>> {
+        Ok(self
+            .tx
+            .cursor_read::<tables::TransactionBlocks>()?
+            .seek(id)
+            .map(|b| b.map(|(_, bn)| bn))?)
     }
 }
 
@@ -2707,7 +2715,6 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockExecu
     fn take_block_and_execution_above(
         &self,
         block: BlockNumber,
-        remove_from: StorageLocation,
     ) -> ProviderResult<Chain<Self::Primitives>> {
         let range = block + 1..=self.last_block_number()?;
 
@@ -2720,7 +2727,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockExecu
 
         // remove block bodies it is needed for both get block range and get block execution results
         // that is why it is deleted afterwards.
-        self.remove_blocks_above(block, remove_from)?;
+        self.remove_blocks_above(block)?;
 
         // Update pipeline progress
         self.update_pipeline_stages(block, true)?;
@@ -2728,11 +2735,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockExecu
         Ok(Chain::new(blocks, execution_state, None))
     }
 
-    fn remove_block_and_execution_above(
-        &self,
-        block: BlockNumber,
-        remove_from: StorageLocation,
-    ) -> ProviderResult<()> {
+    fn remove_block_and_execution_above(&self, block: BlockNumber) -> ProviderResult<()> {
         let range = block + 1..=self.last_block_number()?;
 
         self.unwind_trie_state_range(range)?;
@@ -2742,7 +2745,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockExecu
 
         // remove block bodies it is needed for both get block range and get block execution results
         // that is why it is deleted afterwards.
-        self.remove_blocks_above(block, remove_from)?;
+        self.remove_blocks_above(block)?;
 
         // Update pipeline progress
         self.update_pipeline_stages(block, true)?;
@@ -2780,39 +2783,14 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
     fn insert_block(
         &self,
         block: RecoveredBlock<Self::Block>,
-        write_to: StorageLocation,
     ) -> ProviderResult<StoredBlockBodyIndices> {
         let block_number = block.number();
 
         let mut durations_recorder = metrics::DurationsRecorder::default();
 
-        // total difficulty
-        let ttd = if block_number == 0 {
-            block.header().difficulty()
-        } else {
-            let parent_block_number = block_number - 1;
-            let parent_ttd = self.header_td_by_number(parent_block_number)?.unwrap_or_default();
-            durations_recorder.record_relative(metrics::Action::GetParentTD);
-            parent_ttd + block.header().difficulty()
-        };
-
-        if write_to.database() {
-            self.tx.put::<tables::CanonicalHeaders>(block_number, block.hash())?;
-            durations_recorder.record_relative(metrics::Action::InsertCanonicalHeaders);
-
-            // Put header with canonical hashes.
-            self.tx.put::<tables::Headers<HeaderTy<N>>>(block_number, block.header().clone())?;
-            durations_recorder.record_relative(metrics::Action::InsertHeaders);
-
-            self.tx.put::<tables::HeaderTerminalDifficulties>(block_number, ttd.into())?;
-            durations_recorder.record_relative(metrics::Action::InsertHeaderTerminalDifficulties);
-        }
-
-        if write_to.static_files() {
-            let mut writer =
-                self.static_file_provider.get_writer(block_number, StaticFileSegment::Headers)?;
-            writer.append_header_with_td(block.header(), ttd, &block.hash())?;
-        }
+        self.static_file_provider
+            .get_writer(block_number, StaticFileSegment::Headers)?
+            .append_header(block.header(), &block.hash())?;
 
         self.tx.put::<tables::HeaderNumbers>(block.hash(), block_number)?;
         durations_recorder.record_relative(metrics::Action::InsertHeaderNumbers);
@@ -2842,7 +2820,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
             next_tx_num += 1;
         }
 
-        self.append_block_bodies(vec![(block_number, Some(block.into_body()))], write_to)?;
+        self.append_block_bodies(vec![(block_number, Some(block.into_body()))])?;
 
         debug!(
             target: "providers::db",
@@ -2857,35 +2835,22 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
     fn append_block_bodies(
         &self,
         bodies: Vec<(BlockNumber, Option<BodyTy<N>>)>,
-        write_to: StorageLocation,
     ) -> ProviderResult<()> {
         let Some(from_block) = bodies.first().map(|(block, _)| *block) else { return Ok(()) };
 
         // Initialize writer if we will be writing transactions to staticfiles
-        let mut tx_static_writer = write_to
-            .static_files()
-            .then(|| {
-                self.static_file_provider.get_writer(from_block, StaticFileSegment::Transactions)
-            })
-            .transpose()?;
+        let mut tx_writer =
+            self.static_file_provider.get_writer(from_block, StaticFileSegment::Transactions)?;
 
         let mut block_indices_cursor = self.tx.cursor_write::<tables::BlockBodyIndices>()?;
         let mut tx_block_cursor = self.tx.cursor_write::<tables::TransactionBlocks>()?;
-
-        // Initialize cursor if we will be writing transactions to database
-        let mut tx_cursor = write_to
-            .database()
-            .then(|| self.tx.cursor_write::<tables::Transactions<TxTy<N>>>())
-            .transpose()?;
 
         // Get id for the next tx_num or zero if there are no transactions.
         let mut next_tx_num = tx_block_cursor.last()?.map(|(id, _)| id + 1).unwrap_or_default();
 
         for (block_number, body) in &bodies {
             // Increment block on static file header.
-            if let Some(writer) = tx_static_writer.as_mut() {
-                writer.increment_block(*block_number)?;
-            }
+            tx_writer.increment_block(*block_number)?;
 
             let tx_count = body.as_ref().map(|b| b.transactions().len() as u64).unwrap_or_default();
             let block_indices = StoredBlockBodyIndices { first_tx_num: next_tx_num, tx_count };
@@ -2907,37 +2872,39 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
 
             // write transactions
             for transaction in body.transactions() {
-                if let Some(writer) = tx_static_writer.as_mut() {
-                    writer.append_transaction(next_tx_num, transaction)?;
-                }
-                if let Some(cursor) = tx_cursor.as_mut() {
-                    cursor.append(next_tx_num, transaction)?;
-                }
+                tx_writer.append_transaction(next_tx_num, transaction)?;
 
                 // Increment transaction id for each transaction.
                 next_tx_num += 1;
             }
         }
 
-        self.storage.writer().write_block_bodies(self, bodies, write_to)?;
+        self.storage.writer().write_block_bodies(self, bodies)?;
 
         Ok(())
     }
 
-    fn remove_blocks_above(
-        &self,
-        block: BlockNumber,
-        remove_from: StorageLocation,
-    ) -> ProviderResult<()> {
+    fn remove_blocks_above(&self, block: BlockNumber) -> ProviderResult<()> {
+        // Clean up HeaderNumbers for blocks being removed, we must clear all indexes from MDBX.
         for hash in self.canonical_hashes_range(block + 1, self.last_block_number()? + 1)? {
             self.tx.delete::<tables::HeaderNumbers>(hash, None)?;
         }
 
-        // Only prune canonical headers after we've removed the block hashes as we rely on data from
-        // this table in `canonical_hashes_range`.
-        self.remove::<tables::CanonicalHeaders>(block + 1..)?;
-        self.remove::<tables::Headers<HeaderTy<N>>>(block + 1..)?;
-        self.remove::<tables::HeaderTerminalDifficulties>(block + 1..)?;
+        // Get highest static file block for the total block range
+        let highest_static_file_block = self
+            .static_file_provider()
+            .get_highest_static_file_block(StaticFileSegment::Headers)
+            .expect("todo: error handling, headers should exist");
+
+        // IMPORTANT: we use `highest_static_file_block.saturating_sub(block_number)` to make sure
+        // we remove only what is ABOVE the block.
+        //
+        // i.e., if the highest static file block is 8, we want to remove above block 5 only, we
+        // will have three blocks to remove, which will be block 8, 7, and 6.
+        debug!(target: "providers::db", ?block, "Removing static file blocks above block_number");
+        self.static_file_provider()
+            .get_writer(block, StaticFileSegment::Headers)?
+            .prune_headers(highest_static_file_block.saturating_sub(block))?;
 
         // First transaction to be removed
         let unwind_tx_from = self
@@ -2963,17 +2930,13 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
 
         self.remove::<tables::TransactionSenders>(unwind_tx_from..)?;
 
-        self.remove_bodies_above(block, remove_from)?;
+        self.remove_bodies_above(block)?;
 
         Ok(())
     }
 
-    fn remove_bodies_above(
-        &self,
-        block: BlockNumber,
-        remove_from: StorageLocation,
-    ) -> ProviderResult<()> {
-        self.storage.writer().remove_block_bodies_above(self, block, remove_from)?;
+    fn remove_bodies_above(&self, block: BlockNumber) -> ProviderResult<()> {
+        self.storage.writer().remove_block_bodies_above(self, block)?;
 
         // First transaction to be removed
         let unwind_tx_from = self
@@ -2984,23 +2947,16 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
         self.remove::<tables::BlockBodyIndices>(block + 1..)?;
         self.remove::<tables::TransactionBlocks>(unwind_tx_from..)?;
 
-        if remove_from.database() {
-            self.remove::<tables::Transactions<TxTy<N>>>(unwind_tx_from..)?;
-        }
+        let static_file_tx_num =
+            self.static_file_provider.get_highest_static_file_tx(StaticFileSegment::Transactions);
 
-        if remove_from.static_files() {
-            let static_file_tx_num = self
-                .static_file_provider
-                .get_highest_static_file_tx(StaticFileSegment::Transactions);
+        let to_delete = static_file_tx_num
+            .map(|static_tx| (static_tx + 1).saturating_sub(unwind_tx_from))
+            .unwrap_or_default();
 
-            let to_delete = static_file_tx_num
-                .map(|static_tx| (static_tx + 1).saturating_sub(unwind_tx_from))
-                .unwrap_or_default();
-
-            self.static_file_provider
-                .latest_writer(StaticFileSegment::Transactions)?
-                .prune_transactions(to_delete, block)?;
-        }
+        self.static_file_provider
+            .latest_writer(StaticFileSegment::Transactions)?
+            .prune_transactions(to_delete, block)?;
 
         Ok(())
     }
@@ -3027,7 +2983,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
 
         // Insert the blocks
         for block in blocks {
-            self.insert_block(block, StorageLocation::Database)?;
+            self.insert_block(block)?;
             durations_recorder.record_relative(metrics::Action::InsertBlock);
         }
 

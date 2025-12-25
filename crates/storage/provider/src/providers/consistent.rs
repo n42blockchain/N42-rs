@@ -919,6 +919,10 @@ impl<N: ProviderNodeTypes> BlockReader for ConsistentProvider<N> {
             |_| true,
         )
     }
+
+    fn block_by_transaction_id(&self, id: TxNumber) -> ProviderResult<Option<BlockNumber>> {
+        self.storage_provider.block_by_transaction_id(id)
+    }
 }
 
 impl<N: ProviderNodeTypes> TransactionsProvider for ConsistentProvider<N> {

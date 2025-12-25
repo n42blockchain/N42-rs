@@ -414,6 +414,10 @@ impl<N: ProviderNodeTypes> BlockReader for ProviderFactory<N> {
     ) -> ProviderResult<Vec<RecoveredBlock<Self::Block>>> {
         self.provider()?.recovered_block_range(range)
     }
+
+    fn block_by_transaction_id(&self, id: TxNumber) -> ProviderResult<Option<BlockNumber>> {
+        self.provider()?.block_by_transaction_id(id)
+    }
 }
 
 impl<N: ProviderNodeTypes> TransactionsProvider for ProviderFactory<N> {

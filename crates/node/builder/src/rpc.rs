@@ -1131,39 +1131,26 @@ where
     }
 }
 
+// Note: For N42, we use a simplified implementation that delegates directly to
+// the PayloadValidatorBuilder. Full BasicEngineValidator support requires
+// ConfigureEngineEvm implementation which has API differences with upstream.
 impl<Node, PVB> EngineValidatorBuilder<Node> for BasicEngineValidatorBuilder<PVB>
 where
-    Node: FullNodeComponents<
-        Evm: ConfigureEngineEvm<
-            <<Node::Types as NodeTypes>::Payload as PayloadTypes>::ExecutionData,
-        >,
-    >,
+    Node: FullNodeComponents,
     PVB: PayloadValidatorBuilder<Node>,
-    PVB::Validator: reth_engine_primitives::PayloadValidator<
+    PVB::Validator: EngineValidator<
         <Node::Types as NodeTypes>::Payload,
-        Block = BlockTy<Node::Types>,
+        <Node::Types as NodeTypes>::Primitives,
     >,
 {
-    type EngineValidator = BasicEngineValidator<Node::Provider, Node::Evm, PVB::Validator>;
+    type EngineValidator = PVB::Validator;
 
     async fn build_tree_validator(
         self,
         ctx: &AddOnsContext<'_, Node>,
-        tree_config: TreeConfig,
+        _tree_config: TreeConfig,
     ) -> eyre::Result<Self::EngineValidator> {
-        use crate::launch::InvalidBlockHookExt;
-
-        let validator = self.payload_validator_builder.build(ctx).await?;
-        let data_dir = ctx.config.datadir.clone().resolve_datadir(ctx.config.chain.chain());
-        let invalid_block_hook = ctx.create_invalid_block_hook(&data_dir).await?;
-        Ok(BasicEngineValidator::new(
-            ctx.node.provider().clone(),
-            std::sync::Arc::new(ctx.node.consensus().clone()),
-            ctx.node.evm_config().clone(),
-            validator,
-            tree_config,
-            invalid_block_hook,
-        ))
+        self.payload_validator_builder.build(ctx).await
     }
 }
 

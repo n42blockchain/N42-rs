@@ -4,9 +4,11 @@ use std::ptr;
 
 use ethers::types::{TransactionRequest, U256};
 use eyre::Result;
+use n42_clique::UnverifiedBlock;
 use serde_json;
 
 use crate::blst_utils::generate_bls12_381_keypair;
+use crate::gen_block_verify_result;
 use crate::{deposit_exit::{create_deposit_unsigned_tx, create_get_exit_fee_unsigned_tx, create_exit_unsigned_tx}, run_client};
 
 // ---------------- Helpers ----------------
@@ -54,6 +56,52 @@ set_error(e); return -1; } };
     match res {
         Ok(()) => 0, // success
         Err(e) => { set_error(format!("{}", e)); -1 }
+    }
+}
+
+// ---------------- gen_block_verify_result ----------------
+#[no_mangle]
+pub extern "C" fn gen_block_verify_result_c (
+    block: *const c_char,
+    validator_private_key: *const c_char,
+    out_error: *mut *mut c_char,
+) -> *mut c_char {
+    let mut set_error = |msg: String| {
+        if !out_error.is_null() {
+            unsafe { *out_error = make_c_string(msg); }
+        }
+    };
+
+    let block = match cstr_to_string(block) { Ok(s) => s, Err(e) => {
+set_error(e); return ptr::null_mut(); } };
+    let block: UnverifiedBlock = match serde_json::from_str(&block) {
+        Ok(v) => v,
+        Err(e) => {
+            set_error(format!("{}", e));
+            return ptr::null_mut();
+        }
+    };
+    let pk = match cstr_to_string(validator_private_key) { Ok(s) => s, Err(e)
+=> { set_error(e); return ptr::null_mut(); } };
+
+    // run the async function blocking
+    let res = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(gen_block_verify_result(block, &pk));
+
+    match res {
+        Ok(block_verify_result) => {
+            let json_string = match serde_json::to_string(&block_verify_result) {
+                Ok(v) => v,
+                Err(e) => {
+                    set_error(format!("{}", e));
+                    return ptr::null_mut();
+                }
+            };
+
+            make_c_string(json_string)
+        }, // success
+        Err(e) => { set_error(format!("{}", e)); return ptr::null_mut(); }
     }
 }
 

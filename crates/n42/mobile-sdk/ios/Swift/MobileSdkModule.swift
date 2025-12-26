@@ -22,6 +22,22 @@ result in
     }
 
     @objc
+    func generateBlockVerifyResult(_ block: String, validatorKey: String, resolver: @escaping RCTPromiseResolveBlock, rejecter: @escaping RCTPromiseRejectBlock) {
+        // Call the MobileSdk wrapper created in the previous step
+        MobileSdk.generateBlockVerifyResult(block: block, validatorPrivateKey: validatorKey) { result in
+            switch result {
+            case .success(let verifyResult):
+                // Resolve the promise with the actual string returned from Rust
+                resolver(verifyResult)
+
+            case .failure(let error):
+                // Reject the promise if an error occurred
+                rejecter("BLOCK_VERIFY_ERROR", "\(error)", nil)
+            }
+        }
+    }
+
+    @objc
     func generateBls12381Keypair(_ resolver: @escaping RCTPromiseResolveBlock,
                               rejecter: @escaping RCTPromiseRejectBlock) {
         let result = MobileSdk.generateBls12381Keypair()

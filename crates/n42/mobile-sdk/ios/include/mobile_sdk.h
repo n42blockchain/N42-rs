@@ -12,6 +12,10 @@ void rust_free_string(char *s);
 
 int32_t run_client_c(const char *ws_url, const char *validator_private_key, char **out_error);
 
+char *gen_block_verify_result_c(const char *block,
+                                const char *validator_private_key,
+                                char **out_error);
+
 char *generate_bls12_381_keypair_c(char **out_error);
 
 char *create_deposit_unsigned_tx_c(const char *deposit_contract_address,

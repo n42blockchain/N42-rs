@@ -59,45 +59,13 @@ pub async fn run_client(
         while let Ok(Some(msg)) = timeout(Duration::from_secs(message_timeout_secs ), subscription.next()).await {
             match msg {
                 Ok(block) => {
-                    debug!("Received block: {:?}, pk: {:?}, thread-id: {:?}", block.blockbody.header().number(), hex::encode(pk.to_bytes()), std::thread::current().id());
-                    let block_clone = block.clone();
+                    let block_verify_result = gen_block_verify_result_inner(block, &sk).await?;
+                    let params = rpc_params![block_verify_result.pubkey, block_verify_result.signature, block_verify_result.attestation_data, hex::encode(block_verify_result.block_hash.as_slice())];
+                    let result: () = ws_client
+                        .request("consensusBeaconExt_submitVerification", params)
+                        .await?;
+                    debug!("request result: {:?}", result);
 
-                    if let Ok(receipts_root) = tokio::task::spawn_blocking(||verify(block_clone)).await? {
-                        debug!("receipts_root: {:?}", receipts_root);
-
-                        let attestation_data = AttestationData {
-                            slot: block.blockbody.header().number(),
-                            committee_index: block.committee_index,
-                            receipts_root,
-                        };
-
-                        let bytes: Vec<u8> = serde_json::to_vec(&attestation_data)?;
-                        let bytes_slice: &[u8] = &bytes;
-
-                        let msg = bytes_slice;
-                        let sig = sk.sign(msg, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[]);
-
-                        let err = sig.verify(true, msg, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[], &pk, true);
-                        debug!("sig verify result: {:?}", err);
-
-                        let mut header = block.blockbody.header().clone();
-                        header.receipts_root = receipts_root;
-                        let body = block.blockbody.body().clone();
-                        let sealed_block_recovered: SealedBlock<Block> = SealedBlock::from_parts_unhashed(header, body);
-
-                        let recovered_block_hash = SealedBlock::hash(&sealed_block_recovered);
-                        let params = rpc_params![hex::encode(pk.to_bytes()), hex::encode(sig.to_bytes()), attestation_data, hex::encode(recovered_block_hash.as_slice())];
-                        let result: () = ws_client
-                            .request("consensusBeaconExt_submitVerification", params)
-                            .await?;
-                        debug!("request result: {:?}", result);
-
-                    } else {
-                        warn!("verify failed");
-                        return Err(eyre::eyre!("verify failed: block number: {:?}", block.blockbody.number));
-                    }
-
-                    debug!("Finished block: {:?}, pk: {:?}, thread-id: {:?}", block.blockbody.header().number(), hex::encode(pk.to_bytes()), std::thread::current().id());
                 }
                 Err(e) => {
                     warn!("Subscription error: {:?}", e);
@@ -112,6 +80,63 @@ pub async fn run_client(
     }
 
     Ok(())
+}
+
+pub async fn gen_block_verify_result(
+    block: UnverifiedBlock,
+    validator_private_key: &str,
+    ) -> eyre::Result<BlockVerifyResult> {
+    let validator_private_key = validator_private_key.strip_prefix("0x").unwrap_or(validator_private_key);
+    let validator_private_key_vec = Vec::from_hex(&validator_private_key)?;
+    let sk = SecretKey::from_bytes(&validator_private_key_vec)
+        .map_err(|e| eyre::eyre!("SecretKey error: {e:?}"))?;
+    gen_block_verify_result_inner(block, &sk).await
+}
+
+async fn gen_block_verify_result_inner(block: UnverifiedBlock, sk: &SecretKey) -> eyre::Result<BlockVerifyResult> {
+    let pk = sk.sk_to_pk();
+    debug!("Received block: {:?}, pk: {:?}, thread-id: {:?}", block.blockbody.header().number(), hex::encode(pk.to_bytes()), std::thread::current().id());
+
+    let block_clone = block.clone();
+
+    if let Ok(receipts_root) = tokio::task::spawn_blocking(||verify(block_clone)).await? {
+        debug!("receipts_root: {:?}", receipts_root);
+
+        let attestation_data = AttestationData {
+            slot: block.blockbody.header().number(),
+            committee_index: block.committee_index,
+            receipts_root,
+        };
+
+        let bytes: Vec<u8> = serde_json::to_vec(&attestation_data)?;
+        let bytes_slice: &[u8] = &bytes;
+
+        let msg = bytes_slice;
+        let sig = sk.sign(msg, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[]);
+
+        let err = sig.verify(true, msg, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[], &pk, true);
+        debug!("sig verify result: {:?}", err);
+
+        let mut header = block.blockbody.header().clone();
+        header.receipts_root = receipts_root;
+        let body = block.blockbody.body().clone();
+        let sealed_block_recovered: SealedBlock<Block> = SealedBlock::from_parts_unhashed(header, body);
+
+        let recovered_block_hash = SealedBlock::hash(&sealed_block_recovered);
+
+        let block_verify_result = BlockVerifyResult {
+            pubkey: hex::encode(pk.to_bytes()),
+            signature: hex::encode(sig.to_bytes()),
+            attestation_data,
+            block_hash: recovered_block_hash ,
+        };
+
+        debug!("Finished block: {:?}, pk: {:?}, thread-id: {:?}", block.blockbody.header().number(), hex::encode(pk.to_bytes()), std::thread::current().id());
+        return Ok(block_verify_result);
+    } else {
+        warn!("verify failed");
+        return Err(eyre::eyre!("verify failed: block number: {:?}", block.blockbody.number));
+    }
 }
 
 fn verify(mut unverifiedblock:UnverifiedBlock) -> eyre::Result<B256> {

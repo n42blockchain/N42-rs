@@ -124,6 +124,91 @@ public class MobileSdkTest {
 }
 ```
 
+sdk code example for genBlockVerifyResult
+```java
+package com.example.test_mobile_sdk_aar;
+
+import android.util.Log;
+
+import com.mobileSdk.Api;
+
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
+
+import okhttp3.Response;
+import okhttp3.WebSocket;
+import okhttp3.WebSocketListener;
+
+public class MyWebSocketListener extends WebSocketListener {
+    @Override
+    public void onOpen(WebSocket webSocket, Response response) {
+        // "Subscribe" by sending a JSON message once the connection is open
+        // subscribe with validator bls_pubkey_hex_str
+        String subscribeJson = "{\"jsonrpc\":\"2.0\",\"method\":\"consensusBeaconExt_subscribeToVerificationRequest\",\"params\":[\"9536b707bfa6a05a193bf6fe3b0951a9f16a5a42b0834d19fe3a8c60bb1d50d70d96f101833cd698c5a6d5e92dd96bbb\"],\"id\":1}";
+        webSocket.send(subscribeJson);
+        Log.i("RustLib","onOpen");
+    }
+
+    @Override
+    public void onMessage(WebSocket webSocket, String text) {
+        // Handle incoming text messages
+        Log.i("RustLib","Received: " + text);
+        try {
+            JSONObject json = new JSONObject(text);
+
+            // Notifications usually have a 'method' or 'params' field
+            if (json.has("method")) {
+                String method = json.getString("method");
+
+                switch (method) {
+                    case "subscribeToVerificationRequest":
+                        JSONObject params = json.getJSONObject("params");
+                        JSONObject result = params.getJSONObject("result");
+                        Log.i("RustLib","result: " + result);
+
+                        String validatorPrivateKeyForTest = "3fa701e2b5966ea4e5ad49a65bd59997b1e25f6d83dd5f075d0e01d1e92dfd81";
+                        String blockVerifyResultStr = Api.genBlockVerifyResult(result.toString(), validatorPrivateKeyForTest).join();
+                        Log.i("RustLib","blockVerifyResultStr: " + blockVerifyResultStr);
+
+                        JSONObject blockVerifyResult = new JSONObject(blockVerifyResultStr);
+                        JSONObject request = new JSONObject();
+                        request.put("id", 1);
+                        request.put("jsonrpc", "2.0");
+                        request.put("method", "consensusBeaconExt_submitVerification");
+
+                        // Put all arguments into a JSONArray in order
+                        JSONArray paramsSubmit = new JSONArray();
+                        paramsSubmit.put(blockVerifyResult.getString("pubkey"));
+                        paramsSubmit.put(blockVerifyResult.getString("signature"));
+                        paramsSubmit.put(blockVerifyResult.getJSONObject("attestation_data"));
+                        paramsSubmit.put(blockVerifyResult.getString("block_hash"));
+
+                        request.put("params", paramsSubmit);
+                        Log.i("RustLib","blockVerifyResult: " + blockVerifyResult);
+                        boolean sendOk = webSocket.send(request.toString());
+                        Log.i("RustLib","sent consensusBeaconExt_submitVerification, return value: " + sendOk);
+                        break;
+
+                    default:
+                        Log.i("RustLib","Unknown method: " + method);
+                }
+            }
+        } catch (JSONException e) { Log.i("RustLib","error" + e.toString()); }
+
+
+    }
+
+    @Override
+    public void onFailure(WebSocket webSocket, Throwable t, Response response) {
+        // Handle errors here
+        Log.i("RustLib","onFailure" + t.toString());
+        t.printStackTrace();
+    }
+}
+
+```
+
 ## for ios apps developed in swift
 
 1. Drag mobile_sdk.xcframework into your Xcode project.
@@ -254,14 +339,171 @@ struct ContentView: View {
                     }
                 }
             )
- 
+
 
         }
+
+         Button("Connect, Subscribe, Verify & Submit") {
+            // 1. Connect to your server
+            WebSocketManager.shared.connect(urlStr: wsUrl)
+
+            let validatorPubkey = "9536b707bfa6a05a193bf6fe3b0951a9f16a5a42b0834d19fe3a8c60bb1d50d70d96f101833cd698c5a6d5e92dd96bbb"
+            // 2. Subscribe after a tiny delay to ensure socket is open
+            // In a real app, you'd do this inside the 'onOpen' equivalent
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                WebSocketManager.shared.subscribe(pubkey: validatorPubkey)
+                self.resultText = "Started Connect, Subscribe, Verify & Submit"
+            }
+        }
+        .buttonStyle(.borderedProminent) // Solid colored background
+        .controlSize(.large)             // Makes it bigger and easier to hit
+        .tint(.blue)
     }
 }
 
 #Preview {
     ContentView()
+}
+```
+
+sdk code example for genBlockVerifyResult
+```swift
+import Foundation
+
+class WebSocketManager: NSObject {
+    static let shared = WebSocketManager()
+
+    private var webSocket: URLSessionWebSocketTask?
+    private var isConnected = false
+
+    // Constant key for the hardcoded validator
+    private let validatorKey = "3fa701e2b5966ea4e5ad49a65bd59997b1e25f6d83dd5f075d0e01d1e92dfd81"
+
+    // MARK: - Connection Management
+
+    func connect(urlStr: String) {
+        guard let url = URL(string: urlStr) else { return }
+
+        let session = URLSession(configuration: .default)
+        webSocket = session.webSocketTask(with: url)
+        webSocket?.resume()
+        isConnected = true
+
+        print("WebSocket: Connecting to \(urlStr)...")
+
+        Task { await listen() }
+    }
+
+    func disconnect() {
+        webSocket?.cancel(with: .normalClosure, reason: nil)
+        isConnected = false
+        print("WebSocket: Disconnected")
+    }
+
+    // MARK: - Outbound Communication
+
+    /// Generic helper to send JSON-RPC requests
+    private func sendJsonRpc(method: String, params: [Any], id: Int? = nil) {
+        var request: [String: Any] = [
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params
+        ]
+        if let id = id { request["id"] = id }
+
+        guard let data = try? JSONSerialization.data(withJSONObject: request),
+              let jsonString = String(data: data, encoding: .utf8) else {
+            print("WebSocket: Failed to serialize \(method)")
+            return
+        }
+
+        webSocket?.send(.string(jsonString)) { error in
+            if let error = error {
+                print("WebSocket: Send Error for \(method): \(error)")
+            } else {
+                print("WebSocket: Successfully sent \(method)")
+            }
+        }
+    }
+
+    func subscribe(pubkey: String) {
+        sendJsonRpc(method: "consensusBeaconExt_subscribeToVerificationRequest", params: [pubkey], id: 1)
+    }
+
+    // MARK: - Inbound Message Handling
+
+    private func listen() async {
+        guard let webSocket = webSocket else { return }
+
+        do {
+            let message = try await webSocket.receive()
+            if case .string(let text) = message {
+                handleIncomingText(text)
+            }
+            // Recursively listen
+            await listen()
+        } catch {
+            print("WebSocket: Connection error: \(error)")
+            isConnected = false
+        }
+    }
+
+    private func handleIncomingText(_ text: String) {
+        print("WebSocket Received: \(text)")
+        guard let data = text.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+
+        let method = json["method"] as? String ?? ""
+
+        switch method {
+        case "subscribeToVerificationRequest":
+            processVerificationRequest(json)
+        default:
+            print("WebSocket: Unhandled method: \(method)")
+        }
+    }
+
+    // MARK: - SDK Logic
+
+    private func processVerificationRequest(_ json: [String: Any]) {
+        // Nested Extraction
+        guard let params = json["params"] as? [String: Any],
+              let resultObj = params["result"] as? [String: Any],
+              let resultData = try? JSONSerialization.data(withJSONObject: resultObj),
+              let blockJsonString = String(data: resultData, encoding: .utf8) else {
+            print("WebSocket: Malformed Verification Request")
+            return
+        }
+
+        MobileSdk.generateBlockVerifyResult(block: blockJsonString, validatorPrivateKey: validatorKey) { [weak self] result in
+            switch result {
+            case .success(let verifyResultJson):
+                print("verifyResultJson: \(verifyResultJson)")
+                self?.handleSubmitVerification(verifyResultJson)
+            case .failure(let error):
+                print("SDK: Verification Failed: \(error)")
+            }
+        }
+    }
+
+    private func handleSubmitVerification(_ rawResultJson: String) {
+        guard let data = rawResultJson.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let pubkey = json["pubkey"] as? String,
+              let signature = json["signature"] as? String,
+              let attestationData = json["attestation_data"] as? [String: Any],
+              let blockHash = json["block_hash"] as? String else {
+            print("SDK: Could not parse result for submission")
+            return
+        }
+
+        // Send back to server
+        sendJsonRpc(
+            method: "consensusBeaconExt_submitVerification",
+            params: [pubkey, signature, attestationData, blockHash],
+            id: 1
+        )
+    }
 }
 ```
 

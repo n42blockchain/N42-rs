@@ -147,6 +147,11 @@ class NativeBindings {
             String ws_url,
             String validator_private_key
     );
+
+    public static native CompletableFuture<String> genBlockVerifyResult (
+            String block,
+            String validator_private_key
+    );
 }
 EOF
 
@@ -204,6 +209,16 @@ public class $JAVA_CLASS {
 	) {
 		return NativeBindings.runClient(
             ws_url,
+            validator_private_key
+	);
+    }
+
+    public static CompletableFuture<String> genBlockVerifyResult(
+            String block,
+            String validator_private_key
+	) {
+		return NativeBindings.genBlockVerifyResult(
+            block,
             validator_private_key
 	);
     }

@@ -943,6 +943,8 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> DatabaseProvider<TX, N> {
             let mut last_shard =
                 self.take_shard::<T>(&mut cursor, sharded_key_factory(partial_key, u64::MAX))?;
             last_shard.extend(indices);
+            // Sort to ensure the list is properly ordered after extending
+            last_shard.sort_unstable();
             // Chunk indices and insert them in shards of N size.
             let mut chunks = last_shard.chunks(sharded_key::NUM_OF_INDICES_IN_SHARD).peekable();
             while let Some(list) = chunks.next() {

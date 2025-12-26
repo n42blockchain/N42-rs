@@ -77,6 +77,10 @@ impl<N: ProviderNodeTypes> BlockchainProvider<N> {
     /// Create a new [`BlockchainProvider`] using only the storage, fetching the latest
     /// header from the database to initialize the provider.
     pub fn new(storage: ProviderFactory<N>) -> ProviderResult<Self> {
+        // Re-initialize the static file index to ensure we have the latest state
+        // This is needed because genesis initialization may have written to static files
+        storage.static_file_provider().initialize_index()?;
+
         let provider = storage.provider()?;
         let best = provider.chain_info()?;
         match provider.header_by_number(best.best_number)? {

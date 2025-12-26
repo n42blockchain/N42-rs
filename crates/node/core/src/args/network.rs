@@ -161,6 +161,10 @@ pub struct NetworkArgs {
     /// The policy determines which peers transactions are gossiped to.
     #[arg(long = "tx-propagation-policy", default_value_t = TransactionPropagationKind::All)]
     pub tx_propagation_policy: TransactionPropagationKind,
+
+    /// Optional network ID to override the chain specification's network ID for P2P connections
+    #[arg(long)]
+    pub network_id: Option<u64>,
 }
 
 impl NetworkArgs {
@@ -272,6 +276,7 @@ impl NetworkArgs {
                 // set discovery port based on instance number
                 self.discovery.port,
             ))
+            .network_id(self.network_id)
     }
 
     /// If `no_persist_peers` is false then this returns the path to the persistent peers file path.

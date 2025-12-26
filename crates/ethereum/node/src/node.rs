@@ -132,37 +132,34 @@ impl NodeTypes for EthereumNode {
 }
 
 /// Builds [`EthApi`](reth_rpc::EthApi) for Ethereum.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct EthereumEthApiBuilder;
+#[derive(Debug, Clone, Copy)]
+pub struct EthereumEthApiBuilder<NetworkT = Ethereum>(std::marker::PhantomData<NetworkT>);
 
-impl<N> EthApiBuilder<N> for EthereumEthApiBuilder
+impl<NetworkT> Default for EthereumEthApiBuilder<NetworkT> {
+    fn default() -> Self {
+        Self(Default::default())
+    }
+}
+
+impl<N, NetworkT> EthApiBuilder<N> for EthereumEthApiBuilder<NetworkT>
 where
     N: FullNodeComponents<
         Types: NodeTypes<ChainSpec: Hardforks + EthereumHardforks>,
         Evm: ConfigureEvm<NextBlockEnvCtx: BuildPendingEnv<HeaderTy<N::Types>>>,
     >,
-    EthRpcConverterFor<N>: RpcConvert<
+    NetworkT: RpcTypes<TransactionRequest: SignableTxRequest<TxTy<N::Types>>>,
+    EthRpcConverterFor<N, NetworkT>: RpcConvert<
         Primitives = PrimitivesTy<N::Types>,
         Error = EthApiError,
-        Network = Ethereum,
+        Network = NetworkT,
         Evm = N::Evm,
     >,
     EthApiError: FromEvmError<N::Evm>,
 {
-    type EthApi = EthApiFor<N>;
+    type EthApi = EthApiFor<N, NetworkT>;
 
     async fn build_eth_api(self, ctx: EthApiCtx<'_, N>) -> eyre::Result<Self::EthApi> {
-        let api = reth_rpc::EthApiBuilder::new_with_components(ctx.components.clone())
-            .eth_cache(ctx.cache)
-            .task_spawner(ctx.components.task_executor().clone())
-            .gas_cap(ctx.config.rpc_gas_cap.into())
-            .max_simulate_blocks(ctx.config.rpc_max_simulate_blocks)
-            .eth_proof_window(ctx.config.eth_proof_window)
-            .fee_history_cache_config(ctx.config.fee_history_cache)
-            .proof_permits(ctx.config.proof_permits)
-            .gas_oracle_config(ctx.config.gas_oracle)
-            .build();
-        Ok(api)
+        Ok(ctx.eth_api_builder().map_converter(|r| r.with_network()).build())
     }
 }
 

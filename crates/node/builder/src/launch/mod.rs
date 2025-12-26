@@ -5,12 +5,14 @@
 
 pub mod common;
 mod exex;
+mod invalid_block_hook;
 
 pub(crate) mod debug;
 pub(crate) mod engine;
 
 pub use common::LaunchContext;
 pub use exex::ExExLauncher;
+pub use invalid_block_hook::InvalidBlockHookExt;
 
 use std::future::Future;
 

@@ -4,8 +4,9 @@
 //! Helper provider traits to encapsulate all provider traits for simplicity.
 
 use crate::{
-    AccountReader, BlockReaderIdExt, ChainSpecProvider, ChangeSetReader, DatabaseProviderFactory,
-    StageCheckpointReader, StateProviderFactory, StaticFileProviderFactory,
+    AccountReader, BlockReaderIdExt, BlockReader, ChainSpecProvider, ChangeSetReader,
+    DatabaseProviderFactory, HashedPostStateProvider, PruneCheckpointReader, StageCheckpointReader,
+    StateProviderFactory, StateReader, StaticFileProviderFactory, TrieReader,
 };
 use reth_chain_state::{CanonStateSubscriptions, ForkChoiceSubscriptions};
 use reth_node_types::{BlockTy, HeaderTy, NodeTypesWithDB, ReceiptTy, TxTy};
@@ -16,8 +17,10 @@ use std::fmt::Debug;
 
 /// Helper trait to unify all provider traits for simplicity.
 pub trait FullProvider<N: NodeTypesWithDB>:
-    DatabaseProviderFactory<DB = N::DB>
-    + NodePrimitivesProvider<Primitives = N::Primitives>
+    DatabaseProviderFactory<
+        DB = N::DB,
+        Provider: BlockReader + TrieReader + StageCheckpointReader + PruneCheckpointReader,
+    > + NodePrimitivesProvider<Primitives = N::Primitives>
     + StaticFileProviderFactory<Primitives = N::Primitives>
     + BlockReaderIdExt<
         Transaction = TxTy<N>,
@@ -26,6 +29,8 @@ pub trait FullProvider<N: NodeTypesWithDB>:
         Header = HeaderTy<N>,
     > + AccountReader
     + StateProviderFactory
+    + StateReader
+    + HashedPostStateProvider
     + ChainSpecProvider<ChainSpec = N::ChainSpec>
     + ChangeSetReader
     + CanonStateSubscriptions
@@ -39,8 +44,10 @@ pub trait FullProvider<N: NodeTypesWithDB>:
 }
 
 impl<T, N: NodeTypesWithDB> FullProvider<N> for T where
-    T: DatabaseProviderFactory<DB = N::DB>
-        + NodePrimitivesProvider<Primitives = N::Primitives>
+    T: DatabaseProviderFactory<
+            DB = N::DB,
+            Provider: BlockReader + TrieReader + StageCheckpointReader + PruneCheckpointReader,
+        > + NodePrimitivesProvider<Primitives = N::Primitives>
         + StaticFileProviderFactory<Primitives = N::Primitives>
         + BlockReaderIdExt<
             Transaction = TxTy<N>,
@@ -49,6 +56,8 @@ impl<T, N: NodeTypesWithDB> FullProvider<N> for T where
             Header = HeaderTy<N>,
         > + AccountReader
         + StateProviderFactory
+        + StateReader
+        + HashedPostStateProvider
         + ChainSpecProvider<ChainSpec = N::ChainSpec>
         + ChangeSetReader
         + CanonStateSubscriptions

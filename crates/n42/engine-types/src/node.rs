@@ -31,7 +31,7 @@ use reth_node_builder::{
     },
     node::{FullNodeTypes, NodeTypes},
     rpc::{
-        EngineValidatorAddOn, EngineValidatorBuilder, EthApiBuilder, EthApiCtx, RethRpcAddOns,
+        EngineValidatorAddOn, EthApiBuilder, EthApiCtx, PayloadValidatorBuilder, RethRpcAddOns,
         RpcAddOns, RpcHandle,
     },
     BuilderContext, DebugNode, Node, NodeAdapter, NodeComponentsBuilder, PayloadBuilderConfig,
@@ -249,10 +249,10 @@ where
     >,
     EthApiFor<N>: FullEthApiServer<Provider = N::Provider, Pool = N::Pool>,
 {
-    type Validator = EthereumEngineValidator;
+    type ValidatorBuilder = EthereumEngineValidatorBuilder;
 
-    async fn engine_validator(&self, ctx: &AddOnsContext<'_, N>) -> eyre::Result<Self::Validator> {
-        EthereumEngineValidatorBuilder::default().build(ctx).await
+    fn engine_validator_builder(&self) -> Self::ValidatorBuilder {
+        EthereumEngineValidatorBuilder::default()
     }
 }
 
@@ -471,7 +471,7 @@ where
 #[non_exhaustive]
 pub struct EthereumEngineValidatorBuilder;
 
-impl<Node, Types> EngineValidatorBuilder<Node> for EthereumEngineValidatorBuilder
+impl<Node, Types> PayloadValidatorBuilder<Node> for EthereumEngineValidatorBuilder
 where
     Types: NodeTypes<ChainSpec = ChainSpec, Payload = EthEngineTypes, Primitives = EthPrimitives>,
     Node: FullNodeComponents<Types = Types>,

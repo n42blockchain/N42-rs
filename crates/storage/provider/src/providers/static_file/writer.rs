@@ -274,9 +274,10 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
                 duration = ?start.elapsed(),
                 "Commit"
             );
-
-            self.update_index()?;
         }
+
+        // Always update the index to ensure static file provider can find the data
+        self.update_index()?;
 
         Ok(())
     }

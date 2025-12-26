@@ -255,26 +255,26 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             }
         }
 
-        if self.writer.is_dirty() {
-            // Commits offsets and new user_header to disk
-            self.writer.commit().map_err(ProviderError::other)?;
+        // Always commit to ensure data is written to disk, even if is_dirty() returns false
+        // This is needed because block_range may have been updated by increment_block()
+        // Commits offsets and new user_header to disk
+        self.writer.commit().map_err(ProviderError::other)?;
 
-            if let Some(metrics) = &self.metrics {
-                metrics.record_segment_operation(
-                    self.writer.user_header().segment(),
-                    StaticFileProviderOperation::CommitWriter,
-                    Some(start.elapsed()),
-                );
-            }
-
-            debug!(
-                target: "provider::static_file",
-                segment = ?self.writer.user_header().segment(),
-                path = ?self.data_path,
-                duration = ?start.elapsed(),
-                "Commit"
+        if let Some(metrics) = &self.metrics {
+            metrics.record_segment_operation(
+                self.writer.user_header().segment(),
+                StaticFileProviderOperation::CommitWriter,
+                Some(start.elapsed()),
             );
         }
+
+        debug!(
+            target: "provider::static_file",
+            segment = ?self.writer.user_header().segment(),
+            path = ?self.data_path,
+            duration = ?start.elapsed(),
+            "Commit"
+        );
 
         // Always update the index to ensure static file provider can find the data
         self.update_index()?;

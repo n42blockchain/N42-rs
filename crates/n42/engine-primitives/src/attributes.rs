@@ -3,7 +3,7 @@
 
 //! The implementation of the [`PayloadAttributesBuilder`] for the N42 engine service
 
-use alloy_eips::eip4895::{Withdrawal, Withdrawals};
+use alloy_eips::eip4895::Withdrawal;
 use alloy_primitives::{Address, B256};
 use reth_chainspec::EthereumHardforks;
 use reth_ethereum_engine_primitives::EthPayloadAttributes;

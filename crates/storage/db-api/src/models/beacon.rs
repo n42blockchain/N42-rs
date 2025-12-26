@@ -5,7 +5,7 @@ use crate::{
     table::{Compress, Decompress},
     DatabaseError,
 };
-use bytes::{BufMut, BytesMut};
+use bytes::BufMut;
 use n42_primitives::{BeaconBlock, BeaconState};
 
 impl Decompress for BeaconState {

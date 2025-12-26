@@ -3,7 +3,7 @@
 
 use alloy_primitives::{B256, U256};
 use n42_primitives::{AttestationData, CommitteeIndex};
-use reth_primitives::{BlockBody, SealedBlock};
+use reth_primitives::SealedBlock;
 use reth_revm::cached::CachedReads;
 use serde::{Deserialize, Serialize};
 

@@ -557,7 +557,7 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
         self.len() == 0
     }
 
-    pub fn iter(&self) -> VecTreeIter<T, N> {
+    pub fn iter(&self) -> VecTreeIter<'_, T, N> {
         VecTreeIter {
             tree: self,
             index: 0,

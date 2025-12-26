@@ -9,7 +9,7 @@ use alloc::{
     vec::Vec,
 };
 use alloy_consensus::{
-    constants::MAXIMUM_EXTRA_DATA_SIZE, Blob, Block, BlockBody, BlockHeader, Bytes48, Header,
+    Blob, Block, BlockBody, BlockHeader, Bytes48, Header,
     Transaction, EMPTY_OMMER_ROOT_HASH,
 };
 use alloy_eips::{

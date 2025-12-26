@@ -11,9 +11,8 @@ use std::fmt::{Debug, Formatter};
 use std::sync::atomic::{AtomicBool, Ordering};
 use alloy_primitives::{U256, hex, BlockHash, B64, B256, Address, Bytes, FixedBytes};
 use bytes::BytesMut;
-use rand::prelude::SliceRandom;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
-use reth_primitives::{SealedBlock, SealedHeader, BlockWithSenders};
+use reth_primitives::{SealedBlock, SealedHeader};
 use reth_execution_types::BlockExecutionResult;
 use reth_primitives_traits::{RecoveredBlock, Header, header::clique_utils::{recover_address_generic, SIGNATURE_LENGTH, seal_hash}};
 use reth_provider::{BlockIdReader, BlockReaderIdExt, HeaderProvider};
@@ -25,7 +24,6 @@ use k256::ecdsa::SigningKey;
 use alloy_signer::SignerSync;
 use reth_consensus::{FullConsensus, HeaderValidator, Consensus, ConsensusError, HeaderConsensusError};
 // SnapshotProviderWriter removed in reth v1.5.0
-use reth_node_api::{FullNodeTypes, PrimitivesTy};
 use std::str::FromStr;
 
 //

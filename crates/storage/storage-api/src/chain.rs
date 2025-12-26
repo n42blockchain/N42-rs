@@ -1,4 +1,4 @@
-use crate::{DBProvider, StorageLocation};
+use crate::DBProvider;
 use alloc::vec::Vec;
 use alloy_consensus::Header;
 use alloy_primitives::BlockNumber;

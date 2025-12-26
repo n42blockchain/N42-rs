@@ -21,7 +21,7 @@ use reth_db_api::models::{AccountBeforeTx, BlockNumberAddress, StoredBlockBodyIn
 use reth_execution_types::{BundleStateInit, ExecutionOutcome, RevertsInit};
 use reth_node_types::{BlockTy, HeaderTy, ReceiptTy, TxTy};
 use reth_primitives_traits::{
-    Account, BlockBody, RecoveredBlock, SealedBlock, SealedHeader, StorageEntry,
+    Account, BlockBody, RecoveredBlock, SealedHeader, StorageEntry,
 };
 use reth_prune_types::{PruneCheckpoint, PruneSegment};
 use reth_stages_types::{StageCheckpoint, StageId};

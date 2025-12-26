@@ -1,7 +1,7 @@
 // Copyright (c) 2017-2025 N42 Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use crate::{NodePrimitivesProvider, StorageLocation};
+use crate::NodePrimitivesProvider;
 use alloc::vec::Vec;
 use alloy_primitives::BlockNumber;
 use reth_db_models::StoredBlockBodyIndices;

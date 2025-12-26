@@ -9,7 +9,7 @@ use n42_engine_primitives::PayloadAttributesBuilderExt;
 use n42_primitives::{RelativeEpoch, Attestation, BeaconState, BeaconBlock, Deposit, VoluntaryExitWithSig, parse_deposit_log, BLSPubkey, BlockVerifyResultAggregate, agg_sig_to_fixed, fixed_to_agg_sig, SLOTS_PER_EPOCH, CommitteeIndex, AttestationData};
 use reth_chainspec::EthereumHardforks;
 use reth_chainspec::EthChainSpec;
-use reth_engine_primitives::BeaconConsensusEngineHandle;
+use reth_engine_primitives::ConsensusEngineHandle;
 use reth_engine_primitives::EngineTypes;
 use reth_payload_builder::{PayloadBuilderHandle, PayloadBuilderService};
 use reth_payload_primitives::{
@@ -34,7 +34,7 @@ pub struct N42Migrate<T: PayloadTypes, Provider, B, Pool: TransactionPool> {
     /// The payload attribute builder for the engine
     payload_attributes_builder: B,
     /// beacon engine handle
-    beacon_engine_handle: BeaconConsensusEngineHandle<T>,
+    beacon_engine_handle: ConsensusEngineHandle<T>,
     /// The payload builder for the engine
     payload_builder: PayloadBuilderHandle<T>,
     pool: Pool,
@@ -61,7 +61,7 @@ where
     pub fn spawn_new(
         provider: Provider,
         payload_attributes_builder: B,
-        beacon_engine_handle: BeaconConsensusEngineHandle<T>,
+        beacon_engine_handle: ConsensusEngineHandle<T>,
         payload_builder: PayloadBuilderHandle<T>,
         pool: Pool,
         migrate_from_db_path: Option<String>,

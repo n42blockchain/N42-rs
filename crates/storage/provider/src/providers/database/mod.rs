@@ -18,7 +18,7 @@ use reth_errors::{RethError, RethResult};
 use reth_node_types::{
     BlockTy, HeaderTy, NodeTypes, NodeTypesWithDB, NodeTypesWithDBAdapter, ReceiptTy, TxTy,
 };
-use reth_primitives_traits::{RecoveredBlock, SealedBlock, SealedHeader};
+use reth_primitives_traits::{RecoveredBlock, SealedHeader};
 use reth_prune_types::{PruneCheckpoint, PruneModes, PruneSegment};
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_static_file_types::StaticFileSegment;

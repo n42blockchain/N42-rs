@@ -2,15 +2,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use alloy_primitives::Address;
-use alloy_primitives::{Bytes, Sealable, B256};
-use alloy_rpc_types::{BlockId, BlockNumberOrTag};
+use alloy_primitives::{Sealable, B256};
+use alloy_rpc_types::BlockId;
 use jsonrpsee::types::ErrorObjectOwned;
 use jsonrpsee::{
     core::{RpcResult, SubscriptionResult},
     proc_macros::rpc,
     types::{
         error::{INTERNAL_ERROR_CODE, INVALID_PARAMS_CODE},
-        ErrorObject, SubscriptionId,
+        ErrorObject,
     },
     PendingSubscriptionSink, SubscriptionMessage,
 };
@@ -19,14 +19,14 @@ use n42_primitives::{
     beacon_chain_spec, epoch_to_block_number, AttestationData, BLSPubkey, BeaconBlock, BeaconState,
     Snapshot, ValidatorInfo,
 };
-use pubsub_mem::{subscribe, Event, RouterMsg};
+use pubsub_mem::{subscribe, RouterMsg};
 use reth_consensus::{ConsensusError, FullConsensus};
 use reth_ethereum_primitives::EthPrimitives;
 use reth_node_core::primitives::AlloyBlockHeader;
 use reth_provider::{BeaconProvider, BlockIdReader, BlockReader, HeaderProvider};
-use std::{collections::HashMap, sync::Arc};
-use tokio::sync::{broadcast, mpsc};
-use tracing::{debug, error, info, trace, warn};
+use std::collections::HashMap;
+use tokio::sync::mpsc;
+use tracing::debug;
 
 /// trait interface for a custom rpc namespace: `consensus`
 ///
@@ -372,7 +372,7 @@ where
 
 mod tests {
     use super::*;
-    use jsonrpsee::{http_client::HttpClientBuilder, server::ServerBuilder};
+    use jsonrpsee::server::ServerBuilder;
     use reth_consensus::noop::NoopConsensus;
     use reth_provider::test_utils::NoopProvider;
 

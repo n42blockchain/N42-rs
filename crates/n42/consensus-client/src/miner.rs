@@ -22,7 +22,7 @@ use alloy_rpc_types_engine::{CancunPayloadFields, ExecutionPayloadSidecar, Forkc
 use eyre::OptionExt;
 use futures_util::{stream::Fuse, StreamExt};
 use itertools::Itertools;
-use reth_engine_primitives::BeaconConsensusEngineHandle;
+use reth_engine_primitives::ConsensusEngineHandle;
 use reth_chainspec::EthereumHardforks;
 use reth_chainspec::EthChainSpec;
 use reth_consensus::{FullConsensus, ConsensusError};
@@ -116,7 +116,7 @@ pub struct N42Miner<T: PayloadTypes, Provider, B, Network> {
     payload_attributes_builder: B,
 
     /// beacon engine handle
-    beacon_engine_handle: BeaconConsensusEngineHandle<T>,
+    beacon_engine_handle: ConsensusEngineHandle<T>,
     /// The mining mode for the engine
     mode: MiningMode,
     /// The timer for preparing block
@@ -187,7 +187,7 @@ where
     pub fn spawn_new(
         provider: Provider,
         payload_attributes_builder: B,
-        beacon_engine_handle: BeaconConsensusEngineHandle<T>,
+        beacon_engine_handle: ConsensusEngineHandle<T>,
         mode: MiningMode,
         payload_builder: PayloadBuilderHandle<T>,
         network: Network,

@@ -1,7 +1,7 @@
 // Copyright (c) 2017-2025 N42 Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use alloy_primitives::{Address, BlockHash, BlockNumber, B256};
+use alloy_primitives::{BlockHash, BlockNumber, B256};
 use auto_impl::auto_impl;
 use n42_primitives::{
     BeaconBlock, BeaconBlockChangeset, BeaconState, BeaconStateChangeset, Validator,

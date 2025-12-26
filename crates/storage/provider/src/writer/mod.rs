@@ -4,8 +4,10 @@
 use crate::{
     providers::{StaticFileProvider, StaticFileWriter as SfWriter},
     BlockExecutionWriter, BlockWriter, HistoryWriter, StateWriter, StaticFileProviderFactory,
-    StorageLocation, TrieWriter,
+    TrieWriter,
 };
+#[cfg(test)]
+use crate::StorageLocation;
 use alloy_consensus::BlockHeader;
 use reth_chain_state::ExecutedBlock;
 use reth_db_api::transaction::{DbTx, DbTxMut};

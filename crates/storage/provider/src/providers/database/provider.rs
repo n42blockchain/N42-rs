@@ -15,7 +15,7 @@ use crate::{
     HistoricalStateProviderRef, HistoryWriter, LatestStateProvider, LatestStateProviderRef,
     OriginalValuesKnown, ProviderError, PruneCheckpointReader, PruneCheckpointWriter, RevertsInit,
     StageCheckpointReader, StateProviderBox, StateWriter,
-    StaticFileProviderFactory, StatsReader, StorageLocation, StorageReader, StorageTrieWriter,
+    StaticFileProviderFactory, StatsReader, StorageReader, StorageTrieWriter,
     TransactionVariant, TransactionsProvider, TransactionsProviderExt, TrieReader, TrieWriter,
 };
 use alloy_consensus::{
@@ -49,7 +49,7 @@ use reth_execution_types::{Chain, ExecutionOutcome};
 use reth_node_types::{BlockTy, BodyTy, HeaderTy, NodeTypes, ReceiptTy, TxTy};
 use reth_primitives_traits::{
     Account, Block as _, BlockBody as _, Bytecode, GotExpected, NodePrimitives, RecoveredBlock,
-    SealedBlock, SealedHeader, SignedTransaction, StorageEntry, TxHashRef,
+    SealedHeader, StorageEntry, TxHashRef,
 };
 use reth_prune_types::{
     PruneCheckpoint, PruneMode, PruneModes, PruneSegment, MINIMUM_PRUNING_DISTANCE,
@@ -63,8 +63,8 @@ use reth_storage_api::{
 use reth_storage_errors::provider::{ProviderResult, RootMismatch};
 use reth_trie::{
     prefix_set::{PrefixSet, PrefixSetMut, TriePrefixSets},
-    updates::{StorageTrieUpdates, StorageTrieUpdatesSorted, TrieUpdates, TrieUpdatesSorted},
-    HashedPostStateSorted, Nibbles, StateRoot, StoredNibbles, StoredNibblesSubKey,
+    updates::{StorageTrieUpdatesSorted, TrieUpdates, TrieUpdatesSorted},
+    HashedPostStateSorted, Nibbles, StateRoot, StoredNibbles,
     TrieChangeSetsEntry,
 };
 use reth_trie_db::{

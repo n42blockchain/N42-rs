@@ -22,7 +22,7 @@ use reth_chainspec::{ChainInfo, ChainSpecProvider, EthChainSpec};
 use reth_db::{
     lockfile::StorageLock,
     static_file::{
-        iter_static_files, BlockHashMask, BodyIndicesMask, HeaderMask, HeaderWithHashMask,
+        iter_static_files, BlockHashMask, HeaderMask, HeaderWithHashMask,
         ReceiptMask, StaticFileCursor, TDWithHashMask, TransactionMask,
     },
 };
@@ -36,7 +36,7 @@ use reth_db_api::{
 use reth_ethereum_primitives::{Receipt, TransactionSigned};
 use reth_nippy_jar::{NippyJar, NippyJarChecker, CONFIG_FILE_EXTENSION};
 use reth_node_types::NodePrimitives;
-use reth_primitives_traits::{RecoveredBlock, SealedBlock, SealedHeader, SignedTransaction};
+use reth_primitives_traits::{RecoveredBlock, SealedHeader, SignedTransaction};
 use reth_stages_types::{PipelineTarget, StageId};
 use reth_static_file_types::{
     find_fixed_range, HighestStaticFiles, SegmentHeader, SegmentRangeInclusive, StaticFileSegment,

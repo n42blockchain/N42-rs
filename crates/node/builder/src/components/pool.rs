@@ -135,7 +135,7 @@ impl<'a, Node: FullNodeTypes, V> TxPoolBuilder<'a, Node, V> {
 
 impl<'a, Node: FullNodeTypes, V> TxPoolBuilder<'a, Node, TransactionValidationTaskExecutor<V>>
 where
-    V: TransactionValidator + Clone + 'static,
+    V: TransactionValidator + 'static,
     V::Transaction:
         PoolTransaction<Consensus = TxTy<Node::Types>> + reth_transaction_pool::EthPoolTransaction,
     <Node::Types as NodeTypes>::ChainSpec: EthereumHardforks,

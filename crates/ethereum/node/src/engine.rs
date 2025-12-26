@@ -3,6 +3,7 @@
 
 //! Validates execution payload wrt Ethereum Execution Engine API version.
 
+use alloy_consensus::BlockHeader;
 use alloy_rpc_types_engine::ExecutionData;
 pub use alloy_rpc_types_engine::{
     ExecutionPayloadEnvelopeV2, ExecutionPayloadEnvelopeV3, ExecutionPayloadEnvelopeV4,
@@ -10,12 +11,15 @@ pub use alloy_rpc_types_engine::{
 };
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_engine_primitives::{EngineApiValidator, PayloadValidator};
+use reth_engine_tree::tree::{
+    payload_validator::TreeCtx, EngineValidator,
+};
 use reth_ethereum_payload_builder::EthereumExecutionPayloadValidator;
-use reth_ethereum_primitives::Block;
+use reth_ethereum_primitives::{Block, EthPrimitives};
 use reth_node_api::PayloadTypes;
 use reth_payload_primitives::{
     validate_execution_requests, validate_version_specific_fields, EngineApiMessageVersion,
-    EngineObjectValidationError, NewPayloadError, PayloadOrAttributes,
+    EngineObjectValidationError, InvalidPayloadAttributesError, NewPayloadError, PayloadOrAttributes,
 };
 use reth_primitives_traits::RecoveredBlock;
 use std::sync::Arc;
@@ -92,15 +96,71 @@ where
     }
 }
 
-// Note: The full EngineValidator trait implementation requires:
-// - Access to database provider (for state access)
-// - EVM configuration implementing ConfigureEngineEvm
-// - Ability to execute blocks and return ExecutedBlock
-//
-// This is handled by BasicEngineValidator in reth-engine-tree, which wraps
-// PayloadValidator (implemented above) with full execution capabilities.
-//
-// For N42, the BasicEngineValidatorBuilder in reth-node-builder creates
-// a BasicEngineValidator that combines:
-// - This EthereumEngineValidator as the inner PayloadValidator
-// - The node's provider, EVM config, and consensus for block execution
+/// Type alias for the validation outcome used by EngineValidator.
+pub type EthValidationOutcome = reth_engine_tree::tree::payload_validator::ValidationOutcome<EthPrimitives>;
+
+impl<ChainSpec, Types> EngineValidator<Types, EthPrimitives> for EthereumEngineValidator<ChainSpec>
+where
+    ChainSpec: EthChainSpec + EthereumHardforks + 'static,
+    Types: PayloadTypes<PayloadAttributes = EthPayloadAttributes, ExecutionData = ExecutionData>,
+{
+    fn validate_payload_attributes_against_header(
+        &self,
+        attr: &EthPayloadAttributes,
+        header: &alloy_consensus::Header,
+    ) -> Result<(), InvalidPayloadAttributesError> {
+        // Validate that the payload attributes timestamp is greater than the header timestamp
+        if attr.timestamp <= header.timestamp() {
+            return Err(InvalidPayloadAttributesError::InvalidTimestamp);
+        }
+        Ok(())
+    }
+
+    fn ensure_well_formed_payload(
+        &self,
+        payload: ExecutionData,
+    ) -> Result<RecoveredBlock<Block>, NewPayloadError> {
+        // Delegate to PayloadValidator implementation
+        <Self as PayloadValidator<Types>>::ensure_well_formed_payload(self, payload)
+    }
+
+    fn validate_payload(
+        &mut self,
+        payload: ExecutionData,
+        _ctx: TreeCtx<'_, EthPrimitives>,
+    ) -> EthValidationOutcome {
+        // NOTE: This is a simplified implementation for N42.
+        // Full block execution and state validation is not performed here.
+        // The actual execution should be handled by the engine tree's internal
+        // mechanisms or a separate execution layer.
+        //
+        // For now, we validate the payload structure and return an error
+        // indicating that execution is required.
+        match <Self as PayloadValidator<Types>>::ensure_well_formed_payload(self, payload) {
+            Ok(_block) => {
+                // We cannot return ExecutedBlock without actual execution.
+                // Return an error indicating the payload needs execution.
+                Err(reth_engine_tree::tree::error::InsertPayloadError::Payload(
+                    NewPayloadError::Other(
+                        "EthereumEngineValidator: block execution not implemented, use BasicEngineValidator".into()
+                    )
+                ))
+            }
+            Err(e) => Err(reth_engine_tree::tree::error::InsertPayloadError::Payload(e)),
+        }
+    }
+
+    fn validate_block(
+        &mut self,
+        _block: RecoveredBlock<Block>,
+        _ctx: TreeCtx<'_, EthPrimitives>,
+    ) -> EthValidationOutcome {
+        // NOTE: This is a simplified implementation for N42.
+        // Full block execution and state validation is not performed here.
+        Err(reth_engine_tree::tree::error::InsertPayloadError::Payload(
+            NewPayloadError::Other(
+                "EthereumEngineValidator: block execution not implemented, use BasicEngineValidator".into()
+            )
+        ))
+    }
+}

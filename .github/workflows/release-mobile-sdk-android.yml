@@ -75,7 +75,7 @@ jobs:
         username: ${{ secrets.SERVER_USER }}
         key: ${{ secrets.SERVER_SSH_KEY }}
         port: 22
-        source: crates/n42/mobile-sdk/mobile-sdk-release.aar
+        source: crates/n42/mobile-sdk/mobile-sdk-android.aar
         target: "mobile-sdk-releases/${{ github.ref_name }}/"
 
     - name: Create GitHub Release
@@ -84,6 +84,6 @@ jobs:
         name: ${{ github.ref_name }}
         tag_name: ${{ github.ref_name }}
         files: |
-          crates/n42/mobile-sdk/mobile-sdk-release.aar
+          crates/n42/mobile-sdk/mobile-sdk-android.aar
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

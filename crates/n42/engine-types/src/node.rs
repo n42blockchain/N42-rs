@@ -31,8 +31,8 @@ use reth_node_builder::{
     },
     node::{FullNodeTypes, NodeTypes},
     rpc::{
-        EngineValidatorAddOn, EthApiBuilder, EthApiCtx, PayloadValidatorBuilder, RethRpcAddOns,
-        RpcAddOns, RpcHandle,
+        BasicEngineApiBuilder, BasicEngineValidatorBuilder, EngineValidatorAddOn, EthApiBuilder,
+        EthApiCtx, PayloadValidatorBuilder, RethRpcAddOns, RpcAddOns, RpcHandle,
     },
     BuilderContext, DebugNode, Node, NodeAdapter, NodeComponentsBuilder, PayloadBuilderConfig,
     PayloadTypes,
@@ -127,132 +127,134 @@ impl NodeTypes for N42Node {
 }
 
 /// Builds [`EthApi`](reth_rpc::EthApi) for Ethereum.
-#[derive(Debug, Default)]
+///
+/// This builder creates the Ethereum RPC API implementation using the default
+/// Ethereum network types.
+#[derive(Debug, Default, Clone, Copy)]
 pub struct EthereumEthApiBuilder;
 
 impl<N> EthApiBuilder<N> for EthereumEthApiBuilder
 where
-    N: FullNodeComponents,
-    EthApiFor<N>: FullEthApiServer<Provider = N::Provider, Pool = N::Pool>,
+    N: FullNodeComponents<
+        Types: NodeTypes<ChainSpec: reth_chainspec::Hardforks + EthereumHardforks>,
+        Evm: ConfigureEvm<NextBlockEnvCtx: reth_rpc_eth_api::helpers::pending_block::BuildPendingEnv<reth_node_api::HeaderTy<N::Types>>>,
+    >,
+    reth_rpc::eth::core::EthRpcConverterFor<N, alloy_network::Ethereum>: reth_rpc_eth_api::RpcConvert<
+        Primitives = PrimitivesTy<N::Types>,
+        Error = EthApiError,
+        Network = alloy_network::Ethereum,
+        Evm = N::Evm,
+    >,
+    EthApiError: FromEvmError<N::Evm>,
+    alloy_rpc_types_eth::TransactionRequest: reth_rpc_eth_api::SignableTxRequest<TxTy<N::Types>>,
 {
-    type EthApi = EthApiFor<N>;
+    type EthApi = EthApiFor<N, alloy_network::Ethereum>;
 
     async fn build_eth_api(self, ctx: EthApiCtx<'_, N>) -> eyre::Result<Self::EthApi> {
-        let api = reth_rpc::EthApiBuilder::new(
-            ctx.components.provider().clone(),
-            ctx.components.pool().clone(),
-            ctx.components.network().clone(),
-            ctx.components.evm_config().clone(),
-        )
-        .eth_cache(ctx.cache)
-        .task_spawner(ctx.components.task_executor().clone())
-        .gas_cap(ctx.config.rpc_gas_cap.into())
-        .max_simulate_blocks(ctx.config.rpc_max_simulate_blocks)
-        .eth_proof_window(ctx.config.eth_proof_window)
-        .fee_history_cache_config(ctx.config.fee_history_cache)
-        .proof_permits(ctx.config.proof_permits)
-        .gas_oracle_config(ctx.config.gas_oracle)
-        .build();
-        Ok(api)
+        Ok(ctx.eth_api_builder().map_converter(|r| r.with_network()).build())
     }
 }
 
 /// Add-ons w.r.t. l1 ethereum.
 #[derive(Debug)]
-pub struct EthereumAddOns<N: FullNodeComponents>
-where
-    EthApiFor<N>: FullEthApiServer<Provider = N::Provider, Pool = N::Pool>,
-{
-    inner: RpcAddOns<N, EthereumEthApiBuilder, EthereumEngineValidatorBuilder>,
+pub struct EthereumAddOns<N: FullNodeComponents, EthB: EthApiBuilder<N>, PVB> {
+    inner: RpcAddOns<N, EthB, PVB, BasicEngineApiBuilder<PVB>, BasicEngineValidatorBuilder<PVB>>,
 }
 
-impl<N: FullNodeComponents> Default for EthereumAddOns<N>
-where
-    EthApiFor<N>: FullEthApiServer<Provider = N::Provider, Pool = N::Pool>,
-{
-    fn default() -> Self {
-        Self {
-            inner: Default::default(),
-        }
+impl<N: FullNodeComponents, EthB: EthApiBuilder<N>, PVB> EthereumAddOns<N, EthB, PVB> {
+    /// Create new add-ons with given RPC add-ons.
+    pub fn new(
+        inner: RpcAddOns<N, EthB, PVB, BasicEngineApiBuilder<PVB>, BasicEngineValidatorBuilder<PVB>>,
+    ) -> Self {
+        Self { inner }
     }
 }
 
-impl<N> NodeAddOns<N> for EthereumAddOns<N>
+impl<N> Default for EthereumAddOns<N, EthereumEthApiBuilder, EthereumEngineValidatorBuilder>
 where
     N: FullNodeComponents<
         Types: NodeTypes<
-            ChainSpec = ChainSpec,
+            ChainSpec: EthereumHardforks + Clone + 'static,
+            Payload: reth_engine_primitives::EngineTypes<ExecutionData = alloy_rpc_types_engine::ExecutionData>
+                         + PayloadTypes<PayloadAttributes = EthPayloadAttributes>,
             Primitives = EthPrimitives,
-            Payload = EthEngineTypes,
+        >,
+    >,
+    EthereumEthApiBuilder: EthApiBuilder<N>,
+{
+    fn default() -> Self {
+        Self::new(RpcAddOns::new(
+            EthereumEthApiBuilder::default(),
+            EthereumEngineValidatorBuilder::default(),
+            BasicEngineApiBuilder::default(),
+            BasicEngineValidatorBuilder::default(),
+            Default::default(),
+        ))
+    }
+}
+
+impl<N, EthB, PVB> NodeAddOns<N> for EthereumAddOns<N, EthB, PVB>
+where
+    N: FullNodeComponents<
+        Types: NodeTypes<
+            ChainSpec: EthChainSpec + EthereumHardforks,
+            Primitives = EthPrimitives,
+            Payload: reth_engine_primitives::EngineTypes<ExecutionData = alloy_rpc_types_engine::ExecutionData>,
         >,
         Evm: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes>,
     >,
+    EthB: EthApiBuilder<N>,
+    PVB: PayloadValidatorBuilder<N> + Clone,
+    BasicEngineValidatorBuilder<PVB>: reth_node_builder::rpc::EngineValidatorBuilder<N>,
+    BasicEngineApiBuilder<PVB>: reth_node_builder::rpc::EngineApiBuilder<N>,
     EthApiError: FromEvmError<N::Evm>,
     EvmFactoryFor<N::Evm>: EvmFactory<Tx = TxEnv>,
 {
-    type Handle = RpcHandle<N, EthApiFor<N>>;
+    type Handle = RpcHandle<N, EthB::EthApi>;
 
     async fn launch_add_ons(
         self,
         ctx: reth_node_api::AddOnsContext<'_, N>,
     ) -> eyre::Result<Self::Handle> {
-        let validation_api = ValidationApi::new(
-            ctx.node.provider().clone(),
-            Arc::new(ctx.node.consensus().clone()),
-            ctx.node.evm_config().clone(),
-            ctx.config.rpc.flashbots_config(),
-            Box::new(ctx.node.task_executor().clone()),
-            Arc::new(EthereumEngineValidator::new(ctx.config.chain.clone())),
-        );
-
-        self.inner
-            .launch_add_ons_with(ctx, move |container| {
-                container.modules.merge_if_module_configured(
-                    RethRpcModule::Flashbots,
-                    validation_api.into_rpc(),
-                )?;
-
-                Ok(())
-            })
-            .await
+        self.inner.launch_add_ons(ctx).await
     }
 }
 
-impl<N> RethRpcAddOns<N> for EthereumAddOns<N>
+impl<N, EthB, PVB> RethRpcAddOns<N> for EthereumAddOns<N, EthB, PVB>
 where
     N: FullNodeComponents<
         Types: NodeTypes<
-            ChainSpec = ChainSpec,
+            ChainSpec: EthChainSpec + EthereumHardforks,
             Primitives = EthPrimitives,
-            Payload = EthEngineTypes,
+            Payload: reth_engine_primitives::EngineTypes<ExecutionData = alloy_rpc_types_engine::ExecutionData>,
         >,
         Evm: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes>,
     >,
+    EthB: EthApiBuilder<N>,
+    PVB: PayloadValidatorBuilder<N> + Clone,
+    BasicEngineValidatorBuilder<PVB>: reth_node_builder::rpc::EngineValidatorBuilder<N>,
+    BasicEngineApiBuilder<PVB>: reth_node_builder::rpc::EngineApiBuilder<N>,
     EthApiError: FromEvmError<N::Evm>,
     EvmFactoryFor<N::Evm>: EvmFactory<Tx = TxEnv>,
 {
-    type EthApi = EthApiFor<N>;
+    type EthApi = EthB::EthApi;
 
     fn hooks_mut(&mut self) -> &mut reth_node_builder::rpc::RpcHooks<N, Self::EthApi> {
         self.inner.hooks_mut()
     }
 }
 
-impl<N> EngineValidatorAddOn<N> for EthereumAddOns<N>
+impl<N, EthB, PVB> EngineValidatorAddOn<N> for EthereumAddOns<N, EthB, PVB>
 where
-    N: FullNodeComponents<
-        Types: NodeTypes<
-            ChainSpec = ChainSpec,
-            Primitives = EthPrimitives,
-            Payload = EthEngineTypes,
-        >,
-    >,
-    EthApiFor<N>: FullEthApiServer<Provider = N::Provider, Pool = N::Pool>,
+    N: FullNodeComponents,
+    EthB: EthApiBuilder<N>,
+    PVB: Send,
+    BasicEngineValidatorBuilder<PVB>: reth_node_builder::rpc::EngineValidatorBuilder<N>,
 {
-    type ValidatorBuilder = EthereumEngineValidatorBuilder;
+    type ValidatorBuilder = BasicEngineValidatorBuilder<PVB>;
 
     fn engine_validator_builder(&self) -> Self::ValidatorBuilder {
-        EthereumEngineValidatorBuilder::default()
+        self.inner.engine_validator_builder()
     }
 }
 
@@ -271,6 +273,8 @@ where
 
     type AddOns = EthereumAddOns<
         NodeAdapter<N, <Self::ComponentsBuilder as NodeComponentsBuilder<N>>::Components>,
+        EthereumEthApiBuilder,
+        EthereumEngineValidatorBuilder,
     >;
 
     fn components_builder(&self) -> Self::ComponentsBuilder {

@@ -1379,6 +1379,9 @@ pub trait StaticFileWriter {
 
     /// Commits all changes of all [`StaticFileProviderRW`] of all [`StaticFileSegment`].
     fn commit(&self) -> ProviderResult<()>;
+
+    /// Returns `true` if the static file provider has unwind queued.
+    fn has_unwind_queued(&self) -> bool;
 }
 
 impl<N: NodePrimitives> StaticFileWriter for StaticFileProvider<N> {
@@ -1408,6 +1411,10 @@ impl<N: NodePrimitives> StaticFileWriter for StaticFileProvider<N> {
 
     fn commit(&self) -> ProviderResult<()> {
         self.writers.commit()
+    }
+
+    fn has_unwind_queued(&self) -> bool {
+        self.writers.has_unwind_queued()
     }
 }
 

@@ -72,6 +72,18 @@ impl<N: NodePrimitives> StaticFileWriters<N> {
         }
         Ok(())
     }
+
+    pub(crate) fn has_unwind_queued(&self) -> bool {
+        for writer_lock in [&self.headers, &self.transactions, &self.receipts] {
+            let writer = writer_lock.read();
+            if let Some(writer) = writer.as_ref() {
+                if writer.will_prune_on_commit() {
+                    return true
+                }
+            }
+        }
+        false
+    }
 }
 
 /// Mutable reference to a [`StaticFileProviderRW`] behind a [`RwLockWriteGuard`].
@@ -220,6 +232,11 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         // Updates the [SnapshotProvider] manager
         self.update_index()?;
         Ok(())
+    }
+
+    /// Returns `true` if the writer will prune on commit.
+    pub const fn will_prune_on_commit(&self) -> bool {
+        self.prune_on_commit.is_some()
     }
 
     /// Commits configuration changes to disk and updates the reader index with the new changes.

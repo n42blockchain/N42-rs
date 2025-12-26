@@ -91,3 +91,16 @@ where
         )
     }
 }
+
+// Note: The full EngineValidator trait implementation requires:
+// - Access to database provider (for state access)
+// - EVM configuration implementing ConfigureEngineEvm
+// - Ability to execute blocks and return ExecutedBlock
+//
+// This is handled by BasicEngineValidator in reth-engine-tree, which wraps
+// PayloadValidator (implemented above) with full execution capabilities.
+//
+// For N42, the BasicEngineValidatorBuilder in reth-node-builder creates
+// a BasicEngineValidator that combines:
+// - This EthereumEngineValidator as the inner PayloadValidator
+// - The node's provider, EVM config, and consensus for block execution

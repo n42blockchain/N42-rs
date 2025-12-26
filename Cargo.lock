@@ -9499,6 +9499,7 @@ dependencies = [
  "reth-db",
  "reth-e2e-test-utils",
  "reth-engine-primitives",
+ "reth-engine-tree",
  "reth-ethereum-consensus",
  "reth-ethereum-engine-primitives",
  "reth-ethereum-payload-builder",

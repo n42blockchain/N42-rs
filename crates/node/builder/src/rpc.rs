@@ -1129,9 +1129,8 @@ where
     }
 }
 
-// Note: For N42, we use a simplified implementation that delegates directly to
-// the PayloadValidatorBuilder. Full BasicEngineValidator support requires
-// ConfigureEngineEvm implementation which has API differences with upstream.
+// Note: BasicEngineValidatorBuilder delegates to PayloadValidatorBuilder
+// and requires the validator to implement the full EngineValidator trait.
 impl<Node, PVB> EngineValidatorBuilder<Node> for BasicEngineValidatorBuilder<PVB>
 where
     Node: FullNodeComponents,

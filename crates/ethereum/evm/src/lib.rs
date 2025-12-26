@@ -288,10 +288,17 @@ where
     }
 }
 
-// TODO: Implement ConfigureEngineEvm<ExecutionData> for EthEvmConfig
-// This requires updates to match upstream API changes in ExecutionPayload
-// and related types. For now, engine tree validation uses the default
-// implementation path.
+// NOTE: ConfigureEngineEvm<ExecutionData> implementation for EthEvmConfig
+// requires significant API alignment with upstream reth v1.9.x changes.
+// The implementation involves:
+// - ExecutionPayload field accessors (transactions, excess_blob_gas, fee_recipient, etc.)
+// - TransactionSigned recovery methods (try_recover, with_signer)
+// - ChainSpec Osaka hardfork support (is_osaka_active_at_timestamp)
+//
+// For now, BasicEngineValidatorBuilder uses PayloadValidatorBuilder directly
+// which delegates validation to EthereumEngineValidator implementing PayloadValidator.
+// Full ConfigureEngineEvm support will be added when the N42 chainspec aligns
+// with upstream Ethereum hardfork definitions.
 
 #[cfg(test)]
 mod tests {

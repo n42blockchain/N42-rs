@@ -63,7 +63,7 @@ where
 /// * `provider` - The blockchain database provider
 /// * `evm_config` - The EVM configuration
 /// * `chain_id` - The chain ID for verification
-pub async fn create_invalid_block_hook<N, P, E>(
+pub(crate) async fn create_invalid_block_hook<N, P, E>(
     config: &NodeConfig<P::ChainSpec>,
     data_dir: &ChainPath<DataDirPath>,
     provider: P,

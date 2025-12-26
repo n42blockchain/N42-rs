@@ -1,14 +1,14 @@
 //! Helper types that can be used by launchers.
 
 use crate::{
-    components::{NodeComponents, NodeComponentsBuilder},
+    components::NodeComponentsBuilder,
     hooks::OnComponentInitializedHook,
     BuilderContext, NodeAdapter,
 };
 use alloy_consensus::BlockHeader as _;
 use alloy_eips::eip2124::Head;
 use alloy_primitives::{BlockNumber, B256};
-use eyre::{Context, OptionExt};
+use eyre::Context;
 use rayon::ThreadPoolBuilder;
 use reth_chainspec::{Chain, EthChainSpec, EthereumHardfork, EthereumHardforks};
 use reth_config::{config::EtlConfig, PruneConfig};
@@ -44,7 +44,6 @@ use reth_provider::{
     StaticFileProviderFactory,
 };
 use reth_prune::{PruneModes, PrunerBuilder};
-use reth_rpc_api::clients::EthApiClient;
 use reth_rpc_builder::config::RethRpcServerConfig;
 use reth_rpc_layer::JwtSecret;
 use reth_stages::{sets::DefaultStages, MetricEvent, PipelineBuilder, PipelineTarget, StageId};
@@ -942,40 +941,6 @@ where
     >,
     CB: NodeComponentsBuilder<T>,
 {
-    // TODO: InvalidBlockHook is not available in reth v1.8.4
-    // This feature requires reth v1.9.0+
-    // pub fn invalid_block_hook(&self) -> eyre::Result<Box<dyn InvalidBlockHook<...>>> { ... }
-
-    /// Returns an RPC client for the healthy node, if configured in the node config.
-    fn get_healthy_node_client(&self) -> eyre::Result<Option<jsonrpsee::http_client::HttpClient>> {
-        self.node_config()
-            .debug
-            .healthy_node_rpc_url
-            .as_ref()
-            .map(|url| {
-                let client = jsonrpsee::http_client::HttpClientBuilder::default().build(url)?;
-
-                // Verify that the healthy node is running the same chain as the current node.
-                let chain_id = futures::executor::block_on(async {
-                    EthApiClient::<
-                        alloy_rpc_types::TransactionRequest,
-                        alloy_rpc_types::Transaction,
-                        alloy_rpc_types::Block,
-                        alloy_rpc_types::Receipt,
-                        alloy_rpc_types::Header,
-                        alloy_consensus::TxEnvelope,
-                    >::chain_id(&client)
-                    .await
-                })?
-                .ok_or_eyre("healthy node rpc client didn't return a chain id")?;
-                if chain_id.to::<u64>() != self.chain_id().id() {
-                    eyre::bail!("invalid chain id for healthy node: {chain_id}")
-                }
-
-                Ok(client)
-            })
-            .transpose()
-    }
 }
 
 /// Joins two attachments together.

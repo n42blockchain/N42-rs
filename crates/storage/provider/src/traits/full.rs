@@ -11,8 +11,6 @@ use crate::{
 use reth_chain_state::{CanonStateSubscriptions, ForkChoiceSubscriptions};
 use reth_node_types::{BlockTy, HeaderTy, NodeTypesWithDB, ReceiptTy, TxTy};
 use reth_storage_api::NodePrimitivesProvider;
-use reth_storage_api::{BeaconProvider, BeaconProviderWriter};
-use reth_storage_api::{SnapshotProvider, SnapshotProviderWriter};
 use std::fmt::Debug;
 
 /// Helper trait to unify all provider traits for simplicity.

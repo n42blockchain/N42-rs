@@ -13,13 +13,10 @@ use reth_ethereum_engine_primitives::{
     EthBuiltPayload, EthPayloadAttributes, EthPayloadBuilderAttributes,
 };
 use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
-use reth_evm::{
-    eth::spec::EthExecutorSpec, ConfigureEvm, EvmFactory, EvmFactoryFor, NextBlockEnvAttributes,
-};
+use reth_evm::{ConfigureEvm, EvmFactory, EvmFactoryFor, NextBlockEnvAttributes};
 use reth_network::{primitives::BasicNetworkPrimitives, NetworkHandle, PeersInfo};
 use reth_node_api::{
-    AddOnsContext, FullNodeComponents, HeaderTy, NodeAddOns, NodePrimitives, PrimitivesTy,
-    TreeConfig, TxTy,
+    AddOnsContext, FullNodeComponents, HeaderTy, NodeAddOns, NodePrimitives, PrimitivesTy, TxTy,
 };
 use reth_node_builder::{
     components::{
@@ -40,7 +37,7 @@ use reth_rpc::{
     eth::core::{EthApiFor, EthRpcConverterFor},
     ValidationApi,
 };
-use reth_rpc_api::{eth::FullEthApiServer, servers::BlockSubmissionValidationApiServer};
+use reth_rpc_api::servers::BlockSubmissionValidationApiServer;
 use reth_rpc_builder::config::RethRpcServerConfig;
 use reth_rpc_eth_api::{
     helpers::pending_block::BuildPendingEnv,

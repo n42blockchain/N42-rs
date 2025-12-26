@@ -8,15 +8,13 @@ use alloy_rpc_types::engine::ClientVersionV1;
 use alloy_rpc_types_engine::ExecutionData;
 use jsonrpsee::{core::middleware::layer::Either, RpcModule};
 use reth_chain_state::CanonStateSubscriptions;
-use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks, Hardforks};
+use reth_chainspec::{ChainSpecProvider, EthereumHardforks, Hardforks};
 use reth_engine_primitives::{ConsensusEngineEvent, ConsensusEngineHandle};
-use reth_evm::ConfigureEngineEvm;
 use reth_node_api::{
-    AddOnsContext, BlockTy, EngineApiValidator, EngineTypes, FullNodeComponents, FullNodeTypes,
+    AddOnsContext, EngineApiValidator, EngineTypes, FullNodeComponents, FullNodeTypes,
     NodeAddOns, NodeTypes, PayloadTypes, PayloadValidator, PrimitivesTy, TreeConfig,
 };
 use reth_node_core::{
-    cli::config::RethTransactionPoolConfig,
     node_config::NodeConfig,
     version::{CARGO_PKG_VERSION, CLIENT_CODE, NAME_CLIENT, VERGEN_GIT_SHA},
 };

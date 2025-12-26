@@ -8820,6 +8820,7 @@ dependencies = [
  "reth-provider",
  "reth-prune",
  "reth-revm",
+ "reth-rpc-server-types",
  "reth-stages",
  "reth-static-file",
  "reth-tasks",

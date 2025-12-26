@@ -220,6 +220,8 @@ pub struct NetworkConfigBuilder<N: NetworkPrimitives = EthNetworkPrimitives> {
     /// The Ethereum P2P handshake, see also:
     /// <https://github.com/ethereum/devp2p/blob/master/rlpx.md#initial-handshake>.
     handshake: Arc<dyn EthRlpxHandshake>,
+    /// Optional network id
+    network_id: Option<u64>,
 }
 
 impl NetworkConfigBuilder<EthNetworkPrimitives> {
@@ -260,6 +262,7 @@ impl<N: NetworkPrimitives> NetworkConfigBuilder<N> {
             transactions_manager_config: Default::default(),
             nat: None,
             handshake: Arc::new(EthHandshake::default()),
+            network_id: None,
         }
     }
 
@@ -568,6 +571,14 @@ impl<N: NetworkPrimitives> NetworkConfigBuilder<N> {
         self
     }
 
+    /// Sets an optional network id.
+    ///
+    /// If set, this overrides the chain id when establishing connections.
+    pub fn network_id(mut self, network_id: Option<u64>) -> Self {
+        self.network_id = network_id;
+        self
+    }
+
     /// Consumes the type and creates the actual [`NetworkConfig`]
     /// for the given client type that can interact with the chain.
     ///
@@ -600,6 +611,7 @@ impl<N: NetworkPrimitives> NetworkConfigBuilder<N> {
             transactions_manager_config,
             nat,
             handshake,
+            network_id,
         } = self;
 
         let head = head.unwrap_or_else(|| Head {
@@ -631,8 +643,8 @@ impl<N: NetworkPrimitives> NetworkConfigBuilder<N> {
         // set a fork filter based on the chain spec and head
         let fork_filter = chain_spec.fork_filter(head);
 
-        // get the chain id
-        let chain_id = chain_spec.chain().id();
+        // get the chain id, preferring explicit network_id if set
+        let chain_id = network_id.unwrap_or_else(|| chain_spec.chain().id());
 
         // If default DNS config is used then we add the known dns network to bootstrap from
         if let Some(dns_networks) =

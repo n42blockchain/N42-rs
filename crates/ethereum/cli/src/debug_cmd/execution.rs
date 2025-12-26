@@ -86,11 +86,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
             .into_task_with(task_executor);
 
         let stage_conf = &config.stages;
-        let prune_modes = config
-            .prune
-            .clone()
-            .map(|prune| prune.segments)
-            .unwrap_or_default();
+        let prune_modes = config.prune.segments.clone();
 
         let (tip_tx, tip_rx) = watch::channel(B256::ZERO);
         let executor = EthExecutorProvider::ethereum(provider_factory.chain_spec());

@@ -347,7 +347,8 @@ impl Default for NetworkArgs {
             max_seen_tx_history: DEFAULT_MAX_COUNT_TRANSACTIONS_SEEN_BY_PEER,
             max_capacity_cache_txns_pending_fetch: DEFAULT_MAX_CAPACITY_CACHE_PENDING_FETCH,
             net_if: None,
-            tx_propagation_policy: TransactionPropagationKind::default()
+            tx_propagation_policy: TransactionPropagationKind::default(),
+            network_id: None,
         }
     }
 }

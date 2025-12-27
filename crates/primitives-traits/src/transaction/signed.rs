@@ -135,7 +135,8 @@ pub trait SignedTransaction:
 impl<T> SignedTransaction for EthereumTxEnvelope<T>
 where
     T: RlpEcdsaEncodableTx + SignableTransaction<Signature> + Unpin,
-    Self: Clone + PartialEq + Eq + Decodable + Decodable2718 + MaybeSerde + InMemorySize + TxHashRef,
+    Self:
+        Clone + PartialEq + Eq + Decodable + Decodable2718 + MaybeSerde + InMemorySize + TxHashRef,
 {
     fn recover_signer_unchecked_with_buf(
         &self,

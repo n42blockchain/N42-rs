@@ -4,7 +4,7 @@
 //! Tests for N42 storage module
 
 use crate::*;
-use alloy_primitives::{B256, Address};
+use alloy_primitives::{Address, B256};
 
 mod error_tests {
     use super::*;
@@ -68,4 +68,3 @@ mod table_tests {
         assert!(N42_TABLES.contains(&names::VALIDATOR_CHANGE_SETS));
     }
 }
-

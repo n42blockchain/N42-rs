@@ -320,14 +320,23 @@ struct BeaconExecutionPayloadV2<'a> {
 
 impl<'a> From<BeaconExecutionPayloadV2<'a>> for ExecutionPayloadV2 {
     fn from(payload: BeaconExecutionPayloadV2<'a>) -> Self {
-        let BeaconExecutionPayloadV2 { payload_inner, withdrawals } = payload;
-        Self { payload_inner: payload_inner.into(), withdrawals }
+        let BeaconExecutionPayloadV2 {
+            payload_inner,
+            withdrawals,
+        } = payload;
+        Self {
+            payload_inner: payload_inner.into(),
+            withdrawals,
+        }
     }
 }
 
 impl<'a> From<&'a ExecutionPayloadV2> for BeaconExecutionPayloadV2<'a> {
     fn from(value: &'a ExecutionPayloadV2) -> Self {
-        let ExecutionPayloadV2 { payload_inner, withdrawals } = value;
+        let ExecutionPayloadV2 {
+            payload_inner,
+            withdrawals,
+        } = value;
         BeaconExecutionPayloadV2 {
             payload_inner: payload_inner.into(),
             withdrawals: withdrawals.clone(),
@@ -374,14 +383,26 @@ struct BeaconExecutionPayloadV3<'a> {
 
 impl<'a> From<BeaconExecutionPayloadV3<'a>> for ExecutionPayloadV3 {
     fn from(payload: BeaconExecutionPayloadV3<'a>) -> Self {
-        let BeaconExecutionPayloadV3 { payload_inner, blob_gas_used, excess_blob_gas } = payload;
-        Self { payload_inner: payload_inner.into(), blob_gas_used, excess_blob_gas }
+        let BeaconExecutionPayloadV3 {
+            payload_inner,
+            blob_gas_used,
+            excess_blob_gas,
+        } = payload;
+        Self {
+            payload_inner: payload_inner.into(),
+            blob_gas_used,
+            excess_blob_gas,
+        }
     }
 }
 
 impl<'a> From<&'a ExecutionPayloadV3> for BeaconExecutionPayloadV3<'a> {
     fn from(value: &'a ExecutionPayloadV3) -> Self {
-        let ExecutionPayloadV3 { payload_inner, blob_gas_used, excess_blob_gas } = value;
+        let ExecutionPayloadV3 {
+            payload_inner,
+            blob_gas_used,
+            excess_blob_gas,
+        } = value;
         BeaconExecutionPayloadV3 {
             payload_inner: payload_inner.into(),
             blob_gas_used: *blob_gas_used,

@@ -1,9 +1,8 @@
 //! Helper types that can be used by launchers.
 
 use crate::{
-    components::NodeComponentsBuilder,
-    hooks::OnComponentInitializedHook,
-    BuilderContext, NodeAdapter,
+    components::NodeComponentsBuilder, hooks::OnComponentInitializedHook, BuilderContext,
+    NodeAdapter,
 };
 use alloy_consensus::BlockHeader as _;
 use alloy_eips::eip2124::Head;
@@ -71,12 +70,18 @@ pub struct LaunchContext {
 impl LaunchContext {
     /// Create a new instance of the default node launcher.
     pub const fn new(task_executor: TaskExecutor, data_dir: ChainPath<DataDirPath>) -> Self {
-        Self { task_executor, data_dir }
+        Self {
+            task_executor,
+            data_dir,
+        }
     }
 
     /// Create launch context with attachment.
     pub const fn with<T>(self, attachment: T) -> LaunchContextWith<T> {
-        LaunchContextWith { inner: self, attachment }
+        LaunchContextWith {
+            inner: self,
+            attachment,
+        }
     }
 
     /// Loads the reth config with the configured `data_dir` and overrides settings according to the
@@ -91,7 +96,10 @@ impl LaunchContext {
         ChainSpec: EthChainSpec + reth_chainspec::EthereumHardforks,
     {
         let toml_config = self.load_toml_config(&config)?;
-        Ok(self.with(WithConfigs { config, toml_config }))
+        Ok(self.with(WithConfigs {
+            config,
+            toml_config,
+        }))
     }
 
     /// Loads the reth config with the configured `data_dir` and overrides settings according to the
@@ -105,7 +113,10 @@ impl LaunchContext {
     where
         ChainSpec: EthChainSpec + reth_chainspec::EthereumHardforks,
     {
-        let config_path = config.config.clone().unwrap_or_else(|| self.data_dir.config());
+        let config_path = config
+            .config
+            .clone()
+            .unwrap_or_else(|| self.data_dir.config());
 
         let mut toml_config = reth_config::Config::from_path(&config_path)
             .wrap_err_with(|| format!("Could not load config file {config_path:?}"))?;
@@ -198,7 +209,8 @@ impl<T> LaunchContextWith<T> {
     /// - Raising the file descriptor limit
     /// - Configuring the global rayon thread pool
     pub fn configure_globals(&self, reserved_cpu_cores: u64) {
-        self.inner.configure_globals(reserved_cpu_cores.try_into().unwrap());
+        self.inner
+            .configure_globals(reserved_cpu_cores.try_into().unwrap());
     }
 
     /// Returns the data directory.
@@ -583,12 +595,15 @@ where
     ) -> LaunchContextWith<Attached<WithConfigs<T::ChainSpec>, WithMeteredProvider<T>>> {
         let (metrics_sender, metrics_receiver) = unbounded_channel();
 
-        let with_metrics =
-            WithMeteredProvider { provider_factory: self.right().clone(), metrics_sender };
+        let with_metrics = WithMeteredProvider {
+            provider_factory: self.right().clone(),
+            metrics_sender,
+        };
 
         debug!(target: "reth::cli", "Spawning stages metrics listener task");
         let sync_metrics_listener = reth_stages::MetricsListener::new(metrics_receiver);
-        self.task_executor().spawn_critical("stages metrics listener task", sync_metrics_listener);
+        self.task_executor()
+            .spawn_critical("stages metrics listener task", sync_metrics_listener);
 
         LaunchContextWith {
             inner: self.inner,
@@ -760,7 +775,9 @@ where
     where
         C: HeadersClient<Header: BlockHeader>,
     {
-        self.node_config().max_block(client, self.provider_factory().clone()).await
+        self.node_config()
+            .max_block(client, self.provider_factory().clone())
+            .await
     }
 
     /// Returns the static file provider to interact with the static files.
@@ -824,9 +841,9 @@ where
     /// This checks for OP-Mainnet and ensures we have all the necessary data to progress (past
     /// bedrock height)
     fn ensure_chain_specific_db_checks(&self) -> ProviderResult<()> {
-        if self.chain_spec().is_optimism() &&
-            !self.is_dev() &&
-            self.chain_id() == Chain::optimism_mainnet()
+        if self.chain_spec().is_optimism()
+            && !self.is_dev()
+            && self.chain_id() == Chain::optimism_mainnet()
         {
             let latest = self.blockchain_db().last_block_number()?;
             // bedrock height
@@ -834,7 +851,7 @@ where
                 error!(
                     "Op-mainnet has been launched without importing the pre-Bedrock state. The chain can't progress without this. See also https://reth.rs/run/sync-op-mainnet.html?minimal-bootstrap-recommended"
                 );
-                return Err(ProviderError::BestBlockNotFound)
+                return Err(ProviderError::BestBlockNotFound);
             }
         }
 
@@ -899,11 +916,15 @@ where
         T: FullNodeTypes<Provider: StaticFileProviderFactory>,
     {
         if self.node_config().pruning.bodies_pre_merge {
-            if let Some(merge_block) =
-                self.chain_spec().ethereum_fork_activation(EthereumHardfork::Paris).block_number()
+            if let Some(merge_block) = self
+                .chain_spec()
+                .ethereum_fork_activation(EthereumHardfork::Paris)
+                .block_number()
             {
                 // Ensure we only expire transactions after we synced past the merge block.
-                let Some(latest) = self.blockchain_db().latest_header()? else { return Ok(()) };
+                let Some(latest) = self.blockchain_db().latest_header()? else {
+                    return Ok(());
+                };
                 if latest.number() > merge_block {
                     let provider = self.blockchain_db().static_file_provider();
                     if provider.get_lowest_transaction_static_file_block() < Some(merge_block) {
@@ -1005,7 +1026,10 @@ pub struct WithConfigs<ChainSpec> {
 
 impl<ChainSpec> Clone for WithConfigs<ChainSpec> {
     fn clone(&self) -> Self {
-        Self { config: self.config.clone(), toml_config: self.toml_config.clone() }
+        Self {
+            config: self.config.clone(),
+            toml_config: self.toml_config.clone(),
+        }
     }
 }
 

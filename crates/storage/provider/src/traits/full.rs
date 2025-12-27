@@ -4,7 +4,7 @@
 //! Helper provider traits to encapsulate all provider traits for simplicity.
 
 use crate::{
-    AccountReader, BlockReaderIdExt, BlockReader, ChainSpecProvider, ChangeSetReader,
+    AccountReader, BlockReader, BlockReaderIdExt, ChainSpecProvider, ChangeSetReader,
     DatabaseProviderFactory, HashedPostStateProvider, PruneCheckpointReader, StageCheckpointReader,
     StateProviderFactory, StateReader, StaticFileProviderFactory, TrieReader,
 };

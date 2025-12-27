@@ -16,7 +16,8 @@ use reth_ethereum_primitives::{Block, EthPrimitives};
 use reth_node_api::PayloadTypes;
 use reth_payload_primitives::{
     validate_execution_requests, validate_version_specific_fields, EngineApiMessageVersion,
-    EngineObjectValidationError, InvalidPayloadAttributesError, NewPayloadError, PayloadOrAttributes,
+    EngineObjectValidationError, InvalidPayloadAttributesError, NewPayloadError,
+    PayloadOrAttributes,
 };
 use reth_primitives_traits::RecoveredBlock;
 use std::sync::Arc;
@@ -94,9 +95,11 @@ where
 }
 
 /// Type alias for the validation outcome used by EngineValidator.
-pub type EthValidationOutcome = reth_engine_tree::tree::payload_validator::ValidationOutcome<EthPrimitives>;
+pub type EthValidationOutcome =
+    reth_engine_tree::tree::payload_validator::ValidationOutcome<EthPrimitives>;
 
-impl<ChainSpec, Types> reth_engine_tree::tree::EngineValidator<Types, EthPrimitives> for EthereumEngineValidator<ChainSpec>
+impl<ChainSpec, Types> reth_engine_tree::tree::EngineValidator<Types, EthPrimitives>
+    for EthereumEngineValidator<ChainSpec>
 where
     ChainSpec: EthChainSpec + EthereumHardforks + 'static,
     Types: PayloadTypes<PayloadAttributes = EthPayloadAttributes, ExecutionData = ExecutionData>,
@@ -143,7 +146,9 @@ where
                     )
                 ))
             }
-            Err(e) => Err(reth_engine_tree::tree::error::InsertPayloadError::Payload(e)),
+            Err(e) => Err(reth_engine_tree::tree::error::InsertPayloadError::Payload(
+                e,
+            )),
         }
     }
 

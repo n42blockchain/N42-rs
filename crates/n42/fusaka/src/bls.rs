@@ -230,10 +230,10 @@ mod tests {
     #[test]
     fn test_validate_pairing_input() {
         let pair_size = G1_POINT_SIZE + G2_POINT_SIZE;
-        
+
         let valid_input = vec![0u8; pair_size];
         assert!(validate_pairing_input(&valid_input).is_ok());
-        
+
         let valid_input_2pairs = vec![0u8; pair_size * 2];
         assert!(validate_pairing_input(&valid_input_2pairs).is_ok());
 
@@ -253,8 +253,13 @@ mod tests {
 
     #[test]
     fn test_pairing_gas() {
-        assert_eq!(pairing_gas(1), BLS12_PAIRING_BASE_GAS + BLS12_PAIRING_PAIR_GAS);
-        assert_eq!(pairing_gas(2), BLS12_PAIRING_BASE_GAS + 2 * BLS12_PAIRING_PAIR_GAS);
+        assert_eq!(
+            pairing_gas(1),
+            BLS12_PAIRING_BASE_GAS + BLS12_PAIRING_PAIR_GAS
+        );
+        assert_eq!(
+            pairing_gas(2),
+            BLS12_PAIRING_BASE_GAS + 2 * BLS12_PAIRING_PAIR_GAS
+        );
     }
 }
-

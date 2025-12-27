@@ -166,7 +166,7 @@ where
                 "beacon_state not found by hash, {:?}",
                 beacon_block_hash
             ))?;
-        
+
         // Search for validator by pubkey using validators_store
         let pubkey_bytes: [u8; 48] = pubkey.to_bytes();
         for (index, validator) in beacon_state.validators_store.iter().enumerate() {

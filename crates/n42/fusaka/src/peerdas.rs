@@ -86,16 +86,17 @@ impl DataColumn {
 /// based on their node ID.
 pub fn custody_columns(node_id: &B256, custody_subnet_count: usize) -> Vec<ColumnIndex> {
     let mut columns = Vec::new();
-    
+
     // Simplified column assignment based on node ID
     // In production, this would use more sophisticated selection
     let start_column = (node_id.as_slice()[0] as usize) % NUMBER_OF_COLUMNS;
-    
+
     for i in 0..custody_subnet_count {
-        let column = (start_column + i * (NUMBER_OF_COLUMNS / custody_subnet_count)) % NUMBER_OF_COLUMNS;
+        let column =
+            (start_column + i * (NUMBER_OF_COLUMNS / custody_subnet_count)) % NUMBER_OF_COLUMNS;
         columns.push(column);
     }
-    
+
     columns
 }
 
@@ -183,10 +184,10 @@ mod tests {
     fn test_data_column_new() {
         let column = DataColumn::new(0);
         assert!(column.is_ok());
-        
+
         let column = DataColumn::new(NUMBER_OF_COLUMNS - 1);
         assert!(column.is_ok());
-        
+
         let column = DataColumn::new(NUMBER_OF_COLUMNS);
         assert!(matches!(column, Err(PeerDasError::InvalidColumnIndex(_))));
     }
@@ -219,7 +220,7 @@ mod tests {
         let node_id = B256::from([1u8; 32]);
         let columns = custody_columns(&node_id, 4);
         assert_eq!(columns.len(), 4);
-        
+
         // All columns should be unique
         let mut unique = columns.clone();
         unique.sort();
@@ -237,14 +238,13 @@ mod tests {
     #[test]
     fn test_osaka_blob_params() {
         let params = OsakaBlobParams::default();
-        
+
         assert!(params.is_valid_blob_count(0));
         assert!(params.is_valid_blob_count(OSAKA_MAX_BLOB_COUNT));
         assert!(!params.is_valid_blob_count(OSAKA_MAX_BLOB_COUNT + 1));
-        
+
         assert!(params.is_valid_tx_blob_count(0));
         assert!(params.is_valid_tx_blob_count(OSAKA_MAX_BLOBS_PER_TX));
         assert!(!params.is_valid_tx_blob_count(OSAKA_MAX_BLOBS_PER_TX + 1));
     }
 }
-

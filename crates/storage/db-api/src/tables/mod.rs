@@ -19,6 +19,7 @@ pub mod codecs;
 mod raw;
 pub use raw::{RawDupSort, RawKey, RawTable, RawValue, TableRawRow};
 
+use crate::models::BlockNumberHashedAddress;
 use crate::{
     models::{
         accounts::BlockNumberAddress,
@@ -36,8 +37,9 @@ use reth_ethereum_primitives::{Receipt, TransactionSigned};
 use reth_primitives_traits::{Account, Bytecode, StorageEntry};
 use reth_prune_types::{PruneCheckpoint, PruneSegment};
 use reth_stages_types::StageCheckpoint;
-use reth_trie_common::{BranchNodeCompact, StorageTrieEntry, StoredNibbles, StoredNibblesSubKey, TrieChangeSetsEntry};
-use crate::models::BlockNumberHashedAddress;
+use reth_trie_common::{
+    BranchNodeCompact, StorageTrieEntry, StoredNibbles, StoredNibblesSubKey, TrieChangeSetsEntry,
+};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 

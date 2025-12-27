@@ -6,13 +6,13 @@ use alloy_rpc_types::{Block, Header, Receipt, Transaction, TransactionRequest};
 use eyre::OptionExt;
 use reth_chainspec::EthChainSpec;
 use reth_engine_primitives::InvalidBlockHook;
+use reth_node_api::NodePrimitives;
 use reth_node_api::{FullNodeComponents, NodeTypes};
 use reth_node_core::{
     args::InvalidBlockHookType,
     dirs::{ChainPath, DataDirPath},
     node_config::NodeConfig,
 };
-use reth_node_api::NodePrimitives;
 use reth_provider::ChainSpecProvider;
 use reth_rpc_api::EthApiClient;
 
@@ -84,7 +84,7 @@ where
     use reth_invalid_block_hooks::InvalidBlockWitnessHook;
 
     let Some(ref hook) = config.debug.invalid_block_hook else {
-        return Ok(Box::new(NoopInvalidBlockHook::default()))
+        return Ok(Box::new(NoopInvalidBlockHook::default()));
     };
 
     let healthy_node_rpc_client = get_healthy_node_client(config, chain_id).await?;
@@ -141,9 +141,12 @@ where
     .ok_or_eyre("healthy node rpc client didn't return a chain id")?;
 
     if healthy_chain_id.to::<u64>() != chain_id {
-        eyre::bail!("Invalid chain ID. Expected {}, got {}", chain_id, healthy_chain_id);
+        eyre::bail!(
+            "Invalid chain ID. Expected {}, got {}",
+            chain_id,
+            healthy_chain_id
+        );
     }
 
     Ok(Some(client))
 }
-

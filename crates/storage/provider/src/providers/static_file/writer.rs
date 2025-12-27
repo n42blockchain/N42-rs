@@ -78,7 +78,7 @@ impl<N: NodePrimitives> StaticFileWriters<N> {
             let writer = writer_lock.read();
             if let Some(writer) = writer.as_ref() {
                 if writer.will_prune_on_commit() {
-                    return true
+                    return true;
                 }
             }
         }
@@ -555,11 +555,7 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
     /// blocks.
     ///
     /// Returns the current [`BlockNumber`] as seen in the static file.
-    pub fn append_header(
-        &mut self,
-        header: &N::BlockHeader,
-        hash: &BlockHash,
-    ) -> ProviderResult<()>
+    pub fn append_header(&mut self, header: &N::BlockHeader, hash: &BlockHash) -> ProviderResult<()>
     where
         N::BlockHeader: Compact,
     {

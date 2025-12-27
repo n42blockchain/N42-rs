@@ -13,7 +13,7 @@ mod hardfork_tests {
     fn test_osaka_after_prague() {
         // Osaka (CL) should activate after Prague (EL)
         assert!(N42_OSAKA_TIMESTAMP > N42_PRAGUE_TIMESTAMP);
-        
+
         // Time difference should be reasonable (about 1 month)
         let diff = N42_OSAKA_TIMESTAMP - N42_PRAGUE_TIMESTAMP;
         assert!(diff > 0);
@@ -24,7 +24,7 @@ mod hardfork_tests {
     fn test_osaka_timestamp_valid() {
         // 2025-07-01 00:00:00 UTC
         assert_eq!(N42_OSAKA_TIMESTAMP, 1751328000);
-        
+
         // Verify it's in the future (as of code writing)
         // and a reasonable date
         assert!(N42_OSAKA_TIMESTAMP > 1700000000); // After 2023
@@ -40,8 +40,11 @@ mod bls_precompile_tests {
         let addresses = &BLS_PRECOMPILE_ADDRESSES;
         for i in 0..addresses.len() {
             for j in (i + 1)..addresses.len() {
-                assert_ne!(addresses[i], addresses[j], 
-                    "Addresses at {} and {} should be different", i, j);
+                assert_ne!(
+                    addresses[i], addresses[j],
+                    "Addresses at {} and {} should be different",
+                    i, j
+                );
             }
         }
     }
@@ -51,14 +54,22 @@ mod bls_precompile_tests {
         // BLS precompiles are 0x0b through 0x13
         for (i, addr) in BLS_PRECOMPILE_ADDRESSES.iter().enumerate() {
             let expected_byte = 0x0b + i as u8;
-            assert_eq!(addr.as_slice()[19], expected_byte,
-                "Address {} should end with 0x{:02x}", i, expected_byte);
+            assert_eq!(
+                addr.as_slice()[19],
+                expected_byte,
+                "Address {} should end with 0x{:02x}",
+                i,
+                expected_byte
+            );
         }
     }
 
     #[test]
     fn test_bls_error_display() {
-        let err = BlsError::InvalidInputLength { expected: 128, actual: 64 };
+        let err = BlsError::InvalidInputLength {
+            expected: 128,
+            actual: 64,
+        };
         assert!(format!("{}", err).contains("128"));
         assert!(format!("{}", err).contains("64"));
 
@@ -71,8 +82,10 @@ mod bls_precompile_tests {
         for addr in &BLS_PRECOMPILE_ADDRESSES {
             let name = bls_precompile_name(addr);
             assert!(name.is_some(), "Address {:?} should have a name", addr);
-            assert!(name.unwrap().starts_with("BLS12_"), 
-                "Name should start with BLS12_");
+            assert!(
+                name.unwrap().starts_with("BLS12_"),
+                "Name should start with BLS12_"
+            );
         }
     }
 }
@@ -98,14 +111,20 @@ mod gas_calculation_tests {
         let gas_1 = g1_multiexp_gas(1);
         let gas_2 = g1_multiexp_gas(2);
         let gas_4 = g1_multiexp_gas(4);
-        
+
         // Per-pair cost should decrease with more pairs
         let per_pair_1 = gas_1 / 1;
         let per_pair_2 = gas_2 / 2;
         let per_pair_4 = gas_4 / 4;
-        
-        assert!(per_pair_2 < per_pair_1, "2 pairs should be cheaper per pair than 1");
-        assert!(per_pair_4 < per_pair_2, "4 pairs should be cheaper per pair than 2");
+
+        assert!(
+            per_pair_2 < per_pair_1,
+            "2 pairs should be cheaper per pair than 1"
+        );
+        assert!(
+            per_pair_4 < per_pair_2,
+            "4 pairs should be cheaper per pair than 2"
+        );
     }
 
     #[test]
@@ -113,7 +132,7 @@ mod gas_calculation_tests {
         let gas_1 = pairing_gas(1);
         let gas_2 = pairing_gas(2);
         let gas_3 = pairing_gas(3);
-        
+
         // Pairing gas should increase linearly
         assert_eq!(gas_2 - gas_1, BLS12_PAIRING_PAIR_GAS);
         assert_eq!(gas_3 - gas_2, BLS12_PAIRING_PAIR_GAS);
@@ -181,10 +200,10 @@ mod peerdas_tests {
     #[test]
     fn test_osaka_blob_params_consistency() {
         let params = OsakaBlobParams::new();
-        
+
         // Target should be less than max
         assert!(params.target_blob_count < params.max_blob_count);
-        
+
         // Per-tx max should not exceed block max
         assert!(params.max_blobs_per_tx <= params.max_blob_count);
     }
@@ -194,7 +213,7 @@ mod peerdas_tests {
         let node_id = B256::from([42u8; 32]);
         let columns1 = custody_columns(&node_id, 4);
         let columns2 = custody_columns(&node_id, 4);
-        
+
         assert_eq!(columns1, columns2, "Same node ID should get same columns");
     }
 
@@ -202,10 +221,10 @@ mod peerdas_tests {
     fn test_custody_columns_different_nodes() {
         let node1 = B256::from([1u8; 32]);
         let node2 = B256::from([2u8; 32]);
-        
+
         let columns1 = custody_columns(&node1, 4);
         let columns2 = custody_columns(&node2, 4);
-        
+
         // Different nodes should likely have different columns
         // (not guaranteed but highly probable)
         assert_ne!(columns1, columns2);
@@ -215,11 +234,11 @@ mod peerdas_tests {
     fn test_data_column_validation() {
         let mut column = DataColumn::new(0).unwrap();
         assert!(column.is_valid());
-        
+
         // Add mismatched data
         column.cells.push(vec![0u8; 32]);
         assert!(!column.is_valid());
-        
+
         // Fix by adding proof
         column.proofs.push(B256::ZERO);
         assert!(column.is_valid());
@@ -231,7 +250,7 @@ mod peerdas_tests {
         let samples_1 = samples_needed_for_availability(1);
         let samples_2 = samples_needed_for_availability(2);
         let samples_3 = samples_needed_for_availability(3);
-        
+
         assert!(samples_2 > samples_1);
         assert!(samples_3 > samples_2);
     }
@@ -243,18 +262,18 @@ mod integration_tests {
     #[test]
     fn test_fusaka_complete_feature_set() {
         // Verify all Fusaka features are available
-        
+
         // 1. BLS precompiles
         assert_eq!(BLS_PRECOMPILE_ADDRESSES.len(), 9);
-        
+
         // 2. PeerDAS constants
         assert!(NUMBER_OF_COLUMNS > 0);
         assert!(CELLS_PER_EXT_BLOB > 0);
-        
+
         // 3. Osaka blob params
         let params = OsakaBlobParams::new();
         assert!(params.max_blob_count > 0);
-        
+
         // 4. Timestamps configured
         assert!(N42_OSAKA_TIMESTAMP > 0);
         assert!(N42_PRAGUE_TIMESTAMP > 0);
@@ -264,13 +283,12 @@ mod integration_tests {
     fn test_blob_capacity_increase() {
         // Cancun: target=3, max=6
         // Osaka: target=6, max=9
-        
+
         assert_eq!(OSAKA_TARGET_BLOB_COUNT, 6);
         assert_eq!(OSAKA_MAX_BLOB_COUNT, 9);
-        
+
         // Verify increase from Cancun
         let cancun_max = 6u64;
         assert!(OSAKA_MAX_BLOB_COUNT > cancun_max);
     }
 }
-

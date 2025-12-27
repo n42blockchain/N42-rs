@@ -2561,11 +2561,11 @@ mod tests {
     #[test]
     fn test_relative_epoch_into_epoch() {
         let base_epoch: u64 = 10;
-        
+
         assert_eq!(RelativeEpoch::Current.into_epoch(base_epoch), 10);
         assert_eq!(RelativeEpoch::Previous.into_epoch(base_epoch), 9);
         assert_eq!(RelativeEpoch::Next.into_epoch(base_epoch), 11);
-        
+
         // Test edge case with epoch 0
         assert_eq!(RelativeEpoch::Previous.into_epoch(0), 0); // saturating_sub
         assert_eq!(RelativeEpoch::Current.into_epoch(0), 0);
@@ -2576,11 +2576,14 @@ mod tests {
     fn test_total_balances() {
         let spec = beacon_chain_spec();
         let balances = TotalBalances::new(&spec);
-        
+
         // Should return effective_balance_increment as minimum
         assert_eq!(balances.current_epoch(), spec.effective_balance_increment);
         assert_eq!(balances.previous_epoch(), spec.effective_balance_increment);
-        assert_eq!(balances.previous_epoch_attesters(), spec.effective_balance_increment);
+        assert_eq!(
+            balances.previous_epoch_attesters(),
+            spec.effective_balance_increment
+        );
     }
 
     #[test]
@@ -2598,13 +2601,13 @@ mod tests {
     fn test_validator_status_update() {
         let mut status1 = ValidatorStatus::default();
         let mut status2 = ValidatorStatus::default();
-        
+
         status2.is_slashed = true;
         status2.is_eligible = true;
         status2.is_active_in_current_epoch = true;
-        
+
         status1.update(&status2);
-        
+
         assert!(status1.is_slashed);
         assert!(status1.is_eligible);
         assert!(status1.is_active_in_current_epoch);
@@ -2632,10 +2635,10 @@ mod tests {
         if let Ok(mut cache) = PUBKEY_CACHE.write() {
             cache.clear();
         }
-        
+
         // Generate a valid test pubkey (48 bytes)
         let pubkey_bytes = FixedBytes::<48>::ZERO;
-        
+
         // This should fail because zero bytes is not a valid public key
         // but it tests the cache mechanism
         let result = get_cached_pubkey(&pubkey_bytes);

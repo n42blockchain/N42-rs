@@ -347,9 +347,16 @@ impl<B: Block> RecoveredBlock<B> {
     }
 
     /// Returns a recovered transaction by index, if it exists.
-    pub fn transaction_recovered(&self, idx: usize) -> Option<Recovered<&<B::Body as BlockBody>::Transaction>> {
+    pub fn transaction_recovered(
+        &self,
+        idx: usize,
+    ) -> Option<Recovered<&<B::Body as BlockBody>::Transaction>> {
         let sender = self.senders.get(idx).copied()?;
-        self.block.body().transactions().get(idx).map(|tx| Recovered::new_unchecked(tx, sender))
+        self.block
+            .body()
+            .transactions()
+            .get(idx)
+            .map(|tx| Recovered::new_unchecked(tx, sender))
     }
 
     /// Finds a transaction by hash and returns it with its index and block context.
@@ -361,7 +368,11 @@ impl<B: Block> RecoveredBlock<B> {
             .transactions_iter()
             .enumerate()
             .find(|(_, tx)| Encodable2718::trie_hash(tx) == tx_hash)
-            .map(|(index, tx)| IndexedTx { block: self, tx, index })
+            .map(|(index, tx)| IndexedTx {
+                block: self,
+                tx,
+                index,
+            })
     }
 }
 
@@ -787,9 +798,9 @@ mod rpc_compat {
         {
             match kind {
                 BlockTransactionsKind::Hashes => self.to_rpc_block_with_tx_hashes(header_builder),
-                BlockTransactionsKind::Full => {
-                    self.clone().into_rpc_block_full(tx_resp_builder, header_builder)
-                }
+                BlockTransactionsKind::Full => self
+                    .clone()
+                    .into_rpc_block_full(tx_resp_builder, header_builder),
             }
         }
 
@@ -807,11 +818,21 @@ mod rpc_compat {
             let withdrawals = self.body().withdrawals().cloned();
 
             let transactions = BlockTransactions::Hashes(transactions);
-            let uncles =
-                self.body().ommers().unwrap_or(&[]).iter().map(|h| h.hash_slow()).collect();
+            let uncles = self
+                .body()
+                .ommers()
+                .unwrap_or(&[])
+                .iter()
+                .map(|h| h.hash_slow())
+                .collect();
             let header = header_builder(header, rlp_length)?;
 
-            Ok(Block { header, uncles, transactions, withdrawals })
+            Ok(Block {
+                header,
+                uncles,
+                transactions,
+                withdrawals,
+            })
         }
 
         /// Converts the block into an RPC [`Block`] with transaction hashes.
@@ -825,13 +846,22 @@ mod rpc_compat {
             let transactions = self.body().transaction_hashes_iter().copied().collect();
             let rlp_length = self.rlp_length();
             let (header, body) = self.into_sealed_block().split_sealed_header_body();
-            let BlockBody { ommers, withdrawals, .. } = body.into_ethereum_body();
+            let BlockBody {
+                ommers,
+                withdrawals,
+                ..
+            } = body.into_ethereum_body();
 
             let transactions = BlockTransactions::Hashes(transactions);
             let uncles = ommers.into_iter().map(|h| h.hash_slow()).collect();
             let header = f(header, rlp_length)?;
 
-            Ok(Block { header, uncles, transactions, withdrawals })
+            Ok(Block {
+                header,
+                uncles,
+                transactions,
+                withdrawals,
+            })
         }
 
         /// Converts the block into an RPC [`Block`] with full transaction objects.
@@ -856,7 +886,11 @@ mod rpc_compat {
 
             let (block, senders) = self.split_sealed();
             let (header, body) = block.split_sealed_header_body();
-            let BlockBody { transactions, ommers, withdrawals } = body.into_ethereum_body();
+            let BlockBody {
+                transactions,
+                ommers,
+                withdrawals,
+            } = body.into_ethereum_body();
 
             let transactions = transactions
                 .into_iter()
@@ -879,7 +913,12 @@ mod rpc_compat {
             let uncles = ommers.into_iter().map(|h| h.hash_slow()).collect();
             let header = header_builder(header, block_length)?;
 
-            let block = Block { header, uncles, transactions, withdrawals };
+            let block = Block {
+                header,
+                uncles,
+                transactions,
+                withdrawals,
+            };
 
             Ok(block)
         }

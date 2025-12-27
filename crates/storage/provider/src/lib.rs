@@ -23,9 +23,8 @@ pub use traits::*;
 pub mod providers;
 pub use providers::{
     DatabaseProvider, DatabaseProviderRO, DatabaseProviderRW, HistoricalStateProvider,
-    HistoricalStateProviderRef, LatestStateProvider, LatestStateProviderRef,
-    OverlayStateProvider, OverlayStateProviderFactory, ProviderFactory, StaticFileAccess,
-    StaticFileWriter,
+    HistoricalStateProviderRef, LatestStateProvider, LatestStateProviderRef, OverlayStateProvider,
+    OverlayStateProviderFactory, ProviderFactory, StaticFileAccess, StaticFileWriter,
 };
 
 #[cfg(any(test, feature = "test-utils"))]

@@ -41,13 +41,11 @@ mod error_tests {
         assert!(AposError::MissingSignature.is_validation_error());
         assert!(AposError::ExtraSigners.is_validation_error());
         assert!(AposError::InvalidCheckpointSigners.is_validation_error());
-        assert!(
-            AposError::InvalidDifficulty {
-                got: 1,
-                expected: 2
-            }
-            .is_validation_error()
-        );
+        assert!(AposError::InvalidDifficulty {
+            got: 1,
+            expected: 2
+        }
+        .is_validation_error());
         assert!(AposError::UnauthorizedSigner(Address::ZERO).is_validation_error());
 
         assert!(!AposError::NoSignerSet.is_validation_error());
@@ -170,4 +168,3 @@ mod trait_tests {
         assert!(!consensus.has_proposal(&Address::ZERO));
     }
 }
-

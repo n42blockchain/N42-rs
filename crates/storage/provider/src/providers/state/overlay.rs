@@ -38,7 +38,12 @@ pub struct OverlayStateProviderFactory<F> {
 impl<F> OverlayStateProviderFactory<F> {
     /// Create a new overlay state provider factory
     pub const fn new(factory: F) -> Self {
-        Self { factory, block_hash: None, trie_overlay: None, hashed_state_overlay: None }
+        Self {
+            factory,
+            block_hash: None,
+            trie_overlay: None,
+            hashed_state_overlay: None,
+        }
     }
 
     /// Set the block hash for collecting reverts. All state will be reverted to the point
@@ -102,18 +107,18 @@ where
         let prune_checkpoint = provider.get_prune_checkpoint(PruneSegment::MerkleChangeSets)?;
 
         // Get the upper bound from stage checkpoint
-        let upper_bound =
-            stage_checkpoint.as_ref().map(|chk| chk.block_number).ok_or_else(|| {
-                ProviderError::InsufficientChangesets {
-                    requested: requested_block,
-                    available: 0..=0,
-                }
+        let upper_bound = stage_checkpoint
+            .as_ref()
+            .map(|chk| chk.block_number)
+            .ok_or_else(|| ProviderError::InsufficientChangesets {
+                requested: requested_block,
+                available: 0..=0,
             })?;
 
         // If the requested block is the DB tip (determined by the MerkleChangeSets stage
         // checkpoint) then there won't be any reverts necessary, and we can simply return Ok.
         if upper_bound == requested_block {
-            return Ok(false)
+            return Ok(false);
         }
 
         // Extract the lower bound from prune checkpoint if available.
@@ -213,8 +218,10 @@ where
             (trie_updates, hashed_state_updates)
         } else {
             // If no block_hash, use overlays directly or defaults
-            let trie_updates =
-                self.trie_overlay.clone().unwrap_or_else(|| Arc::new(TrieUpdatesSorted::default()));
+            let trie_updates = self
+                .trie_overlay
+                .clone()
+                .unwrap_or_else(|| Arc::new(TrieUpdatesSorted::default()));
             let hashed_state = self
                 .hashed_state_overlay
                 .clone()
@@ -223,7 +230,11 @@ where
             (trie_updates, hashed_state)
         };
 
-        Ok(OverlayStateProvider::new(provider, trie_updates, hashed_state))
+        Ok(OverlayStateProvider::new(
+            provider,
+            trie_updates,
+            hashed_state,
+        ))
     }
 }
 
@@ -250,7 +261,11 @@ where
         trie_updates: Arc<TrieUpdatesSorted>,
         hashed_post_state: Arc<HashedPostStateSorted>,
     ) -> Self {
-        Self { provider, trie_updates, hashed_post_state }
+        Self {
+            provider,
+            trie_updates,
+            hashed_post_state,
+        }
     }
 }
 
@@ -329,4 +344,3 @@ where
         hashed_cursor_factory.hashed_storage_cursor(hashed_address)
     }
 }
-

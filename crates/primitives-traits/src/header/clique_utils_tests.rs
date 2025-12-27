@@ -312,4 +312,3 @@ fn test_invalid_recovery_id() {
     let result = recover_address(&header);
     assert!(result.is_err(), "Should fail with invalid recovery id");
 }
-

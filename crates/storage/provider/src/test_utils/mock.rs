@@ -26,15 +26,14 @@ use reth_ethereum_primitives::{EthPrimitives, Receipt};
 use reth_execution_types::ExecutionOutcome;
 use reth_node_types::NodeTypes;
 use reth_primitives_traits::{
-    Account, Bytecode, GotExpected, NodePrimitives, RecoveredBlock, SealedHeader,
-    SignerRecoverable,
+    Account, Bytecode, GotExpected, NodePrimitives, RecoveredBlock, SealedHeader, SignerRecoverable,
 };
 use reth_prune_types::PruneModes;
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_storage_api::{
     BlockBodyIndicesProvider, BytecodeReader, DBProvider, DatabaseProviderFactory,
-    HashedPostStateProvider, NodePrimitivesProvider, StageCheckpointReader,
-    StateProofProvider, StorageRootProvider,
+    HashedPostStateProvider, NodePrimitivesProvider, StageCheckpointReader, StateProofProvider,
+    StorageRootProvider,
 };
 use reth_storage_errors::provider::{ConsistentViewError, ProviderError, ProviderResult};
 use reth_trie::{
@@ -571,7 +570,10 @@ where
         let mut result = Vec::new();
         for block_number in block_range {
             // Only include blocks that exist in headers (i.e., have been added to the provider)
-            if headers_lock.values().any(|header| header.number == block_number) {
+            if headers_lock
+                .values()
+                .any(|header| header.number == block_number)
+            {
                 if let Some(block_receipts) = receipts_lock.get(&block_number) {
                     result.push(block_receipts.clone());
                 } else {
@@ -1056,10 +1058,21 @@ mod tests {
 
         let block_hash = BlockHash::random();
         let block_number = 1u64;
-        let header = Header { number: block_number, ..Default::default() };
+        let header = Header {
+            number: block_number,
+            ..Default::default()
+        };
 
-        let receipt1 = Receipt { cumulative_gas_used: 21000, success: true, ..Default::default() };
-        let receipt2 = Receipt { cumulative_gas_used: 42000, success: true, ..Default::default() };
+        let receipt1 = Receipt {
+            cumulative_gas_used: 21000,
+            success: true,
+            ..Default::default()
+        };
+        let receipt2 = Receipt {
+            cumulative_gas_used: 42000,
+            success: true,
+            ..Default::default()
+        };
         let receipts = vec![receipt1, receipt2];
 
         provider.add_header(block_hash, header);
@@ -1074,7 +1087,9 @@ mod tests {
         let range_result = provider.receipts_by_block_range(1..=1).unwrap();
         assert_eq!(range_result, vec![receipts]);
 
-        let non_existent = provider.receipts_by_block(BlockHash::random().into()).unwrap();
+        let non_existent = provider
+            .receipts_by_block(BlockHash::random().into())
+            .unwrap();
         assert_eq!(non_existent, None);
 
         let empty_range = provider.receipts_by_block_range(10..=20).unwrap();
@@ -1090,13 +1105,25 @@ mod tests {
         let block1_number = 1u64;
         let block2_number = 2u64;
 
-        let header1 = Header { number: block1_number, ..Default::default() };
-        let header2 = Header { number: block2_number, ..Default::default() };
+        let header1 = Header {
+            number: block1_number,
+            ..Default::default()
+        };
+        let header2 = Header {
+            number: block2_number,
+            ..Default::default()
+        };
 
-        let receipts1 =
-            vec![Receipt { cumulative_gas_used: 21000, success: true, ..Default::default() }];
-        let receipts2 =
-            vec![Receipt { cumulative_gas_used: 42000, success: true, ..Default::default() }];
+        let receipts1 = vec![Receipt {
+            cumulative_gas_used: 21000,
+            success: true,
+            ..Default::default()
+        }];
+        let receipts2 = vec![Receipt {
+            cumulative_gas_used: 42000,
+            success: true,
+            ..Default::default()
+        }];
 
         provider.add_header(block1_hash, header1);
         provider.add_header(block2_hash, header2);

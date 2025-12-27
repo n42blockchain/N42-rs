@@ -294,7 +294,9 @@ pub struct SubmitBlockRequestQuery {
 impl SubmitBlockRequestQuery {
     /// Opt into bid cancellations.
     pub const fn cancellations() -> Self {
-        Self { cancellations: Some(true) }
+        Self {
+            cancellations: Some(true),
+        }
     }
 }
 

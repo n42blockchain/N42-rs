@@ -152,7 +152,9 @@ mod ssz_requests_conversions {
 
             let accumulator = value
                 .iter()
-                .try_fold(RequestAccumulator::default(), |acc, request| acc.accumulate(request))?;
+                .try_fold(RequestAccumulator::default(), |acc, request| {
+                    acc.accumulate(request)
+                })?;
 
             Ok(Self {
                 deposits: accumulator.deposits,

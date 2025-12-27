@@ -183,10 +183,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
 
         // Insert block, state and hashes
         provider_rw.insert_historical_block(block.clone().try_recover()?)?;
-        provider_rw.write_state(
-            &execution_outcome,
-            OriginalValuesKnown::No,
-        )?;
+        provider_rw.write_state(&execution_outcome, OriginalValuesKnown::No)?;
         let storage_lists =
             provider_rw.changed_storages_with_range(block.number..=block.number())?;
         let storages = provider_rw.plain_state_storages(storage_lists)?;

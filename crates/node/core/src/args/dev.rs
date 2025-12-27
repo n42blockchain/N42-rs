@@ -6,8 +6,7 @@ use clap::Args;
 use humantime::parse_duration;
 
 /// Default dev mode mnemonic
-pub const DEFAULT_MNEMONIC: &str =
-    "test test test test test test test test test test test junk";
+pub const DEFAULT_MNEMONIC: &str = "test test test test test test test test test test test junk";
 
 /// Parameters for Dev testnet configuration
 #[derive(Debug, Args, PartialEq, Eq, Clone)]
@@ -20,7 +19,12 @@ pub struct DevArgs {
     /// Disables network discovery and enables local http server.
     /// Prefunds 20 accounts derived by mnemonic "test test test test test test test test test test
     /// test junk" with 10 000 ETH each.
-    #[arg(long = "dev", alias = "auto-mine", help_heading = "Dev testnet", verbatim_doc_comment)]
+    #[arg(
+        long = "dev",
+        alias = "auto-mine",
+        help_heading = "Dev testnet",
+        verbatim_doc_comment
+    )]
     pub dev: bool,
 
     /// How many transactions to mine per block.

@@ -36,7 +36,12 @@ where
     Rpc: RpcModuleValidator,
 {
     pub(crate) fn new(cli: Cli<C, Ext, Rpc>) -> Self {
-        Self { cli, runner: None, layers: Some(Layers::new()), guard: None }
+        Self {
+            cli,
+            runner: None,
+            layers: Some(Layers::new()),
+            guard: None,
+        }
     }
 
     /// Sets the runner for the CLI commander.
@@ -51,7 +56,9 @@ where
     /// Returns a mutable reference to the tracing layers, or error
     /// if tracing initialized and layers have detached already.
     pub fn access_tracing_layers(&mut self) -> Result<&mut Layers> {
-        self.layers.as_mut().ok_or_else(|| eyre!("Tracing already initialized"))
+        self.layers
+            .as_mut()
+            .ok_or_else(|| eyre!("Tracing already initialized"))
     }
 
     /// Execute the configured cli command.
@@ -63,7 +70,10 @@ where
         C: ChainSpecParser<ChainSpec = ChainSpec>,
     {
         let components = |spec: Arc<ChainSpec>| {
-            (EthEvmConfig::ethereum(spec.clone()), Arc::new(EthBeaconConsensus::new(spec)))
+            (
+                EthEvmConfig::ethereum(spec.clone()),
+                Arc::new(EthBeaconConsensus::new(spec)),
+            )
         };
 
         self.run_with_components::<EthereumNode>(components, |builder, ext| async move {
@@ -95,8 +105,11 @@ where
 
         // Add network name if available to the logs dir
         if let Some(chain_spec) = self.cli.command.chain_spec() {
-            self.cli.logs.log_file_directory =
-                self.cli.logs.log_file_directory.join(chain_spec.chain().to_string());
+            self.cli.logs.log_file_directory = self
+                .cli
+                .logs
+                .log_file_directory
+                .join(chain_spec.chain().to_string());
         }
 
         self.init_tracing(&runner)?;
@@ -175,4 +188,3 @@ where
         }
     }
 }
-

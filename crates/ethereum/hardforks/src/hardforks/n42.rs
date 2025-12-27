@@ -25,9 +25,9 @@ impl Hardfork for BeijingFork {
 }
 
 /// N42 Fusaka hardfork timestamps
-/// 
+///
 /// Fusaka = Prague (EL) + Osaka (CL)
-/// 
+///
 /// Timeline (N42 Mainnet):
 /// - Shanghai: 2025-05-07 00:00:00 UTC (1746576000)
 /// - Cancun:   2025-05-07 00:00:00 UTC (1746576000)

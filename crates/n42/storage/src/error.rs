@@ -60,7 +60,6 @@ impl StorageError {
     }
 }
 
-
 impl From<serde_json::Error> for StorageError {
     fn from(err: serde_json::Error) -> Self {
         Self::SerializationError(err.to_string())
@@ -69,4 +68,3 @@ impl From<serde_json::Error> for StorageError {
 
 /// Result type for storage operations
 pub type StorageResult<T> = Result<T, StorageError>;
-

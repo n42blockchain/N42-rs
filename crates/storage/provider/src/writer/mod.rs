@@ -1,13 +1,13 @@
 // Copyright (c) 2017-2025 N42 Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+#[cfg(test)]
+use crate::StorageLocation;
 use crate::{
     providers::{StaticFileProvider, StaticFileWriter as SfWriter},
     BlockExecutionWriter, BlockWriter, HistoryWriter, StateWriter, StaticFileProviderFactory,
     TrieWriter,
 };
-#[cfg(test)]
-use crate::StorageLocation;
 use alloy_consensus::BlockHeader;
 use reth_chain_state::ExecutedBlock;
 use reth_db_api::transaction::{DbTx, DbTxMut};
@@ -180,15 +180,14 @@ where
 
             // Write state and changesets to the database.
             // Must be written after blocks because of the receipt lookup.
-            self.database().write_state(
-                &execution_output,
-                OriginalValuesKnown::No,
-            )?;
+            self.database()
+                .write_state(&execution_output, OriginalValuesKnown::No)?;
 
             // insert hashes and intermediate merkle nodes
             self.database()
                 .write_hashed_state(&Arc::unwrap_or_clone(hashed_state).into_sorted())?;
-            self.database().write_trie_updates(Arc::unwrap_or_clone(trie))?;
+            self.database()
+                .write_trie_updates(Arc::unwrap_or_clone(trie))?;
         }
 
         // update history indices

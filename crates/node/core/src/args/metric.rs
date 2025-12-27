@@ -36,4 +36,3 @@ pub struct MetricArgs {
     )]
     pub push_gateway_interval: Duration,
 }
-

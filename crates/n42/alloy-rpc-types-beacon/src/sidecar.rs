@@ -66,7 +66,9 @@ impl Iterator for SidecarIterator {
 impl SidecarIterator {
     /// Creates a new [`SidecarIterator`] from a given [`BeaconBlobBundle`].
     pub fn new(bundle: BeaconBlobBundle) -> Self {
-        Self { iter: bundle.into_iter() }
+        Self {
+            iter: bundle.into_iter(),
+        }
     }
 
     /// Returns a BlobTransactionSidecar of len num_hashes.
@@ -80,7 +82,11 @@ impl SidecarIterator {
             commitments.push(next.kzg_commitment);
             proofs.push(next.kzg_proof);
         }
-        Some(BlobTransactionSidecar { blobs, commitments, proofs })
+        Some(BlobTransactionSidecar {
+            blobs,
+            commitments,
+            proofs,
+        })
     }
 }
 

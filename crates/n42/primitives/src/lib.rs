@@ -17,7 +17,7 @@ pub use beacon::*;
 
 mod activation_queue;
 pub mod safe_arith;
-pub use safe_arith::{SafeArith, SafeArithIter, ArithError};
+pub use safe_arith::{ArithError, SafeArith, SafeArithIter};
 
 mod committee_cache;
 pub use committee_cache::CommitteeCache;

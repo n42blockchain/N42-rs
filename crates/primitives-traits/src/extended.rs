@@ -6,7 +6,10 @@ use crate::{
     transaction::signed::{RecoveryError, SignedTransaction},
 };
 use alloc::vec::Vec;
-use alloy_consensus::{transaction::{SignerRecoverable, TxHashRef}, Transaction};
+use alloy_consensus::{
+    transaction::{SignerRecoverable, TxHashRef},
+    Transaction,
+};
 use alloy_eips::{
     eip2718::{Eip2718Error, Eip2718Result, IsTyped2718},
     eip2930::AccessList,

@@ -20,7 +20,9 @@ pub struct PraguePayloadFields {
 impl PraguePayloadFields {
     /// Returns a new [`PraguePayloadFields`] instance.
     pub fn new(requests: impl Into<RequestsOrHash>) -> Self {
-        Self { requests: requests.into() }
+        Self {
+            requests: requests.into(),
+        }
     }
 }
 
@@ -45,7 +47,9 @@ impl MaybePraguePayloadFields {
 
     /// Returns the requests, if any.
     pub fn requests(&self) -> Option<&Requests> {
-        self.fields.as_ref().and_then(|fields| fields.requests.requests())
+        self.fields
+            .as_ref()
+            .and_then(|fields| fields.requests.requests())
     }
 
     /// Calculates or retrieves the requests hash.
@@ -54,7 +58,9 @@ impl MaybePraguePayloadFields {
     ///   dynamically.
     /// - If it contains a precomputed hash (used for testing), it returns that hash directly.
     pub fn requests_hash(&self) -> Option<B256> {
-        self.fields.as_ref().map(|fields| fields.requests.requests_hash())
+        self.fields
+            .as_ref()
+            .map(|fields| fields.requests.requests_hash())
     }
 
     /// Returns a reference to the inner fields.
@@ -66,7 +72,9 @@ impl MaybePraguePayloadFields {
 impl From<PraguePayloadFields> for MaybePraguePayloadFields {
     #[inline]
     fn from(fields: PraguePayloadFields) -> Self {
-        Self { fields: Some(fields) }
+        Self {
+            fields: Some(fields),
+        }
     }
 }
 

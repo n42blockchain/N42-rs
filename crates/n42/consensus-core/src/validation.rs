@@ -10,10 +10,7 @@ use alloy_primitives::{BlockHash, B256};
 use n42_primitives::{Attestation, BeaconBlock, BeaconState, SLOTS_PER_EPOCH};
 
 /// Validate a beacon block against the current state
-pub fn validate_beacon_block(
-    state: &BeaconState,
-    block: &BeaconBlock,
-) -> ConsensusResult<()> {
+pub fn validate_beacon_block(state: &BeaconState, block: &BeaconBlock) -> ConsensusResult<()> {
     // Validate slot
     if block.slot <= state.slot {
         return Err(ConsensusError::InvalidSlot {
@@ -34,24 +31,21 @@ pub fn validate_beacon_block(
 }
 
 /// Validate an attestation against the current state
-pub fn validate_attestation(
-    state: &BeaconState,
-    attestation: &Attestation,
-) -> ConsensusResult<()> {
+pub fn validate_attestation(state: &BeaconState, attestation: &Attestation) -> ConsensusResult<()> {
     // Attestations should be from the current or previous epoch
     let current_epoch = state.slot / SLOTS_PER_EPOCH;
     let attestation_epoch = attestation.data.slot / SLOTS_PER_EPOCH;
-    
+
     if attestation_epoch > current_epoch {
-        return Err(ConsensusError::InvalidAttestation(
-            format!("attestation from future epoch: {attestation_epoch} > {current_epoch}")
-        ));
+        return Err(ConsensusError::InvalidAttestation(format!(
+            "attestation from future epoch: {attestation_epoch} > {current_epoch}"
+        )));
     }
 
     if current_epoch > attestation_epoch + 1 {
-        return Err(ConsensusError::InvalidAttestation(
-            format!("attestation too old: epoch {attestation_epoch} vs current {current_epoch}")
-        ));
+        return Err(ConsensusError::InvalidAttestation(format!(
+            "attestation too old: epoch {attestation_epoch} vs current {current_epoch}"
+        )));
     }
 
     Ok(())
@@ -64,7 +58,7 @@ pub fn validate_state_root(
 ) -> ConsensusResult<()> {
     use alloy_primitives::Sealable;
     let computed_root = computed_state.hash_slow();
-    
+
     if computed_root != block.state_root {
         return Err(ConsensusError::InvalidStateRoot {
             expected: block.state_root,
@@ -76,10 +70,7 @@ pub fn validate_state_root(
 }
 
 /// Validate parent hash against expected value
-pub fn validate_parent_hash(
-    expected: BlockHash,
-    actual: BlockHash,
-) -> ConsensusResult<()> {
+pub fn validate_parent_hash(expected: BlockHash, actual: BlockHash) -> ConsensusResult<()> {
     if expected != actual {
         return Err(ConsensusError::InvalidParentHash { expected, actual });
     }
@@ -166,4 +157,3 @@ mod tests {
         assert!(validate_parent_hash(hash1, hash2).is_err());
     }
 }
-

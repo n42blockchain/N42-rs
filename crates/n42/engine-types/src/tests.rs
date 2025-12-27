@@ -70,4 +70,3 @@ mod payload_builder_tests {
         let _ = format!("{:?}", wrapper2);
     }
 }
-

@@ -1,4 +1,6 @@
+use crate::beacon::Beacon;
 use alloy_eips::eip2718::{Decodable2718, Encodable2718};
+use alloy_primitives::{BlockNumber, Bytes, Sealable};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types::Block;
 use alloy_rpc_types::BlockTransactionsKind;
@@ -6,9 +8,13 @@ use alloy_rpc_types::Transaction as RpcTransaction;
 use alloy_rpc_types_engine::{CancunPayloadFields, ExecutionPayloadSidecar, ForkchoiceState};
 use eyre::OptionExt;
 use n42_engine_primitives::PayloadAttributesBuilderExt;
-use n42_primitives::{RelativeEpoch, Attestation, BeaconState, BeaconBlock, Deposit, VoluntaryExitWithSig, parse_deposit_log, BLSPubkey, BlockVerifyResultAggregate, agg_sig_to_fixed, fixed_to_agg_sig, SLOTS_PER_EPOCH, CommitteeIndex, AttestationData};
-use reth_chainspec::EthereumHardforks;
+use n42_primitives::{
+    agg_sig_to_fixed, fixed_to_agg_sig, parse_deposit_log, Attestation, AttestationData, BLSPubkey,
+    BeaconBlock, BeaconState, BlockVerifyResultAggregate, CommitteeIndex, Deposit, RelativeEpoch,
+    VoluntaryExitWithSig, SLOTS_PER_EPOCH,
+};
 use reth_chainspec::EthChainSpec;
+use reth_chainspec::EthereumHardforks;
 use reth_engine_primitives::ConsensusEngineHandle;
 use reth_engine_primitives::EngineTypes;
 use reth_payload_builder::{PayloadBuilderHandle, PayloadBuilderService};
@@ -16,18 +22,16 @@ use reth_payload_primitives::{
     BuiltPayload, EngineApiMessageVersion, PayloadAttributesBuilder, PayloadKind, PayloadTypes,
 };
 use reth_primitives::{Recovered, SealedBlock, TransactionSigned};
-use reth_transaction_pool::EthPooledTransaction;
 use reth_primitives_traits::{AlloyBlockHeader, BlockBody, NodePrimitives, SignedTransaction};
 use reth_provider::{
     BeaconProvider, BeaconProviderWriter, BlockIdReader, BlockReader, ChainSpecProvider,
 };
+use reth_transaction_pool::EthPooledTransaction;
 use reth_transaction_pool::PoolTransaction;
 use reth_transaction_pool::{TransactionOrigin, TransactionPool};
 use sled::{Db, IVec};
 use tokio::time::{interval_at, sleep, Instant, Interval};
 use tracing::{debug, error, info, warn};
-use crate::beacon::{Beacon};
-use alloy_primitives::{Sealable, BlockNumber, Bytes};
 
 pub struct N42Migrate<T: PayloadTypes, Provider, B, Pool: TransactionPool> {
     provider: Provider,
@@ -94,8 +98,14 @@ where
     }
 
     async fn run_inner(mut self) -> eyre::Result<()> {
-        self.provider.save_beacon_block_hash_by_eth1_hash(&self.provider.chain_spec().genesis_hash(), self.provider.chain_spec().genesis_hash())?;
-        self.provider.save_beacon_state_by_hash(&self.provider.chain_spec().genesis_hash(), BeaconState::new())?;
+        self.provider.save_beacon_block_hash_by_eth1_hash(
+            &self.provider.chain_spec().genesis_hash(),
+            self.provider.chain_spec().genesis_hash(),
+        )?;
+        self.provider.save_beacon_state_by_hash(
+            &self.provider.chain_spec().genesis_hash(),
+            BeaconState::new(),
+        )?;
 
         let db: Option<Db> = if self.migrate_from_db_path.is_some() {
             Some(sled::open(&self.migrate_from_db_path.clone().unwrap())?)
@@ -137,19 +147,20 @@ where
             };
             if rpc_provider.is_some() {
                 while block.is_none() {
-                        match rpc_provider
-                            .as_ref()
-                            .unwrap()
-                            .get_block(block_number.into()).full()
-                            .await?
-                        {
-                            Some(v) => block = Some(v),
-                            _ => {
-                                //eyre::bail!("block {:?} not found, stop", block_number);
-                                debug!(target: "consensus-client", "block {:?} not found from rpc, try again", block_number);
-                                sleep(std::time::Duration::from_millis(500)).await;
-                            }
+                    match rpc_provider
+                        .as_ref()
+                        .unwrap()
+                        .get_block(block_number.into())
+                        .full()
+                        .await?
+                    {
+                        Some(v) => block = Some(v),
+                        _ => {
+                            //eyre::bail!("block {:?} not found, stop", block_number);
+                            debug!(target: "consensus-client", "block {:?} not found from rpc, try again", block_number);
+                            sleep(std::time::Duration::from_millis(500)).await;
                         }
+                    }
                 }
             }
             if block.is_none() {
@@ -268,14 +279,26 @@ where
                 self.provider.chain_spec().genesis_hash()
             } else {
                 //fetch_beacon_block(block.header().parent_hash).unwrap().hash_slow()
-                self.provider.get_beacon_block_hash_by_eth1_hash(&block.header().parent_hash)?
-                .ok_or(eyre::eyre!("get_beacon_block_hash_by_eth1_hash failed, hash={:?}", block.header().parent_hash))?
+                self.provider
+                    .get_beacon_block_hash_by_eth1_hash(&block.header().parent_hash)?
+                    .ok_or(eyre::eyre!(
+                        "get_beacon_block_hash_by_eth1_hash failed, hash={:?}",
+                        block.header().parent_hash
+                    ))?
             };
-            let beacon_block = self.beacon.gen_beacon_block(beacon_state_after_withdrawal, parent_beacon_block_hash, &Default::default(), &Default::default(), &block)?;
+            let beacon_block = self.beacon.gen_beacon_block(
+                beacon_state_after_withdrawal,
+                parent_beacon_block_hash,
+                &Default::default(),
+                &Default::default(),
+                &block,
+            )?;
             let beacon_block_hash = beacon_block.hash_slow();
-            self.provider.save_beacon_block_by_hash(&beacon_block_hash, beacon_block.clone())?;
+            self.provider
+                .save_beacon_block_by_hash(&beacon_block_hash, beacon_block.clone())?;
 
-            self.provider.save_beacon_block_hash_by_eth1_hash(&block.hash(), beacon_block_hash)?;
+            self.provider
+                .save_beacon_block_hash_by_eth1_hash(&block.hash(), beacon_block_hash)?;
         }
     }
 

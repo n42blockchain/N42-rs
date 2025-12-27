@@ -187,4 +187,3 @@ mod tests {
         assert_eq!(NUMBER_OF_COLUMNS, 128);
     }
 }
-

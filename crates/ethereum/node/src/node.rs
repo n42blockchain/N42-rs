@@ -24,9 +24,9 @@ use reth_node_builder::{
     },
     node::{FullNodeTypes, NodeTypes},
     rpc::{
-        BasicEngineApiBuilder, BasicEngineValidatorBuilder, EngineApiBuilder,
-        EngineValidatorAddOn, EngineValidatorBuilder, EthApiBuilder, EthApiCtx,
-        PayloadValidatorBuilder, RethRpcAddOns, RpcAddOns, RpcHandle,
+        BasicEngineApiBuilder, BasicEngineValidatorBuilder, EngineApiBuilder, EngineValidatorAddOn,
+        EngineValidatorBuilder, EthApiBuilder, EthApiCtx, PayloadValidatorBuilder, RethRpcAddOns,
+        RpcAddOns, RpcHandle,
     },
     BuilderContext, DebugNode, Node, NodeAdapter, NodeComponentsBuilder, PayloadBuilderConfig,
     PayloadTypes,
@@ -39,8 +39,7 @@ use reth_rpc::{
 use reth_rpc_api::servers::BlockSubmissionValidationApiServer;
 use reth_rpc_builder::config::RethRpcServerConfig;
 use reth_rpc_eth_api::{
-    helpers::pending_block::BuildPendingEnv,
-    RpcConvert, RpcTypes, SignableTxRequest,
+    helpers::pending_block::BuildPendingEnv, RpcConvert, RpcTypes, SignableTxRequest,
 };
 use reth_rpc_eth_types::{error::FromEvmError, EthApiError};
 use reth_rpc_server_types::RethRpcModule;
@@ -155,7 +154,10 @@ where
     type EthApi = EthApiFor<N, NetworkT>;
 
     async fn build_eth_api(self, ctx: EthApiCtx<'_, N>) -> eyre::Result<Self::EthApi> {
-        Ok(ctx.eth_api_builder().map_converter(|r| r.with_network()).build())
+        Ok(ctx
+            .eth_api_builder()
+            .map_converter(|r| r.with_network())
+            .build())
     }
 }
 
@@ -168,7 +170,13 @@ pub struct EthereumAddOns<N: FullNodeComponents, EthB: EthApiBuilder<N>, PVB> {
 impl<N: FullNodeComponents, EthB: EthApiBuilder<N>, PVB> EthereumAddOns<N, EthB, PVB> {
     /// Create new add-ons with given RPC add-ons.
     pub fn new(
-        inner: RpcAddOns<N, EthB, PVB, BasicEngineApiBuilder<PVB>, BasicEngineValidatorBuilder<PVB>>,
+        inner: RpcAddOns<
+            N,
+            EthB,
+            PVB,
+            BasicEngineApiBuilder<PVB>,
+            BasicEngineValidatorBuilder<PVB>,
+        >,
     ) -> Self {
         Self { inner }
     }
@@ -373,8 +381,9 @@ where
         } else {
             // get the current blob params for the current timestamp, fallback to default Cancun
             // params
-            let current_timestamp =
-                SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
+            let current_timestamp = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_secs();
             let blob_params = ctx
                 .chain_spec()
                 .blob_params_at_timestamp(current_timestamp)

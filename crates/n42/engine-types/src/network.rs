@@ -1,20 +1,19 @@
-use reth_network::config::NetworkMode;
-use reth_network::{NetworkManager, NetworkHandle, PeersInfo};
-use reth_eth_wire_types::BasicNetworkPrimitives;
-use reth_node_api::{AddOnsContext, FullNodeComponents, NodeAddOns, PrimitivesTy, TxTy};
-use reth_ethereum_primitives::EthPrimitives;
 use reth_chainspec::{ChainSpec, EthChainSpec, Hardforks};
+use reth_eth_wire_types::BasicNetworkPrimitives;
+use reth_ethereum_primitives::EthPrimitives;
+use reth_network::config::NetworkMode;
+use reth_network::{NetworkHandle, NetworkManager, PeersInfo};
+use reth_node_api::{AddOnsContext, FullNodeComponents, NodeAddOns, PrimitivesTy, TxTy};
 use reth_node_builder::{
-    components::{
-        NetworkBuilder, PoolBuilder,
-    },
+    components::{NetworkBuilder, PoolBuilder},
     node::{FullNodeTypes, NodeTypes},
     BuilderContext,
 };
-use reth_transaction_pool::{
-    EthTransactionPool, PoolPooledTx, PoolTransaction, TransactionPool, TransactionValidationTaskExecutor,
-};
 use reth_tracing::tracing::{debug, info};
+use reth_transaction_pool::{
+    EthTransactionPool, PoolPooledTx, PoolTransaction, TransactionPool,
+    TransactionValidationTaskExecutor,
+};
 
 /// A basic N42 network builder.
 #[derive(Debug, Default, Clone, Copy)]
@@ -29,14 +28,17 @@ where
         + Unpin
         + 'static,
 {
-    type Network = NetworkHandle<BasicNetworkPrimitives<PrimitivesTy<Node::Types>, PoolPooledTx<Pool>>>;
+    type Network =
+        NetworkHandle<BasicNetworkPrimitives<PrimitivesTy<Node::Types>, PoolPooledTx<Pool>>>;
 
     async fn build_network(
         self,
         ctx: &BuilderContext<Node>,
         pool: Pool,
     ) -> eyre::Result<Self::Network> {
-        let network_config_builder = ctx.network_config_builder()?.network_mode(NetworkMode::Work);
+        let network_config_builder = ctx
+            .network_config_builder()?
+            .network_mode(NetworkMode::Work);
         let network_config = ctx.build_network_config(network_config_builder);
         let network = NetworkManager::builder(network_config).await?;
         let handle = ctx.start_network(network, pool);

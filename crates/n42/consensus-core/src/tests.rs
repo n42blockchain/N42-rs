@@ -18,7 +18,10 @@ mod error_tests {
         let err = ConsensusError::InvalidBlock("bad block".to_string());
         assert!(format!("{}", err).contains("invalid block"));
 
-        let err = ConsensusError::InvalidSlot { expected: 10, actual: 5 };
+        let err = ConsensusError::InvalidSlot {
+            expected: 10,
+            actual: 5,
+        };
         assert!(format!("{}", err).contains("expected >= 10"));
     }
 
@@ -28,7 +31,11 @@ mod error_tests {
         assert!(ConsensusError::BlockNotFound(B256::ZERO).is_recoverable());
 
         assert!(!ConsensusError::InvalidBlock("test".to_string()).is_recoverable());
-        assert!(!ConsensusError::InvalidSlot { expected: 10, actual: 5 }.is_recoverable());
+        assert!(!ConsensusError::InvalidSlot {
+            expected: 10,
+            actual: 5
+        }
+        .is_recoverable());
     }
 
     #[test]
@@ -36,7 +43,11 @@ mod error_tests {
         assert!(ConsensusError::InvalidBlock("test".to_string()).is_validation_error());
         assert!(ConsensusError::InvalidHeader("test".to_string()).is_validation_error());
         assert!(ConsensusError::InvalidAttestation("test".to_string()).is_validation_error());
-        assert!(ConsensusError::InvalidSlot { expected: 10, actual: 5 }.is_validation_error());
+        assert!(ConsensusError::InvalidSlot {
+            expected: 10,
+            actual: 5
+        }
+        .is_validation_error());
 
         assert!(!ConsensusError::ParentStateNotFound(B256::ZERO).is_validation_error());
         assert!(!ConsensusError::Other("test".to_string()).is_validation_error());
@@ -87,4 +98,3 @@ mod state_tests {
         assert_eq!(slots_until_next_epoch(SLOTS_PER_EPOCH), SLOTS_PER_EPOCH);
     }
 }
-

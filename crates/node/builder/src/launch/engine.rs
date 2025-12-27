@@ -63,7 +63,10 @@ impl EngineNodeLauncher {
         data_dir: ChainPath<DataDirPath>,
         engine_tree_config: TreeConfig,
     ) -> Self {
-        Self { ctx: LaunchContext::new(task_executor, data_dir), engine_tree_config }
+        Self {
+            ctx: LaunchContext::new(task_executor, data_dir),
+            engine_tree_config,
+        }
     }
 }
 
@@ -89,14 +92,26 @@ where
         self,
         target: NodeBuilderWithComponents<T, CB, AO>,
     ) -> eyre::Result<Self::Node> {
-        let Self { ctx, engine_tree_config } = self;
+        let Self {
+            ctx,
+            engine_tree_config,
+        } = self;
         let NodeBuilderWithComponents {
             adapter: NodeTypesAdapter { database },
             components_builder,
-            add_ons: AddOns { hooks, exexs: installed_exex, add_ons },
+            add_ons:
+                AddOns {
+                    hooks,
+                    exexs: installed_exex,
+                    add_ons,
+                },
             config,
         } = target;
-        let NodeHooks { on_component_initialized, on_node_started, .. } = hooks;
+        let NodeHooks {
+            on_component_initialized,
+            on_node_started,
+            ..
+        } = hooks;
 
         // setup the launch context
         let ctx = ctx
@@ -162,8 +177,9 @@ where
         let consensus = Arc::new(ctx.components().consensus().clone());
 
         // Configure the pipeline
-        let pipeline_exex_handle =
-            exex_manager_handle.clone().unwrap_or_else(ExExManagerHandle::empty);
+        let pipeline_exex_handle = exex_manager_handle
+            .clone()
+            .unwrap_or_else(ExExManagerHandle::empty);
 
         let era_import_source = if node_config.era.enabled {
             EraImportSource::maybe_new(
@@ -234,7 +250,11 @@ where
             .maybe_reorg(
                 ctx.blockchain_db().clone(),
                 ctx.components().evm_config().clone(),
-                || validator_builder.clone().build_tree_validator(&add_ons_ctx, engine_tree_config.clone()),
+                || {
+                    validator_builder
+                        .clone()
+                        .build_tree_validator(&add_ons_ctx, engine_tree_config.clone())
+                },
                 node_config.debug.reorg_frequency,
                 node_config.debug.reorg_depth,
             )
@@ -302,8 +322,12 @@ where
             ),
         );
 
-        let RpcHandle { rpc_server_handles, rpc_registry, engine_events, beacon_engine_handle } =
-            add_ons.launch_add_ons(add_ons_ctx).await?;
+        let RpcHandle {
+            rpc_server_handles,
+            rpc_registry,
+            engine_events,
+            beacon_engine_handle,
+        } = add_ons.launch_add_ons(add_ons_ctx).await?;
 
         // Run consensus engine to completion
         let initial_target = ctx.initial_backfill_target()?;

@@ -24,8 +24,8 @@ mod payload;
 mod consensus;
 mod network;
 
-pub use payload::N42PayloadServiceBuilder;
 pub use consensus::N42ConsensusBuilder;
+pub use payload::N42PayloadServiceBuilder;
 
 #[cfg(test)]
 mod tests;

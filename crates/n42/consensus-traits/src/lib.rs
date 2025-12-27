@@ -61,4 +61,3 @@ pub use reth_consensus as _;
 
 #[cfg(test)]
 mod tests;
-

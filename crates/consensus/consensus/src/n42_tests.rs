@@ -20,7 +20,10 @@ mod consensus_error_tests {
     #[test]
     fn test_invalid_checkpoint_beneficiary_error() {
         let err = ConsensusError::InvalidCheckpointBeneficiary;
-        assert_eq!(format!("{}", err), "beneficiary in checkpoint block non-zero");
+        assert_eq!(
+            format!("{}", err),
+            "beneficiary in checkpoint block non-zero"
+        );
     }
 
     #[test]
@@ -32,19 +35,28 @@ mod consensus_error_tests {
     #[test]
     fn test_invalid_checkpoint_vote_error() {
         let err = ConsensusError::InvalidCheckpointVote;
-        assert_eq!(format!("{}", err), "vote nonce in checkpoint block non-zero");
+        assert_eq!(
+            format!("{}", err),
+            "vote nonce in checkpoint block non-zero"
+        );
     }
 
     #[test]
     fn test_missing_vanity_error() {
         let err = ConsensusError::MissingVanity;
-        assert_eq!(format!("{}", err), "extra-data 32 byte vanity prefix missing");
+        assert_eq!(
+            format!("{}", err),
+            "extra-data 32 byte vanity prefix missing"
+        );
     }
 
     #[test]
     fn test_missing_signature_error() {
         let err = ConsensusError::MissingSignature;
-        assert_eq!(format!("{}", err), "extra-data 65 byte signature suffix missing");
+        assert_eq!(
+            format!("{}", err),
+            "extra-data 65 byte signature suffix missing"
+        );
     }
 
     #[test]
@@ -59,7 +71,10 @@ mod consensus_error_tests {
     #[test]
     fn test_invalid_checkpoint_signers_error() {
         let err = ConsensusError::InvalidCheckpointSigners;
-        assert_eq!(format!("{}", err), "invalid signer list on checkpoint block");
+        assert_eq!(
+            format!("{}", err),
+            "invalid signer list on checkpoint block"
+        );
     }
 
     #[test]
@@ -363,4 +378,3 @@ mod invalid_transaction_error_tests {
         }
     }
 }
-

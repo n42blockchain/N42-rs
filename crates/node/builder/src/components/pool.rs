@@ -129,7 +129,10 @@ impl<'a, Node: FullNodeTypes> TxPoolBuilder<'a, Node> {
 impl<'a, Node: FullNodeTypes, V> TxPoolBuilder<'a, Node, V> {
     /// Configure the validator for the transaction pool.
     pub fn with_validator<NewV>(self, validator: NewV) -> TxPoolBuilder<'a, Node, NewV> {
-        TxPoolBuilder { ctx: self.ctx, validator }
+        TxPoolBuilder {
+            ctx: self.ctx,
+            validator,
+        }
     }
 }
 
@@ -194,7 +197,10 @@ pub fn create_blob_store_with_cache<Node: FullNodeTypes>(
         Default::default()
     };
 
-    Ok(reth_transaction_pool::blobstore::DiskFileBlobStore::open(data_dir.blobstore(), config)?)
+    Ok(reth_transaction_pool::blobstore::DiskFileBlobStore::open(
+        data_dir.blobstore(),
+        config,
+    )?)
 }
 
 /// Spawn local transaction backup task if enabled.
@@ -217,16 +223,17 @@ where
                 transactions_path,
             );
 
-        ctx.task_executor().spawn_critical_with_graceful_shutdown_signal(
-            "local transactions backup task",
-            |shutdown| {
-                reth_transaction_pool::maintain::backup_local_transactions_task(
-                    shutdown,
-                    pool,
-                    transactions_backup_config,
-                )
-            },
-        );
+        ctx.task_executor()
+            .spawn_critical_with_graceful_shutdown_signal(
+                "local transactions backup task",
+                |shutdown| {
+                    reth_transaction_pool::maintain::backup_local_transactions_task(
+                        shutdown,
+                        pool,
+                        transactions_backup_config,
+                    )
+                },
+            );
     }
     Ok(())
 }
@@ -283,7 +290,9 @@ where
 
 impl<Node: FullNodeTypes, V: std::fmt::Debug> std::fmt::Debug for TxPoolBuilder<'_, Node, V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TxPoolBuilder").field("validator", &self.validator).finish()
+        f.debug_struct("TxPoolBuilder")
+            .field("validator", &self.validator)
+            .finish()
     }
 }
 

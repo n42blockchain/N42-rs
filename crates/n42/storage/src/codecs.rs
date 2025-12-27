@@ -49,10 +49,10 @@ mod tests {
     #[test]
     fn test_beacon_state_roundtrip() {
         let state = BeaconState::default();
-        
+
         let encoded = encode_beacon_state(&state).expect("encode should succeed");
         let decoded = decode_beacon_state(&encoded).expect("decode should succeed");
-        
+
         assert_eq!(
             serde_json::to_string(&state).unwrap(),
             serde_json::to_string(&decoded).unwrap()
@@ -62,10 +62,10 @@ mod tests {
     #[test]
     fn test_beacon_block_roundtrip() {
         let block = BeaconBlock::default();
-        
+
         let encoded = encode_beacon_block(&block).expect("encode should succeed");
         let decoded = decode_beacon_block(&encoded).expect("decode should succeed");
-        
+
         assert_eq!(
             serde_json::to_string(&block).unwrap(),
             serde_json::to_string(&decoded).unwrap()

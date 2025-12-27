@@ -18,7 +18,6 @@ use reth_stages_types::StageCheckpoint;
 use reth_trie_common::{StoredNibbles, StoredNibblesSubKey, *};
 use serde::{Deserialize, Serialize};
 
-
 pub mod accounts;
 mod beacon;
 pub mod blocks;

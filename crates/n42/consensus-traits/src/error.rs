@@ -123,4 +123,3 @@ impl AposError {
 
 /// Result type for APoS operations
 pub type AposResult<T> = Result<T, AposError>;
-

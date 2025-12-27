@@ -23,7 +23,9 @@ use reth_ethereum_engine_primitives::{
 use reth_ethereum_primitives::{EthPrimitives, PooledTransaction, TransactionSigned};
 use reth_evm::{ConfigureEvm, EvmFactory, EvmFactoryFor, NextBlockEnvAttributes};
 use reth_network::{EthNetworkPrimitives, NetworkHandle, PeersInfo};
-use reth_node_api::{AddOnsContext, FullNodeComponents, NodeAddOns, NodePrimitives, PrimitivesTy, TxTy};
+use reth_node_api::{
+    AddOnsContext, FullNodeComponents, NodeAddOns, NodePrimitives, PrimitivesTy, TxTy,
+};
 use reth_node_builder::{
     components::{
         BasicPayloadServiceBuilder, ComponentsBuilder, ConsensusBuilder, ExecutorBuilder,
@@ -137,21 +139,29 @@ impl<N> EthApiBuilder<N> for EthereumEthApiBuilder
 where
     N: FullNodeComponents<
         Types: NodeTypes<ChainSpec: reth_chainspec::Hardforks + EthereumHardforks>,
-        Evm: ConfigureEvm<NextBlockEnvCtx: reth_rpc_eth_api::helpers::pending_block::BuildPendingEnv<reth_node_api::HeaderTy<N::Types>>>,
+        Evm: ConfigureEvm<
+            NextBlockEnvCtx: reth_rpc_eth_api::helpers::pending_block::BuildPendingEnv<
+                reth_node_api::HeaderTy<N::Types>,
+            >,
+        >,
     >,
-    reth_rpc::eth::core::EthRpcConverterFor<N, alloy_network::Ethereum>: reth_rpc_eth_api::RpcConvert<
-        Primitives = PrimitivesTy<N::Types>,
-        Error = EthApiError,
-        Network = alloy_network::Ethereum,
-        Evm = N::Evm,
-    >,
+    reth_rpc::eth::core::EthRpcConverterFor<N, alloy_network::Ethereum>:
+        reth_rpc_eth_api::RpcConvert<
+            Primitives = PrimitivesTy<N::Types>,
+            Error = EthApiError,
+            Network = alloy_network::Ethereum,
+            Evm = N::Evm,
+        >,
     EthApiError: FromEvmError<N::Evm>,
     alloy_rpc_types_eth::TransactionRequest: reth_rpc_eth_api::SignableTxRequest<TxTy<N::Types>>,
 {
     type EthApi = EthApiFor<N, alloy_network::Ethereum>;
 
     async fn build_eth_api(self, ctx: EthApiCtx<'_, N>) -> eyre::Result<Self::EthApi> {
-        Ok(ctx.eth_api_builder().map_converter(|r| r.with_network()).build())
+        Ok(ctx
+            .eth_api_builder()
+            .map_converter(|r| r.with_network())
+            .build())
     }
 }
 
@@ -164,7 +174,13 @@ pub struct EthereumAddOns<N: FullNodeComponents, EthB: EthApiBuilder<N>, PVB> {
 impl<N: FullNodeComponents, EthB: EthApiBuilder<N>, PVB> EthereumAddOns<N, EthB, PVB> {
     /// Create new add-ons with given RPC add-ons.
     pub fn new(
-        inner: RpcAddOns<N, EthB, PVB, BasicEngineApiBuilder<PVB>, BasicEngineValidatorBuilder<PVB>>,
+        inner: RpcAddOns<
+            N,
+            EthB,
+            PVB,
+            BasicEngineApiBuilder<PVB>,
+            BasicEngineValidatorBuilder<PVB>,
+        >,
     ) -> Self {
         Self { inner }
     }
@@ -175,8 +191,9 @@ where
     N: FullNodeComponents<
         Types: NodeTypes<
             ChainSpec: EthereumHardforks + Clone + 'static,
-            Payload: reth_engine_primitives::EngineTypes<ExecutionData = alloy_rpc_types_engine::ExecutionData>
-                         + PayloadTypes<PayloadAttributes = EthPayloadAttributes>,
+            Payload: reth_engine_primitives::EngineTypes<
+                ExecutionData = alloy_rpc_types_engine::ExecutionData,
+            > + PayloadTypes<PayloadAttributes = EthPayloadAttributes>,
             Primitives = EthPrimitives,
         >,
     >,
@@ -199,7 +216,9 @@ where
         Types: NodeTypes<
             ChainSpec: EthChainSpec + EthereumHardforks,
             Primitives = EthPrimitives,
-            Payload: reth_engine_primitives::EngineTypes<ExecutionData = alloy_rpc_types_engine::ExecutionData>,
+            Payload: reth_engine_primitives::EngineTypes<
+                ExecutionData = alloy_rpc_types_engine::ExecutionData,
+            >,
         >,
         Evm: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes>,
     >,
@@ -226,7 +245,9 @@ where
         Types: NodeTypes<
             ChainSpec: EthChainSpec + EthereumHardforks,
             Primitives = EthPrimitives,
-            Payload: reth_engine_primitives::EngineTypes<ExecutionData = alloy_rpc_types_engine::ExecutionData>,
+            Payload: reth_engine_primitives::EngineTypes<
+                ExecutionData = alloy_rpc_types_engine::ExecutionData,
+            >,
         >,
         Evm: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes>,
     >,
@@ -456,7 +477,12 @@ where
         + Unpin
         + 'static,
 {
-    type Network = NetworkHandle<reth_eth_wire_types::BasicNetworkPrimitives<PrimitivesTy<Node::Types>, reth_transaction_pool::PoolPooledTx<Pool>>>;
+    type Network = NetworkHandle<
+        reth_eth_wire_types::BasicNetworkPrimitives<
+            PrimitivesTy<Node::Types>,
+            reth_transaction_pool::PoolPooledTx<Pool>,
+        >,
+    >;
 
     async fn build_network(
         self,

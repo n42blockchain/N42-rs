@@ -19,7 +19,10 @@ pub struct EngineApiExt<B, F> {
 impl<B, F> EngineApiExt<B, F> {
     /// Creates a new wrapper that calls `callback` when the API is built.
     pub const fn new(inner: B, callback: F) -> Self {
-        Self { inner, callback: Some(callback) }
+        Self {
+            inner,
+            callback: Some(callback),
+        }
     }
 }
 

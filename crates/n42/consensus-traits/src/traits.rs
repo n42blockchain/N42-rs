@@ -184,4 +184,3 @@ impl<T> FullAposConsensus for T where
     T: AposConsensus + SnapshotManager + SignerManager + VotingManager + DifficultyCalculator
 {
 }
-

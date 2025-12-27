@@ -99,4 +99,3 @@ mod tests {
         assert_eq!(slots_until_next_epoch(32), 32);
     }
 }
-

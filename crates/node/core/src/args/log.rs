@@ -54,7 +54,12 @@ pub struct LogArgs {
     pub log_file_directory: PlatformPath<LogsDir>,
 
     /// The prefix name of the log files.
-    #[arg(long = "log.file.name", value_name = "NAME", global = true, default_value = "reth.log")]
+    #[arg(
+        long = "log.file.name",
+        value_name = "NAME",
+        global = true,
+        default_value = "reth.log"
+    )]
     pub log_file_name: String,
 
     /// The maximum size (in MB) of one log file.

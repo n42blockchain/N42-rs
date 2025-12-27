@@ -29,7 +29,11 @@ pub struct EngineArgs {
 
     /// CAUTION: This CLI flag has no effect anymore, use --engine.disable-caching-and-prewarming
     /// if you want to disable caching and prewarming
-    #[arg(long = "engine.caching-and-prewarming", default_value = "true", hide = true)]
+    #[arg(
+        long = "engine.caching-and-prewarming",
+        default_value = "true",
+        hide = true
+    )]
     #[deprecated]
     pub caching_and_prewarming_enabled: bool,
 

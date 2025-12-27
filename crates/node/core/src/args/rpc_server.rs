@@ -240,11 +240,19 @@ pub struct RpcServerArgs {
     ///
     /// Options: full (include all transactions), empty (header only), none (disable pending
     /// blocks).
-    #[arg(long = "rpc.pending-block", default_value = "full", value_name = "KIND")]
+    #[arg(
+        long = "rpc.pending-block",
+        default_value = "full",
+        value_name = "KIND"
+    )]
     pub rpc_pending_block: PendingBlockKind,
 
     /// Endpoint to forward transactions to.
-    #[arg(long = "rpc.forwarder", alias = "rpc-forwarder", value_name = "FORWARDER")]
+    #[arg(
+        long = "rpc.forwarder",
+        alias = "rpc-forwarder",
+        value_name = "FORWARDER"
+    )]
     pub rpc_forwarder: Option<Url>,
 
     /// Path to file containing disallowed addresses, json-encoded list of strings. Block

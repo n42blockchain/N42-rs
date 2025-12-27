@@ -4,7 +4,10 @@
 //! Compatibility functions for rpc `Block` type.
 
 use crate::transaction::TransactionCompat;
-use alloy_consensus::{transaction::{Recovered, TxHashRef}, BlockBody, BlockHeader, Sealable};
+use alloy_consensus::{
+    transaction::{Recovered, TxHashRef},
+    BlockBody, BlockHeader, Sealable,
+};
 use alloy_primitives::U256;
 use alloy_rpc_types_eth::{
     Block, BlockTransactions, BlockTransactionsKind, Header, TransactionInfo,
@@ -47,13 +50,22 @@ where
     let transactions = block.body().transaction_hashes_iter().copied().collect();
     let rlp_length = block.rlp_length();
     let (header, body) = block.into_sealed_block().split_sealed_header_body();
-    let BlockBody { ommers, withdrawals, .. } = body.into_ethereum_body();
+    let BlockBody {
+        ommers,
+        withdrawals,
+        ..
+    } = body.into_ethereum_body();
 
     let transactions = BlockTransactions::Hashes(transactions);
     let uncles = ommers.into_iter().map(|h| h.hash_slow()).collect();
     let header = Header::from_consensus(header.into(), None, Some(U256::from(rlp_length)));
 
-    Block { header, uncles, transactions, withdrawals }
+    Block {
+        header,
+        uncles,
+        transactions,
+        withdrawals,
+    }
 }
 
 /// Create a new [`Block`] response from a [`RecoveredBlock`], using the
@@ -78,7 +90,11 @@ where
 
     let (block, senders) = block.split_sealed();
     let (header, body) = block.split_sealed_header_body();
-    let BlockBody { transactions, ommers, withdrawals } = body.into_ethereum_body();
+    let BlockBody {
+        transactions,
+        ommers,
+        withdrawals,
+    } = body.into_ethereum_body();
 
     let transactions = transactions
         .into_iter()
@@ -101,7 +117,12 @@ where
     let uncles = ommers.into_iter().map(|h| h.hash_slow()).collect();
     let header = Header::from_consensus(header.into(), None, Some(U256::from(block_length)));
 
-    let block = Block { header, uncles, transactions, withdrawals };
+    let block = Block {
+        header,
+        uncles,
+        transactions,
+        withdrawals,
+    };
 
     Ok(block)
 }

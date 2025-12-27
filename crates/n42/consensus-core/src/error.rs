@@ -44,7 +44,10 @@ pub enum ConsensusError {
 
     /// Invalid parent hash
     #[error("invalid parent hash: expected {expected}, got {actual}")]
-    InvalidParentHash { expected: BlockHash, actual: BlockHash },
+    InvalidParentHash {
+        expected: BlockHash,
+        actual: BlockHash,
+    },
 
     /// APoS error
     #[error("apos error: {0}")]
@@ -63,10 +66,7 @@ impl ConsensusError {
 
     /// Check if this is a recoverable error
     pub fn is_recoverable(&self) -> bool {
-        matches!(
-            self,
-            Self::ParentStateNotFound(_) | Self::BlockNotFound(_)
-        )
+        matches!(self, Self::ParentStateNotFound(_) | Self::BlockNotFound(_))
     }
 
     /// Check if this is a validation error
@@ -97,4 +97,3 @@ impl From<eyre::Report> for ConsensusError {
 
 /// Result type for consensus operations
 pub type ConsensusResult<T> = Result<T, ConsensusError>;
-

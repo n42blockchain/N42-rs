@@ -832,11 +832,50 @@ where
     ) -> U256 {
         self.init_recent_tds();
 
-        let mut recent_tds = self.recent_tds.write().unwrap();
-        let total_difficulty = *recent_tds.get(&hash).unwrap_or_else(|| panic!("td not found for hash {:?}", hash));
+        // First try the in-memory cache
+        {
+            let mut recent_tds = self.recent_tds.write().unwrap();
+            if let Some(td) = recent_tds.get(&hash) {
+                debug!(target: "consensus::apos", ?hash, total_difficulty=?td, "get total_difficulty from cache");
+                return *td;
+            }
+        }
 
-        debug!(target: "consensus::apos", ?hash, ?total_difficulty, "get total_difficulty");
-        total_difficulty
+        // Fall back to database lookup by hash -> number -> td
+        if let Ok(Some(header)) = self.provider.header(hash) {
+            if let Ok(Some(td)) = self.provider.header_td_by_number(header.number()) {
+                debug!(target: "consensus::apos", ?hash, total_difficulty=?td, "get total_difficulty from db");
+                // Cache it for future use
+                let mut recent_tds = self.recent_tds.write().unwrap();
+                recent_tds.insert(hash, td);
+                return td;
+            }
+            
+            // If TD not in db, try to calculate from parent
+            let parent_hash = header.parent_hash();
+            let parent_td = {
+                let mut recent_tds = self.recent_tds.write().unwrap();
+                recent_tds.get(&parent_hash).copied()
+            }.or_else(|| {
+                // Try to get parent TD from database
+                self.provider.header(parent_hash).ok().flatten()
+                    .and_then(|parent_header| {
+                        self.provider.header_td_by_number(parent_header.number()).ok().flatten()
+                    })
+            });
+            
+            if let Some(parent_td) = parent_td {
+                let td = parent_td + header.difficulty();
+                debug!(target: "consensus::apos", ?hash, total_difficulty=?td, "calculated total_difficulty from parent");
+                let mut recent_tds = self.recent_tds.write().unwrap();
+                recent_tds.insert(hash, td);
+                return td;
+            }
+        }
+
+        // Last resort: return zero with a warning
+        warn!(target: "consensus::apos", ?hash, "td not found for hash, returning zero");
+        U256::ZERO
     }
 
     fn wiggle(

@@ -258,13 +258,6 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         // Always commit to ensure data is written to disk, even if is_dirty() returns false
         // This is needed because block_range may have been updated by increment_block()
         // Commits offsets and new user_header to disk
-        tracing::debug!(
-            target: "provider::static_file",
-            segment = ?self.writer.user_header().segment(),
-            block_range = ?self.writer.user_header().block_range(),
-            is_dirty = self.writer.is_dirty(),
-            "Before NippyJarWriter commit"
-        );
         self.writer.commit().map_err(ProviderError::other)?;
 
         if let Some(metrics) = &self.metrics {

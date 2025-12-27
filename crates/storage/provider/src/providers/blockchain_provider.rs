@@ -79,18 +79,10 @@ impl<N: ProviderNodeTypes> BlockchainProvider<N> {
     pub fn new(storage: ProviderFactory<N>) -> ProviderResult<Self> {
         // Re-initialize the static file index to ensure we have the latest state
         // This is needed because genesis initialization may have written to static files
-        let static_file_provider = storage.static_file_provider();
-        static_file_provider.initialize_index()?;
-
-        // Debug: check if headers are available
-        let highest_headers_block = static_file_provider.get_highest_static_file_block(
-            reth_static_file_types::StaticFileSegment::Headers
-        );
-        tracing::debug!(target: "provider::blockchain", ?highest_headers_block, "After initialize_index");
+        storage.static_file_provider().initialize_index()?;
 
         let provider = storage.provider()?;
         let best = provider.chain_info()?;
-        tracing::debug!(target: "provider::blockchain", ?best, "Chain info");
         match provider.header_by_number(best.best_number)? {
             Some(header) => {
                 drop(provider);

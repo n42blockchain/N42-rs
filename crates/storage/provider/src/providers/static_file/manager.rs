@@ -1410,7 +1410,6 @@ impl<N: NodePrimitives> StaticFileWriter for StaticFileProvider<N> {
     }
 
     fn commit(&self) -> ProviderResult<()> {
-        tracing::debug!(target: "provider::static_file", "StaticFileProvider::commit called");
         self.writers.commit()
     }
 

@@ -11,9 +11,6 @@ pub use alloy_rpc_types_engine::{
 };
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_engine_primitives::{EngineApiValidator, PayloadValidator};
-use reth_engine_tree::tree::{
-    payload_validator::TreeCtx, EngineValidator,
-};
 use reth_ethereum_payload_builder::EthereumExecutionPayloadValidator;
 use reth_ethereum_primitives::{Block, EthPrimitives};
 use reth_node_api::PayloadTypes;
@@ -99,7 +96,7 @@ where
 /// Type alias for the validation outcome used by EngineValidator.
 pub type EthValidationOutcome = reth_engine_tree::tree::payload_validator::ValidationOutcome<EthPrimitives>;
 
-impl<ChainSpec, Types> EngineValidator<Types, EthPrimitives> for EthereumEngineValidator<ChainSpec>
+impl<ChainSpec, Types> reth_engine_tree::tree::EngineValidator<Types, EthPrimitives> for EthereumEngineValidator<ChainSpec>
 where
     ChainSpec: EthChainSpec + EthereumHardforks + 'static,
     Types: PayloadTypes<PayloadAttributes = EthPayloadAttributes, ExecutionData = ExecutionData>,
@@ -127,7 +124,7 @@ where
     fn validate_payload(
         &mut self,
         payload: ExecutionData,
-        _ctx: TreeCtx<'_, EthPrimitives>,
+        _ctx: reth_engine_tree::tree::payload_validator::TreeCtx<'_, EthPrimitives>,
     ) -> EthValidationOutcome {
         // NOTE: This is a simplified implementation for N42.
         // Full block execution and state validation is not performed here.
@@ -153,7 +150,7 @@ where
     fn validate_block(
         &mut self,
         _block: RecoveredBlock<Block>,
-        _ctx: TreeCtx<'_, EthPrimitives>,
+        _ctx: reth_engine_tree::tree::payload_validator::TreeCtx<'_, EthPrimitives>,
     ) -> EthValidationOutcome {
         // NOTE: This is a simplified implementation for N42.
         // Full block execution and state validation is not performed here.

@@ -1131,11 +1131,13 @@ where
 
 // Note: BasicEngineValidatorBuilder delegates to PayloadValidatorBuilder
 // and requires the validator to implement the full EngineValidator trait.
+// This simplified implementation is used because the full BasicEngineValidator
+// requires ConfigureEngineEvm which has complex API requirements.
 impl<Node, PVB> EngineValidatorBuilder<Node> for BasicEngineValidatorBuilder<PVB>
 where
     Node: FullNodeComponents,
     PVB: PayloadValidatorBuilder<Node>,
-    PVB::Validator: EngineValidator<
+    PVB::Validator: reth_engine_tree::tree::EngineValidator<
         <Node::Types as NodeTypes>::Payload,
         <Node::Types as NodeTypes>::Primitives,
     >,

@@ -120,7 +120,8 @@ impl<DB: Database, N: NodeTypes> AsRef<DatabaseProvider<<DB as Database>::TXMut,
 impl<DB: Database, N: NodeTypes + 'static> DatabaseProviderRW<DB, N> {
     /// Commit database transaction and static file if it exists.
     pub fn commit(self) -> ProviderResult<bool> {
-        self.0.commit()
+        // Use the DBProvider trait's commit method which handles static file commits
+        DBProvider::commit(self.0)
     }
 
     /// Consume `DbTx` or `DbTxMut`.
@@ -898,23 +899,6 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
 }
 
 impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> DatabaseProvider<TX, N> {
-    /// Commit database transaction and static files.
-    pub fn commit(self) -> ProviderResult<bool> {
-        // For unwinding it makes more sense to commit the database first, since if
-        // it is interrupted before the static files commit, we can just
-        // truncate the static files according to the
-        // checkpoints on the next start-up.
-        if self.static_file_provider.has_unwind_queued() {
-            self.tx.commit()?;
-            self.static_file_provider.commit()?;
-        } else {
-            self.static_file_provider.commit()?;
-            self.tx.commit()?;
-        }
-
-        Ok(true)
-    }
-
     /// Load shard and remove it. If list is empty, last shard was full or
     /// there are no shards at all.
     fn take_shard<T>(
@@ -3343,6 +3327,23 @@ impl<TX: DbTx + 'static, N: NodeTypes + 'static> DBProvider for DatabaseProvider
 
     fn prune_modes_ref(&self) -> &PruneModes {
         self.prune_modes_ref()
+    }
+
+    /// Commit database transaction and static files.
+    fn commit(self) -> ProviderResult<bool> {
+        // For unwinding it makes more sense to commit the database first, since if
+        // it is interrupted before the static files commit, we can just
+        // truncate the static files according to the
+        // checkpoints on the next start-up.
+        if self.static_file_provider.has_unwind_queued() {
+            self.tx.commit()?;
+            self.static_file_provider.commit()?;
+        } else {
+            self.static_file_provider.commit()?;
+            self.tx.commit()?;
+        }
+
+        Ok(true)
     }
 }
 

@@ -731,7 +731,9 @@ where
                 eyre::bail!("Error advancing the chain: no attestations");
             }
         }
-        let max_td = self.consensus.total_difficulty(block.hash());
+        // Calculate TD for the pending block: parent_td + block_difficulty
+        let parent_td = self.consensus.total_difficulty(block.header().parent_hash());
+        let max_td = parent_td + block.header().difficulty();
         let num_signers = self.get_best_block_num_signers()?;
         let interval = match self.mode {
             MiningMode::Instant(_) => {
@@ -906,7 +908,10 @@ where
         };
         self.pending_block_data.replace(pending_block_data);
 
-        let max_td = self.consensus.total_difficulty(block.header().hash_slow());
+        // Calculate TD for the new block: parent_td + block_difficulty
+        // This avoids cache miss warnings since payload builder uses a different consensus instance
+        let parent_td = self.consensus.total_difficulty(block.header().parent_hash());
+        let max_td = parent_td + block.header().difficulty();
         debug!(target: "consensus-client", ?max_td, "prepare_block: new_block hash {:?}", block.header().hash_slow());
         trace!(target: "consensus-client", ?block);
 

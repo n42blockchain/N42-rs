@@ -1189,6 +1189,31 @@ impl ExecutionPayload {
     pub const fn prev_randao(&self) -> B256 {
         self.as_v1().prev_randao
     }
+
+    /// Returns the transactions for the payload.
+    pub const fn transactions(&self) -> &Vec<Bytes> {
+        &self.as_v1().transactions
+    }
+
+    /// Returns the gas limit for the payload.
+    pub const fn gas_limit(&self) -> u64 {
+        self.as_v1().gas_limit
+    }
+
+    /// Returns the fee recipient.
+    pub const fn fee_recipient(&self) -> Address {
+        self.as_v1().fee_recipient
+    }
+
+    /// Returns the saturated base fee per gas.
+    pub fn saturated_base_fee_per_gas(&self) -> u64 {
+        self.as_v1().base_fee_per_gas.saturating_to()
+    }
+
+    /// Returns the excess blob gas for the payload.
+    pub fn excess_blob_gas(&self) -> Option<u64> {
+        self.as_v3().map(|payload| payload.excess_blob_gas)
+    }
 }
 
 impl From<ExecutionPayloadV1> for ExecutionPayload {

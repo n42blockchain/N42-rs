@@ -8,11 +8,13 @@ use alloy_rpc_types::engine::ClientVersionV1;
 use alloy_rpc_types_engine::ExecutionData;
 use jsonrpsee::{core::middleware::layer::Either, RpcModule};
 use reth_chain_state::CanonStateSubscriptions;
-use reth_chainspec::{ChainSpecProvider, EthereumHardforks, Hardforks};
+use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks, Hardforks};
+use crate::launch::invalid_block_hook::InvalidBlockHookExt;
 use reth_engine_primitives::{ConsensusEngineEvent, ConsensusEngineHandle};
 use reth_node_api::{
-    AddOnsContext, EngineApiValidator, EngineTypes, FullNodeComponents, FullNodeTypes,
-    NodeAddOns, NodeTypes, PayloadTypes, PayloadValidator, PrimitivesTy, TreeConfig,
+    AddOnsContext, BlockTy, ConfigureEngineEvm, EngineApiValidator, EngineTypes, 
+    FullNodeComponents, FullNodeTypes, NodeAddOns, NodeTypes, PayloadTypes, 
+    PayloadValidator, PrimitivesTy, TreeConfig,
 };
 use reth_node_core::{
     node_config::NodeConfig,
@@ -1129,27 +1131,37 @@ where
     }
 }
 
-// Note: BasicEngineValidatorBuilder delegates to PayloadValidatorBuilder
-// and requires the validator to implement the full EngineValidator trait.
-// This simplified implementation is used because the full BasicEngineValidator
-// requires ConfigureEngineEvm which has complex API requirements.
-impl<Node, PVB> EngineValidatorBuilder<Node> for BasicEngineValidatorBuilder<PVB>
+impl<Node, EV> EngineValidatorBuilder<Node> for BasicEngineValidatorBuilder<EV>
 where
-    Node: FullNodeComponents,
-    PVB: PayloadValidatorBuilder<Node>,
-    PVB::Validator: reth_engine_tree::tree::EngineValidator<
+    Node: FullNodeComponents<
+        Evm: ConfigureEngineEvm<
+            <<Node::Types as NodeTypes>::Payload as PayloadTypes>::ExecutionData,
+        >,
+    >,
+    EV: PayloadValidatorBuilder<Node>,
+    EV::Validator: reth_engine_primitives::PayloadValidator<
         <Node::Types as NodeTypes>::Payload,
-        <Node::Types as NodeTypes>::Primitives,
+        Block = BlockTy<Node::Types>,
     >,
 {
-    type EngineValidator = PVB::Validator;
+    type EngineValidator = BasicEngineValidator<Node::Provider, Node::Evm, EV::Validator>;
 
     async fn build_tree_validator(
         self,
         ctx: &AddOnsContext<'_, Node>,
-        _tree_config: TreeConfig,
+        tree_config: TreeConfig,
     ) -> eyre::Result<Self::EngineValidator> {
-        self.payload_validator_builder.build(ctx).await
+        let validator = self.payload_validator_builder.build(ctx).await?;
+        let data_dir = ctx.config.datadir.clone().resolve_datadir(ctx.config.chain.chain());
+        let invalid_block_hook = ctx.create_invalid_block_hook(&data_dir).await?;
+        Ok(BasicEngineValidator::new(
+            ctx.node.provider().clone(),
+            std::sync::Arc::new(ctx.node.consensus().clone()),
+            ctx.node.evm_config().clone(),
+            validator,
+            tree_config,
+            invalid_block_hook,
+        ))
     }
 }
 

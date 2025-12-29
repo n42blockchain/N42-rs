@@ -137,6 +137,31 @@ let max_td = parent_td + block.header().difficulty();
 
 **解决方案**: 将条件从 `spec_id == SpecId::CANCUN` 改为 `spec_id >= SpecId::CANCUN`。
 
+### 6. 网络层变更
+
+#### 6.1 `subscribe_block` 返回空流问题
+
+**问题**: `subscribe_block()` 创建了一个 broadcast channel，但发送方 `_tx` 立即被丢弃，导致流始终返回 `None`。
+
+**解决方案**: 在 `NetworkInner` 中添加 `block_announcer` 字段：
+
+**文件**: `crates/net/network/src/network.rs`
+
+```rust
+struct NetworkInner<N: NetworkPrimitives = EthNetworkPrimitives> {
+    // ... 其他字段
+    /// Sender for block announcement events.
+    block_announcer: EventSender<NewBlock<N::Block>>,
+}
+
+impl<N: NetworkPrimitives> BlockAnnounceProvider for NetworkHandle<N> {
+    fn subscribe_block(&self) -> EventStream<NewBlock<Self::Block>> {
+        // 返回真正的监听器
+        self.inner.block_announcer.new_listener()
+    }
+}
+```
+
 ---
 
 ## 新增依赖

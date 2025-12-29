@@ -305,6 +305,8 @@ where
     let block_gas_limit: u64 = builder.evm_mut().block().gas_limit();
     let base_fee = builder.evm_mut().block().basefee();
 
+    debug!(target: "payload_builder", ?block_gas_limit, ?base_fee, "payload builder block config");
+
     let mut best_txs = best_txs(BestTransactionsAttributes::new(
         base_fee,
         builder
@@ -313,6 +315,7 @@ where
             .blob_gasprice()
             .map(|gasprice| gasprice as u64),
     ));
+    let mut tx_count = 0u64;
     let mut total_fees = U256::ZERO;
 
     let mut header = cons
@@ -332,6 +335,9 @@ where
         .unwrap_or_default();
 
     while let Some(pool_tx) = best_txs.next() {
+        tx_count += 1;
+        debug!(target: "payload_builder", tx_count, tx_hash=?pool_tx.hash(), gas_limit=pool_tx.gas_limit(), "processing transaction from pool");
+
         // ensure we still have capacity for this transaction
         if cumulative_gas_used + pool_tx.gas_limit() > block_gas_limit {
             // we can't fit this transaction into the block, so we need to mark it as invalid
@@ -418,6 +424,8 @@ where
         total_fees += U256::from(miner_fee) * U256::from(gas_used);
         cumulative_gas_used += gas_used;
     }
+
+    debug!(target: "payload_builder", tx_count, ?cumulative_gas_used, ?total_fees, "payload builder finished processing transactions");
 
     // check if we have a better block
     if !is_better_payload(best_payload.as_ref(), total_fees) {

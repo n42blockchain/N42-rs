@@ -305,6 +305,8 @@ where
         + 'static,
 {
     fn evm_env_for_payload(&self, payload: &alloy_rpc_types_engine::ExecutionData) -> Result<reth_evm::EvmEnvFor<Self>, Self::Error> {
+        use reth_primitives_traits::header::clique_utils::recover_address;
+
         let timestamp = payload.payload.timestamp();
         let block_number = payload.payload.block_number();
 
@@ -328,9 +330,19 @@ where
                 BlobExcessGasAndPrice { excess_blob_gas, blob_gasprice }
             });
 
+        // For Clique/APoS: recover signer address from extra_data signature to use as coinbase.
+        // The fee_recipient field in Clique is used for voting and is usually Address::ZERO.
+        // Convert payload to block to get header for signature recovery.
+        let beneficiary = match payload.payload.clone().try_into_block::<TransactionSigned>() {
+            Ok(block) => {
+                recover_address(&block.header).unwrap_or_else(|_| payload.payload.fee_recipient())
+            }
+            Err(_) => payload.payload.fee_recipient(),
+        };
+
         let block_env = BlockEnv {
             number: U256::from(block_number),
-            beneficiary: payload.payload.fee_recipient(),
+            beneficiary,
             timestamp: U256::from(timestamp),
             difficulty: if spec >= SpecId::MERGE {
                 U256::ZERO

@@ -1237,6 +1237,11 @@ impl ExecutionPayload {
         self.as_v1().fee_recipient
     }
 
+    /// Returns the extra data.
+    pub fn extra_data(&self) -> &Bytes {
+        &self.as_v1().extra_data
+    }
+
     /// Returns the saturated base fee per gas.
     pub fn saturated_base_fee_per_gas(&self) -> u64 {
         self.as_v1().base_fee_per_gas.saturating_to()

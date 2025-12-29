@@ -50,6 +50,7 @@ use reth_primitives_traits::SealedBlock;
 //use n42_engine_primitives::{N42PayloadAttributes, N42PayloadBuilderAttributes};
 use reth_basic_payload_builder::{BasicPayloadJobGenerator, BasicPayloadJobGeneratorConfig};
 use reth_chain_state::CanonStateSubscriptions;
+use n42_consensus_traits::SignerManager;
 use reth_consensus::{ConsensusError, FullConsensus};
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_node_api::PayloadBuilderFor;
@@ -192,7 +193,7 @@ where
     EvmConfig: ConfigureEvm<Primitives = EthPrimitives, NextBlockEnvCtx = NextBlockEnvAttributes>,
     Client: StateProviderFactory + ChainSpecProvider<ChainSpec: EthereumHardforks> + Clone,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>,
-    Cons: FullConsensus<EthPrimitives, Error = ConsensusError> + Clone + Unpin + 'static,
+    Cons: FullConsensus<EthPrimitives, Error = ConsensusError> + SignerManager + Clone + Unpin + 'static,
 {
     type Attributes = EthPayloadBuilderAttributes;
     type BuiltPayload = EthBuiltPayload;
@@ -263,7 +264,7 @@ where
     Client: StateProviderFactory + ChainSpecProvider<ChainSpec: EthereumHardforks>,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>,
     F: FnOnce(BestTransactionsAttributes) -> BestTransactionsIter<Pool>,
-    Cons: FullConsensus<EthPrimitives, Error = ConsensusError> + Clone + Unpin + 'static,
+    Cons: FullConsensus<EthPrimitives, Error = ConsensusError> + SignerManager + Clone + Unpin + 'static,
 {
     let BuildArguments {
         mut cached_reads,
@@ -283,13 +284,31 @@ where
         .with_bundle_update()
         .build();
 
+    // Get signer address from consensus to use as coinbase (beneficiary)
+    // This ensures consistency between payload builder and engine tree execution
+    let coinbase = match cons.get_signer_address() {
+        Ok(Some(addr)) => {
+            debug!(target: "payload_builder", signer_address=?addr, "using signer address as coinbase");
+            addr
+        }
+        Ok(None) => {
+            warn!(target: "payload_builder", "No signer address configured, using suggested_fee_recipient");
+            attributes.suggested_fee_recipient()
+        }
+        Err(e) => {
+            warn!(target: "payload_builder", error=?e, "Failed to get signer address, using suggested_fee_recipient");
+            attributes.suggested_fee_recipient()
+        }
+    };
+    debug!(target: "payload_builder", ?coinbase, suggested_fee_recipient=?attributes.suggested_fee_recipient(), "using coinbase for payload building");
+
     let mut builder = evm_config
         .builder_for_next_block(
             &mut db,
             &parent_header,
             NextBlockEnvAttributes {
                 timestamp: attributes.timestamp(),
-                suggested_fee_recipient: attributes.suggested_fee_recipient(),
+                suggested_fee_recipient: coinbase,
                 prev_randao: attributes.prev_randao(),
                 gas_limit: builder_config.gas_limit(parent_header.gas_limit),
                 parent_beacon_block_root: attributes.parent_beacon_block_root(),
@@ -548,7 +567,7 @@ where
         + 'static,
     EvmConfig: ConfigureEvm<Primitives = EthPrimitives, NextBlockEnvCtx = NextBlockEnvAttributes>,
     CB: ConsensusBuilder<Node> + Clone + Send + Sync,
-    CB::Consensus: FullConsensus<EthPrimitives, Error = ConsensusError> + Clone + Unpin + 'static,
+    CB::Consensus: FullConsensus<EthPrimitives, Error = ConsensusError> + SignerManager + Clone + Unpin + 'static,
 {
     async fn spawn_payload_builder_service(
         self,

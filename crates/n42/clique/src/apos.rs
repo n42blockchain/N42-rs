@@ -27,6 +27,7 @@ use tracing::{debug, error, info, warn};
 use alloy_signer::SignerSync;
 use alloy_signer_local::{LocalSigner, PrivateKeySigner};
 use k256::ecdsa::SigningKey;
+use n42_consensus_traits::SignerManager;
 use reth_consensus::{
     Consensus, ConsensusError, FullConsensus, HeaderConsensusError, HeaderValidator,
 };
@@ -992,5 +993,27 @@ where
     ) -> Result<Option<CachedReads>, ConsensusError> {
         let mut recent_cached_reads = self.recent_cached_reads.write().unwrap();
         Ok(recent_cached_reads.get(&block_hash).cloned())
+    }
+}
+
+impl<Provider, ChainSpec> SignerManager for APos<Provider, ChainSpec>
+where
+    Provider: HeaderProvider<Header = reth_primitives_traits::Header>
+        + BlockIdReader
+        + BlockReaderIdExt
+        + Clone
+        + Unpin
+        + 'static,
+    ChainSpec: EthChainSpec + EthereumHardforks,
+{
+    fn set_signer_key(&self, key: Option<String>) -> n42_consensus_traits::AposResult<()> {
+        let eth_signer: Option<PrivateKeySigner> = key.map(|k| k.parse().unwrap());
+        self.set_signer(eth_signer);
+        Ok(())
+    }
+
+    fn get_signer_address(&self) -> n42_consensus_traits::AposResult<Option<Address>> {
+        let signer_guard = self.signer.read().unwrap();
+        Ok(*signer_guard)
     }
 }

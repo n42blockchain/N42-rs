@@ -14,21 +14,19 @@ mod hardfork_tests {
         // Osaka (CL) should activate after Prague (EL)
         assert!(N42_OSAKA_TIMESTAMP > N42_PRAGUE_TIMESTAMP);
 
-        // Time difference should be reasonable (about 1 month)
+        // Time difference is very large since Osaka is delayed for devnet testing
         let diff = N42_OSAKA_TIMESTAMP - N42_PRAGUE_TIMESTAMP;
         assert!(diff > 0);
-        assert!(diff < 60 * 60 * 24 * 60); // Less than 60 days
     }
 
     #[test]
     fn test_osaka_timestamp_valid() {
-        // 2025-07-01 00:00:00 UTC
-        assert_eq!(N42_OSAKA_TIMESTAMP, 1751328000);
+        // 2099-01-01 00:00:00 UTC (delayed for devnet testing)
+        // Original was 1751328000 (2025-07-01)
+        assert_eq!(N42_OSAKA_TIMESTAMP, 4070908800);
 
-        // Verify it's in the future (as of code writing)
-        // and a reasonable date
-        assert!(N42_OSAKA_TIMESTAMP > 1700000000); // After 2023
-        assert!(N42_OSAKA_TIMESTAMP < 2000000000); // Before 2033
+        // Verify it's in the far future (for devnet testing)
+        assert!(N42_OSAKA_TIMESTAMP > 4000000000); // After 2096
     }
 }
 

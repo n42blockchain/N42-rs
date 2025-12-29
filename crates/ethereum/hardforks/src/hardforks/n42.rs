@@ -32,13 +32,16 @@ impl Hardfork for BeijingFork {
 /// - Shanghai: 2025-05-07 00:00:00 UTC (1746576000)
 /// - Cancun:   2025-05-07 00:00:00 UTC (1746576000)
 /// - Prague:   2025-06-03 06:00:00 UTC (1748930400)
-/// - Osaka:    2025-07-01 00:00:00 UTC (1751328000) - Fusaka CL upgrade
+/// - Osaka:    2099-01-01 00:00:00 UTC (4070908800) - Fusaka CL upgrade (delayed for devnet)
 ///
 /// Note: Osaka enables:
 /// - EIP-2537: BLS12-381 precompiles
 /// - EIP-7594: PeerDAS (data availability sampling)
 /// - Increased blob capacity (target: 6, max: 9)
-pub const N42_OSAKA_TIMESTAMP: u64 = 1751328000;
+/// - MAX_TX_GAS_LIMIT_OSAKA: 16,777,216 (2^24) - limits transaction gas
+///
+/// For devnet testing, Osaka is delayed to avoid the 16M gas limit restriction.
+pub const N42_OSAKA_TIMESTAMP: u64 = 4070908800;
 
 /// N42 hardforks
 pub static N42_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {

@@ -6,8 +6,12 @@
 use alloy_primitives::Address;
 
 /// N42 Mainnet Osaka (Fusaka CL) activation timestamp
-/// 2025-07-01 00:00:00 UTC
-pub const N42_OSAKA_TIMESTAMP: u64 = 1751328000;
+/// 2099-01-01 00:00:00 UTC (delayed for devnet testing)
+/// Original: 2025-07-01 00:00:00 UTC (1751328000)
+///
+/// Note: Osaka introduces MAX_TX_GAS_LIMIT_OSAKA (16M gas) which restricts
+/// large contract deployments. Delayed to allow devnet testing.
+pub const N42_OSAKA_TIMESTAMP: u64 = 4070908800;
 
 /// N42 Mainnet Prague (Fusaka EL) activation timestamp
 /// 2025-06-03 06:00:00 UTC
@@ -171,8 +175,10 @@ mod tests {
 
     #[test]
     fn test_osaka_timestamps() {
-        // Osaka should be after Prague
+        // Osaka should be after Prague (delayed to far future for devnet testing)
         assert!(N42_OSAKA_TIMESTAMP > N42_PRAGUE_TIMESTAMP);
+        // Osaka is now set to 2099-01-01 for devnet
+        assert_eq!(N42_OSAKA_TIMESTAMP, 4070908800);
     }
 
     #[test]

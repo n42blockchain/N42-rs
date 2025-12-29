@@ -928,18 +928,21 @@ where
         let committee_cache = if block.number % SLOTS_PER_EPOCH == 0 {
             // committee_cache init requires non-empty validators
             if !beacon_state_after_withdrawal.has_active_validators(RelativeEpoch::Next) {
+                debug!(target: "consensus-client", block_number=block.number, "prepare_block: no active validators for next epoch, skipping broadcast");
                 return Ok(());
             }
             beacon_state_after_withdrawal.gen_committee_cache(RelativeEpoch::Next)?
         } else {
             // committee_cache init requires non-empty validators
             if !beacon_state_after_withdrawal.has_active_validators(RelativeEpoch::Current) {
+                debug!(target: "consensus-client", block_number=block.number, "prepare_block: no active validators for current epoch, skipping broadcast");
                 return Ok(());
             }
             beacon_state_after_withdrawal.gen_committee_cache(RelativeEpoch::Current)?
         };
 
         let beacon_committees = committee_cache.get_beacon_committees_at_slot(block.number)?;
+        debug!(target: "consensus-client", block_number=block.number, num_committees=beacon_committees.len(), "prepare_block: got beacon committees");
 
         let cached_reads = self.consensus.get_cached_reads(block.hash())?.ok_or(eyre::eyre!("cached_reads not found, block_hash={:?}", block.hash()))?;
         let mut header = block.header().clone();
@@ -962,8 +965,22 @@ where
             for validator_index in beacon_committee.committee {
                 target_committee_pubkeys.push(beacon_state_after_withdrawal.get_validator(*validator_index)?.pubkey);
             }
+            debug!(target: "consensus-client", 
+                block_number=block.number, 
+                committee_index=beacon_committee.index, 
+                num_validators=target_committee_pubkeys.len(),
+                pubkeys=?target_committee_pubkeys.iter().map(|p| hex::encode(p)).collect::<Vec<_>>(),
+                "prepare_block: broadcasting to committee"
+            );
             unverified_block.committee_index = beacon_committee.index;
-            let _ = self.broadcast_unverified_block_tx.send((unverified_block.clone(), Arc::new(target_committee_pubkeys)));
+            match self.broadcast_unverified_block_tx.send((unverified_block.clone(), Arc::new(target_committee_pubkeys))) {
+                Ok(num_receivers) => {
+                    debug!(target: "consensus-client", block_number=block.number, num_receivers, "prepare_block: broadcast sent");
+                }
+                Err(e) => {
+                    warn!(target: "consensus-client", block_number=block.number, ?e, "prepare_block: broadcast send failed");
+                }
+            }
         }
         Ok(())
     }

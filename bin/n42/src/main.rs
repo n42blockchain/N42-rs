@@ -38,41 +38,11 @@ fn main() {
     let (broadcast_tx, _broadcast_rx) = broadcast::channel::<(UnverifiedBlock, Arc<Vec<BLSPubkey>>)>(100);
     let broadcast_tx_clone_for_miner = broadcast_tx.clone();
 
-    // Create router channel for pubsub and start router loop
+    // Create router channel for pubsub
     let (router_tx, router_rx) = mpsc::channel::<RouterMsg<UnverifiedBlock>>(100);
     let router_tx_clone = router_tx.clone();
     let router_tx_for_bridge = router_tx.clone();
-
-    // Start the pubsub router loop
-    tokio::spawn(async move {
-        debug!(target: "reth::cli", "Starting pubsub router loop");
-        router_loop(router_rx).await;
-    });
-
-    // Bridge: forward messages from broadcast channel to pubsub router
-    let mut broadcast_rx_for_bridge = broadcast_tx.subscribe();
-    tokio::spawn(async move {
-        debug!(target: "reth::cli", "Starting broadcast-to-pubsub bridge");
-        while let Ok((unverified_block, target_pubkeys)) = broadcast_rx_for_bridge.recv().await {
-            debug!(
-                target: "reth::cli",
-                block_number = unverified_block.blockbody.header().number(),
-                num_validators = target_pubkeys.len(),
-                "Broadcasting block to validators"
-            );
-            // Send to each validator's topic (pubkey hex)
-            for pubkey in target_pubkeys.iter() {
-                let topic = hex::encode(pubkey);
-                let event = Event {
-                    topic: topic.clone(),
-                    payload: unverified_block.clone(),
-                };
-                publish(&router_tx_for_bridge, event).await;
-                debug!(target: "reth::cli", ?topic, "Published block to validator topic");
-            }
-        }
-        debug!(target: "reth::cli", "Broadcast-to-pubsub bridge ended");
-    });
+    let broadcast_rx_for_bridge = broadcast_tx.subscribe();
 
     // Shared consensus instance holder
     let consensus_holder: std::sync::Arc<
@@ -93,6 +63,38 @@ fn main() {
     if let Err(err) =
         Cli::<EthereumChainSpecParser, RessArgs>::parse().run(async move |builder, ress_args| {
             info!(target: "reth::cli", "Launching node");
+
+            // Start the pubsub router loop (must be inside async context)
+            tokio::spawn(async move {
+                debug!(target: "reth::cli", "Starting pubsub router loop");
+                router_loop(router_rx).await;
+            });
+
+            // Bridge: forward messages from broadcast channel to pubsub router
+            let mut broadcast_rx_for_bridge = broadcast_rx_for_bridge;
+            tokio::spawn(async move {
+                debug!(target: "reth::cli", "Starting broadcast-to-pubsub bridge");
+                while let Ok((unverified_block, target_pubkeys)) = broadcast_rx_for_bridge.recv().await {
+                    debug!(
+                        target: "reth::cli",
+                        block_number = unverified_block.blockbody.header().number(),
+                        num_validators = target_pubkeys.len(),
+                        "Broadcasting block to validators"
+                    );
+                    // Send to each validator's topic (pubkey hex)
+                    for pubkey in target_pubkeys.iter() {
+                        let topic = hex::encode(pubkey);
+                        let event = Event {
+                            topic: topic.clone(),
+                            payload: unverified_block.clone(),
+                        };
+                        publish(&router_tx_for_bridge, event).await;
+                        debug!(target: "reth::cli", ?topic, "Published block to validator topic");
+                    }
+                }
+                debug!(target: "reth::cli", "Broadcast-to-pubsub bridge ended");
+            });
+
             let NodeHandle {
                 node,
                 node_exit_future,

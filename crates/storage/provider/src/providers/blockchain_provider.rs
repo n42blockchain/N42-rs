@@ -2883,8 +2883,13 @@ mod tests {
 }
 
 // N42-specific trait implementations
+use crate::errors::any::AnyError;
+use merkle_db_rs::tree::{Tree, VecTree};
 use n42_primitives::{BeaconBlock, BeaconState, Validator};
-use reth_db_api::tables::{BeaconBlockRecord, BeaconStateRecord, Eth1HashToBeaconBlockHash};
+use reth_db_api::tables::{
+    BeaconBlockRecord, BeaconStateRecord, Eth1HashToBeaconBlockHash, TreeByHashForU64,
+    TreeByHashForValidator,
+};
 use reth_db_api::transaction::DbTxMut;
 use reth_storage_api::{BeaconProvider, BeaconProviderWriter};
 
@@ -2904,11 +2909,55 @@ impl<N: ProviderNodeTypes> BeaconProvider for BlockchainProvider<N> {
         &self,
         block_hash: &BlockHash,
     ) -> ProviderResult<Option<BeaconState>> {
-        self.database
+        let mut beacon_state = match self
+            .database
             .provider()?
             .tx_ref()
-            .get::<BeaconStateRecord>(*block_hash)
-            .map_err(Into::into)
+            .get::<BeaconStateRecord>(*block_hash)?
+        {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        // Restore VecTree structures from stored tree nodes
+        let validators_store = VecTree::restore(
+            beacon_state.validators,
+            beacon_state.validators_len,
+            |tree_hash| {
+                self.get_tree_by_hash_for_validator(&tree_hash)
+                    .unwrap_or(None)
+            },
+        )
+        .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+        beacon_state.validators_store = validators_store;
+
+        let inactivity_scores_store = VecTree::restore(
+            beacon_state.inactivity_scores,
+            beacon_state.inactivity_scores_len,
+            |tree_hash| self.get_tree_by_hash_for_u64(&tree_hash).unwrap_or(None),
+        )
+        .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+        beacon_state.inactivity_scores_store = inactivity_scores_store;
+
+        let balances_store = VecTree::restore(
+            beacon_state.balances,
+            beacon_state.balances_len,
+            |tree_hash| self.get_tree_by_hash_for_u64(&tree_hash).unwrap_or(None),
+        )
+        .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+        beacon_state.balances_store = balances_store;
+
+        let epoch_attester_indexes_store = VecTree::restore(
+            beacon_state.epoch_attester_indexes,
+            beacon_state.epoch_attester_indexes_len,
+            |tree_hash| self.get_tree_by_hash_for_u64(&tree_hash).unwrap_or(None),
+        )
+        .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+        beacon_state.epoch_attester_indexes_set =
+            epoch_attester_indexes_store.iter().copied().collect();
+        beacon_state.epoch_attester_indexes_store = epoch_attester_indexes_store;
+
+        Ok(Some(beacon_state))
     }
 
     fn get_beacon_block_hash_by_eth1_hash(
@@ -2924,18 +2973,24 @@ impl<N: ProviderNodeTypes> BeaconProvider for BlockchainProvider<N> {
 
     fn get_tree_by_hash_for_validator(
         &self,
-        _tree_hash: &B256,
+        tree_hash: &B256,
     ) -> ProviderResult<Option<merkle_db_rs::tree::Tree<Validator>>> {
-        // TODO: Implement tree storage for validators
-        Ok(None)
+        self.database
+            .provider()?
+            .tx_ref()
+            .get::<TreeByHashForValidator>(*tree_hash)
+            .map_err(Into::into)
     }
 
     fn get_tree_by_hash_for_u64(
         &self,
-        _tree_hash: &B256,
+        tree_hash: &B256,
     ) -> ProviderResult<Option<merkle_db_rs::tree::Tree<u64>>> {
-        // TODO: Implement tree storage for u64
-        Ok(None)
+        self.database
+            .provider()?
+            .tx_ref()
+            .get::<TreeByHashForU64>(*tree_hash)
+            .map_err(Into::into)
     }
 }
 
@@ -2958,10 +3013,88 @@ impl<N: ProviderNodeTypes> BeaconProviderWriter for BlockchainProvider<N> {
         block_hash: &BlockHash,
         beacon_state: BeaconState,
     ) -> ProviderResult<()> {
+        // Save tree nodes using diff_save (only saves changed nodes)
+        beacon_state
+            .validators_store
+            .diff_save(
+                |tree_hash, tree: &Tree<Validator>| {
+                    self.save_tree_by_hash_for_validator(tree_hash, tree.clone())
+                },
+                |tree_hash| {
+                    self.get_tree_by_hash_for_validator(&tree_hash)
+                        .unwrap_or(None)
+                        .is_some()
+                },
+            )
+            .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+
+        beacon_state
+            .inactivity_scores_store
+            .diff_save(
+                |tree_hash, tree: &Tree<u64>| {
+                    self.save_tree_by_hash_for_u64(tree_hash, tree.clone())
+                },
+                |tree_hash| {
+                    self.get_tree_by_hash_for_u64(&tree_hash)
+                        .unwrap_or(None)
+                        .is_some()
+                },
+            )
+            .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+
+        beacon_state
+            .balances_store
+            .diff_save(
+                |tree_hash, tree: &Tree<u64>| {
+                    self.save_tree_by_hash_for_u64(tree_hash, tree.clone())
+                },
+                |tree_hash| {
+                    self.get_tree_by_hash_for_u64(&tree_hash)
+                        .unwrap_or(None)
+                        .is_some()
+                },
+            )
+            .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+
+        beacon_state
+            .epoch_attester_indexes_store
+            .diff_save(
+                |tree_hash, tree: &Tree<u64>| {
+                    self.save_tree_by_hash_for_u64(tree_hash, tree.clone())
+                },
+                |tree_hash| {
+                    self.get_tree_by_hash_for_u64(&tree_hash)
+                        .unwrap_or(None)
+                        .is_some()
+                },
+            )
+            .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+
+        // Update beacon_state with root hashes from tree stores
+        let beacon_state_updated = BeaconState {
+            validators: beacon_state.validators_store.root(),
+            validators_len: beacon_state.validators_store.len() as u64,
+            inactivity_scores: beacon_state.inactivity_scores_store.root(),
+            inactivity_scores_len: beacon_state.inactivity_scores_store.len() as u64,
+            balances: beacon_state.balances_store.root(),
+            balances_len: beacon_state.balances_store.len() as u64,
+            epoch_attester_indexes: beacon_state.epoch_attester_indexes_store.root(),
+            epoch_attester_indexes_len: beacon_state.epoch_attester_indexes_store.len() as u64,
+
+            // to prevent unnecessary copying from beacon_state
+            validators_store: Default::default(),
+            inactivity_scores_store: Default::default(),
+            balances_store: Default::default(),
+            epoch_attester_indexes_store: Default::default(),
+            epoch_attester_indexes_set: Default::default(),
+
+            ..beacon_state
+        };
+
         let provider = self.database.provider_rw()?;
         provider
             .tx_ref()
-            .put::<BeaconStateRecord>(*block_hash, beacon_state)?;
+            .put::<BeaconStateRecord>(*block_hash, beacon_state_updated)?;
         provider.commit()?;
         Ok(())
     }
@@ -2981,19 +3114,25 @@ impl<N: ProviderNodeTypes> BeaconProviderWriter for BlockchainProvider<N> {
 
     fn save_tree_by_hash_for_validator(
         &self,
-        _tree_hash: &B256,
-        _tree: merkle_db_rs::tree::Tree<Validator>,
+        tree_hash: &B256,
+        tree: merkle_db_rs::tree::Tree<Validator>,
     ) -> ProviderResult<()> {
-        // TODO: Implement tree storage for validators
+        let provider = self.database.provider_rw()?;
+        provider
+            .tx_ref()
+            .put::<TreeByHashForValidator>(*tree_hash, tree)?;
+        provider.commit()?;
         Ok(())
     }
 
     fn save_tree_by_hash_for_u64(
         &self,
-        _tree_hash: &B256,
-        _tree: merkle_db_rs::tree::Tree<u64>,
+        tree_hash: &B256,
+        tree: merkle_db_rs::tree::Tree<u64>,
     ) -> ProviderResult<()> {
-        // TODO: Implement tree storage for u64
+        let provider = self.database.provider_rw()?;
+        provider.tx_ref().put::<TreeByHashForU64>(*tree_hash, tree)?;
+        provider.commit()?;
         Ok(())
     }
 }

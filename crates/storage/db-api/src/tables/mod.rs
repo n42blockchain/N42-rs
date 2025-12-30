@@ -356,7 +356,7 @@ tables! {
     table Snapshots {
         type Key = BlockNumber;
         type Value = Snapshot;
-        }
+    }
 
     /// Stores the snaphsot per hash
     table SnapshotsByHash {

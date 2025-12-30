@@ -871,6 +871,35 @@ where
 
         let (withdrawals, beacon_state_after_withdrawal) = self.beacon.gen_withdrawals(header.hash())?;
         debug!(target: "consensus-client", ?withdrawals, "prepare_block: PayloadAttributes withdrawals");
+        
+        // Log validator status for debugging
+        let current_epoch = beacon_state_after_withdrawal.current_epoch();
+        let total_validators = beacon_state_after_withdrawal.validators_store.len();
+        let active_validators: Vec<_> = beacon_state_after_withdrawal.validators_store.iter()
+            .enumerate()
+            .filter(|(_, v)| v.is_active_at(current_epoch))
+            .map(|(i, v)| (i, v.activation_epoch, v.exit_epoch))
+            .collect();
+        info!(target: "consensus-client", 
+            current_epoch=current_epoch,
+            total_validators=total_validators,
+            active_validators_count=active_validators.len(),
+            "prepare_block: validator status"
+        );
+        if total_validators > 0 && active_validators.is_empty() {
+            // Log first few validators for debugging
+            for (i, v) in beacon_state_after_withdrawal.validators_store.iter().take(5).enumerate() {
+                info!(target: "consensus-client",
+                    validator_index=i,
+                    pubkey=hex::encode(&v.pubkey),
+                    activation_eligibility_epoch=v.activation_eligibility_epoch,
+                    activation_epoch=v.activation_epoch,
+                    exit_epoch=v.exit_epoch,
+                    effective_balance=v.effective_balance,
+                    "prepare_block: validator not yet active"
+                );
+            }
+        }
 
         let forkchoice_state = self.forkchoice_state()?;
         let payload_attributes = self.payload_attributes_builder.build_ext(timestamp.as_secs(), withdrawals, beacon_state_after_withdrawal.randao_mix);

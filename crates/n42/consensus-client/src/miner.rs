@@ -63,6 +63,7 @@ use n42_primitives::{
     BeaconBlock, BeaconState, BlockVerifyResultAggregate, CommitteeIndex, Deposit, RelativeEpoch,
     VoluntaryExitWithSig, SLOTS_PER_EPOCH,
 };
+use ssz::Encode; // For consistent SSZ serialization in signature verification
 
 /// A mining mode for the local dev engine.
 #[derive(Debug)]
@@ -697,7 +698,8 @@ where
             return Err(eyre::eyre!("mismatch receipts_root, expected={:?}, got={:?}", attestation.data.receipts_root, attestation_data.receipts_root));
         }
 
-        let bytes: Vec<u8> = serde_json::to_vec(&attestation_data)?;
+        // Use SSZ encoding for consistent serialization with verify_aggregate_signature
+        let bytes: Vec<u8> = attestation_data.as_ssz_bytes();
         let bytes_slice: &[u8] = &bytes;
         let err = signature.verify(true, bytes_slice, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[], &pubkey, true);
         if err != blst::BLST_ERROR::BLST_SUCCESS {

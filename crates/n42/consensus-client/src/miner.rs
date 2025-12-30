@@ -973,7 +973,9 @@ where
         let beacon_committees = committee_cache.get_beacon_committees_at_slot(block.number)?;
         debug!(target: "consensus-client", block_number=block.number, num_committees=beacon_committees.len(), "prepare_block: got beacon committees");
 
-        let cached_reads = self.consensus.get_cached_reads(block.hash())?.ok_or(eyre::eyre!("cached_reads not found, block_hash={:?}", block.hash()))?;
+        // Try to get cached_reads from consensus, fall back to empty cache if not found
+        // This can happen when payload builder uses a different consensus instance
+        let cached_reads = self.consensus.get_cached_reads(block.hash())?.unwrap_or_default();
         let mut header = block.header().clone();
         header.receipts_root = Default::default();
         let body = block.body().clone();

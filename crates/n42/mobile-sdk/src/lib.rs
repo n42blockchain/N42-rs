@@ -7,7 +7,6 @@ use jsonrpsee::rpc_params;
 use jsonrpsee::ws_client::WsClientBuilder;
 use n42_clique::{BlockVerifyResult, UnverifiedBlock};
 use n42_primitives::AttestationData;
-use ssz::Encode; // For consistent SSZ serialization in signature
 use reth_chainspec::{ChainSpec, ChainSpecBuilder, EthereumHardfork, ForkCondition, N42_DEVNET};
 use reth_ethereum_primitives::{Block, Receipt};
 use reth_evm::execute::Executor;
@@ -75,8 +74,8 @@ pub async fn run_client(ws_url: &str, validator_private_key: &str) -> eyre::Resu
                             receipts_root,
                         };
 
-                        // Use SSZ encoding for consistent serialization with server-side verification
-                        let bytes: Vec<u8> = attestation_data.as_ssz_bytes();
+                        // Use JSON encoding for consistent serialization with server-side verification
+                        let bytes: Vec<u8> = serde_json::to_vec(&attestation_data)?;
                         let bytes_slice: &[u8] = &bytes;
 
                         let msg = bytes_slice;

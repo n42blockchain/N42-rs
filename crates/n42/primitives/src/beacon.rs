@@ -908,8 +908,8 @@ impl BeaconState {
         }
         let pubkeys_refs: Vec<&PublicKey> = pubkeys.iter().collect();
 
-        // PERF: Use SSZ encoding instead of JSON for better performance
-        let bytes: Vec<u8> = attestation.data.as_ssz_bytes();
+        // Use JSON encoding for signature verification
+        let bytes: Vec<u8> = serde_json::to_vec(&attestation.data)?;
         let bytes_slice: &[u8] = &bytes;
 
         let aggregate_sig_verify_result = sig.to_signature().fast_aggregate_verify(
@@ -967,8 +967,8 @@ impl BeaconState {
             }
             all_pubkeys.push(pubkeys);
 
-            // Use SSZ encoding
-            all_messages.push(attestation.data.as_ssz_bytes());
+            // Use JSON encoding
+            all_messages.push(serde_json::to_vec(&attestation.data)?);
         }
 
         // Verify each attestation's aggregate signature
@@ -2733,7 +2733,6 @@ mod tests {
     #[test]
     fn test_attestation_signature_roundtrip() {
         use blst::min_pk::{AggregateSignature, PublicKey, SecretKey, Signature};
-        use ssz::Encode;
 
         // Generate a test keypair
         let ikm = [1u8; 32]; // Use fixed seed for reproducibility
@@ -2747,8 +2746,8 @@ mod tests {
             receipts_root: B256::from([0xab; 32]),
         };
 
-        // Sign using SSZ serialization (same as mobile-sdk client)
-        let bytes: Vec<u8> = attestation_data.as_ssz_bytes();
+        // Sign using JSON serialization (same as mobile-sdk client)
+        let bytes: Vec<u8> = serde_json::to_vec(&attestation_data).unwrap();
         let sig = sk.sign(&bytes, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[]);
 
         // Verify the signature directly (same as miner.rs verification)
@@ -2796,7 +2795,6 @@ mod tests {
     #[test]
     fn test_attestation_signature_multiple_validators() {
         use blst::min_pk::{AggregateSignature, PublicKey, SecretKey};
-        use ssz::Encode;
 
         // Generate multiple keypairs
         let mut secret_keys = Vec::new();
@@ -2816,8 +2814,8 @@ mod tests {
             receipts_root: B256::from([0xcd; 32]),
         };
 
-        // Sign with each validator and aggregate
-        let bytes: Vec<u8> = attestation_data.as_ssz_bytes();
+        // Sign with each validator and aggregate using JSON serialization
+        let bytes: Vec<u8> = serde_json::to_vec(&attestation_data).unwrap();
         let mut agg_sig: Option<AggregateSignature> = None;
 
         for sk in &secret_keys {
@@ -2850,7 +2848,7 @@ mod tests {
     }
 
     #[test]
-    fn test_attestation_signature_ssz_vs_json_mismatch() {
+    fn test_attestation_signature_json_vs_ssz_mismatch() {
         use blst::min_pk::SecretKey;
         use ssz::Encode;
 
@@ -2866,19 +2864,19 @@ mod tests {
             receipts_root: B256::from([0xef; 32]),
         };
 
-        // Sign using SSZ serialization
-        let ssz_bytes: Vec<u8> = attestation_data.as_ssz_bytes();
+        // Sign using JSON serialization (the correct one now)
+        let json_bytes: Vec<u8> = serde_json::to_vec(&attestation_data).unwrap();
         let sig = sk.sign(
-            &ssz_bytes,
+            &json_bytes,
             alloy_rpc_types_beacon::constants::BLS_DST_SIG,
             &[],
         );
 
-        // Try to verify using JSON serialization (should fail)
-        let json_bytes: Vec<u8> = serde_json::to_vec(&attestation_data).unwrap();
+        // Try to verify using SSZ serialization (should fail)
+        let ssz_bytes: Vec<u8> = attestation_data.as_ssz_bytes();
         let err = sig.verify(
             true,
-            &json_bytes,
+            &ssz_bytes,
             alloy_rpc_types_beacon::constants::BLS_DST_SIG,
             &[],
             &pk,
@@ -2890,10 +2888,10 @@ mod tests {
             "Verification should fail when using different serialization"
         );
 
-        // Verify using SSZ serialization (should succeed)
+        // Verify using JSON serialization (should succeed)
         let err = sig.verify(
             true,
-            &ssz_bytes,
+            &json_bytes,
             alloy_rpc_types_beacon::constants::BLS_DST_SIG,
             &[],
             &pk,

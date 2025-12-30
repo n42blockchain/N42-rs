@@ -2729,4 +2729,180 @@ mod tests {
         let hash2 = block.hash_slow();
         assert_eq!(hash, hash2);
     }
+
+    #[test]
+    fn test_attestation_signature_roundtrip() {
+        use blst::min_pk::{AggregateSignature, PublicKey, SecretKey, Signature};
+        use ssz::Encode;
+
+        // Generate a test keypair
+        let ikm = [1u8; 32]; // Use fixed seed for reproducibility
+        let sk = SecretKey::key_gen(&ikm, &[]).unwrap();
+        let pk = sk.sk_to_pk();
+
+        // Create test attestation data
+        let attestation_data = AttestationData {
+            slot: 12345,
+            committee_index: 0,
+            receipts_root: B256::from([0xab; 32]),
+        };
+
+        // Sign using SSZ serialization (same as mobile-sdk client)
+        let bytes: Vec<u8> = attestation_data.as_ssz_bytes();
+        let sig = sk.sign(&bytes, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[]);
+
+        // Verify the signature directly (same as miner.rs verification)
+        let err = sig.verify(
+            true,
+            &bytes,
+            alloy_rpc_types_beacon::constants::BLS_DST_SIG,
+            &[],
+            &pk,
+            true,
+        );
+        assert_eq!(
+            err,
+            blst::BLST_ERROR::BLST_SUCCESS,
+            "Single signature verification failed"
+        );
+
+        // Create attestation with aggregate signature (same as beacon.rs verification)
+        let agg_sig = AggregateSignature::from_signature(&sig);
+        let attestation = Attestation {
+            validator_indexes: [0].into_iter().collect(),
+            data: attestation_data.clone(),
+            block_aggregate_signature: Some(agg_sig_to_fixed(&agg_sig)),
+        };
+
+        // Verify using fast_aggregate_verify (same as verify_aggregate_signature)
+        let sig_bytes = attestation.block_aggregate_signature.as_ref().unwrap();
+        let agg_sig_restored = fixed_to_agg_sig(sig_bytes).unwrap();
+        let pubkeys = vec![pk];
+        let pubkeys_refs: Vec<&PublicKey> = pubkeys.iter().collect();
+
+        let result = agg_sig_restored.to_signature().fast_aggregate_verify(
+            true,
+            &bytes,
+            alloy_rpc_types_beacon::constants::BLS_DST_SIG,
+            &pubkeys_refs,
+        );
+        assert_eq!(
+            result,
+            blst::BLST_ERROR::BLST_SUCCESS,
+            "Aggregate signature verification failed"
+        );
+    }
+
+    #[test]
+    fn test_attestation_signature_multiple_validators() {
+        use blst::min_pk::{AggregateSignature, PublicKey, SecretKey};
+        use ssz::Encode;
+
+        // Generate multiple keypairs
+        let mut secret_keys = Vec::new();
+        let mut public_keys = Vec::new();
+        for i in 0..3 {
+            let ikm = [i + 1; 32];
+            let sk = SecretKey::key_gen(&ikm, &[]).unwrap();
+            let pk = sk.sk_to_pk();
+            secret_keys.push(sk);
+            public_keys.push(pk);
+        }
+
+        // Create test attestation data
+        let attestation_data = AttestationData {
+            slot: 67890,
+            committee_index: 1,
+            receipts_root: B256::from([0xcd; 32]),
+        };
+
+        // Sign with each validator and aggregate
+        let bytes: Vec<u8> = attestation_data.as_ssz_bytes();
+        let mut agg_sig: Option<AggregateSignature> = None;
+
+        for sk in &secret_keys {
+            let sig = sk.sign(&bytes, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[]);
+            match agg_sig.as_mut() {
+                Some(agg) => {
+                    agg.add_signature(&sig, false).unwrap();
+                }
+                None => {
+                    agg_sig = Some(AggregateSignature::from_signature(&sig));
+                }
+            }
+        }
+
+        // Verify aggregate signature
+        let agg_sig = agg_sig.unwrap();
+        let pubkeys_refs: Vec<&PublicKey> = public_keys.iter().collect();
+
+        let result = agg_sig.to_signature().fast_aggregate_verify(
+            true,
+            &bytes,
+            alloy_rpc_types_beacon::constants::BLS_DST_SIG,
+            &pubkeys_refs,
+        );
+        assert_eq!(
+            result,
+            blst::BLST_ERROR::BLST_SUCCESS,
+            "Multi-validator aggregate signature verification failed"
+        );
+    }
+
+    #[test]
+    fn test_attestation_signature_ssz_vs_json_mismatch() {
+        use blst::min_pk::SecretKey;
+        use ssz::Encode;
+
+        // Generate a test keypair
+        let ikm = [42u8; 32];
+        let sk = SecretKey::key_gen(&ikm, &[]).unwrap();
+        let pk = sk.sk_to_pk();
+
+        // Create test attestation data
+        let attestation_data = AttestationData {
+            slot: 100,
+            committee_index: 2,
+            receipts_root: B256::from([0xef; 32]),
+        };
+
+        // Sign using SSZ serialization
+        let ssz_bytes: Vec<u8> = attestation_data.as_ssz_bytes();
+        let sig = sk.sign(
+            &ssz_bytes,
+            alloy_rpc_types_beacon::constants::BLS_DST_SIG,
+            &[],
+        );
+
+        // Try to verify using JSON serialization (should fail)
+        let json_bytes: Vec<u8> = serde_json::to_vec(&attestation_data).unwrap();
+        let err = sig.verify(
+            true,
+            &json_bytes,
+            alloy_rpc_types_beacon::constants::BLS_DST_SIG,
+            &[],
+            &pk,
+            true,
+        );
+        assert_ne!(
+            err,
+            blst::BLST_ERROR::BLST_SUCCESS,
+            "Verification should fail when using different serialization"
+        );
+
+        // Verify using SSZ serialization (should succeed)
+        let err = sig.verify(
+            true,
+            &ssz_bytes,
+            alloy_rpc_types_beacon::constants::BLS_DST_SIG,
+            &[],
+            &pk,
+            true,
+        );
+        assert_eq!(
+            err,
+            blst::BLST_ERROR::BLST_SUCCESS,
+            "Verification should succeed with matching serialization"
+        );
+    }
 }

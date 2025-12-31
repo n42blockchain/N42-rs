@@ -74,7 +74,8 @@ use std::{
 use reth_rpc_api::EngineApiClient;
 use n42_clique::{
     EXTRA_VANITY,
-    EXTRA_SEAL};
+    EXTRA_SEAL
+};
 use reth_primitives_traits::{
     header::clique_utils::SIGNATURE_LENGTH,
     AlloyBlockHeader,

@@ -52,4 +52,26 @@ else
 	sleep 4
 fi
 done
+
+TOTAL_EFFECTIVE_BALANCE=`curl -X POST \
+  -H "Content-Type: application/json" \
+  -d "{\"jsonrpc\":\"2.0\",\"method\":\"consensusBeaconExt_get_total_effective_balance\",\"params\":[],\"id\":1}" \
+  $RPC_ADDR | jq -r '.result'`
+echo $TOTAL_EFFECTIVE_BALANCE
+if (( "$TOTAL_EFFECTIVE_BALANCE" != 64000000000 )); then
+	echo "error: total effective balance is incorrect"
+	exit 1
+fi
+
+VALIDATOR_PUBLIC_KEY=`jq -r '.[0].validator_public_key' v2.json`
+VALIDATOR_INFO=`curl -X POST \
+  -H "Content-Type: application/json" \
+  -d "{\"jsonrpc\":\"2.0\",\"method\":\"consensusBeaconExt_get_beacon_validator_by_pubkey\",\"params\":[\"$VALIDATOR_PUBLIC_KEY\"],\"id\":1}" \
+  $RPC_ADDR`
+ACTIVATION_TIMESTAMP=`echo $VALIDATOR_INFO | jq -r '.result.activation_timestamp'`
+if (( "$ACTIVATION_TIMESTAMP" == 0 )); then
+	echo "error: activation_timestamp is zero"
+	exit 1
+fi
+
 $MOBILE_SDK_TEST exit-for-validators < v2.json

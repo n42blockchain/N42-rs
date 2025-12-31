@@ -15,8 +15,9 @@ use serde::{Deserialize, Serialize};
 use alloy_rlp::{Encodable, Decodable, RlpEncodable,  RlpDecodable};
 use std::collections::{HashMap, BTreeMap};
 use alloy_primitives::{keccak256, BlockHash, B256, Log};
-use n42_primitives::{Attestation, BeaconBlock, BeaconBlockBody, BeaconState, BlockVerifyResultAggregate, CommitteeIndex, Deposit, DepositData, Epoch, ExecutionRequests, Validator, VoluntaryExitWithSig, SLOTS_PER_EPOCH};
+use n42_primitives::{Attestation, BLSPubkey, BeaconBlock, BeaconBlockBody, BeaconState, BlockVerifyResultAggregate, CommitteeIndex, Deposit, DepositData, Epoch, ExecutionRequests, Gwei, Validator, ValidatorInfo, VoluntaryExitWithSig, SLOTS_PER_EPOCH};
 use tracing::{trace, debug, error, info, warn};
+use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug)]
 pub struct Beacon<Provider> {
@@ -89,4 +90,35 @@ where
 
 fn parse_execution_requests(requests: &Option<Requests>) -> eyre::Result<ExecutionRequestsV4> {
     Ok(requests.clone().unwrap_or_default().try_into()?)
+}
+
+// --- CORE TRAITS & TYPES ---
+
+/// The contract: Any type implementing this defines its own response type.
+pub trait Request: Send + 'static {
+    type Response: Send + 'static;
+}
+
+/// The internal wrapper that carries the request and the return path.
+#[derive(Debug)]
+pub struct Envelope<R: Request> {
+    pub request: R,
+    pub response_tx: oneshot::Sender<R::Response>,
+}
+
+// 1. Define specific requests and their responses
+#[derive(Debug)]
+pub struct GetTotalActiveBalance;
+impl Request for GetTotalActiveBalance { type Response = Gwei; }
+
+#[derive(Debug)]
+pub struct GetValidatorInfo { pub pubkey: BLSPubkey }
+impl Request for GetValidatorInfo { type Response = Option<ValidatorInfo>; }
+
+// 2. Since an MPSC channel needs one concrete type, use an Enum to wrap
+// Envelopes
+#[derive(Debug)]
+pub enum RpcToBeaconCommand {
+    GetTotalActiveBalance(Envelope<GetTotalActiveBalance>),
+    GetValidatorInfo(Envelope<GetValidatorInfo>),
 }

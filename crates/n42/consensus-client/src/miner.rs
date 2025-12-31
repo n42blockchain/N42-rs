@@ -54,9 +54,9 @@ use tokio::time::{interval_at, sleep, Instant, Interval};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{trace, debug, error, info, warn};
 
-use crate::beacon::{Beacon};
+use crate::beacon::{Beacon, RpcToBeaconCommand};
 use crate::metrics::MinerMetrics;
-use n42_primitives::{RelativeEpoch, Attestation, BeaconState, BeaconBlock, Deposit, VoluntaryExitWithSig, parse_deposit_log, BLSPubkey, BlockVerifyResultAggregate, agg_sig_to_fixed, fixed_to_agg_sig, SLOTS_PER_EPOCH, CommitteeIndex, AttestationData};
+use n42_primitives::{RelativeEpoch, Attestation, BeaconState, BeaconBlock, Deposit, VoluntaryExitWithSig, parse_deposit_log, BLSPubkey, BlockVerifyResultAggregate, agg_sig_to_fixed, fixed_to_agg_sig, SLOTS_PER_EPOCH, CommitteeIndex, AttestationData, beacon_chain_spec, epoch_to_block_number, ValidatorInfo};
 use n42_primitives::CommitteeCache;
 use crate::network::{fetch_beacon_block, broadcast_beacon_block};
 use pubsub_mem::{RouterMsg, Event, publish};
@@ -137,6 +137,7 @@ pub struct N42Miner<T: PayloadTypes, Provider, B, Network> {
     beacon: Beacon<Provider>,
     broadcast_unverified_block_tx: mpsc::Sender<RouterMsg<UnverifiedBlock>>,
     block_verify_result_rx: mpsc::Receiver<BlockVerifyResult>,
+    rpc_to_beacon_command_rx: mpsc::Receiver<RpcToBeaconCommand>,
     pending_block_data: Option<PendingBlockData>,
     start_timestamp: u64,
     recent_committee_caches: schnellru::LruMap<BlockHash, Arc<CommitteeCache>>,
@@ -203,6 +204,7 @@ where
         consensus: Arc<dyn FullConsensus<<T::BuiltPayload as BuiltPayload>::Primitives, Error = ConsensusError>>,
         broadcast_unverified_block_tx: mpsc::Sender<RouterMsg<UnverifiedBlock>>,
         block_verify_result_rx: mpsc::Receiver<BlockVerifyResult>,
+        rpc_to_beacon_command_rx: mpsc::Receiver<RpcToBeaconCommand>,
     ) {
         let (new_block_tx, new_block_rx) = mpsc::channel::<(NewBlock, BlockHash)>(128);
         let beacon = Beacon::new(provider.clone());
@@ -240,6 +242,7 @@ where
             beacon,
             broadcast_unverified_block_tx,
             block_verify_result_rx,
+            rpc_to_beacon_command_rx,
             pending_block_data: None,
             start_timestamp,
             recent_committee_caches: schnellru::LruMap::new(schnellru::ByLength::new((SLOTS_PER_EPOCH * 2)as u32)),
@@ -269,6 +272,12 @@ where
 
         loop {
             tokio::select! {
+                Some(rpc_to_beacon_command) = self.rpc_to_beacon_command_rx.recv() => {
+                    debug!(target: "consensus-client", ?rpc_to_beacon_command, "rpc_to_beacon_command");
+                    if let Err(e) = self.handle_rpc_to_beacon_command(rpc_to_beacon_command).await {
+                        warn!(target: "consensus-client", "Error handling rpc_to_beacon_command: {:?}", e);
+                    }
+                }
                 Some(verification_result) = self.block_verify_result_rx.recv() => {
                     debug!(target: "consensus-client", ?verification_result, "verification_rx");
                     if let Err(e) = self.handle_verification_result(verification_result).await {
@@ -734,6 +743,28 @@ where
         self.pending_block_data.as_mut().map(|v| { *v.attestations.get_mut(&attestation_data.committee_index).unwrap() = attestation.clone(); });
 
         debug!(target: "consensus-client", "handle_verification_result finish: {verification_result:?}");
+        Ok(())
+    }
+
+    async fn handle_rpc_to_beacon_command(&mut self, rpc_to_beacon_command: RpcToBeaconCommand) -> eyre::Result<()> {
+        let pending_block_data = match self.pending_block_data {
+            Some(ref v) => v,
+            None => {
+                debug!(target: "consensus-client", ?rpc_to_beacon_command, "handle_rpc_to_beacon_command: pending block data not available yet");
+                return Ok(())
+            },
+        };
+        let ref beacon_state = pending_block_data.beacon_state_after_withdrawal;
+        match rpc_to_beacon_command {
+            RpcToBeaconCommand::GetTotalActiveBalance(env) => {
+                let _ = env.response_tx.send(beacon_state.get_total_active_balance(&beacon_chain_spec())?);
+            }
+
+            RpcToBeaconCommand::GetValidatorInfo(env) => {
+                let validator_info = self.get_validator_info(beacon_state, &env.request.pubkey)?;
+                let _ = env.response_tx.send(validator_info);
+            }
+        }
         Ok(())
     }
 
@@ -1309,6 +1340,44 @@ where
         beacon_state.process_withdrawals()?;
         Ok((Some(expected_withdrawals), beacon_state))
 
+    }
+
+    pub fn get_validator_info(&self, beacon_state: &BeaconState, pubkey: &BLSPubkey) -> eyre::Result<Option<ValidatorInfo>> {
+        let validator_index = match beacon_state.get_validator_index_from_pubkey(&pubkey) {
+            Some(v) => v,
+            None => {
+                return Ok(None);
+            }
+        };
+        let validator = beacon_state.get_validator(validator_index)?;
+        let balance_in_beacon = beacon_state.get_balance(validator_index)?;
+        let effective_balance = beacon_state.get_effective_balance(validator_index)?;
+        let inactivity_score = beacon_state.get_inactivity_score(validator_index)?;
+        let activation_block_number = epoch_to_block_number(validator.activation_epoch);
+        let activation_timestamp = match self.provider.header_by_number(activation_block_number)? {
+            Some(v) => v.timestamp(),
+            None => 0,
+        };
+        let exit_block_number = epoch_to_block_number(validator.exit_epoch);
+        let exit_timestamp = match self.provider.header_by_number(exit_block_number)? {
+            Some(v) => v.timestamp(),
+            None => 0,
+        };
+        let withdrawable_block_number = epoch_to_block_number(validator.withdrawable_epoch);
+        let withdrawable_timestamp = match self.provider.header_by_number(withdrawable_block_number)? {
+            Some(v) => v.timestamp(),
+            None => 0,
+        };
+
+        let validator_info = ValidatorInfo {
+            activation_timestamp,
+            exit_timestamp,
+            withdrawable_timestamp,
+            balance_in_beacon,
+            effective_balance,
+            inactivity_score,
+        };
+        Ok(Some(validator_info))
     }
 
 }

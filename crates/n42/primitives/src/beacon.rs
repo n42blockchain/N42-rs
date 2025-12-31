@@ -220,7 +220,9 @@ pub struct BeaconState {
     pub earliest_exit_epoch: Epoch,
     pub exit_balance_to_consume: u64,
 
-    //pub total_active_balance: Option<TotalActiveBalance>,
+    #[serde(skip_serializing, skip_deserializing)]
+    #[ssz(skip_serializing, skip_deserializing)]
+    pub total_active_balance: Option<TotalActiveBalance>,
 
     //pub committee_caches: Vec<CommitteeCache>,
 
@@ -238,10 +240,8 @@ pub struct BeaconState {
     pub epoch_attester_indexes_set: BTreeSet<u64>,
 }
 
-/*
-#[derive(Debug, Clone, Hash, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Hash, Default, PartialEq, Serialize, Deserialize)]
 pub struct TotalActiveBalance(Epoch, u64);
-*/
 
 impl Sealable for BeaconState {
     fn hash_slow(&self) -> B256 {
@@ -483,6 +483,7 @@ impl BeaconState {
         let spec = beacon_chain_spec();
         let mut new_beacon_state = old_beacon_state.clone();
         new_beacon_state.slot += 1;
+        new_beacon_state.build_total_active_balance_cache(&spec)?;
         if (new_beacon_state.slot) % SLOTS_PER_EPOCH == 0 {
             new_beacon_state.process_epoch(&spec)?;
         }
@@ -506,6 +507,7 @@ impl BeaconState {
             self.build_committee_cache(RelativeEpoch::Previous, spec)?;
         }
         */
+        let mut new_total_active_balance: u64 = 0;
 
         for index in (0..self.balances_store.len()) {
             //let balance = self.balances[index].min(spec.max_effective_balance);
@@ -516,7 +518,14 @@ impl BeaconState {
                 validator.effective_balance = new_effective_balance;
                 self.validators_store.set(index, validator)?;
             }
+            new_total_active_balance = new_total_active_balance.saturating_add(new_effective_balance);
         }
+        self.total_active_balance.replace(TotalActiveBalance(self.current_epoch(),
+        std::cmp::max(
+            new_total_active_balance,
+            spec.effective_balance_increment,
+        )
+                ));
 
         /*
         for (index, validator) in self.validators.iter_mut().enumerate() {
@@ -1194,14 +1203,11 @@ impl BeaconState {
     pub fn get_total_active_balance(&self,
         spec: &ChainSpec,
         ) -> eyre::Result<u64> {
-        self.compute_total_active_balance_slow(spec)
-        // self.get_total_active_balance_at_epoch(self.current_epoch())
+        self.get_total_active_balance_at_epoch(self.current_epoch())
     }
 
     /// Get the cached total active balance while checking that it is for the correct `epoch`.
     pub fn get_total_active_balance_at_epoch(&self, epoch: Epoch) -> eyre::Result<u64> {
-        todo!()
-        /*
         let TotalActiveBalance(initialized_epoch, balance) = self
             .total_active_balance.clone()
             .ok_or(eyre::eyre!("TotalActiveBalanceCacheUninitialized"))?;
@@ -1211,7 +1217,27 @@ impl BeaconState {
         } else {
             Err(eyre::eyre!("TotalActiveBalanceCacheInconsistent , initialized_epoch={initialized_epoch}, current_epoch={epoch}"))
         }
-        */
+    }
+
+    /// Build the total active balance cache for the current epoch if it is not already built.
+    pub fn build_total_active_balance_cache(&mut self, spec: &ChainSpec) -> eyre::Result<()> {
+        if self
+            .get_total_active_balance_at_epoch(self.current_epoch())
+            .is_err()
+        {
+            self.force_build_total_active_balance_cache(spec)?;
+        }
+        Ok(())
+    }
+
+    /// Build the total active balance cache, even if it is already built.
+    pub fn force_build_total_active_balance_cache(
+        &mut self,
+        spec: &ChainSpec,
+    ) -> eyre::Result<()> {
+        let total_active_balance = self.compute_total_active_balance_slow(spec)?;
+        self.total_active_balance = Some(TotalActiveBalance(self.current_epoch(), total_active_balance));
+        Ok(())
     }
 
 /// Validates each `Exit` and updates the state, short-circuiting on an invalid object.

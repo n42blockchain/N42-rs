@@ -31,6 +31,7 @@ fn main() {
     }
 
     let (verification_tx, verification_rx) = mpsc::channel(100);
+    let (rpc_to_beacon_command_tx, rpc_to_beacon_command_rx) = mpsc::channel(100);
 
     if let Err(err) =
         Cli::<EthereumChainSpecParser, RessArgs>::parse().run(async move |builder, ress_args| {
@@ -48,7 +49,7 @@ fn main() {
                             let consensus = ctx.consensus().clone();
                             let provider = ctx.provider().clone();
 
-                            let beacon_ext = ConsensusBeaconExt { consensus: consensus.clone(), provider: provider.clone(), verification_tx, router_tx: router_tx_clone };
+                            let beacon_ext = ConsensusBeaconExt { consensus: consensus.clone(), provider: provider.clone(), verification_tx, router_tx: router_tx_clone, rpc_to_beacon_command_tx };
                             let ext = ConsensusExt { consensus, provider };
 
                             // now we merge our extension namespace into all configured transports
@@ -106,6 +107,7 @@ fn main() {
                     node.consensus.clone(),
                     router_tx_clone_for_miner,
                     verification_rx,
+                    rpc_to_beacon_command_rx,
                 );
             }
 

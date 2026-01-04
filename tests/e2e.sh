@@ -74,4 +74,10 @@ if (( "$ACTIVATION_TIMESTAMP" == 0 )); then
 	exit 1
 fi
 
+INACTIVITY_SCORE=`echo $VALIDATOR_INFO | jq -r '.result.inactivity_score'`
+if (( "$INACTIVITY_SCORE" != 0 )); then
+	echo "error: inactivity_score is non-zero"
+	exit 1
+fi
+
 $MOBILE_SDK_TEST exit-for-validators < v2.json

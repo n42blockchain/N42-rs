@@ -805,6 +805,7 @@ impl BeaconState {
         //self.epoch_attester_indexes.extend(attestation.validator_indexes.iter());
         for validator_index in attestation.validator_indexes.iter() {
             self.epoch_attester_indexes_store.push(*validator_index)?;
+            self.epoch_attester_indexes_set.insert(*validator_index);
         }
 
         Ok(())

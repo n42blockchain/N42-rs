@@ -40,7 +40,8 @@ use reth_provider::{
 use crate::{utils::n42_payload_attributes, snapshot_test_utils::TesterAccountPool};
 
 use alloy_primitives::{
-    Bytes, Address, B256};
+    Bytes,
+    Address, B256};
 use alloy_genesis::CliqueConfig;
 use futures::StreamExt;
 use reth::{

@@ -11,6 +11,8 @@ pub(crate) struct BlockchainProviderMetrics {
 
     /// Histogram of get_beacon_state_by_hash durations (in seconds)
     pub(crate) get_beacon_state_by_hash_duration: Histogram,
+    /// Histogram of save_beacon_state_by_hash durations (in seconds)
+    pub(crate) save_beacon_state_by_hash_duration: Histogram,
     /// Histogram of get_beacon_block_by_hash durations (in seconds)
     pub(crate) get_beacon_block_by_hash_duration: Histogram,
 }

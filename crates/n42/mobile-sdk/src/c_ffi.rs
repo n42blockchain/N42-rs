@@ -155,8 +155,8 @@ Err(e) => { set_error(e); return ptr::null_mut(); } };
 { set_error(e); return ptr::null_mut(); } };
     let val_str = match cstr_to_string(deposit_value_in_wei) { Ok(s) => s,
 Err(e) => { set_error(e); return ptr::null_mut(); } };
-    let value = match val_str.parse::<U256>() { Ok(v) => v, Err(_) => {
-set_error("invalid deposit value".into()); return ptr::null_mut(); } };
+    let value = match val_str.parse::<U256>() { Ok(v) => v, Err(e) => {
+set_error(format!("invalid deposit value, {e}").into()); return ptr::null_mut(); } };
 
     match create_deposit_unsigned_tx(&addr, &pk, &wd, &value) {
         Ok(tx) => {

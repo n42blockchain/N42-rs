@@ -65,18 +65,25 @@ where
     while let Some(msg) = rx.recv().await {
         match msg {
             RouterMsg::Publish(event) => {
+                let topics_len = router.topics.len();
+                let subs_len = router.subs.len();
                 if let Some(subs) = router.topics.get_mut(&event.topic) {
                     let before = subs.len();
 
                     subs.retain(|sub| match sub.tx.try_send(event.clone()) {
                         Ok(_) => true,
-                        Err(_) => {
+                        Err(err) => {
                             warn!(
                                 subscriber_id = sub.id,
                                 topic = %event.topic,
+                                ?err,
+                                topics_len,
+                                subs_len,
+                                next_id = %router.next_id.load(Ordering::Relaxed),
                                 "dropping slow or dead subscriber"
                             );
                             router.subs.remove(&sub.id);
+
                             false
                         }
                     });
@@ -103,7 +110,11 @@ where
 
                 let _ = reply.send(id).await;
 
-                debug!(subscriber_id = id, topic = %topic, "subscriber added");
+                debug!(subscriber_id = id, topic = %topic,
+                    topics = %router.topics.len(),
+                    subs = %router.subs.len(),
+                    next_id = %router.next_id.load(Ordering::Relaxed),
+                    "subscriber added");
             }
 
             RouterMsg::Unsubscribe { topic, id } => {
@@ -112,7 +123,11 @@ where
                 }
                 router.subs.remove(&id);
 
-                debug!(subscriber_id = id, topic = %topic, "subscriber removed");
+                debug!(subscriber_id = id, topic = %topic,
+                    topics = %router.topics.len(),
+                    subs = %router.subs.len(),
+                    next_id = %router.next_id.load(Ordering::Relaxed),
+                    "subscriber removed");
             }
 
             RouterMsg::Disconnect { id } => {
@@ -121,7 +136,11 @@ where
                         list.retain(|s| s.id != id);
                     }
 
-                    debug!(subscriber_id = id, topic = %topic, "subscriber disconnected");
+                    debug!(subscriber_id = id, topic = %topic,
+                    topics = %router.topics.len(),
+                    subs = %router.subs.len(),
+                    next_id = %router.next_id.load(Ordering::Relaxed),
+                        "subscriber disconnected");
                 }
             }
         }

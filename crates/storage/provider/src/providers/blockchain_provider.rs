@@ -807,6 +807,7 @@ impl<N: ProviderNodeTypes> BeaconProviderWriter for BlockchainProvider<N> {
     }
 
     fn save_beacon_state_by_hash(&self, block_hash: &BlockHash,  beacon_state: BeaconState) -> ProviderResult<()> {
+        let start = Instant::now();
         beacon_state.validators_store.diff_save(|tree_hash, tree: &Tree<Validator>| {
             self.save_tree_by_hash_for_validator(tree_hash, tree.clone())
         },
@@ -857,7 +858,9 @@ impl<N: ProviderNodeTypes> BeaconProviderWriter for BlockchainProvider<N> {
 
         let provider_rw = self.database_provider_rw()?;
         provider_rw.save_beacon_state_by_hash(block_hash, beacon_state_updated)?;
-        provider_rw.commit().map(|_|())
+        let commit_result = provider_rw.commit().map(|_|());
+        self.metrics.save_beacon_state_by_hash_duration.record(start.elapsed().as_secs_f64());
+        commit_result
     }
 
     fn save_beacon_block_hash_by_eth1_hash(&self, eth1_block_hash: &BlockHash, beacon_block_hash: BlockHash) -> ProviderResult<()> {

@@ -190,15 +190,15 @@ where
 
             let num_input_txs = txs.len();
 
-            let results = self.pool.add_external_transactions(txs).await;
-            debug!(target: "consensus-client", ?results, "add_external_transactions");
+            let results = self.pool.add_transactions(TransactionOrigin::Local, txs).await;
+            debug!(target: "consensus-client", ?results, "add_transactions");
             if results.into_iter().any(|res| res.is_err()) {
-                error!("add_external_transactions did not succeed for some transactions");
-                eyre::bail!("add_external_transactions did not succeed for some transactions");
+                error!("add_transactions did not succeed for some transactions");
+                eyre::bail!("add_transactions did not succeed for some transactions");
             }
 
             let pool_size = self.pool.pool_size();
-            debug!(target: "consensus-client", ?pool_size, "add_external_transactions");
+            debug!(target: "consensus-client", ?pool_size, "add_transactions");
 
             debug!(target: "consensus-client", "before first fcu");
             let forkchoice_state = ForkchoiceState {

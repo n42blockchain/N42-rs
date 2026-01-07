@@ -1,4 +1,5 @@
 use alloy_eips::eip2718::Decodable2718;
+use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::BlockHash;
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types::Block;
@@ -138,6 +139,7 @@ where
             } else {
                 None
             };
+            let mut attestations = Vec::new();
             if rpc_provider.is_some() {
                 while block.is_none() {
                         match rpc_provider
@@ -146,7 +148,26 @@ where
                             .get_block(block_number.into()).full()
                             .await?
                         {
-                            Some(v) => block = Some(v),
+                            Some(v) => {
+                                block = Some(v);
+                                let params = serde_json::value::to_raw_value(&(BlockNumberOrTag::Number(block_number),))?;
+                                match rpc_provider
+                                    .as_ref()
+                                    .unwrap()
+                                    .raw_request_dyn("consensusBeaconExt_get_beacon_block_by_number".into(), &params).await {
+                                    Ok(raw_json) => {
+                                        let full_json: serde_json::Value = serde_json::from_str(raw_json.get())?;
+                                        let sub_value = full_json
+                                            .get("body")
+                                            .and_then(|v| v.get("attestations"))
+                                            .ok_or(eyre::eyre!("Field body.attestations not found"))?;
+                                        attestations = serde_json::from_value(sub_value.clone())?;
+                                    }
+                                    Err(err) => {
+                                        debug!(target: "consensus-client", ?err, "get_beacon_block from rpc");
+                                    }
+                                }
+                            },
                             _ => {
                                 //eyre::bail!("block {:?} not found, stop", block_number);
                                 debug!(target: "consensus-client", "block {:?} not found from rpc, try again", block_number);
@@ -171,7 +192,7 @@ where
                 .unwrap()
                 .unwrap();
 
-            let (_, beacon_state_after_withdrawal) = self.gen_withdrawals(header.hash())?;
+            let (withdrawals, beacon_state_after_withdrawal) = self.gen_withdrawals(header.hash())?;
 
             debug!(target: "consensus-client", ?block, "block of input");
             let transactions = block.transactions.into_transactions();
@@ -210,7 +231,7 @@ where
                 .beacon_engine_handle
                 .fork_choice_updated(
                     forkchoice_state,
-                    Some(self.payload_attributes_builder.build(timestamp)),
+                    Some(self.payload_attributes_builder.build_ext(timestamp, withdrawals, beacon_state_after_withdrawal.randao_mix)),
                     EngineApiMessageVersion::default(),
                 )
                 .await;
@@ -236,6 +257,7 @@ where
                 }
             };
             debug!(target: "consensus-client", ?payload);
+            let execution_requests = payload.requests();
             let block = payload.block();
             if block.body().transactions.len() != num_input_txs {
                 error!(target: "consensus-client", "new block transactions number does not match with old block transactions number at block {:?}, expected {:?}, got {:?}, stop", block.header().number, num_input_txs, block.body().transactions.len());
@@ -274,7 +296,7 @@ where
                 self.provider.get_beacon_block_hash_by_eth1_hash(&block.header().parent_hash)?
                 .ok_or(eyre::eyre!("get_beacon_block_hash_by_eth1_hash failed, hash={:?}", block.header().parent_hash))?
             };
-            let (beacon_block, _) = self.beacon.gen_beacon_block(beacon_state_after_withdrawal, parent_beacon_block_hash, &Default::default(), &Default::default(), &block)?;
+            let (beacon_block, _) = self.beacon.gen_beacon_block(beacon_state_after_withdrawal, parent_beacon_block_hash, &attestations, &execution_requests, &block)?;
             let beacon_block_hash = beacon_block.hash_slow();
             self.provider.save_beacon_block_by_hash(&beacon_block_hash, beacon_block.clone())?;
 

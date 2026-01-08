@@ -620,6 +620,45 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
     pub fn iter(&self) -> VecTreeIter<T, N> {
         VecTreeIter { tree: self, index: 0 }
     }
+
+    /// Removes all key-value pairs from the internal map that are not reachable from the current root, returns the number of pairs removed.
+    pub fn prune(&mut self) -> usize {
+        let initial_size = self.kv.len();
+
+        let mut reachable = HashSet::new();
+        let mut stack = vec![self.root];
+
+        // 1. Standard Reachability Traversal
+        while let Some(current_hash) = stack.pop() {
+            if !reachable.insert(current_hash) {
+                continue;
+            }
+            if let Some(tree_node) = self.kv.get(&current_hash) {
+                match tree_node {
+                    Tree::Node { left, right } => {
+                        stack.push(*left);
+                        stack.push(*right);
+                    }
+                    _ => {} // Leaf and Zero are terminal
+                }
+            }
+        }
+
+        // 2. SSZ Collision Protection (Matching try_new logic)
+        // Even if not strictly reachable from the current root, we must keep
+        // the Default leaf if its hash collides with the zero-tree root at height 0.
+        let default_val = T::default();
+        let default_root = default_val.tree_hash_root();
+        if default_root == zero_tree_root(0) {
+            reachable.insert(default_root);
+        }
+
+        // 3. Retain only reachable or protected nodes
+        self.kv.retain(|hash, _| reachable.contains(hash));
+
+        // 4. Return the count of removed items
+        initial_size - self.kv.len()
+    }
 }
 
 pub struct VecTreeIter<'a, T: Value, N: Unsigned> {
@@ -1297,4 +1336,98 @@ mod tests {
         let leaf_root = 0u64.tree_hash_root();
         assert!(tree.kv.contains_key(&leaf_root), "Leaf(0) must exist in KV store for SSZ compatibility");
     }
+
+    #[test]
+fn test_prune_after_set_updates() {
+    use typenum::U4; // Small tree for easier tracking
+
+    // 1. Initialize a tree with 4 elements
+    // Map will contain: 1 root + 2 internal nodes + 4 leaves
+    let mut tree: VecTree<u64, U4> = VecTree::from_vec(vec![10, 20, 30, 40])
+        .expect("Failed to create tree");
+
+    let removed = tree.prune();
+    assert_eq!(removed, 0, "Freshly built tree should have no orphans");
+
+    let initial_size = tree.kv.len();
+    let old_root = tree.root;
+
+    // 2. Update one element
+    // This creates a new leaf and new internal nodes leading to the root.
+    // The old leaf (10) and its old parent nodes become "orphans".
+    tree.set(0, 99).expect("Set failed");
+
+    let size_after_set = tree.kv.len();
+    assert!(size_after_set > initial_size, "Map should grow as orphans are left behind");
+    assert_ne!(tree.root, old_root, "Root must change after update");
+
+    // 3. Prune the tree
+    let removed = tree.prune();
+    assert!(removed > 0, "Prune should return the count of removed orphans");
+
+    // 4. Verification
+    let final_size = tree.kv.len();
+
+    assert!(
+        final_size < size_after_set,
+        "Prune should reclaim memory by removing orphaned nodes"
+    );
+
+    assert!(
+        final_size == initial_size,
+        "Prune should shrink the tree to the minimal size(initial_size here since vec_len does not change)"
+    );
+
+    assert!(
+        !tree.kv.contains_key(&old_root),
+        "The old root should be removed"
+    );
+
+    assert!(
+        tree.kv.contains_key(&tree.root),
+        "The new root must be preserved"
+    );
+
+    // Verify the un-updated parts are still reachable and preserved
+    // The hash for '20' (index 1), '30' (index 2), and '40' (index 3) should still exist.
+    let leaf_val_20_hash = 20u64.tree_hash_root();
+    assert!(
+        tree.kv.contains_key(&leaf_val_20_hash),
+        "Unchanged siblings must be preserved"
+    );
+
+    assert_eq!(tree.prune(), 0, "Second prune should find nothing to remove");
+}
+
+    #[test]
+    fn test_prune_preserves_full_tree() {
+        // Tree with 3 elements should keep all its nodes after pruning
+        let mut tree: VecTree<u64, U8> = VecTree::from_vec(vec![1, 2, 3])
+            .expect("Failed to create tree");
+        let size_before = tree.kv.len();
+
+        let removed = tree.prune();
+        assert_eq!(removed, 0, "Freshly built tree should have no orphans");
+
+        assert_eq!(tree.kv.len(), size_before, "No nodes should be removed from a healthy tree");
+    }
+
+    #[test]
+    fn test_prune_with_zero_collision() {
+        // Create an empty tree
+        let mut tree: VecTree<u64, U8> = VecTree::try_new(0).expect("Failed to create empty tree");
+
+        let removed = tree.prune();
+        assert_eq!(removed, 0, "Freshly built tree should have no orphans");
+
+        assert!(tree.kv.contains_key(&tree.root), "Root must remain");
+
+        // If u64::default() (0) hashes to the same value as an implicit zero leaf,
+        // the Leaf(0) entry must be preserved if it is part of the reachable path.
+        let zero_leaf_hash = zero_tree_root(0);
+        if 0u64.tree_hash_root() == zero_leaf_hash {
+            assert!(tree.kv.contains_key(&zero_leaf_hash), "Default leaf should be preserved");
+        }
+    }
+
 }

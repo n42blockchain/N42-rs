@@ -569,6 +569,8 @@ impl BeaconState {
         self.process_rewards_and_penalties(&validator_statuses, spec)?;
         self.process_registry_updates(spec)?;
 
+        self.prune();
+
         Ok(())
     }
 
@@ -1903,6 +1905,13 @@ pub fn apply_deposit(
         CommitteeCache::initialized(self, epoch, &spec)
     }
 
+    pub fn prune(&mut self) {
+        let validators_store_num_pruned = self.validators_store.prune();
+        let balances_store_num_pruned = self.balances_store.prune();
+        let inactivity_scores_store_num_pruned = self.inactivity_scores_store.prune();
+        // epoch_attester_indexes_store is reinitialized every epoch and needs no prune
+        debug!(?validators_store_num_pruned, ?balances_store_num_pruned, ?inactivity_scores_store_num_pruned, "prune BeaconState");
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Encode, Decode)]

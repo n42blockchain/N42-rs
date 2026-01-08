@@ -52,7 +52,7 @@ use std::{
 use tokio::sync::{mpsc, broadcast};
 use tokio::time::{interval_at, sleep, Instant, Interval};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{trace, debug, error, info, warn};
+use tracing::{trace, debug, error, info, warn, instrument, Level};
 
 use crate::beacon::{Beacon, RpcToBeaconCommand};
 use crate::metrics::MinerMetrics;
@@ -178,7 +178,7 @@ where
         + BeaconProvider
         + BeaconProviderWriter
         + 'static + Clone,
-    B: PayloadAttributesBuilderExt<<T as PayloadTypes>::PayloadAttributes>,
+    B: PayloadAttributesBuilderExt<<T as PayloadTypes>::PayloadAttributes> + std::fmt::Debug,
     Network: FullNetwork,
     Network: BlockAnnounceProvider<Block = Block<TransactionSigned>>,
     <<Network as BlockDownloaderProvider>::Client as BlockClient>::Block: reth_primitives_traits::Block<Header = reth_primitives_traits::Header>,
@@ -654,6 +654,12 @@ where
         })
     }
 
+    #[instrument(
+        level = Level::DEBUG,
+        ret,
+        skip_all,
+        fields(pubkey = verification_result.pubkey),
+        )]
     async fn handle_verification_result(&mut self, verification_result: BlockVerifyResult) -> eyre::Result<()> {
         debug!(target: "consensus-client", ?verification_result, "handle_verification_result start");
         self.metrics.num_verification_submission.increment(1);
@@ -714,7 +720,6 @@ where
         }
         attestation.validator_indexes.insert(validator_index);
 
-        debug!(target: "consensus-client", pubkey=?pubkey_str, ?block_hash, "handle_verification_result finish");
         Ok(())
     }
 
@@ -741,6 +746,11 @@ where
     }
 
     /// Generates a new beacon block, broadcast eth1 block to peers
+    #[instrument(
+        level = Level::DEBUG,
+        ret,
+        skip_all,
+        )]
     async fn advance(&mut self) -> eyre::Result<()> {
         let pending_block_data = match self.pending_block_data {
             Some(ref v) => v.clone(),
@@ -845,6 +855,11 @@ where
 
 
     /// Generates a new block, broadcast it to validators
+    #[instrument(
+        level = Level::DEBUG,
+        ret,
+        skip_all,
+        )]
     async fn prepare_block(&mut self) -> eyre::Result<()> {
         let num_signers = self.get_best_block_num_signers()?;
 

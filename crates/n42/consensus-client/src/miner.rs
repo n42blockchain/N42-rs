@@ -143,13 +143,6 @@ pub struct N42Miner<T: PayloadTypes, Provider, B, Network> {
     recent_committee_caches: schnellru::LruMap<BlockHash, Arc<CommitteeCache>>,
     recent_beacon_states: schnellru::LruMap<BlockHash, BeaconState>,
 
-    num_generated_blocks: u64,
-    num_skipped_new_block: u64,
-    num_should_skip_block_generation: u64,
-    num_long_delayed_blocks: u64,
-    num_fetched_blocks: u64,
-    order_stats: HashMap<u64, bool>,
-
     metrics: MinerMetrics,
 }
 
@@ -231,12 +224,6 @@ where
             consensus,
             recent_blocks: schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_BLOCKS)),
             recent_num_to_td: schnellru::LruMap::new(schnellru::ByLength::new(NUM_NUM_TO_TD)),
-            num_generated_blocks: 0,
-            num_skipped_new_block: 0,
-            num_should_skip_block_generation: 0,
-            num_long_delayed_blocks: 0,
-            num_fetched_blocks: 0,
-            order_stats: HashMap::new(),
             new_block_tx,
             new_block_rx,
             beacon,
@@ -474,7 +461,7 @@ where
         if let Some(&mut v) = self.recent_num_to_td.get(&new_block.block.number) {
             if v >= U256::from(new_block.td) {
                 debug!(target: "consensus-client", number=new_block.block.number, td=?U256::from(new_block.td), old_td=?v, "skip new block");
-                self.num_skipped_new_block += 1;
+                self.metrics.num_skipped_new_block.increment(1);
                 larger_td = false;
             }
         }
@@ -632,8 +619,10 @@ where
                 safe_block_number = safe_block_number.max(header
                     .number()
                     .saturating_sub(num_signers * NUM_CONFIRM_ROUNDS + 1));
+                self.metrics.num_order_in_round.increment(1);
+            } else {
+                self.metrics.num_out_of_order_in_round.increment(1);
             }
-            self.order_stats.insert(header.number(), order_in_round);
             debug!(target: "consensus-client", number=?header.number(), num_active_signers, order_in_round);
         } else {
             safe_block_number = safe_block_number.max(header
@@ -663,16 +652,6 @@ where
             safe_block_hash,
             finalized_block_hash: safe_block_hash,
         })
-    }
-
-    fn get_order_stats(&self) -> (u64, u64, f64) {
-        let in_order_count = self.order_stats.values().filter(|v| **v).count();
-        let out_of_order_count = self.order_stats.len() - in_order_count;
-        (
-            in_order_count as u64,
-            out_of_order_count as u64,
-            in_order_count as f64 / self.order_stats.len() as f64,
-        )
     }
 
     async fn handle_verification_result(&mut self, verification_result: BlockVerifyResult) -> eyre::Result<()> {
@@ -856,7 +835,7 @@ where
                 };
         });
 
-        self.num_generated_blocks += 1;
+        self.metrics.num_generated_blocks.increment(1);
         if num_signers == 1 {
             self.new_payload(&block).await?;
             self.fcu_hash(block_hash).await?;
@@ -867,11 +846,9 @@ where
 
     /// Generates a new block, broadcast it to validators
     async fn prepare_block(&mut self) -> eyre::Result<()> {
-        let (in_order_count, out_of_order_count, order_ratio) = self.get_order_stats();
         let num_signers = self.get_best_block_num_signers()?;
 
         let block_time = self.interval_prepare_block.period().as_secs();
-        info!(target: "consensus-client", num_generated_blocks=self.num_generated_blocks, num_skipped_new_block=self.num_skipped_new_block, num_should_skip_block_generation=self.num_should_skip_block_generation, num_long_delayed_blocks=self.num_long_delayed_blocks, num_fetched_blocks=self.num_fetched_blocks, in_order_count, out_of_order_count, order_ratio);
 
         let best_block_number = self.provider.best_block_number()?;
         let header = self
@@ -895,14 +872,14 @@ where
         if expected_next_timestamp + Duration::from_secs(block_time * num_signers) <= now {
             warn!(target: "consensus-client", number=header.number() + 1, ?expected_next_timestamp, ?now, "not seeing new blocks for a long time, try generating a block again");
             self.recent_num_to_td.remove(&(header.header().number() + 1));
-            self.num_long_delayed_blocks += 1;
+            self.metrics.num_long_delayed_blocks.increment(1);
             self.interval_prepare_block = interval_at(
                 Instant::now() + Duration::from_secs(block_time),
                 self.interval_prepare_block.period(),
             );
         } else if self.recent_num_to_td.get(&(header.header().number() + 1)).is_some() {
             debug!(target: "consensus-client", number=header.header().number() + 1, "skip generating block");
-            self.num_should_skip_block_generation += 1;
+            self.metrics.num_should_skip_block_generation.increment(1);
             return Ok(());
         }
 
@@ -1252,7 +1229,7 @@ where
     }
 
     async fn fetch_block(&mut self, start: BlockHashOrNumber) -> eyre::Result<<<T::BuiltPayload as BuiltPayload>::Primitives as NodePrimitives>::Block> {
-        self.num_fetched_blocks += 1;
+        self.metrics.num_fetched_blocks.increment(1);
 
         let fetch_client = self.network.fetch_client().await
             .map_err(|err| eyre::eyre!("Failed to get fetch_client: {}, {:?}", err, start))?;

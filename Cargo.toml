@@ -23,6 +23,7 @@ members = [
     "crates/n42/fusaka",
     "crates/n42/merkle_db_rs",
     "crates/n42/storage",
+    "crates/n42/ef-tests",
     #"crates/n42/mobile",
     #"crates/engine/invalid-block-hooks/",
     #"crates/evm/",
@@ -217,6 +218,7 @@ n42-consensus-traits = {path="crates/n42/consensus-traits"}
 n42-consensus-core = {path="crates/n42/consensus-core"}
 n42-storage = {path="crates/n42/storage"}
 n42-fusaka = {path="crates/n42/fusaka"}
+n42-ef-tests = {path="crates/n42/ef-tests"}
 
 blst = "0.3.11"
 

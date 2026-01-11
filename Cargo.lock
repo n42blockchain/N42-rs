@@ -6168,6 +6168,54 @@ dependencies = [
 ]
 
 [[package]]
+name = "n42-ef-tests"
+version = "1.9.3"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-genesis",
+ "alloy-hardforks",
+ "alloy-primitives 1.4.1",
+ "alloy-rlp",
+ "alloy-trie",
+ "chrono",
+ "eyre",
+ "hashbrown 0.15.5",
+ "hex",
+ "n42-primitives",
+ "rayon",
+ "reth-chainspec",
+ "reth-db",
+ "reth-db-api",
+ "reth-ethereum-forks",
+ "reth-ethereum-primitives",
+ "reth-evm",
+ "reth-evm-ethereum",
+ "reth-execution-types",
+ "reth-primitives",
+ "reth-primitives-traits",
+ "reth-provider",
+ "reth-revm",
+ "reth-tracing",
+ "reth-trie",
+ "reth-trie-common",
+ "reth-trie-db",
+ "revm",
+ "revm-database",
+ "revm-inspector",
+ "revm-primitives",
+ "revm-state",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "tempfile",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+ "walkdir",
+]
+
+[[package]]
 name = "n42-engine-primitives"
 version = "1.9.3"
 dependencies = [

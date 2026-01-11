@@ -55,3 +55,4 @@ rustc-ice-*
 # Vim temporary files
 **/.*.swp
 **/.*.swo
+ethereum-tests/

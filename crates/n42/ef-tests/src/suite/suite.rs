@@ -1,7 +1,7 @@
 //! Test suite implementations
 
 use crate::error::{EfTestError, EfTestResult};
-use crate::executor::StateTestExecutor;
+use crate::executor::{BlockchainTestExecutor, StateTestExecutor};
 use crate::fork::{is_fork_supported, ForkSpec};
 use crate::models::{BlockchainTest, StateTest};
 use crate::result::{TestReport, TestReportBuilder, TestResult};
@@ -330,15 +330,37 @@ impl BlockchainTestSuite {
             }
 
             // Run the blockchain test
-            // TODO: Implement blockchain test execution
-            results.push(TestResult::skipped(
-                test_name.clone(),
-                fork.to_string(),
-                "Blockchain test execution not yet implemented".to_string(),
-            ));
+            let result = self.run_blockchain_test(test, test_name);
+            results.push(result);
         }
 
         Ok(results)
+    }
+
+    /// Run a single blockchain test
+    fn run_blockchain_test(&self, test: &BlockchainTest, test_name: &str) -> TestResult {
+        let fork_spec = match ForkSpec::from_name(test.fork()) {
+            Ok(f) => f,
+            Err(e) => {
+                return TestResult::skipped(
+                    test_name.to_string(),
+                    test.fork().to_string(),
+                    e.to_string(),
+                );
+            }
+        };
+
+        let executor = BlockchainTestExecutor::new(&fork_spec, self.chain_id);
+
+        match executor.execute(test, test_name) {
+            Ok(result) => result,
+            Err(e) => TestResult::failed(
+                test_name.to_string(),
+                test.fork().to_string(),
+                std::time::Duration::ZERO,
+                e.to_string(),
+            ),
+        }
     }
 
     /// Run all tests in a directory
@@ -392,6 +414,205 @@ impl BlockchainTestSuite {
 }
 
 impl Suite for BlockchainTestSuite {
+    fn run_all(&self) -> EfTestResult<TestReport> {
+        self.run_directory(None)
+    }
+
+    fn run_filtered(&self, filter: &TestFilter) -> EfTestResult<TestReport> {
+        self.run_directory(Some(filter))
+    }
+
+    fn test_count(&self) -> usize {
+        self.discovery.discover_files().map(|f| f.len()).unwrap_or(0)
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// Transaction test suite
+#[derive(Debug)]
+pub struct TransactionTestSuite {
+    /// Suite name
+    name: String,
+    /// Test discovery
+    discovery: TestDiscovery,
+    /// Forks to test
+    forks: Vec<String>,
+    /// Whether to run tests in parallel
+    parallel: bool,
+}
+
+impl TransactionTestSuite {
+    /// Create a new transaction test suite
+    pub fn new(base_path: impl Into<PathBuf>) -> Self {
+        Self {
+            name: "Transaction Tests".to_string(),
+            discovery: TestDiscovery::new(base_path),
+            forks: Vec::new(),
+            parallel: true,
+        }
+    }
+
+    /// Set the suite name
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+
+    /// Add specific forks to test
+    pub fn with_forks(mut self, forks: Vec<String>) -> Self {
+        self.forks = forks;
+        self
+    }
+
+    /// Set whether to run tests in parallel
+    pub fn with_parallel(mut self, parallel: bool) -> Self {
+        self.parallel = parallel;
+        self
+    }
+
+    /// Run a single test file
+    pub fn run_test_file(
+        &self,
+        file_path: &Path,
+        filter: Option<&TestFilter>,
+    ) -> EfTestResult<Vec<TestResult>> {
+        let tests = self.load_transaction_test_file(file_path)?;
+        let mut results = Vec::new();
+
+        for (test_name, test) in &tests {
+            // Check filter
+            if let Some(f) = filter {
+                if !f.matches(test_name) {
+                    continue;
+                }
+            }
+
+            // Run test for each fork it covers
+            for fork in test.forks() {
+                if !is_fork_supported(fork) {
+                    results.push(TestResult::skipped(
+                        test_name.clone(),
+                        fork.to_string(),
+                        format!("Unsupported fork: {}", fork),
+                    ));
+                    continue;
+                }
+
+                // Check fork filter
+                if let Some(f) = filter {
+                    if !f.matches_fork(fork) {
+                        continue;
+                    }
+                }
+
+                // Check suite fork filter
+                if !self.forks.is_empty() && !self.forks.iter().any(|f| f.eq_ignore_ascii_case(fork)) {
+                    continue;
+                }
+
+                let result = self.run_transaction_test(test, test_name, fork);
+                results.push(result);
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Run a single transaction test
+    fn run_transaction_test(&self, test: &crate::models::TransactionTest, test_name: &str, fork: &str) -> TestResult {
+        use crate::executor::TransactionTestExecutor;
+
+        let fork_spec = match ForkSpec::from_name(fork) {
+            Ok(f) => f,
+            Err(e) => {
+                return TestResult::skipped(
+                    test_name.to_string(),
+                    fork.to_string(),
+                    e.to_string(),
+                );
+            }
+        };
+
+        let executor = TransactionTestExecutor::new(&fork_spec);
+
+        match executor.execute(test, test_name, fork) {
+            Ok(result) => result,
+            Err(e) => TestResult::failed(
+                test_name.to_string(),
+                fork.to_string(),
+                std::time::Duration::ZERO,
+                e.to_string(),
+            ),
+        }
+    }
+
+    /// Load a transaction test file
+    fn load_transaction_test_file(&self, path: &Path) -> EfTestResult<std::collections::HashMap<String, crate::models::TransactionTest>> {
+        let content = std::fs::read_to_string(path).map_err(|e| EfTestError::FixtureRead {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+
+        serde_json::from_str(&content).map_err(|e| EfTestError::JsonParse {
+            path: path.to_path_buf(),
+            source: e,
+        })
+    }
+
+    /// Run all tests in a directory
+    fn run_directory(&self, filter: Option<&TestFilter>) -> EfTestResult<TestReport> {
+        let start = Instant::now();
+        let mut builder = TestReportBuilder::new(&self.name);
+
+        let files = self.discovery.discover_files()?;
+        info!("Running {} transaction test files", files.len());
+
+        if self.parallel {
+            let results: Vec<_> = files
+                .par_iter()
+                .filter_map(|file| match self.run_test_file(file, filter) {
+                    Ok(results) => Some(results),
+                    Err(e) => {
+                        warn!("Error running test file {}: {}", file.display(), e);
+                        None
+                    }
+                })
+                .flatten()
+                .collect();
+
+            for result in results {
+                builder.add_result(result);
+            }
+        } else {
+            for file in &files {
+                match self.run_test_file(file, filter) {
+                    Ok(results) => {
+                        for result in results {
+                            builder.add_result(result);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Error running test file {}: {}", file.display(), e);
+                    }
+                }
+            }
+        }
+
+        let report = builder.build();
+        info!(
+            "Completed {} transaction tests in {:?}",
+            report.summary.total(),
+            start.elapsed()
+        );
+
+        Ok(report)
+    }
+}
+
+impl Suite for TransactionTestSuite {
     fn run_all(&self) -> EfTestResult<TestReport> {
         self.run_directory(None)
     }

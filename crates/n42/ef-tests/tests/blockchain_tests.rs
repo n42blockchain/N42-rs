@@ -39,19 +39,29 @@ fn fixtures_available() -> bool {
 #[test]
 #[ignore = "Requires EF test fixtures to be downloaded"]
 fn test_blockchain_tests_berlin() {
+    let base_path = fixtures_path();
+    let berlin_path = base_path.join("berlin");
+
+    eprintln!("Base fixtures path: {:?}", base_path);
+    eprintln!("Berlin path: {:?}", berlin_path);
+    eprintln!("Path exists: {}", berlin_path.exists());
+
     if !fixtures_available() {
         eprintln!("Skipping test: EF test fixtures not found at {:?}", fixtures_path());
         return;
     }
 
-    let suite = BlockchainTestSuite::new(fixtures_path().join("berlin"))
+    let suite = BlockchainTestSuite::new(berlin_path)
         .with_name("Berlin Blockchain Tests")
         .with_forks(vec!["Berlin".to_string()])
-        .with_parallel(true);
+        .with_parallel(false);
+
+    eprintln!("Test count: {}", suite.test_count());
 
     let report = suite.run_all().expect("Failed to run tests");
 
-    println!("{}", report);
+    println!("=== {} ===", report.name);
+    println!("{}", report.summary);
 }
 
 #[test]
@@ -134,7 +144,7 @@ fn test_blockchain_test_deserialization() {
         "pre": {},
         "postState": {},
         "lastblockhash": "0x0000000000000000000000000000000000000000000000000000000000000000",
-        "genesisRlp": "0x00",
+        "genesisRLP": "0x00",
         "blocks": []
     }"#;
 

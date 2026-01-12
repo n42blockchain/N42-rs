@@ -260,6 +260,18 @@ impl BlockTransaction {
     pub fn is_create(&self) -> bool {
         self.to.is_none()
     }
+
+    /// Get the sender address (already included in the JSON)
+    pub fn sender(&self) -> crate::error::EfTestResult<Address> {
+        Ok(self.sender)
+    }
+
+    /// Get the gas price (uses gas_price or max_fee_per_gas for EIP-1559)
+    pub fn effective_gas_price(&self) -> U256 {
+        self.gas_price
+            .or(self.max_fee_per_gas)
+            .unwrap_or(U256::ZERO)
+    }
 }
 
 #[cfg(test)]

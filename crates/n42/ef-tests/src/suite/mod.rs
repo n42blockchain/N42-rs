@@ -9,4 +9,4 @@ mod discovery;
 mod suite;
 
 pub use discovery::TestDiscovery;
-pub use suite::{BlockchainTestSuite, StateTestSuite, Suite};
+pub use suite::{BlockchainTestSuite, StateTestSuite, Suite, TransactionTestSuite};

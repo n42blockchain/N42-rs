@@ -40,7 +40,7 @@ pub struct BlockchainTest {
     pub config: Option<BlockchainTestConfig>,
 
     /// Genesis RLP
-    #[serde(deserialize_with = "deserialize_bytes")]
+    #[serde(rename = "genesisRLP", deserialize_with = "deserialize_bytes")]
     pub genesis_rlp: Bytes,
 
     /// Blocks to execute

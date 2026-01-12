@@ -7,13 +7,15 @@ mod account;
 mod blockchain_test;
 mod header;
 mod state_test;
-mod transaction;
+pub mod transaction;
+mod transaction_test;
 
 pub use account::Account;
 pub use blockchain_test::{Block, BlockchainTest, GenesisBlockHeader};
 pub use header::Header;
 pub use state_test::{Environment, PostStateResult, StateTest, StateTestIndexes};
 pub use transaction::Transaction;
+pub use transaction_test::{TransactionTest, TransactionTestResult};
 
 use alloy_primitives::{Bytes, B256, U256};
 use serde::{Deserialize, Deserializer};

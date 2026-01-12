@@ -21,7 +21,7 @@ use revm::{
     context::{BlockEnv, CfgEnv, TxEnv},
     context_interface::block::BlobExcessGasAndPrice,
     database::{CacheDB, State},
-    primitives::{eip4844::BLOB_BASE_FEE_UPDATE_FRACTION_CANCUN, hardfork::SpecId},
+    primitives::{eip4844::{BLOB_BASE_FEE_UPDATE_FRACTION_CANCUN, BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE}, hardfork::SpecId},
     state::{AccountInfo, Bytecode},
 };
 use revm_database::{EmptyDB, AccountStatus as DbAccountStatus, PlainAccount, states::CacheAccount};
@@ -515,11 +515,18 @@ impl BlockchainTestExecutor {
         &self,
         header: &crate::models::Header,
     ) -> BlockEnv {
+        let spec_id = self.get_spec_id();
         let blob_excess_gas_and_price = header.excess_blob_gas.map(|excess| {
             // Use a safe blob gas price calculation that handles overflow gracefully
             // The standard BlobExcessGasAndPrice::new() can panic with extremely large
             // excess_blob_gas values due to overflow in the fake_exponential calculation
-            let blob_gasprice = safe_calc_blob_gasprice(excess, BLOB_BASE_FEE_UPDATE_FRACTION_CANCUN);
+            // Prague uses a different update fraction (EIP-7691)
+            let update_fraction = if spec_id >= SpecId::PRAGUE {
+                BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE
+            } else {
+                BLOB_BASE_FEE_UPDATE_FRACTION_CANCUN
+            };
+            let blob_gasprice = safe_calc_blob_gasprice(excess, update_fraction);
             BlobExcessGasAndPrice {
                 excess_blob_gas: excess,
                 blob_gasprice,
@@ -590,6 +597,26 @@ impl BlockchainTestExecutor {
         }
         if let Some(ref blob_hashes) = tx.blob_versioned_hashes {
             tx_env.blob_hashes = blob_hashes.clone();
+        }
+
+        // Handle EIP-7702 authorization list
+        if let Some(ref auth_list) = tx.authorization_list {
+            use alloy_eips::eip7702::{Authorization as Eip7702Auth, SignedAuthorization};
+            use revm::context_interface::{either::Either, transaction::RecoveredAuthorization};
+
+            let signed_auths: Vec<Either<SignedAuthorization, RecoveredAuthorization>> = auth_list
+                .iter()
+                .map(|auth| {
+                    let inner = Eip7702Auth {
+                        chain_id: alloy_primitives::U256::from(auth.chain_id),
+                        address: auth.address,
+                        nonce: auth.nonce,
+                    };
+                    let y_parity = auth.v as u8;
+                    Either::Left(SignedAuthorization::new_unchecked(inner, y_parity, auth.r, auth.s))
+                })
+                .collect();
+            tx_env.authorization_list = signed_auths;
         }
 
         Ok(tx_env)

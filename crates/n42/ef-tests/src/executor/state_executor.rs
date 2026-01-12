@@ -21,7 +21,7 @@ use revm::{
     context::{BlockEnv, CfgEnv, TxEnv},
     context_interface::block::BlobExcessGasAndPrice,
     database::{CacheDB, State},
-    primitives::{eip4844::BLOB_BASE_FEE_UPDATE_FRACTION_CANCUN, hardfork::SpecId},
+    primitives::{eip4844::{BLOB_BASE_FEE_UPDATE_FRACTION_CANCUN, BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE}, hardfork::SpecId},
     state::{AccountInfo, Bytecode},
 };
 use revm_database::EmptyDB;
@@ -674,10 +674,17 @@ impl StateTestExecutor {
 
     /// Build the block environment
     fn build_block_env(&self, env: &crate::models::Environment) -> BlockEnv {
+        let spec_id = self.get_spec_id();
         // Calculate blob_excess_gas_and_price for Cancun+ forks
+        // Prague uses a different update fraction (EIP-7691)
         let blob_excess_gas_and_price = env.current_excess_blob_gas.map(|excess_blob_gas| {
             let excess: u64 = excess_blob_gas.try_into().unwrap_or(0);
-            BlobExcessGasAndPrice::new(excess, BLOB_BASE_FEE_UPDATE_FRACTION_CANCUN)
+            let update_fraction = if spec_id >= SpecId::PRAGUE {
+                BLOB_BASE_FEE_UPDATE_FRACTION_PRAGUE
+            } else {
+                BLOB_BASE_FEE_UPDATE_FRACTION_CANCUN
+            };
+            BlobExcessGasAndPrice::new(excess, update_fraction)
         });
 
         BlockEnv {

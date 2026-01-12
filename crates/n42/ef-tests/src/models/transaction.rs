@@ -183,6 +183,39 @@ pub struct BlockTransaction {
     /// Blob versioned hashes (for EIP-4844)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blob_versioned_hashes: Option<Vec<B256>>,
+
+    /// Authorization list (for EIP-7702)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_list: Option<Vec<Authorization>>,
+}
+
+/// Authorization item for EIP-7702 transactions
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Authorization {
+    /// Chain ID
+    #[serde(deserialize_with = "deserialize_u64")]
+    pub chain_id: u64,
+
+    /// Account address to authorize
+    #[serde(deserialize_with = "deserialize_address")]
+    pub address: Address,
+
+    /// Nonce
+    #[serde(deserialize_with = "deserialize_u64")]
+    pub nonce: u64,
+
+    /// Signature v value
+    #[serde(deserialize_with = "deserialize_u64")]
+    pub v: u64,
+
+    /// Signature r value
+    #[serde(deserialize_with = "deserialize_u256")]
+    pub r: U256,
+
+    /// Signature s value
+    #[serde(deserialize_with = "deserialize_u256")]
+    pub s: U256,
 }
 
 /// Access list item for EIP-2930 transactions

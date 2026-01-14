@@ -808,29 +808,31 @@ impl<N: ProviderNodeTypes> BeaconProviderWriter for BlockchainProvider<N> {
 
     fn save_beacon_state_by_hash(&self, block_hash: &BlockHash,  beacon_state: BeaconState) -> ProviderResult<()> {
         let start = Instant::now();
+        // Use a common db provider for all the write operations in this function, call commit() only once. Avoid unnecessary commit() calls.
+        let provider_rw = self.database_provider_rw()?;
         beacon_state.validators_store.diff_save(|tree_hash, tree: &Tree<Validator>| {
-            self.save_tree_by_hash_for_validator(tree_hash, tree.clone())
+            provider_rw.save_tree_by_hash_for_validator(tree_hash, tree.clone())
         },
         |tree_hash| {
             self.get_tree_by_hash_for_validator(&tree_hash).unwrap_or(None).is_some()
         }).map_err(|e| ProviderError::Other(AnyError::new(e)))?;
 
         beacon_state.inactivity_scores_store.diff_save(|tree_hash, tree: &Tree<u64>| {
-            self.save_tree_by_hash_for_u64(tree_hash, tree.clone())
+            provider_rw.save_tree_by_hash_for_u64(tree_hash, tree.clone())
         },
         |tree_hash| {
             self.get_tree_by_hash_for_u64(&tree_hash).unwrap_or(None).is_some()
         }).map_err(|e| ProviderError::Other(AnyError::new(e)))?;
 
         beacon_state.balances_store.diff_save(|tree_hash, tree: &Tree<u64>| {
-            self.save_tree_by_hash_for_u64(tree_hash, tree.clone())
+            provider_rw.save_tree_by_hash_for_u64(tree_hash, tree.clone())
         },
         |tree_hash| {
             self.get_tree_by_hash_for_u64(&tree_hash).unwrap_or(None).is_some()
         }).map_err(|e| ProviderError::Other(AnyError::new(e)))?;
 
         beacon_state.epoch_attester_indexes_store.diff_save(|tree_hash, tree: &Tree<u64>| {
-            self.save_tree_by_hash_for_u64(tree_hash, tree.clone())
+            provider_rw.save_tree_by_hash_for_u64(tree_hash, tree.clone())
         },
         |tree_hash| {
             self.get_tree_by_hash_for_u64(&tree_hash).unwrap_or(None).is_some()
@@ -856,7 +858,6 @@ impl<N: ProviderNodeTypes> BeaconProviderWriter for BlockchainProvider<N> {
             ..beacon_state
         };
 
-        let provider_rw = self.database_provider_rw()?;
         provider_rw.save_beacon_state_by_hash(block_hash, beacon_state_updated)?;
         let commit_result = provider_rw.commit().map(|_|());
         self.metrics.save_beacon_state_by_hash_duration.record(start.elapsed().as_secs_f64());

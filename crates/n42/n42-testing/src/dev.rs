@@ -37,7 +37,8 @@ use reth_provider::{
 };
 
 #[cfg(test)]
-use crate::{utils::n42_payload_attributes, snapshot_test_utils::TesterAccountPool};
+use crate::{
+    utils::n42_payload_attributes, snapshot_test_utils::TesterAccountPool};
 
 use alloy_primitives::{
     Bytes,

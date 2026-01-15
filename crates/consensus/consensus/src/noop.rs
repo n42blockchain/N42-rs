@@ -33,17 +33,15 @@ impl<H> HeaderValidator<H> for NoopConsensus {
 }
 
 impl<B: Block> Consensus<B> for NoopConsensus {
-    type Error = ConsensusError;
-
     fn validate_body_against_header(
         &self,
         _body: &B::Body,
         _header: &SealedHeader<B::Header>,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), ConsensusError> {
         Ok(())
     }
 
-    fn validate_block_pre_execution(&self, _block: &SealedBlock<B>) -> Result<(), Self::Error> {
+    fn validate_block_pre_execution(&self, _block: &SealedBlock<B>) -> Result<(), ConsensusError> {
         Ok(())
     }
 }

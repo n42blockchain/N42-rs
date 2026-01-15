@@ -3,6 +3,18 @@
 
 use alloy_primitives::{B256, U256};
 
+/// Trait for extracting subkeys from values during database operations.
+///
+/// This trait allows extracting the subkey from a value during database iteration,
+/// enabling proper range queries and filtering on `DupSort` tables.
+pub trait ValueWithSubKey {
+    /// The type of the subkey.
+    type SubKey;
+
+    /// Extracts and returns the subkey from this value.
+    fn get_subkey(&self) -> Self::SubKey;
+}
+
 /// Account storage entry.
 ///
 /// `key` is the subkey when used as a value in the `StorageChangeSets` table.
@@ -30,6 +42,14 @@ impl StorageEntry {
 impl From<(B256, U256)> for StorageEntry {
     fn from((key, value): (B256, U256)) -> Self {
         Self { key, value }
+    }
+}
+
+impl ValueWithSubKey for StorageEntry {
+    type SubKey = B256;
+
+    fn get_subkey(&self) -> Self::SubKey {
+        self.key
     }
 }
 

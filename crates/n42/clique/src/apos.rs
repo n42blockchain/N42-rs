@@ -707,17 +707,15 @@ where
     B: BlockTrait,
     APos<Provider, ChainSpec>: HeaderValidator<<B as reth_primitives_traits::Block>::Header>,
 {
-    type Error = ConsensusError;
-
     fn validate_body_against_header(
         &self,
         body: &B::Body,
         header: &SealedHeader<B::Header>,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), ConsensusError> {
         Ok(())
     }
 
-    fn validate_block_pre_execution(&self, block: &SealedBlock<B>) -> Result<(), Self::Error> {
+    fn validate_block_pre_execution(&self, _block: &SealedBlock<B>) -> Result<(), ConsensusError> {
         Ok(())
     }
 

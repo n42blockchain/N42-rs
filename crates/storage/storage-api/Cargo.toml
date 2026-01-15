@@ -22,7 +22,6 @@ reth-prune-types.workspace = true
 reth-stages-types.workspace = true
 reth-storage-errors.workspace = true
 reth-trie-common.workspace = true
-reth-trie-db = { workspace = true, optional = true }
 revm-database.workspace = true
 reth-ethereum-primitives.workspace = true
 
@@ -58,7 +57,6 @@ std = [
 
 db-api = [
     "dep:reth-db-api",
-    "dep:reth-trie-db",
 ]
 
 serde = [

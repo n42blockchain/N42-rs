@@ -69,6 +69,16 @@ pub enum InvalidTransactionError {
     SignerAccountHasBytecode,
 }
 
+impl InvalidTransactionError {
+    /// Returns `true` if the nonce of a transaction is lower than the account's current nonce.
+    pub fn is_nonce_too_low(&self) -> bool {
+        match self {
+            Self::NonceNotConsistent { tx, state } => tx < state,
+            _ => false,
+        }
+    }
+}
+
 /// Represents error variants that can happen when trying to convert a transaction to pooled
 /// transaction.
 #[derive(Debug, Clone, Eq, PartialEq, derive_more::Display, derive_more::Error)]

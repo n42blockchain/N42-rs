@@ -38,7 +38,6 @@ revm = { workspace = true, features = ["secp256k1", "blst", "c-kzg", "std"] }
 revm-primitives.workspace = true
 revm-database.workspace = true
 revm-state.workspace = true
-revm-inspector.workspace = true
 
 # alloy
 alloy-primitives.workspace = true

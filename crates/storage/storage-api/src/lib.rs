@@ -107,3 +107,6 @@ pub use beacon::*;
 // N42-specific snapshot storage traits
 mod snapshot;
 pub use snapshot::*;
+
+// Helper macros for provider trait implementations
+pub mod macros;

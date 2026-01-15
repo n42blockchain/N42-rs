@@ -43,8 +43,8 @@ pub fn iter_static_files(path: &Path) -> Result<SortedStaticFiles, NippyJarError
                 let jar = NippyJar::<SegmentHeader>::load(&entry.path())?;
 
                 let (block_range, tx_range) = (
-                    jar.user_header().block_range().copied(),
-                    jar.user_header().tx_range().copied(),
+                    jar.user_header().block_range(),
+                    jar.user_header().tx_range(),
                 );
 
                 if let Some(block_range) = block_range {

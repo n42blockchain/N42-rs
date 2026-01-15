@@ -1,6 +1,6 @@
 #![allow(unused)]
 use crate::{
-    providers::{ConsistentProvider, ProviderNodeTypes, StaticFileProvider},
+    providers::{ConsistentProvider, ProviderNodeTypes, StaticFileProvider, StaticFileProviderRWRefMut},
     AccountReader, BlockHashReader, BlockIdReader, BlockNumReader, BlockReader, BlockReaderIdExt,
     BlockSource, CanonChainTracker, CanonStateNotifications, CanonStateSubscriptions,
     ChainSpecProvider, ChainStateBlockReader, ChangeSetReader, DatabaseProvider,
@@ -35,6 +35,7 @@ use reth_primitives_traits::{
 };
 use reth_prune_types::{PruneCheckpoint, PruneSegment};
 use reth_stages_types::{StageCheckpoint, StageId};
+use reth_static_file_types::StaticFileSegment;
 use reth_storage_api::{
     BlockBodyIndicesProvider, DBProvider, NodePrimitivesProvider, StorageChangeSetReader,
     TrieReader,
@@ -185,6 +186,14 @@ impl<N: ProviderNodeTypes> DatabaseProviderFactory for BlockchainProvider<N> {
 impl<N: ProviderNodeTypes> StaticFileProviderFactory for BlockchainProvider<N> {
     fn static_file_provider(&self) -> StaticFileProvider<Self::Primitives> {
         self.database.static_file_provider()
+    }
+
+    fn get_static_file_writer(
+        &self,
+        block: BlockNumber,
+        segment: StaticFileSegment,
+    ) -> ProviderResult<StaticFileProviderRWRefMut<'_, Self::Primitives>> {
+        self.database.get_static_file_writer(block, segment)
     }
 }
 
@@ -732,6 +741,28 @@ impl<N: ProviderNodeTypes> ChangeSetReader for BlockchainProvider<N> {
     ) -> ProviderResult<Vec<AccountBeforeTx>> {
         self.consistent_provider()?
             .account_block_changeset(block_number)
+    }
+
+    fn get_account_before_block(
+        &self,
+        block_number: BlockNumber,
+        address: Address,
+    ) -> ProviderResult<Option<AccountBeforeTx>> {
+        self.consistent_provider()?
+            .get_account_before_block(block_number, address)
+    }
+
+    fn account_changesets_range(
+        &self,
+        range: impl RangeBounds<BlockNumber>,
+    ) -> ProviderResult<Vec<(BlockNumber, AccountBeforeTx)>> {
+        self.consistent_provider()?
+            .account_changesets_range(range)
+    }
+
+    fn account_changeset_count(&self) -> ProviderResult<usize> {
+        self.consistent_provider()?
+            .account_changeset_count()
     }
 }
 

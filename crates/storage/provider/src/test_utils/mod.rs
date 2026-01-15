@@ -11,7 +11,7 @@ use reth_db::{
     test_utils::{create_test_rw_db, create_test_static_files_dir, TempDatabase},
     DatabaseEnv,
 };
-use reth_errors::ProviderResult;
+use reth_storage_errors::provider::{ProviderError, ProviderResult};
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_node_types::{NodeTypes, NodeTypesWithDBAdapter};
 use reth_primitives_traits::{Account, StorageEntry};
@@ -100,7 +100,7 @@ pub fn insert_genesis<N: ProviderNodeTypes<ChainSpec = ChainSpec>>(
 
     let (root, updates) = StateRoot::from_tx(provider.tx_ref())
         .root_with_updates()
-        .map_err(|e| ProviderError::Database(e.into()))?;
+        .map_err(ProviderError::from)?;
     provider.write_trie_updates(updates).unwrap();
 
     provider.commit()?;

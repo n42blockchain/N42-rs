@@ -13,7 +13,7 @@ use alloy_rlp::Encodable;
 use futures::StreamExt;
 use reth_eth_wire::{
     BlockBodies, BlockHeaders, EthNetworkPrimitives, GetBlockBodies, GetBlockHeaders, GetNodeData,
-    GetReceipts, HeadersDirection, NetworkPrimitives, NodeData, Receipts, Receipts69,
+    GetReceipts, GetReceipts70, HeadersDirection, NetworkPrimitives, NodeData, Receipts, Receipts69, Receipts70,
 };
 use reth_network_api::test_utils::PeersHandle;
 use reth_network_p2p::error::RequestResult;
@@ -216,6 +216,48 @@ where
         let _ = response.send(Ok(Receipts69(receipts)));
     }
 
+    fn on_receipts70_request(
+        &self,
+        _peer_id: PeerId,
+        request: GetReceipts70,
+        response: oneshot::Sender<RequestResult<Receipts70<C::Receipt>>>,
+    ) {
+        self.metrics.eth_receipts_requests_received_total.increment(1);
+
+        let GetReceipts70 { first_block_receipt_index, block_hashes } = request;
+        let mut receipts = Vec::new();
+        let mut last_block_incomplete = false;
+        let mut total_bytes = 0;
+
+        for (index, hash) in block_hashes.into_iter().enumerate() {
+            if let Some(receipts_by_block) =
+                self.client.receipts_by_block(BlockHashOrNumber::Hash(hash)).unwrap_or_default()
+            {
+                let skip = if index == 0 { first_block_receipt_index as usize } else { 0 };
+                let block_receipts: Vec<_> = receipts_by_block.into_iter().skip(skip).collect();
+
+                total_bytes += block_receipts.len() * 100; // rough estimate
+
+                if receipts.len() >= MAX_RECEIPTS_SERVE || total_bytes > SOFT_RESPONSE_LIMIT {
+                    last_block_incomplete = true;
+                    if !block_receipts.is_empty() {
+                        receipts.push(block_receipts);
+                    }
+                    break;
+                }
+
+                receipts.push(block_receipts);
+            } else {
+                break;
+            }
+        }
+
+        let _ = response.send(Ok(Receipts70 {
+            last_block_incomplete,
+            receipts,
+        }));
+    }
+
     #[inline]
     fn get_receipts_response<T, F>(&self, request: GetReceipts, transform_fn: F) -> Vec<Vec<T>>
     where
@@ -283,6 +325,9 @@ where
                     }
                     IncomingEthRequest::GetReceipts69 { peer_id, request, response } => {
                         this.on_receipts69_request(peer_id, request, response)
+                    }
+                    IncomingEthRequest::GetReceipts70 { peer_id, request, response } => {
+                        this.on_receipts70_request(peer_id, request, response)
                     }
                 }
             },
@@ -357,5 +402,16 @@ pub enum IncomingEthRequest<N: NetworkPrimitives = EthNetworkPrimitives> {
         request: GetReceipts,
         /// The channel sender for the response containing Receipts69.
         response: oneshot::Sender<RequestResult<Receipts69<N::Receipt>>>,
+    },
+    /// Request Receipts from the peer (eth/70 protocol).
+    ///
+    /// The response should be sent through the channel.
+    GetReceipts70 {
+        /// The ID of the peer to request receipts from.
+        peer_id: PeerId,
+        /// The specific receipts requested.
+        request: GetReceipts70,
+        /// The channel sender for the response containing Receipts70.
+        response: oneshot::Sender<RequestResult<Receipts70<N::Receipt>>>,
     },
 }

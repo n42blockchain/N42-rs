@@ -167,28 +167,25 @@ where
         //  * trie updates (cannot naively extend, need helper)
         //  * indices (already done basically)
         // Insert the blocks
-        for ExecutedBlock {
-            recovered_block,
-            execution_output,
-            trie_data,
-        } in blocks
-        {
+        for executed_block in blocks {
+            let recovered_block = executed_block.recovered_block().clone();
             let _block_hash = recovered_block.hash();
             self.database()
-                .insert_block(Arc::unwrap_or_clone(recovered_block))?;
+                .insert_block(recovered_block)?;
 
             // Write state and changesets to the database.
             // Must be written after blocks because of the receipt lookup.
             self.database()
-                .write_state(&execution_output, OriginalValuesKnown::No)?;
+                .write_state(executed_block.execution_outcome(), OriginalValuesKnown::No)?;
 
             // insert hashes and intermediate merkle nodes
-            if let Some(trie_data) = trie_data {
-                self.database()
-                    .write_hashed_state(&trie_data.hashed_state.into_sorted())?;
-                self.database()
-                    .write_trie_updates(trie_data.trie_updates)?;
-            }
+            let hashed_state = executed_block.hashed_state();
+            self.database()
+                .write_hashed_state(&hashed_state)?;
+
+            let trie_updates = executed_block.trie_updates();
+            self.database()
+                .write_trie_updates_sorted(&trie_updates)?;
         }
 
         // update history indices

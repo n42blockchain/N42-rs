@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 mod manager;
-pub use manager::{StaticFileAccess, StaticFileProvider, StaticFileWriter};
+pub use manager::{StaticFileAccess, StaticFileProvider, StaticFileProviderBuilder, StaticFileWriter};
 
 mod jar;
 pub use jar::StaticFileJarProvider;

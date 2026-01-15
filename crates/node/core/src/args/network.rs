@@ -262,7 +262,7 @@ impl NetworkArgs {
             .peer_config(config.peers_config_with_basic_nodes_from_file(
                 self.persistent_peers_file(peers_file).as_deref(),
             ))
-            .external_ip_resolver(self.nat)
+            .external_ip_resolver(self.nat.clone())
             .sessions_config(
                 SessionsConfig::default().with_upscaled_event_buffer(peers_config.max_peers()),
             )

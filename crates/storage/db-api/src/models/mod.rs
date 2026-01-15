@@ -26,6 +26,7 @@ pub mod sharded_key;
 mod snapshot;
 pub mod storage_sharded_key;
 mod validator;
+mod metadata;
 
 pub use accounts::*;
 pub use blocks::*;
@@ -35,6 +36,7 @@ pub use reth_db_models::{
     StoredBlockWithdrawals,
 };
 pub use sharded_key::ShardedKey;
+pub use metadata::StorageSettings;
 
 /// Macro that implements [`Encode`] and [`Decode`] for uint types.
 macro_rules! impl_uints {

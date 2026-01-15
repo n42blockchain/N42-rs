@@ -246,9 +246,9 @@ impl<N: NetworkPrimitives> PeersInfo for NetworkHandle<N> {
         } else if let Some(record) = self.inner.discv5.as_ref().and_then(|d| d.node_record()) {
             record
         } else {
-            let external_ip = self.inner.nat.and_then(|nat| nat.as_external_ip());
-
             let mut socket_addr = *self.inner.listener_address.lock();
+            let port = socket_addr.port();
+            let external_ip = self.inner.nat.as_ref().and_then(|nat| nat.clone().as_external_ip(port));
             if let Some(ip) = external_ip {
                 // if able to resolve external ip, use it instead and also set the local address
                 socket_addr.set_ip(ip)

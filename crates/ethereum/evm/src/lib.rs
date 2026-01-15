@@ -381,9 +381,11 @@ where
         use reth_primitives_traits::SignedTransaction;
 
         let txs = payload.payload.transactions().clone();
-        let convert = |tx: alloy_primitives::Bytes| -> Result<_, Self::Error> {
-            let tx = TransactionSigned::decode_2718(&mut tx.as_ref())?;
-            let signer = tx.try_recover()?;
+        let convert = |tx: alloy_primitives::Bytes| -> Result<_, core::convert::Infallible> {
+            let tx = TransactionSigned::decode_2718(&mut tx.as_ref())
+                .expect("failed to decode transaction");
+            let signer = tx.try_recover()
+                .expect("failed to recover signer");
             Ok(tx.with_signer(signer))
         };
 

@@ -111,6 +111,7 @@ impl PeersManager {
             basic_nodes,
             max_backoff_count,
             incoming_ip_throttle_duration,
+            ip_filter: _,
         } = config;
         let (manager_tx, handle_rx) = mpsc::unbounded_channel();
         let now = Instant::now();

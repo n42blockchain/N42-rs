@@ -28,6 +28,8 @@ struct DisplayFork {
     activated_at: ForkCondition,
     /// An optional EIP (e.g. `EIP-1559`).
     eip: Option<String>,
+    /// Optional metadata string
+    metadata: Option<String>,
 }
 
 impl core::fmt::Display for DisplayFork {
@@ -170,6 +172,7 @@ impl DisplayHardforks {
                 name: fork.name().to_string(),
                 activated_at: condition,
                 eip: None,
+                metadata: None,
             };
 
             match condition {
@@ -186,6 +189,44 @@ impl DisplayHardforks {
                         fork_block,
                         total_difficulty,
                     };
+                    with_merge.push(display_fork);
+                }
+                ForkCondition::Timestamp(_) => {
+                    post_merge.push(display_fork);
+                }
+                ForkCondition::Never => {}
+            }
+        }
+
+        Self {
+            pre_merge,
+            with_merge,
+            post_merge,
+        }
+    }
+
+    /// Creates a new [`DisplayHardforks`] from an iterator of hardforks with metadata.
+    pub fn with_meta<'a, I>(hardforks: I) -> Self
+    where
+        I: IntoIterator<Item = (&'a dyn Hardfork, ForkCondition, Option<String>)>,
+    {
+        let mut pre_merge = Vec::new();
+        let mut with_merge = Vec::new();
+        let mut post_merge = Vec::new();
+
+        for (fork, condition, metadata) in hardforks {
+            let display_fork = DisplayFork {
+                name: fork.name().to_string(),
+                activated_at: condition,
+                eip: None,
+                metadata,
+            };
+
+            match condition {
+                ForkCondition::Block(_) => {
+                    pre_merge.push(display_fork);
+                }
+                ForkCondition::TTD { .. } => {
                     with_merge.push(display_fork);
                 }
                 ForkCondition::Timestamp(_) => {

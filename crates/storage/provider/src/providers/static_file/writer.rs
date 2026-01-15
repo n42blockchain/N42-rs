@@ -54,6 +54,10 @@ impl<N: NodePrimitives> StaticFileWriters<N> {
             StaticFileSegment::Headers => self.headers.write(),
             StaticFileSegment::Transactions => self.transactions.write(),
             StaticFileSegment::Receipts => self.receipts.write(),
+            StaticFileSegment::TransactionSenders | StaticFileSegment::AccountChangeSets => {
+                // TODO: Add proper handling for these segments
+                return Err(ProviderError::UnsupportedProvider);
+            }
         };
 
         if write_guard.is_none() {
@@ -168,7 +172,7 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
 
         let static_file_provider = Self::upgrade_provider_to_strong_reference(&reader);
 
-        let block_range = static_file_provider.find_fixed_range(block);
+        let block_range = static_file_provider.find_fixed_range(segment, block);
         let (jar, path) = match static_file_provider.get_segment_provider_from_block(
             segment,
             block_range.start(),
@@ -251,6 +255,10 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
                     .prune_transaction_data(to_delete, last_block_number.expect("should exist"))?,
                 StaticFileSegment::Receipts => {
                     self.prune_receipt_data(to_delete, last_block_number.expect("should exist"))?
+                }
+                StaticFileSegment::TransactionSenders | StaticFileSegment::AccountChangeSets => {
+                    // TODO: Add proper handling for these segments
+                    return Err(ProviderError::UnsupportedProvider);
                 }
             }
         }
@@ -367,7 +375,7 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
                 self.data_path = data_path;
 
                 *self.writer.user_header_mut() = SegmentHeader::new(
-                    self.reader().find_fixed_range(last_block + 1),
+                    self.reader().find_fixed_range(segment, last_block + 1),
                     None,
                     None,
                     segment,
@@ -397,6 +405,11 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             .block_end()
             .map(|b| b + 1)
             .unwrap_or_else(|| self.writer.user_header().expected_block_start())
+    }
+
+    /// Returns the current block number (last written block), or None if no blocks have been written yet.
+    pub fn current_block_number(&self) -> Option<BlockNumber> {
+        self.writer.user_header().block_end()
     }
 
     /// Verifies if the incoming block number matches the next expected block number
@@ -821,7 +834,7 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         Ok(())
     }
 
-    fn reader(&self) -> StaticFileProvider<N> {
+    pub(crate) fn reader(&self) -> StaticFileProvider<N> {
         Self::upgrade_provider_to_strong_reference(&self.reader)
     }
 
@@ -864,6 +877,140 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
     #[cfg(any(test, feature = "test-utils"))]
     pub const fn inner(&mut self) -> &mut NippyJarWriter<SegmentHeader> {
         &mut self.writer
+    }
+
+    /// Ensures that the current block is at the specified block number.
+    /// If current block is less than `advance_to`, it will increment blocks until it reaches `advance_to`.
+    pub fn ensure_at_block(&mut self, advance_to: BlockNumber) -> ProviderResult<()> {
+        let current_block = if let Some(current_block_number) = self.current_block_number() {
+            current_block_number
+        } else {
+            self.increment_block(0)?;
+            0
+        };
+
+        match current_block.cmp(&advance_to) {
+            std::cmp::Ordering::Less => {
+                for block in current_block + 1..=advance_to {
+                    self.increment_block(block)?;
+                }
+            }
+            std::cmp::Ordering::Equal => {}
+            std::cmp::Ordering::Greater => {
+                return Err(ProviderError::UnexpectedStaticFileBlockNumber(
+                    self.writer.user_header().segment(),
+                    current_block,
+                    advance_to,
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Appends a single transaction sender to the static file.
+    pub fn append_transaction_sender(
+        &mut self,
+        tx_num: TxNumber,
+        sender: &alloy_primitives::Address,
+    ) -> ProviderResult<()> {
+        let start = Instant::now();
+        self.ensure_no_queued_prune()?;
+
+        debug_assert!(self.writer.user_header().segment() == StaticFileSegment::TransactionSenders);
+        self.append_with_tx_number(tx_num, sender)?;
+
+        if let Some(metrics) = &self.metrics {
+            metrics.record_segment_operation(
+                StaticFileSegment::TransactionSenders,
+                StaticFileProviderOperation::Append,
+                Some(start.elapsed()),
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Appends multiple transaction senders to the static file.
+    pub fn append_transaction_senders<I>(&mut self, senders: I) -> ProviderResult<()>
+    where
+        I: Iterator<Item = (TxNumber, alloy_primitives::Address)>,
+    {
+        debug_assert!(self.writer.user_header().segment() == StaticFileSegment::TransactionSenders);
+
+        let mut senders_iter = senders.into_iter().peekable();
+        // If senders are empty, we can simply return
+        if senders_iter.peek().is_none() {
+            return Ok(());
+        }
+
+        let start = Instant::now();
+        self.ensure_no_queued_prune()?;
+
+        // At this point senders contains at least one sender, so count will be overwritten.
+        let mut count: u64 = 0;
+        for (tx_num, sender) in senders_iter {
+            self.append_with_tx_number(tx_num, &sender)?;
+            count += 1;
+        }
+
+        if let Some(metrics) = &self.metrics {
+            metrics.record_segment_operations(
+                StaticFileSegment::TransactionSenders,
+                StaticFileProviderOperation::Append,
+                count,
+                Some(start.elapsed()),
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Appends a block changeset to the static file.
+    pub fn append_account_changeset(
+        &mut self,
+        mut changeset: Vec<reth_db::models::AccountBeforeTx>,
+        block_number: u64,
+    ) -> ProviderResult<()> {
+        debug_assert!(self.writer.user_header().segment() == StaticFileSegment::AccountChangeSets);
+        let start = Instant::now();
+
+        self.increment_block(block_number)?;
+        self.ensure_no_queued_prune()?;
+
+        // first sort the changeset by address
+        changeset.sort_by_key(|change| change.address);
+
+        // append changeset to static file
+        let mut buf = Vec::new();
+        for change in changeset {
+            buf.clear();
+            Compact::to_compact(&change, &mut buf);
+            self.writer.append_column(Some(Ok(&buf))).map_err(ProviderError::other)?;
+        }
+
+        if let Some(metrics) = &self.metrics {
+            metrics.record_segment_operation(
+                StaticFileSegment::AccountChangeSets,
+                StaticFileProviderOperation::Append,
+                Some(start.elapsed()),
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Queues prune of transaction senders.
+    pub fn prune_transaction_senders(
+        &mut self,
+        to_delete: u64,
+        last_block: BlockNumber,
+    ) -> ProviderResult<()> {
+        debug_assert_eq!(
+            self.writer.user_header().segment(),
+            StaticFileSegment::TransactionSenders
+        );
+        self.queue_prune(to_delete, Some(last_block))
     }
 }
 

@@ -24,7 +24,7 @@ reth-evm.workspace = true
 # Alloy
 alloy-primitives.workspace = true
 alloy-eips.workspace = true
-alloy-evm.workspace = true
+alloy-evm = { version = "0.25.1", default-features = false }
 alloy-consensus.workspace = true
 alloy-rpc-types-engine.workspace = true
 

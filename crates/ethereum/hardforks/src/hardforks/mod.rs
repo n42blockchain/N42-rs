@@ -145,7 +145,7 @@ impl ChainHardforks {
     }
 
     /// Removes `fork` from list.
-    pub fn remove<H: Hardfork>(&mut self, fork: H) {
+    pub fn remove<H: Hardfork>(&mut self, fork: &H) {
         self.forks
             .retain(|(inner_fork, _)| inner_fork.name() != fork.name());
         self.map.remove(fork.name());

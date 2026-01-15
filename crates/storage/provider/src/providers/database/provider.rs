@@ -3,7 +3,7 @@ use crate::{
     providers::{
         database::{chain::ChainStorage, metrics},
         static_file::StaticFileWriter,
-        NodeTypesForProvider, StaticFileProvider,
+        NodeTypesForProvider, StaticFileProvider, StaticFileProviderRWRefMut,
     },
     to_range,
     traits::{
@@ -224,6 +224,15 @@ impl<TX, N: NodeTypes> StaticFileProviderFactory for DatabaseProvider<TX, N> {
     fn static_file_provider(&self) -> StaticFileProvider<Self::Primitives> {
         self.static_file_provider.clone()
     }
+
+    /// Gets a static file writer for the specified block and segment.
+    fn get_static_file_writer(
+        &self,
+        block: BlockNumber,
+        segment: StaticFileSegment,
+    ) -> ProviderResult<StaticFileProviderRWRefMut<'_, Self::Primitives>> {
+        self.static_file_provider.get_writer(block, segment)
+    }
 }
 
 impl<TX: Debug + Send + Sync, N: NodeTypes<ChainSpec: EthChainSpec + 'static>> ChainSpecProvider
@@ -324,7 +333,7 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         let (new_state_root, trie_updates) = StateRoot::from_tx(&self.tx)
             .with_prefix_sets(prefix_sets)
             .root_with_updates()
-            .map_err(|e| ProviderError::Database(e.into()))?;
+            .map_err(ProviderError::from)?;
 
         let parent_number = range.start().saturating_sub(1);
         let parent_state_root = self
@@ -405,27 +414,23 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         //  * trie updates (cannot naively extend, need helper)
         //  * indices (already done basically)
         // Insert the blocks
-        for ExecutedBlock {
-            recovered_block,
-            execution_output,
-            hashed_state,
-            trie_updates,
-        } in blocks
-        {
+        for executed_block in blocks {
+            let recovered_block = executed_block.recovered_block().clone();
             let block_number = recovered_block.number();
-            self.insert_block(Arc::unwrap_or_clone(recovered_block))?;
+            self.insert_block(recovered_block)?;
 
             // Write state and changesets to the database.
             // Must be written after blocks because of the receipt lookup.
-            self.write_state(&execution_output, OriginalValuesKnown::No)?;
+            self.write_state(executed_block.execution_outcome(), OriginalValuesKnown::No)?;
 
-            // insert hashes and intermediate merkle nodes
-            self.write_hashed_state(&Arc::unwrap_or_clone(hashed_state).into_sorted())?;
+            // insert hashes and intermediate merkle nodes and trie updates
+            let hashed_state = executed_block.hashed_state();
+            self.write_hashed_state(&hashed_state)?;
 
-            // sort trie updates and insert changesets
-            let trie_updates_sorted = (*trie_updates).clone().into_sorted();
-            self.write_trie_changesets(block_number, &trie_updates_sorted, None)?;
-            self.write_trie_updates_sorted(&trie_updates_sorted)?;
+            // insert trie changesets and updates
+            let trie_updates = executed_block.trie_updates();
+            self.write_trie_changesets(block_number, &trie_updates, None)?;
+            self.write_trie_updates_sorted(&trie_updates)?;
         }
 
         // update history indices
@@ -1091,6 +1096,54 @@ impl<TX: DbTx, N: NodeTypes> ChangeSetReader for DatabaseProvider<TX, N> {
                 Ok(account_before)
             })
             .collect()
+    }
+
+    fn get_account_before_block(
+        &self,
+        block_number: BlockNumber,
+        address: Address,
+    ) -> ProviderResult<Option<AccountBeforeTx>> {
+        let mut cursor = self.tx.cursor_read::<tables::AccountChangeSets>()?;
+
+        // Search for the account change in the specified block
+        if let Some((_, account_before)) = cursor.seek_exact(block_number)? {
+            if account_before.address == address {
+                return Ok(Some(account_before));
+            }
+        }
+
+        // Walk through all changes in this block to find the matching address
+        for result in cursor.walk_range(block_number..=block_number)? {
+            let (_, account_before) = result?;
+            if account_before.address == address {
+                return Ok(Some(account_before));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn account_changesets_range(
+        &self,
+        range: impl RangeBounds<BlockNumber>,
+    ) -> ProviderResult<Vec<(BlockNumber, AccountBeforeTx)>> {
+        self.tx
+            .cursor_read::<tables::AccountChangeSets>()?
+            .walk_range(range)?
+            .map(|result| -> ProviderResult<_> {
+                let (block_number, account_before) = result?;
+                Ok((block_number, account_before))
+            })
+            .collect()
+    }
+
+    fn account_changeset_count(&self) -> ProviderResult<usize> {
+        self.tx
+            .cursor_read::<tables::AccountChangeSets>()?
+            .walk(None)?
+            .count()
+            .try_into()
+            .map_err(|_| ProviderError::Database(reth_db_api::DatabaseError::Other("count overflow".to_string())))
     }
 }
 
@@ -2222,10 +2275,10 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
     fn write_hashed_state(&self, hashed_state: &HashedPostStateSorted) -> ProviderResult<()> {
         // Write hashed account updates.
         let mut hashed_accounts_cursor = self.tx_ref().cursor_write::<tables::HashedAccounts>()?;
-        for (hashed_address, account) in hashed_state.accounts().accounts_sorted() {
+        for (hashed_address, account) in hashed_state.accounts() {
             if let Some(account) = account {
-                hashed_accounts_cursor.upsert(hashed_address, &account)?;
-            } else if hashed_accounts_cursor.seek_exact(hashed_address)?.is_some() {
+                hashed_accounts_cursor.upsert(*hashed_address, account)?;
+            } else if hashed_accounts_cursor.seek_exact(*hashed_address)?.is_some() {
                 hashed_accounts_cursor.delete_current()?;
             }
         }
@@ -2242,10 +2295,10 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
                 hashed_storage_cursor.delete_current_duplicates()?;
             }
 
-            for (hashed_slot, value) in storage.storage_slots_sorted() {
+            for (hashed_slot, value) in storage.storage_slots_ref() {
                 let entry = StorageEntry {
-                    key: hashed_slot,
-                    value,
+                    key: *hashed_slot,
+                    value: *value,
                 };
                 if let Some(db_entry) =
                     hashed_storage_cursor.seek_by_key_subkey(*hashed_address, entry.key)?
@@ -2959,7 +3012,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> HashingWriter for DatabaseProvi
             let (state_root, trie_updates) = StateRoot::from_tx(&self.tx)
                 .with_prefix_sets(prefix_sets)
                 .root_with_updates()
-                .map_err(|e| ProviderError::Database(e.into()))?;
+                .map_err(ProviderError::from)?;
             if state_root != expected_state_root {
                 return Err(ProviderError::StateRootMismatch(Box::new(RootMismatch {
                     root: GotExpected {
@@ -3137,7 +3190,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockExecu
         // Update pipeline progress
         self.update_pipeline_stages(block, true)?;
 
-        Ok(Chain::new(blocks, execution_state, None))
+        Ok(Chain::new(blocks, execution_state, Default::default(), Default::default()))
     }
 
     fn remove_block_and_execution_above(&self, block: BlockNumber) -> ProviderResult<()> {

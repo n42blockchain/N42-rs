@@ -178,11 +178,20 @@ where
             //
             // TODO(mediocregopher) make from_reverts return sorted
             // https://github.com/paradigmxyz/reth/issues/19382
-            let mut hashed_state_reverts = HashedPostState::from_reverts::<KeccakKeyHasher>(
-                provider.tx_ref(),
-                from_block + 1..,
-            )?
-            .into_sorted();
+            // FIXME: Temporarily commented out due to Sized overflow in reth v1.10.0
+            // This is a known issue with deep type recursion in HashedPostState::from_reverts
+            // TODO: Contact reth team or wait for a fix in later versions
+            // Original code:
+            // let mut hashed_state_reverts = HashedPostState::from_reverts::<KeccakKeyHasher>(
+            //     provider.tx_ref(),
+            //     from_block + 1..,
+            // )?
+            // .into_sorted();
+            tracing::warn!(
+                target: "provider::overlay",
+                "hashed_state_reverts collection is temporarily disabled due to compilation issues in reth v1.10.0"
+            );
+            let mut hashed_state_reverts = HashedPostState::default().into_sorted();
 
             // Extend with overlays if provided. If the reverts are empty we should just use the
             // overlays directly, because `extend_ref` will actually clone the overlay.

@@ -1,6 +1,6 @@
 use super::{DatabaseProviderRO, ProviderFactory, ProviderNodeTypes};
 use crate::{
-    providers::StaticFileProvider, AccountReader, BlockHashReader, BlockIdReader, BlockNumReader,
+    providers::{StaticFileProvider, StaticFileProviderRWRefMut}, AccountReader, BlockHashReader, BlockIdReader, BlockNumReader,
     BlockReader, BlockReaderIdExt, BlockSource, ChainSpecProvider, ChangeSetReader, HeaderProvider,
     ProviderError, PruneCheckpointReader, ReceiptProvider, ReceiptProviderIdExt,
     StageCheckpointReader, StateReader, StaticFileProviderFactory, TransactionVariant,
@@ -23,6 +23,7 @@ use reth_node_types::{BlockTy, HeaderTy, ReceiptTy, TxTy};
 use reth_primitives_traits::{Account, BlockBody, RecoveredBlock, SealedHeader, StorageEntry};
 use reth_prune_types::{PruneCheckpoint, PruneSegment};
 use reth_stages_types::{StageCheckpoint, StageId};
+use reth_static_file_types::StaticFileSegment;
 use reth_storage_api::{
     BlockBodyIndicesProvider, DatabaseProviderFactory, NodePrimitivesProvider, StateProvider,
     StorageChangeSetReader, TrieReader, TryIntoHistoricalStateProvider,
@@ -691,6 +692,14 @@ impl<N: ProviderNodeTypes> NodePrimitivesProvider for ConsistentProvider<N> {
 impl<N: ProviderNodeTypes> StaticFileProviderFactory for ConsistentProvider<N> {
     fn static_file_provider(&self) -> StaticFileProvider<N::Primitives> {
         self.storage_provider.static_file_provider()
+    }
+
+    fn get_static_file_writer(
+        &self,
+        block: BlockNumber,
+        segment: StaticFileSegment,
+    ) -> ProviderResult<StaticFileProviderRWRefMut<'_, Self::Primitives>> {
+        self.storage_provider.get_static_file_writer(block, segment)
     }
 }
 
@@ -1566,6 +1575,51 @@ impl<N: ProviderNodeTypes> ChangeSetReader for ConsistentProvider<N> {
 
             self.storage_provider.account_block_changeset(block_number)
         }
+    }
+
+    fn get_account_before_block(
+        &self,
+        block_number: BlockNumber,
+        address: Address,
+    ) -> ProviderResult<Option<AccountBeforeTx>> {
+        if let Some(state) = self
+            .head_block
+            .as_ref()
+            .and_then(|b| b.block_on_chain(block_number.into()))
+        {
+            let account_before = state
+                .block_ref()
+                .execution_output
+                .bundle
+                .reverts
+                .clone()
+                .to_plain_state_reverts()
+                .accounts
+                .into_iter()
+                .flatten()
+                .find(|(addr, _)| *addr == address)
+                .map(|(address, info)| AccountBeforeTx {
+                    address,
+                    info: info.map(Into::into),
+                });
+            Ok(account_before)
+        } else {
+            self.storage_provider.get_account_before_block(block_number, address)
+        }
+    }
+
+    fn account_changesets_range(
+        &self,
+        range: impl RangeBounds<BlockNumber>,
+    ) -> ProviderResult<Vec<(BlockNumber, AccountBeforeTx)>> {
+        // For changesets range, delegate to storage provider
+        // In-memory state doesn't have historical range data efficiently accessible
+        self.storage_provider.account_changesets_range(range)
+    }
+
+    fn account_changeset_count(&self) -> ProviderResult<usize> {
+        // Delegate to storage provider for the count
+        self.storage_provider.account_changeset_count()
     }
 }
 

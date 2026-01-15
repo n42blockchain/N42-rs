@@ -194,8 +194,6 @@ struct BeaconExecutionPayloadV1<'a> {
     base_fee_per_gas: U256,
     block_hash: Cow<'a, B256>,
     transactions: Cow<'a, [Bytes]>,
-    difficulty: Cow<'a, U256>,
-    nonce: Cow<'a, B64>,
 }
 
 impl<'a> From<BeaconExecutionPayloadV1<'a>> for ExecutionPayloadV1 {
@@ -214,8 +212,6 @@ impl<'a> From<BeaconExecutionPayloadV1<'a>> for ExecutionPayloadV1 {
             extra_data,
             base_fee_per_gas,
             block_hash,
-            difficulty,
-            nonce,
             transactions,
         } = payload;
         Self {
@@ -232,8 +228,6 @@ impl<'a> From<BeaconExecutionPayloadV1<'a>> for ExecutionPayloadV1 {
             extra_data: extra_data.into_owned(),
             base_fee_per_gas,
             block_hash: block_hash.into_owned(),
-            difficulty: difficulty.into_owned(),
-            nonce: nonce.into_owned(),
             transactions: transactions.into_owned(),
         }
     }
@@ -255,8 +249,6 @@ impl<'a> From<&'a ExecutionPayloadV1> for BeaconExecutionPayloadV1<'a> {
             extra_data,
             base_fee_per_gas,
             block_hash,
-            difficulty,
-            nonce,
             transactions,
         } = value;
 
@@ -274,8 +266,6 @@ impl<'a> From<&'a ExecutionPayloadV1> for BeaconExecutionPayloadV1<'a> {
             extra_data: Cow::Borrowed(extra_data),
             base_fee_per_gas: *base_fee_per_gas,
             block_hash: Cow::Borrowed(block_hash),
-            difficulty: Cow::Borrowed(difficulty),
-            nonce: Cow::Borrowed(nonce),
             transactions: Cow::Borrowed(transactions),
         }
     }

@@ -77,7 +77,7 @@ where
 pub async fn get_single_body<B, Client>(
     client: Client,
     header: SealedHeader<B::Header>,
-    consensus: impl Consensus<B, Error = ConsensusError>,
+    consensus: impl Consensus<B>,
 ) -> Result<SealedBlock<B>>
 where
     B: Block,

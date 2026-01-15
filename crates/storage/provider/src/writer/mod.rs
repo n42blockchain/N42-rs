@@ -170,8 +170,7 @@ where
         for ExecutedBlock {
             recovered_block,
             execution_output,
-            hashed_state,
-            trie_updates: trie,
+            trie_data,
         } in blocks
         {
             let _block_hash = recovered_block.hash();
@@ -184,10 +183,12 @@ where
                 .write_state(&execution_output, OriginalValuesKnown::No)?;
 
             // insert hashes and intermediate merkle nodes
-            self.database()
-                .write_hashed_state(&Arc::unwrap_or_clone(hashed_state).into_sorted())?;
-            self.database()
-                .write_trie_updates(Arc::unwrap_or_clone(trie))?;
+            if let Some(trie_data) = trie_data {
+                self.database()
+                    .write_hashed_state(&trie_data.hashed_state.into_sorted())?;
+                self.database()
+                    .write_trie_updates(trie_data.trie_updates)?;
+            }
         }
 
         // update history indices

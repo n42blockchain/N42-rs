@@ -324,7 +324,7 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
         let (new_state_root, trie_updates) = StateRoot::from_tx(&self.tx)
             .with_prefix_sets(prefix_sets)
             .root_with_updates()
-            .map_err(reth_db_api::DatabaseError::from)?;
+            .map_err(|e| ProviderError::Database(e.into()))?;
 
         let parent_number = range.start().saturating_sub(1);
         let parent_state_root = self
@@ -2959,7 +2959,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypes> HashingWriter for DatabaseProvi
             let (state_root, trie_updates) = StateRoot::from_tx(&self.tx)
                 .with_prefix_sets(prefix_sets)
                 .root_with_updates()
-                .map_err(reth_db_api::DatabaseError::from)?;
+                .map_err(|e| ProviderError::Database(e.into()))?;
             if state_root != expected_state_root {
                 return Err(ProviderError::StateRootMismatch(Box::new(RootMismatch {
                     root: GotExpected {

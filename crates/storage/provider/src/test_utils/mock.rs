@@ -97,6 +97,19 @@ impl<T: NodePrimitives> MockEthProvider<T, reth_chainspec::ChainSpec> {
             prune_modes: Default::default(),
         }
     }
+
+    /// Create a new, empty instance with chain spec
+    pub fn new_with_chain_spec(chain_spec: reth_chainspec::ChainSpec) -> Self {
+        Self {
+            blocks: Default::default(),
+            headers: Default::default(),
+            accounts: Default::default(),
+            chain_spec: Arc::new(chain_spec),
+            state_roots: Default::default(),
+            tx: Default::default(),
+            prune_modes: Default::default(),
+        }
+    }
 }
 
 impl<ChainSpec> MockEthProvider<reth_ethereum_primitives::EthPrimitives, ChainSpec> {

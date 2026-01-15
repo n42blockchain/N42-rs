@@ -1,3 +1,4 @@
+use tokio::time::Instant;
 use hex::FromHex;
 use reth_primitives_traits::AlloyBlockHeader;
 use blst::min_pk::SecretKey;
@@ -5,7 +6,7 @@ use reth_evm::execute::Executor;
 use revm_primitives::B256;
 use reth_primitives_traits::{RecoveredBlock, SealedBlock};
 use reth_evm_ethereum::EthEvmConfig;
-use reth_ethereum_primitives::{Block, Receipt};
+use reth_ethereum_primitives::{Block, EthPrimitives, Receipt};
 use reth_provider::test_utils::MockEthProvider;
 use reth_revm::{database::StateProviderDatabase,db::State};
 use reth_chainspec::{ChainSpecBuilder,N42_DEVNET,EthereumHardfork,ForkCondition,ChainSpec};
@@ -20,7 +21,7 @@ use jsonrpsee::ws_client::WsClientBuilder;
 use serde::{Deserialize, Serialize};
 use n42_clique::{BlockVerifyResult, UnverifiedBlock};
 use n42_primitives::{AttestationData};
-use tracing::{debug, info, warn, Level};
+use tracing::{trace, debug, info, warn, instrument, Level};
 
 pub mod deposit_exit;
 
@@ -93,13 +94,26 @@ pub async fn gen_block_verify_result(
     gen_block_verify_result_inner(block, &sk).await
 }
 
+#[instrument(
+    level = Level::DEBUG,
+    ret,
+    skip_all,
+    fields(pubkey = hex::encode(sk.sk_to_pk().to_bytes()), block_number=block.blockbody.header().number()),
+    )]
 async fn gen_block_verify_result_inner(block: UnverifiedBlock, sk: &SecretKey) -> eyre::Result<BlockVerifyResult> {
     let pk = sk.sk_to_pk();
-    debug!("Received block: {:?}, pk: {:?}, thread-id: {:?}", block.blockbody.header().number(), hex::encode(pk.to_bytes()), std::thread::current().id());
+    debug!("Received block, thread-id: {:?}", std::thread::current().id());
 
     let block_clone = block.clone();
 
-    if let Ok(receipts_root) = tokio::task::spawn_blocking(||verify(block_clone)).await? {
+    let start = Instant::now();
+    let verify_result = tokio::task::spawn_blocking(|| {
+        let result = verify(block_clone);
+        result
+    }).await;
+    let duration = start.elapsed();
+    debug!(?duration, "block verify");
+    if let Ok(receipts_root) = verify_result? {
         debug!("receipts_root: {:?}", receipts_root);
 
         let attestation_data = AttestationData {
@@ -112,9 +126,15 @@ async fn gen_block_verify_result_inner(block: UnverifiedBlock, sk: &SecretKey) -
         let bytes_slice: &[u8] = &bytes;
 
         let msg = bytes_slice;
+        let start = Instant::now();
         let sig = sk.sign(msg, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[]);
+        let duration = start.elapsed();
+        debug!(?duration, "bls sign");
 
+        let start = Instant::now();
         let err = sig.verify(true, msg, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[], &pk, true);
+        let duration = start.elapsed();
+        debug!(?duration, "bls verify");
         debug!("sig verify result: {:?}", err);
 
         let mut header = block.blockbody.header().clone();
@@ -139,12 +159,13 @@ async fn gen_block_verify_result_inner(block: UnverifiedBlock, sk: &SecretKey) -
     }
 }
 
+#[instrument(
+    level = Level::DEBUG,
+    ret,
+    skip_all,
+    )]
 fn verify(mut unverifiedblock:UnverifiedBlock) -> eyre::Result<B256> {
-    debug!("verify, {unverifiedblock:?}");
-    let provider_1=MockEthProvider::default();
-    let state=StateProviderDatabase::new(provider_1);
-    let db=
-        State::builder().with_database(unverifiedblock.db.as_db_mut(state)).build();
+    trace!(?unverifiedblock);
     let chain_spec = Arc::new(
         ChainSpecBuilder::from(&*N42_DEVNET)
             .shanghai_activated()
@@ -153,8 +174,11 @@ fn verify(mut unverifiedblock:UnverifiedBlock) -> eyre::Result<B256> {
                 ForkCondition::Timestamp(1))
             .build(),
     );
-    let provider=evm_config(chain_spec);
-    let mut executor = provider.batch_executor(db);
+    let mock_eth_provider: MockEthProvider<EthPrimitives> = MockEthProvider::new_with_chain_spec((*chain_spec).clone());
+    let state = StateProviderDatabase::new(mock_eth_provider);
+    let db = State::builder().with_database(unverifiedblock.db.as_db_mut(state)).build();
+    let evm_config = EthEvmConfig::new(chain_spec);
+    let mut executor =  evm_config.batch_executor(db);
     let mut receipts:Vec<Receipt>=Vec::new();
 
     // for test
@@ -180,8 +204,4 @@ fn verify(mut unverifiedblock:UnverifiedBlock) -> eyre::Result<B256> {
     }
 
     Ok(receipts_root)
-}
-
-fn evm_config(chain_spec: Arc<ChainSpec>) -> EthEvmConfig {
-    EthEvmConfig::new(chain_spec)
 }

@@ -493,10 +493,11 @@ where
                 }
 
                 let (_, beacon_state_after_withdrawal) = self.gen_withdrawals(parent.parent_hash)?;
-                let new_beacon_state = self.beacon.state_transition(beacon_state_after_withdrawal, &new_beacon_block)?;
+                let new_beacon_state = BeaconState::state_transition(&beacon_state_after_withdrawal, &new_beacon_block)?;
                 if new_beacon_state.hash_slow() != new_beacon_block.state_root {
                     return Err(eyre::eyre!("state root mismatch, new_beacon_state hash={:?}, new_beacon_block.state_root={:?}", new_beacon_state.hash_slow(), new_beacon_block.state_root));
                 }
+            self.provider.save_beacon_state_by_hash(&new_beacon_block_hash, new_beacon_state.clone())?;
             self.recent_beacon_states.insert(new_beacon_block_hash, new_beacon_state);
 
                 self.provider.save_beacon_block_by_hash(&new_beacon_block_hash, new_beacon_block.clone())?;
@@ -800,13 +801,19 @@ where
         };
         let (beacon_block, new_beacon_state) = self.beacon.gen_beacon_block(beacon_state_after_withdrawal, parent_beacon_block_hash, &attestations.values().cloned().collect(), &execution_requests, &block)?;
         let beacon_block_hash = beacon_block.hash_slow();
-        self.recent_beacon_states.insert(beacon_block_hash, new_beacon_state);
+        self.recent_beacon_states.insert(beacon_block_hash, new_beacon_state.clone());
         if let Some(v) = committee_cache {
             debug!(target: "consensus-client", "inserting committee_cache into lru for block hash {:?}", beacon_block_hash);
             self.recent_committee_caches.insert(beacon_block_hash, v);
         }
-        self.provider.save_beacon_block_by_hash(&beacon_block_hash, beacon_block.clone())?;
-        self.provider.save_beacon_block_hash_by_eth1_hash(&block.hash(), beacon_block_hash)?;
+        let beacon_provider = self.provider.clone();
+        let eth1_block_hash = block.hash();
+        let beacon_block_clone = beacon_block.clone();
+        tokio::task::spawn_blocking(move || {
+            beacon_provider.save_beacon_state_by_hash(&beacon_block_hash, new_beacon_state)?;
+            beacon_provider.save_beacon_block_by_hash(&beacon_block_hash, beacon_block_clone)?;
+            beacon_provider.save_beacon_block_hash_by_eth1_hash(&eth1_block_hash, beacon_block_hash)
+        }).await??;
         self.metrics.num_attestations_in_blocks_generated_by_this_node.increment(beacon_block.body.attestations.iter().map(|v|v.validator_indexes.len() as u64).sum());
 
         self.recent_blocks.insert(block.hash_slow(), block.clone());

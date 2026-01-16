@@ -296,8 +296,9 @@ where
                 self.provider.get_beacon_block_hash_by_eth1_hash(&block.header().parent_hash)?
                 .ok_or(eyre::eyre!("get_beacon_block_hash_by_eth1_hash failed, hash={:?}", block.header().parent_hash))?
             };
-            let (beacon_block, _) = self.beacon.gen_beacon_block(beacon_state_after_withdrawal, parent_beacon_block_hash, &attestations, &execution_requests, &block)?;
+            let (beacon_block, new_beacon_state) = self.beacon.gen_beacon_block(beacon_state_after_withdrawal, parent_beacon_block_hash, &attestations, &execution_requests, &block)?;
             let beacon_block_hash = beacon_block.hash_slow();
+            self.provider.save_beacon_state_by_hash(&beacon_block_hash, new_beacon_state)?;
             self.provider.save_beacon_block_by_hash(&beacon_block_hash, beacon_block.clone())?;
 
             self.provider.save_beacon_block_hash_by_eth1_hash(&block.hash(), beacon_block_hash)?;

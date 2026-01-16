@@ -70,22 +70,10 @@ where
             },
             ..Default::default()
         };
-        let beacon_state = self.state_transition(old_beacon_state, &beacon_block)?;
+        let beacon_state = BeaconState::state_transition(&old_beacon_state, &beacon_block)?;
         beacon_block.state_root = beacon_state.hash_slow();
         Ok((beacon_block, beacon_state))
     }
-
-    pub fn state_transition(&mut self, beacon_state: BeaconState, beacon_block: &BeaconBlock) -> eyre::Result<BeaconState> {
-        debug!(target: "consensus-client", ?beacon_block, "state_transition");
-        let new_beacon_state = BeaconState::state_transition(&beacon_state, beacon_block)?;
-        let beacon_block_with_root = BeaconBlock { state_root: new_beacon_state.hash_slow(), ..beacon_block.clone() };
-        let beacon_block_hash = beacon_block_with_root.hash_slow();
-        self.provider.save_beacon_state_by_hash(&beacon_block_hash, new_beacon_state.clone())?;
-        debug!(target: "consensus-client", ?beacon_block_hash, ?new_beacon_state, "state_transition");
-
-        Ok(new_beacon_state)
-    }
-
 }
 
 fn parse_execution_requests(requests: &Option<Requests>) -> eyre::Result<ExecutionRequestsV4> {

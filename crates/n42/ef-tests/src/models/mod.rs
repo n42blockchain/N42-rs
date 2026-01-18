@@ -11,10 +11,10 @@ pub mod transaction;
 mod transaction_test;
 
 pub use account::Account;
-pub use blockchain_test::{Block, BlockchainTest, GenesisBlockHeader};
+pub use blockchain_test::{Block, BlockchainTest, EngineNewPayload, ExecutionPayload, GenesisBlockHeader, Withdrawal};
 pub use header::Header;
 pub use state_test::{Environment, PostStateResult, StateTest, StateTestIndexes};
-pub use transaction::Transaction;
+pub use transaction::{AccessListItem, Authorization, BlockTransaction, Transaction};
 pub use transaction_test::{TransactionTest, TransactionTestResult};
 
 use alloy_primitives::{Bytes, B256, U256};

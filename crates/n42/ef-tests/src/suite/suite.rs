@@ -302,6 +302,8 @@ impl BlockchainTestSuite {
         let tests = self.discovery.load_blockchain_test_file(file_path)?;
         let mut results = Vec::new();
 
+        eprintln!("DEBUG: Loaded {} tests from {}", tests.len(), file_path.display());
+
         for (test_name, test) in &tests {
             // Check filter
             if let Some(f) = filter {
@@ -369,33 +371,49 @@ impl BlockchainTestSuite {
         let mut builder = TestReportBuilder::new(&self.name);
 
         let files = self.discovery.discover_files()?;
+        eprintln!("DEBUG: Discovered {} blockchain test files", files.len());
+        eprintln!("DEBUG: Parallel mode: {}", self.parallel);
         info!("Running {} blockchain test files", files.len());
 
         if self.parallel {
+            eprintln!("DEBUG: Using parallel execution");
             let results: Vec<_> = files
                 .par_iter()
-                .filter_map(|file| match self.run_test_file(file, filter) {
-                    Ok(results) => Some(results),
-                    Err(e) => {
-                        warn!("Error running test file {}: {}", file.display(), e);
-                        None
+                .filter_map(|file| {
+                    eprintln!("DEBUG: [parallel] Processing file: {}", file.display());
+                    match self.run_test_file(file, filter) {
+                        Ok(results) => {
+                            eprintln!("DEBUG: [parallel] Got {} results from file", results.len());
+                            Some(results)
+                        }
+                        Err(e) => {
+                            eprintln!("DEBUG: [parallel] Error running test file {}: {}", file.display(), e);
+                            warn!("Error running test file {}: {}", file.display(), e);
+                            None
+                        }
                     }
                 })
                 .flatten()
                 .collect();
 
+            eprintln!("DEBUG: Collected {} total results from parallel execution", results.len());
             for result in results {
                 builder.add_result(result);
             }
         } else {
-            for file in &files {
+            eprintln!("DEBUG: Using sequential execution");
+            eprintln!("DEBUG: files.len() = {}", files.len());
+            for (i, file) in files.iter().enumerate() {
+                eprintln!("DEBUG: [{}] Processing file: {}", i, file.display());
                 match self.run_test_file(file, filter) {
                     Ok(results) => {
+                        eprintln!("DEBUG: [{}] Got {} results from file", i, results.len());
                         for result in results {
                             builder.add_result(result);
                         }
                     }
                     Err(e) => {
+                        eprintln!("DEBUG: [{}] Error: {}", i, e);
                         warn!("Error running test file {}: {}", file.display(), e);
                     }
                 }

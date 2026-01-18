@@ -1,8 +1,9 @@
 //! Blockchain test model for EF tests
 
 use super::{
-    deserialize_b256, deserialize_b256_opt, deserialize_bytes, deserialize_u256,
-    deserialize_u256_opt, deserialize_u64, deserialize_u64_opt, Account, Header,
+    deserialize_b256, deserialize_b256_opt, deserialize_bytes,
+    deserialize_u256, deserialize_u256_opt, deserialize_u64, deserialize_u64_opt,
+    Account, Header,
 };
 use crate::models::transaction::BlockTransaction;
 use alloy_primitives::{Address, Bloom, Bytes, B256, B64, U256};
@@ -20,16 +21,25 @@ pub struct BlockchainTest {
     /// Network/fork name
     pub network: String,
 
-    /// Genesis block header
-    pub genesis_block_header: GenesisBlockHeader,
+    /// Genesis block header (optional for engine_x tests)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub genesis_block_header: Option<GenesisBlockHeader>,
 
-    /// Pre-state accounts
-    #[serde(deserialize_with = "deserialize_accounts")]
-    pub pre: HashMap<Address, Account>,
+    /// Pre-state accounts (optional when preHash is used)
+    #[serde(default, deserialize_with = "deserialize_accounts_opt")]
+    pub pre: Option<HashMap<Address, Account>>,
 
-    /// Expected post-state accounts
-    #[serde(deserialize_with = "deserialize_accounts")]
-    pub post_state: HashMap<Address, Account>,
+    /// Pre-state hash (for engine_x tests)
+    #[serde(rename = "preHash", default, skip_serializing_if = "Option::is_none")]
+    pub pre_hash: Option<String>,
+
+    /// Expected post-state accounts (optional when postStateHash is used)
+    #[serde(default, deserialize_with = "deserialize_accounts_opt")]
+    pub post_state: Option<HashMap<Address, Account>>,
+
+    /// Post-state hash (for engine_x tests)
+    #[serde(rename = "postStateHash", default, skip_serializing_if = "Option::is_none")]
+    pub post_state_hash: Option<String>,
 
     /// Expected last block hash
     #[serde(deserialize_with = "deserialize_b256")]
@@ -39,12 +49,22 @@ pub struct BlockchainTest {
     #[serde(default)]
     pub config: Option<BlockchainTestConfig>,
 
-    /// Genesis RLP
-    #[serde(rename = "genesisRLP", deserialize_with = "deserialize_bytes")]
-    pub genesis_rlp: Bytes,
+    /// Genesis RLP (optional, not present in engine tests)
+    #[serde(
+        rename = "genesisRLP",
+        default,
+        deserialize_with = "deserialize_bytes_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub genesis_rlp: Option<Bytes>,
 
-    /// Blocks to execute
+    /// Blocks to execute (for standard blockchain tests)
+    #[serde(default)]
     pub blocks: Vec<Block>,
+
+    /// Engine API payloads (for engine tests)
+    #[serde(rename = "engineNewPayloads", default, skip_serializing_if = "Option::is_none")]
+    pub engine_new_payloads: Option<Vec<EngineNewPayload>>,
 
     /// Seal engine type
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -298,6 +318,26 @@ where
         .collect()
 }
 
+/// Deserialize optional accounts map
+fn deserialize_accounts_opt<'de, D>(deserializer: D) -> Result<Option<HashMap<Address, Account>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt: Option<HashMap<String, Account>> = Deserialize::deserialize(deserializer)?;
+    match opt {
+        Some(map) => {
+            let result = map.into_iter()
+                .map(|(k, v)| {
+                    let addr = Address::from_str(&k).map_err(serde::de::Error::custom)?;
+                    Ok((addr, v))
+                })
+                .collect::<Result<HashMap<Address, Account>, D::Error>>()?;
+            Ok(Some(result))
+        }
+        None => Ok(None),
+    }
+}
+
 /// Deserialize optional bytes
 fn deserialize_bytes_opt<'de, D>(deserializer: D) -> Result<Option<Bytes>, D::Error>
 where
@@ -392,5 +432,135 @@ mod tests {
         assert_eq!(withdrawal.index, 0);
         assert_eq!(withdrawal.validator_index, 1);
         assert_eq!(withdrawal.amount, 100);
+    }
+}
+
+/// Engine API newPayload call
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineNewPayload {
+    /// Execution payload parameters: [payload, blob_versioned_hashes, parent_beacon_block_root]
+    pub params: serde_json::Value,
+    
+    /// Engine API newPayload version (e.g., "3" for post-Cancun)
+    #[serde(rename = "newPayloadVersion")]
+    pub new_payload_version: String,
+    
+    /// Engine API forkchoiceUpdated version
+    #[serde(rename = "forkchoiceUpdatedVersion")]
+    pub forkchoice_updated_version: String,
+}
+
+/// Execution payload for Engine API (similar to a block)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionPayload {
+    /// Parent block hash
+    #[serde(deserialize_with = "deserialize_b256")]
+    pub parent_hash: B256,
+    
+    /// Fee recipient (coinbase)
+    #[serde(deserialize_with = "deserialize_address")]
+    pub fee_recipient: Address,
+    
+    /// State root
+    #[serde(deserialize_with = "deserialize_b256")]
+    pub state_root: B256,
+    
+    /// Receipts root
+    #[serde(deserialize_with = "deserialize_b256")]
+    pub receipts_root: B256,
+    
+    /// Logs bloom
+    #[serde(deserialize_with = "deserialize_bloom")]
+    pub logs_bloom: Bloom,
+    
+    /// Previous RANDAO value
+    #[serde(deserialize_with = "deserialize_b256")]
+    pub prev_randao: B256,
+    
+    /// Block number
+    #[serde(deserialize_with = "deserialize_u64")]
+    pub block_number: u64,
+    
+    /// Gas limit
+    #[serde(deserialize_with = "deserialize_u64")]
+    pub gas_limit: u64,
+    
+    /// Gas used
+    #[serde(deserialize_with = "deserialize_u64")]
+    pub gas_used: u64,
+    
+    /// Timestamp
+    #[serde(deserialize_with = "deserialize_u64")]
+    pub timestamp: u64,
+    
+    /// Extra data
+    #[serde(deserialize_with = "deserialize_bytes")]
+    pub extra_data: Bytes,
+    
+    /// Base fee per gas (London+)
+    #[serde(deserialize_with = "deserialize_u256")]
+    pub base_fee_per_gas: U256,
+    
+    /// Block hash
+    #[serde(deserialize_with = "deserialize_b256")]
+    pub block_hash: B256,
+    
+    /// Transactions
+    pub transactions: Vec<String>,
+    
+    /// Withdrawals (Shanghai+)
+    #[serde(default)]
+    pub withdrawals: Vec<serde_json::Value>,
+    
+    /// Blob gas used (Cancun+)
+    #[serde(default, deserialize_with = "deserialize_u64_opt", skip_serializing_if = "Option::is_none")]
+    pub blob_gas_used: Option<u64>,
+    
+    /// Excess blob gas (Cancun+)
+    #[serde(default, deserialize_with = "deserialize_u64_opt", skip_serializing_if = "Option::is_none")]
+    pub excess_blob_gas: Option<u64>,
+}
+
+#[cfg(test)]
+mod engine_tests {
+    use super::*;
+    
+    #[test]
+    fn test_engine_api_format_parsing() {
+        let json = r#"{
+            "network": "Cancun",
+            "lastblockhash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "pre": {},
+            "postState": {},
+            "genesisBlockHeader": {
+                "parentHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "uncleHash": "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347",
+                "coinbase": "0x0000000000000000000000000000000000000000",
+                "stateRoot": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+                "transactionsTrie": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+                "receiptTrie": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+                "bloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+                "difficulty": "0x00",
+                "number": "0x00",
+                "gasLimit": "0x07270e00",
+                "gasUsed": "0x00",
+                "timestamp": "0x00",
+                "extraData": "0x00",
+                "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "nonce": "0x0000000000000000",
+                "baseFeePerGas": "0x07",
+                "hash": "0x0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            "engineNewPayloads": []
+        }"#;
+        
+        let test: BlockchainTest = serde_json::from_str(json).expect("Failed to parse engine test");
+        
+        assert_eq!(test.network, "Cancun");
+        assert!(test.blocks.is_empty());
+        assert!(test.engine_new_payloads.is_some());
+        assert_eq!(test.engine_new_payloads.unwrap().len(), 0);
     }
 }

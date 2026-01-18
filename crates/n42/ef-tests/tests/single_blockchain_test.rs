@@ -47,7 +47,7 @@ fn run_single_blockchain_test() {
     for (test_name, test) in &tests {
         eprintln!("Running test: {}", test_name);
         eprintln!("  Fork: {}", test.fork());
-        eprintln!("  Pre-state accounts: {}", test.pre.len());
+        eprintln!("  Pre-state accounts: {}", test.pre.as_ref().map_or(0, |p| p.len()));
         eprintln!("  Blocks: {}", test.blocks.len());
 
         let fork_spec = ForkSpec::from_name(test.fork()).expect("Invalid fork");

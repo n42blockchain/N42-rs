@@ -31,6 +31,26 @@ fn fixtures_path() -> PathBuf {
         .join("blockchain_tests")
 }
 
+/// Get the base fixtures path (parent of blockchain_tests)
+fn base_fixtures_path() -> PathBuf {
+    // Try environment variable first
+    if let Ok(path) = std::env::var("EF_TESTS_PATH") {
+        return PathBuf::from(path);
+    }
+
+    // Default path relative to the crate
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    PathBuf::from(manifest_dir)
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("ethereum-tests")
+        .join("fixtures")
+}
+
 /// Check if fixtures are available
 fn fixtures_available() -> bool {
     fixtures_path().exists()
@@ -53,7 +73,7 @@ fn test_blockchain_tests_berlin() {
 
     let suite = BlockchainTestSuite::new(berlin_path)
         .with_name("Berlin Blockchain Tests")
-        .with_forks(vec!["Berlin".to_string()])
+        // Don't filter by fork - run all forks in the berlin directory
         .with_parallel(false);
 
     eprintln!("Test count: {}", suite.test_count());
@@ -74,7 +94,6 @@ fn test_blockchain_tests_london() {
 
     let suite = BlockchainTestSuite::new(fixtures_path().join("london"))
         .with_name("London Blockchain Tests")
-        .with_forks(vec!["London".to_string()])
         .with_parallel(true);
 
     let report = suite.run_all().expect("Failed to run tests");
@@ -92,7 +111,6 @@ fn test_blockchain_tests_shanghai() {
 
     let suite = BlockchainTestSuite::new(fixtures_path().join("shanghai"))
         .with_name("Shanghai Blockchain Tests")
-        .with_forks(vec!["Shanghai".to_string()])
         .with_parallel(true);
 
     let report = suite.run_all().expect("Failed to run tests");
@@ -110,8 +128,53 @@ fn test_blockchain_tests_cancun() {
 
     let suite = BlockchainTestSuite::new(fixtures_path().join("cancun"))
         .with_name("Cancun Blockchain Tests")
-        .with_forks(vec!["Cancun".to_string()])
         .with_parallel(true);
+
+    let report = suite.run_all().expect("Failed to run tests");
+
+    println!("{}", report);
+}
+
+#[test]
+#[ignore = "Requires EF test fixtures to be downloaded"]
+fn test_blockchain_tests_engine() {
+    let base_path = base_fixtures_path().join("blockchain_tests_engine");
+
+    if !base_path.exists() {
+        eprintln!("Skipping test: blockchain_tests_engine not found at {:?}", base_path);
+        return;
+    }
+
+    eprintln!("Running tests from: {:?}", base_path);
+
+    let suite = BlockchainTestSuite::new(base_path)
+        .with_name("Engine API Blockchain Tests")
+        .with_parallel(true);
+
+    eprintln!("Test count: {}", suite.test_count());
+
+    let report = suite.run_all().expect("Failed to run tests");
+
+    println!("{}", report);
+}
+
+#[test]
+#[ignore = "Requires EF test fixtures to be downloaded"]
+fn test_blockchain_tests_engine_x() {
+    let base_path = base_fixtures_path().join("blockchain_tests_engine_x");
+
+    if !base_path.exists() {
+        eprintln!("Skipping test: blockchain_tests_engine_x not found at {:?}", base_path);
+        return;
+    }
+
+    eprintln!("Running tests from: {:?}", base_path);
+
+    let suite = BlockchainTestSuite::new(base_path)
+        .with_name("Extended Engine Blockchain Tests")
+        .with_parallel(true);
+
+    eprintln!("Test count: {}", suite.test_count());
 
     let report = suite.run_all().expect("Failed to run tests");
 
@@ -180,4 +243,33 @@ fn test_blockchain_sanity_check() {
     println!("  Passed: {}", report.summary.passed);
     println!("  Failed: {}", report.summary.failed);
     println!("  Skipped: {}", report.summary.skipped);
+}
+#[test]
+#[ignore]
+fn test_blockchain_tests_engine_berlin() {
+    use n42_ef_tests::suite::{BlockchainTestSuite, Suite};
+    use std::path::PathBuf;
+    
+    let base_path = PathBuf::from("/Users/jieliu/Documents/n42/N42-rs/ethereum-tests/fixtures/blockchain_tests_engine/berlin");
+
+    if !base_path.exists() {
+        eprintln!("Path not found: {:?}", base_path);
+        return;
+    }
+
+    eprintln!("Running tests from: {:?}", base_path);
+
+    let suite = BlockchainTestSuite::new(base_path)
+        .with_name("Engine Berlin Tests")
+        .with_parallel(false);
+
+    eprintln!("Test file count: {}", suite.test_count());
+
+    let report = suite.run_all().expect("Failed to run tests");
+
+    println!("{}", report);
+    eprintln!("Total: {}", report.summary.total());
+    eprintln!("Passed: {}", report.summary.passed);
+    eprintln!("Failed: {}", report.summary.failed);
+    eprintln!("Skipped: {}", report.summary.skipped);
 }

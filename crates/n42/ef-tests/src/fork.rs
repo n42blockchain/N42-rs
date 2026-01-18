@@ -53,7 +53,29 @@ pub enum ForkSpec {
 impl ForkSpec {
     /// Parse a fork name string into a ForkSpec
     pub fn from_name(name: &str) -> EfTestResult<Self> {
-        match name.to_lowercase().as_str() {
+        let normalized = name.to_lowercase();
+
+        // Handle fork transition tests (e.g., "CancunToPragueAtTime15k")
+        // These tests use the final fork in the transition
+        if normalized.contains("totime") {
+            // Extract the target fork from transition names
+            // Format: "{FromFork}To{ToFork}AtTime{Timestamp}"
+            if normalized.contains("topragueatt") {
+                return Ok(Self::Prague);
+            } else if normalized.contains("tocancunattime") {
+                return Ok(Self::Cancun);
+            } else if normalized.contains("toshanghaiattime") {
+                return Ok(Self::Shanghai);
+            } else if normalized.contains("toparisattime") {
+                return Ok(Self::Paris);
+            } else if normalized.contains("toberlinattime") {
+                return Ok(Self::Berlin);
+            }
+            // If we can't parse the transition, try to extract the last fork mentioned
+            // Fall through to standard parsing
+        }
+
+        match normalized.as_str() {
             "frontier" => Ok(Self::Frontier),
             "homestead" => Ok(Self::Homestead),
             "daofork" | "dao_fork" => Ok(Self::DaoFork),

@@ -10,6 +10,6 @@ debug = []
 ethereum_ssz = "0.9"
 ethereum_ssz_derive = "0.9"
 serde.workspace = true
-sha2 = "0.10.9"
+sha2 = { version = "0.10.9", features = ["asm"] }
 tree_hash = "0.10.0"
 typenum = "1.19.0"

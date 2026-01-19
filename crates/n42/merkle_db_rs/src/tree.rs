@@ -1430,4 +1430,25 @@ fn test_prune_after_set_updates() {
         }
     }
 
+    #[test]
+    fn test_single_push_time_capacity_100000() {
+        use std::time::Instant;
+        use typenum::U131072; // 2^17 = 131072, smallest power of 2 >= 100000
+
+        // Create a tree with capacity ~100000
+        let mut tree = VecTree::<u64, U131072>::try_new(0).unwrap();
+
+        // Measure single push time
+        let start = Instant::now();
+        tree.push(42u64).unwrap();
+        let elapsed = start.elapsed();
+
+        println!("\n========== Single Push Performance Test ==========");
+        println!("Tree capacity: 131072 (2^17)");
+        println!("Tree height: {}", tree.height);
+        println!("Single push time: {:?}", elapsed);
+        println!("==================================================\n");
+
+        assert_eq!(tree.len(), 1);
+    }
 }

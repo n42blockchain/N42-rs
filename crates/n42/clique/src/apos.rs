@@ -690,6 +690,7 @@ where
         &self,
         block: &RecoveredBlock<N::Block>,
         result: &BlockExecutionResult<N::Receipt>,
+        _receipt_root_bloom: Option<reth_consensus::ReceiptRootBloom>,
     ) -> Result<(), ConsensusError> {
         Ok(())
     }

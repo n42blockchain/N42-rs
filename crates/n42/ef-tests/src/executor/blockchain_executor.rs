@@ -278,6 +278,7 @@ impl BlockchainTestExecutor {
                         balance: U256::ZERO,
                         code_hash: alloy_primitives::keccak256(&history_storage_code),
                         code: Some(Bytecode::new_raw(history_storage_code)),
+                            account_id: None,
                     };
 
                     // Insert or update the account in cache
@@ -354,6 +355,7 @@ impl BlockchainTestExecutor {
                                     nonce: 0,
                                     code_hash: revm::primitives::KECCAK_EMPTY,
                                     code: None,
+                                    account_id: None,
                                 },
                                 storage: Default::default(),
                             });
@@ -376,6 +378,7 @@ impl BlockchainTestExecutor {
                                     nonce: initial_nonce,
                                     code_hash,
                                     code: None,
+                                    account_id: None,
                                 },
                                 storage: Default::default(),
                             });
@@ -392,6 +395,7 @@ impl BlockchainTestExecutor {
                             nonce: initial_nonce,
                             code_hash,
                             code: None,
+                            account_id: None,
                         };
                         // Insert into cache as a changed/created account
                         // Storage is left as default - the calculate_state_root function
@@ -427,6 +431,7 @@ impl BlockchainTestExecutor {
                                 nonce: 0,
                                 code_hash: revm::primitives::KECCAK_EMPTY,
                                 code: None,
+                                account_id: None,
                             },
                             storage: Default::default(),
                         });
@@ -439,6 +444,7 @@ impl BlockchainTestExecutor {
                         nonce: 0,
                         code_hash: revm::primitives::KECCAK_EMPTY,
                         code: None,
+                        account_id: None,
                     };
                     // Insert into cache as a newly created account
                     state_db.cache.accounts.insert(coinbase, CacheAccount {
@@ -818,6 +824,7 @@ impl BlockchainTestExecutor {
                 nonce: account.nonce,
                 code_hash: account.code_hash(),
                 code,
+                account_id: None,
             };
 
             db.insert_account_info(*address, account_info);

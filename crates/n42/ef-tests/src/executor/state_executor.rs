@@ -185,6 +185,7 @@ impl StateTestExecutor {
                 nonce: account.nonce,
                 code_hash: account.code_hash(),
                 code,
+                account_id: None,
             };
 
             db.insert_account_info(*address, account_info);

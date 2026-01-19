@@ -145,6 +145,10 @@ impl<'a, DB: Database, I: Inspector<EthEvmContext<&'a mut State<DB>>>> BlockExec
     fn evm_mut(&mut self) -> &mut Self::Evm {
         &mut self.evm
     }
+
+    fn receipts(&self) -> &[Self::Receipt] {
+        &[]
+    }
 }
 
 impl ConfigureEvm for MockEvmConfig {

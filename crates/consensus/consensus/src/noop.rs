@@ -51,6 +51,7 @@ impl<N: NodePrimitives> FullConsensus<N> for NoopConsensus {
         &self,
         _block: &RecoveredBlock<N::Block>,
         _result: &BlockExecutionResult<N::Receipt>,
+        _receipt_root_bloom: Option<crate::ReceiptRootBloom>,
     ) -> Result<(), ConsensusError> {
         Ok(())
     }

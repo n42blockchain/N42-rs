@@ -32,6 +32,9 @@ use reth_revm::cached::CachedReads;
 use std::collections::HashMap;
 use std::time::Duration;
 
+/// Pre-computed receipt root and logs bloom.
+pub type ReceiptRootBloom = (B256, Bloom);
+
 /// A consensus implementation that does nothing.
 pub mod noop;
 
@@ -52,10 +55,14 @@ pub trait FullConsensus<N: NodePrimitives>: Consensus<N::Block> {
     /// See the Yellow Paper sections 4.3.2 "Holistic Validity".
     ///
     /// Note: validating blocks does not include other validations of the Consensus
+    ///
+    /// The `receipt_root_bloom` parameter is an optional pre-computed receipt root and bloom,
+    /// this allows skipping the receipt root computation.
     fn validate_block_post_execution(
         &self,
         block: &RecoveredBlock<N::Block>,
         result: &BlockExecutionResult<N::Receipt>,
+        receipt_root_bloom: Option<ReceiptRootBloom>,
     ) -> Result<(), ConsensusError>;
 }
 

@@ -360,7 +360,7 @@ revm-inspectors = "0.34.0"
 alloy-chains = { version = "0.2.5", default-features = false }
 alloy-dyn-abi = "1.4.3"
 alloy-eip2124 = { version = "0.2.0", default-features = false }
-# alloy-evm = { git = "https://github.com/alloy-rs/evm", rev = "a69f0b45a6b0286e16072cb8399e02ce6ceca353", default-features = false }
+alloy-evm = { version = "0.26.3", default-features = false }
 alloy-primitives = { version = "1.5.0", default-features = false, features = ["map-foldhash"] }
 alloy-rlp = { version = "0.3.10", default-features = false, features = ["core-net", "derive"] }
 alloy-sol-macro = "1.5.0"

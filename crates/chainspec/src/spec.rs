@@ -1294,7 +1294,10 @@ Merge hard forks:
 Post-merge hard forks (timestamp based):
 - Shanghai                         @1681338455
 - Cancun                           @1710338135
-- Prague                           @1746612311"
+- Prague                           @1746612311
+- Osaka                            @1764798551
+- Bpo1                             @1765290071
+- Bpo2                             @1767747671"
         );
     }
 
@@ -1631,7 +1634,7 @@ Post-merge hard forks (timestamp based):
                     EthereumHardfork::Prague,
                     ForkId {
                         hash: ForkHash([0xc3, 0x76, 0xcf, 0x8b]),
-                        next: 0,
+                        next: 1764798551, // Osaka timestamp
                     },
                 ),
             ],
@@ -1738,7 +1741,7 @@ Post-merge hard forks (timestamp based):
                     EthereumHardfork::Prague,
                     ForkId {
                         hash: ForkHash([0xed, 0x88, 0xb5, 0xfd]),
-                        next: 0,
+                        next: 1760427360, // Osaka timestamp for Sepolia
                     },
                 ),
             ],
@@ -1913,10 +1916,10 @@ Post-merge hard forks (timestamp based):
                     },
                     ForkId {
                         hash: ForkHash([0xc3, 0x76, 0xcf, 0x8b]),
-                        next: 0,
+                        next: 1764798551, // Osaka timestamp
                     },
                 ),
-                // Future Prague block
+                // Future block (after all forks)
                 (
                     Head {
                         number: 20000002,
@@ -1924,7 +1927,7 @@ Post-merge hard forks (timestamp based):
                         ..Default::default()
                     },
                     ForkId {
-                        hash: ForkHash([0xc3, 0x76, 0xcf, 0x8b]),
+                        hash: ForkHash([0x07, 0xc9, 0x46, 0x2e]), // Bpo2 hash (final fork)
                         next: 0,
                     },
                 ),
@@ -1956,7 +1959,7 @@ Post-merge hard forks (timestamp based):
                     },
                     ForkId {
                         hash: ForkHash([0x09, 0x29, 0xe2, 0x4e]),
-                        next: 0,
+                        next: 1761677592, // Osaka timestamp for Hoodi
                     },
                 ),
             ],
@@ -2058,7 +2061,7 @@ Post-merge hard forks (timestamp based):
                     },
                     ForkId {
                         hash: ForkHash([0xdf, 0xbd, 0x9b, 0xed]),
-                        next: 0,
+                        next: 1759308480, // Osaka timestamp for Holesky
                     },
                 ),
             ],
@@ -2168,7 +2171,7 @@ Post-merge hard forks (timestamp based):
                     },
                     ForkId {
                         hash: ForkHash([0xed, 0x88, 0xb5, 0xfd]),
-                        next: 0,
+                        next: 1760427360, // Osaka timestamp for Sepolia
                     },
                 ),
             ],
@@ -2539,9 +2542,9 @@ Post-merge hard forks (timestamp based):
                     },
                     ForkId {
                         hash: ForkHash([0xc3, 0x76, 0xcf, 0x8b]),
-                        next: 0,
+                        next: 1764798551, // Osaka timestamp
                     },
-                ), // Future Prague block
+                ), // Future block (after all forks)
                 (
                     Head {
                         number: 20000004,
@@ -2549,7 +2552,7 @@ Post-merge hard forks (timestamp based):
                         ..Default::default()
                     },
                     ForkId {
-                        hash: ForkHash([0xc3, 0x76, 0xcf, 0x8b]),
+                        hash: ForkHash([0x07, 0xc9, 0x46, 0x2e]), // Bpo2 hash (final fork)
                         next: 0,
                     },
                 ),
@@ -3296,7 +3299,7 @@ Post-merge hard forks (timestamp based):
     fn latest_eth_mainnet_fork_id() {
         assert_eq!(
             ForkId {
-                hash: ForkHash([0xc3, 0x76, 0xcf, 0x8b]),
+                hash: ForkHash([0x07, 0xc9, 0x46, 0x2e]), // Updated for Bpo2 (latest fork)
                 next: 0
             },
             MAINNET.latest_fork_id()

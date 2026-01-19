@@ -267,7 +267,7 @@ mod fuzz_tests {
             AposError::InvalidVotingChain,
             AposError::UnauthorizedSigner,
             AposError::RecentlySigned,
-            AposError::UnTransion,
+            AposError::NoTransactions,
         ];
 
         for error in errors {

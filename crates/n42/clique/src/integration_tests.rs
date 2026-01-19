@@ -290,7 +290,7 @@ mod consensus_boundary_tests {
             AposError::InvalidVotingChain,
             AposError::UnauthorizedSigner,
             AposError::RecentlySigned,
-            AposError::UnTransion,
+            AposError::NoTransactions,
         ];
 
         // Ensure all errors can be formatted

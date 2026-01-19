@@ -456,6 +456,94 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
         Ok(())
     }
 
+    /// Pushes multiple values at once, computing shared ancestor hashes only once.
+    pub fn push_batch(&mut self, values: &[T]) -> Result<(), Error>
+    where T: Clone
+    {
+        if values.is_empty() {
+            return Ok(());
+        }
+
+        let start = self.len();
+        let new_len = start + values.len();
+
+        if new_len > N::to_usize() {
+            return Err(Error::VecLenTooLarge {
+                vec_len: new_len as u64,
+                limit: N::to_u64(),
+            });
+        }
+        let default_val = T::default();
+        if default_val.tree_hash_root() == zero_tree_root(0) {
+            self.kv.insert(zero_tree_root(0), Tree::Leaf(default_val));
+        }
+
+        // Insert leaves, collect hashes in order
+        let mut hashes: Vec<Hash256> = values.iter().map(|v| {
+            let h = v.tree_hash_root();
+            self.kv.insert(h, Tree::Leaf(v.clone()));
+            h
+        }).collect();
+
+        let mut level_start = start;
+
+        // Build up level by level
+        for level in 0..self.height {
+            let parent_start = level_start >> 1;
+            let parent_end = (level_start + hashes.len() - 1) >> 1;
+
+            let mut parent_hashes = Vec::with_capacity(parent_end - parent_start + 1);
+
+            for parent_idx in parent_start..=parent_end {
+                let left_idx = parent_idx << 1;
+                let right_idx = left_idx + 1;
+
+                let left = self.batch_get_hash(&hashes, level_start, left_idx, level);
+                let right = self.batch_get_hash(&hashes, level_start, right_idx, level);
+
+                let mut hasher = Sha256::new();
+                hasher.update(left.as_ref() as &[u8; 32]);
+                hasher.update(right.as_ref() as &[u8; 32]);
+                let parent = Hash256::from_slice(&hasher.finalize());
+
+                if parent == zero_tree_root(level + 1) {
+                    self.kv.insert(parent, Tree::Zero(level + 1));
+                } else {
+                    self.kv.insert(parent, Tree::Node { left, right });
+                }
+                parent_hashes.push(parent);
+            }
+
+            hashes = parent_hashes;
+            level_start = parent_start;
+        }
+
+        self.root = hashes[0];
+        self.vec_len = new_len as u64;
+        Ok(())
+    }
+
+    fn batch_get_hash(&self, hashes: &[Hash256], level_start: usize, idx: usize, level: usize) -> Hash256 {
+        if idx >= level_start && idx < level_start + hashes.len() {
+            hashes[idx - level_start]
+        } else {
+            self.get_hash_at_level(idx, level)
+        }
+    }
+
+    fn get_hash_at_level(&self, index: usize, level: usize) -> Hash256 {
+        let mut hash = self.root;
+        for h in (level + 1..=self.height).rev() {
+            match self.kv.get(&hash) {
+                Some(Tree::Node { left, right }) => {
+                    hash = if (index >> (h - 1 - level)) & 1 == 0 { *left } else { *right };
+                }
+                _ => return zero_tree_root(level),
+            }
+        }
+        hash
+    }
+
     pub fn pop(&mut self) -> Option<T>
     where
         T: Default + Clone,
@@ -1450,5 +1538,126 @@ fn test_prune_after_set_updates() {
         println!("==================================================\n");
 
         assert_eq!(tree.len(), 1);
+    }
+
+    #[test]
+    fn test_push_batch_basic() {
+        let mut tree = VecTree::<u64, U8>::try_new(0).unwrap();
+
+        tree.push_batch(&[10, 20, 30]).unwrap();
+
+        assert_eq!(tree.len(), 3);
+        assert_eq!(tree.get(0), Some(&10));
+        assert_eq!(tree.get(1), Some(&20));
+        assert_eq!(tree.get(2), Some(&30));
+    }
+
+    #[test]
+    fn test_push_batch_empty() {
+        let mut tree = VecTree::<u64, U8>::try_new(0).unwrap();
+        let empty: &[u64] = &[];
+
+        tree.push_batch(empty).unwrap();
+
+        assert_eq!(tree.len(), 0);
+    }
+
+    #[test]
+    fn test_push_batch_single() {
+        let mut tree = VecTree::<u64, U8>::try_new(0).unwrap();
+
+        tree.push_batch(&[42]).unwrap();
+
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree.get(0), Some(&42));
+    }
+
+    #[test]
+    fn test_push_batch_to_capacity() {
+        let mut tree = VecTree::<u64, U8>::try_new(0).unwrap();
+
+        tree.push_batch(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+
+        assert_eq!(tree.len(), 8);
+        for i in 0..8 {
+            assert_eq!(tree.get(i), Some(&((i + 1) as u64)));
+        }
+    }
+
+    #[test]
+    fn test_push_batch_overflow() {
+        let mut tree = VecTree::<u64, U8>::try_new(0).unwrap();
+
+        let result = tree.push_batch(&[1, 2, 3, 4, 5, 6, 7, 8, 9]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_push_batch_after_push() {
+        let mut tree = VecTree::<u64, U8>::try_new(0).unwrap();
+
+        tree.push(10).unwrap();
+        tree.push(20).unwrap();
+        tree.push_batch(&[30, 40, 50]).unwrap();
+
+        assert_eq!(tree.len(), 5);
+        assert_eq!(tree.get(0), Some(&10));
+        assert_eq!(tree.get(1), Some(&20));
+        assert_eq!(tree.get(2), Some(&30));
+        assert_eq!(tree.get(3), Some(&40));
+        assert_eq!(tree.get(4), Some(&50));
+    }
+
+    #[test]
+    fn test_push_batch_root_matches_individual_push() {
+        // Verify batch produces same root as individual pushes
+        let mut tree_batch = VecTree::<u64, U16>::try_new(0).unwrap();
+        let mut tree_individual = VecTree::<u64, U16>::try_new(0).unwrap();
+
+        let values: Vec<u64> = (0..10).collect();
+
+        tree_batch.push_batch(&values).unwrap();
+        for v in &values {
+            tree_individual.push(*v).unwrap();
+        }
+
+        assert_eq!(tree_batch.root(), tree_individual.root());
+        assert_eq!(tree_batch.ssz_root(), tree_individual.ssz_root());
+    }
+
+    #[test]
+    fn test_push_batch_perf_comparison() {
+        use std::time::Instant;
+        use typenum::U131072;
+
+        const BATCH_SIZE: usize = 100;
+        let values: Vec<u64> = (0..BATCH_SIZE as u64).collect();
+
+        // Individual pushes
+        let mut tree1 = VecTree::<u64, U131072>::try_new(0).unwrap();
+        let start1 = Instant::now();
+        for v in &values {
+            tree1.push(*v).unwrap();
+        }
+        let elapsed_individual = start1.elapsed();
+
+        // Batch push
+        let mut tree2 = VecTree::<u64, U131072>::try_new(0).unwrap();
+        let start2 = Instant::now();
+        tree2.push_batch(&values).unwrap();
+        let elapsed_batch = start2.elapsed();
+
+        // Verify correctness
+        assert_eq!(tree1.root(), tree2.root());
+
+        let speedup = elapsed_individual.as_nanos() as f64 / elapsed_batch.as_nanos() as f64;
+
+        println!("\n========== Batch Push Performance Test ==========");
+        println!("Batch size: {}", BATCH_SIZE);
+        println!("Individual pushes: {:?}", elapsed_individual);
+        println!("Batch push:        {:?}", elapsed_batch);
+        println!("Speedup:           {:.2}x", speedup);
+        println!("=================================================\n");
     }
 }

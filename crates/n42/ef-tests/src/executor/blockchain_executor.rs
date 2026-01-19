@@ -222,6 +222,7 @@ impl BlockchainTestExecutor {
                             balance: U256::ZERO,
                             code_hash: alloy_primitives::keccak256(&beacon_roots_code),
                             code: Some(Bytecode::new_raw(beacon_roots_code)),
+                            account_id: None,
                         };
 
                         // Insert or update the account in cache

@@ -74,6 +74,12 @@ impl<'a, R> WriteStateInput<'a, R> {
     }
 }
 
+impl<'a, R> From<&'a ExecutionOutcome<R>> for WriteStateInput<'a, R> {
+    fn from(outcome: &'a ExecutionOutcome<R>) -> Self {
+        WriteStateInput::Multiple(outcome)
+    }
+}
+
 /// Configuration for what to write when calling [`StateWriter::write_state`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StateWriteConfig {

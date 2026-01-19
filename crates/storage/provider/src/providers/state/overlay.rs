@@ -102,9 +102,9 @@ where
         provider: &F::Provider,
         requested_block: BlockNumber,
     ) -> ProviderResult<bool> {
-        // Get the MerkleChangeSets stage and prune checkpoints.
-        let stage_checkpoint = provider.get_stage_checkpoint(StageId::MerkleChangeSets)?;
-        let prune_checkpoint = provider.get_prune_checkpoint(PruneSegment::MerkleChangeSets)?;
+        // Get the MerkleExecute stage and prune checkpoints.
+        let stage_checkpoint = provider.get_stage_checkpoint(StageId::MerkleExecute)?;
+        let prune_checkpoint = provider.get_prune_checkpoint(PruneSegment::AccountHistory)?;
 
         // Get the upper bound from stage checkpoint
         let upper_bound = stage_checkpoint
@@ -194,11 +194,11 @@ where
             let mut hashed_state_reverts = HashedPostState::default().into_sorted();
 
             // Extend with overlays if provided. If the reverts are empty we should just use the
-            // overlays directly, because `extend_ref` will actually clone the overlay.
+            // overlays directly, because `extend_ref_and_sort` will actually clone the overlay.
             let trie_updates = match self.trie_overlay.as_ref() {
                 Some(trie_overlay) if trie_reverts.is_empty() => Arc::clone(trie_overlay),
                 Some(trie_overlay) => {
-                    trie_reverts.extend_ref(trie_overlay);
+                    trie_reverts.extend_ref_and_sort(trie_overlay);
                     Arc::new(trie_reverts)
                 }
                 None => Arc::new(trie_reverts),
@@ -209,7 +209,7 @@ where
                     Arc::clone(hashed_state_overlay)
                 }
                 Some(hashed_state_overlay) => {
-                    hashed_state_reverts.extend_ref(hashed_state_overlay);
+                    hashed_state_reverts.extend_ref_and_sort(hashed_state_overlay);
                     Arc::new(hashed_state_reverts)
                 }
                 None => Arc::new(hashed_state_reverts),

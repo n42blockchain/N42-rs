@@ -2034,11 +2034,25 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
 {
     type Receipt = ReceiptTy<N>;
 
-    fn write_state(
+    fn write_state<'a>(
         &self,
-        execution_outcome: &ExecutionOutcome<Self::Receipt>,
+        execution_outcome: impl Into<WriteStateInput<'a, Self::Receipt>>,
         is_value_known: OriginalValuesKnown,
-    ) -> ProviderResult<()> {
+        config: StateWriteConfig,
+    ) -> ProviderResult<()>
+    where
+        Self::Receipt: 'a,
+    {
+        let input: WriteStateInput<'a, Self::Receipt> = execution_outcome.into();
+
+        // Convert WriteStateInput to ExecutionOutcome for processing
+        let execution_outcome = match input {
+            WriteStateInput::Single { outcome, block } => {
+                ExecutionOutcome::from((outcome.clone(), block))
+            }
+            WriteStateInput::Multiple(outcome) => outcome.clone(),
+        };
+
         let first_block = execution_outcome.first_block();
         let block_count = execution_outcome.len() as u64;
         let last_block = execution_outcome.last_block();
@@ -3197,7 +3211,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockExecu
         // Update pipeline progress
         self.update_pipeline_stages(block, true)?;
 
-        Ok(Chain::new(blocks, execution_state, Default::default(), Default::default()))
+        Ok(Chain::new(blocks, execution_state, Default::default()))
     }
 
     fn remove_block_and_execution_above(&self, block: BlockNumber) -> ProviderResult<()> {
@@ -3483,7 +3497,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
             durations_recorder.record_relative(metrics::Action::InsertBlock);
         }
 
-        self.write_state(execution_outcome, OriginalValuesKnown::No)?;
+        self.write_state(execution_outcome, OriginalValuesKnown::No, StateWriteConfig::default())?;
         durations_recorder.record_relative(metrics::Action::InsertState);
 
         // insert hashes and intermediate merkle nodes

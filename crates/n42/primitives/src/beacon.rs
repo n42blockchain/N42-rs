@@ -1,3 +1,4 @@
+use std::time::Instant;
 use hex::FromHex;
 use tree_hash_derive::TreeHash;
 use tree_hash::TreeHash;
@@ -803,12 +804,14 @@ impl BeaconState {
 
     pub fn process_one_attestation(&mut self, attestation: &Attestation) -> eyre::Result<()> {
 
+        let start = Instant::now();
         self.verify_aggregate_signature(&attestation)?;
-        //self.epoch_attester_indexes.extend(attestation.validator_indexes.iter());
-        for validator_index in attestation.validator_indexes.iter() {
-            self.epoch_attester_indexes_store.push(*validator_index)?;
-            self.epoch_attester_indexes_set.insert(*validator_index);
-        }
+        let duration_verify_aggregate_signature = start.elapsed();
+        let indexes: Vec<u64> = attestation.validator_indexes.iter().copied().collect();
+        self.epoch_attester_indexes_store.push_batch(&indexes)?;
+        self.epoch_attester_indexes_set.extend(&attestation.validator_indexes);
+        let duration_process_one_attestation = start.elapsed();
+        debug!(?duration_verify_aggregate_signature, ?duration_process_one_attestation, "process_one_attestation");
 
         Ok(())
     }

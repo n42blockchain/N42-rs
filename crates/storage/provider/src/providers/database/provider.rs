@@ -14,9 +14,9 @@ use crate::{
     DBProvider, HashingWriter, HeaderProvider, HeaderSyncGapProvider, HistoricalStateProvider,
     HistoricalStateProviderRef, HistoryWriter, LatestStateProvider, LatestStateProviderRef,
     OriginalValuesKnown, ProviderError, PruneCheckpointReader, PruneCheckpointWriter, RevertsInit,
-    StageCheckpointReader, StateProviderBox, StateWriter, StaticFileProviderFactory, StatsReader,
-    StorageReader, StorageTrieWriter, TransactionVariant, TransactionsProvider,
-    TransactionsProviderExt, TrieReader, TrieWriter,
+    StageCheckpointReader, StateProviderBox, StateWriter, StateWriteConfig, StaticFileProviderFactory,
+    StatsReader, StorageReader, StorageTrieWriter, TransactionVariant, TransactionsProvider,
+    TransactionsProviderExt, TrieReader, TrieWriter, WriteStateInput,
 };
 use alloy_consensus::{
     transaction::{SignerRecoverable, TransactionMeta},
@@ -421,7 +421,14 @@ impl<TX: DbTx + DbTxMut + 'static, N: NodeTypesForProvider> DatabaseProvider<TX,
 
             // Write state and changesets to the database.
             // Must be written after blocks because of the receipt lookup.
-            self.write_state(executed_block.execution_outcome(), OriginalValuesKnown::No)?;
+            self.write_state(
+                WriteStateInput::Single {
+                    outcome: executed_block.execution_outcome(),
+                    block: block_number,
+                },
+                OriginalValuesKnown::No,
+                StateWriteConfig::default(),
+            )?;
 
             // insert hashes and intermediate merkle nodes and trie updates
             let hashed_state = executed_block.hashed_state();

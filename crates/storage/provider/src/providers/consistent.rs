@@ -1478,7 +1478,7 @@ impl<N: ProviderNodeTypes> StorageChangeSetReader for ConsistentProvider<N> {
             let changesets = state
                 .block()
                 .execution_output
-                .bundle
+                .state
                 .reverts
                 .clone()
                 .to_plain_state_reverts()
@@ -1538,7 +1538,7 @@ impl<N: ProviderNodeTypes> ChangeSetReader for ConsistentProvider<N> {
             let changesets = state
                 .block_ref()
                 .execution_output
-                .bundle
+                .state
                 .reverts
                 .clone()
                 .to_plain_state_reverts()
@@ -1590,7 +1590,7 @@ impl<N: ProviderNodeTypes> ChangeSetReader for ConsistentProvider<N> {
             let account_before = state
                 .block_ref()
                 .execution_output
-                .bundle
+                .state
                 .reverts
                 .clone()
                 .to_plain_state_reverts()
@@ -1653,8 +1653,9 @@ impl<N: ProviderNodeTypes> StateReader for ConsistentProvider<N> {
             .as_ref()
             .and_then(|b| b.block_on_chain(block.into()))
         {
-            let state = state.block_ref().execution_outcome().clone();
-            Ok(Some(state))
+            let execution_output = state.block_ref().execution_outcome().clone();
+            let outcome = ExecutionOutcome::from((execution_output, block));
+            Ok(Some(outcome))
         } else {
             Self::get_state(self, block..=block)
         }

@@ -229,6 +229,8 @@ impl<'a> From<BeaconExecutionPayloadV1<'a>> for ExecutionPayloadV1 {
             base_fee_per_gas,
             block_hash: block_hash.into_owned(),
             transactions: transactions.into_owned(),
+            difficulty: Default::default(),
+            nonce: Default::default(),
         }
     }
 }
@@ -250,6 +252,8 @@ impl<'a> From<&'a ExecutionPayloadV1> for BeaconExecutionPayloadV1<'a> {
             base_fee_per_gas,
             block_hash,
             transactions,
+            difficulty: _,
+            nonce: _,
         } = value;
 
         BeaconExecutionPayloadV1 {

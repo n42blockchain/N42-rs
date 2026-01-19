@@ -5,8 +5,8 @@
 use crate::StorageLocation;
 use crate::{
     providers::{StaticFileProvider, StaticFileWriter as SfWriter},
-    BlockExecutionWriter, BlockWriter, HistoryWriter, StateWriter, StaticFileProviderFactory,
-    TrieWriter,
+    BlockExecutionWriter, BlockWriter, HistoryWriter, StateWriter, StateWriteConfig,
+    StaticFileProviderFactory, TrieWriter, WriteStateInput,
 };
 use alloy_consensus::BlockHeader;
 use reth_chain_state::ExecutedBlock;
@@ -170,13 +170,21 @@ where
         for executed_block in blocks {
             let recovered_block = executed_block.recovered_block().clone();
             let _block_hash = recovered_block.hash();
+            let block_number = recovered_block.number();
             self.database()
                 .insert_block(recovered_block)?;
 
             // Write state and changesets to the database.
             // Must be written after blocks because of the receipt lookup.
             self.database()
-                .write_state(executed_block.execution_outcome(), OriginalValuesKnown::No)?;
+                .write_state(
+                    WriteStateInput::Single {
+                        outcome: executed_block.execution_outcome(),
+                        block: block_number,
+                    },
+                    OriginalValuesKnown::No,
+                    StateWriteConfig::default(),
+                )?;
 
             // insert hashes and intermediate merkle nodes
             let hashed_state = executed_block.hashed_state();

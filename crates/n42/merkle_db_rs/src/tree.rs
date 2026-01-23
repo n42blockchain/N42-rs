@@ -104,7 +104,7 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
 
             // CASE B: The branch has data and we've reached a Leaf
             if height == 0 {
-                // Elements is guaranteed to have the value because CASE A was skipped
+                // Elements slice is non-empty (CASE A would have handled empty), extract the value
                 let leaf_val = elements[0].clone();
                 let root = leaf_val.tree_hash_root();
                 kv.insert(root, Tree::Leaf(leaf_val));
@@ -200,18 +200,17 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
                 continue;
             }
 
-            // --- OPTIMIZATION START ---
-            // Check in-memory map first. If found, use it and skip DB.
+            // Try in-memory cache first, then fall back to database lookup
             let node_opt = existing_kv.get(&current_hash).cloned();
 
             let node = match node_opt {
                 Some(n) => n,
                 None => {
-                    // Not in memory, fetch from DB
+                    // Cache miss, fetch from database
                     match db_get(&current_hash) {
                         Some(n) => n,
                         None => {
-                            // Implicit zero node handling
+                            // Node not in DB - check if it's an implicit zero node
                             if current_hash == zero_tree_root(current_height) {
                                 if current_height == 0 && default_val.tree_hash_root() == zero_tree_root(0) {
                                     Tree::Leaf(T::default())
@@ -228,7 +227,6 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
                     }
                 }
             };
-            // --- OPTIMIZATION END ---
 
             match &node {
                 Tree::Node { left, right } => {
@@ -376,18 +374,14 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
                     };
 
                     if is_zero_node {
-                        // FIX: Collision Handling Logic
-                        // If we hit an empty subtree (Zero node), it usually means "empty".
-                        // BUT, if T::default() has the same hash as an empty leaf (ZeroHash),
-                        // then "empty" effectively means "filled with default values".
-                        //
-                        // We check if `kv` has a Leaf stored at `zero_tree_root(0)`.
-                        // `try_new` and `restore` guarantee this Leaf exists if collision is true.
+                        // Collision Handling: For collision types (where T::default() hashes to zero_tree_root(0)),
+                        // implicit zero branches logically contain default values per SSZ semantics.
+                        // Check if a collision leaf exists in the map and return it.
                         if let Some(Tree::Leaf(val)) = self.kv.get(&zero_tree_root(0)) {
                             return Some(val);
                         }
 
-                        // If no leaf found there, it's truly empty (non-collision type).
+                        // No collision leaf found - this is a truly empty slot (non-collision type).
                         return None;
                     }
 
@@ -442,16 +436,16 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
         let index = self.len();
         if index >= N::to_usize() {
             return Err(Error::VecLenTooLarge {
-                vec_len: self.vec_len + 1, // The length it would be
+                vec_len: self.vec_len + 1, // The new length after push would exceed capacity
                 limit: N::to_u64(),
             });
         }
 
-        // Update the tree *before* incrementing length.
-        // `update_leaf` has no bounds check, so this is safe.
+        // Update the tree structure before incrementing length.
+        // This ordering is safe because update_leaf() has no bounds checks.
         let _ = self.update_leaf(index, Some(value));
 
-        // Now, commit the length change
+        // Commit the length change after tree update succeeds
         self.vec_len += 1;
         Ok(())
     }
@@ -547,7 +541,7 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
 pub fn update_indices<F>(&mut self, indices: &HashSet<usize>, mut f: F) -> Result<(), Error>
     where
         F: FnMut(usize, &mut T),
-        T: Clone + Default + PartialEq, // Added PartialEq for efficient detection
+        T: Clone + Default + PartialEq, // PartialEq required to detect unchanged values and skip hashing
     {
         if indices.is_empty() {
             return Ok(());
@@ -690,11 +684,9 @@ pub fn update_indices<F>(&mut self, indices: &HashSet<usize>, mut f: F) -> Resul
         let default_hash = default_val.tree_hash_root();
         let zero_hash = zero_tree_root(0);
 
-        // LOGIC FIX:
-        // If Hash(Default) == Hash(Zero) (e.g. u64):
-        //    We MUST insert Leaf(Default) to keep the DB entry "Active" for other indices.
-        // If Hash(Default) != Hash(Zero) (e.g. complex struct):
-        //    We MUST insert Zero(0) (None) to ensure the padding hash is correct.
+        // Collision-aware restoration: For collision types (hash(default) == hash(empty)),
+        // store Leaf(default) to maintain the shared collision leaf for other uninitialized positions.
+        // For non-collision types, store Zero(0) to represent the empty slot.
         let old_value_opt = if default_hash == zero_hash {
              self.update_leaf(index, Some(default_val))
         } else {
@@ -811,19 +803,15 @@ pub fn update_indices<F>(&mut self, indices: &HashSet<usize>, mut f: F) -> Resul
 
         let mut new_node_hash;
         if let Some(ref value) = new_value {
-            // Standard SSZ: Hash is directly from the value.
+            // Store the value as a leaf, hash computed from the value itself
             new_node_hash = value.tree_hash_root();
             self.kv.insert(new_node_hash, Tree::Leaf(value.clone()));
         } else {
-            // Restoring to Zero / Default
+            // Restore to empty state - store Zero(0) node
+            // Note: The caller (pop/try_pop) is responsible for collision handling.
+            // For collision types, pop() passes Some(default), not None.
+            // For non-collision types, None is safe to use here.
             new_node_hash = zero_tree_root(0);
-
-            // If we are explicitly setting None, we check for collision again here?
-            // No, update_leaf is low-level. If caller passed None, they WANT Zero.
-            // But we must respect the collision rule: if Zero(0) and Leaf(Default) collide,
-            // we should technically store Leaf(Default) to be safe...
-            // BUT: pop() handles that logic. If pop() wanted Leaf(Default), it passed Some(Default).
-            // If pop() passed None, it means Hash(Default) != Hash(Zero), so Zero is safe.
             self.kv.insert(new_node_hash, Tree::Zero(0));
         }
 
@@ -920,7 +908,7 @@ pub struct VecTreeIter<'a, T: Value, N: Unsigned> {
     index: usize,
 }
 
-// If there are holes in the leaves, this iterator will return early, on the first Zero value
+// Note: For collision types, holes return defaults. For non-collision types, iteration stops at the first hole.
 impl<'a, T: Value, N: Unsigned> Iterator for VecTreeIter<'a, T, N> {
     type Item = &'a T;
 
@@ -2238,15 +2226,15 @@ fn test_prune_after_set_updates() {
 
         let indices: HashSet<usize> = (0..4).collect();
         tree.update_indices(&indices, |_, val| {
-            *val = 0; // Explicitly set to default
+            *val = 0;
         }).unwrap();
 
-        // All should read as 0
+        // Verify all positions read as default
         for i in 0..4 {
             assert_eq!(tree.get(i), Some(&0u64));
         }
 
-        // But tree root should still be zero_tree_root (SSZ semantics)
+        // Tree root should equal zero_tree_root (SSZ: defaults hash to empty tree)
         assert_eq!(tree.root(), zero_tree_root(3));
     }
 

@@ -5,9 +5,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::ptr;
 
-use ethers::types::{TransactionRequest, U256};
-use eyre::Result;
-use serde_json;
+use ethers::types::U256;
 
 use crate::blst_utils::generate_bls12_381_keypair;
 use crate::{
@@ -31,7 +29,15 @@ fn cstr_to_string(c: *const c_char) -> Result<String, String> {
 }
 
 fn make_c_string(s: String) -> *mut c_char {
-    CString::new(s).unwrap().into_raw()
+    match CString::new(s) {
+        Ok(cs) => cs.into_raw(),
+        Err(_) => {
+            // String contains null byte, replace with error message
+            CString::new("string contains null byte")
+                .expect("static string is valid")
+                .into_raw()
+        }
+    }
 }
 
 #[no_mangle]
@@ -75,11 +81,15 @@ pub extern "C" fn run_client_c(
     };
 
     // run the async function blocking
-    let res = tokio::runtime::Runtime::new()
-        .unwrap()
-        .block_on(run_client(&ws, &pk));
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            set_error(format!("failed to create runtime: {}", e));
+            return -1;
+        }
+    };
 
-    match res {
+    match runtime.block_on(run_client(&ws, &pk)) {
         Ok(()) => 0, // success
         Err(e) => {
             set_error(format!("{}", e));
@@ -248,10 +258,13 @@ pub extern "C" fn create_exit_unsigned_tx_c(
     } else {
         match cstr_to_string(fee_in_wei_or_empty) {
             Ok(s) if s.is_empty() => None,
-            Ok(s) => Some(s.parse::<U256>().unwrap_or_else(|_| {
-                set_error("invalid fee".into());
-                U256::zero()
-            })),
+            Ok(s) => match s.parse::<U256>() {
+                Ok(v) => Some(v),
+                Err(_) => {
+                    set_error("invalid fee".into());
+                    return ptr::null_mut();
+                }
+            },
             Err(e) => {
                 set_error(e);
                 return ptr::null_mut();

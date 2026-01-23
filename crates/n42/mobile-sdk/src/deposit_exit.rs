@@ -1,24 +1,16 @@
 // Copyright (c) 2017-2025 N42 Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use alloy_primitives::Address;
-use alloy_primitives::{FixedBytes, B256};
-use ethers::prelude::*;
-use hex::FromHex;
-use n42_primitives::DepositData;
-use serde::{Deserialize, Serialize};
-use ssz_derive::{Decode, Encode};
-use tree_hash::Hash256;
-use tree_hash::TreeHash;
-use tree_hash_derive::TreeHash;
-//use n42_withdrawals::chain_spec::ChainSpec;
+use alloy_primitives::{Address, B256};
 use blst::min_pk::SecretKey;
 use ethers::abi::Token;
-//use ethers::types::{Address, TransactionRequest, U256, NameOrAddress};
+use ethers::prelude::*;
 use ethers::types::{NameOrAddress, TransactionRequest, U256};
 use ethers::utils::keccak256;
-use ethers::utils::WEI_IN_ETHER;
+use hex::FromHex;
+use n42_primitives::DepositData;
 use tracing::debug;
+use tree_hash::TreeHash;
 
 pub use reth_chainspec::{DEVNET_DEPOSIT_CONTRACT_ADDRESS, TESTNET_DEPOSIT_CONTRACT_ADDRESS};
 
@@ -37,10 +29,9 @@ pub fn create_deposit_unsigned_tx(
         hex::decode(addr_hex).map_err(|e| eyre::eyre!("invalid withdrawal_address: {}", e))?;
     if addr_bytes.len() != 20 {
         return Err(eyre::eyre!(
-            "withdrawal_address is 20 bytes，but got {} bytes",
+            "withdrawal_address is 20 bytes, but got {} bytes",
             addr_bytes.len()
-        )
-        .into());
+        ));
     }
     let addr = Address::from_slice(&addr_bytes);
 
@@ -53,16 +44,18 @@ pub fn create_deposit_unsigned_tx(
     let sk = SecretKey::from_bytes(&Vec::from_hex(validator_private_key)?)
         .map_err(|e| eyre::eyre!("SecretKey::from_bytes() error {e:?}"))?;
     let pk = sk.sk_to_pk();
+    debug!("pubkey: {:?}", hex::encode(pk.to_bytes()));
 
-    let pubkey = pk;
-    debug!("pubkey: {:?}", hex::encode(pubkey.to_bytes()));
+    let amount_in_gwei = deposit_value_in_wei / U256::exp10(9);
+    if amount_in_gwei > U256::from(u64::MAX) {
+        return Err(eyre::eyre!("deposit amount too large to fit in u64"));
+    }
 
     let mut deposit_data = DepositData {
-        pubkey: alloy_primitives::FixedBytes(pubkey.to_bytes()),
+        pubkey: alloy_primitives::FixedBytes(pk.to_bytes()),
         withdrawal_credentials: creds,
-        //signature: SignatureBytes::empty(),
         signature: Default::default(),
-        amount: (deposit_value_in_wei / U256::exp10(9)).as_u64(),
+        amount: amount_in_gwei.as_u64(),
     };
     //let spec = ChainSpec::n42();
     deposit_data.signature = deposit_data.create_signature(
@@ -78,7 +71,7 @@ pub fn create_deposit_unsigned_tx(
     let selector = &keccak256("deposit(bytes,bytes,bytes,bytes32)".as_bytes())[0..4];
     // 2. Encode the function parameters
     let encoded_args = ethers::abi::encode(&[
-        Token::Bytes(pubkey.to_bytes().to_vec()),
+        Token::Bytes(pk.to_bytes().to_vec()),
         Token::Bytes(deposit_data.withdrawal_credentials.to_vec()),
         Token::Bytes(deposit_data.signature.to_vec()),
         Token::FixedBytes(root.to_vec()),
@@ -135,13 +128,21 @@ pub fn create_exit_unsigned_tx(
 
     let pubkey_hex = validator_public_key
         .strip_prefix("0x")
-        .unwrap_or(&validator_public_key);
+        .unwrap_or(validator_public_key);
     let pubkey_bytes =
         hex::decode(pubkey_hex).map_err(|e| eyre::eyre!("invalid validator_public_key: {}", e))?;
 
+    // BLS12-381 public key must be exactly 48 bytes
+    if pubkey_bytes.len() != 48 {
+        return Err(eyre::eyre!(
+            "validator_public_key must be 48 bytes, but got {} bytes",
+            pubkey_bytes.len()
+        ));
+    }
+
     let mut data = Vec::with_capacity(56);
     data.extend_from_slice(&pubkey_bytes);
-    data.extend_from_slice(&u64::min_value().to_be_bytes());
+    data.extend_from_slice(&u64::MIN.to_be_bytes());
 
     let tx = TransactionRequest {
         to: Some(contract_address.into()),

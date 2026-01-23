@@ -2,14 +2,38 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use ethers::types::U256;
-use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
-use jni::sys::jobject;
-use jni::sys::jstring;
+use jni::objects::{GlobalRef, JObject, JString};
+use jni::sys::{jobject, jstring};
 use jni::JNIEnv;
 use once_cell::sync::Lazy;
 use tokio::runtime::Runtime;
 
 use crate::blst_utils::generate_bls12_381_keypair;
+
+/// Helper to safely extract a Java string, throwing exception if null or invalid.
+fn get_required_string(
+    env: &mut JNIEnv<'_>,
+    s: &JString<'_>,
+    field_name: &str,
+) -> Result<String, ()> {
+    if s.is_null() {
+        let _ = env.throw_new(
+            "java/lang/IllegalArgumentException",
+            format!("{} cannot be null", field_name),
+        );
+        return Err(());
+    }
+    match env.get_string(s) {
+        Ok(js) => Ok(js.into()),
+        Err(_) => {
+            let _ = env.throw_new(
+                "java/lang/IllegalArgumentException",
+                format!("Failed to read {}", field_name),
+            );
+            Err(())
+        }
+    }
+}
 use crate::deposit_exit::{
     create_deposit_unsigned_tx, create_exit_unsigned_tx, create_get_exit_fee_unsigned_tx,
 };
@@ -21,28 +45,38 @@ static RUNTIME: Lazy<Runtime> =
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_com_mobileSdk_NativeBindings_createDepositUnsignedTx(
     mut env: jni::JNIEnv<'_>,
-    class: jni::objects::JClass<'_>,
+    _class: jni::objects::JClass<'_>,
     deposit_contract_address: JString<'_>,
     validator_private_key: JString<'_>,
     withdrawal_address: JString<'_>,
     deposit_value_wei_in_hex: JString<'_>,
 ) -> jstring {
-    let deposit_contract_address: String = env
-        .get_string(&deposit_contract_address)
-        .expect("Couldn't get Java string from deposit_contract_address!")
-        .into();
-    let validator_private_key: String = env
-        .get_string(&validator_private_key)
-        .expect("Couldn't get Java string from validator_private_key!")
-        .into();
-    let withdrawal_address: String = env
-        .get_string(&withdrawal_address)
-        .expect("Couldn't get Java string from withdrawal_address!")
-        .into();
-    let deposit_value_wei_in_hex: String = env
-        .get_string(&deposit_value_wei_in_hex)
-        .expect("Couldn't get Java string from deposit_value_wei_in_hex!")
-        .into();
+    let deposit_contract_address = match get_required_string(
+        &mut env,
+        &deposit_contract_address,
+        "deposit_contract_address",
+    ) {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let validator_private_key =
+        match get_required_string(&mut env, &validator_private_key, "validator_private_key") {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        };
+    let withdrawal_address =
+        match get_required_string(&mut env, &withdrawal_address, "withdrawal_address") {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        };
+    let deposit_value_wei_in_hex = match get_required_string(
+        &mut env,
+        &deposit_value_wei_in_hex,
+        "deposit_value_wei_in_hex",
+    ) {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
     let deposit_value_wei = match deposit_value_wei_in_hex.parse::<U256>() {
         Ok(v) => v,
         Err(e) => {
@@ -83,7 +117,7 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_createDepositUnsignedTx(
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_com_mobileSdk_NativeBindings_generateBls12381Keypair(
     mut env: jni::JNIEnv<'_>,
-    class: jni::objects::JClass<'_>,
+    _class: jni::objects::JClass<'_>,
 ) -> jstring {
     let key_pair = match generate_bls12_381_keypair() {
         Ok(v) => v,
@@ -111,7 +145,7 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_generateBls12381Keypair(
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_com_mobileSdk_NativeBindings_createGetExitFeeUnsignedTx(
     mut env: jni::JNIEnv<'_>,
-    class: jni::objects::JClass<'_>,
+    _class: jni::objects::JClass<'_>,
 ) -> jstring {
     let transaction_request = match create_get_exit_fee_unsigned_tx() {
         Ok(v) => v,
@@ -139,19 +173,26 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_createGetExitFeeUnsignedTx(
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_com_mobileSdk_NativeBindings_createExitUnsignedTx(
     mut env: jni::JNIEnv<'_>,
-    class: jni::objects::JClass<'_>,
+    _class: jni::objects::JClass<'_>,
     validator_public_key: JString<'_>,
     exit_fee_in_wei_in_hex: JString<'_>,
 ) -> jstring {
-    let validator_public_key: String = env
-        .get_string(&validator_public_key)
-        .expect("Couldn't get Java string from validator_public_key!")
-        .into();
+    let validator_public_key =
+        match get_required_string(&mut env, &validator_public_key, "validator_public_key") {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        };
     let fee = if !exit_fee_in_wei_in_hex.is_null() {
-        let exit_fee_in_wei_in_hex: String = env
-            .get_string(&exit_fee_in_wei_in_hex)
-            .expect("Couldn't get Java string from exit_fee_in_wei_in_hex!")
-            .into();
+        let exit_fee_in_wei_in_hex = match env.get_string(&exit_fee_in_wei_in_hex) {
+            Ok(s) => String::from(s),
+            Err(_) => {
+                let _ = env.throw_new(
+                    "java/lang/IllegalArgumentException",
+                    "Failed to read exit_fee_in_wei_in_hex",
+                );
+                return std::ptr::null_mut();
+            }
+        };
 
         let exit_fee_in_wei = match exit_fee_in_wei_in_hex.parse::<U256>() {
             Ok(v) => v,
@@ -193,29 +234,52 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_createExitUnsignedTx(
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_com_mobileSdk_NativeBindings_runClient(
     mut env: jni::JNIEnv<'_>,
-    class: jni::objects::JClass<'_>,
+    _class: jni::objects::JClass<'_>,
     ws_url: JString<'_>,
     validator_private_key: JString<'_>,
 ) -> jobject {
-    let ws_url: String = env
-        .get_string(&ws_url)
-        .expect("Couldn't get Java string from ws_url!")
-        .into();
-    let validator_private_key: String = env
-        .get_string(&validator_private_key)
-        .expect("Couldn't get Java string from validator_private_key!")
-        .into();
+    let ws_url = match get_required_string(&mut env, &ws_url, "ws_url") {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let validator_private_key =
+        match get_required_string(&mut env, &validator_private_key, "validator_private_key") {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        };
 
     // Create a new CompletableFuture object in Java
-    let cf_class = env
-        .find_class("java/util/concurrent/CompletableFuture")
-        .unwrap();
-    let cf_obj = env.new_object(cf_class, "()V", &[]).unwrap();
+    let cf_class = match env.find_class("java/util/concurrent/CompletableFuture") {
+        Ok(c) => c,
+        Err(_) => {
+            let _ = env.throw_new("java/lang/RuntimeException", "Failed to find CompletableFuture class");
+            return std::ptr::null_mut();
+        }
+    };
+    let cf_obj = match env.new_object(cf_class, "()V", &[]) {
+        Ok(o) => o,
+        Err(_) => {
+            let _ = env.throw_new("java/lang/RuntimeException", "Failed to create CompletableFuture");
+            return std::ptr::null_mut();
+        }
+    };
 
     // Promote CompletableFuture to a global ref so it outlives this JNI call
-    let global_cf: GlobalRef = env.new_global_ref(&cf_obj).unwrap();
+    let global_cf: GlobalRef = match env.new_global_ref(&cf_obj) {
+        Ok(g) => g,
+        Err(_) => {
+            let _ = env.throw_new("java/lang/RuntimeException", "Failed to create global ref");
+            return std::ptr::null_mut();
+        }
+    };
 
-    let jvm = env.get_java_vm().unwrap();
+    let jvm = match env.get_java_vm() {
+        Ok(j) => j,
+        Err(_) => {
+            let _ = env.throw_new("java/lang/RuntimeException", "Failed to get JVM");
+            return std::ptr::null_mut();
+        }
+    };
 
     // Spawn async task
     RUNTIME.spawn(async move {
@@ -227,13 +291,12 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_runClient(
         match result {
             Ok(()) => {
                 // Call CompletableFuture.complete(null)
-                env.call_method(
+                let _ = env.call_method(
                     &global_cf,
                     "complete",
                     "(Ljava/lang/Object;)Z",
                     &[(&JObject::null()).into()],
-                )
-                .unwrap();
+                );
             }
 
             Err(e) => {
@@ -243,24 +306,14 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_runClient(
                     .new_object(ex_class, "(Ljava/lang/String;)V", &[(&jmsg).into()])
                     .unwrap();
 
-                env.call_method(
+                let _ = env.call_method(
                     &global_cf,
                     "completeExceptionally",
                     "(Ljava/lang/Throwable;)Z",
                     &[(&JObject::from(ex_obj)).into()],
-                )
-                .unwrap();
+                );
             }
-        };
-
-        // Call CompletableFuture.complete(null)
-        env.call_method(
-            &global_cf,
-            "complete",
-            "(Ljava/lang/Object;)Z",
-            &[(&JObject::null()).into()],
-        )
-        .unwrap();
+        }
     });
 
     cf_obj.into_raw() // return CompletableFuture immediately

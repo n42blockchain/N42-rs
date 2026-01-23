@@ -190,7 +190,7 @@ async fn main() -> eyre::Result<()> {
         Commands::Validate {
             validator_private_key,
             ws_rpc_url,
-            common,
+            common: _,
         } => {
             validate(validator_private_key.as_deref(), &ws_rpc_url).await?;
         }
@@ -255,16 +255,20 @@ async fn deposit(
 ) -> eyre::Result<()> {
     let sk = match validator_private_key {
         Some(validator_private_key) => {
-            let sk =
-                SecretKey::from_bytes(&Vec::from_hex(&validator_private_key).unwrap()).unwrap();
-            sk
+            let bytes = Vec::from_hex(validator_private_key)
+                .map_err(|e| eyre::eyre!("invalid validator_private_key hex: {}", e))?;
+            SecretKey::from_bytes(&bytes)
+                .map_err(|e| eyre::eyre!("invalid validator_private_key: {:?}", e))?
         }
         None => {
-            let mut rng = ::rand::thread_rng();
+            let mut rng = ::rand::rng();
             let mut ikm = [0u8; 32];
             rng.fill_bytes(&mut ikm);
 
-            let sk = SecretKey::key_gen(&ikm, &[]).unwrap();
+            let sk = SecretKey::key_gen(&ikm, &[])
+                .map_err(|e| eyre::eyre!("SecretKey::key_gen() error: {:?}", e))?;
+            // Securely clear the input key material
+            ikm.fill(0);
             // Note: Private key not logged for security reasons
             info!("generated new validator private key");
             sk
@@ -344,7 +348,10 @@ async fn deposit_multiple(
         .get_transaction_count(wallet_address, Some(BlockNumber::Pending.into()))
         .await?;
     for (withdrawal_address, validator_private_key) in credentials {
-        let sk = SecretKey::from_bytes(&Vec::from_hex(&validator_private_key).unwrap()).unwrap();
+        let bytes = Vec::from_hex(validator_private_key)
+            .map_err(|e| eyre::eyre!("invalid validator_private_key hex: {}", e))?;
+        let sk = SecretKey::from_bytes(&bytes)
+            .map_err(|e| eyre::eyre!("invalid validator_private_key: {:?}", e))?;
         let mut unsigned_tx = create_deposit_unsigned_tx(
             deposit_contract_address,
             &hex::encode(&sk.to_bytes()),
@@ -439,11 +446,14 @@ fn generate_credentials(number_of_validators: u64) -> eyre::Result<()> {
 }
 
 fn generate_credential() -> ValidatorCredential {
-    let mut rng = ::rand::thread_rng();
+    let mut rng = ::rand::rng();
     let mut ikm = [0u8; 32];
     rng.fill_bytes(&mut ikm);
 
-    let validator_private_key = SecretKey::key_gen(&ikm, &[]).unwrap();
+    let validator_private_key = SecretKey::key_gen(&ikm, &[])
+        .expect("SecretKey::key_gen() should not fail with 32 random bytes");
+    // Securely clear the input key material
+    ikm.fill(0);
     let validator_public_key = hex::encode(validator_private_key.sk_to_pk().to_bytes());
 
     let wallet = LocalWallet::new(&mut ethers::core::rand::thread_rng());
@@ -493,19 +503,22 @@ async fn deposit_for_validators(
     Ok(validator_credentials.len() as u64)
 }
 
-async fn validate(validator_private_key: Option<&str>, rpc_url: &str) -> eyre::Result<()> {
+async fn validate(validator_private_key: Option<&str>, ws_rpc_url: &str) -> eyre::Result<()> {
     let validator_private_key = match validator_private_key {
         Some(v) => v.to_owned(),
         None => {
-            let mut rng = ::rand::thread_rng();
+            let mut rng = ::rand::rng();
             let mut ikm = [0u8; 32];
             rng.fill_bytes(&mut ikm);
 
-            let sk = SecretKey::key_gen(&ikm, &[]).unwrap();
+            let sk = SecretKey::key_gen(&ikm, &[])
+                .map_err(|e| eyre::eyre!("SecretKey::key_gen() error: {:?}", e))?;
+            // Securely clear the input key material
+            ikm.fill(0);
             hex::encode(sk.to_bytes())
         }
     };
-    while let Err(e) = run_client(&rpc_url, &validator_private_key).await {
+    while let Err(e) = run_client(ws_rpc_url, &validator_private_key).await {
         info!("run_client error: {e}, retrying...");
         sleep(Duration::from_secs(5)).await;
     }
@@ -539,10 +552,10 @@ async fn exit_for_validators(
     let mut num_successes = 0;
     for validator_credential in validator_credentials {
         let ValidatorCredential {
-            validator_private_key,
+            validator_private_key: _,
             validator_public_key,
             withdrawal_private_key,
-            withdrawal_address,
+            withdrawal_address: _,
         } = validator_credential;
         match exit(withdrawal_private_key, rpc_url, validator_public_key).await {
             Ok(_) => {

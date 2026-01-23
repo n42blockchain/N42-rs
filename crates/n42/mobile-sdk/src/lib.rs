@@ -5,19 +5,17 @@ use jsonrpsee::core::client::Subscription;
 use jsonrpsee::core::client::{ClientT, SubscriptionClientT};
 use jsonrpsee::rpc_params;
 use jsonrpsee::ws_client::WsClientBuilder;
-use n42_clique::{BlockVerifyResult, UnverifiedBlock};
+use n42_clique::UnverifiedBlock;
 use n42_primitives::AttestationData;
 use reth_chainspec::{ChainSpec, ChainSpecBuilder, EthereumHardfork, ForkCondition, N42_DEVNET};
 use reth_ethereum_primitives::{Block, Receipt};
 use reth_evm::execute::Executor;
 use reth_evm::ConfigureEvm;
 use reth_evm_ethereum::EthEvmConfig;
-use reth_primitives_traits::AlloyBlockHeader;
-use reth_primitives_traits::{RecoveredBlock, SealedBlock};
+use reth_primitives_traits::{AlloyBlockHeader, RecoveredBlock, SealedBlock};
 use reth_provider::test_utils::MockEthProvider;
 use reth_revm::{database::StateProviderDatabase, db::State};
 use revm_primitives::B256;
-use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
 use tokio::time::timeout;
 
@@ -127,8 +125,6 @@ pub async fn run_client(ws_url: &str, validator_private_key: &str) -> eyre::Resu
 
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
-
-    Ok(())
 }
 
 fn verify(mut unverifiedblock: UnverifiedBlock) -> eyre::Result<B256> {
@@ -157,7 +153,10 @@ fn verify(mut unverifiedblock: UnverifiedBlock) -> eyre::Result<B256> {
             println!("success, {result:?}");
             receipts = result.receipts;
         }
-        Err(e) => println!("Error during execution: {:?}", e),
+        Err(e) => {
+            println!("Error during execution: {:?}", e);
+            return Err(eyre::eyre!("Block execution failed: {:?}", e));
+        }
     }
     println!("{receipts:?}");
     let receipts_root = Receipt::calculate_receipt_root_no_memo(&receipts);

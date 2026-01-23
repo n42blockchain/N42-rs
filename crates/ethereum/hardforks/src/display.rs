@@ -29,6 +29,7 @@ struct DisplayFork {
     /// An optional EIP (e.g. `EIP-1559`).
     eip: Option<String>,
     /// Optional metadata string
+    #[allow(dead_code)]
     metadata: Option<String>,
 }
 

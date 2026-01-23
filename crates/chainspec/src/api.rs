@@ -9,7 +9,7 @@ use alloy_eips::{eip1559::BaseFeeParams, eip7840::BlobParams};
 use alloy_genesis::Genesis;
 use alloy_primitives::{B256, U256};
 use core::fmt::{Debug, Display};
-use reth_ethereum_forks::{beijing_fork, EthereumHardforks, Hardfork};
+use reth_ethereum_forks::{BEIJING_FORK, EthereumHardforks, Hardfork};
 use reth_network_peers::NodeRecord;
 
 /// Trait representing type configuring a chain spec.
@@ -156,6 +156,6 @@ impl EthChainSpec for ChainSpec {
     }
 
     fn is_n42_attestation_mandatory(&self, timestamp: u64) -> bool {
-        self.fork(beijing_fork).active_at_timestamp(timestamp)
+        self.fork(BEIJING_FORK).active_at_timestamp(timestamp)
     }
 }

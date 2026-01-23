@@ -3,9 +3,9 @@
 
 #![allow(missing_docs)]
 use crate::{is_compounding_withdrawal_credential, BLSPubkey, ChainSpec, Epoch, Gwei};
-use alloy_primitives::{Address, BlockNumber, Bytes, B256};
+use alloy_primitives::{Address, B256};
 use serde::{Deserialize, Serialize};
-use ssz::{Decode, Encode};
+use ssz::Encode;
 use ssz_derive::{Decode, Encode};
 use tree_hash_derive::TreeHash;
 
@@ -13,6 +13,14 @@ use tree_hash_derive::TreeHash;
 pub struct ValidatorBeforeTx {
     pub address: Address,
     pub info: Option<Validator>,
+}
+
+impl reth_primitives_traits::ValueWithSubKey for ValidatorBeforeTx {
+    type SubKey = Address;
+
+    fn get_subkey(&self) -> Self::SubKey {
+        self.address
+    }
 }
 #[derive(Debug)]
 pub struct ValidatorChangeset {

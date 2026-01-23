@@ -282,6 +282,7 @@ where
 impl<N> Node<N> for N42Node
 where
     N: FullNodeTypes<Types = Self>,
+    <<N as FullNodeTypes>::Provider as reth_provider::DatabaseProviderFactory>::Provider: reth_provider::TrieReader,
 {
     type ComponentsBuilder = ComponentsBuilder<
         N,
@@ -307,7 +308,10 @@ where
     }
 }
 
-impl<N: FullNodeComponents<Types = Self>> DebugNode<N> for N42Node {
+impl<N: FullNodeComponents<Types = Self>> DebugNode<N> for N42Node
+where
+    <<N as FullNodeTypes>::Provider as reth_provider::DatabaseProviderFactory>::Provider: reth_provider::TrieReader,
+{
     type RpcBlock = alloy_rpc_types_eth::Block;
 
     fn rpc_to_primitive_block(rpc_block: Self::RpcBlock) -> reth_ethereum_primitives::Block {

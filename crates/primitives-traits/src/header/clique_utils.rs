@@ -75,6 +75,10 @@ pub fn recover_address(header: &Header) -> Result<Address, Box<dyn Error>> {
     ))
 }
 
+/// Recovers the signer address from a Clique header's signature.
+///
+/// This function extracts the ECDSA signature from the header's extra data and recovers
+/// the Ethereum address of the signer who sealed the block.
 pub fn recover_address_generic<H>(header: &H) -> Result<Address, Box<dyn Error>>
 where
     H: BlockHeaderTrait,
@@ -98,6 +102,10 @@ where
     ))
 }
 
+/// Computes the hash that should be signed for a Clique header.
+///
+/// This creates a modified version of the header with the signature portion of the extra data
+/// zeroed out, then returns its hash. This is the hash that validators sign.
 pub fn seal_hash_generic<H>(header: &H) -> B256
 where
     H: BlockHeaderTrait,

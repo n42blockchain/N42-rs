@@ -11,13 +11,13 @@ use std::sync::Arc;
 
 /// Combined trait for N42 consensus that includes both FullConsensus and SignerManager.
 pub trait N42FullConsensus:
-    FullConsensus<EthPrimitives, Error = ConsensusError> + SignerManager
+    FullConsensus<EthPrimitives> + SignerManager
 {
 }
 
 // Blanket implementation for any type that implements both traits
 impl<T> N42FullConsensus for T where
-    T: FullConsensus<EthPrimitives, Error = ConsensusError> + SignerManager
+    T: FullConsensus<EthPrimitives> + SignerManager
 {
 }
 

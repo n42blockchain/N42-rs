@@ -881,7 +881,7 @@ where
             .with_executor(Box::new(node.task_executor().clone()))
             .with_evm_config(node.evm_config().clone())
             .with_consensus(node.consensus().clone())
-            .build_with_auth_server(module_config, engine_api, eth_api);
+            .build_with_auth_server(module_config, engine_api, eth_api, engine_events.clone());
 
         // in dev mode we generate 20 random dev-signer accounts
         if config.dev.dev {
@@ -1137,6 +1137,7 @@ pub trait EngineValidatorBuilder<Node: FullNodeComponents>: Send + Sync + Clone 
         self,
         ctx: &AddOnsContext<'_, Node>,
         tree_config: TreeConfig,
+        changeset_cache: reth_trie_db::ChangesetCache,
     ) -> impl Future<Output = eyre::Result<Self::EngineValidator>> + Send;
 }
 
@@ -1179,6 +1180,7 @@ where
         <Node::Types as NodeTypes>::Payload,
         Block = BlockTy<Node::Types>,
     >,
+    <<Node as reth_node_api::FullNodeTypes>::Provider as reth_provider::DatabaseProviderFactory>::Provider: reth_provider::TrieReader,
 {
     type EngineValidator = BasicEngineValidator<Node::Provider, Node::Evm, EV::Validator>;
 
@@ -1186,6 +1188,7 @@ where
         self,
         ctx: &AddOnsContext<'_, Node>,
         tree_config: TreeConfig,
+        changeset_cache: reth_trie_db::ChangesetCache,
     ) -> eyre::Result<Self::EngineValidator> {
         let validator = self.payload_validator_builder.build(ctx).await?;
         let data_dir = ctx
@@ -1201,6 +1204,7 @@ where
             validator,
             tree_config,
             invalid_block_hook,
+            changeset_cache,
         ))
     }
 }
@@ -1277,6 +1281,7 @@ where
             EngineCapabilities::default(),
             engine_validator,
             ctx.config.engine.accept_execution_requests_hash,
+            ctx.node.network().clone(),
         ))
     }
 }

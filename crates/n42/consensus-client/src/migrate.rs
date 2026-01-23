@@ -179,7 +179,7 @@ where
                 .unwrap()
                 .unwrap();
 
-            let (_, beacon_state_after_withdrawal) = self.beacon.gen_withdrawals(header.hash())?;
+            let (withdrawals, beacon_state_after_withdrawal) = self.beacon.gen_withdrawals(header.hash())?;
 
             debug!(target: "consensus-client", ?block, "block of input");
             let transactions = block.transactions.into_transactions();
@@ -218,7 +218,11 @@ where
                 .beacon_engine_handle
                 .fork_choice_updated(
                     forkchoice_state,
-                    Some(self.payload_attributes_builder.build(timestamp)),
+                    Some(self.payload_attributes_builder.build_ext(
+                        timestamp,
+                        withdrawals,
+                        header.mix_hash().unwrap_or_default()
+                    )),
                     EngineApiMessageVersion::default(),
                 )
                 .await;

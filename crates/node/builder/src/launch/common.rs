@@ -48,7 +48,7 @@ use reth_rpc_layer::JwtSecret;
 use reth_stages::{sets::DefaultStages, MetricEvent, PipelineBuilder, PipelineTarget, StageId};
 use reth_static_file::StaticFileProducer;
 use reth_tasks::TaskExecutor;
-use reth_tracing::tracing::{debug, error, info, warn};
+use reth_tracing::{throttle, tracing::{debug, error, info, warn}};
 use reth_transaction_pool::TransactionPool;
 use std::{sync::Arc, thread::available_parallelism};
 use tokio::sync::{
@@ -426,7 +426,8 @@ where
             self.right().clone(),
             self.chain_spec(),
             StaticFileProvider::read_write(self.data_dir().static_files())?,
-        )
+            reth_provider::providers::RocksDBProvider,
+        )?
         .with_prune_modes(self.prune_modes())
         .with_static_files_metrics();
 
@@ -566,6 +567,7 @@ where
                         }
                     })
                     .build(),
+                self.data_dir().pprof_dumps(),
             );
 
             MetricServer::new(config).serve().await?;
@@ -1062,6 +1064,28 @@ where
     db_provider_container: WithMeteredProvider<NodeTypesWithDBAdapter<T::Types, T::DB>>,
     node_adapter: NodeAdapter<T, CB::Components>,
     head: Head,
+}
+
+/// Creates hooks for metrics reporting.
+pub fn metrics_hooks<N: NodeTypesWithDB>(provider_factory: &ProviderFactory<N>) -> Hooks {
+    use std::time::Duration;
+
+    Hooks::builder()
+        .with_hook({
+            let db = provider_factory.db_ref().clone();
+            move || throttle!(Duration::from_secs(5 * 60), || db.report_metrics())
+        })
+        .with_hook({
+            let sfp = provider_factory.static_file_provider();
+            move || {
+                throttle!(Duration::from_secs(5 * 60), || {
+                    if let Err(error) = sfp.report_metrics() {
+                        error!(%error, "Failed to report metrics from static file provider");
+                    }
+                })
+            }
+        })
+        .build()
 }
 
 #[cfg(test)]

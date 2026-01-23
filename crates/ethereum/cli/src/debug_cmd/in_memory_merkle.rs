@@ -28,7 +28,7 @@ use reth_primitives_traits::SealedBlock;
 use reth_provider::{
     providers::ProviderNodeTypes, AccountExtReader, ChainSpecProvider, DatabaseProviderFactory,
     HashedPostStateProvider, HashingWriter, LatestStateProviderRef, OriginalValuesKnown,
-    ProviderFactory, StageCheckpointReader, StateWriter, StorageReader,
+    ProviderFactory, StageCheckpointReader, StateWriteConfig, StateWriter, StorageReader,
 };
 use reth_revm::database::StateProviderDatabase;
 use reth_stages::StageId;
@@ -169,9 +169,10 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
         let execution_outcome = ExecutionOutcome::from((block_execution_output, block.number()));
 
         // Unpacked `BundleState::state_root_slow` function
+        let hashed_post_state_sorted = state_provider.hashed_post_state(execution_outcome.state()).into_sorted();
         let (in_memory_state_root, in_memory_updates) = StateRoot::overlay_root_with_updates(
             provider.tx_ref(),
-            state_provider.hashed_post_state(execution_outcome.state()),
+            &hashed_post_state_sorted,
         )?;
 
         if in_memory_state_root == block.state_root() {
@@ -183,7 +184,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
 
         // Insert block, state and hashes
         provider_rw.insert_historical_block(block.clone().try_recover()?)?;
-        provider_rw.write_state(&execution_outcome, OriginalValuesKnown::No)?;
+        provider_rw.write_state(&execution_outcome, OriginalValuesKnown::No, StateWriteConfig::full())?;
         let storage_lists =
             provider_rw.changed_storages_with_range(block.number..=block.number())?;
         let storages = provider_rw.plain_state_storages(storage_lists)?;
@@ -194,7 +195,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
         provider_rw.insert_account_for_hashing(accounts)?;
 
         let (state_root, incremental_trie_updates) = StateRoot::incremental_root_with_updates(
-            provider_rw.tx_ref(),
+            &provider_rw,
             block.number..=block.number(),
         )?;
         if state_root != block.state_root() {

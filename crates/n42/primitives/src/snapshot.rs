@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 // use ethcore::snapshot::{ManifestData, SnapshotService};
-use reth_primitives::{arbitrary, Header};
+use reth_primitives::arbitrary;
 use std::collections::HashMap;
 use std::error::Error;
 

@@ -40,6 +40,9 @@ pub use payload::*;
 mod error;
 pub use error::*;
 
+mod testing;
+pub use testing::*;
+
 mod transition;
 pub use transition::*;
 

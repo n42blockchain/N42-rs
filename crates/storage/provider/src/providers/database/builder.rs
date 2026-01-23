@@ -6,7 +6,7 @@
 //! This also includes general purpose staging types that provide builder style functions that lead
 //! up to the intended build target.
 
-use crate::{providers::StaticFileProvider, ProviderFactory};
+use crate::{providers::rocksdb::RocksDBProvider, providers::StaticFileProvider, ProviderFactory};
 use reth_db::{mdbx::DatabaseArguments, open_db_read_only, DatabaseEnv};
 use reth_db_api::{database_metrics::DatabaseMetrics, Database};
 use reth_node_types::{NodeTypes, NodeTypesWithDBAdapter};
@@ -95,7 +95,7 @@ impl<N> ProviderFactoryBuilder<N> {
                 static_files_dir,
                 watch_static_files,
             )?)
-            .build_provider_factory())
+            .build_provider_factory()?)
     }
 }
 
@@ -313,13 +313,16 @@ where
     DB: Database + DatabaseMetrics + Clone + Unpin + 'static,
 {
     /// Creates the [`ProviderFactory`].
-    pub fn build_provider_factory(self) -> ProviderFactory<NodeTypesWithDBAdapter<N, DB>> {
+    pub fn build_provider_factory(
+        self,
+    ) -> reth_storage_errors::provider::ProviderResult<ProviderFactory<NodeTypesWithDBAdapter<N, DB>>>
+    {
         let Self {
             _types,
             val_1,
             val_2,
             val_3,
         } = self;
-        ProviderFactory::new(val_1, val_2, val_3)
+        ProviderFactory::new(val_1, val_2, val_3, RocksDBProvider)
     }
 }

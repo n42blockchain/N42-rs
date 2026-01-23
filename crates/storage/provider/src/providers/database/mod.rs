@@ -1,11 +1,14 @@
 use crate::{
-    providers::{state::latest::LatestStateProvider, StaticFileProvider, StaticFileProviderRWRefMut},
+    providers::{
+        rocksdb::RocksDBProvider, state::latest::LatestStateProvider, StaticFileProvider,
+        StaticFileProviderRWRefMut,
+    },
     to_range,
     traits::{BlockSource, ReceiptProvider},
     BlockHashReader, BlockNumReader, BlockReader, ChainSpecProvider, DatabaseProviderFactory,
     HashedPostStateProvider, HeaderProvider, HeaderSyncGapProvider, ProviderError,
-    PruneCheckpointReader, StageCheckpointReader, StateProviderBox, StaticFileProviderFactory,
-    TransactionVariant, TransactionsProvider,
+    PruneCheckpointReader, RocksDBProviderFactory, StageCheckpointReader, StateProviderBox,
+    StaticFileProviderFactory, TransactionVariant, TransactionsProvider,
 };
 use alloy_consensus::transaction::TransactionMeta;
 use alloy_eips::BlockHashOrNumber;
@@ -23,7 +26,7 @@ use reth_prune_types::{PruneCheckpoint, PruneModes, PruneSegment};
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_static_file_types::StaticFileSegment;
 use reth_storage_api::{
-    BlockBodyIndicesProvider, NodePrimitivesProvider, TryIntoHistoricalStateProvider,
+    BlockBodyIndicesProvider, NodePrimitivesProvider, StorageSettings, TryIntoHistoricalStateProvider,
 };
 use reth_storage_errors::provider::ProviderResult;
 use reth_trie::HashedPostState;
@@ -31,13 +34,13 @@ use revm_database::BundleState;
 use std::{
     ops::{RangeBounds, RangeInclusive},
     path::Path,
-    sync::Arc,
+    sync::{Arc, RwLock},
 };
 
 use tracing::trace;
 
 mod provider;
-pub use provider::{DatabaseProvider, DatabaseProviderRO, DatabaseProviderRW};
+pub use provider::{DatabaseProvider, DatabaseProviderRO, DatabaseProviderRW, SaveBlocksMode};
 
 use super::ProviderNodeTypes;
 
@@ -63,6 +66,10 @@ pub struct ProviderFactory<N: NodeTypesWithDB> {
     prune_modes: PruneModes,
     /// The node storage handler.
     storage: Arc<N::Storage>,
+    /// Storage configuration settings for this node
+    storage_settings: Arc<RwLock<StorageSettings>>,
+    /// `RocksDB` provider
+    rocksdb_provider: RocksDBProvider,
 }
 
 impl<N: NodeTypes> ProviderFactory<NodeTypesWithDBAdapter<N, Arc<DatabaseEnv>>> {
@@ -78,14 +85,20 @@ impl<N: NodeTypesWithDB> ProviderFactory<N> {
         db: N::DB,
         chain_spec: Arc<N::ChainSpec>,
         static_file_provider: StaticFileProvider<N::Primitives>,
-    ) -> Self {
-        Self {
+        rocksdb_provider: RocksDBProvider,
+    ) -> ProviderResult<Self> {
+        // Load storage settings from database at init time
+        let storage_settings = Arc::new(RwLock::new(StorageSettings::default()));
+
+        Ok(Self {
             db,
             chain_spec,
             static_file_provider,
             prune_modes: PruneModes::default(),
             storage: Default::default(),
-        }
+            storage_settings,
+            rocksdb_provider,
+        })
     }
 
     /// Enables metrics on the static file provider.
@@ -121,13 +134,13 @@ impl<N: NodeTypesWithDB<DB = Arc<DatabaseEnv>>> ProviderFactory<N> {
         args: DatabaseArguments,
         static_file_provider: StaticFileProvider<N::Primitives>,
     ) -> RethResult<Self> {
-        Ok(Self {
-            db: Arc::new(init_db(path, args).map_err(RethError::msg)?),
+        Self::new(
+            Arc::new(init_db(path, args).map_err(RethError::msg)?),
             chain_spec,
             static_file_provider,
-            prune_modes: PruneModes::default(),
-            storage: Default::default(),
-        })
+            RocksDBProvider,
+        )
+        .map_err(|e| RethError::msg(e.to_string()))
     }
 }
 
@@ -146,6 +159,8 @@ impl<N: ProviderNodeTypes> ProviderFactory<N> {
             self.static_file_provider.clone(),
             self.prune_modes.clone(),
             self.storage.clone(),
+            self.storage_settings.clone(),
+            self.rocksdb_provider.clone(),
         ))
     }
 
@@ -161,6 +176,8 @@ impl<N: ProviderNodeTypes> ProviderFactory<N> {
             self.static_file_provider.clone(),
             self.prune_modes.clone(),
             self.storage.clone(),
+            self.storage_settings.clone(),
+            self.rocksdb_provider.clone(),
         )))
     }
 
@@ -625,6 +642,8 @@ where
             static_file_provider,
             prune_modes,
             storage,
+            storage_settings,
+            rocksdb_provider,
         } = self;
         f.debug_struct("ProviderFactory")
             .field("db", &db)
@@ -632,6 +651,8 @@ where
             .field("static_file_provider", &static_file_provider)
             .field("prune_modes", &prune_modes)
             .field("storage", &storage)
+            .field("storage_settings", &storage_settings)
+            .field("rocksdb_provider", &rocksdb_provider)
             .finish()
     }
 }
@@ -644,7 +665,30 @@ impl<N: NodeTypesWithDB> Clone for ProviderFactory<N> {
             static_file_provider: self.static_file_provider.clone(),
             prune_modes: self.prune_modes.clone(),
             storage: self.storage.clone(),
+            storage_settings: self.storage_settings.clone(),
+            rocksdb_provider: self.rocksdb_provider.clone(),
         }
+    }
+}
+
+impl<N: NodeTypesWithDB> RocksDBProviderFactory for ProviderFactory<N> {
+    fn rocksdb_provider(&self) -> RocksDBProvider {
+        self.rocksdb_provider.clone()
+    }
+
+    #[cfg(all(unix, feature = "rocksdb"))]
+    fn set_pending_rocksdb_batch(&self, batch: rocksdb::WriteBatchWithTransaction<true>) {
+        self.rocksdb_provider.set_pending_rocksdb_batch(batch)
+    }
+}
+
+impl<N: NodeTypesWithDB> reth_storage_api::StorageSettingsCache for ProviderFactory<N> {
+    fn cached_storage_settings(&self) -> StorageSettings {
+        *self.storage_settings.read().expect("storage settings lock poisoned")
+    }
+
+    fn set_storage_settings_cache(&self, settings: StorageSettings) {
+        *self.storage_settings.write().expect("storage settings lock poisoned") = settings;
     }
 }
 

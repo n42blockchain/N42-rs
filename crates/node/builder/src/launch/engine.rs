@@ -12,7 +12,7 @@ use alloy_consensus::BlockHeader;
 use futures::{future::Either, stream, stream_select, StreamExt};
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_db_api::{database_metrics::DatabaseMetrics, Database};
-use reth_engine_local::{LocalMiner, LocalPayloadAttributesBuilder};
+use reth_engine_local::LocalPayloadAttributesBuilder;
 use reth_engine_service::service::{ChainEvent, EngineService};
 use reth_engine_tree::{
     engine::{EngineApiRequest, EngineRequestHandler},
@@ -41,6 +41,7 @@ use reth_stages::stages::EraImportSource;
 use reth_tasks::TaskExecutor;
 use reth_tokio_util::EventSender;
 use reth_tracing::tracing::{debug, error, info};
+use reth_trie_db::ChangesetCache;
 use std::sync::Arc;
 use tokio::sync::{mpsc::unbounded_channel, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -237,10 +238,13 @@ where
         };
         let validator_builder = add_ons.engine_validator_builder();
 
+        // Create changeset cache that will be shared across the engine
+        let changeset_cache = ChangesetCache::new();
+
         // Build the engine validator with all required components
         let engine_validator = validator_builder
             .clone()
-            .build_tree_validator(&add_ons_ctx, engine_tree_config.clone())
+            .build_tree_validator(&add_ons_ctx, engine_tree_config.clone(), changeset_cache.clone())
             .await?;
 
         // Create the consensus engine stream with optional reorg
@@ -251,9 +255,11 @@ where
                 ctx.blockchain_db().clone(),
                 ctx.components().evm_config().clone(),
                 || {
+                    // Create a separate cache for reorg validator (not shared with main engine)
+                    let reorg_cache = ChangesetCache::new();
                     validator_builder
                         .clone()
-                        .build_tree_validator(&add_ons_ctx, engine_tree_config.clone())
+                        .build_tree_validator(&add_ons_ctx, engine_tree_config.clone(), reorg_cache)
                 },
                 node_config.debug.reorg_frequency,
                 node_config.debug.reorg_depth,
@@ -279,22 +285,25 @@ where
             engine_tree_config,
             ctx.sync_metrics_tx(),
             ctx.components().evm_config().clone(),
+            changeset_cache,
         );
 
-        if ctx.is_dev() {
-            let pool = ctx.components().pool().clone();
-            ctx.task_executor().spawn_critical(
-                "local engine",
-                LocalMiner::new(
-                    ctx.blockchain_db().clone(),
-                    LocalPayloadAttributesBuilder::new(ctx.chain_spec()),
-                    beacon_engine_handle.clone(),
-                    ctx.dev_mining_mode(pool),
-                    ctx.components().payload_builder_handle().clone(),
-                )
-                .run(),
-            );
-        }
+        // TODO: Dev mode local mining has been temporarily disabled due to API changes
+        // This needs to be updated to match the new LocalMiner API
+        // if ctx.is_dev() {
+        //     let pool = ctx.components().pool().clone();
+        //     ctx.task_executor().spawn_critical(
+        //         "local engine",
+        //         LocalMiner::new(
+        //             ctx.blockchain_db().clone(),
+        //             LocalPayloadAttributesBuilder::new(ctx.chain_spec()),
+        //             beacon_engine_handle.clone(),
+        //             ctx.dev_mining_mode(pool),
+        //             ctx.components().payload_builder_handle().clone(),
+        //         )
+        //         .run(),
+        //     );
+        // }
 
         info!(target: "reth::cli", "Consensus engine initialized");
 
@@ -359,8 +368,8 @@ where
                 tokio::select! {
                     payload = built_payloads.select_next_some() => {
                         if let Some(executed_block) = payload.executed_block() {
-                            debug!(target: "reth::cli", block=?executed_block.recovered_block().num_hash(),  "inserting built payload");
-                            engine_service.orchestrator_mut().handler_mut().handler_mut().on_event(EngineApiRequest::InsertExecutedBlock(executed_block).into());
+                            debug!(target: "reth::cli", block=?executed_block.recovered_block.num_hash(),  "inserting built payload");
+                            engine_service.orchestrator_mut().handler_mut().handler_mut().on_event(EngineApiRequest::InsertExecutedBlock(executed_block.into_executed_payload()).into());
                         }
                     }
                     event = engine_service.next() => {

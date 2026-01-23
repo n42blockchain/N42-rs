@@ -16,7 +16,8 @@ use crate::{ChainHardforks, EthereumHardfork, ForkCondition, Hardfork};
 #[derive(Debug, Clone, Default)]
 pub struct BeijingFork;
 
-pub const beijing_fork: BeijingFork = BeijingFork {};
+/// The Beijing fork configuration for N42 network.
+pub const BEIJING_FORK: BeijingFork = BeijingFork {};
 
 impl Hardfork for BeijingFork {
     fn name(&self) -> &'static str {
@@ -41,7 +42,8 @@ impl Hardfork for BeijingFork {
 /// - MAX_TX_GAS_LIMIT_OSAKA: 16,777,216 (2^24) - limits transaction gas
 ///
 /// For devnet testing, Osaka is delayed to avoid the 16M gas limit restriction.
-pub const N42_OSAKA_TIMESTAMP: u64 = 4070908800;
+/// Osaka hardfork timestamp for N42 network.
+pub(crate) const N42_OSAKA_TIMESTAMP: u64 = 4070908800;
 
 /// N42 hardforks
 pub static N42_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
@@ -70,8 +72,8 @@ pub static N42_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
             EthereumHardfork::ArrowGlacier.boxed(),
             ForkCondition::Block(0),
         ),
-        //(beijing_fork.boxed(), ForkCondition::Timestamp(1761621577)),
-        (beijing_fork.boxed(), ForkCondition::Never),
+        //(BEIJING_FORK.boxed(), ForkCondition::Timestamp(1761621577)),
+        (BEIJING_FORK.boxed(), ForkCondition::Never),
         (
             EthereumHardfork::Paris.boxed(),
             ForkCondition::TTD {
@@ -100,6 +102,10 @@ pub static N42_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
     ])
 });
 
+/// Chain hardforks configuration for N42 Clique test network.
+///
+/// This static defines the hardfork activation conditions for the N42 test network
+/// using Clique consensus.
 pub static N42_HARDFORKS_FOR_CLIQUE_TEST: LazyLock<ChainHardforks> = LazyLock::new(|| {
     ChainHardforks::new(vec![
         (EthereumHardfork::Frontier.boxed(), ForkCondition::Block(0)),

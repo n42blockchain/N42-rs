@@ -193,7 +193,7 @@ where
     EvmConfig: ConfigureEvm<Primitives = EthPrimitives, NextBlockEnvCtx = NextBlockEnvAttributes>,
     Client: StateProviderFactory + ChainSpecProvider<ChainSpec: EthereumHardforks> + Clone,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>,
-    Cons: FullConsensus<EthPrimitives, Error = ConsensusError> + SignerManager + Clone + Unpin + 'static,
+    Cons: FullConsensus<EthPrimitives> + SignerManager + Clone + Unpin + 'static,
 {
     type Attributes = EthPayloadBuilderAttributes;
     type BuiltPayload = EthBuiltPayload;
@@ -264,7 +264,7 @@ where
     Client: StateProviderFactory + ChainSpecProvider<ChainSpec: EthereumHardforks>,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>,
     F: FnOnce(BestTransactionsAttributes) -> BestTransactionsIter<Pool>,
-    Cons: FullConsensus<EthPrimitives, Error = ConsensusError> + SignerManager + Clone + Unpin + 'static,
+    Cons: FullConsensus<EthPrimitives> + SignerManager + Clone + Unpin + 'static,
 {
     let BuildArguments {
         mut cached_reads,
@@ -313,6 +313,7 @@ where
                 gas_limit: builder_config.gas_limit(parent_header.gas_limit),
                 parent_beacon_block_root: attributes.parent_beacon_block_root(),
                 withdrawals: Some(attributes.withdrawals().clone()),
+                extra_data: Default::default(),
             },
         )
         .map_err(PayloadBuilderError::other)?;
@@ -364,7 +365,7 @@ where
             // continue
             best_txs.mark_invalid(
                 &pool_tx,
-                InvalidPoolTransactionError::ExceedsGasLimit(pool_tx.gas_limit(), block_gas_limit),
+                &InvalidPoolTransactionError::ExceedsGasLimit(pool_tx.gas_limit(), block_gas_limit),
             );
             continue;
         }
@@ -390,7 +391,7 @@ where
                 trace!(target: "payload_builder", tx=?tx.hash(), ?block_blob_count, "skipping blob transaction because it would exceed the max blob count per block");
                 best_txs.mark_invalid(
                     &pool_tx,
-                    InvalidPoolTransactionError::Eip4844(
+                    &InvalidPoolTransactionError::Eip4844(
                         Eip4844PoolTransactionError::TooManyEip4844Blobs {
                             have: block_blob_count + tx_blob_count,
                             permitted: max_blob_count,
@@ -415,7 +416,7 @@ where
                     trace!(target: "payload_builder", %error, ?tx, "skipping invalid transaction and its descendants");
                     best_txs.mark_invalid(
                         &pool_tx,
-                        InvalidPoolTransactionError::Consensus(
+                        &InvalidPoolTransactionError::Consensus(
                             InvalidTransactionError::TxTypeNotSupported,
                         ),
                     );
@@ -567,7 +568,7 @@ where
         + 'static,
     EvmConfig: ConfigureEvm<Primitives = EthPrimitives, NextBlockEnvCtx = NextBlockEnvAttributes>,
     CB: ConsensusBuilder<Node> + Clone + Send + Sync,
-    CB::Consensus: FullConsensus<EthPrimitives, Error = ConsensusError> + SignerManager + Clone + Unpin + 'static,
+    CB::Consensus: FullConsensus<EthPrimitives> + SignerManager + Clone + Unpin + 'static,
 {
     async fn spawn_payload_builder_service(
         self,

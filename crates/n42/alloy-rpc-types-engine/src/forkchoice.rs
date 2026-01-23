@@ -76,6 +76,16 @@ impl ForkchoiceState {
             Some(self.finalized_block_hash)
         }
     }
+
+    /// Returns `true` if the given hash is one of the block hashes in this state.
+    ///
+    /// Checks if the hash matches `head_block_hash`, `safe_block_hash`, or `finalized_block_hash`.
+    #[inline]
+    pub fn contains(&self, hash: B256) -> bool {
+        self.head_block_hash == hash ||
+            self.safe_block_hash == hash ||
+            self.finalized_block_hash == hash
+    }
 }
 
 /// A standalone forkchoice update errors for RPC.

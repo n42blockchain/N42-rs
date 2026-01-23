@@ -1,5 +1,6 @@
 //! clap [Args](clap::Args) for network related arguments.
 
+use alloy_primitives::B256;
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     ops::Not,
@@ -7,6 +8,7 @@ use std::{
 };
 
 use clap::Args;
+use reth_cli_util::{get_secret_key, load_secret_key::SecretKeyError};
 use reth_chainspec::EthChainSpec;
 use reth_config::Config;
 use reth_discv4::{NodeRecord, DEFAULT_DISCOVERY_ADDR, DEFAULT_DISCOVERY_PORT};
@@ -86,8 +88,15 @@ pub struct NetworkArgs {
     ///
     /// This will also deterministically set the peer ID. If not specified, it will be set in the
     /// data dir for the chain being used.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", conflicts_with = "p2p_secret_key_hex")]
     pub p2p_secret_key: Option<PathBuf>,
+
+    /// Hex encoded secret key to use for this node.
+    ///
+    /// This will also deterministically set the peer ID. Cannot be used together with
+    /// `--p2p-secret-key`.
+    #[arg(long, value_name = "HEX", conflicts_with = "p2p_secret_key")]
+    pub p2p_secret_key_hex: Option<B256>,
 
     /// Do not persist peers.
     #[arg(long, verbatim_doc_comment)]
@@ -211,6 +220,26 @@ impl NetworkArgs {
                 .collect()
         })
     }
+
+    /// Returns the secret key to use for networking.
+    ///
+    /// If `p2p_secret_key_hex` is provided, it will be used directly.
+    /// If `p2p_secret_key` is provided, it will be loaded from the file.
+    /// If neither is provided, the `default_secret_key_path` will be used.
+    pub fn secret_key(
+        &self,
+        default_secret_key_path: PathBuf,
+    ) -> Result<SecretKey, SecretKeyError> {
+        if let Some(b256) = &self.p2p_secret_key_hex {
+            // Use the B256 value directly (already validated as 32 bytes)
+            SecretKey::from_slice(b256.as_slice()).map_err(SecretKeyError::SecretKeyDecodeError)
+        } else {
+            // Load from file (either provided path or default)
+            let secret_key_path = self.p2p_secret_key.clone().unwrap_or(default_secret_key_path);
+            get_secret_key(&secret_key_path)
+        }
+    }
+
     /// Configures and returns a `TransactionsManagerConfig` based on the current settings.
     pub fn transactions_manager_config(&self) -> TransactionsManagerConfig {
         TransactionsManagerConfig {
@@ -351,6 +380,7 @@ impl Default for NetworkArgs {
             peers_file: None,
             identity: P2P_CLIENT_VERSION.to_string(),
             p2p_secret_key: None,
+            p2p_secret_key_hex: None,
             no_persist_peers: false,
             nat: NatResolver::Any,
             addr: DEFAULT_DISCOVERY_ADDR,

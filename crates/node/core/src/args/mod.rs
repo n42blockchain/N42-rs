@@ -59,6 +59,10 @@ pub use pruning::PruningArgs;
 mod datadir_args;
 pub use datadir_args::DatadirArgs;
 
+/// `StaticFilesArgs` for configuring static files.
+mod static_files;
+pub use static_files::{StaticFilesArgs, MINIMAL_BLOCKS_PER_FILE};
+
 /// BenchmarkArgs struct for configuring the benchmark to run
 mod benchmark_args;
 pub use benchmark_args::BenchmarkArgs;

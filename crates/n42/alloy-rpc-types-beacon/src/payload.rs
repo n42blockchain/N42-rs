@@ -13,7 +13,7 @@
 
 use crate::{withdrawals::BeaconWithdrawal, BlsPublicKey};
 use alloy_eips::eip4895::Withdrawal;
-use alloy_primitives::{Address, Bloom, Bytes, B256, B64, U256};
+use alloy_primitives::{Address, Bloom, Bytes, B256, U256};
 use alloy_rpc_types_engine::{
     ExecutionPayload, ExecutionPayloadV1, ExecutionPayloadV2, ExecutionPayloadV3,
 };
@@ -116,6 +116,7 @@ struct BeaconPayloadAttributes {
 /// Optimism Payload Attributes
 #[serde_as]
 #[derive(Serialize, Deserialize)]
+#[allow(dead_code)]
 struct BeaconOptimismPayloadAttributes {
     #[serde(flatten)]
     payload_attributes: BeaconPayloadAttributes,

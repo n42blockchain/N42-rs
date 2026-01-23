@@ -49,10 +49,8 @@ fn main() {
         std::sync::Mutex<
             Option<
                 std::sync::Arc<
-                    dyn reth_consensus::FullConsensus<
-                            reth_ethereum_primitives::EthPrimitives,
-                            Error = reth_consensus::ConsensusError,
-                        > + Send
+                    dyn reth_consensus::FullConsensus<reth_ethereum_primitives::EthPrimitives>
+                        + Send
                         + Sync,
                 >,
             >,

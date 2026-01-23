@@ -133,7 +133,7 @@ pub struct N42Miner<T: PayloadTypes, Provider, B, Network> {
     /// full network  for announce block
     network: Network,
     consensus: Arc<
-        dyn FullConsensus<<T::BuiltPayload as BuiltPayload>::Primitives, Error = ConsensusError>,
+        dyn FullConsensus<<T::BuiltPayload as BuiltPayload>::Primitives>,
     >,
     recent_blocks: schnellru::LruMap<
         B256,
@@ -202,7 +202,7 @@ where
         mode: MiningMode,
         payload_builder: PayloadBuilderHandle<T>,
         network: Network,
-        consensus: Arc<dyn FullConsensus<<T::BuiltPayload as BuiltPayload>::Primitives, Error = ConsensusError>>,
+        consensus: Arc<dyn FullConsensus<<T::BuiltPayload as BuiltPayload>::Primitives>>,
         broadcast_unverified_block_tx: broadcast::Sender<(UnverifiedBlock, Arc<Vec<BLSPubkey>>)>,
         block_verify_result_rx: mpsc::Receiver<BlockVerifyResult>,
     ) {

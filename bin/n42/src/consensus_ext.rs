@@ -59,7 +59,7 @@ pub struct ConsensusExt<Cons, Provider> {
 
 impl<Cons, Provider> ConsensusExtApiServer for ConsensusExt<Cons, Provider>
 where
-    Cons: FullConsensus<EthPrimitives, Error = ConsensusError> + Clone + Unpin + 'static,
+    Cons: FullConsensus<EthPrimitives> + Clone + Unpin + 'static,
     Provider: HeaderProvider + Clone + 'static,
 {
     fn propose(&self, address: Address, auth: bool) -> RpcResult<()> {
@@ -148,7 +148,7 @@ pub struct ConsensusBeaconExt<Cons, Provider> {
 
 impl<Cons, Provider> ConsensusBeaconExtApiServer for ConsensusBeaconExt<Cons, Provider>
 where
-    Cons: FullConsensus<EthPrimitives, Error = ConsensusError> + Clone + Unpin + 'static,
+    Cons: FullConsensus<EthPrimitives> + Clone + Unpin + 'static,
     Provider: HeaderProvider + BeaconProvider + BlockIdReader + BlockReader + Clone + 'static,
 {
     fn subscribe_to_verification_request(

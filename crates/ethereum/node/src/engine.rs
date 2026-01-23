@@ -19,7 +19,8 @@ use reth_payload_primitives::{
     EngineObjectValidationError, InvalidPayloadAttributesError, NewPayloadError,
     PayloadOrAttributes,
 };
-use reth_primitives_traits::RecoveredBlock;
+use reth_primitives_traits::{RecoveredBlock, SealedBlock};
+use reth_chain_state::ExecutedBlock;
 use std::sync::Arc;
 
 /// Validator for the ethereum engine API.
@@ -50,11 +51,19 @@ where
 {
     type Block = Block;
 
+    fn convert_payload_to_block(
+        &self,
+        payload: ExecutionData,
+    ) -> Result<SealedBlock<Self::Block>, NewPayloadError> {
+        self.inner.ensure_well_formed_payload(payload)
+            .map_err(|e| NewPayloadError::Other(e.to_string().into()))
+    }
+
     fn ensure_well_formed_payload(
         &self,
         payload: ExecutionData,
     ) -> Result<RecoveredBlock<Self::Block>, NewPayloadError> {
-        let sealed_block = self.inner.ensure_well_formed_payload(payload)?;
+        let sealed_block = <Self as PayloadValidator<Types>>::convert_payload_to_block(self, payload)?;
         sealed_block
             .try_recover()
             .map_err(|e| NewPayloadError::Other(e.into()))
@@ -116,12 +125,12 @@ where
         Ok(())
     }
 
-    fn ensure_well_formed_payload(
+    fn convert_payload_to_block(
         &self,
         payload: ExecutionData,
-    ) -> Result<RecoveredBlock<Block>, NewPayloadError> {
+    ) -> Result<SealedBlock<Block>, NewPayloadError> {
         // Delegate to PayloadValidator implementation
-        <Self as PayloadValidator<Types>>::ensure_well_formed_payload(self, payload)
+        <Self as PayloadValidator<Types>>::convert_payload_to_block(self, payload)
     }
 
     fn validate_payload(
@@ -136,7 +145,7 @@ where
         //
         // For now, we validate the payload structure and return an error
         // indicating that execution is required.
-        match <Self as PayloadValidator<Types>>::ensure_well_formed_payload(self, payload) {
+        match <Self as PayloadValidator<Types>>::convert_payload_to_block(self, payload) {
             Ok(_block) => {
                 // We cannot return ExecutedBlock without actual execution.
                 // Return an error indicating the payload needs execution.
@@ -154,7 +163,7 @@ where
 
     fn validate_block(
         &mut self,
-        _block: RecoveredBlock<Block>,
+        _block: SealedBlock<Block>,
         _ctx: reth_engine_tree::tree::payload_validator::TreeCtx<'_, EthPrimitives>,
     ) -> EthValidationOutcome {
         // NOTE: This is a simplified implementation for N42.
@@ -164,5 +173,10 @@ where
                 "EthereumEngineValidator: block execution not implemented, use BasicEngineValidator".into()
             )
         ))
+    }
+
+    fn on_inserted_executed_block(&self, _block: ExecutedBlock<EthPrimitives>) {
+        // No-op for this simplified implementation
+        // In a full implementation, this would update caches or perform other bookkeeping
     }
 }

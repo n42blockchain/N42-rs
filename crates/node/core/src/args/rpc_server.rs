@@ -173,6 +173,14 @@ pub struct RpcServerArgs {
     #[arg(long = "rpc.max-tracing-requests", alias = "rpc-max-tracing-requests", value_name = "COUNT", default_value_t = constants::default_max_tracing_requests())]
     pub rpc_max_tracing_requests: usize,
 
+    /// Maximum number of concurrent blocking IO requests.
+    ///
+    /// Blocking IO requests include `eth_call`, `eth_estimateGas`, and similar methods that
+    /// require EVM execution. These are spawned as blocking tasks to avoid blocking the async
+    /// runtime.
+    #[arg(long = "rpc.max-blocking-io-requests", alias = "rpc-max-blocking-io-requests", value_name = "COUNT", default_value_t = constants::DEFAULT_MAX_BLOCKING_IO_REQUEST)]
+    pub rpc_max_blocking_io_requests: usize,
+
     /// Maximum number of blocks for `trace_filter` requests.
     #[arg(long = "rpc.max-trace-filter-blocks", alias = "rpc-max-trace-filter-blocks", value_name = "COUNT", default_value_t = constants::DEFAULT_MAX_TRACE_FILTER_BLOCKS)]
     pub rpc_max_trace_filter_blocks: u64,
@@ -394,6 +402,7 @@ impl Default for RpcServerArgs {
             rpc_max_subscriptions_per_connection: RPC_DEFAULT_MAX_SUBS_PER_CONN.into(),
             rpc_max_connections: RPC_DEFAULT_MAX_CONNECTIONS.into(),
             rpc_max_tracing_requests: constants::default_max_tracing_requests(),
+            rpc_max_blocking_io_requests: constants::DEFAULT_MAX_BLOCKING_IO_REQUEST,
             rpc_max_trace_filter_blocks: constants::DEFAULT_MAX_TRACE_FILTER_BLOCKS,
             rpc_max_blocks_per_filter: constants::DEFAULT_MAX_BLOCKS_PER_FILTER.into(),
             rpc_max_logs_per_response: (constants::DEFAULT_MAX_LOGS_PER_RESPONSE as u64).into(),

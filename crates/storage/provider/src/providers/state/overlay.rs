@@ -1,4 +1,5 @@
 use alloy_primitives::{BlockNumber, B256};
+use reth_chain_state::LazyOverlay;
 use reth_db_api::DatabaseError;
 use reth_errors::{ProviderError, ProviderResult};
 use reth_prune_types::PruneSegment;
@@ -14,7 +15,7 @@ use reth_trie::{
     HashedPostState, HashedPostStateSorted, KeccakKeyHasher,
 };
 use reth_trie_db::{
-    DatabaseHashedCursorFactory, DatabaseHashedPostState, DatabaseTrieCursorFactory,
+    ChangesetCache, DatabaseHashedCursorFactory, DatabaseHashedPostState, DatabaseTrieCursorFactory,
 };
 use std::sync::Arc;
 use tracing::debug;
@@ -27,6 +28,9 @@ use tracing::debug;
 pub struct OverlayStateProviderFactory<F> {
     /// The underlying database provider factory
     factory: F,
+    /// Changeset cache (currently unused but accepted for API compatibility)
+    #[allow(dead_code)]
+    changeset_cache: Option<ChangesetCache>,
     /// Optional block hash for collecting reverts
     block_hash: Option<B256>,
     /// Optional trie overlay
@@ -36,10 +40,24 @@ pub struct OverlayStateProviderFactory<F> {
 }
 
 impl<F> OverlayStateProviderFactory<F> {
-    /// Create a new overlay state provider factory
-    pub const fn new(factory: F) -> Self {
+    /// Create a new overlay state provider factory with changeset cache.
+    ///
+    /// Note: The changeset_cache is accepted for API compatibility but is currently unused.
+    pub fn new(factory: F, changeset_cache: ChangesetCache) -> Self {
         Self {
             factory,
+            changeset_cache: Some(changeset_cache),
+            block_hash: None,
+            trie_overlay: None,
+            hashed_state_overlay: None,
+        }
+    }
+
+    /// Create a new overlay state provider factory without changeset cache.
+    pub const fn new_without_cache(factory: F) -> Self {
+        Self {
+            factory,
+            changeset_cache: None,
             block_hash: None,
             trie_overlay: None,
             hashed_state_overlay: None,
@@ -61,6 +79,18 @@ impl<F> OverlayStateProviderFactory<F> {
         self
     }
 
+    /// Set the lazy overlay.
+    ///
+    /// This accepts a `LazyOverlay` and extracts both the trie updates and hashed state from it.
+    pub fn with_lazy_overlay(mut self, lazy_overlay: Option<LazyOverlay>) -> Self {
+        if let Some(overlay) = lazy_overlay {
+            let (nodes, state) = overlay.as_overlay();
+            self.trie_overlay = Some(nodes);
+            self.hashed_state_overlay = Some(state);
+        }
+        self
+    }
+
     /// Set the hashed state overlay
     ///
     /// This overlay will be applied on top of any reverts applied via `with_block_hash`.
@@ -70,6 +100,16 @@ impl<F> OverlayStateProviderFactory<F> {
     ) -> Self {
         self.hashed_state_overlay = hashed_state_overlay;
         self
+    }
+
+    /// Set the extended hashed state overlay.
+    ///
+    /// This takes a value directly and wraps it in Arc and Some.
+    pub fn with_extended_hashed_state_overlay(
+        self,
+        hashed_state_overlay: HashedPostStateSorted,
+    ) -> Self {
+        self.with_hashed_state_overlay(Some(Arc::new(hashed_state_overlay)))
     }
 }
 
@@ -151,7 +191,7 @@ where
 impl<F> DatabaseProviderROFactory for OverlayStateProviderFactory<F>
 where
     F: DatabaseProviderFactory,
-    F::Provider: TrieReader + StageCheckpointReader + PruneCheckpointReader + BlockNumReader,
+    F::Provider: DBProvider + TrieReader + StageCheckpointReader + PruneCheckpointReader + BlockNumReader,
 {
     type Provider = OverlayStateProvider<F::Provider>;
 

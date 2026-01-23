@@ -114,7 +114,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
             provider_factory, ..
         } = self.env.init::<N>(AccessRights::RW)?;
 
-        let consensus: Arc<dyn FullConsensus<EthPrimitives, Error = ConsensusError>> =
+        let consensus: Arc<dyn FullConsensus<EthPrimitives>> =
             Arc::new(EthBeaconConsensus::new(provider_factory.chain_spec()));
 
         // fetch the best block from the database
@@ -247,9 +247,10 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
                 debug!(target: "reth::cli", ?execution_outcome, "Executed block");
 
                 let hashed_post_state = state_provider.hashed_post_state(execution_outcome.state());
+                let hashed_post_state_sorted = hashed_post_state.clone().into_sorted();
                 let (state_root, trie_updates) = StateRoot::overlay_root_with_updates(
                     provider_factory.provider()?.tx_ref(),
-                    hashed_post_state.clone(),
+                    &hashed_post_state_sorted,
                 )?;
 
                 if state_root != block_with_senders.state_root() {

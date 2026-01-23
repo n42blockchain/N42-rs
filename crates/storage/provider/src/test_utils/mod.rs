@@ -62,7 +62,9 @@ pub fn create_test_provider_factory_with_node_types<N: NodeTypes>(
         db,
         chain_spec,
         StaticFileProvider::read_write(static_dir.keep()).expect("static file provider"),
+        crate::providers::rocksdb::RocksDBProvider,
     )
+    .expect("Failed to create ProviderFactory")
 }
 
 /// Inserts the genesis alloc from the provided chain spec into the trie.

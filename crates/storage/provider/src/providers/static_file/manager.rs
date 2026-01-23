@@ -463,17 +463,12 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         };
 
         let static_files = iter_static_files(&self.path).map_err(ProviderError::other)?;
-        for (segment, ranges) in static_files {
+        for (segment, ranges) in static_files.into_iter() {
             let mut entries = 0;
             let mut size = 0;
 
             for (block_range, _) in &ranges {
-                let fixed_block_range = self.find_fixed_range(segment, block_range.start());
-                let jar_provider = self
-                    .get_segment_provider(segment, || Some(fixed_block_range), None)?
-                    .ok_or_else(|| {
-                        ProviderError::MissingStaticFileBlock(segment, block_range.start())
-                    })?;
+                let jar_provider = self.get_segment_provider(segment, block_range.start())?;
 
                 entries += jar_provider.rows();
 
@@ -506,7 +501,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         block: BlockNumber,
         path: Option<&Path>,
     ) -> ProviderResult<StaticFileJarProvider<'_, N>> {
-        self.get_segment_provider(
+        self.get_segment_provider_for_range(
             segment,
             || self.get_segment_ranges_from_block(segment, block),
             path,
@@ -521,7 +516,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         tx: TxNumber,
         path: Option<&Path>,
     ) -> ProviderResult<StaticFileJarProvider<'_, N>> {
-        self.get_segment_provider(
+        self.get_segment_provider_for_range(
             segment,
             || self.get_segment_ranges_from_transaction(segment, tx),
             path,
@@ -529,10 +524,25 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         .ok_or(ProviderError::MissingStaticFileTx(segment, tx))
     }
 
+    /// Gets the [`StaticFileJarProvider`] of the requested segment and number.
+    ///
+    /// This routes to either block or transaction based provider depending on the segment type.
+    pub fn get_segment_provider(
+        &self,
+        segment: StaticFileSegment,
+        number: u64,
+    ) -> ProviderResult<StaticFileJarProvider<'_, N>> {
+        if segment.is_block_or_change_based() {
+            self.get_segment_provider_from_block(segment, number, None)
+        } else {
+            self.get_segment_provider_from_transaction(segment, number, None)
+        }
+    }
+
     /// Gets the [`StaticFileJarProvider`] of the requested segment and block or transaction.
     ///
     /// `fn_range` should make sure the range goes through `find_fixed_range`.
-    pub fn get_segment_provider(
+    pub fn get_segment_provider_for_range(
         &self,
         segment: StaticFileSegment,
         fn_range: impl Fn() -> Option<SegmentRangeInclusive>,
@@ -566,6 +576,21 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         }
 
         Ok(None)
+    }
+
+    /// Gets the [`StaticFileJarProvider`] of the requested path.
+    pub fn get_segment_provider_for_path(
+        &self,
+        path: &Path,
+    ) -> ProviderResult<Option<StaticFileJarProvider<'_, N>>> {
+        StaticFileSegment::parse_filename(
+            &path
+                .file_name()
+                .ok_or_else(|| ProviderError::MissingStaticFilePath(path.to_path_buf()))?
+                .to_string_lossy(),
+        )
+        .map(|(segment, block_range)| self.get_or_create_jar_provider(segment, &block_range))
+        .transpose()
     }
 
     /// Given a segment and block range it removes the cached provider from the map.
@@ -816,7 +841,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         max_block.clear();
         tx_index.clear();
 
-        for (segment, ranges) in iter_static_files(&self.path).map_err(ProviderError::other)? {
+        for (segment, ranges) in iter_static_files(&self.path).map_err(ProviderError::other)?.into_iter() {
             // Update first and last block for each segment
             if let Some((first_block_range, _)) = ranges.first() {
                 min_block.insert(segment, first_block_range.end());
@@ -826,8 +851,8 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
             }
 
             // Update tx -> block_range index
-            for (block_range, tx_range) in ranges {
-                if let Some(tx_range) = tx_range {
+            for (block_range, header) in ranges {
+                if let Some(tx_range) = header.tx_range() {
                     let tx_end = tx_range.end();
 
                     match tx_index.entry(segment) {
@@ -1222,6 +1247,11 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         Some(SegmentRangeInclusive::new(start, min_block))
     }
 
+    /// Returns the start block of the lowest range for a segment, if it exists.
+    pub fn get_lowest_range_start(&self, segment: StaticFileSegment) -> Option<BlockNumber> {
+        self.get_lowest_range(segment).map(|range| range.start())
+    }
+
     /// Delete all static files for the given segment below the given block number.
     ///
     /// Returns the headers of all deleted jars.
@@ -1417,6 +1447,31 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
     /// Returns directory where `static_files` are located.
     pub fn directory(&self) -> &Path {
         &self.path
+    }
+
+    /// Returns the genesis block number.
+    pub fn genesis_block_number(&self) -> u64 {
+        self.genesis_block_number
+    }
+
+    /// Returns the total count of account changesets.
+    ///
+    /// This is a placeholder implementation that returns 0 since account changesets
+    /// are not yet implemented in static files.
+    pub fn account_changeset_count(&self) -> ProviderResult<usize> {
+        // Account changesets are not yet stored in static files for this implementation
+        Ok(0)
+    }
+
+    /// Returns an iterator over account changesets in the given range.
+    ///
+    /// This is a placeholder implementation that returns an empty iterator since account
+    /// changesets are not yet implemented in static files.
+    pub fn walk_account_changeset_range(
+        &self,
+        _range: std::ops::Range<BlockNumber>,
+    ) -> impl Iterator<Item = ProviderResult<(BlockNumber, reth_db_api::models::AccountBeforeTx)>> {
+        std::iter::empty()
     }
 
     /// Retrieves data from the database or static file, wherever it's available.
@@ -2081,6 +2136,22 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         // For now, return empty changeset as the segment structure may not be ready yet
         // TODO: Implement proper changeset reading once SegmentHeader supports changeset_offset
         Ok(Vec::new())
+    }
+
+    /// Retrieves the account state before a specific block for a given address.
+    ///
+    /// This is a compatibility method for upstream CLI commands.
+    /// TODO: Implement proper account changeset lookup
+    pub fn get_account_before_block(
+        &self,
+        block_number: BlockNumber,
+        address: alloy_primitives::Address,
+    ) -> ProviderResult<Option<reth_primitives_traits::Account>> {
+        // For now, return None as the segment structure may not be ready yet
+        // A proper implementation would search the AccountChangeSets segment
+        // to find the account state before the specified block
+        let _ = (block_number, address);
+        Ok(None)
     }
 }
 

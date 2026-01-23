@@ -73,7 +73,10 @@ pub enum TableType {
 ///         Ok(())
 ///     }
 ///
-///     fn view_dupsort<T: DupSort>(&self) -> Result<(), Self::Error> {
+///     fn view_dupsort<T: DupSort>(&self) -> Result<(), Self::Error>
+///     where
+///         T::Value: reth_primitives_traits::ValueWithSubKey<SubKey = T::SubKey>,
+///     {
 ///         // operate on a dupsort table in a generic way
 ///         Ok(())
 ///     }
@@ -99,7 +102,10 @@ pub trait TableViewer<R> {
     /// Operate on the dupsort table in a generic way.
     ///
     /// By default, the `view` function is invoked unless overridden.
-    fn view_dupsort<T: DupSort>(&self) -> Result<R, Self::Error> {
+    fn view_dupsort<T: DupSort>(&self) -> Result<R, Self::Error>
+    where
+        T::Value: reth_primitives_traits::ValueWithSubKey<SubKey = T::SubKey>,
+    {
         self.view::<T>()
     }
 }
@@ -638,6 +644,12 @@ tables! {
     table ChainState {
         type Key = ChainStateKey;
         type Value = BlockNumber;
+    }
+
+    /// Stores arbitrary metadata as key-value pairs.
+    table Metadata {
+        type Key = String;
+        type Value = Vec<u8>;
     }
 }
 

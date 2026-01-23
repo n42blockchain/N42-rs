@@ -66,7 +66,7 @@ pub trait BlockWriter: Send + Sync {
     /// Bodies are passed as [`Option`]s, if body is `None` the corresponding block is empty.
     fn append_block_bodies(
         &self,
-        bodies: Vec<(BlockNumber, Option<<Self::Block as Block>::Body>)>,
+        bodies: Vec<(BlockNumber, Option<&<Self::Block as Block>::Body>)>,
     ) -> ProviderResult<()>;
 
     /// Removes all blocks above the given block number from the database.

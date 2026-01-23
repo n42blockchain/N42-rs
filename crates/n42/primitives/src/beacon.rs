@@ -1,38 +1,30 @@
 // Copyright (c) 2017-2025 N42 Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use alloy_eips::{
-    eip4895::{Withdrawal, Withdrawals},
-    eip7002::WithdrawalRequest,
-    eip7685::Requests,
-};
+use alloy_eips::{eip4895::Withdrawal, eip7002::WithdrawalRequest};
 use alloy_primitives::{keccak256, Address, BlockHash, Bytes, Log, B256};
 use alloy_primitives::{FixedBytes, Sealable};
 use alloy_rpc_types_beacon::requests::ExecutionRequestsV4;
-use alloy_sol_types::{sol, SolEnum, SolEvent};
+use alloy_sol_types::{sol, SolEvent};
 use blst::min_pk::PublicKey;
 use blst::min_pk::SecretKey;
 use blst::min_pk::{AggregateSignature, Signature};
-use hex::FromHex;
 use integer_sqrt::IntegerSquareRoot;
 use once_cell::sync::Lazy;
 use schnellru::LruMap;
 use serde::{Deserialize, Serialize};
-use ssz::{Decode, Encode};
+use ssz::Encode;
 use ssz_derive::{Decode, Encode};
 use std::collections::BTreeSet;
 use std::sync::RwLock;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error};
 use tree_hash::TreeHash;
 use tree_hash_derive::TreeHash;
 
 use crate::committee_cache::CommitteeCache;
 use crate::safe_arith::SafeArith;
 use crate::safe_arith::SafeArithIter;
-use crate::{
-    activation_queue::ActivationQueue, beacon_committee::BeaconCommittee, CommitteeIndex, Hash256,
-    Slot, Validator,
-};
+use crate::{activation_queue::ActivationQueue, CommitteeIndex, Hash256, Slot, Validator};
 use derivative::Derivative;
 use ethereum_hashing::hash;
 use merkle_db_rs::tree::VecTree;
@@ -185,7 +177,6 @@ macro_rules! verify {
     };
 }
 
-/// Solidity-style struct for the DepositEvent
 sol! {
     #[derive(Debug)]
     event DepositEvent (

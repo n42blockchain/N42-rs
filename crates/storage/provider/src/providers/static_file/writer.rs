@@ -575,6 +575,38 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         self.append_header_with_td(header, U256::ZERO, hash)
     }
 
+    /// Appends header to static files without incrementing block number.
+    ///
+    /// It **DOES NOT CALL** `increment_block()`, it should be handled elsewhere.
+    pub fn append_header_direct(
+        &mut self,
+        header: &N::BlockHeader,
+        total_difficulty: U256,
+        hash: &BlockHash,
+    ) -> ProviderResult<()>
+    where
+        N::BlockHeader: Compact,
+    {
+        let start = Instant::now();
+        self.ensure_no_queued_prune()?;
+
+        debug_assert!(self.writer.user_header().segment() == StaticFileSegment::Headers);
+
+        self.append_column(header)?;
+        self.append_column(CompactU256::from(total_difficulty))?;
+        self.append_column(hash)?;
+
+        if let Some(metrics) = &self.metrics {
+            metrics.record_segment_operation(
+                StaticFileSegment::Headers,
+                StaticFileProviderOperation::Append,
+                Some(start.elapsed()),
+            );
+        }
+
+        Ok(())
+    }
+
     /// Appends header with total difficulty to static files.
     ///
     /// Returns the current [`BlockNumber`] as seen in the static file.
@@ -743,6 +775,19 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             StaticFileSegment::Headers
         );
         self.queue_prune(to_delete, None)
+    }
+
+    /// Adds an instruction to prune account changesets up to the specified block during commit.
+    ///
+    /// This is a compatibility shim for upstream CLI commands.
+    pub fn prune_account_changesets(&mut self, last_block: u64) -> ProviderResult<()> {
+        debug_assert_eq!(
+            self.writer.user_header().segment(),
+            StaticFileSegment::AccountChangeSets
+        );
+        // Calculate how many entries to delete based on last_block
+        // For now, use last_block as to_delete (this may need adjustment)
+        self.queue_prune(last_block, Some(last_block))
     }
 
     /// Adds an instruction to prune `to_delete` elements during commit.

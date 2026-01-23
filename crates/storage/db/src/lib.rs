@@ -165,6 +165,15 @@ pub mod test_utils {
         (temp_dir, path)
     }
 
+    /// Creates a temporary RocksDB directory for testing.
+    ///
+    /// Returns a `(TempDir, PathBuf)` tuple. The `TempDir` will be automatically cleaned up when dropped.
+    pub fn create_test_rocksdb_dir() -> (TempDir, PathBuf) {
+        let temp_dir = TempDir::with_prefix("reth-test-rocksdb-").expect("Failed to create temporary rocksdb directory");
+        let path = temp_dir.path().to_path_buf();
+        (temp_dir, path)
+    }
+
     /// Get a temporary directory path to use for the database
     pub fn tempdir_path() -> PathBuf {
         let builder = tempfile::Builder::new()

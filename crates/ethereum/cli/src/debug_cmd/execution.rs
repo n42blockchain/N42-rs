@@ -67,7 +67,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
         &self,
         config: &Config,
         client: Client,
-        consensus: Arc<dyn FullConsensus<N::Primitives, Error = ConsensusError>>,
+        consensus: Arc<dyn FullConsensus<N::Primitives>>,
         provider_factory: ProviderFactory<N>,
         task_executor: &TaskExecutor,
         static_file_producer: StaticFileProducer<ProviderFactory<N>>,
@@ -184,7 +184,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
             data_dir,
         } = self.env.init::<N>(AccessRights::RW)?;
 
-        let consensus: Arc<dyn FullConsensus<N::Primitives, Error = ConsensusError>> =
+        let consensus: Arc<dyn FullConsensus<N::Primitives>> =
             Arc::new(EthBeaconConsensus::new(provider_factory.chain_spec()));
 
         // Configure and build network

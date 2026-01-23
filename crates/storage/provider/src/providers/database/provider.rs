@@ -2,6 +2,7 @@ use crate::{
     bundle_state::StorageRevertsIter,
     providers::{
         database::{chain::ChainStorage, metrics},
+        rocksdb::{PendingRocksDBBatches, RocksDBProvider},
         static_file::StaticFileWriter,
         NodeTypesForProvider, StaticFileProvider, StaticFileProviderRWRefMut,
     },
@@ -14,9 +15,9 @@ use crate::{
     DBProvider, HashingWriter, HeaderProvider, HeaderSyncGapProvider, HistoricalStateProvider,
     HistoricalStateProviderRef, HistoryWriter, LatestStateProvider, LatestStateProviderRef,
     OriginalValuesKnown, ProviderError, PruneCheckpointReader, PruneCheckpointWriter, RevertsInit,
-    StageCheckpointReader, StateProviderBox, StateWriter, StateWriteConfig, StaticFileProviderFactory,
-    StatsReader, StorageReader, StorageTrieWriter, TransactionVariant, TransactionsProvider,
-    TransactionsProviderExt, TrieReader, TrieWriter, WriteStateInput,
+    RocksDBProviderFactory, StageCheckpointReader, StateProviderBox, StateWriter, StateWriteConfig,
+    StaticFileProviderFactory, StatsReader, StorageReader, StorageTrieWriter, TransactionVariant,
+    TransactionsProvider, TransactionsProviderExt, TrieReader, TrieWriter, WriteStateInput,
 };
 use alloy_consensus::{
     transaction::{SignerRecoverable, TransactionMeta},
@@ -29,6 +30,7 @@ use alloy_primitives::{
     Address, BlockHash, BlockNumber, TxHash, TxNumber, B256, U256,
 };
 use itertools::Itertools;
+use parking_lot::Mutex;
 use rayon::slice::ParallelSliceMut;
 use reth_chain_state::ExecutedBlock;
 use reth_chainspec::{ChainInfo, ChainSpecProvider, EthChainSpec, EthereumHardforks};
@@ -57,7 +59,7 @@ use reth_stages_types::{StageCheckpoint, StageId};
 use reth_static_file_types::StaticFileSegment;
 use reth_storage_api::{
     BlockBodyIndicesProvider, BlockBodyReader, NodePrimitivesProvider, StateProvider,
-    StorageChangeSetReader, TryIntoHistoricalStateProvider,
+    StorageChangeSetReader, StorageSettings, StorageSettingsCache, TryIntoHistoricalStateProvider,
 };
 use reth_storage_errors::provider::{ProviderResult, RootMismatch};
 use reth_trie::trie_cursor::{InMemoryTrieCursorFactory, TrieCursor, TrieCursorFactory};
@@ -66,7 +68,9 @@ use reth_trie::{
     updates::{StorageTrieUpdatesSorted, TrieUpdates, TrieUpdatesSorted},
     HashedPostStateSorted, Nibbles, StateRoot, StoredNibbles, TrieChangeSetsEntry,
 };
-use reth_trie_db::{DatabaseStateRoot, DatabaseStorageTrieCursor, DatabaseTrieCursorFactory};
+use reth_trie_db::{
+    ChangesetCache, DatabaseStateRoot, DatabaseStorageTrieCursor, DatabaseTrieCursorFactory,
+};
 use revm_database::states::{
     PlainStateReverts, PlainStorageChangeset, PlainStorageRevert, StateChangeset,
 };
@@ -75,7 +79,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Debug,
     ops::{Deref, DerefMut, Range, RangeBounds, RangeInclusive},
-    sync::{mpsc, Arc},
+    sync::{mpsc, Arc, RwLock},
 };
 use tracing::{debug, trace};
 
@@ -134,9 +138,26 @@ impl<DB: Database, N: NodeTypes> From<DatabaseProviderRW<DB, N>>
     }
 }
 
+/// Block save mode for [`DatabaseProvider`].
+pub enum SaveBlocksMode {
+    /// Full mode: write block structure + receipts + state + trie.
+    /// Used by engine/production code.
+    Full,
+    /// Blocks only: write block structure (headers, txs, senders, indices).
+    /// Receipts/state/trie are skipped - they may come later via separate calls.
+    /// Used by `insert_block`.
+    BlocksOnly,
+}
+
+impl SaveBlocksMode {
+    /// Returns `true` if this is [`SaveBlocksMode::Full`].
+    pub const fn with_state(self) -> bool {
+        matches!(self, Self::Full)
+    }
+}
+
 /// A provider struct that fetches data from the database.
 /// Wrapper around [`DbTx`] and [`DbTxMut`]. Example: [`HeaderProvider`] [`BlockHashReader`]
-#[derive(Debug)]
 pub struct DatabaseProvider<TX, N: NodeTypes> {
     /// Database transaction.
     tx: TX,
@@ -148,6 +169,34 @@ pub struct DatabaseProvider<TX, N: NodeTypes> {
     prune_modes: PruneModes,
     /// Node storage handler.
     storage: Arc<N::Storage>,
+    /// Storage configuration settings for this node
+    storage_settings: Arc<RwLock<StorageSettings>>,
+    /// `RocksDB` provider
+    rocksdb_provider: RocksDBProvider,
+    /// Changeset cache for trie unwinding
+    changeset_cache: ChangesetCache,
+    /// Pending `RocksDB` batches to be committed at provider commit time.
+    #[cfg_attr(not(all(unix, feature = "rocksdb")), allow(dead_code))]
+    pending_rocksdb_batches: PendingRocksDBBatches,
+    /// Minimum distance from tip required for pruning
+    minimum_pruning_distance: u64,
+}
+
+impl<TX: Debug, N: NodeTypes> Debug for DatabaseProvider<TX, N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseProvider")
+            .field("tx", &self.tx)
+            .field("chain_spec", &self.chain_spec)
+            .field("static_file_provider", &self.static_file_provider)
+            .field("prune_modes", &self.prune_modes)
+            .field("storage", &self.storage)
+            .field("storage_settings", &self.storage_settings)
+            .field("rocksdb_provider", &self.rocksdb_provider)
+            .field("changeset_cache", &self.changeset_cache)
+            .field("pending_rocksdb_batches", &"<pending batches>")
+            .field("minimum_pruning_distance", &self.minimum_pruning_distance)
+            .finish()
+    }
 }
 
 impl<TX, N: NodeTypes> DatabaseProvider<TX, N> {
@@ -247,12 +296,14 @@ impl<TX: Debug + Send + Sync, N: NodeTypes<ChainSpec: EthChainSpec + 'static>> C
 
 impl<TX: DbTxMut, N: NodeTypes> DatabaseProvider<TX, N> {
     /// Creates a provider with an inner read-write transaction.
-    pub const fn new_rw(
+    pub fn new_rw(
         tx: TX,
         chain_spec: Arc<N::ChainSpec>,
         static_file_provider: StaticFileProvider<N::Primitives>,
         prune_modes: PruneModes,
         storage: Arc<N::Storage>,
+        storage_settings: Arc<RwLock<StorageSettings>>,
+        rocksdb_provider: RocksDBProvider,
     ) -> Self {
         Self {
             tx,
@@ -260,6 +311,11 @@ impl<TX: DbTxMut, N: NodeTypes> DatabaseProvider<TX, N> {
             static_file_provider,
             prune_modes,
             storage,
+            storage_settings,
+            rocksdb_provider,
+            changeset_cache: ChangesetCache::default(),
+            pending_rocksdb_batches: Arc::new(Mutex::new(Vec::new())),
+            minimum_pruning_distance: MINIMUM_PRUNING_DISTANCE,
         }
     }
 }
@@ -641,12 +697,14 @@ where
 
 impl<TX: DbTx + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
     /// Creates a provider with an inner read-only transaction.
-    pub const fn new(
+    pub fn new(
         tx: TX,
         chain_spec: Arc<N::ChainSpec>,
         static_file_provider: StaticFileProvider<N::Primitives>,
         prune_modes: PruneModes,
         storage: Arc<N::Storage>,
+        storage_settings: Arc<RwLock<StorageSettings>>,
+        rocksdb_provider: RocksDBProvider,
     ) -> Self {
         Self {
             tx,
@@ -654,6 +712,11 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> DatabaseProvider<TX, N> {
             static_file_provider,
             prune_modes,
             storage,
+            storage_settings,
+            rocksdb_provider,
+            changeset_cache: ChangesetCache::default(),
+            pending_rocksdb_batches: Arc::new(Mutex::new(Vec::new())),
+            minimum_pruning_distance: MINIMUM_PRUNING_DISTANCE,
         }
     }
 
@@ -3311,7 +3374,8 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
             next_tx_num += 1;
         }
 
-        self.append_block_bodies(vec![(block_number, Some(block.into_body()))])?;
+        let body = block.into_body();
+        self.append_block_bodies(vec![(block_number, Some(&body))])?;
 
         debug!(
             target: "providers::db",
@@ -3328,7 +3392,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider + 'static> BlockWrite
 
     fn append_block_bodies(
         &self,
-        bodies: Vec<(BlockNumber, Option<BodyTy<N>>)>,
+        bodies: Vec<(BlockNumber, Option<&BodyTy<N>>)>,
     ) -> ProviderResult<()> {
         let Some(from_block) = bodies.first().map(|(block, _)| *block) else {
             return Ok(());
@@ -3637,6 +3701,28 @@ impl<TX: DbTx + 'static, N: NodeTypes + 'static> DBProvider for DatabaseProvider
     }
 }
 
+impl<TX: Send, N: NodeTypes> StorageSettingsCache for DatabaseProvider<TX, N> {
+    fn cached_storage_settings(&self) -> StorageSettings {
+        *self.storage_settings.read().unwrap()
+    }
+
+    fn set_storage_settings_cache(&self, settings: StorageSettings) {
+        *self.storage_settings.write().unwrap() = settings;
+    }
+}
+
+impl<TX, N: NodeTypes> RocksDBProviderFactory for DatabaseProvider<TX, N> {
+    /// Returns the `RocksDB` provider.
+    fn rocksdb_provider(&self) -> RocksDBProvider {
+        self.rocksdb_provider.clone()
+    }
+
+    #[cfg(all(unix, feature = "rocksdb"))]
+    fn set_pending_rocksdb_batch(&self, batch: rocksdb::WriteBatchWithTransaction<true>) {
+        self.pending_rocksdb_batches.lock().push(batch);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3899,5 +3985,17 @@ mod tests {
         }
 
         assert_eq!(range_result, individual_results);
+    }
+}
+
+impl<TX: DbTxMut, N: NodeTypes> reth_storage_api::MetadataWriter for DatabaseProvider<TX, N> {
+    fn write_metadata(&self, key: &str, value: Vec<u8>) -> ProviderResult<()> {
+        self.tx.put::<tables::Metadata>(key.to_string(), value).map_err(Into::into)
+    }
+}
+
+impl<TX: DbTx, N: NodeTypes> reth_storage_api::MetadataProvider for DatabaseProvider<TX, N> {
+    fn get_metadata(&self, key: &str) -> ProviderResult<Option<Vec<u8>>> {
+        self.tx.get::<tables::Metadata>(key.to_string()).map_err(Into::into)
     }
 }

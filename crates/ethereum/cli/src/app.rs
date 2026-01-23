@@ -6,7 +6,7 @@ use eyre::{eyre, Result};
 use reth_chainspec::{ChainSpec, EthChainSpec};
 use reth_cli::chainspec::ChainSpecParser;
 use reth_cli_commands::{
-    common::{CliComponentsBuilder, CliHeader, CliNodeTypes},
+    common::{CliComponentsBuilder, HeaderMut, CliNodeTypes},
     launcher::{FnLauncher, Launcher},
 };
 use reth_cli_runner::CliRunner;
@@ -95,7 +95,7 @@ where
         ) -> Result<()>,
     ) -> Result<()>
     where
-        N: CliNodeTypes<Primitives: NodePrimitives<BlockHeader: CliHeader>, ChainSpec = ChainSpec>,
+        N: CliNodeTypes<Primitives: NodePrimitives<BlockHeader: HeaderMut>, ChainSpec = ChainSpec>,
         C: ChainSpecParser<ChainSpec = ChainSpec>,
     {
         let runner = match self.runner.take() {
@@ -149,7 +149,7 @@ where
     C: ChainSpecParser<ChainSpec = ChainSpec>,
     Ext: clap::Args + fmt::Debug,
     Rpc: RpcModuleValidator,
-    N: CliNodeTypes<Primitives: NodePrimitives<BlockHeader: CliHeader>, ChainSpec = ChainSpec>,
+    N: CliNodeTypes<Primitives: NodePrimitives<BlockHeader: HeaderMut>, ChainSpec = ChainSpec>,
 {
     match cli.command {
         Commands::Node(command) => {
@@ -172,7 +172,7 @@ where
         }
         Commands::ImportEra(command) => runner.run_blocking_until_ctrl_c(command.execute::<N>()),
         Commands::DumpGenesis(command) => runner.run_blocking_until_ctrl_c(command.execute()),
-        Commands::Db(command) => runner.run_blocking_until_ctrl_c(command.execute::<N>()),
+        Commands::Db(command) => runner.run_command_until_exit(|ctx| command.execute::<N>(ctx)),
         Commands::Download(command) => runner.run_blocking_until_ctrl_c(command.execute::<N>()),
         Commands::Stage(command) => {
             runner.run_command_until_exit(|ctx| command.execute::<N, _>(ctx, components))

@@ -25,7 +25,7 @@ use reth_node_ethereum::{consensus::EthBeaconConsensus, EthExecutorProvider};
 use reth_provider::{
     providers::ProviderNodeTypes, BlockNumReader, BlockWriter, ChainSpecProvider,
     DatabaseProviderFactory, LatestStateProviderRef, OriginalValuesKnown, ProviderFactory,
-    StateWriter,
+    StateWriteConfig, StateWriter,
 };
 use reth_revm::database::StateProviderDatabase;
 use reth_stages::{
@@ -142,7 +142,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
         info!(target: "reth::cli", target_block_number=self.to, "Finished downloading tip of block range");
 
         // build the full block client
-        let consensus: Arc<dyn Consensus<BlockTy<N>, Error = ConsensusError>> =
+        let consensus: Arc<dyn Consensus<BlockTy<N>>> =
             Arc::new(EthBeaconConsensus::new(provider_factory.chain_spec()));
         let block_range_client = FullBlockClient::new(fetch_client, consensus);
 
@@ -178,6 +178,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
             provider_rw.write_state(
                 &ExecutionOutcome::single(block_number, output),
                 OriginalValuesKnown::Yes,
+                StateWriteConfig::full(),
             )?;
 
             let checkpoint = Some(StageCheckpoint::new(

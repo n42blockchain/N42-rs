@@ -6,8 +6,8 @@ use crate::{
     ChainSpecProvider, ChainStateBlockReader, ChangeSetReader, DatabaseProvider,
     DatabaseProviderFactory, FullProvider, HashedPostStateProvider, HeaderProvider, ProviderError,
     ProviderFactory, PruneCheckpointReader, ReceiptProvider, ReceiptProviderIdExt,
-    StageCheckpointReader, StateProviderBox, StateProviderFactory, StateReader,
-    StaticFileProviderFactory, TransactionVariant, TransactionsProvider,
+    RocksDBProviderFactory, StageCheckpointReader, StateProviderBox, StateProviderFactory,
+    StateReader, StaticFileProviderFactory, TransactionVariant, TransactionsProvider,
 };
 use alloy_consensus::{transaction::TransactionMeta, Header};
 use alloy_eips::{
@@ -3165,5 +3165,24 @@ impl<N: ProviderNodeTypes> BeaconProviderWriter for BlockchainProvider<N> {
         provider.tx_ref().put::<TreeByHashForU64>(*tree_hash, tree)?;
         provider.commit()?;
         Ok(())
+    }
+}
+
+impl<N: NodeTypesWithDB> RocksDBProviderFactory for BlockchainProvider<N> {
+    fn rocksdb_provider(&self) -> crate::providers::rocksdb::RocksDBProvider {
+        self.database.rocksdb_provider()
+    }
+
+    #[cfg(all(unix, feature = "rocksdb"))]
+    fn set_pending_rocksdb_batch(&self, batch: rocksdb::WriteBatchWithTransaction<true>) {
+        self.database.set_pending_rocksdb_batch(batch)
+    }
+}
+
+impl<N: NodeTypesWithDB> reth_chain_state::PersistedBlockSubscriptions for BlockchainProvider<N> {
+    fn subscribe_persisted_block(&self) -> reth_chain_state::PersistedBlockNotifications {
+        reth_chain_state::PersistedBlockNotifications(
+            self.canonical_in_memory_state.subscribe_persisted_block()
+        )
     }
 }

@@ -7,9 +7,13 @@ pub use sealed::{Header, SealedHeader, SealedHeaderFor};
 mod error;
 pub use error::HeaderError;
 
+mod header_mut;
+pub use header_mut::HeaderMut;
+
 #[cfg(any(test, feature = "test-utils", feature = "arbitrary"))]
 pub mod test_utils;
 
+/// Clique consensus utilities for header manipulation and validation.
 pub mod clique_utils;
 
 #[cfg(test)]

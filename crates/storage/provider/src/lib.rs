@@ -25,7 +25,8 @@ pub mod providers;
 pub use providers::{
     DatabaseProvider, DatabaseProviderRO, DatabaseProviderRW, HistoricalStateProvider,
     HistoricalStateProviderRef, LatestStateProvider, LatestStateProviderRef, OverlayStateProvider,
-    OverlayStateProviderFactory, ProviderFactory, StaticFileAccess, StaticFileProviderBuilder, StaticFileWriter,
+    OverlayStateProviderFactory, ProviderFactory, SaveBlocksMode, StaticFileAccess,
+    StaticFileProviderBuilder, StaticFileWriter,
 };
 
 pub mod changeset_walker;
@@ -60,7 +61,11 @@ pub mod bundle_state;
 /// Writer standalone type.
 pub mod writer;
 
-pub(crate) fn to_range<R: std::ops::RangeBounds<u64>>(bounds: R) -> std::ops::Range<u64> {
+/// Converts a range bounds into a concrete range.
+///
+/// This helper function takes any type that implements `RangeBounds<u64>` and converts it into a
+/// concrete `Range<u64>`. This is useful for standardizing different range types.
+pub fn to_range<R: std::ops::RangeBounds<u64>>(bounds: R) -> std::ops::Range<u64> {
     let start = match bounds.start_bound() {
         std::ops::Bound::Included(&v) => v,
         std::ops::Bound::Excluded(&v) => v + 1,

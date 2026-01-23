@@ -638,6 +638,43 @@ pub fn update_indices<F>(&mut self, indices: &HashSet<usize>, mut f: F) -> Resul
         Ok(())
     }
 
+    /// Removes and returns the last element from the `VecTree`.
+    ///
+    /// This method always succeeds when the tree is non-empty, treating uninitialized
+    /// positions (holes) as containing `T::default()` values. This is SSZ-compatible
+    /// behavior where vectors are conceptually "filled" with defaults up to their capacity.
+    ///
+    /// # Collision Handling
+    ///
+    /// For types where `T::default().tree_hash_root() == zero_tree_root(0)` (e.g., `u64`),
+    /// this method preserves the internal collision leaf (`Tree::Leaf(T::default())`) to
+    /// maintain correct behavior for other uninitialized positions in the tree.
+    ///
+    /// # Returns
+    ///
+    /// * `Some(value)` - The value at the last position (or `T::default()` if it was a hole)
+    /// * `None` - If the tree is empty (`len() == 0`)
+    ///
+    /// # When to Use
+    ///
+    /// Use `pop()` when `T` implements `Default` and you want SSZ-compatible semantics
+    /// where holes are treated as default values. For types without `Default`, use
+    /// `try_pop()` instead, which can distinguish between actual values and holes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use merkle_db_rs::tree::VecTree;
+    /// # use typenum::U8;
+    /// let mut tree = VecTree::<u64, U8>::try_new(0).unwrap();
+    /// tree.push(42).unwrap();
+    ///
+    /// // Popping an actual value
+    /// assert_eq!(tree.pop(), Some(42));
+    ///
+    /// // Popping when empty returns None
+    /// assert_eq!(tree.pop(), None);
+    /// ```
     pub fn pop(&mut self) -> Option<T>
     where
         T: Default + Clone,
@@ -667,17 +704,52 @@ pub fn update_indices<F>(&mut self, indices: &HashSet<usize>, mut f: F) -> Resul
         Some(old_value_opt.unwrap_or_default())
     }
 
-    /// Tries to pop a value from the end of the `VecTree`.
+    /// Tries to pop a value from the end of the `VecTree`, distinguishing holes from values.
     ///
-    /// This is a "strict" version of `pop` that does **not** require `T: Default`.
+    /// Unlike `pop()`, this method can **fail** when encountering an uninitialized position
+    /// (a hole). This is useful for types that don't implement `Default`, where there's no
+    /// sensible default value to return for holes.
+    ///
+    /// # Semantic Difference from `pop()`
+    ///
+    /// - **`pop()`**: Treats holes as `T::default()`, always succeeds (requires `T: Default`)
+    /// - **`try_pop()`**: Fails on holes with `PoppedEmptySlot` error (no `T: Default` needed)
+    ///
+    /// # Collision Safety
+    ///
+    /// This method is safe to use with types that don't implement `Default`. Types without
+    /// `Default` cannot be collision types (where `hash(default) == hash(empty)`), so this
+    /// method safely uses `Tree::Zero(0)` for the popped position without corrupting the tree.
     ///
     /// # Returns
     ///
-    /// * `Ok(Some(value))` if a leaf with a value was popped.
-    /// * `Ok(None)` if the `VecTree` was already empty (i.e., `len() == 0`).
-    /// * `Err(Error::PoppedEmptySlot)` if the `VecTree` was *not* empty,
-    ///   but the leaf being popped was already a `Zero` node (an empty slot).
-    ///   This is the "zero case" – `pop()` would have returned `Some(T::default())`.
+    /// * `Ok(Some(value))` - Successfully popped an actual value
+    /// * `Ok(None)` - The tree was already empty (`len() == 0`)
+    /// * `Err(Error::PoppedEmptySlot)` - The position was a hole (uninitialized)
+    ///
+    /// # When to Use
+    ///
+    /// Use `try_pop()` when:
+    /// - `T` does not implement `Default`
+    /// - You need to distinguish between actual values and holes
+    /// - You want strict validation that you're not popping uninitialized data
+    ///
+    /// For types with `Default` where holes should be treated as defaults, use `pop()` instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use merkle_db_rs::tree::VecTree;
+    /// # use typenum::U8;
+    /// let mut tree = VecTree::<u64, U8>::try_new(0).unwrap();
+    /// tree.push(42).unwrap();
+    ///
+    /// // Popping an actual value succeeds
+    /// assert_eq!(tree.try_pop(), Ok(Some(42)));
+    ///
+    /// // Popping when empty returns Ok(None)
+    /// assert_eq!(tree.try_pop(), Ok(None));
+    /// ```
     pub fn try_pop(&mut self) -> Result<Option<T>, Error>
     where T: Clone
     {
@@ -1891,6 +1963,365 @@ fn test_prune_after_set_updates() {
         let zero_hash = zero_tree_root(0);
         assert!(matches!(tree.kv.get(&zero_hash), Some(Tree::Leaf(v)) if *v == 0),
             "update_indices must store Tree::Leaf even for default values");
+    }
+
+    // ==================== Collision Mechanism Coverage Tests ====================
+
+    #[test]
+    fn test_collision_get_implicit_zeros() {
+        // Core collision test: Reading uninitialized positions should return Some(&0) for u64
+        let tree = VecTree::<u64, U8>::try_new(8).unwrap();
+
+        // All positions should return Some(&0) even though nothing was set
+        for i in 0..8 {
+            assert_eq!(tree.get(i), Some(&0u64),
+                "Collision type should return default for uninitialized position {}", i);
+        }
+
+        // Verify the collision leaf exists in kv store
+        let zero_hash = zero_tree_root(0);
+        assert!(matches!(tree.kv.get(&zero_hash), Some(Tree::Leaf(v)) if *v == 0),
+            "Collision leaf must exist for implicit zero reads");
+    }
+
+    #[test]
+    fn test_collision_pop_with_holes() {
+        // Test popping holes on collision types returns defaults correctly
+        let mut tree = VecTree::<u64, U8>::try_new(3).unwrap();
+
+        // Set only middle element
+        tree.set(1, 42).unwrap();
+
+        // Pop position 2 (a hole) - should return default (0)
+        assert_eq!(tree.pop(), Some(0u64));
+        assert_eq!(tree.len(), 2);
+
+        // Pop position 1 (actual value) - should return 42
+        assert_eq!(tree.pop(), Some(42u64));
+        assert_eq!(tree.len(), 1);
+
+        // Pop position 0 (a hole) - should return default (0)
+        assert_eq!(tree.pop(), Some(0u64));
+        assert_eq!(tree.len(), 0);
+
+        // Verify collision leaf still exists after all pops
+        let zero_hash = zero_tree_root(0);
+        assert!(tree.kv.contains_key(&zero_hash),
+            "Collision leaf must survive pop operations");
+    }
+
+    #[test]
+    fn test_collision_explicit_default_vs_hole() {
+        // Test that explicitly setting default value vs hole are indistinguishable
+        let mut tree1 = VecTree::<u64, U8>::try_new(2).unwrap();
+        let tree2 = VecTree::<u64, U8>::try_new(2).unwrap();
+
+        // tree1: explicitly set to default
+        tree1.set(0, 0).unwrap();
+        tree1.set(1, 0).unwrap();
+
+        // tree2: leave as holes (implicit defaults)
+        // Nothing set
+
+        // Both should have the same root (SSZ semantics)
+        assert_eq!(tree1.root(), tree2.root(),
+            "Explicit defaults and holes should produce same merkle root");
+
+        // Both should read the same
+        assert_eq!(tree1.get(0), Some(&0u64));
+        assert_eq!(tree2.get(0), Some(&0u64));
+        assert_eq!(tree1.get(1), Some(&0u64));
+        assert_eq!(tree2.get(1), Some(&0u64));
+    }
+
+    #[test]
+    fn test_collision_restore_preserves_collision_leaf() {
+        // Test that restore() correctly rebuilds collision leaf
+        let mut original = VecTree::<u64, U8>::try_new(4).unwrap();
+        original.set(2, 100).unwrap();
+
+        // Create a database (HashMap) to save to
+        let mut db = HashMap::new();
+        original.save(|hash, tree| {
+            db.insert(*hash, tree.clone());
+            Ok::<(), ()>(())
+        }).unwrap();
+
+        // Restore from the database
+        let restored = VecTree::<u64, U8>::restore(
+            original.root(),
+            original.len() as u64,
+            |hash| db.get(hash).cloned()
+        ).unwrap();
+
+        // Verify collision leaf exists
+        let zero_hash = zero_tree_root(0);
+        assert!(matches!(restored.kv.get(&zero_hash), Some(Tree::Leaf(v)) if *v == 0),
+            "Restored tree must have collision leaf");
+
+        // Verify we can read implicit zeros
+        assert_eq!(restored.get(0), Some(&0u64));
+        assert_eq!(restored.get(1), Some(&0u64));
+        assert_eq!(restored.get(2), Some(&100u64));
+        assert_eq!(restored.get(3), Some(&0u64));
+    }
+
+    #[test]
+    fn test_collision_clear_reinitializes_correctly() {
+        // Test that clear() returns tree to initial state
+        let mut tree = VecTree::<u64, U8>::try_new(4).unwrap();
+        tree.push(10).unwrap();
+        tree.push(20).unwrap();
+
+        tree.clear();
+
+        // After clear, tree is empty and back to initial state
+        assert_eq!(tree.len(), 0);
+        assert_eq!(tree.root(), zero_tree_root(tree.height));
+
+        // Should be able to use the tree normally after clear
+        tree.push(30).unwrap();
+        assert_eq!(tree.get(0), Some(&30u64));
+    }
+
+    #[test]
+    fn test_collision_mixed_operations_sparse_tree() {
+        // Complex scenario: mix of sets, gets, pops, pushes on sparse tree
+        let mut tree = VecTree::<u64, U8>::try_new(7).unwrap();
+
+        // Set sparse values
+        tree.set(2, 22).unwrap();
+        tree.set(5, 55).unwrap();
+        tree.set(6, 66).unwrap();
+
+        // Read holes (should return defaults)
+        assert_eq!(tree.get(0), Some(&0u64));
+        assert_eq!(tree.get(1), Some(&0u64));
+        assert_eq!(tree.get(3), Some(&0u64));
+        assert_eq!(tree.get(4), Some(&0u64));
+
+        // Read actual values
+        assert_eq!(tree.get(2), Some(&22u64));
+        assert_eq!(tree.get(5), Some(&55u64));
+        assert_eq!(tree.get(6), Some(&66u64));
+
+        // Overwrite a position with default
+        tree.set(5, 0).unwrap();
+        assert_eq!(tree.get(5), Some(&0u64));
+
+        // Push to extend length (now length is 8)
+        tree.push(77).unwrap();
+        assert_eq!(tree.get(7), Some(&77u64));
+
+        // Pop back
+        assert_eq!(tree.pop(), Some(77u64));
+
+        // Verify collision leaf still intact
+        let zero_hash = zero_tree_root(0);
+        assert!(matches!(tree.kv.get(&zero_hash), Some(Tree::Leaf(v)) if *v == 0));
+    }
+
+    #[test]
+    fn test_collision_prune_after_multiple_ops() {
+        // Verify collision leaf survives prune after various operations
+        let mut tree = VecTree::<u64, U8>::try_new(4).unwrap();
+
+        // Multiple operations
+        tree.push(10).unwrap();
+        tree.push(20).unwrap();
+        tree.pop();
+        tree.push(30).unwrap();
+        tree.set(0, 0).unwrap(); // Set to default
+
+        tree.prune();
+
+        // Collision leaf must still exist
+        let zero_hash = zero_tree_root(0);
+        assert!(tree.kv.contains_key(&zero_hash),
+            "Prune must not remove collision leaf");
+
+        // Should still be able to read defaults
+        assert_eq!(tree.get(0), Some(&0u64));
+    }
+
+    // ==================== Edge Cases ====================
+
+    #[test]
+    fn test_height_zero_tree_collision() {
+        // Tree with capacity 1 (height 0) - edge case
+        use typenum::U1;
+        let mut tree = VecTree::<u64, U1>::try_new(1).unwrap();
+
+        // The root IS the leaf for height 0
+        assert_eq!(tree.height, 0);
+
+        // Should still have collision leaf
+        let zero_hash = zero_tree_root(0);
+        assert!(tree.kv.contains_key(&zero_hash));
+
+        // Get should work
+        assert_eq!(tree.get(0), Some(&0u64));
+
+        // Set and get
+        tree.set(0, 99).unwrap();
+        assert_eq!(tree.get(0), Some(&99u64));
+    }
+
+    #[test]
+    fn test_update_indices_height_zero() {
+        use typenum::U1;
+        let mut tree = VecTree::<u64, U1>::try_new(1).unwrap();
+
+        let mut indices = HashSet::new();
+        indices.insert(0);
+
+        tree.update_indices(&indices, |_, val| {
+            *val = 42;
+        }).unwrap();
+
+        assert_eq!(tree.get(0), Some(&42u64));
+        // Root should be updated directly
+        assert_eq!(tree.root(), 42u64.tree_hash_root());
+    }
+
+    #[test]
+    fn test_update_indices_all_indices() {
+        // Update every single index in the tree
+        let mut tree = VecTree::<u64, U8>::try_new(8).unwrap();
+
+        let indices: HashSet<usize> = (0..8).collect();
+        tree.update_indices(&indices, |idx, val| {
+            *val = (idx * 10) as u64;
+        }).unwrap();
+
+        // Verify all values
+        for i in 0..8 {
+            assert_eq!(tree.get(i), Some(&((i * 10) as u64)));
+        }
+    }
+
+    #[test]
+    fn test_update_indices_interleaved_with_set() {
+        let mut tree = VecTree::<u64, U8>::try_new(8).unwrap();
+
+        // First update_indices
+        let mut indices = HashSet::new();
+        indices.insert(0);
+        indices.insert(2);
+        tree.update_indices(&indices, |idx, val| {
+            *val = idx as u64;
+        }).unwrap();
+
+        // Then manual set
+        tree.set(1, 100).unwrap();
+        tree.set(3, 300).unwrap();
+
+        // Another update_indices
+        let mut indices2 = HashSet::new();
+        indices2.insert(0);
+        indices2.insert(1);
+        tree.update_indices(&indices2, |_, val| {
+            *val += 1000;
+        }).unwrap();
+
+        // Verify final state
+        assert_eq!(tree.get(0), Some(&1000u64)); // 0 + 1000
+        assert_eq!(tree.get(1), Some(&1100u64)); // 100 + 1000
+        assert_eq!(tree.get(2), Some(&2u64));    // unchanged
+        assert_eq!(tree.get(3), Some(&300u64));  // unchanged
+    }
+
+    #[test]
+    fn test_update_indices_empty_to_default() {
+        // Update indices to explicitly set defaults (collision edge case)
+        let mut tree = VecTree::<u64, U8>::try_new(8).unwrap();
+
+        let indices: HashSet<usize> = (0..4).collect();
+        tree.update_indices(&indices, |_, val| {
+            *val = 0; // Explicitly set to default
+        }).unwrap();
+
+        // All should read as 0
+        for i in 0..4 {
+            assert_eq!(tree.get(i), Some(&0u64));
+        }
+
+        // But tree root should still be zero_tree_root (SSZ semantics)
+        assert_eq!(tree.root(), zero_tree_root(3));
+    }
+
+    #[test]
+    fn test_collision_multiple_pops_sparse() {
+        // Pop multiple times from sparse tree with collision type
+        let mut tree = VecTree::<u64, U8>::try_new(5).unwrap();
+
+        // Only set position 2
+        tree.set(2, 42).unwrap();
+
+        // Pop 4 (hole) -> default
+        assert_eq!(tree.pop(), Some(0u64));
+        assert_eq!(tree.len(), 4);
+
+        // Pop 3 (hole) -> default
+        assert_eq!(tree.pop(), Some(0u64));
+        assert_eq!(tree.len(), 3);
+
+        // Pop 2 (value) -> 42
+        assert_eq!(tree.pop(), Some(42u64));
+        assert_eq!(tree.len(), 2);
+
+        // Pop 1 (hole) -> default
+        assert_eq!(tree.pop(), Some(0u64));
+        assert_eq!(tree.len(), 1);
+
+        // Pop 0 (hole) -> default
+        assert_eq!(tree.pop(), Some(0u64));
+        assert_eq!(tree.len(), 0);
+
+        // Verify collision leaf still exists
+        let zero_hash = zero_tree_root(0);
+        assert!(tree.kv.contains_key(&zero_hash));
+    }
+
+    #[test]
+    fn test_try_pop_preserves_values() {
+        // Verify try_pop works correctly with actual values
+        let mut tree = VecTree::<u64, U8>::try_new(0).unwrap();
+
+        // Push actual values
+        tree.push(10).unwrap();
+        tree.push(20).unwrap();
+        tree.push(30).unwrap();
+
+        // Pop them back
+        assert_eq!(tree.try_pop(), Ok(Some(30)));
+        assert_eq!(tree.try_pop(), Ok(Some(20)));
+        assert_eq!(tree.try_pop(), Ok(Some(10)));
+        assert_eq!(tree.try_pop(), Ok(None));
+    }
+
+    #[test]
+    fn test_from_vec_collision_type() {
+        // Test from_vec with collision type includes collision leaf
+        let elements = vec![10u64, 0, 20, 0, 30];
+        let tree = VecTree::<u64, U8>::from_vec(elements).unwrap();
+
+        // Verify values
+        assert_eq!(tree.get(0), Some(&10u64));
+        assert_eq!(tree.get(1), Some(&0u64));
+        assert_eq!(tree.get(2), Some(&20u64));
+        assert_eq!(tree.get(3), Some(&0u64));
+        assert_eq!(tree.get(4), Some(&30u64));
+
+        // Verify collision leaf exists
+        let zero_hash = zero_tree_root(0);
+        assert!(matches!(tree.kv.get(&zero_hash), Some(Tree::Leaf(v)) if *v == 0));
+
+        // Reading beyond length returns None (bounds check)
+        assert_eq!(tree.len(), 5);
+        assert_eq!(tree.get(5), None);
+        assert_eq!(tree.get(6), None);
+        assert_eq!(tree.get(7), None);
     }
 
 }

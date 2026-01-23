@@ -544,6 +544,100 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
         hash
     }
 
+pub fn update_indices<F>(&mut self, indices: &HashSet<usize>, mut f: F) -> Result<(), Error>
+    where
+        F: FnMut(usize, &mut T),
+        T: Clone + Default + PartialEq, // Added PartialEq for efficient detection
+    {
+        if indices.is_empty() {
+            return Ok(());
+        }
+
+        // 1. Pre-validation for Atomicity
+        for &idx in indices {
+            if idx >= self.len() {
+                return Err(Error::OutOfBoundsUpdate {
+                    index: idx as u64,
+                    len: self.vec_len,
+                });
+            }
+        }
+
+        let mut updated_hashes: HashMap<usize, Hash256> = HashMap::new();
+        let default_val = T::default();
+
+        // 2. Leaf Update Phase with Value Comparison
+        for &idx in indices {
+            let old_val = self.get(idx).cloned().unwrap_or_else(|| default_val.clone());
+            let mut new_val = old_val.clone();
+            
+            f(idx, &mut new_val);
+
+            // Optimization: If the value didn't change, avoid the expensive tree_hash_root()
+            if old_val == new_val {
+                continue;
+            }
+
+            // Only hash if a change occurred
+            let new_hash = new_val.tree_hash_root();
+
+            // Always store as Leaf since we have an actual value from the closure.
+            // This matches the behavior of update_leaf() when called with Some(value).
+            // The Zero(0) optimization is only for explicit removals (None), which
+            // update_indices doesn't support - it always produces a value.
+            self.kv.insert(new_hash, Tree::Leaf(new_val));
+
+            updated_hashes.insert(idx, new_hash);
+        }
+
+        // If no values actually changed, early exit
+        if updated_hashes.is_empty() {
+            return Ok(());
+        }
+
+        // 3. Bubble Up Phase
+        for h in 0..self.height {
+            let mut next_level_updates = HashMap::new();
+            let target_zero_hash = zero_tree_root(h + 1);
+
+            for (&idx, _) in &updated_hashes {
+                let parent_idx = idx >> 1;
+                if next_level_updates.contains_key(&parent_idx) {
+                    continue;
+                }
+
+                let left_idx = parent_idx << 1;
+                let right_idx = left_idx + 1;
+
+                let left = updated_hashes.get(&left_idx).cloned()
+                    .unwrap_or_else(|| self.get_hash_at_level(left_idx, h));
+                
+                let right = updated_hashes.get(&right_idx).cloned()
+                    .unwrap_or_else(|| self.get_hash_at_level(right_idx, h));
+
+                let mut hasher = Sha256::new();
+                hasher.update(left.as_slice());
+                hasher.update(right.as_slice());
+                let parent_hash = Hash256::from_slice(&hasher.finalize());
+
+                if parent_hash == target_zero_hash {
+                    self.kv.insert(parent_hash, Tree::Zero(h + 1));
+                } else {
+                    self.kv.insert(parent_hash, Tree::Node { left, right });
+                }
+
+                next_level_updates.insert(parent_idx, parent_hash);
+            }
+            updated_hashes = next_level_updates;
+        }
+
+        if let Some(&new_root) = updated_hashes.get(&0) {
+            self.root = new_root;
+        }
+
+        Ok(())
+    }
+
     pub fn pop(&mut self) -> Option<T>
     where
         T: Default + Clone,
@@ -1660,4 +1754,143 @@ fn test_prune_after_set_updates() {
         println!("Speedup:           {:.2}x", speedup);
         println!("=================================================\n");
     }
+
+#[test]
+    fn test_update_with_index_and_mutation() {
+        let mut tree = VecTree::<u64, U8>::try_new(8).unwrap();
+        let mut set = HashSet::new();
+        set.insert(1);
+        set.insert(3);
+        set.insert(5);
+
+        // Closure now uses both the index and the mutable reference
+        tree.update_indices(&set, |idx, val| {
+            *val = (idx * 10) as u64;
+        }).unwrap();
+
+        assert_eq!(tree.get(1), Some(&10u64));
+        assert_eq!(tree.get(3), Some(&30u64));
+        assert_eq!(tree.get(5), Some(&50u64));
+        assert_eq!(tree.get(0), Some(&0u64)); // Unchanged
+    }
+
+    #[test]
+    fn test_update_indices_shared_parent_bubble() {
+        let mut tree = VecTree::<u64, U8>::try_new(8).unwrap();
+
+        // Indices 0 and 1 share a direct parent at height 1
+        let mut indices = HashSet::new();
+        indices.insert(0);
+        indices.insert(1);
+
+        tree.update_indices(&indices, |_idx, val| {
+            *val = 100;
+        }).unwrap();
+
+        assert_eq!(tree.get(0), Some(&100u64));
+        assert_eq!(tree.get(1), Some(&100u64));
+
+        // Verify the internal node structure was updated in the KV store
+        let root_node = tree.kv.get(&tree.root()).unwrap();
+        if let Tree::Node { left, .. } = root_node {
+            // "left" is the hash of the subtree containing index 0 and 1
+            assert!(tree.kv.contains_key(left), "Intermediate node missing from KV store");
+        } else {
+            panic!("Root should be a Node");
+        }
+    }
+
+    #[test]
+    fn test_update_indices_collision_u64_recovery() {
+        // u64 is a collision type: hash(0) == zero_root(0)
+        let mut tree = VecTree::<u64, U8>::try_new(8).unwrap();
+        let mut set = HashSet::new();
+        set.insert(0);
+
+        // 1. Change to non-zero
+        tree.update_indices(&set, |_, v| *v = 42).unwrap();
+        assert_ne!(tree.root(), zero_tree_root(3));
+
+        // 2. Change back to zero (the collision value)
+        tree.update_indices(&set, |_, v| *v = 0).unwrap();
+
+        assert_eq!(tree.get(0), Some(&0u64));
+        // Tree should mathematically converge back to the empty root
+        assert_eq!(tree.root(), zero_tree_root(3));
+
+        // Critical: Check internal storage.
+        // For collision types, the zero_root(0) MUST be stored as a Leaf.
+        assert!(matches!(tree.kv.get(&zero_tree_root(0)), Some(Tree::Leaf(_))));
+    }
+
+    #[test]
+    fn test_update_indices_atomicity_and_oob() {
+        let mut tree = VecTree::<u64, U8>::try_new(4).unwrap();
+        let root_before = tree.root();
+
+        let mut set = HashSet::new();
+        set.insert(1);
+        set.insert(99); // Out of bounds index
+
+        // This should fail during the pre-validation step
+        let result = tree.update_indices(&set, |_, v| *v = 1000);
+
+        assert!(result.is_err());
+        // Verify tree state remains untouched
+        assert_eq!(tree.root(), root_before);
+        assert_eq!(tree.get(1), Some(&0u64));
+    }
+
+    #[test]
+    fn test_update_indices_consistency_vs_set() {
+        let mut tree_batch = VecTree::<u64, U8>::try_new(8).unwrap();
+        let mut tree_single = VecTree::<u64, U8>::try_new(8).unwrap();
+
+        let indices = vec![0, 2, 4, 6];
+        let mut set = HashSet::new();
+
+        for &i in &indices {
+            set.insert(i);
+            tree_single.set(i, (i + 1) as u64).unwrap();
+        }
+
+        // Apply same updates via batch
+        tree_batch.update_indices(&set, |idx, val| {
+            *val = (idx + 1) as u64;
+        }).unwrap();
+
+        assert_eq!(tree_batch.root(), tree_single.root(), "Batch update produced different root than sequential set()");
+    }
+
+    #[test]
+    fn test_update_indices_always_stores_leaf() {
+        // Verify that update_indices always stores Tree::Leaf, never Tree::Zero(0)
+        // for actual values produced by the closure, even for default values
+        let mut tree = VecTree::<u64, U8>::try_new(8).unwrap();
+        let mut set = HashSet::new();
+        set.insert(0);
+        set.insert(1);
+
+        // Update to non-default values
+        tree.update_indices(&set, |idx, val| {
+            *val = (idx + 10) as u64;
+        }).unwrap();
+
+        // Check that leaves are stored as Leaf nodes
+        let hash_10 = 10u64.tree_hash_root();
+        let hash_11 = 11u64.tree_hash_root();
+        assert!(matches!(tree.kv.get(&hash_10), Some(Tree::Leaf(v)) if *v == 10));
+        assert!(matches!(tree.kv.get(&hash_11), Some(Tree::Leaf(v)) if *v == 11));
+
+        // Update back to default (0) - even for collision types, should store Leaf
+        tree.update_indices(&set, |_, val| {
+            *val = 0;
+        }).unwrap();
+
+        // For u64 collision type, zero_tree_root(0) should map to Tree::Leaf(0)
+        let zero_hash = zero_tree_root(0);
+        assert!(matches!(tree.kv.get(&zero_hash), Some(Tree::Leaf(v)) if *v == 0),
+            "update_indices must store Tree::Leaf even for default values");
+    }
+
 }

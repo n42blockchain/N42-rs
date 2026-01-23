@@ -486,7 +486,10 @@ impl BeaconState {
         new_beacon_state.slot += 1;
         new_beacon_state.build_total_active_balance_cache(&spec)?;
         if (new_beacon_state.slot) % SLOTS_PER_EPOCH == 0 {
+            let start = Instant::now();
             new_beacon_state.process_epoch(&spec)?;
+            let duration_process_epoch = start.elapsed();
+            debug!(?duration_process_epoch);
         }
         new_beacon_state.process_block(&beacon_block, &spec)?;
 
@@ -510,17 +513,14 @@ impl BeaconState {
         */
         let mut new_total_active_balance: u64 = 0;
 
-        for index in (0..self.balances_store.len()) {
-            //let balance = self.balances[index].min(spec.max_effective_balance);
-            let balance = self.balances_store.get(index).ok_or(eyre::eyre!("BalanceNotfound"))?.min(&spec.max_effective_balance);
+        self.validators_store.update_indices(&(0..self.validators_store.len()).collect(), |index, validator| {
+            let balance = self.balances_store.get(index).unwrap().min(&spec.max_effective_balance);
             let new_effective_balance = round_to_nearest(*balance, spec.effective_balance_increment);
-            let mut validator = self.validators_store.get(index).ok_or(eyre::eyre!("ValidatorNotfound"))?.clone();
             if new_effective_balance != validator.effective_balance {
                 validator.effective_balance = new_effective_balance;
-                self.validators_store.set(index, validator)?;
             }
             new_total_active_balance = new_total_active_balance.saturating_add(new_effective_balance);
-        }
+        })?;
         self.total_active_balance.replace(TotalActiveBalance(self.current_epoch(),
         std::cmp::max(
             new_total_active_balance,
@@ -540,19 +540,9 @@ impl BeaconState {
 
         let epoch = self.previous_epoch();
         let active_validator_indices = self.get_active_validator_indices(epoch);
-        for validator_index in active_validator_indices {
-            let is_active = self.epoch_attester_indexes_set.contains(&(validator_index as u64));
-            let mut inactivity_score = self.inactivity_scores_store.get(validator_index).ok_or(eyre::eyre!("InactivityScoreNotfound"))?.clone();
-            if is_active {
-                inactivity_score = inactivity_score.saturating_sub(spec.inactivity_score_recovery_rate);
-            } else {
-                if inactivity_score < spec.max_inactivity_score {
-                    inactivity_score = inactivity_score.saturating_add(spec.inactivity_score_bias);
-                }
-            }
-            self.inactivity_scores_store.set(validator_index, inactivity_score)?;
-            /*
-            let inactivity_score = self.get_inactivity_score_mut(validator_index)?;
+
+        self.inactivity_scores_store.update_indices(&active_validator_indices.into_iter().collect(), |index, inactivity_score| {
+            let is_active = self.epoch_attester_indexes_set.contains(&(index as u64));
             if is_active {
                 *inactivity_score = inactivity_score.saturating_sub(spec.inactivity_score_recovery_rate);
             } else {
@@ -560,10 +550,8 @@ impl BeaconState {
                     *inactivity_score = inactivity_score.saturating_add(spec.inactivity_score_bias);
                 }
             }
-            */
-        }
+        })?;
         let validator_statuses = ValidatorStatuses::new(self, spec)?;
-
         self.epoch_attester_indexes_store.clear();
         self.epoch_attester_indexes_set.clear();
 

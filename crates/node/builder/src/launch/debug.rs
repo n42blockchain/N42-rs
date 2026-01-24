@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use super::LaunchNode;
 use crate::{rpc::RethRpcAddOns, EngineNodeLauncher, Node, NodeHandle};
 use alloy_provider::network::AnyNetwork;
@@ -121,9 +124,12 @@ where
                 Arc::new(block_provider),
             );
 
-            handle.node.task_executor.spawn_critical("rpc-ws consensus client", async move {
-                rpc_consensus_client.run().await
-            });
+            handle
+                .node
+                .task_executor
+                .spawn_critical("rpc-ws consensus client", async move {
+                    rpc_consensus_client.run().await
+                });
         }
 
         if let Some(maybe_custom_etherscan_url) = config.debug.etherscan.clone() {
@@ -145,15 +151,19 @@ where
                         "etherscan api key not found for rpc consensus client for chain: {chain}"
                     )
                 })?,
+                chain.id(),
                 N::Types::rpc_to_primitive_block,
             );
             let rpc_consensus_client = DebugConsensusClient::new(
                 handle.node.add_ons_handle.beacon_engine_handle.clone(),
                 Arc::new(block_provider),
             );
-            handle.node.task_executor.spawn_critical("etherscan consensus client", async move {
-                rpc_consensus_client.run().await
-            });
+            handle
+                .node
+                .task_executor
+                .spawn_critical("etherscan consensus client", async move {
+                    rpc_consensus_client.run().await
+                });
         }
 
         Ok(handle)

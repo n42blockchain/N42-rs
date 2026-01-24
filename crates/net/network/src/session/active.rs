@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Represents an established session.
 
 use core::sync::atomic::Ordering;
@@ -298,6 +301,12 @@ impl<N: NetworkPrimitives> ActiveSession<N> {
                 }
 
                 OnIncomingMessageOutcome::Ok
+            }
+            EthMessage::GetReceipts70(req) => {
+                on_request!(req, Receipts70, GetReceipts70)
+            }
+            EthMessage::Receipts70(resp) => {
+                on_response!(resp, GetReceipts70)
             }
             EthMessage::Other(bytes) => self.try_emit_broadcast(PeerMessage::Other(bytes)).into(),
         }

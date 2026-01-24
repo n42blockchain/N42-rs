@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Transaction pool arguments
 
 use crate::cli::config::RethTransactionPoolConfig;
@@ -65,6 +68,11 @@ pub struct TxPoolArgs {
     #[arg(long = "txpool.minimal-protocol-fee", default_value_t = MIN_PROTOCOL_BASE_FEE)]
     pub minimal_protocol_basefee: u64,
 
+    /// Minimum priority fee required for transaction acceptance into the pool.
+    /// Transactions with priority fee below this value will be rejected.
+    #[arg(long = "txpool.minimum-priority-fee")]
+    pub minimum_priority_fee: Option<u128>,
+
     /// The default enforced gas limit for transactions entering the pool
     #[arg(long = "txpool.gas-limit", default_value_t = ETHEREUM_BLOCK_GAS_LIMIT_30M)]
     pub enforced_gas_limit: u64,
@@ -112,7 +120,11 @@ pub struct TxPoolArgs {
     pub max_queued_lifetime: Duration,
 
     /// Path to store the local transaction backup at, to survive node restarts.
-    #[arg(long = "txpool.transactions-backup", alias = "txpool.journal", value_name = "PATH")]
+    #[arg(
+        long = "txpool.transactions-backup",
+        alias = "txpool.journal",
+        value_name = "PATH"
+    )]
     pub transactions_backup_path: Option<std::path::PathBuf>,
 
     /// Disables transaction backup to disk on node shutdown.
@@ -139,6 +151,7 @@ impl Default for TxPoolArgs {
             max_account_slots: TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER,
             price_bump: DEFAULT_PRICE_BUMP,
             minimal_protocol_basefee: MIN_PROTOCOL_BASE_FEE,
+            minimum_priority_fee: None,
             enforced_gas_limit: ETHEREUM_BLOCK_GAS_LIMIT_30M,
             blob_transaction_price_bump: REPLACE_BLOB_PRICE_BUMP,
             max_tx_input_bytes: DEFAULT_MAX_TX_INPUT_BYTES,
@@ -189,11 +202,13 @@ impl RethTransactionPoolConfig for TxPoolArgs {
                 replace_blob_tx_price_bump: self.blob_transaction_price_bump,
             },
             minimal_protocol_basefee: self.minimal_protocol_basefee,
+            minimum_priority_fee: self.minimum_priority_fee,
             gas_limit: self.enforced_gas_limit,
             pending_tx_listener_buffer_size: self.pending_tx_listener_buffer_size,
             new_tx_listener_buffer_size: self.new_tx_listener_buffer_size,
             max_new_pending_txs_notifications: self.max_new_pending_txs_notifications,
             max_queued_lifetime: self.max_queued_lifetime,
+            ..Default::default()
         }
     }
 }

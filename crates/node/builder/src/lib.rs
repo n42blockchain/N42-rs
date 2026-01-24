@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Standalone crate for Reth configuration and builder types.
 //!
 //! # features
@@ -10,6 +13,19 @@
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+
+// Suppress unused_crate_dependencies warnings for crates that are used indirectly
+// or needed for type definitions
+#[cfg(not(test))]
+use alloy_signer_local as _;
+#[cfg(not(test))]
+use consensus_client as _;
+#[cfg(not(test))]
+use n42_engine_primitives as _;
+#[cfg(not(test))]
+use reth_ethereum_primitives as _;
+#[cfg(not(test))]
+use reth_primitives as _;
 
 /// Node event hooks.
 pub mod hooks;

@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! EVM config for vanilla ethereum.
 //!
 //! # Revm features
@@ -26,7 +29,7 @@ use alloy_evm::{
 };
 use alloy_primitives::{Bytes, U256};
 use core::{convert::Infallible, fmt::Debug};
-use reth_chainspec::{ChainSpec, EthChainSpec, MAINNET};
+use reth_chainspec::{ChainSpec, EthChainSpec, Hardforks, MAINNET};
 use reth_ethereum_primitives::{Block, EthPrimitives, TransactionSigned};
 use reth_evm::{
     precompiles::PrecompilesMap, ConfigureEvm, EvmEnv, EvmFactory, NextBlockEnvAttributes,
@@ -129,6 +132,7 @@ where
                     + FromRecoveredTx<TransactionSigned>
                     + FromTxWithEncoded<TransactionSigned>,
             Spec = SpecId,
+            BlockEnv = BlockEnv,
             Precompiles = PrecompilesMap,
         > + Clone
         + Debug
@@ -151,13 +155,13 @@ where
         &self.block_assembler
     }
 
-    fn evm_env(&self, header: &Header) -> EvmEnv {
+    fn evm_env(&self, header: &Header) -> Result<EvmEnv<SpecId>, Self::Error> {
         let blob_params = self.chain_spec().blob_params_at_timestamp(header.timestamp);
         let spec = config::revm_spec(self.chain_spec(), header);
 
         // configure evm env based on parent block
         let mut cfg_env =
-            CfgEnv::new().with_chain_id(self.chain_spec().chain().id()).with_spec(spec);
+            CfgEnv::new_with_spec(spec).with_chain_id(self.chain_spec().chain().id());
 
         if let Some(blob_params) = &blob_params {
             cfg_env.set_max_blobs_per_tx(blob_params.max_blobs_per_tx);
@@ -187,7 +191,7 @@ where
             blob_excess_gas_and_price,
         };
 
-        EvmEnv { cfg_env, block_env }
+        Ok(EvmEnv::new(cfg_env, block_env))
     }
 
     fn next_evm_env(
@@ -206,17 +210,17 @@ where
 
         // configure evm env based on parent block
         let mut cfg =
-            CfgEnv::new().with_chain_id(self.chain_spec().chain().id()).with_spec(spec_id);
+            CfgEnv::new_with_spec(spec_id).with_chain_id(self.chain_spec().chain().id());
 
         if let Some(blob_params) = &blob_params {
             cfg.set_max_blobs_per_tx(blob_params.max_blobs_per_tx);
         }
 
         // if the parent block did not have excess blob gas (i.e. it was pre-cancun), but it is
-        // cancun now, we need to set the excess blob gas to the default value(0)
+        // cancun or later now, we need to set the excess blob gas to the default value(0)
         let blob_excess_gas_and_price = parent
             .maybe_next_block_excess_blob_gas(blob_params)
-            .or_else(|| (spec_id == SpecId::CANCUN).then_some(0))
+            .or_else(|| (spec_id >= SpecId::CANCUN).then_some(0))
             .map(|excess_blob_gas| {
                 let blob_gasprice =
                     blob_params.unwrap_or_else(BlobParams::cancun).calc_blob_fee(excess_blob_gas);
@@ -258,29 +262,137 @@ where
             blob_excess_gas_and_price,
         };
 
-        Ok((cfg, block_env).into())
+        Ok(EvmEnv::new(cfg, block_env))
     }
 
-    fn context_for_block<'a>(&self, block: &'a SealedBlock<Block>) -> EthBlockExecutionCtx<'a> {
-        EthBlockExecutionCtx {
+    fn context_for_block<'a>(&self, block: &'a SealedBlock<Block>) -> Result<EthBlockExecutionCtx<'a>, Self::Error> {
+        Ok(EthBlockExecutionCtx {
+            tx_count_hint: Some(block.transaction_count()),
             parent_hash: block.header().parent_hash,
             parent_beacon_block_root: block.header().parent_beacon_block_root,
             ommers: &block.body().ommers,
             withdrawals: block.body().withdrawals.as_ref().map(Cow::Borrowed),
-        }
+            extra_data: block.header().extra_data.clone(),
+        })
     }
 
     fn context_for_next_block(
         &self,
         parent: &SealedHeader,
         attributes: Self::NextBlockEnvCtx,
-    ) -> EthBlockExecutionCtx<'_> {
-        EthBlockExecutionCtx {
+    ) -> Result<EthBlockExecutionCtx<'_>, Self::Error> {
+        Ok(EthBlockExecutionCtx {
+            tx_count_hint: None,
             parent_hash: parent.hash(),
             parent_beacon_block_root: attributes.parent_beacon_block_root,
             ommers: &[],
             withdrawals: attributes.withdrawals.map(Cow::Owned),
+            extra_data: attributes.extra_data,
+        })
+    }
+}
+
+impl<EvmF> reth_evm::ConfigureEngineEvm<alloy_rpc_types_engine::ExecutionData> for EthEvmConfig<EvmF>
+where
+    EvmF: EvmFactory<
+            Tx: TransactionEnv
+                    + FromRecoveredTx<TransactionSigned>
+                    + FromTxWithEncoded<TransactionSigned>,
+            Spec = SpecId,
+            BlockEnv = BlockEnv,
+            Precompiles = PrecompilesMap,
+        > + Clone
+        + Debug
+        + Send
+        + Sync
+        + Unpin
+        + 'static,
+{
+    fn evm_env_for_payload(&self, payload: &alloy_rpc_types_engine::ExecutionData) -> Result<reth_evm::EvmEnvFor<Self>, Self::Error> {
+        use reth_primitives_traits::header::clique_utils::recover_address;
+
+        let timestamp = payload.payload.timestamp();
+        let block_number = payload.payload.block_number();
+
+        let blob_params = self.chain_spec().blob_params_at_timestamp(timestamp);
+        let spec =
+            revm_spec_by_timestamp_and_block_number(self.chain_spec(), timestamp, block_number);
+
+        // configure evm env based on parent block
+        let mut cfg_env =
+            CfgEnv::new().with_chain_id(self.chain_spec().chain().id()).with_spec(spec);
+
+        if let Some(blob_params) = &blob_params {
+            cfg_env.set_max_blobs_per_tx(blob_params.max_blobs_per_tx);
         }
+
+        // derive the EIP-4844 blob fees from the header's `excess_blob_gas` and the current
+        // blobparams
+        let blob_excess_gas_and_price =
+            payload.payload.excess_blob_gas().zip(blob_params).map(|(excess_blob_gas, params)| {
+                let blob_gasprice = params.calc_blob_fee(excess_blob_gas);
+                BlobExcessGasAndPrice { excess_blob_gas, blob_gasprice }
+            });
+
+        // For Clique/APoS: recover signer address from extra_data signature to use as coinbase.
+        // The fee_recipient field in Clique is used for voting and is usually Address::ZERO.
+        // Convert payload to block to get header for signature recovery.
+        let beneficiary = match payload.payload.clone().try_into_block::<TransactionSigned>() {
+            Ok(block) => {
+                recover_address(&block.header).unwrap_or_else(|_| payload.payload.fee_recipient())
+            }
+            Err(_) => payload.payload.fee_recipient(),
+        };
+
+        let block_env = BlockEnv {
+            number: U256::from(block_number),
+            beneficiary,
+            timestamp: U256::from(timestamp),
+            difficulty: if spec >= SpecId::MERGE {
+                U256::ZERO
+            } else {
+                payload.payload.as_v1().prev_randao.into()
+            },
+            prevrandao: (spec >= SpecId::MERGE).then(|| payload.payload.as_v1().prev_randao),
+            gas_limit: payload.payload.gas_limit(),
+            basefee: payload.payload.saturated_base_fee_per_gas(),
+            blob_excess_gas_and_price,
+        };
+
+        Ok(EvmEnv { cfg_env, block_env })
+    }
+
+    fn context_for_payload<'a>(
+        &self,
+        payload: &'a alloy_rpc_types_engine::ExecutionData,
+    ) -> Result<reth_evm::ExecutionCtxFor<'a, Self>, Self::Error> {
+        Ok(EthBlockExecutionCtx {
+            tx_count_hint: Some(payload.payload.transactions().len()),
+            parent_hash: payload.parent_hash(),
+            parent_beacon_block_root: payload.sidecar.parent_beacon_block_root(),
+            ommers: &[],
+            withdrawals: payload.payload.withdrawals().map(|w| Cow::Owned(w.clone().into())),
+            extra_data: payload.payload.as_v1().extra_data.clone(),
+        })
+    }
+
+    fn tx_iterator_for_payload(
+        &self,
+        payload: &alloy_rpc_types_engine::ExecutionData,
+    ) -> Result<impl reth_evm::ExecutableTxIterator<Self>, Self::Error> {
+        use alloy_eips::eip2718::Decodable2718;
+        use reth_primitives_traits::SignedTransaction;
+
+        let txs = payload.payload.transactions().clone();
+        let convert = |tx: alloy_primitives::Bytes| -> Result<_, core::convert::Infallible> {
+            let tx = TransactionSigned::decode_2718(&mut tx.as_ref())
+                .expect("failed to decode transaction");
+            let signer = tx.try_recover()
+                .expect("failed to recover signer");
+            Ok(tx.with_signer(signer))
+        };
+
+        Ok((txs, convert))
     }
 }
 

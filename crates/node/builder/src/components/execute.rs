@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! EVM component for the node builder.
 use crate::{BuilderContext, ConfigureEvm, FullNodeTypes};
 use reth_node_api::PrimitivesTy;

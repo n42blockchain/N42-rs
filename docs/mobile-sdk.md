@@ -1,10 +1,15 @@
-# build
-## android
-### prerequisites
-1. gradle
-2. jdk17, set JAVA_HOME and PATH
+# Build
+
+## Android
+
+### Prerequisites
+
+1. Gradle
+2. JDK 17 (set `JAVA_HOME` and `PATH`)
 3. cargo-ndk
-example:
+
+**Example:**
+
 ```shell
 brew install gradle
 brew install openjdk@17
@@ -15,43 +20,47 @@ export PATH="$JAVA_HOME/bin:$PATH"
 cargo install cargo-ndk
 ```
 
-### build commands
+### Build Commands
 ```shell
 cd crates/n42/mobile-sdk
 ./build-aar.sh
 ```
 
-output:
-mobile-sdk-release.aar
+**Output:** `mobile-sdk-release.aar`
 
-## ios
-### prerequisites
+## iOS
+
+### Prerequisites
+
 1. Xcode + iOS SDK
 2. cbindgen
 3. cargo-lipo
+
 ```shell
 cargo install cbindgen
 cargo install cargo-lipo
 ```
-### build commands
+
+### Build Commands
 ```shell
 cd crates/n42/mobile-sdk/ios/
 ./build_xcframework.sh
 ```
 
-Run build_xcframework.sh → produces mobile_sdk.xcframework and headers.
+Run `build_xcframework.sh` to produce `mobile_sdk.xcframework` and headers.
 
-## linux, mac
-### build commands
+## Linux / macOS
+
+### Build Commands
 ```shell
 cargo build -p mobile-sdk --example mobile-sdk-test
 ```
 
-output:
-target/debug/examples/mobile-sdk-test
+**Output:** `target/debug/examples/mobile-sdk-test`
 
-# integration into an app
-## for android apps that use mobile-sdk aar
+# Integration into an App
+
+## For Android Apps Using mobile-sdk AAR
 
 Add the following to your app’s app/src/main/AndroidManifest.xml
 ```xml
@@ -59,7 +68,7 @@ Add the following to your app’s app/src/main/AndroidManifest.xml
 <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
 ```
 
-sdk api example:
+**SDK API Example:**
 ```java
 package com.example.test_mobile_sdk_aar;
 
@@ -124,41 +133,37 @@ public class MobileSdkTest {
 }
 ```
 
-## for ios apps developed in swift
+## For iOS Apps Developed in Swift
 
-1. Drag mobile_sdk.xcframework into your Xcode project.
-
-2. Add mobile_sdk.h, MobileSdk.swift to your project.
-
+1. Drag `mobile_sdk.xcframework` into your Xcode project.
+2. Add `mobile_sdk.h` and `MobileSdk.swift` to your project.
 3. Configure the bridging header for FFI.
 
-### the Bridging Header
-1. Create the Bridging Header
+### The Bridging Header
 
-In Xcode, go to File → New → File → Header File.
+#### 1. Create the Bridging Header
 
-Name it e.g., YourApp-Bridging-Header.h.
+In Xcode, go to **File → New → File → Header File**.
+
+Name it `YourApp-Bridging-Header.h`.
 
 Add your Rust header:
 
+```c
 // YourApp-Bridging-Header.h
 #include "mobile_sdk.h"
+```
 
-2. Tell Xcode to use it
+#### 2. Configure Xcode to Use It
 
-Select your project in the navigator → Build Settings.
-
-Search for Objective-C Bridging Header (type it in the search bar).
-
-If it’s not visible, make sure you select All instead of Basic settings.
-
-Set the path relative to your project, for example:
-
-ios/include/YourApp-Bridging-Header.h
+1. Select your project in the navigator → **Build Settings**.
+2. Search for **Objective-C Bridging Header** (type it in the search bar).
+3. If it's not visible, make sure you select **All** instead of **Basic** settings.
+4. Set the path relative to your project, for example: `ios/include/YourApp-Bridging-Header.h`
 
 This tells Swift to include the C header when compiling Swift files.
 
-sdk api example:
+**SDK API Example:**
 ```swift
 import SwiftUI
 import Foundation
@@ -265,7 +270,8 @@ struct ContentView: View {
 }
 ```
 
-## linux, mac
+## Linux / macOS
+
 ```shell
 ./target/debug/examples/mobile-sdk-test help
 deposit, exit, validate
@@ -285,12 +291,15 @@ Options:
   -V, --version  Print version
 ```
 
-### prerequisites
-We have an ethereum EOA private key for paying for the
-deposit(--deposit-private-key), example:
-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+### Prerequisites
 
-We have an ethereum EOA private key and its public address to be used as withdrawal private key and withadrawal public address, example:
+You need an Ethereum EOA private key for paying for the deposit (`--deposit-private-key`).
+
+**Example:** `0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80`
+
+You also need an Ethereum EOA private key and its public address to be used as the withdrawal private key and withdrawal public address.
+
+**Example:**
 
 0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6,
 0xa0Ee7A142d267C1f36714E4a8F75612F20a79720

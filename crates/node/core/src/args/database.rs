@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! clap [Args](clap::Args) for database configuration
 
 use std::{fmt, str::FromStr, time::Duration};
@@ -74,18 +77,26 @@ impl TypedValueParser for LogLevelValueParser {
         arg: Option<&Arg>,
         value: &std::ffi::OsStr,
     ) -> Result<Self::Value, Error> {
-        let val =
-            value.to_str().ok_or_else(|| Error::raw(ErrorKind::InvalidUtf8, "Invalid UTF-8"))?;
+        let val = value
+            .to_str()
+            .ok_or_else(|| Error::raw(ErrorKind::InvalidUtf8, "Invalid UTF-8"))?;
 
         val.parse::<LogLevel>().map_err(|err| {
-            let arg = arg.map(|a| a.to_string()).unwrap_or_else(|| "...".to_owned());
+            let arg = arg
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "...".to_owned());
             let possible_values = LogLevel::value_variants()
                 .iter()
                 .map(|v| format!("- {:?}: {}", v, v.help_message()))
                 .collect::<Vec<_>>()
-                .join("\n");
+                .join(
+                    "
+",
+                );
             let msg = format!(
-                "Invalid value '{val}' for {arg}: {err}.\n    Possible values:\n{possible_values}"
+                "Invalid value '{val}' for {arg}: {err}.
+    Possible values:
+{possible_values}"
             );
             clap::Error::raw(clap::error::ErrorKind::InvalidValue, msg)
         })

@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Support for handling peer sessions.
 
 mod active;
@@ -1146,7 +1149,7 @@ async fn authenticate_stream<N: NetworkPrimitives>(
         }
 
         let (multiplex_stream, their_status) =
-            match multiplex_stream.into_eth_satellite_stream(status, fork_filter).await {
+            match multiplex_stream.into_eth_satellite_stream(status, fork_filter, handshake).await {
                 Ok((multiplex_stream, their_status)) => (multiplex_stream, their_status),
                 Err(err) => {
                     return PendingSessionEvent::Disconnected {

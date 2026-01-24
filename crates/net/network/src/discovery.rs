@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Discovery support for the network.
 
 use crate::{
@@ -100,7 +103,7 @@ impl Discovery {
 
         let discv5_future = async {
             let Some(config) = discv5_config else { return Ok::<_, NetworkError>((None, None)) };
-            let (discv5, discv5_updates, _local_enr_discv5) = Discv5::start(&sk, config).await?;
+            let (discv5, discv5_updates) = Discv5::start(&sk, config).await?;
             Ok((Some(discv5), Some(discv5_updates.into())))
         };
 

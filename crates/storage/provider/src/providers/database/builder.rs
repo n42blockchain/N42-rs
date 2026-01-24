@@ -1,9 +1,12 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Helper builder entrypoint to instantiate a [`ProviderFactory`].
 //!
 //! This also includes general purpose staging types that provide builder style functions that lead
 //! up to the intended build target.
 
-use crate::{providers::StaticFileProvider, ProviderFactory};
+use crate::{providers::rocksdb::RocksDBProvider, providers::StaticFileProvider, ProviderFactory};
 use reth_db::{mdbx::DatabaseArguments, open_db_read_only, DatabaseEnv};
 use reth_db_api::{database_metrics::DatabaseMetrics, Database};
 use reth_node_types::{NodeTypes, NodeTypesWithDBAdapter};
@@ -79,19 +82,28 @@ impl<N> ProviderFactoryBuilder<N> {
     where
         N: NodeTypes,
     {
-        let ReadOnlyConfig { db_dir, db_args, static_files_dir, watch_static_files } =
-            config.into();
+        let ReadOnlyConfig {
+            db_dir,
+            db_args,
+            static_files_dir,
+            watch_static_files,
+        } = config.into();
         Ok(self
             .db(Arc::new(open_db_read_only(db_dir, db_args)?))
             .chainspec(chainspec)
-            .static_file(StaticFileProvider::read_only(static_files_dir, watch_static_files)?)
-            .build_provider_factory())
+            .static_file(StaticFileProvider::read_only(
+                static_files_dir,
+                watch_static_files,
+            )?)
+            .build_provider_factory()?)
     }
 }
 
 impl<N> Default for ProviderFactoryBuilder<N> {
     fn default() -> Self {
-        Self { _types: Default::default() }
+        Self {
+            _types: Default::default(),
+        }
     }
 }
 
@@ -222,7 +234,10 @@ pub struct TypesAnd1<N, Val1> {
 impl<N, Val1> TypesAnd1<N, Val1> {
     /// Creates a new instance with the given types and one value.
     pub fn new(val_1: Val1) -> Self {
-        Self { _types: Default::default(), val_1 }
+        Self {
+            _types: Default::default(),
+            val_1,
+        }
     }
 
     /// Configures the chainspec.
@@ -242,7 +257,11 @@ pub struct TypesAnd2<N, Val1, Val2> {
 impl<N, Val1, Val2> TypesAnd2<N, Val1, Val2> {
     /// Creates a new instance with the given types and two values.
     pub fn new(val_1: Val1, val_2: Val2) -> Self {
-        Self { _types: Default::default(), val_1, val_2 }
+        Self {
+            _types: Default::default(),
+            val_1,
+            val_2,
+        }
     }
 
     /// Returns the first value.
@@ -279,7 +298,12 @@ pub struct TypesAnd3<N, Val1, Val2, Val3> {
 impl<N, Val1, Val2, Val3> TypesAnd3<N, Val1, Val2, Val3> {
     /// Creates a new instance with the given types and three values.
     pub fn new(val_1: Val1, val_2: Val2, val_3: Val3) -> Self {
-        Self { _types: Default::default(), val_1, val_2, val_3 }
+        Self {
+            _types: Default::default(),
+            val_1,
+            val_2,
+            val_3,
+        }
     }
 }
 
@@ -289,8 +313,16 @@ where
     DB: Database + DatabaseMetrics + Clone + Unpin + 'static,
 {
     /// Creates the [`ProviderFactory`].
-    pub fn build_provider_factory(self) -> ProviderFactory<NodeTypesWithDBAdapter<N, DB>> {
-        let Self { _types, val_1, val_2, val_3 } = self;
-        ProviderFactory::new(val_1, val_2, val_3)
+    pub fn build_provider_factory(
+        self,
+    ) -> reth_storage_errors::provider::ProviderResult<ProviderFactory<NodeTypesWithDBAdapter<N, DB>>>
+    {
+        let Self {
+            _types,
+            val_1,
+            val_2,
+            val_3,
+        } = self;
+        ProviderFactory::new(val_1, val_2, val_3, RocksDBProvider)
     }
 }

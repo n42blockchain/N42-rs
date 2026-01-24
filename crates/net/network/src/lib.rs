@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! reth P2P networking.
 //!
 //! Ethereum's networking protocol is specified in [devp2p](https://github.com/ethereum/devp2p).

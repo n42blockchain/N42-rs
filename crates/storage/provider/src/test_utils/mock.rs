@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::{
     traits::{BlockSource, ReceiptProvider},
     AccountReader, BlockHashReader, BlockIdReader, BlockNumReader, BlockReader, BlockReaderIdExt,
@@ -23,22 +26,20 @@ use reth_ethereum_primitives::{EthPrimitives, Receipt};
 use reth_execution_types::ExecutionOutcome;
 use reth_node_types::NodeTypes;
 use reth_primitives_traits::{
-    Account, Bytecode, GotExpected, NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader,
-    SignerRecoverable,
+    Account, Bytecode, GotExpected, NodePrimitives, RecoveredBlock, SealedHeader, SignerRecoverable,
 };
 use reth_prune_types::PruneModes;
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_storage_api::{
     BlockBodyIndicesProvider, BytecodeReader, DBProvider, DatabaseProviderFactory,
-    HashedPostStateProvider, NodePrimitivesProvider, StageCheckpointReader,
-    StateCommitmentProvider, StateProofProvider, StorageRootProvider,
+    HashedPostStateProvider, NodePrimitivesProvider, StageCheckpointReader, StateProofProvider,
+    StorageRootProvider,
 };
 use reth_storage_errors::provider::{ConsistentViewError, ProviderError, ProviderResult};
 use reth_trie::{
     updates::TrieUpdates, AccountProof, HashedPostState, HashedStorage, MultiProof,
     MultiProofTargets, StorageMultiProof, StorageProof, TrieInput,
 };
-use reth_trie_db::MerklePatriciaTrie;
 use std::{
     collections::BTreeMap,
     fmt::Debug,
@@ -198,7 +199,11 @@ impl ExtendedAccount {
     /// Create new instance of extended account
     pub fn new(nonce: u64, balance: U256) -> Self {
         Self {
-            account: Account { nonce, balance, bytecode_hash: None },
+            account: Account {
+                nonce,
+                balance,
+                bytecode_hash: None,
+            },
             bytecode: None,
             storage: Default::default(),
         }
@@ -230,17 +235,8 @@ pub struct MockNode;
 impl NodeTypes for MockNode {
     type Primitives = EthPrimitives;
     type ChainSpec = reth_chainspec::ChainSpec;
-    type StateCommitment = MerklePatriciaTrie;
     type Storage = EthStorage;
     type Payload = EthEngineTypes;
-}
-
-impl<T, ChainSpec> StateCommitmentProvider for MockEthProvider<T, ChainSpec>
-where
-    T: NodePrimitives,
-    ChainSpec: EthChainSpec + Send + Sync + 'static,
-{
-    type StateCommitment = <MockNode as NodeTypes>::StateCommitment;
 }
 
 impl<T: NodePrimitives, ChainSpec: EthChainSpec + Clone + 'static> DatabaseProviderFactory
@@ -254,14 +250,20 @@ impl<T: NodePrimitives, ChainSpec: EthChainSpec + Clone + 'static> DatabaseProvi
         // TODO: return Ok(self.clone()) when engine tests stops relying on an
         // Error returned here https://github.com/paradigmxyz/reth/pull/14482
         //Ok(self.clone())
-        Err(ConsistentViewError::Syncing { best_block: GotExpected::new(0, 0) }.into())
+        Err(ConsistentViewError::Syncing {
+            best_block: GotExpected::new(0, 0),
+        }
+        .into())
     }
 
     fn database_provider_rw(&self) -> ProviderResult<Self::ProviderRW> {
         // TODO: return Ok(self.clone()) when engine tests stops relying on an
         // Error returned here https://github.com/paradigmxyz/reth/pull/14482
         //Ok(self.clone())
-        Err(ConsistentViewError::Syncing { best_block: GotExpected::new(0, 0) }.into())
+        Err(ConsistentViewError::Syncing {
+            best_block: GotExpected::new(0, 0),
+        }
+        .into())
     }
 }
 
@@ -292,9 +294,9 @@ impl<ChainSpec: EthChainSpec + Send + Sync + 'static> HeaderProvider
 {
     type Header = Header;
 
-    fn header(&self, block_hash: &BlockHash) -> ProviderResult<Option<Header>> {
+    fn header(&self, block_hash: BlockHash) -> ProviderResult<Option<Header>> {
         let lock = self.headers.lock();
-        Ok(lock.get(block_hash).cloned())
+        Ok(lock.get(&block_hash).cloned())
     }
 
     fn header_by_number(&self, num: u64) -> ProviderResult<Option<Header>> {
@@ -323,8 +325,11 @@ impl<ChainSpec: EthChainSpec + Send + Sync + 'static> HeaderProvider
     fn headers_range(&self, range: impl RangeBounds<BlockNumber>) -> ProviderResult<Vec<Header>> {
         let lock = self.headers.lock();
 
-        let mut headers: Vec<_> =
-            lock.values().filter(|header| range.contains(&header.number)).cloned().collect();
+        let mut headers: Vec<_> = lock
+            .values()
+            .filter(|header| range.contains(&header.number))
+            .cloned()
+            .collect();
         headers.sort_by_key(|header| header.number);
 
         Ok(headers)
@@ -378,8 +383,11 @@ impl<ChainSpec: EthChainSpec + 'static> TransactionsProvider
 
     fn transaction_by_id(&self, id: TxNumber) -> ProviderResult<Option<Self::Transaction>> {
         let lock = self.blocks.lock();
-        let transaction =
-            lock.values().flat_map(|block| &block.body.transactions).nth(id as usize).cloned();
+        let transaction = lock
+            .values()
+            .flat_map(|block| &block.body.transactions)
+            .nth(id as usize)
+            .cloned();
 
         Ok(transaction)
     }
@@ -389,15 +397,23 @@ impl<ChainSpec: EthChainSpec + 'static> TransactionsProvider
         id: TxNumber,
     ) -> ProviderResult<Option<Self::Transaction>> {
         let lock = self.blocks.lock();
-        let transaction =
-            lock.values().flat_map(|block| &block.body.transactions).nth(id as usize).cloned();
+        let transaction = lock
+            .values()
+            .flat_map(|block| &block.body.transactions)
+            .nth(id as usize)
+            .cloned();
 
         Ok(transaction)
     }
 
     fn transaction_by_hash(&self, hash: TxHash) -> ProviderResult<Option<Self::Transaction>> {
         Ok(self.blocks.lock().iter().find_map(|(_, block)| {
-            block.body.transactions.iter().find(|tx| *tx.tx_hash() == hash).cloned()
+            block
+                .body
+                .transactions
+                .iter()
+                .find(|tx| *tx.tx_hash() == hash)
+                .cloned()
         }))
     }
 
@@ -418,7 +434,7 @@ impl<ChainSpec: EthChainSpec + 'static> TransactionsProvider
                         excess_blob_gas: block.header.excess_blob_gas,
                         timestamp: block.header.timestamp,
                     };
-                    return Ok(Some((tx.clone(), meta)))
+                    return Ok(Some((tx.clone(), meta)));
                 }
             }
         }
@@ -430,7 +446,7 @@ impl<ChainSpec: EthChainSpec + 'static> TransactionsProvider
         let mut current_tx_number: TxNumber = 0;
         for block in lock.values() {
             if current_tx_number + (block.body.transactions.len() as TxNumber) > id {
-                return Ok(Some(block.header.number))
+                return Ok(Some(block.header.number));
             }
             current_tx_number += block.body.transactions.len() as TxNumber;
         }
@@ -497,7 +513,8 @@ impl<ChainSpec: EthChainSpec + 'static> TransactionsProvider
     }
 
     fn transaction_sender(&self, id: TxNumber) -> ProviderResult<Option<Address>> {
-        self.transaction_by_id(id).map(|tx_option| tx_option.map(|tx| tx.recover_signer().unwrap()))
+        self.transaction_by_id(id)
+            .map(|tx_option| tx_option.map(|tx| tx.recover_signer().unwrap()))
     }
 }
 
@@ -553,7 +570,10 @@ where
         let mut result = Vec::new();
         for block_number in block_range {
             // Only include blocks that exist in headers (i.e., have been added to the provider)
-            if headers_lock.values().any(|header| header.number == block_number) {
+            if headers_lock
+                .values()
+                .any(|header| header.number == block_number)
+            {
                 if let Some(block_receipts) = receipts_lock.get(&block_number) {
                     result.push(block_receipts.clone());
                 } else {
@@ -579,8 +599,9 @@ impl<T: NodePrimitives, ChainSpec: Send + Sync + 'static> BlockHashReader
 {
     fn block_hash(&self, number: u64) -> ProviderResult<Option<B256>> {
         let lock = self.headers.lock();
-        let hash =
-            lock.iter().find_map(|(hash, header)| (header.number == number).then_some(*hash));
+        let hash = lock
+            .iter()
+            .find_map(|(hash, header)| (header.number == number).then_some(*hash));
         Ok(hash)
     }
 
@@ -590,8 +611,10 @@ impl<T: NodePrimitives, ChainSpec: Send + Sync + 'static> BlockHashReader
         end: BlockNumber,
     ) -> ProviderResult<Vec<B256>> {
         let lock = self.headers.lock();
-        let mut hashes: Vec<_> =
-            lock.iter().filter(|(_, header)| (start..end).contains(&header.number)).collect();
+        let mut hashes: Vec<_> = lock
+            .iter()
+            .filter(|(_, header)| (start..end).contains(&header.number))
+            .collect();
 
         hashes.sort_by_key(|(_, header)| header.number);
 
@@ -609,7 +632,10 @@ impl<T: NodePrimitives, ChainSpec: Send + Sync + 'static> BlockNumReader
         Ok(lock
             .iter()
             .find(|(_, header)| header.number == best_block_number)
-            .map(|(hash, header)| ChainInfo { best_hash: *hash, best_number: header.number })
+            .map(|(hash, header)| ChainInfo {
+                best_hash: *hash,
+                best_number: header.number,
+            })
             .unwrap_or_default())
     }
 
@@ -675,7 +701,7 @@ impl<ChainSpec: EthChainSpec + Send + Sync + 'static> BlockReader
 
     fn pending_block_and_receipts(
         &self,
-    ) -> ProviderResult<Option<(SealedBlock<Self::Block>, Vec<Receipt>)>> {
+    ) -> ProviderResult<Option<(RecoveredBlock<Self::Block>, Vec<Receipt>)>> {
         Ok(None)
     }
 
@@ -698,8 +724,11 @@ impl<ChainSpec: EthChainSpec + Send + Sync + 'static> BlockReader
     fn block_range(&self, range: RangeInclusive<BlockNumber>) -> ProviderResult<Vec<Self::Block>> {
         let lock = self.blocks.lock();
 
-        let mut blocks: Vec<_> =
-            lock.values().filter(|block| range.contains(&block.number)).cloned().collect();
+        let mut blocks: Vec<_> = lock
+            .values()
+            .filter(|block| range.contains(&block.number))
+            .cloned()
+            .collect();
         blocks.sort_by_key(|block| block.number);
 
         Ok(blocks)
@@ -718,6 +747,10 @@ impl<ChainSpec: EthChainSpec + Send + Sync + 'static> BlockReader
     ) -> ProviderResult<Vec<RecoveredBlock<Self::Block>>> {
         Ok(vec![])
     }
+
+    fn block_by_transaction_id(&self, _id: TxNumber) -> ProviderResult<Option<BlockNumber>> {
+        Ok(None)
+    }
 }
 
 impl<ChainSpec> BlockReaderIdExt
@@ -733,7 +766,8 @@ where
     }
 
     fn sealed_header_by_id(&self, id: BlockId) -> ProviderResult<Option<SealedHeader>> {
-        self.header_by_id(id)?.map_or_else(|| Ok(None), |h| Ok(Some(SealedHeader::seal_slow(h))))
+        self.header_by_id(id)?
+            .map_or_else(|| Ok(None), |h| Ok(Some(SealedHeader::seal_slow(h))))
     }
 
     fn header_by_id(&self, id: BlockId) -> ProviderResult<Option<Header>> {
@@ -746,7 +780,12 @@ where
 
 impl<T: NodePrimitives, ChainSpec: Send + Sync> AccountReader for MockEthProvider<T, ChainSpec> {
     fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
-        Ok(self.accounts.lock().get(address).cloned().map(|a| a.account))
+        Ok(self
+            .accounts
+            .lock()
+            .get(address)
+            .cloned()
+            .map(|a| a.account))
     }
 }
 
@@ -874,7 +913,10 @@ where
         storage_key: StorageKey,
     ) -> ProviderResult<Option<StorageValue>> {
         let lock = self.accounts.lock();
-        Ok(lock.get(&account).and_then(|account| account.storage.get(&storage_key)).copied())
+        Ok(lock
+            .get(&account)
+            .and_then(|account| account.storage.get(&storage_key))
+            .copied())
     }
 }
 
@@ -886,7 +928,10 @@ where
     fn bytecode_by_hash(&self, code_hash: &B256) -> ProviderResult<Option<Bytecode>> {
         let lock = self.accounts.lock();
         Ok(lock.values().find_map(|account| {
-            match (account.account.bytecode_hash.as_ref(), account.bytecode.as_ref()) {
+            match (
+                account.account.bytecode_hash.as_ref(),
+                account.bytecode.as_ref(),
+            ) {
                 (Some(bytecode_hash), Some(bytecode)) if bytecode_hash == code_hash => {
                     Some(bytecode.clone())
                 }
@@ -911,15 +956,18 @@ impl<T: NodePrimitives, ChainSpec: EthChainSpec + Send + Sync + 'static> StatePr
             BlockNumberOrTag::Latest => self.latest(),
             BlockNumberOrTag::Finalized => {
                 // we can only get the finalized state by hash, not by num
-                let hash =
-                    self.finalized_block_hash()?.ok_or(ProviderError::FinalizedBlockNotFound)?;
+                let hash = self
+                    .finalized_block_hash()?
+                    .ok_or(ProviderError::FinalizedBlockNotFound)?;
 
                 // only look at historical state
                 self.history_by_block_hash(hash)
             }
             BlockNumberOrTag::Safe => {
                 // we can only get the safe state by hash, not by num
-                let hash = self.safe_block_hash()?.ok_or(ProviderError::SafeBlockNotFound)?;
+                let hash = self
+                    .safe_block_hash()?
+                    .ok_or(ProviderError::SafeBlockNotFound)?;
 
                 self.history_by_block_hash(hash)
             }
@@ -973,6 +1021,25 @@ impl<T: NodePrimitives, ChainSpec: Send + Sync> ChangeSetReader for MockEthProvi
     ) -> ProviderResult<Vec<AccountBeforeTx>> {
         Ok(Vec::default())
     }
+
+    fn get_account_before_block(
+        &self,
+        _block_number: BlockNumber,
+        _address: Address,
+    ) -> ProviderResult<Option<AccountBeforeTx>> {
+        Ok(None)
+    }
+
+    fn account_changesets_range(
+        &self,
+        _range: impl RangeBounds<BlockNumber>,
+    ) -> ProviderResult<Vec<(BlockNumber, AccountBeforeTx)>> {
+        Ok(Vec::default())
+    }
+
+    fn account_changeset_count(&self) -> ProviderResult<usize> {
+        Ok(0)
+    }
 }
 
 impl<T: NodePrimitives, ChainSpec: Send + Sync> StateReader for MockEthProvider<T, ChainSpec> {
@@ -1010,10 +1077,21 @@ mod tests {
 
         let block_hash = BlockHash::random();
         let block_number = 1u64;
-        let header = Header { number: block_number, ..Default::default() };
+        let header = Header {
+            number: block_number,
+            ..Default::default()
+        };
 
-        let receipt1 = Receipt { cumulative_gas_used: 21000, success: true, ..Default::default() };
-        let receipt2 = Receipt { cumulative_gas_used: 42000, success: true, ..Default::default() };
+        let receipt1 = Receipt {
+            cumulative_gas_used: 21000,
+            success: true,
+            ..Default::default()
+        };
+        let receipt2 = Receipt {
+            cumulative_gas_used: 42000,
+            success: true,
+            ..Default::default()
+        };
         let receipts = vec![receipt1, receipt2];
 
         provider.add_header(block_hash, header);
@@ -1028,7 +1106,9 @@ mod tests {
         let range_result = provider.receipts_by_block_range(1..=1).unwrap();
         assert_eq!(range_result, vec![receipts]);
 
-        let non_existent = provider.receipts_by_block(BlockHash::random().into()).unwrap();
+        let non_existent = provider
+            .receipts_by_block(BlockHash::random().into())
+            .unwrap();
         assert_eq!(non_existent, None);
 
         let empty_range = provider.receipts_by_block_range(10..=20).unwrap();
@@ -1044,13 +1124,25 @@ mod tests {
         let block1_number = 1u64;
         let block2_number = 2u64;
 
-        let header1 = Header { number: block1_number, ..Default::default() };
-        let header2 = Header { number: block2_number, ..Default::default() };
+        let header1 = Header {
+            number: block1_number,
+            ..Default::default()
+        };
+        let header2 = Header {
+            number: block2_number,
+            ..Default::default()
+        };
 
-        let receipts1 =
-            vec![Receipt { cumulative_gas_used: 21000, success: true, ..Default::default() }];
-        let receipts2 =
-            vec![Receipt { cumulative_gas_used: 42000, success: true, ..Default::default() }];
+        let receipts1 = vec![Receipt {
+            cumulative_gas_used: 21000,
+            success: true,
+            ..Default::default()
+        }];
+        let receipts2 = vec![Receipt {
+            cumulative_gas_used: 42000,
+            success: true,
+            ..Default::default()
+        }];
 
         provider.add_header(block1_hash, header1);
         provider.add_header(block2_hash, header2);

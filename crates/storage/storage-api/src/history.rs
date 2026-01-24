@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use alloy_primitives::{Address, BlockNumber, B256};
 use auto_impl::auto_impl;
 use core::ops::{RangeBounds, RangeInclusive};

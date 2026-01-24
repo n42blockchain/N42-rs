@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // re-export the node api types
 pub use reth_node_api::{FullNodeTypes, NodeTypes};
 
@@ -68,8 +71,6 @@ where
     type Primitives = <N::Types as NodeTypes>::Primitives;
 
     type ChainSpec = <N::Types as NodeTypes>::ChainSpec;
-
-    type StateCommitment = <N::Types as NodeTypes>::StateCommitment;
 
     type Storage = <N::Types as NodeTypes>::Storage;
 

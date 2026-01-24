@@ -1,4 +1,4 @@
-use crate::{DBProvider, StorageLocation};
+use crate::DBProvider;
 use alloc::vec::Vec;
 use alloy_consensus::Header;
 use alloy_primitives::BlockNumber;
@@ -14,7 +14,7 @@ use reth_db_api::{
 use reth_db_models::StoredBlockWithdrawals;
 use reth_ethereum_primitives::TransactionSigned;
 use reth_primitives_traits::{
-    Block, BlockBody, FullBlockHeader, FullNodePrimitives, SignedTransaction,
+    Block, BlockBody, FullBlockHeader, NodePrimitives, SignedTransaction,
 };
 use reth_storage_errors::provider::ProviderResult;
 
@@ -28,8 +28,7 @@ pub trait BlockBodyWriter<Provider, Body: BlockBody> {
     fn write_block_bodies(
         &self,
         provider: &Provider,
-        bodies: Vec<(BlockNumber, Option<Body>)>,
-        write_to: StorageLocation,
+        bodies: Vec<(BlockNumber, Option<&Body>)>,
     ) -> ProviderResult<()>;
 
     /// Removes all block bodies above the given block number from the database.
@@ -37,24 +36,25 @@ pub trait BlockBodyWriter<Provider, Body: BlockBody> {
         &self,
         provider: &Provider,
         block: BlockNumber,
-        remove_from: StorageLocation,
     ) -> ProviderResult<()>;
 }
 
 /// Trait that implements how chain-specific types are written to the storage.
-pub trait ChainStorageWriter<Provider, Primitives: FullNodePrimitives>:
+pub trait ChainStorageWriter<Provider, Primitives: NodePrimitives>:
     BlockBodyWriter<Provider, <Primitives::Block as Block>::Body>
 {
 }
-impl<T, Provider, Primitives: FullNodePrimitives> ChainStorageWriter<Provider, Primitives> for T where
+impl<T, Provider, Primitives: NodePrimitives> ChainStorageWriter<Provider, Primitives> for T where
     T: BlockBodyWriter<Provider, <Primitives::Block as Block>::Body>
 {
 }
 
 /// Input for reading a block body. Contains a header of block being read and a list of pre-fetched
 /// transactions.
-pub type ReadBodyInput<'a, B> =
-    (&'a <B as Block>::Header, Vec<<<B as Block>::Body as BlockBody>::Transaction>);
+pub type ReadBodyInput<'a, B> = (
+    &'a <B as Block>::Header,
+    Vec<<<B as Block>::Body as BlockBody>::Transaction>,
+);
 
 /// Trait that implements how block bodies are read from the storage.
 ///
@@ -75,11 +75,11 @@ pub trait BlockBodyReader<Provider> {
 }
 
 /// Trait that implements how chain-specific types are read from storage.
-pub trait ChainStorageReader<Provider, Primitives: FullNodePrimitives>:
+pub trait ChainStorageReader<Provider, Primitives: NodePrimitives>:
     BlockBodyReader<Provider, Block = Primitives::Block>
 {
 }
-impl<T, Provider, Primitives: FullNodePrimitives> ChainStorageReader<Provider, Primitives> for T where
+impl<T, Provider, Primitives: NodePrimitives> ChainStorageReader<Provider, Primitives> for T where
     T: BlockBodyReader<Provider, Block = Primitives::Block>
 {
 }
@@ -104,26 +104,31 @@ where
     fn write_block_bodies(
         &self,
         provider: &Provider,
-        bodies: Vec<(u64, Option<alloy_consensus::BlockBody<T, H>>)>,
-        _write_to: StorageLocation,
+        bodies: Vec<(u64, Option<&alloy_consensus::BlockBody<T, H>>)>,
     ) -> ProviderResult<()> {
         let mut ommers_cursor = provider.tx_ref().cursor_write::<tables::BlockOmmers<H>>()?;
-        let mut withdrawals_cursor =
-            provider.tx_ref().cursor_write::<tables::BlockWithdrawals>()?;
+        let mut withdrawals_cursor = provider
+            .tx_ref()
+            .cursor_write::<tables::BlockWithdrawals>()?;
 
         for (block_number, body) in bodies {
             let Some(body) = body else { continue };
 
             // Write ommers if any
             if !body.ommers.is_empty() {
-                ommers_cursor.append(block_number, &StoredBlockOmmers { ommers: body.ommers })?;
+                ommers_cursor.append(
+                    block_number,
+                    &StoredBlockOmmers {
+                        ommers: body.ommers.clone(),
+                    },
+                )?;
             }
 
             // Write withdrawals if any
-            if let Some(withdrawals) = body.withdrawals {
+            if let Some(withdrawals) = &body.withdrawals {
                 if !withdrawals.is_empty() {
                     withdrawals_cursor
-                        .append(block_number, &StoredBlockWithdrawals { withdrawals })?;
+                        .append(block_number, &StoredBlockWithdrawals { withdrawals: withdrawals.clone() })?;
                 }
             }
         }
@@ -135,10 +140,13 @@ where
         &self,
         provider: &Provider,
         block: BlockNumber,
-        _remove_from: StorageLocation,
     ) -> ProviderResult<()> {
-        provider.tx_ref().unwind_table_by_num::<tables::BlockWithdrawals>(block)?;
-        provider.tx_ref().unwind_table_by_num::<tables::BlockOmmers>(block)?;
+        provider
+            .tx_ref()
+            .unwind_table_by_num::<tables::BlockWithdrawals>(block)?;
+        provider
+            .tx_ref()
+            .unwind_table_by_num::<tables::BlockOmmers>(block)?;
 
         Ok(())
     }
@@ -160,7 +168,9 @@ where
         // TODO: Ideally storage should hold its own copy of chain spec
         let chain_spec = provider.chain_spec();
 
-        let mut withdrawals_cursor = provider.tx_ref().cursor_read::<tables::BlockWithdrawals>()?;
+        let mut withdrawals_cursor = provider
+            .tx_ref()
+            .cursor_read::<tables::BlockWithdrawals>()?;
 
         let mut bodies = Vec::with_capacity(inputs.len());
 
@@ -187,7 +197,11 @@ where
                     .map(|(_, stored_ommers)| stored_ommers.ommers)
                     .unwrap_or_default()
             };
-            bodies.push(alloy_consensus::BlockBody { transactions, ommers, withdrawals });
+            bodies.push(alloy_consensus::BlockBody {
+                transactions,
+                ommers,
+                withdrawals,
+            });
         }
 
         Ok(bodies)

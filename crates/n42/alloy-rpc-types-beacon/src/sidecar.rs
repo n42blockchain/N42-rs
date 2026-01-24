@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::header::Header;
 use alloy_eips::eip4844::{deserialize_blob, Blob, BlobTransactionSidecar, Bytes48};
 use alloy_primitives::B256;
@@ -63,7 +66,9 @@ impl Iterator for SidecarIterator {
 impl SidecarIterator {
     /// Creates a new [`SidecarIterator`] from a given [`BeaconBlobBundle`].
     pub fn new(bundle: BeaconBlobBundle) -> Self {
-        Self { iter: bundle.into_iter() }
+        Self {
+            iter: bundle.into_iter(),
+        }
     }
 
     /// Returns a BlobTransactionSidecar of len num_hashes.
@@ -77,7 +82,11 @@ impl SidecarIterator {
             commitments.push(next.kzg_commitment);
             proofs.push(next.kzg_proof);
         }
-        Some(BlobTransactionSidecar { blobs, commitments, proofs })
+        Some(BlobTransactionSidecar {
+            blobs,
+            commitments,
+            proofs,
+        })
     }
 }
 

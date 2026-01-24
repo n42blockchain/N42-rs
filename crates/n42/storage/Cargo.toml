@@ -1,0 +1,39 @@
+[package]
+name = "n42-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "N42 Beacon chain storage types and tables"
+
+[lints]
+workspace = true
+
+[dependencies]
+# N42
+n42-primitives.workspace = true
+
+# Alloy
+alloy-primitives.workspace = true
+
+# Serialization
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+criterion.workspace = true
+
+[[bench]]
+name = "storage_benchmarks"
+harness = false
+
+[features]
+default = ["std"]
+std = []
+

@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::{
     config::NetworkMode, message::PeerMessage, protocol::RlpxSubProtocol,
     swarm::NetworkConnectionState, transactions::TransactionsHandle, FetchClient,
@@ -12,6 +15,7 @@ use reth_eth_wire::{
     BlockRangeUpdate, DisconnectReason, EthNetworkPrimitives, NetworkPrimitives,
     NewPooledTransactionHashes, SharedTransactions,
 };
+use reth_eth_wire_types::NewBlock;
 use reth_ethereum_forks::Head;
 use reth_network_api::{
     events::{NetworkPeersEvents, PeerEvent, PeerEventStream},
@@ -83,8 +87,14 @@ impl<N: NetworkPrimitives> NetworkHandle<N> {
             discv5,
             event_sender,
             nat,
+            block_announcer: Default::default(),
         };
         Self { inner: Arc::new(inner) }
+    }
+
+    /// Send a new block announcement to all subscribers.
+    pub fn send_block_announcement(&self, block: NewBlock<N::Block>) {
+        self.inner.block_announcer.notify(block);
     }
 
     /// Returns the [`PeerId`] used in the network.
@@ -236,9 +246,9 @@ impl<N: NetworkPrimitives> PeersInfo for NetworkHandle<N> {
         } else if let Some(record) = self.inner.discv5.as_ref().and_then(|d| d.node_record()) {
             record
         } else {
-            let external_ip = self.inner.nat.and_then(|nat| nat.as_external_ip());
-
             let mut socket_addr = *self.inner.listener_address.lock();
+            let port = socket_addr.port();
+            let external_ip = self.inner.nat.as_ref().and_then(|nat| nat.clone().as_external_ip(port));
             if let Some(ip) = external_ip {
                 // if able to resolve external ip, use it instead and also set the local address
                 socket_addr.set_ip(ip)
@@ -464,6 +474,8 @@ struct NetworkInner<N: NetworkPrimitives = EthNetworkPrimitives> {
     event_sender: EventSender<NetworkEvent<PeerRequest<N>>>,
     /// The NAT resolver
     nat: Option<NatResolver>,
+    /// Sender for block announcement events.
+    block_announcer: EventSender<NewBlock<N::Block>>,
 }
 
 /// Provides access to modify the network's additional protocol handlers.
@@ -551,7 +563,6 @@ pub(crate) enum NetworkHandleMessage<N: NetworkPrimitives = EthNetworkPrimitives
 }
 
 use reth_network_api::{BlockAnnounceProvider, N42BlockImportOutcome};
-use reth_eth_wire_types::NewBlock;
 
 impl<N: NetworkPrimitives> BlockAnnounceProvider for NetworkHandle<N> 
 where 
@@ -566,11 +577,8 @@ where
     }
 
     fn subscribe_block(&self) -> EventStream<NewBlock<Self::Block>> {
-        // Create a broadcast channel for block events
-        let (_tx, rx) = tokio::sync::broadcast::channel(16);
-        // Note: In production, this should be properly connected to block announcement events
-        // For now, we return an empty stream that can be extended later
-        EventStream::new(rx)
+        // Return a new listener for block announcements
+        self.inner.block_announcer.new_listener()
     }
 
     fn validated_block(&self, _result: N42BlockImportOutcome<Self::Block>) {

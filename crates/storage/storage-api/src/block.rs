@@ -4,9 +4,9 @@ use crate::{
 };
 use alloc::{sync::Arc, vec::Vec};
 use alloy_eips::{BlockHashOrNumber, BlockId, BlockNumberOrTag};
-use alloy_primitives::{BlockNumber, B256};
+use alloy_primitives::{BlockNumber, TxNumber, B256};
 use core::ops::RangeInclusive;
-use reth_primitives_traits::{RecoveredBlock, SealedBlock, SealedHeader};
+use reth_primitives_traits::{RecoveredBlock, SealedHeader};
 use reth_storage_errors::provider::ProviderResult;
 
 /// A helper enum that represents the origin of the requested block.
@@ -88,7 +88,7 @@ pub trait BlockReader:
     #[expect(clippy::type_complexity)]
     fn pending_block_and_receipts(
         &self,
-    ) -> ProviderResult<Option<(SealedBlock<Self::Block>, Vec<Self::Receipt>)>>;
+    ) -> ProviderResult<Option<(RecoveredBlock<Self::Block>, Vec<Self::Receipt>)>>;
 
     /// Returns the block with matching hash from the database.
     ///
@@ -144,6 +144,9 @@ pub trait BlockReader:
         &self,
         range: RangeInclusive<BlockNumber>,
     ) -> ProviderResult<Vec<RecoveredBlock<Self::Block>>>;
+
+    /// Returns the block number that contains the given transaction.
+    fn block_by_transaction_id(&self, id: TxNumber) -> ProviderResult<Option<BlockNumber>>;
 }
 
 impl<T: BlockReader> BlockReader for Arc<T> {
@@ -164,7 +167,7 @@ impl<T: BlockReader> BlockReader for Arc<T> {
     }
     fn pending_block_and_receipts(
         &self,
-    ) -> ProviderResult<Option<(SealedBlock<Self::Block>, Vec<Self::Receipt>)>> {
+    ) -> ProviderResult<Option<(RecoveredBlock<Self::Block>, Vec<Self::Receipt>)>> {
         T::pending_block_and_receipts(self)
     }
     fn block_by_hash(&self, hash: B256) -> ProviderResult<Option<Self::Block>> {
@@ -201,6 +204,10 @@ impl<T: BlockReader> BlockReader for Arc<T> {
         range: RangeInclusive<BlockNumber>,
     ) -> ProviderResult<Vec<RecoveredBlock<Self::Block>>> {
         T::recovered_block_range(self, range)
+    }
+
+    fn block_by_transaction_id(&self, id: TxNumber) -> ProviderResult<Option<BlockNumber>> {
+        T::block_by_transaction_id(self, id)
     }
 }
 
@@ -222,7 +229,7 @@ impl<T: BlockReader> BlockReader for &T {
     }
     fn pending_block_and_receipts(
         &self,
-    ) -> ProviderResult<Option<(SealedBlock<Self::Block>, Vec<Self::Receipt>)>> {
+    ) -> ProviderResult<Option<(RecoveredBlock<Self::Block>, Vec<Self::Receipt>)>> {
         T::pending_block_and_receipts(self)
     }
     fn block_by_hash(&self, hash: B256) -> ProviderResult<Option<Self::Block>> {
@@ -260,6 +267,10 @@ impl<T: BlockReader> BlockReader for &T {
     ) -> ProviderResult<Vec<RecoveredBlock<Self::Block>>> {
         T::recovered_block_range(self, range)
     }
+
+    fn block_by_transaction_id(&self, id: TxNumber) -> ProviderResult<Option<BlockNumber>> {
+        T::block_by_transaction_id(self, id)
+    }
 }
 
 /// Trait extension for `BlockReader`, for types that implement `BlockId` conversion.
@@ -277,7 +288,8 @@ pub trait BlockReaderIdExt: BlockReader + ReceiptProviderIdExt {
     ///
     /// Returns `None` if block is not found.
     fn block_by_number_or_tag(&self, id: BlockNumberOrTag) -> ProviderResult<Option<Self::Block>> {
-        self.convert_block_number(id)?.map_or_else(|| Ok(None), |num| self.block(num.into()))
+        self.convert_block_number(id)?
+            .map_or_else(|| Ok(None), |num| self.block(num.into()))
     }
 
     /// Returns the pending block header if available
@@ -329,9 +341,10 @@ pub trait BlockReaderIdExt: BlockReader + ReceiptProviderIdExt {
     ) -> ProviderResult<Option<RecoveredBlock<Self::Block>>> {
         match id {
             BlockId::Hash(hash) => self.recovered_block(hash.block_hash.into(), transaction_kind),
-            BlockId::Number(num) => self
-                .convert_block_number(num)?
-                .map_or_else(|| Ok(None), |num| self.recovered_block(num.into(), transaction_kind)),
+            BlockId::Number(num) => self.convert_block_number(num)?.map_or_else(
+                || Ok(None),
+                |num| self.recovered_block(num.into(), transaction_kind),
+            ),
         }
     }
 

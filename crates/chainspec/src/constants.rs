@@ -1,7 +1,10 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::spec::DepositContract;
 use alloy_eips::eip6110::MAINNET_DEPOSIT_CONTRACT_ADDRESS;
-use alloy_primitives::b256;
 use alloy_primitives::address;
+use alloy_primitives::b256;
 use alloy_primitives::Address;
 
 /// Gas per transaction not creating a contract.

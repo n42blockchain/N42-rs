@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Helpers for recovering signers from a set of transactions
 
 #[cfg(feature = "rayon")]
@@ -8,8 +11,9 @@ pub use iter::*;
 
 #[cfg(feature = "rayon")]
 mod rayon {
-    use crate::{transaction::signed::RecoveryError, SignedTransaction};
+    use crate::{transaction::signed::RecoveryError, Recovered, SignedTransaction};
     use alloc::vec::Vec;
+    use alloy_consensus::transaction::SignerRecoverable;
     use alloy_primitives::Address;
     use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 
@@ -33,14 +37,41 @@ mod rayon {
         T: SignedTransaction,
         I: IntoParallelIterator<Item = &'a T> + IntoIterator<Item = &'a T> + Send,
     {
-        txes.into_par_iter().map(|tx| tx.recover_signer_unchecked()).collect()
+        txes.into_par_iter()
+            .map(|tx| tx.recover_signer_unchecked())
+            .collect()
+    }
+
+    /// Decodes and recovers a list of [`Recovered`] transactions from an iterator.
+    ///
+    /// The `decode` closure transforms each item into a [`SignedTransaction`], which is then
+    /// recovered.
+    ///
+    /// Returns an error if decoding or signature recovery fails for any transaction.
+    ///
+    /// When the `rayon` feature is enabled, recovery is performed in parallel.
+    pub fn try_recover_signers<I, F, T>(items: I, decode: F) -> Result<Vec<Recovered<T>>, RecoveryError>
+    where
+        I: IntoParallelIterator,
+        F: Fn(I::Item) -> Result<T, RecoveryError> + Sync,
+        T: SignerRecoverable + Send,
+    {
+        items
+            .into_par_iter()
+            .map(|item| {
+                let tx = decode(item)?;
+                let signer = tx.recover_signer()?;
+                Ok(Recovered::new_unchecked(tx, signer))
+            })
+            .collect()
     }
 }
 
 #[cfg(not(feature = "rayon"))]
 mod iter {
-    use crate::{transaction::signed::RecoveryError, SignedTransaction};
+    use crate::{transaction::signed::RecoveryError, Recovered, SignedTransaction};
     use alloc::vec::Vec;
+    use alloy_consensus::transaction::SignerRecoverable;
     use alloy_primitives::Address;
 
     /// Recovers a list of signers from a transaction list iterator.
@@ -63,6 +94,30 @@ mod iter {
         T: SignedTransaction,
         I: IntoIterator<Item = &'a T>,
     {
-        txes.into_iter().map(|tx| tx.recover_signer_unchecked()).collect()
+        txes.into_iter()
+            .map(|tx| tx.recover_signer_unchecked())
+            .collect()
+    }
+
+    /// Decodes and recovers a list of [`Recovered`] transactions from an iterator.
+    ///
+    /// The `decode` closure transforms each item into a [`SignedTransaction`], which is then
+    /// recovered.
+    ///
+    /// Returns an error if decoding or signature recovery fails for any transaction.
+    pub fn try_recover_signers<I, F, T>(items: I, decode: F) -> Result<Vec<Recovered<T>>, RecoveryError>
+    where
+        I: IntoIterator,
+        F: Fn(I::Item) -> Result<T, RecoveryError>,
+        T: SignerRecoverable,
+    {
+        items
+            .into_iter()
+            .map(|item| {
+                let tx = decode(item)?;
+                let signer = tx.recover_signer()?;
+                Ok(Recovered::new_unchecked(tx, signer))
+            })
+            .collect()
     }
 }

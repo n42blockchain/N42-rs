@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Reth CLI implementation.
 
 #![doc(
@@ -8,11 +11,15 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
+/// A configurable App on top of the cli parser.
+pub mod app;
 /// Chain specification parser.
 pub mod chainspec;
 pub mod debug_cmd;
 pub mod interface;
-pub use interface::Cli;
+
+pub use app::CliApp;
+pub use interface::{Cli, Commands};
 
 #[cfg(test)]
 mod test {

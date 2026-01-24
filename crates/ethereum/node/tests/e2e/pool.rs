@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::utils::eth_payload_attributes;
 use alloy_consensus::{EthereumTxEnvelope, TxEip4844};
 use alloy_eips::{eip1559::ETHEREUM_BLOCK_GAS_LIMIT_30M, Encodable2718};
@@ -48,7 +51,10 @@ async fn maintain_txpool_stale_eviction() -> eyre::Result<()> {
         .with_chain(chain_spec)
         .with_unused_ports()
         .with_rpc(RpcServerArgs::default().with_unused_ports().with_http());
-    let NodeHandle { node, node_exit_future: _ } = NodeBuilder::new(node_config.clone())
+    let NodeHandle {
+        node,
+        node_exit_future: _,
+    } = NodeBuilder::new(node_config.clone())
         .testing_node(executor.clone())
         .node(EthereumNode::default())
         .launch()
@@ -83,7 +89,10 @@ async fn maintain_txpool_stale_eviction() -> eyre::Result<()> {
     );
     let pooled_tx = EthPooledTransaction::new(tx.clone(), 200);
 
-    txpool.add_transaction(TransactionOrigin::External, pooled_tx).await.unwrap();
+    txpool
+        .add_transaction(TransactionOrigin::External, pooled_tx)
+        .await
+        .unwrap();
     assert_eq!(txpool.len(), 1);
 
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -123,7 +132,10 @@ async fn maintain_txpool_reorg() -> eyre::Result<()> {
         .with_chain(chain_spec)
         .with_unused_ports()
         .with_rpc(RpcServerArgs::default().with_unused_ports().with_http());
-    let NodeHandle { node, node_exit_future: _ } = NodeBuilder::new(node_config.clone())
+    let NodeHandle {
+        node,
+        node_exit_future: _,
+    } = NodeBuilder::new(node_config.clone())
         .testing_node(executor.clone())
         .node(EthereumNode::default())
         .launch()
@@ -175,12 +187,22 @@ async fn maintain_txpool_reorg() -> eyre::Result<()> {
     txpool.set_block_info(block_info);
 
     // add two txs to the pool
-    txpool.add_transaction(TransactionOrigin::External, pooled_tx1).await.unwrap();
-    txpool.add_transaction(TransactionOrigin::External, pooled_tx2).await.unwrap();
+    txpool
+        .add_transaction(TransactionOrigin::External, pooled_tx1)
+        .await
+        .unwrap();
+    txpool
+        .add_transaction(TransactionOrigin::External, pooled_tx2)
+        .await
+        .unwrap();
 
     // inject tx1, make the node advance and eventually generate `CanonStateNotification::Commit`
     // event to propagate to the pool
-    let _ = node.rpc.inject_tx(envelop1.encoded_2718().into()).await.unwrap();
+    let _ = node
+        .rpc
+        .inject_tx(envelop1.encoded_2718().into())
+        .await
+        .unwrap();
 
     // build a payload based on tx1
     let payload1 = node.new_payload().await?;
@@ -190,7 +212,11 @@ async fn maintain_txpool_reorg() -> eyre::Result<()> {
 
     // inject tx2, make the node reorg and eventually generate `CanonStateNotification::Reorg` event
     // to propagate to the pool
-    let _ = node.rpc.inject_tx(envelop2.encoded_2718().into()).await.unwrap();
+    let _ = node
+        .rpc
+        .inject_tx(envelop2.encoded_2718().into())
+        .await
+        .unwrap();
 
     // build a payload based on tx2
     let payload2 = node.new_payload().await?;
@@ -255,7 +281,10 @@ async fn maintain_txpool_commit() -> eyre::Result<()> {
         .with_chain(chain_spec)
         .with_unused_ports()
         .with_rpc(RpcServerArgs::default().with_unused_ports().with_http());
-    let NodeHandle { node, node_exit_future: _ } = NodeBuilder::new(node_config.clone())
+    let NodeHandle {
+        node,
+        node_exit_future: _,
+    } = NodeBuilder::new(node_config.clone())
         .testing_node(executor.clone())
         .node(EthereumNode::default())
         .launch()
@@ -293,12 +322,19 @@ async fn maintain_txpool_commit() -> eyre::Result<()> {
 
     txpool.set_block_info(block_info);
 
-    txpool.add_transaction(TransactionOrigin::External, pooled_tx).await.unwrap();
+    txpool
+        .add_transaction(TransactionOrigin::External, pooled_tx)
+        .await
+        .unwrap();
     assert_eq!(txpool.len(), 1);
 
     // make the node advance and eventually generate `CanonStateNotification::Commit` event to
     // propagate to the pool
-    let _ = node.rpc.inject_tx(envelop.encoded_2718().into()).await.unwrap();
+    let _ = node
+        .rpc
+        .inject_tx(envelop.encoded_2718().into())
+        .await
+        .unwrap();
     let _ = node.advance_block().await.unwrap();
 
     loop {

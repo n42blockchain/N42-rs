@@ -1,18 +1,24 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 #![allow(clippy::arithmetic_side_effects)]
 
 use crate::attestation_duty::AttestationDuty;
+use crate::beacon::SHUFFLE_CACHE;
+use crate::beacon_committee::BeaconCommittee;
+use crate::safe_arith::SafeArith;
+use crate::shuffle_list::shuffle_list;
 use crate::*;
+use crate::{ChainSpec, SLOTS_PER_EPOCH};
+use alloy_primitives::B256;
 use core::num::NonZeroUsize;
 use derivative::Derivative;
-use crate::safe_aitrh::SafeArith;
 use serde::{Deserialize, Serialize};
 use ssz::{four_byte_option_impl, Decode, DecodeError, Encode};
 use ssz_derive::{Decode, Encode};
 use std::ops::Range;
 use std::sync::Arc;
-use crate::shuffle_list::shuffle_list;
-use crate::{SLOTS_PER_EPOCH, ChainSpec};
-use crate::beacon_committee::BeaconCommittee;
+use tracing::debug;
 
 // Define "legacy" implementations of `Option<Epoch>`, `Option<NonZeroUsize>` which use four bytes
 // for encoding the union selector.
@@ -63,21 +69,13 @@ impl CommitteeCache {
     /// Return a new, fully initialized cache.
     ///
     /// Spec v0.12.1
+    /// PERF: Uses cached shuffle results when available
     pub fn initialized(
         state: &BeaconState,
         epoch: Epoch,
         spec: &ChainSpec,
     ) -> eyre::Result<CommitteeCache> {
         // Check that the cache is being built for an in-range epoch.
-        //
-        // We allow caches to be constructed for historic epochs, per:
-        //
-        // https://github.com/sigp/lighthouse/issues/3270
-        let reqd_randao_epoch = epoch
-            .saturating_sub(spec.min_seed_lookahead)
-            .saturating_sub(1u64);
-
-        //if reqd_randao_epoch < state.min_randao_epoch() || epoch > state.current_epoch() + 1 {
         if epoch > state.current_epoch() + 1 {
             return Err(eyre::eyre!("Error::EpochOutOfBounds"));
         }
@@ -88,11 +86,11 @@ impl CommitteeCache {
         }
 
         // The use of `NonZeroUsize` reduces the maximum number of possible validators by one.
-        if state.validators.len() == usize::MAX {
+        if state.validators_store.len() == usize::MAX {
             return Err(eyre::eyre!("Error::TooManyValidators"));
         }
 
-        let active_validator_indices = get_active_validator_indices(&state.validators, epoch);
+        let active_validator_indices = state.get_active_validator_indices(epoch);
 
         if active_validator_indices.is_empty() {
             return Err(eyre::eyre!("Error::InsufficientValidators"));
@@ -101,22 +99,48 @@ impl CommitteeCache {
         let committees_per_slot =
             get_committee_count_per_slot(active_validator_indices.len(), spec)? as u64;
 
-        //let seed = state.get_seed(epoch, Domain::BeaconAttester)?;
         let seed = state.get_seed(epoch, DOMAIN_CONSTANT_BEACON_ATTESTER)?;
 
-        let shuffling = shuffle_list(
-            active_validator_indices,
-            spec.shuffle_round_count,
-            &seed[..],
-            false,
-        )
-        .ok_or(eyre::eyre!("Error::UnableToShuffle"))?;
+        // PERF: Try to get cached shuffle result first
+        let cache_key = (epoch, B256::from_slice(&seed[..]));
+        let shuffling = {
+            // Try cache read
+            let mut cached_result = None;
+            if let Ok(cache) = SHUFFLE_CACHE.read() {
+                if let Some(shuffling) = cache.peek(&cache_key) {
+                    debug!(target: "committee_cache", epoch, "Shuffle cache hit");
+                    cached_result = Some(shuffling.clone());
+                }
+            }
 
-        let mut shuffling_positions = vec![<_>::default(); state.validators.len()];
+            if let Some(result) = cached_result {
+                result
+            } else {
+                // Compute shuffle
+                debug!(target: "committee_cache", epoch, "Shuffle cache miss, computing...");
+                let computed = shuffle_list(
+                    active_validator_indices,
+                    spec.shuffle_round_count,
+                    &seed[..],
+                    false,
+                )
+                .ok_or(eyre::eyre!("Error::UnableToShuffle"))?;
+
+                // Cache the result
+                if let Ok(mut cache) = SHUFFLE_CACHE.write() {
+                    cache.insert(cache_key, computed.clone());
+                }
+
+                computed
+            }
+        };
+
+        let mut shuffling_positions = vec![<_>::default(); state.validators_store.len()];
         for (i, &v) in shuffling.iter().enumerate() {
             *shuffling_positions
                 .get_mut(v)
-                .ok_or(eyre::eyre!("Error::ShuffleIndexOutOfBounds, v={v}"))? = NonZeroUsize::new(i + 1).into();
+                .ok_or(eyre::eyre!("Error::ShuffleIndexOutOfBounds, v={v}"))? =
+                NonZeroUsize::new(i + 1).into();
         }
 
         Ok(CommitteeCache {
@@ -189,15 +213,19 @@ impl CommitteeCache {
     /// Get all the Beacon committees at a given `slot`.
     ///
     /// Committees are sorted by ascending index order 0..committees_per_slot
-    pub fn get_beacon_committees_at_slot(&self, slot: Slot) -> eyre::Result<Vec<BeaconCommittee<'_>>> {
+    pub fn get_beacon_committees_at_slot(
+        &self,
+        slot: Slot,
+    ) -> eyre::Result<Vec<BeaconCommittee<'_>>> {
         if self.initialized_epoch.is_none() {
             return Err(eyre::eyre!("Error::CommitteeCacheUninitialized(None)"));
         }
 
         (0..self.committees_per_slot())
             .map(|index| {
-                self.get_beacon_committee(slot, index)
-                    .ok_or(eyre::eyre!("Error::NoCommittee, slot={slot}, index={index}"))
+                self.get_beacon_committee(slot, index).ok_or(eyre::eyre!(
+                    "Error::NoCommittee, slot={slot}, index={index}"
+                ))
             })
             .collect()
     }
@@ -208,14 +236,16 @@ impl CommitteeCache {
             .initialized_epoch
             .ok_or(eyre::eyre!("Error::CommitteeCacheUninitialized(None)"))?;
 
-        ((initialized_epoch*self.slots_per_epoch)..).take(self.slots_per_epoch as usize).try_fold(
-        //initialized_epoch.slot_iter(self.slots_per_epoch).try_fold(
-            Vec::with_capacity(self.epoch_committee_count()),
-            |mut vec, slot| {
-                vec.append(&mut self.get_beacon_committees_at_slot(slot)?);
-                Ok(vec)
-            },
-        )
+        ((initialized_epoch * self.slots_per_epoch)..)
+            .take(self.slots_per_epoch as usize)
+            .try_fold(
+                //initialized_epoch.slot_iter(self.slots_per_epoch).try_fold(
+                Vec::with_capacity(self.epoch_committee_count()),
+                |mut vec, slot| {
+                    vec.append(&mut self.get_beacon_committees_at_slot(slot)?);
+                    Ok(vec)
+                },
+            )
     }
 
     /// Returns the `AttestationDuty` for the given `validator_index`.
@@ -432,37 +462,35 @@ impl Decode for NonZeroUsizeOption {
     }
 }
 
-    /// Return the number of committees per slot.
-    ///
-    /// Note: the number of committees per slot is constant in each epoch, and depends only on
-    /// the `active_validator_count` during the slot's epoch.
-    ///
-    /// Spec v0.12.1
-    fn get_committee_count_per_slot(
-        active_validator_count: usize,
-        spec: &ChainSpec,
-    ) -> eyre::Result<usize> {
-        get_committee_count_per_slot_with(
-            active_validator_count,
-            spec.max_committees_per_slot,
-            spec.target_committee_size,
-        )
-    }
+/// Return the number of committees per slot.
+///
+/// Note: the number of committees per slot is constant in each epoch, and depends only on
+/// the `active_validator_count` during the slot's epoch.
+///
+/// Spec v0.12.1
+fn get_committee_count_per_slot(
+    active_validator_count: usize,
+    spec: &ChainSpec,
+) -> eyre::Result<usize> {
+    get_committee_count_per_slot_with(
+        active_validator_count,
+        spec.max_committees_per_slot,
+        spec.target_committee_size,
+    )
+}
 
-    fn get_committee_count_per_slot_with(
-        active_validator_count: usize,
-        max_committees_per_slot_var: usize,
-        target_committee_size_var: usize,
-    ) -> eyre::Result<usize> {
-
-        Ok(std::cmp::max(
-            1,
-            std::cmp::min(
-                max_committees_per_slot_var,
-                active_validator_count
-                    .safe_div(SLOTS_PER_EPOCH as usize)?
-                    .safe_div(target_committee_size_var)?,
-            ),
-        ))
-    }
-
+fn get_committee_count_per_slot_with(
+    active_validator_count: usize,
+    max_committees_per_slot_var: usize,
+    target_committee_size_var: usize,
+) -> eyre::Result<usize> {
+    Ok(std::cmp::max(
+        1,
+        std::cmp::min(
+            max_committees_per_slot_var,
+            active_validator_count
+                .safe_div(SLOTS_PER_EPOCH as usize)?
+                .safe_div(target_committee_size_var)?,
+        ),
+    ))
+}

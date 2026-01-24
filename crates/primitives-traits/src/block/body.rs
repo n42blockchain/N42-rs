@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Block body abstraction.
 
 use crate::{
@@ -5,7 +8,7 @@ use crate::{
     MaybeSerdeBincodeCompat, SignedTransaction,
 };
 use alloc::{fmt, vec::Vec};
-use alloy_consensus::{Transaction, Typed2718};
+use alloy_consensus::{transaction::TxHashRef, Transaction, Typed2718};
 use alloy_eips::{eip2718::Encodable2718, eip4895::Withdrawals};
 use alloy_primitives::{Address, Bytes, B256};
 
@@ -123,17 +126,22 @@ pub trait BlockBody:
     ///
     /// Returns `RecoveryError` if there are no ommers in the block.
     fn calculate_ommers_root(&self) -> Option<B256> {
-        self.ommers().map(alloy_consensus::proofs::calculate_ommers_root)
+        self.ommers()
+            .map(alloy_consensus::proofs::calculate_ommers_root)
     }
 
     /// Calculates the total blob gas used by _all_ EIP-4844 transactions in the block.
     fn blob_gas_used(&self) -> u64 {
-        self.transactions_iter().filter_map(|tx| tx.blob_gas_used()).sum()
+        self.transactions_iter()
+            .filter_map(|tx| tx.blob_gas_used())
+            .sum()
     }
 
     /// Returns an iterator over all blob versioned hashes in the block body.
     fn blob_versioned_hashes_iter(&self) -> impl Iterator<Item = &B256> + '_ {
-        self.transactions_iter().filter_map(|tx| tx.blob_versioned_hashes()).flatten()
+        self.transactions_iter()
+            .filter_map(|tx| tx.blob_versioned_hashes())
+            .flatten()
     }
 
     /// Returns an iterator over the encoded 2718 transactions.
@@ -153,7 +161,9 @@ pub trait BlockBody:
     /// See also [`Encodable2718`].
     #[doc(alias = "raw_transactions")]
     fn encoded_2718_transactions(&self) -> Vec<Bytes> {
-        self.encoded_2718_transactions_iter().map(Into::into).collect()
+        self.encoded_2718_transactions_iter()
+            .map(Into::into)
+            .collect()
     }
 
     /// Recover signer addresses for all transactions in the block body.

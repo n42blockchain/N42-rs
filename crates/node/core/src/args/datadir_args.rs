@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! clap [Args](clap::Args) for datadir config
 
 use crate::dirs::{ChainPath, DataDirPath, MaybePlatformPath};
@@ -27,6 +30,14 @@ pub struct DatadirArgs {
         verbatim_doc_comment
     )]
     pub static_files_path: Option<PathBuf>,
+
+    /// The absolute path to store `RocksDB` database in.
+    #[arg(long = "datadir.rocksdb", value_name = "PATH", verbatim_doc_comment)]
+    pub rocksdb_path: Option<PathBuf>,
+
+    /// The absolute path to store pprof dumps in.
+    #[arg(long = "datadir.pprof-dumps", value_name = "PATH", verbatim_doc_comment)]
+    pub pprof_dumps_path: Option<PathBuf>,
 }
 
 impl DatadirArgs {

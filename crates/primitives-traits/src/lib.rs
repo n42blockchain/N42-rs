@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Commonly used types and traits in Reth.
 //!
 //! This crate contains various primitive traits used across reth's components.
@@ -94,13 +97,14 @@ pub use alloy_consensus::{
 pub use transaction::{
     execute::FillTxEnv,
     signed::{FullSignedTx, SignedTransaction},
-    FullTransaction, SignerRecoverable, Transaction,
+    FullTransaction, SignerRecoverable, Transaction, TxHashRef,
 };
 
 pub mod block;
 pub use block::{
     body::{BlockBody, FullBlockBody},
     header::{AlloyBlockHeader, BlockHeader, FullBlockHeader},
+    recovered::IndexedTx,
     Block, FullBlock, RecoveredBlock, SealedBlock,
 };
 
@@ -118,7 +122,7 @@ pub use alloy_primitives::{logs_bloom, Log, LogData};
 pub mod proofs;
 
 mod storage;
-pub use storage::StorageEntry;
+pub use storage::{StorageEntry, ValueWithSubKey};
 
 pub mod sync;
 
@@ -144,7 +148,7 @@ pub use size::InMemorySize;
 
 /// Node traits
 pub mod node;
-pub use node::{BlockTy, BodyTy, FullNodePrimitives, HeaderTy, NodePrimitives, ReceiptTy, TxTy};
+pub use node::{BlockTy, BodyTy, HeaderTy, NodePrimitives, ReceiptTy, TxTy};
 
 /// Helper trait that requires de-/serialize implementation since `serde` feature is enabled.
 #[cfg(feature = "serde")]

@@ -22,7 +22,6 @@ reth-prune-types.workspace = true
 reth-stages-types.workspace = true
 reth-storage-errors.workspace = true
 reth-trie-common.workspace = true
-reth-trie-db = { workspace = true, optional = true }
 revm-database.workspace = true
 reth-ethereum-primitives.workspace = true
 
@@ -33,8 +32,10 @@ alloy-consensus.workspace = true
 alloy-rpc-types-engine.workspace = true
 
 auto_impl.workspace = true
+serde_json = { workspace = true, optional = true }
 
 n42-primitives.workspace = true
+merkle_db_rs.workspace=true
 
 [features]
 default = ["std"]
@@ -53,11 +54,12 @@ std = [
     "reth-storage-errors/std",
     "reth-db-models/std",
     "reth-trie-common/std",
+    "serde_json?/std",
 ]
 
 db-api = [
     "dep:reth-db-api",
-    "dep:reth-trie-db",
+    "dep:serde_json",
 ]
 
 serde = [

@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /// Extension trait for iterators, providing a safe replacement for `sum`.
 pub trait SafeArithIter<T> {
     fn safe_sum(self) -> Result<T>;
@@ -65,7 +68,6 @@ pub trait SafeArith<Rhs = Self>: Sized + Copy {
     assign_method!(safe_rem_assign, safe_rem, Rhs, "%=");
     assign_method!(safe_div_assign, safe_div, Rhs, "/=");
     assign_method!(safe_mul_assign, safe_mul, Rhs, "*=");
-
 }
 
 macro_rules! impl_safe_arith {
@@ -98,7 +100,6 @@ macro_rules! impl_safe_arith {
             fn safe_mul(&self, other: Self) -> Result<Self> {
                 self.checked_mul(other).ok_or(ArithError::Overflow)
             }
-
         }
     };
 }

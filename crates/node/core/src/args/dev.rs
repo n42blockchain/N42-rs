@@ -5,8 +5,11 @@ use std::time::Duration;
 use clap::Args;
 use humantime::parse_duration;
 
+/// Default dev mode mnemonic
+pub const DEFAULT_MNEMONIC: &str = "test test test test test test test test test test test junk";
+
 /// Parameters for Dev testnet configuration
-#[derive(Debug, Args, PartialEq, Eq, Default, Clone)]
+#[derive(Debug, Args, PartialEq, Eq, Clone)]
 #[command(next_help_heading = "Dev testnet")]
 pub struct DevArgs {
     /// Start the node in dev mode
@@ -16,7 +19,12 @@ pub struct DevArgs {
     /// Disables network discovery and enables local http server.
     /// Prefunds 20 accounts derived by mnemonic "test test test test test test test test test test
     /// test junk" with 10 000 ETH each.
-    #[arg(long = "dev", alias = "auto-mine", help_heading = "Dev testnet", verbatim_doc_comment)]
+    #[arg(
+        long = "dev",
+        alias = "auto-mine",
+        help_heading = "Dev testnet",
+        verbatim_doc_comment
+    )]
     pub dev: bool,
 
     /// How many transactions to mine per block.
@@ -40,6 +48,14 @@ pub struct DevArgs {
     )]
     pub block_time: Option<Duration>,
 
+    /// Mnemonic for generating dev accounts (used to derive prefunded accounts).
+    #[arg(
+        long = "dev.mnemonic",
+        help_heading = "Dev testnet",
+        default_value = DEFAULT_MNEMONIC
+    )]
+    pub dev_mnemonic: String,
+
     /// N42: Private key for consensus signer (used in dev/PoA mode)
     #[arg(
         long = "dev.consensus-signer-private-key",
@@ -61,6 +77,20 @@ pub struct DevArgs {
         help_heading = "Dev testnet"
     )]
     pub migrate_old_chain_data_from_rpc: Option<String>,
+}
+
+impl Default for DevArgs {
+    fn default() -> Self {
+        Self {
+            dev: false,
+            block_max_transactions: None,
+            block_time: None,
+            dev_mnemonic: DEFAULT_MNEMONIC.to_string(),
+            consensus_signer_private_key: None,
+            migrate_old_chain_data_from_db: None,
+            migrate_old_chain_data_from_rpc: None,
+        }
+    }
 }
 
 #[cfg(test)]

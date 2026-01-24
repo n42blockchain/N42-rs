@@ -1,0 +1,88 @@
+[package]
+name = "n42-ef-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+exclude.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# n42
+n42-primitives.workspace = true
+
+# reth
+reth-chainspec.workspace = true
+reth-primitives.workspace = true
+reth-primitives-traits.workspace = true
+reth-ethereum-primitives.workspace = true
+reth-ethereum-forks.workspace = true
+reth-revm = { workspace = true, features = ["std"] }
+reth-evm.workspace = true
+reth-evm-ethereum.workspace = true
+reth-provider.workspace = true
+reth-db.workspace = true
+reth-db-api.workspace = true
+reth-trie.workspace = true
+reth-trie-common.workspace = true
+reth-trie-db.workspace = true
+reth-execution-types.workspace = true
+reth-tracing.workspace = true
+
+# revm
+revm = { workspace = true, features = ["secp256k1", "blst", "c-kzg", "std"] }
+revm-primitives.workspace = true
+revm-database.workspace = true
+revm-state.workspace = true
+
+# alloy
+alloy-primitives.workspace = true
+alloy-rlp.workspace = true
+alloy-genesis.workspace = true
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-trie.workspace = true
+alloy-hardforks.workspace = true
+
+# serde
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+serde_with.workspace = true
+
+# misc
+eyre.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+walkdir.workspace = true
+rayon.workspace = true
+hex.workspace = true
+hashbrown = "0.15"
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+tempfile.workspace = true
+
+[[test]]
+name = "state_tests"
+path = "tests/state_tests.rs"
+
+[[test]]
+name = "blockchain_tests"
+path = "tests/blockchain_tests.rs"
+
+[[test]]
+name = "run_all_tests"
+path = "tests/run_all_tests.rs"
+
+[[test]]
+name = "single_blockchain_test"
+path = "tests/single_blockchain_test.rs"
+
+[[test]]
+name = "transaction_tests"
+path = "tests/transaction_tests.rs"

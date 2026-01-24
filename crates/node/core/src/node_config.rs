@@ -1,9 +1,12 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Support for customizing the node
 
 use crate::{
     args::{
-        DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, NetworkArgs, PayloadBuilderArgs,
-        PruningArgs, RpcServerArgs, TxPoolArgs,
+        DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, MetricArgs, NetworkArgs,
+        PayloadBuilderArgs, PruningArgs, RpcServerArgs, StaticFilesArgs, TxPoolArgs,
     },
     dirs::{ChainPath, DataDirPath},
     utils::get_single_header,
@@ -25,7 +28,6 @@ use reth_storage_errors::provider::ProviderResult;
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
     fs,
-    net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -33,12 +35,8 @@ use tracing::*;
 
 use crate::args::EraArgs;
 pub use reth_engine_primitives::{
-    DEFAULT_MAX_PROOF_TASK_CONCURRENCY, DEFAULT_MEMORY_BLOCK_BUFFER_TARGET,
-    DEFAULT_RESERVED_CPU_CORES,
+    DEFAULT_MEMORY_BLOCK_BUFFER_TARGET, DEFAULT_PERSISTENCE_THRESHOLD, DEFAULT_RESERVED_CPU_CORES,
 };
-
-/// Triggers persistence when the number of canonical blocks in memory exceeds this threshold.
-pub const DEFAULT_PERSISTENCE_THRESHOLD: u64 = 2;
 
 /// Default size of cross-block cache in megabytes.
 pub const DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB: u64 = 4 * 1024;
@@ -101,10 +99,8 @@ pub struct NodeConfig<ChainSpec> {
     /// Possible values are either a built-in chain or the path to a chain specification file.
     pub chain: Arc<ChainSpec>,
 
-    /// Enable Prometheus metrics.
-    ///
-    /// The metrics will be served at the given interface and port.
-    pub metrics: Option<SocketAddr>,
+    /// Enable to configure metrics export to endpoints
+    pub metrics: MetricArgs,
 
     /// Add a new instance of a node.
     ///
@@ -152,6 +148,9 @@ pub struct NodeConfig<ChainSpec> {
 
     /// All ERA import related arguments with --era prefix
     pub era: EraArgs,
+
+    /// All static files related arguments
+    pub static_files: StaticFilesArgs,
 }
 
 impl NodeConfig<ChainSpec> {
@@ -169,7 +168,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
         Self {
             config: None,
             chain,
-            metrics: None,
+            metrics: MetricArgs::default(),
             instance: None,
             network: NetworkArgs::default(),
             rpc: RpcServerArgs::default(),
@@ -182,6 +181,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             datadir: DatadirArgs::default(),
             engine: EngineArgs::default(),
             era: EraArgs::default(),
+            static_files: StaticFilesArgs::default(),
         }
     }
 
@@ -222,9 +222,49 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
         self
     }
 
+    /// Set the [`ChainSpec`] for the node and converts the type to that chainid.
+    pub fn map_chain<C>(self, chain: impl Into<Arc<C>>) -> NodeConfig<C> {
+        let Self {
+            datadir,
+            config,
+            metrics,
+            instance,
+            network,
+            rpc,
+            txpool,
+            builder,
+            debug,
+            db,
+            dev,
+            pruning,
+            engine,
+            era,
+            static_files,
+            ..
+        } = self;
+        NodeConfig {
+            datadir,
+            config,
+            chain: chain.into(),
+            metrics,
+            instance,
+            network,
+            rpc,
+            txpool,
+            builder,
+            debug,
+            db,
+            dev,
+            pruning,
+            engine,
+            era,
+            static_files,
+        }
+    }
+
     /// Set the metrics address for the node
-    pub const fn with_metrics(mut self, metrics: SocketAddr) -> Self {
-        self.metrics = Some(metrics);
+    pub fn with_metrics(mut self, metrics: MetricArgs) -> Self {
+        self.metrics = metrics;
         self
     }
 
@@ -309,7 +349,10 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
         let max_block = if let Some(block) = self.debug.max_block {
             Some(block)
         } else if let Some(tip) = self.debug.tip {
-            Some(self.lookup_or_fetch_tip(provider, network_client, tip).await?)
+            Some(
+                self.lookup_or_fetch_tip(provider, network_client, tip)
+                    .await?,
+            )
         } else {
             None
         };
@@ -328,7 +371,10 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
     {
         let provider = factory.database_provider_ro()?;
 
-        let head = provider.get_stage_checkpoint(StageId::Finish)?.unwrap_or_default().block_number;
+        let head = provider
+            .get_stage_checkpoint(StageId::Finish)?
+            .unwrap_or_default()
+            .block_number;
 
         let header = provider
             .header_by_number(head)?
@@ -372,10 +418,13 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
         // try to look up the header in the database
         if let Some(header) = header {
             info!(target: "reth::cli", ?tip, "Successfully looked up tip block in the database");
-            return Ok(header.number())
+            return Ok(header.number());
         }
 
-        Ok(self.fetch_tip_from_network(client, tip.into()).await.number())
+        Ok(self
+            .fetch_tip_from_network(client, tip.into())
+            .await
+            .number())
     }
 
     /// Attempt to look up the block with the given number and return the header.
@@ -395,7 +444,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             match get_single_header(&client, tip).await {
                 Ok(tip_header) => {
                     info!(target: "reth::cli", ?tip, "Successfully fetched tip");
-                    return tip_header
+                    return tip_header;
                 }
                 Err(error) => {
                     fetch_failures += 1;
@@ -488,6 +537,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             pruning: self.pruning,
             engine: self.engine,
             era: self.era,
+            static_files: self.static_files,
         }
     }
 }
@@ -503,7 +553,7 @@ impl<ChainSpec> Clone for NodeConfig<ChainSpec> {
         Self {
             chain: self.chain.clone(),
             config: self.config.clone(),
-            metrics: self.metrics,
+            metrics: self.metrics.clone(),
             instance: self.instance,
             network: self.network.clone(),
             rpc: self.rpc.clone(),
@@ -516,6 +566,7 @@ impl<ChainSpec> Clone for NodeConfig<ChainSpec> {
             datadir: self.datadir.clone(),
             engine: self.engine.clone(),
             era: self.era.clone(),
+            static_files: self.static_files,
         }
     }
 }

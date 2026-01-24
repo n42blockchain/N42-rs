@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Node builder setup tests.
 
 use std::sync::Arc;
@@ -69,6 +72,8 @@ async fn test_eth_launcher() {
 fn test_node_setup() {
     let config = NodeConfig::test();
     let db = create_test_rw_db();
-    let _builder =
-        NodeBuilder::new(config).with_database(db).node(EthereumNode::default()).check_launch();
+    let _builder = NodeBuilder::new(config)
+        .with_database(db)
+        .node(EthereumNode::default())
+        .check_launch();
 }

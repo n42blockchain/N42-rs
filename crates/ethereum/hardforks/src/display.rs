@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::ForkCondition;
 use alloc::{
     format,
@@ -25,6 +28,9 @@ struct DisplayFork {
     activated_at: ForkCondition,
     /// An optional EIP (e.g. `EIP-1559`).
     eip: Option<String>,
+    /// Optional metadata string
+    #[allow(dead_code)]
+    metadata: Option<String>,
 }
 
 impl core::fmt::Display for DisplayFork {
@@ -39,7 +45,9 @@ impl core::fmt::Display for DisplayFork {
             ForkCondition::Block(at) | ForkCondition::Timestamp(at) => {
                 write!(f, "{name_with_eip:32} @{at}")?;
             }
-            ForkCondition::TTD { total_difficulty, .. } => {
+            ForkCondition::TTD {
+                total_difficulty, ..
+            } => {
                 // All networks that have merged are finalized.
                 write!(
                     f,
@@ -129,11 +137,21 @@ impl core::fmt::Display for DisplayHardforks {
                 writeln!(f)?;
             }
         } else {
-            format("Merge hard forks", &self.with_merge, self.post_merge.is_empty(), f)?;
+            format(
+                "Merge hard forks",
+                &self.with_merge,
+                self.post_merge.is_empty(),
+                f,
+            )?;
         }
 
         if !self.post_merge.is_empty() {
-            format("Post-merge hard forks (timestamp based)", &self.post_merge, true, f)?;
+            format(
+                "Post-merge hard forks (timestamp based)",
+                &self.post_merge,
+                true,
+                f,
+            )?;
         }
 
         Ok(())
@@ -151,14 +169,22 @@ impl DisplayHardforks {
         let mut post_merge = Vec::new();
 
         for (fork, condition) in hardforks {
-            let mut display_fork =
-                DisplayFork { name: fork.name().to_string(), activated_at: condition, eip: None };
+            let mut display_fork = DisplayFork {
+                name: fork.name().to_string(),
+                activated_at: condition,
+                eip: None,
+                metadata: None,
+            };
 
             match condition {
                 ForkCondition::Block(_) => {
                     pre_merge.push(display_fork);
                 }
-                ForkCondition::TTD { activation_block_number, total_difficulty, fork_block } => {
+                ForkCondition::TTD {
+                    activation_block_number,
+                    total_difficulty,
+                    fork_block,
+                } => {
                     display_fork.activated_at = ForkCondition::TTD {
                         activation_block_number,
                         fork_block,
@@ -173,6 +199,48 @@ impl DisplayHardforks {
             }
         }
 
-        Self { pre_merge, with_merge, post_merge }
+        Self {
+            pre_merge,
+            with_merge,
+            post_merge,
+        }
+    }
+
+    /// Creates a new [`DisplayHardforks`] from an iterator of hardforks with metadata.
+    pub fn with_meta<'a, I>(hardforks: I) -> Self
+    where
+        I: IntoIterator<Item = (&'a dyn Hardfork, ForkCondition, Option<String>)>,
+    {
+        let mut pre_merge = Vec::new();
+        let mut with_merge = Vec::new();
+        let mut post_merge = Vec::new();
+
+        for (fork, condition, metadata) in hardforks {
+            let display_fork = DisplayFork {
+                name: fork.name().to_string(),
+                activated_at: condition,
+                eip: None,
+                metadata,
+            };
+
+            match condition {
+                ForkCondition::Block(_) => {
+                    pre_merge.push(display_fork);
+                }
+                ForkCondition::TTD { .. } => {
+                    with_merge.push(display_fork);
+                }
+                ForkCondition::Timestamp(_) => {
+                    post_merge.push(display_fork);
+                }
+                ForkCondition::Never => {}
+            }
+        }
+
+        Self {
+            pre_merge,
+            with_merge,
+            post_merge,
+        }
     }
 }

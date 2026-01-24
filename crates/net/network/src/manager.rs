@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! High level network management.
 //!
 //! The [`NetworkManager`] contains the state of the network as a whole. It controls how connections
@@ -514,6 +517,13 @@ impl<N: NetworkPrimitives> NetworkManager<N> {
             }
             PeerRequest::GetReceipts69 { request, response } => {
                 self.delegate_eth_request(IncomingEthRequest::GetReceipts69 {
+                    peer_id,
+                    request,
+                    response,
+                })
+            }
+            PeerRequest::GetReceipts70 { request, response } => {
+                self.delegate_eth_request(IncomingEthRequest::GetReceipts70 {
                     peer_id,
                     request,
                     response,

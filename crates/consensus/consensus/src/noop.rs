@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::{Consensus, ConsensusError, FullConsensus, HeaderValidator};
 use alloc::sync::Arc;
 use reth_execution_types::BlockExecutionResult;
@@ -30,17 +33,15 @@ impl<H> HeaderValidator<H> for NoopConsensus {
 }
 
 impl<B: Block> Consensus<B> for NoopConsensus {
-    type Error = ConsensusError;
-
     fn validate_body_against_header(
         &self,
         _body: &B::Body,
         _header: &SealedHeader<B::Header>,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), ConsensusError> {
         Ok(())
     }
 
-    fn validate_block_pre_execution(&self, _block: &SealedBlock<B>) -> Result<(), Self::Error> {
+    fn validate_block_pre_execution(&self, _block: &SealedBlock<B>) -> Result<(), ConsensusError> {
         Ok(())
     }
 }
@@ -50,6 +51,7 @@ impl<N: NodePrimitives> FullConsensus<N> for NoopConsensus {
         &self,
         _block: &RecoveredBlock<N::Block>,
         _result: &BlockExecutionResult<N::Receipt>,
+        _receipt_root_bloom: Option<crate::ReceiptRootBloom>,
     ) -> Result<(), ConsensusError> {
         Ok(())
     }

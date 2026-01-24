@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Various noop implementations for traits.
 
 use crate::{
@@ -22,9 +25,7 @@ use core::{
 use reth_chainspec::{ChainInfo, ChainSpecProvider, EthChainSpec, MAINNET};
 use reth_db_models::{AccountBeforeTx, StoredBlockBodyIndices};
 use reth_ethereum_primitives::EthPrimitives;
-use reth_primitives_traits::{
-    Account, Bytecode, NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader,
-};
+use reth_primitives_traits::{Account, Bytecode, NodePrimitives, RecoveredBlock, SealedHeader};
 use reth_prune_types::{PruneCheckpoint, PruneSegment};
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_storage_errors::provider::{ProviderError, ProviderResult};
@@ -44,14 +45,20 @@ pub struct NoopProvider<ChainSpec = reth_chainspec::ChainSpec, N = EthPrimitives
 impl<ChainSpec, N> NoopProvider<ChainSpec, N> {
     /// Create a new instance for specific primitive types.
     pub fn new(chain_spec: Arc<ChainSpec>) -> Self {
-        Self { chain_spec, _phantom: Default::default() }
+        Self {
+            chain_spec,
+            _phantom: Default::default(),
+        }
     }
 }
 
 impl<ChainSpec> NoopProvider<ChainSpec> {
     /// Create a new instance of the `NoopBlockReader`.
     pub fn eth(chain_spec: Arc<ChainSpec>) -> Self {
-        Self { chain_spec, _phantom: Default::default() }
+        Self {
+            chain_spec,
+            _phantom: Default::default(),
+        }
     }
 }
 
@@ -70,7 +77,10 @@ impl Default for NoopProvider {
 
 impl<ChainSpec, N> Clone for NoopProvider<ChainSpec, N> {
     fn clone(&self) -> Self {
-        Self { chain_spec: Arc::clone(&self.chain_spec), _phantom: Default::default() }
+        Self {
+            chain_spec: Arc::clone(&self.chain_spec),
+            _phantom: Default::default(),
+        }
     }
 }
 
@@ -169,7 +179,7 @@ impl<C: Send + Sync, N: NodePrimitives> BlockReader for NoopProvider<C, N> {
 
     fn pending_block_and_receipts(
         &self,
-    ) -> ProviderResult<Option<(SealedBlock<Self::Block>, Vec<Self::Receipt>)>> {
+    ) -> ProviderResult<Option<(RecoveredBlock<Self::Block>, Vec<Self::Receipt>)>> {
         Ok(None)
     }
 
@@ -205,6 +215,10 @@ impl<C: Send + Sync, N: NodePrimitives> BlockReader for NoopProvider<C, N> {
         _range: RangeInclusive<BlockNumber>,
     ) -> ProviderResult<Vec<RecoveredBlock<Self::Block>>> {
         Ok(Vec::new())
+    }
+
+    fn block_by_transaction_id(&self, _id: TxNumber) -> ProviderResult<Option<BlockNumber>> {
+        Ok(None)
     }
 }
 
@@ -312,7 +326,7 @@ impl<C: Send + Sync, N: NodePrimitives> ReceiptProviderIdExt for NoopProvider<C,
 impl<C: Send + Sync, N: NodePrimitives> HeaderProvider for NoopProvider<C, N> {
     type Header = N::BlockHeader;
 
-    fn header(&self, _block_hash: &BlockHash) -> ProviderResult<Option<Self::Header>> {
+    fn header(&self, _block_hash: BlockHash) -> ProviderResult<Option<Self::Header>> {
         Ok(None)
     }
 
@@ -363,6 +377,25 @@ impl<C: Send + Sync, N: NodePrimitives> ChangeSetReader for NoopProvider<C, N> {
         _block_number: BlockNumber,
     ) -> ProviderResult<Vec<AccountBeforeTx>> {
         Ok(Vec::default())
+    }
+
+    fn get_account_before_block(
+        &self,
+        _block_number: BlockNumber,
+        _address: Address,
+    ) -> ProviderResult<Option<AccountBeforeTx>> {
+        Ok(None)
+    }
+
+    fn account_changesets_range(
+        &self,
+        _range: impl RangeBounds<BlockNumber>,
+    ) -> ProviderResult<Vec<(BlockNumber, AccountBeforeTx)>> {
+        Ok(Vec::default())
+    }
+
+    fn account_changeset_count(&self) -> ProviderResult<usize> {
+        Ok(0)
     }
 }
 
@@ -476,15 +509,18 @@ impl<C: Send + Sync + 'static, N: NodePrimitives> StateProviderFactory for NoopP
             BlockNumberOrTag::Latest => self.latest(),
             BlockNumberOrTag::Finalized => {
                 // we can only get the finalized state by hash, not by num
-                let hash =
-                    self.finalized_block_hash()?.ok_or(ProviderError::FinalizedBlockNotFound)?;
+                let hash = self
+                    .finalized_block_hash()?
+                    .ok_or(ProviderError::FinalizedBlockNotFound)?;
 
                 // only look at historical state
                 self.history_by_block_hash(hash)
             }
             BlockNumberOrTag::Safe => {
                 // we can only get the safe state by hash, not by num
-                let hash = self.safe_block_hash()?.ok_or(ProviderError::SafeBlockNotFound)?;
+                let hash = self
+                    .safe_block_hash()?
+                    .ok_or(ProviderError::SafeBlockNotFound)?;
 
                 self.history_by_block_hash(hash)
             }

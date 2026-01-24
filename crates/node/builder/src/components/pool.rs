@@ -1,8 +1,12 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Pool component for the node builder.
 
 use alloy_primitives::Address;
 use reth_chain_state::CanonStateSubscriptions;
-use reth_node_api::TxTy;
+use reth_chainspec::EthereumHardforks;
+use reth_node_api::{NodeTypes, TxTy};
 use reth_transaction_pool::{
     blobstore::DiskFileBlobStore, CoinbaseTipOrdering, PoolConfig, PoolTransaction, SubPoolLimit,
     TransactionPool, TransactionValidationTaskExecutor, TransactionValidator,
@@ -97,7 +101,10 @@ impl PoolBuilderConfigOverrides {
         if let Some(minimal_protocol_basefee) = minimal_protocol_basefee {
             config.minimal_protocol_basefee = minimal_protocol_basefee;
         }
-        config.local_transactions_config.local_addresses.extend(local_addresses);
+        config
+            .local_transactions_config
+            .local_addresses
+            .extend(local_addresses);
 
         config
     }
@@ -122,15 +129,19 @@ impl<'a, Node: FullNodeTypes> TxPoolBuilder<'a, Node> {
 impl<'a, Node: FullNodeTypes, V> TxPoolBuilder<'a, Node, V> {
     /// Configure the validator for the transaction pool.
     pub fn with_validator<NewV>(self, validator: NewV) -> TxPoolBuilder<'a, Node, NewV> {
-        TxPoolBuilder { ctx: self.ctx, validator }
+        TxPoolBuilder {
+            ctx: self.ctx,
+            validator,
+        }
     }
 }
 
 impl<'a, Node: FullNodeTypes, V> TxPoolBuilder<'a, Node, TransactionValidationTaskExecutor<V>>
 where
-    V: TransactionValidator + Clone + 'static,
+    V: TransactionValidator + 'static,
     V::Transaction:
         PoolTransaction<Consensus = TxTy<Node::Types>> + reth_transaction_pool::EthPoolTransaction,
+    <Node::Types as NodeTypes>::ChainSpec: EthereumHardforks,
 {
     /// Build the transaction pool and spawn its maintenance tasks.
     /// This method creates the blob store, builds the pool, and spawns maintenance tasks.
@@ -186,7 +197,10 @@ pub fn create_blob_store_with_cache<Node: FullNodeTypes>(
         Default::default()
     };
 
-    Ok(reth_transaction_pool::blobstore::DiskFileBlobStore::open(data_dir.blobstore(), config)?)
+    Ok(reth_transaction_pool::blobstore::DiskFileBlobStore::open(
+        data_dir.blobstore(),
+        config,
+    )?)
 }
 
 /// Spawn local transaction backup task if enabled.
@@ -209,16 +223,17 @@ where
                 transactions_path,
             );
 
-        ctx.task_executor().spawn_critical_with_graceful_shutdown_signal(
-            "local transactions backup task",
-            |shutdown| {
-                reth_transaction_pool::maintain::backup_local_transactions_task(
-                    shutdown,
-                    pool,
-                    transactions_backup_config,
-                )
-            },
-        );
+        ctx.task_executor()
+            .spawn_critical_with_graceful_shutdown_signal(
+                "local transactions backup task",
+                |shutdown| {
+                    reth_transaction_pool::maintain::backup_local_transactions_task(
+                        shutdown,
+                        pool,
+                        transactions_backup_config,
+                    )
+                },
+            );
     }
     Ok(())
 }
@@ -231,6 +246,7 @@ fn spawn_pool_maintenance_task<Node, Pool>(
 ) -> eyre::Result<()>
 where
     Node: FullNodeTypes,
+    <Node::Types as NodeTypes>::ChainSpec: EthereumHardforks,
     Pool: reth_transaction_pool::TransactionPoolExt + Clone + 'static,
     Pool::Transaction: PoolTransaction<Consensus = TxTy<Node::Types>>,
 {
@@ -263,6 +279,7 @@ fn spawn_maintenance_tasks<Node, Pool>(
 ) -> eyre::Result<()>
 where
     Node: FullNodeTypes,
+    <Node::Types as NodeTypes>::ChainSpec: EthereumHardforks,
     Pool: reth_transaction_pool::TransactionPoolExt + Clone + 'static,
     Pool::Transaction: PoolTransaction<Consensus = TxTy<Node::Types>>,
 {
@@ -273,7 +290,9 @@ where
 
 impl<Node: FullNodeTypes, V: std::fmt::Debug> std::fmt::Debug for TxPoolBuilder<'_, Node, V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TxPoolBuilder").field("validator", &self.validator).finish()
+        f.debug_struct("TxPoolBuilder")
+            .field("validator", &self.validator)
+            .finish()
     }
 }
 

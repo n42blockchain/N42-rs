@@ -1,30 +1,32 @@
 //! Builder support for rpc components.
 
 pub use jsonrpsee::server::middleware::rpc::{RpcService, RpcServiceBuilder};
-pub use reth_rpc_builder::{middleware::RethRpcMiddleware, Identity};
+pub use reth_engine_tree::tree::{BasicEngineValidator, EngineValidator};
+pub use reth_rpc_builder::{middleware::RethRpcMiddleware, Identity, Stack};
 
-use crate::{BeaconConsensusEngineEvent, BeaconConsensusEngineHandle};
+use crate::launch::invalid_block_hook::InvalidBlockHookExt;
 use alloy_rpc_types::engine::ClientVersionV1;
 use alloy_rpc_types_engine::ExecutionData;
 use jsonrpsee::{core::middleware::layer::Either, RpcModule};
 use reth_chain_state::CanonStateSubscriptions;
-use reth_chainspec::{ChainSpecProvider, EthereumHardforks};
+use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks, Hardforks};
+use reth_engine_primitives::{ConsensusEngineEvent, ConsensusEngineHandle};
 use reth_node_api::{
-    AddOnsContext, BlockTy, EngineTypes, EngineValidator, FullNodeComponents, FullNodeTypes,
-    NodeAddOns, NodeTypes, PayloadTypes, ReceiptTy,
+    AddOnsContext, BlockTy, ConfigureEngineEvm, EngineApiValidator, EngineTypes,
+    FullNodeComponents, FullNodeTypes, NodeAddOns, NodeTypes, PayloadTypes, PayloadValidator,
+    PrimitivesTy, TreeConfig,
 };
 use reth_node_core::{
     node_config::NodeConfig,
     version::{CARGO_PKG_VERSION, CLIENT_CODE, NAME_CLIENT, VERGEN_GIT_SHA},
 };
 use reth_payload_builder::{PayloadBuilderHandle, PayloadStore};
-use reth_rpc::eth::{EthApiTypes, FullEthApiServer};
-use reth_rpc_api::{eth::helpers::AddDevSigners, IntoEngineApiRpcModule};
+use reth_rpc::eth::{DevSigner, EthApiTypes, FullEthApiServer};
+use reth_rpc_api::{eth::helpers::EthTransactions, IntoEngineApiRpcModule};
 use reth_rpc_builder::{
     auth::{AuthRpcModule, AuthServerHandle},
     config::RethRpcServerConfig,
-    RpcModuleBuilder, RpcRegistryInner, RpcServerConfig, RpcServerHandle, Stack,
-    TransportRpcModules,
+    RpcModuleBuilder, RpcRegistryInner, RpcServerConfig, RpcServerHandle, TransportRpcModules,
 };
 use reth_rpc_engine_api::{capabilities::EngineCapabilities, EngineApi};
 use reth_rpc_eth_types::{cache::cache_new_blocks_task, EthConfig, EthStateCache};
@@ -61,7 +63,10 @@ where
     EthApi: EthApiTypes,
 {
     fn default() -> Self {
-        Self { on_rpc_started: Box::<()>::default(), extend_rpc_modules: Box::<()>::default() }
+        Self {
+            on_rpc_started: Box::<()>::default(),
+            extend_rpc_modules: Box::<()>::default(),
+        }
     }
 }
 
@@ -320,10 +325,9 @@ pub struct RpcHandle<Node: FullNodeComponents, EthApi: EthApiTypes> {
     ///
     /// Caution: This is a multi-producer, multi-consumer broadcast and allows grants access to
     /// dispatch events
-    pub engine_events:
-        EventSender<BeaconConsensusEngineEvent<<Node::Types as NodeTypes>::Primitives>>,
+    pub engine_events: EventSender<ConsensusEngineEvent<<Node::Types as NodeTypes>::Primitives>>,
     /// Handle to the beacon consensus engine.
-    pub beacon_engine_handle: BeaconConsensusEngineHandle<<Node::Types as NodeTypes>::Payload>,
+    pub beacon_engine_handle: ConsensusEngineHandle<<Node::Types as NodeTypes>::Payload>,
 }
 
 impl<Node: FullNodeComponents, EthApi: EthApiTypes> Clone for RpcHandle<Node, EthApi> {
@@ -369,10 +373,9 @@ pub struct RpcServerOnlyHandle<Node: FullNodeComponents, EthApi: EthApiTypes> {
     /// Configured RPC modules.
     pub rpc_registry: RpcRegistry<Node, EthApi>,
     /// Notification channel for engine API events
-    pub engine_events:
-        EventSender<BeaconConsensusEngineEvent<<Node::Types as NodeTypes>::Primitives>>,
+    pub engine_events: EventSender<ConsensusEngineEvent<<Node::Types as NodeTypes>::Primitives>>,
     /// Handle to the consensus engine.
-    pub engine_handle: BeaconConsensusEngineHandle<<Node::Types as NodeTypes>::Payload>,
+    pub engine_handle: ConsensusEngineHandle<<Node::Types as NodeTypes>::Payload>,
 }
 
 /// Handle returned when only the authenticated Engine API server is launched.
@@ -387,10 +390,9 @@ pub struct AuthServerOnlyHandle<Node: FullNodeComponents, EthApi: EthApiTypes> {
     /// Configured RPC modules.
     pub rpc_registry: RpcRegistry<Node, EthApi>,
     /// Notification channel for engine API events
-    pub engine_events:
-        EventSender<BeaconConsensusEngineEvent<<Node::Types as NodeTypes>::Primitives>>,
+    pub engine_events: EventSender<ConsensusEngineEvent<<Node::Types as NodeTypes>::Primitives>>,
     /// Handle to the consensus engine.
-    pub engine_handle: BeaconConsensusEngineHandle<<Node::Types as NodeTypes>::Payload>,
+    pub engine_handle: ConsensusEngineHandle<<Node::Types as NodeTypes>::Payload>,
 }
 
 /// Internal context struct for RPC setup shared between different launch methods
@@ -402,8 +404,8 @@ struct RpcSetupContext<'a, Node: FullNodeComponents, EthApi: EthApiTypes> {
     auth_config: reth_rpc_builder::auth::AuthServerConfig,
     registry: RpcRegistry<Node, EthApi>,
     on_rpc_started: Box<dyn OnRpcStarted<Node, EthApi>>,
-    engine_events: EventSender<BeaconConsensusEngineEvent<<Node::Types as NodeTypes>::Primitives>>,
-    engine_handle: BeaconConsensusEngineHandle<<Node::Types as NodeTypes>::Payload>,
+    engine_events: EventSender<ConsensusEngineEvent<<Node::Types as NodeTypes>::Primitives>>,
+    engine_handle: ConsensusEngineHandle<<Node::Types as NodeTypes>::Payload>,
 }
 
 /// Node add-ons containing RPC server configuration, with customizable eth API handler.
@@ -419,18 +421,21 @@ struct RpcSetupContext<'a, Node: FullNodeComponents, EthApi: EthApiTypes> {
 pub struct RpcAddOns<
     Node: FullNodeComponents,
     EthB: EthApiBuilder<Node>,
-    EV,
-    EB = BasicEngineApiBuilder<EV>,
+    PVB,
+    EB = BasicEngineApiBuilder<PVB>,
+    EVB = BasicEngineValidatorBuilder<PVB>,
     RpcMiddleware = Identity,
 > {
     /// Additional RPC add-ons.
     pub hooks: RpcHooks<Node, EthB::EthApi>,
     /// Builder for `EthApi`
     eth_api_builder: EthB,
-    /// Engine validator
-    engine_validator_builder: EV,
+    /// Payload validator builder
+    payload_validator_builder: PVB,
     /// Builder for `EngineApi`
     engine_api_builder: EB,
+    /// Builder for tree validator
+    engine_validator_builder: EVB,
     /// Configurable RPC middleware stack.
     ///
     /// This middleware is applied to all RPC requests across all transports (HTTP, WS, IPC).
@@ -438,25 +443,28 @@ pub struct RpcAddOns<
     rpc_middleware: RpcMiddleware,
 }
 
-impl<Node, EthB, EV, EB, RpcMiddleware> Debug for RpcAddOns<Node, EthB, EV, EB, RpcMiddleware>
+impl<Node, EthB, PVB, EB, EVB, RpcMiddleware> Debug
+    for RpcAddOns<Node, EthB, PVB, EB, EVB, RpcMiddleware>
 where
     Node: FullNodeComponents,
     EthB: EthApiBuilder<Node>,
-    EV: Debug,
+    PVB: Debug,
     EB: Debug,
+    EVB: Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RpcAddOns")
             .field("hooks", &self.hooks)
             .field("eth_api_builder", &"...")
-            .field("engine_validator_builder", &self.engine_validator_builder)
+            .field("payload_validator_builder", &self.payload_validator_builder)
             .field("engine_api_builder", &self.engine_api_builder)
+            .field("engine_validator_builder", &self.engine_validator_builder)
             .field("rpc_middleware", &"...")
             .finish()
     }
 }
 
-impl<Node, EthB, EV, EB, RpcMiddleware> RpcAddOns<Node, EthB, EV, EB, RpcMiddleware>
+impl<Node, EthB, PVB, EB, EVB, RpcMiddleware> RpcAddOns<Node, EthB, PVB, EB, EVB, RpcMiddleware>
 where
     Node: FullNodeComponents,
     EthB: EthApiBuilder<Node>,
@@ -464,13 +472,15 @@ where
     /// Creates a new instance of the RPC add-ons.
     pub fn new(
         eth_api_builder: EthB,
-        engine_validator_builder: EV,
+        payload_validator_builder: PVB,
         engine_api_builder: EB,
+        engine_validator_builder: EVB,
         rpc_middleware: RpcMiddleware,
     ) -> Self {
         Self {
             hooks: RpcHooks::default(),
             eth_api_builder,
+            payload_validator_builder,
             engine_validator_builder,
             engine_api_builder,
             rpc_middleware,
@@ -481,13 +491,44 @@ where
     pub fn with_engine_api<T>(
         self,
         engine_api_builder: T,
-    ) -> RpcAddOns<Node, EthB, EV, T, RpcMiddleware> {
-        let Self { hooks, eth_api_builder, engine_validator_builder, rpc_middleware, .. } = self;
+    ) -> RpcAddOns<Node, EthB, PVB, T, EVB, RpcMiddleware> {
+        let Self {
+            hooks,
+            eth_api_builder,
+            payload_validator_builder,
+            engine_validator_builder,
+            rpc_middleware,
+            ..
+        } = self;
         RpcAddOns {
             hooks,
             eth_api_builder,
-            engine_validator_builder,
+            payload_validator_builder,
             engine_api_builder,
+            engine_validator_builder,
+            rpc_middleware,
+        }
+    }
+
+    /// Maps the [`PayloadValidatorBuilder`] builder type.
+    pub fn with_payload_validator<T>(
+        self,
+        payload_validator_builder: T,
+    ) -> RpcAddOns<Node, EthB, T, EB, EVB, RpcMiddleware> {
+        let Self {
+            hooks,
+            eth_api_builder,
+            engine_api_builder,
+            engine_validator_builder,
+            rpc_middleware,
+            ..
+        } = self;
+        RpcAddOns {
+            hooks,
+            eth_api_builder,
+            payload_validator_builder,
+            engine_api_builder,
+            engine_validator_builder,
             rpc_middleware,
         }
     }
@@ -496,13 +537,21 @@ where
     pub fn with_engine_validator<T>(
         self,
         engine_validator_builder: T,
-    ) -> RpcAddOns<Node, EthB, T, EB, RpcMiddleware> {
-        let Self { hooks, eth_api_builder, engine_api_builder, rpc_middleware, .. } = self;
+    ) -> RpcAddOns<Node, EthB, PVB, EB, T, RpcMiddleware> {
+        let Self {
+            hooks,
+            eth_api_builder,
+            payload_validator_builder,
+            engine_api_builder,
+            rpc_middleware,
+            ..
+        } = self;
         RpcAddOns {
             hooks,
             eth_api_builder,
-            engine_validator_builder,
+            payload_validator_builder,
             engine_api_builder,
+            engine_validator_builder,
             rpc_middleware,
         }
     }
@@ -545,14 +594,24 @@ where
     /// - Middleware is applied to the RPC service layer, not the HTTP transport layer
     /// - The default middleware is `Identity` (no-op), which passes through requests unchanged
     /// - Middleware layers are applied in the order they are added via `.layer()`
-    pub fn with_rpc_middleware<T>(self, rpc_middleware: T) -> RpcAddOns<Node, EthB, EV, EB, T> {
-        let Self { hooks, eth_api_builder, engine_validator_builder, engine_api_builder, .. } =
-            self;
+    pub fn with_rpc_middleware<T>(
+        self,
+        rpc_middleware: T,
+    ) -> RpcAddOns<Node, EthB, PVB, EB, EVB, T> {
+        let Self {
+            hooks,
+            eth_api_builder,
+            payload_validator_builder,
+            engine_api_builder,
+            engine_validator_builder,
+            ..
+        } = self;
         RpcAddOns {
             hooks,
             eth_api_builder,
-            engine_validator_builder,
+            payload_validator_builder,
             engine_api_builder,
+            engine_validator_builder,
             rpc_middleware,
         }
     }
@@ -561,20 +620,22 @@ where
     pub fn layer_rpc_middleware<T>(
         self,
         layer: T,
-    ) -> RpcAddOns<Node, EthB, EV, EB, Stack<RpcMiddleware, T>> {
+    ) -> RpcAddOns<Node, EthB, PVB, EB, EVB, Stack<RpcMiddleware, T>> {
         let Self {
             hooks,
             eth_api_builder,
-            engine_validator_builder,
+            payload_validator_builder,
             engine_api_builder,
+            engine_validator_builder,
             rpc_middleware,
         } = self;
         let rpc_middleware = Stack::new(rpc_middleware, layer);
         RpcAddOns {
             hooks,
             eth_api_builder,
-            engine_validator_builder,
+            payload_validator_builder,
             engine_api_builder,
+            engine_validator_builder,
             rpc_middleware,
         }
     }
@@ -583,9 +644,19 @@ where
     pub fn option_layer_rpc_middleware<T>(
         self,
         layer: Option<T>,
-    ) -> RpcAddOns<Node, EthB, EV, EB, Stack<RpcMiddleware, Either<T, Identity>>> {
-        let layer = layer.map(Either::Left).unwrap_or(Either::Right(Identity::new()));
+    ) -> RpcAddOns<Node, EthB, PVB, EB, EVB, Stack<RpcMiddleware, Either<T, Identity>>> {
+        let layer = layer
+            .map(Either::Left)
+            .unwrap_or(Either::Right(Identity::new()));
         self.layer_rpc_middleware(layer)
+    }
+
+    /// Returns the engine validator builder
+    pub fn engine_validator_builder(&self) -> EVB
+    where
+        EVB: Clone,
+    {
+        self.engine_validator_builder.clone()
     }
 
     /// Sets the hook that is run once the rpc server is started.
@@ -609,24 +680,32 @@ where
     }
 }
 
-impl<Node, EthB, EV, EB> Default for RpcAddOns<Node, EthB, EV, EB, Identity>
+impl<Node, EthB, PVB, EB, EVB> Default for RpcAddOns<Node, EthB, PVB, EB, EVB, Identity>
 where
     Node: FullNodeComponents,
-    EthB: EthApiBuilder<Node>,
-    EV: Default,
+    EthB: EthApiBuilder<Node> + Default,
+    PVB: Default,
     EB: Default,
+    EVB: Default,
 {
     fn default() -> Self {
-        Self::new(EthB::default(), EV::default(), EB::default(), Default::default())
+        Self::new(
+            EthB::default(),
+            PVB::default(),
+            EB::default(),
+            EVB::default(),
+            Default::default(),
+        )
     }
 }
 
-impl<N, EthB, EV, EB, RpcMiddleware> RpcAddOns<N, EthB, EV, EB, RpcMiddleware>
+impl<N, EthB, PVB, EB, EVB, RpcMiddleware> RpcAddOns<N, EthB, PVB, EB, EVB, RpcMiddleware>
 where
     N: FullNodeComponents,
     N::Provider: ChainSpecProvider<ChainSpec: EthereumHardforks>,
     EthB: EthApiBuilder<N>,
-    EV: EngineValidatorBuilder<N>,
+    PVB: PayloadValidatorBuilder<N>,
+    EVB: EngineValidatorBuilder<N>,
     EB: EngineApiBuilder<N>,
     RpcMiddleware: RethRpcMiddleware,
 {
@@ -657,11 +736,16 @@ where
             engine_handle,
         } = setup_ctx;
 
-        let server_config = config.rpc.rpc_server_config().set_rpc_middleware(rpc_middleware);
+        let server_config = config
+            .rpc
+            .rpc_server_config()
+            .set_rpc_middleware(rpc_middleware);
         let rpc_server_handle = Self::launch_rpc_server_internal(server_config, &modules).await?;
 
-        let handles =
-            RethRpcServerHandles { rpc: rpc_server_handle.clone(), auth: AuthServerHandle::noop() };
+        let handles = RethRpcServerHandles {
+            rpc: rpc_server_handle.clone(),
+            auth: AuthServerHandle::noop(),
+        };
         Self::finalize_rpc_setup(
             &mut registry,
             &mut modules,
@@ -704,7 +788,10 @@ where
             engine_handle,
         } = setup_ctx;
 
-        let server_config = config.rpc.rpc_server_config().set_rpc_middleware(rpc_middleware);
+        let server_config = config
+            .rpc
+            .rpc_server_config()
+            .set_rpc_middleware(rpc_middleware);
         let auth_module_clone = auth_module.clone();
 
         // launch servers concurrently
@@ -743,10 +830,21 @@ where
     where
         F: FnOnce(RpcModuleContainer<'_, N, EthB::EthApi>) -> eyre::Result<()>,
     {
-        let Self { eth_api_builder, engine_api_builder, hooks, .. } = self;
+        let Self {
+            eth_api_builder,
+            engine_api_builder,
+            hooks,
+            ..
+        } = self;
 
         let engine_api = engine_api_builder.build_engine_api(&ctx).await?;
-        let AddOnsContext { node, config, beacon_engine_handle, jwt_secret, engine_events } = ctx;
+        let AddOnsContext {
+            node,
+            config,
+            beacon_engine_handle,
+            jwt_secret,
+            engine_events,
+        } = ctx;
 
         info!(target: "reth::cli", "Engine API handler initialized");
 
@@ -765,7 +863,11 @@ where
             }),
         );
 
-        let ctx = EthApiCtx { components: &node, config: config.rpc.eth_config(), cache };
+        let ctx = EthApiCtx {
+            components: &node,
+            config: config.rpc.eth_config(),
+            cache,
+        };
         let eth_api = eth_api_builder.build_eth_api(ctx).await?;
 
         let auth_config = config.rpc.auth_server_config(jwt_secret)?;
@@ -779,11 +881,12 @@ where
             .with_executor(Box::new(node.task_executor().clone()))
             .with_evm_config(node.evm_config().clone())
             .with_consensus(node.consensus().clone())
-            .build_with_auth_server(module_config, engine_api, eth_api);
+            .build_with_auth_server(module_config, engine_api, eth_api, engine_events.clone());
 
         // in dev mode we generate 20 random dev-signer accounts
         if config.dev.dev {
-            registry.eth_api().with_dev_accounts();
+            let signers = DevSigner::from_mnemonic(config.dev.dev_mnemonic.as_str(), 20);
+            registry.eth_api().signers().write().extend(signers);
         }
 
         let mut registry = RpcRegistry { registry };
@@ -795,7 +898,10 @@ where
             auth_module: &mut auth_module,
         };
 
-        let RpcHooks { on_rpc_started, extend_rpc_modules } = hooks;
+        let RpcHooks {
+            on_rpc_started,
+            extend_rpc_modules,
+        } = hooks;
 
         ext(RpcModuleContainer {
             modules: ctx.modules,
@@ -868,19 +974,27 @@ where
         on_rpc_started: Box<dyn OnRpcStarted<N, EthB::EthApi>>,
         handles: RethRpcServerHandles,
     ) -> eyre::Result<()> {
-        let ctx = RpcContext { node: node.clone(), config, registry, modules, auth_module };
+        let ctx = RpcContext {
+            node: node.clone(),
+            config,
+            registry,
+            modules,
+            auth_module,
+        };
 
         on_rpc_started.on_rpc_started(ctx, handles)?;
         Ok(())
     }
 }
 
-impl<N, EthB, EV, EB, RpcMiddleware> NodeAddOns<N> for RpcAddOns<N, EthB, EV, EB, RpcMiddleware>
+impl<N, EthB, PVB, EB, EVB, RpcMiddleware> NodeAddOns<N>
+    for RpcAddOns<N, EthB, PVB, EB, EVB, RpcMiddleware>
 where
     N: FullNodeComponents,
     <N as FullNodeTypes>::Provider: ChainSpecProvider<ChainSpec: EthereumHardforks>,
     EthB: EthApiBuilder<N>,
-    EV: EngineValidatorBuilder<N>,
+    PVB: PayloadValidatorBuilder<N>,
+    EVB: EngineValidatorBuilder<N>,
     EB: EngineApiBuilder<N>,
     RpcMiddleware: RethRpcMiddleware,
 {
@@ -903,8 +1017,8 @@ pub trait RethRpcAddOns<N: FullNodeComponents>:
     fn hooks_mut(&mut self) -> &mut RpcHooks<N, Self::EthApi>;
 }
 
-impl<N: FullNodeComponents, EthB, EV, EB, RpcMiddleware> RethRpcAddOns<N>
-    for RpcAddOns<N, EthB, EV, EB, RpcMiddleware>
+impl<N: FullNodeComponents, EthB, PVB, EB, EVB, RpcMiddleware> RethRpcAddOns<N>
+    for RpcAddOns<N, EthB, PVB, EB, EVB, RpcMiddleware>
 where
     Self: NodeAddOns<N, Handle = RpcHandle<N, EthB::EthApi>>,
     EthB: EthApiBuilder<N>,
@@ -925,7 +1039,28 @@ pub struct EthApiCtx<'a, N: FullNodeTypes> {
     /// Eth API configuration
     pub config: EthConfig,
     /// Cache for eth state
-    pub cache: EthStateCache<BlockTy<N::Types>, ReceiptTy<N::Types>>,
+    pub cache: EthStateCache<PrimitivesTy<N::Types>>,
+}
+
+impl<'a, N> EthApiCtx<'a, N>
+where
+    N: FullNodeComponents<Types: NodeTypes<ChainSpec: Hardforks + EthereumHardforks>>,
+{
+    /// Returns an `EthApiBuilder` with the necessary context pre-configured.
+    pub fn eth_api_builder(
+        self,
+    ) -> reth_rpc::EthApiBuilder<N, reth_rpc::eth::core::EthRpcConverterFor<N>> {
+        reth_rpc::EthApiBuilder::new_with_components(self.components.clone())
+            .eth_cache(self.cache)
+            .task_spawner(self.components.task_executor().clone())
+            .gas_cap(self.config.rpc_gas_cap.into())
+            .max_simulate_blocks(self.config.rpc_max_simulate_blocks)
+            .eth_proof_window(self.config.eth_proof_window)
+            .fee_history_cache_config(self.config.fee_history_cache)
+            .proof_permits(self.config.proof_permits)
+            .gas_oracle_config(self.config.gas_oracle)
+            .max_batch_size(self.config.max_batch_size)
+    }
 }
 
 /// A `EthApi` that knows how to build `eth` namespace API from [`FullNodeComponents`].
@@ -933,7 +1068,6 @@ pub trait EthApiBuilder<N: FullNodeComponents>: Default + Send + 'static {
     /// The Ethapi implementation this builder will build.
     type EthApi: EthApiTypes
         + FullEthApiServer<Provider = N::Provider, Pool = N::Pool>
-        + AddDevSigners
         + Unpin
         + 'static;
 
@@ -944,63 +1078,134 @@ pub trait EthApiBuilder<N: FullNodeComponents>: Default + Send + 'static {
     ) -> impl Future<Output = eyre::Result<Self::EthApi>> + Send;
 }
 
-/// Helper trait that provides the validator for the engine API
+/// Helper trait that provides the validator builder for the engine API
 pub trait EngineValidatorAddOn<Node: FullNodeComponents>: Send {
-    /// The Validator type to use for the engine API.
-    type Validator: EngineValidator<<Node::Types as NodeTypes>::Payload, Block = BlockTy<Node::Types>>
-        + Clone;
+    /// The validator builder type to use.
+    type ValidatorBuilder: EngineValidatorBuilder<Node>;
 
-    /// Creates the engine validator for an engine API based node.
-    fn engine_validator(
-        &self,
-        ctx: &AddOnsContext<'_, Node>,
-    ) -> impl Future<Output = eyre::Result<Self::Validator>>;
+    /// Returns the validator builder.
+    fn engine_validator_builder(&self) -> Self::ValidatorBuilder;
 }
 
-impl<N, EthB, EV, EB> EngineValidatorAddOn<N> for RpcAddOns<N, EthB, EV, EB>
+impl<N, EthB, PVB, EB, EVB, RpcMiddleware> EngineValidatorAddOn<N>
+    for RpcAddOns<N, EthB, PVB, EB, EVB, RpcMiddleware>
 where
     N: FullNodeComponents,
     EthB: EthApiBuilder<N>,
-    EV: EngineValidatorBuilder<N>,
+    PVB: Send,
+    EVB: EngineValidatorBuilder<N>,
     EB: EngineApiBuilder<N>,
+    RpcMiddleware: Send,
 {
-    type Validator = EV::Validator;
+    type ValidatorBuilder = EVB;
 
-    async fn engine_validator(&self, ctx: &AddOnsContext<'_, N>) -> eyre::Result<Self::Validator> {
-        self.engine_validator_builder.clone().build(ctx).await
+    fn engine_validator_builder(&self) -> Self::ValidatorBuilder {
+        self.engine_validator_builder.clone()
     }
 }
 
-/// A type that knows how to build the engine validator.
-pub trait EngineValidatorBuilder<Node: FullNodeComponents>: Send + Sync + Clone {
-    /// The consensus implementation to build.
-    type Validator: EngineValidator<<Node::Types as NodeTypes>::Payload, Block = BlockTy<Node::Types>>
-        + Clone;
+/// Builder trait for creating payload validators for the Engine API.
+///
+/// This trait is responsible for building validators that validate engine API
+/// version-specific fields and payload attributes.
+pub trait PayloadValidatorBuilder<Node: FullNodeComponents>: Send + Sync + Clone {
+    /// The validator type that will be used by the Engine API.
+    type Validator: PayloadValidator<<Node::Types as NodeTypes>::Payload>;
 
-    /// Creates the engine validator.
+    /// Builds the engine API validator.
+    ///
+    /// Returns a validator that validates engine API version-specific fields and payload
+    /// attributes.
     fn build(
         self,
         ctx: &AddOnsContext<'_, Node>,
     ) -> impl Future<Output = eyre::Result<Self::Validator>> + Send;
 }
 
-impl<Node, F, Fut, Validator> EngineValidatorBuilder<Node> for F
-where
-    Node: FullNodeComponents,
-    Validator: EngineValidator<<Node::Types as NodeTypes>::Payload, Block = BlockTy<Node::Types>>
-        + Clone
-        + Unpin
-        + 'static,
-    F: FnOnce(&AddOnsContext<'_, Node>) -> Fut + Send + Sync + Clone,
-    Fut: Future<Output = eyre::Result<Validator>> + Send,
-{
-    type Validator = Validator;
+/// A type that knows how to build the engine validator.
+pub trait EngineValidatorBuilder<Node: FullNodeComponents>: Send + Sync + Clone {
+    /// The tree validator type that will be used by the consensus engine.
+    type EngineValidator: EngineValidator<
+        <Node::Types as NodeTypes>::Payload,
+        <Node::Types as NodeTypes>::Primitives,
+    >;
 
-    fn build(
+    /// Builds the tree validator for the consensus engine.
+    ///
+    /// Returns a validator that handles block execution, state validation, and fork handling.
+    fn build_tree_validator(
         self,
         ctx: &AddOnsContext<'_, Node>,
-    ) -> impl Future<Output = eyre::Result<Self::Validator>> {
-        self(ctx)
+        tree_config: TreeConfig,
+        changeset_cache: reth_trie_db::ChangesetCache,
+    ) -> impl Future<Output = eyre::Result<Self::EngineValidator>> + Send;
+}
+
+/// Basic implementation of [`EngineValidatorBuilder`].
+///
+/// This builder creates a [`BasicEngineValidator`] using the provided payload validator builder.
+#[derive(Debug, Clone)]
+pub struct BasicEngineValidatorBuilder<PVB> {
+    /// The payload validator builder used to create the engine validator.
+    payload_validator_builder: PVB,
+}
+
+impl<PVB> BasicEngineValidatorBuilder<PVB> {
+    /// Creates a new instance with the given payload validator builder.
+    pub const fn new(payload_validator_builder: PVB) -> Self {
+        Self {
+            payload_validator_builder,
+        }
+    }
+}
+
+impl<PVB> Default for BasicEngineValidatorBuilder<PVB>
+where
+    PVB: Default,
+{
+    fn default() -> Self {
+        Self::new(PVB::default())
+    }
+}
+
+impl<Node, EV> EngineValidatorBuilder<Node> for BasicEngineValidatorBuilder<EV>
+where
+    Node: FullNodeComponents<
+        Evm: ConfigureEngineEvm<
+            <<Node::Types as NodeTypes>::Payload as PayloadTypes>::ExecutionData,
+        >,
+    >,
+    EV: PayloadValidatorBuilder<Node>,
+    EV::Validator: reth_engine_primitives::PayloadValidator<
+        <Node::Types as NodeTypes>::Payload,
+        Block = BlockTy<Node::Types>,
+    >,
+    <<Node as reth_node_api::FullNodeTypes>::Provider as reth_provider::DatabaseProviderFactory>::Provider: reth_provider::TrieReader,
+{
+    type EngineValidator = BasicEngineValidator<Node::Provider, Node::Evm, EV::Validator>;
+
+    async fn build_tree_validator(
+        self,
+        ctx: &AddOnsContext<'_, Node>,
+        tree_config: TreeConfig,
+        changeset_cache: reth_trie_db::ChangesetCache,
+    ) -> eyre::Result<Self::EngineValidator> {
+        let validator = self.payload_validator_builder.build(ctx).await?;
+        let data_dir = ctx
+            .config
+            .datadir
+            .clone()
+            .resolve_datadir(ctx.config.chain.chain());
+        let invalid_block_hook = ctx.create_invalid_block_hook(&data_dir).await?;
+        Ok(BasicEngineValidator::new(
+            ctx.node.provider().clone(),
+            std::sync::Arc::new(ctx.node.consensus().clone()),
+            ctx.node.evm_config().clone(),
+            validator,
+            tree_config,
+            invalid_block_hook,
+            changeset_cache,
+        ))
     }
 }
 
@@ -1030,11 +1235,11 @@ pub trait EngineApiBuilder<Node: FullNodeComponents>: Send + Sync {
 /// [`EngineTypes`] and uses the general purpose [`EngineApi`] implementation as the builder's
 /// output.
 #[derive(Debug, Default)]
-pub struct BasicEngineApiBuilder<EV> {
-    engine_validator_builder: EV,
+pub struct BasicEngineApiBuilder<PVB> {
+    payload_validator_builder: PVB,
 }
 
-impl<N, EV> EngineApiBuilder<N> for BasicEngineApiBuilder<EV>
+impl<N, PVB> EngineApiBuilder<N> for BasicEngineApiBuilder<PVB>
 where
     N: FullNodeComponents<
         Types: NodeTypes<
@@ -1042,20 +1247,23 @@ where
             Payload: PayloadTypes<ExecutionData = ExecutionData> + EngineTypes,
         >,
     >,
-    EV: EngineValidatorBuilder<N>,
+    PVB: PayloadValidatorBuilder<N>,
+    PVB::Validator: EngineApiValidator<<N::Types as NodeTypes>::Payload>,
 {
     type EngineApi = EngineApi<
         N::Provider,
         <N::Types as NodeTypes>::Payload,
         N::Pool,
-        EV::Validator,
+        PVB::Validator,
         <N::Types as NodeTypes>::ChainSpec,
     >;
 
     async fn build_engine_api(self, ctx: &AddOnsContext<'_, N>) -> eyre::Result<Self::EngineApi> {
-        let Self { engine_validator_builder } = self;
+        let Self {
+            payload_validator_builder,
+        } = self;
 
-        let engine_validator = engine_validator_builder.build(ctx).await?;
+        let engine_validator = payload_validator_builder.build(ctx).await?;
         let client = ClientVersionV1 {
             code: CLIENT_CODE,
             name: NAME_CLIENT.to_string(),
@@ -1073,6 +1281,7 @@ where
             EngineCapabilities::default(),
             engine_validator,
             ctx.config.engine.accept_execution_requests_hash,
+            ctx.node.network().clone(),
         ))
     }
 }

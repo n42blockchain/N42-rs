@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use metrics::Histogram;
 use reth_eth_wire::DisconnectReason;
 use reth_ethereum_primitives::TxType;

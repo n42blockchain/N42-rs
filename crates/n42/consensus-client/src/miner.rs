@@ -1,61 +1,68 @@
 //! Contains the implementation of the mining mode for the local engine.
 
-use alloy_eips::{
-    eip7685::Requests,
-};
-use blst::min_pk::{AggregateSignature, Signature};
-use blst::min_pk::PublicKey;
-use alloy_primitives::FixedBytes;
-use n42_clique::{BlockVerifyResult, UnverifiedBlock};
-use reth_storage_errors::provider::ProviderResult;
-use n42_engine_primitives::{PayloadAttributesBuilderExt};
-use std::str::FromStr;
 use alloy_consensus::TxReceipt;
-use alloy_primitives::{Sealable, BlockNumber, Bytes};
-use reth_network_api::{FullNetwork, BlockDownloaderProvider, BlockAnnounceProvider, NetworkEventListenerProvider};
-use reth_ethereum_primitives::{EthPrimitives};
-use reth_primitives::TransactionSigned;
-use reth_primitives_traits::{AlloyBlockHeader, NodePrimitives, BlockBody};
+use alloy_eips::eip7685::Requests;
 use alloy_eips::{BlockHashOrNumber, BlockNumHash};
+use alloy_primitives::FixedBytes;
 use alloy_primitives::{keccak256, Address, BlockHash, TxHash, B256, U128, U256};
+use alloy_primitives::{BlockNumber, Bytes, Sealable};
 use alloy_rpc_types_engine::{CancunPayloadFields, ExecutionPayloadSidecar, ForkchoiceState};
+use blst::min_pk::PublicKey;
+use blst::min_pk::{AggregateSignature, Signature};
 use eyre::OptionExt;
 use futures_util::{stream::Fuse, StreamExt};
 use itertools::Itertools;
-use reth_engine_primitives::BeaconConsensusEngineHandle;
-use reth_chainspec::EthereumHardforks;
+use n42_clique::{BlockVerifyResult, UnverifiedBlock};
+use n42_engine_primitives::PayloadAttributesBuilderExt;
 use reth_chainspec::EthChainSpec;
-use reth_consensus::{FullConsensus, ConsensusError};
-use reth_payload_primitives::{EngineApiMessageVersion};
-use reth_eth_wire_types::{NewBlock, NetworkPrimitives};
+use reth_chainspec::EthereumHardforks;
+use reth_consensus::{ConsensusError, FullConsensus};
+use reth_engine_primitives::ConsensusEngineHandle;
+use reth_eth_wire_types::{NetworkPrimitives, NewBlock};
+use reth_ethereum_primitives::EthPrimitives;
+use reth_network_api::{
+    BlockAnnounceProvider, BlockDownloaderProvider, FullNetwork, NetworkEventListenerProvider,
+};
 use reth_network_p2p::{
-    bodies::client::BodiesClient, headers::client::HeadersClient, priority::Priority,
-    BlockClient,
+    bodies::client::BodiesClient, headers::client::HeadersClient, priority::Priority, BlockClient,
 };
 use reth_payload_builder::PayloadBuilderHandle;
-use reth_payload_primitives::{
-    BuiltPayload, PayloadAttributesBuilder, PayloadKind, PayloadTypes,
-};
+use reth_payload_primitives::EngineApiMessageVersion;
+use reth_payload_primitives::{BuiltPayload, PayloadAttributesBuilder, PayloadKind, PayloadTypes};
+use reth_primitives::TransactionSigned;
 use reth_primitives::{Block, Header, SealedBlock};
-use reth_primitives_traits::{Block as BlockTrait, header::clique_utils::{recover_address, recover_address_generic}};
-use reth_provider::{BlockIdReader, BlockReader, ChainSpecProvider, BeaconProvider, BeaconProviderWriter, DatabaseProviderFactory, ChainStateBlockReader};
+use reth_primitives_traits::{
+    header::clique_utils::{recover_address, recover_address_generic},
+    Block as BlockTrait,
+};
+use reth_primitives_traits::{AlloyBlockHeader, BlockBody, NodePrimitives};
+use reth_provider::{
+    BeaconProvider, BeaconProviderWriter, BlockIdReader, BlockReader, ChainSpecProvider,
+    ChainStateBlockReader, DatabaseProviderFactory,
+};
+use reth_storage_errors::provider::ProviderResult;
 use reth_transaction_pool::TransactionPool;
-use std::collections::{HashMap};
+use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
-    time::{Duration, UNIX_EPOCH, SystemTime},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{mpsc, broadcast};
+use tokio::sync::{broadcast, mpsc};
 use tokio::time::{interval_at, sleep, Instant, Interval};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{trace, debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
-use crate::beacon::{Beacon};
-use n42_primitives::{RelativeEpoch, Attestation, BeaconState, BeaconBlock, Deposit, VoluntaryExitWithSig, parse_deposit_log, BLSPubkey, BlockVerifyResultAggregate, agg_sig_to_fixed, fixed_to_agg_sig, SLOTS_PER_EPOCH, CommitteeIndex, AttestationData};
-use crate::network::{fetch_beacon_block, broadcast_beacon_block};
+use crate::beacon::Beacon;
+use crate::network::{broadcast_beacon_block, fetch_beacon_block};
+use n42_primitives::{
+    agg_sig_to_fixed, fixed_to_agg_sig, parse_deposit_log, Attestation, AttestationData, BLSPubkey,
+    BeaconBlock, BeaconState, BlockVerifyResultAggregate, CommitteeIndex, Deposit, RelativeEpoch,
+    VoluntaryExitWithSig, SLOTS_PER_EPOCH,
+};
 
 /// A mining mode for the local dev engine.
 #[derive(Debug)]
@@ -116,7 +123,7 @@ pub struct N42Miner<T: PayloadTypes, Provider, B, Network> {
     payload_attributes_builder: B,
 
     /// beacon engine handle
-    beacon_engine_handle: BeaconConsensusEngineHandle<T>,
+    beacon_engine_handle: ConsensusEngineHandle<T>,
     /// The mining mode for the engine
     mode: MiningMode,
     /// The timer for preparing block
@@ -125,8 +132,13 @@ pub struct N42Miner<T: PayloadTypes, Provider, B, Network> {
     payload_builder: PayloadBuilderHandle<T>,
     /// full network  for announce block
     network: Network,
-    consensus: Arc<dyn FullConsensus<<T::BuiltPayload as BuiltPayload>::Primitives, Error = ConsensusError>>,
-    recent_blocks: schnellru::LruMap<B256, SealedBlock<<<T::BuiltPayload as BuiltPayload>::Primitives as NodePrimitives>::Block>>,
+    consensus: Arc<
+        dyn FullConsensus<<T::BuiltPayload as BuiltPayload>::Primitives>,
+    >,
+    recent_blocks: schnellru::LruMap<
+        B256,
+        SealedBlock<<<T::BuiltPayload as BuiltPayload>::Primitives as NodePrimitives>::Block>,
+    >,
     recent_num_to_td: schnellru::LruMap<u64, U256>,
     new_block_tx: mpsc::Sender<(NewBlock, BlockHash)>,
     new_block_rx: mpsc::Receiver<(NewBlock, BlockHash)>,
@@ -167,8 +179,7 @@ where
     T: PayloadTypes,
     <T::BuiltPayload as BuiltPayload>::Primitives: NodePrimitives,
     <T::BuiltPayload as BuiltPayload>::Primitives: NodePrimitives<Block = reth_ethereum_primitives::Block>,
-    Provider: 
-        BlockReader
+    Provider: BlockReader
         + BlockIdReader
         + ChainSpecProvider<ChainSpec: EthereumHardforks>
         + DatabaseProviderFactory <Provider: ChainStateBlockReader>
@@ -187,11 +198,11 @@ where
     pub fn spawn_new(
         provider: Provider,
         payload_attributes_builder: B,
-        beacon_engine_handle: BeaconConsensusEngineHandle<T>,
+        beacon_engine_handle: ConsensusEngineHandle<T>,
         mode: MiningMode,
         payload_builder: PayloadBuilderHandle<T>,
         network: Network,
-        consensus: Arc<dyn FullConsensus<<T::BuiltPayload as BuiltPayload>::Primitives, Error = ConsensusError>>,
+        consensus: Arc<dyn FullConsensus<<T::BuiltPayload as BuiltPayload>::Primitives>>,
         broadcast_unverified_block_tx: broadcast::Sender<(UnverifiedBlock, Arc<Vec<BLSPubkey>>)>,
         block_verify_result_rx: mpsc::Receiver<BlockVerifyResult>,
     ) {
@@ -518,7 +529,6 @@ where
         let snapshot = self
             .consensus
             .snapshot(header.number(), header.hash_slow(), None)?;
-        
 
         Ok(snapshot.signers)
     }
@@ -687,6 +697,7 @@ where
             return Err(eyre::eyre!("mismatch receipts_root, expected={:?}, got={:?}", attestation.data.receipts_root, attestation_data.receipts_root));
         }
 
+        // Use JSON encoding for consistent serialization with verify_aggregate_signature
         let bytes: Vec<u8> = serde_json::to_vec(&attestation_data)?;
         let bytes_slice: &[u8] = &bytes;
         let err = signature.verify(true, bytes_slice, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[], &pubkey, true);
@@ -731,7 +742,9 @@ where
                 eyre::bail!("Error advancing the chain: no attestations");
             }
         }
-        let max_td = self.consensus.total_difficulty(block.hash());
+        // Calculate TD for the pending block: parent_td + block_difficulty
+        let parent_td = self.consensus.total_difficulty(block.header().parent_hash());
+        let max_td = parent_td + block.header().difficulty();
         let num_signers = self.get_best_block_num_signers()?;
         let interval = match self.mode {
             MiningMode::Instant(_) => {
@@ -859,6 +872,35 @@ where
 
         let (withdrawals, beacon_state_after_withdrawal) = self.beacon.gen_withdrawals(header.hash())?;
         debug!(target: "consensus-client", ?withdrawals, "prepare_block: PayloadAttributes withdrawals");
+        
+        // Log validator status for debugging
+        let current_epoch = beacon_state_after_withdrawal.current_epoch();
+        let total_validators = beacon_state_after_withdrawal.validators_store.len();
+        let active_validators: Vec<_> = beacon_state_after_withdrawal.validators_store.iter()
+            .enumerate()
+            .filter(|(_, v)| v.is_active_at(current_epoch))
+            .map(|(i, v)| (i, v.activation_epoch, v.exit_epoch))
+            .collect();
+        info!(target: "consensus-client", 
+            current_epoch=current_epoch,
+            total_validators=total_validators,
+            active_validators_count=active_validators.len(),
+            "prepare_block: validator status"
+        );
+        if total_validators > 0 && active_validators.is_empty() {
+            // Log first few validators for debugging
+            for (i, v) in beacon_state_after_withdrawal.validators_store.iter().take(5).enumerate() {
+                info!(target: "consensus-client",
+                    validator_index=i,
+                    pubkey=hex::encode(&v.pubkey),
+                    activation_eligibility_epoch=v.activation_eligibility_epoch,
+                    activation_epoch=v.activation_epoch,
+                    exit_epoch=v.exit_epoch,
+                    effective_balance=v.effective_balance,
+                    "prepare_block: validator not yet active"
+                );
+            }
+        }
 
         let forkchoice_state = self.forkchoice_state()?;
         let payload_attributes = self.payload_attributes_builder.build_ext(timestamp.as_secs(), withdrawals, beacon_state_after_withdrawal.randao_mix);
@@ -906,27 +948,35 @@ where
         };
         self.pending_block_data.replace(pending_block_data);
 
-        let max_td = self.consensus.total_difficulty(block.header().hash_slow());
+        // Calculate TD for the new block: parent_td + block_difficulty
+        // This avoids cache miss warnings since payload builder uses a different consensus instance
+        let parent_td = self.consensus.total_difficulty(block.header().parent_hash());
+        let max_td = parent_td + block.header().difficulty();
         debug!(target: "consensus-client", ?max_td, "prepare_block: new_block hash {:?}", block.header().hash_slow());
         trace!(target: "consensus-client", ?block);
 
         let committee_cache = if block.number % SLOTS_PER_EPOCH == 0 {
             // committee_cache init requires non-empty validators
             if !beacon_state_after_withdrawal.has_active_validators(RelativeEpoch::Next) {
+                debug!(target: "consensus-client", block_number=block.number, "prepare_block: no active validators for next epoch, skipping broadcast");
                 return Ok(());
             }
-            beacon_state_after_withdrawal.committee_cache(RelativeEpoch::Next)?
+            beacon_state_after_withdrawal.gen_committee_cache(RelativeEpoch::Next)?
         } else {
             // committee_cache init requires non-empty validators
             if !beacon_state_after_withdrawal.has_active_validators(RelativeEpoch::Current) {
+                debug!(target: "consensus-client", block_number=block.number, "prepare_block: no active validators for current epoch, skipping broadcast");
                 return Ok(());
             }
-            beacon_state_after_withdrawal.committee_cache(RelativeEpoch::Current)?
+            beacon_state_after_withdrawal.gen_committee_cache(RelativeEpoch::Current)?
         };
 
         let beacon_committees = committee_cache.get_beacon_committees_at_slot(block.number)?;
+        debug!(target: "consensus-client", block_number=block.number, num_committees=beacon_committees.len(), "prepare_block: got beacon committees");
 
-        let cached_reads = self.consensus.get_cached_reads(block.hash())?.ok_or(eyre::eyre!("cached_reads not found, block_hash={:?}", block.hash()))?;
+        // Try to get cached_reads from consensus, fall back to empty cache if not found
+        // This can happen when payload builder uses a different consensus instance
+        let cached_reads = self.consensus.get_cached_reads(block.hash())?.unwrap_or_default();
         let mut header = block.header().clone();
         header.receipts_root = Default::default();
         let body = block.body().clone();
@@ -947,8 +997,22 @@ where
             for validator_index in beacon_committee.committee {
                 target_committee_pubkeys.push(beacon_state_after_withdrawal.get_validator(*validator_index)?.pubkey);
             }
+            debug!(target: "consensus-client", 
+                block_number=block.number, 
+                committee_index=beacon_committee.index, 
+                num_validators=target_committee_pubkeys.len(),
+                pubkeys=?target_committee_pubkeys.iter().map(|p| hex::encode(p)).collect::<Vec<_>>(),
+                "prepare_block: broadcasting to committee"
+            );
             unverified_block.committee_index = beacon_committee.index;
-            let _ = self.broadcast_unverified_block_tx.send((unverified_block.clone(), Arc::new(target_committee_pubkeys)));
+            match self.broadcast_unverified_block_tx.send((unverified_block.clone(), Arc::new(target_committee_pubkeys))) {
+                Ok(num_receivers) => {
+                    debug!(target: "consensus-client", block_number=block.number, num_receivers, "prepare_block: broadcast sent");
+                }
+                Err(e) => {
+                    warn!(target: "consensus-client", block_number=block.number, ?e, "prepare_block: broadcast send failed");
+                }
+            }
         }
         Ok(())
     }
@@ -1222,8 +1286,5 @@ where
 }
 
 fn exit_by_sigint() {
-    let _ = nix::sys::signal::kill(
-        nix::unistd::Pid::this(),
-        nix::sys::signal::Signal::SIGINT,
-    );
+    let _ = nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGINT);
 }

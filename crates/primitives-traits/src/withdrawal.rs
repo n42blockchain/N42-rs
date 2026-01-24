@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! [EIP-4895](https://eips.ethereum.org/EIPS/eip-4895) Withdrawal types.
 
 #[cfg(test)]
@@ -40,10 +43,10 @@ mod tests {
 
     impl PartialEq<Withdrawal> for RethWithdrawal {
         fn eq(&self, other: &Withdrawal) -> bool {
-            self.index == other.index &&
-                self.validator_index == other.validator_index &&
-                self.address == other.address &&
-                self.amount == other.amount
+            self.index == other.index
+                && self.validator_index == other.validator_index
+                && self.address == other.address
+                && self.amount == other.amount
         }
     }
 

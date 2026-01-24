@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Tables and data models.
 //!
 //! # Overview
@@ -16,6 +19,7 @@ pub mod codecs;
 mod raw;
 pub use raw::{RawDupSort, RawKey, RawTable, RawValue, TableRawRow};
 
+use crate::models::BlockNumberHashedAddress;
 use crate::{
     models::{
         accounts::BlockNumberAddress,
@@ -28,14 +32,16 @@ use crate::{
 };
 use alloy_consensus::Header;
 use alloy_primitives::{Address, BlockHash, BlockNumber, TxHash, TxNumber, B256};
+use n42_primitives::{BeaconBlock, BeaconState, Snapshot, Validator, ValidatorBeforeTx};
 use reth_ethereum_primitives::{Receipt, TransactionSigned};
 use reth_primitives_traits::{Account, Bytecode, StorageEntry};
 use reth_prune_types::{PruneCheckpoint, PruneSegment};
 use reth_stages_types::StageCheckpoint;
-use reth_trie_common::{BranchNodeCompact, StorageTrieEntry, StoredNibbles, StoredNibblesSubKey};
+use reth_trie_common::{
+    BranchNodeCompact, StorageTrieEntry, StoredNibbles, StoredNibblesSubKey, TrieChangeSetsEntry,
+};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use n42_primitives::{BeaconBlock,BeaconState, Snapshot, Validator, ValidatorBeforeTx};
 
 /// Enum for the types of tables present in libmdbx.
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -67,7 +73,10 @@ pub enum TableType {
 ///         Ok(())
 ///     }
 ///
-///     fn view_dupsort<T: DupSort>(&self) -> Result<(), Self::Error> {
+///     fn view_dupsort<T: DupSort>(&self) -> Result<(), Self::Error>
+///     where
+///         T::Value: reth_primitives_traits::ValueWithSubKey<SubKey = T::SubKey>,
+///     {
 ///         // operate on a dupsort table in a generic way
 ///         Ok(())
 ///     }
@@ -93,7 +102,10 @@ pub trait TableViewer<R> {
     /// Operate on the dupsort table in a generic way.
     ///
     /// By default, the `view` function is invoked unless overridden.
-    fn view_dupsort<T: DupSort>(&self) -> Result<R, Self::Error> {
+    fn view_dupsort<T: DupSort>(&self) -> Result<R, Self::Error>
+    where
+        T::Value: reth_primitives_traits::ValueWithSubKey<SubKey = T::SubKey>,
+    {
         self.view::<T>()
     }
 }
@@ -129,7 +141,9 @@ macro_rules! tables {
             ///
             #[doc = concat!("Marker type representing a database table mapping [`", stringify!($key), "`] to ", tables!(@value_doc $key, $value, $($($generic),*)?), ".")]
             $(
-                #[doc = concat!("\n\nThis table's `DUPSORT` subkey is [`", stringify!($subkey), "`].")]
+                #[doc = concat!("
+
+This table's `DUPSORT` subkey is [`", stringify!($subkey), "`].")]
             )?
             pub struct $name$(<$($generic $( = $default)?),*>)? {
                 _private: std::marker::PhantomData<($($($generic,)*)?)>,
@@ -312,7 +326,7 @@ tables! {
         type Key = BlockHash;
         type Value = BeaconBlock;
     }
-    
+
     ///
     table BeaconNum2Hash{
         type Key = BlockNumber;
@@ -348,7 +362,7 @@ tables! {
     table Snapshots {
         type Key = BlockNumber;
         type Value = Snapshot;
-        }
+    }
 
     /// Stores the snaphsot per hash
     table SnapshotsByHash {
@@ -361,7 +375,7 @@ tables! {
         type Key = HeaderHash;
         type Value = Address;
     }
-    
+
     /// Stores the beacon block per hash
     table BeaconBlocksByHash {
         type Key = BlockHash;
@@ -378,6 +392,18 @@ tables! {
     table BeaconBlockHashesByEth1Hash {
         type Key = BlockHash;
         type Value = BlockHash;
+        }
+
+    /// Stores the Tree node per tree node hash for validator
+    table TreeByHashForValidator {
+        type Key = B256;
+        type Value = merkle_db_rs::tree::Tree<Validator>;
+        }
+
+    /// Stores the Tree node per tree node hash for u64
+    table TreeByHashForU64 {
+        type Key = B256;
+        type Value = merkle_db_rs::tree::Tree<u64>;
         }
 
     /// Stores the header hashes belonging to the canonical chain.
@@ -568,6 +594,20 @@ tables! {
         type SubKey = StoredNibblesSubKey;
     }
 
+    /// Stores the state of a node in the accounts trie prior to a particular block being executed.
+    table AccountsTrieChangeSets {
+        type Key = BlockNumber;
+        type Value = TrieChangeSetsEntry;
+        type SubKey = StoredNibblesSubKey;
+    }
+
+    /// Stores the state of a node in a storage trie prior to a particular block being executed.
+    table StoragesTrieChangeSets {
+        type Key = BlockNumberHashedAddress;
+        type Value = TrieChangeSetsEntry;
+        type SubKey = StoredNibblesSubKey;
+    }
+
     /// Stores the transaction sender for each canonical transaction.
     /// It is needed to speed up execution stage and allows fetching signer without doing
     /// transaction signed recovery
@@ -604,6 +644,12 @@ tables! {
     table ChainState {
         type Key = ChainStateKey;
         type Value = BlockNumber;
+    }
+
+    /// Stores arbitrary metadata as key-value pairs.
+    table Metadata {
+        type Key = String;
+        type Value = Vec<u8>;
     }
 }
 

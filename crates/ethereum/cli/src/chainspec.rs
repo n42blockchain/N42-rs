@@ -1,9 +1,20 @@
-use reth_chainspec::{ChainSpec, DEV, HOLESKY, HOODI, MAINNET, SEPOLIA, N42, N42_DEVNET};
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+use reth_chainspec::{ChainSpec, DEV, HOLESKY, HOODI, MAINNET, N42, N42_DEVNET, SEPOLIA};
 use reth_cli::chainspec::{parse_genesis, ChainSpecParser};
 use std::sync::Arc;
 
 /// Chains supported by reth. First value should be used as the default.
-pub const SUPPORTED_CHAINS: &[&str] = &["mainnet", "sepolia", "holesky", "hoodi", "n42", "n42-devnet", "dev"];
+pub const SUPPORTED_CHAINS: &[&str] = &[
+    "mainnet",
+    "sepolia",
+    "holesky",
+    "hoodi",
+    "n42",
+    "n42-devnet",
+    "dev",
+];
 
 /// Clap value parser for [`ChainSpec`]s.
 ///

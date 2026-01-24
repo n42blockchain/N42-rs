@@ -1,4 +1,7 @@
-use crate::{NodePrimitivesProvider, StorageLocation};
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+use crate::NodePrimitivesProvider;
 use alloc::vec::Vec;
 use alloy_primitives::BlockNumber;
 use reth_db_models::StoredBlockBodyIndices;
@@ -14,43 +17,27 @@ pub trait BlockExecutionWriter:
     /// Take all of the blocks above the provided number and their execution result
     ///
     /// The passed block number will stay in the database.
-    ///
-    /// Accepts [`StorageLocation`] specifying from where should transactions and receipts be
-    /// removed.
     fn take_block_and_execution_above(
         &self,
         block: BlockNumber,
-        remove_from: StorageLocation,
     ) -> ProviderResult<Chain<Self::Primitives>>;
 
     /// Remove all of the blocks above the provided number and their execution result
     ///
     /// The passed block number will stay in the database.
-    ///
-    /// Accepts [`StorageLocation`] specifying from where should transactions and receipts be
-    /// removed.
-    fn remove_block_and_execution_above(
-        &self,
-        block: BlockNumber,
-        remove_from: StorageLocation,
-    ) -> ProviderResult<()>;
+    fn remove_block_and_execution_above(&self, block: BlockNumber) -> ProviderResult<()>;
 }
 
 impl<T: BlockExecutionWriter> BlockExecutionWriter for &T {
     fn take_block_and_execution_above(
         &self,
         block: BlockNumber,
-        remove_from: StorageLocation,
     ) -> ProviderResult<Chain<Self::Primitives>> {
-        (*self).take_block_and_execution_above(block, remove_from)
+        (*self).take_block_and_execution_above(block)
     }
 
-    fn remove_block_and_execution_above(
-        &self,
-        block: BlockNumber,
-        remove_from: StorageLocation,
-    ) -> ProviderResult<()> {
-        (*self).remove_block_and_execution_above(block, remove_from)
+    fn remove_block_and_execution_above(&self, block: BlockNumber) -> ProviderResult<()> {
+        (*self).remove_block_and_execution_above(block)
     }
 }
 
@@ -67,13 +54,9 @@ pub trait BlockWriter: Send + Sync {
     ///
     /// Return [`StoredBlockBodyIndices`] that contains indices of the first and last transactions
     /// and transition in the block.
-    ///
-    /// Accepts [`StorageLocation`] value which specifies where transactions and headers should be
-    /// written.
     fn insert_block(
         &self,
         block: RecoveredBlock<Self::Block>,
-        write_to: StorageLocation,
     ) -> ProviderResult<StoredBlockBodyIndices>;
 
     /// Appends a batch of block bodies extending the canonical chain. This is invoked during
@@ -83,25 +66,16 @@ pub trait BlockWriter: Send + Sync {
     /// Bodies are passed as [`Option`]s, if body is `None` the corresponding block is empty.
     fn append_block_bodies(
         &self,
-        bodies: Vec<(BlockNumber, Option<<Self::Block as Block>::Body>)>,
-        write_to: StorageLocation,
+        bodies: Vec<(BlockNumber, Option<&<Self::Block as Block>::Body>)>,
     ) -> ProviderResult<()>;
 
     /// Removes all blocks above the given block number from the database.
     ///
     /// Note: This does not remove state or execution data.
-    fn remove_blocks_above(
-        &self,
-        block: BlockNumber,
-        remove_from: StorageLocation,
-    ) -> ProviderResult<()>;
+    fn remove_blocks_above(&self, block: BlockNumber) -> ProviderResult<()>;
 
     /// Removes all block bodies above the given block number from the database.
-    fn remove_bodies_above(
-        &self,
-        block: BlockNumber,
-        remove_from: StorageLocation,
-    ) -> ProviderResult<()>;
+    fn remove_bodies_above(&self, block: BlockNumber) -> ProviderResult<()>;
 
     /// Appends a batch of sealed blocks to the blockchain, including sender information, and
     /// updates the post-state.

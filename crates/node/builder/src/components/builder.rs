@@ -7,7 +7,7 @@ use crate::{
     },
     BuilderContext, ConfigureEvm, FullNodeTypes,
 };
-use reth_consensus::{ConsensusError, FullConsensus};
+use reth_consensus::FullConsensus;
 use reth_network::types::NetPrimitivesFor;
 use reth_network_api::FullNetwork;
 use reth_node_api::{PrimitivesTy, TxTy};
@@ -394,7 +394,7 @@ where
         + 'static,
     EVM: ConfigureEvm<Primitives = PrimitivesTy<Node::Types>> + 'static,
     Cons:
-        FullConsensus<PrimitivesTy<Node::Types>, Error = ConsensusError> + Clone + Unpin + 'static,
+        FullConsensus<PrimitivesTy<Node::Types>> + Clone + Unpin + 'static,
 {
     type Components = Components<Node, Net, Pool, EVM, Cons>;
 

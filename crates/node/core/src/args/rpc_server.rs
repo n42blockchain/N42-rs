@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! clap [Args](clap::Args) for RPC related arguments.
 
 use std::{
@@ -15,7 +18,9 @@ use clap::{
 };
 use rand::Rng;
 use reth_cli_util::parse_ether_value;
+use reth_rpc_eth_types::builder::config::PendingBlockKind;
 use reth_rpc_server_types::{constants, RethRpcModule, RpcModuleSelection};
+use url::Url;
 
 use crate::args::{
     types::{MaxU32, ZeroAsNoneU64},
@@ -94,6 +99,12 @@ pub struct RpcServerArgs {
     #[arg(long, default_value_t = constants::DEFAULT_IPC_ENDPOINT.to_string())]
     pub ipcpath: String,
 
+    /// Set the permissions for the IPC socket file, in octal format.
+    ///
+    /// If not specified, the permissions will be set by the system's umask.
+    #[arg(long = "ipc.permissions")]
+    pub ipc_socket_permissions: Option<String>,
+
     /// Auth server address to listen on
     #[arg(long = "authrpc.addr", default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST))]
     pub auth_addr: IpAddr,
@@ -108,7 +119,12 @@ pub struct RpcServerArgs {
     ///
     /// If no path is provided, a secret will be generated and stored in the datadir under
     /// `<DIR>/<CHAIN_ID>/jwt.hex`. For mainnet this would be `~/.reth/mainnet/jwt.hex` by default.
-    #[arg(long = "authrpc.jwtsecret", value_name = "PATH", global = true, required = false)]
+    #[arg(
+        long = "authrpc.jwtsecret",
+        value_name = "PATH",
+        global = true,
+        required = false
+    )]
     pub auth_jwtsecret: Option<PathBuf>,
 
     /// Enable auth engine API over IPC
@@ -124,7 +140,12 @@ pub struct RpcServerArgs {
     ///
     /// This is __not__ used for the authenticated engine-API RPC server, see
     /// `--authrpc.jwtsecret`.
-    #[arg(long = "rpc.jwtsecret", value_name = "HEX", global = true, required = false)]
+    #[arg(
+        long = "rpc.jwtsecret",
+        value_name = "HEX",
+        global = true,
+        required = false
+    )]
     pub rpc_jwtsecret: Option<JwtSecret>,
 
     /// Set the maximum RPC request payload size for both HTTP and WS in megabytes.
@@ -152,6 +173,14 @@ pub struct RpcServerArgs {
     #[arg(long = "rpc.max-tracing-requests", alias = "rpc-max-tracing-requests", value_name = "COUNT", default_value_t = constants::default_max_tracing_requests())]
     pub rpc_max_tracing_requests: usize,
 
+    /// Maximum number of concurrent blocking IO requests.
+    ///
+    /// Blocking IO requests include `eth_call`, `eth_estimateGas`, and similar methods that
+    /// require EVM execution. These are spawned as blocking tasks to avoid blocking the async
+    /// runtime.
+    #[arg(long = "rpc.max-blocking-io-requests", alias = "rpc-max-blocking-io-requests", value_name = "COUNT", default_value_t = constants::DEFAULT_MAX_BLOCKING_IO_REQUEST)]
+    pub rpc_max_blocking_io_requests: usize,
+
     /// Maximum number of blocks for `trace_filter` requests.
     #[arg(long = "rpc.max-trace-filter-blocks", alias = "rpc-max-trace-filter-blocks", value_name = "COUNT", default_value_t = constants::DEFAULT_MAX_TRACE_FILTER_BLOCKS)]
     pub rpc_max_trace_filter_blocks: u64,
@@ -173,6 +202,15 @@ pub struct RpcServerArgs {
         default_value_t = constants::gas_oracle::RPC_DEFAULT_GAS_CAP
     )]
     pub rpc_gas_cap: u64,
+
+    /// Maximum memory (in bytes) for EVM memory that can be consumed by RPC calls.
+    #[arg(
+        long = "rpc.evm-memory-limit",
+        value_name = "MEMORY_LIMIT",
+        value_parser = MaxOr::new(RangedU64ValueParser::<u64>::new().range(1..)),
+        default_value_t = (1 << 32) - 1
+    )]
+    pub rpc_evm_memory_limit: u64,
 
     /// Maximum eth transaction fee (in ether) that can be sent via the RPC APIs (0 = no cap)
     #[arg(
@@ -205,6 +243,25 @@ pub struct RpcServerArgs {
     /// Maximum number of concurrent getproof requests.
     #[arg(long = "rpc.proof-permits", alias = "rpc-proof-permits", value_name = "COUNT", default_value_t = constants::DEFAULT_PROOF_PERMITS)]
     pub rpc_proof_permits: usize,
+
+    /// Configures the pending block behavior for RPC responses.
+    ///
+    /// Options: full (include all transactions), empty (header only), none (disable pending
+    /// blocks).
+    #[arg(
+        long = "rpc.pending-block",
+        default_value = "full",
+        value_name = "KIND"
+    )]
+    pub rpc_pending_block: PendingBlockKind,
+
+    /// Endpoint to forward transactions to.
+    #[arg(
+        long = "rpc.forwarder",
+        alias = "rpc-forwarder",
+        value_name = "FORWARDER"
+    )]
+    pub rpc_forwarder: Option<Url>,
 
     /// Path to file containing disallowed addresses, json-encoded list of strings. Block
     /// validation API will reject blocks containing transactions from these addresses.
@@ -297,8 +354,11 @@ impl RpcServerArgs {
     /// Append a random string to the ipc path, to prevent possible collisions when multiple nodes
     /// are being run on the same machine.
     pub fn with_ipc_random_path(mut self) -> Self {
-        let random_string: String =
-            rand::rng().sample_iter(rand::distr::Alphanumeric).take(8).map(char::from).collect();
+        let random_string: String = rand::rng()
+            .sample_iter(rand::distr::Alphanumeric)
+            .take(8)
+            .map(char::from)
+            .collect();
         self.ipcpath = format!("{}-{}", self.ipcpath, random_string);
         self
     }
@@ -330,6 +390,7 @@ impl Default for RpcServerArgs {
             ws_api: None,
             ipcdisable: false,
             ipcpath: constants::DEFAULT_IPC_ENDPOINT.to_string(),
+            ipc_socket_permissions: None,
             auth_addr: Ipv4Addr::LOCALHOST.into(),
             auth_port: constants::DEFAULT_AUTH_PORT,
             auth_jwtsecret: None,
@@ -341,16 +402,20 @@ impl Default for RpcServerArgs {
             rpc_max_subscriptions_per_connection: RPC_DEFAULT_MAX_SUBS_PER_CONN.into(),
             rpc_max_connections: RPC_DEFAULT_MAX_CONNECTIONS.into(),
             rpc_max_tracing_requests: constants::default_max_tracing_requests(),
+            rpc_max_blocking_io_requests: constants::DEFAULT_MAX_BLOCKING_IO_REQUEST,
             rpc_max_trace_filter_blocks: constants::DEFAULT_MAX_TRACE_FILTER_BLOCKS,
             rpc_max_blocks_per_filter: constants::DEFAULT_MAX_BLOCKS_PER_FILTER.into(),
             rpc_max_logs_per_response: (constants::DEFAULT_MAX_LOGS_PER_RESPONSE as u64).into(),
             rpc_gas_cap: constants::gas_oracle::RPC_DEFAULT_GAS_CAP,
+            rpc_evm_memory_limit: (1 << 32) - 1,
             rpc_tx_fee_cap: constants::DEFAULT_TX_FEE_CAP_WEI,
             rpc_max_simulate_blocks: constants::DEFAULT_MAX_SIMULATE_BLOCKS,
             rpc_eth_proof_window: constants::DEFAULT_ETH_PROOF_WINDOW,
             gas_price_oracle: GasPriceOracleArgs::default(),
             rpc_state_cache: RpcStateCacheArgs::default(),
             rpc_proof_permits: constants::DEFAULT_PROOF_PERMITS,
+            rpc_pending_block: PendingBlockKind::Full,
+            rpc_forwarder: None,
             builder_disallow: Default::default(),
         }
     }
@@ -370,20 +435,26 @@ impl TypedValueParser for RpcModuleSelectionValueParser {
         arg: Option<&Arg>,
         value: &OsStr,
     ) -> Result<Self::Value, clap::Error> {
-        let val =
-            value.to_str().ok_or_else(|| clap::Error::new(clap::error::ErrorKind::InvalidUtf8))?;
+        let val = value
+            .to_str()
+            .ok_or_else(|| clap::Error::new(clap::error::ErrorKind::InvalidUtf8))?;
         val.parse::<RpcModuleSelection>().map_err(|err| {
-            let arg = arg.map(|a| a.to_string()).unwrap_or_else(|| "...".to_owned());
+            let arg = arg
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "...".to_owned());
             let possible_values = RethRpcModule::all_variant_names().to_vec().join(",");
             let msg = format!(
-                "Invalid value '{val}' for {arg}: {err}.\n    [possible values: {possible_values}]"
+                "Invalid value '{val}' for {arg}: {err}.
+    [possible values: {possible_values}]"
             );
             clap::Error::raw(clap::error::ErrorKind::InvalidValue, msg)
         })
     }
 
     fn possible_values(&self) -> Option<Box<dyn Iterator<Item = PossibleValue> + '_>> {
-        let values = RethRpcModule::all_variant_names().iter().map(PossibleValue::new);
+        let values = RethRpcModule::all_variant_names()
+            .iter()
+            .map(PossibleValue::new);
         Some(Box::new(values))
     }
 }

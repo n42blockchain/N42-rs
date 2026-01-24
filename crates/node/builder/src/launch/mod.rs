@@ -1,13 +1,18 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Abstraction for launching a node.
 
 pub mod common;
 mod exex;
+pub mod invalid_block_hook;
 
 pub(crate) mod debug;
 pub(crate) mod engine;
 
 pub use common::LaunchContext;
 pub use exex::ExExLauncher;
+pub use invalid_block_hook::InvalidBlockHookExt;
 
 use std::future::Future;
 

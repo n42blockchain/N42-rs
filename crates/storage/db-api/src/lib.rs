@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! reth's database abstraction layer.
 //!
 //! The database abstraction assumes that the underlying store is a KV store subdivided into tables.

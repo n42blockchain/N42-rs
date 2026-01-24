@@ -1,10 +1,13 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! API related to listening for network events.
 
 use reth_eth_wire_types::{
     message::RequestPair, BlockBodies, BlockHeaders, Capabilities, DisconnectReason, EthMessage,
     EthNetworkPrimitives, EthVersion, GetBlockBodies, GetBlockHeaders, GetNodeData,
-    GetPooledTransactions, GetReceipts, NetworkPrimitives, NodeData, PooledTransactions, Receipts,
-    Receipts69, UnifiedStatus,
+    GetPooledTransactions, GetReceipts, GetReceipts70, NetworkPrimitives, NodeData, PooledTransactions, Receipts,
+    Receipts69, Receipts70, UnifiedStatus,
 };
 use reth_ethereum_forks::ForkId;
 use reth_network_p2p::error::{RequestError, RequestResult};
@@ -238,6 +241,15 @@ pub enum PeerRequest<N: NetworkPrimitives = EthNetworkPrimitives> {
         /// The channel to send the response for receipts.
         response: oneshot::Sender<RequestResult<Receipts69<N::Receipt>>>,
     },
+    /// Requests receipts from the peer (eth/70 protocol).
+    ///
+    /// The response should be sent through the channel.
+    GetReceipts70 {
+        /// The request for receipts.
+        request: GetReceipts70,
+        /// The channel to send the response for receipts.
+        response: oneshot::Sender<RequestResult<Receipts70<N::Receipt>>>,
+    },
 }
 
 // === impl PeerRequest ===
@@ -257,6 +269,7 @@ impl<N: NetworkPrimitives> PeerRequest<N> {
             Self::GetNodeData { response, .. } => response.send(Err(err)).ok(),
             Self::GetReceipts { response, .. } => response.send(Err(err)).ok(),
             Self::GetReceipts69 { response, .. } => response.send(Err(err)).ok(),
+            Self::GetReceipts70 { response, .. } => response.send(Err(err)).ok(),
         };
     }
 
@@ -280,6 +293,9 @@ impl<N: NetworkPrimitives> PeerRequest<N> {
             }
             Self::GetReceipts { request, .. } | Self::GetReceipts69 { request, .. } => {
                 EthMessage::GetReceipts(RequestPair { request_id, message: request.clone() })
+            }
+            Self::GetReceipts70 { request, .. } => {
+                EthMessage::GetReceipts70(RequestPair { request_id, message: request.clone() })
             }
         }
     }

@@ -1,5 +1,6 @@
 //! clap [Args](clap::Args) for network related arguments.
 
+use alloy_primitives::B256;
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     ops::Not,
@@ -7,6 +8,7 @@ use std::{
 };
 
 use clap::Args;
+use reth_cli_util::{get_secret_key, load_secret_key::SecretKeyError};
 use reth_chainspec::EthChainSpec;
 use reth_config::Config;
 use reth_discv4::{NodeRecord, DEFAULT_DISCOVERY_ADDR, DEFAULT_DISCOVERY_PORT};
@@ -70,7 +72,12 @@ pub struct NetworkArgs {
 
     /// The path to the known peers file. Connected peers are dumped to this file on nodes
     /// shutdown, and read on startup. Cannot be used with `--no-persist-peers`.
-    #[arg(long, value_name = "FILE", verbatim_doc_comment, conflicts_with = "no_persist_peers")]
+    #[arg(
+        long,
+        value_name = "FILE",
+        verbatim_doc_comment,
+        conflicts_with = "no_persist_peers"
+    )]
     pub peers_file: Option<PathBuf>,
 
     /// Custom node identity
@@ -81,8 +88,15 @@ pub struct NetworkArgs {
     ///
     /// This will also deterministically set the peer ID. If not specified, it will be set in the
     /// data dir for the chain being used.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", conflicts_with = "p2p_secret_key_hex")]
     pub p2p_secret_key: Option<PathBuf>,
+
+    /// Hex encoded secret key to use for this node.
+    ///
+    /// This will also deterministically set the peer ID. Cannot be used together with
+    /// `--p2p-secret-key`.
+    #[arg(long, value_name = "HEX", conflicts_with = "p2p_secret_key")]
+    pub p2p_secret_key_hex: Option<B256>,
 
     /// Do not persist peers.
     #[arg(long, verbatim_doc_comment)]
@@ -153,7 +167,11 @@ pub struct NetworkArgs {
     /// Name of network interface used to communicate with peers.
     ///
     /// If flag is set, but no value is passed, the default interface for docker `eth0` is tried.
-    #[arg(long = "net-if.experimental", conflicts_with = "addr", value_name = "IF_NAME")]
+    #[arg(
+        long = "net-if.experimental",
+        conflicts_with = "addr",
+        value_name = "IF_NAME"
+    )]
     pub net_if: Option<String>,
 
     /// Transaction Propagation Policy
@@ -161,13 +179,21 @@ pub struct NetworkArgs {
     /// The policy determines which peers transactions are gossiped to.
     #[arg(long = "tx-propagation-policy", default_value_t = TransactionPropagationKind::All)]
     pub tx_propagation_policy: TransactionPropagationKind,
+
+    /// Optional network ID to override the chain specification's network ID for P2P connections
+    #[arg(long)]
+    pub network_id: Option<u64>,
 }
 
 impl NetworkArgs {
     /// Returns the resolved IP address.
     pub fn resolved_addr(&self) -> IpAddr {
         if let Some(ref if_name) = self.net_if {
-            let if_name = if if_name.is_empty() { DEFAULT_NET_IF_NAME } else { if_name };
+            let if_name = if if_name.is_empty() {
+                DEFAULT_NET_IF_NAME
+            } else {
+                if_name
+            };
             return match reth_net_nat::net_if::resolve_net_if_ip(if_name) {
                 Ok(addr) => addr,
                 Err(err) => {
@@ -188,9 +214,32 @@ impl NetworkArgs {
     /// Returns the resolved bootnodes if any are provided.
     pub fn resolved_bootnodes(&self) -> Option<Vec<NodeRecord>> {
         self.bootnodes.clone().map(|bootnodes| {
-            bootnodes.into_iter().filter_map(|node| node.resolve_blocking().ok()).collect()
+            bootnodes
+                .into_iter()
+                .filter_map(|node| node.resolve_blocking().ok())
+                .collect()
         })
     }
+
+    /// Returns the secret key to use for networking.
+    ///
+    /// If `p2p_secret_key_hex` is provided, it will be used directly.
+    /// If `p2p_secret_key` is provided, it will be loaded from the file.
+    /// If neither is provided, the `default_secret_key_path` will be used.
+    pub fn secret_key(
+        &self,
+        default_secret_key_path: PathBuf,
+    ) -> Result<SecretKey, SecretKeyError> {
+        if let Some(b256) = &self.p2p_secret_key_hex {
+            // Use the B256 value directly (already validated as 32 bytes)
+            SecretKey::from_slice(b256.as_slice()).map_err(SecretKeyError::SecretKeyDecodeError)
+        } else {
+            // Load from file (either provided path or default)
+            let secret_key_path = self.p2p_secret_key.clone().unwrap_or(default_secret_key_path);
+            get_secret_key(&secret_key_path)
+        }
+    }
+
     /// Configures and returns a `TransactionsManagerConfig` based on the current settings.
     pub fn transactions_manager_config(&self) -> TransactionsManagerConfig {
         TransactionsManagerConfig {
@@ -242,7 +291,7 @@ impl NetworkArgs {
             .peer_config(config.peers_config_with_basic_nodes_from_file(
                 self.persistent_peers_file(peers_file).as_deref(),
             ))
-            .external_ip_resolver(self.nat)
+            .external_ip_resolver(self.nat.clone())
             .sessions_config(
                 SessionsConfig::default().with_upscaled_event_buffer(peers_config.max_peers()),
             )
@@ -261,7 +310,8 @@ impl NetworkArgs {
             // apply discovery settings
             .apply(|builder| {
                 let rlpx_socket = (addr, self.port).into();
-                self.discovery.apply_to_builder(builder, rlpx_socket, chain_bootnodes)
+                self.discovery
+                    .apply_to_builder(builder, rlpx_socket, chain_bootnodes)
             })
             .listener_addr(SocketAddr::new(
                 addr, // set discovery port based on instance number
@@ -272,6 +322,7 @@ impl NetworkArgs {
                 // set discovery port based on instance number
                 self.discovery.port,
             ))
+            .network_id(self.network_id)
     }
 
     /// If `no_persist_peers` is false then this returns the path to the persistent peers file path.
@@ -310,7 +361,9 @@ impl NetworkArgs {
     /// Resolve all trusted peers at once
     pub async fn resolve_trusted_peers(&self) -> Result<Vec<NodeRecord>, std::io::Error> {
         futures::future::try_join_all(
-            self.trusted_peers.iter().map(|peer| async move { peer.resolve().await }),
+            self.trusted_peers
+                .iter()
+                .map(|peer| async move { peer.resolve().await }),
         )
         .await
     }
@@ -327,6 +380,7 @@ impl Default for NetworkArgs {
             peers_file: None,
             identity: P2P_CLIENT_VERSION.to_string(),
             p2p_secret_key: None,
+            p2p_secret_key_hex: None,
             no_persist_peers: false,
             nat: NatResolver::Any,
             addr: DEFAULT_DISCOVERY_ADDR,
@@ -342,7 +396,8 @@ impl Default for NetworkArgs {
             max_seen_tx_history: DEFAULT_MAX_COUNT_TRANSACTIONS_SEEN_BY_PEER,
             max_capacity_cache_txns_pending_fetch: DEFAULT_MAX_CAPACITY_CACHE_PENDING_FETCH,
             net_if: None,
-            tx_propagation_policy: TransactionPropagationKind::default()
+            tx_propagation_policy: TransactionPropagationKind::default(),
+            network_id: None,
         }
     }
 }
@@ -496,9 +551,9 @@ impl DiscoveryArgs {
             return false;
         }
 
-        self.enable_discv5_discovery ||
-            self.discv5_addr.is_some() ||
-            self.discv5_addr_ipv6.is_some()
+        self.enable_discv5_discovery
+            || self.discv5_addr.is_some()
+            || self.discv5_addr_ipv6.is_some()
     }
 
     /// Set the discovery port to zero, to allow the OS to assign a random unused port when
@@ -560,7 +615,10 @@ mod tests {
 
         let args =
             CommandParser::<NetworkArgs>::parse_from(["reth", "--nat", "extip:0.0.0.0"]).args;
-        assert_eq!(args.nat, NatResolver::ExternalIp("0.0.0.0".parse().unwrap()));
+        assert_eq!(
+            args.nat,
+            NatResolver::ExternalIp("0.0.0.0".parse().unwrap())
+        );
     }
 
     #[test]

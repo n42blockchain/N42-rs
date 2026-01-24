@@ -1,16 +1,20 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+#[cfg(test)]
+use crate::StorageLocation;
 use crate::{
     providers::{StaticFileProvider, StaticFileWriter as SfWriter},
-    BlockExecutionWriter, BlockWriter, HistoryWriter, StateWriter, StaticFileProviderFactory,
-    StorageLocation, TrieWriter,
+    BlockExecutionWriter, BlockWriter, HistoryWriter, StateWriter, StateWriteConfig,
+    StaticFileProviderFactory, TrieWriter, WriteStateInput,
 };
 use alloy_consensus::BlockHeader;
-use reth_chain_state::{ExecutedBlock, ExecutedBlockWithTrieUpdates};
+use reth_chain_state::ExecutedBlock;
 use reth_db_api::transaction::{DbTx, DbTxMut};
 use reth_errors::{ProviderError, ProviderResult};
 use reth_primitives_traits::{NodePrimitives, SignedTransaction};
 use reth_static_file_types::StaticFileSegment;
 use reth_storage_api::{DBProvider, StageCheckpointWriter, TransactionsProviderExt};
-use reth_storage_errors::writer::UnifiedStorageWriterError;
 use revm_database::OriginalValuesKnown;
 use std::sync::Arc;
 use tracing::debug;
@@ -30,7 +34,10 @@ impl<'a, ProviderDB, ProviderSF> UnifiedStorageWriter<'a, ProviderDB, ProviderSF
     /// - `database`: An optional reference to a database provider.
     /// - `static_file`: An optional mutable reference to a static file instance.
     pub const fn new(database: &'a ProviderDB, static_file: Option<ProviderSF>) -> Self {
-        Self { database, static_file }
+        Self {
+            database,
+            static_file,
+        }
     }
 
     /// Creates a new instance of [`UnifiedStorageWriter`] from a database provider and a static
@@ -70,11 +77,11 @@ impl<'a, ProviderDB, ProviderSF> UnifiedStorageWriter<'a, ProviderDB, ProviderSF
     ///
     /// # Returns
     /// - `Ok(())` if the static file instance is set.
-    /// - `Err(StorageWriterError::MissingStaticFileWriter)` if the static file instance is not set.
+    /// - `Err(ProviderError)` if the static file instance is not set.
     #[expect(unused)]
-    const fn ensure_static_file(&self) -> Result<(), UnifiedStorageWriterError> {
+    const fn ensure_static_file(&self) -> ProviderResult<()> {
         if self.static_file.is_none() {
-            return Err(UnifiedStorageWriterError::MissingStaticFileWriter)
+            return Err(ProviderError::UnsupportedProvider);
         }
         Ok(())
     }
@@ -132,14 +139,14 @@ where
         + StaticFileProviderFactory,
 {
     /// Writes executed blocks and receipts to storage.
-    pub fn save_blocks<N>(&self, blocks: Vec<ExecutedBlockWithTrieUpdates<N>>) -> ProviderResult<()>
+    pub fn save_blocks<N>(&self, blocks: Vec<ExecutedBlock<N>>) -> ProviderResult<()>
     where
         N: NodePrimitives<SignedTx: SignedTransaction>,
         ProviderDB: BlockWriter<Block = N::Block> + StateWriter<Receipt = N::Receipt>,
     {
         if blocks.is_empty() {
             debug!(target: "provider::storage_writer", "Attempted to write empty block range");
-            return Ok(())
+            return Ok(());
         }
 
         // NOTE: checked non-empty above
@@ -160,36 +167,42 @@ where
         //  * trie updates (cannot naively extend, need helper)
         //  * indices (already done basically)
         // Insert the blocks
-        for ExecutedBlockWithTrieUpdates {
-            block: ExecutedBlock { recovered_block, execution_output, hashed_state },
-            trie,
-        } in blocks
-        {
-            let block_hash = recovered_block.hash();
+        for executed_block in blocks {
+            let recovered_block = executed_block.recovered_block().clone();
+            let _block_hash = recovered_block.hash();
+            let block_number = recovered_block.number();
             self.database()
-                .insert_block(Arc::unwrap_or_clone(recovered_block), StorageLocation::Both)?;
+                .insert_block(recovered_block)?;
 
             // Write state and changesets to the database.
             // Must be written after blocks because of the receipt lookup.
-            self.database().write_state(
-                &execution_output,
-                OriginalValuesKnown::No,
-                StorageLocation::StaticFiles,
-            )?;
+            self.database()
+                .write_state(
+                    WriteStateInput::Single {
+                        outcome: executed_block.execution_outcome(),
+                        block: block_number,
+                    },
+                    OriginalValuesKnown::No,
+                    StateWriteConfig::default(),
+                )?;
 
             // insert hashes and intermediate merkle nodes
+            let hashed_state = executed_block.hashed_state();
             self.database()
-                .write_hashed_state(&Arc::unwrap_or_clone(hashed_state).into_sorted())?;
-            self.database().write_trie_updates(
-                trie.as_ref().ok_or(ProviderError::MissingTrieUpdates(block_hash))?,
-            )?;
+                .write_hashed_state(&hashed_state)?;
+
+            let trie_updates = executed_block.trie_updates();
+            self.database()
+                .write_trie_updates_sorted(&trie_updates)?;
         }
 
         // update history indices
-        self.database().update_history_indices(first_number..=last_block_number)?;
+        self.database()
+            .update_history_indices(first_number..=last_block_number)?;
 
         // Update pipeline progress
-        self.database().update_pipeline_stages(last_block_number, false)?;
+        self.database()
+            .update_pipeline_stages(last_block_number, false)?;
 
         debug!(target: "provider::storage_writer", range = ?first_number..=last_block_number, "Appended block data");
 
@@ -202,7 +215,8 @@ where
     pub fn remove_blocks_above(&self, block_number: u64) -> ProviderResult<()> {
         // IMPORTANT: we use `block_number+1` to make sure we remove only what is ABOVE the block
         debug!(target: "provider::storage_writer", ?block_number, "Removing blocks from database above block_number");
-        self.database().remove_block_and_execution_above(block_number, StorageLocation::Both)?;
+        self.database()
+            .remove_block_and_execution_above(block_number)?;
 
         // Get highest static file block for the total block range
         let highest_static_file_block = self
@@ -269,20 +283,33 @@ mod tests {
         let hashed_slot = keccak256(slot);
         {
             let provider_rw = provider_factory.provider_rw().unwrap();
-            let mut accounts_cursor =
-                provider_rw.tx_ref().cursor_write::<tables::HashedAccounts>().unwrap();
-            let mut storage_cursor =
-                provider_rw.tx_ref().cursor_write::<tables::HashedStorages>().unwrap();
+            let mut accounts_cursor = provider_rw
+                .tx_ref()
+                .cursor_write::<tables::HashedAccounts>()
+                .unwrap();
+            let mut storage_cursor = provider_rw
+                .tx_ref()
+                .cursor_write::<tables::HashedStorages>()
+                .unwrap();
 
             for address in addresses {
                 let hashed_address = keccak256(address);
                 accounts_cursor
-                    .insert(hashed_address, &Account { nonce: 1, ..Default::default() })
+                    .insert(
+                        hashed_address,
+                        &Account {
+                            nonce: 1,
+                            ..Default::default()
+                        },
+                    )
                     .unwrap();
                 storage_cursor
                     .insert(
                         hashed_address,
-                        &StorageEntry { key: hashed_slot, value: U256::from(1) },
+                        &StorageEntry {
+                            key: hashed_slot,
+                            value: U256::from(1),
+                        },
                     )
                     .unwrap();
             }
@@ -291,15 +318,22 @@ mod tests {
 
         let mut hashed_state = HashedPostState::default();
         hashed_state.accounts.insert(destroyed_address_hashed, None);
-        hashed_state.storages.insert(destroyed_address_hashed, HashedStorage::new(true));
+        hashed_state
+            .storages
+            .insert(destroyed_address_hashed, HashedStorage::new(true));
 
         let provider_rw = provider_factory.provider_rw().unwrap();
-        assert!(matches!(provider_rw.write_hashed_state(&hashed_state.into_sorted()), Ok(())));
+        assert!(matches!(
+            provider_rw.write_hashed_state(&hashed_state.into_sorted()),
+            Ok(())
+        ));
         provider_rw.commit().unwrap();
 
         let provider = provider_factory.provider().unwrap();
         assert_eq!(
-            provider.tx_ref().get::<tables::HashedAccounts>(destroyed_address_hashed),
+            provider
+                .tx_ref()
+                .get::<tables::HashedAccounts>(destroyed_address_hashed),
             Ok(None)
         );
         assert_eq!(
@@ -320,10 +354,21 @@ mod tests {
         let address_a = Address::ZERO;
         let address_b = Address::repeat_byte(0xff);
 
-        let account_a = RevmAccountInfo { balance: U256::from(1), nonce: 1, ..Default::default() };
-        let account_b = RevmAccountInfo { balance: U256::from(2), nonce: 2, ..Default::default() };
-        let account_b_changed =
-            RevmAccountInfo { balance: U256::from(3), nonce: 3, ..Default::default() };
+        let account_a = RevmAccountInfo {
+            balance: U256::from(1),
+            nonce: 1,
+            ..Default::default()
+        };
+        let account_b = RevmAccountInfo {
+            balance: U256::from(2),
+            nonce: 2,
+            ..Default::default()
+        };
+        let account_b_changed = RevmAccountInfo {
+            balance: U256::from(3),
+            nonce: 3,
+            ..Default::default()
+        };
 
         let mut state = State::builder().with_bundle_update().build();
         state.insert_not_existing(address_a);
@@ -355,14 +400,20 @@ mod tests {
         let mut revm_bundle_state = state.take_bundle();
 
         // Write plain state and reverts separately.
-        let reverts = revm_bundle_state.take_all_reverts().to_plain_state_reverts();
+        let reverts = revm_bundle_state
+            .take_all_reverts()
+            .to_plain_state_reverts();
         let plain_state = revm_bundle_state.to_plain_state(OriginalValuesKnown::Yes);
         assert!(plain_state.storage.is_empty());
         assert!(plain_state.contracts.is_empty());
-        provider.write_state_changes(plain_state).expect("Could not write plain state to DB");
+        provider
+            .write_state_changes(plain_state)
+            .expect("Could not write plain state to DB");
 
         assert_eq!(reverts.storage, [[]]);
-        provider.write_state_reverts(reverts, 1).expect("Could not write reverts to DB");
+        provider
+            .write_state_reverts(reverts, 1)
+            .expect("Could not write reverts to DB");
 
         let reth_account_a = account_a.into();
         let reth_account_b = account_b.into();
@@ -370,12 +421,16 @@ mod tests {
 
         // Check plain state
         assert_eq!(
-            provider.basic_account(&address_a).expect("Could not read account state"),
+            provider
+                .basic_account(&address_a)
+                .expect("Could not read account state"),
             Some(reth_account_a),
             "Account A state is wrong"
         );
         assert_eq!(
-            provider.basic_account(&address_b).expect("Could not read account state"),
+            provider
+                .basic_account(&address_b)
+                .expect("Could not read account state"),
             Some(reth_account_b_changed),
             "Account B state is wrong"
         );
@@ -386,13 +441,29 @@ mod tests {
             .cursor_dup_read::<tables::AccountChangeSets>()
             .expect("Could not open changeset cursor");
         assert_eq!(
-            changeset_cursor.seek_exact(1).expect("Could not read account change set"),
-            Some((1, AccountBeforeTx { address: address_a, info: None })),
+            changeset_cursor
+                .seek_exact(1)
+                .expect("Could not read account change set"),
+            Some((
+                1,
+                AccountBeforeTx {
+                    address: address_a,
+                    info: None
+                }
+            )),
             "Account A changeset is wrong"
         );
         assert_eq!(
-            changeset_cursor.next_dup().expect("Changeset table is malformed"),
-            Some((1, AccountBeforeTx { address: address_b, info: Some(reth_account_b) })),
+            changeset_cursor
+                .next_dup()
+                .expect("Changeset table is malformed"),
+            Some((
+                1,
+                AccountBeforeTx {
+                    address: address_b,
+                    info: Some(reth_account_b)
+                }
+            )),
             "Account B changeset is wrong"
         );
 
@@ -414,33 +485,57 @@ mod tests {
         let mut revm_bundle_state = state.take_bundle();
 
         // Write plain state and reverts separately.
-        let reverts = revm_bundle_state.take_all_reverts().to_plain_state_reverts();
+        let reverts = revm_bundle_state
+            .take_all_reverts()
+            .to_plain_state_reverts();
         let plain_state = revm_bundle_state.to_plain_state(OriginalValuesKnown::Yes);
         // Account B selfdestructed so flag for it should be present.
         assert_eq!(
             plain_state.storage,
-            [PlainStorageChangeset { address: address_b, wipe_storage: true, storage: vec![] }]
+            [PlainStorageChangeset {
+                address: address_b,
+                wipe_storage: true,
+                storage: vec![]
+            }]
         );
         assert!(plain_state.contracts.is_empty());
-        provider.write_state_changes(plain_state).expect("Could not write plain state to DB");
+        provider
+            .write_state_changes(plain_state)
+            .expect("Could not write plain state to DB");
 
         assert_eq!(
             reverts.storage,
-            [[PlainStorageRevert { address: address_b, wiped: true, storage_revert: vec![] }]]
+            [[PlainStorageRevert {
+                address: address_b,
+                wiped: true,
+                storage_revert: vec![]
+            }]]
         );
-        provider.write_state_reverts(reverts, 2).expect("Could not write reverts to DB");
+        provider
+            .write_state_reverts(reverts, 2)
+            .expect("Could not write reverts to DB");
 
         // Check new plain state for account B
         assert_eq!(
-            provider.basic_account(&address_b).expect("Could not read account state"),
+            provider
+                .basic_account(&address_b)
+                .expect("Could not read account state"),
             None,
             "Account B should be deleted"
         );
 
         // Check change set
         assert_eq!(
-            changeset_cursor.seek_exact(2).expect("Could not read account change set"),
-            Some((2, AccountBeforeTx { address: address_b, info: Some(reth_account_b_changed) })),
+            changeset_cursor
+                .seek_exact(2)
+                .expect("Could not read account change set"),
+            Some((
+                2,
+                AccountBeforeTx {
+                    address: address_b,
+                    info: Some(reth_account_b_changed)
+                }
+            )),
             "Account B changeset is wrong after deletion"
         );
     }
@@ -453,7 +548,11 @@ mod tests {
         let address_a = Address::ZERO;
         let address_b = Address::repeat_byte(0xff);
 
-        let account_b = RevmAccountInfo { balance: U256::from(2), nonce: 2, ..Default::default() };
+        let account_b = RevmAccountInfo {
+            balance: U256::from(2),
+            nonce: 2,
+            ..Default::default()
+        };
 
         let mut state = State::builder().with_bundle_update().build();
         state.insert_not_existing(address_a);
@@ -474,11 +573,17 @@ mod tests {
                     storage: HashMap::from_iter([
                         (
                             U256::from(0),
-                            EvmStorageSlot { present_value: U256::from(1), ..Default::default() },
+                            EvmStorageSlot {
+                                present_value: U256::from(1),
+                                ..Default::default()
+                            },
                         ),
                         (
                             U256::from(1),
-                            EvmStorageSlot { present_value: U256::from(2), ..Default::default() },
+                            EvmStorageSlot {
+                                present_value: U256::from(2),
+                                ..Default::default()
+                            },
                         ),
                     ]),
                     transaction_id: 0,
@@ -507,7 +612,11 @@ mod tests {
 
         let outcome = ExecutionOutcome::new(state.take_bundle(), Default::default(), 1, Vec::new());
         provider
-            .write_state(&outcome, OriginalValuesKnown::Yes, StorageLocation::Database)
+            .write_state(
+                &outcome,
+                OriginalValuesKnown::Yes,
+                StorageLocation::Database,
+            )
             .expect("Could not write bundle state to DB");
 
         // Check plain storage state
@@ -518,14 +627,23 @@ mod tests {
 
         assert_eq!(
             storage_cursor.seek_exact(address_a).unwrap(),
-            Some((address_a, StorageEntry { key: B256::ZERO, value: U256::from(1) })),
+            Some((
+                address_a,
+                StorageEntry {
+                    key: B256::ZERO,
+                    value: U256::from(1)
+                }
+            )),
             "Slot 0 for account A should be 1"
         );
         assert_eq!(
             storage_cursor.next_dup().unwrap(),
             Some((
                 address_a,
-                StorageEntry { key: B256::from(U256::from(1).to_be_bytes()), value: U256::from(2) }
+                StorageEntry {
+                    key: B256::from(U256::from(1).to_be_bytes()),
+                    value: U256::from(2)
+                }
             )),
             "Slot 1 for account A should be 2"
         );
@@ -539,7 +657,10 @@ mod tests {
             storage_cursor.seek_exact(address_b).unwrap(),
             Some((
                 address_b,
-                StorageEntry { key: B256::from(U256::from(1).to_be_bytes()), value: U256::from(2) }
+                StorageEntry {
+                    key: B256::from(U256::from(1).to_be_bytes()),
+                    value: U256::from(2)
+                }
             )),
             "Slot 1 for account B should be 2"
         );
@@ -555,10 +676,15 @@ mod tests {
             .cursor_dup_read::<tables::StorageChangeSets>()
             .expect("Could not open storage changeset cursor");
         assert_eq!(
-            changeset_cursor.seek_exact(BlockNumberAddress((1, address_a))).unwrap(),
+            changeset_cursor
+                .seek_exact(BlockNumberAddress((1, address_a)))
+                .unwrap(),
             Some((
                 BlockNumberAddress((1, address_a)),
-                StorageEntry { key: B256::ZERO, value: U256::from(0) }
+                StorageEntry {
+                    key: B256::ZERO,
+                    value: U256::from(0)
+                }
             )),
             "Slot 0 for account A should have changed from 0"
         );
@@ -566,7 +692,10 @@ mod tests {
             changeset_cursor.next_dup().unwrap(),
             Some((
                 BlockNumberAddress((1, address_a)),
-                StorageEntry { key: B256::from(U256::from(1).to_be_bytes()), value: U256::from(0) }
+                StorageEntry {
+                    key: B256::from(U256::from(1).to_be_bytes()),
+                    value: U256::from(0)
+                }
             )),
             "Slot 1 for account A should have changed from 0"
         );
@@ -577,10 +706,15 @@ mod tests {
         );
 
         assert_eq!(
-            changeset_cursor.seek_exact(BlockNumberAddress((1, address_b))).unwrap(),
+            changeset_cursor
+                .seek_exact(BlockNumberAddress((1, address_b)))
+                .unwrap(),
             Some((
                 BlockNumberAddress((1, address_b)),
-                StorageEntry { key: B256::from(U256::from(1).to_be_bytes()), value: U256::from(1) }
+                StorageEntry {
+                    key: B256::from(U256::from(1).to_be_bytes()),
+                    value: U256::from(1)
+                }
             )),
             "Slot 1 for account B should have changed from 1"
         );
@@ -607,7 +741,11 @@ mod tests {
         state.merge_transitions(BundleRetention::Reverts);
         let outcome = ExecutionOutcome::new(state.take_bundle(), Default::default(), 2, Vec::new());
         provider
-            .write_state(&outcome, OriginalValuesKnown::Yes, StorageLocation::Database)
+            .write_state(
+                &outcome,
+                OriginalValuesKnown::Yes,
+                StorageLocation::Database,
+            )
             .expect("Could not write bundle state to DB");
 
         assert_eq!(
@@ -617,10 +755,15 @@ mod tests {
         );
 
         assert_eq!(
-            changeset_cursor.seek_exact(BlockNumberAddress((2, address_a))).unwrap(),
+            changeset_cursor
+                .seek_exact(BlockNumberAddress((2, address_a)))
+                .unwrap(),
             Some((
                 BlockNumberAddress((2, address_a)),
-                StorageEntry { key: B256::ZERO, value: U256::from(1) }
+                StorageEntry {
+                    key: B256::ZERO,
+                    value: U256::from(1)
+                }
             )),
             "Slot 0 for account A should have changed from 1 on deletion"
         );
@@ -628,7 +771,10 @@ mod tests {
             changeset_cursor.next_dup().unwrap(),
             Some((
                 BlockNumberAddress((2, address_a)),
-                StorageEntry { key: B256::from(U256::from(1).to_be_bytes()), value: U256::from(2) }
+                StorageEntry {
+                    key: B256::from(U256::from(1).to_be_bytes()),
+                    value: U256::from(2)
+                }
             )),
             "Slot 1 for account A should have changed from 2 on deletion"
         );
@@ -645,7 +791,10 @@ mod tests {
         let provider = factory.database_provider_rw().unwrap();
 
         let address1 = Address::random();
-        let account_info = RevmAccountInfo { nonce: 1, ..Default::default() };
+        let account_info = RevmAccountInfo {
+            nonce: 1,
+            ..Default::default()
+        };
 
         // Block #0: initial state.
         let mut init_state = State::builder().with_bundle_update().build();
@@ -660,11 +809,17 @@ mod tests {
                 storage: HashMap::from_iter([
                     (
                         U256::ZERO,
-                        EvmStorageSlot { present_value: U256::from(1), ..Default::default() },
+                        EvmStorageSlot {
+                            present_value: U256::from(1),
+                            ..Default::default()
+                        },
                     ),
                     (
                         U256::from(1),
-                        EvmStorageSlot { present_value: U256::from(2), ..Default::default() },
+                        EvmStorageSlot {
+                            present_value: U256::from(2),
+                            ..Default::default()
+                        },
                     ),
                 ]),
                 transaction_id: 0,
@@ -675,7 +830,11 @@ mod tests {
         let outcome =
             ExecutionOutcome::new(init_state.take_bundle(), Default::default(), 0, Vec::new());
         provider
-            .write_state(&outcome, OriginalValuesKnown::Yes, StorageLocation::Database)
+            .write_state(
+                &outcome,
+                OriginalValuesKnown::Yes,
+                StorageLocation::Database,
+            )
             .expect("Could not write bundle state to DB");
 
         let mut state = State::builder().with_bundle_update().build();
@@ -741,15 +900,24 @@ mod tests {
                 storage: HashMap::from_iter([
                     (
                         U256::ZERO,
-                        EvmStorageSlot { present_value: U256::from(2), ..Default::default() },
+                        EvmStorageSlot {
+                            present_value: U256::from(2),
+                            ..Default::default()
+                        },
                     ),
                     (
                         U256::from(2),
-                        EvmStorageSlot { present_value: U256::from(4), ..Default::default() },
+                        EvmStorageSlot {
+                            present_value: U256::from(4),
+                            ..Default::default()
+                        },
                     ),
                     (
                         U256::from(6),
-                        EvmStorageSlot { present_value: U256::from(6), ..Default::default() },
+                        EvmStorageSlot {
+                            present_value: U256::from(6),
+                            ..Default::default()
+                        },
                     ),
                 ]),
                 transaction_id: 0,
@@ -787,7 +955,10 @@ mod tests {
                 // 0x00 => 0 => 2
                 storage: HashMap::from_iter([(
                     U256::ZERO,
-                    EvmStorageSlot { present_value: U256::from(2), ..Default::default() },
+                    EvmStorageSlot {
+                        present_value: U256::from(2),
+                        ..Default::default()
+                    },
                 )]),
                 transaction_id: 0,
             },
@@ -821,7 +992,10 @@ mod tests {
                 // 0x00 => 0 => 9
                 storage: HashMap::from_iter([(
                     U256::ZERO,
-                    EvmStorageSlot { present_value: U256::from(9), ..Default::default() },
+                    EvmStorageSlot {
+                        present_value: U256::from(9),
+                        ..Default::default()
+                    },
                 )]),
                 transaction_id: 0,
             },
@@ -834,7 +1008,11 @@ mod tests {
         let outcome: ExecutionOutcome =
             ExecutionOutcome::new(bundle, Default::default(), 1, Vec::new());
         provider
-            .write_state(&outcome, OriginalValuesKnown::Yes, StorageLocation::Database)
+            .write_state(
+                &outcome,
+                OriginalValuesKnown::Yes,
+                StorageLocation::Database,
+            )
             .expect("Could not write bundle state to DB");
 
         let mut storage_changeset_cursor = provider
@@ -856,14 +1034,20 @@ mod tests {
             storage_changes.next(),
             Some(Ok((
                 BlockNumberAddress((0, address1)),
-                StorageEntry { key: B256::with_last_byte(0), value: U256::ZERO }
+                StorageEntry {
+                    key: B256::with_last_byte(0),
+                    value: U256::ZERO
+                }
             )))
         );
         assert_eq!(
             storage_changes.next(),
             Some(Ok((
                 BlockNumberAddress((0, address1)),
-                StorageEntry { key: B256::with_last_byte(1), value: U256::ZERO }
+                StorageEntry {
+                    key: B256::with_last_byte(1),
+                    value: U256::ZERO
+                }
             )))
         );
 
@@ -873,7 +1057,10 @@ mod tests {
             storage_changes.next(),
             Some(Ok((
                 BlockNumberAddress((1, address1)),
-                StorageEntry { key: B256::with_last_byte(0), value: U256::from(1) }
+                StorageEntry {
+                    key: B256::with_last_byte(0),
+                    value: U256::from(1)
+                }
             )))
         );
 
@@ -884,14 +1071,20 @@ mod tests {
             storage_changes.next(),
             Some(Ok((
                 BlockNumberAddress((2, address1)),
-                StorageEntry { key: B256::with_last_byte(0), value: U256::from(2) }
+                StorageEntry {
+                    key: B256::with_last_byte(0),
+                    value: U256::from(2)
+                }
             )))
         );
         assert_eq!(
             storage_changes.next(),
             Some(Ok((
                 BlockNumberAddress((2, address1)),
-                StorageEntry { key: B256::with_last_byte(1), value: U256::from(2) }
+                StorageEntry {
+                    key: B256::with_last_byte(1),
+                    value: U256::from(2)
+                }
             )))
         );
 
@@ -906,21 +1099,30 @@ mod tests {
             storage_changes.next(),
             Some(Ok((
                 BlockNumberAddress((4, address1)),
-                StorageEntry { key: B256::with_last_byte(0), value: U256::ZERO }
+                StorageEntry {
+                    key: B256::with_last_byte(0),
+                    value: U256::ZERO
+                }
             )))
         );
         assert_eq!(
             storage_changes.next(),
             Some(Ok((
                 BlockNumberAddress((4, address1)),
-                StorageEntry { key: B256::with_last_byte(2), value: U256::ZERO }
+                StorageEntry {
+                    key: B256::with_last_byte(2),
+                    value: U256::ZERO
+                }
             )))
         );
         assert_eq!(
             storage_changes.next(),
             Some(Ok((
                 BlockNumberAddress((4, address1)),
-                StorageEntry { key: B256::with_last_byte(6), value: U256::ZERO }
+                StorageEntry {
+                    key: B256::with_last_byte(6),
+                    value: U256::ZERO
+                }
             )))
         );
 
@@ -932,21 +1134,30 @@ mod tests {
             storage_changes.next(),
             Some(Ok((
                 BlockNumberAddress((5, address1)),
-                StorageEntry { key: B256::with_last_byte(0), value: U256::from(2) }
+                StorageEntry {
+                    key: B256::with_last_byte(0),
+                    value: U256::from(2)
+                }
             )))
         );
         assert_eq!(
             storage_changes.next(),
             Some(Ok((
                 BlockNumberAddress((5, address1)),
-                StorageEntry { key: B256::with_last_byte(2), value: U256::from(4) }
+                StorageEntry {
+                    key: B256::with_last_byte(2),
+                    value: U256::from(4)
+                }
             )))
         );
         assert_eq!(
             storage_changes.next(),
             Some(Ok((
                 BlockNumberAddress((5, address1)),
-                StorageEntry { key: B256::with_last_byte(6), value: U256::from(6) }
+                StorageEntry {
+                    key: B256::with_last_byte(6),
+                    value: U256::from(6)
+                }
             )))
         );
 
@@ -959,7 +1170,10 @@ mod tests {
             storage_changes.next(),
             Some(Ok((
                 BlockNumberAddress((7, address1)),
-                StorageEntry { key: B256::with_last_byte(0), value: U256::ZERO }
+                StorageEntry {
+                    key: B256::with_last_byte(0),
+                    value: U256::ZERO
+                }
             )))
         );
         assert_eq!(storage_changes.next(), None);
@@ -971,7 +1185,10 @@ mod tests {
         let provider = factory.database_provider_rw().unwrap();
 
         let address1 = Address::random();
-        let account1 = RevmAccountInfo { nonce: 1, ..Default::default() };
+        let account1 = RevmAccountInfo {
+            nonce: 1,
+            ..Default::default()
+        };
 
         // Block #0: initial state.
         let mut init_state = State::builder().with_bundle_update().build();
@@ -986,11 +1203,17 @@ mod tests {
                 storage: HashMap::from_iter([
                     (
                         U256::ZERO,
-                        EvmStorageSlot { present_value: U256::from(1), ..Default::default() },
+                        EvmStorageSlot {
+                            present_value: U256::from(1),
+                            ..Default::default()
+                        },
                     ),
                     (
                         U256::from(1),
-                        EvmStorageSlot { present_value: U256::from(2), ..Default::default() },
+                        EvmStorageSlot {
+                            present_value: U256::from(2),
+                            ..Default::default()
+                        },
                     ),
                 ]),
                 transaction_id: 0,
@@ -1000,7 +1223,11 @@ mod tests {
         let outcome =
             ExecutionOutcome::new(init_state.take_bundle(), Default::default(), 0, Vec::new());
         provider
-            .write_state(&outcome, OriginalValuesKnown::Yes, StorageLocation::Database)
+            .write_state(
+                &outcome,
+                OriginalValuesKnown::Yes,
+                StorageLocation::Database,
+            )
             .expect("Could not write bundle state to DB");
 
         let mut state = State::builder().with_bundle_update().build();
@@ -1039,7 +1266,10 @@ mod tests {
                 // 0x01 => 0 => 5
                 storage: HashMap::from_iter([(
                     U256::from(1),
-                    EvmStorageSlot { present_value: U256::from(5), ..Default::default() },
+                    EvmStorageSlot {
+                        present_value: U256::from(5),
+                        ..Default::default()
+                    },
                 )]),
                 transaction_id: 0,
             },
@@ -1049,7 +1279,11 @@ mod tests {
         state.merge_transitions(BundleRetention::Reverts);
         let outcome = ExecutionOutcome::new(state.take_bundle(), Default::default(), 1, Vec::new());
         provider
-            .write_state(&outcome, OriginalValuesKnown::Yes, StorageLocation::Database)
+            .write_state(
+                &outcome,
+                OriginalValuesKnown::Yes,
+                StorageLocation::Database,
+            )
             .expect("Could not write bundle state to DB");
 
         let mut storage_changeset_cursor = provider
@@ -1063,14 +1297,20 @@ mod tests {
             storage_changes.next(),
             Some(Ok((
                 BlockNumberAddress((1, address1)),
-                StorageEntry { key: B256::with_last_byte(0), value: U256::from(1) }
+                StorageEntry {
+                    key: B256::with_last_byte(0),
+                    value: U256::from(1)
+                }
             )))
         );
         assert_eq!(
             storage_changes.next(),
             Some(Ok((
                 BlockNumberAddress((1, address1)),
-                StorageEntry { key: B256::with_last_byte(1), value: U256::from(2) }
+                StorageEntry {
+                    key: B256::with_last_byte(1),
+                    value: U256::from(2)
+                }
             )))
         );
         assert_eq!(storage_changes.next(), None);
@@ -1111,9 +1351,14 @@ mod tests {
         type PreState = BTreeMap<Address, (Account, BTreeMap<B256, U256>)>;
         let mut prestate: PreState = (0..10)
             .map(|key| {
-                let account = Account { nonce: 1, balance: U256::from(key), bytecode_hash: None };
-                let storage =
-                    (1..11).map(|key| (B256::with_last_byte(key), U256::from(key))).collect();
+                let account = Account {
+                    nonce: 1,
+                    balance: U256::from(key),
+                    bytecode_hash: None,
+                };
+                let storage = (1..11)
+                    .map(|key| (B256::with_last_byte(key), U256::from(key)))
+                    .collect();
                 (Address::with_last_byte(key), (account, storage))
             })
             .collect();
@@ -1125,11 +1370,15 @@ mod tests {
         let tx = provider_rw.tx_ref();
         for (address, (account, storage)) in &prestate {
             let hashed_address = keccak256(address);
-            tx.put::<tables::HashedAccounts>(hashed_address, *account).unwrap();
+            tx.put::<tables::HashedAccounts>(hashed_address, *account)
+                .unwrap();
             for (slot, value) in storage {
                 tx.put::<tables::HashedStorages>(
                     hashed_address,
-                    StorageEntry { key: keccak256(slot), value: *value },
+                    StorageEntry {
+                        key: keccak256(slot),
+                        value: *value,
+                    },
                 )
                 .unwrap();
             }
@@ -1140,20 +1389,20 @@ mod tests {
 
         let mut state = State::builder().with_bundle_update().build();
 
-        let assert_state_root = |state: &State<EmptyDB>, expected: &PreState, msg| {
-            assert_eq!(
-                StateRoot::overlay_root(
-                    tx,
-                    provider_factory.hashed_post_state(&state.bundle_state)
-                )
-                .unwrap(),
-                state_root(expected.clone().into_iter().map(|(address, (account, storage))| (
-                    address,
-                    (account, storage.into_iter())
-                ))),
-                "{msg}"
-            );
-        };
+        let assert_state_root =
+            |state: &State<EmptyDB>, expected: &PreState, msg| {
+                assert_eq!(
+                    StateRoot::overlay_root(
+                        tx,
+                        provider_factory.hashed_post_state(&state.bundle_state)
+                    )
+                    .unwrap(),
+                    state_root(expected.clone().into_iter().map(
+                        |(address, (account, storage))| (address, (account, storage.into_iter()))
+                    )),
+                    "{msg}"
+                );
+            };
 
         // database only state root is correct
         assert_state_root(&state, &prestate, "empty");
@@ -1244,8 +1493,11 @@ mod tests {
         assert_state_root(&state, &prestate, "changed nonce");
 
         // recreate account 1
-        let account1_new =
-            Account { nonce: 56, balance: U256::from(123), bytecode_hash: Some(B256::random()) };
+        let account1_new = Account {
+            nonce: 56,
+            balance: U256::from(123),
+            bytecode_hash: Some(B256::random()),
+        };
         prestate.insert(address1, (account1_new, BTreeMap::default()));
         state.commit(HashMap::from_iter([(
             address1,
@@ -1263,7 +1515,11 @@ mod tests {
         let slot20 = U256::from(20);
         let slot20_key = B256::from(slot20);
         let account1_slot20_value = U256::from(12345);
-        prestate.get_mut(&address1).unwrap().1.insert(slot20_key, account1_slot20_value);
+        prestate
+            .get_mut(&address1)
+            .unwrap()
+            .1
+            .insert(slot20_key, account1_slot20_value);
         state.commit(HashMap::from_iter([(
             address1,
             RevmAccount {
@@ -1285,9 +1541,18 @@ mod tests {
         let address1 = Address::random();
         let address2 = Address::random();
 
-        let account1 = RevmAccountInfo { nonce: 1, ..Default::default() };
-        let account1_changed = RevmAccountInfo { nonce: 1, ..Default::default() };
-        let account2 = RevmAccountInfo { nonce: 1, ..Default::default() };
+        let account1 = RevmAccountInfo {
+            nonce: 1,
+            ..Default::default()
+        };
+        let account1_changed = RevmAccountInfo {
+            nonce: 1,
+            ..Default::default()
+        };
+        let account2 = RevmAccountInfo {
+            nonce: 1,
+            ..Default::default()
+        };
 
         let present_state = BundleState::builder(2..=2)
             .state_present_account_info(address1, account1_changed.clone())
@@ -1314,7 +1579,10 @@ mod tests {
         // reverts num should stay the same.
         assert_eq!(end_state.reverts.len(), 1);
         // account1 is not overwritten.
-        assert_eq!(end_state.state.get(&address1).unwrap().info, Some(account1_changed));
+        assert_eq!(
+            end_state.state.get(&address1).unwrap().info,
+            Some(account1_changed)
+        );
         // account2 got inserted
         assert_eq!(end_state.state.get(&address2).unwrap().info, Some(account2));
     }
@@ -1340,11 +1608,14 @@ mod tests {
         );
         let mut state = HashedPostState::default();
         state.storages.insert(hashed_address, init_storage.clone());
-        provider_rw.write_hashed_state(&state.clone().into_sorted()).unwrap();
+        provider_rw
+            .write_hashed_state(&state.clone().into_sorted())
+            .unwrap();
 
         // calculate database storage root and write intermediate storage nodes.
-        let (storage_root, _, storage_updates) =
-            StorageRoot::from_tx_hashed(tx, hashed_address).calculate(true).unwrap();
+        let (storage_root, _, storage_updates) = StorageRoot::from_tx_hashed(tx, hashed_address)
+            .calculate(true)
+            .unwrap();
         assert_eq!(storage_root, storage_root_prehashed(init_storage.storage));
         assert!(!storage_updates.is_empty());
         provider_rw
@@ -1362,11 +1633,18 @@ mod tests {
             .map(|str| (B256::from_str(str).unwrap(), U256::from(1))),
         );
         let mut state = HashedPostState::default();
-        state.storages.insert(hashed_address, updated_storage.clone());
-        provider_rw.write_hashed_state(&state.clone().into_sorted()).unwrap();
+        state
+            .storages
+            .insert(hashed_address, updated_storage.clone());
+        provider_rw
+            .write_hashed_state(&state.clone().into_sorted())
+            .unwrap();
 
         // re-calculate database storage root
         let storage_root = StorageRoot::overlay_root(tx, address, updated_storage.clone()).unwrap();
-        assert_eq!(storage_root, storage_root_prehashed(updated_storage.storage));
+        assert_eq!(
+            storage_root,
+            storage_root_prehashed(updated_storage.storage)
+        );
     }
 }

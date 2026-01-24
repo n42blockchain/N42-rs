@@ -42,6 +42,7 @@ sha2.workspace = true
 sha3 = "0.10.5"
 # n42
 n42-primitives.workspace = true
+n42-consensus-traits.workspace = true
 
 alloy-serde.workspace = true
 # serde
@@ -81,6 +82,19 @@ eyre.workspace = true
 # arbitrary utils
 arbitrary = { workspace = true, features = ["derive"], optional = true }
 hex = "0.4.3"
+
+[dev-dependencies]
+serde_json.workspace = true
+criterion = { version = "0.5", features = ["html_reports"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[[bench]]
+name = "consensus_benchmarks"
+harness = false
+
+[[bench]]
+name = "tps_benchmarks"
+harness = false
 
 [lints]
 workspace = true

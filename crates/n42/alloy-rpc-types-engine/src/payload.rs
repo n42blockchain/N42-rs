@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Payload types.
 
 use crate::{ExecutionPayloadSidecar, PayloadError};
@@ -6,8 +9,7 @@ use alloc::{
     vec::Vec,
 };
 use alloy_consensus::{
-    constants::MAXIMUM_EXTRA_DATA_SIZE, Blob, Block, BlockBody, BlockHeader, Bytes48, Header,
-    Transaction, EMPTY_OMMER_ROOT_HASH,
+    Blob, Block, BlockBody, BlockHeader, Bytes48, Header, Transaction, EMPTY_OMMER_ROOT_HASH,
 };
 use alloy_eips::{
     eip2718::{Decodable2718, Encodable2718},
@@ -130,7 +132,10 @@ impl ExecutionPayloadFieldV2 {
 /// This is the input to `engine_newPayloadV2`, which may or may not have a withdrawals field.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "camelCase", deny_unknown_fields))]
+#[cfg_attr(
+    feature = "serde",
+    serde(rename_all = "camelCase", deny_unknown_fields)
+)]
 #[cfg_attr(any(test, feature = "arbitrary"), derive(arbitrary::Arbitrary))]
 pub struct ExecutionPayloadInputV2 {
     /// The V1 execution payload
@@ -378,7 +383,14 @@ impl ExecutionPayloadV1 {
             nonce: self.nonce,
         };
 
-        Ok(Block { header, body: BlockBody { transactions, ommers: vec![], withdrawals: None } })
+        Ok(Block {
+            header,
+            body: BlockBody {
+                transactions,
+                ommers: vec![],
+                withdrawals: None,
+            },
+        })
     }
 
     /// Converts [`alloy_consensus::Block`] to [`ExecutionPayloadV1`].
@@ -398,8 +410,11 @@ impl ExecutionPayloadV1 {
         T: Encodable2718,
         H: BlockHeader,
     {
-        let transactions =
-            block.body.transactions().map(|tx| tx.encoded_2718().into()).collect::<Vec<_>>();
+        let transactions = block
+            .body
+            .transactions()
+            .map(|tx| tx.encoded_2718().into())
+            .collect::<Vec<_>>();
         Self {
             parent_hash: block.parent_hash(),
             fee_recipient: block.beneficiary(),
@@ -832,7 +847,11 @@ impl BlobsBundleV1 {
                 (commitments, proofs, blobs)
             },
         );
-        Self { commitments, proofs, blobs }
+        Self {
+            commitments,
+            proofs,
+            blobs,
+        }
     }
 
     /// Returns a new empty blobs bundle.
@@ -863,7 +882,11 @@ impl BlobsBundleV1 {
     /// If len is more than the blobs bundle len.
     pub fn pop_sidecar(&mut self, len: usize) -> BlobTransactionSidecar {
         let (commitments, proofs, blobs) = self.take(len);
-        BlobTransactionSidecar { commitments, proofs, blobs }
+        BlobTransactionSidecar {
+            commitments,
+            proofs,
+            blobs,
+        }
     }
 }
 
@@ -907,7 +930,11 @@ impl BlobsBundleV2 {
                 (commitments, proofs, blobs)
             },
         );
-        Self { commitments, proofs, blobs }
+        Self {
+            commitments,
+            proofs,
+            blobs,
+        }
     }
 
     /// Returns a new empty blobs bundle.
@@ -938,7 +965,53 @@ impl BlobsBundleV2 {
     /// If len is more than the blobs bundle len.
     pub fn pop_sidecar(&mut self, len: usize) -> BlobTransactionSidecarEip7594 {
         let (commitments, cell_proofs, blobs) = self.take(len);
-        BlobTransactionSidecarEip7594 { commitments, cell_proofs, blobs }
+        BlobTransactionSidecarEip7594 {
+            commitments,
+            cell_proofs,
+            blobs,
+        }
+    }
+
+    /// Converts this bundle into a single [`BlobTransactionSidecarEip7594`].
+    ///
+    /// Returns an error if the bundle doesn't contain the correct number of cell proofs
+    /// (expected blobs.len() * CELLS_PER_EXT_BLOB) or if the commitments length doesn't
+    /// match the blobs length.
+    ///
+    /// Returns an empty [`BlobTransactionSidecarEip7594`] if the bundle is empty.
+    #[cfg(feature = "kzg")]
+    pub fn try_into_sidecar(
+        self,
+    ) -> Result<BlobTransactionSidecarEip7594, alloy_consensus::error::ValueError<Self>> {
+        let expected_cell_proofs_len = self.blobs.len() * CELLS_PER_EXT_BLOB;
+        if self.proofs.len() != expected_cell_proofs_len {
+            let msg = format!(
+                "cell proofs length mismatch, expected {expected_cell_proofs_len}, has {}",
+                self.proofs.len()
+            );
+            return Err(alloy_consensus::error::ValueError::new(self, msg));
+        }
+
+        if self.commitments.len() != self.blobs.len() {
+            let msg = format!(
+                "commitments length ({}) mismatch, expected blob length ({})",
+                self.commitments.len(),
+                self.blobs.len()
+            );
+            return Err(alloy_consensus::error::ValueError::new(self, msg));
+        }
+
+        let Self {
+            commitments,
+            proofs,
+            blobs,
+        } = self;
+
+        Ok(BlobTransactionSidecarEip7594 {
+            commitments,
+            cell_proofs: proofs,
+            blobs,
+        })
     }
 }
 
@@ -1148,6 +1221,36 @@ impl ExecutionPayload {
     pub const fn prev_randao(&self) -> B256 {
         self.as_v1().prev_randao
     }
+
+    /// Returns the transactions for the payload.
+    pub const fn transactions(&self) -> &Vec<Bytes> {
+        &self.as_v1().transactions
+    }
+
+    /// Returns the gas limit for the payload.
+    pub const fn gas_limit(&self) -> u64 {
+        self.as_v1().gas_limit
+    }
+
+    /// Returns the fee recipient.
+    pub const fn fee_recipient(&self) -> Address {
+        self.as_v1().fee_recipient
+    }
+
+    /// Returns the extra data.
+    pub fn extra_data(&self) -> &Bytes {
+        &self.as_v1().extra_data
+    }
+
+    /// Returns the saturated base fee per gas.
+    pub fn saturated_base_fee_per_gas(&self) -> u64 {
+        self.as_v1().base_fee_per_gas.saturating_to()
+    }
+
+    /// Returns the excess blob gas for the payload.
+    pub fn excess_blob_gas(&self) -> Option<u64> {
+        self.as_v3().map(|payload| payload.excess_blob_gas)
+    }
 }
 
 impl From<ExecutionPayloadV1> for ExecutionPayload {
@@ -1327,8 +1430,7 @@ impl<'de> serde::Deserialize<'de> for ExecutionPayload {
                     block_hash.ok_or_else(|| serde::de::Error::missing_field("blockHash"))?;
                 let difficulty =
                     difficulty.ok_or_else(|| serde::de::Error::missing_field("difficulty"))?;
-                let nonce =
-                    nonce.ok_or_else(|| serde::de::Error::missing_field("nonce"))?;
+                let nonce = nonce.ok_or_else(|| serde::de::Error::missing_field("nonce"))?;
                 let transactions =
                     transactions.ok_or_else(|| serde::de::Error::missing_field("transactions"))?;
 
@@ -1363,7 +1465,10 @@ impl<'de> serde::Deserialize<'de> for ExecutionPayload {
                     (blob_gas_used, excess_blob_gas)
                 {
                     return Ok(ExecutionPayload::V3(ExecutionPayloadV3 {
-                        payload_inner: ExecutionPayloadV2 { payload_inner: v1, withdrawals },
+                        payload_inner: ExecutionPayloadV2 {
+                            payload_inner: v1,
+                            withdrawals,
+                        },
                         blob_gas_used,
                         excess_blob_gas,
                     }));
@@ -1374,7 +1479,10 @@ impl<'de> serde::Deserialize<'de> for ExecutionPayload {
                     return Err(serde::de::Error::custom("invalid enum variant"));
                 }
 
-                Ok(ExecutionPayload::V2(ExecutionPayloadV2 { payload_inner: v1, withdrawals }))
+                Ok(ExecutionPayload::V2(ExecutionPayloadV2 {
+                    payload_inner: v1,
+                    withdrawals,
+                }))
             }
         }
 
@@ -1426,7 +1534,10 @@ impl ExecutionPayloadBodyV1 {
         T: Encodable2718 + 'a,
     {
         Self {
-            transactions: transactions.into_iter().map(|tx| tx.encoded_2718().into()).collect(),
+            transactions: transactions
+                .into_iter()
+                .map(|tx| tx.encoded_2718().into())
+                .collect(),
             withdrawals: withdrawals.map(Withdrawals::into_inner),
         }
     }
@@ -1484,12 +1595,18 @@ pub struct PayloadStatus {
 impl PayloadStatus {
     /// Initializes a new payload status.
     pub const fn new(status: PayloadStatusEnum, latest_valid_hash: Option<B256>) -> Self {
-        Self { status, latest_valid_hash }
+        Self {
+            status,
+            latest_valid_hash,
+        }
     }
 
     /// Creates a new payload status from the given status.
     pub const fn from_status(status: PayloadStatusEnum) -> Self {
-        Self { status, latest_valid_hash: None }
+        Self {
+            status,
+            latest_valid_hash: None,
+        }
     }
 
     /// Sets the latest valid hash.
@@ -1547,14 +1664,19 @@ impl serde::Serialize for PayloadStatus {
 
 impl From<PayloadError> for PayloadStatusEnum {
     fn from(error: PayloadError) -> Self {
-        Self::Invalid { validation_error: error.to_string() }
+        Self::Invalid {
+            validation_error: error.to_string(),
+        }
     }
 }
 
 /// Represents the status response of a payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(tag = "status", rename_all = "SCREAMING_SNAKE_CASE"))]
+#[cfg_attr(
+    feature = "serde",
+    serde(tag = "status", rename_all = "SCREAMING_SNAKE_CASE")
+)]
 #[cfg_attr(any(test, feature = "arbitrary"), derive(arbitrary::Arbitrary))]
 pub enum PayloadStatusEnum {
     /// VALID is returned by the engine API in the following calls:
@@ -2197,8 +2319,9 @@ mod tests {
         "#;
 
         // deserialize payload
-        let payload: ExecutionPayload =
-            serde_json::from_str::<ExecutionPayloadV3>(deser_block).unwrap().into();
+        let payload: ExecutionPayload = serde_json::from_str::<ExecutionPayloadV3>(deser_block)
+            .unwrap()
+            .into();
 
         // NOTE: the actual block hash here is incorrect, it is a result of a bug, this was the
         // fix:
@@ -2211,7 +2334,10 @@ mod tests {
             b256!("1162de8a0f4d20d86b9ad6e0a2575ab60f00a433dc70d9318c8abc9041fddf54");
 
         // set up cancun payload fields
-        let cancun_fields = CancunPayloadFields { parent_beacon_block_root, versioned_hashes };
+        let cancun_fields = CancunPayloadFields {
+            parent_beacon_block_root,
+            versioned_hashes,
+        };
 
         // convert into block
         let block = payload

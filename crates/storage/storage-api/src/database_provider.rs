@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use alloc::vec::Vec;
 use core::ops::{Bound, RangeBounds};
 use reth_db_api::{
@@ -61,7 +64,10 @@ pub trait DBProvider: Sized {
         &self,
         range: impl RangeBounds<T::Key>,
     ) -> Result<Vec<KeyValue<T>>, DatabaseError> {
-        self.tx_ref().cursor_read::<T>()?.walk_range(range)?.collect::<Result<Vec<_>, _>>()
+        self.tx_ref()
+            .cursor_read::<T>()?
+            .walk_range(range)?
+            .collect::<Result<Vec<_>, _>>()
     }
 
     /// Iterates over read only values in the given table and collects them into a vector.
@@ -161,6 +167,29 @@ pub trait DatabaseProviderFactory: Send + Sync {
 
 /// Helper type alias to get the associated transaction type from a [`DatabaseProviderFactory`].
 pub type FactoryTx<F> = <<F as DatabaseProviderFactory>::DB as Database>::TX;
+
+/// A trait which can be used to describe any factory-like type which returns a read-only provider.
+pub trait DatabaseProviderROFactory {
+    /// Provider type returned by this factory.
+    ///
+    /// This type is intentionally left unconstrained; constraints can be added as-needed when this
+    /// is used.
+    type Provider;
+
+    /// Creates and returns a Provider.
+    fn database_provider_ro(&self) -> ProviderResult<Self::Provider>;
+}
+
+impl<T> DatabaseProviderROFactory for T
+where
+    T: DatabaseProviderFactory,
+{
+    type Provider = T::Provider;
+
+    fn database_provider_ro(&self) -> ProviderResult<Self::Provider> {
+        <T as DatabaseProviderFactory>::database_provider_ro(self)
+    }
+}
 
 fn range_size_hint(range: &impl RangeBounds<u64>) -> Option<usize> {
     let start = match range.start_bound().cloned() {

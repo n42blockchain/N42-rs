@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Bootnodes for the network
 
 use crate::NodeRecord;
@@ -6,11 +9,11 @@ use alloc::vec::Vec;
 mod ethereum;
 pub use ethereum::*;
 
-mod optimism;
 mod ast;
+mod optimism;
 
-pub use optimism::*;
 use crate::bootnodes::ast::{N42_BOOTNODES, N42_TESTNET_BOOTNODES};
+pub use optimism::*;
 
 /// Returns parsed ast nodes
 pub fn n42_nodes() -> Vec<NodeRecord> {
@@ -64,5 +67,8 @@ pub fn base_testnet_nodes() -> Vec<NodeRecord> {
 
 /// Parses all the nodes
 pub fn parse_nodes(nodes: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<NodeRecord> {
-    nodes.into_iter().map(|s| s.as_ref().parse().unwrap()).collect()
+    nodes
+        .into_iter()
+        .map(|s| s.as_ref().parse().unwrap())
+        .collect()
 }

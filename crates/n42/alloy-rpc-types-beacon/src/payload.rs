@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Payload support for the beacon API.
 //!
 //! Internal helper module to deserialize/serialize the payload attributes for the beacon API, which
@@ -10,7 +13,7 @@
 
 use crate::{withdrawals::BeaconWithdrawal, BlsPublicKey};
 use alloy_eips::eip4895::Withdrawal;
-use alloy_primitives::{Address, Bloom, Bytes, B256, B64, U256};
+use alloy_primitives::{Address, Bloom, Bytes, B256, U256};
 use alloy_rpc_types_engine::{
     ExecutionPayload, ExecutionPayloadV1, ExecutionPayloadV2, ExecutionPayloadV3,
 };
@@ -113,6 +116,7 @@ struct BeaconPayloadAttributes {
 /// Optimism Payload Attributes
 #[serde_as]
 #[derive(Serialize, Deserialize)]
+#[allow(dead_code)]
 struct BeaconOptimismPayloadAttributes {
     #[serde(flatten)]
     payload_attributes: BeaconPayloadAttributes,
@@ -191,8 +195,6 @@ struct BeaconExecutionPayloadV1<'a> {
     base_fee_per_gas: U256,
     block_hash: Cow<'a, B256>,
     transactions: Cow<'a, [Bytes]>,
-    difficulty: Cow<'a, U256>,
-    nonce: Cow<'a, B64>,
 }
 
 impl<'a> From<BeaconExecutionPayloadV1<'a>> for ExecutionPayloadV1 {
@@ -211,8 +213,6 @@ impl<'a> From<BeaconExecutionPayloadV1<'a>> for ExecutionPayloadV1 {
             extra_data,
             base_fee_per_gas,
             block_hash,
-            difficulty,
-            nonce,
             transactions,
         } = payload;
         Self {
@@ -229,9 +229,9 @@ impl<'a> From<BeaconExecutionPayloadV1<'a>> for ExecutionPayloadV1 {
             extra_data: extra_data.into_owned(),
             base_fee_per_gas,
             block_hash: block_hash.into_owned(),
-            difficulty: difficulty.into_owned(),
-            nonce: nonce.into_owned(),
             transactions: transactions.into_owned(),
+            difficulty: Default::default(),
+            nonce: Default::default(),
         }
     }
 }
@@ -252,9 +252,9 @@ impl<'a> From<&'a ExecutionPayloadV1> for BeaconExecutionPayloadV1<'a> {
             extra_data,
             base_fee_per_gas,
             block_hash,
-            difficulty,
-            nonce,
             transactions,
+            difficulty: _,
+            nonce: _,
         } = value;
 
         BeaconExecutionPayloadV1 {
@@ -271,8 +271,6 @@ impl<'a> From<&'a ExecutionPayloadV1> for BeaconExecutionPayloadV1<'a> {
             extra_data: Cow::Borrowed(extra_data),
             base_fee_per_gas: *base_fee_per_gas,
             block_hash: Cow::Borrowed(block_hash),
-            difficulty: Cow::Borrowed(difficulty),
-            nonce: Cow::Borrowed(nonce),
             transactions: Cow::Borrowed(transactions),
         }
     }
@@ -317,14 +315,23 @@ struct BeaconExecutionPayloadV2<'a> {
 
 impl<'a> From<BeaconExecutionPayloadV2<'a>> for ExecutionPayloadV2 {
     fn from(payload: BeaconExecutionPayloadV2<'a>) -> Self {
-        let BeaconExecutionPayloadV2 { payload_inner, withdrawals } = payload;
-        Self { payload_inner: payload_inner.into(), withdrawals }
+        let BeaconExecutionPayloadV2 {
+            payload_inner,
+            withdrawals,
+        } = payload;
+        Self {
+            payload_inner: payload_inner.into(),
+            withdrawals,
+        }
     }
 }
 
 impl<'a> From<&'a ExecutionPayloadV2> for BeaconExecutionPayloadV2<'a> {
     fn from(value: &'a ExecutionPayloadV2) -> Self {
-        let ExecutionPayloadV2 { payload_inner, withdrawals } = value;
+        let ExecutionPayloadV2 {
+            payload_inner,
+            withdrawals,
+        } = value;
         BeaconExecutionPayloadV2 {
             payload_inner: payload_inner.into(),
             withdrawals: withdrawals.clone(),
@@ -371,14 +378,26 @@ struct BeaconExecutionPayloadV3<'a> {
 
 impl<'a> From<BeaconExecutionPayloadV3<'a>> for ExecutionPayloadV3 {
     fn from(payload: BeaconExecutionPayloadV3<'a>) -> Self {
-        let BeaconExecutionPayloadV3 { payload_inner, blob_gas_used, excess_blob_gas } = payload;
-        Self { payload_inner: payload_inner.into(), blob_gas_used, excess_blob_gas }
+        let BeaconExecutionPayloadV3 {
+            payload_inner,
+            blob_gas_used,
+            excess_blob_gas,
+        } = payload;
+        Self {
+            payload_inner: payload_inner.into(),
+            blob_gas_used,
+            excess_blob_gas,
+        }
     }
 }
 
 impl<'a> From<&'a ExecutionPayloadV3> for BeaconExecutionPayloadV3<'a> {
     fn from(value: &'a ExecutionPayloadV3) -> Self {
-        let ExecutionPayloadV3 { payload_inner, blob_gas_used, excess_blob_gas } = value;
+        let ExecutionPayloadV3 {
+            payload_inner,
+            blob_gas_used,
+            excess_blob_gas,
+        } = value;
         BeaconExecutionPayloadV3 {
             payload_inner: payload_inner.into(),
             blob_gas_used: *blob_gas_used,

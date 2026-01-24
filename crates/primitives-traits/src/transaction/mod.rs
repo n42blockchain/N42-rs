@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Transaction abstraction
 
 pub mod execute;
@@ -7,7 +10,9 @@ pub mod signed;
 pub mod error;
 pub mod recover;
 
-pub use alloy_consensus::transaction::{SignerRecoverable, TransactionInfo, TransactionMeta};
+pub use alloy_consensus::transaction::{
+    SignerRecoverable, TransactionInfo, TransactionMeta, TxHashRef,
+};
 
 use crate::{InMemorySize, MaybeCompact, MaybeSerde};
 use core::{fmt, hash::Hash};

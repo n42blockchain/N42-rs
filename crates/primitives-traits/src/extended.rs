@@ -1,9 +1,15 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::{
     size::InMemorySize,
     transaction::signed::{RecoveryError, SignedTransaction},
 };
 use alloc::vec::Vec;
-use alloy_consensus::{transaction::SignerRecoverable, Transaction};
+use alloy_consensus::{
+    transaction::{SignerRecoverable, TxHashRef},
+    Transaction,
+};
 use alloy_eips::{
     eip2718::{Eip2718Error, Eip2718Result, IsTyped2718},
     eip2930::AccessList,
@@ -151,10 +157,10 @@ where
     }
 }
 
-impl<B, T> SignedTransaction for Extended<B, T>
+impl<B, T> TxHashRef for Extended<B, T>
 where
-    B: SignedTransaction + IsTyped2718,
-    T: SignedTransaction,
+    B: TxHashRef,
+    T: TxHashRef,
 {
     fn tx_hash(&self) -> &TxHash {
         match self {
@@ -162,7 +168,13 @@ where
             Self::Other(tx) => tx.tx_hash(),
         }
     }
+}
 
+impl<B, T> SignedTransaction for Extended<B, T>
+where
+    B: SignedTransaction + IsTyped2718,
+    T: SignedTransaction,
+{
     fn recover_signer_unchecked_with_buf(
         &self,
         buf: &mut Vec<u8>,

@@ -1,4 +1,19 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use alloy_primitives::{B256, U256};
+
+/// Trait for extracting subkeys from values during database operations.
+///
+/// This trait allows extracting the subkey from a value during database iteration,
+/// enabling proper range queries and filtering on `DupSort` tables.
+pub trait ValueWithSubKey {
+    /// The type of the subkey.
+    type SubKey;
+
+    /// Extracts and returns the subkey from this value.
+    fn get_subkey(&self) -> Self::SubKey;
+}
 
 /// Account storage entry.
 ///
@@ -6,7 +21,10 @@ use alloy_primitives::{B256, U256};
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(any(test, feature = "arbitrary"), derive(arbitrary::Arbitrary))]
-#[cfg_attr(any(test, feature = "reth-codec"), reth_codecs::add_arbitrary_tests(compact))]
+#[cfg_attr(
+    any(test, feature = "reth-codec"),
+    reth_codecs::add_arbitrary_tests(compact)
+)]
 pub struct StorageEntry {
     /// Storage key.
     pub key: B256,
@@ -24,6 +42,14 @@ impl StorageEntry {
 impl From<(B256, U256)> for StorageEntry {
     fn from((key, value): (B256, U256)) -> Self {
         Self { key, value }
+    }
+}
+
+impl ValueWithSubKey for StorageEntry {
+    type SubKey = B256;
+
+    fn get_subkey(&self) -> Self::SubKey {
+        self.key
     }
 }
 

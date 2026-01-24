@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Node add-ons. Depend on core [`NodeComponents`](crate::NodeComponents).
 
 use reth_node_api::{FullNodeComponents, NodeAddOns};

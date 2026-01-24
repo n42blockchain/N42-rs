@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Parameters for configuring the rpc more granularity via CLI
 
 /// NetworkArg struct for configuring the network
@@ -23,6 +26,10 @@ pub use database::DatabaseArgs;
 /// LogArgs struct for configuring the logger
 mod log;
 pub use log::{ColorMode, LogArgs, Verbosity};
+
+/// `MetricArgs` to configure metrics.
+mod metric;
+pub use metric::MetricArgs;
 
 /// `PayloadBuilderArgs` struct for configuring the payload builder
 mod payload_builder;
@@ -51,6 +58,10 @@ pub use pruning::PruningArgs;
 /// DatadirArgs for configuring data storage paths
 mod datadir_args;
 pub use datadir_args::DatadirArgs;
+
+/// `StaticFilesArgs` for configuring static files.
+mod static_files;
+pub use static_files::{StaticFilesArgs, MINIMAL_BLOCKS_PER_FILE};
 
 /// BenchmarkArgs struct for configuring the benchmark to run
 mod benchmark_args;

@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Implements data structures specific to the database
 
 use crate::{
@@ -15,16 +18,15 @@ use reth_stages_types::StageCheckpoint;
 use reth_trie_common::{StoredNibbles, StoredNibblesSubKey, *};
 use serde::{Deserialize, Serialize};
 
-use n42_primitives::Snapshot;
-
 pub mod accounts;
+mod beacon;
 pub mod blocks;
 pub mod integer_list;
 pub mod sharded_key;
-pub mod storage_sharded_key;
 mod snapshot;
+pub mod storage_sharded_key;
 mod validator;
-mod beacon;
+mod metadata;
 
 pub use accounts::*;
 pub use blocks::*;
@@ -34,6 +36,7 @@ pub use reth_db_models::{
     StoredBlockWithdrawals,
 };
 pub use sharded_key::ShardedKey;
+pub use metadata::StorageSettings;
 
 /// Macro that implements [`Encode`] and [`Decode`] for uint types.
 macro_rules! impl_uints {
@@ -104,7 +107,9 @@ impl Encode for B256 {
 
 impl Decode for B256 {
     fn decode(value: &[u8]) -> Result<Self, DatabaseError> {
-        Ok(Self::new(value.try_into().map_err(|_| DatabaseError::Decode)?))
+        Ok(Self::new(
+            value.try_into().map_err(|_| DatabaseError::Decode)?,
+        ))
     }
 }
 
@@ -224,6 +229,7 @@ impl_compression_for_compact!(
     TxType,
     StorageEntry,
     BranchNodeCompact,
+    TrieChangeSetsEntry,
     StoredNibbles,
     StoredNibblesSubKey,
     StorageTrieEntry,

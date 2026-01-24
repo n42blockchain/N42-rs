@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //mod addons;
 //pub use addons::N42NodeAddOns;
 
@@ -18,11 +21,14 @@ mod payload;
 //mod job_generator;
 //mod job;
 //mod metrics;
-mod network;
 mod consensus;
+mod network;
 
+pub use consensus::N42ConsensusBuilder;
 pub use payload::N42PayloadServiceBuilder;
 
+#[cfg(test)]
+mod tests;
 
 //
 // #[tokio::main]

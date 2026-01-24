@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Various error variants that can happen when working with transactions.
 
 use crate::GotExpectedBoxed;
@@ -64,6 +67,16 @@ pub enum InvalidTransactionError {
     /// Thrown if the sender of a transaction is a contract.
     #[error("transaction signer has bytecode set")]
     SignerAccountHasBytecode,
+}
+
+impl InvalidTransactionError {
+    /// Returns `true` if the nonce of a transaction is lower than the account's current nonce.
+    pub fn is_nonce_too_low(&self) -> bool {
+        match self {
+            Self::NonceNotConsistent { tx, state } => tx < state,
+            _ => false,
+        }
+    }
 }
 
 /// Represents error variants that can happen when trying to convert a transaction to pooled

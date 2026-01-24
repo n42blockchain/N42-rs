@@ -1,10 +1,17 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+use super::Header;
+use crate::BlockHeader as BlockHeaderTrait;
+use alloc::boxed::Box;
+use alloy_primitives::{keccak256, Address, BlockNumber, Bloom, Bytes, B256, B64, U256};
 use alloy_rlp::{length_of_length, Encodable};
 use bytes::BufMut;
-use secp256k1::{Message, SECP256K1, Error as SecpError, ecdsa::{RecoverableSignature, RecoveryId}, PublicKey};
-use std::error::Error;
-use super::Header;
-use alloy_primitives::{U256, Bloom, BlockNumber, keccak256, B64, B256, Address, Bytes};
-use crate::{BlockHeader as BlockHeaderTrait};
+use core::error::Error;
+use secp256k1::{
+    ecdsa::{RecoverableSignature, RecoveryId},
+    Error as SecpError, Message, PublicKey, SECP256K1,
+};
 
 /// recovery error
 #[derive(Debug)]
@@ -23,8 +30,8 @@ pub enum RecoveryError {
     EcdsaError(SecpError),
 }
 
-impl std::fmt::Display for RecoveryError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for RecoveryError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::MissingSignature => write!(f, "Missing signature"),
             Self::InvalidMessage => write!(f, "Invalid message"),
@@ -42,7 +49,7 @@ impl From<SecpError> for RecoveryError {
     }
 }
 
-impl std::error::Error for RecoveryError {}
+impl core::error::Error for RecoveryError {}
 ///  indicates the byte length required to carry a signature with recovery id.
 ///  Fixed number of extra-data suffix bytes reserved for signer seal
 pub const SIGNATURE_LENGTH: usize = 64 + 1;
@@ -63,9 +70,15 @@ pub fn recover_address(header: &Header) -> Result<Address, Box<dyn Error>> {
         RecoveryId::try_from(i32::from(signature[64]))?,
     )?;
 
-    Ok(public_key_to_address(SECP256K1.recover_ecdsa(&message, &signature)?))
+    Ok(public_key_to_address(
+        SECP256K1.recover_ecdsa(&message, &signature)?,
+    ))
 }
 
+/// Recovers the signer address from a Clique header's signature.
+///
+/// This function extracts the ECDSA signature from the header's extra data and recovers
+/// the Ethereum address of the signer who sealed the block.
 pub fn recover_address_generic<H>(header: &H) -> Result<Address, Box<dyn Error>>
 where
     H: BlockHeaderTrait,
@@ -84,14 +97,19 @@ where
         RecoveryId::try_from(i32::from(signature[64]))?,
     )?;
 
-    Ok(public_key_to_address(SECP256K1.recover_ecdsa(&message, &signature)?))
+    Ok(public_key_to_address(
+        SECP256K1.recover_ecdsa(&message, &signature)?,
+    ))
 }
 
+/// Computes the hash that should be signed for a Clique header.
+///
+/// This creates a modified version of the header with the signature portion of the extra data
+/// zeroed out, then returns its hash. This is the hash that validators sign.
 pub fn seal_hash_generic<H>(header: &H) -> B256
 where
     H: BlockHeaderTrait,
 {
-
     struct LocalHeader {
         parent_hash: B256,
         ommers_hash: B256,
@@ -138,13 +156,14 @@ where
         }
     }
 
-
     impl Encodable for LocalHeader {
         fn encode(&self, out: &mut dyn BufMut) {
             // Create a header indicating the encoded content is a list with the payload length computed
             // from the header's payload calculation function.
-            let list_header =
-                alloy_rlp::Header { list: true, payload_length: self.header_payload_length() };
+            let list_header = alloy_rlp::Header {
+                list: true,
+                payload_length: self.header_payload_length(),
+            };
             list_header.encode(out);
 
             // Encode each header field sequentially
@@ -193,23 +212,24 @@ where
         gas_used: header.gas_used(),
         timestamp: header.timestamp(),
         extra_data: Bytes::new(),
-        mix_hash: header.mix_hash().unwrap(),
-        nonce: u64::from(header.nonce().unwrap()),
+        // SEC-002: Safe handling of optional mix_hash and nonce
+        mix_hash: header.mix_hash().unwrap_or_default(),
+        nonce: u64::from(header.nonce().unwrap_or_default()),
         base_fee_per_gas: header.base_fee_per_gas(),
     };
 
     // Handle the extra field, excluding the last CRYPTO_SIGNATURE_LENGTH bytes
     if header.extra_data().len() > SIGNATURE_LENGTH {
-        sig_header.extra_data = Bytes::from(header.extra_data()[..header.extra_data().len() - SIGNATURE_LENGTH].to_vec());
+        sig_header.extra_data = Bytes::from(
+            header.extra_data()[..header.extra_data().len() - SIGNATURE_LENGTH].to_vec(),
+        );
     }
 
     keccak256(alloy_rlp::encode(&sig_header))
 }
 
-
 /// SealHash returns the hash of a block prior to it being sealed.
 pub fn seal_hash(header: &Header) -> B256 {
-
     struct LocalHeader {
         parent_hash: B256,
         ommers_hash: B256,
@@ -256,13 +276,14 @@ pub fn seal_hash(header: &Header) -> B256 {
         }
     }
 
-
     impl Encodable for LocalHeader {
         fn encode(&self, out: &mut dyn BufMut) {
             // Create a header indicating the encoded content is a list with the payload length computed
             // from the header's payload calculation function.
-            let list_header =
-                alloy_rlp::Header { list: true, payload_length: self.header_payload_length() };
+            let list_header = alloy_rlp::Header {
+                list: true,
+                payload_length: self.header_payload_length(),
+            };
             list_header.encode(out);
 
             // Encode each header field sequentially
@@ -318,7 +339,8 @@ pub fn seal_hash(header: &Header) -> B256 {
 
     // Handle the extra field, excluding the last CRYPTO_SIGNATURE_LENGTH bytes
     if header.extra_data.len() > SIGNATURE_LENGTH {
-        sig_header.extra_data = Bytes::from(header.extra_data[..header.extra_data.len() - SIGNATURE_LENGTH].to_vec());
+        sig_header.extra_data =
+            Bytes::from(header.extra_data[..header.extra_data.len() - SIGNATURE_LENGTH].to_vec());
     }
 
     keccak256(alloy_rlp::encode(&sig_header))

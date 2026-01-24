@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Command for debugging block building.
 use alloy_consensus::BlockHeader;
 use alloy_eips::{
@@ -81,8 +84,10 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
     ) -> RethResult<Arc<SealedBlock<BlockTy<N>>>> {
         let provider = factory.provider()?;
 
-        let best_number =
-            provider.get_stage_checkpoint(StageId::Finish)?.unwrap_or_default().block_number;
+        let best_number = provider
+            .get_stage_checkpoint(StageId::Finish)?
+            .unwrap_or_default()
+            .block_number;
         let best_hash = provider
             .block_hash(best_number)?
             .expect("the hash for the latest block is missing, database is corrupt");
@@ -105,9 +110,11 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
         self,
         ctx: CliContext,
     ) -> eyre::Result<()> {
-        let Environment { provider_factory, .. } = self.env.init::<N>(AccessRights::RW)?;
+        let Environment {
+            provider_factory, ..
+        } = self.env.init::<N>(AccessRights::RW)?;
 
-        let consensus: Arc<dyn FullConsensus<EthPrimitives, Error = ConsensusError>> =
+        let consensus: Arc<dyn FullConsensus<EthPrimitives>> =
             Arc::new(EthBeaconConsensus::new(provider_factory.chain_spec()));
 
         // fetch the best block from the database
@@ -163,7 +170,10 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
                     let encoded_length = pooled.encode_2718_len();
 
                     // insert the blob into the store
-                    blob_store.insert(*transaction.tx_hash(), alloy_eips::eip7594::BlobTransactionSidecarVariant::Eip4844(sidecar))?;
+                    blob_store.insert(
+                        *transaction.tx_hash(),
+                        alloy_eips::eip7594::BlobTransactionSidecarVariant::Eip4844(sidecar),
+                    )?;
 
                     encoded_length
                 }
@@ -191,7 +201,10 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
                 .then(Vec::new),
         };
         let payload_config = PayloadConfig::new(
-            Arc::new(SealedHeader::new(best_block.header().clone(), best_block.hash())),
+            Arc::new(SealedHeader::new(
+                best_block.header().clone(),
+                best_block.hash(),
+            )),
             reth_payload_builder::EthPayloadBuilderAttributes::try_new(
                 best_block.hash(),
                 payload_attrs,
@@ -234,9 +247,10 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
                 debug!(target: "reth::cli", ?execution_outcome, "Executed block");
 
                 let hashed_post_state = state_provider.hashed_post_state(execution_outcome.state());
+                let hashed_post_state_sorted = hashed_post_state.clone().into_sorted();
                 let (state_root, trie_updates) = StateRoot::overlay_root_with_updates(
                     provider_factory.provider()?.tx_ref(),
-                    hashed_post_state.clone(),
+                    &hashed_post_state_sorted,
                 )?;
 
                 if state_root != block_with_senders.state_root() {

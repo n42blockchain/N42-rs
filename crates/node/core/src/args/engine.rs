@@ -1,11 +1,14 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! clap [Args](clap::Args) for engine purposes
 
 use clap::Args;
 use reth_engine_primitives::TreeConfig;
 
 use crate::node_config::{
-    DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB, DEFAULT_MAX_PROOF_TASK_CONCURRENCY,
-    DEFAULT_MEMORY_BLOCK_BUFFER_TARGET, DEFAULT_PERSISTENCE_THRESHOLD, DEFAULT_RESERVED_CPU_CORES,
+    DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB, DEFAULT_MEMORY_BLOCK_BUFFER_TARGET,
+    DEFAULT_PERSISTENCE_THRESHOLD, DEFAULT_RESERVED_CPU_CORES,
 };
 
 /// Parameters for configuring the engine driver.
@@ -26,7 +29,11 @@ pub struct EngineArgs {
 
     /// CAUTION: This CLI flag has no effect anymore, use --engine.disable-caching-and-prewarming
     /// if you want to disable caching and prewarming
-    #[arg(long = "engine.caching-and-prewarming", default_value = "true", hide = true)]
+    #[arg(
+        long = "engine.caching-and-prewarming",
+        default_value = "true",
+        hide = true
+    )]
     #[deprecated]
     pub caching_and_prewarming_enabled: bool,
 
@@ -52,10 +59,6 @@ pub struct EngineArgs {
     /// Enables accepting requests hash instead of an array of requests in `engine_newPayloadV4`.
     #[arg(long = "engine.accept-execution-requests-hash")]
     pub accept_execution_requests_hash: bool,
-
-    /// Configure the maximum number of concurrent proof tasks
-    #[arg(long = "engine.max-proof-task-concurrency", default_value_t = DEFAULT_MAX_PROOF_TASK_CONCURRENCY)]
-    pub max_proof_task_concurrency: u64,
 
     /// Configure the number of reserved CPU cores for non-reth processes
     #[arg(long = "engine.reserved-cpu-cores", default_value_t = DEFAULT_RESERVED_CPU_CORES)]
@@ -100,7 +103,6 @@ impl Default for EngineArgs {
             state_provider_metrics: false,
             cross_block_cache_size: DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB,
             accept_execution_requests_hash: false,
-            max_proof_task_concurrency: DEFAULT_MAX_PROOF_TASK_CONCURRENCY,
             reserved_cpu_cores: DEFAULT_RESERVED_CPU_CORES,
             precompile_cache_enabled: true,
             precompile_cache_disabled: false,
@@ -117,11 +119,10 @@ impl EngineArgs {
             .with_persistence_threshold(self.persistence_threshold)
             .with_memory_block_buffer_target(self.memory_block_buffer_target)
             .with_legacy_state_root(self.legacy_state_root_task_enabled)
-            .without_caching_and_prewarming(self.caching_and_prewarming_disabled)
+            .without_prewarming(self.caching_and_prewarming_disabled)
             .with_state_provider_metrics(self.state_provider_metrics)
             .with_always_compare_trie_updates(self.state_root_task_compare_updates)
             .with_cross_block_cache_size(self.cross_block_cache_size * 1024 * 1024)
-            .with_max_proof_task_concurrency(self.max_proof_task_concurrency)
             .with_reserved_cpu_cores(self.reserved_cpu_cores)
             .without_precompile_cache(self.precompile_cache_disabled)
             .with_state_root_fallback(self.state_root_fallback)

@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use super::{
     AccountReader, BlockHashReader, BlockIdReader, StateProofProvider, StateRootProvider,
     StorageRootProvider,
@@ -28,6 +31,20 @@ pub trait StateReader: Send + Sync {
 
 /// Type alias of boxed [`StateProvider`].
 pub type StateProviderBox = Box<dyn StateProvider>;
+
+// Manual Debug implementation for dyn StateProvider to satisfy revm's Database trait bound
+impl core::fmt::Debug for dyn StateProvider {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StateProvider").finish_non_exhaustive()
+    }
+}
+
+// Debug implementation for dyn StateProvider + Sync + Send to satisfy revm's Database trait bound
+impl core::fmt::Debug for dyn StateProvider + Sync + Send {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StateProvider").finish_non_exhaustive()
+    }
+}
 
 /// An abstraction for a type that provides state data.
 #[auto_impl(&, Arc, Box)]
@@ -62,10 +79,10 @@ pub trait StateProvider:
 
         if let Some(code_hash) = acc.bytecode_hash {
             if code_hash == KECCAK_EMPTY {
-                return Ok(None)
+                return Ok(None);
             }
             // Get the code from the code hash
-            return self.bytecode_by_hash(&code_hash)
+            return self.bytecode_by_hash(&code_hash);
         }
 
         // Return `None` if no code hash is set
@@ -79,7 +96,8 @@ pub trait StateProvider:
         // Get basic account information
         // Returns None if acc doesn't exist
 
-        self.basic_account(addr)?.map_or_else(|| Ok(None), |acc| Ok(Some(acc.balance)))
+        self.basic_account(addr)?
+            .map_or_else(|| Ok(None), |acc| Ok(Some(acc.balance)))
     }
 
     /// Get account nonce by its address.
@@ -88,22 +106,14 @@ pub trait StateProvider:
     fn account_nonce(&self, addr: &Address) -> ProviderResult<Option<u64>> {
         // Get basic account information
         // Returns None if acc doesn't exist
-        self.basic_account(addr)?.map_or_else(|| Ok(None), |acc| Ok(Some(acc.nonce)))
+        self.basic_account(addr)?
+            .map_or_else(|| Ok(None), |acc| Ok(Some(acc.nonce)))
     }
 }
 
 /// Minimal requirements to read a full account, for example, to validate its new transactions
 pub trait AccountInfoReader: AccountReader + BytecodeReader {}
 impl<T: AccountReader + BytecodeReader> AccountInfoReader for T {}
-
-/// Trait implemented for database providers that can provide the [`reth_trie_db::StateCommitment`]
-/// type.
-#[cfg(feature = "db-api")]
-pub trait StateCommitmentProvider: Send + Sync {
-    /// The [`reth_trie_db::StateCommitment`] type that can be used to perform state commitment
-    /// operations.
-    type StateCommitment: reth_trie_db::StateCommitment;
-}
 
 /// Trait that provides the hashed state from various sources.
 #[auto_impl(&, Arc, Box)]

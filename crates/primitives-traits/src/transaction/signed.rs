@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! API of a signed transaction.
 
 use crate::{
@@ -10,7 +13,7 @@ use alloy_consensus::{
     EthereumTxEnvelope, SignableTransaction,
 };
 use alloy_eips::eip2718::{Decodable2718, Encodable2718};
-use alloy_primitives::{keccak256, Address, Signature, TxHash, B256};
+use alloy_primitives::{keccak256, Address, Signature, B256};
 use alloy_rlp::{Decodable, Encodable};
 use core::hash::Hash;
 
@@ -19,6 +22,8 @@ pub use alloy_consensus::crypto::RecoveryError;
 /// Helper trait that unifies all behaviour required by block to support full node operations.
 pub trait FullSignedTx: SignedTransaction + MaybeCompact + MaybeSerdeBincodeCompat {}
 impl<T> FullSignedTx for T where T: SignedTransaction + MaybeCompact + MaybeSerdeBincodeCompat {}
+
+use alloy_consensus::transaction::TxHashRef;
 
 /// A signed transaction.
 #[auto_impl::auto_impl(&, Arc)]
@@ -39,10 +44,8 @@ pub trait SignedTransaction:
     + MaybeSerde
     + InMemorySize
     + SignerRecoverable
+    + TxHashRef
 {
-    /// Returns reference to transaction hash.
-    fn tx_hash(&self) -> &TxHash;
-
     /// Returns whether this transaction type can be __broadcasted__ as full transaction over the
     /// network.
     ///
@@ -85,7 +88,8 @@ pub trait SignedTransaction:
     /// Tries to recover signer and return [`Recovered`] by cloning the type.
     #[auto_impl(keep_default_for(&, Arc))]
     fn try_clone_into_recovered(&self) -> Result<Recovered<Self>, RecoveryError> {
-        self.recover_signer().map(|signer| Recovered::new_unchecked(self.clone(), signer))
+        self.recover_signer()
+            .map(|signer| Recovered::new_unchecked(self.clone(), signer))
     }
 
     /// Tries to recover signer and return [`Recovered`].
@@ -107,7 +111,8 @@ pub trait SignedTransaction:
     #[deprecated(note = "Use try_into_recovered_unchecked instead")]
     #[auto_impl(keep_default_for(&, Arc))]
     fn into_recovered_unchecked(self) -> Result<Recovered<Self>, RecoveryError> {
-        self.recover_signer_unchecked().map(|signer| Recovered::new_unchecked(self, signer))
+        self.recover_signer_unchecked()
+            .map(|signer| Recovered::new_unchecked(self, signer))
     }
 
     /// Returns the [`Recovered`] transaction with the given sender.
@@ -130,18 +135,9 @@ pub trait SignedTransaction:
 impl<T> SignedTransaction for EthereumTxEnvelope<T>
 where
     T: RlpEcdsaEncodableTx + SignableTransaction<Signature> + Unpin,
-    Self: Clone + PartialEq + Eq + Decodable + Decodable2718 + MaybeSerde + InMemorySize,
+    Self:
+        Clone + PartialEq + Eq + Decodable + Decodable2718 + MaybeSerde + InMemorySize + TxHashRef,
 {
-    fn tx_hash(&self) -> &TxHash {
-        match self {
-            Self::Legacy(tx) => tx.hash(),
-            Self::Eip2930(tx) => tx.hash(),
-            Self::Eip1559(tx) => tx.hash(),
-            Self::Eip7702(tx) => tx.hash(),
-            Self::Eip4844(tx) => tx.hash(),
-        }
-    }
-
     fn recover_signer_unchecked_with_buf(
         &self,
         buf: &mut Vec<u8>,

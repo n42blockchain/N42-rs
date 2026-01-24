@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 #[cfg(feature = "ssz")]
 use alloy_eips::eip7685::Requests;
 use alloy_eips::{
@@ -149,7 +152,9 @@ mod ssz_requests_conversions {
 
             let accumulator = value
                 .iter()
-                .try_fold(RequestAccumulator::default(), |acc, request| acc.accumulate(request))?;
+                .try_fold(RequestAccumulator::default(), |acc, request| {
+                    acc.accumulate(request)
+                })?;
 
             Ok(Self {
                 deposits: accumulator.deposits,

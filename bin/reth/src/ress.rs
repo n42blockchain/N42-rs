@@ -1,9 +1,12 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::network::PeersHandleProvider;
 use reth_ethereum_primitives::EthPrimitives;
 use reth_evm::ConfigureEvm;
 use reth_network::{protocol::IntoRlpxSubProtocol, NetworkProtocols};
 use reth_network_api::FullNetwork;
-use reth_node_api::BeaconConsensusEngineEvent;
+use reth_node_api::ConsensusEngineEvent;
 use reth_node_core::args::RessArgs;
 use reth_provider::providers::{BlockchainProvider, ProviderNodeTypes};
 use reth_ress_protocol::{NodeType, ProtocolState, RessProtocolHandler};
@@ -20,7 +23,7 @@ pub fn install_ress_subprotocol<P, E, N>(
     evm_config: E,
     network: N,
     task_executor: TaskExecutor,
-    engine_events: EventStream<BeaconConsensusEngineEvent<EthPrimitives>>,
+    engine_events: EventStream<ConsensusEngineEvent<EthPrimitives>>,
 ) -> eyre::Result<()>
 where
     P: ProviderNodeTypes<Primitives = EthPrimitives>,

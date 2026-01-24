@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use std::collections::HashSet;
 use alloy_primitives::{BlockHash, TxHash, B256};
 use derive_more::Error;

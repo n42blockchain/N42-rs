@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Command for debugging execution.
 
 use alloy_eips::BlockHashOrNumber;
@@ -64,7 +67,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
         &self,
         config: &Config,
         client: Client,
-        consensus: Arc<dyn FullConsensus<N::Primitives, Error = ConsensusError>>,
+        consensus: Arc<dyn FullConsensus<N::Primitives>>,
         provider_factory: ProviderFactory<N>,
         task_executor: &TaskExecutor,
         static_file_producer: StaticFileProducer<ProviderFactory<N>>,
@@ -83,7 +86,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
             .into_task_with(task_executor);
 
         let stage_conf = &config.stages;
-        let prune_modes = config.prune.clone().map(|prune| prune.segments).unwrap_or_default();
+        let prune_modes = config.prune.segments.clone();
 
         let (tip_tx, tip_rx) = watch::channel(B256::ZERO);
         let executor = EthExecutorProvider::ethereum(provider_factory.chain_spec());
@@ -133,7 +136,12 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
         let secret_key = get_secret_key(&network_secret_path)?;
         let network = self
             .network
-            .network_config(config, provider_factory.chain_spec(), secret_key, default_peers_path)
+            .network_config(
+                config,
+                provider_factory.chain_spec(),
+                secret_key,
+                default_peers_path,
+            )
             .with_task_executor(Box::new(task_executor))
             .build(provider_factory)
             .start_network()
@@ -156,7 +164,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
             match get_single_header(&client, BlockHashOrNumber::Number(block)).await {
                 Ok(tip_header) => {
                     info!(target: "reth::cli", ?block, "Successfully fetched block");
-                    return Ok(tip_header.hash())
+                    return Ok(tip_header.hash());
                 }
                 Err(error) => {
                     error!(target: "reth::cli", ?block, %error, "Failed to fetch the block. Retrying...");
@@ -170,15 +178,21 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
         self,
         ctx: CliContext,
     ) -> eyre::Result<()> {
-        let Environment { provider_factory, config, data_dir } =
-            self.env.init::<N>(AccessRights::RW)?;
+        let Environment {
+            provider_factory,
+            config,
+            data_dir,
+        } = self.env.init::<N>(AccessRights::RW)?;
 
-        let consensus: Arc<dyn FullConsensus<N::Primitives, Error = ConsensusError>> =
+        let consensus: Arc<dyn FullConsensus<N::Primitives>> =
             Arc::new(EthBeaconConsensus::new(provider_factory.chain_spec()));
 
         // Configure and build network
-        let network_secret_path =
-            self.network.p2p_secret_key.clone().unwrap_or_else(|| data_dir.p2p_secret());
+        let network_secret_path = self
+            .network
+            .p2p_secret_key
+            .clone()
+            .unwrap_or_else(|| data_dir.p2p_secret());
         let network = self
             .build_network(
                 &config,
@@ -205,11 +219,12 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
 
         let provider = provider_factory.provider()?;
 
-        let latest_block_number =
-            provider.get_stage_checkpoint(StageId::Finish)?.map(|ch| ch.block_number);
+        let latest_block_number = provider
+            .get_stage_checkpoint(StageId::Finish)?
+            .map(|ch| ch.block_number);
         if latest_block_number.unwrap_or_default() >= self.to {
             info!(target: "reth::cli", latest = latest_block_number, "Nothing to run");
-            return Ok(())
+            return Ok(());
         }
 
         ctx.task_executor.spawn_critical(
@@ -217,7 +232,9 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
             reth_node_events::node::handle_events(
                 Some(Box::new(network)),
                 latest_block_number,
-                pipeline.events().map(Into::<NodeEvent<N::Primitives>>::into),
+                pipeline
+                    .events()
+                    .map(Into::<NodeEvent<N::Primitives>>::into),
             ),
         );
 
@@ -225,8 +242,9 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
         while current_max_block < self.to {
             let next_block = current_max_block + 1;
             let target_block = self.to.min(current_max_block + self.interval);
-            let target_block_hash =
-                self.fetch_block_hash(fetch_client.clone(), target_block).await?;
+            let target_block_hash = self
+                .fetch_block_hash(fetch_client.clone(), target_block)
+                .await?;
 
             // Run the pipeline
             info!(target: "reth::cli", from = next_block, to = target_block, tip = ?target_block_hash, "Starting pipeline");
@@ -235,7 +253,9 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
             trace!(target: "reth::cli", from = next_block, to = target_block, tip = ?target_block_hash, ?result, "Pipeline finished");
 
             // Unwind the pipeline without committing.
-            provider_factory.provider_rw()?.unwind_trie_state_range(next_block..=target_block)?;
+            provider_factory
+                .provider_rw()?
+                .unwind_trie_state_range(next_block..=target_block)?;
 
             // Update latest block
             current_max_block = target_block;

@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Collection of traits and types for common storage access.
 
 #![doc(
@@ -79,6 +82,12 @@ mod stats;
 #[cfg(feature = "db-api")]
 pub use stats::*;
 
+pub mod metadata;
+#[cfg(feature = "db-api")]
+pub use metadata::{MetadataProvider, MetadataWriter, StorageSettingsCache};
+#[cfg(feature = "db-api")]
+pub use reth_db_api::models::StorageSettings;
+
 mod primitives;
 pub use primitives::*;
 
@@ -100,3 +109,10 @@ pub use full::*;
 // N42-specific beacon storage traits
 mod beacon;
 pub use beacon::*;
+
+// N42-specific snapshot storage traits
+mod snapshot;
+pub use snapshot::*;
+
+// Helper macros for provider trait implementations
+pub mod macros;

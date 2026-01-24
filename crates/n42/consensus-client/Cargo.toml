@@ -10,6 +10,8 @@ exclude.workspace = true
 
 [dependencies]
 n42-engine-primitives.workspace = true
+merkle_db_rs.workspace=true
+pubsub-mem.workspace=true
 n42-primitives.workspace = true
 n42-clique.workspace = true
 # reth
@@ -55,6 +57,13 @@ alloy-consensus.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 futures-util.workspace = true
+
+# metrics
+reth-metrics = { workspace = true }
+metrics = { workspace = true }
+
+# http
+reqwest.workspace = true
 
 # misc
 hex.workspace = true

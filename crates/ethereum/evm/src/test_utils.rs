@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::EthEvmConfig;
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use alloy_consensus::Header;
@@ -7,7 +10,7 @@ use parking_lot::Mutex;
 use reth_ethereum_primitives::{Receipt, TransactionSigned};
 use reth_evm::{
     block::{
-        BlockExecutionError, BlockExecutor, BlockExecutorFactory, BlockExecutorFor, CommitChanges,
+        BlockExecutionError, BlockExecutor, BlockExecutorFactory, BlockExecutorFor,
         ExecutableTx,
     },
     eth::{EthBlockExecutionCtx, EthEvmContext},
@@ -16,7 +19,7 @@ use reth_evm::{
 use reth_execution_types::{BlockExecutionResult, ExecutionOutcome};
 use reth_primitives_traits::{BlockTy, SealedBlock, SealedHeader};
 use revm::{
-    context::result::{ExecutionResult, HaltReason},
+    context::result::{ExecutionResult, HaltReason, Output, ResultAndState, SuccessReason},
     database::State,
     Inspector,
 };
@@ -87,20 +90,28 @@ impl<'a, DB: Database, I: Inspector<EthEvmContext<&'a mut State<DB>>>> BlockExec
         Ok(())
     }
 
-    fn execute_transaction_with_result_closure(
+    fn execute_transaction_without_commit(
         &mut self,
         _tx: impl ExecutableTx<Self>,
-        _f: impl FnOnce(&ExecutionResult<HaltReason>),
-    ) -> Result<u64, BlockExecutionError> {
-        Ok(0)
+    ) -> Result<ResultAndState<HaltReason>, BlockExecutionError> {
+        Ok(ResultAndState::new(
+            ExecutionResult::Success {
+                reason: SuccessReason::Return,
+                gas_used: 0,
+                gas_refunded: 0,
+                logs: Vec::new(),
+                output: Output::Call(Default::default()),
+            },
+            Default::default(),
+        ))
     }
 
-    fn execute_transaction_with_commit_condition(
+    fn commit_transaction(
         &mut self,
+        _result: ResultAndState<HaltReason>,
         _tx: impl ExecutableTx<Self>,
-        _f: impl FnOnce(&ExecutionResult<HaltReason>) -> CommitChanges,
-    ) -> Result<Option<u64>, BlockExecutionError> {
-        Ok(Some(0))
+    ) -> Result<u64, BlockExecutionError> {
+        Ok(0)
     }
 
     fn finish(
@@ -115,6 +126,7 @@ impl<'a, DB: Database, I: Inspector<EthEvmContext<&'a mut State<DB>>>> BlockExec
                 reqs
             }),
             gas_used: 0,
+            blob_gas_used: 0,
         };
 
         evm.db_mut().bundle_state = bundle;
@@ -133,6 +145,10 @@ impl<'a, DB: Database, I: Inspector<EthEvmContext<&'a mut State<DB>>>> BlockExec
     fn evm_mut(&mut self) -> &mut Self::Evm {
         &mut self.evm
     }
+
+    fn receipts(&self) -> &[Self::Receipt] {
+        &[]
+    }
 }
 
 impl ConfigureEvm for MockEvmConfig {
@@ -150,7 +166,7 @@ impl ConfigureEvm for MockEvmConfig {
         self.inner.block_assembler()
     }
 
-    fn evm_env(&self, header: &Header) -> EvmEnvFor<Self> {
+    fn evm_env(&self, header: &Header) -> Result<EvmEnvFor<Self>, Self::Error> {
         self.inner.evm_env(header)
     }
 
@@ -165,7 +181,7 @@ impl ConfigureEvm for MockEvmConfig {
     fn context_for_block<'a>(
         &self,
         block: &'a SealedBlock<BlockTy<Self::Primitives>>,
-    ) -> reth_evm::ExecutionCtxFor<'a, Self> {
+    ) -> Result<reth_evm::ExecutionCtxFor<'a, Self>, Self::Error> {
         self.inner.context_for_block(block)
     }
 
@@ -173,7 +189,7 @@ impl ConfigureEvm for MockEvmConfig {
         &self,
         parent: &SealedHeader,
         attributes: Self::NextBlockEnvCtx,
-    ) -> reth_evm::ExecutionCtxFor<'_, Self> {
+    ) -> Result<reth_evm::ExecutionCtxFor<'_, Self>, Self::Error> {
         self.inner.context_for_next_block(parent, attributes)
     }
 }

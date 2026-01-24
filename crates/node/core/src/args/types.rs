@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Additional helper types for CLI parsing.
 
 use std::{fmt, num::ParseIntError, str::FromStr};
@@ -126,7 +129,11 @@ where
         arg: Option<&clap::Arg>,
         value: &std::ffi::OsStr,
     ) -> Result<Self::Value, clap::Error> {
-        if value.to_str().map(|s| s.eq_ignore_ascii_case("max")).unwrap_or(false) {
+        if value
+            .to_str()
+            .map(|s| s.eq_ignore_ascii_case("max"))
+            .unwrap_or(false)
+        {
             Ok(u64::MAX)
         } else {
             self.inner.parse_ref(cmd, arg, value).map(Into::into)

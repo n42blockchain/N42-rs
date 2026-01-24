@@ -1,0 +1,33 @@
+[package]
+name = "n42-fusaka"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "N42 Fusaka (Prague + Osaka) hardfork support and tests"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Alloy
+alloy-primitives.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+hex.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "fusaka_benchmarks"
+harness = false
+
+[features]
+default = ["std"]
+std = []
+

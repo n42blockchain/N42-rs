@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use super::{PayloadStatus, PayloadStatusEnum};
 use crate::PayloadId;
 use alloy_primitives::B256;
@@ -34,7 +37,11 @@ impl ForkchoiceState {
     /// Creates a new [ForkchoiceState] with head, safe, and finalized block hashes set to the given
     /// hash.
     pub const fn same_hash(hash: B256) -> Self {
-        Self { head_block_hash: hash, safe_block_hash: hash, finalized_block_hash: hash }
+        Self {
+            head_block_hash: hash,
+            safe_block_hash: hash,
+            finalized_block_hash: hash,
+        }
     }
 
     /// Returns the `head_block_hash`, only if it is not [`B256::ZERO`], otherwise this returns
@@ -68,6 +75,16 @@ impl ForkchoiceState {
         } else {
             Some(self.finalized_block_hash)
         }
+    }
+
+    /// Returns `true` if the given hash is one of the block hashes in this state.
+    ///
+    /// Checks if the hash matches `head_block_hash`, `safe_block_hash`, or `finalized_block_hash`.
+    #[inline]
+    pub fn contains(&self, hash: B256) -> bool {
+        self.head_block_hash == hash ||
+            self.safe_block_hash == hash ||
+            self.finalized_block_hash == hash
     }
 }
 
@@ -132,12 +149,18 @@ pub struct ForkchoiceUpdated {
 impl ForkchoiceUpdated {
     /// Creates a new [ForkchoiceUpdated] with the given [PayloadStatus].
     pub const fn new(payload_status: PayloadStatus) -> Self {
-        Self { payload_status, payload_id: None }
+        Self {
+            payload_status,
+            payload_id: None,
+        }
     }
 
     /// Creates a new [ForkchoiceUpdated] with the given [PayloadStatusEnum].
     pub const fn from_status(status: PayloadStatusEnum) -> Self {
-        Self { payload_status: PayloadStatus::from_status(status), payload_id: None }
+        Self {
+            payload_status: PayloadStatus::from_status(status),
+            payload_id: None,
+        }
     }
 
     /// Sets the latest valid hash of the payload status.

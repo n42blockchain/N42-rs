@@ -197,8 +197,15 @@ where
             INMEMORY_CACHED_READS,
         )));
 
-        let eth_signer: Option<PrivateKeySigner> =
-            signer_private_key.map(|key| key.parse().unwrap());
+        let eth_signer: Option<PrivateKeySigner> = signer_private_key.and_then(|key| {
+            match key.parse() {
+                Ok(signer) => Some(signer),
+                Err(e) => {
+                    error!(target: "consensus::apos", "Failed to parse signer private key: {:?}", e);
+                    None
+                }
+            }
+        });
 
         let eth_signer_address = eth_signer.clone().map(|signer| signer.address());
         info!(target: "consensus::apos", "apos set signer address {:?}", eth_signer_address);
@@ -327,27 +334,36 @@ where
         } else {
             finalized_block_number
         };
-        (start_block_number..=best_block_number).for_each(|block_number| {
+        for block_number in start_block_number..=best_block_number {
             debug!(target: "consensus::apos", ?block_number, "init_recent_tds");
-            let header = self
-                .provider
-                .header_by_number(block_number)
-                .unwrap()
-                .unwrap();
+            let header = match self.provider.header_by_number(block_number) {
+                Ok(Some(h)) => h,
+                Ok(None) => {
+                    warn!(target: "consensus::apos", ?block_number, "header not found during init_recent_tds");
+                    continue;
+                }
+                Err(e) => {
+                    warn!(target: "consensus::apos", ?block_number, ?e, "failed to get header during init_recent_tds");
+                    continue;
+                }
+            };
             if block_number == start_block_number {
                 let start_td = self
                     .provider
                     .header_td_by_number(start_block_number)
                     .unwrap_or(Some(U256::ZERO))
                     .unwrap_or(U256::ZERO);
-                let mut recent_tds = self.recent_tds.write().unwrap();
-                recent_tds.insert(header.hash_slow(), start_td);
-            } else {
-                let mut recent_tds = self.recent_tds.write().unwrap();
-                let parent_td = *recent_tds.get(&header.parent_hash()).unwrap();
-                recent_tds.insert(header.hash_slow(), parent_td + header.difficulty());
+                if let Ok(mut recent_tds) = self.recent_tds.write() {
+                    recent_tds.insert(header.hash_slow(), start_td);
+                }
+            } else if let Ok(mut recent_tds) = self.recent_tds.write() {
+                if let Some(parent_td) = recent_tds.get(&header.parent_hash()).copied() {
+                    recent_tds.insert(header.hash_slow(), parent_td + header.difficulty());
+                } else {
+                    warn!(target: "consensus::apos", parent_hash=?header.parent_hash(), "parent td not found");
+                }
             }
-        });
+        }
 
         self.recent_tds_inited.store(true, Ordering::Relaxed);
     }
@@ -532,8 +548,11 @@ where
         + BlockReaderIdExt
         + Unpin,
 {
-    fn fmt(&self, _f: &mut Formatter<'_>) -> std::fmt::Result {
-        todo!()
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("APos")
+            .field("config", &self.config)
+            .field("signer", &self.signer.read().ok())
+            .finish_non_exhaustive()
     }
 }
 
@@ -860,8 +879,22 @@ where
     }
 
     fn set_eth_signer_by_key(&self, eth_signer_key: Option<String>) -> Result<(), ConsensusError> {
-        let eth_signer = eth_signer_key
-            .map(|key| PrivateKeySigner::from_bytes(&FixedBytes::from_str(&key).unwrap()).unwrap());
+        let eth_signer = match eth_signer_key {
+            Some(key) => {
+                let fixed_bytes = FixedBytes::from_str(&key).map_err(|e| {
+                    ConsensusError::AposErrorDetail {
+                        detail: format!("Invalid signer key format: {}", e),
+                    }
+                })?;
+                let signer = PrivateKeySigner::from_bytes(&fixed_bytes).map_err(|e| {
+                    ConsensusError::AposErrorDetail {
+                        detail: format!("Failed to create signer from key: {}", e),
+                    }
+                })?;
+                Some(signer)
+            }
+            None => None,
+        };
         self.set_signer(eth_signer);
         Ok(())
     }
@@ -1006,7 +1039,18 @@ where
     ChainSpec: EthChainSpec + EthereumHardforks,
 {
     fn set_signer_key(&self, key: Option<String>) -> n42_consensus_traits::AposResult<()> {
-        let eth_signer: Option<PrivateKeySigner> = key.map(|k| k.parse().unwrap());
+        let eth_signer: Option<PrivateKeySigner> = match key {
+            Some(k) => match k.parse() {
+                Ok(signer) => Some(signer),
+                Err(e) => {
+                    error!(target: "consensus::apos", "Failed to parse signer key: {:?}", e);
+                    return Err(n42_consensus_traits::AposError::InvalidSignerKey(
+                        format!("{:?}", e),
+                    ));
+                }
+            },
+            None => None,
+        };
         self.set_signer(eth_signer);
         Ok(())
     }

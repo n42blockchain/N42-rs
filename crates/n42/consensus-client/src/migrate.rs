@@ -119,13 +119,13 @@ where
             None
         };
 
+        let best_number = self.provider.best_block_number()?;
         let header = self
             .provider
-            .sealed_header(self.provider.best_block_number().unwrap())
-            .unwrap()
-            .unwrap();
+            .sealed_header(best_number)?
+            .ok_or_else(|| eyre::eyre!("sealed_header not found for best block {}", best_number))?;
         let mut timestamp = header.timestamp();
-        let mut block_number = self.provider.best_block_number().unwrap();
+        let mut block_number = best_number;
         let mut start = std::time::Instant::now();
         loop {
             if block_number % 100 == 0 {
@@ -173,28 +173,39 @@ where
                 timestamp += 8;
             }
 
+            let current_best = self.provider.best_block_number()?;
             let header = self
                 .provider
-                .sealed_header(self.provider.best_block_number().unwrap())
-                .unwrap()
-                .unwrap();
+                .sealed_header(current_best)?
+                .ok_or_else(|| eyre::eyre!("sealed_header not found for block {}", current_best))?;
 
             let (withdrawals, beacon_state_after_withdrawal) = self.beacon.gen_withdrawals(header.hash())?;
 
             debug!(target: "consensus-client", ?block, "block of input");
             let transactions = block.transactions.into_transactions();
-            let txs = transactions
+            let txs: Vec<EthPooledTransaction> = transactions
                 .into_iter()
-                .map(|rpc_tx: RpcTransaction| {
+                .filter_map(|rpc_tx: RpcTransaction| {
                     debug!(target: "consensus-client", ?rpc_tx);
 
-                    let tx_signed: TransactionSigned = rpc_tx.try_into().unwrap();
+                    let tx_signed: TransactionSigned = match rpc_tx.try_into() {
+                        Ok(tx) => tx,
+                        Err(e) => {
+                            warn!(target: "consensus-client", ?e, "Failed to convert RPC transaction");
+                            return None;
+                        }
+                    };
                     // Calculate encoded length for pool transaction (using EIP-2718 encoding)
                     let encoded_length = tx_signed.encode_2718_len();
-                    let recovered = tx_signed.try_into_recovered().unwrap();
-                    EthPooledTransaction::new(recovered, encoded_length)
+                    match tx_signed.try_into_recovered() {
+                        Ok(recovered) => Some(EthPooledTransaction::new(recovered, encoded_length)),
+                        Err(e) => {
+                            warn!(target: "consensus-client", ?e, "Failed to recover transaction");
+                            None
+                        }
+                    }
                 })
-                .collect::<Vec<_>>();
+                .collect();
 
             let num_input_txs = txs.len();
 
@@ -319,7 +330,7 @@ where
             .chain_spec()
             .is_cancun_active_at_timestamp(block.timestamp())
             .then(|| CancunPayloadFields {
-                parent_beacon_block_root: block.parent_beacon_block_root().unwrap(),
+                parent_beacon_block_root: block.parent_beacon_block_root().unwrap_or_default(),
                 versioned_hashes: block.blob_versioned_hashes_iter().copied().collect(),
             });
 

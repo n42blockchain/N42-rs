@@ -555,14 +555,14 @@ impl BeaconState {
         for index in 0..num_validators {
             let balance = self
                 .balances_store
-                .get(index)
+                .get(index)?
                 .ok_or(eyre::eyre!("BalanceNotfound"))?
                 .min(&spec.max_effective_balance);
             let new_effective_balance =
                 round_to_nearest(*balance, spec.effective_balance_increment);
             let validator = self
                 .validators_store
-                .get(index)
+                .get(index)?
                 .ok_or(eyre::eyre!("ValidatorNotfound"))?;
 
             if new_effective_balance != validator.effective_balance {
@@ -589,7 +589,7 @@ impl BeaconState {
                 .contains(&(validator_index as u64));
             let current_score = self
                 .inactivity_scores_store
-                .get(validator_index)
+                .get(validator_index)?
                 .ok_or(eyre::eyre!("InactivityScoreNotfound"))?;
 
             let new_score = if is_active {
@@ -654,7 +654,7 @@ impl BeaconState {
             */
             let mut validator = self
                 .validators_store
-                .get(index)
+                .get(index)?
                 .ok_or(eyre::eyre!("ValidatorNotfound"))?
                 .clone();
             if validator.is_eligible_for_activation_queue(spec) {
@@ -689,7 +689,7 @@ impl BeaconState {
             //self.get_validator_mut(index)?.activation_epoch = delayed_activation_epoch;
             let mut validator = self
                 .validators_store
-                .get(index)
+                .get(index)?
                 .ok_or(eyre::eyre!("ValidatorNotfound"))?
                 .clone();
             validator.activation_epoch = delayed_activation_epoch;
@@ -1174,7 +1174,7 @@ impl BeaconState {
     /// Safe indexer for the `validators` list.
     pub fn get_validator(&self, validator_index: usize) -> eyre::Result<&Validator> {
         self.validators_store
-            .get(validator_index)
+            .get(validator_index)?
             .ok_or(eyre::eyre!("UnknownValidator, {validator_index}"))
     }
 
@@ -1189,9 +1189,9 @@ impl BeaconState {
 
     pub fn get_balance(&self, validator_index: usize) -> eyre::Result<u64> {
         self.balances_store
-            .get(validator_index)
-            .ok_or(eyre::eyre!("UnknownValidator, {validator_index}"))
+            .get(validator_index)?
             .copied()
+            .ok_or(eyre::eyre!("UnknownValidator, {validator_index}"))
     }
 
     /*
@@ -1205,9 +1205,9 @@ impl BeaconState {
 
     pub fn get_inactivity_score(&self, validator_index: usize) -> eyre::Result<u64> {
         self.inactivity_scores_store
-            .get(validator_index)
-            .ok_or(eyre::eyre!("UnknownValidator, {validator_index}"))
+            .get(validator_index)?
             .copied()
+            .ok_or(eyre::eyre!("UnknownValidator, {validator_index}"))
     }
 
     /*
@@ -1310,7 +1310,7 @@ impl BeaconState {
         */
         let mut validator = self
             .validators_store
-            .get(index)
+            .get(index)?
             .ok_or(eyre::eyre!("ValidatorNotfound"))?
             .clone();
         validator.exit_epoch = exit_queue_epoch;
@@ -1411,7 +1411,7 @@ impl BeaconState {
 
         let validator = self
             .validators_store
-            .get(exit.validator_index as usize)
+            .get(exit.validator_index as usize)?
             .ok_or_else(|| eyre::eyre!("ExitInvalid::ValidatorUnknown({}", exit.validator_index))?;
 
         // Verify the validator is active.
@@ -2041,7 +2041,7 @@ pub fn increase_balance(state: &mut BeaconState, index: usize, delta: u64) -> ey
     //increase_balance_directly(state.get_balance_mut(index)?, delta)
     let balance = state
         .balances_store
-        .get(index)
+        .get(index)?
         .ok_or(eyre::eyre!("BalanceNotfound"))?;
     Ok(state
         .balances_store
@@ -2060,7 +2060,7 @@ pub fn decrease_balance(state: &mut BeaconState, index: usize, delta: u64) -> ey
     //decrease_balance_directly(state.get_balance_mut(index)?, delta)
     let balance = state
         .balances_store
-        .get(index)
+        .get(index)?
         .ok_or(eyre::eyre!("BalanceNotfound"))?;
     Ok(state
         .balances_store

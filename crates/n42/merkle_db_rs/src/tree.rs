@@ -271,9 +271,9 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
         Hash256::from_slice(&hasher.finalize())
     }
 
-    pub fn get(&self, index: usize) -> Option<&T> {
+    pub fn get(&self, index: usize) -> Result<Option<&T>, Error> {
         if index >= self.len() {
-            return None;
+            return Ok(None);
         }
 
         let height = self.height;
@@ -303,49 +303,53 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
                         // We check if `kv` has a Leaf stored at `zero_tree_root(0)`.
                         // `try_new` and `restore` guarantee this Leaf exists if collision is true.
                         if let Some(Tree::Leaf(val)) = self.kv.get(&zero_tree_root(0)) {
-                            return Some(val);
+                            return Ok(Some(val));
                         }
 
                         // If no leaf found there, it's truly empty (non-collision type).
-                        return None;
+                        return Ok(None);
                     }
 
                     // If it's None and NOT a zero root, the tree is corrupted.
-                    panic!(
-                        "Inconsistent tree: missing node for hash {:?} at height {}",
-                        current_hash,
-                        h + 1
-                    );
+                    return Err(Error::InconsistentTreeMissingNode {
+                        height: h + 1,
+                        hash: current_hash,
+                    });
                 }
                 Some(Tree::Leaf(_)) => {
-                    panic!("Inconsistent tree: found Leaf node at height {}", h + 1);
+                    return Err(Error::InconsistentTreeLeafAtNonZeroHeight {
+                        height: h + 1,
+                        hash: current_hash,
+                    });
                 }
             }
         }
 
         match self.kv.get(&current_hash) {
-            Some(Tree::Leaf(value)) => Some(value),
+            Some(Tree::Leaf(value)) => Ok(Some(value)),
             Some(Tree::Zero(0)) => {
                 // Explicit zero node at leaf level -> Empty.
-                None
+                Ok(None)
             }
             None => {
                 if current_hash == zero_tree_root(0) {
                     // Implicit zero leaf.
                     // Check for collision leaf again (handle implicit leaf case)
                     if let Some(Tree::Leaf(val)) = self.kv.get(&zero_tree_root(0)) {
-                        return Some(val);
+                        return Ok(Some(val));
                     }
-                    None
+                    Ok(None)
                 } else {
-                    panic!(
-                        "Inconsistent tree: missing node for leaf hash {:?}",
-                        current_hash
-                    );
+                    Err(Error::InconsistentTreeMissingNode {
+                        height: 0,
+                        hash: current_hash,
+                    })
                 }
             }
             Some(Tree::Node { .. }) | Some(Tree::Zero(_)) => {
-                panic!("Inconsistent tree: found non-Leaf node at height 0");
+                Err(Error::InconsistentTreeNonLeafAtZeroHeight {
+                    hash: current_hash,
+                })
             }
         }
     }
@@ -358,7 +362,7 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
             });
         }
 
-        let _ = self.update_leaf(index, Some(value));
+        self.update_leaf(index, Some(value))?;
         Ok(())
     }
 
@@ -376,19 +380,19 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
 
         // Update the tree *before* incrementing length.
         // `update_leaf` has no bounds check, so this is safe.
-        let _ = self.update_leaf(index, Some(value));
+        self.update_leaf(index, Some(value))?;
 
         // Now, commit the length change
         self.vec_len += 1;
         Ok(())
     }
 
-    pub fn pop(&mut self) -> Option<T>
+    pub fn pop(&mut self) -> Result<Option<T>, Error>
     where
         T: Default + Clone,
     {
         if self.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         self.vec_len -= 1;
@@ -404,12 +408,12 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
         // If Hash(Default) != Hash(Zero) (e.g. complex struct):
         //    We MUST insert Zero(0) (None) to ensure the padding hash is correct.
         let old_value_opt = if default_hash == zero_hash {
-            self.update_leaf(index, Some(default_val))
+            self.update_leaf(index, Some(default_val))?
         } else {
-            self.update_leaf(index, None)
+            self.update_leaf(index, None)?
         };
 
-        Some(old_value_opt.unwrap_or_default())
+        Ok(Some(old_value_opt.unwrap_or_default()))
     }
 
     /// Tries to pop a value from the end of the `VecTree`.
@@ -434,7 +438,7 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
         self.vec_len -= 1;
         let index = self.len();
 
-        let old_value_opt = self.update_leaf(index, None);
+        let old_value_opt = self.update_leaf(index, None)?;
 
         match old_value_opt {
             Some(value) => Ok(Some(value)),
@@ -446,9 +450,9 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
 
     /// Internal function to update a leaf and rebuild the tree path.
     /// This function is the core logic for `set`, `push`, and `pop`.
-    /// It has NO bounds checks and will panic on internal tree corruption.
+    /// It has NO bounds checks and returns an error on internal tree corruption.
     /// It returns the *old* value that was at that leaf.
-    fn update_leaf(&mut self, index: usize, new_value: Option<T>) -> Option<T>
+    fn update_leaf(&mut self, index: usize, new_value: Option<T>) -> Result<Option<T>, Error>
     where
         T: Clone,
     {
@@ -461,14 +465,26 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
                 Some(Tree::Node { left, right }) => (*left, *right),
                 Some(Tree::Zero(h_zero)) => {
                     if *h_zero != h {
-                        panic!("Inconsistent tree height");
+                        return Err(Error::InconsistentTreeZeroHeightMismatch {
+                            expected: h,
+                            found: *h_zero,
+                            hash: current_hash,
+                        });
                     }
                     (zero_tree_root(h - 1), zero_tree_root(h - 1))
                 }
-                Some(Tree::Leaf(_)) => panic!("Found Leaf at height {}", h),
+                Some(Tree::Leaf(_)) => {
+                    return Err(Error::InconsistentTreeLeafAtNonZeroHeight {
+                        height: h,
+                        hash: current_hash,
+                    });
+                }
                 None => {
                     if current_hash != zero_tree_root(h) {
-                        panic!("Missing node");
+                        return Err(Error::InconsistentTreeMissingNode {
+                            height: h,
+                            hash: current_hash,
+                        });
                     }
                     (zero_tree_root(h - 1), zero_tree_root(h - 1))
                 }
@@ -487,7 +503,11 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
         let old_value = match self.kv.get(&current_hash) {
             Some(Tree::Leaf(val)) => Some(val.clone()),
             Some(Tree::Zero(0)) | None => None,
-            _ => panic!("Invalid leaf state"),
+            _ => {
+                return Err(Error::InconsistentTreeNonLeafAtZeroHeight {
+                    hash: current_hash,
+                });
+            }
         };
 
         let mut new_node_hash;
@@ -509,7 +529,10 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
         }
 
         for h in 0..height {
-            let sibling_hash = siblings.pop().unwrap();
+            // siblings has exactly `height` elements, so this cannot fail
+            let sibling_hash = siblings
+                .pop()
+                .expect("siblings vector should have enough elements");
             let (left_hash, right_hash) = if (index >> h) & 1 == 0 {
                 (new_node_hash, sibling_hash)
             } else {
@@ -538,7 +561,7 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
         }
 
         self.root = new_node_hash;
-        old_value
+        Ok(old_value)
     }
 
     pub fn clear(&mut self) {
@@ -570,7 +593,8 @@ pub struct VecTreeIter<'a, T: Value, N: Unsigned> {
     index: usize,
 }
 
-// If there are holes in the leaves, this iterator will return early, on the first Zero value
+// If there are holes in the leaves, this iterator will return early, on the first Zero value.
+// If the tree is corrupted (get() returns an Error), the iterator stops early.
 impl<'a, T: Value, N: Unsigned> Iterator for VecTreeIter<'a, T, N> {
     type Item = &'a T;
 
@@ -579,7 +603,8 @@ impl<'a, T: Value, N: Unsigned> Iterator for VecTreeIter<'a, T, N> {
             return None;
         }
 
-        let item = self.tree.get(self.index)?;
+        // If get() returns an error (corrupted tree), stop iteration
+        let item = self.tree.get(self.index).ok()??;
         self.index += 1;
         Some(item)
     }
@@ -630,17 +655,17 @@ mod tests {
         assert_eq!(tree.root, zero_tree_root(height_n));
 
         // Get from zero tree
-        assert_eq!(tree.get(0), Some(&u64::default()));
+        assert_eq!(tree.get(0), Ok(Some(&u64::default())));
 
         // Set and Get
         tree.set(0, 42u64).unwrap();
-        assert_eq!(tree.get(0), Some(&42u64));
+        assert_eq!(tree.get(0), Ok(Some(&42u64)));
 
         // Root should be leaf hash
         assert_eq!(tree.root, 42u64.tree_hash_root());
 
         // OOB
-        assert_eq!(tree.get(1), None);
+        assert_eq!(tree.get(1), Ok(None));
         assert!(tree.set(1, 99u64).is_err());
     }
 
@@ -679,13 +704,13 @@ mod tests {
         let height_n = tree_height(U16::to_usize()); // tree_height(16) = 4
         assert_eq!(tree.height, height_n);
 
-        assert_eq!(tree.get(0), Some(&u64::default()));
-        assert_eq!(tree.get(5), Some(&u64::default()));
-        assert_eq!(tree.get(9), Some(&u64::default()));
+        assert_eq!(tree.get(0), Ok(Some(&u64::default())));
+        assert_eq!(tree.get(5), Ok(Some(&u64::default())));
+        assert_eq!(tree.get(9), Ok(Some(&u64::default())));
 
         // OOB get should also be None
-        assert_eq!(tree.get(10), None);
-        assert_eq!(tree.get(99), None);
+        assert_eq!(tree.get(10), Ok(None));
+        assert_eq!(tree.get(99), Ok(None));
     }
 
     #[test]
@@ -704,12 +729,12 @@ mod tests {
         assert_ne!(tree.root, zero_root);
 
         // Get back the value
-        assert_eq!(tree.get(3), Some(&100u64));
+        assert_eq!(tree.get(3), Ok(Some(&100u64)));
 
-        assert_eq!(tree.get(0), Some(&u64::default()));
-        assert_eq!(tree.get(2), Some(&u64::default()));
-        assert_eq!(tree.get(4), Some(&u64::default()));
-        assert_eq!(tree.get(7), Some(&u64::default()));
+        assert_eq!(tree.get(0), Ok(Some(&u64::default())));
+        assert_eq!(tree.get(2), Ok(Some(&u64::default())));
+        assert_eq!(tree.get(4), Ok(Some(&u64::default())));
+        assert_eq!(tree.get(7), Ok(Some(&u64::default())));
     }
 
     #[test]
@@ -718,13 +743,13 @@ mod tests {
 
         // Set initial value
         tree.set(5, 100u64).unwrap();
-        assert_eq!(tree.get(5), Some(&100u64));
+        assert_eq!(tree.get(5), Ok(Some(&100u64)));
         let root1 = tree.root;
         let ssz_root1 = tree.ssz_root();
 
         // Set new value at same index
         tree.set(5, 200u64).unwrap();
-        assert_eq!(tree.get(5), Some(&200u64));
+        assert_eq!(tree.get(5), Ok(Some(&200u64)));
         let root2 = tree.root;
         let ssz_root2 = tree.ssz_root();
 
@@ -743,14 +768,14 @@ mod tests {
         tree.set(2, 30u64).unwrap();
 
         // Check all values
-        assert_eq!(tree.get(0), Some(&10u64));
-        assert_eq!(tree.get(1), Some(&u64::default()));
-        assert_eq!(tree.get(2), Some(&30u64));
-        assert_eq!(tree.get(3), Some(&u64::default()));
-        assert_eq!(tree.get(4), Some(&50u64));
+        assert_eq!(tree.get(0), Ok(Some(&10u64)));
+        assert_eq!(tree.get(1), Ok(Some(&u64::default())));
+        assert_eq!(tree.get(2), Ok(Some(&30u64)));
+        assert_eq!(tree.get(3), Ok(Some(&u64::default())));
+        assert_eq!(tree.get(4), Ok(Some(&50u64)));
 
         // Check OOB
-        assert_eq!(tree.get(5), None);
+        assert_eq!(tree.get(5), Ok(None));
     }
 
     #[test]
@@ -808,12 +833,12 @@ mod tests {
 
         tree.push(10u64).unwrap();
         assert_eq!(tree.len(), 1);
-        assert_eq!(tree.get(0), Some(&10u64));
+        assert_eq!(tree.get(0), Ok(Some(&10u64)));
 
         tree.push(20u64).unwrap();
         assert_eq!(tree.len(), 2);
-        assert_eq!(tree.get(0), Some(&10u64));
-        assert_eq!(tree.get(1), Some(&20u64));
+        assert_eq!(tree.get(0), Ok(Some(&10u64)));
+        assert_eq!(tree.get(1), Ok(Some(&20u64)));
     }
 
     #[test]
@@ -846,17 +871,17 @@ mod tests {
         tree.push(20u64).unwrap();
         assert_eq!(tree.len(), 2);
 
-        let popped = tree.pop();
+        let popped = tree.pop().unwrap();
         assert_eq!(popped, Some(20u64));
         assert_eq!(tree.len(), 1);
-        assert_eq!(tree.get(0), Some(&10u64));
-        assert_eq!(tree.get(1), None); // Index 1 is now OOB
+        assert_eq!(tree.get(0), Ok(Some(&10u64)));
+        assert_eq!(tree.get(1), Ok(None)); // Index 1 is now OOB
 
-        let popped2 = tree.pop();
+        let popped2 = tree.pop().unwrap();
         assert_eq!(popped2, Some(10u64));
         assert_eq!(tree.len(), 0);
         assert!(tree.is_empty());
-        assert_eq!(tree.get(0), None); // Index 0 is now OOB
+        assert_eq!(tree.get(0), Ok(None)); // Index 0 is now OOB
     }
 
     #[test]
@@ -864,7 +889,7 @@ mod tests {
         let mut tree = VecTree::<u64, U8>::try_new(0).unwrap();
         assert!(tree.is_empty());
 
-        let popped = tree.pop();
+        let popped = tree.pop().unwrap();
         assert_eq!(popped, None);
         assert!(tree.is_empty());
     }
@@ -876,20 +901,20 @@ mod tests {
         tree.push(10).unwrap(); // len 1
         tree.push(20).unwrap(); // len 2
 
-        let val1 = tree.pop(); // pops 20, len 1
+        let val1 = tree.pop().unwrap(); // pops 20, len 1
         assert_eq!(val1, Some(20));
         assert_eq!(tree.len(), 1);
 
         tree.push(30).unwrap(); // len 2
         assert_eq!(tree.len(), 2);
-        assert_eq!(tree.get(0), Some(&10));
-        assert_eq!(tree.get(1), Some(&30));
+        assert_eq!(tree.get(0), Ok(Some(&10)));
+        assert_eq!(tree.get(1), Ok(Some(&30)));
 
-        let val2 = tree.pop(); // pops 30, len 1
+        let val2 = tree.pop().unwrap(); // pops 30, len 1
         assert_eq!(val2, Some(30));
-        let val3 = tree.pop(); // pops 10, len 0
+        let val3 = tree.pop().unwrap(); // pops 10, len 0
         assert_eq!(val3, Some(10));
-        let val4 = tree.pop(); // pops None, len 0
+        let val4 = tree.pop().unwrap(); // pops None, len 0
         assert_eq!(val4, None);
         assert!(tree.is_empty());
     }
@@ -908,7 +933,7 @@ mod tests {
         assert_eq!(tree.len(), 1);
 
         // Pop the value, root should be restored
-        let val = tree.pop();
+        let val = tree.pop().unwrap();
         assert_eq!(val, Some(12345u64));
         assert_eq!(tree.len(), 0);
         assert_eq!(tree.root, zero_root);
@@ -945,7 +970,7 @@ mod tests {
         tree.push(u64::default()).unwrap(); // This creates a Zero(0) leaf at [1]
         tree.push(30u64).unwrap();
         assert_eq!(tree.len(), 3);
-        assert_eq!(tree.get(1), Some(&u64::default()));
+        assert_eq!(tree.get(1), Ok(Some(&u64::default())));
 
         // Pop 30 (works)
         let res1 = tree.try_pop().unwrap();
@@ -992,7 +1017,7 @@ mod tests {
         assert_eq!(tree.len(), 0);
         assert!(tree.is_empty());
         assert_eq!(tree.root, zero_root); // Root is restored
-        assert_eq!(tree.get(0), None); // All elements are gone
+        assert_eq!(tree.get(0), Ok(None)); // All elements are gone
     }
 
     #[test]
@@ -1033,7 +1058,7 @@ mod tests {
         let restored =
             VecTree::<u64, U8>::restore(tree.root, tree.len() as u64, |h| db.get(h).cloned())
                 .unwrap();
-        assert_eq!(restored.get(0), Some(&0u64));
+        assert_eq!(restored.get(0), Ok(Some(&0u64)));
     }
 
     #[test]
@@ -1063,14 +1088,14 @@ mod tests {
         assert_eq!(restored_tree.root, root);
 
         // Check contents
-        assert_eq!(restored_tree.get(0), Some(&10u64));
-        assert_eq!(restored_tree.get(1), Some(&20u64));
+        assert_eq!(restored_tree.get(0), Ok(Some(&10u64)));
+        assert_eq!(restored_tree.get(1), Ok(Some(&20u64)));
 
         // Crucial check: Since Hash(Default) collides with ZeroHash for u64,
         // restore() logic infers Leaf(Default).
-        assert_eq!(restored_tree.get(2), Some(&0u64));
+        assert_eq!(restored_tree.get(2), Ok(Some(&0u64)));
 
-        assert_eq!(restored_tree.get(3), Some(&40u64));
+        assert_eq!(restored_tree.get(3), Ok(Some(&40u64)));
 
         // Ensure iterators work
         let vals: Vec<u64> = restored_tree.iter().cloned().collect();
@@ -1208,8 +1233,8 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(restored.get(0), Some(&10));
-        assert_eq!(restored.get(2), Some(&300));
+        assert_eq!(restored.get(0), Ok(Some(&10)));
+        assert_eq!(restored.get(2), Ok(Some(&300)));
         assert_eq!(restored.root, tree.root);
     }
 }

@@ -20,5 +20,5 @@
         assert_eq!(tree.len(), 0);
         assert!(tree.is_empty());
         assert_eq!(tree.root, zero_root); // Root is restored
-        assert_eq!(tree.get(0), None); // All elements are gone
+        assert_eq!(tree.get(0), Ok(None)); // All elements are gone
     }

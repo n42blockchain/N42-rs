@@ -11,7 +11,6 @@ use blst::min_pk::PublicKey;
 use blst::min_pk::{AggregateSignature, Signature};
 use eyre::OptionExt;
 use futures_util::{stream::Fuse, StreamExt};
-use itertools::Itertools;
 use n42_clique::{BlockVerifyResult, UnverifiedBlock};
 use n42_engine_primitives::PayloadAttributesBuilderExt;
 use reth_chainspec::EthChainSpec;
@@ -218,8 +217,10 @@ where
         };
         let block_time = mode_interval.period().as_secs();
 
-        let start_timestamp =
-            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+        let start_timestamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("System time is before UNIX epoch")
+            .as_secs();
         let miner = Self {
             provider,
             payload_attributes_builder,
@@ -310,10 +311,13 @@ where
                 if let Ok(all_peers) = self.network.get_all_peers().await {
                     debug!(target: "consensus-client", peers_count=all_peers.len());
                     if !all_peers.is_empty() {
-                        status_counts = all_peers
-                            .iter()
-                            .map(|v| (v.status.total_difficulty.unwrap_or_default(), v.status.blockhash))
-                            .counts();
+                        // Count occurrences of each (total_difficulty, blockhash) pair
+                        let mut counts = HashMap::new();
+                        for peer in &all_peers {
+                            let key = (peer.status.total_difficulty.unwrap_or_default(), peer.status.blockhash);
+                            *counts.entry(key).or_insert(0usize) += 1;
+                        }
+                        status_counts = counts;
                         break;
                     }
                 }
@@ -546,10 +550,12 @@ where
             .unwrap_or(Some(0))
             .unwrap_or(0);
         if safe_block_number == 0 {
-            safe_block_number = self
-                .provider.database_provider_ro().unwrap().last_safe_block_number()
-            .unwrap_or(Some(0))
-            .unwrap_or(0);
+            if let Ok(db_provider) = self.provider.database_provider_ro() {
+                safe_block_number = db_provider
+                    .last_safe_block_number()
+                    .unwrap_or(Some(0))
+                    .unwrap_or(0);
+            }
         }
 
         let safe_block_header = self
@@ -652,11 +658,12 @@ where
     fn get_order_stats(&self) -> (u64, u64, f64) {
         let in_order_count = self.order_stats.values().filter(|v| **v).count();
         let out_of_order_count = self.order_stats.len() - in_order_count;
-        (
-            in_order_count as u64,
-            out_of_order_count as u64,
-            in_order_count as f64 / self.order_stats.len() as f64,
-        )
+        let order_ratio = if self.order_stats.is_empty() {
+            0.0
+        } else {
+            in_order_count as f64 / self.order_stats.len() as f64
+        };
+        (in_order_count as u64, out_of_order_count as u64, order_ratio)
     }
 
     fn handle_verification_result(&mut self, verification_result: BlockVerifyResult) -> eyre::Result<()> {
@@ -718,7 +725,12 @@ where
             },
         }
         attestation.validator_indexes.insert(validator_index);
-        self.pending_block_data.as_mut().map(|v| { *v.attestations.get_mut(&attestation_data.committee_index).unwrap() = attestation.clone(); });
+        let updated_attestation = attestation.clone();
+        if let Some(ref mut pending_data) = self.pending_block_data {
+            if let Some(stored_attestation) = pending_data.attestations.get_mut(&attestation_data.committee_index) {
+                *stored_attestation = updated_attestation;
+            }
+        }
 
         Ok(())
     }
@@ -1035,7 +1047,7 @@ where
             .chain_spec()
             .is_cancun_active_at_timestamp(block.timestamp())
             .then(|| CancunPayloadFields {
-                parent_beacon_block_root: block.parent_beacon_block_root().unwrap(),
+                parent_beacon_block_root: block.parent_beacon_block_root().unwrap_or_default(),
                 versioned_hashes: block.blob_versioned_hashes_iter().copied().collect(),
             });
 

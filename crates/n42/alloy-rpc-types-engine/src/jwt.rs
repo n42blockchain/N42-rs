@@ -262,7 +262,8 @@ impl JwtSecret {
     pub fn random() -> Self {
         let random_bytes: [u8; 32] = rand::thread_rng().gen();
         let secret = hex::encode(random_bytes);
-        Self::from_hex(secret).unwrap()
+        // Safety: hex::encode of 32 bytes always produces a valid 64-char hex string
+        Self::from_hex(secret).expect("hex encoding of 32 bytes is always valid")
     }
 
     /// Encode the header and claims given and sign the payload using the algorithm from the header

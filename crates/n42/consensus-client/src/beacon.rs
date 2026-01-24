@@ -181,3 +181,26 @@ where
 fn parse_execution_requests(requests: &Option<Requests>) -> eyre::Result<ExecutionRequestsV4> {
     Ok(requests.clone().unwrap_or_default().try_into()?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_eips::eip7685::Requests;
+
+    #[test]
+    fn test_parse_execution_requests_none() {
+        let result = parse_execution_requests(&None);
+        assert!(result.is_ok());
+        let requests = result.unwrap();
+        assert!(requests.deposits.is_empty());
+        assert!(requests.withdrawals.is_empty());
+        assert!(requests.consolidations.is_empty());
+    }
+
+    #[test]
+    fn test_parse_execution_requests_empty() {
+        let requests = Some(Requests::default());
+        let result = parse_execution_requests(&requests);
+        assert!(result.is_ok());
+    }
+}

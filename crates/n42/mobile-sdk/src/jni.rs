@@ -286,7 +286,13 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_runClient(
         let result = run_client(&ws_url, &validator_private_key).await;
 
         // Attach thread to JVM to call back into Java
-        let mut env = jvm.attach_current_thread().unwrap();
+        let mut env = match jvm.attach_current_thread() {
+            Ok(env) => env,
+            Err(e) => {
+                eprintln!("Failed to attach thread to JVM: {}", e);
+                return;
+            }
+        };
 
         match result {
             Ok(()) => {
@@ -300,11 +306,29 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_runClient(
             }
 
             Err(e) => {
-                let jmsg = env.new_string(e.to_string()).unwrap();
-                let ex_class = env.find_class("java/lang/RuntimeException").unwrap();
-                let ex_obj = env
-                    .new_object(ex_class, "(Ljava/lang/String;)V", &[(&jmsg).into()])
-                    .unwrap();
+                // Try to create and throw a Java exception
+                let error_msg = e.to_string();
+                let jmsg = match env.new_string(&error_msg) {
+                    Ok(s) => s,
+                    Err(je) => {
+                        eprintln!("Failed to create Java string for error '{}': {}", error_msg, je);
+                        return;
+                    }
+                };
+                let ex_class = match env.find_class("java/lang/RuntimeException") {
+                    Ok(c) => c,
+                    Err(je) => {
+                        eprintln!("Failed to find RuntimeException class: {}", je);
+                        return;
+                    }
+                };
+                let ex_obj = match env.new_object(ex_class, "(Ljava/lang/String;)V", &[(&jmsg).into()]) {
+                    Ok(o) => o,
+                    Err(je) => {
+                        eprintln!("Failed to create RuntimeException: {}", je);
+                        return;
+                    }
+                };
 
                 let _ = env.call_method(
                     &global_cf,

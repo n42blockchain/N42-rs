@@ -43,6 +43,12 @@ pub enum Error {
     PoppedEmptySlot {
         index: u64,
     },
+
+    /// Found a `Tree::Node` or `Tree::Zero(h>0)` at height 0 during traversal.
+    /// At height 0, we should only find `Tree::Leaf` or `Tree::Zero(0)`.
+    InconsistentTreeNonLeafAtZeroHeight {
+        hash: Hash256,
+    },
 }
 
 impl Display for Error {

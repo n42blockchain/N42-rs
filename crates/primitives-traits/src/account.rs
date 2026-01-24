@@ -259,6 +259,7 @@ mod tests {
     use alloy_primitives::{hex_literal::hex, B256, U256};
     use reth_codecs::Compact;
     use revm_bytecode::{JumpTable, LegacyAnalyzedBytecode};
+    use std::sync::Arc;
 
     #[test]
     fn test_account() {
@@ -318,11 +319,11 @@ mod tests {
         assert_eq!(len, 17);
 
         let mut buf = vec![];
-        let bytecode = Bytecode(RevmBytecode::LegacyAnalyzed(LegacyAnalyzedBytecode::new(
+        let bytecode = Bytecode(RevmBytecode::LegacyAnalyzed(Arc::new(LegacyAnalyzedBytecode::new(
             Bytes::from(&hex!("ff00")),
             2,
             JumpTable::from_slice(&[0], 2),
-        )));
+        ))));
         let len = bytecode.to_compact(&mut buf);
         assert_eq!(len, 16);
 

@@ -27,6 +27,10 @@ pub struct VecTree<T: Value, N: Unsigned> {
     kv: HashMap<Hash256, Tree<T>>,
     vec_len: u64,
     height: usize, // The fixed height of the tree based on capacity N
+    /// For collision types (where T::default() hashes to zero_tree_root(0)),
+    /// stores the default value to return when reading uninitialized positions.
+    /// None for non-collision types.
+    default_for_collision: Option<T>,
     _phantom: PhantomData<N>,
 }
 
@@ -42,21 +46,22 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
         let height = tree_height(N::to_usize());
         let root = zero_tree_root(height);
 
-        let mut kv = HashMap::from([(root, Tree::Zero(height))]);
+        let kv = HashMap::from([(root, Tree::Zero(height))]);
 
-        // SSZ Compatibility: If T::default() collides with Zero(0), we must ensure
-        // the Leaf(Default) node exists in the map.
-        // This allows `get` to return a reference to it when traversing implicit zero branches.
+        // SSZ Collision Handling: Store default separately for collision types
         let default_val = T::default();
-        if default_val.tree_hash_root() == zero_tree_root(0) {
-            kv.insert(zero_tree_root(0), Tree::Leaf(default_val));
-        }
+        let default_for_collision = if default_val.tree_hash_root() == zero_tree_root(0) {
+            Some(default_val)
+        } else {
+            None
+        };
 
         Ok(Self {
             root,
             kv,
             vec_len,
             height,
+            default_for_collision,
             _phantom: PhantomData,
         })
     }
@@ -87,14 +92,8 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
                 let root = zero_tree_root(height);
 
                 if height == 0 {
-                    // Special Handling for Height 0 (The Leaf Level)
-                    // We check for collision just like in `try_new`.
-                    let default_val = T::default();
-                    if default_val.tree_hash_root() == root {
-                        kv.insert(root, Tree::Leaf(default_val));
-                    } else {
-                        kv.insert(root, Tree::Zero(0));
-                    }
+                    // Leaf level - store Zero node for empty positions
+                    kv.insert(root, Tree::Zero(0));
                 } else {
                     // Internal nodes that are empty are stored as Zero subtrees
                     kv.insert(root, Tree::Zero(height));
@@ -134,11 +133,20 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
 
         let root = build_recursive(&elements, height, &mut kv);
 
+        // SSZ Collision Handling: Store default separately for collision types
+        let default_val = T::default();
+        let default_for_collision = if default_val.tree_hash_root() == zero_tree_root(0) {
+            Some(default_val)
+        } else {
+            None
+        };
+
         Ok(Self {
             root,
             kv,
             vec_len,
             height,
+            default_for_collision,
             _phantom: PhantomData,
         })
     }
@@ -177,22 +185,10 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
         let mut kv = HashMap::new();
         let mut stack = vec![(root, height)];
 
-        // Pre-insert Leaf(Default) if collision happens.
-        let default_val = T::default();
-        if default_val.tree_hash_root() == zero_tree_root(0) {
-            kv.insert(zero_tree_root(0), Tree::Leaf(default_val.clone()));
-        }
-
         while let Some((current_hash, current_height)) = stack.pop() {
-            // Optimization: If hash matches zero root, we usually don't need to check DB/Map
-            // UNLESS it's a collision case at height 0.
+            // Optimization: If hash matches zero root, store Zero node directly
             if current_hash == zero_tree_root(current_height) {
-                if current_height == 0 && default_val.tree_hash_root() == zero_tree_root(0) {
-                    // Collision: ensure Leaf(Default) is present (pre-inserted above).
-                    kv.insert(current_hash, Tree::Leaf(T::default()));
-                } else {
-                    kv.insert(current_hash, Tree::Zero(current_height));
-                }
+                kv.insert(current_hash, Tree::Zero(current_height));
                 continue;
             }
 
@@ -212,11 +208,7 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
                         None => {
                             // Node not in DB - check if it's an implicit zero node
                             if current_hash == zero_tree_root(current_height) {
-                                if current_height == 0 && default_val.tree_hash_root() == zero_tree_root(0) {
-                                    Tree::Leaf(T::default())
-                                } else {
-                                    Tree::Zero(current_height)
-                                }
+                                Tree::Zero(current_height)
                             } else {
                                 return Err(Error::InconsistentTreeMissingNode {
                                     height: current_height,
@@ -260,11 +252,20 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
             kv.insert(current_hash, node);
         }
 
+        // SSZ Collision Handling: Store default separately for collision types
+        let default_val = T::default();
+        let default_for_collision = if default_val.tree_hash_root() == zero_tree_root(0) {
+            Some(default_val)
+        } else {
+            None
+        };
+
         Ok(Self {
             root,
             kv,
             vec_len,
             height,
+            default_for_collision,
             _phantom: PhantomData,
         })
     }
@@ -374,15 +375,8 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
                     };
 
                     if is_zero_node {
-                        // Collision Handling: For collision types (where T::default() hashes to zero_tree_root(0)),
-                        // implicit zero branches logically contain default values per SSZ semantics.
-                        // Check if a collision leaf exists in the map and return it.
-                        if let Some(Tree::Leaf(val)) = self.kv.get(&zero_tree_root(0)) {
-                            return Some(val);
-                        }
-
-                        // No collision leaf found - this is a truly empty slot (non-collision type).
-                        return None;
+                        // Collision Handling: Return default for collision types, None otherwise
+                        return self.default_for_collision.as_ref();
                     }
 
                     // If it's None and NOT a zero root, the tree is corrupted.
@@ -396,21 +390,16 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
 
         match self.kv.get(&current_hash) {
             Some(Tree::Leaf(value)) => Some(value),
-            Some(Tree::Zero(0)) => {
-                // Explicit zero node at leaf level -> Empty.
-                None
-            }
-            None => {
+            Some(Tree::Zero(0)) | None => {
+                // Zero node or implicit zero at leaf level
                 if current_hash == zero_tree_root(0) {
-                    // Implicit zero leaf.
-                    // Check for collision leaf again (handle implicit leaf case)
-                    if let Some(Tree::Leaf(val)) = self.kv.get(&zero_tree_root(0)) {
-                        return Some(val);
-                    }
-                    None
-                } else {
+                    // Return collision default if it exists, None otherwise
+                    return self.default_for_collision.as_ref();
+                }
+                if let None = self.kv.get(&current_hash) {
                     panic!("Inconsistent tree: missing node for leaf hash {:?}", current_hash);
                 }
+                None
             }
             Some(Tree::Node { .. }) | Some(Tree::Zero(_)) => {
                 panic!("Inconsistent tree: found non-Leaf node at height 0");
@@ -466,10 +455,6 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
                 vec_len: new_len as u64,
                 limit: N::to_u64(),
             });
-        }
-        let default_val = T::default();
-        if default_val.tree_hash_root() == zero_tree_root(0) {
-            self.kv.insert(zero_tree_root(0), Tree::Leaf(default_val));
         }
 
         // Insert leaves, collect hashes in order
@@ -638,12 +623,6 @@ pub fn update_indices<F>(&mut self, indices: &HashSet<usize>, mut f: F) -> Resul
     /// positions (holes) as containing `T::default()` values. This is SSZ-compatible
     /// behavior where vectors are conceptually "filled" with defaults up to their capacity.
     ///
-    /// # Collision Handling
-    ///
-    /// For types where `T::default().tree_hash_root() == zero_tree_root(0)` (e.g., `u64`),
-    /// this method preserves the internal collision leaf (`Tree::Leaf(T::default())`) to
-    /// maintain correct behavior for other uninitialized positions in the tree.
-    ///
     /// # Returns
     ///
     /// * `Some(value)` - The value at the last position (or `T::default()` if it was a hole)
@@ -680,18 +659,7 @@ pub fn update_indices<F>(&mut self, indices: &HashSet<usize>, mut f: F) -> Resul
         self.vec_len -= 1;
         let index = self.len();
 
-        let default_val = T::default();
-        let default_hash = default_val.tree_hash_root();
-        let zero_hash = zero_tree_root(0);
-
-        // Collision-aware restoration: For collision types (hash(default) == hash(empty)),
-        // store Leaf(default) to maintain the shared collision leaf for other uninitialized positions.
-        // For non-collision types, store Zero(0) to represent the empty slot.
-        let old_value_opt = if default_hash == zero_hash {
-             self.update_leaf(index, Some(default_val))
-        } else {
-             self.update_leaf(index, None)
-        };
+        let old_value_opt = self.update_leaf(index, None);
 
         Some(old_value_opt.unwrap_or_default())
     }
@@ -706,12 +674,6 @@ pub fn update_indices<F>(&mut self, indices: &HashSet<usize>, mut f: F) -> Resul
     ///
     /// - **`pop()`**: Treats holes as `T::default()`, always succeeds (requires `T: Default`)
     /// - **`try_pop()`**: Fails on holes with `PoppedEmptySlot` error (no `T: Default` needed)
-    ///
-    /// # Collision Safety
-    ///
-    /// This method is safe to use with types that don't implement `Default`. Types without
-    /// `Default` cannot be collision types (where `hash(default) == hash(empty)`), so this
-    /// method safely uses `Tree::Zero(0)` for the popped position without corrupting the tree.
     ///
     /// # Returns
     ///
@@ -807,12 +769,17 @@ pub fn update_indices<F>(&mut self, indices: &HashSet<usize>, mut f: F) -> Resul
             new_node_hash = value.tree_hash_root();
             self.kv.insert(new_node_hash, Tree::Leaf(value.clone()));
         } else {
-            // Restore to empty state - store Zero(0) node
-            // Note: The caller (pop/try_pop) is responsible for collision handling.
-            // For collision types, pop() passes Some(default), not None.
-            // For non-collision types, None is safe to use here.
+            // Restore to empty state
             new_node_hash = zero_tree_root(0);
-            self.kv.insert(new_node_hash, Tree::Zero(0));
+
+            // Collision handling: Preserve default value for collision types
+            // For collision types, store Tree::Leaf(default) so get() returns the default
+            // For non-collision types, store Tree::Zero(0) so get() returns None
+            if let Some(ref default_val) = self.default_for_collision {
+                self.kv.insert(new_node_hash, Tree::Leaf(default_val.clone()));
+            } else {
+                self.kv.insert(new_node_hash, Tree::Zero(0));
+            }
         }
 
         for h in 0..height {
@@ -886,19 +853,10 @@ pub fn update_indices<F>(&mut self, indices: &HashSet<usize>, mut f: F) -> Resul
             }
         }
 
-        // 2. SSZ Collision Protection (Matching try_new logic)
-        // Even if not strictly reachable from the current root, we must keep
-        // the Default leaf if its hash collides with the zero-tree root at height 0.
-        let default_val = T::default();
-        let default_root = default_val.tree_hash_root();
-        if default_root == zero_tree_root(0) {
-            reachable.insert(default_root);
-        }
-
-        // 3. Retain only reachable or protected nodes
+        // 2. Retain only reachable nodes
         self.kv.retain(|hash, _| reachable.contains(hash));
 
-        // 4. Return the count of removed items
+        // 3. Return the count of removed items
         initial_size - self.kv.len()
     }
 }
@@ -1277,10 +1235,10 @@ mod tests {
 
     #[test]
     fn test_try_pop_on_zero_slot() {
-        // Create a tree with len=3, but push a default value at [1]
+        // Create a tree with len=3, explicitly pushing default value at [1]
         let mut tree = VecTree::<u64, U8>::try_new(0).unwrap();
         tree.push(10u64).unwrap();
-        tree.push(u64::default()).unwrap(); // This creates a Zero(0) leaf at [1]
+        tree.push(u64::default()).unwrap(); // This stores Tree::Leaf(0), not a hole
         tree.push(30u64).unwrap();
         assert_eq!(tree.len(), 3);
         assert_eq!(tree.get(1), Some(&u64::default()));
@@ -1290,16 +1248,10 @@ mod tests {
         assert_eq!(res1, Some(30u64));
         assert_eq!(tree.len(), 2);
 
-        // Pop default() at [1] (this is the "Zero situation")
-        let res2 = tree.try_pop();
-        assert!(res2.is_err());
-        match res2.err().unwrap() {
-            Error::PoppedEmptySlot { index } => {
-                assert_eq!(index, 1);
-            }
-            _ => panic!("Wrong error type"),
-        }
-        assert_eq!(tree.len(), 1); // Length still decremented
+        // Pop default() at [1] - explicitly pushed value should succeed
+        let res2 = tree.try_pop().unwrap();
+        assert_eq!(res2, Some(u64::default()));
+        assert_eq!(tree.len(), 1);
 
         // Pop 10 (works)
         let res3 = tree.try_pop().unwrap();
@@ -1664,11 +1616,11 @@ fn test_prune_after_set_updates() {
 
         assert!(tree.kv.contains_key(&tree.root), "Root must remain");
 
-        // If u64::default() (0) hashes to the same value as an implicit zero leaf,
-        // the Leaf(0) entry must be preserved if it is part of the reachable path.
+        // For collision types, verify that default_for_collision is preserved
         let zero_leaf_hash = zero_tree_root(0);
         if 0u64.tree_hash_root() == zero_leaf_hash {
-            assert!(tree.kv.contains_key(&zero_leaf_hash), "Default leaf should be preserved");
+            assert_eq!(tree.default_for_collision, Some(0u64),
+                "Collision default should be preserved after prune");
         }
     }
 
@@ -1966,10 +1918,9 @@ fn test_prune_after_set_updates() {
                 "Collision type should return default for uninitialized position {}", i);
         }
 
-        // Verify the collision leaf exists in kv store
-        let zero_hash = zero_tree_root(0);
-        assert!(matches!(tree.kv.get(&zero_hash), Some(Tree::Leaf(v)) if *v == 0),
-            "Collision leaf must exist for implicit zero reads");
+        // Verify the collision default is set
+        assert_eq!(tree.default_for_collision, Some(0u64),
+            "Collision default must be set for implicit zero reads");
     }
 
     #[test]
@@ -1992,10 +1943,9 @@ fn test_prune_after_set_updates() {
         assert_eq!(tree.pop(), Some(0u64));
         assert_eq!(tree.len(), 0);
 
-        // Verify collision leaf still exists after all pops
-        let zero_hash = zero_tree_root(0);
-        assert!(tree.kv.contains_key(&zero_hash),
-            "Collision leaf must survive pop operations");
+        // Verify collision default still exists after all pops
+        assert_eq!(tree.default_for_collision, Some(0u64),
+            "Collision default must survive pop operations");
     }
 
     #[test]
@@ -2042,10 +1992,9 @@ fn test_prune_after_set_updates() {
             |hash| db.get(hash).cloned()
         ).unwrap();
 
-        // Verify collision leaf exists
-        let zero_hash = zero_tree_root(0);
-        assert!(matches!(restored.kv.get(&zero_hash), Some(Tree::Leaf(v)) if *v == 0),
-            "Restored tree must have collision leaf");
+        // Verify collision default is set
+        assert_eq!(restored.default_for_collision, Some(0u64),
+            "Restored tree must have collision default set");
 
         // Verify we can read implicit zeros
         assert_eq!(restored.get(0), Some(&0u64));
@@ -2104,9 +2053,8 @@ fn test_prune_after_set_updates() {
         // Pop back
         assert_eq!(tree.pop(), Some(77u64));
 
-        // Verify collision leaf still intact
-        let zero_hash = zero_tree_root(0);
-        assert!(matches!(tree.kv.get(&zero_hash), Some(Tree::Leaf(v)) if *v == 0));
+        // Verify collision default still intact
+        assert_eq!(tree.default_for_collision, Some(0u64));
     }
 
     #[test]
@@ -2123,10 +2071,9 @@ fn test_prune_after_set_updates() {
 
         tree.prune();
 
-        // Collision leaf must still exist
-        let zero_hash = zero_tree_root(0);
-        assert!(tree.kv.contains_key(&zero_hash),
-            "Prune must not remove collision leaf");
+        // Collision default must still be set
+        assert_eq!(tree.default_for_collision, Some(0u64),
+            "Collision default must be preserved");
 
         // Should still be able to read defaults
         assert_eq!(tree.get(0), Some(&0u64));
@@ -2143,9 +2090,8 @@ fn test_prune_after_set_updates() {
         // The root IS the leaf for height 0
         assert_eq!(tree.height, 0);
 
-        // Should still have collision leaf
-        let zero_hash = zero_tree_root(0);
-        assert!(tree.kv.contains_key(&zero_hash));
+        // Should have collision default set
+        assert_eq!(tree.default_for_collision, Some(0u64));
 
         // Get should work
         assert_eq!(tree.get(0), Some(&0u64));
@@ -2266,9 +2212,8 @@ fn test_prune_after_set_updates() {
         assert_eq!(tree.pop(), Some(0u64));
         assert_eq!(tree.len(), 0);
 
-        // Verify collision leaf still exists
-        let zero_hash = zero_tree_root(0);
-        assert!(tree.kv.contains_key(&zero_hash));
+        // Verify collision default still exists
+        assert_eq!(tree.default_for_collision, Some(0u64));
     }
 
     #[test]
@@ -2301,9 +2246,8 @@ fn test_prune_after_set_updates() {
         assert_eq!(tree.get(3), Some(&0u64));
         assert_eq!(tree.get(4), Some(&30u64));
 
-        // Verify collision leaf exists
-        let zero_hash = zero_tree_root(0);
-        assert!(matches!(tree.kv.get(&zero_hash), Some(Tree::Leaf(v)) if *v == 0));
+        // Verify collision default is set
+        assert_eq!(tree.default_for_collision, Some(0u64));
 
         // Reading beyond length returns None (bounds check)
         assert_eq!(tree.len(), 5);

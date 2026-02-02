@@ -34,6 +34,9 @@ pub const SLOTS_PER_EPOCH: u64 = 32;
 
 pub const DOMAIN_CONSTANT_BEACON_ATTESTER: u32 = 1;
 
+pub use typenum::Unsigned;
+pub type MaxNumValidators = U100000;
+
 // EthSpec
 pub const max_withdrawals_per_payload: usize = 16;
 pub const pending_partial_withdrawals_limit: usize = 16; // ?
@@ -192,7 +195,7 @@ pub struct BeaconState {
     #[serde(skip_serializing, skip_deserializing)]
     #[ssz(skip_serializing, skip_deserializing)]
     #[derivative(Debug="ignore")]
-    pub validators_store: VecTree<Validator, U100000>,
+    pub validators_store: VecTree<Validator, MaxNumValidators>,
 
     //pub balances: Vec<Gwei>,
     pub balances: Hash256,
@@ -201,7 +204,7 @@ pub struct BeaconState {
     #[serde(skip_serializing, skip_deserializing)]
     #[ssz(skip_serializing, skip_deserializing)]
     #[derivative(Debug="ignore")]
-    pub balances_store: VecTree<Gwei, U100000>,
+    pub balances_store: VecTree<Gwei, MaxNumValidators>,
 
     //pub inactivity_scores: Vec<u64>,
     pub inactivity_scores: Hash256,
@@ -210,7 +213,7 @@ pub struct BeaconState {
     #[serde(skip_serializing, skip_deserializing)]
     #[ssz(skip_serializing, skip_deserializing)]
     #[derivative(Debug="ignore")]
-    pub inactivity_scores_store: VecTree<u64, U100000>,
+    pub inactivity_scores_store: VecTree<u64, MaxNumValidators>,
 
     pub randao_mix: B256,
 
@@ -232,7 +235,7 @@ pub struct BeaconState {
     #[serde(skip_serializing, skip_deserializing)]
     #[ssz(skip_serializing, skip_deserializing)]
     #[derivative(Debug="ignore")]
-    pub epoch_attester_indexes_store: VecTree<u64, U100000>,
+    pub epoch_attester_indexes_store: VecTree<u64, MaxNumValidators>,
 
     #[serde(skip_serializing, skip_deserializing)]
     #[ssz(skip_serializing, skip_deserializing)]

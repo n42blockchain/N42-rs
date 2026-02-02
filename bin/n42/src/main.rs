@@ -8,6 +8,7 @@ use alloy_signer_local::PrivateKeySigner;
 use consensus_client::miner::N42Miner;
 use consensus_client::migrate::N42Migrate;
 use n42_clique::UnverifiedBlock;
+use n42_primitives::{MaxNumValidators, Unsigned};
 use n42_engine_primitives::N42PayloadAttributesBuilder;
 use clap::Parser;
 use n42::{args::RessArgs, cli::Cli, ress::install_ress_subprotocol};
@@ -30,15 +31,15 @@ fn main() {
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
     }
 
-    let (verification_tx, verification_rx) = mpsc::channel(100);
-    let (rpc_to_beacon_command_tx, rpc_to_beacon_command_rx) = mpsc::channel(100);
+    let (verification_tx, verification_rx) = mpsc::channel(MaxNumValidators::USIZE);
+    let (rpc_to_beacon_command_tx, rpc_to_beacon_command_rx) = mpsc::channel(MaxNumValidators::USIZE);
 
     if let Err(err) =
         Cli::<EthereumChainSpecParser, RessArgs>::parse().run(async move |builder, ress_args| {
             info!(target: "reth::cli", "Launching node");
 
             // Create router control channel
-            let (router_tx, router_rx) = mpsc::channel::<RouterMsg<UnverifiedBlock>>(128);
+            let (router_tx, router_rx) = mpsc::channel::<RouterMsg<UnverifiedBlock>>(MaxNumValidators::USIZE);
             let router_tx_clone = router_tx.clone();
             let router_tx_clone_for_miner = router_tx.clone();
 

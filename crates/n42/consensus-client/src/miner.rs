@@ -702,11 +702,6 @@ where
 
         debug!(target: "consensus-client", "sig verify start:");
         let bytes: Vec<u8> = serde_json::to_vec(&attestation_data)?;
-        let err = tokio::task::spawn_blocking(move || signature.verify(true, &bytes, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[], &pubkey, true)).await?;
-        if err != blst::BLST_ERROR::BLST_SUCCESS {
-            return Err(eyre::eyre!("{err:?}"));
-        }
-        debug!(target: "consensus-client", "sig verify result: {:?}", err);
 
         match attestation.block_aggregate_signature {
             Some(ref mut v) => {

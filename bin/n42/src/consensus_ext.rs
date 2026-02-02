@@ -1,3 +1,5 @@
+use blst::min_pk::{AggregateSignature, Signature};
+use blst::min_pk::PublicKey;
 use alloy_rpc_types::{BlockId, BlockNumberOrTag};
 use consensus_client::beacon::{Envelope, GetTotalActiveBalance, GetValidatorInfo, RpcToBeaconCommand};
 use n42_clique::{BlockVerifyResult, UnverifiedBlock};
@@ -98,7 +100,7 @@ pub trait ConsensusBeaconExtApi {
     fn subscribe_to_verification_request(&self, pubkey: BLSPubkey) -> SubscriptionResult;
 
     #[method(name = "submitVerification")]
-    fn submit_verification(&self, pubkey: String,
+    async fn submit_verification(&self, pubkey: String,
         signature: String, attestation_data: AttestationData, block_hash: B256,
         ) -> RpcResult<()>;
 
@@ -194,11 +196,26 @@ where
         Ok(())
     }
 
-    fn submit_verification(&self, pubkey: String,
+    async fn submit_verification(&self, pubkey: String,
         signature: String, attestation_data: AttestationData, block_hash: B256,
         ) -> RpcResult<()> {
         debug!(target: "reth::cli", ?pubkey, "received verification from rpc, slot={:?}", attestation_data.slot);
-        let v = BlockVerifyResult {pubkey, signature, attestation_data, block_hash};
+
+        let v = BlockVerifyResult {pubkey: pubkey.clone(), signature: signature.clone(), attestation_data: attestation_data.clone(), block_hash};
+        let signature = Signature::from_bytes(&hex::decode(signature)
+.map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))?)
+.map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))?;
+        let bytes: Vec<u8> = serde_json::to_vec(&attestation_data)
+.map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))?;
+        let pubkey_bytes = hex::decode(pubkey)
+.map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))?;
+        let pubkey = PublicKey::from_bytes(&pubkey_bytes)
+.map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))?;
+        let err = tokio::task::spawn_blocking(move || signature.verify(true, &bytes, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[], &pubkey, true)).await
+.map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))?;
+        if err != blst::BLST_ERROR::BLST_SUCCESS {
+            return Err(ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{err:?}"), None::<()>));
+        }
         self.verification_tx.try_send(v).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))
     }
 

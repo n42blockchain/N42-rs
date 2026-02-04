@@ -764,6 +764,7 @@ impl<N: ProviderNodeTypes> BeaconProvider for BlockchainProvider<N> {
             self.metrics.num_get_tree_by_hash_for_validator_in_getting_a_beacon_state.increment(1);
             self.get_tree_by_hash_for_validator(&tree_hash).unwrap_or(None)
         }).map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+        beacon_state.validators_pubkey_to_index = validators_store.iter().enumerate().map(|(i, validator)| (validator.pubkey, i)).collect();
         beacon_state.validators_store = validators_store;
 
         let inactivity_scores_store = VecTree::restore(beacon_state.inactivity_scores, beacon_state.inactivity_scores_len, |tree_hash| {

@@ -197,6 +197,11 @@ pub struct BeaconState {
     #[derivative(Debug="ignore")]
     pub validators_store: VecTree<Validator, MaxNumValidators>,
 
+    #[serde(skip_serializing, skip_deserializing)]
+    #[ssz(skip_serializing, skip_deserializing)]
+    #[derivative(Debug="ignore")]
+    pub validators_pubkey_to_index: HashMap<BLSPubkey, usize>,
+
     //pub balances: Vec<Gwei>,
     pub balances: Hash256,
     pub balances_len: u64,
@@ -1048,7 +1053,7 @@ impl BeaconState {
     }
 
     pub fn get_validator_index_from_pubkey(&self, pubkey: &BLSPubkey) -> Option<usize> {
-        self.validators_store.iter().position(|validator| validator.pubkey == *pubkey)
+        self.validators_pubkey_to_index.get(pubkey).cloned()
     }
 
     /// Return the effective balance for a validator with the given `validator_index`.
@@ -1406,7 +1411,7 @@ impl BeaconState {
         let index = self.validators_store.len();
         //let fork_name = self.fork_name_unchecked();
         self.validators_store.push(Validator::from_deposit(
-            pubkey,
+            pubkey.clone(),
             withdrawal_credentials,
             amount,
             //fork_name,
@@ -1414,6 +1419,7 @@ impl BeaconState {
         ))?;
         self.balances_store.push(amount)?;
         self.inactivity_scores_store.push(0)?;
+        self.validators_pubkey_to_index.insert(pubkey, index);
 
         // Altair or later initializations.
         /*

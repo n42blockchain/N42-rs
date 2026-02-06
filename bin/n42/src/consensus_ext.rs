@@ -179,7 +179,7 @@ where
                 let subscription_id = sink.subscription_id();
                 while let Some(event) = rx.recv().await {
                     let data_to_be_verified = event.payload;
-                    debug!(target: "reth::cli", ?pubkey, "start broadcasting, block number {:?}", data_to_be_verified.blockbody.header().number());
+                    trace!(target: "reth::cli", ?pubkey, "start broadcasting, block number {:?}", data_to_be_verified.blockbody.header().number());
                     if sink.is_closed() {
                         debug!(target: "reth::cli", ?subscription_id, "subscribe_to_verification_request client disconnected");
                         break;
@@ -189,7 +189,7 @@ where
                         debug!(target: "reth::cli", ?subscription_id, ?e, "subscribe_to_verification_request Error sending to client");
                         break;
                     }
-                    debug!(target: "reth::cli", ?pubkey, "finish broadcasting, block number {:?}", data_to_be_verified.blockbody.header().number());
+                    trace!(target: "reth::cli", ?pubkey, "finish broadcasting, block number {:?}", data_to_be_verified.blockbody.header().number());
                 }
             }
         });
@@ -199,7 +199,7 @@ where
     async fn submit_verification(&self, pubkey: String,
         signature: String, attestation_data: AttestationData, block_hash: B256,
         ) -> RpcResult<()> {
-        debug!(target: "reth::cli", ?pubkey, "received verification from rpc, slot={:?}", attestation_data.slot);
+        trace!(target: "reth::cli", ?pubkey, "received verification from rpc, slot={:?}", attestation_data.slot);
 
         let v = BlockVerifyResult {pubkey: pubkey.clone(), signature: signature.clone(), attestation_data: attestation_data.clone(), block_hash};
         let signature = Signature::from_bytes(&hex::decode(signature)

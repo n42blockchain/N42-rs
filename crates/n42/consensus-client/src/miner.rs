@@ -266,7 +266,7 @@ where
                     }
                 }
                 Some(verification_result) = self.block_verify_result_rx.recv() => {
-                    debug!(target: "consensus-client", ?verification_result, "verification_rx");
+                    trace!(target: "consensus-client", ?verification_result, "verification_rx");
                     if let Err(e) = self.handle_verification_result(verification_result).await {
                         warn!(target: "consensus-client", "Error handling verification_result: {:?}", e);
                     }
@@ -657,12 +657,11 @@ where
 
     #[instrument(
         level = Level::DEBUG,
-        ret,
         skip_all,
         fields(pubkey = verification_result.pubkey),
         )]
     async fn handle_verification_result(&mut self, verification_result: BlockVerifyResult) -> eyre::Result<()> {
-        debug!(target: "consensus-client", ?verification_result, "handle_verification_result start");
+        trace!(target: "consensus-client", ?verification_result, "handle_verification_result start");
         self.metrics.num_verification_submission.increment(1);
         let pending_block_data = self.pending_block_data.as_mut().ok_or_eyre("no pending block data")?;
         let block = &pending_block_data.block;
@@ -700,7 +699,7 @@ where
             return Err(eyre::eyre!("mismatch receipts_root, expected={:?}, got={:?}", attestation.data.receipts_root, attestation_data.receipts_root));
         }
 
-        debug!(target: "consensus-client", "sig verify start:");
+        trace!(target: "consensus-client", "sig verify start:");
         let bytes: Vec<u8> = serde_json::to_vec(&attestation_data)?;
 
         match attestation.block_aggregate_signature {

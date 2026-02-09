@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::time::Instant;
 use hex::FromHex;
 use tree_hash_derive::TreeHash;
@@ -245,7 +246,7 @@ pub struct BeaconState {
     #[serde(skip_serializing, skip_deserializing)]
     #[ssz(skip_serializing, skip_deserializing)]
     #[derivative(Debug="ignore")]
-    pub epoch_attester_indexes_set: BTreeSet<u64>,
+    pub epoch_attester_indexes_set: HashSet<u64>,
 }
 
 #[derive(Debug, Clone, Hash, Default, PartialEq, Serialize, Deserialize)]

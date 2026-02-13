@@ -57,7 +57,6 @@ use tracing::{trace, debug, error, info, warn, instrument, Level};
 use crate::beacon::{Beacon, RpcToBeaconCommand};
 use crate::metrics::MinerMetrics;
 use n42_primitives::{RelativeEpoch, Attestation, BeaconState, BeaconBlock, Deposit, VoluntaryExitWithSig, parse_deposit_log, BLSPubkey, BlockVerifyResultAggregate, agg_sig_to_fixed, fixed_to_agg_sig, SLOTS_PER_EPOCH, CommitteeIndex, AttestationData, beacon_chain_spec, epoch_to_block_number, ValidatorInfo};
-use n42_primitives::CommitteeCache;
 use crate::network::{fetch_beacon_block, broadcast_beacon_block};
 use pubsub_mem::{RouterMsg, Event, publish};
 
@@ -140,7 +139,6 @@ pub struct N42Miner<T: PayloadTypes, Provider, B, Network> {
     rpc_to_beacon_command_rx: mpsc::Receiver<RpcToBeaconCommand>,
     pending_block_data: Option<PendingBlockData>,
     start_timestamp: u64,
-    recent_committee_caches: schnellru::LruMap<BlockHash, Arc<CommitteeCache>>,
     recent_beacon_states: schnellru::LruMap<BlockHash, BeaconState>,
 
     metrics: MinerMetrics,
@@ -152,7 +150,6 @@ struct PendingBlockData {
     beacon_state_after_withdrawal: BeaconState,
     execution_requests: Option<Requests>,
     attestations: HashMap<CommitteeIndex, Attestation>,
-    committee_cache: Option<Arc<CommitteeCache>>,
 }
 
 const DEPOSIT_GAP: u64 = 6;
@@ -232,7 +229,6 @@ where
             rpc_to_beacon_command_rx,
             pending_block_data: None,
             start_timestamp,
-            recent_committee_caches: schnellru::LruMap::new(schnellru::ByLength::new((SLOTS_PER_EPOCH * 2)as u32)),
             recent_beacon_states: schnellru::LruMap::new(schnellru::ByLength::new((SLOTS_PER_EPOCH * 2)as u32)),
 
             metrics: Default::default(),
@@ -754,7 +750,7 @@ where
                 return Ok(())
             },
         };
-        let PendingBlockData { block, beacon_state_after_withdrawal, execution_requests, mut attestations, committee_cache } = pending_block_data;
+        let PendingBlockData { block, beacon_state_after_withdrawal, execution_requests, mut attestations, } = pending_block_data;
         attestations.retain(|_, attestation| {
             attestation.block_aggregate_signature.is_some()
         });
@@ -796,10 +792,6 @@ where
         let (beacon_block, new_beacon_state) = self.beacon.gen_beacon_block(beacon_state_after_withdrawal, parent_beacon_block_hash, &attestations.values().cloned().collect(), &execution_requests, &block)?;
         let beacon_block_hash = beacon_block.hash_slow();
         self.recent_beacon_states.insert(beacon_block_hash, new_beacon_state.clone());
-        if let Some(v) = committee_cache {
-            debug!(target: "consensus-client", "inserting committee_cache into lru for block hash {:?}", beacon_block_hash);
-            self.recent_committee_caches.insert(beacon_block_hash, v);
-        }
         let beacon_provider = self.provider.clone();
         let eth1_block_hash = block.hash();
         let beacon_block_clone = beacon_block.clone();
@@ -947,74 +939,12 @@ where
             beacon_state_after_withdrawal: beacon_state_after_withdrawal.clone(),
             execution_requests: execution_requests.clone(),
             attestations: Default::default(),
-            committee_cache: None,
         };
         self.pending_block_data.replace(pending_block_data);
 
         let max_td = self.consensus.total_difficulty(block.header().hash_slow());
         debug!(target: "consensus-client", ?max_td, "prepare_block: new_block hash {:?}", block.header().hash_slow());
         trace!(target: "consensus-client", ?block);
-
-        let committee_cache = if block.header().number() % SLOTS_PER_EPOCH == 0 {
-            debug!(target: "consensus-client", "generating committee_cache for  block number {:?}", block.header().number());
-            match beacon_state_after_withdrawal.gen_committee_cache(RelativeEpoch::Next) {
-                Ok(v) => Arc::new(v),
-                Err(e) => {
-                    debug!(target: "consensus-client", ?e, "gen_committee_cache failed");
-                    return Ok(());
-                }
-            }
-        } else {
-            let mut beacon_block_hash = self.provider.get_beacon_block_hash_by_eth1_hash(&block.header().parent_hash())?.ok_or(eyre::eyre!("beacon block hash not found, eth1_block_hash={:?}", block.header().parent_hash()))?;
-
-            let mut beacon_block_hashes = Vec::new();
-            beacon_block_hashes.push(beacon_block_hash);
-            let committee_cache = loop {
-                match self.recent_committee_caches.get(&beacon_block_hash) {
-                    Some(v) => {
-                        debug!(target: "consensus-client", "getting committee_cache from lru for block hash {:?}", beacon_block_hash);
-                        break (*v).clone();
-                    }
-                    None => {
-                        let beacon_block = self.provider.get_beacon_block_by_hash(&beacon_block_hash)?.ok_or(eyre::eyre!("beacon block not found, beacon_block_hash={:?}", beacon_block_hash))?;
-                        if beacon_block.slot == 0 {
-                            debug!(target: "consensus-client", "searching for beacon block reached slot 0");
-                            return Ok(());
-                        }
-                        if beacon_block.slot % SLOTS_PER_EPOCH == 0 {
-
-                            let parent_beacon_state = match self.recent_beacon_states.get(&beacon_block.parent_hash) {
-                                Some (v) => v,
-                                None => {
-                                    &mut self.provider.get_beacon_state_by_hash(&beacon_block.parent_hash)?.ok_or(eyre::eyre!("beacon state not found, beacon_block_hash={:?}", beacon_block.parent_hash))?
-                                }
-                            };
-
-                            match parent_beacon_state.gen_committee_cache(RelativeEpoch::Next) {
-                                Ok(v) => break Arc::new(v),
-                                Err(e) => {
-                                    debug!(target: "consensus-client", ?e, "gen_committee_cache failed");
-                                    return Ok(());
-                                }
-                            }
-                        } else {
-                            beacon_block_hash = beacon_block.parent_hash;
-                            beacon_block_hashes.push(beacon_block_hash);
-                        }
-                    }
-                }
-            };
-            while let Some(v) = beacon_block_hashes.pop() {
-                self.recent_committee_caches.insert(v, committee_cache.clone());
-            }
-            committee_cache
-        };
-        //debug!(target: "consensus-client", "{committee_cache:?}");
-
-        let beacon_committees = committee_cache.get_beacon_committees_at_slot(block.number)?;
-        debug!(target: "consensus-client", ?beacon_committees);
-
-        self.pending_block_data.as_mut().ok_or(eyre::eyre!("pending_block_data not found, block_number={:?}", block.number))?.committee_cache = Some(committee_cache.clone());
 
         let cached_reads = self.consensus.get_cached_reads(block.hash())?.ok_or(eyre::eyre!("cached_reads not found, block_hash={:?}", block.hash()))?;
         let mut header = block.header().clone();
@@ -1023,25 +953,28 @@ where
         let sealed_block_modified = SealedBlock::from_parts_unhashed(header, body);
         trace!(target: "consensus-client", ?sealed_block_modified);
         let mut unverified_block = UnverifiedBlock::new(sealed_block_modified, cached_reads, max_td, 0);
-        for beacon_committee in &beacon_committees {
-            let attestation = Attestation {
-                data: AttestationData {
-                    slot: block.number,
-                    committee_index: beacon_committee.index,
-                    receipts_root: block.header().receipts_root,
-                },
-                ..Default::default()
-            };
-            self.pending_block_data.as_mut().ok_or(eyre::eyre!("pending_block_data not found, block_number={:?}", block.number))?.attestations.insert(beacon_committee.index, attestation);
-            unverified_block.committee_index = beacon_committee.index;
-            for validator_index in beacon_committee.committee {
-                let pubkey = beacon_state_after_withdrawal.get_validator(*validator_index)?.pubkey;
-                let pubkey = hex::encode(&pubkey);
-                let event = Event { topic: pubkey, payload: unverified_block.clone()};
 
-                publish(&self.broadcast_unverified_block_tx, event).await;
-            }
+        let beacon_committee_index = 0;
+        let beacon_state = &self.pending_block_data.as_ref().ok_or(eyre::eyre!("pending_block_data not found, block_number={:?}", block.number))?.beacon_state_after_withdrawal;
+        let committee = beacon_state.get_current_active_validator_indices();
+        let attestation = Attestation {
+            data: AttestationData {
+                slot: block.number,
+                committee_index: beacon_committee_index,
+                receipts_root: block.header().receipts_root,
+            },
+            ..Default::default()
+        };
+        self.pending_block_data.as_mut().ok_or(eyre::eyre!("pending_block_data not found, block_number={:?}", block.number))?.attestations.insert(beacon_committee_index, attestation);
+        unverified_block.committee_index = beacon_committee_index;
+        for validator_index in &committee {
+            let pubkey = beacon_state_after_withdrawal.get_validator(*validator_index)?.pubkey;
+            let pubkey = hex::encode(&pubkey);
+            let event = Event { topic: pubkey, payload: unverified_block.clone()};
+
+            publish(&self.broadcast_unverified_block_tx, event).await;
         }
+
         Ok(())
     }
 

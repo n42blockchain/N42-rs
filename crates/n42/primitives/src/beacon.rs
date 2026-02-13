@@ -1700,6 +1700,11 @@ impl BeaconState {
         active
     }
 
+    pub fn get_current_active_validator_indices(&self) -> Vec<usize> {
+        let epoch = self.current_epoch();
+        self.get_active_validator_indices(epoch)
+    }
+
     pub fn gen_committee_cache(
         &self,
         relative_epoch: RelativeEpoch,

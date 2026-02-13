@@ -26,9 +26,10 @@ use reth_node_core::{
 use reth_node_ethereum::{consensus::EthBeaconConsensus, EthEvmConfig};
 use reth_primitives_traits::SealedBlock;
 use reth_provider::{
-    providers::ProviderNodeTypes, AccountExtReader, ChainSpecProvider, DatabaseProviderFactory,
-    HashedPostStateProvider, HashingWriter, LatestStateProviderRef, OriginalValuesKnown,
-    ProviderFactory, StageCheckpointReader, StateWriteConfig, StateWriter, StorageReader,
+    providers::ProviderNodeTypes, AccountExtReader, BlockWriter, ChainSpecProvider,
+    DatabaseProviderFactory, HashedPostStateProvider, HashingWriter, LatestStateProviderRef,
+    OriginalValuesKnown, ProviderFactory, StageCheckpointReader, StateWriteConfig, StateWriter,
+    StorageReader,
 };
 use reth_revm::database::StateProviderDatabase;
 use reth_stages::StageId;
@@ -183,8 +184,8 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
         let provider_rw = provider_factory.database_provider_rw()?;
 
         // Insert block, state and hashes
-        provider_rw.insert_historical_block(block.clone().try_recover()?)?;
-        provider_rw.write_state(&execution_outcome, OriginalValuesKnown::No, StateWriteConfig::full())?;
+        provider_rw.insert_block(&block.clone().try_recover()?)?;
+        provider_rw.write_state(&execution_outcome, OriginalValuesKnown::No, StateWriteConfig::default())?;
         let storage_lists =
             provider_rw.changed_storages_with_range(block.number..=block.number())?;
         let storages = provider_rw.plain_state_storages(storage_lists)?;

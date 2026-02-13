@@ -60,7 +60,7 @@ pub struct ConsensusExt<Cons, Provider> {
 impl<Cons, Provider> ConsensusExtApiServer for ConsensusExt<Cons, Provider>
 where
     Cons: FullConsensus<EthPrimitives> + Clone + Unpin + 'static,
-    Provider: HeaderProvider + Clone + 'static,
+    Provider: HeaderProvider + Clone + Send + Sync + 'static,
 {
     fn propose(&self, address: Address, auth: bool) -> RpcResult<()> {
         Ok(self.consensus.propose(address, auth).unwrap_or_default())

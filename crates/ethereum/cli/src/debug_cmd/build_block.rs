@@ -125,8 +125,10 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
         let blockchain_db = BlockchainProvider::new(provider_factory.clone())?;
         let blob_store = InMemoryBlobStore::default();
 
-        let validator = TransactionValidationTaskExecutor::eth_builder(blockchain_db.clone())
-            .with_head_timestamp(best_block.timestamp)
+        let validator = TransactionValidationTaskExecutor::eth_builder(
+                blockchain_db.clone(),
+                EthEvmConfig::new(provider_factory.chain_spec()),
+            )
             .kzg_settings(self.kzg_settings()?)
             .with_additional_tasks(1)
             .build_with_tasks(ctx.task_executor.clone(), blob_store.clone());
@@ -248,7 +250,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
 
                 let hashed_post_state = state_provider.hashed_post_state(execution_outcome.state());
                 let hashed_post_state_sorted = hashed_post_state.clone().into_sorted();
-                let (state_root, trie_updates) = StateRoot::overlay_root_with_updates(
+                let (state_root, _trie_updates) = StateRoot::overlay_root_with_updates(
                     provider_factory.provider()?.tx_ref(),
                     &hashed_post_state_sorted,
                 )?;
@@ -267,7 +269,6 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
                     Vec::from([block_with_senders]),
                     &execution_outcome,
                     hashed_post_state.into_sorted(),
-                    trie_updates,
                 )?;
                 info!(target: "reth::cli", "Successfully appended built block");
             }

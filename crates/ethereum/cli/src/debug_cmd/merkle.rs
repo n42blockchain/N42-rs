@@ -168,7 +168,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
                 .map_err(|_| eyre::eyre!("Error sealing block with senders"))?;
             trace!(target: "reth::cli", block_number, "Executing block");
 
-            provider_rw.insert_block(sealed_block.clone())?;
+            provider_rw.insert_block(&sealed_block)?;
 
             let executor = executor_provider.batch_executor(StateProviderDatabase::new(
                 LatestStateProviderRef::new(&provider_rw),
@@ -178,7 +178,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
             provider_rw.write_state(
                 &ExecutionOutcome::single(block_number, output),
                 OriginalValuesKnown::Yes,
-                StateWriteConfig::full(),
+                StateWriteConfig::default(),
             )?;
 
             let checkpoint = Some(StageCheckpoint::new(

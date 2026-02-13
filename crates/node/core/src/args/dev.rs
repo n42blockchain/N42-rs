@@ -52,6 +52,34 @@ pub struct DevArgs {
         default_value = DEFAULT_MNEMONIC
     )]
     pub dev_mnemonic: String,
+
+    /// Consensus signer private key for N42 APos consensus.
+    #[arg(
+        long = "dev.consensus-signer-private-key",
+        help_heading = "Dev testnet",
+        value_name = "CONSENSUS_SIGNER_PRIVATE_KEY",
+        env = "CONSENSUS_SIGNER_PRIVATE_KEY",
+        verbatim_doc_comment
+    )]
+    pub consensus_signer_private_key: Option<String>,
+
+    /// Migrate old chain data to this chain from db.
+    #[arg(
+        long = "dev.migrate-old-chain-data-from-db",
+        help_heading = "Dev testnet",
+        value_name = "MIGRATE_OLD_CHAIN_DATA_FROM_DB",
+        verbatim_doc_comment
+    )]
+    pub migrate_old_chain_data_from_db: Option<String>,
+
+    /// Migrate old chain data to this chain from rpc.
+    #[arg(
+        long = "dev.migrate-old-chain-data-from-rpc",
+        help_heading = "Dev testnet",
+        value_name = "MIGRATE_OLD_CHAIN_DATA_FROM_RPC",
+        verbatim_doc_comment
+    )]
+    pub migrate_old_chain_data_from_rpc: Option<String>,
 }
 
 impl Default for DevArgs {
@@ -61,6 +89,9 @@ impl Default for DevArgs {
             block_max_transactions: None,
             block_time: None,
             dev_mnemonic: DEFAULT_MNEMONIC.to_string(),
+            consensus_signer_private_key: None,
+            migrate_old_chain_data_from_db: None,
+            migrate_old_chain_data_from_rpc: None,
         }
     }
 }
@@ -86,7 +117,7 @@ mod tests {
                 dev: false,
                 block_max_transactions: None,
                 block_time: None,
-                dev_mnemonic: DEFAULT_MNEMONIC.to_string(),
+                ..Default::default()
             }
         );
 
@@ -97,7 +128,7 @@ mod tests {
                 dev: true,
                 block_max_transactions: None,
                 block_time: None,
-                dev_mnemonic: DEFAULT_MNEMONIC.to_string(),
+                ..Default::default()
             }
         );
 
@@ -108,7 +139,7 @@ mod tests {
                 dev: true,
                 block_max_transactions: None,
                 block_time: None,
-                dev_mnemonic: DEFAULT_MNEMONIC.to_string(),
+                ..Default::default()
             }
         );
 
@@ -125,7 +156,7 @@ mod tests {
                 dev: true,
                 block_max_transactions: Some(2),
                 block_time: None,
-                dev_mnemonic: DEFAULT_MNEMONIC.to_string(),
+                ..Default::default()
             }
         );
 
@@ -137,7 +168,7 @@ mod tests {
                 dev: true,
                 block_max_transactions: None,
                 block_time: Some(std::time::Duration::from_secs(1)),
-                dev_mnemonic: DEFAULT_MNEMONIC.to_string(),
+                ..Default::default()
             }
         );
     }

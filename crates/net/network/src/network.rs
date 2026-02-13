@@ -12,6 +12,7 @@ use reth_eth_wire::{
     BlockRangeUpdate, DisconnectReason, EthNetworkPrimitives, NetworkPrimitives,
     NewPooledTransactionHashes, SharedTransactions,
 };
+use reth_eth_wire_types::NewBlock;
 use reth_ethereum_forks::Head;
 use reth_network_api::{
     events::{NetworkPeersEvents, PeerEvent, PeerEventStream},
@@ -83,8 +84,14 @@ impl<N: NetworkPrimitives> NetworkHandle<N> {
             discv5,
             event_sender,
             nat,
+            block_announcer: Default::default(),
         };
         Self { inner: Arc::new(inner) }
+    }
+
+    /// Send a new block announcement to all subscribers.
+    pub fn send_block_announcement(&self, block: NewBlock<N::Block>) {
+        self.inner.block_announcer.notify(block);
     }
 
     /// Returns the [`PeerId`] used in the network.
@@ -487,6 +494,8 @@ struct NetworkInner<N: NetworkPrimitives = EthNetworkPrimitives> {
     event_sender: EventSender<NetworkEvent<PeerRequest<N>>>,
     /// The NAT resolver
     nat: Option<NatResolver>,
+    /// Sender for block announcement events.
+    block_announcer: EventSender<NewBlock<N::Block>>,
 }
 
 /// Provides access to modify the network's additional protocol handlers.
@@ -571,4 +580,26 @@ pub(crate) enum NetworkHandleMessage<N: NetworkPrimitives = EthNetworkPrimitives
     ConnectPeer(PeerId, PeerKind, PeerAddr),
     /// Message to update the node's advertised block range information.
     InternalBlockRangeUpdate(BlockRangeUpdate),
+}
+
+use reth_network_api::{BlockAnnounceProvider, N42BlockImportOutcome};
+
+impl<N: NetworkPrimitives> BlockAnnounceProvider for NetworkHandle<N>
+where
+    N::Block: Send + Sync + Clone + 'static,
+    N::NewBlockPayload: From<NewBlock<N::Block>>,
+{
+    type Block = N::Block;
+
+    fn announce_block(&self, block: NewBlock<Self::Block>, hash: B256) {
+        self.send_message(NetworkHandleMessage::AnnounceBlock(block.into(), hash))
+    }
+
+    fn subscribe_block(&self) -> EventStream<NewBlock<Self::Block>> {
+        self.inner.block_announcer.new_listener()
+    }
+
+    fn validated_block(&self, _result: N42BlockImportOutcome<Self::Block>) {
+        // Block validation is handled internally, this is a no-op for now
+    }
 }

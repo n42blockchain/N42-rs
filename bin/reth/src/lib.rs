@@ -55,7 +55,7 @@
 use alloy_primitives as _;
 
 pub mod cli;
-pub mod ress;
+// pub mod ress; // Disabled: ress protocol deps not yet available
 
 /// Re-exported utils.
 pub mod utils {

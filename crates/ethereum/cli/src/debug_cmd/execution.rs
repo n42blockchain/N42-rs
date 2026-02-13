@@ -14,7 +14,6 @@ use reth_cli_runner::CliContext;
 use reth_cli_util::get_secret_key;
 use reth_config::Config;
 use reth_consensus::FullConsensus;
-use reth_db::DatabaseEnv;
 use reth_downloaders::{
     bodies::bodies::BodiesDownloaderBuilder,
     headers::reverse_headers::ReverseHeadersDownloaderBuilder,
@@ -25,7 +24,6 @@ use reth_exex::ExExManagerHandle;
 use reth_network::{BlockDownloaderProvider, NetworkHandle};
 use reth_network_api::NetworkInfo;
 use reth_network_p2p::{headers::client::HeadersClient, EthBlockClient};
-use reth_node_api::NodeTypesWithDBAdapter;
 use reth_node_core::{args::NetworkArgs, utils::get_single_header};
 use reth_node_ethereum::{consensus::EthBeaconConsensus, EthExecutorProvider};
 use reth_node_events::node::NodeEvent;
@@ -124,12 +122,12 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
     }
 
     async fn build_network<
-        N: CliNodeTypes<ChainSpec = C::ChainSpec, Primitives = EthPrimitives>,
+        N: ProviderNodeTypes<ChainSpec = C::ChainSpec, Primitives = EthPrimitives>,
     >(
         &self,
         config: &Config,
         task_executor: TaskExecutor,
-        provider_factory: ProviderFactory<NodeTypesWithDBAdapter<N, Arc<DatabaseEnv>>>,
+        provider_factory: ProviderFactory<N>,
         network_secret_path: PathBuf,
         default_peers_path: PathBuf,
     ) -> eyre::Result<NetworkHandle> {
@@ -227,7 +225,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
             return Ok(());
         }
 
-        ctx.task_executor.spawn_critical(
+        ctx.task_executor.spawn_critical_task(
             "events task",
             reth_node_events::node::handle_events(
                 Some(Box::new(network)),
@@ -255,7 +253,7 @@ impl<C: ChainSpecParser<ChainSpec = ChainSpec>> Command<C> {
             // Unwind the pipeline without committing.
             provider_factory
                 .provider_rw()?
-                .unwind_trie_state_range(next_block..=target_block)?;
+                .unwind_trie_state_from(next_block)?;
 
             // Update latest block
             current_max_block = target_block;

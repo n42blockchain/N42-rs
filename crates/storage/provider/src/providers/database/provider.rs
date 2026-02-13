@@ -1447,40 +1447,40 @@ impl<TX: DbTx + 'static, N: NodeTypes> AccountExtReader for DatabaseProvider<TX,
             .static_file_provider
             .get_highest_static_file_block(StaticFileSegment::AccountChangeSets);
 
-        if let Some(highest) = highest_static_block &&
-            self.cached_storage_settings().storage_v2
-        {
-            let start = *range.start();
-            let static_end = (*range.end()).min(highest);
+        if let Some(highest) = highest_static_block {
+            if self.cached_storage_settings().storage_v2 {
+                let start = *range.start();
+                let static_end = (*range.end()).min(highest);
 
-            let mut changed_accounts_and_blocks: BTreeMap<_, Vec<u64>> = BTreeMap::default();
-            if start <= static_end {
-                for block in start..=static_end {
-                    let block_changesets = self.account_block_changeset(block)?;
-                    for changeset in block_changesets {
-                        changed_accounts_and_blocks
-                            .entry(changeset.address)
-                            .or_default()
-                            .push(block);
+                let mut changed_accounts_and_blocks: BTreeMap<_, Vec<u64>> = BTreeMap::default();
+                if start <= static_end {
+                    for block in start..=static_end {
+                        let block_changesets = self.account_block_changeset(block)?;
+                        for changeset in block_changesets {
+                            changed_accounts_and_blocks
+                                .entry(changeset.address)
+                                .or_default()
+                                .push(block);
+                        }
                     }
                 }
+
+                return Ok(changed_accounts_and_blocks)
             }
-
-            Ok(changed_accounts_and_blocks)
-        } else {
-            let mut changeset_cursor = self.tx.cursor_read::<tables::AccountChangeSets>()?;
-
-            let account_transitions = changeset_cursor.walk_range(range)?.try_fold(
-                BTreeMap::new(),
-                |mut accounts: BTreeMap<Address, Vec<u64>>, entry| -> ProviderResult<_> {
-                    let (index, account) = entry?;
-                    accounts.entry(account.address).or_default().push(index);
-                    Ok(accounts)
-                },
-            )?;
-
-            Ok(account_transitions)
         }
+
+        let mut changeset_cursor = self.tx.cursor_read::<tables::AccountChangeSets>()?;
+
+        let account_transitions = changeset_cursor.walk_range(range)?.try_fold(
+            BTreeMap::new(),
+            |mut accounts: BTreeMap<Address, Vec<u64>>, entry| -> ProviderResult<_> {
+                let (index, account) = entry?;
+                accounts.entry(account.address).or_default().push(index);
+                Ok(accounts)
+            },
+        )?;
+
+        Ok(account_transitions)
     }
 }
 
@@ -1958,30 +1958,32 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> TransactionsProvider for Datab
         &self,
         tx_hash: TxHash,
     ) -> ProviderResult<Option<(Self::Transaction, TransactionMeta)>> {
-        if let Some(transaction_id) = self.transaction_id(tx_hash)? &&
-            let Some(transaction) = self.transaction_by_id_unhashed(transaction_id)? &&
-            let Some(block_number) = self.block_by_transaction_id(transaction_id)? &&
-            let Some(sealed_header) = self.sealed_header(block_number)?
-        {
-            let (header, block_hash) = sealed_header.split();
-            if let Some(block_body) = self.block_body_indices(block_number)? {
-                // the index of the tx in the block is the offset:
-                // len([start..tx_id])
-                // NOTE: `transaction_id` is always `>=` the block's first
-                // index
-                let index = transaction_id - block_body.first_tx_num();
+        if let Some(transaction_id) = self.transaction_id(tx_hash)? {
+            if let Some(transaction) = self.transaction_by_id_unhashed(transaction_id)? {
+                if let Some(block_number) = self.block_by_transaction_id(transaction_id)? {
+                    if let Some(sealed_header) = self.sealed_header(block_number)? {
+                        let (header, block_hash) = sealed_header.split();
+                        if let Some(block_body) = self.block_body_indices(block_number)? {
+                            // the index of the tx in the block is the offset:
+                            // len([start..tx_id])
+                            // NOTE: `transaction_id` is always `>=` the block's first
+                            // index
+                            let index = transaction_id - block_body.first_tx_num();
 
-                let meta = TransactionMeta {
-                    tx_hash,
-                    index,
-                    block_hash,
-                    block_number,
-                    base_fee: header.base_fee_per_gas(),
-                    excess_blob_gas: header.excess_blob_gas(),
-                    timestamp: header.timestamp(),
-                };
+                            let meta = TransactionMeta {
+                                tx_hash,
+                                index,
+                                block_hash,
+                                block_number,
+                                base_fee: header.base_fee_per_gas(),
+                                excess_blob_gas: header.excess_blob_gas(),
+                                timestamp: header.timestamp(),
+                            };
 
-                return Ok(Some((transaction, meta)))
+                            return Ok(Some((transaction, meta)))
+                        }
+                    }
+                }
             }
         }
 
@@ -1992,14 +1994,14 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> TransactionsProvider for Datab
         &self,
         id: BlockHashOrNumber,
     ) -> ProviderResult<Option<Vec<Self::Transaction>>> {
-        if let Some(block_number) = self.convert_hash_or_number(id)? &&
-            let Some(body) = self.block_body_indices(block_number)?
-        {
-            let tx_range = body.tx_num_range();
-            return if tx_range.is_empty() {
-                Ok(Some(Vec::new()))
-            } else {
-                self.transactions_by_tx_range(tx_range).map(Some)
+        if let Some(block_number) = self.convert_hash_or_number(id)? {
+            if let Some(body) = self.block_body_indices(block_number)? {
+                let tx_range = body.tx_num_range();
+                return if tx_range.is_empty() {
+                    Ok(Some(Vec::new()))
+                } else {
+                    self.transactions_by_tx_range(tx_range).map(Some)
+                }
             }
         }
         Ok(None)
@@ -2075,14 +2077,14 @@ impl<TX: DbTx + 'static, N: NodeTypesForProvider> ReceiptProvider for DatabasePr
         &self,
         block: BlockHashOrNumber,
     ) -> ProviderResult<Option<Vec<Self::Receipt>>> {
-        if let Some(number) = self.convert_hash_or_number(block)? &&
-            let Some(body) = self.block_body_indices(number)?
-        {
-            let tx_range = body.tx_num_range();
-            return if tx_range.is_empty() {
-                Ok(Some(Vec::new()))
-            } else {
-                self.receipts_by_tx_range(tx_range).map(Some)
+        if let Some(number) = self.convert_hash_or_number(block)? {
+            if let Some(body) = self.block_body_indices(number)? {
+                let tx_range = body.tx_num_range();
+                return if tx_range.is_empty() {
+                    Ok(Some(Vec::new()))
+                } else {
+                    self.receipts_by_tx_range(tx_range).map(Some)
+                }
             }
         }
         Ok(None)
@@ -2610,10 +2612,11 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
                 for entry in storage {
                     tracing::trace!(?address, ?entry.key, "Updating plain state storage");
                     if let Some(db_entry) =
-                        storages_cursor.seek_by_key_subkey(address, entry.key)? &&
-                        db_entry.key == entry.key
+                        storages_cursor.seek_by_key_subkey(address, entry.key)?
                     {
-                        storages_cursor.delete_current()?;
+                        if db_entry.key == entry.key {
+                            storages_cursor.delete_current()?;
+                        }
                     }
 
                     if !entry.value.is_zero() {
@@ -2658,10 +2661,11 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
                 let entry = StorageEntry { key: *hashed_slot, value: *value };
 
                 if let Some(db_entry) =
-                    hashed_storage_cursor.seek_by_key_subkey(*hashed_address, entry.key)? &&
-                    db_entry.key == entry.key
+                    hashed_storage_cursor.seek_by_key_subkey(*hashed_address, entry.key)?
                 {
-                    hashed_storage_cursor.delete_current()?;
+                    if db_entry.key == entry.key {
+                        hashed_storage_cursor.delete_current()?;
+                    }
                 }
 
                 if !entry.value.is_zero() {
@@ -2863,44 +2867,46 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
             block_bodies.last().expect("already checked if there are blocks").last_tx_num();
 
         let storage_range = BlockNumberAddress::range(range.clone());
-        let storage_changeset = if let Some(highest_block) = self
+        let storage_changeset_highest = self
             .static_file_provider
-            .get_highest_static_file_block(StaticFileSegment::StorageChangeSets) &&
-            self.cached_storage_settings().storage_v2
-        {
-            let changesets = self.storage_changesets_range(block + 1..=highest_block)?;
-            let mut changeset_writer =
-                self.static_file_provider.latest_writer(StaticFileSegment::StorageChangeSets)?;
-            changeset_writer.prune_storage_changesets(block)?;
-            changesets
-        } else {
-            self.take::<tables::StorageChangeSets>(storage_range)?
-                .into_iter()
-                .map(|(k, v)| {
-                    (k, ChangesetEntry { key: StorageSlotKey::plain(v.key), value: v.value })
-                })
-                .collect()
-        };
+            .get_highest_static_file_block(StaticFileSegment::StorageChangeSets);
+        let storage_changeset =
+            if storage_changeset_highest.is_some() && self.cached_storage_settings().storage_v2 {
+                let highest_block = storage_changeset_highest.unwrap();
+                let changesets = self.storage_changesets_range(block + 1..=highest_block)?;
+                let mut changeset_writer = self
+                    .static_file_provider
+                    .latest_writer(StaticFileSegment::StorageChangeSets)?;
+                changeset_writer.prune_storage_changesets(block)?;
+                changesets
+            } else {
+                self.take::<tables::StorageChangeSets>(storage_range)?
+                    .into_iter()
+                    .map(|(k, v)| {
+                        (k, ChangesetEntry { key: StorageSlotKey::plain(v.key), value: v.value })
+                    })
+                    .collect()
+            };
 
         // if there are static files for this segment, prune them.
         let highest_changeset_block = self
             .static_file_provider
             .get_highest_static_file_block(StaticFileSegment::AccountChangeSets);
-        let account_changeset = if let Some(highest_block) = highest_changeset_block &&
-            self.cached_storage_settings().storage_v2
-        {
-            // TODO: add a `take` method that removes and returns the items instead of doing this
-            let changesets = self.account_changesets_range(block + 1..highest_block + 1)?;
-            let mut changeset_writer =
-                self.static_file_provider.latest_writer(StaticFileSegment::AccountChangeSets)?;
-            changeset_writer.prune_account_changesets(block)?;
+        let account_changeset =
+            if highest_changeset_block.is_some() && self.cached_storage_settings().storage_v2 {
+                let highest_block = highest_changeset_block.unwrap();
+                // TODO: add a `take` method that removes and returns the items instead of doing this
+                let changesets = self.account_changesets_range(block + 1..highest_block + 1)?;
+                let mut changeset_writer =
+                    self.static_file_provider.latest_writer(StaticFileSegment::AccountChangeSets)?;
+                changeset_writer.prune_account_changesets(block)?;
 
-            changesets
-        } else {
-            // Have to remove from static files if they exist, otherwise remove using `take` for the
-            // changeset tables
-            self.take::<tables::AccountChangeSets>(range)?
-        };
+                changesets
+            } else {
+                // Have to remove from static files if they exist, otherwise remove using `take` for
+                // the changeset tables
+                self.take::<tables::AccountChangeSets>(range)?
+            };
 
         let (state, reverts) = if self.cached_storage_settings().use_hashed_state() {
             let mut hashed_accounts_cursor = self.tx.cursor_write::<tables::HashedAccounts>()?;

@@ -152,10 +152,10 @@ impl<N: NodePrimitives> StaticFileWriters<N> {
             &self.storage_change_sets,
         ] {
             let writer = writer_lock.read();
-            if let Some(writer) = writer.as_ref() &&
-                writer.will_prune_on_commit()
-            {
-                return true
+            if let Some(writer) = writer.as_ref() {
+                if writer.will_prune_on_commit() {
+                    return true
+                }
             }
         }
         false
@@ -516,10 +516,10 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             return Ok(());
         }
 
-        if let Some(offset) = self.current_changeset_offset.take() &&
-            let Some(writer) = &mut self.changeset_offsets
-        {
-            writer.append(&offset).map_err(ProviderError::other)?;
+        if let Some(offset) = self.current_changeset_offset.take() {
+            if let Some(writer) = &mut self.changeset_offsets {
+                writer.append(&offset).map_err(ProviderError::other)?;
+            }
         }
         Ok(())
     }
@@ -792,10 +792,10 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         // Handle changeset offset tracking for changeset segments
         if segment.is_change_based() {
             // Write previous block's offset if we have one
-            if let Some(offset) = self.current_changeset_offset.take() &&
-                let Some(writer) = &mut self.changeset_offsets
-            {
-                writer.append(&offset).map_err(ProviderError::other)?;
+            if let Some(offset) = self.current_changeset_offset.take() {
+                if let Some(writer) = &mut self.changeset_offsets {
+                    writer.append(&offset).map_err(ProviderError::other)?;
+                }
             }
             // Start tracking new block's offset
             let new_offset = self.writer.rows() as u64;

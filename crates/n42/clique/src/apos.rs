@@ -348,11 +348,9 @@ where
                 }
             };
             if block_number == start_block_number {
-                let start_td = self
-                    .provider
-                    .header_td_by_number(start_block_number)
-                    .unwrap_or(Some(U256::ZERO))
-                    .unwrap_or(U256::ZERO);
+                // TD is no longer tracked in the database (removed in reth v1.11.0 for PoS).
+                // For PoA (N42), we seed the starting TD as U256::ZERO and accumulate from there.
+                let start_td = U256::ZERO;
                 if let Ok(mut recent_tds) = self.recent_tds.write() {
                     recent_tds.insert(header.hash_slow(), start_td);
                 }
@@ -949,35 +947,14 @@ where
             }
         }
 
-        // Fall back to database lookup by hash -> number -> td
+        // TD is no longer stored in the database (removed in reth v1.11.0 for PoS).
+        // Try to calculate from parent TD in the in-memory cache.
         if let Ok(Some(header)) = self.provider.header(hash) {
-            if let Ok(Some(td)) = self.provider.header_td_by_number(header.number()) {
-                debug!(target: "consensus::apos", ?hash, total_difficulty=?td, "get total_difficulty from db");
-                // Cache it for future use
-                let mut recent_tds = self.recent_tds.write().unwrap();
-                recent_tds.insert(hash, td);
-                return td;
-            }
-
-            // If TD not in db, try to calculate from parent
             let parent_hash = header.parent_hash();
             let parent_td = {
                 let mut recent_tds = self.recent_tds.write().unwrap();
                 recent_tds.get(&parent_hash).copied()
-            }
-            .or_else(|| {
-                // Try to get parent TD from database
-                self.provider
-                    .header(parent_hash)
-                    .ok()
-                    .flatten()
-                    .and_then(|parent_header| {
-                        self.provider
-                            .header_td_by_number(parent_header.number())
-                            .ok()
-                            .flatten()
-                    })
-            });
+            };
 
             if let Some(parent_td) = parent_td {
                 let td = parent_td + header.difficulty();

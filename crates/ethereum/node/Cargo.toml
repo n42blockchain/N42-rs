@@ -38,9 +38,11 @@ reth-revm = { workspace = true, features = ["std"] }
 reth-rpc-eth-types.workspace = true
 reth-engine-local.workspace = true
 reth-engine-primitives = { workspace = true, features = ["std"] }
+reth-engine-tree.workspace = true
 reth-payload-primitives.workspace = true
 
 # ethereum
+alloy-consensus.workspace = true
 alloy-eips.workspace = true
 alloy-network.workspace = true
 alloy-rpc-types-eth.workspace = true

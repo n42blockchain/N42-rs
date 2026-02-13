@@ -623,10 +623,10 @@ impl Drop for RocksDBProviderInner {
                     tracing::warn!(target: "providers::rocksdb", ?e, "Failed to flush WAL on drop");
                 }
                 for cf_name in ROCKSDB_TABLES {
-                    if let Some(cf) = db.cf_handle(cf_name) &&
-                        let Err(e) = db.flush_cf(&cf)
-                    {
-                        tracing::warn!(target: "providers::rocksdb", cf = cf_name, ?e, "Failed to flush CF on drop");
+                    if let Some(cf) = db.cf_handle(cf_name) {
+                        if let Err(e) = db.flush_cf(&cf) {
+                            tracing::warn!(target: "providers::rocksdb", cf = cf_name, ?e, "Failed to flush CF on drop");
+                        }
                     }
                 }
                 db.cancel_all_background_work(true);
@@ -1448,24 +1448,24 @@ impl<'a> RocksDBBatch<'a> {
     /// This is called after each `put` or `delete` operation to prevent unbounded memory growth.
     /// Returns immediately if auto-commit is disabled or threshold not reached.
     fn maybe_auto_commit(&mut self) -> ProviderResult<()> {
-        if let Some(threshold) = self.auto_commit_threshold &&
-            self.inner.size_in_bytes() >= threshold
-        {
-            tracing::debug!(
-                target: "providers::rocksdb",
-                batch_size = self.inner.size_in_bytes(),
-                threshold,
-                "Auto-committing RocksDB batch"
-            );
-            let old_batch = std::mem::take(&mut self.inner);
-            self.provider.0.db_rw().write_opt(old_batch, &WriteOptions::default()).map_err(
-                |e| {
-                    ProviderError::Database(DatabaseError::Commit(DatabaseErrorInfo {
-                        message: e.to_string().into(),
-                        code: -1,
-                    }))
-                },
-            )?;
+        if let Some(threshold) = self.auto_commit_threshold {
+            if self.inner.size_in_bytes() >= threshold {
+                tracing::debug!(
+                    target: "providers::rocksdb",
+                    batch_size = self.inner.size_in_bytes(),
+                    threshold,
+                    "Auto-committing RocksDB batch"
+                );
+                let old_batch = std::mem::take(&mut self.inner);
+                self.provider.0.db_rw().write_opt(old_batch, &WriteOptions::default()).map_err(
+                    |e| {
+                        ProviderError::Database(DatabaseError::Commit(DatabaseErrorInfo {
+                            message: e.to_string().into(),
+                            code: -1,
+                        }))
+                    },
+                )?;
+            }
         }
         Ok(())
     }
@@ -1767,12 +1767,12 @@ impl<'a> RocksDBBatch<'a> {
             }
         }
 
-        if let Some((last_key, last_value)) = last_remaining &&
-            !is_sentinel(&last_key)
-        {
-            delete_shard(self, last_key)?;
-            put_shard(self, create_sentinel(), &last_value)?;
-            updated = true;
+        if let Some((last_key, last_value)) = last_remaining {
+            if !is_sentinel(&last_key) {
+                delete_shard(self, last_key)?;
+                put_shard(self, create_sentinel(), &last_value)?;
+                updated = true;
+            }
         }
 
         if deleted {

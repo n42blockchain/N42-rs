@@ -187,10 +187,10 @@ impl<Provider: DBProvider + BlockHashReader + StorageSettingsCache> StateProvide
             )
         } else {
             let mut cursor = self.tx().cursor_dup_read::<tables::PlainStorageState>()?;
-            if let Some(entry) = cursor.seek_by_key_subkey(account, storage_key)? &&
-                entry.key == storage_key
-            {
-                return Ok(Some(entry.value));
+            if let Some(entry) = cursor.seek_by_key_subkey(account, storage_key)? {
+                if entry.key == storage_key {
+                    return Ok(Some(entry.value));
+                }
             }
             Ok(None)
         }

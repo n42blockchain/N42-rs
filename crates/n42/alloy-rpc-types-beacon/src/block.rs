@@ -55,7 +55,6 @@ pub struct BeaconBlock<T = serde_json::Value> {
 /// Eth1 data included in beacon blocks.
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[cfg_attr(feature = "ssz", derive(ssz_derive::Encode, ssz_derive::Decode))]
 pub struct Eth1Data {
     /// Root of the deposit tree.
     pub deposit_root: B256,
@@ -69,7 +68,6 @@ pub struct Eth1Data {
 /// A checkpoint in the beacon chain.
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[cfg_attr(feature = "ssz", derive(ssz_derive::Encode, ssz_derive::Decode))]
 pub struct Checkpoint {
     /// The epoch.
     #[serde_as(as = "DisplayFromStr")]
@@ -81,7 +79,6 @@ pub struct Checkpoint {
 /// Attestation data.
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[cfg_attr(feature = "ssz", derive(ssz_derive::Encode, ssz_derive::Decode))]
 pub struct AttestationData {
     /// Slot number.
     #[serde_as(as = "DisplayFromStr")]
@@ -99,7 +96,6 @@ pub struct AttestationData {
 
 /// An attestation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ssz", derive(ssz_derive::Encode, ssz_derive::Decode))]
 pub struct Attestation {
     /// Aggregation bits.
     pub aggregation_bits: Bytes,
@@ -112,7 +108,6 @@ pub struct Attestation {
 /// An indexed attestation.
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ssz", derive(ssz_derive::Encode, ssz_derive::Decode))]
 pub struct IndexedAttestation {
     /// Attesting validator indices.
     #[serde_as(as = "Vec<DisplayFromStr>")]
@@ -125,7 +120,6 @@ pub struct IndexedAttestation {
 
 /// A proposer slashing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ssz", derive(ssz_derive::Encode, ssz_derive::Decode))]
 pub struct ProposerSlashing {
     /// First signed header.
     pub signed_header_1: SignedBeaconBlockHeader,
@@ -135,7 +129,6 @@ pub struct ProposerSlashing {
 
 /// A signed beacon block header.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ssz", derive(ssz_derive::Encode, ssz_derive::Decode))]
 pub struct SignedBeaconBlockHeader {
     /// Header message.
     pub message: BeaconBlockHeader,
@@ -145,7 +138,6 @@ pub struct SignedBeaconBlockHeader {
 
 /// An attester slashing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ssz", derive(ssz_derive::Encode, ssz_derive::Decode))]
 pub struct AttesterSlashing {
     /// First attestation.
     pub attestation_1: IndexedAttestation,
@@ -156,7 +148,6 @@ pub struct AttesterSlashing {
 /// Deposit data.
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ssz", derive(ssz_derive::Encode, ssz_derive::Decode))]
 pub struct DepositData {
     /// Validator public key.
     pub pubkey: BlsPublicKey,
@@ -171,7 +162,6 @@ pub struct DepositData {
 
 /// A deposit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ssz", derive(ssz_derive::Encode, ssz_derive::Decode))]
 pub struct Deposit {
     /// Merkle proof.
     pub proof: Vec<B256>,
@@ -182,7 +172,6 @@ pub struct Deposit {
 /// A voluntary exit.
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ssz", derive(ssz_derive::Encode, ssz_derive::Decode))]
 pub struct VoluntaryExit {
     /// Earliest epoch when voluntary exit can be processed.
     #[serde_as(as = "DisplayFromStr")]
@@ -194,7 +183,6 @@ pub struct VoluntaryExit {
 
 /// A signed voluntary exit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ssz", derive(ssz_derive::Encode, ssz_derive::Decode))]
 pub struct SignedVoluntaryExit {
     /// Voluntary exit message.
     pub message: VoluntaryExit,
@@ -204,7 +192,6 @@ pub struct SignedVoluntaryExit {
 
 /// Sync aggregate data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ssz", derive(ssz_derive::Encode, ssz_derive::Decode))]
 pub struct SyncAggregate {
     /// Sync committee participation bits.
     pub sync_committee_bits: Bytes,
@@ -215,7 +202,6 @@ pub struct SyncAggregate {
 /// A BLS to execution address change message.
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ssz", derive(ssz_derive::Encode, ssz_derive::Decode))]
 pub struct BlsToExecutionChange {
     /// Validator index.
     #[serde_as(as = "DisplayFromStr")]
@@ -228,7 +214,6 @@ pub struct BlsToExecutionChange {
 
 /// A signed BLS to execution address change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ssz", derive(ssz_derive::Encode, ssz_derive::Decode))]
 pub struct SignedBlsToExecutionChange {
     /// The change message.
     pub message: BlsToExecutionChange,

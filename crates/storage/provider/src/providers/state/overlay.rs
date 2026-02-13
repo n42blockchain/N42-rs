@@ -298,10 +298,14 @@ where
         let hashed_state_updates_total_len;
 
         // If block_hash is provided, collect reverts
-        let (trie_updates, hashed_post_state) = if let Some(from_block) =
-            self.get_requested_block_number(provider)? &&
+        let from_block_opt = self.get_requested_block_number(provider)?;
+        let reverts_needed = if let Some(from_block) = from_block_opt {
             self.reverts_required(provider, db_tip_block, from_block)?
-        {
+        } else {
+            false
+        };
+        let (trie_updates, hashed_post_state) = if let Some(from_block) = from_block_opt {
+            if reverts_needed {
             debug!(
                 target: "providers::state::overlay",
                 block_hash = ?self.block_hash,
@@ -375,6 +379,17 @@ where
             );
 
             (trie_updates, hashed_state_updates)
+            } else {
+                // reverts not needed, use overlays directly
+                let (trie_updates, hashed_state) = self.resolve_overlays();
+
+                retrieve_trie_reverts_duration = Duration::ZERO;
+                retrieve_hashed_state_reverts_duration = Duration::ZERO;
+                trie_updates_total_len = trie_updates.total_len();
+                hashed_state_updates_total_len = hashed_state.total_len();
+
+                (trie_updates, hashed_state)
+            }
         } else {
             // If no block_hash, use overlays directly (resolving lazy if set)
             let (trie_updates, hashed_state) = self.resolve_overlays();

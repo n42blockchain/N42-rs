@@ -1750,12 +1750,13 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                 }
             }
 
-            if let Some((db_last_entry, _)) = db_cursor.last()? &&
-                highest_static_file_entry
+            if let Some((db_last_entry, _)) = db_cursor.last()? {
+                if highest_static_file_entry
                     .is_none_or(|highest_entry| db_last_entry > highest_entry)
-            {
-                debug!(target: "reth::providers::static_file", db_last_entry, "Database has entries beyond static files, no unwind needed");
-                return Ok(None)
+                {
+                    debug!(target: "reth::providers::static_file", db_last_entry, "Database has entries beyond static files, no unwind needed");
+                    return Ok(None)
+                }
             }
         } else {
             debug!(target: "reth::providers::static_file", "No database entries found");
@@ -1873,30 +1874,31 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
 
         if let Some((db_first_key, _)) = db_cursor.first()? {
             let db_first_block = block_from_key(&db_first_key);
-            if let Some(highest_block) = highest_static_file_block &&
-                !(db_first_block <= highest_block || highest_block + 1 == db_first_block)
-            {
-                info!(
-                    target: "reth::providers::static_file",
-                    ?db_first_block,
-                    ?highest_block,
-                    unwind_target = highest_block,
-                    ?segment,
-                    "Setting unwind target."
-                );
-                return Ok(Some(highest_block))
+            if let Some(highest_block) = highest_static_file_block {
+                if !(db_first_block <= highest_block || highest_block + 1 == db_first_block) {
+                    info!(
+                        target: "reth::providers::static_file",
+                        ?db_first_block,
+                        ?highest_block,
+                        unwind_target = highest_block,
+                        ?segment,
+                        "Setting unwind target."
+                    );
+                    return Ok(Some(highest_block))
+                }
             }
 
-            if let Some((db_last_key, _)) = db_cursor.last()? &&
-                highest_static_file_block
+            if let Some((db_last_key, _)) = db_cursor.last()? {
+                if highest_static_file_block
                     .is_none_or(|highest_block| block_from_key(&db_last_key) > highest_block)
-            {
-                debug!(
-                    target: "reth::providers::static_file",
-                    ?segment,
-                    "Database has entries beyond static files, no unwind needed"
-                );
-                return Ok(None)
+                {
+                    debug!(
+                        target: "reth::providers::static_file",
+                        ?segment,
+                        "Database has entries beyond static files, no unwind needed"
+                    );
+                    return Ok(None)
+                }
             }
         } else {
             debug!(target: "reth::providers::static_file", ?segment, "No database entries found");
@@ -2234,19 +2236,21 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         let mut data = Vec::new();
 
         // If there is, check the maximum block or transaction number of the segment.
-        if let Some(static_file_upper_bound) = if segment.is_block_or_change_based() {
+        let static_file_upper_bound_opt = if segment.is_block_or_change_based() {
             self.get_highest_static_file_block(segment)
         } else {
             self.get_highest_static_file_tx(segment)
-        } && block_or_tx_range.start <= static_file_upper_bound
-        {
-            let end = block_or_tx_range.end.min(static_file_upper_bound + 1);
-            data.extend(fetch_from_static_file(
-                self,
-                block_or_tx_range.start..end,
-                &mut predicate,
-            )?);
-            block_or_tx_range.start = end;
+        };
+        if let Some(static_file_upper_bound) = static_file_upper_bound_opt {
+            if block_or_tx_range.start <= static_file_upper_bound {
+                let end = block_or_tx_range.end.min(static_file_upper_bound + 1);
+                data.extend(fetch_from_static_file(
+                    self,
+                    block_or_tx_range.start..end,
+                    &mut predicate,
+                )?);
+                block_or_tx_range.start = end;
+            }
         }
 
         if block_or_tx_range.end > block_or_tx_range.start {
@@ -2471,12 +2475,13 @@ impl<N: NodePrimitives> ChangeSetReader for StaticFileProvider<N> {
             }
         }
 
-        if low < range.end &&
-            let Some(change) = cursor
+        if low < range.end {
+            if let Some(change) = cursor
                 .get_one::<reth_db::static_file::AccountChangesetMask>(low.into())?
                 .filter(|change| change.address == address)
-        {
-            return Ok(Some(change));
+            {
+                return Ok(Some(change));
+            }
         }
 
         Ok(None)
@@ -2600,15 +2605,16 @@ impl<N: NodePrimitives> StorageChangeSetReader for StaticFileProvider<N> {
             }
         }
 
-        if low < range.end &&
-            let Some(change) = cursor
+        if low < range.end {
+            if let Some(change) = cursor
                 .get_one::<StorageChangesetMask>(low.into())?
                 .filter(|change| change.address == address && change.key == storage_key)
-        {
-            return Ok(Some(ChangesetEntry {
-                key: StorageSlotKey::hashed(change.key),
-                value: change.value,
-            }));
+            {
+                return Ok(Some(ChangesetEntry {
+                    key: StorageSlotKey::hashed(change.key),
+                    value: change.value,
+                }));
+            }
         }
 
         Ok(None)

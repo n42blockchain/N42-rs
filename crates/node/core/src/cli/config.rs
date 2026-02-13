@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! Config traits for various node components.
 
 use alloy_eips::eip1559::ETHEREUM_BLOCK_GAS_LIMIT_36M;
@@ -38,6 +35,11 @@ pub trait PayloadBuilderConfig {
     /// Maximum number of tasks to spawn for building a payload.
     fn max_payload_tasks(&self) -> usize;
 
+    /// Maximum number of blobs to include per block (EIP-7872).
+    ///
+    /// If `None`, defaults to the protocol maximum.
+    fn max_blobs_per_block(&self) -> Option<u64>;
+
     /// Returns the configured gas limit if set, or a chain-specific default.
     fn gas_limit_for(&self, chain: Chain) -> u64 {
         if let Some(limit) = self.gas_limit() {
@@ -45,9 +47,9 @@ pub trait PayloadBuilderConfig {
         }
 
         match chain.kind() {
-            ChainKind::Named(NamedChain::Sepolia | NamedChain::Holesky) => {
-                ETHEREUM_BLOCK_GAS_LIMIT_60M
-            }
+            ChainKind::Named(
+                NamedChain::Mainnet | NamedChain::Sepolia | NamedChain::Holesky | NamedChain::Hoodi,
+            ) => ETHEREUM_BLOCK_GAS_LIMIT_60M,
             _ => ETHEREUM_BLOCK_GAS_LIMIT_36M,
         }
     }
@@ -86,4 +88,7 @@ impl<N: NetworkPrimitives> RethNetworkConfig for reth_network::NetworkManager<N>
 pub trait RethTransactionPoolConfig {
     /// Returns transaction pool configuration.
     fn pool_config(&self) -> PoolConfig;
+
+    /// Returns max batch size for transaction batch insertion.
+    fn max_batch_size(&self) -> usize;
 }

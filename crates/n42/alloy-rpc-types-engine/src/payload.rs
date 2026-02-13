@@ -25,6 +25,9 @@ use core::iter::{FromIterator, IntoIterator};
 /// The execution payload body response that allows for `null` values.
 pub type ExecutionPayloadBodiesV1 = Vec<Option<ExecutionPayloadBodyV1>>;
 
+/// The execution payload body V2 response that allows for `null` values.
+pub type ExecutionPayloadBodiesV2 = Vec<Option<ExecutionPayloadBodyV2>>;
+
 /// And 8-byte identifier for an execution payload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -305,8 +308,10 @@ pub struct ExecutionPayloadV1 {
     /// The transactions of the block.
     pub transactions: Vec<Bytes>,
     /// difficulty for N42
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "U256::is_zero"))]
     pub difficulty: U256,
     /// nonce for N42
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "B64::is_zero"))]
     pub nonce: B64,
 }
 
@@ -584,8 +589,10 @@ impl ssz::Decode for ExecutionPayloadV2 {
                 base_fee_per_gas: decoder.decode_next()?,
                 block_hash: decoder.decode_next()?,
                 transactions: decoder.decode_next()?,
-                difficulty: decoder.decode_next()?,
-                nonce: decoder.decode_next()?,
+                // N42-specific fields not present in standard SSZ format;
+                    // use defaults for beacon chain wire compatibility
+                    difficulty: Default::default(),
+                    nonce: Default::default(),
             },
             withdrawals: decoder.decode_next()?,
         })
@@ -628,8 +635,16 @@ impl ssz::Encode for ExecutionPayloadV2 {
     }
 
     fn ssz_bytes_len(&self) -> usize {
-        <ExecutionPayloadV1 as ssz::Encode>::ssz_bytes_len(&self.payload_inner)
-            + ssz::BYTES_PER_LENGTH_OFFSET
+        // Manually compute to match ssz_append (excludes N42 difficulty/nonce fields)
+        let fixed = <B256 as ssz::Encode>::ssz_fixed_len() * 5
+            + <Address as ssz::Encode>::ssz_fixed_len()
+            + <Bloom as ssz::Encode>::ssz_fixed_len()
+            + <u64 as ssz::Encode>::ssz_fixed_len() * 4
+            + <U256 as ssz::Encode>::ssz_fixed_len()
+            + ssz::BYTES_PER_LENGTH_OFFSET * 3;
+        fixed
+            + self.payload_inner.extra_data.ssz_bytes_len()
+            + self.payload_inner.transactions.ssz_bytes_len()
             + self.withdrawals.ssz_bytes_len()
     }
 }
@@ -765,8 +780,9 @@ impl ssz::Decode for ExecutionPayloadV3 {
                     base_fee_per_gas: decoder.decode_next()?,
                     block_hash: decoder.decode_next()?,
                     transactions: decoder.decode_next()?,
-                    difficulty: decoder.decode_next()?,
-                    nonce: decoder.decode_next()?,
+                    // N42-specific fields not present in standard SSZ format
+                    difficulty: Default::default(),
+                    nonce: Default::default(),
                 },
                 withdrawals: decoder.decode_next()?,
             },
@@ -1428,9 +1444,8 @@ impl<'de> serde::Deserialize<'de> for ExecutionPayload {
                     .ok_or_else(|| serde::de::Error::missing_field("baseFeePerGas"))?;
                 let block_hash =
                     block_hash.ok_or_else(|| serde::de::Error::missing_field("blockHash"))?;
-                let difficulty =
-                    difficulty.ok_or_else(|| serde::de::Error::missing_field("difficulty"))?;
-                let nonce = nonce.ok_or_else(|| serde::de::Error::missing_field("nonce"))?;
+                let difficulty = difficulty.unwrap_or_default();
+                let nonce = nonce.unwrap_or_default();
                 let transactions =
                     transactions.ok_or_else(|| serde::de::Error::missing_field("transactions"))?;
 
@@ -1509,6 +1524,49 @@ impl<'de> serde::Deserialize<'de> for ExecutionPayload {
     }
 }
 
+/// This structure maps on the ExecutionPayloadV4 structure of the beacon chain spec.
+///
+/// This is the Amsterdam fork payload type which adds the block access list (EIP-7928).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+#[cfg_attr(any(test, feature = "arbitrary"), derive(arbitrary::Arbitrary))]
+pub struct ExecutionPayloadV4 {
+    /// Inner V3 payload
+    #[cfg_attr(feature = "serde", serde(flatten))]
+    pub payload_inner: ExecutionPayloadV3,
+    /// RLP-encoded block access list as defined in [EIP-7928].
+    ///
+    /// [EIP-7928]: https://eips.ethereum.org/EIPS/eip-7928
+    pub block_access_list: Bytes,
+}
+
+/// This structure maps for the return value of `engine_getPayload` of the beacon chain spec, for
+/// V6.
+///
+/// See also:
+/// <https://github.com/ethereum/execution-apis/blob/main/src/engine/amsterdam.md>
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+#[cfg_attr(any(test, feature = "arbitrary"), derive(arbitrary::Arbitrary))]
+pub struct ExecutionPayloadEnvelopeV6 {
+    /// Execution payload V4
+    pub execution_payload: ExecutionPayloadV4,
+    /// The expected value to be received by the feeRecipient in wei
+    pub block_value: U256,
+    /// The blobs, commitments, and EIP-7594 style cell proofs associated with the executed
+    /// payload.
+    pub blobs_bundle: BlobsBundleV2,
+    /// Introduced in V3, this represents a suggestion from the execution layer if the payload
+    /// should be used instead of an externally provided one.
+    pub should_override_builder: bool,
+    /// A list of opaque [EIP-7685][eip7685] requests.
+    ///
+    /// [eip7685]: https://eips.ethereum.org/EIPS/eip-7685
+    pub execution_requests: Requests,
+}
+
 /// This structure contains a body of an execution payload.
 ///
 /// See also: <https://github.com/ethereum/execution-apis/blob/6452a6b194d7db269bf1dbd087a267251d3cc7f8/src/engine/shanghai.md#executionpayloadbodyv1>
@@ -1551,6 +1609,55 @@ impl ExecutionPayloadBodyV1 {
 impl<T: Encodable2718, H> From<Block<T, H>> for ExecutionPayloadBodyV1 {
     fn from(value: Block<T, H>) -> Self {
         Self::from_block(value)
+    }
+}
+
+/// This structure contains a body of an execution payload (V2).
+///
+/// V2 adds the optional `block_access_list` field for the Amsterdam fork (EIP-7928).
+///
+/// See also: <https://github.com/ethereum/execution-apis/blob/main/src/engine/amsterdam.md>
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+#[cfg_attr(any(test, feature = "arbitrary"), derive(arbitrary::Arbitrary))]
+pub struct ExecutionPayloadBodyV2 {
+    /// Enveloped encoded transactions.
+    pub transactions: Vec<Bytes>,
+    /// All withdrawals in the block.
+    ///
+    /// Will always be `None` if pre shanghai.
+    pub withdrawals: Option<Vec<Withdrawal>>,
+    /// The RLP-encoded block access list.
+    ///
+    /// Will always be `None` if pre amsterdam.
+    pub block_access_list: Option<Bytes>,
+}
+
+impl ExecutionPayloadBodyV2 {
+    /// Creates an [`ExecutionPayloadBodyV2`] from the given withdrawals, transactions, and block
+    /// access list.
+    pub fn new<'a, T>(
+        withdrawals: Option<Withdrawals>,
+        transactions: impl IntoIterator<Item = &'a T>,
+        block_access_list: Option<Bytes>,
+    ) -> Self
+    where
+        T: Encodable2718 + 'a,
+    {
+        Self {
+            transactions: transactions
+                .into_iter()
+                .map(|tx| tx.encoded_2718().into())
+                .collect(),
+            withdrawals: withdrawals.map(Withdrawals::into_inner),
+            block_access_list,
+        }
+    }
+
+    /// Converts a [`alloy_consensus::Block`] into an execution payload body V2.
+    pub fn from_block<T: Encodable2718, H>(block: Block<T, H>, block_access_list: Option<Bytes>) -> Self {
+        Self::new(block.body.withdrawals.clone(), block.body.transactions(), block_access_list)
     }
 }
 

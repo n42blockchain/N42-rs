@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! Test helper impls for transactions
 
 #![allow(dead_code)]
@@ -54,7 +51,7 @@ pub async fn new_tx_manager(
     (transactions, network)
 }
 
-/// Directly buffer hahs into tx fetcher for testing.
+/// Directly buffer hash into tx fetcher for testing.
 pub fn buffer_hash_to_tx_fetcher(
     tx_fetcher: &mut TransactionFetcher,
     hash: TxHash,

@@ -12,7 +12,7 @@ use revm::{bytecode::Bytecode, state::AccountInfo, Database, DatabaseRef};
 /// A helper trait responsible for providing state necessary for EVM execution.
 ///
 /// This serves as the data layer for [`Database`].
-pub trait EvmStateProvider: Send + Sync {
+pub trait EvmStateProvider {
     /// Get basic account information.
     ///
     /// Returns [`None`] if the account doesn't exist.
@@ -67,13 +67,6 @@ impl<T: StateProvider> EvmStateProvider for T {
 #[derive(Clone)]
 pub struct StateProviderDatabase<DB>(pub DB);
 
-// Manual Debug implementation that doesn't require DB: Debug
-impl<DB> core::fmt::Debug for StateProviderDatabase<DB> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("StateProviderDatabase").finish_non_exhaustive()
-    }
-}
-
 impl<DB> StateProviderDatabase<DB> {
     /// Create new State with generic `StateProvider`.
     pub const fn new(db: DB) -> Self {
@@ -83,6 +76,12 @@ impl<DB> StateProviderDatabase<DB> {
     /// Consume State and return inner `StateProvider`.
     pub fn into_inner(self) -> DB {
         self.0
+    }
+}
+
+impl<DB> core::fmt::Debug for StateProviderDatabase<DB> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StateProviderDatabase").finish_non_exhaustive()
     }
 }
 

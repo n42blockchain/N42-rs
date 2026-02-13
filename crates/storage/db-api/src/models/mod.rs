@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! Implements data structures specific to the database
 
 use crate::{
@@ -15,28 +12,28 @@ use reth_ethereum_primitives::{Receipt, TransactionSigned, TxType};
 use reth_primitives_traits::{Account, Bytecode, StorageEntry};
 use reth_prune_types::{PruneCheckpoint, PruneSegment};
 use reth_stages_types::StageCheckpoint;
-use reth_trie_common::{StoredNibbles, StoredNibblesSubKey, *};
+use reth_trie_common::{StorageTrieEntry, StoredNibbles, StoredNibblesSubKey, *};
 use serde::{Deserialize, Serialize};
 
 pub mod accounts;
 mod beacon;
 pub mod blocks;
 pub mod integer_list;
+pub mod metadata;
 pub mod sharded_key;
 mod snapshot;
 pub mod storage_sharded_key;
 mod validator;
-mod metadata;
 
 pub use accounts::*;
 pub use blocks::*;
 pub use integer_list::IntegerList;
+pub use metadata::*;
 pub use reth_db_models::{
-    AccountBeforeTx, ClientVersion, StaticFileBlockWithdrawals, StoredBlockBodyIndices,
-    StoredBlockWithdrawals,
+    AccountBeforeTx, ClientVersion, StaticFileBlockWithdrawals, StorageBeforeTx,
+    StoredBlockBodyIndices, StoredBlockWithdrawals,
 };
 pub use sharded_key::ShardedKey;
-pub use metadata::StorageSettings;
 
 /// Macro that implements [`Encode`] and [`Decode`] for uint types.
 macro_rules! impl_uints {
@@ -107,9 +104,7 @@ impl Encode for B256 {
 
 impl Decode for B256 {
     fn decode(value: &[u8]) -> Result<Self, DatabaseError> {
-        Ok(Self::new(
-            value.try_into().map_err(|_| DatabaseError::Decode)?,
-        ))
+        Ok(Self::new(value.try_into().map_err(|_| DatabaseError::Decode)?))
     }
 }
 
@@ -132,13 +127,10 @@ impl Decode for String {
 }
 
 impl Encode for StoredNibbles {
-    type Encoded = Vec<u8>;
+    type Encoded = arrayvec::ArrayVec<u8, 64>;
 
-    // Delegate to the Compact implementation
     fn encode(self) -> Self::Encoded {
-        // NOTE: This used to be `to_compact`, but all it does is append the bytes to the buffer,
-        // Convert Nibbles to Vec<u8> using to_vec() as From<Nibbles> is no longer available.
-        self.0.to_vec()
+        self.0.iter().collect()
     }
 }
 
@@ -225,11 +217,10 @@ impl_compression_for_compact!(
     Header,
     Account,
     Log,
-    Receipt,
+    Receipt<T>,
     TxType,
     StorageEntry,
     BranchNodeCompact,
-    TrieChangeSetsEntry,
     StoredNibbles,
     StoredNibblesSubKey,
     StorageTrieEntry,
@@ -239,6 +230,7 @@ impl_compression_for_compact!(
     StaticFileBlockWithdrawals,
     Bytecode,
     AccountBeforeTx,
+    StorageBeforeTx,
     TransactionSigned,
     CompactU256,
     StageCheckpoint,
@@ -251,9 +243,9 @@ impl_compression_for_compact!(
 #[cfg(feature = "op")]
 mod op {
     use super::*;
-    use reth_optimism_primitives::{OpReceipt, OpTransactionSigned};
+    use op_alloy_consensus::{OpReceipt, OpTxEnvelope};
 
-    impl_compression_for_compact!(OpTransactionSigned, OpReceipt);
+    impl_compression_for_compact!(OpTxEnvelope, OpReceipt);
 }
 
 macro_rules! impl_compression_fixed_compact {
@@ -267,7 +259,7 @@ macro_rules! impl_compression_fixed_compact {
                 }
 
                 fn compress_to_buf<B: bytes::BufMut + AsMut<[u8]>>(&self, buf: &mut B) {
-                    let _  = Compact::to_compact(self, buf);
+                    let _ = Compact::to_compact(self, buf);
                 }
             }
 
@@ -289,7 +281,7 @@ impl_compression_fixed_compact!(B256, Address);
 macro_rules! add_wrapper_struct {
     ($(($name:tt, $wrapper:tt)),+) => {
         $(
-            /// Wrapper struct so it can use StructFlags from Compact, when used as pure table values.
+            /// Wrapper struct so it can use `StructFlags` from Compact, when used as pure table values.
             #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, Compact)]
             #[cfg_attr(any(test, feature = "arbitrary"), derive(arbitrary::Arbitrary))]
             #[add_arbitrary_tests(compact)]

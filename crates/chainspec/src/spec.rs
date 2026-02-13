@@ -8,7 +8,13 @@ use crate::{
     },
     EthChainSpec,
 };
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{
+    boxed::Box,
+    collections::BTreeMap,
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 use alloy_chains::{Chain, NamedChain};
 use alloy_consensus::{
     constants::{
@@ -18,7 +24,8 @@ use alloy_consensus::{
     Header,
 };
 use alloy_eips::{
-    eip1559::INITIAL_BASE_FEE, eip7685::EMPTY_REQUESTS_HASH, eip7892::BlobScheduleBlobParams,
+    eip1559::INITIAL_BASE_FEE, eip7685::EMPTY_REQUESTS_HASH, eip7840::BlobParams,
+    eip7892::BlobScheduleBlobParams,
 };
 use alloy_genesis::Genesis;
 use alloy_primitives::{address, b256, Address, BlockNumber, B256, U256};
@@ -78,6 +85,8 @@ pub fn make_genesis_header(genesis: &Genesis, hardforks: &ChainHardforks) -> Hea
         .then_some(EMPTY_REQUESTS_HASH);
 
     Header {
+        number: genesis.number.unwrap_or_default(),
+        parent_hash: genesis.parent_hash.unwrap_or_default(),
         gas_limit: genesis.gas_limit,
         difficulty: genesis.difficulty,
         nonce: genesis.nonce.into(),
@@ -94,6 +103,32 @@ pub fn make_genesis_header(genesis: &Genesis, hardforks: &ChainHardforks) -> Hea
         requests_hash,
         ..Default::default()
     }
+}
+
+/// Converts the given [`BlobScheduleBlobParams`] into blobs schedule.
+pub fn blob_params_to_schedule(
+    params: &BlobScheduleBlobParams,
+    hardforks: &ChainHardforks,
+) -> BTreeMap<String, BlobParams> {
+    let mut schedule = BTreeMap::new();
+    schedule.insert("cancun".to_string(), params.cancun);
+    schedule.insert("prague".to_string(), params.prague);
+    schedule.insert("osaka".to_string(), params.osaka);
+
+    // Map scheduled entries back to bpo fork names by matching timestamps
+    let bpo_forks = EthereumHardfork::bpo_variants();
+    for (timestamp, blob_params) in &params.scheduled {
+        for bpo_fork in bpo_forks {
+            if let ForkCondition::Timestamp(fork_ts) = hardforks.fork(bpo_fork) {
+                if fork_ts == *timestamp {
+                    schedule.insert(bpo_fork.name().to_lowercase(), *blob_params);
+                    break;
+                }
+            }
+        }
+    }
+
+    schedule
 }
 
 pub const N42_GENESIS_HASH: B256 =
@@ -389,6 +424,23 @@ impl ChainSpec {
     /// Converts the given [`Genesis`] into a [`ChainSpec`].
     pub fn from_genesis(genesis: Genesis) -> Self {
         genesis.into()
+    }
+
+    /// Build a chainspec using [`ChainSpecBuilder`]
+    pub fn builder() -> ChainSpecBuilder {
+        ChainSpecBuilder::default()
+    }
+
+    /// Map a chain ID to a known chain spec, if available.
+    pub fn from_chain_id(chain_id: u64) -> Option<Arc<Self>> {
+        match NamedChain::try_from(chain_id).ok()? {
+            NamedChain::Mainnet => Some(MAINNET.clone()),
+            NamedChain::Sepolia => Some(SEPOLIA.clone()),
+            NamedChain::Holesky => Some(HOLESKY.clone()),
+            NamedChain::Hoodi => Some(HOODI.clone()),
+            NamedChain::Dev => Some(DEV.clone()),
+            _ => None,
+        }
     }
 
     /// Get information about the chain itself
@@ -729,11 +781,6 @@ impl ChainSpec {
         None
     }
 
-    /// Build a chainspec using [`ChainSpecBuilder`]
-    pub fn builder() -> ChainSpecBuilder {
-        ChainSpecBuilder::default()
-    }
-
     /// Returns the known bootnode records for the given chain.
     pub fn bootnodes(&self) -> Option<Vec<NodeRecord>> {
         if self.is_n42_testnet() {
@@ -943,7 +990,7 @@ impl EthereumHardforks for ChainSpec {
 
 /// A trait for reading the current chainspec.
 #[auto_impl::auto_impl(&, Arc)]
-pub trait ChainSpecProvider: Debug + Send + Sync {
+pub trait ChainSpecProvider: Debug + Send {
     /// The chain spec type.
     type ChainSpec: EthChainSpec + 'static;
 
@@ -974,6 +1021,12 @@ impl ChainSpecBuilder {
     /// Set the chain ID
     pub const fn chain(mut self, chain: Chain) -> Self {
         self.chain = Some(chain);
+        self
+    }
+
+    /// Resets any existing hardforks from the builder.
+    pub fn reset(mut self) -> Self {
+        self.hardforks = ChainHardforks::default();
         self
     }
 
@@ -1132,11 +1185,23 @@ impl ChainSpecBuilder {
         self
     }
 
+    /// Enable Prague at the given timestamp.
+    pub fn with_prague_at(mut self, timestamp: u64) -> Self {
+        self.hardforks.insert(EthereumHardfork::Prague, ForkCondition::Timestamp(timestamp));
+        self
+    }
+
     /// Enable Osaka at genesis.
     pub fn osaka_activated(mut self) -> Self {
         self = self.prague_activated();
         self.hardforks
             .insert(EthereumHardfork::Osaka, ForkCondition::Timestamp(0));
+        self
+    }
+
+    /// Enable Osaka at the given timestamp.
+    pub fn with_osaka_at(mut self, timestamp: u64) -> Self {
+        self.hardforks.insert(EthereumHardfork::Osaka, ForkCondition::Timestamp(timestamp));
         self
     }
 

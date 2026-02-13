@@ -1,30 +1,30 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! Support for customizing the node
 
 use crate::{
     args::{
-        DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, MetricArgs, NetworkArgs,
-        PayloadBuilderArgs, PruningArgs, RpcServerArgs, StaticFilesArgs, TxPoolArgs,
+        DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, NetworkArgs, PayloadBuilderArgs,
+        PruningArgs, RpcServerArgs, StaticFilesArgs, StorageArgs, TxPoolArgs,
     },
     dirs::{ChainPath, DataDirPath},
     utils::get_single_header,
 };
 use alloy_consensus::BlockHeader;
 use alloy_eips::BlockHashOrNumber;
-use alloy_primitives::{BlockNumber, B256};
+use alloy_primitives::{BlockNumber, B256, U256};
 use eyre::eyre;
 use reth_chainspec::{ChainSpec, EthChainSpec, MAINNET};
 use reth_config::config::PruneConfig;
+use reth_engine_local::MiningMode;
 use reth_ethereum_forks::{EthereumHardforks, Head};
 use reth_network_p2p::headers::client::HeadersClient;
 use reth_primitives_traits::SealedHeader;
 use reth_stages_types::StageId;
 use reth_storage_api::{
     BlockHashReader, DatabaseProviderFactory, HeaderProvider, StageCheckpointReader,
+    StorageSettings,
 };
 use reth_storage_errors::provider::ProviderResult;
+use reth_transaction_pool::TransactionPool;
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
     fs,
@@ -33,13 +33,13 @@ use std::{
 };
 use tracing::*;
 
-use crate::args::EraArgs;
+use crate::args::{EraArgs, MetricArgs};
 pub use reth_engine_primitives::{
     DEFAULT_MEMORY_BLOCK_BUFFER_TARGET, DEFAULT_PERSISTENCE_THRESHOLD, DEFAULT_RESERVED_CPU_CORES,
 };
 
 /// Default size of cross-block cache in megabytes.
-pub const DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB: u64 = 4 * 1024;
+pub const DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB: usize = 4 * 1024;
 
 /// This includes all necessary configuration to launch the node.
 /// The individual configuration options can be overwritten before launching the node.
@@ -151,6 +151,9 @@ pub struct NodeConfig<ChainSpec> {
 
     /// All static files related arguments
     pub static_files: StaticFilesArgs,
+
+    /// All storage related arguments with --storage prefix
+    pub storage: StorageArgs,
 }
 
 impl NodeConfig<ChainSpec> {
@@ -182,6 +185,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             engine: EngineArgs::default(),
             era: EraArgs::default(),
             static_files: StaticFilesArgs::default(),
+            storage: StorageArgs::default(),
         }
     }
 
@@ -193,6 +197,22 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
         self.dev.dev = true;
         self.network.discovery.disable_discovery = true;
         self
+    }
+
+    /// Apply a function to the config.
+    pub fn apply<F>(self, f: F) -> Self
+    where
+        F: FnOnce(Self) -> Self,
+    {
+        f(self)
+    }
+
+    /// Applies a fallible function to the config.
+    pub fn try_apply<F, R>(self, f: F) -> Result<Self, R>
+    where
+        F: FnOnce(Self) -> Result<Self, R>,
+    {
+        f(self)
     }
 
     /// Sets --dev mode for the node [`NodeConfig::dev`], if `dev` is true.
@@ -240,6 +260,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             engine,
             era,
             static_files,
+            storage,
             ..
         } = self;
         NodeConfig {
@@ -259,6 +280,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             engine,
             era,
             static_files,
+            storage,
         }
     }
 
@@ -327,12 +349,31 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
         self
     }
 
+    /// Set the storage args for the node
+    pub const fn with_storage(mut self, storage: StorageArgs) -> Self {
+        self.storage = storage;
+        self
+    }
+
     /// Returns pruning configuration.
     pub fn prune_config(&self) -> Option<PruneConfig>
     where
         ChainSpec: EthereumHardforks,
     {
         self.pruning.prune_config(&self.chain)
+    }
+
+    /// Returns the effective storage settings derived from `--storage.v2`.
+    ///
+    /// The base storage mode is determined by `--storage.v2`:
+    /// - When `--storage.v2` is set: uses [`StorageSettings::v2()`] defaults
+    /// - Otherwise: uses [`StorageSettings::base()`] defaults
+    pub const fn storage_settings(&self) -> StorageSettings {
+        if self.storage.v2 {
+            StorageSettings::v2()
+        } else {
+            StorageSettings::base()
+        }
     }
 
     /// Returns the max block that the node should run to, looking it up from the network if
@@ -349,10 +390,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
         let max_block = if let Some(block) = self.debug.max_block {
             Some(block)
         } else if let Some(tip) = self.debug.tip {
-            Some(
-                self.lookup_or_fetch_tip(provider, network_client, tip)
-                    .await?,
-            )
+            Some(self.lookup_or_fetch_tip(provider, network_client, tip).await?)
         } else {
             None
         };
@@ -371,20 +409,11 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
     {
         let provider = factory.database_provider_ro()?;
 
-        let head = provider
-            .get_stage_checkpoint(StageId::Finish)?
-            .unwrap_or_default()
-            .block_number;
+        let head = provider.get_stage_checkpoint(StageId::Finish)?.unwrap_or_default().block_number;
 
         let header = provider
             .header_by_number(head)?
             .expect("the header for the latest block is missing, database is corrupt");
-
-        let total_difficulty = provider
-            .header_td_by_number(head)?
-            // total difficulty is effectively deprecated, but still required in some places, e.g.
-            // p2p
-            .unwrap_or_default();
 
         let hash = provider
             .block_hash(head)?
@@ -394,7 +423,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             number: head,
             hash,
             difficulty: header.difficulty(),
-            total_difficulty,
+            total_difficulty: U256::ZERO,
             timestamp: header.timestamp(),
         })
     }
@@ -418,13 +447,10 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
         // try to look up the header in the database
         if let Some(header) = header {
             info!(target: "reth::cli", ?tip, "Successfully looked up tip block in the database");
-            return Ok(header.number());
+            return Ok(header.number())
         }
 
-        Ok(self
-            .fetch_tip_from_network(client, tip.into())
-            .await
-            .number())
+        Ok(self.fetch_tip_from_network(client, tip.into()).await.number())
     }
 
     /// Attempt to look up the block with the given number and return the header.
@@ -444,7 +470,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             match get_single_header(&client, tip).await {
                 Ok(tip_header) => {
                     info!(target: "reth::cli", ?tip, "Successfully fetched tip");
-                    return tip_header;
+                    return tip_header
                 }
                 Err(error) => {
                     fetch_failures += 1;
@@ -468,6 +494,12 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
     pub fn with_unused_ports(mut self) -> Self {
         self.rpc = self.rpc.with_unused_ports();
         self.network = self.network.with_unused_ports();
+        self
+    }
+
+    /// Disables all discovery services for the node.
+    pub const fn with_disabled_discovery(mut self) -> Self {
+        self.network.discovery.disable_discovery = true;
         self
     }
 
@@ -538,6 +570,19 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             engine: self.engine,
             era: self.era,
             static_files: self.static_files,
+            storage: self.storage,
+        }
+    }
+
+    /// Returns the [`MiningMode`] intended for --dev mode.
+    pub fn dev_mining_mode<Pool>(&self, pool: Pool) -> MiningMode<Pool>
+    where
+        Pool: TransactionPool + Unpin,
+    {
+        if let Some(interval) = self.dev.block_time {
+            MiningMode::interval(interval)
+        } else {
+            MiningMode::instant(pool, self.dev.block_max_transactions)
         }
     }
 }
@@ -567,6 +612,7 @@ impl<ChainSpec> Clone for NodeConfig<ChainSpec> {
             engine: self.engine.clone(),
             era: self.era.clone(),
             static_files: self.static_files,
+            storage: self.storage,
         }
     }
 }

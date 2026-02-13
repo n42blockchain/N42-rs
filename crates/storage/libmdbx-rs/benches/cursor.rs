@@ -1,13 +1,9 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 #![allow(missing_docs)]
 mod utils;
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use pprof::criterion::{Output, PProfProfiler};
+use criterion::{criterion_group, criterion_main, Criterion};
 use reth_libmdbx::{ffi::*, *};
-use std::ptr;
+use std::{hint::black_box, ptr};
 use utils::*;
 
 /// Benchmark of iterator sequential read performance.
@@ -16,10 +12,10 @@ fn bench_get_seq_iter(c: &mut Criterion) {
     let (_dir, env) = setup_bench_db(n);
     let txn = env.begin_ro_txn().unwrap();
     let db = txn.open_db(None).unwrap();
-
+    let dbi = db.dbi();
     c.bench_function("bench_get_seq_iter", |b| {
         b.iter(|| {
-            let mut cursor = txn.cursor(&db).unwrap();
+            let mut cursor = txn.cursor(dbi).unwrap();
             let mut i = 0;
             let mut count = 0u32;
 
@@ -58,11 +54,11 @@ fn bench_get_seq_cursor(c: &mut Criterion) {
     let (_dir, env) = setup_bench_db(n);
     let txn = env.begin_ro_txn().unwrap();
     let db = txn.open_db(None).unwrap();
-
+    let dbi = db.dbi();
     c.bench_function("bench_get_seq_cursor", |b| {
         b.iter(|| {
             let (i, count) = txn
-                .cursor(&db)
+                .cursor(dbi)
                 .unwrap()
                 .iter::<ObjectLength, ObjectLength>()
                 .map(Result::unwrap)
@@ -89,11 +85,11 @@ fn bench_get_seq_raw(c: &mut Criterion) {
     c.bench_function("bench_get_seq_raw", |b| {
         b.iter(|| unsafe {
             txn.txn_execute(|txn| {
-                mdbx_cursor_open(txn, dbi, &mut cursor);
+                mdbx_cursor_open(txn, dbi, &raw mut cursor);
                 let mut i = 0;
                 let mut count = 0u32;
 
-                while mdbx_cursor_get(cursor, &mut key, &mut data, MDBX_NEXT) == 0 {
+                while mdbx_cursor_get(cursor, &raw mut key, &raw mut data, MDBX_NEXT) == 0 {
                     i += key.iov_len + data.iov_len;
                     count += 1;
                 }
@@ -109,7 +105,7 @@ fn bench_get_seq_raw(c: &mut Criterion) {
 
 criterion_group! {
     name = benches;
-    config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
+    config = Criterion::default();
     targets = bench_get_seq_iter, bench_get_seq_cursor, bench_get_seq_raw
 }
 criterion_main!(benches);

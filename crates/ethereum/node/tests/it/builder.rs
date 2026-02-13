@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! Node builder setup tests.
 
 use std::sync::Arc;
@@ -13,7 +10,8 @@ use reth_node_api::NodeTypesWithDBAdapter;
 use reth_node_builder::{EngineNodeLauncher, FullNodeComponents, NodeBuilder, NodeConfig};
 use reth_node_ethereum::node::{EthereumAddOns, EthereumNode};
 use reth_provider::providers::BlockchainProvider;
-use reth_tasks::TaskManager;
+use reth_rpc_builder::Identity;
+use reth_tasks::Runtime;
 
 #[test]
 fn test_basic_setup() {
@@ -36,6 +34,7 @@ fn test_basic_setup() {
             let _client = handles.rpc.http_client();
             Ok(())
         })
+        .map_add_ons(|addons| addons.with_rpc_middleware(Identity::default()))
         .extend_rpc_modules(|ctx| {
             let _ = ctx.config();
             let _ = ctx.node().provider();
@@ -47,21 +46,26 @@ fn test_basic_setup() {
 
 #[tokio::test]
 async fn test_eth_launcher() {
-    let tasks = TaskManager::current();
+    let runtime = Runtime::with_existing_handle(tokio::runtime::Handle::current()).unwrap();
     let config = NodeConfig::test();
     let db = create_test_rw_db();
     let _builder =
         NodeBuilder::new(config)
             .with_database(db)
+            .with_launch_context(runtime.clone())
             .with_types_and_provider::<EthereumNode, BlockchainProvider<
                 NodeTypesWithDBAdapter<EthereumNode, Arc<TempDatabase<DatabaseEnv>>>,
             >>()
             .with_components(EthereumNode::components())
             .with_add_ons(EthereumAddOns::default())
+            .apply(|builder| {
+                let _ = builder.db();
+                builder
+            })
             .launch_with_fn(|builder| {
                 let launcher = EngineNodeLauncher::new(
-                    tasks.executor(),
-                    builder.config.datadir(),
+                    runtime.clone(),
+                    builder.config().datadir(),
                     Default::default(),
                 );
                 builder.launch_with(launcher)
@@ -69,11 +73,47 @@ async fn test_eth_launcher() {
 }
 
 #[test]
+fn test_eth_launcher_with_tokio_runtime() {
+    // #[tokio::test] can not be used here because we need to create a custom tokio runtime
+    // and it would be dropped before the test is finished, resulting in a panic.
+    let main_rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+
+    let custom_rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+
+    main_rt.block_on(async {
+        let runtime = Runtime::with_existing_handle(tokio::runtime::Handle::current()).unwrap();
+        let config = NodeConfig::test();
+        let db = create_test_rw_db();
+        let _builder =
+            NodeBuilder::new(config)
+                .with_database(db)
+                .with_launch_context(runtime.clone())
+                .with_types_and_provider::<EthereumNode, BlockchainProvider<
+                    NodeTypesWithDBAdapter<EthereumNode, Arc<TempDatabase<DatabaseEnv>>>,
+                >>()
+                .with_components(EthereumNode::components())
+                .with_add_ons(
+                    EthereumAddOns::default().with_tokio_runtime(Some(custom_rt.handle().clone())),
+                )
+                .apply(|builder| {
+                    let _ = builder.db();
+                    builder
+                })
+                .launch_with_fn(|builder| {
+                    let launcher = EngineNodeLauncher::new(
+                        runtime.clone(),
+                        builder.config().datadir(),
+                        Default::default(),
+                    );
+                    builder.launch_with(launcher)
+                });
+    });
+}
+
+#[test]
 fn test_node_setup() {
     let config = NodeConfig::test();
     let db = create_test_rw_db();
-    let _builder = NodeBuilder::new(config)
-        .with_database(db)
-        .node(EthereumNode::default())
-        .check_launch();
+    let _builder =
+        NodeBuilder::new(config).with_database(db).node(EthereumNode::default()).check_launch();
 }

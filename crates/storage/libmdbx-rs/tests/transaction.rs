@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 #![allow(missing_docs)]
 use reth_libmdbx::*;
 use std::{
@@ -53,9 +50,9 @@ fn test_put_get_del_multi() {
     txn.commit().unwrap();
 
     let txn = env.begin_rw_txn().unwrap();
-    let db = txn.open_db(None).unwrap();
+    let dbi = txn.open_db(None).unwrap().dbi();
     {
-        let mut cur = txn.cursor(&db).unwrap();
+        let mut cur = txn.cursor(dbi).unwrap();
         let iter = cur.iter_dup_of::<(), [u8; 4]>(b"key1");
         let vals = iter.map(|x| x.unwrap()).map(|(_, x)| x).collect::<Vec<_>>();
         assert_eq!(vals, vec![*b"val1", *b"val2", *b"val3"]);
@@ -69,9 +66,9 @@ fn test_put_get_del_multi() {
     txn.commit().unwrap();
 
     let txn = env.begin_rw_txn().unwrap();
-    let db = txn.open_db(None).unwrap();
+    let dbi = txn.open_db(None).unwrap().dbi();
     {
-        let mut cur = txn.cursor(&db).unwrap();
+        let mut cur = txn.cursor(dbi).unwrap();
         let iter = cur.iter_dup_of::<(), [u8; 4]>(b"key1");
         let vals = iter.map(|x| x.unwrap()).map(|(_, x)| x).collect::<Vec<_>>();
         assert_eq!(vals, vec![*b"val1", *b"val3"]);
@@ -106,10 +103,13 @@ fn test_reserve() {
     let env = Environment::builder().open(dir.path()).unwrap();
 
     let txn = env.begin_rw_txn().unwrap();
-    let db = txn.open_db(None).unwrap();
+    let dbi = txn.open_db(None).unwrap().dbi();
     {
-        let mut writer = txn.reserve(&db, b"key1", 4, WriteFlags::empty()).unwrap();
-        writer.write_all(b"val1").unwrap();
+        unsafe {
+            // SAFETY: the returned slice is used before the transaction is committed or aborted.
+            let mut writer = txn.reserve(dbi, b"key1", 4, WriteFlags::empty()).unwrap();
+            writer.write_all(b"val1").unwrap();
+        }
     }
     txn.commit().unwrap();
 
@@ -151,13 +151,13 @@ fn test_clear_db() {
     {
         let txn = env.begin_rw_txn().unwrap();
         txn.put(txn.open_db(None).unwrap().dbi(), b"key", b"val", WriteFlags::empty()).unwrap();
-        assert!(!txn.commit().unwrap().0);
+        txn.commit().unwrap();
     }
 
     {
         let txn = env.begin_rw_txn().unwrap();
         txn.clear_db(txn.open_db(None).unwrap().dbi()).unwrap();
-        assert!(!txn.commit().unwrap().0);
+        txn.commit().unwrap();
     }
 
     let txn = env.begin_ro_txn().unwrap();
@@ -181,16 +181,16 @@ fn test_drop_db() {
             .unwrap();
             // Workaround for MDBX dbi drop issue
             txn.create_db(Some("canary"), DatabaseFlags::empty()).unwrap();
-            assert!(!txn.commit().unwrap().0);
+            txn.commit().unwrap();
         }
         {
             let txn = env.begin_rw_txn().unwrap();
-            let db = txn.open_db(Some("test")).unwrap();
+            let dbi = txn.open_db(Some("test")).unwrap().dbi();
             unsafe {
-                txn.drop_db(db).unwrap();
+                txn.drop_db(dbi).unwrap();
             }
             assert!(matches!(txn.open_db(Some("test")).unwrap_err(), Error::NotFound));
-            assert!(!txn.commit().unwrap().0);
+            txn.commit().unwrap();
         }
     }
 
@@ -294,8 +294,8 @@ fn test_stat() {
 
     {
         let txn = env.begin_ro_txn().unwrap();
-        let db = txn.open_db(None).unwrap();
-        let stat = txn.db_stat(&db).unwrap();
+        let dbi = txn.open_db(None).unwrap().dbi();
+        let stat = txn.db_stat(dbi).unwrap();
         assert_eq!(stat.entries(), 3);
     }
 
@@ -307,8 +307,8 @@ fn test_stat() {
 
     {
         let txn = env.begin_ro_txn().unwrap();
-        let db = txn.open_db(None).unwrap();
-        let stat = txn.db_stat(&db).unwrap();
+        let dbi = txn.open_db(None).unwrap().dbi();
+        let stat = txn.db_stat(dbi).unwrap();
         assert_eq!(stat.entries(), 1);
     }
 
@@ -321,8 +321,8 @@ fn test_stat() {
 
     {
         let txn = env.begin_ro_txn().unwrap();
-        let db = txn.open_db(None).unwrap();
-        let stat = txn.db_stat(&db).unwrap();
+        let dbi = txn.open_db(None).unwrap().dbi();
+        let stat = txn.db_stat(dbi).unwrap();
         assert_eq!(stat.entries(), 4);
     }
 }
@@ -334,20 +334,22 @@ fn test_stat_dupsort() {
 
     let txn = env.begin_rw_txn().unwrap();
     let db = txn.create_db(None, DatabaseFlags::DUP_SORT).unwrap();
-    txn.put(db.dbi(), b"key1", b"val1", WriteFlags::empty()).unwrap();
-    txn.put(db.dbi(), b"key1", b"val2", WriteFlags::empty()).unwrap();
-    txn.put(db.dbi(), b"key1", b"val3", WriteFlags::empty()).unwrap();
-    txn.put(db.dbi(), b"key2", b"val1", WriteFlags::empty()).unwrap();
-    txn.put(db.dbi(), b"key2", b"val2", WriteFlags::empty()).unwrap();
-    txn.put(db.dbi(), b"key2", b"val3", WriteFlags::empty()).unwrap();
-    txn.put(db.dbi(), b"key3", b"val1", WriteFlags::empty()).unwrap();
-    txn.put(db.dbi(), b"key3", b"val2", WriteFlags::empty()).unwrap();
-    txn.put(db.dbi(), b"key3", b"val3", WriteFlags::empty()).unwrap();
+    let dbi = db.dbi();
+    txn.put(dbi, b"key1", b"val1", WriteFlags::empty()).unwrap();
+    txn.put(dbi, b"key1", b"val2", WriteFlags::empty()).unwrap();
+    txn.put(dbi, b"key1", b"val3", WriteFlags::empty()).unwrap();
+    txn.put(dbi, b"key2", b"val1", WriteFlags::empty()).unwrap();
+    txn.put(dbi, b"key2", b"val2", WriteFlags::empty()).unwrap();
+    txn.put(dbi, b"key2", b"val3", WriteFlags::empty()).unwrap();
+    txn.put(dbi, b"key3", b"val1", WriteFlags::empty()).unwrap();
+    txn.put(dbi, b"key3", b"val2", WriteFlags::empty()).unwrap();
+    txn.put(dbi, b"key3", b"val3", WriteFlags::empty()).unwrap();
     txn.commit().unwrap();
 
     {
         let txn = env.begin_ro_txn().unwrap();
-        let stat = txn.db_stat(&txn.open_db(None).unwrap()).unwrap();
+        let dbi = txn.open_db(None).unwrap().dbi();
+        let stat = txn.db_stat(dbi).unwrap();
         assert_eq!(stat.entries(), 9);
     }
 
@@ -359,7 +361,8 @@ fn test_stat_dupsort() {
 
     {
         let txn = env.begin_ro_txn().unwrap();
-        let stat = txn.db_stat(&txn.open_db(None).unwrap()).unwrap();
+        let dbi = txn.open_db(None).unwrap().dbi();
+        let stat = txn.db_stat(dbi).unwrap();
         assert_eq!(stat.entries(), 5);
     }
 
@@ -372,7 +375,8 @@ fn test_stat_dupsort() {
 
     {
         let txn = env.begin_ro_txn().unwrap();
-        let stat = txn.db_stat(&txn.open_db(None).unwrap()).unwrap();
+        let dbi = txn.open_db(None).unwrap().dbi();
+        let stat = txn.db_stat(dbi).unwrap();
         assert_eq!(stat.entries(), 8);
     }
 }

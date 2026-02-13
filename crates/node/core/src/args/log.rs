@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! clap [Args](clap::Args) for logging configuration.
 
 use crate::dirs::{LogsDir, PlatformPath};
@@ -11,8 +8,11 @@ use reth_tracing::{
 };
 use std::{fmt, fmt::Display};
 use tracing::{level_filters::LevelFilter, Level};
+
 /// Constant to convert megabytes to bytes
 const MB_TO_BYTES: u64 = 1024 * 1024;
+
+const PROFILER_TRACING_FILTER: &str = "debug";
 
 /// The log configuration.
 #[derive(Debug, Args)]
@@ -23,12 +23,7 @@ pub struct LogArgs {
     pub log_stdout_format: LogFormat,
 
     /// The filter to use for logs written to stdout.
-    #[arg(
-        long = "log.stdout.filter",
-        value_name = "FILTER",
-        global = true,
-        default_value = ""
-    )]
+    #[arg(long = "log.stdout.filter", value_name = "FILTER", global = true, default_value = "")]
     pub log_stdout_filter: String,
 
     /// The format to use for logs written to the log file.
@@ -36,49 +31,24 @@ pub struct LogArgs {
     pub log_file_format: LogFormat,
 
     /// The filter to use for logs written to the log file.
-    #[arg(
-        long = "log.file.filter",
-        value_name = "FILTER",
-        global = true,
-        default_value = "debug"
-    )]
+    #[arg(long = "log.file.filter", value_name = "FILTER", global = true, default_value = "debug")]
     pub log_file_filter: String,
 
     /// The path to put log files in.
-    #[arg(
-        long = "log.file.directory",
-        value_name = "PATH",
-        global = true,
-        default_value_t
-    )]
+    #[arg(long = "log.file.directory", value_name = "PATH", global = true, default_value_t)]
     pub log_file_directory: PlatformPath<LogsDir>,
 
     /// The prefix name of the log files.
-    #[arg(
-        long = "log.file.name",
-        value_name = "NAME",
-        global = true,
-        default_value = "reth.log"
-    )]
+    #[arg(long = "log.file.name", value_name = "NAME", global = true, default_value = "reth.log")]
     pub log_file_name: String,
 
     /// The maximum size (in MB) of one log file.
-    #[arg(
-        long = "log.file.max-size",
-        value_name = "SIZE",
-        global = true,
-        default_value_t = 200
-    )]
+    #[arg(long = "log.file.max-size", value_name = "SIZE", global = true, default_value_t = 200)]
     pub log_file_max_size: u64,
 
     /// The maximum amount of log files that will be stored. If set to 0, background file logging
     /// is disabled.
-    #[arg(
-        long = "log.file.max-files",
-        value_name = "COUNT",
-        global = true,
-        default_value_t = 5
-    )]
+    #[arg(long = "log.file.max-files", value_name = "COUNT", global = true, default_value_t = 5)]
     pub log_file_max_files: usize,
 
     /// Write logs to journald.
@@ -94,6 +64,34 @@ pub struct LogArgs {
     )]
     pub journald_filter: String,
 
+    /// Emit traces to samply. Only useful when profiling.
+    #[arg(long = "log.samply", global = true, hide = true)]
+    pub samply: bool,
+
+    /// The filter to use for traces emitted to samply.
+    #[arg(
+        long = "log.samply.filter",
+        value_name = "FILTER",
+        global = true,
+        default_value = PROFILER_TRACING_FILTER,
+        hide = true
+    )]
+    pub samply_filter: String,
+
+    /// Emit traces to tracy. Only useful when profiling.
+    #[arg(long = "log.tracy", global = true, hide = true)]
+    pub tracy: bool,
+
+    /// The filter to use for traces emitted to tracy.
+    #[arg(
+        long = "log.tracy.filter",
+        value_name = "FILTER",
+        global = true,
+        default_value = PROFILER_TRACING_FILTER,
+        hide = true
+    )]
+    pub tracy_filter: String,
+
     /// Sets whether or not the formatter emits ANSI terminal escape codes for colors and other
     /// text formatting.
     #[arg(
@@ -103,6 +101,7 @@ pub struct LogArgs {
         default_value_t = ColorMode::Always
     )]
     pub color: ColorMode,
+
     /// The verbosity settings for the tracer.
     #[command(flatten)]
     pub verbosity: Verbosity,
@@ -161,6 +160,23 @@ impl LogArgs {
             tracer = tracer.with_file(file, info);
         }
 
+        if self.samply {
+            let config = self.layer_info(LogFormat::Terminal, self.samply_filter.clone(), false);
+            tracer = tracer.with_samply(config);
+        }
+
+        if self.tracy {
+            #[cfg(feature = "tracy")]
+            {
+                let config = self.layer_info(LogFormat::Terminal, self.tracy_filter.clone(), false);
+                tracer = tracer.with_tracy(config);
+            }
+            #[cfg(not(feature = "tracy"))]
+            {
+                tracing::warn!("`--log.tracy` requested but `tracy` feature was not compiled in");
+            }
+        }
+
         let guard = tracer.init_with_layers(layers)?;
         Ok(guard)
     }
@@ -171,7 +187,7 @@ impl LogArgs {
 pub enum ColorMode {
     /// Colors on
     Always,
-    /// Colors on
+    /// Auto-detect
     Auto,
     /// Colors off
     Never,
@@ -202,13 +218,7 @@ pub struct Verbosity {
     verbosity: u8,
 
     /// Silence all log output.
-    #[arg(
-        long,
-        alias = "silent",
-        short = 'q',
-        global = true,
-        help_heading = "Display"
-    )]
+    #[arg(long, alias = "silent", short = 'q', global = true, help_heading = "Display")]
     quiet: bool,
 }
 

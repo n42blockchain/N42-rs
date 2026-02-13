@@ -28,7 +28,7 @@ use reth::{
     rpc::types::engine::ForkchoiceState,
 };
 use reth_node_builder::{rpc::RethRpcAddOns, FullNode, NodeBuilder, NodeConfig, NodeHandle};
-use reth_tasks::TaskManager;
+use reth_tasks::Runtime;
 
 use n42_clique::{EXTRA_SEAL, EXTRA_VANITY};
 use reth_primitives_traits::{header::clique_utils::SIGNATURE_LENGTH, AlloyBlockHeader};
@@ -190,8 +190,7 @@ impl CliqueTest {
 
     async fn happy_path(&self) -> eyre::Result<()> {
         reth_tracing::init_test_tracing();
-        let tasks = TaskManager::current();
-        let exec = tasks.executor();
+        let runtime = Runtime::with_existing_handle(tokio::runtime::Handle::current()).unwrap();
 
         let network_config = NetworkArgs {
             discovery: DiscoveryArgs {
@@ -214,7 +213,7 @@ impl CliqueTest {
             });
 
         let NodeHandle { node, .. } = NodeBuilder::new(node_config.clone())
-            .testing_node(exec.clone())
+            .testing_node(runtime.clone())
             .with_types::<N42Node>()
             .with_components(N42Node::default().components_builder())
             .with_add_ons(N42Node::default().add_ons())

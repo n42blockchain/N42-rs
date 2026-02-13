@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use crate::BlockIdReader;
 use alloc::vec::Vec;
 use alloy_eips::{BlockHashOrNumber, BlockId, BlockNumberOrTag};
@@ -14,7 +11,7 @@ pub type ProviderReceipt<P> = <P as ReceiptProvider>::Receipt;
 
 /// Client trait for fetching receipt data.
 #[auto_impl::auto_impl(&, Arc)]
-pub trait ReceiptProvider: Send + Sync {
+pub trait ReceiptProvider {
     /// The receipt type.
     type Receipt: Receipt;
 
@@ -76,7 +73,7 @@ pub trait ReceiptProviderIdExt: ReceiptProvider + BlockIdReader {
                 if let Some(num) = self.convert_block_number(num_tag)? {
                     BlockHashOrNumber::Number(num)
                 } else {
-                    return Ok(None);
+                    return Ok(None)
                 }
             }
         };

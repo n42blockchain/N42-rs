@@ -1,20 +1,19 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use crate::EthEvmConfig;
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
-use alloy_consensus::Header;
+use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
+use alloy_consensus::{Header, TxType};
 use alloy_eips::eip7685::Requests;
 use alloy_evm::precompiles::PrecompilesMap;
+use alloy_primitives::Bytes;
+use alloy_rpc_types_engine::ExecutionData;
 use parking_lot::Mutex;
 use reth_ethereum_primitives::{Receipt, TransactionSigned};
 use reth_evm::{
     block::{
-        BlockExecutionError, BlockExecutor, BlockExecutorFactory, BlockExecutorFor,
-        ExecutableTx,
+        BlockExecutionError, BlockExecutor, BlockExecutorFactory, BlockExecutorFor, ExecutableTx,
     },
-    eth::{EthBlockExecutionCtx, EthEvmContext},
-    ConfigureEvm, Database, EthEvm, EthEvmFactory, Evm, EvmEnvFor, EvmFactory,
+    eth::{EthBlockExecutionCtx, EthEvmContext, EthTxResult},
+    ConfigureEngineEvm, ConfigureEvm, Database, EthEvm, EthEvmFactory, Evm, EvmEnvFor, EvmFactory,
+    ExecutableTxIterator, ExecutionCtxFor, RecoveredTx,
 };
 use reth_execution_types::{BlockExecutionResult, ExecutionOutcome};
 use reth_primitives_traits::{BlockTy, SealedBlock, SealedHeader};
@@ -66,7 +65,12 @@ impl BlockExecutorFactory for MockEvmConfig {
         DB: Database + 'a,
         I: Inspector<<Self::EvmFactory as EvmFactory>::Context<&'a mut State<DB>>> + 'a,
     {
-        MockExecutor { result: self.exec_results.lock().pop().unwrap(), evm, hook: None }
+        MockExecutor {
+            result: self.exec_results.lock().pop().unwrap(),
+            evm,
+            hook: None,
+            receipts: Vec::new(),
+        }
     }
 }
 
@@ -77,6 +81,7 @@ pub struct MockExecutor<'a, DB: Database, I> {
     evm: EthEvm<&'a mut State<DB>, I, PrecompilesMap>,
     #[debug(skip)]
     hook: Option<Box<dyn reth_evm::OnStateHook>>,
+    receipts: Vec<Receipt>,
 }
 
 impl<'a, DB: Database, I: Inspector<EthEvmContext<&'a mut State<DB>>>> BlockExecutor
@@ -85,32 +90,37 @@ impl<'a, DB: Database, I: Inspector<EthEvmContext<&'a mut State<DB>>>> BlockExec
     type Evm = EthEvm<&'a mut State<DB>, I, PrecompilesMap>;
     type Transaction = TransactionSigned;
     type Receipt = Receipt;
+    type Result = EthTxResult<HaltReason, TxType>;
 
     fn apply_pre_execution_changes(&mut self) -> Result<(), BlockExecutionError> {
         Ok(())
     }
 
-    fn execute_transaction_without_commit(
-        &mut self,
-        _tx: impl ExecutableTx<Self>,
-    ) -> Result<ResultAndState<HaltReason>, BlockExecutionError> {
-        Ok(ResultAndState::new(
-            ExecutionResult::Success {
-                reason: SuccessReason::Return,
-                gas_used: 0,
-                gas_refunded: 0,
-                logs: Vec::new(),
-                output: Output::Call(Default::default()),
-            },
-            Default::default(),
-        ))
+    fn receipts(&self) -> &[Self::Receipt] {
+        &self.receipts
     }
 
-    fn commit_transaction(
+    fn execute_transaction_without_commit(
         &mut self,
-        _result: ResultAndState<HaltReason>,
-        _tx: impl ExecutableTx<Self>,
-    ) -> Result<u64, BlockExecutionError> {
+        tx: impl ExecutableTx<Self>,
+    ) -> Result<Self::Result, BlockExecutionError> {
+        Ok(EthTxResult {
+            result: ResultAndState::new(
+                ExecutionResult::Success {
+                    reason: SuccessReason::Return,
+                    gas_used: 0,
+                    gas_refunded: 0,
+                    logs: vec![],
+                    output: Output::Call(Bytes::from(vec![])),
+                },
+                Default::default(),
+            ),
+            tx_type: tx.into_parts().1.tx().tx_type(),
+            blob_gas_used: 0,
+        })
+    }
+
+    fn commit_transaction(&mut self, _output: Self::Result) -> Result<u64, BlockExecutionError> {
         Ok(0)
     }
 
@@ -144,10 +154,6 @@ impl<'a, DB: Database, I: Inspector<EthEvmContext<&'a mut State<DB>>>> BlockExec
 
     fn evm_mut(&mut self) -> &mut Self::Evm {
         &mut self.evm
-    }
-
-    fn receipts(&self) -> &[Self::Receipt] {
-        &[]
     }
 }
 
@@ -191,5 +197,25 @@ impl ConfigureEvm for MockEvmConfig {
         attributes: Self::NextBlockEnvCtx,
     ) -> Result<reth_evm::ExecutionCtxFor<'_, Self>, Self::Error> {
         self.inner.context_for_next_block(parent, attributes)
+    }
+}
+
+impl ConfigureEngineEvm<ExecutionData> for MockEvmConfig {
+    fn evm_env_for_payload(&self, payload: &ExecutionData) -> Result<EvmEnvFor<Self>, Self::Error> {
+        self.inner.evm_env_for_payload(payload)
+    }
+
+    fn context_for_payload<'a>(
+        &self,
+        payload: &'a ExecutionData,
+    ) -> Result<ExecutionCtxFor<'a, Self>, Self::Error> {
+        self.inner.context_for_payload(payload)
+    }
+
+    fn tx_iterator_for_payload(
+        &self,
+        payload: &ExecutionData,
+    ) -> Result<impl ExecutableTxIterator<Self>, Self::Error> {
+        self.inner.tx_iterator_for_payload(payload)
     }
 }

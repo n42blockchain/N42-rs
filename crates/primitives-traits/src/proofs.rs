@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! Helper function for calculating Merkle proofs and hashes.
 pub use alloy_trie::root::ordered_trie_root_with_encoder;
 
@@ -55,13 +52,8 @@ mod tests {
 
         for (test_addr, expected_root) in fixtures {
             let mut genesis_alloc = HashMap::new();
-            genesis_alloc.insert(
-                test_addr,
-                GenesisAccount {
-                    balance: U256::MAX,
-                    ..Default::default()
-                },
-            );
+            genesis_alloc
+                .insert(test_addr, GenesisAccount { balance: U256::MAX, ..Default::default() });
 
             let root = state_root_unhashed(genesis_alloc);
 

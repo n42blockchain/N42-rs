@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! Tables and data models.
 //!
 //! # Overview
@@ -19,7 +16,6 @@ pub mod codecs;
 mod raw;
 pub use raw::{RawDupSort, RawKey, RawTable, RawValue, TableRawRow};
 
-use crate::models::BlockNumberHashedAddress;
 use crate::{
     models::{
         accounts::BlockNumberAddress,
@@ -37,9 +33,7 @@ use reth_ethereum_primitives::{Receipt, TransactionSigned};
 use reth_primitives_traits::{Account, Bytecode, StorageEntry};
 use reth_prune_types::{PruneCheckpoint, PruneSegment};
 use reth_stages_types::StageCheckpoint;
-use reth_trie_common::{
-    BranchNodeCompact, StorageTrieEntry, StoredNibbles, StoredNibblesSubKey, TrieChangeSetsEntry,
-};
+use reth_trie_common::{BranchNodeCompact, StorageTrieEntry, StoredNibbles, StoredNibblesSubKey};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -73,10 +67,7 @@ pub enum TableType {
 ///         Ok(())
 ///     }
 ///
-///     fn view_dupsort<T: DupSort>(&self) -> Result<(), Self::Error>
-///     where
-///         T::Value: reth_primitives_traits::ValueWithSubKey<SubKey = T::SubKey>,
-///     {
+///     fn view_dupsort<T: DupSort>(&self) -> Result<(), Self::Error> {
 ///         // operate on a dupsort table in a generic way
 ///         Ok(())
 ///     }
@@ -141,9 +132,7 @@ macro_rules! tables {
             ///
             #[doc = concat!("Marker type representing a database table mapping [`", stringify!($key), "`] to ", tables!(@value_doc $key, $value, $($($generic),*)?), ".")]
             $(
-                #[doc = concat!("
-
-This table's `DUPSORT` subkey is [`", stringify!($subkey), "`].")]
+                #[doc = concat!("\n\nThis table's `DUPSORT` subkey is [`", stringify!($subkey), "`].")]
             )?
             pub struct $name$(<$($generic $( = $default)?),*>)? {
                 _private: std::marker::PhantomData<($($($generic,)*)?)>,
@@ -315,104 +304,14 @@ This table's `DUPSORT` subkey is [`", stringify!($subkey), "`].")]
 }
 
 tables! {
-    ///
-    table BeaconStateRecord{
-        type Key = BlockHash;
-        type Value = BeaconState;
-    }
-
-    ///
-    table BeaconBlockRecord{
-        type Key = BlockHash;
-        type Value = BeaconBlock;
-    }
-
-    ///
-    table BeaconNum2Hash{
-        type Key = BlockNumber;
-        type Value = BlockHash;
-    }
-
-    /// Maps eth1 block hash to beacon block hash
-    table Eth1HashToBeaconBlockHash{
-        type Key = BlockHash;
-        type Value = BlockHash;
-    }
-
-    /// current
-    table PlainValidatorState{
-        type Key = Address;
-        type Value = Validator;
-    }
-
-    /// history
-    table ValidatorsHistory{
-        type Key = ShardedKey<Address>;
-        type Value = BlockNumberList;
-    }
-
-    /// changesets
-    table ValidatorChangeSets{
-        type Key = BlockNumber;
-        type Value = ValidatorBeforeTx;
-        type SubKey = Address;
-    }
-
-    /// apos snapshot
-    table Snapshots {
-        type Key = BlockNumber;
-        type Value = Snapshot;
-    }
-
-    /// Stores the snaphsot per hash
-    table SnapshotsByHash {
-        type Key = HeaderHash;
-        type Value = Snapshot;
-        }
-
-    /// Stores the signer per hash
-    table SignersByHash {
-        type Key = HeaderHash;
-        type Value = Address;
-    }
-
-    /// Stores the beacon block per hash
-    table BeaconBlocksByHash {
-        type Key = BlockHash;
-        type Value = BeaconBlock;
-        }
-
-    /// Stores the beacon state per hash
-    table BeaconStatesByHash {
-        type Key = BlockHash;
-        type Value = BeaconState;
-        }
-
-    /// Stores the beacon block hash per eth1 hash
-    table BeaconBlockHashesByEth1Hash {
-        type Key = BlockHash;
-        type Value = BlockHash;
-        }
-
-    /// Stores the Tree node per tree node hash for validator
-    table TreeByHashForValidator {
-        type Key = B256;
-        type Value = merkle_db_rs::tree::Tree<Validator>;
-        }
-
-    /// Stores the Tree node per tree node hash for u64
-    table TreeByHashForU64 {
-        type Key = B256;
-        type Value = merkle_db_rs::tree::Tree<u64>;
-        }
-
     /// Stores the header hashes belonging to the canonical chain.
     table CanonicalHeaders {
         type Key = BlockNumber;
         type Value = HeaderHash;
     }
 
-    /// Stores the total difficulty from a block header.
+    /// Stores the total difficulty from block headers.
+    /// Note: Deprecated.
     table HeaderTerminalDifficulties {
         type Key = BlockNumber;
         type Value = CompactU256;
@@ -511,8 +410,7 @@ tables! {
     /// the shard that equal or more than asked. For example:
     /// * For N=50 we would get first shard.
     /// * for N=150 we would get second shard.
-    /// * If max block number is 200 and we ask for N=250 we would fetch last shard and
-    ///     know that needed entry is in `AccountPlainState`.
+    /// * If max block number is 200 and we ask for N=250 we would fetch last shard and know that needed entry is in `AccountPlainState`.
     /// * If there were no shard we would get `None` entry or entry of different storage key.
     ///
     /// Code example can be found in `reth_provider::HistoricalStateProviderRef`
@@ -534,8 +432,7 @@ tables! {
     /// the shard that equal or more than asked. For example:
     /// * For N=50 we would get first shard.
     /// * for N=150 we would get second shard.
-    /// * If max block number is 200 and we ask for N=250 we would fetch last shard and
-    ///     know that needed entry is in `StoragePlainState`.
+    /// * If max block number is 200 and we ask for N=250 we would fetch last shard and know that needed entry is in `StoragePlainState`.
     /// * If there were no shard we would get `None` entry or entry of different storage key.
     ///
     /// Code example can be found in `reth_provider::HistoricalStateProviderRef`
@@ -587,26 +484,103 @@ tables! {
         type Value = BranchNodeCompact;
     }
 
-    /// From HashedAddress => NibblesSubKey => Intermediate value
+    /// From `HashedAddress` => `NibblesSubKey` => Intermediate value
     table StoragesTrie {
         type Key = B256;
         type Value = StorageTrieEntry;
         type SubKey = StoredNibblesSubKey;
     }
 
-    /// Stores the state of a node in the accounts trie prior to a particular block being executed.
-    table AccountsTrieChangeSets {
-        type Key = BlockNumber;
-        type Value = TrieChangeSetsEntry;
-        type SubKey = StoredNibblesSubKey;
+    ///
+    table BeaconStateRecord{
+        type Key = BlockHash;
+        type Value = BeaconState;
     }
 
-    /// Stores the state of a node in a storage trie prior to a particular block being executed.
-    table StoragesTrieChangeSets {
-        type Key = BlockNumberHashedAddress;
-        type Value = TrieChangeSetsEntry;
-        type SubKey = StoredNibblesSubKey;
+    ///
+    table BeaconBlockRecord{
+        type Key = BlockHash;
+        type Value = BeaconBlock;
     }
+
+    ///
+    table BeaconNum2Hash{
+        type Key = BlockNumber;
+        type Value = BlockHash;
+    }
+
+    /// Maps eth1 block hash to beacon block hash
+    table Eth1HashToBeaconBlockHash{
+        type Key = BlockHash;
+        type Value = BlockHash;
+    }
+
+    /// current
+    table PlainValidatorState{
+        type Key = Address;
+        type Value = Validator;
+    }
+
+    /// history
+    table ValidatorsHistory{
+        type Key = ShardedKey<Address>;
+        type Value = BlockNumberList;
+    }
+
+    /// changesets
+    table ValidatorChangeSets{
+        type Key = BlockNumber;
+        type Value = ValidatorBeforeTx;
+        type SubKey = Address;
+    }
+
+    /// apos snapshot
+    table Snapshots {
+        type Key = BlockNumber;
+        type Value = Snapshot;
+    }
+
+    /// Stores the snaphsot per hash
+    table SnapshotsByHash {
+        type Key = HeaderHash;
+        type Value = Snapshot;
+        }
+
+    /// Stores the signer per hash
+    table SignersByHash {
+        type Key = HeaderHash;
+        type Value = Address;
+    }
+
+    /// Stores the beacon block per hash
+    table BeaconBlocksByHash {
+        type Key = BlockHash;
+        type Value = BeaconBlock;
+        }
+
+    /// Stores the beacon state per hash
+    table BeaconStatesByHash {
+        type Key = BlockHash;
+        type Value = BeaconState;
+        }
+
+    /// Stores the beacon block hash per eth1 hash
+    table BeaconBlockHashesByEth1Hash {
+        type Key = BlockHash;
+        type Value = BlockHash;
+        }
+
+    /// Stores the Tree node per tree node hash for validator
+    table TreeByHashForValidator {
+        type Key = B256;
+        type Value = merkle_db_rs::tree::Tree<Validator>;
+        }
+
+    /// Stores the Tree node per tree node hash for u64
+    table TreeByHashForU64 {
+        type Key = B256;
+        type Value = merkle_db_rs::tree::Tree<u64>;
+        }
 
     /// Stores the transaction sender for each canonical transaction.
     /// It is needed to speed up execution stage and allows fetching signer without doing
@@ -646,7 +620,8 @@ tables! {
         type Value = BlockNumber;
     }
 
-    /// Stores arbitrary metadata as key-value pairs.
+    /// Stores generic node metadata as key-value pairs.
+    /// Can store feature flags, configuration markers, and other node-specific data.
     table Metadata {
         type Key = String;
         type Value = Vec<u8>;
@@ -658,8 +633,8 @@ tables! {
 pub enum ChainStateKey {
     /// Last finalized block key
     LastFinalizedBlock,
-    /// Last finalized block key
-    LastSafeBlockBlock,
+    /// Last safe block key
+    LastSafeBlock,
 }
 
 impl Encode for ChainStateKey {
@@ -668,7 +643,7 @@ impl Encode for ChainStateKey {
     fn encode(self) -> Self::Encoded {
         match self {
             Self::LastFinalizedBlock => [0],
-            Self::LastSafeBlockBlock => [1],
+            Self::LastSafeBlock => [1],
         }
     }
 }
@@ -677,7 +652,7 @@ impl Decode for ChainStateKey {
     fn decode(value: &[u8]) -> Result<Self, crate::DatabaseError> {
         match value {
             [0] => Ok(Self::LastFinalizedBlock),
-            [1] => Ok(Self::LastSafeBlockBlock),
+            [1] => Ok(Self::LastSafeBlock),
             _ => Err(crate::DatabaseError::Decode),
         }
     }

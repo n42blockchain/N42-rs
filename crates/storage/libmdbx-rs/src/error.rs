@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use std::{ffi::c_int, result};
 
 /// An MDBX result.
@@ -91,7 +88,9 @@ pub enum Error {
     BadSignature,
     /// Database should be recovered, but cannot be done automatically since it's in read-only
     /// mode.
-    #[error("database should be recovered, but cannot be done automatically since it's in read-only mode")]
+    #[error(
+        "database should be recovered, but cannot be done automatically since it's in read-only mode"
+    )]
     WannaRecovery,
     /// The given key value is mismatched to the current cursor position.
     #[error("the given key value is mismatched to the current cursor position")]
@@ -100,7 +99,9 @@ pub enum Error {
     #[error("invalid parameter specified")]
     DecodeError,
     /// The environment opened in read-only.
-    #[error("the environment opened in read-only")]
+    #[error(
+        "the environment opened in read-only, check <https://reth.rs/run/troubleshooting.html> for more"
+    )]
     Access,
     /// Database is too large for the current system.
     #[error("database is too large for the current system")]
@@ -122,11 +123,17 @@ pub enum Error {
     /// Read transaction has been timed out.
     #[error("read transaction has been timed out")]
     ReadTransactionTimeout,
+    /// The transaction commit was aborted due to previous errors.
+    ///
+    /// This can happen in exceptionally rare cases and it signals the problem coming from inside
+    /// of mdbx.
+    #[error("botched transaction")]
+    BotchedTransaction,
     /// Permission defined
     #[error("permission denied to setup database")]
     Permission,
     /// Unknown error code.
-    #[error("unknown error code: {0}")]
+    #[error("{}", Error::fmt_other(*.0))]
     Other(i32),
 }
 
@@ -203,9 +210,17 @@ impl Error {
             Self::WriteTransactionUnsupportedInReadOnlyMode |
             Self::NestedTransactionsUnsupportedWithWriteMap => ffi::MDBX_EACCESS,
             Self::ReadTransactionTimeout => -96000, // Custom non-MDBX error code
+            Self::BotchedTransaction => -96001,
             Self::Permission => ffi::MDBX_EPERM,
             Self::Other(err_code) => *err_code,
         }
+    }
+
+    fn fmt_other(code: i32) -> String {
+        let mut s = String::with_capacity(1024);
+        let desc = unsafe { ffi::mdbx_strerror_r(code, s.as_mut_ptr().cast(), 1024) };
+        let desc = unsafe { std::ffi::CStr::from_ptr(desc) }.to_string_lossy();
+        desc.into_owned()
     }
 }
 
@@ -215,6 +230,14 @@ impl From<Error> for i32 {
     }
 }
 
+/// Parses an MDBX error code into a result type.
+///
+/// Note that this function returns `Ok(false)` on `MDBX_SUCCESS` and
+/// `Ok(true)` on `MDBX_RESULT_TRUE`. The return value requires extra
+/// care since its interpretation depends on the callee being called.
+///
+/// The most unintuitive case is `mdbx_txn_commit` which returns `Ok(true)`
+/// when the commit has been aborted.
 #[inline]
 pub(crate) const fn mdbx_result(err_code: c_int) -> Result<bool> {
     match err_code {
@@ -241,7 +264,10 @@ mod tests {
 
     #[test]
     fn test_description() {
-        assert_eq!("the environment opened in read-only", Error::from_err_code(13).to_string());
+        assert_eq!(
+            "the environment opened in read-only, check <https://reth.rs/run/troubleshooting.html> for more",
+            Error::from_err_code(13).to_string()
+        );
 
         assert_eq!("file is not an MDBX file", Error::Invalid.to_string());
     }

@@ -1,8 +1,6 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use crate::utils::eth_payload_attributes;
-use alloy_eips::{calc_next_block_base_fee, eip2718::Encodable2718};
+use alloy_eips::{eip2718::Encodable2718, eip7910::EthConfig};
+use alloy_genesis::Genesis;
 use alloy_primitives::{Address, B256, U256};
 use alloy_provider::{network::EthereumWallet, Provider, ProviderBuilder, SendableTx};
 use alloy_rpc_types_beacon::relay::{
@@ -12,11 +10,22 @@ use alloy_rpc_types_beacon::relay::{
 use alloy_rpc_types_engine::{BlobsBundleV1, ExecutionPayloadV3};
 use alloy_rpc_types_eth::TransactionRequest;
 use rand::{rngs::StdRng, Rng, SeedableRng};
-use reth_chainspec::{ChainSpecBuilder, MAINNET};
+use reth_chainspec::{ChainSpecBuilder, EthChainSpec, MAINNET};
 use reth_e2e_test_utils::setup_engine;
+use reth_network::types::NatResolver;
+use reth_node_builder::{NodeBuilder, NodeHandle};
+use reth_node_core::{
+    args::{NetworkArgs, RpcServerArgs},
+    node_config::NodeConfig,
+};
 use reth_node_ethereum::EthereumNode;
 use reth_payload_primitives::BuiltPayload;
-use std::sync::Arc;
+use reth_rpc_api::servers::AdminApiServer;
+use reth_tasks::Runtime;
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 alloy_sol_types::sol! {
     #[sol(rpc, bytecode = "6080604052348015600f57600080fd5b5060405160db38038060db833981016040819052602a91607a565b60005b818110156074576040805143602082015290810182905260009060600160408051601f19818403018152919052805160209091012080555080606d816092565b915050602d565b505060b8565b600060208284031215608b57600080fd5b5051919050565b60006001820160b157634e487b7160e01b600052601160045260246000fd5b5060010190565b60168060c56000396000f3fe6080604052600080fdfea164736f6c6343000810000a")]
@@ -48,8 +57,14 @@ async fn test_fee_history() -> eyre::Result<()> {
             .build(),
     );
 
-    let (mut nodes, _tasks, wallet) =
-        setup_engine::<EthereumNode>(1, chain_spec.clone(), false, eth_payload_attributes).await?;
+    let (mut nodes, wallet) = setup_engine::<EthereumNode>(
+        1,
+        chain_spec.clone(),
+        false,
+        Default::default(),
+        eth_payload_attributes,
+    )
+    .await?;
     let mut node = nodes.pop().unwrap();
     let provider = ProviderBuilder::new()
         .wallet(EthereumWallet::new(wallet.wallet_gen().swap_remove(0)))
@@ -58,28 +73,22 @@ async fn test_fee_history() -> eyre::Result<()> {
     let fee_history = provider.get_fee_history(10, 0_u64.into(), &[]).await?;
 
     let genesis_base_fee = chain_spec.initial_base_fee().unwrap() as u128;
-    let expected_first_base_fee = genesis_base_fee
-        - genesis_base_fee
-            / chain_spec
-                .base_fee_params_at_block(0)
+    let expected_first_base_fee = genesis_base_fee -
+        genesis_base_fee /
+            chain_spec
+                .base_fee_params_at_timestamp(chain_spec.genesis_timestamp())
                 .max_change_denominator;
     assert_eq!(fee_history.base_fee_per_gas[0], genesis_base_fee);
     assert_eq!(fee_history.base_fee_per_gas[1], expected_first_base_fee,);
-
     // Spend some gas
-    let builder = GasWaster::deploy_builder(&provider, U256::from(500))
-        .send()
-        .await?;
+    let builder = GasWaster::deploy_builder(&provider, U256::from(500)).send().await?;
     node.advance_block().await?;
     let receipt = builder.get_receipt().await?;
     assert!(receipt.status());
 
     let block = provider.get_block_by_number(1.into()).await?.unwrap();
     assert_eq!(block.header.gas_used, receipt.gas_used,);
-    assert_eq!(
-        block.header.base_fee_per_gas.unwrap(),
-        expected_first_base_fee as u64
-    );
+    assert_eq!(block.header.base_fee_per_gas.unwrap(), expected_first_base_fee as u64);
 
     for _ in 0..100 {
         let _ = GasWaster::deploy_builder(&provider, U256::from(rng.random_range(0..1000)))
@@ -95,9 +104,7 @@ async fn test_fee_history() -> eyre::Result<()> {
         let latest_block = rng.random_range(0..=latest_block);
         let block_count = rng.random_range(1..=(latest_block + 1));
 
-        let fee_history = provider
-            .get_fee_history(block_count, latest_block.into(), &[])
-            .await?;
+        let fee_history = provider.get_fee_history(block_count, latest_block.into(), &[]).await?;
 
         let mut prev_header = provider
             .get_block_by_number((latest_block + 1 - block_count).into())
@@ -105,18 +112,9 @@ async fn test_fee_history() -> eyre::Result<()> {
             .unwrap()
             .header;
         for block in (latest_block + 2 - block_count)..=latest_block {
-            let expected_base_fee = calc_next_block_base_fee(
-                prev_header.gas_used,
-                prev_header.gas_limit,
-                prev_header.base_fee_per_gas.unwrap(),
-                chain_spec.base_fee_params_at_block(block),
-            );
-
-            let header = provider
-                .get_block_by_number(block.into())
-                .await?
-                .unwrap()
-                .header;
+            let header = provider.get_block_by_number(block.into()).await?.unwrap().header;
+            let expected_base_fee =
+                chain_spec.next_block_base_fee(&prev_header, header.timestamp).unwrap();
 
             assert_eq!(header.base_fee_per_gas.unwrap(), expected_base_fee);
             assert_eq!(
@@ -144,8 +142,14 @@ async fn test_flashbots_validate_v3() -> eyre::Result<()> {
             .build(),
     );
 
-    let (mut nodes, _tasks, wallet) =
-        setup_engine::<EthereumNode>(1, chain_spec.clone(), false, eth_payload_attributes).await?;
+    let (mut nodes, wallet) = setup_engine::<EthereumNode>(
+        1,
+        chain_spec.clone(),
+        false,
+        Default::default(),
+        eth_payload_attributes,
+    )
+    .await?;
     let mut node = nodes.pop().unwrap();
     let provider = ProviderBuilder::new()
         .wallet(EthereumWallet::new(wallet.wallet_gen().swap_remove(0)))
@@ -154,10 +158,8 @@ async fn test_flashbots_validate_v3() -> eyre::Result<()> {
     node.advance(100, |_| {
         let provider = provider.clone();
         Box::pin(async move {
-            let SendableTx::Envelope(tx) = provider
-                .fill(TransactionRequest::default().to(Address::ZERO))
-                .await
-                .unwrap()
+            let SendableTx::Envelope(tx) =
+                provider.fill(TransactionRequest::default().to(Address::ZERO)).await.unwrap()
             else {
                 unreachable!()
             };
@@ -167,9 +169,7 @@ async fn test_flashbots_validate_v3() -> eyre::Result<()> {
     })
     .await?;
 
-    let _ = provider
-        .send_transaction(TransactionRequest::default().to(Address::ZERO))
-        .await?;
+    let _ = provider.send_transaction(TransactionRequest::default().to(Address::ZERO)).await?;
     let payload = node.new_payload().await?;
 
     let mut request = BuilderBlockValidationRequestV3 {
@@ -204,12 +204,7 @@ async fn test_flashbots_validate_v3() -> eyre::Result<()> {
         .is_err());
     request.registered_gas_limit += 1;
 
-    request
-        .request
-        .execution_payload
-        .payload_inner
-        .payload_inner
-        .state_root = B256::ZERO;
+    request.request.execution_payload.payload_inner.payload_inner.state_root = B256::ZERO;
     assert!(provider
         .raw_request::<_, ()>("flashbots_validateBuilderSubmissionV3".into(), (&request,))
         .await
@@ -229,8 +224,14 @@ async fn test_flashbots_validate_v4() -> eyre::Result<()> {
             .build(),
     );
 
-    let (mut nodes, _tasks, wallet) =
-        setup_engine::<EthereumNode>(1, chain_spec.clone(), false, eth_payload_attributes).await?;
+    let (mut nodes, wallet) = setup_engine::<EthereumNode>(
+        1,
+        chain_spec.clone(),
+        false,
+        Default::default(),
+        eth_payload_attributes,
+    )
+    .await?;
     let mut node = nodes.pop().unwrap();
     let provider = ProviderBuilder::new()
         .wallet(EthereumWallet::new(wallet.wallet_gen().swap_remove(0)))
@@ -239,10 +240,8 @@ async fn test_flashbots_validate_v4() -> eyre::Result<()> {
     node.advance(100, |_| {
         let provider = provider.clone();
         Box::pin(async move {
-            let SendableTx::Envelope(tx) = provider
-                .fill(TransactionRequest::default().to(Address::ZERO))
-                .await
-                .unwrap()
+            let SendableTx::Envelope(tx) =
+                provider.fill(TransactionRequest::default().to(Address::ZERO)).await.unwrap()
             else {
                 unreachable!()
             };
@@ -252,9 +251,7 @@ async fn test_flashbots_validate_v4() -> eyre::Result<()> {
     })
     .await?;
 
-    let _ = provider
-        .send_transaction(TransactionRequest::default().to(Address::ZERO))
-        .await?;
+    let _ = provider.send_transaction(TransactionRequest::default().to(Address::ZERO)).await?;
     let payload = node.new_payload().await?;
 
     let mut request = BuilderBlockValidationRequestV4 {
@@ -290,15 +287,91 @@ async fn test_flashbots_validate_v4() -> eyre::Result<()> {
         .is_err());
     request.registered_gas_limit += 1;
 
-    request
-        .request
-        .execution_payload
-        .payload_inner
-        .payload_inner
-        .state_root = B256::ZERO;
+    request.request.execution_payload.payload_inner.payload_inner.state_root = B256::ZERO;
     assert!(provider
         .raw_request::<_, ()>("flashbots_validateBuilderSubmissionV4".into(), (&request,))
         .await
         .is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_eth_config() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+
+    let prague_timestamp = 10;
+    let osaka_timestamp = timestamp + 10000000;
+
+    let chain_spec = Arc::new(
+        ChainSpecBuilder::default()
+            .chain(MAINNET.chain)
+            .genesis(serde_json::from_str(include_str!("../assets/genesis.json")).unwrap())
+            .cancun_activated()
+            .with_prague_at(prague_timestamp)
+            .with_osaka_at(osaka_timestamp)
+            .build(),
+    );
+
+    let (mut nodes, wallet) = setup_engine::<EthereumNode>(
+        1,
+        chain_spec.clone(),
+        false,
+        Default::default(),
+        eth_payload_attributes,
+    )
+    .await?;
+    let mut node = nodes.pop().unwrap();
+    let provider = ProviderBuilder::new()
+        .wallet(EthereumWallet::new(wallet.wallet_gen().swap_remove(0)))
+        .connect_http(node.rpc_url());
+
+    let _ = provider.send_transaction(TransactionRequest::default().to(Address::ZERO)).await?;
+    node.advance_block().await?;
+
+    let config = provider.client().request_noparams::<EthConfig>("eth_config").await?;
+
+    assert_eq!(config.last.unwrap().activation_time, osaka_timestamp);
+    assert_eq!(config.current.activation_time, prague_timestamp);
+    assert_eq!(config.next.unwrap().activation_time, osaka_timestamp);
+
+    Ok(())
+}
+
+// <https://github.com/paradigmxyz/reth/issues/19765>
+#[tokio::test]
+async fn test_admin_external_ip() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let runtime = Runtime::with_existing_handle(tokio::runtime::Handle::current()).unwrap();
+
+    // Chain spec with test allocs
+    let genesis: Genesis = serde_json::from_str(include_str!("../assets/genesis.json")).unwrap();
+    let chain_spec =
+        Arc::new(ChainSpecBuilder::default().chain(MAINNET.chain).genesis(genesis).build());
+
+    let external_ip = "10.64.128.71".parse().unwrap();
+    // Node setup
+    let node_config = NodeConfig::test()
+        .with_chain(chain_spec)
+        .with_network(
+            NetworkArgs::default().with_nat_resolver(NatResolver::ExternalIp(external_ip)),
+        )
+        .with_unused_ports()
+        .with_rpc(RpcServerArgs::default().with_unused_ports().with_http());
+
+    let NodeHandle { node, node_exit_future: _ } = NodeBuilder::new(node_config)
+        .testing_node(runtime)
+        .node(EthereumNode::default())
+        .launch()
+        .await?;
+
+    let api = node.add_ons_handle.admin_api();
+
+    let info = api.node_info().await.unwrap();
+
+    assert_eq!(info.ip, external_ip);
+
     Ok(())
 }

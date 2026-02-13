@@ -17,14 +17,14 @@ reth-chainspec.workspace = true
 reth-ethereum-forks.workspace = true
 reth-primitives-traits.workspace = true
 reth-ethereum-primitives.workspace = true
-reth-storage-errors.workspace = true
 revm.workspace = true
 reth-evm.workspace = true
+reth-storage-errors.workspace = true
 
 # Alloy
 alloy-primitives.workspace = true
 alloy-eips.workspace = true
-alloy-evm = { workspace = true, features = ["std"] }
+alloy-evm.workspace = true
 alloy-consensus.workspace = true
 alloy-rpc-types-engine.workspace = true
 
@@ -35,15 +35,8 @@ derive_more = { workspace = true, optional = true }
 [dev-dependencies]
 reth-testing-utils.workspace = true
 reth-evm = { workspace = true, features = ["test-utils"] }
-reth-execution-types.workspace = true
 secp256k1.workspace = true
 alloy-genesis.workspace = true
-criterion = { version = "0.5", features = ["html_reports"] }
-rand = "0.8"
-
-[[bench]]
-name = "transfer_benchmarks"
-harness = false
 
 [features]
 default = ["std"]
@@ -62,8 +55,11 @@ std = [
     "revm/std",
     "reth-ethereum-primitives/std",
     "derive_more?/std",
+    "alloy-rpc-types-engine/std",
+    "reth-storage-errors/std",
 ]
 test-utils = [
+    "std",
     "dep:parking_lot",
     "dep:derive_more",
     "reth-chainspec/test-utils",

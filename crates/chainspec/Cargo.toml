@@ -18,7 +18,7 @@ alloy-trie = { workspace = true, features = ["ethereum"] }
 reth-primitives-traits.workspace = true
 
 # ethereum
-alloy-evm = { workspace = true, features = ["std"] }
+alloy-evm.workspace = true
 alloy-chains = { workspace = true, features = ["serde", "rlp"] }
 alloy-eips = { workspace = true, features = ["serde"] }
 alloy-genesis.workspace = true
@@ -35,7 +35,6 @@ derive_more.workspace = true
 alloy-trie = { workspace = true, features = ["arbitrary"] }
 alloy-eips = { workspace = true, features = ["arbitrary"] }
 alloy-rlp = { workspace = true, features = ["arrayvec"] }
-alloy-genesis.workspace = true
 
 [features]
 default = ["std"]

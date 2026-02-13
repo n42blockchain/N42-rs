@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! clap [Args](clap::Args) for debugging purposes
 
 use alloy_primitives::B256;
@@ -35,19 +32,23 @@ pub struct DebugArgs {
         long = "debug.etherscan",
         help_heading = "Debug",
         conflicts_with = "tip",
-        conflicts_with = "rpc_consensus_ws",
+        conflicts_with = "rpc_consensus_url",
         value_name = "ETHERSCAN_API_URL"
     )]
     pub etherscan: Option<Option<String>>,
 
-    /// Runs a fake consensus client using blocks fetched from an RPC `WebSocket` endpoint.
+    /// Runs a fake consensus client using blocks fetched from an RPC endpoint.
+    /// Supports both HTTP and `WebSocket` endpoints - `WebSocket` endpoints will use
+    /// subscriptions, while HTTP endpoints will poll for new blocks.
     #[arg(
-        long = "debug.rpc-consensus-ws",
+        long = "debug.rpc-consensus-url",
+        alias = "debug.rpc-consensus-ws",
         help_heading = "Debug",
         conflicts_with = "tip",
-        conflicts_with = "etherscan"
+        conflicts_with = "etherscan",
+        value_name = "RPC_URL"
     )]
-    pub rpc_consensus_ws: Option<String>,
+    pub rpc_consensus_url: Option<String>,
 
     /// If provided, the engine will skip `n` consecutive FCUs.
     #[arg(long = "debug.skip-fcu", help_heading = "Debug")]
@@ -62,21 +63,13 @@ pub struct DebugArgs {
     pub reorg_frequency: Option<usize>,
 
     /// The reorg depth for chain reorgs.
-    #[arg(
-        long = "debug.reorg-depth",
-        requires = "reorg_frequency",
-        help_heading = "Debug"
-    )]
+    #[arg(long = "debug.reorg-depth", requires = "reorg_frequency", help_heading = "Debug")]
     pub reorg_depth: Option<usize>,
 
     /// The path to store engine API messages at.
     /// If specified, all of the intercepted engine API messages
     /// will be written to specified location.
-    #[arg(
-        long = "debug.engine-api-store",
-        help_heading = "Debug",
-        value_name = "PATH"
-    )]
+    #[arg(long = "debug.engine-api-store", help_heading = "Debug", value_name = "PATH")]
     pub engine_api_store: Option<PathBuf>,
 
     /// Determines which type of invalid block hook to install
@@ -91,6 +84,11 @@ pub struct DebugArgs {
     pub invalid_block_hook: Option<InvalidBlockSelection>,
 
     /// The RPC URL of a healthy node to use for comparing invalid block hook results against.
+    ///
+    ///Debug setting that enables execution witness comparison for troubleshooting bad blocks.
+    /// When enabled, the node will collect execution witnesses from the specified source and
+    /// compare them against local execution when a bad block is encountered, helping identify
+    /// discrepancies in state execution.
     #[arg(
         long = "debug.healthy-node-rpc-url",
         help_heading = "Debug",
@@ -98,6 +96,18 @@ pub struct DebugArgs {
         verbatim_doc_comment
     )]
     pub healthy_node_rpc_url: Option<String>,
+
+    /// The URL of the ethstats server to connect to.
+    /// Example: `nodename:secret@host:port`
+    #[arg(long = "ethstats", help_heading = "Debug")]
+    pub ethstats: Option<String>,
+
+    /// Set the node to idle state when the backfill is not running.
+    ///
+    /// This makes the `eth_syncing` RPC return "Idle" when the node has just started or finished
+    /// the backfill, but did not yet receive any new blocks.
+    #[arg(long = "debug.startup-sync-state-idle", help_heading = "Debug")]
+    pub startup_sync_state_idle: bool,
 }
 
 impl Default for DebugArgs {
@@ -107,7 +117,7 @@ impl Default for DebugArgs {
             tip: None,
             max_block: None,
             etherscan: None,
-            rpc_consensus_ws: None,
+            rpc_consensus_url: None,
             skip_fcu: None,
             skip_new_payload: None,
             reorg_frequency: None,
@@ -115,6 +125,8 @@ impl Default for DebugArgs {
             engine_api_store: None,
             invalid_block_hook: Some(InvalidBlockSelection::default()),
             healthy_node_rpc_url: None,
+            ethstats: None,
+            startup_sync_state_idle: false,
         }
     }
 }
@@ -224,7 +236,7 @@ impl FromStr for InvalidBlockSelection {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if s.is_empty() {
-            return Ok(Self(Default::default()));
+            return Ok(Self(Default::default()))
         }
         let hooks = s.split(',').map(str::trim).peekable();
         Self::try_from_selection(hooks)
@@ -233,15 +245,7 @@ impl FromStr for InvalidBlockSelection {
 
 impl fmt::Display for InvalidBlockSelection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "[{}]",
-            self.0
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
+        write!(f, "[{}]", self.0.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", "))
     }
 }
 
@@ -259,26 +263,20 @@ impl TypedValueParser for InvalidBlockSelectionValueParser {
         arg: Option<&Arg>,
         value: &OsStr,
     ) -> Result<Self::Value, clap::Error> {
-        let val = value
-            .to_str()
-            .ok_or_else(|| clap::Error::new(clap::error::ErrorKind::InvalidUtf8))?;
+        let val =
+            value.to_str().ok_or_else(|| clap::Error::new(clap::error::ErrorKind::InvalidUtf8))?;
         val.parse::<InvalidBlockSelection>().map_err(|err| {
-            let arg = arg
-                .map(|a| a.to_string())
-                .unwrap_or_else(|| "...".to_owned());
+            let arg = arg.map(|a| a.to_string()).unwrap_or_else(|| "...".to_owned());
             let possible_values = InvalidBlockHookType::all_variant_names().to_vec().join(",");
             let msg = format!(
-                "Invalid value '{val}' for {arg}: {err}.
-    [possible values: {possible_values}]"
+                "Invalid value '{val}' for {arg}: {err}.\n    [possible values: {possible_values}]"
             );
             clap::Error::raw(clap::error::ErrorKind::InvalidValue, msg)
         })
     }
 
     fn possible_values(&self) -> Option<Box<dyn Iterator<Item = PossibleValue> + '_>> {
-        let values = InvalidBlockHookType::all_variant_names()
-            .iter()
-            .map(PossibleValue::new);
+        let values = InvalidBlockHookType::all_variant_names().iter().map(PossibleValue::new);
         Some(Box::new(values))
     }
 }
@@ -357,6 +355,17 @@ mod tests {
         let default_args = DebugArgs::default();
         let args = CommandParser::<DebugArgs>::parse_from(["reth"]).args;
         assert_eq!(args, default_args);
+    }
+
+    #[test]
+    fn test_parse_invalid_block_args_none() {
+        let expected_args = DebugArgs {
+            invalid_block_hook: Some(InvalidBlockSelection::from(vec![])),
+            ..Default::default()
+        };
+        let args =
+            CommandParser::<DebugArgs>::parse_from(["reth", "--debug.invalid-block-hook", ""]).args;
+        assert_eq!(args, expected_args);
     }
 
     #[test]

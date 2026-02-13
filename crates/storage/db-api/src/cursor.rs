@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use std::{
     fmt,
     ops::{Bound, RangeBounds},
@@ -65,8 +62,14 @@ pub trait DbCursorRO<T: Table> {
 
 /// A read-only cursor over the dup table `T`.
 pub trait DbDupCursorRO<T: DupSort> {
+    /// Positions the cursor at the prev KV pair of the table, returning it.
+    fn prev_dup(&mut self) -> PairResult<T>;
+
     /// Positions the cursor at the next KV pair of the table, returning it.
     fn next_dup(&mut self) -> PairResult<T>;
+
+    /// Positions the cursor at the last duplicate value of the current key.
+    fn last_dup(&mut self) -> ValueOnlyResult<T>;
 
     /// Positions the cursor at the next KV pair of the table, skipping duplicates.
     fn next_no_dup(&mut self) -> PairResult<T>;
@@ -90,7 +93,7 @@ pub trait DbDupCursorRO<T: DupSort> {
     /// | `key`  | `subkey` | **Equivalent starting position**        |
     /// |--------|----------|-----------------------------------------|
     /// | `None` | `None`   | [`DbCursorRO::first()`]                 |
-    /// | `Some` | `None`   | [`DbCursorRO::seek()`]               |
+    /// | `Some` | `None`   | [`DbCursorRO::seek_exact()`]            |
     /// | `None` | `Some`   | [`DbDupCursorRO::seek_by_key_subkey()`] |
     /// | `Some` | `Some`   | [`DbDupCursorRO::seek_by_key_subkey()`] |
     fn walk_dup(
@@ -122,7 +125,7 @@ pub trait DbCursorRW<T: Table> {
     fn delete_current(&mut self) -> Result<(), DatabaseError>;
 }
 
-/// Read Write Cursor over `DupSorted` table.
+/// Read Write Cursor over `DupSort` table.
 pub trait DbDupCursorRW<T: DupSort> {
     /// Delete all duplicate entries for current key.
     fn delete_current_duplicates(&mut self) -> Result<(), DatabaseError>;
@@ -147,10 +150,7 @@ where
     CURSOR: DbCursorRO<T> + fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Walker")
-            .field("cursor", &self.cursor)
-            .field("start", &self.start)
-            .finish()
+        f.debug_struct("Walker").field("cursor", &self.cursor).field("start", &self.start).finish()
     }
 }
 
@@ -231,7 +231,7 @@ impl<T: Table, CURSOR: DbCursorRO<T>> Iterator for ReverseWalker<'_, T, CURSOR> 
     fn next(&mut self) -> Option<Self::Item> {
         let start = self.start.take();
         if start.is_some() {
-            return start;
+            return start
         }
 
         self.cursor.prev().transpose()
@@ -271,7 +271,7 @@ impl<T: Table, CURSOR: DbCursorRO<T>> Iterator for RangeWalker<'_, T, CURSOR> {
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.is_done {
-            return None;
+            return None
         }
 
         let next_item = self.start.take().or_else(|| self.cursor.next().transpose());
@@ -312,12 +312,7 @@ impl<'cursor, T: Table, CURSOR: DbCursorRO<T>> RangeWalker<'cursor, T, CURSOR> {
             None => true,
             _ => false,
         };
-        Self {
-            cursor,
-            start,
-            end_key,
-            is_done,
-        }
+        Self { cursor, start, end_key, is_done }
     }
 }
 
@@ -375,7 +370,7 @@ impl<T: DupSort, CURSOR: DbDupCursorRO<T>> Iterator for DupWalker<'_, T, CURSOR>
     fn next(&mut self) -> Option<Self::Item> {
         let start = self.start.take();
         if start.is_some() {
-            return start;
+            return start
         }
         self.cursor.next_dup().transpose()
     }

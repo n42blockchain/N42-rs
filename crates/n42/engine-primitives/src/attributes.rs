@@ -128,12 +128,18 @@ mod tests {
 
     #[test]
     fn test_build_payload_attributes() {
+        use alloy_consensus::Header;
+        use reth_primitives_traits::SealedHeader;
+
         let chain_spec = Arc::new(ChainSpec::default());
         let signer = Address::from_slice(&[0x42; 20]);
         let builder = N42PayloadAttributesBuilder::new_add_signer(chain_spec, Some(signer));
 
         let timestamp = 1700000000u64;
-        let attrs = builder.build(timestamp);
+        let mut header = Header::default();
+        header.timestamp = timestamp;
+        let sealed_header = SealedHeader::new(header, Default::default());
+        let attrs = builder.build(&sealed_header);
 
         assert_eq!(attrs.timestamp, timestamp);
         assert_eq!(attrs.prev_randao, B256::ZERO);
@@ -142,11 +148,17 @@ mod tests {
 
     #[test]
     fn test_build_payload_attributes_no_signer() {
+        use alloy_consensus::Header;
+        use reth_primitives_traits::SealedHeader;
+
         let chain_spec = Arc::new(ChainSpec::default());
         let builder = N42PayloadAttributesBuilder::new(chain_spec);
 
         let timestamp = 1700000000u64;
-        let attrs = builder.build(timestamp);
+        let mut header = Header::default();
+        header.timestamp = timestamp;
+        let sealed_header = SealedHeader::new(header, Default::default());
+        let attrs = builder.build(&sealed_header);
 
         assert_eq!(attrs.timestamp, timestamp);
         assert_eq!(attrs.suggested_fee_recipient, Address::ZERO);

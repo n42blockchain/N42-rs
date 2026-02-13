@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! Payload component configuration for the Ethereum node.
 
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
@@ -55,7 +52,10 @@ where
             ctx.provider().clone(),
             pool,
             evm_config,
-            EthereumBuilderConfig::new().with_gas_limit(gas_limit),
+            EthereumBuilderConfig::new()
+                .with_gas_limit(gas_limit)
+                .with_max_blobs_per_block(conf.max_blobs_per_block())
+                .with_extra_data(conf.extra_data_bytes()),
         ))
     }
 }

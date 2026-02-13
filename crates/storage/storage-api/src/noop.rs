@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! Various noop implementations for traits.
 
 use crate::{
@@ -8,14 +5,17 @@ use crate::{
     BlockReader, BlockReaderIdExt, BlockSource, BytecodeReader, ChangeSetReader,
     HashedPostStateProvider, HeaderProvider, NodePrimitivesProvider, PruneCheckpointReader,
     ReceiptProvider, ReceiptProviderIdExt, StageCheckpointReader, StateProofProvider,
-    StateProvider, StateProviderBox, StateProviderFactory, StateRootProvider, StorageRootProvider,
-    TransactionVariant, TransactionsProvider,
+    StateProvider, StateProviderBox, StateProviderFactory, StateReader, StateRootProvider,
+    StorageRootProvider, TransactionVariant, TransactionsProvider,
 };
+
+#[cfg(feature = "db-api")]
+use crate::{DBProvider, DatabaseProviderFactory, StorageChangeSetReader, StorageSettingsCache};
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use alloy_consensus::transaction::TransactionMeta;
 use alloy_eips::{BlockHashOrNumber, BlockId, BlockNumberOrTag};
 use alloy_primitives::{
-    Address, BlockHash, BlockNumber, Bytes, StorageKey, StorageValue, TxHash, TxNumber, B256, U256,
+    Address, BlockHash, BlockNumber, Bytes, StorageKey, StorageValue, TxHash, TxNumber, B256,
 };
 use core::{
     fmt::Debug,
@@ -23,9 +23,14 @@ use core::{
     ops::{RangeBounds, RangeInclusive},
 };
 use reth_chainspec::{ChainInfo, ChainSpecProvider, EthChainSpec, MAINNET};
+#[cfg(feature = "db-api")]
+use reth_db_api::mock::{DatabaseMock, TxMock};
 use reth_db_models::{AccountBeforeTx, StoredBlockBodyIndices};
 use reth_ethereum_primitives::EthPrimitives;
+use reth_execution_types::ExecutionOutcome;
 use reth_primitives_traits::{Account, Bytecode, NodePrimitives, RecoveredBlock, SealedHeader};
+#[cfg(feature = "db-api")]
+use reth_prune_types::PruneModes;
 use reth_prune_types::{PruneCheckpoint, PruneSegment};
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_storage_errors::provider::{ProviderError, ProviderResult};
@@ -39,6 +44,10 @@ use reth_trie_common::{
 #[non_exhaustive]
 pub struct NoopProvider<ChainSpec = reth_chainspec::ChainSpec, N = EthPrimitives> {
     chain_spec: Arc<ChainSpec>,
+    #[cfg(feature = "db-api")]
+    tx: TxMock,
+    #[cfg(feature = "db-api")]
+    prune_modes: PruneModes,
     _phantom: PhantomData<N>,
 }
 
@@ -47,6 +56,10 @@ impl<ChainSpec, N> NoopProvider<ChainSpec, N> {
     pub fn new(chain_spec: Arc<ChainSpec>) -> Self {
         Self {
             chain_spec,
+            #[cfg(feature = "db-api")]
+            tx: TxMock::default(),
+            #[cfg(feature = "db-api")]
+            prune_modes: PruneModes::default(),
             _phantom: Default::default(),
         }
     }
@@ -57,6 +70,10 @@ impl<ChainSpec> NoopProvider<ChainSpec> {
     pub fn eth(chain_spec: Arc<ChainSpec>) -> Self {
         Self {
             chain_spec,
+            #[cfg(feature = "db-api")]
+            tx: TxMock::default(),
+            #[cfg(feature = "db-api")]
+            prune_modes: PruneModes::default(),
             _phantom: Default::default(),
         }
     }
@@ -79,6 +96,10 @@ impl<ChainSpec, N> Clone for NoopProvider<ChainSpec, N> {
     fn clone(&self) -> Self {
         Self {
             chain_spec: Arc::clone(&self.chain_spec),
+            #[cfg(feature = "db-api")]
+            tx: self.tx.clone(),
+            #[cfg(feature = "db-api")]
+            prune_modes: self.prune_modes.clone(),
             _phantom: Default::default(),
         }
     }
@@ -251,10 +272,6 @@ impl<C: Send + Sync, N: NodePrimitives> TransactionsProvider for NoopProvider<C,
         Ok(None)
     }
 
-    fn transaction_block(&self, _id: TxNumber) -> ProviderResult<Option<BlockNumber>> {
-        todo!()
-    }
-
     fn transactions_by_block(
         &self,
         _block_id: BlockHashOrNumber,
@@ -334,14 +351,6 @@ impl<C: Send + Sync, N: NodePrimitives> HeaderProvider for NoopProvider<C, N> {
         Ok(None)
     }
 
-    fn header_td(&self, _hash: &BlockHash) -> ProviderResult<Option<U256>> {
-        Ok(None)
-    }
-
-    fn header_td_by_number(&self, _number: BlockNumber) -> ProviderResult<Option<U256>> {
-        Ok(None)
-    }
-
     fn headers_range(
         &self,
         _range: impl RangeBounds<BlockNumber>,
@@ -389,12 +398,42 @@ impl<C: Send + Sync, N: NodePrimitives> ChangeSetReader for NoopProvider<C, N> {
 
     fn account_changesets_range(
         &self,
-        _range: impl RangeBounds<BlockNumber>,
+        _range: impl core::ops::RangeBounds<BlockNumber>,
     ) -> ProviderResult<Vec<(BlockNumber, AccountBeforeTx)>> {
         Ok(Vec::default())
     }
 
     fn account_changeset_count(&self) -> ProviderResult<usize> {
+        Ok(0)
+    }
+}
+
+#[cfg(feature = "db-api")]
+impl<C: Send + Sync, N: NodePrimitives> StorageChangeSetReader for NoopProvider<C, N> {
+    fn storage_changeset(
+        &self,
+        _block_number: BlockNumber,
+    ) -> ProviderResult<Vec<(reth_db_api::models::BlockNumberAddress, crate::ChangesetEntry)>> {
+        Ok(Vec::default())
+    }
+
+    fn get_storage_before_block(
+        &self,
+        _block_number: BlockNumber,
+        _address: Address,
+        _storage_key: B256,
+    ) -> ProviderResult<Option<crate::ChangesetEntry>> {
+        Ok(None)
+    }
+
+    fn storage_changesets_range(
+        &self,
+        _range: impl core::ops::RangeBounds<BlockNumber>,
+    ) -> ProviderResult<Vec<(reth_db_api::models::BlockNumberAddress, crate::ChangesetEntry)>> {
+        Ok(Vec::default())
+    }
+
+    fn storage_changeset_count(&self) -> ProviderResult<usize> {
         Ok(0)
     }
 }
@@ -480,6 +519,17 @@ impl<C: Send + Sync, N: NodePrimitives> HashedPostStateProvider for NoopProvider
     }
 }
 
+impl<C: Send + Sync, N: NodePrimitives> StateReader for NoopProvider<C, N> {
+    type Receipt = N::Receipt;
+
+    fn get_state(
+        &self,
+        _block: BlockNumber,
+    ) -> ProviderResult<Option<ExecutionOutcome<Self::Receipt>>> {
+        Ok(None)
+    }
+}
+
 impl<C: Send + Sync, N: NodePrimitives> StateProvider for NoopProvider<C, N> {
     fn storage(
         &self,
@@ -487,6 +537,14 @@ impl<C: Send + Sync, N: NodePrimitives> StateProvider for NoopProvider<C, N> {
         _storage_key: StorageKey,
     ) -> ProviderResult<Option<StorageValue>> {
         Ok(None)
+    }
+
+    fn storage_by_hashed_key(
+        &self,
+        _account: Address,
+        _hashed_storage_key: StorageKey,
+    ) -> ProviderResult<Option<StorageValue>> {
+        Err(ProviderError::UnsupportedProvider)
     }
 }
 
@@ -509,18 +567,15 @@ impl<C: Send + Sync + 'static, N: NodePrimitives> StateProviderFactory for NoopP
             BlockNumberOrTag::Latest => self.latest(),
             BlockNumberOrTag::Finalized => {
                 // we can only get the finalized state by hash, not by num
-                let hash = self
-                    .finalized_block_hash()?
-                    .ok_or(ProviderError::FinalizedBlockNotFound)?;
+                let hash =
+                    self.finalized_block_hash()?.ok_or(ProviderError::FinalizedBlockNotFound)?;
 
                 // only look at historical state
                 self.history_by_block_hash(hash)
             }
             BlockNumberOrTag::Safe => {
                 // we can only get the safe state by hash, not by num
-                let hash = self
-                    .safe_block_hash()?
-                    .ok_or(ProviderError::SafeBlockNotFound)?;
+                let hash = self.safe_block_hash()?.ok_or(ProviderError::SafeBlockNotFound)?;
 
                 self.history_by_block_hash(hash)
             }
@@ -549,6 +604,10 @@ impl<C: Send + Sync + 'static, N: NodePrimitives> StateProviderFactory for NoopP
     }
 
     fn pending_state_by_hash(&self, _block_hash: B256) -> ProviderResult<Option<StateProviderBox>> {
+        Ok(Some(Box::new(self.clone())))
+    }
+
+    fn maybe_pending(&self) -> ProviderResult<Option<StateProviderBox>> {
         Ok(Some(Box::new(self.clone())))
     }
 }
@@ -595,4 +654,57 @@ impl<C: Send + Sync, N: Send + Sync> BlockBodyIndicesProvider for NoopProvider<C
     ) -> ProviderResult<Vec<StoredBlockBodyIndices>> {
         Ok(Vec::new())
     }
+}
+
+#[cfg(feature = "db-api")]
+impl<ChainSpec: Send + Sync, N: NodePrimitives> DBProvider for NoopProvider<ChainSpec, N> {
+    type Tx = TxMock;
+
+    fn tx_ref(&self) -> &Self::Tx {
+        &self.tx
+    }
+
+    fn tx_mut(&mut self) -> &mut Self::Tx {
+        &mut self.tx
+    }
+
+    fn into_tx(self) -> Self::Tx {
+        self.tx
+    }
+
+    fn prune_modes_ref(&self) -> &PruneModes {
+        &self.prune_modes
+    }
+
+    fn commit(self) -> ProviderResult<()> {
+        use reth_db_api::transaction::DbTx;
+
+        Ok(self.tx.commit()?)
+    }
+}
+
+#[cfg(feature = "db-api")]
+impl<ChainSpec: Send + Sync, N: NodePrimitives> DatabaseProviderFactory
+    for NoopProvider<ChainSpec, N>
+{
+    type DB = DatabaseMock;
+    type Provider = Self;
+    type ProviderRW = Self;
+
+    fn database_provider_ro(&self) -> ProviderResult<Self::Provider> {
+        Ok(self.clone())
+    }
+
+    fn database_provider_rw(&self) -> ProviderResult<Self::ProviderRW> {
+        Ok(self.clone())
+    }
+}
+
+#[cfg(feature = "db-api")]
+impl<ChainSpec: Send + Sync, N: Send + Sync> StorageSettingsCache for NoopProvider<ChainSpec, N> {
+    fn cached_storage_settings(&self) -> reth_db_api::models::StorageSettings {
+        reth_db_api::models::StorageSettings::default()
+    }
+
+    fn set_storage_settings_cache(&self, _settings: reth_db_api::models::StorageSettings) {}
 }

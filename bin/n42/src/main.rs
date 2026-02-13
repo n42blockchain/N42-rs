@@ -10,7 +10,7 @@ use consensus_client::miner::N42Miner;
 use n42::consensus_ext::{
     ConsensusBeaconExt, ConsensusBeaconExtApiServer, ConsensusExt, ConsensusExtApiServer,
 };
-use n42::{args::RessArgs, cli::Cli, ress::install_ress_subprotocol};
+use n42::cli::Cli;
 use n42_clique::UnverifiedBlock;
 use n42_engine_primitives::N42PayloadAttributesBuilder;
 use n42_engine_types::N42Node;
@@ -59,7 +59,7 @@ fn main() {
     let consensus_holder_clone = consensus_holder.clone();
 
     if let Err(err) =
-        Cli::<EthereumChainSpecParser, RessArgs>::parse().run(async move |builder, ress_args| {
+        Cli::<EthereumChainSpecParser>::parse().run(async move |builder, _extra_args| {
             info!(target: "reth::cli", "Launching node");
 
             // Start the pubsub router loop (must be inside async context)
@@ -189,16 +189,17 @@ fn main() {
             }
 
             // Install ress subprotocol.
-            if ress_args.enabled {
-                install_ress_subprotocol(
-                    ress_args,
-                    node.provider,
-                    node.evm_config,
-                    node.network,
-                    node.task_executor,
-                    node.add_ons_handle.engine_events.new_listener(),
-                )?;
-            }
+            // Disabled: ress protocol deps not yet available in v1.11.0
+            // if ress_args.enabled {
+            //     install_ress_subprotocol(
+            //         ress_args,
+            //         node.provider,
+            //         node.evm_config,
+            //         node.network,
+            //         node.task_executor,
+            //         node.add_ons_handle.engine_events.new_listener(),
+            //     )?;
+            // }
 
             node_exit_future.await
         })

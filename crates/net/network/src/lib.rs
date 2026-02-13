@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! reth P2P networking.
 //!
 //! Ethereum's networking protocol is specified in [devp2p](https://github.com/ethereum/devp2p).
@@ -118,7 +115,7 @@
 )]
 #![allow(unreachable_pub)]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 #[cfg(any(test, feature = "test-utils"))]
 /// Common helpers for network testing.
@@ -143,6 +140,7 @@ mod listener;
 mod manager;
 mod metrics;
 mod network;
+mod required_block_filter;
 mod session;
 mod state;
 mod swarm;
@@ -177,6 +175,7 @@ pub use reth_network_p2p as p2p;
 
 /// re-export types crates
 pub mod types {
+    pub use reth_discv4::NatResolver;
     pub use reth_eth_wire_types::*;
     pub use reth_network_types::*;
 }

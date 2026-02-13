@@ -28,8 +28,7 @@ struct DisplayFork {
     activated_at: ForkCondition,
     /// An optional EIP (e.g. `EIP-1559`).
     eip: Option<String>,
-    /// Optional metadata string
-    #[allow(dead_code)]
+    /// Optional metadata to display alongside the fork (e.g. blob parameters)
     metadata: Option<String>,
 }
 
@@ -44,15 +43,19 @@ impl core::fmt::Display for DisplayFork {
         match self.activated_at {
             ForkCondition::Block(at) | ForkCondition::Timestamp(at) => {
                 write!(f, "{name_with_eip:32} @{at}")?;
+                if let Some(metadata) = &self.metadata {
+                    write!(f, "          {metadata}")?;
+                }
             }
-            ForkCondition::TTD {
-                total_difficulty, ..
-            } => {
+            ForkCondition::TTD { total_difficulty, .. } => {
                 // All networks that have merged are finalized.
                 write!(
                     f,
                     "{name_with_eip:32} @{total_difficulty} (network is known to be merged)",
                 )?;
+                if let Some(metadata) = &self.metadata {
+                    write!(f, "          {metadata}")?;
+                }
             }
             ForkCondition::Never => unreachable!(),
         }
@@ -124,34 +127,26 @@ impl core::fmt::Display for DisplayHardforks {
             Ok(())
         }
 
-        format(
-            "Pre-merge hard forks (block based)",
-            &self.pre_merge,
-            self.with_merge.is_empty(),
-            f,
-        )?;
-
-        if self.with_merge.is_empty() {
-            if !self.post_merge.is_empty() {
-                // need an extra line here in case we don't have a merge block (optimism)
-                writeln!(f)?;
-            }
-        } else {
+        if !self.pre_merge.is_empty() {
             format(
-                "Merge hard forks",
-                &self.with_merge,
-                self.post_merge.is_empty(),
+                "Pre-merge hard forks (block based)",
+                &self.pre_merge,
+                self.with_merge.is_empty(),
                 f,
             )?;
         }
 
+        if self.with_merge.is_empty() {
+            if !self.pre_merge.is_empty() && !self.post_merge.is_empty() {
+                // need an extra line here in case we don't have a merge block (optimism)
+                writeln!(f)?;
+            }
+        } else {
+            format("Merge hard forks", &self.with_merge, self.post_merge.is_empty(), f)?;
+        }
+
         if !self.post_merge.is_empty() {
-            format(
-                "Post-merge hard forks (timestamp based)",
-                &self.post_merge,
-                true,
-                f,
-            )?;
+            format("Post-merge hard forks (timestamp based)", &self.post_merge, true, f)?;
         }
 
         Ok(())
@@ -164,49 +159,11 @@ impl DisplayHardforks {
     where
         I: IntoIterator<Item = (&'a dyn Hardfork, ForkCondition)>,
     {
-        let mut pre_merge = Vec::new();
-        let mut with_merge = Vec::new();
-        let mut post_merge = Vec::new();
-
-        for (fork, condition) in hardforks {
-            let mut display_fork = DisplayFork {
-                name: fork.name().to_string(),
-                activated_at: condition,
-                eip: None,
-                metadata: None,
-            };
-
-            match condition {
-                ForkCondition::Block(_) => {
-                    pre_merge.push(display_fork);
-                }
-                ForkCondition::TTD {
-                    activation_block_number,
-                    total_difficulty,
-                    fork_block,
-                } => {
-                    display_fork.activated_at = ForkCondition::TTD {
-                        activation_block_number,
-                        fork_block,
-                        total_difficulty,
-                    };
-                    with_merge.push(display_fork);
-                }
-                ForkCondition::Timestamp(_) => {
-                    post_merge.push(display_fork);
-                }
-                ForkCondition::Never => {}
-            }
-        }
-
-        Self {
-            pre_merge,
-            with_merge,
-            post_merge,
-        }
+        // Delegate to with_meta by mapping the iterator to include None for metadata
+        Self::with_meta(hardforks.into_iter().map(|(fork, condition)| (fork, condition, None)))
     }
 
-    /// Creates a new [`DisplayHardforks`] from an iterator of hardforks with metadata.
+    /// Creates a new [`DisplayHardforks`] from an iterator of hardforks with optional metadata.
     pub fn with_meta<'a, I>(hardforks: I) -> Self
     where
         I: IntoIterator<Item = (&'a dyn Hardfork, ForkCondition, Option<String>)>,
@@ -237,10 +194,6 @@ impl DisplayHardforks {
             }
         }
 
-        Self {
-            pre_merge,
-            with_merge,
-            post_merge,
-        }
+        Self { pre_merge, with_merge, post_merge }
     }
 }

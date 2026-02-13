@@ -1,17 +1,14 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
+use crate::ChangesetEntry;
 use alloy_primitives::{Address, BlockNumber, B256};
 use auto_impl::auto_impl;
 use core::ops::{RangeBounds, RangeInclusive};
 use reth_db_api::models::BlockNumberAddress;
 use reth_db_models::AccountBeforeTx;
-use reth_primitives_traits::StorageEntry;
 use reth_storage_errors::provider::ProviderResult;
 
 /// History Writer
-#[auto_impl(&, Arc, Box)]
-pub trait HistoryWriter: Send + Sync {
+#[auto_impl(&, Box)]
+pub trait HistoryWriter: Send {
     /// Unwind and clear account history indices.
     ///
     /// Returns number of changesets walked.
@@ -39,7 +36,7 @@ pub trait HistoryWriter: Send + Sync {
     /// Returns number of changesets walked.
     fn unwind_storage_history_indices(
         &self,
-        changesets: impl Iterator<Item = (BlockNumberAddress, StorageEntry)>,
+        changesets: impl Iterator<Item = (BlockNumberAddress, ChangesetEntry)>,
     ) -> ProviderResult<usize>;
 
     /// Unwind and clear storage history indices in a given block range.
@@ -47,7 +44,7 @@ pub trait HistoryWriter: Send + Sync {
     /// Returns number of changesets walked.
     fn unwind_storage_history_indices_range(
         &self,
-        range: impl RangeBounds<BlockNumberAddress>,
+        range: impl RangeBounds<BlockNumber>,
     ) -> ProviderResult<usize>;
 
     /// Insert storage change index to database. Used inside `StorageHistoryIndex` stage

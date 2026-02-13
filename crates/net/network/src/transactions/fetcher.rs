@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! `TransactionFetcher` is responsible for rate limiting and retry logic for fetching
 //! transactions. Upon receiving an announcement, functionality of the `TransactionFetcher` is
 //! used for filtering out hashes 1) for which the tx is already known and 2) unknown but the hash
@@ -149,13 +146,13 @@ impl<N: NetworkPrimitives> TransactionFetcher<N> {
 
     /// Removes the specified hashes from inflight tracking.
     #[inline]
-    pub fn remove_hashes_from_transaction_fetcher<I>(&mut self, hashes: I)
+    pub fn remove_hashes_from_transaction_fetcher<'a, I>(&mut self, hashes: I)
     where
-        I: IntoIterator<Item = TxHash>,
+        I: IntoIterator<Item = &'a TxHash>,
     {
         for hash in hashes {
-            self.hashes_fetch_inflight_and_pending_fetch.remove(&hash);
-            self.hashes_pending_fetch.remove(&hash);
+            self.hashes_fetch_inflight_and_pending_fetch.remove(hash);
+            self.hashes_pending_fetch.remove(hash);
         }
     }
 
@@ -191,13 +188,7 @@ impl<N: NetworkPrimitives> TransactionFetcher<N> {
         let TxFetchMetadata { fallback_peers, .. } =
             self.hashes_fetch_inflight_and_pending_fetch.peek(&hash)?;
 
-        for peer_id in fallback_peers.iter() {
-            if self.is_idle(peer_id) {
-                return Some(peer_id)
-            }
-        }
-
-        None
+        fallback_peers.iter().find(|peer_id| self.is_idle(peer_id))
     }
 
     /// Returns any idle peer for any hash pending fetch. If one is found, the corresponding
@@ -287,9 +278,7 @@ impl<N: NetworkPrimitives> TransactionFetcher<N> {
 
         // folds size based on expected response size  and adds selected hashes to the request
         // list and the other hashes to the surplus list
-        loop {
-            let Some((hash, metadata)) = hashes_from_announcement_iter.next() else { break };
-
+        for (hash, metadata) in hashes_from_announcement_iter.by_ref() {
             let Some((_ty, size)) = metadata else {
                 unreachable!("this method is called upon reception of an eth68 announcement")
             };
@@ -416,7 +405,6 @@ impl<N: NetworkPrimitives> TransactionFetcher<N> {
             if let (_, Some(evicted_hash)) = self.hashes_pending_fetch.insert_and_get_evicted(hash)
             {
                 self.hashes_fetch_inflight_and_pending_fetch.remove(&evicted_hash);
-                self.hashes_pending_fetch.remove(&evicted_hash);
             }
         }
     }
@@ -429,7 +417,7 @@ impl<N: NetworkPrimitives> TransactionFetcher<N> {
         &mut self,
         peers: &HashMap<PeerId, PeerMetadata<N>>,
         has_capacity_wrt_pending_pool_imports: impl Fn(usize) -> bool,
-    ) {
+    ) -> bool {
         let mut hashes_to_request = RequestTxHashes::with_capacity(
             DEFAULT_MARGINAL_COUNT_HASHES_GET_POOLED_TRANSACTIONS_REQUEST,
         );
@@ -446,7 +434,7 @@ impl<N: NetworkPrimitives> TransactionFetcher<N> {
                     budget_find_idle_fallback_peer,
                 ) else {
                     // no peers are idle or budget is depleted
-                    return
+                    return false
                 };
 
                 peer_id
@@ -455,7 +443,7 @@ impl<N: NetworkPrimitives> TransactionFetcher<N> {
         );
 
         // peer should always exist since `is_session_active` already checked
-        let Some(peer) = peers.get(&peer_id) else { return };
+        let Some(peer) = peers.get(&peer_id) else { return false };
         let conn_eth_version = peer.version;
 
         // fill the request with more hashes pending fetch that have been announced by the peer.
@@ -499,7 +487,10 @@ impl<N: NetworkPrimitives> TransactionFetcher<N> {
             );
 
             self.buffer_hashes(failed_to_request_hashes, Some(peer_id));
+            return false
         }
+
+        true
     }
 
     /// Filters out hashes that have been seen before. For hashes that have already been seen, the
@@ -885,15 +876,19 @@ impl<N: NetworkPrimitives> TransactionFetcher<N> {
                 if unsolicited > 0 {
                     self.metrics.unsolicited_transactions.increment(unsolicited as u64);
                 }
-                if verification_outcome == VerificationOutcome::ReportPeer {
-                    // todo: report peer for sending hashes that weren't requested
+
+                let report_peer = if verification_outcome == VerificationOutcome::ReportPeer {
                     trace!(target: "net::tx",
                         peer_id=format!("{peer_id:#}"),
                         unverified_len,
                         verified_payload_len=verified_payload.len(),
                         "received `PooledTransactions` response from peer with entries that didn't verify against request, filtered out transactions"
                     );
-                }
+                    true
+                } else {
+                    false
+                };
+
                 // peer has only sent hashes that we didn't request
                 if verified_payload.is_empty() {
                     return FetchEvent::FetchError { peer_id, error: RequestError::BadResponse }
@@ -955,7 +950,7 @@ impl<N: NetworkPrimitives> TransactionFetcher<N> {
 
                 let transactions = valid_payload.into_data().into_values().collect();
 
-                FetchEvent::TransactionsFetched { peer_id, transactions }
+                FetchEvent::TransactionsFetched { peer_id, transactions, report_peer }
             }
             Ok(Err(req_err)) => {
                 self.try_buffer_hashes_for_retry(requested_hashes, &peer_id);
@@ -1042,6 +1037,9 @@ pub enum FetchEvent<T = PooledTransaction> {
         peer_id: PeerId,
         /// The transactions that were fetched, if available.
         transactions: PooledTransactions<T>,
+        /// Whether the peer should be penalized for sending unsolicited transactions or for
+        /// misbehavior.
+        report_peer: bool,
     },
     /// Triggered when there is an error in fetching transactions.
     FetchError {

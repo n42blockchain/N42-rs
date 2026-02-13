@@ -1,9 +1,4 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! Account related models and types.
-
-use std::ops::{Bound, Range, RangeBounds, RangeInclusive};
 
 use crate::{
     impl_fixed_arbitrary,
@@ -12,6 +7,7 @@ use crate::{
 };
 use alloy_primitives::{Address, BlockNumber, StorageKey, B256};
 use serde::{Deserialize, Serialize};
+use std::ops::{Bound, Range, RangeBounds, RangeInclusive};
 
 /// [`BlockNumber`] concatenated with [`Address`].
 ///
@@ -75,46 +71,71 @@ impl Decode for BlockNumberAddress {
 }
 
 /// A [`RangeBounds`] over a range of [`BlockNumberAddress`]s. Used to conveniently convert from a
-/// range of block numbers to a range of [`BlockNumberAddress`]s.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// range of [`BlockNumber`]s.
+#[derive(Debug)]
 pub struct BlockNumberAddressRange {
-    /// The start of the range.
+    /// Starting bound of the range.
     pub start: Bound<BlockNumberAddress>,
-    /// The end of the range.
+    /// Ending bound of the range.
     pub end: Bound<BlockNumberAddress>,
 }
 
 impl RangeBounds<BlockNumberAddress> for BlockNumberAddressRange {
     fn start_bound(&self) -> Bound<&BlockNumberAddress> {
-        match &self.start {
-            Bound::Included(v) => Bound::Included(v),
-            Bound::Excluded(v) => Bound::Excluded(v),
-            Bound::Unbounded => Bound::Unbounded,
-        }
+        self.start.as_ref()
     }
 
     fn end_bound(&self) -> Bound<&BlockNumberAddress> {
-        match &self.end {
-            Bound::Included(v) => Bound::Included(v),
-            Bound::Excluded(v) => Bound::Excluded(v),
-            Bound::Unbounded => Bound::Unbounded,
-        }
+        self.end.as_ref()
     }
 }
 
 impl<R: RangeBounds<BlockNumber>> From<R> for BlockNumberAddressRange {
-    fn from(range: R) -> Self {
-        let start = match range.start_bound() {
+    fn from(r: R) -> Self {
+        let start = match r.start_bound() {
             Bound::Included(n) => Bound::Included(BlockNumberAddress((*n, Address::ZERO))),
             Bound::Excluded(n) => Bound::Included(BlockNumberAddress((n + 1, Address::ZERO))),
             Bound::Unbounded => Bound::Unbounded,
         };
-        let end = match range.end_bound() {
+
+        let end = match r.end_bound() {
             Bound::Included(n) => Bound::Excluded(BlockNumberAddress((n + 1, Address::ZERO))),
             Bound::Excluded(n) => Bound::Excluded(BlockNumberAddress((*n, Address::ZERO))),
             Bound::Unbounded => Bound::Unbounded,
         };
+
         Self { start, end }
+    }
+}
+
+/// [`Address`] concatenated with [`StorageKey`]. Used by `reth_etl` and history stages.
+///
+/// Since it's used as a key, it isn't compressed when encoding it.
+#[derive(
+    Debug, Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, Ord, PartialOrd, Hash,
+)]
+pub struct AddressStorageKey(pub (Address, StorageKey));
+
+impl Encode for AddressStorageKey {
+    type Encoded = [u8; 52];
+
+    fn encode(self) -> Self::Encoded {
+        let address = self.0 .0;
+        let storage_key = self.0 .1;
+
+        let mut buf = [0u8; 52];
+
+        buf[..20].copy_from_slice(address.as_slice());
+        buf[20..].copy_from_slice(storage_key.as_slice());
+        buf
+    }
+}
+
+impl Decode for AddressStorageKey {
+    fn decode(value: &[u8]) -> Result<Self, DatabaseError> {
+        let address = Address::from_slice(&value[..20]);
+        let storage_key = StorageKey::from_slice(&value[20..]);
+        Ok(Self((address, storage_key)))
     }
 }
 
@@ -155,37 +176,6 @@ impl Decode for BlockNumberHashedAddress {
     }
 }
 
-/// [`Address`] concatenated with [`StorageKey`]. Used by `reth_etl` and history stages.
-///
-/// Since it's used as a key, it isn't compressed when encoding it.
-#[derive(
-    Debug, Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, Ord, PartialOrd, Hash,
-)]
-pub struct AddressStorageKey(pub (Address, StorageKey));
-
-impl Encode for AddressStorageKey {
-    type Encoded = [u8; 52];
-
-    fn encode(self) -> Self::Encoded {
-        let address = self.0 .0;
-        let storage_key = self.0 .1;
-
-        let mut buf = [0u8; 52];
-
-        buf[..20].copy_from_slice(address.as_slice());
-        buf[20..].copy_from_slice(storage_key.as_slice());
-        buf
-    }
-}
-
-impl Decode for AddressStorageKey {
-    fn decode(value: &[u8]) -> Result<Self, DatabaseError> {
-        let address = Address::from_slice(&value[..20]);
-        let storage_key = StorageKey::from_slice(&value[20..]);
-        Ok(Self((address, storage_key)))
-    }
-}
-
 impl_fixed_arbitrary!(
     (BlockNumberAddress, 28),
     (BlockNumberHashedAddress, 40),
@@ -195,13 +185,13 @@ impl_fixed_arbitrary!(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_primitives::address;
     use rand::{rng, Rng};
-    use std::str::FromStr;
 
     #[test]
     fn test_block_number_address() {
         let num = 1u64;
-        let hash = Address::from_str("ba5e000000000000000000000000000000000000").unwrap();
+        let hash = address!("0xba5e000000000000000000000000000000000000");
         let key = BlockNumberAddress((num, hash));
 
         let mut bytes = [0u8; 28];
@@ -226,7 +216,7 @@ mod tests {
     #[test]
     fn test_address_storage_key() {
         let storage_key = StorageKey::random();
-        let address = Address::from_str("ba5e000000000000000000000000000000000000").unwrap();
+        let address = address!("0xba5e000000000000000000000000000000000000");
         let key = AddressStorageKey((address, storage_key));
 
         let mut bytes = [0u8; 52];

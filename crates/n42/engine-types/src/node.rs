@@ -9,7 +9,6 @@
 use alloy_eips::{eip7840::BlobParams, merge::EPOCH_SLOTS};
 use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks};
 use reth_consensus::{ConsensusError, FullConsensus};
-use reth_node_ethereum::node::EthereumConsensusBuilder;
 pub use reth_node_ethereum::{payload::EthereumPayloadBuilder, EthereumEngineValidator};
 use reth_node_ethereum::{EthEngineTypes, EthEvmConfig};
 //use reth_ethereum_consensus::EthBeaconConsensus;
@@ -36,8 +35,7 @@ use reth_node_builder::{
         BasicEngineApiBuilder, BasicEngineValidatorBuilder, EngineValidatorAddOn, EthApiBuilder,
         EthApiCtx, PayloadValidatorBuilder, RethRpcAddOns, RpcAddOns, RpcHandle,
     },
-    BuilderContext, DebugNode, Node, NodeAdapter, NodeComponentsBuilder, PayloadBuilderConfig,
-    PayloadTypes,
+    BuilderContext, DebugNode, Node, NodeAdapter, PayloadTypes,
 };
 use reth_provider::{providers::ProviderFactoryBuilder, CanonStateSubscriptions, EthStorage};
 use reth_rpc::{eth::core::EthApiFor, ValidationApi};
@@ -270,6 +268,7 @@ where
     N: FullNodeComponents,
     EthB: EthApiBuilder<N>,
     PVB: Send,
+    BasicEngineApiBuilder<PVB>: reth_node_builder::rpc::EngineApiBuilder<N>,
     BasicEngineValidatorBuilder<PVB>: reth_node_builder::rpc::EngineValidatorBuilder<N>,
 {
     type ValidatorBuilder = BasicEngineValidatorBuilder<PVB>;
@@ -282,7 +281,6 @@ where
 impl<N> Node<N> for N42Node
 where
     N: FullNodeTypes<Types = Self>,
-    <<N as FullNodeTypes>::Provider as reth_provider::DatabaseProviderFactory>::Provider: reth_provider::TrieReader,
 {
     type ComponentsBuilder = ComponentsBuilder<
         N,
@@ -294,7 +292,7 @@ where
     >;
 
     type AddOns = EthereumAddOns<
-        NodeAdapter<N, <Self::ComponentsBuilder as NodeComponentsBuilder<N>>::Components>,
+        NodeAdapter<N>,
         EthereumEthApiBuilder,
         EthereumEngineValidatorBuilder,
     >;
@@ -308,30 +306,20 @@ where
     }
 }
 
-impl<N: FullNodeComponents<Types = Self>> DebugNode<N> for N42Node
-where
-    <<N as FullNodeTypes>::Provider as reth_provider::DatabaseProviderFactory>::Provider: reth_provider::TrieReader,
-{
+impl<N: FullNodeComponents<Types = Self>> DebugNode<N> for N42Node {
     type RpcBlock = alloy_rpc_types_eth::Block;
 
     fn rpc_to_primitive_block(rpc_block: Self::RpcBlock) -> reth_ethereum_primitives::Block {
-        let alloy_rpc_types_eth::Block {
-            header,
-            transactions,
-            withdrawals,
-            ..
-        } = rpc_block;
-        reth_ethereum_primitives::Block {
-            header: header.inner,
-            body: reth_ethereum_primitives::BlockBody {
-                transactions: transactions
-                    .into_transactions()
-                    .map(|tx| tx.inner.into_inner().into())
-                    .collect(),
-                ommers: Default::default(),
-                withdrawals,
-            },
-        }
+        rpc_block.into_consensus().convert_transactions()
+    }
+
+    fn local_payload_attributes_builder(
+        chain_spec: &Self::ChainSpec,
+    ) -> impl reth_node_api::PayloadAttributesBuilder<
+        <Self::Payload as PayloadTypes>::PayloadAttributes,
+        reth_node_api::HeaderTy<Self>,
+    > {
+        n42_engine_primitives::N42PayloadAttributesBuilder::new(Arc::new(chain_spec.clone()))
     }
 }
 
@@ -348,9 +336,7 @@ where
     type EVM = EthEvmConfig;
 
     async fn build_evm(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::EVM> {
-        let evm_config = EthEvmConfig::new(ctx.chain_spec())
-            .with_extra_data(ctx.payload_builder_config().extra_data_bytes());
-        Ok(evm_config)
+        Ok(EthEvmConfig::new(ctx.chain_spec()))
     }
 }
 
@@ -364,17 +350,18 @@ pub struct EthereumPoolBuilder {
     // TODO add options for txpool args
 }
 
-impl<Types, Node> PoolBuilder<Node> for EthereumPoolBuilder
+impl<Types, Node, Evm> PoolBuilder<Node, Evm> for EthereumPoolBuilder
 where
     Types: NodeTypes<
         ChainSpec: EthereumHardforks,
         Primitives: NodePrimitives<SignedTx = TransactionSigned>,
     >,
     Node: FullNodeTypes<Types = Types>,
+    Evm: ConfigureEvm<Primitives = reth_node_api::PrimitivesTy<Types>> + Clone + 'static,
 {
-    type Pool = EthTransactionPool<Node::Provider, DiskFileBlobStore>;
+    type Pool = EthTransactionPool<Node::Provider, DiskFileBlobStore, Evm>;
 
-    async fn build_pool(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::Pool> {
+    async fn build_pool(self, ctx: &BuilderContext<Node>, evm_config: Evm) -> eyre::Result<Self::Pool> {
         let data_dir = ctx.config().datadir();
         let pool_config = ctx.pool_config();
 
@@ -400,8 +387,7 @@ where
             DiskFileBlobStoreConfig::default().with_max_cached_entries(blob_cache_size);
 
         let blob_store = DiskFileBlobStore::open(data_dir.blobstore(), custom_config)?;
-        let validator = TransactionValidationTaskExecutor::eth_builder(ctx.provider().clone())
-            .with_head_timestamp(ctx.head().timestamp)
+        let validator = TransactionValidationTaskExecutor::eth_builder(ctx.provider().clone(), evm_config)
             .kzg_settings(ctx.kzg_settings()?)
             .with_local_transactions_config(pool_config.local_transactions_config.clone())
             .set_tx_fee_cap(ctx.config().rpc.rpc_tx_fee_cap)
@@ -444,7 +430,7 @@ where
             }
 
             // spawn the maintenance task
-            ctx.task_executor().spawn_critical(
+            ctx.task_executor().spawn_critical_task(
                 "txpool maintenance task",
                 reth_transaction_pool::maintain::maintain_transaction_pool_future(
                     client,

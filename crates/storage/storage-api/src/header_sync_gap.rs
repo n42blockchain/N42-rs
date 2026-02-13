@@ -1,12 +1,9 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use alloy_primitives::BlockNumber;
 use reth_primitives_traits::{BlockHeader, SealedHeader};
 use reth_storage_errors::provider::ProviderResult;
 
 /// Provider for getting the local tip header for sync gap calculation.
-pub trait HeaderSyncGapProvider: Send + Sync {
+pub trait HeaderSyncGapProvider: Send {
     /// The header type.
     type Header: BlockHeader;
 

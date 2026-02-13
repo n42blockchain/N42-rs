@@ -1,7 +1,26 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! Block abstraction.
+//!
+//! This module provides the core block types and transformations:
+//!
+//! ```rust
+//! # use reth_primitives_traits::{Block, SealedBlock, RecoveredBlock};
+//! # fn example<B: Block + 'static>(block: B) -> Result<(), Box<dyn std::error::Error>>
+//! # where B::Body: reth_primitives_traits::BlockBody<Transaction: reth_primitives_traits::SignedTransaction> {
+//! // Basic block flow
+//! let block: B = block;
+//!
+//! // Seal (compute hash)
+//! let sealed: SealedBlock<B> = block.seal();
+//!
+//! // Recover senders
+//! let recovered: RecoveredBlock<B> = sealed.try_recover()?;
+//!
+//! // Access components
+//! let senders = recovered.senders();
+//! let hash = recovered.hash();
+//! # Ok(())
+//! # }
+//! ```
 
 pub(crate) mod sealed;
 pub use sealed::SealedBlock;
@@ -31,17 +50,9 @@ pub mod serde_bincode_compat {
 }
 
 /// Helper trait that unifies all behaviour required by block to support full node operations.
-pub trait FullBlock:
-    Block<Header: FullBlockHeader, Body: FullBlockBody> + alloy_rlp::Encodable + alloy_rlp::Decodable
-{
-}
+pub trait FullBlock: Block<Header: FullBlockHeader, Body: FullBlockBody> {}
 
-impl<T> FullBlock for T where
-    T: Block<Header: FullBlockHeader, Body: FullBlockBody>
-        + alloy_rlp::Encodable
-        + alloy_rlp::Decodable
-{
-}
+impl<T> FullBlock for T where T: Block<Header: FullBlockHeader, Body: FullBlockBody> {}
 
 /// Helper trait to access [`BlockBody::Transaction`] given a [`Block`].
 pub type BlockTx<B> = <<B as Block>::Body as BlockBody>::Transaction;
@@ -50,7 +61,7 @@ pub type BlockTx<B> = <<B as Block>::Body as BlockBody>::Transaction;
 ///
 /// This type defines the structure of a block in the blockchain.
 /// A [`Block`] is composed of a header and a body.
-/// It is expected that a block can always be completely reconstructed from its header and body.
+/// It is expected that a block can always be completely reconstructed from its header and body
 pub trait Block:
     Send
     + Sync
@@ -150,7 +161,7 @@ pub trait Block:
         } else {
             // Fall back to recovery if lengths don't match
             let Ok(senders) = self.body().recover_signers_unchecked() else {
-                return Err(BlockRecoveryError::new(self));
+                return Err(BlockRecoveryError::new(self))
             };
             senders
         };
@@ -171,12 +182,9 @@ pub trait Block:
     /// transactions.
     ///
     /// Returns the block as error if a signature is invalid.
-    fn try_into_recovered(self) -> Result<RecoveredBlock<Self>, BlockRecoveryError<Self>>
-    where
-        <Self::Body as BlockBody>::Transaction: SignedTransaction,
-    {
+    fn try_into_recovered(self) -> Result<RecoveredBlock<Self>, BlockRecoveryError<Self>> {
         let Ok(signers) = self.body().recover_signers() else {
-            return Err(BlockRecoveryError::new(self));
+            return Err(BlockRecoveryError::new(self))
         };
         Ok(RecoveredBlock::new_unhashed(self, signers))
     }
@@ -258,6 +266,11 @@ pub trait TestBlock: Block<Header: crate::test_utils::TestHeader> {
     /// Updates the block number.
     fn set_block_number(&mut self, number: alloy_primitives::BlockNumber) {
         crate::header::test_utils::TestHeader::set_block_number(self.header_mut(), number);
+    }
+
+    /// Updates the block timestamp.
+    fn set_timestamp(&mut self, timestamp: u64) {
+        crate::header::test_utils::TestHeader::set_timestamp(self.header_mut(), timestamp);
     }
 
     /// Updates the block state root.

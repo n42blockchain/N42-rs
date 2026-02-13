@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use alloc::vec::Vec;
 use core::ops::{Bound, RangeBounds};
 use reth_db_api::{
@@ -40,9 +37,7 @@ pub trait DBProvider: Sized {
     }
 
     /// Commit database transaction
-    fn commit(self) -> ProviderResult<bool> {
-        Ok(self.into_tx().commit()?)
-    }
+    fn commit(self) -> ProviderResult<()>;
 
     /// Returns a reference to prune modes.
     fn prune_modes_ref(&self) -> &PruneModes;
@@ -64,10 +59,7 @@ pub trait DBProvider: Sized {
         &self,
         range: impl RangeBounds<T::Key>,
     ) -> Result<Vec<KeyValue<T>>, DatabaseError> {
-        self.tx_ref()
-            .cursor_read::<T>()?
-            .walk_range(range)?
-            .collect::<Result<Vec<_>, _>>()
+        self.tx_ref().cursor_read::<T>()?.walk_range(range)?.collect::<Result<Vec<_>, _>>()
     }
 
     /// Iterates over read only values in the given table and collects them into a vector.
@@ -191,7 +183,8 @@ where
     }
 }
 
-fn range_size_hint(range: &impl RangeBounds<u64>) -> Option<usize> {
+/// Returns the length of the range if the range has a bounded end.
+pub fn range_size_hint(range: &impl RangeBounds<u64>) -> Option<usize> {
     let start = match range.start_bound().cloned() {
         Bound::Included(start) => start,
         Bound::Excluded(start) => start.checked_add(1)?,

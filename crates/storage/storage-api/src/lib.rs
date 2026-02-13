@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! Collection of traits and types for common storage access.
 
 #![doc(
@@ -9,7 +6,7 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
@@ -82,19 +79,15 @@ mod stats;
 #[cfg(feature = "db-api")]
 pub use stats::*;
 
-pub mod metadata;
-#[cfg(feature = "db-api")]
-pub use metadata::{MetadataProvider, MetadataWriter, StorageSettingsCache};
-#[cfg(feature = "db-api")]
-pub use reth_db_api::models::StorageSettings;
-
 mod primitives;
 pub use primitives::*;
 
 mod block_indices;
 pub use block_indices::*;
 
+#[cfg(feature = "std")]
 mod block_writer;
+#[cfg(feature = "std")]
 pub use block_writer::*;
 
 mod state_writer;
@@ -103,8 +96,18 @@ pub use state_writer::*;
 mod header_sync_gap;
 pub use header_sync_gap::HeaderSyncGapProvider;
 
+#[cfg(feature = "db-api")]
+pub mod metadata;
+#[cfg(feature = "db-api")]
+pub use metadata::{MetadataProvider, MetadataWriter, StorageSettingsCache};
+#[cfg(feature = "db-api")]
+pub use reth_db_api::models::StorageSettings;
+
 mod full;
 pub use full::*;
+
+// Helper macros for provider trait implementations
+pub mod macros;
 
 // N42-specific beacon storage traits
 mod beacon;
@@ -114,5 +117,18 @@ pub use beacon::*;
 mod snapshot;
 pub use snapshot::*;
 
-// Helper macros for provider trait implementations
-pub mod macros;
+// N42-specific legacy traits
+mod legacy;
+pub use legacy::*;
+
+// N42-specific ommers
+mod ommers;
+pub use ommers::*;
+
+// N42-specific validator
+mod validator;
+pub use validator::*;
+
+// N42-specific withdrawals
+mod withdrawals;
+pub use withdrawals::*;

@@ -53,7 +53,7 @@ mod consensus_builder_tests {
 }
 
 mod payload_builder_tests {
-    use super::*;
+    use crate::payload::EthereumPayloadBuilderWrapper;
 
     #[test]
     fn test_ethereum_payload_builder_wrapper_default() {

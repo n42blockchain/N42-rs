@@ -1,20 +1,17 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 /// Default budget to try and drain streams.
 ///
-/// Increased from 10 to 20 for higher throughput.
-pub const DEFAULT_BUDGET_TRY_DRAIN_STREAM: u32 = 20;
+/// Default is 10 iterations.
+pub const DEFAULT_BUDGET_TRY_DRAIN_STREAM: u32 = 10;
 
 /// Default budget to try and drain headers and bodies download streams.
 ///
-/// Increased from 2 to 4 for faster sync.
-pub const DEFAULT_BUDGET_TRY_DRAIN_DOWNLOADERS: u32 = 4;
+/// Default is 2 iterations.
+pub const DEFAULT_BUDGET_TRY_DRAIN_DOWNLOADERS: u32 = 2;
 
 /// Default budget to try and drain [`Swarm`](crate::swarm::Swarm).
 ///
-/// Increased from 10 to 20 for higher network event processing.
-pub const DEFAULT_BUDGET_TRY_DRAIN_SWARM: u32 = 20;
+/// Default is 10 [`SwarmEvent`](crate::swarm::SwarmEvent)s.
+pub const DEFAULT_BUDGET_TRY_DRAIN_SWARM: u32 = 10;
 
 /// Default budget to try and drain pending messages from [`NetworkHandle`](crate::NetworkHandle)
 /// channel. Polling the [`TransactionsManager`](crate::transactions::TransactionsManager) future
@@ -37,13 +34,6 @@ pub const DEFAULT_BUDGET_TRY_DRAIN_NETWORK_TRANSACTION_EVENTS: u32 = DEFAULT_BUD
 //
 // Default is 40 pending pool imports.
 pub const DEFAULT_BUDGET_TRY_DRAIN_PENDING_POOL_IMPORTS: u32 = 4 * DEFAULT_BUDGET_TRY_DRAIN_STREAM;
-
-/// Default budget to try and stream hashes of successfully imported transactions from the pool.
-///
-/// Default is naturally same as the number of transactions to attempt importing,
-/// [`DEFAULT_BUDGET_TRY_DRAIN_PENDING_POOL_IMPORTS`], so 40 pool imports.
-pub const DEFAULT_BUDGET_TRY_DRAIN_POOL_IMPORTS: u32 =
-    DEFAULT_BUDGET_TRY_DRAIN_PENDING_POOL_IMPORTS;
 
 /// Polls the given stream. Breaks with `true` if there maybe is more work.
 #[macro_export]

@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! Block body abstraction.
 
 use crate::{
@@ -8,7 +5,10 @@ use crate::{
     MaybeSerdeBincodeCompat, SignedTransaction,
 };
 use alloc::{fmt, vec::Vec};
-use alloy_consensus::{transaction::TxHashRef, Transaction, Typed2718};
+use alloy_consensus::{
+    transaction::{Recovered, TxHashRef},
+    Transaction, Typed2718,
+};
 use alloy_eips::{eip2718::Encodable2718, eip4895::Withdrawals};
 use alloy_primitives::{Address, Bytes, B256};
 
@@ -112,7 +112,7 @@ pub trait BlockBody:
 
     /// Calculate the withdrawals root for the block body.
     ///
-    /// Returns `RecoveryError` if there are no withdrawals in the block.
+    /// Returns `Some(root)` if withdrawals are present, otherwise `None`.
     fn calculate_withdrawals_root(&self) -> Option<B256> {
         self.withdrawals().map(|withdrawals| {
             alloy_consensus::proofs::calculate_withdrawals_root(withdrawals.as_slice())
@@ -124,24 +124,19 @@ pub trait BlockBody:
 
     /// Calculate the ommers root for the block body.
     ///
-    /// Returns `RecoveryError` if there are no ommers in the block.
+    /// Returns `Some(root)` if ommers are present, otherwise `None`.
     fn calculate_ommers_root(&self) -> Option<B256> {
-        self.ommers()
-            .map(alloy_consensus::proofs::calculate_ommers_root)
+        self.ommers().map(alloy_consensus::proofs::calculate_ommers_root)
     }
 
     /// Calculates the total blob gas used by _all_ EIP-4844 transactions in the block.
     fn blob_gas_used(&self) -> u64 {
-        self.transactions_iter()
-            .filter_map(|tx| tx.blob_gas_used())
-            .sum()
+        self.transactions_iter().filter_map(|tx| tx.blob_gas_used()).sum()
     }
 
     /// Returns an iterator over all blob versioned hashes in the block body.
     fn blob_versioned_hashes_iter(&self) -> impl Iterator<Item = &B256> + '_ {
-        self.transactions_iter()
-            .filter_map(|tx| tx.blob_versioned_hashes())
-            .flatten()
+        self.transactions_iter().filter_map(|tx| tx.blob_versioned_hashes()).flatten()
     }
 
     /// Returns an iterator over the encoded 2718 transactions.
@@ -161,26 +156,18 @@ pub trait BlockBody:
     /// See also [`Encodable2718`].
     #[doc(alias = "raw_transactions")]
     fn encoded_2718_transactions(&self) -> Vec<Bytes> {
-        self.encoded_2718_transactions_iter()
-            .map(Into::into)
-            .collect()
+        self.encoded_2718_transactions_iter().map(Into::into).collect()
     }
 
     /// Recover signer addresses for all transactions in the block body.
-    fn recover_signers(&self) -> Result<Vec<Address>, RecoveryError>
-    where
-        Self::Transaction: SignedTransaction,
-    {
+    fn recover_signers(&self) -> Result<Vec<Address>, RecoveryError> {
         crate::transaction::recover::recover_signers(self.transactions())
     }
 
     /// Recover signer addresses for all transactions in the block body.
     ///
     /// Returns an error if some transaction's signature is invalid.
-    fn try_recover_signers(&self) -> Result<Vec<Address>, RecoveryError>
-    where
-        Self::Transaction: SignedTransaction,
-    {
+    fn try_recover_signers(&self) -> Result<Vec<Address>, RecoveryError> {
         self.recover_signers()
     }
 
@@ -188,10 +175,7 @@ pub trait BlockBody:
     /// signature has a low `s` value_.
     ///
     /// Returns `RecoveryError`, if some transaction's signature is invalid.
-    fn recover_signers_unchecked(&self) -> Result<Vec<Address>, RecoveryError>
-    where
-        Self::Transaction: SignedTransaction,
-    {
+    fn recover_signers_unchecked(&self) -> Result<Vec<Address>, RecoveryError> {
         crate::transaction::recover::recover_signers_unchecked(self.transactions())
     }
 
@@ -199,11 +183,61 @@ pub trait BlockBody:
     /// signature has a low `s` value_.
     ///
     /// Returns an error if some transaction's signature is invalid.
-    fn try_recover_signers_unchecked(&self) -> Result<Vec<Address>, RecoveryError>
-    where
-        Self::Transaction: SignedTransaction,
-    {
+    fn try_recover_signers_unchecked(&self) -> Result<Vec<Address>, RecoveryError> {
         self.recover_signers_unchecked()
+    }
+
+    /// Recovers signers for all transactions in the block body and returns a vector of
+    /// [`Recovered`].
+    fn recover_transactions(&self) -> Result<Vec<Recovered<Self::Transaction>>, RecoveryError> {
+        self.recover_signers().map(|signers| {
+            self.transactions()
+                .iter()
+                .zip(signers)
+                .map(|(tx, signer)| tx.clone().with_signer(signer))
+                .collect()
+        })
+    }
+
+    /// Returns an iterator over `Recovered<&Transaction>` for all transactions in the block body.
+    ///
+    /// This method recovers signers and returns an iterator without cloning transactions,
+    /// making it more efficient than [`BlockBody::recover_transactions`] when owned values are not
+    /// required.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any transaction's signature is invalid.
+    fn recover_transactions_ref(
+        &self,
+    ) -> Result<impl Iterator<Item = Recovered<&Self::Transaction>> + '_, RecoveryError> {
+        let signers = self.recover_signers()?;
+        Ok(self
+            .transactions()
+            .iter()
+            .zip(signers)
+            .map(|(tx, signer)| Recovered::new_unchecked(tx, signer)))
+    }
+
+    /// Returns an iterator over `Recovered<&Transaction>` for all transactions in the block body
+    /// _without ensuring that the signature has a low `s` value_.
+    ///
+    /// This method recovers signers and returns an iterator without cloning transactions,
+    /// making it more efficient than recovering with owned transactions when owned values are not
+    /// required.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any transaction's signature is invalid.
+    fn recover_transactions_unchecked_ref(
+        &self,
+    ) -> Result<impl Iterator<Item = Recovered<&Self::Transaction>> + '_, RecoveryError> {
+        let signers = self.recover_signers_unchecked()?;
+        Ok(self
+            .transactions()
+            .iter()
+            .zip(signers)
+            .map(|(tx, signer)| Recovered::new_unchecked(tx, signer)))
     }
 }
 

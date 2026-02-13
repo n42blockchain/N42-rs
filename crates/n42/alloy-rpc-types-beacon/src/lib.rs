@@ -11,6 +11,9 @@
 
 use alloy_primitives::FixedBytes;
 use constants::{BLS_PUBLIC_KEY_BYTES_LEN, BLS_SIGNATURE_BYTES_LEN};
+// Suppress unused crate warnings for dependencies required by upstream alloy
+use derive_more as _;
+use thiserror as _;
 
 /// Constants used in the Beacon API.
 pub mod constants;
@@ -18,8 +21,17 @@ pub mod constants;
 /// Beacon API events support.
 pub mod events;
 
+/// Types and functions related to the beacon block.
+pub mod block;
+
 /// Types and functions related to the beacon block header.
 pub mod header;
+
+/// Types for the beacon genesis endpoint.
+pub mod genesis;
+
+/// Types for beacon node endpoints.
+pub mod node;
 
 /// Types and functions related to the beacon block payload.
 pub mod payload;

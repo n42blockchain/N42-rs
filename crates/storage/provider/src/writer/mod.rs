@@ -74,16 +74,17 @@ mod tests {
 
         let provider = provider_factory.provider().unwrap();
         assert_eq!(
-            provider.tx_ref().get::<tables::HashedAccounts>(destroyed_address_hashed),
-            Ok(None)
+            provider.tx_ref().get::<tables::HashedAccounts>(destroyed_address_hashed).unwrap(),
+            None
         );
         assert_eq!(
             provider
                 .tx_ref()
                 .cursor_read::<tables::HashedStorages>()
                 .unwrap()
-                .seek_by_key_subkey(destroyed_address_hashed, hashed_slot),
-            Ok(None)
+                .seek_by_key_subkey(destroyed_address_hashed, hashed_slot)
+                .unwrap(),
+            None
         );
     }
 
@@ -109,6 +110,7 @@ mod tests {
             address_a,
             RevmAccount {
                 info: account_a.clone(),
+                original_info: Box::new(account_a.clone()),
                 status: AccountStatus::Touched | AccountStatus::Created,
                 storage: HashMap::default(),
                 transaction_id: 0,
@@ -120,6 +122,7 @@ mod tests {
             address_b,
             RevmAccount {
                 info: account_b_changed.clone(),
+                original_info: Box::new(account_b_changed.clone()),
                 status: AccountStatus::Touched,
                 storage: HashMap::default(),
                 transaction_id: 0,
@@ -179,7 +182,8 @@ mod tests {
             address_b,
             RevmAccount {
                 status: AccountStatus::Touched | AccountStatus::SelfDestructed,
-                info: account_b_changed,
+                info: account_b_changed.clone(),
+                original_info: Box::new(account_b_changed),
                 storage: HashMap::default(),
                 transaction_id: 0,
             },
@@ -244,6 +248,7 @@ mod tests {
                 RevmAccount {
                     status: AccountStatus::Touched | AccountStatus::Created,
                     info: RevmAccountInfo::default(),
+                    original_info: Box::new(RevmAccountInfo::default()),
                     // 0x00 => 0 => 1
                     // 0x01 => 0 => 2
                     storage: HashMap::from_iter([
@@ -263,7 +268,8 @@ mod tests {
                 address_b,
                 RevmAccount {
                     status: AccountStatus::Touched,
-                    info: account_b,
+                    info: account_b.clone(),
+                    original_info: Box::new(account_b),
                     // 0x01 => 1 => 2
                     storage: HashMap::from_iter([(
                         U256::from(1),
@@ -374,6 +380,7 @@ mod tests {
             RevmAccount {
                 status: AccountStatus::Touched | AccountStatus::SelfDestructed,
                 info: RevmAccountInfo::default(),
+                original_info: Box::new(RevmAccountInfo::default()),
                 storage: HashMap::default(),
                 transaction_id: 0,
             },
@@ -429,6 +436,7 @@ mod tests {
             address1,
             RevmAccount {
                 info: account_info.clone(),
+                original_info: Box::new(account_info.clone()),
                 status: AccountStatus::Touched | AccountStatus::Created,
                 // 0x00 => 0 => 1
                 // 0x01 => 0 => 2
@@ -466,6 +474,7 @@ mod tests {
             RevmAccount {
                 status: AccountStatus::Touched,
                 info: account_info.clone(),
+                original_info: Box::new(account_info.clone()),
                 // 0x00 => 1 => 2
                 storage: HashMap::from_iter([(
                     U256::ZERO,
@@ -486,6 +495,7 @@ mod tests {
             RevmAccount {
                 status: AccountStatus::Touched | AccountStatus::SelfDestructed,
                 info: account_info.clone(),
+                original_info: Box::new(account_info.clone()),
                 storage: HashMap::default(),
                 transaction_id: 0,
             },
@@ -498,6 +508,7 @@ mod tests {
             RevmAccount {
                 status: AccountStatus::Touched | AccountStatus::Created,
                 info: account_info.clone(),
+                original_info: Box::new(account_info.clone()),
                 storage: HashMap::default(),
                 transaction_id: 0,
             },
@@ -510,6 +521,7 @@ mod tests {
             RevmAccount {
                 status: AccountStatus::Touched,
                 info: account_info.clone(),
+                original_info: Box::new(account_info.clone()),
                 // 0x00 => 0 => 2
                 // 0x02 => 0 => 4
                 // 0x06 => 0 => 6
@@ -538,6 +550,7 @@ mod tests {
             RevmAccount {
                 status: AccountStatus::Touched | AccountStatus::SelfDestructed,
                 info: account_info.clone(),
+                original_info: Box::new(account_info.clone()),
                 storage: HashMap::default(),
                 transaction_id: 0,
             },
@@ -550,6 +563,7 @@ mod tests {
             RevmAccount {
                 status: AccountStatus::Touched | AccountStatus::Created,
                 info: account_info.clone(),
+                original_info: Box::new(account_info.clone()),
                 storage: HashMap::default(),
                 transaction_id: 0,
             },
@@ -559,6 +573,7 @@ mod tests {
             RevmAccount {
                 status: AccountStatus::Touched,
                 info: account_info.clone(),
+                original_info: Box::new(account_info.clone()),
                 // 0x00 => 0 => 2
                 storage: HashMap::from_iter([(
                     U256::ZERO,
@@ -572,6 +587,7 @@ mod tests {
             RevmAccount {
                 status: AccountStatus::Touched | AccountStatus::SelfDestructed,
                 info: account_info.clone(),
+                original_info: Box::new(account_info.clone()),
                 storage: HashMap::default(),
                 transaction_id: 0,
             },
@@ -581,6 +597,7 @@ mod tests {
             RevmAccount {
                 status: AccountStatus::Touched | AccountStatus::Created,
                 info: account_info.clone(),
+                original_info: Box::new(account_info.clone()),
                 storage: HashMap::default(),
                 transaction_id: 0,
             },
@@ -592,7 +609,8 @@ mod tests {
             address1,
             RevmAccount {
                 status: AccountStatus::Touched,
-                info: account_info,
+                info: account_info.clone(),
+                original_info: Box::new(account_info),
                 // 0x00 => 0 => 9
                 storage: HashMap::from_iter([(
                     U256::ZERO,
@@ -628,46 +646,46 @@ mod tests {
         // 0x00: 0
         // 0x01: 0
         assert_eq!(
-            storage_changes.next(),
-            Some(Ok((
+            storage_changes.next().map(|r| r.unwrap()),
+            Some((
                 BlockNumberAddress((0, address1)),
                 StorageEntry { key: B256::with_last_byte(0), value: U256::ZERO }
-            )))
+            ))
         );
         assert_eq!(
-            storage_changes.next(),
-            Some(Ok((
+            storage_changes.next().map(|r| r.unwrap()),
+            Some((
                 BlockNumberAddress((0, address1)),
                 StorageEntry { key: B256::with_last_byte(1), value: U256::ZERO }
-            )))
+            ))
         );
 
         // Block #1
         // 0x00: 1
         assert_eq!(
-            storage_changes.next(),
-            Some(Ok((
+            storage_changes.next().map(|r| r.unwrap()),
+            Some((
                 BlockNumberAddress((1, address1)),
                 StorageEntry { key: B256::with_last_byte(0), value: U256::from(1) }
-            )))
+            ))
         );
 
         // Block #2 (destroyed)
         // 0x00: 2
         // 0x01: 2
         assert_eq!(
-            storage_changes.next(),
-            Some(Ok((
+            storage_changes.next().map(|r| r.unwrap()),
+            Some((
                 BlockNumberAddress((2, address1)),
                 StorageEntry { key: B256::with_last_byte(0), value: U256::from(2) }
-            )))
+            ))
         );
         assert_eq!(
-            storage_changes.next(),
-            Some(Ok((
+            storage_changes.next().map(|r| r.unwrap()),
+            Some((
                 BlockNumberAddress((2, address1)),
                 StorageEntry { key: B256::with_last_byte(1), value: U256::from(2) }
-            )))
+            ))
         );
 
         // Block #3
@@ -678,25 +696,25 @@ mod tests {
         // 0x02: 0
         // 0x06: 0
         assert_eq!(
-            storage_changes.next(),
-            Some(Ok((
+            storage_changes.next().map(|r| r.unwrap()),
+            Some((
                 BlockNumberAddress((4, address1)),
                 StorageEntry { key: B256::with_last_byte(0), value: U256::ZERO }
-            )))
+            ))
         );
         assert_eq!(
-            storage_changes.next(),
-            Some(Ok((
+            storage_changes.next().map(|r| r.unwrap()),
+            Some((
                 BlockNumberAddress((4, address1)),
                 StorageEntry { key: B256::with_last_byte(2), value: U256::ZERO }
-            )))
+            ))
         );
         assert_eq!(
-            storage_changes.next(),
-            Some(Ok((
+            storage_changes.next().map(|r| r.unwrap()),
+            Some((
                 BlockNumberAddress((4, address1)),
                 StorageEntry { key: B256::with_last_byte(6), value: U256::ZERO }
-            )))
+            ))
         );
 
         // Block #5 (destroyed)
@@ -704,25 +722,25 @@ mod tests {
         // 0x02: 4
         // 0x06: 6
         assert_eq!(
-            storage_changes.next(),
-            Some(Ok((
+            storage_changes.next().map(|r| r.unwrap()),
+            Some((
                 BlockNumberAddress((5, address1)),
                 StorageEntry { key: B256::with_last_byte(0), value: U256::from(2) }
-            )))
+            ))
         );
         assert_eq!(
-            storage_changes.next(),
-            Some(Ok((
+            storage_changes.next().map(|r| r.unwrap()),
+            Some((
                 BlockNumberAddress((5, address1)),
                 StorageEntry { key: B256::with_last_byte(2), value: U256::from(4) }
-            )))
+            ))
         );
         assert_eq!(
-            storage_changes.next(),
-            Some(Ok((
+            storage_changes.next().map(|r| r.unwrap()),
+            Some((
                 BlockNumberAddress((5, address1)),
                 StorageEntry { key: B256::with_last_byte(6), value: U256::from(6) }
-            )))
+            ))
         );
 
         // Block #6
@@ -731,13 +749,13 @@ mod tests {
         // Block #7
         // 0x00: 0
         assert_eq!(
-            storage_changes.next(),
-            Some(Ok((
+            storage_changes.next().map(|r| r.unwrap()),
+            Some((
                 BlockNumberAddress((7, address1)),
                 StorageEntry { key: B256::with_last_byte(0), value: U256::ZERO }
-            )))
+            ))
         );
-        assert_eq!(storage_changes.next(), None);
+        assert_eq!(storage_changes.next().map(|r| r.unwrap()), None);
     }
 
     #[test]
@@ -755,6 +773,7 @@ mod tests {
             address1,
             RevmAccount {
                 info: account1.clone(),
+                original_info: Box::new(account1.clone()),
                 status: AccountStatus::Touched | AccountStatus::Created,
                 // 0x00 => 0 => 1
                 // 0x01 => 0 => 2
@@ -791,6 +810,7 @@ mod tests {
             RevmAccount {
                 status: AccountStatus::Touched | AccountStatus::SelfDestructed,
                 info: account1.clone(),
+                original_info: Box::new(account1.clone()),
                 storage: HashMap::default(),
                 transaction_id: 0,
             },
@@ -801,6 +821,7 @@ mod tests {
             RevmAccount {
                 status: AccountStatus::Touched | AccountStatus::Created,
                 info: account1.clone(),
+                original_info: Box::new(account1.clone()),
                 storage: HashMap::default(),
                 transaction_id: 0,
             },
@@ -810,7 +831,8 @@ mod tests {
             address1,
             RevmAccount {
                 status: AccountStatus::Touched,
-                info: account1,
+                info: account1.clone(),
+                original_info: Box::new(account1),
                 // 0x01 => 0 => 5
                 storage: HashMap::from_iter([(
                     U256::from(1),
@@ -835,20 +857,20 @@ mod tests {
         let mut storage_changes = storage_changeset_cursor.walk_range(range).unwrap();
 
         assert_eq!(
-            storage_changes.next(),
-            Some(Ok((
+            storage_changes.next().map(|r| r.unwrap()),
+            Some((
                 BlockNumberAddress((1, address1)),
                 StorageEntry { key: B256::with_last_byte(0), value: U256::from(1) }
-            )))
+            ))
         );
         assert_eq!(
-            storage_changes.next(),
-            Some(Ok((
+            storage_changes.next().map(|r| r.unwrap()),
+            Some((
                 BlockNumberAddress((1, address1)),
                 StorageEntry { key: B256::with_last_byte(1), value: U256::from(2) }
-            )))
+            ))
         );
-        assert_eq!(storage_changes.next(), None);
+        assert_eq!(storage_changes.next().map(|r| r.unwrap()), None);
     }
 
     #[test]
@@ -942,6 +964,7 @@ mod tests {
             RevmAccount {
                 status: AccountStatus::Touched | AccountStatus::SelfDestructed,
                 info: RevmAccountInfo::default(),
+                original_info: Box::new(RevmAccountInfo::default()),
                 storage: HashMap::default(),
                 transaction_id: 0,
             },
@@ -963,11 +986,13 @@ mod tests {
 
         let account2_slot2_new_value = U256::from(100);
         account2.1.insert(slot2_key, account2_slot2_new_value);
+        let account2_info: RevmAccountInfo = account2.0.into();
         state.commit(HashMap::from_iter([(
             address2,
             RevmAccount {
                 status: AccountStatus::Touched,
-                info: account2.0.into(),
+                info: account2_info.clone(),
+                original_info: Box::new(account2_info),
                 storage: HashMap::from_iter([(
                     slot2,
                     EvmStorageSlot::new_changed(
@@ -988,11 +1013,13 @@ mod tests {
         state.insert_account(address3, account3.0.into());
 
         account3.0.balance = U256::from(24);
+        let account3_info: RevmAccountInfo = account3.0.into();
         state.commit(HashMap::from_iter([(
             address3,
             RevmAccount {
                 status: AccountStatus::Touched,
-                info: account3.0.into(),
+                info: account3_info.clone(),
+                original_info: Box::new(account3_info),
                 storage: HashMap::default(),
                 transaction_id: 0,
             },
@@ -1006,11 +1033,13 @@ mod tests {
         state.insert_account(address4, account4.0.into());
 
         account4.0.nonce = 128;
+        let account4_info: RevmAccountInfo = account4.0.into();
         state.commit(HashMap::from_iter([(
             address4,
             RevmAccount {
                 status: AccountStatus::Touched,
-                info: account4.0.into(),
+                info: account4_info.clone(),
+                original_info: Box::new(account4_info),
                 storage: HashMap::default(),
                 transaction_id: 0,
             },
@@ -1022,11 +1051,13 @@ mod tests {
         let account1_new =
             Account { nonce: 56, balance: U256::from(123), bytecode_hash: Some(B256::random()) };
         prestate.insert(address1, (account1_new, BTreeMap::default()));
+        let account1_new_info: RevmAccountInfo = account1_new.into();
         state.commit(HashMap::from_iter([(
             address1,
             RevmAccount {
                 status: AccountStatus::Touched | AccountStatus::Created,
-                info: account1_new.into(),
+                info: account1_new_info.clone(),
+                original_info: Box::new(account1_new_info),
                 storage: HashMap::default(),
                 transaction_id: 0,
             },
@@ -1039,11 +1070,13 @@ mod tests {
         let slot20_key = B256::from(slot20);
         let account1_slot20_value = U256::from(12345);
         prestate.get_mut(&address1).unwrap().1.insert(slot20_key, account1_slot20_value);
+        let account1_new_info2: RevmAccountInfo = account1_new.into();
         state.commit(HashMap::from_iter([(
             address1,
             RevmAccount {
                 status: AccountStatus::Touched | AccountStatus::Created,
-                info: account1_new.into(),
+                info: account1_new_info2.clone(),
+                original_info: Box::new(account1_new_info2),
                 storage: HashMap::from_iter([(
                     slot20,
                     EvmStorageSlot::new_changed(U256::ZERO, account1_slot20_value, 0),

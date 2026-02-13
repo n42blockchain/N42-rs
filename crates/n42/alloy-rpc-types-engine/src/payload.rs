@@ -308,8 +308,10 @@ pub struct ExecutionPayloadV1 {
     /// The transactions of the block.
     pub transactions: Vec<Bytes>,
     /// difficulty for N42
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "U256::is_zero"))]
     pub difficulty: U256,
     /// nonce for N42
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "B64::is_zero"))]
     pub nonce: B64,
 }
 
@@ -587,8 +589,10 @@ impl ssz::Decode for ExecutionPayloadV2 {
                 base_fee_per_gas: decoder.decode_next()?,
                 block_hash: decoder.decode_next()?,
                 transactions: decoder.decode_next()?,
-                difficulty: decoder.decode_next()?,
-                nonce: decoder.decode_next()?,
+                // N42-specific fields not present in standard SSZ format;
+                    // use defaults for beacon chain wire compatibility
+                    difficulty: Default::default(),
+                    nonce: Default::default(),
             },
             withdrawals: decoder.decode_next()?,
         })
@@ -631,8 +635,16 @@ impl ssz::Encode for ExecutionPayloadV2 {
     }
 
     fn ssz_bytes_len(&self) -> usize {
-        <ExecutionPayloadV1 as ssz::Encode>::ssz_bytes_len(&self.payload_inner)
-            + ssz::BYTES_PER_LENGTH_OFFSET
+        // Manually compute to match ssz_append (excludes N42 difficulty/nonce fields)
+        let fixed = <B256 as ssz::Encode>::ssz_fixed_len() * 5
+            + <Address as ssz::Encode>::ssz_fixed_len()
+            + <Bloom as ssz::Encode>::ssz_fixed_len()
+            + <u64 as ssz::Encode>::ssz_fixed_len() * 4
+            + <U256 as ssz::Encode>::ssz_fixed_len()
+            + ssz::BYTES_PER_LENGTH_OFFSET * 3;
+        fixed
+            + self.payload_inner.extra_data.ssz_bytes_len()
+            + self.payload_inner.transactions.ssz_bytes_len()
             + self.withdrawals.ssz_bytes_len()
     }
 }
@@ -768,8 +780,9 @@ impl ssz::Decode for ExecutionPayloadV3 {
                     base_fee_per_gas: decoder.decode_next()?,
                     block_hash: decoder.decode_next()?,
                     transactions: decoder.decode_next()?,
-                    difficulty: decoder.decode_next()?,
-                    nonce: decoder.decode_next()?,
+                    // N42-specific fields not present in standard SSZ format
+                    difficulty: Default::default(),
+                    nonce: Default::default(),
                 },
                 withdrawals: decoder.decode_next()?,
             },
@@ -1431,9 +1444,8 @@ impl<'de> serde::Deserialize<'de> for ExecutionPayload {
                     .ok_or_else(|| serde::de::Error::missing_field("baseFeePerGas"))?;
                 let block_hash =
                     block_hash.ok_or_else(|| serde::de::Error::missing_field("blockHash"))?;
-                let difficulty =
-                    difficulty.ok_or_else(|| serde::de::Error::missing_field("difficulty"))?;
-                let nonce = nonce.ok_or_else(|| serde::de::Error::missing_field("nonce"))?;
+                let difficulty = difficulty.unwrap_or_default();
+                let nonce = nonce.unwrap_or_default();
                 let transactions =
                     transactions.ok_or_else(|| serde::de::Error::missing_field("transactions"))?;
 

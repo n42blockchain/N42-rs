@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! Various error variants that can happen when working with transactions.
 
 use crate::GotExpectedBoxed;
@@ -54,9 +51,6 @@ pub enum InvalidTransactionError {
     /// The transaction gas exceeds the limit
     #[error("intrinsic gas too high")]
     GasTooHigh,
-    /// The transaction gas limit exceeds the maximum allowed after Osaka hardfork.
-    #[error("gas limit too high")]
-    GasLimitTooHigh,
     /// Thrown to ensure no one is able to specify a transaction with a tip higher than the total
     /// fee cap.
     #[error("max priority fee per gas higher than max fee per gas")]
@@ -67,10 +61,14 @@ pub enum InvalidTransactionError {
     /// Thrown if the sender of a transaction is a contract.
     #[error("transaction signer has bytecode set")]
     SignerAccountHasBytecode,
+    /// Thrown post Osaka if gas limit is too high.
+    #[error("gas limit too high")]
+    GasLimitTooHigh,
 }
 
 impl InvalidTransactionError {
-    /// Returns `true` if the nonce of a transaction is lower than the account's current nonce.
+    /// Returns true if this is [`InvalidTransactionError::NonceNotConsistent`] and the
+    /// transaction's nonce is lower than the state's.
     pub fn is_nonce_too_low(&self) -> bool {
         match self {
             Self::NonceNotConsistent { tx, state } => tx < state,

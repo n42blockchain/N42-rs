@@ -30,12 +30,13 @@ revm-state.workspace = true
 op-alloy-consensus = { workspace = true, optional = true, features = ["k256"] }
 
 # crypto
-secp256k1 = { workspace = true, features = ["recovery"] }
+secp256k1 = { workspace = true, features = ["recovery"], optional = true }
 
 # misc
 auto_impl.workspace = true
 byteorder = { workspace = true, optional = true }
 bytes.workspace = true
+dashmap = { workspace = true, features = ["inline"], optional = true }
 derive_more.workspace = true
 once_cell.workspace = true
 serde_with = { workspace = true, optional = true }
@@ -50,8 +51,6 @@ arbitrary = { workspace = true, features = ["derive"], optional = true }
 proptest = { workspace = true, optional = true }
 proptest-arbitrary-interop = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
-
-# rpc-compat
 alloy-rpc-types-eth = { workspace = true, optional = true }
 
 [dev-dependencies]
@@ -71,12 +70,9 @@ rand.workspace = true
 rand_08.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-test-fuzz.workspace = true
-modular-bitfield.workspace = true
 
 [features]
 default = ["std"]
-rpc-compat = ["alloy-rpc-types-eth"]
 std = [
     "alloy-consensus/std",
     "alloy-eips/std",
@@ -89,7 +85,7 @@ std = [
     "bytes/std",
     "derive_more/std",
     "once_cell/std",
-    "secp256k1/std",
+    "secp256k1?/std",
     "thiserror/std",
     "alloy-trie/std",
     "op-alloy-consensus?/std",
@@ -97,6 +93,7 @@ std = [
     "reth-chainspec/std",
     "revm-bytecode/std",
     "revm-state/std",
+    "alloy-rpc-types-eth?/std",
 ]
 secp256k1 = ["alloy-consensus/secp256k1"]
 test-utils = [
@@ -114,11 +111,13 @@ arbitrary = [
     "alloy-eips/arbitrary",
     "revm-primitives/arbitrary",
     "reth-codecs?/arbitrary",
-    "secp256k1/global-context",
-    "secp256k1/rand",
+    "secp256k1?/global-context",
+    "secp256k1?/rand",
     "op-alloy-consensus?/arbitrary",
     "alloy-trie/arbitrary",
     "reth-chainspec/arbitrary",
+    "alloy-rpc-types-eth?/arbitrary",
+    "dashmap?/arbitrary",
 ]
 serde-bincode-compat = [
     "serde",
@@ -127,6 +126,8 @@ serde-bincode-compat = [
     "alloy-eips/serde-bincode-compat",
     "op-alloy-consensus?/serde",
     "op-alloy-consensus?/serde-bincode-compat",
+    "alloy-genesis/serde-bincode-compat",
+    "alloy-rpc-types-eth?/serde-bincode-compat",
 ]
 serde = [
     "dep:serde",
@@ -139,11 +140,13 @@ serde = [
     "revm-primitives/serde",
     "revm-primitives/serde",
     "op-alloy-consensus?/serde",
-    "secp256k1/serde",
+    "secp256k1?/serde",
     "alloy-trie/serde",
     "revm-bytecode/serde",
     "revm-state/serde",
     "rand_08/serde",
+    "alloy-rpc-types-eth?/serde",
+    "dashmap?/serde",
 ]
 reth-codec = [
     "dep:reth-codecs",
@@ -157,3 +160,5 @@ op = [
 rayon = [
     "dep:rayon",
 ]
+dashmap = ["dep:dashmap"]
+rpc-compat = ["alloy-rpc-types-eth"]

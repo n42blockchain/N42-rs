@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //!  [EIP-2930](https://eips.ethereum.org/EIPS/eip-2930): Access List types
 
 #[cfg(test)]
@@ -11,22 +8,11 @@ mod tests {
     use proptest::proptest;
     use proptest_arbitrary_interop::arb;
     use reth_codecs::{add_arbitrary_tests, Compact};
-    use serde::{Deserialize, Serialize};
 
     /// This type is kept for compatibility tests after the codec support was added to alloy-eips
-    /// AccessList type natively
+    /// `AccessList` type natively
     #[derive(
-        Clone,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        Default,
-        RlpDecodableWrapper,
-        RlpEncodableWrapper,
-        Serialize,
-        Deserialize,
-        Compact,
+        Clone, Debug, PartialEq, Eq, Default, RlpDecodableWrapper, RlpEncodableWrapper, Compact,
     )]
     #[cfg_attr(any(test, feature = "arbitrary"), derive(arbitrary::Arbitrary))]
     #[add_arbitrary_tests(compact, rlp)]
@@ -39,22 +25,9 @@ mod tests {
     }
 
     // This
-    #[derive(
-        Clone,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        Default,
-        RlpDecodable,
-        RlpEncodable,
-        Serialize,
-        Deserialize,
-        Compact,
-    )]
+    #[derive(Clone, Debug, PartialEq, Eq, Default, RlpDecodable, RlpEncodable, Compact)]
     #[cfg_attr(any(test, feature = "arbitrary"), derive(arbitrary::Arbitrary))]
     #[add_arbitrary_tests(compact, rlp)]
-    #[serde(rename_all = "camelCase")]
     struct RethAccessListItem {
         /// Account address that would be loaded at the start of execution
         address: Address,

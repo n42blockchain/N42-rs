@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use crate::{sync::OnceLock, InMemorySize, NodePrimitives};
 pub use alloy_consensus::Header;
 use alloy_consensus::Sealed;
@@ -23,10 +20,7 @@ pub type SealedHeaderFor<N> = SealedHeader<<N as NodePrimitives>::BlockHeader>;
 /// [`SealedHeader::hash`] computes the hash if it has not been computed yet.
 #[derive(Debug, Clone, AsRef, Deref)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    any(test, feature = "reth-codec"),
-    reth_codecs::add_arbitrary_tests(rlp)
-)]
+#[cfg_attr(any(test, feature = "reth-codec"), reth_codecs::add_arbitrary_tests(rlp))]
 pub struct SealedHeader<H = Header> {
     /// Block hash
     #[cfg_attr(feature = "serde", serde(skip))]
@@ -41,19 +35,13 @@ impl<H> SealedHeader<H> {
     /// Creates the sealed header without hashing the header.
     #[inline]
     pub fn new_unhashed(header: H) -> Self {
-        Self {
-            header,
-            hash: Default::default(),
-        }
+        Self { header, hash: Default::default() }
     }
 
     /// Creates the sealed header with the corresponding block hash.
     #[inline]
     pub fn new(header: H, hash: BlockHash) -> Self {
-        Self {
-            header,
-            hash: hash.into(),
-        }
+        Self { header, hash: hash.into() }
     }
 
     /// Returns the sealed Header fields.
@@ -82,10 +70,7 @@ impl<H> SealedHeader<H> {
 
     /// Converts from &`SealedHeader<H>` to `SealedHeader<&H>`.
     pub fn sealed_ref(&self) -> SealedHeader<&H> {
-        SealedHeader {
-            hash: self.hash.clone(),
-            header: &self.header,
-        }
+        SealedHeader { hash: self.hash.clone(), header: &self.header }
     }
 }
 
@@ -109,7 +94,7 @@ impl<H: Sealable> SealedHeader<H> {
         *self.hash_ref()
     }
 
-    /// This is the inverse of [`Header::seal_slow`] which returns the raw header and hash.
+    /// This is the inverse of [`Self::seal_slow`] which returns the raw header and hash.
     pub fn split(self) -> (H, BlockHash) {
         let hash = self.hash();
         (self.header, hash)
@@ -128,10 +113,7 @@ impl<H: Sealable> SealedHeader<&H> {
         H: Clone,
     {
         let Self { hash, header } = self;
-        SealedHeader {
-            hash,
-            header: header.clone(),
-        }
+        SealedHeader { hash, header: header.clone() }
     }
 }
 
@@ -143,10 +125,7 @@ impl<H: alloy_consensus::BlockHeader + Sealable> SealedHeader<H> {
 
     /// Return a [`BlockWithParent`] for this header.
     pub fn block_with_parent(&self) -> BlockWithParent {
-        BlockWithParent {
-            parent: self.parent_hash(),
-            block: self.num_hash(),
-        }
+        BlockWithParent { parent: self.parent_hash(), block: self.num_hash() }
     }
 }
 
@@ -249,6 +228,11 @@ impl<H: crate::test_utils::TestHeader> SealedHeader<H> {
         self.header.set_block_number(number);
     }
 
+    /// Updates the block timestamp.
+    pub fn set_timestamp(&mut self, timestamp: u64) {
+        self.header.set_timestamp(timestamp);
+    }
+
     /// Updates the block state root.
     pub fn set_state_root(&mut self, state_root: alloy_primitives::B256) {
         self.header.set_state_root(state_root);
@@ -257,6 +241,34 @@ impl<H: crate::test_utils::TestHeader> SealedHeader<H> {
     /// Updates the block difficulty.
     pub fn set_difficulty(&mut self, difficulty: alloy_primitives::U256) {
         self.header.set_difficulty(difficulty);
+    }
+}
+
+#[cfg(feature = "rpc-compat")]
+mod rpc_compat {
+    use super::*;
+
+    impl<H> SealedHeader<H> {
+        /// Converts this header into `alloy_rpc_types_eth::Header<H>`.
+        ///
+        /// Note: This does not set the total difficulty or size of the block.
+        pub fn into_rpc_header(self) -> alloy_rpc_types_eth::Header<H>
+        where
+            H: Sealable,
+        {
+            alloy_rpc_types_eth::Header::from_sealed(self.into())
+        }
+
+        /// Converts an `alloy_rpc_types_eth::Header<H>` into a `SealedHeader<H>`.
+        pub fn from_rpc_header(header: alloy_rpc_types_eth::Header<H>) -> Self {
+            Self::new(header.inner, header.hash)
+        }
+    }
+
+    impl<H> From<alloy_rpc_types_eth::Header<H>> for SealedHeader<H> {
+        fn from(value: alloy_rpc_types_eth::Header<H>) -> Self {
+            Self::from_rpc_header(value)
+        }
     }
 }
 
@@ -294,10 +306,7 @@ pub(super) mod serde_bincode_compat {
         for SealedHeader<'a, H>
     {
         fn from(value: &'a super::SealedHeader<H>) -> Self {
-            Self {
-                hash: value.hash(),
-                header: value.header.as_repr(),
-            }
+            Self { hash: value.hash(), header: value.header.as_repr() }
         }
     }
 

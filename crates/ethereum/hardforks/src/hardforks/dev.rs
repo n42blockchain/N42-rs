@@ -56,5 +56,9 @@ pub static DEV_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
             EthereumHardfork::Prague.boxed(),
             ForkCondition::Timestamp(0),
         ),
+        (
+            EthereumHardfork::Osaka.boxed(),
+            ForkCondition::Timestamp(0),
+        ),
     ])
 });

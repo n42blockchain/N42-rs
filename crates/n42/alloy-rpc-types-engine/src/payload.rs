@@ -1509,6 +1509,49 @@ impl<'de> serde::Deserialize<'de> for ExecutionPayload {
     }
 }
 
+/// This structure maps on the ExecutionPayloadV4 structure of the beacon chain spec.
+///
+/// This is the Amsterdam fork payload type which adds the block access list (EIP-7928).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+#[cfg_attr(any(test, feature = "arbitrary"), derive(arbitrary::Arbitrary))]
+pub struct ExecutionPayloadV4 {
+    /// Inner V3 payload
+    #[cfg_attr(feature = "serde", serde(flatten))]
+    pub payload_inner: ExecutionPayloadV3,
+    /// RLP-encoded block access list as defined in [EIP-7928].
+    ///
+    /// [EIP-7928]: https://eips.ethereum.org/EIPS/eip-7928
+    pub block_access_list: Bytes,
+}
+
+/// This structure maps for the return value of `engine_getPayload` of the beacon chain spec, for
+/// V6.
+///
+/// See also:
+/// <https://github.com/ethereum/execution-apis/blob/main/src/engine/amsterdam.md>
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+#[cfg_attr(any(test, feature = "arbitrary"), derive(arbitrary::Arbitrary))]
+pub struct ExecutionPayloadEnvelopeV6 {
+    /// Execution payload V4
+    pub execution_payload: ExecutionPayloadV4,
+    /// The expected value to be received by the feeRecipient in wei
+    pub block_value: U256,
+    /// The blobs, commitments, and EIP-7594 style cell proofs associated with the executed
+    /// payload.
+    pub blobs_bundle: BlobsBundleV2,
+    /// Introduced in V3, this represents a suggestion from the execution layer if the payload
+    /// should be used instead of an externally provided one.
+    pub should_override_builder: bool,
+    /// A list of opaque [EIP-7685][eip7685] requests.
+    ///
+    /// [eip7685]: https://eips.ethereum.org/EIPS/eip-7685
+    pub execution_requests: Requests,
+}
+
 /// This structure contains a body of an execution payload.
 ///
 /// See also: <https://github.com/ethereum/execution-apis/blob/6452a6b194d7db269bf1dbd087a267251d3cc7f8/src/engine/shanghai.md#executionpayloadbodyv1>
@@ -1551,6 +1594,55 @@ impl ExecutionPayloadBodyV1 {
 impl<T: Encodable2718, H> From<Block<T, H>> for ExecutionPayloadBodyV1 {
     fn from(value: Block<T, H>) -> Self {
         Self::from_block(value)
+    }
+}
+
+/// This structure contains a body of an execution payload (V2).
+///
+/// V2 adds the optional `block_access_list` field for the Amsterdam fork (EIP-7928).
+///
+/// See also: <https://github.com/ethereum/execution-apis/blob/main/src/engine/amsterdam.md>
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+#[cfg_attr(any(test, feature = "arbitrary"), derive(arbitrary::Arbitrary))]
+pub struct ExecutionPayloadBodyV2 {
+    /// Enveloped encoded transactions.
+    pub transactions: Vec<Bytes>,
+    /// All withdrawals in the block.
+    ///
+    /// Will always be `None` if pre shanghai.
+    pub withdrawals: Option<Vec<Withdrawal>>,
+    /// The RLP-encoded block access list.
+    ///
+    /// Will always be `None` if pre amsterdam.
+    pub block_access_list: Option<Bytes>,
+}
+
+impl ExecutionPayloadBodyV2 {
+    /// Creates an [`ExecutionPayloadBodyV2`] from the given withdrawals, transactions, and block
+    /// access list.
+    pub fn new<'a, T>(
+        withdrawals: Option<Withdrawals>,
+        transactions: impl IntoIterator<Item = &'a T>,
+        block_access_list: Option<Bytes>,
+    ) -> Self
+    where
+        T: Encodable2718 + 'a,
+    {
+        Self {
+            transactions: transactions
+                .into_iter()
+                .map(|tx| tx.encoded_2718().into())
+                .collect(),
+            withdrawals: withdrawals.map(Withdrawals::into_inner),
+            block_access_list,
+        }
+    }
+
+    /// Converts a [`alloy_consensus::Block`] into an execution payload body V2.
+    pub fn from_block<T: Encodable2718, H>(block: Block<T, H>, block_access_list: Option<Bytes>) -> Self {
+        Self::new(block.body.withdrawals.clone(), block.body.transactions(), block_access_list)
     }
 }
 

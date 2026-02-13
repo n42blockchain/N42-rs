@@ -7,7 +7,7 @@
     html_favicon_url = "https://raw.githubusercontent.com/alloy-rs/core/main/assets/favicon.ico"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(not(feature = "std"), no_std)]
 
 #[macro_use]
@@ -62,10 +62,13 @@ pub const CAPABILITIES: &[&str] = &[
     "engine_getPayloadV2",
     "engine_getPayloadV3",
     "engine_getPayloadV4",
+    "engine_getPayloadV5",
     "engine_newPayloadV1",
     "engine_newPayloadV2",
     "engine_newPayloadV3",
     "engine_newPayloadV4",
     "engine_getPayloadBodiesByHashV1",
     "engine_getPayloadBodiesByRangeV1",
+    "engine_getPayloadBodiesByHashV2",
+    "engine_getPayloadBodiesByRangeV2",
 ];

@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! A network implementation for testing purposes.
 
 use crate::{
@@ -22,6 +19,7 @@ use reth_eth_wire::{
     protocol::Protocol, DisconnectReason, EthNetworkPrimitives, HelloMessageWithProtocols,
 };
 use reth_ethereum_primitives::{PooledTransactionVariant, TransactionSigned};
+use reth_evm_ethereum::EthEvmConfig;
 use reth_network_api::{
     events::{PeerEvent, SessionInfo},
     test_utils::{PeersHandle, PeersHandleProvider},
@@ -185,17 +183,20 @@ where
     C: ChainSpecProvider<ChainSpec: EthereumHardforks>
         + StateProviderFactory
         + BlockReaderIdExt
-        + HeaderProvider
+        + HeaderProvider<Header = alloy_consensus::Header>
         + Clone
         + 'static,
     Pool: TransactionPool,
 {
     /// Installs an eth pool on each peer
-    pub fn with_eth_pool(self) -> Testnet<C, EthTransactionPool<C, InMemoryBlobStore>> {
+    pub fn with_eth_pool(
+        self,
+    ) -> Testnet<C, EthTransactionPool<C, InMemoryBlobStore, EthEvmConfig>> {
         self.map_pool(|peer| {
             let blob_store = InMemoryBlobStore::default();
             let pool = TransactionValidationTaskExecutor::eth(
                 peer.client.clone(),
+                EthEvmConfig::mainnet(),
                 blob_store.clone(),
                 TokioTaskExecutor::default(),
             );
@@ -211,7 +212,7 @@ where
     pub fn with_eth_pool_config(
         self,
         tx_manager_config: TransactionsManagerConfig,
-    ) -> Testnet<C, EthTransactionPool<C, InMemoryBlobStore>> {
+    ) -> Testnet<C, EthTransactionPool<C, InMemoryBlobStore, EthEvmConfig>> {
         self.with_eth_pool_config_and_policy(tx_manager_config, Default::default())
     }
 
@@ -220,11 +221,12 @@ where
         self,
         tx_manager_config: TransactionsManagerConfig,
         policy: TransactionPropagationKind,
-    ) -> Testnet<C, EthTransactionPool<C, InMemoryBlobStore>> {
+    ) -> Testnet<C, EthTransactionPool<C, InMemoryBlobStore, EthEvmConfig>> {
         self.map_pool(|peer| {
             let blob_store = InMemoryBlobStore::default();
             let pool = TransactionValidationTaskExecutor::eth(
                 peer.client.clone(),
+                EthEvmConfig::mainnet(),
                 blob_store.clone(),
                 TokioTaskExecutor::default(),
             );
@@ -402,13 +404,7 @@ pub struct Peer<C, Pool = TestPool> {
     #[pin]
     request_handler: Option<EthRequestHandler<C, EthNetworkPrimitives>>,
     #[pin]
-    transactions_manager: Option<
-        TransactionsManager<
-            Pool,
-            EthNetworkPrimitives,
-            NetworkPolicies<TransactionPropagationKind, StrictEthAnnouncementFilter>,
-        >,
-    >,
+    transactions_manager: Option<TransactionsManager<Pool, EthNetworkPrimitives>>,
     pool: Option<Pool>,
     client: C,
     secret_key: SecretKey,
@@ -789,9 +785,9 @@ impl NetworkEventStream {
         peers
     }
 
-    /// Ensures that the first two events are a [`NetworkEvent::Peer(PeerEvent::PeerAdded`] and
-    /// [`NetworkEvent::ActivePeerSession`], returning the [`PeerId`] of the established
-    /// session.
+    /// Ensures that the first two events are a [`NetworkEvent::Peer`] and
+    /// [`PeerEvent::PeerAdded`][`NetworkEvent::ActivePeerSession`], returning the [`PeerId`] of the
+    /// established session.
     pub async fn peer_added_and_established(&mut self) -> Option<PeerId> {
         let peer_id = match self.inner.next().await {
             Some(NetworkEvent::Peer(PeerEvent::PeerAdded(peer_id))) => peer_id,

@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use crate::{BlockNumReader, BlockReader};
 use alloc::vec::Vec;
 use alloy_consensus::transaction::TransactionMeta;
@@ -25,7 +22,7 @@ pub enum TransactionVariant {
 
 ///  Client trait for fetching transactions related data.
 #[auto_impl::auto_impl(&, Arc)]
-pub trait TransactionsProvider: BlockNumReader + Send + Sync {
+pub trait TransactionsProvider: BlockNumReader + Send {
     /// The transaction type this provider reads.
     type Transaction: Send + Sync + SignedTransaction;
 
@@ -51,9 +48,6 @@ pub trait TransactionsProvider: BlockNumReader + Send + Sync {
         &self,
         hash: TxHash,
     ) -> ProviderResult<Option<(Self::Transaction, TransactionMeta)>>;
-
-    /// Get transaction block number
-    fn transaction_block(&self, id: TxNumber) -> ProviderResult<Option<BlockNumber>>;
 
     /// Get transactions by block id.
     fn transactions_by_block(

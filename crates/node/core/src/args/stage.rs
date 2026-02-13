@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! Shared arguments related to stages
 use derive_more::Display;
 
@@ -41,12 +38,6 @@ pub enum StageEnum {
     ///
     /// Handles Merkle tree-related computations and data processing.
     Merkle,
-    // TODO: Uncomment when upstream reth CLI supports this variant
-    // /// The merkle changesets stage within the pipeline.
-    // ///
-    // /// Handles Merkle trie changesets for storage and accounts.
-    // #[value(name = "merkle-changesets")]
-    // MerkleChangeSets,
     /// The transaction lookup stage within the pipeline.
     ///
     /// Deals with the retrieval and processing of transactions.

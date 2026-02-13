@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use crate::Tables;
 use metrics::Histogram;
 use reth_metrics::{metrics::Counter, Metrics};
@@ -200,8 +197,10 @@ impl TransactionOutcome {
 pub(crate) enum Operation {
     /// Database get operation.
     Get,
-    /// Database put operation.
-    Put,
+    /// Database put upsert operation.
+    PutUpsert,
+    /// Database put append operation.
+    PutAppend,
     /// Database delete operation.
     Delete,
     /// Database cursor upsert operation.
@@ -223,7 +222,8 @@ impl Operation {
     pub(crate) const fn as_str(&self) -> &'static str {
         match self {
             Self::Get => "get",
-            Self::Put => "put",
+            Self::PutUpsert => "put-upsert",
+            Self::PutAppend => "put-append",
             Self::Delete => "delete",
             Self::CursorUpsert => "cursor-upsert",
             Self::CursorInsert => "cursor-insert",
@@ -321,22 +321,14 @@ impl TransactionOutcomeMetrics {
         }
 
         if let Some(commit_latency) = commit_latency {
-            self.commit_preparation_duration_seconds
-                .record(commit_latency.preparation());
-            self.commit_gc_wallclock_duration_seconds
-                .record(commit_latency.gc_wallclock());
-            self.commit_audit_duration_seconds
-                .record(commit_latency.audit());
-            self.commit_write_duration_seconds
-                .record(commit_latency.write());
-            self.commit_sync_duration_seconds
-                .record(commit_latency.sync());
-            self.commit_ending_duration_seconds
-                .record(commit_latency.ending());
-            self.commit_whole_duration_seconds
-                .record(commit_latency.whole());
-            self.commit_gc_cputime_duration_seconds
-                .record(commit_latency.gc_cputime());
+            self.commit_preparation_duration_seconds.record(commit_latency.preparation());
+            self.commit_gc_wallclock_duration_seconds.record(commit_latency.gc_wallclock());
+            self.commit_audit_duration_seconds.record(commit_latency.audit());
+            self.commit_write_duration_seconds.record(commit_latency.write());
+            self.commit_sync_duration_seconds.record(commit_latency.sync());
+            self.commit_ending_duration_seconds.record(commit_latency.ending());
+            self.commit_whole_duration_seconds.record(commit_latency.whole());
+            self.commit_gc_cputime_duration_seconds.record(commit_latency.gc_cputime());
         }
     }
 }

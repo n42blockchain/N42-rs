@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! Connection types for a session
 
 use futures::{Sink, Stream};
@@ -68,7 +65,7 @@ impl<N: NetworkPrimitives> EthRlpxConnection<N> {
         }
     }
 
-    /// Returns  access to the underlying stream.
+    /// Returns access to the underlying stream.
     #[inline]
     pub(crate) const fn inner(&self) -> &P2PStream<ECIESStream<TcpStream>> {
         match self {

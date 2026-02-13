@@ -51,8 +51,8 @@ reth-node-builder.workspace = true
 reth-node-metrics.workspace = true
 reth-consensus.workspace = true
 reth-tokio-util.workspace = true
-reth-ress-protocol.workspace = true
-reth-ress-provider.workspace = true
+# reth-ress-protocol.workspace = true  # TODO: Not available in v1.11.0
+# reth-ress-provider.workspace = true  # TODO: Not available in v1.11.0
 consensus-client.workspace = true
 
 # alloy

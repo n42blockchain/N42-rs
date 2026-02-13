@@ -291,6 +291,7 @@ reth-node-api = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.
 reth-node-builder = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 reth-node-core = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
+reth-node-ethstats = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 reth-node-events = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 reth-node-metrics = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 reth-optimism-node = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
@@ -335,6 +336,7 @@ reth-tasks = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" 
 reth-testing-utils = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 reth-tokio-util = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 reth-tracing = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
+reth-tracing-otlp = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 reth-transaction-pool = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 reth-trie = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 reth-trie-common = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
@@ -342,7 +344,6 @@ reth-trie-db = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0
 reth-trie-parallel = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 
 reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-ress-protocol = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 reth-ress-provider = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 
 # revm
@@ -415,6 +416,7 @@ derivative = "2"
 ethereum_hashing = "0.7.0"
 integer-sqrt = "0.1.5"
 aquamarine = "0.6"
+arrayvec = { version = "0.7.6", default-features = false }
 auto_impl = "1"
 backon = { version = "1.2", default-features = false, features = ["std-blocking-sleep", "tokio-sleep"] }
 bincode = "1.3"
@@ -433,10 +435,11 @@ fdlimit = "0.3.0"
 generic-array = "0.14"
 humantime = "2.1"
 humantime-serde = "1.1"
+ipnet = "2.11"
 itertools = { version = "0.14", default-features = false }
 linked_hash_set = "0.1"
 lz4 = "1.28.1"
-modular-bitfield = "0.11.2"
+modular-bitfield = "0.13.1"
 notify = { version = "8.0.0", default-features = false, features = ["macos_fsevent"] }
 nybbles = { version = "0.4.8", default-features = false }
 once_cell = { version = "1.19", default-features = false, features = ["critical-section"] }
@@ -589,6 +592,7 @@ ratatui = { version = "0.29", default-features = false }
 ringbuffer = "0.15.0"
 rmp-serde = "1.3"
 roaring = "0.10.2"
+rocksdb = { version = "0.24" }
 rolling-file = "0.2.0"
 sha3 = "0.10.5"
 snap = "1.1.1"

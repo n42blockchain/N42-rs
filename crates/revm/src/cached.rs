@@ -3,7 +3,7 @@
 
 //! Database adapters for payload building.
 use alloy_primitives::{
-    map::{Entry, HashMap},
+    map::{AddressMap, B256Map, Entry, HashMap, U256Map},
     Address, B256, U256,
 };
 use core::cell::RefCell;
@@ -28,15 +28,16 @@ use serde::{Deserialize, Serialize};
 ///     let db = cached_reads.as_db_mut(db);
 ///     // this is `Database` and can be used to build a payload, it never commits to `CachedReads` or the underlying database, but all reads from the underlying database are cached in `CachedReads`.
 ///     // Subsequent payload build attempts can use cached reads and avoid hitting the underlying database.
+///     // Note: `cached_reads` must outlive `db` to satisfy lifetime requirements.
 ///     let state = State::builder().with_database(db).build();
 /// }
 /// ```
-#[derive(Debug, Clone, Default,Serialize,Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CachedReads {
     /// Block state account with storage.
-    pub accounts: HashMap<Address, CachedAccount>,
+    pub accounts: AddressMap<CachedAccount>,
     /// Created contracts.
-    pub contracts: HashMap<B256, Bytecode>,
+    pub contracts: B256Map<Bytecode>,
     /// Block hash mapped to the block number.
     pub block_hashes: HashMap<u64, B256>,
 }
@@ -55,12 +56,7 @@ impl CachedReads {
     }
 
     /// Inserts an account info into the cache.
-    pub fn insert_account(
-        &mut self,
-        address: Address,
-        info: AccountInfo,
-        storage: HashMap<U256, U256>,
-    ) {
+    pub fn insert_account(&mut self, address: Address, info: AccountInfo, storage: U256Map<U256>) {
         self.accounts.insert(address, CachedAccount { info: Some(info), storage });
     }
 
@@ -75,6 +71,10 @@ impl CachedReads {
 }
 
 /// A [Database] that caches reads inside [`CachedReads`].
+///
+/// The lifetime parameter `'a` is tied to the lifetime of the underlying [`CachedReads`] instance.
+/// This ensures that the cache remains valid for the entire duration this wrapper is used.
+/// The original [`CachedReads`] must outlive this wrapper to prevent use-after-free.
 #[derive(Debug)]
 pub struct CachedReadsDbMut<'a, DB> {
     /// The cache of reads.
@@ -150,11 +150,11 @@ impl<DB: DatabaseRef> Database for CachedReadsDbMut<'_, DB> {
     }
 
     fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
-        let code = match self.cached.block_hashes.entry(number) {
+        let hash = match self.cached.block_hashes.entry(number) {
             Entry::Occupied(entry) => *entry.get(),
             Entry::Vacant(entry) => *entry.insert(self.db.block_hash_ref(number)?),
         };
-        Ok(code)
+        Ok(hash)
     }
 }
 
@@ -162,6 +162,11 @@ impl<DB: DatabaseRef> Database for CachedReadsDbMut<'_, DB> {
 ///
 /// This is intended to be used as the [`DatabaseRef`] for
 /// `revm::db::State` for repeated payload build jobs.
+///
+/// The lifetime parameter `'a` matches the lifetime of the underlying [`CachedReadsDbMut`],
+/// which in turn is tied to the [`CachedReads`] cache. [`RefCell`] is used here to provide
+/// interior mutability for the [`DatabaseRef`] trait (which requires `&self`), while the
+/// lifetime ensures the cache remains valid throughout the wrapper's usage.
 #[derive(Debug)]
 pub struct CachedReadsDBRef<'a, DB> {
     /// The inner cache reads db mut.
@@ -190,17 +195,17 @@ impl<DB: DatabaseRef> DatabaseRef for CachedReadsDBRef<'_, DB> {
 
 /// Cached account contains the account state with storage
 /// but lacks the account status.
-#[derive(Debug, Clone,Serialize,Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedAccount {
     /// Account state.
     pub info: Option<AccountInfo>,
     /// Account's storage.
-    pub storage: HashMap<U256, U256>,
+    pub storage: U256Map<U256>,
 }
 
 impl CachedAccount {
     fn new(info: Option<AccountInfo>) -> Self {
-        Self { info, storage: HashMap::default() }
+        Self { info, storage: U256Map::default() }
     }
 }
 

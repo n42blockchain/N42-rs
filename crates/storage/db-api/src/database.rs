@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use crate::{
     table::TableImporter,
     transaction::{DbTx, DbTxMut},
@@ -29,11 +26,11 @@ pub trait Database: Send + Sync + Debug {
     /// end of the execution.
     fn view<T, F>(&self, f: F) -> Result<T, DatabaseError>
     where
-        F: FnOnce(&Self::TX) -> T,
+        F: FnOnce(&mut Self::TX) -> T,
     {
-        let tx = self.tx()?;
+        let mut tx = self.tx()?;
 
-        let res = f(&tx);
+        let res = f(&mut tx);
         tx.commit()?;
 
         Ok(res)

@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! Utility functions for node startup and shutdown, for example path parsing and retrieving single
 //! blocks from the network.
 
@@ -8,7 +5,7 @@ use alloy_consensus::BlockHeader;
 use alloy_eips::BlockHashOrNumber;
 use alloy_rpc_types_engine::{JwtError, JwtSecret};
 use eyre::Result;
-use reth_consensus::{Consensus, ConsensusError};
+use reth_consensus::Consensus;
 use reth_network_p2p::{
     bodies::client::BodiesClient, headers::client::HeadersClient, priority::Priority,
 };
@@ -44,10 +41,7 @@ pub async fn get_single_header<Client>(
 where
     Client: HeadersClient<Header: reth_primitives_traits::BlockHeader>,
 {
-    let (peer_id, response) = client
-        .get_header_with_priority(id, Priority::High)
-        .await?
-        .split();
+    let (peer_id, response) = client.get_header_with_priority(id, Priority::High).await?.split();
 
     let Some(header) = response else {
         client.report_bad_message(peer_id);

@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! Collection of traits and trait implementations for common database operations.
 //!
 //! ## Feature Flags
@@ -13,8 +10,7 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
-#![recursion_limit = "3072"]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 /// Various provider traits.
 mod traits;
@@ -25,8 +21,8 @@ pub mod providers;
 pub use providers::{
     DatabaseProvider, DatabaseProviderRO, DatabaseProviderRW, HistoricalStateProvider,
     HistoricalStateProviderRef, LatestStateProvider, LatestStateProviderRef, OverlayStateProvider,
-    OverlayStateProviderFactory, ProviderFactory, SaveBlocksMode, StaticFileAccess,
-    StaticFileProviderBuilder, StaticFileWriter,
+    OverlayStateProviderFactory, ProviderFactory, PruneShardOutcome, PrunedIndices, SaveBlocksMode,
+    StaticFileAccess, StaticFileProviderBuilder, StaticFileWriteCtx, StaticFileWriter,
 };
 
 pub mod changeset_walker;
@@ -61,10 +57,7 @@ pub mod bundle_state;
 /// Writer standalone type.
 pub mod writer;
 
-/// Converts a range bounds into a concrete range.
-///
-/// This helper function takes any type that implements `RangeBounds<u64>` and converts it into a
-/// concrete `Range<u64>`. This is useful for standardizing different range types.
+/// Converts a [`RangeBounds`](std::ops::RangeBounds) into a concrete [`Range`](std::ops::Range)
 pub fn to_range<R: std::ops::RangeBounds<u64>>(bounds: R) -> std::ops::Range<u64> {
     let start = match bounds.start_bound() {
         std::ops::Bound::Included(&v) => v,

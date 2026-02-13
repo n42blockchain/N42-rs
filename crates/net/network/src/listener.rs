@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! Contains connection-oriented interfaces.
 
 use futures::{ready, Stream, StreamExt};

@@ -1,22 +1,19 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! Pool component for the node builder.
 
-use alloy_primitives::Address;
+use crate::{BuilderContext, FullNodeTypes};
+use alloy_primitives::map::AddressSet;
 use reth_chain_state::CanonStateSubscriptions;
 use reth_chainspec::EthereumHardforks;
-use reth_node_api::{NodeTypes, TxTy};
+use reth_node_api::{BlockTy, NodeTypes, TxTy};
 use reth_transaction_pool::{
-    blobstore::DiskFileBlobStore, CoinbaseTipOrdering, PoolConfig, PoolTransaction, SubPoolLimit,
-    TransactionPool, TransactionValidationTaskExecutor, TransactionValidator,
+    blobstore::DiskFileBlobStore, BlobStore, CoinbaseTipOrdering, PoolConfig, PoolTransaction,
+    SubPoolLimit, TransactionOrdering, TransactionPool, TransactionValidationTaskExecutor,
+    TransactionValidator,
 };
-use std::{collections::HashSet, future::Future};
-
-use crate::{BuilderContext, FullNodeTypes};
+use std::future::Future;
 
 /// A type that knows how to build the transaction pool.
-pub trait PoolBuilder<Node: FullNodeTypes>: Send {
+pub trait PoolBuilder<Node: FullNodeTypes, Evm>: Send {
     /// The transaction pool to build.
     type Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TxTy<Node::Types>>>
         + Unpin
@@ -26,16 +23,17 @@ pub trait PoolBuilder<Node: FullNodeTypes>: Send {
     fn build_pool(
         self,
         ctx: &BuilderContext<Node>,
+        evm_config: Evm,
     ) -> impl Future<Output = eyre::Result<Self::Pool>> + Send;
 }
 
-impl<Node, F, Fut, Pool> PoolBuilder<Node> for F
+impl<Node, F, Fut, Pool, Evm> PoolBuilder<Node, Evm> for F
 where
     Node: FullNodeTypes,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TxTy<Node::Types>>>
         + Unpin
         + 'static,
-    F: FnOnce(&BuilderContext<Node>) -> Fut + Send,
+    F: FnOnce(&BuilderContext<Node>, Evm) -> Fut + Send,
     Fut: Future<Output = eyre::Result<Pool>> + Send,
 {
     type Pool = Pool;
@@ -43,8 +41,9 @@ where
     fn build_pool(
         self,
         ctx: &BuilderContext<Node>,
+        evm_config: Evm,
     ) -> impl Future<Output = eyre::Result<Self::Pool>> {
-        self(ctx)
+        self(ctx, evm_config)
     }
 }
 
@@ -64,7 +63,7 @@ pub struct PoolBuilderConfigOverrides {
     /// Minimum base fee required by the protocol.
     pub minimal_protocol_basefee: Option<u64>,
     /// Addresses that will be considered as local. Above exemptions apply.
-    pub local_addresses: HashSet<Address>,
+    pub local_addresses: AddressSet,
     /// Additional tasks to validate new transactions.
     pub additional_validation_tasks: Option<usize>,
 }
@@ -101,10 +100,7 @@ impl PoolBuilderConfigOverrides {
         if let Some(minimal_protocol_basefee) = minimal_protocol_basefee {
             config.minimal_protocol_basefee = minimal_protocol_basefee;
         }
-        config
-            .local_transactions_config
-            .local_addresses
-            .extend(local_addresses);
+        config.local_transactions_config.local_addresses.extend(local_addresses);
 
         config
     }
@@ -129,44 +125,80 @@ impl<'a, Node: FullNodeTypes> TxPoolBuilder<'a, Node> {
 impl<'a, Node: FullNodeTypes, V> TxPoolBuilder<'a, Node, V> {
     /// Configure the validator for the transaction pool.
     pub fn with_validator<NewV>(self, validator: NewV) -> TxPoolBuilder<'a, Node, NewV> {
-        TxPoolBuilder {
-            ctx: self.ctx,
-            validator,
-        }
+        TxPoolBuilder { ctx: self.ctx, validator }
     }
 }
 
-impl<'a, Node: FullNodeTypes, V> TxPoolBuilder<'a, Node, TransactionValidationTaskExecutor<V>>
+impl<'a, Node, V> TxPoolBuilder<'a, Node, TransactionValidationTaskExecutor<V>>
 where
-    V: TransactionValidator + 'static,
+    Node: FullNodeTypes<Types: NodeTypes<ChainSpec: EthereumHardforks>>,
+    V: TransactionValidator<Block = BlockTy<Node::Types>> + 'static,
     V::Transaction:
         PoolTransaction<Consensus = TxTy<Node::Types>> + reth_transaction_pool::EthPoolTransaction,
-    <Node::Types as NodeTypes>::ChainSpec: EthereumHardforks,
 {
+    /// Consume the ype and build the [`reth_transaction_pool::Pool`] with the given config and blob
+    /// store.
+    pub fn build<BS>(
+        self,
+        blob_store: BS,
+        pool_config: PoolConfig,
+    ) -> reth_transaction_pool::Pool<
+        TransactionValidationTaskExecutor<V>,
+        CoinbaseTipOrdering<V::Transaction>,
+        BS,
+    >
+    where
+        BS: BlobStore,
+    {
+        let TxPoolBuilder { validator, .. } = self;
+        reth_transaction_pool::Pool::new(
+            validator,
+            CoinbaseTipOrdering::default(),
+            blob_store,
+            pool_config,
+        )
+    }
+
     /// Build the transaction pool and spawn its maintenance tasks.
     /// This method creates the blob store, builds the pool, and spawns maintenance tasks.
-    pub fn build_and_spawn_maintenance_task(
+    pub fn build_and_spawn_maintenance_task<BS>(
         self,
-        blob_store: DiskFileBlobStore,
+        blob_store: BS,
         pool_config: PoolConfig,
     ) -> eyre::Result<
         reth_transaction_pool::Pool<
             TransactionValidationTaskExecutor<V>,
             CoinbaseTipOrdering<V::Transaction>,
-            DiskFileBlobStore,
+            BS,
         >,
-    > {
-        // Destructure self to avoid partial move issues
-        let TxPoolBuilder { ctx, validator, .. } = self;
-
-        let transaction_pool = reth_transaction_pool::Pool::new(
-            validator,
+    >
+    where
+        BS: BlobStore,
+    {
+        self.build_with_ordering_and_spawn_maintenance_task(
             CoinbaseTipOrdering::default(),
             blob_store,
-            pool_config.clone(),
-        );
+            pool_config,
+        )
+    }
 
-        // Spawn maintenance tasks using standalone functions
+    /// Build the transaction pool with a custom [`TransactionOrdering`] and spawn its maintenance
+    /// tasks.
+    pub fn build_with_ordering_and_spawn_maintenance_task<BS, O>(
+        self,
+        ordering: O,
+        blob_store: BS,
+        pool_config: PoolConfig,
+    ) -> eyre::Result<reth_transaction_pool::Pool<TransactionValidationTaskExecutor<V>, O, BS>>
+    where
+        BS: BlobStore,
+        O: TransactionOrdering<Transaction = V::Transaction>,
+    {
+        let TxPoolBuilder { ctx, validator, .. } = self;
+
+        let transaction_pool =
+            reth_transaction_pool::Pool::new(validator, ordering, blob_store, pool_config.clone());
+
         spawn_maintenance_tasks(ctx, transaction_pool.clone(), &pool_config)?;
 
         Ok(transaction_pool)
@@ -177,14 +209,12 @@ where
 pub fn create_blob_store<Node: FullNodeTypes>(
     ctx: &BuilderContext<Node>,
 ) -> eyre::Result<DiskFileBlobStore> {
-    let data_dir = ctx.config().datadir();
-    Ok(reth_transaction_pool::blobstore::DiskFileBlobStore::open(
-        data_dir.blobstore(),
-        Default::default(),
-    )?)
+    let cache_size = Some(ctx.config().txpool.max_cached_entries);
+    create_blob_store_with_cache(ctx, cache_size)
 }
 
-/// Create blob store with custom cache size configuration.
+/// Create blob store with custom cache size configuration for how many blobs should be cached in
+/// memory.
 pub fn create_blob_store_with_cache<Node: FullNodeTypes>(
     ctx: &BuilderContext<Node>,
     cache_size: Option<u32>,
@@ -197,10 +227,7 @@ pub fn create_blob_store_with_cache<Node: FullNodeTypes>(
         Default::default()
     };
 
-    Ok(reth_transaction_pool::blobstore::DiskFileBlobStore::open(
-        data_dir.blobstore(),
-        config,
-    )?)
+    Ok(reth_transaction_pool::blobstore::DiskFileBlobStore::open(data_dir.blobstore(), config)?)
 }
 
 /// Spawn local transaction backup task if enabled.
@@ -223,17 +250,16 @@ where
                 transactions_path,
             );
 
-        ctx.task_executor()
-            .spawn_critical_with_graceful_shutdown_signal(
-                "local transactions backup task",
-                |shutdown| {
-                    reth_transaction_pool::maintain::backup_local_transactions_task(
-                        shutdown,
-                        pool,
-                        transactions_backup_config,
-                    )
-                },
-            );
+        ctx.task_executor().spawn_critical_with_graceful_shutdown_signal(
+            "local transactions backup task",
+            |shutdown| {
+                reth_transaction_pool::maintain::backup_local_transactions_task(
+                    shutdown,
+                    pool,
+                    transactions_backup_config,
+                )
+            },
+        );
     }
     Ok(())
 }
@@ -245,15 +271,14 @@ fn spawn_pool_maintenance_task<Node, Pool>(
     pool_config: &PoolConfig,
 ) -> eyre::Result<()>
 where
-    Node: FullNodeTypes,
-    <Node::Types as NodeTypes>::ChainSpec: EthereumHardforks,
-    Pool: reth_transaction_pool::TransactionPoolExt + Clone + 'static,
+    Node: FullNodeTypes<Types: NodeTypes<ChainSpec: EthereumHardforks>>,
+    Pool: reth_transaction_pool::TransactionPoolExt<Block = BlockTy<Node::Types>> + Clone + 'static,
     Pool::Transaction: PoolTransaction<Consensus = TxTy<Node::Types>>,
 {
     let chain_events = ctx.provider().canonical_state_stream();
     let client = ctx.provider().clone();
 
-    ctx.task_executor().spawn_critical(
+    ctx.task_executor().spawn_critical_task(
         "txpool maintenance task",
         reth_transaction_pool::maintain::maintain_transaction_pool_future(
             client,
@@ -272,15 +297,14 @@ where
 }
 
 /// Spawn all maintenance tasks for a transaction pool (backup + main maintenance).
-fn spawn_maintenance_tasks<Node, Pool>(
+pub fn spawn_maintenance_tasks<Node, Pool>(
     ctx: &BuilderContext<Node>,
     pool: Pool,
     pool_config: &PoolConfig,
 ) -> eyre::Result<()>
 where
-    Node: FullNodeTypes,
-    <Node::Types as NodeTypes>::ChainSpec: EthereumHardforks,
-    Pool: reth_transaction_pool::TransactionPoolExt + Clone + 'static,
+    Node: FullNodeTypes<Types: NodeTypes<ChainSpec: EthereumHardforks>>,
+    Pool: reth_transaction_pool::TransactionPoolExt<Block = BlockTy<Node::Types>> + Clone + 'static,
     Pool::Transaction: PoolTransaction<Consensus = TxTy<Node::Types>>,
 {
     spawn_local_backup_task(ctx, pool.clone())?;
@@ -290,9 +314,7 @@ where
 
 impl<Node: FullNodeTypes, V: std::fmt::Debug> std::fmt::Debug for TxPoolBuilder<'_, Node, V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TxPoolBuilder")
-            .field("validator", &self.validator)
-            .finish()
+        f.debug_struct("TxPoolBuilder").field("validator", &self.validator).finish()
     }
 }
 

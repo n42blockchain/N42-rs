@@ -1,13 +1,11 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! Additional testing support for `NoopProvider`.
 
-use crate::{providers::{StaticFileProvider, StaticFileProviderRWRefMut}, StaticFileProviderFactory};
-use alloy_primitives::BlockNumber;
+use crate::{
+    providers::{RocksDBProvider, StaticFileProvider, StaticFileProviderRWRefMut},
+    RocksDBProviderFactory, StaticFileProviderFactory,
+};
+use reth_errors::{ProviderError, ProviderResult};
 use reth_primitives_traits::NodePrimitives;
-use reth_static_file_types::StaticFileSegment;
-use reth_storage_errors::provider::{ProviderError, ProviderResult};
 use std::path::PathBuf;
 
 /// Re-exported for convenience
@@ -20,9 +18,23 @@ impl<C: Send + Sync, N: NodePrimitives> StaticFileProviderFactory for NoopProvid
 
     fn get_static_file_writer(
         &self,
-        _block: BlockNumber,
-        _segment: StaticFileSegment,
+        _block: alloy_primitives::BlockNumber,
+        _segment: reth_static_file_types::StaticFileSegment,
     ) -> ProviderResult<StaticFileProviderRWRefMut<'_, Self::Primitives>> {
-        Err(ProviderError::UnsupportedProvider)
+        Err(ProviderError::ReadOnlyStaticFileAccess)
+    }
+}
+
+impl<C: Send + Sync, N: NodePrimitives> RocksDBProviderFactory for NoopProvider<C, N> {
+    fn rocksdb_provider(&self) -> RocksDBProvider {
+        RocksDBProvider::builder(PathBuf::default()).build().unwrap()
+    }
+
+    #[cfg(all(unix, feature = "rocksdb"))]
+    fn set_pending_rocksdb_batch(&self, _batch: rocksdb::WriteBatchWithTransaction<true>) {}
+
+    #[cfg(all(unix, feature = "rocksdb"))]
+    fn commit_pending_rocksdb_batches(&self) -> ProviderResult<()> {
+        Ok(())
     }
 }

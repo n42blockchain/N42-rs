@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! Support for handling additional RLPx-based application-level protocols.
 //!
 //! See also <https://github.com/ethereum/devp2p/blob/master/README.md>

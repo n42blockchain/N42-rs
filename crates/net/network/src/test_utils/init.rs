@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use enr::{k256::ecdsa::SigningKey, Enr, EnrPublicKey};
 use reth_network_peers::PeerId;
 use std::net::SocketAddr;
@@ -16,7 +13,7 @@ pub fn enr_to_peer_id(enr: Enr<SigningKey>) -> PeerId {
 // copied from ethers-rs
 /// A bit of hack to find an unused TCP port.
 ///
-/// Does not guarantee that the given port is unused after the function exists, just that it was
+/// Does not guarantee that the given port is unused after the function exits, just that it was
 /// unused before the function started (i.e., it does not reserve a port).
 pub fn unused_port() -> u16 {
     unused_tcp_addr().port()

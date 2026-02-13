@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use super::{
     AccountReader, BlockHashReader, BlockIdReader, StateProofProvider, StateRootProvider,
     StorageRootProvider,
@@ -17,8 +14,8 @@ use reth_trie_common::HashedPostState;
 use revm_database::BundleState;
 
 /// This just receives state, or [`ExecutionOutcome`], from the provider
-#[auto_impl::auto_impl(&, Arc, Box)]
-pub trait StateReader: Send + Sync {
+#[auto_impl::auto_impl(&, Box)]
+pub trait StateReader: Send {
     /// Receipt type in [`ExecutionOutcome`].
     type Receipt: Send + Sync;
 
@@ -30,24 +27,10 @@ pub trait StateReader: Send + Sync {
 }
 
 /// Type alias of boxed [`StateProvider`].
-pub type StateProviderBox = Box<dyn StateProvider>;
-
-// Manual Debug implementation for dyn StateProvider to satisfy revm's Database trait bound
-impl core::fmt::Debug for dyn StateProvider {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("StateProvider").finish_non_exhaustive()
-    }
-}
-
-// Debug implementation for dyn StateProvider + Sync + Send to satisfy revm's Database trait bound
-impl core::fmt::Debug for dyn StateProvider + Sync + Send {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("StateProvider").finish_non_exhaustive()
-    }
-}
+pub type StateProviderBox = Box<dyn StateProvider + Send + 'static>;
 
 /// An abstraction for a type that provides state data.
-#[auto_impl(&, Arc, Box)]
+#[auto_impl(&, Box)]
 pub trait StateProvider:
     BlockHashReader
     + AccountReader
@@ -56,14 +39,27 @@ pub trait StateProvider:
     + StorageRootProvider
     + StateProofProvider
     + HashedPostStateProvider
-    + Send
-    + Sync
 {
     /// Get storage of given account.
+    ///
+    /// When `use_hashed_state` is enabled, the `account` and `storage_key` are hashed internally
+    /// before lookup. Callers must pass **unhashed** (plain) values.
     fn storage(
         &self,
         account: Address,
         storage_key: StorageKey,
+    ) -> ProviderResult<Option<StorageValue>>;
+
+    /// Get storage using a pre-hashed storage key.
+    ///
+    /// Unlike [`Self::storage`], `hashed_storage_key` must already be keccak256-hashed.
+    /// The `address` remains unhashed (plain) since history indices are keyed by plain address.
+    /// This is used when changeset keys are pre-hashed (e.g., `use_hashed_state` mode)
+    /// to avoid double-hashing.
+    fn storage_by_hashed_key(
+        &self,
+        address: Address,
+        hashed_storage_key: StorageKey,
     ) -> ProviderResult<Option<StorageValue>>;
 
     /// Get account code by its address.
@@ -79,10 +75,10 @@ pub trait StateProvider:
 
         if let Some(code_hash) = acc.bytecode_hash {
             if code_hash == KECCAK_EMPTY {
-                return Ok(None);
+                return Ok(None)
             }
             // Get the code from the code hash
-            return self.bytecode_by_hash(&code_hash);
+            return self.bytecode_by_hash(&code_hash)
         }
 
         // Return `None` if no code hash is set
@@ -96,8 +92,7 @@ pub trait StateProvider:
         // Get basic account information
         // Returns None if acc doesn't exist
 
-        self.basic_account(addr)?
-            .map_or_else(|| Ok(None), |acc| Ok(Some(acc.balance)))
+        self.basic_account(addr)?.map_or_else(|| Ok(None), |acc| Ok(Some(acc.balance)))
     }
 
     /// Get account nonce by its address.
@@ -106,8 +101,7 @@ pub trait StateProvider:
     fn account_nonce(&self, addr: &Address) -> ProviderResult<Option<u64>> {
         // Get basic account information
         // Returns None if acc doesn't exist
-        self.basic_account(addr)?
-            .map_or_else(|| Ok(None), |acc| Ok(Some(acc.nonce)))
+        self.basic_account(addr)?.map_or_else(|| Ok(None), |acc| Ok(Some(acc.nonce)))
     }
 }
 
@@ -116,15 +110,15 @@ pub trait AccountInfoReader: AccountReader + BytecodeReader {}
 impl<T: AccountReader + BytecodeReader> AccountInfoReader for T {}
 
 /// Trait that provides the hashed state from various sources.
-#[auto_impl(&, Arc, Box)]
-pub trait HashedPostStateProvider: Send + Sync {
+#[auto_impl(&, Box)]
+pub trait HashedPostStateProvider {
     /// Returns the `HashedPostState` of the provided [`BundleState`].
     fn hashed_post_state(&self, bundle_state: &BundleState) -> HashedPostState;
 }
 
 /// Trait for reading bytecode associated with a given code hash.
-#[auto_impl(&, Arc, Box)]
-pub trait BytecodeReader: Send + Sync {
+#[auto_impl(&, Box)]
+pub trait BytecodeReader {
     /// Get account code by its hash
     fn bytecode_by_hash(&self, code_hash: &B256) -> ProviderResult<Option<Bytecode>>;
 }
@@ -152,7 +146,7 @@ pub trait TryIntoHistoricalStateProvider {
 /// Note: the `pending` block is considered the block that extends the canonical chain but one and
 /// has the `latest` block as its parent.
 ///
-/// All states are _inclusive_, meaning they include _all_ all changes made (executed transactions)
+/// All states are _inclusive_, meaning they include _all_ changes made (executed transactions)
 /// in their respective blocks. For example [`StateProviderFactory::history_by_block_number`] for
 /// block number `n` will return the state after block `n` was executed (transactions, withdrawals).
 /// In other words, all states point to the end of the state's respective block, which is equivalent
@@ -161,8 +155,8 @@ pub trait TryIntoHistoricalStateProvider {
 /// This affects tracing, or replaying blocks, which will need to be executed on top of the state of
 /// the parent block. For example, in order to trace block `n`, the state after block `n - 1` needs
 /// to be used, since block `n` was executed on its parent block's state.
-#[auto_impl(&, Arc, Box)]
-pub trait StateProviderFactory: BlockIdReader + Send + Sync {
+#[auto_impl(&, Box, Arc)]
+pub trait StateProviderFactory: BlockIdReader + Send {
     /// Storage provider for latest block.
     fn latest(&self) -> ProviderResult<StateProviderBox>;
 
@@ -213,4 +207,9 @@ pub trait StateProviderFactory: BlockIdReader + Send + Sync {
     ///
     /// If the block couldn't be found, returns `None`.
     fn pending_state_by_hash(&self, block_hash: B256) -> ProviderResult<Option<StateProviderBox>>;
+
+    /// Returns a pending [`StateProvider`] if it exists.
+    ///
+    /// This will return `None` if there's no pending state.
+    fn maybe_pending(&self) -> ProviderResult<Option<StateProviderBox>>;
 }

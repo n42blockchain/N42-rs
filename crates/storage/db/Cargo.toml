@@ -18,6 +18,7 @@ reth-fs-util.workspace = true
 reth-storage-errors.workspace = true
 reth-nippy-jar.workspace = true
 reth-tracing.workspace = true
+tracing.workspace = true
 reth-static-file-types.workspace = true
 
 # ethereum
@@ -46,6 +47,7 @@ strum = { workspace = true, features = ["derive"], optional = true }
 [dev-dependencies]
 # reth libs with arbitrary
 reth-primitives-traits = { workspace = true, features = ["reth-codec"] }
+reth-prune-types.workspace = true
 
 alloy-primitives = { workspace = true, features = ["getrandom"] }
 alloy-consensus.workspace = true
@@ -81,6 +83,7 @@ test-utils = [
     "reth-db-api/test-utils",
     "reth-nippy-jar/test-utils",
     "reth-primitives-traits/test-utils",
+    "reth-prune-types/test-utils",
 ]
 bench = ["reth-db-api/bench"]
 arbitrary = [
@@ -88,6 +91,7 @@ arbitrary = [
     "alloy-primitives/arbitrary",
     "alloy-consensus/arbitrary",
     "reth-primitives-traits/arbitrary",
+    "reth-prune-types/arbitrary",
 ]
 op = [
     "reth-db-api/op",
@@ -107,5 +111,10 @@ harness = false
 
 [[bench]]
 name = "get"
+required-features = ["test-utils"]
+harness = false
+
+[[bench]]
+name = "put"
 required-features = ["test-utils"]
 harness = false

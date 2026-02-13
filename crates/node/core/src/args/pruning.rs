@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! Pruning and full node arguments
 
 use crate::{args::error::ReceiptsLogError, primitives::EthereumHardfork};
@@ -8,87 +5,183 @@ use alloy_primitives::{Address, BlockNumber};
 use clap::{builder::RangedU64ValueParser, Args};
 use reth_chainspec::EthereumHardforks;
 use reth_config::config::PruneConfig;
-use reth_prune_types::{PruneMode, PruneModes, ReceiptsLogPruneConfig, MINIMUM_PRUNING_DISTANCE};
-use std::collections::BTreeMap;
+use reth_prune_types::{
+    PruneMode, PruneModes, ReceiptsLogPruneConfig, MINIMUM_DISTANCE, MINIMUM_UNWIND_SAFE_DISTANCE,
+};
+use std::{collections::BTreeMap, ops::Not, sync::OnceLock};
+
+/// Global static pruning defaults
+static PRUNING_DEFAULTS: OnceLock<DefaultPruningValues> = OnceLock::new();
+
+/// Default values for `--full` and `--minimal` pruning modes that can be customized.
+///
+/// Global defaults can be set via [`DefaultPruningValues::try_init`].
+#[derive(Debug, Clone)]
+pub struct DefaultPruningValues {
+    /// Prune modes for `--full` flag.
+    ///
+    /// Note: `bodies_history` is ignored when `full_bodies_history_use_pre_merge` is `true`.
+    pub full_prune_modes: PruneModes,
+    /// If `true`, `--full` will set `bodies_history` to prune everything before the merge block
+    /// (Paris hardfork). If `false`, uses `full_prune_modes.bodies_history` directly.
+    pub full_bodies_history_use_pre_merge: bool,
+    /// Prune modes for `--minimal` flag.
+    pub minimal_prune_modes: PruneModes,
+}
+
+impl DefaultPruningValues {
+    /// Initialize the global pruning defaults with this configuration.
+    ///
+    /// Returns `Err(self)` if already initialized.
+    pub fn try_init(self) -> Result<(), Self> {
+        PRUNING_DEFAULTS.set(self)
+    }
+
+    /// Get a reference to the global pruning defaults.
+    pub fn get_global() -> &'static Self {
+        PRUNING_DEFAULTS.get_or_init(Self::default)
+    }
+
+    /// Set the prune modes for `--full` flag.
+    pub fn with_full_prune_modes(mut self, modes: PruneModes) -> Self {
+        self.full_prune_modes = modes;
+        self
+    }
+
+    /// Set whether `--full` should use pre-merge pruning for bodies history.
+    ///
+    /// When `true` (default), bodies are pruned before the Paris hardfork block.
+    /// When `false`, uses `full_prune_modes.bodies_history` directly.
+    pub const fn with_full_bodies_history_use_pre_merge(mut self, use_pre_merge: bool) -> Self {
+        self.full_bodies_history_use_pre_merge = use_pre_merge;
+        self
+    }
+
+    /// Set the prune modes for `--minimal` flag.
+    pub fn with_minimal_prune_modes(mut self, modes: PruneModes) -> Self {
+        self.minimal_prune_modes = modes;
+        self
+    }
+}
+
+impl Default for DefaultPruningValues {
+    fn default() -> Self {
+        Self {
+            full_prune_modes: PruneModes {
+                sender_recovery: Some(PruneMode::Full),
+                transaction_lookup: None,
+                receipts: Some(PruneMode::Distance(MINIMUM_UNWIND_SAFE_DISTANCE)),
+                account_history: Some(PruneMode::Distance(MINIMUM_UNWIND_SAFE_DISTANCE)),
+                storage_history: Some(PruneMode::Distance(MINIMUM_UNWIND_SAFE_DISTANCE)),
+                // This field is ignored when full_bodies_history_use_pre_merge is true
+                bodies_history: None,
+                receipts_log_filter: Default::default(),
+            },
+            full_bodies_history_use_pre_merge: true,
+            minimal_prune_modes: PruneModes {
+                sender_recovery: Some(PruneMode::Full),
+                transaction_lookup: Some(PruneMode::Full),
+                receipts: Some(PruneMode::Distance(MINIMUM_DISTANCE)),
+                account_history: Some(PruneMode::Distance(MINIMUM_UNWIND_SAFE_DISTANCE)),
+                storage_history: Some(PruneMode::Distance(MINIMUM_UNWIND_SAFE_DISTANCE)),
+                bodies_history: Some(PruneMode::Distance(MINIMUM_UNWIND_SAFE_DISTANCE)),
+                receipts_log_filter: Default::default(),
+            },
+        }
+    }
+}
 
 /// Parameters for pruning and full node
 #[derive(Debug, Clone, Args, PartialEq, Eq, Default)]
 #[command(next_help_heading = "Pruning")]
 pub struct PruningArgs {
-    /// Run full node. Only the most recent [`MINIMUM_PRUNING_DISTANCE`] block states are stored.
-    #[arg(long, default_value_t = false)]
+    /// Run full node. Only the most recent [`MINIMUM_UNWIND_SAFE_DISTANCE`] block states are
+    /// stored.
+    #[arg(long, default_value_t = false, conflicts_with = "minimal")]
     pub full: bool,
 
+    /// Run minimal storage mode with maximum pruning and smaller static files.
+    ///
+    /// This mode configures the node to use minimal disk space by:
+    /// - Fully pruning sender recovery, transaction lookup, receipts
+    /// - Leaving 10,064 blocks for account, storage history and block bodies
+    /// - Using 10,000 blocks per static file segment
+    #[arg(long, default_value_t = false, conflicts_with = "full")]
+    pub minimal: bool,
+
     /// Minimum pruning interval measured in blocks.
-    #[arg(long, value_parser = RangedU64ValueParser::<u64>::new().range(1..),)]
+    #[arg(long = "prune.block-interval", alias = "block-interval", value_parser = RangedU64ValueParser::<u64>::new().range(1..))]
     pub block_interval: Option<u64>,
 
     // Sender Recovery
     /// Prunes all sender recovery data.
-    #[arg(long = "prune.senderrecovery.full", conflicts_with_all = &["sender_recovery_distance", "sender_recovery_before"])]
+    #[arg(long = "prune.sender-recovery.full", alias = "prune.senderrecovery.full", conflicts_with_all = &["sender_recovery_distance", "sender_recovery_before"])]
     pub sender_recovery_full: bool,
     /// Prune sender recovery data before the `head-N` block number. In other words, keep last N +
     /// 1 blocks.
-    #[arg(long = "prune.senderrecovery.distance", value_name = "BLOCKS", conflicts_with_all = &["sender_recovery_full", "sender_recovery_before"])]
+    #[arg(long = "prune.sender-recovery.distance", alias = "prune.senderrecovery.distance", value_name = "BLOCKS", conflicts_with_all = &["sender_recovery_full", "sender_recovery_before"])]
     pub sender_recovery_distance: Option<u64>,
     /// Prune sender recovery data before the specified block number. The specified block number is
     /// not pruned.
-    #[arg(long = "prune.senderrecovery.before", value_name = "BLOCK_NUMBER", conflicts_with_all = &["sender_recovery_full", "sender_recovery_distance"])]
+    #[arg(long = "prune.sender-recovery.before", alias = "prune.senderrecovery.before", value_name = "BLOCK_NUMBER", conflicts_with_all = &["sender_recovery_full", "sender_recovery_distance"])]
     pub sender_recovery_before: Option<BlockNumber>,
 
     // Transaction Lookup
     /// Prunes all transaction lookup data.
-    #[arg(long = "prune.transactionlookup.full", conflicts_with_all = &["transaction_lookup_distance", "transaction_lookup_before"])]
+    #[arg(long = "prune.transaction-lookup.full", alias = "prune.transactionlookup.full", conflicts_with_all = &["transaction_lookup_distance", "transaction_lookup_before"])]
     pub transaction_lookup_full: bool,
     /// Prune transaction lookup data before the `head-N` block number. In other words, keep last N
     /// + 1 blocks.
-    #[arg(long = "prune.transactionlookup.distance", value_name = "BLOCKS", conflicts_with_all = &["transaction_lookup_full", "transaction_lookup_before"])]
+    #[arg(long = "prune.transaction-lookup.distance", alias = "prune.transactionlookup.distance", value_name = "BLOCKS", conflicts_with_all = &["transaction_lookup_full", "transaction_lookup_before"])]
     pub transaction_lookup_distance: Option<u64>,
     /// Prune transaction lookup data before the specified block number. The specified block number
     /// is not pruned.
-    #[arg(long = "prune.transactionlookup.before", value_name = "BLOCK_NUMBER", conflicts_with_all = &["transaction_lookup_full", "transaction_lookup_distance"])]
+    #[arg(long = "prune.transaction-lookup.before", alias = "prune.transactionlookup.before", value_name = "BLOCK_NUMBER", conflicts_with_all = &["transaction_lookup_full", "transaction_lookup_distance"])]
     pub transaction_lookup_before: Option<BlockNumber>,
 
     // Receipts
     /// Prunes all receipt data.
-    #[arg(long = "prune.receipts.full", conflicts_with_all = &["receipts_distance", "receipts_before"])]
+    #[arg(long = "prune.receipts.full", conflicts_with_all = &["receipts_pre_merge", "receipts_distance", "receipts_before"])]
     pub receipts_full: bool,
+    /// Prune receipts before the merge block.
+    #[arg(long = "prune.receipts.pre-merge", conflicts_with_all = &["receipts_full", "receipts_distance", "receipts_before"])]
+    pub receipts_pre_merge: bool,
     /// Prune receipts before the `head-N` block number. In other words, keep last N + 1 blocks.
-    #[arg(long = "prune.receipts.distance", value_name = "BLOCKS", conflicts_with_all = &["receipts_full", "receipts_before"])]
+    #[arg(long = "prune.receipts.distance", value_name = "BLOCKS", conflicts_with_all = &["receipts_full", "receipts_pre_merge", "receipts_before"])]
     pub receipts_distance: Option<u64>,
     /// Prune receipts before the specified block number. The specified block number is not pruned.
-    #[arg(long = "prune.receipts.before", value_name = "BLOCK_NUMBER", conflicts_with_all = &["receipts_full", "receipts_distance"])]
+    #[arg(long = "prune.receipts.before", value_name = "BLOCK_NUMBER", conflicts_with_all = &["receipts_full", "receipts_pre_merge", "receipts_distance"])]
     pub receipts_before: Option<BlockNumber>,
     // Receipts Log Filter
     /// Configure receipts log filter. Format:
-    /// <`address`>:<`prune_mode`>[,<`address`>:<`prune_mode`>...] Where <`prune_mode`> can be
-    /// 'full', 'distance:<`blocks`>', or 'before:<`block_number`>'
-    #[arg(long = "prune.receiptslogfilter", value_name = "FILTER_CONFIG", conflicts_with_all = &["receipts_full", "receipts_distance",  "receipts_before"], value_parser = parse_receipts_log_filter)]
+    /// <`address`>:<`prune_mode`>... where <`prune_mode`> can be 'full', 'distance:<`blocks`>', or
+    /// 'before:<`block_number`>'
+    #[arg(long = "prune.receiptslogfilter", value_name = "FILTER_CONFIG", conflicts_with_all = &["receipts_full", "receipts_pre_merge", "receipts_distance",  "receipts_before"], value_parser = parse_receipts_log_filter)]
     pub receipts_log_filter: Option<ReceiptsLogPruneConfig>,
 
     // Account History
     /// Prunes all account history.
-    #[arg(long = "prune.accounthistory.full", conflicts_with_all = &["account_history_distance", "account_history_before"])]
+    #[arg(long = "prune.account-history.full", alias = "prune.accounthistory.full", conflicts_with_all = &["account_history_distance", "account_history_before"])]
     pub account_history_full: bool,
     /// Prune account before the `head-N` block number. In other words, keep last N + 1 blocks.
-    #[arg(long = "prune.accounthistory.distance", value_name = "BLOCKS", conflicts_with_all = &["account_history_full", "account_history_before"])]
+    #[arg(long = "prune.account-history.distance", alias = "prune.accounthistory.distance", value_name = "BLOCKS", conflicts_with_all = &["account_history_full", "account_history_before"])]
     pub account_history_distance: Option<u64>,
     /// Prune account history before the specified block number. The specified block number is not
     /// pruned.
-    #[arg(long = "prune.accounthistory.before", value_name = "BLOCK_NUMBER", conflicts_with_all = &["account_history_full", "account_history_distance"])]
+    #[arg(long = "prune.account-history.before", alias = "prune.accounthistory.before", value_name = "BLOCK_NUMBER", conflicts_with_all = &["account_history_full", "account_history_distance"])]
     pub account_history_before: Option<BlockNumber>,
 
     // Storage History
     /// Prunes all storage history data.
-    #[arg(long = "prune.storagehistory.full", conflicts_with_all = &["storage_history_distance", "storage_history_before"])]
+    #[arg(long = "prune.storage-history.full", alias = "prune.storagehistory.full", conflicts_with_all = &["storage_history_distance", "storage_history_before"])]
     pub storage_history_full: bool,
     /// Prune storage history before the `head-N` block number. In other words, keep last N + 1
     /// blocks.
-    #[arg(long = "prune.storagehistory.distance", value_name = "BLOCKS", conflicts_with_all = &["storage_history_full", "storage_history_before"])]
+    #[arg(long = "prune.storage-history.distance", alias = "prune.storagehistory.distance", value_name = "BLOCKS", conflicts_with_all = &["storage_history_full", "storage_history_before"])]
     pub storage_history_distance: Option<u64>,
     /// Prune storage history before the specified block number. The specified block number is not
     /// pruned.
-    #[arg(long = "prune.storagehistory.before", value_name = "BLOCK_NUMBER", conflicts_with_all = &["storage_history_full", "storage_history_distance"])]
+    #[arg(long = "prune.storage-history.before", alias = "prune.storagehistory.before", value_name = "BLOCK_NUMBER", conflicts_with_all = &["storage_history_full", "storage_history_distance"])]
     pub storage_history_before: Option<BlockNumber>,
 
     // Bodies
@@ -107,27 +200,34 @@ pub struct PruningArgs {
 
 impl PruningArgs {
     /// Returns pruning configuration.
+    ///
+    /// Returns [`None`] if no parameters are specified and default pruning configuration should be
+    /// used.
     pub fn prune_config<ChainSpec>(&self, chain_spec: &ChainSpec) -> Option<PruneConfig>
     where
         ChainSpec: EthereumHardforks,
     {
-        // Initialise with a default prune configuration.
+        // Initialize with a default prune configuration.
         let mut config = PruneConfig::default();
 
         // If --full is set, use full node defaults.
         if self.full {
+            let defaults = DefaultPruningValues::get_global();
+            let mut segments = defaults.full_prune_modes.clone();
+            if defaults.full_bodies_history_use_pre_merge {
+                segments.bodies_history = chain_spec
+                    .ethereum_fork_activation(EthereumHardfork::Paris)
+                    .block_number()
+                    .map(PruneMode::Before);
+            }
+            config = PruneConfig { block_interval: config.block_interval, segments }
+        }
+
+        // If --minimal is set, use minimal storage mode with aggressive pruning.
+        if self.minimal {
             config = PruneConfig {
                 block_interval: config.block_interval,
-                segments: PruneModes {
-                    sender_recovery: Some(PruneMode::Full),
-                    transaction_lookup: None,
-                    receipts: Some(PruneMode::Distance(MINIMUM_PRUNING_DISTANCE)),
-                    account_history: Some(PruneMode::Distance(MINIMUM_PRUNING_DISTANCE)),
-                    storage_history: Some(PruneMode::Distance(MINIMUM_PRUNING_DISTANCE)),
-                    // TODO: set default to pre-merge block if available
-                    bodies_history: None,
-                    receipts_log_filter: Default::default(),
-                },
+                segments: DefaultPruningValues::get_global().minimal_prune_modes.clone(),
             }
         }
 
@@ -141,7 +241,7 @@ impl PruningArgs {
         if let Some(mode) = self.transaction_lookup_prune_mode() {
             config.segments.transaction_lookup = Some(mode);
         }
-        if let Some(mode) = self.receipts_prune_mode() {
+        if let Some(mode) = self.receipts_prune_mode(chain_spec) {
             config.segments.receipts = Some(mode);
         }
         if let Some(mode) = self.account_history_prune_mode() {
@@ -153,11 +253,8 @@ impl PruningArgs {
         if let Some(mode) = self.storage_history_prune_mode() {
             config.segments.storage_history = Some(mode);
         }
-        if let Some(receipt_logs) = self
-            .receipts_log_filter
-            .as_ref()
-            .filter(|c| !c.is_empty())
-            .cloned()
+        if let Some(receipt_logs) =
+            self.receipts_log_filter.as_ref().filter(|c| !c.is_empty()).cloned()
         {
             config.segments.receipts_log_filter = receipt_logs;
             // need to remove the receipts segment filter entirely because that takes precedence
@@ -165,7 +262,7 @@ impl PruningArgs {
             config.segments.receipts.take();
         }
 
-        Some(config)
+        config.is_default().not().then_some(config)
     }
 
     fn bodies_prune_mode<ChainSpec>(&self, chain_spec: &ChainSpec) -> Option<PruneMode>
@@ -208,15 +305,21 @@ impl PruningArgs {
         }
     }
 
-    const fn receipts_prune_mode(&self) -> Option<PruneMode> {
-        if self.receipts_full {
+    fn receipts_prune_mode<ChainSpec>(&self, chain_spec: &ChainSpec) -> Option<PruneMode>
+    where
+        ChainSpec: EthereumHardforks,
+    {
+        if self.receipts_pre_merge {
+            chain_spec
+                .ethereum_fork_activation(EthereumHardfork::Paris)
+                .block_number()
+                .map(PruneMode::Before)
+        } else if self.receipts_full {
             Some(PruneMode::Full)
         } else if let Some(distance) = self.receipts_distance {
             Some(PruneMode::Distance(distance))
-        } else if let Some(block_number) = self.receipts_before {
-            Some(PruneMode::Before(block_number))
         } else {
-            None
+            self.receipts_before.map(PruneMode::Before)
         }
     }
 
@@ -269,18 +372,16 @@ pub(crate) fn parse_receipts_log_filter(
                 if parts.len() < 3 {
                     return Err(ReceiptsLogError::InvalidFilterFormat(filter.to_string()));
                 }
-                let distance = parts[2]
-                    .parse::<u64>()
-                    .map_err(ReceiptsLogError::InvalidDistance)?;
+                let distance =
+                    parts[2].parse::<u64>().map_err(ReceiptsLogError::InvalidDistance)?;
                 PruneMode::Distance(distance)
             }
             s if s.starts_with("before") => {
                 if parts.len() < 3 {
                     return Err(ReceiptsLogError::InvalidFilterFormat(filter.to_string()));
                 }
-                let block_number = parts[2]
-                    .parse::<u64>()
-                    .map_err(ReceiptsLogError::InvalidBlockNumber)?;
+                let block_number =
+                    parts[2].parse::<u64>().map_err(ReceiptsLogError::InvalidBlockNumber)?;
                 PruneMode::Before(block_number)
             }
             _ => return Err(ReceiptsLogError::InvalidPruneMode(parts[1].to_string())),
@@ -340,15 +441,9 @@ mod tests {
         assert_eq!(config.0.len(), 3);
 
         // Check that the args were parsed correctly.
-        let addr1: Address = "0x0000000000000000000000000000000000000001"
-            .parse()
-            .unwrap();
-        let addr2: Address = "0x0000000000000000000000000000000000000002"
-            .parse()
-            .unwrap();
-        let addr3: Address = "0x0000000000000000000000000000000000000003"
-            .parse()
-            .unwrap();
+        let addr1: Address = "0x0000000000000000000000000000000000000001".parse().unwrap();
+        let addr2: Address = "0x0000000000000000000000000000000000000002".parse().unwrap();
+        let addr3: Address = "0x0000000000000000000000000000000000000003".parse().unwrap();
 
         assert_eq!(config.0.get(&addr1), Some(&PruneMode::Full));
         assert_eq!(config.0.get(&addr2), Some(&PruneMode::Distance(1000)));
@@ -358,10 +453,7 @@ mod tests {
     #[test]
     fn test_parse_receipts_log_filter_invalid_filter_format() {
         let result = parse_receipts_log_filter("invalid_format");
-        assert!(matches!(
-            result,
-            Err(ReceiptsLogError::InvalidFilterFormat(_))
-        ));
+        assert!(matches!(result, Err(ReceiptsLogError::InvalidFilterFormat(_))));
     }
 
     #[test]
@@ -390,9 +482,6 @@ mod tests {
         let result = parse_receipts_log_filter(
             "0x0000000000000000000000000000000000000000:before:invalid_block",
         );
-        assert!(matches!(
-            result,
-            Err(ReceiptsLogError::InvalidBlockNumber(_))
-        ));
+        assert!(matches!(result, Err(ReceiptsLogError::InvalidBlockNumber(_))));
     }
 }

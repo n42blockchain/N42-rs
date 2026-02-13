@@ -1,18 +1,16 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
+use crate::ChangesetEntry;
 use alloc::collections::{BTreeMap, BTreeSet};
-use alloy_primitives::{map::HashMap, Address, BlockNumber, B256};
+use alloy_primitives::{map::B256Map, Address, BlockNumber, B256};
 use auto_impl::auto_impl;
-use core::ops::{RangeBounds, RangeInclusive};
+use core::ops::RangeBounds;
 use reth_db_api::models::BlockNumberAddress;
 use reth_db_models::AccountBeforeTx;
 use reth_primitives_traits::{Account, StorageEntry};
 use reth_storage_errors::provider::ProviderResult;
 
 /// Hashing Writer
-#[auto_impl(&, Arc, Box)]
-pub trait HashingWriter: Send + Sync {
+#[auto_impl(&, Box)]
+pub trait HashingWriter: Send {
     /// Unwind and clear account hashing.
     ///
     /// # Returns
@@ -50,8 +48,8 @@ pub trait HashingWriter: Send + Sync {
     /// Mapping of hashed keys of updated accounts to their respective updated hashed slots.
     fn unwind_storage_hashing(
         &self,
-        changesets: impl Iterator<Item = (BlockNumberAddress, StorageEntry)>,
-    ) -> ProviderResult<HashMap<B256, BTreeSet<B256>>>;
+        changesets: impl Iterator<Item = (BlockNumberAddress, ChangesetEntry)>,
+    ) -> ProviderResult<B256Map<BTreeSet<B256>>>;
 
     /// Unwind and clear storage hashing in a given block range.
     ///
@@ -60,8 +58,8 @@ pub trait HashingWriter: Send + Sync {
     /// Mapping of hashed keys of updated accounts to their respective updated hashed slots.
     fn unwind_storage_hashing_range(
         &self,
-        range: impl RangeBounds<BlockNumberAddress>,
-    ) -> ProviderResult<HashMap<B256, BTreeSet<B256>>>;
+        range: impl RangeBounds<BlockNumber>,
+    ) -> ProviderResult<B256Map<BTreeSet<B256>>>;
 
     /// Iterates over storages and inserts them to hashing table.
     ///
@@ -71,18 +69,5 @@ pub trait HashingWriter: Send + Sync {
     fn insert_storage_for_hashing(
         &self,
         storages: impl IntoIterator<Item = (Address, impl IntoIterator<Item = StorageEntry>)>,
-    ) -> ProviderResult<HashMap<B256, BTreeSet<B256>>>;
-
-    /// Calculate the hashes of all changed accounts and storages, and finally calculate the state
-    /// root.
-    ///
-    /// The hashes are calculated from `fork_block_number + 1` to `current_block_number`.
-    ///
-    /// The resulting state root is compared with `expected_state_root`.
-    fn insert_hashes(
-        &self,
-        range: RangeInclusive<BlockNumber>,
-        end_block_hash: B256,
-        expected_state_root: B256,
-    ) -> ProviderResult<()>;
+    ) -> ProviderResult<B256Map<BTreeSet<B256>>>;
 }

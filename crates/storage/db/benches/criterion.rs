@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 #![allow(missing_docs)]
 
 use std::{path::Path, sync::Arc};
@@ -34,7 +31,6 @@ pub fn db(c: &mut Criterion) {
     group.warm_up_time(std::time::Duration::from_millis(200));
 
     measure_table_db::<CanonicalHeaders>(&mut group);
-    measure_table_db::<HeaderTerminalDifficulties>(&mut group);
     measure_table_db::<HeaderNumbers>(&mut group);
     measure_table_db::<Headers>(&mut group);
     measure_table_db::<BlockBodyIndices>(&mut group);
@@ -51,7 +47,6 @@ pub fn serialization(c: &mut Criterion) {
     group.warm_up_time(std::time::Duration::from_millis(200));
 
     measure_table_serialization::<CanonicalHeaders>(&mut group);
-    measure_table_serialization::<HeaderTerminalDifficulties>(&mut group);
     measure_table_serialization::<HeaderNumbers>(&mut group);
     measure_table_serialization::<Headers>(&mut group);
     measure_table_serialization::<BlockBodyIndices>(&mut group);
@@ -142,7 +137,8 @@ where
                 for (k, _, v, _) in input {
                     crsr.append(k, &v).expect("submit");
                 }
-                tx.inner.commit().unwrap()
+                drop(crsr);
+                tx.commit().unwrap()
             },
         )
     });
@@ -152,10 +148,7 @@ where
             || {
                 // Reset DB
                 let _ = fs::remove_dir_all(bench_db_path);
-                (
-                    input,
-                    Arc::try_unwrap(create_test_rw_db_with_path(bench_db_path)).unwrap(),
-                )
+                (input, Arc::try_unwrap(create_test_rw_db_with_path(bench_db_path)).unwrap())
             },
             |(input, db)| {
                 // Create TX
@@ -165,8 +158,8 @@ where
                     let (k, _, v, _) = input.get(index).unwrap().clone();
                     crsr.insert(k, &v).expect("submit");
                 }
-
-                tx.inner.commit().unwrap()
+                drop(crsr);
+                tx.commit().unwrap()
             },
         )
     });
@@ -193,9 +186,7 @@ where
             let tx = db.tx().expect("tx");
             for index in RANDOM_INDEXES {
                 let mut cursor = tx.cursor_read::<T>().expect("cursor");
-                cursor
-                    .seek_exact(input.get(index).unwrap().0.clone())
-                    .unwrap();
+                cursor.seek_exact(input.get(index).unwrap().0.clone()).unwrap();
             }
         })
     });
@@ -229,7 +220,8 @@ where
                 for (k, _, v, _) in input {
                     crsr.append_dup(k, v).expect("submit");
                 }
-                tx.inner.commit().unwrap()
+                drop(crsr);
+                tx.commit().unwrap()
             },
         )
     });
@@ -240,10 +232,7 @@ where
                 // Reset DB
                 let _ = fs::remove_dir_all(bench_db_path);
 
-                (
-                    input,
-                    Arc::try_unwrap(create_test_rw_db_with_path(bench_db_path)).unwrap(),
-                )
+                (input, Arc::try_unwrap(create_test_rw_db_with_path(bench_db_path)).unwrap())
             },
             |(input, db)| {
                 // Create TX
@@ -252,7 +241,7 @@ where
                     let (k, _, v, _) = input.get(index).unwrap().clone();
                     tx.put::<T>(k, v).unwrap();
                 }
-                tx.inner.commit().unwrap();
+                tx.commit().unwrap()
             },
         )
     });

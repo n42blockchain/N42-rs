@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use alloc::{
     collections::{BTreeMap, BTreeSet},
     vec::Vec,
@@ -27,7 +24,7 @@ pub trait AccountExtReader {
     /// Iterate over account changesets and return all account address that were changed.
     fn changed_accounts_with_range(
         &self,
-        _range: impl RangeBounds<BlockNumber>,
+        _range: RangeInclusive<BlockNumber>,
     ) -> ProviderResult<BTreeSet<Address>>;
 
     /// Get basic account information for multiple accounts. A more efficient version than calling

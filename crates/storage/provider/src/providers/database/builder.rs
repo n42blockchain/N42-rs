@@ -1,15 +1,14 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! Helper builder entrypoint to instantiate a [`ProviderFactory`].
-//!
-//! This also includes general purpose staging types that provide builder style functions that lead
-//! up to the intended build target.
 
-use crate::{providers::rocksdb::RocksDBProvider, providers::StaticFileProvider, ProviderFactory};
-use reth_db::{mdbx::DatabaseArguments, open_db_read_only, DatabaseEnv};
-use reth_db_api::{database_metrics::DatabaseMetrics, Database};
-use reth_node_types::{NodeTypes, NodeTypesWithDBAdapter};
+use crate::{
+    providers::{NodeTypesForProvider, RocksDBProvider, StaticFileProvider},
+    ProviderFactory,
+};
+use reth_db::{
+    mdbx::{DatabaseArguments, MaxReadTransactionDuration},
+    open_db_read_only, DatabaseEnv,
+};
+use reth_node_types::NodeTypesWithDBAdapter;
 use std::{
     marker::PhantomData,
     path::{Path, PathBuf},
@@ -18,26 +17,16 @@ use std::{
 
 /// Helper type to create a [`ProviderFactory`].
 ///
-/// This type is the entry point for a stage based builder.
-///
-/// The intended staging is:
-///  1. Configure the database: [`ProviderFactoryBuilder::db`]
-///  2. Configure the chainspec: `chainspec`
-///  3. Configure the [`StaticFileProvider`]: `static_file`
+/// See [`ProviderFactoryBuilder::open_read_only`] for usage examples.
 #[derive(Debug)]
 pub struct ProviderFactoryBuilder<N> {
     _types: PhantomData<N>,
 }
 
 impl<N> ProviderFactoryBuilder<N> {
-    /// Maps the [`NodeTypes`] of this builder.
+    /// Maps the [`reth_node_types::NodeTypes`] of this builder.
     pub fn types<T>(self) -> ProviderFactoryBuilder<T> {
         ProviderFactoryBuilder::default()
-    }
-
-    /// Configures the database.
-    pub fn db<DB>(self, db: DB) -> TypesAnd1<N, DB> {
-        TypesAnd1::new(db)
     }
 
     /// Opens the database with the given chainspec and [`ReadOnlyConfig`].
@@ -48,12 +37,13 @@ impl<N> ProviderFactoryBuilder<N> {
     ///
     /// ```no_run
     /// use reth_chainspec::MAINNET;
-    /// use reth_node_types::NodeTypes;
-    /// use reth_provider::providers::ProviderFactoryBuilder;
+    /// use reth_provider::providers::{NodeTypesForProvider, ProviderFactoryBuilder};
     ///
-    /// fn demo<N: NodeTypes<ChainSpec = reth_chainspec::ChainSpec>>() {
+    /// fn demo<N: NodeTypesForProvider<ChainSpec = reth_chainspec::ChainSpec>>(
+    ///     runtime: reth_tasks::Runtime,
+    /// ) {
     ///     let provider_factory = ProviderFactoryBuilder::<N>::default()
-    ///         .open_read_only(MAINNET.clone(), "datadir")
+    ///         .open_read_only(MAINNET.clone(), "datadir", runtime)
     ///         .unwrap();
     /// }
     /// ```
@@ -64,13 +54,41 @@ impl<N> ProviderFactoryBuilder<N> {
     ///
     /// ```no_run
     /// use reth_chainspec::MAINNET;
-    /// use reth_node_types::NodeTypes;
-    /// ///
-    /// use reth_provider::providers::{ProviderFactoryBuilder, ReadOnlyConfig};
+    /// use reth_provider::providers::{NodeTypesForProvider, ProviderFactoryBuilder, ReadOnlyConfig};
     ///
-    /// fn demo<N: NodeTypes<ChainSpec = reth_chainspec::ChainSpec>>() {
+    /// fn demo<N: NodeTypesForProvider<ChainSpec = reth_chainspec::ChainSpec>>(
+    ///     runtime: reth_tasks::Runtime,
+    /// ) {
     ///     let provider_factory = ProviderFactoryBuilder::<N>::default()
-    ///         .open_read_only(MAINNET.clone(), ReadOnlyConfig::from_datadir("datadir").no_watch())
+    ///         .open_read_only(
+    ///             MAINNET.clone(),
+    ///             ReadOnlyConfig::from_datadir("datadir").no_watch(),
+    ///             runtime,
+    ///         )
+    ///         .unwrap();
+    /// }
+    /// ```
+    ///
+    /// # Open an instance with disabled read-transaction timeout
+    ///
+    /// By default, read transactions are automatically terminated after a timeout to prevent
+    /// database free list growth. However, if the database is static (no writes occurring), this
+    /// safety mechanism can be disabled using
+    /// [`ReadOnlyConfig::disable_long_read_transaction_safety`].
+    ///
+    /// ```no_run
+    /// use reth_chainspec::MAINNET;
+    /// use reth_provider::providers::{NodeTypesForProvider, ProviderFactoryBuilder, ReadOnlyConfig};
+    ///
+    /// fn demo<N: NodeTypesForProvider<ChainSpec = reth_chainspec::ChainSpec>>(
+    ///     runtime: reth_tasks::Runtime,
+    /// ) {
+    ///     let provider_factory = ProviderFactoryBuilder::<N>::default()
+    ///         .open_read_only(
+    ///             MAINNET.clone(),
+    ///             ReadOnlyConfig::from_datadir("datadir").disable_long_read_transaction_safety(),
+    ///             runtime,
+    ///         )
     ///         .unwrap();
     /// }
     /// ```
@@ -78,36 +96,30 @@ impl<N> ProviderFactoryBuilder<N> {
         self,
         chainspec: Arc<N::ChainSpec>,
         config: impl Into<ReadOnlyConfig>,
-    ) -> eyre::Result<ProviderFactory<NodeTypesWithDBAdapter<N, Arc<DatabaseEnv>>>>
+        runtime: reth_tasks::Runtime,
+    ) -> eyre::Result<ProviderFactory<NodeTypesWithDBAdapter<N, DatabaseEnv>>>
     where
-        N: NodeTypes,
+        N: NodeTypesForProvider,
     {
-        let ReadOnlyConfig {
-            db_dir,
-            db_args,
-            static_files_dir,
-            watch_static_files,
-        } = config.into();
-        Ok(self
-            .db(Arc::new(open_db_read_only(db_dir, db_args)?))
-            .chainspec(chainspec)
-            .static_file(StaticFileProvider::read_only(
-                static_files_dir,
-                watch_static_files,
-            )?)
-            .build_provider_factory()?)
+        let ReadOnlyConfig { db_dir, db_args, static_files_dir, rocksdb_dir, watch_static_files } =
+            config.into();
+        let db = open_db_read_only(db_dir, db_args)?;
+        let static_file_provider =
+            StaticFileProvider::read_only(static_files_dir, watch_static_files)?;
+        let rocksdb_provider =
+            RocksDBProvider::builder(&rocksdb_dir).with_default_tables().build()?;
+        ProviderFactory::new(db, chainspec, static_file_provider, rocksdb_provider, runtime)
+            .map_err(Into::into)
     }
 }
 
 impl<N> Default for ProviderFactoryBuilder<N> {
     fn default() -> Self {
-        Self {
-            _types: Default::default(),
-        }
+        Self { _types: Default::default() }
     }
 }
 
-/// Settings for how to open the database and static files.
+/// Settings for how to open the database, static files, and `RocksDB`.
 ///
 /// The default derivation from a path assumes the path is the datadir:
 /// [`ReadOnlyConfig::from_datadir`]
@@ -119,6 +131,8 @@ pub struct ReadOnlyConfig {
     pub db_args: DatabaseArguments,
     /// The path to the static file dir
     pub static_files_dir: PathBuf,
+    /// The path to the `RocksDB` directory
+    pub rocksdb_dir: PathBuf,
     /// Whether the static files should be watched for changes.
     pub watch_static_files: bool,
 }
@@ -131,6 +145,7 @@ impl ReadOnlyConfig {
     /// ```text
     ///  -`datadir`
     ///    |__db
+    ///    |__rocksdb
     ///    |__static_files
     /// ```
     ///
@@ -138,7 +153,22 @@ impl ReadOnlyConfig {
     /// [`StaticFileProvider::read_only`]
     pub fn from_datadir(datadir: impl AsRef<Path>) -> Self {
         let datadir = datadir.as_ref();
-        Self::from_dirs(datadir.join("db"), datadir.join("static_files"))
+        Self {
+            db_dir: datadir.join("db"),
+            db_args: Default::default(),
+            static_files_dir: datadir.join("static_files"),
+            rocksdb_dir: datadir.join("rocksdb"),
+            watch_static_files: true,
+        }
+    }
+
+    /// Disables long-lived read transaction safety guarantees.
+    ///
+    /// Caution: Keeping database transaction open indefinitely can cause the free list to grow if
+    /// changes to the database are made.
+    pub const fn disable_long_read_transaction_safety(mut self) -> Self {
+        self.db_args.max_read_transaction_duration(Some(MaxReadTransactionDuration::Unbounded));
+        self
     }
 
     /// Derives the [`ReadOnlyConfig`] from the database dir.
@@ -147,7 +177,8 @@ impl ReadOnlyConfig {
     ///
     /// ```text
     ///    - db
-    ///    -static_files
+    ///    - rocksdb
+    ///    - static_files
     /// ```
     ///
     /// By default this watches the static file directory for changes, see also
@@ -158,13 +189,10 @@ impl ReadOnlyConfig {
     /// If the path does not exist
     pub fn from_db_dir(db_dir: impl AsRef<Path>) -> Self {
         let db_dir = db_dir.as_ref();
-        let static_files_dir = std::fs::canonicalize(db_dir)
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_path_buf()
-            .join("static_files");
-        Self::from_dirs(db_dir, static_files_dir)
+        let datadir = std::fs::canonicalize(db_dir).unwrap().parent().unwrap().to_path_buf();
+        let static_files_dir = datadir.join("static_files");
+        let rocksdb_dir = datadir.join("rocksdb");
+        Self::from_dirs(db_dir, static_files_dir, rocksdb_dir)
     }
 
     /// Creates the config for the given paths.
@@ -172,11 +200,16 @@ impl ReadOnlyConfig {
     ///
     /// By default this watches the static file directory for changes, see also
     /// [`StaticFileProvider::read_only`]
-    pub fn from_dirs(db_dir: impl AsRef<Path>, static_files_dir: impl AsRef<Path>) -> Self {
+    pub fn from_dirs(
+        db_dir: impl AsRef<Path>,
+        static_files_dir: impl AsRef<Path>,
+        rocksdb_dir: impl AsRef<Path>,
+    ) -> Self {
         Self {
-            static_files_dir: static_files_dir.as_ref().into(),
             db_dir: db_dir.as_ref().into(),
             db_args: Default::default(),
+            static_files_dir: static_files_dir.as_ref().into(),
+            rocksdb_dir: rocksdb_dir.as_ref().into(),
             watch_static_files: true,
         }
     }
@@ -221,108 +254,5 @@ where
 {
     fn from(value: T) -> Self {
         Self::from_datadir(value.as_ref())
-    }
-}
-
-/// This is staging type that contains the configured types and _one_ value.
-#[derive(Debug)]
-pub struct TypesAnd1<N, Val1> {
-    _types: PhantomData<N>,
-    val_1: Val1,
-}
-
-impl<N, Val1> TypesAnd1<N, Val1> {
-    /// Creates a new instance with the given types and one value.
-    pub fn new(val_1: Val1) -> Self {
-        Self {
-            _types: Default::default(),
-            val_1,
-        }
-    }
-
-    /// Configures the chainspec.
-    pub fn chainspec<C>(self, chainspec: Arc<C>) -> TypesAnd2<N, Val1, Arc<C>> {
-        TypesAnd2::new(self.val_1, chainspec)
-    }
-}
-
-/// This is staging type that contains the configured types and _two_ values.
-#[derive(Debug)]
-pub struct TypesAnd2<N, Val1, Val2> {
-    _types: PhantomData<N>,
-    val_1: Val1,
-    val_2: Val2,
-}
-
-impl<N, Val1, Val2> TypesAnd2<N, Val1, Val2> {
-    /// Creates a new instance with the given types and two values.
-    pub fn new(val_1: Val1, val_2: Val2) -> Self {
-        Self {
-            _types: Default::default(),
-            val_1,
-            val_2,
-        }
-    }
-
-    /// Returns the first value.
-    pub const fn val_1(&self) -> &Val1 {
-        &self.val_1
-    }
-
-    /// Returns the second value.
-    pub const fn val_2(&self) -> &Val2 {
-        &self.val_2
-    }
-
-    /// Configures the [`StaticFileProvider`].
-    pub fn static_file(
-        self,
-        static_file_provider: StaticFileProvider<N::Primitives>,
-    ) -> TypesAnd3<N, Val1, Val2, StaticFileProvider<N::Primitives>>
-    where
-        N: NodeTypes,
-    {
-        TypesAnd3::new(self.val_1, self.val_2, static_file_provider)
-    }
-}
-
-/// This is staging type that contains the configured types and _three_ values.
-#[derive(Debug)]
-pub struct TypesAnd3<N, Val1, Val2, Val3> {
-    _types: PhantomData<N>,
-    val_1: Val1,
-    val_2: Val2,
-    val_3: Val3,
-}
-
-impl<N, Val1, Val2, Val3> TypesAnd3<N, Val1, Val2, Val3> {
-    /// Creates a new instance with the given types and three values.
-    pub fn new(val_1: Val1, val_2: Val2, val_3: Val3) -> Self {
-        Self {
-            _types: Default::default(),
-            val_1,
-            val_2,
-            val_3,
-        }
-    }
-}
-
-impl<N, DB> TypesAnd3<N, DB, Arc<N::ChainSpec>, StaticFileProvider<N::Primitives>>
-where
-    N: NodeTypes,
-    DB: Database + DatabaseMetrics + Clone + Unpin + 'static,
-{
-    /// Creates the [`ProviderFactory`].
-    pub fn build_provider_factory(
-        self,
-    ) -> reth_storage_errors::provider::ProviderResult<ProviderFactory<NodeTypesWithDBAdapter<N, DB>>>
-    {
-        let Self {
-            _types,
-            val_1,
-            val_2,
-            val_3,
-        } = self;
-        ProviderFactory::new(val_1, val_2, val_3, RocksDBProvider)
     }
 }

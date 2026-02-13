@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 #![allow(missing_docs)]
 
 use alloy_primitives::TxHash;
@@ -47,8 +44,7 @@ fn get(c: &mut Criterion) {
     group.bench_function("get_by_encoded_key", |b| {
         b.iter(|| {
             for key in &keys {
-                tx.get_by_encoded_key::<TransactionHashNumbers>(key)
-                    .unwrap();
+                tx.get_by_encoded_key::<TransactionHashNumbers>(key).unwrap();
             }
         })
     });

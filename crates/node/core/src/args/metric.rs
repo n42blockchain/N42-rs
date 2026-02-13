@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use clap::Parser;
 use reth_cli_util::{parse_duration_from_secs, parse_socket_address};
 use std::{net::SocketAddr, time::Duration};

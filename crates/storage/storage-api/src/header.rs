@@ -1,9 +1,6 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use alloc::vec::Vec;
 use alloy_eips::BlockHashOrNumber;
-use alloy_primitives::{BlockHash, BlockNumber, U256};
+use alloy_primitives::{BlockHash, BlockNumber};
 use core::ops::RangeBounds;
 use reth_primitives_traits::{BlockHeader, SealedHeader};
 use reth_storage_errors::provider::ProviderResult;
@@ -13,7 +10,7 @@ pub type ProviderHeader<P> = <P as HeaderProvider>::Header;
 
 /// Client trait for fetching `Header` related data.
 #[auto_impl::auto_impl(&, Arc)]
-pub trait HeaderProvider: Send + Sync {
+pub trait HeaderProvider: Send {
     /// The header type this provider supports.
     type Header: BlockHeader;
 
@@ -30,9 +27,7 @@ pub trait HeaderProvider: Send + Sync {
         &self,
         block_hash: BlockHash,
     ) -> ProviderResult<Option<SealedHeader<Self::Header>>> {
-        Ok(self
-            .header(block_hash)?
-            .map(|header| SealedHeader::new(header, block_hash)))
+        Ok(self.header(block_hash)?.map(|header| SealedHeader::new(header, block_hash)))
     }
 
     /// Get header by block number
@@ -48,12 +43,6 @@ pub trait HeaderProvider: Send + Sync {
             BlockHashOrNumber::Number(num) => self.header_by_number(num),
         }
     }
-
-    /// Get total difficulty by block hash.
-    fn header_td(&self, hash: &BlockHash) -> ProviderResult<Option<U256>>;
-
-    /// Get total difficulty by block number.
-    fn header_td_by_number(&self, number: BlockNumber) -> ProviderResult<Option<U256>>;
 
     /// Get headers in range of block numbers
     fn headers_range(

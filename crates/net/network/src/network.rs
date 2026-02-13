@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use crate::{
     config::NetworkMode, message::PeerMessage, protocol::RlpxSubProtocol,
     swarm::NetworkConnectionState, transactions::TransactionsHandle, FetchClient,
@@ -15,7 +12,6 @@ use reth_eth_wire::{
     BlockRangeUpdate, DisconnectReason, EthNetworkPrimitives, NetworkPrimitives,
     NewPooledTransactionHashes, SharedTransactions,
 };
-use reth_eth_wire_types::NewBlock;
 use reth_ethereum_forks::Head;
 use reth_network_api::{
     events::{NetworkPeersEvents, PeerEvent, PeerEventStream},
@@ -87,14 +83,8 @@ impl<N: NetworkPrimitives> NetworkHandle<N> {
             discv5,
             event_sender,
             nat,
-            block_announcer: Default::default(),
         };
         Self { inner: Arc::new(inner) }
-    }
-
-    /// Send a new block announcement to all subscribers.
-    pub fn send_block_announcement(&self, block: NewBlock<N::Block>) {
-        self.inner.block_announcer.notify(block);
     }
 
     /// Returns the [`PeerId`] used in the network.
@@ -242,13 +232,33 @@ impl<N: NetworkPrimitives> PeersInfo for NetworkHandle<N> {
 
     fn local_node_record(&self) -> NodeRecord {
         if let Some(discv4) = &self.inner.discv4 {
+            // Note: the discv4 services uses the same `nat` so we can directly return the node
+            // record here
             discv4.node_record()
-        } else if let Some(record) = self.inner.discv5.as_ref().and_then(|d| d.node_record()) {
-            record
+        } else if let Some(discv5) = self.inner.discv5.as_ref() {
+            // for disv5 we must check if we have an external ip configured
+            if let Some(external) =
+                self.inner.nat.clone().and_then(|nat| nat.as_external_ip(discv5.local_port()))
+            {
+                NodeRecord::new((external, discv5.local_port()).into(), *self.peer_id())
+            } else {
+                // use the node record that discv5 tracks or use localhost
+                self.inner.discv5.as_ref().and_then(|d| d.node_record()).unwrap_or_else(|| {
+                    NodeRecord::new(
+                        (std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), discv5.local_port())
+                            .into(),
+                        *self.peer_id(),
+                    )
+                })
+            }
+            // also use the tcp port
+            .with_tcp_port(self.inner.listener_address.lock().port())
         } else {
             let mut socket_addr = *self.inner.listener_address.lock();
-            let port = socket_addr.port();
-            let external_ip = self.inner.nat.as_ref().and_then(|nat| nat.clone().as_external_ip(port));
+
+            let external_ip =
+                self.inner.nat.clone().and_then(|nat| nat.as_external_ip(socket_addr.port()));
+
             if let Some(ip) = external_ip {
                 // if able to resolve external ip, use it instead and also set the local address
                 socket_addr.set_ip(ip)
@@ -342,6 +352,9 @@ impl<N: NetworkPrimitives> Peers for NetworkHandle<N> {
 
     /// Sends a message to the [`NetworkManager`](crate::NetworkManager) to connect to the given
     /// peer.
+    ///
+    /// This will add a new entry for the given peer if it isn't tracked yet.
+    /// If it is tracked then the peer is updated with the given information.
     fn connect_peer_kind(
         &self,
         peer_id: PeerId,
@@ -474,8 +487,6 @@ struct NetworkInner<N: NetworkPrimitives = EthNetworkPrimitives> {
     event_sender: EventSender<NetworkEvent<PeerRequest<N>>>,
     /// The NAT resolver
     nat: Option<NatResolver>,
-    /// Sender for block announcement events.
-    block_announcer: EventSender<NewBlock<N::Block>>,
 }
 
 /// Provides access to modify the network's additional protocol handlers.
@@ -560,28 +571,4 @@ pub(crate) enum NetworkHandleMessage<N: NetworkPrimitives = EthNetworkPrimitives
     ConnectPeer(PeerId, PeerKind, PeerAddr),
     /// Message to update the node's advertised block range information.
     InternalBlockRangeUpdate(BlockRangeUpdate),
-}
-
-use reth_network_api::{BlockAnnounceProvider, N42BlockImportOutcome};
-
-impl<N: NetworkPrimitives> BlockAnnounceProvider for NetworkHandle<N> 
-where 
-    N::Block: Send + Sync + Clone + 'static,
-    N::NewBlockPayload: From<NewBlock<N::Block>>,
-{
-    type Block = N::Block;
-
-    fn announce_block(&self, block: NewBlock<Self::Block>, hash: B256) {
-        // Convert NewBlock<Block> to N::NewBlockPayload
-        self.send_message(NetworkHandleMessage::AnnounceBlock(block.into(), hash))
-    }
-
-    fn subscribe_block(&self) -> EventStream<NewBlock<Self::Block>> {
-        // Return a new listener for block announcements
-        self.inner.block_announcer.new_listener()
-    }
-
-    fn validated_block(&self, _result: N42BlockImportOutcome<Self::Block>) {
-        // Block validation is handled internally, this is a no-op for now
-    }
 }

@@ -11,8 +11,19 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod block;
+pub mod receipt;
+mod rpc;
 pub mod transaction;
-pub use transaction::TransactionCompat;
+
+pub use block::TryFromBlockResponse;
+pub use receipt::TryFromReceiptResponse;
+pub use rpc::*;
+pub use transaction::{
+    RpcConvert, RpcConverter, TransactionConversionError, TryFromTransactionResponse, TryIntoSimTx,
+    TxInfoMapper,
+};
+
+pub use alloy_evm::rpc::{CallFees, CallFeesError, EthTxEnvError, TryIntoTxEnv};

@@ -1,14 +1,11 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use alloc::vec::Vec;
 use alloy_eips::BlockHashOrNumber;
 use alloy_primitives::{BlockNumber, B256};
 use reth_storage_errors::provider::ProviderResult;
 
 /// Client trait for fetching block hashes by number.
-#[auto_impl::auto_impl(&, Arc, Box)]
-pub trait BlockHashReader: Send + Sync {
+#[auto_impl::auto_impl(&, Box, Arc)]
+pub trait BlockHashReader {
     /// Get the hash of the block with the given number. Returns `None` if no block with this number
     /// exists.
     fn block_hash(&self, number: BlockNumber) -> ProviderResult<Option<B256>>;

@@ -9,31 +9,35 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 // Note: This crate requires std for N42 consensus implementation
 // #![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
 
-use alloc::{fmt::Debug, string::String, vec::Vec};
+use alloc::{boxed::Box, fmt::Debug, string::String, sync::Arc, vec::Vec};
 use alloy_consensus::Header;
 use alloy_primitives::{Address, BlockHash, BlockNumber, Bloom, B256, U256};
+use core::error::Error;
+
+/// Pre-computed receipt root and logs bloom.
+///
+/// When provided to [`FullConsensus::validate_block_post_execution`], this allows skipping
+/// the receipt root computation and using the pre-computed values instead.
+pub type ReceiptRootBloom = (B256, Bloom);
 use reth_execution_types::BlockExecutionResult;
 use reth_primitives_traits::{
-    constants::{MAXIMUM_GAS_LIMIT_BLOCK, MINIMUM_GAS_LIMIT},
+    constants::{GAS_LIMIT_BOUND_DIVISOR, MAXIMUM_GAS_LIMIT_BLOCK, MINIMUM_GAS_LIMIT},
     transaction::error::InvalidTransactionError,
     Block, GotExpected, GotExpectedBoxed, NodePrimitives, RecoveredBlock, SealedBlock,
     SealedHeader,
 };
-use std::sync::Arc;
 
+// N42 imports
 use n42_primitives::Snapshot;
 use reth_revm::cached::CachedReads;
 use std::collections::HashMap;
 use std::time::Duration;
-
-/// Pre-computed receipt root and logs bloom.
-pub type ReceiptRootBloom = (B256, Bloom);
 
 /// A consensus implementation that does nothing.
 pub mod noop;
@@ -54,10 +58,10 @@ pub trait FullConsensus<N: NodePrimitives>: Consensus<N::Block> {
     ///
     /// See the Yellow Paper sections 4.3.2 "Holistic Validity".
     ///
-    /// Note: validating blocks does not include other validations of the Consensus
+    /// If `receipt_root_bloom` is provided, the implementation should use the pre-computed
+    /// receipt root and logs bloom instead of computing them from the receipts.
     ///
-    /// The `receipt_root_bloom` parameter is an optional pre-computed receipt root and bloom,
-    /// this allows skipping the receipt root computation.
+    /// Note: validating blocks does not include other validations of the Consensus
     fn validate_block_post_execution(
         &self,
         block: &RecoveredBlock<N::Block>,
@@ -79,13 +83,16 @@ pub trait Consensus<B: Block>: HeaderValidator<B::Header> {
     /// Validate a block disregarding world state, i.e. things that can be checked before sender
     /// recovery and execution.
     ///
-    /// See the Yellow Paper sections 4.3.2 "Holistic Validity", 4.3.4 "Block Header Validity", and
-    /// 11.1 "Ommer Validation".
+    /// See the Yellow Paper sections 4.4.2 "Holistic Validity", 4.4.4 "Block Header Validity".
+    /// Note: Ommer Validation (previously section 11.1) has been deprecated since the Paris hard
+    /// fork transition to proof of stake.
     ///
     /// **This should not be called for the genesis block**.
     ///
     /// Note: validating blocks does not include other validations of the Consensus
     fn validate_block_pre_execution(&self, block: &SealedBlock<B>) -> Result<(), ConsensusError>;
+
+    // --- N42-specific methods with default implementations ---
 
     /// for N42
     fn prepare(&self, parent_header: &SealedHeader) -> Result<Header, ConsensusError> {
@@ -150,7 +157,7 @@ pub trait Consensus<B: Block>: HeaderValidator<B::Header> {
     }
 }
 
-/// HeaderValidator is a protocol that validates headers and their relationships.
+/// `HeaderValidator` is a protocol that validates headers and their relationships.
 #[auto_impl::auto_impl(&, Arc)]
 pub trait HeaderValidator<H = Header>: Debug + Send + Sync {
     /// Validate if header is correct and follows consensus specification.
@@ -166,7 +173,7 @@ pub trait HeaderValidator<H = Header>: Debug + Send + Sync {
     ///
     /// **This should not be called for the genesis block**.
     ///
-    /// Note: Validating header against its parent does not include other HeaderValidator
+    /// Note: Validating header against its parent does not include other `HeaderValidator`
     /// validations.
     fn validate_header_against_parent(
         &self,
@@ -192,8 +199,7 @@ pub trait HeaderValidator<H = Header>: Debug + Send + Sync {
                 .map_err(|e| HeaderConsensusError(e, initial_header.clone()))?;
             let mut parent = initial_header;
             for child in remaining_headers {
-                self.validate_header(child)
-                    .map_err(|e| HeaderConsensusError(e, child.clone()))?;
+                self.validate_header(child).map_err(|e| HeaderConsensusError(e, child.clone()))?;
                 self.validate_header_against_parent(child, parent)
                     .map_err(|e| HeaderConsensusError(e, child.clone()))?;
                 parent = child;
@@ -204,7 +210,7 @@ pub trait HeaderValidator<H = Header>: Debug + Send + Sync {
 }
 
 /// Consensus Errors
-#[derive(Debug, PartialEq, Eq, Clone, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ConsensusError {
     /// Error when the gas used in the header exceeds the gas limit.
     #[error("block used gas ({gas_used}) is greater than gas limit ({gas_limit})")]
@@ -214,7 +220,7 @@ pub enum ConsensusError {
         /// The gas limit in the block header.
         gas_limit: u64,
     },
-    /// Error when the gas the gas limit is more than the maximum allowed.
+    /// Error when the gas limit is more than the maximum allowed.
     #[error(
         "header gas limit ({gas_limit}) exceed the maximum allowed gas limit ({MAXIMUM_GAS_LIMIT_BLOCK})"
     )]
@@ -400,17 +406,6 @@ pub enum ConsensusError {
         blob_gas_per_blob: u64,
     },
 
-    /// Error when excess blob gas is not a multiple of blob gas per blob.
-    #[error(
-        "excess blob gas {excess_blob_gas} is not a multiple of blob gas per blob {blob_gas_per_blob}"
-    )]
-    ExcessBlobGasNotMultipleOfBlobGasPerBlob {
-        /// The actual excess blob gas.
-        excess_blob_gas: u64,
-        /// The blob gas per blob.
-        blob_gas_per_blob: u64,
-    },
-
     /// Error when the blob gas used in the header does not match the expected blob gas used.
     #[error("blob gas used mismatch: {0}")]
     BlobGasUsedDiff(GotExpected<u64>),
@@ -439,7 +434,7 @@ pub enum ConsensusError {
     },
 
     /// Error when the child gas limit exceeds the maximum allowed increase.
-    #[error("child gas_limit {child_gas_limit} max increase is {parent_gas_limit}/1024")]
+    #[error("child gas_limit {child_gas_limit} exceeds the max allowed increase ({parent_gas_limit}/{GAS_LIMIT_BOUND_DIVISOR})")]
     GasLimitInvalidIncrease {
         /// The parent gas limit.
         parent_gas_limit: u64,
@@ -468,7 +463,7 @@ pub enum ConsensusError {
     },
 
     /// Error when the child gas limit exceeds the maximum allowed decrease.
-    #[error("child gas_limit {child_gas_limit} max decrease is {parent_gas_limit}/1024")]
+    #[error("child gas_limit {child_gas_limit} is below the max allowed decrease ({parent_gas_limit}/{GAS_LIMIT_BOUND_DIVISOR})")]
     GasLimitInvalidDecrease {
         /// The parent gas limit.
         parent_gas_limit: u64,
@@ -486,7 +481,19 @@ pub enum ConsensusError {
         /// The block's timestamp.
         timestamp: u64,
     },
-    // for N42
+    /// Error when the block is too large.
+    #[error("block is too large: {rlp_length} > {max_rlp_length}")]
+    BlockTooLarge {
+        /// The actual RLP length of the block.
+        rlp_length: usize,
+        /// The maximum allowed RLP length.
+        max_rlp_length: usize,
+    },
+    /// EIP-7825: Transaction gas limit exceeds maximum allowed
+    #[error(transparent)]
+    TransactionGasLimitTooHigh(Box<TxGasLimitTooHighErr>),
+
+    // --- N42-specific error variants ---
     #[error("unknown block")]
     UnknownBlock,
     #[error("beneficiary in checkpoint block non-zero")]
@@ -517,22 +524,13 @@ pub enum ConsensusError {
     NoSignerSet,
     #[error("apos error detail {detail}")]
     AposErrorDetail { detail: String },
-    /// Error when a transaction's gas limit exceeds the maximum allowed.
-    #[error("transaction gas limit too high: tx_hash={}, gas_limit={}, max_allowed={}", .0.tx_hash, .0.gas_limit, .0.max_allowed)]
-    TransactionGasLimitTooHigh(Box<TxGasLimitTooHighErr>),
-
-    /// Error when the block is too large.
-    #[error("block is too large: rlp_length={rlp_length}, max_rlp_length={max_rlp_length}")]
-    BlockTooLarge {
-        /// The actual RLP length of the block.
-        rlp_length: usize,
-        /// The maximum allowed RLP length.
-        max_rlp_length: usize,
-    },
 
     /// Other, likely an injected L2 error.
     #[error("{0}")]
     Other(String),
+    /// Other unspecified error.
+    #[error(transparent)]
+    Custom(#[from] Arc<dyn Error + Send + Sync>),
 }
 
 impl ConsensusError {
@@ -548,13 +546,20 @@ impl From<InvalidTransactionError> for ConsensusError {
     }
 }
 
+impl From<TxGasLimitTooHighErr> for ConsensusError {
+    fn from(value: TxGasLimitTooHighErr) -> Self {
+        Self::TransactionGasLimitTooHigh(Box::new(value))
+    }
+}
+
 /// `HeaderConsensusError` combines a `ConsensusError` with the `SealedHeader` it relates to.
 #[derive(thiserror::Error, Debug)]
 #[error("Consensus error: {0}, Invalid header: {1:?}")]
-pub struct HeaderConsensusError<H>(pub ConsensusError, pub SealedHeader<H>);
+pub struct HeaderConsensusError<H>(ConsensusError, SealedHeader<H>);
 
-/// Error when a transaction's gas limit exceeds the maximum allowed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// EIP-7825: Transaction gas limit exceeds maximum allowed
+#[derive(thiserror::Error, Debug, Eq, PartialEq, Clone)]
+#[error("transaction gas limit ({gas_limit}) is greater than the cap ({max_allowed})")]
 pub struct TxGasLimitTooHighErr {
     /// Hash of the transaction that violates the rule
     pub tx_hash: B256,
@@ -564,8 +569,33 @@ pub struct TxGasLimitTooHighErr {
     pub max_allowed: u64,
 }
 
-impl From<TxGasLimitTooHighErr> for ConsensusError {
-    fn from(value: TxGasLimitTooHighErr) -> Self {
-        Self::TransactionGasLimitTooHigh(Box::new(value))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(thiserror::Error, Debug)]
+    #[error("Custom L2 consensus error")]
+    struct CustomL2Error;
+
+    #[test]
+    fn test_custom_error_conversion() {
+        // Test conversion from custom error to ConsensusError
+        let custom_err = CustomL2Error;
+        let arc_err: Arc<dyn Error + Send + Sync> = Arc::new(custom_err);
+        let consensus_err: ConsensusError = arc_err.into();
+
+        // Verify it's the Custom variant
+        assert!(matches!(consensus_err, ConsensusError::Custom(_)));
+    }
+
+    #[test]
+    fn test_custom_error_display() {
+        let custom_err = CustomL2Error;
+        let arc_err: Arc<dyn Error + Send + Sync> = Arc::new(custom_err);
+        let consensus_err: ConsensusError = arc_err.into();
+
+        // Verify the error message is preserved through transparent attribute
+        let error_message = format!("{}", consensus_err);
+        assert_eq!(error_message, "Custom L2 consensus error");
     }
 }

@@ -1,7 +1,6 @@
 //! Metadata provider trait for reading and writing node metadata.
 
 use alloc::vec::Vec;
-#[cfg(feature = "db-api")]
 use reth_db_api::models::StorageSettings;
 use reth_storage_errors::provider::{ProviderError, ProviderResult};
 
@@ -17,12 +16,15 @@ pub trait MetadataProvider: Send {
     /// Get a metadata value by key
     fn get_metadata(&self, key: &str) -> ProviderResult<Option<Vec<u8>>>;
 
-    /// Get storage settings for this node
-    #[cfg(feature = "db-api")]
+    /// Get storage settings for this node.
+    ///
+    /// If the stored metadata can't be deserialized (e.g. the format changed),
+    /// this returns `None` instead of an error so commands like `db clear` can
+    /// still operate without requiring a compatible metadata schema.
     fn storage_settings(&self) -> ProviderResult<Option<StorageSettings>> {
-        self.get_metadata(keys::STORAGE_SETTINGS)?
-            .map(|bytes| serde_json::from_slice(&bytes).map_err(ProviderError::other))
-            .transpose()
+        Ok(self
+            .get_metadata(keys::STORAGE_SETTINGS)?
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok()))
     }
 }
 
@@ -35,7 +37,6 @@ pub trait MetadataWriter: Send {
     ///
     /// Be sure to update provider factory cache with
     /// [`StorageSettingsCache::set_storage_settings_cache`].
-    #[cfg(feature = "db-api")]
     fn write_storage_settings(&self, settings: StorageSettings) -> ProviderResult<()> {
         self.write_metadata(
             keys::STORAGE_SETTINGS,
@@ -45,7 +46,6 @@ pub trait MetadataWriter: Send {
 }
 
 /// Trait for caching storage settings on a provider factory.
-#[cfg(feature = "db-api")]
 pub trait StorageSettingsCache: Send {
     /// Gets the cached storage settings.
     fn cached_storage_settings(&self) -> StorageSettings;

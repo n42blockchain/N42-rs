@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! Capability messaging
 //!
 //! An `RLPx` stream is multiplexed via the prepended message-id of a framed message.
@@ -111,11 +108,15 @@ pub enum PeerResponse<N: NetworkPrimitives = EthNetworkPrimitives> {
         response: oneshot::Receiver<RequestResult<Receipts<N::Receipt>>>,
     },
     /// Represents a response to a request for receipts.
+    ///
+    /// This is a variant of `Receipts` that was introduced in `eth/69`.
+    /// The difference is that this variant does not require the inclusion of bloom filters in the
+    /// response, making it more lightweight.
     Receipts69 {
         /// The receiver channel for the response to a receipts request.
         response: oneshot::Receiver<RequestResult<Receipts69<N::Receipt>>>,
     },
-    /// Represents a response to a request for receipts (eth/70 protocol).
+    /// Represents a response to a request for receipts using eth/70.
     Receipts70 {
         /// The receiver channel for the response to a receipts request.
         response: oneshot::Receiver<RequestResult<Receipts70<N::Receipt>>>,

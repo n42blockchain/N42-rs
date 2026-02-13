@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use crate::NodePrimitivesProvider;
 use alloc::vec::Vec;
 use alloy_primitives::BlockNumber;
@@ -8,11 +5,11 @@ use reth_db_models::StoredBlockBodyIndices;
 use reth_execution_types::{Chain, ExecutionOutcome};
 use reth_primitives_traits::{Block, NodePrimitives, RecoveredBlock};
 use reth_storage_errors::provider::ProviderResult;
-use reth_trie_common::{updates::TrieUpdates, HashedPostStateSorted};
+use reth_trie_common::HashedPostStateSorted;
 
 /// `BlockExecution` Writer
 pub trait BlockExecutionWriter:
-    NodePrimitivesProvider<Primitives: NodePrimitives<Block = Self::Block>> + BlockWriter + Send + Sync
+    NodePrimitivesProvider<Primitives: NodePrimitives<Block = Self::Block>> + BlockWriter
 {
     /// Take all of the blocks above the provided number and their execution result
     ///
@@ -42,8 +39,8 @@ impl<T: BlockExecutionWriter> BlockExecutionWriter for &T {
 }
 
 /// Block Writer
-#[auto_impl::auto_impl(&, Arc, Box)]
-pub trait BlockWriter: Send + Sync {
+#[auto_impl::auto_impl(&, Box)]
+pub trait BlockWriter {
     /// The body this writer can write.
     type Block: Block;
     /// The receipt type for [`ExecutionOutcome`].
@@ -56,7 +53,7 @@ pub trait BlockWriter: Send + Sync {
     /// and transition in the block.
     fn insert_block(
         &self,
-        block: RecoveredBlock<Self::Block>,
+        block: &RecoveredBlock<Self::Block>,
     ) -> ProviderResult<StoredBlockBodyIndices>;
 
     /// Appends a batch of block bodies extending the canonical chain. This is invoked during
@@ -81,7 +78,7 @@ pub trait BlockWriter: Send + Sync {
     /// updates the post-state.
     ///
     /// Inserts the blocks into the database and updates the state with
-    /// provided `BundleState`.
+    /// provided `BundleState`. The database's trie state is _not_ updated.
     ///
     /// # Parameters
     ///
@@ -96,6 +93,5 @@ pub trait BlockWriter: Send + Sync {
         blocks: Vec<RecoveredBlock<Self::Block>>,
         execution_outcome: &ExecutionOutcome<Self::Receipt>,
         hashed_state: HashedPostStateSorted,
-        trie_updates: TrieUpdates,
     ) -> ProviderResult<()>;
 }

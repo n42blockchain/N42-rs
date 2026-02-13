@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use std::{
     env,
     path::{Path, PathBuf},
@@ -102,15 +99,6 @@ fn generate_bindings(mdbx: &Path, out_file: &Path) {
         .allowlist_var("^(MDBX|mdbx)_.*")
         .allowlist_type("^(MDBX|mdbx)_.*")
         .allowlist_function("^(MDBX|mdbx)_.*")
-        .blocklist_type("iovec")
-        .raw_line("
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct iovec {
-    pub iov_base: *mut ::std::os::raw::c_void,
-    pub iov_len: usize,
-}
-            ")
         .size_t_is_usize(true)
         .merge_extern_blocks(true)
         .parse_callbacks(Box::new(Callbacks))

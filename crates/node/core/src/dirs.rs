@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! reth data directories.
 
 use crate::{args::DatadirArgs, utils::parse_path};

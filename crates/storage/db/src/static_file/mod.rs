@@ -1,8 +1,9 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! reth's static file database table import and access
 
+use reth_nippy_jar::{NippyJar, NippyJarError};
+use reth_static_file_types::{
+    SegmentHeader, SegmentRangeInclusive, StaticFileMap, StaticFileSegment,
+};
 use std::path::Path;
 
 mod cursor;
@@ -10,11 +11,9 @@ pub use cursor::StaticFileCursor;
 
 mod mask;
 pub use mask::*;
-use reth_nippy_jar::{NippyJar, NippyJarError};
 
 mod masks;
 pub use masks::*;
-use reth_static_file_types::{SegmentHeader, SegmentRangeInclusive, StaticFileMap, StaticFileSegment};
 
 /// Alias type for a map of [`StaticFileSegment`] and sorted lists of existing static file ranges.
 type SortedStaticFiles = StaticFileMap<Vec<(SegmentRangeInclusive, SegmentHeader)>>;
@@ -41,16 +40,18 @@ pub fn iter_static_files(path: &Path) -> Result<SortedStaticFiles, NippyJarError
                 if let Some(block_range) = jar.user_header().block_range() {
                     static_files
                         .entry(segment)
-                        .and_modify(|headers| headers.push((block_range, jar.user_header().clone())))
+                        .and_modify(|headers| {
+                            headers.push((block_range, jar.user_header().clone()))
+                        })
                         .or_insert_with(|| vec![(block_range, jar.user_header().clone())]);
                 }
             }
         }
     }
 
+    // Sort by block end range.
     for range_list in static_files.values_mut() {
-        // Sort by block end range.
-        range_list.sort_by_key(|(r, _)| r.end());
+        range_list.sort_by_key(|(block_range, _)| block_range.end());
     }
 
     Ok(static_files)

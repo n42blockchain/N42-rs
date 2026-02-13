@@ -1,10 +1,11 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
+use reth_db::DatabaseEnv;
 // re-export the node api types
 pub use reth_node_api::{FullNodeTypes, NodeTypes};
 
-use crate::{components::NodeComponentsBuilder, rpc::RethRpcAddOns, NodeAdapter, NodeAddOns};
+use crate::{
+    components::NodeComponentsBuilder, rpc::RethRpcAddOns, NodeAdapter, NodeAddOns, NodeHandle,
+    RethFullAdapter,
+};
 use reth_node_api::{EngineTypes, FullNodeComponents, PayloadTypes};
 use reth_node_core::{
     dirs::{ChainPath, DataDirPath},
@@ -21,6 +22,10 @@ use std::{
     ops::{Deref, DerefMut},
     sync::Arc,
 };
+
+/// A helper type to obtain components for a given node when [`FullNodeTypes::Types`] is a [`Node`]
+/// implementation.
+pub type ComponentsFor<N> = <<<N as FullNodeTypes>::Types as Node<N>>::ComponentsBuilder as NodeComponentsBuilder<N>>::Components;
 
 /// A [`crate::Node`] is a [`NodeTypes`] that comes with preconfigured components.
 ///
@@ -174,14 +179,16 @@ where
     /// Returns the [`EngineApiClient`] interface for the authenticated engine API.
     ///
     /// This will send authenticated http requests to the node's auth server.
-    pub fn engine_http_client(&self) -> impl EngineApiClient<Engine> {
+    pub fn engine_http_client(&self) -> impl EngineApiClient<Engine> + use<Engine, Node, AddOns> {
         self.auth_server_handle().http_client()
     }
 
     /// Returns the [`EngineApiClient`] interface for the authenticated engine API.
     ///
     /// This will send authenticated ws requests to the node's auth server.
-    pub async fn engine_ws_client(&self) -> impl EngineApiClient<Engine> {
+    pub async fn engine_ws_client(
+        &self,
+    ) -> impl EngineApiClient<Engine> + use<Engine, Node, AddOns> {
         self.auth_server_handle().ws_client().await
     }
 
@@ -189,7 +196,9 @@ where
     ///
     /// This will send not authenticated IPC requests to the node's auth server.
     #[cfg(unix)]
-    pub async fn engine_ipc_client(&self) -> Option<impl EngineApiClient<Engine>> {
+    pub async fn engine_ipc_client(
+        &self,
+    ) -> Option<impl EngineApiClient<Engine> + use<Engine, Node, AddOns>> {
         self.auth_server_handle().ipc_client().await
     }
 }
@@ -207,3 +216,11 @@ impl<Node: FullNodeComponents, AddOns: NodeAddOns<Node>> DerefMut for FullNode<N
         &mut self.add_ons_handle
     }
 }
+
+/// Helper type alias to define [`FullNode`] for a given [`Node`].
+pub type FullNodeFor<N, DB = DatabaseEnv> =
+    FullNode<NodeAdapter<RethFullAdapter<DB, N>>, <N as Node<RethFullAdapter<DB, N>>>::AddOns>;
+
+/// Helper type alias to define [`NodeHandle`] for a given [`Node`].
+pub type NodeHandleFor<N, DB = DatabaseEnv> =
+    NodeHandle<NodeAdapter<RethFullAdapter<DB, N>>, <N as Node<RethFullAdapter<DB, N>>>::AddOns>;

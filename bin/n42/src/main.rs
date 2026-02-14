@@ -3,11 +3,11 @@
 #[global_allocator]
 static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
 
-use std::{time::Duration};
+use std::{sync::Arc, time::Duration};
 use alloy_signer_local::PrivateKeySigner;
 use consensus_client::miner::N42Miner;
 use consensus_client::migrate::N42Migrate;
-use n42_clique::UnverifiedBlock;
+use n42_clique::{UnverifiedBlock, VerifiedAttestation};
 use n42_primitives::{MaxNumValidators, Unsigned};
 use n42_engine_primitives::N42PayloadAttributesBuilder;
 use clap::Parser;
@@ -31,7 +31,7 @@ fn main() {
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
     }
 
-    let (verification_tx, verification_rx) = mpsc::channel(MaxNumValidators::USIZE);
+    let (verification_tx, verification_rx) = mpsc::channel::<VerifiedAttestation>(MaxNumValidators::USIZE);
     let (rpc_to_beacon_command_tx, rpc_to_beacon_command_rx) = mpsc::channel(MaxNumValidators::USIZE);
 
     if let Err(err) =
@@ -39,7 +39,7 @@ fn main() {
             info!(target: "reth::cli", "Launching node");
 
             // Create router control channel
-            let (router_tx, router_rx) = mpsc::channel::<RouterMsg<UnverifiedBlock>>(MaxNumValidators::USIZE);
+            let (router_tx, router_rx) = mpsc::channel::<RouterMsg<Arc<UnverifiedBlock>>>(MaxNumValidators::USIZE);
             let router_tx_clone = router_tx.clone();
             let router_tx_clone_for_miner = router_tx.clone();
 

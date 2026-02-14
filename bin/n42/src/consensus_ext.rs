@@ -1,8 +1,8 @@
-use blst::min_pk::{AggregateSignature, Signature};
+use blst::min_pk::Signature;
 use blst::min_pk::PublicKey;
 use alloy_rpc_types::{BlockId, BlockNumberOrTag};
 use consensus_client::beacon::{Envelope, GetTotalActiveBalance, GetValidatorInfo, RpcToBeaconCommand};
-use n42_clique::{BlockVerifyResult, UnverifiedBlock};
+use n42_clique::{BlockVerifyResult, UnverifiedBlock, VerifiedAttestation};
 use reth_node_core::primitives::AlloyBlockHeader;
 use std::{collections::HashMap, sync::Arc};
 use reth_consensus::{ConsensusError, FullConsensus};
@@ -11,7 +11,7 @@ use alloy_primitives::{Bytes, Sealable, B256};
 use jsonrpsee::{core::{async_trait, RpcResult, SubscriptionResult}, proc_macros::rpc, types::{error::{INTERNAL_ERROR_CODE, INVALID_PARAMS_CODE}, ErrorObject, SubscriptionId}, PendingSubscriptionSink, SubscriptionMessage};
 use jsonrpsee::types::ErrorObjectOwned;
 use alloy_primitives::Address;
-use n42_primitives::{beacon_chain_spec, AttestationData, BLSPubkey, BeaconBlock, BeaconState, Snapshot, ValidatorInfo};
+use n42_primitives::{AttestationData, BLSPubkey, BeaconBlock, BeaconState, Snapshot, ValidatorInfo};
 use reth_provider::{BeaconProvider, BlockIdReader, BlockReader, HeaderProvider};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{trace, debug, error, info, warn};
@@ -157,8 +157,8 @@ pub trait ConsensusBeaconExtApi {
 pub struct ConsensusBeaconExt<Cons, Provider> {
     pub consensus: Cons,
     pub provider: Provider,
-    pub verification_tx: mpsc::Sender<BlockVerifyResult>,
-    pub router_tx: mpsc::Sender<RouterMsg<UnverifiedBlock>>,
+    pub verification_tx: mpsc::Sender<VerifiedAttestation>,
+    pub router_tx: mpsc::Sender<RouterMsg<Arc<UnverifiedBlock>>>,
     pub rpc_to_beacon_command_tx: mpsc::Sender<RpcToBeaconCommand>,
 }
 
@@ -184,13 +184,14 @@ where
             if let Ok(sink) = pending.accept().await {
                 let subscription_id = sink.subscription_id();
                 while let Some(event) = rx.recv().await {
-                    let data_to_be_verified = event.payload;
+                    let data_to_be_verified = event.payload; // Arc<UnverifiedBlock>
                     trace!(target: "reth::cli", ?pubkey, "start broadcasting, block number {:?}", data_to_be_verified.blockbody.header().number());
                     if sink.is_closed() {
                         debug!(target: "reth::cli", ?subscription_id, "subscribe_to_verification_request client disconnected");
                         break;
                     }
-                    let message = SubscriptionMessage::new("subscribeToVerificationRequest", subscription_id.clone(), &data_to_be_verified).unwrap();
+                    // Arc<T> implements Serialize when T: Serialize, so this is transparent
+                    let message = SubscriptionMessage::new("subscribeToVerificationRequest", subscription_id.clone(), &*data_to_be_verified).unwrap();
                     if let Err(e) = sink.send(message).await {
                         debug!(target: "reth::cli", ?subscription_id, ?e, "subscribe_to_verification_request Error sending to client");
                         break;
@@ -207,22 +208,39 @@ where
         ) -> RpcResult<()> {
         trace!(target: "reth::cli", ?pubkey, "received verification from rpc, slot={:?}", attestation_data.slot);
 
-        let v = BlockVerifyResult {pubkey: pubkey.clone(), signature: signature.clone(), attestation_data: attestation_data.clone(), block_hash};
-        let signature = Signature::from_bytes(&hex::decode(signature)
-.map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))?)
-.map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))?;
+        // Decode hex once, reuse raw bytes
+        let sig_bytes = hex::decode(&signature)
+            .map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))?;
+        let sig_for_verify = Signature::from_bytes(&sig_bytes)
+            .map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))?;
         let bytes: Vec<u8> = serde_json::to_vec(&attestation_data)
-.map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))?;
-        let pubkey_bytes = hex::decode(pubkey)
-.map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))?;
-        let pubkey = PublicKey::from_bytes(&pubkey_bytes)
-.map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))?;
-        let err = tokio::task::spawn_blocking(move || signature.verify(true, &bytes, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[], &pubkey, true)).await
-.map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))?;
+            .map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))?;
+        let pubkey_bytes_vec = hex::decode(&pubkey)
+            .map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))?;
+        let pk = PublicKey::from_bytes(&pubkey_bytes_vec)
+            .map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))?;
+
+        // BLS verify in blocking thread (single verification point for the entire pipeline)
+        let err = tokio::task::spawn_blocking(move || sig_for_verify.verify(true, &bytes, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[], &pk, true)).await
+            .map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))?;
         if err != blst::BLST_ERROR::BLST_SUCCESS {
             return Err(ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{err:?}"), None::<()>));
         }
-        self.verification_tx.try_send(v).map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))
+
+        // Reconstruct Signature from raw bytes (cheap, no hex decode) for VerifiedAttestation
+        let verified_sig = Signature::from_bytes(&sig_bytes)
+            .map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))?;
+        let pubkey_fixed: BLSPubkey = pubkey_bytes_vec.as_slice().try_into()
+            .map_err(|_| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, "pubkey must be exactly 48 bytes".to_string(), None::<()>))?;
+
+        let verified = VerifiedAttestation {
+            pubkey_bytes: pubkey_fixed,
+            signature: verified_sig,
+            attestation_data,
+            block_hash,
+        };
+        self.verification_tx.try_send(verified)
+            .map_err(|e| ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, format!("{e:?}"), None::<()>))
     }
 
     fn get_beacon_block_hash_by_eth1_hash(&self,

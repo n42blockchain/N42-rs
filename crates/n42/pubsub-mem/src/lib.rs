@@ -167,7 +167,7 @@ pub async fn subscribe<P>(
 where
     P: Clone + Send + Sync + 'static,
 {
-    let (tx, rx) = mpsc::channel(64);
+    let (tx, rx) = mpsc::channel(256);
     let (reply_tx, mut reply_rx) = mpsc::channel(1);
 
     router_tx

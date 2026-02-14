@@ -22,7 +22,6 @@ use alloy_primitives::{keccak256, Address, BlockHash, TxHash, B256, U128, U256};
 use alloy_rpc_types_engine::{CancunPayloadFields, ExecutionPayloadSidecar, ForkchoiceState};
 use eyre::OptionExt;
 use futures_util::{stream::Fuse, StreamExt};
-use itertools::Itertools;
 use reth_engine_primitives::BeaconConsensusEngineHandle;
 use reth_chainspec::EthereumHardforks;
 use reth_chainspec::EthChainSpec;
@@ -209,7 +208,9 @@ where
         let block_time = mode_interval.period().as_secs();
 
         let start_timestamp =
-            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
         let miner = Self {
             provider,
             payload_attributes_builder,
@@ -307,10 +308,11 @@ where
                 if let Ok(all_peers) = self.network.get_all_peers().await {
                     debug!(target: "consensus-client", peers_count=all_peers.len());
                     if !all_peers.is_empty() {
-                        status_counts = all_peers
-                            .iter()
-                            .map(|v| (v.status.total_difficulty, v.status.blockhash))
-                            .counts();
+                        let mut counts = HashMap::new();
+                        for peer in &all_peers {
+                            *counts.entry((peer.status.total_difficulty, peer.status.blockhash)).or_insert(0usize) += 1;
+                        }
+                        status_counts = counts;
                         break;
                     }
                 }
@@ -429,7 +431,7 @@ where
             }
             if let Some(block) = self.recent_blocks.get(&parent) {
                 parent = block.header().parent_hash();
-                parent_num = block.header().number() - 1;
+                parent_num = block.header().number().saturating_sub(1);
                 difficulty = block.header().difficulty();
                 debug!(target: "consensus-client", ?difficulty);
                 parents.push(block.clone());
@@ -438,7 +440,7 @@ where
             match self.fetch_block(parent.into()).await {
                 Ok(parent_block) => {
                     parent = parent_block.header().parent_hash();
-                    parent_num = parent_block.header().number() - 1;
+                    parent_num = parent_block.header().number().saturating_sub(1);
                     difficulty = parent_block.header().difficulty();
                     debug!(target: "consensus-client", ?difficulty);
                     let sealed_block = parent_block.seal_slow();
@@ -454,8 +456,8 @@ where
         let mut larger_td = max_td < U256::from(new_block.td);
         debug!(target: "consensus-client", is_fork, ?max_td, new_block_td=?U256::from(new_block.td));
 
-        if let Some(&mut v) = self.recent_num_to_td.get(&new_block.block.number) {
-            if v >= U256::from(new_block.td) {
+        if let Some(v) = self.recent_num_to_td.get(&new_block.block.number) {
+            if *v >= U256::from(new_block.td) {
                 debug!(target: "consensus-client", number=new_block.block.number, td=?U256::from(new_block.td), old_td=?v, "skip new block");
                 self.metrics.num_skipped_new_block.increment(1);
                 larger_td = false;
@@ -546,10 +548,11 @@ where
             .unwrap_or(Some(0))
             .unwrap_or(0);
         if safe_block_number == 0 {
-            safe_block_number = self
-                .provider.database_provider_ro().unwrap().last_safe_block_number()
-            .unwrap_or(Some(0))
-            .unwrap_or(0);
+            if let Ok(db_provider) = self.provider.database_provider_ro() {
+                safe_block_number = db_provider.last_safe_block_number()
+                    .unwrap_or(Some(0))
+                    .unwrap_or(0);
+            }
         }
 
         let safe_block_header = self
@@ -805,7 +808,7 @@ where
         self.recent_blocks.insert(block.hash_slow(), block.clone());
 
         let wiggle = self.consensus.wiggle(
-            block.header().number() - 1,
+            block.header().number().saturating_sub(1),
             block.header().parent_hash(),
             block.header().difficulty(),
         );
@@ -868,7 +871,7 @@ where
             .duration_since(UNIX_EPOCH)?;
         let time_for_tx_gathering = 1;
         let time_for_attestatation_gathering = block_time - time_for_tx_gathering;
-        let expected_next_timestamp = Duration::from_secs(header.header().timestamp() + time_for_tx_gathering);
+        let expected_next_timestamp = Duration::from_secs(header.header().timestamp().saturating_add(time_for_tx_gathering));
         if expected_next_timestamp > now {
             self.interval_prepare_block = interval_at(
                 Instant::now() + (expected_next_timestamp - now),
@@ -1075,7 +1078,7 @@ where
         let best_block_number = self.provider.best_block_number().unwrap_or(0);
         info!(target: "consensus-client", ?finalized_block_number, ?best_block_number, "initial_sync_to_hash");
 
-        let num_blocks = best_block_number - finalized_block_number;
+        let num_blocks = best_block_number.saturating_sub(finalized_block_number);
         let start_block_number = if num_blocks > MAX_NUM_LOCAL_BLOCKS_TO_CHECK {
             warn!(target: "consensus-client", ?finalized_block_number, ?best_block_number, MAX_NUM_LOCAL_BLOCKS_TO_CHECK=?MAX_NUM_LOCAL_BLOCKS_TO_CHECK,
                 "some of the blocks from finalized block to best block are not checked to see they are same as the blocks on the chain",
@@ -1095,7 +1098,7 @@ where
             let header_hash_from_p2p = header_from_p2p.hash_slow();
             if hash != header_hash_from_p2p {
                 warn!(target: "consensus-client", number, ?hash, ?header_hash_from_p2p, "found first different block");
-                warn!(target: "consensus-client", "please execute 'n42 stage unwind to-block {}', then run n42 node again", number - 1);
+                warn!(target: "consensus-client", "please execute 'n42 stage unwind to-block {}', then run n42 node again", number.saturating_sub(1));
                 exit_by_sigint();
                 sleep(Duration::from_secs(u64::MAX)).await;
             }

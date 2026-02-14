@@ -58,12 +58,24 @@ where
             }
         );
 
+        let deposits: Vec<Deposit> = execution_requests.deposits.iter().map(|d| {
+            Deposit {
+                data: DepositData {
+                    pubkey: d.pubkey,
+                    withdrawal_credentials: d.withdrawal_credentials,
+                    signature: d.signature,
+                    amount: d.amount,
+                },
+                ..Default::default()
+            }
+        }).collect();
+
         let mut beacon_block = BeaconBlock {
             slot: old_beacon_state.slot + 1,
             parent_hash,
             eth1_block_hash: eth1_sealed_block.hash_slow(),
             body: BeaconBlockBody {
-                deposits: Default::default(),
+                deposits,
                 attestations: attestations.clone(),
                 voluntary_exits: Default::default(),
                 execution_requests,

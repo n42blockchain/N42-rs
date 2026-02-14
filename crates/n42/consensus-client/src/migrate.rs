@@ -101,25 +101,25 @@ where
         self.provider.save_beacon_block_hash_by_eth1_hash(&self.provider.chain_spec().genesis_hash(), self.provider.chain_spec().genesis_hash())?;
         self.provider.save_beacon_state_by_hash(&self.provider.chain_spec().genesis_hash(), BeaconState::new())?;
 
-        let db: Option<Db> = if self.migrate_from_db_path.is_some() {
-            Some(sled::open(&self.migrate_from_db_path.clone().unwrap())?)
+        let db: Option<Db> = if let Some(ref path) = self.migrate_from_db_path {
+            Some(sled::open(path)?)
         } else {
             None
         };
-        let rpc_provider = if self.migrate_from_rpc.is_some() {
-            let rpc_url = self.migrate_from_rpc.clone().unwrap().parse()?;
+        let rpc_provider = if let Some(ref rpc) = self.migrate_from_rpc {
+            let rpc_url = rpc.parse()?;
             Some(ProviderBuilder::new().on_http(rpc_url))
         } else {
             None
         };
 
+        let best_block = self.provider.best_block_number()?;
         let header = self
             .provider
-            .sealed_header(self.provider.best_block_number().unwrap())
-            .unwrap()
-            .unwrap();
+            .sealed_header(best_block)?
+            .ok_or_else(|| eyre::eyre!("sealed_header not found for best block {best_block}"))?;
         let mut timestamp = header.timestamp();
-        let mut block_number = self.provider.best_block_number().unwrap();
+        let mut block_number = best_block;
         let mut start = std::time::Instant::now();
         loop {
             if block_number % 100 == 0 {
@@ -129,31 +129,25 @@ where
             }
             block_number += 1;
             debug!(target: "consensus-client", ?block_number, "before reading from database");
-            let mut block = if db.is_some() {
-                let value = db.as_ref().unwrap().get(block_number.to_be_bytes())?;
-                if value.is_some() {
-                    Some(serde_json::from_slice(&value.unwrap())?)
-                } else {
-                    None
+            let mut block = if let Some(ref db) = db {
+                match db.get(block_number.to_be_bytes())? {
+                    Some(value) => Some(serde_json::from_slice(&value)?),
+                    None => None,
                 }
             } else {
                 None
             };
             let mut attestations = Vec::new();
-            if rpc_provider.is_some() {
+            if let Some(ref rpc) = rpc_provider {
                 while block.is_none() {
-                        match rpc_provider
-                            .as_ref()
-                            .unwrap()
+                        match rpc
                             .get_block(block_number.into()).full()
                             .await?
                         {
                             Some(v) => {
                                 block = Some(v);
                                 let params = serde_json::value::to_raw_value(&(BlockNumberOrTag::Number(block_number),))?;
-                                match rpc_provider
-                                    .as_ref()
-                                    .unwrap()
+                                match rpc
                                     .raw_request_dyn("consensusBeaconExt_get_beacon_block_by_number".into(), &params).await {
                                     Ok(raw_json) => {
                                         let full_json: serde_json::Value = serde_json::from_str(raw_json.get())?;
@@ -186,11 +180,11 @@ where
                 timestamp += 8;
             }
 
+            let current_best = self.provider.best_block_number()?;
             let header = self
                 .provider
-                .sealed_header(self.provider.best_block_number().unwrap())
-                .unwrap()
-                .unwrap();
+                .sealed_header(current_best)?
+                .ok_or_else(|| eyre::eyre!("sealed_header not found for block {current_best}"))?;
 
             let (withdrawals, beacon_state_after_withdrawal) = self.gen_withdrawals(header.hash())?;
 
@@ -198,16 +192,20 @@ where
             let transactions = block.transactions.into_transactions();
             let txs = transactions
                 .into_iter()
-                .map(|rpc_tx: RpcTransaction| {
+                .map(|rpc_tx: RpcTransaction| -> eyre::Result<_> {
                     debug!(target: "consensus-client", ?rpc_tx);
 
-                    let tx_signed: TransactionSigned = rpc_tx.try_into().unwrap();
-                    let pooled_transaction: PooledTransaction = tx_signed.try_into().unwrap();
+                    let tx_signed: TransactionSigned = rpc_tx.try_into()
+                        .map_err(|e| eyre::eyre!("Failed to convert RPC tx to TransactionSigned: {e:?}"))?;
+                    let pooled_transaction: PooledTransaction = tx_signed.try_into()
+                        .map_err(|e| eyre::eyre!("Failed to convert to PooledTransaction: {e:?}"))?;
 
-                    let recovered = pooled_transaction.try_into_recovered().unwrap();
-                    Pool::Transaction::from_pooled(recovered.try_into().unwrap())
+                    let recovered = pooled_transaction.try_into_recovered()
+                        .map_err(|e| eyre::eyre!("Failed to recover transaction: {e:?}"))?;
+                    Ok(Pool::Transaction::from_pooled(recovered.try_into()
+                        .map_err(|e| eyre::eyre!("Failed to convert recovered tx: {e:?}"))?))
                 })
-                .collect::<Vec<_>>();
+                .collect::<eyre::Result<Vec<_>>>()?;
 
             let num_input_txs = txs.len();
 

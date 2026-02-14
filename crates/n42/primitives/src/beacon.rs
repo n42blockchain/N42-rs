@@ -500,8 +500,11 @@ impl BeaconState {
         ) -> eyre::Result<()> {
         let mut new_total_active_balance: u64 = 0;
 
+        if self.balances_store.len() < self.validators_store.len() {
+            return Err(eyre::eyre!("balances_store length ({}) < validators_store length ({})", self.balances_store.len(), self.validators_store.len()));
+        }
         self.validators_store.update_indices(&(0..self.validators_store.len()).collect(), |index, validator| {
-            let balance = self.balances_store.get(index).unwrap().min(&spec.max_effective_balance);
+            let balance = self.balances_store.get(index).expect("bounds checked above").min(&spec.max_effective_balance);
             let new_effective_balance = round_to_nearest(*balance, spec.effective_balance_increment);
             if new_effective_balance != validator.effective_balance {
                 validator.effective_balance = new_effective_balance;

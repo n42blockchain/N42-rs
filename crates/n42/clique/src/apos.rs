@@ -238,10 +238,18 @@ where
     fn set_signer(&self, eth_signer: Option<LocalSigner<SigningKey>>) {
         let eth_signer_address = eth_signer.clone().map(|signer| signer.address());
         info!(target: "consensus::apos", "set_signer, new signer={:?}", eth_signer_address);
-        let mut signer_guard = self.signer.write().unwrap();
-        let mut eth_signer_guard = self.eth_signer.write().unwrap();
-        *signer_guard = eth_signer_address;
-        *eth_signer_guard = eth_signer;
+        match (self.signer.write(), self.eth_signer.write()) {
+            (Ok(mut signer_guard), Ok(mut eth_signer_guard)) => {
+                *signer_guard = eth_signer_address;
+                *eth_signer_guard = eth_signer;
+            }
+            (Err(e), _) => {
+                error!(target: "consensus::apos", "signer lock poisoned: {}", e);
+            }
+            (_, Err(e)) => {
+                error!(target: "consensus::apos", "eth_signer lock poisoned: {}", e);
+            }
+        }
     }
 
     /// verifySeal checks whether the signature contained in the header satisfies the
@@ -323,7 +331,13 @@ where
             .unwrap_or(Some(0))
             .unwrap_or(0);
         info!(target: "consensus::apos", ?finalized_block_number, "init_recent_tds");
-        let best_block_number = self.provider.best_block_number().unwrap();
+        let best_block_number = match self.provider.best_block_number() {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(target: "consensus::apos", ?e, "failed to get best_block_number in init_recent_tds");
+                return;
+            }
+        };
         info!(target: "consensus::apos", ?best_block_number, "init_recent_tds");
         let num_blocks = best_block_number - finalized_block_number + 1;
         let start_block_number = if num_blocks > INMEMORY_TDS.into() {
@@ -366,27 +380,38 @@ where
         self.recent_tds_inited.store(true, Ordering::Relaxed);
     }
 
-    fn save_total_difficulty<H>(&self, header: &H)
+    fn save_total_difficulty<H>(&self, header: &H) -> Result<(), ConsensusError>
     where
         H: BlockHeaderTrait,
     {
         self.init_recent_tds();
 
         let total_difficulty = {
-            let mut recent_tds = self.recent_tds.write().unwrap();
-            let parent_td = recent_tds.get(&header.parent_hash()).unwrap_or_else(|| {
-                panic!(
-                    "td not found for parent hash {:?}, current header={:?}",
-                    header.parent_hash(),
-                    header
-                )
-            });
+            let mut recent_tds = self.recent_tds.write().map_err(|e| {
+                ConsensusError::AposErrorDetail {
+                    detail: format!("lock poisoned: {}", e),
+                }
+            })?;
+            let parent_td = recent_tds.get(&header.parent_hash()).ok_or_else(|| {
+                ConsensusError::AposErrorDetail {
+                    detail: format!(
+                        "td not found for parent hash {:?}, current header number={}",
+                        header.parent_hash(),
+                        header.number()
+                    ),
+                }
+            })?;
             *parent_td + header.difficulty()
         };
 
-        let mut recent_tds = self.recent_tds.write().unwrap();
+        let mut recent_tds = self.recent_tds.write().map_err(|e| {
+            ConsensusError::AposErrorDetail {
+                detail: format!("lock poisoned: {}", e),
+            }
+        })?;
         recent_tds.insert(header.hash_slow(), total_difficulty);
         debug!(target: "consensus::apos", "saved total_difficulty {}", total_difficulty);
+        Ok(())
     }
 
     /// snapshot retrieves the authorization snapshot at a given point in time.
@@ -402,8 +427,16 @@ where
         let mut number = number;
         let mut parents = parents;
 
-        let mut recents = self.recents.write().unwrap(); //
-        let mut recent_headers = self.recent_headers.write().unwrap();
+        let mut recents = self.recents.write().map_err(|e| {
+            ConsensusError::AposErrorDetail {
+                detail: format!("lock poisoned: {}", e),
+            }
+        })?;
+        let mut recent_headers = self.recent_headers.write().map_err(|e| {
+            ConsensusError::AposErrorDetail {
+                detail: format!("lock poisoned: {}", e),
+            }
+        })?;
 
         while snap.is_none() {
             //Attempt to retrieve a snapshot from memory
@@ -432,7 +465,7 @@ where
                         || self
                             .provider
                             .header_by_number(number - 1)
-                            .unwrap()
+                            .map_err(|_| ConsensusError::UnknownBlock)?
                             .is_none()))
             {
                 if let Ok(Some(checkpoint)) = self.provider.header_by_number(number) {
@@ -471,8 +504,10 @@ where
             }
 
             // No snapshot for this header, gather the header and move backward
-            let header = if parents.is_some() && !parents.as_ref().unwrap().is_empty() {
-                let header = parents.as_mut().unwrap().pop().unwrap();
+            let from_parent = parents
+                .as_mut()
+                .and_then(|p| if p.is_empty() { None } else { p.pop() });
+            let header = if let Some(header) = from_parent {
                 if header.hash_slow() != hash || header.number() != number {
                     error!(target: "consensus::apos", "parent hash check failed: {:?}, {:?}, {:?}, {:?}", header.hash_slow(), hash, header.number(), number);
                     return Err(ConsensusError::UnknownBlock);
@@ -504,7 +539,9 @@ where
         }
 
         let snap = snap
-            .unwrap()
+            .ok_or(ConsensusError::AposErrorDetail {
+                detail: "snapshot not found".to_string(),
+            })?
             .apply::<_, Provider::Header>(headers, |header| {
                 let signer = recover_address_generic(&header)?;
                 Ok(signer)
@@ -574,7 +611,9 @@ where
         // Don't waste time checking blocks from the future
         let present_timestamp = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
+            .map_err(|e| ConsensusError::AposErrorDetail {
+                detail: format!("system time error: {}", e),
+            })?
             .as_secs();
 
         if header.timestamp()
@@ -593,12 +632,14 @@ where
         }
 
         // Nonces must be 0x00..0 or 0xff..f, zeroes enforced on checkpoints
-        if header.nonce().unwrap() != NONCE_AUTH_VOTE && header.nonce().unwrap() != NONCE_DROP_VOTE
-        {
+        let nonce = header.nonce().ok_or(ConsensusError::AposErrorDetail {
+            detail: "header nonce is missing".to_string(),
+        })?;
+        if nonce != NONCE_AUTH_VOTE && nonce != NONCE_DROP_VOTE {
             return Err(ConsensusError::InvalidVote);
         }
 
-        if checkpoint && header.nonce().unwrap() != NONCE_DROP_VOTE {
+        if checkpoint && nonce != NONCE_DROP_VOTE {
             return Err(ConsensusError::InvalidCheckpointVote);
         }
 
@@ -669,10 +710,14 @@ where
             .map_err(|e| ConsensusError::AposErrorDetail {
                 detail: e.to_string(),
             })?;
-        let mut recent_headers = self.recent_headers.write().unwrap();
+        let mut recent_headers = self.recent_headers.write().map_err(|e| {
+            ConsensusError::AposErrorDetail {
+                detail: format!("lock poisoned: {}", e),
+            }
+        })?;
         recent_headers.insert(header_hash, header.clone());
 
-        self.save_total_difficulty(header);
+        self.save_total_difficulty(header)?;
 
         Ok(())
     }
@@ -754,7 +799,11 @@ where
 
         if header.number % self.config.epoch != 0 {
             //Collect all proposals to be voted on
-            let proposals_lock = self.proposals.read().unwrap();
+            let proposals_lock = self.proposals.read().map_err(|e| {
+                ConsensusError::AposErrorDetail {
+                    detail: format!("lock poisoned: {}", e),
+                }
+            })?;
             let addresses: Vec<Address> = proposals_lock
                 .iter()
                 //.filter(|(&address, &authorize)| snap.valid_vote(address, authorize))
@@ -763,12 +812,14 @@ where
 
             //If there are proposals to be voted on, proceed with the vote
             if !addresses.is_empty() {
-                header.beneficiary = *addresses.choose(&mut rand::rng()).unwrap();
-                if let Some(&authorize) = proposals_lock.get(&header.beneficiary) {
-                    if authorize {
-                        header.nonce = NONCE_AUTH_VOTE.into();
-                    } else {
-                        header.nonce = NONCE_DROP_VOTE.into();
+                if let Some(&addr) = addresses.choose(&mut rand::rng()) {
+                    header.beneficiary = addr;
+                    if let Some(&authorize) = proposals_lock.get(&header.beneficiary) {
+                        if authorize {
+                            header.nonce = NONCE_AUTH_VOTE.into();
+                        } else {
+                            header.nonce = NONCE_DROP_VOTE.into();
+                        }
                     }
                 }
             }
@@ -776,7 +827,11 @@ where
 
         debug!(target: "consensus::apos", ?snap, "snap");
         //Copy the signer to prevent data competition
-        let signer_guard = self.signer.read().unwrap();
+        let signer_guard = self.signer.read().map_err(|e| {
+            ConsensusError::AposErrorDetail {
+                detail: format!("lock poisoned: {}", e),
+            }
+        })?;
         if let Some(signer) = *signer_guard {
             //Set the correct difficulty level
             header.difficulty = calc_difficulty(&snap, &signer);
@@ -825,7 +880,9 @@ where
         let signer = self
             .signer
             .read()
-            .unwrap()
+            .map_err(|e| ConsensusError::AposErrorDetail {
+                detail: format!("lock poisoned: {}", e),
+            })?
             .ok_or(ConsensusError::NoSignerSet)?;
         debug!(target: "consensus::apos", "seal() signer={:?}", signer);
         // Bail out if we're unauthorized to sign a block
@@ -852,7 +909,11 @@ where
         //
         // }
 
-        let eth_signer_guard = self.eth_signer.read().unwrap();
+        let eth_signer_guard = self.eth_signer.read().map_err(|e| {
+            ConsensusError::AposErrorDetail {
+                detail: format!("lock poisoned: {}", e),
+            }
+        })?;
         let eth_signer = eth_signer_guard
             .as_ref()
             .ok_or(ConsensusError::NoSignerSet)?;
@@ -865,13 +926,23 @@ where
         let mut extra_data_mut = BytesMut::from(&header.extra_data[..]);
         extra_data_mut[header.extra_data.len().saturating_sub(SIGNATURE_LENGTH)..]
             .copy_from_slice(&sighash.as_bytes());
-        *extra_data_mut.last_mut().unwrap() -= 27;
+        if let Some(last) = extra_data_mut.last_mut() {
+            *last -= 27;
+        } else {
+            return Err(ConsensusError::AposErrorDetail {
+                detail: "extra_data is empty after signature copy".to_string(),
+            });
+        }
         header.extra_data = Bytes::from(extra_data_mut.freeze());
 
-        let mut recent_headers = self.recent_headers.write().unwrap();
+        let mut recent_headers = self.recent_headers.write().map_err(|e| {
+            ConsensusError::AposErrorDetail {
+                detail: format!("lock poisoned: {}", e),
+            }
+        })?;
         recent_headers.insert(header.hash_slow(), header.clone());
 
-        self.save_total_difficulty(header);
+        self.save_total_difficulty(header)?;
 
         Ok(())
     }
@@ -917,21 +988,33 @@ where
 
     fn propose(&self, address: Address, auth: bool) -> Result<(), ConsensusError> {
         info!(target: "consensus::apos", "propose(), address={}, auth={}", address, auth);
-        let mut proposals_guard = self.proposals.write().unwrap();
+        let mut proposals_guard = self.proposals.write().map_err(|e| {
+            ConsensusError::AposErrorDetail {
+                detail: format!("lock poisoned: {}", e),
+            }
+        })?;
         proposals_guard.insert(address, auth);
         Ok(())
     }
 
     fn discard(&self, address: Address) -> Result<(), ConsensusError> {
         info!(target: "consensus::apos", "discard(), address={}", address);
-        let mut proposals_guard = self.proposals.write().unwrap();
+        let mut proposals_guard = self.proposals.write().map_err(|e| {
+            ConsensusError::AposErrorDetail {
+                detail: format!("lock poisoned: {}", e),
+            }
+        })?;
         proposals_guard.remove(&address);
         Ok(())
     }
 
     fn proposals(&self) -> Result<HashMap<Address, bool>, ConsensusError> {
         info!(target: "consensus::apos", "proposals()");
-        let proposals_guard = self.proposals.read().unwrap();
+        let proposals_guard = self.proposals.read().map_err(|e| {
+            ConsensusError::AposErrorDetail {
+                detail: format!("lock poisoned: {}", e),
+            }
+        })?;
         Ok(proposals_guard.clone())
     }
 
@@ -940,10 +1023,17 @@ where
 
         // First try the in-memory cache
         {
-            let mut recent_tds = self.recent_tds.write().unwrap();
-            if let Some(td) = recent_tds.get(&hash) {
-                debug!(target: "consensus::apos", ?hash, total_difficulty=?td, "get total_difficulty from cache");
-                return *td;
+            match self.recent_tds.write() {
+                Ok(mut recent_tds) => {
+                    if let Some(td) = recent_tds.get(&hash) {
+                        debug!(target: "consensus::apos", ?hash, total_difficulty=?td, "get total_difficulty from cache");
+                        return *td;
+                    }
+                }
+                Err(e) => {
+                    warn!(target: "consensus::apos", "recent_tds lock poisoned: {}", e);
+                    return U256::ZERO;
+                }
             }
         }
 
@@ -951,16 +1041,25 @@ where
         // Try to calculate from parent TD in the in-memory cache.
         if let Ok(Some(header)) = self.provider.header(hash) {
             let parent_hash = header.parent_hash();
-            let parent_td = {
-                let mut recent_tds = self.recent_tds.write().unwrap();
-                recent_tds.get(&parent_hash).copied()
+            let parent_td = match self.recent_tds.write() {
+                Ok(mut recent_tds) => recent_tds.get(&parent_hash).copied(),
+                Err(e) => {
+                    warn!(target: "consensus::apos", "recent_tds lock poisoned: {}", e);
+                    return U256::ZERO;
+                }
             };
 
             if let Some(parent_td) = parent_td {
                 let td = parent_td + header.difficulty();
                 debug!(target: "consensus::apos", ?hash, total_difficulty=?td, "calculated total_difficulty from parent");
-                let mut recent_tds = self.recent_tds.write().unwrap();
-                recent_tds.insert(hash, td);
+                match self.recent_tds.write() {
+                    Ok(mut recent_tds) => {
+                        recent_tds.insert(hash, td);
+                    }
+                    Err(e) => {
+                        warn!(target: "consensus::apos", "recent_tds lock poisoned: {}", e);
+                    }
+                }
                 return td;
             }
         }
@@ -991,7 +1090,11 @@ where
         block_hash: BlockHash,
         cached_reads: CachedReads,
     ) -> Result<(), ConsensusError> {
-        let mut recent_cached_reads = self.recent_cached_reads.write().unwrap();
+        let mut recent_cached_reads = self.recent_cached_reads.write().map_err(|e| {
+            ConsensusError::AposErrorDetail {
+                detail: format!("lock poisoned: {}", e),
+            }
+        })?;
         recent_cached_reads.insert(block_hash, cached_reads);
         Ok(())
     }
@@ -1000,7 +1103,11 @@ where
         &self,
         block_hash: BlockHash,
     ) -> Result<Option<CachedReads>, ConsensusError> {
-        let mut recent_cached_reads = self.recent_cached_reads.write().unwrap();
+        let mut recent_cached_reads = self.recent_cached_reads.write().map_err(|e| {
+            ConsensusError::AposErrorDetail {
+                detail: format!("lock poisoned: {}", e),
+            }
+        })?;
         Ok(recent_cached_reads.get(&block_hash).cloned())
     }
 }
@@ -1033,7 +1140,9 @@ where
     }
 
     fn get_signer_address(&self) -> n42_consensus_traits::AposResult<Option<Address>> {
-        let signer_guard = self.signer.read().unwrap();
+        let signer_guard = self.signer.read().map_err(|e| {
+            n42_consensus_traits::AposError::Other(format!("signer lock poisoned: {}", e))
+        })?;
         Ok(*signer_guard)
     }
 }

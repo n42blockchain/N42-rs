@@ -1,10 +1,7 @@
 // Copyright (c) 2017-2025 N42 Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::collections::HashSet;
-use alloy_primitives::{BlockHash, TxHash, B256};
-use derive_more::Error;
-use reth_errors::BlockExecutionError;
+use alloy_primitives::{BlockHash, B256};
 use reth_eth_wire_types::NewBlock;
 use reth_tokio_util::EventStream;
 use reth_consensus::ConsensusError;

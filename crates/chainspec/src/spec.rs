@@ -164,10 +164,7 @@ fn make_chain_spec(
     };
     spec.genesis.config.dao_fork_support = true;
     let state_root = state_root_ref_unhashed(&spec.genesis.alloc);
-    println!(
-        "Computed state_root from genesis alloc: state_root={}",
-        state_root
-    );
+    tracing::info!(target: "chainspec", %state_root, "Computed state_root from genesis alloc");
     spec.into()
 }
 

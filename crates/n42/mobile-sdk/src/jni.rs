@@ -221,7 +221,7 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_runClient(
                 env.call_method(
                     &global_cf,
                     "complete",
-                    "(Ljava/lang/Object;)Z",
+                    "(Ljava/lang/String;)V",
                     &[(&JObject::null()).into()],
                 )
                 .unwrap();
@@ -232,7 +232,7 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_runClient(
                 let ex_class = env.find_class("java/lang/RuntimeException")
 .unwrap();
                 let ex_obj = env
-                    .new_object(ex_class, "(Ljava/lang/Object;)Z",
+                    .new_object(ex_class, "(Ljava/lang/String;)V",
 &[(&jmsg).into()])
                     .unwrap();
 
@@ -245,15 +245,6 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_runClient(
                 .unwrap();
             }
         };
-
-        // Call CompletableFuture.complete(null)
-        env.call_method(
-            &global_cf,
-            "complete",
-            "(Ljava/lang/Object;)Z",
-            &[(&JObject::null()).into()],
-        )
-        .unwrap();
     });
 
     cf_obj.into_raw() // return CompletableFuture immediately
@@ -308,7 +299,7 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_genBlockVerifyResult(
                         let ex_class = env.find_class("java/lang/RuntimeException")
             .unwrap();
                         let ex_obj = env
-                            .new_object(ex_class, "(Ljava/lang/Object;)Z",
+                            .new_object(ex_class, "(Ljava/lang/String;)V",
             &[(&jmsg).into()])
                             .unwrap();
 
@@ -330,7 +321,7 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_genBlockVerifyResult(
                 env.call_method(
                     &global_cf,
                     "complete",
-                    "(Ljava/lang/Object;)Z",
+                    "(Ljava/lang/String;)V",
                     &[JValue::Object(&java_string.into()
                         )],
                 )
@@ -342,7 +333,7 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_genBlockVerifyResult(
                 let ex_class = env.find_class("java/lang/RuntimeException")
 .unwrap();
                 let ex_obj = env
-                    .new_object(ex_class, "(Ljava/lang/Object;)Z",
+                    .new_object(ex_class, "(Ljava/lang/String;)V",
 &[(&jmsg).into()])
                     .unwrap();
 
@@ -355,15 +346,6 @@ pub extern "C" fn Java_com_mobileSdk_NativeBindings_genBlockVerifyResult(
                 .unwrap();
             }
         };
-
-        // Call CompletableFuture.complete(null)
-        env.call_method(
-            &global_cf,
-            "complete",
-            "(Ljava/lang/Object;)Z",
-            &[(&JObject::null()).into()],
-        )
-        .unwrap();
     });
 
     cf_obj.into_raw() // return CompletableFuture immediately

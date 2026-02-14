@@ -59,7 +59,13 @@ pub fn create_deposit_unsigned_tx(
         withdrawal_credentials: creds,
         //signature: SignatureBytes::empty(),
         signature: Default::default(),
-        amount: (deposit_value_in_wei / U256::exp10(9)).as_u64(),
+        amount: {
+            let gwei = deposit_value_in_wei / U256::exp10(9);
+            if gwei > U256::from(u64::MAX) {
+                return Err(eyre::eyre!("deposit value too large to fit in u64 Gwei"));
+            }
+            gwei.as_u64()
+        },
     };
     //let spec = ChainSpec::n42();
     deposit_data.signature = deposit_data.create_signature(&sk,
@@ -138,6 +144,9 @@ pub fn create_exit_unsigned_tx(
         .unwrap_or(&validator_public_key);
     let pubkey_bytes = hex::decode(pubkey_hex)
         .map_err(|e| eyre::eyre!("invalid validator_public_key: {}", e))?;
+    if pubkey_bytes.len() != 48 {
+        return Err(eyre::eyre!("validator_public_key must be 48 bytes, got {} bytes", pubkey_bytes.len()));
+    }
 
     let mut data = Vec::with_capacity(56);
     data.extend_from_slice(&pubkey_bytes);

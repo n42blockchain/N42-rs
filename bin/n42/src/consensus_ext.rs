@@ -91,7 +91,8 @@ where
     fn proposals(
         &self,
         ) -> RpcResult<HashMap<Address, bool>> {
-        Ok(self.consensus.proposals().unwrap_or_default())
+        self.consensus.proposals()
+            .map_err(|err| ErrorObject::owned(INTERNAL_ERROR_CODE, err.to_string(), Option::<()>::None))
     }
 }
 

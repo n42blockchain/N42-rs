@@ -37,9 +37,12 @@ pub async fn run_client(
     validator_private_key: &str,
     ) -> eyre::Result<()> {
     let validator_private_key = validator_private_key.strip_prefix("0x").unwrap_or(validator_private_key);
-    let validator_private_key_vec = Vec::from_hex(&validator_private_key)?;
+    let mut validator_private_key_vec = Vec::from_hex(&validator_private_key)?;
     let sk = SecretKey::from_bytes(&validator_private_key_vec)
-        .map_err(|e| eyre::eyre!("SecretKey error: {e:?}"))?;
+        .map_err(|e| eyre::eyre!("SecretKey error: {e:?}"));
+    // Zero out private key bytes immediately after use
+    validator_private_key_vec.fill(0);
+    let sk = sk?;
     let pk = sk.sk_to_pk();
 
     let message_timeout_secs = 300;
@@ -88,9 +91,12 @@ pub async fn gen_block_verify_result(
     validator_private_key: &str,
     ) -> eyre::Result<BlockVerifyResult> {
     let validator_private_key = validator_private_key.strip_prefix("0x").unwrap_or(validator_private_key);
-    let validator_private_key_vec = Vec::from_hex(&validator_private_key)?;
+    let mut validator_private_key_vec = Vec::from_hex(&validator_private_key)?;
     let sk = SecretKey::from_bytes(&validator_private_key_vec)
-        .map_err(|e| eyre::eyre!("SecretKey error: {e:?}"))?;
+        .map_err(|e| eyre::eyre!("SecretKey error: {e:?}"));
+    // Zero out private key bytes immediately after use
+    validator_private_key_vec.fill(0);
+    let sk = sk?;
     gen_block_verify_result_inner(block, &sk).await
 }
 

@@ -7,8 +7,12 @@ pub fn generate_bls12_381_keypair() -> eyre::Result<(String, String)> {
     rng.fill_bytes(&mut ikm);
 
     let sk = SecretKey::key_gen(&ikm, &[])
-        .map_err(|e| eyre::eyre!("SecretKey::key_gen() error {e:?}"))?;
+        .map_err(|e| eyre::eyre!("SecretKey::key_gen() error {e:?}"));
 
+    // Zero out IKM immediately after use
+    ikm.fill(0);
+
+    let sk = sk?;
     let pk = sk.sk_to_pk();
 
     let privkey_hex = hex::encode(sk.to_bytes());

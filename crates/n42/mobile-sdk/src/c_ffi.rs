@@ -5,11 +5,17 @@ use std::ptr;
 use ethers::types::{TransactionRequest, U256};
 use eyre::Result;
 use n42_clique::UnverifiedBlock;
+use once_cell::sync::Lazy;
 use serde_json;
+use tokio::runtime::Runtime;
 
 use crate::blst_utils::generate_bls12_381_keypair;
 use crate::gen_block_verify_result;
 use crate::{deposit_exit::{create_deposit_unsigned_tx, create_get_exit_fee_unsigned_tx, create_exit_unsigned_tx}, run_client};
+
+static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
+    Runtime::new().expect("Failed to create Tokio runtime")
+});
 
 // ---------------- Helpers ----------------
 fn cstr_to_string(c: *const c_char) -> Result<String, String> {
@@ -21,7 +27,9 @@ format!("utf8 error: {}", e)) }
 }
 
 fn make_c_string(s: String) -> *mut c_char {
-    CString::new(s).unwrap().into_raw()
+    // Replace interior NUL bytes to prevent panic
+    let sanitized = s.replace('\0', "");
+    CString::new(sanitized).unwrap_or_default().into_raw()
 }
 
 #[no_mangle]
@@ -49,9 +57,7 @@ set_error(e); return -1; } };
 => { set_error(e); return -1; } };
 
     // run the async function blocking
-    let res = tokio::runtime::Runtime::new()
-        .unwrap()
-        .block_on(run_client(&ws, &pk));
+    let res = RUNTIME.block_on(run_client(&ws, &pk));
 
     match res {
         Ok(()) => 0, // success
@@ -85,9 +91,7 @@ set_error(e); return ptr::null_mut(); } };
 => { set_error(e); return ptr::null_mut(); } };
 
     // run the async function blocking
-    let res = tokio::runtime::Runtime::new()
-        .unwrap()
-        .block_on(gen_block_verify_result(block, &pk));
+    let res = RUNTIME.block_on(gen_block_verify_result(block, &pk));
 
     match res {
         Ok(block_verify_result) => {
@@ -222,8 +226,10 @@ Err(e) => { set_error(e); return ptr::null_mut(); } };
     } else {
         match cstr_to_string(fee_in_wei_or_empty) {
             Ok(s) if s.is_empty() => None,
-            Ok(s) => Some(s.parse::<U256>().unwrap_or_else(|_| {
-set_error("invalid fee".into()); U256::zero() })),
+            Ok(s) => match s.parse::<U256>() {
+                Ok(v) => Some(v),
+                Err(_) => { set_error("invalid fee".into()); return ptr::null_mut(); }
+            },
             Err(e) => { set_error(e); return ptr::null_mut(); }
         }
     };

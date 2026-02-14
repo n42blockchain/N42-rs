@@ -160,6 +160,8 @@ const WAIT_FOR_DOWNLOAD_INTERVAL_MS: u64 = 100;
 const SYNC_DOWNLOAD_BLOCKS_UNIT: u64 = 512;
 const MAX_NUM_LOCAL_BLOCKS_TO_CHECK: u64 = 256;
 const MIN_NO_BLOCK_TIMESTAMP_GAP: u64 = 300;
+const MAX_PARENT_TRAVERSAL: usize = 256;
+const SYNC_INNER_LOOP_TIMEOUT_SECS: u64 = 120;
 
 impl<T, Provider, B, Network> N42Miner<T, Provider, B, Network>
 where
@@ -423,6 +425,10 @@ where
         let mut difficulty;
         let safe_block_num_hash = self.get_safe_block_num_hash_from_provider()?;
         loop {
+            if parents.len() >= MAX_PARENT_TRAVERSAL {
+                warn!(target: "consensus-client", "parent chain traversal limit reached ({MAX_PARENT_TRAVERSAL}), aborting");
+                break;
+            }
             debug!(target: "consensus-client", ?parent_num, ?parent, safe_number=?safe_block_num_hash.number, block_hash=?block.hash());
             if parent_num < safe_block_num_hash.number {
                 break;
@@ -684,6 +690,10 @@ where
             return Err(eyre::eyre!("verification result block hash mismatch: block_hash={block_hash:?}, pending block hash={:?}", block.hash()));
         }
 
+        if attestation_data.slot != block.number() {
+            return Err(eyre::eyre!("attestation slot mismatch: expected={}, got={}", block.number(), attestation_data.slot));
+        }
+
         let attestation = pending_block_data.attestations.get_mut(&attestation_data.committee_index)
 .ok_or(eyre::eyre!("attestation not found, block_hash={block_hash:?}, committee index={:?}", attestation_data.committee_index))?;
 
@@ -694,8 +704,16 @@ where
         let pubkey = PublicKey::from_bytes(&pubkey_bytes).map_err(|e| eyre::eyre!("{e:?}"))?;
 
         let pubkey_fixed_bytes: BLSPubkey = pubkey_bytes.as_slice().try_into().map_err(|_| eyre::eyre!("pubkey must be exactly 48 bytes"))?;
+        let beacon_state = &pending_block_data.beacon_state_after_withdrawal;
         let validator_index =
-            pending_block_data.beacon_state_after_withdrawal.get_validator_index_from_pubkey(&pubkey_fixed_bytes).ok_or(eyre::eyre!("validator not found, block_hash={block_hash:?}, pubkey={pubkey_str:?}"))? as u64;
+            beacon_state.get_validator_index_from_pubkey(&pubkey_fixed_bytes).ok_or(eyre::eyre!("validator not found, block_hash={block_hash:?}, pubkey={pubkey_str:?}"))? as u64;
+
+        // Check that the validator is active at the current epoch
+        let current_epoch = beacon_state.current_epoch();
+        let validator = beacon_state.get_validator(validator_index as usize)?;
+        if !validator.is_active_at(current_epoch) {
+            return Err(eyre::eyre!("inactive validator, pubkey={pubkey_str:?}, epoch={current_epoch}"));
+        }
 
         if attestation.validator_indexes.contains(&validator_index) {
             return Err(eyre::eyre!("duplicate attestations for validator, pubkey={pubkey_str:?}"));
@@ -707,6 +725,12 @@ where
 
         trace!(target: "consensus-client", "sig verify start:");
         let bytes: Vec<u8> = serde_json::to_vec(&attestation_data)?;
+
+        // Verify individual BLS signature before aggregation (defense-in-depth)
+        let verify_result = signature.verify(true, &bytes, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[], &pubkey, true);
+        if verify_result != blst::BLST_ERROR::BLST_SUCCESS {
+            return Err(eyre::eyre!("BLS signature verification failed for pubkey={pubkey_str:?}: {verify_result:?}"));
+        }
 
         match attestation.block_aggregate_signature {
             Some(ref mut v) => {
@@ -853,6 +877,8 @@ where
             self.new_payload(&block).await?;
             self.fcu_hash(block_hash).await?;
         }
+        // Clear pending block data after successful processing to prevent stale data reuse
+        self.pending_block_data = None;
         Ok(())
     }
 
@@ -1144,9 +1170,15 @@ where
 
             let next_header_from_p2p = self.fetch_header(next_block_number.into()).await?;
             self.fcu_hash(next_header_from_p2p.hash_slow()).await?;
+            let inner_loop_start = Instant::now();
             loop {
                 let block_number = self.provider.best_block_number()?;
                 if block_number < next_block_number {
+                    if inner_loop_start.elapsed() > Duration::from_secs(SYNC_INNER_LOOP_TIMEOUT_SECS) {
+                        return Err(eyre::eyre!(
+                            "sync_to_hash_in_small_unit: timed out waiting for block {next_block_number}, current={block_number}"
+                        ));
+                    }
                     sleep(Duration::from_millis(WAIT_FOR_DOWNLOAD_INTERVAL_MS)).await;
                 } else {
                     info!(target: "consensus-client", ?block_number, "sync_to_hash_in_small_unit: synced to block");

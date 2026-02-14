@@ -1,5 +1,6 @@
 use tokio::time::Instant;
 use hex::FromHex;
+use once_cell::sync::Lazy;
 use reth_primitives_traits::AlloyBlockHeader;
 use blst::min_pk::SecretKey;
 use reth_evm::execute::Executor;
@@ -13,6 +14,17 @@ use reth_chainspec::{ChainSpecBuilder,N42_DEVNET,EthereumHardfork,ForkCondition,
 use reth_evm::ConfigureEvm;
 use tokio::time::timeout;
 use std::{sync::Arc, time::Duration};
+
+/// Cached chain spec for mobile SDK block verification.
+/// Avoids rebuilding ChainSpec on every verify() call - important for mobile performance.
+static SDK_CHAIN_SPEC: Lazy<Arc<ChainSpec>> = Lazy::new(|| {
+    Arc::new(
+        ChainSpecBuilder::from(&*N42_DEVNET)
+            .shanghai_activated()
+            .with_fork(EthereumHardfork::Cancun, ForkCondition::Timestamp(1))
+            .build(),
+    )
+});
 use jsonrpsee::core::client::{SubscriptionClientT, ClientT};
 use futures_util::StreamExt;
 use jsonrpsee::core::client::Subscription;
@@ -113,56 +125,44 @@ async fn gen_block_verify_result_inner(block: UnverifiedBlock, sk: &SecretKey) -
     let block_clone = block.clone();
 
     let start = Instant::now();
-    let verify_result = tokio::task::spawn_blocking(|| {
-        let result = verify(block_clone);
-        result
-    }).await;
+    let verify_result = tokio::task::spawn_blocking(|| verify(block_clone)).await;
     let duration = start.elapsed();
     debug!(?duration, "block verify");
-    if let Ok(receipts_root) = verify_result? {
-        debug!("receipts_root: {:?}", receipts_root);
 
-        let attestation_data = AttestationData {
-            slot: block.blockbody.header().number(),
-            committee_index: block.committee_index,
-            receipts_root,
-        };
+    // Propagate both JoinError and verify error directly
+    let receipts_root = verify_result??;
+    debug!("receipts_root: {:?}", receipts_root);
 
-        let bytes: Vec<u8> = serde_json::to_vec(&attestation_data)?;
-        let bytes_slice: &[u8] = &bytes;
+    let attestation_data = AttestationData {
+        slot: block.blockbody.header().number(),
+        committee_index: block.committee_index,
+        receipts_root,
+    };
 
-        let msg = bytes_slice;
-        let start = Instant::now();
-        let sig = sk.sign(msg, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[]);
-        let duration = start.elapsed();
-        debug!(?duration, "bls sign");
+    let bytes: Vec<u8> = serde_json::to_vec(&attestation_data)?;
+    let start = Instant::now();
+    let sig = sk.sign(&bytes, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[]);
+    let duration = start.elapsed();
+    debug!(?duration, "bls sign");
 
-        let start = Instant::now();
-        let err = sig.verify(true, msg, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[], &pk, true);
-        let duration = start.elapsed();
-        debug!(?duration, "bls verify");
-        debug!("sig verify result: {:?}", err);
+    // BLS self-verification skipped on mobile: node verifies signatures upon receipt.
+    // Mobile's job is receipt verification (block re-execution), not signature self-check.
 
-        let mut header = block.blockbody.header().clone();
-        header.receipts_root = receipts_root;
-        let body = block.blockbody.body().clone();
-        let sealed_block_recovered: SealedBlock<Block> = SealedBlock::from_parts_unhashed(header, body);
+    let mut header = block.blockbody.header().clone();
+    header.receipts_root = receipts_root;
+    let body = block.blockbody.body().clone();
+    let sealed_block_recovered: SealedBlock<Block> = SealedBlock::from_parts_unhashed(header, body);
+    let recovered_block_hash = SealedBlock::hash(&sealed_block_recovered);
 
-        let recovered_block_hash = SealedBlock::hash(&sealed_block_recovered);
+    let block_verify_result = BlockVerifyResult {
+        pubkey: hex::encode(pk.to_bytes()),
+        signature: hex::encode(sig.to_bytes()),
+        attestation_data,
+        block_hash: recovered_block_hash,
+    };
 
-        let block_verify_result = BlockVerifyResult {
-            pubkey: hex::encode(pk.to_bytes()),
-            signature: hex::encode(sig.to_bytes()),
-            attestation_data,
-            block_hash: recovered_block_hash ,
-        };
-
-        debug!("Finished block: {:?}, pk: {:?}, thread-id: {:?}", block.blockbody.header().number(), hex::encode(pk.to_bytes()), std::thread::current().id());
-        return Ok(block_verify_result);
-    } else {
-        warn!("verify failed");
-        return Err(eyre::eyre!("verify failed: block number: {:?}", block.blockbody.number));
-    }
+    debug!("Finished block: {:?}, pk: {:?}, thread-id: {:?}", block.blockbody.header().number(), hex::encode(pk.to_bytes()), std::thread::current().id());
+    Ok(block_verify_result)
 }
 
 #[instrument(
@@ -172,41 +172,30 @@ async fn gen_block_verify_result_inner(block: UnverifiedBlock, sk: &SecretKey) -
     )]
 fn verify(mut unverifiedblock:UnverifiedBlock) -> eyre::Result<B256> {
     trace!(?unverifiedblock);
-    let chain_spec = Arc::new(
-        ChainSpecBuilder::from(&*N42_DEVNET)
-            .shanghai_activated()
-            .with_fork(
-                EthereumHardfork::Cancun,
-                ForkCondition::Timestamp(1))
-            .build(),
-    );
+    let chain_spec = SDK_CHAIN_SPEC.clone();
     let mock_eth_provider: MockEthProvider<EthPrimitives> = MockEthProvider::new_with_chain_spec((*chain_spec).clone());
     let state = StateProviderDatabase::new(mock_eth_provider);
     let db = State::builder().with_database(unverifiedblock.db.as_db_mut(state)).build();
     let evm_config = EthEvmConfig::new(chain_spec);
-    let mut executor =  evm_config.batch_executor(db);
-    let mut receipts:Vec<Receipt>=Vec::new();
+    let mut executor = evm_config.batch_executor(db);
 
-    // for test
-    let sealed_block_receipts_root = unverifiedblock.blockbody.header().receipts_root;
+    // The expected receipts_root from the block header, used to verify execution correctness.
+    // Mobile SDK re-executes the block and compares receipts_root — this is the core
+    // verification path for mobile validators (no full state/Merkle tree needed).
+    let expected_receipts_root = unverifiedblock.blockbody.header().receipts_root;
 
     let recovered = RecoveredBlock::try_recover_sealed(unverifiedblock.blockbody)?;
-    match executor.execute_one(&recovered) {
-        Ok(result) => {
-            debug!("success, {result:?}");
-            receipts=result.receipts;
-        }
-        Err(e) => warn!("Error during execution: {:?}", e),
-    }
-    debug!("{receipts:?}");
-    let receipts_root = Receipt::calculate_receipt_root_no_memo(&receipts);
+    let result = executor.execute_one(&recovered)
+        .map_err(|e| eyre::eyre!("block execution failed: {e:?}"))?;
+
+    let receipts_root = Receipt::calculate_receipt_root_no_memo(&result.receipts);
     debug!("computed {receipts_root:?}");
 
-    // for test
-    if sealed_block_receipts_root != B256::ZERO {
-        if receipts_root != sealed_block_receipts_root {
-            return Err(eyre::eyre!("receipts_root={:?}, expected={:?}", receipts_root, sealed_block_receipts_root));
-        }
+    // Verify receipts_root matches: ensures the block execution is correct.
+    if expected_receipts_root != B256::ZERO && receipts_root != expected_receipts_root {
+        return Err(eyre::eyre!(
+            "receipts_root mismatch: computed={receipts_root:?}, expected={expected_receipts_root:?}"
+        ));
     }
 
     Ok(receipts_root)

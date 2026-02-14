@@ -561,6 +561,10 @@ pub enum ConsensusError {
     )]
     NoSignerSet,
     #[error(
+        "invalid signer key"
+    )]
+    InvalidSignerKey,
+    #[error(
         "apos error detail {detail}"
     )]
     AposErrorDetail {

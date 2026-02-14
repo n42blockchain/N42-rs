@@ -413,7 +413,9 @@ where
         if max_td >= U256::from(new_block.td) {
             return Ok(());
         }
-        let _ = self.exit_if_lagged_progress(&block).await;
+        if let Err(e) = self.exit_if_lagged_progress(&block).await {
+            warn!(target: "consensus-client", "exit_if_lagged_progress error: {e:?}");
+        }
 
         let mut is_fork = false;
         let mut parent = block.hash();
@@ -584,6 +586,11 @@ where
         const NUM_CONFIRM_ROUNDS: u64 = 1;
 
         let num_signers = self.get_best_block_num_signers()?;
+        if num_signers == 0 {
+            let safe_block_header = self.provider.sealed_header(safe_block_number)?
+                .ok_or(eyre::eyre!("sealed_header not found, block_number={:?}", safe_block_number))?;
+            return Ok(BlockNumHash { number: safe_block_header.number(), hash: safe_block_header.hash_slow() });
+        }
         let best_block_number = self.provider.best_block_number()?;
         let mut active_signers: Vec<Address> = Vec::new();
         for i in (best_block_number.saturating_sub(NUM_SAMPLE_ROUNDS * num_signers) ..best_block_number) {
@@ -829,7 +836,7 @@ where
             if let Err(e) = new_block_tx.send((
                     NewBlock {
                         block: block_clone.unseal(),
-                        td: max_td.to::<U128>(),
+                        td: max_td.saturating_to::<U128>(),
                     },
                     block_hash,
                 ))
@@ -869,8 +876,8 @@ where
         debug!(target: "consensus-client", block_time, "prepare_block");
         let now = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)?;
-        let time_for_tx_gathering = 1;
-        let time_for_attestatation_gathering = block_time - time_for_tx_gathering;
+        let time_for_tx_gathering = 1u64;
+        let time_for_attestatation_gathering = block_time.saturating_sub(time_for_tx_gathering);
         let expected_next_timestamp = Duration::from_secs(header.header().timestamp().saturating_add(time_for_tx_gathering));
         if expected_next_timestamp > now {
             self.interval_prepare_block = interval_at(
@@ -1211,7 +1218,11 @@ where
             .sealed_header(best_block_number)?
             .ok_or(eyre::eyre!("sealed_header not found, block_number={:?}", best_block_number))?;
         let td = self.consensus.total_difficulty(header.hash_slow());
-        let average_td = td.to::<u64>() as f64 / header.number() as f64;
+        let average_td = if header.number() > 0 {
+            td.saturating_to::<u64>() as f64 / header.number() as f64
+        } else {
+            0.0
+        };
         info!(hash=?header.hash(), ?td, header_number=header.number(), header_timestamp=header.timestamp(), average_td, "max_td_and_hash");
         Ok((td, header.hash()))
     }

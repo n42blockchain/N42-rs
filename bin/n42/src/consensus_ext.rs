@@ -67,19 +67,24 @@ where
         address: Address,
         auth: bool,
         ) -> RpcResult<()> {
-        Ok(self.consensus.propose(address, auth).unwrap_or_default())
+        self.consensus.propose(address, auth)
+            .map_err(|err| ErrorObject::owned(INTERNAL_ERROR_CODE, err.to_string(), Option::<()>::None))
     }
 
     fn discard(&self,
         address: Address,
         ) -> RpcResult<()> {
-        Ok(self.consensus.discard(address).unwrap_or_default())
+        self.consensus.discard(address)
+            .map_err(|err| ErrorObject::owned(INTERNAL_ERROR_CODE, err.to_string(), Option::<()>::None))
     }
 
     fn get_snapshot(&self,
         number: u64,
         ) -> RpcResult<Snapshot> {
-        let hash = self.provider.header_by_number(number).unwrap_or_default().unwrap_or_default().hash_slow();
+        let header = self.provider.header_by_number(number)
+            .map_err(|e| ErrorObject::owned(INTERNAL_ERROR_CODE, e.to_string(), Option::<()>::None))?
+            .ok_or_else(|| ErrorObject::owned(INVALID_PARAMS_CODE, format!("Block {number} not found"), Option::<()>::None))?;
+        let hash = header.hash_slow();
         self.consensus.snapshot(number, hash, None).map_err(|err| ErrorObject::owned(INVALID_PARAMS_CODE, err.to_string(), Option::<()>::None))
     }
 

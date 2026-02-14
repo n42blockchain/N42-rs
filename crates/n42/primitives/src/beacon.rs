@@ -499,6 +499,7 @@ impl BeaconState {
         spec: &ChainSpec,
         ) -> eyre::Result<()> {
         let mut new_total_active_balance: u64 = 0;
+        let current_epoch = self.current_epoch();
 
         if self.balances_store.len() < self.validators_store.len() {
             return Err(eyre::eyre!("balances_store length ({}) < validators_store length ({})", self.balances_store.len(), self.validators_store.len()));
@@ -509,7 +510,9 @@ impl BeaconState {
             if new_effective_balance != validator.effective_balance {
                 validator.effective_balance = new_effective_balance;
             }
-            new_total_active_balance = new_total_active_balance.saturating_add(new_effective_balance);
+            if validator.is_active_at(current_epoch) {
+                new_total_active_balance = new_total_active_balance.saturating_add(new_effective_balance);
+            }
         })?;
         self.total_active_balance.replace(TotalActiveBalance(self.current_epoch(),
         std::cmp::max(
@@ -640,7 +643,7 @@ impl BeaconState {
         self.process_attestation(&beacon_block_body.attestations)?;
         //self.process_voluntary_exit(&beacon_block_body.voluntary_exits)?;
 
-        let deposits: Vec<Deposit> = beacon_block_body.execution_requests.deposits.clone().iter().map(|deposit_request| {
+        let deposits: Vec<Deposit> = beacon_block_body.execution_requests.deposits.iter().map(|deposit_request| {
             Deposit {
                 proof: Default::default(),
                 data: DepositData {
@@ -762,15 +765,13 @@ impl BeaconState {
     }
 
     fn process_one_attestation(&mut self, attestation: &Attestation) -> eyre::Result<()> {
-
+        // Signature already verified in process_randao, skip redundant verification
         let start = Instant::now();
-        self.verify_aggregate_signature(&attestation)?;
-        let duration_verify_aggregate_signature = start.elapsed();
         let indexes: Vec<u64> = attestation.validator_indexes.iter().copied().collect();
         self.epoch_attester_indexes_store.push_batch(&indexes)?;
         self.epoch_attester_indexes_set.extend(&attestation.validator_indexes);
         let duration_process_one_attestation = start.elapsed();
-        debug!(?duration_verify_aggregate_signature, ?duration_process_one_attestation, "process_one_attestation");
+        debug!(?duration_process_one_attestation, "process_one_attestation");
 
         Ok(())
     }
@@ -925,7 +926,7 @@ impl BeaconState {
         }
 
         // Update pending partial withdrawals [New in Electra:EIP7251]
-        if let Some(processed_partial_withdrawals_count) = processed_partial_withdrawals_count.clone() {
+        if let Some(processed_partial_withdrawals_count) = processed_partial_withdrawals_count {
             self
                 //.pending_partial_withdrawals_mut()?
                 //.pop_front(processed_partial_withdrawals_count)?;
@@ -2000,7 +2001,7 @@ pub fn get_attestation_component_delta_n42(
 
     delta.reward(base_reward)?;
     if is_punishable {
-        delta.penalize(base_reward * spec.multiple_reward_for_inactivity_penalty)?;
+        delta.penalize(base_reward.safe_mul(spec.multiple_reward_for_inactivity_penalty)?)?;
     }
 
     Ok(delta)

@@ -380,10 +380,16 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
                     }
 
                     // If it's None and NOT a zero root, the tree is corrupted.
+                    #[cfg(debug_assertions)]
                     panic!("Inconsistent tree: missing node for hash {:?} at height {}", current_hash, h + 1);
+                    #[cfg(not(debug_assertions))]
+                    return None;
                 }
                 Some(Tree::Leaf(_)) => {
+                    #[cfg(debug_assertions)]
                     panic!("Inconsistent tree: found Leaf node at height {}", h + 1);
+                    #[cfg(not(debug_assertions))]
+                    return None;
                 }
             }
         }
@@ -397,12 +403,16 @@ impl<T: Value, N: Unsigned> VecTree<T, N> {
                     return self.default_for_collision.as_ref();
                 }
                 if let None = self.kv.get(&current_hash) {
+                    #[cfg(debug_assertions)]
                     panic!("Inconsistent tree: missing node for leaf hash {:?}", current_hash);
                 }
                 None
             }
             Some(Tree::Node { .. }) | Some(Tree::Zero(_)) => {
+                #[cfg(debug_assertions)]
                 panic!("Inconsistent tree: found non-Leaf node at height 0");
+                #[cfg(not(debug_assertions))]
+                return None;
             }
         }
     }

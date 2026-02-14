@@ -211,8 +211,8 @@ where
     fn set_signer(&self, eth_signer: Option<LocalSigner<SigningKey>>) {
         let eth_signer_address = eth_signer.clone().map(|signer| {signer.address()});
         info!(target: "consensus::apos", "set_signer, new signer={:?}", eth_signer_address);
-        let mut signer_guard = self.signer.write().unwrap();
-        let mut eth_signer_guard = self.eth_signer.write().unwrap();
+        let mut signer_guard = self.signer.write().unwrap_or_else(|e| e.into_inner());
+        let mut eth_signer_guard = self.eth_signer.write().unwrap_or_else(|e| e.into_inner());
         *signer_guard = eth_signer_address;
         *eth_signer_guard = eth_signer;
     }
@@ -288,7 +288,7 @@ where
     // controlling the signer voting.
 
     fn init_recent_tds(&self) {
-        if self.recent_tds_inited.load(Ordering::Relaxed) {
+        if self.recent_tds_inited.load(Ordering::Acquire) {
             return;
         }
         let finalized_block_number = self.provider
@@ -296,9 +296,15 @@ where
             .unwrap_or(Some(0))
             .unwrap_or(0);
         info!(target: "consensus::apos", ?finalized_block_number, "init_recent_tds");
-        let best_block_number = self.provider.best_block_number().unwrap();
+        let best_block_number = match self.provider.best_block_number() {
+            Ok(n) => n,
+            Err(e) => {
+                error!(target: "consensus::apos", ?e, "init_recent_tds: failed to get best_block_number");
+                return;
+            }
+        };
         info!(target: "consensus::apos", ?best_block_number, "init_recent_tds");
-        let num_blocks = best_block_number - finalized_block_number + 1;
+        let num_blocks = best_block_number.saturating_sub(finalized_block_number).saturating_add(1);
         let start_block_number = if num_blocks > INMEMORY_TDS.into() {
             warn!(target: "consensus::apos", ?finalized_block_number, ?best_block_number, td_cache_size=?INMEMORY_TDS,
                 "the number of blocks from finalized block to best block is larger than td cache size, this may cause 'td not found' errors later",
@@ -309,22 +315,35 @@ where
         };
         (start_block_number..=best_block_number).for_each(|block_number| {
             debug!(target: "consensus::apos", ?block_number, "init_recent_tds");
-            let header = self.provider.header_by_number(block_number).unwrap().unwrap();
+            let header = match self.provider.header_by_number(block_number) {
+                Ok(Some(h)) => h,
+                Ok(None) => {
+                    warn!(target: "consensus::apos", ?block_number, "init_recent_tds: header not found, skipping");
+                    return;
+                }
+                Err(e) => {
+                    warn!(target: "consensus::apos", ?block_number, ?e, "init_recent_tds: failed to get header, skipping");
+                    return;
+                }
+            };
             if block_number == start_block_number {
                 let start_td = self.provider.header_td_by_number(start_block_number)
                     .unwrap_or(Some(U256::ZERO))
                     .unwrap_or(U256::ZERO);
-                let mut recent_tds = self.recent_tds.write().unwrap();
+                let mut recent_tds = self.recent_tds.write().unwrap_or_else(|e| e.into_inner());
                 recent_tds.insert(header.hash_slow(), start_td);
             } else {
-                let mut recent_tds = self.recent_tds.write().unwrap();
-                let parent_td = *recent_tds.get(&header.parent_hash()).unwrap();
+                let mut recent_tds = self.recent_tds.write().unwrap_or_else(|e| e.into_inner());
+                let parent_td = recent_tds.get(&header.parent_hash()).copied().unwrap_or_else(|| {
+                    warn!(target: "consensus::apos", parent_hash=?header.parent_hash(), "init_recent_tds: parent_td not found, using ZERO");
+                    U256::ZERO
+                });
                 recent_tds.insert(header.hash_slow(), parent_td + header.difficulty());
             }
         }
         );
 
-        self.recent_tds_inited.store(true, Ordering::Relaxed);
+        self.recent_tds_inited.store(true, Ordering::Release);
     }
 
     fn save_total_difficulty<H>(&self, header: &H)
@@ -361,8 +380,8 @@ where
         let mut number = number;
         let mut parents = parents;
 
-        let mut recents = self.recents.write().unwrap(); //
-        let mut recent_headers = self.recent_headers.write().unwrap();
+        let mut recents = self.recents.write().unwrap_or_else(|e| e.into_inner()); //
+        let mut recent_headers = self.recent_headers.write().unwrap_or_else(|e| e.into_inner());
 
         while snap.is_none() {
             //Attempt to retrieve a snapshot from memory
@@ -491,8 +510,10 @@ where
     ChainSpec: EthChainSpec + EthereumHardforks,
     Provider: 'static + Clone + HeaderProvider<Header = reth_primitives_traits::Header> + SnapshotProvider + SnapshotProviderWriter + BlockIdReader  + BlockReaderIdExt + Unpin,
 {
-    fn fmt(&self, _f: &mut Formatter<'_>) -> std::fmt::Result {
-        todo!()
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("APos")
+            .field("recent_tds_inited", &self.recent_tds_inited)
+            .finish_non_exhaustive()
     }
 }
 
@@ -598,7 +619,7 @@ where
         }
 
         self.verify_seal(&snap, header, None).map_err(|e| {ConsensusError::AposErrorDetail {detail: e.to_string()}})?;
-        let mut recent_headers = self.recent_headers.write().unwrap();
+        let mut recent_headers = self.recent_headers.write().unwrap_or_else(|e| e.into_inner());
         recent_headers.insert(header_hash, header.clone());
 
         self.save_total_difficulty(header);
@@ -678,7 +699,7 @@ where
 
         if header.number %self.config.epoch != 0 {
             //Collect all proposals to be voted on
-            let proposals_lock = self.proposals.read().unwrap();
+            let proposals_lock = self.proposals.read().unwrap_or_else(|e| e.into_inner());
             let addresses: Vec<Address> = proposals_lock.iter()
                 //.filter(|(&address, &authorize)| snap.valid_vote(address, authorize))
                 .map(|(address, _)| *address)
@@ -699,7 +720,7 @@ where
 
         debug!(target: "consensus::apos", ?snap, "snap");
         //Copy the signer to prevent data competition
-        let signer_guard = self.signer.read().unwrap();
+        let signer_guard = self.signer.read().unwrap_or_else(|e| e.into_inner());
         if let Some(signer) = *signer_guard {
             //Set the correct difficulty level
             header.difficulty = calc_difficulty(&snap, &signer);
@@ -744,7 +765,7 @@ where
         //todo
 
 
-        let signer = self.signer.read().unwrap().ok_or(ConsensusError::NoSignerSet)?;
+        let signer = self.signer.read().unwrap_or_else(|e| e.into_inner()).ok_or(ConsensusError::NoSignerSet)?;
         debug!(target: "consensus::apos", "seal() signer={:?}", signer);
         // Bail out if we're unauthorized to sign a block
         let snap = self.snapshot_inner(header.number - 1, header.parent_hash, None)?;
@@ -770,7 +791,7 @@ where
         //
         // }
 
-        let eth_signer_guard = self.eth_signer.read().unwrap();
+        let eth_signer_guard = self.eth_signer.read().unwrap_or_else(|e| e.into_inner());
         let eth_signer = eth_signer_guard.as_ref().ok_or(ConsensusError::NoSignerSet)?;
         // Sign all the things!
         let header_bytes = seal_hash(header);
@@ -788,7 +809,7 @@ where
         }
         header.extra_data = Bytes::from(extra_data_mut.freeze());
 
-        let mut recent_headers = self.recent_headers.write().unwrap();
+        let mut recent_headers = self.recent_headers.write().unwrap_or_else(|e| e.into_inner());
         recent_headers.insert(header.hash_slow(), header.clone());
 
         self.save_total_difficulty(header);
@@ -797,9 +818,16 @@ where
     }
 
     fn set_eth_signer_by_key(&self, eth_signer_key: Option<String>) -> Result<(), ConsensusError> {
-        let eth_signer = eth_signer_key.map(|key| {
-            PrivateKeySigner::from_bytes(&FixedBytes::from_str(&key).unwrap()).unwrap()
-        });
+        let eth_signer = match eth_signer_key {
+            Some(key) => {
+                let bytes = FixedBytes::from_str(&key)
+                    .map_err(|_| ConsensusError::InvalidSignerKey)?;
+                let signer = PrivateKeySigner::from_bytes(&bytes)
+                    .map_err(|_| ConsensusError::InvalidSignerKey)?;
+                Some(signer)
+            }
+            None => None,
+        };
         self.set_signer(eth_signer);
         Ok(())
     }
@@ -827,7 +855,7 @@ where
         auth: bool,
     ) -> Result<(), ConsensusError> {
         info!(target: "consensus::apos", "propose(), address={}, auth={}", address, auth);
-        let mut proposals_guard = self.proposals.write().unwrap();
+        let mut proposals_guard = self.proposals.write().unwrap_or_else(|e| e.into_inner());
         proposals_guard.insert(address, auth);
         Ok(())
     }
@@ -837,7 +865,7 @@ where
         address: Address,
     ) -> Result<(), ConsensusError> {
         info!(target: "consensus::apos", "discard(), address={}", address);
-        let mut proposals_guard = self.proposals.write().unwrap();
+        let mut proposals_guard = self.proposals.write().unwrap_or_else(|e| e.into_inner());
         proposals_guard.remove(&address);
         Ok(())
     }
@@ -846,7 +874,7 @@ where
         &self,
     ) -> Result<HashMap<Address, bool>, ConsensusError> {
         info!(target: "consensus::apos", "proposals()");
-        let proposals_guard = self.proposals.read().unwrap();
+        let proposals_guard = self.proposals.read().unwrap_or_else(|e| e.into_inner());
         Ok(proposals_guard.clone())
     }
 
@@ -889,7 +917,7 @@ where
         block_hash: BlockHash,
         cached_reads: CachedReads
         ) -> Result<(), ConsensusError> {
-        let mut recent_cached_reads = self.recent_cached_reads.write().unwrap();
+        let mut recent_cached_reads = self.recent_cached_reads.write().unwrap_or_else(|e| e.into_inner());
         recent_cached_reads.insert(block_hash, cached_reads);
         Ok(())
     }
@@ -898,7 +926,7 @@ where
         &self,
         block_hash: BlockHash,
     ) -> Result<Option<CachedReads>, ConsensusError> {
-        let mut recent_cached_reads = self.recent_cached_reads.write().unwrap();
+        let mut recent_cached_reads = self.recent_cached_reads.write().unwrap_or_else(|e| e.into_inner());
         Ok(recent_cached_reads.get(&block_hash).cloned())
     }
 }

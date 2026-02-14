@@ -211,8 +211,8 @@ impl EthereumBuilderConfig {
 /// Ref: <https://github.com/ethereum/go-ethereum/blob/88cbfab332c96edfbe99d161d9df6a40721bd786/core/block_validator.go#L166>
 pub fn calculate_block_gas_limit(parent_gas_limit: u64, desired_gas_limit: u64) -> u64 {
     let delta = (parent_gas_limit / GAS_LIMIT_BOUND_DIVISOR).saturating_sub(1);
-    let min_gas_limit = parent_gas_limit - delta;
-    let max_gas_limit = parent_gas_limit + delta;
+    let min_gas_limit = parent_gas_limit.saturating_sub(delta);
+    let max_gas_limit = parent_gas_limit.saturating_add(delta);
     desired_gas_limit.clamp(min_gas_limit, max_gas_limit)
 }
 // reth/crates/ethereum/payload/src/config.rs
@@ -461,8 +461,13 @@ where
         }
 
         // update add to total fees
-        let miner_fee =
-            tx.effective_tip_per_gas(base_fee).expect("fee is always valid; execution succeeded");
+        let miner_fee = match tx.effective_tip_per_gas(base_fee) {
+            Some(fee) => fee,
+            None => {
+                warn!(target: "payload_builder", tx_hash=?tx.hash(), "skipping tx with invalid effective tip");
+                continue;
+            }
+        };
         total_fees += U256::from(miner_fee) * U256::from(gas_used);
         cumulative_gas_used += gas_used;
     }
@@ -521,7 +526,9 @@ where
     let sealed_block = Arc::new(SealedBlock::seal_parts(header, block.into_block().body));
 
     let block_hash = SealedBlock::hash(&sealed_block);
-    let _ = cons.set_cached_reads(block_hash, cached_reads.clone());
+    if let Err(e) = cons.set_cached_reads(block_hash, cached_reads.clone()) {
+        warn!(target: "payload_builder", ?block_hash, ?e, "failed to set cached reads");
+    }
 
     let payload = EthBuiltPayload::new(attributes.id, sealed_block, total_fees, requests)
         // add blob sidecars from the executed txs

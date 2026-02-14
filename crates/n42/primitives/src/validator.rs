@@ -54,7 +54,8 @@ impl Validator {
         balance: u64,
         spec: &ChainSpec,
     ) -> bool {
-        self.effective_balance == spec.max_effective_balance
+        self.has_execution_withdrawal_credential(spec)
+            && self.effective_balance == spec.max_effective_balance
             && balance > spec.max_effective_balance
     }
 
@@ -62,8 +63,11 @@ impl Validator {
         &self,
         balance: u64,
         epoch: Epoch,
+        spec: &ChainSpec,
     ) -> bool {
-        self.withdrawable_epoch <= epoch && balance > 0
+        self.has_execution_withdrawal_credential(spec)
+            && self.withdrawable_epoch <= epoch
+            && balance > 0
     }
 
     pub fn get_execution_withdrawal_address(&self) -> Option<Address> {

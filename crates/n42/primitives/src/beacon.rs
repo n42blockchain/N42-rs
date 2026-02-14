@@ -482,7 +482,7 @@ impl BeaconState {
         debug!(target: "consensus-client", ?old_beacon_state, ?beacon_block, "state_transition");
         let spec = beacon_chain_spec();
         let mut new_beacon_state = old_beacon_state.clone();
-        new_beacon_state.slot += 1;
+        new_beacon_state.slot = new_beacon_state.slot.safe_add(1)?;
         new_beacon_state.build_total_active_balance_cache(&spec)?;
         if (new_beacon_state.slot) % SLOTS_PER_EPOCH == 0 {
             let start = Instant::now();
@@ -767,6 +767,14 @@ impl BeaconState {
     fn process_one_attestation(&mut self, attestation: &Attestation) -> eyre::Result<()> {
         // Signature already verified in process_randao, skip redundant verification
         let start = Instant::now();
+        // Validate that all attesting validators are active
+        let current_epoch = self.current_epoch();
+        for &vi in &attestation.validator_indexes {
+            let validator = self.get_validator(vi as usize)?;
+            if !validator.is_active_at(current_epoch) {
+                return Err(eyre::eyre!("attestation includes inactive validator index {vi} at epoch {current_epoch}"));
+            }
+        }
         let indexes: Vec<u64> = attestation.validator_indexes.iter().copied().collect();
         self.epoch_attester_indexes_store.push_batch(&indexes)?;
         self.epoch_attester_indexes_set.extend(&attestation.validator_indexes);
@@ -834,7 +842,7 @@ impl BeaconState {
                     .safe_sum()?;
                 let balance = self
                     .get_balance(withdrawal.validator_index as usize)?
-                    .safe_sub(total_withdrawn)?;
+                    .saturating_sub(total_withdrawn);
                 let has_excess_balance = balance > spec.min_activation_balance;
 
                 if validator.exit_epoch == spec.far_future_epoch
@@ -872,8 +880,8 @@ impl BeaconState {
             })
             .safe_sum()?;
         let balance = self.get_balance(validator_index as usize)?
-            .safe_sub(partially_withdrawn_balance)?;
-        if validator.is_fully_withdrawable_validator(balance, epoch) {
+            .saturating_sub(partially_withdrawn_balance);
+        if validator.is_fully_withdrawable_validator(balance, epoch, spec) {
             withdrawals.push(Withdrawal {
                 index: withdrawal_index,
                 validator_index,
@@ -1141,8 +1149,8 @@ impl BeaconState {
 
     /// Get the cached total active balance while checking that it is for the correct `epoch`.
     fn get_total_active_balance_at_epoch(&self, epoch: Epoch) -> eyre::Result<u64> {
-        let TotalActiveBalance(initialized_epoch, balance) = self
-            .total_active_balance.clone()
+        let &TotalActiveBalance(initialized_epoch, balance) = self
+            .total_active_balance.as_ref()
             .ok_or(eyre::eyre!("TotalActiveBalanceCacheUninitialized"))?;
 
         if initialized_epoch == epoch {
@@ -1346,6 +1354,11 @@ impl BeaconState {
         let validator_index = self.get_validator_index_from_pubkey(&deposit_data.pubkey);
 
         let amount = deposit_data.amount;
+
+        // Skip zero-amount deposits to avoid creating useless validator entries
+        if amount == 0 {
+            return Ok(());
+        }
 
         if let Some(index) = validator_index {
             /*

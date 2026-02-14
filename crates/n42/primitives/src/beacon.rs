@@ -453,13 +453,13 @@ pub fn parse_deposit_log(log: &Log) -> Option<DepositEvent> {
 impl BeaconState {
     pub fn new() -> Self {
         let validators_len = 0;
-        let validators_store = VecTree::try_new(validators_len).unwrap();
+        let validators_store = VecTree::try_new(validators_len).expect("VecTree::try_new(0) for validators must succeed");
         let inactivity_scores_len = 0;
-        let inactivity_scores_store = VecTree::try_new(inactivity_scores_len).unwrap();
+        let inactivity_scores_store = VecTree::try_new(inactivity_scores_len).expect("VecTree::try_new(0) for inactivity_scores must succeed");
         let balances_len = 0;
-        let balances_store = VecTree::try_new(balances_len).unwrap();
+        let balances_store = VecTree::try_new(balances_len).expect("VecTree::try_new(0) for balances must succeed");
         let epoch_attester_indexes_len = 0;
-        let epoch_attester_indexes_store = VecTree::try_new(epoch_attester_indexes_len).unwrap();
+        let epoch_attester_indexes_store = VecTree::try_new(epoch_attester_indexes_len).expect("VecTree::try_new(0) for epoch_attester_indexes must succeed");
         Self {
             //committee_caches: vec![Default::default(); 3],
             validators: validators_store.root(),
@@ -620,7 +620,9 @@ impl BeaconState {
 
         let mut mix = self.randao_mix;
         for attestation in &beacon_block_body.attestations {
-            mix = mix ^ keccak256(attestation.block_aggregate_signature.unwrap());
+            let sig = attestation.block_aggregate_signature
+                .ok_or_else(|| eyre::eyre!("Missing block_aggregate_signature in attestation for slot {}", self.slot))?;
+            mix = mix ^ keccak256(sig);
         }
 
         self.randao_mix = mix;
@@ -2209,9 +2211,16 @@ impl RelativeEpoch {
 }
 
 pub fn round_down(n: u64, step: u64) -> u64 {
+    if step == 0 {
+        return n;
+    }
     n - (n % step)
 }
 
 fn round_to_nearest(n: u64, step: u64) -> u64 {
-    ((n + step / 2) / step) * step
+    if step == 0 {
+        return n;
+    }
+    // Use saturating_add to prevent overflow on (n + step/2)
+    (n.saturating_add(step / 2) / step).saturating_mul(step)
 }

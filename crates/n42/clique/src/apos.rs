@@ -176,7 +176,9 @@ where
         let recent_tds_inited = AtomicBool::new(false);
         let recent_cached_reads = RwLock::new(schnellru::LruMap::new(schnellru::ByLength::new(INMEMORY_CACHED_READS)));
 
-        let eth_signer: Option<PrivateKeySigner> = signer_private_key.map(|key| { key.parse().unwrap() });
+        let eth_signer: Option<PrivateKeySigner> = signer_private_key.map(|key| {
+            key.parse().expect("Invalid signer private key format")
+        });
 
         let eth_signer_address = eth_signer.clone().map(|signer| {signer.address()});
         info!(target: "consensus::apos", "apos set signer address {:?}", eth_signer_address);
@@ -332,12 +334,15 @@ where
         self.init_recent_tds();
 
         let total_difficulty = {
-            let mut recent_tds = self.recent_tds.write().unwrap();
-            let parent_td = recent_tds.get(&header.parent_hash()).unwrap_or_else(|| panic!("td not found for parent hash {:?}, current header={:?}", header.parent_hash(), header));
-            *parent_td + header.difficulty()
+            let mut recent_tds = self.recent_tds.write().unwrap_or_else(|e| e.into_inner());
+            let parent_td = recent_tds.get(&header.parent_hash()).copied().unwrap_or_else(|| {
+                warn!(target: "consensus::apos", parent_hash=?header.parent_hash(), "td not found for parent hash, using difficulty as fallback");
+                U256::ZERO
+            });
+            parent_td + header.difficulty()
         };
 
-        let mut recent_tds = self.recent_tds.write().unwrap();
+        let mut recent_tds = self.recent_tds.write().unwrap_or_else(|e| e.into_inner());
         recent_tds.insert(header.hash_slow(), total_difficulty);
         debug!(target: "consensus::apos", "saved total_difficulty {}", total_difficulty);
     }
@@ -379,17 +384,24 @@ where
             // at a checkpoint block without a parent (light client CHT), or we have piled
             // up more headers than allowed to be reorged (chain reinit from a freezer),
             // consider the checkpoint trusted and snapshot it.
-            if number == 0 || (number % self.config.epoch == 0 && (headers.len() > FULL_IMMUTABILITY_THRESHOLD || self.provider.header_by_number(number -1).unwrap().is_none())) {
+            if number == 0 || (number % self.config.epoch == 0 && (headers.len() > FULL_IMMUTABILITY_THRESHOLD || self.provider.header_by_number(number -1).ok().flatten().is_none())) {
                 if let Ok(Some(checkpoint)) = self.provider.header_by_number(number) {
                     debug!(target: "consensus::apos", "checkpoint={:?}", checkpoint);
                     let hash = checkpoint.hash_slow();
-                    //info!(target: "consensus::apos", "snapshot() : number={}, hash_slow hash={:?}", number, hash);
-            
+
                     //Calculate the list of signatories
-                    let signers_count = (checkpoint.extra_data().len() - EXTRA_VANITY - SIGNATURE_LENGTH) /  Address::len_bytes();
+                    let extra_data_len = checkpoint.extra_data().len();
+                    if extra_data_len < EXTRA_VANITY + SIGNATURE_LENGTH {
+                        return Err(ConsensusError::MissingSignature);
+                    }
+                    let signers_bytes_len = extra_data_len - EXTRA_VANITY - SIGNATURE_LENGTH;
+                    if signers_bytes_len % Address::len_bytes() != 0 {
+                        return Err(ConsensusError::InvalidCheckpointSigners);
+                    }
+                    let signers_count = signers_bytes_len / Address::len_bytes();
 
                     let mut signers = Vec::with_capacity(signers_count);
-            
+
                     for i in 0..signers_count {
                         let start = EXTRA_VANITY + i * Address::len_bytes();
                         let end = start + Address::len_bytes();
@@ -499,7 +511,9 @@ where
 
         // Don't waste time checking blocks from the future
         let present_timestamp =
-            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
 
         if header.timestamp() > present_timestamp + alloy_eips::merge::ALLOWED_FUTURE_BLOCK_TIME_SECONDS {
             return Err(ConsensusError::TimestampIsInFuture {
@@ -516,11 +530,12 @@ where
 
 
         // Nonces must be 0x00..0 or 0xff..f, zeroes enforced on checkpoints
-        if header.nonce().unwrap() != NONCE_AUTH_VOTE && header.nonce().unwrap() != NONCE_DROP_VOTE {
+        let nonce = header.nonce().ok_or(ConsensusError::InvalidVote)?;
+        if nonce != NONCE_AUTH_VOTE && nonce != NONCE_DROP_VOTE {
             return Err(ConsensusError::InvalidVote);
         }
 
-        if checkpoint && header.nonce().unwrap() != NONCE_DROP_VOTE {
+        if checkpoint && nonce != NONCE_DROP_VOTE {
             return Err(ConsensusError::InvalidCheckpointVote);
         }
 
@@ -573,6 +588,9 @@ where
                 .iter()
                 .flat_map(|signer| signer.as_slice().to_vec())
                 .collect();
+            if header.extra_data().len() < EXTRA_VANITY + EXTRA_SEAL {
+                return Err(ConsensusError::MissingSignature);
+            }
             let extra_suffix = header.extra_data().len() - EXTRA_SEAL;
             if header.extra_data()[EXTRA_VANITY..extra_suffix] != signers[..] {
                 return Err(ConsensusError::InvalidCheckpointSigners);
@@ -667,8 +685,8 @@ where
                 .collect();
 
             //If there are proposals to be voted on, proceed with the vote
-            if !addresses.is_empty() {
-                header.beneficiary = *addresses.choose(&mut rand::rng()).unwrap();
+            if let Some(&beneficiary) = addresses.choose(&mut rand::rng()) {
+                header.beneficiary = beneficiary;
                 if let Some(&authorize) = proposals_lock.get(&header.beneficiary) {
                     if authorize {
                         header.nonce = NONCE_AUTH_VOTE.into();
@@ -759,8 +777,15 @@ where
         let sighash = eth_signer.sign_hash_sync(&header_bytes).map_err(|_| ConsensusError::SignHeaderError)?;
 
         let mut extra_data_mut = BytesMut::from(&header.extra_data[..]);
-        extra_data_mut[header.extra_data.len().saturating_sub(SIGNATURE_LENGTH)..].copy_from_slice(&sighash.as_bytes());
-        *extra_data_mut.last_mut().unwrap() -= 27;
+        if extra_data_mut.len() < SIGNATURE_LENGTH {
+            return Err(ConsensusError::MissingSignature);
+        }
+        let sig_offset = extra_data_mut.len() - SIGNATURE_LENGTH;
+        extra_data_mut[sig_offset..].copy_from_slice(&sighash.as_bytes());
+        const SIGNATURE_V_OFFSET: u8 = 27;
+        if let Some(last) = extra_data_mut.last_mut() {
+            *last -= SIGNATURE_V_OFFSET;
+        }
         header.extra_data = Bytes::from(extra_data_mut.freeze());
 
         let mut recent_headers = self.recent_headers.write().unwrap();
@@ -831,8 +856,11 @@ where
     ) -> U256 {
         self.init_recent_tds();
 
-        let mut recent_tds = self.recent_tds.write().unwrap();
-        let total_difficulty = *recent_tds.get(&hash).unwrap_or_else(|| panic!("td not found for hash {:?}", hash));
+        let mut recent_tds = self.recent_tds.write().unwrap_or_else(|e| e.into_inner());
+        let total_difficulty = recent_tds.get(&hash).copied().unwrap_or_else(|| {
+            warn!(target: "consensus::apos", ?hash, "td not found for hash, returning zero");
+            U256::ZERO
+        });
 
         debug!(target: "consensus::apos", ?hash, ?total_difficulty, "get total_difficulty");
         total_difficulty

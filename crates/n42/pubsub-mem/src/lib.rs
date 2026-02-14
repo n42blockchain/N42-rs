@@ -95,6 +95,10 @@ where
                         "event routed"
                     );
                 }
+                // Clean up empty topic after dropping dead subscribers
+                if router.topics.get(&event.topic).is_some_and(|l| l.is_empty()) {
+                    router.topics.remove(&event.topic);
+                }
             }
 
             RouterMsg::Subscribe { topic, tx, reply } => {
@@ -121,6 +125,10 @@ where
                 if let Some(list) = router.topics.get_mut(&topic) {
                     list.retain(|s| s.id != id);
                 }
+                // Clean up empty topic to prevent memory leak
+                if router.topics.get(&topic).is_some_and(|l| l.is_empty()) {
+                    router.topics.remove(&topic);
+                }
                 router.subs.remove(&id);
 
                 debug!(subscriber_id = id, topic = %topic,
@@ -134,6 +142,10 @@ where
                 if let Some(topic) = router.subs.remove(&id) {
                     if let Some(list) = router.topics.get_mut(&topic) {
                         list.retain(|s| s.id != id);
+                    }
+                    // Clean up empty topic to prevent memory leak
+                    if router.topics.get(&topic).is_some_and(|l| l.is_empty()) {
+                        router.topics.remove(&topic);
                     }
 
                     debug!(subscriber_id = id, topic = %topic,

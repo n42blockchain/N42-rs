@@ -263,12 +263,14 @@ impl Snapshot
             }
 
             //Count new votes
-            let authorize = match header.nonce()
-                .ok_or(VotingError::InvalidVotingChain)?
-            {
-                nonce if hex::encode(nonce) == hex::encode(NONCE_AUTH_VOTE) => true,
-                nonce if hex::encode(nonce) == hex::encode(NONCE_DROP_VOTE) => false,
-                _ => return Err(VotingError::InvalidVote),
+            let nonce = header.nonce()
+                .ok_or(VotingError::InvalidVotingChain)?;
+            let authorize = if nonce == NONCE_AUTH_VOTE {
+                true
+            } else if nonce == NONCE_DROP_VOTE {
+                false
+            } else {
+                return Err(VotingError::InvalidVote);
             };
 
             if snap.cast(header.beneficiary(), authorize) {
@@ -354,6 +356,9 @@ impl Snapshot
     /// inturn returns if a signer at a given block height is in-turn or not.
     pub fn inturn(&self, number: u64, signer: &Address) -> bool {
         let signers = self.signers();
+        if signers.is_empty() || number == 0 {
+            return false;
+        }
         let mut offset = 0;
 
         //Find the position of the given signer in the sorted list

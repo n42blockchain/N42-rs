@@ -115,8 +115,9 @@ mod ssz_requests_conversions {
                         return Err(TryFromRequestsError::EmptyRequest);
                     }
 
-                    let (request_type, payload) =
-                        request.split_first().expect("already checked for empty");
+                    let (request_type, payload) = request
+                        .split_first()
+                        .ok_or(TryFromRequestsError::EmptyRequest)?;
 
                     match *request_type {
                         DEPOSIT_REQUEST_TYPE => {

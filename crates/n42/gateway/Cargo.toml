@@ -1,0 +1,40 @@
+[package]
+name = "n42-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+exclude.workspace = true
+
+[dependencies]
+# n42
+n42-clique.workspace = true
+n42-primitives.workspace = true
+
+# alloy
+alloy-primitives.workspace = true
+alloy-rpc-types-beacon.workspace = true
+
+# BLS
+blst.workspace = true
+
+# async
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+futures-util.workspace = true
+
+# serialization
+serde.workspace = true
+serde_json.workspace = true
+ethereum_ssz.workspace = true
+
+# misc
+eyre.workspace = true
+tracing.workspace = true
+hex = "0.4"
+fxhash = "0.2"
+
+[lints]
+workspace = true

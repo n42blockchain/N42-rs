@@ -34,12 +34,16 @@ fn main() {
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
     }
 
-    let (verification_tx, verification_rx) = mpsc::channel(100);
-    let (broadcast_tx, _broadcast_rx) = broadcast::channel::<(UnverifiedBlock, Arc<Vec<BLSPubkey>>)>(100);
+    // Channel capacities sized for million-validator scale:
+    // - verification: high volume of individual BLS signature submissions
+    // - broadcast: one message per committee per block
+    // - router: fan-out from broadcast to individual validator topics
+    let (verification_tx, verification_rx) = mpsc::channel(10_000);
+    let (broadcast_tx, _broadcast_rx) = broadcast::channel::<(UnverifiedBlock, Arc<Vec<BLSPubkey>>)>(1_000);
     let broadcast_tx_clone_for_miner = broadcast_tx.clone();
 
     // Create router channel for pubsub
-    let (router_tx, router_rx) = mpsc::channel::<RouterMsg<UnverifiedBlock>>(100);
+    let (router_tx, router_rx) = mpsc::channel::<RouterMsg<UnverifiedBlock>>(10_000);
     let router_tx_clone = router_tx.clone();
     let router_tx_for_bridge = router_tx.clone();
     let broadcast_rx_for_bridge = broadcast_tx.subscribe();

@@ -3,6 +3,7 @@
 
 //! Consensus client
 
+pub mod aggregation_pipeline;
 pub mod beacon;
 pub mod metrics;
 pub mod migrate;

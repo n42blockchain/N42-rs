@@ -151,6 +151,36 @@ pub fn beacon_chain_spec() -> ChainSpec {
     }
 }
 
+/// Returns dynamically adjusted committee parameters based on total active validator count.
+///
+/// At million-validator scale, not every validator needs to attest every slot.
+/// This function scales `max_committees_per_slot` and `target_committee_size` so that:
+/// - Small networks (<= 1K): 4 committees × 4 validators = 16 validators/slot
+/// - Medium networks (1K-100K): 16 committees × 128 validators = 2,048 validators/slot
+/// - Large networks (100K-1M): 64 committees × 256 validators = 16,384 validators/slot
+/// - Mega networks (>1M): 128 committees × 512 validators = 65,536 validators/slot
+///
+/// With 32 slots per epoch, all validators rotate through within 1 epoch:
+/// - 1M validators / 16,384 per slot = ~61 slots ≈ 2 epochs
+pub fn dynamic_committee_params(total_validators: usize) -> (usize, usize) {
+    match total_validators {
+        0..=1_000 => (4, 4),
+        1_001..=100_000 => (16, 128),
+        100_001..=1_000_000 => (64, 256),
+        _ => (128, 512),
+    }
+}
+
+/// Returns a `ChainSpec` with committee parameters dynamically adjusted
+/// for the given active validator count.
+pub fn beacon_chain_spec_for_validators(total_validators: usize) -> ChainSpec {
+    let (max_committees, target_size) = dynamic_committee_params(total_validators);
+    let mut spec = beacon_chain_spec();
+    spec.max_committees_per_slot = max_committees;
+    spec.target_committee_size = target_size;
+    spec
+}
+
 /*
 pub const inactivity_score_bias: u64 = 1;
 pub const inactivity_score_recovery_rate: u64 = 5;
@@ -899,8 +929,8 @@ impl BeaconState {
         }
         let pubkeys_refs: Vec<&PublicKey> = pubkeys.iter().collect();
 
-        // Use JSON encoding for signature verification
-        let bytes: Vec<u8> = serde_json::to_vec(&attestation.data)?;
+        // Use SSZ encoding for deterministic signature verification
+        let bytes: Vec<u8> = attestation.data.as_ssz_bytes();
         let bytes_slice: &[u8] = &bytes;
 
         let aggregate_sig_verify_result = sig.to_signature().fast_aggregate_verify(
@@ -958,8 +988,8 @@ impl BeaconState {
             }
             all_pubkeys.push(pubkeys);
 
-            // Use JSON encoding
-            all_messages.push(serde_json::to_vec(&attestation.data)?);
+            // Use SSZ encoding for deterministic serialization
+            all_messages.push(attestation.data.as_ssz_bytes());
         }
 
         // Verify each attestation's aggregate signature
@@ -1983,6 +2013,14 @@ impl BeaconState {
         active
     }
 
+    /// Returns the count of active validators at the given epoch without allocating a Vec.
+    pub fn get_active_validator_count(&self, epoch: Epoch) -> usize {
+        self.validators_store
+            .iter()
+            .filter(|v| v.is_active_at(epoch))
+            .count()
+    }
+
     /*
         /// Get all of the Beacon committees at a given relative epoch.
         ///
@@ -2024,7 +2062,8 @@ impl BeaconState {
         relative_epoch: RelativeEpoch,
     ) -> eyre::Result<CommitteeCache> {
         let epoch = relative_epoch.into_epoch(self.current_epoch());
-        let spec = beacon_chain_spec();
+        let active_count = self.get_active_validator_count(epoch);
+        let spec = beacon_chain_spec_for_validators(active_count);
         CommitteeCache::initialized(self, epoch, &spec)
     }
 }
@@ -2550,6 +2589,40 @@ mod tests {
     }
 
     #[test]
+    fn test_dynamic_committee_params() {
+        // Small network
+        assert_eq!(dynamic_committee_params(100), (4, 4));
+        assert_eq!(dynamic_committee_params(1000), (4, 4));
+
+        // Medium network
+        assert_eq!(dynamic_committee_params(1001), (16, 128));
+        assert_eq!(dynamic_committee_params(50_000), (16, 128));
+        assert_eq!(dynamic_committee_params(100_000), (16, 128));
+
+        // Large network
+        assert_eq!(dynamic_committee_params(100_001), (64, 256));
+        assert_eq!(dynamic_committee_params(500_000), (64, 256));
+        assert_eq!(dynamic_committee_params(1_000_000), (64, 256));
+
+        // Mega network
+        assert_eq!(dynamic_committee_params(1_000_001), (128, 512));
+        assert_eq!(dynamic_committee_params(5_000_000), (128, 512));
+    }
+
+    #[test]
+    fn test_beacon_chain_spec_for_validators() {
+        let spec_small = beacon_chain_spec_for_validators(500);
+        assert_eq!(spec_small.max_committees_per_slot, 4);
+        assert_eq!(spec_small.target_committee_size, 4);
+
+        let spec_large = beacon_chain_spec_for_validators(500_000);
+        assert_eq!(spec_large.max_committees_per_slot, 64);
+        assert_eq!(spec_large.target_committee_size, 256);
+        // Other fields unchanged
+        assert_eq!(spec_large.min_activation_balance, 32000000000);
+    }
+
+    #[test]
     fn test_relative_epoch_into_epoch() {
         let base_epoch: u64 = 10;
 
@@ -2724,6 +2797,7 @@ mod tests {
     #[test]
     fn test_attestation_signature_roundtrip() {
         use blst::min_pk::{AggregateSignature, PublicKey, SecretKey, Signature};
+        use ssz::Encode;
 
         // Generate a test keypair
         let ikm = [1u8; 32]; // Use fixed seed for reproducibility
@@ -2737,8 +2811,8 @@ mod tests {
             receipts_root: B256::from([0xab; 32]),
         };
 
-        // Sign using JSON serialization (same as mobile-sdk client)
-        let bytes: Vec<u8> = serde_json::to_vec(&attestation_data).unwrap();
+        // Sign using SSZ serialization (deterministic, same as mobile-sdk client)
+        let bytes: Vec<u8> = attestation_data.as_ssz_bytes();
         let sig = sk.sign(&bytes, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[]);
 
         // Verify the signature directly (same as miner.rs verification)
@@ -2786,6 +2860,7 @@ mod tests {
     #[test]
     fn test_attestation_signature_multiple_validators() {
         use blst::min_pk::{AggregateSignature, PublicKey, SecretKey};
+        use ssz::Encode;
 
         // Generate multiple keypairs
         let mut secret_keys = Vec::new();
@@ -2805,8 +2880,8 @@ mod tests {
             receipts_root: B256::from([0xcd; 32]),
         };
 
-        // Sign with each validator and aggregate using JSON serialization
-        let bytes: Vec<u8> = serde_json::to_vec(&attestation_data).unwrap();
+        // Sign with each validator and aggregate using SSZ serialization
+        let bytes: Vec<u8> = attestation_data.as_ssz_bytes();
         let mut agg_sig: Option<AggregateSignature> = None;
 
         for sk in &secret_keys {
@@ -2839,7 +2914,7 @@ mod tests {
     }
 
     #[test]
-    fn test_attestation_signature_json_vs_ssz_mismatch() {
+    fn test_attestation_signature_ssz_deterministic() {
         use blst::min_pk::SecretKey;
         use ssz::Encode;
 
@@ -2855,16 +2930,15 @@ mod tests {
             receipts_root: B256::from([0xef; 32]),
         };
 
-        // Sign using JSON serialization (the correct one now)
-        let json_bytes: Vec<u8> = serde_json::to_vec(&attestation_data).unwrap();
+        // Sign using SSZ serialization (deterministic and fast)
+        let ssz_bytes: Vec<u8> = attestation_data.as_ssz_bytes();
         let sig = sk.sign(
-            &json_bytes,
+            &ssz_bytes,
             alloy_rpc_types_beacon::constants::BLS_DST_SIG,
             &[],
         );
 
-        // Try to verify using SSZ serialization (should fail)
-        let ssz_bytes: Vec<u8> = attestation_data.as_ssz_bytes();
+        // Verify using SSZ serialization (should succeed)
         let err = sig.verify(
             true,
             &ssz_bytes,
@@ -2873,13 +2947,18 @@ mod tests {
             &pk,
             true,
         );
-        assert_ne!(
+        assert_eq!(
             err,
             blst::BLST_ERROR::BLST_SUCCESS,
-            "Verification should fail when using different serialization"
+            "SSZ-signed attestation should verify with SSZ encoding"
         );
 
-        // Verify using JSON serialization (should succeed)
+        // SSZ encoding should be deterministic across multiple calls
+        let ssz_bytes_2: Vec<u8> = attestation_data.as_ssz_bytes();
+        assert_eq!(ssz_bytes, ssz_bytes_2, "SSZ encoding must be deterministic");
+
+        // Try to verify using JSON serialization (should fail - different encoding)
+        let json_bytes: Vec<u8> = serde_json::to_vec(&attestation_data).unwrap();
         let err = sig.verify(
             true,
             &json_bytes,
@@ -2888,10 +2967,10 @@ mod tests {
             &pk,
             true,
         );
-        assert_eq!(
+        assert_ne!(
             err,
             blst::BLST_ERROR::BLST_SUCCESS,
-            "Verification should succeed with matching serialization"
+            "SSZ-signed attestation should NOT verify with JSON encoding"
         );
     }
 }

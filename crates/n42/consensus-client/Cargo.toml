@@ -84,6 +84,7 @@ schnellru.workspace = true
 itertools.workspace = true
 alloy-sol-types.workspace = true
 blst.workspace = true
+rayon.workspace = true
 
 op-alloy-rpc-types-engine = { workspace = true, optional = true }
 

@@ -7,6 +7,7 @@ use jsonrpsee::rpc_params;
 use jsonrpsee::ws_client::WsClientBuilder;
 use n42_clique::UnverifiedBlock;
 use n42_primitives::AttestationData;
+use ssz::Encode;
 use reth_chainspec::{ChainSpec, ChainSpecBuilder, EthereumHardfork, ForkCondition, N42_DEVNET};
 use reth_ethereum_primitives::{Block, Receipt};
 use reth_evm::execute::Executor;
@@ -27,6 +28,8 @@ pub mod jni;
 pub mod c_ffi;
 
 pub mod blst_utils;
+
+pub mod resilient_client;
 
 pub async fn run_client(ws_url: &str, validator_private_key: &str) -> eyre::Result<()> {
     let validator_private_key = validator_private_key
@@ -72,8 +75,8 @@ pub async fn run_client(ws_url: &str, validator_private_key: &str) -> eyre::Resu
                             receipts_root,
                         };
 
-                        // Use JSON encoding for consistent serialization with server-side verification
-                        let bytes: Vec<u8> = serde_json::to_vec(&attestation_data)?;
+                        // Use SSZ encoding for deterministic serialization consistent with server-side
+                        let bytes: Vec<u8> = attestation_data.as_ssz_bytes();
                         let bytes_slice: &[u8] = &bytes;
 
                         let msg = bytes_slice;
@@ -131,8 +134,10 @@ fn verify(mut unverifiedblock: UnverifiedBlock) -> eyre::Result<B256> {
     println!("verify, {unverifiedblock:?}");
     let provider_1 = MockEthProvider::default();
     let state = StateProviderDatabase::new(provider_1);
+    // Arc::make_mut clones only if refcount > 1; after deserialization refcount is always 1
+    let cached_reads = std::sync::Arc::make_mut(&mut unverifiedblock.db);
     let db = State::builder()
-        .with_database(unverifiedblock.db.as_db_mut(state))
+        .with_database(cached_reads.as_db_mut(state))
         .build();
     let chain_spec = Arc::new(
         ChainSpecBuilder::from(&*N42_DEVNET)

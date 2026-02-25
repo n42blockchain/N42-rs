@@ -546,7 +546,9 @@ where
                 let signer = recover_address_generic(&header)?;
                 Ok(signer)
             })
-            .map_err(|_| ConsensusError::InvalidDifficulty)?;
+            .map_err(|e| ConsensusError::AposErrorDetail {
+                detail: format!("snapshot apply failed: {e}"),
+            })?;
 
         recents.insert(snap.hash, snap.clone());
 

@@ -220,7 +220,7 @@ where
 
         let start_timestamp = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("System time is before UNIX epoch")
+            .unwrap_or_default()
             .as_secs();
         let miner = Self {
             provider,
@@ -545,17 +545,12 @@ where
     }
 
     fn get_safe_block_num_hash_from_provider(&mut self) -> eyre::Result<BlockNumHash> {
-        let mut safe_block_number = self
-            .provider
-            .safe_block_number()
-            .unwrap_or(Some(0))
-            .unwrap_or(0);
+        let mut safe_block_number =
+            self.provider.safe_block_number().ok().flatten().unwrap_or(0);
         if safe_block_number == 0 {
             if let Ok(db_provider) = self.provider.database_provider_ro() {
-                safe_block_number = db_provider
-                    .last_safe_block_number()
-                    .unwrap_or(Some(0))
-                    .unwrap_or(0);
+                safe_block_number =
+                    db_provider.last_safe_block_number().ok().flatten().unwrap_or(0);
             }
         }
 
@@ -572,11 +567,8 @@ where
     }
 
     fn determine_safe_block(&mut self) -> eyre::Result<BlockNumHash> {
-        let mut safe_block_number = self
-            .provider
-            .safe_block_number()
-            .unwrap_or(Some(0))
-            .unwrap_or(0);
+        let mut safe_block_number =
+            self.provider.safe_block_number().ok().flatten().unwrap_or(0);
 
         let best_block_number = self.provider.best_block_number()?;
         let header = self
@@ -710,7 +702,7 @@ where
         let bytes_slice: &[u8] = &bytes;
         let err = signature.verify(true, bytes_slice, alloy_rpc_types_beacon::constants::BLS_DST_SIG, &[], &pubkey, true);
         if err != blst::BLST_ERROR::BLST_SUCCESS {
-            return Err(eyre::eyre!("{verification_result:?}"));
+            return Err(eyre::eyre!("BLS signature verification failed: {err:?}"));
         }
         debug!(target: "consensus-client", "sig verify result: {:?}", err);
 

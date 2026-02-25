@@ -26,7 +26,7 @@ use reth_node_core::primitives::AlloyBlockHeader;
 use reth_provider::{BeaconProvider, BlockIdReader, BlockReader, HeaderProvider};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// trait interface for a custom rpc namespace: `consensus`
 ///
@@ -63,11 +63,15 @@ where
     Provider: HeaderProvider + Clone + Send + Sync + 'static,
 {
     fn propose(&self, address: Address, auth: bool) -> RpcResult<()> {
-        Ok(self.consensus.propose(address, auth).unwrap_or_default())
+        self.consensus
+            .propose(address, auth)
+            .map_err(|e| ErrorObject::owned(INTERNAL_ERROR_CODE, e.to_string(), None::<()>))
     }
 
     fn discard(&self, address: Address) -> RpcResult<()> {
-        Ok(self.consensus.discard(address).unwrap_or_default())
+        self.consensus
+            .discard(address)
+            .map_err(|e| ErrorObject::owned(INTERNAL_ERROR_CODE, e.to_string(), None::<()>))
     }
 
     fn get_snapshot(&self, number: u64) -> RpcResult<Snapshot> {
@@ -83,7 +87,9 @@ where
     }
 
     fn proposals(&self) -> RpcResult<HashMap<Address, bool>> {
-        Ok(self.consensus.proposals().unwrap_or_default())
+        self.consensus
+            .proposals()
+            .map_err(|e| ErrorObject::owned(INTERNAL_ERROR_CODE, e.to_string(), None::<()>))
     }
 }
 
@@ -176,12 +182,17 @@ where
                         debug!(target: "reth::cli", ?subscription_id, "subscribe_to_verification_request client disconnected");
                         break;
                     }
-                    let message = SubscriptionMessage::new(
+                    let message = match SubscriptionMessage::new(
                         "subscribeToVerificationRequest",
                         subscription_id.clone(),
                         &data_to_be_verified,
-                    )
-                    .unwrap();
+                    ) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            debug!(target: "reth::cli", ?subscription_id, ?e, "subscribe_to_verification_request failed to serialize message");
+                            break;
+                        }
+                    };
                     if let Err(e) = sink.send(message).await {
                         debug!(target: "reth::cli", ?subscription_id, ?e, "subscribe_to_verification_request Error sending to client");
                         break;
@@ -207,7 +218,10 @@ where
             attestation_data,
             block_hash,
         };
-        let _ = self.verification_tx.try_send(v);
+        self.verification_tx.try_send(v).map_err(|e| {
+            warn!(target: "reth::cli", "verification_tx full, dropping result: {e}");
+            ErrorObject::owned(INTERNAL_ERROR_CODE, "verification queue full, retry later", None::<()>)
+        })?;
         Ok(())
     }
 

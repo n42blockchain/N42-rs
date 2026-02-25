@@ -39,7 +39,7 @@ fn main() {
     // - broadcast: one message per committee per block
     // - router: fan-out from broadcast to individual validator topics
     let (verification_tx, verification_rx) = mpsc::channel(10_000);
-    let (broadcast_tx, _broadcast_rx) = broadcast::channel::<(UnverifiedBlock, Arc<Vec<BLSPubkey>>)>(1_000);
+    let (broadcast_tx, _broadcast_rx) = broadcast::channel::<(UnverifiedBlock, Arc<Vec<BLSPubkey>>)>(10_000);
     let broadcast_tx_clone_for_miner = broadcast_tx.clone();
 
     // Create router channel for pubsub
@@ -107,7 +107,7 @@ fn main() {
                     let provider = ctx.provider().clone();
 
                     // Store consensus reference for later use
-                    *consensus_holder_clone.lock().unwrap() =
+                    *consensus_holder_clone.lock().unwrap_or_else(|e| e.into_inner()) =
                         Some(std::sync::Arc::new(consensus.clone()));
 
                     let beacon_ext = ConsensusBeaconExt {
@@ -135,14 +135,17 @@ fn main() {
             // Get the stored consensus instance
             let consensus = consensus_holder
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .clone()
-                .expect("consensus should be set");
+                .ok_or_else(|| eyre::eyre!("consensus not initialized"))?;
 
             let node_config_dev = node.config.clone().dev();
             let consensus_signer_private_key = node_config_dev.dev.consensus_signer_private_key;
             let signer_address = if let Some(signer_private_key) = &consensus_signer_private_key {
-                let eth_signer: PrivateKeySigner = signer_private_key.to_string().parse().unwrap();
+                let eth_signer: PrivateKeySigner = signer_private_key
+                    .to_string()
+                    .parse()
+                    .map_err(|e| eyre::eyre!("invalid consensus signer private key: {e}"))?;
                 Some(eth_signer.address())
             } else {
                 None

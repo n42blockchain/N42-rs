@@ -1,26 +1,12 @@
 use n42_clique::APos;
-use n42_consensus_traits::SignerManager;
 use reth_chainspec::ChainSpec;
-use reth_consensus::FullConsensus;
-use reth_ethereum_primitives::EthPrimitives;
 use reth_node_api::FullNodeTypes;
 use reth_node_builder::components::ConsensusBuilder;
 use reth_node_builder::{BuilderContext, NodeTypes};
+use reth_ethereum_primitives::EthPrimitives;
 use std::any::Any;
 use std::fmt;
 use std::sync::{Arc, Mutex};
-
-/// Combined trait for N42 consensus that includes both FullConsensus and SignerManager.
-pub trait N42FullConsensus:
-    FullConsensus<EthPrimitives> + SignerManager
-{
-}
-
-// Blanket implementation for any type that implements both traits
-impl<T> N42FullConsensus for T where
-    T: FullConsensus<EthPrimitives> + SignerManager
-{
-}
 
 /// A basic ethereum consensus builder.
 ///
@@ -68,6 +54,14 @@ where
             if let Some(arc) = cached.downcast_ref::<Arc<APos<Node::Provider, ChainSpec>>>() {
                 return Ok(arc.clone());
             }
+            // The cached instance has a different concrete type — two distinct
+            // Node::Provider types are sharing one N42ConsensusBuilder, which is
+            // not supported.  Bail loudly instead of silently creating a second
+            // APos instance that would break the shared-signer-key mechanism.
+            return Err(eyre::eyre!(
+                "N42ConsensusBuilder: cached consensus type mismatch; \
+                 all clones must use the same Node::Provider type"
+            ));
         }
 
         // First call: create the consensus and cache it for all other clones.

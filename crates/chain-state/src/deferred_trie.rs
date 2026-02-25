@@ -316,13 +316,18 @@ impl DeferredTrieData {
         // In reth v1.11.1, the proof_task closure can call wait_cloned() from a
         // rayon worker thread during block finalization. The original debug_assert
         // would abort the process (via Rayon's "unexpected panic" handler). We
-        // degrade it to a warning-only to prevent test suite crashes.
+        // degrade it to a one-time warning to prevent both crashes and log flooding.
         #[cfg(feature = "rayon")]
-        if rayon::current_thread_index().is_some() {
-            tracing::warn!(
-                target: "engine::tree::deferred_trie",
-                "wait_cloned called from rayon worker thread - possible deadlock risk"
-            );
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if rayon::current_thread_index().is_some() && !WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    target: "engine::tree::deferred_trie",
+                    "wait_cloned called from rayon worker thread - possible deadlock risk \
+                     (this warning fires only once)"
+                );
+            }
         }
         let mut state = self.state.lock();
         match &mut *state {

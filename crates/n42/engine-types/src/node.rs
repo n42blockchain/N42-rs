@@ -74,12 +74,17 @@ impl N42Node {
             PayloadBuilderAttributes = EthPayloadBuilderAttributes,
         >,
     {
+        // A single builder is created and cloned so that both the engine and the
+        // payload-builder receive the *same* Arc<APos<...>> instance (via the shared
+        // Arc<Mutex<...>> inside N42ConsensusBuilder).  This ensures that signer-key
+        // rotation via Consensus::set_eth_signer_by_key affects both subsystems.
+        let consensus_builder = N42ConsensusBuilder::default();
         ComponentsBuilder::default()
             .node_types::<Node>()
             .pool(EthereumPoolBuilder::default())
             .executor(EthereumExecutorBuilder::default())
-            .consensus(N42ConsensusBuilder::default())
-            .payload(N42PayloadServiceBuilder::new(N42ConsensusBuilder::default()))
+            .consensus(consensus_builder.clone())
+            .payload(N42PayloadServiceBuilder::new(consensus_builder))
             .network(N42NetworkBuilder::default())
     }
 

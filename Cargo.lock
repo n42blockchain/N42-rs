@@ -8292,14 +8292,14 @@ dependencies = [
 
 [[package]]
 name = "reth-chain-state"
-version = "1.11.1"
-source = "git+https://github.com/paradigmxyz/reth.git?tag=v1.11.1#bef3d7b4d1da937fcccc9bbd6f8bd93e16380dc7"
+version = "2.1.6"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
  "alloy-primitives 1.5.7",
  "alloy-signer",
  "alloy-signer-local",
+ "codspeed-criterion-compat",
  "derive_more 2.1.1",
  "metrics",
  "parking_lot 0.12.5",
@@ -8313,6 +8313,7 @@ dependencies = [
  "reth-metrics",
  "reth-primitives-traits",
  "reth-storage-api",
+ "reth-testing-utils",
  "reth-trie",
  "revm-database",
  "revm-state",

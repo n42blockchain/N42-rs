@@ -4,7 +4,7 @@ use alloy_rpc_types_engine::ExecutionPayloadV3;
 use alloy_signer_local::PrivateKeySigner;
 use reth_chainspec::make_genesis_header;
 use reth_chainspec::{ChainSpec, N42};
-use reth_consensus::Consensus;
+use reth_consensus::{Consensus, ConsensusError};
 use reth_ethereum_engine_primitives::ExecutionPayloadEnvelopeV3;
 use reth_ethereum_forks::N42_HARDFORKS_FOR_CLIQUE_TEST;
 use reth_node_api::{EngineTypes, FullNodeComponents, FullNodeTypes, PayloadTypes};
@@ -77,7 +77,10 @@ fn get_addresses_from_extra_data(extra_data: Bytes) -> Vec<Address> {
 
 #[cfg(test)]
 async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(
-    node: &FullNode<Node, AddOns>, eth_signer_key: String) -> eyre::Result<()>
+    node: &FullNode<Node, AddOns>,
+    eth_signer_key: String,
+    set_signer: &(dyn Fn(Option<String>) -> Result<(), ConsensusError> + Sync),
+) -> eyre::Result<()>
     where <<<Node as FullNodeTypes>::Types as NodeTypes>::Payload as PayloadTypes>::PayloadBuilderAttributes: From<EthPayloadBuilderAttributes>,
     <<Node as FullNodeTypes>::Types as NodeTypes>::Primitives: NodePrimitives<Block = reth_ethereum_primitives::Block>,
     <<Node as FullNodeTypes>::Types as NodeTypes>::Payload: EngineTypes,
@@ -108,8 +111,9 @@ async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(
         PrivateKeySigner::from_bytes(&FixedBytes::from_str(&eth_signer_key).unwrap()).unwrap();
     let eth_signer_address = eth_signer.address();
     let attributes = n42_payload_attributes(timestamp, parent_hash, eth_signer_address);
-    // TODO: In reth v1.5.0, consensus field is private. Need to refactor to access through trait.
-    // node.consensus.set_eth_signer_by_key(Some(eth_signer_key.clone()))?;
+    // Update the active signer key in the APoS consensus engine before building the block.
+    // This enables key rotation for multi-signer tests (each block signed by a different validator).
+    set_signer(Some(eth_signer_key.clone()))?;
     let payload_id = node
         .payload_builder_handle
         .send_new_payload(attributes.clone().into())
@@ -202,36 +206,122 @@ impl CliqueTest {
         let mut accounts = TesterAccountPool::new();
         let chainspec = self.gen_chainspec(&mut accounts);
 
+        // Use the first authorized signer's actual private key so the APoS engine
+        // recognizes it as a valid signer (must match the address in genesis extra_data).
+        let first_signer_key = self
+            .signers
+            .first()
+            .map(|s| hex::encode(accounts.secret_key(s).secret_bytes()))
+            .unwrap_or_else(|| hex::encode(B256::random().as_slice()));
+
         let node_config = NodeConfig::new(Arc::new(chainspec))
             .with_network(network_config.clone())
             .with_unused_ports()
             .with_rpc(RpcServerArgs::default().with_unused_ports().with_http())
             .with_dev(DevArgs {
                 dev: false,
-                consensus_signer_private_key: Some(B256::random().to_string()),
+                consensus_signer_private_key: Some(first_signer_key),
                 ..Default::default()
             });
+
+        // Holder for the signer-setter closure, populated inside extend_rpc_modules.
+        // Using Arc<Mutex<Option<...>>> so the holder can be shared between the hook
+        // (FnOnce, 'static) and the test body without holding a MutexGuard across awaits.
+        type SetSignerFn = std::sync::Arc<
+            dyn Fn(Option<String>) -> Result<(), ConsensusError> + Send + Sync,
+        >;
+        type ProposeFn =
+            std::sync::Arc<dyn Fn(Address, bool) -> Result<(), ConsensusError> + Send + Sync>;
+        type DiscardFn =
+            std::sync::Arc<dyn Fn(Address) -> Result<(), ConsensusError> + Send + Sync>;
+
+        let signer_fn_holder: std::sync::Arc<std::sync::Mutex<Option<SetSignerFn>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let propose_fn_holder: std::sync::Arc<std::sync::Mutex<Option<ProposeFn>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let discard_fn_holder: std::sync::Arc<std::sync::Mutex<Option<DiscardFn>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let signer_fn_holder_for_hook = signer_fn_holder.clone();
+        let propose_fn_holder_for_hook = propose_fn_holder.clone();
+        let discard_fn_holder_for_hook = discard_fn_holder.clone();
 
         let NodeHandle { node, .. } = NodeBuilder::new(node_config.clone())
             .testing_node(runtime.clone())
             .with_types::<N42Node>()
             .with_components(N42Node::default().components_builder())
             .with_add_ons(N42Node::default().add_ons())
+            .extend_rpc_modules(move |ctx| {
+                // Capture a clone of the Arc<APos<...>> consensus handle.
+                // APos uses interior mutability (RwLock) so &self suffices for key/vote changes.
+                let consensus = ctx.node().consensus().clone();
+                let c_signer = consensus.clone();
+                let c_propose = consensus.clone();
+                let c_discard = consensus.clone();
+                // Use UFCS to resolve the Consensus<Block> impl uniquely — APos implements
+                // Consensus for multiple block-generic bounds, so the turbofish is required.
+                let setter: SetSignerFn = std::sync::Arc::new(move |key| {
+                    <_ as reth_consensus::Consensus<reth_ethereum_primitives::Block>>::set_eth_signer_by_key(&*c_signer, key)
+                });
+                let proposer: ProposeFn = std::sync::Arc::new(move |addr, auth| {
+                    <_ as reth_consensus::Consensus<reth_ethereum_primitives::Block>>::propose(
+                        &*c_propose,
+                        addr,
+                        auth,
+                    )
+                });
+                let discarder: DiscardFn = std::sync::Arc::new(move |addr| {
+                    <_ as reth_consensus::Consensus<reth_ethereum_primitives::Block>>::discard(
+                        &*c_discard,
+                        addr,
+                    )
+                });
+                *signer_fn_holder_for_hook.lock().unwrap() = Some(setter);
+                *propose_fn_holder_for_hook.lock().unwrap() = Some(proposer);
+                *discard_fn_holder_for_hook.lock().unwrap() = Some(discarder);
+                Ok(())
+            })
             .launch()
             .await?;
+
+        // Retrieve the closures populated by extend_rpc_modules above.
+        let set_signer: SetSignerFn = signer_fn_holder
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("signer setter must be initialised by extend_rpc_modules");
+        let propose: ProposeFn = propose_fn_holder
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("propose fn must be initialised by extend_rpc_modules");
+        let discard: DiscardFn = discard_fn_holder
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("discard fn must be initialised by extend_rpc_modules");
 
         let payload_events = node.payload_builder_handle.subscribe().await?;
         let mut payload_event_stream = payload_events.into_stream();
 
-        // TODO: In reth v1.5.0, consensus is not directly accessible from FullNode.
-        // For now, skip the consensus-related tests and just verify block production.
-        // This needs to be fixed by implementing a proper way to access consensus through NodeAddOns.
-
+        // Track the last voted-for address so we can clear the proposal before the next block.
+        // This ensures each block carries exactly the intended single vote (or no vote).
+        let mut prev_voted_addr: Option<Address> = None;
         for vote in &self.votes {
+            // Clear the previous block's proposal so it doesn't bleed into this block.
+            if let Some(prev_addr) = prev_voted_addr.take() {
+                discard(prev_addr)?;
+            }
+            // Register the current block's vote proposal (if any).
+            prev_voted_addr = if let (Some(voted_name), Some(auth)) = (&vote.voted, vote.auth) {
+                let voted_addr = accounts.address(voted_name);
+                propose(voted_addr, auth)?;
+                Some(voted_addr)
+            } else {
+                None
+            };
             let eth_signer_key = hex::encode(accounts.secret_key(&vote.signer).secret_bytes());
             println!("signer={} eth_signer_key={eth_signer_key:?}", vote.signer);
-            // Skip vote processing for now - consensus access needs refactoring
-            new_block(&node, eth_signer_key).await?;
+            new_block(&node, eth_signer_key, &*set_signer).await?;
         }
         let best_number = node.provider.chain_info().unwrap().best_number;
         let block_hash = node.provider.block_hash(best_number).unwrap().unwrap();

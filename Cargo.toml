@@ -28,7 +28,7 @@ members = [
     #"crates/engine/invalid-block-hooks/",
     #"crates/evm/",
     "crates/chainspec/",
-    #"crates/chain-state",
+    "crates/chain-state",
     "crates/node/builder/",
     #"crates/consensus/auto-seal/",
     "crates/consensus/consensus/",
@@ -648,7 +648,7 @@ reth-network-api = { path = "crates/net/network-api" }
 reth-network-peers = { path = "crates/net/peers"}
 # reth-rpc = { path = "crates/n42/reth-rpc" }  # Disabled: use upstream reth-rpc v1.9.3
 #reth-testing-utils={path="testing/testing-utils"}
-#reth-chain-state = { path = "crates/chain-state"}
+reth-chain-state = { path = "crates/chain-state"}
 
 [patch.crates-io]
 #alloy-genesis = { path = "./crates/n42/alloy-genesis" }

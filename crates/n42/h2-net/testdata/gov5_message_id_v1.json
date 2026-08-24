@@ -1,0 +1,35 @@
+{
+  "_comment": "gov5 internal/p2p.MsgID = hash.Hash(genesis||topic||data)[:20]; hash.Hash is Keccak256. Generated from gov5 common/hash.",
+  "vectors": [
+    {
+      "genesis_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "topic": "/n42/h2/4/ssz_snappy",
+      "data": "",
+      "message_id": "94878c4d2ba7416eb3131fa337e1ff08c5c53113"
+    },
+    {
+      "genesis_hash": "0100000000000000000000000000000000000000000000000000000000000000",
+      "topic": "/n42/h2/4/ssz_snappy",
+      "data": "6e3432",
+      "message_id": "ef7876d3c7e1f96e08a72918f232c765db6850ff"
+    },
+    {
+      "genesis_hash": "d4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3",
+      "topic": "/n42/h2/4/ssz_snappy",
+      "data": "deadbeef",
+      "message_id": "056859ab8013063a93a89d2455c3f0c2be8377b5"
+    },
+    {
+      "genesis_hash": "d4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3",
+      "topic": "/n42/h2/4",
+      "data": "deadbeef",
+      "message_id": "7b49ff5305ef38bbb782f0030c486dcf25512bc2"
+    },
+    {
+      "genesis_hash": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+      "topic": "/n42/h2/4/ssz_snappy",
+      "data": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+      "message_id": "3a2665c07b0dcf21b039e34683f0141ae253addf"
+    }
+  ]
+}

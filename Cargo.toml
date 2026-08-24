@@ -22,6 +22,14 @@ members = [
     "crates/n42/consensus-traits",
     "crates/n42/fusaka",
     "crates/n42/merkle_db_rs",
+    "crates/n42/bmt-core",
+    "crates/n42/h2-primitives",
+    "crates/n42/h2-wire",
+    "crates/n42/h2-consensus",
+    "crates/n42/h2-net",
+    "crates/n42/h2-execution",
+    "crates/n42/mobile-verify",
+    "crates/n42/twig-core",
     "crates/n42/storage",
     "crates/n42/ef-tests",
     #"crates/n42/mobile",
@@ -213,6 +221,14 @@ n42-engine-primitives = {path="crates/n42/engine-primitives"}
 consensus-client = {path="crates/n42/consensus-client"}
 mobile-sdk = {path="crates/n42/mobile-sdk"}
 pubsub-mem = {path="crates/n42/pubsub-mem"}
+n42-bmt-core = { path = "crates/n42/bmt-core" }
+n42-h2-primitives = { path = "crates/n42/h2-primitives" }
+n42-h2-wire = { path = "crates/n42/h2-wire" }
+n42-h2-consensus = { path = "crates/n42/h2-consensus" }
+n42-h2-net = { path = "crates/n42/h2-net" }
+n42-h2-execution = { path = "crates/n42/h2-execution" }
+n42-mobile-verify = { path = "crates/n42/mobile-verify" }
+n42-twig-core = { path = "crates/n42/twig-core" }
 merkle_db_rs = {path="crates/n42/merkle_db_rs"}
 n42-consensus-traits = {path="crates/n42/consensus-traits"}
 n42-consensus-core = {path="crates/n42/consensus-core"}
@@ -596,6 +612,7 @@ rocksdb = { version = "0.24" }
 rolling-file = "0.2.0"
 sha3 = "0.10.5"
 snap = "1.1.1"
+libp2p = { version = "0.56", default-features = false }
 socket2 = { version = "0.5", default-features = false }
 sysinfo = { version = "0.33", default-features = false }
 tracing-journald = "0.3"

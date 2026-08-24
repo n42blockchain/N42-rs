@@ -1,0 +1,4 @@
+# Cross-client interop fixtures are byte-exact contracts shared with ../N42-gov5.
+# A Windows checkout with core.autocrlf=true would rewrite them to CRLF and
+# produce phantom drift against the pinned SHA-256 values. Mirrors gov5's pin.
+crates/n42/*/testdata/*.json -text

@@ -1,0 +1,45 @@
+[package]
+name = "n42-h2-net"
+version.workspace = true
+edition.workspace = true
+# Ported from ../N42-26 (rustc 1.97). Higher than the workspace's 1.86: the twig
+# SIMD kernel uses AVX-512 intrinsics stabilised in 1.89, and the H2 codecs use
+# 1.87 APIs. Declared per-crate so the rest of the workspace keeps its MSRV.
+rust-version = "1.89"
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "gov5-compatible GossipSub transport for HotStuff-2 v4 finality observation"
+
+[dependencies]
+n42-h2-primitives.workspace = true
+n42-h2-wire.workspace = true
+n42-h2-consensus.workspace = true
+
+# secp256k1 is REQUIRED, not optional: gov5 nodes carry secp256k1 libp2p
+# identities, and without this feature the Noise handshake fails at
+# "Invalid public key: cargo feature `secp256k1` is not enabled".
+libp2p = { workspace = true, features = ["gossipsub", "tokio", "tcp", "noise", "yamux", "macros", "secp256k1", "request-response"] }
+futures = "0.3"
+snap.workspace = true
+# libp2p's Codec trait is #[async_trait], so the impl must be annotated too.
+async-trait = "0.1"
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+alloy-primitives = { workspace = true, features = ["serde"] }
+serde = { workspace = true, features = ["derive"] }
+thiserror.workspace = true
+tracing.workspace = true
+
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+serde_json.workspace = true
+hex.workspace = true
+snap.workspace = true
+n42-h2-consensus.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+[[example]]
+name = "h2_observer"
+path = "examples/h2_observer.rs"

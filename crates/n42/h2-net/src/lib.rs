@@ -1,0 +1,28 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! GossipSub transport for HotStuff-2 v4 cross-client traffic.
+//!
+//! This is the piece that lets a Rust node join a Go (gov5) fleet's gossip mesh
+//! and follow its finality. It carries the router parameters, topic strings, and
+//! message-ID function gov5 uses, so a Rust member behaves like a Go one at the
+//! pubsub layer; the envelope codec and the finality check live in
+//! [`n42_h2_wire`] and [`n42_h2_consensus`].
+//!
+//! Scope is deliberately the *observer* path: subscribe, decode, verify. There
+//! is no publish path here, because publishing means participating in
+//! consensus, and this repo does not yet carry the HotStuff-2 state machine.
+//! See `docs/N42_26_PORT.md`.
+
+pub mod config;
+pub mod message_id;
+pub mod observer;
+pub mod rpc;
+pub mod status;
+pub mod topic;
+
+pub use config::{gov5_gossipsub_config, max_gossip_wire_size};
+pub use message_id::{gov5_message_id_fn, gov5_message_id_parts};
+pub use observer::{H2V4Observer, ObserverConfig, ObserverError, ObserverEvent};
+pub use status::{Status, StatusError, STATUS_PROTOCOL};
+pub use topic::{h2_v4_topic, H2_V4_TOPIC, H2_V4_TOPIC_BASE};

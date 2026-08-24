@@ -1,0 +1,33 @@
+[package]
+name = "n42-twig-core"
+version.workspace = true
+edition.workspace = true
+# Ported from ../N42-26 (rustc 1.97). Higher than the workspace's 1.86: the twig
+# SIMD kernel uses AVX-512 intrinsics stabilised in 1.89, and the H2 codecs use
+# 1.87 APIs. Declared per-crate so the rest of the workspace keeps its MSRV.
+rust-version = "1.89"
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "QMDB-style twig engine (all-DRAM AlDBaran variant) — ported from N42-26"
+
+# Zero reth/mdbx dependencies: pure-blake3 QMDB-style twig engine + proof
+# verification, so mobile / FFI can verify twig proofs without the storage stack.
+
+[dependencies]
+blake3.workspace = true
+serde = { workspace = true, features = ["derive"] }
+thiserror.workspace = true
+# Optional: cross-shard parallelism for the builder. OFF by default so mobile/FFI
+# stays zero-dep (it only verifies proofs).
+rayon = { workspace = true, optional = true }
+
+[features]
+default = []
+rayon = ["dep:rayon"]
+
+[dev-dependencies]
+rand.workspace = true
+bincode.workspace = true
+serde_json.workspace = true
+hex.workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "n42-bmt-core"
+version.workspace = true
+edition.workspace = true
+# Ported from ../N42-26 (rustc 1.97). Higher than the workspace's 1.86: the twig
+# SIMD kernel uses AVX-512 intrinsics stabilised in 1.89, and the H2 codecs use
+# 1.87 APIs. Declared per-crate so the rest of the workspace keeps its MSRV.
+rust-version = "1.89"
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Sparse binary Merkle tree (SBMT) engine — ported from N42-26"
+
+# Zero reth/mdbx dependencies: pure-blake3 SBMT engine + proof verification, so
+# mobile / FFI can verify SBMT proofs without pulling the storage stack.
+
+[dependencies]
+blake3.workspace = true
+serde = { workspace = true, features = ["derive"] }
+thiserror.workspace = true

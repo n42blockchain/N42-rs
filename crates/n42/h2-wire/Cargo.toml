@@ -1,0 +1,25 @@
+[package]
+name = "n42-h2-wire"
+version.workspace = true
+edition.workspace = true
+# Ported from ../N42-26 (rustc 1.97). Higher than the workspace's 1.86: the twig
+# SIMD kernel uses AVX-512 intrinsics stabilised in 1.89, and the H2 codecs use
+# 1.87 APIs. Declared per-crate so the rest of the workspace keeps its MSRV.
+rust-version = "1.89"
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "HotStuff-2 cross-client wire codec: legacy H2 messages + chain-bound v4 envelope/domains — ported from N42-26"
+
+[dependencies]
+n42-h2-primitives.workspace = true
+alloy-primitives = { workspace = true, features = ["serde"] }
+serde = { workspace = true, features = ["derive"] }
+bincode.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+snap.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+hex.workspace = true

@@ -1,0 +1,29 @@
+[package]
+name = "n42-h2-primitives"
+version.workspace = true
+edition.workspace = true
+# Ported from ../N42-26 (rustc 1.97). Higher than the workspace's 1.86: the twig
+# SIMD kernel uses AVX-512 intrinsics stabilised in 1.89, and the H2 codecs use
+# 1.87 APIs. Declared per-crate so the rest of the workspace keeps its MSRV.
+rust-version = "1.89"
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "HotStuff-2 consensus primitives: BLS keys/aggregation and the chain-bound v4 interop wire format — ported from N42-26"
+
+# Zero reth coupling: BLS + consensus message codec only, so the Go<->Rust
+# interop contract can be verified without the execution stack.
+
+[dependencies]
+blst.workspace = true
+bitvec = { version = "1.0", features = ["serde"] }
+alloy-primitives = { workspace = true, features = ["serde"] }
+serde = { workspace = true, features = ["derive"] }
+bincode.workspace = true
+thiserror.workspace = true
+derive_more.workspace = true
+zeroize = { version = "1", features = ["derive"] }
+getrandom = "0.4"
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -1,0 +1,30 @@
+[package]
+name = "n42-h2-consensus"
+version.workspace = true
+edition.workspace = true
+# Ported from ../N42-26 (rustc 1.97). Higher than the workspace's 1.86: the twig
+# SIMD kernel uses AVX-512 intrinsics stabilised in 1.89, and the H2 codecs use
+# 1.87 APIs. Declared per-crate so the rest of the workspace keeps its MSRV.
+rust-version = "1.89"
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "HotStuff-2 validator set and read-only H2-v4 finality verification — ported from N42-26"
+
+[dependencies]
+n42-h2-primitives.workspace = true
+n42-h2-wire.workspace = true
+alloy-primitives = { workspace = true, features = ["serde"] }
+bitvec = { version = "1.0", features = ["serde"] }
+sha2.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+tracing.workspace = true
+blake3.workspace = true
+bincode.workspace = true
+serde = { workspace = true, features = ["derive"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+hex.workspace = true
+sha2.workspace = true

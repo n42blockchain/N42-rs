@@ -1,0 +1,22 @@
+[package]
+name = "n42-h2-execution"
+version.workspace = true
+edition.workspace = true
+# Ported from ../N42-26 (rustc 1.97); see the note in the sibling h2 crates.
+rust-version = "1.89"
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Execution-layer seam and driver connecting HotStuff-2 consensus to an Engine API"
+
+[dependencies]
+n42-h2-consensus.workspace = true
+alloy-primitives = { workspace = true, features = ["serde"] }
+alloy-rpc-types-engine.workspace = true
+async-trait = "0.1"
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+n42-h2-primitives.workspace = true

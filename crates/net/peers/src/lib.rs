@@ -80,6 +80,8 @@ pub mod trusted_peer;
 pub use trusted_peer::TrustedPeer;
 
 mod bootnodes;
+/// N42 bootnode lists, kept separate from upstream's.
+pub mod n42_bootnodes;
 pub use bootnodes::*;
 
 /// This tag should be set to indicate to libsecp256k1 that the following bytes denote an

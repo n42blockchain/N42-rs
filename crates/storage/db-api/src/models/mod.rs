@@ -1,3 +1,6 @@
+// N42 beacon/validator/snapshot codecs moved to n42-primitives::db_codec:
+// reth moved Compress/Decompress into reth-codecs, so implementing them here
+// for n42-primitives types violates the orphan rule.
 //! Implements data structures specific to the database
 
 use crate::{
@@ -11,14 +14,11 @@ use reth_trie_common::{StoredNibbles, StoredNibblesSubKey, *};
 use serde::{Deserialize, Serialize};
 
 pub mod accounts;
-mod beacon;
 pub mod blocks;
 pub mod integer_list;
 pub mod metadata;
 pub mod sharded_key;
-mod snapshot;
 pub mod storage_sharded_key;
-mod validator;
 
 pub use accounts::*;
 pub use blocks::*;

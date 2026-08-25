@@ -1,7 +1,11 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Bootnodes for the network
 //!
 //! Ethereum bootnodes come from <https://github.com/ledgerwatch/erigon/blob/devel/params/bootnodes.go>
 
+use crate::n42_bootnodes::{N42_BOOTNODES, N42_TESTNET_BOOTNODES};
 use crate::NodeRecord;
 use alloc::vec::Vec;
 
@@ -59,4 +63,14 @@ pub fn hoodi_nodes() -> Vec<NodeRecord> {
 /// Parses all the nodes
 pub fn parse_nodes(nodes: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<NodeRecord> {
     nodes.into_iter().map(|s| s.as_ref().parse().unwrap()).collect()
+}
+
+/// Returns parsed N42 mainnet nodes.
+pub fn n42_nodes() -> Vec<NodeRecord> {
+    parse_nodes(&N42_BOOTNODES[..])
+}
+
+/// Returns parsed N42 testnet nodes.
+pub fn n42_testnet_nodes() -> Vec<NodeRecord> {
+    parse_nodes(&N42_TESTNET_BOOTNODES[..])
 }

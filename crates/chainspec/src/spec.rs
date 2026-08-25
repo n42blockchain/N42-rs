@@ -27,7 +27,12 @@ use alloy_eips::{
     eip1559::INITIAL_BASE_FEE, eip7685::EMPTY_REQUESTS_HASH, eip7840::BlobParams,
     eip7892::BlobScheduleBlobParams, eip7928::EMPTY_BLOCK_ACCESS_LIST_HASH,
 };
-use alloy_genesis::Genesis;
+// These live in alloy-hardforks, re-exported through reth-ethereum-forks.
+use reth_ethereum_forks::ethereum::{
+    mainnet::{MAINNET_PARIS_BLOCK, MAINNET_PARIS_TTD},
+    sepolia::{SEPOLIA_PARIS_BLOCK, SEPOLIA_PARIS_TTD},
+};
+use alloy_genesis::{ChainConfig, Genesis};
 use alloy_primitives::{address, b256, Address, BlockNumber, B256, U256};
 use alloy_trie::root::state_root_ref_unhashed;
 use core::fmt::Debug;
@@ -38,7 +43,7 @@ use reth_ethereum_forks::{
     N42_HARDFORKS,
 };
 use reth_network_peers::{
-    holesky_nodes, hoodi_nodes, mainnet_nodes, n42_testnet_nodes, op_nodes, op_testnet_nodes,
+    holesky_nodes, hoodi_nodes, mainnet_nodes, n42_testnet_nodes,
     sepolia_nodes, NodeRecord,
 };
 use reth_primitives_traits::{sync::LazyLock, SealedHeader};
@@ -412,31 +417,6 @@ pub fn mainnet_chain_config() -> ChainConfig {
     )
 }
 
-/// Converts the given [`BlobScheduleBlobParams`] into blobs schedule.
-pub fn blob_params_to_schedule(
-    params: &BlobScheduleBlobParams,
-    hardforks: &ChainHardforks,
-) -> BTreeMap<String, BlobParams> {
-    let mut schedule = BTreeMap::new();
-    schedule.insert("cancun".to_string(), params.cancun);
-    schedule.insert("prague".to_string(), params.prague);
-    schedule.insert("osaka".to_string(), params.osaka);
-
-    // Map scheduled entries back to bpo fork names by matching timestamps
-    let bpo_forks = EthereumHardfork::bpo_variants();
-    for (timestamp, blob_params) in &params.scheduled {
-        for bpo_fork in bpo_forks {
-            if let ForkCondition::Timestamp(fork_ts) = hardforks.fork(bpo_fork) &&
-                fork_ts == *timestamp
-            {
-                schedule.insert(bpo_fork.name().to_lowercase(), *blob_params);
-                break;
-            }
-        }
-    }
-
-    schedule
-}
 
 /// A wrapper around [`BaseFeeParams`] that allows for specifying constant or dynamic EIP-1559
 /// parameters based on the active [Hardfork].
@@ -908,14 +888,8 @@ impl ChainSpec {
             C::Holesky => Some(holesky_nodes()),
             C::Hoodi => Some(hoodi_nodes()),
             // opstack uses the same bootnodes for all chains: <https://github.com/paradigmxyz/reth/issues/14603>
-            C::Base | C::Optimism | C::Unichain | C::World => Some(op_nodes()),
-            C::OptimismSepolia | C::BaseSepolia | C::UnichainSepolia | C::WorldSepolia => {
-                Some(op_testnet_nodes())
-            }
 
             // fallback for optimism chains
-            chain if chain.is_optimism() && chain.is_testnet() => Some(op_testnet_nodes()),
-            chain if chain.is_optimism() => Some(op_nodes()),
             _ => None,
         }
     }

@@ -2,7 +2,7 @@
 name = "alloy-rpc-types-engine"
 description = "Types for the `engine` Ethereum JSON-RPC namespace"
 
-version = "1.6.3"
+version = "2.4.1"
 #version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -74,9 +74,11 @@ serde = [
 	"rand?/serde",
 ]
 jwt = ["std", "dep:jsonwebtoken", "dep:rand"]
+# reth 2.4.1's node-core requests this; upstream added it in alloy 2.x.
+jwt-aws-lc-rs = ["jwt", "jsonwebtoken/aws_lc_rs"]
 jsonrpsee-types = ["dep:jsonrpsee-types"]
 ssz = ["std", "dep:ethereum_ssz", "dep:ethereum_ssz_derive", "alloy-eips/ssz"]
-kzg = ["alloy-consensus/kzg"]
+kzg = ["alloy-consensus/kzg", "alloy-eips/kzg"]
 arbitrary = ["dep:arbitrary", "std", "alloy-primitives/arbitrary", "alloy-serde/arbitrary", "alloy-consensus/arbitrary", "alloy-eips/arbitrary"]
 
 [dev-dependencies]

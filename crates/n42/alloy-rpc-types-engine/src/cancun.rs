@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! Contains types related to the Cancun hardfork that will be used by RPC to communicate with the
 //! beacon consensus engine.
 
@@ -26,10 +23,7 @@ pub struct CancunPayloadFields {
 impl CancunPayloadFields {
     /// Returns a new [`CancunPayloadFields`] instance.
     pub const fn new(parent_beacon_block_root: B256, versioned_hashes: Vec<B256>) -> Self {
-        Self {
-            parent_beacon_block_root,
-            versioned_hashes,
-        }
+        Self { parent_beacon_block_root, versioned_hashes }
     }
 }
 
@@ -47,16 +41,14 @@ impl MaybeCancunPayloadFields {
         Self { fields: None }
     }
 
-    /// Returns a new `MaybeCancunPayloadFields` with the given cancun fields.
+    /// Consumes `self` and returns the contained [`CancunPayloadFields`], if present.
     pub fn into_inner(self) -> Option<CancunPayloadFields> {
         self.fields
     }
 
     /// Returns the parent beacon block root, if any.
     pub fn parent_beacon_block_root(&self) -> Option<B256> {
-        self.fields
-            .as_ref()
-            .map(|fields| fields.parent_beacon_block_root)
+        self.fields.as_ref().map(|fields| fields.parent_beacon_block_root)
     }
 
     /// Returns the blob versioned hashes, if any.
@@ -73,9 +65,7 @@ impl MaybeCancunPayloadFields {
 impl From<CancunPayloadFields> for MaybeCancunPayloadFields {
     #[inline]
     fn from(fields: CancunPayloadFields) -> Self {
-        Self {
-            fields: Some(fields),
-        }
+        Self { fields: Some(fields) }
     }
 }
 

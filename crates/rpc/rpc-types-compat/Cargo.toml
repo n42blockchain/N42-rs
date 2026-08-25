@@ -51,5 +51,5 @@ op = [
     "dep:op-alloy-network",
 
 
-    "alloy-evm/op",
+
 ]

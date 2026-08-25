@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 #[cfg(feature = "ssz")]
 use alloy_eips::eip7685::Requests;
 use alloy_eips::{
@@ -98,7 +95,7 @@ mod ssz_requests_conversions {
                     request_type: u8,
                 ) -> Result<Vec<T>, TryFromRequestsError>
                 where
-                    Vec<T>: Decode + Encode,
+                    T: Decode,
                 {
                     let list: Vec<T> = Vec::from_ssz_bytes(payload)
                         .map_err(|e| SszDecodeError(request_type, e))?;
@@ -152,9 +149,7 @@ mod ssz_requests_conversions {
 
             let accumulator = value
                 .iter()
-                .try_fold(RequestAccumulator::default(), |acc, request| {
-                    acc.accumulate(request)
-                })?;
+                .try_fold(RequestAccumulator::default(), |acc, request| acc.accumulate(request))?;
 
             Ok(Self {
                 deposits: accumulator.deposits,
@@ -174,7 +169,7 @@ mod ssz_requests_conversions {
         #[error("unknown request_type prefix: {0}")]
         UnknownRequestType(u8),
         /// Remaining bytes could not be decoded as SSZ requests_data.
-        #[error("ssz error decoding requests_type: {0}")]
+        #[error("ssz decode error for request_type {0}: {1:?}")]
         SszDecodeError(u8, DecodeError),
         /// Requests of request_type exceeds Electra size limits
         #[error("requests_data payload for request_type {0} exceeds Electra size limit {1}")]

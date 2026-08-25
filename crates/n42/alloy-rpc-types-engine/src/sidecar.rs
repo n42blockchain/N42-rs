@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! Contains helpers for dealing with additional parameters of `newPayload` requests.
 
 use crate::{
@@ -38,9 +35,8 @@ impl ExecutionPayloadSidecar {
         T: Transaction,
         H: BlockHeader,
     {
-        let cancun = block
-            .parent_beacon_block_root()
-            .map(|parent_beacon_block_root| CancunPayloadFields {
+        let cancun =
+            block.parent_beacon_block_root().map(|parent_beacon_block_root| CancunPayloadFields {
                 parent_beacon_block_root,
                 versioned_hashes: block.body.blob_versioned_hashes_iter().copied().collect(),
             });
@@ -56,26 +52,17 @@ impl ExecutionPayloadSidecar {
 
     /// Returns a new empty instance (pre-cancun, v1, v2)
     pub const fn none() -> Self {
-        Self {
-            cancun: MaybeCancunPayloadFields::none(),
-            prague: MaybePraguePayloadFields::none(),
-        }
+        Self { cancun: MaybeCancunPayloadFields::none(), prague: MaybePraguePayloadFields::none() }
     }
 
     /// Creates a new instance for cancun with the cancun fields for `engine_newPayloadV3`
     pub fn v3(cancun: CancunPayloadFields) -> Self {
-        Self {
-            cancun: cancun.into(),
-            prague: MaybePraguePayloadFields::none(),
-        }
+        Self { cancun: cancun.into(), prague: MaybePraguePayloadFields::none() }
     }
 
     /// Creates a new instance post prague for `engine_newPayloadV4`
     pub fn v4(cancun: CancunPayloadFields, prague: PraguePayloadFields) -> Self {
-        Self {
-            cancun: cancun.into(),
-            prague: prague.into(),
-        }
+        Self { cancun: cancun.into(), prague: prague.into() }
     }
 
     /// Returns a reference to the [`CancunPayloadFields`].

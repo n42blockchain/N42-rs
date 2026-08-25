@@ -1,7 +1,21 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! JWT (JSON Web Token) utilities for the Engine API.
+//!
+//! # Feature flags
+//!
+//! This module is gated behind the `jwt` feature, which is **not enabled by default**.
+//! Enabling `jwt` alone is not sufficient to build this crate: the underlying
+//! [`jsonwebtoken`] crate requires a cryptographic backend, and this crate does not
+//! select one for you. You must opt in to a backend explicitly via one of:
+//!
+//! - `jwt-aws-lc-rs` — enables `jwt` together with `jsonwebtoken/aws_lc_rs` (recommended
+//!   for most platforms; uses [aws-lc-rs](https://github.com/aws/aws-lc-rs)).
+//! - Enabling `jsonwebtoken/rust_crypto` (or the individual `hmac` + `sha2` features) from your own
+//!   `Cargo.toml` if you prefer the pure-Rust backend.
+//!
+//! Building with just `jwt` and no backend will fail to link the HS256 implementation
+//! used by [`JwtSecret::validate`] and [`JwtSecret::encode`]. This is intentional so
+//! downstream crates can choose the backend that fits their target and licensing
+//! constraints rather than inheriting one transitively.
 
 use alloc::string::String;
 use alloy_primitives::hex;
@@ -110,6 +124,10 @@ const JWT_SECRET_LEN: usize = 64;
 /// The JWT `iat` (issued-at) claim cannot exceed +-60 seconds from the current time.
 const JWT_MAX_IAT_DIFF: Duration = Duration::from_secs(60);
 
+/// The JWT `exp` (expiration time) claim is accepted if not older than 60 seconds from the current
+/// time.
+const JWT_EXP_GRACE_PERIOD_SECS: Duration = Duration::from_secs(60);
+
 /// The execution layer client MUST support at least the following alg HMAC + SHA256 (HS256)
 #[cfg(feature = "serde")]
 const JWT_SIGNATURE_ALGO: Algorithm = Algorithm::HS256;
@@ -133,22 +151,27 @@ pub struct Claims {
     pub iat: u64,
     /// The "exp" (expiration time) claim identifies the expiration time on or after which the JWT
     /// MUST NOT be accepted for processing.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub exp: Option<u64>,
 }
 
 impl Claims {
     /// Creates a new instance of [`Claims`] with the current timestamp as the `iat` claim.
     pub fn with_current_timestamp() -> Self {
-        Self {
-            iat: get_current_timestamp(),
-            exp: None,
-        }
+        Self { iat: get_current_timestamp(), exp: None }
     }
 
     /// Checks if the `iat` claim is within the allowed range from the current time.
     pub fn is_within_time_window(&self) -> bool {
         let now_secs = get_current_timestamp();
         now_secs.abs_diff(self.iat) <= JWT_MAX_IAT_DIFF.as_secs()
+    }
+
+    /// Returns true if there is no `exp` claim or if the token is not yet expired (with leeway).
+    pub fn is_exp_valid(&self) -> bool {
+        let Some(exp) = self.exp else { return true };
+        let now_secs = get_current_timestamp();
+        exp + JWT_EXP_GRACE_PERIOD_SECS.as_secs() >= now_secs
     }
 }
 
@@ -178,14 +201,13 @@ impl JwtSecret {
     ///
     /// This strips the leading `0x`, if any.
     pub fn from_hex<S: AsRef<str>>(hex: S) -> Result<Self, JwtError> {
-        let hex = hex.as_ref().trim().trim_start_matches("0x");
-        if hex.len() == JWT_SECRET_LEN {
-            let hex_bytes = hex::decode(hex)?;
-            // is 32bytes, see length check
-            let bytes = hex_bytes.try_into().expect("is expected len");
-            Ok(Self(bytes))
-        } else {
-            Err(JwtError::InvalidLength(JWT_SECRET_LEN, hex.len()))
+        let hex = hex.as_ref().trim();
+        match hex::decode_to_array(hex) {
+            Ok(b) => Ok(Self(b)),
+            Err(hex::FromHexError::InvalidStringLength | hex::FromHexError::OddLength) => {
+                Err(JwtError::InvalidLength(JWT_SECRET_LEN, hex.len()))
+            }
+            Err(e) => Err(JwtError::JwtSecretHexDecodeError(e)),
         }
     }
 
@@ -195,10 +217,7 @@ impl JwtSecret {
     #[cfg(feature = "std")]
     pub fn from_file(fpath: &Path) -> Result<Self, JwtError> {
         fs::read_to_string(fpath)
-            .map_err(|err| JwtError::Read {
-                source: err,
-                path: fpath.into(),
-            })
+            .map_err(|err| JwtError::Read { source: err, path: fpath.into() })
             .and_then(Self::from_hex)
     }
 
@@ -208,19 +227,14 @@ impl JwtSecret {
     pub fn try_create_random(fpath: &Path) -> Result<Self, JwtError> {
         if let Some(dir) = fpath.parent() {
             // Create parent directory
-            fs::create_dir_all(dir).map_err(|err| JwtError::CreateDir {
-                source: err,
-                path: fpath.into(),
-            })?
+            fs::create_dir_all(dir)
+                .map_err(|err| JwtError::CreateDir { source: err, path: dir.into() })?
         }
 
         let secret = Self::random();
         let bytes = &secret.0;
         let hex = hex::encode(bytes);
-        fs::write(fpath, hex).map_err(|err| JwtError::Write {
-            source: err,
-            path: fpath.into(),
-        })?;
+        fs::write(fpath, hex).map_err(|err| JwtError::Write { source: err, path: fpath.into() })?;
         Ok(secret)
     }
 
@@ -231,18 +245,30 @@ impl JwtSecret {
     /// - The JWT `exp` (expiration time) claim is validated by default if defined.
     ///
     /// See also: [JWT Claims - Engine API specs](https://github.com/ethereum/execution-apis/blob/main/src/engine/authentication.md#jwt-claims)
+    ///
+    /// # Crypto backend
+    ///
+    /// HS256 verification is performed by [`jsonwebtoken`], which requires a cryptographic
+    /// backend to be selected at build time. This crate does not pick one for you; enable
+    /// either the `jwt-aws-lc-rs` feature on this crate, or one of `jsonwebtoken`'s own
+    /// backend features (`aws_lc_rs`, `rust_crypto`, or `hmac` + `sha2`) from your
+    /// `Cargo.toml`. Without a backend selected the crate will fail to build.
     #[cfg(feature = "serde")]
     pub fn validate(&self, jwt: &str) -> Result<(), JwtError> {
         // Create a new validation object with the required signature algorithm
         // and ensure that the `iat` claim is present. The `exp` claim is validated if defined.
         let mut validation = Validation::new(JWT_SIGNATURE_ALGO);
-        validation.set_required_spec_claims(&["iat"]);
+        validation.required_spec_claims.clear();
+        validation.validate_exp = false;
         let bytes = &self.0;
 
         match jsonwebtoken::decode::<Claims>(jwt, &DecodingKey::from_secret(bytes), &validation) {
             Ok(token) => {
                 if !token.claims.is_within_time_window() {
                     Err(JwtError::InvalidIssuanceTimestamp)?
+                }
+                if !token.claims.is_exp_valid() {
+                    Err(JwtError::JwtDecodingError("exp claim has expired".into()))?
                 }
             }
             Err(err) => match *err.kind() {
@@ -260,10 +286,7 @@ impl JwtSecret {
 
     /// Generates a random [`JwtSecret`] containing a hex-encoded 256 bit secret key.
     pub fn random() -> Self {
-        let random_bytes: [u8; 32] = rand::thread_rng().gen();
-        let secret = hex::encode(random_bytes);
-        // Safety: hex::encode of 32 bytes always produces a valid 64-char hex string
-        Self::from_hex(secret).expect("hex encoding of 32 bytes is always valid")
+        Self(rand::rng().random())
     }
 
     /// Encode the header and claims given and sign the payload using the algorithm from the header
@@ -284,7 +307,7 @@ impl JwtSecret {
 
 impl core::fmt::Debug for JwtSecret {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_tuple("JwtSecretHash").field(&"{{}}").finish()
+        f.debug_tuple("JwtSecret").field(&"{{}}").finish()
     }
 }
 
@@ -309,11 +332,19 @@ mod tests {
     #[test]
     fn from_hex() {
         let key = "f79ae8046bc11c9927afe911db7143c51a806c4a537cc08e0d37140b0192f430";
-        let secret: Result<JwtSecret, _> = JwtSecret::from_hex(key);
-        assert!(secret.is_ok());
+        let secret_0: Result<JwtSecret, _> = JwtSecret::from_hex(key);
+        assert!(secret_0.is_ok());
 
-        let secret: Result<JwtSecret, _> = JwtSecret::from_hex(key);
-        assert!(secret.is_ok());
+        let key = "0xf79ae8046bc11c9927afe911db7143c51a806c4a537cc08e0d37140b0192f430";
+        let secret_1: Result<JwtSecret, _> = JwtSecret::from_hex(key);
+        assert!(secret_1.is_ok());
+
+        let key = "0xf79ae8046bc11c9927afe911db7143c51a806c4a537cc08e0d37140b0192f430 ";
+        let secret_2: Result<JwtSecret, _> = JwtSecret::from_hex(key);
+        assert!(secret_2.is_ok());
+
+        assert_eq!(secret_0.as_ref().unwrap().clone(), secret_1.unwrap());
+        assert_eq!(secret_0.unwrap(), secret_2.unwrap());
     }
 
     #[test]
@@ -359,10 +390,7 @@ mod tests {
     #[cfg(feature = "serde")]
     fn validation_ok() {
         let secret = JwtSecret::random();
-        let claims = Claims {
-            iat: get_current_timestamp(),
-            exp: Some(10000000000),
-        };
+        let claims = Claims { iat: get_current_timestamp(), exp: Some(10000000000) };
         let jwt = secret.encode(&claims).unwrap();
 
         let result = secret.validate(&jwt);
@@ -388,12 +416,10 @@ mod tests {
         let secret = JwtSecret::random();
 
         // Check past 'iat' claim more than 60 secs
-        let offset = Duration::from_secs(JWT_MAX_IAT_DIFF.as_secs() + 1);
+        // Use a larger margin to avoid timing flakiness
+        let offset = Duration::from_secs(JWT_MAX_IAT_DIFF.as_secs() + 10);
         let out_of_window_time = SystemTime::now().checked_sub(offset).unwrap();
-        let claims = Claims {
-            iat: to_u64(out_of_window_time),
-            exp: Some(10000000000),
-        };
+        let claims = Claims { iat: to_u64(out_of_window_time), exp: Some(10000000000) };
         let jwt = secret.encode(&claims).unwrap();
 
         let result = secret.validate(&jwt);
@@ -401,12 +427,10 @@ mod tests {
         assert!(matches!(result, Err(JwtError::InvalidIssuanceTimestamp)));
 
         // Check future 'iat' claim more than 60 secs
-        let offset = Duration::from_secs(JWT_MAX_IAT_DIFF.as_secs() + 1);
+        // Use a larger margin to avoid timing flakiness
+        let offset = Duration::from_secs(JWT_MAX_IAT_DIFF.as_secs() + 10);
         let out_of_window_time = SystemTime::now().checked_add(offset).unwrap();
-        let claims = Claims {
-            iat: to_u64(out_of_window_time),
-            exp: Some(10000000000),
-        };
+        let claims = Claims { iat: to_u64(out_of_window_time), exp: Some(10000000000) };
         let jwt = secret.encode(&claims).unwrap();
 
         let result = secret.validate(&jwt);
@@ -418,10 +442,7 @@ mod tests {
     #[cfg(feature = "serde")]
     fn validation_error_exp_expired() {
         let secret = JwtSecret::random();
-        let claims = Claims {
-            iat: get_current_timestamp(),
-            exp: Some(1),
-        };
+        let claims = Claims { iat: get_current_timestamp(), exp: Some(1) };
         let jwt = secret.encode(&claims).unwrap();
 
         let result = secret.validate(&jwt);
@@ -433,10 +454,7 @@ mod tests {
     #[cfg(feature = "serde")]
     fn validation_error_wrong_signature() {
         let secret_1 = JwtSecret::random();
-        let claims = Claims {
-            iat: get_current_timestamp(),
-            exp: Some(10000000000),
-        };
+        let claims = Claims { iat: get_current_timestamp(), exp: Some(10000000000) };
         let jwt = secret_1.encode(&claims).unwrap();
 
         // A different secret will generate a different signature.
@@ -454,17 +472,11 @@ mod tests {
         let key = EncodingKey::from_secret(bytes);
         let unsupported_algo = Header::new(Algorithm::HS384);
 
-        let claims = Claims {
-            iat: get_current_timestamp(),
-            exp: Some(10000000000),
-        };
+        let claims = Claims { iat: get_current_timestamp(), exp: Some(10000000000) };
         let jwt = encode(&unsupported_algo, &claims, &key).unwrap();
         let result = secret.validate(&jwt);
 
-        assert!(matches!(
-            result,
-            Err(JwtError::UnsupportedSignatureAlgorithm)
-        ));
+        assert!(matches!(result, Err(JwtError::UnsupportedSignatureAlgorithm)));
     }
 
     #[test]
@@ -472,15 +484,35 @@ mod tests {
     fn valid_without_exp_claim() {
         let secret = JwtSecret::random();
 
-        let claims = Claims {
-            iat: get_current_timestamp(),
-            exp: None,
-        };
+        let claims = Claims { iat: get_current_timestamp(), exp: None };
         let jwt = secret.encode(&claims).unwrap();
 
         let result = secret.validate(&jwt);
 
         assert!(matches!(result, Ok(())));
+    }
+
+    #[test]
+    #[cfg(feature = "serde")]
+    fn omits_exp_claim_when_none() {
+        let secret = JwtSecret::random();
+        let claims = Claims { iat: get_current_timestamp(), exp: None };
+        let token = secret.encode(&claims).unwrap();
+
+        // Decode the payload (middle segment) without verification
+        use base64::Engine;
+        let payload = token.split('.').nth(1).unwrap();
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).unwrap();
+        let payload = str::from_utf8(&payload).unwrap();
+
+        // RFC 7519 §4.1.4: "exp" is OPTIONAL — when absent it means no expiration.
+        // When present, it MUST be a NumericDate (a number), not null.
+        // Serializing `exp: None` as `"exp": null` produces a non-conforming JWT
+        // that is rejected by some execution clients (Besu).
+        assert!(
+            !payload.contains("\"exp\""),
+            "Claims with exp: None must omit the field, not serialize as null. Got: {payload}"
+        );
     }
 
     #[test]

@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 #![doc = include_str!("../README.md")]
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/alloy-rs/core/main/assets/alloy.jpg",
@@ -40,14 +37,18 @@ pub use payload::*;
 mod error;
 pub use error::*;
 
-mod testing;
-pub use testing::*;
-
 mod transition;
 pub use transition::*;
 
+mod testing;
+pub use testing::*;
+
 #[doc(inline)]
 pub use alloy_eips::eip4844::BlobAndProofV1;
+#[doc(inline)]
+pub use alloy_eips::eip4844::BlobAndProofV2;
+#[doc(inline)]
+pub use alloy_eips::eip4844::BlobCellsAndProofsV1;
 
 /// The list of all supported Engine capabilities available over the engine endpoint.
 ///

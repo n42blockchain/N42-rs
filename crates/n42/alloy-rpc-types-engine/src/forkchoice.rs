@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 use super::{PayloadStatus, PayloadStatusEnum};
 use crate::PayloadId;
 use alloy_primitives::B256;
@@ -11,17 +8,24 @@ pub const INVALID_FORK_CHOICE_STATE_ERROR: i32 = -38002;
 /// invalid payload attributes error code.
 pub const INVALID_PAYLOAD_ATTRIBUTES_ERROR: i32 = -38003;
 
+/// too deep reorg error code.
+pub const TOO_DEEP_REORG_ERROR: i32 = -38006;
+
 /// invalid forkchoice state error message.
 pub const INVALID_FORK_CHOICE_STATE_ERROR_MSG: &str = "Invalid forkchoice state";
 
 /// invalid payload attributes error message.
 pub const INVALID_PAYLOAD_ATTRIBUTES_ERROR_MSG: &str = "Invalid payload attributes";
 
+/// too deep reorg error message.
+pub const TOO_DEEP_REORG_ERROR_MSG: &str = "Too deep reorg";
+
 /// Represents possible variants of a processed forkchoice update.
 pub type ForkChoiceUpdateResult = Result<ForkchoiceUpdated, ForkchoiceUpdateError>;
 
 /// This structure encapsulates the fork choice state
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "ssz", derive(ssz_derive::Encode, ssz_derive::Decode))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
 pub struct ForkchoiceState {
@@ -37,11 +41,7 @@ impl ForkchoiceState {
     /// Creates a new [ForkchoiceState] with head, safe, and finalized block hashes set to the given
     /// hash.
     pub const fn same_hash(hash: B256) -> Self {
-        Self {
-            head_block_hash: hash,
-            safe_block_hash: hash,
-            finalized_block_hash: hash,
-        }
+        Self { head_block_hash: hash, safe_block_hash: hash, finalized_block_hash: hash }
     }
 
     /// Returns the `head_block_hash`, only if it is not [`B256::ZERO`], otherwise this returns
@@ -77,14 +77,11 @@ impl ForkchoiceState {
         }
     }
 
-    /// Returns `true` if the given hash is one of the block hashes in this state.
-    ///
-    /// Checks if the hash matches `head_block_hash`, `safe_block_hash`, or `finalized_block_hash`.
-    #[inline]
+    /// Returns true if any of the hashes in this [`ForkchoiceState`] match the given hash
     pub fn contains(&self, hash: B256) -> bool {
-        self.head_block_hash == hash ||
-            self.safe_block_hash == hash ||
-            self.finalized_block_hash == hash
+        self.head_block_hash == hash
+            || self.safe_block_hash == hash
+            || self.finalized_block_hash == hash
     }
 }
 
@@ -106,31 +103,12 @@ pub enum ForkchoiceUpdateError {
     /// Thrown when a forkchoice final block does not exist in the database.
     #[display("final block not available in database")]
     UnknownFinalBlock,
+    /// Thrown when the requested reorg depth exceeds the client's configured limit.
+    #[display("too deep reorg")]
+    TooDeepReorg,
 }
 
 impl core::error::Error for ForkchoiceUpdateError {}
-
-#[cfg(feature = "jsonrpsee-types")]
-impl From<ForkchoiceUpdateError> for jsonrpsee_types::error::ErrorObject<'static> {
-    fn from(value: ForkchoiceUpdateError) -> Self {
-        match value {
-            ForkchoiceUpdateError::UpdatedInvalidPayloadAttributes => {
-                jsonrpsee_types::error::ErrorObject::owned(
-                    INVALID_PAYLOAD_ATTRIBUTES_ERROR,
-                    INVALID_PAYLOAD_ATTRIBUTES_ERROR_MSG,
-                    None::<()>,
-                )
-            }
-            ForkchoiceUpdateError::InvalidState | ForkchoiceUpdateError::UnknownFinalBlock => {
-                jsonrpsee_types::error::ErrorObject::owned(
-                    INVALID_FORK_CHOICE_STATE_ERROR,
-                    INVALID_FORK_CHOICE_STATE_ERROR_MSG,
-                    None::<()>,
-                )
-            }
-        }
-    }
-}
 
 /// Represents a successfully _processed_ forkchoice state update.
 ///
@@ -149,18 +127,12 @@ pub struct ForkchoiceUpdated {
 impl ForkchoiceUpdated {
     /// Creates a new [ForkchoiceUpdated] with the given [PayloadStatus].
     pub const fn new(payload_status: PayloadStatus) -> Self {
-        Self {
-            payload_status,
-            payload_id: None,
-        }
+        Self { payload_status, payload_id: None }
     }
 
     /// Creates a new [ForkchoiceUpdated] with the given [PayloadStatusEnum].
     pub const fn from_status(status: PayloadStatusEnum) -> Self {
-        Self {
-            payload_status: PayloadStatus::from_status(status),
-            payload_id: None,
-        }
+        Self { payload_status: PayloadStatus::from_status(status), payload_id: None }
     }
 
     /// Sets the latest valid hash of the payload status.
@@ -188,5 +160,104 @@ impl ForkchoiceUpdated {
     /// Returns true if the payload status is invalid.
     pub const fn is_invalid(&self) -> bool {
         self.payload_status.is_invalid()
+    }
+}
+
+#[cfg(feature = "ssz")]
+impl ssz::Encode for ForkchoiceUpdated {
+    fn is_ssz_fixed_len() -> bool {
+        false
+    }
+
+    fn ssz_append(&self, buf: &mut alloc::vec::Vec<u8>) {
+        let payload_id = self.payload_id.unwrap_or_default();
+        let offset = <PayloadStatus as ssz::Encode>::ssz_fixed_len()
+            + <alloy_primitives::B64 as ssz::Encode>::ssz_fixed_len();
+        let mut encoder = ssz::SszEncoder::container(buf, offset);
+
+        encoder.append(&self.payload_status);
+        encoder.append(&payload_id.0);
+
+        encoder.finalize();
+    }
+
+    fn ssz_bytes_len(&self) -> usize {
+        <PayloadStatus as ssz::Encode>::ssz_fixed_len()
+            + <alloy_primitives::B64 as ssz::Encode>::ssz_fixed_len()
+            + self.payload_status.ssz_bytes_len()
+    }
+}
+
+#[cfg(feature = "ssz")]
+impl ssz::Decode for ForkchoiceUpdated {
+    fn is_ssz_fixed_len() -> bool {
+        false
+    }
+
+    fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, ssz::DecodeError> {
+        let mut builder = ssz::SszDecoderBuilder::new(bytes);
+
+        builder.register_type::<PayloadStatus>()?;
+        builder.register_type::<alloy_primitives::B64>()?;
+
+        let mut decoder = builder.build()?;
+        let payload_status = decoder.decode_next()?;
+        let payload_id: alloy_primitives::B64 = decoder.decode_next()?;
+        let payload_id = (!payload_id.is_zero()).then_some(PayloadId(payload_id));
+
+        Ok(Self { payload_status, payload_id })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(feature = "ssz")]
+    fn ssz_forkchoice_state_roundtrip() {
+        use ssz::{Decode, Encode};
+
+        let state = ForkchoiceState {
+            head_block_hash: B256::with_last_byte(1),
+            safe_block_hash: B256::with_last_byte(2),
+            finalized_block_hash: B256::with_last_byte(3),
+        };
+
+        let encoded = state.as_ssz_bytes();
+        let decoded = ForkchoiceState::from_ssz_bytes(&encoded).unwrap();
+        assert_eq!(decoded, state);
+    }
+
+    #[test]
+    #[cfg(feature = "ssz")]
+    fn ssz_forkchoice_updated_roundtrip() {
+        use ssz::{Decode, Encode};
+
+        let updated = ForkchoiceUpdated {
+            payload_status: PayloadStatus {
+                status: PayloadStatusEnum::Invalid {
+                    validation_error: "invalid block number".to_string(),
+                },
+                latest_valid_hash: Some(B256::with_last_byte(4)),
+            },
+            payload_id: Some(PayloadId(alloy_primitives::B64::with_last_byte(5))),
+        };
+
+        let encoded = updated.as_ssz_bytes();
+        let decoded = ForkchoiceUpdated::from_ssz_bytes(&encoded).unwrap();
+        assert_eq!(decoded, updated);
+    }
+
+    #[test]
+    #[cfg(feature = "ssz")]
+    fn ssz_forkchoice_updated_zero_payload_id_is_none() {
+        use ssz::{Decode, Encode};
+
+        let updated = ForkchoiceUpdated::from_status(PayloadStatusEnum::Syncing);
+
+        let encoded = updated.as_ssz_bytes();
+        let decoded = ForkchoiceUpdated::from_ssz_bytes(&encoded).unwrap();
+        assert_eq!(decoded, updated);
     }
 }

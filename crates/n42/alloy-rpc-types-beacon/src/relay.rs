@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! Flashbots relay API types.
 //!
 //! See also <https://flashbots.github.io/relay-specs/>
@@ -9,6 +6,7 @@ use crate::{requests::ExecutionRequestsV4, BlsPublicKey, BlsSignature};
 use alloy_primitives::{Address, B256, U256};
 use alloy_rpc_types_engine::{
     BlobsBundleV1, BlobsBundleV2, ExecutionPayloadV1, ExecutionPayloadV2, ExecutionPayloadV3,
+    ExecutionPayloadV4,
 };
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
@@ -177,6 +175,7 @@ pub struct SignedBidSubmissionV4 {
 
 /// Submission for the `/relay/v1/builder/blocks` endpoint (Fulu).
 ///
+///
 /// Also known as `FuluSubmitBlockRequest`.
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,6 +188,28 @@ pub struct SignedBidSubmissionV5 {
     #[serde(with = "crate::payload::beacon_payload_v3")]
     pub execution_payload: ExecutionPayloadV3,
     /// The Fulu block bundle for this bid.
+    pub blobs_bundle: BlobsBundleV2,
+    /// The Pectra execution requests for this bid.
+    pub execution_requests: ExecutionRequestsV4,
+    /// The signature associated with the submission.
+    pub signature: BlsSignature,
+}
+
+/// Submission for the `/relay/v1/builder/blocks` endpoint (Amsterdam).
+///
+///
+/// Also known as `AmsterdamSubmitBlockRequest`.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ssz", derive(ssz_derive::Decode, ssz_derive::Encode))]
+pub struct SignedBidSubmissionV6 {
+    /// The [`BidTrace`] message associated with the submission.
+    pub message: BidTrace,
+    /// The execution payload for the submission.
+    #[serde(with = "crate::payload::beacon_payload_v4")]
+    pub execution_payload: ExecutionPayloadV4,
+    /// The Amsterdam block bundle for this bid.
     pub blobs_bundle: BlobsBundleV2,
     /// The Pectra execution requests for this bid.
     pub execution_requests: ExecutionRequestsV4,
@@ -274,7 +295,6 @@ impl From<SignedBidSubmissionV4> for SubmitBlockRequest {
         Self::Electra(value)
     }
 }
-
 impl From<SignedBidSubmissionV5> for SubmitBlockRequest {
     fn from(value: SignedBidSubmissionV5) -> Self {
         Self::Fulu(value)
@@ -294,9 +314,7 @@ pub struct SubmitBlockRequestQuery {
 impl SubmitBlockRequestQuery {
     /// Opt into bid cancellations.
     pub const fn cancellations() -> Self {
-        Self {
-            cancellations: Some(true),
-        }
+        Self { cancellations: Some(true) }
     }
 }
 
@@ -358,6 +376,41 @@ pub struct BuilderBlockValidationRequestV4 {
     pub parent_beacon_block_root: B256,
 }
 
+impl BuilderBlockValidationRequestV4 {
+    /// Converts this validation request to [`alloy_rpc_types_engine::ExecutionData`].
+    ///
+    /// Extracts the execution payload and creates the appropriate sidecar with versioned hashes and
+    /// execution requests.
+    #[cfg(all(feature = "sha2", feature = "ssz"))]
+    pub fn into_execution_data(self) -> alloy_rpc_types_engine::ExecutionData {
+        let versioned_hashes = self.request.blobs_bundle.versioned_hashes();
+
+        // Create Cancun payload fields
+        let cancun_fields = alloy_rpc_types_engine::CancunPayloadFields {
+            parent_beacon_block_root: self.parent_beacon_block_root,
+            versioned_hashes,
+        };
+
+        // Convert execution requests to Requests type
+        let prague_fields = alloy_rpc_types_engine::PraguePayloadFields::new(
+            self.request.execution_requests.to_requests(),
+        );
+
+        // Create the execution payload sidecar
+        let sidecar =
+            alloy_rpc_types_engine::ExecutionPayloadSidecar::v4(cancun_fields, prague_fields);
+
+        alloy_rpc_types_engine::ExecutionData::new(self.request.execution_payload.into(), sidecar)
+    }
+}
+
+#[cfg(all(feature = "sha2", feature = "ssz"))]
+impl From<BuilderBlockValidationRequestV4> for alloy_rpc_types_engine::ExecutionData {
+    fn from(request: BuilderBlockValidationRequestV4) -> Self {
+        request.into_execution_data()
+    }
+}
+
 /// A Request to validate a [`SignedBidSubmissionV5`]
 #[serde_as]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -370,6 +423,93 @@ pub struct BuilderBlockValidationRequestV5 {
     pub registered_gas_limit: u64,
     /// The parent beacon block root for the validation request.
     pub parent_beacon_block_root: B256,
+}
+
+impl BuilderBlockValidationRequestV5 {
+    /// Converts this validation request to [`alloy_rpc_types_engine::ExecutionData`].
+    ///
+    /// Extracts the execution payload and creates the appropriate sidecar with versioned hashes and
+    /// execution requests.
+    #[cfg(all(feature = "sha2", feature = "ssz"))]
+    pub fn into_execution_data(self) -> alloy_rpc_types_engine::ExecutionData {
+        let versioned_hashes = self.request.blobs_bundle.versioned_hashes();
+
+        // Create Cancun payload fields
+        let cancun_fields = alloy_rpc_types_engine::CancunPayloadFields {
+            parent_beacon_block_root: self.parent_beacon_block_root,
+            versioned_hashes,
+        };
+
+        // Convert execution requests to Requests type
+        let prague_fields = alloy_rpc_types_engine::PraguePayloadFields::new(
+            self.request.execution_requests.to_requests(),
+        );
+
+        // Create the execution payload sidecar
+        let sidecar =
+            alloy_rpc_types_engine::ExecutionPayloadSidecar::v4(cancun_fields, prague_fields);
+
+        alloy_rpc_types_engine::ExecutionData::new(self.request.execution_payload.into(), sidecar)
+    }
+}
+
+#[cfg(all(feature = "sha2", feature = "ssz"))]
+impl From<BuilderBlockValidationRequestV5> for alloy_rpc_types_engine::ExecutionData {
+    fn from(request: BuilderBlockValidationRequestV5) -> Self {
+        request.into_execution_data()
+    }
+}
+
+/// A Request to validate a [`SignedBidSubmissionV6`]
+#[serde_as]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuilderBlockValidationRequestV6 {
+    /// The request to be validated.
+    #[serde(flatten)]
+    pub request: SignedBidSubmissionV6,
+    /// The registered gas limit for the validation request.
+    #[serde_as(as = "DisplayFromStr")]
+    pub registered_gas_limit: u64,
+    /// The parent beacon block root for the validation request.
+    pub parent_beacon_block_root: B256,
+}
+
+impl BuilderBlockValidationRequestV6 {
+    /// Converts this validation request to [`alloy_rpc_types_engine::ExecutionData`].
+    ///
+    /// Extracts the execution payload and creates the appropriate sidecar with versioned hashes and
+    /// execution requests.
+    #[cfg(all(feature = "sha2", feature = "ssz"))]
+    pub fn into_execution_data(self) -> alloy_rpc_types_engine::ExecutionData {
+        let versioned_hashes = self.request.blobs_bundle.versioned_hashes();
+
+        // Create Cancun payload fields
+        let cancun_fields = alloy_rpc_types_engine::CancunPayloadFields {
+            parent_beacon_block_root: self.parent_beacon_block_root,
+            versioned_hashes,
+        };
+
+        // Convert execution requests to Requests type
+        let prague_fields = alloy_rpc_types_engine::PraguePayloadFields::new(
+            self.request.execution_requests.to_requests(),
+        );
+
+        // Create the execution payload sidecar
+        let sidecar =
+            alloy_rpc_types_engine::ExecutionPayloadSidecar::v4(cancun_fields, prague_fields);
+
+        alloy_rpc_types_engine::ExecutionData::new(
+            alloy_rpc_types_engine::ExecutionPayload::V4(self.request.execution_payload),
+            sidecar,
+        )
+    }
+}
+
+#[cfg(all(feature = "sha2", feature = "ssz"))]
+impl From<BuilderBlockValidationRequestV6> for alloy_rpc_types_engine::ExecutionData {
+    fn from(request: BuilderBlockValidationRequestV6) -> Self {
+        request.into_execution_data()
+    }
 }
 
 /// Response type for the GET `/relay/v1/data/bidtraces/builder_blocks_received`
@@ -618,21 +758,21 @@ pub mod error {
             /// The actual block hash
             actual: B256,
         },
-        /// Thrown if block hash mismatches
+        /// Thrown if gas limit mismatches
         #[error("incorrect GasLimit {actual}, expected {expected}")]
         IncorrectGasLimit {
             /// The expected gas limit
             expected: u64,
             /// The actual gas limit
-            actual: B256,
+            actual: u64,
         },
-        /// Thrown if block hash mismatches
+        /// Thrown if gas used mismatches
         #[error("incorrect GasUsed {actual}, expected {expected}")]
         IncorrectGasUsed {
             /// The expected gas used
             expected: u64,
             /// The actual gas used
-            actual: B256,
+            actual: u64,
         },
     }
 }
@@ -686,6 +826,39 @@ mod tests {
         let bid = serde_json::from_str::<SignedBidSubmissionV4>(s).unwrap();
         let json: serde_json::Value = serde_json::from_str(s).unwrap();
         assert_eq!(json, serde_json::to_value(bid).unwrap());
+    }
+
+    fn amsterdam_bid_submission_v6() -> SignedBidSubmissionV6 {
+        let bid_submission_v4_json =
+            include_str!("examples/relay_builder_block_validation_request_v4.json");
+        let bid_submission_v4: SignedBidSubmissionV4 =
+            serde_json::from_str(bid_submission_v4_json).unwrap();
+
+        SignedBidSubmissionV6 {
+            message: bid_submission_v4.message.clone(),
+            execution_payload: ExecutionPayloadV4 {
+                payload_inner: bid_submission_v4.execution_payload.clone(),
+                block_access_list: alloy_primitives::Bytes::from(vec![0xaa, 0xbb, 0xcc]),
+                slot_number: 6,
+            },
+            blobs_bundle: alloy_rpc_types_engine::BlobsBundleV2 {
+                commitments: bid_submission_v4.blobs_bundle.commitments.clone(),
+                proofs: bid_submission_v4.blobs_bundle.proofs.clone(),
+                blobs: bid_submission_v4.blobs_bundle.blobs.clone(),
+            },
+            execution_requests: bid_submission_v4.execution_requests.clone(),
+            signature: bid_submission_v4.signature,
+        }
+    }
+
+    #[test]
+    fn amsterdam_bid_submission() {
+        let bid = amsterdam_bid_submission_v6();
+        let json = serde_json::to_value(&bid).unwrap();
+        let deserialized = serde_json::from_value::<SignedBidSubmissionV6>(json.clone()).unwrap();
+
+        assert_eq!(bid, deserialized);
+        assert_eq!(json, serde_json::to_value(deserialized).unwrap());
     }
 
     #[cfg(feature = "ssz")]
@@ -748,5 +921,228 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(s).unwrap();
         let to_json: serde_json::Value = serde_json::to_value(payload).unwrap();
         assert_eq!(json, to_json);
+    }
+
+    #[cfg(all(feature = "sha2", feature = "ssz"))]
+    #[test]
+    fn test_builder_block_validation_request_v4_to_execution_data() {
+        // Use the existing test data for SignedBidSubmissionV4 and wrap it in a validation request
+        let bid_submission_json =
+            include_str!("examples/relay_builder_block_validation_request_v4.json");
+        let bid_submission: SignedBidSubmissionV4 =
+            serde_json::from_str(bid_submission_json).unwrap();
+
+        let request = BuilderBlockValidationRequestV4 {
+            request: bid_submission,
+            registered_gas_limit: 30000000,
+            parent_beacon_block_root: B256::from_slice(&[0x12; 32]),
+        };
+
+        let expected_payload = request.request.execution_payload.clone();
+        let expected_parent_beacon_block_root = request.parent_beacon_block_root;
+        let expected_hashes = request.request.blobs_bundle.versioned_hashes();
+
+        let execution_data = request.into_execution_data();
+
+        // Verify the execution payload is V3
+        match &execution_data.payload {
+            alloy_rpc_types_engine::ExecutionPayload::V3(payload) => {
+                assert_eq!(payload, &expected_payload);
+            }
+            _ => panic!("Expected ExecutionPayload::V3"),
+        }
+
+        // Verify the sidecar contains the correct parent beacon block root
+        assert_eq!(
+            execution_data.sidecar.parent_beacon_block_root(),
+            Some(expected_parent_beacon_block_root)
+        );
+
+        // Verify versioned hashes are computed correctly
+        let cancun_fields = execution_data.sidecar.cancun().unwrap();
+        assert_eq!(cancun_fields.parent_beacon_block_root, expected_parent_beacon_block_root);
+        assert_eq!(cancun_fields.versioned_hashes, expected_hashes);
+
+        // Verify execution requests are present
+        assert!(execution_data.sidecar.prague().is_some());
+    }
+
+    #[cfg(all(feature = "sha2", feature = "ssz"))]
+    #[test]
+    fn test_builder_block_validation_request_v4_from_trait() {
+        let bid_submission_json =
+            include_str!("examples/relay_builder_block_validation_request_v4.json");
+        let bid_submission: SignedBidSubmissionV4 =
+            serde_json::from_str(bid_submission_json).unwrap();
+
+        let request = BuilderBlockValidationRequestV4 {
+            request: bid_submission,
+            registered_gas_limit: 30000000,
+            parent_beacon_block_root: B256::from_slice(&[0x12; 32]),
+        };
+
+        let execution_data_owned: alloy_rpc_types_engine::ExecutionData = request.clone().into();
+
+        let execution_data_method = request.into_execution_data();
+        assert_eq!(execution_data_owned.payload, execution_data_method.payload);
+        assert_eq!(
+            execution_data_owned.sidecar.parent_beacon_block_root(),
+            execution_data_method.sidecar.parent_beacon_block_root()
+        );
+    }
+
+    #[cfg(all(feature = "sha2", feature = "ssz"))]
+    #[test]
+    fn test_builder_block_validation_request_v5_to_execution_data() {
+        // Create a test SignedBidSubmissionV5 based on the V4 test data structure
+        let bid_submission_v4_json =
+            include_str!("examples/relay_builder_block_validation_request_v4.json");
+        let bid_submission_v4: SignedBidSubmissionV4 =
+            serde_json::from_str(bid_submission_v4_json).unwrap();
+
+        // Convert to V5 structure (same data, but with BlobsBundleV2)
+        let bid_submission_v5 = SignedBidSubmissionV5 {
+            message: bid_submission_v4.message.clone(),
+            execution_payload: bid_submission_v4.execution_payload.clone(),
+            blobs_bundle: alloy_rpc_types_engine::BlobsBundleV2 {
+                commitments: bid_submission_v4.blobs_bundle.commitments.clone(),
+                proofs: bid_submission_v4.blobs_bundle.proofs.clone(),
+                blobs: bid_submission_v4.blobs_bundle.blobs.clone(),
+            },
+            execution_requests: bid_submission_v4.execution_requests.clone(),
+            signature: bid_submission_v4.signature,
+        };
+
+        let request = BuilderBlockValidationRequestV5 {
+            request: bid_submission_v5,
+            registered_gas_limit: 30000000,
+            parent_beacon_block_root: B256::from_slice(&[0x13; 32]),
+        };
+
+        // Store references before calling to_execution_data() which consumes self
+        let expected_payload = request.request.execution_payload.clone();
+        let expected_parent_beacon_block_root = request.parent_beacon_block_root;
+        let expected_hashes = request.request.blobs_bundle.versioned_hashes();
+
+        // Test the convenience method
+        let execution_data = request.into_execution_data();
+
+        // Verify the execution payload is V3
+        match &execution_data.payload {
+            alloy_rpc_types_engine::ExecutionPayload::V3(payload) => {
+                assert_eq!(payload, &expected_payload);
+            }
+            _ => panic!("Expected ExecutionPayload::V3"),
+        }
+
+        // Verify the sidecar contains the correct parent beacon block root
+        assert_eq!(
+            execution_data.sidecar.parent_beacon_block_root(),
+            Some(expected_parent_beacon_block_root)
+        );
+
+        // Verify versioned hashes are computed correctly
+        let cancun_fields = execution_data.sidecar.cancun().unwrap();
+        assert_eq!(cancun_fields.parent_beacon_block_root, expected_parent_beacon_block_root);
+        assert_eq!(cancun_fields.versioned_hashes, expected_hashes);
+
+        // Verify execution requests are present
+        assert!(execution_data.sidecar.prague().is_some());
+    }
+
+    #[cfg(all(feature = "sha2", feature = "ssz"))]
+    #[test]
+    fn test_builder_block_validation_request_v5_from_trait() {
+        // Create a test SignedBidSubmissionV5 based on the V4 test data structure
+        let bid_submission_v4_json =
+            include_str!("examples/relay_builder_block_validation_request_v4.json");
+        let bid_submission_v4: SignedBidSubmissionV4 =
+            serde_json::from_str(bid_submission_v4_json).unwrap();
+
+        // Convert to V5 structure (same data, but with BlobsBundleV2)
+        let bid_submission_v5 = SignedBidSubmissionV5 {
+            message: bid_submission_v4.message.clone(),
+            execution_payload: bid_submission_v4.execution_payload.clone(),
+            blobs_bundle: alloy_rpc_types_engine::BlobsBundleV2 {
+                commitments: bid_submission_v4.blobs_bundle.commitments.clone(),
+                proofs: bid_submission_v4.blobs_bundle.proofs.clone(),
+                blobs: bid_submission_v4.blobs_bundle.blobs.clone(),
+            },
+            execution_requests: bid_submission_v4.execution_requests.clone(),
+            signature: bid_submission_v4.signature,
+        };
+
+        let request = BuilderBlockValidationRequestV5 {
+            request: bid_submission_v5,
+            registered_gas_limit: 30000000,
+            parent_beacon_block_root: B256::from_slice(&[0x13; 32]),
+        };
+
+        let execution_data_owned: alloy_rpc_types_engine::ExecutionData = request.clone().into();
+
+        let execution_data_method = request.into_execution_data();
+        assert_eq!(execution_data_owned.payload, execution_data_method.payload);
+        assert_eq!(
+            execution_data_owned.sidecar.parent_beacon_block_root(),
+            execution_data_method.sidecar.parent_beacon_block_root()
+        );
+    }
+
+    #[cfg(all(feature = "sha2", feature = "ssz"))]
+    #[test]
+    fn test_builder_block_validation_request_v6_to_execution_data() {
+        let bid_submission_v6 = amsterdam_bid_submission_v6();
+
+        let request = BuilderBlockValidationRequestV6 {
+            request: bid_submission_v6,
+            registered_gas_limit: 30000000,
+            parent_beacon_block_root: B256::from_slice(&[0x14; 32]),
+        };
+
+        let expected_payload = request.request.execution_payload.clone();
+        let expected_block_access_list =
+            request.request.execution_payload.block_access_list.clone();
+        let expected_parent_beacon_block_root = request.parent_beacon_block_root;
+        let expected_hashes = request.request.blobs_bundle.versioned_hashes();
+
+        let execution_data = request.into_execution_data();
+
+        match &execution_data.payload {
+            alloy_rpc_types_engine::ExecutionPayload::V4(payload) => {
+                assert_eq!(payload, &expected_payload);
+            }
+            _ => panic!("Expected ExecutionPayload::V4"),
+        }
+        assert_eq!(execution_data.payload.block_access_list(), Some(&expected_block_access_list));
+
+        assert_eq!(
+            execution_data.sidecar.parent_beacon_block_root(),
+            Some(expected_parent_beacon_block_root)
+        );
+
+        let cancun_fields = execution_data.sidecar.cancun().unwrap();
+        assert_eq!(cancun_fields.parent_beacon_block_root, expected_parent_beacon_block_root);
+        assert_eq!(cancun_fields.versioned_hashes, expected_hashes);
+
+        assert!(execution_data.sidecar.prague().is_some());
+    }
+
+    #[cfg(all(feature = "sha2", feature = "ssz"))]
+    #[test]
+    fn test_builder_block_validation_request_v6_from_trait() {
+        let request = BuilderBlockValidationRequestV6 {
+            request: amsterdam_bid_submission_v6(),
+            registered_gas_limit: 30000000,
+            parent_beacon_block_root: B256::from_slice(&[0x14; 32]),
+        };
+
+        let execution_data_owned: alloy_rpc_types_engine::ExecutionData = request.clone().into();
+
+        let execution_data_method = request.into_execution_data();
+        assert_eq!(execution_data_owned.payload, execution_data_method.payload);
+        assert_eq!(
+            execution_data_owned.sidecar.parent_beacon_block_root(),
+            execution_data_method.sidecar.parent_beacon_block_root()
+        );
     }
 }

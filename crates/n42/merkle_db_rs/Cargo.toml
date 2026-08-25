@@ -7,9 +7,12 @@ edition = "2024"
 debug = []
 
 [dependencies]
-ethereum_ssz = "0.9"
-ethereum_ssz_derive = "0.9"
+serde_json.workspace = true
+reth-codecs.workspace = true
+bytes.workspace = true
+ethereum_ssz.workspace = true
+ethereum_ssz_derive.workspace = true
 serde.workspace = true
 sha2 = "0.10.9"
-tree_hash = "0.10.0"
+tree_hash.workspace = true
 typenum = "1.19.0"

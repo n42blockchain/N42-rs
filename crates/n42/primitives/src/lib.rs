@@ -13,6 +13,8 @@ mod validator;
 pub use validator::*;
 
 pub mod beacon;
+/// Database codecs for the beacon types.
+pub mod db_codec;
 pub use beacon::*;
 
 mod activation_queue;

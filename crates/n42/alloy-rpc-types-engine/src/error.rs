@@ -1,6 +1,3 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 //! Error variants when validating an execution payload.
 
 use alloy_primitives::{Bytes, B256, U256};
@@ -53,7 +50,7 @@ pub enum PayloadError {
     /// cancun fields missing in post-cancun payload.
     #[display("cancun fields missing in post-cancun payload")]
     PostCancunWithoutCancunFields,
-    /// blob transactions present in pre-prague payload.
+    /// EIP-7702 transactions present in pre-prague payload.
     #[display("eip 7702 transactions present in pre-prague payload")]
     PrePragueBlockWithEip7702Transactions,
     /// requests present in pre-prague payload.

@@ -612,9 +612,6 @@ pub enum ConsensusError {
     #[error("apos error detail {detail}")]
     AposErrorDetail { detail: String },
 
-    /// Other, likely an injected L2 error.
-    #[error("{0}")]
-    Other(String),
     /// Other unspecified error.
     #[error(transparent)]
     Other(#[from] Arc<dyn Error + Send + Sync>),

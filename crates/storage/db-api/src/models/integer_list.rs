@@ -60,11 +60,7 @@ impl IntegerList {
 
     /// Pushes a new integer to the list.
     pub fn push(&mut self, value: u64) -> Result<(), IntegerListError> {
-        if self.0.push(value) {
-            Ok(())
-        } else {
-            Err(IntegerListError::UnsortedInput)
-        }
+        self.0.try_push(value).map_err(|_| IntegerListError::UnsortedInput)
     }
 
     /// Clears the list.

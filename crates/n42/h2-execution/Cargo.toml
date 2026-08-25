@@ -3,7 +3,7 @@ name = "n42-h2-execution"
 version.workspace = true
 edition.workspace = true
 # Ported from ../N42-26 (rustc 1.97); see the note in the sibling h2 crates.
-rust-version = "1.89"
+rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true

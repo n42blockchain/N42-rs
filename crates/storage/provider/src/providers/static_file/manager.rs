@@ -2497,8 +2497,8 @@ impl<N: NodePrimitives> StorageChangeSetReader for StaticFileProvider<N> {
             }
         }
 
-        if low < range.end {
-            if let Some(change) = cursor
+        if low < range.end &&
+            let Some(change) = cursor
                 .get_one::<StorageChangesetMask>(low.into())?
                 .filter(|change| change.address == address && change.key == storage_key)
         {

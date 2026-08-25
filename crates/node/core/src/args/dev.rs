@@ -133,6 +133,12 @@ pub struct DefaultDevArgs {
     pub payload_wait_time: Option<Duration>,
     /// Default mnemonic used to derive dev accounts.
     pub dev_mnemonic: String,
+    /// N42: default consensus signer private key for APoS.
+    pub consensus_signer_private_key: Option<String>,
+    /// N42: default source db for old-chain-data migration.
+    pub migrate_old_chain_data_from_db: Option<String>,
+    /// N42: default source rpc for old-chain-data migration.
+    pub migrate_old_chain_data_from_rpc: Option<String>,
 }
 
 impl DefaultDevArgs {
@@ -208,6 +214,9 @@ impl Default for DevArgs {
             finality_depth,
             payload_wait_time,
             dev_mnemonic,
+            consensus_signer_private_key,
+            migrate_old_chain_data_from_db,
+            migrate_old_chain_data_from_rpc,
         } = DefaultDevArgs::get_global().clone();
         Self {
             dev,
@@ -216,6 +225,9 @@ impl Default for DevArgs {
             finality_depth,
             payload_wait_time,
             dev_mnemonic,
+            consensus_signer_private_key,
+            migrate_old_chain_data_from_db,
+            migrate_old_chain_data_from_rpc,
         }
     }
 }

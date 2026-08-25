@@ -3042,7 +3042,7 @@ impl<TX: DbTxMut + DbTx + 'static, N: NodeTypesForProvider> StateWriter
             block_bodies.last().expect("already checked if there are blocks").last_tx_num();
 
         let storage_range = BlockNumberAddress::range(range.clone());
-        let storage_changeset_highest = self
+        let storage_changeset = if let Some(highest_block) = self
             .static_file_provider
             .get_highest_static_file_block(StaticFileSegment::StorageChangeSets) &&
             self.cached_storage_settings().storage_v2

@@ -12,6 +12,9 @@ description = "Reth storage provider traits and types"
 workspace = true
 
 [dependencies]
+# n42
+n42-primitives.workspace = true
+merkle_db_rs.workspace = true
 # reth
 reth-db-models.workspace = true
 reth-chainspec.workspace = true
@@ -41,9 +44,6 @@ alloy-primitives = { workspace = true, features = ["getrandom"] }
 tokio = { workspace = true, features = ["macros", "rt"] }
 tokio-stream.workspace = true
 
-# n42
-n42-primitives.workspace = true
-merkle_db_rs.workspace = true
 
 [features]
 default = ["std"]

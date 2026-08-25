@@ -5,7 +5,7 @@ edition.workspace = true
 # Ported from ../N42-26 (rustc 1.97). Higher than the workspace's 1.86: the twig
 # SIMD kernel uses AVX-512 intrinsics stabilised in 1.89, and the H2 codecs use
 # 1.87 APIs. Declared per-crate so the rest of the workspace keeps its MSRV.
-rust-version = "1.89"
+rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true

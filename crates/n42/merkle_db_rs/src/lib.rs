@@ -40,3 +40,6 @@ mod tests {
         assert_eq!(result, 4);
     }
 }
+
+/// Database codecs for [`tree::Tree`].
+pub mod db_codec;

@@ -95,7 +95,8 @@ serde.workspace = true
 enr = { workspace = true, features = ["rust-secp256k1"] }
 alloy-rpc-types-trace.workspace = true
 similar-asserts.workspace = true
-reqwest.workspace = true
+# the e2e tests call Response::json()
+reqwest = { workspace = true, features = ["json"] }
 reth-rpc-layer.workspace = true
 
 [features]

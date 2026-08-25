@@ -1467,6 +1467,8 @@ mod tests {
 
     fn payload_v1() -> ExecutionPayloadV1 {
         ExecutionPayloadV1 {
+            difficulty: Default::default(),
+            nonce: Default::default(),
             parent_hash: B256::repeat_byte(1),
             fee_recipient: Address::repeat_byte(2),
             state_root: B256::repeat_byte(3),

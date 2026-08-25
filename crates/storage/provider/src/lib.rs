@@ -63,8 +63,11 @@ pub use static_file::StaticFileSegment;
 
 pub mod bundle_state;
 
-/// Writer standalone type.
-pub mod writer;
+// `pub mod writer` removed: upstream dropped the declaration in #19554
+// ("introduce EitherWriter", 2025-11-06) and kept only either_writer, leaving
+// writer/mod.rs as an orphan file it no longer compiles. This fork still
+// declared it, which is the only reason its tests ran here at all — and they
+// encode pre-refactor expectations.
 
 /// Converts a [`RangeBounds`](std::ops::RangeBounds) into a concrete [`Range`](std::ops::Range)
 pub fn to_range<R: std::ops::RangeBounds<u64>>(bounds: R) -> std::ops::Range<u64> {

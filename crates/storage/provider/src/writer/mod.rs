@@ -43,7 +43,6 @@ mod tests {
     /// four fields stay public, so construct and then set.
     fn revm_account(
         info: RevmAccountInfo,
-        original_info: RevmAccountInfo,
         status: AccountStatus,
         storage: revm::state::EvmStorage,
     ) -> RevmAccount {
@@ -51,7 +50,9 @@ mod tests {
         account.info = info;
         account.status = status;
         account.storage = storage;
-        *account.original_info_mut() = original_info;
+        // original_info is deliberately left at its default (None). It is the
+        // BAL's view of the pre-load account; upstream's equivalent tests do not
+        // set it, and forcing it to a copy of `info` changes revert generation.
         account
     }
 
@@ -132,10 +133,8 @@ mod tests {
             address_a,
             revm_account(
                 account_a.clone(),
-                account_a.clone(),
                 AccountStatus::Touched | AccountStatus::Created,
-                HashMap::default(),
-            ),
+                HashMap::default()),
         )]));
 
         // 0xff.. is changed (balance + 1, nonce + 1)
@@ -143,10 +142,8 @@ mod tests {
             address_b,
             revm_account(
                 account_b_changed.clone(),
-                account_b_changed.clone(),
                 AccountStatus::Touched,
-                HashMap::default(),
-            ),
+                HashMap::default()),
         )]));
 
         state.merge_transitions(BundleRetention::Reverts);
@@ -202,10 +199,8 @@ mod tests {
             address_b,
             revm_account(
                 account_b_changed.clone(),
-                account_b_changed,
                 AccountStatus::Touched | AccountStatus::SelfDestructed,
-                HashMap::default(),
-            ),
+                HashMap::default()),
         )]));
 
         state.merge_transitions(BundleRetention::Reverts);
@@ -266,19 +261,15 @@ mod tests {
                 address_a,
                 revm_account(
                 RevmAccountInfo::default(),
-                RevmAccountInfo::default(),
                 AccountStatus::Touched | AccountStatus::Created,
-                HashMap::default(),
-            ),
+                HashMap::default()),
             ),
             (
                 address_b,
                 revm_account(
                 account_b.clone(),
-                account_b,
                 AccountStatus::Touched,
-                HashMap::default(),
-            ),
+                HashMap::default()),
             ),
         ]));
 
@@ -377,10 +368,8 @@ mod tests {
             address_a,
             revm_account(
                 RevmAccountInfo::default(),
-                RevmAccountInfo::default(),
                 AccountStatus::Touched | AccountStatus::SelfDestructed,
-                HashMap::default(),
-            ),
+                HashMap::default()),
         )]));
 
         state.merge_transitions(BundleRetention::Reverts);
@@ -433,10 +422,8 @@ mod tests {
             address1,
             revm_account(
                 account_info.clone(),
-                account_info.clone(),
                 AccountStatus::Touched | AccountStatus::Created,
-                HashMap::default(),
-            ),
+                HashMap::default()),
         )]));
         init_state.merge_transitions(BundleRetention::Reverts);
 
@@ -458,10 +445,8 @@ mod tests {
             address1,
             revm_account(
                 account_info.clone(),
-                account_info.clone(),
                 AccountStatus::Touched,
-                HashMap::default(),
-            ),
+                HashMap::default()),
         )]));
         state.merge_transitions(BundleRetention::Reverts);
 
@@ -470,10 +455,8 @@ mod tests {
             address1,
             revm_account(
                 account_info.clone(),
-                account_info.clone(),
                 AccountStatus::Touched | AccountStatus::SelfDestructed,
-                HashMap::default(),
-            ),
+                HashMap::default()),
         )]));
         state.merge_transitions(BundleRetention::Reverts);
 
@@ -482,10 +465,8 @@ mod tests {
             address1,
             revm_account(
                 account_info.clone(),
-                account_info.clone(),
                 AccountStatus::Touched | AccountStatus::Created,
-                HashMap::default(),
-            ),
+                HashMap::default()),
         )]));
         state.merge_transitions(BundleRetention::Reverts);
 
@@ -494,10 +475,8 @@ mod tests {
             address1,
             revm_account(
                 account_info.clone(),
-                account_info.clone(),
                 AccountStatus::Touched,
-                HashMap::default(),
-            ),
+                HashMap::default()),
         )]));
         state.merge_transitions(BundleRetention::Reverts);
 
@@ -506,10 +485,8 @@ mod tests {
             address1,
             revm_account(
                 account_info.clone(),
-                account_info.clone(),
                 AccountStatus::Touched | AccountStatus::SelfDestructed,
-                HashMap::default(),
-            ),
+                HashMap::default()),
         )]));
         state.merge_transitions(BundleRetention::Reverts);
 
@@ -518,37 +495,29 @@ mod tests {
             address1,
             revm_account(
                 account_info.clone(),
-                account_info.clone(),
                 AccountStatus::Touched | AccountStatus::Created,
-                HashMap::default(),
-            ),
+                HashMap::default()),
         )]));
         state.commit(HashMap::from_iter([(
             address1,
             revm_account(
-                account_info.clone(),
                 account_info.clone(),
                 AccountStatus::Touched,
-                HashMap::default(),
-            ),
+                HashMap::default()),
         )]));
         state.commit(HashMap::from_iter([(
             address1,
             revm_account(
-                account_info.clone(),
                 account_info.clone(),
                 AccountStatus::Touched | AccountStatus::SelfDestructed,
-                HashMap::default(),
-            ),
+                HashMap::default()),
         )]));
         state.commit(HashMap::from_iter([(
             address1,
             revm_account(
                 account_info.clone(),
-                account_info.clone(),
                 AccountStatus::Touched | AccountStatus::Created,
-                HashMap::default(),
-            ),
+                HashMap::default()),
         )]));
         state.merge_transitions(BundleRetention::Reverts);
 
@@ -557,10 +526,8 @@ mod tests {
             address1,
             revm_account(
                 account_info.clone(),
-                account_info,
                 AccountStatus::Touched,
-                HashMap::default(),
-            ),
+                HashMap::default()),
         )]));
 
         state.merge_transitions(BundleRetention::Reverts);
@@ -716,10 +683,8 @@ mod tests {
             address1,
             revm_account(
                 account1.clone(),
-                account1.clone(),
                 AccountStatus::Touched | AccountStatus::Created,
-                HashMap::default(),
-            ),
+                HashMap::default()),
         )]));
         init_state.merge_transitions(BundleRetention::Reverts);
         let outcome =
@@ -740,30 +705,24 @@ mod tests {
             address1,
             revm_account(
                 account1.clone(),
-                account1.clone(),
                 AccountStatus::Touched | AccountStatus::SelfDestructed,
-                HashMap::default(),
-            ),
+                HashMap::default()),
         )]));
 
         state.commit(HashMap::from_iter([(
             address1,
             revm_account(
-                account1.clone(),
                 account1.clone(),
                 AccountStatus::Touched | AccountStatus::Created,
-                HashMap::default(),
-            ),
+                HashMap::default()),
         )]));
 
         state.commit(HashMap::from_iter([(
             address1,
             revm_account(
                 account1.clone(),
-                account1,
                 AccountStatus::Touched,
-                HashMap::default(),
-            ),
+                HashMap::default()),
         )]));
 
         // Commit block #1 changes to the database.
@@ -905,10 +864,8 @@ mod tests {
             address1,
             revm_account(
                 RevmAccountInfo::default(),
-                RevmAccountInfo::default(),
                 AccountStatus::Touched | AccountStatus::SelfDestructed,
-                HashMap::default(),
-            ),
+                HashMap::default()),
         )]));
         state.merge_transitions(BundleRetention::PlainState);
         assert_state_root(&state, &prestate, "destroyed account");
@@ -932,7 +889,6 @@ mod tests {
             address2,
             revm_account(
                 account2_info.clone(),
-                account2_info,
                 AccountStatus::Touched,
                 HashMap::from_iter([(
                     slot2,
@@ -958,10 +914,8 @@ mod tests {
             address3,
             revm_account(
                 account3_info.clone(),
-                account3_info,
                 AccountStatus::Touched,
-                HashMap::default(),
-            ),
+                HashMap::default()),
         )]));
         state.merge_transitions(BundleRetention::PlainState);
         assert_state_root(&state, &prestate, "changed balance");
@@ -977,10 +931,8 @@ mod tests {
             address4,
             revm_account(
                 account4_info.clone(),
-                account4_info,
                 AccountStatus::Touched,
-                HashMap::default(),
-            ),
+                HashMap::default()),
         )]));
         state.merge_transitions(BundleRetention::PlainState);
         assert_state_root(&state, &prestate, "changed nonce");
@@ -994,10 +946,8 @@ mod tests {
             address1,
             revm_account(
                 account1_new_info.clone(),
-                account1_new_info,
                 AccountStatus::Touched | AccountStatus::Created,
-                HashMap::default(),
-            ),
+                HashMap::default()),
         )]));
         state.merge_transitions(BundleRetention::PlainState);
         assert_state_root(&state, &prestate, "recreated");
@@ -1012,7 +962,6 @@ mod tests {
             address1,
             revm_account(
                 account1_new_info2.clone(),
-                account1_new_info2,
                 AccountStatus::Touched | AccountStatus::Created,
                 HashMap::from_iter([(
                     slot20,
@@ -1148,4 +1097,5 @@ mod tests {
         };
         assert_eq!(storage_root, storage_root_prehashed(updated_storage.storage));
     }
+
 }

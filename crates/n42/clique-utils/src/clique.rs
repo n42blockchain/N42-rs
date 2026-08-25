@@ -1,8 +1,8 @@
 // Copyright (c) 2017-2025 N42 Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use super::Header;
-use crate::BlockHeader as BlockHeaderTrait;
+use reth_primitives_traits::Header;
+use reth_primitives_traits::BlockHeader as BlockHeaderTrait;
 use alloc::boxed::Box;
 use alloy_primitives::{keccak256, Address, BlockNumber, Bloom, Bytes, B256, B64, U256};
 use alloy_rlp::{length_of_length, Encodable};

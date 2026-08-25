@@ -7,10 +7,8 @@ use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_execution_types::BlockExecutionResult;
 use reth_primitives::{SealedBlock, SealedHeader};
 use reth_primitives_traits::AlloyBlockHeader;
-use reth_primitives_traits::{
-    header::clique_utils::{recover_address_generic, seal_hash, SIGNATURE_LENGTH},
-    Header, RecoveredBlock,
-};
+use n42_clique_utils::{recover_address_generic, seal_hash, SIGNATURE_LENGTH};
+use reth_primitives_traits::{Header, RecoveredBlock};
 use reth_primitives_traits::{
     Block as BlockTrait, BlockHeader as BlockHeaderTrait, NodePrimitives,
 };

@@ -30,10 +30,8 @@ use reth_payload_primitives::EngineApiMessageVersion;
 use reth_payload_primitives::{BuiltPayload, PayloadAttributesBuilder, PayloadKind, PayloadTypes};
 use reth_primitives::TransactionSigned;
 use reth_primitives::{Block, Header, SealedBlock};
-use reth_primitives_traits::{
-    header::clique_utils::{recover_address, recover_address_generic},
-    Block as BlockTrait,
-};
+use n42_clique_utils::{recover_address, recover_address_generic};
+use reth_primitives_traits::Block as BlockTrait;
 use reth_primitives_traits::{AlloyBlockHeader, BlockBody, NodePrimitives};
 use reth_provider::{
     BeaconProvider, BeaconProviderWriter, BlockIdReader, BlockReader, ChainSpecProvider,

@@ -9,6 +9,7 @@ repository.workspace = true
 exclude.workspace = true
 
 [dependencies]
+n42-clique-utils.workspace = true
 once_cell.workspace = true
 unexpected = "0.1"
 

@@ -31,7 +31,8 @@ use reth_node_builder::{rpc::RethRpcAddOns, FullNode, NodeBuilder, NodeConfig, N
 use reth_tasks::Runtime;
 
 use n42_clique::{EXTRA_SEAL, EXTRA_VANITY};
-use reth_primitives_traits::{header::clique_utils::SIGNATURE_LENGTH, AlloyBlockHeader};
+use n42_clique_utils::SIGNATURE_LENGTH;
+use reth_primitives_traits::AlloyBlockHeader;
 use reth_rpc_api::EngineApiClient;
 use std::{
     str::FromStr,

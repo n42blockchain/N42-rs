@@ -12,6 +12,7 @@ members = [
     "bin/n42/",
     "crates/n42/primitives/",
     "crates/n42/clique/",
+    "crates/n42/clique-utils",
     "crates/n42/engine-types/",
     "crates/n42/engine-primitives/",
     "crates/n42/n42-testing",
@@ -50,7 +51,6 @@ members = [
     "crates/node/core/",
     "crates/ethereum/node/",
     #"crates/primitives/",
-    "crates/primitives-traits/",
     #"crates/rpc/rpc-eth-api/",
     "crates/rpc/rpc-types-compat/",
     "crates/storage/db/",
@@ -216,6 +216,7 @@ codegen-units = 1
 # for n42
 n42-primitives = { path = "crates/n42/primitives" }
 n42-clique = {path="crates/n42/clique"}
+n42-clique-utils = { path = "crates/n42/clique-utils" }
 n42-engine-types = {path="crates/n42/engine-types"}
 n42-engine-primitives = {path="crates/n42/engine-primitives"}
 consensus-client = {path="crates/n42/consensus-client"}
@@ -239,12 +240,11 @@ n42-ef-tests = {path="crates/n42/ef-tests"}
 blst = "0.3.11"
 
 reth = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-auto-seal-consensus = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
+# Removed from workspace.dependencies: unused here, and all of these are gone
+# from reth 2.4.1 (the optimism crates moved to op-reth; the rest deleted).
+# Dropping them shrinks the upgrade surface. See docs/RETH_2_4_1_UPGRADE.md.
 reth-basic-payload-builder = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 #reth-beacon-consensus = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-bench = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-blockchain-tree = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-blockchain-tree-api = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 reth-chain-state = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 reth-chainspec = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 reth-cli = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
@@ -283,7 +283,6 @@ reth-ethereum-payload-builder = { git = "https://github.com/paradigmxyz/reth.git
 reth-etl = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 reth-evm = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 reth-evm-ethereum = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-optimism-evm = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 reth-execution-errors = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 reth-execution-types = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 reth-exex = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
@@ -310,16 +309,7 @@ reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth.git", tag = "v
 reth-node-ethstats = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 reth-node-events = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 reth-node-metrics = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-optimism-node = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 reth-node-types = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-optimism-chainspec = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-optimism-cli = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-optimism-consensus = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-optimism-forks = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-optimism-payload-builder = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-optimism-primitives = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-optimism-rpc = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-optimism-storage = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 reth-payload-builder = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 reth-payload-primitives = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 reth-payload-builder-primitives = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
@@ -332,7 +322,6 @@ reth-prune-types = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.
 reth-revm = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0", default-features = false }
 reth-rpc = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 reth-rpc-api = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-rpc-api-testing-util = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 reth-rpc-builder = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 reth-rpc-engine-api = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 reth-rpc-eth-api = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
@@ -632,16 +621,22 @@ tree_hash_derive = "0.10.0"
 [patch.'https://github.com/paradigmxyz/reth.git']
 reth = { path = "bin/reth" }
 reth-revm = { path = "crates/revm" }
-reth-evm-ethereum = { path = "crates/ethereum/evm" }
+# reth-evm-ethereum is NOT forked any more: the vendored copy was byte-identical
+# to upstream v1.11.0 in both src/ and Cargo.toml (the only difference was a
+# benches/ dir). N42_CUSTOMIZATIONS.md's claim that it calls recover_address for
+# the beneficiary is stale — nothing in it references clique_utils.
 reth-chainspec = { path = "crates/chainspec" }
 reth-node-builder = { path = "crates/node/builder" }
 #reth-primitives = { path = "crates/primitives" }
-reth-primitives-traits = { path = "crates/primitives-traits" }
+# reth-primitives-traits is NOT forked any more. The fork existed only to carry
+# clique_utils, which is now the standalone n42-clique-utils crate, so upstream
+# is used as-is — one less crate to re-sync on every reth bump, and one less
+# thing to re-home when reth moved this crate out of its repo.
 reth-node-core = { path = "crates/node/core" }
 reth-node-ethereum = { path = "crates/ethereum/node" }
 reth-provider = { path = "crates/storage/provider" }
-reth-libmdbx = { path = "crates/storage/libmdbx-rs" }
-reth-mdbx-sys = { path = "crates/storage/libmdbx-rs/mdbx-sys" }
+# reth-libmdbx / reth-mdbx-sys are NOT forked any more: the vendored copies were
+# byte-identical to upstream v1.11.0 apart from README links and a VERSION.txt.
 reth-db = {path = "crates/storage/db", optional = true }
 reth-ethereum-forks = { path = "crates/ethereum/hardforks"}
 reth-ethereum-cli = { path = "crates/ethereum/cli"}

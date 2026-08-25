@@ -3,11 +3,11 @@
 
 //! Tests for clique_utils module - signature recovery and seal hash computation
 
-use super::clique_utils::{
+use crate::clique::{
     public_key_to_address, recover_address, recover_address_generic, seal_hash, seal_hash_generic,
     RecoveryError, SIGNATURE_LENGTH,
 };
-use super::Header;
+use reth_primitives_traits::Header;
 use alloy_primitives::{keccak256, Address, Bloom, Bytes, B256, B64, U256};
 use secp256k1::{ecdsa::RecoveryId, Message, PublicKey, SecretKey, SECP256K1};
 

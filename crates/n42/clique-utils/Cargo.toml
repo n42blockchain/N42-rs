@@ -1,0 +1,29 @@
+[package]
+name = "n42-clique-utils"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Clique/APoS header signature recovery and seal hashing"
+
+[lints]
+workspace = true
+
+[dependencies]
+reth-primitives-traits.workspace = true
+alloy-primitives.workspace = true
+alloy-rlp.workspace = true
+bytes.workspace = true
+secp256k1 = { workspace = true, features = ["recovery"] }
+
+[features]
+default = ["std"]
+std = [
+    "alloy-primitives/std",
+    "alloy-rlp/std",
+    "bytes/std",
+    "reth-primitives-traits/std",
+    "secp256k1/std",
+]

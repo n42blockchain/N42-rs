@@ -4342,6 +4342,8 @@ mod tests {
     #[cfg(feature = "ssz")]
     fn ssz_payload_v1() -> ExecutionPayloadV1 {
         ExecutionPayloadV1 {
+            difficulty: Default::default(),
+            nonce: Default::default(),
             parent_hash: B256::with_last_byte(1),
             fee_recipient: Address::with_last_byte(2),
             state_root: B256::with_last_byte(3),
@@ -5435,6 +5437,8 @@ mod tests {
         let transaction = Bytes::from_static(&hex!("f86d0a8458b20efd825208946177843db3138ae69679a54b95cf345ed759450d8806f3e8d87878800080820a95a0f8bddb1dcc4558b532ff747760a6f547dd275afdbe7bdecc90680e71de105757a014f34ba38c180913c0543b0ac2eccfb77cc3f801a535008dc50e533fbe435f53"));
 
         let payload = ExecutionPayloadV1 {
+            difficulty: Default::default(),
+            nonce: Default::default(),
             parent_hash: B256::default(),
             fee_recipient: Address::default(),
             state_root: B256::default(),
@@ -5466,6 +5470,8 @@ mod tests {
     #[test]
     fn test_with_transactions_root_extra_data_validation() {
         let payload = ExecutionPayloadV1 {
+            difficulty: Default::default(),
+            nonce: Default::default(),
             parent_hash: B256::default(),
             fee_recipient: Address::default(),
             state_root: B256::default(),
@@ -5494,6 +5500,8 @@ mod tests {
         let transaction = Bytes::from_static(&hex!("f86d0a8458b20efd825208946177843db3138ae69679a54b95cf345ed759450d8806f3e8d87878800080820a95a0f8bddb1dcc4558b532ff747760a6f547dd275afdbe7bdecc90680e71de105757a014f34ba38c180913c0543b0ac2eccfb77cc3f801a535008dc50e533fbe435f53"));
 
         let payload = ExecutionPayload::V1(ExecutionPayloadV1 {
+            difficulty: Default::default(),
+            nonce: Default::default(),
             parent_hash: B256::default(),
             fee_recipient: Address::default(),
             state_root: B256::default(),
@@ -5878,6 +5886,8 @@ mod tests {
     fn serde_roundtrip_payload_input_v2_with_withdrawals() {
         let payload = ExecutionPayloadInputV2 {
             execution_payload: ExecutionPayloadV1 {
+                difficulty: Default::default(),
+                nonce: Default::default(),
                 parent_hash: B256::default(),
                 fee_recipient: Address::default(),
                 state_root: B256::default(),
@@ -5906,6 +5916,8 @@ mod tests {
     fn serde_roundtrip_payload_input_v2_without_withdrawals() {
         let payload = ExecutionPayloadInputV2 {
             execution_payload: ExecutionPayloadV1 {
+                difficulty: Default::default(),
+                nonce: Default::default(),
                 parent_hash: B256::default(),
                 fee_recipient: Address::default(),
                 state_root: B256::default(),

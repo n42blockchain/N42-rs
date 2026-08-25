@@ -17,7 +17,7 @@ use crate::network::N42NetworkBuilder;
 //use crate::{N42EngineTypes, N42NodeAddOns, N42PayloadServiceBuilder};
 use crate::N42PayloadServiceBuilder;
 use reth_ethereum_engine_primitives::{
-    EthBuiltPayload, EthPayloadAttributes, EthPayloadBuilderAttributes,
+    EthBuiltPayload, EthPayloadAttributes,
 };
 use reth_ethereum_primitives::{EthPrimitives, PooledTransaction, TransactionSigned};
 use reth_evm::{ConfigureEvm, EvmFactory, EvmFactoryFor, NextBlockEnvAttributes};
@@ -71,7 +71,6 @@ impl N42Node {
         <Node::Types as NodeTypes>::Payload: PayloadTypes<
             BuiltPayload = EthBuiltPayload,
             PayloadAttributes = EthPayloadAttributes,
-            PayloadBuilderAttributes = EthPayloadBuilderAttributes,
         >,
     {
         ComponentsBuilder::default()
@@ -203,6 +202,8 @@ where
             EthereumEngineValidatorBuilder::default(),
             BasicEngineApiBuilder::default(),
             BasicEngineValidatorBuilder::default(),
+            // upstream split the middleware argument into rpc + auth-http
+            Default::default(),
             Default::default(),
         ))
     }

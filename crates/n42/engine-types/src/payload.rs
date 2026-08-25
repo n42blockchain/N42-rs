@@ -25,9 +25,8 @@ use reth_evm::{
     ConfigureEvm, Evm, NextBlockEnvAttributes,
 };
 use reth_evm_ethereum::EthEvmConfig;
-use reth_payload_builder::{EthBuiltPayload, EthPayloadBuilderAttributes};
+use reth_payload_builder::EthBuiltPayload;
 use reth_payload_builder_primitives::PayloadBuilderError;
-use reth_payload_primitives::PayloadBuilderAttributes;
 use reth_primitives_traits::transaction::error::InvalidTransactionError;
 use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_storage_api::StateProviderFactory;
@@ -195,12 +194,13 @@ where
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>,
     Cons: FullConsensus<EthPrimitives> + SignerManager + Clone + Unpin + 'static,
 {
-    type Attributes = EthPayloadBuilderAttributes;
+    // upstream: PayloadBuilder::Attributes is now a PayloadAttributes
+    type Attributes = EthPayloadAttributes;
     type BuiltPayload = EthBuiltPayload;
 
     fn try_build(
         &self,
-        args: BuildArguments<EthPayloadBuilderAttributes, EthBuiltPayload>,
+        args: BuildArguments<EthPayloadAttributes, EthBuiltPayload>,
     ) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError> {
         default_n42_payload(
             self.evm_config.clone(),
@@ -228,7 +228,16 @@ where
         &self,
         config: PayloadConfig<Self::Attributes>,
     ) -> Result<EthBuiltPayload, PayloadBuilderError> {
-        let args = BuildArguments::new(Default::default(), config, Default::default(), None);
+        // upstream added execution_cache and state_root_handle; this path shares
+        // neither with the engine, so both are None.
+        let args = BuildArguments::new(
+            Default::default(),
+            None,
+            None,
+            config,
+            Default::default(),
+            None,
+        );
 
         default_n42_payload(
             self.evm_config.clone(),
@@ -255,7 +264,7 @@ pub fn default_n42_payload<EvmConfig, Client, Pool, F, Cons>(
     client: Client,
     pool: Pool,
     builder_config: EthereumBuilderConfig,
-    args: BuildArguments<EthPayloadBuilderAttributes, EthBuiltPayload>,
+    args: BuildArguments<EthPayloadAttributes, EthBuiltPayload>,
     best_txs: F,
     cons: Cons,
 ) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError>
@@ -271,9 +280,15 @@ where
         config,
         cancel,
         best_payload,
+        // upstream additions this builder does not use
+        execution_cache: _,
+        state_root_handle: _,
     } = args;
     let PayloadConfig {
         parent_header,
+        // upstream additions: the payload id moved off the attributes onto the config
+        parent_block_info: _,
+        payload_id,
         attributes,
     } = config;
 
@@ -293,26 +308,28 @@ where
         }
         Ok(None) => {
             warn!(target: "payload_builder", "No signer address configured, using suggested_fee_recipient");
-            attributes.suggested_fee_recipient()
+            attributes.suggested_fee_recipient
         }
         Err(e) => {
             warn!(target: "payload_builder", error=?e, "Failed to get signer address, using suggested_fee_recipient");
-            attributes.suggested_fee_recipient()
+            attributes.suggested_fee_recipient
         }
     };
-    debug!(target: "payload_builder", ?coinbase, suggested_fee_recipient=?attributes.suggested_fee_recipient(), "using coinbase for payload building");
+    debug!(target: "payload_builder", ?coinbase, suggested_fee_recipient=?attributes.suggested_fee_recipient, "using coinbase for payload building");
 
     let mut builder = evm_config
         .builder_for_next_block(
             &mut db,
             &parent_header,
             NextBlockEnvAttributes {
-                timestamp: attributes.timestamp(),
+                // EIP-7843; APoS does not drive slots
+                slot_number: None,
+                timestamp: attributes.timestamp,
                 suggested_fee_recipient: coinbase,
-                prev_randao: attributes.prev_randao(),
+                prev_randao: attributes.prev_randao,
                 gas_limit: builder_config.gas_limit(parent_header.gas_limit),
-                parent_beacon_block_root: attributes.parent_beacon_block_root(),
-                withdrawals: Some(attributes.withdrawals().clone()),
+                parent_beacon_block_root: attributes.parent_beacon_block_root,
+                withdrawals: attributes.withdrawals.clone().map(Into::into),
                 extra_data: Default::default(),
             },
         )
@@ -320,7 +337,7 @@ where
 
     let chain_spec = client.chain_spec();
 
-    debug!(target: "payload_builder", id=%attributes.id, parent_header = ?parent_header.hash(), parent_number = parent_header.number, "building new payload");
+    debug!(target: "payload_builder", id=%payload_id, parent_header = ?parent_header.hash(), parent_number = parent_header.number, "building new payload");
     let mut cumulative_gas_used = 0;
     let block_gas_limit: u64 = builder.evm_mut().block().gas_limit();
     let base_fee = builder.evm_mut().block().basefee();
@@ -365,7 +382,7 @@ where
             // continue
             best_txs.mark_invalid(
                 &pool_tx,
-                &InvalidPoolTransactionError::ExceedsGasLimit(pool_tx.gas_limit(), block_gas_limit),
+                InvalidPoolTransactionError::ExceedsGasLimit(pool_tx.gas_limit(), block_gas_limit),
             );
             continue;
         }
@@ -391,7 +408,7 @@ where
                 trace!(target: "payload_builder", tx=?tx.hash(), ?block_blob_count, "skipping blob transaction because it would exceed the max blob count per block");
                 best_txs.mark_invalid(
                     &pool_tx,
-                    &InvalidPoolTransactionError::Eip4844(
+                    InvalidPoolTransactionError::Eip4844(
                         Eip4844PoolTransactionError::TooManyEip4844Blobs {
                             have: block_blob_count + tx_blob_count,
                             permitted: max_blob_count,
@@ -416,7 +433,7 @@ where
                     trace!(target: "payload_builder", %error, ?tx, "skipping invalid transaction and its descendants");
                     best_txs.mark_invalid(
                         &pool_tx,
-                        &InvalidPoolTransactionError::Consensus(
+                        InvalidPoolTransactionError::Consensus(
                             InvalidTransactionError::TxTypeNotSupported,
                         ),
                     );
@@ -441,8 +458,11 @@ where
         let miner_fee = tx
             .effective_tip_per_gas(base_fee)
             .expect("fee is always valid; execution succeeded");
-        total_fees += U256::from(miner_fee) * U256::from(gas_used);
-        cumulative_gas_used += gas_used;
+        // EIP-8037 split gas into execution and state components; fees and the
+        // block's cumulative counter both track the execution gas.
+        let tx_gas_used = gas_used.tx_gas_used();
+        total_fees += U256::from(miner_fee) * U256::from(tx_gas_used);
+        cumulative_gas_used += tx_gas_used;
     }
 
     debug!(target: "payload_builder", tx_count, ?cumulative_gas_used, ?total_fees, "payload builder finished processing transactions");
@@ -462,7 +482,9 @@ where
         execution_result,
         block,
         ..
-    } = builder.finish(&state_provider)?;
+    // upstream added an optional precomputed (state_root, trie_updates);
+    // this builder computes them itself.
+    } = builder.finish(&state_provider, None)?;
 
     let requests = chain_spec
         .is_prague_active_at_timestamp(attributes.timestamp)
@@ -516,12 +538,21 @@ where
     cons.seal(&mut header)
         .map_err(|err| PayloadBuilderError::Internal(err.into()))?;
 
-    let sealed_block = Arc::new(SealedBlock::seal_parts(header, block.into_block().body));
-
+    // Keep the recovered senders: EthBuiltPayload now takes a RecoveredBlock, and
+    // re-recovering them from signatures here would be pure waste.
+    let senders = block.senders().to_vec();
+    let sealed_block = SealedBlock::seal_parts(header, block.into_block().body);
     let block_hash = SealedBlock::hash(&sealed_block);
     let _ = cons.set_cached_reads(block_hash, cached_reads.clone());
 
-    let payload = EthBuiltPayload::new(attributes.id, sealed_block, total_fees, requests)
+    let recovered = Arc::new(reth_primitives_traits::RecoveredBlock::new_sealed(
+        sealed_block,
+        senders,
+    ));
+
+    // upstream dropped payload_id from this constructor and added the optional
+    // encoded block access list (EIP-7928), which APoS does not produce.
+    let payload = EthBuiltPayload::new(recovered, total_fees, requests, None)
         // add blob sidecars from the executed txs
         .with_sidecars(blob_sidecars);
 
@@ -561,7 +592,6 @@ where
     <Node::Types as NodeTypes>::Payload: PayloadTypes<
         BuiltPayload = EthBuiltPayload,
         PayloadAttributes = EthPayloadAttributes,
-        PayloadBuilderAttributes = EthPayloadBuilderAttributes,
     >,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TxTy<Node::Types>>>
         + Unpin

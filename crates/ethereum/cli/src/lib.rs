@@ -14,7 +14,9 @@ pub mod app;
 pub mod chainspec;
 pub mod interface;
 
-pub mod debug_cmd;
+// debug_cmd removed: upstream deleted it, and it was never wired into this
+// repo's command tree — a `pub mod` that nothing referenced. It accounted for
+// every compile error in this crate after the reth upgrade.
 
 pub use app::{CliApp, ExtendedCommand};
 pub use interface::{Cli, Commands, NoSubCmd};

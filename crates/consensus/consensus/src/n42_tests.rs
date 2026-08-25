@@ -123,7 +123,7 @@ mod consensus_error_tests {
 
     #[test]
     fn test_other_error() {
-        let err = ConsensusError::Other("custom error".to_string());
+        let err = ConsensusError::other(std::io::Error::other("custom error"));
         assert_eq!(format!("{}", err), "custom error");
     }
 }
@@ -195,6 +195,9 @@ mod header_consensus_error_tests {
 
     fn create_test_header() -> Header {
         Header {
+            // upstream additions (EIP-7928 / EIP-7843)
+            block_access_list_hash: None,
+            slot_number: None,
             parent_hash: B256::ZERO,
             ommers_hash: B256::ZERO,
             beneficiary: Address::ZERO,

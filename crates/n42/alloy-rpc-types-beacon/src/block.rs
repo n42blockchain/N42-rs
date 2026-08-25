@@ -1093,6 +1093,8 @@ mod tests {
             use alloy_rpc_types_engine::ExecutionPayloadV1;
 
             let payload = ExecutionPayloadV1 {
+                difficulty: Default::default(),
+                nonce: Default::default(),
                 parent_hash: B256::repeat_byte(0x01),
                 fee_recipient: Address::repeat_byte(0x02),
                 state_root: B256::repeat_byte(0x03),

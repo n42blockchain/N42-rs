@@ -3,15 +3,19 @@
 
 use alloy_primitives::{Address, B256};
 use reth::rpc::types::engine::PayloadAttributes;
-use reth_payload_builder::EthPayloadBuilderAttributes;
 
 #[cfg(test)]
 pub(crate) fn n42_payload_attributes(
     timestamp: u64,
-    parent_hash: B256,
+    _parent_hash: B256,
     eth_signer_address: Address,
-) -> EthPayloadBuilderAttributes {
-    let attributes = PayloadAttributes {
+// upstream removed EthPayloadBuilderAttributes; the payload attributes are
+// now used directly, and the parent hash travels separately.
+) -> PayloadAttributes {
+    PayloadAttributes {
+        // upstream additions; N42 drives neither
+        slot_number: None,
+        target_gas_limit: None,
         timestamp,
         prev_randao: B256::ZERO,
         suggested_fee_recipient: eth_signer_address,
@@ -22,6 +26,5 @@ pub(crate) fn n42_payload_attributes(
         // root missing for active Cancun block"
         parent_beacon_block_root: Some(B256::ZERO),
         //parent_beacon_block_root: None,
-    };
-    EthPayloadBuilderAttributes::new(parent_hash, attributes)
+    }
 }

@@ -9,7 +9,6 @@ use reth_ethereum_engine_primitives::ExecutionPayloadEnvelopeV3;
 use reth_ethereum_forks::N42_HARDFORKS_FOR_CLIQUE_TEST;
 use reth_node_api::{EngineTypes, FullNodeComponents, FullNodeTypes, PayloadTypes};
 use reth_node_builder::node::NodeTypes;
-use reth_payload_builder::EthPayloadBuilderAttributes;
 use reth_payload_primitives::{BuiltPayload, PayloadKind};
 use reth_primitives_traits::{NodePrimitives, SealedHeader};
 use reth_provider::{BlockHashReader, BlockNumReader, BlockReaderIdExt};
@@ -79,7 +78,11 @@ fn get_addresses_from_extra_data(extra_data: Bytes) -> Vec<Address> {
 #[cfg(test)]
 async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(
     node: &FullNode<Node, AddOns>, eth_signer_key: String) -> eyre::Result<()>
-    where <<<Node as FullNodeTypes>::Types as NodeTypes>::Payload as PayloadTypes>::PayloadBuilderAttributes: From<EthPayloadBuilderAttributes>,
+    where
+    // replaces the old PayloadBuilderAttributes: From<EthPayloadBuilderAttributes>
+    // bound; upstream removed that associated type
+    <<<Node as FullNodeTypes>::Types as NodeTypes>::Payload as PayloadTypes>::PayloadAttributes:
+        From<reth::rpc::types::engine::PayloadAttributes>,
     <<Node as FullNodeTypes>::Types as NodeTypes>::Primitives: NodePrimitives<Block = reth_ethereum_primitives::Block>,
     <<Node as FullNodeTypes>::Types as NodeTypes>::Payload: EngineTypes,
 {
@@ -113,7 +116,11 @@ async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(
     // node.consensus.set_eth_signer_by_key(Some(eth_signer_key.clone()))?;
     let payload_id = node
         .payload_builder_handle
-        .send_new_payload(attributes.clone().into())
+        .send_new_payload(reth_payload_builder::BuildNewPayload {
+            attributes: attributes.clone().into(),
+            parent_hash,
+            resources: Default::default(),
+        })
         .await
         .unwrap()?;
     println!("payload_id={payload_id}");
@@ -191,7 +198,8 @@ impl CliqueTest {
 
     async fn happy_path(&self) -> eyre::Result<()> {
         reth_tracing::init_test_tracing();
-        let runtime = Runtime::with_existing_handle(tokio::runtime::Handle::current()).unwrap();
+        // upstream removed with_existing_handle; Runtime::test() is the test constructor
+        let runtime = Runtime::test();
 
         let network_config = NetworkArgs {
             discovery: DiscoveryArgs {

@@ -897,6 +897,7 @@ dependencies = [
  "alloy-serde 2.4.1",
  "arbitrary",
  "assert_matches",
+ "base64 0.22.1",
  "derive_more 2.1.1",
  "ethereum_ssz",
  "ethereum_ssz_derive",

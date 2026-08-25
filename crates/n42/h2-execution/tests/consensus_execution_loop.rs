@@ -19,6 +19,9 @@ const GENESIS: B256 = B256::ZERO;
 
 fn attrs() -> PayloadAttributes {
     PayloadAttributes {
+        // upstream additions; N42 drives neither
+        slot_number: None,
+        target_gas_limit: None,
         timestamp: 1_700_000_001,
         prev_randao: B256::ZERO,
         suggested_fee_recipient: Default::default(),

@@ -963,6 +963,8 @@ mod transaction_response_tests {
         let envelope = EthereumTxEnvelope::Legacy(signed_tx);
 
         let tx_response = Transaction {
+            // upstream added this to the RPC transaction shape
+            block_timestamp: None,
             inner: Recovered::new_unchecked(envelope, Address::ZERO),
             block_hash: None,
             block_number: None,

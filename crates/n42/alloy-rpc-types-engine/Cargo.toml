@@ -82,6 +82,12 @@ kzg = ["alloy-consensus/kzg", "alloy-eips/kzg"]
 arbitrary = ["dep:arbitrary", "std", "alloy-primitives/arbitrary", "alloy-serde/arbitrary", "alloy-consensus/arbitrary", "alloy-eips/arbitrary"]
 
 [dev-dependencies]
+base64 = "0.22"
+# the `any(test, feature = "arbitrary")` derives need the Arbitrary impls from
+# these crates, which are behind their own arbitrary features
+alloy-eips = { workspace = true, features = ["arbitrary"] }
+alloy-consensus = { workspace = true, features = ["arbitrary"] }
+alloy-serde = { workspace = true, features = ["arbitrary"] }
 alloy-primitives = { workspace = true, features = [
     "rand",
     "rlp",

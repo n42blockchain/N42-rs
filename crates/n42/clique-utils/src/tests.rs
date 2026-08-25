@@ -14,6 +14,9 @@ use secp256k1::{ecdsa::RecoveryId, Message, PublicKey, SecretKey, SECP256K1};
 /// Create a test header with default values
 fn create_test_header() -> Header {
     Header {
+        // upstream additions (EIP-7928 / EIP-7843); APoS sets neither
+        block_access_list_hash: None,
+        slot_number: None,
         parent_hash: B256::ZERO,
         ommers_hash: B256::ZERO,
         beneficiary: Address::ZERO,

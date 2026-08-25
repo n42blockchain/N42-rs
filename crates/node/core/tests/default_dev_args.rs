@@ -28,6 +28,10 @@ fn custom_dev_defaults_apply_to_cli_and_default() {
         finality_depth: NonZeroUsize::new(2).unwrap(),
         payload_wait_time: Some(Duration::from_millis(250)),
         dev_mnemonic: "custom mnemonic".to_string(),
+        // N42 additions to DevArgs; not driven by the upstream defaults builder
+        consensus_signer_private_key: None,
+        migrate_old_chain_data_from_db: None,
+        migrate_old_chain_data_from_rpc: None,
     };
 
     assert_eq!(CommandParser::<DevArgs>::parse_from(["reth"]).args, expected);

@@ -40,6 +40,8 @@ pub use launch::{
     *,
 };
 
+mod txpool_prewarm;
+
 mod handle;
 pub use handle::NodeHandle;
 

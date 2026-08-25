@@ -10,7 +10,7 @@ use crate::{
         policy::NetworkPolicies,
         TransactionsHandle, TransactionsManager, TransactionsManagerConfig,
     },
-    NetworkConfig, NetworkConfigBuilder, NetworkHandle, NetworkManager,
+    NetworkConfig, NetworkConfigBuilder, NetworkHandle, NetworkManager, PeersConfig,
 };
 use futures::{FutureExt, StreamExt};
 use pin_project::pin_project;
@@ -20,6 +20,7 @@ use reth_eth_wire::{
 };
 use reth_ethereum_primitives::{PooledTransactionVariant, TransactionSigned};
 use reth_evm_ethereum::EthEvmConfig;
+use reth_metrics::common::mpsc::memory_bounded_channel;
 use reth_network_api::{
     events::{PeerEvent, SessionInfo},
     test_utils::{PeersHandle, PeersHandleProvider},
@@ -27,9 +28,10 @@ use reth_network_api::{
 };
 use reth_network_peers::PeerId;
 use reth_storage_api::{
-    noop::NoopProvider, BlockReader, BlockReaderIdExt, HeaderProvider, StateProviderFactory,
+    noop::NoopProvider, BalProvider, BlockReader, BlockReaderIdExt, HeaderProvider,
+    StateProviderFactory, StateRangeProviderFactory,
 };
-use reth_tasks::TokioTaskExecutor;
+use reth_tasks::Runtime;
 use reth_tokio_util::EventStream;
 use reth_transaction_pool::{
     blobstore::InMemoryBlobStore,
@@ -45,12 +47,11 @@ use std::{
     task::{Context, Poll},
 };
 use tokio::{
-    sync::{
-        mpsc::{channel, unbounded_channel},
-        oneshot,
-    },
+    sync::{mpsc::channel, oneshot},
     task::JoinHandle,
 };
+
+use crate::transactions::constants::tx_manager::DEFAULT_TX_MANAGER_CHANNEL_MEMORY_LIMIT_BYTES;
 
 /// A test network consisting of multiple peers.
 pub struct Testnet<C, Pool> {
@@ -198,7 +199,7 @@ where
                 peer.client.clone(),
                 EthEvmConfig::mainnet(),
                 blob_store.clone(),
-                TokioTaskExecutor::default(),
+                Runtime::test(),
             );
             peer.map_transactions_manager(EthTransactionPool::eth_pool(
                 pool,
@@ -228,7 +229,7 @@ where
                 peer.client.clone(),
                 EthEvmConfig::mainnet(),
                 blob_store.clone(),
-                TokioTaskExecutor::default(),
+                Runtime::test(),
             );
 
             peer.map_transactions_manager_with(
@@ -247,6 +248,9 @@ where
             Receipt = reth_ethereum_primitives::Receipt,
             Header = alloy_consensus::Header,
         > + HeaderProvider
+        + BalProvider
+        + StateProviderFactory
+        + StateRangeProviderFactory
         + Clone
         + Unpin
         + 'static,
@@ -319,6 +323,9 @@ where
             Receipt = reth_ethereum_primitives::Receipt,
             Header = alloy_consensus::Header,
         > + HeaderProvider
+        + BalProvider
+        + StateProviderFactory
+        + StateRangeProviderFactory
         + Unpin
         + 'static,
     Pool: TransactionPool<
@@ -462,7 +469,10 @@ where
     }
 
     /// Set a new request handler that's connected to the peer's network
-    pub fn install_request_handler(&mut self) {
+    pub fn install_request_handler(&mut self)
+    where
+        C: BalProvider,
+    {
         let (tx, rx) = channel(ETH_REQUEST_CHANNEL_CAPACITY);
         self.network.set_eth_request_handler(tx);
         let peers = self.network.peers_handle();
@@ -472,7 +482,10 @@ where
 
     /// Set a new transactions manager that's connected to the peer's network
     pub fn install_transactions_manager(&mut self, pool: Pool) {
-        let (tx, rx) = unbounded_channel();
+        let (tx, rx) = memory_bounded_channel(
+            DEFAULT_TX_MANAGER_CHANNEL_MEMORY_LIMIT_BYTES,
+            "test_tx_channel",
+        );
         self.network.set_transactions(tx);
         let transactions_manager = TransactionsManager::new(
             self.handle(),
@@ -490,7 +503,10 @@ where
         P: TransactionPool,
     {
         let Self { mut network, request_handler, client, secret_key, .. } = self;
-        let (tx, rx) = unbounded_channel();
+        let (tx, rx) = memory_bounded_channel(
+            DEFAULT_TX_MANAGER_CHANNEL_MEMORY_LIMIT_BYTES,
+            "test_tx_channel",
+        );
         network.set_transactions(tx);
         let transactions_manager = TransactionsManager::new(
             network.handle().clone(),
@@ -531,7 +547,10 @@ where
         P: TransactionPool,
     {
         let Self { mut network, request_handler, client, secret_key, .. } = self;
-        let (tx, rx) = unbounded_channel();
+        let (tx, rx) = memory_bounded_channel(
+            DEFAULT_TX_MANAGER_CHANNEL_MEMORY_LIMIT_BYTES,
+            "test_tx_channel",
+        );
         network.set_transactions(tx);
 
         let announcement_policy = StrictEthAnnouncementFilter::default();
@@ -573,6 +592,9 @@ where
             Receipt = reth_ethereum_primitives::Receipt,
             Header = alloy_consensus::Header,
         > + HeaderProvider
+        + BalProvider
+        + StateProviderFactory
+        + StateRangeProviderFactory
         + Unpin
         + 'static,
     Pool: TransactionPool<
@@ -703,8 +725,12 @@ where
         C: ChainSpecProvider<ChainSpec: Hardforks>,
     {
         let secret_key = SecretKey::new(&mut rand_08::thread_rng());
+        let protocols: Vec<Protocol> = protocols.into_iter().collect();
+        // `NetworkConfigBuilder::build` re-derives snap advertisement from `snap_enabled`, which
+        // would otherwise silently strip a manually included `snap` capability.
+        let snap_enabled = protocols.iter().any(|p| p.cap.name == Protocol::snap_2().cap.name);
 
-        let builder = Self::network_config_builder(secret_key);
+        let builder = Self::network_config_builder(secret_key).with_snap(snap_enabled);
         let hello_message =
             HelloMessageWithProtocols::builder(builder.get_peer_id()).protocols(protocols).build();
         let config = builder.hello_message(hello_message).build(client.clone());
@@ -713,11 +739,12 @@ where
     }
 
     fn network_config_builder(secret_key: SecretKey) -> NetworkConfigBuilder {
-        NetworkConfigBuilder::new(secret_key)
+        NetworkConfigBuilder::new(secret_key, Runtime::test())
             .listener_addr(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)))
             .discovery_addr(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)))
             .disable_dns_discovery()
             .disable_discv4_discovery()
+            .peer_config(PeersConfig::test())
     }
 }
 

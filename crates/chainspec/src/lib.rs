@@ -39,15 +39,6 @@ pub use spec::{
     MAINNET, N42, N42_DEVNET, SEPOLIA,
 };
 
-use reth_primitives_traits::sync::OnceLock;
-
-/// Simple utility to create a thread-safe sync cell with a value set.
-pub fn once_cell_set<T>(value: T) -> OnceLock<T> {
-    let once = OnceLock::new();
-    let _ = once.set(value);
-    once
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

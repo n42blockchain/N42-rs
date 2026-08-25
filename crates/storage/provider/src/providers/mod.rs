@@ -27,20 +27,16 @@ mod consistent_view;
 pub use consistent_view::{ConsistentDbView, ConsistentViewError};
 
 mod blockchain_provider;
-pub use blockchain_provider::BlockchainProvider;
+pub use blockchain_provider::{BlockchainProvider, SNAPSHOT_STATE_RETENTION};
 
 mod consistent;
 pub use consistent::ConsistentProvider;
 
-// RocksDB currently only supported on Unix platforms
-// Windows support is planned for future releases
-#[cfg_attr(all(unix, feature = "rocksdb"), path = "rocksdb/mod.rs")]
-#[cfg_attr(not(all(unix, feature = "rocksdb")), path = "rocksdb_stub.rs")]
 pub(crate) mod rocksdb;
 
 pub use rocksdb::{
     PruneShardOutcome, PrunedIndices, RocksDBBatch, RocksDBBuilder, RocksDBIter, RocksDBProvider,
-    RocksDBRawIter, RocksDBStats, RocksDBTableStats, RocksTx,
+    RocksDBRawIter, RocksDBStats, RocksDBTableStats, RocksReadSnapshot, RocksTx,
 };
 
 /// Helper trait to bound [`NodeTypes`] so that combined with database they satisfy

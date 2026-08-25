@@ -8,13 +8,17 @@ use crate::{message::BlockRequest, session::BlockRangeInfo};
 use alloy_primitives::B256;
 use futures::StreamExt;
 use reth_eth_wire::{
-    Capabilities, EthNetworkPrimitives, GetBlockBodies, GetBlockHeaders, NetworkPrimitives,
+    snap::SnapProtocolMessage, BlockAccessLists, Capabilities, EthNetworkPrimitives, EthVersion,
+    GetBlockAccessLists, GetBlockBodies, GetBlockHeaders, GetReceipts, NetworkPrimitives,
 };
 use reth_network_api::test_utils::PeersHandle;
 use reth_network_p2p::{
+    block_access_lists::client::BalRequirement,
     error::{EthResponseValidator, PeerRequestResult, RequestError, RequestResult},
     headers::client::HeadersRequest,
     priority::Priority,
+    receipts::client::ReceiptsResponse,
+    snap::client::SnapResponse,
 };
 use reth_network_peers::PeerId;
 use reth_network_types::ReputationChangeKind;
@@ -32,6 +36,9 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 
 type InflightHeadersRequest<H> = Request<HeadersRequest, PeerRequestResult<Vec<H>>>;
 type InflightBodiesRequest<B> = Request<(), PeerRequestResult<Vec<B>>>;
+type InflightReceiptsRequest<R> = Request<(), PeerRequestResult<ReceiptsResponse<R>>>;
+type InflightBlockAccessListsRequest = Request<(), PeerRequestResult<BlockAccessLists>>;
+type InflightSnapRequest = Request<(), PeerRequestResult<SnapResponse>>;
 
 /// Manages data fetching operations.
 ///
@@ -45,6 +52,12 @@ pub struct StateFetcher<N: NetworkPrimitives = EthNetworkPrimitives> {
     inflight_headers_requests: HashMap<PeerId, InflightHeadersRequest<N::BlockHeader>>,
     /// Currently active [`GetBlockBodies`] requests
     inflight_bodies_requests: HashMap<PeerId, InflightBodiesRequest<N::BlockBody>>,
+    /// Currently active [`GetBlockAccessLists`] requests
+    inflight_bals_requests: HashMap<PeerId, InflightBlockAccessListsRequest>,
+    /// Currently active `GetReceipts` requests
+    inflight_receipts_requests: HashMap<PeerId, InflightReceiptsRequest<N::Receipt>>,
+    /// Currently active `snap/2` requests
+    inflight_snap_requests: HashMap<PeerId, InflightSnapRequest>,
     /// The list of _available_ peers for requests.
     peers: HashMap<PeerId, Peer>,
     /// The handle to the peers manager
@@ -67,6 +80,9 @@ impl<N: NetworkPrimitives> StateFetcher<N> {
         Self {
             inflight_headers_requests: Default::default(),
             inflight_bodies_requests: Default::default(),
+            inflight_bals_requests: Default::default(),
+            inflight_receipts_requests: Default::default(),
+            inflight_snap_requests: Default::default(),
             peers: Default::default(),
             peers_handle,
             num_active_peers,
@@ -77,15 +93,16 @@ impl<N: NetworkPrimitives> StateFetcher<N> {
     }
 
     /// Invoked when connected to a new peer.
-    pub(crate) fn new_active_peer(
-        &mut self,
-        peer_id: PeerId,
-        best_hash: B256,
-        best_number: u64,
-        capabilities: Arc<Capabilities>,
-        timeout: Arc<AtomicU64>,
-        range_info: Option<BlockRangeInfo>,
-    ) {
+    pub(crate) fn new_active_peer(&mut self, peer: NewPeerInfo) {
+        let NewPeerInfo {
+            peer_id,
+            best_hash,
+            best_number,
+            capabilities,
+            timeout,
+            range_info,
+            supports_snap,
+        } = peer;
         self.peers.insert(
             peer_id,
             Peer {
@@ -96,6 +113,7 @@ impl<N: NetworkPrimitives> StateFetcher<N> {
                 timeout,
                 last_response_likely_bad: false,
                 range_info,
+                supports_snap,
             },
         );
     }
@@ -112,6 +130,15 @@ impl<N: NetworkPrimitives> StateFetcher<N> {
             let _ = req.response.send(Err(RequestError::ConnectionDropped));
         }
         if let Some(req) = self.inflight_bodies_requests.remove(peer) {
+            let _ = req.response.send(Err(RequestError::ConnectionDropped));
+        }
+        if let Some(req) = self.inflight_bals_requests.remove(peer) {
+            let _ = req.response.send(Err(RequestError::ConnectionDropped));
+        }
+        if let Some(req) = self.inflight_receipts_requests.remove(peer) {
+            let _ = req.response.send(Err(RequestError::ConnectionDropped));
+        }
+        if let Some(req) = self.inflight_snap_requests.remove(peer) {
             let _ = req.response.send(Err(RequestError::ConnectionDropped));
         }
     }
@@ -142,7 +169,11 @@ impl<N: NetworkPrimitives> StateFetcher<N> {
     /// adequate data. Additionally, if full blocks are required this prioritizes peers that have
     /// full history available
     fn next_best_peer(&self, requirement: BestPeerRequirements) -> Option<PeerId> {
-        let mut idle = self.peers.iter().filter(|(_, peer)| peer.state.is_idle());
+        // filter out peers that aren't idle or don't meet the requirement
+        let mut idle = self
+            .peers
+            .iter()
+            .filter(|(_, peer)| peer.state.is_idle() && peer.satisfies(&requirement));
 
         let mut best_peer = idle.next()?;
 
@@ -170,6 +201,14 @@ impl<N: NetworkPrimitives> StateFetcher<N> {
         Some(*best_peer.0)
     }
 
+    /// Returns whether any connected peer can serve BAL requests.
+    fn has_eth71_peer(&self) -> bool {
+        self.peers.values().any(|peer| {
+            !matches!(peer.state, PeerState::Closing) &&
+                peer.capabilities.supports_eth_at_least(&EthVersion::Eth71)
+        })
+    }
+
     /// Returns the next action to return
     fn poll_action(&mut self) -> PollAction {
         // we only check and not pop here since we don't know yet whether a peer is available.
@@ -179,8 +218,15 @@ impl<N: NetworkPrimitives> StateFetcher<N> {
 
         let request = self.queued_requests.pop_front().expect("not empty");
         let Some(peer_id) = self.next_best_peer(request.best_peer_requirements()) else {
-            // need to put back the request
-            self.queued_requests.push_front(request);
+            // Optional BAL/snap requests can lose their capable peer while queued; complete them
+            // instead of waiting for future peer churn.
+            if self.should_fail_fast(&request) {
+                request.send_err_response(RequestError::UnsupportedCapability);
+            } else {
+                // no peer matches this request's requirements; requeue at the back so other
+                // queued requests get a chance on the next poll instead of head-of-line blocking.
+                self.queued_requests.push_back(request);
+            }
             return PollAction::NoPeersAvailable
         };
 
@@ -202,21 +248,30 @@ impl<N: NetworkPrimitives> StateFetcher<N> {
             loop {
                 // poll incoming requests
                 match self.download_requests_rx.poll_next_unpin(cx) {
-                    Poll::Ready(Some(request)) => match request.get_priority() {
-                        Priority::High => {
-                            // find the first normal request and queue before, add this request to
-                            // the back of the high-priority queue
-                            let pos = self
-                                .queued_requests
-                                .iter()
-                                .position(|req| req.is_normal_priority())
-                                .unwrap_or(0);
-                            self.queued_requests.insert(pos, request);
+                    Poll::Ready(Some(request)) => {
+                        // Optional BAL/snap requests should not wait for future peer churn if no
+                        // connected peer can serve them right now.
+                        if self.should_fail_fast(&request) {
+                            request.send_err_response(RequestError::UnsupportedCapability);
+                            continue
                         }
-                        Priority::Normal => {
-                            self.queued_requests.push_back(request);
+
+                        match request.get_priority() {
+                            Priority::High => {
+                                // find first normal request and queue before it; add this request
+                                // to the back of the high-priority queue
+                                let pos = self
+                                    .queued_requests
+                                    .iter()
+                                    .position(|req| req.is_normal_priority())
+                                    .unwrap_or(0);
+                                self.queued_requests.insert(pos, request);
+                            }
+                            Priority::Normal => {
+                                self.queued_requests.push_back(request);
+                            }
                         }
-                    },
+                    }
                     Poll::Ready(None) => {
                         unreachable!("channel can't close")
                     }
@@ -230,6 +285,20 @@ impl<N: NetworkPrimitives> StateFetcher<N> {
         }
     }
 
+    /// Returns whether any connected peer negotiated `snap/2`.
+    fn has_snap_peer(&self) -> bool {
+        self.peers
+            .values()
+            .any(|peer| !matches!(peer.state, PeerState::Closing) && peer.supports_snap)
+    }
+
+    /// Returns `true` if `request` cannot be served by any currently connected peer and should
+    /// fail immediately instead of waiting for future peer churn.
+    fn should_fail_fast(&self, request: &DownloadRequest<N>) -> bool {
+        (request.is_optional_bal() && !self.has_eth71_peer()) ||
+            (request.is_snap() && !self.has_snap_peer())
+    }
+
     /// Handles a new request to a peer.
     ///
     /// Caution: this assumes the peer exists and is idle
@@ -239,6 +308,15 @@ impl<N: NetworkPrimitives> StateFetcher<N> {
             peer.state = req.peer_state();
         }
 
+        self.prepare_inflight_block_request(peer_id, req)
+    }
+
+    /// Tracks an inflight request and converts it into a peer request.
+    fn prepare_inflight_block_request(
+        &mut self,
+        peer_id: PeerId,
+        req: DownloadRequest<N>,
+    ) -> BlockRequest {
         match req {
             DownloadRequest::GetBlockHeaders { request, response, .. } => {
                 let inflight = Request { request: request.clone(), response };
@@ -256,15 +334,41 @@ impl<N: NetworkPrimitives> StateFetcher<N> {
                 self.inflight_bodies_requests.insert(peer_id, inflight);
                 BlockRequest::GetBlockBodies(GetBlockBodies(request))
             }
+            DownloadRequest::GetBlockAccessLists { request, response, .. } => {
+                let inflight = Request { request: (), response };
+                self.inflight_bals_requests.insert(peer_id, inflight);
+                BlockRequest::GetBlockAccessLists(GetBlockAccessLists(request))
+            }
+            DownloadRequest::GetReceipts { request, response, .. } => {
+                let inflight = Request { request: (), response };
+                self.inflight_receipts_requests.insert(peer_id, inflight);
+                BlockRequest::GetReceipts(GetReceipts(request))
+            }
+            DownloadRequest::GetSnap { request, response, .. } => {
+                let inflight = Request { request: (), response };
+                self.inflight_snap_requests.insert(peer_id, inflight);
+                BlockRequest::GetSnap(Box::new(request))
+            }
         }
     }
 
-    /// Returns a new followup request for the peer.
+    /// Returns a queued followup request the peer can serve.
+    ///
+    /// This is an immediate scheduling shortcut after a successful response. It skips queued
+    /// requests whose hard requirements do not match this peer, leaving them for the regular peer
+    /// selection path.
     ///
     /// Caution: this expects that the peer is _not_ closed.
     fn followup_request(&mut self, peer_id: PeerId) -> Option<BlockResponseOutcome> {
-        let req = self.queued_requests.pop_front()?;
-        let req = self.prepare_block_request(peer_id, req);
+        let peer = self.peers.get_mut(&peer_id)?;
+        let req_idx = self.queued_requests.iter().position(|req| {
+            // Find the first queued request this peer can serve.
+            peer.satisfies(&req.best_peer_requirements())
+        })?;
+        let req = self.queued_requests.remove(req_idx).expect("valid request index");
+
+        peer.state = req.peer_state();
+        let req = self.prepare_inflight_block_request(peer_id, req);
         Some(BlockResponseOutcome::Request(peer_id, req))
     }
 
@@ -330,6 +434,72 @@ impl<N: NetworkPrimitives> StateFetcher<N> {
         None
     }
 
+    /// Called on a `GetBlockAccessLists` response from a peer
+    pub(crate) fn on_block_access_lists_response(
+        &mut self,
+        peer_id: PeerId,
+        res: RequestResult<BlockAccessLists>,
+    ) -> Option<BlockResponseOutcome> {
+        let is_likely_bad_response = res.is_err();
+
+        if let Some(resp) = self.inflight_bals_requests.remove(&peer_id) {
+            let _ = resp.response.send(res.map(|b| (peer_id, b).into()));
+        }
+        if let Some(peer) = self.peers.get_mut(&peer_id) {
+            peer.last_response_likely_bad = is_likely_bad_response;
+
+            if peer.state.on_request_finished() && !is_likely_bad_response {
+                return self.followup_request(peer_id)
+            }
+        }
+        None
+    }
+
+    /// Called on a `GetReceipts` response from a peer.
+    ///
+    /// All receipt variants (legacy with bloom, eth/69, eth/70) are expected to be normalized
+    /// to [`ReceiptsResponse`] by the caller before invoking this method.
+    pub(crate) fn on_receipts_response(
+        &mut self,
+        peer_id: PeerId,
+        res: RequestResult<ReceiptsResponse<N::Receipt>>,
+    ) -> Option<BlockResponseOutcome> {
+        let is_likely_bad_response = res.as_ref().map_or(true, |resp| resp.receipts.is_empty());
+
+        if let Some(resp) = self.inflight_receipts_requests.remove(&peer_id) {
+            let _ = resp.response.send(res.map(|r| (peer_id, r).into()));
+        }
+        if let Some(peer) = self.peers.get_mut(&peer_id) {
+            peer.last_response_likely_bad = is_likely_bad_response;
+
+            if peer.state.on_request_finished() && !is_likely_bad_response {
+                return self.followup_request(peer_id)
+            }
+        }
+        None
+    }
+
+    /// Called on a `snap/2` response from a peer.
+    pub(crate) fn on_snap_response(
+        &mut self,
+        peer_id: PeerId,
+        res: RequestResult<SnapResponse>,
+    ) -> Option<BlockResponseOutcome> {
+        let is_likely_bad_response = res.is_err();
+
+        if let Some(resp) = self.inflight_snap_requests.remove(&peer_id) {
+            let _ = resp.response.send(res.map(|r| (peer_id, r).into()));
+        }
+        if let Some(peer) = self.peers.get_mut(&peer_id) {
+            peer.last_response_likely_bad = is_likely_bad_response;
+
+            if peer.state.on_request_finished() && !is_likely_bad_response {
+                return self.followup_request(peer_id)
+            }
+        }
+        None
+    }
+
     /// Returns a new [`FetchClient`] that can send requests to this type.
     pub(crate) fn client(&self) -> FetchClient<N> {
         FetchClient {
@@ -345,6 +515,25 @@ enum PollAction {
     Ready(FetchAction),
     NoRequests,
     NoPeersAvailable,
+}
+
+/// Everything [`StateFetcher::new_active_peer`] needs to register a newly connected peer.
+#[derive(Debug)]
+pub(crate) struct NewPeerInfo {
+    /// The remote peer's identifier.
+    pub(crate) peer_id: PeerId,
+    /// Best known hash that the peer has.
+    pub(crate) best_hash: B256,
+    /// The best block number of the peer.
+    pub(crate) best_number: u64,
+    /// Capabilities announced by the peer.
+    pub(crate) capabilities: Arc<Capabilities>,
+    /// The current timeout value to use for the peer.
+    pub(crate) timeout: Arc<AtomicU64>,
+    /// The range info for the peer.
+    pub(crate) range_info: Option<BlockRangeInfo>,
+    /// Whether the connection negotiated `snap/2` and can serve [`DownloadRequest::GetSnap`].
+    pub(crate) supports_snap: bool,
 }
 
 /// Represents a connected peer
@@ -370,6 +559,8 @@ struct Peer {
     last_response_likely_bad: bool,
     /// Tracks the range info for the peer.
     range_info: Option<BlockRangeInfo>,
+    /// Whether the connection negotiated `snap/2` and can serve [`DownloadRequest::GetSnap`].
+    supports_snap: bool,
 }
 
 impl Peer {
@@ -391,6 +582,17 @@ impl Peer {
         self.range_info.as_ref().map(|info| info.range())
     }
 
+    /// Returns whether this peer can serve requests with the given hard requirements.
+    fn satisfies(&self, requirement: &BestPeerRequirements) -> bool {
+        match requirement {
+            BestPeerRequirements::EthVersion(ver) => self.capabilities.supports_eth_at_least(ver),
+            BestPeerRequirements::SupportsSnap => self.supports_snap,
+            BestPeerRequirements::None |
+            BestPeerRequirements::FullBlock |
+            BestPeerRequirements::FullBlockRange(_) => true,
+        }
+    }
+
     /// Returns true if this peer has a better range than the other peer for serving the requested
     /// range.
     ///
@@ -409,7 +611,7 @@ impl Peer {
                 let self_covers = self_r.contains(range.start()) && self_r.contains(range.end());
                 let other_covers = other_r.contains(range.start()) && other_r.contains(range.end());
 
-                #[allow(clippy::match_same_arms)]
+                #[expect(clippy::match_same_arms)]
                 match (self_covers, other_covers) {
                     (true, false) => true,  // Only self covers the range
                     (false, true) => false, // Only other covers the range
@@ -437,9 +639,13 @@ impl Peer {
     /// Returns true if this peer is better than the other peer based on the given requirements.
     fn is_better(&self, other: &Self, requirement: &BestPeerRequirements) -> bool {
         match requirement {
-            BestPeerRequirements::None => false,
             BestPeerRequirements::FullBlockRange(range) => self.has_better_range(other, range),
             BestPeerRequirements::FullBlock => self.has_full_history() && !other.has_full_history(),
+            // Version/capability-based filtering happens in `next_best_peer`, so by the time we
+            // get here both peers already satisfy the requirement.
+            BestPeerRequirements::None |
+            BestPeerRequirements::EthVersion(_) |
+            BestPeerRequirements::SupportsSnap => false,
         }
     }
 }
@@ -453,6 +659,12 @@ enum PeerState {
     GetBlockHeaders,
     /// Peer is handling a `GetBlockBodies` request.
     GetBlockBodies,
+    /// Peer is handling a `GetBlockAccessLists` request.
+    GetBlockAccessLists,
+    /// Peer is handling a `GetReceipts` request.
+    GetReceipts,
+    /// Peer is handling a `snap/2` request.
+    GetSnap,
     /// Peer session is about to close
     Closing,
 }
@@ -491,6 +703,7 @@ struct Request<Req, Resp> {
 
 /// Requests that can be sent to the Syncer from a [`FetchClient`]
 #[derive(Debug)]
+#[expect(clippy::enum_variant_names)]
 pub(crate) enum DownloadRequest<N: NetworkPrimitives> {
     /// Download the requested headers and send response through channel
     GetBlockHeaders {
@@ -498,12 +711,31 @@ pub(crate) enum DownloadRequest<N: NetworkPrimitives> {
         response: oneshot::Sender<PeerRequestResult<Vec<N::BlockHeader>>>,
         priority: Priority,
     },
-    /// Download the requested headers and send response through channel
+    /// Download the requested bodies and send response through channel
     GetBlockBodies {
         request: Vec<B256>,
         response: oneshot::Sender<PeerRequestResult<Vec<N::BlockBody>>>,
         priority: Priority,
         range_hint: Option<RangeInclusive<u64>>,
+    },
+    /// Download the requested access lists and send response through channel
+    GetBlockAccessLists {
+        request: Vec<B256>,
+        response: oneshot::Sender<PeerRequestResult<BlockAccessLists>>,
+        priority: Priority,
+        requirement: BalRequirement,
+    },
+    /// Download receipts for the given block hashes and send response through channel
+    GetReceipts {
+        request: Vec<B256>,
+        response: oneshot::Sender<PeerRequestResult<ReceiptsResponse<N::Receipt>>>,
+        priority: Priority,
+    },
+    /// Send a `snap/2` request and send response through channel
+    GetSnap {
+        request: SnapProtocolMessage,
+        response: oneshot::Sender<PeerRequestResult<SnapResponse>>,
+        priority: Priority,
     },
 }
 
@@ -515,15 +747,20 @@ impl<N: NetworkPrimitives> DownloadRequest<N> {
         match self {
             Self::GetBlockHeaders { .. } => PeerState::GetBlockHeaders,
             Self::GetBlockBodies { .. } => PeerState::GetBlockBodies,
+            Self::GetBlockAccessLists { .. } => PeerState::GetBlockAccessLists,
+            Self::GetReceipts { .. } => PeerState::GetReceipts,
+            Self::GetSnap { .. } => PeerState::GetSnap,
         }
     }
 
     /// Returns the requested priority of this request
     const fn get_priority(&self) -> &Priority {
         match self {
-            Self::GetBlockHeaders { priority, .. } | Self::GetBlockBodies { priority, .. } => {
-                priority
-            }
+            Self::GetBlockHeaders { priority, .. } |
+            Self::GetBlockBodies { priority, .. } |
+            Self::GetBlockAccessLists { priority, .. } |
+            Self::GetReceipts { priority, .. } |
+            Self::GetSnap { priority, .. } => priority,
         }
     }
 
@@ -532,10 +769,32 @@ impl<N: NetworkPrimitives> DownloadRequest<N> {
         self.get_priority().is_normal()
     }
 
+    /// Returns `true` if this is an optional BAL request.
+    const fn is_optional_bal(&self) -> bool {
+        matches!(self, Self::GetBlockAccessLists { requirement: BalRequirement::Optional, .. })
+    }
+
+    /// Returns `true` if this is a `snap/2` request.
+    const fn is_snap(&self) -> bool {
+        matches!(self, Self::GetSnap { .. })
+    }
+
+    /// Sends an error response to the waiting caller.
+    fn send_err_response(self, err: RequestError) {
+        let _ = match self {
+            Self::GetBlockHeaders { response, .. } => response.send(Err(err)).ok(),
+            Self::GetBlockBodies { response, .. } => response.send(Err(err)).ok(),
+            Self::GetBlockAccessLists { response, .. } => response.send(Err(err)).ok(),
+            Self::GetReceipts { response, .. } => response.send(Err(err)).ok(),
+            Self::GetSnap { response, .. } => response.send(Err(err)).ok(),
+        };
+    }
+
     /// Returns the best peer requirements for this request.
     fn best_peer_requirements(&self) -> BestPeerRequirements {
         match self {
             Self::GetBlockHeaders { .. } => BestPeerRequirements::None,
+            Self::GetBlockAccessLists { .. } => BestPeerRequirements::EthVersion(EthVersion::Eth71),
             Self::GetBlockBodies { range_hint, .. } => {
                 if let Some(range) = range_hint {
                     BestPeerRequirements::FullBlockRange(range.clone())
@@ -543,6 +802,8 @@ impl<N: NetworkPrimitives> DownloadRequest<N> {
                     BestPeerRequirements::FullBlock
                 }
             }
+            Self::GetReceipts { .. } => BestPeerRequirements::FullBlock,
+            Self::GetSnap { .. } => BestPeerRequirements::SupportsSnap,
         }
     }
 }
@@ -577,6 +838,10 @@ enum BestPeerRequirements {
     FullBlockRange(RangeInclusive<u64>),
     /// Peer must have full range.
     FullBlock,
+    /// Peer must support at least this eth protocol version.
+    EthVersion(EthVersion),
+    /// Peer must have negotiated `snap/2`.
+    SupportsSnap,
 }
 
 #[cfg(test)]
@@ -585,6 +850,8 @@ mod tests {
     use crate::{peers::PeersManager, PeersConfig};
     use alloy_consensus::Header;
     use alloy_primitives::B512;
+    use reth_eth_wire::Capability;
+    use reth_eth_wire_types::snap::{AccountRangeMessage, GetAccountRangeMessage};
     use std::future::poll_fn;
 
     #[tokio::test(flavor = "multi_thread")]
@@ -618,22 +885,24 @@ mod tests {
         let peer1 = B512::random();
         let peer2 = B512::random();
         let capabilities = Arc::new(Capabilities::from(vec![]));
-        fetcher.new_active_peer(
-            peer1,
-            B256::random(),
-            1,
-            Arc::clone(&capabilities),
-            Arc::new(AtomicU64::new(1)),
-            None,
-        );
-        fetcher.new_active_peer(
-            peer2,
-            B256::random(),
-            2,
-            Arc::clone(&capabilities),
-            Arc::new(AtomicU64::new(1)),
-            None,
-        );
+        fetcher.new_active_peer(NewPeerInfo {
+            peer_id: peer1,
+            best_hash: B256::random(),
+            best_number: 1,
+            capabilities: Arc::clone(&capabilities),
+            timeout: Arc::new(AtomicU64::new(1)),
+            range_info: None,
+            supports_snap: false,
+        });
+        fetcher.new_active_peer(NewPeerInfo {
+            peer_id: peer2,
+            best_hash: B256::random(),
+            best_number: 2,
+            capabilities: Arc::clone(&capabilities),
+            timeout: Arc::new(AtomicU64::new(1)),
+            range_info: None,
+            supports_snap: false,
+        });
 
         let first_peer = fetcher.next_best_peer(BestPeerRequirements::None).unwrap();
         assert!(first_peer == peer1 || first_peer == peer2);
@@ -661,30 +930,33 @@ mod tests {
         let peer2_timeout = Arc::new(AtomicU64::new(300));
 
         let capabilities = Arc::new(Capabilities::from(vec![]));
-        fetcher.new_active_peer(
-            peer1,
-            B256::random(),
-            1,
-            Arc::clone(&capabilities),
-            Arc::new(AtomicU64::new(30)),
-            None,
-        );
-        fetcher.new_active_peer(
-            peer2,
-            B256::random(),
-            2,
-            Arc::clone(&capabilities),
-            Arc::clone(&peer2_timeout),
-            None,
-        );
-        fetcher.new_active_peer(
-            peer3,
-            B256::random(),
-            3,
-            Arc::clone(&capabilities),
-            Arc::new(AtomicU64::new(50)),
-            None,
-        );
+        fetcher.new_active_peer(NewPeerInfo {
+            peer_id: peer1,
+            best_hash: B256::random(),
+            best_number: 1,
+            capabilities: Arc::clone(&capabilities),
+            timeout: Arc::new(AtomicU64::new(30)),
+            range_info: None,
+            supports_snap: false,
+        });
+        fetcher.new_active_peer(NewPeerInfo {
+            peer_id: peer2,
+            best_hash: B256::random(),
+            best_number: 2,
+            capabilities: Arc::clone(&capabilities),
+            timeout: Arc::clone(&peer2_timeout),
+            range_info: None,
+            supports_snap: false,
+        });
+        fetcher.new_active_peer(NewPeerInfo {
+            peer_id: peer3,
+            best_hash: B256::random(),
+            best_number: 3,
+            capabilities: Arc::clone(&capabilities),
+            timeout: Arc::new(AtomicU64::new(50)),
+            range_info: None,
+            supports_snap: false,
+        });
 
         // Must always get peer1 (lowest timeout)
         assert_eq!(fetcher.next_best_peer(BestPeerRequirements::None), Some(peer1));
@@ -748,14 +1020,15 @@ mod tests {
             (req, header)
         };
 
-        fetcher.new_active_peer(
+        fetcher.new_active_peer(NewPeerInfo {
             peer_id,
-            Default::default(),
-            Default::default(),
-            Arc::new(Capabilities::from(vec![])),
-            Default::default(),
-            None,
-        );
+            best_hash: Default::default(),
+            best_number: Default::default(),
+            capabilities: Arc::new(Capabilities::from(vec![])),
+            timeout: Default::default(),
+            range_info: None,
+            supports_snap: false,
+        });
 
         let (req, header) = request_pair();
         fetcher.inflight_headers_requests.insert(peer_id, req);
@@ -784,6 +1057,41 @@ mod tests {
         assert!(fetcher.peers[&peer_id].state.is_idle());
     }
 
+    #[tokio::test]
+    async fn test_partial_header_response_triggers_followup() {
+        let (mut fetcher, peer_id) = fetcher_with_peer();
+
+        let (followup_tx, _followup_rx) = oneshot::channel();
+        fetcher.queued_requests.push_back(DownloadRequest::GetBlockHeaders {
+            request: HeadersRequest::falling(1u64.into(), 1),
+            response: followup_tx,
+            priority: Priority::High,
+        });
+
+        let (response_tx, mut response_rx) = oneshot::channel();
+        fetcher.inflight_headers_requests.insert(
+            peer_id,
+            Request { request: HeadersRequest::falling(2u64.into(), 2), response: response_tx },
+        );
+        fetcher.peers.get_mut(&peer_id).unwrap().state = PeerState::GetBlockHeaders;
+
+        let header = Header { number: 2, ..Default::default() };
+        let outcome = fetcher.on_block_headers_response(peer_id, Ok(vec![header]));
+
+        let Some(BlockResponseOutcome::Request(
+            dispatched_peer,
+            BlockRequest::GetBlockHeaders(request),
+        )) = outcome
+        else {
+            panic!("expected a header followup request")
+        };
+        assert_eq!(dispatched_peer, peer_id);
+        assert_eq!(request.start_block, 1u64.into());
+        assert_eq!(request.limit, 1);
+        assert!(!fetcher.peers[&peer_id].last_response_likely_bad);
+        assert!(response_rx.try_recv().is_ok());
+    }
+
     #[test]
     fn test_peer_is_better_none_requirement() {
         let peer1 = Peer {
@@ -794,6 +1102,7 @@ mod tests {
             timeout: Arc::new(AtomicU64::new(10)),
             last_response_likely_bad: false,
             range_info: Some(BlockRangeInfo::new(0, 100, B256::random())),
+            supports_snap: false,
         };
 
         let peer2 = Peer {
@@ -804,6 +1113,7 @@ mod tests {
             timeout: Arc::new(AtomicU64::new(20)),
             last_response_likely_bad: false,
             range_info: None,
+            supports_snap: false,
         };
 
         // With None requirement, is_better should always return false
@@ -822,6 +1132,7 @@ mod tests {
             timeout: Arc::new(AtomicU64::new(10)),
             last_response_likely_bad: false,
             range_info: Some(BlockRangeInfo::new(0, 100, B256::random())),
+            supports_snap: false,
         };
 
         // Peer without full history (earliest = 50)
@@ -833,6 +1144,7 @@ mod tests {
             timeout: Arc::new(AtomicU64::new(10)),
             last_response_likely_bad: false,
             range_info: Some(BlockRangeInfo::new(50, 100, B256::random())),
+            supports_snap: false,
         };
 
         // Peer without range info (treated as full history)
@@ -844,6 +1156,7 @@ mod tests {
             timeout: Arc::new(AtomicU64::new(10)),
             last_response_likely_bad: false,
             range_info: None,
+            supports_snap: false,
         };
 
         // Peer with full history is better than peer without
@@ -872,6 +1185,7 @@ mod tests {
             timeout: Arc::new(AtomicU64::new(10)),
             last_response_likely_bad: false,
             range_info: Some(BlockRangeInfo::new(0, 100, B256::random())),
+            supports_snap: false,
         };
 
         // Peer that doesn't cover the range (earliest too high)
@@ -883,6 +1197,7 @@ mod tests {
             timeout: Arc::new(AtomicU64::new(10)),
             last_response_likely_bad: false,
             range_info: Some(BlockRangeInfo::new(70, 100, B256::random())),
+            supports_snap: false,
         };
 
         // Peer that covers the requested range is better than one that doesn't
@@ -906,6 +1221,7 @@ mod tests {
             timeout: Arc::new(AtomicU64::new(10)),
             last_response_likely_bad: false,
             range_info: Some(BlockRangeInfo::new(0, 50, B256::random())),
+            supports_snap: false,
         };
 
         // Peer without full history that also covers the range
@@ -917,6 +1233,7 @@ mod tests {
             timeout: Arc::new(AtomicU64::new(10)),
             last_response_likely_bad: false,
             range_info: Some(BlockRangeInfo::new(30, 50, B256::random())),
+            supports_snap: false,
         };
 
         // When both cover the range, prefer none
@@ -938,6 +1255,7 @@ mod tests {
             timeout: Arc::new(AtomicU64::new(10)),
             last_response_likely_bad: false,
             range_info: Some(BlockRangeInfo::new(0, 50, B256::random())),
+            supports_snap: false,
         };
 
         // Peer without full history that also covers the range
@@ -949,6 +1267,7 @@ mod tests {
             timeout: Arc::new(AtomicU64::new(10)),
             last_response_likely_bad: false,
             range_info: Some(BlockRangeInfo::new(30, 50, B256::random())),
+            supports_snap: false,
         };
 
         // When both cover the range, prefer lower start value
@@ -970,6 +1289,7 @@ mod tests {
             timeout: Arc::new(AtomicU64::new(10)),
             last_response_likely_bad: false,
             range_info: Some(BlockRangeInfo::new(0, 30, B256::random())),
+            supports_snap: false,
         };
 
         // Peer without full history that also doesn't cover the range
@@ -981,6 +1301,7 @@ mod tests {
             timeout: Arc::new(AtomicU64::new(10)),
             last_response_likely_bad: false,
             range_info: Some(BlockRangeInfo::new(10, 30, B256::random())),
+            supports_snap: false,
         };
 
         // When neither covers the range, prefer full history
@@ -1002,6 +1323,7 @@ mod tests {
             timeout: Arc::new(AtomicU64::new(10)),
             last_response_likely_bad: false,
             range_info: Some(BlockRangeInfo::new(30, 100, B256::random())),
+            supports_snap: false,
         };
 
         // Peer without range info
@@ -1013,6 +1335,7 @@ mod tests {
             timeout: Arc::new(AtomicU64::new(10)),
             last_response_likely_bad: false,
             range_info: None,
+            supports_snap: false,
         };
 
         // Peer without range info is not better (we prefer peers with known ranges)
@@ -1038,6 +1361,7 @@ mod tests {
             timeout: Arc::new(AtomicU64::new(10)),
             last_response_likely_bad: false,
             range_info: Some(BlockRangeInfo::new(30, 100, B256::random())),
+            supports_snap: false,
         };
 
         // Peer without range info (treated as full history with unknown latest)
@@ -1049,6 +1373,7 @@ mod tests {
             timeout: Arc::new(AtomicU64::new(10)),
             last_response_likely_bad: false,
             range_info: None,
+            supports_snap: false,
         };
 
         // Peer with range that covers is better than peer without range info
@@ -1073,6 +1398,7 @@ mod tests {
             timeout: Arc::new(AtomicU64::new(10)),
             last_response_likely_bad: false,
             range_info: Some(BlockRangeInfo::new(70, 100, B256::random())),
+            supports_snap: false,
         };
 
         // Peer without range info (treated as full history)
@@ -1084,6 +1410,7 @@ mod tests {
             timeout: Arc::new(AtomicU64::new(10)),
             last_response_likely_bad: false,
             range_info: None,
+            supports_snap: false,
         };
 
         // Peer with range that doesn't cover is not better
@@ -1109,6 +1436,7 @@ mod tests {
             timeout: Arc::new(AtomicU64::new(10)),
             last_response_likely_bad: false,
             range_info: Some(BlockRangeInfo::new(50, 100, B256::random())),
+            supports_snap: false,
         };
 
         // Peer that's one block short at the start
@@ -1120,6 +1448,7 @@ mod tests {
             timeout: Arc::new(AtomicU64::new(10)),
             last_response_likely_bad: false,
             range_info: Some(BlockRangeInfo::new(51, 100, B256::random())),
+            supports_snap: false,
         };
 
         // Peer that's one block short at the end
@@ -1131,6 +1460,7 @@ mod tests {
             timeout: Arc::new(AtomicU64::new(10)),
             last_response_likely_bad: false,
             range_info: Some(BlockRangeInfo::new(50, 99, B256::random())),
+            supports_snap: false,
         };
 
         // Exact coverage is better than short coverage
@@ -1145,5 +1475,788 @@ mod tests {
         assert!(
             !peer_short_end.is_better(&peer_exact, &BestPeerRequirements::FullBlockRange(range))
         );
+    }
+
+    /// Creates a `StateFetcher` with a single idle peer and returns both.
+    fn fetcher_with_peer() -> (StateFetcher<EthNetworkPrimitives>, PeerId) {
+        let manager = PeersManager::new(PeersConfig::default());
+        let mut fetcher =
+            StateFetcher::<EthNetworkPrimitives>::new(manager.handle(), Default::default());
+        let peer_id = B512::random();
+
+        fetcher.new_active_peer(NewPeerInfo {
+            peer_id,
+            best_hash: Default::default(),
+            best_number: Default::default(),
+            capabilities: Arc::new(Capabilities::from(vec![])),
+            timeout: Default::default(),
+            range_info: None,
+            supports_snap: false,
+        });
+        (fetcher, peer_id)
+    }
+
+    /// Inserts an inflight receipts request into the fetcher and returns the
+    /// `oneshot::Receiver` that the final response will be sent through.
+    fn insert_inflight_receipts(
+        fetcher: &mut StateFetcher<EthNetworkPrimitives>,
+        peer_id: PeerId,
+    ) -> oneshot::Receiver<PeerRequestResult<ReceiptsResponse<reth_ethereum_primitives::Receipt>>>
+    {
+        let (tx, rx) = oneshot::channel();
+        fetcher.inflight_receipts_requests.insert(peer_id, Request { request: (), response: tx });
+        fetcher.peers.get_mut(&peer_id).unwrap().state = PeerState::GetReceipts;
+        rx
+    }
+
+    // ---- Receipts: basic dispatch ----
+
+    #[tokio::test]
+    async fn test_poll_dispatches_receipts_to_peer() {
+        let (mut fetcher, peer_id) = fetcher_with_peer();
+
+        poll_fn(move |cx| {
+            let (tx, _rx) = oneshot::channel();
+            fetcher.queued_requests.push_back(DownloadRequest::GetReceipts {
+                request: vec![B256::ZERO],
+                response: tx,
+                priority: Priority::default(),
+            });
+
+            let Poll::Ready(FetchAction::BlockRequest { peer_id: dispatched_peer, request }) =
+                fetcher.poll(cx)
+            else {
+                panic!("expected Ready(BlockRequest)");
+            };
+            assert_eq!(dispatched_peer, peer_id);
+            assert!(matches!(request, BlockRequest::GetReceipts(_)));
+
+            // Peer should now be in GetReceipts state
+            assert!(matches!(fetcher.peers[&peer_id].state, PeerState::GetReceipts));
+            // Inflight request should be tracked
+            assert!(fetcher.inflight_receipts_requests.contains_key(&peer_id));
+
+            Poll::Ready(())
+        })
+        .await;
+    }
+
+    // ---- Receipts: response handling ----
+
+    #[tokio::test]
+    async fn test_receipts_complete_response_resolves_and_idles_peer() {
+        let (mut fetcher, peer_id) = fetcher_with_peer();
+
+        let rx = insert_inflight_receipts(&mut fetcher, peer_id);
+
+        let resp = ReceiptsResponse::new(vec![vec![]]);
+        let outcome = fetcher.on_receipts_response(peer_id, Ok(resp));
+
+        // No queued requests, so no followup
+        assert!(outcome.is_none());
+        // Peer back to idle
+        assert!(fetcher.peers[&peer_id].state.is_idle());
+        // Inflight cleaned up
+        assert!(!fetcher.inflight_receipts_requests.contains_key(&peer_id));
+
+        // Caller receives the response
+        let result = rx.await.unwrap().unwrap();
+        assert_eq!(result.1.receipts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_receipts_empty_response_marks_peer_bad() {
+        let (mut fetcher, peer_id) = fetcher_with_peer();
+        let _rx = insert_inflight_receipts(&mut fetcher, peer_id);
+
+        let resp = ReceiptsResponse::new(vec![]);
+        let _ = fetcher.on_receipts_response(peer_id, Ok(resp));
+
+        assert!(fetcher.peers[&peer_id].last_response_likely_bad);
+    }
+
+    #[tokio::test]
+    async fn test_receipts_error_forwards_and_marks_peer_bad() {
+        let (mut fetcher, peer_id) = fetcher_with_peer();
+        let rx = insert_inflight_receipts(&mut fetcher, peer_id);
+
+        let _ = fetcher.on_receipts_response(peer_id, Err(RequestError::Timeout));
+
+        assert!(fetcher.peers[&peer_id].last_response_likely_bad);
+        // Error is forwarded to the caller
+        let result = rx.await.unwrap();
+        assert_eq!(result.unwrap_err(), RequestError::Timeout);
+    }
+
+    #[tokio::test]
+    async fn test_session_closed_cancels_inflight_receipts() {
+        let (mut fetcher, peer_id) = fetcher_with_peer();
+        let rx = insert_inflight_receipts(&mut fetcher, peer_id);
+
+        fetcher.on_session_closed(&peer_id);
+
+        assert!(!fetcher.peers.contains_key(&peer_id));
+        assert!(!fetcher.inflight_receipts_requests.contains_key(&peer_id));
+
+        let result = rx.await.unwrap();
+        assert_eq!(result.unwrap_err(), RequestError::ConnectionDropped);
+    }
+
+    #[tokio::test]
+    async fn test_receipts_response_triggers_followup() {
+        let (mut fetcher, peer_id) = fetcher_with_peer();
+
+        // Queue a bodies request as a followup candidate
+        let (followup_tx, _followup_rx) = oneshot::channel();
+        fetcher.queued_requests.push_back(DownloadRequest::GetBlockBodies {
+            request: vec![B256::random()],
+            response: followup_tx,
+            priority: Priority::default(),
+            range_hint: None,
+        });
+
+        let _rx = insert_inflight_receipts(&mut fetcher, peer_id);
+
+        let resp = ReceiptsResponse::new(vec![vec![]]);
+        let outcome = fetcher.on_receipts_response(peer_id, Ok(resp));
+
+        assert!(matches!(outcome, Some(BlockResponseOutcome::Request(pid, _)) if pid == peer_id));
+    }
+
+    #[tokio::test]
+    async fn test_followup_skips_request_peer_cannot_serve() {
+        let (mut fetcher, peer_id) = fetcher_with_peer();
+
+        let peer_71 = B512::random();
+        let caps_71 = Arc::new(Capabilities::from(vec![Capability::new("eth".into(), 71)]));
+        fetcher.new_active_peer(NewPeerInfo {
+            peer_id: peer_71,
+            best_hash: B256::random(),
+            best_number: 100,
+            capabilities: caps_71,
+            timeout: Arc::new(AtomicU64::new(10)),
+            range_info: None,
+            supports_snap: false,
+        });
+        fetcher.peers.get_mut(&peer_71).expect("peer exists").state = PeerState::GetBlockHeaders;
+
+        let (followup_tx, _followup_rx) = oneshot::channel();
+        fetcher.queued_requests.push_back(DownloadRequest::GetBlockAccessLists {
+            request: vec![B256::random()],
+            response: followup_tx,
+            priority: Priority::Normal,
+            requirement: BalRequirement::Optional,
+        });
+
+        let _rx = insert_inflight_receipts(&mut fetcher, peer_id);
+
+        let resp = ReceiptsResponse::new(vec![vec![]]);
+        assert!(fetcher.on_receipts_response(peer_id, Ok(resp)).is_none());
+        assert!(fetcher.peers[&peer_id].state.is_idle());
+        assert!(!fetcher.inflight_bals_requests.contains_key(&peer_id));
+        assert!(matches!(
+            fetcher.queued_requests.front(),
+            Some(DownloadRequest::GetBlockAccessLists {
+                requirement: BalRequirement::Optional,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_followup_uses_first_satisfiable_request() {
+        let (mut fetcher, peer_id) = fetcher_with_peer();
+
+        let peer_71 = B512::random();
+        let caps_71 = Arc::new(Capabilities::from(vec![Capability::new("eth".into(), 71)]));
+        fetcher.new_active_peer(NewPeerInfo {
+            peer_id: peer_71,
+            best_hash: B256::random(),
+            best_number: 100,
+            capabilities: caps_71,
+            timeout: Arc::new(AtomicU64::new(10)),
+            range_info: None,
+            supports_snap: false,
+        });
+        fetcher.peers.get_mut(&peer_71).expect("peer exists").state = PeerState::GetBlockHeaders;
+
+        let (bal_tx, _bal_rx) = oneshot::channel();
+        fetcher.queued_requests.push_back(DownloadRequest::GetBlockAccessLists {
+            request: vec![B256::random()],
+            response: bal_tx,
+            priority: Priority::Normal,
+            requirement: BalRequirement::Optional,
+        });
+
+        let (bodies_tx, _bodies_rx) = oneshot::channel();
+        fetcher.queued_requests.push_back(DownloadRequest::GetBlockBodies {
+            request: vec![B256::random()],
+            response: bodies_tx,
+            priority: Priority::Normal,
+            range_hint: None,
+        });
+
+        let _rx = insert_inflight_receipts(&mut fetcher, peer_id);
+
+        let resp = ReceiptsResponse::new(vec![vec![]]);
+        let outcome = fetcher.on_receipts_response(peer_id, Ok(resp));
+
+        assert!(matches!(
+            outcome,
+            Some(BlockResponseOutcome::Request(pid, BlockRequest::GetBlockBodies(_))) if pid == peer_id
+        ));
+        assert!(fetcher.inflight_bodies_requests.contains_key(&peer_id));
+        assert!(matches!(fetcher.peers[&peer_id].state, PeerState::GetBlockBodies));
+        assert_eq!(fetcher.queued_requests.len(), 1);
+        assert!(matches!(
+            fetcher.queued_requests.front(),
+            Some(DownloadRequest::GetBlockAccessLists {
+                requirement: BalRequirement::Optional,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_prepare_block_request_creates_inflight_receipts() {
+        let (mut fetcher, peer_id) = fetcher_with_peer();
+        let hashes = vec![B256::with_last_byte(1), B256::with_last_byte(2)];
+
+        let (tx, _rx) = oneshot::channel();
+        let req = DownloadRequest::GetReceipts {
+            request: hashes.clone(),
+            response: tx,
+            priority: Priority::default(),
+        };
+
+        let block_request = fetcher.prepare_block_request(peer_id, req);
+
+        // Returns a GetReceipts block request with the same hashes
+        match block_request {
+            BlockRequest::GetReceipts(ref get) => {
+                assert_eq!(get.0, hashes);
+            }
+            other => panic!("expected GetReceipts, got {other:?}"),
+        }
+
+        // Peer state transitions to GetReceipts
+        assert!(matches!(fetcher.peers[&peer_id].state, PeerState::GetReceipts));
+
+        // Inflight request is tracked
+        assert!(fetcher.inflight_receipts_requests.contains_key(&peer_id));
+    }
+    #[tokio::test]
+    async fn test_next_best_peer_eth71_no_support() {
+        let manager = PeersManager::new(PeersConfig::default());
+        let mut fetcher =
+            StateFetcher::<EthNetworkPrimitives>::new(manager.handle(), Default::default());
+
+        let peer = B512::random();
+
+        // Capabilities WITHOUT eth71
+        let capabilities = Arc::new(Capabilities::new(vec![]));
+
+        fetcher.new_active_peer(NewPeerInfo {
+            peer_id: peer,
+            best_hash: B256::random(),
+            best_number: 100,
+            capabilities,
+            timeout: Arc::new(AtomicU64::new(10)),
+            range_info: None,
+            supports_snap: false,
+        });
+
+        // Should return None because peer doesn't support eth71
+        assert_eq!(
+            fetcher.next_best_peer(BestPeerRequirements::EthVersion(EthVersion::Eth71)),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_next_best_peer_eth71_supported() {
+        let manager = PeersManager::new(PeersConfig::default());
+        let mut fetcher =
+            StateFetcher::<EthNetworkPrimitives>::new(manager.handle(), Default::default());
+
+        let peer = B512::random();
+
+        // Build capability list that includes Eth71
+        let capabilities = Arc::new(Capabilities::from(vec![Capability::new("eth".into(), 71)]));
+
+        fetcher.new_active_peer(NewPeerInfo {
+            peer_id: peer,
+            best_hash: B256::random(),
+            best_number: 100,
+            capabilities,
+            timeout: Arc::new(AtomicU64::new(10)),
+            range_info: None,
+            supports_snap: false,
+        });
+
+        assert_eq!(
+            fetcher.next_best_peer(BestPeerRequirements::EthVersion(EthVersion::Eth71)),
+            Some(peer)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_next_best_peer_eth71_filters_correctly() {
+        let manager = PeersManager::new(PeersConfig::default());
+        let mut fetcher =
+            StateFetcher::<EthNetworkPrimitives>::new(manager.handle(), Default::default());
+
+        let peer_no_71 = B512::random();
+        let peer_with_71 = B512::random();
+
+        // Peer without eth71
+        let caps_old = Arc::new(Capabilities::new(vec![]));
+
+        // Peer with eth71
+        let caps_71 = Arc::new(Capabilities::from(vec![Capability::new("eth".into(), 71)]));
+
+        fetcher.new_active_peer(NewPeerInfo {
+            peer_id: peer_no_71,
+            best_hash: B256::random(),
+            best_number: 100,
+            capabilities: caps_old,
+            timeout: Arc::new(AtomicU64::new(5)),
+            range_info: None,
+            supports_snap: false,
+        });
+
+        fetcher.new_active_peer(NewPeerInfo {
+            peer_id: peer_with_71,
+            best_hash: B256::random(),
+            best_number: 100,
+            capabilities: caps_71,
+            timeout: Arc::new(AtomicU64::new(50)),
+            range_info: None,
+            supports_snap: false,
+        });
+
+        // Even though peer_no_71 has lower timeout,
+        // it must NOT be selected.
+        assert_eq!(
+            fetcher.next_best_peer(BestPeerRequirements::EthVersion(EthVersion::Eth71)),
+            Some(peer_with_71)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wakes_when_eth71_peer_connects() {
+        use futures::task::noop_waker;
+        use std::task::{Context, Poll};
+
+        let manager = PeersManager::new(PeersConfig::default());
+        let mut fetcher =
+            StateFetcher::<EthNetworkPrimitives>::new(manager.handle(), Default::default());
+
+        // Queue Eth71-required request
+        let (tx, _rx) = oneshot::channel();
+        fetcher.queued_requests.push_back(DownloadRequest::GetBlockAccessLists {
+            request: vec![],
+            response: tx,
+            priority: Priority::Normal,
+            requirement: BalRequirement::Mandatory,
+        });
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // No peers -> must be Pending
+        assert!(matches!(fetcher.poll(&mut cx), Poll::Pending));
+
+        // Add peer WITHOUT Eth71 support
+        let peer_old = B512::random();
+        let caps_old = Arc::new(Capabilities::new(vec![]));
+
+        fetcher.new_active_peer(NewPeerInfo {
+            peer_id: peer_old,
+            best_hash: B256::random(),
+            best_number: 100,
+            capabilities: caps_old,
+            timeout: Arc::new(AtomicU64::new(10)),
+            range_info: None,
+            supports_snap: false,
+        });
+
+        // Still Pending
+        assert!(matches!(fetcher.poll(&mut cx), Poll::Pending));
+
+        // Add peer WITH Eth71 support
+        let peer_71 = B512::random();
+        let caps_71 = Arc::new(Capabilities::from(vec![Capability::new("eth".into(), 71)]));
+
+        fetcher.new_active_peer(NewPeerInfo {
+            peer_id: peer_71,
+            best_hash: B256::random(),
+            best_number: 100,
+            capabilities: caps_71,
+            timeout: Arc::new(AtomicU64::new(10)),
+            range_info: None,
+            supports_snap: false,
+        });
+
+        // Now we must get Ready(BlockRequest)
+        if let Poll::Ready(FetchAction::BlockRequest { peer_id, .. }) = fetcher.poll(&mut cx) {
+            assert_eq!(peer_id, peer_71);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_optional_bal_request_rejected_without_eth71_peer() {
+        use futures::task::noop_waker;
+        use std::task::{Context, Poll};
+
+        let manager = PeersManager::new(PeersConfig::default());
+        let mut fetcher =
+            StateFetcher::<EthNetworkPrimitives>::new(manager.handle(), Default::default());
+
+        let peer_old = B512::random();
+        let caps_old = Arc::new(Capabilities::new(vec![]));
+        fetcher.new_active_peer(NewPeerInfo {
+            peer_id: peer_old,
+            best_hash: B256::random(),
+            best_number: 100,
+            capabilities: caps_old,
+            timeout: Arc::new(AtomicU64::new(10)),
+            range_info: None,
+            supports_snap: false,
+        });
+
+        let (tx, rx) = oneshot::channel();
+        fetcher
+            .download_requests_tx
+            .send(DownloadRequest::GetBlockAccessLists {
+                request: vec![],
+                response: tx,
+                priority: Priority::Normal,
+                requirement: BalRequirement::Optional,
+            })
+            .unwrap();
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(matches!(fetcher.poll(&mut cx), Poll::Pending));
+        assert!(fetcher.queued_requests.is_empty());
+        assert_eq!(rx.await.unwrap().unwrap_err(), RequestError::UnsupportedCapability);
+    }
+
+    #[tokio::test]
+    async fn test_optional_bal_request_waits_for_busy_eth71_peer() {
+        use futures::task::noop_waker;
+        use std::task::{Context, Poll};
+
+        let manager = PeersManager::new(PeersConfig::default());
+        let mut fetcher =
+            StateFetcher::<EthNetworkPrimitives>::new(manager.handle(), Default::default());
+
+        let peer_71 = B512::random();
+        let caps_71 = Arc::new(Capabilities::from(vec![Capability::new("eth".into(), 71)]));
+        fetcher.new_active_peer(NewPeerInfo {
+            peer_id: peer_71,
+            best_hash: B256::random(),
+            best_number: 100,
+            capabilities: caps_71,
+            timeout: Arc::new(AtomicU64::new(10)),
+            range_info: None,
+            supports_snap: false,
+        });
+        fetcher.peers.get_mut(&peer_71).expect("peer exists").state = PeerState::GetBlockHeaders;
+
+        let (tx, _rx) = oneshot::channel();
+        fetcher
+            .download_requests_tx
+            .send(DownloadRequest::GetBlockAccessLists {
+                request: vec![],
+                response: tx,
+                priority: Priority::Normal,
+                requirement: BalRequirement::Optional,
+            })
+            .unwrap();
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(matches!(fetcher.poll(&mut cx), Poll::Pending));
+        assert_eq!(fetcher.queued_requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_queued_optional_bal_request_rejected_after_eth71_disconnect() {
+        use futures::task::noop_waker;
+        use std::task::{Context, Poll};
+
+        let manager = PeersManager::new(PeersConfig::default());
+        let mut fetcher =
+            StateFetcher::<EthNetworkPrimitives>::new(manager.handle(), Default::default());
+
+        let peer_old = B512::random();
+        let caps_old = Arc::new(Capabilities::new(vec![]));
+        fetcher.new_active_peer(NewPeerInfo {
+            peer_id: peer_old,
+            best_hash: B256::random(),
+            best_number: 100,
+            capabilities: caps_old,
+            timeout: Arc::new(AtomicU64::new(10)),
+            range_info: None,
+            supports_snap: false,
+        });
+
+        let peer_71 = B512::random();
+        let caps_71 = Arc::new(Capabilities::from(vec![Capability::new("eth".into(), 71)]));
+        fetcher.new_active_peer(NewPeerInfo {
+            peer_id: peer_71,
+            best_hash: B256::random(),
+            best_number: 100,
+            capabilities: caps_71,
+            timeout: Arc::new(AtomicU64::new(10)),
+            range_info: None,
+            supports_snap: false,
+        });
+        fetcher.peers.get_mut(&peer_71).expect("peer exists").state = PeerState::GetBlockHeaders;
+
+        let (tx, rx) = oneshot::channel();
+        fetcher
+            .download_requests_tx
+            .send(DownloadRequest::GetBlockAccessLists {
+                request: vec![],
+                response: tx,
+                priority: Priority::Normal,
+                requirement: BalRequirement::Optional,
+            })
+            .unwrap();
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(matches!(fetcher.poll(&mut cx), Poll::Pending));
+        assert_eq!(fetcher.queued_requests.len(), 1);
+
+        fetcher.on_session_closed(&peer_71);
+
+        assert!(matches!(fetcher.poll(&mut cx), Poll::Pending));
+        assert!(fetcher.queued_requests.is_empty());
+        assert_eq!(rx.await.unwrap().unwrap_err(), RequestError::UnsupportedCapability);
+    }
+
+    #[tokio::test]
+    async fn test_next_best_peer_snap_no_support() {
+        let manager = PeersManager::new(PeersConfig::default());
+        let mut fetcher =
+            StateFetcher::<EthNetworkPrimitives>::new(manager.handle(), Default::default());
+
+        let peer = B512::random();
+        fetcher.new_active_peer(NewPeerInfo {
+            peer_id: peer,
+            best_hash: B256::random(),
+            best_number: 100,
+            capabilities: Arc::new(Capabilities::new(vec![])),
+            timeout: Arc::new(AtomicU64::new(10)),
+            range_info: None,
+            supports_snap: false,
+        });
+
+        assert_eq!(fetcher.next_best_peer(BestPeerRequirements::SupportsSnap), None);
+    }
+
+    #[tokio::test]
+    async fn test_next_best_peer_snap_supported() {
+        let manager = PeersManager::new(PeersConfig::default());
+        let mut fetcher =
+            StateFetcher::<EthNetworkPrimitives>::new(manager.handle(), Default::default());
+
+        let peer = B512::random();
+        fetcher.new_active_peer(NewPeerInfo {
+            peer_id: peer,
+            best_hash: B256::random(),
+            best_number: 100,
+            capabilities: Arc::new(Capabilities::new(vec![])),
+            timeout: Arc::new(AtomicU64::new(10)),
+            range_info: None,
+            supports_snap: true,
+        });
+
+        assert_eq!(fetcher.next_best_peer(BestPeerRequirements::SupportsSnap), Some(peer));
+    }
+
+    #[tokio::test]
+    async fn test_next_best_peer_snap_filters_correctly() {
+        let manager = PeersManager::new(PeersConfig::default());
+        let mut fetcher =
+            StateFetcher::<EthNetworkPrimitives>::new(manager.handle(), Default::default());
+
+        let peer_no_snap = B512::random();
+        let peer_with_snap = B512::random();
+
+        fetcher.new_active_peer(NewPeerInfo {
+            peer_id: peer_no_snap,
+            best_hash: B256::random(),
+            best_number: 100,
+            capabilities: Arc::new(Capabilities::new(vec![])),
+            timeout: Arc::new(AtomicU64::new(5)),
+            range_info: None,
+            supports_snap: false,
+        });
+        fetcher.new_active_peer(NewPeerInfo {
+            peer_id: peer_with_snap,
+            best_hash: B256::random(),
+            best_number: 100,
+            capabilities: Arc::new(Capabilities::new(vec![])),
+            timeout: Arc::new(AtomicU64::new(50)),
+            range_info: None,
+            supports_snap: true,
+        });
+
+        // Even though peer_no_snap has a lower timeout, it must NOT be selected.
+        assert_eq!(
+            fetcher.next_best_peer(BestPeerRequirements::SupportsSnap),
+            Some(peer_with_snap)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_snap_request_rejected_without_snap_peer() {
+        use futures::task::noop_waker;
+        use std::task::{Context, Poll};
+
+        let manager = PeersManager::new(PeersConfig::default());
+        let mut fetcher =
+            StateFetcher::<EthNetworkPrimitives>::new(manager.handle(), Default::default());
+
+        // Only an eth-only peer is connected.
+        fetcher.new_active_peer(NewPeerInfo {
+            peer_id: B512::random(),
+            best_hash: B256::random(),
+            best_number: 100,
+            capabilities: Arc::new(Capabilities::new(vec![])),
+            timeout: Arc::new(AtomicU64::new(10)),
+            range_info: None,
+            supports_snap: false,
+        });
+
+        let (tx, rx) = oneshot::channel();
+        fetcher
+            .download_requests_tx
+            .send(DownloadRequest::GetSnap {
+                request: SnapProtocolMessage::GetAccountRange(GetAccountRangeMessage {
+                    request_id: 0,
+                    root_hash: B256::ZERO,
+                    starting_hash: B256::ZERO,
+                    limit_hash: B256::ZERO,
+                    response_bytes: 0,
+                }),
+                response: tx,
+                priority: Priority::Normal,
+            })
+            .unwrap();
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(matches!(fetcher.poll(&mut cx), Poll::Pending));
+        assert!(fetcher.queued_requests.is_empty());
+        assert_eq!(rx.await.unwrap().unwrap_err(), RequestError::UnsupportedCapability);
+    }
+
+    #[tokio::test]
+    async fn test_snap_response_triggers_followup() {
+        let manager = PeersManager::new(PeersConfig::default());
+        let mut fetcher =
+            StateFetcher::<EthNetworkPrimitives>::new(manager.handle(), Default::default());
+
+        let peer_id = B512::random();
+        fetcher.new_active_peer(NewPeerInfo {
+            peer_id,
+            best_hash: B256::random(),
+            best_number: 100,
+            capabilities: Arc::new(Capabilities::new(vec![])),
+            timeout: Arc::new(AtomicU64::new(10)),
+            range_info: None,
+            supports_snap: true,
+        });
+
+        // Queue a followup snap request for the same peer.
+        let (followup_tx, _followup_rx) = oneshot::channel();
+        fetcher.queued_requests.push_back(DownloadRequest::GetSnap {
+            request: SnapProtocolMessage::GetAccountRange(GetAccountRangeMessage {
+                request_id: 0,
+                root_hash: B256::ZERO,
+                starting_hash: B256::ZERO,
+                limit_hash: B256::ZERO,
+                response_bytes: 0,
+            }),
+            response: followup_tx,
+            priority: Priority::Normal,
+        });
+
+        let (tx, mut rx) = oneshot::channel();
+        fetcher.inflight_snap_requests.insert(peer_id, Request { request: (), response: tx });
+        fetcher.peers.get_mut(&peer_id).unwrap().state = PeerState::GetSnap;
+
+        let resp = SnapResponse::AccountRange(AccountRangeMessage {
+            request_id: 1,
+            accounts: vec![],
+            proof: vec![],
+        });
+        let outcome = fetcher.on_snap_response(peer_id, Ok(resp));
+
+        assert!(matches!(outcome, Some(BlockResponseOutcome::Request(pid, _)) if pid == peer_id));
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_queued_snap_request_rejected_after_last_peer_disconnects() {
+        use futures::task::noop_waker;
+        use std::task::{Context, Poll};
+
+        let manager = PeersManager::new(PeersConfig::default());
+        let mut fetcher =
+            StateFetcher::<EthNetworkPrimitives>::new(manager.handle(), Default::default());
+
+        // The only connected peer supports snap but is busy, so the request gets queued.
+        let peer = B512::random();
+        fetcher.new_active_peer(NewPeerInfo {
+            peer_id: peer,
+            best_hash: B256::random(),
+            best_number: 100,
+            capabilities: Arc::new(Capabilities::new(vec![])),
+            timeout: Arc::new(AtomicU64::new(10)),
+            range_info: None,
+            supports_snap: true,
+        });
+        fetcher.peers.get_mut(&peer).expect("peer exists").state = PeerState::GetBlockHeaders;
+
+        let (tx, rx) = oneshot::channel();
+        fetcher
+            .download_requests_tx
+            .send(DownloadRequest::GetSnap {
+                request: SnapProtocolMessage::GetAccountRange(GetAccountRangeMessage {
+                    request_id: 0,
+                    root_hash: B256::ZERO,
+                    starting_hash: B256::ZERO,
+                    limit_hash: B256::ZERO,
+                    response_bytes: 0,
+                }),
+                response: tx,
+                priority: Priority::Normal,
+            })
+            .unwrap();
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(matches!(fetcher.poll(&mut cx), Poll::Pending));
+        assert_eq!(fetcher.queued_requests.len(), 1);
+
+        // The only peer disconnects, leaving `self.peers` empty. The still-queued request must
+        // resolve immediately instead of waiting for a peer that can never come back.
+        fetcher.on_session_closed(&peer);
+
+        assert!(matches!(fetcher.poll(&mut cx), Poll::Pending));
+        assert!(fetcher.queued_requests.is_empty());
+        assert_eq!(rx.await.unwrap().unwrap_err(), RequestError::UnsupportedCapability);
     }
 }

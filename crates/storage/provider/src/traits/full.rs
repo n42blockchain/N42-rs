@@ -1,10 +1,10 @@
 //! Helper provider traits to encapsulate all provider traits for simplicity.
 
 use crate::{
-    AccountReader, BlockReader, BlockReaderIdExt, ChainSpecProvider, ChangeSetReader,
+    AccountReader, BalProvider, BlockReader, BlockReaderIdExt, ChainSpecProvider, ChangeSetReader,
     DatabaseProviderFactory, HashedPostStateProvider, PruneCheckpointReader,
-    RocksDBProviderFactory, StageCheckpointReader, StateProviderFactory, StateReader,
-    StaticFileProviderFactory,
+    RocksDBProviderFactory, StageCheckpointReader, StateProviderFactory, StateRangeProviderFactory,
+    StateReader, StaticFileProviderFactory,
 };
 use reth_chain_state::{
     CanonStateSubscriptions, ForkChoiceSubscriptions, PersistedBlockSubscriptions,
@@ -32,7 +32,9 @@ pub trait FullProvider<N: NodeTypesWithDB>:
         Receipt = ReceiptTy<N>,
         Header = HeaderTy<N>,
     > + AccountReader
+    + BalProvider
     + StateProviderFactory
+    + StateRangeProviderFactory
     + StateReader
     + HashedPostStateProvider
     + ChainSpecProvider<ChainSpec = N::ChainSpec>
@@ -42,6 +44,7 @@ pub trait FullProvider<N: NodeTypesWithDB>:
     + ForkChoiceSubscriptions<Header = HeaderTy<N>>
     + PersistedBlockSubscriptions
     + StageCheckpointReader
+    + PruneCheckpointReader
     + Clone
     + Debug
     + Unpin
@@ -67,7 +70,9 @@ impl<T, N: NodeTypesWithDB> FullProvider<N> for T where
             Receipt = ReceiptTy<N>,
             Header = HeaderTy<N>,
         > + AccountReader
+        + BalProvider
         + StateProviderFactory
+        + StateRangeProviderFactory
         + StateReader
         + HashedPostStateProvider
         + ChainSpecProvider<ChainSpec = N::ChainSpec>
@@ -77,6 +82,7 @@ impl<T, N: NodeTypesWithDB> FullProvider<N> for T where
         + ForkChoiceSubscriptions<Header = HeaderTy<N>>
         + PersistedBlockSubscriptions
         + StageCheckpointReader
+        + PruneCheckpointReader
         + Clone
         + Debug
         + Unpin

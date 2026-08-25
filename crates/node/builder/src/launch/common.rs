@@ -41,8 +41,12 @@ use rayon::ThreadPoolBuilder;
 use reth_chainspec::{Chain, EthChainSpec, EthereumHardforks};
 use reth_config::{config::EtlConfig, PruneConfig};
 use reth_consensus::noop::NoopConsensus;
-use reth_db_api::{database::Database, database_metrics::DatabaseMetrics};
-use reth_db_common::init::{init_genesis_with_settings, InitStorageError};
+use reth_db_api::{
+    database::Database, database_metrics::DatabaseMetrics, models::PartialStateTrieUnwindMarker,
+};
+use reth_db_common::init::{
+    init_genesis_with_settings, init_genesis_with_settings_and_validate, InitStorageError,
+};
 use reth_downloaders::{bodies::noop::NoopBodiesDownloader, headers::noop::NoopHeaderDownloader};
 use reth_engine_local::MiningMode;
 use reth_evm::{noop::NoopEvmConfig, ConfigureEvm};
@@ -51,7 +55,7 @@ use reth_fs_util as fs;
 use reth_network_p2p::headers::client::HeadersClient;
 use reth_node_api::{FullNodeTypes, NodeTypes, NodeTypesWithDB, NodeTypesWithDBAdapter};
 use reth_node_core::{
-    args::DefaultEraHost,
+    args::{DefaultEraHost, PruneConfigKind},
     dirs::{ChainPath, DataDirPath},
     node_config::NodeConfig,
     primitives::BlockHeader,
@@ -62,30 +66,33 @@ use reth_node_metrics::{
     hooks::Hooks,
     recorder::install_prometheus_recorder,
     server::{MetricServer, MetricServerConfig},
+    storage::StorageSettingsInfo,
     version::VersionInfo,
 };
 use reth_provider::{
     providers::{NodeTypesForProvider, ProviderNodeTypes, RocksDBProvider, StaticFileProvider},
-    BlockHashReader, BlockNumReader, ProviderError, ProviderFactory, ProviderResult,
-    RocksDBProviderFactory, StageCheckpointReader, StaticFileProviderBuilder,
-    StaticFileProviderFactory,
+    BalConfig, BalStoreHandle, BlockHashReader, BlockNumReader, DBProvider,
+    DatabaseProviderFactory, InMemoryBalStore, MetadataProvider, MetadataWriter, ProviderError,
+    ProviderFactory, ProviderResult, RocksDBProviderFactory, StageCheckpointReader,
+    StaticFileProviderBuilder, StaticFileProviderFactory, StorageSettingsCache,
 };
-use reth_prune::{PruneModes, PrunerBuilder};
+use reth_prune::{PruneMode, PruneModes, PrunerBuilder};
 use reth_rpc_builder::config::RethRpcServerConfig;
 use reth_rpc_layer::JwtSecret;
 use reth_stages::{
-    sets::DefaultStages, stages::EraImportSource, MetricEvent, PipelineBuilder, PipelineTarget,
-    StageId,
+    sets::DefaultStages,
+    stages::{EraImportSource, MerkleStage},
+    MetricEvent, PipelineBuilder, PipelineTarget, StageId, StageSet,
 };
-use reth_static_file::StaticFileProducer;
+use reth_static_file::{blocks_per_file_for_prune_distance, StaticFileProducer, StaticFileSegment};
+use reth_storage_overlay::OverlayManager;
 use reth_tasks::TaskExecutor;
 use reth_tracing::{
     throttle,
     tracing::{debug, error, info, warn},
 };
 use reth_transaction_pool::TransactionPool;
-use reth_trie_db::ChangesetCache;
-use std::{sync::Arc, thread::available_parallelism, time::Duration};
+use std::{num::NonZeroUsize, sync::Arc, thread::available_parallelism, time::Duration};
 use tokio::sync::{
     mpsc::{unbounded_channel, UnboundedSender},
     oneshot, watch,
@@ -167,8 +174,9 @@ impl LaunchContext {
 
         info!(target: "reth::cli", path = ?config_path, "Configuration loaded");
 
-        // Update the config with the command line arguments
-        toml_config.peers.trusted_nodes_only = config.network.trusted_only;
+        // Update the config with the command line arguments. Only override when the CLI flag is
+        // set, so the TOML value is preserved when the flag is not passed.
+        toml_config.peers.trusted_nodes_only |= config.network.trusted_only;
 
         // Merge static file CLI arguments with config file, giving priority to CLI
         toml_config.static_files =
@@ -195,7 +203,7 @@ impl LaunchContext {
                 should_save = true;
             }
         } else if !reth_config.prune.is_default() {
-            warn!(target: "reth::cli", "Pruning configuration is present in the config file, but no CLI arguments are provided. Using config from file.");
+            info!(target: "reth::cli", "Pruning configuration is present in the config file, but no CLI arguments are provided. Using config from file.");
         }
 
         if should_save {
@@ -228,8 +236,10 @@ impl LaunchContext {
         }
 
         // Configure the implicit global rayon pool for `par_iter` usage.
-        let num_threads = available_parallelism()
-            .map_or(0, |num| num.get().saturating_sub(reserved_cpu_cores).max(1));
+        // TODO: reserved_cpu_cores is currently ignored because subtracting from thread pool
+        // sizes doesn't actually reserve CPU cores for other processes.
+        let _ = reserved_cpu_cores;
+        let num_threads = available_parallelism().map_or(1, NonZeroUsize::get);
         if let Err(err) = ThreadPoolBuilder::new()
             .num_threads(num_threads)
             .thread_name(|i| format!("rayon-{i:02}"))
@@ -469,7 +479,9 @@ where
     /// check.**
     pub async fn create_provider_factory<N, Evm>(
         &self,
-        changeset_cache: ChangesetCache,
+        overlay_manager: OverlayManager<N::Primitives>,
+        rocksdb_provider: Option<RocksDBProvider>,
+        disabled_stages: &[StageId],
     ) -> eyre::Result<ProviderFactory<N>>
     where
         N: ProviderNodeTypes<DB = DB, ChainSpec = ChainSpec>,
@@ -479,21 +491,47 @@ where
         let static_files_config = &self.toml_config().static_files;
         static_files_config.validate()?;
 
+        let prune_config = self.prune_config();
+
+        let mut blocks_per_file = static_files_config.as_blocks_per_file_map();
+        // Receipts in static files are pruned by deleting whole files, so with the default file
+        // size a distance-based prune target is only reached every 500k blocks. Unless a file size
+        // is explicitly configured, derive one from the prune distance so retention tracks the
+        // configured distance.
+        if blocks_per_file.get(StaticFileSegment::Receipts).is_none() &&
+            let Some(PruneMode::Distance(distance)) = prune_config.segments.receipts
+        {
+            blocks_per_file
+                .insert(StaticFileSegment::Receipts, blocks_per_file_for_prune_distance(distance));
+        }
+
         // Apply per-segment blocks_per_file configuration
         let static_file_provider =
             StaticFileProviderBuilder::read_write(self.data_dir().static_files())
                 .with_metrics()
-                .with_blocks_per_file_for_segments(&static_files_config.as_blocks_per_file_map())
+                .with_blocks_per_file_for_segments(&blocks_per_file)
                 .with_genesis_block_number(self.chain_spec().genesis().number.unwrap_or_default())
                 .build()?;
 
-        // Initialize RocksDB provider with metrics, statistics, and default tables
-        let rocksdb_provider = RocksDBProvider::builder(self.data_dir().rocksdb())
-            .with_default_tables()
-            .with_metrics()
-            .with_statistics()
-            .build()?;
+        // Use the provided RocksDB provider or create a new one
+        let rocksdb_provider = if let Some(provider) = rocksdb_provider {
+            provider
+        } else {
+            RocksDBProvider::builder(self.data_dir().rocksdb())
+                .with_default_tables()
+                .with_metrics()
+                .with_statistics()
+                .build()?
+        };
 
+        let balstore_cache_size = self
+            .node_config()
+            .db
+            .balstore_cache_size
+            .unwrap_or(BalConfig::DEFAULT_IN_MEMORY_RETENTION_DISTANCE);
+        let bal_store = BalStoreHandle::new(InMemoryBalStore::new(
+            BalConfig::with_in_memory_retention_distance(balstore_cache_size),
+        ));
         let factory = ProviderFactory::new(
             self.right().clone(),
             self.chain_spec(),
@@ -501,41 +539,38 @@ where
             rocksdb_provider,
             self.task_executor().clone(),
         )?
-        .with_prune_modes(self.prune_modes())
-        .with_changeset_cache(changeset_cache);
+        .with_prune_modes(prune_config.segments)
+        .with_minimum_pruning_distance(prune_config.minimum_pruning_distance)
+        .with_overlay_manager(overlay_manager)
+        .with_bal_store(bal_store);
 
         // Check consistency between the database and static files, returning
         // the unwind targets for each storage layer if inconsistencies are
         // found.
         let (rocksdb_unwind, static_file_unwind) = factory.check_consistency()?;
+        let provider_ro = factory.database_provider_ro()?;
+        // Finish is committed before Merkle during unwind, so this marker is authoritative when
+        // resuming an interrupted partial trie unwind.
+        let (partial_trie_unwind, has_persisted_partial_trie_unwind) =
+            get_partial_trie_unwind_marker(&provider_ro)?;
+        drop(provider_ro);
+        let persist_partial_trie_unwind =
+            !has_persisted_partial_trie_unwind && partial_trie_unwind.is_some();
+        let partial_trie_unwind_target =
+            partial_trie_unwind.map(|marker| marker.partial_state_trie);
+        // Recover the partial state trie first. Its unwind enables
+        // `walk_all_changed_branch_children`, which is more expensive than a normal unwind, so
+        // it only runs to the partial trie target. A lower storage-layer target is then unwound
+        // normally.
+        let storage_unwind = [rocksdb_unwind, static_file_unwind].into_iter().flatten().min();
+        let storage_unwind = storage_unwind.filter(|unwind_block| {
+            partial_trie_unwind_target.is_none_or(|partial_trie| *unwind_block < partial_trie)
+        });
 
-        // Take the minimum block number to ensure all storage layers are consistent.
-        let unwind_target = [rocksdb_unwind, static_file_unwind].into_iter().flatten().min();
-
-        if let Some(unwind_block) = unwind_target {
-            // Highly unlikely to happen, and given its destructive nature, it's better to panic
-            // instead. Unwinding to 0 would leave MDBX with a huge free list size.
-            let inconsistency_source = match (rocksdb_unwind, static_file_unwind) {
-                (Some(_), Some(_)) => "RocksDB and static file",
-                (Some(_), None) => "RocksDB",
-                (None, Some(_)) => "static file",
-                (None, None) => unreachable!(),
-            };
-            assert_ne!(
-                unwind_block, 0,
-                "A {} inconsistency was found that would trigger an unwind to block 0",
-                inconsistency_source
-            );
-
-            let unwind_target = PipelineTarget::Unwind(unwind_block);
-
-            info!(target: "reth::cli", %unwind_target, %inconsistency_source, "Executing unwind after consistency check.");
-
-            let (_tip_tx, tip_rx) = watch::channel(B256::ZERO);
-
-            // Builds an unwind-only pipeline
-            let pipeline = PipelineBuilder::default()
-                .add_stages(DefaultStages::new(
+        if partial_trie_unwind_target.is_some() || storage_unwind.is_some() {
+            let build_unwind_pipeline = |walk_all_changed_branch_children| {
+                let (_tip_tx, tip_rx) = watch::channel(B256::ZERO);
+                let mut stages = DefaultStages::new(
                     factory.clone(),
                     tip_rx,
                     Arc::new(NoopConsensus::default()),
@@ -545,26 +580,90 @@ where
                     self.toml_config().stages.clone(),
                     self.prune_modes(),
                     None,
-                ))
-                .build(
+                )
+                .builder()
+                .disable_all(disabled_stages);
+
+                if walk_all_changed_branch_children {
+                    // Partial trie recovery is not complete until Merkle has unwound.
+                    stages =
+                        stages.set(MerkleStage::new_unwind(true)).enable(StageId::MerkleUnwind);
+                }
+
+                PipelineBuilder::default().add_stages(stages).build(
                     factory.clone(),
                     StaticFileProducer::new(factory.clone(), self.prune_modes()),
-                );
+                )
+            };
+            let mut unwinds = Vec::with_capacity(2);
 
-            // Unwinds to block
+            if let Some(unwind_block) = partial_trie_unwind_target {
+                unwinds.push((
+                    PipelineTarget::Unwind(unwind_block),
+                    "partial state trie".to_owned(),
+                    build_unwind_pipeline(true),
+                    true,
+                ));
+            }
+
+            if let Some(unwind_block) = storage_unwind {
+                // Highly unlikely to happen, and given its destructive nature, it's better to
+                // panic instead. Unwinding to 0 would leave MDBX with a huge free list size.
+                let inconsistency_source = match (rocksdb_unwind, static_file_unwind) {
+                    (Some(_), Some(_)) => "RocksDB and static file",
+                    (Some(_), None) => "RocksDB",
+                    (None, Some(_)) => "static file",
+                    (None, None) => unreachable!(),
+                };
+                assert_ne!(
+                    unwind_block, 0,
+                    "A {inconsistency_source} inconsistency was found that would trigger an unwind to block 0"
+                );
+                unwinds.push((
+                    PipelineTarget::Unwind(unwind_block),
+                    inconsistency_source.to_owned(),
+                    build_unwind_pipeline(false),
+                    false,
+                ));
+            }
+
+            if persist_partial_trie_unwind {
+                // The marker must be durable before any unwind stage can commit.
+                let provider_rw = factory.database_provider_rw()?;
+                write_partial_trie_unwind_marker(
+                    &provider_rw,
+                    partial_trie_unwind.expect("partial trie unwind marker must exist"),
+                )?;
+                provider_rw.commit()?;
+            }
+
             let (tx, rx) = oneshot::channel();
+            let factory = factory.clone();
 
             // Pipeline should be run as blocking and panic if it fails.
-            self.task_executor().spawn_critical_blocking_task(
-                "pipeline task",
-                Box::pin(async move {
-                    let (_, result) = pipeline.run_as_fut(Some(unwind_target)).await;
-                    let _ = tx.send(result);
-                }),
-            );
-            rx.await?.inspect_err(|err| {
-                error!(target: "reth::cli", %unwind_target, %inconsistency_source, %err, "failed to run unwind")
-            })?;
+            self.task_executor().spawn_critical_blocking_task("pipeline task", async move {
+                let result: Result<(), reth_stages::PipelineError> = async {
+                    for (unwind_target, inconsistency_source, pipeline, clear_partial_trie_unwind) in
+                        unwinds
+                    {
+                        info!(target: "reth::cli", %unwind_target, %inconsistency_source, "Executing unwind after consistency check.");
+                        let (_, result) = pipeline.run_as_fut(Some(unwind_target)).await;
+                        result.inspect_err(|err| {
+                            error!(target: "reth::cli", %unwind_target, %inconsistency_source, %err, "failed to run unwind");
+                        })?;
+
+                        if clear_partial_trie_unwind {
+                            let provider_rw = factory.database_provider_rw()?;
+                            delete_partial_trie_unwind_marker(&provider_rw)?;
+                            provider_rw.commit()?;
+                        }
+                    }
+                    Ok(())
+                }
+                .await;
+                let _ = tx.send(result);
+            });
+            rx.await??;
         }
 
         Ok(factory)
@@ -573,13 +672,17 @@ where
     /// Creates a new [`ProviderFactory`] and attaches it to the launch context.
     pub async fn with_provider_factory<N, Evm>(
         self,
-        changeset_cache: ChangesetCache,
+        overlay_manager: OverlayManager<N::Primitives>,
+        rocksdb_provider: Option<RocksDBProvider>,
+        disabled_stages: &[StageId],
     ) -> eyre::Result<LaunchContextWith<Attached<WithConfigs<ChainSpec>, ProviderFactory<N>>>>
     where
         N: ProviderNodeTypes<DB = DB, ChainSpec = ChainSpec>,
         Evm: ConfigureEvm<Primitives = N::Primitives> + 'static,
     {
-        let factory = self.create_provider_factory::<N, Evm>(changeset_cache).await?;
+        let factory = self
+            .create_provider_factory::<N, Evm>(overlay_manager, rocksdb_provider, disabled_stages)
+            .await?;
         let ctx = LaunchContextWith {
             inner: self.inner,
             attachment: self.attachment.map_right(|_| factory),
@@ -611,18 +714,36 @@ where
     /// This launches the prometheus endpoint.
     ///
     /// Convenience function to [`Self::start_prometheus_endpoint`]
-    pub async fn with_prometheus_server(self) -> eyre::Result<Self> {
+    pub async fn with_prometheus_server(self) -> eyre::Result<Self>
+    where
+        T::ChainSpec: EthereumHardforks,
+    {
         self.start_prometheus_endpoint().await?;
         Ok(self)
     }
 
     /// Starts the prometheus endpoint.
-    pub async fn start_prometheus_endpoint(&self) -> eyre::Result<()> {
+    pub async fn start_prometheus_endpoint(&self) -> eyre::Result<()>
+    where
+        T::ChainSpec: EthereumHardforks,
+    {
         // ensure recorder runs upkeep periodically
         install_prometheus_recorder().spawn_upkeep();
 
         let listen_addr = self.node_config().metrics.prometheus;
         if let Some(addr) = listen_addr {
+            let prune_config = self.prune_config();
+            let pruning_mode =
+                PruneConfigKind::from_config(&prune_config, self.chain_spec().as_ref()).as_str();
+            // On existing databases, stored settings are authoritative and already cached by the
+            // provider factory. Fresh databases do not have storage metadata until genesis is
+            // initialized, so report the configured setting during this pre-genesis startup window.
+            let storage_settings =
+                if self.provider_factory().get_stage_checkpoint(StageId::Headers)?.is_some() {
+                    self.provider_factory().cached_storage_settings()
+                } else {
+                    self.node_config().storage_settings()
+                };
             let config = MetricServerConfig::new(
                 addr,
                 VersionInfo {
@@ -638,6 +759,12 @@ where
                 metrics_hooks(self.provider_factory()),
                 self.data_dir().pprof_dumps(),
             )
+            .with_storage_settings_info(StorageSettingsInfo {
+                storage_v2: storage_settings.storage_v2,
+                pruning_mode,
+                prune_config: serde_json::to_string(&prune_config)
+                    .expect("serializing PruneConfig should not fail"),
+            })
             .with_push_gateway(
                 self.node_config().metrics.push_gateway_url.clone(),
                 self.node_config().metrics.push_gateway_interval,
@@ -651,7 +778,11 @@ where
 
     /// Convenience function to [`Self::init_genesis`]
     pub fn with_genesis(self) -> Result<Self, InitStorageError> {
-        init_genesis_with_settings(self.provider_factory(), self.node_config().storage_settings())?;
+        init_genesis_with_settings_and_validate(
+            self.provider_factory(),
+            self.node_config().storage_settings(),
+            !self.node_config().debug.skip_genesis_validation,
+        )?;
         Ok(self)
     }
 
@@ -888,11 +1019,14 @@ where
     /// This returns the configured `debug.tip` if set, otherwise it will check if backfill was
     /// previously interrupted and returns the block hash of the last checkpoint, see also
     /// [`Self::check_pipeline_consistency`]
-    pub fn initial_backfill_target(&self) -> ProviderResult<Option<B256>> {
+    pub fn initial_backfill_target(
+        &self,
+        disabled_stages: &[StageId],
+    ) -> ProviderResult<Option<B256>> {
         let mut initial_target = self.node_config().debug.tip;
 
         if initial_target.is_none() {
-            initial_target = self.check_pipeline_consistency()?;
+            initial_target = self.check_pipeline_consistency(disabled_stages)?;
         }
 
         Ok(initial_target)
@@ -940,11 +1074,15 @@ where
     /// # Returns
     ///
     /// A target block hash if the pipeline is inconsistent, otherwise `None`.
-    pub fn check_pipeline_consistency(&self) -> ProviderResult<Option<B256>> {
+    pub fn check_pipeline_consistency(
+        &self,
+        disabled_stages: &[StageId],
+    ) -> ProviderResult<Option<B256>> {
         // We skip the era stage if it's not enabled
         let era_enabled = self.era_import_source().is_some();
-        let mut all_stages =
-            StageId::ALL.into_iter().filter(|id| era_enabled || id != &StageId::Era);
+        let mut all_stages = StageId::ALL
+            .into_iter()
+            .filter(|id| (era_enabled || id != &StageId::Era) && !disabled_stages.contains(id));
 
         // Get the expected first stage based on config.
         let first_stage = all_stages.next().expect("there must be at least one stage");
@@ -1004,7 +1142,7 @@ where
     }
 
     /// Launches ExEx (Execution Extensions) and returns the ExEx manager handle.
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity)]
     pub async fn launch_exex(
         &self,
         installed_exex: Vec<(
@@ -1026,7 +1164,7 @@ where
     ///     .launch()
     ///     .await
     /// ```
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity)]
     pub fn exex_launcher(
         &self,
         installed_exex: Vec<(
@@ -1103,7 +1241,7 @@ where
         // If engine events are provided, spawn listener for new payload reporting
         let ethstats_for_events = ethstats.clone();
         let task_executor = self.task_executor().clone();
-        task_executor.spawn_task(Box::pin(async move {
+        task_executor.spawn_task(async move {
             while let Some(event) = engine_events.next().await {
                 use reth_engine_primitives::ConsensusEngineEvent;
                 match event {
@@ -1126,10 +1264,10 @@ where
                     }
                 }
             }
-        }));
+        });
 
         // Spawn main ethstats service
-        task_executor.spawn_task(Box::pin(async move { ethstats.run().await }));
+        task_executor.spawn_task(async move { ethstats.run().await });
 
         Ok(())
     }
@@ -1260,13 +1398,98 @@ pub fn metrics_hooks<N: NodeTypesWithDB>(provider_factory: &ProviderFactory<N>) 
         .build()
 }
 
+fn get_partial_trie_unwind_marker(
+    provider: &(impl MetadataProvider + StageCheckpointReader),
+) -> ProviderResult<(Option<PartialStateTrieUnwindMarker>, bool)> {
+    if let Some(marker) = provider.get_metadata(PARTIAL_STATE_TRIE_UNWIND_METADATA_KEY)? {
+        let marker = serde_json::from_slice::<PartialStateTrieUnwindMarker>(&marker)
+            .map_err(ProviderError::other)?;
+        if marker.partial_state_trie >= marker.finish_block_number {
+            return Err(ProviderError::other(std::io::Error::other(format!(
+                "partial state trie unwind target #{} is not below original Finish #{}",
+                marker.partial_state_trie, marker.finish_block_number,
+            ))))
+        }
+        return Ok((Some(marker), true))
+    }
+
+    let Some(finish_checkpoint) = provider.get_stage_checkpoint(StageId::Finish)? else {
+        return Ok((None, false))
+    };
+    let Some(partial_state_trie) =
+        finish_checkpoint.finish_stage_checkpoint().and_then(|finish| finish.partial_state_trie())
+    else {
+        return Ok((None, false))
+    };
+
+    if partial_state_trie > finish_checkpoint.block_number {
+        return Err(ProviderError::other(std::io::Error::other(format!(
+            "partial state trie frontier #{partial_state_trie} is ahead of Finish #{}",
+            finish_checkpoint.block_number,
+        ))))
+    }
+
+    Ok((
+        (partial_state_trie < finish_checkpoint.block_number).then_some(
+            PartialStateTrieUnwindMarker {
+                finish_block_number: finish_checkpoint.block_number,
+                partial_state_trie,
+            },
+        ),
+        false,
+    ))
+}
+
+/// Metadata key for a partial state trie unwind that has not completed yet.
+const PARTIAL_STATE_TRIE_UNWIND_METADATA_KEY: &str = "partial_state_trie_unwind";
+
+fn write_partial_trie_unwind_marker(
+    provider: &impl MetadataWriter,
+    marker: PartialStateTrieUnwindMarker,
+) -> ProviderResult<()> {
+    provider.write_metadata(
+        PARTIAL_STATE_TRIE_UNWIND_METADATA_KEY,
+        serde_json::to_vec(&marker).map_err(ProviderError::other)?,
+    )
+}
+
+fn delete_partial_trie_unwind_marker(provider: &impl MetadataWriter) -> ProviderResult<()> {
+    provider.delete_metadata(PARTIAL_STATE_TRIE_UNWIND_METADATA_KEY)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{LaunchContext, NodeConfig};
+    use super::{get_partial_trie_unwind_marker, LaunchContext, NodeConfig};
     use reth_config::Config;
+    use reth_db_api::models::PartialStateTrieUnwindMarker;
     use reth_node_core::args::PruningArgs;
+    use reth_provider::{MetadataProvider, ProviderResult, StageCheckpointReader};
+    use reth_stages::{FinishCheckpoint, StageCheckpoint, StageId};
 
     const EXTENSION: &str = "toml";
+
+    struct MockProvider(Option<Vec<u8>>, Option<StageCheckpoint>);
+
+    impl MetadataProvider for MockProvider {
+        fn get_metadata(&self, _: &str) -> ProviderResult<Option<Vec<u8>>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    impl StageCheckpointReader for MockProvider {
+        fn get_stage_checkpoint(&self, id: StageId) -> ProviderResult<Option<StageCheckpoint>> {
+            assert_eq!(id, StageId::Finish);
+            Ok(self.1)
+        }
+
+        fn get_stage_checkpoint_progress(&self, _: StageId) -> ProviderResult<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        fn get_all_checkpoints(&self) -> ProviderResult<Vec<(String, StageCheckpoint)>> {
+            Ok(Vec::new())
+        }
+    }
 
     fn with_tempdir(filename: &str, proc: fn(&std::path::Path)) {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -1304,6 +1527,7 @@ mod tests {
                     bodies_distance: None,
                     receipts_log_filter: None,
                     bodies_before: None,
+                    minimum_distance: None,
                 },
                 ..NodeConfig::test()
             };
@@ -1314,5 +1538,119 @@ mod tests {
 
             assert_eq!(reth_config, loaded_config);
         })
+    }
+
+    #[test]
+    fn get_partial_trie_unwind_marker_uses_partial_finish_checkpoint() {
+        let finish_checkpoint = StageCheckpoint::new(42)
+            .with_finish_stage_checkpoint(FinishCheckpoint { partial_state_trie: Some(21) });
+        let expected =
+            finish_checkpoint.finish_stage_checkpoint().unwrap().partial_state_trie().map(
+                |partial_state_trie| PartialStateTrieUnwindMarker {
+                    finish_block_number: finish_checkpoint.block_number,
+                    partial_state_trie,
+                },
+            );
+
+        assert_eq!(
+            get_partial_trie_unwind_marker(&MockProvider(None, Some(finish_checkpoint))).unwrap(),
+            (expected, false)
+        );
+
+        let genesis_checkpoint = StageCheckpoint::new(42)
+            .with_finish_stage_checkpoint(FinishCheckpoint { partial_state_trie: Some(0) });
+        let expected =
+            genesis_checkpoint.finish_stage_checkpoint().unwrap().partial_state_trie().map(
+                |partial_state_trie| PartialStateTrieUnwindMarker {
+                    finish_block_number: genesis_checkpoint.block_number,
+                    partial_state_trie,
+                },
+            );
+
+        assert_eq!(
+            get_partial_trie_unwind_marker(&MockProvider(None, Some(genesis_checkpoint))).unwrap(),
+            (expected, false)
+        );
+    }
+
+    #[test]
+    fn get_partial_trie_unwind_marker_resumes_persisted_unwind() {
+        let marker =
+            PartialStateTrieUnwindMarker { finish_block_number: 42, partial_state_trie: 21 };
+
+        assert_eq!(
+            get_partial_trie_unwind_marker(&MockProvider(
+                Some(serde_json::to_vec(&marker).unwrap()),
+                Some(StageCheckpoint::new(21)),
+            ),)
+            .unwrap(),
+            (Some(marker), true)
+        );
+        assert_eq!(
+            get_partial_trie_unwind_marker(&MockProvider(
+                Some(serde_json::to_vec(&marker).unwrap()),
+                None
+            ),)
+            .unwrap(),
+            (Some(marker), true)
+        );
+    }
+
+    #[test]
+    fn get_partial_trie_unwind_marker_ignores_non_lagging_or_missing_partial_checkpoint() {
+        let matching_finish_checkpoint = StageCheckpoint::new(42)
+            .with_finish_stage_checkpoint(FinishCheckpoint { partial_state_trie: Some(42) });
+        let ahead_finish_checkpoint = StageCheckpoint::new(42)
+            .with_finish_stage_checkpoint(FinishCheckpoint { partial_state_trie: Some(43) });
+        let missing_partial_finish_checkpoint = StageCheckpoint::new(42)
+            .with_finish_stage_checkpoint(FinishCheckpoint { partial_state_trie: None });
+
+        assert_eq!(
+            get_partial_trie_unwind_marker(&MockProvider(None, Some(matching_finish_checkpoint)),)
+                .unwrap(),
+            (None, false)
+        );
+        assert_eq!(
+            get_partial_trie_unwind_marker(&MockProvider(
+                None,
+                Some(missing_partial_finish_checkpoint)
+            ),)
+            .unwrap(),
+            (None, false)
+        );
+        assert_eq!(
+            get_partial_trie_unwind_marker(&MockProvider(None, None)).unwrap(),
+            (None, false)
+        );
+
+        let partial_frontier = ahead_finish_checkpoint
+            .finish_stage_checkpoint()
+            .and_then(|finish| finish.partial_state_trie());
+        let result =
+            get_partial_trie_unwind_marker(&MockProvider(None, Some(ahead_finish_checkpoint)));
+        if partial_frontier.is_some() {
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("ahead of Finish"), "unexpected error: {error}");
+        } else {
+            assert_eq!(result.unwrap(), (None, false));
+        }
+    }
+
+    #[test]
+    fn get_partial_trie_unwind_marker_rejects_invalid_persisted_marker() {
+        let marker =
+            PartialStateTrieUnwindMarker { finish_block_number: 42, partial_state_trie: 42 };
+        let error = get_partial_trie_unwind_marker(&MockProvider(
+            Some(serde_json::to_vec(&marker).unwrap()),
+            None,
+        ))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("is not below original Finish"));
+    }
+
+    #[test]
+    fn get_partial_trie_unwind_marker_rejects_malformed_metadata() {
+        assert!(get_partial_trie_unwind_marker(&MockProvider(Some(vec![0xff]), None)).is_err());
     }
 }

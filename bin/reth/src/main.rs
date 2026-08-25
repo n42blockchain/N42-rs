@@ -3,8 +3,12 @@
 #[global_allocator]
 static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
 
+// Required for "override_allocator_on_supported_platforms".
+#[cfg(all(feature = "jemalloc", unix))]
+use reth_cli_util::allocator::tikv_jemalloc_sys as _;
+
 #[cfg(all(feature = "jemalloc-prof", unix))]
-#[unsafe(export_name = "_rjem_malloc_conf")]
+#[unsafe(export_name = "malloc_conf")]
 static MALLOC_CONF: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
 
 use clap::Parser;
@@ -14,6 +18,18 @@ use reth_node_ethereum::EthereumNode;
 use tracing::info;
 
 fn main() {
+    #[cfg(feature = "jit")]
+    {
+        match reth_node_ethereum::node::maybe_run_jit_helper() {
+            Ok(std::ops::ControlFlow::Break(())) => return,
+            Ok(std::ops::ControlFlow::Continue(())) => {}
+            Err(err) => {
+                eprintln!("Error: {err:?}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     reth_cli_util::sigsegv_handler::install();
 
     // Enable backtraces unless a RUST_BACKTRACE value has already been explicitly provided.

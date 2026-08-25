@@ -239,121 +239,128 @@ n42-ef-tests = {path="crates/n42/ef-tests"}
 
 blst = "0.3.11"
 
-reth = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
+reth = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
 # Removed from workspace.dependencies: unused here, and all of these are gone
 # from reth 2.4.1 (the optimism crates moved to op-reth; the rest deleted).
 # Dropping them shrinks the upgrade surface. See docs/RETH_2_4_1_UPGRADE.md.
-reth-basic-payload-builder = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-#reth-beacon-consensus = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-chain-state = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-chainspec = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-cli = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-cli-commands = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-cli-runner = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-cli-util = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-codecs = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-codecs-derive = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-config = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-consensus = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-consensus-common = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-consensus-debug-client = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-db = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0", default-features = false }
-reth-db-api = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-db-common = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-db-models = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-discv4 = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-discv5 = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-dns-discovery = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-downloaders = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-e2e-test-utils = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-ecies = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-engine-local = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-engine-primitives = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-engine-tree = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-engine-service = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-engine-util = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-errors = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-eth-wire = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-eth-wire-types = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-ethereum-cli = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-ethereum-consensus = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-ethereum-engine-primitives = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-ethereum-forks = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-ethereum-payload-builder = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-etl = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-evm = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-evm-ethereum = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-execution-errors = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-execution-types = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-exex = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-exex-test-utils = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-exex-types = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-fs-util = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-invalid-block-hooks = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-ipc = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-libmdbx = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-mdbx-sys = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-metrics = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-net-banlist = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-net-nat = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-network = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-network-api = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-network-p2p = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-network-peers = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0", default-features = false }
-reth-network-types = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-nippy-jar = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-node-api = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-node-builder = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-node-core = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-node-ethereum = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-node-ethstats = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-node-events = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-node-metrics = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-node-types = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-payload-builder = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-payload-primitives = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-payload-builder-primitives = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-payload-validator = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
+reth-basic-payload-builder = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+#reth-beacon-consensus = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-chain-state = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-chainspec = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+alloy-node-bindings = { version = "2.3.0", default-features = false }
+libc = "0.2"
+quanta = "0.12"
+reth-storage-overlay = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-cli = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-cli-commands = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-cli-runner = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-cli-util = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-codecs = { version = "0.6.0", default-features = false }
+reth-codecs-derive = "0.6.0"
+reth-config = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-consensus = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-consensus-common = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-consensus-debug-client = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-db = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a", default-features = false }
+reth-db-api = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-db-common = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-db-models = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-discv4 = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-discv5 = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-dns-discovery = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-downloaders = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-e2e-test-utils = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-ecies = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-engine-local = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-engine-primitives = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-engine-tree = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+# reth-engine-service: removed upstream in reth 2.x
+reth-engine-util = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-errors = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-eth-wire = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-eth-wire-types = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-ethereum-cli = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-ethereum-consensus = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-ethereum-engine-primitives = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-ethereum-forks = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-ethereum-payload-builder = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-etl = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-evm = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-evm-ethereum = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-execution-errors = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-execution-types = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-exex = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-exex-test-utils = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-exex-types = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-fs-util = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-invalid-block-hooks = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-ipc = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-libmdbx = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-mdbx-sys = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-metrics = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-net-banlist = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-net-nat = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-network = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-network-api = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-network-p2p = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-network-peers = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a", default-features = false }
+reth-network-types = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-nippy-jar = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-node-api = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-node-builder = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-node-core = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-node-ethereum = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-node-ethstats = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-node-events = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-node-metrics = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-node-types = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-payload-builder = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-payload-primitives = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-payload-builder-primitives = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-payload-validator = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
 # reth-primitives was deprecated upstream and is deleted in reth 2.4.1 (#23220).
 # Its contents live in reth-ethereum-primitives + reth-primitives-traits.
-reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0", default-features = false }
-reth-provider = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-prune = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-prune-types = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-revm = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0", default-features = false }
-reth-rpc = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-rpc-api = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-rpc-builder = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-rpc-engine-api = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-rpc-eth-api = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-rpc-eth-types = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0", default-features = false }
-reth-rpc-layer = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-rpc-server-types = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-rpc-types-compat = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-rpc-convert = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-stages = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-stages-api = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-stages-types = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-static-file = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-static-file-types = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-storage-api = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-storage-errors = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-tasks = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-testing-utils = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-tokio-util = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-tracing = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-tracing-otlp = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-transaction-pool = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-trie = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-trie-common = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-trie-db = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-trie-parallel = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
+# moved out of the reth repo into reth-core, consumed from crates.io (reth #23210)
+reth-primitives-traits = { version = "0.6.0", default-features = false }
+reth-provider = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-prune = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-prune-types = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-revm = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a", default-features = false }
+reth-rpc = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-rpc-api = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-rpc-builder = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-rpc-engine-api = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-rpc-eth-api = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-rpc-eth-types = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a", default-features = false }
+reth-rpc-layer = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-rpc-server-types = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+# Upstream renamed this crate reth-rpc-convert (reth #17013), so there is no
+# longer anything to [patch] — the vendored copy is now a plain path dependency.
+reth-rpc-types-compat = { path = "crates/rpc/rpc-types-compat" }
+reth-rpc-convert = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-stages = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-stages-api = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-stages-types = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-static-file = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-static-file-types = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-storage-api = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-storage-errors = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-tasks = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-testing-utils = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-tokio-util = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-tracing = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-tracing-otlp = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-transaction-pool = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-trie = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-trie-common = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-trie-db = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-trie-parallel = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
 
-reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-ress-provider = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
+reth-ethereum-primitives = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
+reth-ress-provider = { git = "https://github.com/n42blockchain/reth.git", rev = "23316e3ff8adca8c3bd5085ff0565fcae019202a" }
 
 # revm
-revm = { version = "34.0.0", default-features = false }
+revm = { version = "42.0.1", default-features = false }
 revm-bytecode = { version = "8.0.0", default-features = false }
 revm-database = { version = "10.0.0", default-features = false }
 revm-state = { version = "9.0.0", default-features = false }
@@ -368,7 +375,7 @@ alloy-chains = { version = "0.2.5", default-features = false }
 alloy-dyn-abi = "1.5.6"
 alloy-eip2124 = { version = "0.2.0", default-features = false }
 alloy-evm = { version = "0.27.2", default-features = false }
-alloy-primitives = { version = "1.5.6", default-features = false, features = ["map-foldhash"] }
+alloy-primitives = { version = "1.6.1", default-features = false, features = ["map-foldhash"] }
 alloy-rlp = { version = "0.3.13", default-features = false, features = ["core-net", "derive"] }
 alloy-sol-macro = "1.5.6"
 alloy-sol-types = { version = "1.5.6", default-features = false }
@@ -377,10 +384,10 @@ alloy-trie = { version = "0.9.4", default-features = false }
 alloy-eip7928 = "0.3.0"
 alloy-hardforks = "0.4.5"
 
-alloy-consensus = { version = "1.6.3", default-features = false }
+alloy-consensus = { version = "2.3.0", default-features = false }
 alloy-contract = { version = "1.6.3", default-features = false }
-alloy-eips = { version = "1.6.3", default-features = false }
-alloy-genesis = { version = "1.6.3", default-features = false }
+alloy-eips = { version = "2.3.0", default-features = false }
+alloy-genesis = { version = "2.3.0", default-features = false }
 alloy-json-rpc = { version = "1.6.3", default-features = false }
 alloy-network = { version = "1.6.3", default-features = false }
 alloy-network-primitives = { version = "1.6.3", default-features = false }
@@ -393,7 +400,7 @@ alloy-rpc-types-anvil = { version = "1.6.3", default-features = false }
 alloy-rpc-types-beacon = { version = "1.6.3", default-features = false }
 alloy-rpc-types-debug = { version = "1.6.3", default-features = false }
 alloy-rpc-types-engine = { version = "1.6.3", default-features = false }
-alloy-rpc-types-eth = { version = "1.6.3", default-features = false }
+alloy-rpc-types-eth = { version = "2.3.0", default-features = false }
 alloy-rpc-types-mev = { version = "1.6.3", default-features = false }
 alloy-rpc-types-trace = { version = "1.6.3", default-features = false }
 alloy-rpc-types-txpool = { version = "1.6.3", default-features = false }
@@ -619,7 +626,11 @@ nix = { version = "0.29.0", features = ["signal"] }
 tree_hash = "0.10.0"
 tree_hash_derive = "0.10.0"
 
-[patch.'https://github.com/paradigmxyz/reth.git']
+# n42blockchain/reth @ chore/reth-upstream-20260804 — N42's own reth fork, which
+# is what ../N42-26 builds against and what these vendored crates were merged
+# against. It is 113 commits ahead of paradigmxyz's v2.4.1 tag and carries
+# crates (e.g. reth-storage-overlay) that the tag does not have.
+[patch.'https://github.com/n42blockchain/reth.git']
 reth = { path = "bin/reth" }
 reth-revm = { path = "crates/revm" }
 # reth-evm-ethereum is NOT forked any more: the vendored copy was byte-identical
@@ -646,7 +657,6 @@ reth-ethereum-cli = { path = "crates/ethereum/cli"}
 #reth-invalid-block-hooks = { path = "crates/engine/invalid-block-hooks" }
 reth-db-api={path = "crates/storage/db-api"}
 reth-storage-api={path="crates/storage/storage-api"}
-reth-rpc-types-compat={path="crates/rpc/rpc-types-compat"}
 #reth-ethereum-payload-builder={path="crates/ethereum/payload"}
 #reth-auto-seal-consensus={path="crates/consensus/auto-seal"}
 reth-consensus = { path="crates/consensus/consensus"}

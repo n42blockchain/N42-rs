@@ -1,31 +1,21 @@
-// Copyright (c) 2017-2025 N42 Contributors
-// SPDX-License-Identifier: MIT OR Apache-2.0
-
 #![allow(missing_docs)]
 
 use std::{env, error::Error};
-use vergen::{BuildBuilder, CargoBuilder, Emitter};
-use vergen_git2::Git2Builder;
+use vergen::{Build, Cargo, Emitter};
+use vergen_git2::Git2;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut emitter = Emitter::default();
 
-    let build_builder = BuildBuilder::default().build_timestamp(true).build()?;
+    let build_builder = Build::builder().build_timestamp(true).build();
 
     emitter.add_instructions(&build_builder)?;
 
-    let cargo_builder = CargoBuilder::default()
-        .features(true)
-        .target_triple(true)
-        .build()?;
+    let cargo_builder = Cargo::builder().features(true).target_triple(true).build();
 
     emitter.add_instructions(&cargo_builder)?;
 
-    let git_builder = Git2Builder::default()
-        .describe(false, true, None)
-        .dirty(true)
-        .sha(false)
-        .build()?;
+    let git_builder = Git2::builder().describe(false, true, None).dirty(true).sha(false).build();
 
     emitter.add_instructions(&git_builder)?;
 
@@ -95,10 +85,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Example: reth/v0.1.0-alpha.1-428a6dc2f/aarch64-apple-darwin
     println!(
         "cargo:rustc-env=RETH_P2P_CLIENT_VERSION={}",
-        format_args!(
-            "reth/v{pkg_version}-{sha_short}/{}",
-            env::var("VERGEN_CARGO_TARGET_TRIPLE")?
-        )
+        format_args!("reth/v{pkg_version}-{sha_short}/{}", env::var("VERGEN_CARGO_TARGET_TRIPLE")?)
     );
 
     Ok(())

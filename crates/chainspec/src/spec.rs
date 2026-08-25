@@ -25,7 +25,7 @@ use alloy_consensus::{
 };
 use alloy_eips::{
     eip1559::INITIAL_BASE_FEE, eip7685::EMPTY_REQUESTS_HASH, eip7840::BlobParams,
-    eip7892::BlobScheduleBlobParams,
+    eip7892::BlobScheduleBlobParams, eip7928::EMPTY_BLOCK_ACCESS_LIST_HASH,
 };
 use alloy_genesis::Genesis;
 use alloy_primitives::{address, b256, Address, BlockNumber, B256, U256};
@@ -84,6 +84,18 @@ pub fn make_genesis_header(genesis: &Genesis, hardforks: &ChainHardforks) -> Hea
         .active_at_timestamp(genesis.timestamp)
         .then_some(EMPTY_REQUESTS_HASH);
 
+    // If Amsterdam is activated at genesis we set block access list hash to an empty bal hash
+    let block_access_list_hash = hardforks
+        .fork(EthereumHardfork::Amsterdam)
+        .active_at_timestamp(genesis.timestamp)
+        .then_some(EMPTY_BLOCK_ACCESS_LIST_HASH);
+
+    // If Amsterdam is activated at genesis we set slot number to 0
+    let slot_number = hardforks
+        .fork(EthereumHardfork::Amsterdam)
+        .active_at_timestamp(genesis.timestamp)
+        .then_some(0);
+
     Header {
         number: genesis.number.unwrap_or_default(),
         parent_hash: genesis.parent_hash.unwrap_or_default(),
@@ -101,6 +113,8 @@ pub fn make_genesis_header(genesis: &Genesis, hardforks: &ChainHardforks) -> Hea
         blob_gas_used,
         excess_blob_gas,
         requests_hash,
+        block_access_list_hash,
+        slot_number,
         ..Default::default()
     }
 }
@@ -320,6 +334,109 @@ pub static DEV: LazyLock<Arc<ChainSpec>> = LazyLock::new(|| {
     }
     .into()
 });
+
+/// Creates a [`ChainConfig`] from the given chain, hardforks, deposit contract address, and blob
+/// schedule.
+pub fn create_chain_config(
+    chain: Option<Chain>,
+    hardforks: &ChainHardforks,
+    deposit_contract_address: Option<Address>,
+    blob_schedule: BTreeMap<String, BlobParams>,
+) -> ChainConfig {
+    // Helper to extract block number from a hardfork condition
+    let block_num = |fork: EthereumHardfork| hardforks.fork(fork).block_number();
+
+    // Helper to extract timestamp from a hardfork condition
+    let timestamp = |fork: EthereumHardfork| -> Option<u64> {
+        match hardforks.fork(fork) {
+            ForkCondition::Timestamp(t) => Some(t),
+            _ => None,
+        }
+    };
+
+    // Extract TTD from Paris fork
+    let (terminal_total_difficulty, terminal_total_difficulty_passed) =
+        match hardforks.fork(EthereumHardfork::Paris) {
+            ForkCondition::TTD { total_difficulty, .. } => (Some(total_difficulty), true),
+            _ => (None, false),
+        };
+
+    // Check if DAO fork is supported (it has an activation block)
+    let dao_fork_support = hardforks.fork(EthereumHardfork::Dao) != ForkCondition::Never;
+
+    ChainConfig {
+        chain_id: chain.map(|c| c.id()).unwrap_or(0),
+        homestead_block: block_num(EthereumHardfork::Homestead),
+        dao_fork_block: block_num(EthereumHardfork::Dao),
+        dao_fork_support,
+        eip150_block: block_num(EthereumHardfork::Tangerine),
+        eip155_block: block_num(EthereumHardfork::SpuriousDragon),
+        eip158_block: block_num(EthereumHardfork::SpuriousDragon),
+        byzantium_block: block_num(EthereumHardfork::Byzantium),
+        constantinople_block: block_num(EthereumHardfork::Constantinople),
+        petersburg_block: block_num(EthereumHardfork::Petersburg),
+        istanbul_block: block_num(EthereumHardfork::Istanbul),
+        muir_glacier_block: block_num(EthereumHardfork::MuirGlacier),
+        berlin_block: block_num(EthereumHardfork::Berlin),
+        london_block: block_num(EthereumHardfork::London),
+        arrow_glacier_block: block_num(EthereumHardfork::ArrowGlacier),
+        gray_glacier_block: block_num(EthereumHardfork::GrayGlacier),
+        merge_netsplit_block: None,
+        shanghai_time: timestamp(EthereumHardfork::Shanghai),
+        cancun_time: timestamp(EthereumHardfork::Cancun),
+        prague_time: timestamp(EthereumHardfork::Prague),
+        osaka_time: timestamp(EthereumHardfork::Osaka),
+        amsterdam_time: timestamp(EthereumHardfork::Amsterdam),
+        bpo1_time: timestamp(EthereumHardfork::Bpo1),
+        bpo2_time: timestamp(EthereumHardfork::Bpo2),
+        bpo3_time: timestamp(EthereumHardfork::Bpo3),
+        bpo4_time: timestamp(EthereumHardfork::Bpo4),
+        bpo5_time: timestamp(EthereumHardfork::Bpo5),
+        terminal_total_difficulty,
+        terminal_total_difficulty_passed,
+        deposit_contract_address,
+        blob_schedule,
+        ..Default::default()
+    }
+}
+
+/// Returns a [`ChainConfig`] for the current Ethereum mainnet chain.
+pub fn mainnet_chain_config() -> ChainConfig {
+    let hardforks: ChainHardforks = EthereumHardfork::mainnet().into();
+    let blob_schedule = blob_params_to_schedule(&MAINNET.blob_params, &hardforks);
+    create_chain_config(
+        Some(Chain::mainnet()),
+        &hardforks,
+        Some(MAINNET_DEPOSIT_CONTRACT.address),
+        blob_schedule,
+    )
+}
+
+/// Converts the given [`BlobScheduleBlobParams`] into blobs schedule.
+pub fn blob_params_to_schedule(
+    params: &BlobScheduleBlobParams,
+    hardforks: &ChainHardforks,
+) -> BTreeMap<String, BlobParams> {
+    let mut schedule = BTreeMap::new();
+    schedule.insert("cancun".to_string(), params.cancun);
+    schedule.insert("prague".to_string(), params.prague);
+    schedule.insert("osaka".to_string(), params.osaka);
+
+    // Map scheduled entries back to bpo fork names by matching timestamps
+    let bpo_forks = EthereumHardfork::bpo_variants();
+    for (timestamp, blob_params) in &params.scheduled {
+        for bpo_fork in bpo_forks {
+            if let ForkCondition::Timestamp(fork_ts) = hardforks.fork(bpo_fork) &&
+                fork_ts == *timestamp
+            {
+                schedule.insert(bpo_fork.name().to_lowercase(), *blob_params);
+                break;
+            }
+        }
+    }
+
+    schedule
+}
 
 /// A wrapper around [`BaseFeeParams`] that allows for specifying constant or dynamic EIP-1559
 /// parameters based on the active [Hardfork].
@@ -867,21 +984,39 @@ impl From<Genesis> for ChainSpec {
         // We expect no new networks to be configured with the merge, so we ignore the TTD field
         // and merge netsplit block from external genesis files. All existing networks that have
         // merged should have a static ChainSpec already (namely mainnet and sepolia).
-        let paris_block_and_final_difficulty =
-            if let Some(ttd) = genesis.config.terminal_total_difficulty {
-                hardforks.push((
-                    EthereumHardfork::Paris.boxed(),
-                    ForkCondition::TTD {
-                        // NOTE: this will not work properly if the merge is not activated at
-                        // genesis, and there is no merge netsplit block
-                        activation_block_number: genesis
-                            .config
-                            .merge_netsplit_block
-                            .unwrap_or_default(),
-                        total_difficulty: ttd,
-                        fork_block: genesis.config.merge_netsplit_block,
-                    },
-                ));
+        let paris_block_and_final_difficulty = if let Some(ttd) =
+            genesis.config.terminal_total_difficulty
+        {
+            hardforks.push((
+                EthereumHardfork::Paris.boxed(),
+                ForkCondition::TTD {
+                    // NOTE: this will not work properly if the merge is not activated at
+                    // genesis, and there is no merge netsplit block
+                    activation_block_number: genesis
+                        .config
+                        .merge_netsplit_block
+                        .or_else(|| {
+                            // due to this limitation we can't determine the merge block,
+                            // this is the case for perfnet testing for example
+                            // at the time of this fix, only two networks transitioned: MAINNET +
+                            // SEPOLIA and this parsing from genesis is used for shadowforking, so
+                            // we can reasonably assume that if the TTD and the chainid matches
+                            // those networks we use the activation
+                            // blocks of those networks
+                            match genesis.config.chain_id {
+                                1 if ttd == MAINNET_PARIS_TTD => return Some(MAINNET_PARIS_BLOCK),
+                                11155111 if ttd == SEPOLIA_PARIS_TTD => {
+                                    return Some(SEPOLIA_PARIS_BLOCK)
+                                }
+                                _ => {}
+                            };
+                            None
+                        })
+                        .unwrap_or_default(),
+                    total_difficulty: ttd,
+                    fork_block: genesis.config.merge_netsplit_block,
+                },
+            ));
 
                 genesis
                     .config
@@ -900,6 +1035,12 @@ impl From<Genesis> for ChainSpec {
             (EthereumHardfork::Cancun.boxed(), genesis.config.cancun_time),
             (EthereumHardfork::Prague.boxed(), genesis.config.prague_time),
             (EthereumHardfork::Osaka.boxed(), genesis.config.osaka_time),
+            (EthereumHardfork::Bpo1.boxed(), genesis.config.bpo1_time),
+            (EthereumHardfork::Bpo2.boxed(), genesis.config.bpo2_time),
+            (EthereumHardfork::Bpo3.boxed(), genesis.config.bpo3_time),
+            (EthereumHardfork::Bpo4.boxed(), genesis.config.bpo4_time),
+            (EthereumHardfork::Bpo5.boxed(), genesis.config.bpo5_time),
+            (EthereumHardfork::Amsterdam.boxed(), genesis.config.amsterdam_time),
         ];
 
         let mut time_hardforks = time_hardfork_opts
@@ -1199,6 +1340,19 @@ impl ChainSpecBuilder {
     /// Enable Osaka at the given timestamp.
     pub fn with_osaka_at(mut self, timestamp: u64) -> Self {
         self.hardforks.insert(EthereumHardfork::Osaka, ForkCondition::Timestamp(timestamp));
+        self
+    }
+
+    /// Enable Amsterdam at genesis.
+    pub fn amsterdam_activated(mut self) -> Self {
+        self = self.osaka_activated();
+        self.hardforks.insert(EthereumHardfork::Amsterdam, ForkCondition::Timestamp(0));
+        self
+    }
+
+    /// Enable Amsterdam at the given timestamp.
+    pub fn with_amsterdam_at(mut self, timestamp: u64) -> Self {
+        self.hardforks.insert(EthereumHardfork::Amsterdam, ForkCondition::Timestamp(timestamp));
         self
     }
 

@@ -1,9 +1,7 @@
 //! Payload component configuration for the Ethereum node.
 
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
-use reth_ethereum_engine_primitives::{
-    EthBuiltPayload, EthPayloadAttributes, EthPayloadBuilderAttributes,
-};
+use reth_ethereum_engine_primitives::{EthBuiltPayload, EthPayloadAttributes};
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_ethereum_primitives::EthPrimitives;
 use reth_evm::ConfigureEvm;
@@ -29,11 +27,8 @@ where
             Primitives = PrimitivesTy<Types>,
             NextBlockEnvCtx = reth_evm::NextBlockEnvAttributes,
         > + 'static,
-    Types::Payload: PayloadTypes<
-        BuiltPayload = EthBuiltPayload,
-        PayloadAttributes = EthPayloadAttributes,
-        PayloadBuilderAttributes = EthPayloadBuilderAttributes,
-    >,
+    Types::Payload:
+        PayloadTypes<BuiltPayload = EthBuiltPayload, PayloadAttributes = EthPayloadAttributes>,
 {
     type PayloadBuilder =
         reth_ethereum_payload_builder::EthereumPayloadBuilder<Pool, Node::Provider, Evm>;
@@ -47,6 +42,7 @@ where
         let conf = ctx.payload_builder_config();
         let chain = ctx.chain_spec().chain();
         let gas_limit = conf.gas_limit_for(chain);
+        let skip_state_root = ctx.config().tree_config().skip_state_root();
 
         Ok(reth_ethereum_payload_builder::EthereumPayloadBuilder::new(
             ctx.provider().clone(),
@@ -55,7 +51,8 @@ where
             EthereumBuilderConfig::new()
                 .with_gas_limit(gas_limit)
                 .with_max_blobs_per_block(conf.max_blobs_per_block())
-                .with_extra_data(conf.extra_data_bytes()),
+                .with_extra_data(conf.extra_data())
+                .with_skip_state_root(skip_state_root),
         ))
     }
 }

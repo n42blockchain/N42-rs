@@ -151,8 +151,7 @@ impl EthChainSpec for ChainSpec {
     }
 
     fn final_paris_total_difficulty(&self) -> Option<U256> {
-        self.paris_block_and_final_difficulty
-            .map(|(_, final_difficulty)| final_difficulty)
+        self.get_final_paris_total_difficulty()
     }
 
     fn is_n42_attestation_mandatory(&self, timestamp: u64) -> bool {

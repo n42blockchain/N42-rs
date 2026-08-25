@@ -1,17 +1,26 @@
 use crate::{
-    providers::{NodeTypesForProvider, ProviderNodeTypes, RocksDBBuilder, StaticFileProvider},
+    providers::{
+        NodeTypesForProvider, ProviderNodeTypes, RocksDBBuilder, StaticFileProvider,
+        StaticFileProviderBuilder,
+    },
     HashingWriter, ProviderFactory, TrieWriter,
 };
 use alloy_primitives::B256;
-use reth_chainspec::{ChainSpec, MAINNET};
-use reth_db::{test_utils::TempDatabase, DatabaseEnv};
+use reth_chainspec::{ChainSpec, ChainSpecBuilder, MAINNET};
+use reth_db::{mdbx::DatabaseArguments, test_utils::TempDatabase, DatabaseEnv};
 use reth_errors::ProviderResult;
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_node_types::NodeTypesWithDBAdapter;
 use reth_primitives_traits::{Account, StorageEntry};
+use reth_storage_api::StorageSettingsCache;
 use reth_trie::StateRoot;
 use reth_trie_db::DatabaseStateRoot;
 use std::sync::Arc;
+
+type DbStateRoot<'a, TX, A> = StateRoot<
+    reth_trie_db::DatabaseTrieCursorFactory<&'a TX, A>,
+    reth_trie_db::DatabaseHashedCursorFactory<&'a TX>,
+>;
 
 pub mod blocks;
 mod mock;
@@ -43,12 +52,33 @@ pub fn create_test_provider_factory() -> ProviderFactory<MockNodeTypesWithDB> {
 pub fn create_test_provider_factory_with_chain_spec(
     chain_spec: Arc<ChainSpec>,
 ) -> ProviderFactory<MockNodeTypesWithDB> {
-    create_test_provider_factory_with_node_types::<MockNodeTypes>(chain_spec)
+    let genesis_block_number = chain_spec.genesis.number.unwrap_or_default();
+    create_test_provider_factory_with_node_types_and_genesis::<MockNodeTypes>(
+        chain_spec,
+        genesis_block_number,
+    )
+}
+
+/// Creates a test provider factory whose chain starts at `genesis_block_number`.
+pub fn create_test_provider_factory_with_genesis_block_number(
+    genesis_block_number: u64,
+) -> ProviderFactory<MockNodeTypesWithDB> {
+    let mut genesis = MAINNET.genesis.clone();
+    genesis.number = Some(genesis_block_number);
+    let chain_spec = Arc::new(ChainSpecBuilder::mainnet().genesis(genesis).build());
+    create_test_provider_factory_with_chain_spec(chain_spec)
 }
 
 /// Creates test provider factory with provided chain spec.
 pub fn create_test_provider_factory_with_node_types<N: NodeTypesForProvider>(
     chain_spec: Arc<N::ChainSpec>,
+) -> ProviderFactory<NodeTypesWithDBAdapter<N, Arc<TempDatabase<DatabaseEnv>>>> {
+    create_test_provider_factory_with_node_types_and_genesis(chain_spec, 0)
+}
+
+fn create_test_provider_factory_with_node_types_and_genesis<N: NodeTypesForProvider>(
+    chain_spec: Arc<N::ChainSpec>,
+    genesis_block_number: u64,
 ) -> ProviderFactory<NodeTypesWithDBAdapter<N, Arc<TempDatabase<DatabaseEnv>>>> {
     // Create a single temp directory that contains all data dirs (db, static_files, rocksdb).
     // TempDatabase will clean up the entire directory on drop.
@@ -62,6 +92,41 @@ pub fn create_test_provider_factory_with_node_types<N: NodeTypesForProvider>(
 
     // Create database with the datadir path so TempDatabase cleans up everything on drop
     let db = reth_db::test_utils::create_test_rw_db_with_datadir(&datadir_path);
+
+    ProviderFactory::new(
+        db,
+        chain_spec,
+        StaticFileProviderBuilder::read_write(static_files_path)
+            .with_genesis_block_number(genesis_block_number)
+            .build()
+            .expect("static file provider"),
+        RocksDBBuilder::new(&rocksdb_path)
+            .with_default_tables()
+            .build()
+            .expect("failed to create test RocksDB provider"),
+        reth_tasks::Runtime::test(),
+    )
+    .expect("failed to create test provider factory")
+}
+
+/// Creates test provider factory with provided chain spec and custom database arguments.
+///
+/// Same as [`create_test_provider_factory_with_chain_spec`] but allows overriding the default
+/// test database arguments (e.g. to increase the MDBX geometry for heavy benchmarks).
+pub fn create_test_provider_factory_with_chain_spec_and_db_args(
+    chain_spec: Arc<ChainSpec>,
+    db_args: DatabaseArguments,
+) -> ProviderFactory<MockNodeTypesWithDB> {
+    let datadir_path = reth_db::test_utils::tempdir_path();
+
+    let db_path = datadir_path.join("db");
+    let static_files_path = datadir_path.join("static_files");
+    let rocksdb_path = datadir_path.join("rocksdb");
+
+    std::fs::create_dir_all(&static_files_path).expect("failed to create static_files dir");
+
+    let db = reth_db::init_db(&db_path, db_args).expect("failed to init db");
+    let db = Arc::new(TempDatabase::new(db, datadir_path));
 
     ProviderFactory::new(
         db,
@@ -100,7 +165,9 @@ pub fn insert_genesis<N: ProviderNodeTypes<ChainSpec = ChainSpec>>(
     });
     provider.insert_storage_for_hashing(alloc_storage)?;
 
-    let (root, updates) = StateRoot::from_tx(provider.tx_ref()).root_with_updates()?;
+    let (root, updates) = reth_trie_db::with_adapter!(provider, |A| {
+        DbStateRoot::<_, A>::from_tx(provider.tx_ref()).root_with_updates()?
+    });
     provider.write_trie_updates(updates).unwrap();
 
     provider.commit()?;

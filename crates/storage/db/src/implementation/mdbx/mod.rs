@@ -25,7 +25,7 @@ use reth_tracing::tracing::error;
 use std::{
     collections::HashMap,
     ops::{Deref, Range},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -244,6 +244,8 @@ impl DatabaseArguments {
 pub struct DatabaseEnv {
     /// Libmdbx-sys environment.
     inner: Environment,
+    /// Path to the database directory.
+    path: PathBuf,
     /// Opened DBIs for reuse.
     /// Important: Do not manually close these DBIs, like via `mdbx_dbi_close`.
     /// More generally, do not dynamically create, re-open, or drop tables at
@@ -276,6 +278,30 @@ impl Database for DatabaseEnv {
             self.metrics.clone(),
         )
         .map_err(|e| DatabaseError::InitTx(e.into()))
+    }
+
+    fn path(&self) -> PathBuf {
+        self.path.clone()
+    }
+
+    fn oldest_reader_txnid(&self) -> Option<u64> {
+        let info = self.inner.info().ok()?;
+        let txnid = info.latter_reader_txnid();
+        if txnid == 0 {
+            None
+        } else {
+            Some(txnid)
+        }
+    }
+
+    fn last_txnid(&self) -> Option<u64> {
+        let info = self.inner.info().ok()?;
+        let txnid = info.last_txnid();
+        if txnid == 0 {
+            None
+        } else {
+            Some(txnid as u64)
+        }
     }
 }
 
@@ -508,6 +534,7 @@ impl DatabaseEnv {
 
         let env = Self {
             inner: inner_env.open(path).map_err(|e| DatabaseError::Open(e.into()))?,
+            path: path.to_path_buf(),
             dbis: Arc::default(),
             metrics: None,
             _lock_file,
@@ -520,6 +547,15 @@ impl DatabaseEnv {
     pub fn with_metrics(mut self) -> Self {
         self.metrics = Some(DatabaseEnvMetrics::new().into());
         self
+    }
+
+    /// Enables metrics on the database if requested.
+    pub fn with_metrics_if(self, enabled: bool) -> Self {
+        if enabled {
+            self.with_metrics()
+        } else {
+            self
+        }
     }
 
     /// Creates all the tables defined in [`Tables`], if necessary.

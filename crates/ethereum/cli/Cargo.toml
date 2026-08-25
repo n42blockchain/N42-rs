@@ -88,10 +88,13 @@ tempfile.workspace = true
 [features]
 default = ["jemalloc", "reth-revm/portable"]
 
-dev = ["reth-cli-commands/arbitrary"]
-
 otlp = ["reth-tracing/otlp", "reth-node-core/otlp"]
 otlp-logs = ["reth-tracing/otlp-logs", "reth-node-core/otlp-logs"]
+
+dev = ["reth-cli-commands/arbitrary"]
+
+jit = ["reth-node-ethereum/jit"]
+gmp = ["reth-node-ethereum/gmp"]
 
 asm-keccak = [
     "reth-node-core/asm-keccak",
@@ -140,6 +143,3 @@ min-trace-logs = [
     "tracing/release_max_level_trace",
     "reth-node-core/min-trace-logs",
 ]
-
-rocksdb = ["reth-cli-commands/rocksdb"]
-edge = ["rocksdb"]

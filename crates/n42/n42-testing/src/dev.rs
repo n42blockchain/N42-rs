@@ -75,9 +75,127 @@ fn get_addresses_from_extra_data(extra_data: Bytes) -> Vec<Address> {
     signers
 }
 
+/// Applies a test action to one consensus instance: sets the signer key, then
+/// replaces the pending proposals with `vote`.
+#[cfg(test)]
+type ConsensusSetup =
+    Arc<dyn Fn(String, Option<(Address, bool)>) -> eyre::Result<()> + Send + Sync>;
+
+/// Reads the APoS snapshot at a block from one consensus instance.
+#[cfg(test)]
+type SnapshotReader =
+    Arc<dyn Fn(u64, B256) -> eyre::Result<n42_primitives::Snapshot> + Send + Sync>;
+
+/// Wraps [`N42ConsensusBuilder`] and publishes setters for every consensus it builds.
+///
+/// The node's consensus is not reachable from `FullNode`, and these tests re-sign each
+/// block with a different authorized signer, so the key cannot just be baked into
+/// `DevArgs` once at launch. Capturing each `Arc<APos>` as it is built keeps that on the
+/// test side instead of widening the reth fork.
+///
+/// A node builds consensus twice — once for the consensus component and once inside
+/// [`N42PayloadServiceBuilder`] — and the two instances hold independent signer state.
+/// Payload building reads the second one, so every captured instance has to be set.
+#[cfg(test)]
+#[derive(Default, Clone)]
+struct CapturingConsensusBuilder {
+    setups: Arc<std::sync::Mutex<Vec<ConsensusSetup>>>,
+    snapshots: Arc<std::sync::Mutex<Vec<SnapshotReader>>>,
+}
+
+#[cfg(test)]
+impl CapturingConsensusBuilder {
+    /// Arms every consensus instance this builder produced for the next block: signs
+    /// with `key` and casts `vote` (an authorization vote on an address), if any.
+    fn arm(&self, key: &str, vote: Option<(Address, bool)>) -> eyre::Result<()> {
+        let setups = self
+            .setups
+            .lock()
+            .map_err(|e| eyre::eyre!("consensus setups lock poisoned: {e}"))?
+            .clone();
+        eyre::ensure!(!setups.is_empty(), "consensus builder never ran");
+        for setup in setups {
+            setup(key.to_string(), vote)?;
+        }
+        Ok(())
+    }
+
+    /// Reads the APoS snapshot at `(number, hash)`. All captured instances share the
+    /// same provider, so the first one is representative.
+    fn snapshot(&self, number: u64, hash: B256) -> eyre::Result<n42_primitives::Snapshot> {
+        let reader = self
+            .snapshots
+            .lock()
+            .map_err(|e| eyre::eyre!("snapshot readers lock poisoned: {e}"))?
+            .first()
+            .cloned()
+            .ok_or_else(|| eyre::eyre!("consensus builder never ran"))?;
+        reader(number, hash)
+    }
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for CapturingConsensusBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CapturingConsensusBuilder").finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+impl<Node> reth_node_builder::components::ConsensusBuilder<Node> for CapturingConsensusBuilder
+where
+    Node: FullNodeTypes<Types: NodeTypes<ChainSpec = ChainSpec, Primitives = reth_ethereum_primitives::EthPrimitives>>,
+{
+    type Consensus = Arc<n42_clique::APos<<Node as FullNodeTypes>::Provider, ChainSpec>>;
+
+    async fn build_consensus(
+        self,
+        ctx: &reth_node_builder::BuilderContext<Node>,
+    ) -> eyre::Result<Self::Consensus> {
+        let consensus = <n42_engine_types::N42ConsensusBuilder as reth_node_builder::components::ConsensusBuilder<Node>>::build_consensus(
+            n42_engine_types::N42ConsensusBuilder::default(),
+            ctx,
+        )
+        .await?;
+        let handle = consensus.clone();
+        self.setups
+            .lock()
+            .map_err(|e| eyre::eyre!("consensus setups lock poisoned: {e}"))?
+            .push(Arc::new(move |key: String, vote: Option<(Address, bool)>| {
+                type Block = reth_ethereum_primitives::Block;
+                <_ as Consensus<Block>>::set_eth_signer_by_key(&*handle, Some(key))?;
+                // Each block casts at most one vote, so clear whatever the previous
+                // block left pending before arming the next one.
+                for address in
+                    <_ as Consensus<Block>>::proposals(&*handle)?.keys().copied().collect::<Vec<_>>()
+                {
+                    <_ as Consensus<Block>>::discard(&*handle, address)?;
+                }
+                if let Some((address, auth)) = vote {
+                    <_ as Consensus<Block>>::propose(&*handle, address, auth)?;
+                }
+                Ok(())
+            }));
+        let handle = consensus.clone();
+        self.snapshots
+            .lock()
+            .map_err(|e| eyre::eyre!("snapshot readers lock poisoned: {e}"))?
+            .push(Arc::new(move |number: u64, hash: B256| {
+                Ok(<_ as Consensus<reth_ethereum_primitives::Block>>::snapshot(
+                    &*handle, number, hash, None,
+                )?)
+            }));
+        Ok(consensus)
+    }
+}
+
 #[cfg(test)]
 async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(
-    node: &FullNode<Node, AddOns>, eth_signer_key: String) -> eyre::Result<()>
+    node: &FullNode<Node, AddOns>,
+    eth_signer_key: String,
+    vote: Option<(Address, bool)>,
+    consensus: &CapturingConsensusBuilder,
+) -> eyre::Result<()>
     where
     // replaces the old PayloadBuilderAttributes: From<EthPayloadBuilderAttributes>
     // bound; upstream removed that associated type
@@ -112,8 +230,9 @@ async fn new_block<Node: FullNodeComponents, AddOns: RethRpcAddOns<Node>>(
         PrivateKeySigner::from_bytes(&FixedBytes::from_str(&eth_signer_key).unwrap()).unwrap();
     let eth_signer_address = eth_signer.address();
     let attributes = n42_payload_attributes(timestamp, parent_hash, eth_signer_address);
-    // TODO: In reth v1.5.0, consensus field is private. Need to refactor to access through trait.
-    // node.consensus.set_eth_signer_by_key(Some(eth_signer_key.clone()))?;
+    // Without a signer APoS cannot seal, the payload job fails, and every test here
+    // dies on "missing payload".
+    consensus.arm(&eth_signer_key, vote)?;
     let payload_id = node
         .payload_builder_handle
         .send_new_payload(reth_payload_builder::BuildNewPayload {
@@ -221,10 +340,18 @@ impl CliqueTest {
                 ..Default::default()
             });
 
+        let capturing_consensus = CapturingConsensusBuilder::default();
         let NodeHandle { node, .. } = NodeBuilder::new(node_config.clone())
             .testing_node(runtime.clone())
             .with_types::<N42Node>()
-            .with_components(N42Node::default().components_builder())
+            .with_components(
+                N42Node::default()
+                    .components_builder()
+                    .consensus(capturing_consensus.clone())
+                    .payload(n42_engine_types::N42PayloadServiceBuilder::new(
+                        capturing_consensus.clone(),
+                    )),
+            )
             .with_add_ons(N42Node::default().add_ons())
             .launch()
             .await?;
@@ -237,21 +364,26 @@ impl CliqueTest {
         // This needs to be fixed by implementing a proper way to access consensus through NodeAddOns.
 
         for vote in &self.votes {
+            let vote_cast = vote
+                .voted
+                .as_ref()
+                .map(|voted| (accounts.address(voted), vote.auth.unwrap_or(true)));
             let eth_signer_key = hex::encode(accounts.secret_key(&vote.signer).secret_bytes());
             println!("signer={} eth_signer_key={eth_signer_key:?}", vote.signer);
-            // Skip vote processing for now - consensus access needs refactoring
-            new_block(&node, eth_signer_key).await?;
+            new_block(&node, eth_signer_key, vote_cast, &capturing_consensus).await?;
         }
         let best_number = node.provider.chain_info().unwrap().best_number;
         let block_hash = node.provider.block_hash(best_number).unwrap().unwrap();
         println!("best_number={best_number:?}, block_hash={block_hash:?}");
 
-        // Skip snapshot verification for now - consensus access needs refactoring
-        // let snapshot = consensus.snapshot(best_number, block_hash, None).unwrap();
-        // println!("snapshot={snapshot:?}");
-        // let expected_signers: Vec<Address> = self.results.iter()
-        //     .map(|a| accounts.address(a)).collect();
-        // assert_eq!(snapshot.signers, expected_signers);
+        let snapshot = capturing_consensus.snapshot(best_number, block_hash)?;
+        println!("snapshot={snapshot:?}");
+        let mut expected_signers: Vec<Address> =
+            self.results.iter().map(|a| accounts.address(a)).collect();
+        expected_signers.sort_unstable();
+        let mut actual_signers = snapshot.signers.clone();
+        actual_signers.sort_unstable();
+        assert_eq!(actual_signers, expected_signers);
 
         let first_event = payload_event_stream.next().await.unwrap()?;
         let second_event = payload_event_stream.next().await.unwrap()?;

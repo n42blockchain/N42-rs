@@ -8040,6 +8040,7 @@ dependencies = [
  "n42-clique-utils",
  "n42-engine-primitives",
  "n42-engine-types",
+ "n42-primitives",
  "rand 0.9.5",
  "reth",
  "reth-basic-payload-builder",

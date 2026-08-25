@@ -102,9 +102,13 @@ pub mod providers {
     pub use reth_provider::*;
 }
 
-/// Re-exported from `reth_primitives`.
+/// Re-exported from `reth_ethereum_primitives` and `reth_primitives_traits`.
+///
+/// Was `reth_primitives::*`, which reth 2.4.1 deletes; these are the two crates
+/// its contents actually came from.
 pub mod primitives {
-    pub use reth_primitives::*;
+    pub use reth_ethereum_primitives::*;
+    pub use reth_primitives_traits::*;
 }
 
 /// Re-exported from `reth_ethereum_consensus`.

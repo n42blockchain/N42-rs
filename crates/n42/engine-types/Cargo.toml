@@ -36,7 +36,6 @@ reth-consensus.workspace = true
 #reth-auto-seal-consensus.workspace = true
 reth-revm.workspace = true
 reth-tasks.workspace = true
-reth-primitives.workspace = true
 reth-primitives-traits.workspace = true
 reth-storage-api.workspace = true
 reth-ethereum-primitives.workspace = true

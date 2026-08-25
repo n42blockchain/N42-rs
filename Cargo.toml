@@ -314,7 +314,8 @@ reth-payload-builder = { git = "https://github.com/paradigmxyz/reth.git", tag = 
 reth-payload-primitives = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 reth-payload-builder-primitives = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 reth-payload-validator = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
-reth-primitives = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0", default-features = false, features = ["std"] }
+# reth-primitives was deprecated upstream and is deleted in reth 2.4.1 (#23220).
+# Its contents live in reth-ethereum-primitives + reth-primitives-traits.
 reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0", default-features = false }
 reth-provider = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }
 reth-prune = { git = "https://github.com/paradigmxyz/reth.git", tag = "v1.11.0" }

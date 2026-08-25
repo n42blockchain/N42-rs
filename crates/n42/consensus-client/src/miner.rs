@@ -28,8 +28,10 @@ use reth_network_p2p::{
 use reth_payload_builder::PayloadBuilderHandle;
 use reth_payload_primitives::EngineApiMessageVersion;
 use reth_payload_primitives::{BuiltPayload, PayloadAttributesBuilder, PayloadKind, PayloadTypes};
-use reth_primitives::TransactionSigned;
-use reth_primitives::{Block, Header, SealedBlock};
+use reth_ethereum_primitives::{Block, TransactionSigned};
+use reth_primitives_traits::Header;
+// reth-primitives (deleted in reth 2.4.1) supplied this default type argument.
+type SealedBlock<B = Block> = reth_primitives_traits::SealedBlock<B>;
 use n42_clique_utils::{recover_address, recover_address_generic};
 use reth_primitives_traits::Block as BlockTrait;
 use reth_primitives_traits::{AlloyBlockHeader, BlockBody, NodePrimitives};
@@ -185,7 +187,9 @@ where
         + 'static + Clone,
     B: PayloadAttributesBuilderExt<<T as PayloadTypes>::PayloadAttributes>,
     Network: FullNetwork,
-    Network: BlockAnnounceProvider<Block = Block<TransactionSigned>>,
+    // reth_ethereum_primitives::Block is already Block<TransactionSigned>;
+    // reth-primitives' alias was generic over the transaction type, this one is not.
+    Network: BlockAnnounceProvider<Block = Block>,
     <<Network as BlockDownloaderProvider>::Client as BlockClient>::Block: reth_primitives_traits::Block<Header = reth_primitives_traits::Header>,
     <<<Network as BlockDownloaderProvider>::Client as BlockClient>::Block as reth_primitives_traits::Block>::Body: BlockBody< Transaction = TransactionSigned>,
     <<Network as NetworkEventListenerProvider>::Primitives as NetworkPrimitives>::Block: reth_primitives_traits::Block<Header = reth_primitives_traits::Header>,

@@ -9,6 +9,7 @@ repository.workspace = true
 exclude.workspace = true
 
 [dependencies]
+reth-ethereum-primitives.workspace = true
 ethereum_serde_utils = "0.7"
 hex-literal = "0.3"
 hex = "0.4"
@@ -18,7 +19,9 @@ derivative.workspace = true
 ethereum_hashing.workspace = true
 ethereum_ssz.workspace = true
 ethereum_ssz_derive.workspace = true
-arbitrary.workspace = true
+# `derive` is required: this crate uses `arbitrary::Arbitrary` derives that used
+# to come via reth_primitives' re-export of the crate.
+arbitrary = { workspace = true, features = ["derive"] }
 integer-sqrt.workspace = true
 thiserror.workspace = true
 alloy-eips.workspace = true
@@ -27,10 +30,9 @@ alloy-sol-types.workspace = true
 eyre.workspace = true
 serde_json.workspace=true
 #reth
-reth-primitives = { workspace = true, default-features = false, features = ["std","arbitrary"] }
 reth-primitives-traits.workspace = true
 alloy-rlp.workspace = true
-alloy-primitives.workspace = true
+alloy-primitives = { workspace = true, features = ["arbitrary"] }
 reth-codecs.workspace = true
 
 # arbitrary utils

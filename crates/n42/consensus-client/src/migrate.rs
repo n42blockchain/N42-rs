@@ -21,7 +21,10 @@ use reth_payload_builder::{PayloadBuilderHandle, PayloadBuilderService};
 use reth_payload_primitives::{
     BuiltPayload, EngineApiMessageVersion, PayloadAttributesBuilder, PayloadKind, PayloadTypes,
 };
-use reth_primitives::{Recovered, SealedBlock, TransactionSigned};
+use reth_ethereum_primitives::TransactionSigned;
+use reth_primitives_traits::Recovered;
+// reth-primitives (deleted in reth 2.4.1) supplied this default type argument.
+type SealedBlock<B = reth_ethereum_primitives::Block> = reth_primitives_traits::SealedBlock<B>;
 use reth_primitives_traits::{AlloyBlockHeader, BlockBody, NodePrimitives, SignedTransaction};
 use reth_provider::{
     BeaconProvider, BeaconProviderWriter, BlockIdReader, BlockReader, ChainSpecProvider,

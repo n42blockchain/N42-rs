@@ -6,7 +6,10 @@ use alloy_rpc_types_beacon::requests::ExecutionRequestsV4;
 use blst::min_pk::{PublicKey, Signature};
 use merkle_db_rs::tree::{Tree, VecTree};
 use reth_chainspec::EthereumHardforks;
-use reth_primitives::{Block, Header, SealedBlock};
+use reth_ethereum_primitives::Block;
+use reth_primitives_traits::Header;
+// reth-primitives (deleted in reth 2.4.1) supplied this default type argument.
+type SealedBlock<B = Block> = reth_primitives_traits::SealedBlock<B>;
 use reth_primitives_traits::AlloyBlockHeader;
 use reth_provider::{
     BeaconProvider, BeaconProviderWriter, BlockIdReader, BlockReader, ChainSpecProvider,

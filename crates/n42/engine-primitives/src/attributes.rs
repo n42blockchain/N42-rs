@@ -58,6 +58,11 @@ where
                 .chain_spec
                 .is_cancun_active_at_timestamp(timestamp)
                 .then(Default::default),
+            // Added upstream after this crate was written. N42 does not drive
+            // either: slots are a CL concept APoS has no equivalent for, and the
+            // gas-limit target is left to the builder's own configuration.
+            slot_number: None,
+            target_gas_limit: None,
         }
     }
 }

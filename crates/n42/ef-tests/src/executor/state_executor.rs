@@ -245,7 +245,8 @@ impl StateTestExecutor {
             .build();
 
         // Set state clear flag based on fork (EIP-161)
-        state_db.set_state_clear_flag(spec_id >= SpecId::SPURIOUS_DRAGON);
+        // revm 42: state-clear (EIP-161) is derived from the spec id in the
+        // journal; State::set_state_clear_flag no longer exists.
 
         // Create EVM environment and execute using EthEvmConfig
         let evm_env = EvmEnv {
@@ -689,6 +690,8 @@ impl StateTestExecutor {
         });
 
         BlockEnv {
+            // EIP-7843 slot number; EF fixtures do not carry one.
+            slot_num: 0,
             number: U256::from(env.current_number),
             beneficiary: env.current_coinbase,
             timestamp: U256::from(env.current_timestamp),

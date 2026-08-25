@@ -15,6 +15,7 @@ use reth_ethereum_payload_builder::EthereumExecutionPayloadValidator;
 use reth_ethereum_primitives::{Block, EthPrimitives};
 use reth_node_api::PayloadTypes;
 use reth_payload_primitives::{
+    BuiltPayloadExecutedBlock,
     validate_execution_requests, validate_version_specific_fields, EngineApiMessageVersion,
     EngineObjectValidationError, InvalidPayloadAttributesError, NewPayloadError,
     PayloadOrAttributes,
@@ -175,8 +176,26 @@ where
         ))
     }
 
-    fn on_inserted_executed_block(&self, _block: ExecutedBlock<EthPrimitives>) {
-        // No-op for this simplified implementation
-        // In a full implementation, this would update caches or perform other bookkeeping
+    fn on_inserted_executed_block(
+        &self,
+        _block: BuiltPayloadExecutedBlock<EthPrimitives>,
+    ) -> reth_errors::ProviderResult<reth_chain_state::ExecutedBlock<EthPrimitives>> {
+        // Upstream changed this from a notification to a function that must return
+        // the executed block. This validator is a stub whose `execute` already
+        // errors with "use BasicEngineValidator"; fabricating an ExecutedBlock here
+        // would be worse than saying so.
+        Err(reth_errors::ProviderError::UnsupportedProvider)
+    }
+
+    /// Upstream added this to the trait; this simplified validator loans no
+    /// resources to payload-builder jobs, so the default set is correct.
+    fn payload_builder_resources(
+        &self,
+        _parent_hash: alloy_primitives::B256,
+        _parent_header: &<EthPrimitives as reth_node_api::NodePrimitives>::BlockHeader,
+        _timestamp: u64,
+        _state: &mut reth_engine_tree::tree::EngineApiTreeState<EthPrimitives>,
+    ) -> reth_payload_builder::PayloadBuilderResources {
+        Default::default()
     }
 }

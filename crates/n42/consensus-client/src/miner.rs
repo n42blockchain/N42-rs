@@ -511,7 +511,7 @@ where
                 let forkchoice_state = self.forkchoice_state_with_head(block.hash())?;
                 match self
                     .beacon_engine_handle
-                    .fork_choice_updated(forkchoice_state, None, EngineApiMessageVersion::default())
+                    .fork_choice_updated(forkchoice_state, None)
                     .await
                 {
                     Ok(v) => {
@@ -923,7 +923,6 @@ where
             .fork_choice_updated(
                 forkchoice_state,
                 Some(payload_attributes),
-                EngineApiMessageVersion::default(),
             )
             .await?;
         if !res.payload_status.is_valid() {
@@ -1053,7 +1052,7 @@ where
                 versioned_hashes: block.blob_versioned_hashes_iter().copied().collect(),
             });
 
-        let execution_data = T::block_to_payload(block.clone());
+        let execution_data = T::block_to_payload(block.clone(), None);
         let res = self
             .beacon_engine_handle
             .new_payload(
@@ -1074,7 +1073,7 @@ where
         let forkchoice_state = self.forkchoice_state_with_head(block_hash)?;
         match self
             .beacon_engine_handle
-            .fork_choice_updated(forkchoice_state, None, EngineApiMessageVersion::default())
+            .fork_choice_updated(forkchoice_state, None)
             .await
         {
             Ok(v) => {
@@ -1103,7 +1102,7 @@ where
         };
         match self
             .beacon_engine_handle
-            .fork_choice_updated(forkchoice_state, None, EngineApiMessageVersion::default())
+            .fork_choice_updated(forkchoice_state, None)
             .await
         {
             Ok(v) => {

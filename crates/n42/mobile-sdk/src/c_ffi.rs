@@ -40,7 +40,7 @@ fn make_c_string(s: String) -> *mut c_char {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn rust_free_string(s: *mut c_char) {
     if s.is_null() {
         return;
@@ -51,7 +51,7 @@ pub extern "C" fn rust_free_string(s: *mut c_char) {
 }
 
 // ---------------- run_client ----------------
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn run_client_c(
     ws_url: *const c_char,
     validator_private_key: *const c_char,
@@ -99,7 +99,7 @@ pub extern "C" fn run_client_c(
 }
 
 // ---------------- generate_bls12_381_keypair ----------------
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn generate_bls12_381_keypair_c(out_error: *mut *mut c_char) -> *mut c_char {
     let mut set_error = |msg: String| {
         if !out_error.is_null() {
@@ -129,7 +129,7 @@ pub extern "C" fn generate_bls12_381_keypair_c(out_error: *mut *mut c_char) -> *
 }
 
 // ---------------- create_deposit_unsigned_tx ----------------
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn create_deposit_unsigned_tx_c(
     deposit_contract_address: *const c_char,
     validator_private_key: *const c_char,
@@ -201,7 +201,7 @@ pub extern "C" fn create_deposit_unsigned_tx_c(
 }
 
 // ---------------- create_get_exit_fee_unsigned_tx ----------------
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn create_get_exit_fee_unsigned_tx_c(out_error: *mut *mut c_char) -> *mut c_char {
     let mut set_error = |msg: String| {
         if !out_error.is_null() {
@@ -231,7 +231,7 @@ pub extern "C" fn create_get_exit_fee_unsigned_tx_c(out_error: *mut *mut c_char)
 }
 
 // ---------------- create_exit_unsigned_tx ----------------
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn create_exit_unsigned_tx_c(
     validator_public_key: *const c_char,
     fee_in_wei_or_empty: *const c_char,

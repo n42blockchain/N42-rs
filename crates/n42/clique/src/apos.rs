@@ -753,6 +753,9 @@ where
         block: &RecoveredBlock<N::Block>,
         result: &BlockExecutionResult<N::Receipt>,
         _receipt_root_bloom: Option<reth_consensus::ReceiptRootBloom>,
+        // EIP-7928 block access list hash, added upstream. APoS does not produce
+        // one, so post-execution validation ignores it.
+        _block_access_list_hash: Option<alloy_primitives::B256>,
     ) -> Result<(), ConsensusError> {
         Ok(())
     }

@@ -237,7 +237,6 @@ where
                         withdrawals,
                         header.mix_hash().unwrap_or_default()
                     )),
-                    EngineApiMessageVersion::default(),
                 )
                 .await;
             debug!(target: "consensus-client", ?res, "after first fcu");
@@ -279,7 +278,7 @@ where
             };
             match self
                 .beacon_engine_handle
-                .fork_choice_updated(forkchoice_state, None, EngineApiMessageVersion::default())
+                .fork_choice_updated(forkchoice_state, None)
                 .await
             {
                 Ok(v) => {
@@ -337,7 +336,7 @@ where
                 versioned_hashes: block.blob_versioned_hashes_iter().copied().collect(),
             });
 
-        let execution_data = T::block_to_payload(block.clone());
+        let execution_data = T::block_to_payload(block.clone(), None);
         let res = self
             .beacon_engine_handle
             .new_payload(execution_data)

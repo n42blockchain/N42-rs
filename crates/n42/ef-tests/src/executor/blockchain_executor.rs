@@ -135,7 +135,8 @@ impl BlockchainTestExecutor {
             .with_database(db)
             .with_bundle_update()
             .build();
-        state_db.set_state_clear_flag(spec_id >= SpecId::SPURIOUS_DRAGON);
+        // revm 42: state-clear (EIP-161) is derived from the spec id in the
+        // journal; State::set_state_clear_flag no longer exists.
 
         // Track the last block hash
         let mut last_block_hash = genesis_header.hash;
@@ -863,6 +864,8 @@ impl BlockchainTestExecutor {
         });
 
         BlockEnv {
+            // EIP-7843 slot number; EF fixtures do not carry one.
+            slot_num: 0,
             number: U256::from(header.number),
             beneficiary: header.coinbase,
             timestamp: U256::from(header.timestamp),

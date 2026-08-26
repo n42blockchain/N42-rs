@@ -25,7 +25,7 @@ use alloy_rpc_types_engine::PayloadAttributes;
 use n42_h2_consensus::{ConsensusEngine, EngineOutput, ValidatorInfo, ValidatorSet};
 use n42_h2_execution::{ExecutionDriver, MockExecutionLayer};
 use n42_h2_net::{H2V4Transport, TransportConfig, TransportEvent};
-use n42_h2_node::{H2Service, ServiceEvent};
+use n42_h2_node::{H2Service, ProposalContext, ServiceEvent};
 use n42_h2_primitives::bls::BlsSecretKey;
 use n42_h2_primitives::consensus::H2V4ChainIdentity;
 use tokio::sync::mpsc;
@@ -43,11 +43,11 @@ const fn identity() -> H2V4ChainIdentity {
     }
 }
 
-const fn attributes(view: u64, _head: B256) -> Option<PayloadAttributes> {
+const fn attributes(context: ProposalContext) -> Option<PayloadAttributes> {
     Some(PayloadAttributes {
         // Deterministic rather than wall-clock: a test that depends on the
         // clock fails on a loaded machine for reasons unrelated to consensus.
-        timestamp: 1_700_000_000 + view,
+        timestamp: 1_700_000_000 + context.view,
         prev_randao: B256::ZERO,
         suggested_fee_recipient: Address::ZERO,
         withdrawals: Some(Vec::new()),
@@ -247,6 +247,35 @@ async fn four_rust_nodes_reach_agreement_over_a_real_gossip_mesh() {
     assert!(view > 0, "commit must be in a real view");
     assert_ne!(block_hash, B256::ZERO, "commit must name a real block");
     assert!(index < VALIDATORS);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn followers_commit_only_after_bodies_arrive_over_the_block_topic() {
+    // The proposal names a hash; the body has to reach the followers some
+    // other way, and gov5's way is the fork-scoped block topic. With one
+    // proposer, nobody else ever builds the block, so a follower that commits
+    // has necessarily received the body over gossip, executed it, and voted.
+    //
+    // This is what `four_rust_nodes_reach_agreement` cannot show: there every
+    // node proposes, and the mock builds the same block for each of them.
+    let nodes = build_fleet(&[0]).await;
+
+    let mut bodies_at = std::collections::HashSet::new();
+    let committed = run_until(nodes, Duration::from_secs(60), |index, event| {
+        if matches!(event, ServiceEvent::BodyReceived { .. }) {
+            bodies_at.insert(index);
+        }
+        index > 0 && matches!(event, ServiceEvent::Committed { .. })
+    })
+    .await;
+
+    let Some((index, ServiceEvent::Committed { block_hash, .. })) = committed else {
+        panic!("no follower committed a block within the budget");
+    };
+    assert!(
+        bodies_at.contains(&index),
+        "follower {index} committed {block_hash} without ever receiving a body",
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

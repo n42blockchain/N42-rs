@@ -27,6 +27,11 @@ async-trait = "0.1"
 tokio = { workspace = true, features = ["rt", "macros"] }
 
 alloy-primitives = { workspace = true, features = ["serde"] }
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-rlp.workspace = true
+alloy-rpc-types-engine.workspace = true
+hex.workspace = true
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 tracing.workspace = true

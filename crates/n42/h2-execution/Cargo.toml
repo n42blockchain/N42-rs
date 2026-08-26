@@ -13,6 +13,7 @@ description = "Execution-layer seam and driver connecting HotStuff-2 consensus t
 n42-h2-consensus.workspace = true
 alloy-primitives = { workspace = true, features = ["serde"] }
 alloy-rpc-types-engine.workspace = true
+alloy-consensus.workspace = true
 async-trait = "0.1"
 thiserror.workspace = true
 tracing.workspace = true

@@ -53,8 +53,18 @@ cargo run --release --bin n42 -- node --chain crates/chainspec/res/genesis/n42_d
 Caveat: `tests/e2e.sh` passes `--chain n42-devnet`, but the vendored
 `crates/ethereum/cli/src/chainspec.rs` currently maps only `mainnet|sepolia|holesky|hoodi|dev` and falls
 through to `parse_genesis()` for anything else — the `n42`/`n42-devnet` names were dropped during a reth
-re-sync even though `N42` and `N42_DEVNET` still exist in `crates/chainspec`. Pass a genesis JSON path, or
-restore the names in `chain_value_parser` + `SUPPORTED_CHAINS`.
+re-sync even though `N42` and `N42_DEVNET` still exist in `crates/chainspec`. Pass a genesis JSON path:
+`--chain crates/chainspec/res/genesis/n42_devnet.json`.
+
+`n42_devnet.json` is the native chain's devnet: `"stateScheme": "qmdb"`, `"consensus": "hotstuff"`
+with four dev validators (secrets in `n42_devnet_validators.json`, derived from a public seed — dev
+only), every Ethereum fork through Osaka active at genesis, and the Prague system contracts in the
+alloc. Both `--chain <path>` and the `N42_DEVNET` constant build its genesis header the same way, with
+the QMDB root of the alloc; a genesis file that declares its own fork schedule is trusted over the
+legacy `N42_HARDFORKS` list. The same file is what a gov5 node is initialised from (`n42 init`).
+On a chain whose genesis names a `hotstuff` validator set `bin/n42` spawns no APoS miner: the fleet
+(`cargo run -p n42-h2-node --example h2_validator -- --chain <genesis> --propose …`) drives it over
+the Engine API, and `--dev.consensus-signer-private-key` only seals what the fleet asks for.
 
 `cargo build`/`cargo test` with no `-p` only touches `default-members` (`bin/n42`). Use `--workspace`
 deliberately — it is a very large build.
@@ -137,7 +147,7 @@ Key N42 crates:
 | `crates/n42/{h2-primitives,h2-wire,h2-consensus}` | HotStuff-2 interop: BLS + message types, the Go↔Rust v4 wire codec, and validator-set + finality verification. Ported from `../N42-26`; tested against gov5's byte-exact fixtures. |
 | `crates/n42/mobile-verify` | Mobile verification formats: receipts, BLS attestations, twig/SBMT state proofs. Distinct from `mobile-sdk`, which is validator key/deposit tooling. |
 | `crates/n42/h2-execution` | Execution-layer seam (`ExecutionLayer`: Engine API in alloy types, no reth types) plus the driver connecting HotStuff-2 to it. A concrete reth adapter is not yet written — see `docs/N42_26_PORT.md`. |
-| `crates/n42/h2-net` | gov5-compatible GossipSub transport, the `/rpc/status/1/ssz_snappy` handshake (without which gov5 drops the peer), and a read-only finality observer. `cargo run -p n42-h2-net --example h2_observer -- --help`. The libp2p `secp256k1` feature is load-bearing — gov5 nodes use secp256k1 identities and the Noise handshake fails without it. |
+| `crates/n42/h2-net` | gov5-compatible GossipSub transport, the `/rpc/status/1/ssz_snappy` handshake (without which gov5 drops the peer), gov5's block-body topic (`block_gossip`: `/n42/<fork digest>/block/ssz_snappy`, RLP `[header, txs, verifiers, rewards]` — a proposal names only a hash, so without this followers cannot vote), and a read-only finality observer. `cargo run -p n42-h2-net --example h2_observer -- --help`. The libp2p `secp256k1` feature is load-bearing — gov5 nodes use secp256k1 identities and the Noise handshake fails without it. |
 | `crates/n42/n42-testing` | Integration tests for APoS signer voting — the suite CI runs. Tests live in `src/dev.rs` behind `#[cfg(test)]`, not in `tests/`. |
 | `crates/n42/ef-tests` | Ethereum Foundation state/blockchain/transaction spec-test runner. |
 

@@ -17,6 +17,7 @@
 //! and the layer that drives it from these events is the node service.
 //! See `docs/N42_26_PORT.md`.
 
+pub mod block_gossip;
 pub mod config;
 pub mod message_id;
 pub mod observer;
@@ -25,6 +26,10 @@ pub mod status;
 pub mod topic;
 pub mod transport;
 
+pub use block_gossip::{
+    decode_block_gossip, encode_block_gossip, gov5_block_topic, gov5_header_view, BlockGossipError,
+    GossipBlock, HeaderProfile,
+};
 pub use config::{gov5_gossipsub_config, max_gossip_wire_size};
 pub use message_id::{gov5_message_id_fn, gov5_message_id_parts};
 pub use observer::{H2V4Observer, ObserverConfig, ObserverError, ObserverEvent};

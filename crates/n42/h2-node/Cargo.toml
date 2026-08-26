@@ -31,6 +31,8 @@ libp2p = { workspace = true, default-features = false }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 n42-h2-el-rpc.workspace = true
 n42-mobile-service.workspace = true
+n42-qmdb-reth.workspace = true
+reth-cli.workspace = true
 url.workspace = true
 
 [lints]

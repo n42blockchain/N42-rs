@@ -195,7 +195,17 @@ fn main() {
                 None
             };
 
-            let mining_mode = if let Some(_) = consensus_signer_private_key {
+            // A chain whose genesis names a HotStuff-2 validator set is driven
+            // over the Engine API by those validators (`h2_validator`); the
+            // signer key still seals the blocks they ask for, but APoS block
+            // production would race their forkchoice and lose.
+            let hotstuff_chain =
+                n42_qmdb_reth::HotStuffGenesisConfig::from_genesis(node.chain_spec().genesis())
+                    .is_ok();
+            let mining_mode = if hotstuff_chain {
+                info!(target: "reth::cli", "chain declares a HotStuff-2 validator set; APoS mining is off");
+                consensus_client::miner::MiningMode::NoMining
+            } else if let Some(_) = consensus_signer_private_key {
                 let block_time = node_config_dev
                     .dev
                     .block_time
@@ -225,6 +235,10 @@ fn main() {
                     migrate_from_db_path,
                     migrate_from_db_rpc,
                 );
+            } else if hotstuff_chain {
+                // No miner at all, not merely a miner with mining off: the
+                // miner also re-proposes when the chain looks stalled, which
+                // on a HotStuff-2 chain is just the fleet pacing itself.
             } else {
                 N42Miner::spawn_new(
                     node.provider.clone(),

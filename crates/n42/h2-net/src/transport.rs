@@ -36,6 +36,7 @@ use n42_h2_wire::h2_v4::{decode_gossip, encode_gossip, H2V4Envelope, H2V4Error};
 use crate::config::gov5_gossipsub_config;
 use crate::rpc::{status_behaviour, StatusBehaviour};
 use crate::status::Status;
+use crate::block_gossip::gov5_block_topic;
 use crate::topic::h2_v4_topic;
 
 /// Errors that stop a transport from starting.
@@ -179,6 +180,15 @@ pub enum TransportEvent {
         /// Why it was rejected.
         reason: String,
     },
+    /// A block body arrived on the chain's block topic, still compressed.
+    /// Which header shapes to accept is the consumer's decision — see
+    /// [`crate::block_gossip::HeaderProfile`] — so it is not decoded here.
+    Block {
+        /// The peer that delivered it, when authored.
+        from: Option<PeerId>,
+        /// The raw-snappy payload.
+        data: Vec<u8>,
+    },
     /// The transport joined the v4 topic.
     Subscribed,
     /// A fleet member connected.
@@ -224,6 +234,8 @@ pub(crate) struct H2Behaviour {
 pub struct H2V4Transport {
     swarm: Swarm<H2Behaviour>,
     topic: IdentTopic,
+    /// Where block bodies travel; bound to the chain by its fork digest.
+    block_topic: IdentTopic,
     identity: H2V4ChainIdentity,
     mesh_peers: HashSet<PeerId>,
     /// Events produced before the loop starts (dials that failed immediately).
@@ -279,6 +291,17 @@ impl H2V4Transport {
                 topic: topic.to_string(),
                 source,
             })?;
+        // Bodies travel separately from proposals; a validator that joins only
+        // the consensus topic hears every proposal and can vote on none.
+        let block_topic = gov5_block_topic(config.identity.genesis_hash);
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&block_topic)
+            .map_err(|source| TransportError::Subscribe {
+                topic: block_topic.to_string(),
+                source,
+            })?;
 
         for addr in &config.listen_addrs {
             swarm
@@ -304,6 +327,7 @@ impl H2V4Transport {
         Ok(Self {
             swarm,
             topic,
+            block_topic,
             identity: config.identity,
             mesh_peers: HashSet::new(),
             pending_events: dial_errors,
@@ -369,6 +393,18 @@ impl H2V4Transport {
             .publish(self.topic.clone(), payload)?)
     }
 
+    /// Publishes an already-encoded block body on the chain's block topic.
+    ///
+    /// Takes the compressed bytes from [`crate::block_gossip::encode_block_gossip`]
+    /// rather than a payload, so the profile decision stays with the caller.
+    pub fn publish_block(&mut self, data: Vec<u8>) -> Result<gossipsub::MessageId, PublishError> {
+        Ok(self
+            .swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(self.block_topic.clone(), data)?)
+    }
+
     /// Drives the swarm until something worth reporting happens.
     ///
     /// Returns `None` only if the swarm stream ends, which it does not do in
@@ -384,6 +420,12 @@ impl H2V4Transport {
                     message,
                     ..
                 })) => {
+                    if message.topic == self.block_topic.hash() {
+                        return Some(TransportEvent::Block {
+                            from: message.source,
+                            data: message.data,
+                        });
+                    }
                     if message.topic != self.topic.hash() {
                         continue;
                     }

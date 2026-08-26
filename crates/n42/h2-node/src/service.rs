@@ -49,6 +49,7 @@
 //! deadline on every iteration. Dropping that arm is what turns a node that
 //! looks connected into one that silently stops voting.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use alloy_primitives::B256;
@@ -56,7 +57,9 @@ use n42_h2_consensus::wire_bridge::{self, BridgeError};
 use n42_h2_consensus::{ConsensusEngine, ConsensusEvent, EngineOutput};
 use n42_h2_execution::{DriverAction, ExecutionDriver, ExecutionLayer};
 use alloy_rpc_types_engine::PayloadAttributes;
-use n42_h2_net::{H2V4Transport, TransportEvent};
+use n42_h2_net::{
+    decode_block_gossip, encode_block_gossip, H2V4Transport, HeaderProfile, TransportEvent,
+};
 use n42_h2_primitives::consensus::{H2V4ChainIdentity, QuorumCertificate};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -64,7 +67,8 @@ use tracing::{debug, info, warn};
 /// Decides what a leader proposes for a view, given the view number and the
 /// current head. `None` declines the view — see
 /// [`H2Service::with_payload_attributes`].
-type PayloadAttributesBuilder = dyn Fn(u64, B256) -> Option<PayloadAttributes> + Send + Sync;
+type PayloadAttributesBuilder =
+    dyn Fn(ProposalContext) -> Option<PayloadAttributes> + Send + Sync;
 
 /// How many views one step may propose for before going back to the network.
 ///
@@ -123,6 +127,12 @@ pub enum ServiceEvent {
         /// The block that could not be executed.
         block_hash: B256,
     },
+    /// A block body arrived over the block topic and is now cached. If
+    /// consensus was waiting on it, execution is retried in the same step.
+    BodyReceived {
+        /// The block the body belongs to.
+        block_hash: B256,
+    },
     /// The view advanced.
     ViewChanged {
         /// The view now current.
@@ -165,6 +175,58 @@ pub struct H2Service<E> {
     meshed: bool,
     /// Persists consensus state before a commit is announced as final.
     checkpoint: Option<Box<CheckpointWriter>>,
+    /// The builder declined to propose for the current view — the period had
+    /// not elapsed — so the next step must not wait for the view to time out
+    /// before asking again. See [`PROPOSE_RETRY`].
+    proposal_deferred: bool,
+    /// Which header shapes this node puts on, and accepts from, the block
+    /// topic. See [`HeaderProfile`].
+    header_profile: HeaderProfile,
+    /// Blocks consensus asked to execute before their bodies arrived. A body
+    /// for one of these re-runs the execution instead of waiting for the next
+    /// proposal to mention the block again, which it may never do.
+    awaiting_bodies: HashSet<B256>,
+    /// Bodies that arrived for awaited blocks, to execute on the next drain.
+    /// Kept separate because the transport handler cannot await.
+    ready_bodies: Vec<B256>,
+    /// Every body that arrived since the last drain, for reporting.
+    received_bodies: Vec<B256>,
+    /// Block bodies the mesh would not accept yet; retried like `outbox`.
+    body_outbox: Vec<Vec<u8>>,
+    /// Timestamps of blocks this node has seen the body of, for
+    /// [`ProposalContext::head_timestamp`]. Bounded; insertion order in
+    /// `timestamp_order`.
+    block_timestamps: std::collections::HashMap<B256, u64>,
+    timestamp_order: Vec<B256>,
+}
+
+/// How long a leader whose builder declined waits before asking it again.
+///
+/// A declined proposal is a pacing decision — the chain's period has not
+/// elapsed since the parent — and nothing else is due to happen in a view
+/// where the leader has not proposed. Without this the next ask comes at the
+/// view timeout, and every other view is lost to it. gov5 paces its own
+/// re-asks at `minProposeDelayMs`, 200ms on the devnet.
+const PROPOSE_RETRY: Duration = Duration::from_millis(200);
+
+/// How many block timestamps to remember. Far more than any head-selection
+/// needs; the bound is against a peer flooding bodies, not a working set.
+const REMEMBERED_TIMESTAMPS: usize = 256;
+
+/// What a leader knows when deciding whether, and how, to propose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProposalContext {
+    /// The view being proposed for.
+    pub view: u64,
+    /// The block the proposal would build on.
+    pub head: B256,
+    /// The head's timestamp, when this node has seen the block — its own
+    /// builds and every body received over the block topic. `None` after a
+    /// restart, or for a head whose body never came this way. A builder paces
+    /// against this: an Engine API timestamp is a whole second and must be
+    /// strictly greater than the parent's, and only the parent's timestamp
+    /// says what that means.
+    pub head_timestamp: Option<u64>,
 }
 
 /// Persists the engine's state. Called before a commit reaches the execution
@@ -209,7 +271,26 @@ impl<E: ExecutionLayer> H2Service<E> {
             proposed_view: None,
             meshed: false,
             checkpoint: None,
+            proposal_deferred: false,
+            header_profile: HeaderProfile::Ethereum,
+            awaiting_bodies: HashSet::new(),
+            ready_bodies: Vec::new(),
+            received_bodies: Vec::new(),
+            body_outbox: Vec::new(),
+            block_timestamps: std::collections::HashMap::new(),
+            timestamp_order: Vec::new(),
         }
+    }
+
+    /// Sets the header shape used on the block topic.
+    ///
+    /// [`HeaderProfile::Ethereum`] is what this node's own builder produces
+    /// and is the default; a fleet shared with gov5 nodes needs
+    /// [`HeaderProfile::Gov5H2`] at both ends, which the builder does not emit
+    /// yet.
+    pub const fn with_header_profile(mut self, profile: HeaderProfile) -> Self {
+        self.header_profile = profile;
+        self
     }
 
     /// Persists consensus state at every commit.
@@ -231,8 +312,9 @@ impl<E: ExecutionLayer> H2Service<E> {
 
     /// Makes this node produce blocks when it is leader.
     ///
-    /// The closure is called with the view and the current head, and returns the
-    /// attributes to build under. Without it the node votes on other members'
+    /// The closure is called with a [`ProposalContext`] — the view, the head,
+    /// and the head's timestamp when known — and returns the attributes to
+    /// build under. Without it the node votes on other members'
     /// proposals but never makes one — a valid way to run, and the safe default,
     /// since a node that proposes garbage is worse than one that proposes
     /// nothing.
@@ -253,7 +335,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// leader proposes about once a second and declines in between.
     pub fn with_payload_attributes(
         mut self,
-        attributes: impl Fn(u64, B256) -> Option<PayloadAttributes> + Send + Sync + 'static,
+        attributes: impl Fn(ProposalContext) -> Option<PayloadAttributes> + Send + Sync + 'static,
     ) -> Self {
         self.payload_attributes = Some(Box::new(attributes));
         self
@@ -367,6 +449,10 @@ impl<E: ExecutionLayer> H2Service<E> {
                 debug!(target: "n42.h2.node", view = self.engine.current_view(), "view timed out");
                 self.engine.on_timeout()?;
             }
+            () = tokio::time::sleep(PROPOSE_RETRY), if self.proposal_deferred => {
+                // Nothing happened; the builder is asked again at the top of
+                // the next step.
+            }
         }
 
         self.drain_outputs(&mut events).await?;
@@ -392,6 +478,9 @@ impl<E: ExecutionLayer> H2Service<E> {
                     }
                     ServiceEvent::PayloadMissing { block_hash } => {
                         warn!(target: "n42.h2.node", ?block_hash, "block body not available");
+                    }
+                    ServiceEvent::BodyReceived { block_hash } => {
+                        debug!(target: "n42.h2.node", ?block_hash, "block body received");
                     }
                     _ => {}
                 }
@@ -428,6 +517,27 @@ impl<E: ExecutionLayer> H2Service<E> {
                     }
                 }
             }
+            TransportEvent::Block { data, .. } => {
+                // Nothing here is trusted beyond its own consistency: the
+                // header hashes to the block hash, the transactions hash to
+                // the header's root. Whether the block is *valid* is the
+                // execution layer's verdict, and whether it is *the* block is
+                // consensus's — both check the same hash.
+                match decode_block_gossip(&data, self.header_profile) {
+                    Ok(block) => {
+                        let block_hash = block.block_hash;
+                        self.remember_timestamp(block_hash, block.header.timestamp);
+                        self.driver.cache_payload(block_hash, block.execution_data());
+                        if self.awaiting_bodies.remove(&block_hash) {
+                            self.ready_bodies.push(block_hash);
+                        }
+                        self.received_bodies.push(block_hash);
+                    }
+                    Err(err) => {
+                        debug!(target: "n42.h2.node", %err, "dropped a block body");
+                    }
+                }
+            }
             TransportEvent::StatusExchanged {
                 peer,
                 height,
@@ -461,6 +571,17 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// Not a `while let Some(..) = recv().await` loop: that would block waiting
     /// for the *next* output rather than stopping when the channel runs dry.
     async fn drain_outputs(&mut self, events: &mut Vec<ServiceEvent>) -> Result<(), ServiceError> {
+        for block_hash in std::mem::take(&mut self.received_bodies) {
+            events.push(ServiceEvent::BodyReceived { block_hash });
+        }
+        // A body that consensus already asked for re-runs the execution it
+        // could not do at the time. Through the same path as the original
+        // request, so the resulting BlockImported reaches the engine the same
+        // way.
+        for block_hash in std::mem::take(&mut self.ready_bodies) {
+            self.handle_output(EngineOutput::ExecuteBlock(block_hash), events)
+                .await?;
+        }
         while let Ok(output) = self.outputs.try_recv() {
             self.handle_output(output, events).await?;
         }
@@ -565,21 +686,36 @@ impl<E: ExecutionLayer> H2Service<E> {
         };
         let view = self.engine.current_view();
         if self.proposed_view == Some(view) || !self.engine.is_current_leader() {
+            self.proposal_deferred = false;
             return;
         }
         // Marked before the build, not after: a build that fails should not be
         // retried on every subsequent event in the same view, which would pin
         // the loop against a broken execution layer.
-        let Some(attrs) = build_attributes(view, self.driver.head()) else {
+        let head = self.driver.head();
+        let context = ProposalContext {
+            view,
+            head,
+            head_timestamp: self.block_timestamps.get(&head).copied(),
+        };
+        let Some(attrs) = build_attributes(context) else {
             // Declined for now — not marked as proposed, so the next step asks
             // again. This is how a leader paces itself against a clock coarser
             // than its commit latency.
+            self.proposal_deferred = true;
             return;
         };
+        self.proposal_deferred = false;
         self.proposed_view = Some(view);
         match self.driver.build_block(attrs).await {
             Ok(built) => {
                 debug!(target: "n42.h2.node", view, block = ?built.hash, txs = built.tx_count, "built a block to propose");
+                // The proposal names the hash; the body has to get there by
+                // itself, and before the proposal if the followers are to vote
+                // in the first round. Publishing it first is the best order
+                // gossip can offer.
+                self.remember_timestamp(built.hash, built.timestamp);
+                self.publish_body(&built.execution_data);
                 if let Err(err) = self
                     .engine
                     .process_event(ConsensusEvent::BlockReady(built.hash, None))
@@ -607,6 +743,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 }
             }
             DriverAction::PayloadMissing { block_hash } => {
+                self.awaiting_bodies.insert(block_hash);
                 events.push(ServiceEvent::PayloadMissing { block_hash });
             }
             DriverAction::Rejected { block_hash, reason } => {
@@ -658,13 +795,55 @@ impl<E: ExecutionLayer> H2Service<E> {
         }
     }
 
+    fn remember_timestamp(&mut self, block_hash: B256, timestamp: u64) {
+        if self.block_timestamps.insert(block_hash, timestamp).is_none() {
+            self.timestamp_order.push(block_hash);
+            while self.timestamp_order.len() > REMEMBERED_TIMESTAMPS {
+                let oldest = self.timestamp_order.remove(0);
+                self.block_timestamps.remove(&oldest);
+            }
+        }
+    }
+
+    /// Publishes a block body, queueing it if the mesh is not ready.
+    fn publish_body(&mut self, execution: &alloy_rpc_types_engine::ExecutionData) {
+        let block_hash = execution.block_hash();
+        let data = match encode_block_gossip(execution, self.header_profile) {
+            Ok(data) => data,
+            Err(err) => {
+                // A block nobody else can receive is a block nobody else can
+                // vote on: the view is going to time out, and this is why.
+                warn!(target: "n42.h2.node", %err, ?block_hash, "cannot encode our own block for the fleet");
+                return;
+            }
+        };
+        self.send_body(data, block_hash);
+    }
+
+    fn send_body(&mut self, data: Vec<u8>, block_hash: B256) {
+        match self.transport.publish_block(data.clone()) {
+            Ok(_) => {}
+            Err(err) if err.is_already_published() => {}
+            Err(err) if err.is_transient() => {
+                debug!(target: "n42.h2.node", ?block_hash, "mesh not ready; queueing block body");
+                self.body_outbox.push(data);
+            }
+            Err(err) => {
+                warn!(target: "n42.h2.node", %err, ?block_hash, "block body publish failed");
+            }
+        }
+    }
+
     /// Retries queued messages once the mesh exists.
     ///
     /// Only worth attempting when there is somewhere to send: retrying into an
     /// empty mesh just re-queues everything and burns the loop.
     fn flush_outbox(&mut self, events: &mut Vec<ServiceEvent>) {
-        if self.outbox.is_empty() || self.transport.mesh_size() == 0 {
+        if self.transport.mesh_size() == 0 {
             return;
+        }
+        for data in std::mem::take(&mut self.body_outbox) {
+            self.send_body(data, B256::ZERO);
         }
         for message in std::mem::take(&mut self.outbox) {
             self.publish(message, events);

@@ -272,10 +272,73 @@ Three constraints, none of which this code can remove:
 - **reth's trie is stale from block 1.** The outcome reports no trie updates, so
   `eth_getProof` and anything reading the stored MPT is wrong on a QMDB chain.
   Proofs come from the forest (`mobile_getProof`).
-- **One tree copy per block.** gov5 shares a tree and reverts with undo records;
-  `n42-twig-core` has no undo yet, so each validated block clones its parent's
-  tree. Correct, bounded by the retention window, and the obvious next
-  optimisation for a large state.
+- ~~One tree copy per block.~~ Resolved: `n42-twig-core` now has gov5's undo
+  records (`BlockUndo`, `apply_undo`) and the forest moves one shared tree
+  between held blocks — revert to the common ancestor, re-apply down — instead
+  of copying it. See **Undo records** below.
+
+## The devnet genesis, and gov5's genesis hash reproduced
+
+`crates/chainspec/res/genesis/n42_devnet.json` is now the native chain's devnet,
+shaped after gov5's own presets — `qs_epoch_test`, which gov5 calls "the
+reference for new HotStuff chains", and `h2_interop_test`, the chain built for
+Rust↔Go interop:
+
+- `"stateScheme": "qmdb"`, `"consensus": "hotstuff"`, and a `hotstuff` block
+  (`period` 3, `baseTimeout` 6000, `maxTimeout` 30000, `epochLength` out of
+  reach, `interopV4: true`) with four dev validators whose BLS keys derive from
+  a public seed (`n42_devnet_validators.json`; `h2_keygen --seed`). Addresses
+  are the first four anvil accounts.
+- Every Ethereum fork through Osaka at genesis, written both ways — `*Block: 0`
+  for gov5, `*Time: 0` for alloy — so one file loads in both clients. gov5's
+  N42-only precompile forks (`pqPrecompilesTime` and friends) are left off: reth
+  does not have them, and a mixed fleet must not diverge on a precompile call.
+  `mobileAnchorTime` is off for the same reason — it adds a header field.
+- `difficulty` 0 from genesis (BFT is post-merge from block 0, as
+  `qs_epoch_test` notes), the Prague system contracts in the alloc with gov5's
+  exact bytecode, 1 gwei base fee, 30M gas.
+
+Both `--chain <path>` and the `N42_DEVNET` constant build the same genesis header:
+`make_chain_spec` now trusts a genesis that declares its own fork schedule, and
+`From<Genesis>` applies the QMDB root through `reth_chainspec::qmdb`.
+
+**gov5's `mainnet_qmdb` genesis hash reproduces exactly.** Its 2,322-account
+alloc, converted from gov5's base64 form, with `mainnetQMDBGenesisBlock()`'s
+parameters (timestamp 1678174066, difficulty 131072, gas limit 4712388) and
+the `mainnet_qmdb.json` schedule, gives `0x5fcf94b7…` — the value pinned as
+`params.MainnetQMDBGenesisHash`. That is the whole genesis pipeline agreeing
+with Go byte for byte: leaf encoding, sorted append, root, and the header
+fields reth derives from the schedule (`tests/gov5_genesis.rs`).
+
+`h2_validator --chain <genesis.json>` takes chain id, genesis hash, validator
+set (in QC bitmap order), timeouts and block period from that file's `hotstuff`
+block, so a Rust member and a Go member of one chain cannot disagree about the
+fleet.
+
+**Still open for mixed fleets:** this node's payload builder seals every block
+with the APoS signature in `extraData`, so a produced header carries more than
+the 32 bytes Ethereum permits. gov5 ignores the seal on a HotStuff chain, but
+if it enforces the size limit it will reject those blocks. The genesis carries
+the APoS-shaped `extraData` on purpose so this node keeps sealing; freeing the
+builder from APoS on a HotStuff chain is the next step.
+
+## Undo records
+
+`n42-twig-core` now carries gov5's `BlockUndo`: the append cursor before the
+block, every slot the block deactivated with what it held, and the keys it
+appended. `apply_undo` truncates the appends (index, bits, leaves, cursor,
+spilled twigs) and revives the deactivations, and afterwards the tree is
+byte-identical to one that never saw the block — the test checks the whole
+snapshot, not only the root, and that a sibling re-applied afterwards matches a
+node that only ever applied it. Nothing is mutated until every check passes.
+
+`QmdbForest` uses them the way gov5's `RevertBlock` does: one tree, moved
+between held blocks by reverting to the common ancestor and re-applying down.
+Re-application must land on the recorded root, and a disagreement is refused
+rather than filed. A producer's computed-but-unfiled block stays applied as
+pending work and is adopted on `insert` when the hash arrives, or reverted by
+whatever moves the tree next. Cost per block is now the block's own operations,
+not the size of the state.
 
 ## Restarting a validator
 
@@ -305,6 +368,60 @@ Two ordering constraints, both found by restarting a live node:
 Verified: three consecutive restarts, the chain growing across all of them, no
 rejected forkchoices.
 
+## The block body channel
+
+The four-validator devnet, once the Engine API round-trip was right, reached
+exactly zero commits. Every follower logged `NO BODY for 0x…; cannot vote on
+it`: a HotStuff-2 proposal carries only the block hash, the import-gated vote
+waits for `BlockImported`, and nothing was delivering the body. The leader had
+it; nobody else could.
+
+gov5 delivers bodies on a second gossip topic, and this node now does the same:
+
+- **Topic** `/n42/<fork digest>/block/ssz_snappy`, the fork digest being the
+  first four bytes of the genesis hash — so a body from another chain is not
+  even subscribed to.
+- **Payload** raw-snappy RLP of `[header, transactions, verifiers, rewards]`
+  (`internal/p2p/broadcaster.go` `BroadcastBlock`; the verifier and reward
+  lists are consumed structurally and never trusted). Same message id rule as
+  the consensus topic. N42-26's `gov5_block.rs` codec is ported into
+  `n42-h2-net` as `block_gossip`.
+- **Ordering.** The leader publishes the body *before* handing the hash to
+  the engine, so the body has the best chance of preceding the proposal.
+  When it does not — one `NO BODY` per hour of running, in practice — the
+  service remembers the hash as awaited and re-runs the execution the moment
+  the body arrives, rather than waiting for a proposal that will never repeat.
+- **Trust.** Nothing in a received body is taken on faith beyond its own
+  consistency: the header hashes to the block hash and the transactions to
+  the header's root. Validity is the execution layer's verdict; identity is
+  consensus's — both check the same hash. Requests are carried by hash only
+  (gov5's form does not list them); a block with the empty requests hash gets
+  the empty list, which every `newPayload` version accepts.
+
+**The header-profile switch.** gov5's live H2 headers have a shape an Engine
+API payload cannot express — zero ommers hash, difficulty 0, extra data
+`N42H || view (u64 LE) || seal` — so decoding one means reconstructing it and
+letting the hash pick the variant. This node's own blocks do not have that
+shape yet: the builder seals them the Ethereum way (empty-list ommers hash,
+APoS extra data). `HeaderProfile::Ethereum` gossips those exactly as the
+payload says; `HeaderProfile::Gov5H2` is the reconstruction. The wire format is
+gov5's either way. **A fleet mixing Go and Rust members needs the builder to
+emit gov5's profile** (and reth's header validation to accept it, which N42-26
+does through a consensus adapter); that is the one remaining piece between
+this node and a Go-led fleet, and it is not in this change.
+
+Measured on the four-validator devnet (`run-devnet.sh`: one QMDB `n42` node,
+four `h2_validator --chain n42_devnet.json --propose`): 21 blocks in 60s on a
+3s period, every view committed, 0 timeouts, 0 execution-layer warnings, 21
+QMDB state roots. Killing validator 1 and restarting it with its data
+directory: `resuming at view 29 (last voted 28)`, 11 commits in the next 30s
+including 3 blocks it built as leader, and the other three never timed out.
+The harness test `followers_commit_only_after_bodies_arrive_over_the_block_topic`
+pins the property with one proposer: a follower that commits has necessarily
+received the body over gossip. (The older four-proposer test could not show
+this — the mock built the same block for everyone, which is also why the gap
+went unnoticed.)
+
 ## First live block
 
 A single-validator fleet (`n = 1`, `f = 0`, quorum 1) run against a real `n42`
@@ -328,16 +445,19 @@ the hashes the commits named. Three things only showed up here:
 
 Two constraints on the setup, both worth knowing before repeating it:
 
-- `crates/chainspec/res/genesis/n42_devnet.json` has an **empty `config`**, so
-  `--chain <that file>` activates no hard forks and every `forkchoiceUpdatedV3`
-  is rejected with `-38003`. A genesis with `shanghaiTime`/`cancunTime` set is
-  needed. (`ChainSpec::N42_DEVNET` in Rust does carry hardforks; the JSON does
-  not, and `--chain <path>` uses the JSON.)
+- `crates/chainspec/res/genesis/n42_devnet.json` at the time had an **empty
+  `config`**, so `--chain <that file>` activated no hard forks and every
+  `forkchoiceUpdatedV3` was rejected with `-38003`. The checked-in devnet
+  genesis now declares its schedule (see "The devnet genesis" above), and a
+  genesis that declares one is trusted over the legacy hardfork list.
 - N42's payload builder seals through APoS, so the node needs
   `--dev.consensus-signer-private-key` for an authorized signer even when
   HotStuff-2 is driving it — without one, every build dies and `getPayload`
-  answers "unknown payload". Pair it with a long `--dev.block-time` so the APoS
-  miner does not also produce blocks.
+  answers "unknown payload". The APoS miner used to run alongside and race the
+  fleet's forkchoice (`Error advancing the chain … InvalidState`, and its
+  stalled-chain watchdog re-proposing on its own); `bin/n42` now spawns no
+  miner at all on a chain whose genesis names a `hotstuff` validator set. The
+  signer key still seals what the fleet asks for.
 
 ### Why a leader was proposing every other view
 
@@ -368,13 +488,24 @@ none visible without a live execution layer:
 
 Measured after: 21 blocks in 20s with no rejected builds, against 5 in 12s
 before — about one block per second, which is what a whole-second timestamp
-allows. The views a leader declines do time out, and that is the mechanism
-working as intended rather than waste.
+allows.
 
-Also worth knowing: this node holds no consensus state across restarts, so a
-restarted validator proposes from genesis and the execution layer answers
-`-38006 Too deep reorg`. N42-26 keeps that in `persistence.rs`; nothing here
-does.
+4. **Pacing has to be against the parent, and a declined leader has to be
+   asked again.** On the four-validator devnet (period 3s, base timeout 6s)
+   the pattern came back: commit, timeout, commit, timeout. Two causes. The
+   builder paced against *this node's* last proposal, so a leader whose
+   predecessor had just committed proposed at once, with a timestamp equal to
+   the parent's second, and the execution layer refused the attributes
+   (`-38003`). And once a builder declined, nothing woke the service before
+   the view timeout — a leader that has not proposed has no events coming.
+   The service now hands the builder a `ProposalContext` carrying the head's
+   timestamp (learned from its own builds and from every body received over
+   the block topic), the builder declines until `parent + period`, and a
+   declined proposal arms a 200ms retry (gov5's `minProposeDelayMs`) instead
+   of waiting for the timeout. Measured after: 21 blocks in 60s on a 3s
+   period, every view committed, zero timeouts.
+
+Consensus state across restarts is covered in "Restarting a validator" above.
 
 ## Live cross-client attach: how far it got
 
@@ -605,6 +736,13 @@ nothing.
 
 Ordered by dependency, not by value.
 
+0. **Emit gov5's H2 header profile from the builder.** `N42H`-prefixed extra
+   data carrying the view, zero ommers hash, difficulty 0, and a consensus
+   adapter so reth's header validation accepts it (N42-26's `adapter.rs`).
+   Without it a Go node rejects every Rust-built block and vice versa; with it
+   the Rust fleet above becomes a mixed one. Everything else on the path —
+   genesis hash, gossip topics and framing, the status handshake, the Engine
+   API round-trip, block bodies — is already gov5's.
 1. **Run the observer against the live fleet.** Everything below the socket is
    tested; what remains is operational — point `h2_observer` at real fleet
    peers with the fleet's genesis hash and validator list, and confirm it

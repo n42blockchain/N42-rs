@@ -22,4 +22,4 @@ pub mod persistence;
 pub mod service;
 
 pub use persistence::{ConsensusCheckpoint, ConsensusStore, FileVoteLog, StoreError};
-pub use service::{H2Service, ServiceError, ServiceEvent};
+pub use service::{H2Service, ServiceError, ServiceEvent, ProposalContext};

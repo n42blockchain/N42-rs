@@ -184,6 +184,9 @@ impl H2V4Observer {
                 }
             }
             TransportEvent::Rejected { from, reason } => ObserverEvent::Rejected { from, reason },
+            // A block body is fleet traffic, not finality: an observer watches
+            // for Decide and does not execute blocks.
+            TransportEvent::Block { from, .. } => ObserverEvent::NonDecide { from },
             TransportEvent::Subscribed => ObserverEvent::Subscribed,
             TransportEvent::PeerConnected(peer) => ObserverEvent::PeerConnected(peer),
             TransportEvent::PeerDisconnected(peer) => ObserverEvent::PeerDisconnected(peer),

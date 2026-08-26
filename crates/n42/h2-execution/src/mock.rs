@@ -103,6 +103,39 @@ impl MockExecutionLayer {
     }
 
     /// Builds an [`ExecutionData`] whose block hash is `hash`.
+    /// A block whose hash really is the hash of its header, as a built block
+    /// from a live execution layer would be. Anything that re-derives the hash
+    /// from the payload — gossiping the body to followers does — needs this;
+    /// a made-up hash would be refused as a lie about the block.
+    pub fn built_block(number: u64) -> BuiltBlock {
+        let header = alloy_consensus::Header {
+            number,
+            timestamp: 1_700_000_000 + number,
+            gas_limit: 30_000_000,
+            base_fee_per_gas: Some(7),
+            transactions_root: alloy_consensus::EMPTY_ROOT_HASH,
+            receipts_root: alloy_consensus::EMPTY_ROOT_HASH,
+            ..Default::default()
+        };
+        let block = alloy_consensus::Block {
+            header,
+            body: alloy_consensus::BlockBody {
+                transactions: Vec::<alloy_consensus::TxEnvelope>::new(),
+                ommers: Vec::new(),
+                withdrawals: None,
+            },
+        };
+        let hash = block.header.hash_slow();
+        BuiltBlock {
+            hash,
+            number,
+            timestamp: block.header.timestamp,
+            tx_count: 0,
+            execution_data: ExecutionData::from_block_unchecked(hash, &block),
+            blob_tx_hashes: Vec::new(),
+        }
+    }
+
     pub fn payload_for(hash: B256, number: u64) -> ExecutionData {
         ExecutionData {
             payload: ExecutionPayload::V1(ExecutionPayloadV1 {
@@ -187,14 +220,6 @@ impl ExecutionLayer for MockExecutionLayer {
             state.next_block += 1;
             state.next_block
         };
-        let hash = B256::from(U256::from(0xb10c_0000u64 + number));
-        Some(Ok(BuiltBlock {
-            hash,
-            number,
-            timestamp: 1_700_000_000 + number,
-            tx_count: 0,
-            execution_data: Self::payload_for(hash, number),
-            blob_tx_hashes: Vec::new(),
-        }))
+        Some(Ok(Self::built_block(number)))
     }
 }

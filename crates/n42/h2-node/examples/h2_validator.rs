@@ -8,9 +8,7 @@
 //!
 //! ```text
 //! cargo run -p n42-h2-node --example h2_validator -- \
-//!     --chain-id 94 \
-//!     --genesis 0x<genesis hash> \
-//!     --validators validators.json \
+//!     --chain crates/chainspec/res/genesis/n42_devnet.json \
 //!     --index 0 \
 //!     --bls-key 0x<64 hex chars> \
 //!     --el http://127.0.0.1:8551 \
@@ -19,6 +17,13 @@
 //!     --listen /ip4/0.0.0.0/tcp/32200 \
 //!     --propose
 //! ```
+//!
+//! `--chain <genesis.json>` is the same file the execution layer and any gov5
+//! node on the chain were initialised from. Chain id, genesis hash, validator
+//! set (in QC bitmap order), view timeouts and block period all come from its
+//! `hotstuff` block, so the three clients cannot disagree about the fleet.
+//! `--chain-id`/`--genesis`/`--validators` remain for a chain that keeps its
+//! validators elsewhere.
 //!
 //! `--el` is the *auth* port (reth's `--authrpc.port`, default 8551), not the
 //! public JSON-RPC port. Pointing it at the public port makes every Engine API
@@ -70,6 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_writer(std::io::stderr)
         .init();
 
+    let mut chain_path: Option<String> = None;
     let mut chain_id: Option<u64> = None;
     let mut genesis: Option<B256> = None;
     let mut validators_path: Option<String> = None;
@@ -83,11 +89,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut propose = false;
     let mut mobile_addr: Option<String> = None;
     let mut datadir: Option<String> = None;
-    let mut base_timeout_ms: u64 = 4_000;
+    let mut base_timeout_ms: Option<u64> = None;
+    let mut max_timeout_ms: Option<u64> = None;
+    let mut period_secs: u64 = 1;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--chain" => chain_path = Some(args.next().ok_or("--chain needs a genesis path")?),
             "--chain-id" => chain_id = Some(args.next().ok_or("--chain-id needs a value")?.parse()?),
             "--genesis" => {
                 let raw = args.next().ok_or("--genesis needs a value")?;
@@ -107,7 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Some(args.next().ok_or("--fault-tolerance needs a value")?.parse()?)
             }
             "--timeout-ms" => {
-                base_timeout_ms = args.next().ok_or("--timeout-ms needs a value")?.parse()?
+                base_timeout_ms = Some(args.next().ok_or("--timeout-ms needs a value")?.parse()?)
             }
             "--datadir" => datadir = Some(args.next().ok_or("--datadir needs a path")?),
             "--mobile" => mobile_addr = Some(args.next().ok_or("--mobile needs an address")?),
@@ -120,13 +129,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let identity = H2V4ChainIdentity {
-        chain_id: chain_id.ok_or("--chain-id is required")?,
-        genesis_hash: genesis.ok_or("--genesis is required")?,
+    // Everything about the fleet from one file, when there is one.
+    let (identity, validators): (H2V4ChainIdentity, Vec<ValidatorInfo>) = match &chain_path {
+        Some(path) => {
+            use reth_cli::chainspec::ChainSpecParser as _;
+            let spec = n42_qmdb_reth::N42ChainSpecParser::parse(path)?;
+            let hotstuff = n42_qmdb_reth::HotStuffGenesisConfig::from_genesis(&spec.genesis)?;
+            base_timeout_ms.get_or_insert(hotstuff.base_timeout);
+            max_timeout_ms.get_or_insert(hotstuff.max_timeout);
+            period_secs = hotstuff.period.max(1);
+            (
+                H2V4ChainIdentity {
+                    chain_id: chain_id.unwrap_or_else(|| spec.chain().id()),
+                    genesis_hash: genesis.unwrap_or_else(|| spec.genesis_hash()),
+                },
+                hotstuff.validator_set()?,
+            )
+        }
+        None => (
+            H2V4ChainIdentity {
+                chain_id: chain_id.ok_or("--chain-id is required without --chain")?,
+                genesis_hash: genesis.ok_or("--genesis is required without --chain")?,
+            },
+            serde_json::from_str(&std::fs::read_to_string(
+                validators_path.ok_or("--validators is required without --chain")?,
+            )?)?,
+        ),
     };
-    let validators: Vec<ValidatorInfo> = serde_json::from_str(&std::fs::read_to_string(
-        validators_path.ok_or("--validators is required")?,
-    )?)?;
+    let base_timeout_ms = base_timeout_ms.unwrap_or(4_000);
+    let max_timeout_ms = max_timeout_ms.unwrap_or(base_timeout_ms * 4);
     if validators.is_empty() {
         return Err("validator list is empty".into());
     }
@@ -217,7 +248,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     secret_key,
                     validator_set,
                     base_timeout_ms,
-                    base_timeout_ms * 4,
+                    max_timeout_ms,
                     output_tx,
                 )
             }
@@ -236,7 +267,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             secret_key,
                             epochs,
                             base_timeout_ms,
-                            base_timeout_ms * 4,
+                            max_timeout_ms,
                             output_tx,
                             vote_log,
                         )
@@ -258,7 +289,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             secret_key,
                             epochs,
                             base_timeout_ms,
-                            base_timeout_ms * 4,
+                            max_timeout_ms,
                             output_tx,
                             recovered.view,
                             recovered.locked_qc,
@@ -293,8 +324,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if propose {
             let fee_recipient = entry.address;
-            service = service.with_payload_attributes(move |_view, _head| {
-                block_attributes(fee_recipient)
+            service = service.with_payload_attributes(move |context| {
+                block_attributes(fee_recipient, period_secs, context.head_timestamp)
             });
         }
 
@@ -327,6 +358,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ServiceEvent::SyncRequired { local_view, target_view } => {
                         eprintln!("BEHIND local={local_view} fleet={target_view}");
                     }
+                    ServiceEvent::BodyReceived { block_hash } => {
+                        println!("body         : {block_hash}");
+                    }
                     ServiceEvent::PayloadMissing { block_hash } => {
                         eprintln!("NO BODY for {block_hash}; cannot vote on it");
                     }
@@ -351,17 +385,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// the future (the execution layer rejects the block outright). Both were
 /// observed on a live node. Declining in between paces the chain at roughly one
 /// block per second, which is what the timestamp resolution allows.
-fn block_attributes(fee_recipient: Address) -> Option<PayloadAttributes> {
+fn block_attributes(
+    fee_recipient: Address,
+    period_secs: u64,
+    head_timestamp: Option<u64>,
+) -> Option<PayloadAttributes> {
     static LAST: AtomicU64 = AtomicU64::new(0);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or_default();
-    // Claim this second, or decline if it is already taken.
+    // Pace against the parent, the way gov5 does: the next block is due at
+    // `parent + period`, and a leader that is asked before then declines and
+    // is asked again. Proposing earlier gives the execution layer a timestamp
+    // no later than the parent's — the same second — which it refuses
+    // outright, and the view is lost to a timeout. Without the parent's
+    // timestamp (a restart, a head this node never saw the body of), fall
+    // back to pacing against this node's own last proposal.
+    let earliest = match head_timestamp {
+        Some(parent) => parent.saturating_add(period_secs),
+        None => LAST.load(Ordering::Relaxed).saturating_add(period_secs),
+    };
+    if now < earliest {
+        return None;
+    }
     let timestamp = LAST
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
-            (now > last).then_some(now)
-        })
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| (now > last).then_some(now))
         .ok()
         .map(|_| now)?;
     Some(PayloadAttributes {
@@ -378,9 +427,10 @@ fn block_attributes(fee_recipient: Address) -> Option<PayloadAttributes> {
 const USAGE: &str = "\
 h2_validator — run a participating HotStuff-2 v4 node against an execution layer
 
-  --chain-id <u64>          fleet chain id (e.g. 94 for mainnet_qmdb_staggered)
-  --genesis <0x…>           fleet genesis hash
-  --validators <path>       JSON array of {address, bls_public_key}
+  --chain <genesis.json>    the chain's genesis; supplies id, hash, validators, timeouts, period
+  --chain-id <u64>          fleet chain id (without --chain)
+  --genesis <0x…>           fleet genesis hash (without --chain)
+  --validators <path>       JSON array of {address, bls_public_key} (without --chain)
   --index <u32>             this node's position in that array
   --bls-key <0x…>           this node's BLS secret key (32 bytes)
   --el <url>                Engine API auth endpoint (reth --authrpc.port, 8551)
@@ -391,5 +441,5 @@ h2_validator — run a participating HotStuff-2 v4 node against an execution lay
   --mobile <addr>           serve the mobile_* endpoint here (e.g. 127.0.0.1:9545)
   --datadir <path>          persist consensus state here (required to restart safely)
   --fault-tolerance <u32>   override f; defaults to (n-1)/3
-  --timeout-ms <u64>        base view timeout (default 4000)
+  --timeout-ms <u64>        base view timeout (default: genesis hotstuff.baseTimeout, else 4000)
 ";

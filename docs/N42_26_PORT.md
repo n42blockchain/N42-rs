@@ -26,7 +26,8 @@ none: no existing package version was replaced, so the reth v1.11.0 build graph
 resolves exactly as before.
 
 Test count by crate: bmt-core 7, twig-core 38, h2-primitives 48, h2-wire 9,
-h2-consensus 217, mobile-verify 61, h2-net 35, h2-execution 9, h2-node 3 — **434 total**.
+h2-consensus 217, mobile-verify 61, h2-net 35, h2-execution 9, h2-node 3,
+h2-el-rpc 15 — **449 total**.
 
 | Crate | From N42-26 | Lines | Tests | What it gives this repo |
 |---|---|---|---|---|
@@ -37,6 +38,7 @@ h2-consensus 217, mobile-verify 61, h2-net 35, h2-execution 9, h2-node 3 — **4
 | `n42-h2-consensus` | `n42-consensus` (all but `adapter.rs`) + `n42-consensus-service/h2_finality.rs` | 12,599 | 209 | The HotStuff-2 protocol core — state machine, proposal, voting, quorum assembly, pacemaker, view change, timeout certificates — plus validator set, epoch management, leader selection, rotor, vote log, and `VerifyH2V4Decide`. Enough to *participate*, not only observe. |
 | `n42-mobile-verify` | `n42-mobile` (format half) | 2,363 | 61 | Verification receipts, BLS attestation aggregation, twig/SBMT state proofs, hot-contract code cache. |
 | `n42-h2-net` | new, modelled on `n42-network` | 2,266 | 35 | gov5-compatible GossipSub transport: topic strings, router parameters, gov5's message-ID function, the `/rpc/status/1/ssz_snappy` handshake. `H2V4Transport` is the bidirectional mesh member (subscribe, decode, **publish**); `H2V4Observer` is the read-only use of it, turning wire bytes into verified finality. Ships a runnable `h2_observer` example. |
+| `n42-h2-el-rpc` | new, in the spirit of `n42-el-rpc` | 730 | 15 | An `ExecutionLayer` over the published Engine API (authenticated JSON-RPC), so one adapter drives reth, this repo's node, and gov5's `eth-el` — with no reth dependency on the consensus side. Transport is a trait, so the version mapping and error handling are tested against a recorded transport rather than a live node. |
 | `n42-h2-node` | new | 490 | 3 | The service loop that makes the other three a fleet member: transport events become consensus events, engine outputs become published envelopes and execution calls, execution answers come back as consensus events. A four-node integration test commits a block over a real gossip mesh. |
 | `n42-h2-execution` | seam from `n42-consensus-service/src/el.rs`; driver is new | 920 | 9 | The execution-layer seam (`ExecutionLayer`, Engine API in alloy types only) and the driver that services consensus's requests against it, plus an in-memory EL for testing the loop. |
 
@@ -138,6 +140,23 @@ Against the brief's action list for the Rust side:
   - **Duplicate publishes are success.** gov5's message id is a hash of the
     payload and engines re-broadcast by design, so gossipsub's `Duplicate` means
     the fleet already has the message.
+- [x] 9. Drive a real execution layer — `n42-h2-el-rpc`. Two things about the
+  Engine API are easy to get wrong and silent when wrong, so both are pinned by
+  tests:
+  - **A Prague block is a V3 payload sent to `newPayloadV4`.** Reading the method
+    version off the payload struct sends it to V3, which is rejected for a
+    missing parameter — an error that reads like a payload problem.
+  - **`getPayload` never echoes `parentBeaconBlockRoot`**, but re-importing the
+    built block needs it. The client remembers it per build, from the
+    `forkchoiceUpdated` that started it. Without that, a block is accepted
+    locally and rejected by every peer one hop later.
+
+  Amsterdam (`newPayloadV5`) is refused rather than guessed at: there is no
+  execution client here to check the mapping against, and a wrong guess would
+  first fail at the fork on a live chain.
+
+  `cargo run -p n42-h2-node --example h2_validator -- --help` assembles the whole
+  stack against a running execution client.
 - [ ] 6. (Standing constraint) do not configure epoch validator changes on a v4 chain.
 
 ## Live cross-client attach: how far it got

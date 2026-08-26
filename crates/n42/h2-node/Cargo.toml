@@ -28,7 +28,9 @@ hex.workspace = true
 libp2p = { workspace = true, default-features = false }
 serde.workspace = true
 serde_json.workspace = true
-tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+n42-h2-el-rpc.workspace = true
+url.workspace = true
 
 [lints]
 workspace = true

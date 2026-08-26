@@ -5608,6 +5608,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
@@ -7885,6 +7886,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "n42-h2-el-rpc"
+version = "2.1.5"
+dependencies = [
+ "alloy-consensus 2.4.1",
+ "alloy-eips 2.4.1",
+ "alloy-primitives 1.6.1",
+ "alloy-rpc-types-engine 2.4.1",
+ "async-trait",
+ "n42-h2-execution",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "n42-h2-execution"
 version = "2.1.5"
 dependencies = [
@@ -7929,6 +7949,7 @@ dependencies = [
  "hex",
  "libp2p",
  "n42-h2-consensus",
+ "n42-h2-el-rpc",
  "n42-h2-execution",
  "n42-h2-net",
  "n42-h2-primitives",
@@ -7939,6 +7960,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
@@ -9964,16 +9986,21 @@ dependencies = [
  "http-body 1.1.0",
  "http-body-util",
  "hyper 1.11.0",
+ "hyper-rustls",
  "hyper-util",
  "js-sys",
  "log",
  "percent-encoding",
  "pin-project-lite",
+ "quinn",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "serde_urlencoded",
  "sync_wrapper 1.0.2",
  "tokio",
+ "tokio-rustls",
  "tower",
  "tower-http",
  "tower-service",
@@ -9981,6 +10008,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]

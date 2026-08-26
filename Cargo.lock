@@ -8005,6 +8005,8 @@ dependencies = [
  "n42-h2-primitives",
  "n42-h2-wire",
  "n42-mobile-verify",
+ "n42-qmdb-state",
+ "n42-twig-core",
  "serde",
  "serde_json",
  "thiserror 2.0.20",

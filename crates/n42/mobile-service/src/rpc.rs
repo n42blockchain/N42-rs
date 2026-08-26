@@ -22,8 +22,9 @@
 //! | `mobile_registerVerifier` | `[pubkey_hex]` | the verifier's registry index |
 //! | `mobile_submitReceipt` | `[receipt_hex]` | [`SubmitOutcome`] |
 //! | `mobile_attestation` | `[block_hash]` | the aggregate, or `null` |
+//! | `mobile_getProof` | `[address]` or `[address, slot]` | [`crate::StateProofReport`], or `null` |
 
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
 use n42_mobile_verify::receipt::decode_receipt;
 use serde_json::{json, Value};
 
@@ -123,6 +124,30 @@ pub fn dispatch(
             Ok(match service.attestation(&block_hash) {
                 None => Value::Null,
                 Some(attestation) => serde_json::to_value(attestation)
+                    .map_err(|e| RpcError::new(codes::INTERNAL, e))?,
+            })
+        }
+
+        "mobile_getProof" => {
+            let address: Address = str_param(params, 0, "address")?
+                .parse()
+                .map_err(|e| RpcError::new(codes::INVALID_PARAMS, e))?;
+            // Absent second param means the account itself; a present one means
+            // that storage slot.
+            let slot = match params.get(1) {
+                None | Some(Value::Null) => None,
+                Some(_) => Some(
+                    str_param(params, 1, "slot")?
+                        .parse::<B256>()
+                        .map_err(|e| RpcError::new(codes::INVALID_PARAMS, e))?,
+                ),
+            };
+            Ok(match service.prove(address, slot) {
+                // Null, not an error: a node with no state tree and a key with
+                // no leaf are both "nothing to prove", and QMDB membership
+                // proofs cannot tell a caller which.
+                None => Value::Null,
+                Some(report) => serde_json::to_value(report)
                     .map_err(|e| RpcError::new(codes::INTERNAL, e))?,
             })
         }

@@ -13,11 +13,12 @@
 //! check with two pairings. What the service supplies is availability and
 //! aggregation, not authority.
 //!
-//! Not covered: state proofs. Serving one means holding the QMDB twig forest the
-//! proof is cut from, and this node keeps its state in reth's MDBX instead. The
-//! verifier side is ready ([`n42_mobile_verify::state_proof`]) and so is the
-//! engine ([`n42_twig_core`](https://docs.rs/n42-twig-core)); the missing piece
-//! is the node maintaining that state. See `docs/N42_26_PORT.md`.
+//! State proofs come from [`n42_qmdb_state`], which is the same tree a QMDB
+//! chain's block header takes its state root from. That is what makes the chain
+//! of trust close: the phone verifies the `Decide`'s signatures, those commit to
+//! a state root, and the proof is checked against that same root. Hand
+//! [`MobileService::with_state`] the tree the node applies blocks to; without it
+//! the node serves finality and collects receipts but cannot prove state.
 
 pub mod http;
 pub mod rpc;
@@ -26,5 +27,6 @@ pub mod service;
 pub use http::serve;
 pub use rpc::{dispatch, RpcError};
 pub use service::{
+    StateProofReport,
     FinalityReport, MobileService, RecordError, SubmitError, SubmitOutcome,
 };

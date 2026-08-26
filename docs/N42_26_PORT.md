@@ -27,7 +27,8 @@ resolves exactly as before.
 
 Test count by crate: bmt-core 7, twig-core 38, h2-primitives 48, h2-wire 9,
 h2-consensus 217, mobile-verify 61, h2-net 35, h2-execution 9, h2-node 3,
-h2-el-rpc 15, mobile-service 19 — **468 total**.
+h2-el-rpc 15, mobile-service 26, qmdb-state 10, h2-node persistence 8 —
+**486 total**.
 
 The stack has been run end to end against a live execution layer; see
 **First live block** below.
@@ -41,6 +42,7 @@ The stack has been run end to end against a live execution layer; see
 | `n42-h2-consensus` | `n42-consensus` (all but `adapter.rs`) + `n42-consensus-service/h2_finality.rs` | 12,599 | 209 | The HotStuff-2 protocol core — state machine, proposal, voting, quorum assembly, pacemaker, view change, timeout certificates — plus validator set, epoch management, leader selection, rotor, vote log, and `VerifyH2V4Decide`. Enough to *participate*, not only observe. |
 | `n42-mobile-verify` | `n42-mobile` (format half) | 2,363 | 61 | Verification receipts, BLS attestation aggregation, twig/SBMT state proofs, hot-contract code cache. |
 | `n42-h2-net` | new, modelled on `n42-network` | 2,266 | 35 | gov5-compatible GossipSub transport: topic strings, router parameters, gov5's message-ID function, the `/rpc/status/1/ssz_snappy` handshake. `H2V4Transport` is the bidirectional mesh member (subscribe, decode, **publish**); `H2V4Observer` is the read-only use of it, turning wire bytes into verified finality. Ships a runnable `h2_observer` example. |
+| `n42-qmdb-state` | new | 450 | 10 | The QMDB state commitment: a block's state root and the proofs cut from it. On a QMDB chain this *is* the header's state root — see **QMDB is the header's state root** below. |
 | `n42-mobile-service` | new, in the spirit of `n42-mobile` | 900 | 19 | The node's half of mobile verification: serves each commit as the `Decide` a fleet member would verify, and aggregates the receipts phones send back into a BLS attestation. `mobile_*` JSON-RPC over a minimal HTTP front end. |
 | `n42-h2-el-rpc` | new, in the spirit of `n42-el-rpc` | 730 | 15 | An `ExecutionLayer` over the published Engine API (authenticated JSON-RPC), so one adapter drives reth, this repo's node, and gov5's `eth-el` — with no reth dependency on the consensus side. Transport is a trait, so the version mapping and error handling are tested against a recorded transport rather than a live node. |
 | `n42-h2-node` | new | 490 | 3 | The service loop that makes the other three a fleet member: transport events become consensus events, engine outputs become published envelopes and execution calls, execution answers come back as consensus events. A four-node integration test commits a block over a real gossip mesh. |
@@ -183,7 +185,73 @@ Against the brief's action list for the Rust side:
   forest it is cut from, and this node keeps state in reth's MDBX. The verifier
   side (`mobile-verify::state_proof`) and the engine (`n42-twig-core`) are both
   ready; the node maintaining that state is not.
+- [x] 12. State proofs — `mobile_getProof`, served from the same tree the state
+  root comes from. A phone verifies the `Decide`'s signatures, those commit to a
+  state root, and the proof checks against that root: nothing in the chain is
+  the server's word. A proof cut from a different tree does not verify, which is
+  what makes the rest worth anything.
+- [x] 13. Consensus state across restarts — `h2-node::persistence`. See
+  **Restarting a validator** below.
 - [ ] 6. (Standing constraint) do not configure epoch validator changes on a v4 chain.
+
+## QMDB is the header's state root
+
+Confirmed against gov5 before building anything: `QMDBRootComputer` implements
+`state.RootComputer`, `IntraBlockState.IntermediateRoot()` delegates to it when
+one is installed, and `cmd/n42-state-verify` checks membership proofs against
+`header.Root`. So on a QMDB chain the header's state root is the twig-forest
+root, not an MPT root — a node computing the latter produces headers such a
+fleet rejects, and "generate a correct header" and "serve a state proof" are the
+same problem.
+
+`n42-qmdb-state` is the Rust side of that computer. Three properties come
+straight from gov5's implementation, each a fork if wrong:
+
+- **The root depends on write order.** QMDB is append-only and every set
+  consumes a slot, so gov5 sorts a block's operations by key hash before
+  applying any (Go map iteration is randomized — applying dirty maps directly is
+  not reproducible even on one machine). Hence `apply_block` takes a whole block.
+- **An emptied account and a zeroed slot delete their leaf**, rather than
+  writing one that encodes nothing.
+- **A reorg cannot be handled by re-applying state.** In gov5's own words,
+  executing a competing block on an un-reverted tree "appends at shifted slots
+  and forks the root permanently vs nodes that only ever applied the winner" —
+  even when the resulting state is correct. `revert_to` restores the tree.
+
+**Not yet wired into block production.** reth exposes `StateRootStrategy` with a
+`prepare_payload_builder` hook (`BasicEngineValidator::with_state_root_strategy`),
+which is the supported place to substitute this and needs no fork. Until that is
+done, this node's own headers still carry an MPT root; the crate computes the
+gov5-compatible root and serves proofs against it, but block production does not
+consult it.
+
+## Restarting a validator
+
+The vote log is a safety requirement, not a convenience: a node that restarts
+without it re-votes in views it already signed, which is equivocation and
+indistinguishable from deliberate double-signing. It is written before the
+signature and fsynced, and an fsync failure aborts the vote.
+
+Recovery takes the *more conservative* of the log and the checkpoint. Measured on
+a live node, the checkpoint said `last_voted 13` while the vote log said 15 —
+the crash landed between signing and checkpointing, and recovering from the
+checkpoint alone would have re-voted in 14 and 15.
+
+Two ordering constraints, both found by restarting a live node:
+
+- **Durability comes before finality.** A commit tells the execution layer a
+  block is finalized, and the Engine API has no way to take that back. Announcing
+  it and then dying before the checkpoint reaches disk leaves the node believing
+  less than its execution layer does, and every later forkchoice is refused as a
+  reorg past the finalized block (`-38006`). The checkpoint is therefore written
+  inside the service, before the commit reaches the driver, and a checkpoint
+  that fails stops the commit.
+- **The execution head has to be recovered too.** Resuming consensus at view N
+  while pointing the driver at genesis sends a forkchoice thousands of blocks
+  back. The last committed QC names the block that was head.
+
+Verified: three consecutive restarts, the chain growing across all of them, no
+rejected forkchoices.
 
 ## First live block
 

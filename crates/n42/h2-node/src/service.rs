@@ -30,6 +30,15 @@
 //! other event coming, so an attempt made after the wait waits for a timeout it
 //! should never have needed.
 //!
+//! **Durability comes before finality.** Committing tells the execution layer a
+//! block is finalized, and the Engine API does not allow that to be taken back.
+//! A node that announces finality and then dies before its own consensus state
+//! reaches disk restarts believing less than its execution layer does, and every
+//! forkchoice it sends afterwards is rejected as a reorg past the finalized
+//! block. So a commit checkpoint, when one is configured, is written *before*
+//! the commit reaches the execution layer, and a checkpoint that fails stops the
+//! commit rather than proceeding undurable.
+//!
 //! **Startup is not a timeout.** A node that comes up before its mesh does
 //! would otherwise spend its first views broadcasting timeouts to nobody and
 //! arrive at the fleet already several views behind. The first view's clock
@@ -154,7 +163,14 @@ pub struct H2Service<E> {
     /// Whether the gossip mesh has ever had a peer. Until it does, the view
     /// clock is held off — see the module docs.
     meshed: bool,
+    /// Persists consensus state before a commit is announced as final.
+    checkpoint: Option<Box<CheckpointWriter>>,
 }
+
+/// Persists the engine's state. Called before a commit reaches the execution
+/// layer; an `Err` aborts the commit rather than finalising something this node
+/// could not record.
+type CheckpointWriter = dyn Fn(&ConsensusEngine) -> Result<(), String> + Send + Sync;
 
 impl<E> std::fmt::Debug for H2Service<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -192,7 +208,25 @@ impl<E: ExecutionLayer> H2Service<E> {
             payload_attributes: None,
             proposed_view: None,
             meshed: false,
+            checkpoint: None,
         }
+    }
+
+    /// Persists consensus state at every commit.
+    ///
+    /// Called *before* the commit is handed to the execution layer, because
+    /// finality announced over the Engine API cannot be withdrawn: a node that
+    /// finalises a block and then restarts without a record of it points its
+    /// forkchoice at an earlier block and is refused. If the writer returns an
+    /// error the commit does not reach the execution layer at all — better a
+    /// stalled node than one whose execution layer has finalised more than its
+    /// consensus can prove.
+    pub fn with_checkpoint(
+        mut self,
+        writer: impl Fn(&ConsensusEngine) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        self.checkpoint = Some(Box::new(writer));
+        self
     }
 
     /// Makes this node produce blocks when it is leader.
@@ -438,6 +472,20 @@ impl<E: ExecutionLayer> H2Service<E> {
         output: EngineOutput,
         events: &mut Vec<ServiceEvent>,
     ) -> Result<(), ServiceError> {
+        // Durability first, and only for the output that announces finality.
+        // See the module docs: the Engine API has no way to un-finalise a block.
+        if let (EngineOutput::BlockCommitted { view, block_hash, .. }, Some(write)) =
+            (&output, self.checkpoint.as_ref())
+            && let Err(error) = write(&self.engine)
+        {
+            warn!(
+                target: "n42.h2.node",
+                %error, view, ?block_hash,
+                "could not persist consensus state; the commit is not being finalised",
+            );
+            return Ok(());
+        }
+
         // The execution driver sees every output and decides for itself which
         // ones concern it, so this does not have to duplicate that judgement.
         let action = self.driver.handle_output(&output).await;

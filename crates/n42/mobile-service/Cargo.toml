@@ -14,6 +14,8 @@ n42-h2-consensus.workspace = true
 n42-h2-primitives.workspace = true
 n42-h2-wire.workspace = true
 n42-mobile-verify.workspace = true
+n42-qmdb-state.workspace = true
+n42-twig-core.workspace = true
 alloy-primitives = { workspace = true, features = ["serde"] }
 serde = { workspace = true, features = ["derive"] }
 hex.workspace = true

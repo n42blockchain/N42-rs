@@ -18,6 +18,8 @@
 //! what `../N42-26`'s equivalent (`n42-consensus-service`) carries that this
 //! does not.
 
+pub mod persistence;
 pub mod service;
 
+pub use persistence::{ConsensusCheckpoint, ConsensusStore, FileVoteLog, StoreError};
 pub use service::{H2Service, ServiceError, ServiceEvent};

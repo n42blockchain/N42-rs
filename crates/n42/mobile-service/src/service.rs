@@ -11,6 +11,13 @@
 //! which this aggregates into a BLS attestation that anyone can check with two
 //! pairings regardless of how many phones took part.
 //!
+//! State proofs are served from the same QMDB tree the block header's state root
+//! comes from — on a QMDB chain those are the same value, so a phone checks the
+//! proof against a root it already established from the `Decide` above. That is
+//! the whole chain of trust: signatures it verified, a root those signatures
+//! commit to, and a proof that root commits to. Nothing in it is this server's
+//! word.
+//!
 //! **Every receipt's signature is verified here.** Neither
 //! [`n42_mobile_verify::ReceiptAggregator`] nor
 //! [`n42_mobile_verify::AttestationBuilder`] checks one — the aggregator counts
@@ -20,8 +27,10 @@
 //! block's attestation by sending one bad receipt.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
+use n42_qmdb_state::QmdbState;
 use n42_h2_consensus::wire_bridge::{self, BridgeError};
 use n42_h2_primitives::consensus::{
     ConsensusMessage, Decide, H2V4ChainIdentity, QuorumCertificate,
@@ -113,6 +122,29 @@ pub struct MobileService {
     order: VecDeque<B256>,
     finality: Option<FinalityReport>,
     max_blocks: usize,
+    /// The QMDB tree this node's state root comes from, when it keeps one.
+    /// Shared with whatever applies blocks to it.
+    state: Option<Arc<Mutex<QmdbState>>>,
+}
+
+/// A membership proof and the root it is checked against.
+///
+/// The root is included so a phone can compare it with the one in the header it
+/// already verified, and reject a proof cut from some other tree. A proof
+/// without its root is a proof of nothing in particular.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateProofReport {
+    /// The state root the proof is anchored to. On a QMDB chain this is the
+    /// header's state root.
+    pub root: B256,
+    /// The leaf key proved: `Blake3(address)` or `Blake3(address || slot)`.
+    pub key: B256,
+    /// The leaf value, as the tree holds it.
+    #[serde(with = "hex_bytes")]
+    pub value: Vec<u8>,
+    /// The proof in gov5's v2 layout.
+    #[serde(with = "hex_bytes")]
+    pub proof: Vec<u8>,
 }
 
 impl MobileService {
@@ -127,7 +159,18 @@ impl MobileService {
             order: VecDeque::new(),
             finality: None,
             max_blocks: DEFAULT_TRACKED_BLOCKS,
+            state: None,
         }
+    }
+
+    /// Serves state proofs from `state`.
+    ///
+    /// The same tree the node's block headers take their state root from —
+    /// anything else and a phone would be verifying a proof against a root
+    /// nothing else agrees with.
+    pub fn with_state(mut self, state: Arc<Mutex<QmdbState>>) -> Self {
+        self.state = Some(state);
+        self
     }
 
     /// Registers a phone's BLS public key and returns its index.
@@ -248,6 +291,35 @@ impl MobileService {
             return None;
         }
         builder.clone().build().ok()
+    }
+
+    /// Proves what the state tree holds for an account, or for one of its
+    /// storage slots when `slot` is given.
+    ///
+    /// `None` means either that this node keeps no state tree, or that the key
+    /// has no live leaf. Those are deliberately not distinguished: QMDB
+    /// membership proofs do not prove absence, so a caller must not read either
+    /// as "the account does not exist".
+    pub fn prove(&self, address: Address, slot: Option<B256>) -> Option<StateProofReport> {
+        let state = self.state.as_ref()?;
+        let state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let proof = match slot {
+            Some(slot) => state.prove_storage(address, slot),
+            None => state.prove_account(address),
+        }?;
+        Some(StateProofReport {
+            root: state.root(),
+            key: B256::from(proof.key),
+            value: proof.value.clone(),
+            proof: proof.encode().ok()?,
+        })
+    }
+
+    /// Whether this node can serve state proofs at all.
+    pub const fn serves_state_proofs(&self) -> bool {
+        self.state.is_some()
     }
 
     /// How many blocks are collecting receipts.

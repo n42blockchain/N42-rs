@@ -28,6 +28,13 @@
 //! node votes on other members' proposals but never makes one, which is the
 //! right way to join a fleet that is already producing.
 //!
+//! `--datadir <path>` makes consensus state survive a restart: the vote log
+//! (a safety requirement — a node that restarts without it re-votes in views it
+//! already signed, which is equivocation) and a checkpoint so the node rejoins
+//! near the head instead of proposing from genesis, which a live execution layer
+//! answers with `-38006 Too deep reorg`. Without it the node runs stateless and
+//! must not be restarted into a fleet it was already voting in.
+//!
 //! `--mobile <addr>` opens the `mobile_*` endpoint phones talk to: it serves
 //! each commit as the `Decide` a fleet member would verify, and collects the
 //! verification receipts phones send back. It has no TLS, auth, or rate limiting
@@ -49,7 +56,7 @@ use n42_h2_consensus::{ConsensusEngine, EngineOutput, ValidatorInfo, ValidatorSe
 use n42_h2_el_rpc::{EngineApiClient, HttpTransport};
 use n42_h2_execution::ExecutionDriver;
 use n42_h2_net::{H2V4Transport, TransportConfig};
-use n42_h2_node::{H2Service, ServiceEvent};
+use n42_h2_node::{ConsensusStore, H2Service, ServiceEvent};
 use n42_h2_primitives::bls::BlsSecretKey;
 use n42_h2_primitives::consensus::H2V4ChainIdentity;
 use n42_mobile_service::MobileService;
@@ -75,6 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut fault_tolerance: Option<u32> = None;
     let mut propose = false;
     let mut mobile_addr: Option<String> = None;
+    let mut datadir: Option<String> = None;
     let mut base_timeout_ms: u64 = 4_000;
 
     let mut args = std::env::args().skip(1);
@@ -101,6 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--timeout-ms" => {
                 base_timeout_ms = args.next().ok_or("--timeout-ms needs a value")?.parse()?
             }
+            "--datadir" => datadir = Some(args.next().ok_or("--datadir needs a path")?),
             "--mobile" => mobile_addr = Some(args.next().ok_or("--mobile needs an address")?),
             "--propose" => propose = true,
             "--help" | "-h" => {
@@ -189,22 +198,99 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
 
         let (output_tx, output_rx) = tokio::sync::mpsc::channel::<EngineOutput>(256);
-        let mut engine = ConsensusEngine::new(
-            index,
-            secret_key,
-            validator_set,
-            base_timeout_ms,
-            base_timeout_ms * 4,
-            output_tx,
-        );
+        let store = datadir
+            .as_ref()
+            .map(ConsensusStore::open)
+            .transpose()?;
+        // The execution layer's head has to be recovered alongside the view. A
+        // node that resumes consensus at view N but points its driver at genesis
+        // sends a forkchoiceUpdated for a block thousands behind, and a live
+        // execution layer answers "-38006 Too deep reorg" for every proposal it
+        // then tries to build. The last committed QC names the block that was
+        // head when the checkpoint was written.
+        let mut recovered_head = None;
+        let mut engine = match &store {
+            None => {
+                println!("state        : in memory only (do not restart into a live fleet)");
+                ConsensusEngine::new(
+                    index,
+                    secret_key,
+                    validator_set,
+                    base_timeout_ms,
+                    base_timeout_ms * 4,
+                    output_tx,
+                )
+            }
+            Some(store) => {
+                // The vote log goes in whether or not there is anything to
+                // recover: it has to be durable before the first signature, not
+                // after the first restart.
+                let vote_log: Arc<dyn n42_h2_consensus::VoteLogWriter> =
+                    Arc::new(store.vote_log()?);
+                let epochs = n42_h2_consensus::EpochManager::new(validator_set);
+                match store.load()? {
+                    None => {
+                        println!("state        : {}, fresh", datadir.as_deref().unwrap_or("."));
+                        ConsensusEngine::with_epoch_manager_and_vote_log(
+                            index,
+                            secret_key,
+                            epochs,
+                            base_timeout_ms,
+                            base_timeout_ms * 4,
+                            output_tx,
+                            vote_log,
+                        )
+                    }
+                    Some(recovered) => {
+                        println!(
+                            "state        : resuming at view {} (last voted {})",
+                            recovered.view, recovered.last_voted_view,
+                        );
+                        if recovered.last_committed_qc.view > 0 {
+                            recovered_head = Some(recovered.last_committed_qc.block_hash);
+                            println!(
+                                "head         : {}",
+                                recovered.last_committed_qc.block_hash,
+                            );
+                        }
+                        ConsensusEngine::with_recovered_state_and_vote_log(
+                            index,
+                            secret_key,
+                            epochs,
+                            base_timeout_ms,
+                            base_timeout_ms * 4,
+                            output_tx,
+                            recovered.view,
+                            recovered.locked_qc,
+                            recovered.last_committed_qc,
+                            recovered.consecutive_timeouts,
+                            recovered.last_voted_view,
+                            recovered.last_commit_voted_view,
+                            vote_log,
+                        )
+                    }
+                }
+            }
+        };
         // Without this the node signs under the native profile and every fleet
         // member rejects its votes.
         engine.enable_h2_v4_signing(identity);
 
         let el = EngineApiClient::new(HttpTransport::new(el_url, jwt, Duration::from_secs(8))?);
-        let driver = ExecutionDriver::new(el, identity.genesis_hash);
+        let driver = ExecutionDriver::new(el, recovered_head.unwrap_or(identity.genesis_hash));
 
         let mut service = H2Service::new(transport, engine, driver, output_rx, validator_count);
+        if let Some(store) = store {
+            // Inside the service, not on the event it emits: the checkpoint has
+            // to be durable before the commit reaches the execution layer, and
+            // by the time an event is handed back here the forkchoice has
+            // already gone out.
+            service = service.with_checkpoint(move |engine| {
+                store
+                    .save(&n42_h2_node::persistence::checkpoint_from(engine))
+                    .map_err(|error| error.to_string())
+            });
+        }
         if propose {
             let fee_recipient = entry.address;
             service = service.with_payload_attributes(move |_view, _head| {
@@ -303,6 +389,7 @@ h2_validator — run a participating HotStuff-2 v4 node against an execution lay
   --listen <multiaddr>      address to listen on (repeatable)
   --propose                 build blocks when leader (default: vote only)
   --mobile <addr>           serve the mobile_* endpoint here (e.g. 127.0.0.1:9545)
+  --datadir <path>          persist consensus state here (required to restart safely)
   --fault-tolerance <u32>   override f; defaults to (n-1)/3
   --timeout-ms <u64>        base view timeout (default 4000)
 ";

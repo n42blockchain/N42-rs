@@ -1,0 +1,34 @@
+[package]
+name = "n42-h2-node"
+version.workspace = true
+edition.workspace = true
+# Ported from ../N42-26 (rustc 1.97); see the note in the sibling h2 crates.
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Wires the HotStuff-2 engine to the gov5 gossip transport and an execution layer"
+
+[dependencies]
+n42-h2-consensus.workspace = true
+n42-h2-execution.workspace = true
+n42-h2-net.workspace = true
+n42-h2-primitives.workspace = true
+n42-h2-wire.workspace = true
+alloy-primitives = { workspace = true, features = ["serde"] }
+alloy-rpc-types-engine.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+futures.workspace = true
+hex.workspace = true
+libp2p = { workspace = true, default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+[lints]
+workspace = true

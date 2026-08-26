@@ -26,6 +26,7 @@ pub mod rotor;
 pub mod validator;
 mod validator_info;
 pub mod vote_log;
+pub mod wire_bridge;
 
 pub use error::{ConsensusError, ConsensusResult};
 pub use protocol::quorum::{

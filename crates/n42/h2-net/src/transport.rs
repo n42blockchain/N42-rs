@@ -88,6 +88,17 @@ pub enum PublishError {
 }
 
 impl PublishError {
+    /// Whether the message is already on the wire.
+    ///
+    /// gossipsub dedupes by message id, and gov5's id is a hash of the payload,
+    /// so re-sending an identical message is refused as a duplicate. That is
+    /// success from the sender's point of view — the fleet has the message —
+    /// and consensus engines re-broadcast on purpose, so treating it as a
+    /// failure buries the real ones in noise.
+    pub const fn is_already_published(&self) -> bool {
+        matches!(self, Self::Gossipsub(gossipsub::PublishError::Duplicate))
+    }
+
     /// Whether retrying once the mesh has peers is likely to succeed.
     ///
     /// A node that comes up before the fleet does hits this on every send until

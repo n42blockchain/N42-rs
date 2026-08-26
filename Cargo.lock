@@ -7920,6 +7920,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "n42-h2-node"
+version = "2.1.5"
+dependencies = [
+ "alloy-primitives 1.6.1",
+ "alloy-rpc-types-engine 2.4.1",
+ "futures",
+ "hex",
+ "libp2p",
+ "n42-h2-consensus",
+ "n42-h2-execution",
+ "n42-h2-net",
+ "n42-h2-primitives",
+ "n42-h2-wire",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "n42-h2-primitives"
 version = "2.1.5"
 dependencies = [

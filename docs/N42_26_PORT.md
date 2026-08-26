@@ -26,7 +26,7 @@ none: no existing package version was replaced, so the reth v1.11.0 build graph
 resolves exactly as before.
 
 Test count by crate: bmt-core 7, twig-core 38, h2-primitives 48, h2-wire 9,
-h2-consensus 209, mobile-verify 61, h2-net 35, h2-execution 9 — **423 total**.
+h2-consensus 217, mobile-verify 61, h2-net 35, h2-execution 9, h2-node 3 — **434 total**.
 
 | Crate | From N42-26 | Lines | Tests | What it gives this repo |
 |---|---|---|---|---|
@@ -37,6 +37,7 @@ h2-consensus 209, mobile-verify 61, h2-net 35, h2-execution 9 — **423 total**.
 | `n42-h2-consensus` | `n42-consensus` (all but `adapter.rs`) + `n42-consensus-service/h2_finality.rs` | 12,599 | 209 | The HotStuff-2 protocol core — state machine, proposal, voting, quorum assembly, pacemaker, view change, timeout certificates — plus validator set, epoch management, leader selection, rotor, vote log, and `VerifyH2V4Decide`. Enough to *participate*, not only observe. |
 | `n42-mobile-verify` | `n42-mobile` (format half) | 2,363 | 61 | Verification receipts, BLS attestation aggregation, twig/SBMT state proofs, hot-contract code cache. |
 | `n42-h2-net` | new, modelled on `n42-network` | 2,266 | 35 | gov5-compatible GossipSub transport: topic strings, router parameters, gov5's message-ID function, the `/rpc/status/1/ssz_snappy` handshake. `H2V4Transport` is the bidirectional mesh member (subscribe, decode, **publish**); `H2V4Observer` is the read-only use of it, turning wire bytes into verified finality. Ships a runnable `h2_observer` example. |
+| `n42-h2-node` | new | 490 | 3 | The service loop that makes the other three a fleet member: transport events become consensus events, engine outputs become published envelopes and execution calls, execution answers come back as consensus events. A four-node integration test commits a block over a real gossip mesh. |
 | `n42-h2-execution` | seam from `n42-consensus-service/src/el.rs`; driver is new | 920 | 9 | The execution-layer seam (`ExecutionLayer`, Engine API in alloy types only) and the driver that services consensus's requests against it, plus an in-memory EL for testing the loop. |
 
 ### Renames
@@ -122,6 +123,21 @@ Against the brief's action list for the Rust side:
   Chain-identity mismatch is refused before the wire, and an empty mesh is
   reported as transient so a node that starts before its fleet retries instead
   of giving up.
+- [x] 8. Participate, not just follow — `n42-h2-node`. `tests/four_node_fleet.rs`
+  runs four `H2Service`s over TCP with gov5's router parameters and envelope
+  format and commits a block. Three things had to be fixed to get there, all of
+  which would have bitten a real deployment:
+  - **Genesis QC encoding.** `validate_bitmap` rejects an embedded signer count
+    of zero, so a genesis QC crosses the wire with an *empty* bitmap while the
+    rest of this crate spells it `[0, 0]`. Emitting `[0, 0]` made every first
+    proposal unpublishable, reported as "non-canonical bitmap" three layers from
+    the cause.
+  - **Startup timeouts.** A node whose view clock starts before its mesh does
+    spends its first views broadcasting timeouts to nobody and arrives already
+    behind. `H2Service` holds the first view's clock until a mesh peer exists.
+  - **Duplicate publishes are success.** gov5's message id is a hash of the
+    payload and engines re-broadcast by design, so gossipsub's `Duplicate` means
+    the fleet already has the message.
 - [ ] 6. (Standing constraint) do not configure epoch validator changes on a v4 chain.
 
 ## Live cross-client attach: how far it got

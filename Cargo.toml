@@ -29,6 +29,7 @@ members = [
     "crates/n42/h2-consensus",
     "crates/n42/h2-net",
     "crates/n42/h2-execution",
+    "crates/n42/h2-node",
     "crates/n42/mobile-verify",
     "crates/n42/twig-core",
     "crates/n42/storage",
@@ -228,6 +229,7 @@ n42-h2-wire = { path = "crates/n42/h2-wire" }
 n42-h2-consensus = { path = "crates/n42/h2-consensus" }
 n42-h2-net = { path = "crates/n42/h2-net" }
 n42-h2-execution = { path = "crates/n42/h2-execution" }
+n42-h2-node = { path = "crates/n42/h2-node" }
 n42-mobile-verify = { path = "crates/n42/mobile-verify" }
 n42-twig-core = { path = "crates/n42/twig-core" }
 merkle_db_rs = {path="crates/n42/merkle_db_rs"}

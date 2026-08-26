@@ -32,5 +32,5 @@ pub use engine::{
     built_block_from_envelope, forkchoice_method, new_payload_call, EngineApiClient,
 };
 pub use transport::{
-    HttpTransport, JsonRpcTransport, RpcError, TransportError, UNKNOWN_PAYLOAD,
+    HttpTransport, JsonRpcTransport, RpcError, TransportError, UNKNOWN_PAYLOAD, UNSUPPORTED_FORK,
 };

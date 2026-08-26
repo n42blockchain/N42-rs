@@ -33,7 +33,8 @@
 //!
 //! `forkchoiceUpdated` picks its version from the attributes, since each version
 //! is defined by the fields it accepts: `parentBeaconBlockRoot` requires V3,
-//! `withdrawals` requires V2.
+//! `withdrawals` requires V2. `getPayload` is asked newest-first, because each
+//! of its versions answers for exactly one fork and refuses the rest.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -41,19 +42,18 @@ use std::sync::Mutex;
 use alloy_consensus::constants::EIP4844_TX_TYPE_ID;
 use alloy_consensus::{TxEnvelope, Typed2718};
 use alloy_eips::eip2718::Decodable2718;
-use alloy_eips::eip7685::RequestsOrHash;
+use alloy_eips::eip7685::{Requests, RequestsOrHash};
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::{
-    CancunPayloadFields, ExecutionData, ExecutionPayload, ExecutionPayloadEnvelopeV3,
-    ExecutionPayloadEnvelopeV4, ExecutionPayloadInputV2, ExecutionPayloadSidecar,
-    ForkchoiceState, ForkchoiceUpdated, PayloadAttributes, PayloadId, PayloadStatus,
-    PraguePayloadFields,
+    CancunPayloadFields, ExecutionData, ExecutionPayload, ExecutionPayloadInputV2,
+    ExecutionPayloadSidecar, ExecutionPayloadV3, ForkchoiceState, ForkchoiceUpdated,
+    PayloadAttributes, PayloadId, PayloadStatus, PraguePayloadFields,
 };
 use n42_h2_execution::{BuiltBlock, ElError, ExecutionLayer, ResolveKind};
 use serde_json::{json, Value};
 use tracing::debug;
 
-use crate::transport::{JsonRpcTransport, TransportError, UNKNOWN_PAYLOAD};
+use crate::transport::{JsonRpcTransport, TransportError, UNKNOWN_PAYLOAD, UNSUPPORTED_FORK};
 
 /// How many in-flight builds to remember the beacon root for.
 ///
@@ -190,18 +190,40 @@ pub const fn forkchoice_method(attrs: Option<&PayloadAttributes>) -> &'static st
     }
 }
 
-/// Picks the `getPayload` version matching the `forkchoiceUpdated` that started
-/// the build.
+/// The `getPayload` versions, newest first.
 ///
-/// Kept alongside [`forkchoice_method`] because the two must agree: a build
-/// started by V3 must be collected by `getPayloadV3` or later, or the execution
-/// layer returns a payload missing the Cancun fields.
-const fn get_payload_method(started_with: &str) -> &'static str {
-    match started_with.as_bytes() {
-        b"engine_forkchoiceUpdatedV1" => "engine_getPayloadV1",
-        b"engine_forkchoiceUpdatedV2" => "engine_getPayloadV2",
-        _ => "engine_getPayloadV3",
-    }
+/// Each version is bound to a fork: V5 answers only for Osaka builds, V4 only
+/// for Prague, V3 only for Cancun, and the execution layer refuses the others
+/// with [`UNSUPPORTED_FORK`]. This client does not carry the fork schedule, so
+/// it asks newest-first and takes the first version that answers. The wrong
+/// choice is not merely refused, either: a Prague build collected through V3
+/// arrives without its execution requests, the block re-imported from it lacks
+/// the requests hash its header carries, and the leader's own execution layer
+/// rejects the block it just built with "block hash mismatch".
+const GET_PAYLOAD_METHODS: [&str; 3] =
+    ["engine_getPayloadV5", "engine_getPayloadV4", "engine_getPayloadV3"];
+
+/// What every `getPayload` version has in common.
+///
+/// V3, V4 and V5 differ in what else they carry — V4 adds execution requests,
+/// V5 changes the blobs bundle — but the block, its KZG commitments and the
+/// requests are all that re-importing it needs, and all three spell those the
+/// same way. Reading them through one shape is what lets the version be chosen
+/// at runtime.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetPayloadEnvelope {
+    execution_payload: ExecutionPayloadV3,
+    #[serde(default)]
+    blobs_bundle: BlobCommitments,
+    #[serde(default)]
+    execution_requests: Option<Vec<alloy_primitives::Bytes>>,
+}
+
+#[derive(Default, serde::Deserialize)]
+struct BlobCommitments {
+    #[serde(default)]
+    commitments: Vec<alloy_primitives::FixedBytes<48>>,
 }
 
 /// Turns a `getPayload` envelope into the node-neutral result.
@@ -211,23 +233,12 @@ const fn get_payload_method(started_with: &str) -> &'static str {
 /// the Engine API never echoes it back. It is nevertheless required to re-import
 /// the block through `newPayload`, so the client remembers it per build — see
 /// [`EngineApiClient::fork_choice_updated_with_attrs`].
-///
-/// Accepts both the V3 and V4 envelope shapes: V4 is V3 with execution requests
-/// flattened on, so a Prague endpoint's answer parses as either, and trying V4
-/// first is what keeps the requests instead of dropping them.
 pub fn built_block_from_envelope(
     value: Value,
     parent_beacon_block_root: B256,
 ) -> Result<BuiltBlock, ElError> {
-    let (envelope, requests) =
-        match serde_json::from_value::<ExecutionPayloadEnvelopeV4>(value.clone()) {
-            Ok(v4) => (v4.envelope_inner, Some(v4.execution_requests)),
-            Err(_) => {
-                let v3: ExecutionPayloadEnvelopeV3 = serde_json::from_value(value)
-                    .map_err(|e| ElError::new(format!("unusable getPayload envelope: {e}")))?;
-                (v3, None)
-            }
-        };
+    let envelope: GetPayloadEnvelope = serde_json::from_value(value)
+        .map_err(|e| ElError::new(format!("unusable getPayload envelope: {e}")))?;
 
     let inner = &envelope.execution_payload.payload_inner.payload_inner;
     let hash = inner.block_hash;
@@ -239,16 +250,21 @@ pub fn built_block_from_envelope(
     // From the bundle's KZG commitments, not from the transactions: this is the
     // list `newPayload` checks the block against, and the execution layer that
     // built it is the authority on it.
-    let versioned_hashes = envelope.blobs_bundle.versioned_hashes();
+    let versioned_hashes = envelope
+        .blobs_bundle
+        .commitments
+        .iter()
+        .map(|c| alloy_eips::eip4844::kzg_to_versioned_hash(c.as_slice()))
+        .collect();
     let cancun = CancunPayloadFields {
         parent_beacon_block_root,
         versioned_hashes,
     };
-    let sidecar = match requests {
+    let sidecar = match envelope.execution_requests {
         Some(requests) => ExecutionPayloadSidecar::v4(
             cancun,
             PraguePayloadFields {
-                requests: RequestsOrHash::Requests(requests),
+                requests: RequestsOrHash::Requests(Requests::new(requests)),
             },
         ),
         None => ExecutionPayloadSidecar::v3(cancun),
@@ -339,18 +355,29 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
         // happens on the caller's side, in how long it lets the build run before
         // asking. Honouring the kind by polling here would be worse — each call
         // may terminate the build.
-        let method = get_payload_method(forkchoice_method(None));
+        //
         // A build this client did not start has no remembered root. Zero is the
         // honest stand-in — it is what a pre-Cancun chain uses — and the block
         // will fail its own `newPayload` check rather than being imported under
         // a root nobody agreed to.
         let beacon_root = self.recall_build(id).unwrap_or_default();
-        match self.transport.call(method, vec![json!(id)]).await {
-            Ok(value) => Some(built_block_from_envelope(value, beacon_root)),
-            // A build the execution layer does not know about is an absent
-            // result, not a failure: the driver retries or moves on.
-            Err(TransportError::Rpc(err)) if err.code == UNKNOWN_PAYLOAD => None,
-            Err(err) => Some(Err(ElError::new(err))),
+        for method in GET_PAYLOAD_METHODS {
+            match self.transport.call(method, vec![json!(id)]).await {
+                Ok(value) => {
+                    debug!(target: "n42.h2.el", method, "getPayload");
+                    return Some(built_block_from_envelope(value, beacon_root));
+                }
+                // Wrong version for this build's fork: ask the next one down.
+                Err(TransportError::Rpc(err)) if err.code == UNSUPPORTED_FORK => {}
+                // A build the execution layer does not know about is an absent
+                // result, not a failure: the driver retries or moves on.
+                Err(TransportError::Rpc(err)) if err.code == UNKNOWN_PAYLOAD => return None,
+                Err(err) => return Some(Err(ElError::new(err))),
+            }
         }
+        Some(Err(ElError::new(
+            "no getPayload version accepted this build; the execution layer is on a fork this \
+             adapter does not know",
+        )))
     }
 }

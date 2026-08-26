@@ -10,6 +10,8 @@ repository.workspace = true
 description = "Installs the QMDB state commitment into reth's block production and validation"
 
 [dependencies]
+n42-h2-consensus.workspace = true
+n42-h2-primitives.workspace = true
 n42-qmdb-state.workspace = true
 n42-twig-core.workspace = true
 alloy-consensus.workspace = true
@@ -33,12 +35,12 @@ revm-database.workspace = true
 bincode.workspace = true
 eyre.workspace = true
 serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
 thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 revm-state.workspace = true
-serde_json = { workspace = true, features = ["std"] }
 
 [lints]
 workspace = true

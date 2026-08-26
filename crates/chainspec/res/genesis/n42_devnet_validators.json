@@ -1,0 +1,31 @@
+{
+  "seed": "n42-devnet-validator",
+  "derivation": "BlsSecretKey::key_gen(keccak256(format!(\"{seed}-{index}\")))",
+  "note": "Development keys only. Anyone can derive them; never fund or run a real fleet with them.",
+  "validators": [
+    {
+      "index": 0,
+      "address": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+      "bls_public_key": "0x864e99d7900501f8dc373a94aaf98f37bcd5c2efad85a04832e6a908b088e24cd05fb3a682aa7817c7d22aad4cf54a2d",
+      "bls_secret_key": "0x6c84c4caa6d4b66b80eb3901a2d2cd5d01f9c797162072c5d49e0a5b56392156"
+    },
+    {
+      "index": 1,
+      "address": "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
+      "bls_public_key": "0x972979766cca84f864dbd3d393a7fe7ee877cb0c39cea2119329040c567a38c5a3be0f54ba396e5c8da0bbb2b33807cd",
+      "bls_secret_key": "0x66e0a85213bf50d08770fca62948d3fdb601bc43239e22e8220e5c1fb767690a"
+    },
+    {
+      "index": 2,
+      "address": "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc",
+      "bls_public_key": "0xb533aa26282058942534c1eaf57950bce822e895420a4777626634d995aed717eb2a5f351e91833b10b2ad20ca3f6fd1",
+      "bls_secret_key": "0x5436caccb10aa1499f050aa8565b9247420d88b820257516f00b38bedbfc4361"
+    },
+    {
+      "index": 3,
+      "address": "0x90f79bf6eb2c4f870365e785982e1f101e93b906",
+      "bls_public_key": "0x88d5f930092ca519d94f9faf111bb176a3b7636ab86ef9504e86cf60780c1d8b023db2ccaace5afb74b8b53325eaebe5",
+      "bls_secret_key": "0x5823f6378be0e39cdc5895fc1a8614e912d46119eb517eee9f91adfb207e2d1a"
+    }
+  ]
+}

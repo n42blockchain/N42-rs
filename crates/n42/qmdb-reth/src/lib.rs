@@ -23,6 +23,7 @@
 
 pub mod chainspec;
 pub mod changes;
+pub mod hotstuff;
 pub mod node_state;
 pub mod strategy;
 
@@ -31,5 +32,6 @@ pub use chainspec::{
     STATE_SCHEME_KEY, STATE_SCHEME_QMDB,
 };
 pub use changes::{changes_from_alloc, changes_from_bundle};
+pub use hotstuff::{GenesisValidator, HotStuffConfigError, HotStuffGenesisConfig};
 pub use node_state::{NodeStateError, QmdbNodeState};
 pub use strategy::{QmdbEngineValidatorBuilder, QmdbStateRootStrategy};

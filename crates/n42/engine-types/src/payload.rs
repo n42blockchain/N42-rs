@@ -527,12 +527,13 @@ where
         .is_prague_active_at_timestamp(attributes.timestamp)
         .then_some(execution_result.requests);
 
-    // initialize empty blob sidecars at first. If cancun is active then this will
-    let mut blob_sidecars: Vec<alloy_consensus::BlobTransactionSidecar> = Vec::new();
-
-    // only determine cancun fields when active
+    // Blob sidecars, in whichever variant the pool holds them. Kept as the
+    // variant and not flattened to EIP-4844: the Osaka `getPayload` envelope
+    // carries cell proofs and refuses an EIP-4844-shaped bundle outright — even
+    // an empty one — and reth reports that refusal as "unknown payload", which
+    // reads like the build never happened.
+    let mut blob_sidecars = reth_ethereum_engine_primitives::BlobSidecars::Empty;
     if chain_spec.is_cancun_active_at_timestamp(attributes.timestamp) {
-        // grab the blob sidecars from the executed txs
         let raw_sidecars = pool
             .get_all_blobs_exact(
                 block
@@ -543,16 +544,9 @@ where
                     .collect(),
             )
             .map_err(PayloadBuilderError::other)?;
-
-        // Convert BlobTransactionSidecarVariant to BlobTransactionSidecar
-        blob_sidecars = raw_sidecars
-            .into_iter()
-            .filter_map(|arc_sidecar| {
-                let sidecar = Arc::unwrap_or_clone(arc_sidecar);
-                // BlobTransactionSidecarVariant can be converted via into_eip4844()
-                sidecar.into_eip4844()
-            })
-            .collect();
+        for sidecar in raw_sidecars {
+            blob_sidecars.push_sidecar_variant(Arc::unwrap_or_clone(sidecar));
+        }
     }
 
     header.state_root = match &qmdb_prepared {

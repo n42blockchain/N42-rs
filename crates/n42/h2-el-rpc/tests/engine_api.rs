@@ -26,6 +26,7 @@ use alloy_rpc_types_engine::{
 };
 use n42_h2_el_rpc::{
     new_payload_call, EngineApiClient, JsonRpcTransport, RpcError, TransportError, UNKNOWN_PAYLOAD,
+    UNSUPPORTED_FORK,
 };
 use n42_h2_execution::{ExecutionLayer, ResolveKind};
 use serde_json::{json, Value};
@@ -386,4 +387,57 @@ async fn a_v4_envelope_keeps_its_execution_requests() {
         built.execution_data.sidecar.requests().is_some(),
         "the V4 envelope's execution requests were dropped",
     );
+}
+
+/// Each `getPayload` version answers for one fork and refuses the rest, and
+/// the client has no fork schedule, so it asks newest-first. Getting this wrong
+/// is silent until it is not: a Prague build collected through V3 has no
+/// requests, and the leader's own execution layer rejects the re-import with
+/// "block hash mismatch".
+#[tokio::test]
+async fn get_payload_is_asked_newest_first_until_a_version_accepts_the_fork() {
+    let recorder = Recorder::with_answers(vec![
+        Err(UNSUPPORTED_FORK),
+        Err(UNSUPPORTED_FORK),
+        Ok(json!({
+            "executionPayload": payload_v3(),
+            "blockValue": "0x0",
+            "blobsBundle": {"commitments": [], "proofs": [], "blobs": []},
+            "shouldOverrideBuilder": false,
+        })),
+    ]);
+    let client = EngineApiClient::new(SharedRecorder(recorder.clone()));
+    let built = client
+        .resolve_payload(PayloadId::new([3; 8]), ResolveKind::WaitForPending)
+        .await
+        .expect("the build exists")
+        .expect("and is usable");
+    assert_eq!(
+        recorder.methods(),
+        vec!["engine_getPayloadV5", "engine_getPayloadV4", "engine_getPayloadV3"]
+    );
+    // A Cancun-shaped envelope carries no requests, so the re-import goes to V3.
+    assert_eq!(new_payload_call(&built.execution_data).unwrap().0, "engine_newPayloadV3");
+}
+
+/// A V5 (Osaka) envelope: a different blobs bundle, and requests. The block it
+/// carries re-imports through `newPayloadV4`, which covers Prague and Osaka.
+#[tokio::test]
+async fn an_osaka_envelope_is_read_and_re_imported_with_its_requests() {
+    let recorder = Recorder::with_answers(vec![Ok(json!({
+        "executionPayload": payload_v3(),
+        "blockValue": "0x0",
+        "blobsBundle": {"commitments": [], "proofs": [], "blobs": []},
+        "shouldOverrideBuilder": false,
+        "executionRequests": [],
+    }))]);
+    let client = EngineApiClient::new(SharedRecorder(recorder.clone()));
+    let built = client
+        .resolve_payload(PayloadId::new([5; 8]), ResolveKind::WaitForPending)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recorder.methods(), vec!["engine_getPayloadV5"]);
+    assert!(built.execution_data.sidecar.requests().is_some());
+    assert_eq!(new_payload_call(&built.execution_data).unwrap().0, "engine_newPayloadV4");
 }

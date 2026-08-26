@@ -156,15 +156,37 @@ pub const N42_GENESIS_HASH: B256 =
 pub const N42_TESTNET_CHAINID: u64 = 1142;
 pub const N42_DEVNET_CHAINID: u64 = 1143;
 
+/// Whether a genesis config carries a fork schedule of its own.
+///
+/// The legacy N42 genesis files have an empty `config` and rely on the
+/// built-in [`N42_HARDFORKS`]; the QMDB devnet declares every fork in the file,
+/// the same file a gov5 node is initialised from. A file that says which forks
+/// it has is believed — anything else would give the same JSON two different
+/// genesis hashes depending on whether it was loaded by name or by path.
+fn declares_fork_schedule(genesis: &Genesis) -> bool {
+    let config = &genesis.config;
+    config.shanghai_time.is_some()
+        || config.cancun_time.is_some()
+        || config.prague_time.is_some()
+        || config.london_block.is_some()
+}
+
 fn make_chain_spec(
     genesis: Genesis,
     chain: Chain,
     deposit_contract: Option<DepositContract>,
 ) -> ChainSpec {
+    if declares_fork_schedule(&genesis) {
+        let mut spec = ChainSpec::from(genesis);
+        spec.chain = chain;
+        spec.deposit_contract = deposit_contract;
+        spec.genesis.config.dao_fork_support = true;
+        return spec;
+    }
     let hardforks = N42_HARDFORKS.clone();
     //let genesis_hash = alloy_primitives::keccak256(alloy_rlp::encode(genesis.header()));
     let genesis_header = SealedHeader::new_unhashed(
-        make_genesis_header(&genesis, &hardforks),
+        crate::qmdb::genesis_header(&genesis, &hardforks),
         //genesis_hash,
     );
     let mut spec = ChainSpec {
@@ -1061,7 +1083,9 @@ impl From<Genesis> for ChainSpec {
 
         Self {
             chain: genesis.config.chain_id.into(),
-            genesis_header: SealedHeader::new_unhashed(make_genesis_header(&genesis, &hardforks)),
+            genesis_header: SealedHeader::new_unhashed(crate::qmdb::genesis_header(
+                &genesis, &hardforks,
+            )),
             genesis,
             hardforks,
             paris_block_and_final_difficulty,

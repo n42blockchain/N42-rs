@@ -35,6 +35,12 @@ pub struct RpcError {
 /// which is a normal outcome when a build was superseded or the EL restarted.
 pub const UNKNOWN_PAYLOAD: i64 = -38001;
 
+/// The method version does not match the fork the payload belongs to.
+///
+/// `engine_getPayloadV3` on a Prague build, for instance. Not a failure of the
+/// build: the execution layer is saying "ask again with the right version".
+pub const UNSUPPORTED_FORK: i64 = -38005;
+
 impl std::fmt::Display for RpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} (code {})", self.message, self.code)

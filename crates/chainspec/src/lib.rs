@@ -22,6 +22,7 @@ mod api;
 /// The chain info module.
 mod info;
 /// The chain spec module.
+pub mod qmdb;
 mod spec;
 
 pub use alloy_chains::{Chain, ChainKind, NamedChain};

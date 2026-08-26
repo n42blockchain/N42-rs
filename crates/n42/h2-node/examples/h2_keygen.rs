@@ -24,12 +24,14 @@ use n42_h2_primitives::bls::BlsSecretKey;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut count: usize = 4;
     let mut out_dir = PathBuf::from(".");
+    let mut seed: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--count" => count = args.next().ok_or("--count needs a value")?.parse()?,
             "--out-dir" => out_dir = PathBuf::from(args.next().ok_or("--out-dir needs a path")?),
+            "--seed" => seed = Some(args.next().ok_or("--seed needs a label")?),
             "--help" | "-h" => {
                 eprintln!("{USAGE}");
                 return Ok(());
@@ -45,7 +47,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut validators = Vec::with_capacity(count);
     for index in 0..count {
-        let secret = BlsSecretKey::random()?;
+        // A seeded key is derived, not drawn: `key_gen(keccak256(seed-index))`,
+        // so a devnet's validators can be reproduced by anyone with the label —
+        // the BLS analogue of a mnemonic-derived dev account. Never seed a
+        // production fleet.
+        let secret = match &seed {
+            Some(label) => {
+                let ikm: [u8; 32] = alloy_primitives::keccak256(format!("{label}-{index}")).0;
+                BlsSecretKey::key_gen(&ikm)?
+            }
+            None => BlsSecretKey::random()?,
+        };
         let key_path = out_dir.join(format!("validator-{index}.key"));
         std::fs::write(&key_path, format!("0x{}\n", hex::encode(secret.to_bytes())))?;
         // The secret is the whole identity of a validator; leaving it
@@ -86,4 +98,5 @@ h2_keygen — generate BLS validator keys and a fleet's validator list
 
   --count <n>       how many validators to generate (default 4)
   --out-dir <path>  where to write them (default .)
+  --seed <label>    derive keys from the label instead of randomness (dev only)
 ";

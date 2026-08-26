@@ -14,7 +14,10 @@ n42-h2-execution.workspace = true
 alloy-consensus.workspace = true
 alloy-eips.workspace = true
 alloy-primitives = { workspace = true, features = ["serde"] }
-alloy-rpc-types-engine = { workspace = true, features = ["jwt", "serde"] }
+# `jwt-aws-lc-rs`, not plain `jwt`: the bare feature pulls in jsonwebtoken
+# without selecting a crypto provider, which compiles and then panics on the
+# first token it signs. reth's own node-core requests the same feature.
+alloy-rpc-types-engine = { workspace = true, features = ["jwt-aws-lc-rs", "serde"] }
 async-trait = "0.1"
 reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 serde = { workspace = true, features = ["derive"] }

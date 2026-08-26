@@ -73,6 +73,10 @@ serde = [
 	"alloy-primitives/serde",
 	"rand?/serde",
 ]
+# Note: this pulls jsonwebtoken in but selects no crypto provider, so signing a
+# token panics at runtime. Depend on `jwt-aws-lc-rs` (or enable a jsonwebtoken
+# provider feature yourself) rather than this one directly. Kept as upstream
+# defines it.
 jwt = ["std", "dep:jsonwebtoken", "dep:rand"]
 # reth 2.4.1's node-core requests this; upstream added it in alloy 2.x.
 jwt-aws-lc-rs = ["jwt", "jsonwebtoken/aws_lc_rs"]

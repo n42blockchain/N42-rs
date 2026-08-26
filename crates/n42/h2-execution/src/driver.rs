@@ -209,7 +209,28 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             .ok_or_else(|| ElError::new(format!("no payload build for id {payload_id}")))??;
 
         self.cache_payload(built.hash, built.execution_data.clone());
-        Ok(built)
+
+        // Import our own block before proposing it. `getPayload` builds a block
+        // but does not insert it, and the leader never receives its own proposal
+        // back over gossip, so nothing else ever will: the block would be
+        // committed by consensus and then rejected by the leader's own
+        // execution layer, which answers the commit's forkchoiceUpdated with
+        // SYNCING and leaves the chain stuck at the parent.
+        let status = self.el.new_payload(built.execution_data.clone()).await?;
+        match status.status {
+            PayloadStatusEnum::Valid => {
+                self.head = built.hash;
+                Ok(built)
+            }
+            // Proposing a block this node's own execution layer will not accept
+            // wastes a view at best and splits the fleet at worst.
+            PayloadStatusEnum::Invalid { validation_error } => Err(ElError::new(format!(
+                "our own execution layer rejected the block we built: {validation_error}"
+            ))),
+            other => Err(ElError::new(format!(
+                "our own execution layer did not accept the block we built: {other:?}"
+            ))),
+        }
     }
 
     /// Handles one consensus output.

@@ -53,11 +53,22 @@ async fn leader_builds_a_block_and_can_serve_its_own_execute_request() {
     let built = driver.build_block(attrs()).await.unwrap();
     assert_eq!(built.number, 1);
 
-    // The build must have gone through FCU-with-attrs then resolve — an FCU
-    // without attributes would never start a build.
+    // FCU-with-attrs to start the build (an FCU without attributes never would),
+    // resolve to collect it, then newPayload to import it.
+    //
+    // That third call is not redundant: `getPayload` builds a block without
+    // inserting it, and the leader never receives its own proposal back over
+    // gossip, so nothing else ever imports it. Without it the block is committed
+    // by consensus and then rejected by the leader's own execution layer, which
+    // answers the commit's forkchoiceUpdated with SYNCING and leaves the chain
+    // stuck at the parent — which is exactly what a live node did.
     assert!(matches!(
         el.calls().as_slice(),
-        [ElCall::ForkchoiceUpdatedWithAttrs(_), ElCall::ResolvePayload(_)]
+        [
+            ElCall::ForkchoiceUpdatedWithAttrs(_),
+            ElCall::ResolvePayload(_),
+            ElCall::NewPayload(_)
+        ]
     ));
 
     // Our own proposal must not require a network round trip to execute.

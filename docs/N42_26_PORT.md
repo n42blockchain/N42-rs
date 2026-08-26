@@ -29,6 +29,9 @@ Test count by crate: bmt-core 7, twig-core 38, h2-primitives 48, h2-wire 9,
 h2-consensus 217, mobile-verify 61, h2-net 35, h2-execution 9, h2-node 3,
 h2-el-rpc 15 — **449 total**.
 
+The stack has been run end to end against a live execution layer; see
+**First live block** below.
+
 | Crate | From N42-26 | Lines | Tests | What it gives this repo |
 |---|---|---|---|---|
 | `n42-bmt-core` | `n42-bmt-core` | 898 | 7 | Sparse binary Merkle tree (Blake3). Zero deps beyond blake3/serde/thiserror. |
@@ -157,7 +160,45 @@ Against the brief's action list for the Rust side:
 
   `cargo run -p n42-h2-node --example h2_validator -- --help` assembles the whole
   stack against a running execution client.
+- [x] 10. Produce a block on a live chain. See **First live block**.
 - [ ] 6. (Standing constraint) do not configure epoch validator changes on a v4 chain.
+
+## First live block
+
+A single-validator fleet (`n = 1`, `f = 0`, quorum 1) run against a real `n42`
+node over the Engine API, on a Cancun-enabled devnet genesis. Consensus
+committed views 1, 3, 5, … and the execution layer's chain grew to block 13 with
+the hashes the commits named. Three things only showed up here:
+
+- **`jwt` is not a working feature by itself.** `alloy-rpc-types-engine`'s bare
+  `jwt` pulls in `jsonwebtoken` without selecting a crypto provider: it compiles
+  and then panics on the first token signed. Depend on `jwt-aws-lc-rs`, which is
+  what reth's own `node-core` requests.
+- **The leader must import its own block.** `getPayload` builds a block without
+  inserting it, and the leader never gets its own proposal back over gossip, so
+  nothing else ever will. Without an explicit `newPayload`, consensus committed
+  the block and the leader's own execution layer answered the commit's
+  `forkchoiceUpdated` with SYNCING, leaving the chain at genesis while the logs
+  showed healthy commits.
+- **A node that is its own quorum must not wait for a mesh.** The startup hold
+  added for fleet members stops a single-validator chain dead: the one member
+  waits forever for a fleet that is already complete.
+
+Two constraints on the setup, both worth knowing before repeating it:
+
+- `crates/chainspec/res/genesis/n42_devnet.json` has an **empty `config`**, so
+  `--chain <that file>` activates no hard forks and every `forkchoiceUpdatedV3`
+  is rejected with `-38003`. A genesis with `shanghaiTime`/`cancunTime` set is
+  needed. (`ChainSpec::N42_DEVNET` in Rust does carry hardforks; the JSON does
+  not, and `--chain <path>` uses the JSON.)
+- N42's payload builder seals through APoS, so the node needs
+  `--dev.consensus-signer-private-key` for an authorized signer even when
+  HotStuff-2 is driving it — without one, every build dies and `getPayload`
+  answers "unknown payload". Pair it with a long `--dev.block-time` so the APoS
+  miner does not also produce blocks.
+
+Not yet measured: a leader proposes every *other* view here, because a view that
+has just committed does not get a proposal. Costs throughput, not correctness.
 
 ## Live cross-client attach: how far it got
 

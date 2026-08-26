@@ -396,6 +396,13 @@ impl<E: ExecutionLayer> H2Service<E> {
         if self.meshed {
             return;
         }
+        // A node that reaches quorum by itself has nobody to wait for. Holding
+        // the clock for a mesh peer would stop a single-validator chain dead:
+        // the one member waits forever for a fleet that is already complete.
+        if self.engine.quorum_size() <= 1 {
+            self.meshed = true;
+            return;
+        }
         let view = self.engine.current_view();
         if self.transport.mesh_size() > 0 {
             self.meshed = true;

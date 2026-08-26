@@ -53,6 +53,16 @@ impl BlsSecretKey {
         Ok(Self(sk))
     }
 
+    /// The raw scalar, for persisting a validator's identity.
+    ///
+    /// The counterpart to [`Self::from_bytes`]. Treat the result the way the key
+    /// file is treated: anything that can read these 32 bytes can sign as this
+    /// validator, and a fleet that sees two conflicting signatures from one
+    /// validator treats it as equivocation.
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.0.to_bytes()
+    }
+
     pub fn public_key(&self) -> BlsPublicKey {
         BlsPublicKey(self.0.sk_to_pk())
     }
@@ -187,7 +197,16 @@ impl std::hash::Hash for BlsPublicKey {
 
 impl Serialize for BlsPublicKey {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_bytes(&self.to_bytes())
+        // Hex in JSON, raw bytes on the wire. A validator list is a file people
+        // read, diff, and paste between clients, and gov5 writes these as hex;
+        // 48 decimal numbers is the same value in a form nobody can check by
+        // eye. Binary formats keep the byte encoding, so nothing on the wire
+        // moves — `is_human_readable` is exactly this distinction.
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&format!("0x{}", hex::encode(self.to_bytes())))
+        } else {
+            serializer.serialize_bytes(&self.to_bytes())
+        }
     }
 }
 

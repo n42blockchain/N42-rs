@@ -31,7 +31,9 @@ pub use chainspec::{
     qmdb_genesis_root, state_scheme, with_declared_state_scheme, N42ChainSpecParser, StateScheme,
     STATE_SCHEME_KEY, STATE_SCHEME_QMDB,
 };
-pub use changes::{changes_from_alloc, changes_from_bundle};
+pub use changes::{
+    changes_from_alloc, changes_from_bundle, changes_from_execution, with_prague_system_caller,
+};
 pub use hotstuff::{GenesisValidator, HotStuffConfigError, HotStuffGenesisConfig};
 pub use node_state::{NodeStateError, QmdbNodeState};
 pub use strategy::{QmdbEngineValidatorBuilder, QmdbStateRootStrategy};

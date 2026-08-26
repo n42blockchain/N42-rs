@@ -39,7 +39,7 @@
 //!   applying the same blocks in the same order arrives at the same root; one
 //!   that reconstructs state some other way does not.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub mod alloc;
 pub mod forest;
@@ -95,9 +95,16 @@ impl AccountState {
 /// lying around in this crate.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BlockChanges {
-    /// Accounts touched this block. `None` deletes; an [`AccountState::is_empty`]
-    /// account deletes too, matching gov5.
+    /// Accounts touched this block. `None` deletes. An [`AccountState::is_empty`]
+    /// account deletes too unless it is in `initialised`, matching gov5's
+    /// `isAccountEmpty`: nonce 0, balance 0, and *not initialised*.
     pub accounts: BTreeMap<Address, Option<AccountState>>,
+    /// Accounts gov5 would hold as state objects. Every state object Erigon
+    /// loads or creates is `Initialised`, so an execution client's touched
+    /// account is a live leaf even when it is empty — the system caller of a
+    /// Prague block being the everyday case. Genesis alloc entries are not
+    /// marked; the root of an alloc is verified against gov5 as is.
+    pub initialised: BTreeSet<Address>,
     /// Storage slots touched this block. A zero value deletes the slot.
     pub storage: BTreeMap<Address, BTreeMap<B256, U256>>,
 }
@@ -114,6 +121,14 @@ impl BlockChanges {
         self
     }
 
+    /// Records an account's post-block state as gov5 records a state object:
+    /// live even when empty. See `initialised`.
+    pub fn set_account_initialised(&mut self, address: Address, account: AccountState) -> &mut Self {
+        self.accounts.insert(address, Some(account));
+        self.initialised.insert(address);
+        self
+    }
+
     /// Records that an account was destroyed.
     pub fn delete_account(&mut self, address: Address) -> &mut Self {
         self.accounts.insert(address, None);
@@ -124,6 +139,12 @@ impl BlockChanges {
     pub fn set_storage(&mut self, address: Address, slot: B256, value: U256) -> &mut Self {
         self.storage.entry(address).or_default().insert(slot, value);
         self
+    }
+
+    /// What was recorded for an account: `None` if untouched, `Some(None)` if
+    /// deleted, `Some(Some(state))` if written.
+    pub fn account(&self, address: &Address) -> Option<Option<&AccountState>> {
+        self.accounts.get(address).map(Option::as_ref)
     }
 
     /// How many leaf operations this produces.
@@ -145,7 +166,8 @@ impl BlockChanges {
         let mut operations = Vec::with_capacity(self.len());
         for (address, account) in &self.accounts {
             let key = gov5_account_key(&address.0 .0);
-            let value = account.filter(|state| !state.is_empty()).map(|state| {
+            let live = self.initialised.contains(address);
+            let value = account.filter(|state| live || !state.is_empty()).map(|state| {
                 encode_gov5_account_value(
                     state.nonce,
                     &state.balance.to_be_bytes::<32>(),

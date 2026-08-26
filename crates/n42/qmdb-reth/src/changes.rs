@@ -25,7 +25,7 @@
 //! has no pre-block slots and the two agree; a chain that re-enables the old
 //! semantics would need a storage enumerator here.
 
-use alloy_primitives::B256;
+use alloy_primitives::{address, Address, B256, U256};
 use n42_qmdb_state::{AccountState, BlockChanges};
 use revm_database::BundleState;
 
@@ -35,7 +35,14 @@ pub fn changes_from_bundle(bundle: &BundleState) -> BlockChanges {
     for (address, account) in &bundle.state {
         match &account.info {
             Some(info) => {
-                changes.set_account(
+                tracing::debug!(
+                    target: "n42.qmdb.changes",
+                    %address, nonce = info.nonce, balance = %info.balance, code_hash = %info.code_hash,
+                    "leaf: account",
+                );
+                // A bundle account is a state object gov5 would hold, and every
+                // state object it holds is `Initialised`: live even when empty.
+                changes.set_account_initialised(
                     *address,
                     AccountState {
                         nonce: info.nonce,
@@ -47,10 +54,16 @@ pub fn changes_from_bundle(bundle: &BundleState) -> BlockChanges {
             // Destroyed, or touched while not existing. gov5 deletes in both
             // cases, and deleting an absent leaf is a no-op in both trees.
             None => {
+                tracing::debug!(target: "n42.qmdb.changes", %address, "leaf: account deleted");
                 changes.delete_account(*address);
             }
         }
         for (slot, value) in &account.storage {
+            tracing::debug!(
+                target: "n42.qmdb.changes",
+                %address, slot = %B256::from(slot.to_be_bytes::<32>()), value = %value.present_value,
+                "leaf: slot",
+            );
             changes.set_storage(
                 *address,
                 B256::from(slot.to_be_bytes::<32>()),
@@ -59,6 +72,49 @@ pub fn changes_from_bundle(bundle: &BundleState) -> BlockChanges {
         }
     }
     changes
+}
+
+/// The leaves a block writes, from its execution, under the rules of the fork
+/// it executed in.
+///
+/// `prague_active` adds the one leaf revm's bundle cannot show: see
+/// [`with_prague_system_caller`].
+pub fn changes_from_execution(bundle: &BundleState, prague_active: bool) -> BlockChanges {
+    let mut changes = changes_from_bundle(bundle);
+    if prague_active {
+        with_prague_system_caller(&mut changes);
+    }
+    changes
+}
+
+/// `SYSTEM_ADDRESS` (EIP-4788): the caller of every system call.
+pub const PRAGUE_SYSTEM_CALLER: Address = address!("fffffffffffffffffffffffffffffffffffffffe");
+
+/// The caller of Prague's end-of-block system calls, as gov5 writes it.
+///
+/// EIP-7002 and EIP-7251 are executed by calling the request contracts from
+/// `SYSTEM_ADDRESS`. Erigon's `SysCallContract` (gov5 `ProcessPragueSystemCalls`)
+/// loads that caller as a state object, which puts it in the journal's dirty
+/// set, and gov5's root computer writes every dirty account — so every Prague
+/// block on a gov5 chain writes `0xffff…fffe` as a live, empty account: nonce
+/// 0, balance 0, no code — a one-byte leaf, `[0x00]`, since gov5's
+/// `isAccountEmpty` spares an initialised account and `MarshalV2` encodes an
+/// empty field bitmap. reth's `SystemCaller` deliberately removes the
+/// system address from the state after each call, so it never reaches the
+/// bundle. Measured on the devnet: this leaf was the entire difference
+/// between the two clients' roots for block 1.
+///
+/// EIP-4788 and EIP-2935 do not contribute it: gov5 writes those slots
+/// directly (`SetState`, `StoreParentBlockHash`) rather than through a call.
+pub fn with_prague_system_caller(changes: &mut BlockChanges) {
+    changes.set_account_initialised(
+        PRAGUE_SYSTEM_CALLER,
+        AccountState {
+            nonce: 0,
+            balance: U256::ZERO,
+            code_hash: alloy_primitives::KECCAK256_EMPTY,
+        },
+    );
 }
 
 pub use n42_qmdb_state::changes_from_alloc;
@@ -85,6 +141,29 @@ mod tests {
             code: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_prague_block_writes_the_system_caller_as_an_empty_live_account() {
+        let bundle = BundleState::default();
+        let without = changes_from_execution(&bundle, false);
+        assert_eq!(without.len(), 0);
+        let with = changes_from_execution(&bundle, true);
+        assert_eq!(with.len(), 1);
+        // Live and empty, not deleted: gov5's root computer sees a state
+        // object, and an object is a leaf.
+        assert_eq!(
+            with.account(&PRAGUE_SYSTEM_CALLER),
+            Some(Some(&AccountState {
+                nonce: 0,
+                balance: U256::ZERO,
+                code_hash: alloy_primitives::KECCAK256_EMPTY,
+            }))
+        );
+        // And it is a leaf, not a deletion: gov5's `[0x00]`.
+        let ops = with.operations();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].value.as_deref(), Some(&[0u8][..]));
     }
 
     /// gov5 writes every touched account, changed or not, and the root moves

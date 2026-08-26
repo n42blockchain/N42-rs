@@ -48,19 +48,41 @@ use reth_storage_overlay::OverlayManager;
 use reth_trie::updates::TrieUpdates;
 use tracing::debug;
 
-use crate::changes::changes_from_bundle;
+use crate::changes::changes_from_execution;
+use reth_chainspec::EthereumHardforks;
 use crate::node_state::QmdbNodeState;
 
 /// Computes QMDB roots for blocks the engine tree validates.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct QmdbStateRootStrategy {
     state: QmdbNodeState,
+    /// Whether Prague is active at a timestamp: it decides whether the block
+    /// wrote the system caller leaf. See `changes::with_prague_system_caller`.
+    prague_at: PragueAt,
+}
+
+/// Fork lookup captured from the chain spec, so the strategy needs no type
+/// parameter for it.
+pub type PragueAt = Arc<dyn Fn(u64) -> bool + Send + Sync>;
+
+impl std::fmt::Debug for QmdbStateRootStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QmdbStateRootStrategy").field("state", &self.state).finish_non_exhaustive()
+    }
 }
 
 impl QmdbStateRootStrategy {
     /// A strategy over the node's forest.
-    pub const fn new(state: QmdbNodeState) -> Self {
-        Self { state }
+    /// A strategy over `state`, on a chain whose Prague activation `chain_spec`
+    /// knows.
+    pub fn new<C: EthereumHardforks + Send + Sync + 'static>(
+        state: QmdbNodeState,
+        chain_spec: Arc<C>,
+    ) -> Self {
+        Self {
+            state,
+            prague_at: Arc::new(move |timestamp| chain_spec.is_prague_active_at_timestamp(timestamp)),
+        }
     }
 }
 
@@ -79,6 +101,7 @@ where
         Ok(PreparedStateRootJob::new(
             Box::new(QmdbStateRootJob {
                 state: self.state.clone(),
+                prague_at: self.prague_at.clone(),
             }),
             None,
         ))
@@ -87,6 +110,7 @@ where
 
 struct QmdbStateRootJob {
     state: QmdbNodeState,
+    prague_at: PragueAt,
 }
 
 impl<N: NodePrimitives> StateRootJob<N> for QmdbStateRootJob {
@@ -101,7 +125,7 @@ impl<N: NodePrimitives> StateRootJob<N> for QmdbStateRootJob {
         _hashed_state: &LazyHashedPostState,
     ) -> ProviderResult<StateRootJobOutcome> {
         let header = block.header();
-        let changes = changes_from_bundle(&output.state);
+        let changes = changes_from_execution(&output.state, (self.prague_at)(header.timestamp()));
         let root = self
             .state
             .validate_block(
@@ -164,6 +188,7 @@ where
             <Node::Types as NodeTypes>::Payload,
             Block = BlockTy<Node::Types>,
         > + Clone,
+    <Node::Types as NodeTypes>::ChainSpec: EthereumHardforks,
 {
     type EngineValidator = BasicEngineValidator<Node::Provider, Node::Evm, PVB::Validator>;
 
@@ -181,7 +206,7 @@ where
             Some(state) => {
                 let strategy: Arc<
                     dyn StateRootStrategy<PrimitivesTy<Node::Types>, Node::Provider, Node::Evm>,
-                > = Arc::new(QmdbStateRootStrategy::new(state));
+                > = Arc::new(QmdbStateRootStrategy::new(state, ctx.config.chain.clone()));
                 validator.with_state_root_strategy(strategy)
             }
             None => validator,

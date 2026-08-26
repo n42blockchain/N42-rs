@@ -19,7 +19,7 @@ n42-h2-consensus.workspace = true
 # secp256k1 is REQUIRED, not optional: gov5 nodes carry secp256k1 libp2p
 # identities, and without this feature the Noise handshake fails at
 # "Invalid public key: cargo feature `secp256k1` is not enabled".
-libp2p = { workspace = true, features = ["gossipsub", "tokio", "tcp", "noise", "yamux", "macros", "secp256k1", "request-response"] }
+libp2p = { workspace = true, features = ["gossipsub", "tokio", "tcp", "noise", "yamux", "macros", "secp256k1", "request-response", "identify"] }
 futures = "0.3"
 snap.workspace = true
 # libp2p's Codec trait is #[async_trait], so the impl must be annotated too.

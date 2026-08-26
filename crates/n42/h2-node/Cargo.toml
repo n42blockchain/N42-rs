@@ -27,7 +27,7 @@ tracing.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 futures.workspace = true
 hex.workspace = true
-libp2p = { workspace = true, default-features = false }
+libp2p = { workspace = true, default-features = false, features = ["secp256k1"] }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 n42-h2-el-rpc.workspace = true
 n42-mobile-service.workspace = true

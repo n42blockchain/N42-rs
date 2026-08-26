@@ -50,7 +50,7 @@ async fn leader_builds_a_block_and_can_serve_its_own_execute_request() {
     let el = MockExecutionLayer::new();
     let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
 
-    let built = driver.build_block(attrs()).await.unwrap();
+    let built = driver.build_block(attrs(), 1).await.unwrap();
     assert_eq!(built.number, 1);
 
     // FCU-with-attrs to start the build (an FCU without attributes never would),
@@ -190,7 +190,7 @@ async fn a_build_that_never_starts_reports_the_status_not_a_bare_failure() {
     });
     let mut driver = ExecutionDriver::new(el, GENESIS);
 
-    let err = driver.build_block(attrs()).await.unwrap_err();
+    let err = driver.build_block(attrs(), 1).await.unwrap_err();
     assert!(err.to_string().contains("no payload id"), "{err}");
     // An operator needs to know whether the EL said VALID or SYNCING here.
     assert!(err.to_string().contains("Valid"), "{err}");

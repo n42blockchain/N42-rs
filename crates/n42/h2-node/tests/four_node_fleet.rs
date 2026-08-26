@@ -69,6 +69,13 @@ struct Node {
 /// but never proposes, which is how a member joining someone else's fleet
 /// usually starts.
 async fn build_fleet(proposers: &[usize]) -> Vec<Node> {
+    build_fleet_with(proposers, false).await
+}
+
+/// `gov5_profile` runs every node under gov5's HotStuff header profile:
+/// built blocks are finished with the view and a BLS seal, and bodies are
+/// decoded under that profile.
+async fn build_fleet_with(proposers: &[usize], gov5_profile: bool) -> Vec<Node> {
     // Off unless RUST_LOG asks for it; a failing fleet test is otherwise silent
     // about which of the three layers stopped.
     let _ = tracing_subscriber::fmt()
@@ -117,6 +124,7 @@ async fn build_fleet(proposers: &[usize]) -> Vec<Node> {
         }
 
         let (output_tx, output_rx) = mpsc::channel::<EngineOutput>(256);
+        let seal_key = key.clone();
         let mut engine = ConsensusEngine::new(
             index as u32,
             key,
@@ -131,6 +139,9 @@ async fn build_fleet(proposers: &[usize]) -> Vec<Node> {
 
         let driver = ExecutionDriver::new(MockExecutionLayer::new(), identity.genesis_hash);
         let mut service = H2Service::new(transport, engine, driver, output_rx, VALIDATORS);
+        if gov5_profile {
+            service = service.with_gov5_h2_profile(seal_key);
+        }
         if proposers.contains(&index) {
             service = service.with_payload_attributes(attributes);
         }
@@ -276,6 +287,30 @@ async fn followers_commit_only_after_bodies_arrive_over_the_block_topic() {
         bodies_at.contains(&index),
         "follower {index} committed {block_hash} without ever receiving a body",
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_fleet_commits_under_gov5s_header_profile() {
+    // Same fleet, gov5's header profile: the leader finishes each block with
+    // the view and its BLS seal before proposing, so the hash consensus
+    // agrees on is not the hash the execution layer built. Followers decode
+    // bodies under the same profile. A follower commit proves the finished
+    // block travelled, reconstructed, and executed on the far side.
+    let nodes = build_fleet_with(&[0], true).await;
+
+    let mut bodies_at = std::collections::HashSet::new();
+    let committed = run_until(nodes, Duration::from_secs(60), |index, event| {
+        if matches!(event, ServiceEvent::BodyReceived { .. }) {
+            bodies_at.insert(index);
+        }
+        index > 0 && matches!(event, ServiceEvent::Committed { .. })
+    })
+    .await;
+
+    let Some((index, ServiceEvent::Committed { .. })) = committed else {
+        panic!("no follower committed a gov5-profile block within the budget");
+    };
+    assert!(bodies_at.contains(&index), "follower {index} committed without a body");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -21,6 +21,7 @@
 
 pub mod error;
 pub mod h2_finality;
+pub mod header_profile;
 pub mod protocol;
 pub mod rotor;
 pub mod validator;
@@ -29,6 +30,15 @@ pub mod vote_log;
 pub mod wire_bridge;
 
 pub use error::{ConsensusError, ConsensusResult};
+pub use header_profile::{
+    block_for_header, execution_data_for_block, gov5_receipts_root, gov5_rewards_root, header_view,
+    is_empty_requests_hash,
+    normalize_to_gov5_h2, reconstruct_gov5_h2_block, seal_hash, seal_header,
+    validate_gov5_h2_header, verify_seal, HeaderExtra, HeaderProfileError, N42HeaderProfile,
+    ReceiptView,
+    EXTRA_SEAL_LEN, GOV5_EMPTY_REQUESTS_HASH, GOV5_HEADER_EXTRA_MAGIC, GOV5_NIL_HASH,
+    MAX_HEADER_EXTRA_LEN,
+};
 pub use protocol::quorum::{
     validator_changes_hash, verify_commit_qc, verify_commit_qc_with_profile, verify_qc, verify_tc,
 };

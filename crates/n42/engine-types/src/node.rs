@@ -335,8 +335,8 @@ where
     type AddOns = EthereumAddOns<
         NodeAdapter<N>,
         EthereumEthApiBuilder,
-        EthereumEngineValidatorBuilder,
-        QmdbEngineValidatorBuilder<EthereumEngineValidatorBuilder>,
+        crate::engine_validator::N42EngineValidatorBuilder,
+        QmdbEngineValidatorBuilder<crate::engine_validator::N42EngineValidatorBuilder>,
     >;
 
     fn components_builder(&self) -> Self::ComponentsBuilder {
@@ -346,7 +346,7 @@ where
     fn add_ons(&self) -> Self::AddOns {
         EthereumAddOns::new(RpcAddOns::new(
             EthereumEthApiBuilder::default(),
-            EthereumEngineValidatorBuilder::default(),
+            crate::engine_validator::N42EngineValidatorBuilder,
             BasicEngineApiBuilder::default(),
             QmdbEngineValidatorBuilder::new(self.qmdb.clone()),
             Default::default(),

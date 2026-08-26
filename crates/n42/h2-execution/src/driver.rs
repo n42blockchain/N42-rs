@@ -102,10 +102,31 @@ impl DriverAction {
     }
 }
 
+/// Rewrites a freshly built payload into the block this node will propose.
+///
+/// Called with the payload and the view it is proposed in. The execution
+/// layer builds without knowing the view, and on a chain whose header
+/// commits to it (gov5's HotStuff profile) the header has to be finished —
+/// view stamped, seal signed, hash re-formed — before anyone else sees it.
+/// The result is what gets cached, imported, and proposed.
+pub type PayloadNormalizer =
+    dyn Fn(&ExecutionData, u64) -> Result<ExecutionData, String> + Send + Sync;
+
+struct Normalizer(Box<PayloadNormalizer>);
+
+impl std::fmt::Debug for Normalizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PayloadNormalizer")
+    }
+}
+
 /// Drives an [`ExecutionLayer`] on behalf of the consensus engine.
 #[derive(Debug)]
 pub struct ExecutionDriver<E> {
     el: E,
+    /// Finishes a built payload before it is proposed. `None` proposes the
+    /// payload exactly as built.
+    normalizer: Option<Normalizer>,
     /// Payloads seen but not yet executed, keyed by block hash. Populated from
     /// proposals, direct pushes, and our own builds.
     payloads: HashMap<B256, ExecutionData>,
@@ -127,12 +148,21 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     pub fn new(el: E, genesis: B256) -> Self {
         Self {
             el,
+            normalizer: None,
             payloads: HashMap::new(),
             head: genesis,
             finalized: genesis,
             max_cached_payloads: Self::DEFAULT_MAX_CACHED_PAYLOADS,
             payload_order: Vec::new(),
         }
+    }
+
+    /// Installs a [`PayloadNormalizer`] applied to every block this node builds.
+    pub fn set_payload_normalizer(
+        &mut self,
+        normalizer: impl Fn(&ExecutionData, u64) -> Result<ExecutionData, String> + Send + Sync + 'static,
+    ) {
+        self.normalizer = Some(Normalizer(Box::new(normalizer)));
     }
 
     /// Overrides the payload cache bound.
@@ -186,7 +216,11 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// Returns the built block *and* caches its payload, so the subsequent
     /// `ExecuteBlock` for our own proposal is served locally rather than
     /// requiring a round trip.
-    pub async fn build_block(&mut self, attrs: PayloadAttributes) -> Result<BuiltBlock, ElError> {
+    pub async fn build_block(
+        &mut self,
+        attrs: PayloadAttributes,
+        view: u64,
+    ) -> Result<BuiltBlock, ElError> {
         let updated = self
             .el
             .fork_choice_updated_with_attrs(self.forkchoice(self.head), attrs)
@@ -202,11 +236,23 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             ))
         })?;
 
-        let built = self
+        let mut built = self
             .el
             .resolve_payload(payload_id, ResolveKind::WaitForPending)
             .await
             .ok_or_else(|| ElError::new(format!("no payload build for id {payload_id}")))??;
+
+        // The block the execution layer built is not necessarily the block
+        // this node proposes: a chain whose header carries the view needs it
+        // stamped and sealed first, and that changes the hash. From here on
+        // only the finished block exists — it is what gets imported, and the
+        // hash consensus sees.
+        if let Some(normalize) = &self.normalizer {
+            let finished = (normalize.0)(&built.execution_data, view)
+                .map_err(|e| ElError::new(format!("finishing the built block: {e}")))?;
+            built.hash = finished.block_hash();
+            built.execution_data = finished;
+        }
 
         self.cache_payload(built.hash, built.execution_data.clone());
 

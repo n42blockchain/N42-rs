@@ -22,9 +22,13 @@ mod payload;
 //mod job;
 //mod metrics;
 mod consensus;
+pub mod engine_validator;
+pub mod hotstuff_consensus;
 mod network;
 
-pub use consensus::N42ConsensusBuilder;
+pub use consensus::{is_hotstuff_chain, N42Consensus, N42ConsensusBuilder, N42FullConsensus};
+pub use engine_validator::{header_profile_for, N42EngineValidator, N42EngineValidatorBuilder};
+pub use hotstuff_consensus::{gov5_receipt_root_bloom, HotStuffConsensus};
 pub use payload::N42PayloadServiceBuilder;
 
 #[cfg(test)]

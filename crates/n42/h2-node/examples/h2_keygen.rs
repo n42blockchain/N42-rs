@@ -32,6 +32,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--count" => count = args.next().ok_or("--count needs a value")?.parse()?,
             "--out-dir" => out_dir = PathBuf::from(args.next().ok_or("--out-dir needs a path")?),
             "--seed" => seed = Some(args.next().ok_or("--seed needs a label")?),
+            // gov5 keeps its libp2p identity as a hex secp256k1 secret in
+            // `<datadir>/network-keys`; this prints the peer id that key
+            // yields, so a Rust node can dial a Go node by multiaddr.
+            "--libp2p-peer-id" => {
+                let hex_key = args.next().ok_or("--libp2p-peer-id needs a hex secp256k1 secret")?;
+                let mut bytes = hex::decode(hex_key.trim().trim_start_matches("0x"))?;
+                let secret = libp2p::identity::secp256k1::SecretKey::try_from_bytes(&mut bytes)?;
+                let keypair: libp2p::identity::Keypair =
+                    libp2p::identity::secp256k1::Keypair::from(secret).into();
+                println!("{}", keypair.public().to_peer_id());
+                return Ok(());
+            }
             "--help" | "-h" => {
                 eprintln!("{USAGE}");
                 return Ok(());

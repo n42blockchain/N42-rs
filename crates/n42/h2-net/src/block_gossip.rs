@@ -22,15 +22,11 @@
 //! which header shapes are accepted, and a mixed fleet needs the builder to
 //! adopt gov5's.
 
-use alloy_consensus::{proofs::calculate_transaction_root, Block, BlockBody, Header, TxEnvelope};
+use alloy_consensus::{proofs::calculate_transaction_root, Block, Header, TxEnvelope};
 use alloy_eips::eip2718::{Decodable2718, Encodable2718};
-use alloy_eips::eip7685::{Requests, RequestsOrHash, EMPTY_REQUESTS_HASH};
-use alloy_primitives::{keccak256, Bytes, B256, U256};
+use alloy_primitives::{keccak256, Bytes, B256};
 use alloy_rlp::{Decodable, Encodable, Header as RlpHeader};
-use alloy_rpc_types_engine::{
-    CancunPayloadFields, ExecutionData, ExecutionPayload, ExecutionPayloadSidecar,
-    PraguePayloadFields,
-};
+use alloy_rpc_types_engine::ExecutionData;
 use libp2p::gossipsub::IdentTopic;
 
 /// Fixed prefix gov5's H2 header-extra encoder writes.
@@ -40,17 +36,9 @@ pub const MIN_GOV5_HEADER_EXTRA_BYTES: usize = 12;
 /// Bound shared with gov5's high-TC envelope limit.
 pub const MAX_GOV5_HEADER_EXTRA_BYTES: usize = 4096;
 
-/// Which header shapes a block on the wire may have.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HeaderProfile {
-    /// The header is exactly what the execution payload says: empty-list
-    /// ommers hash, whatever extra data the builder sealed. This node's own
-    /// blocks, today.
-    Ethereum,
-    /// gov5's live H2 header: zero ommers hash, difficulty 0 (or the legacy 1),
-    /// extra data `N42H || view (u64 LE) || …`. What a Go fleet member emits.
-    Gov5H2,
-}
+/// Which header shapes a block on the wire may have. The chain-wide
+/// definition lives with the consensus crate; this is the same type.
+pub use n42_h2_consensus::header_profile::N42HeaderProfile as HeaderProfile;
 
 /// The block topic for a chain.
 pub fn gov5_block_topic(genesis_hash: B256) -> IdentTopic {
@@ -94,18 +82,8 @@ pub enum BlockGossipError {
 
 /// The view a gov5 H2 header was proposed in.
 pub fn gov5_header_view(header: &Header) -> Result<u64, BlockGossipError> {
-    let encoded = header.extra_data.as_ref();
-    if encoded.len() < MIN_GOV5_HEADER_EXTRA_BYTES || &encoded[..4] != GOV5_HEADER_EXTRA_MAGIC {
-        return Err(BlockGossipError::HeaderProfile(
-            HeaderProfile::Gov5H2,
-            "missing canonical N42H view prefix".to_owned(),
-        ));
-    }
-    Ok(u64::from_le_bytes(
-        encoded[4..12]
-            .try_into()
-            .expect("length checked before fixed-width conversion"),
-    ))
+    n42_h2_consensus::header_view(header)
+        .map_err(|e| BlockGossipError::HeaderProfile(HeaderProfile::Gov5H2, e.to_string()))
 }
 
 /// Checks a header against a profile.
@@ -123,25 +101,9 @@ pub fn validate_header(header: &Header, profile: HeaderProfile) -> Result<(), Bl
             }
             Ok(())
         }
-        HeaderProfile::Gov5H2 => {
-            if header.ommers_hash != B256::ZERO {
-                return violation("ommers hash is not zero");
-            }
-            if header.difficulty != U256::ZERO && header.difficulty != U256::from(1) {
-                return violation("difficulty is neither 0 nor the legacy 1");
-            }
-            let extra = header.extra_data.as_ref();
-            if extra.len() < MIN_GOV5_HEADER_EXTRA_BYTES {
-                return violation("extra data is shorter than magic + view");
-            }
-            if extra.len() > MAX_GOV5_HEADER_EXTRA_BYTES {
-                return violation("extra data exceeds 4096 bytes");
-            }
-            if !extra.starts_with(GOV5_HEADER_EXTRA_MAGIC) {
-                return violation("extra data is missing the N42H magic");
-            }
-            Ok(())
-        }
+        HeaderProfile::Gov5H2 => n42_h2_consensus::validate_gov5_h2_header(header)
+            .map(|_| ())
+            .map_err(|e| BlockGossipError::HeaderProfile(profile, e.to_string())),
     }
 }
 
@@ -267,55 +229,8 @@ impl GossipBlock {
     /// requests is handed over by hash, which an execution layer accepts only
     /// where its API allows it.
     pub fn execution_data(&self) -> ExecutionData {
-        let block = Block {
-            header: self.header.clone(),
-            body: BlockBody {
-                transactions: self.transactions.clone(),
-                ommers: Vec::new(),
-                // Post-Shanghai headers carry a withdrawals root; the empty
-                // root is the only value a block without a withdrawals list
-                // can satisfy, so an empty list is what it must have had.
-                withdrawals: self
-                    .header
-                    .withdrawals_root
-                    .map(|_| alloy_eips::eip4895::Withdrawals::default()),
-            },
-        };
-        let payload = ExecutionPayload::from_block_unchecked(self.block_hash, &block).0;
-        let sidecar = match self.header.parent_beacon_block_root {
-            None => ExecutionPayloadSidecar::none(),
-            Some(parent_beacon_block_root) => {
-                let cancun = CancunPayloadFields {
-                    parent_beacon_block_root,
-                    versioned_hashes: block
-                        .body
-                        .transactions
-                        .iter()
-                        .flat_map(|tx| {
-                            alloy_consensus::Transaction::blob_versioned_hashes(tx)
-                                .map(<[B256]>::to_vec)
-                                .unwrap_or_default()
-                        })
-                        .collect(),
-                };
-                match self.header.requests_hash {
-                    None => ExecutionPayloadSidecar::v3(cancun),
-                    Some(hash) if hash == EMPTY_REQUESTS_HASH => ExecutionPayloadSidecar::v4(
-                        cancun,
-                        PraguePayloadFields {
-                            requests: RequestsOrHash::Requests(Requests::default()),
-                        },
-                    ),
-                    Some(hash) => ExecutionPayloadSidecar::v4(
-                        cancun,
-                        PraguePayloadFields {
-                            requests: RequestsOrHash::Hash(hash),
-                        },
-                    ),
-                }
-            }
-        };
-        ExecutionData::new(payload, sidecar)
+        let block = n42_h2_consensus::block_for_header(self.header.clone(), self.transactions.clone());
+        n42_h2_consensus::execution_data_for_block(self.block_hash, &block)
     }
 }
 
@@ -341,19 +256,8 @@ fn reconstruct_block(
             }
             Ok(direct)
         }
-        HeaderProfile::Gov5H2 => {
-            let mut block = direct;
-            block.header.ommers_hash = B256::ZERO;
-            for difficulty in [U256::ZERO, U256::from(1)] {
-                block.header.difficulty = difficulty;
-                if validate_header(&block.header, profile).is_ok()
-                    && block.header.hash_slow() == expected_hash
-                {
-                    return Ok(block);
-                }
-            }
-            Err(BlockGossipError::PayloadHashMismatch)
-        }
+        HeaderProfile::Gov5H2 => n42_h2_consensus::reconstruct_gov5_h2_block::<TxEnvelope>(execution)
+            .map_err(|e| BlockGossipError::HeaderProfile(profile, e.to_string())),
     }
 }
 
@@ -420,7 +324,9 @@ fn take_rlp_bytes<'a>(cursor: &mut &'a [u8]) -> Option<&'a [u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::Address;
+    use alloy_consensus::BlockBody;
+    use alloy_eips::eip7685::EMPTY_REQUESTS_HASH;
+    use alloy_primitives::{Address, U256};
 
     fn header(extra: Bytes) -> Header {
         Header {
@@ -513,6 +419,31 @@ mod tests {
         }
         let compressed = snap::raw::Encoder::new().compress_vec(&[0xC1, 0x80]).unwrap();
         assert!(decode_block_gossip(&compressed, HeaderProfile::Ethereum).is_err());
+    }
+
+    /// `Block.Marshal()` of an empty Cancun+Prague block, printed by gov5's
+    /// own code (`cmd/h2-profile-fixture`): the bytes `BroadcastBlock` puts on
+    /// the block topic before snappy.
+    #[test]
+    fn a_block_gov5_produced_decodes_to_the_hash_gov5_computed() {
+        let header_rlp =
+            alloy_primitives::hex::decode(include_str!("../testdata/gov5_empty_block.header.hex").trim())
+                .unwrap();
+        let mut cursor = header_rlp.as_slice();
+        let header = alloy_consensus::Header::decode(&mut cursor)
+            .unwrap_or_else(|e| panic!("gov5 header does not decode: {e}"));
+        assert!(cursor.is_empty(), "gov5 header has {} trailing bytes", cursor.len());
+        assert_eq!(
+            header.hash_slow(),
+            alloy_primitives::b256!("7f9765be6eb977fdd306510e60aeac2d4c6cb7925016d5c9b48dc0722544234a")
+        );
+
+        let rlp = alloy_primitives::hex::decode(include_str!("../testdata/gov5_empty_block.rlp.hex").trim())
+            .unwrap();
+        let block = decode_block_rlp(&rlp, HeaderProfile::Gov5H2)
+            .unwrap_or_else(|e| panic!("gov5 block does not decode: {e:?}"));
+        assert_eq!(block.block_hash, header.hash_slow());
+        assert!(block.transactions.is_empty());
     }
 
     #[test]

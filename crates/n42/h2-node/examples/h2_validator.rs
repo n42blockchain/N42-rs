@@ -175,6 +175,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Checked here rather than left to fail silently: an engine that cannot find
     // its own key in the set runs as an observer, and nothing about a node in
     // that state looks wrong from the outside.
+    // A genesis that names a hotstuff validator set is a gov5-profile chain:
+    // blocks carry the view and a BLS seal in their extra data. The same key
+    // that votes signs the seal.
+    let gov5_profile = chain_path.is_some();
+    let seal_key = secret_key.clone();
     if secret_key.public_key() != entry.bls_public_key {
         return Err(format!(
             "--bls-key does not match validator {index} in the set; this node would run as a \
@@ -322,10 +327,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .map_err(|error| error.to_string())
             });
         }
+        if gov5_profile {
+            service = service.with_gov5_h2_profile(seal_key);
+        }
         if propose {
             let fee_recipient = entry.address;
             service = service.with_payload_attributes(move |context| {
-                block_attributes(fee_recipient, period_secs, context.head_timestamp)
+                block_attributes(fee_recipient, period_secs, context.head_timestamp, context.head_seen)
             });
         }
 
@@ -389,30 +397,45 @@ fn block_attributes(
     fee_recipient: Address,
     period_secs: u64,
     head_timestamp: Option<u64>,
+    head_seen: Option<std::time::Instant>,
 ) -> Option<PayloadAttributes> {
     static LAST: AtomicU64 = AtomicU64::new(0);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or_default();
-    // Pace against the parent, the way gov5 does: the next block is due at
-    // `parent + period`, and a leader that is asked before then declines and
-    // is asked again. Proposing earlier gives the execution layer a timestamp
-    // no later than the parent's — the same second — which it refuses
-    // outright, and the view is lost to a timeout. Without the parent's
-    // timestamp (a restart, a head this node never saw the body of), fall
-    // back to pacing against this node's own last proposal.
-    let earliest = match head_timestamp {
-        Some(parent) => parent.saturating_add(period_secs),
-        None => LAST.load(Ordering::Relaxed).saturating_add(period_secs),
-    };
-    if now < earliest {
+    // Two clocks constrain a block's timestamp, and they are not the same
+    // clock. The stamp is the wall clock — gov5 ignores any gossiped block
+    // whose timestamp is ahead of its own clock, with no tolerance — and it
+    // must exceed the parent's, which for a Go parent is `parent + period`
+    // stamped however early the Go leader proposed (`hotstuff/adapter.go`
+    // `Prepare`): after a Go block this node waits for the clock to pass the
+    // parent's stamp. Pacing, meanwhile, is `period` after the parent was
+    // *seen* here, by this node's clock, not after the parent's stamp: waiting
+    // for the clock to reach `parent + period` after a Go block that is
+    // already a period ahead lost every such view to the timeout (measured).
+    // Without the parent (a restart, a head this node never saw the body of),
+    // pace against this node's own last proposal.
+    match (head_timestamp, head_seen) {
+        (Some(parent), seen) => {
+            if now <= parent {
+                return None;
+            }
+            if seen.is_some_and(|seen| seen.elapsed().as_secs() < period_secs) {
+                return None;
+            }
+        }
+        (None, _) => {
+            if now < LAST.load(Ordering::Relaxed).saturating_add(period_secs) {
+                return None;
+            }
+        }
+    }
+    let timestamp = now;
+    if LAST.fetch_max(timestamp, Ordering::Relaxed) >= timestamp {
+        // Already proposed in this second.
         return None;
     }
-    let timestamp = LAST
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| (now > last).then_some(now))
-        .ok()
-        .map(|_| now)?;
     Some(PayloadAttributes {
         timestamp,
         prev_randao: B256::ZERO,

@@ -50,7 +50,7 @@ use reth_primitives_traits::SealedBlock;
 use reth_basic_payload_builder::{BasicPayloadJobGenerator, BasicPayloadJobGeneratorConfig};
 use reth_chain_state::CanonStateSubscriptions;
 use n42_consensus_traits::SignerManager;
-use n42_qmdb_reth::{changes_from_bundle, QmdbNodeState};
+use n42_qmdb_reth::{changes_from_execution, QmdbNodeState};
 use reth_trie::updates::TrieUpdates;
 use reth_consensus::{ConsensusError, FullConsensus};
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
@@ -327,7 +327,9 @@ where
             addr
         }
         Ok(None) => {
-            warn!(target: "payload_builder", "No signer address configured, using suggested_fee_recipient");
+            // The normal case on a HotStuff chain: the leader names the
+            // beneficiary, and a local signer key must not override it.
+            debug!(target: "payload_builder", "no signer address configured; using suggested_fee_recipient");
             attributes.suggested_fee_recipient
         }
         Err(e) => {
@@ -378,6 +380,15 @@ where
     let mut header = cons
         .prepare(&parent_header)
         .map_err(|err| PayloadBuilderError::Internal(err.into()))?;
+    // A HotStuff chain's blocks follow gov5's header profile: the beneficiary
+    // is the fee recipient the leader named (gov5 sets Coinbase to the
+    // signer), the ommers hash and difficulty are zero, and the receipts
+    // root is gov5's keccak-of-receipts rather than a trie. The view and
+    // the seal are stamped by the validator process after the build.
+    let hotstuff = n42_qmdb_reth::HotStuffGenesisConfig::from_genesis(chain_spec.genesis()).is_ok();
+    if hotstuff {
+        header.beneficiary = coinbase;
+    }
 
     builder.apply_pre_execution_changes().map_err(|err| {
         warn!(target: "payload_builder", %err, "failed to apply pre-execution changes");
@@ -516,7 +527,13 @@ where
                 builder.finish(&state_provider, Some((B256::ZERO, TrieUpdates::default())))?;
             let bundle = db.take_bundle();
             let prepared = state
-                .compute(parent_header.hash(), &changes_from_bundle(&bundle))
+                .compute(
+                    parent_header.hash(),
+                    &changes_from_execution(
+                        &bundle,
+                        chain_spec.is_prague_active_at_timestamp(attributes.timestamp),
+                    ),
+                )
                 .map_err(PayloadBuilderError::other)?;
             (outcome, Some(prepared))
         }
@@ -554,7 +571,15 @@ where
         None => block.header().state_root,
     };
     header.transactions_root = block.header().transactions_root;
-    header.receipts_root = block.header().receipts_root;
+    header.receipts_root = if hotstuff {
+        crate::hotstuff_consensus::gov5_receipt_root_bloom(&execution_result.receipts).0
+    } else {
+        block.header().receipts_root
+    };
+    if hotstuff {
+        header.ommers_hash = B256::ZERO;
+        header.difficulty = U256::ZERO;
+    }
     header.logs_bloom = block.header().logs_bloom;
     header.gas_limit = block.header().gas_limit;
     header.gas_used = block.header().gas_used;

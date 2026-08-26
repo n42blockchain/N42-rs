@@ -37,7 +37,9 @@ use crate::config::gov5_gossipsub_config;
 use crate::rpc::{status_behaviour, StatusBehaviour};
 use crate::status::Status;
 use crate::block_gossip::gov5_block_topic;
-use crate::topic::h2_v4_topic;
+use crate::topic::{fork_scoped_topic, h2_v4_topic};
+use n42_h2_wire::h2_wire::{decode_gov5_gossip_message, encode_gov5_gossip_message};
+use n42_h2_wire::H2Message;
 
 /// Errors that stop a transport from starting.
 #[derive(Debug, thiserror::Error)]
@@ -180,6 +182,17 @@ pub enum TransportEvent {
         /// Why it was rejected.
         reason: String,
     },
+    /// A consensus message from the chain's native topic —
+    /// `/n42/<fork digest>/hotstuff_consensus/ssz_snappy`, where a gov5 fleet
+    /// runs its consensus. Native encoding, no chain-bound envelope: the
+    /// topic is already chain-scoped by its fork digest. Signatures are
+    /// verified by the consensus layer, as for [`Self::Envelope`].
+    Native {
+        /// The peer that delivered it, when authored.
+        from: Option<PeerId>,
+        /// The decoded message.
+        message: Box<H2Message>,
+    },
     /// A block body arrived on the chain's block topic, still compressed.
     /// Which header shapes to accept is the consumer's decision — see
     /// [`crate::block_gossip::HeaderProfile`] — so it is not decoded here.
@@ -222,12 +235,25 @@ pub enum TransportEvent {
     },
 }
 
+/// What this node says it is, in the identify exchange. gov5 does not check
+/// the string; it checks the protocol list that comes with it.
+pub const IDENTIFY_PROTOCOL_VERSION: &str = "/n42/h2/1.0.0";
+
 #[derive(NetworkBehaviour)]
 pub(crate) struct H2Behaviour {
     gossipsub: gossipsub::Behaviour,
     /// gov5 drops peers that cannot answer a status request, so this is not
     /// optional decoration — without it the connection dies within seconds.
     status: StatusBehaviour,
+    /// Not decoration either. go-libp2p-pubsub learns which peers speak
+    /// gossipsub from the identify exchange (`EvtPeerIdentificationCompleted`,
+    /// `peer_notify.go`): a peer that connects after startup and never
+    /// identifies is never given a gossipsub stream, never sent the Go
+    /// node's subscriptions, and never counted as a topic peer — connected,
+    /// status-exchanged, and invisible to consensus. Observed live: three Rust
+    /// members connected to a gov5 node for a minute without a single
+    /// gossipsub RPC in either direction.
+    identify: libp2p::identify::Behaviour,
 }
 
 /// A bidirectional member of a gov5 HotStuff-2 v4 gossip mesh.
@@ -236,6 +262,8 @@ pub struct H2V4Transport {
     topic: IdentTopic,
     /// Where block bodies travel; bound to the chain by its fork digest.
     block_topic: IdentTopic,
+    /// gov5's own consensus topic, likewise fork-scoped.
+    native_topic: IdentTopic,
     identity: H2V4ChainIdentity,
     mesh_peers: HashSet<PeerId>,
     /// Events produced before the loop starts (dials that failed immediately).
@@ -267,6 +295,10 @@ impl H2V4Transport {
             gossipsub: gossipsub::Behaviour::new(MessageAuthenticity::Anonymous, gossipsub_config)
                 .map_err(|e| TransportError::Behaviour(e.to_string()))?,
             status: status_behaviour(),
+            identify: libp2p::identify::Behaviour::new(
+                libp2p::identify::Config::new(IDENTIFY_PROTOCOL_VERSION.into(), keypair.public())
+                    .with_agent_version(format!("n42-rs/h2-net/{}", env!("CARGO_PKG_VERSION"))),
+            ),
         };
 
         let mut swarm = SwarmBuilder::with_existing_identity(keypair)
@@ -302,6 +334,18 @@ impl H2V4Transport {
                 topic: block_topic.to_string(),
                 source,
             })?;
+        // gov5's consensus runs on its fork-scoped native topic; the v4
+        // topic carries only Decide proofs for observers. A fleet member
+        // has to be on both to hear a Go leader's proposals.
+        let native_topic = fork_scoped_topic(config.identity.genesis_hash, "hotstuff_consensus");
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&native_topic)
+            .map_err(|source| TransportError::Subscribe {
+                topic: native_topic.to_string(),
+                source,
+            })?;
 
         for addr in &config.listen_addrs {
             swarm
@@ -328,6 +372,7 @@ impl H2V4Transport {
             swarm,
             topic,
             block_topic,
+            native_topic,
             identity: config.identity,
             mesh_peers: HashSet::new(),
             pending_events: dial_errors,
@@ -393,6 +438,27 @@ impl H2V4Transport {
             .publish(self.topic.clone(), payload)?)
     }
 
+    /// Publishes a consensus message on the chain's native topic, in gov5's
+    /// own encoding — what a Go fleet member listens for.
+    pub fn publish_native(&mut self, message: &H2Message) -> Result<gossipsub::MessageId, PublishError> {
+        let payload = encode_gov5_gossip_message(message)
+            .map_err(|e| PublishError::Encode(n42_h2_wire::H2V4Error::Wire(e)))?;
+        Ok(self
+            .swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(self.native_topic.clone(), payload)?)
+    }
+
+    /// Peers in this node's mesh for the native consensus topic.
+    pub fn native_mesh_size(&self) -> usize {
+        self.swarm
+            .behaviour()
+            .gossipsub
+            .mesh_peers(&self.native_topic.hash())
+            .count()
+    }
+
     /// Publishes an already-encoded block body on the chain's block topic.
     ///
     /// Takes the compressed bytes from [`crate::block_gossip::encode_block_gossip`]
@@ -426,16 +492,53 @@ impl H2V4Transport {
                             data: message.data,
                         });
                     }
+                    if message.topic == self.native_topic.hash() {
+                        return Some(match decode_gov5_gossip_message(&message.data) {
+                            Ok(decoded) => TransportEvent::Native {
+                                from: message.source,
+                                message: Box::new(decoded),
+                            },
+                            Err(err) => TransportEvent::Rejected {
+                                from: message.source,
+                                reason: format!("native message: {err}"),
+                            },
+                        });
+                    }
                     if message.topic != self.topic.hash() {
                         continue;
                     }
                     return Some(self.decode_payload(message.source, &message.data));
                 }
                 SwarmEvent::Behaviour(H2BehaviourEvent::Gossipsub(
-                    gossipsub::Event::Subscribed { topic, .. },
-                )) if topic == self.topic.hash() => {
-                    return Some(TransportEvent::Subscribed);
+                    gossipsub::Event::Subscribed { peer_id, topic },
+                )) => {
+                    tracing::debug!(target: "n42.h2.net", %peer_id, %topic, "peer subscribed");
+                    if topic == self.topic.hash() {
+                        return Some(TransportEvent::Subscribed);
+                    }
                 }
+                SwarmEvent::Behaviour(H2BehaviourEvent::Gossipsub(
+                    gossipsub::Event::Unsubscribed { peer_id, topic },
+                )) => {
+                    tracing::debug!(target: "n42.h2.net", %peer_id, %topic, "peer unsubscribed");
+                }
+                SwarmEvent::Behaviour(H2BehaviourEvent::Gossipsub(
+                    gossipsub::Event::GossipsubNotSupported { peer_id },
+                )) => {
+                    // A peer this node cannot gossip with is a peer that will
+                    // never hear a proposal: worth more than a debug line.
+                    tracing::warn!(target: "n42.h2.net", %peer_id, "peer does not support gossipsub");
+                }
+                SwarmEvent::Behaviour(H2BehaviourEvent::Identify(
+                    libp2p::identify::Event::Received { peer_id, info, .. },
+                )) => {
+                    tracing::debug!(
+                        target: "n42.h2.net",
+                        %peer_id, agent = %info.agent_version, protocols = info.protocols.len(),
+                        "peer identified",
+                    );
+                }
+                SwarmEvent::Behaviour(H2BehaviourEvent::Identify(_)) => {}
                 SwarmEvent::Behaviour(H2BehaviourEvent::Status(
                     request_response::Event::Message { peer, message, .. },
                 )) => {

@@ -1,0 +1,651 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! gov5's HotStuff-2 block header profile — what a block looks like when a
+//! Go fleet member produced it, and what this node must produce for a Go
+//! member to accept.
+//!
+//! The Ethereum header layout is kept field for field (gov5's `block.Header`
+//! is "100% Ethereum Pectra compatible"), but four fields carry HotStuff
+//! rather than proof-of-work or beacon-chain meaning
+//! (`internal/consensus/hotstuff/adapter.go` `Prepare`, `header_extra.go`):
+//!
+//! - `extra_data` is `"N42H" ‖ view (u64 little-endian) ‖ [QC] ‖ seal`, the
+//!   seal being 96 reserved bytes that `Seal` fills with the leader's BLS
+//!   signature over the header hashed *without* those 96 bytes.
+//! - `difficulty` is 0 (a legacy range carries 1). Ordering is by view.
+//! - `beneficiary` is the leader's address.
+//! - `ommers_hash` is whatever the producer left there. gov5's miner leaves
+//!   the Go zero value, so live headers commit to `B256::ZERO`; its genesis
+//!   uses the Ethereum empty-list hash. Neither side checks it, both sides
+//!   hash it, so a decoder must reconstruct exactly what was there.
+//!
+//! And one commitment differs: gov5 computes the **receipts root** as the
+//! keccak of the concatenated receipt encodings (`hash.DeriveSha`, keccak of
+//! nothing for an empty block), not as a Merkle-Patricia root. The
+//! transactions root is the ordinary trie root on a QMDB chain
+//! (`block.UseEthereumTxRoot`).
+//!
+//! Everything here is checked against bytes produced by gov5's own code.
+//! `VerifyHeader` on the Go side checks the extra layout, timestamp > parent,
+//! gas used ≤ gas limit, and that no parent beacon root is set while no
+//! committee evidence exists; it does not verify the seal. This node signs it
+//! anyway.
+
+use alloy_consensus::{Block, BlockBody, Header, TxEnvelope, EMPTY_OMMER_ROOT_HASH};
+use alloy_eips::eip7685::{Requests, RequestsOrHash, EMPTY_REQUESTS_HASH};
+use alloy_primitives::{b256, keccak256, Address, Bytes, Log, B256, U256};
+use alloy_rlp::{Encodable, RlpEncodable};
+use alloy_rpc_types_engine::{
+    CancunPayloadFields, ExecutionData, ExecutionPayload, ExecutionPayloadSidecar,
+    PraguePayloadFields,
+};
+use n42_h2_primitives::bls::{BlsPublicKey, BlsSecretKey, BlsSignature};
+
+/// Which header shape a chain's blocks have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum N42HeaderProfile {
+    /// The header is exactly what the execution payload says: empty-list
+    /// ommers hash, whatever extra data the builder sealed. An APoS chain.
+    #[default]
+    Ethereum,
+    /// gov5's HotStuff-2 header, described in this module. A chain whose
+    /// genesis names a `hotstuff` validator set.
+    Gov5H2,
+}
+
+/// The four bytes every HotStuff header's extra data starts with.
+pub const GOV5_HEADER_EXTRA_MAGIC: [u8; 4] = *b"N42H";
+/// Magic plus the little-endian view.
+pub const EXTRA_MIN_LEN: usize = 12;
+/// The BLS seal gov5 reserves at the end of the extra data.
+pub const EXTRA_SEAL_LEN: usize = 96;
+/// Bound shared with gov5's high-TC envelope limit.
+pub const MAX_HEADER_EXTRA_LEN: usize = 4096;
+
+/// `keccak256("")`: gov5's receipts root for a block with no receipts
+/// (`hash.NilHash`), and its withdrawals root for a block with no rewards.
+pub const GOV5_NIL_HASH: B256 =
+    b256!("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470");
+
+/// What gov5 writes in `requestsHash` when a Prague block carried no
+/// EIP-7685 requests: `keccak256(RLP([]))`, the empty trie root — not the
+/// EIP's `sha256("")`, which gov5 uses only at genesis
+/// (`hotstuff/adapter.go` `FinalizeAndAssemble`).
+pub const GOV5_EMPTY_REQUESTS_HASH: B256 = alloy_consensus::EMPTY_ROOT_HASH;
+
+/// gov5's `withdrawalsRoot`: not a withdrawals commitment at all but
+/// `hash.DeriveSha(rewards)` — keccak over the concatenated
+/// `rlp([address, amount])` of the block's validator rewards, keccak of
+/// nothing when there are none. A chain where rewards are paid needs the
+/// rewards list to reproduce it; this node pays none and produces the empty
+/// value.
+pub fn gov5_rewards_root(rewards: impl IntoIterator<Item = (Address, U256)>) -> B256 {
+    let mut concatenated = Vec::new();
+    for (address, amount) in rewards {
+        #[derive(RlpEncodable)]
+        struct Reward {
+            address: Address,
+            amount: U256,
+        }
+        Reward { address, amount }.encode(&mut concatenated);
+    }
+    keccak256(&concatenated)
+}
+
+/// Whether a `requestsHash` says "no requests" in either convention.
+pub fn is_empty_requests_hash(hash: B256) -> bool {
+    hash == EMPTY_REQUESTS_HASH || hash == GOV5_EMPTY_REQUESTS_HASH
+}
+
+/// What a header's extra data says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeaderExtra {
+    /// The view the block was proposed in.
+    pub view: u64,
+    /// The committed QC the leader embedded, in gov5's own encoding, or empty.
+    /// Carried opaquely: this node authenticates blocks through the
+    /// proposal and commit certificates on the wire, not through this copy.
+    pub qc: Vec<u8>,
+    /// The trailing 96-byte seal, when the layout reserves one. All zeros
+    /// before `Seal`, the leader's BLS signature after.
+    pub seal: Option<[u8; EXTRA_SEAL_LEN]>,
+}
+
+impl HeaderExtra {
+    /// The extra data a leader writes before sealing: view, no QC, seal
+    /// reserved. What gov5's `buildHeaderExtra(view, nil)` produces.
+    pub const fn for_view(view: u64) -> Self {
+        Self {
+            view,
+            qc: Vec::new(),
+            seal: Some([0; EXTRA_SEAL_LEN]),
+        }
+    }
+
+    /// The bytes.
+    pub fn encode(&self) -> Bytes {
+        let mut out = Vec::with_capacity(EXTRA_MIN_LEN + self.qc.len() + EXTRA_SEAL_LEN);
+        out.extend_from_slice(&GOV5_HEADER_EXTRA_MAGIC);
+        out.extend_from_slice(&self.view.to_le_bytes());
+        out.extend_from_slice(&self.qc);
+        if let Some(seal) = &self.seal {
+            out.extend_from_slice(seal);
+        }
+        out.into()
+    }
+
+    /// Reads the layouts gov5's `decodeHeaderExtra` accepts.
+    ///
+    /// After magic and view: nothing; a seal alone; a QC followed by a seal;
+    /// or, in the legacy layout, a QC alone. gov5 tells the last two apart by
+    /// trying to decode the QC; this node does not decode QCs, so a payload
+    /// longer than a seal is read as QC-then-seal, which is every header a
+    /// current gov5 produces.
+    pub fn decode(extra: &[u8]) -> Result<Self, HeaderProfileError> {
+        if extra.len() > MAX_HEADER_EXTRA_LEN {
+            return Err(HeaderProfileError::ExtraTooLong(extra.len()));
+        }
+        if extra.len() < EXTRA_MIN_LEN {
+            return Err(HeaderProfileError::ExtraTooShort(extra.len()));
+        }
+        if extra[..4] != GOV5_HEADER_EXTRA_MAGIC {
+            return Err(HeaderProfileError::MissingMagic);
+        }
+        let view = u64::from_le_bytes(
+            extra[4..EXTRA_MIN_LEN]
+                .try_into()
+                .expect("length checked before fixed-width conversion"),
+        );
+        let payload = &extra[EXTRA_MIN_LEN..];
+        let (qc, seal) = if payload.len() >= EXTRA_SEAL_LEN {
+            let (qc, seal) = payload.split_at(payload.len() - EXTRA_SEAL_LEN);
+            let mut fixed = [0u8; EXTRA_SEAL_LEN];
+            fixed.copy_from_slice(seal);
+            (qc.to_vec(), Some(fixed))
+        } else {
+            (payload.to_vec(), None)
+        };
+        Ok(Self { view, qc, seal })
+    }
+}
+
+/// Why a header is not a gov5 HotStuff header.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum HeaderProfileError {
+    /// Shorter than magic plus view.
+    #[error("extra data is {0} bytes, shorter than magic + view")]
+    ExtraTooShort(usize),
+    /// Past gov5's bound.
+    #[error("extra data is {0} bytes, past the 4096-byte bound")]
+    ExtraTooLong(usize),
+    /// Does not start with `N42H`.
+    #[error("extra data does not start with N42H")]
+    MissingMagic,
+    /// Neither 0 nor the legacy 1.
+    #[error("difficulty {0} is neither 0 nor the legacy 1")]
+    Difficulty(U256),
+    /// Post-merge headers carry a zero nonce.
+    #[error("nonce is not zero")]
+    Nonce,
+    /// Neither gov5's zero nor Ethereum's empty-list hash.
+    #[error("ommers hash {0} is neither zero nor the empty-list hash")]
+    OmmersHash(B256),
+    /// The layout reserves no seal to sign into.
+    #[error("extra data reserves no seal")]
+    NoSeal,
+    /// The seal does not verify under the given key.
+    #[error("seal does not verify: {0}")]
+    Seal(String),
+    /// A payload could not be turned back into a block.
+    #[error("execution payload cannot reconstruct a block: {0}")]
+    Reconstruction(String),
+}
+
+/// The view a header was proposed in.
+pub fn header_view(header: &Header) -> Result<u64, HeaderProfileError> {
+    HeaderExtra::decode(&header.extra_data).map(|extra| extra.view)
+}
+
+/// Checks the HotStuff-specific fields and returns the decoded extra data.
+///
+/// Fork-dependent fields (withdrawals root, blob gas, requests hash) are the
+/// execution layer's business and are not looked at here.
+pub fn validate_gov5_h2_header(header: &Header) -> Result<HeaderExtra, HeaderProfileError> {
+    let extra = HeaderExtra::decode(&header.extra_data)?;
+    if header.difficulty != U256::ZERO && header.difficulty != U256::from(1) {
+        return Err(HeaderProfileError::Difficulty(header.difficulty));
+    }
+    if !header.nonce.is_zero() {
+        return Err(HeaderProfileError::Nonce);
+    }
+    if header.ommers_hash != B256::ZERO && header.ommers_hash != EMPTY_OMMER_ROOT_HASH {
+        return Err(HeaderProfileError::OmmersHash(header.ommers_hash));
+    }
+    Ok(extra)
+}
+
+/// The hash the leader signs: the header with the trailing seal removed
+/// (gov5 `sealHash`, which strips 96 bytes only when there is more than a
+/// seal's worth of extra data).
+pub fn seal_hash(header: &Header) -> B256 {
+    let mut unsealed = header.clone();
+    if unsealed.extra_data.len() > EXTRA_SEAL_LEN {
+        let keep = unsealed.extra_data.len() - EXTRA_SEAL_LEN;
+        unsealed.extra_data = Bytes::copy_from_slice(&unsealed.extra_data[..keep]);
+    }
+    unsealed.hash_slow()
+}
+
+/// Signs the seal into the header's reserved trailing bytes, as gov5's `Seal`
+/// does. The header's hash changes; re-hash after.
+pub fn seal_header(header: &mut Header, key: &BlsSecretKey) -> Result<(), HeaderProfileError> {
+    let extra = HeaderExtra::decode(&header.extra_data)?;
+    if extra.seal.is_none() {
+        return Err(HeaderProfileError::NoSeal);
+    }
+    // gov5 seals under the proof-of-possession ciphersuite, the same one its
+    // consensus votes use.
+    let signature = key.sign_h2_v4(seal_hash(header).as_slice());
+    let mut bytes = header.extra_data.to_vec();
+    let start = bytes.len() - EXTRA_SEAL_LEN;
+    bytes[start..].copy_from_slice(&signature.to_bytes());
+    header.extra_data = bytes.into();
+    Ok(())
+}
+
+/// Checks the seal against a leader's public key.
+pub fn verify_seal(header: &Header, leader: &BlsPublicKey) -> Result<(), HeaderProfileError> {
+    let extra = HeaderExtra::decode(&header.extra_data)?;
+    let seal = extra.seal.ok_or(HeaderProfileError::NoSeal)?;
+    let signature =
+        BlsSignature::from_bytes(&seal).map_err(|e| HeaderProfileError::Seal(e.to_string()))?;
+    leader
+        .verify_h2_v4_prevalidated(seal_hash(header).as_slice(), &signature)
+        .map_err(|e| HeaderProfileError::Seal(e.to_string()))
+}
+
+/// The parts of a receipt gov5's receipts root commits to.
+#[derive(Clone, Copy, Debug)]
+pub struct ReceiptView<'a> {
+    /// EIP-658 status.
+    pub success: bool,
+    /// Gas used by the block up to and including this transaction.
+    pub cumulative_gas_used: u64,
+    /// The logs.
+    pub logs: &'a [Log],
+}
+
+#[derive(RlpEncodable)]
+struct StoredLog {
+    address: Address,
+    topics: Vec<B256>,
+    data: Bytes,
+}
+
+#[derive(RlpEncodable)]
+struct StoredReceipt {
+    status: u64,
+    cumulative_gas_used: u64,
+    logs: Vec<StoredLog>,
+}
+
+/// gov5's receipts root: `hash.DeriveSha(receipts)` — keccak over the
+/// concatenation of `rlp([status, cumulativeGasUsed, [[address, topics,
+/// data]…]])` per receipt, and keccak of nothing when there are none. Not a
+/// trie; no bloom, no transaction type.
+pub fn gov5_receipts_root<'a>(receipts: impl IntoIterator<Item = ReceiptView<'a>>) -> B256 {
+    let mut concatenated = Vec::new();
+    for receipt in receipts {
+        StoredReceipt {
+            status: u64::from(receipt.success),
+            cumulative_gas_used: receipt.cumulative_gas_used,
+            logs: receipt
+                .logs
+                .iter()
+                .map(|log| StoredLog {
+                    address: log.address,
+                    topics: log.data.topics().to_vec(),
+                    data: log.data.data.clone(),
+                })
+                .collect(),
+        }
+        .encode(&mut concatenated);
+    }
+    keccak256(&concatenated)
+}
+
+/// The Engine API payload for a block whose header is already final.
+///
+/// Everything the Engine API needs is in the header and transactions, with
+/// one exception: execution requests are carried by hash only, since neither
+/// gov5's block form nor a header lists them. A block with the empty requests
+/// hash gets the empty list, which every `newPayload` version accepts; one
+/// with real requests is handed over by hash, which an execution layer
+/// accepts only where its API allows it.
+pub fn execution_data_for_block(block_hash: B256, block: &Block<TxEnvelope>) -> ExecutionData {
+    let payload = ExecutionPayload::from_block_unchecked(block_hash, block).0;
+    let sidecar = match block.header.parent_beacon_block_root {
+        None => ExecutionPayloadSidecar::none(),
+        Some(parent_beacon_block_root) => {
+            let cancun = CancunPayloadFields {
+                parent_beacon_block_root,
+                versioned_hashes: block
+                    .body
+                    .transactions
+                    .iter()
+                    .flat_map(|tx| {
+                        alloy_consensus::Transaction::blob_versioned_hashes(tx)
+                            .map(<[B256]>::to_vec)
+                            .unwrap_or_default()
+                    })
+                    .collect(),
+            };
+            match block.header.requests_hash {
+                None => ExecutionPayloadSidecar::v3(cancun),
+                Some(hash) if is_empty_requests_hash(hash) => ExecutionPayloadSidecar::v4(
+                    cancun,
+                    PraguePayloadFields {
+                        requests: RequestsOrHash::Requests(Requests::default()),
+                    },
+                ),
+                Some(hash) => ExecutionPayloadSidecar::v4(
+                    cancun,
+                    PraguePayloadFields {
+                        requests: RequestsOrHash::Hash(hash),
+                    },
+                ),
+            }
+        }
+    };
+    ExecutionData::new(payload, sidecar)
+}
+
+/// The block a payload describes, with the header fields a payload cannot
+/// carry (`ommers_hash`, `difficulty`) restored by trying gov5's variants
+/// and letting the payload's block hash pick one.
+///
+/// A payload whose header is already the gov5 shape reconstructs; one
+/// whose hash matches none of the variants is refused — the header on the
+/// wire is not the block that was hashed.
+pub fn reconstruct_gov5_h2_block<T: alloy_eips::Decodable2718>(
+    execution: &ExecutionData,
+) -> Result<Block<T>, HeaderProfileError> {
+    let expected = execution.block_hash();
+    let mut block = execution
+        .clone()
+        .try_into_block::<T>()
+        .map_err(|e| HeaderProfileError::Reconstruction(e.to_string()))?;
+    validate_gov5_h2_header(&block.header)?;
+    // Two more fields a payload cannot carry as gov5 wrote them: the
+    // withdrawals root, which gov5 fills with its rewards commitment (the
+    // payload's empty withdrawals list reconstructs to the trie's empty
+    // root), and the requests hash, whose "none" gov5 spells differently
+    // from EIP-7685. Each has the value the payload implies and the value
+    // gov5 would have written; the hash picks.
+    let withdrawals_roots: Vec<Option<B256>> = match block.header.withdrawals_root {
+        Some(root) if block.body.withdrawals.as_ref().is_none_or(|w| w.is_empty()) => {
+            vec![Some(root), Some(GOV5_NIL_HASH)]
+        }
+        other => vec![other],
+    };
+    let requests_hashes: Vec<Option<B256>> = match block.header.requests_hash {
+        Some(hash) if is_empty_requests_hash(hash) => {
+            vec![Some(hash), Some(GOV5_EMPTY_REQUESTS_HASH), Some(EMPTY_REQUESTS_HASH)]
+        }
+        other => vec![other],
+    };
+    for ommers_hash in [B256::ZERO, EMPTY_OMMER_ROOT_HASH] {
+        for difficulty in [U256::ZERO, U256::from(1)] {
+            for withdrawals_root in &withdrawals_roots {
+                for requests_hash in &requests_hashes {
+                    block.header.ommers_hash = ommers_hash;
+                    block.header.difficulty = difficulty;
+                    block.header.withdrawals_root = *withdrawals_root;
+                    block.header.requests_hash = *requests_hash;
+                    if block.header.hash_slow() == expected {
+                        return Ok(block);
+                    }
+                }
+            }
+        }
+    }
+    Err(HeaderProfileError::Reconstruction(
+        "no gov5 header variant hashes to the payload's block hash".into(),
+    ))
+}
+
+/// Turns a locally built payload into the block this node proposes.
+///
+/// The execution layer builds a block for a view it does not know, with the
+/// seal unsigned; this stamps the view, seals with the leader's key when one
+/// is given, forces the two fields gov5's producer sets (`ommers_hash` zero,
+/// `difficulty` zero), and forms the new block hash. Execution outputs —
+/// state root, receipts root, gas — are untouched: they were computed for
+/// exactly these transactions and stay valid under the new header.
+///
+/// A payload built under the Ethereum profile is accepted as input: the
+/// point is to make one that was not into one that is.
+pub fn normalize_to_gov5_h2(
+    execution: &ExecutionData,
+    view: u64,
+    sealer: Option<&BlsSecretKey>,
+) -> Result<ExecutionData, HeaderProfileError> {
+    let mut block = execution
+        .clone()
+        .try_into_block::<TxEnvelope>()
+        .map_err(|e| HeaderProfileError::Reconstruction(e.to_string()))?;
+    block.header.ommers_hash = B256::ZERO;
+    block.header.difficulty = U256::ZERO;
+    block.header.nonce = Default::default();
+    block.header.extra_data = HeaderExtra::for_view(view).encode();
+    // gov5's two non-Ethereum roots. This node pays no rewards, so the
+    // withdrawals field carries the empty rewards commitment; a block with
+    // actual withdrawals has no gov5 form and is refused rather than
+    // mis-committed.
+    if block.header.withdrawals_root.is_some() {
+        if block.body.withdrawals.as_ref().is_some_and(|w| !w.is_empty()) {
+            return Err(HeaderProfileError::Reconstruction(
+                "gov5 blocks carry rewards, not withdrawals".into(),
+            ));
+        }
+        block.header.withdrawals_root = Some(gov5_rewards_root([]));
+    }
+    if block.header.requests_hash.is_some_and(is_empty_requests_hash) {
+        block.header.requests_hash = Some(GOV5_EMPTY_REQUESTS_HASH);
+    }
+    if let Some(key) = sealer {
+        seal_header(&mut block.header, key)?;
+    }
+    let hash = block.header.hash_slow();
+    Ok(execution_data_for_block(hash, &block))
+}
+
+/// A block body with these transactions and, on a post-Shanghai header, the
+/// empty withdrawals list that its empty withdrawals root implies.
+pub fn block_for_header(header: Header, transactions: Vec<TxEnvelope>) -> Block<TxEnvelope> {
+    let withdrawals = header
+        .withdrawals_root
+        .map(|_| alloy_eips::eip4895::Withdrawals::default());
+    Block {
+        header,
+        body: BlockBody {
+            transactions,
+            ommers: Vec::new(),
+            withdrawals,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_consensus::EMPTY_ROOT_HASH;
+    use alloy_primitives::{address, hex, LogData};
+
+    // Every expected value below was printed by gov5's own code
+    // (`hash.DeriveSha`, `buildHeaderExtra`, `sealHash`, `Header.Hash`) run
+    // over the same inputs.
+
+    #[test]
+    fn empty_receipts_root_is_keccak_of_nothing() {
+        assert_eq!(gov5_receipts_root([]), GOV5_NIL_HASH);
+        assert_eq!(GOV5_NIL_HASH, keccak256([]));
+    }
+
+    #[test]
+    fn receipts_root_matches_gov5_derive_sha() {
+        let log = Log {
+            address: address!("1111111111111111111111111111111111111111"),
+            data: LogData::new_unchecked(
+                vec![
+                    b256!("2222222222222222222222222222222222222222222222222222222222222222"),
+                    b256!("0000000000000000000000000000000000000000000000000000000000000033"),
+                ],
+                Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]),
+            ),
+        };
+        let logs = [log];
+        let root = gov5_receipts_root([
+            ReceiptView {
+                success: true,
+                cumulative_gas_used: 21_000,
+                logs: &[],
+            },
+            ReceiptView {
+                success: false,
+                cumulative_gas_used: 63_000,
+                logs: &logs,
+            },
+        ]);
+        assert_eq!(root, GOV5_RECEIPTS_TWO);
+    }
+
+    fn fixture_header() -> Header {
+        Header {
+            parent_hash: B256::repeat_byte(1),
+            ommers_hash: B256::ZERO,
+            beneficiary: address!("f39fd6e51aad88f6f4ce6ab8827279cfffb92266"),
+            state_root: B256::repeat_byte(2),
+            transactions_root: EMPTY_ROOT_HASH,
+            receipts_root: GOV5_NIL_HASH,
+            difficulty: U256::ZERO,
+            number: 7,
+            gas_limit: 30_000_000,
+            timestamp: 1_700_000_000,
+            extra_data: HeaderExtra::for_view(7).encode(),
+            base_fee_per_gas: Some(7),
+            withdrawals_root: Some(EMPTY_ROOT_HASH),
+            blob_gas_used: Some(0),
+            excess_blob_gas: Some(0),
+            parent_beacon_block_root: Some(B256::ZERO),
+            requests_hash: Some(EMPTY_REQUESTS_HASH),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn extra_data_matches_gov5_build_header_extra() {
+        let extra = HeaderExtra::for_view(7).encode();
+        assert_eq!(hex::encode(&extra), GOV5_EXTRA_VIEW7);
+        let decoded = HeaderExtra::decode(&extra).unwrap();
+        assert_eq!(decoded.view, 7);
+        assert!(decoded.qc.is_empty());
+        assert_eq!(decoded.seal, Some([0; 96]));
+    }
+
+    #[test]
+    fn header_hash_and_seal_hash_match_gov5() {
+        let header = fixture_header();
+        assert_eq!(header.hash_slow(), GOV5_HEADER_HASH);
+        assert_eq!(seal_hash(&header), GOV5_SEAL_HASH);
+        assert_eq!(validate_gov5_h2_header(&header).unwrap().view, 7);
+    }
+
+    #[test]
+    fn a_seal_signs_the_unsealed_header_and_verifies() {
+        let key = BlsSecretKey::random().unwrap();
+        let mut header = fixture_header();
+        let before = seal_hash(&header);
+        seal_header(&mut header, &key).unwrap();
+        // Sealing changes the block hash but not what was signed.
+        assert_ne!(header.hash_slow(), GOV5_HEADER_HASH);
+        assert_eq!(seal_hash(&header), before);
+        verify_seal(&header, &key.public_key()).unwrap();
+        let other = BlsSecretKey::random().unwrap();
+        assert!(verify_seal(&header, &other.public_key()).is_err());
+    }
+
+    #[test]
+    fn gov5_layouts_decode_and_others_are_refused() {
+        // QC then seal: what a gov5 leader with a committed QC writes.
+        let with_qc = HeaderExtra {
+            view: 3,
+            qc: vec![0xAB; 40],
+            seal: Some([1; 96]),
+        };
+        assert_eq!(HeaderExtra::decode(&with_qc.encode()).unwrap(), with_qc);
+        // Bare view.
+        let bare = HeaderExtra {
+            view: 9,
+            qc: vec![],
+            seal: None,
+        };
+        assert_eq!(HeaderExtra::decode(&bare.encode()).unwrap(), bare);
+        assert!(matches!(
+            HeaderExtra::decode(b"N42"),
+            Err(HeaderProfileError::ExtraTooShort(3))
+        ));
+        assert!(matches!(
+            HeaderExtra::decode(&[0u8; 12]),
+            Err(HeaderProfileError::MissingMagic)
+        ));
+        assert!(matches!(
+            HeaderExtra::decode(&vec![0u8; 4097]),
+            Err(HeaderProfileError::ExtraTooLong(4097))
+        ));
+    }
+
+    #[test]
+    fn normalizing_a_payload_gives_a_gov5_header_that_round_trips() {
+        let key = BlsSecretKey::random().unwrap();
+        let mut ethereum = fixture_header();
+        ethereum.ommers_hash = EMPTY_OMMER_ROOT_HASH;
+        ethereum.extra_data = Bytes::from(vec![0u8; 97]);
+        let block = block_for_header(ethereum, vec![]);
+        let built = execution_data_for_block(block.header.hash_slow(), &block);
+
+        let proposed = normalize_to_gov5_h2(&built, 42, Some(&key)).unwrap();
+        let reconstructed = reconstruct_gov5_h2_block::<TxEnvelope>(&proposed).unwrap();
+        assert_eq!(reconstructed.header.hash_slow(), proposed.block_hash());
+        assert_eq!(reconstructed.header.ommers_hash, B256::ZERO);
+        assert_eq!(header_view(&reconstructed.header).unwrap(), 42);
+        verify_seal(&reconstructed.header, &key.public_key()).unwrap();
+        // Execution outputs survived, and the two roots gov5 spells its own
+        // way took gov5's spelling.
+        assert_eq!(reconstructed.header.state_root, B256::repeat_byte(2));
+        assert_eq!(reconstructed.header.receipts_root, GOV5_NIL_HASH);
+        assert_eq!(reconstructed.header.withdrawals_root, Some(GOV5_NIL_HASH));
+        assert_eq!(reconstructed.header.requests_hash, Some(GOV5_EMPTY_REQUESTS_HASH));
+        assert!(proposed.sidecar.requests().is_some());
+    }
+
+    #[test]
+    fn gov5_roots_for_nothing_are_what_gov5_writes() {
+        assert_eq!(gov5_rewards_root([]), GOV5_NIL_HASH);
+        assert_eq!(GOV5_EMPTY_REQUESTS_HASH, alloy_consensus::EMPTY_ROOT_HASH);
+        assert!(is_empty_requests_hash(EMPTY_REQUESTS_HASH));
+        assert!(is_empty_requests_hash(GOV5_EMPTY_REQUESTS_HASH));
+        assert!(!is_empty_requests_hash(B256::ZERO));
+    }
+
+    #[test]
+    fn a_payload_that_lies_about_its_hash_does_not_reconstruct() {
+        let block = block_for_header(fixture_header(), vec![]);
+        let mut payload = execution_data_for_block(block.header.hash_slow(), &block);
+        payload.payload.as_v1_mut().block_hash = B256::repeat_byte(0xEE);
+        assert!(reconstruct_gov5_h2_block::<TxEnvelope>(&payload).is_err());
+    }
+
+    include!("header_profile_fixture.rs");
+}

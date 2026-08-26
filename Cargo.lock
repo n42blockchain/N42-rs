@@ -6708,6 +6708,7 @@ dependencies = [
  "libp2p-core",
  "libp2p-dns",
  "libp2p-gossipsub",
+ "libp2p-identify",
  "libp2p-identity",
  "libp2p-mdns",
  "libp2p-metrics",
@@ -6818,6 +6819,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "libp2p-identify"
+version = "0.47.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ab792a8b68fdef443a62155b01970c81c3aadab5e659621b063ef252a8e65e8"
+dependencies = [
+ "asynchronous-codec",
+ "either",
+ "futures",
+ "futures-bounded",
+ "futures-timer",
+ "libp2p-core",
+ "libp2p-identity",
+ "libp2p-swarm",
+ "quick-protobuf",
+ "quick-protobuf-codec",
+ "smallvec",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
 name = "libp2p-identity"
 version = "0.2.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6865,6 +6887,7 @@ dependencies = [
  "futures",
  "libp2p-core",
  "libp2p-gossipsub",
+ "libp2p-identify",
  "libp2p-identity",
  "libp2p-swarm",
  "pin-project",
@@ -7805,6 +7828,7 @@ dependencies = [
  "alloy-rpc-types",
  "alloy-rpc-types-engine 2.4.1",
  "alloy-rpc-types-eth 2.4.1",
+ "alloy-signer-local",
  "eyre",
  "futures-core",
  "futures-util",
@@ -7812,14 +7836,18 @@ dependencies = [
  "n42-clique",
  "n42-consensus-traits",
  "n42-engine-primitives",
+ "n42-h2-consensus",
+ "n42-primitives",
  "n42-qmdb-reth",
  "reth-basic-payload-builder",
  "reth-chain-state",
  "reth-chainspec",
  "reth-consensus",
+ "reth-consensus-common",
  "reth-engine-primitives",
  "reth-errors",
  "reth-eth-wire-types",
+ "reth-ethereum-consensus",
  "reth-ethereum-engine-primitives",
  "reth-ethereum-payload-builder",
  "reth-ethereum-primitives",
@@ -7872,7 +7900,11 @@ dependencies = [
 name = "n42-h2-consensus"
 version = "2.1.5"
 dependencies = [
+ "alloy-consensus 2.4.1",
+ "alloy-eips 2.4.1",
  "alloy-primitives 1.6.1",
+ "alloy-rlp",
+ "alloy-rpc-types-engine 2.4.1",
  "bincode",
  "bitvec",
  "blake3",

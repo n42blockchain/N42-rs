@@ -61,6 +61,7 @@ use n42_h2_net::{
     decode_block_gossip, encode_block_gossip, H2V4Transport, HeaderProfile, TransportEvent,
 };
 use n42_h2_primitives::consensus::{H2V4ChainIdentity, QuorumCertificate};
+use n42_h2_wire::{H2Message, H2V4Envelope};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -182,6 +183,11 @@ pub struct H2Service<E> {
     /// Which header shapes this node puts on, and accepts from, the block
     /// topic. See [`HeaderProfile`].
     header_profile: HeaderProfile,
+    /// Whether consensus messages go out on gov5's native topic in gov5's
+    /// own encoding, as a Go fleet member sends them, rather than on the
+    /// chain-bound v4 topic. Inbound traffic is accepted from both either
+    /// way; Decide proofs are always also published on v4 for observers.
+    native_wire: bool,
     /// Blocks consensus asked to execute before their bodies arrived. A body
     /// for one of these re-runs the execution instead of waiting for the next
     /// proposal to mention the block again, which it may never do.
@@ -197,6 +203,11 @@ pub struct H2Service<E> {
     /// [`ProposalContext::head_timestamp`]. Bounded; insertion order in
     /// `timestamp_order`.
     block_timestamps: std::collections::HashMap<B256, u64>,
+    /// Block numbers, same bookkeeping, for the height this node advertises
+    /// in the status handshake once a block commits.
+    block_numbers: std::collections::HashMap<B256, u64>,
+    /// When each block was first seen here, for [`ProposalContext::head_seen`].
+    block_seen: std::collections::HashMap<B256, std::time::Instant>,
     timestamp_order: Vec<B256>,
 }
 
@@ -227,6 +238,12 @@ pub struct ProposalContext {
     /// strictly greater than the parent's, and only the parent's timestamp
     /// says what that means.
     pub head_timestamp: Option<u64>,
+    /// When this node first had the head — built it, or received its body —
+    /// by this node's own clock. What a builder paces against: the head's
+    /// timestamp is another leader's claim about time (gov5 stamps
+    /// `parent + period` however early it proposes), while this is when the
+    /// block actually happened here.
+    pub head_seen: Option<std::time::Instant>,
 }
 
 /// Persists the engine's state. Called before a commit reaches the execution
@@ -273,13 +290,33 @@ impl<E: ExecutionLayer> H2Service<E> {
             checkpoint: None,
             proposal_deferred: false,
             header_profile: HeaderProfile::Ethereum,
+            native_wire: false,
             awaiting_bodies: HashSet::new(),
             ready_bodies: Vec::new(),
             received_bodies: Vec::new(),
             body_outbox: Vec::new(),
             block_timestamps: std::collections::HashMap::new(),
+            block_numbers: std::collections::HashMap::new(),
+            block_seen: std::collections::HashMap::new(),
             timestamp_order: Vec::new(),
         }
+    }
+
+    /// Runs this node under gov5's `HotStuff` header profile.
+    ///
+    /// Blocks it builds are finished before they are proposed — the view
+    /// stamped into the extra data, the seal signed with `key`, the ommers
+    /// hash and difficulty set to what gov5's producer writes — and blocks it
+    /// receives are decoded under the same profile. What a Go fleet member
+    /// does, so the two can share a chain.
+    pub fn with_gov5_h2_profile(mut self, key: n42_h2_primitives::bls::BlsSecretKey) -> Self {
+        self.header_profile = HeaderProfile::Gov5H2;
+        self.native_wire = true;
+        self.driver.set_payload_normalizer(move |payload, view| {
+            n42_h2_consensus::normalize_to_gov5_h2(payload, view, Some(&key))
+                .map_err(|e| e.to_string())
+        });
+        self
     }
 
     /// Sets the header shape used on the block topic.
@@ -490,32 +527,19 @@ impl<E: ExecutionLayer> H2Service<E> {
 
     fn handle_transport_event(&mut self, event: TransportEvent) -> Result<(), ServiceError> {
         match event {
-            TransportEvent::Envelope { envelope, .. } => {
-                match wire_bridge::to_engine(&envelope, self.validator_count) {
-                    Ok(message) => {
-                        // A message that fails the engine's own checks is a
-                        // peer problem, not a local one: log it and keep the
-                        // node running rather than taking the fleet's word for
-                        // when this process should stop.
-                        if let Err(err) = self.engine.process_event(ConsensusEvent::Message(message))
-                        {
-                            debug!(target: "n42.h2.node", %err, "engine rejected a message");
-                        }
-                    }
-                    Err(BridgeError::InvalidBitmap { .. }) => {
-                        // Almost always a fleet running a different validator
-                        // set size, which is a configuration problem worth
-                        // seeing rather than a malformed-packet statistic.
-                        warn!(
-                            target: "n42.h2.node",
-                            expected = self.validator_count,
-                            "rejected a message whose signer bitmap does not match our validator set size",
-                        );
-                    }
-                    Err(err) => {
-                        debug!(target: "n42.h2.node", %err, "undecodable consensus message");
-                    }
-                }
+            TransportEvent::Envelope { envelope, .. } => self.accept_envelope(&envelope),
+            TransportEvent::Native { message, .. } => {
+                // The native topic is chain-scoped by its fork digest and
+                // carries no envelope; give the message the envelope the
+                // bridge expects, under this node's own identity. The
+                // signatures inside are chain-bound regardless — a gov5
+                // fleet with interopV4 signs the v4 domains on this topic.
+                let envelope = H2V4Envelope {
+                    identity: self.identity,
+                    changes_hash: B256::ZERO,
+                    message: *message,
+                };
+                self.accept_envelope(&envelope);
             }
             TransportEvent::Block { data, .. } => {
                 // Nothing here is trusted beyond its own consistency: the
@@ -526,7 +550,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 match decode_block_gossip(&data, self.header_profile) {
                     Ok(block) => {
                         let block_hash = block.block_hash;
-                        self.remember_timestamp(block_hash, block.header.timestamp);
+                        self.remember_block(block_hash, block.header.timestamp, block.header.number);
                         self.driver.cache_payload(block_hash, block.execution_data());
                         if self.awaiting_bodies.remove(&block_hash) {
                             self.ready_bodies.push(block_hash);
@@ -534,7 +558,11 @@ impl<E: ExecutionLayer> H2Service<E> {
                         self.received_bodies.push(block_hash);
                     }
                     Err(err) => {
-                        debug!(target: "n42.h2.node", %err, "dropped a block body");
+                        // The bytes matter here: a body this node cannot read
+                        // is a body it cannot vote on, and the usual cause is
+                        // a wire-format difference with the producer.
+                        let head = data.iter().take(256).map(|b| format!("{b:02x}")).collect::<String>();
+                        debug!(target: "n42.h2.node", %err, len = data.len(), head, "dropped a block body");
                     }
                 }
             }
@@ -564,6 +592,35 @@ impl<E: ExecutionLayer> H2Service<E> {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Feeds a decoded consensus message to the engine.
+    fn accept_envelope(&mut self, envelope: &H2V4Envelope) {
+        match wire_bridge::to_engine(envelope, self.validator_count) {
+            Ok(message) => {
+                // A message that fails the engine's own checks is a
+                // peer problem, not a local one: log it and keep the
+                // node running rather than taking the fleet's word for
+                // when this process should stop.
+                if let Err(err) = self.engine.process_event(ConsensusEvent::Message(message))
+                {
+                    debug!(target: "n42.h2.node", %err, "engine rejected a message");
+                }
+            }
+            Err(BridgeError::InvalidBitmap { .. }) => {
+                // Almost always a fleet running a different validator
+                // set size, which is a configuration problem worth
+                // seeing rather than a malformed-packet statistic.
+                warn!(
+                    target: "n42.h2.node",
+                    expected = self.validator_count,
+                    "rejected a message whose signer bitmap does not match our validator set size",
+                );
+            }
+            Err(err) => {
+                debug!(target: "n42.h2.node", %err, "undecodable consensus message");
+            }
+        }
     }
 
     /// Drains the engine's output channel to empty.
@@ -627,6 +684,12 @@ impl<E: ExecutionLayer> H2Service<E> {
                 commit_qc,
                 ..
             } => {
+                // The status handshake advertises the committed height; a
+                // peer deciding whether this node is worth syncing from reads
+                // it, and gov5 waits for a peer at or above its own height.
+                if let Some(number) = self.block_numbers.get(&block_hash).copied() {
+                    self.transport.set_advertised_height(number);
+                }
                 events.push(ServiceEvent::Committed {
                     view,
                     block_hash,
@@ -697,6 +760,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             view,
             head,
             head_timestamp: self.block_timestamps.get(&head).copied(),
+            head_seen: self.block_seen.get(&head).copied(),
         };
         let Some(attrs) = build_attributes(context) else {
             // Declined for now — not marked as proposed, so the next step asks
@@ -707,14 +771,14 @@ impl<E: ExecutionLayer> H2Service<E> {
         };
         self.proposal_deferred = false;
         self.proposed_view = Some(view);
-        match self.driver.build_block(attrs).await {
+        match self.driver.build_block(attrs, view).await {
             Ok(built) => {
                 debug!(target: "n42.h2.node", view, block = ?built.hash, txs = built.tx_count, "built a block to propose");
                 // The proposal names the hash; the body has to get there by
                 // itself, and before the proposal if the followers are to vote
                 // in the first round. Publishing it first is the best order
                 // gossip can offer.
-                self.remember_timestamp(built.hash, built.timestamp);
+                self.remember_block(built.hash, built.timestamp, built.number);
                 self.publish_body(&built.execution_data);
                 if let Err(err) = self
                     .engine
@@ -778,7 +842,18 @@ impl<E: ExecutionLayer> H2Service<E> {
             }
         };
 
-        match self.transport.publish(&envelope) {
+        let result = if self.native_wire {
+            // What a Go member does: consensus on the native topic, and the
+            // Decide proof additionally on the chain-bound v4 topic, where
+            // observers verify finality without joining consensus.
+            if matches!(envelope.message, H2Message::Decide(_)) {
+                let _ = self.transport.publish(&envelope);
+            }
+            self.transport.publish_native(&envelope.message)
+        } else {
+            self.transport.publish(&envelope)
+        };
+        match result {
             // A duplicate is already on the wire — engines re-broadcast by
             // design, and gov5's message id is a hash of the payload.
             Ok(_) => events.push(ServiceEvent::Published { view }),
@@ -795,12 +870,16 @@ impl<E: ExecutionLayer> H2Service<E> {
         }
     }
 
-    fn remember_timestamp(&mut self, block_hash: B256, timestamp: u64) {
+    fn remember_block(&mut self, block_hash: B256, timestamp: u64, number: u64) {
         if self.block_timestamps.insert(block_hash, timestamp).is_none() {
+            self.block_numbers.insert(block_hash, number);
+            self.block_seen.insert(block_hash, std::time::Instant::now());
             self.timestamp_order.push(block_hash);
             while self.timestamp_order.len() > REMEMBERED_TIMESTAMPS {
                 let oldest = self.timestamp_order.remove(0);
                 self.block_timestamps.remove(&oldest);
+                self.block_numbers.remove(&oldest);
+                self.block_seen.remove(&oldest);
             }
         }
     }

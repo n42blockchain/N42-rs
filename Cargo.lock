@@ -8067,6 +8067,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "n42-qmdb-state"
+version = "2.1.5"
+dependencies = [
+ "alloy-primitives 1.6.1",
+ "hex",
+ "n42-twig-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
 name = "n42-storage"
 version = "2.1.5"
 dependencies = [

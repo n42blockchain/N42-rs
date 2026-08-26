@@ -1,0 +1,24 @@
+[package]
+name = "n42-qmdb-state"
+version.workspace = true
+edition.workspace = true
+# Ported from ../N42-26 (rustc 1.97); see the note in the sibling h2 crates.
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "QMDB state commitment: the twig-forest root that is a gov5 block's state root"
+
+[dependencies]
+n42-twig-core.workspace = true
+alloy-primitives = { workspace = true, features = ["serde"] }
+serde = { workspace = true, features = ["derive"] }
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+serde_json = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

@@ -16,7 +16,11 @@ description = "QMDB-style twig engine (all-DRAM AlDBaran variant) — ported fro
 
 [dependencies]
 blake3.workspace = true
-serde = { workspace = true, features = ["derive"] }
+# "std" as well as "derive": the workspace pins serde with default-features
+# off, so a crate that serialises a Vec has to ask for it. Without this the
+# crate builds only when something else in the graph happens to enable it,
+# which is to say it does not build on its own.
+serde = { workspace = true, features = ["derive", "std"] }
 thiserror.workspace = true
 # Optional: cross-shard parallelism for the builder. OFF by default so mobile/FFI
 # stays zero-dep (it only verifies proofs).

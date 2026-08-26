@@ -840,6 +840,19 @@ pub struct QmdbCompatTree {
     next_slot: u64,
 }
 
+impl std::fmt::Debug for QmdbCompatTree {
+    /// Summary only. The leaf set is the whole world state, so printing it would
+    /// turn a stray `{:?}` into a memory event — and the root is not included
+    /// either, because reading it rebuilds the upper tree and a debug format
+    /// should not cost that.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QmdbCompatTree")
+            .field("leaves", &self.len())
+            .field("next_slot", &self.next_slot())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Default for QmdbCompatTree {
     fn default() -> Self {
         Self::new()

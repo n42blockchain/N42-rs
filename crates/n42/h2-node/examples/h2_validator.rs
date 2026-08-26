@@ -28,6 +28,11 @@
 //! node votes on other members' proposals but never makes one, which is the
 //! right way to join a fleet that is already producing.
 //!
+//! `--mobile <addr>` opens the `mobile_*` endpoint phones talk to: it serves
+//! each commit as the `Decide` a fleet member would verify, and collects the
+//! verification receipts phones send back. It has no TLS, auth, or rate limiting
+//! — put it behind something that does before exposing it.
+//!
 //! The BLS key must be the one at `--index` in `validators.json`; the node
 //! checks this at startup, because a mismatch turns it into a silent observer:
 //! the engine finds no local key in the set, so it never votes, never proposes,
@@ -35,6 +40,7 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy_primitives::{Address, B256};
@@ -46,6 +52,7 @@ use n42_h2_net::{H2V4Transport, TransportConfig};
 use n42_h2_node::{H2Service, ServiceEvent};
 use n42_h2_primitives::bls::BlsSecretKey;
 use n42_h2_primitives::consensus::H2V4ChainIdentity;
+use n42_mobile_service::MobileService;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -67,6 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut listen: Vec<String> = Vec::new();
     let mut fault_tolerance: Option<u32> = None;
     let mut propose = false;
+    let mut mobile_addr: Option<String> = None;
     let mut base_timeout_ms: u64 = 4_000;
 
     let mut args = std::env::args().skip(1);
@@ -93,6 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--timeout-ms" => {
                 base_timeout_ms = args.next().ok_or("--timeout-ms needs a value")?.parse()?
             }
+            "--mobile" => mobile_addr = Some(args.next().ok_or("--mobile needs an address")?),
             "--propose" => propose = true,
             "--help" | "-h" => {
                 eprintln!("{USAGE}");
@@ -164,6 +173,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("execution    : {el_url}");
         println!("proposing    : {}", if propose { "yes" } else { "no (votes only)" });
 
+        // Phones verify the Decide, not this node's word for it, so the endpoint
+        // needs the chain identity the envelopes are bound to.
+        let mobile = mobile_addr.as_ref().map(|addr| {
+            let service = Arc::new(Mutex::new(MobileService::new(identity, 1)));
+            let served = Arc::clone(&service);
+            let bind_to = addr.clone();
+            std::thread::spawn(move || {
+                if let Err(error) = n42_mobile_service::serve(bind_to.as_str(), served) {
+                    eprintln!("mobile endpoint stopped: {error}");
+                }
+            });
+            println!("mobile       : {addr}");
+            service
+        });
+
         let (output_tx, output_rx) = tokio::sync::mpsc::channel::<EngineOutput>(256);
         let mut engine = ConsensusEngine::new(
             index,
@@ -192,8 +216,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             for event in service.step().await? {
                 match event {
-                    ServiceEvent::Committed { view, block_hash } => {
+                    ServiceEvent::Committed {
+                        view,
+                        block_hash,
+                        commit_qc,
+                    } => {
                         println!("COMMIT view={view} block={block_hash}");
+                        if let Some(mobile) = &mobile {
+                            let mut guard = mobile
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            // Block number is not carried on the consensus event;
+                            // the view is what a phone indexes finality by here.
+                            if let Err(error) =
+                                guard.record_commit(view, block_hash, view, *commit_qc, None)
+                            {
+                                eprintln!("could not publish the commit to phones: {error}");
+                            }
+                        }
                     }
                     ServiceEvent::ViewChanged { new_view } => {
                         println!("view   {new_view}");
@@ -262,6 +302,7 @@ h2_validator — run a participating HotStuff-2 v4 node against an execution lay
   --peer <multiaddr>        fleet member to dial (repeatable)
   --listen <multiaddr>      address to listen on (repeatable)
   --propose                 build blocks when leader (default: vote only)
+  --mobile <addr>           serve the mobile_* endpoint here (e.g. 127.0.0.1:9545)
   --fault-tolerance <u32>   override f; defaults to (n-1)/3
   --timeout-ms <u64>        base view timeout (default 4000)
 ";

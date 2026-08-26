@@ -88,6 +88,7 @@ impl BlockVerificationStatus {
 /// Aggregates verification receipts across multiple blocks.
 ///
 /// Maintains per-block status for recent blocks and evicts old ones when at capacity.
+#[derive(Debug)]
 pub struct ReceiptAggregator {
     blocks: HashMap<B256, BlockVerificationStatus>,
     default_threshold: u32,

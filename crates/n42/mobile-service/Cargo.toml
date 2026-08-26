@@ -1,0 +1,29 @@
+[package]
+name = "n42-mobile-service"
+version.workspace = true
+edition.workspace = true
+# Ported from ../N42-26 (rustc 1.97); see the note in the sibling h2 crates.
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Node-side service a mobile verifier talks to: finality proofs out, verification receipts in"
+
+[dependencies]
+n42-h2-consensus.workspace = true
+n42-h2-primitives.workspace = true
+n42-h2-wire.workspace = true
+n42-mobile-verify.workspace = true
+alloy-primitives = { workspace = true, features = ["serde"] }
+serde = { workspace = true, features = ["derive"] }
+hex.workspace = true
+serde_json = { workspace = true, features = ["std"] }
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+n42-h2-wire.workspace = true
+serde_json = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

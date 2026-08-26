@@ -163,6 +163,11 @@ impl AggregatedAttestation {
 /// The builder accepts receipts that match the target `(block_hash, block_number,
 /// receipts_root)` and deduplicates by verifier pubkey. Once enough receipts
 /// have been collected, call [`build`] to produce the aggregate.
+///
+/// `Clone` so a caller can take an aggregate of what it has so far without
+/// giving up the ability to add more: [`Self::build`] consumes the builder, and
+/// receipts keep arriving after a threshold is first crossed.
+#[derive(Debug, Clone)]
 pub struct AttestationBuilder {
     block_hash: B256,
     block_number: u64,

@@ -48,7 +48,7 @@ use n42_h2_consensus::{ConsensusEngine, ConsensusEvent, EngineOutput};
 use n42_h2_execution::{DriverAction, ExecutionDriver, ExecutionLayer};
 use alloy_rpc_types_engine::PayloadAttributes;
 use n42_h2_net::{H2V4Transport, TransportEvent};
-use n42_h2_primitives::consensus::H2V4ChainIdentity;
+use n42_h2_primitives::consensus::{H2V4ChainIdentity, QuorumCertificate};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -93,6 +93,14 @@ pub enum ServiceEvent {
         view: u64,
         /// The block.
         block_hash: B256,
+        /// The certificate that committed it.
+        ///
+        /// Carried, not dropped: it is what turns "this node says so" into a
+        /// proof anyone can check, and the only thing that lets a consumer —
+        /// a mobile-verification endpoint, an archive, a bridge — republish the
+        /// commit as the `Decide` a fleet member would have verified. Boxed
+        /// because it is far larger than the rest of the enum.
+        commit_qc: Box<QuorumCertificate>,
     },
     /// This node published a consensus message.
     Published {
@@ -337,7 +345,9 @@ impl<E: ExecutionLayer> H2Service<E> {
         loop {
             for event in self.step().await? {
                 match event {
-                    ServiceEvent::Committed { view, block_hash } => {
+                    ServiceEvent::Committed {
+                        view, block_hash, ..
+                    } => {
                         info!(target: "n42.h2.node", view, ?block_hash, "committed");
                     }
                     ServiceEvent::SyncRequired {
@@ -443,9 +453,16 @@ impl<E: ExecutionLayer> H2Service<E> {
                 self.publish(message, events);
             }
             EngineOutput::BlockCommitted {
-                view, block_hash, ..
+                view,
+                block_hash,
+                commit_qc,
+                ..
             } => {
-                events.push(ServiceEvent::Committed { view, block_hash });
+                events.push(ServiceEvent::Committed {
+                    view,
+                    block_hash,
+                    commit_qc: Box::new(commit_qc),
+                });
             }
             EngineOutput::ViewChanged { new_view } => {
                 events.push(ServiceEvent::ViewChanged { new_view });

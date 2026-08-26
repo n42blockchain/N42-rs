@@ -241,7 +241,7 @@ async fn four_rust_nodes_reach_agreement_over_a_real_gossip_mesh() {
     })
     .await;
 
-    let Some((index, ServiceEvent::Committed { view, block_hash })) = committed else {
+    let Some((index, ServiceEvent::Committed { view, block_hash, .. })) = committed else {
         panic!("no node committed a block within the budget");
     };
     assert!(view > 0, "commit must be in a real view");

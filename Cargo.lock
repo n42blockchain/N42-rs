@@ -7954,6 +7954,7 @@ dependencies = [
  "n42-h2-net",
  "n42-h2-primitives",
  "n42-h2-wire",
+ "n42-mobile-service",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -7992,6 +7993,22 @@ dependencies = [
  "sha2 0.10.9",
  "snap",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "n42-mobile-service"
+version = "2.1.5"
+dependencies = [
+ "alloy-primitives 1.6.1",
+ "hex",
+ "n42-h2-consensus",
+ "n42-h2-primitives",
+ "n42-h2-wire",
+ "n42-mobile-verify",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tracing",
 ]
 
 [[package]]

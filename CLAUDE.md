@@ -62,9 +62,13 @@ only), every Ethereum fork through Osaka active at genesis, and the Prague syste
 alloc. Both `--chain <path>` and the `N42_DEVNET` constant build its genesis header the same way, with
 the QMDB root of the alloc; a genesis file that declares its own fork schedule is trusted over the
 legacy `N42_HARDFORKS` list. The same file is what a gov5 node is initialised from (`n42 init`).
-On a chain whose genesis names a `hotstuff` validator set `bin/n42` spawns no APoS miner: the fleet
+On a chain whose genesis names a `hotstuff` validator set `bin/n42` runs `HotStuffConsensus`
+(gov5's header profile and roots) instead of APoS and spawns no miner: the fleet
 (`cargo run -p n42-h2-node --example h2_validator -- --chain <genesis> --propose …`) drives it over
-the Engine API, and `--dev.consensus-signer-private-key` only seals what the fleet asks for.
+the Engine API. `scripts/devnet-fleet.sh <tag> <secs> [--gov5]` runs the whole devnet — one QMDB
+node, four Rust validators, or three plus a gov5 member from `../N42-gov5` (which needs
+`docs/gov5-cancun-parent-beacon-root.patch` applied). `docs/N42_26_PORT.md` "Joining a Go fleet"
+lists every cross-client rule that had to be matched.
 
 `cargo build`/`cargo test` with no `-p` only touches `default-members` (`bin/n42`). Use `--workspace`
 deliberately — it is a very large build.

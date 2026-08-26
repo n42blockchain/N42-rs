@@ -507,6 +507,98 @@ allows.
 
 Consensus state across restarts is covered in "Restarting a validator" above.
 
+## Joining a Go fleet: a Rust node in gov5's consensus
+
+Measured end state (`scripts/devnet-fleet.sh mixed 90 --gov5`: one QMDB `n42`,
+three Rust validators, one gov5 validator, the checked-in devnet genesis):
+90 s, 37 blocks, both clients at height 37 with the same head hash, the Go
+member leading and sealing every fourth view (9 blocks), importing and voting
+on every Rust block, zero errors on either side. Before this work the same
+setup reached zero commits on the Go side. Everything between those two
+numbers is listed here, because each item was found by the fleet refusing to
+work and none was visible from the code alone.
+
+**The header profile.** gov5's block header is Ethereum's field for field, but
+four fields mean something else (`internal/consensus/hotstuff/adapter.go`
+`Prepare`, `header_extra.go`): `extra_data` is `"N42H" ‖ view (LE u64) ‖ [QC]
+‖ 96-byte BLS seal`, `difficulty` is 0, `beneficiary` is the leader, and
+`ommers_hash` is the Go zero value — its miner never sets it. The seal is the
+leader's signature over the header hashed without the last 96 bytes, under the
+same proof-of-possession ciphersuite as its votes; gov5's `VerifyHeader` does
+not check it, this node signs it anyway. `n42-h2-consensus::header_profile`
+is the codec, checked against bytes printed by gov5's own code: extra layout,
+header hash, seal hash, and — the part that could not be reasoned out —
+**gov5's receipts root**, which is not a trie but the keccak of the
+concatenated `rlp([status, cumulativeGas, logs])`, keccak of nothing for an
+empty block (`hash.DeriveSha`). The same function spells two more roots its
+own way: `withdrawalsRoot` carries the rewards commitment (keccak of nothing
+without rewards), and `requestsHash` for no requests is the empty trie root,
+not EIP-7685's `sha256("")`.
+
+On the execution layer the profile is [`HotStuffConsensus`]
+(`crates/n42/engine-types/src/hotstuff_consensus.rs`), installed by
+`N42ConsensusBuilder` on any genesis naming a `hotstuff` validator set, in
+place of APoS: gov5's header rules, gov5's receipts root in post-execution
+validation, both spellings of the two roots above. `N42EngineValidator`
+reconstructs the block a payload describes by trying the header values gov5
+would have written — a payload carries neither `ommers_hash` nor
+`difficulty`, and its withdrawals list reconstructs to the trie root — and
+lets the block hash pick; nothing is guessed. The validator process finishes
+each block it builds (`normalize_to_gov5_h2`: view, seal, the two roots, new
+hash) before importing and proposing it.
+
+**The consensus channel is not the v4 topic.** gov5 publishes on
+`/n42/h2/4/ssz_snappy` only Decide proofs, for observers; its consensus runs
+on `/n42/<fork digest>/hotstuff_consensus/ssz_snappy`, in the message
+encoding `n42-h2-wire` already reads (the v4 envelope is that encoding with
+an identity prefix). With `interopV4` in the genesis, gov5 signs the v4
+chain-bound domains on that topic, so the engine's signing profile was
+already right; the transport now speaks both topics, and a member publishes
+consensus natively and the Decide proof additionally on v4.
+
+**go-libp2p-pubsub only meshes with identified peers.** Three Rust members
+sat connected to the Go node for a minute, status exchanged, gossipsub
+streams negotiated in both directions, with no subscription ever crossing:
+go-libp2p-pubsub v0.17 adds a peer that connected after startup only on
+`EvtPeerIdentificationCompleted` (`peer_notify.go`), and this node did not
+speak `/ipfs/id/1.0.0`. The transport now carries the identify behaviour.
+
+**The system caller leaf.** With everything above in place the Go node
+imported this node's block 1 and rejected it: `state root mismatch`. Tracing
+both clients' QMDB write sets for the block gave two identical lists of four
+leaves — the EIP-2935 and EIP-4788 contracts and their slots — and one extra
+on the Go side: `0xffff…fffe`, the caller of Prague's system calls, as a live
+empty account. Erigon's `SysCallContract` leaves that caller in the dirty set
+as an initialised object, gov5's root computer writes every dirty object, and
+its `isAccountEmpty` spares initialised accounts; reth's `SystemCaller`
+removes the address after every call. `changes_from_execution` adds the leaf
+on Prague blocks, and every bundle account is now written live even when
+empty, since every state object gov5 holds is initialised.
+
+**Timestamps: two clocks.** gov5 stamps `parent + period` however early it
+proposes, and ignores any gossiped block stamped ahead of its own wall clock,
+with no tolerance. So after a Go block a Rust leader must wait for the clock
+to pass the parent's stamp, and stamp the wall clock — not `parent + period`,
+which after a Go block is a period ahead and lost every such view to the
+timeout, and not `parent + 1` while the clock is behind it, which the Go node
+dropped as a future block. Pacing is `period` after the parent was *seen*
+here (`ProposalContext::head_seen`), by this node's clock.
+
+**One change gov5 needs.** Without committee evidence gov5 leaves
+`parentBeaconRoot` nil on a Cancun chain — encoded as an empty string,
+unrepresentable over the Engine API (`newPayloadV3+` requires the root), and
+it skips EIP-4788 for the block, which no reth-validated block can match.
+`docs/gov5-cancun-parent-beacon-root.patch` makes `Prepare` write the zero
+root in that case, which is what genesis and every Engine API client write
+and what gov5's own `VerifyHeader` already accepts. The mixed-fleet
+measurement above was taken with it applied; it belongs in the gov5 repo.
+
+Not done, and what it costs: gov5 recovers from a same-height sibling — its
+own speculative block against the next leader's — by fetching the block from
+peers over `/rpc/block_by_hash/1/ssz_snappy`; this node does not serve it, so
+a Go member that falls into that state stays behind until restarted. Serving
+the request from the bodies this node already holds is the next item.
+
 ## Live cross-client attach: how far it got
 
 There is no gov5 fleet on this Linux host — the deployment docs point at a
@@ -736,13 +828,10 @@ nothing.
 
 Ordered by dependency, not by value.
 
-0. **Emit gov5's H2 header profile from the builder.** `N42H`-prefixed extra
-   data carrying the view, zero ommers hash, difficulty 0, and a consensus
-   adapter so reth's header validation accepts it (N42-26's `adapter.rs`).
-   Without it a Go node rejects every Rust-built block and vice versa; with it
-   the Rust fleet above becomes a mixed one. Everything else on the path —
-   genesis hash, gossip topics and framing, the status handshake, the Engine
-   API round-trip, block bodies — is already gov5's.
+0. **Serve gov5's block-fetch RPC** (`/rpc/block_by_hash/1/ssz_snappy`, and
+   `blocks_by_range` for a member that starts behind) from the bodies this
+   node holds, so a Go member recovers from a sibling or a restart without
+   help. See "Joining a Go fleet" for what a Go fleet needs and already gets.
 1. **Run the observer against the live fleet.** Everything below the socket is
    tested; what remains is operational — point `h2_observer` at real fleet
    peers with the fleet's genesis hash and validator list, and confirm it

@@ -26,7 +26,7 @@ none: no existing package version was replaced, so the reth v1.11.0 build graph
 resolves exactly as before.
 
 Test count by crate: bmt-core 7, twig-core 38, h2-primitives 48, h2-wire 9,
-h2-consensus 209, mobile-verify 61, h2-net 24, h2-execution 9 — **412 total**.
+h2-consensus 209, mobile-verify 61, h2-net 35, h2-execution 9 — **423 total**.
 
 | Crate | From N42-26 | Lines | Tests | What it gives this repo |
 |---|---|---|---|---|
@@ -36,7 +36,7 @@ h2-consensus 209, mobile-verify 61, h2-net 24, h2-execution 9 — **412 total**.
 | `n42-h2-wire` | `n42-network/src/h2_{wire,v4}.rs` | 1,200 | 9 | The Go↔Rust wire contract: legacy H2 codec + v4 envelope, all five documented rejection paths. Carries no networking stack. |
 | `n42-h2-consensus` | `n42-consensus` (all but `adapter.rs`) + `n42-consensus-service/h2_finality.rs` | 12,599 | 209 | The HotStuff-2 protocol core — state machine, proposal, voting, quorum assembly, pacemaker, view change, timeout certificates — plus validator set, epoch management, leader selection, rotor, vote log, and `VerifyH2V4Decide`. Enough to *participate*, not only observe. |
 | `n42-mobile-verify` | `n42-mobile` (format half) | 2,363 | 61 | Verification receipts, BLS attestation aggregation, twig/SBMT state proofs, hot-contract code cache. |
-| `n42-h2-net` | new, modelled on `n42-network` | 1,861 | 24 | gov5-compatible GossipSub transport: topic strings, router parameters, gov5's message-ID function, the `/rpc/status/1/ssz_snappy` handshake, and an observer that turns wire bytes into verified finality. Ships a runnable `h2_observer` example. |
+| `n42-h2-net` | new, modelled on `n42-network` | 2,266 | 35 | gov5-compatible GossipSub transport: topic strings, router parameters, gov5's message-ID function, the `/rpc/status/1/ssz_snappy` handshake. `H2V4Transport` is the bidirectional mesh member (subscribe, decode, **publish**); `H2V4Observer` is the read-only use of it, turning wire bytes into verified finality. Ships a runnable `h2_observer` example. |
 | `n42-h2-execution` | seam from `n42-consensus-service/src/el.rs`; driver is new | 920 | 9 | The execution-layer seam (`ExecutionLayer`, Engine API in alloy types only) and the driver that services consensus's requests against it, plus an in-memory EL for testing the loop. |
 
 ### Renames
@@ -115,6 +115,13 @@ Against the brief's action list for the Rust side:
   loopback test (`tests/gossip_loopback.rs`) publishes a fixture Decide over a
   real socket through a gov5-parameterised mesh and verifies it on the other
   side. **Partially attached to a real Go node — see below.**
+- [x] 7. Publish path — `H2V4Transport::publish`. `tests/transport_publish.rs`
+  sends a fixture Decide from one transport and verifies it as finality at a
+  peer that did not send it, which is the direction an observer never exercises:
+  without it a Rust validator can vote into the void and look healthy doing it.
+  Chain-identity mismatch is refused before the wire, and an empty mesh is
+  reported as transient so a node that starts before its fleet retries instead
+  of giving up.
 - [ ] 6. (Standing constraint) do not configure epoch validator changes on a v4 chain.
 
 ## Live cross-client attach: how far it got

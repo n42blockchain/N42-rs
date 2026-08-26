@@ -9,9 +9,12 @@
 //! pubsub layer; the envelope codec and the finality check live in
 //! [`n42_h2_wire`] and [`n42_h2_consensus`].
 //!
-//! Scope is deliberately the *observer* path: subscribe, decode, verify. There
-//! is no publish path here, because publishing means participating in
-//! consensus, and this repo does not yet carry the HotStuff-2 state machine.
+//! [`transport::H2V4Transport`] is the bidirectional mesh member: it subscribes,
+//! decodes, and publishes, and hands envelopes up without judging them.
+//! [`observer::H2V4Observer`] is the read-only use of it — follow finality,
+//! never speak — which is what monitoring and sync-target consumers want.
+//! Neither one runs consensus: the state machine lives in [`n42_h2_consensus`],
+//! and the layer that drives it from these events is the node service.
 //! See `docs/N42_26_PORT.md`.
 
 pub mod config;
@@ -20,9 +23,13 @@ pub mod observer;
 pub mod rpc;
 pub mod status;
 pub mod topic;
+pub mod transport;
 
 pub use config::{gov5_gossipsub_config, max_gossip_wire_size};
 pub use message_id::{gov5_message_id_fn, gov5_message_id_parts};
 pub use observer::{H2V4Observer, ObserverConfig, ObserverError, ObserverEvent};
 pub use status::{Status, StatusError, STATUS_PROTOCOL};
 pub use topic::{h2_v4_topic, H2_V4_TOPIC, H2_V4_TOPIC_BASE};
+pub use transport::{
+    H2V4Transport, PublishError, TransportConfig, TransportError, TransportEvent,
+};

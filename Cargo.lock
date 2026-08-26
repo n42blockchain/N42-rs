@@ -7581,6 +7581,7 @@ dependencies = [
  "n42-engine-primitives",
  "n42-engine-types",
  "n42-primitives",
+ "n42-qmdb-reth",
  "pubsub-mem",
  "reth-chainspec",
  "reth-cli-runner",
@@ -7811,6 +7812,7 @@ dependencies = [
  "n42-clique",
  "n42-consensus-traits",
  "n42-engine-primitives",
+ "n42-qmdb-reth",
  "reth-basic-payload-builder",
  "reth-chain-state",
  "reth-chainspec",
@@ -8069,6 +8071,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "n42-qmdb-reth"
+version = "2.1.5"
+dependencies = [
+ "alloy-consensus 2.4.1",
+ "alloy-genesis",
+ "alloy-primitives 1.6.1",
+ "alloy-rpc-types-engine 2.4.1",
+ "bincode",
+ "eyre",
+ "n42-qmdb-state",
+ "n42-twig-core",
+ "reth-chainspec",
+ "reth-cli",
+ "reth-engine-primitives",
+ "reth-engine-tree",
+ "reth-ethereum-cli",
+ "reth-ethereum-primitives",
+ "reth-execution-types",
+ "reth-node-api",
+ "reth-node-builder",
+ "reth-primitives-traits",
+ "reth-provider",
+ "reth-storage-overlay",
+ "reth-trie",
+ "revm-database",
+ "revm-state",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
 name = "n42-qmdb-state"
 version = "2.1.5"
 dependencies = [
@@ -8117,6 +8152,8 @@ dependencies = [
  "n42-engine-primitives",
  "n42-engine-types",
  "n42-primitives",
+ "n42-qmdb-reth",
+ "n42-qmdb-state",
  "rand 0.9.5",
  "reth",
  "reth-basic-payload-builder",

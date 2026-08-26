@@ -10,6 +10,7 @@ use alloy_eips::{eip7840::BlobParams, merge::EPOCH_SLOTS};
 use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks};
 use reth_consensus::{ConsensusError, FullConsensus};
 pub use reth_node_ethereum::{payload::EthereumPayloadBuilder, EthereumEngineValidator};
+use n42_qmdb_reth::{QmdbEngineValidatorBuilder, QmdbNodeState};
 use reth_node_ethereum::{EthEngineTypes, EthEvmConfig};
 //use reth_ethereum_consensus::EthBeaconConsensus;
 use crate::consensus::N42ConsensusBuilder;
@@ -52,13 +53,49 @@ use revm::context::TxEnv;
 use std::{default::Default, sync::Arc, time::SystemTime};
 
 /// Type configuration for a regular Ethereum node.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 #[non_exhaustive]
-pub struct N42Node;
+pub struct N42Node {
+    /// The QMDB state this node commits to, on a chain that declares it.
+    ///
+    /// Shared by the payload builder and the engine validator, which is the
+    /// point: a block this node builds is validated by this node next, and the
+    /// two must read the same trees.
+    qmdb: Option<QmdbNodeState>,
+}
 
 impl N42Node {
+    /// A node committing to `qmdb`, or to reth's Merkle-Patricia trie when `None`.
+    pub const fn with_qmdb(qmdb: Option<QmdbNodeState>) -> Self {
+        Self { qmdb }
+    }
+
+    /// The QMDB state, if this node commits to one.
+    pub const fn qmdb(&self) -> Option<&QmdbNodeState> {
+        self.qmdb.as_ref()
+    }
+
     /// Returns a [`ComponentsBuilder`] configured for a regular Ethereum node.
     pub fn components<Node>() -> ComponentsBuilder<
+        Node,
+        EthereumPoolBuilder,
+        N42PayloadServiceBuilder<N42ConsensusBuilder>,
+        N42NetworkBuilder,
+        EthereumExecutorBuilder,
+        N42ConsensusBuilder,
+    >
+    where
+        Node: FullNodeTypes<Types: NodeTypes<ChainSpec = ChainSpec, Primitives = EthPrimitives>>,
+        <Node::Types as NodeTypes>::Payload: PayloadTypes<
+            BuiltPayload = EthBuiltPayload,
+            PayloadAttributes = EthPayloadAttributes,
+        >,
+    {
+        Self::components_with(None)
+    }
+
+    /// Like [`Self::components`], with built blocks committing to `qmdb`.
+    pub fn components_with<Node>(qmdb: Option<QmdbNodeState>) -> ComponentsBuilder<
         Node,
         EthereumPoolBuilder,
         N42PayloadServiceBuilder<N42ConsensusBuilder>,
@@ -78,7 +115,9 @@ impl N42Node {
             .pool(EthereumPoolBuilder::default())
             .executor(EthereumExecutorBuilder::default())
             .consensus(N42ConsensusBuilder::default())
-            .payload(N42PayloadServiceBuilder::new(N42ConsensusBuilder::default()))
+            .payload(
+                N42PayloadServiceBuilder::new(N42ConsensusBuilder::default()).with_qmdb(qmdb),
+            )
             .network(N42NetworkBuilder::default())
     }
 
@@ -163,22 +202,23 @@ where
 }
 
 /// Add-ons w.r.t. l1 ethereum.
+///
+/// `ValB` is the engine validator builder. reth's stock one is the default;
+/// this node installs [`QmdbEngineValidatorBuilder`] so block validation checks
+/// QMDB roots on a chain that declares them.
 #[derive(Debug)]
-pub struct EthereumAddOns<N: FullNodeComponents, EthB: EthApiBuilder<N>, PVB> {
-    inner: RpcAddOns<N, EthB, PVB, BasicEngineApiBuilder<PVB>, BasicEngineValidatorBuilder<PVB>>,
+pub struct EthereumAddOns<
+    N: FullNodeComponents,
+    EthB: EthApiBuilder<N>,
+    PVB,
+    ValB = BasicEngineValidatorBuilder<PVB>,
+> {
+    inner: RpcAddOns<N, EthB, PVB, BasicEngineApiBuilder<PVB>, ValB>,
 }
 
-impl<N: FullNodeComponents, EthB: EthApiBuilder<N>, PVB> EthereumAddOns<N, EthB, PVB> {
+impl<N: FullNodeComponents, EthB: EthApiBuilder<N>, PVB, ValB> EthereumAddOns<N, EthB, PVB, ValB> {
     /// Create new add-ons with given RPC add-ons.
-    pub fn new(
-        inner: RpcAddOns<
-            N,
-            EthB,
-            PVB,
-            BasicEngineApiBuilder<PVB>,
-            BasicEngineValidatorBuilder<PVB>,
-        >,
-    ) -> Self {
+    pub fn new(inner: RpcAddOns<N, EthB, PVB, BasicEngineApiBuilder<PVB>, ValB>) -> Self {
         Self { inner }
     }
 }
@@ -209,7 +249,7 @@ where
     }
 }
 
-impl<N, EthB, PVB> NodeAddOns<N> for EthereumAddOns<N, EthB, PVB>
+impl<N, EthB, PVB, ValB> NodeAddOns<N> for EthereumAddOns<N, EthB, PVB, ValB>
 where
     N: FullNodeComponents<
         Types: NodeTypes<
@@ -223,7 +263,7 @@ where
     >,
     EthB: EthApiBuilder<N>,
     PVB: PayloadValidatorBuilder<N> + Clone,
-    BasicEngineValidatorBuilder<PVB>: reth_node_builder::rpc::EngineValidatorBuilder<N>,
+    ValB: reth_node_builder::rpc::EngineValidatorBuilder<N>,
     BasicEngineApiBuilder<PVB>: reth_node_builder::rpc::EngineApiBuilder<N>,
     EthApiError: FromEvmError<N::Evm>,
     EvmFactoryFor<N::Evm>: EvmFactory<Tx = TxEnv>,
@@ -238,7 +278,7 @@ where
     }
 }
 
-impl<N, EthB, PVB> RethRpcAddOns<N> for EthereumAddOns<N, EthB, PVB>
+impl<N, EthB, PVB, ValB> RethRpcAddOns<N> for EthereumAddOns<N, EthB, PVB, ValB>
 where
     N: FullNodeComponents<
         Types: NodeTypes<
@@ -252,7 +292,7 @@ where
     >,
     EthB: EthApiBuilder<N>,
     PVB: PayloadValidatorBuilder<N> + Clone,
-    BasicEngineValidatorBuilder<PVB>: reth_node_builder::rpc::EngineValidatorBuilder<N>,
+    ValB: reth_node_builder::rpc::EngineValidatorBuilder<N>,
     BasicEngineApiBuilder<PVB>: reth_node_builder::rpc::EngineApiBuilder<N>,
     EthApiError: FromEvmError<N::Evm>,
     EvmFactoryFor<N::Evm>: EvmFactory<Tx = TxEnv>,
@@ -264,15 +304,15 @@ where
     }
 }
 
-impl<N, EthB, PVB> EngineValidatorAddOn<N> for EthereumAddOns<N, EthB, PVB>
+impl<N, EthB, PVB, ValB> EngineValidatorAddOn<N> for EthereumAddOns<N, EthB, PVB, ValB>
 where
     N: FullNodeComponents,
     EthB: EthApiBuilder<N>,
     PVB: Send,
     BasicEngineApiBuilder<PVB>: reth_node_builder::rpc::EngineApiBuilder<N>,
-    BasicEngineValidatorBuilder<PVB>: reth_node_builder::rpc::EngineValidatorBuilder<N>,
+    ValB: reth_node_builder::rpc::EngineValidatorBuilder<N>,
 {
-    type ValidatorBuilder = BasicEngineValidatorBuilder<PVB>;
+    type ValidatorBuilder = ValB;
 
     fn engine_validator_builder(&self) -> Self::ValidatorBuilder {
         self.inner.engine_validator_builder()
@@ -296,14 +336,22 @@ where
         NodeAdapter<N>,
         EthereumEthApiBuilder,
         EthereumEngineValidatorBuilder,
+        QmdbEngineValidatorBuilder<EthereumEngineValidatorBuilder>,
     >;
 
     fn components_builder(&self) -> Self::ComponentsBuilder {
-        Self::components()
+        Self::components_with(self.qmdb.clone())
     }
 
     fn add_ons(&self) -> Self::AddOns {
-        EthereumAddOns::default()
+        EthereumAddOns::new(RpcAddOns::new(
+            EthereumEthApiBuilder::default(),
+            EthereumEngineValidatorBuilder::default(),
+            BasicEngineApiBuilder::default(),
+            QmdbEngineValidatorBuilder::new(self.qmdb.clone()),
+            Default::default(),
+            Default::default(),
+        ))
     }
 }
 

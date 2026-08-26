@@ -27,8 +27,8 @@ resolves exactly as before.
 
 Test count by crate: bmt-core 7, twig-core 38, h2-primitives 48, h2-wire 9,
 h2-consensus 217, mobile-verify 61, h2-net 35, h2-execution 9, h2-node 3,
-h2-el-rpc 15, mobile-service 26, qmdb-state 10, h2-node persistence 8 —
-**486 total**.
+h2-el-rpc 15, mobile-service 26, qmdb-state 17, qmdb-reth 14, h2-node persistence 8 —
+**507 total**, plus the QMDB end-to-end test in `n42-testing`.
 
 The stack has been run end to end against a live execution layer; see
 **First live block** below.
@@ -42,7 +42,8 @@ The stack has been run end to end against a live execution layer; see
 | `n42-h2-consensus` | `n42-consensus` (all but `adapter.rs`) + `n42-consensus-service/h2_finality.rs` | 12,599 | 209 | The HotStuff-2 protocol core — state machine, proposal, voting, quorum assembly, pacemaker, view change, timeout certificates — plus validator set, epoch management, leader selection, rotor, vote log, and `VerifyH2V4Decide`. Enough to *participate*, not only observe. |
 | `n42-mobile-verify` | `n42-mobile` (format half) | 2,363 | 61 | Verification receipts, BLS attestation aggregation, twig/SBMT state proofs, hot-contract code cache. |
 | `n42-h2-net` | new, modelled on `n42-network` | 2,266 | 35 | gov5-compatible GossipSub transport: topic strings, router parameters, gov5's message-ID function, the `/rpc/status/1/ssz_snappy` handshake. `H2V4Transport` is the bidirectional mesh member (subscribe, decode, **publish**); `H2V4Observer` is the read-only use of it, turning wire bytes into verified finality. Ships a runnable `h2_observer` example. |
-| `n42-qmdb-state` | new | 450 | 10 | The QMDB state commitment: a block's state root and the proofs cut from it. On a QMDB chain this *is* the header's state root — see **QMDB is the header's state root** below. |
+| `n42-qmdb-reth` | new | 900 | 14 | Installs the QMDB root into reth: genesis header rewrite, bundle→leaves, the shared persisted forest, and the `StateRootStrategy` for validation. |
+| `n42-qmdb-state` | new | 850 | 17 | The QMDB state commitment: a block's state root and the proofs cut from it. On a QMDB chain this *is* the header's state root — see **QMDB is the header's state root** below. |
 | `n42-mobile-service` | new, in the spirit of `n42-mobile` | 900 | 19 | The node's half of mobile verification: serves each commit as the `Decide` a fleet member would verify, and aggregates the receipts phones send back into a BLS attestation. `mobile_*` JSON-RPC over a minimal HTTP front end. |
 | `n42-h2-el-rpc` | new, in the spirit of `n42-el-rpc` | 730 | 15 | An `ExecutionLayer` over the published Engine API (authenticated JSON-RPC), so one adapter drives reth, this repo's node, and gov5's `eth-el` — with no reth dependency on the consensus side. Transport is a trait, so the version mapping and error handling are tested against a recorded transport rather than a live node. |
 | `n42-h2-node` | new | 490 | 3 | The service loop that makes the other three a fleet member: transport events become consensus events, engine outputs become published envelopes and execution calls, execution answers come back as consensus events. A four-node integration test commits a block over a real gossip mesh. |
@@ -192,6 +193,8 @@ Against the brief's action list for the Rust side:
   what makes the rest worth anything.
 - [x] 13. Consensus state across restarts — `h2-node::persistence`. See
   **Restarting a validator** below.
+- [x] 14. QMDB in block production and validation — `n42-qmdb-reth`. See
+  **Wired into block production and validation** below.
 - [ ] 6. (Standing constraint) do not configure epoch validator changes on a v4 chain.
 
 ## QMDB is the header's state root
@@ -218,12 +221,61 @@ straight from gov5's implementation, each a fork if wrong:
   and forks the root permanently vs nodes that only ever applied the winner" —
   even when the resulting state is correct. `revert_to` restores the tree.
 
-**Not yet wired into block production.** reth exposes `StateRootStrategy` with a
-`prepare_payload_builder` hook (`BasicEngineValidator::with_state_root_strategy`),
-which is the supported place to substitute this and needs no fork. Until that is
-done, this node's own headers still carry an MPT root; the crate computes the
-gov5-compatible root and serves proofs against it, but block production does not
-consult it.
+### Wired into block production and validation — `n42-qmdb-reth`
+
+A chain opts in the way gov5 does, with `"stateScheme": "qmdb"` in the genesis
+config; a genesis without it is a Merkle-Patricia chain and nothing here runs.
+The eth-el branch is MPT for exactly that reason. On a QMDB chain:
+
+- **Genesis.** `N42ChainSpecParser` rebuilds the genesis header with the forest
+  root of the alloc, as gov5's `genesis_qmdb.go` does. This changes the genesis
+  hash — it must, since that is the hash a gov5 node on the same chain has.
+  reth's `init_genesis` still populates its trie tables from the alloc but does
+  not compare the result to the header, so the two coexist.
+- **Building.** `N42PayloadBuilder` hands reth's block builder a zero root so it
+  skips the MPT computation, turns the bundle execution left behind into leaves
+  (`changes_from_bundle`), asks the forest for the root, and seals it into the
+  header. The tree is filed under the block hash once that hash exists.
+- **Validating.** `QmdbStateRootStrategy` is installed through
+  `BasicEngineValidator::with_state_root_strategy` — reth's public seam, no
+  fork. After execution it computes the same root from the same kind of bundle
+  and reth compares it to the header. A block whose header disagrees gets no
+  tree, so nothing can build on state consensus never accepted.
+- **One forest.** `QmdbNodeState` is shared by the builder, the validator, and
+  the mobile endpoint, keyed by block hash so sibling proposals at one height
+  are each computed against their parent. It is persisted on every canonical
+  head move and restored at startup; a snapshot that is missing or behind the
+  database is refused, because a QMDB tree cannot be rebuilt from reth's state
+  tables (they do not keep the append history).
+
+**Which leaves a block writes** is gov5's dirty set, not a diff: every account a
+transaction touched is written whether or not a field changed, because an
+unchanged leaf still consumes a slot and still moves the root. revm's bundle
+holds exactly the touched set, and its storage exactly the slots whose value
+changed, which is what Erigon's `dirtyStorage` holds — so the mapping is direct.
+This is the one place cross-client agreement rests on an argument rather than a
+fixture; a replay of the same block on both clients is the test that closes it.
+
+Verified live on a fresh QMDB devnet: genesis hash differs from the MPT one for
+the same alloc; the forest is seeded from the alloc; a validator produced blocks
+that the node's own engine validated through the strategy (13 of 13, zero
+mismatches at debug level); two restarts restored the forest at the head and the
+chain continued, 0 → 12 → 24 → 37, with no rejected forkchoices. In the harness
+(`test_qmdb_chain__headers_carry_the_forest_root_and_validate`) a block carrying
+a transfer moves the root and empty blocks leave it alone.
+
+Three constraints, none of which this code can remove:
+
+- **No pipeline sync.** Only the engine tree consults a strategy. Backfill
+  computes MPT roots in its own stage and would reject every QMDB header. A QMDB
+  node syncs by replaying blocks through the engine, or from a forest snapshot.
+- **reth's trie is stale from block 1.** The outcome reports no trie updates, so
+  `eth_getProof` and anything reading the stored MPT is wrong on a QMDB chain.
+  Proofs come from the forest (`mobile_getProof`).
+- **One tree copy per block.** gov5 shares a tree and reverts with undo records;
+  `n42-twig-core` has no undo yet, so each validated block clones its parent's
+  tree. Correct, bounded by the retention window, and the obvious next
+  optimisation for a large state.
 
 ## Restarting a validator
 

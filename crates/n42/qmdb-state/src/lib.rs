@@ -41,7 +41,12 @@
 
 use std::collections::BTreeMap;
 
+pub mod forest;
+
 use alloy_primitives::{Address, B256, U256};
+pub use forest::{
+    ForestSnapshot, PreparedBlock, QmdbForest, StateProofProvider, DEFAULT_RETAIN_DEPTH,
+};
 use n42_twig_core::qmdb_compat::{
     encode_gov5_account_value, gov5_account_key, gov5_storage_key, QmdbCompatTree, QmdbOperation,
     QmdbOperationError, QmdbProof, GOV5_EMPTY_CODE_HASH,
@@ -173,6 +178,26 @@ pub enum StateError {
     /// A checkpoint was rolled back to that this tree does not hold.
     #[error("no checkpoint at block {0}")]
     UnknownCheckpoint(u64),
+    /// A block was built on a parent whose tree is not held — either never
+    /// validated here, or already outside the retention window. Its root
+    /// cannot be computed, because the root depends on the parent's append
+    /// history and not only on its state.
+    #[error("no QMDB tree for parent block {0}")]
+    UnknownParent(B256),
+    /// A block was named that no tree is held for.
+    #[error("no QMDB tree for block {0}")]
+    UnknownBlock(B256),
+    /// A snapshot was written by a different layout of this crate.
+    #[error("QMDB snapshot layout {found} is not the {expected} this build reads")]
+    SnapshotVersion {
+        /// The version in the snapshot.
+        found: u32,
+        /// The version this build writes.
+        expected: u32,
+    },
+    /// A snapshot did not decode into a tree.
+    #[error("QMDB snapshot: {0}")]
+    Snapshot(String),
 }
 
 /// A point the tree can be rolled back to.

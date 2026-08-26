@@ -12,7 +12,7 @@
 #![allow(clippy::useless_let_if_seq)]
 
 use alloy_consensus::{Transaction, Typed2718};
-use alloy_primitives::U256;
+use alloy_primitives::{B256, U256};
 use reth_basic_payload_builder::{
     is_better_payload, BuildArguments, BuildOutcome, MissingPayloadBehaviour, PayloadBuilder,
     PayloadConfig,
@@ -50,6 +50,8 @@ use reth_primitives_traits::SealedBlock;
 use reth_basic_payload_builder::{BasicPayloadJobGenerator, BasicPayloadJobGeneratorConfig};
 use reth_chain_state::CanonStateSubscriptions;
 use n42_consensus_traits::SignerManager;
+use n42_qmdb_reth::{changes_from_bundle, QmdbNodeState};
+use reth_trie::updates::TrieUpdates;
 use reth_consensus::{ConsensusError, FullConsensus};
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_node_api::PayloadBuilderFor;
@@ -164,6 +166,9 @@ pub struct N42PayloadBuilder<Pool, Client, EvmConfig, Cons> {
     builder_config: EthereumBuilderConfig,
     /// consensus
     cons: Cons,
+    /// The QMDB state this node commits to. `None` means the chain is a
+    /// Merkle-Patricia chain and reth computes the root.
+    qmdb: Option<QmdbNodeState>,
 }
 
 impl<Pool, Client, EvmConfig, Cons> N42PayloadBuilder<Pool, Client, EvmConfig, Cons> {
@@ -181,7 +186,19 @@ impl<Pool, Client, EvmConfig, Cons> N42PayloadBuilder<Pool, Client, EvmConfig, C
             evm_config,
             builder_config,
             cons,
+            qmdb: None,
         }
+    }
+
+    /// Commits built blocks to `qmdb` instead of the Merkle-Patricia trie.
+    ///
+    /// Must be the same state the engine validator checks against: the block
+    /// this builds is validated by this node's own execution layer next, and a
+    /// root computed from one forest and checked against another disagrees
+    /// even when both are right.
+    pub fn with_qmdb(mut self, qmdb: Option<QmdbNodeState>) -> Self {
+        self.qmdb = qmdb;
+        self
     }
 }
 
@@ -210,6 +227,7 @@ where
             args,
             |attributes| self.pool.best_transactions_with_attributes(attributes),
             self.cons.clone(),
+            self.qmdb.clone(),
         )
     }
 
@@ -247,6 +265,7 @@ where
             args,
             |attributes| self.pool.best_transactions_with_attributes(attributes),
             self.cons.clone(),
+            self.qmdb.clone(),
         )?
         .into_payload()
         .ok_or_else(|| PayloadBuilderError::MissingPayload)
@@ -267,6 +286,7 @@ pub fn default_n42_payload<EvmConfig, Client, Pool, F, Cons>(
     args: BuildArguments<EthPayloadAttributes, EthBuiltPayload>,
     best_txs: F,
     cons: Cons,
+    qmdb: Option<QmdbNodeState>,
 ) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError>
 where
     EvmConfig: ConfigureEvm<Primitives = EthPrimitives, NextBlockEnvCtx = NextBlockEnvAttributes>,
@@ -478,13 +498,30 @@ where
         });
     }
 
-    let BlockBuilderOutcome {
-        execution_result,
-        block,
-        ..
-    // upstream added an optional precomputed (state_root, trie_updates);
-    // this builder computes them itself.
-    } = builder.finish(&state_provider, None)?;
+    // On a QMDB chain the state root is not reth's to compute. The builder is
+    // handed a zero root so it skips the Merkle-Patricia computation; the real
+    // root comes from the forest, over the bundle execution left behind, and
+    // replaces the zero in the header below. The block hash follows from the
+    // sealed header, so the tree is filed under it only once that is known.
+    let (
+        BlockBuilderOutcome {
+            execution_result,
+            block,
+            ..
+        },
+        qmdb_prepared,
+    ) = match &qmdb {
+        Some(state) => {
+            let outcome =
+                builder.finish(&state_provider, Some((B256::ZERO, TrieUpdates::default())))?;
+            let bundle = db.take_bundle();
+            let prepared = state
+                .compute(parent_header.hash(), &changes_from_bundle(&bundle))
+                .map_err(PayloadBuilderError::other)?;
+            (outcome, Some(prepared))
+        }
+        None => (builder.finish(&state_provider, None)?, None),
+    };
 
     let requests = chain_spec
         .is_prague_active_at_timestamp(attributes.timestamp)
@@ -518,7 +555,10 @@ where
             .collect();
     }
 
-    header.state_root = block.header().state_root;
+    header.state_root = match &qmdb_prepared {
+        Some(prepared) => prepared.root,
+        None => block.header().state_root,
+    };
     header.transactions_root = block.header().transactions_root;
     header.receipts_root = block.header().receipts_root;
     header.logs_bloom = block.header().logs_bloom;
@@ -534,6 +574,8 @@ where
     header.mix_hash = attributes.prev_randao;
     header.parent_beacon_block_root = attributes.parent_beacon_block_root;
 
+    let block_number = header.number;
+
     // seal
     cons.seal(&mut header)
         .map_err(|err| PayloadBuilderError::Internal(err.into()))?;
@@ -543,6 +585,13 @@ where
     let senders = block.senders().to_vec();
     let sealed_block = SealedBlock::seal_parts(header, block.into_block().body);
     let block_hash = SealedBlock::hash(&sealed_block);
+    if let (Some(state), Some(prepared)) = (&qmdb, qmdb_prepared) {
+        // Now the hash is known, the tree can be filed. Validation of this same
+        // block, moments from now, finds it there and agrees by construction.
+        state
+            .insert(block_hash, block_number, prepared)
+            .map_err(PayloadBuilderError::other)?;
+    }
     let _ = cons.set_cached_reads(block_hash, cached_reads.clone());
 
     let recovered = Arc::new(reth_primitives_traits::RecoveredBlock::new_sealed(
@@ -568,12 +617,15 @@ where
 pub struct N42PayloadServiceBuilder<CB> {
     /// The consensus builder to create consensus instances.
     consensus_builder: CB,
+    /// The QMDB state built blocks commit to, on a chain that declares it.
+    qmdb: Option<QmdbNodeState>,
 }
 
 impl<CB: Default> Default for N42PayloadServiceBuilder<CB> {
     fn default() -> Self {
         Self {
             consensus_builder: CB::default(),
+            qmdb: None,
         }
     }
 }
@@ -581,7 +633,16 @@ impl<CB: Default> Default for N42PayloadServiceBuilder<CB> {
 impl<CB> N42PayloadServiceBuilder<CB> {
     /// Create a new [`N42PayloadServiceBuilder`] with a consensus builder.
     pub const fn new(consensus_builder: CB) -> Self {
-        Self { consensus_builder }
+        Self {
+            consensus_builder,
+            qmdb: None,
+        }
+    }
+
+    /// Commits built blocks to `qmdb`. See [`N42PayloadBuilder::with_qmdb`].
+    pub fn with_qmdb(mut self, qmdb: Option<QmdbNodeState>) -> Self {
+        self.qmdb = qmdb;
+        self
     }
 }
 
@@ -620,7 +681,8 @@ where
             EthEvmConfig::new(ctx.chain_spec()),
             EthereumBuilderConfig::new().with_gas_limit(gas_limit),
             consensus,
-        );
+        )
+        .with_qmdb(self.qmdb.clone());
 
         let builder_conf = ctx.config().builder.clone();
 

@@ -10,6 +10,7 @@ license.workspace = true
 n42-engine-primitives.workspace = true
 n42-clique.workspace = true
 n42-consensus-traits.workspace = true
+n42-qmdb-reth.workspace = true
 #reth
 reth-evm.workspace = true
 reth-evm-ethereum.workspace = true

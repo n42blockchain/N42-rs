@@ -14,6 +14,8 @@ n42-clique-utils.workspace = true
 n42-clique.workspace = true
 n42-primitives.workspace = true
 n42-engine-types.workspace = true
+n42-qmdb-reth.workspace = true
+n42-qmdb-state.workspace = true
 n42-engine-primitives.workspace = true
 
 # reth

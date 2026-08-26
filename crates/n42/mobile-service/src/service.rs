@@ -27,10 +27,10 @@
 //! block's attestation by sending one bad receipt.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use alloy_primitives::{Address, B256};
-use n42_qmdb_state::QmdbState;
+use n42_qmdb_state::StateProofProvider;
 use n42_h2_consensus::wire_bridge::{self, BridgeError};
 use n42_h2_primitives::consensus::{
     ConsensusMessage, Decide, H2V4ChainIdentity, QuorumCertificate,
@@ -110,7 +110,6 @@ pub enum RecordError {
 }
 
 /// The node side of mobile verification.
-#[derive(Debug)]
 pub struct MobileService {
     identity: H2V4ChainIdentity,
     registry: VerifierRegistry,
@@ -124,7 +123,7 @@ pub struct MobileService {
     max_blocks: usize,
     /// The QMDB tree this node's state root comes from, when it keeps one.
     /// Shared with whatever applies blocks to it.
-    state: Option<Arc<Mutex<QmdbState>>>,
+    state: Option<Arc<dyn StateProofProvider>>,
 }
 
 /// A membership proof and the root it is checked against.
@@ -145,6 +144,16 @@ pub struct StateProofReport {
     /// The proof in gov5's v2 layout.
     #[serde(with = "hex_bytes")]
     pub proof: Vec<u8>,
+}
+
+impl std::fmt::Debug for MobileService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MobileService")
+            .field("identity", &self.identity)
+            .field("tracked_blocks", &self.builders.len())
+            .field("serves_state_proofs", &self.state.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl MobileService {
@@ -168,7 +177,7 @@ impl MobileService {
     /// The same tree the node's block headers take their state root from —
     /// anything else and a phone would be verifying a proof against a root
     /// nothing else agrees with.
-    pub fn with_state(mut self, state: Arc<Mutex<QmdbState>>) -> Self {
+    pub fn with_state(mut self, state: Arc<dyn StateProofProvider>) -> Self {
         self.state = Some(state);
         self
     }
@@ -302,15 +311,12 @@ impl MobileService {
     /// as "the account does not exist".
     pub fn prove(&self, address: Address, slot: Option<B256>) -> Option<StateProofReport> {
         let state = self.state.as_ref()?;
-        let state = state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let proof = match slot {
             Some(slot) => state.prove_storage(address, slot),
             None => state.prove_account(address),
         }?;
         Some(StateProofReport {
-            root: state.root(),
+            root: state.state_root(),
             key: B256::from(proof.key),
             value: proof.value.clone(),
             proof: proof.encode().ok()?,

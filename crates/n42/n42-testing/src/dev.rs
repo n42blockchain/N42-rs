@@ -18,7 +18,7 @@ use zerocopy::AsBytes;
 use crate::{snapshot_test_utils::TesterAccountPool, utils::n42_payload_attributes};
 
 use alloy_genesis::CliqueConfig;
-use alloy_primitives::{Address, Bytes, B256};
+use alloy_primitives::{Address, Bytes, B256, U256};
 use futures::StreamExt;
 use n42_engine_types::N42Node;
 use reth::{
@@ -1327,4 +1327,165 @@ async fn test_recent_signatures_should_not_reset_on_checkpoint_blocks_imported()
         ..Default::default()
     };
     test.run().await
+}
+
+
+/// On a QMDB chain every header this node produces carries the forest root, its
+/// own engine validates each block against the same forest, and a restart picks
+/// the forest up where the chain is.
+///
+/// This goes through the real paths: the payload builder computes the root, the
+/// block is handed back over the Engine API, and reth's engine tree validates it
+/// with the QMDB strategy installed. A mismatch anywhere and the engine rejects
+/// the block, so the chain not advancing is the failure signal.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_qmdb_chain__headers_carry_the_forest_root_and_validate() -> eyre::Result<()> {
+    use n42_qmdb_reth::{with_declared_state_scheme, QmdbNodeState};
+
+    reth_tracing::init_test_tracing();
+    let runtime = Runtime::test();
+    let mut accounts = TesterAccountPool::new();
+    let base = CliqueTest {
+        signers: vec!["A".to_string()],
+        ..Default::default()
+    };
+    let mut chainspec = base.gen_chainspec(&mut accounts);
+    let mpt_genesis_root = chainspec.genesis_header.state_root;
+
+    // A funded sender, so one block can carry a transaction and actually move
+    // the root. Empty blocks leave a QMDB root where it was, which would let a
+    // builder that never appended anything pass every assertion below.
+    let sender = PrivateKeySigner::from_bytes(&B256::repeat_byte(0x42))?;
+    chainspec.genesis.alloc.insert(
+        sender.address(),
+        alloy_genesis::GenesisAccount {
+            balance: U256::from(10u128.pow(18)),
+            ..Default::default()
+        },
+    );
+
+    // Declare the scheme the way gov5 does, in the genesis config.
+    chainspec
+        .genesis
+        .config
+        .extra_fields
+        .insert_value("stateScheme".to_string(), "qmdb")?;
+    let chainspec = with_declared_state_scheme(chainspec)?;
+    assert_ne!(
+        chainspec.genesis_header.state_root, mpt_genesis_root,
+        "a QMDB genesis has a different root than the same alloc on MPT",
+    );
+    let chainspec = Arc::new(chainspec);
+
+    let dir = std::env::temp_dir().join(format!("n42-qmdb-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let qmdb = QmdbNodeState::new(chainspec.clone(), &dir);
+
+    let node_config = NodeConfig::new(chainspec.clone())
+        .with_network(NetworkArgs {
+            discovery: DiscoveryArgs {
+                disable_discovery: true,
+                ..DiscoveryArgs::default()
+            },
+            ..NetworkArgs::default()
+        })
+        .with_unused_ports()
+        .with_rpc(RpcServerArgs::default().with_unused_ports().with_http())
+        .with_dev(DevArgs {
+            dev: false,
+            consensus_signer_private_key: Some(B256::random().to_string()),
+            ..Default::default()
+        });
+
+    let capturing_consensus = CapturingConsensusBuilder::default();
+    let types = N42Node::with_qmdb(Some(qmdb.clone()));
+    let NodeHandle { node, .. } = NodeBuilder::new(node_config)
+        .testing_node(runtime.clone())
+        .with_types::<N42Node>()
+        .with_components(
+            types
+                .components_builder()
+                .consensus(capturing_consensus.clone())
+                .payload(
+                    n42_engine_types::N42PayloadServiceBuilder::new(capturing_consensus.clone())
+                        .with_qmdb(Some(qmdb.clone())),
+                ),
+        )
+        .with_add_ons(types.add_ons())
+        .launch()
+        .await?;
+
+    let genesis_hash = node.provider.block_hash(0)?.expect("genesis is stored");
+    assert_eq!(genesis_hash, chainspec.genesis_hash(), "the database holds the QMDB genesis");
+    qmdb.initialize((0, genesis_hash))?;
+    assert_eq!(qmdb.root_of(&genesis_hash), Some(chainspec.genesis_header.state_root));
+
+    let key = hex::encode(accounts.secret_key("A").secret_bytes());
+    let mut previous_root = chainspec.genesis_header.state_root;
+    for expected in 1..=3u64 {
+        // Block 2 carries a transfer; the others are empty.
+        if expected == 2 {
+            let tx = alloy_consensus::TxEip1559 {
+                chain_id: chainspec.chain().id(),
+                nonce: 0,
+                gas_limit: 21_000,
+                max_fee_per_gas: 10_000_000_000,
+                max_priority_fee_per_gas: 1_000_000_000,
+                to: alloy_primitives::TxKind::Call(Address::with_last_byte(0x77)),
+                value: U256::from(1_000u64),
+                ..Default::default()
+            };
+            let signature = alloy_signer::SignerSync::sign_hash_sync(
+                &sender,
+                &alloy_consensus::SignableTransaction::signature_hash(&tx),
+            )?;
+            let signed = reth_ethereum_primitives::TransactionSigned::new_unhashed(
+                tx.into(),
+                signature,
+            );
+            let encoded_len = alloy_eips::eip2718::Encodable2718::encode_2718_len(&signed);
+            let recovered =
+                reth_primitives_traits::Recovered::new_unchecked(signed, sender.address());
+            let pooled = reth_transaction_pool::EthPooledTransaction::new(recovered, encoded_len);
+            reth_transaction_pool::TransactionPool::add_transaction(
+                &node.pool,
+                reth_transaction_pool::TransactionOrigin::Local,
+                pooled,
+            )
+            .await?;
+        }
+
+        new_block(&node, key.clone(), None, &capturing_consensus).await?;
+        let header = node.provider.latest_header()?.expect("a head");
+        assert_eq!(
+            header.number, expected,
+            "block {expected} was not accepted by the engine — its QMDB root did not validate",
+        );
+        let root = qmdb
+            .root_of(&header.hash())
+            .expect("validating the block filed its tree");
+        assert_eq!(header.state_root, root, "the header carries the forest root");
+        assert_ne!(header.state_root, B256::ZERO);
+        if expected == 2 {
+            assert!(header.gas_used > 0, "block 2 must have included the transfer");
+            assert_ne!(
+                header.state_root, previous_root,
+                "a block that writes state must move the QMDB root",
+            );
+        } else {
+            assert_eq!(header.state_root, previous_root, "an empty block leaves the root alone");
+        }
+        previous_root = header.state_root;
+        qmdb.on_canonical(header.hash())?;
+    }
+
+    // A restart at the same head restores the forest and continues the same
+    // append history, which is what a QMDB chain cannot rebuild from state.
+    let head = node.provider.latest_header()?.expect("a head");
+    let restarted = QmdbNodeState::new(chainspec.clone(), &dir);
+    restarted.initialize((head.number, head.hash()))?;
+    assert_eq!(restarted.root_of(&head.hash()), Some(head.state_root));
+
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
 }

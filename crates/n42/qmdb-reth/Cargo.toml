@@ -1,0 +1,44 @@
+[package]
+name = "n42-qmdb-reth"
+version.workspace = true
+edition.workspace = true
+# Ported from ../N42-26 (rustc 1.97); see the note in the sibling h2 crates.
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Installs the QMDB state commitment into reth's block production and validation"
+
+[dependencies]
+n42-qmdb-state.workspace = true
+n42-twig-core.workspace = true
+alloy-consensus.workspace = true
+alloy-genesis.workspace = true
+alloy-primitives = { workspace = true, features = ["serde"] }
+alloy-rpc-types-engine.workspace = true
+reth-chainspec.workspace = true
+reth-cli.workspace = true
+reth-engine-primitives.workspace = true
+reth-engine-tree.workspace = true
+reth-ethereum-cli.workspace = true
+reth-ethereum-primitives.workspace = true
+reth-execution-types.workspace = true
+reth-node-api.workspace = true
+reth-node-builder.workspace = true
+reth-primitives-traits.workspace = true
+reth-provider.workspace = true
+reth-storage-overlay.workspace = true
+reth-trie.workspace = true
+revm-database.workspace = true
+bincode.workspace = true
+eyre.workspace = true
+serde = { workspace = true, features = ["derive", "std"] }
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+revm-state.workspace = true
+serde_json = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

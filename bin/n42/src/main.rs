@@ -16,13 +16,14 @@ use n42_engine_primitives::N42PayloadAttributesBuilder;
 use n42_engine_types::N42Node;
 use n42_primitives::BLSPubkey;
 use pubsub_mem::{publish, router_loop, Event, RouterMsg};
-use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
+use n42_qmdb_reth::{state_scheme, N42ChainSpecParser, QmdbNodeState, StateScheme};
+use reth_provider::{BlockHashReader, BlockNumReader, CanonStateSubscriptions};
 use reth_node_builder::{FullNodeComponents, NodeHandle};
 use reth_node_core::primitives::AlloyBlockHeader;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 const DEFAULT_BLOCK_TIME_SECS: u64 = 8;
 
@@ -59,7 +60,7 @@ fn main() {
     let consensus_holder_clone = consensus_holder.clone();
 
     if let Err(err) =
-        Cli::<EthereumChainSpecParser>::parse().run(async move |builder, _extra_args| {
+        Cli::<N42ChainSpecParser>::parse().run(async move |builder, _extra_args| {
             info!(target: "reth::cli", "Launching node");
 
             // Start the pubsub router loop (must be inside async context)
@@ -93,11 +94,26 @@ fn main() {
                 debug!(target: "reth::cli", "Broadcast-to-pubsub bridge ended");
             });
 
+            // Which state commitment this chain uses is declared in its genesis,
+            // the same way gov5 reads it. A QMDB chain gets one forest, shared by
+            // the payload builder and the engine validator, and persisted under
+            // the datadir so a restart continues the same append history.
+            let chain = builder.config().chain.clone();
+            let qmdb = match state_scheme(&chain.genesis) {
+                StateScheme::Qmdb => {
+                    let dir = builder.config().datadir().data_dir().join("qmdb");
+                    info!(target: "reth::cli", dir = %dir.display(), "chain declares the QMDB state commitment");
+                    Some(QmdbNodeState::new(chain, dir))
+                }
+                StateScheme::Mpt => None,
+            };
+            let qmdb_for_startup = qmdb.clone();
+
             let NodeHandle {
                 node,
                 node_exit_future,
             } = builder
-                .node(N42Node::default())
+                .node(N42Node::with_qmdb(qmdb))
                 .extend_rpc_modules(move |ctx| {
                     let consensus = ctx.node().consensus().clone();
                     let provider = ctx.provider().clone();
@@ -136,6 +152,41 @@ fn main() {
                 .expect("consensus should be set");
 
             let node_config_dev = node.config.clone().dev();
+            // The forest can only be restored once the database is open and the
+            // head is known, which is now; and it has to be ready before anything
+            // produces or validates a block, which is what follows.
+            if let Some(qmdb) = &qmdb_for_startup {
+                let info = node.provider.chain_info()?;
+                let head_hash = node
+                    .provider
+                    .block_hash(info.best_number)?
+                    .ok_or_else(|| eyre::eyre!("no hash for head block {}", info.best_number))?;
+                qmdb.initialize((info.best_number, head_hash))?;
+                info!(target: "reth::cli", block = info.best_number, %head_hash, "QMDB state ready");
+
+                // Follow the canonical chain so the persisted head keeps up with
+                // the database's. Lagging is tolerable — only the tip matters,
+                // and every tree in between was filed at validation.
+                let mut canonical = node.provider.subscribe_to_canonical_state();
+                let follower = qmdb.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match canonical.recv().await {
+                            Ok(notification) => {
+                                let tip = notification.tip().hash();
+                                if let Err(error) = follower.on_canonical(tip) {
+                                    error!(target: "reth::cli", %error, "QMDB head could not follow the canonical chain");
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                warn!(target: "reth::cli", skipped, "QMDB head follower fell behind canonical notifications");
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                });
+            }
+
             let consensus_signer_private_key = node_config_dev.dev.consensus_signer_private_key;
             let signer_address = if let Some(signer_private_key) = &consensus_signer_private_key {
                 let eth_signer: PrivateKeySigner = signer_private_key.to_string().parse().unwrap();

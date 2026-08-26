@@ -197,8 +197,42 @@ Two constraints on the setup, both worth knowing before repeating it:
   answers "unknown payload". Pair it with a long `--dev.block-time` so the APoS
   miner does not also produce blocks.
 
-Not yet measured: a leader proposes every *other* view here, because a view that
-has just committed does not get a proposal. Costs throughput, not correctness.
+### Why a leader was proposing every other view
+
+The first live run produced a block roughly every 3.4s against a 3s view
+timeout: every commit was followed by a wasted round. Three separate causes,
+none visible without a live execution layer:
+
+1. **The proposal attempt came after the wait.** HotStuff-2 is responsive — a
+   leader that has formed a QC proposes for the next view immediately. Attempting
+   it after the `select!` makes it wait for an unrelated event first, and a
+   leader that has just committed has none coming, so it waits out the view.
+   The attempt now happens at the top of each step, after draining (draining
+   first is what makes the view current).
+2. **One proposal per step.** A commit lands in the drain *after* the proposal
+   that caused it, so one step can span several views. The loop now keeps
+   proposing while the view advances, up to a bound, and when the bound stops a
+   leader that is still making progress it polls the transport without blocking
+   rather than going to sleep.
+3. **Engine API timestamps are whole seconds.** HotStuff-2 commits in tens of
+   milliseconds, so a leader that proposes every view either repeats a second —
+   the execution layer accepts the forkchoiceUpdated, never finishes the build,
+   and `getPayload` blocks until the view times out, with nothing in the logs
+   but a slow call — or forces the timestamp forward and runs the chain's clock
+   into the future until the execution layer rejects the blocks outright
+   ("block timestamp N is in the future compared to our clock time M"). Both
+   were observed. `with_payload_attributes` now takes a closure returning
+   `Option`, so a leader can decline a view and be asked again.
+
+Measured after: 21 blocks in 20s with no rejected builds, against 5 in 12s
+before — about one block per second, which is what a whole-second timestamp
+allows. The views a leader declines do time out, and that is the mechanism
+working as intended rather than waste.
+
+Also worth knowing: this node holds no consensus state across restarts, so a
+restarted validator proposes from genesis and the execution layer answers
+`-38006 Too deep reorg`. N42-26 keeps that in `persistence.rs`; nothing here
+does.
 
 ## Live cross-client attach: how far it got
 

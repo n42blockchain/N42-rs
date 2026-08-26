@@ -34,6 +34,7 @@
 //! and never broadcasts a timeout, while looking connected and healthy.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy_primitives::{Address, B256};
@@ -215,12 +216,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// `prev_randao` is zero and the beacon root is zero because HotStuff-2 has no
 /// beacon chain supplying them; what matters is that every member computes the
 /// same values for the same block, and a constant satisfies that.
-fn block_attributes(fee_recipient: Address) -> PayloadAttributes {
-    let timestamp = SystemTime::now()
+///
+/// Returns `None` when it is too soon to propose again. An Engine API timestamp
+/// is a whole second and each block's must exceed its parent's, while HotStuff-2
+/// commits in tens of milliseconds — so a leader that proposes every view either
+/// repeats a second (the execution layer never finishes the build and
+/// `getPayload` blocks until the view times out) or runs the chain's clock into
+/// the future (the execution layer rejects the block outright). Both were
+/// observed on a live node. Declining in between paces the chain at roughly one
+/// block per second, which is what the timestamp resolution allows.
+fn block_attributes(fee_recipient: Address) -> Option<PayloadAttributes> {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or_default();
-    PayloadAttributes {
+    // Claim this second, or decline if it is already taken.
+    let timestamp = LAST
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+            (now > last).then_some(now)
+        })
+        .ok()
+        .map(|_| now)?;
+    Some(PayloadAttributes {
         timestamp,
         prev_randao: B256::ZERO,
         suggested_fee_recipient: fee_recipient,
@@ -228,7 +246,7 @@ fn block_attributes(fee_recipient: Address) -> PayloadAttributes {
         parent_beacon_block_root: Some(B256::ZERO),
         target_gas_limit: None,
         slot_number: None,
-    }
+    })
 }
 
 const USAGE: &str = "\

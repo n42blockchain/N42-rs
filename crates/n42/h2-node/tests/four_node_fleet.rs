@@ -43,8 +43,8 @@ const fn identity() -> H2V4ChainIdentity {
     }
 }
 
-const fn attributes(view: u64, _head: B256) -> PayloadAttributes {
-    PayloadAttributes {
+const fn attributes(view: u64, _head: B256) -> Option<PayloadAttributes> {
+    Some(PayloadAttributes {
         // Deterministic rather than wall-clock: a test that depends on the
         // clock fails on a loaded machine for reasons unrelated to consensus.
         timestamp: 1_700_000_000 + view,
@@ -54,7 +54,7 @@ const fn attributes(view: u64, _head: B256) -> PayloadAttributes {
         parent_beacon_block_root: Some(B256::ZERO),
         target_gas_limit: None,
         slot_number: None,
-    }
+    })
 }
 
 struct Node {

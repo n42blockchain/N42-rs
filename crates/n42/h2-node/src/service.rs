@@ -17,12 +17,18 @@
 //! engine's outputs to empty before returning to the select, rather than
 //! treating the channel as one more thing to poll.
 //!
-//! **A leader has to be asked to build.** The engine proposes only when it is
-//! handed a `BlockReady`, which comes from the execution layer, which needs
-//! payload attributes this layer has no business inventing. So block production
-//! is opt-in: supply [`H2Service::with_payload_attributes`] and this node
-//! proposes when it is leader; leave it out and it votes but never proposes,
-//! which is what a non-producing fleet member should do.
+//! **A leader has to be asked to build, before it waits.** The engine proposes
+//! only when handed a `BlockReady`, which comes from the execution layer, which
+//! needs payload attributes this layer has no business inventing. So block
+//! production is opt-in: supply [`H2Service::with_payload_attributes`] and this
+//! node proposes when it is leader; leave it out and it votes but never
+//! proposes, which is what a member joining an existing fleet should do.
+//!
+//! The attempt happens at the top of each step, before blocking on anything.
+//! HotStuff-2 is responsive — a leader that has just formed a QC proposes for
+//! the next view straight away — and a leader that has just committed has no
+//! other event coming, so an attempt made after the wait waits for a timeout it
+//! should never have needed.
 //!
 //! **Startup is not a timeout.** A node that comes up before its mesh does
 //! would otherwise spend its first views broadcasting timeouts to nobody and
@@ -45,6 +51,18 @@ use n42_h2_net::{H2V4Transport, TransportEvent};
 use n42_h2_primitives::consensus::H2V4ChainIdentity;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+
+/// Decides what a leader proposes for a view, given the view number and the
+/// current head. `None` declines the view — see
+/// [`H2Service::with_payload_attributes`].
+type PayloadAttributesBuilder = dyn Fn(u64, B256) -> Option<PayloadAttributes> + Send + Sync;
+
+/// How many views one step may propose for before going back to the network.
+///
+/// Bounded rather than "until the view stops moving": a fleet that commits
+/// faster than the transport is polled would otherwise starve its own gossip,
+/// and a node that stops reading the network stops being a fleet member.
+const MAX_PROPOSALS_PER_STEP: usize = 4;
 
 /// How far the view deadline is pushed out on each step taken before the mesh
 /// exists. Small enough that a mesh forming mid-step costs almost nothing,
@@ -121,7 +139,7 @@ pub struct H2Service<E> {
     outbox: Vec<n42_h2_primitives::consensus::ConsensusMessage>,
     /// Builds the payload attributes for a block this node proposes. `None`
     /// means this node never proposes — see the module docs.
-    payload_attributes: Option<Box<dyn Fn(u64, B256) -> PayloadAttributes + Send + Sync>>,
+    payload_attributes: Option<Box<PayloadAttributesBuilder>>,
     /// The view this node last built a block for, so a leader does not rebuild
     /// on every event it handles while still in the same view.
     proposed_view: Option<u64>,
@@ -176,9 +194,24 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// proposals but never makes one — a valid way to run, and the safe default,
     /// since a node that proposes garbage is worse than one that proposes
     /// nothing.
+    ///
+    /// Returning `None` declines to propose for this view, and the node asks
+    /// again on the next step. That is the answer to the constraint below: an
+    /// Engine API timestamp is a whole second, and HotStuff-2 commits in tens of
+    /// milliseconds, so a leader that always proposes runs the chain's clock
+    /// into the future until the execution layer refuses the blocks.
+    ///
+    /// **The timestamp must be strictly greater than the parent block's, and
+    /// must not be ahead of wall clock.** Returning `now()` unconditionally
+    /// gives two consecutive blocks the same second: the execution layer accepts
+    /// the forkchoiceUpdated, never finishes the build, and `getPayload` blocks
+    /// until the view times out, with nothing in the logs but a slow call.
+    /// Forcing the timestamp forward instead runs it past the local clock, and
+    /// the execution layer rejects the block outright. Between those two, a
+    /// leader proposes about once a second and declines in between.
     pub fn with_payload_attributes(
         mut self,
-        attributes: impl Fn(u64, B256) -> PayloadAttributes + Send + Sync + 'static,
+        attributes: impl Fn(u64, B256) -> Option<PayloadAttributes> + Send + Sync + 'static,
     ) -> Self {
         self.payload_attributes = Some(Box::new(attributes));
         self
@@ -218,6 +251,56 @@ impl<E: ExecutionLayer> H2Service<E> {
         let mut events = Vec::new();
         self.hold_view_clock_until_meshed();
 
+        // Drain, then propose, then drain again — before waiting, not after.
+        //
+        // HotStuff-2 is responsive: a leader that has just formed a QC proposes
+        // for the next view immediately. Deferring the attempt until after the
+        // select makes it wait for some unrelated event first, and a leader that
+        // has just committed has none coming, so it sits until the view times
+        // out and the round is lost.
+        //
+        // The leading drain is what makes the view current: the commit that
+        // ended the last round may still be sitting in the output channel, and
+        // proposing before reading it proposes for the view just finished, which
+        // the guard then skips.
+        let mut still_advancing = false;
+        for remaining in (0..MAX_PROPOSALS_PER_STEP).rev() {
+            self.drain_outputs(&mut events).await?;
+            let before = self.engine.current_view();
+            self.propose_if_leader().await;
+            self.drain_outputs(&mut events).await?;
+            // A commit lands in the drain *after* the proposal that caused it,
+            // so one step can span several views. Stopping at one proposal per
+            // step means the next view's proposal waits for the select to
+            // return, and a leader that just committed has nothing else coming —
+            // so it waits for a timeout it never needed.
+            if self.engine.current_view() == before {
+                break;
+            }
+            still_advancing = remaining == 0;
+        }
+
+        if still_advancing {
+            // The bound stopped a leader that was still making progress.
+            // Blocking now would trade the rest of its views for a timeout, so
+            // look at the network without waiting and come straight back —
+            // skipping the look entirely would starve the transport of a node
+            // that always has something to propose.
+            tokio::select! {
+                biased;
+                event = self.transport.next_event() => {
+                    let Some(event) = event else {
+                        return Err(ServiceError::TransportEnded);
+                    };
+                    self.handle_transport_event(event)?;
+                }
+                () = std::future::ready(()) => {}
+            }
+            self.drain_outputs(&mut events).await?;
+            self.flush_outbox(&mut events);
+            return Ok(events);
+        }
+
         // Arm from the pacemaker every iteration rather than holding one sleep
         // across views: a commit resets the deadline, and a sleep armed for the
         // old view would fire late or not at all.
@@ -244,10 +327,6 @@ impl<E: ExecutionLayer> H2Service<E> {
             }
         }
 
-        self.drain_outputs(&mut events).await?;
-        self.propose_if_leader().await;
-        // Proposing emits, so drain again rather than leaving a proposal to sit
-        // in the channel until the next event arrives.
         self.drain_outputs(&mut events).await?;
         self.flush_outbox(&mut events);
         Ok(events)
@@ -426,9 +505,13 @@ impl<E: ExecutionLayer> H2Service<E> {
         // Marked before the build, not after: a build that fails should not be
         // retried on every subsequent event in the same view, which would pin
         // the loop against a broken execution layer.
+        let Some(attrs) = build_attributes(view, self.driver.head()) else {
+            // Declined for now — not marked as proposed, so the next step asks
+            // again. This is how a leader paces itself against a clock coarser
+            // than its commit latency.
+            return;
+        };
         self.proposed_view = Some(view);
-
-        let attrs = build_attributes(view, self.driver.head());
         match self.driver.build_block(attrs).await {
             Ok(built) => {
                 debug!(target: "n42.h2.node", view, block = ?built.hash, txs = built.tx_count, "built a block to propose");

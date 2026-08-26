@@ -239,10 +239,7 @@ impl QmdbNodeState {
 
     /// Files a producer's computed tree under the block it turned out to be.
     pub fn insert(&self, block_hash: B256, number: u64, prepared: PreparedBlock) -> Result<(), NodeStateError> {
-        self.with_forest(|forest| {
-            forest.insert(block_hash, number, prepared);
-            Ok(())
-        })
+        self.with_forest(|forest| forest.insert(block_hash, number, prepared))
     }
 
     /// Computes a validated block's root and files its tree if the header agrees.
@@ -266,7 +263,7 @@ impl QmdbNodeState {
             let prepared = forest.compute(parent, changes)?;
             let root = prepared.root;
             if root == header_root {
-                forest.insert(block_hash, number, prepared);
+                forest.insert(block_hash, number, prepared)?;
             } else {
                 warn!(
                     target: "n42.qmdb",
@@ -296,7 +293,7 @@ impl QmdbNodeState {
     pub fn on_canonical(&self, block_hash: B256) -> Result<(), NodeStateError> {
         let snapshot = self.with_forest(|forest| {
             forest.set_canonical(block_hash)?;
-            Ok(forest.snapshot())
+            forest.snapshot()
         })?;
         write_snapshot(&self.snapshot_path(), &snapshot)?;
         debug!(target: "n42.qmdb", block = snapshot.head_number, %block_hash, "persisted the QMDB head");
@@ -310,11 +307,11 @@ impl StateProofProvider for QmdbNodeState {
     }
 
     fn prove_account(&self, address: Address) -> Option<QmdbProof> {
-        self.lock().as_ref()?.prove_account(address)
+        self.lock().as_mut()?.prove_account(address)
     }
 
     fn prove_storage(&self, address: Address, slot: B256) -> Option<QmdbProof> {
-        self.lock().as_ref()?.prove_storage(address, slot)
+        self.lock().as_mut()?.prove_storage(address, slot)
     }
 }
 

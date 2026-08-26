@@ -7910,6 +7910,7 @@ dependencies = [
 name = "n42-h2-execution"
 version = "2.1.5"
 dependencies = [
+ "alloy-consensus 2.4.1",
  "alloy-primitives 1.6.1",
  "alloy-rpc-types-engine 2.4.1",
  "async-trait",
@@ -7924,7 +7925,11 @@ dependencies = [
 name = "n42-h2-net"
 version = "2.1.5"
 dependencies = [
+ "alloy-consensus 2.4.1",
+ "alloy-eips 2.4.1",
  "alloy-primitives 1.6.1",
+ "alloy-rlp",
+ "alloy-rpc-types-engine 2.4.1",
  "async-trait",
  "futures",
  "hex",
@@ -7957,6 +7962,8 @@ dependencies = [
  "n42-h2-primitives",
  "n42-h2-wire",
  "n42-mobile-service",
+ "n42-qmdb-reth",
+ "reth-cli",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -8080,6 +8087,8 @@ dependencies = [
  "alloy-rpc-types-engine 2.4.1",
  "bincode",
  "eyre",
+ "n42-h2-consensus",
+ "n42-h2-primitives",
  "n42-qmdb-state",
  "n42-twig-core",
  "reth-chainspec",
@@ -8107,6 +8116,7 @@ dependencies = [
 name = "n42-qmdb-state"
 version = "2.1.5"
 dependencies = [
+ "alloy-genesis",
  "alloy-primitives 1.6.1",
  "hex",
  "n42-twig-core",
@@ -10244,6 +10254,7 @@ dependencies = [
  "alloy-trie",
  "auto_impl",
  "derive_more 2.1.1",
+ "n42-qmdb-state",
  "reth-ethereum-forks",
  "reth-network-peers",
  "reth-primitives-traits",

@@ -827,6 +827,64 @@ fn hash_bits(bits: &[u8; BITS_BYTES]) -> Hash {
     *hasher.finalize().as_bytes()
 }
 
+/// One slot deactivated during a block: it was live with `(key, value)`
+/// immediately before the block. A slot dies at most once — slots are never
+/// reused — so entries never conflict across blocks.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UndoEntry {
+    /// The slot that was deactivated.
+    pub slot: u64,
+    /// The key it held.
+    pub key: Hash,
+    /// The value it held.
+    pub value: Vec<u8>,
+}
+
+/// One block's undo record: what it takes to roll the tree back across it.
+///
+/// This is gov5's `BlockUndo`. The append-only structure makes the revert
+/// exact: slots the block appended occupy `[prev_next_slot, next_slot)` and are
+/// truncated; slots it deactivated are `entries` and are revived. A QMDB root
+/// is a function of the append history, so re-executing a competing block on
+/// an un-reverted tree appends at shifted slots and forks the root permanently
+/// against a node that only ever applied the winner. Reverting first restores
+/// the exact pre-block tree, and re-applying the sibling then lands on the same
+/// slots on every node.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BlockUndo {
+    /// The append cursor before the block's operations.
+    pub prev_next_slot: u64,
+    /// The slots the block deactivated, with what they held.
+    pub entries: Vec<UndoEntry>,
+    /// `appended_keys[i]` is the key appended at slot `prev_next_slot + i`.
+    /// Not needed to revert an in-memory tree, whose entries are always
+    /// readable; carried so the record is self-describing, as gov5's is.
+    pub appended_keys: Vec<Hash>,
+}
+
+/// Why an undo record could not be applied.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum QmdbUndoError {
+    /// The record was taken from a tree further along than this one.
+    #[error("undo record is ahead of this tree (prev={prev}, next={next})")]
+    Ahead {
+        /// The record's cursor.
+        prev: u64,
+        /// The tree's cursor.
+        next: u64,
+    },
+    /// A block is being recorded; reverting under it would corrupt the record.
+    #[error("cannot apply an undo record while undo recording is active")]
+    RecordingActive,
+    /// A revived slot's entry disagrees with the record — the record does not
+    /// belong to this tree's history.
+    #[error("undo entry for slot {slot} does not match the tree's entry")]
+    EntryMismatch {
+        /// The slot in question.
+        slot: u64,
+    },
+}
+
 /// A correctness-first QMDB tree for cross-client bootstrap and vectors.
 ///
 /// It deliberately rebuilds the small upper tree on root reads. gov5's
@@ -838,6 +896,9 @@ pub struct QmdbCompatTree {
     index: HashMap<Hash, u64>,
     twigs: Vec<Twig>,
     next_slot: u64,
+    /// The record being captured, between `start_undo_recording` and
+    /// `stop_undo_recording`.
+    recording: Option<BlockUndo>,
 }
 
 impl std::fmt::Debug for QmdbCompatTree {
@@ -866,6 +927,7 @@ impl QmdbCompatTree {
             index: HashMap::new(),
             twigs: Vec::new(),
             next_slot: 0,
+            recording: None,
         }
     }
 
@@ -929,7 +991,11 @@ impl QmdbCompatTree {
     /// Append a new frozen leaf, deactivating an earlier live slot for `key`.
     pub fn set(&mut self, key: Hash, value: Vec<u8>) {
         if let Some(old_slot) = self.index.get(&key).copied() {
+            self.record_deactivation(old_slot);
             self.deactivate(old_slot);
+        }
+        if let Some(record) = self.recording.as_mut() {
+            record.appended_keys.push(key);
         }
         let slot = self.next_slot;
         self.next_slot += 1;
@@ -951,8 +1017,132 @@ impl QmdbCompatTree {
         let Some(slot) = self.index.remove(key) else {
             return false;
         };
+        self.record_deactivation(slot);
         self.deactivate(slot);
         true
+    }
+
+    /// Begins capturing an undo record for the operations that follow — one
+    /// block's worth. A record already being captured is discarded.
+    pub fn start_undo_recording(&mut self) {
+        self.recording = Some(BlockUndo {
+            prev_next_slot: self.next_slot,
+            entries: Vec::new(),
+            appended_keys: Vec::new(),
+        });
+    }
+
+    /// Ends the capture and returns the block's record, or `None` if recording
+    /// was never started.
+    pub fn stop_undo_recording(&mut self) -> Option<BlockUndo> {
+        self.recording.take()
+    }
+
+    /// Like [`Self::apply_sorted_ops`], returning the record that undoes it.
+    pub fn apply_sorted_ops_recorded(
+        &mut self,
+        operations: impl IntoIterator<Item = QmdbOperation>,
+    ) -> Result<(Hash, BlockUndo), QmdbOperationError> {
+        self.start_undo_recording();
+        let root = match self.apply_sorted_ops(operations) {
+            Ok(root) => root,
+            Err(error) => {
+                // A refused batch mutates nothing, so there is nothing to undo.
+                self.recording = None;
+                return Err(error);
+            }
+        };
+        let undo = self.recording.take().unwrap_or_default();
+        Ok((root, undo))
+    }
+
+    /// Rolls the tree back across one block, using that block's undo record.
+    ///
+    /// Reverting deeper means applying records newest first. Afterwards the
+    /// root equals, byte for byte, the root the tree had immediately before the
+    /// block — and re-applying the same operations lands on the same slots.
+    ///
+    /// Nothing is mutated until every check has passed, so a refused record
+    /// leaves the tree exactly as it was.
+    pub fn apply_undo(&mut self, undo: &BlockUndo) -> Result<(), QmdbUndoError> {
+        if self.recording.is_some() {
+            return Err(QmdbUndoError::RecordingActive);
+        }
+        let prev = undo.prev_next_slot;
+        if prev > self.next_slot {
+            return Err(QmdbUndoError::Ahead {
+                prev,
+                next: self.next_slot,
+            });
+        }
+        // Revivals below the cursor must name what the slot actually holds:
+        // a record from another history would otherwise revive the wrong key.
+        for entry in undo.entries.iter().filter(|entry| entry.slot < prev) {
+            let held = &self.entries[entry.slot as usize];
+            if held.key != entry.key || held.value != entry.value {
+                return Err(QmdbUndoError::EntryMismatch { slot: entry.slot });
+            }
+        }
+
+        let mut touched_twigs = std::collections::BTreeSet::new();
+
+        // 1. Truncate the block's appends: drop their index mappings, clear
+        //    their bits, null their leaves.
+        for slot in prev..self.next_slot {
+            let entry = &self.entries[slot as usize];
+            if entry.active && self.index.get(&entry.key) == Some(&slot) {
+                self.index.remove(&entry.key);
+            }
+            let twig_id = (slot as usize) / TWIG_SIZE;
+            let local = (slot as usize) % TWIG_SIZE;
+            let twig = &mut self.twigs[twig_id];
+            twig.set_leaf_unchecked(local, NULL_HASH);
+            twig.bits[local / 8] &= !(1 << (local % 8));
+            touched_twigs.insert(twig_id);
+        }
+        self.entries.truncate(prev as usize);
+        self.next_slot = prev;
+
+        // 2. Drop twigs the truncation emptied entirely. The boundary twig,
+        //    if `prev` cuts through it, stays and is recomputed below.
+        let twigs_remaining = if prev == 0 {
+            0
+        } else {
+            ((prev - 1) as usize) / TWIG_SIZE + 1
+        };
+        self.twigs.truncate(twigs_remaining);
+        touched_twigs.retain(|id| *id < twigs_remaining);
+
+        // 3. Revive the slots the block deactivated. Only those below the
+        //    cursor: a slot the block both appended and killed is gone with
+        //    the truncation.
+        for entry in undo.entries.iter().filter(|entry| entry.slot < prev) {
+            let slot = entry.slot;
+            self.entries[slot as usize].active = true;
+            self.index.insert(entry.key, slot);
+            let twig_id = (slot as usize) / TWIG_SIZE;
+            let local = (slot as usize) % TWIG_SIZE;
+            self.twigs[twig_id].bits[local / 8] |= 1 << (local % 8);
+            touched_twigs.insert(twig_id);
+        }
+
+        for twig_id in touched_twigs {
+            self.twigs[twig_id].recompute();
+        }
+        Ok(())
+    }
+
+    /// Captures a slot's pre-deactivation state into the active record.
+    fn record_deactivation(&mut self, slot: u64) {
+        let Some(record) = self.recording.as_mut() else {
+            return;
+        };
+        let entry = &self.entries[slot as usize];
+        record.entries.push(UndoEntry {
+            slot,
+            key: entry.key,
+            value: entry.value.clone(),
+        });
     }
 
     /// Apply one block's mutations in the exact deterministic order used by gov5. Duplicates are
@@ -1610,5 +1800,171 @@ mod tests {
         let encoded = proof.encode().unwrap();
         assert_eq!(QmdbProof::decode(&encoded).unwrap(), proof);
         assert!(tree.prove(&indexed_key(u64::MAX)).is_none());
+    }
+}
+
+#[cfg(test)]
+mod undo_tests {
+    //! The property gov5's `ApplyUndo` exists for: after a revert the tree is
+    //! *byte-identical* to one that never saw the block — not merely equal in
+    //! state — so a competing block re-applied afterwards lands on the same
+    //! slots as it does on a node that only ever applied the winner.
+
+    use super::*;
+
+    fn key(n: u64) -> Hash {
+        let mut key = [0u8; 32];
+        key[..8].copy_from_slice(&n.to_be_bytes());
+        *blake3::hash(&key).as_bytes()
+    }
+
+    fn sets(range: std::ops::Range<u64>, tag: u8) -> Vec<QmdbOperation> {
+        range
+            .map(|n| QmdbOperation {
+                key: key(n),
+                value: Some(vec![tag, n as u8]),
+            })
+            .collect()
+    }
+
+    fn seeded(n: u64) -> QmdbCompatTree {
+        let mut tree = QmdbCompatTree::new();
+        tree.apply_sorted_ops(sets(0..n, 0xA0)).unwrap();
+        tree
+    }
+
+    #[test]
+    fn a_reverted_block_leaves_no_trace() {
+        let mut tree = seeded(10);
+        let before_root = tree.root();
+        let before_slot = tree.next_slot();
+        let before_len = tree.len();
+
+        // Overwrite three, delete two, append four.
+        let mut ops = sets(2..5, 0xB0);
+        ops.push(QmdbOperation { key: key(7), value: None });
+        ops.push(QmdbOperation { key: key(8), value: None });
+        ops.extend(sets(20..24, 0xC0));
+        let (after_root, undo) = tree.apply_sorted_ops_recorded(ops).unwrap();
+        assert_ne!(after_root, before_root);
+        assert_eq!(undo.prev_next_slot, before_slot);
+        assert_eq!(undo.entries.len(), 5, "three overwrites and two deletes deactivated a slot each");
+        assert_eq!(undo.appended_keys.len(), 7, "three overwrites and four inserts appended");
+
+        tree.apply_undo(&undo).unwrap();
+        assert_eq!(tree.root(), before_root, "root is restored byte for byte");
+        assert_eq!(tree.next_slot(), before_slot, "the append cursor is rewound");
+        assert_eq!(tree.len(), before_len);
+        assert_eq!(tree.get(&key(2)), Some(&[0xA0, 2][..]), "an overwritten key holds its old value");
+        assert_eq!(tree.get(&key(7)), Some(&[0xA0, 7][..]), "a deleted key is back");
+        assert!(tree.get(&key(20)).is_none(), "an appended key is gone");
+        // And a proof at a revived slot verifies against the restored root.
+        let proof = tree.prove(&key(7)).expect("revived key has a leaf");
+        assert!(proof.verify_for_key(&tree.root(), &key(7)));
+    }
+
+    /// The sibling-switch case from gov5's comment on `RevertBlock`.
+    #[test]
+    fn a_sibling_applied_after_a_revert_matches_a_node_that_never_saw_the_loser() {
+        let loser = || {
+            let mut ops = sets(1..3, 0xB0);
+            ops.push(QmdbOperation { key: key(5), value: None });
+            ops
+        };
+        let winner = || sets(4..6, 0xC0);
+
+        let mut honest = seeded(10);
+        let honest_root = honest.apply_sorted_ops(winner()).unwrap();
+
+        let mut reorged = seeded(10);
+        let (_, undo) = reorged.apply_sorted_ops_recorded(loser()).unwrap();
+        reorged.apply_undo(&undo).unwrap();
+        let reorged_root = reorged.apply_sorted_ops(winner()).unwrap();
+
+        assert_eq!(reorged_root, honest_root);
+        assert_eq!(reorged.snapshot(), honest.snapshot(), "not just the root: the whole layout");
+
+        // And without the revert it forks, which is the whole reason for it.
+        let mut naive = seeded(10);
+        naive.apply_sorted_ops(loser()).unwrap();
+        assert_ne!(naive.apply_sorted_ops(winner()).unwrap(), honest_root);
+    }
+
+    #[test]
+    fn reverting_deeper_applies_records_newest_first() {
+        let mut tree = seeded(10);
+        let root0 = tree.root();
+        let (root1, undo1) = tree.apply_sorted_ops_recorded(sets(0..3, 0xB1)).unwrap();
+        let (_, undo2) = tree.apply_sorted_ops_recorded(sets(1..4, 0xB2)).unwrap();
+        let (_, undo3) = tree.apply_sorted_ops_recorded(sets(2..5, 0xB3)).unwrap();
+
+        tree.apply_undo(&undo3).unwrap();
+        tree.apply_undo(&undo2).unwrap();
+        assert_eq!(tree.root(), root1);
+        tree.apply_undo(&undo1).unwrap();
+        assert_eq!(tree.root(), root0);
+    }
+
+    /// Appends that cross into a new twig must drop that twig on revert, and a
+    /// twig the cursor cuts through must be rebuilt, not merely bit-flipped.
+    #[test]
+    fn a_revert_across_a_twig_boundary_restores_the_twig_count() {
+        let mut tree = seeded((TWIG_SIZE as u64) - 5);
+        let before_root = tree.root();
+        let twigs_before = tree.twigs.len();
+        assert_eq!(twigs_before, 1);
+
+        let (_, undo) = tree.apply_sorted_ops_recorded(sets(5000..5100, 0xD0)).unwrap();
+        assert_eq!(tree.twigs.len(), 2, "the appends spilled into a second twig");
+
+        tree.apply_undo(&undo).unwrap();
+        assert_eq!(tree.twigs.len(), 1, "the spilled twig is dropped");
+        assert_eq!(tree.root(), before_root);
+    }
+
+    #[test]
+    fn a_key_appended_and_deleted_in_one_block_is_simply_gone() {
+        let mut tree = seeded(4);
+        let before_root = tree.root();
+        // apply_sorted_ops refuses duplicate keys, so do the two steps by hand.
+        tree.start_undo_recording();
+        tree.set(key(99), vec![1]);
+        assert!(tree.delete(&key(99)));
+        let undo = tree.stop_undo_recording().unwrap();
+        assert_eq!(undo.entries.len(), 1, "the delete recorded a deactivation");
+        assert!(undo.entries[0].slot >= undo.prev_next_slot, "of a slot the block itself appended");
+
+        tree.apply_undo(&undo).unwrap();
+        assert_eq!(tree.root(), before_root);
+        assert!(tree.get(&key(99)).is_none());
+    }
+
+    #[test]
+    fn a_record_from_another_history_is_refused_without_mutating() {
+        let mut tree = seeded(10);
+        let root = tree.root();
+        let mut other = seeded(10);
+        other.apply_sorted_ops(sets(0..1, 0xEE)).unwrap();
+        let (_, foreign) = other.apply_sorted_ops_recorded(sets(0..1, 0xEF)).unwrap();
+        // `foreign` revives slot 10 as key(0)/[0xEE,0]; this tree's slot 10
+        // does not exist at all — its cursor is 10.
+        assert!(matches!(tree.apply_undo(&foreign), Err(QmdbUndoError::Ahead { .. })));
+        assert_eq!(tree.root(), root);
+
+        // A record whose cursor fits but whose revival names the wrong value.
+        let (_, mut mine) = tree.apply_sorted_ops_recorded(sets(0..1, 0xB0)).unwrap();
+        let revived = mine.entries[0].slot;
+        mine.entries[0].value = vec![0xFF];
+        assert_eq!(tree.apply_undo(&mine), Err(QmdbUndoError::EntryMismatch { slot: revived }));
+    }
+
+    #[test]
+    fn a_revert_while_recording_is_refused() {
+        let mut tree = seeded(3);
+        let (_, undo) = tree.apply_sorted_ops_recorded(sets(0..1, 0xB0)).unwrap();
+        tree.start_undo_recording();
+        assert_eq!(tree.apply_undo(&undo), Err(QmdbUndoError::RecordingActive));
+        tree.stop_undo_recording();
+        tree.apply_undo(&undo).unwrap();
     }
 }

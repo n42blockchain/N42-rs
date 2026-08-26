@@ -25,15 +25,9 @@
 //! has no pre-block slots and the two agree; a chain that re-enables the old
 //! semantics would need a storage enumerator here.
 
-use std::collections::BTreeMap;
-
-use alloy_genesis::GenesisAccount;
-use alloy_primitives::{keccak256, Address, B256, U256};
+use alloy_primitives::B256;
 use n42_qmdb_state::{AccountState, BlockChanges};
 use revm_database::BundleState;
-
-/// Keccak-256 of empty code, which is what an account without code carries.
-const KECCAK_EMPTY: B256 = alloy_primitives::KECCAK256_EMPTY;
 
 /// The leaves a block writes, from the bundle its execution left behind.
 pub fn changes_from_bundle(bundle: &BundleState) -> BlockChanges {
@@ -67,39 +61,16 @@ pub fn changes_from_bundle(bundle: &BundleState) -> BlockChanges {
     changes
 }
 
-/// The leaves a genesis allocation writes.
-///
-/// gov5 reads the plain state the alloc just produced and hands it to the same
-/// root computer a block goes through, so genesis is block zero's change set
-/// and nothing more special than that.
-pub fn changes_from_alloc(alloc: &BTreeMap<Address, GenesisAccount>) -> BlockChanges {
-    let mut changes = BlockChanges::new();
-    for (address, account) in alloc {
-        let code_hash = account
-            .code
-            .as_ref()
-            .filter(|code| !code.is_empty())
-            .map_or(KECCAK_EMPTY, keccak256);
-        changes.set_account(
-            *address,
-            AccountState {
-                nonce: account.nonce.unwrap_or_default(),
-                balance: account.balance,
-                code_hash,
-            },
-        );
-        if let Some(storage) = &account.storage {
-            for (slot, value) in storage {
-                changes.set_storage(*address, *slot, U256::from_be_bytes(value.0));
-            }
-        }
-    }
-    changes
-}
+pub use n42_qmdb_state::changes_from_alloc;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_genesis::GenesisAccount;
+    use alloy_primitives::{keccak256, Address, U256};
+    use std::collections::BTreeMap;
+
+    const KECCAK_EMPTY: B256 = alloy_primitives::KECCAK256_EMPTY;
     use revm_database::states::bundle_state::BundleBuilder;
     use revm_state::AccountInfo;
 

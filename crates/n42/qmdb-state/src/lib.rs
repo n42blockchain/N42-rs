@@ -41,9 +41,11 @@
 
 use std::collections::BTreeMap;
 
+pub mod alloc;
 pub mod forest;
 
 use alloy_primitives::{Address, B256, U256};
+pub use alloc::changes_from_alloc;
 pub use forest::{
     ForestSnapshot, PreparedBlock, QmdbForest, StateProofProvider, DEFAULT_RETAIN_DEPTH,
 };
@@ -198,6 +200,35 @@ pub enum StateError {
     /// A snapshot did not decode into a tree.
     #[error("QMDB snapshot: {0}")]
     Snapshot(String),
+    /// An undo record could not be applied — the tree and the record do not
+    /// belong to the same history.
+    #[error("QMDB undo: {0}")]
+    Undo(String),
+    /// Two held blocks share no ancestor within the retained window, so the
+    /// tree cannot be walked from one to the other.
+    #[error("no held ancestor connects block {from} to block {to}")]
+    Unreachable {
+        /// Where the tree stands.
+        from: B256,
+        /// Where it was asked to go.
+        to: B256,
+    },
+    /// A block on the tree's current path has no undo record — the forest's
+    /// bookkeeping is inconsistent, which is a bug, not an input problem.
+    #[error("block {0} is on the applied path but holds no undo record")]
+    NotApplied(B256),
+    /// Re-applying a held block produced a different root than it had the
+    /// first time. Re-application is deterministic; this means the tree it
+    /// was re-applied to is not the tree it was first applied to.
+    #[error("re-applying block {block} gave root {got}, expected {expected}")]
+    Replay {
+        /// The block.
+        block: B256,
+        /// Its recorded root.
+        expected: B256,
+        /// What re-application produced.
+        got: B256,
+    },
 }
 
 /// A point the tree can be rolled back to.

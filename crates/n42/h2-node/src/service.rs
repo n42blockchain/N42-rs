@@ -59,7 +59,8 @@ use n42_h2_execution::{DriverAction, ExecutionDriver, ExecutionLayer};
 use alloy_rpc_types_engine::PayloadAttributes;
 use n42_h2_net::{
     compress_block_rlp, decode_block_rlp, decompress_block_gossip, encode_block_rlp,
-    encode_block_rlp_parts, H2V4Transport, HeaderProfile, TransportEvent, MAX_RANGE_BLOCKS,
+    encode_block_rlp_parts, BlockChunk, H2V4Transport, HeaderProfile, PeerId, RangeRequest,
+    TransportEvent, MAX_RANGE_BLOCKS,
 };
 use n42_h2_primitives::consensus::{H2V4ChainIdentity, QuorumCertificate};
 use n42_h2_wire::{H2Message, H2V4Envelope};
@@ -135,6 +136,22 @@ pub enum ServiceEvent {
         /// The block the body belongs to.
         block_hash: B256,
     },
+    /// A peer's status showed it ahead of this node's execution layer, and
+    /// this node started pulling the gap by range.
+    Syncing {
+        /// This node's height when it started.
+        from: u64,
+        /// The peer's height.
+        to: u64,
+    },
+    /// The pull finished — the execution layer is at the height the peer
+    /// reported — or stopped short.
+    Synced {
+        /// The height reached.
+        height: u64,
+        /// Whether the target was reached.
+        complete: bool,
+    },
     /// The view advanced.
     ViewChanged {
         /// The view now current.
@@ -200,6 +217,13 @@ pub struct H2Service<E> {
     received_bodies: Vec<B256>,
     /// Block bodies the mesh would not accept yet; retried like `outbox`.
     body_outbox: Vec<Vec<u8>>,
+    /// Peers whose status arrived since the last drain, with the height
+    /// they reported, to compare against the execution layer there.
+    pending_status: Vec<(PeerId, u64)>,
+    /// A catch-up in progress, if any.
+    catch_up: Option<CatchUp>,
+    /// Range replies to import on the next drain.
+    pending_imports: Vec<(PeerId, RangeRequest, Vec<BlockChunk>)>,
     /// Range requests to answer from the execution layer on the next drain;
     /// kept here because the transport handler cannot await.
     pending_ranges: Vec<(String, n42_h2_net::RangeRequest, n42_h2_net::RangeRequestChannel)>,
@@ -228,6 +252,23 @@ pub struct H2Service<E> {
 /// view timeout, and every other view is lost to it. gov5 paces its own
 /// re-asks at `minProposeDelayMs`, 200ms on the devnet.
 const PROPOSE_RETRY: Duration = Duration::from_millis(200);
+
+/// A pull of the blocks this node is missing, from one peer, by range.
+///
+/// Started when a peer's status shows it ahead of this node's execution
+/// layer — a member restarting after an absence, or joining a chain that
+/// has been running — and driven one range at a time: the reply is
+/// imported through `newPayload` in order, each block becoming the
+/// finalized head, and the next range asked for until the peer's height is
+/// reached. Only the execution layer catches up here; the consensus engine
+/// finds the current view from the messages it hears.
+#[derive(Debug)]
+struct CatchUp {
+    peer: PeerId,
+    next: u64,
+    target: u64,
+    started_at: u64,
+}
 
 /// How many block bodies to keep for peers that ask. gov5 asks for the
 /// parent of a block it cannot place and for the block a proposal names —
@@ -310,6 +351,9 @@ impl<E: ExecutionLayer> H2Service<E> {
             ready_bodies: Vec::new(),
             received_bodies: Vec::new(),
             body_outbox: Vec::new(),
+            pending_status: Vec::new(),
+            catch_up: None,
+            pending_imports: Vec::new(),
             pending_ranges: Vec::new(),
             body_store: std::collections::HashMap::new(),
             body_store_order: Vec::new(),
@@ -629,9 +673,15 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // order; gov5 reads until the stream closes.
                 self.pending_ranges.push((peer.to_string(), request, channel));
             }
-            TransportEvent::RangeFetched { peer, request, reply } => {
-                debug!(target: "n42.h2.node", %peer, ?request, blocks = reply.as_ref().map(Vec::len).ok(), "range reply");
-            }
+            TransportEvent::RangeFetched { peer, request, reply } => match reply {
+                Ok(chunks) => self.pending_imports.push((peer, request, chunks)),
+                Err(reason) => {
+                    warn!(target: "n42.h2.node", %peer, ?request, reason, "range request refused");
+                    if self.catch_up.as_ref().is_some_and(|c| c.peer == peer) {
+                        self.catch_up = None;
+                    }
+                }
+            },
             TransportEvent::StatusExchanged {
                 peer,
                 height,
@@ -640,6 +690,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             } => {
                 if fork_matches {
                     debug!(target: "n42.h2.node", %peer, height, "peer on our chain");
+                    self.pending_status.push((peer, height));
                 } else {
                     // gov5 sends goodbye on a fork mismatch, so this connection
                     // is about to die and the operator needs to know why.
@@ -694,6 +745,8 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// Not a `while let Some(..) = recv().await` loop: that would block waiting
     /// for the *next* output rather than stopping when the channel runs dry.
     async fn drain_outputs(&mut self, events: &mut Vec<ServiceEvent>) -> Result<(), ServiceError> {
+        self.consider_catch_up(events).await;
+        self.import_ranges(events).await;
         for (peer, request, channel) in std::mem::take(&mut self.pending_ranges) {
             // Only the execution layer is held across the await: the
             // transport is not `Sync`, and a future holding all of `self`
@@ -950,6 +1003,125 @@ impl<E: ExecutionLayer> H2Service<E> {
                 warn!(target: "n42.h2.node", %err, view, "publish failed");
             }
         }
+    }
+
+    /// Starts a catch-up if a peer's status shows it ahead of the execution
+    /// layer and none is running.
+    async fn consider_catch_up(&mut self, events: &mut Vec<ServiceEvent>) {
+        let statuses = std::mem::take(&mut self.pending_status);
+        if statuses.is_empty() || self.catch_up.is_some() {
+            return;
+        }
+        let Some((peer, height)) = statuses.into_iter().max_by_key(|(_, h)| *h) else {
+            return;
+        };
+        let latest = match self.driver.execution_layer().latest_block_number().await {
+            Ok(Some(latest)) => latest,
+            // An execution layer that does not say cannot be caught up.
+            Ok(None) => return,
+            Err(err) => {
+                debug!(target: "n42.h2.node", %err, "could not read the execution layer's height");
+                return;
+            }
+        };
+        if height <= latest {
+            return;
+        }
+        info!(target: "n42.h2.node", %peer, from = latest, to = height, "behind a peer; pulling the gap by range");
+        self.catch_up = Some(CatchUp {
+            peer,
+            next: latest + 1,
+            target: height,
+            started_at: latest,
+        });
+        self.request_next_range();
+        events.push(ServiceEvent::Syncing {
+            from: latest,
+            to: height,
+        });
+    }
+
+    fn request_next_range(&mut self) {
+        let Some(catch_up) = &self.catch_up else {
+            return;
+        };
+        let count = (catch_up.target - catch_up.next + 1).min(MAX_RANGE_BLOCKS);
+        self.transport.request_range(
+            catch_up.peer,
+            RangeRequest {
+                start: catch_up.next,
+                count,
+                step: 1,
+            },
+        );
+    }
+
+    /// Imports the ranges that came back, in order, through the execution
+    /// layer; asks for the next range while the target is not reached.
+    async fn import_ranges(&mut self, events: &mut Vec<ServiceEvent>) {
+        for (peer, request, chunks) in std::mem::take(&mut self.pending_imports) {
+            let Some(catch_up) = self.catch_up.as_ref() else {
+                continue;
+            };
+            if catch_up.peer != peer || request.start != catch_up.next {
+                debug!(target: "n42.h2.node", %peer, ?request, "range reply not part of the catch-up; dropped");
+                continue;
+            }
+            if chunks.is_empty() {
+                warn!(target: "n42.h2.node", %peer, ?request, "peer served none of the range; catch-up stopped");
+                self.finish_catch_up(events, false);
+                continue;
+            }
+            for chunk in chunks {
+                let block = match decode_block_rlp(&chunk.rlp, self.header_profile) {
+                    Ok(block) => block,
+                    Err(err) => {
+                        warn!(target: "n42.h2.node", %peer, %err, "peer served a block this node cannot read; catch-up stopped");
+                        self.finish_catch_up(events, false);
+                        return;
+                    }
+                };
+                let expected = self.catch_up.as_ref().map(|c| c.next).unwrap_or_default();
+                if block.header.number != expected {
+                    warn!(target: "n42.h2.node", %peer, got = block.header.number, expected, "peer served blocks out of order; catch-up stopped");
+                    self.finish_catch_up(events, false);
+                    return;
+                }
+                let hash = block.block_hash;
+                match self.driver.import_committed(block.execution_data()).await {
+                    Ok(_) => {
+                        self.remember_block(hash, block.header.timestamp, block.header.number);
+                        self.remember_body(hash, chunk.rlp);
+                        if let Some(c) = self.catch_up.as_mut() {
+                            c.next += 1;
+                        }
+                    }
+                    Err(err) => {
+                        warn!(target: "n42.h2.node", %peer, number = block.header.number, %err, "could not import a pulled block; catch-up stopped");
+                        self.finish_catch_up(events, false);
+                        return;
+                    }
+                }
+            }
+            let done = self.catch_up.as_ref().is_some_and(|c| c.next > c.target);
+            if done {
+                self.finish_catch_up(events, true);
+            } else {
+                self.request_next_range();
+            }
+        }
+    }
+
+    fn finish_catch_up(&mut self, events: &mut Vec<ServiceEvent>, complete: bool) {
+        let Some(catch_up) = self.catch_up.take() else {
+            return;
+        };
+        let height = catch_up.next.saturating_sub(1);
+        if height > catch_up.started_at {
+            self.transport.set_advertised_height(height);
+        }
+        info!(target: "n42.h2.node", from = catch_up.started_at, height, target = catch_up.target, complete, "catch-up finished");
+        events.push(ServiceEvent::Synced { height, complete });
     }
 
     fn remember_body(&mut self, block_hash: B256, rlp: Vec<u8>) {

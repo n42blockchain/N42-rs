@@ -595,6 +595,21 @@ measurement above was taken with it applied; it is on gov5's `main` as
 `95d47b46` (with a test), so a gov5 built from `main` needs nothing further.
 The patch file stays here for a checkout on an older branch.
 
+**A Rust member that starts behind.** The other direction of the same
+protocol. A member's execution layer is fed only over the Engine API, so
+one joining a running chain — a fresh datadir, or a long absence — has
+no blocks and no way to get them from devp2p. When a peer's status shows
+it ahead of the execution layer (`eth_blockNumber`), the service pulls the
+gap by range from that peer, imports each block in order through
+`newPayload` and a forkchoice that finalizes it — the chain it came from is
+the fleet's committed one — and asks for the next range until the peer's
+height is reached; the consensus engine then finds the fleet's view from
+the messages it hears. Measured: a member started 45 s late with an empty
+execution layer pulled 1–12 from a peer in 160 ms, jumped from view 1 to
+the fleet's 17, and committed every view after — its execution layer at 36
+with the main chain's head hash when the run ended. The harness pins the
+pull with mock execution layers (`a_member_that_starts_behind_pulls_the_chain_from_its_peers`).
+
 **Fetch-on-miss.** gov5 recovers from anything it cannot place — the parent
 of a gossiped block, the block a proposal names, its own speculative sibling
 against the next leader's — by asking every connected peer for the block
@@ -855,11 +870,11 @@ nothing.
 
 Ordered by dependency, not by value.
 
-0. **A Rust member that starts behind.** Everything a Go member needs to
-   catch up is served; a Rust member's own execution layer is fed only by
-   the Engine API, so one that joins an old chain has no way to fill the
-   gap. Pulling `bodies_by_range` from a peer (the transport already asks)
-   and replaying it through `newPayload` is the missing half.
+0. **Bodies beyond the store.** `block_by_hash` is served from the last
+   4096 bodies the service kept; a request for an older block by hash is
+   answered "not found" although the execution layer has it. Serving it
+   from `eth_getBlockByHash` closes that, the way ranges already come from
+   `eth_getBlockByNumber`.
 1. **Run the observer against the live fleet.** Everything below the socket is
    tested; what remains is operational — point `h2_observer` at real fleet
    peers with the fleet's genesis hash and validator list, and confirm it

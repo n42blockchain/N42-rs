@@ -279,6 +279,37 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         }
     }
 
+    /// Imports a block the fleet has already committed — one pulled from a
+    /// peer to catch up — and makes it the finalized head, since the chain
+    /// it came from is the fleet's canonical one. Returns the hash on
+    /// success; any verdict but VALID is an error, because a catch-up that
+    /// skips a block leaves every later one without a parent.
+    pub async fn import_committed(&mut self, payload: ExecutionData) -> Result<B256, ElError> {
+        let block_hash = payload.block_hash();
+        let status = self.el.new_payload(payload).await?;
+        match status.status {
+            PayloadStatusEnum::Valid => {}
+            PayloadStatusEnum::Invalid { validation_error } => {
+                return Err(ElError::new(format!("execution layer rejected block {block_hash}: {validation_error}")));
+            }
+            other => {
+                return Err(ElError::new(format!("execution layer did not accept block {block_hash}: {other:?}")));
+            }
+        }
+        let state = ForkchoiceState {
+            head_block_hash: block_hash,
+            safe_block_hash: block_hash,
+            finalized_block_hash: block_hash,
+        };
+        let updated = self.el.fork_choice_updated(state).await?;
+        if let PayloadStatusEnum::Invalid { validation_error } = updated.payload_status.status {
+            return Err(ElError::new(format!("forkchoice to {block_hash} refused: {validation_error}")));
+        }
+        self.head = block_hash;
+        self.finalized = block_hash;
+        Ok(block_hash)
+    }
+
     /// Handles one consensus output.
     pub async fn handle_output(&mut self, output: &EngineOutput) -> DriverAction {
         match output {

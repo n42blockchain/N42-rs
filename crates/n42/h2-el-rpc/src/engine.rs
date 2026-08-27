@@ -306,6 +306,16 @@ fn blob_transaction_hashes(transactions: &[alloy_primitives::Bytes]) -> Vec<B256
 
 #[async_trait::async_trait]
 impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
+    async fn latest_block_number(&self) -> Result<Option<u64>, ElError> {
+        let hex: String = self
+            .call("eth_blockNumber", vec![])
+            .await
+            .map_err(|e| ElError::new(e.to_string()))?;
+        u64::from_str_radix(hex.trim_start_matches("0x"), 16)
+            .map(Some)
+            .map_err(|e| ElError::new(format!("eth_blockNumber returned {hex}: {e}")))
+    }
+
     async fn block_by_number(
         &self,
         number: u64,

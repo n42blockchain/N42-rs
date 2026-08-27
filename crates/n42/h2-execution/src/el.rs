@@ -63,6 +63,12 @@ pub enum ResolveKind {
 /// The execution layer, as consensus sees it.
 #[async_trait::async_trait]
 pub trait ExecutionLayer: Send + Sync + 'static {
+    /// The execution layer's canonical head number, for telling how far
+    /// behind a peer this node is. `None` when not offered.
+    async fn latest_block_number(&self) -> Result<Option<u64>, ElError> {
+        Ok(None)
+    }
+
     /// A canonical block by number, as its header and transactions, for
     /// serving peers that sync by range. `None` when the execution layer
     /// does not have it — or, in the default, does not offer the lookup.

@@ -56,8 +56,9 @@ impl Default for MockBehaviour {
 struct MockState {
     calls: Vec<ElCall>,
     next_block: u64,
-    /// Blocks this mock built, by number, for range requests.
-    built: std::collections::HashMap<u64, (alloy_consensus::Header, Vec<alloy_consensus::TxEnvelope>)>,
+    /// Blocks this mock built or accepted, by number, for range requests
+    /// and for the height it reports.
+    blocks: std::collections::HashMap<u64, (alloy_consensus::Header, Vec<alloy_consensus::TxEnvelope>)>,
 }
 
 /// An [`ExecutionLayer`] that records calls instead of executing.
@@ -175,6 +176,18 @@ impl ExecutionLayer for MockExecutionLayer {
         if let Some(error) = behaviour.new_payload_error {
             return Err(ElError(error));
         }
+        // An accepted block is one this mock can serve and count, as a real
+        // execution layer would.
+        if matches!(behaviour.new_payload_status, PayloadStatusEnum::Valid) {
+            if let Ok(block) = payload.clone().try_into_block::<alloy_consensus::TxEnvelope>() {
+                let number = block.header.number;
+                self.state
+                    .lock()
+                    .expect("mock state lock")
+                    .blocks
+                    .insert(number, (block.header, block.body.transactions));
+            }
+        }
         Ok(PayloadStatus {
             status: behaviour.new_payload_status,
             latest_valid_hash: Some(hash),
@@ -211,11 +224,15 @@ impl ExecutionLayer for MockExecutionLayer {
         })
     }
 
+    async fn latest_block_number(&self) -> Result<Option<u64>, ElError> {
+        Ok(Some(self.state.lock().expect("mock state lock").blocks.keys().copied().max().unwrap_or(0)))
+    }
+
     async fn block_by_number(
         &self,
         number: u64,
     ) -> Result<Option<(alloy_consensus::Header, Vec<alloy_consensus::TxEnvelope>)>, ElError> {
-        Ok(self.state.lock().expect("mock state lock").built.get(&number).cloned())
+        Ok(self.state.lock().expect("mock state lock").blocks.get(&number).cloned())
     }
 
     async fn resolve_payload(
@@ -225,8 +242,11 @@ impl ExecutionLayer for MockExecutionLayer {
     ) -> Option<Result<BuiltBlock, ElError>> {
         self.record(ElCall::ResolvePayload(id));
         let number = {
+            // One past the highest block this mock has built or accepted, so
+            // a fleet of mocks numbers one chain rather than one per builder.
             let mut state = self.state.lock().expect("mock state lock");
-            state.next_block += 1;
+            let known = state.blocks.keys().copied().max().unwrap_or(0);
+            state.next_block = state.next_block.max(known) + 1;
             state.next_block
         };
         let built = Self::built_block(number);
@@ -234,7 +254,7 @@ impl ExecutionLayer for MockExecutionLayer {
             self.state
                 .lock()
                 .expect("mock state lock")
-                .built
+                .blocks
                 .insert(number, (block.header, block.body.transactions));
         }
         Some(Ok(built))

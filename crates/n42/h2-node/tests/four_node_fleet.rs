@@ -84,6 +84,84 @@ async fn build_fleet_with(proposers: &[usize], gov5_profile: bool) -> Vec<Node> 
         .try_init();
 
     let identity = identity();
+    let (keys, validator_set) = validator_keys();
+
+    let mut nodes = Vec::with_capacity(VALIDATORS);
+    let mut first_addr: Option<libp2p::Multiaddr> = None;
+    for (index, key) in keys.into_iter().enumerate() {
+        let (node, addr) = build_node(
+            index,
+            key,
+            &validator_set,
+            identity,
+            first_addr.clone(),
+            proposers.contains(&index),
+            gov5_profile,
+        )
+        .await;
+        if first_addr.is_none() {
+            first_addr = Some(addr);
+        }
+        nodes.push(node);
+    }
+    nodes
+}
+
+/// One member: its transport listening on loopback (dialing `peer` if
+/// given, star topology onto node 0), its engine, a mock execution layer.
+/// Returns the node and the address others can dial it at.
+async fn build_node(
+    index: usize,
+    key: BlsSecretKey,
+    validator_set: &ValidatorSet,
+    identity: H2V4ChainIdentity,
+    peer: Option<libp2p::Multiaddr>,
+    propose: bool,
+    gov5_profile: bool,
+) -> (Node, libp2p::Multiaddr) {
+    let mut config = TransportConfig::new(identity)
+        .with_listen_addr("/ip4/127.0.0.1/tcp/0".parse().unwrap());
+    if let Some(addr) = peer {
+        config = config.with_peer(addr);
+    }
+    let mut transport = H2V4Transport::new(config).expect("transport");
+
+    let listen_addr = loop {
+        match transport.next_event().await {
+            Some(TransportEvent::Listening(addr)) => break addr,
+            Some(_) => {}
+            None => panic!("transport ended before listening"),
+        }
+    };
+    let addr = listen_addr.with(libp2p::multiaddr::Protocol::P2p(*transport.local_peer_id()));
+
+    let (output_tx, output_rx) = mpsc::channel::<EngineOutput>(256);
+    let seal_key = key.clone();
+    let mut engine = ConsensusEngine::new(
+        index as u32,
+        key,
+        validator_set.clone(),
+        // Short enough that a stuck view recovers inside the test's budget,
+        // long enough that a slow machine does not time out a healthy view.
+        1_000,
+        4_000,
+        output_tx,
+    );
+    engine.enable_h2_v4_signing(identity);
+
+    let driver = ExecutionDriver::new(MockExecutionLayer::new(), identity.genesis_hash);
+    let mut service = H2Service::new(transport, engine, driver, output_rx, VALIDATORS);
+    if gov5_profile {
+        service = service.with_gov5_h2_profile(seal_key);
+    }
+    if propose {
+        service = service.with_payload_attributes(attributes);
+    }
+    (Node { service }, addr)
+}
+
+/// The dev validator set: keys and the set built from them.
+fn validator_keys() -> (Vec<BlsSecretKey>, ValidatorSet) {
     let keys: Vec<BlsSecretKey> = (0..VALIDATORS)
         .map(|_| BlsSecretKey::random().expect("bls keygen"))
         .collect();
@@ -96,59 +174,27 @@ async fn build_fleet_with(proposers: &[usize], gov5_profile: bool) -> Vec<Node> 
             p2p_peer_id: None,
         })
         .collect();
-    let validator_set = ValidatorSet::new(&validators, FAULT_TOLERANCE);
+    let set = ValidatorSet::new(&validators, FAULT_TOLERANCE);
+    (keys, set)
+}
 
-    let mut nodes = Vec::with_capacity(VALIDATORS);
-    let mut first_addr: Option<libp2p::Multiaddr> = None;
-    for (index, key) in keys.into_iter().enumerate() {
-        let mut config = TransportConfig::new(identity)
-            .with_listen_addr("/ip4/127.0.0.1/tcp/0".parse().unwrap());
-        // Star topology onto node 0. gossipsub's mesh does the rest, which is
-        // also how a real member joins a fleet from one bootstrap address.
-        if let Some(addr) = &first_addr {
-            config = config.with_peer(addr.clone());
-        }
-        let mut transport = H2V4Transport::new(config).expect("transport");
-
-        let listen_addr = loop {
-            match transport.next_event().await {
-                Some(TransportEvent::Listening(addr)) => break addr,
-                Some(_) => {}
-                None => panic!("transport ended before listening"),
+/// Runs a node in its own task, forwarding its events. See [`run_until`]
+/// for why a task each and not one `select_all`.
+fn spawn_node(index: usize, mut node: Node, tx: mpsc::UnboundedSender<(usize, ServiceEvent)>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match node.service.step().await {
+                Ok(events) => {
+                    for event in events {
+                        if tx.send((index, event)).is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(_) => return,
             }
-        };
-        if first_addr.is_none() {
-            first_addr = Some(
-                listen_addr.with(libp2p::multiaddr::Protocol::P2p(*transport.local_peer_id())),
-            );
         }
-
-        let (output_tx, output_rx) = mpsc::channel::<EngineOutput>(256);
-        let seal_key = key.clone();
-        let mut engine = ConsensusEngine::new(
-            index as u32,
-            key,
-            validator_set.clone(),
-            // Short enough that a stuck view recovers inside the test's budget,
-            // long enough that a slow machine does not time out a healthy view.
-            1_000,
-            4_000,
-            output_tx,
-        );
-        engine.enable_h2_v4_signing(identity);
-
-        let driver = ExecutionDriver::new(MockExecutionLayer::new(), identity.genesis_hash);
-        let mut service = H2Service::new(transport, engine, driver, output_rx, VALIDATORS);
-        if gov5_profile {
-            service = service.with_gov5_h2_profile(seal_key);
-        }
-        if proposers.contains(&index) {
-            service = service.with_payload_attributes(attributes);
-        }
-
-        nodes.push(Node { service });
-    }
-    nodes
+    })
 }
 
 /// Drives every node concurrently until `stop` accepts an event, or the
@@ -332,4 +378,66 @@ async fn a_node_with_no_payload_builder_still_votes() {
         spoke.is_some(),
         "a non-proposing node never spoke; it would count against quorum"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_that_starts_behind_pulls_the_chain_from_its_peers() {
+    // Three members run and commit; the fourth arrives with an empty
+    // execution layer. Its peers' status shows them ahead, it pulls the gap
+    // by range, imports each block through its execution layer, and ends
+    // level with them. Views are the engine's problem and not asserted here.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+    let identity = identity();
+    let (mut keys, validator_set) = validator_keys();
+    let late_key = keys.pop().expect("four keys");
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut handles = Vec::new();
+    let mut first_addr = None;
+    for (index, key) in keys.into_iter().enumerate() {
+        let (node, addr) = build_node(index, key, &validator_set, identity, first_addr.clone(), true, false).await;
+        if first_addr.is_none() {
+            first_addr = Some(addr);
+        }
+        handles.push(spawn_node(index, node, tx.clone()));
+    }
+
+    // Let the three build a chain worth pulling.
+    let mut commits = 0;
+    let started = tokio::time::timeout(Duration::from_secs(60), async {
+        while let Some((index, event)) = rx.recv().await {
+            if index == 0 && matches!(event, ServiceEvent::Committed { .. }) {
+                commits += 1;
+                if commits >= 5 {
+                    return;
+                }
+            }
+        }
+    })
+    .await;
+    started.expect("the three-member fleet commits five blocks");
+
+    let (late, _) = build_node(3, late_key, &validator_set, identity, first_addr, false, false).await;
+    handles.push(spawn_node(3, late, tx.clone()));
+
+    let synced = tokio::time::timeout(Duration::from_secs(60), async {
+        while let Some((index, event)) = rx.recv().await {
+            if index == 3 {
+                if let ServiceEvent::Synced { height, complete } = event {
+                    return (height, complete);
+                }
+            }
+        }
+        panic!("event channel closed");
+    })
+    .await;
+    for handle in handles {
+        handle.abort();
+    }
+    let (height, complete) = synced.expect("the late member syncs within the budget");
+    assert!(complete, "the pull stopped short at {height}");
+    assert!(height >= 3, "synced only to {height}");
 }

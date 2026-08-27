@@ -372,6 +372,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ServiceEvent::PayloadMissing { block_hash } => {
                         eprintln!("NO BODY for {block_hash}; cannot vote on it");
                     }
+                    ServiceEvent::Syncing { from, to } => {
+                        println!("syncing      : {from} -> {to}");
+                    }
+                    ServiceEvent::Synced { height, complete } => {
+                        println!("synced       : height {height}{}", if complete { "" } else { " (stopped short)" });
+                    }
                     ServiceEvent::Published { .. } => {}
                 }
             }

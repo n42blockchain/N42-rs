@@ -31,6 +31,8 @@ pub use block_gossip::{
     encode_block_gossip, encode_block_rlp, encode_block_rlp_parts, gov5_block_topic, gov5_header_view, BlockGossipError,
     GossipBlock, HeaderProfile,
 };
+/// The peer identity type, so consumers need not depend on libp2p.
+pub use libp2p::PeerId;
 pub use rpc::{
     BlockChunk, BlockReply, RangeReply, RangeRequest, BLOCK_BY_HASH_PROTOCOL,
     BODIES_BY_RANGE_PROTOCOL, MAX_RANGE_BLOCKS,

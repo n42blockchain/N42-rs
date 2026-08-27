@@ -44,6 +44,22 @@ if [ -n "$WITH_GOV5" ]; then
   GOPEER="--peer /ip4/127.0.0.1/tcp/30393/p2p/$GOID"
 fi
 for i in $(seq 0 $LAST); do
+  # LATE_VALIDATOR=<index> LATE_DELAY=<secs> starts one Rust member late with
+  # a fresh datadir, so it has to pull the chain from its peers by range.
+  if [ "${LATE_VALIDATOR:-}" = "$i" ]; then
+    # Its own execution layer, fresh, with no devp2p peers: the only way it
+    # can get the chain is the pull this exercises.
+    (sleep ${LATE_DELAY:-60}; rm -rf $F/consensus-$i $F/datadir-late
+      RUST_LOG=${RUST_LOG_EL:-info} $BIN/n42 node --chain $GENESIS --datadir $F/datadir-late \
+        --authrpc.port 18561 --authrpc.jwtsecret $F/jwt.hex --http --http.port 18555 --port 30323 \
+        --disable-discovery --ipcdisable > $F/el-late-$TAG.log 2>&1 &
+      for _ in $(seq 1 60); do grep -aq "RPC auth server started" $F/el-late-$TAG.log 2>/dev/null && break; sleep 1; done
+      RUST_LOG=${RUST_LOG_V:-n42=debug} $BIN/examples/h2_validator --chain $GENESIS --index $i \
+        --bls-key $(cat $F/keys/validator-$i.key) --el http://127.0.0.1:18561 --jwt $F/jwt.hex \
+        --listen /ip4/127.0.0.1/tcp/$((19000+i)) --propose --datadir $F/consensus-$i $PEER ${DIALGO:-} \
+        > $F/v$i-$TAG.log 2>&1) > /dev/null 2>&1 &
+    continue
+  fi
   RUST_LOG=${RUST_LOG_V:-n42=debug} $BIN/examples/h2_validator --chain $GENESIS --index $i \
     --bls-key $(cat $F/keys/validator-$i.key) --el http://127.0.0.1:18551 --jwt $F/jwt.hex \
     --listen /ip4/127.0.0.1/tcp/$((19000+i)) --propose --datadir $F/consensus-$i $PEER ${DIALGO:-} \
@@ -76,6 +92,10 @@ echo "EL: newPayload=$(grep -ac 'Received new payload' $F/el-$TAG.log) qmdb_root
 height() { curl -s -X POST -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' http://127.0.0.1:$1 | python3 -c "import sys,json;print(int(json.load(sys.stdin)['result'],16))" 2>/dev/null; }
 hash_at() { curl -s -X POST -H 'content-type: application/json' --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getBlockByNumber\",\"params\":[\"0x$(printf %x $2)\",false]}" http://127.0.0.1:$1 | python3 -c "import sys,json;b=json.load(sys.stdin).get('result');print(b['hash'] if b else None)" 2>/dev/null; }
 H1=$(height 18545); echo "reth height: $H1"
+if [ -n "${LATE_VALIDATOR:-}" ]; then
+  HL=$(height 18555); echo "late member: el height=$HL $(grep -a '^syncing\|^synced' $F/v$LATE_VALIDATOR-$TAG.log | tr '\n' ' ') commits=$(grep -ac '^COMMIT' $F/v$LATE_VALIDATOR-$TAG.log)"
+  echo "block $HL: main=$(hash_at 18545 $HL) late=$(hash_at 18555 $HL)"
+fi
 if [ -n "$WITH_GOV5" ]; then
   GL=$F/gov5/log/n42.log
   echo "gov5: sealed=$(grep -ac 'sealed new block' $GL) committed=$(grep -ac 'block committed' $GL) errors=$(grep -ac '"level":"error"' $GL) height=$(height 28545)"

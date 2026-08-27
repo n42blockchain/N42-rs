@@ -177,6 +177,16 @@ where
         // node's Ethereum-profile history, carry the empty-list hash. A body
         // never has ommers on this chain, so either value is "none".
         let ommers_hash = body.calculate_ommers_root();
+        if header.ommers_hash == B256::ZERO && !body.ommers.is_empty() {
+            // Zero says "none"; a body that brings ommers under it is lying.
+            return Err(ConsensusError::BodyOmmersHashDiff(
+                GotExpected {
+                    got: ommers_hash,
+                    expected: header.ommers_hash,
+                }
+                .into(),
+            ));
+        }
         if header.ommers_hash != B256::ZERO && header.ommers_hash != ommers_hash {
             return Err(ConsensusError::BodyOmmersHashDiff(
                 GotExpected {

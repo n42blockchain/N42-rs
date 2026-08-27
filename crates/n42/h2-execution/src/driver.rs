@@ -279,12 +279,17 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         }
     }
 
-    /// Imports a block the fleet has already committed — one pulled from a
-    /// peer to catch up — and makes it the finalized head, since the chain
-    /// it came from is the fleet's canonical one. Returns the hash on
-    /// success; any verdict but VALID is an error, because a catch-up that
-    /// skips a block leaves every later one without a parent.
-    pub async fn import_committed(&mut self, payload: ExecutionData) -> Result<B256, ElError> {
+    /// Imports a block pulled from a peer to catch up and makes it the head.
+    ///
+    /// Head and safe, not finalized: the peer says this is the fleet's
+    /// chain, and execution says the block is valid, but neither is a
+    /// commit certificate. Finality follows the next Decide this node sees,
+    /// which finalizes the block it names and, with it, everything pulled
+    /// beneath; until then a peer that served a sibling chain costs a reorg
+    /// rather than a node stuck behind a wrong finalized block. Returns the
+    /// hash on success; any verdict but VALID is an error, because a
+    /// catch-up that skips a block leaves every later one without a parent.
+    pub async fn import_pulled(&mut self, payload: ExecutionData) -> Result<B256, ElError> {
         let block_hash = payload.block_hash();
         let status = self.el.new_payload(payload).await?;
         match status.status {
@@ -299,14 +304,13 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         let state = ForkchoiceState {
             head_block_hash: block_hash,
             safe_block_hash: block_hash,
-            finalized_block_hash: block_hash,
+            finalized_block_hash: self.finalized,
         };
         let updated = self.el.fork_choice_updated(state).await?;
         if let PayloadStatusEnum::Invalid { validation_error } = updated.payload_status.status {
             return Err(ElError::new(format!("forkchoice to {block_hash} refused: {validation_error}")));
         }
         self.head = block_hash;
-        self.finalized = block_hash;
         Ok(block_hash)
     }
 

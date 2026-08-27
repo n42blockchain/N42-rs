@@ -273,6 +273,13 @@ struct CatchUp {
     started_at: u64,
 }
 
+/// How many block requests may wait for the execution layer at once, and
+/// how many range requests: past these a request is answered empty rather
+/// than queued, so one peer cannot hold every other's answers behind a
+/// thousand lookups.
+const MAX_PENDING_SERVES: usize = 256;
+const MAX_PENDING_RANGES: usize = 8;
+
 /// How many block bodies to keep for peers that ask. gov5 asks for the
 /// parent of a block it cannot place and for the block a proposal names —
 /// recent blocks, both — but a member restarting after a long absence walks
@@ -645,6 +652,13 @@ impl<E: ExecutionLayer> H2Service<E> {
                         debug!(target: "n42.h2.node", %peer, ?hash, "peer asked for a block; served from the store");
                         self.transport.respond_block(channel, Some(body));
                     }
+                    None if self.pending_block_requests.len() >= MAX_PENDING_SERVES => {
+                        // A queue this deep is a peer asking faster than the
+                        // execution layer answers; better a prompt "not
+                        // found" than a stall for everyone behind it.
+                        debug!(target: "n42.h2.node", %peer, ?hash, "block request queue full; refused");
+                        self.transport.respond_block(channel, None);
+                    }
                     None => self.pending_block_requests.push((peer.to_string(), hash, channel)),
                 }
             }
@@ -682,7 +696,12 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // has every block, rather than from the body store, which
                 // has the recent ones. As many as it has from the start, in
                 // order; gov5 reads until the stream closes.
-                self.pending_ranges.push((peer.to_string(), request, channel));
+                if self.pending_ranges.len() >= MAX_PENDING_RANGES {
+                    debug!(target: "n42.h2.node", %peer, ?request, "range request queue full; refused");
+                    self.transport.respond_range(channel, Vec::new());
+                } else {
+                    self.pending_ranges.push((peer.to_string(), request, channel));
+                }
             }
             TransportEvent::RangeFetched { peer, request, reply } => match reply {
                 Ok(chunks) => self.pending_imports.push((peer, request, chunks)),
@@ -1047,7 +1066,9 @@ impl<E: ExecutionLayer> H2Service<E> {
                 return;
             }
         };
-        if height <= latest {
+        // One block behind is the normal state of a follower mid-import; a
+        // pull is for a gap consensus will not close by itself.
+        if height <= latest + 1 {
             return;
         }
         info!(target: "n42.h2.node", %peer, from = latest, to = height, "behind a peer; pulling the gap by range");
@@ -1111,7 +1132,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                     return;
                 }
                 let hash = block.block_hash;
-                match self.driver.import_committed(block.execution_data()).await {
+                match self.driver.import_pulled(block.execution_data()).await {
                     Ok(_) => {
                         self.remember_block(hash, block.header.timestamp, block.header.number);
                         self.remember_body(hash, chunk.rlp);

@@ -1,7 +1,7 @@
 # Ethereum 主网 witness 回放：用 Rust 超越 gov5 的方案（2026-08-27）
 
 本文是新方向的起点文档：先把 `../N42-gov5` 最近几天 witness 执行的代码、
-优化过程和实测数据读清楚，再据此给出在本仓库用 Rust（reth 2.4.1 / revm 42）
+优化过程和实测数据读清楚，再据此给出在本仓库用 Rust（reth 2.5.1 / revm 42）
 做同一件事、并明确以 gov5 生产数字为基线去超越的架构与里程碑。
 所有 gov5 数字均来自其仓库 `docs/ethel/` 下的交接文档与本机 `/data/blockchain`
 的输入集；本文中标注"估"的数字是推断，必须以实测替换。
@@ -143,7 +143,7 @@ gov5 的 Go 回放器消费不了）。审计发现并已修（分支 `witness-v
 ## 5. Rust 架构
 
 新 crate `crates/n42/witness-replay`（lib + bin `n42-witness-replay`），只依赖
-reth 2.4.1 已在图里的 crate，不碰 vendored fork。
+reth 2.5.1 已在图里的 crate，不碰 vendored fork。
 
 ```
 reader 线程 ×R ──segment 解码──▶ 有界 reservoir（按内存计）──▶ worker 线程 ×W ──▶ 聚合/校验/可选输出
@@ -161,7 +161,7 @@ reader 线程 ×R ──segment 解码──▶ 有界 reservoir（按内存计�
   `code_hash → Arc<Bytecode>` 缓存，含 jumpdest 分析结果，只做一次）；
   `storage()` 查 slot 表；`block_hash()` 从 headerc 取最近 256 个 header 的哈希
   （每 worker 一个环）；缺 key = 该块 witness 不完整，直接判失败，不猜。
-- **执行层**：reth 2.4.1 `EthEvmConfig`（主网 ChainSpec）→
+- **执行层**：reth 2.5.1 `EthEvmConfig`（主网 ChainSpec）→
   `BlockExecutor::execute_one(&RecoveredBlock)`，senders 来自 senders 表
   （`RecoveredBlock::new_unhashed(block, senders)`，不做 ecrecover）；
   校验 = `reth_ethereum_consensus::validate_block_post_execution`

@@ -90,7 +90,7 @@ type SnapshotReader =
 ///
 /// The node's consensus is not reachable from `FullNode`, and these tests re-sign each
 /// block with a different authorized signer, so the key cannot just be baked into
-/// `DevArgs` once at launch. Capturing each `Arc<APos>` as it is built keeps that on the
+/// `DevArgs` once at launch. Capturing each consensus as it is built keeps that on the
 /// test side instead of widening the reth fork.
 ///
 /// A node builds consensus twice — once for the consensus component and once inside
@@ -146,7 +146,7 @@ impl<Node> reth_node_builder::components::ConsensusBuilder<Node> for CapturingCo
 where
     Node: FullNodeTypes<Types: NodeTypes<ChainSpec = ChainSpec, Primitives = reth_ethereum_primitives::EthPrimitives>>,
 {
-    type Consensus = Arc<n42_clique::APos<<Node as FullNodeTypes>::Provider, ChainSpec>>;
+    type Consensus = Arc<n42_engine_types::N42Consensus<<Node as FullNodeTypes>::Provider>>;
 
     async fn build_consensus(
         self,

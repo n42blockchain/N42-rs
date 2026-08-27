@@ -167,8 +167,9 @@ Three N42 clients live side by side on this host, and code moves between them:
   and writes reth-format MDBX tables for cross-client work.
 - `../N42-26` — the newer Rust client, on reth **2.4.1** (edition 2024, rustc
   1.97) with HotStuff-2 and QMDB. Depends on reth by local path (`../reth`).
-- `../reth` — a reth checkout at 2.4.1, 1,484 commits ahead of this repo's
-  pinned v1.11.0.
+- `../reth` — a checkout of the n42blockchain/reth fork with upstream tags
+  fetched; `scripts/reth-sync.py` reads upstream revisions from it. This repo
+  itself pins upstream paradigmxyz/reth by tag (`v2.5.1` as of 2026-08-27).
 
 The `n42-{bmt-core,twig-core,h2-primitives,h2-wire,h2-consensus,mobile-verify,h2-net,h2-execution}`
 crates came from `../N42-26` (`h2-net` is new, modelled on its `n42-network`;
@@ -204,12 +205,19 @@ recorder and replayer must share one revm version.
 
 ## Upgrading reth
 
-`docs/RETH_2_4_1_UPGRADE.md` is the current, measured assessment (the guide below
-is older and its "current version" section is stale). The short version: reth
-2.4.1 deleted or relocated 22 of the 121 reth crates this repo depends on, and
-two of them — `reth-primitives-traits` (which holds the APoS `clique_utils`) and
-`reth-rpc-types-compat` — are crates this repo maintains vendored forks of. They
-must be re-homed against a different upstream before anything else resolves.
+The repo is on reth **v2.5.1** (upstream tag; revm 42, alloy 2.3, edition 2024).
+`docs/RETH_2_4_1_UPGRADE.md` records the 1.11.0 → 2.4.1 move (22 of 121 reth
+crates deleted or relocated; `reth-primitives-traits` now comes from crates.io).
+
+Bumping to a newer reth: `scripts/reth-sync.py <old-rev> <new-rev>` three-way
+merges every vendored crate in the patch table from the upstream checkout at
+`../reth` (fetch the tag there first), lists conflicts and files to look at;
+then replace the `tag = "vX.Y.Z"` on every reth entry in `Cargo.toml`, align the
+shared crates.io versions with upstream's `[workspace.dependencies]`, run
+`cargo update`, and fix the cascade. The 2.4.1 → 2.5.1 step took one conflict
+(`providers/state/mod.rs`, our `macros` module next to upstream's removed
+`overlay`), one deletion (`consistent_view.rs`, removed upstream), and one
+renamed feature (`reqwest` 0.13: `rustls-tls` → `rustls`).
 
 
 `docs/RETH_UPGRADE_GUIDE.md` and `patches/` describe the process (note: the guide's "current version"

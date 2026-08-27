@@ -64,6 +64,10 @@ use reth_node_builder::{
 use reth_payload_builder::{PayloadBuilderHandle, PayloadBuilderService};
 use std::future::Future;
 
+// Historical catch-up never enters the payload builder. Until a qualified
+// live PEVM builder exists, every invocation here is the live sequential path.
+const LIVE_EVM_PATH: &str = "live_sequential";
+
 // wrapper
 
 // Payload component configuration for the Ethereum node.
@@ -219,7 +223,8 @@ where
         &self,
         args: BuildArguments<EthPayloadAttributes, EthBuiltPayload>,
     ) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError> {
-        default_n42_payload(
+        let started = std::time::Instant::now();
+        let result = default_n42_payload(
             self.evm_config.clone(),
             self.client.clone(),
             self.pool.clone(),
@@ -228,7 +233,22 @@ where
             |attributes| self.pool.best_transactions_with_attributes(attributes),
             self.cons.clone(),
             self.qmdb.clone(),
+        );
+        let outcome = if result.is_ok() { "ok" } else { "error" };
+        metrics::histogram!(
+            "n42_evm_path_duration_ms",
+            "path" => LIVE_EVM_PATH,
+            "phase" => "payload_build",
         )
+        .record(started.elapsed().as_secs_f64() * 1_000.0);
+        metrics::counter!(
+            "n42_evm_path_calls_total",
+            "path" => LIVE_EVM_PATH,
+            "phase" => "payload_build",
+            "outcome" => outcome,
+        )
+        .increment(1);
+        result
     }
 
     fn on_missing_payload(

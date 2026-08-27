@@ -17,8 +17,10 @@
 
 pub mod driver;
 pub mod el;
+pub mod execution_path;
 pub mod mock;
 
 pub use driver::{DriverAction, ExecutionDriver};
 pub use el::{BuiltBlock, ElError, ExecutionLayer, ResolveKind};
+pub use execution_path::{ExecutionPath, ExecutionScheduling, ExecutionWorkload};
 pub use mock::{ElCall, MockBehaviour, MockExecutionLayer};

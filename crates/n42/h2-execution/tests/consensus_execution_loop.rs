@@ -12,7 +12,7 @@ use alloy_primitives::{B256, U256};
 use alloy_rpc_types_engine::{PayloadAttributes, PayloadStatusEnum};
 use n42_h2_consensus::EngineOutput;
 use n42_h2_execution::{
-    ElCall, ExecutionDriver, MockBehaviour, MockExecutionLayer,
+    ElCall, ExecutionDriver, ExecutionLayer, ExecutionPath, MockBehaviour, MockExecutionLayer,
 };
 
 const GENESIS: B256 = B256::ZERO;
@@ -149,6 +149,41 @@ async fn an_execution_layer_error_is_a_rejection_not_an_import() {
     let action = driver.handle_output(&execute(hash)).await;
     assert!(action.imported_block().is_none());
     assert!(action.rejection().unwrap().1.contains("engine unavailable"));
+}
+
+#[tokio::test]
+async fn unsupported_or_non_live_paths_fail_before_the_engine_adapter() {
+    let el = MockExecutionLayer::new();
+    let hash = B256::repeat_byte(0x12);
+
+    let pevm = el
+        .new_payload_for(
+            ExecutionPath::LIVE_PEVM,
+            MockExecutionLayer::payload_for(hash, 1),
+        )
+        .await
+        .unwrap_err();
+    assert!(pevm.to_string().contains("live_pevm"), "{pevm}");
+
+    let historical_build = el
+        .fork_choice_updated_with_attrs_for(
+            ExecutionPath::HISTORICAL_SEQUENTIAL,
+            alloy_rpc_types_engine::ForkchoiceState {
+                head_block_hash: GENESIS,
+                safe_block_hash: GENESIS,
+                finalized_block_hash: GENESIS,
+            },
+            attrs(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        historical_build
+            .to_string()
+            .contains("historical_sequential"),
+        "{historical_build}"
+    );
+    assert!(el.calls().is_empty(), "rejected paths reached the raw adapter");
 }
 
 #[tokio::test]

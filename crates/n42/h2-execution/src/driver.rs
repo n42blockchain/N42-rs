@@ -24,7 +24,10 @@ use alloy_rpc_types_engine::{
 };
 use n42_h2_consensus::{ConsensusEvent, EngineOutput};
 
-use crate::el::{BuiltBlock, ElError, ExecutionLayer, ResolveKind};
+use crate::{
+    el::{BuiltBlock, ElError, ExecutionLayer, ResolveKind},
+    ExecutionPath,
+};
 
 /// What the driver produced for one consensus output.
 ///
@@ -223,7 +226,11 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     ) -> Result<BuiltBlock, ElError> {
         let updated = self
             .el
-            .fork_choice_updated_with_attrs(self.forkchoice(self.head), attrs)
+            .fork_choice_updated_with_attrs_for(
+                ExecutionPath::LIVE_SEQUENTIAL,
+                self.forkchoice(self.head),
+                attrs,
+            )
             .await?;
 
         // A build only starts if the EL accepted the forkchoice. Reporting the
@@ -238,7 +245,11 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
 
         let mut built = self
             .el
-            .resolve_payload(payload_id, ResolveKind::WaitForPending)
+            .resolve_payload_for(
+                ExecutionPath::LIVE_SEQUENTIAL,
+                payload_id,
+                ResolveKind::WaitForPending,
+            )
             .await
             .ok_or_else(|| ElError::new(format!("no payload build for id {payload_id}")))??;
 
@@ -262,7 +273,10 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         // committed by consensus and then rejected by the leader's own
         // execution layer, which answers the commit's forkchoiceUpdated with
         // SYNCING and leaves the chain stuck at the parent.
-        let status = self.el.new_payload(built.execution_data.clone()).await?;
+        let status = self
+            .el
+            .new_payload_for(ExecutionPath::LIVE_SEQUENTIAL, built.execution_data.clone())
+            .await?;
         match status.status {
             PayloadStatusEnum::Valid => {
                 self.head = built.hash;
@@ -291,7 +305,10 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// catch-up that skips a block leaves every later one without a parent.
     pub async fn import_pulled(&mut self, payload: ExecutionData) -> Result<B256, ElError> {
         let block_hash = payload.block_hash();
-        let status = self.el.new_payload(payload).await?;
+        let status = self
+            .el
+            .new_payload_for(ExecutionPath::HISTORICAL_SEQUENTIAL, payload)
+            .await?;
         match status.status {
             PayloadStatusEnum::Valid => {}
             PayloadStatusEnum::Invalid { validation_error } => {
@@ -306,7 +323,10 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             safe_block_hash: block_hash,
             finalized_block_hash: self.finalized,
         };
-        let updated = self.el.fork_choice_updated(state).await?;
+        let updated = self
+            .el
+            .fork_choice_updated_for(ExecutionPath::HISTORICAL_SEQUENTIAL, state)
+            .await?;
         if let PayloadStatusEnum::Invalid { validation_error } = updated.payload_status.status {
             return Err(ElError::new(format!("forkchoice to {block_hash} refused: {validation_error}")));
         }
@@ -330,7 +350,11 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             return DriverAction::PayloadMissing { block_hash };
         };
 
-        match self.el.new_payload(payload).await {
+        match self
+            .el
+            .new_payload_for(ExecutionPath::LIVE_SEQUENTIAL, payload)
+            .await
+        {
             Ok(status) => match status.status {
                 PayloadStatusEnum::Valid => {
                     self.head = block_hash;
@@ -362,7 +386,11 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             safe_block_hash: block_hash,
             finalized_block_hash: block_hash,
         };
-        match self.el.fork_choice_updated(state).await {
+        match self
+            .el
+            .fork_choice_updated_for(ExecutionPath::LIVE_SEQUENTIAL, state)
+            .await
+        {
             Ok(updated) => match updated.payload_status.status {
                 PayloadStatusEnum::Invalid { validation_error } => DriverAction::Rejected {
                     block_hash,

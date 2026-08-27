@@ -17,6 +17,7 @@ alloy-consensus.workspace = true
 async-trait = "0.1"
 thiserror.workspace = true
 tracing.workspace = true
+metrics.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

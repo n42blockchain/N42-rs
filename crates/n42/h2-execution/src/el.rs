@@ -15,7 +15,40 @@
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::{
     ExecutionData, ForkchoiceState, ForkchoiceUpdated, PayloadAttributes, PayloadId, PayloadStatus,
+    PayloadStatusEnum,
 };
+
+use crate::ExecutionPath;
+
+fn payload_outcome(status: &PayloadStatusEnum) -> &'static str {
+    match status {
+        PayloadStatusEnum::Valid => "valid",
+        PayloadStatusEnum::Invalid { .. } => "invalid",
+        PayloadStatusEnum::Syncing => "syncing",
+        PayloadStatusEnum::Accepted => "accepted",
+    }
+}
+
+fn record_call(
+    path: ExecutionPath,
+    phase: &'static str,
+    started: std::time::Instant,
+    outcome: &'static str,
+) {
+    metrics::histogram!(
+        "n42_evm_path_duration_ms",
+        "path" => path.label(),
+        "phase" => phase,
+    )
+    .record(started.elapsed().as_secs_f64() * 1_000.0);
+    metrics::counter!(
+        "n42_evm_path_calls_total",
+        "path" => path.label(),
+        "phase" => phase,
+        "outcome" => outcome,
+    )
+    .increment(1);
+}
 
 /// Error at the EL boundary.
 ///
@@ -94,12 +127,62 @@ pub trait ExecutionLayer: Send + Sync + 'static {
     /// Engine-API `newPayload` — insert and validate a block.
     async fn new_payload(&self, payload: ExecutionData) -> Result<PayloadStatus, ElError>;
 
+    /// Classified Engine-API `newPayload` call.
+    ///
+    /// Raw methods remain the adapter/test-double seam. Production callers use
+    /// the classified wrappers so historical catch-up is never aggregated with
+    /// live execution and unsupported PEVM cannot silently fall back.
+    async fn new_payload_for(
+        &self,
+        path: ExecutionPath,
+        payload: ExecutionData,
+    ) -> Result<PayloadStatus, ElError> {
+        let started = std::time::Instant::now();
+        if !path.uses_current_engine_api() {
+            record_call(path, "new_payload", started, "unsupported");
+            return Err(ElError::new(format!(
+                "execution path {} is not implemented by the canonical Engine API adapter",
+                path.label()
+            )));
+        }
+
+        let result = self.new_payload(payload).await;
+        let outcome = result
+            .as_ref()
+            .map_or("error", |status| payload_outcome(&status.status));
+        record_call(path, "new_payload", started, outcome);
+        result
+    }
+
     /// Engine-API `forkchoiceUpdated` without attributes — the finalise and
     /// import path.
     async fn fork_choice_updated(
         &self,
         state: ForkchoiceState,
     ) -> Result<ForkchoiceUpdated, ElError>;
+
+    /// Classified canonical-head update paired with [`Self::new_payload_for`].
+    async fn fork_choice_updated_for(
+        &self,
+        path: ExecutionPath,
+        state: ForkchoiceState,
+    ) -> Result<ForkchoiceUpdated, ElError> {
+        let started = std::time::Instant::now();
+        if !path.uses_current_engine_api() || !path.may_write_canonical_state() {
+            record_call(path, "forkchoice_updated", started, "unsupported");
+            return Err(ElError::new(format!(
+                "execution path {} may not update canonical fork choice",
+                path.label()
+            )));
+        }
+
+        let result = self.fork_choice_updated(state).await;
+        let outcome = result.as_ref().map_or("error", |updated| {
+            payload_outcome(&updated.payload_status.status)
+        });
+        record_call(path, "forkchoice_updated", started, outcome);
+        result
+    }
 
     /// `forkchoiceUpdated` with attributes — starts a payload build. Kept
     /// separate from the attribute-less call so the finalise path can later move
@@ -110,10 +193,65 @@ pub trait ExecutionLayer: Send + Sync + 'static {
         attrs: PayloadAttributes,
     ) -> Result<ForkchoiceUpdated, ElError>;
 
+    /// Classified FCU with payload attributes, used only to start a live build.
+    async fn fork_choice_updated_with_attrs_for(
+        &self,
+        path: ExecutionPath,
+        state: ForkchoiceState,
+        attrs: PayloadAttributes,
+    ) -> Result<ForkchoiceUpdated, ElError> {
+        let started = std::time::Instant::now();
+        if !path.may_start_payload_build() {
+            record_call(
+                path,
+                "forkchoice_updated_with_attrs",
+                started,
+                "unsupported",
+            );
+            return Err(ElError::new(format!(
+                "execution path {} may not start a canonical payload build",
+                path.label()
+            )));
+        }
+
+        let result = self.fork_choice_updated_with_attrs(state, attrs).await;
+        let outcome = result.as_ref().map_or("error", |updated| {
+            payload_outcome(&updated.payload_status.status)
+        });
+        record_call(path, "forkchoice_updated_with_attrs", started, outcome);
+        result
+    }
+
     /// Resolves a started build. `None` means no such job.
     async fn resolve_payload(
         &self,
         id: PayloadId,
         kind: ResolveKind,
     ) -> Option<Result<BuiltBlock, ElError>>;
+
+    /// Classified resolution of a live payload build.
+    async fn resolve_payload_for(
+        &self,
+        path: ExecutionPath,
+        id: PayloadId,
+        kind: ResolveKind,
+    ) -> Option<Result<BuiltBlock, ElError>> {
+        let started = std::time::Instant::now();
+        if !path.may_start_payload_build() {
+            record_call(path, "resolve_payload", started, "unsupported");
+            return Some(Err(ElError::new(format!(
+                "execution path {} may not resolve a canonical payload build",
+                path.label()
+            ))));
+        }
+
+        let result = self.resolve_payload(id, kind).await;
+        let outcome = match &result {
+            Some(Ok(_)) => "ok",
+            Some(Err(_)) => "error",
+            None => "missing",
+        };
+        record_call(path, "resolve_payload", started, outcome);
+        result
+    }
 }

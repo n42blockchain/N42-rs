@@ -142,6 +142,10 @@ gov5 的 Go 回放器消费不了）。审计发现并已修（分支 `witness-v
 
 ## 5. Rust 架构
 
+执行口径必须遵守 [`EXECUTION_PATHS.md`](./EXECUTION_PATHS.md)：本工具属于
+`historical_parallel_blocks`，不是 `historical_pevm`，更不是 `live_sequential`。
+外部 `../pevm` 的历史结果也不得混入 live TPS。
+
 新 crate `crates/n42/witness-replay`（lib + bin `n42-witness-replay`），只依赖
 reth 2.5.1 已在图里的 crate，不碰 vendored fork。
 

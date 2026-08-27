@@ -7953,6 +7953,7 @@ dependencies = [
  "alloy-primitives 1.7.1",
  "alloy-rpc-types-engine 2.4.1",
  "async-trait",
+ "metrics",
  "n42-h2-consensus",
  "n42-h2-primitives",
  "thiserror 2.0.20",

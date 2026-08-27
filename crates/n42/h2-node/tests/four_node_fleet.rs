@@ -425,10 +425,10 @@ async fn a_member_that_starts_behind_pulls_the_chain_from_its_peers() {
 
     let synced = tokio::time::timeout(Duration::from_secs(60), async {
         while let Some((index, event)) = rx.recv().await {
-            if index == 3 {
-                if let ServiceEvent::Synced { height, complete } = event {
-                    return (height, complete);
-                }
+            if index == 3
+                && let ServiceEvent::Synced { height, complete } = event
+            {
+                return (height, complete);
             }
         }
         panic!("event channel closed");

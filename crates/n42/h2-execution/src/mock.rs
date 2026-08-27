@@ -178,15 +178,15 @@ impl ExecutionLayer for MockExecutionLayer {
         }
         // An accepted block is one this mock can serve and count, as a real
         // execution layer would.
-        if matches!(behaviour.new_payload_status, PayloadStatusEnum::Valid) {
-            if let Ok(block) = payload.clone().try_into_block::<alloy_consensus::TxEnvelope>() {
-                let number = block.header.number;
-                self.state
-                    .lock()
-                    .expect("mock state lock")
-                    .blocks
-                    .insert(number, (block.header, block.body.transactions));
-            }
+        if matches!(behaviour.new_payload_status, PayloadStatusEnum::Valid)
+            && let Ok(block) = payload.clone().try_into_block::<alloy_consensus::TxEnvelope>()
+        {
+            let number = block.header.number;
+            self.state
+                .lock()
+                .expect("mock state lock")
+                .blocks
+                .insert(number, (block.header, block.body.transactions));
         }
         Ok(PayloadStatus {
             status: behaviour.new_payload_status,

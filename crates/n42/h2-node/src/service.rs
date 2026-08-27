@@ -224,6 +224,9 @@ pub struct H2Service<E> {
     catch_up: Option<CatchUp>,
     /// Range replies to import on the next drain.
     pending_imports: Vec<(PeerId, RangeRequest, Vec<BlockChunk>)>,
+    /// Block requests the store could not answer, for the execution layer
+    /// on the next drain.
+    pending_block_requests: Vec<(String, B256, n42_h2_net::BlockRequestChannel)>,
     /// Range requests to answer from the execution layer on the next drain;
     /// kept here because the transport handler cannot await.
     pending_ranges: Vec<(String, n42_h2_net::RangeRequest, n42_h2_net::RangeRequestChannel)>,
@@ -354,6 +357,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             pending_status: Vec::new(),
             catch_up: None,
             pending_imports: Vec::new(),
+            pending_block_requests: Vec::new(),
             pending_ranges: Vec::new(),
             body_store: std::collections::HashMap::new(),
             body_store_order: Vec::new(),
@@ -633,9 +637,16 @@ impl<E: ExecutionLayer> H2Service<E> {
                 }
             }
             TransportEvent::BlockRequest { peer, hash, channel } => {
-                let body = self.body_store.get(&hash).cloned();
-                debug!(target: "n42.h2.node", %peer, ?hash, found = body.is_some(), "peer asked for a block");
-                self.transport.respond_block(channel, body);
+                // The store holds recent bodies byte for byte; anything older
+                // is rebuilt from the execution layer on the next drain, the
+                // way ranges are served.
+                match self.body_store.get(&hash).cloned() {
+                    Some(body) => {
+                        debug!(target: "n42.h2.node", %peer, ?hash, "peer asked for a block; served from the store");
+                        self.transport.respond_block(channel, Some(body));
+                    }
+                    None => self.pending_block_requests.push((peer.to_string(), hash, channel)),
+                }
             }
             TransportEvent::BlockFetched { peer, hash, reply } => match reply {
                 Ok(chunk) => {
@@ -747,6 +758,18 @@ impl<E: ExecutionLayer> H2Service<E> {
     async fn drain_outputs(&mut self, events: &mut Vec<ServiceEvent>) -> Result<(), ServiceError> {
         self.consider_catch_up(events).await;
         self.import_ranges(events).await;
+        for (peer, hash, channel) in std::mem::take(&mut self.pending_block_requests) {
+            let body = match self.driver.execution_layer().block_by_hash(hash).await {
+                Ok(Some((header, transactions))) => Some(encode_block_rlp_parts(&header, &transactions)),
+                Ok(None) => None,
+                Err(err) => {
+                    debug!(target: "n42.h2.node", ?hash, %err, "execution layer could not serve a block");
+                    None
+                }
+            };
+            debug!(target: "n42.h2.node", peer, ?hash, found = body.is_some(), "peer asked for a block; execution layer consulted");
+            self.transport.respond_block(channel, body);
+        }
         for (peer, request, channel) in std::mem::take(&mut self.pending_ranges) {
             // Only the execution layer is held across the await: the
             // transport is not `Sync`, and a future holding all of `self`

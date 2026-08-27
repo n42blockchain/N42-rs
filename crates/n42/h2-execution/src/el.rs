@@ -69,6 +69,17 @@ pub trait ExecutionLayer: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// A block by hash, canonical or not, as its header and transactions —
+    /// for serving a peer's fetch-on-miss when the body is no longer in the
+    /// consensus layer's own store. `None` when not held or not offered.
+    async fn block_by_hash(
+        &self,
+        hash: B256,
+    ) -> Result<Option<(alloy_consensus::Header, Vec<alloy_consensus::TxEnvelope>)>, ElError> {
+        let _ = hash;
+        Ok(None)
+    }
+
     /// A canonical block by number, as its header and transactions, for
     /// serving peers that sync by range. `None` when the execution layer
     /// does not have it — or, in the default, does not offer the lookup.

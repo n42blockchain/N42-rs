@@ -228,6 +228,20 @@ impl ExecutionLayer for MockExecutionLayer {
         Ok(Some(self.state.lock().expect("mock state lock").blocks.keys().copied().max().unwrap_or(0)))
     }
 
+    async fn block_by_hash(
+        &self,
+        hash: B256,
+    ) -> Result<Option<(alloy_consensus::Header, Vec<alloy_consensus::TxEnvelope>)>, ElError> {
+        Ok(self
+            .state
+            .lock()
+            .expect("mock state lock")
+            .blocks
+            .values()
+            .find(|(header, _)| header.hash_slow() == hash)
+            .cloned())
+    }
+
     async fn block_by_number(
         &self,
         number: u64,

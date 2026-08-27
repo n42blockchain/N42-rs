@@ -316,6 +316,17 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
             .map_err(|e| ElError::new(format!("eth_blockNumber returned {hex}: {e}")))
     }
 
+    async fn block_by_hash(
+        &self,
+        hash: B256,
+    ) -> Result<Option<(alloy_consensus::Header, Vec<TxEnvelope>)>, ElError> {
+        let block: Option<alloy_rpc_types_eth::Block> = self
+            .call("eth_getBlockByHash", vec![json!(hash), json!(true)])
+            .await
+            .map_err(|e| ElError::new(e.to_string()))?;
+        Ok(block.map(block_parts))
+    }
+
     async fn block_by_number(
         &self,
         number: u64,

@@ -616,8 +616,9 @@ against the next leader's — by asking every connected peer for the block
 over `/rpc/block_by_hash/1/ssz_snappy`: a bare 32-byte hash, answered with
 a status byte, the fork digest, and the block RLP as one framed-snappy
 chunk. The transport now serves it from the bodies the service keeps (every
-block built or received, gov5's RLP, the last 4096) and asks for it itself
-when a proposal names a body it has not seen. Measured: a Go member started
+block built or received, gov5's RLP, the last 4096), falling back to the
+execution layer's `eth_getBlockByHash` for anything older, and asks for it
+itself when a proposal names a body it has not seen. Measured: a Go member started
 25 s late, eight blocks behind, asked, was served, "aligned and imported",
 and went on to lead — 41 blocks in 100 s, both clients at 41 with the same
 head, no errors.
@@ -870,11 +871,12 @@ nothing.
 
 Ordered by dependency, not by value.
 
-0. **Bodies beyond the store.** `block_by_hash` is served from the last
-   4096 bodies the service kept; a request for an older block by hash is
-   answered "not found" although the execution layer has it. Serving it
-   from `eth_getBlockByHash` closes that, the way ranges already come from
-   `eth_getBlockByNumber`.
+0. **Rejoining after a long absence, measured.** Every piece a member
+   needs to rejoin is in place — status, range pull, fetch-on-miss, the
+   engine's jump to the fleet's view — and each is measured over minutes.
+   What is not measured is hours: a member returning to a chain thousands
+   of views ahead, with its persisted forest and vote log, and the mobile
+   endpoint serving proofs on a mixed fleet throughout.
 1. **Run the observer against the live fleet.** Everything below the socket is
    tested; what remains is operational — point `h2_observer` at real fleet
    peers with the fleet's genesis hash and validator list, and confirm it

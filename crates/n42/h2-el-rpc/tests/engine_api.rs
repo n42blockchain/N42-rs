@@ -441,3 +441,48 @@ async fn an_osaka_envelope_is_read_and_re_imported_with_its_requests() {
     assert!(built.execution_data.sidecar.requests().is_some());
     assert_eq!(new_payload_call(&built.execution_data).unwrap().0, "engine_newPayloadV4");
 }
+
+/// The `eth_` lookups that serve peers: a block by number or hash comes
+/// back as the consensus header and transactions, and the head number as a
+/// number — asked of the auth endpoint, since the spec puts these methods
+/// there.
+#[tokio::test]
+async fn chain_lookups_come_back_as_consensus_types() {
+    let header = alloy_consensus::Header {
+        number: 7,
+        timestamp: 1_700_000_000,
+        gas_limit: 30_000_000,
+        base_fee_per_gas: Some(7),
+        ..Default::default()
+    };
+    let hash = header.hash_slow();
+    let rpc_block: alloy_rpc_types_eth::Block = alloy_rpc_types_eth::Block {
+        header: alloy_rpc_types_eth::Header {
+            hash,
+            inner: header.clone(),
+            total_difficulty: None,
+            size: None,
+        },
+        uncles: Vec::new(),
+        transactions: alloy_rpc_types_eth::BlockTransactions::Full(Vec::new()),
+        withdrawals: None,
+    };
+    let as_json = serde_json::to_value(&rpc_block).unwrap();
+    let recorder = Recorder::with_answers(vec![Ok(as_json.clone()), Ok(as_json), Ok(json!("0x24")), Ok(Value::Null)]);
+    let client = EngineApiClient::new(SharedRecorder(recorder.clone()));
+
+    let (by_number, txs) = client.block_by_number(7).await.unwrap().expect("served");
+    assert_eq!(by_number, header);
+    assert!(txs.is_empty());
+    let (by_hash, _) = client.block_by_hash(hash).await.unwrap().expect("served");
+    assert_eq!(by_hash.hash_slow(), hash);
+    assert_eq!(client.latest_block_number().await.unwrap(), Some(36));
+    assert_eq!(client.block_by_number(99).await.unwrap(), None);
+
+    assert_eq!(
+        recorder.methods(),
+        ["eth_getBlockByNumber", "eth_getBlockByHash", "eth_blockNumber", "eth_getBlockByNumber"]
+    );
+    assert_eq!(recorder.params(0), vec![json!("0x7"), json!(true)]);
+    assert_eq!(recorder.params(1), vec![json!(hash), json!(true)]);
+}

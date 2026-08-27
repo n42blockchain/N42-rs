@@ -591,7 +591,9 @@ it skips EIP-4788 for the block, which no reth-validated block can match.
 `docs/gov5-cancun-parent-beacon-root.patch` makes `Prepare` write the zero
 root in that case, which is what genesis and every Engine API client write
 and what gov5's own `VerifyHeader` already accepts. The mixed-fleet
-measurement above was taken with it applied; it belongs in the gov5 repo.
+measurement above was taken with it applied; it is on gov5's `main` as
+`95d47b46` (with a test), so a gov5 built from `main` needs nothing further.
+The patch file stays here for a checkout on an older branch.
 
 Not done, and what it costs: gov5 recovers from a same-height sibling — its
 own speculative block against the next leader's — by fetching the block from

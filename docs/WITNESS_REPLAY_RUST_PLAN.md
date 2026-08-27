@@ -126,6 +126,16 @@ Erigon 派 IBS 的读序，等于在 Rust 里重写一个 IBS，且 25M 块里�
 录制、逐块在新鲜 state 回放 receipts 一致并通过 `validate_block_post_execution`，
 错块/篡改的 witness 不通过；`ExecutionStage` 带 `witness_dir` 跑出的块可无状态回放。
 
+**2026-08-27 补充：`../pevm`（n42blockchain/pevm，reth 1.10.2 / revm 34）已经实现了同一件事，
+而且更合适**——它对 reth 归档库逐块并行执行（每块 `history_by_block_number(n-1)` +
+新鲜 `State`），在 DB 层录制恰好就是新鲜 cache 的 miss 序列，不需要影子 `State`；
+流格式与 gov5 的 `MarshalV2`、`NCIX`/64 块批 zstd 容器逐字节一致（只是顺序是 revm 的，
+gov5 的 Go 回放器消费不了）。审计发现并已修（分支 `witness-verify`）：录制与回放都不
+校验执行结果、回放在流耗尽时回退到过期状态的数据库。现在录制必须通过
+`validate_block_post_execution`，回放必须恰好消费完流并通过同一校验，
+`--witness-verify N` 让录制 run 每 N 块自证。**硬约束：谁录谁放**——revm 34 与 42 的
+`State` 语义已有分歧（state-clear 标志），回放器必须与录制器同版本。
+
 录制成本：主网全量执行一遍（用户估约 20 小时，Windows 宿主 `d:\reth2k`），
 一次性；回放端零额外查找。pevm 一类并行执行器与位置式 witness 不兼容——
 读序必须来自顺序执行——录制只能走顺序的执行阶段。

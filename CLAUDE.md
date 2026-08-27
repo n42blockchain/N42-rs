@@ -197,7 +197,10 @@ to beat them in Rust. gov5's witness is a positional read stream with no keys
 with reth: `docs/patches/0001-feat-witness-record-*.patch` (reth branch
 `witness-record`, crate `reth-witness`) adds a `StateReadObserver` to revm's
 `State` and a per-block shadow `State` that decides what a fresh replayer will
-read; `reth node --debug.witness-dir <DIR>` records during sync.
+read; `reth node --debug.witness-dir <DIR>` records during sync. `../pevm`
+(reth 1.10.2) records the same positional witness block-parallel from a reth
+archive (`pevm evm --witness-dir`, branch `witness-verify` adds verification);
+recorder and replayer must share one revm version.
 
 ## Upgrading reth
 

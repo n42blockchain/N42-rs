@@ -7927,6 +7927,7 @@ dependencies = [
  "alloy-eips 2.4.1",
  "alloy-primitives 1.6.1",
  "alloy-rpc-types-engine 2.4.1",
+ "alloy-rpc-types-eth 2.4.1",
  "async-trait",
  "n42-h2-execution",
  "reqwest 0.12.28",

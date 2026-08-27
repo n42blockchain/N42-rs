@@ -186,6 +186,16 @@ cargo test -p n42-bmt-core -p n42-twig-core -p n42-h2-primitives -p n42-h2-wire 
            -p n42-h2-execution                                      # 412 tests
 ```
 
+## Witness replay (new direction)
+
+`docs/WITNESS_REPLAY_RUST_PLAN.md` records what gov5's `cmd/witness-replay` does
+(stateless parallel re-execution of Ethereum mainnet from per-block witnesses,
+inputs under `/data/blockchain/{witness,witness-geth,code-mdbx}`), its measured
+numbers (49m48s / 376k CPU-s for 25.77M blocks with verification) and the plan
+to beat them in Rust. Its key finding: gov5's witness is a positional read
+stream with no keys, so the Rust side needs a keyed witness (v2) exported once
+by gov5 rather than a byte-for-byte imitation of Erigon's read order.
+
 ## Upgrading reth
 
 `docs/RETH_2_4_1_UPGRADE.md` is the current, measured assessment (the guide below

@@ -192,9 +192,12 @@ cargo test -p n42-bmt-core -p n42-twig-core -p n42-h2-primitives -p n42-h2-wire 
 (stateless parallel re-execution of Ethereum mainnet from per-block witnesses,
 inputs under `/data/blockchain/{witness,witness-geth,code-mdbx}`), its measured
 numbers (49m48s / 376k CPU-s for 25.77M blocks with verification) and the plan
-to beat them in Rust. Its key finding: gov5's witness is a positional read
-stream with no keys, so the Rust side needs a keyed witness (v2) exported once
-by gov5 rather than a byte-for-byte imitation of Erigon's read order.
+to beat them in Rust. gov5's witness is a positional read stream with no keys
+(zero lookups at replay), so the Rust side records its own positional witness
+with reth: `docs/patches/0001-feat-witness-record-*.patch` (reth branch
+`witness-record`, crate `reth-witness`) adds a `StateReadObserver` to revm's
+`State` and a per-block shadow `State` that decides what a fresh replayer will
+read; `reth node --debug.witness-dir <DIR>` records during sync.
 
 ## Upgrading reth
 

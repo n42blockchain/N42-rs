@@ -96,20 +96,39 @@ revm 的读取时点不同（access list 预热时就加载账户与 slot；coin
 Erigon 派 IBS 的读序，等于在 Rust 里重写一个 IBS，且 25M 块里任何一个时点
 差异都会以 gas/receipt 不匹配的形式在很远的地方爆出来——这是**不该走的路**。
 
-**决策：把交换格式改成带 key 的 witness（v2），由 gov5 一次性导出。**
-`WitnessReplayReader.ReadAccountData(address)` / `ReadAccountStorage(address, key)`
-在回放时手里就有 key，加一个"边回放边写 `(addr → account|absent)`、
-`(addr, slot → value)`"的输出表即可（估 100 行 Go，一次 ~50 分钟生产 run 顺带
-产出；每块去重、按 key 排序）。之后：
+**决策（2026-08-27 修订）：witness 保持位置式、无 key，但由 reth 自己录制。**
+带 key 的格式被否决：回放时每块要做数千次 map 查询、2500 万块合计上百亿次，
+且 key（20/52 字节）普遍比值大，存储与性能优势一起丢掉；位置式回放是 0 查询。
 
-- Rust 端按 key 查表，与读取顺序无关，revm 的任何访问模式都正确；
-- 这是所有无状态验证者（reth `ExecutionWitness`、移动端验证）都需要的形态，
-  gov5 也能用它去掉对读序的脆弱依赖；
-- 两边消费同一份每块前置状态，比较才公平。
+改为让 reth 在执行阶段按 revm 自己的读取顺序写出流：录制端和回放端跑的是
+同一份 revm `State` 与同一份 reth 块执行器，读序**由构造保证一致**，不需要
+任何一方模仿对方。实现见 `docs/patches/0001-feat-witness-record-*.patch`
+（打在 n42blockchain/reth `23316e3ff8`、分支 `witness-record`）：
 
-在 v2 落地前，Rust 端可以先用**顺序流 + 只做 EOA 转账/简单块**的方式验证
-读取器与执行链路（早期 0–1M 块大多空块或纯转账，两种引擎读序一致），
-但不以此作为正确性结论。
+- vendored `revm-database` 42.0.0 加 `State::read_observer`（`StateReadObserver`：
+  每次 `basic`/`storage` 回答后、每次提交前通知）；
+- `reth-witness` crate：流格式（`[len:1][data]`，账户 = nonce/balance/codeHash
+  紧凑编码，缺失 = len 0；槽位 = 去前导零的大端值）、磁盘存储
+  （`witness.idx` 16 字节头 + 每块 12 字节 `(offset u64, len u32)`，
+  `witness.NNNN.dat` 2 GiB 段，逐块 zstd，可在执行检查点续写/回退）、
+  录制器、`replay_block`/`WitnessDb`；
+- 录制器的核心：执行阶段的批量 `State` 跨块缓存，它发给 provider 的读并不是
+  新鲜 `State` 会发出的读，所以录制器每块维护一个**影子**新鲜 `State`，把批量
+  `State` 回答的每次读都喂给影子，由影子自己的 cache 决定哪些读会到达数据库
+  ——这正是回放端新鲜 `State` 将做出的同一决定、同一段代码；提交也镜像到影子。
+  影子解释不了的读（先读槽位后读账户、提交从未读过的账户）让该块大声失败。
+- 接线：`Executor::{set_read_observer, read_observer_mut}`、
+  `ExecutionStage::with_witness_dir`、`ExecutionConfig::witness_dir`、
+  `reth node --debug.witness-dir <DIR>`。
+
+已验证：单元测试（格式、存储续写/回退/缺口）、三块链（跨块 cache 命中、上一块
+创建的合约、先缺失后创建的账户、revert 帧内的读、withdrawals）在批量执行器下
+录制、逐块在新鲜 state 回放 receipts 一致并通过 `validate_block_post_execution`，
+错块/篡改的 witness 不通过；`ExecutionStage` 带 `witness_dir` 跑出的块可无状态回放。
+
+录制成本：主网全量执行一遍（用户估约 20 小时，Windows 宿主 `d:\reth2k`），
+一次性；回放端零额外查找。pevm 一类并行执行器与位置式 witness 不兼容——
+读序必须来自顺序执行——录制只能走顺序的执行阶段。
 
 ## 5. Rust 架构
 

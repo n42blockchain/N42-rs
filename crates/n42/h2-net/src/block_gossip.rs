@@ -116,9 +116,26 @@ pub fn encode_block_gossip(
     execution: &ExecutionData,
     profile: HeaderProfile,
 ) -> Result<Vec<u8>, BlockGossipError> {
-    let rlp = encode_block_rlp(execution, profile)?;
+    compress_block_rlp(&encode_block_rlp(execution, profile)?)
+}
+
+/// The topic's compression of an already-encoded block.
+pub fn compress_block_rlp(rlp: &[u8]) -> Result<Vec<u8>, BlockGossipError> {
     snap::raw::Encoder::new()
-        .compress_vec(&rlp)
+        .compress_vec(rlp)
+        .map_err(|error| BlockGossipError::Snappy(error.to_string()))
+}
+
+/// The block RLP inside a compressed topic payload, before any decoding —
+/// what a node keeps to serve `block_by_hash` requests byte for byte.
+pub fn decompress_block_gossip(data: &[u8]) -> Result<Vec<u8>, BlockGossipError> {
+    let len = snap::raw::decompress_len(data)
+        .map_err(|error| BlockGossipError::Snappy(error.to_string()))?;
+    if len > crate::config::MAX_GOSSIP_SIZE {
+        return Err(BlockGossipError::Snappy("expands past the gossip size limit".into()));
+    }
+    snap::raw::Decoder::new()
+        .decompress_vec(data)
         .map_err(|error| BlockGossipError::Snappy(error.to_string()))
 }
 
@@ -127,15 +144,7 @@ pub fn decode_block_gossip(
     data: &[u8],
     profile: HeaderProfile,
 ) -> Result<GossipBlock, BlockGossipError> {
-    let len = snap::raw::decompress_len(data)
-        .map_err(|error| BlockGossipError::Snappy(error.to_string()))?;
-    if len > crate::config::MAX_GOSSIP_SIZE {
-        return Err(BlockGossipError::Snappy("expands past the gossip size limit".into()));
-    }
-    let rlp = snap::raw::Decoder::new()
-        .decompress_vec(data)
-        .map_err(|error| BlockGossipError::Snappy(error.to_string()))?;
-    decode_block_rlp(&rlp, profile)
+    decode_block_rlp(&decompress_block_gossip(data)?, profile)
 }
 
 /// The uncompressed wire form: `[header, tx_bytes, verifiers, rewards]`.

@@ -19,8 +19,10 @@ use libp2p::request_response;
 use libp2p::StreamProtocol;
 
 use crate::status::{
-    frame_payload, framed_len, unframe_payload, Status, RESPONSE_CODE_SUCCESS, STATUS_PROTOCOL,
+    frame_payload, framed_len_limit, unframe_payload_limit, Status, RESPONSE_CODE_SUCCESS,
+    STATUS_PROTOCOL,
 };
+use alloy_primitives::B256;
 
 /// The negotiated protocol.
 pub fn status_protocol() -> StreamProtocol {
@@ -43,23 +45,32 @@ async fn read_framed<T>(io: &mut T) -> io::Result<Vec<u8>>
 where
     T: AsyncRead + Unpin + Send,
 {
+    read_framed_limit(io, MAX_FRAMED_BYTES, crate::status::MAX_CHUNK_SIZE).await
+}
+
+/// Reads one `varint(len) ‖ framed-snappy` chunk, bounded both on the wire and
+/// once decoded.
+async fn read_framed_limit<T>(io: &mut T, max_wire: usize, max_decoded: u64) -> io::Result<Vec<u8>>
+where
+    T: AsyncRead + Unpin + Send,
+{
     let mut buf = Vec::with_capacity(128);
-    let mut chunk = [0u8; 512];
+    let mut chunk = [0u8; 4096];
     loop {
-        if let Some(end) = framed_len(&buf).map_err(to_io)? {
-            return unframe_payload(&buf[..end]).map_err(to_io);
+        if let Some(end) = framed_len_limit(&buf, max_decoded).map_err(to_io)? {
+            return unframe_payload_limit(&buf[..end], max_decoded).map_err(to_io);
         }
-        if buf.len() > MAX_FRAMED_BYTES {
+        if buf.len() > max_wire {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("status frame exceeded {MAX_FRAMED_BYTES} bytes without completing"),
+                format!("frame exceeded {max_wire} bytes without completing"),
             ));
         }
         let n = io.read(&mut chunk).await?;
         if n == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                "stream ended mid status frame",
+                "stream ended mid frame",
             ));
         }
         buf.extend_from_slice(&chunk[..n]);
@@ -274,5 +285,189 @@ mod tests {
             codec.read_request(&status_protocol(), &mut cursor).await.unwrap(),
             first
         );
+    }
+}
+
+/// gov5's fetch-on-miss protocol (`internal/sync/rpc_block_by_hash.go`): a
+/// bare 32-byte hash on the stream, answered with a status byte, the 4-byte
+/// fork digest, and the block's RLP as one `varint ‖ framed-snappy` chunk —
+/// or a non-zero status byte and a framed error message. gov5 asks every
+/// connected peer for a block it hears of but does not hold: the parent of a
+/// gossiped block, or the block a proposal names; without an answer a Go
+/// member that fell behind by one sibling stays behind.
+pub const BLOCK_BY_HASH_PROTOCOL: &str = "/rpc/block_by_hash/1/ssz_snappy";
+
+/// The protocol as libp2p names it.
+pub fn block_by_hash_protocol() -> StreamProtocol {
+    StreamProtocol::new(BLOCK_BY_HASH_PROTOCOL)
+}
+
+/// gov5 `responseCodeInvalidRequest`.
+pub const RESPONSE_CODE_INVALID_REQUEST: u8 = 1;
+/// gov5 `responseCodeServerError`, which is what it answers for a block it
+/// does not have.
+pub const RESPONSE_CODE_SERVER_ERROR: u8 = 2;
+/// gov5 `encoder.MaxBlockChunkSize`.
+pub const MAX_BLOCK_CHUNK: u64 = 64 << 20;
+/// Bound on the compressed chunk as it arrives.
+const MAX_BLOCK_WIRE_BYTES: usize = (MAX_BLOCK_CHUNK as usize) + (MAX_BLOCK_CHUNK as usize) / 6 + 32;
+
+/// A served block.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockChunk {
+    /// The chain's fork digest, as gov5 writes before the block.
+    pub fork_digest: [u8; 4],
+    /// gov5's block RLP: `[header, txs, verifiers, rewards]`.
+    pub rlp: Vec<u8>,
+}
+
+/// What a `block_by_hash` request comes back with: the block, or the peer's
+/// error message.
+pub type BlockReply = Result<BlockChunk, String>;
+
+/// The codec.
+#[derive(Debug, Clone, Default)]
+pub struct BlockByHashCodec;
+
+#[async_trait]
+impl request_response::Codec for BlockByHashCodec {
+    type Protocol = StreamProtocol;
+    type Request = B256;
+    type Response = BlockReply;
+
+    async fn read_request<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Request>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let mut hash = [0u8; 32];
+        io.read_exact(&mut hash).await?;
+        Ok(B256::from(hash))
+    }
+
+    async fn read_response<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Response>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let mut code = [0u8; 1];
+        io.read_exact(&mut code).await?;
+        if code[0] != RESPONSE_CODE_SUCCESS {
+            let message = read_framed(io).await.unwrap_or_default();
+            return Ok(Err(format!(
+                "code {}: {}",
+                code[0],
+                String::from_utf8_lossy(&message)
+            )));
+        }
+        let mut fork_digest = [0u8; 4];
+        io.read_exact(&mut fork_digest).await?;
+        let rlp = read_framed_limit(io, MAX_BLOCK_WIRE_BYTES, MAX_BLOCK_CHUNK).await?;
+        Ok(Ok(BlockChunk { fork_digest, rlp }))
+    }
+
+    async fn write_request<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+        hash: Self::Request,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        io.write_all(hash.as_slice()).await?;
+        io.close().await
+    }
+
+    async fn write_response<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+        reply: Self::Response,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        let out = encode_block_reply(&reply).map_err(to_io)?;
+        io.write_all(&out).await?;
+        io.close().await
+    }
+}
+
+/// The bytes gov5's `writeBlockChunk` / `writeErrorResponseToStream` put on
+/// the stream for a reply.
+pub fn encode_block_reply(reply: &BlockReply) -> Result<Vec<u8>, crate::status::StatusError> {
+    match reply {
+        Ok(chunk) => {
+            let mut out = Vec::with_capacity(5 + chunk.rlp.len());
+            out.push(RESPONSE_CODE_SUCCESS);
+            out.extend_from_slice(&chunk.fork_digest);
+            out.extend_from_slice(&frame_payload(&chunk.rlp)?);
+            Ok(out)
+        }
+        Err(message) => {
+            let mut out = vec![RESPONSE_CODE_SERVER_ERROR];
+            out.extend_from_slice(&frame_payload(message.as_bytes())?);
+            Ok(out)
+        }
+    }
+}
+
+/// The request-response behaviour for the protocol.
+pub type BlockByHashBehaviour = request_response::Behaviour<BlockByHashCodec>;
+
+/// Serving and requesting.
+pub fn block_by_hash_behaviour() -> BlockByHashBehaviour {
+    request_response::Behaviour::with_codec(
+        BlockByHashCodec,
+        [(block_by_hash_protocol(), request_response::ProtocolSupport::Full)],
+        request_response::Config::default(),
+    )
+}
+
+#[cfg(test)]
+mod block_by_hash_tests {
+    use super::*;
+    use crate::status::unframe_payload;
+    use futures::executor::block_on;
+    use libp2p::request_response::Codec as _;
+
+    #[test]
+    fn a_served_block_is_status_digest_and_one_framed_chunk() {
+        let chunk = BlockChunk {
+            fork_digest: [0x11, 0x24, 0x89, 0xf0],
+            rlp: vec![0xc4, 0xc0, 0xc0, 0xc0, 0xc0],
+        };
+        let bytes = encode_block_reply(&Ok(chunk.clone())).unwrap();
+        assert_eq!(bytes[0], RESPONSE_CODE_SUCCESS);
+        assert_eq!(&bytes[1..5], &chunk.fork_digest);
+        assert_eq!(unframe_payload(&bytes[5..]).unwrap(), chunk.rlp);
+
+        // And it reads back through the codec, as the Go requester reads it.
+        let mut codec = BlockByHashCodec;
+        let proto = block_by_hash_protocol();
+        let reply = block_on(codec.read_response(&proto, &mut futures::io::Cursor::new(bytes))).unwrap();
+        assert_eq!(reply, Ok(chunk));
+    }
+
+    #[test]
+    fn a_missing_block_is_gov5s_server_error_with_a_framed_message() {
+        let bytes = encode_block_reply(&Err("block not found".into())).unwrap();
+        assert_eq!(bytes[0], RESPONSE_CODE_SERVER_ERROR);
+        assert_eq!(unframe_payload(&bytes[1..]).unwrap(), b"block not found");
+        let mut codec = BlockByHashCodec;
+        let proto = block_by_hash_protocol();
+        let reply = block_on(codec.read_response(&proto, &mut futures::io::Cursor::new(bytes))).unwrap();
+        assert_eq!(reply, Err("code 2: block not found".into()));
+    }
+
+    #[test]
+    fn the_request_is_the_bare_hash() {
+        let mut codec = BlockByHashCodec;
+        let proto = block_by_hash_protocol();
+        let hash = B256::repeat_byte(0xAB);
+        let mut wire = Vec::new();
+        block_on(codec.write_request(&proto, &mut wire, hash)).unwrap();
+        assert_eq!(wire, hash.as_slice());
+        let back = block_on(codec.read_request(&proto, &mut futures::io::Cursor::new(wire))).unwrap();
+        assert_eq!(back, hash);
     }
 }

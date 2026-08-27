@@ -72,7 +72,7 @@ async fn build_fleet(proposers: &[usize]) -> Vec<Node> {
     build_fleet_with(proposers, false).await
 }
 
-/// `gov5_profile` runs every node under gov5's HotStuff header profile:
+/// `gov5_profile` runs every node under gov5's `HotStuff` header profile:
 /// built blocks are finished with the view and a BLS seal, and bodies are
 /// decoded under that profile.
 async fn build_fleet_with(proposers: &[usize], gov5_profile: bool) -> Vec<Node> {

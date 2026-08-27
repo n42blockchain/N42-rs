@@ -12,7 +12,7 @@
 # docs/gov5-cancun-parent-beacon-root.patch applied.
 set -u
 REPO=$(cd "$(dirname "$0")/.." && pwd)
-GOV5=${N42_GOV5:-$REPO/../N42-gov5}
+GOV5=$(cd "${N42_GOV5:-$REPO/../N42-gov5}" && pwd)
 F=${N42_FLEET_DIR:-/tmp/n42-fleet}
 TAG=${1:-run}; SECS=${2:-60}; shift 2 || true
 WITH_GOV5=; KEEP=
@@ -55,6 +55,9 @@ for i in $(seq 0 $LAST); do
     if [ -n "$WITH_GOV5" ]; then
       # The Go member: standalone sync (it starts level with the chain and
       # follows by gossip), static peering onto node 0, mining as validator 3.
+      # GOV5_DELAY=<secs> starts it late, so it has to catch up by asking the
+      # Rust members for blocks (fetch-on-miss over block_by_hash).
+      sleep ${GOV5_DELAY:-0}
       $GOV5/build/bin/n42 --chain private --profile n42 --data.dir $F/gov5 --mine --etherbase $ADDR3 \
         --http --http.port 28545 --port 30393 --p2p.no-discovery --p2p.min-sync-peers 0 \
         --p2p.peer /ip4/127.0.0.1/tcp/19000/p2p/$ID --log.level ${GOV5_LOG:-info} --log.console \

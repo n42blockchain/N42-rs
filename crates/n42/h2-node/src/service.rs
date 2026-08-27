@@ -58,7 +58,8 @@ use n42_h2_consensus::{ConsensusEngine, ConsensusEvent, EngineOutput};
 use n42_h2_execution::{DriverAction, ExecutionDriver, ExecutionLayer};
 use alloy_rpc_types_engine::PayloadAttributes;
 use n42_h2_net::{
-    decode_block_gossip, encode_block_gossip, H2V4Transport, HeaderProfile, TransportEvent,
+    compress_block_rlp, decode_block_rlp, decompress_block_gossip, encode_block_rlp, H2V4Transport,
+    HeaderProfile, TransportEvent,
 };
 use n42_h2_primitives::consensus::{H2V4ChainIdentity, QuorumCertificate};
 use n42_h2_wire::{H2Message, H2V4Envelope};
@@ -199,6 +200,11 @@ pub struct H2Service<E> {
     received_bodies: Vec<B256>,
     /// Block bodies the mesh would not accept yet; retried like `outbox`.
     body_outbox: Vec<Vec<u8>>,
+    /// Every body this node built or received, as gov5 block RLP, to answer
+    /// `block_by_hash` — gov5's fetch-on-miss, and this node's own. Bounded;
+    /// insertion order in `body_store_order`.
+    body_store: std::collections::HashMap<B256, Vec<u8>>,
+    body_store_order: Vec<B256>,
     /// Timestamps of blocks this node has seen the body of, for
     /// [`ProposalContext::head_timestamp`]. Bounded; insertion order in
     /// `timestamp_order`.
@@ -219,6 +225,12 @@ pub struct H2Service<E> {
 /// view timeout, and every other view is lost to it. gov5 paces its own
 /// re-asks at `minProposeDelayMs`, 200ms on the devnet.
 const PROPOSE_RETRY: Duration = Duration::from_millis(200);
+
+/// How many block bodies to keep for peers that ask. gov5 asks for the
+/// parent of a block it cannot place and for the block a proposal names —
+/// recent blocks, both — but a member restarting after a long absence walks
+/// back further, and a body is a few hundred bytes when empty.
+const REMEMBERED_BODIES: usize = 4096;
 
 /// How many block timestamps to remember. Far more than any head-selection
 /// needs; the bound is against a peer flooding bodies, not a working set.
@@ -295,6 +307,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             ready_bodies: Vec::new(),
             received_bodies: Vec::new(),
             body_outbox: Vec::new(),
+            body_store: std::collections::HashMap::new(),
+            body_store_order: Vec::new(),
             block_timestamps: std::collections::HashMap::new(),
             block_numbers: std::collections::HashMap::new(),
             block_seen: std::collections::HashMap::new(),
@@ -547,9 +561,13 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // the header's root. Whether the block is *valid* is the
                 // execution layer's verdict, and whether it is *the* block is
                 // consensus's — both check the same hash.
-                match decode_block_gossip(&data, self.header_profile) {
-                    Ok(block) => {
+                let decoded = decompress_block_gossip(&data).and_then(|rlp| {
+                    decode_block_rlp(&rlp, self.header_profile).map(|block| (block, rlp))
+                });
+                match decoded {
+                    Ok((block, rlp)) => {
                         let block_hash = block.block_hash;
+                        self.remember_body(block_hash, rlp);
                         self.remember_block(block_hash, block.header.timestamp, block.header.number);
                         self.driver.cache_payload(block_hash, block.execution_data());
                         if self.awaiting_bodies.remove(&block_hash) {
@@ -565,6 +583,40 @@ impl<E: ExecutionLayer> H2Service<E> {
                         debug!(target: "n42.h2.node", %err, len = data.len(), head, "dropped a block body");
                     }
                 }
+            }
+            TransportEvent::BlockRequest { peer, hash, channel } => {
+                let body = self.body_store.get(&hash).cloned();
+                debug!(target: "n42.h2.node", %peer, ?hash, found = body.is_some(), "peer asked for a block");
+                self.transport.respond_block(channel, body);
+            }
+            TransportEvent::BlockFetched { peer, hash, reply } => match reply {
+                Ok(chunk) => {
+                    // The same path a gossiped body takes; the hash the peer
+                    // sent it under is checked by the decode, not trusted.
+                    match decode_block_rlp(&chunk.rlp, self.header_profile) {
+                        Ok(block) if block.block_hash == hash => {
+                            self.remember_block(hash, block.header.timestamp, block.header.number);
+                            self.remember_body(hash, chunk.rlp);
+                            self.driver.cache_payload(hash, block.execution_data());
+                            if self.awaiting_bodies.remove(&hash) {
+                                self.ready_bodies.push(hash);
+                            }
+                            self.received_bodies.push(hash);
+                        }
+                        Ok(block) => {
+                            debug!(target: "n42.h2.node", %peer, ?hash, got = ?block.block_hash, "peer answered a block request with the wrong block");
+                        }
+                        Err(err) => {
+                            debug!(target: "n42.h2.node", %peer, ?hash, %err, "peer answered a block request with a body this node cannot read");
+                        }
+                    }
+                }
+                Err(reason) => {
+                    debug!(target: "n42.h2.node", %peer, ?hash, reason, "peer does not have a requested block");
+                }
+            },
+            TransportEvent::BlockFetchFailed { peer, hash, reason } => {
+                debug!(target: "n42.h2.node", %peer, ?hash, reason, "block request failed");
             }
             TransportEvent::StatusExchanged {
                 peer,
@@ -807,7 +859,15 @@ impl<E: ExecutionLayer> H2Service<E> {
                 }
             }
             DriverAction::PayloadMissing { block_hash } => {
-                self.awaiting_bodies.insert(block_hash);
+                // The body may still be in flight on the block topic; ask
+                // for it too, as gov5 does, from everyone connected. An
+                // answer that arrives after the gossip copy is a duplicate
+                // the cache absorbs.
+                if self.awaiting_bodies.insert(block_hash) {
+                    for peer in self.transport.connected_peer_ids() {
+                        self.transport.request_block(peer, block_hash);
+                    }
+                }
                 events.push(ServiceEvent::PayloadMissing { block_hash });
             }
             DriverAction::Rejected { block_hash, reason } => {
@@ -870,6 +930,16 @@ impl<E: ExecutionLayer> H2Service<E> {
         }
     }
 
+    fn remember_body(&mut self, block_hash: B256, rlp: Vec<u8>) {
+        if self.body_store.insert(block_hash, rlp).is_none() {
+            self.body_store_order.push(block_hash);
+            while self.body_store_order.len() > REMEMBERED_BODIES {
+                let oldest = self.body_store_order.remove(0);
+                self.body_store.remove(&oldest);
+            }
+        }
+    }
+
     fn remember_block(&mut self, block_hash: B256, timestamp: u64, number: u64) {
         if self.block_timestamps.insert(block_hash, timestamp).is_none() {
             self.block_numbers.insert(block_hash, number);
@@ -887,8 +957,13 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// Publishes a block body, queueing it if the mesh is not ready.
     fn publish_body(&mut self, execution: &alloy_rpc_types_engine::ExecutionData) {
         let block_hash = execution.block_hash();
-        let data = match encode_block_gossip(execution, self.header_profile) {
-            Ok(data) => data,
+        let data = match encode_block_rlp(execution, self.header_profile)
+            .and_then(|rlp| compress_block_rlp(&rlp).map(|data| (rlp, data)))
+        {
+            Ok((rlp, data)) => {
+                self.remember_body(block_hash, rlp);
+                data
+            }
             Err(err) => {
                 // A block nobody else can receive is a block nobody else can
                 // vote on: the view is going to time out, and this is why.

@@ -595,11 +595,22 @@ measurement above was taken with it applied; it is on gov5's `main` as
 `95d47b46` (with a test), so a gov5 built from `main` needs nothing further.
 The patch file stays here for a checkout on an older branch.
 
-Not done, and what it costs: gov5 recovers from a same-height sibling — its
-own speculative block against the next leader's — by fetching the block from
-peers over `/rpc/block_by_hash/1/ssz_snappy`; this node does not serve it, so
-a Go member that falls into that state stays behind until restarted. Serving
-the request from the bodies this node already holds is the next item.
+**Fetch-on-miss.** gov5 recovers from anything it cannot place — the parent
+of a gossiped block, the block a proposal names, its own speculative sibling
+against the next leader's — by asking every connected peer for the block
+over `/rpc/block_by_hash/1/ssz_snappy`: a bare 32-byte hash, answered with
+a status byte, the fork digest, and the block RLP as one framed-snappy
+chunk. The transport now serves it from the bodies the service keeps (every
+block built or received, gov5's RLP, the last 4096) and asks for it itself
+when a proposal names a body it has not seen. Measured: a Go member started
+25 s late, eight blocks behind, asked, was served, "aligned and imported",
+and went on to lead — 41 blocks in 100 s, both clients at 41 with the same
+head, no errors.
+
+What a Go member still cannot do against Rust peers is start *far* behind:
+gov5's initial sync fetches ranges (`blocks_by_range`), which this node does
+not serve, so a member joining an old chain has to be handed a snapshot or
+started level with it.
 
 ## Live cross-client attach: how far it got
 
@@ -830,10 +841,10 @@ nothing.
 
 Ordered by dependency, not by value.
 
-0. **Serve gov5's block-fetch RPC** (`/rpc/block_by_hash/1/ssz_snappy`, and
-   `blocks_by_range` for a member that starts behind) from the bodies this
-   node holds, so a Go member recovers from a sibling or a restart without
-   help. See "Joining a Go fleet" for what a Go fleet needs and already gets.
+0. **Serve gov5's range sync** (`blocks_by_range`, `headers_by_range`) so a
+   Go member can join a chain it is far behind on; `block_by_hash` is
+   served already. See "Joining a Go fleet" for what a Go fleet needs and
+   already gets.
 1. **Run the observer against the live fleet.** Everything below the socket is
    tested; what remains is operational — point `h2_observer` at real fleet
    peers with the fleet's genesis hash and validator list, and confirm it

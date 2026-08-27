@@ -150,7 +150,18 @@ impl H2V4Observer {
     /// Returns `None` only if the swarm stream ends, which it does not do in
     /// normal operation.
     pub async fn next_event(&mut self) -> Option<ObserverEvent> {
-        let event = self.transport.next_event().await?;
+        let event = loop {
+            let event = self.transport.next_event().await?;
+            match event {
+                // An observer keeps no bodies; it answers so the peer does
+                // not wait out a timeout on it.
+                TransportEvent::BlockRequest { channel, .. } => {
+                    self.transport.respond_block(channel, None);
+                }
+                TransportEvent::BlockFetched { .. } | TransportEvent::BlockFetchFailed { .. } => {}
+                other => break other,
+            }
+        };
         Some(self.classify(event))
     }
 
@@ -190,6 +201,11 @@ impl H2V4Observer {
             // Native-topic traffic is not chain-bound; an observer trusts
             // only the v4 Decide proofs.
             TransportEvent::Native { from, .. } => ObserverEvent::NonDecide { from },
+            TransportEvent::BlockRequest { peer, .. }
+            | TransportEvent::BlockFetched { peer, .. }
+            | TransportEvent::BlockFetchFailed { peer, .. } => {
+                ObserverEvent::NonDecide { from: Some(peer) }
+            }
             TransportEvent::Subscribed => ObserverEvent::Subscribed,
             TransportEvent::PeerConnected(peer) => ObserverEvent::PeerConnected(peer),
             TransportEvent::PeerDisconnected(peer) => ObserverEvent::PeerDisconnected(peer),

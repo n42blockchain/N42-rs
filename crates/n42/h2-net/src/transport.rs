@@ -22,7 +22,9 @@
 //! enabled by default, because a QUIC dial to a node that only advertises TCP
 //! fails in a way that is easy to misread as a consensus problem.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+use alloy_primitives::B256;
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -34,7 +36,10 @@ use n42_h2_primitives::consensus::H2V4ChainIdentity;
 use n42_h2_wire::h2_v4::{decode_gossip, encode_gossip, H2V4Envelope, H2V4Error};
 
 use crate::config::gov5_gossipsub_config;
-use crate::rpc::{status_behaviour, StatusBehaviour};
+use crate::rpc::{
+    block_by_hash_behaviour, status_behaviour, BlockByHashBehaviour, BlockChunk, BlockReply,
+    StatusBehaviour,
+};
 use crate::status::Status;
 use crate::block_gossip::gov5_block_topic;
 use crate::topic::{fork_scoped_topic, h2_v4_topic};
@@ -159,6 +164,10 @@ impl TransportConfig {
     }
 }
 
+/// Where the answer to a [`TransportEvent::BlockRequest`] goes.
+#[derive(Debug)]
+pub struct BlockRequestChannel(request_response::ResponseChannel<BlockReply>);
+
 /// What the transport saw.
 #[derive(Debug)]
 pub enum TransportEvent {
@@ -192,6 +201,35 @@ pub enum TransportEvent {
         from: Option<PeerId>,
         /// The decoded message.
         message: Box<H2Message>,
+    },
+    /// A peer asked for a block by hash (gov5's fetch-on-miss). Answer with
+    /// [`H2V4Transport::respond_block`]; every request must be answered, a
+    /// dropped channel leaves the peer waiting out its timeout.
+    BlockRequest {
+        /// Who asked.
+        peer: PeerId,
+        /// The block they want.
+        hash: B256,
+        /// Where the answer goes.
+        channel: BlockRequestChannel,
+    },
+    /// A block this node asked for came back — or the peer said no.
+    BlockFetched {
+        /// Who answered.
+        peer: PeerId,
+        /// The block asked for.
+        hash: B256,
+        /// The block, or the peer's error.
+        reply: BlockReply,
+    },
+    /// A block request never got an answer.
+    BlockFetchFailed {
+        /// Who was asked.
+        peer: PeerId,
+        /// The block asked for.
+        hash: B256,
+        /// Why.
+        reason: String,
     },
     /// A block body arrived on the chain's block topic, still compressed.
     /// Which header shapes to accept is the consumer's decision — see
@@ -245,6 +283,11 @@ pub(crate) struct H2Behaviour {
     /// gov5 drops peers that cannot answer a status request, so this is not
     /// optional decoration — without it the connection dies within seconds.
     status: StatusBehaviour,
+    /// gov5's fetch-on-miss: how a member that missed a body, or holds a
+    /// competing sibling, catches up. Served from the bodies the consensus
+    /// layer keeps; a fleet member that does not answer leaves a Go peer
+    /// behind for good.
+    blocks: BlockByHashBehaviour,
     /// Not decoration either. go-libp2p-pubsub learns which peers speak
     /// gossipsub from the identify exchange (`EvtPeerIdentificationCompleted`,
     /// `peer_notify.go`): a peer that connects after startup and never
@@ -268,6 +311,9 @@ pub struct H2V4Transport {
     mesh_peers: HashSet<PeerId>,
     /// Events produced before the loop starts (dials that failed immediately).
     pending_events: Vec<TransportEvent>,
+    /// Block requests this node sent, by request id, so the answer can be
+    /// matched to the hash it was for.
+    block_requests: HashMap<request_response::OutboundRequestId, B256>,
     /// The head height this node advertises in its own status messages.
     advertised_height: u64,
 }
@@ -295,6 +341,7 @@ impl H2V4Transport {
             gossipsub: gossipsub::Behaviour::new(MessageAuthenticity::Anonymous, gossipsub_config)
                 .map_err(|e| TransportError::Behaviour(e.to_string()))?,
             status: status_behaviour(),
+            blocks: block_by_hash_behaviour(),
             identify: libp2p::identify::Behaviour::new(
                 libp2p::identify::Config::new(IDENTIFY_PROTOCOL_VERSION.into(), keypair.public())
                     .with_agent_version(format!("n42-rs/h2-net/{}", env!("CARGO_PKG_VERSION"))),
@@ -376,6 +423,7 @@ impl H2V4Transport {
             identity: config.identity,
             mesh_peers: HashSet::new(),
             pending_events: dial_errors,
+            block_requests: HashMap::new(),
             advertised_height: 0,
         })
     }
@@ -459,6 +507,32 @@ impl H2V4Transport {
             .count()
     }
 
+    /// Peers currently connected, for asking them things.
+    pub fn connected_peer_ids(&self) -> Vec<PeerId> {
+        self.swarm.connected_peers().copied().collect()
+    }
+
+    /// Asks `peer` for a block by hash. The answer arrives as
+    /// [`TransportEvent::BlockFetched`] or [`TransportEvent::BlockFetchFailed`].
+    pub fn request_block(&mut self, peer: PeerId, hash: B256) {
+        let id = self.swarm.behaviour_mut().blocks.send_request(&peer, hash);
+        self.block_requests.insert(id, hash);
+    }
+
+    /// Answers a [`TransportEvent::BlockRequest`]: the block's gov5 RLP, or
+    /// gov5's "not found" when this node does not have it.
+    pub fn respond_block(&mut self, channel: BlockRequestChannel, rlp: Option<Vec<u8>>) {
+        let reply = match rlp {
+            Some(rlp) => Ok(BlockChunk {
+                fork_digest: self.our_status().fork_digest(),
+                rlp,
+            }),
+            None => Err("block not found".to_owned()),
+        };
+        // A closed channel means the peer went away; nothing to do about it.
+        let _ = self.swarm.behaviour_mut().blocks.send_response(channel.0, reply);
+    }
+
     /// Publishes an already-encoded block body on the chain's block topic.
     ///
     /// Takes the compressed bytes from [`crate::block_gossip::encode_block_gossip`]
@@ -539,6 +613,48 @@ impl H2V4Transport {
                     );
                 }
                 SwarmEvent::Behaviour(H2BehaviourEvent::Identify(_)) => {}
+                SwarmEvent::Behaviour(H2BehaviourEvent::Blocks(
+                    request_response::Event::Message { peer, message, .. },
+                )) => match message {
+                    request_response::Message::Request {
+                        request, channel, ..
+                    } => {
+                        return Some(TransportEvent::BlockRequest {
+                            peer,
+                            hash: request,
+                            channel: BlockRequestChannel(channel),
+                        });
+                    }
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                    } => {
+                        if let Some(hash) = self.block_requests.remove(&request_id) {
+                            return Some(TransportEvent::BlockFetched {
+                                peer,
+                                hash,
+                                reply: response,
+                            });
+                        }
+                    }
+                },
+                SwarmEvent::Behaviour(H2BehaviourEvent::Blocks(
+                    request_response::Event::OutboundFailure {
+                        peer,
+                        request_id,
+                        error,
+                        ..
+                    },
+                )) => {
+                    if let Some(hash) = self.block_requests.remove(&request_id) {
+                        return Some(TransportEvent::BlockFetchFailed {
+                            peer,
+                            hash,
+                            reason: error.to_string(),
+                        });
+                    }
+                }
+                SwarmEvent::Behaviour(H2BehaviourEvent::Blocks(_)) => {}
                 SwarmEvent::Behaviour(H2BehaviourEvent::Status(
                     request_response::Event::Message { peer, message, .. },
                 )) => {

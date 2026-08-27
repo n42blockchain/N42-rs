@@ -213,9 +213,15 @@ pub fn frame_payload(ssz: &[u8]) -> Result<Vec<u8>, StatusError> {
 
 /// Decodes a framed payload produced by [`frame_payload`].
 pub fn unframe_payload(bytes: &[u8]) -> Result<Vec<u8>, StatusError> {
+    unframe_payload_limit(bytes, MAX_CHUNK_SIZE)
+}
+
+/// [`unframe_payload`] with a caller-chosen bound on the decoded size — gov5's
+/// block chunks allow 64 MiB where a status message allows 1 MiB.
+pub fn unframe_payload_limit(bytes: &[u8], max_decoded: u64) -> Result<Vec<u8>, StatusError> {
     use std::io::Read;
     let (len, consumed) = decode_varint(bytes)?;
-    if len > MAX_CHUNK_SIZE {
+    if len > max_decoded {
         return Err(StatusError::TooLong { got: len });
     }
     let mut out = vec![0u8; len as usize];
@@ -237,12 +243,17 @@ pub fn unframe_payload(bytes: &[u8]) -> Result<Vec<u8>, StatusError> {
 ///
 /// Returns `Ok(None)` when more bytes are needed.
 pub fn framed_len(bytes: &[u8]) -> Result<Option<usize>, StatusError> {
+    framed_len_limit(bytes, MAX_CHUNK_SIZE)
+}
+
+/// [`framed_len`] with a caller-chosen bound on the declared size.
+pub fn framed_len_limit(bytes: &[u8], max_decoded: u64) -> Result<Option<usize>, StatusError> {
     let (declared, consumed) = match decode_varint(bytes) {
         Ok(v) => v,
         Err(_) if bytes.len() < 10 => return Ok(None),
         Err(e) => return Err(e),
     };
-    if declared > MAX_CHUNK_SIZE {
+    if declared > max_decoded {
         return Err(StatusError::TooLong { got: declared });
     }
 

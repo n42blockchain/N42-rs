@@ -607,10 +607,24 @@ when a proposal names a body it has not seen. Measured: a Go member started
 and went on to lead — 41 blocks in 100 s, both clients at 41 with the same
 head, no errors.
 
-What a Go member still cannot do against Rust peers is start *far* behind:
-gov5's initial sync fetches ranges (`blocks_by_range`), which this node does
-not serve, so a member joining an old chain has to be handed a snapshot or
-started level with it.
+**Range sync.** gov5's other way of catching up — its initial sync when
+peers are ahead, and its leader-side catch-up when it finds itself behind by
+more than `blockProductionSyncGate` — is `/rpc/bodies_by_range/1/ssz_snappy`:
+an SSZ `{start: H256, count, step}` in one framed chunk, answered with the
+blocks in order as `block_by_hash`-style chunks until the stream closes.
+The transport serves it from the execution layer's canonical chain
+(`eth_getBlockByNumber` over the Engine API's auth endpoint, which carries
+the `eth_` methods the spec requires), up to gov5's 1024 blocks per request
+and stopping at the first block it lacks. Only `bodies_by_range` exists on
+the Go side; there is no headers-by-range handler.
+
+Measured with a Go member started 240 s late (some 45 blocks behind): it
+caught up and went on to lead, 65 blocks in 160 s, both clients at 65 with
+the same head, no errors — through gossip's future-block queue and
+fetch-on-miss, before its range catch-up had reason to fire. The range
+codec is checked against gov5's SSZ and chunk layout and over a real
+connection between two transports; a live gov5 range request has not been
+observed yet, because on this devnet the cheaper path always won.
 
 ## Live cross-client attach: how far it got
 
@@ -841,10 +855,11 @@ nothing.
 
 Ordered by dependency, not by value.
 
-0. **Serve gov5's range sync** (`blocks_by_range`, `headers_by_range`) so a
-   Go member can join a chain it is far behind on; `block_by_hash` is
-   served already. See "Joining a Go fleet" for what a Go fleet needs and
-   already gets.
+0. **A Rust member that starts behind.** Everything a Go member needs to
+   catch up is served; a Rust member's own execution layer is fed only by
+   the Engine API, so one that joins an old chain has no way to fill the
+   gap. Pulling `bodies_by_range` from a peer (the transport already asks)
+   and replaying it through `newPayload` is the missing half.
 1. **Run the observer against the live fleet.** Everything below the socket is
    tested; what remains is operational — point `h2_observer` at real fleet
    peers with the fleet's genesis hash and validator list, and confirm it

@@ -114,7 +114,7 @@ impl Status {
 
 /// Each 8-byte group is read big-endian into a `u64`, then written little-endian
 /// by SSZ — which is a byte reversal per group.
-fn encode_h256(value: &B256) -> [u8; 32] {
+pub(crate) fn encode_h256(value: &B256) -> [u8; 32] {
     let mut out = [0u8; 32];
     for group in 0..4 {
         let src = &value.as_slice()[group * 8..group * 8 + 8];
@@ -124,7 +124,7 @@ fn encode_h256(value: &B256) -> [u8; 32] {
     out
 }
 
-fn decode_h256(bytes: &[u8]) -> B256 {
+pub(crate) fn decode_h256(bytes: &[u8]) -> B256 {
     let mut out = [0u8; 32];
     for group in 0..4 {
         let word = u64::from_le_bytes(

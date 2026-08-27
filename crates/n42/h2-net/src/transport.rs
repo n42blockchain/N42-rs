@@ -37,8 +37,8 @@ use n42_h2_wire::h2_v4::{decode_gossip, encode_gossip, H2V4Envelope, H2V4Error};
 
 use crate::config::gov5_gossipsub_config;
 use crate::rpc::{
-    block_by_hash_behaviour, status_behaviour, BlockByHashBehaviour, BlockChunk, BlockReply,
-    StatusBehaviour,
+    block_by_hash_behaviour, bodies_by_range_behaviour, status_behaviour, BlockByHashBehaviour,
+    BlockChunk, BlockReply, BodiesByRangeBehaviour, RangeReply, RangeRequest, StatusBehaviour,
 };
 use crate::status::Status;
 use crate::block_gossip::gov5_block_topic;
@@ -168,6 +168,10 @@ impl TransportConfig {
 #[derive(Debug)]
 pub struct BlockRequestChannel(request_response::ResponseChannel<BlockReply>);
 
+/// Where the answer to a [`TransportEvent::RangeRequest`] goes.
+#[derive(Debug)]
+pub struct RangeRequestChannel(request_response::ResponseChannel<RangeReply>);
+
 /// What the transport saw.
 #[derive(Debug)]
 pub enum TransportEvent {
@@ -231,6 +235,26 @@ pub enum TransportEvent {
         /// Why.
         reason: String,
     },
+    /// A peer asked for a range of blocks by number (gov5's range sync,
+    /// how a member that starts behind catches up). Answer with
+    /// [`H2V4Transport::respond_range`].
+    RangeRequest {
+        /// Who asked.
+        peer: PeerId,
+        /// What they want.
+        request: RangeRequest,
+        /// Where the answer goes.
+        channel: RangeRequestChannel,
+    },
+    /// A range this node asked for came back — or the peer said no.
+    RangeFetched {
+        /// Who answered.
+        peer: PeerId,
+        /// What was asked.
+        request: RangeRequest,
+        /// The blocks, in order, or the peer's error.
+        reply: RangeReply,
+    },
     /// A block body arrived on the chain's block topic, still compressed.
     /// Which header shapes to accept is the consumer's decision — see
     /// [`crate::block_gossip::HeaderProfile`] — so it is not decoded here.
@@ -288,6 +312,8 @@ pub(crate) struct H2Behaviour {
     /// layer keeps; a fleet member that does not answer leaves a Go peer
     /// behind for good.
     blocks: BlockByHashBehaviour,
+    /// gov5's range sync, served from the execution layer's chain.
+    ranges: BodiesByRangeBehaviour,
     /// Not decoration either. go-libp2p-pubsub learns which peers speak
     /// gossipsub from the identify exchange (`EvtPeerIdentificationCompleted`,
     /// `peer_notify.go`): a peer that connects after startup and never
@@ -314,6 +340,8 @@ pub struct H2V4Transport {
     /// Block requests this node sent, by request id, so the answer can be
     /// matched to the hash it was for.
     block_requests: HashMap<request_response::OutboundRequestId, B256>,
+    /// Range requests this node sent, by request id.
+    range_requests: HashMap<request_response::OutboundRequestId, RangeRequest>,
     /// The head height this node advertises in its own status messages.
     advertised_height: u64,
 }
@@ -342,6 +370,7 @@ impl H2V4Transport {
                 .map_err(|e| TransportError::Behaviour(e.to_string()))?,
             status: status_behaviour(),
             blocks: block_by_hash_behaviour(),
+            ranges: bodies_by_range_behaviour(),
             identify: libp2p::identify::Behaviour::new(
                 libp2p::identify::Config::new(IDENTIFY_PROTOCOL_VERSION.into(), keypair.public())
                     .with_agent_version(format!("n42-rs/h2-net/{}", env!("CARGO_PKG_VERSION"))),
@@ -424,6 +453,7 @@ impl H2V4Transport {
             mesh_peers: HashSet::new(),
             pending_events: dial_errors,
             block_requests: HashMap::new(),
+            range_requests: HashMap::new(),
             advertised_height: 0,
         })
     }
@@ -517,6 +547,25 @@ impl H2V4Transport {
     pub fn request_block(&mut self, peer: PeerId, hash: B256) {
         let id = self.swarm.behaviour_mut().blocks.send_request(&peer, hash);
         self.block_requests.insert(id, hash);
+    }
+
+    /// Asks `peer` for a range of blocks. The answer arrives as
+    /// [`TransportEvent::RangeFetched`].
+    pub fn request_range(&mut self, peer: PeerId, request: RangeRequest) {
+        let id = self.swarm.behaviour_mut().ranges.send_request(&peer, request);
+        self.range_requests.insert(id, request);
+    }
+
+    /// Answers a [`TransportEvent::RangeRequest`] with the blocks this node
+    /// has, in order — as many as it could find from the start, which is
+    /// how gov5 serves a range it only partly holds.
+    pub fn respond_range(&mut self, channel: RangeRequestChannel, rlps: Vec<Vec<u8>>) {
+        let fork_digest = self.our_status().fork_digest();
+        let chunks = rlps
+            .into_iter()
+            .map(|rlp| BlockChunk { fork_digest, rlp })
+            .collect();
+        let _ = self.swarm.behaviour_mut().ranges.send_response(channel.0, Ok(chunks));
     }
 
     /// Answers a [`TransportEvent::BlockRequest`]: the block's gov5 RLP, or
@@ -655,6 +704,48 @@ impl H2V4Transport {
                     }
                 }
                 SwarmEvent::Behaviour(H2BehaviourEvent::Blocks(_)) => {}
+                SwarmEvent::Behaviour(H2BehaviourEvent::Ranges(
+                    request_response::Event::Message { peer, message, .. },
+                )) => match message {
+                    request_response::Message::Request {
+                        request, channel, ..
+                    } => {
+                        return Some(TransportEvent::RangeRequest {
+                            peer,
+                            request,
+                            channel: RangeRequestChannel(channel),
+                        });
+                    }
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                    } => {
+                        if let Some(request) = self.range_requests.remove(&request_id) {
+                            return Some(TransportEvent::RangeFetched {
+                                peer,
+                                request,
+                                reply: response,
+                            });
+                        }
+                    }
+                },
+                SwarmEvent::Behaviour(H2BehaviourEvent::Ranges(
+                    request_response::Event::OutboundFailure {
+                        peer,
+                        request_id,
+                        error,
+                        ..
+                    },
+                )) => {
+                    if let Some(request) = self.range_requests.remove(&request_id) {
+                        return Some(TransportEvent::RangeFetched {
+                            peer,
+                            request,
+                            reply: Err(error.to_string()),
+                        });
+                    }
+                }
+                SwarmEvent::Behaviour(H2BehaviourEvent::Ranges(_)) => {}
                 SwarmEvent::Behaviour(H2BehaviourEvent::Status(
                     request_response::Event::Message { peer, message, .. },
                 )) => {

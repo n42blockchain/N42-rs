@@ -158,7 +158,12 @@ impl H2V4Observer {
                 TransportEvent::BlockRequest { channel, .. } => {
                     self.transport.respond_block(channel, None);
                 }
-                TransportEvent::BlockFetched { .. } | TransportEvent::BlockFetchFailed { .. } => {}
+                TransportEvent::RangeRequest { channel, .. } => {
+                    self.transport.respond_range(channel, Vec::new());
+                }
+                TransportEvent::BlockFetched { .. }
+                | TransportEvent::BlockFetchFailed { .. }
+                | TransportEvent::RangeFetched { .. } => {}
                 other => break other,
             }
         };
@@ -203,7 +208,9 @@ impl H2V4Observer {
             TransportEvent::Native { from, .. } => ObserverEvent::NonDecide { from },
             TransportEvent::BlockRequest { peer, .. }
             | TransportEvent::BlockFetched { peer, .. }
-            | TransportEvent::BlockFetchFailed { peer, .. } => {
+            | TransportEvent::BlockFetchFailed { peer, .. }
+            | TransportEvent::RangeRequest { peer, .. }
+            | TransportEvent::RangeFetched { peer, .. } => {
                 ObserverEvent::NonDecide { from: Some(peer) }
             }
             TransportEvent::Subscribed => ObserverEvent::Subscribed,

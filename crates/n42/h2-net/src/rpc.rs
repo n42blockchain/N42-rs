@@ -19,8 +19,8 @@ use libp2p::request_response;
 use libp2p::StreamProtocol;
 
 use crate::status::{
-    frame_payload, framed_len_limit, unframe_payload_limit, Status, RESPONSE_CODE_SUCCESS,
-    STATUS_PROTOCOL,
+    decode_h256, encode_h256, frame_payload, framed_len_limit, unframe_payload_limit, Status,
+    RESPONSE_CODE_SUCCESS, STATUS_PROTOCOL,
 };
 use alloy_primitives::B256;
 
@@ -50,30 +50,49 @@ where
 
 /// Reads one `varint(len) ‖ framed-snappy` chunk, bounded both on the wire and
 /// once decoded.
+///
+/// Reads exactly the chunk and not a byte more: a range reply is several of
+/// these back to back on one stream, and a reader that buffered ahead would
+/// swallow the start of the next.
 async fn read_framed_limit<T>(io: &mut T, max_wire: usize, max_decoded: u64) -> io::Result<Vec<u8>>
 where
     T: AsyncRead + Unpin + Send,
 {
     let mut buf = Vec::with_capacity(128);
-    let mut chunk = [0u8; 4096];
+    // The length varint, a byte at a time.
+    loop {
+        let mut byte = [0u8; 1];
+        io.read_exact(&mut byte).await?;
+        buf.push(byte[0]);
+        if byte[0] < 0x80 {
+            break;
+        }
+        if buf.len() >= 10 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "length varint too long"));
+        }
+    }
+    // Then whole snappy frames — a 4-byte header naming the body length —
+    // until the declared length is accounted for.
     loop {
         if let Some(end) = framed_len_limit(&buf, max_decoded).map_err(to_io)? {
-            return unframe_payload_limit(&buf[..end], max_decoded).map_err(to_io);
+            if end != buf.len() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "frame ended mid snappy chunk"));
+            }
+            return unframe_payload_limit(&buf, max_decoded).map_err(to_io);
         }
-        if buf.len() > max_wire {
+        let mut header = [0u8; 4];
+        io.read_exact(&mut header).await?;
+        let body_len = u32::from_le_bytes([header[1], header[2], header[3], 0]) as usize;
+        if buf.len() + 4 + body_len > max_wire {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("frame exceeded {max_wire} bytes without completing"),
             ));
         }
-        let n = io.read(&mut chunk).await?;
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "stream ended mid frame",
-            ));
-        }
-        buf.extend_from_slice(&chunk[..n]);
+        buf.extend_from_slice(&header);
+        let start = buf.len();
+        buf.resize(start + body_len, 0);
+        io.read_exact(&mut buf[start..]).await?;
     }
 }
 
@@ -469,5 +488,224 @@ mod block_by_hash_tests {
         assert_eq!(wire, hash.as_slice());
         let back = block_on(codec.read_request(&proto, &mut futures::io::Cursor::new(wire))).unwrap();
         assert_eq!(back, hash);
+    }
+}
+
+/// gov5's range sync (`internal/sync/rpc_blocks_by_range.go`), which is how
+/// a member that starts behind catches up: `BodiesByRangeRequest {start,
+/// count, step}` as SSZ in one framed chunk, answered with the blocks in
+/// order, each as a `block_by_hash`-style chunk, the stream closing after the
+/// last. Only `bodies_by_range` is registered on the Go side; there is no
+/// headers-by-range handler to match.
+pub const BODIES_BY_RANGE_PROTOCOL: &str = "/rpc/bodies_by_range/1/ssz_snappy";
+
+/// The protocol as libp2p names it.
+pub fn bodies_by_range_protocol() -> StreamProtocol {
+    StreamProtocol::new(BODIES_BY_RANGE_PROTOCOL)
+}
+
+/// gov5's `maxRequestBlocks`: the most blocks one range request may name.
+pub const MAX_RANGE_BLOCKS: u64 = 1024;
+
+/// A range of blocks by number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RangeRequest {
+    /// First block number.
+    pub start: u64,
+    /// How many.
+    pub count: u64,
+    /// Stride; gov5 serves every request as stride 1.
+    pub step: u64,
+}
+
+/// SSZ size of the request: offset, count, step, then the 32-byte start.
+pub const RANGE_REQUEST_SSZ_LEN: usize = 4 + 8 + 8 + 32;
+
+impl RangeRequest {
+    /// gov5's SSZ: a container of `{StartBlockNumber: H256, Count: u64, Step:
+    /// u64}` where the H256 is variable-size (an offset in the fixed part),
+    /// and encoded as gov5 encodes a number in an H256 — four little-endian
+    /// words of the big-endian value.
+    pub fn to_ssz(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(RANGE_REQUEST_SSZ_LEN);
+        out.extend_from_slice(&20u32.to_le_bytes());
+        out.extend_from_slice(&self.count.to_le_bytes());
+        out.extend_from_slice(&self.step.to_le_bytes());
+        let start = B256::from(alloy_primitives::U256::from(self.start));
+        out.extend_from_slice(&encode_h256(&start));
+        out
+    }
+
+    /// The inverse.
+    pub fn from_ssz(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() != RANGE_REQUEST_SSZ_LEN {
+            return Err(format!("range request is {} bytes, want {RANGE_REQUEST_SSZ_LEN}", bytes.len()));
+        }
+        let offset = u32::from_le_bytes(bytes[0..4].try_into().expect("4 bytes"));
+        if offset != 20 {
+            return Err(format!("range request start offset {offset}, want 20"));
+        }
+        let count = u64::from_le_bytes(bytes[4..12].try_into().expect("8 bytes"));
+        let step = u64::from_le_bytes(bytes[12..20].try_into().expect("8 bytes"));
+        let start = decode_h256(&bytes[20..52]);
+        if start.as_slice()[..24].iter().any(|b| *b != 0) {
+            return Err("range request start does not fit a block number".into());
+        }
+        let start = u64::from_be_bytes(start.as_slice()[24..32].try_into().expect("8 bytes"));
+        Ok(Self { start, count, step })
+    }
+}
+
+/// What a range request comes back with: the blocks served, in order, or the
+/// peer's error.
+pub type RangeReply = Result<Vec<BlockChunk>, String>;
+
+/// The codec.
+#[derive(Debug, Clone, Default)]
+pub struct BodiesByRangeCodec;
+
+#[async_trait]
+impl request_response::Codec for BodiesByRangeCodec {
+    type Protocol = StreamProtocol;
+    type Request = RangeRequest;
+    type Response = RangeReply;
+
+    async fn read_request<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Request>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let ssz = read_framed(io).await?;
+        RangeRequest::from_ssz(&ssz).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    async fn read_response<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Response>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let mut chunks = Vec::new();
+        loop {
+            let mut code = [0u8; 1];
+            if io.read(&mut code).await? == 0 {
+                // The stream closing is how gov5 ends a range.
+                return Ok(Ok(chunks));
+            }
+            if code[0] != RESPONSE_CODE_SUCCESS {
+                let message = read_framed(io).await.unwrap_or_default();
+                return Ok(Err(format!("code {}: {}", code[0], String::from_utf8_lossy(&message))));
+            }
+            let mut fork_digest = [0u8; 4];
+            io.read_exact(&mut fork_digest).await?;
+            let rlp = read_framed_limit(io, MAX_BLOCK_WIRE_BYTES, MAX_BLOCK_CHUNK).await?;
+            chunks.push(BlockChunk { fork_digest, rlp });
+            if chunks.len() as u64 > MAX_RANGE_BLOCKS {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "peer served more blocks than a range allows"));
+            }
+        }
+    }
+
+    async fn write_request<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+        request: Self::Request,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        let framed = frame_payload(&request.to_ssz()).map_err(to_io)?;
+        io.write_all(&framed).await?;
+        io.close().await
+    }
+
+    async fn write_response<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+        reply: Self::Response,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        match reply {
+            Ok(chunks) => {
+                for chunk in chunks {
+                    io.write_all(&encode_block_reply(&Ok(chunk)).map_err(to_io)?).await?;
+                }
+            }
+            Err(message) => {
+                io.write_all(&encode_block_reply(&Err(message)).map_err(to_io)?).await?;
+            }
+        }
+        io.close().await
+    }
+}
+
+/// The request-response behaviour for the protocol.
+pub type BodiesByRangeBehaviour = request_response::Behaviour<BodiesByRangeCodec>;
+
+/// Serving and requesting.
+pub fn bodies_by_range_behaviour() -> BodiesByRangeBehaviour {
+    request_response::Behaviour::with_codec(
+        BodiesByRangeCodec,
+        [(bodies_by_range_protocol(), request_response::ProtocolSupport::Full)],
+        request_response::Config::default(),
+    )
+}
+
+#[cfg(test)]
+mod bodies_by_range_tests {
+    use super::*;
+    use futures::executor::block_on;
+    use libp2p::request_response::Codec as _;
+
+    #[test]
+    fn the_request_is_gov5s_ssz_container() {
+        let request = RangeRequest { start: 7, count: 64, step: 1 };
+        let ssz = request.to_ssz();
+        assert_eq!(ssz.len(), RANGE_REQUEST_SSZ_LEN);
+        assert_eq!(&ssz[0..4], &20u32.to_le_bytes());
+        assert_eq!(&ssz[4..12], &64u64.to_le_bytes());
+        assert_eq!(&ssz[12..20], &1u64.to_le_bytes());
+        // A number in an H256: the low word carries it, little-endian, in
+        // the last of the four words.
+        assert_eq!(&ssz[20..44], &[0u8; 24]);
+        assert_eq!(&ssz[44..52], &7u64.to_le_bytes());
+        assert_eq!(RangeRequest::from_ssz(&ssz).unwrap(), request);
+    }
+
+    #[test]
+    fn a_range_reply_is_chunks_until_the_stream_closes() {
+        let chunks = vec![
+            BlockChunk { fork_digest: [1, 2, 3, 4], rlp: vec![0xc4, 0xc0, 0xc0, 0xc0, 0xc0] },
+            BlockChunk { fork_digest: [1, 2, 3, 4], rlp: vec![0xc4, 0xc0, 0xc0, 0xc0, 0xc1] },
+        ];
+        let mut codec = BodiesByRangeCodec;
+        let proto = bodies_by_range_protocol();
+        let mut wire = Vec::new();
+        block_on(codec.write_response(&proto, &mut wire, Ok(chunks.clone()))).unwrap();
+        let back = block_on(codec.read_response(&proto, &mut futures::io::Cursor::new(wire))).unwrap();
+        assert_eq!(back, Ok(chunks));
+
+        let mut empty = Vec::new();
+        block_on(codec.write_response(&proto, &mut empty, Ok(vec![]))).unwrap();
+        assert!(empty.is_empty());
+        let none = block_on(codec.read_response(&proto, &mut futures::io::Cursor::new(empty))).unwrap();
+        assert_eq!(none, Ok(vec![]));
+
+        let mut refused = Vec::new();
+        block_on(codec.write_response(&proto, &mut refused, Err("no".into()))).unwrap();
+        let err = block_on(codec.read_response(&proto, &mut futures::io::Cursor::new(refused))).unwrap();
+        assert_eq!(err, Err("code 2: no".into()));
+    }
+
+    #[test]
+    fn the_request_round_trips_through_the_codec() {
+        let mut codec = BodiesByRangeCodec;
+        let proto = bodies_by_range_protocol();
+        let request = RangeRequest { start: 100, count: 3, step: 1 };
+        let mut wire = Vec::new();
+        block_on(codec.write_request(&proto, &mut wire, request)).unwrap();
+        let back = block_on(codec.read_request(&proto, &mut futures::io::Cursor::new(wire))).unwrap();
+        assert_eq!(back, request);
     }
 }

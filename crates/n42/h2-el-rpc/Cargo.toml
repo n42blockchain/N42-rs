@@ -18,6 +18,7 @@ alloy-primitives = { workspace = true, features = ["serde"] }
 # without selecting a crypto provider, which compiles and then panics on the
 # first token it signs. reth's own node-core requests the same feature.
 alloy-rpc-types-engine = { workspace = true, features = ["jwt-aws-lc-rs", "serde"] }
+alloy-rpc-types-eth = { workspace = true, features = ["serde"] }
 async-trait = "0.1"
 reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 serde = { workspace = true, features = ["derive"] }

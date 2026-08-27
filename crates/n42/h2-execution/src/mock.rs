@@ -56,6 +56,8 @@ impl Default for MockBehaviour {
 struct MockState {
     calls: Vec<ElCall>,
     next_block: u64,
+    /// Blocks this mock built, by number, for range requests.
+    built: std::collections::HashMap<u64, (alloy_consensus::Header, Vec<alloy_consensus::TxEnvelope>)>,
 }
 
 /// An [`ExecutionLayer`] that records calls instead of executing.
@@ -209,6 +211,13 @@ impl ExecutionLayer for MockExecutionLayer {
         })
     }
 
+    async fn block_by_number(
+        &self,
+        number: u64,
+    ) -> Result<Option<(alloy_consensus::Header, Vec<alloy_consensus::TxEnvelope>)>, ElError> {
+        Ok(self.state.lock().expect("mock state lock").built.get(&number).cloned())
+    }
+
     async fn resolve_payload(
         &self,
         id: PayloadId,
@@ -220,6 +229,14 @@ impl ExecutionLayer for MockExecutionLayer {
             state.next_block += 1;
             state.next_block
         };
-        Some(Ok(Self::built_block(number)))
+        let built = Self::built_block(number);
+        if let Ok(block) = built.execution_data.clone().try_into_block::<alloy_consensus::TxEnvelope>() {
+            self.state
+                .lock()
+                .expect("mock state lock")
+                .built
+                .insert(number, (block.header, block.body.transactions));
+        }
+        Some(Ok(built))
     }
 }

@@ -28,16 +28,19 @@ pub mod transport;
 
 pub use block_gossip::{
     compress_block_rlp, decode_block_gossip, decode_block_rlp, decompress_block_gossip,
-    encode_block_gossip, encode_block_rlp, gov5_block_topic, gov5_header_view, BlockGossipError,
+    encode_block_gossip, encode_block_rlp, encode_block_rlp_parts, gov5_block_topic, gov5_header_view, BlockGossipError,
     GossipBlock, HeaderProfile,
 };
-pub use rpc::{BlockChunk, BlockReply, BLOCK_BY_HASH_PROTOCOL};
+pub use rpc::{
+    BlockChunk, BlockReply, RangeReply, RangeRequest, BLOCK_BY_HASH_PROTOCOL,
+    BODIES_BY_RANGE_PROTOCOL, MAX_RANGE_BLOCKS,
+};
 pub use config::{gov5_gossipsub_config, max_gossip_wire_size};
 pub use message_id::{gov5_message_id_fn, gov5_message_id_parts};
 pub use observer::{H2V4Observer, ObserverConfig, ObserverError, ObserverEvent};
 pub use status::{Status, StatusError, STATUS_PROTOCOL};
 pub use topic::{h2_v4_topic, H2_V4_TOPIC, H2_V4_TOPIC_BASE};
 pub use transport::{
-    BlockRequestChannel, H2V4Transport, PublishError, TransportConfig, TransportError,
+    BlockRequestChannel, H2V4Transport, RangeRequestChannel, PublishError, TransportConfig, TransportError,
     TransportEvent,
 };

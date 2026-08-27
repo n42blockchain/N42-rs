@@ -156,12 +156,15 @@ pub fn encode_block_rlp(
     if calculate_transaction_root(&block.body.transactions) != block.header.transactions_root {
         return Err(BlockGossipError::TransactionRootMismatch);
     }
+    Ok(encode_block_rlp_parts(&block.header, &block.body.transactions))
+}
 
+/// The uncompressed wire form for a header and its transactions as they
+/// stand — what a node that already holds the block serves.
+pub fn encode_block_rlp_parts(header: &Header, transactions: &[TxEnvelope]) -> Vec<u8> {
     let mut header_rlp = Vec::new();
-    block.header.encode(&mut header_rlp);
-    let transaction_bytes = block
-        .body
-        .transactions
+    header.encode(&mut header_rlp);
+    let transaction_bytes = transactions
         .iter()
         .map(|transaction| Bytes::from(transaction.encoded_2718()))
         .collect::<Vec<_>>();
@@ -179,7 +182,7 @@ pub fn encode_block_rlp(
     transaction_bytes.encode(&mut encoded);
     verifiers.encode(&mut encoded);
     rewards.encode(&mut encoded);
-    Ok(encoded)
+    encoded
 }
 
 /// Decodes the uncompressed wire form.

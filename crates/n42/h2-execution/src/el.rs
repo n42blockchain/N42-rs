@@ -63,6 +63,17 @@ pub enum ResolveKind {
 /// The execution layer, as consensus sees it.
 #[async_trait::async_trait]
 pub trait ExecutionLayer: Send + Sync + 'static {
+    /// A canonical block by number, as its header and transactions, for
+    /// serving peers that sync by range. `None` when the execution layer
+    /// does not have it — or, in the default, does not offer the lookup.
+    async fn block_by_number(
+        &self,
+        number: u64,
+    ) -> Result<Option<(alloy_consensus::Header, Vec<alloy_consensus::TxEnvelope>)>, ElError> {
+        let _ = number;
+        Ok(None)
+    }
+
     /// Engine-API `newPayload` — insert and validate a block.
     async fn new_payload(&self, payload: ExecutionData) -> Result<PayloadStatus, ElError>;
 

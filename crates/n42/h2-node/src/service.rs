@@ -58,8 +58,8 @@ use n42_h2_consensus::{ConsensusEngine, ConsensusEvent, EngineOutput};
 use n42_h2_execution::{DriverAction, ExecutionDriver, ExecutionLayer};
 use alloy_rpc_types_engine::PayloadAttributes;
 use n42_h2_net::{
-    compress_block_rlp, decode_block_rlp, decompress_block_gossip, encode_block_rlp, H2V4Transport,
-    HeaderProfile, TransportEvent,
+    compress_block_rlp, decode_block_rlp, decompress_block_gossip, encode_block_rlp,
+    encode_block_rlp_parts, H2V4Transport, HeaderProfile, TransportEvent, MAX_RANGE_BLOCKS,
 };
 use n42_h2_primitives::consensus::{H2V4ChainIdentity, QuorumCertificate};
 use n42_h2_wire::{H2Message, H2V4Envelope};
@@ -200,6 +200,9 @@ pub struct H2Service<E> {
     received_bodies: Vec<B256>,
     /// Block bodies the mesh would not accept yet; retried like `outbox`.
     body_outbox: Vec<Vec<u8>>,
+    /// Range requests to answer from the execution layer on the next drain;
+    /// kept here because the transport handler cannot await.
+    pending_ranges: Vec<(String, n42_h2_net::RangeRequest, n42_h2_net::RangeRequestChannel)>,
     /// Every body this node built or received, as gov5 block RLP, to answer
     /// `block_by_hash` — gov5's fetch-on-miss, and this node's own. Bounded;
     /// insertion order in `body_store_order`.
@@ -307,6 +310,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             ready_bodies: Vec::new(),
             received_bodies: Vec::new(),
             body_outbox: Vec::new(),
+            pending_ranges: Vec::new(),
             body_store: std::collections::HashMap::new(),
             body_store_order: Vec::new(),
             block_timestamps: std::collections::HashMap::new(),
@@ -618,6 +622,16 @@ impl<E: ExecutionLayer> H2Service<E> {
             TransportEvent::BlockFetchFailed { peer, hash, reason } => {
                 debug!(target: "n42.h2.node", %peer, ?hash, reason, "block request failed");
             }
+            TransportEvent::RangeRequest { peer, request, channel } => {
+                // Served from the execution layer's canonical chain, which
+                // has every block, rather than from the body store, which
+                // has the recent ones. As many as it has from the start, in
+                // order; gov5 reads until the stream closes.
+                self.pending_ranges.push((peer.to_string(), request, channel));
+            }
+            TransportEvent::RangeFetched { peer, request, reply } => {
+                debug!(target: "n42.h2.node", %peer, ?request, blocks = reply.as_ref().map(Vec::len).ok(), "range reply");
+            }
             TransportEvent::StatusExchanged {
                 peer,
                 height,
@@ -680,6 +694,14 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// Not a `while let Some(..) = recv().await` loop: that would block waiting
     /// for the *next* output rather than stopping when the channel runs dry.
     async fn drain_outputs(&mut self, events: &mut Vec<ServiceEvent>) -> Result<(), ServiceError> {
+        for (peer, request, channel) in std::mem::take(&mut self.pending_ranges) {
+            // Only the execution layer is held across the await: the
+            // transport is not `Sync`, and a future holding all of `self`
+            // could not be spawned.
+            let rlps = serve_range(self.driver.execution_layer(), request).await;
+            debug!(target: "n42.h2.node", peer, ?request, served = rlps.len(), "peer asked for a range");
+            self.transport.respond_range(channel, rlps);
+        }
         for block_hash in std::mem::take(&mut self.received_bodies) {
             events.push(ServiceEvent::BodyReceived { block_hash });
         }
@@ -1008,4 +1030,24 @@ impl<E: ExecutionLayer> H2Service<E> {
     pub fn time_to_timeout(&self) -> Duration {
         self.engine.pacemaker().remaining()
     }
+}
+
+/// The blocks of a range an execution layer can produce, from the start
+/// until the first it does not have.
+async fn serve_range<E: ExecutionLayer>(el: &E, request: n42_h2_net::RangeRequest) -> Vec<Vec<u8>> {
+    let count = request.count.min(MAX_RANGE_BLOCKS);
+    let mut rlps = Vec::new();
+    for number in request.start..request.start.saturating_add(count) {
+        match el.block_by_number(number).await {
+            Ok(Some((header, transactions))) => {
+                rlps.push(encode_block_rlp_parts(&header, &transactions));
+            }
+            Ok(None) => break,
+            Err(err) => {
+                debug!(target: "n42.h2.node", number, %err, "execution layer could not serve a block");
+                break;
+            }
+        }
+    }
+    rlps
 }

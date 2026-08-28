@@ -1038,10 +1038,16 @@ impl<E: ExecutionLayer> H2Service<E> {
             self.proposal_deferred = false;
             return;
         }
-        // Marked before the build, not after: a build that fails should not be
-        // retried on every subsequent event in the same view, which would pin
-        // the loop against a broken execution layer.
-        let head = self.driver.head();
+        // The parent is the block the highest QC certifies, not whatever the
+        // execution layer imported last: a proposal has to extend its justify
+        // QC's block (the fleet refuses one that does not), and a leader that
+        // has yet to import that block — it joined after the block went round,
+        // or the QC reached it before the body — would otherwise propose a
+        // sibling from a stale head. Such a leader asks for the block and
+        // proposes once it has it; the genesis QC certifies nothing and leaves
+        // the head in charge.
+        let certified = self.engine.locked_qc().block_hash;
+        let head = if certified == B256::ZERO { self.driver.head() } else { certified };
         let head_header = match self.block_headers.get(&head) {
             Some(header) => Some(header.clone()),
             None => match self.driver.execution_layer().block_by_hash(head).await {
@@ -1053,6 +1059,19 @@ impl<E: ExecutionLayer> H2Service<E> {
                 }
             },
         };
+        if head != self.driver.head() && head_header.is_none() {
+            warn!(target: "n42.h2.node", view, certified = ?head, imported = ?self.driver.head(), "the block our highest QC certifies is not imported; asking for it before proposing");
+            if self.awaiting_bodies.insert(head) {
+                for peer in self.transport.connected_peer_ids() {
+                    self.transport.request_block(peer, head);
+                }
+            }
+            self.proposal_deferred = true;
+            return;
+        }
+        // Marked before the build, not after: a build that fails should not be
+        // retried on every subsequent event in the same view, which would pin
+        // the loop against a broken execution layer.
         let context = ProposalContext {
             view,
             head,
@@ -1069,7 +1088,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         };
         self.proposal_deferred = false;
         self.proposed_view = Some(view);
-        match self.driver.build_block(attrs, view).await {
+        match self.driver.build_block_on(head, attrs, view).await {
             Ok(built) => {
                 debug!(target: "n42.h2.node", view, block = ?built.hash, txs = built.tx_count, "built a block to propose");
                 // The proposal names the hash; the body has to get there by
@@ -1103,6 +1122,13 @@ impl<E: ExecutionLayer> H2Service<E> {
     ) -> Result<(), ServiceError> {
         match action {
             DriverAction::Consensus(event) => {
+                // The engine's extends rule reads the parent of an imported
+                // block; every block imported here came with its header.
+                if let ConsensusEvent::BlockImported(block_hash) = event.as_ref() {
+                    if let Some(header) = self.block_headers.get(block_hash) {
+                        self.engine.remember_parent(*block_hash, header.parent_hash);
+                    }
+                }
                 if let Err(err) = self.engine.process_event(*event) {
                     debug!(target: "n42.h2.node", %err, "engine rejected an execution event");
                 }
@@ -1198,9 +1224,9 @@ impl<E: ExecutionLayer> H2Service<E> {
                 return;
             }
         };
-        // One block behind is the normal state of a follower mid-import; a
-        // pull is for a gap consensus will not close by itself.
-        if height <= latest + 1 {
+        // Statuses arrive on connect, and a block the fleet gossiped before
+        // this node connected never comes by itself — however small the gap.
+        if height <= latest {
             return;
         }
         info!(target: "n42.h2.node", %peer, from = latest, to = height, "behind a peer; pulling the gap by range");

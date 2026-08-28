@@ -232,6 +232,10 @@ pub enum EngineOutput {
 pub(super) struct PendingProposal {
     pub(super) view: ViewNumber,
     pub(super) block_hash: B256,
+    /// The block the proposal's `justify_qc` certifies; the proposal has to
+    /// extend it (gov5's `extendsJustify`), which is checked once the
+    /// block's parent is known.
+    pub(super) justify_block: B256,
 }
 
 /// The HotStuff-2 consensus engine.
@@ -283,6 +287,9 @@ pub struct ConsensusEngine {
     /// Insertion order for bounded imported-block eviction. H2 import evidence
     /// survives view changes because a new leader can repropose the same block.
     pub(super) imported_block_fifo: VecDeque<B256>,
+    /// Parent hash of every imported block still in `imported_blocks`, as the
+    /// orchestrator reported it; what the extends rule reads.
+    pub(super) imported_parents: HashMap<B256, B256>,
     /// Tracks which block hash each validator voted for (equivocation detection).
     /// Tracks R1 (Vote) per validator per view for equivocation detection.
     pub(super) equivocation_tracker: HashMap<u32, B256>,
@@ -385,6 +392,7 @@ impl ConsensusEngine {
             pending_proposal: None,
             imported_blocks: HashSet::new(),
             imported_block_fifo: VecDeque::new(),
+            imported_parents: HashMap::new(),
             equivocation_tracker: HashMap::new(),
             commit_equivocation_tracker: HashMap::new(),
             proposal_equivocation_tracker: HashMap::new(),
@@ -492,6 +500,7 @@ impl ConsensusEngine {
             pending_proposal: None,
             imported_blocks: HashSet::new(),
             imported_block_fifo: VecDeque::new(),
+            imported_parents: HashMap::new(),
             equivocation_tracker: HashMap::new(),
             commit_equivocation_tracker: HashMap::new(),
             proposal_equivocation_tracker: HashMap::new(),
@@ -826,6 +835,14 @@ impl ConsensusEngine {
     pub fn is_leader_for_view(&self, view: u64) -> bool {
         self.local_validator_index_for_view(view)
             .is_some_and(|index| index == self.leader_index_for_view(view))
+    }
+
+    /// Records a block's parent ahead of its `BlockImported`, so the vote that
+    /// import releases can check the proposal extends its justify QC's block.
+    /// Unknown parents are tolerated by that check, so this is advisory — but
+    /// without it the rule cannot refuse anything.
+    pub fn remember_parent(&mut self, block_hash: B256, parent_hash: B256) {
+        self.imported_parents.insert(block_hash, parent_hash);
     }
 
     pub fn locked_qc(&self) -> &QuorumCertificate {
@@ -2636,6 +2653,56 @@ mod tests {
     }
 
     #[test]
+    fn test_h2_vote_refuses_a_proposal_that_does_not_extend_its_justify() {
+        // A justify QC at view 1 certifies `certified`; view 2's proposal has
+        // to be its child. A sibling (same parent as `certified`) is what a
+        // leader proposes from a head that never imported `certified`.
+        let genesis = B256::repeat_byte(0x42);
+        let certified = B256::repeat_byte(0xA1);
+        let vote_after = |block: B256, parent: B256| {
+            let (mut engine, sks, vs, mut rx) = make_engine(4, 0);
+            enable_test_h2(&mut engine);
+            let mut proposal = signed_h2_test_proposal(&engine, 2, block, 2, &sks[2]);
+            // Signed under the H2 profile, as the fleet's QCs are.
+            let mut collector =
+                crate::protocol::quorum::VoteCollector::new(1, certified, vs.len());
+            let message = engine.signing_profile.vote_message(1, certified);
+            for i in [0u32, 1, 2] {
+                collector
+                    .add_vote(i, engine.signing_profile.sign(&sks[i as usize], &message))
+                    .unwrap();
+            }
+            proposal.justify_qc = collector
+                .build_qc_with_profile_message(&vs, &message, engine.signing_profile)
+                .unwrap();
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                    proposal,
+                )))
+                .expect("the proposal itself is valid");
+            assert_eq!(engine.current_view(), 2, "the justify QC carries the engine to view 2");
+            engine.remember_parent(block, parent);
+            engine
+                .process_event(ConsensusEvent::BlockImported(block))
+                .expect("import is reported");
+            std::iter::from_fn(|| rx.try_recv().ok()).any(|output| {
+                matches!(
+                    output,
+                    EngineOutput::SendToValidator(_, ConsensusMessage::Vote(_))
+                )
+            })
+        };
+        assert!(
+            !vote_after(B256::repeat_byte(0xB2), genesis),
+            "a sibling of the certified block must not get a vote"
+        );
+        assert!(
+            vote_after(B256::repeat_byte(0xC3), certified),
+            "a child of the certified block gets one"
+        );
+    }
+
+    #[test]
     fn test_h2_vote_waits_for_execution_import() {
         let (mut engine, sks, _, mut rx) = make_engine(4, 0);
         enable_test_h2(&mut engine);
@@ -4014,6 +4081,7 @@ mod tests {
         engine.pending_proposal = Some(PendingProposal {
             view: engine.current_view(),
             block_hash: awaited,
+            justify_block: B256::ZERO,
         });
 
         for index in 0..128u64 {

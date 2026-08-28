@@ -224,11 +224,25 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         attrs: PayloadAttributes,
         view: u64,
     ) -> Result<BuiltBlock, ElError> {
+        self.build_block_on(self.head, attrs, view).await
+    }
+
+    /// Builds on `parent` rather than on the head: what a leader does when the
+    /// block its highest QC certifies is not the last block its execution
+    /// layer imported. The forkchoice that starts the build makes `parent`
+    /// the head (safe and finalized stay where they are), so the execution
+    /// layer has to know the block already.
+    pub async fn build_block_on(
+        &mut self,
+        parent: B256,
+        attrs: PayloadAttributes,
+        view: u64,
+    ) -> Result<BuiltBlock, ElError> {
         let updated = self
             .el
             .fork_choice_updated_with_attrs_for(
                 ExecutionPath::LIVE_SEQUENTIAL,
-                self.forkchoice(self.head),
+                self.forkchoice(parent),
                 attrs,
             )
             .await?;

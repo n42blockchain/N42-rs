@@ -440,8 +440,12 @@ impl ConsensusEngine {
             self.pending_proposal = Some(super::state_machine::PendingProposal {
                 view,
                 block_hash: proposal.block_hash,
+                justify_block: proposal.justify_qc.block_hash,
             });
             if self.imported_blocks.contains(&proposal.block_hash) {
+                if !self.extends_justify(proposal.block_hash) {
+                    return Ok(());
+                }
                 tracing::info!(target: "n42::interop::h2v4", view, block_hash = %proposal.block_hash, "import-gated vote: block already execution-validated");
                 self.send_vote(view, proposal.block_hash)?;
             } else {
@@ -621,10 +625,48 @@ impl ConsensusEngine {
             super::quorum::ConsensusSigningProfile::H2V4(_)
         );
         if let Some(view) = pending_vote_view.filter(|_| profile_is_h2_v4) {
+            if !self.extends_justify(block_hash) {
+                return Ok(());
+            }
             tracing::info!(target: "n42::interop::h2v4", view, %block_hash, "import-gated vote: execution validated, sending vote");
             self.send_vote(view, block_hash)?;
         }
         Ok(())
+    }
+
+    /// The extends rule: a proposal's block has to be a child of the block its
+    /// justify QC certifies. `is_safe_to_vote` compares views only, so without
+    /// this a leader that never imported the certified block can propose a
+    /// sibling of it from a stale head — and a quorum that votes on views
+    /// alone commits that sibling next to a block it already committed. gov5
+    /// refuses exactly this (`extendsJustify`); it wedges instead when a
+    /// Rust quorum does not.
+    ///
+    /// A genesis justify (no block) and an unknown parent pass, as they do in
+    /// gov5: the rule refuses what it can see, and never a vote it cannot judge.
+    fn extends_justify(&self, block_hash: B256) -> bool {
+        let Some(pending) = self.pending_proposal.as_ref() else {
+            return true;
+        };
+        if pending.justify_block == B256::ZERO {
+            return true;
+        }
+        let Some(parent) = self.imported_parents.get(&block_hash).copied() else {
+            return true;
+        };
+        // A zero parent is no parent: gov5 reads it as unknown, and so do
+        // the harness's mock blocks.
+        if parent == B256::ZERO {
+            return true;
+        }
+        if parent != pending.justify_block {
+            tracing::warn!(target: "n42::interop::h2v4",
+                view = pending.view, %block_hash, %parent, justify_block = %pending.justify_block,
+                "import-gated vote REFUSED: proposal does not extend its justify QC's block"
+            );
+            return false;
+        }
+        true
     }
 
     /// Drops the oldest import evidence, skipping the hash a deferred H2 vote is
@@ -652,6 +694,7 @@ impl ConsensusEngine {
                 continue;
             }
             self.imported_blocks.remove(&oldest);
+            self.imported_parents.remove(&oldest);
             return;
         }
     }

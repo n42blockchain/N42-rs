@@ -84,11 +84,21 @@ thread_local! {
     });
 }
 
+/// Runs `f` on this thread's scratch. A thread whose thread-locals are
+/// already being torn down (a codec called from a destructor as the thread
+/// exits) gets a scratch of its own for the call rather than a panic.
 fn with_scratch<T>(f: impl FnOnce(&mut Scratch) -> T) -> T {
-    SCRATCH.with(|cell| {
+    let mut f = Some(f);
+    match SCRATCH.try_with(|cell| {
         let mut scratch = cell.borrow_mut();
-        f(&mut scratch)
-    })
+        (f.take().expect("the closure runs once"))(&mut scratch)
+    }) {
+        Ok(out) => out,
+        Err(_destroyed) => {
+            let mut scratch = Scratch { encoder: snap::raw::Encoder::new(), block: Vec::new() };
+            (f.take().expect("try_with did not run the closure"))(&mut scratch)
+        }
+    }
 }
 
 /// Compresses `input` as one raw snappy block — the gossip form.

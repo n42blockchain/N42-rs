@@ -58,8 +58,22 @@ async fn read_framed_limit<T>(io: &mut T, max_wire: usize, max_decoded: u64) -> 
 where
     T: AsyncRead + Unpin + Send,
 {
-    let mut buf = Vec::with_capacity(128);
-    // The length varint, a byte at a time.
+    let declared = read_varint(io).await?;
+    if declared > max_decoded {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            crate::status::StatusError::TooLong { got: declared }.to_string(),
+        ));
+    }
+    read_framed_body(io, declared, max_wire).await
+}
+
+/// The varint that opens a chunk: the uncompressed length to come.
+async fn read_varint<T>(io: &mut T) -> io::Result<u64>
+where
+    T: AsyncRead + Unpin + Send,
+{
+    let mut buf = Vec::with_capacity(10);
     loop {
         let mut byte = [0u8; 1];
         io.read_exact(&mut byte).await?;
@@ -71,14 +85,24 @@ where
             return Err(io::Error::new(io::ErrorKind::InvalidData, "length varint too long"));
         }
     }
-    // Then whole snappy frames — a 4-byte header naming the body length —
-    // until the declared length is accounted for.
+    crate::status::decode_varint(&buf).map(|(value, _)| value).map_err(to_io)
+}
+
+/// The framed-snappy body of a chunk whose varint has been read and whose
+/// declared length has been accepted by the caller: whole snappy frames — a
+/// 4-byte header naming the body length — until `declared` bytes are
+/// accounted for, then decoded.
+async fn read_framed_body<T>(io: &mut T, declared: u64, max_wire: usize) -> io::Result<Vec<u8>>
+where
+    T: AsyncRead + Unpin + Send,
+{
+    let mut buf = crate::status::encode_varint(declared);
     loop {
-        if let Some(end) = framed_len_limit(&buf, max_decoded).map_err(to_io)? {
+        if let Some(end) = framed_len_limit(&buf, declared).map_err(to_io)? {
             if end != buf.len() {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "frame ended mid snappy chunk"));
             }
-            return unframe_payload_limit(&buf, max_decoded).map_err(to_io);
+            return unframe_payload_limit(&buf, declared).map_err(to_io);
         }
         let mut header = [0u8; 4];
         io.read_exact(&mut header).await?;
@@ -507,6 +531,18 @@ pub fn bodies_by_range_protocol() -> StreamProtocol {
 /// gov5's `maxRequestBlocks`: the most blocks one range request may name.
 pub const MAX_RANGE_BLOCKS: u64 = 1024;
 
+/// The most decoded bytes one range reply may carry, across all its blocks.
+///
+/// The per-block cap ([`MAX_BLOCK_CHUNK`], 64 MiB) times the block cap
+/// ([`MAX_RANGE_BLOCKS`]) is 64 GiB — a bound in name only. A reply is held
+/// whole until the stream closes (libp2p's request-response hands back one
+/// value), so what a peer can make this node buffer is what this constant
+/// says. gov5 has no such budget to match; 256 MiB is over a thousand
+/// blocks of a quarter megabyte each, well past what the devnet's blocks
+/// run, and an honest peer serving bigger blocks serves a shorter range —
+/// the requester asks for the rest from where the reply ended.
+pub const MAX_RANGE_BYTES: u64 = 256 << 20;
+
 /// A range of blocks by number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RangeRequest {
@@ -582,25 +618,7 @@ impl request_response::Codec for BodiesByRangeCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        let mut chunks = Vec::new();
-        loop {
-            let mut code = [0u8; 1];
-            if io.read(&mut code).await? == 0 {
-                // The stream closing is how gov5 ends a range.
-                return Ok(Ok(chunks));
-            }
-            if code[0] != RESPONSE_CODE_SUCCESS {
-                let message = read_framed(io).await.unwrap_or_default();
-                return Ok(Err(format!("code {}: {}", code[0], String::from_utf8_lossy(&message))));
-            }
-            let mut fork_digest = [0u8; 4];
-            io.read_exact(&mut fork_digest).await?;
-            let rlp = read_framed_limit(io, MAX_BLOCK_WIRE_BYTES, MAX_BLOCK_CHUNK).await?;
-            chunks.push(BlockChunk { fork_digest, rlp });
-            if chunks.len() as u64 > MAX_RANGE_BLOCKS {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "peer served more blocks than a range allows"));
-            }
-        }
+        read_range_reply(io, MAX_RANGE_BLOCKS, MAX_RANGE_BYTES).await
     }
 
     async fn write_request<T>(
@@ -637,6 +655,54 @@ impl request_response::Codec for BodiesByRangeCodec {
             }
         }
         io.close().await
+    }
+}
+
+/// Reads a range reply: block chunks until the stream closes, or a refusal.
+///
+/// Bounded three ways before anything is allocated for a chunk: the block
+/// count (`max_blocks` — the reply is refused at the first block past it,
+/// which is not read), the per-block declared length ([`MAX_BLOCK_CHUNK`]),
+/// and the running total of declared lengths (`max_bytes`, a budget for the
+/// whole reply). All three read the varint a chunk opens with, so a peer
+/// declaring past a bound costs one varint, not a buffer.
+async fn read_range_reply<T>(io: &mut T, max_blocks: u64, max_bytes: u64) -> io::Result<RangeReply>
+where
+    T: AsyncRead + Unpin + Send,
+{
+    let mut chunks = Vec::new();
+    let mut total = 0u64;
+    loop {
+        let mut code = [0u8; 1];
+        if io.read(&mut code).await? == 0 {
+            // The stream closing is how gov5 ends a range.
+            return Ok(Ok(chunks));
+        }
+        if code[0] != RESPONSE_CODE_SUCCESS {
+            let message = read_framed(io).await.unwrap_or_default();
+            return Ok(Err(format!("code {}: {}", code[0], String::from_utf8_lossy(&message))));
+        }
+        if chunks.len() as u64 >= max_blocks {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "peer served more blocks than a range allows"));
+        }
+        let mut fork_digest = [0u8; 4];
+        io.read_exact(&mut fork_digest).await?;
+        let declared = read_varint(io).await?;
+        if declared > MAX_BLOCK_CHUNK {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                crate::status::StatusError::TooLong { got: declared }.to_string(),
+            ));
+        }
+        total = total.saturating_add(declared);
+        if total > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("range reply exceeds the {max_bytes} byte budget at block {}", chunks.len() + 1),
+            ));
+        }
+        let rlp = read_framed_body(io, declared, MAX_BLOCK_WIRE_BYTES).await?;
+        chunks.push(BlockChunk { fork_digest, rlp });
     }
 }
 
@@ -707,5 +773,68 @@ mod bodies_by_range_tests {
         block_on(codec.write_request(&proto, &mut wire, request)).unwrap();
         let back = block_on(codec.read_request(&proto, &mut futures::io::Cursor::new(wire))).unwrap();
         assert_eq!(back, request);
+    }
+
+    fn reply_of(sizes: &[usize]) -> Vec<u8> {
+        let mut wire = Vec::new();
+        for (i, size) in sizes.iter().enumerate() {
+            let chunk = BlockChunk { fork_digest: [1, 2, 3, 4], rlp: vec![i as u8; *size] };
+            wire.extend_from_slice(&encode_block_reply(&Ok(chunk)).unwrap());
+        }
+        wire
+    }
+
+    #[test]
+    fn a_reply_past_the_byte_budget_is_refused_where_it_crosses_it() {
+        let wire = reply_of(&[100, 100, 100]);
+        // 300 bytes declared in all: fits a 300 budget, not a 299 one.
+        let ok = block_on(read_range_reply(&mut futures::io::Cursor::new(wire.clone()), 10, 300)).unwrap();
+        assert_eq!(ok.unwrap().len(), 3);
+        let err = block_on(read_range_reply(&mut futures::io::Cursor::new(wire.clone()), 10, 299)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("budget at block 3"), "{err}");
+        // The budget is on declared, uncompressed bytes, so a peer cannot
+        // slip under it by compressing well: 100 zero bytes frame to far
+        // fewer on the wire, and still count as 100.
+        assert!(wire.len() < 300, "wire is {} bytes", wire.len());
+        let err = block_on(read_range_reply(&mut futures::io::Cursor::new(wire), 10, 150)).unwrap_err();
+        assert!(err.to_string().contains("budget at block 2"), "{err}");
+    }
+
+    #[test]
+    fn a_reply_with_too_many_blocks_is_refused_at_the_first_extra_one() {
+        let wire = reply_of(&[5, 5, 5]);
+        let ok = block_on(read_range_reply(&mut futures::io::Cursor::new(wire.clone()), 3, 1 << 20)).unwrap();
+        assert_eq!(ok.unwrap().len(), 3);
+        // With a cap of two, the third block's status byte is read and the
+        // reply refused before its body is: the cursor stands at its digest.
+        let mut cursor = futures::io::Cursor::new(wire.clone());
+        let err = block_on(read_range_reply(&mut cursor, 2, 1 << 20)).unwrap_err();
+        assert!(err.to_string().contains("more blocks"), "{err}");
+        let two_blocks = reply_of(&[5, 5]).len();
+        assert_eq!(cursor.position() as usize, two_blocks + 1);
+    }
+
+    #[test]
+    fn a_block_declared_past_the_chunk_cap_is_refused_before_its_body() {
+        let mut wire = vec![RESPONSE_CODE_SUCCESS, 1, 2, 3, 4];
+        wire.extend_from_slice(&crate::status::encode_varint(MAX_BLOCK_CHUNK + 1));
+        wire.extend_from_slice(&[0u8; 64]);
+        let mut cursor = futures::io::Cursor::new(wire);
+        let err = block_on(read_range_reply(&mut cursor, MAX_RANGE_BLOCKS, MAX_RANGE_BYTES)).unwrap_err();
+        assert!(err.to_string().contains("exceeds max chunk size"), "{err}");
+        // Only the status, digest and varint were consumed.
+        assert_eq!(cursor.position(), 5 + crate::status::encode_varint(MAX_BLOCK_CHUNK + 1).len() as u64);
+    }
+
+    #[test]
+    fn the_codec_applies_the_production_bounds() {
+        // A thousand and twenty-five tiny blocks: past the block cap.
+        let wire = reply_of(&vec![1; MAX_RANGE_BLOCKS as usize + 1]);
+        let mut codec = BodiesByRangeCodec;
+        let proto = bodies_by_range_protocol();
+        let err = block_on(codec.read_response(&proto, &mut futures::io::Cursor::new(wire))).unwrap_err();
+        assert!(err.to_string().contains("more blocks"), "{err}");
+        assert_eq!(MAX_RANGE_BYTES, 256 * 1024 * 1024);
     }
 }

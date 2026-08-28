@@ -36,7 +36,7 @@ pub use block_gossip::{
 pub use libp2p::PeerId;
 pub use rpc::{
     BlockChunk, BlockReply, RangeReply, RangeRequest, BLOCK_BY_HASH_PROTOCOL,
-    BODIES_BY_RANGE_PROTOCOL, MAX_RANGE_BLOCKS,
+    BODIES_BY_RANGE_PROTOCOL, MAX_RANGE_BLOCKS, MAX_RANGE_BYTES,
 };
 pub use config::{gov5_gossipsub_config, max_gossip_wire_size};
 pub use message_id::{gov5_message_id_fn, gov5_message_id_parts};

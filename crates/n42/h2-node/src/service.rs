@@ -225,7 +225,10 @@ pub struct H2Service<E> {
     pending_status: Vec<(PeerId, u64)>,
     /// A catch-up in progress, if any.
     catch_up: Option<CatchUp>,
-    /// Range replies to import on the next drain.
+    /// Range replies to import on the next drain. Bounded without a cap of
+    /// its own: a reply comes only for a request this node made, one catch-up
+    /// runs at a time with one request in flight, and the transport holds a
+    /// reply to [`n42_h2_net::MAX_RANGE_BYTES`] of decoded blocks.
     pending_imports: Vec<(PeerId, RangeRequest, Vec<BlockChunk>)>,
     /// Block requests the store could not answer, for the execution layer
     /// on the next drain.

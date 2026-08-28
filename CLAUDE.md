@@ -58,8 +58,10 @@ re-sync even though `N42` and `N42_DEVNET` still exist in `crates/chainspec`. Pa
 
 `n42_devnet.json` is the native chain's devnet: `"stateScheme": "qmdb"`, `"consensus": "hotstuff"`
 with four dev validators (secrets in `n42_devnet_validators.json`, derived from a public seed — dev
-only), every Ethereum fork through Osaka active at genesis, and the Prague system contracts in the
-alloc. Both `--chain <path>` and the `N42_DEVNET` constant build its genesis header the same way, with
+only), every Ethereum fork through Osaka active at genesis, the Prague system contracts in the
+alloc, and gov5's production-shaped consensus settings: a 1 ETH `devBlockReward` with a faucet
+(paid as withdrawals), a 4096-key `committeePool` with 64 signers (every header links to the
+parent's committee evidence through `parentBeaconRoot`), and `epochLength` 20. Both `--chain <path>` and the `N42_DEVNET` constant build its genesis header the same way, with
 the QMDB root of the alloc; a genesis file that declares its own fork schedule is trusted over the
 legacy `N42_HARDFORKS` list. The same file is what a gov5 node is initialised from (`n42 init`).
 On a chain whose genesis names a `hotstuff` validator set `bin/n42` runs `HotStuffConsensus`

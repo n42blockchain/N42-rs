@@ -875,100 +875,113 @@ devnet genesis. gov5's production fleet is `mainnet_qmdb_staggered`
 (`params/chainspecs/mainnet_qmdb_staggered.json`, chain id 94, seven
 validators, period 3 s, head 13,013,133 replayed from mainnet history and
 resealed with BLS, 35 GB). Checked item by item against that chainspec and
-`internal/consensus/hotstuff/adapter.go`, a Rust member cannot join it yet.
-Blocking, in the order the fleet would refuse us:
+`internal/consensus/hotstuff/adapter.go`. `../N42-26` was checked for each
+item too: it has none of the first four (no rewards, committee pool, mobile
+anchor or EOF), a file-based epoch schedule and a consensus-state bootstrap
+bundle rather than a state snapshot, and its live interop ran on an isolated
+committee chain without rewards or a committee pool — so nothing there
+shortens this list.
 
-1. **Block reward and faucet credit.** `hotstuff.devBlockReward` is 1 ETH:
-   every block credits the coinbase and `devFaucetAddress` in `Finalize`
-   (`adapter.go` ~683) and lists both in `rewards`, whose `DeriveSha` is the
-   withdrawals root. Consensus-relevant: it is in the state root. This node
-   builds and executes blocks with no such credit, so its root differs from
-   gov5's on every block of chain 94, both directions. The natural mapping
-   is the Engine API's withdrawals (a reward in wei is a withdrawal in gwei;
-   1 ETH divides exactly): the normalizer would derive the two rewards from
-   the chainspec and the reconstruct would turn a gov5 block's `rewards`
-   into the payload's withdrawals. Small, but it has to be exact.
-2. **Committee evidence in `parentBeaconRoot`.** `committeePool` is
-   enabled (pool 200k, committee 512, ramp 1M blocks — long past at head
-   13M). With it wired, every header must carry
-   `ParentBeaconRoot = Blake3(parent's committee evidence)` and gov5's
-   `VerifyHeader` rejects anything else ("committee-evidence link broken").
-   This node writes the zero root, and to write the right one it needs the
-   committee pool itself: the seeded deterministic committee selection, the
-   per-block BLS evidence, its Blake3 commitment, and the
-   `consensus_registerCommitteeValidator` hand-over that replaces simulated
-   slots with real mobile validators. None of that is ported.
-3. **`MobileRegistryRoot`, a header field Ethereum does not have.** Under
+**Done since, each measured on the devnet genesis with a mixed fleet (one
+QMDB node, three Rust validators, one gov5 member; see the commits):**
+
+1. **Block reward and faucet credit.** `hotstuff.devBlockReward` (1 ETH)
+   credits the coinbase and `devFaucetAddress` in gov5's `Finalize`, listed
+   as the block's rewards and committed to in the withdrawals root — in every
+   block's state root. The rewards are now the Engine API's withdrawals (a
+   reward in wei is a withdrawal in gwei): a leader derives them from the
+   genesis into its payload attributes, the execution layer credits them
+   after the transactions as gov5 does, the normalizer writes gov5's root,
+   a gov5 block's rewards become the imported payload's withdrawals, and the
+   block wire form carries the list both ways. Measured: 100 s, 41 blocks,
+   both clients at 41 with the same head, the Go member sealing ten, zero
+   errors, the faucet holding 41 ETH on both.
+2. **Committee evidence in `parentBeaconRoot`.** With
+   `hotstuff.committeePool` enabled every header must carry
+   `Blake3(parent's committee evidence)`, which gov5's `VerifyHeader`
+   enforces. The evidence is deterministic — keys from a seed, a committee
+   drawn per block, one signature of the summed secret scalars — so
+   `n42_h2_consensus::committee_pool` rebuilds it from the parent header
+   alone, checked byte for byte against gov5's `blspool` output for a small
+   pool and for chain 94's 200,000-key pool
+   (`testdata/gov5_committee_evidence.txt`). A leader derives the root from
+   the head's header; the execution layer's HotStuff consensus checks every
+   imported header against the evidence it rebuilds. Measured with a
+   4096-key pool and 64 signers: 41 blocks, same head on both, block 5's
+   root the same non-zero evidence on both, zero errors. Not ported: the
+   hand-over of pool slots to real mobile validators
+   (`consensus_registerCommitteeValidator`); chain 94 has none registered.
+3. **Epoch boundaries** (`epochLength` 20, as `qs_epoch_test`): the epoch
+   arithmetic is the same on both sides (`(view-1)/length`, boundary at
+   `(view-1) % length == 0`). Measured over 150 s and 60 views, crossing
+   two boundaries: same head on both, the Go member sealing fifteen, zero
+   errors. Still unmeasured: a validator-set *change* at a boundary
+   (gov5's `ReconfigurationManager`, fed by `hotstuff_proposeAddValidator`),
+   which chain 94 has never exercised either.
+
+**Still blocking, in the order the fleet would refuse us:**
+
+4. **`MobileRegistryRoot`, a header field Ethereum does not have.** Under
    the `mobileAnchor` fork (active since 2026-07-18 on chain 94) gov5's
    miner stamps a 21st header field with the mobile-registry root when the
    node has an anchor provider. reth's `Header` cannot carry it, the Engine
    API cannot express it, and the alloy decoder refuses a header with it.
-   Whether the seven nodes are wired with the provider decides whether
-   this bites on day one; the field exists in the type either way.
-4. **Execution semantics beyond reth.** gov5's EVM has EOF
+   Whether the seven nodes are wired with the provider decides whether this
+   bites on day one; the field exists in the type either way.
+5. **Execution semantics beyond reth.** gov5's EVM has EOF
    (`internal/vm/eof.go`, `eofTime` 2025-12-09, active) — Ethereum dropped
    it and revm 42 has none; any EOF contract on chain 94 diverges. Fusaka
-   is active; Glamsterdam (`glamsterdamTime` 2027-01-01, gas repricing)
-   is not yet. `ltHashTime` is set but nothing in gov5 reads it today.
-5. **The fork schedule.** Shanghai at block 305,000 and Cancun at
-   3,935,000 are block-number forks; reth only knows them by timestamp, and
-   `beijingBlock`, `ltHashTime`, `mobileAnchorTime`, `eofTime`,
-   `glamsterdamTime` have no reth spelling at all. Irrelevant for a member
-   that starts at the head with every fork active, decisive for one that
-   has to execute history.
-6. **Bootstrapping 13 million blocks.** A member's execution layer is fed
-   only through the Engine API, so today it can only pull the whole chain
-   by `bodies_by_range` and re-execute it — days, and item 5 in the way.
-   gov5 has a QMDB snapshot (`internal/snapshot`) and a witness RPC
-   (`/n42/req/get_block_witness/1`); this repo verifies gov5's portable
-   snapshot stream (`twig_core::qmdb_compat::verify_portable_stream`) but
-   has no path from a snapshot into a live QMDB forest plus reth's plain
-   state at the head. Without it a Rust member never reaches the head.
-7. **Epoch reconfiguration parity.** `epochLength` is 200 with a real
-   `ReconfigurationManager` on the Go side; this engine has epochs and
-   staged transitions of its own, but the two have never been run against
-   each other — the devnet genesis has no epochs. `qs_epoch_test`
-   (chain 95, epochLength 20, same validators) is the chain to prove it
-   on before chain 94.
+   is active; Glamsterdam (`glamsterdamTime` 2027-01-01, gas repricing) is
+   not yet. `ltHashTime` is set but nothing in gov5 reads it today.
+6. **The fork schedule.** Shanghai at block 305,000 and Cancun at
+   3,935,000 are block-number forks. reth's `is_shanghai_active_at_timestamp`
+   is false for a `ForkCondition::Block`, so even at the head — where Prague
+   by timestamp picks the right EVM spec — the withdrawals checks would
+   refuse every block. The fix is in the genesis loader: map each block-number
+   fork to the timestamp of that block (known from the chain; timestamps are
+   monotonic, so the schedules are equivalent). `beijingBlock`, `ltHashTime`,
+   `mobileAnchorTime`, `eofTime`, `glamsterdamTime` have no reth spelling;
+   only `eofTime` and `mobileAnchorTime` change anything executable.
+7. **Bootstrapping 13 million blocks.** A member's execution layer is fed
+   only through the Engine API, so today it can only pull the whole chain by
+   `bodies_by_range` and re-execute it. gov5's `cmd/n42-qmdb-export` writes
+   the cross-client portable snapshot this repo already verifies
+   (`twig_core::qmdb_compat::verify_portable_stream`); what is missing is
+   the path from that stream into a live QMDB forest plus reth's plain state
+   and headers at the head.
 8. **Transactions.** gov5 members generate load with `--dev.txgen` and
    gossip transactions among themselves over libp2p; nothing delivers them
-   to this node's reth pool, so a Rust leader would seal blocks empty of
-   the fleet's transactions. Not a consensus failure, but not an equal
-   member either.
+   to this node's reth pool, so a Rust leader would seal blocks empty of the
+   fleet's transactions. Not a consensus failure, but not an equal member.
 
 And one thing that is not ours: on that fleet gov5 itself wedges after a
 handful of blocks at a fork-active head (`docs/mainnet_qmdb_staggered-
 7node-status.md`, "Layer 5": competing same-height blocks are never
 reconciled below the head pointer). A Rust member would meet the same
-wedge; whether it should tolerate or expose it is a question for when
-the rest is done.
+wedge; whether it should tolerate or expose it is a question for when the
+rest is done.
 
-What the devnet work already covers, and needs no repeat: the header
-profile and its three roots, the native consensus topic and the v4
-Decide topic, identify, the system-caller leaf, the two clocks,
-`block_by_hash`, `bodies_by_range`, range catch-up, fetch-on-miss, the
-secp256k1 identities, static peers (`--p2p.peer` is how the fleet is
-wired too), and the `interopV4` signing profile.
+The devnet genesis now carries the production shape for everything above
+that is done: a 1 ETH reward with the faucet, a 4096-key committee pool with
+64 signers, epochs of 20 views.
 
 ## Roadmap
 
-Ordered by dependency, not by value. Items 2–4 of the previous roadmap —
-the HotStuff-2 core, the reth upgrade (now v2.5.1) and QMDB as the live
-state backend — are done; what follows is the production-fleet list
-above in build order.
+Ordered by dependency, not by value. Rewards, the committee-evidence link
+and epoch boundaries are done and measured (above); what follows is the
+rest of the production-fleet list in build order.
 
-0. **Rewards as withdrawals** (item 1): derive from the chainspec, map
-   both ways, prove on a chain-94-shaped devnet genesis (`devBlockReward`
-   and `devFaucetAddress` set) with a mixed fleet.
-1. **Committee pool** (item 2): port selection, evidence, commitment and
-   registration; prove on the same devnet with `committeePool` enabled.
-2. **qs_epoch_test** (item 7): run the mixed fleet on chain 95 and watch
-   an epoch boundary.
-3. **Snapshot bootstrap** (item 6): gov5 portable snapshot → QMDB forest
-   + reth plain state at head; then `--chain` chain 94 with block-number
-   forks mapped (item 5) so the member starts at the head.
-4. **Header field and EVM parity** (items 3–4): `MobileRegistryRoot`
-   needs a header extension on the reth side; EOF is a revm question.
+0. **Snapshot bootstrap** (item 7): `n42-qmdb-export` stream → QMDB forest
+   + reth plain state and headers at the head, so a member starts there.
+1. **The fork schedule** (item 6): block-number forks mapped to their
+   blocks' timestamps in the genesis loader; then `--chain` chain 94.
+2. **Validator-set changes at a boundary** (item 3's remainder): drive
+   `hotstuff_proposeAddValidator` on a mixed devnet and watch both sides
+   take the new set.
+3. **Header field and EVM parity** (items 4–5): `MobileRegistryRoot` needs
+   a header extension on the reth side; EOF is a revm question.
+4. **Transactions** (item 8): subscribe to gov5's transaction gossip and
+   feed the reth pool.
 5. **Rejoining after a long absence, measured over hours**, and the
    observer against the live fleet — the two operational items from
    before, unchanged.

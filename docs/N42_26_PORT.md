@@ -936,6 +936,17 @@ QMDB node, three Rust validators, one gov5 member; see the commits):**
    same head as the main execution layer and gov5, zero errors. Chain 94's
    35 GB will be the first real test of the sizes involved; the forest is
    held in memory, which is its own item.
+5. **The chain's identity, and the fork schedule.** `n42-gov5-genesis`
+   folds gov5's chainspec, allocation (decimal balances, base64 code) and
+   genesis-block fields into a genesis this node loads, and checks the
+   result against the hash gov5 records: chain 94 (`0xa2d2ff5d…`, a
+   2762-account allocation whose QMDB root this node computes identically)
+   and chain 95 both reproduce, so the fork digest on the wire is right.
+   The block-number forks become timestamps with `--fork-time` — the
+   timestamps of blocks 305,000 and 3,935,000, one RPC call each — which is
+   the equivalent schedule on a chain whose timestamps only grow. The
+   generated files are under `crates/chainspec/res/genesis/gov5/`. gov5's
+   own forks stay untranslated and inert (see item 6 below).
 
 **Still blocking, in the order the fleet would refuse us:**
 
@@ -951,15 +962,10 @@ QMDB node, three Rust validators, one gov5 member; see the commits):**
    it and revm 42 has none; any EOF contract on chain 94 diverges. Fusaka
    is active; Glamsterdam (`glamsterdamTime` 2027-01-01, gas repricing) is
    not yet. `ltHashTime` is set but nothing in gov5 reads it today.
-6. **The fork schedule.** Shanghai at block 305,000 and Cancun at
-   3,935,000 are block-number forks. reth's `is_shanghai_active_at_timestamp`
-   is false for a `ForkCondition::Block`, so even at the head — where Prague
-   by timestamp picks the right EVM spec — the withdrawals checks would
-   refuse every block. The fix is in the genesis loader: map each block-number
-   fork to the timestamp of that block (known from the chain; timestamps are
-   monotonic, so the schedules are equivalent). `beijingBlock`, `ltHashTime`,
-   `mobileAnchorTime`, `eofTime`, `glamsterdamTime` have no reth spelling;
-   only `eofTime` and `mobileAnchorTime` change anything executable.
+6. **gov5's own forks.** `beijingBlock`, `ltHashTime`, `mobileAnchorTime`,
+   `eofTime`, `glamsterdamTime` have no reth spelling and are carried
+   through the genesis inert; only `eofTime` and `mobileAnchorTime` change
+   anything executable (items 4 and 5).
 7. **Transactions.** gov5 members generate load with `--dev.txgen` and
    gossip transactions among themselves over libp2p; nothing delivers them
    to this node's reth pool, so a Rust leader would seal blocks empty of the
@@ -982,15 +988,13 @@ Ordered by dependency, not by value. Rewards, the committee-evidence link
 and epoch boundaries are done and measured (above); what follows is the
 rest of the production-fleet list in build order.
 
-0. **The fork schedule** (item 6): block-number forks mapped to their
-   blocks' timestamps in the genesis loader; then `--chain` chain 94.
-1. **Validator-set changes at a boundary** (item 3's remainder): per
+0. **Validator-set changes at a boundary** (item 3's remainder): per
    `docs/VALIDATOR_LIFECYCLE_DESIGN.md`, phases 0–1 first — a non-zero
    `changes_hash` and proposals as transactions — then the measurement.
-2. **Header field and EVM parity** (items 4–5): `MobileRegistryRoot` needs
+1. **Header field and EVM parity** (items 4–6): `MobileRegistryRoot` needs
    a header extension on the reth side; EOF is a revm question.
-3. **Transactions** (item 7): subscribe to gov5's transaction gossip and
+2. **Transactions** (item 7): subscribe to gov5's transaction gossip and
    feed the reth pool.
-4. **Rejoining after a long absence, measured over hours**, and the
+3. **Rejoining after a long absence, measured over hours**, and the
    observer against the live fleet — the two operational items from
    before, unchanged.

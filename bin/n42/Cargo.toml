@@ -50,6 +50,7 @@ reth-db-api.workspace = true
 reth-static-file-types.workspace = true
 reth-db-common.workspace = true
 reth-cli-commands.workspace = true
+reth-cli.workspace = true
 reth-payload-builder.workspace = true
 reth-payload-primitives.workspace = true
 reth-node-api.workspace = true
@@ -156,3 +157,7 @@ path = "src/main.rs"
 [[bin]]
 name = "n42-init-snapshot"
 path = "src/init_snapshot.rs"
+
+[[bin]]
+name = "n42-gov5-genesis"
+path = "src/gov5_genesis.rs"

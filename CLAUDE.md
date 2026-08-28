@@ -74,7 +74,10 @@ an older branch). `GOV5_DELAY=<s>` starts the Go member late; `LATE_VALIDATOR=<i
 starts one Rust member late with its own fresh execution layer, so it has to pull the chain by range;
 `LATE_SNAPSHOT=<dir>` initialises that execution layer at a chain's head instead
 (`n42-init-snapshot init`, from gov5's `n42-reth-state-dump` JSONL + header and a portable QMDB
-snapshot — `n42-qmdb-export` or `n42-init-snapshot export`), so it pulls only what came after. `docs/N42_26_PORT.md` "Joining a Go fleet"
+snapshot — `n42-qmdb-export` or `n42-init-snapshot export`), so it pulls only what came after.
+`n42-gov5-genesis` folds gov5's chainspec + alloc + genesis-block fields into a genesis this node
+loads and checks the hash; `crates/chainspec/res/genesis/gov5/` holds chain 94 and 95 (see its
+README for the `--fork-time` step before running on them). `docs/N42_26_PORT.md` "Joining a Go fleet"
 lists every cross-client rule that had to be matched.
 
 `cargo build`/`cargo test` with no `-p` only touches `default-members` (`bin/n42`). Use `--workspace`

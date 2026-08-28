@@ -948,6 +948,20 @@ QMDB node, three Rust validators, one gov5 member; see the commits):**
    generated files are under `crates/chainspec/res/genesis/gov5/`. gov5's
    own forks stay untranslated and inert (see item 6 below).
 
+6. **Transactions, both ways.** A validator started with `--el-rpc <url>`
+   polls its execution layer's pool (`txpool_content`, every 500 ms) and
+   publishes what it finds on gov5's `transaction_v2` topic in gov5's batch
+   framing (`0x7e` + RLP list of raw EIP-2718 transactions, at most 256 per
+   batch and 256 KiB, `n42-h2-net::tx_gossip`); every transaction arriving
+   on that topic — a batch or a bare transaction — is handed to the
+   execution layer with `eth_sendRawTransaction`. Measured on the mixed
+   fleet with `examples/send_tx`: transactions submitted only to gov5's RPC
+   were sealed by a Rust leader (block 25, validator 1), and every
+   transaction submitted only to the Rust execution layer appeared in gov5's
+   pool by gossip (its debug log rejects them with `nonce too low`, because
+   the Rust leader had sealed them, at 1 s a block, before the batch
+   arrived). `scripts/devnet-fleet.sh` passes `--el-rpc` to every validator.
+
 **Still blocking, in the order the fleet would refuse us:**
 
 4. **`MobileRegistryRoot`, a header field Ethereum does not have.** Under
@@ -966,10 +980,6 @@ QMDB node, three Rust validators, one gov5 member; see the commits):**
    `eofTime`, `glamsterdamTime` have no reth spelling and are carried
    through the genesis inert; only `eofTime` and `mobileAnchorTime` change
    anything executable (items 4 and 5).
-7. **Transactions.** gov5 members generate load with `--dev.txgen` and
-   gossip transactions among themselves over libp2p; nothing delivers them
-   to this node's reth pool, so a Rust leader would seal blocks empty of the
-   fleet's transactions. Not a consensus failure, but not an equal member.
 
 And one thing that is not ours: on that fleet gov5 itself wedges after a
 handful of blocks at a fork-active head (`docs/mainnet_qmdb_staggered-
@@ -993,8 +1003,9 @@ rest of the production-fleet list in build order.
    `changes_hash` and proposals as transactions — then the measurement.
 1. **Header field and EVM parity** (items 4–6): `MobileRegistryRoot` needs
    a header extension on the reth side; EOF is a revm question.
-2. **Transactions** (item 7): subscribe to gov5's transaction gossip and
-   feed the reth pool.
+2. **Transactions** (item 7): done (item 6 above); what remains is
+   gov5's own optimisation of announcing a hash before a body, if it ever
+   gets one.
 3. **Rejoining after a long absence, measured over hours**, and the
    observer against the live fleet — the two operational items from
    before, unchanged.

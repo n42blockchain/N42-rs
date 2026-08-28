@@ -7596,7 +7596,10 @@ dependencies = [
 name = "n42"
 version = "2.1.5"
 dependencies = [
+ "alloy-consensus 2.4.1",
+ "alloy-genesis",
  "alloy-primitives 1.7.1",
+ "alloy-rlp",
  "alloy-rpc-types",
  "alloy-signer-local",
  "aquamarine",
@@ -7613,11 +7616,15 @@ dependencies = [
  "n42-qmdb-reth",
  "pubsub-mem",
  "reth-chainspec",
+ "reth-cli",
+ "reth-cli-commands",
  "reth-cli-runner",
  "reth-cli-util",
  "reth-consensus",
  "reth-consensus-common",
  "reth-db",
+ "reth-db-api",
+ "reth-db-common",
  "reth-ethereum-cli",
  "reth-ethereum-payload-builder",
  "reth-ethereum-primitives",
@@ -7640,9 +7647,12 @@ dependencies = [
  "reth-rpc-eth-types",
  "reth-rpc-server-types",
  "reth-rpc-types-compat",
+ "reth-static-file-types",
  "reth-tasks",
  "reth-tokio-util",
  "reth-transaction-pool",
+ "serde",
+ "serde_json",
  "similar-asserts",
  "tempfile",
  "tokio",
@@ -7950,6 +7960,7 @@ name = "n42-h2-execution"
 version = "2.1.5"
 dependencies = [
  "alloy-consensus 2.4.1",
+ "alloy-eips 2.4.1",
  "alloy-primitives 1.7.1",
  "alloy-rpc-types-engine 2.4.1",
  "async-trait",
@@ -7990,8 +8001,12 @@ dependencies = [
 name = "n42-h2-node"
 version = "2.1.5"
 dependencies = [
+ "alloy-consensus 2.4.1",
+ "alloy-eips 2.4.1",
  "alloy-primitives 1.7.1",
  "alloy-rpc-types-engine 2.4.1",
+ "alloy-signer 2.4.1",
+ "alloy-signer-local",
  "futures",
  "hex",
  "libp2p",
@@ -8003,6 +8018,7 @@ dependencies = [
  "n42-h2-wire",
  "n42-mobile-service",
  "n42-qmdb-reth",
+ "reqwest 0.13.4",
  "reth-cli",
  "serde",
  "serde_json",

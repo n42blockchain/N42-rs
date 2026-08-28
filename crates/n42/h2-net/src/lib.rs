@@ -18,6 +18,7 @@
 //! See `docs/N42_26_PORT.md`.
 
 pub mod block_gossip;
+pub mod tx_gossip;
 pub mod config;
 pub mod message_id;
 pub mod observer;
@@ -46,3 +47,4 @@ pub use transport::{
     BlockRequestChannel, H2V4Transport, RangeRequestChannel, PublishError, TransportConfig, TransportError,
     TransportEvent,
 };
+pub use tx_gossip::{decode_tx_batch, encode_tx_batch, TxGossipError, TX_BATCH_MAX_BYTES, TX_BATCH_MAX_TXS};

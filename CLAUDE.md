@@ -75,6 +75,9 @@ starts one Rust member late with its own fresh execution layer, so it has to pul
 `LATE_SNAPSHOT=<dir>` initialises that execution layer at a chain's head instead
 (`n42-init-snapshot init`, from gov5's `n42-reth-state-dump` JSONL + header and a portable QMDB
 snapshot — `n42-qmdb-export` or `n42-init-snapshot export`), so it pulls only what came after.
+Every validator gets `--el-rpc <url>` (the execution layer's public RPC): it gossips its pool's
+transactions on gov5's `transaction_v2` topic and hands gossiped ones to `eth_sendRawTransaction`
+(`examples/send_tx` submits signed transfers to either client's RPC for this).
 `n42-gov5-genesis` folds gov5's chainspec + alloc + genesis-block fields into a genesis this node
 loads and checks the hash; `crates/chainspec/res/genesis/gov5/` holds chain 94 and 95 (see its
 README for the `--fork-time` step before running on them). `docs/N42_26_PORT.md` "Joining a Go fleet"

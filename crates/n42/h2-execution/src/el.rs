@@ -131,6 +131,13 @@ pub trait ExecutionLayer: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// Hands a transaction to the execution layer's pool
+    /// (`eth_sendRawTransaction`), returning its hash. The default declines:
+    /// an execution layer that does not offer the method.
+    async fn send_raw_transaction(&self, raw: alloy_primitives::Bytes) -> Result<B256, ElError> {
+        let _ = raw;
+        Err(ElError::new("the execution layer does not accept transactions here"))
+    }
     /// Engine-API `newPayload` — insert and validate a block.
     async fn new_payload(&self, payload: ExecutionData) -> Result<PayloadStatus, ElError>;
 

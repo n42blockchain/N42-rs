@@ -66,13 +66,13 @@ for i in $(seq 0 $LAST); do
         --disable-discovery --ipcdisable > $F/el-late-$TAG.log 2>&1 &
       for _ in $(seq 1 60); do grep -aq "RPC auth server started" $F/el-late-$TAG.log 2>/dev/null && break; sleep 1; done
       RUST_LOG=${RUST_LOG_V:-n42=debug} $BIN/examples/h2_validator --chain $GENESIS --index $i \
-        --bls-key $(cat $F/keys/validator-$i.key) --el http://127.0.0.1:18561 --jwt $F/jwt.hex \
+        --bls-key $(cat $F/keys/validator-$i.key) --el http://127.0.0.1:18561 --el-rpc http://127.0.0.1:18555 --jwt $F/jwt.hex \
         --listen /ip4/127.0.0.1/tcp/$((19000+i)) --propose --datadir $F/consensus-$i $PEER ${DIALGO:-} \
         > $F/v$i-$TAG.log 2>&1) > /dev/null 2>&1 &
     continue
   fi
   RUST_LOG=${RUST_LOG_V:-n42=debug} $BIN/examples/h2_validator --chain $GENESIS --index $i \
-    --bls-key $(cat $F/keys/validator-$i.key) --el http://127.0.0.1:18551 --jwt $F/jwt.hex \
+    --bls-key $(cat $F/keys/validator-$i.key) --el http://127.0.0.1:18551 --el-rpc http://127.0.0.1:18545 --jwt $F/jwt.hex \
     --listen /ip4/127.0.0.1/tcp/$((19000+i)) --propose --datadir $F/consensus-$i $PEER ${DIALGO:-} \
     > $F/v$i-$TAG.log 2>&1 &
   if [ $i = 0 ]; then

@@ -195,6 +195,14 @@ pub enum TransportEvent {
         /// Why it was rejected.
         reason: String,
     },
+    /// A transaction message from the chain's transaction topic, compressed as
+    /// received; see [`crate::tx_gossip`].
+    Transactions {
+        /// The peer that delivered it.
+        from: Option<PeerId>,
+        /// The raw-snappy payload.
+        data: Vec<u8>,
+    },
     /// A consensus message from the chain's native topic —
     /// `/n42/<fork digest>/hotstuff_consensus/ssz_snappy`, where a gov5 fleet
     /// runs its consensus. Native encoding, no chain-bound envelope: the
@@ -331,6 +339,8 @@ pub struct H2V4Transport {
     topic: IdentTopic,
     /// Where block bodies travel; bound to the chain by its fork digest.
     block_topic: IdentTopic,
+    /// gov5's transaction topic, `/n42/<fork digest>/transaction_v2/ssz_snappy`.
+    tx_topic: IdentTopic,
     /// gov5's own consensus topic, likewise fork-scoped.
     native_topic: IdentTopic,
     identity: H2V4ChainIdentity,
@@ -422,6 +432,17 @@ impl H2V4Transport {
                 topic: native_topic.to_string(),
                 source,
             })?;
+        // The fleet's transactions travel on their own topic; a member off
+        // it seals none of them and shows none of its own to the others.
+        let tx_topic = fork_scoped_topic(config.identity.genesis_hash, "transaction_v2");
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&tx_topic)
+            .map_err(|source| TransportError::Subscribe {
+                topic: tx_topic.to_string(),
+                source,
+            })?;
 
         for addr in &config.listen_addrs {
             swarm
@@ -448,6 +469,7 @@ impl H2V4Transport {
             swarm,
             topic,
             block_topic,
+            tx_topic,
             native_topic,
             identity: config.identity,
             mesh_peers: HashSet::new(),
@@ -582,6 +604,16 @@ impl H2V4Transport {
         let _ = self.swarm.behaviour_mut().blocks.send_response(channel.0, reply);
     }
 
+    /// Publishes a compressed transaction batch on the chain's transaction
+    /// topic; see [`crate::tx_gossip`].
+    pub fn publish_transactions(&mut self, data: Vec<u8>) -> Result<gossipsub::MessageId, PublishError> {
+        Ok(self
+            .swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(self.tx_topic.clone(), data)?)
+    }
+
     /// Publishes an already-encoded block body on the chain's block topic.
     ///
     /// Takes the compressed bytes from [`crate::block_gossip::encode_block_gossip`]
@@ -611,6 +643,12 @@ impl H2V4Transport {
                 })) => {
                     if message.topic == self.block_topic.hash() {
                         return Some(TransportEvent::Block {
+                            from: message.source,
+                            data: message.data,
+                        });
+                    }
+                    if message.topic == self.tx_topic.hash() {
+                        return Some(TransportEvent::Transactions {
                             from: message.source,
                             data: message.data,
                         });

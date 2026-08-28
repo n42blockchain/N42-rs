@@ -82,6 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut index: Option<u32> = None;
     let mut bls_key: Option<String> = None;
     let mut el_url: Option<String> = None;
+    let mut el_rpc: Option<String> = None;
     let mut jwt_path: Option<String> = None;
     let mut peers: Vec<String> = Vec::new();
     let mut listen: Vec<String> = Vec::new();
@@ -108,6 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--index" => index = Some(args.next().ok_or("--index needs a value")?.parse()?),
             "--bls-key" => bls_key = Some(args.next().ok_or("--bls-key needs a value")?),
             "--el" => el_url = Some(args.next().ok_or("--el needs a URL")?),
+            "--el-rpc" => el_rpc = Some(args.next().ok_or("--el-rpc needs a URL")?),
             "--jwt" => jwt_path = Some(args.next().ok_or("--jwt needs a path")?),
             "--peer" => peers.push(args.next().ok_or("--peer needs a multiaddr")?),
             "--listen" => listen.push(args.next().ok_or("--listen needs a multiaddr")?),
@@ -332,6 +334,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if gov5_profile {
             service = service.with_gov5_h2_profile(seal_key);
         }
+        if let Some(rpc) = &el_rpc {
+            service = service.with_transaction_source(rpc.parse()?);
+            println!("transaction source: {rpc}");
+        }
         if propose {
             let fee_recipient = entry.address;
             // The chain's committee pool, if it has one: every header links
@@ -509,6 +515,7 @@ const USAGE: &str = "\
 h2_validator — run a participating HotStuff-2 v4 node against an execution layer
 
   --chain <genesis.json>    the chain's genesis; supplies id, hash, validators, timeouts, period
+  --el-rpc <url>            the execution layer's public JSON-RPC; its pool's transactions are gossiped to the fleet
   --chain-id <u64>          fleet chain id (without --chain)
   --genesis <0x…>           fleet genesis hash (without --chain)
   --validators <path>       JSON array of {address, bls_public_key} (without --chain)

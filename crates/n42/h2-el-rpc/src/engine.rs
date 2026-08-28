@@ -335,6 +335,14 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
         Ok(block.map(block_parts))
     }
 
+    async fn send_raw_transaction(&self, raw: alloy_primitives::Bytes) -> Result<B256, ElError> {
+        // The Engine API's auth endpoint serves this too: the spec requires
+        // it of every execution client, for exactly this use.
+        self.call("eth_sendRawTransaction", vec![json!(raw)])
+            .await
+            .map_err(|e| ElError::new(e.to_string()))
+    }
+
     async fn new_payload(&self, payload: ExecutionData) -> Result<PayloadStatus, ElError> {
         let (method, params) = new_payload_call(&payload)?;
         debug!(target: "n42.h2.el", method, "newPayload");

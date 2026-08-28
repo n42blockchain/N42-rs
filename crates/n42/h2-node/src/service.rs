@@ -53,13 +53,14 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use alloy_consensus::Header;
-use alloy_primitives::B256;
+use alloy_primitives::{keccak256, Bytes, B256};
 use n42_h2_consensus::wire_bridge::{self, BridgeError};
 use n42_h2_consensus::{ConsensusEngine, ConsensusEvent, EngineOutput};
 use n42_h2_execution::{DriverAction, ExecutionDriver, ExecutionLayer};
 use alloy_rpc_types_engine::PayloadAttributes;
 use n42_h2_net::{
-    compress_block_rlp, decode_block_rlp, decompress_block_gossip, encode_block_rlp,
+    compress_block_rlp, decode_block_rlp, decode_tx_batch, decompress_block_gossip,
+    encode_block_rlp, encode_tx_batch,
     encode_block_rlp_parts, BlockChunk, H2V4Transport, HeaderProfile, PeerId, RangeRequest,
     TransportEvent, MAX_RANGE_BLOCKS,
 };
@@ -241,6 +242,15 @@ pub struct H2Service<E> {
     /// [`ProposalContext::head_timestamp`]. Bounded; insertion order in
     /// `timestamp_order`.
     block_timestamps: std::collections::HashMap<B256, u64>,
+    /// Transactions heard on the fleet's transaction topic, waiting to be
+    /// handed to the execution layer's pool.
+    inbound_transactions: Vec<Bytes>,
+    /// Transactions this node's own pool admitted, from the source installed
+    /// with [`Self::with_transaction_source`], waiting to go out.
+    outbound_transactions: Option<mpsc::Receiver<Vec<Bytes>>>,
+    /// Hashes of transactions heard from the fleet, so the pool's echo of
+    /// them is not gossiped back. Bounded.
+    gossiped_transactions: std::collections::VecDeque<B256>,
     /// The headers of the same blocks.
     block_headers: std::collections::HashMap<B256, Header>,
     /// Block numbers, same bookkeeping, for the height this node advertises
@@ -377,6 +387,9 @@ impl<E: ExecutionLayer> H2Service<E> {
             body_store: std::collections::HashMap::new(),
             body_store_order: Vec::new(),
             block_timestamps: std::collections::HashMap::new(),
+            inbound_transactions: Vec::new(),
+            outbound_transactions: None,
+            gossiped_transactions: std::collections::VecDeque::new(),
             block_headers: std::collections::HashMap::new(),
             block_numbers: std::collections::HashMap::new(),
             block_seen: std::collections::HashMap::new(),
@@ -460,6 +473,19 @@ impl<E: ExecutionLayer> H2Service<E> {
         self
     }
 
+    /// Gossips the transactions this node's execution layer admits to its
+    /// pool, read from its public JSON-RPC at `rpc_url` — the Engine API's
+    /// auth endpoint accepts transactions but does not list them. Polled
+    /// with `eth_newPendingTransactionFilter`; a Go leader seals what it
+    /// hears here, exactly as a Rust leader seals what it hears from the
+    /// Go members.
+    pub fn with_transaction_source(mut self, rpc_url: url::Url) -> Self {
+        let (tx, rx) = mpsc::channel(64);
+        tokio::spawn(crate::tx_source::poll_pending_transactions(rpc_url, tx));
+        self.outbound_transactions = Some(rx);
+        self
+    }
+
     /// The transport, for dialing more peers or reading mesh state.
     pub const fn transport(&self) -> &H2V4Transport {
         &self.transport
@@ -540,6 +566,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 () = std::future::ready(()) => {}
             }
             self.drain_outputs(&mut events).await?;
+            self.forward_inbound_transactions().await;
             self.flush_outbox(&mut events);
             return Ok(events);
         }
@@ -549,6 +576,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         // old view would fire late or not at all.
         let timeout = self.engine.pacemaker().timeout_sleep();
         tokio::pin!(timeout);
+        let outbound = self.outbound_transactions.as_mut();
 
         tokio::select! {
             event = self.transport.next_event() => {
@@ -556,6 +584,16 @@ impl<E: ExecutionLayer> H2Service<E> {
                     return Err(ServiceError::TransportEnded);
                 };
                 self.handle_transport_event(event)?;
+            }
+            batch = async {
+                match outbound {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(batch) = batch {
+                    self.publish_transactions(batch);
+                }
             }
             output = self.outputs.recv() => {
                 let Some(output) = output else {
@@ -575,8 +613,58 @@ impl<E: ExecutionLayer> H2Service<E> {
         }
 
         self.drain_outputs(&mut events).await?;
+        self.forward_inbound_transactions().await;
         self.flush_outbox(&mut events);
         Ok(events)
+    }
+
+    /// Hands the transactions heard from the fleet to the execution layer's
+    /// pool. A refusal is the pool's verdict on one transaction, logged and
+    /// forgotten; the fleet's next batch is not held up by it.
+    async fn forward_inbound_transactions(&mut self) {
+        if self.inbound_transactions.is_empty() {
+            return;
+        }
+        let batch = std::mem::take(&mut self.inbound_transactions);
+        let el = self.driver.execution_layer();
+        let mut accepted = 0usize;
+        for raw in batch {
+            match el.send_raw_transaction(raw).await {
+                Ok(_) => accepted += 1,
+                Err(err) => debug!(target: "n42.h2.node", %err, "the pool declined a gossiped transaction"),
+            }
+        }
+        if accepted > 0 {
+            debug!(target: "n42.h2.node", accepted, "handed gossiped transactions to the pool");
+        }
+    }
+
+    /// Gossips transactions this node's pool admitted, leaving out the ones
+    /// that came from the fleet in the first place.
+    fn publish_transactions(&mut self, batch: Vec<Bytes>) {
+        let fresh: Vec<Bytes> = batch
+            .into_iter()
+            .filter(|raw| !self.gossiped_transactions.contains(&keccak256(raw)))
+            .collect();
+        if fresh.is_empty() {
+            return;
+        }
+        for chunk in fresh.chunks(n42_h2_net::TX_BATCH_MAX_TXS) {
+            let encoded = match encode_tx_batch(chunk).and_then(|payload| {
+                compress_block_rlp(&payload).map_err(|_| n42_h2_net::TxGossipError::TooLarge(payload.len()))
+            }) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    debug!(target: "n42.h2.node", %err, "could not encode a transaction batch");
+                    continue;
+                }
+            };
+            if let Err(err) = self.transport.publish_transactions(encoded) {
+                debug!(target: "n42.h2.node", %err, "could not gossip transactions");
+            } else {
+                debug!(target: "n42.h2.node", count = chunk.len(), "gossiped transactions");
+            }
+        }
     }
 
     /// Runs until the transport or the engine stops.
@@ -622,6 +710,22 @@ impl<E: ExecutionLayer> H2Service<E> {
                     message: *message,
                 };
                 self.accept_envelope(&envelope);
+            }
+            TransportEvent::Transactions { data, .. } => {
+                match decompress_block_gossip(&data).and_then(|payload| {
+                    decode_tx_batch(&payload).map_err(|e| n42_h2_net::BlockGossipError::InvalidRewards(e.to_string()))
+                }) {
+                    Ok(transactions) => {
+                        for raw in transactions {
+                            self.gossiped_transactions.push_back(keccak256(&raw));
+                            while self.gossiped_transactions.len() > REMEMBERED_TIMESTAMPS * 16 {
+                                self.gossiped_transactions.pop_front();
+                            }
+                            self.inbound_transactions.push(raw);
+                        }
+                    }
+                    Err(err) => debug!(target: "n42.h2.node", %err, "dropped a transaction message"),
+                }
             }
             TransportEvent::Block { data, .. } => {
                 // Nothing here is trusted beyond its own consistency: the

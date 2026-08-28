@@ -202,7 +202,9 @@ impl H2V4Observer {
             TransportEvent::Rejected { from, reason } => ObserverEvent::Rejected { from, reason },
             // A block body is fleet traffic, not finality: an observer watches
             // for Decide and does not execute blocks.
-            TransportEvent::Block { from, .. } => ObserverEvent::NonDecide { from },
+            TransportEvent::Block { from, .. } | TransportEvent::Transactions { from, .. } => {
+                ObserverEvent::NonDecide { from }
+            }
             // Native-topic traffic is not chain-bound; an observer trusts
             // only the v4 Decide proofs.
             TransportEvent::Native { from, .. } => ObserverEvent::NonDecide { from },

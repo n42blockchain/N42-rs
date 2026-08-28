@@ -43,6 +43,9 @@ const SNAPSHOT_FILE: &str = "forest.bin";
 /// Why the node's QMDB state could not be used.
 #[derive(Debug, thiserror::Error)]
 pub enum NodeStateError {
+    /// A portable snapshot could not be used.
+    #[error("portable QMDB snapshot: {0}")]
+    Portable(String),
     /// Nothing has restored the trees yet. See the module docs.
     #[error("QMDB state is not initialised; the node cannot compute state roots yet")]
     Uninitialised,
@@ -224,6 +227,78 @@ impl QmdbNodeState {
         };
         *guard = Some(forest);
         Ok(())
+    }
+
+    /// Restores the forest from a cross-client portable snapshot — gov5's
+    /// `n42-qmdb-export` output, or this node's own [`Self::portable_export`]
+    /// — for a database being initialised at the snapshot's block rather than
+    /// at genesis. The snapshot is authenticated, bound to `(chain_id,
+    /// genesis_hash)`, must be at `expected_head`, and its root must equal
+    /// `expected_root`, the state root of the header the caller trusts.
+    /// Persisted at once so the node's next start finds it under that head.
+    pub fn initialize_from_portable(
+        &self,
+        portable: &[u8],
+        chain_id: u64,
+        genesis_hash: B256,
+        expected_head: (u64, B256),
+        expected_root: B256,
+    ) -> Result<(), NodeStateError> {
+        use n42_twig_core::qmdb_compat::QmdbPortableSnapshot;
+        let snapshot = QmdbPortableSnapshot::decode(portable)
+            .map_err(|e| NodeStateError::Portable(e.to_string()))?;
+        let at = (snapshot.block_number, B256::from(snapshot.block_hash));
+        if at != expected_head {
+            return Err(NodeStateError::Portable(format!(
+                "snapshot is at block {} {:?}, the header at {} {:?}",
+                at.0, at.1, expected_head.0, expected_head.1
+            )));
+        }
+        let tree = snapshot
+            .verify_and_build(chain_id, &genesis_hash.0)
+            .map_err(|e| NodeStateError::Portable(e.to_string()))?;
+        let root = B256::from(tree.root());
+        if root != expected_root {
+            return Err(NodeStateError::Portable(format!(
+                "snapshot root {root:?} is not the header's state root {expected_root:?}"
+            )));
+        }
+        let mut forest = QmdbForest::from_tree(expected_head.0, expected_head.1, tree);
+        write_snapshot(&self.snapshot_path(), &forest.snapshot()?)?;
+        info!(target: "n42.qmdb", block = expected_head.0, head = %expected_head.1, %root, "restored the QMDB forest from a portable snapshot");
+        *self.lock() = Some(forest);
+        Ok(())
+    }
+
+    /// The persisted forest as a cross-client portable snapshot, for another
+    /// node to start from. Reads the snapshot file; the node need not be
+    /// running.
+    pub fn portable_export(&self, chain_id: u64, genesis_hash: B256) -> Result<Vec<u8>, NodeStateError> {
+        use n42_twig_core::qmdb_compat::{QmdbPortableSnapshot, QmdbSlotEntry, QmdbSlotSnapshot};
+        let path = self.snapshot_path();
+        let snapshot = read_snapshot(&path)?.ok_or(NodeStateError::NoSnapshot { path, head_number: 0 })?;
+        let tree = QmdbForest::from_snapshot(&snapshot)?;
+        let entries = snapshot
+            .tree
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(slot, entry)| QmdbSlotEntry {
+                slot: slot as u64,
+                key: entry.key,
+                value: entry.value.clone(),
+                active: entry.active,
+            })
+            .collect();
+        let portable = QmdbPortableSnapshot {
+            chain_id,
+            genesis_hash: genesis_hash.0,
+            block_number: snapshot.head_number,
+            block_hash: snapshot.head_hash.0,
+            root: tree.root().0,
+            slots: QmdbSlotSnapshot { next_slot: snapshot.tree.next_slot, entries },
+        };
+        portable.encode().map_err(|e| NodeStateError::Portable(e.to_string()))
     }
 
     /// Whether [`Self::initialize`] has run.

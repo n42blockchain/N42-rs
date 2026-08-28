@@ -918,6 +918,24 @@ QMDB node, three Rust validators, one gov5 member; see the commits):**
    errors. Still unmeasured: a validator-set *change* at a boundary
    (gov5's `ReconfigurationManager`, fed by `hotstuff_proposeAddValidator`),
    which chain 94 has never exercised either.
+4. **Bootstrapping from a snapshot.** `n42-init-snapshot init` builds an
+   empty datadir at a chain's head from three files: gov5's
+   `n42-reth-state-dump` output (reth `init-state` JSONL plus the head's
+   header RLP) and the QMDB slot log as the cross-client portable snapshot
+   (`n42-qmdb-export`, or `n42-init-snapshot export` from a Rust node). It
+   writes the state the way reth 2.5 stores it — hashed accounts and storage,
+   changesets in static files, history in RocksDB, dummy headers below the
+   head — and rebuilds the QMDB forest from the slot log, refusing anything
+   whose root is not the header's. reth's own `init-state` cannot serve here
+   only because it recomputes a Merkle root the header does not carry.
+   Measured: a fresh fleet run to block 25 and stopped; gov5's state dump and
+   the Rust node's QMDB export taken at that block (same hash, same root);
+   the fleet resumed with `LATE_VALIDATOR=2 LATE_SNAPSHOT=<dir>` — the member
+   whose execution layer was initialised from the snapshot pulled blocks
+   25→27 from its peers, committed 36 views, and ended at block 63 with the
+   same head as the main execution layer and gov5, zero errors. Chain 94's
+   35 GB will be the first real test of the sizes involved; the forest is
+   held in memory, which is its own item.
 
 **Still blocking, in the order the fleet would refuse us:**
 
@@ -942,14 +960,7 @@ QMDB node, three Rust validators, one gov5 member; see the commits):**
    monotonic, so the schedules are equivalent). `beijingBlock`, `ltHashTime`,
    `mobileAnchorTime`, `eofTime`, `glamsterdamTime` have no reth spelling;
    only `eofTime` and `mobileAnchorTime` change anything executable.
-7. **Bootstrapping 13 million blocks.** A member's execution layer is fed
-   only through the Engine API, so today it can only pull the whole chain by
-   `bodies_by_range` and re-execute it. gov5's `cmd/n42-qmdb-export` writes
-   the cross-client portable snapshot this repo already verifies
-   (`twig_core::qmdb_compat::verify_portable_stream`); what is missing is
-   the path from that stream into a live QMDB forest plus reth's plain state
-   and headers at the head.
-8. **Transactions.** gov5 members generate load with `--dev.txgen` and
+7. **Transactions.** gov5 members generate load with `--dev.txgen` and
    gossip transactions among themselves over libp2p; nothing delivers them
    to this node's reth pool, so a Rust leader would seal blocks empty of the
    fleet's transactions. Not a consensus failure, but not an equal member.
@@ -971,17 +982,15 @@ Ordered by dependency, not by value. Rewards, the committee-evidence link
 and epoch boundaries are done and measured (above); what follows is the
 rest of the production-fleet list in build order.
 
-0. **Snapshot bootstrap** (item 7): `n42-qmdb-export` stream → QMDB forest
-   + reth plain state and headers at the head, so a member starts there.
-1. **The fork schedule** (item 6): block-number forks mapped to their
+0. **The fork schedule** (item 6): block-number forks mapped to their
    blocks' timestamps in the genesis loader; then `--chain` chain 94.
-2. **Validator-set changes at a boundary** (item 3's remainder): drive
-   `hotstuff_proposeAddValidator` on a mixed devnet and watch both sides
-   take the new set.
-3. **Header field and EVM parity** (items 4–5): `MobileRegistryRoot` needs
+1. **Validator-set changes at a boundary** (item 3's remainder): per
+   `docs/VALIDATOR_LIFECYCLE_DESIGN.md`, phases 0–1 first — a non-zero
+   `changes_hash` and proposals as transactions — then the measurement.
+2. **Header field and EVM parity** (items 4–5): `MobileRegistryRoot` needs
    a header extension on the reth side; EOF is a revm question.
-4. **Transactions** (item 8): subscribe to gov5's transaction gossip and
+3. **Transactions** (item 7): subscribe to gov5's transaction gossip and
    feed the reth pool.
-5. **Rejoining after a long absence, measured over hours**, and the
+4. **Rejoining after a long absence, measured over hours**, and the
    observer against the live fleet — the two operational items from
    before, unchanged.

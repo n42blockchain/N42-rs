@@ -71,7 +71,10 @@ the Engine API. `scripts/devnet-fleet.sh <tag> <secs> [--gov5]` runs the whole d
 node, four Rust validators, or three plus a gov5 member from `../N42-gov5` (built from a commit that includes gov5 `95d47b46`,
 the zero parent-beacon-root fix; `docs/gov5-cancun-parent-beacon-root.patch` is the same change for
 an older branch). `GOV5_DELAY=<s>` starts the Go member late; `LATE_VALIDATOR=<i> LATE_DELAY=<s>`
-starts one Rust member late with its own fresh execution layer, so it has to pull the chain by range. `docs/N42_26_PORT.md` "Joining a Go fleet"
+starts one Rust member late with its own fresh execution layer, so it has to pull the chain by range;
+`LATE_SNAPSHOT=<dir>` initialises that execution layer at a chain's head instead
+(`n42-init-snapshot init`, from gov5's `n42-reth-state-dump` JSONL + header and a portable QMDB
+snapshot — `n42-qmdb-export` or `n42-init-snapshot export`), so it pulls only what came after. `docs/N42_26_PORT.md` "Joining a Go fleet"
 lists every cross-client rule that had to be matched.
 
 `cargo build`/`cargo test` with no `-p` only touches `default-members` (`bin/n42`). Use `--workspace`

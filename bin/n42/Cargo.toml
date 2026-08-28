@@ -41,6 +41,15 @@ reth-rpc-server-types.workspace = true
 reth-network = { workspace = true, features = ["serde"] }
 reth-network-api.workspace = true
 reth-tasks.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+alloy-consensus.workspace = true
+alloy-rlp.workspace = true
+alloy-genesis.workspace = true
+reth-db-api.workspace = true
+reth-static-file-types.workspace = true
+reth-db-common.workspace = true
+reth-cli-commands.workspace = true
 reth-payload-builder.workspace = true
 reth-payload-primitives.workspace = true
 reth-node-api.workspace = true
@@ -143,3 +152,7 @@ min-trace-logs = [
 [[bin]]
 name = "n42"
 path = "src/main.rs"
+
+[[bin]]
+name = "n42-init-snapshot"
+path = "src/init_snapshot.rs"

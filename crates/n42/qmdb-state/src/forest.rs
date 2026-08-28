@@ -137,6 +137,14 @@ impl QmdbForest {
         Ok(Self::at(snapshot.head_number, snapshot.head_hash, tree))
     }
 
+    /// A forest whose head is `(number, hash)` and whose state is `tree` —
+    /// how a node that did not execute the chain, but received its state,
+    /// begins. The tree's root must be the head's state root; the caller
+    /// checks that against the header it trusts.
+    pub fn from_tree(number: u64, hash: B256, tree: QmdbCompatTree) -> Self {
+        Self::at(number, hash, tree)
+    }
+
     fn at(number: u64, hash: B256, tree: QmdbCompatTree) -> Self {
         let root = B256::from(tree.root());
         let mut records = HashMap::new();

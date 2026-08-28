@@ -3,6 +3,7 @@
 # optionally one gov5 (Go) validator in place of the fourth.
 #
 #   scripts/devnet-fleet.sh <tag> <seconds> [--gov5] [--keep]
+#   LATE_VALIDATOR=<i> LATE_DELAY=<s> [LATE_SNAPSHOT=<dir>] start one member late (from a snapshot)
 #
 # Data lives under $N42_FLEET_DIR (default: /tmp/n42-fleet). Every process is
 # left running afterwards so it can be inspected; the next run kills them.
@@ -50,6 +51,16 @@ for i in $(seq 0 $LAST); do
     # Its own execution layer, fresh, with no devp2p peers: the only way it
     # can get the chain is the pull this exercises.
     (sleep ${LATE_DELAY:-60}; rm -rf $F/consensus-$i $F/datadir-late
+      # LATE_SNAPSHOT=<dir> starts that execution layer at a chain's head
+      # instead of at genesis: <dir> holds state.jsonl (+ .header.rlp) and
+      # state.qmdb, as n42-reth-state-dump / n42-qmdb-export / the export
+      # side of n42-init-snapshot write them. The member then pulls only
+      # what the fleet produced after the snapshot.
+      if [ -n "${LATE_SNAPSHOT:-}" ]; then
+        $BIN/n42-init-snapshot init --datadir $F/datadir-late --chain $GENESIS \
+          --state $LATE_SNAPSHOT/state.jsonl --header $LATE_SNAPSHOT/state.jsonl.header.rlp \
+          --qmdb $LATE_SNAPSHOT/state.qmdb > $F/init-late-$TAG.log 2>&1
+      fi
       RUST_LOG=${RUST_LOG_EL:-info} $BIN/n42 node --chain $GENESIS --datadir $F/datadir-late \
         --authrpc.port 18561 --authrpc.jwtsecret $F/jwt.hex --http --http.port 18555 --port 30323 \
         --disable-discovery --ipcdisable > $F/el-late-$TAG.log 2>&1 &

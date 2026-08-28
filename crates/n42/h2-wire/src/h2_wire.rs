@@ -244,8 +244,7 @@ pub fn decode_gov5_gossip_message(data: &[u8]) -> Result<H2Message, H2WireError>
             max: MAX_ENVELOPE_PAYLOAD + 5,
         });
     }
-    let decoded = snap::raw::Decoder::new()
-        .decompress_vec(data)
+    let decoded = crate::snappy::decompress_raw(data)
         .map_err(|error| H2WireError::InvalidSnappy(error.to_string()))?;
     decode_message(&decoded)
 }
@@ -253,8 +252,7 @@ pub fn decode_gov5_gossip_message(data: &[u8]) -> Result<H2Message, H2WireError>
 /// Encode a canonical gov5 H2 message as a raw Snappy gossip block.
 pub fn encode_gov5_gossip_message(message: &H2Message) -> Result<Vec<u8>, H2WireError> {
     let encoded = encode_message(message)?;
-    snap::raw::Encoder::new()
-        .compress_vec(&encoded)
+    crate::snappy::compress_raw(&encoded)
         .map_err(|error| H2WireError::InvalidSnappy(error.to_string()))
 }
 

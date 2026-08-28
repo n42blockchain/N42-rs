@@ -134,9 +134,7 @@ pub fn encode_block_gossip(
 
 /// The topic's compression of an already-encoded block.
 pub fn compress_block_rlp(rlp: &[u8]) -> Result<Vec<u8>, BlockGossipError> {
-    snap::raw::Encoder::new()
-        .compress_vec(rlp)
-        .map_err(|error| BlockGossipError::Snappy(error.to_string()))
+    n42_h2_wire::snappy::compress_raw(rlp).map_err(|error| BlockGossipError::Snappy(error.to_string()))
 }
 
 /// The block RLP inside a compressed topic payload, before any decoding —
@@ -147,9 +145,7 @@ pub fn decompress_block_gossip(data: &[u8]) -> Result<Vec<u8>, BlockGossipError>
     if len > crate::config::MAX_GOSSIP_SIZE {
         return Err(BlockGossipError::Snappy("expands past the gossip size limit".into()));
     }
-    snap::raw::Decoder::new()
-        .decompress_vec(data)
-        .map_err(|error| BlockGossipError::Snappy(error.to_string()))
+    n42_h2_wire::snappy::decompress_raw(data).map_err(|error| BlockGossipError::Snappy(error.to_string()))
 }
 
 /// Decodes a compressed block off the topic.

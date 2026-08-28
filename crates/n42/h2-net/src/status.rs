@@ -16,8 +16,8 @@
 //!
 //! The varint length is of the *uncompressed* SSZ, and the compression is the
 //! snappy **framing** format (`snappy.NewBufferedWriter` in Go,
-//! [`snap::write::FrameEncoder`] here), not the raw block format that the gossip
-//! path uses. Mixing the two is the easiest mistake to make: gossip payloads are
+//! [`n42_h2_wire::snappy::frame`] here), not the raw block format that the
+//! gossip path uses. Mixing the two is the easiest mistake to make: gossip
 //! raw-snappy, RPC payloads are framed-snappy.
 //!
 //! # SSZ layout
@@ -197,17 +197,13 @@ pub fn decode_varint(bytes: &[u8]) -> Result<(u64, usize), StatusError> {
 }
 
 /// Frames a payload the way gov5's `EncodeWithMaxLength` does.
+///
+/// The snappy framing comes from [`n42_h2_wire::snappy`], which keeps its
+/// codec scratch per thread instead of allocating a `FrameEncoder` per call —
+/// a range reply frames up to a thousand of these back to back.
 pub fn frame_payload(ssz: &[u8]) -> Result<Vec<u8>, StatusError> {
-    use std::io::Write;
     let mut out = encode_varint(ssz.len() as u64);
-    let mut encoder = snap::write::FrameEncoder::new(Vec::new());
-    encoder
-        .write_all(ssz)
-        .map_err(|e| StatusError::Snappy(e.to_string()))?;
-    let compressed = encoder
-        .into_inner()
-        .map_err(|e| StatusError::Snappy(e.to_string()))?;
-    out.extend_from_slice(&compressed);
+    n42_h2_wire::snappy::frame_into(&mut out, ssz).map_err(|e| StatusError::Snappy(e.to_string()))?;
     Ok(out)
 }
 
@@ -219,17 +215,12 @@ pub fn unframe_payload(bytes: &[u8]) -> Result<Vec<u8>, StatusError> {
 /// [`unframe_payload`] with a caller-chosen bound on the decoded size — gov5's
 /// block chunks allow 64 MiB where a status message allows 1 MiB.
 pub fn unframe_payload_limit(bytes: &[u8], max_decoded: u64) -> Result<Vec<u8>, StatusError> {
-    use std::io::Read;
     let (len, consumed) = decode_varint(bytes)?;
     if len > max_decoded {
         return Err(StatusError::TooLong { got: len });
     }
-    let mut out = vec![0u8; len as usize];
-    let mut decoder = snap::read::FrameDecoder::new(&bytes[consumed..]);
-    decoder
-        .read_exact(&mut out)
-        .map_err(|e| StatusError::Snappy(e.to_string()))?;
-    Ok(out)
+    n42_h2_wire::snappy::unframe(&bytes[consumed..], len as usize)
+        .map_err(|e| StatusError::Snappy(e.to_string()))
 }
 
 /// Walks snappy frame headers to find where a framed payload ends.

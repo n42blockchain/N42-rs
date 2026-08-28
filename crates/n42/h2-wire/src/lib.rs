@@ -15,6 +15,7 @@
 
 pub mod h2_v4;
 pub mod h2_wire;
+pub mod snappy;
 
 pub use h2_v4::*;
 pub use h2_wire::{decode_message, encode_message, H2Message, H2WireError};

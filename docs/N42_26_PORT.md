@@ -867,36 +867,108 @@ wire protocol is unchanged between the two, so interop is unaffected. Revisit
 when the repo moves to reth 2.4.1, at which point matching N42-26's pin costs
 nothing.
 
+## Joining the production fleet: what is still missing (2026-08-28)
+
+The devnet measurements above prove the protocol: a Rust member votes,
+leads, imports, serves and catches up on a mixed fleet, on the checked-in
+devnet genesis. gov5's production fleet is `mainnet_qmdb_staggered`
+(`params/chainspecs/mainnet_qmdb_staggered.json`, chain id 94, seven
+validators, period 3 s, head 13,013,133 replayed from mainnet history and
+resealed with BLS, 35 GB). Checked item by item against that chainspec and
+`internal/consensus/hotstuff/adapter.go`, a Rust member cannot join it yet.
+Blocking, in the order the fleet would refuse us:
+
+1. **Block reward and faucet credit.** `hotstuff.devBlockReward` is 1 ETH:
+   every block credits the coinbase and `devFaucetAddress` in `Finalize`
+   (`adapter.go` ~683) and lists both in `rewards`, whose `DeriveSha` is the
+   withdrawals root. Consensus-relevant: it is in the state root. This node
+   builds and executes blocks with no such credit, so its root differs from
+   gov5's on every block of chain 94, both directions. The natural mapping
+   is the Engine API's withdrawals (a reward in wei is a withdrawal in gwei;
+   1 ETH divides exactly): the normalizer would derive the two rewards from
+   the chainspec and the reconstruct would turn a gov5 block's `rewards`
+   into the payload's withdrawals. Small, but it has to be exact.
+2. **Committee evidence in `parentBeaconRoot`.** `committeePool` is
+   enabled (pool 200k, committee 512, ramp 1M blocks — long past at head
+   13M). With it wired, every header must carry
+   `ParentBeaconRoot = Blake3(parent's committee evidence)` and gov5's
+   `VerifyHeader` rejects anything else ("committee-evidence link broken").
+   This node writes the zero root, and to write the right one it needs the
+   committee pool itself: the seeded deterministic committee selection, the
+   per-block BLS evidence, its Blake3 commitment, and the
+   `consensus_registerCommitteeValidator` hand-over that replaces simulated
+   slots with real mobile validators. None of that is ported.
+3. **`MobileRegistryRoot`, a header field Ethereum does not have.** Under
+   the `mobileAnchor` fork (active since 2026-07-18 on chain 94) gov5's
+   miner stamps a 21st header field with the mobile-registry root when the
+   node has an anchor provider. reth's `Header` cannot carry it, the Engine
+   API cannot express it, and the alloy decoder refuses a header with it.
+   Whether the seven nodes are wired with the provider decides whether
+   this bites on day one; the field exists in the type either way.
+4. **Execution semantics beyond reth.** gov5's EVM has EOF
+   (`internal/vm/eof.go`, `eofTime` 2025-12-09, active) — Ethereum dropped
+   it and revm 42 has none; any EOF contract on chain 94 diverges. Fusaka
+   is active; Glamsterdam (`glamsterdamTime` 2027-01-01, gas repricing)
+   is not yet. `ltHashTime` is set but nothing in gov5 reads it today.
+5. **The fork schedule.** Shanghai at block 305,000 and Cancun at
+   3,935,000 are block-number forks; reth only knows them by timestamp, and
+   `beijingBlock`, `ltHashTime`, `mobileAnchorTime`, `eofTime`,
+   `glamsterdamTime` have no reth spelling at all. Irrelevant for a member
+   that starts at the head with every fork active, decisive for one that
+   has to execute history.
+6. **Bootstrapping 13 million blocks.** A member's execution layer is fed
+   only through the Engine API, so today it can only pull the whole chain
+   by `bodies_by_range` and re-execute it — days, and item 5 in the way.
+   gov5 has a QMDB snapshot (`internal/snapshot`) and a witness RPC
+   (`/n42/req/get_block_witness/1`); this repo verifies gov5's portable
+   snapshot stream (`twig_core::qmdb_compat::verify_portable_stream`) but
+   has no path from a snapshot into a live QMDB forest plus reth's plain
+   state at the head. Without it a Rust member never reaches the head.
+7. **Epoch reconfiguration parity.** `epochLength` is 200 with a real
+   `ReconfigurationManager` on the Go side; this engine has epochs and
+   staged transitions of its own, but the two have never been run against
+   each other — the devnet genesis has no epochs. `qs_epoch_test`
+   (chain 95, epochLength 20, same validators) is the chain to prove it
+   on before chain 94.
+8. **Transactions.** gov5 members generate load with `--dev.txgen` and
+   gossip transactions among themselves over libp2p; nothing delivers them
+   to this node's reth pool, so a Rust leader would seal blocks empty of
+   the fleet's transactions. Not a consensus failure, but not an equal
+   member either.
+
+And one thing that is not ours: on that fleet gov5 itself wedges after a
+handful of blocks at a fork-active head (`docs/mainnet_qmdb_staggered-
+7node-status.md`, "Layer 5": competing same-height blocks are never
+reconciled below the head pointer). A Rust member would meet the same
+wedge; whether it should tolerate or expose it is a question for when
+the rest is done.
+
+What the devnet work already covers, and needs no repeat: the header
+profile and its three roots, the native consensus topic and the v4
+Decide topic, identify, the system-caller leaf, the two clocks,
+`block_by_hash`, `bodies_by_range`, range catch-up, fetch-on-miss, the
+secp256k1 identities, static peers (`--p2p.peer` is how the fleet is
+wired too), and the `interopV4` signing profile.
+
 ## Roadmap
 
-Ordered by dependency, not by value.
+Ordered by dependency, not by value. Items 2–4 of the previous roadmap —
+the HotStuff-2 core, the reth upgrade (now v2.5.1) and QMDB as the live
+state backend — are done; what follows is the production-fleet list
+above in build order.
 
-0. **Rejoining after a long absence, measured.** Every piece a member
-   needs to rejoin is in place — status, range pull, fetch-on-miss, the
-   engine's jump to the fleet's view — and each is measured over minutes.
-   What is not measured is hours: a member returning to a chain thousands
-   of views ahead, with its persisted forest and vote log, and the mobile
-   endpoint serving proofs on a mixed fleet throughout.
-1. **Run the observer against the live fleet.** Everything below the socket is
-   tested; what remains is operational — point `h2_observer` at real fleet
-   peers with the fleet's genesis hash and validator list, and confirm it
-   follows finality. Needs the fleet's peer multiaddrs and an operator willing
-   to let an extra peer connect.
-2. **HotStuff-2 protocol core.** ~9k near-reth-free lines. Gives this repo a
-   voting/proposing node rather than an observer. Independent of the reth
-   version; can land before any upgrade.
-3. **reth v1.11.0 → 2.4.1.** The wall. 1,484 upstream commits across 12+
-   vendored fork crates, plus edition 2021 → 2024 and rustc 1.86 → 1.97. This
-   repo's own history (1.9.3 → 1.10.2 → 1.11.0) shows what each step costs.
-   Prerequisite for `adapter.rs`, `n42-consensus-service`, `n42-jmt`, and for
-   EL parity with N42-26.
-4. **QMDB as a live state backend.** `verify_portable_stream` bootstraps from a
-   snapshot; running the fleet's commitment scheme as this node's state root
-   engine is a different and much larger job — it means an alternative to reth's
-   MPT `StateRootProvider`.
-
-An honest alternative to 3 and 4: N42-26 already *is* the reth-2.4.1 Rust client
-with HotStuff-2 and QMDB. If the goal is a Rust node on the gov5 fleet rather
-than this specific codebase, converging on N42-26 is cheaper than back-porting
-into a reth-1.11 fork. This repo's distinct asset is APoS/Clique plus the beacon
-storage layer, which N42-26 does not have.
+0. **Rewards as withdrawals** (item 1): derive from the chainspec, map
+   both ways, prove on a chain-94-shaped devnet genesis (`devBlockReward`
+   and `devFaucetAddress` set) with a mixed fleet.
+1. **Committee pool** (item 2): port selection, evidence, commitment and
+   registration; prove on the same devnet with `committeePool` enabled.
+2. **qs_epoch_test** (item 7): run the mixed fleet on chain 95 and watch
+   an epoch boundary.
+3. **Snapshot bootstrap** (item 6): gov5 portable snapshot → QMDB forest
+   + reth plain state at head; then `--chain` chain 94 with block-number
+   forks mapped (item 5) so the member starts at the head.
+4. **Header field and EVM parity** (items 3–4): `MobileRegistryRoot`
+   needs a header extension on the reth side; EOF is a revm question.
+5. **Rejoining after a long absence, measured over hours**, and the
+   observer against the live fleet — the two operational items from
+   before, unchanged.

@@ -1405,6 +1405,16 @@ impl<E: ExecutionLayer> H2Service<E> {
                 let hash = block.block_hash;
                 let number = block.header.number;
                 self.note_peer_height(peer, number);
+                // Gossip may have got there first: bodies held back while
+                // the pull was far behind are executed as it closes in, and
+                // their commits finalise them. A forkchoice back to a block
+                // behind the finalised one is a reorg reth refuses.
+                if self.imported.contains(&hash) {
+                    if let Some(c) = self.catch_up.as_mut() {
+                        c.next += 1;
+                    }
+                    continue;
+                }
                 match self.driver.import_pulled(block.execution_data()).await {
                     Ok(_) => {
                         self.remember_imported(hash);

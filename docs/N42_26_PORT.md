@@ -642,6 +642,52 @@ codec is checked against gov5's SSZ and chunk layout and over a real
 connection between two transports; a live gov5 range request has not been
 observed yet, because on this devnet the cheaper path always won.
 
+**Coming back after an hour.** The absence a fleet actually meets is not
+a fresh member but one that took part, went away with its execution layer,
+and comes back on the same datadirs to a chain that moved on without it.
+`scripts/devnet-fleet.sh` does that (`ABSENT_VALIDATOR=2 ABSENT_AT=300
+ABSENT_FOR=3600`): the member resumes from its checkpoint ("resuming at
+view 121, last voted 120"), its execution layer is up in 1.5 s, the first
+status it hears shows the Go member ahead, and it pulls the gap by range.
+Measured on the mixed devnet with one hour away: absent at height 120,
+back with the fleet at 1002; 883 blocks pulled from gov5 and imported in
+44.9 s (19.7 blocks/s through `newPayload` + forkchoice, debug build,
+QMDB roots); the 14 blocks the fleet produced meanwhile arrived by gossip
+and fetch-on-miss in the next 7 s; view 121 → 1298 by the QC it heard;
+first commit 52 s after the return, on its own proposal (it was that
+view's leader), then 62 proposals and 231 commits in the 14 minutes the
+run had left, no timeouts anywhere in the fleet after the return, every
+client at 1234 with the same head, gov5 without an error. The fleet of
+three had timed out every fourth view for the hour (the absent leader's),
+which is why the chain grew 882 blocks in 1178 views.
+
+The pull now goes on past the status's target a window (1024 blocks) at a
+time until the peer serves short or refuses — gov5 answers a range past
+its head with "code 2: invalid block number" — so a chain that keeps
+producing during a long pull is caught up by the pull itself, not left to
+gossip's future queue.
+
+**The safety bug the first attempt found.** The first run of this
+scenario did not get as far as the absence: with member 2 starting a few
+seconds after the others (its own execution layer had to come up), the
+fleet committed block 1 at view 1, and member 2 — leader of view 2, having
+heard the view-1 QC but never imported its block — built on its stale
+genesis head and proposed a *sibling* of the committed block. The two Rust
+members voted for it and committed it next to the block they had committed
+one view earlier; the gov5 member, whose `extendsJustify` refuses a
+proposal that does not extend its justify QC's block, refused to revert its
+applied chain and stopped (the "CONSENSUS STATE FORKED FROM APPLIED CHAIN"
+wedge — in this case gov5 was right and the Rust quorum was wrong). The
+port's safety check compared views alone (`justify.view >= locked.view`);
+the extends rule had not been carried over. It is now: the engine remembers
+the parent of every imported block, the import-gated vote is refused when
+that parent is not the justify QC's block (a zero or unknown parent passes,
+as in gov5; `test_h2_vote_refuses_a_proposal_that_does_not_extend_its_justify`),
+a leader builds on the block its highest QC certifies rather than on its
+execution layer's last import and asks the fleet for that block when it
+lacks it, and a member whose peers are ahead at connect pulls the gap
+however small.
+
 ## Live cross-client attach: how far it got
 
 There is no gov5 fleet on this Linux host — the deployment docs point at a
@@ -1006,6 +1052,7 @@ rest of the production-fleet list in build order.
 2. **Transactions** (item 7): done (item 6 above); what remains is
    gov5's own optimisation of announcing a hash before a body, if it ever
    gets one.
-3. **Rejoining after a long absence, measured over hours**, and the
-   observer against the live fleet — the two operational items from
-   before, unchanged.
+3. **Rejoining after a long absence**: measured at one hour ("Coming
+   back after an hour", above), which also surfaced and fixed the missing
+   extends rule. The observer against the live fleet still waits for a
+   reachable one — there is no gov5 fleet on this host.

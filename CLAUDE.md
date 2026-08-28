@@ -72,6 +72,9 @@ node, four Rust validators, or three plus a gov5 member from `../N42-gov5` (buil
 the zero parent-beacon-root fix; `docs/gov5-cancun-parent-beacon-root.patch` is the same change for
 an older branch). `GOV5_DELAY=<s>` starts the Go member late; `LATE_VALIDATOR=<i> LATE_DELAY=<s>`
 starts one Rust member late with its own fresh execution layer, so it has to pull the chain by range;
+`ABSENT_VALIDATOR=<i> ABSENT_AT=<s> ABSENT_FOR=<s>` runs one member with its own execution layer from
+the start, kills both at `ABSENT_AT` keeping the datadirs, and restarts them `ABSENT_FOR` seconds later
+(logs get a `-back` suffix) — the long-absence rejoin measurement;
 `LATE_SNAPSHOT=<dir>` initialises that execution layer at a chain's head instead
 (`n42-init-snapshot init`, from gov5's `n42-reth-state-dump` JSONL + header and a portable QMDB
 snapshot — `n42-qmdb-export` or `n42-init-snapshot export`), so it pulls only what came after.

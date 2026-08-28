@@ -330,6 +330,12 @@ const MAX_HELD_BODIES: usize = 4096;
 const MAX_IMPORTED: usize = 8192;
 /// Between the end of one catch-up and the start of the next.
 const CATCH_UP_RETRY: Duration = Duration::from_secs(3);
+/// Pulled blocks imported per step. Importing a whole window of 1024 in one
+/// go kept the swarm unpolled for the fifty seconds it took; gov5's streams
+/// to this node timed out meanwhile and it dropped the connection. Between
+/// batches the loop polls the transport and reads consensus, which the
+/// guards on far-ahead blocks and unimported commits make safe.
+const PULLED_BLOCKS_PER_STEP: usize = 32;
 
 /// How many block bodies to keep for peers that ask. gov5 asks for the
 /// parent of a block it cannot place and for the block a proposal names —
@@ -593,7 +599,9 @@ impl<E: ExecutionLayer> H2Service<E> {
             still_advancing = remaining == 0;
         }
 
-        if still_advancing {
+        // A range reply half imported is finished the same way: the swarm
+        // gets one poll and the step returns to import the next batch.
+        if still_advancing || !self.pending_imports.is_empty() {
             // The bound stopped a leader that was still making progress.
             // Blocking now would trade the rest of its views for a timeout, so
             // look at the network without waiting and come straight back —
@@ -1368,9 +1376,13 @@ impl<E: ExecutionLayer> H2Service<E> {
     }
 
     /// Imports the ranges that came back, in order, through the execution
-    /// layer; asks for the next range while the target is not reached.
+    /// layer, at most [`PULLED_BLOCKS_PER_STEP`] per call — what is left of a
+    /// reply waits for the next step; asks for the next range while the
+    /// target is not reached.
     async fn import_ranges(&mut self, events: &mut Vec<ServiceEvent>) {
-        for (peer, request, chunks) in std::mem::take(&mut self.pending_imports) {
+        let mut budget = PULLED_BLOCKS_PER_STEP;
+        let mut replies = std::mem::take(&mut self.pending_imports).into_iter();
+        while let Some((peer, request, chunks)) = replies.next() {
             let Some(catch_up) = self.catch_up.as_ref() else {
                 continue;
             };
@@ -1387,7 +1399,12 @@ impl<E: ExecutionLayer> H2Service<E> {
                 }
                 continue;
             }
-            for chunk in chunks {
+            let mut chunks = std::collections::VecDeque::from(chunks);
+            while budget > 0 {
+                let Some(chunk) = chunks.pop_front() else {
+                    break;
+                };
+                budget -= 1;
                 let block = match decode_block_rlp(&chunk.rlp, self.header_profile) {
                     Ok(block) => block,
                     Err(err) => {
@@ -1435,6 +1452,20 @@ impl<E: ExecutionLayer> H2Service<E> {
             let Some(catch_up) = self.catch_up.as_mut() else {
                 continue;
             };
+            if !chunks.is_empty() {
+                // Out of budget with this reply unfinished: back where it
+                // was, under the start the catch-up now expects, ahead of the
+                // replies not yet looked at.
+                let rest = RangeRequest {
+                    start: catch_up.next,
+                    count: chunks.len() as u64,
+                    step: request.step,
+                };
+                let mut pending = vec![(peer, rest, Vec::from(chunks))];
+                pending.extend(replies);
+                self.pending_imports = pending;
+                return;
+            }
             let window_filled = catch_up.next > catch_up.target;
             if window_filled {
                 // The status's target is reached, or a probe window came back

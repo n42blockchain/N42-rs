@@ -537,11 +537,20 @@ pub const MAX_RANGE_BLOCKS: u64 = 1024;
 /// ([`MAX_RANGE_BLOCKS`]) is 64 GiB — a bound in name only. A reply is held
 /// whole until the stream closes (libp2p's request-response hands back one
 /// value), so what a peer can make this node buffer is what this constant
-/// says. gov5 has no such budget to match; 256 MiB is over a thousand
-/// blocks of a quarter megabyte each, well past what the devnet's blocks
-/// run, and an honest peer serving bigger blocks serves a shorter range —
-/// the requester asks for the rest from where the reply ended.
+/// says. gov5 has no such budget to match, and a gov5 server serves the
+/// whole range whatever its blocks weigh; 256 MiB is over a thousand blocks
+/// of a quarter megabyte each, well past what the devnet's blocks run. A
+/// reply that would cross the budget is not refused — the peer broke no
+/// rule — it ends at the last block that fits, and the requester asks for
+/// the rest from where the reply ended, as it does for any short reply.
+/// This node's own range server stops at the same budget
+/// (`n42_h2_node`'s `serve_range`), so between two of these nodes the cut
+/// is made before the bytes are sent.
 pub const MAX_RANGE_BYTES: u64 = 256 << 20;
+
+// The budget always fits the largest single block, so a reply is never
+// empty for want of room.
+const _: () = assert!(MAX_RANGE_BYTES >= MAX_BLOCK_CHUNK);
 
 /// A range of blocks by number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -665,7 +674,12 @@ impl request_response::Codec for BodiesByRangeCodec {
 /// which is not read), the per-block declared length ([`MAX_BLOCK_CHUNK`]),
 /// and the running total of declared lengths (`max_bytes`, a budget for the
 /// whole reply). All three read the varint a chunk opens with, so a peer
-/// declaring past a bound costs one varint, not a buffer.
+/// declaring past a bound costs one varint, not a buffer. The first two are
+/// protocol violations and fail the reply; the budget is this node's own
+/// limit, so a reply that would cross it is returned as the blocks read so
+/// far — a short reply, which the catch-up continues from — and the stream
+/// is left standing at the varint of the block that did not fit. Only when
+/// not even the first block fits is the reply an error.
 async fn read_range_reply<T>(io: &mut T, max_blocks: u64, max_bytes: u64) -> io::Result<RangeReply>
 where
     T: AsyncRead + Unpin + Send,
@@ -696,10 +710,15 @@ where
         }
         total = total.saturating_add(declared);
         if total > max_bytes {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("range reply exceeds the {max_bytes} byte budget at block {}", chunks.len() + 1),
-            ));
+            if chunks.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("range reply's first block of {declared} bytes is past the {max_bytes} byte budget"),
+                ));
+            }
+            // The blocks before this one are the reply; the stream is dropped
+            // with this block's body unread.
+            return Ok(Ok(chunks));
         }
         let rlp = read_framed_body(io, declared, MAX_BLOCK_WIRE_BYTES).await?;
         chunks.push(BlockChunk { fork_digest, rlp });
@@ -785,20 +804,32 @@ mod bodies_by_range_tests {
     }
 
     #[test]
-    fn a_reply_past_the_byte_budget_is_refused_where_it_crosses_it() {
+    fn a_reply_past_the_byte_budget_ends_at_the_last_block_that_fits() {
         let wire = reply_of(&[100, 100, 100]);
-        // 300 bytes declared in all: fits a 300 budget, not a 299 one.
+        // 300 bytes declared in all: fits a 300 budget whole.
         let ok = block_on(read_range_reply(&mut futures::io::Cursor::new(wire.clone()), 10, 300)).unwrap();
         assert_eq!(ok.unwrap().len(), 3);
-        let err = block_on(read_range_reply(&mut futures::io::Cursor::new(wire.clone()), 10, 299)).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains("budget at block 3"), "{err}");
+        // Not a 299 one: the third block does not fit, so the reply is the
+        // first two — a short reply, not an error — and the stream stands
+        // at the third block's varint, its body unread.
+        let mut cursor = futures::io::Cursor::new(wire.clone());
+        let short = block_on(read_range_reply(&mut cursor, 10, 299)).unwrap().unwrap();
+        assert_eq!(short.len(), 2);
+        assert_eq!(short[1].rlp, vec![1u8; 100]);
+        let two_blocks = reply_of(&[100, 100]).len();
+        let varint = crate::status::encode_varint(100).len();
+        assert_eq!(cursor.position() as usize, two_blocks + 1 + 4 + varint);
         // The budget is on declared, uncompressed bytes, so a peer cannot
         // slip under it by compressing well: 100 zero bytes frame to far
         // fewer on the wire, and still count as 100.
         assert!(wire.len() < 300, "wire is {} bytes", wire.len());
-        let err = block_on(read_range_reply(&mut futures::io::Cursor::new(wire), 10, 150)).unwrap_err();
-        assert!(err.to_string().contains("budget at block 2"), "{err}");
+        let short = block_on(read_range_reply(&mut futures::io::Cursor::new(wire.clone()), 10, 150)).unwrap().unwrap();
+        assert_eq!(short.len(), 1);
+        // A budget the first block alone is past is the one case that is an
+        // error: there is nothing to serve short of it.
+        let err = block_on(read_range_reply(&mut futures::io::Cursor::new(wire), 10, 99)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("first block"), "{err}");
     }
 
     #[test]

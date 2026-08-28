@@ -1453,12 +1453,28 @@ impl<E: ExecutionLayer> H2Service<E> {
 /// with the wrong block cannot smuggle one in.
 ///
 /// An execution layer that does not report its head or does not answer by
-/// hash (both are the trait's defaults), or that no longer holds a block of
-/// the range, is walked forward by number instead, with the same parent link
-/// checked between neighbours; a seam ends the reply there, so what is
-/// served still links, only shorter. gov5 reads a reply from `start` in
-/// order, so a reply is never served with a hole.
+/// hash (both are the trait's defaults), that fails either lookup, or that
+/// no longer holds a block of the range, is walked forward by number
+/// instead, with the same parent link checked between neighbours; a seam
+/// ends the reply there, so what is served still links, only shorter. gov5
+/// reads a reply from `start` in order, so a reply is never served with a
+/// hole.
+///
+/// The reply is also held to [`n42_h2_net::MAX_RANGE_BYTES`] of block RLP,
+/// the budget a requester of this implementation reads a reply up to: past
+/// it the requester would drop the rest unread, so it is not fetched or
+/// sent. A reply cut there is a short reply like any other, and the
+/// requester asks for the rest from where it ended.
 async fn serve_range<E: ExecutionLayer>(el: &E, request: n42_h2_net::RangeRequest) -> Vec<Vec<u8>> {
+    serve_range_within(el, request, n42_h2_net::MAX_RANGE_BYTES).await
+}
+
+/// [`serve_range`] with the byte budget as a parameter, for the tests.
+async fn serve_range_within<E: ExecutionLayer>(
+    el: &E,
+    request: n42_h2_net::RangeRequest,
+    max_bytes: u64,
+) -> Vec<Vec<u8>> {
     let count = request.count.min(MAX_RANGE_BLOCKS);
     if count == 0 {
         return Vec::new();
@@ -1467,16 +1483,16 @@ async fn serve_range<E: ExecutionLayer>(el: &E, request: n42_h2_net::RangeReques
     let latest = match el.latest_block_number().await {
         Ok(latest) => latest,
         Err(err) => {
-            debug!(target: "n42.h2.node", %err, "execution layer could not report its head");
-            return Vec::new();
+            debug!(target: "n42.h2.node", %err, "execution layer could not report its head; walking the range forward");
+            None
         }
     };
     if let Some(head) = latest
-        && let Some(chunks) = serve_range_anchored(el, request.start, last.min(head)).await
+        && let Some(chunks) = serve_range_anchored(el, request.start, last.min(head), max_bytes).await
     {
         return chunks;
     }
-    serve_range_forward(el, request.start, last).await
+    serve_range_forward(el, request.start, last, max_bytes).await
 }
 
 /// gov5's block form of an execution layer block.
@@ -1489,10 +1505,17 @@ fn range_chunk(block: &n42_h2_execution::ChainBlock) -> Vec<u8> {
 }
 
 /// `start..=last` by walking parent hashes down from `last`, resolved by
-/// number once. `None` when a block of the range could not be had by hash,
-/// or was not the block its child named — the caller falls back to the
-/// forward walk; nothing partial is served from here.
-async fn serve_range_anchored<E: ExecutionLayer>(el: &E, start: u64, last: u64) -> Option<Vec<Vec<u8>>> {
+/// number once. `None` when a block of the range could not be had — the
+/// anchor by number, or an earlier block by hash — or was not the block its
+/// child named, or when the range's blocks together outweigh `max_bytes`:
+/// the caller falls back to the forward walk, which serves what it can from
+/// `start`; nothing partial is served from here.
+async fn serve_range_anchored<E: ExecutionLayer>(
+    el: &E,
+    start: u64,
+    last: u64,
+    max_bytes: u64,
+) -> Option<Vec<Vec<u8>>> {
     if last < start {
         return Some(Vec::new());
     }
@@ -1502,16 +1525,24 @@ async fn serve_range_anchored<E: ExecutionLayer>(el: &E, start: u64, last: u64) 
             debug!(target: "n42.h2.node", asked = last, got = block.header.number, "execution layer answered a block request with the wrong number");
             return None;
         }
-        Ok(None) => return Some(Vec::new()),
+        Ok(None) => {
+            debug!(target: "n42.h2.node", number = last, "execution layer does not serve the block its head names; walking forward");
+            return None;
+        }
         Err(err) => {
             debug!(target: "n42.h2.node", number = last, %err, "execution layer could not serve a block");
-            return Some(Vec::new());
+            return None;
         }
     };
     let mut chunks = Vec::with_capacity((last - start + 1) as usize);
     let mut parent_hash = anchor.header.parent_hash;
     let mut number = last;
-    chunks.push(range_chunk(&anchor));
+    let mut total = 0u64;
+    let chunk = range_chunk(&anchor);
+    if !fits_budget(&mut total, chunk.len(), max_bytes, number) {
+        return None;
+    }
+    chunks.push(chunk);
     while number > start {
         number -= 1;
         let block = match el.block_by_hash(parent_hash).await {
@@ -1530,17 +1561,34 @@ async fn serve_range_anchored<E: ExecutionLayer>(el: &E, start: u64, last: u64) 
             return None;
         }
         parent_hash = block.header.parent_hash;
-        chunks.push(range_chunk(&block));
+        let chunk = range_chunk(&block);
+        if !fits_budget(&mut total, chunk.len(), max_bytes, number) {
+            return None;
+        }
+        chunks.push(chunk);
     }
     chunks.reverse();
     Some(chunks)
 }
 
+/// Adds a chunk's bytes to a reply's running total, and says whether the
+/// reply is still within `max_bytes` with it.
+fn fits_budget(total: &mut u64, len: usize, max_bytes: u64, number: u64) -> bool {
+    *total = total.saturating_add(len as u64);
+    if *total > max_bytes {
+        debug!(target: "n42.h2.node", number, total = *total, max_bytes, "range reply outweighs the byte budget");
+        return false;
+    }
+    true
+}
+
 /// `start..=last` by number, forward, ending at the first block that does
-/// not link to the one before it.
-async fn serve_range_forward<E: ExecutionLayer>(el: &E, start: u64, last: u64) -> Vec<Vec<u8>> {
+/// not link to the one before it, or that would take the reply past
+/// `max_bytes`.
+async fn serve_range_forward<E: ExecutionLayer>(el: &E, start: u64, last: u64, max_bytes: u64) -> Vec<Vec<u8>> {
     let mut chunks = Vec::new();
     let mut previous: Option<B256> = None;
+    let mut total = 0u64;
     for number in start..=last {
         let block = match el.block_by_number(number).await {
             Ok(Some(block)) => block,
@@ -1558,8 +1606,12 @@ async fn serve_range_forward<E: ExecutionLayer>(el: &E, start: u64, last: u64) -
             debug!(target: "n42.h2.node", number, "chain moved under a range being served; ended at the seam");
             break;
         }
+        let chunk = range_chunk(&block);
+        if !fits_budget(&mut total, chunk.len(), max_bytes, number) {
+            break;
+        }
         previous = Some(block.header.hash_slow());
-        chunks.push(range_chunk(&block));
+        chunks.push(chunk);
     }
     chunks
 }
@@ -1598,6 +1650,11 @@ mod range_tests {
         lookups_before_fork: usize,
         lookups: AtomicUsize,
         reports_head: bool,
+        /// `latest_block_number` fails outright.
+        head_error: bool,
+        /// How far past its last block the reported head lies — a head the
+        /// layer names but cannot serve.
+        head_overstated_by: u64,
     }
 
     impl Reorging {
@@ -1613,6 +1670,8 @@ mod range_tests {
                 lookups_before_fork,
                 lookups: AtomicUsize::new(0),
                 reports_head: true,
+                head_error: false,
+                head_overstated_by: 0,
             }
         }
 
@@ -1629,7 +1688,12 @@ mod range_tests {
     #[async_trait::async_trait]
     impl ExecutionLayer for Reorging {
         async fn latest_block_number(&self) -> Result<Option<u64>, ElError> {
-            Ok(self.reports_head.then(|| self.canonical.lock().unwrap().len() as u64 - 1))
+            if self.head_error {
+                return Err(ElError::new("eth_blockNumber: connection refused"));
+            }
+            Ok(self
+                .reports_head
+                .then(|| self.canonical.lock().unwrap().len() as u64 - 1 + self.head_overstated_by))
         }
         async fn block_by_hash(&self, hash: B256) -> Result<Option<ChainBlock>, ElError> {
             self.tick();
@@ -1765,5 +1829,56 @@ mod range_tests {
         assert_eq!(served.len(), 4);
         assert_linked(&served, 3);
         assert_eq!(served[1].1, four);
+    }
+
+    #[tokio::test]
+    async fn a_head_the_layer_cannot_report_or_serve_is_walked_forward() {
+        let main = chain(B256::ZERO, 10, 0xA);
+        // `eth_blockNumber` fails: the range is still served, by number.
+        let mut el = Reorging::new(main.clone(), None, usize::MAX);
+        el.head_error = true;
+        let served = numbers_and_links(&serve_range(&el, RangeRequest { start: 2, count: 5, step: 1 }).await);
+        assert_eq!(served.len(), 5);
+        assert_linked(&served, 2);
+        // The layer names a head it does not serve (block 12 of a chain to
+        // 9): the anchor is missing, and the range is served by number up
+        // to what exists rather than answered empty.
+        let mut el = Reorging::new(main, None, usize::MAX);
+        el.head_overstated_by = 3;
+        let served = numbers_and_links(&serve_range(&el, RangeRequest { start: 7, count: 6, step: 1 }).await);
+        assert_eq!(served.iter().map(|(n, _, _)| *n).collect::<Vec<_>>(), vec![7, 8, 9]);
+        assert_linked(&served, 7);
+    }
+
+    #[tokio::test]
+    async fn a_reply_is_cut_at_the_byte_budget_on_either_walk() {
+        let mut main = chain(B256::ZERO, 6, 0xA);
+        // Heavy blocks, re-linked after the change.
+        let mut parent = B256::ZERO;
+        for block in &mut main {
+            block.header.parent_hash = parent;
+            block.header.extra_data = vec![0xC; 1024].into();
+            parent = block.header.hash_slow();
+        }
+        let sizes: Vec<u64> = main.iter().map(|b| range_chunk(b).len() as u64).collect();
+        let request = RangeRequest { start: 1, count: 4, step: 1 };
+        // Room for blocks 1 and 2 and half of 3.
+        let budget = sizes[1] + sizes[2] + sizes[3] / 2;
+
+        let el = Reorging::new(main.clone(), None, usize::MAX);
+        let served = numbers_and_links(&serve_range_within(&el, request, budget).await);
+        assert_eq!(served.iter().map(|(n, _, _)| *n).collect::<Vec<_>>(), vec![1, 2]);
+        assert_linked(&served, 1);
+        // Exactly the budget fits the three.
+        let served = serve_range_within(&el, request, sizes[1] + sizes[2] + sizes[3]).await;
+        assert_eq!(served.len(), 3);
+
+        let mut el = Reorging::new(main, None, usize::MAX);
+        el.reports_head = false;
+        let served = numbers_and_links(&serve_range_within(&el, request, budget).await);
+        assert_eq!(served.iter().map(|(n, _, _)| *n).collect::<Vec<_>>(), vec![1, 2]);
+        assert_linked(&served, 1);
+        // The production budget is the requester's.
+        assert_eq!(n42_h2_net::MAX_RANGE_BYTES, 256 << 20);
     }
 }

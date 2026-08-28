@@ -186,9 +186,16 @@ impl QmdbNodeState {
     /// From the snapshot if it matches the head; from the alloc if the database
     /// is at genesis; otherwise an error, since a QMDB chain cannot start from
     /// execution state alone. Idempotent once initialised.
+    ///
+    /// The snapshot is read and decoded — or the alloc replayed — with the
+    /// lock released: a forest is hundreds of megabytes on a live chain, and
+    /// every other holder of this handle (the mobile endpoint's root and
+    /// proofs, the engine's `is_initialized`, `Debug`) would otherwise wait
+    /// out the file read behind the lock rather than answer at once that
+    /// nothing is initialised yet. Two callers racing here both read; the
+    /// first to take the lock installs, the second finds it done.
     pub fn initialize(&self, head: (u64, B256)) -> Result<(), NodeStateError> {
-        let mut guard = self.lock();
-        if guard.is_some() {
+        if self.lock().is_some() {
             return Ok(());
         }
         let (head_number, head_hash) = head;
@@ -225,7 +232,10 @@ impl QmdbNodeState {
                 return Err(NodeStateError::NoSnapshot { path, head_number });
             }
         };
-        *guard = Some(forest);
+        let mut guard = self.lock();
+        if guard.is_none() {
+            *guard = Some(forest);
+        }
         Ok(())
     }
 
@@ -388,6 +398,20 @@ impl StateProofProvider for QmdbNodeState {
     fn prove_storage(&self, address: Address, slot: B256) -> Option<QmdbProof> {
         self.lock().as_mut()?.prove_storage(address, slot)
     }
+
+    fn prove_account_anchored(&self, address: Address) -> Option<(B256, QmdbProof)> {
+        let mut guard = self.lock();
+        let forest = guard.as_mut()?;
+        let proof = forest.prove_account(address)?;
+        Some((forest.root(), proof))
+    }
+
+    fn prove_storage_anchored(&self, address: Address, slot: B256) -> Option<(B256, QmdbProof)> {
+        let mut guard = self.lock();
+        let forest = guard.as_mut()?;
+        let proof = forest.prove_storage(address, slot)?;
+        Some((forest.root(), proof))
+    }
 }
 
 fn read_snapshot(path: &Path) -> Result<Option<ForestSnapshot>, NodeStateError> {
@@ -531,6 +555,50 @@ mod tests {
             behind.initialize((5, B256::repeat_byte(0x55))),
             Err(NodeStateError::SnapshotMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn concurrent_initialisation_installs_one_forest_and_reads_off_the_lock() {
+        let chain = qmdb_chain();
+        let dir = scratch("concurrent-init");
+        let genesis_hash = chain.genesis_hash();
+        // Write a snapshot at genesis so both callers take the file path.
+        let seed = QmdbNodeState::new(chain.clone(), &dir);
+        seed.initialize((0, genesis_hash)).unwrap();
+        seed.on_canonical(genesis_hash).unwrap();
+        assert!(seed.snapshot_path().exists());
+        let root = seed.state_root();
+
+        let state = QmdbNodeState::new(chain, &dir);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let state = &state;
+                scope.spawn(move || state.initialize((0, genesis_hash)).unwrap());
+            }
+        });
+        assert!(state.is_initialized());
+        assert_eq!(state.head(), Some((0, genesis_hash)));
+        assert_eq!(state.state_root(), root);
+        // A third initialisation is a no-op, not a second forest.
+        state.initialize((0, genesis_hash)).unwrap();
+        assert_eq!(state.head(), Some((0, genesis_hash)));
+    }
+
+    #[test]
+    fn an_anchored_proof_carries_the_root_it_verifies_against() {
+        let chain = qmdb_chain();
+        let state = QmdbNodeState::new(chain.clone(), scratch("anchored"));
+        let genesis_hash = chain.genesis_hash();
+        state.initialize((0, genesis_hash)).unwrap();
+        let address: Address = "0x0000000000000000000000000000000000000001".parse().unwrap();
+        let (root, proof) = state.prove_account_anchored(address).expect("the alloc account has a leaf");
+        assert_eq!(root, state.state_root());
+        assert!(proof.verify_for_key(&root.0, &proof.key), "the proof verifies against the root it came with");
+        assert!(state.prove_storage_anchored(address, B256::ZERO).is_none(), "no storage leaf");
+        assert!(
+            QmdbNodeState::new(chain, scratch("anchored-uninit")).prove_account_anchored(address).is_none(),
+            "nothing before initialisation"
+        );
     }
 
     #[test]

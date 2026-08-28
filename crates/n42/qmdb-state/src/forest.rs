@@ -433,6 +433,24 @@ pub trait StateProofProvider: Send + Sync {
     fn prove_account(&self, address: Address) -> Option<QmdbProof>;
     /// Proves a storage slot's leaf, if it has one.
     fn prove_storage(&self, address: Address, slot: B256) -> Option<QmdbProof>;
+
+    /// Proves an account's leaf together with the root it is anchored to,
+    /// both read under one view of the tree. Calling [`Self::prove_account`]
+    /// and [`Self::state_root`] separately leaves a window for the head to
+    /// move between them, and a proof against one root reported with
+    /// another verifies nowhere. Implementors holding a lock override this
+    /// to take it once; the default is the two calls, for a provider whose
+    /// tree cannot move.
+    fn prove_account_anchored(&self, address: Address) -> Option<(B256, QmdbProof)> {
+        let proof = self.prove_account(address)?;
+        Some((self.state_root(), proof))
+    }
+
+    /// [`Self::prove_account_anchored`] for a storage slot.
+    fn prove_storage_anchored(&self, address: Address, slot: B256) -> Option<(B256, QmdbProof)> {
+        let proof = self.prove_storage(address, slot)?;
+        Some((self.state_root(), proof))
+    }
 }
 
 impl StateProofProvider for std::sync::Mutex<QmdbForest> {
@@ -453,6 +471,18 @@ impl StateProofProvider for std::sync::Mutex<QmdbForest> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .prove_storage(address, slot)
     }
+
+    fn prove_account_anchored(&self, address: Address) -> Option<(B256, QmdbProof)> {
+        let mut forest = self.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let proof = forest.prove_account(address)?;
+        Some((forest.root(), proof))
+    }
+
+    fn prove_storage_anchored(&self, address: Address, slot: B256) -> Option<(B256, QmdbProof)> {
+        let mut forest = self.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let proof = forest.prove_storage(address, slot)?;
+        Some((forest.root(), proof))
+    }
 }
 
 impl StateProofProvider for std::sync::Mutex<super::QmdbState> {
@@ -472,6 +502,18 @@ impl StateProofProvider for std::sync::Mutex<super::QmdbState> {
         self.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .prove_storage(address, slot)
+    }
+
+    fn prove_account_anchored(&self, address: Address) -> Option<(B256, QmdbProof)> {
+        let state = self.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let proof = state.prove_account(address)?;
+        Some((state.root(), proof))
+    }
+
+    fn prove_storage_anchored(&self, address: Address, slot: B256) -> Option<(B256, QmdbProof)> {
+        let state = self.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let proof = state.prove_storage(address, slot)?;
+        Some((state.root(), proof))
     }
 }
 

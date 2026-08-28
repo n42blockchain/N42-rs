@@ -59,7 +59,7 @@ use alloy_primitives::{Address, B256};
 use alloy_rpc_types_engine::{JwtSecret, PayloadAttributes};
 use n42_h2_consensus::{ConsensusEngine, EngineOutput, ValidatorInfo, ValidatorSet};
 use n42_h2_el_rpc::{EngineApiClient, HttpTransport};
-use n42_h2_execution::ExecutionDriver;
+use n42_h2_execution::{ExecutionDriver, ExecutionLayer};
 use n42_h2_net::{H2V4Transport, TransportConfig};
 use n42_h2_node::{ConsensusStore, H2Service, ServiceEvent};
 use n42_h2_primitives::bls::BlsSecretKey;
@@ -317,7 +317,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         engine.enable_h2_v4_signing(identity);
 
         let el = EngineApiClient::new(HttpTransport::new(el_url, jwt, Duration::from_secs(8))?);
-        let driver = ExecutionDriver::new(el, recovered_head.unwrap_or(identity.genesis_hash));
+        // The driver starts where the execution layer actually is. The
+        // checkpoint's last committed block may be one this node committed on
+        // the fleet's certificates while behind, without ever importing it; a
+        // driver anchored on a block the execution layer lacks would send
+        // every forkchoice to an unknown head.
+        let start_head = match recovered_head {
+            Some(hash) if el.block_by_hash(hash).await?.is_some() => hash,
+            Some(hash) => {
+                let latest = el.latest_block_number().await?.unwrap_or(0);
+                let head = el
+                    .block_by_number(latest)
+                    .await?
+                    .map(|block| block.header.hash_slow())
+                    .unwrap_or(identity.genesis_hash);
+                println!("execution    : at {latest} ({head:#x}), not at the checkpoint's {hash:#x}; starting from the execution layer");
+                head
+            }
+            None => identity.genesis_hash,
+        };
+        let driver = ExecutionDriver::new(el, start_head);
 
         let mut service = H2Service::new(transport, engine, driver, output_rx, validator_count);
         if let Some(store) = store {

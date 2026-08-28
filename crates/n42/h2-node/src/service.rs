@@ -228,6 +228,13 @@ pub struct H2Service<E> {
     catch_up_retry_after: Option<std::time::Instant>,
     /// The peer whose catch-up failed last; another is preferred.
     failed_peer: Option<PeerId>,
+    /// Blocks the execution layer has imported through this service — voted
+    /// on, pulled or built. A commit for any other block is not handed to
+    /// the execution layer: a forkchoice to a head reth does not have starts
+    /// the same peerless backfill as a far-ahead payload. Bounded; insertion
+    /// order in `imported_order`.
+    imported: HashSet<B256>,
+    imported_order: std::collections::VecDeque<B256>,
     /// Bodies that arrived for awaited blocks, to execute on the next drain.
     /// Kept separate because the transport handler cannot await.
     ready_bodies: Vec<B256>,
@@ -319,6 +326,8 @@ const MAX_PENDING_RANGES: usize = 8;
 const FAR_AHEAD_BLOCKS: u64 = 32;
 /// Bodies held back at most; the oldest go first.
 const MAX_HELD_BODIES: usize = 4096;
+/// Imported hashes remembered; older commits never arrive.
+const MAX_IMPORTED: usize = 8192;
 /// Between the end of one catch-up and the start of the next.
 const CATCH_UP_RETRY: Duration = Duration::from_secs(3);
 
@@ -409,6 +418,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             peer_heights: std::collections::HashMap::new(),
             catch_up_retry_after: None,
             failed_peer: None,
+            imported: HashSet::new(),
+            imported_order: std::collections::VecDeque::new(),
             ready_bodies: Vec::new(),
             received_bodies: Vec::new(),
             body_outbox: Vec::new(),
@@ -1000,6 +1011,16 @@ impl<E: ExecutionLayer> H2Service<E> {
 
         // The execution driver sees every output and decides for itself which
         // ones concern it, so this does not have to duplicate that judgement.
+        if let EngineOutput::BlockCommitted { view, block_hash, .. } = &output
+            && !self.imported.contains(block_hash)
+        {
+            // The engine commits what the fleet certifies, imported here or
+            // not; the execution layer follows only what it has. The pull
+            // brings the rest, and the commits after it are for blocks it
+            // holds.
+            debug!(target: "n42.h2.node", view, ?block_hash, "commit for a block the execution layer has not imported; not finalised here");
+            return Ok(());
+        }
         if let EngineOutput::ExecuteBlock(block_hash) = &output
             && self.far_ahead(*block_hash)
         {
@@ -1151,6 +1172,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         match self.driver.build_block_on(head, attrs, view).await {
             Ok(built) => {
                 debug!(target: "n42.h2.node", view, block = ?built.hash, txs = built.tx_count, "built a block to propose");
+                self.remember_imported(built.hash);
                 // The proposal names the hash; the body has to get there by
                 // itself, and before the proposal if the followers are to vote
                 // in the first round. Publishing it first is the best order
@@ -1185,6 +1207,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // The engine's extends rule reads the parent of an imported
                 // block; every block imported here came with its header.
                 if let ConsensusEvent::BlockImported(block_hash) = event.as_ref() {
+                    self.remember_imported(*block_hash);
                     if let Some(header) = self.block_headers.get(block_hash) {
                         self.engine.remember_parent(*block_hash, header.parent_hash);
                         self.note_imported(header.number);
@@ -1384,6 +1407,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 self.note_peer_height(peer, number);
                 match self.driver.import_pulled(block.execution_data()).await {
                     Ok(_) => {
+                        self.remember_imported(hash);
                         self.note_imported(number);
                         self.remember_block(hash, &block.header);
                         self.remember_body(hash, chunk.rlp);
@@ -1440,6 +1464,17 @@ impl<E: ExecutionLayer> H2Service<E> {
         match (self.block_headers.get(&block_hash), self.imported_height) {
             (Some(header), Some(tip)) => header.number > tip + FAR_AHEAD_BLOCKS,
             _ => false,
+        }
+    }
+
+    fn remember_imported(&mut self, block_hash: B256) {
+        if self.imported.insert(block_hash) {
+            self.imported_order.push_back(block_hash);
+            while self.imported_order.len() > MAX_IMPORTED {
+                if let Some(oldest) = self.imported_order.pop_front() {
+                    self.imported.remove(&oldest);
+                }
+            }
         }
     }
 

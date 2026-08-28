@@ -111,8 +111,16 @@ impl MockExecutionLayer {
     /// from the payload — gossiping the body to followers does — needs this;
     /// a made-up hash would be refused as a lie about the block.
     pub fn built_block(number: u64) -> BuiltBlock {
+        Self::built_block_on(number, B256::ZERO)
+    }
+
+    /// [`Self::built_block`] with its parent named, so a run of built blocks
+    /// links the way a real execution layer's chain does — what serving a
+    /// range by parent hash relies on.
+    pub fn built_block_on(number: u64, parent_hash: B256) -> BuiltBlock {
         let header = alloy_consensus::Header {
             number,
+            parent_hash,
             timestamp: 1_700_000_000 + number,
             gas_limit: 30_000_000,
             base_fee_per_gas: Some(7),
@@ -256,15 +264,21 @@ impl ExecutionLayer for MockExecutionLayer {
         _kind: ResolveKind,
     ) -> Option<Result<BuiltBlock, ElError>> {
         self.record(ElCall::ResolvePayload(id));
-        let number = {
+        let (number, parent_hash) = {
             // One past the highest block this mock has built or accepted, so
-            // a fleet of mocks numbers one chain rather than one per builder.
+            // a fleet of mocks numbers one chain rather than one per builder;
+            // on that block, so the chain links by hash as a real one does.
             let mut state = self.state.lock().expect("mock state lock");
             let known = state.blocks.keys().copied().max().unwrap_or(0);
+            let parent_hash = state
+                .blocks
+                .get(&known)
+                .map(|block| block.header.hash_slow())
+                .unwrap_or_default();
             state.next_block = state.next_block.max(known) + 1;
-            state.next_block
+            (state.next_block, parent_hash)
         };
-        let built = Self::built_block(number);
+        let built = Self::built_block_on(number, parent_hash);
         if let Ok(block) = built.execution_data.clone().try_into_block::<alloy_consensus::TxEnvelope>() {
             self.state
                 .lock()

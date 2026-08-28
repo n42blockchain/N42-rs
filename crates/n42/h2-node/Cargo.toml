@@ -29,6 +29,7 @@ url.workspace = true
 
 [dev-dependencies]
 alloy-signer.workspace = true
+async-trait = "0.1"
 alloy-signer-local.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 futures.workspace = true

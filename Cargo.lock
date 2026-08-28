@@ -8007,6 +8007,7 @@ dependencies = [
  "alloy-rpc-types-engine 2.4.1",
  "alloy-signer 2.4.1",
  "alloy-signer-local",
+ "async-trait",
  "futures",
  "hex",
  "libp2p",

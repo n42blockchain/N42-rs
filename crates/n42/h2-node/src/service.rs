@@ -1434,26 +1434,333 @@ impl<E: ExecutionLayer> H2Service<E> {
     }
 }
 
-/// The blocks of a range an execution layer can produce, from the start
-/// until the first it does not have.
+/// The blocks of a range, read from one view of the execution layer's chain.
+///
+/// A range is served over up to a thousand separate lookups, and the chain
+/// can move between any two of them: a block-by-number read on each side of
+/// a reorg hands the peer blocks from two chains that do not link, and its
+/// import stops at the seam (Erigon shipped the same class of bug in its
+/// range server, hash and body read from different snapshots). So the range
+/// is read from one anchor and walked by hash: the highest block of the
+/// range is resolved by number once, and every earlier block is fetched by
+/// its child's `parent_hash`. What is served is one chain by construction —
+/// the one that was canonical when the anchor was read — however the head
+/// moves meanwhile. Each block is checked to hash to what its child named
+/// and to carry the number expected of it, so an execution layer answering
+/// with the wrong block cannot smuggle one in.
+///
+/// An execution layer that does not report its head or does not answer by
+/// hash (both are the trait's defaults), or that no longer holds a block of
+/// the range, is walked forward by number instead, with the same parent link
+/// checked between neighbours; a seam ends the reply there, so what is
+/// served still links, only shorter. gov5 reads a reply from `start` in
+/// order, so a reply is never served with a hole.
 async fn serve_range<E: ExecutionLayer>(el: &E, request: n42_h2_net::RangeRequest) -> Vec<Vec<u8>> {
     let count = request.count.min(MAX_RANGE_BLOCKS);
-    let mut rlps = Vec::new();
-    for number in request.start..request.start.saturating_add(count) {
-        match el.block_by_number(number).await {
-            Ok(Some(block)) => {
-                rlps.push(encode_block_rlp_parts(
-                    &block.header,
-                    &block.transactions,
-                    &withdrawals_to_rewards(block.withdrawals.as_deref().unwrap_or(&[])),
-                ));
+    if count == 0 {
+        return Vec::new();
+    }
+    let last = request.start.saturating_add(count - 1);
+    let latest = match el.latest_block_number().await {
+        Ok(latest) => latest,
+        Err(err) => {
+            debug!(target: "n42.h2.node", %err, "execution layer could not report its head");
+            return Vec::new();
+        }
+    };
+    if let Some(head) = latest
+        && let Some(chunks) = serve_range_anchored(el, request.start, last.min(head)).await
+    {
+        return chunks;
+    }
+    serve_range_forward(el, request.start, last).await
+}
+
+/// gov5's block form of an execution layer block.
+fn range_chunk(block: &n42_h2_execution::ChainBlock) -> Vec<u8> {
+    encode_block_rlp_parts(
+        &block.header,
+        &block.transactions,
+        &withdrawals_to_rewards(block.withdrawals.as_deref().unwrap_or(&[])),
+    )
+}
+
+/// `start..=last` by walking parent hashes down from `last`, resolved by
+/// number once. `None` when a block of the range could not be had by hash,
+/// or was not the block its child named — the caller falls back to the
+/// forward walk; nothing partial is served from here.
+async fn serve_range_anchored<E: ExecutionLayer>(el: &E, start: u64, last: u64) -> Option<Vec<Vec<u8>>> {
+    if last < start {
+        return Some(Vec::new());
+    }
+    let anchor = match el.block_by_number(last).await {
+        Ok(Some(block)) if block.header.number == last => block,
+        Ok(Some(block)) => {
+            debug!(target: "n42.h2.node", asked = last, got = block.header.number, "execution layer answered a block request with the wrong number");
+            return None;
+        }
+        Ok(None) => return Some(Vec::new()),
+        Err(err) => {
+            debug!(target: "n42.h2.node", number = last, %err, "execution layer could not serve a block");
+            return Some(Vec::new());
+        }
+    };
+    let mut chunks = Vec::with_capacity((last - start + 1) as usize);
+    let mut parent_hash = anchor.header.parent_hash;
+    let mut number = last;
+    chunks.push(range_chunk(&anchor));
+    while number > start {
+        number -= 1;
+        let block = match el.block_by_hash(parent_hash).await {
+            Ok(Some(block)) => block,
+            Ok(None) => {
+                debug!(target: "n42.h2.node", number, hash = ?parent_hash, "execution layer does not serve a block of the range by hash; walking forward");
+                return None;
             }
+            Err(err) => {
+                debug!(target: "n42.h2.node", number, %err, "execution layer could not serve a block");
+                return None;
+            }
+        };
+        if block.header.number != number || block.header.hash_slow() != parent_hash {
+            debug!(target: "n42.h2.node", asked = ?parent_hash, number, got = block.header.number, "execution layer answered a block request with the wrong block");
+            return None;
+        }
+        parent_hash = block.header.parent_hash;
+        chunks.push(range_chunk(&block));
+    }
+    chunks.reverse();
+    Some(chunks)
+}
+
+/// `start..=last` by number, forward, ending at the first block that does
+/// not link to the one before it.
+async fn serve_range_forward<E: ExecutionLayer>(el: &E, start: u64, last: u64) -> Vec<Vec<u8>> {
+    let mut chunks = Vec::new();
+    let mut previous: Option<B256> = None;
+    for number in start..=last {
+        let block = match el.block_by_number(number).await {
+            Ok(Some(block)) => block,
             Ok(None) => break,
             Err(err) => {
                 debug!(target: "n42.h2.node", number, %err, "execution layer could not serve a block");
                 break;
             }
+        };
+        if block.header.number != number {
+            debug!(target: "n42.h2.node", asked = number, got = block.header.number, "execution layer answered a block request with the wrong number");
+            break;
+        }
+        if previous.is_some_and(|hash| block.header.parent_hash != hash) {
+            debug!(target: "n42.h2.node", number, "chain moved under a range being served; ended at the seam");
+            break;
+        }
+        previous = Some(block.header.hash_slow());
+        chunks.push(range_chunk(&block));
+    }
+    chunks
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+    use n42_h2_execution::{ChainBlock, ElError};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    fn chain(genesis_parent: B256, len: u64, salt: u8) -> Vec<ChainBlock> {
+        let mut blocks = Vec::new();
+        let mut parent_hash = genesis_parent;
+        for number in 0..len {
+            let header = Header {
+                number,
+                parent_hash,
+                timestamp: 1_000 + number * 4,
+                extra_data: vec![salt].into(),
+                ..Default::default()
+            };
+            parent_hash = header.hash_slow();
+            blocks.push(ChainBlock { header, transactions: Vec::new(), withdrawals: None });
+        }
+        blocks
+    }
+
+    /// An execution layer whose canonical chain can be swapped for another
+    /// after a number of lookups — a reorg happening while a range is served.
+    struct Reorging {
+        canonical: Mutex<Vec<ChainBlock>>,
+        by_hash: HashMap<B256, ChainBlock>,
+        fork: Mutex<Option<Vec<ChainBlock>>>,
+        lookups_before_fork: usize,
+        lookups: AtomicUsize,
+        reports_head: bool,
+    }
+
+    impl Reorging {
+        fn new(canonical: Vec<ChainBlock>, fork: Option<Vec<ChainBlock>>, lookups_before_fork: usize) -> Self {
+            let mut by_hash = HashMap::new();
+            for block in canonical.iter().chain(fork.iter().flatten()) {
+                by_hash.insert(block.header.hash_slow(), block.clone());
+            }
+            Self {
+                canonical: Mutex::new(canonical),
+                by_hash,
+                fork: Mutex::new(fork),
+                lookups_before_fork,
+                lookups: AtomicUsize::new(0),
+                reports_head: true,
+            }
+        }
+
+        fn tick(&self) {
+            let n = self.lookups.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == self.lookups_before_fork
+                && let Some(fork) = self.fork.lock().unwrap().take()
+            {
+                *self.canonical.lock().unwrap() = fork;
+            }
         }
     }
-    rlps
+
+    #[async_trait::async_trait]
+    impl ExecutionLayer for Reorging {
+        async fn latest_block_number(&self) -> Result<Option<u64>, ElError> {
+            Ok(self.reports_head.then(|| self.canonical.lock().unwrap().len() as u64 - 1))
+        }
+        async fn block_by_hash(&self, hash: B256) -> Result<Option<ChainBlock>, ElError> {
+            self.tick();
+            Ok(self.by_hash.get(&hash).cloned())
+        }
+        async fn block_by_number(&self, number: u64) -> Result<Option<ChainBlock>, ElError> {
+            self.tick();
+            Ok(self.canonical.lock().unwrap().get(number as usize).cloned())
+        }
+        async fn new_payload(&self, _: alloy_rpc_types_engine::ExecutionData) -> Result<alloy_rpc_types_engine::PayloadStatus, ElError> {
+            unreachable!()
+        }
+        async fn fork_choice_updated(&self, _: alloy_rpc_types_engine::ForkchoiceState) -> Result<alloy_rpc_types_engine::ForkchoiceUpdated, ElError> {
+            unreachable!()
+        }
+        async fn fork_choice_updated_with_attrs(&self, _: alloy_rpc_types_engine::ForkchoiceState, _: PayloadAttributes) -> Result<alloy_rpc_types_engine::ForkchoiceUpdated, ElError> {
+            unreachable!()
+        }
+        async fn resolve_payload(&self, _: alloy_rpc_types_engine::PayloadId, _: n42_h2_execution::ResolveKind) -> Option<Result<n42_h2_execution::BuiltBlock, ElError>> {
+            unreachable!()
+        }
+    }
+
+    fn numbers_and_links(rlps: &[Vec<u8>]) -> Vec<(u64, B256, B256)> {
+        rlps.iter()
+            .map(|rlp| {
+                let block = decode_block_rlp(rlp, HeaderProfile::Ethereum).unwrap();
+                (block.header.number, block.block_hash, block.header.parent_hash)
+            })
+            .collect()
+    }
+
+    fn assert_linked(served: &[(u64, B256, B256)], from: u64) {
+        for (i, (number, _, parent)) in served.iter().enumerate() {
+            assert_eq!(*number, from + i as u64, "served out of order");
+            if i > 0 {
+                assert_eq!(*parent, served[i - 1].1, "block {number} does not link to the one before");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_range_is_one_chain_even_when_the_head_reorgs_mid_way() {
+        let main = chain(B256::ZERO, 20, 0xA);
+        // A fork sharing blocks 0..=9 and diverging from 10.
+        let mut fork = main[..10].to_vec();
+        fork.extend(chain(main[9].header.hash_slow(), 10, 0xB).into_iter().map(|mut b| {
+            b.header.number += 10;
+            b
+        }));
+        // Re-link the fork's numbers: rebuild hashes after renumbering.
+        let mut parent = main[9].header.hash_slow();
+        for block in fork.iter_mut().skip(10) {
+            block.header.parent_hash = parent;
+            parent = block.header.hash_slow();
+        }
+        let request = RangeRequest { start: 5, count: 12, step: 1 };
+
+        // Reorg after the fourth lookup, in the middle of the range.
+        let el = Reorging::new(main.clone(), Some(fork.clone()), 4);
+        let served = numbers_and_links(&serve_range(&el, request).await);
+        assert_eq!(served.len(), 12);
+        assert_linked(&served, 5);
+        // And it is the chain that was canonical when the range was anchored.
+        let expected: Vec<B256> = main[5..17].iter().map(|b| b.header.hash_slow()).collect();
+        assert_eq!(served.iter().map(|(_, h, _)| *h).collect::<Vec<_>>(), expected);
+    }
+
+    #[tokio::test]
+    async fn a_forward_walk_ends_at_the_seam_when_the_head_is_not_reported() {
+        let main = chain(B256::ZERO, 20, 0xA);
+        let mut fork = main[..10].to_vec();
+        let mut parent = main[9].header.hash_slow();
+        for number in 10..20 {
+            let header = Header { number, parent_hash: parent, extra_data: vec![0xB].into(), ..Default::default() };
+            parent = header.hash_slow();
+            fork.push(ChainBlock { header, transactions: Vec::new(), withdrawals: None });
+        }
+        let mut el = Reorging::new(main.clone(), Some(fork), 4);
+        el.reports_head = false;
+        let request = RangeRequest { start: 8, count: 8, step: 1 };
+        let served = numbers_and_links(&serve_range(&el, request).await);
+        // Blocks 8, 9, 10 came from `main`; the fourth lookup swapped the
+        // chain, and block 11 of the fork does not link to `main`'s 10.
+        assert_eq!(served.len(), 3);
+        assert_linked(&served, 8);
+    }
+
+    #[tokio::test]
+    async fn a_range_is_bounded_by_the_head_and_the_block_cap() {
+        let main = chain(B256::ZERO, 8, 0xA);
+        let el = Reorging::new(main, None, usize::MAX);
+        let served = numbers_and_links(&serve_range(&el, RangeRequest { start: 5, count: 100, step: 1 }).await);
+        assert_eq!(served.len(), 3);
+        assert_linked(&served, 5);
+        assert!(serve_range(&el, RangeRequest { start: 8, count: 4, step: 1 }).await.is_empty());
+        assert!(serve_range(&el, RangeRequest { start: 2, count: 0, step: 1 }).await.is_empty());
+
+        let long = chain(B256::ZERO, MAX_RANGE_BLOCKS + 10, 0xA);
+        let el = Reorging::new(long, None, usize::MAX);
+        let served = serve_range(&el, RangeRequest { start: 0, count: MAX_RANGE_BLOCKS + 5, step: 1 }).await;
+        assert_eq!(served.len() as u64, MAX_RANGE_BLOCKS);
+    }
+
+    #[tokio::test]
+    async fn a_block_the_layer_does_not_serve_by_hash_falls_back_to_the_forward_walk() {
+        let main = chain(B256::ZERO, 10, 0xA);
+        let mut el = Reorging::new(main.clone(), None, usize::MAX);
+        // Block 3 is gone from the by-hash index; by number it is there.
+        let missing = main[3].header.hash_slow();
+        el.by_hash.remove(&missing);
+        let served = numbers_and_links(&serve_range(&el, RangeRequest { start: 2, count: 5, step: 1 }).await);
+        assert_eq!(served.len(), 5);
+        assert_linked(&served, 2);
+        // An execution layer with no by-hash lookup at all (the trait's
+        // default answers `None`) is served the same way.
+        el.by_hash.clear();
+        let served = numbers_and_links(&serve_range(&el, RangeRequest { start: 2, count: 5, step: 1 }).await);
+        assert_eq!(served.len(), 5);
+        assert_linked(&served, 2);
+    }
+
+    #[tokio::test]
+    async fn a_wrong_block_from_the_layer_is_not_served() {
+        let main = chain(B256::ZERO, 10, 0xA);
+        let mut el = Reorging::new(main.clone(), None, usize::MAX);
+        // The by-hash index answers block 4's hash with block 2.
+        let four = main[4].header.hash_slow();
+        el.by_hash.insert(four, main[2].clone());
+        let served = numbers_and_links(&serve_range(&el, RangeRequest { start: 3, count: 4, step: 1 }).await);
+        // The lie is not served: what comes back links and carries the
+        // numbers asked for (the forward walk by number supplied it).
+        assert_eq!(served.len(), 4);
+        assert_linked(&served, 3);
+        assert_eq!(served[1].1, four);
+    }
 }

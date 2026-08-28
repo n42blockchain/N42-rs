@@ -23,7 +23,7 @@ Branch `perf/erigon-borrow-20260828`, four code commits then this document.
 | (b) range served from separate views | `h2-node/src/service.rs:1439-1454` `serve_range`: one `el.block_by_number(n)` per block, each an independent `eth_getBlockByNumber` over `h2-el-rpc/src/engine.rs:329-338`; no linkage between neighbours. A reorg between two calls served blocks of two chains; the importer's per-block hash check (`decode_block_rlp`) cannot see across blocks, so the seam surfaced only as a `newPayload` failure at the peer. | **Found.** Over a JSON-RPC seam there is no `database_provider_ro()` to hold; the equivalent is to anchor once and walk by hash. | Anchored walk-back: commit `00e63fd6c`. Existing hash re-verification on receipt (`service.rs` `decode_block_rlp`, `block.block_hash == hash` for by-hash replies) kept. |
 | (b) `block_by_hash` fetch-on-miss | `service.rs:903-916`: one `block_by_hash` call per request | Not a finding — a single read is one view. | — |
 | (c) range receive — per-block and count limits | `h2-net/src/rpc.rs:518-540` `BodiesByRangeCodec::read_response`: per block 64 MiB (`MAX_BLOCK_CHUNK`, gov5's `MaxBlockChunkSize`), count `MAX_RANGE_BLOCKS` 1024 checked *after* the 1025th block was read and decoded. | Present but the count check ran late. | Checked before the body is read: commit `53b4a2294`. |
-| (c) range receive — total byte budget | none; 64 MiB × 1024 = 64 GiB reachable in theory | **Found.** | `MAX_RANGE_BYTES` = 256 MiB of declared bytes: commit `53b4a2294`. gov5 has no equivalent constant to match (`internal/p2p/encoder/ssz.go` caps chunks only). |
+| (c) range receive — total byte budget | none; 64 MiB × 1024 = 64 GiB reachable in theory | **Found.** | `MAX_RANGE_BYTES` = 256 MiB of declared bytes: commit `53b4a2294`, reply cut short rather than refused at the budget in the review follow-up below. gov5 has no equivalent constant to match (`internal/p2p/encoder/ssz.go` caps chunks only). |
 | (c) range receive — buffering everything before import | libp2p `request_response::Codec` returns one `Vec<BlockChunk>` at stream close; `service.rs` `pending_imports` then imports in order. | Structural; bounded by the budget. | Not changed — see "Not done". |
 | (c) range receive — backpressure | `service.rs:228-235`: `pending_imports` uncapped, `pending_ranges` capped at 8 (`MAX_PENDING_RANGES`), `pending_block_requests` at 256. | `pending_imports` is bounded by construction: replies come only for requests this node made, one catch-up runs at a time with one request in flight (`request_next_range` is called only after a reply is processed). | Documented on the field: commit `53b4a2294`. |
 | (d) lock held across file I/O — QMDB | `qmdb-reth/src/node_state.rs:179-227` `initialize`: `self.lock()` then `read_snapshot(&path)` (`std::fs::read` + bincode decode) and, at genesis, the alloc replay, all under the forest mutex. | **Found.** Startup-only, but every other handle (`state_root`, `is_initialized`, `Debug`, proofs) blocked behind the read instead of answering `Uninitialised`. | Read, decode and replay moved off the lock; install under it once: commit `fd43712ae`. |
@@ -123,6 +123,60 @@ initialising concurrently install one forest with the snapshot on disk and
 the root intact; an anchored proof verifies against the root it came with
 (`QmdbProof::verify_for_key`), storage without a leaf and an uninitialised
 handle answer `None`. `qmdb-state` and the mobile state-proof suite pass.
+
+## Review follow-ups
+
+Pre-merge review of the four code commits, with what it changed:
+
+- **Budget refusal stalled the catch-up** (`h2-net/src/rpc.rs`
+  `read_range_reply`, `h2-node/src/service.rs` `import_ranges`). Crossing
+  `MAX_RANGE_BYTES` returned an `io::Error`, which the transport reports as
+  a range failure and the catch-up treats as "peer served none of the
+  range; catch-up stopped". gov5 servers apply no byte budget and serve the
+  whole range whatever the blocks weigh, and this node's own server served
+  1024 blocks regardless, so a chain whose blocks average more than 256 KiB
+  could not be pulled by range at all — the reply was refused, retried, and
+  refused again, with nothing of it imported. Fixed on both sides: the
+  reader now returns the blocks read before the one that does not fit, as
+  a short reply (the stream is dropped at that block's varint, body
+  unread; only a first block past the budget is still an error, which the
+  production constants make impossible — `MAX_RANGE_BYTES >=
+  MAX_BLOCK_CHUNK` is a compile-time assertion), and the catch-up asks for
+  the rest from where the reply ended, as it does for any short reply.
+  `serve_range` stops at the same budget, so between two of these nodes
+  the cut is made before the bytes are sent; the anchored walk hands over
+  to the forward walk when the range outweighs the budget from its anchor.
+  Tests: `a_reply_past_the_byte_budget_ends_at_the_last_block_that_fits`
+  (h2-net), `a_reply_is_cut_at_the_byte_budget_on_either_walk` (h2-node).
+- **Anchor failures answered empty instead of falling back**
+  (`serve_range`). An `eth_blockNumber` error, or a head the execution
+  layer named but did not serve by number, returned an empty reply — the
+  catch-up's "peer served none of the range" — where the forward walk
+  would have served what existed. Both now fall back to the forward walk,
+  as a missing block by hash already did. Test:
+  `a_head_the_layer_cannot_report_or_serve_is_walked_forward`.
+- **Codec called during thread teardown** (`h2-wire/src/snappy.rs`
+  `with_scratch`). `LocalKey::with` panics once the thread's locals are
+  being destroyed; `try_with` now falls back to a scratch for that one
+  call. No production path compresses from a destructor; hardening only.
+- Checked and left as is: the pooled raw encoder zeroes its hash table on
+  every `compress` (`snap` `block_table`), so nothing carries between
+  messages; a panic inside a codec releases the `RefCell` borrow on
+  unwind, and the scratch holds no state a later call reads; the framed
+  decoder's chunk-length thresholds are `snap`'s exactly (76490-byte
+  source buffer, 65536-byte destination, 6-byte stream body); the QMDB
+  `initialize` race installs the first forest to reach the lock and, as
+  before, returns `Ok` to a second initialiser whatever head it named,
+  and `on_canonical` cannot run before the install (`with_forest` answers
+  `Uninitialised`); `main.rs` initialises before the canonical follower is
+  spawned; `prove_*_anchored` reads the proof and `root_of(head)` from the
+  same tree position (`prove_account` stands the tree at `head` first).
+- Timing re-run on the review host: 72 B frame 0.55 → 0.05 µs (11.8×),
+  unframe 0.69 → 0.04 µs (15.5×); 1 MiB and 12 MiB within 1 % on
+  encode, +3 % on decode; the raw encoder on 72 B is 0.033 → 0.044 µs —
+  a small input uses `snap`'s stack table, so the pool's thread-local
+  access is the larger cost there. Ten nanoseconds either way; the table
+  above should be read as "no change" for raw compression.
 
 ## Verification
 

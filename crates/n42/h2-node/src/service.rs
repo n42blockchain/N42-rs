@@ -213,6 +213,21 @@ pub struct H2Service<E> {
     /// for one of these re-runs the execution instead of waiting for the next
     /// proposal to mention the block again, which it may never do.
     awaiting_bodies: HashSet<B256>,
+    /// Height of the last block the execution layer is known to have
+    /// imported, once read; what "far ahead" is measured from.
+    imported_height: Option<u64>,
+    /// Bodies held back because they run far ahead of the execution layer:
+    /// on a block more than 32 past its tip reth starts a backfill it has
+    /// no peers for and answers every forkchoice with SYNCING from then on.
+    /// Re-examined as the pull moves the tip. Bounded.
+    held_bodies: Vec<B256>,
+    /// The highest height each peer is known to be at, from its status and
+    /// from the blocks it gossips or serves; what a catch-up consults.
+    peer_heights: std::collections::HashMap<PeerId, u64>,
+    /// No new catch-up before this; set when one ends.
+    catch_up_retry_after: Option<std::time::Instant>,
+    /// The peer whose catch-up failed last; another is preferred.
+    failed_peer: Option<PeerId>,
     /// Bodies that arrived for awaited blocks, to execute on the next drain.
     /// Kept separate because the transport handler cannot await.
     ready_bodies: Vec<B256>,
@@ -297,6 +312,15 @@ struct CatchUp {
 /// thousand lookups.
 const MAX_PENDING_SERVES: usize = 256;
 const MAX_PENDING_RANGES: usize = 8;
+/// A block this far past the execution layer's tip is not handed to it:
+/// reth's `MIN_BLOCKS_FOR_PIPELINE_RUN`, past which a payload with an
+/// unknown parent starts a backfill this node's execution layer has no
+/// devp2p peers to complete.
+const FAR_AHEAD_BLOCKS: u64 = 32;
+/// Bodies held back at most; the oldest go first.
+const MAX_HELD_BODIES: usize = 4096;
+/// Between the end of one catch-up and the start of the next.
+const CATCH_UP_RETRY: Duration = Duration::from_secs(3);
 
 /// How many block bodies to keep for peers that ask. gov5 asks for the
 /// parent of a block it cannot place and for the block a proposal names —
@@ -380,6 +404,11 @@ impl<E: ExecutionLayer> H2Service<E> {
             header_profile: HeaderProfile::Ethereum,
             native_wire: false,
             awaiting_bodies: HashSet::new(),
+            imported_height: None,
+            held_bodies: Vec::new(),
+            peer_heights: std::collections::HashMap::new(),
+            catch_up_retry_after: None,
+            failed_peer: None,
             ready_bodies: Vec::new(),
             received_bodies: Vec::new(),
             body_outbox: Vec::new(),
@@ -731,7 +760,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                     Err(err) => debug!(target: "n42.h2.node", %err, "dropped a transaction message"),
                 }
             }
-            TransportEvent::Block { data, .. } => {
+            TransportEvent::Block { from, data } => {
                 // Nothing here is trusted beyond its own consistency: the
                 // header hashes to the block hash, the transactions hash to
                 // the header's root. Whether the block is *valid* is the
@@ -743,6 +772,9 @@ impl<E: ExecutionLayer> H2Service<E> {
                 match decoded {
                     Ok((block, rlp)) => {
                         let block_hash = block.block_hash;
+                        if let Some(peer) = from {
+                            self.note_peer_height(peer, block.header.number);
+                        }
                         self.remember_body(block_hash, rlp);
                         self.remember_block(block_hash, &block.header);
                         self.driver.cache_payload(block_hash, block.execution_data());
@@ -930,6 +962,13 @@ impl<E: ExecutionLayer> H2Service<E> {
         // could not do at the time. Through the same path as the original
         // request, so the resulting BlockImported reaches the engine the same
         // way.
+        for block_hash in std::mem::take(&mut self.held_bodies) {
+            if self.far_ahead(block_hash) {
+                self.held_bodies.push(block_hash);
+            } else {
+                self.ready_bodies.push(block_hash);
+            }
+        }
         for block_hash in std::mem::take(&mut self.ready_bodies) {
             self.handle_output(EngineOutput::ExecuteBlock(block_hash), events)
                 .await?;
@@ -961,6 +1000,18 @@ impl<E: ExecutionLayer> H2Service<E> {
 
         // The execution driver sees every output and decides for itself which
         // ones concern it, so this does not have to duplicate that judgement.
+        if let EngineOutput::ExecuteBlock(block_hash) = &output
+            && self.far_ahead(*block_hash)
+        {
+            if !self.held_bodies.contains(block_hash) {
+                if self.held_bodies.len() >= MAX_HELD_BODIES {
+                    self.held_bodies.remove(0);
+                }
+                self.held_bodies.push(*block_hash);
+            }
+            debug!(target: "n42.h2.node", ?block_hash, tip = ?self.imported_height, "block runs far ahead of the execution layer; held until the pull reaches it");
+            return Ok(());
+        }
         let action = self.driver.handle_output(&output).await;
         self.apply_driver_action(action, events)?;
 
@@ -1136,6 +1187,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 if let ConsensusEvent::BlockImported(block_hash) = event.as_ref() {
                     if let Some(header) = self.block_headers.get(block_hash) {
                         self.engine.remember_parent(*block_hash, header.parent_hash);
+                        self.note_imported(header.number);
                     }
                 }
                 if let Err(err) = self.engine.process_event(*event) {
@@ -1217,13 +1269,36 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// Starts a catch-up if a peer's status shows it ahead of the execution
     /// layer and none is running.
     async fn consider_catch_up(&mut self, events: &mut Vec<ServiceEvent>) {
-        let statuses = std::mem::take(&mut self.pending_status);
-        if statuses.is_empty() || self.catch_up.is_some() {
+        for (peer, height) in std::mem::take(&mut self.pending_status) {
+            self.note_peer_height(peer, height);
+        }
+        if self.catch_up.is_some()
+            || self
+                .catch_up_retry_after
+                .is_some_and(|after| std::time::Instant::now() < after)
+        {
             return;
         }
-        let Some((peer, height)) = statuses.into_iter().max_by_key(|(_, h)| *h) else {
+        // The peer known to be highest — another than the one whose pull
+        // failed last, when there is another. A peer's height comes from its
+        // status at connect and from every block it gossips or serves since,
+        // so a node that falls behind later finds a peer to pull from too.
+        let failed = self.failed_peer;
+        let best = |exclude: Option<PeerId>| {
+            self.peer_heights
+                .iter()
+                .filter(|(peer, _)| Some(**peer) != exclude)
+                .max_by_key(|(_, height)| **height)
+                .map(|(peer, height)| (*peer, *height))
+        };
+        let Some((peer, height)) = best(failed).or_else(|| best(None)) else {
             return;
         };
+        // The execution layer is asked only when a peer may be past what was
+        // last read from it.
+        if self.imported_height.is_some_and(|tip| height <= tip) {
+            return;
+        }
         let latest = match self.driver.execution_layer().latest_block_number().await {
             Ok(Some(latest)) => latest,
             // An execution layer that does not say cannot be caught up.
@@ -1233,6 +1308,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 return;
             }
         };
+        self.imported_height = Some(latest);
         // Statuses arrive on connect, and a block the fleet gossiped before
         // this node connected never comes by itself — however small the gap.
         if height <= latest {
@@ -1304,8 +1380,11 @@ impl<E: ExecutionLayer> H2Service<E> {
                     return;
                 }
                 let hash = block.block_hash;
+                let number = block.header.number;
+                self.note_peer_height(peer, number);
                 match self.driver.import_pulled(block.execution_data()).await {
                     Ok(_) => {
+                        self.note_imported(number);
                         self.remember_block(hash, &block.header);
                         self.remember_body(hash, chunk.rlp);
                         if let Some(c) = self.catch_up.as_mut() {
@@ -1348,8 +1427,29 @@ impl<E: ExecutionLayer> H2Service<E> {
         if height > catch_up.started_at {
             self.transport.set_advertised_height(height);
         }
+        self.catch_up_retry_after = Some(std::time::Instant::now() + CATCH_UP_RETRY);
+        self.failed_peer = (!complete).then_some(catch_up.peer);
         info!(target: "n42.h2.node", from = catch_up.started_at, height, target = catch_up.target, complete, "catch-up finished");
         events.push(ServiceEvent::Synced { height, complete });
+    }
+
+    /// Whether a block, by the header this node holds for it, runs more
+    /// than [`FAR_AHEAD_BLOCKS`] past the execution layer's last known
+    /// import. Unknown either way is not far.
+    fn far_ahead(&self, block_hash: B256) -> bool {
+        match (self.block_headers.get(&block_hash), self.imported_height) {
+            (Some(header), Some(tip)) => header.number > tip + FAR_AHEAD_BLOCKS,
+            _ => false,
+        }
+    }
+
+    fn note_imported(&mut self, number: u64) {
+        self.imported_height = Some(self.imported_height.map_or(number, |tip| tip.max(number)));
+    }
+
+    fn note_peer_height(&mut self, peer: PeerId, height: u64) {
+        let known = self.peer_heights.entry(peer).or_insert(height);
+        *known = (*known).max(height);
     }
 
     fn remember_body(&mut self, block_hash: B256, rlp: Vec<u8>) {

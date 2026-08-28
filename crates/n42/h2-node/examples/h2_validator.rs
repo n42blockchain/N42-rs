@@ -334,6 +334,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if propose {
             let fee_recipient = entry.address;
+            // The chain's committee pool, if it has one: every header links
+            // to the parent's committee evidence through its parent beacon
+            // root, and gov5 refuses a block that does not.
+            let committee = hotstuff_config
+                .as_ref()
+                .map(|config| config.committee_pool())
+                .transpose()?
+                .flatten()
+                .map(std::sync::Arc::new);
+            if let Some(pool) = &committee {
+                println!(
+                    "committee pool: {} keys, {} per block",
+                    pool.config().pool_size,
+                    pool.config().committee_size
+                );
+            }
             // The chain's per-block rewards, as the withdrawals the execution
             // layer credits; gov5 credits the same amounts in `Finalize`.
             let rewards = hotstuff_config
@@ -345,9 +361,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("block rewards: {} withdrawal(s) per block", withdrawals.len());
             }
             service = service.with_payload_attributes(move |context| {
+                let parent_beacon_block_root = match (&committee, &context.head_header) {
+                    (Some(pool), Some(parent)) => {
+                        match pool.parent_beacon_root(parent.number, &parent.hash_slow(), &parent.receipts_root) {
+                            Ok(root) => root,
+                            Err(err) => {
+                                eprintln!("committee evidence for the head failed: {err}");
+                                return None;
+                            }
+                        }
+                    }
+                    // Without the parent's header there is no evidence to
+                    // link to; wait until it is known.
+                    (Some(_), None) => return None,
+                    (None, _) => B256::ZERO,
+                };
                 block_attributes(
                     fee_recipient,
                     withdrawals.clone(),
+                    parent_beacon_block_root,
                     period_secs,
                     context.head_timestamp,
                     context.head_seen,
@@ -420,6 +452,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn block_attributes(
     fee_recipient: Address,
     withdrawals: Vec<alloy_eips::eip4895::Withdrawal>,
+    parent_beacon_block_root: B256,
     period_secs: u64,
     head_timestamp: Option<u64>,
     head_seen: Option<std::time::Instant>,
@@ -466,7 +499,7 @@ fn block_attributes(
         prev_randao: B256::ZERO,
         suggested_fee_recipient: fee_recipient,
         withdrawals: Some(withdrawals),
-        parent_beacon_block_root: Some(B256::ZERO),
+        parent_beacon_block_root: Some(parent_beacon_block_root),
         target_gas_limit: None,
         slot_number: None,
     })

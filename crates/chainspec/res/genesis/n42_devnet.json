@@ -75,7 +75,14 @@
         }
       ],
       "devBlockReward": 1000000000000000000,
-      "devFaucetAddress": "0x42e9819036f61bF665D5f727E8C03121f12f586e"
+      "devFaucetAddress": "0x42e9819036f61bF665D5f727E8C03121f12f586e",
+      "committeePool": {
+        "enabled": true,
+        "seedHex": "0x0101010101010101010101010101010101010101010101010101010101010101",
+        "poolSize": 4096,
+        "committeeSize": 64,
+        "rampBlocks": 0
+      }
     }
   },
   "nonce": "0x0",

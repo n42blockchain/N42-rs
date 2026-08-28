@@ -52,6 +52,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+use alloy_consensus::Header;
 use alloy_primitives::B256;
 use n42_h2_consensus::wire_bridge::{self, BridgeError};
 use n42_h2_consensus::{ConsensusEngine, ConsensusEvent, EngineOutput};
@@ -240,6 +241,8 @@ pub struct H2Service<E> {
     /// [`ProposalContext::head_timestamp`]. Bounded; insertion order in
     /// `timestamp_order`.
     block_timestamps: std::collections::HashMap<B256, u64>,
+    /// The headers of the same blocks.
+    block_headers: std::collections::HashMap<B256, Header>,
     /// Block numbers, same bookkeeping, for the height this node advertises
     /// in the status handshake once a block commits.
     block_numbers: std::collections::HashMap<B256, u64>,
@@ -292,7 +295,7 @@ const REMEMBERED_BODIES: usize = 4096;
 const REMEMBERED_TIMESTAMPS: usize = 256;
 
 /// What a leader knows when deciding whether, and how, to propose.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProposalContext {
     /// The view being proposed for.
     pub view: u64,
@@ -305,6 +308,10 @@ pub struct ProposalContext {
     /// strictly greater than the parent's, and only the parent's timestamp
     /// says what that means.
     pub head_timestamp: Option<u64>,
+    /// The head's header, when this node holds it — its own builds, bodies
+    /// received, or the execution layer's copy. What a builder derives the
+    /// parent beacon root from on a chain with a committee pool.
+    pub head_header: Option<Header>,
     /// When this node first had the head — built it, or received its body —
     /// by this node's own clock. What a builder paces against: the head's
     /// timestamp is another leader's claim about time (gov5 stamps
@@ -370,6 +377,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             body_store: std::collections::HashMap::new(),
             body_store_order: Vec::new(),
             block_timestamps: std::collections::HashMap::new(),
+            block_headers: std::collections::HashMap::new(),
             block_numbers: std::collections::HashMap::new(),
             block_seen: std::collections::HashMap::new(),
             timestamp_order: Vec::new(),
@@ -628,7 +636,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                     Ok((block, rlp)) => {
                         let block_hash = block.block_hash;
                         self.remember_body(block_hash, rlp);
-                        self.remember_block(block_hash, block.header.timestamp, block.header.number);
+                        self.remember_block(block_hash, &block.header);
                         self.driver.cache_payload(block_hash, block.execution_data());
                         if self.awaiting_bodies.remove(&block_hash) {
                             self.ready_bodies.push(block_hash);
@@ -669,7 +677,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                     // sent it under is checked by the decode, not trusted.
                     match decode_block_rlp(&chunk.rlp, self.header_profile) {
                         Ok(block) if block.block_hash == hash => {
-                            self.remember_block(hash, block.header.timestamp, block.header.number);
+                            self.remember_block(hash, &block.header);
                             self.remember_body(hash, chunk.rlp);
                             self.driver.cache_payload(hash, block.execution_data());
                             if self.awaiting_bodies.remove(&hash) {
@@ -930,10 +938,22 @@ impl<E: ExecutionLayer> H2Service<E> {
         // retried on every subsequent event in the same view, which would pin
         // the loop against a broken execution layer.
         let head = self.driver.head();
+        let head_header = match self.block_headers.get(&head) {
+            Some(header) => Some(header.clone()),
+            None => match self.driver.execution_layer().block_by_hash(head).await {
+                Ok(Some(block)) => Some(block.header),
+                Ok(None) => None,
+                Err(err) => {
+                    debug!(target: "n42.h2.node", ?head, %err, "execution layer could not serve the head's header");
+                    None
+                }
+            },
+        };
         let context = ProposalContext {
             view,
             head,
             head_timestamp: self.block_timestamps.get(&head).copied(),
+            head_header,
             head_seen: self.block_seen.get(&head).copied(),
         };
         let Some(attrs) = build_attributes(context) else {
@@ -952,7 +972,10 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // itself, and before the proposal if the followers are to vote
                 // in the first round. Publishing it first is the best order
                 // gossip can offer.
-                self.remember_block(built.hash, built.timestamp, built.number);
+                match built.execution_data.clone().try_into_block::<alloy_consensus::TxEnvelope>() {
+                    Ok(block) => self.remember_block(built.hash, &block.header),
+                    Err(err) => debug!(target: "n42.h2.node", %err, "built payload has no header to remember"),
+                }
                 self.publish_body(&built.execution_data);
                 if let Err(err) = self
                     .engine
@@ -1139,7 +1162,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 let hash = block.block_hash;
                 match self.driver.import_pulled(block.execution_data()).await {
                     Ok(_) => {
-                        self.remember_block(hash, block.header.timestamp, block.header.number);
+                        self.remember_block(hash, &block.header);
                         self.remember_body(hash, chunk.rlp);
                         if let Some(c) = self.catch_up.as_mut() {
                             c.next += 1;
@@ -1183,15 +1206,17 @@ impl<E: ExecutionLayer> H2Service<E> {
         }
     }
 
-    fn remember_block(&mut self, block_hash: B256, timestamp: u64, number: u64) {
-        if self.block_timestamps.insert(block_hash, timestamp).is_none() {
-            self.block_numbers.insert(block_hash, number);
+    fn remember_block(&mut self, block_hash: B256, header: &Header) {
+        if self.block_timestamps.insert(block_hash, header.timestamp).is_none() {
+            self.block_numbers.insert(block_hash, header.number);
+            self.block_headers.insert(block_hash, header.clone());
             self.block_seen.insert(block_hash, std::time::Instant::now());
             self.timestamp_order.push(block_hash);
             while self.timestamp_order.len() > REMEMBERED_TIMESTAMPS {
                 let oldest = self.timestamp_order.remove(0);
                 self.block_timestamps.remove(&oldest);
                 self.block_numbers.remove(&oldest);
+                self.block_headers.remove(&oldest);
                 self.block_seen.remove(&oldest);
             }
         }

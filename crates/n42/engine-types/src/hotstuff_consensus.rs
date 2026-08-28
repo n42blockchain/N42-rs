@@ -33,7 +33,7 @@ use n42_consensus_traits::{AposError, AposResult, SignerManager};
 use n42_h2_consensus::{
     gov5_receipts_root, gov5_rewards_root, is_empty_requests_hash, validate_gov5_h2_header,
     withdrawals_to_rewards,
-    HeaderExtra, ReceiptView, GOV5_EMPTY_REQUESTS_HASH,
+    HeaderExtra, ReceiptView, SimulatedCommitteePool, GOV5_EMPTY_REQUESTS_HASH,
 };
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_consensus::{Consensus, ConsensusError, FullConsensus, HeaderValidator, ReceiptRootBloom};
@@ -58,16 +58,46 @@ pub struct HotStuffConsensus<ChainSpec> {
     /// operator's information; on a HotStuff chain the block's beneficiary is
     /// the fee recipient the leader names, not a local key.
     signer: RwLock<Option<Address>>,
+    /// The chain's committee pool, when its genesis enables one: every
+    /// header's parent beacon root must be the Blake3 of the parent's
+    /// committee evidence, which the pool rebuilds from the parent header.
+    committee: Option<SimulatedCommitteePool>,
+}
+
+/// A header whose parent beacon root is not the parent's committee evidence.
+#[derive(Debug, thiserror::Error)]
+#[error("parent beacon root {got} is not the parent's committee evidence {expected}")]
+pub struct CommitteeLinkError {
+    /// What the header carries.
+    pub got: B256,
+    /// The Blake3 of the parent's evidence.
+    pub expected: B256,
 }
 
 impl<ChainSpec: EthChainSpec + EthereumHardforks> HotStuffConsensus<ChainSpec> {
     /// Rules for `chain_spec`.
     pub fn new(chain_spec: Arc<ChainSpec>) -> Self {
+        let committee = match n42_qmdb_reth::HotStuffGenesisConfig::from_genesis(chain_spec.genesis()) {
+            Ok(config) => match config.committee_pool() {
+                Ok(pool) => pool,
+                Err(err) => {
+                    tracing::warn!(target: "n42::consensus", %err, "committee pool in the genesis could not be built; headers will not be checked against it");
+                    None
+                }
+            },
+            Err(_) => None,
+        };
         Self {
             ethereum: EthBeaconConsensus::new(chain_spec.clone()),
             chain_spec,
             signer: RwLock::new(None),
+            committee,
         }
+    }
+
+    /// The committee pool the chain runs, if any.
+    pub const fn committee_pool(&self) -> Option<&SimulatedCommitteePool> {
+        self.committee.as_ref()
     }
 
     /// The chain.
@@ -161,7 +191,20 @@ where
         // limit ramp, base fee, blob gas: gov5 checks the first two and
         // relies on every producer deriving the rest the same way, which is
         // what checking them here guarantees for blocks this node accepts.
-        self.ethereum.validate_header_against_parent(header, parent)
+        self.ethereum.validate_header_against_parent(header, parent)?;
+        // The committee-evidence link, exactly as gov5's `VerifyHeader`
+        // checks it: the parent beacon root is the Blake3 of the parent's
+        // evidence, zero when the parent is genesis.
+        if let Some(pool) = &self.committee {
+            let expected = pool
+                .parent_beacon_root(parent.number, &parent.hash(), &parent.receipts_root)
+                .map_err(|err| ConsensusError::Other(Arc::new(err)))?;
+            let got = header.parent_beacon_block_root.unwrap_or_default();
+            if got != expected {
+                return Err(ConsensusError::Other(Arc::new(CommitteeLinkError { got, expected })));
+            }
+        }
+        Ok(())
     }
 }
 

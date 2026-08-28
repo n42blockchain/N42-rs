@@ -68,9 +68,63 @@ pub struct HotStuffGenesisConfig {
     /// The dev faucet paid the same reward each block, if any.
     #[serde(default)]
     pub dev_faucet_address: Option<alloy_primitives::Address>,
+    /// gov5's simulated BLS committee pool. When enabled, every header's
+    /// parent beacon root is the Blake3 of the parent's committee evidence;
+    /// see `n42_h2_consensus::committee_pool`.
+    #[serde(default)]
+    pub committee_pool: Option<CommitteePoolGenesis>,
+}
+
+/// `hotstuff.committeePool` in the genesis.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitteePoolGenesis {
+    /// Whether the pool is in force.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The 32-byte master seed, hex.
+    #[serde(default)]
+    pub seed_hex: String,
+    /// Keys in the pool.
+    #[serde(default)]
+    pub pool_size: usize,
+    /// Signers drawn per block.
+    #[serde(default)]
+    pub committee_size: usize,
+    /// Blocks over which the active pool grows to its full size.
+    #[serde(default)]
+    pub ramp_blocks: u64,
+}
+
+impl CommitteePoolGenesis {
+    /// The pool's configuration, when enabled. The seed must be 32 bytes.
+    pub fn config(&self) -> Result<Option<n42_h2_consensus::CommitteePoolConfig>, String> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let seed: alloy_primitives::B256 = self
+            .seed_hex
+            .parse()
+            .map_err(|e| format!("hotstuff.committeePool.seedHex must be 32-byte hex: {e}"))?;
+        Ok(Some(n42_h2_consensus::CommitteePoolConfig {
+            seed,
+            pool_size: self.pool_size,
+            committee_size: self.committee_size,
+            ramp_blocks: self.ramp_blocks,
+        }))
+    }
 }
 
 impl HotStuffGenesisConfig {
+    /// The committee pool the chain runs, built from the genesis; `None`
+    /// when the chain has none.
+    pub fn committee_pool(&self) -> Result<Option<n42_h2_consensus::SimulatedCommitteePool>, String> {
+        let Some(config) = self.committee_pool.as_ref().map(CommitteePoolGenesis::config).transpose()?.flatten() else {
+            return Ok(None);
+        };
+        n42_h2_consensus::SimulatedCommitteePool::new(config).map(Some).map_err(|e| e.to_string())
+    }
+
     /// The rewards gov5 pays in a block whose coinbase is `coinbase`, in
     /// gov5's order: the coinbase first, then the faucet. Empty when the
     /// chain pays none.

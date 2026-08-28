@@ -43,7 +43,7 @@ const fn identity() -> H2V4ChainIdentity {
     }
 }
 
-const fn attributes(context: ProposalContext) -> Option<PayloadAttributes> {
+fn attributes(context: ProposalContext) -> Option<PayloadAttributes> {
     Some(PayloadAttributes {
         // Deterministic rather than wall-clock: a test that depends on the
         // clock fails on a loaded machine for reasons unrelated to consensus.

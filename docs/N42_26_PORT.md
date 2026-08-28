@@ -642,30 +642,89 @@ codec is checked against gov5's SSZ and chunk layout and over a real
 connection between two transports; a live gov5 range request has not been
 observed yet, because on this devnet the cheaper path always won.
 
-**Coming back after an hour.** The absence a fleet actually meets is not
-a fresh member but one that took part, went away with its execution layer,
-and comes back on the same datadirs to a chain that moved on without it.
-`scripts/devnet-fleet.sh` does that (`ABSENT_VALIDATOR=2 ABSENT_AT=300
-ABSENT_FOR=3600`): the member resumes from its checkpoint ("resuming at
-view 121, last voted 120"), its execution layer is up in 1.5 s, the first
-status it hears shows the Go member ahead, and it pulls the gap by range.
-Measured on the mixed devnet with one hour away: absent at height 120,
-back with the fleet at 1002; 883 blocks pulled from gov5 and imported in
-44.9 s (19.7 blocks/s through `newPayload` + forkchoice, debug build,
-QMDB roots); the 14 blocks the fleet produced meanwhile arrived by gossip
-and fetch-on-miss in the next 7 s; view 121 → 1298 by the QC it heard;
-first commit 52 s after the return, on its own proposal (it was that
-view's leader), then 62 proposals and 231 commits in the 14 minutes the
-run had left, no timeouts anywhere in the fleet after the return, every
-client at 1234 with the same head, gov5 without an error. The fleet of
-three had timed out every fourth view for the hour (the absent leader's),
-which is why the chain grew 882 blocks in 1178 views.
+**Coming back after hours away.** The absence a fleet actually meets is
+not a fresh member but one that took part, went away with its execution
+layer, and comes back on the same datadirs to a chain that moved on
+without it. `scripts/devnet-fleet.sh` does that (`ABSENT_VALIDATOR=2
+ABSENT_AT=300 ABSENT_FOR=<s>`): the member resumes from its checkpoint
+("resuming at view 121, last voted 120"), its execution layer is up in
+1.5 s, the first status it hears shows a peer ahead, and it pulls the gap
+by range. Measured on the mixed devnet, where the fleet of three times out
+every fourth view while the member is away (the absent leader's), so the
+chain grows about 0.25 blocks a second:
 
-The pull now goes on past the status's target a window (1024 blocks) at a
-time until the peer serves short or refuses — gov5 answers a range past
-its head with "code 2: invalid block number" — so a chain that keeps
-producing during a long pull is caught up by the pull itself, not left to
-gossip's future queue.
+- *One hour away*: absent at 120, back with the fleet at 1002; 883 blocks
+  pulled from gov5 and imported in 44.9 s (19.7 blocks/s through
+  `newPayload` + forkchoice, debug build, QMDB roots); the 14 blocks the
+  fleet produced meanwhile arrived by gossip and fetch-on-miss in the next
+  7 s; view 121 → 1298 by the QC it heard; first commit 52 s after the
+  return, on its own proposal, then 62 proposals and 231 commits in the
+  14 minutes left, no timeouts anywhere in the fleet after the return,
+  every client at 1234 with the same head, gov5 without an error.
+- *Ninety minutes away*: absent at 119, back at 1446, 1327 blocks behind.
+  The first window of 1024 came from gov5 in 49.6 s; gov5 dropped the
+  connection during it (item 4 below), and 3.7 s after the refused second
+  request the pull went on from a Rust member, 1143 → 1447 in 12.8 s,
+  while the bodies gossip had held back were executed as the tip closed
+  in. First commit 69 s after the
+  return; then 60 proposals, no timeouts in the fleet, every client at
+  1676 with the same head, the execution layer never in reth's syncing
+  state.
+- *Three hours away*: absent at 119, back at 2771, 2652 blocks behind.
+  Again 1024 from gov5 in 49.9 s and the connection gone for the second
+  request (item 4), then 1143 → 2800 from a Rust member in 65.4 s
+  (25 blocks/s), probed to the peer's head, complete. First commit 126 s after the return, on its own
+  proposal; then 55 proposals, no timeouts in the fleet, every client at
+  2992 with the same head, gov5 without an error, reth never syncing.
+  Three hours cost two minutes; the pull, not the absence, sets the bill.
+
+The two three-hour runs before that one found what the hour had not.
+The pull imports a window of 1024 blocks before the loop reads consensus
+again, so every message that arrived during the window is handled at its
+end — a member 2650 blocks behind reaches that point at block 1144 with a
+few thousand views of proposals and commits waiting. Four things went
+wrong there, each fixed in its own commit:
+
+1. The eager import handed reth a proposal's payload 1600 blocks past
+   its tip. A payload more than 32 blocks past the tip with an unknown
+   parent (`MIN_BLOCKS_FOR_PIPELINE_RUN`) starts reth's backfill, which
+   needs devp2p peers this execution layer does not have; every forkchoice
+   answered SYNCING from then on, the next pulled block failed to import,
+   and the member led nothing for the rest of the run. A block whose
+   header puts it more than 32 past the last known import is now held,
+   and re-examined as the pull moves the tip.
+2. With payloads held, the same state came from the commits: the engine
+   commits what a quorum certifies whether or not the node holds the
+   block, and the driver's commit path sent a forkchoice with that block
+   as head, safe and finalised — a head reth does not have starts the same
+   backfill. A commit is handed to the execution layer only for a block
+   imported through the service (voted on, pulled or built). The
+   validator's driver also starts from the block the execution layer is
+   actually at when the checkpoint's last committed block is one it never
+   imported.
+3. Once the held bodies were executed as the pull closed in, and their
+   commits finalised them, the pull's next window held blocks the
+   execution layer already had; a forkchoice back to one of them is a
+   reorg behind the finalised block, which reth refuses (-38006). Pulled
+   blocks already imported are counted and skipped.
+4. The window was imported in one go, and for the fifty seconds that
+   took the swarm went unpolled: gov5's streams to the node timed out
+   ("direct-push stream failed: context deadline exceeded") and it dropped
+   the peer, which is why the second window had to come from a Rust
+   member both times. Pulled blocks are imported 32 per step now, the
+   transport polled between batches: on the next run (25 minutes away,
+   370 blocks behind) gov5 held the connection through the whole pull,
+   served it in 3.5 s and refused the probe past its head, and the member
+   committed 15 s after its return.
+
+A catch-up that ends — complete or not — allows another after 3 s, from
+the highest peer known (heights come from statuses at connect and from
+every block a peer gossips or serves since; the peer whose pull failed
+last is passed over when there is another), and a pull that reaches its
+target goes on probing a window at a time until the peer serves short or
+refuses — gov5 answers a range past its head with "code 2: invalid block
+number". A chain that keeps producing during a long pull is caught up by
+the pull itself, not left to gossip's future queue.
 
 **The safety bug the first attempt found.** The first run of this
 scenario did not get as far as the absence: with member 2 starting a few
@@ -1052,7 +1111,8 @@ rest of the production-fleet list in build order.
 2. **Transactions** (item 7): done (item 6 above); what remains is
    gov5's own optimisation of announcing a hash before a body, if it ever
    gets one.
-3. **Rejoining after a long absence**: measured at one hour ("Coming
-   back after an hour", above), which also surfaced and fixed the missing
-   extends rule. The observer against the live fleet still waits for a
+3. **Rejoining after a long absence**: measured at one hour, ninety
+   minutes and three hours ("Coming back after hours away", above), which
+   surfaced and fixed the missing extends rule and three ways a long pull
+   lost its execution layer to reth's peerless backfill. The observer against the live fleet still waits for a
    reachable one — there is no gov5 fleet on this host.

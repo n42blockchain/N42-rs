@@ -4,6 +4,7 @@
 #
 #   scripts/devnet-fleet.sh <tag> <seconds> [--gov5] [--keep]
 #   LATE_VALIDATOR=<i> LATE_DELAY=<s> [LATE_SNAPSHOT=<dir>] start one member late (from a snapshot)
+#   ABSENT_VALIDATOR=<i> ABSENT_AT=<s> ABSENT_FOR=<s> take one member (own EL) away and bring it back
 #
 # Data lives under $N42_FLEET_DIR (default: /tmp/n42-fleet). Every process is
 # left running afterwards so it can be inspected; the next run kills them.
@@ -45,6 +46,32 @@ if [ -n "$WITH_GOV5" ]; then
   GOPEER="--peer /ip4/127.0.0.1/tcp/30393/p2p/$GOID"
 fi
 for i in $(seq 0 $LAST); do
+  # ABSENT_VALIDATOR=<index> ABSENT_AT=<secs> ABSENT_FOR=<secs>: one Rust
+  # member with its own execution layer takes part from the start, goes away
+  # entirely at ABSENT_AT (validator and execution layer killed, both datadirs
+  # kept) and comes back ABSENT_FOR seconds later on the same datadirs, so it
+  # has to rejoin a chain that moved on without it. Its logs carry the
+  # "-back" suffix after the return. Not index 0: the others peer through it.
+  if [ "${ABSENT_VALIDATOR:-}" = "$i" ]; then
+    rm -rf $F/consensus-$i $F/datadir-late
+    own_el() { RUST_LOG=${RUST_LOG_EL:-info} $BIN/n42 node --chain $GENESIS --datadir $F/datadir-late \
+        --authrpc.port 18561 --authrpc.jwtsecret $F/jwt.hex --http --http.port 18555 --port 30323 \
+        --disable-discovery --ipcdisable > $F/el-late-$TAG$1.log 2>&1 &
+      for _ in $(seq 1 60); do grep -aq "RPC auth server started" $F/el-late-$TAG$1.log 2>/dev/null && break; sleep 1; done; }
+    own_v() { RUST_LOG=${RUST_LOG_V:-n42=debug} $BIN/examples/h2_validator --chain $GENESIS --index $i \
+        --bls-key $(cat $F/keys/validator-$i.key) --el http://127.0.0.1:18561 --el-rpc http://127.0.0.1:18555 --jwt $F/jwt.hex \
+        --listen /ip4/127.0.0.1/tcp/$((19000+i)) --propose --datadir $F/consensus-$i $PEER ${DIALGO:-} \
+        > $F/v$i-$TAG$1.log 2>&1 & }
+    own_el ""; own_v ""
+    (sleep ${ABSENT_AT:-300}
+      pkill -f "^$BIN/examples/h2_validator --chain $GENESIS --index $i "; pkill -f "^$BIN/n42 node --chain $GENESIS --datadir $F/datadir-late"
+      echo "$(date +%T) member $i absent at height $(curl -s -X POST -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' http://127.0.0.1:18545 | python3 -c "import sys,json;print(int(json.load(sys.stdin)['result'],16))")" >> $F/absent-$TAG.log
+      sleep ${ABSENT_FOR:-3600}
+      echo "$(date +%T) member $i returning at height $(curl -s -X POST -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' http://127.0.0.1:18545 | python3 -c "import sys,json;print(int(json.load(sys.stdin)['result'],16))")" >> $F/absent-$TAG.log
+      own_el -back; own_v -back
+      echo "$(date +%T) member $i back" >> $F/absent-$TAG.log) > /dev/null 2>&1 &
+    continue
+  fi
   # LATE_VALIDATOR=<index> LATE_DELAY=<secs> starts one Rust member late with
   # a fresh datadir, so it has to pull the chain from its peers by range.
   if [ "${LATE_VALIDATOR:-}" = "$i" ]; then
@@ -106,6 +133,13 @@ H1=$(height 18545); echo "reth height: $H1"
 if [ -n "${LATE_VALIDATOR:-}" ]; then
   HL=$(height 18555); echo "late member: el height=$HL $(grep -a '^syncing\|^synced' $F/v$LATE_VALIDATOR-$TAG.log | tr '\n' ' ') commits=$(grep -ac '^COMMIT' $F/v$LATE_VALIDATOR-$TAG.log)"
   echo "block $HL: main=$(hash_at 18545 $HL) late=$(hash_at 18555 $HL)"
+fi
+if [ -n "${ABSENT_VALIDATOR:-}" ]; then
+  A=$ABSENT_VALIDATOR; cat $F/absent-$TAG.log
+  HL=$(height 18555); echo "absent member back: el height=$HL (main $H1) commits=$(grep -ac '^COMMIT' $F/v$A-$TAG-back.log) proposals=$(grep -ac 'built a block to propose' $F/v$A-$TAG-back.log) timeouts=$(grep -ac 'WARN.*view timed out' $F/v$A-$TAG-back.log)"
+  grep -a "pulling the gap by range\|catch-up finished\|behind the fleet" $F/v$A-$TAG-back.log | sed 's/\x1b\[[0-9;]*m//g' | cut -c1-200 | head -8
+  echo "first commit after return: $(grep -a -m1 'block committed!' $F/v$A-$TAG-back.log | sed 's/\x1b\[[0-9;]*m//g' | sed 's/process_event.*voting: //' | cut -c1-140)"
+  echo "block $HL: main=$(hash_at 18545 $HL) back=$(hash_at 18555 $HL)"
 fi
 if [ -n "$WITH_GOV5" ]; then
   GL=$F/gov5/log/n42.log

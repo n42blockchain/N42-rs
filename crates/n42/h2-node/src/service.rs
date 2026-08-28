@@ -285,6 +285,10 @@ struct CatchUp {
     next: u64,
     target: u64,
     started_at: u64,
+    /// The target from the peer's status is reached; the pull now probes
+    /// past it, a window at a time, for what the fleet produced meanwhile.
+    /// The peer's first short reply is the end of its chain.
+    probing: bool,
 }
 
 /// How many block requests may wait for the execution layer at once, and
@@ -819,9 +823,14 @@ impl<E: ExecutionLayer> H2Service<E> {
             TransportEvent::RangeFetched { peer, request, reply } => match reply {
                 Ok(chunks) => self.pending_imports.push((peer, request, chunks)),
                 Err(reason) => {
-                    warn!(target: "n42.h2.node", %peer, ?request, reason, "range request refused");
                     if self.catch_up.as_ref().is_some_and(|c| c.peer == peer) {
-                        self.catch_up = None;
+                        // Handed to the import loop as an empty reply: a
+                        // refusal of a probe past the peer's head is the end
+                        // of its chain, anything else stops the catch-up.
+                        debug!(target: "n42.h2.node", %peer, ?request, reason, "range request refused");
+                        self.pending_imports.push((peer, request, Vec::new()));
+                    } else {
+                        warn!(target: "n42.h2.node", %peer, ?request, reason, "range request refused");
                     }
                 }
             },
@@ -1235,6 +1244,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             next: latest + 1,
             target: height,
             started_at: latest,
+            probing: false,
         });
         self.request_next_range();
         events.push(ServiceEvent::Syncing {
@@ -1270,8 +1280,12 @@ impl<E: ExecutionLayer> H2Service<E> {
                 continue;
             }
             if chunks.is_empty() {
-                warn!(target: "n42.h2.node", %peer, ?request, "peer served none of the range; catch-up stopped");
-                self.finish_catch_up(events, false);
+                if catch_up.probing {
+                    self.finish_catch_up(events, true);
+                } else {
+                    warn!(target: "n42.h2.node", %peer, ?request, "peer served none of the range; catch-up stopped");
+                    self.finish_catch_up(events, false);
+                }
                 continue;
             }
             for chunk in chunks {
@@ -1305,8 +1319,20 @@ impl<E: ExecutionLayer> H2Service<E> {
                     }
                 }
             }
-            let done = self.catch_up.as_ref().is_some_and(|c| c.next > c.target);
-            if done {
+            let Some(catch_up) = self.catch_up.as_mut() else {
+                continue;
+            };
+            let window_filled = catch_up.next > catch_up.target;
+            if window_filled {
+                // The status's target is reached, or a probe window came back
+                // full: the fleet kept producing while this pull ran, and a
+                // gap of a whole window is not one gossip's future queue
+                // closes. Probe on until the peer serves short.
+                catch_up.probing = true;
+                catch_up.target = catch_up.next + MAX_RANGE_BLOCKS - 1;
+                self.request_next_range();
+            } else if catch_up.probing {
+                // Short of a probe window: that was the peer's head.
                 self.finish_catch_up(events, true);
             } else {
                 self.request_next_range();

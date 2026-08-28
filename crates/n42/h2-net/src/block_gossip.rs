@@ -24,8 +24,10 @@
 
 use alloy_consensus::{proofs::calculate_transaction_root, Block, Header, TxEnvelope};
 use alloy_eips::eip2718::{Decodable2718, Encodable2718};
-use alloy_primitives::{keccak256, Bytes, B256};
-use alloy_rlp::{Decodable, Encodable, Header as RlpHeader};
+use alloy_eips::eip4895::{Withdrawal, Withdrawals};
+use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
+use alloy_rlp::{Decodable, Encodable, Header as RlpHeader, RlpDecodable, RlpEncodable};
+use n42_h2_consensus::{rewards_to_withdrawals, withdrawals_to_rewards};
 use alloy_rpc_types_engine::ExecutionData;
 use libp2p::gossipsub::IdentTopic;
 
@@ -55,6 +57,11 @@ pub struct GossipBlock {
     pub header: Header,
     /// The transactions, in order.
     pub transactions: Vec<TxEnvelope>,
+    /// The rewards, in order, as `(address, amount in wei)`.
+    pub rewards: Vec<(Address, U256)>,
+    /// The rewards as the withdrawals this node's execution layer credits
+    /// (`rewards_to_withdrawals`); checked convertible when decoded.
+    pub withdrawals: Vec<Withdrawal>,
 }
 
 /// Why a block could not be encoded or decoded.
@@ -78,6 +85,12 @@ pub enum BlockGossipError {
     /// The compressed payload could not be expanded.
     #[error("snappy: {0}")]
     Snappy(String),
+    /// A reward cannot be a withdrawal, or the list does not decode.
+    #[error("block rewards: {0}")]
+    InvalidRewards(String),
+    /// The rewards do not hash to the header's withdrawals root.
+    #[error("block rewards root mismatch")]
+    RewardsRootMismatch,
 }
 
 /// The view a gov5 H2 header was proposed in.
@@ -156,12 +169,25 @@ pub fn encode_block_rlp(
     if calculate_transaction_root(&block.body.transactions) != block.header.transactions_root {
         return Err(BlockGossipError::TransactionRootMismatch);
     }
-    Ok(encode_block_rlp_parts(&block.header, &block.body.transactions))
+    let rewards = withdrawals_to_rewards(block.body.withdrawals.as_ref().map_or(&[][..], |w| w.as_slice()));
+    Ok(encode_block_rlp_parts(&block.header, &block.body.transactions, &rewards))
 }
 
-/// The uncompressed wire form for a header and its transactions as they
-/// stand — what a node that already holds the block serves.
-pub fn encode_block_rlp_parts(header: &Header, transactions: &[TxEnvelope]) -> Vec<u8> {
+/// One reward on the wire: gov5's `Reward{Address, Amount}` under
+/// reflective RLP, `[address, amount]`.
+#[derive(RlpEncodable, RlpDecodable)]
+struct RewardRlp {
+    address: Address,
+    amount: U256,
+}
+
+/// The uncompressed wire form for a header, its transactions and its
+/// rewards as they stand — what a node that already holds the block serves.
+pub fn encode_block_rlp_parts(
+    header: &Header,
+    transactions: &[TxEnvelope],
+    rewards: &[(Address, U256)],
+) -> Vec<u8> {
     let mut header_rlp = Vec::new();
     header.encode(&mut header_rlp);
     let transaction_bytes = transactions
@@ -169,7 +195,10 @@ pub fn encode_block_rlp_parts(header: &Header, transactions: &[TxEnvelope]) -> V
         .map(|transaction| Bytes::from(transaction.encoded_2718()))
         .collect::<Vec<_>>();
     let verifiers = Vec::<Bytes>::new();
-    let rewards = Vec::<Bytes>::new();
+    let rewards = rewards
+        .iter()
+        .map(|(address, amount)| RewardRlp { address: *address, amount: *amount })
+        .collect::<Vec<_>>();
     let payload_length =
         header_rlp.len() + transaction_bytes.length() + verifiers.length() + rewards.length();
     let mut encoded = Vec::new();
@@ -212,7 +241,8 @@ pub fn decode_block_rlp(
     let transactions = decode_transactions(transactions_rlp)?;
 
     take_rlp_list_item(&mut payload).ok_or(BlockGossipError::InvalidRlp)?;
-    take_rlp_list_item(&mut payload).ok_or(BlockGossipError::InvalidRlp)?;
+    let rewards_rlp = take_rlp_list_item(&mut payload).ok_or(BlockGossipError::InvalidRlp)?;
+    let rewards = decode_rewards(rewards_rlp)?;
     if !payload.is_empty() {
         take_rlp_bytes(&mut payload).ok_or(BlockGossipError::InvalidRlp)?;
     }
@@ -223,12 +253,44 @@ pub fn decode_block_rlp(
     if calculate_transaction_root(&transactions) != header.transactions_root {
         return Err(BlockGossipError::TransactionRootMismatch);
     }
+    // The withdrawals root is gov5's rewards commitment; rewards that do not
+    // hash to it are not the block's, and would only fail in execution. A
+    // block without rewards may carry either spelling of "none": gov5's
+    // keccak of nothing, or the empty trie root its resealed history and
+    // genesis write.
+    if profile == HeaderProfile::Gov5H2
+        && let Some(root) = header.withdrawals_root
+        && root != n42_h2_consensus::gov5_rewards_root(rewards.iter().copied())
+        && !(rewards.is_empty() && root == alloy_consensus::EMPTY_ROOT_HASH)
+    {
+        return Err(BlockGossipError::RewardsRootMismatch);
+    }
+    let withdrawals = rewards_to_withdrawals(&rewards)
+        .map_err(|error| BlockGossipError::InvalidRewards(error.to_string()))?;
 
     Ok(GossipBlock {
         block_hash: keccak256(header_rlp),
         header,
         transactions,
+        rewards,
+        withdrawals,
     })
+}
+
+/// The rewards list: `[[address, amount], ...]`.
+fn decode_rewards(encoded: &[u8]) -> Result<Vec<(Address, U256)>, BlockGossipError> {
+    let mut cursor = encoded;
+    let list = RlpHeader::decode(&mut cursor).map_err(|_| BlockGossipError::InvalidRlp)?;
+    if !list.list || list.payload_length != cursor.len() {
+        return Err(BlockGossipError::InvalidRlp);
+    }
+    let mut rewards = Vec::new();
+    while !cursor.is_empty() {
+        let reward = RewardRlp::decode(&mut cursor)
+            .map_err(|error| BlockGossipError::InvalidRewards(error.to_string()))?;
+        rewards.push((reward.address, reward.amount));
+    }
+    Ok(rewards)
 }
 
 impl GossipBlock {
@@ -241,7 +303,15 @@ impl GossipBlock {
     /// requests is handed over by hash, which an execution layer accepts only
     /// where its API allows it.
     pub fn execution_data(&self) -> ExecutionData {
-        let block = n42_h2_consensus::block_for_header(self.header.clone(), self.transactions.clone());
+        let withdrawals = self.header.withdrawals_root.map(|_| Withdrawals(self.withdrawals.clone()));
+        let block = Block {
+            header: self.header.clone(),
+            body: alloy_consensus::BlockBody {
+                transactions: self.transactions.clone(),
+                ommers: Vec::new(),
+                withdrawals,
+            },
+        };
         n42_h2_consensus::execution_data_for_block(self.block_hash, &block)
     }
 }

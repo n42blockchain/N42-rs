@@ -85,6 +85,19 @@ pub struct BuiltBlock {
     pub blob_tx_hashes: Vec<B256>,
 }
 
+/// A block as the execution layer holds it: header, transactions and, on a
+/// post-Shanghai chain, its withdrawals — which on a gov5 chain are its
+/// rewards.
+#[derive(Debug, Clone)]
+pub struct ChainBlock {
+    /// The header.
+    pub header: alloy_consensus::Header,
+    /// The transactions, in order.
+    pub transactions: Vec<alloy_consensus::TxEnvelope>,
+    /// The withdrawals; `None` before Shanghai.
+    pub withdrawals: Option<Vec<alloy_eips::eip4895::Withdrawal>>,
+}
+
 /// How to resolve a started build — the node-neutral stand-in for reth's
 /// `PayloadKind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,10 +118,7 @@ pub trait ExecutionLayer: Send + Sync + 'static {
     /// A block by hash, canonical or not, as its header and transactions —
     /// for serving a peer's fetch-on-miss when the body is no longer in the
     /// consensus layer's own store. `None` when not held or not offered.
-    async fn block_by_hash(
-        &self,
-        hash: B256,
-    ) -> Result<Option<(alloy_consensus::Header, Vec<alloy_consensus::TxEnvelope>)>, ElError> {
+    async fn block_by_hash(&self, hash: B256) -> Result<Option<ChainBlock>, ElError> {
         let _ = hash;
         Ok(None)
     }
@@ -116,10 +126,7 @@ pub trait ExecutionLayer: Send + Sync + 'static {
     /// A canonical block by number, as its header and transactions, for
     /// serving peers that sync by range. `None` when the execution layer
     /// does not have it — or, in the default, does not offer the lookup.
-    async fn block_by_number(
-        &self,
-        number: u64,
-    ) -> Result<Option<(alloy_consensus::Header, Vec<alloy_consensus::TxEnvelope>)>, ElError> {
+    async fn block_by_number(&self, number: u64) -> Result<Option<ChainBlock>, ElError> {
         let _ = number;
         Ok(None)
     }

@@ -471,13 +471,14 @@ async fn chain_lookups_come_back_as_consensus_types() {
     let recorder = Recorder::with_answers(vec![Ok(as_json.clone()), Ok(as_json), Ok(json!("0x24")), Ok(Value::Null)]);
     let client = EngineApiClient::new(SharedRecorder(recorder.clone()));
 
-    let (by_number, txs) = client.block_by_number(7).await.unwrap().expect("served");
+    let served = client.block_by_number(7).await.unwrap().expect("served");
+    let (by_number, txs) = (served.header, served.transactions);
     assert_eq!(by_number, header);
     assert!(txs.is_empty());
-    let (by_hash, _) = client.block_by_hash(hash).await.unwrap().expect("served");
+    let by_hash = client.block_by_hash(hash).await.unwrap().expect("served").header;
     assert_eq!(by_hash.hash_slow(), hash);
     assert_eq!(client.latest_block_number().await.unwrap(), Some(36));
-    assert_eq!(client.block_by_number(99).await.unwrap(), None);
+    assert!(client.block_by_number(99).await.unwrap().is_none());
 
     assert_eq!(
         recorder.methods(),

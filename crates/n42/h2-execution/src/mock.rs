@@ -16,7 +16,7 @@ use alloy_rpc_types_engine::{
     PayloadAttributes, PayloadId, PayloadStatus, PayloadStatusEnum,
 };
 
-use crate::el::{BuiltBlock, ElError, ExecutionLayer, ResolveKind};
+use crate::el::{ChainBlock, BuiltBlock, ElError, ExecutionLayer, ResolveKind};
 
 /// One Engine API call the driver made.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,7 +58,7 @@ struct MockState {
     next_block: u64,
     /// Blocks this mock built or accepted, by number, for range requests
     /// and for the height it reports.
-    blocks: std::collections::HashMap<u64, (alloy_consensus::Header, Vec<alloy_consensus::TxEnvelope>)>,
+    blocks: std::collections::HashMap<u64, ChainBlock>,
 }
 
 /// An [`ExecutionLayer`] that records calls instead of executing.
@@ -186,7 +186,14 @@ impl ExecutionLayer for MockExecutionLayer {
                 .lock()
                 .expect("mock state lock")
                 .blocks
-                .insert(number, (block.header, block.body.transactions));
+                .insert(
+                    number,
+                    ChainBlock {
+                        header: block.header,
+                        transactions: block.body.transactions,
+                        withdrawals: block.body.withdrawals.map(|w| w.0),
+                    },
+                );
         }
         Ok(PayloadStatus {
             status: behaviour.new_payload_status,
@@ -228,24 +235,18 @@ impl ExecutionLayer for MockExecutionLayer {
         Ok(Some(self.state.lock().expect("mock state lock").blocks.keys().copied().max().unwrap_or(0)))
     }
 
-    async fn block_by_hash(
-        &self,
-        hash: B256,
-    ) -> Result<Option<(alloy_consensus::Header, Vec<alloy_consensus::TxEnvelope>)>, ElError> {
+    async fn block_by_hash(&self, hash: B256) -> Result<Option<ChainBlock>, ElError> {
         Ok(self
             .state
             .lock()
             .expect("mock state lock")
             .blocks
             .values()
-            .find(|(header, _)| header.hash_slow() == hash)
+            .find(|block| block.header.hash_slow() == hash)
             .cloned())
     }
 
-    async fn block_by_number(
-        &self,
-        number: u64,
-    ) -> Result<Option<(alloy_consensus::Header, Vec<alloy_consensus::TxEnvelope>)>, ElError> {
+    async fn block_by_number(&self, number: u64) -> Result<Option<ChainBlock>, ElError> {
         Ok(self.state.lock().expect("mock state lock").blocks.get(&number).cloned())
     }
 
@@ -269,7 +270,14 @@ impl ExecutionLayer for MockExecutionLayer {
                 .lock()
                 .expect("mock state lock")
                 .blocks
-                .insert(number, (block.header, block.body.transactions));
+                .insert(
+                    number,
+                    ChainBlock {
+                        header: block.header,
+                        transactions: block.body.transactions,
+                        withdrawals: block.body.withdrawals.map(|w| w.0),
+                    },
+                );
         }
         Some(Ok(built))
     }

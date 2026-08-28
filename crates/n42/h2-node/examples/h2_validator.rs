@@ -130,6 +130,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Everything about the fleet from one file, when there is one.
+    let mut hotstuff_config: Option<n42_qmdb_reth::HotStuffGenesisConfig> = None;
     let (identity, validators): (H2V4ChainIdentity, Vec<ValidatorInfo>) = match &chain_path {
         Some(path) => {
             use reth_cli::chainspec::ChainSpecParser as _;
@@ -138,6 +139,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             base_timeout_ms.get_or_insert(hotstuff.base_timeout);
             max_timeout_ms.get_or_insert(hotstuff.max_timeout);
             period_secs = hotstuff.period.max(1);
+            hotstuff_config = Some(hotstuff.clone());
             (
                 H2V4ChainIdentity {
                     chain_id: chain_id.unwrap_or_else(|| spec.chain().id()),
@@ -332,8 +334,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if propose {
             let fee_recipient = entry.address;
+            // The chain's per-block rewards, as the withdrawals the execution
+            // layer credits; gov5 credits the same amounts in `Finalize`.
+            let rewards = hotstuff_config
+                .as_ref()
+                .map(|config| config.block_rewards(fee_recipient))
+                .unwrap_or_default();
+            let withdrawals = n42_h2_consensus::rewards_to_withdrawals(&rewards)?;
+            if !withdrawals.is_empty() {
+                println!("block rewards: {} withdrawal(s) per block", withdrawals.len());
+            }
             service = service.with_payload_attributes(move |context| {
-                block_attributes(fee_recipient, period_secs, context.head_timestamp, context.head_seen)
+                block_attributes(
+                    fee_recipient,
+                    withdrawals.clone(),
+                    period_secs,
+                    context.head_timestamp,
+                    context.head_seen,
+                )
             });
         }
 
@@ -401,6 +419,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// block per second, which is what the timestamp resolution allows.
 fn block_attributes(
     fee_recipient: Address,
+    withdrawals: Vec<alloy_eips::eip4895::Withdrawal>,
     period_secs: u64,
     head_timestamp: Option<u64>,
     head_seen: Option<std::time::Instant>,
@@ -446,7 +465,7 @@ fn block_attributes(
         timestamp,
         prev_randao: B256::ZERO,
         suggested_fee_recipient: fee_recipient,
-        withdrawals: Some(Vec::new()),
+        withdrawals: Some(withdrawals),
         parent_beacon_block_root: Some(B256::ZERO),
         target_gas_limit: None,
         slot_number: None,

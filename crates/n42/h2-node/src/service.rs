@@ -62,6 +62,7 @@ use n42_h2_net::{
     encode_block_rlp_parts, BlockChunk, H2V4Transport, HeaderProfile, PeerId, RangeRequest,
     TransportEvent, MAX_RANGE_BLOCKS,
 };
+use n42_h2_consensus::withdrawals_to_rewards;
 use n42_h2_primitives::consensus::{H2V4ChainIdentity, QuorumCertificate};
 use n42_h2_wire::{H2Message, H2V4Envelope};
 use tokio::sync::mpsc;
@@ -779,7 +780,11 @@ impl<E: ExecutionLayer> H2Service<E> {
         self.import_ranges(events).await;
         for (peer, hash, channel) in std::mem::take(&mut self.pending_block_requests) {
             let body = match self.driver.execution_layer().block_by_hash(hash).await {
-                Ok(Some((header, transactions))) => Some(encode_block_rlp_parts(&header, &transactions)),
+                Ok(Some(block)) => Some(encode_block_rlp_parts(
+                    &block.header,
+                    &block.transactions,
+                    &withdrawals_to_rewards(block.withdrawals.as_deref().unwrap_or(&[])),
+                )),
                 Ok(None) => None,
                 Err(err) => {
                     debug!(target: "n42.h2.node", ?hash, %err, "execution layer could not serve a block");
@@ -1255,8 +1260,12 @@ async fn serve_range<E: ExecutionLayer>(el: &E, request: n42_h2_net::RangeReques
     let mut rlps = Vec::new();
     for number in request.start..request.start.saturating_add(count) {
         match el.block_by_number(number).await {
-            Ok(Some((header, transactions))) => {
-                rlps.push(encode_block_rlp_parts(&header, &transactions));
+            Ok(Some(block)) => {
+                rlps.push(encode_block_rlp_parts(
+                    &block.header,
+                    &block.transactions,
+                    &withdrawals_to_rewards(block.withdrawals.as_deref().unwrap_or(&[])),
+                ));
             }
             Ok(None) => break,
             Err(err) => {

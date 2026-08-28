@@ -34,6 +34,7 @@
 
 use alloy_consensus::{Block, BlockBody, Header, TxEnvelope, EMPTY_OMMER_ROOT_HASH};
 use alloy_eips::eip7685::{Requests, RequestsOrHash, EMPTY_REQUESTS_HASH};
+use alloy_eips::eip4895::{Withdrawal, Withdrawals};
 use alloy_primitives::{b256, keccak256, Address, Bytes, Log, B256, U256};
 use alloy_rlp::{Encodable, RlpEncodable};
 use alloy_rpc_types_engine::{
@@ -91,6 +92,49 @@ pub fn gov5_rewards_root(rewards: impl IntoIterator<Item = (Address, U256)>) -> 
         Reward { address, amount }.encode(&mut concatenated);
     }
     keccak256(&concatenated)
+}
+
+/// Wei per gwei: an Engine API withdrawal's amount is in gwei.
+const GWEI: u64 = 1_000_000_000;
+
+/// gov5's rewards as the Engine API's withdrawals, which is how this node's
+/// execution layer credits them: a withdrawal's amount is in gwei and is
+/// credited after the transactions, exactly as gov5's `Finalize` credits a
+/// reward. The withdrawal index is the reward's position and the validator
+/// index zero; neither reaches the state or the header, whose withdrawals
+/// root is gov5's rewards commitment, not the withdrawals trie.
+///
+/// A reward that is not a whole number of gwei has no withdrawal and is
+/// refused; gov5's dev rewards are whole ether.
+pub fn rewards_to_withdrawals(
+    rewards: &[(Address, U256)],
+) -> Result<Vec<Withdrawal>, HeaderProfileError> {
+    let gwei = U256::from(GWEI);
+    rewards
+        .iter()
+        .enumerate()
+        .map(|(index, (address, amount))| {
+            if *amount % gwei != U256::ZERO {
+                return Err(HeaderProfileError::Reconstruction(format!(
+                    "reward of {amount} wei to {address} is not a whole number of gwei"
+                )));
+            }
+            let amount = u64::try_from(*amount / gwei).map_err(|_| {
+                HeaderProfileError::Reconstruction(format!(
+                    "reward of {amount} wei to {address} does not fit a withdrawal"
+                ))
+            })?;
+            Ok(Withdrawal { index: index as u64, validator_index: 0, address: *address, amount })
+        })
+        .collect()
+}
+
+/// The rewards a block's withdrawals stand for; see [`rewards_to_withdrawals`].
+pub fn withdrawals_to_rewards(withdrawals: &[Withdrawal]) -> Vec<(Address, U256)> {
+    withdrawals
+        .iter()
+        .map(|withdrawal| (withdrawal.address, U256::from(withdrawal.amount) * U256::from(GWEI)))
+        .collect()
 }
 
 /// Whether a `requestsHash` says "no requests" in either convention.
@@ -384,10 +428,11 @@ pub fn reconstruct_gov5_h2_block<T: alloy_eips::Decodable2718>(
     // from EIP-7685. Each has the value the payload implies and the value
     // gov5 would have written; the hash picks.
     let withdrawals_roots: Vec<Option<B256>> = match block.header.withdrawals_root {
-        Some(root) if block.body.withdrawals.as_ref().is_none_or(|w| w.is_empty()) => {
-            vec![Some(root), Some(GOV5_NIL_HASH)]
+        Some(root) => {
+            let rewards = withdrawals_to_rewards(block.body.withdrawals.as_ref().map_or(&[][..], |w| w.as_slice()));
+            vec![Some(root), Some(gov5_rewards_root(rewards))]
         }
-        other => vec![other],
+        None => vec![None],
     };
     let requests_hashes: Vec<Option<B256>> = match block.header.requests_hash {
         Some(hash) if is_empty_requests_hash(hash) => {
@@ -439,17 +484,12 @@ pub fn normalize_to_gov5_h2(
     block.header.difficulty = U256::ZERO;
     block.header.nonce = Default::default();
     block.header.extra_data = HeaderExtra::for_view(view).encode();
-    // gov5's two non-Ethereum roots. This node pays no rewards, so the
-    // withdrawals field carries the empty rewards commitment; a block with
-    // actual withdrawals has no gov5 form and is refused rather than
-    // mis-committed.
+    // gov5's two non-Ethereum roots. The withdrawals field carries the
+    // rewards commitment; the block's withdrawals are its rewards (see
+    // `rewards_to_withdrawals`), keccak of nothing when there are none.
     if block.header.withdrawals_root.is_some() {
-        if block.body.withdrawals.as_ref().is_some_and(|w| !w.is_empty()) {
-            return Err(HeaderProfileError::Reconstruction(
-                "gov5 blocks carry rewards, not withdrawals".into(),
-            ));
-        }
-        block.header.withdrawals_root = Some(gov5_rewards_root([]));
+        let rewards = withdrawals_to_rewards(block.body.withdrawals.as_ref().map_or(&[][..], |w| w.as_slice()));
+        block.header.withdrawals_root = Some(gov5_rewards_root(rewards));
     }
     if block.header.requests_hash.is_some_and(is_empty_requests_hash) {
         block.header.requests_hash = Some(GOV5_EMPTY_REQUESTS_HASH);
@@ -459,6 +499,29 @@ pub fn normalize_to_gov5_h2(
     }
     let hash = block.header.hash_slow();
     Ok(execution_data_for_block(hash, &block))
+}
+
+/// A block body with these transactions and, on a post-Shanghai header, the
+/// block's rewards as its withdrawals; a header without a withdrawals root
+/// gets no withdrawals list, and its rewards must be none.
+pub fn block_for_header_with_rewards(
+    header: Header,
+    transactions: Vec<TxEnvelope>,
+    rewards: &[(Address, U256)],
+) -> Result<Block<TxEnvelope>, HeaderProfileError> {
+    let withdrawals = match header.withdrawals_root {
+        Some(_) => Some(Withdrawals(rewards_to_withdrawals(rewards)?)),
+        None if rewards.is_empty() => None,
+        None => {
+            return Err(HeaderProfileError::Reconstruction(
+                "rewards on a header without a withdrawals root".into(),
+            ))
+        }
+    };
+    Ok(Block {
+        header,
+        body: alloy_consensus::BlockBody { transactions, ommers: Vec::new(), withdrawals },
+    })
 }
 
 /// A block body with these transactions and, on a post-Shanghai header, the
@@ -486,6 +549,46 @@ mod tests {
     // Every expected value below was printed by gov5's own code
     // (`hash.DeriveSha`, `buildHeaderExtra`, `sealHash`, `Header.Hash`) run
     // over the same inputs.
+
+    #[test]
+    fn rewards_round_trip_through_withdrawals() {
+        let one_ether = U256::from(1_000_000_000_000_000_000u128);
+        let rewards = vec![
+            (address!("d2a316a1cd3a777141cb7e5aace46fb01df90eac"), one_ether),
+            (address!("42e9819036f61bf665d5f727e8c03121f12f586e"), one_ether),
+        ];
+        let withdrawals = rewards_to_withdrawals(&rewards).unwrap();
+        assert_eq!(withdrawals.len(), 2);
+        assert_eq!(withdrawals[0].index, 0);
+        assert_eq!(withdrawals[1].index, 1);
+        assert_eq!(withdrawals[0].amount, 1_000_000_000, "one ether is 1e9 gwei");
+        assert_eq!(withdrawals_to_rewards(&withdrawals), rewards);
+        assert!(rewards_to_withdrawals(&[(rewards[0].0, U256::from(1))]).is_err(), "a wei is not a withdrawal");
+        assert_eq!(gov5_rewards_root(withdrawals_to_rewards(&[])), GOV5_NIL_HASH);
+    }
+
+    #[test]
+    fn a_normalized_block_commits_to_its_rewards_and_reconstructs() {
+        let one_ether = U256::from(1_000_000_000_000_000_000u128);
+        let leader = address!("d2a316a1cd3a777141cb7e5aace46fb01df90eac");
+        let mut header = fixture_header();
+        header.withdrawals_root = Some(EMPTY_ROOT_HASH);
+        let withdrawals = rewards_to_withdrawals(&[(leader, one_ether)]).unwrap();
+        let block = Block {
+            header,
+            body: alloy_consensus::BlockBody {
+                transactions: Vec::<TxEnvelope>::new(),
+                ommers: Vec::new(),
+                withdrawals: Some(Withdrawals(withdrawals.clone())),
+            },
+        };
+        let hash = block.header.hash_slow();
+        let normalized = normalize_to_gov5_h2(&execution_data_for_block(hash, &block), 7, None).unwrap();
+        let rebuilt = reconstruct_gov5_h2_block::<TxEnvelope>(&normalized).unwrap();
+        assert_eq!(rebuilt.header.withdrawals_root, Some(gov5_rewards_root([(leader, one_ether)])));
+        assert_eq!(rebuilt.body.withdrawals.as_deref(), Some(&withdrawals));
+        assert_eq!(rebuilt.header.hash_slow(), normalized.block_hash());
+    }
 
     #[test]
     fn empty_receipts_root_is_keccak_of_nothing() {

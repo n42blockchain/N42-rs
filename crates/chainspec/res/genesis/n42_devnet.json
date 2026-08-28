@@ -73,7 +73,9 @@
           "address": "0x90f79bf6eb2c4f870365e785982e1f101e93b906",
           "blsKey": "0x88d5f930092ca519d94f9faf111bb176a3b7636ab86ef9504e86cf60780c1d8b023db2ccaace5afb74b8b53325eaebe5"
         }
-      ]
+      ],
+      "devBlockReward": 1000000000000000000,
+      "devFaucetAddress": "0x42e9819036f61bF665D5f727E8C03121f12f586e"
     }
   },
   "nonce": "0x0",

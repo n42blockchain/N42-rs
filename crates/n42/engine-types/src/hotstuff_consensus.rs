@@ -32,6 +32,7 @@ use alloy_primitives::{logs_bloom, Address, B256, U256};
 use n42_consensus_traits::{AposError, AposResult, SignerManager};
 use n42_h2_consensus::{
     gov5_receipts_root, gov5_rewards_root, is_empty_requests_hash, validate_gov5_h2_header,
+    withdrawals_to_rewards,
     HeaderExtra, ReceiptView, GOV5_EMPTY_REQUESTS_HASH,
 };
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
@@ -209,13 +210,14 @@ where
         }
 
         // gov5 fills `withdrawalsRoot` with its rewards commitment — keccak
-        // of nothing when no rewards were paid — while Ethereum's trie root
-        // of an empty withdrawals list is the empty trie root. Both are
-        // "no withdrawals" here; a header claiming otherwise is refused.
+        // of the block's rewards, of nothing when none were paid — while
+        // Ethereum's is the withdrawals trie root. The block's withdrawals
+        // are its rewards (`rewards_to_withdrawals`); either spelling of the
+        // same list is accepted, a header claiming another list is refused.
         match (header.withdrawals_root, body.withdrawals.as_ref()) {
             (Some(header_root), Some(withdrawals)) => {
                 let trie_root = body.calculate_withdrawals_root().unwrap_or_default();
-                let gov5_root = withdrawals.is_empty().then(|| gov5_rewards_root([]));
+                let gov5_root = Some(gov5_rewards_root(withdrawals_to_rewards(withdrawals.as_slice())));
                 if header_root != trie_root && Some(header_root) != gov5_root {
                     return Err(ConsensusError::BodyWithdrawalsRootDiff(
                         GotExpected {

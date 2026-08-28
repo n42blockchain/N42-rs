@@ -59,6 +59,32 @@ pub struct HotStuffGenesisConfig {
     /// Whether the chain speaks the `H2-v4` cross-client wire profile.
     #[serde(default)]
     pub interop_v4: bool,
+    /// gov5's fixed per-block dev reward in wei, credited to the block's
+    /// coinbase (the leader) and, when one is named, to the dev faucet
+    /// address as well (`hotstuff/adapter.go` `Finalize`). Consensus-relevant:
+    /// it is in every block's state root. Zero pays nothing.
+    #[serde(default)]
+    pub dev_block_reward: u64,
+    /// The dev faucet paid the same reward each block, if any.
+    #[serde(default)]
+    pub dev_faucet_address: Option<alloy_primitives::Address>,
+}
+
+impl HotStuffGenesisConfig {
+    /// The rewards gov5 pays in a block whose coinbase is `coinbase`, in
+    /// gov5's order: the coinbase first, then the faucet. Empty when the
+    /// chain pays none.
+    pub fn block_rewards(&self, coinbase: alloy_primitives::Address) -> Vec<(alloy_primitives::Address, alloy_primitives::U256)> {
+        if self.dev_block_reward == 0 {
+            return Vec::new();
+        }
+        let amount = alloy_primitives::U256::from(self.dev_block_reward);
+        let mut rewards = vec![(coinbase, amount)];
+        if let Some(faucet) = self.dev_faucet_address.filter(|faucet| !faucet.is_zero()) {
+            rewards.push((faucet, amount));
+        }
+        rewards
+    }
 }
 
 const fn default_period() -> u64 {

@@ -29,11 +29,14 @@ mod validator_info;
 pub mod vote_log;
 pub mod wire_bridge;
 
+pub mod committee_pool;
+pub use committee_pool::{CommitteePoolConfig, CommitteePoolError, ConsensusEvidence, SimulatedCommitteePool};
 pub use error::{ConsensusError, ConsensusResult};
 pub use header_profile::{
-    block_for_header, execution_data_for_block, gov5_receipts_root, gov5_rewards_root, header_view,
-    is_empty_requests_hash,
-    normalize_to_gov5_h2, reconstruct_gov5_h2_block, seal_hash, seal_header,
+    block_for_header, block_for_header_with_rewards, execution_data_for_block, gov5_receipts_root,
+    gov5_rewards_root, header_view, is_empty_requests_hash, normalize_to_gov5_h2,
+    reconstruct_gov5_h2_block, rewards_to_withdrawals, seal_hash, seal_header,
+    withdrawals_to_rewards,
     validate_gov5_h2_header, verify_seal, HeaderExtra, HeaderProfileError, N42HeaderProfile,
     ReceiptView,
     EXTRA_SEAL_LEN, GOV5_EMPTY_REQUESTS_HASH, GOV5_HEADER_EXTRA_MAGIC, GOV5_NIL_HASH,

@@ -49,7 +49,7 @@ use alloy_rpc_types_engine::{
     ExecutionPayloadSidecar, ExecutionPayloadV3, ForkchoiceState, ForkchoiceUpdated,
     PayloadAttributes, PayloadId, PayloadStatus, PraguePayloadFields,
 };
-use n42_h2_execution::{BuiltBlock, ElError, ExecutionLayer, ResolveKind};
+use n42_h2_execution::{ChainBlock, BuiltBlock, ElError, ExecutionLayer, ResolveKind};
 use serde_json::{json, Value};
 use tracing::debug;
 
@@ -316,10 +316,7 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
             .map_err(|e| ElError::new(format!("eth_blockNumber returned {hex}: {e}")))
     }
 
-    async fn block_by_hash(
-        &self,
-        hash: B256,
-    ) -> Result<Option<(alloy_consensus::Header, Vec<TxEnvelope>)>, ElError> {
+    async fn block_by_hash(&self, hash: B256) -> Result<Option<ChainBlock>, ElError> {
         let block: Option<alloy_rpc_types_eth::Block> = self
             .call("eth_getBlockByHash", vec![json!(hash), json!(true)])
             .await
@@ -327,10 +324,7 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
         Ok(block.map(block_parts))
     }
 
-    async fn block_by_number(
-        &self,
-        number: u64,
-    ) -> Result<Option<(alloy_consensus::Header, Vec<TxEnvelope>)>, ElError> {
+    async fn block_by_number(&self, number: u64) -> Result<Option<ChainBlock>, ElError> {
         // The Engine API's auth endpoint also serves the handful of `eth_`
         // methods the spec requires of it, this one among them, so no second
         // endpoint is needed to serve peers the chain.
@@ -419,7 +413,7 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
 
 /// The consensus header and transactions inside an `eth_getBlockByNumber`
 /// answer, which is what gov5's block form is built from.
-pub fn block_parts(block: alloy_rpc_types_eth::Block) -> (alloy_consensus::Header, Vec<TxEnvelope>) {
+pub fn block_parts(block: alloy_rpc_types_eth::Block) -> ChainBlock {
     let header = block.header.inner;
     let transactions = block
         .transactions
@@ -427,5 +421,5 @@ pub fn block_parts(block: alloy_rpc_types_eth::Block) -> (alloy_consensus::Heade
         .into_iter()
         .map(|tx| tx.inner.into_inner())
         .collect();
-    (header, transactions)
+    ChainBlock { header, transactions, withdrawals: block.withdrawals.map(|w| w.0) }
 }

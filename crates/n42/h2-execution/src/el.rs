@@ -90,6 +90,10 @@ pub struct BuiltBlock {
 /// rewards.
 #[derive(Debug, Clone)]
 pub struct ChainBlock {
+    /// The block's hash as the execution layer holds it — not recomputed
+    /// from the header, which on a gov5 chain lacks the field its hash
+    /// covers (see `n42_h2_consensus::Gov5HeaderExtension`).
+    pub hash: B256,
     /// The header.
     pub header: alloy_consensus::Header,
     /// The transactions, in order.

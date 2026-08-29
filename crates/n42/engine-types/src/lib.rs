@@ -23,6 +23,8 @@ mod payload;
 //mod metrics;
 mod consensus;
 pub mod engine_validator;
+pub mod evm;
+pub use evm::N42EvmConfig;
 pub mod hotstuff_consensus;
 mod network;
 

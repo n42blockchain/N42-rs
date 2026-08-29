@@ -32,7 +32,8 @@ pub use chainspec::{
     STATE_SCHEME_KEY, STATE_SCHEME_QMDB,
 };
 pub use changes::{
-    changes_from_alloc, changes_from_bundle, changes_from_execution, with_prague_system_caller,
+    changes_from_alloc, changes_from_bundle, changes_from_execution, record_restored_slots,
+    restored_slots, restored_slots_key, with_prague_system_caller, with_restored_slots, RestoredSlot,
 };
 pub use hotstuff::{GenesisValidator, HotStuffConfigError, HotStuffGenesisConfig};
 pub use node_state::{NodeStateError, QmdbNodeState};

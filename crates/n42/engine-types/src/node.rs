@@ -378,10 +378,10 @@ where
     Types: NodeTypes<ChainSpec = ChainSpec, Primitives = EthPrimitives>,
     Node: FullNodeTypes<Types = Types>,
 {
-    type EVM = EthEvmConfig;
+    type EVM = crate::N42EvmConfig;
 
     async fn build_evm(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::EVM> {
-        Ok(EthEvmConfig::new(ctx.chain_spec()))
+        Ok(crate::N42EvmConfig::new(ctx.chain_spec()))
     }
 }
 

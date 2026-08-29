@@ -546,12 +546,18 @@ where
             let outcome =
                 builder.finish(&state_provider, Some((B256::ZERO, TrieUpdates::default())))?;
             let bundle = db.take_bundle();
+            let restored = n42_qmdb_reth::restored_slots(n42_qmdb_reth::restored_slots_key(
+                parent_header.hash(),
+                outcome.block.body().transactions().map(|tx| *alloy_consensus::transaction::TxHashRef::tx_hash(tx)),
+            ))
+            .unwrap_or_default();
             let prepared = state
                 .compute(
                     parent_header.hash(),
                     &changes_from_execution(
                         &bundle,
                         chain_spec.is_prague_active_at_timestamp(attributes.timestamp),
+                        &restored,
                     ),
                 )
                 .map_err(PayloadBuilderError::other)?;
@@ -717,7 +723,7 @@ where
         let payload_builder = N42PayloadBuilder::new(
             ctx.provider().clone(),
             pool.clone(),
-            EthEvmConfig::new(ctx.chain_spec()),
+            crate::N42EvmConfig::new(ctx.chain_spec()),
             EthereumBuilderConfig::new().with_gas_limit(gas_limit),
             consensus,
         )

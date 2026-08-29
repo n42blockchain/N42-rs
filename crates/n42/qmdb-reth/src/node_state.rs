@@ -39,6 +39,14 @@ use tracing::{debug, info, warn};
 use crate::changes::changes_from_alloc;
 
 const SNAPSHOT_FILE: &str = "forest.bin";
+/// The canonical blocks applied since the base snapshot, oldest first.
+const DELTA_FILE: &str = "forest-deltas.bin";
+/// A base snapshot is rewritten — in the background, from a copy of the
+/// tree — once the delta log grows past this, so a restart replays a bounded
+/// amount and the log never becomes the state.
+const DELTA_REWRITE_BYTES: u64 = 512 << 20;
+/// ... or after this many canonical blocks, whichever comes first.
+const DELTA_REWRITE_BLOCKS: u64 = 20_000;
 
 /// Why the node's QMDB state could not be used.
 #[derive(Debug, thiserror::Error)]
@@ -116,6 +124,37 @@ struct Inner {
     forest: Mutex<Option<QmdbForest>>,
     chain: Arc<ChainSpec>,
     dir: PathBuf,
+    persistence: Mutex<Persistence>,
+}
+
+/// One canonical block as the delta log records it: enough to re-apply it on
+/// the persisted tree.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct DeltaRecord {
+    number: u64,
+    hash: B256,
+    parent: B256,
+    ops: Vec<n42_twig_core::qmdb_compat::QmdbOperation>,
+}
+
+/// Where the on-disk state stands: the base snapshot and the delta log
+/// together cover the chain up to `covered`.
+///
+/// A forest at a live chain's scale is gigabytes; writing it whole for every
+/// block was the cost of the first design, and it does not fit a block
+/// period. So the base is rewritten in the background and only every so
+/// often, and each canonical block appends its leaf operations to a log the
+/// next start replays on the base.
+#[derive(Default)]
+struct Persistence {
+    /// The head the base plus the log stand at; `None` until the first write.
+    covered: Option<(u64, B256)>,
+    /// The head of the base snapshot on disk.
+    base: Option<(u64, B256)>,
+    /// Bytes appended to the log since the base was last rewritten.
+    delta_bytes: u64,
+    /// A base rewrite in flight, with the head it will stand at.
+    rewrite: Option<(std::thread::JoinHandle<Result<(), NodeStateError>>, (u64, B256))>,
 }
 
 /// A handle to the node's QMDB state. Cheap to clone; all clones share it.
@@ -155,6 +194,7 @@ impl QmdbNodeState {
                 forest: Mutex::new(None),
                 chain,
                 dir: dir.into(),
+                persistence: Mutex::new(Persistence::default()),
             }),
         }
     }
@@ -162,6 +202,18 @@ impl QmdbNodeState {
     /// Where the snapshot lives.
     pub fn snapshot_path(&self) -> PathBuf {
         self.inner.dir.join(SNAPSHOT_FILE)
+    }
+
+    /// Where the delta log lives.
+    pub fn delta_path(&self) -> PathBuf {
+        self.inner.dir.join(DELTA_FILE)
+    }
+
+    fn persistence(&self) -> MutexGuard<'_, Persistence> {
+        self.inner
+            .persistence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn lock(&self) -> MutexGuard<'_, Option<QmdbForest>> {
@@ -201,18 +253,29 @@ impl QmdbNodeState {
         let (head_number, head_hash) = head;
         let path = self.snapshot_path();
 
+        let mut base = None;
         let forest = match read_snapshot(&path)? {
             Some(snapshot) if snapshot.head_hash == head_hash => {
                 info!(target: "n42.qmdb", block = head_number, %head_hash, "restored the QMDB forest");
+                base = Some((snapshot.head_number, snapshot.head_hash));
                 QmdbForest::from_snapshot(&snapshot)?
             }
             Some(snapshot) => {
-                return Err(NodeStateError::SnapshotMismatch {
-                    snapshot_number: snapshot.head_number,
-                    snapshot_hash: snapshot.head_hash,
-                    head_number,
-                    head_hash,
-                });
+                // Behind the head: the delta log may carry the rest.
+                let (snapshot_number, snapshot_hash) = (snapshot.head_number, snapshot.head_hash);
+                let mut forest = QmdbForest::from_snapshot(&snapshot)?;
+                let replayed = replay_deltas(&self.delta_path(), &mut forest, head_hash)?;
+                if forest.head().1 != head_hash {
+                    return Err(NodeStateError::SnapshotMismatch {
+                        snapshot_number: forest.head().0,
+                        snapshot_hash: forest.head().1,
+                        head_number,
+                        head_hash,
+                    });
+                }
+                info!(target: "n42.qmdb", base = snapshot_number, %snapshot_hash, replayed, block = head_number, %head_hash, "restored the QMDB forest from the base snapshot and the delta log");
+                base = Some((snapshot_number, snapshot_hash));
+                forest
             }
             None if head_number == 0 => {
                 let chain = &self.inner.chain;
@@ -234,6 +297,12 @@ impl QmdbNodeState {
         };
         let mut guard = self.lock();
         if guard.is_none() {
+            let mut persistence = self.persistence();
+            // Seeded from the alloc, nothing is on disk yet: the first
+            // canonical head is written whole.
+            persistence.covered = base.map(|_| forest.head());
+            persistence.base = base;
+            persistence.delta_bytes = std::fs::metadata(self.delta_path()).map(|m| m.len()).unwrap_or(0);
             *guard = Some(forest);
         }
         Ok(())
@@ -275,7 +344,14 @@ impl QmdbNodeState {
         }
         let mut forest = QmdbForest::from_tree(expected_head.0, expected_head.1, tree);
         write_snapshot(&self.snapshot_path(), &forest.snapshot()?)?;
+        truncate_deltas(&self.delta_path())?;
         info!(target: "n42.qmdb", block = expected_head.0, head = %expected_head.1, %root, "restored the QMDB forest from a portable snapshot");
+        {
+            let mut persistence = self.persistence();
+            persistence.covered = Some(expected_head);
+            persistence.base = Some(expected_head);
+            persistence.delta_bytes = 0;
+        }
         *self.lock() = Some(forest);
         Ok(())
     }
@@ -307,6 +383,7 @@ impl QmdbNodeState {
             block_hash: snapshot.head_hash.0,
             root: tree.root().0,
             slots: QmdbSlotSnapshot { next_slot: snapshot.tree.next_slot, entries },
+            leaf_form: snapshot.tree.leaf_form.clone(),
         };
         portable.encode().map_err(|e| NodeStateError::Portable(e.to_string()))
     }
@@ -370,18 +447,93 @@ impl QmdbNodeState {
         self.lock().as_ref().map(QmdbForest::head)
     }
 
-    /// Advances the canonical head and persists its tree.
+    /// Advances the canonical head and persists it: the blocks from the
+    /// persisted head to the new one go to the delta log; the base snapshot
+    /// is rewritten in the background once the log is long enough, and
+    /// whole, at once, only when the new head does not descend from what
+    /// is on disk.
     ///
     /// A head the forest does not hold is an error rather than a silent gap: it
     /// means a block reached the canonical chain without passing through this
     /// node's validation, and the forest can no longer compute the next root.
     pub fn on_canonical(&self, block_hash: B256) -> Result<(), NodeStateError> {
-        let snapshot = self.with_forest(|forest| {
+        let mut persistence = self.persistence();
+        // A finished base rewrite: adopt it, and drop the log's prefix it
+        // made redundant.
+        if persistence.rewrite.as_ref().is_some_and(|(handle, _)| handle.is_finished()) {
+            let (handle, at) = persistence.rewrite.take().expect("checked above");
+            match handle.join() {
+                Ok(Ok(())) => {
+                    persistence.base = Some(at);
+                    persistence.delta_bytes = trim_deltas(&self.delta_path(), at.0)?;
+                    info!(target: "n42.qmdb", block = at.0, head = %at.1, log_bytes = persistence.delta_bytes, "base snapshot rewritten");
+                }
+                Ok(Err(err)) => warn!(target: "n42.qmdb", %err, "the base snapshot rewrite failed; the delta log keeps growing"),
+                Err(_) => warn!(target: "n42.qmdb", "the base snapshot rewrite panicked; the delta log keeps growing"),
+            }
+        }
+        let covered = persistence.covered;
+        let (head, path, full) = self.with_forest(|forest| {
+            let path = covered.and_then(|(_, from)| forest.path_between(from, block_hash));
             forest.set_canonical(block_hash)?;
-            forest.snapshot()
+            let head = forest.head();
+            match path {
+                Some(path) => Ok((head, path, None)),
+                None => Ok((head, Vec::new(), Some(forest.snapshot()?))),
+            }
         })?;
+        if let Some(snapshot) = full {
+            // Not an extension of what is on disk (first write, or a head the
+            // log cannot reach): the whole tree, now.
+            write_snapshot(&self.snapshot_path(), &snapshot)?;
+            truncate_deltas(&self.delta_path())?;
+            persistence.base = Some(head);
+            persistence.delta_bytes = 0;
+            debug!(target: "n42.qmdb", block = head.0, %block_hash, "persisted the QMDB head whole");
+        } else {
+            let mut bytes = 0u64;
+            let mut log = open_delta_log(&self.delta_path())?;
+            for (number, hash, parent, ops) in path {
+                bytes += append_delta(&mut log, &DeltaRecord { number, hash, parent, ops })?;
+            }
+            use std::io::Write as _;
+            log.flush().map_err(|source| NodeStateError::Io { path: self.delta_path(), source })?;
+            persistence.delta_bytes += bytes;
+            debug!(target: "n42.qmdb", block = head.0, %block_hash, log_bytes = persistence.delta_bytes, "appended the QMDB head to the delta log");
+        }
+        persistence.covered = Some(head);
+        // Time for a new base? Copy the tree under the lock, write it off it.
+        let since_base = persistence.base.map_or(u64::MAX, |(number, _)| head.0.saturating_sub(number));
+        if persistence.rewrite.is_none()
+            && (persistence.delta_bytes >= DELTA_REWRITE_BYTES || since_base >= DELTA_REWRITE_BLOCKS)
+        {
+            let snapshot = self.with_forest(|forest| forest.snapshot())?;
+            let path = self.snapshot_path();
+            let at = (snapshot.head_number, snapshot.head_hash);
+            info!(target: "n42.qmdb", block = at.0, head = %at.1, "rewriting the base snapshot in the background");
+            let handle = std::thread::Builder::new()
+                .name("qmdb-base-snapshot".into())
+                .spawn(move || write_snapshot(&path, &snapshot))
+                .map_err(|source| NodeStateError::Io { path: self.snapshot_path(), source })?;
+            persistence.rewrite = Some((handle, at));
+        }
+        Ok(())
+    }
+
+    /// Writes the base snapshot at the canonical head now, synchronously —
+    /// for a shutdown, so the next start need not replay the log. Waits for
+    /// a background rewrite first.
+    pub fn persist_now(&self) -> Result<(), NodeStateError> {
+        let mut persistence = self.persistence();
+        if let Some((handle, _)) = persistence.rewrite.take() {
+            let _ = handle.join();
+        }
+        let snapshot = self.with_forest(|forest| forest.snapshot())?;
         write_snapshot(&self.snapshot_path(), &snapshot)?;
-        debug!(target: "n42.qmdb", block = snapshot.head_number, %block_hash, "persisted the QMDB head");
+        truncate_deltas(&self.delta_path())?;
+        persistence.base = Some((snapshot.head_number, snapshot.head_hash));
+        persistence.covered = persistence.base;
+        persistence.delta_bytes = 0;
         Ok(())
     }
 }
@@ -411,6 +563,99 @@ impl StateProofProvider for QmdbNodeState {
         let forest = guard.as_mut()?;
         let proof = forest.prove_storage(address, slot)?;
         Some((forest.root(), proof))
+    }
+}
+
+fn open_delta_log(path: &Path) -> Result<std::io::BufWriter<std::fs::File>, NodeStateError> {
+    let io = |source| NodeStateError::Io { path: path.to_path_buf(), source };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(io)?;
+    }
+    let file = std::fs::OpenOptions::new().create(true).append(true).open(path).map_err(io)?;
+    Ok(std::io::BufWriter::new(file))
+}
+
+/// Appends one record, length-prefixed; returns the bytes written.
+fn append_delta(log: &mut std::io::BufWriter<std::fs::File>, record: &DeltaRecord) -> Result<u64, NodeStateError> {
+    use std::io::Write as _;
+    let bytes = bincode::serialize(record).map_err(|source| NodeStateError::Decode {
+        path: PathBuf::from(DELTA_FILE),
+        source,
+    })?;
+    let io = |source| NodeStateError::Io { path: PathBuf::from(DELTA_FILE), source };
+    log.write_all(&(bytes.len() as u32).to_le_bytes()).map_err(io)?;
+    log.write_all(&bytes).map_err(io)?;
+    Ok(4 + bytes.len() as u64)
+}
+
+/// Every record of the log, in order. A truncated tail — a crash mid-append
+/// — ends the read; what precedes it is whole.
+fn read_deltas(path: &Path) -> Result<Vec<DeltaRecord>, NodeStateError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => return Err(NodeStateError::Io { path: path.to_path_buf(), source }),
+    };
+    let mut records = Vec::new();
+    let mut cursor = 0usize;
+    while cursor + 4 <= bytes.len() {
+        let len = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().expect("four bytes")) as usize;
+        let start = cursor + 4;
+        let Some(end) = start.checked_add(len).filter(|end| *end <= bytes.len()) else {
+            warn!(target: "n42.qmdb", offset = cursor, "the delta log ends in a partial record; ignoring it");
+            break;
+        };
+        let record: DeltaRecord = bincode::deserialize(&bytes[start..end]).map_err(|source| NodeStateError::Decode {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        records.push(record);
+        cursor = end;
+    }
+    Ok(records)
+}
+
+/// Re-applies the log's records that chain from the forest's head, stopping
+/// at `target` if it is reached. Returns how many were applied.
+fn replay_deltas(path: &Path, forest: &mut QmdbForest, target: B256) -> Result<usize, NodeStateError> {
+    let mut applied = 0usize;
+    for record in read_deltas(path)? {
+        if forest.head().1 == target {
+            break;
+        }
+        if record.parent != forest.head().1 {
+            continue;
+        }
+        forest.apply_ops(record.parent, record.hash, record.number, record.ops)?;
+        forest.set_canonical(record.hash)?;
+        applied += 1;
+    }
+    Ok(applied)
+}
+
+/// Drops the log's records at or below `base_number`; returns the new size.
+fn trim_deltas(path: &Path, base_number: u64) -> Result<u64, NodeStateError> {
+    let keep: Vec<DeltaRecord> = read_deltas(path)?.into_iter().filter(|record| record.number > base_number).collect();
+    let temp = path.with_extension("bin.tmp");
+    let io = |source| NodeStateError::Io { path: path.to_path_buf(), source };
+    {
+        let file = std::fs::File::create(&temp).map_err(io)?;
+        let mut log = std::io::BufWriter::new(file);
+        for record in &keep {
+            append_delta(&mut log, record)?;
+        }
+        use std::io::Write as _;
+        log.flush().map_err(io)?;
+    }
+    std::fs::rename(&temp, path).map_err(io)?;
+    std::fs::metadata(path).map(|m| m.len()).map_err(io)
+}
+
+fn truncate_deltas(path: &Path) -> Result<(), NodeStateError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(NodeStateError::Io { path: path.to_path_buf(), source }),
     }
 }
 
@@ -555,6 +800,59 @@ mod tests {
             behind.initialize((5, B256::repeat_byte(0x55))),
             Err(NodeStateError::SnapshotMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn canonical_blocks_go_to_the_delta_log_and_a_restart_replays_them() {
+        let chain = qmdb_chain();
+        let dir = scratch("deltas");
+        let genesis_hash = chain.genesis_hash();
+        let state = QmdbNodeState::new(chain.clone(), &dir);
+        state.initialize((0, genesis_hash)).unwrap();
+
+        let mut parent = genesis_hash;
+        let mut heads = Vec::new();
+        for number in 1..=6u64 {
+            let mut changes = BlockChanges::new();
+            changes.accounts.insert(
+                Address::with_last_byte(number as u8),
+                Some(n42_qmdb_state::AccountState {
+                    nonce: 0,
+                    balance: alloy_primitives::U256::from(number * 1000),
+                    code_hash: B256::from(n42_twig_core::qmdb_compat::GOV5_EMPTY_CODE_HASH),
+                }),
+            );
+            let hash = B256::repeat_byte(0x10 + number as u8);
+            let root = state.compute(parent, &changes).unwrap().root;
+            state.validate_block(parent, hash, number, &changes, root).unwrap();
+            state.on_canonical(hash).unwrap();
+            heads.push((number, hash, root));
+            parent = hash;
+        }
+        // The first canonical write is the base; the rest are log records.
+        let base = read_snapshot(&state.snapshot_path()).unwrap().unwrap();
+        assert_eq!(base.head_number, 1);
+        assert_eq!(read_deltas(&state.delta_path()).unwrap().len(), 5);
+
+        let (number, hash, root) = heads[5];
+        let restarted = QmdbNodeState::new(chain.clone(), &dir);
+        restarted.initialize((number, hash)).unwrap();
+        assert_eq!(restarted.head(), Some((number, hash)));
+        assert_eq!(restarted.state_root(), root);
+
+        // A restart at an earlier canonical block replays up to it only.
+        let (number, hash, root) = heads[2];
+        let earlier = QmdbNodeState::new(chain.clone(), &dir);
+        earlier.initialize((number, hash)).unwrap();
+        assert_eq!(earlier.state_root(), root);
+
+        // persist_now folds everything into the base.
+        restarted.persist_now().unwrap();
+        assert_eq!(read_snapshot(&restarted.snapshot_path()).unwrap().unwrap().head_number, 6);
+        assert!(read_deltas(&restarted.delta_path()).unwrap().is_empty());
+        let again = QmdbNodeState::new(chain, &dir);
+        again.initialize((6, heads[5].1)).unwrap();
+        assert_eq!(again.state_root(), heads[5].2);
     }
 
     #[test]

@@ -93,6 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut base_timeout_ms: Option<u64> = None;
     let mut max_timeout_ms: Option<u64> = None;
     let mut period_secs: u64 = 1;
+    let mut net_key: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -121,6 +122,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 base_timeout_ms = Some(args.next().ok_or("--timeout-ms needs a value")?.parse()?)
             }
             "--datadir" => datadir = Some(args.next().ok_or("--datadir needs a path")?),
+            "--net-key" => net_key = Some(args.next().ok_or("--net-key needs a hex secp256k1 secret")?),
             "--mobile" => mobile_addr = Some(args.next().ok_or("--mobile needs an address")?),
             "--propose" => propose = true,
             "--help" | "-h" => {
@@ -133,6 +135,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Everything about the fleet from one file, when there is one.
     let mut hotstuff_config: Option<n42_qmdb_reth::HotStuffGenesisConfig> = None;
+    // gov5's own forks: what its headers carry beyond Ethereum's fields.
+    let mut fork_schedule = n42_h2_consensus::Gov5ForkSchedule::default();
     let (identity, validators): (H2V4ChainIdentity, Vec<ValidatorInfo>) = match &chain_path {
         Some(path) => {
             use reth_cli::chainspec::ChainSpecParser as _;
@@ -142,6 +146,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_timeout_ms.get_or_insert(hotstuff.max_timeout);
             period_secs = hotstuff.period.max(1);
             hotstuff_config = Some(hotstuff.clone());
+            fork_schedule = n42_h2_consensus::Gov5ForkSchedule::from_genesis(&spec.genesis);
             (
                 H2V4ChainIdentity {
                     chain_id: chain_id.unwrap_or_else(|| spec.chain().id()),
@@ -214,12 +219,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+    // A fixed libp2p identity, gov5's way: the hex secp256k1 secret its
+    // `<datadir>/network-keys` holds. A fleet whose members list each other
+    // by peer id keeps dialing the id it was given; taking over a member's
+    // slot means taking over its identity too.
+    let keypair = match &net_key {
+        Some(hex_key) => {
+            let mut bytes = hex::decode(hex_key.trim().trim_start_matches("0x"))?;
+            let secret = libp2p::identity::secp256k1::SecretKey::try_from_bytes(&mut bytes)?;
+            Some(libp2p::identity::Keypair::from(libp2p::identity::secp256k1::Keypair::from(secret)))
+        }
+        None => None,
+    };
+
     runtime.block_on(async move {
-        let transport = H2V4Transport::new(config)?;
+        let transport = match keypair {
+            Some(keypair) => H2V4Transport::with_keypair(config, keypair)?,
+            None => H2V4Transport::new(config)?,
+        };
         println!("node peer id : {}", transport.local_peer_id());
         println!("chain        : id {} genesis {}", identity.chain_id, identity.genesis_hash);
         println!("validator    : index {index} of {validator_count} (f = {f})");
         println!("execution    : {el_url}");
+        if let Some(at) = fork_schedule.mobile_anchor_time {
+            println!("gov5 forks   : mobileAnchor at {at} (headers carry MobileRegistryRoot)");
+        }
         println!("proposing    : {}", if propose { "yes" } else { "no (votes only)" });
 
         // Phones verify the Decide, not this node's word for it, so the endpoint
@@ -313,10 +337,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         // Without this the node signs under the native profile and every fleet
-        // member rejects its votes.
-        engine.enable_h2_v4_signing(identity);
+        // member rejects its votes. gov5 signs the chain-bound v4 messages
+        // only on a chain whose spec sets `interopV4`; its production chains
+        // do not, and sign its original messages instead.
+        let interop_v4 = hotstuff_config.as_ref().is_none_or(|config| config.interop_v4);
+        if interop_v4 {
+            engine.enable_h2_v4_signing(identity);
+            println!("signing      : H2-v4, chain-bound (interopV4)");
+        } else {
+            engine.enable_gov5_legacy_signing();
+            println!("signing      : gov5 legacy messages (no interopV4 in the genesis)");
+        }
 
         let el = EngineApiClient::new(HttpTransport::new(el_url, jwt, Duration::from_secs(8))?);
+        // A checkpoint written while this node was still pulling the chain
+        // names the fleet's commit, which its own execution layer may never
+        // have seen; a forkchoice naming it is refused. Start from what the
+        // execution layer holds instead.
+        if let Some(head) = recovered_head {
+            use n42_h2_execution::ExecutionLayer as _;
+            match el.block_by_hash(head).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    println!("head         : {head} is unknown to the execution layer; finality restarts from the next commit");
+                    recovered_head = None;
+                }
+                Err(error) => println!("head         : could not be checked against the execution layer: {error}"),
+            }
+        }
         let driver = ExecutionDriver::new(el, recovered_head.unwrap_or(identity.genesis_hash));
 
         let mut service = H2Service::new(transport, engine, driver, output_rx, validator_count);
@@ -332,7 +380,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
         }
         if gov5_profile {
-            service = service.with_gov5_h2_profile(seal_key);
+            service = service.with_gov5_h2_profile(seal_key, fork_schedule);
         }
         if let Some(rpc) = &el_rpc {
             service = service.with_transaction_source(rpc.parse()?);
@@ -369,7 +417,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             service = service.with_payload_attributes(move |context| {
                 let parent_beacon_block_root = match (&committee, &context.head_header) {
                     (Some(pool), Some(parent)) => {
-                        match pool.parent_beacon_root(parent.number, &parent.hash_slow(), &parent.receipts_root) {
+                        // The head's hash, not the header rehashed: on a
+                        // gov5 chain the header lacks the field its hash
+                        // covers.
+                        match pool.parent_beacon_root(parent.number, &context.head, &parent.receipts_root) {
                             Ok(root) => root,
                             Err(err) => {
                                 eprintln!("committee evidence for the head failed: {err}");

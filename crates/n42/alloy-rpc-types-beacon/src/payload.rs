@@ -274,6 +274,7 @@ impl<'a> From<BeaconExecutionPayloadV1<'a>> for ExecutionPayloadV1 {
             // difficulty/nonce. They are re-derived from the header, not the wire.
             difficulty: Default::default(),
             nonce: Default::default(),
+            mobile_registry_root: None,
         }
     }
 }
@@ -298,6 +299,7 @@ impl<'a> From<&'a ExecutionPayloadV1> for BeaconExecutionPayloadV1<'a> {
             // N42-only, not part of the CL payload shape
             difficulty: _,
             nonce: _,
+            mobile_registry_root: _,
         } = value;
 
         BeaconExecutionPayloadV1 {

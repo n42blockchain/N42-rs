@@ -17,6 +17,7 @@ n42-h2-wire.workspace = true
 alloy-primitives = { workspace = true, features = ["serde"] }
 alloy-consensus.workspace = true
 alloy-eips.workspace = true
+alloy-genesis.workspace = true
 alloy-rlp.workspace = true
 alloy-rpc-types-engine.workspace = true
 bitvec = { version = "1.0", features = ["serde"] }

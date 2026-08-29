@@ -7612,6 +7612,7 @@ dependencies = [
  "n42-clique",
  "n42-engine-primitives",
  "n42-engine-types",
+ "n42-h2-consensus",
  "n42-primitives",
  "n42-qmdb-reth",
  "pubsub-mem",
@@ -7837,6 +7838,7 @@ version = "0.0.0"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
+ "alloy-evm",
  "alloy-genesis",
  "alloy-network 2.4.1",
  "alloy-primitives 1.7.1",
@@ -7918,6 +7920,7 @@ version = "2.1.5"
 dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-eips 2.4.1",
+ "alloy-genesis",
  "alloy-primitives 1.7.1",
  "alloy-rlp",
  "alloy-rpc-types-engine 2.4.1",

@@ -200,10 +200,7 @@ impl ConsensusEngine {
 
         // Clear pending block data: similar to Tendermint's "prevote nil".
         self.pending_proposal = None;
-        if !matches!(
-            self.signing_profile,
-            super::quorum::ConsensusSigningProfile::H2V4(_)
-        ) {
+        if !self.signing_profile.is_gov5() {
             self.imported_blocks.clear();
             self.imported_block_fifo.clear();
         }

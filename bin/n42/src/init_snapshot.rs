@@ -114,7 +114,7 @@ struct RootLine {
 const COMMIT_UNITS: usize = 100_000;
 
 /// A header from a file holding its RLP, raw or as hex.
-fn read_header_from_file(path: &std::path::Path) -> eyre::Result<Header> {
+fn read_header_from_file(path: &std::path::Path) -> eyre::Result<(Header, B256)> {
     let bytes = fs::read(path).wrap_err("header file")?;
     let text = std::str::from_utf8(&bytes).map(str::trim).unwrap_or("");
     let rlp = if text.starts_with("0x") || text.chars().all(|c| c.is_ascii_hexdigit()) && !text.is_empty() {
@@ -122,12 +122,11 @@ fn read_header_from_file(path: &std::path::Path) -> eyre::Result<Header> {
     } else {
         bytes
     };
-    let mut cursor = rlp.as_slice();
-    let header = <Header as alloy_rlp::Decodable>::decode(&mut cursor).wrap_err("header RLP")?;
-    if !cursor.is_empty() {
-        bail!("header file has {} trailing bytes", cursor.len());
-    }
-    Ok(header)
+    // gov5's codec, which reads its own fields beyond Ethereum's and hashes
+    // them; the hash is what the datadir is anchored at.
+    let (header, extension) = n42_h2_consensus::decode_gov5_header(&rlp).wrap_err("header RLP")?;
+    let hash = n42_h2_consensus::gov5_header_hash(&header, &extension);
+    Ok((header, hash))
 }
 
 fn main() -> eyre::Result<()> {
@@ -153,8 +152,7 @@ fn init(args: InitArgs, runtime: reth_tasks::Runtime) -> eyre::Result<()> {
     let Environment { provider_factory, data_dir, .. } =
         args.env.init::<N42Node>(AccessRights::RW, runtime)?;
 
-    let header: Header = read_header_from_file(&args.header)?;
-    let hash = header.hash_slow();
+    let (header, hash) = read_header_from_file(&args.header)?;
     let number = header.number;
     let root = header.state_root;
     println!("head: block {number} {hash} state root {root}");

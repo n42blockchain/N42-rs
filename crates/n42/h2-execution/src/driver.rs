@@ -337,10 +337,36 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             safe_block_hash: block_hash,
             finalized_block_hash: self.finalized,
         };
-        let updated = self
+        let updated = match self
             .el
             .fork_choice_updated_for(ExecutionPath::HISTORICAL_SEQUENTIAL, state)
-            .await?;
+            .await
+        {
+            Ok(updated) => updated,
+            // The finalised block this node remembers is one its execution
+            // layer never had: a checkpoint written while the node was
+            // still pulling the chain names the fleet's commit, not a block
+            // of its own (Engine API -38002, "invalid forkchoice state").
+            // Finality then restarts from the next commit; the pull itself
+            // goes on with nothing finalised.
+            Err(error) if error.0.contains("-38002") && self.finalized != B256::ZERO => {
+                tracing::warn!(
+                    target: "n42.h2.driver",
+                    finalized = %self.finalized,
+                    "the execution layer does not know the finalised block; pulling with none until the next commit"
+                );
+                self.finalized = B256::ZERO;
+                let state = ForkchoiceState {
+                    head_block_hash: block_hash,
+                    safe_block_hash: block_hash,
+                    finalized_block_hash: B256::ZERO,
+                };
+                self.el
+                    .fork_choice_updated_for(ExecutionPath::HISTORICAL_SEQUENTIAL, state)
+                    .await?
+            }
+            Err(error) => return Err(error),
+        };
         if let PayloadStatusEnum::Invalid { validation_error } = updated.payload_status.status {
             return Err(ElError::new(format!("forkchoice to {block_hash} refused: {validation_error}")));
         }

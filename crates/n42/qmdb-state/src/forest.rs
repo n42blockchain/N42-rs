@@ -276,13 +276,52 @@ impl QmdbForest {
         number: u64,
         changes: &BlockChanges,
     ) -> Result<B256, StateError> {
+        self.apply_ops(parent, block_hash, number, changes.operations())
+    }
+
+    /// [`Self::apply`] with the block's sorted leaf operations already
+    /// derived — what a persisted delta record carries.
+    pub fn apply_ops(
+        &mut self,
+        parent: B256,
+        block_hash: B256,
+        number: u64,
+        ops: Vec<QmdbOperation>,
+    ) -> Result<B256, StateError> {
         if let Some(root) = self.root_of(&block_hash) {
             return Ok(root);
         }
-        let prepared = self.compute(parent, changes)?;
+        self.move_to(parent)?;
+        let (root, undo) = self.tree.apply_sorted_ops_recorded(ops.clone())?;
+        self.pending = Some((parent, undo));
+        let prepared = PreparedBlock {
+            root: B256::from(root),
+            parent,
+            ops,
+        };
         let root = prepared.root;
         self.insert(block_hash, number, prepared)?;
         Ok(root)
+    }
+
+    /// The held blocks from just above `from` up to and including `to`,
+    /// oldest first, as `(number, hash, parent, ops)` — the records a
+    /// persisted forest at `from` needs to stand at `to`. `None` when `to`
+    /// does not descend from `from` through held blocks.
+    pub fn path_between(&self, from: B256, to: B256) -> Option<Vec<(u64, B256, B256, Vec<QmdbOperation>)>> {
+        let mut path = Vec::new();
+        let mut cursor = to;
+        while cursor != from {
+            let record = self.records.get(&cursor)?;
+            if record.ops.is_empty() && record.parent == B256::ZERO {
+                // The block the forest was restored at: nothing lies beneath.
+                return None;
+            }
+            path.push((record.number, cursor, record.parent, record.ops.clone()));
+            cursor = record.parent;
+        }
+        path.reverse();
+        Some(path)
     }
 
     /// Advances the canonical head and drops blocks that have fallen out of

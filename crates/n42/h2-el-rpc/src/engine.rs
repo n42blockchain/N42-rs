@@ -422,6 +422,7 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
 /// The consensus header and transactions inside an `eth_getBlockByNumber`
 /// answer, which is what gov5's block form is built from.
 pub fn block_parts(block: alloy_rpc_types_eth::Block) -> ChainBlock {
+    let hash = block.header.hash;
     let header = block.header.inner;
     let transactions = block
         .transactions
@@ -429,5 +430,5 @@ pub fn block_parts(block: alloy_rpc_types_eth::Block) -> ChainBlock {
         .into_iter()
         .map(|tx| tx.inner.into_inner())
         .collect();
-    ChainBlock { header, transactions, withdrawals: block.withdrawals.map(|w| w.0) }
+    ChainBlock { hash, header, transactions, withdrawals: block.withdrawals.map(|w| w.0) }
 }

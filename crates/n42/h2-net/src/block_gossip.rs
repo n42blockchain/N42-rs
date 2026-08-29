@@ -27,7 +27,7 @@ use alloy_eips::eip2718::{Decodable2718, Encodable2718};
 use alloy_eips::eip4895::{Withdrawal, Withdrawals};
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy_rlp::{Decodable, Encodable, Header as RlpHeader, RlpDecodable, RlpEncodable};
-use n42_h2_consensus::{rewards_to_withdrawals, withdrawals_to_rewards};
+use n42_h2_consensus::{rewards_to_withdrawals, withdrawals_to_rewards, Gov5HeaderExtension};
 use alloy_rpc_types_engine::ExecutionData;
 use libp2p::gossipsub::IdentTopic;
 
@@ -51,6 +51,8 @@ pub fn gov5_block_topic(genesis_hash: B256) -> IdentTopic {
 /// A block as decoded from the wire.
 #[derive(Clone, Debug)]
 pub struct GossipBlock {
+    /// gov5's header fields beyond Ethereum's, as decoded from the wire.
+    pub extension: Gov5HeaderExtension,
     /// Keccak of the header RLP, which is the hash the proposal named.
     pub block_hash: B256,
     /// The header, exactly as the producer sealed it.
@@ -161,12 +163,12 @@ pub fn encode_block_rlp(
     execution: &ExecutionData,
     profile: HeaderProfile,
 ) -> Result<Vec<u8>, BlockGossipError> {
-    let block = reconstruct_block(execution, profile)?;
+    let (block, extension) = reconstruct_block(execution, profile)?;
     if calculate_transaction_root(&block.body.transactions) != block.header.transactions_root {
         return Err(BlockGossipError::TransactionRootMismatch);
     }
     let rewards = withdrawals_to_rewards(block.body.withdrawals.as_ref().map_or(&[][..], |w| w.as_slice()));
-    Ok(encode_block_rlp_parts(&block.header, &block.body.transactions, &rewards))
+    Ok(encode_block_rlp_parts(&block.header, &extension, &block.body.transactions, &rewards))
 }
 
 /// One reward on the wire: gov5's `Reward{Address, Amount}` under
@@ -181,11 +183,11 @@ struct RewardRlp {
 /// rewards as they stand — what a node that already holds the block serves.
 pub fn encode_block_rlp_parts(
     header: &Header,
+    extension: &Gov5HeaderExtension,
     transactions: &[TxEnvelope],
     rewards: &[(Address, U256)],
 ) -> Vec<u8> {
-    let mut header_rlp = Vec::new();
-    header.encode(&mut header_rlp);
+    let header_rlp = n42_h2_consensus::gov5_header_rlp(header, extension);
     let transaction_bytes = transactions
         .iter()
         .map(|transaction| Bytes::from(transaction.encoded_2718()))
@@ -226,11 +228,20 @@ pub fn decode_block_rlp(
     }
 
     let header_rlp = take_rlp_item(&mut payload).ok_or(BlockGossipError::InvalidRlp)?;
-    let mut header_cursor = header_rlp;
-    let header = Header::decode(&mut header_cursor).map_err(|_| BlockGossipError::InvalidRlp)?;
-    if !header_cursor.is_empty() {
-        return Err(BlockGossipError::InvalidRlp);
-    }
+    let (header, extension) = match profile {
+        // gov5's codec: the placeholders of its optional tail, and its
+        // fields beyond Ethereum's.
+        HeaderProfile::Gov5H2 => n42_h2_consensus::decode_gov5_header(header_rlp)
+            .map_err(|e| BlockGossipError::HeaderProfile(profile, e.to_string()))?,
+        HeaderProfile::Ethereum => {
+            let mut header_cursor = header_rlp;
+            let header = Header::decode(&mut header_cursor).map_err(|_| BlockGossipError::InvalidRlp)?;
+            if !header_cursor.is_empty() {
+                return Err(BlockGossipError::InvalidRlp);
+            }
+            (header, Gov5HeaderExtension::NONE)
+        }
+    };
     validate_header(&header, profile)?;
 
     let transactions_rlp = take_rlp_item(&mut payload).ok_or(BlockGossipError::InvalidRlp)?;
@@ -266,6 +277,7 @@ pub fn decode_block_rlp(
 
     Ok(GossipBlock {
         block_hash: keccak256(header_rlp),
+        extension,
         header,
         transactions,
         rewards,
@@ -308,7 +320,7 @@ impl GossipBlock {
                 withdrawals,
             },
         };
-        n42_h2_consensus::execution_data_for_block(self.block_hash, &block)
+        n42_h2_consensus::execution_data_for_block(self.block_hash, &block, &self.extension)
     }
 }
 
@@ -320,7 +332,7 @@ impl GossipBlock {
 fn reconstruct_block(
     execution: &ExecutionData,
     profile: HeaderProfile,
-) -> Result<Block<TxEnvelope>, BlockGossipError> {
+) -> Result<(Block<TxEnvelope>, Gov5HeaderExtension), BlockGossipError> {
     let expected_hash = execution.block_hash();
     let direct = execution
         .clone()
@@ -332,7 +344,7 @@ fn reconstruct_block(
             if direct.header.hash_slow() != expected_hash {
                 return Err(BlockGossipError::PayloadHashMismatch);
             }
-            Ok(direct)
+            Ok((direct, Gov5HeaderExtension::NONE))
         }
         HeaderProfile::Gov5H2 => n42_h2_consensus::reconstruct_gov5_h2_block::<TxEnvelope>(execution)
             .map_err(|e| BlockGossipError::HeaderProfile(profile, e.to_string())),

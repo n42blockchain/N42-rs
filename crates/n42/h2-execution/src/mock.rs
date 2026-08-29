@@ -166,6 +166,7 @@ impl MockExecutionLayer {
                 transactions: Vec::new(),
                 // N42-specific: this repo's vendored alloy-rpc-types-engine adds
                 // difficulty and nonce to the V1 payload (APoS carries the
+                mobile_registry_root: None,
                 // Clique-style seal there). Upstream alloy has neither.
                 difficulty: U256::ZERO,
                 nonce: Default::default(),
@@ -197,6 +198,7 @@ impl ExecutionLayer for MockExecutionLayer {
                 .insert(
                     number,
                     ChainBlock {
+                        hash: payload.block_hash(),
                         header: block.header,
                         transactions: block.body.transactions,
                         withdrawals: block.body.withdrawals.map(|w| w.0),
@@ -287,6 +289,7 @@ impl ExecutionLayer for MockExecutionLayer {
                 .insert(
                     number,
                     ChainBlock {
+                        hash: built.execution_data.block_hash(),
                         header: block.header,
                         transactions: block.body.transactions,
                         withdrawals: block.body.withdrawals.map(|w| w.0),

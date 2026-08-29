@@ -1095,6 +1095,7 @@ mod tests {
             let payload = ExecutionPayloadV1 {
                 difficulty: Default::default(),
                 nonce: Default::default(),
+                mobile_registry_root: None,
                 parent_hash: B256::repeat_byte(0x01),
                 fee_recipient: Address::repeat_byte(0x02),
                 state_root: B256::repeat_byte(0x03),

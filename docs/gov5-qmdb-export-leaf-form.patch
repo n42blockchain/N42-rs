@@ -1,0 +1,249 @@
+commit 2c8ee7507ff37bff3833577ce279daa6194bbe2c
+Author: MiraWells <1020080523@qq.com>
+Date:   Sat Aug 29 05:55:43 2026 +0000
+
+    scripts(qs): fleet-monitor hwmon heading
+
+diff --git a/cmd/n42-qmdb-export/main.go b/cmd/n42-qmdb-export/main.go
+index d16855ba..252e5c19 100644
+--- a/cmd/n42-qmdb-export/main.go
++++ b/cmd/n42-qmdb-export/main.go
+@@ -29,6 +29,7 @@ func main() {
+ 	dbPath := flag.String("db", "", "replay-v2 chaindata directory with QMDB history")
+ 	outputPath := flag.String("out", "", "portable snapshot output file")
+ 	mapGB := flag.Int("map.gb", 512, "MDBX map size in GiB")
++	leafForm := flag.Bool("leaf-form", false, "write the v2 leaf-form snapshot (per-twig leaf hashes and live entries); the only form a node that reclaims dead entry rows can write")
+ 	flag.Parse()
+ 	if *dbPath == "" || *outputPath == "" {
+ 		fatalf("usage: n42-qmdb-export --db <chaindata> --out <snapshot>")
+@@ -124,13 +125,20 @@ func main() {
+ 		}
+ 		return entry, nil
+ 	}
++	if *leafForm {
++		stats := computer.Tree().StatsForV2(tx)
++		fmt.Fprintf(os.Stderr, "leaf-form export: %d twigs (%d without leaf hashes), %d live entries\n", stats.Twigs, stats.HollowTwigs, stats.LiveEntries)
++	}
+ 	written, err := writeAtomic(*outputPath, func(w io.Writer) (int64, error) {
++		if *leafForm {
++			return qmdb.WritePortableSnapshotV2(w, metadata, computer.Tree(), tx)
++		}
+ 		return qmdb.WritePortableSnapshot(w, metadata, source)
+ 	})
+ 	if err != nil {
+ 		fatalf("encode portable snapshot: %v", err)
+ 	}
+-	if key != nil {
++	if key != nil && !*leafForm {
+ 		fatalf("QMDB entry table contains rows beyond next slot %d", metadata.NextSlot)
+ 	}
+ 	if cursorErr != nil {
+diff --git a/lib/qmdb/portable_v2.go b/lib/qmdb/portable_v2.go
+new file mode 100644
+index 00000000..d6fd6560
+--- /dev/null
++++ b/lib/qmdb/portable_v2.go
+@@ -0,0 +1,203 @@
++// Copyright 2022-2026 The N42 Authors
++// This file is part of the N42 library.
++
++package qmdb
++
++import (
++	"encoding/binary"
++	"errors"
++	"fmt"
++	"io"
++	"sort"
++
++	"lukechampine.com/blake3"
++)
++
++// portableSnapshotMagicV2 marks the leaf-form snapshot: per twig its frozen
++// leaf root, active bits and (when the node still holds them) leaf hashes,
++// then the live entries only. A node that reclaims dead entry rows cannot
++// write the v1 slot log, whose dead slots must carry key and value; the
++// split commitment needs no more than their leaf hashes, which the twig
++// leaf blobs keep, and for a twig without a blob the frozen leaf root alone
++// carries the commitment.
++var portableSnapshotMagicV2 = [8]byte{'N', '4', '2', 'Q', 'M', 'D', 'B', 2}
++
++const (
++	portableTwigHollow byte = 0 // leaf root and bits only; the twig holds no live slot
++	portableTwigLeaves byte = 1 // leaf root, bits, then one 32-byte leaf per appended slot
++)
++
++// WritePortableSnapshotV2 streams the leaf-form snapshot of t, whose forest
++// must already be loaded and whose root must equal metadata.Root. Live
++// entries are read through g (the positional entry log) in slot order.
++func WritePortableSnapshotV2(w io.Writer, metadata PortableSnapshotMetadata, t *Tree, g Getter) (int64, error) {
++	if t == nil || g == nil {
++		return 0, errors.New("qmdb: nil tree or getter for the v2 portable snapshot")
++	}
++	if t.Root() != metadata.Root {
++		return 0, fmt.Errorf("qmdb: tree root %x is not the snapshot root %x", t.Root(), metadata.Root)
++	}
++	if t.nextSlot != metadata.NextSlot {
++		return 0, fmt.Errorf("qmdb: tree next slot %d is not the snapshot next slot %d", t.nextSlot, metadata.NextSlot)
++	}
++	numTwigs := len(t.twigs)
++	if want := int((metadata.NextSlot + TwigSize - 1) / TwigSize); numTwigs != want {
++		return 0, fmt.Errorf("qmdb: %d twigs for next slot %d, expected %d", numTwigs, metadata.NextSlot, want)
++	}
++
++	// Live entries in slot order, from the index: the entry log may still
++	// hold rows of slots that died since the last flush.
++	type liveRef struct {
++		slot uint64
++		key  Hash
++	}
++	live := make([]liveRef, 0, t.idx.Len())
++	if !t.IndexRange(func(keyHash Hash, slot uint64) bool {
++		live = append(live, liveRef{slot: slot, key: keyHash})
++		return true
++	}) {
++		return 0, errors.New("qmdb: the index is not iterable")
++	}
++	sort.Slice(live, func(i, j int) bool { return live[i].slot < live[j].slot })
++
++	hasher := blake3.New(32, nil)
++	payload := &countingWriter{w: io.MultiWriter(w, hasher)}
++	var header [8 + 8 + 32 + 8 + 32 + 32 + 8 + 8 + 8]byte
++	copy(header[:8], portableSnapshotMagicV2[:])
++	binary.LittleEndian.PutUint64(header[8:16], metadata.ChainID)
++	copy(header[16:48], metadata.GenesisHash[:])
++	binary.LittleEndian.PutUint64(header[48:56], metadata.BlockNumber)
++	copy(header[56:88], metadata.BlockHash[:])
++	copy(header[88:120], metadata.Root[:])
++	binary.LittleEndian.PutUint64(header[120:128], metadata.NextSlot)
++	binary.LittleEndian.PutUint64(header[128:136], uint64(numTwigs))
++	binary.LittleEndian.PutUint64(header[136:144], uint64(len(live)))
++	if _, err := payload.Write(header[:]); err != nil {
++		return payload.n, err
++	}
++
++	leafStore := t.leafStore
++	if leafStore == nil {
++		leafStore = LeafStoreFromGetter(g)
++	}
++	scratch := new([2 * TwigSize]Hash)
++	hollow, withLeaves := 0, 0
++	for id := 0; id < numTwigs; id++ {
++		tw := t.twigs[id]
++		if tw == nil {
++			return payload.n, fmt.Errorf("qmdb: twig %d is not loaded", id)
++		}
++		appended := metadata.NextSlot - uint64(id)*TwigSize
++		if appended > TwigSize {
++			appended = TwigSize
++		}
++		var leaves *[2 * TwigSize]Hash
++		leafRoot := tw.leafRoot
++		switch {
++		case tw.nodes != nil:
++			leaves = tw.nodes
++			leafRoot = tw.nodes[1]
++		default:
++			clear(scratch[:])
++			if li, ok := leafStore.(LeafStoreInto); ok && li.LeavesInto(id, scratch) {
++				leaves = scratch
++			} else if blob, ok := leafStore.Leaves(id); ok && len(blob) == TwigSize*32 {
++				for i := 0; i < TwigSize; i++ {
++					copy(scratch[TwigSize+i][:], blob[i*32:(i+1)*32])
++				}
++				leaves = scratch
++			}
++			if leaves != nil {
++				// The blob must reproduce the frozen root it claims to expand.
++				for start := TwigSize - 1; start >= 1; start-- {
++					scratch[start] = hashNode(scratch[start*2], scratch[start*2+1])
++				}
++				if scratch[1] != leafRoot {
++					return payload.n, fmt.Errorf("qmdb: twig %d leaf blob does not reproduce its frozen leaf root", id)
++				}
++			}
++		}
++		if leaves == nil && tw.live > 0 {
++			return payload.n, fmt.Errorf("qmdb: twig %d holds %d live slots but no leaf hashes; the snapshot cannot prove them", id, tw.live)
++		}
++		var fixed [32 + TwigSize/8 + 1]byte
++		copy(fixed[:32], leafRoot[:])
++		copy(fixed[32:32+TwigSize/8], tw.bits[:])
++		if leaves == nil {
++			fixed[32+TwigSize/8] = portableTwigHollow
++			hollow++
++		} else {
++			fixed[32+TwigSize/8] = portableTwigLeaves
++			withLeaves++
++		}
++		if _, err := payload.Write(fixed[:]); err != nil {
++			return payload.n, err
++		}
++		if leaves != nil {
++			for local := uint64(0); local < appended; local++ {
++				if _, err := payload.Write(leaves[TwigSize+local][:]); err != nil {
++					return payload.n, err
++				}
++			}
++		}
++	}
++
++	cold := t.cold
++	if cold == nil {
++		cold = ColdReaderFromGetter(g)
++	}
++	for i, ref := range live {
++		if i > 0 && live[i-1].slot == ref.slot {
++			return payload.n, fmt.Errorf("qmdb: slot %d is indexed twice", ref.slot)
++		}
++		var value []byte
++		if e, ok := t.entryAt(ref.slot); ok && e.keyHash == ref.key {
++			value = e.value
++		} else if kh, v, ok := cold.ColdEntry(ref.slot); ok && kh == ref.key {
++			value = v
++		} else {
++			return payload.n, fmt.Errorf("qmdb: live slot %d (key %x) has no entry row", ref.slot, ref.key)
++		}
++		if len(value) > maxPortableValueSize {
++			return payload.n, fmt.Errorf("qmdb: portable slot %d value is too large: %d", ref.slot, len(value))
++		}
++		var fixed [8 + 32 + 4]byte
++		binary.LittleEndian.PutUint64(fixed[:8], ref.slot)
++		copy(fixed[8:40], ref.key[:])
++		binary.LittleEndian.PutUint32(fixed[40:44], uint32(len(value)))
++		if _, err := payload.Write(fixed[:]); err != nil {
++			return payload.n, err
++		}
++		if _, err := payload.Write(value); err != nil {
++			return payload.n, err
++		}
++	}
++	digest := hasher.Sum(nil)
++	n, err := w.Write(digest)
++	_ = hollow
++	_ = withLeaves
++	return payload.n + int64(n), err
++}
++
++// PortableSnapshotV2Stats describes what a leaf-form export wrote.
++type PortableSnapshotV2Stats struct {
++	Twigs, HollowTwigs, LiveEntries int
++}
++
++// StatsForV2 reports how the tree would be exported in leaf form.
++func (t *Tree) StatsForV2(g Getter) PortableSnapshotV2Stats {
++	leafStore := t.leafStore
++	if leafStore == nil {
++		leafStore = LeafStoreFromGetter(g)
++	}
++	stats := PortableSnapshotV2Stats{Twigs: len(t.twigs), LiveEntries: t.idx.Len()}
++	for id, tw := range t.twigs {
++		if tw == nil || tw.nodes != nil {
++			continue
++		}
++		if _, ok := leafStore.Leaves(id); !ok {
++			stats.HollowTwigs++
++		}
++	}
++	return stats
++}

@@ -48,6 +48,8 @@ use reth_storage_overlay::OverlayManager;
 use reth_trie::updates::TrieUpdates;
 use tracing::debug;
 
+use alloy_consensus::transaction::TxHashRef as _;
+use reth_primitives_traits::BlockBody as _;
 use crate::changes::changes_from_execution;
 use reth_chainspec::EthereumHardforks;
 use crate::node_state::QmdbNodeState;
@@ -125,7 +127,14 @@ impl<N: NodePrimitives> StateRootJob<N> for QmdbStateRootJob {
         _hashed_state: &LazyHashedPostState,
     ) -> ProviderResult<StateRootJobOutcome> {
         let header = block.header();
-        let changes = changes_from_execution(&output.state, (self.prague_at)(header.timestamp()));
+        // The slots the block changed and restored, as the executor saw them
+        // go by; a block executed elsewhere (none is) would have none filed.
+        let key = crate::restored_slots_key(
+            header.parent_hash(),
+            block.body().transactions().iter().map(|tx| *tx.tx_hash()),
+        );
+        let restored = crate::restored_slots(key).unwrap_or_default();
+        let changes = changes_from_execution(&output.state, (self.prague_at)(header.timestamp()), &restored);
         let root = self
             .state
             .validate_block(

@@ -181,7 +181,14 @@ fn main() {
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                                 warn!(target: "reth::cli", skipped, "QMDB head follower fell behind canonical notifications");
                             }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                // Shutting down: fold the delta log into the
+                                // base so the next start restores at once.
+                                if let Err(error) = follower.persist_now() {
+                                    warn!(target: "reth::cli", %error, "QMDB forest could not be persisted at shutdown");
+                                }
+                                break;
+                            }
                         }
                     }
                 });

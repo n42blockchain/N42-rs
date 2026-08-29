@@ -58,6 +58,7 @@ alloy-network.workspace = true
 alloy-rpc-types-eth.workspace = true
 alloy-rpc-types = { workspace = true, features = ["engine"] }
 alloy-rpc-types-engine.workspace = true
+alloy-evm.workspace = true
 reth-provider.workspace = true
 
 

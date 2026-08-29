@@ -152,7 +152,7 @@ async fn build_node(
     let driver = ExecutionDriver::new(MockExecutionLayer::new(), identity.genesis_hash);
     let mut service = H2Service::new(transport, engine, driver, output_rx, VALIDATORS);
     if gov5_profile {
-        service = service.with_gov5_h2_profile(seal_key);
+        service = service.with_gov5_h2_profile(seal_key, n42_h2_consensus::Gov5ForkSchedule::default());
     }
     if propose {
         service = service.with_payload_attributes(attributes);

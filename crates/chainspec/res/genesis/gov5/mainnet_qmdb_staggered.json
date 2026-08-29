@@ -8302,6 +8302,7 @@
     "berlinBlock": 0,
     "byzantiumBlock": 0,
     "cancunBlock": 3935000,
+    "cancunTime": 1710335881,
     "chainId": 94,
     "consensus": "hotstuff",
     "constantinopleBlock": 0,
@@ -8374,6 +8375,7 @@
     "petersburgBlock": 0,
     "pragueTime": 1746612311,
     "shanghaiBlock": 305000,
+    "shanghaiTime": 1681295943,
     "stateScheme": "qmdb",
     "terminalTotalDifficulty": 0,
     "terminalTotalDifficultyPassed": true

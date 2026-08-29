@@ -25,9 +25,23 @@ pub enum ConsensusSigningProfile {
     #[default]
     Native,
     H2V4(H2V4ChainIdentity),
+    /// gov5's signing profile on a chain without `interopV4`: its original
+    /// messages (`hotstuff/types.go` — `view ‖ hash` for proposals and
+    /// votes, `"commit" ‖ view ‖ hash` for commit votes, `"timeout" ‖ view`
+    /// and `"newview" ‖ view`), not bound to the chain, under the same
+    /// proof-of-possession ciphersuite as the v4 profile. What gov5's
+    /// production chains run: chain 94 has no `interopV4` in its spec.
+    Gov5Legacy,
 }
 
 impl ConsensusSigningProfile {
+    /// Whether the fleet is gov5's — either of its profiles — and so the
+    /// engine keeps to gov5's rules: import-gated votes, import evidence
+    /// kept across views, the extends rule.
+    pub const fn is_gov5(self) -> bool {
+        matches!(self, Self::H2V4(_) | Self::Gov5Legacy)
+    }
+
     pub fn proposal_message(
         self,
         view: ViewNumber,
@@ -36,6 +50,9 @@ impl ConsensusSigningProfile {
     ) -> Vec<u8> {
         match self {
             Self::Native => proposal_signing_message(view, &block_hash, validator_changes).to_vec(),
+            // gov5's `proposalSigningMessage` without v4 is its plain
+            // `SigningMessage`: no changes hash at all.
+            Self::Gov5Legacy => signing_message(view, &block_hash).to_vec(),
             // gov5's v4 profile hardcodes a zero validator-change hash and
             // does not support reconfiguration (interop_v4.go). Deriving a
             // real hash here would be invisible until a committee change
@@ -54,7 +71,7 @@ impl ConsensusSigningProfile {
 
     pub fn vote_message(self, view: ViewNumber, block_hash: B256) -> Vec<u8> {
         match self {
-            Self::Native => signing_message(view, &block_hash).to_vec(),
+            Self::Native | Self::Gov5Legacy => signing_message(view, &block_hash).to_vec(),
             Self::H2V4(identity) => h2_v4_vote_signing_message(identity, view, block_hash).to_vec(),
         }
     }
@@ -62,6 +79,7 @@ impl ConsensusSigningProfile {
     pub fn commit_message(self, view: ViewNumber, block_hash: B256, changes_hash: B256) -> Vec<u8> {
         match self {
             Self::Native => commit_signing_message(view, &block_hash, &changes_hash).to_vec(),
+            Self::Gov5Legacy => gov5_legacy_commit_signing_message(view, &block_hash).to_vec(),
             // Zero for the same reason as `proposal_message`.
             Self::H2V4(identity) => {
                 let _ = changes_hash;
@@ -72,14 +90,14 @@ impl ConsensusSigningProfile {
 
     pub fn timeout_message(self, view: ViewNumber) -> Vec<u8> {
         match self {
-            Self::Native => timeout_signing_message(view).to_vec(),
+            Self::Native | Self::Gov5Legacy => timeout_signing_message(view).to_vec(),
             Self::H2V4(identity) => h2_v4_timeout_signing_message(identity, view).to_vec(),
         }
     }
 
     pub fn new_view_message(self, view: ViewNumber) -> Vec<u8> {
         match self {
-            Self::Native => newview_signing_message(view).to_vec(),
+            Self::Native | Self::Gov5Legacy => newview_signing_message(view).to_vec(),
             Self::H2V4(identity) => h2_v4_new_view_signing_message(identity, view).to_vec(),
         }
     }
@@ -87,7 +105,7 @@ impl ConsensusSigningProfile {
     pub fn sign(self, secret_key: &BlsSecretKey, message: &[u8]) -> BlsSignature {
         match self {
             Self::Native => secret_key.sign(message),
-            Self::H2V4(_) => secret_key.sign_h2_v4(message),
+            Self::H2V4(_) | Self::Gov5Legacy => secret_key.sign_h2_v4(message),
         }
     }
 
@@ -99,7 +117,7 @@ impl ConsensusSigningProfile {
     ) -> bool {
         match self {
             Self::Native => public_key.verify_prevalidated(message, signature),
-            Self::H2V4(_) => public_key.verify_h2_v4_prevalidated(message, signature),
+            Self::H2V4(_) | Self::Gov5Legacy => public_key.verify_h2_v4_prevalidated(message, signature),
         }
         .is_ok()
     }
@@ -115,7 +133,9 @@ impl ConsensusSigningProfile {
     ) -> Result<(), Vec<usize>> {
         match self {
             Self::Native => batch_verify_with_fallback(messages, signatures, public_keys),
-            Self::H2V4(_) => batch_verify_h2_v4_with_fallback(messages, signatures, public_keys),
+            Self::H2V4(_) | Self::Gov5Legacy => {
+                batch_verify_h2_v4_with_fallback(messages, signatures, public_keys)
+            }
         }
     }
 
@@ -127,7 +147,7 @@ impl ConsensusSigningProfile {
     ) -> bool {
         match self {
             Self::Native => AggregateSignature::verify_aggregate(message, signature, public_keys),
-            Self::H2V4(_) => {
+            Self::H2V4(_) | Self::Gov5Legacy => {
                 AggregateSignature::verify_h2_v4_aggregate(message, signature, public_keys)
             }
         }
@@ -787,6 +807,17 @@ pub fn timeout_signing_message(view: ViewNumber) -> [u8; 15] {
     let mut msg = [0u8; 15];
     msg[..7].copy_from_slice(b"timeout");
     msg[7..].copy_from_slice(&view.to_le_bytes());
+    msg
+}
+
+/// gov5's commit-vote message without v4 (`hotstuff/types.go`
+/// `CommitSigningMessage`): `"commit" ‖ view (8 bytes LE) ‖ block_hash`,
+/// 46 bytes — no changes hash.
+pub fn gov5_legacy_commit_signing_message(view: ViewNumber, block_hash: &B256) -> [u8; 46] {
+    let mut msg = [0u8; 46];
+    msg[..6].copy_from_slice(b"commit");
+    msg[6..14].copy_from_slice(&view.to_le_bytes());
+    msg[14..46].copy_from_slice(block_hash.as_slice());
     msg
 }
 
@@ -1552,5 +1583,50 @@ mod tests {
             native.proposal_message(view, block_hash, &None),
             "native signing must keep binding validator changes"
         );
+    }
+}
+
+#[cfg(test)]
+mod gov5_legacy_profile_tests {
+    use super::*;
+    use n42_h2_primitives::bls::BlsSecretKey;
+
+    /// gov5's `hotstuff/types.go` layouts, byte for byte.
+    #[test]
+    fn the_legacy_messages_are_gov5s() {
+        let hash = B256::repeat_byte(0xAB);
+        let profile = ConsensusSigningProfile::Gov5Legacy;
+        let mut vote = vec![7, 0, 0, 0, 0, 0, 0, 0];
+        vote.extend_from_slice(hash.as_slice());
+        assert_eq!(profile.vote_message(7, hash), vote);
+        assert_eq!(profile.proposal_message(7, hash, &None), vote);
+        let mut commit = b"commit".to_vec();
+        commit.extend_from_slice(&7u64.to_le_bytes());
+        commit.extend_from_slice(hash.as_slice());
+        assert_eq!(commit.len(), 46);
+        assert_eq!(profile.commit_message(7, hash, B256::repeat_byte(1)), commit);
+        let mut timeout = b"timeout".to_vec();
+        timeout.extend_from_slice(&7u64.to_le_bytes());
+        assert_eq!(profile.timeout_message(7), timeout);
+        let mut new_view = b"newview".to_vec();
+        new_view.extend_from_slice(&7u64.to_le_bytes());
+        assert_eq!(profile.new_view_message(7), new_view);
+        assert!(profile.is_gov5());
+        assert!(!ConsensusSigningProfile::Native.is_gov5());
+    }
+
+    /// The legacy profile signs under the v4 ciphersuite, not the native one.
+    #[test]
+    fn the_legacy_profile_uses_the_v4_ciphersuite() {
+        let key = BlsSecretKey::key_gen(&[3u8; 32]).unwrap();
+        let message = ConsensusSigningProfile::Gov5Legacy.vote_message(9, B256::repeat_byte(2));
+        let signature = ConsensusSigningProfile::Gov5Legacy.sign(&key, &message);
+        assert!(ConsensusSigningProfile::Gov5Legacy.verify_single(&key.public_key(), &message, &signature));
+        assert!(!ConsensusSigningProfile::Native.verify_single(&key.public_key(), &message, &signature));
+        assert!(ConsensusSigningProfile::H2V4(H2V4ChainIdentity {
+            chain_id: 1,
+            genesis_hash: B256::ZERO
+        })
+        .verify_single(&key.public_key(), &message, &signature));
     }
 }

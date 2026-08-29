@@ -1469,6 +1469,7 @@ mod tests {
         ExecutionPayloadV1 {
             difficulty: Default::default(),
             nonce: Default::default(),
+            mobile_registry_root: None,
             parent_hash: B256::repeat_byte(1),
             fee_recipient: Address::repeat_byte(2),
             state_root: B256::repeat_byte(3),

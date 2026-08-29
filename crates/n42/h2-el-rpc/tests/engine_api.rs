@@ -102,6 +102,7 @@ fn payload_v1() -> ExecutionPayloadV1 {
         extra_data: Bytes::new(),
         difficulty: U256::ZERO,
         nonce: Default::default(),
+        mobile_registry_root: None,
         base_fee_per_gas: U256::from(7u64),
         block_hash: B256::repeat_byte(9),
         transactions: Vec::new(),

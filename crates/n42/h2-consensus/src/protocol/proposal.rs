@@ -150,10 +150,7 @@ impl ConsensusEngine {
         // Include any pending validator changes so all nodes apply the same
         // changes at CommitQC time (consensus-safe commit-then-activate).
         let validator_changes = self.epoch_manager.pending_changes_for_proposal();
-        if matches!(
-            self.signing_profile,
-            super::quorum::ConsensusSigningProfile::H2V4(_)
-        ) && validator_changes
+        if self.signing_profile.is_gov5() && validator_changes
             .as_ref()
             .is_some_and(|changes| !changes.is_empty())
         {
@@ -277,10 +274,7 @@ impl ConsensusEngine {
         }
 
         let pk = view_set.get_public_key(proposal.proposer)?;
-        if matches!(
-            self.signing_profile,
-            super::quorum::ConsensusSigningProfile::H2V4(_)
-        ) && proposal
+        if self.signing_profile.is_gov5() && proposal
             .validator_changes
             .as_ref()
             .is_some_and(|changes| !changes.is_empty())
@@ -433,10 +427,7 @@ impl ConsensusEngine {
         // Gov5's H2 profile is import-gated: an R1 vote attests that this node
         // has executed and validated the proposed payload, not merely seen its
         // hash. Keep the native profile's established optimistic path intact.
-        if matches!(
-            self.signing_profile,
-            super::quorum::ConsensusSigningProfile::H2V4(_)
-        ) {
+        if self.signing_profile.is_gov5() {
             self.pending_proposal = Some(super::state_machine::PendingProposal {
                 view,
                 block_hash: proposal.block_hash,
@@ -620,10 +611,7 @@ impl ConsensusEngine {
                     && self.round_state.may_vote_in(pending.view)
             })
             .map(|pending| pending.view);
-        let profile_is_h2_v4 = matches!(
-            self.signing_profile,
-            super::quorum::ConsensusSigningProfile::H2V4(_)
-        );
+        let profile_is_h2_v4 = self.signing_profile.is_gov5();
         if let Some(view) = pending_vote_view.filter(|_| profile_is_h2_v4) {
             if !self.extends_justify(block_hash) {
                 return Ok(());

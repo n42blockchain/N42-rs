@@ -171,11 +171,9 @@ where
             return Err(ConsensusError::ParentBeaconBlockRootUnexpected);
         }
 
-        if self.chain_spec.is_prague_active_at_timestamp(timestamp) {
-            if header.requests_hash.is_none() {
-                return Err(ConsensusError::RequestsHashMissing);
-            }
-        } else if header.requests_hash.is_some() {
+        // Under Prague gov5's producer may leave the requests hash nil
+        // (chain 94 does): "no requests", checked against execution below.
+        if !self.chain_spec.is_prague_active_at_timestamp(timestamp) && header.requests_hash.is_some() {
             return Err(ConsensusError::RequestsHashUnexpected);
         }
 
@@ -372,6 +370,11 @@ where
         // requests, and a block that did is held to the EIP.
         if self.chain_spec.is_prague_active_at_timestamp(header.timestamp) {
             let Some(header_hash) = header.requests_hash else {
+                // gov5's nil: the block carried no requests, or it is not
+                // the block that was executed.
+                if result.requests.is_empty() {
+                    return Ok(());
+                }
                 return Err(ConsensusError::RequestsHashMissing);
             };
             let matches = if result.requests.is_empty() {

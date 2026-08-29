@@ -1008,7 +1008,18 @@ QMDB node, three Rust validators, one gov5 member; see the commits):**
    the Rust leader had sealed them, at 1 s a block, before the batch
    arrived). `scripts/devnet-fleet.sh` passes `--el-rpc` to every validator.
 
-**Still blocking, in the order the fleet would refuse us:**
+**2026-08-29: done on the live fleet.** An n42-rs node took over
+validator slot 6 of chain 94 — bootstrapped from node6's state, voting
+and leading, its blocks on every Go node's chain. Items 4 and 6 below are
+resolved (`Gov5HeaderExtension` carries `MobileRegistryRoot` through the
+codec, the hash and the Engine API; `mobileAnchorTime` is read), and three
+things the list did not know about were met and fixed: gov5's signing
+messages without `interopV4`, the QMDB export of a node that prunes dead
+entries (the leaf-form snapshot), and slots a block changes and restores,
+which gov5 writes and revm drops. Item 5 (EOF) stands. The record is
+`docs/chain94-validator-20260829.md`.
+
+**Still blocking, in the order the fleet would refuse us (as of 2026-08-28):**
 
 4. **`MobileRegistryRoot`, a header field Ethereum does not have.** Under
    the `mobileAnchor` fork (active since 2026-07-18 on chain 94) gov5's

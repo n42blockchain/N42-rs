@@ -20,7 +20,7 @@
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::{ExecutionData, PayloadAttributes as EthPayloadAttributes, PayloadError};
 use n42_h2_consensus::header_profile::N42HeaderProfile;
-use n42_h2_consensus::reconstruct_gov5_h2_block;
+use n42_h2_consensus::{reconstruct_gov5_h2_block, Gov5ForkSchedule};
 use n42_qmdb_reth::HotStuffGenesisConfig;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_engine_primitives::{EngineApiValidator, EngineTypes, PayloadValidator};
@@ -52,6 +52,8 @@ pub fn header_profile_for<ChainSpec: EthChainSpec>(chain_spec: &ChainSpec) -> N4
 pub struct N42EngineValidator<ChainSpec> {
     inner: EthereumEngineValidator<ChainSpec>,
     profile: N42HeaderProfile,
+    /// gov5's own forks, for the header field they add.
+    schedule: Gov5ForkSchedule,
 }
 
 impl<ChainSpec> N42EngineValidator<ChainSpec> {
@@ -60,7 +62,14 @@ impl<ChainSpec> N42EngineValidator<ChainSpec> {
         Self {
             inner: EthereumEngineValidator::new(chain_spec),
             profile,
+            schedule: Gov5ForkSchedule { mobile_anchor_time: None },
         }
+    }
+
+    /// The same, on a chain with gov5's own fork schedule.
+    pub const fn with_schedule(mut self, schedule: Gov5ForkSchedule) -> Self {
+        self.schedule = schedule;
+        self
     }
 
     /// The profile in force.
@@ -89,9 +98,22 @@ where
 
         let expected_hash = payload.block_hash();
         // The block gov5 hashed: header profile checked, ommers hash and
-        // difficulty restored, hash confirmed.
-        let block = reconstruct_gov5_h2_block::<TransactionSigned>(&payload)
+        // difficulty restored, hash confirmed, gov5's own field read.
+        let (block, extension) = reconstruct_gov5_h2_block::<TransactionSigned>(&payload)
             .map_err(|err| NewPayloadError::Other(err.into()))?;
+        // gov5's `VerifyHeader`: the field is there exactly under its fork.
+        if !self.schedule.allows(block.header.timestamp, &extension) {
+            return Err(NewPayloadError::Other(
+                format!(
+                    "header at {} {} MobileRegistryRoot, which gov5's mobileAnchor fork ({:?}) {}",
+                    block.header.timestamp,
+                    if extension.is_none() { "lacks" } else { "carries" },
+                    self.schedule.mobile_anchor_time,
+                    if extension.is_none() { "requires" } else { "forbids" },
+                )
+                .into(),
+            ));
+        }
 
         // reth's own checks on the same payload, told the hash of the
         // Ethereum-shaped header so its hash comparison is against the
@@ -109,17 +131,18 @@ where
             ethereum_shaped,
         )?;
 
-        let sealed = SealedBlock::seal_slow(block);
-        if sealed.hash() != expected_hash {
-            // Cannot happen after reconstruction confirmed the hash; kept
-            // so a future change to either side fails loudly.
+        // Sealed with the hash gov5 computed, which reconstruction has just
+        // confirmed: `seal_slow` would hash the header without its
+        // extension. With no extension the two agree; checked, so a change
+        // to either side fails loudly.
+        if extension.is_none() && block.header.hash_slow() != expected_hash {
             return Err(PayloadError::BlockHash {
-                execution: sealed.hash(),
+                execution: block.header.hash_slow(),
                 consensus: expected_hash,
             }
             .into());
         }
-        Ok(sealed)
+        Ok(SealedBlock::new_unchecked(block, expected_hash))
     }
 }
 
@@ -173,7 +196,8 @@ where
     async fn build(self, ctx: &AddOnsContext<'_, Node>) -> eyre::Result<Self::Validator> {
         let chain_spec = ctx.config.chain.clone();
         let profile = header_profile_for(chain_spec.as_ref());
-        Ok(N42EngineValidator::new(chain_spec, profile))
+        let schedule = Gov5ForkSchedule::from_genesis(chain_spec.genesis());
+        Ok(N42EngineValidator::new(chain_spec, profile).with_schedule(schedule))
     }
 }
 
@@ -189,7 +213,7 @@ mod tests {
     use alloy_consensus::{Header, EMPTY_OMMER_ROOT_HASH, EMPTY_ROOT_HASH};
     use alloy_eips::eip7685::EMPTY_REQUESTS_HASH;
     use alloy_primitives::{Bytes, U256};
-    use n42_h2_consensus::{block_for_header, execution_data_for_block, HeaderExtra, GOV5_NIL_HASH};
+    use n42_h2_consensus::{block_for_header, execution_data_for_block, Gov5HeaderExtension, HeaderExtra, GOV5_NIL_HASH};
     use reth_chainspec::{ChainSpec, MAINNET};
     use reth_node_ethereum::EthEngineTypes;
 
@@ -218,7 +242,7 @@ mod tests {
 
     fn payload_for(header: Header) -> ExecutionData {
         let block = block_for_header(header, vec![]);
-        execution_data_for_block(block.header.hash_slow(), &block)
+        execution_data_for_block(block.header.hash_slow(), &block, &Gov5HeaderExtension::NONE)
     }
 
     fn validator(profile: N42HeaderProfile) -> N42EngineValidator<ChainSpec> {

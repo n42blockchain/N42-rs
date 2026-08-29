@@ -411,11 +411,15 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// hash and difficulty set to what gov5's producer writes — and blocks it
     /// receives are decoded under the same profile. What a Go fleet member
     /// does, so the two can share a chain.
-    pub fn with_gov5_h2_profile(mut self, key: n42_h2_primitives::bls::BlsSecretKey) -> Self {
+    pub fn with_gov5_h2_profile(
+        mut self,
+        key: n42_h2_primitives::bls::BlsSecretKey,
+        schedule: n42_h2_consensus::Gov5ForkSchedule,
+    ) -> Self {
         self.header_profile = HeaderProfile::Gov5H2;
         self.native_wire = true;
         self.driver.set_payload_normalizer(move |payload, view| {
-            n42_h2_consensus::normalize_to_gov5_h2(payload, view, Some(&key))
+            n42_h2_consensus::normalize_to_gov5_h2(payload, view, Some(&key), &schedule)
                 .map_err(|e| e.to_string())
         });
         self
@@ -904,11 +908,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         self.import_ranges(events).await;
         for (peer, hash, channel) in std::mem::take(&mut self.pending_block_requests) {
             let body = match self.driver.execution_layer().block_by_hash(hash).await {
-                Ok(Some(block)) => Some(encode_block_rlp_parts(
-                    &block.header,
-                    &block.transactions,
-                    &withdrawals_to_rewards(block.withdrawals.as_deref().unwrap_or(&[])),
-                )),
+                Ok(Some(block)) => range_chunk(&block),
                 Ok(None) => None,
                 Err(err) => {
                     debug!(target: "n42.h2.node", ?hash, %err, "execution layer could not serve a block");
@@ -1495,13 +1495,20 @@ async fn serve_range_within<E: ExecutionLayer>(
     serve_range_forward(el, request.start, last, max_bytes).await
 }
 
-/// gov5's block form of an execution layer block.
-fn range_chunk(block: &n42_h2_execution::ChainBlock) -> Vec<u8> {
-    encode_block_rlp_parts(
+/// gov5's block form of an execution layer block, or `None` when the header
+/// the execution layer holds does not hash to the block's hash under any
+/// extension this node knows — a block it cannot serve faithfully.
+fn range_chunk(block: &n42_h2_execution::ChainBlock) -> Option<Vec<u8>> {
+    let Some(extension) = n42_h2_consensus::Gov5HeaderExtension::recover(&block.header, block.hash) else {
+        warn!(target: "n42.h2.node", number = block.header.number, hash = ?block.hash, "the execution layer's header does not hash to its block hash; not serving it");
+        return None;
+    };
+    Some(encode_block_rlp_parts(
         &block.header,
+        &extension,
         &block.transactions,
         &withdrawals_to_rewards(block.withdrawals.as_deref().unwrap_or(&[])),
-    )
+    ))
 }
 
 /// `start..=last` by walking parent hashes down from `last`, resolved by
@@ -1538,7 +1545,7 @@ async fn serve_range_anchored<E: ExecutionLayer>(
     let mut parent_hash = anchor.header.parent_hash;
     let mut number = last;
     let mut total = 0u64;
-    let chunk = range_chunk(&anchor);
+    let chunk = range_chunk(&anchor)?;
     if !fits_budget(&mut total, chunk.len(), max_bytes, number) {
         return None;
     }
@@ -1556,12 +1563,12 @@ async fn serve_range_anchored<E: ExecutionLayer>(
                 return None;
             }
         };
-        if block.header.number != number || block.header.hash_slow() != parent_hash {
+        if block.header.number != number || block.hash != parent_hash {
             debug!(target: "n42.h2.node", asked = ?parent_hash, number, got = block.header.number, "execution layer answered a block request with the wrong block");
             return None;
         }
         parent_hash = block.header.parent_hash;
-        let chunk = range_chunk(&block);
+        let chunk = range_chunk(&block)?;
         if !fits_budget(&mut total, chunk.len(), max_bytes, number) {
             return None;
         }
@@ -1606,11 +1613,13 @@ async fn serve_range_forward<E: ExecutionLayer>(el: &E, start: u64, last: u64, m
             debug!(target: "n42.h2.node", number, "chain moved under a range being served; ended at the seam");
             break;
         }
-        let chunk = range_chunk(&block);
+        let Some(chunk) = range_chunk(&block) else {
+            break;
+        };
         if !fits_budget(&mut total, chunk.len(), max_bytes, number) {
             break;
         }
-        previous = Some(block.header.hash_slow());
+        previous = Some(block.hash);
         chunks.push(chunk);
     }
     chunks
@@ -1636,7 +1645,7 @@ mod range_tests {
                 ..Default::default()
             };
             parent_hash = header.hash_slow();
-            blocks.push(ChainBlock { header, transactions: Vec::new(), withdrawals: None });
+            blocks.push(ChainBlock { hash: parent_hash, header, transactions: Vec::new(), withdrawals: None });
         }
         blocks
     }
@@ -1661,7 +1670,7 @@ mod range_tests {
         fn new(canonical: Vec<ChainBlock>, fork: Option<Vec<ChainBlock>>, lookups_before_fork: usize) -> Self {
             let mut by_hash = HashMap::new();
             for block in canonical.iter().chain(fork.iter().flatten()) {
-                by_hash.insert(block.header.hash_slow(), block.clone());
+                by_hash.insert(block.hash, block.clone());
             }
             Self {
                 canonical: Mutex::new(canonical),
@@ -1770,7 +1779,7 @@ mod range_tests {
         for number in 10..20 {
             let header = Header { number, parent_hash: parent, extra_data: vec![0xB].into(), ..Default::default() };
             parent = header.hash_slow();
-            fork.push(ChainBlock { header, transactions: Vec::new(), withdrawals: None });
+            fork.push(ChainBlock { hash: parent, header, transactions: Vec::new(), withdrawals: None });
         }
         let mut el = Reorging::new(main.clone(), Some(fork), 4);
         el.reports_head = false;
@@ -1859,8 +1868,9 @@ mod range_tests {
             block.header.parent_hash = parent;
             block.header.extra_data = vec![0xC; 1024].into();
             parent = block.header.hash_slow();
+            block.hash = parent;
         }
-        let sizes: Vec<u64> = main.iter().map(|b| range_chunk(b).len() as u64).collect();
+        let sizes: Vec<u64> = main.iter().map(|b| range_chunk(b).unwrap().len() as u64).collect();
         let request = RangeRequest { start: 1, count: 4, step: 1 };
         // Room for blocks 1 and 2 and half of 3.
         let budget = sizes[1] + sizes[2] + sizes[3] / 2;

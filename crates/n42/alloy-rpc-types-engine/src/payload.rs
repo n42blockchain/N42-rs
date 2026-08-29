@@ -310,6 +310,8 @@ impl<'de> serde::Deserialize<'de> for ExecutionPayloadInputV2 {
             difficulty: U256,
             #[serde(default)]
             nonce: B64,
+            #[serde(default)]
+            mobile_registry_root: Option<B256>,
             withdrawals: Option<Vec<Withdrawal>>,
         }
 
@@ -332,6 +334,7 @@ impl<'de> serde::Deserialize<'de> for ExecutionPayloadInputV2 {
                 transactions: helper.transactions,
                 difficulty: helper.difficulty,
                 nonce: helper.nonce,
+                mobile_registry_root: helper.mobile_registry_root,
             },
             withdrawals: helper.withdrawals,
         })
@@ -778,6 +781,13 @@ pub struct ExecutionPayloadV1 {
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "B64::is_zero"))]
     #[cfg_attr(feature = "ssz", ssz(skip_serializing, skip_deserializing))]
     pub nonce: B64,
+    /// gov5's `MobileRegistryRoot`, a header field Ethereum does not have,
+    /// stamped by its leaders under the `mobileAnchor` fork and part of the
+    /// block hash. Carried here so a consensus client can hand the execution
+    /// layer the header gov5 hashed; absent on every other chain.
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
+    #[cfg_attr(feature = "ssz", ssz(skip_serializing, skip_deserializing))]
+    pub mobile_registry_root: Option<B256>,
 }
 
 impl ExecutionPayloadV1 {
@@ -905,6 +915,7 @@ impl ExecutionPayloadV1 {
             // N42: the APoS seal lives in these two header fields.
             difficulty: block.difficulty(),
             nonce: block.nonce().unwrap_or_default(),
+            mobile_registry_root: None,
             parent_hash: block.parent_hash(),
             fee_recipient: block.beneficiary(),
             state_root: block.state_root(),
@@ -993,6 +1004,8 @@ impl<'de> serde::Deserialize<'de> for ExecutionPayloadV2 {
             difficulty: U256,
             #[serde(default)]
             nonce: B64,
+            #[serde(default)]
+            mobile_registry_root: Option<B256>,
             withdrawals: Vec<Withdrawal>,
         }
 
@@ -1015,6 +1028,7 @@ impl<'de> serde::Deserialize<'de> for ExecutionPayloadV2 {
                 transactions: helper.transactions,
                 difficulty: helper.difficulty,
                 nonce: helper.nonce,
+                mobile_registry_root: helper.mobile_registry_root,
             },
             withdrawals: helper.withdrawals,
         })
@@ -1178,6 +1192,7 @@ impl ssz::Decode for ExecutionPayloadV2 {
             payload_inner: ExecutionPayloadV1 {
                 difficulty: Default::default(),
                 nonce: Default::default(),
+                mobile_registry_root: None,
                 parent_hash: decoder.decode_next()?,
                 fee_recipient: decoder.decode_next()?,
                 state_root: decoder.decode_next()?,
@@ -1295,6 +1310,8 @@ impl<'de> serde::Deserialize<'de> for ExecutionPayloadV3 {
             difficulty: U256,
             #[serde(default)]
             nonce: B64,
+            #[serde(default)]
+            mobile_registry_root: Option<B256>,
             withdrawals: Vec<Withdrawal>,
             #[serde(with = "alloy_serde::quantity")]
             blob_gas_used: u64,
@@ -1322,6 +1339,7 @@ impl<'de> serde::Deserialize<'de> for ExecutionPayloadV3 {
                     transactions: helper.transactions,
                     difficulty: helper.difficulty,
                     nonce: helper.nonce,
+                    mobile_registry_root: helper.mobile_registry_root,
                 },
                 withdrawals: helper.withdrawals,
             },
@@ -1474,6 +1492,7 @@ impl ssz::Decode for ExecutionPayloadV3 {
                 payload_inner: ExecutionPayloadV1 {
                     difficulty: Default::default(),
                     nonce: Default::default(),
+                    mobile_registry_root: None,
                     parent_hash: decoder.decode_next()?,
                     fee_recipient: decoder.decode_next()?,
                     state_root: decoder.decode_next()?,
@@ -1602,6 +1621,8 @@ impl<'de> serde::Deserialize<'de> for ExecutionPayloadV4 {
             difficulty: U256,
             #[serde(default)]
             nonce: B64,
+            #[serde(default)]
+            mobile_registry_root: Option<B256>,
             withdrawals: Vec<Withdrawal>,
             #[serde(with = "alloy_serde::quantity")]
             blob_gas_used: u64,
@@ -1633,6 +1654,7 @@ impl<'de> serde::Deserialize<'de> for ExecutionPayloadV4 {
                         transactions: helper.transactions,
                         difficulty: helper.difficulty,
                         nonce: helper.nonce,
+                        mobile_registry_root: helper.mobile_registry_root,
                     },
                     withdrawals: helper.withdrawals,
                 },
@@ -1682,6 +1704,7 @@ impl ssz::Decode for ExecutionPayloadV4 {
                     payload_inner: ExecutionPayloadV1 {
                         difficulty: Default::default(),
                         nonce: Default::default(),
+                        mobile_registry_root: None,
                         parent_hash: decoder.decode_next()?,
                         fee_recipient: decoder.decode_next()?,
                         state_root: decoder.decode_next()?,
@@ -3176,6 +3199,7 @@ impl<'de> serde::Deserialize<'de> for ExecutionPayload {
                     // N42
                     Difficulty,
                     Nonce,
+                    MobileRegistryRoot,
                 }
 
                 let mut parent_hash = None;
@@ -3194,6 +3218,7 @@ impl<'de> serde::Deserialize<'de> for ExecutionPayload {
                 let mut transactions = None;
                 let mut difficulty = None;
                 let mut nonce = None;
+                let mut mobile_registry_root = None;
                 let mut withdrawals = None;
                 let mut blob_gas_used = None;
                 let mut excess_blob_gas = None;
@@ -3231,6 +3256,7 @@ impl<'de> serde::Deserialize<'de> for ExecutionPayload {
                         // N42: the APoS seal, carried through the untagged decoder
                         Fields::Difficulty => difficulty = Some(map.next_value()?),
                         Fields::Nonce => nonce = Some(map.next_value()?),
+                        Fields::MobileRegistryRoot => mobile_registry_root = Some(map.next_value()?),
                         Fields::Withdrawals => withdrawals = Some(map.next_value()?),
                         Fields::BlobGasUsed => {
                             let raw = map.next_value::<U64>()?;
@@ -3282,6 +3308,7 @@ impl<'de> serde::Deserialize<'de> for ExecutionPayload {
                 let v1 = ExecutionPayloadV1 {
                     difficulty: difficulty.unwrap_or_default(),
                     nonce: nonce.unwrap_or_default(),
+                    mobile_registry_root,
                     parent_hash,
                     fee_recipient,
                     state_root,
@@ -4344,6 +4371,7 @@ mod tests {
         ExecutionPayloadV1 {
             difficulty: Default::default(),
             nonce: Default::default(),
+            mobile_registry_root: None,
             parent_hash: B256::with_last_byte(1),
             fee_recipient: Address::with_last_byte(2),
             state_root: B256::with_last_byte(3),
@@ -5049,6 +5077,7 @@ mod tests {
                 payload_inner: ExecutionPayloadV1 {
                     difficulty: Default::default(),
                     nonce: Default::default(),
+                    mobile_registry_root: None,
                     base_fee_per_gas:  U256::from(7u64),
                     block_number: 0xa946u64,
                     block_hash: hex!("a5ddd3f286f429458a39cafc13ffe89295a7efa8eb363cf89a1a4887dbcf272b").into(),
@@ -5094,6 +5123,7 @@ mod tests {
                 payload_inner: ExecutionPayloadV1 {
                     difficulty: Default::default(),
                     nonce: Default::default(),
+                    mobile_registry_root: None,
                     base_fee_per_gas:  U256::from(7u64),
                     block_number: 0xa946u64,
                     block_hash: hex!("a5ddd3f286f429458a39cafc13ffe89295a7efa8eb363cf89a1a4887dbcf272b").into(),
@@ -5439,6 +5469,7 @@ mod tests {
         let payload = ExecutionPayloadV1 {
             difficulty: Default::default(),
             nonce: Default::default(),
+            mobile_registry_root: None,
             parent_hash: B256::default(),
             fee_recipient: Address::default(),
             state_root: B256::default(),
@@ -5472,6 +5503,7 @@ mod tests {
         let payload = ExecutionPayloadV1 {
             difficulty: Default::default(),
             nonce: Default::default(),
+            mobile_registry_root: None,
             parent_hash: B256::default(),
             fee_recipient: Address::default(),
             state_root: B256::default(),
@@ -5502,6 +5534,7 @@ mod tests {
         let payload = ExecutionPayload::V1(ExecutionPayloadV1 {
             difficulty: Default::default(),
             nonce: Default::default(),
+            mobile_registry_root: None,
             parent_hash: B256::default(),
             fee_recipient: Address::default(),
             state_root: B256::default(),
@@ -5685,6 +5718,7 @@ mod tests {
             payload_inner: ExecutionPayloadV1 {
                 difficulty: Default::default(),
                 nonce: Default::default(),
+                mobile_registry_root: None,
                 parent_hash: B256::default(),
                 fee_recipient: Address::default(),
                 state_root: B256::default(),
@@ -5722,6 +5756,7 @@ mod tests {
                     payload_inner: ExecutionPayloadV1 {
                         difficulty: Default::default(),
                         nonce: Default::default(),
+                        mobile_registry_root: None,
                         parent_hash: B256::default(),
                         fee_recipient: Address::default(),
                         state_root: B256::default(),
@@ -5853,6 +5888,7 @@ mod tests {
                     payload_inner: ExecutionPayloadV1 {
                         difficulty: Default::default(),
                         nonce: Default::default(),
+                        mobile_registry_root: None,
                         parent_hash: B256::default(),
                         fee_recipient: Address::default(),
                         state_root: B256::default(),
@@ -5888,6 +5924,7 @@ mod tests {
             execution_payload: ExecutionPayloadV1 {
                 difficulty: Default::default(),
                 nonce: Default::default(),
+                mobile_registry_root: None,
                 parent_hash: B256::default(),
                 fee_recipient: Address::default(),
                 state_root: B256::default(),
@@ -5918,6 +5955,7 @@ mod tests {
             execution_payload: ExecutionPayloadV1 {
                 difficulty: Default::default(),
                 nonce: Default::default(),
+                mobile_registry_root: None,
                 parent_hash: B256::default(),
                 fee_recipient: Address::default(),
                 state_root: B256::default(),
@@ -5951,6 +5989,7 @@ mod tests {
                         payload_inner: ExecutionPayloadV1 {
                         difficulty: Default::default(),
                         nonce: Default::default(),
+                        mobile_registry_root: None,
                             parent_hash: B256::default(),
                             fee_recipient: Address::default(),
                             state_root: B256::default(),
@@ -5994,6 +6033,7 @@ mod tests {
                 payload_inner: ExecutionPayloadV1 {
                     difficulty: Default::default(),
                     nonce: Default::default(),
+                    mobile_registry_root: None,
                     parent_hash: B256::default(),
                     fee_recipient: Address::default(),
                     state_root: B256::default(),

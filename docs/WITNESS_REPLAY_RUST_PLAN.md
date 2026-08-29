@@ -226,7 +226,7 @@ codeHash 前 20 字节键的 26 字节项索引，读后校验 keccak；code-mdb
 |---|---|---|---|
 | gov5 witness-replay（其文档） | 41 min（记录为 49m48s） | 376,118 | 全量 + 验证 |
 | pevm 第一次 | 27.0 min | 396,850 | 83,369 块失败：code-mdbx 读事务 5 分钟超时 |
-| pevm + senders 表 + 无 bundle State + 免复制批解码 + 线程本地码缓存 | **23.9 min** | 351,575 | **0 失败**，每块都对头校验 |
+| pevm + senders 表 + 无 bundle State + 免复制批解码 + 线程本地码缓存 | **23.9 min** | 351,575 | **0 失败**，每块都对头校验；3,678,099,879 笔交易、312,450 Ggas（`--geth-census`），即 218 Ggas/s |
 | 同上 + maxperf/native | 23.8 min | 352,160 | 全量尺度无收益 |
 
 第一个瓶颈是发送者恢复：ancient 里没有 sender，reth 的恢复又在每个 worker 里

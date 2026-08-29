@@ -212,3 +212,31 @@ M0 可以立刻开始（不依赖 gov5 改动）；M0' 是唯一需要 gov5 侧�
   可反向帮助定位。
 - 全量 run 只在系统空闲时跑（与 §1 同机，独占），与本仓库其它长时测试
   （`scripts/devnet-fleet.sh` 的 LATE_DELAY/GOV5_DELAY 长时间重加入）同一纪律。
+
+## 2026-08-29 实测：Rust witness 全量回放
+
+Windows 端用 pevm 录完的位置式 witness（`/data/witness-rust`，25,765,567 项，
+170 GB）复制到本机后，pevm（`../pevm` main，reth 2.5.1）在没有 reth 归档的条件下
+完成了全量回放：块与体来自 `witness-geth`（只有 headers/bodies，BLOCKHASH 的哈希
+由 header RLP 现算），senders 与 codes 来自 gov5 的列式集合（codes.cidx 是按
+codeHash 前 20 字节键的 26 字节项索引，读后校验 keccak；code-mdbx 兜底），
+数据库是 `pevm init` 建的空目录。命令与细节见 `../pevm/docs/witness.md`。
+
+| 配置 | 墙钟 | CPU-s | 备注 |
+|---|---|---|---|
+| gov5 witness-replay（其文档） | 41 min（记录为 49m48s） | 376,118 | 全量 + 验证 |
+| pevm 第一次 | 27.0 min | 396,850 | 83,369 块失败：code-mdbx 读事务 5 分钟超时 |
+| pevm + senders 表 + 无 bundle State + 免复制批解码 + 线程本地码缓存 | **23.9 min** | 351,575 | **0 失败**，每块都对头校验 |
+| 同上 + maxperf/native | 23.8 min | 352,160 | 全量尺度无收益 |
+
+第一个瓶颈是发送者恢复：ancient 里没有 sender，reth 的恢复又在每个 worker 里
+fan-out 到 rayon，密集段 perf 显示 56% CPU 在 crossbeam/rayon、22% 在 secp256k1；
+接入 gov5 的 senders 表后两者归零，5 万块从 14.8 s 降到 6.0 s。此后的剖析已是
+EVM 本身（解释器分发、keccak、revm State 缓存、bn254 配对），约每物理核
+1.5 Ggas/s，接近解释器的自然速度；substrate-bn 比 arkworks 慢 10%，`-s 64`
+对齐批无收益。
+
+revmc JIT（LLVM 22.1，进程内编译热点合约）在 20 万块密集段编译了 1,439 个合约、
+1,600 万帧走机器码，但墙钟 3.6×、CPU 3.8× 于解释器，且 84 个块回放失败：编译码
+的状态读取序列与解释器不同，无 key 的位置式 witness 无法吸收——JIT 只能回放用同一
+JIT 录制的 witness。feature 保留、默认关闭。

@@ -81,4 +81,5 @@ revm.workspace = true
 reth-metrics.workspace = true
 metrics.workspace = true
 
-
+[dev-dependencies]
+serde_json = { workspace = true, features = ["std"] }

@@ -432,7 +432,16 @@ where
             DiskFileBlobStoreConfig::default().with_max_cached_entries(blob_cache_size);
 
         let blob_store = DiskFileBlobStore::open(data_dir.blobstore(), custom_config)?;
+        // gov5's pool admits no EIP-7702 set-code transaction on its own
+        // chains (its `validateSetCodeStructure` keys on a `pragueTime` the
+        // chain does not set), so no Go leader ever builds one; a block from
+        // this node carries only what the fleet has built and validated.
+        let gov5 = crate::is_gov5_genesis(ctx.chain_spec().genesis());
+        if gov5 {
+            info!(target: "reth::cli", "gov5 chain: the pool refuses EIP-7702 set-code transactions, as gov5's does");
+        }
         let validator = TransactionValidationTaskExecutor::eth_builder(ctx.provider().clone(), evm_config)
+            .set_eip7702(!gov5)
             .kzg_settings(ctx.kzg_settings()?)
             .with_local_transactions_config(pool_config.local_transactions_config.clone())
             .set_tx_fee_cap(ctx.config().rpc.rpc_tx_fee_cap)

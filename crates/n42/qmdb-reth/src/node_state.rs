@@ -522,11 +522,21 @@ impl QmdbNodeState {
 
     /// Writes the base snapshot at the canonical head now, synchronously —
     /// for a shutdown, so the next start need not replay the log. Waits for
-    /// a background rewrite first.
-    pub fn persist_now(&self) -> Result<(), NodeStateError> {
+    /// a background rewrite first. Returns whether anything was written:
+    /// nothing is when the base already stands at the head with no log
+    /// after it, so a second call (the node's exit path and the canonical
+    /// stream's close both come here) costs a lock, not a 2 GB file.
+    pub fn persist_now(&self) -> Result<bool, NodeStateError> {
         let mut persistence = self.persistence();
-        if let Some((handle, _)) = persistence.rewrite.take() {
-            let _ = handle.join();
+        if let Some((handle, at)) = persistence.rewrite.take() {
+            if let Ok(Ok(())) = handle.join() {
+                persistence.base = Some(at);
+                persistence.delta_bytes = trim_deltas(&self.delta_path(), at.0)?;
+            }
+        }
+        let head = self.with_forest(|forest| Ok(forest.head()))?;
+        if persistence.base == Some(head) && persistence.covered == Some(head) && persistence.delta_bytes == 0 {
+            return Ok(false);
         }
         let snapshot = self.with_forest(|forest| forest.snapshot())?;
         write_snapshot(&self.snapshot_path(), &snapshot)?;
@@ -534,7 +544,33 @@ impl QmdbNodeState {
         persistence.base = Some((snapshot.head_number, snapshot.head_hash));
         persistence.covered = persistence.base;
         persistence.delta_bytes = 0;
-        Ok(())
+        Ok(true)
+    }
+
+    /// Persists the forest for a shutdown at `db_head`, the block the
+    /// database will report as its head at the next start: the base
+    /// snapshot must not stand above it, since a forest cannot rewind, and
+    /// need not stand below it, since the delta log is what a start
+    /// replays. The forest is advanced to `db_head` first when it holds
+    /// the block and stands below it (the canonical follower may lag).
+    /// Returns whether the base was written.
+    pub fn persist_for_shutdown(&self, db_head: (u64, B256)) -> Result<bool, NodeStateError> {
+        let Some(head) = self.head() else {
+            return Ok(false);
+        };
+        if head == db_head {
+            return self.persist_now();
+        }
+        if head.0 < db_head.0 && self.root_of(&db_head.1).is_some() {
+            self.on_canonical(db_head.1)?;
+            return self.persist_now();
+        }
+        info!(
+            target: "n42.qmdb",
+            forest = head.0, database = db_head.0,
+            "the forest does not stand at the database head; the delta log is kept for the next start",
+        );
+        Ok(false)
     }
 }
 
@@ -846,10 +882,14 @@ mod tests {
         earlier.initialize((number, hash)).unwrap();
         assert_eq!(earlier.state_root(), root);
 
-        // persist_now folds everything into the base.
-        restarted.persist_now().unwrap();
+        // persist_now folds everything into the base; a second call finds
+        // nothing to write.
+        assert!(restarted.persist_now().unwrap());
         assert_eq!(read_snapshot(&restarted.snapshot_path()).unwrap().unwrap().head_number, 6);
         assert!(read_deltas(&restarted.delta_path()).unwrap().is_empty());
+        let written = std::fs::metadata(restarted.snapshot_path()).unwrap().modified().unwrap();
+        assert!(!restarted.persist_now().unwrap());
+        assert_eq!(std::fs::metadata(restarted.snapshot_path()).unwrap().modified().unwrap(), written);
         let again = QmdbNodeState::new(chain, &dir);
         again.initialize((6, heads[5].1)).unwrap();
         assert_eq!(again.state_root(), heads[5].2);

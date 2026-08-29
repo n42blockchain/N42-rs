@@ -84,6 +84,19 @@ pub fn is_hotstuff_chain(chain_spec: &ChainSpec) -> bool {
     HotStuffGenesisConfig::from_genesis(&chain_spec.genesis).is_ok()
 }
 
+/// Whether the chain is driven by gov5's HotStuff-2 (a validator set in the
+/// genesis without the `interopV4` cross-client profile): the node then
+/// follows gov5's rules where they differ from Ethereum's — see
+/// [`crate::N42EvmConfig`] and [`crate::HotStuffConsensus`].
+pub fn is_gov5_chain(chain_spec: &ChainSpec) -> bool {
+    is_gov5_genesis(&chain_spec.genesis)
+}
+
+/// [`is_gov5_chain`], from the genesis alone.
+pub fn is_gov5_genesis(genesis: &alloy_genesis::Genesis) -> bool {
+    HotStuffGenesisConfig::from_genesis(genesis).is_ok_and(|config| !config.interop_v4)
+}
+
 macro_rules! delegate {
     ($self:ident, $c:ident => $e:expr) => {
         match $self {

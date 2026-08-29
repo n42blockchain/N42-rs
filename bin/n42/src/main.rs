@@ -273,10 +273,35 @@ fn main() {
             //     )?;
             // }
 
-            node_exit_future.await
+            let exit = node_exit_future.await;
+            // The node has stopped and flushed its database: fold the QMDB
+            // delta log into the base snapshot so the next start restores
+            // at once instead of replaying it.
+            if let Some(qmdb) = &qmdb_for_startup {
+                match persist_qmdb_at_exit(qmdb, &node.provider) {
+                    Ok(true) => info!(target: "reth::cli", "QMDB forest persisted at shutdown"),
+                    Ok(false) => {}
+                    Err(error) => warn!(target: "reth::cli", %error, "QMDB forest could not be persisted at shutdown"),
+                }
+            }
+            exit
         })
     {
         error!(target: "reth::cli", "Error: {err:?}");
         std::process::exit(1);
     }
+}
+
+/// Persists the QMDB forest at the block the database holds as its head —
+/// the one the next start will initialise the forest at.
+fn persist_qmdb_at_exit<P>(qmdb: &QmdbNodeState, provider: &P) -> eyre::Result<bool>
+where
+    P: reth_provider::DatabaseProviderFactory<Provider: BlockNumReader + BlockHashReader>,
+{
+    let db = provider.database_provider_ro()?;
+    let number = db.last_block_number()?;
+    let hash = db
+        .block_hash(number)?
+        .ok_or_else(|| eyre::eyre!("no hash for the database head block {number}"))?;
+    Ok(qmdb.persist_for_shutdown((number, hash))?)
 }

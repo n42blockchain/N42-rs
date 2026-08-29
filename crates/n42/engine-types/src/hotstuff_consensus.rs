@@ -11,8 +11,11 @@
 //! deliberately does not check that reth's does: the 32-byte extra-data bound
 //! (gov5 headers carry at least 108 bytes), and the empty-list ommers hash
 //! (gov5's producer leaves it zero). Everything fork-dependent — withdrawals,
-//! blob gas, requests, base fee, gas limit ramp, timestamp ordering — is
-//! Ethereum's and is checked as Ethereum checks it.
+//! blob gas, base fee, gas limit ramp, timestamp ordering — is Ethereum's and
+//! is checked as Ethereum checks it, with one gov5 convention: a header that
+//! carries no requests hash commits to no EIP-7685 requests at all, since
+//! gov5 executes the request contracts for their state effects and discards
+//! their output (see `validate_block_post_execution`).
 //!
 //! The seal is not verified here, matching gov5's `VerifyHeader`. Whether a
 //! block is *the* block is consensus's decision, made on the hash; the seal
@@ -367,15 +370,22 @@ where
 
         // Requests: gov5 spells "none" as the empty trie root where EIP-7685
         // says sha256 of nothing; both are accepted for a block that made no
-        // requests, and a block that did is held to the EIP.
+        // requests, and a block that commits to requests is held to the EIP.
+        // A header without a requests hash commits to nothing: gov5's
+        // producer runs the EIP-7002/7251 system calls for their state
+        // effects and discards what they return, never collects EIP-6110
+        // deposits, and stamps no hash (chain 94 never has) — so what
+        // execution returned here is not checked against it either.
         if self.chain_spec.is_prague_active_at_timestamp(header.timestamp) {
             let Some(header_hash) = header.requests_hash else {
-                // gov5's nil: the block carried no requests, or it is not
-                // the block that was executed.
-                if result.requests.is_empty() {
-                    return Ok(());
+                if !result.requests.is_empty() {
+                    tracing::debug!(
+                        target: "n42::consensus",
+                        number = header.number, requests = result.requests.len(),
+                        "block made execution requests its header does not commit to (gov5 discards them)",
+                    );
                 }
-                return Err(ConsensusError::RequestsHashMissing);
+                return Ok(());
             };
             let matches = if result.requests.is_empty() {
                 is_empty_requests_hash(header_hash)
@@ -457,6 +467,60 @@ mod tests {
         let (root, bloom) = gov5_receipt_root_bloom(std::slice::from_ref(&receipt));
         assert_ne!(root, GOV5_NIL_HASH);
         assert!(bloom.contains_input(alloy_primitives::BloomInput::Raw(Address::repeat_byte(1).as_slice())));
+    }
+
+    fn prague_chain() -> Arc<reth_chainspec::ChainSpec> {
+        let genesis: alloy_genesis::Genesis = serde_json::from_str(
+            r#"{
+                "config": { "chainId": 94, "shanghaiTime": 0, "cancunTime": 0, "pragueTime": 0 },
+                "alloc": {},
+                "difficulty": "0x0", "gasLimit": "0x1c9c380", "timestamp": "0x0", "extraData": "0x", "nonce": "0x0",
+                "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "coinbase": "0x0000000000000000000000000000000000000000", "number": "0x0", "gasUsed": "0x0",
+                "parentHash": "0x0000000000000000000000000000000000000000000000000000000000000000"
+            }"#,
+        )
+        .unwrap();
+        Arc::new(genesis.into())
+    }
+
+    fn empty_block(requests_hash: Option<B256>) -> RecoveredBlock<EthBlock> {
+        let header = Header {
+            number: 1,
+            timestamp: 1_800_000_000,
+            gas_used: 0,
+            receipts_root: GOV5_NIL_HASH,
+            withdrawals_root: Some(alloy_consensus::constants::EMPTY_WITHDRAWALS),
+            requests_hash,
+            ..Default::default()
+        };
+        let body = EthBlockBody { transactions: vec![], ommers: vec![], withdrawals: Some(Default::default()) };
+        RecoveredBlock::new_unhashed(EthBlock::new(header, body), vec![])
+    }
+
+    #[test]
+    fn a_header_without_a_requests_hash_commits_to_no_requests() {
+        // gov5 runs the request contracts and discards what they return;
+        // a header that carries no hash is not checked against them.
+        let consensus = HotStuffConsensus::new(prague_chain());
+        let mut result = BlockExecutionResult::<Receipt>::default();
+        result.requests.push_request_with_type(1, alloy_primitives::Bytes::from_static(&[0x11; 76]));
+        consensus.validate_block_post_execution(&empty_block(None), &result, None, None).unwrap();
+
+        // A header that does commit to requests is held to them.
+        let wrong = empty_block(Some(B256::repeat_byte(0x33)));
+        assert!(matches!(
+            consensus.validate_block_post_execution(&wrong, &result, None, None),
+            Err(ConsensusError::BodyRequestsHashDiff(_))
+        ));
+        let right = empty_block(Some(result.requests.requests_hash()));
+        consensus.validate_block_post_execution(&right, &result, None, None).unwrap();
+        // And "none", in either spelling, when there are none.
+        let none = BlockExecutionResult::<Receipt>::default();
+        consensus.validate_block_post_execution(&empty_block(Some(GOV5_EMPTY_REQUESTS_HASH)), &none, None, None).unwrap();
+        consensus
+            .validate_block_post_execution(&empty_block(Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH)), &none, None, None)
+            .unwrap();
     }
 
     #[test]

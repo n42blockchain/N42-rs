@@ -344,3 +344,11 @@ gov5 的 minimal/full/archive 三档分发（`docs/ethel/n42-eth-client-distribu
 每个增量文件落盘前 blake2b 校验（分钟级），`--verify-cmd` 在每次应用后对
 `{from}..{to}` 区间跑更深的验证（如 witness 回放）。未移植：gov5 列式
 headerc/bodyc 读取器（pevm 内建回放验证 gov5 发布的 archive 需要它）与发布端工具。
+
+**08-30 实测三项。** 用真实归档（gov5 的 858 GiB 输入集 + Rust witness）验证了分发
+客户端：(1) 19 GB 真实文件上 Go/Rust 的 manifest_id 逐字节一致、verify 互认、单字节
+篡改双方都点名到文件；(2) HTTP 镜像上 2.0 GB 增量 catch-up 约 2 s 落到新 manifest；
+(3) follow 轮询中发现新发布，应用后 `--verify-cmd` 对拿到的 witness 真实回放新增的
+787,649 块，17.7 s、0 失败——追高 + 全量重执行远在 1 分钟以内。重要发现：位置式
+witness 只能由录制它的引擎回放（gov5 的流在 pevm 下立即错位），archive 层必须分发
+与验证客户端同源的 witness 流；容器格式（NCIX freezer）两边通用。

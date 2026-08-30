@@ -229,7 +229,8 @@ codeHash 前 20 字节键的 26 字节项索引，读后校验 keccak；code-mdb
 | pevm + senders 表 + 无 bundle State + 免复制批解码 + 线程本地码缓存 | 23.9 min | 351,575 | 0 失败——但**尾段 889,000 块未跑**（见 08-30 修正） |
 | 同上 + maxperf/native | 23.8 min | 352,160 | 同上，全量尺度无收益 |
 | 08-30：读端按索引找 blob、逐块取体、复用 CacheState、私有码副本、`-s 64` | 23.3 min | 350,905 | 全部 25,765,565 块，0 失败、0 任务中止；峰值 105 GB |
-| 08-30：合约字节码全局一份静态副本；每块 `ReplayCache` 取代 revm `State` | **20.5 min** | 309,749 | **全部块，0 失败、0 任务中止**；312,450 Ggas，254 Ggas/s；峰值 106 GB；gov5 的 2.0× |
+| 08-30：合约字节码全局一份静态副本；每块 `ReplayCache` 取代 revm `State` | 20.5 min | 309,749 | 全部块，0 失败、0 任务中止；312,450 Ggas，254 Ggas/s；峰值 106 GB；gov5 的 2.0× |
+| 08-30：再加 PGO 构建 + `gmp` 特性 + 4M 项 keccak 缓存 | **20.0 min** | 301,299 | **全部块，0 失败、0 任务中止**；261 Ggas/s；峰值 105 GB；gov5 的 2.05× |
 
 第一个瓶颈是发送者恢复：ancient 里没有 sender，reth 的恢复又在每个 worker 里
 fan-out 到 rayon，密集段 perf 显示 56% CPU 在 crossbeam/rayon、22% 在 secp256k1；

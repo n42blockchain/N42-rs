@@ -332,3 +332,15 @@ rustc 1.98 与系统 llvm-profdata 同为 LLVM 22.1.8）CPU −2.7~−3.7%、单
 （sha3-asm 在 Zen 5 上本就选标量 Keccak，作者基准显示最快）；每块固定开销 0.096 ms
 （<1%）。预编译后端已是 secp256k1 C、blst、c-kzg；GMP modexp 需 `libgmp-dev`/`m4`
 未测。剩余的都是解释器指令数本身与满载下随机访存的延迟，单项 ≤3%。
+
+## 2026-08-30 eth-el 快照分发客户端（追高 live）
+
+gov5 的 minimal/full/archive 三档分发（`docs/ethel/n42-eth-client-distribution.md`）
+已移植到 Rust：`pevm` 分支 `feat/eth-el-snapshot` 的 `n42-eth-snapshot` 二进制，
+格式逐字节兼容（模式选择器、逐文件 blake2b-256、排序文件表的 sha256 manifest_id、
+`releases.json`、`deltas/<from>-<to>/<mode>` 增量树）。同一数据目录上 Go 与 Rust
+生成的 manifest_id 完全一致，双向 verify 互认；Go 测试套件的场景全部移植并通过。
+追高：`fetch` 引导，`catch-up` 沿增量链走到发布者最新，`follow` 轮询自动应用——
+每个增量文件落盘前 blake2b 校验（分钟级），`--verify-cmd` 在每次应用后对
+`{from}..{to}` 区间跑更深的验证（如 witness 回放）。未移植：gov5 列式
+headerc/bodyc 读取器（pevm 内建回放验证 gov5 发布的 archive 需要它）与发布端工具。

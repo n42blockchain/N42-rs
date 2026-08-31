@@ -206,8 +206,10 @@ cargo test -p n42-bmt-core -p n42-twig-core -p n42-h2-primitives -p n42-h2-wire 
 `docs/WITNESS_REPLAY_RUST_PLAN.md` records what gov5's `cmd/witness-replay` does
 (stateless parallel re-execution of Ethereum mainnet from per-block witnesses,
 inputs under `/data/blockchain/{witness,witness-geth,code-mdbx}`), its measured
-numbers (49m48s / 376k CPU-s for 25.77M blocks with verification) and the plan
-to beat them in Rust. gov5's witness is a positional read stream with no keys
+numbers (49m48s / 376k CPU-s with verification), and the Rust result that beat
+them: the whole chain (25,864,982 blocks, 315,472 Ggas, 3.7B transactions)
+replays and verifies in 19.7 minutes — 266.4 Ggas/s, 3.13M TPS, 2.08× gov5 —
+via `../pevm` (PGO build, per-block ReplayCache, gov5's freezer inputs). gov5's witness is a positional read stream with no keys
 (zero lookups at replay), so the Rust side records its own positional witness
 with reth: `docs/patches/0001-feat-witness-record-*.patch` (reth branch
 `witness-record`, crate `reth-witness`) adds a `StateReadObserver` to revm's

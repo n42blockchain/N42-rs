@@ -136,8 +136,12 @@ fn main() {
 
                     // The raw getPayload, beside the Engine API on the auth
                     // transport. See `engine_ext`.
+                    let raw_endpoint = std::env::var("N42_PAYLOAD_SERVE")
+                        .ok()
+                        .and_then(|addr| addr.parse::<std::net::SocketAddr>().ok());
                     let engine_ext = N42EngineExt {
                         payloads: ctx.node().payload_builder_handle().clone(),
+                        raw_endpoint,
                     };
 
                     // now we merge our extension namespace into all configured transports
@@ -202,6 +206,22 @@ fn main() {
             } else {
                 None
             };
+
+            // The raw payload channel for the validator, loopback only. See
+            // `payload_serve`.
+            if let Ok(addr) = std::env::var("N42_PAYLOAD_SERVE") {
+                match addr.parse::<std::net::SocketAddr>() {
+                    Ok(addr) => {
+                        let payloads = node.payload_builder_handle.clone();
+                        tokio::spawn(async move {
+                            if let Err(err) = n42::payload_serve::serve(addr, payloads).await {
+                                error!(target: "reth::cli", %err, "raw payload channel stopped");
+                            }
+                        });
+                    }
+                    Err(err) => error!(target: "reth::cli", %err, %addr, "N42_PAYLOAD_SERVE is not an address"),
+                }
+            }
 
             // A binary path into the pool, for load generators. Off unless
             // asked for, and meant for loopback: it admits nothing

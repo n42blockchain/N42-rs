@@ -22,6 +22,7 @@ alloy-rpc-types-engine = { workspace = true, features = ["jwt-aws-lc-rs", "serde
 alloy-rpc-types-eth = { workspace = true, features = ["serde"] }
 async-trait = "0.1"
 reqwest = { workspace = true, features = ["json", "rustls"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "sync"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["std"] }
 thiserror.workspace = true

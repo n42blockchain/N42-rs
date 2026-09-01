@@ -63,6 +63,7 @@ f7_check_binary_fresh() {
 : "${F7_AUTH_BASE:=8600}"    # Engine API (auth), one per node
 : "${F7_HTTP_BASE:=8700}"    # public JSON-RPC
 : "${F7_INGEST_BASE:=8900}"  # binary transaction ingest, loopback only
+: "${F7_PAYLOAD_BASE:=8950}" # raw payload channel to the validator, loopback only
 : "${F7_DEVP2P_BASE:=8800}"  # bound but unused; devp2p is off, see below
 : "${F7_P2P_BASE:=19000}"    # consensus libp2p
 : "${F7_MOBILE_BASE:=21000}" # mobile_* endpoint, off unless F7_MOBILE=1

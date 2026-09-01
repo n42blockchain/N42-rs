@@ -51,6 +51,7 @@ cmd_up() {
 
     f7_el_args "$i"
     N42_TX_INGEST="${F7_INGEST:+127.0.0.1:$((F7_INGEST_BASE + i))}" \
+    N42_PAYLOAD_SERVE="127.0.0.1:$((F7_PAYLOAD_BASE + i))" \
       RUST_LOG="$F7_LOG_EL" f7_spawn "$d/el.pid" "$d/el.log" $pin "$F7_BIN/n42" "${F7_EL_ARGS[@]}"
   done
 
@@ -230,6 +231,7 @@ cmd_roll() {
   pin=$(f7_pin "$i")
   f7_el_args "$i"
   N42_TX_INGEST="${F7_INGEST:+127.0.0.1:$((F7_INGEST_BASE + i))}" \
+  N42_PAYLOAD_SERVE="127.0.0.1:$((F7_PAYLOAD_BASE + i))" \
     RUST_LOG="$F7_LOG_EL" f7_spawn "$d/el.pid" "$d/el.log" $pin "$F7_BIN/n42" "${F7_EL_ARGS[@]}"
   for _ in $(seq 1 120); do grep -aq "RPC auth server started" "$d/el.log" 2>/dev/null && break; sleep 1; done
   f7_validator_args "$i"

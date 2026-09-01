@@ -51,12 +51,19 @@ pub trait N42EngineApi {
     /// the build has finished; `null` for a build this node does not know.
     #[method(name = "getPayloadRaw")]
     async fn get_payload_raw(&self, id: PayloadId) -> RpcResult<Option<RawBuiltPayload>>;
+
+    /// The loopback address of the raw payload channel (`payload_serve`),
+    /// when this node runs one; `null` otherwise.
+    #[method(name = "payloadEndpoint")]
+    async fn payload_endpoint(&self) -> RpcResult<Option<String>>;
 }
 
 /// Serves [`N42EngineApi`] from the node's payload service.
 pub struct N42EngineExt<T: PayloadTypes> {
     /// The same handle the Engine API resolves builds through.
     pub payloads: PayloadBuilderHandle<T>,
+    /// Where `payload_serve` listens, if it does.
+    pub raw_endpoint: Option<std::net::SocketAddr>,
 }
 
 #[jsonrpsee::core::async_trait]
@@ -78,5 +85,9 @@ where
                 block_access_list: payload.block_access_list().cloned(),
             })),
         }
+    }
+
+    async fn payload_endpoint(&self) -> RpcResult<Option<String>> {
+        Ok(self.raw_endpoint.map(|addr| addr.to_string()))
     }
 }

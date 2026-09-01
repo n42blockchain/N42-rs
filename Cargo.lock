@@ -7625,6 +7625,7 @@ name = "n42"
 version = "2.1.5"
 dependencies = [
  "alloy-consensus 2.4.1",
+ "alloy-eips 2.4.1",
  "alloy-genesis",
  "alloy-primitives 1.7.1",
  "alloy-rlp",
@@ -7645,6 +7646,7 @@ dependencies = [
  "n42-qmdb-reth",
  "n42-tx-ingest",
  "pubsub-mem",
+ "rayon",
  "reth-chainspec",
  "reth-cli",
  "reth-cli-commands",

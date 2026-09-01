@@ -89,6 +89,18 @@ pub struct EngineApiClient<T> {
     /// until it says "method not found" once; a stock execution layer is asked
     /// exactly one extra question in its life.
     raw_payloads: std::sync::atomic::AtomicBool,
+    /// The loopback channel this repo's execution layer serves built blocks
+    /// on as bytes (`payload_serve`), once its address has been asked for.
+    raw_channel: tokio::sync::Mutex<RawChannel>,
+}
+
+/// State of the raw payload channel. See `payload_serve` in `bin/n42`.
+#[derive(Debug, Default)]
+struct RawChannel {
+    /// `None` until asked; `Some(None)` for an execution layer without one.
+    endpoint: Option<Option<std::net::SocketAddr>>,
+    /// The connection, kept across builds. Dropped on any error and remade.
+    stream: Option<tokio::net::TcpStream>,
 }
 
 impl<T: JsonRpcTransport> EngineApiClient<T> {
@@ -99,6 +111,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
             builds: Mutex::new((HashMap::new(), Vec::new())),
             fcu_rung: std::sync::atomic::AtomicUsize::new(0),
             raw_payloads: std::sync::atomic::AtomicBool::new(true),
+            raw_channel: tokio::sync::Mutex::new(RawChannel::default()),
         }
     }
 
@@ -551,6 +564,11 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
         // will fail its own `newPayload` check rather than being imported under
         // a root nobody agreed to.
         let beacon_root = self.recall_build(id).unwrap_or_default();
+        // The loopback channel first: the block as bytes, nothing hex-encoded
+        // or parsed. Any failure on it falls through to the JSON forms.
+        if let Some(answer) = self.resolve_over_channel(id, beacon_root).await {
+            return answer;
+        }
         // This repo's execution layer answers with the block's RLP, which
         // skips a 24 MB JSON document each way and the decode the validator
         // then needed to find the header. Anything else falls through to the
@@ -588,6 +606,103 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
             "no getPayload version accepted this build; the execution layer is on a fork this \
              adapter does not know",
         )))
+    }
+}
+
+impl<T: JsonRpcTransport> EngineApiClient<T> {
+    /// Collects a build over the raw payload channel.
+    ///
+    /// `None` means "not this way": no channel, a channel that failed, or an
+    /// execution layer that does not serve one — the caller then uses the
+    /// JSON forms. `Some(None)` is the channel saying the build is unknown.
+    async fn resolve_over_channel(
+        &self,
+        id: PayloadId,
+        beacon_root: B256,
+    ) -> Option<Option<Result<BuiltBlock, ElError>>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut channel = self.raw_channel.lock().await;
+        if channel.endpoint.is_none() {
+            let found = match self.transport.call("n42Engine_payloadEndpoint", vec![]).await {
+                Ok(Value::String(addr)) => addr.parse::<std::net::SocketAddr>().ok(),
+                Ok(_) => None,
+                Err(TransportError::Rpc(err)) if err.code == METHOD_NOT_FOUND => None,
+                Err(err) => {
+                    debug!(target: "n42.h2.el", %err, "asking for the raw payload endpoint");
+                    return None;
+                }
+            };
+            debug!(target: "n42.h2.el", ?found, "raw payload endpoint");
+            channel.endpoint = Some(found);
+        }
+        let addr = (*channel.endpoint.as_ref()?)?;
+        let started = std::time::Instant::now();
+        let attempt: std::io::Result<Option<Result<BuiltBlock, ElError>>> = async {
+            if channel.stream.is_none() {
+                let stream = tokio::net::TcpStream::connect(addr).await?;
+                stream.set_nodelay(true)?;
+                channel.stream = Some(stream);
+            }
+            let stream = channel.stream.as_mut().expect("just connected");
+            stream.write_all(&id.0 .0).await?;
+            match stream.read_u8().await? {
+                0 => Ok(None),
+                2 => {
+                    let len = stream.read_u32_le().await? as usize;
+                    let mut message = vec![0u8; len];
+                    stream.read_exact(&mut message).await?;
+                    Ok(Some(Err(ElError::new(String::from_utf8_lossy(&message).into_owned()))))
+                }
+                1 => {
+                    let len = stream.read_u32_le().await? as usize;
+                    let mut block = vec![0u8; len];
+                    stream.read_exact(&mut block).await?;
+                    let requests = if stream.read_u8().await? == 1 {
+                        let n = stream.read_u32_le().await? as usize;
+                        let mut requests = Vec::with_capacity(n);
+                        for _ in 0..n {
+                            let len = stream.read_u32_le().await? as usize;
+                            let mut request = vec![0u8; len];
+                            stream.read_exact(&mut request).await?;
+                            requests.push(alloy_primitives::Bytes::from(request));
+                        }
+                        Some(requests)
+                    } else {
+                        None
+                    };
+                    let bal = if stream.read_u8().await? == 1 {
+                        let len = stream.read_u32_le().await? as usize;
+                        let mut bal = vec![0u8; len];
+                        stream.read_exact(&mut bal).await?;
+                        Some(alloy_primitives::Bytes::from(bal))
+                    } else {
+                        None
+                    };
+                    let received = started.elapsed();
+                    let built = built_block_from_parts(block.into(), requests, bal, beacon_root);
+                    if len > 1_000_000 {
+                        debug!(
+                            target: "n42.h2.el",
+                            bytes = len,
+                            channel_ms = received.as_millis() as u64,
+                            split_ms = started.elapsed().saturating_sub(received).as_millis() as u64,
+                            "raw payload collected"
+                        );
+                    }
+                    Ok(Some(built))
+                }
+                other => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("status {other}"))),
+            }
+        }
+        .await;
+        match attempt {
+            Ok(answer) => Some(answer),
+            Err(err) => {
+                debug!(target: "n42.h2.el", %err, "raw payload channel failed; using JSON for this build");
+                channel.stream = None;
+                None
+            }
+        }
     }
 }
 
@@ -664,10 +779,20 @@ pub fn split_block_rlp(
 /// anything having been decoded. The header rides along so the seal can be
 /// applied to it directly.
 pub fn built_block_from_raw(value: Value, parent_beacon_block_root: B256) -> Result<BuiltBlock, ElError> {
-    use alloy_rpc_types_engine::{ExecutionPayloadV1, ExecutionPayloadV2};
     let raw: RawBuiltPayload = serde_json::from_value(value)
         .map_err(|e| ElError::new(format!("unusable getPayloadRaw answer: {e}")))?;
-    let (header, transactions, withdrawals) = split_block_rlp(&raw.block)?;
+    built_block_from_parts(raw.block, raw.requests, raw.block_access_list, parent_beacon_block_root)
+}
+
+/// [`built_block_from_raw`] from the parts, however they arrived.
+pub fn built_block_from_parts(
+    block: alloy_primitives::Bytes,
+    requests: Option<Vec<alloy_primitives::Bytes>>,
+    block_access_list: Option<alloy_primitives::Bytes>,
+    parent_beacon_block_root: B256,
+) -> Result<BuiltBlock, ElError> {
+    use alloy_rpc_types_engine::{ExecutionPayloadV1, ExecutionPayloadV2};
+    let (header, transactions, withdrawals) = split_block_rlp(&block)?;
     // Blob transactions need the blobs bundle, which this path does not carry.
     if transactions.iter().any(|tx| tx.first() == Some(&0x03)) {
         return Err(ElError::new("raw payload path cannot carry blob transactions"));
@@ -703,7 +828,7 @@ pub fn built_block_from_raw(value: Value, parent_beacon_block_root: B256) -> Res
                 blob_gas_used,
                 excess_blob_gas: header.excess_blob_gas.unwrap_or_default(),
             };
-            match raw.block_access_list {
+            match block_access_list {
                 Some(block_access_list) => ExecutionPayload::V4(ExecutionPayloadV4 {
                     payload_inner: v3,
                     block_access_list,
@@ -717,7 +842,7 @@ pub fn built_block_from_raw(value: Value, parent_beacon_block_root: B256) -> Res
         None => ExecutionPayloadSidecar::none(),
         Some(_) => {
             let cancun = CancunPayloadFields { parent_beacon_block_root, versioned_hashes: Vec::new() };
-            match (header.requests_hash.is_some(), raw.requests) {
+            match (header.requests_hash.is_some(), requests) {
                 (true, requests) => ExecutionPayloadSidecar::v4(
                     cancun,
                     PraguePayloadFields {

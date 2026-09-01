@@ -56,6 +56,8 @@ reth-payload-builder.workspace = true
 reth-payload-primitives.workspace = true
 reth-ethereum-engine-primitives.workspace = true
 alloy-rpc-types-engine.workspace = true
+alloy-eips.workspace = true
+rayon.workspace = true
 reth-node-api.workspace = true
 reth-node-core.workspace = true
 reth-ethereum-payload-builder.workspace = true
@@ -78,7 +80,7 @@ alloy-signer-local.workspace = true
 tracing.workspace = true
 
 # async
-tokio = { workspace = true, features = ["sync", "macros", "time", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["sync", "macros", "time", "rt-multi-thread", "net", "io-util"] }
 
 # misc
 hex.workspace = true

@@ -34,6 +34,7 @@ pub mod cli;
 
 pub mod consensus_ext;
 pub mod engine_ext;
+pub mod payload_serve;
 
 /// Re-exported utils.
 pub mod utils {

@@ -144,7 +144,7 @@ pub fn compress_block_rlp(rlp: &[u8]) -> Result<Vec<u8>, BlockGossipError> {
 pub fn decompress_block_gossip(data: &[u8]) -> Result<Vec<u8>, BlockGossipError> {
     let len = snap::raw::decompress_len(data)
         .map_err(|error| BlockGossipError::Snappy(error.to_string()))?;
-    if len > crate::config::MAX_GOSSIP_SIZE {
+    if len > crate::config::max_gossip_size() {
         return Err(BlockGossipError::Snappy("expands past the gossip size limit".into()));
     }
     snap::raw::Decoder::new()

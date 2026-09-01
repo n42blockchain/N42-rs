@@ -33,8 +33,39 @@ pub const GOSSIP_SUB_HEARTBEAT: Duration = Duration::from_millis(700);
 /// keep the seen-cache from growing to hundreds of MB at fleet throughput.
 pub const SEEN_MESSAGES_TTL: Duration = Duration::from_secs(30);
 
-/// gov5 `encoder.MaxGossipSize` default (`N42_MAX_GOSSIP_MB` overrides it).
-pub const MAX_GOSSIP_SIZE: usize = 1 << 20;
+/// gov5 `encoder.MaxGossipSize` default, in bytes, before `N42_MAX_GOSSIP_MB`.
+pub const DEFAULT_MAX_GOSSIP_SIZE: usize = 1 << 20;
+
+/// The largest block payload this node will publish or accept.
+///
+/// One mebibyte is gov5's default and it is a *block size* cap that presents as
+/// a gas cap: at roughly 107 bytes a transfer it holds a block to about 8,500
+/// transactions no matter what the gas limit says, and the give-away is an
+/// occupancy that is constant across windows while everything else varies
+/// (their `docs/QS_TPS_BENCHMARK.md`, "the block-size cap masquerading as a gas
+/// cap"). A full 480M-gas block needs about 2.44 MB.
+///
+/// So it has to be settable, and it has to be settable *the same way*: gov5
+/// reads `N42_MAX_GOSSIP_MB`, and two clients on one chain that disagree about
+/// this do not merely differ in throughput — the one with the smaller cap
+/// refuses to decode the other's blocks and drops out of the fleet.
+///
+/// Read once. A cap that changed under a running node would let it publish a
+/// block it would then refuse to accept back.
+pub fn max_gossip_size() -> usize {
+    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| gossip_size_from(std::env::var("N42_MAX_GOSSIP_MB").ok().as_deref()))
+}
+
+/// The cap `N42_MAX_GOSSIP_MB` names, in bytes. Anything unset, unparseable or
+/// zero leaves the default: a misread variable must not silently shrink the cap
+/// to nothing and take the node off the chain.
+fn gossip_size_from(megabytes: Option<&str>) -> usize {
+    megabytes
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|mb| *mb > 0)
+        .map_or(DEFAULT_MAX_GOSSIP_SIZE, |mb| mb << 20)
+}
 
 /// gov5 `GossipMaxSize()` = `snappy.MaxEncodedLen(MaxGossipSize)`.
 ///
@@ -42,8 +73,9 @@ pub const MAX_GOSSIP_SIZE: usize = 1 << 20;
 /// *encoded* bound, not the raw one: gov5 learned this when a cap pinned at
 /// 1 MiB silently held the network at the default while producers sized blocks
 /// to a raised budget, and libp2p then refused to publish them.
-pub const fn max_gossip_wire_size() -> usize {
-    32 + MAX_GOSSIP_SIZE + MAX_GOSSIP_SIZE / 6
+pub fn max_gossip_wire_size() -> usize {
+    let size = max_gossip_size();
+    32 + size + size / 6
 }
 
 /// Builds a gossipsub config equivalent to gov5's router for the given chain.
@@ -80,6 +112,17 @@ mod tests {
         // Go: snappy.MaxEncodedLen(1<<20) == 32 + 1048576 + 174762
         assert_eq!(max_gossip_wire_size(), 32 + 1_048_576 + 174_762);
         assert_eq!(max_gossip_wire_size(), 1_223_370);
+    }
+
+    #[test]
+    fn the_gossip_cap_follows_gov5s_variable_and_falls_back_safely() {
+        assert_eq!(gossip_size_from(Some("8")), 8 << 20, "gov5's benchmark setting");
+        assert_eq!(gossip_size_from(Some(" 4 ")), 4 << 20, "surrounding space is not an error");
+        // A cap of zero, or a typo, would refuse every block on the chain. The
+        // default is the only safe reading of a variable that did not parse.
+        for bad in [Some("0"), Some("eight"), Some(""), None] {
+            assert_eq!(gossip_size_from(bad), DEFAULT_MAX_GOSSIP_SIZE, "{bad:?}");
+        }
     }
 
     #[test]

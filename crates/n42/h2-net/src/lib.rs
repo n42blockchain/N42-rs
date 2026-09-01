@@ -38,7 +38,7 @@ pub use rpc::{
     BlockChunk, BlockReply, RangeReply, RangeRequest, BLOCK_BY_HASH_PROTOCOL,
     BODIES_BY_RANGE_PROTOCOL, MAX_RANGE_BLOCKS,
 };
-pub use config::{gov5_gossipsub_config, max_gossip_wire_size};
+pub use config::{gov5_gossipsub_config, max_gossip_size, max_gossip_wire_size};
 pub use message_id::{gov5_message_id_fn, gov5_message_id_parts};
 pub use observer::{H2V4Observer, ObserverConfig, ObserverError, ObserverEvent};
 pub use status::{Status, StatusError, STATUS_PROTOCOL};

@@ -19,6 +19,8 @@ alloy-signer-local.workspace = true
 #reth
 reth-evm.workspace = true
 reth-evm-ethereum.workspace = true
+rayon.workspace = true
+alloy-trie.workspace = true
 reth-errors.workspace = true
 reth-trie.workspace = true
 reth-execution-types.workspace = true

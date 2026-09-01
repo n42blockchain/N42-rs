@@ -24,7 +24,7 @@ use reth_evm::{
     execute::{BlockBuilder, BlockBuilderOutcome},
     ConfigureEvm, Evm, NextBlockEnvAttributes,
 };
-use reth_evm_ethereum::EthEvmConfig;
+use reth_evm_ethereum::{EthBlockAssembler, EthEvmConfig};
 use reth_payload_builder::EthBuiltPayload;
 use reth_payload_builder_primitives::PayloadBuilderError;
 use reth_primitives_traits::transaction::error::InvalidTransactionError;
@@ -210,8 +210,19 @@ impl<Pool, Client, EvmConfig, Cons> N42PayloadBuilder<Pool, Client, EvmConfig, C
 impl<Pool, Client, EvmConfig, Cons> PayloadBuilder
     for N42PayloadBuilder<Pool, Client, EvmConfig, Cons>
 where
-    EvmConfig: ConfigureEvm<Primitives = EthPrimitives, NextBlockEnvCtx = NextBlockEnvAttributes>,
-    Client: StateProviderFactory + ChainSpecProvider<ChainSpec: EthereumHardforks> + Clone,
+    EvmConfig: ConfigureEvm<
+        Primitives = EthPrimitives,
+        NextBlockEnvCtx = NextBlockEnvAttributes,
+        BlockAssembler = EthBlockAssembler<Client::ChainSpec>,
+        BlockExecutorFactory = reth_evm::eth::EthBlockExecutorFactory<
+            reth_evm_ethereum::RethReceiptBuilder,
+            Arc<Client::ChainSpec>,
+            reth_evm::eth::EthEvmFactory,
+        >,
+    >,
+    Client: StateProviderFactory
+        + ChainSpecProvider<ChainSpec: EthereumHardforks + reth_chainspec::EthChainSpec + reth_evm::eth::spec::EthExecutorSpec>
+        + Clone,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>,
     Cons: FullConsensus<EthPrimitives> + SignerManager + Clone + Unpin + 'static,
 {
@@ -309,8 +320,18 @@ pub fn default_n42_payload<EvmConfig, Client, Pool, F, Cons>(
     qmdb: Option<QmdbNodeState>,
 ) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError>
 where
-    EvmConfig: ConfigureEvm<Primitives = EthPrimitives, NextBlockEnvCtx = NextBlockEnvAttributes>,
-    Client: StateProviderFactory + ChainSpecProvider<ChainSpec: EthereumHardforks>,
+    EvmConfig: ConfigureEvm<
+        Primitives = EthPrimitives,
+        NextBlockEnvCtx = NextBlockEnvAttributes,
+        BlockAssembler = EthBlockAssembler<Client::ChainSpec>,
+        BlockExecutorFactory = reth_evm::eth::EthBlockExecutorFactory<
+            reth_evm_ethereum::RethReceiptBuilder,
+            Arc<Client::ChainSpec>,
+            reth_evm::eth::EthEvmFactory,
+        >,
+    >,
+    Client: StateProviderFactory
+        + ChainSpecProvider<ChainSpec: EthereumHardforks + reth_chainspec::EthChainSpec + reth_evm::eth::spec::EthExecutorSpec>,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>,
     F: FnOnce(BestTransactionsAttributes) -> BestTransactionsIter<Pool>,
     Cons: FullConsensus<EthPrimitives> + SignerManager + Clone + Unpin + 'static,
@@ -374,25 +395,41 @@ where
     };
     debug!(target: "payload_builder", ?coinbase, suggested_fee_recipient=?attributes.suggested_fee_recipient, "using coinbase for payload building");
 
-    let mut builder = evm_config
-        .builder_for_next_block(
-            &mut db,
-            &parent_header,
-            NextBlockEnvAttributes {
-                // EIP-7843; APoS does not drive slots
-                slot_number: None,
-                timestamp: attributes.timestamp,
-                suggested_fee_recipient: coinbase,
-                prev_randao: attributes.prev_randao,
-                gas_limit: builder_config.gas_limit(parent_header.gas_limit),
-                parent_beacon_block_root: attributes.parent_beacon_block_root,
-                withdrawals: attributes.withdrawals.clone().map(Into::into),
-                extra_data: Default::default(),
-            },
-        )
-        .map_err(PayloadBuilderError::other)?;
-
     let chain_spec = client.chain_spec();
+    // A HotStuff chain's blocks follow gov5's header profile: the beneficiary
+    // is the fee recipient the leader named (gov5 sets Coinbase to the
+    // signer), the ommers hash and difficulty are zero, and the receipts
+    // root is gov5's keccak-of-receipts rather than a trie. The view and
+    // the seal are stamped by the validator process after the build.
+    let hotstuff = n42_qmdb_reth::HotStuffGenesisConfig::from_genesis(chain_spec.genesis()).is_ok();
+
+    // What `builder_for_next_block` does, with this repo's assembler in place
+    // of reth's: see `assembler` for what that saves and why.
+    let next_attributes = NextBlockEnvAttributes {
+        // EIP-7843; APoS does not drive slots
+        slot_number: None,
+        timestamp: attributes.timestamp,
+        suggested_fee_recipient: coinbase,
+        prev_randao: attributes.prev_randao,
+        gas_limit: builder_config.gas_limit(parent_header.gas_limit),
+        parent_beacon_block_root: attributes.parent_beacon_block_root,
+        withdrawals: attributes.withdrawals.clone().map(Into::into),
+        extra_data: Default::default(),
+    };
+    let evm_env = evm_config
+        .next_evm_env(&parent_header, &next_attributes)
+        .map_err(PayloadBuilderError::other)?;
+    let evm = evm_config.evm_with_env(&mut db, evm_env);
+    let block_ctx = evm_config
+        .context_for_next_block(&parent_header, next_attributes)
+        .map_err(PayloadBuilderError::other)?;
+    let mut builder: reth_evm::execute::BasicBlockBuilder<'_, EvmConfig::BlockExecutorFactory, _, _, EthPrimitives> = reth_evm::execute::BasicBlockBuilder {
+        executor: evm_config.create_executor(evm, block_ctx.clone()),
+        ctx: block_ctx,
+        assembler: crate::assembler::N42BlockAssembler::new(EthBlockAssembler::new(chain_spec.clone()), hotstuff),
+        parent: &parent_header,
+        transactions: Vec::new(),
+    };
 
     debug!(target: "payload_builder", id=%payload_id, parent_header = ?parent_header.hash(), parent_number = parent_header.number, "building new payload");
     // Timed in phases, because at the 163,000-transaction tier this function
@@ -424,12 +461,6 @@ where
     let mut header = cons
         .prepare(&parent_header)
         .map_err(|err| PayloadBuilderError::Internal(err.into()))?;
-    // A HotStuff chain's blocks follow gov5's header profile: the beneficiary
-    // is the fee recipient the leader named (gov5 sets Coinbase to the
-    // signer), the ommers hash and difficulty are zero, and the receipts
-    // root is gov5's keccak-of-receipts rather than a trie. The view and
-    // the seal are stamped by the validator process after the build.
-    let hotstuff = n42_qmdb_reth::HotStuffGenesisConfig::from_genesis(chain_spec.genesis()).is_ok();
     if hotstuff {
         header.beneficiary = coinbase;
     }

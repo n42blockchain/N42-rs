@@ -409,7 +409,12 @@ f7_el_args() {
       --rpc.txfeecap 0
       # Sender recovery is the largest import component when the followers'
       # pools are cold, which sharded supply guarantees.
-      --engine.sender-recovery-cache
+      # `F7_NO_SENDER_CACHE=1` drops it, which is the A/B that says whether the
+      # cache carries a sender from pool admission to block import at all. gov5
+      # measured their equivalent at exactly 0% under warm pools, because the
+      # hint pass reads the sender off the pooled transaction object and never
+      # reaches the cache.
+      $( [[ ${F7_NO_SENDER_CACHE:-0} == 1 ]] || echo --engine.sender-recovery-cache )
       --engine.txpool-prewarming
     )
   fi

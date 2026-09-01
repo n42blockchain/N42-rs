@@ -2053,3 +2053,47 @@ measured as one.
 
 Comparable standing at the 163,000-transaction tier with 2,000,000 recipients:
 **65,197 TPS** against N42-26's 156,499.
+
+### Two clients, and I confused them
+
+A correction that matters for every attribution in round 18. There are two
+sibling clients here and they are not interchangeable:
+
+* **`../N42-gov5`** — the Go client. MDBX, HotStuff, QMDB. Measured peak on this
+  box **41,495 TPS** at 0.496 s blocks, 22,857-transaction blocks.
+* **`../N42-26`** — the Rust client. reth-based, so it shares
+  `crates/ethereum/payload/src/lib.rs` with this repo. Record **156,499 TPS** at
+  163,000-transaction blocks.
+
+The 156,499 this file has been chasing is N42-26's and is recorded correctly
+above. What was wrong: the binary ingest server's pool gate is credited in its
+own source to "gov5's sibling client" when it came from N42-26's
+`crates/n42-node/src/ingest.rs`, and in a message to the gov5 session I
+attributed N42-26's roadmap and their 156,499 to them. Their reply: no reth in
+their repo, no such file, and 156,499 appears nowhere in their records. Fixed in
+the source; recorded here.
+
+### The comparison that came out of it, which is worth more than the mistake
+
+Their per-block decomposition against this fleet's, on the same box:
+
+| | this fleet | gov5 |
+|---|---:|---:|
+| block | 163,000 tx | 22,857 tx |
+| import total | 676 ms | 148.2 ms |
+| **execution per transaction** | **3.586 µs** | **3.403 µs** (3.033 broadcast) |
+| non-execution per transaction | **0.56 µs** | **3.08 µs** |
+
+**Per-transaction execution is the same within 15%.** Two clients, two
+languages, two state backends, and the EVM costs the same per transfer — which
+says the throughput difference between this fleet and gov5 is not execution
+speed at all. It is that a 163,000-transaction block amortises fixed per-block
+cost over seven times as many transactions: 0.56 µs against 3.08.
+
+That cuts against a target this file has been circling. The follower's 584.6 ms
+of execution is 86% of its import and it looked like the obvious thing to
+attack — but at 3.586 µs a transfer it is already at the same cost as another
+client's, so parallel execution is an improvement to make, not a gap to close.
+The gap this fleet still has is against N42-26, who run the same serial
+`payload/src/lib.rs` at the same block size, and that one cannot be explained by
+amortisation.

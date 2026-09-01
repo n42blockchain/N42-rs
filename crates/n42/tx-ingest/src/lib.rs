@@ -40,10 +40,11 @@
 //! reply carries the pool's pending count so a client that wants to pace itself
 //! can, without a second round trip to ask.
 //!
-//! Taken from gov5's sibling client, which solved the same problem in the same
-//! place. What is *not* taken from it, yet, is the other half of their design:
-//! their client sends a pre-recovered sender with each transaction and the
-//! server trusts it, skipping ECDSA entirely. That removes ~50 us a transaction
+//! Taken from N42-26's `crates/n42-node/src/ingest.rs`, which solved the same
+//! problem in the same place — *not* from gov5, which is the Go client and has
+//! no such path. What is *not* taken from it, yet, is the other half of their
+//! design: their client sends a pre-recovered sender with each transaction and
+//! the server trusts it, skipping ECDSA entirely. That removes ~50 us a transaction
 //! and it is the right trade when recovery is the ceiling — but on this fleet
 //! the machine is 94% idle at 22,000 TPS, so recovery is not the ceiling, and
 //! trusting a client-supplied sender would change what the benchmark verifies

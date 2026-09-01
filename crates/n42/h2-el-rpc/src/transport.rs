@@ -41,6 +41,15 @@ pub const UNKNOWN_PAYLOAD: i64 = -38001;
 /// build: the execution layer is saying "ask again with the right version".
 pub const UNSUPPORTED_FORK: i64 = -38005;
 
+/// The Engine API's "invalid payload attributes".
+///
+/// A version refusing a *field* rather than the method: Amsterdam requires
+/// EIP-7843's slot number on a `forkchoiceUpdatedV4` that starts a build, and
+/// every fork before it refuses one. A client without the fork schedule reads
+/// this the same way it reads [`UNSUPPORTED_FORK`] — as "ask the next version
+/// down".
+pub const INVALID_PAYLOAD_ATTRIBUTES: i64 = -38003;
+
 impl std::fmt::Display for RpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} (code {})", self.message, self.code)

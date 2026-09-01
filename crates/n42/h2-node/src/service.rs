@@ -2009,7 +2009,19 @@ impl<E: ExecutionLayer> H2Service<E> {
             let rewards = n42_h2_consensus::withdrawals_to_rewards(
                 execution.payload.as_v2().map_or(&[][..], |v2| v2.withdrawals.as_slice()),
             );
-            n42_h2_net::encode_block_rlp_raw(header, &execution.payload.as_v1().transactions, &rewards)
+            // The access list travels with the block or the fleet cannot import
+            // it: on an Amsterdam chain a payload without one is refused, and
+            // on any chain a block without one is executed serially.
+            let bal = match &execution.payload {
+                alloy_rpc_types_engine::ExecutionPayload::V4(v4) => Some(v4.block_access_list.clone()),
+                _ => None,
+            };
+            n42_h2_net::encode_block_rlp_raw(
+                header,
+                &execution.payload.as_v1().transactions,
+                &rewards,
+                bal.as_ref(),
+            )
         });
         let data = match own.map(Ok).unwrap_or_else(|| encode_block_rlp(execution, self.header_profile)) {
             Ok(rlp) => {

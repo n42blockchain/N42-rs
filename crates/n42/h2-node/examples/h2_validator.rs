@@ -463,6 +463,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if context.preparing { 0 } else { period_ms },
                     context.head_timestamp,
                     context.head_seen,
+                    // The block this build will produce, so `slot_number` on
+                    // the attributes and on the payload that comes back are the
+                    // same number. Absent a parent header there is nothing to
+                    // count from, and a chain before Amsterdam must not carry
+                    // one at all.
+                    context.head_header.as_ref().map(|header| header.number + 1),
                 )
             });
         }
@@ -546,6 +552,7 @@ fn block_attributes(
     period_ms: u64,
     head_timestamp: Option<u64>,
     head_seen: Option<std::time::Instant>,
+    slot_number: Option<u64>,
 ) -> Option<PayloadAttributes> {
     static LAST_MS: AtomicU64 = AtomicU64::new(0);
     let now_ms = SystemTime::now()
@@ -611,7 +618,15 @@ fn block_attributes(
         withdrawals: Some(withdrawals),
         parent_beacon_block_root: Some(parent_beacon_block_root),
         target_gas_limit: None,
-        slot_number: None,
+        // EIP-7843's slot number, which Amsterdam requires of a
+        // `forkchoiceUpdatedV4` that starts a build and forbids before it.
+        //
+        // This chain has no slots — HotStuff commits a block per view — so the
+        // number of the block about to be built stands in for one. It is
+        // monotonic, every member derives it from the parent without being
+        // told, and it is what the adapter puts on the payload that comes back,
+        // so the two agree by construction.
+        slot_number,
     })
 }
 

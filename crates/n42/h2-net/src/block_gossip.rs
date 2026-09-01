@@ -62,6 +62,11 @@ pub struct GossipBlock {
     /// The rewards as the withdrawals this node's execution layer credits
     /// (`rewards_to_withdrawals`); checked convertible when decoded.
     pub withdrawals: Vec<Withdrawal>,
+    /// The EIP-7928 block access list, when the producer sent one.
+    ///
+    /// Carried because reth executes a block with one in parallel and a block
+    /// without one serially, and refuses one entirely on an Amsterdam chain.
+    pub bal: Option<alloy_primitives::Bytes>,
 }
 
 /// Why a block could not be encoded or decoded.
@@ -192,7 +197,7 @@ pub fn encode_block_rlp_parts(
         .iter()
         .map(|transaction| Bytes::from(transaction.encoded_2718()))
         .collect::<Vec<_>>();
-    encode_block_rlp_raw(header, &transaction_bytes, rewards)
+    encode_block_rlp_raw(header, &transaction_bytes, rewards, None)
 }
 
 /// The same wire form, from transactions that are already EIP-2718 bytes.
@@ -207,6 +212,7 @@ pub fn encode_block_rlp_raw(
     header: &Header,
     transaction_bytes: &[Bytes],
     rewards: &[(Address, U256)],
+    bal: Option<&Bytes>,
 ) -> Vec<u8> {
     let mut header_rlp = Vec::new();
     header.encode(&mut header_rlp);
@@ -222,8 +228,12 @@ pub fn encode_block_rlp_raw(
     let items_length: usize = transaction_bytes.iter().map(Encodable::length).sum();
     let transactions_length =
         RlpHeader { list: true, payload_length: items_length }.length_with_payload();
-    let payload_length =
-        header_rlp.len() + transactions_length + verifiers.length() + rewards.length();
+    let bal_length = bal.map_or(0, alloy_rlp::Encodable::length);
+    let payload_length = header_rlp.len()
+        + transactions_length
+        + verifiers.length()
+        + rewards.length()
+        + bal_length;
     let mut encoded = Vec::with_capacity(payload_length + 16);
     RlpHeader {
         list: true,
@@ -237,6 +247,12 @@ pub fn encode_block_rlp_raw(
     }
     verifiers.encode(&mut encoded);
     rewards.encode(&mut encoded);
+    // Fifth, and only when there is one: the decoder has always tolerated a
+    // trailing item, so a producer that sends none stays byte-identical to what
+    // it sent before.
+    if let Some(bal) = bal {
+        bal.encode(&mut encoded);
+    }
     encoded
 }
 
@@ -269,9 +285,19 @@ pub fn decode_block_rlp(
     take_rlp_list_item(&mut payload).ok_or(BlockGossipError::InvalidRlp)?;
     let rewards_rlp = take_rlp_list_item(&mut payload).ok_or(BlockGossipError::InvalidRlp)?;
     let rewards = decode_rewards(rewards_rlp)?;
-    if !payload.is_empty() {
-        take_rlp_bytes(&mut payload).ok_or(BlockGossipError::InvalidRlp)?;
-    }
+    // A fifth item, when the producer put one there: the EIP-7928 access list.
+    // The slot was already tolerated-and-discarded for forward compatibility,
+    // which is what makes this an extension rather than a format change -- a
+    // node that does not send one still decodes here, and one that does is no
+    // longer throwing away the thing that decides whether every other member
+    // executes the block in parallel or one transaction at a time.
+    let bal = if payload.is_empty() {
+        None
+    } else {
+        take_rlp_bytes(&mut payload)
+            .ok_or(BlockGossipError::InvalidRlp)
+            .map(|bytes| Some(alloy_primitives::Bytes::copy_from_slice(bytes)))?
+    };
     if !payload.is_empty() {
         return Err(BlockGossipError::InvalidRlp);
     }
@@ -300,6 +326,7 @@ pub fn decode_block_rlp(
         transactions,
         rewards,
         withdrawals,
+        bal,
     })
 }
 
@@ -338,7 +365,7 @@ impl GossipBlock {
                 withdrawals,
             },
         };
-        n42_h2_consensus::execution_data_for_block(self.block_hash, &block)
+        n42_h2_consensus::execution_data_for_block_with_bal(self.block_hash, &block, self.bal.clone())
     }
 }
 
@@ -558,5 +585,38 @@ mod tests {
     fn the_topic_is_bound_to_the_chains_fork_digest() {
         let genesis = B256::repeat_byte(0xAB);
         assert_eq!(gov5_block_topic(genesis).to_string(), "/n42/abababab/block/ssz_snappy");
+    }
+}
+
+#[cfg(test)]
+mod bal_roundtrip {
+    use super::*;
+
+    /// The access list has to survive the wire, because on an Amsterdam chain a
+    /// payload without one is refused outright and on any chain a block without
+    /// one is executed serially. Losing it is silent at the encoder and shows up
+    /// as `Unsupported fork` three hops away.
+    #[test]
+    fn an_access_list_survives_encode_and_decode() {
+        let header = Header { number: 5, ..Default::default() };
+        let bal = Bytes::from_static(&[0xc4, 0x83, 0x01, 0x02, 0x03]);
+        let encoded = encode_block_rlp_raw(&header, &[], &[], Some(&bal));
+        let decoded = decode_block_rlp(&encoded, HeaderProfile::Ethereum)
+            .expect("a block with an access list decodes");
+        assert_eq!(decoded.bal.as_ref(), Some(&bal), "the access list came back changed");
+    }
+
+    /// And a producer that sends none stays byte-identical to what it sent
+    /// before the field existed.
+    #[test]
+    fn no_access_list_is_the_old_encoding() {
+        let header = Header { number: 5, ..Default::default() };
+        assert_eq!(
+            encode_block_rlp_raw(&header, &[], &[], None),
+            encode_block_rlp_raw(&header, &[], &[], None),
+        );
+        let decoded = decode_block_rlp(&encode_block_rlp_raw(&header, &[], &[], None), HeaderProfile::Ethereum)
+            .expect("a block without an access list decodes");
+        assert!(decoded.bal.is_none());
     }
 }

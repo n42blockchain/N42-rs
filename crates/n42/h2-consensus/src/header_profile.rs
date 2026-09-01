@@ -368,6 +368,20 @@ pub fn gov5_receipts_root<'a>(receipts: impl IntoIterator<Item = ReceiptView<'a>
 /// with real requests is handed over by hash, which an execution layer
 /// accepts only where its API allows it.
 pub fn execution_data_for_block(block_hash: B256, block: &Block<TxEnvelope>) -> ExecutionData {
+    execution_data_for_block_with_bal(block_hash, block, None)
+}
+
+/// [`execution_data_for_block`], carrying an EIP-7928 access list.
+///
+/// The list is not decoration: reth executes a block with one in parallel and a
+/// block without one serially, and on an Amsterdam chain it refuses a payload
+/// that has none at all. A block reconstructed from the wire therefore has to
+/// carry its list or it cannot be imported.
+pub fn execution_data_for_block_with_bal(
+    block_hash: B256,
+    block: &Block<TxEnvelope>,
+    bal: Option<alloy_primitives::Bytes>,
+) -> ExecutionData {
     let payload = ExecutionPayload::from_block_unchecked(block_hash, block).0;
     let sidecar = match block.header.parent_beacon_block_root {
         None => ExecutionPayloadSidecar::none(),
@@ -401,6 +415,22 @@ pub fn execution_data_for_block(block_hash: B256, block: &Block<TxEnvelope>) -> 
                 ),
             }
         }
+    };
+    let payload = match bal {
+        Some(block_access_list) => match payload {
+            ExecutionPayload::V3(v3) => ExecutionPayload::V4(
+                alloy_rpc_types_engine::ExecutionPayloadV4 {
+                    payload_inner: v3,
+                    block_access_list,
+                    // As in the Engine API adapter: this chain has no slots, so
+                    // the block's own number stands in, and every node derives
+                    // it from the block rather than being told.
+                    slot_number: block.header.number,
+                },
+            ),
+            other => other,
+        },
+        None => payload,
     };
     ExecutionData::new(payload, sidecar)
 }
@@ -515,7 +545,16 @@ pub fn normalize_to_gov5_h2_with_header(
     }
     let hash = block.header.hash_slow();
     let header = block.header.clone();
-    Ok((execution_data_for_block(hash, &block), header))
+    // The access list survives the seal. Sealing rebuilds the payload from a
+    // decoded block, so anything the payload carried and the block does not is
+    // dropped unless it is carried across explicitly -- and dropping this one
+    // turns a parallel import into a serial one, or on an Amsterdam chain into
+    // a refusal.
+    let bal = match &execution.payload {
+        ExecutionPayload::V4(v4) => Some(v4.block_access_list.clone()),
+        _ => None,
+    };
+    Ok((execution_data_for_block_with_bal(hash, &block, bal), header))
 }
 
 /// A block body with these transactions and, on a post-Shanghai header, the

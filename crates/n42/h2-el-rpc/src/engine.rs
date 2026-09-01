@@ -54,7 +54,10 @@ use n42_h2_execution::{ChainBlock, BuiltBlock, ElError, ExecutionLayer, ResolveK
 use serde_json::{json, Value};
 use tracing::debug;
 
-use crate::transport::{JsonRpcTransport, TransportError, UNKNOWN_PAYLOAD, UNSUPPORTED_FORK};
+use crate::transport::{
+    JsonRpcTransport, TransportError, INVALID_PAYLOAD_ATTRIBUTES, UNKNOWN_PAYLOAD,
+    UNSUPPORTED_FORK,
+};
 
 /// How many in-flight builds to remember the beacon root for.
 ///
@@ -249,17 +252,30 @@ const GET_PAYLOAD_METHODS: [&str; 4] =
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GetPayloadEnvelope {
-    execution_payload: ExecutionPayloadV3,
+    execution_payload: PayloadMaybeWithBal,
     #[serde(default)]
     blobs_bundle: BlobCommitments,
     #[serde(default)]
     execution_requests: Option<Vec<alloy_primitives::Bytes>>,
-    /// The EIP-7928 block access list, from Amsterdam's V6 envelope.
-    ///
-    /// Worth carrying for one reason: reth executes a block in parallel when it
-    /// has one and serially when it does not
-    /// (`payload_validator.rs::bal_path_eligible`). Dropping it here is the
-    /// difference between rayon workers and a `while` loop.
+}
+
+/// A `getPayload` payload, keeping the access list if the version carries one.
+///
+/// The list is *inside* `executionPayload`, not beside it: Amsterdam's envelope
+/// types the field as `ExecutionPayloadV4`, which is a V3 payload plus the list.
+/// Reading the field at the envelope's top level finds nothing and finds it
+/// silently, because serde ignores what it does not recognise -- so the payload
+/// comes back as V3, the block imports serially where it can import at all, and
+/// the first sign of it is `Unsupported fork` three hops away in a follower.
+///
+/// Worth carrying for one reason: reth executes a block in parallel when it has
+/// one and serially when it does not
+/// (`payload_validator.rs::bal_path_eligible`).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PayloadMaybeWithBal {
+    #[serde(flatten)]
+    payload: ExecutionPayloadV3,
     #[serde(default)]
     block_access_list: Option<alloy_primitives::Bytes>,
 }
@@ -284,7 +300,7 @@ pub fn built_block_from_envelope(
     let envelope: GetPayloadEnvelope = serde_json::from_value(value)
         .map_err(|e| ElError::new(format!("unusable getPayload envelope: {e}")))?;
 
-    let inner = &envelope.execution_payload.payload_inner.payload_inner;
+    let inner = &envelope.execution_payload.payload.payload_inner.payload_inner;
     let hash = inner.block_hash;
     let number = inner.block_number;
     let timestamp = inner.timestamp;
@@ -317,9 +333,9 @@ pub fn built_block_from_envelope(
     // V4 when the build came back with an access list, V3 otherwise. The
     // variant is what carries the list to `newPayload`, and `newPayload` is
     // where reth decides between rayon workers and a `while` loop.
-    let payload = match envelope.block_access_list {
+    let payload = match envelope.execution_payload.block_access_list {
         Some(block_access_list) => ExecutionPayload::V4(ExecutionPayloadV4 {
-            payload_inner: envelope.execution_payload,
+            payload_inner: envelope.execution_payload.payload,
             block_access_list,
             // EIP-7843's slot number is a consensus-layer concept and this
             // chain has no slots: HotStuff commits a block per view, so the
@@ -329,7 +345,7 @@ pub fn built_block_from_envelope(
             // way from the same block.
             slot_number: number,
         }),
-        None => ExecutionPayload::V3(envelope.execution_payload),
+        None => ExecutionPayload::V3(envelope.execution_payload.payload),
     };
 
     Ok(BuiltBlock {
@@ -445,13 +461,52 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
         state: ForkchoiceState,
         attrs: PayloadAttributes,
     ) -> Result<ForkchoiceUpdated, ElError> {
-        let method = forkchoice_method(Some(&attrs));
-        debug!(target: "n42.h2.el", method, "forkchoiceUpdated with attributes");
         let beacon_root = attrs.parent_beacon_block_root;
-        let updated: ForkchoiceUpdated = self
-            .call(method, vec![json!(state), json!(attrs)])
-            .await
-            .map_err(ElError::new)?;
+        // Newest-first, like `getPayload`, and for the same reason: this client
+        // does not carry the fork schedule, and each version is bound to a fork
+        // in *both* directions. Amsterdam refuses V3-with-attributes and
+        // requires EIP-7843's slot number; everything before Amsterdam refuses
+        // V4 and refuses a slot number outright. Sending one shape to every
+        // chain therefore breaks whichever chain it was not written for, which
+        // is how a fix for an Amsterdam fleet stopped a Prague one.
+        //
+        // So the newest shape is tried and the older one answers for the older
+        // chain. The fallback covers both refusals a wrong version produces:
+        // `UNSUPPORTED_FORK` for the method and `INVALID_PAYLOAD_ATTRIBUTES`
+        // for the field.
+        // Only the post-Cancun shape has two candidate versions. Attributes
+        // without a beacon root belong to an older fork and their version is
+        // decided by the fields alone, with nothing to fall back to.
+        let older = [forkchoice_method(Some(&attrs))];
+        let ladder: &[&str] = if attrs.parent_beacon_block_root.is_some() {
+            &FCU_WITH_ATTRS_METHODS
+        } else {
+            &older
+        };
+        let mut last: Option<ElError> = None;
+        let mut updated: Option<ForkchoiceUpdated> = None;
+        for &method in ladder {
+            let mut attempt = attrs.clone();
+            if method == "engine_forkchoiceUpdatedV3" {
+                attempt.slot_number = None;
+            }
+            debug!(target: "n42.h2.el", method, "forkchoiceUpdated with attributes");
+            match self.call(method, vec![json!(state), json!(attempt)]).await {
+                Ok(value) => {
+                    updated = Some(value);
+                    break;
+                }
+                Err(TransportError::Rpc(err))
+                    if err.code == UNSUPPORTED_FORK || err.code == INVALID_PAYLOAD_ATTRIBUTES =>
+                {
+                    last = Some(ElError::new(err));
+                }
+                Err(err) => return Err(ElError::new(err)),
+            }
+        }
+        let updated = updated.ok_or_else(|| {
+            last.unwrap_or_else(|| ElError::new("no forkchoiceUpdated version accepted the attributes"))
+        })?;
 
         // Remember what this build was started under, so collecting it can
         // rebuild a sidecar the block can be re-imported with.

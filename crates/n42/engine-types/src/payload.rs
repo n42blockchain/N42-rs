@@ -334,9 +334,24 @@ where
 
     let state_provider = client.state_by_block_hash(parent_header.hash())?;
     let state = StateProviderDatabase::new(&state_provider);
+    // The block access list, when the chain is past Amsterdam.
+    //
+    // EIP-7928, and the reason to build one here is not the EIP: reth executes
+    // an incoming block in parallel when it carries an access list and serially
+    // when it does not (`payload_validator.rs::bal_path_eligible`). A builder
+    // that omits it produces blocks every node then validates one transaction
+    // at a time.
+    //
+    // This is the line reth's own `default_ethereum_payload` has and this
+    // builder did not, which is why `getPayloadV6` answered
+    // `MissingBlockAccessList` on a chain where Amsterdam was demonstrably
+    // active -- the forkchoice had already refused attributes without EIP-7843's
+    // slot number.
+    let is_amsterdam = client.chain_spec().is_amsterdam_active_at_timestamp(attributes.timestamp);
     let mut db = State::builder()
         .with_database(cached_reads.as_db_mut(state))
         .with_bundle_update()
+        .with_bal_builder_if(is_amsterdam)
         .build();
 
     // Get signer address from consensus to use as coinbase (beneficiary)
@@ -538,6 +553,7 @@ where
         BlockBuilderOutcome {
             execution_result,
             block,
+            block_access_list,
             ..
         },
         qmdb_prepared,
@@ -638,9 +654,20 @@ where
         senders,
     ));
 
-    // upstream dropped payload_id from this constructor and added the optional
-    // encoded block access list (EIP-7928), which APoS does not produce.
-    let payload = EthBuiltPayload::new(recovered, total_fees, requests, None)
+    // The EIP-7928 access list, RLP-encoded, when the builder made one.
+    //
+    // This used to be `None` with a comment saying APoS does not produce one,
+    // which was true until the state above was given a BAL builder. Leaving it
+    // `None` after that is worse than not building it: the list exists, is
+    // thrown away here, `getPayloadV6` answers `MissingBlockAccessList`, and on
+    // an Amsterdam chain the leader cannot produce a block at all.
+    //
+    // It is also what decides how every node executes the block. reth takes the
+    // parallel path for a block that carries one and the serial path for a
+    // block that does not, and says nothing either way.
+    let block_access_list: Option<alloy_primitives::Bytes> =
+        block_access_list.map(|bal| alloy_rlp::encode(&bal).into());
+    let payload = EthBuiltPayload::new(recovered, total_fees, requests, block_access_list)
         // add blob sidecars from the executed txs
         .with_sidecars(blob_sidecars);
 

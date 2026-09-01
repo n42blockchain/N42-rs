@@ -100,6 +100,13 @@ struct Args {
     per_tx: u64,
     offset: u64,
     gas_price: u128,
+    /// Gas limit on every transfer, funding included. 21,000 is a transfer
+    /// everywhere before Amsterdam; on an Amsterdam chain EIP-8037 charges
+    /// state creation up front, and a transfer that *creates* its recipient
+    /// needs about 207,000 of limit or it runs out of gas -- mined, charged,
+    /// and the value never moves. Measured here: a funding round that
+    /// "mined through nonce 6000" and left every sender at 0 wei.
+    gas: u64,
     conc: usize,
     rpc_batch: usize,
     shard_senders: bool,
@@ -213,7 +220,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             (from..upto)
                                 .map(|n| {
                                     let to = recipient(args.recipients, (worker * chunk + index) as u64 * args.per_tx + n);
-                                    signed(key, n, args.chain_id, args.gas_price, 1, to)
+                                    signed(key, n, args.chain_id, args.gas_price, args.gas, 1, to)
                                 }),
                         );
                         let accepted = submit(&client, rpc, &batch, &sent, &rejected);
@@ -273,11 +280,11 @@ fn derive(offset: u64, index: usize) -> PrivateKeySigner {
     }
 }
 
-fn signed(key: &PrivateKeySigner, nonce: u64, chain_id: u64, gas_price: u128, value: u64, to: Address) -> String {
+fn signed(key: &PrivateKeySigner, nonce: u64, chain_id: u64, gas_price: u128, gas: u64, value: u64, to: Address) -> String {
     let tx = TxEip1559 {
         chain_id,
         nonce,
-        gas_limit: TRANSFER_GAS,
+        gas_limit: gas,
         max_fee_per_gas: gas_price,
         max_priority_fee_per_gas: gas_price / 10,
         to: TxKind::Call(to),
@@ -335,7 +342,7 @@ fn flood_over_ingest(
             batch.extend(
                 (from..upto).map(|n| {
                     let to = recipient(args.recipients, index as u64 * args.per_tx + n);
-                    signed_raw(key, n, args.chain_id, args.gas_price, 1, to)
+                    signed_raw(key, n, args.chain_id, args.gas_price, args.gas, 1, to)
                 }),
             );
             if conn.send(index, &batch).is_err() {
@@ -445,11 +452,11 @@ impl Ingest {
 }
 
 /// The same transaction as [`signed`], as bytes rather than as a hex string.
-fn signed_raw(key: &PrivateKeySigner, nonce: u64, chain_id: u64, gas_price: u128, value: u64, to: Address) -> Vec<u8> {
+fn signed_raw(key: &PrivateKeySigner, nonce: u64, chain_id: u64, gas_price: u128, gas: u64, value: u64, to: Address) -> Vec<u8> {
     let tx = TxEip1559 {
         chain_id,
         nonce,
-        gas_limit: TRANSFER_GAS,
+        gas_limit: gas,
         max_fee_per_gas: gas_price,
         max_priority_fee_per_gas: gas_price / 10,
         to: TxKind::Call(to),
@@ -545,7 +552,7 @@ fn fund(
     };
 
     // Per sender: everything the flood will spend, plus ten transfers of slack.
-    let per_gas = args.gas_price * u128::from(TRANSFER_GAS);
+    let per_gas = args.gas_price * u128::from(args.gas);
     let fund_value = per_gas * u128::from(args.per_tx + 10);
     let total = (fund_value + per_gas) * args.senders as u128;
 
@@ -575,7 +582,7 @@ fn fund(
         let tx = TxEip1559 {
             chain_id: args.chain_id,
             nonce,
-            gas_limit: TRANSFER_GAS,
+            gas_limit: args.gas,
             max_fee_per_gas: args.gas_price,
             max_priority_fee_per_gas: args.gas_price / 10,
             to: TxKind::Call(key.address()),
@@ -611,6 +618,20 @@ fn fund(
         let mined = u64::from_str_radix(mined.as_str().unwrap_or("0x0").trim_start_matches("0x"), 16)?;
         if mined >= target {
             println!("funding      : mined through nonce {mined}");
+            // Mined is not funded. A transfer whose gas limit is below what
+            // this chain charges to create the recipient is mined, charged
+            // and failed, and the faucet's nonce advances exactly as if it had
+            // worked -- so the balance is what has to be read.
+            let first = keys.first().ok_or("no senders to fund")?;
+            let held = call("eth_getBalance", vec![json!(first.address()), json!("latest")])?;
+            let held = U256::from_str_radix(held.as_str().unwrap_or("0x0").trim_start_matches("0x"), 16)?;
+            if held.is_zero() {
+                return Err(format!(
+                    "funding mined but {} holds 0 wei: the transfers failed in execution -- on an Amsterdam chain raise --gas (EIP-8037 charges account creation up front)",
+                    first.address()
+                )
+                .into());
+            }
             return Ok(());
         }
         std::thread::sleep(Duration::from_secs(1));
@@ -628,6 +649,7 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
         per_tx: 300,
         offset: 0,
         gas_price: 10_000_000_000,
+        gas: TRANSFER_GAS,
         conc: 32,
         rpc_batch: 100,
         shard_senders: false,
@@ -646,6 +668,7 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
             "--pertx" => args.per_tx = next()?.parse()?,
             "--offset" => args.offset = next()?.parse()?,
             "--gasprice" => args.gas_price = next()?.parse()?,
+            "--gas" => args.gas = next()?.parse()?,
             "--conc" => args.conc = next()?.parse()?,
             "--rpcbatch" => args.rpc_batch = next()?.parse::<usize>()?.clamp(1, MAX_RPC_BATCH),
             "--ingest" => args.ingest = next()?.split(',').map(str::to_owned).collect(),
@@ -678,6 +701,8 @@ tx_flood — fund a derived sender set and flood the fleet with transfers
   --pertx <n>         transactions per sender (default 300)
   --offset <n>        shift the derived set; use a fresh one every round
   --gasprice <wei>    default 10 gwei; must stay above the chain's base fee
+  --gas <limit>       gas limit per transfer (default 21000; ~210000 on Amsterdam,
+                      where EIP-8037 makes creating the recipient cost more)
   --conc <n>          concurrent submitters (default 32)
   --rpcbatch <n>      transactions per JSON-RPC batch, 1-200 (default 100)
   --shard-senders     pin each sender to one node (cold-follower path)

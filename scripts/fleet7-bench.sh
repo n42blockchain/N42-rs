@@ -144,6 +144,43 @@ g['gasLimit'] = hex(int(sys.argv[3]))
 json.dump(g, open(sys.argv[2], 'w'), indent=2)" "$F7_GENESIS" "$DERIVED" "$GASCEIL"
   export F7_GENESIS=$DERIVED
 fi
+# Amsterdam on top of whatever tier the round chose. reth executes a block in
+# parallel only when it carries an EIP-7928 access list, and a builder makes
+# one only past Amsterdam, so this one field in the genesis is the switch
+# between the serial `while` loop and the rayon path for every node's import.
+# Derived per round like the gas tier, and for the same reason.
+if [[ ${F7_AMSTERDAM:-0} == 1 ]]; then
+  DERIVED=${F7_ROOT:-/data/blockchain/rust-fleet7-bench}/genesis-amsterdam-$(basename "$F7_GENESIS")
+  mkdir -p "$(dirname "$DERIVED")"
+  python3 -c "import json,sys
+g = json.load(open(sys.argv[1]))
+g['config']['amsterdamTime'] = 0
+json.dump(g, open(sys.argv[2], 'w'), indent=2)" "$F7_GENESIS" "$DERIVED"
+  export F7_GENESIS=$DERIVED
+fi
+# The gas limit on every transfer, and whether the round creates its recipients
+# before measuring.
+#
+# 21,000 is a transfer on every fork before Amsterdam. revm's Amsterdam carries
+# EIP-8037, which charges state creation up front: a transfer that *creates*
+# its recipient is refused below ~207,000 of limit and, mined with 21,000,
+# fails inside execution -- charged, nonce advanced, value never moved. The
+# first Amsterdam round here funded 6,000 senders that way and reported an idle
+# chain. Measured on this chain: a creating transfer uses 204,600 gas, an
+# update 21,000, so a 3.42G block holds ~18,600 creations or 163,000 updates.
+#
+# N42-26 measures on Cancun, where a creation costs the same 21,000 as an
+# update. The comparable measurement on an Amsterdam chain is therefore updates:
+# F7_PRECREATE runs a flood that touches every recipient slot before the
+# windows start (6,000 x 500 = 3,000,000 transfers cover 99.9% of the 2,000,000
+# slots, by the same hash the measured flood uses), and the windows then
+# measure the same state writes N42-26's do after their first two million.
+if [[ ${F7_AMSTERDAM:-0} == 1 ]]; then
+  : "${F7_TX_GAS:=210000}"
+  : "${F7_PRECREATE:=1}"
+fi
+: "${F7_TX_GAS:=21000}"
+: "${F7_PRECREATE:=0}"
 # The interval is a measurement parameter here, not a property of the chain.
 export F7_BLOCK_INTERVAL_MS=${F7_BLOCK_INTERVAL_MS:-1000}
 # The chain's own baseTimeout unless a round overrides it, and NOT a multiple of
@@ -181,8 +218,8 @@ RPCS=$(for ((i = 0; i < F7_NODES; i++)); do printf 'http://127.0.0.1:%s,' $((F7_
 
 {
   echo "round        : $TAG"
-  echo "tier         : gossip ${N42_MAX_GOSSIP_MB}MB, gas ceiling ${F7_BENCH_GASCEIL}, pool ${F7_BENCH_POOL_SLOTS}, pacing ${F7_BLOCK_INTERVAL_MS}ms, view timeout ${F7_VIEW_TIMEOUT_MS:-genesis}"
-  echo "supply       : $SENDERS senders x $PERTX tx, offset $OFFSET, conc $CONC, batch $RPCBATCH${SHARD:+, sharded}, $RECIPIENTS recipients"
+  echo "tier         : gossip ${N42_MAX_GOSSIP_MB}MB, gas ceiling ${F7_BENCH_GASCEIL}, pool ${F7_BENCH_POOL_SLOTS}, pacing ${F7_BLOCK_INTERVAL_MS}ms, view timeout ${F7_VIEW_TIMEOUT_MS:-genesis}${F7_AMSTERDAM:+, amsterdam}"
+  echo "supply       : $SENDERS senders x $PERTX tx, offset $OFFSET, conc $CONC, batch $RPCBATCH${SHARD:+, sharded}, $RECIPIENTS recipients, gas $F7_TX_GAS${F7_PRECREATE:+, precreate $F7_PRECREATE}"
   echo "windows      : $WINDOWS x ${WINDOW_SEC}s after ${DECAY_SEC}s of base-fee decay"
 }
 
@@ -251,9 +288,37 @@ if [[ -n ${F7_INGEST:-} ]]; then
   INGEST_ARG=(--ingest "$INGESTS")
   echo "ingest       : $INGESTS"
 fi
+# Create the recipients first, when the round asked for it (see F7_PRECREATE
+# above). Synchronous: it has to be *mined*, not merely accepted, before the
+# windows start, so after the flood exits the pool is watched until it drains.
+if [[ $F7_PRECREATE == 1 ]]; then
+  PRE_START=$SECONDS
+  $FLOOD_PIN "$F7_BIN/examples/tx_flood" --rpc "$RPCS" --chain-id "$CHAIN" \
+    "${INGEST_ARG[@]}" --recipients "$RECIPIENTS" \
+    --senders 6000 --pertx 500 --offset $((OFFSET + 500000)) --gasprice "$GASPRICE" --gas "$F7_TX_GAS" \
+    --conc "$CONC" --rpcbatch "$RPCBATCH" \
+    > "$OUT/precreate.log" 2>&1 < /dev/null || { echo "REFUSING: the precreate flood failed; see $OUT/precreate.log"; exit 1; }
+  read_pending() {
+    curl -s --max-time 5 -X POST -H 'content-type: application/json' \
+      --data '{"jsonrpc":"2.0","id":1,"method":"txpool_status","params":[]}' \
+      "http://127.0.0.1:$F7_HTTP_BASE" \
+      | python3 -c "import sys,json;r=json.load(sys.stdin)['result'];print(int(r['pending'],16)+int(r['queued'],16))" 2>/dev/null || echo 1
+  }
+  PENDING=$(read_pending)
+  while (( PENDING > 0 && SECONDS - PRE_START < 900 )); do
+    sleep 5
+    PENDING=$(read_pending)
+  done
+  echo "precreate    : $(grep -c . "$OUT/precreate.log") log lines, pool at $PENDING after $((SECONDS - PRE_START))s, base fee now $(read_basefee) wei"
+  if (( PENDING > 0 )); then
+    echo "REFUSING: the precreate transfers did not drain within 900s"
+    exit 1
+  fi
+fi
+
 setsid $FLOOD_PIN "$F7_BIN/examples/tx_flood" --rpc "$RPCS" --chain-id "$CHAIN" \
   "${INGEST_ARG[@]}" --recipients "$RECIPIENTS" \
-  --senders "$SENDERS" --pertx "$PERTX" --offset "$OFFSET" --gasprice "$GASPRICE" \
+  --senders "$SENDERS" --pertx "$PERTX" --offset "$OFFSET" --gasprice "$GASPRICE" --gas "$F7_TX_GAS" \
   --conc "$CONC" --rpcbatch "$RPCBATCH" $SHARD \
   > "$OUT/flood.log" 2>&1 < /dev/null &
 FLOOD=$!

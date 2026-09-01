@@ -2349,3 +2349,104 @@ The guard added earlier checks the validator binary against its sources and says
 nothing about the node's. Its first two failures were false positives (a test
 file, a different example); this one is a false negative, which is the more
 expensive direction.
+
+## Round 21: gate 9 was on the leader, and the parallel executor is a net loss here
+
+### Gate 9, found by the unit test and verified on the fleet
+
+The reconstruction was never the problem. alloy's `from_block_unchecked`
+produces a **V4** payload for any header carrying `block_access_list_hash`, and
+fills the list field with the 32-byte hash as a placeholder. This repo's
+`execution_data_for_block_with_bal` handled `V3 => V4` and passed anything else
+through unchanged — so the leader sealed and gossiped a payload whose "access
+list" was a hash. Every importer then hashed the placeholder and no header
+variant could match. The fix is one arm: replace the placeholder with the list
+when the payload is already V4. The `#[ignore]`d test passes and is no longer
+ignored; the field-by-field print now shows only the two fields the candidate
+set already covers.
+
+Two harness defects fell with it, both of the "wrong number rather than error"
+kind: `tx_flood` treated a mined funding transaction as a funded sender, and the
+ingest server took the pool's read lock and cloned every pending `Arc` on each
+2 ms gate poll. The second is why the generator's ceiling was 51,719/s:
+
+| | before | after |
+|---|---:|---:|
+| ingest submission rate | 51,719 tx/s | **127,240 tx/s** |
+
+(`pool_size().pending` instead of `pending_transactions().len()`, and sender
+recovery moved to a blocking thread.) The `forkchoiceUpdated` ladder also now
+remembers the rung the chain accepted, so a pre-Amsterdam chain no longer pays
+a refused V4 round trip on every leader build.
+
+### The Amsterdam chain charges 205,000 gas to create an account
+
+The first Amsterdam round reported an idle chain with a full generator. revm 43's
+`AMSTERDAM` carries **EIP-8037** (state-creation gas, the reservoir model) along
+with EIP-8038 and EIP-2780. Measured on this chain:
+
+| transfer | gas needed | gas used |
+|---|---:|---:|
+| to an existing account | 21,000 | 21,000 |
+| to a fresh account, value 0 | 21,000 | 21,000 |
+| **to a fresh account, value > 0** | **~207,000** | **204,600** (183,600 at block level) |
+
+A 21,000-gas creating transfer is mined *failed*: charged, nonce advanced, value
+never moves — which is why "funding mined through nonce 6000" left every sender
+at 0 wei. N42-26 measures on Cancun, where a creation costs the same 21,000 as an
+update, so the comparable measurement on Amsterdam is updates only:
+`F7_AMSTERDAM=1` now sets `--gas 210000` and runs a precreate flood (6,000 x 500
+= 3,000,000 transfers cover 99.9% of the 2,000,000 recipient slots; 77 s to
+mine) before the windows. Whether EIP-8037 belongs on this chain at all is a
+chain-rules decision, not a benchmark one; it is recorded here, not made.
+
+### reth's BAL executor, measured: 65,197 -> 40,809
+
+Round `ams-bal6`, the 163,000-transaction tier with 2,000,000 recipients,
+recipients precreated, every block through `execute_block_bal` (291 of 291):
+
+| | Osaka, serial (`yamux2`) | Amsterdam, BAL parallel (`ams-bal6`) |
+|---|---:|---:|
+| win2 / win3 | 65,197 / 65,190 TPS | **40,809 / 40,923** |
+| cycle | 2.500 s | **3.750 s** |
+| block execution (follower) | 584.6 ms serial | **521–745 ms** parallel |
+| follower payload -> canonical | 676 ms | **1,189 ms** |
+| leader build | ~740 ms | **1,430–1,728 ms** |
+| body on the wire | 12.2 MB | **24–25 MB** (16 MB compressed) |
+
+The parallel path executes 163,000 transfers no faster than the serial loop
+did, and everything around it got more expensive: the builder now constructs
+the access list (+0.8 s on the leader), the importer verifies it after
+executing (+0.5 s between "executed" and "state root finished"), and the list
+doubles the body. Nothing here is a tuning problem: the executor is at parity,
+and the costs are the EIP's.
+
+So the arithmetic of round 19 — "parallel execution is necessary and at 6.5x
+sufficient" — was right about necessary and wrong about where the 6.5x would
+come from. reth's implementation is not it for this workload.
+
+### What the serial chain now says
+
+At the 163,000 tier the chain is build ~0.9 s + propagate ~0.3 s + import
+~0.68 s = 1.9 s, measured against a 2.5 s cycle; the 0.6 s difference is vote
+gating, step latency and pacing. 160,000 TPS at this block size is a cycle of
+1.0 s, so **build and import each have to roughly halve, and propagation with
+them** — which is what N42-26's 1.15 s cycle on the same serial builder says is
+possible. The next rounds mine their devlogs for the execution-side changes
+this fleet has not adopted, rather than continuing with the access list.
+
+### Control: the Osaka chain with the same binaries
+
+One round (`osaka-ctl1`), everything as `yamux2` except the binaries carrying
+this round's fixes:
+
+| | `yamux2` | `osaka-ctl1` |
+|---|---:|---:|
+| win2 / win3 | 65,197 / 65,190 TPS | **70,632 / 70,631** |
+| cycle | 2.500 s | **2.308 s** |
+
+Windows 2 and 3 reproduce to the transaction, as they did before. One round is
+not a result by this file's rule; the candidate mechanism is the ingest gate no
+longer taking the pool's read lock 500 times a second per connection — the
+builder drains the same pool under the same lock — and it is measured properly
+with `fleet7-repeat.sh` before it is claimed.

@@ -47,7 +47,8 @@ pub mod forest;
 use alloy_primitives::{Address, B256, U256};
 pub use alloc::changes_from_alloc;
 pub use forest::{
-    ForestSnapshot, PreparedBlock, QmdbForest, StateProofProvider, DEFAULT_RETAIN_DEPTH,
+    ForestDelta, ForestSnapshot, PreparedBlock, QmdbForest, StateProofProvider,
+    DEFAULT_RETAIN_DEPTH,
 };
 use n42_twig_core::qmdb_compat::{
     encode_gov5_account_value, gov5_account_key, gov5_storage_key, QmdbCompatTree, QmdbOperation,
@@ -251,6 +252,20 @@ pub enum StateError {
         /// What re-application produced.
         got: B256,
     },
+    /// A delta was taken against, or applied to, a different append cursor than
+    /// the one it describes. A QMDB root depends on the append history, so a
+    /// delta applied to the wrong base does not produce a merely stale tree —
+    /// it produces one that never existed.
+    #[error("QMDB delta expected append cursor {expected}, found {found}")]
+    DeltaBase {
+        /// The cursor that was required.
+        expected: u64,
+        /// The cursor that was offered.
+        found: u64,
+    },
+    /// A delta named a slot the tree does not have.
+    #[error("QMDB delta names slot {0}, which the tree does not hold")]
+    DeltaSlot(u64),
 }
 
 /// A point the tree can be rolled back to.

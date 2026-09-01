@@ -1183,6 +1183,23 @@ impl QmdbCompatTree {
         upper[1]
     }
 
+    /// The entry at `slot`, if the tree has one.
+    ///
+    /// This is what lets a caller record what a block changed without walking
+    /// the whole leaf set: the slots a block appends are the contiguous range
+    /// above the previous append cursor, and the slots it deactivates are named
+    /// by its [`BlockUndo`]. Both are read one at a time through here, so the
+    /// cost of persisting a block is the size of the block rather than the size
+    /// of the state.
+    pub fn entry_at(&self, slot: u64) -> Option<QmdbEntrySnapshot> {
+        let entry = self.entries.get(usize::try_from(slot).ok()?)?;
+        Some(QmdbEntrySnapshot {
+            key: entry.key,
+            value: entry.value.clone(),
+            active: entry.active,
+        })
+    }
+
     pub fn snapshot(&self) -> QmdbSnapshot {
         QmdbSnapshot {
             next_slot: self.next_slot,

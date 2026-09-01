@@ -20,12 +20,12 @@
 //!
 //! The window of held blocks is bounded, so it stays a window.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use alloy_primitives::{Address, B256};
 use n42_twig_core::qmdb_compat::{
-    gov5_account_key, gov5_storage_key, BlockUndo, QmdbCompatTree, QmdbOperation, QmdbProof,
-    QmdbSnapshot,
+    gov5_account_key, gov5_storage_key, BlockUndo, QmdbCompatTree, QmdbEntrySnapshot,
+    QmdbOperation, QmdbProof, QmdbSnapshot,
 };
 use serde::{Deserialize, Serialize};
 
@@ -80,6 +80,92 @@ pub struct ForestSnapshot {
 impl ForestSnapshot {
     /// The layout this crate writes.
     pub const VERSION: u32 = 1;
+
+    /// Moves this snapshot forward by one delta, in place.
+    ///
+    /// The inverse of [`QmdbForest::delta_since`], and the reason a node can
+    /// restore its head without ever having written the whole tree at that
+    /// head: a checkpoint plus the deltas taken since it is the same state.
+    pub fn apply_delta(&mut self, delta: &ForestDelta) -> Result<(), StateError> {
+        if delta.version != ForestDelta::VERSION {
+            return Err(StateError::SnapshotVersion {
+                found: delta.version,
+                expected: ForestDelta::VERSION,
+            });
+        }
+        // A delta is only meaningful on the state it was taken against. Applying
+        // one to a different base would produce a tree that is neither the base
+        // nor the head, and whose root would be wrong in a way nothing downstream
+        // could attribute.
+        if delta.base_next_slot != self.tree.next_slot {
+            return Err(StateError::DeltaBase {
+                expected: self.tree.next_slot,
+                found: delta.base_next_slot,
+            });
+        }
+        // Everything is checked before anything is written. A delta that fails
+        // halfway leaves a snapshot that is neither state, and a caller holding
+        // one has no way to tell.
+        if delta.base_next_slot + delta.appended.len() as u64 != delta.next_slot {
+            return Err(StateError::DeltaBase {
+                expected: delta.next_slot,
+                found: delta.base_next_slot + delta.appended.len() as u64,
+            });
+        }
+        for (slot, _) in &delta.changed {
+            let index = usize::try_from(*slot).map_err(|_| StateError::DeltaSlot(*slot))?;
+            if index >= self.tree.entries.len() {
+                return Err(StateError::DeltaSlot(*slot));
+            }
+        }
+        for (slot, entry) in &delta.changed {
+            self.tree.entries[*slot as usize] = entry.clone();
+        }
+        self.tree.entries.extend(delta.appended.iter().cloned());
+        self.tree.next_slot = delta.next_slot;
+        self.head_number = delta.head_number;
+        self.head_hash = delta.head_hash;
+        Ok(())
+    }
+}
+
+/// What changed between one persisted head and the next.
+///
+/// QMDB only ever appends at a cursor and deactivates slots below it, so the
+/// whole of a move is a contiguous run of new slots plus the handful of older
+/// ones the block touched. That is what makes incremental persistence possible
+/// at all: writing this costs the size of the block, while writing a
+/// [`ForestSnapshot`] costs the size of the world state, every block.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForestDelta {
+    /// Layout version, checked on the way in.
+    pub version: u32,
+    /// The block this delta lands on.
+    pub head_number: u64,
+    /// Its hash.
+    pub head_hash: B256,
+    /// The append cursor this delta was taken against.
+    pub base_next_slot: u64,
+    /// The append cursor afterwards.
+    pub next_slot: u64,
+    /// Slots `base_next_slot..next_slot`, in order.
+    pub appended: Vec<QmdbEntrySnapshot>,
+    /// Slots below `base_next_slot` whose entry differs afterwards — in
+    /// practice the ones the moved blocks deactivated or revived.
+    pub changed: Vec<(u64, QmdbEntrySnapshot)>,
+}
+
+impl ForestDelta {
+    /// The layout this crate writes.
+    pub const VERSION: u32 = 1;
+
+    /// Roughly what this costs to store, for a caller deciding when a run of
+    /// deltas has grown longer than the checkpoint it is replacing.
+    pub fn weight(&self) -> usize {
+        let entry = |e: &QmdbEntrySnapshot| e.value.len() + 33;
+        self.appended.iter().map(entry).sum::<usize>()
+            + self.changed.iter().map(|(_, e)| entry(e) + 8).sum::<usize>()
+    }
 }
 
 /// What the forest remembers about a held block.
@@ -108,6 +194,20 @@ pub struct QmdbForest {
     records: HashMap<B256, BlockRecord>,
     head: (u64, B256),
     retain_depth: u64,
+    /// Slots the tree has deactivated or revived since the last delta was
+    /// taken. Every move of the tree goes through a [`BlockUndo`], and an undo
+    /// record names exactly the slots it flips, so recording them here — on the
+    /// way in and on the way out — describes that half of the move without
+    /// comparing two trees.
+    dirty_slots: BTreeSet<u64>,
+    /// The lowest the append cursor has been since the last delta was taken.
+    ///
+    /// The other half of a move, and the one that is easy to miss: reverting a
+    /// block rewinds the cursor, and the block applied in its place appends
+    /// over the very slots the reverted one held. Those slots were never
+    /// deactivated — they were abandoned and reused — so nothing names them but
+    /// the cursor's low-water mark.
+    min_cursor: u64,
 }
 
 impl QmdbForest {
@@ -147,6 +247,7 @@ impl QmdbForest {
 
     fn at(number: u64, hash: B256, tree: QmdbCompatTree) -> Self {
         let root = B256::from(tree.root());
+        let next_slot = tree.next_slot();
         let mut records = HashMap::new();
         records.insert(
             hash,
@@ -165,7 +266,16 @@ impl QmdbForest {
             records,
             head: (number, hash),
             retain_depth: DEFAULT_RETAIN_DEPTH,
+            dirty_slots: BTreeSet::new(),
+            min_cursor: next_slot,
         }
+    }
+
+    /// Records what a move touched: the slots the undo names, and how far back
+    /// it left the append cursor.
+    fn note_move(&mut self, undo: &BlockUndo) {
+        self.dirty_slots.extend(undo.entries.iter().map(|entry| entry.slot));
+        self.min_cursor = self.min_cursor.min(self.tree.next_slot());
     }
 
     /// Sets how many blocks behind the head are kept.
@@ -221,6 +331,7 @@ impl QmdbForest {
         self.move_to(parent)?;
         let ops = changes.operations();
         let (root, undo) = self.tree.apply_sorted_ops_recorded(ops.clone())?;
+        self.note_move(&undo);
         self.pending = Some((parent, undo));
         Ok(PreparedBlock {
             root: B256::from(root),
@@ -244,6 +355,7 @@ impl QmdbForest {
             Some((parent, undo)) if parent == prepared.parent => Some(undo),
             Some((_, undo)) => {
                 self.tree.apply_undo(&undo).map_err(|e| StateError::Undo(e.to_string()))?;
+                self.note_move(&undo);
                 None
             }
             None => None,
@@ -321,6 +433,74 @@ impl QmdbForest {
         })
     }
 
+    /// What changed between the state at `base_next_slot` and the canonical
+    /// head, and clears the record so the next call describes the next move.
+    ///
+    /// The caller owns the pairing: `base_next_slot` must be the cursor of the
+    /// state this delta will be applied to, which is the `next_slot` the last
+    /// delta (or checkpoint) left behind. A mismatch is refused by
+    /// [`ForestSnapshot::apply_delta`] rather than silently producing a wrong
+    /// tree.
+    pub fn delta_since(&mut self, base_next_slot: u64) -> Result<ForestDelta, StateError> {
+        let head = self.head.1;
+        self.move_to(head)?;
+        let next_slot = self.tree.next_slot();
+        if base_next_slot > next_slot {
+            return Err(StateError::DeltaBase {
+                expected: next_slot,
+                found: base_next_slot,
+            });
+        }
+        let appended = (base_next_slot..next_slot)
+            .map(|slot| self.tree.entry_at(slot).ok_or(StateError::DeltaSlot(slot)))
+            .collect::<Result<Vec<_>, _>>()?;
+        // What lies below the base and may differ from it: the slots a move
+        // flipped, plus every slot the cursor was rewound past and then
+        // re-appended over. Slots above the base need no entry here — they are
+        // already carried by `appended`, at their current value.
+        let rewound_from = self.min_cursor.min(base_next_slot);
+        let changed = self
+            .dirty_slots
+            .iter()
+            .copied()
+            .filter(|slot| *slot < base_next_slot)
+            .chain(rewound_from..base_next_slot)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|slot| {
+                self.tree.entry_at(slot).map(|entry| (slot, entry)).ok_or(StateError::DeltaSlot(slot))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.dirty_slots.clear();
+        self.min_cursor = next_slot;
+        Ok(ForestDelta {
+            version: ForestDelta::VERSION,
+            head_number: self.head.0,
+            head_hash: head,
+            base_next_slot,
+            next_slot,
+            appended,
+            changed,
+        })
+    }
+
+    /// The append cursor the tree currently stands at — what a caller pairs
+    /// with a checkpoint so the next [`Self::delta_since`] lands on it.
+    pub fn next_slot(&self) -> u64 {
+        self.tree.next_slot()
+    }
+
+    /// Forgets what has changed, without describing it.
+    ///
+    /// For a caller that has just written the whole tree: the changes are in
+    /// that snapshot, and the next delta must be measured from it rather than
+    /// carrying them a second time. Taking a delta and dropping it would do the
+    /// same, at the cost of copying every changed entry to discard it.
+    pub fn forget_changes(&mut self) {
+        self.dirty_slots.clear();
+        self.min_cursor = self.tree.next_slot();
+    }
+
     /// Proves an account at the canonical head.
     pub fn prove_account(&mut self, address: Address) -> Option<QmdbProof> {
         self.move_to(self.head.1).ok()?;
@@ -338,6 +518,7 @@ impl QmdbForest {
     fn move_to(&mut self, target: B256) -> Result<(), StateError> {
         if let Some((_, undo)) = self.pending.take() {
             self.tree.apply_undo(&undo).map_err(|e| StateError::Undo(e.to_string()))?;
+            self.note_move(&undo);
         }
         if self.tip == target {
             return Ok(());
@@ -372,6 +553,7 @@ impl QmdbForest {
             self.tree
                 .apply_undo(&undo)
                 .map_err(|e| StateError::Undo(e.to_string()))?;
+            self.note_move(&undo);
         }
         self.tip = common;
 
@@ -388,12 +570,14 @@ impl QmdbForest {
                 .records
                 .get(hash)
                 .ok_or(StateError::UnknownBlock(*hash))?;
-            let (root, undo) = self.tree.apply_sorted_ops_recorded(record.ops.clone())?;
+            let (ops, expected) = (record.ops.clone(), record.root);
+            let (root, undo) = self.tree.apply_sorted_ops_recorded(ops)?;
+            self.note_move(&undo);
             let root = B256::from(root);
-            if root != record.root {
+            if root != expected {
                 return Err(StateError::Replay {
                     block: *hash,
-                    expected: record.root,
+                    expected,
                     got: root,
                 });
             }
@@ -527,6 +711,90 @@ mod tests {
         let mut linear = QmdbForest::genesis(GENESIS, &BlockChanges::new()).unwrap();
         assert_eq!(linear.apply(GENESIS, h(0x0A), 1, &changes(1)).unwrap(), root_a);
         assert_eq!(linear.apply(h(0x0A), h(0xA2), 2, &changes(3)).unwrap(), root_a2);
+    }
+
+    /// The property the delta log rests on: a checkpoint plus the deltas taken
+    /// since it is the same tree as a snapshot taken at the end, slot for slot
+    /// and root for root. Anything less and a restarted node would compute a
+    /// root nobody else does.
+    #[test]
+    fn checkpoint_plus_deltas_is_the_same_tree_as_a_snapshot() {
+        let mut forest = QmdbForest::genesis(GENESIS, &changes(0xF0)).unwrap();
+        let mut replayed = forest.snapshot().unwrap();
+        let mut cursor = forest.next_slot();
+
+        // Forty blocks, each rewriting an account the last few blocks also
+        // wrote, so slots are deactivated below the cursor as well as appended
+        // above it.
+        let mut parent = GENESIS;
+        for number in 1..=40u8 {
+            let hash = h(number);
+            forest.apply(parent, hash, number as u64, &changes(number % 7)).unwrap();
+            forest.set_canonical(hash).unwrap();
+            let delta = forest.delta_since(cursor).unwrap();
+            cursor = delta.next_slot;
+            replayed.apply_delta(&delta).unwrap();
+            parent = hash;
+        }
+
+        let direct = forest.snapshot().unwrap();
+        assert_eq!(replayed.head_hash, direct.head_hash);
+        assert_eq!(replayed.head_number, direct.head_number);
+        assert_eq!(replayed.tree, direct.tree, "the replayed leaf set is the written one");
+        assert_eq!(
+            QmdbForest::from_snapshot(&replayed).unwrap().root(),
+            forest.root(),
+            "and it hashes to the same QMDB root",
+        );
+    }
+
+    /// The same, across a branch switch. A delta taken after the forest moved
+    /// off a sibling has to carry the slots that move revived, not only the
+    /// ones the new block appended.
+    #[test]
+    fn a_delta_taken_after_a_branch_switch_carries_the_revert() {
+        let mut forest = QmdbForest::genesis(GENESIS, &changes(0xF0)).unwrap();
+        let mut replayed = forest.snapshot().unwrap();
+        let mut cursor = forest.next_slot();
+
+        forest.apply(GENESIS, h(0x0A), 1, &changes(1)).unwrap();
+        forest.set_canonical(h(0x0A)).unwrap();
+        let delta = forest.delta_since(cursor).unwrap();
+        cursor = delta.next_slot;
+        replayed.apply_delta(&delta).unwrap();
+
+        // A sibling of A wins, and then a child of it.
+        forest.apply(GENESIS, h(0x0B), 1, &changes(2)).unwrap();
+        forest.apply(h(0x0B), h(0xB2), 2, &changes(3)).unwrap();
+        forest.set_canonical(h(0xB2)).unwrap();
+        let delta = forest.delta_since(cursor).unwrap();
+        replayed.apply_delta(&delta).unwrap();
+
+        let direct = forest.snapshot().unwrap();
+        assert_eq!(replayed.tree, direct.tree);
+        assert_eq!(QmdbForest::from_snapshot(&replayed).unwrap().root(), forest.root());
+    }
+
+    /// A delta is refused by the state it does not describe. Applying one to
+    /// the wrong base would give a tree that never existed, and a root that
+    /// nothing downstream could attribute to a block.
+    #[test]
+    fn a_delta_is_refused_on_the_wrong_base() {
+        let mut forest = QmdbForest::genesis(GENESIS, &changes(0xF0)).unwrap();
+        let base = forest.snapshot().unwrap();
+        let cursor = forest.next_slot();
+        forest.apply(GENESIS, h(0x0A), 1, &changes(1)).unwrap();
+        forest.set_canonical(h(0x0A)).unwrap();
+        let first = forest.delta_since(cursor).unwrap();
+        forest.apply(h(0x0A), h(0x0B), 2, &changes(2)).unwrap();
+        forest.set_canonical(h(0x0B)).unwrap();
+        let second = forest.delta_since(first.next_slot).unwrap();
+
+        let mut skipped = base;
+        assert!(
+            matches!(skipped.apply_delta(&second), Err(StateError::DeltaBase { .. })),
+            "a delta that skips its predecessor is refused, not applied",
+        );
     }
 
     #[test]

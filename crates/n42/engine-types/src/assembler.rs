@@ -29,22 +29,57 @@ use reth_evm::{
 };
 use reth_evm_ethereum::EthBlockAssembler;
 use reth_primitives_traits::{logs_bloom, Receipt, SignedTransaction};
+use std::sync::{Arc, Mutex};
+
+/// The QMDB root, computed while the transactions trie is.
+///
+/// The root is over the execution's bundle, which the assembler is handed,
+/// and it used to be computed by the payload builder *after* assembly: 63-113
+/// ms at the 163,000-transaction tier, one after the other with a
+/// transactions trie of about the same size. The two are independent, so the
+/// assembler runs them side by side and leaves the result here for the
+/// payload builder to collect.
+pub struct QmdbRootJob {
+    /// The forest to compute against.
+    pub state: n42_qmdb_reth::QmdbNodeState,
+    /// The block's parent, which the tree is computed on top of.
+    pub parent: alloy_primitives::B256,
+    /// Whether Prague is active at the block, which changes how the bundle is
+    /// read.
+    pub prague: bool,
+    /// Where the result goes. `None` until the assembler has run.
+    pub out: Arc<Mutex<Option<Result<n42_qmdb_reth::PreparedBlock, String>>>>,
+}
+
+impl std::fmt::Debug for QmdbRootJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QmdbRootJob").field("parent", &self.parent).field("prague", &self.prague).finish_non_exhaustive()
+    }
+}
 
 /// [`EthBlockAssembler`], with the roots precomputed the way described in the
 /// module documentation.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct N42BlockAssembler<ChainSpec> {
     inner: EthBlockAssembler<ChainSpec>,
     /// Whether the chain's header profile replaces the receipts root, so the
     /// trie need not be built.
     hotstuff: bool,
+    /// The QMDB root to compute alongside, on a QMDB chain.
+    qmdb: Option<QmdbRootJob>,
 }
 
 impl<ChainSpec> N42BlockAssembler<ChainSpec> {
     /// Wraps reth's assembler. `hotstuff` says the receipts root will be
     /// replaced by the payload builder and need not be computed.
     pub const fn new(inner: EthBlockAssembler<ChainSpec>, hotstuff: bool) -> Self {
-        Self { inner, hotstuff }
+        Self { inner, hotstuff, qmdb: None }
+    }
+
+    /// Computes the QMDB root during assembly as well. See [`QmdbRootJob`].
+    pub fn with_qmdb_root(mut self, job: QmdbRootJob) -> Self {
+        self.qmdb = Some(job);
+        self
     }
 }
 
@@ -78,8 +113,21 @@ where
     ) -> Result<Self::Block, BlockExecutionError> {
         let receipts = &input.output.receipts;
         let hotstuff = self.hotstuff;
+        let bundle = input.bundle_state;
         let (transactions_root, (receipts_root, bloom)) = rayon::join(
-            || parallel_transaction_root(&input.transactions),
+            || {
+                rayon::join(
+                    || parallel_transaction_root(&input.transactions),
+                    || {
+                        if let Some(job) = &self.qmdb {
+                            let changes = n42_qmdb_reth::changes_from_execution(bundle, job.prague);
+                            let prepared = job.state.compute(job.parent, &changes).map_err(|e| e.to_string());
+                            *job.out.lock().unwrap_or_else(|p| p.into_inner()) = Some(prepared);
+                        }
+                    },
+                )
+                .0
+            },
             || {
                 let bloom = logs_bloom(receipts.iter().flat_map(|r| r.logs()));
                 // Replaced by gov5's keccak-of-receipts in the payload builder;

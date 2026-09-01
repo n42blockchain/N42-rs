@@ -2450,3 +2450,71 @@ not a result by this file's rule; the candidate mechanism is the ingest gate no
 longer taking the pool's read lock 500 times a second per connection — the
 builder drains the same pool under the same lock — and it is measured properly
 with `fleet7-repeat.sh` before it is claimed.
+
+## Round 22: the leader's build, taken apart
+
+### What the builder actually spends
+
+The payload builder now logs its phases per block. At the 163,000-transaction
+tier, before anything was changed:
+
+| phase | ms |
+|---|---:|
+| pool (best transactions) | 72-97 |
+| EVM execution | 184-273 |
+| `builder.finish` (transactions trie, receipts trie, bloom) | **262-286** |
+| QMDB root | 63-113 |
+| assembly | 7 |
+| total | 613-783 |
+
+Execution is 1.3 µs a transaction, the same as N42-26's 229 ms for the same
+block. The largest phase was the assembly, and half of it was a receipts trie
+that the HotStuff header profile overwrites with gov5's keccak a moment later.
+
+And the validator sees more than the builder spends: 862-917 ms for a build
+whose function took 650-780, plus 125-149 ms to seal — the seal decoded the
+whole payload to construct the header it stamps.
+
+### N42-26's number is a different measurement
+
+Their devlogs (read for the first time in full this round) settle what
+156,499 — now 170,546 — is: a *controlled benchmark* mode by their own
+`performance-records.md`. `N42_SKIP_TX_VERIFY=1`, a presigned ingest whose
+sender the server trusts, and a leader payload cache with a follower fast path
+that on a cache hit skips the EVM, the transactions root, the hashed post-state
+and post-execution validation entirely (follower import 57 ms, EVM 0 ms). Their
+parallel executor has never run in the live path
+(`n42_parallel_evm_blocks_total = 0`). Every follower on this fleet executes
+every block. The two numbers are not the same thing, and this file keeps
+measuring the one where they do.
+
+### Two changes, two rounds
+
+**`n42Engine_getPayloadRaw`** — the built block as RLP instead of a 24 MB JSON
+document with 163,000 hex strings in it, split into the header and each
+transaction's bytes without decoding any of them, and the seal applied to the
+header alone (`raw1`).
+
+**The assembler** — the transactions root with its encodings produced in
+parallel, the receipts trie not built on a HotStuff chain (`asm1`).
+
+| | `osaka-ctl` (3 runs) | `raw1` | `asm1` |
+|---|---:|---:|---:|
+| win2 / win3 | 65,198 / 70,606 | 76,058 / 70,624 | **81,497 / 81,497** |
+| cycle | 2.3-2.5 s | 2.14-2.31 s | **2.00 s** |
+| seal | 125-149 ms | **4-6 ms** | 4-5 ms |
+| build, validator's view | 862-917 ms | 817-887 ms | **642-692 ms** |
+| `finish` | 262-286 ms | — | **104-122 ms** |
+| leader commit -> body published | 1,069 ms | 925 ms | **733 ms** |
+
+The raw path bought less than expected on the build itself (the JSON was not
+the 150-200 ms the gap suggested; the seal was) and the assembler bought what
+its phase said it would. Windows 2 and 3 of `asm1` are identical to the
+transaction, at 15 blocks a window.
+
+What is left on the leader: pool 75, execution 230, transactions trie ~110,
+QMDB root ~100, and ~100 ms between the builder finishing and the validator
+holding the block. On the follower: 684 ms from payload to canonical, of
+which execution is ~584 — 2.5x what the builder spends executing the same
+transactions. That ratio is the next thing to explain, with a profile rather
+than a guess.

@@ -423,10 +423,23 @@ where
     let block_ctx = evm_config
         .context_for_next_block(&parent_header, next_attributes)
         .map_err(PayloadBuilderError::other)?;
+    // The QMDB root is computed inside assembly, beside the transactions
+    // trie, and collected from here afterwards.
+    let qmdb_root: Arc<std::sync::Mutex<Option<Result<n42_qmdb_reth::PreparedBlock, String>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let mut assembler = crate::assembler::N42BlockAssembler::new(EthBlockAssembler::new(chain_spec.clone()), hotstuff);
+    if let Some(state) = &qmdb {
+        assembler = assembler.with_qmdb_root(crate::assembler::QmdbRootJob {
+            state: state.clone(),
+            parent: parent_header.hash(),
+            prague: chain_spec.is_prague_active_at_timestamp(attributes.timestamp),
+            out: qmdb_root.clone(),
+        });
+    }
     let mut builder: reth_evm::execute::BasicBlockBuilder<'_, EvmConfig::BlockExecutorFactory, _, _, EthPrimitives> = reth_evm::execute::BasicBlockBuilder {
         executor: evm_config.create_executor(evm, block_ctx.clone()),
         ctx: block_ctx,
-        assembler: crate::assembler::N42BlockAssembler::new(EthBlockAssembler::new(chain_spec.clone()), hotstuff),
+        assembler,
         parent: &parent_header,
         transactions: Vec::new(),
     };
@@ -613,16 +626,25 @@ where
                 builder.finish(&state_provider, Some((B256::ZERO, TrieUpdates::default())))?;
             let finish_took = finish_at.elapsed();
             let root_at = std::time::Instant::now();
-            let bundle = db.take_bundle();
-            let prepared = state
-                .compute(
-                    parent_header.hash(),
-                    &changes_from_execution(
-                        &bundle,
-                        chain_spec.is_prague_active_at_timestamp(attributes.timestamp),
-                    ),
-                )
-                .map_err(PayloadBuilderError::other)?;
+            // Computed during assembly (see `assembler`); the fallback below
+            // is for an assembler that did not run the job, which does not
+            // happen, and it is cheaper to keep than to reason about.
+            let prepared = match qmdb_root.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                Some(Ok(prepared)) => prepared,
+                Some(Err(err)) => return Err(PayloadBuilderError::other(std::io::Error::other(err))),
+                None => {
+                    let bundle = db.take_bundle();
+                    state
+                        .compute(
+                            parent_header.hash(),
+                            &changes_from_execution(
+                                &bundle,
+                                chain_spec.is_prague_active_at_timestamp(attributes.timestamp),
+                            ),
+                        )
+                        .map_err(PayloadBuilderError::other)?
+                }
+            };
             (outcome, Some(prepared), finish_took, root_at.elapsed())
         }
         None => {

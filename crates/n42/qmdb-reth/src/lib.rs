@@ -35,5 +35,7 @@ pub use changes::{
     changes_from_alloc, changes_from_bundle, changes_from_execution, with_prague_system_caller,
 };
 pub use hotstuff::{GenesisValidator, HotStuffConfigError, HotStuffGenesisConfig};
+/// The tree a producer computed for a block it has not yet sealed.
+pub use n42_qmdb_state::forest::PreparedBlock;
 pub use node_state::{NodeStateError, QmdbNodeState};
 pub use strategy::{QmdbEngineValidatorBuilder, QmdbStateRootStrategy};

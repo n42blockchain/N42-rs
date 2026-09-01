@@ -79,6 +79,12 @@ pub struct EngineApiClient<T> {
     /// requires it, so a build's root has to survive from the request that
     /// started it to the response that collects it.
     builds: Mutex<(HashMap<PayloadId, B256>, Vec<PayloadId>)>,
+    /// Where in [`FCU_WITH_ATTRS_METHODS`] the last accepted build-starting
+    /// call was, so the ladder is climbed once per chain rather than once per
+    /// build: a pre-Amsterdam chain refuses V4 on every leader build, and a
+    /// refused round trip on the leader's path is a refused round trip on the
+    /// fleet's cycle.
+    fcu_rung: std::sync::atomic::AtomicUsize,
 }
 
 impl<T: JsonRpcTransport> EngineApiClient<T> {
@@ -87,6 +93,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
         Self {
             transport,
             builds: Mutex::new((HashMap::new(), Vec::new())),
+            fcu_rung: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -485,7 +492,12 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
         };
         let mut last: Option<ElError> = None;
         let mut updated: Option<ForkchoiceUpdated> = None;
-        for &method in ladder {
+        // Start from the rung that answered last time. The chain does not
+        // change fork under a running client, so a version it refused once it
+        // refuses every time, and paying that refusal per build was measured
+        // as one more round trip on every leader path of a pre-Amsterdam fleet.
+        let start = self.fcu_rung.load(std::sync::atomic::Ordering::Relaxed).min(ladder.len() - 1);
+        for (rung, &method) in ladder.iter().enumerate().skip(start) {
             let mut attempt = attrs.clone();
             if method == "engine_forkchoiceUpdatedV3" {
                 attempt.slot_number = None;
@@ -493,6 +505,7 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
             debug!(target: "n42.h2.el", method, "forkchoiceUpdated with attributes");
             match self.call(method, vec![json!(state), json!(attempt)]).await {
                 Ok(value) => {
+                    self.fcu_rung.store(rung, std::sync::atomic::Ordering::Relaxed);
                     updated = Some(value);
                     break;
                 }

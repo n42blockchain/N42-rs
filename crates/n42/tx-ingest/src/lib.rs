@@ -56,8 +56,8 @@
 //! Not a peer protocol and not authenticated. It hands transactions to the pool
 //! exactly as `eth_sendRawTransaction` does — the pool validates every one, and
 //! recovering the sender is the bulk of that — so it can admit nothing the RPC
-//! could not. It is off unless a `--tx-ingest` address is given, and it should
-//! be bound to loopback.
+//! could not. It is off unless `N42_TX_INGEST=<addr>` is set, and it should be
+//! bound to loopback.
 
 use std::net::SocketAddr;
 
@@ -132,7 +132,8 @@ async fn serve_connection<P>(
     cache: Option<reth_evm::SenderRecoveryCache>,
 ) -> std::io::Result<()>
 where
-    P: TransactionPool,
+    P: TransactionPool + 'static,
+    P::Transaction: 'static,
 {
     let gate = high_water();
     // Nagle would batch the acknowledgements into the next read's latency, and
@@ -168,11 +169,17 @@ where
         // chain has taken a block out of the pool, and the client hears nothing
         // until then, which is the whole difference between backpressure and a
         // generator burning its budget on retries.
-        while pool.pending_transactions().len() >= gate {
+        //
+        // Read off the pool's size counters, not `pending_transactions()`:
+        // that one takes the pool's read lock and clones every pending
+        // transaction's `Arc` into a fresh `Vec`, which at a 100,000-deep pool
+        // polled every 2 ms by 32 connections is a few hundred million refcount
+        // touches a second under the same lock the pool admits through.
+        while pool.pool_size().pending >= gate {
             tokio::time::sleep(GATE_POLL).await;
         }
-        let accepted = admit(&pool, raws, cache.as_ref()).await;
-        let pending = u32::try_from(pool.pending_transactions().len()).unwrap_or(u32::MAX);
+        let accepted = admit(&pool, raws, cache.clone()).await;
+        let pending = u32::try_from(pool.pool_size().pending).unwrap_or(u32::MAX);
         stream.write_u32_le(accepted).await?;
         stream.write_u32_le(pending).await?;
     }
@@ -187,8 +194,41 @@ where
 async fn admit<P>(
     pool: &P,
     raws: Vec<Bytes>,
-    cache: Option<&reth_evm::SenderRecoveryCache>,
+    cache: Option<reth_evm::SenderRecoveryCache>,
 ) -> u32
+where
+    P: TransactionPool + 'static,
+    P::Transaction: 'static,
+{
+    // Decoding and sender recovery are CPU work -- ~50 us of secp256k1 per
+    // transaction, so a 10,000-transaction frame is half a second -- and they
+    // used to run on the runtime's worker thread, where every other connection
+    // on that thread, and the pool's own futures, waited behind them. Blocking
+    // threads are for exactly this.
+    let decoded = match tokio::task::spawn_blocking(move || decode_and_recover::<P>(raws, cache.as_ref())).await {
+        Ok(decoded) => decoded,
+        Err(err) => {
+            warn!(target: "n42.tx_ingest", %err, "sender recovery task failed");
+            return 0;
+        }
+    };
+    if decoded.is_empty() {
+        return 0;
+    }
+    // `External`, the same origin `eth_sendRawTransaction` uses for a
+    // transaction that did not come from this node: it is validated, priced and
+    // gossiped exactly as one that arrived over RPC.
+    let results = pool.add_transactions(TransactionOrigin::External, decoded).await;
+    let accepted = results.iter().filter(|outcome| outcome.is_ok()).count();
+    u32::try_from(accepted).unwrap_or(u32::MAX)
+}
+
+/// Decodes a frame's transactions and recovers their senders, on the calling
+/// thread.
+fn decode_and_recover<P>(
+    raws: Vec<Bytes>,
+    cache: Option<&reth_evm::SenderRecoveryCache>,
+) -> Vec<P::Transaction>
 where
     P: TransactionPool,
 {
@@ -220,13 +260,5 @@ where
             Err(err) => debug!(target: "n42.tx_ingest", %err, "undecodable transaction"),
         }
     }
-    if decoded.is_empty() {
-        return 0;
-    }
-    // `External`, the same origin `eth_sendRawTransaction` uses for a
-    // transaction that did not come from this node: it is validated, priced and
-    // gossiped exactly as one that arrived over RPC.
-    let results = pool.add_transactions(TransactionOrigin::External, decoded).await;
-    let accepted = results.iter().filter(|outcome| outcome.is_ok()).count();
-    u32::try_from(accepted).unwrap_or(u32::MAX)
+    decoded
 }

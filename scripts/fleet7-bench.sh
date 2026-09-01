@@ -131,6 +131,7 @@ export F7_BLOCK_INTERVAL_MS=${F7_BLOCK_INTERVAL_MS:-1000}
 export F7_VIEW_TIMEOUT_MS=${F7_VIEW_TIMEOUT_MS:-}
 export F7_ROOT=${F7_ROOT:-/data/blockchain/rust-fleet7-bench}
 source "$HERE/fleet7-env.sh"
+f7_check_binary_fresh || exit 1
 
 OUT=$F7_ROOT/bench-$TAG
 mkdir -p "$OUT"

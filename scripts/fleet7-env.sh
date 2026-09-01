@@ -24,6 +24,26 @@ REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 : "${F7_ROOT:=/data/blockchain/rust-fleet7}"
 : "${F7_GENESIS:=$REPO/crates/chainspec/res/genesis/n42_fleet7.json}"
 : "${F7_BIN:=$REPO/target/release}"
+
+# Refuse to launch a validator binary older than the code it was built from.
+#
+# A round takes minutes and reports a number whatever it measured, so a stale
+# binary is not an error that announces itself -- it is a result, filed against
+# the wrong change. This session came within one command of measuring a reverted
+# edit because the binary was built at 07:45 and the source reverted at 07:54.
+# F7_SKIP_STALE_CHECK=1 for the rare case where that is deliberate.
+f7_check_binary_fresh() {
+  local bin=$F7_BIN/examples/h2_validator newest
+  [[ ${F7_SKIP_STALE_CHECK:-0} == 1 ]] && return 0
+  [[ -x $bin ]] || return 0
+  newest=$(find "$REPO/crates/n42/h2-node" "$REPO/crates/n42/h2-net"                 "$REPO/crates/n42/h2-consensus" "$REPO/crates/n42/h2-execution"                 "$REPO/crates/n42/h2-el-rpc"                 -name '*.rs' -newer "$bin" -print -quit 2>/dev/null)
+  [[ -z $newest ]] && return 0
+  echo "REFUSING: $bin is older than $newest" >&2
+  echo "  A round would measure the previous build and report it as this one." >&2
+  echo "  cargo build --release -p n42-h2-node --example h2_validator" >&2
+  echo "  (F7_SKIP_STALE_CHECK=1 to run anyway)" >&2
+  return 1
+}
 : "${F7_NODES:=7}"
 : "${F7_SEED:=n42-fleet7-validator}"
 

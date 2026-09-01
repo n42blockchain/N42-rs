@@ -138,6 +138,26 @@ pub trait ExecutionLayer: Send + Sync + 'static {
         let _ = raw;
         Err(ElError::new("the execution layer does not accept transactions here"))
     }
+
+    /// Hands a batch of transactions to the pool, returning how many it took.
+    ///
+    /// One call for many transactions, because the caller is a consensus loop.
+    /// Forwarding a gossiped batch one round trip at a time blocks that loop for
+    /// as long as the batch takes — measured on the seven-node fleet as a
+    /// median block cycle of 0.5 s with a p90 of 6 s and a p99 body arrival of
+    /// 14 s, because the libp2p swarm is not polled while the loop is inside
+    /// those awaits. The default implementation is the sequential one, so an
+    /// execution layer that has nothing better keeps working; the JSON-RPC
+    /// client overrides it with a single batched request.
+    async fn send_raw_transactions(&self, raws: Vec<alloy_primitives::Bytes>) -> usize {
+        let mut accepted = 0;
+        for raw in raws {
+            if self.send_raw_transaction(raw).await.is_ok() {
+                accepted += 1;
+            }
+        }
+        accepted
+    }
     /// Engine-API `newPayload` — insert and validate a block.
     async fn new_payload(&self, payload: ExecutionData) -> Result<PayloadStatus, ElError>;
 

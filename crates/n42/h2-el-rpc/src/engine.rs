@@ -343,6 +343,26 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
             .map_err(|e| ElError::new(e.to_string()))
     }
 
+    async fn send_raw_transactions(&self, raws: Vec<alloy_primitives::Bytes>) -> usize {
+        // Chunked, because a batch is one HTTP body and the execution layer
+        // caps how large that may be (reth's `--rpc.max-request-size`, 15 MB by
+        // default). A hex-encoded transfer is a few hundred bytes of JSON, so
+        // a thousand of them is comfortably inside any such limit while still
+        // being a thousand round trips saved.
+        const CHUNK: usize = 1000;
+        let mut accepted = 0;
+        for chunk in raws.chunks(CHUNK) {
+            accepted += self
+                .transport
+                .call_many(
+                    "eth_sendRawTransaction",
+                    chunk.iter().map(|raw| vec![json!(raw)]).collect(),
+                )
+                .await;
+        }
+        accepted
+    }
+
     async fn new_payload(&self, payload: ExecutionData) -> Result<PayloadStatus, ElError> {
         let (method, params) = new_payload_call(&payload)?;
         debug!(target: "n42.h2.el", method, "newPayload");

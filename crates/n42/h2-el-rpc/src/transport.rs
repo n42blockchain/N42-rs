@@ -68,6 +68,24 @@ pub enum TransportError {
 pub trait JsonRpcTransport: Send + Sync + 'static {
     /// Sends one call and returns its `result` field.
     async fn call(&self, method: &str, params: Vec<Value>) -> Result<Value, TransportError>;
+
+    /// Sends the same method many times in one request, returning how many
+    /// succeeded.
+    ///
+    /// The caller that needs this is a consensus loop forwarding a gossiped
+    /// batch of transactions: one round trip each blocks that loop for the
+    /// length of the batch, and nothing else — including the libp2p swarm —
+    /// runs while it does. The default is the sequential version, so a
+    /// transport with nothing better still works.
+    async fn call_many(&self, method: &str, params_each: Vec<Vec<Value>>) -> usize {
+        let mut ok = 0;
+        for params in params_each {
+            if self.call(method, params).await.is_ok() {
+                ok += 1;
+            }
+        }
+        ok
+    }
 }
 
 /// The authenticated HTTP transport an Engine API endpoint expects.
@@ -114,6 +132,42 @@ impl HttpTransport {
 
 #[async_trait::async_trait]
 impl JsonRpcTransport for HttpTransport {
+    /// One HTTP request carrying a JSON-RPC array. Elements are independent —
+    /// some accepted, some refused — so this counts the results rather than
+    /// failing the batch, and a malformed answer counts as none accepted rather
+    /// than as one failure.
+    async fn call_many(&self, method: &str, params_each: Vec<Vec<Value>>) -> usize {
+        if params_each.is_empty() {
+            return 0;
+        }
+        let body: Vec<Value> = params_each
+            .into_iter()
+            .map(|params| {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": self.next_id.fetch_add(1, Ordering::Relaxed),
+                    "method": method,
+                    "params": params,
+                })
+            })
+            .collect();
+        let Ok(bearer) = self.bearer() else { return 0 };
+        let response = self
+            .client
+            .post(self.url.clone())
+            .header(reqwest::header::AUTHORIZATION, bearer)
+            .json(&body)
+            .send()
+            .await;
+        let Ok(response) = response else { return 0 };
+        match response.json::<Value>().await {
+            Ok(Value::Array(results)) => {
+                results.iter().filter(|r| r.get("error").is_none()).count()
+            }
+            _ => 0,
+        }
+    }
+
     async fn call(&self, method: &str, params: Vec<Value>) -> Result<Value, TransportError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let body = json!({

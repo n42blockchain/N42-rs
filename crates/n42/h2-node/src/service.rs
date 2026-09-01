@@ -219,6 +219,10 @@ pub struct H2Service<E> {
     /// arrives and still does not let the block execute cannot start the
     /// request over immediately. Bounded; insertion order in
     /// `body_requested_order`.
+    /// Whether a leader also hands its body straight to each member. Off by
+    /// default: it is additive on the wire, but it is this node's own protocol
+    /// and a fleet should be able to run without it.
+    direct_push: bool,
     body_requested_at: std::collections::HashMap<B256, std::time::Instant>,
     body_requested_order: std::collections::VecDeque<B256>,
     /// Height of the last block the execution layer is known to have
@@ -477,6 +481,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             header_profile: HeaderProfile::Ethereum,
             native_wire: false,
             awaiting_bodies: HashSet::new(),
+            direct_push: false,
             body_requested_at: std::collections::HashMap::new(),
             body_requested_order: std::collections::VecDeque::new(),
             imported_height: None,
@@ -580,6 +585,19 @@ impl<E: ExecutionLayer> H2Service<E> {
         attributes: impl Fn(ProposalContext) -> Option<PayloadAttributes> + Send + Sync + 'static,
     ) -> Self {
         self.payload_attributes = Some(Box::new(attributes));
+        self
+    }
+
+    /// Also hands each block body straight to every connected member, rather
+    /// than only publishing it to the mesh.
+    ///
+    /// Measured on a seven-node fleet: a body reaches a follower in 30 ms at
+    /// the median and 1.1 s at the p90, and the p90 is the mesh queueing rather
+    /// than the bytes — encoding and compressing a whole 480M-gas block is
+    /// 4 ms. The topic remains the fallback for members this node is not
+    /// connected to and for every gov5 member.
+    pub const fn with_direct_block_push(mut self, enabled: bool) -> Self {
+        self.direct_push = enabled;
         self
     }
 
@@ -964,6 +982,32 @@ impl<E: ExecutionLayer> H2Service<E> {
                     debug!(target: "n42.h2.node", %peer, ?hash, reason, "peer does not have a requested block");
                 }
             },
+            TransportEvent::BlockPushed { peer, chunk } => {
+                // A body the leader sent without being asked. It goes through
+                // the same decode as a fetched one and is identified by what it
+                // decodes to rather than by anything the sender claimed, so an
+                // unsolicited push can introduce nothing a fetch could not.
+                // Arriving twice — pushed and then gossiped — costs one decode:
+                // everything below is idempotent, and `awaiting_bodies` has
+                // already been emptied by whichever copy came first.
+                match decode_block_rlp(&chunk.rlp, self.header_profile) {
+                    Ok(block) => {
+                        let hash = block.block_hash;
+                        if !self.body_store.contains_key(&hash) {
+                            self.remember_block(hash, &block.header);
+                            self.remember_body(hash, chunk.rlp);
+                            self.driver.cache_payload(hash, block.execution_data());
+                            if self.awaiting_bodies.remove(&hash) {
+                                self.ready_bodies.push(hash);
+                            }
+                            self.received_bodies.push(hash);
+                        }
+                    }
+                    Err(err) => {
+                        debug!(target: "n42.h2.node", %peer, %err, "a pushed body could not be read");
+                    }
+                }
+            }
             TransportEvent::BlockFetchFailed { peer, hash, reason } => {
                 debug!(target: "n42.h2.node", %peer, ?hash, reason, "block request failed");
             }
@@ -1713,6 +1757,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             .and_then(|rlp| compress_block_rlp(&rlp).map(|data| (rlp, data)))
         {
             Ok((rlp, data)) => {
+                self.push_body(&rlp, block_hash);
                 self.remember_body(block_hash, rlp);
                 data
             }
@@ -1724,6 +1769,21 @@ impl<E: ExecutionLayer> H2Service<E> {
             }
         };
         self.send_body(data, block_hash);
+    }
+
+    /// Hands the body straight to every connected member, alongside the topic.
+    ///
+    /// The mesh is the fallback rather than the other way round: a push reaches
+    /// a member in one hop, and the topic reaches the ones this node is not
+    /// connected to and every gov5 member, which does not speak the protocol.
+    /// A body that arrives twice costs one decode and is then recognised as
+    /// held.
+    fn push_body(&mut self, rlp: &[u8], block_hash: B256) {
+        if !self.direct_push {
+            return;
+        }
+        let sent = self.transport.push_block_to_all(&rlp);
+        debug!(target: "n42.h2.node", ?block_hash, peers = sent, "pushed the body to the fleet");
     }
 
     fn send_body(&mut self, data: Vec<u8>, block_hash: B256) {

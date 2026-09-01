@@ -1218,6 +1218,7 @@ rather than one number. Two levers went through it:
 | baseline (genesis timeout, 250 ms pacing) | 3 | **858,658** | 5% | 820,892 – 862,339 |
 | view timeout 500 ms (gov5's 2x ratio) | 3 | 685,710 | 11% | 639,996 – 718,162 |
 | `--engine.suppress-persistence-during-build` | 3 | 832,900 | 5% | 811,599 – 851,572 |
+| leader direct block push | 3 | 861,093 | 7% | 842,119 – 902,826 |
 
 The timeout is **20% worse** and its range does not touch the baseline's: a real
 effect, in the opposite direction to the one a single round had suggested.
@@ -1226,6 +1227,21 @@ overlapping**, which at a 5% spread is no effect at all — and reth's own note
 for that flag ("useful on chains with short block times where persistence I/O
 can interfere with block building latency") describes this tier exactly, so a
 plausible mechanism and a measured nothing.
+
+Direct push is **+0.3% with the ranges overlapping almost entirely** — no
+throughput effect either, which is the fifth confirmed mechanism in this
+document to move nothing. It was built because the measurement pointed at it:
+bodies arrive in 30 ms at the median and 1.1 s at the p90, and the p90 is the
+mesh queueing rather than the bytes. The mechanism does what it was built to do
+— body arrival p90 495.8 ms and p99 6.7 s against 1,107.7 ms and 39.8 s in the
+single rounds before it — but those baselines are one round each, so that is a
+direction and not a magnitude, and the number the fleet produces did not move.
+N42-26 measure the same design at +6.95%, which is inside this rig's spread; if
+it is worth that here, three runs cannot see it.
+
+It is kept, off by default. A latency improvement with no throughput result is
+still a latency improvement, and the protocol is additive — gov5 members do not
+speak it and take the body from the topic exactly as before.
 
 The change worth keeping is not either result. It is that both statements are
 now the kind that can be wrong in only one way: three runs, a stated spread, and

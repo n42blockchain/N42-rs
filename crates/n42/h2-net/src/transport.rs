@@ -37,7 +37,8 @@ use n42_h2_wire::h2_v4::{decode_gossip, encode_gossip, H2V4Envelope, H2V4Error};
 
 use crate::config::gov5_gossipsub_config;
 use crate::rpc::{
-    block_by_hash_behaviour, bodies_by_range_behaviour, status_behaviour, BlockByHashBehaviour,
+    block_by_hash_behaviour, block_push_behaviour, bodies_by_range_behaviour, status_behaviour,
+    BlockByHashBehaviour, BlockPushBehaviour,
     BlockChunk, BlockReply, BodiesByRangeBehaviour, RangeReply, RangeRequest, StatusBehaviour,
 };
 use crate::status::Status;
@@ -263,6 +264,17 @@ pub enum TransportEvent {
         /// The blocks, in order, or the peer's error.
         reply: RangeReply,
     },
+    /// A leader handed this node a block body directly, without being asked.
+    ///
+    /// The payload is what `block_by_hash` would have answered with, so a
+    /// consumer can treat it exactly as it treats a fetched body — which is the
+    /// point: no second path to keep correct.
+    BlockPushed {
+        /// The leader that sent it.
+        peer: PeerId,
+        /// The body, as a chunk.
+        chunk: BlockChunk,
+    },
     /// A block body arrived on the chain's block topic, still compressed.
     /// Which header shapes to accept is the consumer's decision — see
     /// [`crate::block_gossip::HeaderProfile`] — so it is not decoded here.
@@ -320,6 +332,11 @@ pub(crate) struct H2Behaviour {
     /// layer keeps; a fleet member that does not answer leaves a Go peer
     /// behind for good.
     blocks: BlockByHashBehaviour,
+    /// A leader handing its body straight to each member rather than only
+    /// publishing it to the mesh. See [`crate::rpc::BLOCK_PUSH_PROTOCOL`]; a
+    /// peer that does not speak it — every gov5 member — simply falls back to
+    /// the topic.
+    pushes: BlockPushBehaviour,
     /// gov5's range sync, served from the execution layer's chain.
     ranges: BodiesByRangeBehaviour,
     /// Not decoration either. go-libp2p-pubsub learns which peers speak
@@ -380,6 +397,7 @@ impl H2V4Transport {
                 .map_err(|e| TransportError::Behaviour(e.to_string()))?,
             status: status_behaviour(),
             blocks: block_by_hash_behaviour(),
+            pushes: block_push_behaviour(),
             ranges: bodies_by_range_behaviour(),
             identify: libp2p::identify::Behaviour::new(
                 libp2p::identify::Config::new(IDENTIFY_PROTOCOL_VERSION.into(), keypair.public())
@@ -592,6 +610,31 @@ impl H2V4Transport {
 
     /// Answers a [`TransportEvent::BlockRequest`]: the block's gov5 RLP, or
     /// gov5's "not found" when this node does not have it.
+    /// Hands `chunk` straight to `peer`, unasked.
+    ///
+    /// One stream per member, so the body does not wait on the mesh forwarding
+    /// it. Fire and forget from the caller's side: the acknowledgement is
+    /// consumed by the transport, and a peer that does not speak the protocol
+    /// fails the request rather than the block — the topic still carries it.
+    pub fn push_block(&mut self, peer: PeerId, rlp: Vec<u8>) {
+        let chunk = BlockChunk {
+            fork_digest: self.our_status().fork_digest(),
+            rlp,
+        };
+        self.swarm.behaviour_mut().pushes.send_request(&peer, chunk);
+    }
+
+    /// Hands `rlp` to every connected peer at once, returning how many were
+    /// sent to. The fanout is what tells a leader whether the mesh still has
+    /// to carry the body for anyone.
+    pub fn push_block_to_all(&mut self, rlp: &[u8]) -> usize {
+        let peers = self.connected_peer_ids();
+        for peer in &peers {
+            self.push_block(*peer, rlp.to_vec());
+        }
+        peers.len()
+    }
+
     pub fn respond_block(&mut self, channel: BlockRequestChannel, rlp: Option<Vec<u8>>) {
         let reply = match rlp {
             Some(rlp) => Ok(BlockChunk {
@@ -742,6 +785,29 @@ impl H2V4Transport {
                     }
                 }
                 SwarmEvent::Behaviour(H2BehaviourEvent::Blocks(_)) => {}
+                SwarmEvent::Behaviour(H2BehaviourEvent::Pushes(
+                    request_response::Event::Message { peer, message, .. },
+                )) => match message {
+                    request_response::Message::Request {
+                        request, channel, ..
+                    } => {
+                        // Acknowledge before handing it up. The leader counts
+                        // these to know whether its fanout resolved, and an
+                        // acknowledgement that waited for the block to be
+                        // decoded and executed would be measuring something
+                        // else entirely.
+                        let _ = self.swarm.behaviour_mut().pushes.send_response(
+                            channel,
+                            crate::status::RESPONSE_CODE_SUCCESS,
+                        );
+                        return Some(TransportEvent::BlockPushed {
+                            peer,
+                            chunk: request,
+                        });
+                    }
+                    request_response::Message::Response { .. } => {}
+                },
+                SwarmEvent::Behaviour(H2BehaviourEvent::Pushes(_)) => {}
                 SwarmEvent::Behaviour(H2BehaviourEvent::Ranges(
                     request_response::Event::Message { peer, message, .. },
                 )) => match message {

@@ -205,6 +205,9 @@ impl H2V4Observer {
             TransportEvent::Block { from, .. } | TransportEvent::Transactions { from, .. } => {
                 ObserverEvent::NonDecide { from }
             }
+            // A body pushed straight at this node is a body like any other; an
+            // observer watches finality and does not import blocks.
+            TransportEvent::BlockPushed { peer, .. } => ObserverEvent::NonDecide { from: Some(peer) },
             // Native-topic traffic is not chain-bound; an observer trusts
             // only the v4 Decide proofs.
             TransportEvent::Native { from, .. } => ObserverEvent::NonDecide { from },

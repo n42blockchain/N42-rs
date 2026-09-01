@@ -433,6 +433,134 @@ pub fn encode_block_reply(reply: &BlockReply) -> Result<Vec<u8>, crate::status::
 /// The request-response behaviour for the protocol.
 pub type BlockByHashBehaviour = request_response::Behaviour<BlockByHashCodec>;
 
+/// A leader handing its block body straight to each member, unasked.
+///
+/// The block topic is a mesh: the leader publishes once and the body reaches
+/// six peers by being forwarded, which costs a hop through however many nodes
+/// gossipsub chooses and puts the body behind whatever else those nodes are
+/// carrying. Measured on this fleet at the 480M tier, a body reaches a follower
+/// in 30 ms at the median and 1.1 s at the p90, and the p90 is queueing rather
+/// than bytes -- encoding and compressing the whole block is 4 ms.
+///
+/// So the leader also sends it directly, one stream per member. N42-26 reaches
+/// the same design from their own measurements and puts it at +6.95%.
+///
+/// The payload is a [`BlockChunk`], byte for byte what `block_by_hash` answers
+/// with, so a pushed body takes the path a fetched one already takes and there
+/// is no second decoder to keep honest. The response is an acknowledgement,
+/// which is what makes a fanout countable: a leader can tell whether all six
+/// members have the body, and gossip stays as the fallback for the ones that do
+/// not answer -- including every gov5 member, which does not speak this at all.
+pub const BLOCK_PUSH_PROTOCOL: &str = "/rpc/block_push/1/ssz_snappy";
+
+/// The protocol as libp2p names it.
+pub fn block_push_protocol() -> StreamProtocol {
+    StreamProtocol::new(BLOCK_PUSH_PROTOCOL)
+}
+
+/// Codec for [`BLOCK_PUSH_PROTOCOL`]: a chunk out, a response code back.
+#[derive(Debug, Clone, Default)]
+pub struct BlockPushCodec;
+
+#[async_trait]
+impl request_response::Codec for BlockPushCodec {
+    type Protocol = StreamProtocol;
+    type Request = BlockChunk;
+    type Response = u8;
+
+    async fn read_request<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Request>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let mut fork_digest = [0u8; 4];
+        io.read_exact(&mut fork_digest).await?;
+        let rlp = read_framed_limit(io, MAX_BLOCK_WIRE_BYTES, MAX_BLOCK_CHUNK).await?;
+        Ok(BlockChunk { fork_digest, rlp })
+    }
+
+    async fn read_response<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Response>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let mut code = [0u8; 1];
+        io.read_exact(&mut code).await?;
+        Ok(code[0])
+    }
+
+    async fn write_request<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+        chunk: Self::Request,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        io.write_all(&chunk.fork_digest).await?;
+        io.write_all(&frame_payload(&chunk.rlp).map_err(to_io)?).await?;
+        io.close().await
+    }
+
+    async fn write_response<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+        code: Self::Response,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        io.write_all(&[code]).await?;
+        io.close().await
+    }
+}
+
+/// The behaviour for [`BLOCK_PUSH_PROTOCOL`].
+pub type BlockPushBehaviour = request_response::Behaviour<BlockPushCodec>;
+
+/// Pushing and accepting.
+pub fn block_push_behaviour() -> BlockPushBehaviour {
+    request_response::Behaviour::with_codec(
+        BlockPushCodec,
+        [(block_push_protocol(), request_response::ProtocolSupport::Full)],
+        request_response::Config::default(),
+    )
+}
+
+#[cfg(test)]
+mod block_push_tests {
+    use super::*;
+    use futures::executor::block_on;
+    use libp2p::request_response::Codec as _;
+
+    /// A pushed body is the same bytes `block_by_hash` answers with, which is
+    /// the whole reason the receiving side needs no second decoder.
+    #[test]
+    fn a_pushed_chunk_round_trips() {
+        let chunk = BlockChunk {
+            fork_digest: [0x11, 0x24, 0x89, 0xf0],
+            rlp: vec![0xc4, 0xc0, 0xc0, 0xc0, 0xc0],
+        };
+        let mut wire = Vec::new();
+        block_on(BlockPushCodec.write_request(&block_push_protocol(), &mut wire, chunk.clone()))
+            .expect("write");
+        let back = block_on(BlockPushCodec.read_request(&block_push_protocol(), &mut wire.as_slice()))
+            .expect("read");
+        assert_eq!(back.fork_digest, chunk.fork_digest);
+        assert_eq!(back.rlp, chunk.rlp);
+    }
+
+    #[test]
+    fn an_acknowledgement_round_trips() {
+        let mut wire = Vec::new();
+        block_on(BlockPushCodec.write_response(&block_push_protocol(), &mut wire, RESPONSE_CODE_SUCCESS))
+            .expect("write");
+        let code = block_on(BlockPushCodec.read_response(&block_push_protocol(), &mut wire.as_slice()))
+            .expect("read");
+        assert_eq!(code, RESPONSE_CODE_SUCCESS);
+    }
+}
+
 /// Serving and requesting.
 pub fn block_by_hash_behaviour() -> BlockByHashBehaviour {
     request_response::Behaviour::with_codec(

@@ -93,6 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut node_key: Option<String> = None;
     let mut worker_threads: Option<usize> = None;
     let mut block_interval_ms: Option<u64> = None;
+    let mut direct_push = false;
     let mut base_timeout_ms: Option<u64> = None;
     let mut max_timeout_ms: Option<u64> = None;
     let mut period_secs: u64 = 1;
@@ -125,6 +126,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--datadir" => datadir = Some(args.next().ok_or("--datadir needs a path")?),
             "--node-key" => node_key = Some(args.next().ok_or("--node-key needs a hex secret")?),
+            "--direct-block-push" => direct_push = true,
             "--block-interval-ms" => {
                 block_interval_ms =
                     Some(args.next().ok_or("--block-interval-ms needs a value")?.parse()?)
@@ -432,6 +434,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // that poll quantises the block interval, so it has to be sized
             // from the pacing rather than left at its production default.
             service = service.with_block_pacing(Duration::from_millis(period_ms));
+            service = service.with_direct_block_push(direct_push);
             service = service.with_payload_attributes(move |context| {
                 let parent_beacon_block_root = match (&committee, &context.head_header) {
                     (Some(pool), Some(parent)) => {
@@ -667,6 +670,8 @@ h2_validator — run a participating HotStuff-2 v4 node against an execution lay
   --mobile <addr>           serve the mobile_* endpoint here (e.g. 127.0.0.1:9545)
   --datadir <path>          persist consensus state here (required to restart safely)
   --node-key <0x…|path>     libp2p secp256k1 identity; without it, <datadir>/network-key
+  --direct-block-push       hand each block body straight to every member as
+                            well as publishing it; the topic stays the fallback
   --block-interval-ms <n>   pace in milliseconds, overriding the chain's period.
                             Below 1000 the chain's clock leaves real time; see
                             block_attributes. Benchmarks only.

@@ -395,6 +395,10 @@ f7_validator_args() {
   # costs twenty-four block-times. Measured at 250 ms: 61 timeouts across seven
   # nodes in a round of 164 blocks, about 6% of views, each 6 s.
   [[ -n ${F7_VIEW_TIMEOUT_MS:-} ]] && F7_V_ARGS+=(--timeout-ms "$F7_VIEW_TIMEOUT_MS")
+  # The leader hands its body to every member directly as well as publishing it.
+  # Measured motivation: a body arrives in 30 ms at the median and 1.1 s at the
+  # p90, and the p90 is the mesh queueing rather than the bytes.
+  [[ ${F7_DIRECT_PUSH:-0} == 1 ]] && F7_V_ARGS+=(--direct-block-push)
   [[ $F7_MOBILE == 1 ]] && F7_V_ARGS+=(--mobile "127.0.0.1:$((F7_MOBILE_BASE + i))")
   # A static full mesh, as gov5 wires its seven. Peering everyone through one
   # node instead would make that node the fleet's single point of failure for

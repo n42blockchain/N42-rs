@@ -8,6 +8,15 @@
 //!
 //! Prints each transaction's hash; `eth_getTransactionReceipt` on any member
 //! then says which block, and whose, sealed it.
+//!
+//! `--rate <tx/s>` paces the sending instead of bursting, and `--seconds <n>`
+//! runs for a duration rather than a count — a fleet measured only on empty
+//! blocks says nothing about the costs that scale with transactions, which on
+//! gov5's fleet is where the dominant one was found.
+//!
+//! One key is one nonce sequence, so one process is one sender. Load comes from
+//! running several against different funded accounts; two processes sharing a
+//! key race its nonce and most of what they send is rejected.
 
 use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
 use alloy_eips::eip2718::Encodable2718;
@@ -22,6 +31,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut to = None;
     let mut count = 1u64;
     let mut chain_id = 1143u64;
+    let mut rate: Option<f64> = None;
+    let mut seconds: Option<u64> = None;
+    let mut quiet = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -30,6 +42,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--to" => to = Some(args.next().ok_or("--to needs an address")?),
             "--count" => count = args.next().ok_or("--count needs a number")?.parse()?,
             "--chain-id" => chain_id = args.next().ok_or("--chain-id needs a number")?.parse()?,
+            "--rate" => rate = Some(args.next().ok_or("--rate needs a number")?.parse()?),
+            "--seconds" => seconds = Some(args.next().ok_or("--seconds needs a number")?.parse()?),
+            // A sustained run prints one line per transaction otherwise, which
+            // at any useful rate is its own kind of load.
+            "--quiet" => quiet = true,
             other => return Err(format!("unknown argument {other}").into()),
         }
     }
@@ -46,7 +63,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let nonce_hex = call("eth_getTransactionCount", vec![json!(signer.address()), json!("pending")])?;
     let mut nonce = u64::from_str_radix(nonce_hex.as_str().unwrap_or("0x0").trim_start_matches("0x"), 16)?;
-    for _ in 0..count {
+
+    let started = std::time::Instant::now();
+    let deadline = seconds.map(|s| started + std::time::Duration::from_secs(s));
+    let gap = rate.filter(|r| *r > 0.0).map(|r| std::time::Duration::from_secs_f64(1.0 / r));
+    // `--seconds` runs until the clock says stop; without it, `--count` does.
+    let limit = if deadline.is_some() { u64::MAX } else { count };
+
+    let mut sent = 0u64;
+    let mut rejected = 0u64;
+    for index in 0..limit {
+        if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
+            break;
+        }
+        if let Some(gap) = gap {
+            // Paced from the start, not from the last send, so a slow node
+            // does not let the sender drift and then catch up in a burst.
+            let due = started + gap * u32::try_from(index).unwrap_or(u32::MAX);
+            if let Some(wait) = due.checked_duration_since(std::time::Instant::now()) {
+                std::thread::sleep(wait);
+            }
+        }
         let tx = TxEip1559 {
             chain_id,
             nonce,
@@ -60,9 +97,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let signature = signer.sign_hash_sync(&tx.signature_hash())?;
         let envelope: TxEnvelope = tx.into_signed(signature).into();
         let raw = alloy_primitives::hex::encode_prefixed(envelope.encoded_2718());
-        let hash = call("eth_sendRawTransaction", vec![json!(raw)])?;
-        println!("{} nonce {nonce}", hash.as_str().unwrap_or("?"));
-        nonce += 1;
+        match call("eth_sendRawTransaction", vec![json!(raw)]) {
+            Ok(hash) => {
+                if !quiet {
+                    println!("{} nonce {nonce}", hash.as_str().unwrap_or("?"));
+                }
+                sent += 1;
+                nonce += 1;
+            }
+            // A sustained sender outlives the pool's patience: once it is full
+            // the node refuses, and the right answer is to keep the nonce and
+            // try again rather than to stop and leave a gap nothing can fill.
+            Err(err) if deadline.is_some() => {
+                rejected += 1;
+                if rejected % 100 == 1 {
+                    eprintln!("rejected: {err}");
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    if deadline.is_some() {
+        let elapsed = started.elapsed().as_secs_f64();
+        println!("sent {sent} in {elapsed:.1}s ({:.1}/s), {rejected} rejected", sent as f64 / elapsed);
     }
     Ok(())
 }

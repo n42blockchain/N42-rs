@@ -33,6 +33,7 @@
 pub mod cli;
 
 pub mod consensus_ext;
+pub mod engine_ext;
 
 /// Re-exported utils.
 pub mod utils {

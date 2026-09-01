@@ -7,6 +7,7 @@ use alloy_signer_local::PrivateKeySigner;
 use clap::Parser;
 use consensus_client::migrate::N42Migrate;
 use consensus_client::miner::N42Miner;
+use n42::engine_ext::{N42EngineApiServer, N42EngineExt};
 use n42::consensus_ext::{
     ConsensusBeaconExt, ConsensusBeaconExtApiServer, ConsensusExt, ConsensusExtApiServer,
 };
@@ -133,8 +134,15 @@ fn main() {
                         provider,
                     };
 
+                    // The raw getPayload, beside the Engine API on the auth
+                    // transport. See `engine_ext`.
+                    let engine_ext = N42EngineExt {
+                        payloads: ctx.node().payload_builder_handle().clone(),
+                    };
+
                     // now we merge our extension namespace into all configured transports
                     ctx.auth_module.merge_auth_methods(ext.into_rpc())?;
+                    ctx.auth_module.merge_auth_methods(engine_ext.into_rpc())?;
                     ctx.modules.merge_configured(beacon_ext.into_rpc())?;
 
                     info!(target: "reth::cli", "consensus rpc extension enabled");

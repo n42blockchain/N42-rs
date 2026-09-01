@@ -50,6 +50,12 @@ pub const UNSUPPORTED_FORK: i64 = -38005;
 /// down".
 pub const INVALID_PAYLOAD_ATTRIBUTES: i64 = -38003;
 
+/// JSON-RPC's "method not found".
+///
+/// What a stock execution layer answers to this repo's `n42Engine` methods; the
+/// client falls back to the Engine API's own shape and does not ask again.
+pub const METHOD_NOT_FOUND: i64 = -32601;
+
 impl std::fmt::Display for RpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} (code {})", self.message, self.code)

@@ -587,10 +587,18 @@ impl<E: ExecutionLayer> H2Service<E> {
     pub fn with_gov5_h2_profile(mut self, key: n42_h2_primitives::bls::BlsSecretKey) -> Self {
         self.header_profile = HeaderProfile::Gov5H2;
         self.native_wire = true;
-        self.driver.set_payload_normalizer(move |payload, view| {
-            n42_h2_consensus::normalize_to_gov5_h2_with_header(payload, view, Some(&key))
-                .map(|(data, header)| (data, Some(header)))
-                .map_err(|e| e.to_string())
+        self.driver.set_payload_normalizer(move |payload, header, view| {
+            match header {
+                Some(header) => n42_h2_consensus::normalize_to_gov5_h2_from_header(
+                    header.clone(),
+                    payload,
+                    view,
+                    Some(&key),
+                ),
+                None => n42_h2_consensus::normalize_to_gov5_h2_with_header(payload, view, Some(&key)),
+            }
+            .map(|(data, header)| (data, Some(header)))
+            .map_err(|e| e.to_string())
         });
         self
     }

@@ -35,7 +35,7 @@ pub use error::{ConsensusError, ConsensusResult};
 pub use header_profile::{
     block_for_header, block_for_header_with_rewards, execution_data_for_block, gov5_receipts_root,
     gov5_rewards_root, header_view, is_empty_requests_hash, normalize_to_gov5_h2,
-    normalize_to_gov5_h2_with_header,
+    normalize_to_gov5_h2_with_header, normalize_to_gov5_h2_from_header,
     execution_data_for_block_with_bal,
     reconstruct_gov5_h2_block, rewards_to_withdrawals, seal_hash, seal_header,
     withdrawals_to_rewards,

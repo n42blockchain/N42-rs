@@ -55,8 +55,8 @@ use serde_json::{json, Value};
 use tracing::debug;
 
 use crate::transport::{
-    JsonRpcTransport, TransportError, INVALID_PAYLOAD_ATTRIBUTES, UNKNOWN_PAYLOAD,
-    UNSUPPORTED_FORK,
+    JsonRpcTransport, TransportError, INVALID_PAYLOAD_ATTRIBUTES, METHOD_NOT_FOUND,
+    UNKNOWN_PAYLOAD, UNSUPPORTED_FORK,
 };
 
 /// How many in-flight builds to remember the beacon root for.
@@ -85,6 +85,10 @@ pub struct EngineApiClient<T> {
     /// refused round trip on the leader's path is a refused round trip on the
     /// fleet's cycle.
     fcu_rung: std::sync::atomic::AtomicUsize,
+    /// Whether the execution layer answers `n42Engine_getPayloadRaw`. Assumed
+    /// until it says "method not found" once; a stock execution layer is asked
+    /// exactly one extra question in its life.
+    raw_payloads: std::sync::atomic::AtomicBool,
 }
 
 impl<T: JsonRpcTransport> EngineApiClient<T> {
@@ -94,6 +98,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
             transport,
             builds: Mutex::new((HashMap::new(), Vec::new())),
             fcu_rung: std::sync::atomic::AtomicUsize::new(0),
+            raw_payloads: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -546,6 +551,25 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
         // will fail its own `newPayload` check rather than being imported under
         // a root nobody agreed to.
         let beacon_root = self.recall_build(id).unwrap_or_default();
+        // This repo's execution layer answers with the block's RLP, which
+        // skips a 24 MB JSON document each way and the decode the validator
+        // then needed to find the header. Anything else falls through to the
+        // Engine API's own shape below.
+        if self.raw_payloads.load(std::sync::atomic::Ordering::Relaxed) {
+            match self.transport.call("n42Engine_getPayloadRaw", vec![json!(id)]).await {
+                Ok(Value::Null) => return None,
+                Ok(value) => {
+                    debug!(target: "n42.h2.el", "getPayloadRaw");
+                    return Some(built_block_from_raw(value, beacon_root));
+                }
+                Err(TransportError::Rpc(err)) if err.code == METHOD_NOT_FOUND => {
+                    debug!(target: "n42.h2.el", "execution layer has no n42Engine_getPayloadRaw; using getPayload");
+                    self.raw_payloads.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(TransportError::Rpc(err)) if err.code == UNKNOWN_PAYLOAD => return None,
+                Err(err) => return Some(Err(ElError::new(err))),
+            }
+        }
         for method in GET_PAYLOAD_METHODS {
             match self.transport.call(method, vec![json!(id)]).await {
                 Ok(value) => {
@@ -567,6 +591,154 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
     }
 }
 
+/// What `n42Engine_getPayloadRaw` answers with.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawBuiltPayload {
+    block: alloy_primitives::Bytes,
+    #[serde(default)]
+    requests: Option<Vec<alloy_primitives::Bytes>>,
+    #[serde(default)]
+    block_access_list: Option<alloy_primitives::Bytes>,
+}
+
+/// Splits a block's RLP into its header, its transactions as the EIP-2718
+/// bytes the Engine API and gov5's wire both want, and its withdrawals.
+///
+/// The transactions are *not* decoded: each is either an RLP string wrapping
+/// a typed transaction, whose contents are the bytes wanted, or an RLP list
+/// that is a legacy transaction, whose whole encoding is. A 163,000-transaction
+/// block is 163,000 slice operations here where decoding it is 50 ms and the
+/// JSON it replaces was 150-200.
+pub fn split_block_rlp(
+    rlp: &[u8],
+) -> Result<(alloy_consensus::Header, Vec<alloy_primitives::Bytes>, Vec<alloy_eips::eip4895::Withdrawal>), ElError> {
+    use alloy_rlp::Decodable;
+    let bad = |what: &str| ElError::new(format!("raw payload: {what}"));
+    let mut buf = rlp;
+    let outer = alloy_rlp::Header::decode(&mut buf).map_err(|e| bad(&e.to_string()))?;
+    if !outer.list || buf.len() < outer.payload_length {
+        return Err(bad("not a block list"));
+    }
+    let mut payload = &buf[..outer.payload_length];
+    let header = alloy_consensus::Header::decode(&mut payload).map_err(|e| bad(&format!("header: {e}")))?;
+    let txs_header = alloy_rlp::Header::decode(&mut payload).map_err(|e| bad(&e.to_string()))?;
+    if !txs_header.list || payload.len() < txs_header.payload_length {
+        return Err(bad("transactions are not a list"));
+    }
+    let (mut items, rest) = payload.split_at(txs_header.payload_length);
+    payload = rest;
+    let mut transactions = Vec::with_capacity(items.len() / 100);
+    while !items.is_empty() {
+        let whole = items;
+        let item = alloy_rlp::Header::decode(&mut items).map_err(|e| bad(&e.to_string()))?;
+        if items.len() < item.payload_length {
+            return Err(bad("truncated transaction"));
+        }
+        let (body, after) = items.split_at(item.payload_length);
+        transactions.push(if item.list {
+            alloy_primitives::Bytes::copy_from_slice(&whole[..whole.len() - after.len()])
+        } else {
+            alloy_primitives::Bytes::copy_from_slice(body)
+        });
+        items = after;
+    }
+    let ommers = alloy_rlp::Header::decode(&mut payload).map_err(|e| bad(&e.to_string()))?;
+    if payload.len() < ommers.payload_length {
+        return Err(bad("truncated ommers"));
+    }
+    payload = &payload[ommers.payload_length..];
+    let withdrawals = if payload.is_empty() {
+        Vec::new()
+    } else {
+        Vec::<alloy_eips::eip4895::Withdrawal>::decode(&mut payload)
+            .map_err(|e| bad(&format!("withdrawals: {e}")))?
+    };
+    Ok((header, transactions, withdrawals))
+}
+
+/// A [`BuiltBlock`] from `n42Engine_getPayloadRaw`'s answer.
+///
+/// The payload is assembled from the header's fields and the transactions'
+/// bytes, which is exactly what the Engine API's envelope carries, without
+/// anything having been decoded. The header rides along so the seal can be
+/// applied to it directly.
+pub fn built_block_from_raw(value: Value, parent_beacon_block_root: B256) -> Result<BuiltBlock, ElError> {
+    use alloy_rpc_types_engine::{ExecutionPayloadV1, ExecutionPayloadV2};
+    let raw: RawBuiltPayload = serde_json::from_value(value)
+        .map_err(|e| ElError::new(format!("unusable getPayloadRaw answer: {e}")))?;
+    let (header, transactions, withdrawals) = split_block_rlp(&raw.block)?;
+    // Blob transactions need the blobs bundle, which this path does not carry.
+    if transactions.iter().any(|tx| tx.first() == Some(&0x03)) {
+        return Err(ElError::new("raw payload path cannot carry blob transactions"));
+    }
+    let hash = header.hash_slow();
+    let v1 = ExecutionPayloadV1 {
+        parent_hash: header.parent_hash,
+        fee_recipient: header.beneficiary,
+        state_root: header.state_root,
+        receipts_root: header.receipts_root,
+        logs_bloom: header.logs_bloom,
+        prev_randao: header.mix_hash,
+        block_number: header.number,
+        gas_limit: header.gas_limit,
+        gas_used: header.gas_used,
+        timestamp: header.timestamp,
+        extra_data: header.extra_data.clone(),
+        base_fee_per_gas: alloy_primitives::U256::from(header.base_fee_per_gas.unwrap_or_default()),
+        block_hash: hash,
+        transactions,
+        // This repo's fork of the payload types carries APoS's two header
+        // fields; the seal zeroes both a moment later.
+        difficulty: header.difficulty,
+        nonce: header.nonce,
+    };
+    let tx_count = v1.transactions.len();
+    let payload = match (header.withdrawals_root.is_some(), header.blob_gas_used) {
+        (false, _) => ExecutionPayload::V1(v1),
+        (true, None) => ExecutionPayload::V2(ExecutionPayloadV2 { payload_inner: v1, withdrawals }),
+        (true, Some(blob_gas_used)) => {
+            let v3 = ExecutionPayloadV3 {
+                payload_inner: ExecutionPayloadV2 { payload_inner: v1, withdrawals },
+                blob_gas_used,
+                excess_blob_gas: header.excess_blob_gas.unwrap_or_default(),
+            };
+            match raw.block_access_list {
+                Some(block_access_list) => ExecutionPayload::V4(ExecutionPayloadV4 {
+                    payload_inner: v3,
+                    block_access_list,
+                    slot_number: header.number,
+                }),
+                None => ExecutionPayload::V3(v3),
+            }
+        }
+    };
+    let sidecar = match header.parent_beacon_block_root {
+        None => ExecutionPayloadSidecar::none(),
+        Some(_) => {
+            let cancun = CancunPayloadFields { parent_beacon_block_root, versioned_hashes: Vec::new() };
+            match (header.requests_hash.is_some(), raw.requests) {
+                (true, requests) => ExecutionPayloadSidecar::v4(
+                    cancun,
+                    PraguePayloadFields {
+                        requests: RequestsOrHash::Requests(Requests::new(requests.unwrap_or_default())),
+                    },
+                ),
+                (false, _) => ExecutionPayloadSidecar::v3(cancun),
+            }
+        }
+    };
+    Ok(BuiltBlock {
+        hash,
+        number: header.number,
+        timestamp: header.timestamp,
+        tx_count,
+        execution_data: ExecutionData::new(payload, sidecar),
+        blob_tx_hashes: Vec::new(),
+        header: Some(header),
+    })
+}
+
 /// The consensus header and transactions inside an `eth_getBlockByNumber`
 /// answer, which is what gov5's block form is built from.
 pub fn block_parts(block: alloy_rpc_types_eth::Block) -> ChainBlock {
@@ -578,4 +750,41 @@ pub fn block_parts(block: alloy_rpc_types_eth::Block) -> ChainBlock {
         .map(|tx| tx.inner.into_inner())
         .collect();
     ChainBlock { header, transactions, withdrawals: block.withdrawals.map(|w| w.0) }
+}
+
+
+#[cfg(test)]
+mod raw_payload_tests {
+    use super::*;
+    use alloy_consensus::{Block, BlockBody, Header, TxEip1559, TxEnvelope, TxLegacy};
+    use alloy_eips::Encodable2718;
+    use alloy_primitives::{Address, Signature, TxKind, U256};
+
+    fn typed() -> TxEnvelope {
+        let tx = TxEip1559 { chain_id: 1, nonce: 3, gas_limit: 21_000, max_fee_per_gas: 10, max_priority_fee_per_gas: 1, to: TxKind::Call(Address::repeat_byte(2)), value: U256::from(9), ..Default::default() };
+        TxEnvelope::Eip1559(alloy_consensus::Signed::new_unchecked(tx, Signature::test_signature(), Default::default()))
+    }
+    fn legacy() -> TxEnvelope {
+        let tx = TxLegacy { chain_id: Some(1), nonce: 4, gas_price: 10, gas_limit: 21_000, to: TxKind::Call(Address::repeat_byte(3)), value: U256::from(1), ..Default::default() };
+        TxEnvelope::Legacy(alloy_consensus::Signed::new_unchecked(tx, Signature::test_signature(), Default::default()))
+    }
+
+    /// The split hands back exactly the bytes `encoded_2718` would, for both a
+    /// typed transaction (an RLP string on the block) and a legacy one (an
+    /// RLP list that is its own encoding), plus the header and withdrawals.
+    #[test]
+    fn splitting_a_block_yields_its_2718_bytes() {
+        // A well-formed post-Shanghai header: the trailing optional fields
+        // encode positionally, so a withdrawals root without a base fee is an
+        // encoding no real block has and alloy's own decoder rejects it.
+        let header = Header { number: 5, base_fee_per_gas: Some(7), withdrawals_root: Some(alloy_consensus::EMPTY_ROOT_HASH), ..Default::default() };
+        let withdrawals = vec![alloy_eips::eip4895::Withdrawal { index: 1, validator_index: 2, address: Address::repeat_byte(7), amount: 3 }];
+        let block = Block { header: header.clone(), body: BlockBody { transactions: vec![typed(), legacy(), typed()], ommers: Vec::new(), withdrawals: Some(alloy_eips::eip4895::Withdrawals(withdrawals.clone())) } };
+        let rlp = alloy_rlp::encode(&block);
+        let (got_header, txs, got_withdrawals) = split_block_rlp(&rlp).expect("splits");
+        assert_eq!(got_header, header);
+        assert_eq!(got_withdrawals, withdrawals);
+        let want: Vec<Vec<u8>> = block.body.transactions.iter().map(|tx| tx.encoded_2718()).collect();
+        assert_eq!(txs.iter().map(|b| b.to_vec()).collect::<Vec<_>>(), want);
+    }
 }

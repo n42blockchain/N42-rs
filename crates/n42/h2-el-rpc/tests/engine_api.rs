@@ -68,6 +68,12 @@ struct SharedRecorder(Arc<Recorder>);
 #[async_trait::async_trait]
 impl JsonRpcTransport for SharedRecorder {
     async fn call(&self, method: &str, params: Vec<Value>) -> Result<Value, TransportError> {
+        // A stock execution layer: this repo's `n42Engine` methods do not
+        // exist, and the client is expected to fall back to the Engine API's
+        // own shape without it counting as a call in the sequences below.
+        if method.starts_with("n42Engine_") {
+            return Err(TransportError::Rpc(RpcError { code: -32601, message: "method not found".into() }));
+        }
         self.0
             .calls
             .lock()

@@ -395,6 +395,15 @@ where
     let chain_spec = client.chain_spec();
 
     debug!(target: "payload_builder", id=%payload_id, parent_header = ?parent_header.hash(), parent_number = parent_header.number, "building new payload");
+    // Timed in phases, because at the 163,000-transaction tier this function
+    // is the largest single item on the fleet's serial chain (~740 ms of a
+    // 2.3 s cycle) and "execution" was assumed to be most of it. The sibling
+    // Rust client's breakdown at the same tier says otherwise: EVM 229 ms,
+    // pool 57, block assembly 162. Which of those this builder spends its time
+    // on decides what to fix, and guessing has been wrong before.
+    let build_started = std::time::Instant::now();
+    let mut pool_ns: u128 = 0;
+    let mut exec_ns: u128 = 0;
     let mut cumulative_gas_used = 0;
     let block_gas_limit: u64 = builder.evm_mut().block().gas_limit();
     let base_fee = builder.evm_mut().block().basefee();
@@ -437,7 +446,10 @@ where
         .map(|params| params.max_blob_count)
         .unwrap_or_default();
 
-    while let Some(pool_tx) = best_txs.next() {
+    loop {
+        let pool_at = std::time::Instant::now();
+        let Some(pool_tx) = best_txs.next() else { break };
+        pool_ns += pool_at.elapsed().as_nanos();
         tx_count += 1;
         debug!(target: "payload_builder", tx_count, tx_hash=?pool_tx.hash(), gas_limit=pool_tx.gas_limit(), "processing transaction from pool");
 
@@ -485,7 +497,10 @@ where
             }
         }
 
-        let gas_used = match builder.execute_transaction(tx.clone()) {
+        let exec_at = std::time::Instant::now();
+        let executed = builder.execute_transaction(tx.clone());
+        exec_ns += exec_at.elapsed().as_nanos();
+        let gas_used = match executed {
             Ok(gas_used) => gas_used,
             Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
                 error, ..
@@ -532,6 +547,7 @@ where
     }
 
     debug!(target: "payload_builder", tx_count, ?cumulative_gas_used, ?total_fees, "payload builder finished processing transactions");
+    let loop_done = build_started.elapsed();
 
     // check if we have a better block
     if !is_better_payload(best_payload.as_ref(), total_fees) {
@@ -557,10 +573,15 @@ where
             ..
         },
         qmdb_prepared,
+        finish_took,
+        root_took,
     ) = match &qmdb {
         Some(state) => {
+            let finish_at = std::time::Instant::now();
             let outcome =
                 builder.finish(&state_provider, Some((B256::ZERO, TrieUpdates::default())))?;
+            let finish_took = finish_at.elapsed();
+            let root_at = std::time::Instant::now();
             let bundle = db.take_bundle();
             let prepared = state
                 .compute(
@@ -571,10 +592,15 @@ where
                     ),
                 )
                 .map_err(PayloadBuilderError::other)?;
-            (outcome, Some(prepared))
+            (outcome, Some(prepared), finish_took, root_at.elapsed())
         }
-        None => (builder.finish(&state_provider, None)?, None),
+        None => {
+            let finish_at = std::time::Instant::now();
+            let outcome = builder.finish(&state_provider, None)?;
+            (outcome, None, finish_at.elapsed(), std::time::Duration::ZERO)
+        }
     };
+    let finished_at = build_started.elapsed();
 
     let requests = chain_spec
         .is_prague_active_at_timestamp(attributes.timestamp)
@@ -667,6 +693,25 @@ where
     // block that does not, and says nothing either way.
     let block_access_list: Option<alloy_primitives::Bytes> =
         block_access_list.map(|bal| alloy_rlp::encode(&bal).into());
+    // At info only for blocks big enough to matter; an empty block every
+    // 250 ms would otherwise be a line every 250 ms.
+    let total = build_started.elapsed();
+    let assemble_ms = total.saturating_sub(finished_at).as_millis() as u64;
+    if tx_count >= 1000 {
+        tracing::info!(
+            target: "payload_builder",
+            txs = tx_count,
+            gas = cumulative_gas_used,
+            pool_ms = (pool_ns / 1_000_000) as u64,
+            exec_ms = (exec_ns / 1_000_000) as u64,
+            loop_ms = loop_done.as_millis() as u64,
+            finish_ms = finish_took.as_millis() as u64,
+            root_ms = root_took.as_millis() as u64,
+            assemble_ms,
+            total_ms = total.as_millis() as u64,
+            "payload build phases"
+        );
+    }
     let payload = EthBuiltPayload::new(recovered, total_fees, requests, block_access_list)
         // add blob sidecars from the executed txs
         .with_sidecars(blob_sidecars);

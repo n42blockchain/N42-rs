@@ -13,6 +13,7 @@ description = "Engine API client implementing the HotStuff-2 execution-layer sea
 n42-h2-execution.workspace = true
 alloy-consensus.workspace = true
 alloy-eips.workspace = true
+alloy-rlp.workspace = true
 alloy-primitives = { workspace = true, features = ["serde"] }
 # `jwt-aws-lc-rs`, not plain `jwt`: the bare feature pulls in jsonwebtoken
 # without selecting a crypto provider, which compiles and then panics on the

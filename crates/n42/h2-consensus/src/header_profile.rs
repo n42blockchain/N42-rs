@@ -542,6 +542,45 @@ pub fn normalize_to_gov5_h2(
     normalize_to_gov5_h2_with_header(execution, view, sealer).map(|(data, _)| data)
 }
 
+/// [`normalize_to_gov5_h2_with_header`] for a caller that already has the
+/// header, which is the leader on the raw payload path.
+///
+/// The seal changes the header alone -- extra data, ommers hash, difficulty,
+/// nonce, gov5's withdrawals and requests placeholders, and through them the
+/// hash -- and of those only the extra data and the hash appear in the
+/// payload. So the payload is patched in place and the transactions are never
+/// touched: the general path decodes 163,000 of them to construct this same
+/// header and encodes them back, 130 ms at that tier, for two fields.
+pub fn normalize_to_gov5_h2_from_header(
+    mut header: alloy_consensus::Header,
+    execution: &ExecutionData,
+    view: u64,
+    sealer: Option<&BlsSecretKey>,
+) -> Result<(ExecutionData, alloy_consensus::Header), HeaderProfileError> {
+    header.ommers_hash = B256::ZERO;
+    header.difficulty = U256::ZERO;
+    header.nonce = Default::default();
+    header.extra_data = HeaderExtra::for_view(view).encode();
+    if header.withdrawals_root.is_some() {
+        let withdrawals = execution.payload.as_v2().map_or(&[][..], |v2| v2.withdrawals.as_slice());
+        header.withdrawals_root = Some(gov5_rewards_root(withdrawals_to_rewards(withdrawals)));
+    }
+    if header.requests_hash.is_some_and(is_empty_requests_hash) {
+        header.requests_hash = Some(GOV5_EMPTY_REQUESTS_HASH);
+    }
+    if let Some(key) = sealer {
+        seal_header(&mut header, key)?;
+    }
+    let hash = header.hash_slow();
+    let mut data = execution.clone();
+    let v1 = data.payload.as_v1_mut();
+    v1.extra_data = header.extra_data.clone();
+    v1.block_hash = hash;
+    v1.difficulty = header.difficulty;
+    v1.nonce = header.nonce;
+    Ok((data, header))
+}
+
 /// [`normalize_to_gov5_h2`], returning the header it built as well.
 ///
 /// The header is a by-product of sealing and it used to be thrown away, after
@@ -790,6 +829,48 @@ mod tests {
             "the sealed header must carry EIP-7928's hash, not the conversion's",
         );
         assert_eq!(rebuilt.header.hash_slow(), data.block_hash());
+    }
+
+    /// The header-only seal is the general seal, without the decode. Same
+    /// hash, same payload, or the leader would be proposing a block whose
+    /// body its own execution layer rebuilds under a different hash.
+    #[test]
+    fn sealing_from_the_header_matches_sealing_from_the_payload() {
+        let header = Header {
+            number: 7,
+            gas_limit: 30_000_000,
+            gas_used: 21_000,
+            timestamp: 1_700_000_000,
+            base_fee_per_gas: Some(7),
+            withdrawals_root: Some(alloy_consensus::EMPTY_ROOT_HASH),
+            blob_gas_used: Some(0),
+            excess_blob_gas: Some(0),
+            parent_beacon_block_root: Some(B256::repeat_byte(9)),
+            requests_hash: Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH),
+            difficulty: U256::from(1),
+            ommers_hash: alloy_consensus::EMPTY_OMMER_ROOT_HASH,
+            ..Default::default()
+        };
+        let block = Block {
+            header: header.clone(),
+            body: alloy_consensus::BlockBody {
+                transactions: Vec::<TxEnvelope>::new(),
+                ommers: Vec::new(),
+                withdrawals: Some(Withdrawals(vec![alloy_eips::eip4895::Withdrawal {
+                    index: 0,
+                    validator_index: 0,
+                    address: alloy_primitives::Address::repeat_byte(0x42),
+                    amount: 5,
+                }])),
+            },
+        };
+        let data = execution_data_for_block(block.header.hash_slow(), &block);
+        let (general, general_header) = normalize_to_gov5_h2_with_header(&data, 11, None).unwrap();
+        let (fast, fast_header) = normalize_to_gov5_h2_from_header(header, &data, 11, None).unwrap();
+        assert_eq!(fast_header, general_header, "the two seals built different headers");
+        assert_eq!(fast.block_hash(), general.block_hash());
+        assert_eq!(fast.payload.as_v1(), general.payload.as_v1(), "the patched payload differs from the rebuilt one");
+        assert_eq!(fast.payload.as_v2().map(|v| &v.withdrawals), general.payload.as_v2().map(|v| &v.withdrawals));
     }
 
     #[test]

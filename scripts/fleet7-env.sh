@@ -375,12 +375,19 @@ f7_validator_args() {
     --index "$i"
     --bls-key "$(cat "$F7_ROOT/keys/validator-$i.key")"
     --el "http://127.0.0.1:$((F7_AUTH_BASE + i))"
-    --el-rpc "http://127.0.0.1:$((F7_HTTP_BASE + i))"
     --jwt "$F7_ROOT/jwt.hex"
     --listen "/ip4/127.0.0.1/tcp/$((F7_P2P_BASE + i))"
     --datadir "$d/consensus"
     --propose
   )
+  # `--el-rpc` turns on transaction gossip in both directions: this node
+  # publishes what its pool admitted, and hands what the fleet publishes to
+  # `eth_sendRawTransaction`. F7_NO_TX_GOSSIP=1 leaves it off, which is a
+  # diagnostic rather than a tier -- the flood already submits to all seven
+  # RPCs, so in a bench round the gossip carries nothing the pools do not
+  # already have, and dropping it isolates what the forwarding costs. On a real
+  # fleet it is how a transaction reaches the nodes it was not sent to.
+  [[ ${F7_NO_TX_GOSSIP:-0} == 1 ]] || F7_V_ARGS+=(--el-rpc "http://127.0.0.1:$((F7_HTTP_BASE + i))")
   [[ $F7_PROFILE == lean ]] && F7_V_ARGS+=(--worker-threads 2)
   # A throughput round is not trying to honour a block interval, it is trying to
   # find the ceiling, so the bench tier paces in milliseconds and overrides the

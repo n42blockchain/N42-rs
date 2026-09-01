@@ -203,6 +203,9 @@ pub struct H2Service<E> {
     /// not elapsed — so the next step must not wait for the view to time out
     /// before asking again. See [`PROPOSE_RETRY`].
     proposal_deferred: bool,
+    /// Hands gossiped transactions to the pool, off this loop. See
+    /// [`crate::tx_source::forward_transactions`].
+    inbound_forward: Option<mpsc::Sender<Vec<Bytes>>>,
     /// Why this node last declined to propose, for the timeout log to quote.
     ///
     /// A view that times out has exactly two shapes and they need opposite
@@ -287,7 +290,7 @@ pub struct H2Service<E> {
     block_timestamps: std::collections::HashMap<B256, u64>,
     /// Transactions heard on the fleet's transaction topic, waiting to be
     /// handed to the execution layer's pool.
-    inbound_transactions: Vec<Bytes>,
+    inbound_transactions: std::collections::VecDeque<Bytes>,
     /// Transactions this node's own pool admitted, from the source installed
     /// with [`Self::with_transaction_source`], waiting to go out.
     outbound_transactions: Option<mpsc::Receiver<Vec<Bytes>>>,
@@ -377,6 +380,22 @@ const MAX_PENDING_RANGES: usize = 8;
 /// import, so this is simply inert until it can be right.
 const FAR_AHEAD_BLOCKS: u64 = 1;
 /// Bodies held back at most; the oldest go first.
+/// How many gossiped transactions go to the forwarder in one handoff.
+const TX_FORWARD_MAX: usize = 1000;
+
+/// How many handoffs may be in flight to the forwarder before the loop drops.
+///
+/// Small deliberately. The arrival rate is set by the fleet and the drain rate
+/// by this node's pool, so under sustained oversupply this queue is always
+/// full and the question is only what happens then. Dropping is right: a
+/// gossiped transaction that has waited behind four full batches has either
+/// reached the pool by another route or been mined, and buffering it costs
+/// memory to deliver something stale.
+const TX_FORWARD_QUEUE: usize = 4;
+
+/// How many gossiped transactions may wait in the loop for the next handoff.
+const INBOUND_TX_CAP: usize = 8000;
+
 const MAX_HELD_BODIES: usize = 4096;
 /// Imported hashes remembered; older commits never arrive.
 const MAX_IMPORTED: usize = 8192;
@@ -487,6 +506,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             meshed: false,
             checkpoint: None,
             proposal_deferred: false,
+            inbound_forward: None,
             defer_reason: None,
             header_profile: HeaderProfile::Ethereum,
             native_wire: false,
@@ -512,7 +532,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             body_store: std::collections::HashMap::new(),
             body_store_order: Vec::new(),
             block_timestamps: std::collections::HashMap::new(),
-            inbound_transactions: Vec::new(),
+            inbound_transactions: std::collections::VecDeque::new(),
             outbound_transactions: None,
             gossiped_transactions: std::collections::VecDeque::new(),
             block_headers: std::collections::HashMap::new(),
@@ -631,8 +651,16 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// Go members.
     pub fn with_transaction_source(mut self, rpc_url: url::Url) -> Self {
         let (tx, rx) = mpsc::channel(64);
-        tokio::spawn(crate::tx_source::poll_pending_transactions(rpc_url, tx));
+        tokio::spawn(crate::tx_source::poll_pending_transactions(rpc_url.clone(), tx));
         self.outbound_transactions = Some(rx);
+        // The inbound direction of the same arrangement, and the same RPC. It
+        // gets its own task rather than a turn in the loop for the reason on
+        // `forward_transactions`: waiting for the pool is waiting with the
+        // transport unread, and this is the one piece of work here whose size
+        // the fleet sets rather than the chain.
+        let (forward_tx, forward_rx) = mpsc::channel(TX_FORWARD_QUEUE);
+        tokio::spawn(crate::tx_source::forward_transactions(rpc_url, forward_rx));
+        self.inbound_forward = Some(forward_tx);
         self
     }
 
@@ -718,7 +746,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 () = std::future::ready(()) => {}
             }
             self.drain_outputs(&mut events).await?;
-            self.forward_inbound_transactions().await;
+            self.forward_inbound_transactions();
             self.flush_outbox(&mut events);
             return Ok(events);
         }
@@ -791,7 +819,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         self.drain_transport(&mut events).await?;
 
         self.drain_outputs(&mut events).await?;
-        self.forward_inbound_transactions().await;
+        self.forward_inbound_transactions();
         self.flush_outbox(&mut events);
         Ok(events)
     }
@@ -819,25 +847,43 @@ impl<E: ExecutionLayer> H2Service<E> {
         Ok(())
     }
 
-    /// Hands the transactions heard from the fleet to the execution layer's
-    /// pool. A refusal is the pool's verdict on one transaction, logged and
-    /// forgotten; the fleet's next batch is not held up by it.
-    async fn forward_inbound_transactions(&mut self) {
-        if self.inbound_transactions.is_empty() {
+    /// Passes gossiped transactions to the forwarder, without waiting for it.
+    ///
+    /// Nothing here awaits, which is the whole point: `try_send` either takes
+    /// the batch or says the forwarder is behind, and a loop that blocked on
+    /// either answer would be back to being deaf to its mesh while the pool
+    /// thinks. See [`crate::tx_source::forward_transactions`] for what that
+    /// cost.
+    fn forward_inbound_transactions(&mut self) {
+        let Some(sink) = &self.inbound_forward else {
+            self.inbound_transactions.clear();
             return;
-        }
-        let batch = std::mem::take(&mut self.inbound_transactions);
-        let offered = batch.len();
-        // One request, not one per transaction. This loop does not poll the
-        // transport while it awaits, so a batch forwarded a round trip at a
-        // time stops consensus for the length of the batch: measured on the
-        // seven-node fleet at 6,000 senders as a p90 block cycle of 6 s and a
-        // p99 body arrival of 14 s, against medians of 0.5 s and 32 ms. The
-        // medians were fine throughout, which is what made it a tail problem
-        // rather than an obvious one.
-        let accepted = self.driver.execution_layer().send_raw_transactions(batch).await;
-        if accepted > 0 {
-            debug!(target: "n42.h2.node", accepted, offered, "handed gossiped transactions to the pool");
+        };
+        while !self.inbound_transactions.is_empty() {
+            let take = self.inbound_transactions.len().min(TX_FORWARD_MAX);
+            let batch: Vec<Bytes> = self.inbound_transactions.drain(..take).collect();
+            let offered = batch.len();
+            match sink.try_send(batch) {
+                Ok(()) => {
+                    debug!(target: "n42.h2.node", offered, waiting = self.inbound_transactions.len(), "passed gossiped transactions to the forwarder");
+                }
+                Err(mpsc::error::TrySendError::Full(batch)) => {
+                    // The pool is slower than the fleet. Keep what did not fit
+                    // for the next step, up to the cap, and stop trying now.
+                    for raw in batch.into_iter().rev() {
+                        self.inbound_transactions.push_front(raw);
+                    }
+                    while self.inbound_transactions.len() > INBOUND_TX_CAP {
+                        self.inbound_transactions.pop_front();
+                    }
+                    return;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.inbound_forward = None;
+                    self.inbound_transactions.clear();
+                    return;
+                }
+            }
         }
     }
 
@@ -923,7 +969,10 @@ impl<E: ExecutionLayer> H2Service<E> {
                             while self.gossiped_transactions.len() > REMEMBERED_TIMESTAMPS * 16 {
                                 self.gossiped_transactions.pop_front();
                             }
-                            self.inbound_transactions.push(raw);
+                            self.inbound_transactions.push_back(raw);
+                            if self.inbound_transactions.len() > INBOUND_TX_CAP {
+                                self.inbound_transactions.pop_front();
+                            }
                         }
                     }
                     Err(err) => debug!(target: "n42.h2.node", %err, "dropped a transaction message"),

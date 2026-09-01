@@ -1306,3 +1306,191 @@ gigabytes of state is thirty-five gigabytes resident, per node, and it is now
 the largest single item. The other two are the header field
 `MobileRegistryRoot`, which reth's `Header` cannot carry, and gov5's EOF, which
 revm 42 does not implement — both recorded in `docs/N42_26_PORT.md`.
+
+## Round 16: the consensus loop was handing transactions to the pool
+
+Fifteen rounds had moved throughput once. Five mechanisms had been confirmed to
+work and shown to change nothing, and the record's own summary of why was that
+the cycle is made of tails rather than of medians. That was true and it was not
+yet a cause.
+
+Two things arrived together to give one.
+
+### gov5's own fleet, on this host, at this tier
+
+gov5 ran a seven-node round on this machine at settings that happen to match
+this fleet's bench tier exactly — 250 ms pacing, a 480M gas ceiling, seven
+miners — so for the price of reading their RPC there was a same-machine
+comparison with every variable except the client held still:
+
+| | this fleet | gov5, same host, same hour |
+|---|---:|---:|
+| cycle | 1,430–1,667 ms | 256–323 ms |
+| transactions per block | 22,857 | ~12,300 |
+| occupancy | ~100% | 53% |
+| TPS | ~15,000 | 45,700–48,000 |
+
+The first thing that settles is a direction this file was about to take. Their
+blocks are *half* the size and their cycle is five times shorter, so more gas
+per block is not what they are doing, and the round that had been prepared to
+test a 960M tier was not run. (`--gasceil` was built for it and is kept, since
+the reason it was needed is real: a block's gas limit moves by 1/1024 of its
+parent's per block, so a chain born at 480M needs ~710 blocks to reach a 960M
+ceiling, and a round pointed at a ceiling it has not climbed to measures the
+chain it was born as.)
+
+The second thing it settles is where the gap is *not*. Per transaction this
+fleet's median path is 19 µs, against 22 µs per transaction of gov5's entire
+cycle. The median path is not behind. 22,857 transactions in the 442 ms the
+medians actually sum to would be 51,700 TPS — better than gov5's peak. The
+whole difference is the ~1,060 ms of cycle that no median accounts for.
+
+### Naming the timeouts instead of subtracting them
+
+Three previous attempts on that gap worked by subtracting medians from the
+cycle, and two of them were wrong. So the timeout was made to say its own
+cause: a view that expires has two shapes needing opposite fixes — the leader
+never proposed, or it proposed and the votes did not arrive — and only the
+leader knows which, only at the moment it decided. The reason is now recorded
+where the decision is made and quoted when the view expires, at warn, because
+at 0.37 a block this is the fleet's dominant cost and not an exceptional event.
+
+A round at the baseline settings, which reproduced it to the transaction
+(win1 10,666, win2 13,714 — the same figures as the three t6000 runs):
+
+| | |
+|---|---:|
+| timed-out views, fleet-wide | 88 |
+| of which "not this node's view to lead" | 83 (94%) |
+| commits, six of the nodes | 192 |
+| commits, node 3 | **111** |
+| nodes that ever logged BEHIND | **node 3, and no other** |
+
+Every node's timeouts were at views ≡ 3 (mod 7) — the views node 3 leads. One
+member out of seven was sick, never recovered, and paid its 1-in-7 leader slot
+at the full six-second `baseTimeout` about fourteen times. Fourteen views ×
+6 s is 84 s of dead time in a 90 s measurement: **the round was mostly node 3's
+timeouts.**
+
+Node 3's own log says how it got sick, and it is not what a stalled node usually
+looks like:
+
+```
+06:39:46.658  view 112 committed
+      …       11.08 s in which this node logs nothing at all
+06:39:57.742  view 113 times out
+06:39:57.773  view 113's body arrives — 31 ms after the view it belonged to expired
+```
+
+Not slow: silent. No bodies, no proposals, no votes, and its execution layer
+idle beside it. Something stopped the service loop for eleven seconds, and
+while it was stopped the node was deaf to the mesh.
+
+### What the loop was doing
+
+`forward_inbound_transactions` — handing the transactions the fleet gossiped to
+this node's own pool. The call site already carried a comment saying this loop
+cannot poll its transport while it awaits, and the fix that comment describes
+was to send the batch as one request instead of one per transaction. That was
+done, and it was not enough, because the batch itself has no bound: it is
+everything that arrived since the last step, the adapter chunks it into
+JSON-RPC batches of a thousand, and each chunk is a round trip the loop waits
+out. At 6,000 senders that is tens of thousands of transactions, tens of
+sequential round trips, against a pool already answering `txpool is full` — and
+every one of those validations is paid before the rejection.
+
+It is the only work in that loop whose size is set by the *fleet's* send rate
+rather than by the chain's. Everything else scales with one block.
+
+### What it costs
+
+A diagnostic round with the forwarding switched off entirely
+(`F7_NO_TX_GOSSIP=1`, which is sound only as a diagnostic: the flood submits to
+all seven RPCs, so in a bench round the gossip carries nothing the pools do not
+already have):
+
+| | baseline | forwarding off |
+|---|---:|---:|
+| win1 | 10,666 TPS, 2.143 s cycle | **34,284 TPS, 0.667 s** |
+| win2 | 13,714 TPS, 1.667 s cycle | **38,786 TPS, 0.588 s** |
+| transactions, whole round | 858,658 | **2,270,887** |
+| timed-out views | 88 | **5** |
+| commits, worst node / best node | 111 / 192 | **360 / 360** |
+
+Not one node fell behind. Occupancy stayed at 100%, so this is 22,857
+transactions a block at a 0.588 s cycle — twice gov5's block at rather more
+than gov5's rate, on the same machine.
+
+The 2.64× is the size of what one unbounded `await` in a consensus loop was
+costing, and every one of the five confirmed-but-inert mechanisms before it was
+inert for the same reason: they improved a median while the fleet was spending
+its time somewhere no median could see.
+
+**And 38,786 TPS is a floor, not a ceiling.** Window 3 collapses to 3.3%
+occupancy, which the first reading of this round put down to the base fee
+reaching 186 Ggwei and the chain pricing its own flood out. That reading is
+wrong, and the round's own numbers say so: window 3's base fee *starts* at 320,
+so the blocks before it were empty, and empty blocks are not what a chain that
+has priced its supply out looks like — they are what a chain with no supply
+looks like. `tx_flood` runs `while live > 0` and exits when every sender has
+sent its `--pertx`; at 6,000 x 500 that is 3,000,000 transactions and this round
+consumed 2,270,887 of them, so the generator was finishing while window 3 was
+being measured.
+
+Which means the chain was never shown to be saturated. Windows 1 and 2 took
+2.19M transactions in 60 s — about 36,500 a second offered against 36,535
+achieved — so the fleet kept up with everything it was given and its ceiling is
+somewhere above. The next round has to outsupply it before any of these figures
+can be called a maximum.
+
+Credit for that correction goes to the gov5 session working on the same host,
+which had just been caught by the same thing from the other side: their load
+generator's rate limit was a no-op under batching, so it dumped 12M transactions
+in 80 s and exited, and three of their four windows were measuring a draining
+pool while reporting it as the chain slowing down. Two harnesses, the same
+failure, found once. They also corrected the comparison figure taken from their
+RPC above: 45,700-48,000 TPS was an instantaneous sample, their own measured
+windows peak at ~41,500, and they have since established that their fleet
+saturates near 40,000 — raising offered load from 40k to 80k tx/s *lowered*
+their peak window to 36,190. So the target to size against is ~41,500, not
+48,000.
+
+### The fix that ships, and what it is worth
+
+Switching the forwarding off is a diagnostic. What ships is the forwarding
+moved off the loop entirely: its own task, its own HTTP client on the same
+public RPC, fed by a four-deep channel, and the loop hands over with `try_send`
+and never waits for an answer.
+
+An intermediate attempt is worth recording because it failed and the reason is
+the whole point. Rationing the forwarding inline — at most one JSON-RPC batch
+per step, so the stall is bounded rather than unbounded — measured **12,190
+TPS**, which is the baseline. The same total work spent in smaller pieces is the
+same total work, and a loop that waits for the pool at all is a loop that is
+deaf while it waits. Bounding the stall was never the fix; removing it was.
+
+Three rounds each, against the three-round baseline:
+
+| | baseline | forwarding off the loop |
+|---|---:|---:|
+| win1 TPS, median | 11,428 (10,999–11,428) | **22,290 (19,047–24,380)** |
+| whole round, median | 858,658 (5% spread) | **1,411,294 (10% spread)** |
+| ratio | — | **1.95x on win1, 1.64x on the round** |
+
+Neither pair of ranges overlaps, which after this file's history is the only
+form in which a result counts.
+
+The 1.64x understates it, and the reason matters more than the number: all
+three off-loop rounds report **zero** transactions in window 3, where the
+baseline still had 2,220 TPS of supply left to chew on. The faster fleet
+exhausts a 3,000,000-transaction round before the round is over, so the totals
+are comparing a fleet that ran out against one that did not.
+
+Window 2 says the same thing more precisely. Across the three rounds it runs at
+a **0.370–0.536 s cycle at 32.7–66.1% occupancy** — the fleet taking a 480M-gas
+block every 0.4 s and finding it half empty. At 22,857 transfers per full block
+that is a demonstrated appetite of roughly **54,800 transactions a second**
+against a generator supplying 22,662. So:
+
+**This fleet has never been saturated, and no number in this file is its
+maximum.** The next measurement has to outsupply it before any of them can be.

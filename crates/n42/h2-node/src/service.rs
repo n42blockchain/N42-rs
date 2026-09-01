@@ -203,6 +203,15 @@ pub struct H2Service<E> {
     /// not elapsed — so the next step must not wait for the view to time out
     /// before asking again. See [`PROPOSE_RETRY`].
     proposal_deferred: bool,
+    /// Why this node last declined to propose, for the timeout log to quote.
+    ///
+    /// A view that times out has exactly two shapes and they need opposite
+    /// fixes: the leader never proposed, or it proposed and the votes did not
+    /// arrive. Only the leader knows which, and only at the moment it decided,
+    /// so the reason is recorded there and read when the view expires. Every
+    /// previous attempt to attribute this fleet's timeouts worked by
+    /// subtracting medians from the cycle, which was wrong twice.
+    defer_reason: Option<&'static str>,
     /// Which header shapes this node puts on, and accepts from, the block
     /// topic. See [`HeaderProfile`].
     header_profile: HeaderProfile,
@@ -478,6 +487,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             meshed: false,
             checkpoint: None,
             proposal_deferred: false,
+            defer_reason: None,
             header_profile: HeaderProfile::Ethereum,
             native_wire: false,
             awaiting_bodies: HashSet::new(),
@@ -745,7 +755,22 @@ impl<E: ExecutionLayer> H2Service<E> {
             }
             () = &mut timeout => {
                 // A view that produced nothing advances only because of this.
-                debug!(target: "n42.h2.node", view = self.engine.current_view(), "view timed out");
+                // Logged at warn, and with its cause, because this is the
+                // fleet's dominant cost rather than an exceptional event: at
+                // the 480M tier the median path is 442 ms and the measured
+                // cycle 1,500 ms, and 0.37 timeouts a block at a 6 s
+                // `baseTimeout` is the whole of that difference. Which of the
+                // two shapes below it is decides what to fix.
+                let view = self.engine.current_view();
+                let leader = self.engine.is_current_leader();
+                warn!(
+                    target: "n42.h2.node",
+                    view,
+                    leader,
+                    proposed = self.proposed_view == Some(view),
+                    reason = self.defer_reason.unwrap_or(if leader { "proposed; the votes did not arrive" } else { "not this node's view to lead" }),
+                    "view timed out"
+                );
                 self.engine.on_timeout()?;
             }
             () = tokio::time::sleep(self.propose_retry), if self.proposal_deferred => {
@@ -1277,6 +1302,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         let view = self.engine.current_view();
         if self.proposed_view == Some(view) || !self.engine.is_current_leader() {
             self.proposal_deferred = false;
+            self.defer_reason = None;
             return;
         }
         // The parent is the block the highest QC certifies, not whatever the
@@ -1308,6 +1334,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 }
             }
             self.proposal_deferred = true;
+            self.defer_reason = Some("the QC's block is not imported here");
             return;
         }
         // Marked before the build, not after: a build that fails should not be
@@ -1325,9 +1352,11 @@ impl<E: ExecutionLayer> H2Service<E> {
             // again. This is how a leader paces itself against a clock coarser
             // than its commit latency.
             self.proposal_deferred = true;
+            self.defer_reason = Some("the attribute builder declined");
             return;
         };
         self.proposal_deferred = false;
+        self.defer_reason = None;
         self.proposed_view = Some(view);
         match self.driver.build_block_on(head, attrs, view).await {
             Ok(built) => {

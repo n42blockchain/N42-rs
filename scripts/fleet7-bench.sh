@@ -49,6 +49,7 @@ RPCBATCH=100
 # At 1e14 the cap is not reached until roughly ninety-eight consecutive full
 # blocks, which covers three thirty-second windows.
 GASPRICE=100000000000000
+GASCEIL=
 PROFILE_NODE=-1
 SHARD=
 
@@ -64,6 +65,7 @@ while (( $# )); do
     --conc)         CONC=$2; shift 2 ;;
     --rpcbatch)     RPCBATCH=$2; shift 2 ;;
     --gasprice)     GASPRICE=$2; shift 2 ;;
+    --gasceil)      GASCEIL=$2; shift 2 ;;
     --profile-node) PROFILE_NODE=$2; shift 2 ;;
     --shard-senders) SHARD=--shard-senders; shift ;;
     -h|--help)      sed -n '2,8p' "$0" | sed 's/^# \?//'; exit 0 ;;
@@ -74,13 +76,43 @@ done
 # The bench tier, exported so fleet7-env.sh builds the node arguments with it.
 # Declared here and nowhere else, for the reason at the top of fleet7-env.sh.
 export F7_PROFILE=${F7_PROFILE:-bench}
-export N42_MAX_GOSSIP_MB=${N42_MAX_GOSSIP_MB:-8}
+# Sized from the gas tier rather than fixed, so the cap never quietly becomes
+# the binding constraint when the tier moves. 8 MB holds a 480M-gas block of
+# transfers (~2.5 MB of RLP) with room to spare, and that ratio is kept: a cap
+# that starts truncating blocks presents as a gas ceiling that does not work,
+# which is a slow thing to recognise.
+export N42_MAX_GOSSIP_MB=${N42_MAX_GOSSIP_MB:-$(( ${GASCEIL:-480000000} / 60000000 ))}
 # A separate chain, not the production-shape one. Its period is 1 s rather than
 # 3, and its genesis gas limit is the tier's -- both are chain parameters, so a
-# round cannot borrow them from a flag. One second is this client's floor: the
-# proposer's pacing and the Engine API timestamp are both whole seconds, so
-# gov5's 0.496 s cycle is not reachable here without a millisecond path.
+# round cannot borrow them from a flag.
+#
+# The period is the chain's clock, not a floor on how fast blocks may be made.
+# A header's timestamp is its parent's plus the period whatever rate blocks
+# actually arrive at, so pacing below the period produces a chain whose own
+# clock runs ahead of the wall clock rather than an invalid block. gov5 do the
+# same when they benchmark a 3 s chainspec at 500 ms.
 export F7_GENESIS=${F7_GENESIS:-$(cd "$HERE/.." && pwd)/crates/chainspec/res/genesis/n42_fleet7_bench.json}
+
+# --gasceil sets the tier's gas limit in the *genesis*, not only as the builder's
+# ceiling, because those are not interchangeable. A block's gas limit may move by
+# 1/1024 of its parent's per block, so a chain born at 480M reaches a 960M
+# ceiling after roughly 710 blocks -- eighteen minutes at this fleet's cycle,
+# where the flood starts at thirty seconds. Pointed at a ceiling it has not
+# climbed to yet, a round measures the chain it was born as.
+#
+# The derived genesis is written per round rather than checked in: it differs
+# from the bench chain in one field, and a second near-identical genesis in the
+# tree is one more thing to keep in sync for no reason.
+if [[ -n $GASCEIL ]]; then
+  export F7_BENCH_GASCEIL=$GASCEIL
+  DERIVED=${F7_ROOT:-/data/blockchain/rust-fleet7-bench}/genesis-${GASCEIL}.json
+  mkdir -p "$(dirname "$DERIVED")"
+  python3 -c "import json,sys
+g = json.load(open(sys.argv[1]))
+g['gasLimit'] = hex(int(sys.argv[3]))
+json.dump(g, open(sys.argv[2], 'w'), indent=2)" "$F7_GENESIS" "$DERIVED" "$GASCEIL"
+  export F7_GENESIS=$DERIVED
+fi
 # The interval is a measurement parameter here, not a property of the chain.
 export F7_BLOCK_INTERVAL_MS=${F7_BLOCK_INTERVAL_MS:-1000}
 # The chain's own baseTimeout unless a round overrides it, and NOT a multiple of

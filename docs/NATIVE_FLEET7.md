@@ -1912,3 +1912,55 @@ the point.
 Running total at the 163,000-transaction tier: **48,898 -> 54,331 -> 59,764 ->
 65,177 TPS**, a third more than the tier started at, from four changes of which
 none were tuning and three came from reading N42-26's devlogs.
+
+### Building ahead, measured again: a 4x regression became an 8% gain
+
+The same change, the same switch, re-measured after the leader's path had been
+cleared of the three redundant decodes and the awaited import:
+
+| | win2 | cycle | prepared builds used |
+|---|---:|---:|---|
+| `N42_BUILD_AHEAD` off | 65,177 TPS | 2.501 s | — |
+| `N42_BUILD_AHEAD` on | **70,615 TPS** | **2.308 s** | 17 of 19 |
+
+It had measured **four times slower** at the 480M tier, across three rounds,
+with the switch flipped back reproducing the baseline to the transaction. That
+measurement was not wrong. It was a measurement of the code as it stood: a
+leader whose loop was held for 710 ms by an awaited import and whose path
+carried three full decodes of its own block had no room to use a payload
+prepared early, and the prepared forkchoice competed with an execution layer
+that was already busy.
+
+The lesson is not "measure twice". It is that **a negative result is about the
+system it was measured in, not about the idea**, and when the system changes
+enough the result has to be re-earned. Nothing in this file's method catches
+that automatically; what caught it was noticing that the leader's build had
+become the largest item on the serial chain and asking what would remove it.
+
+Running total at the 163,000-transaction tier: 48,898 -> 54,331 -> 59,764 ->
+65,177 -> **70,615 TPS**, cycle 3.33 s -> 2.31 s.
+
+### The workload is not the same workload
+
+Then a comparison problem, found by reading N42-26's stress generator rather
+than their devlogs:
+
+| | recipients |
+|---|---|
+| this fleet's `tx_flood` | **one** — every transfer goes to `0x4242…42` |
+| N42-26's `n42-stress` | up to **2,000,000 distinct**, hash-derived |
+
+Their 163,000-transaction block touches up to 163,000 recipient accounts. This
+fleet's touches one. That is five orders of magnitude of difference in state
+writes per block, and it runs against this fleet in the comparison: **their
+blocks do more work than these and are still 2.2x faster**, so the gap measured
+here is if anything understated.
+
+It also makes one direction untestable. Every transaction in these blocks writes
+the same account, so a Block-STM parallel executor would find a write-write
+conflict on every one and serialise — which is why N42-26's own roadmap says the
+speedup "shows only on contract-heavy blocks". Parallel execution cannot be
+evaluated on this workload at all.
+
+The generator has to change before any of these numbers can be called a
+comparison. Fixing it will lower them.

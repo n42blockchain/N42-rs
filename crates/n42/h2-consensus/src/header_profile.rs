@@ -422,12 +422,21 @@ pub fn execution_data_for_block_with_bal(
                 alloy_rpc_types_engine::ExecutionPayloadV4 {
                     payload_inner: v3,
                     block_access_list,
-                    // As in the Engine API adapter: this chain has no slots, so
-                    // the block's own number stands in, and every node derives
-                    // it from the block rather than being told.
                     slot_number: block.header.number,
                 },
             ),
+            // alloy's `from_block_unchecked` already produces a V4 payload for a
+            // header that carries `block_access_list_hash`, with the 32-byte
+            // *hash* standing in for the list it does not have. Left there, the
+            // payload the leader seals and gossips carries a hash where every
+            // importer expects a list: reth cannot decode it, and a follower's
+            // `try_into_block` hashes the 32 bytes and never reproduces the
+            // sealed header. This was gate 9, and it was on the leader.
+            ExecutionPayload::V4(mut v4) => {
+                v4.block_access_list = block_access_list;
+                v4.slot_number = block.header.number;
+                ExecutionPayload::V4(v4)
+            }
             other => other,
         },
         None => payload,
@@ -679,21 +688,17 @@ mod tests {
     /// A block whose header carries EIP-7928's access-list hash has to be
     /// reconstructible from the payload that describes it.
     ///
-    /// **Currently failing, and kept because it is the cheapest statement of
-    /// what is left.** Two things are already known from it: the payload
-    /// conversion returns `block_access_list_hash: None` rather than the sealed
-    /// value, and correcting only that field still does not reproduce the
-    /// sealed hash — so at least one other header field also differs between
-    /// what is sealed and what a payload reconstructs. Finding it is a
-    /// field-by-field comparison, which this test is the right place to do.
+    /// This was gate 9 on the way to parallel execution, and it took a unit
+    /// test to see it: the fleet only ever said "no gov5 header variant hashes
+    /// to the payload's block hash", three hops from the cause. The cause was
+    /// `execution_data_for_block_with_bal` handing on a V4 payload whose list
+    /// field held the header's 32-byte hash (alloy's placeholder) instead of
+    /// the list, so every importer hashed the placeholder.
     ///
     /// The payload carries the *list*; the header carries its *hash*, derived by
-    /// the execution layer. So the field is absent from anything rebuilt from a
-    /// payload unless it is recomputed, and a header that hashes differently is
-    /// a block the node refuses — which on a live fleet surfaces three hops away
-    /// as "no gov5 header variant hashes to the payload's block hash".
+    /// the execution layer. The field-by-field print stays because it is what
+    /// names a field when the assertion at the end fails.
     #[test]
-    #[ignore = "open: an Amsterdam header does not yet round-trip through a payload"]
     fn a_header_with_an_access_list_hash_is_reconstructible() {
         let bal_bytes = alloy_primitives::Bytes::from(alloy_rlp::encode(
             &alloy_eip7928::BlockAccessList::default(),
@@ -743,8 +748,7 @@ mod tests {
         // so the field comes back wrong and the reconstruction has to try the
         // computed value alongside it. That is the whole reason this test
         // exists.
-        let direct = data.clone().try_into_block::<TxEnvelope>().unwrap();
-        assert_ne!(direct.header.block_access_list_hash, Some(bal_hash));
+
         // Field by field, because "no variant matched" names no field.
         let sealed = normalize_to_gov5_h2_with_header(
             &execution_data_for_block_with_bal(hash, &block, Some(bal_bytes2)),

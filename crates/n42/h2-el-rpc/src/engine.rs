@@ -46,7 +46,8 @@ use alloy_eips::eip7685::{Requests, RequestsOrHash};
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::{
     CancunPayloadFields, ExecutionData, ExecutionPayload, ExecutionPayloadInputV2,
-    ExecutionPayloadSidecar, ExecutionPayloadV3, ForkchoiceState, ForkchoiceUpdated,
+    ExecutionPayloadSidecar, ExecutionPayloadV3, ExecutionPayloadV4, ForkchoiceState,
+    ForkchoiceUpdated,
     PayloadAttributes, PayloadId, PayloadStatus, PraguePayloadFields,
 };
 use n42_h2_execution::{ChainBlock, BuiltBlock, ElError, ExecutionLayer, ResolveKind};
@@ -168,9 +169,28 @@ pub fn new_payload_call(data: &ExecutionData) -> Result<(&'static str, Vec<Value
                 None => ("engine_newPayloadV3", params),
             })
         }
-        ExecutionPayload::V4(_) => Err(ElError::new(
-            "Amsterdam payloads (engine_newPayloadV5) are not supported by this adapter",
-        )),
+        // Amsterdam: the same three arguments as V4 plus the requests, with the
+        // access list riding inside the payload itself. Sending this block to
+        // `newPayloadV4` is refused outright -- reth's version gate rejects
+        // `(V4, Payload)` once Amsterdam is active -- and sending it without
+        // the access list would be worse than refused: the block would import
+        // serially and nothing would say why.
+        ExecutionPayload::V4(payload) => {
+            let versioned_hashes = sidecar.versioned_hashes().cloned().unwrap_or_default();
+            let parent_beacon_block_root = sidecar.parent_beacon_block_root().ok_or_else(|| {
+                ElError::new("a V4 payload needs a parent beacon block root; sidecar has none")
+            })?;
+            let requests = sidecar.requests().cloned().unwrap_or_default();
+            Ok((
+                "engine_newPayloadV5",
+                vec![
+                    json!(payload),
+                    json!(versioned_hashes),
+                    json!(parent_beacon_block_root),
+                    json!(requests),
+                ],
+            ))
+        }
     }
 }
 
@@ -182,13 +202,29 @@ pub fn new_payload_call(data: &ExecutionData) -> Result<(&'static str, Vec<Value
 pub const fn forkchoice_method(attrs: Option<&PayloadAttributes>) -> &'static str {
     match attrs {
         // Without attributes this is a plain head/finalise update. V3 accepts
-        // that on every post-Cancun chain, which is every chain this runs on.
+        // that on every post-Cancun chain, which is every chain this runs on,
+        // and Amsterdam's version gate only rejects V3 when it carries
+        // attributes.
         None => "engine_forkchoiceUpdatedV3",
-        Some(attrs) if attrs.parent_beacon_block_root.is_some() => "engine_forkchoiceUpdatedV3",
+        Some(attrs) if attrs.parent_beacon_block_root.is_some() => FCU_WITH_ATTRS_NEWEST,
         Some(attrs) if attrs.withdrawals.is_some() => "engine_forkchoiceUpdatedV2",
         Some(_) => "engine_forkchoiceUpdatedV1",
     }
 }
+
+/// The `forkchoiceUpdated` version used to *start a build*, newest first.
+///
+/// Amsterdam rejects `(V3, PayloadAttributes)` outright — reth's
+/// `validate_version_specific_fields` returns `UNSUPPORTED_FORK` — so a chain
+/// with `amsterdamTime` set needs V4 to begin a payload at all. A chain without
+/// it rejects V4 the same way, so the caller falls back; see
+/// [`FCU_WITH_ATTRS_METHODS`].
+const FCU_WITH_ATTRS_NEWEST: &str = "engine_forkchoiceUpdatedV4";
+
+/// Every `forkchoiceUpdated`-with-attributes version, newest first, for the
+/// fallback the fork schedule would otherwise have to be carried to decide.
+pub const FCU_WITH_ATTRS_METHODS: [&str; 2] =
+    ["engine_forkchoiceUpdatedV4", "engine_forkchoiceUpdatedV3"];
 
 /// The `getPayload` versions, newest first.
 ///
@@ -200,8 +236,8 @@ pub const fn forkchoice_method(attrs: Option<&PayloadAttributes>) -> &'static st
 /// arrives without its execution requests, the block re-imported from it lacks
 /// the requests hash its header carries, and the leader's own execution layer
 /// rejects the block it just built with "block hash mismatch".
-const GET_PAYLOAD_METHODS: [&str; 3] =
-    ["engine_getPayloadV5", "engine_getPayloadV4", "engine_getPayloadV3"];
+const GET_PAYLOAD_METHODS: [&str; 4] =
+    ["engine_getPayloadV6", "engine_getPayloadV5", "engine_getPayloadV4", "engine_getPayloadV3"];
 
 /// What every `getPayload` version has in common.
 ///
@@ -218,6 +254,14 @@ struct GetPayloadEnvelope {
     blobs_bundle: BlobCommitments,
     #[serde(default)]
     execution_requests: Option<Vec<alloy_primitives::Bytes>>,
+    /// The EIP-7928 block access list, from Amsterdam's V6 envelope.
+    ///
+    /// Worth carrying for one reason: reth executes a block in parallel when it
+    /// has one and serially when it does not
+    /// (`payload_validator.rs::bal_path_eligible`). Dropping it here is the
+    /// difference between rayon workers and a `while` loop.
+    #[serde(default)]
+    block_access_list: Option<alloy_primitives::Bytes>,
 }
 
 #[derive(Default, serde::Deserialize)]
@@ -270,17 +314,32 @@ pub fn built_block_from_envelope(
         None => ExecutionPayloadSidecar::v3(cancun),
     };
 
+    // V4 when the build came back with an access list, V3 otherwise. The
+    // variant is what carries the list to `newPayload`, and `newPayload` is
+    // where reth decides between rayon workers and a `while` loop.
+    let payload = match envelope.block_access_list {
+        Some(block_access_list) => ExecutionPayload::V4(ExecutionPayloadV4 {
+            payload_inner: envelope.execution_payload,
+            block_access_list,
+            // EIP-7843's slot number is a consensus-layer concept and this
+            // chain has no slots: HotStuff commits a block per view, so the
+            // block's own number is the only monotonic index every member
+            // agrees on without being told. It is what this node will send
+            // back with the block, so leader and followers derive it the same
+            // way from the same block.
+            slot_number: number,
+        }),
+        None => ExecutionPayload::V3(envelope.execution_payload),
+    };
+
     Ok(BuiltBlock {
         hash,
         number,
         timestamp,
         tx_count,
-        execution_data: ExecutionData::new(
-            ExecutionPayload::V3(envelope.execution_payload),
-            sidecar,
-        ),
+        execution_data: ExecutionData::new(payload, sidecar),
         blob_tx_hashes,
-            header: None,
+        header: None,
     })
 }
 

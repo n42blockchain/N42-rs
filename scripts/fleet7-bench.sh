@@ -162,10 +162,20 @@ export F7_BLOCK_INTERVAL_MS=${F7_BLOCK_INTERVAL_MS:-1000}
 export F7_VIEW_TIMEOUT_MS=${F7_VIEW_TIMEOUT_MS:-}
 export F7_ROOT=${F7_ROOT:-/data/blockchain/rust-fleet7-bench}
 source "$HERE/fleet7-env.sh"
-f7_check_binary_fresh || exit 1
 
+# The output directory before anything can refuse, so a refusal leaves a record.
+#
+# Everything that rejects a round -- the staleness guard, the base-fee decay, the
+# faucet -- used to run before `mkdir`, so an early exit produced no directory,
+# no round.txt and no reason. Four rounds died that way and each cost a re-run to
+# find out why. A failure that leaves nothing behind is the same defect class as
+# a failure that leaves a wrong number.
 OUT=$F7_ROOT/bench-$TAG
 mkdir -p "$OUT"
+exec > >(tee -a "$OUT/round.txt") 2>&1
+
+f7_check_binary_fresh || exit 1
+
 CHAIN=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['config']['chainId'])" "$F7_GENESIS")
 RPCS=$(for ((i = 0; i < F7_NODES; i++)); do printf 'http://127.0.0.1:%s,' $((F7_HTTP_BASE + i)); done | sed 's/,$//')
 
@@ -174,9 +184,9 @@ RPCS=$(for ((i = 0; i < F7_NODES; i++)); do printf 'http://127.0.0.1:%s,' $((F7_
   echo "tier         : gossip ${N42_MAX_GOSSIP_MB}MB, gas ceiling ${F7_BENCH_GASCEIL}, pool ${F7_BENCH_POOL_SLOTS}, pacing ${F7_BLOCK_INTERVAL_MS}ms, view timeout ${F7_VIEW_TIMEOUT_MS:-genesis}"
   echo "supply       : $SENDERS senders x $PERTX tx, offset $OFFSET, conc $CONC, batch $RPCBATCH${SHARD:+, sharded}, $RECIPIENTS recipients"
   echo "windows      : $WINDOWS x ${WINDOW_SEC}s after ${DECAY_SEC}s of base-fee decay"
-} | tee "$OUT/round.txt"
+}
 
-"$HERE/fleet7.sh" up --fresh | tee -a "$OUT/round.txt"
+"$HERE/fleet7.sh" up --fresh
 
 # Empty blocks until the base fee has actually decayed, rather than for a fixed
 # time.
@@ -211,14 +221,14 @@ while (( BASEFEE > DECAY_TARGET && SECONDS - DECAY_START < DECAY_MAX_SEC )); do
   sleep 2
   BASEFEE=$(read_basefee)
 done
-echo "decay        : ${BASEFEE} wei after $((SECONDS - DECAY_START))s of empty blocks (target ${DECAY_TARGET})" | tee -a "$OUT/round.txt"
+echo "decay        : ${BASEFEE} wei after $((SECONDS - DECAY_START))s of empty blocks (target ${DECAY_TARGET})"
 if (( BASEFEE > DECAY_TARGET )); then
-  echo "REFUSING: the base fee did not reach ${DECAY_TARGET} wei in ${DECAY_MAX_SEC}s; the chain is not making empty blocks" | tee -a "$OUT/round.txt"
+  echo "REFUSING: the base fee did not reach ${DECAY_TARGET} wei in ${DECAY_MAX_SEC}s; the chain is not making empty blocks"
   exit 1
 fi
-echo "base fee     : $BASEFEE wei against a $GASPRICE cap" | tee -a "$OUT/round.txt"
+echo "base fee     : $BASEFEE wei against a $GASPRICE cap"
 if (( BASEFEE >= GASPRICE )); then
-  echo "REFUSING: the base fee is at or above the flood's price; this round would die in funding" | tee -a "$OUT/round.txt"
+  echo "REFUSING: the base fee is at or above the flood's price; this round would die in funding"
   exit 1
 fi
 
@@ -231,7 +241,7 @@ fi
 FLOOD_CORES=${F7_FLOOD_CORES:-$((F7_CORE_OFFSET + F7_NODES * F7_CORES_PER_NODE))-$(($(nproc) - 1))}
 FLOOD_PIN=""
 [[ $F7_PIN == 1 ]] && FLOOD_PIN="taskset -c $FLOOD_CORES"
-echo "flood cores  : ${FLOOD_CORES}" | tee -a "$OUT/round.txt"
+echo "flood cores  : ${FLOOD_CORES}"
 # The binary ingest path, when a round asked for one. Funding stays on RPC --
 # it is six thousand transactions once and it reads nonces back -- so the RPC
 # list is passed either way.
@@ -239,7 +249,7 @@ INGEST_ARG=()
 if [[ -n ${F7_INGEST:-} ]]; then
   INGESTS=$(for ((i = 0; i < F7_NODES; i++)); do printf '127.0.0.1:%s,' $((F7_INGEST_BASE + i)); done | sed 's/,$//')
   INGEST_ARG=(--ingest "$INGESTS")
-  echo "ingest       : $INGESTS" | tee -a "$OUT/round.txt"
+  echo "ingest       : $INGESTS"
 fi
 setsid $FLOOD_PIN "$F7_BIN/examples/tx_flood" --rpc "$RPCS" --chain-id "$CHAIN" \
   "${INGEST_ARG[@]}" --recipients "$RECIPIENTS" \
@@ -247,7 +257,7 @@ setsid $FLOOD_PIN "$F7_BIN/examples/tx_flood" --rpc "$RPCS" --chain-id "$CHAIN" 
   --conc "$CONC" --rpcbatch "$RPCBATCH" $SHARD \
   > "$OUT/flood.log" 2>&1 < /dev/null &
 FLOOD=$!
-echo "flood        : pid $FLOOD, log $OUT/flood.log" | tee -a "$OUT/round.txt"
+echo "flood        : pid $FLOOD, log $OUT/flood.log"
 
 # Wait for funding to mine before the first window, or window 1 measures the
 # funding phase instead of the flood.
@@ -260,18 +270,18 @@ for _ in $(seq 1 180); do
   grep -aq "^Error:" "$OUT/flood.log" 2>/dev/null && { cat "$OUT/flood.log"; exit 1; }
   sleep 1
 done
-grep -a "faucet\|funding" "$OUT/flood.log" | tee -a "$OUT/round.txt"
+grep -a "faucet\|funding" "$OUT/flood.log"
 
 for ((w = 1; w <= WINDOWS; w++)); do
-  "$HERE/fleet7-measure.py" "$F7_HTTP_BASE" "$WINDOW_SEC" "win$w" | tee -a "$OUT/round.txt"
+  "$HERE/fleet7-measure.py" "$F7_HTTP_BASE" "$WINDOW_SEC" "win$w"
   # A profile is pulled between windows, never inside one.
   if (( PROFILE_NODE >= 0 && w < WINDOWS )); then
-    "$HERE/fleet7-profile.sh" "$PROFILE_NODE" "$OUT/profile-win$w" 2>&1 | tail -3 | tee -a "$OUT/round.txt"
+    "$HERE/fleet7-profile.sh" "$PROFILE_NODE" "$OUT/profile-win$w" 2>&1 | tail -3
   fi
 done
 
-echo "--- resources at the end of the round ---" | tee -a "$OUT/round.txt"
-"$HERE/fleet7.sh" stats | tail -3 | tee -a "$OUT/round.txt"
+echo "--- resources at the end of the round ---"
+"$HERE/fleet7.sh" stats | tail -3
 kill "$FLOOD" 2>/dev/null || true
-tail -3 "$OUT/flood.log" | tee -a "$OUT/round.txt"
+tail -3 "$OUT/flood.log"
 echo "round recorded in $OUT/round.txt"

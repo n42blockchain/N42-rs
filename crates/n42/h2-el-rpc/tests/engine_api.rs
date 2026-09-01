@@ -190,19 +190,29 @@ fn a_v3_payload_without_cancun_fields_is_refused_rather_than_defaulted() {
 }
 
 #[test]
-fn amsterdam_is_refused_at_the_call_rather_than_mapped_by_guess() {
-    // There is no execution client here to check the V5 mapping against, and a
-    // wrong guess would first fail at the Amsterdam fork on a live chain.
+fn an_amsterdam_payload_goes_to_v5_with_its_access_list() {
+    // The access list is the reason this variant exists: reth executes a block
+    // in parallel when it carries one and serially when it does not, so a V4
+    // payload sent as V3 would import correctly and quietly lose the
+    // parallelism. It also cannot be sent to `newPayloadV4` at all -- reth's
+    // version gate rejects `(V4, Payload)` once Amsterdam is active.
+    let cancun = CancunPayloadFields {
+        parent_beacon_block_root: B256::repeat_byte(9),
+        versioned_hashes: vec![],
+    };
     let data = ExecutionData::new(
         ExecutionPayload::V4(ExecutionPayloadV4 {
             payload_inner: payload_v3(),
-            block_access_list: Bytes::new(),
-            slot_number: 0,
+            block_access_list: Bytes::from_static(&[0xc0]),
+            slot_number: 7,
         }),
-        ExecutionPayloadSidecar::none(),
+        ExecutionPayloadSidecar::v3(cancun),
     );
-    let err = new_payload_call(&data).unwrap_err();
-    assert!(err.to_string().contains("Amsterdam"));
+    let (method, params) = new_payload_call(&data).unwrap();
+    assert_eq!(method, "engine_newPayloadV5");
+    assert_eq!(params.len(), 4, "payload, versioned hashes, beacon root, requests");
+    let sent = serde_json::to_string(&params[0]).unwrap();
+    assert!(sent.contains("blockAccessList"), "the access list has to reach the node");
 }
 
 #[tokio::test]
@@ -243,11 +253,15 @@ async fn attributes_choose_the_forkchoice_version() {
         .await
         .unwrap();
 
+    // A forkchoice with no attributes stays on V3 — Amsterdam's version gate
+    // rejects V3 only when it carries attributes — while one that starts a
+    // build goes to V4, because `(V3, PayloadAttributes)` is refused outright
+    // once Amsterdam is active and a chain without Amsterdam falls back.
     assert_eq!(
         recorder.methods(),
         vec![
             "engine_forkchoiceUpdatedV3",
-            "engine_forkchoiceUpdatedV3",
+            "engine_forkchoiceUpdatedV4",
             "engine_forkchoiceUpdatedV2",
         ]
     );
@@ -397,6 +411,9 @@ async fn a_v4_envelope_keeps_its_execution_requests() {
 #[tokio::test]
 async fn get_payload_is_asked_newest_first_until_a_version_accepts_the_fork() {
     let recorder = Recorder::with_answers(vec![
+        // One refusal per version above the one that answers: V6, V5 and V4
+        // all decline, so the ladder has to reach V3 to find the Cancun build.
+        Err(UNSUPPORTED_FORK),
         Err(UNSUPPORTED_FORK),
         Err(UNSUPPORTED_FORK),
         Ok(json!({
@@ -412,9 +429,17 @@ async fn get_payload_is_asked_newest_first_until_a_version_accepts_the_fork() {
         .await
         .expect("the build exists")
         .expect("and is usable");
+    // V6 first now: Amsterdam's envelope is the only one that carries the
+    // access list, and a build collected through an older version imports
+    // serially with nothing to say it could have been parallel.
     assert_eq!(
         recorder.methods(),
-        vec!["engine_getPayloadV5", "engine_getPayloadV4", "engine_getPayloadV3"]
+        vec![
+            "engine_getPayloadV6",
+            "engine_getPayloadV5",
+            "engine_getPayloadV4",
+            "engine_getPayloadV3",
+        ]
     );
     // A Cancun-shaped envelope carries no requests, so the re-import goes to V3.
     assert_eq!(new_payload_call(&built.execution_data).unwrap().0, "engine_newPayloadV3");
@@ -437,7 +462,7 @@ async fn an_osaka_envelope_is_read_and_re_imported_with_its_requests() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(recorder.methods(), vec!["engine_getPayloadV5"]);
+    assert_eq!(recorder.methods(), vec!["engine_getPayloadV6"]);
     assert!(built.execution_data.sidecar.requests().is_some());
     assert_eq!(new_payload_call(&built.execution_data).unwrap().0, "engine_newPayloadV4");
 }

@@ -90,6 +90,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut propose = false;
     let mut mobile_addr: Option<String> = None;
     let mut datadir: Option<String> = None;
+    let mut node_key: Option<String> = None;
+    let mut worker_threads: Option<usize> = None;
+    let mut block_interval_ms: Option<u64> = None;
     let mut base_timeout_ms: Option<u64> = None;
     let mut max_timeout_ms: Option<u64> = None;
     let mut period_secs: u64 = 1;
@@ -121,6 +124,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 base_timeout_ms = Some(args.next().ok_or("--timeout-ms needs a value")?.parse()?)
             }
             "--datadir" => datadir = Some(args.next().ok_or("--datadir needs a path")?),
+            "--node-key" => node_key = Some(args.next().ok_or("--node-key needs a hex secret")?),
+            "--block-interval-ms" => {
+                block_interval_ms =
+                    Some(args.next().ok_or("--block-interval-ms needs a value")?.parse()?)
+            }
+            "--worker-threads" => {
+                worker_threads =
+                    Some(args.next().ok_or("--worker-threads needs a value")?.parse()?)
+            }
             "--mobile" => mobile_addr = Some(args.next().ok_or("--mobile needs an address")?),
             "--propose" => propose = true,
             "--help" | "-h" => {
@@ -208,19 +220,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("give at least one --peer to dial or one --listen address".into());
     }
 
+    // The chain's period is the pacing unless a benchmark overrides it, which
+    // gov5 spells the same way. Warn rather than merely document: a fleet whose
+    // timestamps have left the wall clock is not one to leave running.
+    let period_ms = block_interval_ms.unwrap_or(period_secs.saturating_mul(1000)).max(1);
+    if period_ms < 1000 {
+        eprintln!(
+            "WARNING: --block-interval-ms {period_ms} is under a second. Block timestamps will be \
+             taken from the parent rather than the clock, so this chain's time runs ahead of real \
+             time and it cannot interoperate with gov5. Benchmarks only."
+        );
+    }
+
     let el_url: url::Url = el_url.ok_or("--el is required")?.parse()?;
     let jwt = JwtSecret::from_file(Path::new(&jwt_path.ok_or("--jwt is required")?))?;
 
+    // The libp2p identity has to outlive the process. A fleet is wired with
+    // static multiaddrs that name a peer id, so a node that draws a fresh key
+    // at every start comes back after a restart as a stranger: its peers' dial
+    // entries point at an identity that no longer exists, and it has to be
+    // rediscovered by whatever is left. gov5 keeps this key in
+    // `<datadir>/network-keys`; this keeps it in `<datadir>/network-key`, in
+    // the same form (a hex secp256k1 secret), so `h2_keygen --libp2p-peer-id`
+    // reads either.
+    let keypair = load_or_create_identity(node_key.as_deref(), datadir.as_deref())?;
+
+    // A consensus node is latency-bound, not throughput-bound: it signs, gossips
+    // and waits. tokio's default is one worker per core, which on a many-core
+    // host means hundreds of threads per validator and, in a fleet of seven,
+    // thousands of stacks for work that never fills four.
+    let workers = worker_threads.unwrap_or_else(|| {
+        std::thread::available_parallelism().map_or(4, |n| n.get().min(4))
+    });
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
         .enable_all()
         .build()?;
     runtime.block_on(async move {
-        let transport = H2V4Transport::new(config)?;
+        let transport = H2V4Transport::with_keypair(config, keypair)?;
         println!("node peer id : {}", transport.local_peer_id());
         println!("chain        : id {} genesis {}", identity.chain_id, identity.genesis_hash);
         println!("validator    : index {index} of {validator_count} (f = {f})");
         println!("execution    : {el_url}");
         println!("proposing    : {}", if propose { "yes" } else { "no (votes only)" });
+        println!("pacing       : {period_ms} ms");
 
         // Phones verify the Decide, not this node's word for it, so the endpoint
         // needs the chain identity the envelopes are bound to.
@@ -385,6 +428,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if !withdrawals.is_empty() {
                 println!("block rewards: {} withdrawal(s) per block", withdrawals.len());
             }
+            // The service polls the builder while a proposal is deferred, and
+            // that poll quantises the block interval, so it has to be sized
+            // from the pacing rather than left at its production default.
+            service = service.with_block_pacing(Duration::from_millis(period_ms));
             service = service.with_payload_attributes(move |context| {
                 let parent_beacon_block_root = match (&committee, &context.head_header) {
                     (Some(pool), Some(parent)) => {
@@ -405,7 +452,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     fee_recipient,
                     withdrawals.clone(),
                     parent_beacon_block_root,
-                    period_secs,
+                    period_ms,
                     context.head_timestamp,
                     context.head_seen,
                 )
@@ -474,19 +521,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// the future (the execution layer rejects the block outright). Both were
 /// observed on a live node. Declining in between paces the chain at roughly one
 /// block per second, which is what the timestamp resolution allows.
+///
+/// # Below a second
+///
+/// `period_ms` under 1000 is a benchmark mode and changes what a timestamp
+/// means. A header's timestamp is a whole second and must strictly exceed its
+/// parent's, so more than one block a second cannot be stamped from the wall
+/// clock at all; the block instead takes `parent + 1`, and the chain's clock
+/// runs ahead of real time in proportion to how far under a second the pacing
+/// is. That is harmless while measuring throughput and wrong for anything else:
+/// the stamps stop describing when blocks happened, and gov5 drops a gossiped
+/// block whose timestamp is ahead of its own clock, so such a fleet cannot be
+/// mixed with one. gov5 draws the same line, with the same units, in
+/// `--block-interval-ms`.
 fn block_attributes(
     fee_recipient: Address,
     withdrawals: Vec<alloy_eips::eip4895::Withdrawal>,
     parent_beacon_block_root: B256,
-    period_secs: u64,
+    period_ms: u64,
     head_timestamp: Option<u64>,
     head_seen: Option<std::time::Instant>,
 ) -> Option<PayloadAttributes> {
     static LAST: AtomicU64 = AtomicU64::new(0);
-    let now = SystemTime::now()
+    let sub_second = period_ms < 1000;
+    let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_millis() as u64)
         .unwrap_or_default();
+    let now = now_ms / 1000;
     // Two clocks constrain a block's timestamp, and they are not the same
     // clock. The stamp is the wall clock — gov5 ignores any gossiped block
     // whose timestamp is ahead of its own clock, with no tolerance — and it
@@ -501,21 +563,34 @@ fn block_attributes(
     // pace against this node's own last proposal.
     match (head_timestamp, head_seen) {
         (Some(parent), seen) => {
-            if now <= parent {
+            // Under a second the wall clock cannot separate two blocks, so the
+            // stamp comes from the parent instead and this test would refuse
+            // every one of them.
+            if !sub_second && now <= parent {
                 return None;
             }
-            if seen.is_some_and(|seen| seen.elapsed().as_secs() < period_secs) {
+            if seen.is_some_and(|seen| (seen.elapsed().as_millis() as u64) < period_ms) {
                 return None;
             }
         }
         (None, _) => {
-            if now < LAST.load(Ordering::Relaxed).saturating_add(period_secs) {
+            // LAST is milliseconds so that it can be compared with `period_ms`
+            // whatever the pacing is. Keeping it in seconds and adding a
+            // millisecond period to it silently disables this guard: the two
+            // sides differ by a factor of a thousand, so the test never fires.
+            if now_ms < LAST.load(Ordering::Relaxed).saturating_add(period_ms) {
                 return None;
             }
         }
     }
-    let timestamp = now;
-    if LAST.fetch_max(timestamp, Ordering::Relaxed) >= timestamp {
+    let timestamp = match head_timestamp {
+        Some(parent) if sub_second => parent + 1,
+        _ => now,
+    };
+    // `fetch_max` rather than a store: a clock that jumps backwards must not be
+    // able to reopen a second this node has already proposed in.
+    let previous_ms = LAST.fetch_max(now_ms, Ordering::Relaxed);
+    if !sub_second && previous_ms / 1000 >= timestamp {
         // Already proposed in this second.
         return None;
     }
@@ -528,6 +603,50 @@ fn block_attributes(
         target_gas_limit: None,
         slot_number: None,
     })
+}
+
+/// The node's libp2p identity: `--node-key` if given, else `<datadir>/network-key`
+/// (created on first use), else a fresh key that lives only as long as the process.
+fn load_or_create_identity(
+    node_key: Option<&str>,
+    datadir: Option<&str>,
+) -> Result<libp2p::identity::Keypair, Box<dyn std::error::Error>> {
+    let hex_secret = match (node_key, datadir) {
+        // A path is accepted as well as a literal, so a key never has to appear
+        // in a process listing.
+        (Some(value), _) => {
+            let path = Path::new(value);
+            if path.is_file() { std::fs::read_to_string(path)? } else { value.to_owned() }
+        }
+        (None, Some(dir)) => {
+            let path = Path::new(dir).join("network-key");
+            if path.is_file() {
+                std::fs::read_to_string(&path)?
+            } else {
+                use std::io::Write as _;
+                let secret = libp2p::identity::secp256k1::SecretKey::generate();
+                let hex_secret = hex::encode(secret.to_bytes());
+                std::fs::create_dir_all(dir)?;
+                // Created private, not made private afterwards: writing the
+                // secret first and fixing the mode second leaves a window in
+                // which anyone on the host can read it.
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt as _;
+                    options.mode(0o600);
+                }
+                options.open(&path)?.write_all(hex_secret.as_bytes())?;
+                hex_secret
+            }
+        }
+        // Stateless: the node cannot be restarted into the fleet anyway.
+        (None, None) => return Ok(libp2p::identity::Keypair::generate_ed25519()),
+    };
+    let mut bytes = hex::decode(hex_secret.trim().trim_start_matches("0x"))?;
+    let secret = libp2p::identity::secp256k1::SecretKey::try_from_bytes(&mut bytes)?;
+    Ok(libp2p::identity::secp256k1::Keypair::from(secret).into())
 }
 
 const USAGE: &str = "\
@@ -547,6 +666,11 @@ h2_validator — run a participating HotStuff-2 v4 node against an execution lay
   --propose                 build blocks when leader (default: vote only)
   --mobile <addr>           serve the mobile_* endpoint here (e.g. 127.0.0.1:9545)
   --datadir <path>          persist consensus state here (required to restart safely)
+  --node-key <0x…|path>     libp2p secp256k1 identity; without it, <datadir>/network-key
+  --block-interval-ms <n>   pace in milliseconds, overriding the chain's period.
+                            Below 1000 the chain's clock leaves real time; see
+                            block_attributes. Benchmarks only.
+  --worker-threads <n>      tokio worker threads (default: min(cores, 4))
   --fault-tolerance <u32>   override f; defaults to (n-1)/3
   --timeout-ms <u64>        base view timeout (default: genesis hotstuff.baseTimeout, else 4000)
 ";

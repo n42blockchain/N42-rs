@@ -564,23 +564,12 @@ pub fn normalize_to_gov5_h2_with_header(
     if block.header.requests_hash.is_some_and(is_empty_requests_hash) {
         block.header.requests_hash = Some(GOV5_EMPTY_REQUESTS_HASH);
     }
-    // EIP-7928's access-list hash, recomputed rather than inherited.
-    //
-    // `try_into_block` fills this field from the payload's list, and it does not
-    // use EIP-7928's scheme -- for an empty list it yields keccak of the RLP
-    // encoding where the specification's hash is something else entirely. Seal a
-    // header carrying that and the block hash is computed over a field the
-    // execution layer will recompute differently, so the block this node just
-    // built is rejected by the node itself with nothing to say which field
-    // disagreed.
-    if let ExecutionPayload::V4(v4) = &execution.payload {
-        block.header.block_access_list_hash =
-            <alloy_eip7928::BlockAccessList as alloy_rlp::Decodable>::decode(
-                &mut v4.block_access_list.as_ref(),
-            )
-            .ok()
-            .map(|bal| alloy_eip7928::compute_block_access_list_hash(bal.as_slice()));
-    }
+    // The access-list hash is *not* recomputed here. An earlier version of this
+    // function did, on the reading that `try_into_block` fills the field with
+    // keccak of the encoding rather than EIP-7928's hash. That reading came from
+    // a malformed test object -- a pre-Cancun payload wrapped in a V4 variant --
+    // and the conversion is in fact correct. Overwriting it turned a right
+    // answer into `None`.
     if let Some(key) = sealer {
         seal_header(&mut block.header, key)?;
     }
@@ -715,14 +704,22 @@ mod tests {
         .expect("the list round-trips");
         let bal_hash = alloy_eip7928::compute_block_access_list_hash(decoded.as_slice());
 
-        let mut header = Header {
+        // Cancun-shaped, because an Amsterdam block is: leave the blob fields
+        // `None` and `execution_data_for_block` builds a pre-Cancun payload,
+        // which wrapped in a V4 variant is an object no execution layer would
+        // ever produce. The first version of this test did exactly that and
+        // spent two rounds looking like a reconstruction bug.
+        let header = Header {
             number: 3,
             withdrawals_root: Some(alloy_consensus::EMPTY_ROOT_HASH),
             block_access_list_hash: Some(bal_hash),
+            blob_gas_used: Some(0),
+            excess_blob_gas: Some(0),
+            parent_beacon_block_root: Some(B256::repeat_byte(7)),
+            ommers_hash: B256::ZERO,
+            difficulty: U256::ZERO,
             ..Default::default()
         };
-        header.ommers_hash = B256::ZERO;
-        header.difficulty = U256::ZERO;
         let block = Block {
             header: header.clone(),
             body: alloy_consensus::BlockBody {
@@ -734,6 +731,7 @@ mod tests {
         let hash = block.header.hash_slow();
         // Through the real sequence: a leader normalizes what its execution
         // layer built, and a follower reconstructs what the leader sealed.
+        let bal_bytes2 = bal_bytes.clone();
         let data = normalize_to_gov5_h2(
             &execution_data_for_block_with_bal(hash, &block, Some(bal_bytes)),
             9,
@@ -747,6 +745,37 @@ mod tests {
         // exists.
         let direct = data.clone().try_into_block::<TxEnvelope>().unwrap();
         assert_ne!(direct.header.block_access_list_hash, Some(bal_hash));
+        // Field by field, because "no variant matched" names no field.
+        let sealed = normalize_to_gov5_h2_with_header(
+            &execution_data_for_block_with_bal(hash, &block, Some(bal_bytes2)),
+            9,
+            None,
+        )
+        .unwrap()
+        .1;
+        let from_payload = data.clone().try_into_block::<TxEnvelope>().unwrap().header;
+        for (name, a, b) in [
+            ("parent_hash", format!("{:?}", sealed.parent_hash), format!("{:?}", from_payload.parent_hash)),
+            ("ommers_hash", format!("{:?}", sealed.ommers_hash), format!("{:?}", from_payload.ommers_hash)),
+            ("state_root", format!("{:?}", sealed.state_root), format!("{:?}", from_payload.state_root)),
+            ("tx_root", format!("{:?}", sealed.transactions_root), format!("{:?}", from_payload.transactions_root)),
+            ("receipts_root", format!("{:?}", sealed.receipts_root), format!("{:?}", from_payload.receipts_root)),
+            ("withdrawals_root", format!("{:?}", sealed.withdrawals_root), format!("{:?}", from_payload.withdrawals_root)),
+            ("requests_hash", format!("{:?}", sealed.requests_hash), format!("{:?}", from_payload.requests_hash)),
+            ("bal_hash", format!("{:?}", sealed.block_access_list_hash), format!("{:?}", from_payload.block_access_list_hash)),
+            ("difficulty", format!("{:?}", sealed.difficulty), format!("{:?}", from_payload.difficulty)),
+            ("nonce", format!("{:?}", sealed.nonce), format!("{:?}", from_payload.nonce)),
+            ("extra_data", format!("{:?}", sealed.extra_data), format!("{:?}", from_payload.extra_data)),
+            ("gas_limit", format!("{}", sealed.gas_limit), format!("{}", from_payload.gas_limit)),
+            ("base_fee", format!("{:?}", sealed.base_fee_per_gas), format!("{:?}", from_payload.base_fee_per_gas)),
+            ("blob_gas", format!("{:?}", sealed.blob_gas_used), format!("{:?}", from_payload.blob_gas_used)),
+            ("excess_blob", format!("{:?}", sealed.excess_blob_gas), format!("{:?}", from_payload.excess_blob_gas)),
+            ("beacon_root", format!("{:?}", sealed.parent_beacon_block_root), format!("{:?}", from_payload.parent_beacon_block_root)),
+        ] {
+            if a != b {
+                eprintln!("DIFFERS {name}: sealed={a} payload={b}");
+            }
+        }
         let rebuilt = match reconstruct_gov5_h2_block::<TxEnvelope>(&data) {
             Ok(block) => block,
             Err(err) => panic!("reconstruction failed: {err}"),

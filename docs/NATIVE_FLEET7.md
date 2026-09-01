@@ -2306,21 +2306,37 @@ handed a normalized Amsterdam payload and asked to reproduce the sealed hash.
 
 Two things fell out of it immediately, neither visible from the fleet:
 
-**The access-list hash has two schemes and the payload conversion uses neither
-of the right one.** `try_into_block` fills `block_access_list_hash` from the
-payload's list — for one test list it yielded keccak of the RLP encoding, and
-after normalization it yields `None` — while reth's header carries
-`compute_block_access_list_hash`, which is EIP-7928's. So the leader was sealing
-a header whose access-list hash the execution layer would recompute differently,
-and rejecting its own block with nothing to say which field disagreed. The
-normalizer now recomputes it before sealing.
+**A finding recorded here an hour ago was wrong, and the way it was wrong is the
+point.** It said the access-list hash has two schemes and the payload conversion
+used the wrong one, so the normalizer was changed to recompute it before
+sealing. That reading came from a malformed test object: the test header left
+the blob-gas fields unset, so `execution_data_for_block` built a *pre-Cancun*
+payload, which the test then wrapped in a V4 variant — an object no execution
+layer would produce. Give the test header its Cancun fields and the conversion
+computes the hash correctly. The "fix" was overwriting a right answer with
+`None`, and it has been removed.
 
-**And that is not the whole of it.** Correcting only that field still does not
-reproduce the sealed hash, so at least one more header field differs between
-what is sealed and what a payload reconstructs. The test is left in the tree,
-`#[ignore]`d with that stated, because it is the cheapest possible statement of
-what remains and the right place to do the field-by-field comparison — no fleet,
-no four minutes, no base-fee decay.
+Two malformed-input conclusions in one session, both written down before being
+checked against a well-formed case. The first was `22,000 x 4,096`; this one is
+a header built by hand that no producer would emit. **A test fixture is an input
+like any other, and a conclusion drawn from one that could not occur is not a
+finding about the system.**
+
+**What the test did earn is the field-by-field comparison**, which "no variant
+matched" never gives. Against a well-formed Cancun header the differences are:
+
+| field | sealed | rebuilt from payload | already a candidate |
+|---|---|---|---|
+| `ommers_hash` | zero | empty-ommer root | yes |
+| `withdrawals_root` | gov5's nil | empty trie root | yes |
+| `block_access_list_hash` | one value | **another** | yes, and still not matching |
+
+The first two are the variants this reconstruction was already built to try. The
+third is open: both the sealed value and the payload's are present in the
+candidate set and the hash still does not reproduce, so the remaining difference
+is either a fourth field or the candidate set is being applied wrongly. The test
+stays in the tree, `#[ignore]`d, because it answers this in zero seconds where a
+fleet round takes four minutes and a base-fee decay.
 
 ### The staleness guard has a blind spot
 

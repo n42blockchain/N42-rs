@@ -147,13 +147,44 @@ RPCS=$(for ((i = 0; i < F7_NODES; i++)); do printf 'http://127.0.0.1:%s,' $((F7_
 
 "$HERE/fleet7.sh" up --fresh | tee -a "$OUT/round.txt"
 
-# Empty blocks first: the chain starts at its base-fee floor anyway on a fresh
-# datadir, but the decay is kept so a round on a reused chain behaves the same
-# way and the script records the price it actually started from.
+# Empty blocks until the base fee has actually decayed, rather than for a fixed
+# time.
+#
+# A fresh chain does *not* start at its floor: block 1 is 875,000,000 wei and
+# every empty block takes 12.5% off, so reaching the low thousands needs about
+# 120 blocks. Whether thirty seconds contains 120 blocks depends on how quickly
+# the fleet came up, and when it does not the flood starts against a base fee
+# still in the tens of millions.
+#
+# That is not a hypothetical. Two rounds of the same build reported 43,426 TPS
+# and 10,666 TPS; the difference was 7,887 wei against 31,060,570 at the start,
+# and nothing in the output said so. The first diagnosis of it -- "the datadirs
+# were not wiped" -- was wrong too: the chain was fresh both times and simply
+# had not decayed as far.
+#
+# So the wait is on the number, with the old duration as the floor and a
+# generous ceiling. A round that cannot reach the target says so and stops,
+# because a round that starts above it is not measuring the tier it claims to.
+: "${DECAY_TARGET:=100000}"
+: "${DECAY_MAX_SEC:=180}"
+read_basefee() {
+  curl -s --max-time 5 -X POST -H 'content-type: application/json' \
+    --data '{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["latest",false]}' \
+    "http://127.0.0.1:$F7_HTTP_BASE" \
+    | python3 -c "import sys,json;print(int(json.load(sys.stdin)['result']['baseFeePerGas'],16))" 2>/dev/null || echo 0
+}
+DECAY_START=$SECONDS
 sleep "$DECAY_SEC"
-BASEFEE=$(curl -s --max-time 5 -X POST -H 'content-type: application/json' \
-  --data '{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["latest",false]}' \
-  "http://127.0.0.1:$F7_HTTP_BASE" | python3 -c "import sys,json;print(int(json.load(sys.stdin)['result']['baseFeePerGas'],16))")
+BASEFEE=$(read_basefee)
+while (( BASEFEE > DECAY_TARGET && SECONDS - DECAY_START < DECAY_MAX_SEC )); do
+  sleep 2
+  BASEFEE=$(read_basefee)
+done
+echo "decay        : ${BASEFEE} wei after $((SECONDS - DECAY_START))s of empty blocks (target ${DECAY_TARGET})" | tee -a "$OUT/round.txt"
+if (( BASEFEE > DECAY_TARGET )); then
+  echo "REFUSING: the base fee did not reach ${DECAY_TARGET} wei in ${DECAY_MAX_SEC}s; the chain is not making empty blocks" | tee -a "$OUT/round.txt"
+  exit 1
+fi
 echo "base fee     : $BASEFEE wei against a $GASPRICE cap" | tee -a "$OUT/round.txt"
 if (( BASEFEE >= GASPRICE )); then
   echo "REFUSING: the base fee is at or above the flood's price; this round would die in funding" | tee -a "$OUT/round.txt"
@@ -170,7 +201,17 @@ FLOOD_CORES=${F7_FLOOD_CORES:-$((F7_CORE_OFFSET + F7_NODES * F7_CORES_PER_NODE))
 FLOOD_PIN=""
 [[ $F7_PIN == 1 ]] && FLOOD_PIN="taskset -c $FLOOD_CORES"
 echo "flood cores  : ${FLOOD_CORES}" | tee -a "$OUT/round.txt"
+# The binary ingest path, when a round asked for one. Funding stays on RPC --
+# it is six thousand transactions once and it reads nonces back -- so the RPC
+# list is passed either way.
+INGEST_ARG=()
+if [[ -n ${F7_INGEST:-} ]]; then
+  INGESTS=$(for ((i = 0; i < F7_NODES; i++)); do printf '127.0.0.1:%s,' $((F7_INGEST_BASE + i)); done | sed 's/,$//')
+  INGEST_ARG=(--ingest "$INGESTS")
+  echo "ingest       : $INGESTS" | tee -a "$OUT/round.txt"
+fi
 setsid $FLOOD_PIN "$F7_BIN/examples/tx_flood" --rpc "$RPCS" --chain-id "$CHAIN" \
+  "${INGEST_ARG[@]}" \
   --senders "$SENDERS" --pertx "$PERTX" --offset "$OFFSET" --gasprice "$GASPRICE" \
   --conc "$CONC" --rpcbatch "$RPCBATCH" $SHARD \
   > "$OUT/flood.log" 2>&1 < /dev/null &

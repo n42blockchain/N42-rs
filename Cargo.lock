@@ -7642,6 +7642,7 @@ dependencies = [
  "n42-engine-types",
  "n42-primitives",
  "n42-qmdb-reth",
+ "n42-tx-ingest",
  "pubsub-mem",
  "reth-chainspec",
  "reth-cli",
@@ -8296,6 +8297,16 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "n42-tx-ingest"
+version = "2.1.5"
+dependencies = [
+ "alloy-primitives 1.7.1",
+ "reth-transaction-pool",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

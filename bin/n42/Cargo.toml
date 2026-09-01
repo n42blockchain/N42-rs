@@ -18,6 +18,7 @@ reth-primitives-traits.workspace = true
 pubsub-mem.workspace = true
 n42-engine-types.workspace = true
 n42-qmdb-reth.workspace = true
+n42-tx-ingest.workspace = true
 n42-engine-primitives.workspace = true
 n42-primitives.workspace = true
 n42-clique.workspace = true

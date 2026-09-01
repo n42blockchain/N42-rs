@@ -435,6 +435,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // from the pacing rather than left at its production default.
             service = service.with_block_pacing(Duration::from_millis(period_ms));
             service = service.with_direct_block_push(direct_push);
+            service = service.with_build_ahead(std::env::var("N42_BUILD_AHEAD").is_ok());
             service = service.with_payload_attributes(move |context| {
                 let parent_beacon_block_root = match (&committee, &context.head_header) {
                     (Some(pool), Some(parent)) => {
@@ -456,7 +457,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     withdrawals.clone(),
                     parent_beacon_block_root,
                     period_secs,
-                    period_ms,
+                    // Pacing decides when to propose, not when to start
+                    // building. A prepared build asks for the attributes it
+                    // would use and leaves the timing to the proposal.
+                    if context.preparing { 0 } else { period_ms },
                     context.head_timestamp,
                     context.head_seen,
                 )

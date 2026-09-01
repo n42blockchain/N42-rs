@@ -1,0 +1,18 @@
+[package]
+name = "n42-tx-ingest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Binary TCP transaction ingest for throughput rounds"
+
+[lints]
+workspace = true
+
+[dependencies]
+reth-transaction-pool.workspace = true
+alloy-primitives.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "rt", "macros"] }
+tracing.workspace = true

@@ -1601,3 +1601,132 @@ It did not contaminate anything: `target/release/n42` was last built on
 it. It is measured on its own, after the dedup question is settled, and the
 sequencing matters — the validator binary and the execution-layer binary have to
 move one at a time or neither result means anything.
+
+## Round 17: the generator stops being the answer
+
+Two changes to the leader's path and one to the load generator, measured
+separately, with one of the three turning out to be a fourfold regression.
+
+### What the leader's path is actually made of
+
+The leader's build was timed in four parts rather than guessed at, because the
+two candidate fixes are opposites and this file has picked wrong before. At the
+480M tier, on full blocks:
+
+| stage | | |
+|---|---:|---|
+| `fcu_ms` | 0 ms | telling the execution layer to start |
+| `build_ms` | **95 ms** | waiting for it to fill the block |
+| `seal_ms` | 17 ms | stamping the view into the header |
+| `import_ms` | **80 ms** | executing the block this node just built |
+| total | 195 ms | |
+
+`import_ms` is the striking one. `getPayload` builds a block without inserting
+it; sealing the view changes the hash, so reth cannot recognise the block as
+the one it assembled and runs every transaction a second time. reth does
+short-circuit a block already in its tree — a block from `getPayload` is not in
+it.
+
+### Moving the import behind the proposal
+
+The import has to happen: the leader never receives its own proposal back over
+gossip, so nothing else ever imports it, and the block would be committed by
+consensus and then rejected by the leader's own execution layer. But it does not
+have to happen *first*. Publishing the body and the proposal before importing
+takes 80 ms off the leader's path and gives every follower the block 80 ms
+earlier, to execute in parallel with the leader's own import.
+
+Leader path after: **110 ms** (`build 89`, `seal 17`).
+
+### The binary ingest path
+
+The generator was the other half. Measured during a flood, the whole fleet used
+**13.8 cores of the 224 pinned — 6%** — and the generator itself used 0.9 of a
+core to deliver ~22,000 transactions a second. Sixty-four threads, each blocked
+about 290 ms per 100-transaction batch on a JSON-RPC round trip.
+
+`crates/n42/tx-ingest` is the same submission without the three costs that have
+nothing to do with the transaction: hex encoding, JSON, and above all a round
+trip the sender waits out. Frames are length-prefixed raw EIP-2718; a client
+pipelines across its senders, one frame in flight per sender, so a single
+sender's nonces stay strictly serial while the connection always has work on it.
+
+The other half is gov5's, and it is the half that mattered: **the server waits
+rather than refusing.** A frame is not admitted while the pool is at its high
+water mark, and the reply carries the pool's pending count. Every round in this
+file until now logged `txpool is full`, and a refused generator retries — which
+means re-signing, so a full pool turned the generator's whole budget into work
+neither side kept.
+
+| | JSON-RPC | binary ingest with the gate |
+|---|---:|---:|
+| submitted | ~22,000/s | **51,719/s** |
+| rejected | every round | **0** |
+| win1 | 22,290 TPS | **43,426** |
+| win2 | 22,662 TPS | **44,189** |
+| cycle | 1.000 s | **0.517 s** |
+| occupancy | 100% | 100% |
+
+Supply is no longer the binding constraint: the generator delivers faster than
+the chain consumes, the gate holds the pool at ~100,800, and occupancy stays at
+100%. What sets the rate now is the chain.
+
+One thing deliberately not taken from gov5's design: their client sends a
+pre-recovered sender with each transaction and their server trusts it, skipping
+ECDSA entirely. That is the right trade when recovery is the ceiling. Here the
+machine is 94% idle, so it is not the ceiling, and trusting a client-supplied
+sender would change what the benchmark verifies without changing what it
+measures. `recover_raw_transaction` — the same entry point
+`eth_sendRawTransaction` uses — stays.
+
+### Building ahead is a fourfold regression
+
+The remaining 89 ms is the leader waiting for a build it could have started a
+consensus round earlier: the parent of a leader's block is the block committed
+in the previous view, and a node knows that block when it *imports* it, before
+the votes are in.
+
+The first attempt never fired — `ahead=false` on all 59 proposals in a round —
+because the prepared build ran the proposal's pacing gate, and a build prepared
+the instant a block is imported always has `head_seen.elapsed() ≈ 0`. Pacing
+decides when to propose, not when to start building; the fix was a `preparing`
+flag on the context.
+
+With it firing, three consecutive rounds reported **~11,400 TPS against 43,426**,
+and the switch flipped back reproduces 43,427 — the same figure to one
+transaction. So it is not noise and not the environment.
+
+**Off by default, behind `N42_BUILD_AHEAD`.** The arithmetic is sound and the
+measurement says the arithmetic is not the whole story: asking the execution
+layer for a payload on a block the fleet has not committed costs far more than
+the 89 ms wait it saves. The untested hypothesis is that the prepared
+forkchoice moves the execution layer's head to an uncommitted block and the
+commit that follows has to undo it, but that is a guess, and this file's rule is
+that a mechanism is not a cost until it is measured.
+
+### Three harness defects, all of the same shape
+
+Each of these produced a wrong number rather than an error, which is the
+expensive kind:
+
+1. **`fleet7-repeat.sh` divided a spread by a zero median** when a window
+   reported no transactions, killing the summary after the windows that had one
+   — no `total txs` line, no `runs` line, and a caller waiting on either waited
+   forever. Cost: eighty minutes.
+2. **The staleness guard, added earlier in this session, fired twice on files
+   that do not go into the binary** (a test, and a different example), refusing
+   valid rounds. It also fired once correctly. Now narrowed to exactly the
+   compilation inputs of the binary it checks, and `fleet7-repeat.sh` pins a
+   snapshot of the binaries for the whole repeat so editing source mid-run is
+   harmless.
+3. **The base-fee decay was a fixed thirty seconds.** A fresh chain starts at
+   875,000,000 wei and loses 12.5% per empty block, so reaching the floor takes
+   about 120 blocks — and whether thirty seconds contains 120 blocks depends on
+   how fast the fleet came up. Two rounds of the same build started at 7,887 wei
+   and 31,060,570 wei. It now waits on the number rather than the clock; the
+   round that found this needed **80 seconds**, and the next needed 30.
+
+The first diagnosis of (3) was "the datadirs were not wiped", and a guard was
+written for it before the chain itself was read. It was wrong — the chain was
+fresh both times — and reading `baseFeePerGas` from blocks 1, 20 and 65 settled
+it in one command.

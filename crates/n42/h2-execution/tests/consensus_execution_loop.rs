@@ -53,15 +53,23 @@ async fn leader_builds_a_block_and_can_serve_its_own_execute_request() {
     let built = driver.build_block(attrs(), 1).await.unwrap();
     assert_eq!(built.number, 1);
 
-    // FCU-with-attrs to start the build (an FCU without attributes never would),
-    // resolve to collect it, then newPayload to import it.
-    //
-    // That third call is not redundant: `getPayload` builds a block without
-    // inserting it, and the leader never receives its own proposal back over
-    // gossip, so nothing else ever imports it. Without it the block is committed
-    // by consensus and then rejected by the leader's own execution layer, which
-    // answers the commit's forkchoiceUpdated with SYNCING and leaves the chain
-    // stuck at the parent — which is exactly what a live node did.
+    // Building is FCU-with-attrs to start it (an FCU without attributes never
+    // would) and resolve to collect it. Importing is a separate call, made
+    // after the proposal is on the wire, because it costs a second full
+    // execution of the block and the fleet should not be waiting through it.
+    assert!(matches!(
+        el.calls().as_slice(),
+        [ElCall::ForkchoiceUpdatedWithAttrs(_), ElCall::ResolvePayload(_)]
+    ));
+
+    // But it must still happen, and this is the assertion that says so.
+    // `getPayload` builds a block without inserting it, and the leader never
+    // receives its own proposal back over gossip, so nothing else ever imports
+    // it. Without this the block is committed by consensus and then rejected by
+    // the leader's own execution layer, which answers the commit's
+    // forkchoiceUpdated with SYNCING and leaves the chain stuck at the parent —
+    // which is exactly what a live node did.
+    driver.import_own_block(&built).await.unwrap();
     assert!(matches!(
         el.calls().as_slice(),
         [

@@ -23,7 +23,7 @@ use alloy_rpc_types_engine::{
     ExecutionData, ForkchoiceState, PayloadAttributes, PayloadStatusEnum,
 };
 use n42_h2_consensus::{ConsensusEvent, EngineOutput};
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::{
     el::{BuiltBlock, ElError, ExecutionLayer, ResolveKind},
@@ -131,6 +131,10 @@ pub struct ExecutionDriver<E> {
     /// Finishes a built payload before it is proposed. `None` proposes the
     /// payload exactly as built.
     normalizer: Option<Normalizer>,
+    /// A build started before this node needed the block: the parent it was
+    /// started on, the attributes it was started with, and the id to collect
+    /// it by. See [`Self::prepare_build_on`].
+    prepared: Option<(B256, PayloadAttributes, alloy_rpc_types_engine::PayloadId)>,
     /// Payloads seen but not yet executed, keyed by block hash. Populated from
     /// proposals, direct pushes, and our own builds.
     payloads: HashMap<B256, ExecutionData>,
@@ -153,6 +157,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         Self {
             el,
             normalizer: None,
+            prepared: None,
             payloads: HashMap::new(),
             head: genesis,
             finalized: genesis,
@@ -215,6 +220,46 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         }
     }
 
+    /// Starts a build now for a block this node expects to propose later.
+    ///
+    /// The execution layer needs time to fill a block -- measured at the 480M
+    /// tier as 95 ms of a 195 ms leader path, which is the largest single
+    /// piece of it -- and that time is only on the critical path because the
+    /// build starts when the node becomes leader. It does not have to.
+    ///
+    /// The parent of the block a leader proposes is the block committed in the
+    /// view before it, and a node knows that block when it *imports* it, which
+    /// is before the fleet has finished voting on it. Starting the build there
+    /// overlaps it with the rest of the consensus round, so by the time this
+    /// node is leader the payload is waiting.
+    ///
+    /// Speculative and cheap to be wrong about: if that view ends in a timeout
+    /// instead of a commit, the parent this was started on is not the parent
+    /// the proposal needs, the prepared build is discarded on the mismatch, and
+    /// the leader starts one the old way.
+    pub async fn prepare_build_on(
+        &mut self,
+        parent: B256,
+        attrs: PayloadAttributes,
+    ) -> Result<(), ElError> {
+        if self.prepared.as_ref().is_some_and(|(p, a, _)| *p == parent && *a == attrs) {
+            return Ok(());
+        }
+        let updated = self
+            .el
+            .fork_choice_updated_with_attrs_for(
+                ExecutionPath::LIVE_SEQUENTIAL,
+                self.forkchoice(parent),
+                attrs.clone(),
+            )
+            .await?;
+        if let Some(id) = updated.payload_id {
+            debug!(target: "n42.h2.el", ?parent, "started a build ahead of leading");
+            self.prepared = Some((parent, attrs, id));
+        }
+        Ok(())
+    }
+
     /// Leader path: builds a block on top of the current head.
     ///
     /// Returns the built block *and* caches its payload, so the subsequent
@@ -246,24 +291,42 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         // twice (so the work is not done twice). Guessing between them is how
         // this file has been wrong before.
         let started = std::time::Instant::now();
-        let updated = self
-            .el
-            .fork_choice_updated_with_attrs_for(
-                ExecutionPath::LIVE_SEQUENTIAL,
-                self.forkchoice(parent),
-                attrs,
-            )
-            .await?;
+        // A build prepared earlier counts only if it was started on this exact
+        // parent with these exact attributes. Anything else and the block it
+        // is assembling is not the block this node is about to propose.
+        let prepared = match self.prepared.take() {
+            Some((p, a, id)) if p == parent && a == attrs => Some(id),
+            _ => None,
+        };
+        // The status is kept, not just the id: VALID-without-an-id and SYNCING
+        // mean very different things to an operator, and a bare "no payload id"
+        // says neither. A prepared build has no status to report because its
+        // forkchoice was answered earlier and accepted then.
+        let (payload_id, status) = match prepared {
+            Some(id) => (Some(id), None),
+            None => {
+                let updated = self
+                    .el
+                    .fork_choice_updated_with_attrs_for(
+                        ExecutionPath::LIVE_SEQUENTIAL,
+                        self.forkchoice(parent),
+                        attrs,
+                    )
+                    .await?;
+                (updated.payload_id, Some(updated.payload_status.status))
+            }
+        };
+        let ahead = prepared.is_some();
         let after_fcu = started.elapsed();
 
         // A build only starts if the EL accepted the forkchoice. Reporting the
         // status is more useful than a bare "no payload id": VALID-without-id
         // and SYNCING mean very different things to an operator.
-        let payload_id = updated.payload_id.ok_or_else(|| {
-            ElError::new(format!(
-                "forkchoiceUpdated returned no payload id (status {:?})",
-                updated.payload_status.status
-            ))
+        let payload_id = payload_id.ok_or_else(|| match &status {
+            Some(status) => {
+                ElError::new(format!("forkchoiceUpdated returned no payload id (status {status:?})"))
+            }
+            None => ElError::new("a build prepared earlier had no payload id".to_string()),
         })?;
 
         let mut built = self
@@ -292,37 +355,59 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         let after_seal = started.elapsed();
         self.cache_payload(built.hash, built.execution_data.clone());
 
-        // Import our own block before proposing it. `getPayload` builds a block
-        // but does not insert it, and the leader never receives its own proposal
-        // back over gossip, so nothing else ever will: the block would be
-        // committed by consensus and then rejected by the leader's own
-        // execution layer, which answers the commit's forkchoiceUpdated with
-        // SYNCING and leaves the chain stuck at the parent.
+        info!(
+            target: "n42.h2.el",
+            view,
+            ahead,
+            fcu_ms = after_fcu.as_millis() as u64,
+            build_ms = (after_resolve - after_fcu).as_millis() as u64,
+            seal_ms = (after_seal - after_resolve).as_millis() as u64,
+            total_ms = started.elapsed().as_millis() as u64,
+            "leader build path"
+        );
+        Ok(built)
+    }
+
+    /// Inserts a block this node built into its own execution layer.
+    ///
+    /// Separate from building, and called *after* the proposal has gone out,
+    /// because it is not on the fleet's critical path and used to be on it.
+    /// `getPayload` builds a block without inserting it, and the leader never
+    /// receives its own proposal back over gossip, so nothing else ever will:
+    /// the block would be committed by consensus and then rejected by the
+    /// leader's own execution layer, which answers the commit's
+    /// forkchoiceUpdated with SYNCING and leaves the chain stuck at the parent.
+    /// So it has to happen -- it just does not have to happen first.
+    ///
+    /// It costs a second full execution of the block. Sealing the view into
+    /// the header changes the hash, so the execution layer cannot recognise
+    /// the block as the one it assembled and runs every transaction again;
+    /// reth short-circuits a block already in its tree, and a block from
+    /// `getPayload` is not in it. Measured at the 480M tier as 80 ms of a
+    /// 195 ms leader path, against 95 ms of waiting for the build and 17 ms of
+    /// sealing. Ahead of the proposal it delayed every follower by that much;
+    /// behind it, the followers have had the body for 80 ms already and are
+    /// executing it in parallel with this.
+    pub async fn import_own_block(&mut self, built: &BuiltBlock) -> Result<(), ElError> {
+        let started = std::time::Instant::now();
         let status = self
             .el
             .new_payload_for(ExecutionPath::LIVE_SEQUENTIAL, built.execution_data.clone())
             .await?;
-        // `import` is this node executing the block it has just built. Sealing
-        // the view into the header changes the hash, so the execution layer
-        // cannot recognise the block as the one it assembled and runs every
-        // transaction a second time.
         info!(
             target: "n42.h2.el",
-            view,
-            fcu_ms = after_fcu.as_millis() as u64,
-            build_ms = (after_resolve - after_fcu).as_millis() as u64,
-            seal_ms = (after_seal - after_resolve).as_millis() as u64,
-            import_ms = started.elapsed().saturating_sub(after_seal).as_millis() as u64,
-            total_ms = started.elapsed().as_millis() as u64,
-            "leader build path"
+            block = ?built.hash,
+            import_ms = started.elapsed().as_millis() as u64,
+            "imported our own block"
         );
         match status.status {
             PayloadStatusEnum::Valid => {
                 self.head = built.hash;
-                Ok(built)
+                Ok(())
             }
-            // Proposing a block this node's own execution layer will not accept
-            // wastes a view at best and splits the fleet at worst.
+            // A block this node's own execution layer will not accept has
+            // already been proposed by the time we know. The view is lost
+            // either way; what matters is that it is loud.
             PayloadStatusEnum::Invalid { validation_error } => Err(ElError::new(format!(
                 "our own execution layer rejected the block we built: {validation_error}"
             ))),

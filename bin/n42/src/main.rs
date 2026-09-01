@@ -195,6 +195,26 @@ fn main() {
                 None
             };
 
+            // A binary path into the pool, for load generators. Off unless
+            // asked for, and meant for loopback: it admits nothing
+            // `eth_sendRawTransaction` would not, but it is unauthenticated,
+            // so binding it anywhere reachable would be a mistake.
+            if let Ok(addr) = std::env::var("N42_TX_INGEST") {
+                match addr.parse::<std::net::SocketAddr>() {
+                    Ok(addr) => {
+                        let pool = node.pool.clone();
+                        tokio::spawn(async move {
+                            if let Err(err) = n42_tx_ingest::serve(addr, pool).await {
+                                error!(target: "reth::cli", %err, "transaction ingest stopped");
+                            }
+                        });
+                    }
+                    Err(err) => {
+                        error!(target: "reth::cli", %err, %addr, "N42_TX_INGEST is not an address");
+                    }
+                }
+            }
+
             // A chain whose genesis names a HotStuff-2 validator set is driven
             // over the Engine API by those validators (`h2_validator`); the
             // signer key still seals the blocks they ask for, but APoS block

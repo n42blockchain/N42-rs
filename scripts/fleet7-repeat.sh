@@ -30,9 +30,29 @@ while (( $# )); do
 done
 
 : "${F7_ROOT:=/data/blockchain/rust-fleet7-bench}"
+: "${F7_BIN:=$(cd "$HERE/.." && pwd)/target/release}"
 OUT=$F7_ROOT/repeat-$TAG
 mkdir -p "$OUT"
+# Pin the binaries for the whole repeat.
+#
+# A distribution is only a distribution if every round measured the same build,
+# and a repeat runs for a quarter of an hour -- long enough that editing the
+# source meanwhile is normal rather than careless. Copying the binaries once
+# makes those edits harmless: the rounds keep measuring what the repeat started
+# with, and the staleness guard sees a snapshot that cannot go stale under it.
+#
+# Learned the expensive way: three rounds were refused mid-repeat because the
+# source moved under them, and the run reported "no completed runs" after
+# eighty minutes.
+SNAP=$OUT/bin
+mkdir -p "$SNAP/examples"
+cp "$F7_BIN/n42" "$SNAP/n42"
+cp "$F7_BIN/examples/h2_validator" "$F7_BIN/examples/h2_keygen" "$F7_BIN/examples/tx_flood" "$SNAP/examples/"
+export F7_BIN=$SNAP
+export F7_SKIP_STALE_CHECK=1
+
 echo "$RUNS runs of '$TAG', results in $OUT" | tee "$OUT/summary.txt"
+echo "binaries pinned in $SNAP" | tee -a "$OUT/summary.txt"
 
 for ((run = 1; run <= RUNS; run++)); do
   # A fresh offset every round, derived so two runs of this script never collide.

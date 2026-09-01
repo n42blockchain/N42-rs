@@ -36,7 +36,16 @@ f7_check_binary_fresh() {
   local bin=$F7_BIN/examples/h2_validator newest
   [[ ${F7_SKIP_STALE_CHECK:-0} == 1 ]] && return 0
   [[ -x $bin ]] || return 0
-  newest=$(find "$REPO/crates/n42/h2-node" "$REPO/crates/n42/h2-net"                 "$REPO/crates/n42/h2-consensus" "$REPO/crates/n42/h2-execution"                 "$REPO/crates/n42/h2-el-rpc"                 -name '*.rs' -newer "$bin" -print -quit 2>/dev/null)
+  # `src` and `examples` only. Test and bench sources do not go into this
+  # binary, and counting them made the guard refuse a round because a *test*
+  # had been edited after the build -- which cost eighty minutes of a
+  # measurement that then reported "no completed runs".
+  # Exactly the sources that go into *this* binary: the crate's `src` trees
+  # and its own example file. Earlier versions counted the whole `tests` and
+  # `examples` directories, so editing a test -- or a different example --
+  # refused a round that would have been perfectly valid. Both cost a
+  # measurement.
+  newest=$(find "$REPO/crates/n42/h2-node/src" "$REPO/crates/n42/h2-net/src" "$REPO/crates/n42/h2-consensus/src" "$REPO/crates/n42/h2-execution/src" "$REPO/crates/n42/h2-el-rpc/src" "$REPO/crates/n42/h2-node/examples/h2_validator.rs" -name '*.rs' -newer "$bin" -print -quit 2>/dev/null)
   [[ -z $newest ]] && return 0
   echo "REFUSING: $bin is older than $newest" >&2
   echo "  A round would measure the previous build and report it as this one." >&2
@@ -53,6 +62,7 @@ f7_check_binary_fresh() {
 # the gov5 fleet lost a node on two consecutive starts to exactly that.
 : "${F7_AUTH_BASE:=8600}"    # Engine API (auth), one per node
 : "${F7_HTTP_BASE:=8700}"    # public JSON-RPC
+: "${F7_INGEST_BASE:=8900}"  # binary transaction ingest, loopback only
 : "${F7_DEVP2P_BASE:=8800}"  # bound but unused; devp2p is off, see below
 : "${F7_P2P_BASE:=19000}"    # consensus libp2p
 : "${F7_MOBILE_BASE:=21000}" # mobile_* endpoint, off unless F7_MOBILE=1

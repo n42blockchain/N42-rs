@@ -73,6 +73,10 @@ struct Args {
     rpc_batch: usize,
     shard_senders: bool,
     skip_funding: bool,
+    /// Binary ingest addresses, one per node, in place of JSON-RPC for the
+    /// flood. Funding stays on RPC: it is six thousand transactions once, and
+    /// it needs to read nonces back.
+    ingest: Vec<String>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -124,6 +128,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut nonce = vec![0u64; part.len()];
                 let mut stalls = vec![0u32; part.len()];
                 let mut live = part.len();
+                // The binary path, when a round asked for one. A worker gets
+                // one connection; its parallelism is the frames it keeps in
+                // flight on that connection, not the number of connections.
+                let mut ingest = if args.ingest.is_empty() {
+                    None
+                } else {
+                    let addr = &args.ingest[worker % args.ingest.len()];
+                    match Ingest::connect(addr) {
+                        Ok(conn) => Some(conn),
+                        Err(err) => {
+                            eprintln!("ingest {addr}: {err}");
+                            return;
+                        }
+                    }
+                };
+                if let Some(conn) = ingest.as_mut() {
+                    flood_over_ingest(conn, part, &mut nonce, &mut stalls, args, &sent, &rejected);
+                    return;
+                }
                 while live > 0 {
                     live = 0;
                     for (index, key) in part.iter().enumerate() {
@@ -227,6 +250,175 @@ fn signed(key: &PrivateKeySigner, nonce: u64, chain_id: u64, gas_price: u128, va
     let signature = key.sign_hash_sync(&tx.signature_hash()).expect("sign");
     let envelope: TxEnvelope = tx.into_signed(signature).into();
     alloy_primitives::hex::encode_prefixed(envelope.encoded_2718())
+}
+
+/// Floods one worker's senders over a binary ingest connection.
+///
+/// Round-robin across the senders, one frame in flight per sender, and a bound
+/// on how many frames may be outstanding at once so a worker cannot outrun the
+/// node's ability to answer. A sender whose frame is still unanswered is
+/// skipped rather than waited on, which is what keeps every other sender
+/// moving while one is being validated.
+fn flood_over_ingest(
+    conn: &mut Ingest,
+    part: &[PrivateKeySigner],
+    nonce: &mut [u64],
+    stalls: &mut [u32],
+    args: &Args,
+    sent: &AtomicU64,
+    rejected: &AtomicU64,
+) {
+    /// Frames a worker may have unanswered at once.
+    ///
+    /// Deep enough that the connection is never idle waiting for an answer,
+    /// shallow enough that a worker cannot bury the node under work it has
+    /// already refused: at 100 transactions a frame this is 3,200 in flight
+    /// per worker.
+    const WINDOW: usize = 32;
+
+    let mut inflight = vec![false; part.len()];
+    let mut done = vec![false; part.len()];
+    // The deepest the pool was seen to be, so a round can tell a generator that
+    // could not keep up from a chain that was full the whole time.
+    let mut deepest = 0usize;
+    let mut batch: Vec<Vec<u8>> = Vec::with_capacity(args.rpc_batch);
+    loop {
+        let mut wrote = false;
+        for (index, key) in part.iter().enumerate() {
+            if done[index] || inflight[index] || conn.inflight.len() >= WINDOW {
+                continue;
+            }
+            let from = nonce[index];
+            if from >= args.per_tx {
+                done[index] = true;
+                continue;
+            }
+            let upto = (from + args.rpc_batch as u64).min(args.per_tx);
+            batch.clear();
+            batch.extend(
+                (from..upto).map(|n| signed_raw(key, n, args.chain_id, args.gas_price, 1)),
+            );
+            if conn.send(index, &batch).is_err() {
+                return;
+            }
+            inflight[index] = true;
+            wrote = true;
+        }
+        // Nothing left to write and nothing left to hear about.
+        if !wrote && conn.inflight.is_empty() {
+            if deepest > 0 {
+                eprintln!("ingest       : deepest pool seen {deepest} pending");
+            }
+            return;
+        }
+        match conn.recv() {
+            Ok(Some((index, offered, accepted, pending))) => {
+                deepest = deepest.max(pending);
+                inflight[index] = false;
+                sent.fetch_add(accepted as u64, Ordering::Relaxed);
+                rejected.fetch_add((offered - accepted) as u64, Ordering::Relaxed);
+                // Only accepted nonces advance, exactly as on the RPC path: a
+                // skipped nonce leaves a hole and every later transaction from
+                // that sender queues behind it forever.
+                nonce[index] += accepted as u64;
+                if accepted < offered {
+                    stalls[index] += 1;
+                    if stalls[index] > 600 {
+                        done[index] = true;
+                    }
+                } else {
+                    stalls[index] = 0;
+                }
+            }
+            Ok(None) => {}
+            Err(_) => return,
+        }
+    }
+}
+
+/// One connection to a node's binary transaction ingest.
+///
+/// Frames go out without waiting for the ones before them to be answered,
+/// which is the whole reason this exists. Over JSON-RPC each batch was a
+/// request the sender had to see answered before it could send again —
+/// measured at about 290 ms per 100-transaction batch, with 64 threads idle
+/// for essentially all of it and the generator using 0.9 of a core to deliver
+/// ~22,000 transactions a second.
+///
+/// The window is per sender, not per transaction: a worker owns many senders
+/// and puts one frame in flight for each, so a single sender's nonces are
+/// still strictly serial — one frame, then its answer, then the next — while
+/// the connection always has work on it.
+struct Ingest {
+    stream: std::net::TcpStream,
+    /// Senders with a frame in flight, in the order the frames were written.
+    /// Replies come back in the same order, so this is what matches an answer
+    /// to the sender it belongs to.
+    inflight: std::collections::VecDeque<(usize, usize)>,
+}
+
+impl Ingest {
+    fn connect(addr: &str) -> std::io::Result<Self> {
+        let stream = std::net::TcpStream::connect(addr)?;
+        // Without this the kernel holds a frame back waiting for company, and
+        // the pipelining above turns back into a round trip per batch.
+        stream.set_nodelay(true)?;
+        Ok(Self { stream, inflight: std::collections::VecDeque::new() })
+    }
+
+    /// Writes one frame: `u32` count, then each transaction as `u32` length and
+    /// its raw EIP-2718 bytes.
+    fn send(&mut self, sender: usize, batch: &[Vec<u8>]) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut frame = Vec::with_capacity(4 + batch.iter().map(|t| 4 + t.len()).sum::<usize>());
+        frame.extend_from_slice(&(batch.len() as u32).to_le_bytes());
+        for raw in batch {
+            frame.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+            frame.extend_from_slice(raw);
+        }
+        // One write for the whole frame: a frame split across writes is a
+        // frame the server reads in two syscalls.
+        self.stream.write_all(&frame)?;
+        self.inflight.push_back((sender, batch.len()));
+        Ok(())
+    }
+
+    /// Reads the answer to the oldest frame still in flight.
+    ///
+    /// The answer arrives when the pool has room, not when the frame arrives:
+    /// the server holds a frame at its high water mark rather than refusing it,
+    /// so a full pool shows up here as a slow reply and not as a rejection to
+    /// re-sign and resend. The pending count comes back with it, which is what
+    /// makes the generator's own logs able to say whether it was the chain that
+    /// was full or the generator that was slow.
+    fn recv(&mut self) -> std::io::Result<Option<(usize, usize, usize, usize)>> {
+        use std::io::Read;
+        let Some((sender, offered)) = self.inflight.pop_front() else {
+            return Ok(None);
+        };
+        let mut buf = [0u8; 8];
+        self.stream.read_exact(&mut buf)?;
+        let accepted = u32::from_le_bytes(buf[0..4].try_into().expect("4 bytes")) as usize;
+        let pending = u32::from_le_bytes(buf[4..8].try_into().expect("4 bytes")) as usize;
+        Ok(Some((sender, offered, accepted, pending)))
+    }
+}
+
+/// The same transaction as [`signed`], as bytes rather than as a hex string.
+fn signed_raw(key: &PrivateKeySigner, nonce: u64, chain_id: u64, gas_price: u128, value: u64) -> Vec<u8> {
+    let tx = TxEip1559 {
+        chain_id,
+        nonce,
+        gas_limit: TRANSFER_GAS,
+        max_fee_per_gas: gas_price,
+        max_priority_fee_per_gas: gas_price / 10,
+        to: TxKind::Call(SINK),
+        value: U256::from(value),
+        ..Default::default()
+    };
+    let signature = key.sign_hash_sync(&tx.signature_hash()).expect("sign");
+    let envelope: TxEnvelope = tx.into_signed(signature).into();
+    envelope.encoded_2718()
 }
 
 /// Submits a batch as one JSON-RPC array. Counts each element's outcome, since
@@ -400,6 +592,7 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
         rpc_batch: 100,
         shard_senders: false,
         skip_funding: false,
+        ingest: Vec::new(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -414,6 +607,7 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
             "--gasprice" => args.gas_price = next()?.parse()?,
             "--conc" => args.conc = next()?.parse()?,
             "--rpcbatch" => args.rpc_batch = next()?.parse::<usize>()?.clamp(1, MAX_RPC_BATCH),
+            "--ingest" => args.ingest = next()?.split(',').map(str::to_owned).collect(),
             "--shard-senders" => args.shard_senders = true,
             "--skip-funding" => args.skip_funding = true,
             "--help" | "-h" => {

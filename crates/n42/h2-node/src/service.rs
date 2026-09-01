@@ -206,6 +206,15 @@ pub struct H2Service<E> {
     /// Hands gossiped transactions to the pool, off this loop. See
     /// [`crate::tx_source::forward_transactions`].
     inbound_forward: Option<mpsc::Sender<Vec<Bytes>>>,
+    /// A block just imported, whose successor this node may be about to lead.
+    /// Set where imports are observed, which is a sync path, and acted on in
+    /// the step, which is not.
+    prepare_on: Option<B256>,
+    /// Whether to start a build before this node is leader. Off by default:
+    /// it is a change to when the execution layer is asked for a payload, and
+    /// the first measurement of it was a fourfold regression rather than the
+    /// saving its arithmetic promised. See [`Self::with_build_ahead`].
+    prepare_ahead: bool,
     /// Why this node last declined to propose, for the timeout log to quote.
     ///
     /// A view that times out has exactly two shapes and they need opposite
@@ -450,6 +459,21 @@ const REMEMBERED_TIMESTAMPS: usize = 256;
 pub struct ProposalContext {
     /// The view being proposed for.
     pub view: u64,
+    /// Whether this is a build being *started* rather than a proposal being
+    /// made.
+    ///
+    /// A builder paces its proposals; it must not pace its builds. Starting a
+    /// build early is the whole point of preparing one — the execution layer
+    /// needs ~90 ms to fill a block, and that time is only on the critical
+    /// path because the build starts when the node becomes leader. Asked to
+    /// prepare, a builder should answer with the attributes it *would* use and
+    /// leave the timing to the proposal.
+    ///
+    /// Missing this was measured: the first version of the prepared build ran
+    /// the pacing gate too, and since a build is prepared the moment a block is
+    /// imported, `head_seen.elapsed()` was always ~0 and the gate always said
+    /// "not yet". Fifty-nine proposals in a round, `ahead=false` on every one.
+    pub preparing: bool,
     /// The block the proposal would build on.
     pub head: B256,
     /// The head's timestamp, when this node has seen the block — its own
@@ -516,6 +540,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             checkpoint: None,
             proposal_deferred: false,
             inbound_forward: None,
+            prepare_on: None,
+            prepare_ahead: false,
             defer_reason: None,
             header_profile: HeaderProfile::Ethereum,
             native_wire: false,
@@ -723,8 +749,9 @@ impl<E: ExecutionLayer> H2Service<E> {
         for remaining in (0..MAX_PROPOSALS_PER_STEP).rev() {
             self.drain_outputs(&mut events).await?;
             let before = self.engine.current_view();
-            self.propose_if_leader().await;
+            self.propose_if_leader(&mut events).await;
             self.drain_outputs(&mut events).await?;
+            self.flush_prepare().await;
             // A commit lands in the drain *after* the proposal that caused it,
             // so one step can span several views. Stopping at one proposal per
             // step means the next view's proposal waits for the select to
@@ -828,6 +855,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         self.drain_transport(&mut events).await?;
 
         self.drain_outputs(&mut events).await?;
+        self.flush_prepare().await;
         self.forward_inbound_transactions();
         self.flush_outbox(&mut events);
         Ok(events)
@@ -1351,9 +1379,76 @@ impl<E: ExecutionLayer> H2Service<E> {
         self.engine.pacemaker_mut().extend_deadline(MESH_WAIT_STEP);
     }
 
+    /// Starts a build before this node is leader, rather than when it becomes
+    /// one.
+    ///
+    /// Off by default and kept behind a switch because the arithmetic for it
+    /// is convincing and the measurement is not: a leader spends ~90 ms of a
+    /// ~110 ms path waiting for the execution layer to fill a block, and
+    /// starting that build a consensus round earlier should take it off the
+    /// critical path. Measured, it took window 1 from 43,426 TPS to about
+    /// 11,400 in three consecutive rounds. Something about asking the
+    /// execution layer for a payload on a block the fleet has not committed
+    /// costs far more than the wait it saves, and until that is understood
+    /// this is not a default.
+    pub const fn with_build_ahead(mut self, enabled: bool) -> Self {
+        self.prepare_ahead = enabled;
+        self
+    }
+
+    /// Starts the execution layer assembling the block this node will propose
+    /// next, while the fleet is still voting on the one it just imported.
+    ///
+    /// The parent of a leader's block is the block committed in the view
+    /// before it, and this node learns that block when it imports it — which
+    /// is before the votes are in. If the next view is this node's to lead,
+    /// the builder can have the whole rest of the consensus round to fill the
+    /// block instead of the node waiting 95 ms for it afterwards.
+    ///
+    /// Same attributes builder as the proposal itself, so a prepared build is
+    /// either exactly the block that gets proposed or is discarded: the driver
+    /// keeps the parent and the attributes it started on and refuses to
+    /// collect a build that does not match what the proposal asks for.
+    /// Acts on the last import, if the next view is this node's to lead.
+    async fn flush_prepare(&mut self) {
+        let Some(parent) = self.prepare_on.take() else { return };
+        if self.prepare_ahead {
+            self.prepare_next_build(parent).await;
+        }
+    }
+
+    async fn prepare_next_build(&mut self, parent: B256) {
+        let Some(build_attributes) = self.payload_attributes.as_ref() else {
+            return;
+        };
+        let next = self.engine.current_view().saturating_add(1);
+        if !self.engine.is_leader_for_view(next) {
+            return;
+        }
+        let Some(header) = self.block_headers.get(&parent).cloned() else {
+            return;
+        };
+        let context = ProposalContext {
+            view: next,
+            preparing: true,
+            head: parent,
+            head_timestamp: self.block_timestamps.get(&parent).copied(),
+            head_header: Some(header),
+            head_seen: self.block_seen.get(&parent).copied(),
+        };
+        // The builder declines while pacing; that is a "not yet", not a "no",
+        // and the proposal will ask again. Nothing to prepare in that case.
+        let Some(attrs) = build_attributes(context) else {
+            return;
+        };
+        if let Err(err) = self.driver.prepare_build_on(parent, attrs).await {
+            debug!(target: "n42.h2.node", %err, ?parent, "could not start a build ahead of leading");
+        }
+    }
+
     /// Builds and announces a block when this node is the leader of a view it
     /// has not yet proposed for.
-    async fn propose_if_leader(&mut self) {
+    async fn propose_if_leader(&mut self, events: &mut Vec<ServiceEvent>) {
         let Some(build_attributes) = self.payload_attributes.as_ref() else {
             return;
         };
@@ -1400,6 +1495,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         // the loop against a broken execution layer.
         let context = ProposalContext {
             view,
+            preparing: false,
             head,
             head_timestamp: self.block_timestamps.get(&head).copied(),
             head_header,
@@ -1435,6 +1531,23 @@ impl<E: ExecutionLayer> H2Service<E> {
                 {
                     warn!(target: "n42.h2.node", %err, view, "engine refused our own block");
                 }
+                // Flush before importing, and import before returning.
+                //
+                // Before: the flush at the end of the step meant the 80 ms of
+                // re-executing our own block sat between the block existing and
+                // the fleet hearing about it. Flushing here puts the proposal on
+                // the wire first, so the followers spend that 80 ms executing
+                // the block rather than waiting for it.
+                //
+                // It is still awaited rather than deferred to the end of the
+                // step, because a step may propose up to MAX_PROPOSALS_PER_STEP
+                // times and the next proposal builds on this block: an
+                // un-imported parent makes the execution layer answer the next
+                // forkchoice with SYNCING.
+                self.flush_outbox(events);
+                if let Err(err) = self.driver.import_own_block(&built).await {
+                    warn!(target: "n42.h2.node", %err, view, "our own execution layer would not take the block we proposed");
+                }
             }
             Err(err) => {
                 // The view will time out and move on; that is the correct
@@ -1459,6 +1572,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                         self.engine.remember_parent(*block_hash, header.parent_hash);
                         self.note_imported(header.number);
                     }
+                    self.prepare_on = Some(*block_hash);
                 }
                 if let Err(err) = self.engine.process_event(*event) {
                     debug!(target: "n42.h2.node", %err, "engine rejected an execution event");

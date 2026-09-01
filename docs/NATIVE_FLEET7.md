@@ -2165,3 +2165,55 @@ fleet's first requirement is memory. `N42_SENDER_CACHE_MULT` keeps the sweep
 available. The ingest keeps populating the cache: it costs one insert per
 transaction on a path that already had the sender in hand, and it is the wiring
 that should have been there.
+
+## Round 19: the gas tier is exhausted, and what that leaves
+
+Doubling the tier, everything else held:
+
+| tier | tx a block | cycle | TPS |
+|---|---:|---:|---:|
+| 3.42 G | 163,000 | 2.500 s | **65,197** |
+| 6.84 G | 326,000 | 5.000 s | **65,197** |
+
+Identical to the transaction. Twice the block, twice the cycle: per-block fixed
+cost is already negligible against per-transaction cost, and **bigger blocks are
+finished as a lever**. The +11% that 480M → 3.42G bought was the last of the
+amortisation, not the start of a trend.
+
+That reduces the problem to one line. The serial chain is 12.5 µs a transaction:
+
+| | per transaction |
+|---|---:|
+| propagate | 1.9 µs |
+| **import (execution)** | **4.2 µs** |
+| **build (execution + selection)** | **5.5 µs** |
+| seal | 0.9 µs |
+
+Execution appears twice — the leader executes to build, every node executes to
+validate — and is 9.7 of the 12.5. 160,000 TPS needs 6.25 µs, and no combination
+of the other three reaches it: removing propagation entirely leaves 10.6.
+
+**So parallel execution is necessary, and at N42-26's stated 6.5x for simple
+transfers it is also sufficient** — 1.9 + 0.9 + 1.5 + 0.9 = 5.2 µs, about
+192,000 TPS. Everything else measured in this file is a rounding error against
+it.
+
+### The two routes to it, priced
+
+reth already implements parallel execution, gated on the block carrying an
+EIP-7928 block access list (`payload_validator.rs`: `has_block_access_list()` →
+`bal::execute_block`). N42-26's roadmap says it never fires for them because
+they are on Cancun. This chain declares `osakaTime = 0`, so the fork is not the
+obstacle here — the transport is:
+
+* `getPayloadV5` (Osaka) returns an envelope with **no** BAL.
+* The BAL rides in `ExecutionPayloadV4`, carried by `newPayloadV5` (Amsterdam).
+* This repo's Engine API adapter tops out at `newPayloadV4` and **explicitly
+  refuses V5**.
+
+So the work is plumbing, not algorithms: Amsterdam in the chainspec, V4 payload
+and V5 methods in the adapter, and the BAL carried through the seal and the
+block gossip encoding. reth's half is already written.
+
+The alternative is writing a parallel block executor, which is N42-26's plan B
+and which their own roadmap stages over four phases. The plumbing is cheaper.

@@ -86,6 +86,42 @@ loads and checks the hash; `crates/chainspec/res/genesis/gov5/` holds chain 94 a
 README for the `--fork-time` step before running on them). `docs/N42_26_PORT.md` "Joining a Go fleet"
 lists every cross-client rule that had to be matched.
 
+`scripts/fleet7.sh` runs the **all-Rust seven-node fleet** on the native chain — gov5's flagship
+shape, seven independent members each with its own execution layer and validator in a static full
+mesh, no discovery and no devp2p. Its genesis is `crates/chainspec/res/genesis/n42_fleet7.json`
+(chain 94's consensus parameters: epoch 200, gov5's 200,000-slot committee pool with 512 signers,
+but every fork at block 0, because the block reward is paid as withdrawals). Every launch argument
+lives in `scripts/fleet7-env.sh` and nowhere else. `up --fresh` / `status` / `watch <secs>` /
+`roll <i>` / `down`; `F7_TXGEN_RATE=<tx/s>` offers it load (200 tx/s sustained,
+0 rejected, block interval held).
+
+Throughput rounds are `scripts/fleet7-bench.sh` (one round: fresh datadirs at
+the 480M bench tier on `n42_fleet7_bench.json`, base-fee decay, flood,
+N x 30 s windows; `F7_BLOCK_INTERVAL_MS` paces in milliseconds and
+`F7_VIEW_TIMEOUT_MS` overrides the chain's baseTimeout, but a *tighter* one is
+worse: three runs each say 500 ms is 20% slower than the genesis 6,000 ms at
+250 ms pacing, because the timeout has to exceed the cycle a block actually
+takes and this fleet's is 1.4-2.5 s whatever the pacing asks for), `examples/tx_flood` (funds and floods a derived
+sender set, gov5's derivation so both clients draw on the same accounts),
+`scripts/fleet7-measure.py` (TPS **and** occupancy and full(>=95%), because the
+first is ambiguous without the others), `scripts/fleet7-phases.py` (where a
+block's cycle goes — run at the END of a round and compare whole rounds only)
+and `scripts/fleet7-profile.sh` (perf between windows; `--alloc` for jemalloc
+heap profiles, the instrument a CPU profile cannot replace).
+
+**Never draw a conclusion from one round.** `scripts/fleet7-repeat.sh <n>` runs a
+configuration repeatedly and prints the spread. Measured over three runs: the
+round's transaction total varies 5% and window 1 varies 4%, but window 2 varies
+17% and window 3 by 89% — so the total and window 1 are the metrics, and a
+difference under about 10% between single rounds is invisible. Two consecutive
+runs of one configuration produced 1,024,853 and 894,094 transactions.
+
+Profiled rounds need `cargo build --profile profiling` and
+`F7_BIN=target/profiling`: `[profile.release]` strips symbols and a profile of
+it names nothing. `docs/NATIVE_FLEET7.md` records what it measures, the three defects that only
+appear at seven nodes, and which knobs are worth turning — plus the one set that is not (the
+GossipSub parameters are a gov5 wire contract, asserted in tests, not a tuning surface).
+
 `cargo build`/`cargo test` with no `-p` only touches `default-members` (`bin/n42`). Use `--workspace`
 deliberately — it is a very large build.
 
@@ -198,7 +234,7 @@ byte-exact contracts — compare by SHA-256 of raw bytes, never text-mode conten
 ```bash
 cargo test -p n42-bmt-core -p n42-twig-core -p n42-h2-primitives -p n42-h2-wire \
            -p n42-h2-consensus -p n42-mobile-verify -p n42-h2-net \
-           -p n42-h2-execution                                      # 412 tests
+           -p n42-h2-execution                                      # 464 tests
 ```
 
 ## Witness replay (new direction)

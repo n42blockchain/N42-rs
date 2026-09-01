@@ -70,8 +70,14 @@ if not totals:
 def spread(v):
     if len(v) < 2:
         return f'{v[0]:,} (one run)'
-    return (f'median {statistics.median(v):,.0f}  min {min(v):,}  max {max(v):,}  '
-            f'spread {100 * (max(v) - min(v)) / statistics.median(v):.0f}%')
+    median = statistics.median(v)
+    line = f'median {median:,.0f}  min {min(v):,}  max {max(v):,}'
+    # A window every round reports as zero is a real outcome -- the generator
+    # ran out before the window did -- and a spread relative to a zero median
+    # is not. Dividing anyway raised ZeroDivisionError here, which killed the
+    # summary silently after the windows that did have a median: no `total
+    # txs` line, no `runs` line, and a caller waiting on either waited forever.
+    return line if median == 0 else f'{line}  spread {100 * (max(v) - min(v)) / median:.0f}%'
 for w in sorted(per_window):
     print(f'{w} tps : {spread(per_window[w])}')
 print(f'total txs: {spread(totals)}')

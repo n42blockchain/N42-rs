@@ -1494,3 +1494,110 @@ against a generator supplying 22,662. So:
 
 **This fleet has never been saturated, and no number in this file is its
 maximum.** The next measurement has to outsupply it before any of them can be.
+
+### The ceiling probe went the wrong way, and said where to look
+
+Supply was raised five-fold — 6,000 senders x 2,500 transactions, 15,000,000
+against a fleet that had just demonstrated an appetite of about 54,800 a second
+— on the assumption that the previous rounds were supply-limited and the number
+would rise.
+
+It fell:
+
+| | 3,000,000 supply | 15,000,000 supply |
+|---|---:|---:|
+| win1 | 22,290 TPS, 1.000 s | 22,094 TPS, 1.035 s |
+| win2 | 22,662 TPS, 0.536 s | **8,633 TPS, 1.667 s** |
+| win3 | 0 (supply gone) | 12,319 TPS, 1.250 s |
+| nodes behind | none | **node 4: 123 commits against 170** |
+| timed-out views | 5 | 53 |
+
+More load made it slower, and the one-member-falls-behind pathology came back
+with it. gov5 had already reported the same shape from the other side — raising
+their generator from 40k to 80k offered tx/s lowered their peak window from
+41,495 to 36,190 — so this is a property of the regime rather than of either
+client.
+
+It also falsifies the framing of the previous section. "Supply-limited" was the
+right reading of window 2's 32-66% occupancy, but "therefore more supply gives a
+bigger number" did not follow, and the probe was worth running precisely because
+that step was an assumption rather than a measurement.
+
+What it points at is a defect of exactly the same family as the forwarding one,
+one layer along: **work whose size the fleet sets, done where consensus has to
+wait for it.** `publish_transactions` filtered the pool's outgoing transactions
+against a `VecDeque` of 4,096 remembered hashes using `contains`, which is a
+linear scan, once per transaction published. At 22,000 TPS that is around 90
+million 32-byte comparisons a second on the consensus event loop, and it grows
+linearly with the transaction rate — so raising supply raises the cost of
+carrying it, which is the mechanism by which more load produces fewer blocks.
+
+The deque is kept for eviction order and a `HashSet` added beside it for
+membership. Both structures hold the same hashes; only the lookup changes.
+
+### The scan was replaced, and the replacement was not a result
+
+Three rounds of the set-based dedup against three of the off-loop build:
+
+| | median round | spread | range |
+|---|---:|---:|---|
+| forwarding off the loop | 1,411,294 | 10% | 1,274,724 – 1,417,110 |
+| + set-based dedup | 1,244,697 | 23% | 1,043,100 – 1,325,706 |
+
+The ranges overlap, the medians differ by 12% inside spreads of 10% and 23%, and
+window 1's spread went from 4% to 65%. **That is not a result in either
+direction**, and the mechanism argued for it in the previous section — 90
+million comparisons a second — is arithmetic on an assumption, not a
+measurement. `publish_transactions` is fed by a filter polled every 500 ms, and
+how many transactions per second actually reach it was never measured.
+
+There is also a method error in it, and it is the more useful half. The change
+was not the data-structure change it was described as. The original pushed every
+heard hash into the deque **including duplicates**, so 4,096 entries held fewer
+than 4,096 distinct hashes; a `HashSet` holds 4,096 distinct ones and therefore
+remembers a longer window and filters more of this node's own publishing. So two
+things changed at once — how the window is searched, and what the window
+remembers — and the round measured the pair. Whatever it measured, it was not
+"O(n) versus O(1)".
+
+It was redone as a counting multiset — exactly the original semantics, only the
+lookup differs — and re-measured:
+
+| | median round | spread | range |
+|---|---:|---:|---|
+| the scan (unchanged) | 1,411,294 | 10% | 1,274,724 – 1,417,110 |
+| counting multiset, O(1) | 1,372,147 | 69% | 1,119,860 – 2,060,892 |
+
+**No effect.** Three percent on the median, with the ranges overlapping across
+almost their whole length. The scan cost nothing measurable, and the 90-million
+figure was arithmetic on a publish rate that was never measured — the outbound
+side is fed by a filter polled every 500 ms, and how many transactions actually
+come through it per second is still unknown.
+
+The index has been taken back out. It is not carried for a benefit that does not
+exist, and this fleet is meant to be frugal; what stays is the note above the
+field saying it was tried and what it measured.
+
+That makes six confirmed-but-inert mechanisms in this file, and this is the
+first where the mechanism was written down as a finding before it was checked.
+The rule that follows is narrower than "measure everything": **a cost argued
+from a rate is not a cost until the rate is measured.** Both halves of
+`90e6 = 22,000 x 4,096` were assumptions; only the 4,096 was ever read off the
+code.
+
+### A commit that carried something it did not mention
+
+`eddc3a9fb` was made with `git add -A` and swept in an unrelated, unmeasured
+change to `crates/node/builder`: sizing reth's sender-recovery cache from the
+transaction pool rather than taking upstream's `1 << 17` default. The reasoning
+is gov5's and it is sound — the cache is direct-mapped, the whole pool churns
+through it, and at a 360,000-slot pool a block's senders are overwritten between
+the pool recovering them and the block arriving — but it is a change to a
+vendored reth crate that every node compiles, and it went in inside a commit
+about transaction forwarding.
+
+It did not contaminate anything: `target/release/n42` was last built on
+2026-08-31 and the patch is from 2026-09-01, so no round in this file ran with
+it. It is measured on its own, after the dedup question is settled, and the
+sequencing matters — the validator binary and the execution-layer binary have to
+move one at a time or neither result means anything.

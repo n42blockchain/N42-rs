@@ -16,6 +16,8 @@ n42-h2-primitives.workspace = true
 n42-h2-wire.workspace = true
 alloy-primitives = { workspace = true, features = ["serde"] }
 alloy-consensus.workspace = true
+# For EIP-7928's access-list hash, which a payload carries only as the list.
+alloy-eip7928.workspace = true
 alloy-eips.workspace = true
 alloy-rlp.workspace = true
 alloy-rpc-types-engine.workspace = true

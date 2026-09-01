@@ -470,16 +470,40 @@ pub fn reconstruct_gov5_h2_block<T: alloy_eips::Decodable2718>(
         }
         other => vec![other],
     };
+    // And a third the payload cannot carry: EIP-7928's access list *hash*.
+    // The Engine API sends the list, not its hash — the execution layer derives
+    // one from the other — so a header rebuilt from a payload has the field
+    // empty while the header that was hashed had it filled.
+    let bal_hashes: Vec<Option<B256>> = match &execution.payload {
+        ExecutionPayload::V4(v4) => {
+            // The payload carries the list RLP-encoded; the header carries its
+            // hash. Decoding here is the only way to get from one to the other.
+            let decoded = <alloy_eip7928::BlockAccessList as alloy_rlp::Decodable>::decode(
+                &mut v4.block_access_list.as_ref(),
+            )
+            .ok();
+            let mut candidates = vec![block.header.block_access_list_hash];
+            if let Some(bal) = decoded {
+                candidates
+                    .push(Some(alloy_eip7928::compute_block_access_list_hash(bal.as_slice())));
+            }
+            candidates
+        }
+        _ => vec![block.header.block_access_list_hash],
+    };
     for ommers_hash in [B256::ZERO, EMPTY_OMMER_ROOT_HASH] {
         for difficulty in [U256::ZERO, U256::from(1)] {
             for withdrawals_root in &withdrawals_roots {
                 for requests_hash in &requests_hashes {
-                    block.header.ommers_hash = ommers_hash;
-                    block.header.difficulty = difficulty;
-                    block.header.withdrawals_root = *withdrawals_root;
-                    block.header.requests_hash = *requests_hash;
-                    if block.header.hash_slow() == expected {
-                        return Ok(block);
+                    for bal_hash in &bal_hashes {
+                        block.header.ommers_hash = ommers_hash;
+                        block.header.difficulty = difficulty;
+                        block.header.withdrawals_root = *withdrawals_root;
+                        block.header.requests_hash = *requests_hash;
+                        block.header.block_access_list_hash = *bal_hash;
+                        if block.header.hash_slow() == expected {
+                            return Ok(block);
+                        }
                     }
                 }
             }

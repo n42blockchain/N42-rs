@@ -2217,3 +2217,83 @@ block gossip encoding. reth's half is already written.
 
 The alternative is writing a parallel block executor, which is N42-26's plan B
 and which their own roadmap stages over four phases. The plumbing is cheaper.
+
+## Round 20: reth already has a parallel executor, and nine gates to reach it
+
+The arithmetic in round 19 left one route to the target, and this round
+established that the executor for it is already written — in reth, behind a gate
+this fleet had never opened.
+
+### It is real, and it is gated on one field
+
+`payload_validator.rs::bal_path_eligible` chooses between a serial `while` loop
+and `payload_processor::bal::execute_block`, and the choice is `bal.is_some()` —
+the fork check next to it is still a TODO. The parallel side is not scaffolding:
+`rayon::Scope`, one worker per pool thread, speculative execution in parallel,
+and a commit loop that only applies state diffs in order.
+
+N42-26's roadmap says it never fires for them because they are on Cancun, and
+lists a parallel executor as P0 work staged over four phases. **This chain
+declares `osakaTime = 0`, so the fork was never the obstacle here.** The
+transport was.
+
+### Nine gates, eight passed
+
+Each was found by reth's own error, and the error moved one step per round:
+
+| | symptom | cause |
+|---|---|---|
+| 1 | `-38005 Unsupported fork` | the adapter stopped at V4; Amsterdam refuses `(V3, attrs)`, `(V4, payload)`, `(V5, getPayload)` |
+| 2 | `-38003 Invalid payload attributes` | EIP-7843's slot number, required post-Amsterdam and refused before it |
+| 3 | `no payload build for id` | symptom of 4 |
+| 4 | `could not transform version=V6` | `MissingBlockAccessList` |
+| 5 | — | **this repo's `default_n42_payload` lacks upstream's `with_bal_builder_if`** |
+| 6 | still `MissingBlockAccessList` | **the built list was then dropped: `EthBuiltPayload::new(.., None)`** |
+| 7 | `-38005` on the *import* side | followers rebuild from gossip, which carried no list |
+| 8 | still `-38005` | **`blockAccessList` is nested inside `executionPayload`, and serde ignored it silently** |
+| 9 | `no gov5 header variant hashes to the payload's block hash` | the header's `block_access_list_hash` — open |
+
+Gates 5, 6 and 7 are one root cause seen three times: **forking a file does not
+fork what upstream adds to it later.** One upstream line corresponds to two
+holes here, and the third has no upstream counterpart at all because gov5's
+block format is ours.
+
+Gate 8 is the subtlest thing found today. `blockAccessList` lives *inside*
+`executionPayload` — Amsterdam types that field as `ExecutionPayloadV4`, a V3
+payload plus the list — and serde ignores fields it does not recognise. Read at
+the envelope's top level it is always absent, silently, and the first sign is
+`Unsupported fork` three hops away in a follower. What located it was a wire
+round-trip test *passing*: with the encoding proved good, the fault had to be
+upstream of it.
+
+Gate 9 is a different shape again: the information is **not in the protocol**.
+The Engine API carries the access *list*; the header carries its *hash*, which
+the execution layer derives. A header rebuilt from a payload therefore cannot
+have it. gov5's `withdrawals_root` and `requests_hash` have the same problem and
+the reconstruction already solves it by trying both candidate values and letting
+the block hash decide — the access-list hash was added as a fifth dimension, and
+does not yet match.
+
+### And a regression that nearly shipped
+
+Making `forkchoiceUpdated`-with-attributes always use V4 with a slot number is
+required on Amsterdam and **refused on every fork before it**. Seven consecutive
+rounds ran the Amsterdam genesis, so the fleet's normal configuration was broken
+and silent for all of them. A regression round on the default genesis is what
+found it; without that the tree would have been green, well-committed and unable
+to start a chain.
+
+Fixed with the newest-first fallback whose constant had already been written and
+never used. The narrower lesson: **a change should be scoped as tightly as the
+reason for it.** The reason was "Amsterdam needs V4"; the code said "every call
+with attributes uses V4".
+
+Baseline re-verified after the fix: windows 2 and 3 both **65,197 TPS** at a
+2.500 s cycle, identical to before.
+
+### Where this leaves the target
+
+Not reached. The comparable figure is 65,197 TPS at 163,000 transactions a block
+with 2,000,000 recipients, against a target above 160,000. The route to it is
+established, the executor exists, eight of nine gates are open, and the ninth is
+characterised precisely rather than guessed at.

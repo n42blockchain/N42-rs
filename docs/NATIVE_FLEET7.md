@@ -1730,3 +1730,117 @@ The first diagnosis of (3) was "the datadirs were not wiped", and a guard was
 written for it before the chain itself was read. It was wrong — the chain was
 fresh both times — and reading `baseFeePerGas` from blocks 1, 20 and 65 settled
 it in one command.
+
+## Round 18: catching up with N42-26's tier
+
+N42-26's record is 156,499 TPS at **163,000 transactions a block**. Reading their
+devlogs settled what to copy and what not to, and then measuring settled it
+again — differently, twice.
+
+### The comparison was not what it looked like
+
+Earlier rounds said "my cycle is faster, the difference is block size". That was
+an artefact of comparing at *different* block sizes. Run at their tier:
+
+| | N42-26 | this fleet |
+|---|---:|---:|
+| transactions a block | 163,000 | 163,000 |
+| cycle | 1.15 s | 3.33 s |
+| TPS | 156,499 | 48,898 |
+
+At the same block size they are **2.9x faster per block**. The honest gap is
+theirs, not the tier's.
+
+Bigger blocks alone bought almost nothing: 7.1x the transactions cost 6.4x the
+cycle, so 44,189 TPS became 48,898 — 11%. Per-block cost is close to linear in
+block size, which is the thing a gas tier cannot get around.
+
+### Sizing the tier is three numbers, not one
+
+A 163,000-transaction block needs a pool that can hold one. The bench tier's
+120,000-slot pending pool is five blocks at 480M and **less than one** at 3.42G,
+and a builder that cannot fill a block does not say so — it produces short
+blocks and the round reports them as the chain's rate. The pool and the ingest
+gate are now derived from the gas ceiling the way the gossip cap already was:
+three blocks of pool, a gate at five sixths of it.
+
+### Two redundant decodes of the leader's own block
+
+Tracing one full cycle through the leader's log found 648 ms between the block
+being finished and its body being published, on a path where sealing is 150 ms.
+
+The whole of it was `built.execution_data.clone().try_into_block::<TxEnvelope>()`
+— a clone of twelve megabytes and a full decode of 163,000 transactions into
+typed envelopes, **to read one header**. And the header had just been built:
+`normalize_to_gov5_h2` constructs it to hash it, then drops it. The same payload
+was decoded twice in a row for the same object.
+
+Returning the sealed header instead: **48,898 -> 54,331 TPS**, 648 ms -> 425 ms.
+
+At 22,857 transactions the same defect is about 90 ms and invisible. It took the
+tier to make it show.
+
+### What the remaining 418 ms is, and what it is not
+
+| | |
+|---|---:|
+| `encode_ms` | **346–401 ms** |
+| `compress_ms` | 9–10 ms |
+| `push_ms` | 2–4 ms |
+
+Snappy on nineteen megabytes is ten milliseconds. Encoding the block into gov5's
+RLP is thirty-five times that, and it is a third full decode: `encode_block_rlp`
+reconstructs the block from raw bytes, recomputes the transaction root as a trie
+over 163,000 transactions, and re-encodes every transaction back to the bytes it
+started from.
+
+### Sharing the pushed block: confirmed, and inert
+
+`push_block_to_all` copied the block once per peer — six copies of twelve
+megabytes per block, on the consensus loop. Changed to a shared `Bytes`, which
+is what N42-26 did with an `Arc<Vec<u8>>`.
+
+**No measurable difference**: 425 ms -> 418 ms, and the round's windows land in
+the same places. The instrumentation then said why: `push_ms` is 2–4 ms. Seventy
+megabytes of memcpy is about ten milliseconds at this machine's bandwidth, and
+the "six copies of twelve megabytes" arithmetic that motivated the change never
+had a rate under it.
+
+That is the eighth confirmed-but-inert mechanism in this file and the third time
+this session that a cost was argued from a quantity without measuring the rate.
+The change stays — it is strictly less copying with no downside — but it is not
+a result.
+
+### What was studied and deliberately not taken
+
+N42-26's `payload_cache` (402-line reth patch): the payload builder stores its
+execution output keyed by block hash, and `newPayload` takes it and skips the
+EVM entirely, forcing a synchronous state root because the StateRootTask would
+otherwise wait for execution updates that never come. It exactly matches a cost
+measured here — the leader re-executing its own block, 710 ms at this tier.
+
+Not adopted, for two reasons and one caveat:
+
+* The phase analysis says the leader's own import is **not on the serial chain**.
+  Every node executes every block as a follower (621 ms); the leader merely does
+  one extra execution per seven blocks. Removing it saves EL work, not cycle.
+* It needs three more reth crates in the patch table (`crates/evm/evm`,
+  `crates/ethereum/payload`, `crates/engine/tree`).
+* And it would miss anyway without a change: sealing the view alters the block
+  hash, so a cache keyed by the built hash never matches the imported one.
+  Re-keying after the seal would work — the seal touches only extra data,
+  ommers hash and difficulty, none of which change the execution output.
+
+Three other things from their devlogs, checked and not applicable: their zstd is
+on their own payload format, while this fleet's block topic is gov5's
+`ssz_snappy` wire contract; their `connection_limits` ordering bug needs a
+`connection_limits` behaviour, which this transport does not have; and their
+UDP receive-buffer ceiling is a QUIC problem, while this transport is TCP.
+
+### A note on how this file is kept
+
+N42-26 keeps 152 numbered devlogs under an index. This file is one document with
+rounds appended, now past 1,500 lines. The convention that matters is the same
+one either way: **every attempt is recorded, including the ones that did
+nothing** — eight of the mechanisms in this file are confirmed and inert, and
+they are the reason the ones that worked can be believed.

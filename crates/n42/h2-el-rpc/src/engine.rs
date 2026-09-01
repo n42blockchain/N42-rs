@@ -280,6 +280,7 @@ pub fn built_block_from_envelope(
             sidecar,
         ),
         blob_tx_hashes,
+            header: None,
     })
 }
 

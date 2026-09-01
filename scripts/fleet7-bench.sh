@@ -105,6 +105,25 @@ export F7_GENESIS=${F7_GENESIS:-$(cd "$HERE/.." && pwd)/crates/chainspec/res/gen
 # tree is one more thing to keep in sync for no reason.
 if [[ -n $GASCEIL ]]; then
   export F7_BENCH_GASCEIL=$GASCEIL
+  # The pool and the ingest gate are sized from the tier, not left where the
+  # previous tier put them.
+  #
+  # A pool that cannot hold one block is a builder that can never fill one, and
+  # nothing says so: the blocks come out short and the round reports it as the
+  # chain's rate. At the 480M tier a block is 22,857 transfers against a
+  # 120,000-slot pool -- five blocks' worth -- and at 3.42G it is 163,000
+  # against the same 120,000, which is less than one. Three blocks' worth is the
+  # ratio this file settled on: enough that the builder always has a full block
+  # in front of it, not so much that the pool's own bookkeeping grows for
+  # nothing.
+  #
+  # The gate follows the pool rather than the block, because its job is to stop
+  # the generator from filling the pool, not to stop it from filling a block.
+  blk=$(( GASCEIL / 21000 ))
+  : "${F7_BENCH_POOL_SLOTS:=$(( blk * 3 ))}"
+  : "${N42_TX_INGEST_HIGH_WATER:=$(( F7_BENCH_POOL_SLOTS * 5 / 6 ))}"
+  export F7_BENCH_POOL_SLOTS N42_TX_INGEST_HIGH_WATER
+  echo "tier sizing  : ${blk} tx/block, pool ${F7_BENCH_POOL_SLOTS}, ingest gate ${N42_TX_INGEST_HIGH_WATER}"
   DERIVED=${F7_ROOT:-/data/blockchain/rust-fleet7-bench}/genesis-${GASCEIL}.json
   mkdir -p "$(dirname "$DERIVED")"
   python3 -c "import json,sys

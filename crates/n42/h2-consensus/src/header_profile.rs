@@ -476,6 +476,22 @@ pub fn normalize_to_gov5_h2(
     view: u64,
     sealer: Option<&BlsSecretKey>,
 ) -> Result<ExecutionData, HeaderProfileError> {
+    normalize_to_gov5_h2_with_header(execution, view, sealer).map(|(data, _)| data)
+}
+
+/// [`normalize_to_gov5_h2`], returning the header it built as well.
+///
+/// The header is a by-product of sealing and it used to be thrown away, after
+/// which the caller decoded the whole payload again to get it back. At the
+/// 163,000-transaction tier that second decode is a clone and a full RLP walk
+/// of twelve megabytes -- measured as 648 ms between the leader finishing its
+/// block and publishing the body, on a path where the seal itself is 150 ms.
+/// Handing the header back costs nothing and removes it.
+pub fn normalize_to_gov5_h2_with_header(
+    execution: &ExecutionData,
+    view: u64,
+    sealer: Option<&BlsSecretKey>,
+) -> Result<(ExecutionData, alloy_consensus::Header), HeaderProfileError> {
     let mut block = execution
         .clone()
         .try_into_block::<TxEnvelope>()
@@ -498,7 +514,8 @@ pub fn normalize_to_gov5_h2(
         seal_header(&mut block.header, key)?;
     }
     let hash = block.header.hash_slow();
-    Ok(execution_data_for_block(hash, &block))
+    let header = block.header.clone();
+    Ok((execution_data_for_block(hash, &block), header))
 }
 
 /// A block body with these transactions and, on a post-Shanghai header, the

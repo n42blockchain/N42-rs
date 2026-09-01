@@ -588,7 +588,8 @@ impl<E: ExecutionLayer> H2Service<E> {
         self.header_profile = HeaderProfile::Gov5H2;
         self.native_wire = true;
         self.driver.set_payload_normalizer(move |payload, view| {
-            n42_h2_consensus::normalize_to_gov5_h2(payload, view, Some(&key))
+            n42_h2_consensus::normalize_to_gov5_h2_with_header(payload, view, Some(&key))
+                .map(|(data, header)| (data, Some(header)))
                 .map_err(|e| e.to_string())
         });
         self
@@ -1074,7 +1075,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                     match decode_block_rlp(&chunk.rlp, self.header_profile) {
                         Ok(block) if block.block_hash == hash => {
                             self.remember_block(hash, &block.header);
-                            self.remember_body(hash, chunk.rlp);
+                            self.remember_body(hash, chunk.rlp.to_vec());
                             self.driver.cache_payload(hash, block.execution_data());
                             if self.awaiting_bodies.remove(&hash) {
                                 self.ready_bodies.push(hash);
@@ -1106,7 +1107,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                         let hash = block.block_hash;
                         if !self.body_store.contains_key(&hash) {
                             self.remember_block(hash, &block.header);
-                            self.remember_body(hash, chunk.rlp);
+                            self.remember_body(hash, chunk.rlp.to_vec());
                             self.driver.cache_payload(hash, block.execution_data());
                             if self.awaiting_bodies.remove(&hash) {
                                 self.ready_bodies.push(hash);
@@ -1466,8 +1467,15 @@ impl<E: ExecutionLayer> H2Service<E> {
         // sibling from a stale head. Such a leader asks for the block and
         // proposes once it has it; the genesis QC certifies nothing and leaves
         // the head in charge.
+        // Timed from here to the build, because the phase analysis says a
+        // leader spends 1,397 ms between committing and publishing a body while
+        // building and sealing account for 887 of it. The 510 ms in between is
+        // this function, and nothing here looks like 510 ms -- which is exactly
+        // why it gets measured rather than reasoned about.
+        let decided = std::time::Instant::now();
         let certified = self.engine.locked_qc().block_hash;
         let head = if certified == B256::ZERO { self.driver.head() } else { certified };
+        let from_el = !self.block_headers.contains_key(&head);
         let head_header = match self.block_headers.get(&head) {
             Some(header) => Some(header.clone()),
             None => match self.driver.execution_layer().block_by_hash(head).await {
@@ -1501,6 +1509,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             head_header,
             head_seen: self.block_seen.get(&head).copied(),
         };
+        let header_at = decided.elapsed();
         let Some(attrs) = build_attributes(context) else {
             // Declined for now — not marked as proposed, so the next step asks
             // again. This is how a leader paces itself against a clock coarser
@@ -1509,9 +1518,18 @@ impl<E: ExecutionLayer> H2Service<E> {
             self.defer_reason = Some("the attribute builder declined");
             return;
         };
+        let attrs_at = decided.elapsed();
         self.proposal_deferred = false;
         self.defer_reason = None;
         self.proposed_view = Some(view);
+        info!(
+            target: "n42.h2.node",
+            view,
+            header_ms = header_at.as_millis() as u64,
+            attrs_ms = attrs_at.saturating_sub(header_at).as_millis() as u64,
+            from_el,
+            "proposal preamble"
+        );
         match self.driver.build_block_on(head, attrs, view).await {
             Ok(built) => {
                 debug!(target: "n42.h2.node", view, block = ?built.hash, txs = built.tx_count, "built a block to propose");
@@ -1520,9 +1538,19 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // itself, and before the proposal if the followers are to vote
                 // in the first round. Publishing it first is the best order
                 // gossip can offer.
-                match built.execution_data.clone().try_into_block::<alloy_consensus::TxEnvelope>() {
-                    Ok(block) => self.remember_block(built.hash, &block.header),
-                    Err(err) => debug!(target: "n42.h2.node", %err, "built payload has no header to remember"),
+                // The header the seal already built, not a second decode of
+                // the block to find it again. That decode was a clone and a
+                // full RLP walk of the whole payload: 648 ms between finishing
+                // a 163,000-transaction block and publishing its body, against
+                // 150 ms for the seal that had just constructed the same
+                // header.
+                if let Some(header) = built.header.clone() {
+                    self.remember_block(built.hash, &header);
+                } else {
+                    match built.execution_data.clone().try_into_block::<alloy_consensus::TxEnvelope>() {
+                        Ok(block) => self.remember_block(built.hash, &block.header),
+                        Err(err) => debug!(target: "n42.h2.node", %err, "built payload has no header to remember"),
+                    }
                 }
                 self.publish_body(&built.execution_data);
                 if let Err(err) = self
@@ -1817,7 +1845,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                         self.remember_imported(hash);
                         self.note_imported(number);
                         self.remember_block(hash, &block.header);
-                        self.remember_body(hash, chunk.rlp);
+                        self.remember_body(hash, chunk.rlp.to_vec());
                         if let Some(c) = self.catch_up.as_mut() {
                             c.next += 1;
                         }
@@ -1954,11 +1982,35 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// Publishes a block body, queueing it if the mesh is not ready.
     fn publish_body(&mut self, execution: &alloy_rpc_types_engine::ExecutionData) {
         let block_hash = execution.block_hash();
-        let data = match encode_block_rlp(execution, self.header_profile)
-            .and_then(|rlp| compress_block_rlp(&rlp).map(|data| (rlp, data)))
-        {
-            Ok((rlp, data)) => {
+        // Timed in three because the gap between a leader finishing a block and
+        // the fleet hearing about it is 418 ms at the 163,000-transaction tier
+        // and nothing else is left in it. Encoding walks the whole block into
+        // gov5's RLP; compressing walks the result again; and both are on the
+        // consensus loop.
+        let started = std::time::Instant::now();
+        let data = match encode_block_rlp(execution, self.header_profile) {
+            Ok(rlp) => {
+                let encoded = started.elapsed();
+                let data = match compress_block_rlp(&rlp) {
+                    Ok(data) => data,
+                    Err(err) => {
+                        warn!(target: "n42.h2.node", %err, ?block_hash, "cannot compress our own block");
+                        return;
+                    }
+                };
+                let compressed = started.elapsed();
                 self.push_body(&rlp, block_hash);
+                if rlp.len() > 1_000_000 {
+                    info!(
+                        target: "n42.h2.node",
+                        bytes = rlp.len(),
+                        wire = data.len(),
+                        encode_ms = encoded.as_millis() as u64,
+                        compress_ms = compressed.saturating_sub(encoded).as_millis() as u64,
+                        push_ms = started.elapsed().saturating_sub(compressed).as_millis() as u64,
+                        "block body prepared"
+                    );
+                }
                 self.remember_body(block_hash, rlp);
                 data
             }

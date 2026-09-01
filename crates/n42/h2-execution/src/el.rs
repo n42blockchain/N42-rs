@@ -83,6 +83,14 @@ pub struct BuiltBlock {
     /// Transaction hashes of the EIP-4844 transactions in this block, used to
     /// gather and broadcast their sidecars.
     pub blob_tx_hashes: Vec<B256>,
+    /// The header, when the normalizer built one.
+    ///
+    /// Carried rather than recovered: sealing constructs the header to hash it,
+    /// and the caller needs the same header a moment later. Decoding the
+    /// payload again to get it back is a clone and a full RLP walk of the whole
+    /// block -- 648 ms at the 163,000-transaction tier, on a path where sealing
+    /// itself is 150 ms.
+    pub header: Option<alloy_consensus::Header>,
 }
 
 /// A block as the execution layer holds it: header, transactions and, on a

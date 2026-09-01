@@ -603,7 +603,7 @@ impl H2V4Transport {
         let fork_digest = self.our_status().fork_digest();
         let chunks = rlps
             .into_iter()
-            .map(|rlp| BlockChunk { fork_digest, rlp })
+            .map(|rlp| BlockChunk { fork_digest, rlp: rlp.into() })
             .collect();
         let _ = self.swarm.behaviour_mut().ranges.send_response(channel.0, Ok(chunks));
     }
@@ -616,7 +616,7 @@ impl H2V4Transport {
     /// it. Fire and forget from the caller's side: the acknowledgement is
     /// consumed by the transport, and a peer that does not speak the protocol
     /// fails the request rather than the block — the topic still carries it.
-    pub fn push_block(&mut self, peer: PeerId, rlp: Vec<u8>) {
+    pub fn push_block(&mut self, peer: PeerId, rlp: alloy_primitives::Bytes) {
         let chunk = BlockChunk {
             fork_digest: self.our_status().fork_digest(),
             rlp,
@@ -627,10 +627,16 @@ impl H2V4Transport {
     /// Hands `rlp` to every connected peer at once, returning how many were
     /// sent to. The fanout is what tells a leader whether the mesh still has
     /// to carry the body for anyone.
+    /// Hands the same block to every connected member, copying it once.
+    ///
+    /// The bytes are wrapped once and the wrapper is what each peer's request
+    /// gets, so a fanout of six costs six refcounts rather than six copies of
+    /// the block.
     pub fn push_block_to_all(&mut self, rlp: &[u8]) -> usize {
+        let shared = alloy_primitives::Bytes::copy_from_slice(rlp);
         let peers = self.connected_peer_ids();
         for peer in &peers {
-            self.push_block(*peer, rlp.to_vec());
+            self.push_block(*peer, shared.clone());
         }
         peers.len()
     }
@@ -639,7 +645,7 @@ impl H2V4Transport {
         let reply = match rlp {
             Some(rlp) => Ok(BlockChunk {
                 fork_digest: self.our_status().fork_digest(),
-                rlp,
+                rlp: rlp.into(),
             }),
             None => Err("block not found".to_owned()),
         };

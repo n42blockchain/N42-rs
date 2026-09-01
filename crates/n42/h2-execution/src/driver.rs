@@ -113,8 +113,10 @@ impl DriverAction {
 /// commits to it (gov5's HotStuff profile) the header has to be finished —
 /// view stamped, seal signed, hash re-formed — before anyone else sees it.
 /// The result is what gets cached, imported, and proposed.
-pub type PayloadNormalizer =
-    dyn Fn(&ExecutionData, u64) -> Result<ExecutionData, String> + Send + Sync;
+pub type PayloadNormalizer = dyn Fn(&ExecutionData, u64)
+        -> Result<(ExecutionData, Option<alloy_consensus::Header>), String>
+    + Send
+    + Sync;
 
 struct Normalizer(Box<PayloadNormalizer>);
 
@@ -169,7 +171,10 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// Installs a [`PayloadNormalizer`] applied to every block this node builds.
     pub fn set_payload_normalizer(
         &mut self,
-        normalizer: impl Fn(&ExecutionData, u64) -> Result<ExecutionData, String> + Send + Sync + 'static,
+        normalizer: impl Fn(&ExecutionData, u64) -> Result<(ExecutionData, Option<alloy_consensus::Header>), String>
+            + Send
+            + Sync
+            + 'static,
     ) {
         self.normalizer = Some(Normalizer(Box::new(normalizer)));
     }
@@ -346,10 +351,11 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         // only the finished block exists — it is what gets imported, and the
         // hash consensus sees.
         if let Some(normalize) = &self.normalizer {
-            let finished = (normalize.0)(&built.execution_data, view)
+            let (finished, header) = (normalize.0)(&built.execution_data, view)
                 .map_err(|e| ElError::new(format!("finishing the built block: {e}")))?;
             built.hash = finished.block_hash();
             built.execution_data = finished;
+            built.header = header;
         }
 
         let after_seal = started.elapsed();

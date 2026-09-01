@@ -337,7 +337,13 @@ pub struct BlockChunk {
     /// The chain's fork digest, as gov5 writes before the block.
     pub fork_digest: [u8; 4],
     /// gov5's block RLP: `[header, txs, verifiers, rewards]`.
-    pub rlp: Vec<u8>,
+    ///
+    /// `Bytes` rather than `Vec<u8>` because a leader hands the same block to
+    /// every member and libp2p's request-response takes an owned request per
+    /// peer. Copied, that is six copies of a twelve-megabyte block per block --
+    /// 72 MB of memcpy on the consensus loop, at the tier where the block is
+    /// big enough for anyone to notice. Cloning a `Bytes` moves a refcount.
+    pub rlp: alloy_primitives::Bytes,
 }
 
 /// What a `block_by_hash` request comes back with: the block, or the peer's
@@ -380,7 +386,7 @@ impl request_response::Codec for BlockByHashCodec {
         let mut fork_digest = [0u8; 4];
         io.read_exact(&mut fork_digest).await?;
         let rlp = read_framed_limit(io, MAX_BLOCK_WIRE_BYTES, MAX_BLOCK_CHUNK).await?;
-        Ok(Ok(BlockChunk { fork_digest, rlp }))
+        Ok(Ok(BlockChunk { fork_digest, rlp: rlp.into() }))
     }
 
     async fn write_request<T>(
@@ -475,7 +481,7 @@ impl request_response::Codec for BlockPushCodec {
         let mut fork_digest = [0u8; 4];
         io.read_exact(&mut fork_digest).await?;
         let rlp = read_framed_limit(io, MAX_BLOCK_WIRE_BYTES, MAX_BLOCK_CHUNK).await?;
-        Ok(BlockChunk { fork_digest, rlp })
+        Ok(BlockChunk { fork_digest, rlp: rlp.into() })
     }
 
     async fn read_response<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Response>
@@ -539,7 +545,7 @@ mod block_push_tests {
     fn a_pushed_chunk_round_trips() {
         let chunk = BlockChunk {
             fork_digest: [0x11, 0x24, 0x89, 0xf0],
-            rlp: vec![0xc4, 0xc0, 0xc0, 0xc0, 0xc0],
+            rlp: alloy_primitives::Bytes::from_static(&[0xc4, 0xc0, 0xc0, 0xc0, 0xc0]),
         };
         let mut wire = Vec::new();
         block_on(BlockPushCodec.write_request(&block_push_protocol(), &mut wire, chunk.clone()))
@@ -581,7 +587,7 @@ mod block_by_hash_tests {
     fn a_served_block_is_status_digest_and_one_framed_chunk() {
         let chunk = BlockChunk {
             fork_digest: [0x11, 0x24, 0x89, 0xf0],
-            rlp: vec![0xc4, 0xc0, 0xc0, 0xc0, 0xc0],
+            rlp: alloy_primitives::Bytes::from_static(&[0xc4, 0xc0, 0xc0, 0xc0, 0xc0]),
         };
         let bytes = encode_block_reply(&Ok(chunk.clone())).unwrap();
         assert_eq!(bytes[0], RESPONSE_CODE_SUCCESS);
@@ -724,7 +730,7 @@ impl request_response::Codec for BodiesByRangeCodec {
             let mut fork_digest = [0u8; 4];
             io.read_exact(&mut fork_digest).await?;
             let rlp = read_framed_limit(io, MAX_BLOCK_WIRE_BYTES, MAX_BLOCK_CHUNK).await?;
-            chunks.push(BlockChunk { fork_digest, rlp });
+            chunks.push(BlockChunk { fork_digest, rlp: rlp.into() });
             if chunks.len() as u64 > MAX_RANGE_BLOCKS {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "peer served more blocks than a range allows"));
             }
@@ -804,8 +810,8 @@ mod bodies_by_range_tests {
     #[test]
     fn a_range_reply_is_chunks_until_the_stream_closes() {
         let chunks = vec![
-            BlockChunk { fork_digest: [1, 2, 3, 4], rlp: vec![0xc4, 0xc0, 0xc0, 0xc0, 0xc0] },
-            BlockChunk { fork_digest: [1, 2, 3, 4], rlp: vec![0xc4, 0xc0, 0xc0, 0xc0, 0xc1] },
+            BlockChunk { fork_digest: [1, 2, 3, 4], rlp: alloy_primitives::Bytes::from_static(&[0xc4, 0xc0, 0xc0, 0xc0, 0xc0]) },
+            BlockChunk { fork_digest: [1, 2, 3, 4], rlp: vec![0xc4, 0xc0, 0xc0, 0xc0, 0xc1].into() },
         ];
         let mut codec = BodiesByRangeCodec;
         let proto = bodies_by_range_protocol();

@@ -410,7 +410,7 @@ impl H2V4Transport {
             .with_tcp(
                 Default::default(),
                 libp2p::noise::Config::new,
-                libp2p::yamux::Config::default,
+                crate::config::yamux_config,
             )
             .map_err(|e| TransportError::Transport(e.to_string()))?
             .with_behaviour(|_| behaviour)

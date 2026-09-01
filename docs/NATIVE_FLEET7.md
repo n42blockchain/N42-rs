@@ -1991,3 +1991,65 @@ these figures is quoted.
 
 N42-26's generator clamps recipients to two million the same way, and their
 sixty-second round moves 9.39M transfers, so they are in the same regime.
+
+### The propagation tail, found by a ratio and diagnosed wrongly twice
+
+Applying the byte floor to what was left of the serial chain. A 12.2 MB body
+touched once is about 1.2 ms of work at this machine's memory bandwidth:
+
+| step | measured | vs the floor |
+|---|---:|---:|
+| snappy compress | 10 ms | 8x |
+| encode from raw bytes | 6 ms | 5x |
+| direct push, sender side | 4 ms | 3x |
+| **published -> received** | **302 ms** | **248x** |
+
+Everything on the leader's path sits at 3-8x. Propagation sits at 248x, which is
+40 MB/s across loopback. Small bodies cross in 0.1 ms, which rules out a stalled
+event loop and leaves flow control.
+
+libp2p's yamux receive window is the specification's 256 KiB, so a 12.2 MB body
+is about forty-eight window round trips. Raising it to 16 MiB:
+
+| yamux | win2, two rounds each |
+|---|---:|
+| libp2p default | 38,032 / 38,032 TPS |
+| **fixed 16 MiB window** | **59,762 / 65,197 TPS** |
+
+**+57% to +71%**, with the two pairs not overlapping and one of them reproducing
+to the transaction.
+
+Two things about that were wrong on the way, and they are the useful part.
+
+**The 256 KiB was a constant read from the wrong version.** libp2p-yamux 0.47
+defaults to yamux **0.13**, whose flow control tunes itself; the 256 KiB default
+is yamux 0.12's. `set_receive_window_size` does not raise a window — it switches
+the connection back to 0.12 and a fixed one. The change is a trade of
+auto-tuning for a constant, and it happens to win here. Reading a default and
+assuming it is in force is the same error that produced the sender-cache sizing
+earlier in this file, which gov5 then measured at exactly 0% hit rate because
+their import path never consults that cache at all.
+
+**And the median was never the problem.** The ratio pointed at propagation and
+propagation was right, but the fix did not move the median — 302 ms to 285 ms.
+It moved the tail:
+
+| | median | p90 | p99 |
+|---|---:|---:|---:|
+| libp2p default | 311 ms | 757 ms | **1,599 ms** |
+| fixed 16 MiB | 285 ms | 374 ms | **633 ms** |
+
+A cycle is a mean and a mean is made of its tail — this file's oldest lesson,
+arrived at again from a different direction. The byte-floor ratio found the
+right subsystem for the wrong reason, which is still worth more than not finding
+it.
+
+**And a two-variable round, which is my error and not the rig's.** The first
+window round also carried a rebuilt execution layer with the sender-cache sizing
+backed out, and its 80% was credited to yamux before either was isolated. Three
+rounds in a 2x2 settled it: the cache changes nothing (38,032 either way) and the
+window is the whole effect. Same mistake as the dedup index earlier — two changes
+measured as one.
+
+Comparable standing at the 163,000-transaction tier with 2,000,000 recipients:
+**65,197 TPS** against N42-26's 156,499.

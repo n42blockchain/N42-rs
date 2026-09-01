@@ -142,3 +142,48 @@ mod tests {
         ));
     }
 }
+
+/// The per-substream receive window for yamux, in bytes.
+///
+/// yamux's default is the specification's 256 KiB, which is a sensible number
+/// for a wide-area mesh of small messages and the wrong one for handing a
+/// twelve-megabyte block to a peer on the same host: the sender stops every
+/// 256 KiB until the receiver returns credit, so the transfer costs about
+/// forty-eight round trips through the receiver's event loop.
+///
+/// Measured on the seven-node fleet at the 163,000-transaction tier: a 12.2 MB
+/// body took 302 ms from published to received, which is 40 MB/s on loopback
+/// and 248 times what touching those bytes once costs. Every other step on the
+/// leader's path is 3-8 times that floor. Small bodies cross in 0.1 ms, which
+/// is what rules out a stalled event loop and leaves flow control.
+///
+/// The cost is memory: this much may be buffered per substream per peer. At the
+/// default of 16 MiB and six peers that is bounded by what the fleet already
+/// spends on one block, and `N42_YAMUX_WINDOW_MB` exists so a memory-constrained
+/// deployment can put it back.
+pub fn yamux_receive_window() -> Option<u32> {
+    const DEFAULT_MB: u32 = 16;
+    let mb = std::env::var("N42_YAMUX_WINDOW_MB")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_MB);
+    (mb > 0).then(|| mb.clamp(1, 256) << 20)
+}
+
+/// yamux, with the receive window raised only if a round asked for it.
+///
+/// `N42_YAMUX_WINDOW_MB=0` leaves libp2p's default untouched. The distinction
+/// matters: libp2p-yamux 0.47 defaults to yamux 0.13, whose flow control tunes
+/// itself, while `set_receive_window_size` switches the connection back to
+/// yamux 0.12 and a fixed window. This is not "raise a number", it is "trade
+/// auto-tuning for a constant" — and on this fleet the constant wins, in a
+/// place that took two rounds each side to find.
+pub fn yamux_config() -> libp2p::yamux::Config {
+    let Some(window) = yamux_receive_window() else {
+        return libp2p::yamux::Config::default();
+    };
+    let mut config = libp2p::yamux::Config::default();
+    #[allow(deprecated)]
+    config.set_receive_window_size(window);
+    config
+}

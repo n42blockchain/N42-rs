@@ -763,35 +763,22 @@ impl<Node: FullNodeTypes> BuilderContext<Node> {
         executor: TaskExecutor,
         config_container: WithConfigs<<Node::Types as NodeTypes>::ChainSpec>,
     ) -> Self {
-        // Sized from the transaction pool, not from upstream's default.
+        // Upstream's default, on purpose.
         //
-        // The cache is direct-mapped, so a colliding hash overwrites rather
-        // than evicting by age, and what churns through it is the whole pool
-        // rather than one block. Upstream's 1 << 17 is comfortably above a
-        // block and well below a throughput node's pool: at a 360,000-slot
-        // pool the entries for a block's transactions are overwritten between
-        // the pool recovering them and the block arriving, and import pays the
-        // ~50 us of secp256k1 a second time. gov5 measured exactly this on
-        // their own equivalent cache -- ~30% of an imported block's senders
-        // already overwritten, 6.2 s of secp256k1 in a 30 s saturated profile
-        // -- and fixed it by sizing above the pool's population rather than
-        // the block's. This does the same, and keeps upstream's value as the
-        // floor so a default-sized pool behaves as it did.
+        // This was briefly sized from the transaction pool, on gov5's finding
+        // that their equivalent cache was evicting an imported block's senders
+        // before the block arrived. They have since measured the cache under
+        // the mode that matters and retracted it: with warm pools their import
+        // path never consults the cache at all -- the sender is already on the
+        // pooled transaction object -- so its hit rate is not low, it is zero,
+        // and their 2^18 -> 2^20 resize bought nothing. The change was never
+        // compiled into a running node here and no round in `NATIVE_FLEET7.md`
+        // ran with it.
         let sender_recovery_cache = config_container
             .config
             .engine
             .sender_recovery_cache_enabled
-            .then(|| {
-                let pool = &config_container.config.txpool;
-                let population = pool
-                    .pending_max_count
-                    .saturating_add(pool.basefee_max_count)
-                    .saturating_add(pool.queued_max_count);
-                // A power of two at least as large as the population, since
-                // the cache is indexed by masking the hash.
-                let capacity = population.next_power_of_two().max(1 << 17);
-                reth_evm::SenderRecoveryCache::new(capacity)
-            });
+            .then(reth_evm::SenderRecoveryCache::default);
         Self { head, provider, executor, config_container, sender_recovery_cache }
     }
 

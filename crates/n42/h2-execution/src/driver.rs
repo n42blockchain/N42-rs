@@ -23,6 +23,7 @@ use alloy_rpc_types_engine::{
     ExecutionData, ForkchoiceState, PayloadAttributes, PayloadStatusEnum,
 };
 use n42_h2_consensus::{ConsensusEvent, EngineOutput};
+use tracing::info;
 
 use crate::{
     el::{BuiltBlock, ElError, ExecutionLayer, ResolveKind},
@@ -238,6 +239,13 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         attrs: PayloadAttributes,
         view: u64,
     ) -> Result<BuiltBlock, ElError> {
+        // Timed in four parts because the leader's whole path is 396.5 ms
+        // against 82.7 ms of block execution, and which part holds the rest
+        // decides between two different fixes: building ahead of being leader
+        // (so the wait leaves the critical path) or not building the block
+        // twice (so the work is not done twice). Guessing between them is how
+        // this file has been wrong before.
+        let started = std::time::Instant::now();
         let updated = self
             .el
             .fork_choice_updated_with_attrs_for(
@@ -246,6 +254,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                 attrs,
             )
             .await?;
+        let after_fcu = started.elapsed();
 
         // A build only starts if the EL accepted the forkchoice. Reporting the
         // status is more useful than a bare "no payload id": VALID-without-id
@@ -266,6 +275,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             )
             .await
             .ok_or_else(|| ElError::new(format!("no payload build for id {payload_id}")))??;
+        let after_resolve = started.elapsed();
 
         // The block the execution layer built is not necessarily the block
         // this node proposes: a chain whose header carries the view needs it
@@ -279,6 +289,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             built.execution_data = finished;
         }
 
+        let after_seal = started.elapsed();
         self.cache_payload(built.hash, built.execution_data.clone());
 
         // Import our own block before proposing it. `getPayload` builds a block
@@ -291,6 +302,20 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             .el
             .new_payload_for(ExecutionPath::LIVE_SEQUENTIAL, built.execution_data.clone())
             .await?;
+        // `import` is this node executing the block it has just built. Sealing
+        // the view into the header changes the hash, so the execution layer
+        // cannot recognise the block as the one it assembled and runs every
+        // transaction a second time.
+        info!(
+            target: "n42.h2.el",
+            view,
+            fcu_ms = after_fcu.as_millis() as u64,
+            build_ms = (after_resolve - after_fcu).as_millis() as u64,
+            seal_ms = (after_seal - after_resolve).as_millis() as u64,
+            import_ms = started.elapsed().saturating_sub(after_seal).as_millis() as u64,
+            total_ms = started.elapsed().as_millis() as u64,
+            "leader build path"
+        );
         match status.status {
             PayloadStatusEnum::Valid => {
                 self.head = built.hash;

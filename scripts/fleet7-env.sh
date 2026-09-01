@@ -166,6 +166,24 @@ print(total)
 #    largest import component whenever the followers' pools do not already hold
 #    the block's transactions. reth's levers are --engine.sender-recovery-cache
 #    and --engine.txpool-prewarming.
+# Worker counts, as an array so a round can set them once. The lean tier keeps
+# the frugal values; the bench tier takes upstream's defaults by omitting the
+# flags entirely, which is what `F7_EL_WORKERS=()` means.
+if [[ ${F7_PROFILE:-lean} == bench ]]; then
+  : "${F7_WORKERS:=default}"
+else
+  : "${F7_WORKERS:=2}"
+fi
+if [[ $F7_WORKERS == default ]]; then
+  F7_EL_WORKERS=()
+else
+  F7_EL_WORKERS=(
+    --engine.storage-worker-count "$F7_WORKERS"
+    --engine.account-worker-count "$F7_WORKERS"
+    --engine.prewarming-threads "$F7_WORKERS"
+  )
+fi
+
 : "${F7_BENCH_GASCEIL:=480000000}"
 : "${F7_BENCH_POOL_SLOTS:=120000}"
 : "${F7_BENCH_POOL_MB:=512}"
@@ -287,9 +305,23 @@ f7_el_args() {
       # dedicated host; each of these is per node, so the figure to read is
       # seven times what it says.
       --engine.cross-block-cache-size 128   # default 4096 MB
-      --engine.storage-worker-count 2       # default 2x parallelism
-      --engine.account-worker-count 2       # default = storage workers
-      --engine.prewarming-threads 2         # default = parallelism
+
+      # Worker counts, which are a memory setting in the lean tier and a
+      # throughput setting in the bench tier -- the same three numbers, read
+      # two different ways, and they were left at the memory reading when the
+      # goal changed. Upstream defaults them to the node's parallelism (and
+      # twice that for storage workers), which `taskset` makes 32 per node
+      # here; pinning them to 2 caps the work that recovers senders and warms
+      # state at a sixteenth of the cores the node is given.
+      #
+      # It matters at ingress rather than at import: 62-68 ms to add a
+      # 22,857-transaction block cannot contain 1.14 s of serial secp256k1, so
+      # recovery is already being paid when transactions enter the pool and
+      # carried to import by the sender cache. Two threads is about 40,000
+      # recoveries a second against an ingress of roughly 22,000 -- close
+      # enough that oversupply may be where it first binds, which is a
+      # hypothesis and not yet a measurement.
+      "${F7_EL_WORKERS[@]}"
 
       # The RPC caches serve queries this fleet does not make.
       --rpc-cache.max-receipts 64

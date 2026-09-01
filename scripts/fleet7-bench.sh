@@ -52,6 +52,17 @@ GASPRICE=100000000000000
 GASCEIL=
 PROFILE_NODE=-1
 SHARD=
+# How many accounts the round's transfers pay.
+#
+# One was the old shape and it was the wrong one: a 163,000-transaction block
+# paying a single account writes one account, where the same block with
+# scattered recipients writes 163,000 -- five orders of magnitude of state that
+# every earlier number in this file left out. N42-26's generator spreads over up
+# to two million, so this does too, and the comparison is a comparison.
+#
+# It also makes parallel execution measurable at all: every transfer paying the
+# same account is a write-write conflict on every transfer.
+RECIPIENTS=${F7_RECIPIENTS:-2000000}
 
 while (( $# )); do
   case $1 in
@@ -67,6 +78,7 @@ while (( $# )); do
     --gasprice)     GASPRICE=$2; shift 2 ;;
     --gasceil)      GASCEIL=$2; shift 2 ;;
     --profile-node) PROFILE_NODE=$2; shift 2 ;;
+    --recipients)   RECIPIENTS=$2; shift 2 ;;
     --shard-senders) SHARD=--shard-senders; shift ;;
     -h|--help)      sed -n '2,8p' "$0" | sed 's/^# \?//'; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -160,7 +172,7 @@ RPCS=$(for ((i = 0; i < F7_NODES; i++)); do printf 'http://127.0.0.1:%s,' $((F7_
 {
   echo "round        : $TAG"
   echo "tier         : gossip ${N42_MAX_GOSSIP_MB}MB, gas ceiling ${F7_BENCH_GASCEIL}, pool ${F7_BENCH_POOL_SLOTS}, pacing ${F7_BLOCK_INTERVAL_MS}ms, view timeout ${F7_VIEW_TIMEOUT_MS:-genesis}"
-  echo "supply       : $SENDERS senders x $PERTX tx, offset $OFFSET, conc $CONC, batch $RPCBATCH${SHARD:+, sharded}"
+  echo "supply       : $SENDERS senders x $PERTX tx, offset $OFFSET, conc $CONC, batch $RPCBATCH${SHARD:+, sharded}, $RECIPIENTS recipients"
   echo "windows      : $WINDOWS x ${WINDOW_SEC}s after ${DECAY_SEC}s of base-fee decay"
 } | tee "$OUT/round.txt"
 
@@ -230,7 +242,7 @@ if [[ -n ${F7_INGEST:-} ]]; then
   echo "ingest       : $INGESTS" | tee -a "$OUT/round.txt"
 fi
 setsid $FLOOD_PIN "$F7_BIN/examples/tx_flood" --rpc "$RPCS" --chain-id "$CHAIN" \
-  "${INGEST_ARG[@]}" \
+  "${INGEST_ARG[@]}" --recipients "$RECIPIENTS" \
   --senders "$SENDERS" --pertx "$PERTX" --offset "$OFFSET" --gasprice "$GASPRICE" \
   --conc "$CONC" --rpcbatch "$RPCBATCH" $SHARD \
   > "$OUT/flood.log" 2>&1 < /dev/null &

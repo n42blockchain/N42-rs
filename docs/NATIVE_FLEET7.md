@@ -1964,3 +1964,30 @@ evaluated on this workload at all.
 
 The generator has to change before any of these numbers can be called a
 comparison. Fixing it will lower them.
+
+### The comparable number, and it is half
+
+With N42-26's recipient spread — 2,000,000 hash-derived accounts instead of one
+sink — at the 163,000-transaction tier, everything else identical:
+
+| recipients | win1 | win2 | win3 |
+|---|---:|---:|---:|
+| one | 72,243 | 70,615 | 65,167 |
+| **2,000,000** | **35,112** | **38,032** | **54,331** |
+
+So the honest figure against their 156,499 TPS is **38,032–54,331**, and the gap
+is 2.9–4.1x rather than the 2.2x this file had been claiming. Every number in
+this file before this point was measured on a workload that wrote one account
+per block.
+
+The shape inside the round is the interesting part. Window 3 is 55% faster than
+window 1 on the same chain with the same supply, and the reason is account
+creation: 15,000,000 transfers over 2,000,000 recipients means the first two
+million transfers each create an account and write new trie nodes, and the rest
+update accounts that already exist. A round that starts on an empty recipient
+set measures creation; one that runs long enough measures updates. Both are real
+and they are not the same number — which is a thing to state whenever one of
+these figures is quoted.
+
+N42-26's generator clamps recipients to two million the same way, and their
+sixty-second round moves 9.39M transfers, so they are in the same regime.

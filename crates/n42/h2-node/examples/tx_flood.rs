@@ -54,9 +54,40 @@ use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
 use serde_json::{json, Value};
 
-/// Where the flood's transfers go. Value lands somewhere that will never spend
-/// it again, so the senders' balances are the only thing that moves.
+/// Where the flood's transfers go when `--recipients 1`.
+///
+/// Value lands somewhere that will never spend it again, so the senders'
+/// balances are the only thing that moves.
 const SINK: Address = Address::new([0x42; 20]);
+
+/// Knuth's multiplicative constant, as N42-26's `n42-stress` uses it to spread
+/// recipients. Kept identical so a block of this fleet's transfers touches the
+/// same *number* of accounts, in the same scattered way, as a block of theirs.
+const RECIPIENT_SPREAD: u32 = 2_654_435_761;
+
+/// The recipient for one transfer.
+///
+/// One address for every transfer is the wrong shape and it took a comparison
+/// to notice: a 163,000-transaction block that pays a single account writes one
+/// account, where the same block with scattered recipients writes 163,000.
+/// Five orders of magnitude of state, absent from every number this harness
+/// produced before.
+///
+/// It also made one direction unmeasurable. Every transaction writing the same
+/// account is a write-write conflict on every transaction, so a parallel
+/// executor would serialise on it completely -- exactly the case N42-26's
+/// roadmap excludes when it says the speedup shows only on contract-heavy
+/// blocks.
+fn recipient(spread: u32, index: u64) -> Address {
+    if spread <= 1 {
+        return SINK;
+    }
+    let slot = ((index as u32).wrapping_mul(RECIPIENT_SPREAD)) % spread;
+    let mut bytes = [0u8; 20];
+    bytes[..4].copy_from_slice(&slot.to_be_bytes());
+    bytes[4] = 0x42;
+    Address::new(bytes)
+}
 const TRANSFER_GAS: u64 = 21_000;
 /// gov5 caps a batch here; beyond it the JSON body itself becomes the cost.
 const MAX_RPC_BATCH: usize = 200;
@@ -73,6 +104,9 @@ struct Args {
     rpc_batch: usize,
     shard_senders: bool,
     skip_funding: bool,
+    /// How many distinct recipients the transfers are spread over. 1 keeps the
+    /// old single-sink shape.
+    recipients: u32,
     /// Binary ingest addresses, one per node, in place of JSON-RPC for the
     /// flood. Funding stays on RPC: it is six thousand transactions once, and
     /// it needs to read nonces back.
@@ -177,7 +211,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         batch.clear();
                         batch.extend(
                             (from..upto)
-                                .map(|n| signed(key, n, args.chain_id, args.gas_price, 1)),
+                                .map(|n| {
+                                    let to = recipient(args.recipients, (worker * chunk + index) as u64 * args.per_tx + n);
+                                    signed(key, n, args.chain_id, args.gas_price, 1, to)
+                                }),
                         );
                         let accepted = submit(&client, rpc, &batch, &sent, &rejected);
                         nonce[index] += accepted as u64;
@@ -236,14 +273,14 @@ fn derive(offset: u64, index: usize) -> PrivateKeySigner {
     }
 }
 
-fn signed(key: &PrivateKeySigner, nonce: u64, chain_id: u64, gas_price: u128, value: u64) -> String {
+fn signed(key: &PrivateKeySigner, nonce: u64, chain_id: u64, gas_price: u128, value: u64, to: Address) -> String {
     let tx = TxEip1559 {
         chain_id,
         nonce,
         gas_limit: TRANSFER_GAS,
         max_fee_per_gas: gas_price,
         max_priority_fee_per_gas: gas_price / 10,
-        to: TxKind::Call(SINK),
+        to: TxKind::Call(to),
         value: U256::from(value),
         ..Default::default()
     };
@@ -296,7 +333,10 @@ fn flood_over_ingest(
             let upto = (from + args.rpc_batch as u64).min(args.per_tx);
             batch.clear();
             batch.extend(
-                (from..upto).map(|n| signed_raw(key, n, args.chain_id, args.gas_price, 1)),
+                (from..upto).map(|n| {
+                    let to = recipient(args.recipients, index as u64 * args.per_tx + n);
+                    signed_raw(key, n, args.chain_id, args.gas_price, 1, to)
+                }),
             );
             if conn.send(index, &batch).is_err() {
                 return;
@@ -405,14 +445,14 @@ impl Ingest {
 }
 
 /// The same transaction as [`signed`], as bytes rather than as a hex string.
-fn signed_raw(key: &PrivateKeySigner, nonce: u64, chain_id: u64, gas_price: u128, value: u64) -> Vec<u8> {
+fn signed_raw(key: &PrivateKeySigner, nonce: u64, chain_id: u64, gas_price: u128, value: u64, to: Address) -> Vec<u8> {
     let tx = TxEip1559 {
         chain_id,
         nonce,
         gas_limit: TRANSFER_GAS,
         max_fee_per_gas: gas_price,
         max_priority_fee_per_gas: gas_price / 10,
-        to: TxKind::Call(SINK),
+        to: TxKind::Call(to),
         value: U256::from(value),
         ..Default::default()
     };
@@ -593,6 +633,7 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
         shard_senders: false,
         skip_funding: false,
         ingest: Vec::new(),
+        recipients: 1,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -608,6 +649,7 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
             "--conc" => args.conc = next()?.parse()?,
             "--rpcbatch" => args.rpc_batch = next()?.parse::<usize>()?.clamp(1, MAX_RPC_BATCH),
             "--ingest" => args.ingest = next()?.split(',').map(str::to_owned).collect(),
+            "--recipients" => args.recipients = next()?.parse()?,
             "--shard-senders" => args.shard_senders = true,
             "--skip-funding" => args.skip_funding = true,
             "--help" | "-h" => {

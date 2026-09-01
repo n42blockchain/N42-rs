@@ -19,6 +19,8 @@ async-trait = "0.1"
 thiserror.workspace = true
 tracing.workspace = true
 metrics.workspace = true
+# For handing a leader's own import to a task rather than awaiting it.
+tokio = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

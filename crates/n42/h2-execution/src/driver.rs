@@ -23,7 +23,7 @@ use alloy_rpc_types_engine::{
     ExecutionData, ForkchoiceState, PayloadAttributes, PayloadStatusEnum,
 };
 use n42_h2_consensus::{ConsensusEvent, EngineOutput};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::{
     el::{BuiltBlock, ElError, ExecutionLayer, ResolveKind},
@@ -129,7 +129,9 @@ impl std::fmt::Debug for Normalizer {
 /// Drives an [`ExecutionLayer`] on behalf of the consensus engine.
 #[derive(Debug)]
 pub struct ExecutionDriver<E> {
-    el: E,
+    /// Shared so a leader's import of its own block can be handed to a task
+    /// instead of awaited. See [`Self::spawn_import_own_block`].
+    el: std::sync::Arc<E>,
     /// Finishes a built payload before it is proposed. `None` proposes the
     /// payload exactly as built.
     normalizer: Option<Normalizer>,
@@ -157,7 +159,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// Builds a driver whose head and finalised block are `genesis`.
     pub fn new(el: E, genesis: B256) -> Self {
         Self {
-            el,
+            el: std::sync::Arc::new(el),
             normalizer: None,
             prepared: None,
             payloads: HashMap::new(),
@@ -394,6 +396,46 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// sealing. Ahead of the proposal it delayed every follower by that much;
     /// behind it, the followers have had the body for 80 ms already and are
     /// executing it in parallel with this.
+    /// Starts the import of a block this node built, without waiting for it.
+    ///
+    /// The wait was the point of moving it behind the proposal and it is not
+    /// enough on its own: at the 163,000-transaction tier the import is 710 ms,
+    /// and awaiting it holds the consensus loop for that long -- during which
+    /// the leader cannot read the votes for the block it has just proposed.
+    ///
+    /// Nothing needs to come back from it. The consensus engine asks for the
+    /// block to be executed like any other, and that request finds it already
+    /// in the execution layer's tree and returns at once; if this task has not
+    /// finished by then, the request executes the block itself and the only
+    /// cost is that the saving did not happen. gov5's sibling client calls
+    /// those the two cases and falls back the same way.
+    ///
+    /// Two `newPayload` calls for one block cannot race: reth serialises engine
+    /// requests through one channel, and the second finds the block in the tree.
+    pub fn spawn_import_own_block(&self, built: &BuiltBlock) {
+        let el = std::sync::Arc::clone(&self.el);
+        let payload = built.execution_data.clone();
+        let hash = built.hash;
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            match el.new_payload_for(ExecutionPath::LIVE_SEQUENTIAL, payload).await {
+                Ok(status) => info!(
+                    target: "n42.h2.el",
+                    block = ?hash,
+                    import_ms = started.elapsed().as_millis() as u64,
+                    status = ?status.status,
+                    "imported our own block"
+                ),
+                Err(err) => warn!(
+                    target: "n42.h2.el",
+                    block = ?hash, %err,
+                    "our own execution layer would not take the block we built"
+                ),
+            }
+        });
+    }
+
+    /// Imports a block this node built and waits for the verdict.
     pub async fn import_own_block(&mut self, built: &BuiltBlock) -> Result<(), ElError> {
         let started = std::time::Instant::now();
         let status = self

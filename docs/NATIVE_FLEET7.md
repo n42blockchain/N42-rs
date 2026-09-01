@@ -1844,3 +1844,42 @@ rounds appended, now past 1,500 lines. The convention that matters is the same
 one either way: **every attempt is recorded, including the ones that did
 nothing** — eight of the mechanisms in this file are confirmed and inert, and
 they are the reason the ones that worked can be believed.
+
+### Eager import: the half that was missing
+
+N42-26's `devlog-22-consensus-exec-pipeline.md` carries the timing diagram that
+says what was still wrong here:
+
+```
+before:  Build N -> broadcast -> vote -> await import (710 ms) -> ...
+after:   Build N -> broadcast -> vote -> Build N+1
+                        |
+                        +-- eager import, spawned, parallel with the vote
+```
+
+Moving the import behind the proposal was half of it, and this file recorded
+that half as done. Awaited, it still holds the consensus loop for the length of
+the import — 710 ms at this tier — and during that time the leader cannot read
+the votes for the block it has just proposed.
+
+Handed to a task instead:
+
+| | win2 | cycle |
+|---|---:|---:|
+| import awaited | 54,331 TPS | 3.000 s |
+| import spawned | **59,764 TPS** | **2.727 s** |
+
+Window 2 and window 3 both report 1,793,000 transactions in 11 blocks, which is
+as reproducible as this rig gets.
+
+Nothing has to come back from the task. The consensus engine asks for the block
+to be executed like any other, and that request finds it in the execution
+layer's tree; if the task has not finished, the request executes it and the only
+cost is the saving not happening — N42-26 call these the two cases and fall back
+the same way. Their devlog also answers the obvious worry: reth serialises engine
+requests through one channel, so the eager `newPayload` and the commit's
+forkchoice cannot race.
+
+At the 163,000-transaction tier this fleet has now gone **48,898 -> 54,331 ->
+59,764 TPS**, and both steps came from reading their devlogs rather than from
+tuning.

@@ -1572,10 +1572,16 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // times and the next proposal builds on this block: an
                 // un-imported parent makes the execution layer answer the next
                 // forkchoice with SYNCING.
+                // Flush, then start the import without waiting for it.
+                //
+                // Behind the proposal was the first half; not awaited is the
+                // rest. At the 163,000-transaction tier the import is 710 ms,
+                // and a loop that awaits it cannot read the votes for the block
+                // it has just proposed. The engine will ask for the block to be
+                // executed like any other, and that request finds it already in
+                // the tree.
                 self.flush_outbox(events);
-                if let Err(err) = self.driver.import_own_block(&built).await {
-                    warn!(target: "n42.h2.node", %err, view, "our own execution layer would not take the block we proposed");
-                }
+                self.driver.spawn_import_own_block(&built);
             }
             Err(err) => {
                 // The view will time out and move on; that is the correct

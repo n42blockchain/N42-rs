@@ -2297,3 +2297,39 @@ Not reached. The comparable figure is 65,197 TPS at 163,000 transactions a block
 with 2,000,000 recipients, against a target above 160,000. The route to it is
 established, the executor exists, eight of nine gates are open, and the ninth is
 characterised precisely rather than guessed at.
+
+### Gate 9, isolated into a test rather than a fleet
+
+The ninth gate is now a unit test instead of a four-minute round, which is the
+trick gov5 took from gate 8 applied to itself: `reconstruct_gov5_h2_block` is
+handed a normalized Amsterdam payload and asked to reproduce the sealed hash.
+
+Two things fell out of it immediately, neither visible from the fleet:
+
+**The access-list hash has two schemes and the payload conversion uses neither
+of the right one.** `try_into_block` fills `block_access_list_hash` from the
+payload's list — for one test list it yielded keccak of the RLP encoding, and
+after normalization it yields `None` — while reth's header carries
+`compute_block_access_list_hash`, which is EIP-7928's. So the leader was sealing
+a header whose access-list hash the execution layer would recompute differently,
+and rejecting its own block with nothing to say which field disagreed. The
+normalizer now recomputes it before sealing.
+
+**And that is not the whole of it.** Correcting only that field still does not
+reproduce the sealed hash, so at least one more header field differs between
+what is sealed and what a payload reconstructs. The test is left in the tree,
+`#[ignore]`d with that stated, because it is the cheapest possible statement of
+what remains and the right place to do the field-by-field comparison — no fleet,
+no four minutes, no base-fee decay.
+
+### The staleness guard has a blind spot
+
+Gate 9 also cost two rounds to a stale binary for the third time today. The
+reconstruction runs in the *node* — `engine-types/src/engine_validator.rs` calls
+it while validating `newPayload` — and the fix was compiled into
+`h2_validator` but not into `n42`.
+
+The guard added earlier checks the validator binary against its sources and says
+nothing about the node's. Its first two failures were false positives (a test
+file, a different example); this one is a false negative, which is the more
+expensive direction.

@@ -564,6 +564,23 @@ pub fn normalize_to_gov5_h2_with_header(
     if block.header.requests_hash.is_some_and(is_empty_requests_hash) {
         block.header.requests_hash = Some(GOV5_EMPTY_REQUESTS_HASH);
     }
+    // EIP-7928's access-list hash, recomputed rather than inherited.
+    //
+    // `try_into_block` fills this field from the payload's list, and it does not
+    // use EIP-7928's scheme -- for an empty list it yields keccak of the RLP
+    // encoding where the specification's hash is something else entirely. Seal a
+    // header carrying that and the block hash is computed over a field the
+    // execution layer will recompute differently, so the block this node just
+    // built is rejected by the node itself with nothing to say which field
+    // disagreed.
+    if let ExecutionPayload::V4(v4) = &execution.payload {
+        block.header.block_access_list_hash =
+            <alloy_eip7928::BlockAccessList as alloy_rlp::Decodable>::decode(
+                &mut v4.block_access_list.as_ref(),
+            )
+            .ok()
+            .map(|bal| alloy_eip7928::compute_block_access_list_hash(bal.as_slice()));
+    }
     if let Some(key) = sealer {
         seal_header(&mut block.header, key)?;
     }
@@ -668,6 +685,78 @@ mod tests {
         assert_eq!(rebuilt.header.withdrawals_root, Some(gov5_rewards_root([(leader, one_ether)])));
         assert_eq!(rebuilt.body.withdrawals.as_deref(), Some(&withdrawals));
         assert_eq!(rebuilt.header.hash_slow(), normalized.block_hash());
+    }
+
+    /// A block whose header carries EIP-7928's access-list hash has to be
+    /// reconstructible from the payload that describes it.
+    ///
+    /// **Currently failing, and kept because it is the cheapest statement of
+    /// what is left.** Two things are already known from it: the payload
+    /// conversion returns `block_access_list_hash: None` rather than the sealed
+    /// value, and correcting only that field still does not reproduce the
+    /// sealed hash — so at least one other header field also differs between
+    /// what is sealed and what a payload reconstructs. Finding it is a
+    /// field-by-field comparison, which this test is the right place to do.
+    ///
+    /// The payload carries the *list*; the header carries its *hash*, derived by
+    /// the execution layer. So the field is absent from anything rebuilt from a
+    /// payload unless it is recomputed, and a header that hashes differently is
+    /// a block the node refuses — which on a live fleet surfaces three hops away
+    /// as "no gov5 header variant hashes to the payload's block hash".
+    #[test]
+    #[ignore = "open: an Amsterdam header does not yet round-trip through a payload"]
+    fn a_header_with_an_access_list_hash_is_reconstructible() {
+        let bal_bytes = alloy_primitives::Bytes::from(alloy_rlp::encode(
+            &alloy_eip7928::BlockAccessList::default(),
+        ));
+        let decoded = <alloy_eip7928::BlockAccessList as alloy_rlp::Decodable>::decode(
+            &mut bal_bytes.as_ref(),
+        )
+        .expect("the list round-trips");
+        let bal_hash = alloy_eip7928::compute_block_access_list_hash(decoded.as_slice());
+
+        let mut header = Header {
+            number: 3,
+            withdrawals_root: Some(alloy_consensus::EMPTY_ROOT_HASH),
+            block_access_list_hash: Some(bal_hash),
+            ..Default::default()
+        };
+        header.ommers_hash = B256::ZERO;
+        header.difficulty = U256::ZERO;
+        let block = Block {
+            header: header.clone(),
+            body: alloy_consensus::BlockBody {
+                transactions: Vec::<TxEnvelope>::new(),
+                ommers: Vec::new(),
+                withdrawals: Some(Withdrawals(Vec::new())),
+            },
+        };
+        let hash = block.header.hash_slow();
+        // Through the real sequence: a leader normalizes what its execution
+        // layer built, and a follower reconstructs what the leader sealed.
+        let data = normalize_to_gov5_h2(
+            &execution_data_for_block_with_bal(hash, &block, Some(bal_bytes)),
+            9,
+            None,
+        )
+        .expect("the block normalizes");
+        // A payload conversion cannot know the hashing scheme the header used —
+        // it sees the list, and EIP-7928's hash is not keccak of the encoding —
+        // so the field comes back wrong and the reconstruction has to try the
+        // computed value alongside it. That is the whole reason this test
+        // exists.
+        let direct = data.clone().try_into_block::<TxEnvelope>().unwrap();
+        assert_ne!(direct.header.block_access_list_hash, Some(bal_hash));
+        let rebuilt = match reconstruct_gov5_h2_block::<TxEnvelope>(&data) {
+            Ok(block) => block,
+            Err(err) => panic!("reconstruction failed: {err}"),
+        };
+        assert_eq!(
+            rebuilt.header.block_access_list_hash,
+            Some(bal_hash),
+            "the sealed header must carry EIP-7928's hash, not the conversion's",
+        );
+        assert_eq!(rebuilt.header.hash_slow(), data.block_hash());
     }
 
     #[test]

@@ -1883,3 +1883,32 @@ forkchoice cannot race.
 At the 163,000-transaction tier this fleet has now gone **48,898 -> 54,331 ->
 59,764 TPS**, and both steps came from reading their devlogs rather than from
 tuning.
+
+### The leader took its own block apart three times
+
+The same root cause showed up in three places, and it is the most useful pattern
+this tier exposed: **a leader repeatedly decoding a block it had just built.**
+
+| where | what it did | cost |
+|---|---|---:|
+| sealing | `try_into_block` to construct the header, hashes it, drops it | 150 ms (needed) |
+| remembering the header | `try_into_block` again, for the header just dropped | 648 -> 425 ms |
+| encoding for the wire | `try_into_block` a third time, plus a transaction-root trie rebuilt over 163,000 transactions to check its own block, then every transaction encoded back into the bytes it came from | **346-401 -> 6 ms** |
+
+The block's transactions are EIP-2718 bytes in the payload the whole time, which
+is exactly what gov5's block RLP wants. Compressing nineteen megabytes is 10 ms;
+encoding them was 360. The ratio is what gives the game away — thirty-five times
+the cost of touching every byte, spent on taking the block apart and putting it
+back together.
+
+| | win2 | cycle |
+|---|---:|---:|
+| general encode path | 59,764 TPS | 2.727 s |
+| raw bytes, sealed header | **65,177 TPS** | **2.501 s** |
+
+The general path stays for blocks this node did not build, where the decode is
+the point.
+
+Running total at the 163,000-transaction tier: **48,898 -> 54,331 -> 59,764 ->
+65,177 TPS**, a third more than the tier started at, from four changes of which
+none were tuning and three came from reading N42-26's devlogs.

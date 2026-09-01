@@ -1552,7 +1552,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                         Err(err) => debug!(target: "n42.h2.node", %err, "built payload has no header to remember"),
                     }
                 }
-                self.publish_body(&built.execution_data);
+                self.publish_body(&built.execution_data, built.header.as_ref());
                 if let Err(err) = self
                     .engine
                     .process_event(ConsensusEvent::BlockReady(built.hash, None))
@@ -1986,7 +1986,11 @@ impl<E: ExecutionLayer> H2Service<E> {
     }
 
     /// Publishes a block body, queueing it if the mesh is not ready.
-    fn publish_body(&mut self, execution: &alloy_rpc_types_engine::ExecutionData) {
+    fn publish_body(
+        &mut self,
+        execution: &alloy_rpc_types_engine::ExecutionData,
+        sealed: Option<&alloy_consensus::Header>,
+    ) {
         let block_hash = execution.block_hash();
         // Timed in three because the gap between a leader finishing a block and
         // the fleet hearing about it is 418 ms at the 163,000-transaction tier
@@ -1994,7 +1998,20 @@ impl<E: ExecutionLayer> H2Service<E> {
         // gov5's RLP; compressing walks the result again; and both are on the
         // consensus loop.
         let started = std::time::Instant::now();
-        let data = match encode_block_rlp(execution, self.header_profile) {
+        // A node that built this block does not have to take it apart to send
+        // it. The payload already carries every transaction as the EIP-2718
+        // bytes this encoding wants, and the header came out of sealing, so the
+        // general path's decode-and-re-encode -- plus a transaction-root trie
+        // rebuilt over the whole block to check our own work -- is 346-401 ms
+        // at the 163,000-transaction tier against 9-10 ms to compress the
+        // result. The general path stays for blocks this node did not build.
+        let own = sealed.map(|header| {
+            let rewards = n42_h2_consensus::withdrawals_to_rewards(
+                execution.payload.as_v2().map_or(&[][..], |v2| v2.withdrawals.as_slice()),
+            );
+            n42_h2_net::encode_block_rlp_raw(header, &execution.payload.as_v1().transactions, &rewards)
+        });
+        let data = match own.map(Ok).unwrap_or_else(|| encode_block_rlp(execution, self.header_profile)) {
             Ok(rlp) => {
                 let encoded = started.elapsed();
                 let data = match compress_block_rlp(&rlp) {

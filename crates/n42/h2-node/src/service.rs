@@ -189,6 +189,8 @@ pub struct H2Service<E> {
     /// Builds the payload attributes for a block this node proposes. `None`
     /// means this node never proposes — see the module docs.
     payload_attributes: Option<Box<PayloadAttributesBuilder>>,
+    /// How long to wait before asking the builder again; see [`PROPOSE_RETRY`].
+    propose_retry: Duration,
     /// The view this node last built a block for, so a leader does not rebuild
     /// on every event it handles while still in the same view.
     proposed_view: Option<u64>,
@@ -213,6 +215,12 @@ pub struct H2Service<E> {
     /// for one of these re-runs the execution instead of waiting for the next
     /// proposal to mention the block again, which it may never do.
     awaiting_bodies: HashSet<B256>,
+    /// When each block's body was last asked of every peer, so a body that
+    /// arrives and still does not let the block execute cannot start the
+    /// request over immediately. Bounded; insertion order in
+    /// `body_requested_order`.
+    body_requested_at: std::collections::HashMap<B256, std::time::Instant>,
+    body_requested_order: std::collections::VecDeque<B256>,
     /// Height of the last block the execution layer is known to have
     /// imported, once read; what "far ahead" is measured from.
     imported_height: Option<u64>,
@@ -290,7 +298,23 @@ pub struct H2Service<E> {
 /// where the leader has not proposed. Without this the next ask comes at the
 /// view timeout, and every other view is lost to it. gov5 paces its own
 /// re-asks at `minProposeDelayMs`, 200ms on the devnet.
+///
+/// It is a *default*, not a constant, because it quantises the block interval:
+/// a leader whose pacing deadline falls just after a re-ask waits the whole
+/// retry again, so the achieved interval is the pacing rounded up to a multiple
+/// of this. At gov5's three-second pacing that is invisible. At a 250 ms
+/// benchmark pacing it is up to 200 ms on a 250 ms target, and it showed up as
+/// a leader taking 872 ms between committing and publishing when the pacing,
+/// the build and the encode together account for about 400.
 const PROPOSE_RETRY: Duration = Duration::from_millis(200);
+
+/// The re-ask interval as a fraction of the pacing, and the floor under it.
+/// An eighth of a three-second period clamps back to the 200 ms default; an
+/// eighth of 250 ms is 31 ms, which is small against the interval it is
+/// quantising and still far more than the cost of asking (an in-memory head
+/// lookup and a closure that returns `None`).
+const PROPOSE_RETRY_FRACTION: u32 = 8;
+const PROPOSE_RETRY_FLOOR: Duration = Duration::from_millis(10);
 
 /// A pull of the blocks this node is missing, from one peer, by range.
 ///
@@ -319,17 +343,50 @@ struct CatchUp {
 /// thousand lookups.
 const MAX_PENDING_SERVES: usize = 256;
 const MAX_PENDING_RANGES: usize = 8;
-/// A block this far past the execution layer's tip is not handed to it:
-/// reth's `MIN_BLOCKS_FOR_PIPELINE_RUN`, past which a payload with an
-/// unknown parent starts a backfill this node's execution layer has no
-/// devp2p peers to complete.
-const FAR_AHEAD_BLOCKS: u64 = 32;
+/// A block this far past the execution layer's tip is not handed to it.
+///
+/// It was 32 — reth's `MIN_BLOCKS_FOR_PIPELINE_RUN`, past which a payload with
+/// an unknown parent starts a backfill this node's execution layer has no
+/// devp2p peers to complete. One is the distance that actually happens, and it
+/// costs the same: reth parks an orphan payload whatever the gap, and with no
+/// peers to reach the parent it stays parked with every later `newPayload`
+/// behind it. Measured on a node that missed a single body: **43 seconds** of
+/// stall, `latest_block` two behind the fleet, and every view that node led
+/// timing out at six seconds — while the seven-node cycle's median phases add
+/// to 438 ms. Missing one body should cost one block.
+///
+/// Judged by block number rather than by whether the parent's hash is known.
+/// A hash-based test needs this node's bookkeeping to agree with the execution
+/// layer's about what has been imported, and when it does not — a fresh driver
+/// whose head is a genesis constant the blocks do not descend from, which is
+/// exactly the four-node fleet test — it holds every block forever. Failing
+/// closed is worse than the stall; `imported_height` is `None` until the first
+/// import, so this is simply inert until it can be right.
+const FAR_AHEAD_BLOCKS: u64 = 1;
 /// Bodies held back at most; the oldest go first.
 const MAX_HELD_BODIES: usize = 4096;
 /// Imported hashes remembered; older commits never arrive.
 const MAX_IMPORTED: usize = 8192;
 /// Between the end of one catch-up and the start of the next.
 const CATCH_UP_RETRY: Duration = Duration::from_secs(3);
+/// Between one broadcast request for a block's body and the next.
+///
+/// Without this the two halves of the body path chase each other: consensus
+/// asks for a block it cannot execute, the request goes to every connected
+/// peer, a body comes back, executing it still fails — because what is missing
+/// is the block's parent, not the block — and the hash leaves the awaiting set,
+/// so the very next pass asks all of them again. Measured on a seven-node fleet
+/// where one member missed a proposal's body while the mesh was still forming:
+/// the node re-imported one block 2,531 times, wrote a gigabyte of log in six
+/// minutes, and filled every peer's inbound streams to capacity
+/// (`libp2p_request_response: Dropping inbound stream`). The fleet still made
+/// blocks throughout, which is what made it worth finding rather than obvious.
+const BODY_REQUEST_INTERVAL: Duration = Duration::from_millis(750);
+/// Hashes remembered for that interval. One per block in flight is enough; the
+/// bound is here so a long run cannot grow the map.
+const MAX_BODY_REQUEST_TIMES: usize = 1024;
+/// Transport events handled per step beyond the one the select takes.
+const MAX_TRANSPORT_DRAIN: usize = 256;
 /// Pulled blocks imported per step. Importing a whole window of 1024 in one
 /// go kept the swarm unpolled for the fifty seconds it took; gov5's streams
 /// to this node timed out meanwhile and it dropped the connection. Between
@@ -412,6 +469,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             validator_count,
             outbox: Vec::new(),
             payload_attributes: None,
+            propose_retry: PROPOSE_RETRY,
             proposed_view: None,
             meshed: false,
             checkpoint: None,
@@ -419,6 +477,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             header_profile: HeaderProfile::Ethereum,
             native_wire: false,
             awaiting_bodies: HashSet::new(),
+            body_requested_at: std::collections::HashMap::new(),
+            body_requested_order: std::collections::VecDeque::new(),
             imported_height: None,
             held_bodies: Vec::new(),
             peer_heights: std::collections::HashMap::new(),
@@ -520,6 +580,18 @@ impl<E: ExecutionLayer> H2Service<E> {
         attributes: impl Fn(ProposalContext) -> Option<PayloadAttributes> + Send + Sync + 'static,
     ) -> Self {
         self.payload_attributes = Some(Box::new(attributes));
+        self
+    }
+
+    /// Sizes the re-ask interval from the chain's block pacing.
+    ///
+    /// The service cannot see the pacing — it lives in the attributes builder,
+    /// which answers `None` until the deadline passes — so the caller that
+    /// knows it says so. Without this the re-ask is a constant and quantises
+    /// the interval it is meant to be polling; see [`PROPOSE_RETRY`].
+    pub fn with_block_pacing(mut self, pacing: Duration) -> Self {
+        self.propose_retry = (pacing / PROPOSE_RETRY_FRACTION)
+            .clamp(PROPOSE_RETRY_FLOOR, PROPOSE_RETRY);
         self
     }
 
@@ -658,16 +730,50 @@ impl<E: ExecutionLayer> H2Service<E> {
                 debug!(target: "n42.h2.node", view = self.engine.current_view(), "view timed out");
                 self.engine.on_timeout()?;
             }
-            () = tokio::time::sleep(PROPOSE_RETRY), if self.proposal_deferred => {
+            () = tokio::time::sleep(self.propose_retry), if self.proposal_deferred => {
                 // Nothing happened; the builder is asked again at the top of
                 // the next step.
             }
         }
 
+        // Everything the transport already has, not one event per step.
+        //
+        // The select above takes exactly one, and a step can spend a hundred
+        // milliseconds or more awaiting the execution layer, so a node under
+        // transaction gossip reads its mesh at whatever rate its own block
+        // cycle runs. Block bodies then queue behind transaction batches on the
+        // same mesh: measured at 6,000 senders as a median body arrival of
+        // 380 ms against 32 ms at 64 senders, with the execution cost of the
+        // block unchanged either way.
+        self.drain_transport(&mut events).await?;
+
         self.drain_outputs(&mut events).await?;
         self.forward_inbound_transactions().await;
         self.flush_outbox(&mut events);
         Ok(events)
+    }
+
+    /// Handles every transport event already queued, up to a bound.
+    ///
+    /// Bounded because the transport can always have more: an unbounded drain
+    /// under sustained gossip would never return to the engine, which is the
+    /// same starvation this fixes, pointed the other way.
+    async fn drain_transport(&mut self, events: &mut Vec<ServiceEvent>) -> Result<(), ServiceError> {
+        for _ in 0..MAX_TRANSPORT_DRAIN {
+            let ready = tokio::select! {
+                biased;
+                event = self.transport.next_event() => {
+                    Some(event.ok_or(ServiceError::TransportEnded)?)
+                }
+                () = std::future::ready(()) => None,
+            };
+            match ready {
+                Some(event) => self.handle_transport_event(event)?,
+                None => break,
+            }
+        }
+        let _ = events;
+        Ok(())
     }
 
     /// Hands the transactions heard from the fleet to the execution layer's
@@ -678,16 +784,17 @@ impl<E: ExecutionLayer> H2Service<E> {
             return;
         }
         let batch = std::mem::take(&mut self.inbound_transactions);
-        let el = self.driver.execution_layer();
-        let mut accepted = 0usize;
-        for raw in batch {
-            match el.send_raw_transaction(raw).await {
-                Ok(_) => accepted += 1,
-                Err(err) => debug!(target: "n42.h2.node", %err, "the pool declined a gossiped transaction"),
-            }
-        }
+        let offered = batch.len();
+        // One request, not one per transaction. This loop does not poll the
+        // transport while it awaits, so a batch forwarded a round trip at a
+        // time stops consensus for the length of the batch: measured on the
+        // seven-node fleet at 6,000 senders as a p90 block cycle of 6 s and a
+        // p99 body arrival of 14 s, against medians of 0.5 s and 32 ms. The
+        // medians were fine throughout, which is what made it a tail problem
+        // rather than an obvious one.
+        let accepted = self.driver.execution_layer().send_raw_transactions(batch).await;
         if accepted > 0 {
-            debug!(target: "n42.h2.node", accepted, "handed gossiped transactions to the pool");
+            debug!(target: "n42.h2.node", accepted, offered, "handed gossiped transactions to the pool");
         }
     }
 
@@ -800,6 +907,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                         if self.awaiting_bodies.remove(&block_hash) {
                             self.ready_bodies.push(block_hash);
                         }
+                        info!(target: "n42.h2.node", ?block_hash, "block body received");
                         self.received_bodies.push(block_hash);
                     }
                     Err(err) => {
@@ -1030,7 +1138,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             return Ok(());
         }
         if let EngineOutput::ExecuteBlock(block_hash) = &output
-            && self.far_ahead(*block_hash)
+            && (self.far_ahead(*block_hash))
         {
             if !self.held_bodies.contains(block_hash) {
                 if self.held_bodies.len() >= MAX_HELD_BODIES {
@@ -1038,7 +1146,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 }
                 self.held_bodies.push(*block_hash);
             }
-            debug!(target: "n42.h2.node", ?block_hash, tip = ?self.imported_height, "block runs far ahead of the execution layer; held until the pull reaches it");
+            debug!(target: "n42.h2.node", ?block_hash, tip = ?self.imported_height, "block runs ahead of the execution layer; held until the pull reaches it");
             return Ok(());
         }
         let action = self.driver.handle_output(&output).await;
@@ -1230,12 +1338,19 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // for it too, as gov5 does, from everyone connected. An
                 // answer that arrives after the gossip copy is a duplicate
                 // the cache absorbs.
-                if self.awaiting_bodies.insert(block_hash) {
+                //
+                // Once per interval, though, and not once per pass: see
+                // BODY_REQUEST_INTERVAL. The event goes out on the same
+                // schedule, because a caller that logs every pass is how the
+                // spin was found and a gigabyte of log is not a better signal
+                // than one line.
+                if self.body_request_due(block_hash) {
+                    self.awaiting_bodies.insert(block_hash);
                     for peer in self.transport.connected_peer_ids() {
                         self.transport.request_block(peer, block_hash);
                     }
+                    events.push(ServiceEvent::PayloadMissing { block_hash });
                 }
-                events.push(ServiceEvent::PayloadMissing { block_hash });
             }
             DriverAction::Rejected { block_hash, reason } => {
                 // Consensus must not vote for it, and the engine learns that by
@@ -1245,6 +1360,26 @@ impl<E: ExecutionLayer> H2Service<E> {
             DriverAction::Finalized { .. } | DriverAction::Ignored => {}
         }
         Ok(())
+    }
+
+    /// Whether this block's body may be asked of the fleet again, recording
+    /// the ask if so.
+    fn body_request_due(&mut self, block_hash: B256) -> bool {
+        let now = std::time::Instant::now();
+        if let Some(last) = self.body_requested_at.get(&block_hash)
+            && now.duration_since(*last) < BODY_REQUEST_INTERVAL
+        {
+            return false;
+        }
+        if self.body_requested_at.insert(block_hash, now).is_none() {
+            self.body_requested_order.push_back(block_hash);
+            while self.body_requested_order.len() > MAX_BODY_REQUEST_TIMES {
+                if let Some(oldest) = self.body_requested_order.pop_front() {
+                    self.body_requested_at.remove(&oldest);
+                }
+            }
+        }
+        true
     }
 
     /// Publishes a message, queueing it if the mesh is not ready.
@@ -1502,11 +1637,28 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// than [`FAR_AHEAD_BLOCKS`] past the execution layer's last known
     /// import. Unknown either way is not far.
     fn far_ahead(&self, block_hash: B256) -> bool {
-        match (self.block_headers.get(&block_hash), self.imported_height) {
+        match (self.block_headers.get(&block_hash), self.imported_tip()) {
             (Some(header), Some(tip)) => header.number > tip + FAR_AHEAD_BLOCKS,
             _ => false,
         }
     }
+
+    /// The execution layer's height, as fresh as this node can know it.
+    ///
+    /// `imported_height` is set when the `BlockImported` event is drained,
+    /// which is one hop behind the driver's own head — and at a threshold of one
+    /// there is no slack for that hop: the next block arrives looking two past a
+    /// tip that has already moved, and is held. The driver's head advances
+    /// synchronously with the import, so its height is the truthful answer when
+    /// the header is known; `imported_height` remains the fallback for a head
+    /// this node never saw a header for.
+    fn imported_tip(&self) -> Option<u64> {
+        self.block_headers
+            .get(&self.driver.head())
+            .map(|header| header.number)
+            .or(self.imported_height)
+    }
+
 
     fn remember_imported(&mut self, block_hash: B256) {
         if self.imported.insert(block_hash) {
@@ -1575,15 +1727,31 @@ impl<E: ExecutionLayer> H2Service<E> {
     }
 
     fn send_body(&mut self, data: Vec<u8>, block_hash: B256) {
-        match self.transport.publish_block(data.clone()) {
-            Ok(_) => {}
+        // Queue before publishing when there is no mesh, rather than cloning
+        // the body so the failure path can have a copy. A full block's body is
+        // megabytes -- the largest object this node handles -- and it was being
+        // copied on every publish to serve a branch that only runs while the
+        // mesh is still forming.
+        if self.transport.mesh_size() == 0 {
+            debug!(target: "n42.h2.node", ?block_hash, "mesh not ready; queueing block body");
+            self.body_outbox.push(data);
+            return;
+        }
+        let bytes = data.len();
+        match self.transport.publish_block(data) {
+            // Timestamped on both sides so the fleet's block-body latency is a
+            // measurement rather than a residual: at the 480M tier the cycle has
+            // ~173 ms in it that the leader's build, the followers' import and
+            // the quorum do not account for, and encoding and compressing the
+            // body is only 4 ms of that (`examples/gossip_cost`).
+            Ok(_) => info!(target: "n42.h2.node", ?block_hash, bytes, "published block body"),
             Err(err) if err.is_already_published() => {}
-            Err(err) if err.is_transient() => {
-                debug!(target: "n42.h2.node", ?block_hash, "mesh not ready; queueing block body");
-                self.body_outbox.push(data);
-            }
+            // A publish that fails with a mesh present is not fatal and is not
+            // worth another copy of the body: peers that miss it ask for it by
+            // hash, which is the path that already carries every block a
+            // follower joins late for.
             Err(err) => {
-                warn!(target: "n42.h2.node", %err, ?block_hash, "block body publish failed");
+                warn!(target: "n42.h2.node", %err, ?block_hash, "block body publish failed; peers will have to fetch it");
             }
         }
     }

@@ -2097,3 +2097,24 @@ client's, so parallel execution is an improvement to make, not a gap to close.
 The gap this fleet still has is against N42-26, who run the same serial
 `payload/src/lib.rs` at the same block size, and that one cannot be explained by
 amortisation.
+
+### reth's sender-recovery cache does nothing here either
+
+| | import median | p90 | win2 / win3 |
+|---|---:|---:|---:|
+| `--engine.sender-recovery-cache` | 676 ms | 763 ms | 65,197 / 65,190 TPS |
+| without it | **669 ms** | **737 ms** | **65,140 / 65,197 TPS** |
+
+Windows 2 and 3 reproduce to the transaction across the pair. The cache is
+inert on this import path.
+
+gov5 reached the same conclusion on a Go client with a different pool, a
+different state backend and a different cache, by tracing hit rates rather than
+by A/B: theirs is consulted zero times because the sender is already on the
+pooled transaction object when the hint pass asks. Two independent clients, two
+methods, same answer — which is worth more than either measurement alone, and is
+the strongest evidence in this file for anything.
+
+Tenth confirmed-but-inert mechanism. It also retires the sizing change twice
+over: gov5 withdrew the finding it was based on, and this A/B says the cache's
+existence changes nothing to size.

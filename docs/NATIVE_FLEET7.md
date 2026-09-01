@@ -2118,3 +2118,50 @@ the strongest evidence in this file for anything.
 Tenth confirmed-but-inert mechanism. It also retires the sizing change twice
 over: gov5 withdrew the finding it was based on, and this A/B says the cache's
 existence changes nothing to size.
+
+### The second sender recovery is real, and free
+
+Two rounds settle a question that took three attempts to ask properly.
+
+**First attempt.** Switching reth's `--engine.sender-recovery-cache` off changed
+nothing (676 → 669 ms, windows reproducing to the transaction), and that was read
+as "the sender is not recovered twice". It does not follow: a cache that never
+hits is indistinguishable from no cache.
+
+**Then the source, rather than the inference.** reth consults the cache once per
+transaction on the import path (`tx_iterator_for_payload`), so the null had only
+one reading left — asked, and missing. And the reason is structural rather than a
+matter of size: the cache has exactly two consumers, devp2p transaction gossip
+and block import, and both recover-or-insert. This fleet runs
+`--disable-tx-gossip` and admits over the binary ingest and RPC, so **nothing
+populates it before import** and it cannot hit by construction.
+
+**So the ingest was made to populate it** (`try_recover_with_cache`, the entry
+devp2p uses), with the cache sized at four times the pool — 8,388,608 slots,
+fifty-one times a block, hits guaranteed:
+
+| | import median | p90 | win3 |
+|---|---:|---:|---:|
+| cache never populated | 676 ms | 763 ms | 65,197 TPS |
+| populated, 8.4M slots | **661 ms** | **743 ms** | **65,197 TPS** |
+
+**Nothing.** 2.2% on the median, window 3 identical to the transaction.
+
+And this null says something the first one could not. The cache is populated and
+must hit, so the second recovery **is** happening and removing it **does not
+help**. reth recovers senders in parallel ahead of the execution loop — the loop
+waits on an already-recovered iterator, which is what its `transaction_wait`
+metric measures — so the ~50 µs a transaction is paid on cores that are idle
+anyway. This fleet uses 6% of its machine. Work removed from an idle core is not
+time saved.
+
+Eleventh confirmed-but-inert mechanism, and the most carefully established one:
+the mechanism is real, the duplication is real, and the saving is zero because
+the resource it saves is not scarce here.
+
+The sizing goes back to upstream's `1 << 17`. Four times the pool is about
+440 MB a node for a 2.2% that this rig cannot distinguish from noise, and this
+fleet's first requirement is memory. `N42_SENDER_CACHE_MULT` keeps the sweep
+available. The ingest keeps populating the cache: it costs one insert per
+transaction on a path that already had the sender in hand, and it is the wiring
+that should have been there.

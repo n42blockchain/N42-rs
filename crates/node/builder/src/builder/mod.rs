@@ -763,22 +763,58 @@ impl<Node: FullNodeTypes> BuilderContext<Node> {
         executor: TaskExecutor,
         config_container: WithConfigs<<Node::Types as NodeTypes>::ChainSpec>,
     ) -> Self {
-        // Upstream's default, on purpose.
+        // Sized above the transaction pool, not at upstream's `1 << 17`.
         //
-        // This was briefly sized from the transaction pool, on gov5's finding
-        // that their equivalent cache was evicting an imported block's senders
-        // before the block arrived. They have since measured the cache under
-        // the mode that matters and retracted it: with warm pools their import
-        // path never consults the cache at all -- the sender is already on the
-        // pooled transaction object -- so its hit rate is not low, it is zero,
-        // and their 2^18 -> 2^20 resize bought nothing. The change was never
-        // compiled into a running node here and no round in `NATIVE_FLEET7.md`
-        // ran with it.
+        // reth consults this cache for every transaction on the import path
+        // (`tx_iterator_for_payload`), and the pool populates it on admission,
+        // so a hit is the difference between recovering a sender once and
+        // recovering it twice. The cache is direct-mapped: a colliding hash
+        // overwrites rather than ageing out, and what churns through it is the
+        // whole pool. At 131,072 entries against a 489,000-slot pool holding
+        // 163,000-transaction blocks, a block's senders are overwritten long
+        // before the block arrives, so the cache is consulted every time and
+        // hits almost never -- which is what an A/B showing no difference
+        // between having it and not having it looks like.
+        //
+        // This was withdrawn once on gov5's retraction of the finding behind
+        // it. That retraction is about their client, where the import path
+        // never consults a cache at all because the sender is already on the
+        // pooled object. reth's does consult it. The reasoning was theirs; the
+        // path is not.
         let sender_recovery_cache = config_container
             .config
             .engine
             .sender_recovery_cache_enabled
-            .then(reth_evm::SenderRecoveryCache::default);
+            .then(|| {
+                let pool = &config_container.config.txpool;
+                let population = pool
+                    .pending_max_count
+                    .saturating_add(pool.basefee_max_count)
+                    .saturating_add(pool.queued_max_count);
+                // Headroom, not just capacity. The cache is direct-mapped, so a
+                // colliding hash overwrites immediately rather than ageing out:
+                // at a load factor near 1 the entries a block needs are gone
+                // before the block arrives, and the cache is consulted every
+                // time and hits almost never. `N42_SENDER_CACHE_MULT` is the
+                // multiple of the pool's population to size it at, so the
+                // ratio can be swept without a rebuild.
+                // Default 0 = upstream's size, because a cache large enough to
+                // guarantee hits was measured to buy nothing. `population * 4`
+                // is 8,388,608 slots here, about 440 MB a node, against a
+                // 2.2% move in import time that this rig cannot distinguish
+                // from noise and a window 3 that reproduced to the transaction.
+                let mult = std::env::var("N42_SENDER_CACHE_MULT")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let slots = if mult == 0 {
+                    1 << 17
+                } else {
+                    population.saturating_mul(mult).next_power_of_two().max(1 << 17)
+                };
+                tracing::info!(target: "reth::cli", population, mult, slots, "sender recovery cache");
+                reth_evm::SenderRecoveryCache::new(slots)
+            });
         Self { head, provider, executor, config_container, sender_recovery_cache }
     }
 

@@ -13,6 +13,8 @@ workspace = true
 
 [dependencies]
 reth-transaction-pool.workspace = true
+reth-evm.workspace = true
 alloy-primitives.workspace = true
+alloy-eips.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "rt", "macros"] }
 tracing.workspace = true

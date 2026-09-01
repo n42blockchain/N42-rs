@@ -98,7 +98,11 @@ fn high_water() -> usize {
 /// One task per connection, and each connection is independent: a generator
 /// gets its parallelism by opening several rather than by this doing anything
 /// clever with one.
-pub async fn serve<P>(addr: SocketAddr, pool: P) -> std::io::Result<()>
+pub async fn serve<P>(
+    addr: SocketAddr,
+    pool: P,
+    cache: Option<reth_evm::SenderRecoveryCache>,
+) -> std::io::Result<()>
 where
     P: TransactionPool + Clone + 'static,
 {
@@ -113,15 +117,20 @@ where
             }
         };
         let pool = pool.clone();
+        let cache = cache.clone();
         tokio::spawn(async move {
-            if let Err(err) = serve_connection(stream, pool).await {
+            if let Err(err) = serve_connection(stream, pool, cache).await {
                 debug!(target: "n42.tx_ingest", %peer, %err, "ingest connection ended");
             }
         });
     }
 }
 
-async fn serve_connection<P>(mut stream: TcpStream, pool: P) -> std::io::Result<()>
+async fn serve_connection<P>(
+    mut stream: TcpStream,
+    pool: P,
+    cache: Option<reth_evm::SenderRecoveryCache>,
+) -> std::io::Result<()>
 where
     P: TransactionPool,
 {
@@ -162,7 +171,7 @@ where
         while pool.pending_transactions().len() >= gate {
             tokio::time::sleep(GATE_POLL).await;
         }
-        let accepted = admit(&pool, raws).await;
+        let accepted = admit(&pool, raws, cache.as_ref()).await;
         let pending = u32::try_from(pool.pending_transactions().len()).unwrap_or(u32::MAX);
         stream.write_u32_le(accepted).await?;
         stream.write_u32_le(pending).await?;
@@ -175,17 +184,38 @@ where
 /// connection: one malformed transaction in a batch says nothing about the
 /// next one, and a generator that sends one is not an attacker, it is a
 /// generator with a bug.
-async fn admit<P>(pool: &P, raws: Vec<Bytes>) -> u32
+async fn admit<P>(
+    pool: &P,
+    raws: Vec<Bytes>,
+    cache: Option<&reth_evm::SenderRecoveryCache>,
+) -> u32
 where
     P: TransactionPool,
 {
     let mut decoded = Vec::with_capacity(raws.len());
     for raw in raws {
-        // The same entry point `eth_sendRawTransaction` uses: decode the
-        // EIP-2718 envelope and recover the sender. Recovery is most of the
-        // cost and it is deliberately still here -- see the note at the top
-        // about what this path does not shortcut.
-        match <P::Transaction as PoolTransaction>::recover_raw_transaction(raw.as_ref()) {
+        // Recover through the cache when there is one, so the sender this
+        // costs ~50 us to compute is still there when the block carrying this
+        // transaction is imported.
+        //
+        // Without it the work is simply done twice. reth's cache has exactly
+        // two consumers -- devp2p transaction gossip and block import -- and
+        // both recover-or-insert, so on a fleet that runs `--disable-tx-gossip`
+        // and admits over RPC or over this path, nothing populates it before
+        // import and it cannot hit by construction. That is what an A/B showing
+        // no difference between having the cache and not having it looks like,
+        // and it is not the same as the work being absent.
+        type Pooled<P> = <<P as TransactionPool>::Transaction as PoolTransaction>::Pooled;
+        let recovered = match <Pooled<P> as alloy_eips::Decodable2718>::decode_2718_exact(raw.as_ref()) {
+            Ok(pooled) => match cache {
+                Some(cache) => <P::Transaction as PoolTransaction>::try_recover_with_cache(pooled, cache)
+                    .map_err(|_| "invalid signature".to_string()),
+                None => <P::Transaction as PoolTransaction>::try_recover(pooled)
+                    .map_err(|_| "invalid signature".to_string()),
+            },
+            Err(err) => Err(err.to_string()),
+        };
+        match recovered {
             Ok(tx) => decoded.push(tx),
             Err(err) => debug!(target: "n42.tx_ingest", %err, "undecodable transaction"),
         }

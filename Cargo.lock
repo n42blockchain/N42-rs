@@ -8303,7 +8303,9 @@ dependencies = [
 name = "n42-tx-ingest"
 version = "2.1.5"
 dependencies = [
+ "alloy-eips 2.4.1",
  "alloy-primitives 1.7.1",
+ "reth-evm",
  "reth-transaction-pool",
  "tokio",
  "tracing",

@@ -203,8 +203,11 @@ fn main() {
                 match addr.parse::<std::net::SocketAddr>() {
                     Ok(addr) => {
                         let pool = node.pool.clone();
+                        // The sender-recovery cache, so a transaction admitted
+                        // here is not recovered again when its block arrives.
+                        let cache = node.evm_config().sender_recovery_cache.clone();
                         tokio::spawn(async move {
-                            if let Err(err) = n42_tx_ingest::serve(addr, pool).await {
+                            if let Err(err) = n42_tx_ingest::serve(addr, pool, cache).await {
                                 error!(target: "reth::cli", %err, "transaction ingest stopped");
                             }
                         });

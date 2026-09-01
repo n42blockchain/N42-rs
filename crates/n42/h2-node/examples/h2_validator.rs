@@ -226,11 +226,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // gov5 spells the same way. Warn rather than merely document: a fleet whose
     // timestamps have left the wall clock is not one to leave running.
     let period_ms = block_interval_ms.unwrap_or(period_secs.saturating_mul(1000)).max(1);
-    if period_ms < 1000 {
+    if period_ms < period_secs.saturating_mul(1000) {
         eprintln!(
-            "WARNING: --block-interval-ms {period_ms} is under a second. Block timestamps will be \
-             taken from the parent rather than the clock, so this chain's time runs ahead of real \
-             time and it cannot interoperate with gov5. Benchmarks only."
+            "note: --block-interval-ms {period_ms} paces faster than the chain's {period_secs}s \
+             period. Timestamps advance by the period per block regardless, as gov5's do, so this \
+             chain's clock runs ahead of real time in proportion."
         );
     }
 
@@ -455,6 +455,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     fee_recipient,
                     withdrawals.clone(),
                     parent_beacon_block_root,
+                    period_secs,
                     period_ms,
                     context.head_timestamp,
                     context.head_seen,
@@ -525,78 +526,80 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// observed on a live node. Declining in between paces the chain at roughly one
 /// block per second, which is what the timestamp resolution allows.
 ///
-/// # Below a second
+/// # Pacing and the timestamp are different things
 ///
-/// `period_ms` under 1000 is a benchmark mode and changes what a timestamp
-/// means. A header's timestamp is a whole second and must strictly exceed its
-/// parent's, so more than one block a second cannot be stamped from the wall
-/// clock at all; the block instead takes `parent + 1`, and the chain's clock
-/// runs ahead of real time in proportion to how far under a second the pacing
-/// is. That is harmless while measuring throughput and wrong for anything else:
-/// the stamps stop describing when blocks happened, and gov5 drops a gossiped
-/// block whose timestamp is ahead of its own clock, so such a fleet cannot be
-/// mixed with one. gov5 draws the same line, with the same units, in
-/// `--block-interval-ms`.
+/// `period_ms` decides how often this node offers to propose. The timestamp
+/// comes from the parent plus the chain's declared period and never from the
+/// clock, so pacing a 3-second chain at 250 ms does not produce an invalid
+/// block — it produces a chain whose own clock advances twelve times faster
+/// than the wall clock. gov5 does exactly this when they benchmark, and their
+/// verification never compares a timestamp to the local clock.
 fn block_attributes(
     fee_recipient: Address,
     withdrawals: Vec<alloy_eips::eip4895::Withdrawal>,
     parent_beacon_block_root: B256,
+    period_secs: u64,
     period_ms: u64,
     head_timestamp: Option<u64>,
     head_seen: Option<std::time::Instant>,
 ) -> Option<PayloadAttributes> {
-    static LAST: AtomicU64 = AtomicU64::new(0);
-    let sub_second = period_ms < 1000;
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or_default();
-    let now = now_ms / 1000;
-    // Two clocks constrain a block's timestamp, and they are not the same
-    // clock. The stamp is the wall clock — gov5 ignores any gossiped block
-    // whose timestamp is ahead of its own clock, with no tolerance — and it
-    // must exceed the parent's, which for a Go parent is `parent + period`
-    // stamped however early the Go leader proposed (`hotstuff/adapter.go`
-    // `Prepare`): after a Go block this node waits for the clock to pass the
-    // parent's stamp. Pacing, meanwhile, is `period` after the parent was
-    // *seen* here, by this node's clock, not after the parent's stamp: waiting
-    // for the clock to reach `parent + period` after a Go block that is
-    // already a period ahead lost every such view to the timeout (measured).
-    // Without the parent (a restart, a head this node never saw the body of),
-    // pace against this node's own last proposal.
+
+    // Pacing decides *when* to propose; it does not decide the timestamp.
+    //
+    // Measured from the parent as this node saw it, not from the parent's own
+    // stamp. Those are different clocks: a Go leader stamps `parent + period`
+    // however early it proposed, so waiting for the wall clock to reach that
+    // stamp after a Go block lost every such view to the timeout.
     match (head_timestamp, head_seen) {
-        (Some(parent), seen) => {
-            // Under a second the wall clock cannot separate two blocks, so the
-            // stamp comes from the parent instead and this test would refuse
-            // every one of them.
-            if !sub_second && now <= parent {
-                return None;
-            }
-            if seen.is_some_and(|seen| (seen.elapsed().as_millis() as u64) < period_ms) {
-                return None;
-            }
-        }
+        (Some(_), Some(seen)) if (seen.elapsed().as_millis() as u64) < period_ms => return None,
+        (Some(_), _) => {}
+        // No parent — a restart, or a head this node never saw the body of —
+        // so pace against this node's own last proposal. In milliseconds,
+        // because `period_ms` is: keeping this in seconds and adding a
+        // millisecond period to it disables the guard by a factor of a
+        // thousand rather than loosening it.
         (None, _) => {
-            // LAST is milliseconds so that it can be compared with `period_ms`
-            // whatever the pacing is. Keeping it in seconds and adding a
-            // millisecond period to it silently disables this guard: the two
-            // sides differ by a factor of a thousand, so the test never fires.
-            if now_ms < LAST.load(Ordering::Relaxed).saturating_add(period_ms) {
+            if now_ms < LAST_MS.load(Ordering::Relaxed).saturating_add(period_ms) {
                 return None;
             }
         }
     }
+    LAST_MS.fetch_max(now_ms, Ordering::Relaxed);
+
+    // The timestamp is the parent's plus the chain's period. Never the wall
+    // clock, at any pacing.
+    //
+    // This is gov5's rule (`hotstuff/adapter.go` `Prepare`: "Deterministic
+    // block time: parent time + period, with NO now-floor") and their reason is
+    // a correctness one rather than a matter of taste. A wall-clock stamp
+    // changes between two build attempts for the same parent, so the block hash
+    // changes with it, and a leader triggered twice for one view produces two
+    // different blocks that followers cannot choose between. Deriving it from
+    // the parent makes a leader produce exactly one block per height however
+    // many times it is asked.
+    //
+    // It also removes the reason sub-second blocks looked impossible. A header
+    // timestamp is a whole second and must exceed its parent's, so blocks
+    // faster than a second cannot be stamped from the clock at all — but they
+    // never were. The chain's timestamps are a grid of `genesis + N * period`
+    // that advances at the chain's declared rate whatever rate blocks actually
+    // arrive at, which is exactly what gov5's own chain does when they benchmark
+    // a 3-second chainspec at 500 ms pacing.
+    //
+    // The verification side agrees: gov5's HotStuff `VerifyHeader` compares the
+    // timestamp only against the parent's and never against its own clock. The
+    // `ErrFutureBlock` rule that made this look like an interop hazard lives in
+    // their APoA engine, which is a different chain.
     let timestamp = match head_timestamp {
-        Some(parent) if sub_second => parent + 1,
-        _ => now,
+        Some(parent) => parent.saturating_add(period_secs.max(1)),
+        // Genesis is the only block with no parent to derive from.
+        None => now_ms / 1000,
     };
-    // `fetch_max` rather than a store: a clock that jumps backwards must not be
-    // able to reopen a second this node has already proposed in.
-    let previous_ms = LAST.fetch_max(now_ms, Ordering::Relaxed);
-    if !sub_second && previous_ms / 1000 >= timestamp {
-        // Already proposed in this second.
-        return None;
-    }
     Some(PayloadAttributes {
         timestamp,
         prev_randao: B256::ZERO,

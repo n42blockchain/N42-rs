@@ -480,6 +480,38 @@ box's free memory fell to 4-5 GB, which is what shreds the page cache at this ti
 keeps A1's speed with the decay bounded, and is what `scripts/fleet7-env.sh` sets now. A2a's 371,096 on window 1 and
 25.81M a round are the best this block shape has read.
 
+### Where the time is now (loop173-174)
+
+**The leader's profile, retaken (loop173).** With the allocator's eager purge off, `madvise` is 23 of the builder
+thread's 7,183 samples (0.3%, against 24% in loop167). What is left is byte movement: 29% in libc with no symbol
+(memcpy/memmove, which keep no frame pointer), 8% growing vectors through `rallocx`, 12% in `graft_bundles_with`
+itself and 9% in the map's `insert`. The graft is what moves those bytes: ~147,000 `BundleAccount` entries into one
+map, plus the reverts. `jemalloc_bg_thd` now takes 9-12% of a node's samples -- the purging the application threads
+no longer do, and off the critical path. Two small things to chase: 2% of the builder thread is a hashed post-state
+that tables-off should have skipped (callers lost, the chain breaks), and `execute_for_build`'s samples are 95%
+kernel, which is the page faults of its per-candidate slots.
+
+**The cycle, and the tenure change (loop173).** Window 1's median cycle is 410 ms against a 310-330 ms build, so
+~80 ms is the consensus round trip; `vote -> Decide` is 10 ms. The loss is elsewhere: roughly once a window a tenure
+change costs 2.3 s. The new leader's prepared build is discarded (`same_parent=false`), its forkchoice answers
+Syncing three times ("the parent is still importing"), and it builds only after its own import of the last leader's
+block lands -- that import is 477-497 ms, and the build that follows took 1,664 ms.
+
+**The follower's import (loop174).** It is the longest single step (336-452 ms a full block) and it gates both the
+vote and a tenure change. Its phases on a full block: convert 36-48, senders 26-46 (113-143k of 163,000 senders
+cached), execution 139-200, checks 4, QMDB root 27-28, hashed 0 (tables off), engine 36-40. `N42_FOLLOWER_SENDER_
+GROUPS=1` gives the follower the leader's grouping; three pairs of legs:
+
+| grouping | groups | import execution ms | import total ms | win1 | round (M tx) |
+| --- | --- | --- | --- | --- | --- |
+| components (default) | 308-336 | 162.7 | 376.7 | 343,487 | 24.34 |
+| by sender | 512-535 | 158.0 | 360.3 | 345,405 | 24.07 |
+
+The partition itself falls (44 -> 8-37 ms) and the import with it, 16 ms; the execution does not move and neither
+does the round. Left off by default. The reason the follower's execution is 150-160 ms where the leader's is 81 for
+the same transfers is that the follower's `exec_ms` carries its graft (`merge_ms` 38-131) -- the same graft the
+leader pays in its fold. That is where the next change goes.
+
 ## 10. Where the work stopped (2026-09-15)
 
 - Defects 5-9 are fixed and confirmed on the fleet (e5d859d82, 2ce2f60e5, b902caff1, bdb8a802e; loop159, loop162,

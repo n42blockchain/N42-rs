@@ -525,6 +525,218 @@ pub fn graft_bundles_with<DB: Database>(
     Ok(graft)
 }
 
+/// A graft built beside the execution: each batch's bundle is folded into a
+/// bundle of the graft's own the moment that batch finishes, on that batch's
+/// thread, while the others are still executing. The block's state is not
+/// touched until [`install_staged`], so a batch that fails leaves nothing
+/// behind -- and the work the leader's serial chain used to do after the
+/// execution (a `BundleAccount` per touched account moved into one map, 60 ms
+/// of a full block) is done by the time the last batch lands.
+///
+/// The rules are [`graft_bundles_with`]'s, against the staged bundle instead
+/// of the block's: an account two batches touched gets both changes added
+/// together, the beneficiary is left out with its credit returned, and an
+/// account the block's state already holds is summed into a delta the install
+/// commits.
+#[derive(Debug)]
+pub struct StagedGraft {
+    beneficiary: Address,
+    state: alloy_primitives::map::AddressHashMap<BundleAccount>,
+    state_size: usize,
+    contracts: alloy_primitives::map::B256HashMap<revm::bytecode::Bytecode>,
+    reverts: Vec<(Address, AccountRevert)>,
+    /// Per held address: what to add, what to subtract, the nonce to add, and
+    /// whether every batch saw the account absent.
+    slow: alloy_primitives::map::AddressHashMap<(U256, U256, u64, bool)>,
+    graft: Graft,
+    capacity: usize,
+}
+
+impl StagedGraft {
+    /// A staged graft for a block whose beneficiary is `beneficiary`.
+    /// `capacity` is the accounts the block is expected to touch, reserved
+    /// once instead of grown a batch at a time. Which accounts the block's
+    /// own state already holds is settled by [`install_staged`], which is
+    /// where the state is known -- a follower's pre-execution system calls
+    /// run while the batches are still going.
+    pub fn new(beneficiary: Address, capacity: usize) -> Self {
+        Self {
+            beneficiary,
+            state: Default::default(),
+            state_size: 0,
+            contracts: Default::default(),
+            reverts: Vec::new(),
+            slow: Default::default(),
+            graft: Graft::default(),
+            capacity,
+        }
+    }
+
+    /// Whether the staged bundle carries `address`.
+    pub fn holds(&self, address: &Address) -> bool {
+        self.state.contains_key(address)
+    }
+
+    /// Folds one batch's bundle in. The first one is taken whole where it can
+    /// be (as [`graft_bundles_with`]'s base swap does): the map it already
+    /// built becomes the staged one rather than being copied into an empty.
+    pub fn add(&mut self, bundle: BundleState) {
+        let BundleState { state: accounts, contracts, mut reverts, state_size, .. } = bundle;
+        let taken = std::mem::take(&mut *reverts);
+        if self.state.is_empty()
+            && self.graft.accounts == 0
+            && graft_base_swap()
+            && !accounts.is_empty()
+        {
+            let mut accounts = accounts;
+            let mut state_size = state_size;
+            if let Some(account) = accounts.remove(&self.beneficiary) {
+                state_size -= account.size_hint();
+                let new_balance = account.info.as_ref().map(|i| i.balance).unwrap_or_default();
+                let old_balance = account.original_info.as_ref().map(|i| i.balance).unwrap_or_default();
+                self.graft.beneficiary_delta = self.graft.beneficiary_delta.saturating_add(new_balance.saturating_sub(old_balance));
+            }
+            self.graft.accounts += accounts.len();
+            self.state = accounts;
+            self.state.reserve(self.capacity.saturating_sub(self.state.len()));
+            self.state_size = state_size;
+            self.contracts.extend(contracts);
+            self.reverts.reserve(self.capacity);
+            self.reverts
+                .extend(taken.into_iter().flatten().filter(|(address, _)| *address != self.beneficiary));
+            return;
+        }
+        self.contracts.extend(contracts);
+        let mut repeated: alloy_primitives::map::AddressHashSet = Default::default();
+        for (address, account) in accounts {
+            let Some(info) = account.info.as_ref() else { continue };
+            let (new_balance, new_nonce) = (info.balance, info.nonce);
+            let (old_balance, old_nonce) = match &account.original_info {
+                Some(orig) => (orig.balance, orig.nonce),
+                None => (U256::ZERO, 0),
+            };
+            if address == self.beneficiary {
+                self.graft.beneficiary_delta = self.graft.beneficiary_delta.saturating_add(new_balance.saturating_sub(old_balance));
+                repeated.insert(address);
+                continue;
+            }
+            if let Some(staged) = self.state.get_mut(&address).and_then(|a| a.info.as_mut()) {
+                // An earlier batch staged it: added to what is there.
+                repeated.insert(address);
+                staged.balance = if new_balance >= old_balance {
+                    staged.balance.saturating_add(new_balance - old_balance)
+                } else {
+                    staged.balance.saturating_sub(old_balance - new_balance)
+                };
+                staged.nonce += new_nonce - old_nonce;
+                continue;
+            }
+            if self.state.is_empty() {
+                self.state.reserve(self.capacity);
+                self.reverts.reserve(self.capacity);
+            }
+            self.state_size += account.size_hint();
+            self.state.insert(address, account);
+            self.graft.accounts += 1;
+        }
+        for (address, revert) in taken.into_iter().flatten() {
+            if !repeated.contains(&address) {
+                self.reverts.push((address, revert));
+            }
+        }
+    }
+}
+
+/// Puts a [`StagedGraft`] on the block's state: its bundle becomes the block's
+/// where the block has none yet (the usual case for a block whose transfers
+/// all ran in the parallel step), and is grafted account by account where it
+/// has one. The deltas of the accounts the block already held are committed.
+/// `keep_cache` fills the state's cache as [`graft_bundles_with`] does, for a
+/// block whose serial loop or post-execution changes may read a staged account.
+pub fn install_staged<DB: Database>(
+    state: &mut State<DB>,
+    staged: StagedGraft,
+    keep_cache: bool,
+) -> Result<Graft, <State<DB> as Database>::Error> {
+    let StagedGraft { beneficiary, state: mut accounts, mut state_size, contracts, reverts, mut slow, mut graft, .. } = staged;
+    graft.reverts = reverts;
+    // Accounts the block's state holds of its own (a pre-execution system
+    // call's, an earlier transaction's): their changes go on top of the
+    // block's values, not the parent's, so they leave the staged bundle and
+    // become deltas. The cache holds a handful of them, so this looks them up
+    // rather than every staged account.
+    if !state.cache.accounts.is_empty() {
+        let cached: Vec<Address> = state.cache.accounts.keys().copied().collect();
+        for address in cached {
+            let Some(account) = accounts.remove(&address) else { continue };
+            state_size -= account.size_hint();
+            graft.accounts -= 1;
+            let Some(info) = account.info.as_ref() else { continue };
+            let (new_balance, new_nonce) = (info.balance, info.nonce);
+            let (old_balance, old_nonce) = match &account.original_info {
+                Some(orig) => (orig.balance, orig.nonce),
+                None => (U256::ZERO, 0),
+            };
+            let entry = slow.entry(address).or_insert((U256::ZERO, U256::ZERO, 0, true));
+            if new_balance >= old_balance {
+                entry.0 = entry.0.saturating_add(new_balance - old_balance);
+            } else {
+                entry.1 = entry.1.saturating_add(old_balance - new_balance);
+            }
+            entry.2 += new_nonce - old_nonce;
+            entry.3 &= account.original_info.is_none();
+            graft.reverts.retain(|(reverted, _)| *reverted != address);
+        }
+    }
+    if state.bundle_state.state.is_empty() {
+        if keep_cache {
+            state.cache.accounts.reserve(accounts.len());
+            for (address, account) in &accounts {
+                if let Some(info) = account.info.as_ref() {
+                    state.cache.accounts.insert(
+                        *address,
+                        CacheAccount {
+                            account: Some(PlainAccount { info: info.clone(), storage: Default::default() }),
+                            status: account.status,
+                        },
+                    );
+                }
+            }
+        }
+        state.bundle_state.state = accounts;
+        state.bundle_state.state_size = state_size;
+        state.bundle_state.contracts.extend(contracts);
+    } else {
+        // The block's state already carries a bundle (an earlier graft, or a
+        // merge of its own): the staged accounts go through the account-by-
+        // account path, which adds to what is there.
+        let bundle = BundleState { state: accounts, contracts, reverts: Default::default(), state_size, reverts_size: 0 };
+        let merged = graft_bundles_with(state, vec![bundle], beneficiary, keep_cache)?;
+        graft.accounts = merged.accounts;
+        graft.committed = merged.committed;
+        graft.beneficiary_delta = graft.beneficiary_delta.saturating_add(merged.beneficiary_delta);
+    }
+    if !slow.is_empty() {
+        let mut changes: revm::state::EvmState = Default::default();
+        for (address, (add, sub, nonce, original_absent)) in slow {
+            let cached = state.cache.accounts.get(&address).expect("only an address the cache held is summed here");
+            let existed = cached.account.is_some();
+            let mut merged = cached.account.as_ref().map(|a| a.info.clone()).unwrap_or_default();
+            merged.balance = merged.balance.saturating_add(add).saturating_sub(sub);
+            merged.nonce += nonce;
+            let mut acc = Account::from(merged);
+            acc.status = AccountStatus::Touched;
+            if !existed && original_absent {
+                acc.status |= AccountStatus::Created;
+            }
+            changes.insert(address, acc);
+        }
+        graft.committed += changes.len();
+        state.commit(changes);
+    }
+    Ok(graft)
+}
+
 /// Appends a graft's reverts to a taken bundle's revert set for the block
 /// (the last one, which the state's merge created; a new one if the merge
 /// found nothing to revert). An account the block touched again after the
@@ -592,6 +804,26 @@ where
     G: Database + std::fmt::Debug + Send,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
+    execute_for_build_with(evm_env, keys, convert, open, None)
+}
+
+/// [`execute_for_build`] with somewhere for each batch's bundle to go as that
+/// batch finishes: `on_bundle` is called on the batch's own thread, while the
+/// others are still executing ([`StagedGraft`]). With a sink the run's
+/// `bundles` come back empty, and a run that fails leaves whatever the sink
+/// collected to be dropped.
+pub fn execute_for_build_with<T, G>(
+    evm_env: &reth_evm::EvmEnv,
+    keys: &[(Address, Address)],
+    convert: &(dyn Fn(usize) -> (T, TxEnv) + Sync),
+    open: &(dyn Fn() -> Option<G> + Sync),
+    on_bundle: Option<&(dyn Fn(BundleState) + Sync)>,
+) -> Result<BuildRun<T>, NotParallel>
+where
+    T: Send + Sync,
+    G: Database + std::fmt::Debug + Send,
+    G::Error: std::fmt::Display + Send + Sync + 'static,
+{
     let beneficiary = evm_env.block_env.beneficiary;
     let mut phases = Phases::default();
     let at = std::time::Instant::now();
@@ -612,7 +844,7 @@ where
     // 80-150 ms of a full block's build (loop138-139).
     let slots: Vec<std::sync::OnceLock<BuiltTransfer<T>>> = (0..keys.len()).map(|_| std::sync::OnceLock::new()).collect();
     let slots_ref = &slots;
-    let results: Vec<Result<(Vec<usize>, BundleState), NotParallel>> = pool.install(|| {
+    let results: Vec<Result<(Vec<usize>, Option<BundleState>), NotParallel>> = pool.install(|| {
         use rayon::prelude::*;
         batches
             .par_iter()
@@ -650,7 +882,17 @@ where
                     }
                 }
                 state.merge_transitions(BundleRetention::Reverts);
-                Ok((skipped, state.take_bundle()))
+                let bundle = state.take_bundle();
+                match on_bundle {
+                    // Folded into the staged graft here, on this batch's
+                    // thread: the work is off the builder's chain, and the
+                    // sink's lock only ever holds one batch at a time.
+                    Some(sink) => {
+                        sink(bundle);
+                        Ok((skipped, None))
+                    }
+                    None => Ok((skipped, Some(bundle))),
+                }
             })
             .collect()
     });
@@ -661,7 +903,9 @@ where
     for r in results {
         let (skipped, bundle) = r?;
         run.skipped.extend(skipped);
-        run.bundles.push(bundle);
+        if let Some(bundle) = bundle {
+            run.bundles.push(bundle);
+        }
     }
     // Candidate order, as the serial builder would have laid the block out
     // (each sender's transfers were run in that order, and the graft does
@@ -704,6 +948,14 @@ where
 pub fn follower_sender_groups() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("N42_FOLLOWER_SENDER_GROUPS").is_ok_and(|v| v == "1"))
+}
+
+/// Whether `N42_GRAFT_STREAM=1` is set: each batch's bundle is folded into the
+/// block's graft as that batch finishes ([`StagedGraft`]) instead of all of
+/// them after the execution. Off until a fleet leg measures it.
+pub fn graft_stream() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_GRAFT_STREAM").is_ok_and(|v| v == "1"))
 }
 
 /// Whether the graft takes the largest bundle as the block's bundle (default;
@@ -788,9 +1040,13 @@ where
     phases.batches = batches.len();
 
     // The batches, on the worker pool. Each yields its bundle (the accounts
-    // it changed, with their originals) and the gas each transaction used.
+    // it changed, with their originals) and the gas each transaction used --
+    // or, with `N42_GRAFT_STREAM=1`, folds the bundle into the block's graft
+    // there and then ([`StagedGraft`]) and yields only the gas.
+    let staged = (graft && graft_stream())
+        .then(|| std::sync::Mutex::new(StagedGraft::new(beneficiary, txs.len())));
     let at = std::time::Instant::now();
-    let results: Vec<Result<(revm::database::BundleState, Vec<(usize, u64)>), NotParallel>> = {
+    let results: Vec<Result<(Option<revm::database::BundleState>, Vec<(usize, u64)>), NotParallel>> = {
         use rayon::prelude::*;
         batches
             .par_iter()
@@ -813,7 +1069,14 @@ where
                     }
                 }
                 state.merge_transitions(BundleRetention::Reverts);
-                Ok((state.take_bundle(), gas))
+                let bundle = state.take_bundle();
+                match staged.as_ref() {
+                    Some(staged) => {
+                        staged.lock().expect("the staged graft's lock").add(bundle);
+                        Ok((None, gas))
+                    }
+                    None => Ok((Some(bundle), gas)),
+                }
             })
             .collect()
     };
@@ -826,7 +1089,9 @@ where
                 for (i, g) in gas {
                     gas_of[i] = g;
                 }
-                bundles.push(bundle);
+                if let Some(bundle) = bundle {
+                    bundles.push(bundle);
+                }
             }
             Err(why) => return Ok(Err(why)),
         }
@@ -851,7 +1116,11 @@ where
     // an account a reward reached and a transfer touched gets both.
     let at = std::time::Instant::now();
     let err = |e: &dyn std::fmt::Display| BlockExecutionError::other(std::io::Error::other(e.to_string()));
-    let (mut changes, beneficiary_delta, grafted) = if graft {
+    let (mut changes, beneficiary_delta, grafted) = if let Some(staged) = staged {
+        let staged = staged.into_inner().expect("the staged graft's lock");
+        let grafted = install_staged(&mut state, staged, false).map_err(|e| err(&e))?;
+        (revm::state::EvmState::default(), grafted.beneficiary_delta, Some(grafted.reverts))
+    } else if graft {
         let grafted = graft_bundles_with(&mut state, bundles, beneficiary, false).map_err(|e| err(&e))?;
         (revm::state::EvmState::default(), grafted.beneficiary_delta, Some(grafted.reverts))
     } else {
@@ -1166,6 +1435,114 @@ mod tests {
         for (address, revert) in &theirs {
             assert_eq!(ours.get(address), Some(revert), "revert {address}");
         }
+    }
+
+    /// An account the block's state already holds leaves the staged bundle at
+    /// the install and becomes a delta, exactly as the graft after the
+    /// execution makes it one -- including its revert, which is the block's
+    /// own, not the graft's.
+    #[test]
+    fn a_staged_graft_delta_matches_the_graft_for_an_account_the_block_holds() {
+        let info = |balance: u64, nonce: u64| AccountInfo { balance: U256::from(balance), nonce, ..Default::default() };
+        let bundle = |address: Address, after: (u64, u64), before: (u64, u64)| {
+            BundleState::builder(0..=0)
+                .state_present_account_info(address, info(after.0, after.1))
+                .state_original_account_info(address, info(before.0, before.1))
+                .revert_account_info(0, address, Some(Some(info(before.0, before.1))))
+                .build()
+        };
+        let held = addr(5);
+        let fresh = addr(6);
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(held, info(100, 0));
+        db.insert_account_info(fresh, info(7, 0));
+        let bundles = || {
+            vec![
+                bundle(held, (110, 1), (100, 0)),
+                {
+                    let mut b = BundleState::builder(0..=0)
+                        .state_present_account_info(held, info(105, 0))
+                        .state_original_account_info(held, info(100, 0))
+                        .revert_account_info(0, held, Some(Some(info(100, 0))));
+                    b = b
+                        .state_present_account_info(fresh, info(9, 0))
+                        .state_original_account_info(fresh, info(7, 0))
+                        .revert_account_info(0, fresh, Some(Some(info(7, 0))));
+                    b.build()
+                },
+            ]
+        };
+
+        let mut after = State::builder().with_database(db.clone()).with_bundle_update().build();
+        assert_eq!(after.basic(held).unwrap().map(|a| a.balance), Some(U256::from(100)), "the block read it");
+        let grafted = graft_bundles_with(&mut after, bundles(), addr(9), true).expect("graft");
+
+        let mut beside = State::builder().with_database(db.clone()).with_bundle_update().build();
+        assert_eq!(beside.basic(held).unwrap().map(|a| a.balance), Some(U256::from(100)));
+        let mut staged = StagedGraft::new(addr(9), 4);
+        for b in bundles() {
+            staged.add(b);
+        }
+        let installed = install_staged(&mut beside, staged, true).expect("install");
+
+        assert_eq!(installed.committed, grafted.committed, "committed as deltas");
+        assert_eq!(installed.accounts, grafted.accounts, "staged accounts");
+        let balance = |state: &State<CacheDB<EmptyDB>>, address: Address| {
+            state.cache.accounts.get(&address).and_then(|a| a.account.as_ref()).map(|a| (a.info.balance, a.info.nonce))
+        };
+        assert_eq!(balance(&beside, held), balance(&after, held), "the held account");
+        assert_eq!(balance(&beside, held), Some((U256::from(115), 1)), "both batches' deltas");
+        assert_eq!(
+            beside.bundle_state.state.get(&fresh).and_then(|a| a.info.as_ref()).map(|i| i.balance),
+            after.bundle_state.state.get(&fresh).and_then(|a| a.info.as_ref()).map(|i| i.balance),
+            "the staged account",
+        );
+        let sorted = |mut reverts: Vec<(Address, AccountRevert)>| {
+            reverts.sort_by_key(|(address, _)| *address);
+            reverts
+        };
+        assert_eq!(sorted(installed.reverts), sorted(grafted.reverts), "reverts");
+    }
+
+    /// The staged graft, folded bundle by bundle beside the execution and
+    /// installed at the end, lands exactly where the graft after the
+    /// execution does: the same accounts, the same reverts, the same credit.
+    #[test]
+    fn a_staged_graft_lands_where_the_graft_does() {
+        let (block, db) = fixture(8, 6);
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_env = evm_config.evm_env(block.header()).expect("env");
+        let envs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
+        let keys: Vec<(Address, Address)> = envs.iter().map(|e| (e.caller, e.kind.to().copied().unwrap())).collect();
+        let run = execute_for_build(&evm_env, &keys, &|i| ((), envs[i].clone()), &|| Some(db.clone())).expect("a block of transfers");
+        let beneficiary = evm_env.block_env.beneficiary;
+
+        let mut after = State::builder().with_database(db.clone()).with_bundle_update().build();
+        let grafted = graft_bundles(&mut after, run.bundles.clone(), beneficiary).expect("graft");
+
+        let mut beside = State::builder().with_database(db.clone()).with_bundle_update().build();
+        let mut staged = StagedGraft::new(beneficiary, keys.len());
+        for bundle in run.bundles {
+            staged.add(bundle);
+        }
+        let installed = install_staged(&mut beside, staged, true).expect("install");
+
+        assert_eq!(installed.beneficiary_delta, grafted.beneficiary_delta, "the beneficiary's credit");
+        assert_eq!(installed.committed, grafted.committed);
+        assert_eq!(beside.bundle_state.state.len(), after.bundle_state.state.len(), "accounts");
+        assert_eq!(beside.bundle_state.state_size, after.bundle_state.state_size, "state size");
+        for (address, theirs) in &after.bundle_state.state {
+            let ours = beside.bundle_state.state.get(address).unwrap_or_else(|| panic!("account {address} missing"));
+            assert_eq!(ours.info, theirs.info, "info {address}");
+            assert_eq!(ours.original_info, theirs.original_info, "original {address}");
+            assert_eq!(ours.status, theirs.status, "status {address}");
+        }
+        assert_eq!(beside.cache.accounts.len(), after.cache.accounts.len(), "the cache both keep");
+        let sorted = |mut reverts: Vec<(Address, AccountRevert)>| {
+            reverts.sort_by_key(|(address, _)| *address);
+            reverts
+        };
+        assert_eq!(sorted(installed.reverts), sorted(grafted.reverts), "reverts");
     }
 
     /// An account the block touches again after the graft -- here a sender

@@ -831,7 +831,21 @@ where
             };
             let open = || open_parent_state().ok().map(StateProviderDatabase::new);
             par_prep_ms = prep_at.elapsed().as_millis() as u64;
-            match crate::parallel_transfer::execute_for_build(&group_env, &keys, &convert, &open) {
+            // `N42_GRAFT_STREAM=1`: each batch's bundle is folded into the
+            // block's graft as that batch finishes, on the worker pool, rather
+            // than all of them on this thread once the execution is over (the
+            // graft was 60 ms of the leader's serial chain, loop173-174). The
+            // block's state is untouched until the install below, so a batch
+            // that fails still leaves the serial path a clean state.
+            let staged = crate::parallel_transfer::graft_stream().then(|| {
+                std::sync::Mutex::new(crate::parallel_transfer::StagedGraft::new(group_env.block_env.beneficiary, keys.len()))
+            });
+            let sink = staged.as_ref().map(|staged| {
+                move |bundle: revm::database::BundleState| staged.lock().expect("the staged graft's lock").add(bundle)
+            });
+            let sink: Option<&(dyn Fn(revm::database::BundleState) + Sync)> =
+                sink.as_ref().map(|sink| sink as &(dyn Fn(revm::database::BundleState) + Sync));
+            match crate::parallel_transfer::execute_for_build_with(&group_env, &keys, &convert, &open, sink) {
                 Ok(run) => {
                     use reth_evm::execute::BlockExecutor as _;
                     let beneficiary = group_env.block_env.beneficiary;
@@ -919,8 +933,12 @@ where
                     // turns the skip on; the cache insert per account was
                     // ~a third of a 70 ms graft.
                     let block_full = block_gas_limit.saturating_sub(cumulative_gas_used) < MIN_TRANSACTION_GAS;
-                    let withdrawals_clear = attributes.withdrawals.as_ref().is_none_or(|ws| {
-                        ws.iter().all(|w| !run.bundles.iter().any(|b| b.state.contains_key(&w.address)))
+                    let withdrawals_clear = attributes.withdrawals.as_ref().is_none_or(|ws| match staged.as_ref() {
+                        Some(staged) => {
+                            let staged = staged.lock().expect("the staged graft's lock");
+                            ws.iter().all(|w| !staged.holds(&w.address))
+                        }
+                        None => ws.iter().all(|w| !run.bundles.iter().any(|b| b.state.contains_key(&w.address))),
                     });
                     // Sealed early, nothing after the graft reads the cache
                     // either: the serial loop never runs.
@@ -938,13 +956,17 @@ where
                     // will seal early: the seal needs it, and the graft's
                     // 60-100 ms hide it (loop139: 42 ms on the seal path).
                     let bundles = run.bundles;
+                    let staged = staged.map(|staged| staged.into_inner().expect("the staged graft's lock"));
                     let (graft, early_root) = std::thread::scope(|scope| {
                         let root = sealing_early.then(|| {
                             let txs: &[reth_primitives_traits::Recovered<TransactionSigned>] = &builder.transactions;
                             scope.spawn(move || crate::assembler::parallel_transaction_root_recovered(txs))
                         });
                         let db = builder.executor.evm_mut().db_mut();
-                        let graft = crate::parallel_transfer::graft_bundles_with(db, bundles, beneficiary, keep_cache);
+                        let graft = match staged {
+                            Some(staged) => crate::parallel_transfer::install_staged(db, staged, keep_cache),
+                            None => crate::parallel_transfer::graft_bundles_with(db, bundles, beneficiary, keep_cache),
+                        };
                         (graft, root.map(|job| job.join().expect("the transactions root job does not panic")))
                     });
                     early_transactions_root = early_root;

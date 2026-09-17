@@ -449,13 +449,48 @@ node allocates reth's fixed-capacity cross-block cache (4 GB by default) at star
 runner's 16 GB. The harness now caps the cache at 64 MB and the whole suite peaks at 4.7 GB locally. CI shows it once
 the branch reaches main.
 
+### The allocator and the receipts (loop170-171)
+
+Two of the cuts named above were measured on 2026-09-16, six legs each, in the tables-off baseline.
+
+**The receipts off the serial chain (9f4c489a3).** A block the parallel step fills and that seals early never
+executes on its builder again, so the executor's commit per transfer only fed the receipts and the gas its finish
+reports. Both are built on the worker pool now and handed to that finish behind the seal; a guard refuses the serial
+loop if the early seal does not happen after all. Over eight legs 1,514 early-sealed blocks took the path with no
+guard error, no invalid block and no gas-used mismatch, and the segment fell from 27-61 ms to 11-33. On by default
+since loop171 (`N42_DIRECT_RECEIPTS=0` goes back to the commits).
+
+**The allocator.** jemalloc 5.3 gives every allocation of 8 MiB or more a dedicated arena that purges it on free
+("purge eagerly for huge allocations", `arena.c`), so each block's bundle, revert vector and transaction vectors cost
+a `madvise` when they go and a fresh page fault when the next block allocates the same size. loop167's leader spent
+24% of its build thread's samples and 25% of its engine thread's in that `madvise`, against 6% for the graft's own
+code. `oversize_threshold:0` turns the arena off; the pages then stay with the ordinary arenas under their decay.
+Means of two legs each (loop171, all with the direct receipts):
+
+| allocator | round (M tx) | win1 | commit ms | fold ms | sealed_at ms | build total ms | free memory floor |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| A0 `thp:always` | 23.15 | 333,911 | 30 | 102 | 285 | 383 | 39.7-43.4 GB |
+| A1 + `oversize_threshold:0` | 24.71 | 345,066 | 12 | 61 | 218 | 306 | 4.2-5.1 GB |
+| A2 + `dirty_decay_ms:2000,background_thread:true` | 24.75 | 354,504 | 14 | 63 | 220 | 298 | 17.2-42.8 GB |
+
+loop170's two legs of A1 read the same way (25.02 and 25.58M, 350,004 and 341,447, build 312 and 300 ms) against
+21.33 and 13.32M for A0. The leader's whole build fell 383 -> 298 ms and every phase of it with it, including the
+receipts loop, which halves again -- that time was the allocator's, not the work's. A1 alone is not safe to run: the
+box's free memory fell to 4-5 GB, which is what shreds the page cache at this tier (round 43's window collapse). A2
+keeps A1's speed with the decay bounded, and is what `scripts/fleet7-env.sh` sets now. A2a's 371,096 on window 1 and
+25.81M a round are the best this block shape has read.
+
 ## 10. Where the work stopped (2026-09-15)
 
 - Defects 5-9 are fixed and confirmed on the fleet (e5d859d82, 2ce2f60e5, b902caff1, bdb8a802e; loop159, loop162,
   loop163, loop165). Stage 6c's hashed-tables-off experiment holds and adds 6.5% a round (above). Neither supply-side
   verification (loop168) nor the follower's check before the vote (loop169) binds the round. Next on the path to
-  1M: the leader's fold (123-139 ms median: the receipts loop ~53 ms and the graft ~70 ms), then the production
-  prerequisites of the tables off. Also seen, not yet chased: 3-12 commit forkchoices a leg answered Valid after
+  1M: the receipts are off the serial chain and the allocator's eager purge is off (above), which leaves the leader's
+  build at ~298 ms and window 1 at ~355k. The graft (~45-55 ms of the fold) and the transactions the seal moves are
+  next, and they should be re-profiled first: the leader's profile was taken before the allocator change and most of
+  what it showed was `madvise`. The tables off need the rest of their production prerequisites
+  (`docs/QMDB_UPGRADE_PLAN.md` stage 6c: the 64-block lag cap, reth's own hashed pass, RPC proofs; the unwind and
+  restart ones are done, c78cc0d28). Also seen, not yet chased: 3-12 commit forkchoices a leg answered Valid after
   500 ms or more, without a stall. Defect 3 (an invalid block after a hang, a TC and a reorg) has not recurred since
   defect 5's fix; the C9 one-off (node6's state root for an empty block 79) is not explained.
 - History from 2026-09-01 was rewritten twice to take assistant attribution out of commit messages and then to

@@ -1895,12 +1895,14 @@ fn build_graft_no_cache() -> bool {
     *ON.get_or_init(|| std::env::var("N42_BUILD_GRAFT_NO_CACHE").is_ok_and(|v| v == "1"))
 }
 
-/// Whether a block that will seal early builds its receipts beside the parallel step
-/// (`N42_DIRECT_RECEIPTS=1`) instead of one executor commit per transfer. Off until a fleet leg
-/// measures it.
+/// Whether a block that will seal early builds its receipts beside the parallel step instead of
+/// one executor commit per transfer (`N42_DIRECT_RECEIPTS=0` goes back to the commits). On since
+/// loop170-171: 1,514 early-sealed blocks over eight legs took it with no guard error, no invalid
+/// block and no gas-used mismatch, and the receipts left the leader's serial chain (27-61 ms a
+/// full block before, 11-33 after).
 fn direct_receipts_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_DIRECT_RECEIPTS").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var("N42_DIRECT_RECEIPTS").map_or(true, |v| v != "0"))
 }
 
 fn parallel_build() -> bool {

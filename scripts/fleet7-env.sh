@@ -156,7 +156,14 @@ print(total)
 # `_RJEM_MALLOC_CONF`, is the one tikv-jemallocator uses when it keeps the
 # `_rjem_` prefix, and this binary does not. Setting that name changed nothing
 # and said nothing. `MALLOC_CONF` is the one this build reads.
-: "${F7_JEMALLOC:=abort_conf:true,narenas:2,dirty_decay_ms:2000,muzzy_decay_ms:0,background_thread:true,thp:never}"
+#
+# `oversize_threshold:0` turns off jemalloc's huge arena, which purges every free of 8 MiB or more
+# at once: loop167's leader spent 24% of its build thread and 25% of its engine thread in that
+# madvise, and the next block faulted the same pages back in. Without it (loop170-171, six legs
+# each) the round is 23.2M transactions and the leader's build 383 ms; with it 24.7M and 298-306,
+# and the decay settings above are what keeps the freed pages from piling up (loop171 A1 against
+# A2: 4-5 GB of the box free against 17-43).
+: "${F7_JEMALLOC:=abort_conf:true,narenas:2,dirty_decay_ms:2000,muzzy_decay_ms:0,background_thread:true,oversize_threshold:0,thp:never}"
 
 # ----------------------------------------------------------- bench tier -----
 # The `bench` profile is `lean` plus the four settings gov5 found decide the
@@ -212,7 +219,7 @@ fi
 # read their state through -- was down to 9 GB. Bookended (jemA1/jemB/jemA2,
 # the variable verified in the EL's environ): followers 4.20 / 3.98 / 4.32
 # us/tx on full blocks, windows 2-3 130k/125k, 136k/136k, 119k/125k.
-: "${F7_JEMALLOC_DECAY:=dirty_decay_ms:1000,muzzy_decay_ms:0,background_thread:true}"
+: "${F7_JEMALLOC_DECAY:=dirty_decay_ms:2000,muzzy_decay_ms:0,background_thread:true,oversize_threshold:0}"
 [[ $F7_PROFILE == lean ]] || export MALLOC_CONF="${MALLOC_CONF:-$F7_JEMALLOC_DECAY}"
 
 # Log level. The validator's own logs are the fleet's only progress record, so

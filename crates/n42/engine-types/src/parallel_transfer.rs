@@ -423,7 +423,14 @@ pub fn graft_bundles_with<DB: Database>(
     }
     state.bundle_state.state.reserve(total);
     graft.reverts.reserve(total);
-    let mut slow: revm::state::EvmState = Default::default();
+    // Accounts the block's state already holds: their deltas are summed here
+    // and applied in one commit at the end. Summed, because the block's cache
+    // is what each delta is computed against and it does not change until that
+    // commit: two batches touching such an account used to leave only the
+    // last one's change (`two_bundles_touching_an_account_the_block_holds`).
+    // Per address: what to add, what to subtract, the nonce to add, and
+    // whether every batch saw the account absent.
+    let mut slow: alloy_primitives::map::HashMap<Address, (U256, U256, u64, bool)> = Default::default();
     for bundle in bundles {
         let BundleState { state: accounts, reverts, .. } = bundle;
         // Addresses this bundle changed that an earlier one had already put
@@ -462,24 +469,19 @@ pub fn graft_bundles_with<DB: Database>(
                 }
                 continue;
             }
-            if let Some(cached) = state.cache.accounts.get(&address) {
+            if state.cache.accounts.contains_key(&address) {
                 // The block's state has its own view of this account; a
-                // delta through the ordinary path.
+                // delta through the ordinary path, summed with any other
+                // batch's and committed once below.
                 repeated.insert(address);
-                let existed = cached.account.is_some();
-                let mut merged = cached.account.as_ref().map(|a| a.info.clone()).unwrap_or_default();
-                merged.balance = if new_balance >= old_balance {
-                    merged.balance.saturating_add(new_balance - old_balance)
+                let entry = slow.entry(address).or_insert((U256::ZERO, U256::ZERO, 0, true));
+                if new_balance >= old_balance {
+                    entry.0 = entry.0.saturating_add(new_balance - old_balance);
                 } else {
-                    merged.balance.saturating_sub(old_balance - new_balance)
-                };
-                merged.nonce += new_nonce - old_nonce;
-                let mut acc = Account::from(merged);
-                acc.status = AccountStatus::Touched;
-                if !existed && account.original_info.is_none() {
-                    acc.status |= AccountStatus::Created;
+                    entry.1 = entry.1.saturating_add(old_balance - new_balance);
                 }
-                slow.insert(address, acc);
+                entry.2 += new_nonce - old_nonce;
+                entry.3 &= account.original_info.is_none();
                 continue;
             }
             if keep_cache {
@@ -503,8 +505,22 @@ pub fn graft_bundles_with<DB: Database>(
         }
     }
     if !slow.is_empty() {
-        graft.committed = slow.len();
-        state.commit(slow);
+        let mut changes: revm::state::EvmState = Default::default();
+        for (address, (add, sub, nonce, original_absent)) in slow {
+            let cached = state.cache.accounts.get(&address).expect("only an address the cache holds is summed here");
+            let existed = cached.account.is_some();
+            let mut merged = cached.account.as_ref().map(|a| a.info.clone()).unwrap_or_default();
+            merged.balance = merged.balance.saturating_add(add).saturating_sub(sub);
+            merged.nonce += nonce;
+            let mut acc = Account::from(merged);
+            acc.status = AccountStatus::Touched;
+            if !existed && original_absent {
+                acc.status |= AccountStatus::Created;
+            }
+            changes.insert(address, acc);
+        }
+        graft.committed = changes.len();
+        state.commit(changes);
     }
     Ok(graft)
 }
@@ -1042,6 +1058,36 @@ mod tests {
         let mut reverted: Vec<Address> = graft.reverts.iter().map(|(a, _)| *a).collect();
         reverted.sort();
         assert_eq!(reverted, vec![addr(1), addr(2), addr(3), addr(4)], "one revert per account, the shared one the base's");
+    }
+
+    /// Two batches touching an account the block's state already holds both
+    /// land: their deltas are summed against the block's value, which does not
+    /// change until the graft's one commit at the end.
+    #[test]
+    fn two_bundles_touching_an_account_the_block_holds() {
+        let info = |balance: u64, nonce: u64| AccountInfo { balance: U256::from(balance), nonce, ..Default::default() };
+        let bundle = |address: Address, after: (u64, u64), before: (u64, u64)| {
+            BundleState::builder(0..=0)
+                .state_present_account_info(address, info(after.0, after.1))
+                .state_original_account_info(address, info(before.0, before.1))
+                .revert_account_info(0, address, Some(Some(info(before.0, before.1))))
+                .build()
+        };
+        let held = addr(5);
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(held, info(100, 0));
+        let mut state = State::builder().with_database(db).with_bundle_update().build();
+        // The block's state already read the account: it is in the cache, so
+        // the graft cannot stage it and takes the delta path for it.
+        assert_eq!(state.basic(held).unwrap().map(|a| a.balance), Some(U256::from(100)));
+        let first = bundle(held, (110, 1), (100, 0));
+        let second = bundle(held, (105, 0), (100, 0));
+        let graft = graft_bundles_with(&mut state, vec![first, second], addr(9), true).expect("graft");
+        assert_eq!(graft.committed, 1, "one account committed as a delta");
+        assert_eq!(graft.accounts, 0, "nothing was staged");
+        let after = state.cache.accounts.get(&held).and_then(|a| a.account.as_ref()).expect("the account").info.clone();
+        assert_eq!(after.balance, U256::from(115), "both batches' credits, not just the last one's");
+        assert_eq!(after.nonce, 1, "the first batch's nonce bump");
     }
 
     /// The build-mode run, committed in its order with the beneficiary

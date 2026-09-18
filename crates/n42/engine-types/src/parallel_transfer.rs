@@ -1780,8 +1780,32 @@ mod tests {
             let groups = at.elapsed();
             let at = std::time::Instant::now();
             let mut state = State::builder().with_database(db.clone()).with_bundle_update().build();
-            let graft = graft_bundles(&mut state, run.bundles, beneficiary).unwrap();
+            // `keep_cache` false: what a block that seals early and a
+            // follower's import both use (nothing reads the cache after).
+            let graft = graft_bundles_with(&mut state, run.bundles, beneficiary, false).unwrap();
             let grafted = at.elapsed();
+
+            // The same block again, with each batch folding its bundle into
+            // the staged graft as it finishes: what the execution hides and
+            // what is left for the install.
+            let at = std::time::Instant::now();
+            let staged = std::sync::Mutex::new(StagedGraft::new(beneficiary, keys.len()));
+            let sink = |bundle: BundleState| staged.lock().expect("the staged graft's lock").add(bundle);
+            let streamed_run =
+                execute_for_build_with(&evm_env, &keys, &|i| ((), envs[i].clone()), &|| Some(db.clone()), Some(&sink))
+                    .expect("a block of transfers");
+            let streamed_groups = at.elapsed();
+            let at = std::time::Instant::now();
+            let mut streamed_state = State::builder().with_database(db.clone()).with_bundle_update().build();
+            let installed =
+                install_staged(&mut streamed_state, staged.into_inner().expect("the staged graft's lock"), false).unwrap();
+            let installed_ms = at.elapsed();
+            assert_eq!(installed.accounts, graft.accounts, "the staged graft holds the same accounts");
+            assert_eq!(installed.beneficiary_delta, graft.beneficiary_delta);
+            assert_eq!(streamed_run.executed.len(), run.executed.len());
+            eprintln!(
+                "round {round}: streamed: execution+fold {streamed_groups:?} (exec alone was {groups:?}), install {installed_ms:?}  ==  after: execution {groups:?} + graft {grafted:?}"
+            );
             let at = std::time::Instant::now();
             state.merge_transitions(BundleRetention::Reverts);
             let mut bundle = state.take_bundle();

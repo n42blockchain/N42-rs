@@ -754,22 +754,52 @@ pub fn append_reverts(bundle: &mut BundleState, reverts: Vec<(Address, AccountRe
         bundle.reverts.push(Vec::new());
     }
     let last = bundle.reverts.len() - 1;
-    let merged = &mut bundle.reverts[last];
-    if !merged.is_empty() {
-        let grafted: alloy_primitives::map::AddressHashSet = reverts.iter().map(|(a, _)| *a).collect();
-        merged.retain(|(address, _)| !grafted.contains(address));
-    }
-    merged.extend(reverts);
     // Sorted by address as revm's own merge leaves them; on the worker pool,
     // a block's 147,000 reverts being too many for one thread on the
     // follower's critical path.
-    if merged.len() >= 4096 {
-        use rayon::prelude::*;
-        merged.par_sort_unstable_by_key(|(address, _)| *address);
+    let mut reverts = reverts;
+    sort_reverts(&mut reverts);
+    let merged = &mut bundle.reverts[last];
+    if merged.is_empty() {
+        // The block's merge had nothing of its own to revert: the graft's set
+        // becomes the block's, moved rather than copied into it.
+        *merged = reverts;
     } else {
-        merged.sort_unstable_by_key(|(address, _)| *address);
+        // The block's own reverts are a handful -- the beneficiary, the
+        // withdrawals' recipients -- so each is looked up in the graft's
+        // sorted set rather than the graft's 147,000 being put in a set of
+        // their own (5-8 ms of a follower's import, loop174).
+        let mut few: Vec<(Address, AccountRevert)> = std::mem::take(merged)
+            .into_iter()
+            .filter(|(address, _)| reverts.binary_search_by_key(address, |(address, _)| *address).is_err())
+            .collect();
+        few.sort_unstable_by_key(|(address, _)| *address);
+        // Merged into the graft's set from the back: every entry of it moves
+        // at most once, and no second buffer of 147,000 reverts is allocated.
+        let (mut i, mut k) = (reverts.len(), reverts.len() + few.len());
+        reverts.resize_with(k, Default::default);
+        while let Some(entry) = few.pop() {
+            while i > 0 && reverts[i - 1].0 > entry.0 {
+                reverts.swap(k - 1, i - 1);
+                i -= 1;
+                k -= 1;
+            }
+            reverts[k - 1] = entry;
+            k -= 1;
+        }
+        *merged = reverts;
     }
     bundle.reverts_size = bundle.reverts.iter().map(Vec::len).sum();
+}
+
+/// By address, on the worker pool where there are enough of them to pay for it.
+fn sort_reverts(reverts: &mut [(Address, AccountRevert)]) {
+    if reverts.len() >= 4096 {
+        use rayon::prelude::*;
+        reverts.par_sort_unstable_by_key(|(address, _)| *address);
+    } else {
+        reverts.sort_unstable_by_key(|(address, _)| *address);
+    }
 }
 
 /// Executes candidate transfers for a block being built, one group per
@@ -1587,6 +1617,64 @@ mod tests {
         addresses.dedup();
         assert_eq!(addresses.len(), bundle.reverts[0].len(), "no account twice");
         assert_eq!(bundle.reverts_size, bundle.reverts[0].len());
+    }
+
+    /// The block's own reverts are merged into the graft's sorted set from the
+    /// back: everything ends sorted, an account both carry keeps the graft's
+    /// (to the parent's value), and nothing appears twice.
+    #[test]
+    fn the_blocks_own_reverts_merge_into_the_grafts_sorted_set() {
+        use revm::database::states::reverts::{AccountInfoRevert, Reverts};
+        let revert = |nonce: u64| AccountRevert {
+            account: AccountInfoRevert::RevertTo(AccountInfo { nonce, ..Default::default() }),
+            ..Default::default()
+        };
+        // The graft's: 5,000 addresses in no order, past the parallel sort's threshold.
+        let mut seed = 0x243f6a8885a308d3u64;
+        let mut grafted: Vec<(Address, AccountRevert)> = (0..5_000u64)
+            .map(|i| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (addr(1_000 + i), revert(i))
+            })
+            .collect();
+        grafted.swap(0, 4_999);
+        grafted.swap(17, 2_500);
+        // The block's own: two the graft also carries, and three it does not
+        // -- one below every grafted address, one above, one between.
+        let own = vec![
+            (addr(1_017), revert(999_017)),
+            (addr(4_000), revert(999_000)),
+            (addr(1), revert(1)),
+            (addr(9_999), revert(2)),
+            (addr(500), revert(3)),
+        ];
+        let mut bundle = BundleState {
+            state: Default::default(),
+            contracts: Default::default(),
+            reverts: Reverts::new(vec![own]),
+            state_size: 0,
+            reverts_size: 0,
+        };
+        append_reverts(&mut bundle, grafted);
+
+        let merged = &bundle.reverts[0];
+        assert_eq!(merged.len(), 5_000 + 3, "the graft's, plus the block's own that it does not carry");
+        let addresses: Vec<Address> = merged.iter().map(|(address, _)| *address).collect();
+        let mut sorted = addresses.clone();
+        sorted.sort();
+        assert_eq!(addresses, sorted, "sorted by address");
+        sorted.dedup();
+        assert_eq!(sorted.len(), merged.len(), "no account twice");
+        let at = |address: Address| {
+            merged.iter().find(|(held, _)| *held == address).map(|(_, revert)| revert.clone()).expect("present")
+        };
+        assert_eq!(at(addr(1_017)), revert(17), "the graft's revert, not the block's later one");
+        assert_eq!(at(addr(500)), revert(3), "the block's own, which the graft does not carry");
+        assert_eq!(at(addr(1)), revert(1), "below every grafted address");
+        assert_eq!(at(addr(9_999)), revert(2), "above every grafted address");
+        assert_eq!(bundle.reverts_size, merged.len());
     }
 
     /// A full bench-tier block (163,000 transfers, 6,000 senders, recipients

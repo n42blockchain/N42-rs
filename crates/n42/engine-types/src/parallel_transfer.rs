@@ -980,12 +980,31 @@ pub fn follower_sender_groups() -> bool {
     *ON.get_or_init(|| std::env::var("N42_FOLLOWER_SENDER_GROUPS").is_ok_and(|v| v == "1"))
 }
 
-/// Whether `N42_GRAFT_STREAM=1` is set: each batch's bundle is folded into the
-/// block's graft as that batch finishes ([`StagedGraft`]) instead of all of
-/// them after the execution. Off until a fleet leg measures it.
+/// Whether `N42_GRAFT_STREAM=1` is set: a builder folds each batch's bundle
+/// into the block's graft as that batch finishes ([`StagedGraft`]) instead of
+/// all of them after the execution.
+///
+/// Off, and measured so (loop176, three pairs): the leader's fold falls 73 ->
+/// 43-49 ms but its parallel step rises 78-84 -> 143-159, because the fold is
+/// memory bandwidth and page faults rather than work that can be scheduled --
+/// on a node whose ingest and imports are already using that bandwidth there
+/// is nothing for it to hide in, and overlapping it costs more than it saves.
+/// The bench, on an idle box, reads the opposite (5 ms against 49), which is
+/// what makes it worth keeping behind a flag.
 pub fn graft_stream() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("N42_GRAFT_STREAM").is_ok_and(|v| v == "1"))
+}
+
+/// Whether `N42_FOLLOWER_GRAFT_STREAM=1` is set: a follower's import folds its
+/// batches' bundles the same way. It is the side of the same change that paid
+/// on the fleet (loop176: the import's execution 150-156 -> 140-149 ms and the
+/// import 344-363 -> 330-355, since the merge it removes is larger than the
+/// execution it lengthens), and the import gates both the vote and the build
+/// after a tenure change.
+pub fn follower_graft_stream() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_GRAFT_STREAM").is_ok_and(|v| v == "1"))
 }
 
 /// Whether the graft takes the largest bundle as the block's bundle (default;
@@ -1073,7 +1092,7 @@ where
     // it changed, with their originals) and the gas each transaction used --
     // or, with `N42_GRAFT_STREAM=1`, folds the bundle into the block's graft
     // there and then ([`StagedGraft`]) and yields only the gas.
-    let staged = (graft && graft_stream())
+    let staged = (graft && follower_graft_stream())
         .then(|| std::sync::Mutex::new(StagedGraft::new(beneficiary, txs.len())));
     let at = std::time::Instant::now();
     let results: Vec<Result<(Option<revm::database::BundleState>, Vec<(usize, u64)>), NotParallel>> = {

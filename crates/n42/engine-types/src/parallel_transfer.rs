@@ -996,15 +996,18 @@ pub fn graft_stream() -> bool {
     *ON.get_or_init(|| std::env::var("N42_GRAFT_STREAM").is_ok_and(|v| v == "1"))
 }
 
-/// Whether `N42_FOLLOWER_GRAFT_STREAM=1` is set: a follower's import folds its
-/// batches' bundles the same way. It is the side of the same change that paid
-/// on the fleet (loop176: the import's execution 150-156 -> 140-149 ms and the
-/// import 344-363 -> 330-355, since the merge it removes is larger than the
-/// execution it lengthens), and the import gates both the vote and the build
-/// after a tenure change.
+/// Whether a follower's import folds its batches' bundles the same way
+/// (`N42_FOLLOWER_GRAFT_STREAM=0` goes back to grafting them after the
+/// execution). On: it is the side of the change that paid on the fleet, over
+/// four pairs of legs and with no invalid block among them -- the import
+/// 344-363 -> 330-355 ms (loop176) and 355-356 -> 331-337 (loop177), since
+/// the merge it removes is larger than the execution it lengthens, and fewer
+/// imports run past 600 ms. The import gates both the vote and the build
+/// after a tenure change. The leader's side of it costs and stays off
+/// ([`graft_stream`]).
 pub fn follower_graft_stream() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_GRAFT_STREAM").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_GRAFT_STREAM").map_or(true, |v| v != "0"))
 }
 
 /// Whether the graft takes the largest bundle as the block's bundle (default;

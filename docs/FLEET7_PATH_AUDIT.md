@@ -543,6 +543,24 @@ vector and sorted the result. It now sorts the graft's set on the worker pool, l
 search, and either moves the set in whole or merges those few from the back. On a 129,000-account block the revert
 phase of a follower's import is 11-14 -> 5-7 ms and the leader's merge behind the seal 16-24 -> 6-14.
 
+### The thread budget (loop178)
+
+Each node is pinned to 32 logical CPUs and runs a 16-thread build pool, a 16-thread global rayon pool (the
+follower's import), 8 tokio workers and 20 ingest recovery threads: 60 threads on 32 CPUs. Two legs each, with the
+follower's streamed graft on everywhere:
+
+| | leader parallel step ms | fold ms | build total ms | import total ms | recover us/tx | win1 | round (M tx) | free memory floor |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| P0 today | 80, 80 | 69, 67 | 303, 303 | 341, 333 | 16 | 349,072 | 24.58 | 40.3, 41.3 GB |
+| P1 build and rayon pools at 24 | 72, 69 | 75, 78 | 304, 306 | 346, 343 | 16 | 347,160 | 24.53 | 40.9, 22.2 GB |
+| P2 ingest recovery at 12 | 82, 83 | 67, 63 | 302, 290 | 346, 322 | 12 | 358,128 | 25.02 | 2.6, 39.0 GB |
+
+Widening the pools does cut the leader's parallel step (80 -> 69-72 ms) and buys nothing: the fold rises by 8 and
+the follower's import with it, so the build ends where it started. The threads were not idle, they were each
+other's contention. Cutting the ingest's recovery threads instead makes the ingest itself faster per transaction
+(16 -> 12 us) and leaves the build and the import the CPUs they were short of: the best round and window of the
+loop. One P2 leg left the box 2.6 GB free, which is too close to the edge to adopt on this evidence.
+
 ## 10. Where the work stopped (2026-09-15)
 
 - Defects 5-9 are fixed and confirmed on the fleet (e5d859d82, 2ce2f60e5, b902caff1, bdb8a802e; loop159, loop162,

@@ -561,6 +561,58 @@ other's contention. Cutting the ingest's recovery threads instead makes the inge
 (16 -> 12 us) and leaves the build and the import the CPUs they were short of: the best round and window of the
 loop. One P2 leg left the box 2.6 GB free, which is too close to the edge to adopt on this evidence.
 
+### The ceilings, and what each is worth (loop179, the scaling bench)
+
+The target is 1M TPS at this block shape: 163,000 transfers touching ~147,000 accounts, so 6.1 blocks a second, a
+163 ms cycle. Today's cycle is 393-399 ms. These are the ceilings between here and there, each with what it is
+worth and how it was measured -- the ones without a number are what the next legs are for.
+
+| | ceiling | where it stands | as TPS | how it was measured |
+| --- | --- | --- | --- | --- |
+| A | the protocol's fixed cost a cycle (proposal, votes, QC, body push) | ~90-100 ms | 1.6-1.8M | by subtraction; a leg of its own is queued (loop180 A1) |
+| B | the leader's build | 280-305 ms a block | ~540k | leg medians |
+| C | a follower's import | 316-341 ms a block | ~480k | leg medians |
+| D | the cycle as it runs | 393-399 ms | 410k, window 1 reads 350-373k | `fleet7-cycles.py` |
+| E | the supply (the flood and the ingest) | ~280k/s sustained a round | 280-350k | the flood's own log; a leg of its own is queued (loop180 E) |
+| F | the box's CPUs: 7 nodes of 32 logical CPUs, 60 threads each | -- | -- | loop178: widening the pools moves the contention, cutting the ingest's threads pays |
+| G | memory bandwidth (the graft, the allocator) | the graft is 43-45 ms whatever the thread count | -- | the scaling bench below |
+| H | the round's decay (windows 2-3) | round average 250-280k against 350-373k in window 1 | -- | every leg; the cause is the page cache (round 43) |
+
+**Per transaction, in CPU.** What 1M TPS a node would need if every part scaled perfectly, from the measurements:
+signature verification ~8 us (the merged Ed25519 batch, 7.7 us a signature) = 8 cores; the state reads ~3 us (two
+accounts a transfer through the QMDB read view) = 3 cores; the QMDB tree's update 3-5 us an account = 4 cores; the
+body's encode and decode ~4 us = 4 cores; the execution itself ~1.4 us = 1.5 cores. Twenty to twenty-five cores a
+node, before the serial parts. This box gives each of seven nodes 16 physical cores.
+
+**How the parallel phases scale with cores** (the same 163,000-transfer block through the two benches, medians of
+three rounds, milliseconds):
+
+| threads | leader execution | graft (serial) | import, by component | import, by sender |
+| --- | --- | --- | --- | --- |
+| 8 | 169 | 43 | 180 | 170 |
+| 16 | 176 | 44 | 173 | 164 |
+| 32 | 124 | 44 | 133 | 119 |
+| 64 | 107 | 45 | 112 | 103 |
+
+Three things fall out of it. Eight threads and sixteen are the same number, and only thirty-two breaks it: on a box
+of this shape the first sixteen threads are spread across sockets and the work is memory-bound, which is also why
+widening the fleet's pools bought nothing (loop178). The graft does not move with the thread count at all -- it is
+serial memory movement, and no arrangement of cores touches it. And a node with 64 threads to itself would run the
+parallel phases 35-40% faster, which puts a dedicated machine a node at roughly 500-550k, not at 1M: the rest has
+to come out of the serial parts and the per-transaction work.
+
+**The ingest's threads (loop179, two legs each).** Cutting the recovery threads from 20 to 12 is worth 6% of window
+1, and to 8 a little more of the round; both make the ingest itself faster per transaction, because what those
+threads were contending for is what the build and the import needed.
+
+| recovery threads | build ms | recover us/tx | import ms | win1 | round (M tx) | free memory floor |
+| --- | --- | --- | --- | --- | --- | --- |
+| 20 | 305, 297 | 16 | 341, 336 | 350,088 | 24.86 | 29.6, 44.3 GB |
+| 12 | 293, 287 | 12 | 316, 323 | 371,162 | 25.41 | 12.9, 18.3 GB |
+| 8 | 283, 280 | 11 | 326, 333 | 358,026 | 25.75 | 17.3, 39.7 GB |
+
+Twelve is the fleet's setting from here on.
+
 ## 10. Where the work stopped (2026-09-15)
 
 - Defects 5-9 are fixed and confirmed on the fleet (e5d859d82, 2ce2f60e5, b902caff1, bdb8a802e; loop159, loop162,

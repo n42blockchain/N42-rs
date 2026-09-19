@@ -512,6 +512,37 @@ does the round. Left off by default. The reason the follower's execution is 150-
 the same transfers is that the follower's `exec_ms` carries its graft (`merge_ms` 38-131) -- the same graft the
 leader pays in its fold. That is where the next change goes.
 
+### The graft, folded beside the execution (loop176)
+
+The graft moves every account a block touches into one map. A `StagedGraft` (2e31a7845) folds each batch's bundle
+on that batch's own thread as it finishes and the block's state takes the result in one move, so nothing of it is
+left for the builder's serial chain. In the bench, on an idle box and a 162,000-transfer block, that is exactly what
+happens: the graft after the execution is 49.9 ms, while folding costs 5.5 ms inside the execution and an install of
+0.17 ms.
+
+On the fleet it does not hold for the leader. Three pairs (loop176, medians of a leg):
+
+| | parallel step ms | fold ms | sealed at ms | build total ms | import execution ms | import total ms |
+| --- | --- | --- | --- | --- | --- | --- |
+| today | 78-84 | 73 | 230-241 | 303-311 | 150-156 | 344-363 |
+| streamed | 143-144 | 43-49 | 262-267 | 323-328 | 140-149 | 330-355 |
+| streamed, follower by sender | 148-159 | 48-49 | 267-285 | 331-350 | 143-158 | 330-354 |
+
+The fold falls by 25-30 ms and the parallel step rises by 65: the graft is memory bandwidth and page faults, not
+work that can be scheduled, and a node whose ingest and imports are already using that bandwidth has nothing for it
+to hide in. The bench box was idle, which is what it was measuring. So `N42_GRAFT_STREAM` stays off for the leader.
+
+The follower's side of the same change pays, because the merge it removes is larger than the execution it
+lengthens: its import falls 344-363 to 330-355 ms. That side has its own flag now
+(`N42_FOLLOWER_GRAFT_STREAM`, b8da62216) and its own legs (loop177). Every leg above: 0 invalid blocks, 0 gas-used
+mismatches, 0 unanswered reads.
+
+**The revert merge (52cb4178d).** Independent of the streaming, and in both paths: the append put the graft's
+147,000 reverts in a hash set to filter the block's own handful out of them, copied them all into the block's
+vector and sorted the result. It now sorts the graft's set on the worker pool, looks the block's few up by binary
+search, and either moves the set in whole or merges those few from the back. On a 129,000-account block the revert
+phase of a follower's import is 11-14 -> 5-7 ms and the leader's merge behind the seal 16-24 -> 6-14.
+
 ## 10. Where the work stopped (2026-09-15)
 
 - Defects 5-9 are fixed and confirmed on the fleet (e5d859d82, 2ce2f60e5, b902caff1, bdb8a802e; loop159, loop162,

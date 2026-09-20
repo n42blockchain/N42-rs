@@ -137,6 +137,10 @@ struct Inner<T: PoolTransaction> {
     current: Option<(Address, usize)>,
     /// Consecutive nonces a build takes from one sender before moving on.
     run: usize,
+    /// Builds this queue has served, so a give-back line names the build
+    /// that asked: two builds in flight on one parent are the shape this
+    /// node's stale give-back came from, and the numbers tell them apart.
+    builds: u64,
 }
 
 /// How many consecutive nonces a build takes from one sender before moving
@@ -213,6 +217,7 @@ impl<T: PoolTransaction> TxQueue<T> {
                 held: VecDeque::new(),
                 current: None,
                 run: run.max(1),
+                builds: 0,
             })),
             inbox: Arc::new(Mutex::new(Vec::new())),
             staged: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -479,6 +484,8 @@ impl<T: PoolTransaction> TxQueue<T> {
         {
             let mut inner = self.inner.lock();
             self.drain_inbox(&mut inner);
+            inner.builds += 1;
+            let build = inner.builds;
             match inner.last_build.take() {
                 // "The same parent again" does not mean the block built from
                 // that take was not committed: with two builds in flight on
@@ -492,8 +499,8 @@ impl<T: PoolTransaction> TxQueue<T> {
                 // `give_back`.
                 Some((previous, taken)) if previous == parent => {
                     let count = taken.len();
-                    inner.give_back(taken);
-                    tracing::info!(target: "n42.tx_queue", count, "previous build on the same parent was not committed; its transactions are offered again");
+                    let gave = inner.give_back(taken);
+                    tracing::info!(target: "n42.tx_queue", build, ?parent, count, offered = gave.offered, mined = gave.filtered, "previous build on the same parent was not committed; its transactions are offered again");
                 }
                 // A build on another parent -- a build ahead superseded by the
                 // next block -- took transactions the queue must not lose: they
@@ -502,8 +509,12 @@ impl<T: PoolTransaction> TxQueue<T> {
                 // sat at its gate (round 38).
                 Some((previous, taken)) if !taken.is_empty() => {
                     let count = taken.len();
-                    inner.give_back(taken);
-                    tracing::debug!(target: "n42.tx_queue", count, ?previous, ?parent, "a build on another parent was superseded; its transactions are offered again");
+                    let gave = inner.give_back(taken);
+                    if gave.filtered > 0 {
+                        tracing::info!(target: "n42.tx_queue", build, ?previous, ?parent, count, offered = gave.offered, mined = gave.filtered, "a build on another parent was superseded; its transactions are offered again");
+                    } else {
+                        tracing::debug!(target: "n42.tx_queue", build, ?previous, ?parent, count, offered = gave.offered, "a build on another parent was superseded; its transactions are offered again");
+                    }
                 }
                 _ => {}
             }

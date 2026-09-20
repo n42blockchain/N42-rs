@@ -220,6 +220,10 @@ fn reader_keep_cap_env() -> u64 {
 /// The reader keep cap with the hashed tables off; see [`reader_keep_cap_env`].
 const TABLES_OFF_READER_KEEP_CAP: u64 = 1024;
 
+/// How many canonical blocks apart the reader's lag is logged, so a leg's log
+/// carries its history rather than only its accidents.
+const READER_LAG_LOG_EVERY: u64 = 64;
+
 fn entry_file_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("N42_QMDB_ENTRY_FILE").is_ok_and(|v| v == "1"))
@@ -326,6 +330,14 @@ struct Inner {
     /// How far below the canonical head the forest keeps records for the view
     /// ([`reader_keep_cap_env`], or `set_reader_keep_cap`).
     reader_keep_cap: std::sync::atomic::AtomicU64,
+    /// The canonical head's number, kept here so the reader's lag can be read
+    /// without taking the forest's lock.
+    canonical_number: std::sync::atomic::AtomicU64,
+    /// The highest lag threshold the reader-lag warning has fired at, 0 for
+    /// none; see [`QmdbNodeState::note_reader_lag`].
+    lag_warned: std::sync::atomic::AtomicU64,
+    /// The canonical number the last periodic lag line was logged at.
+    lag_logged_at: std::sync::atomic::AtomicU64,
 }
 
 /// The delta log's position, as the node last left it.
@@ -398,6 +410,9 @@ impl QmdbNodeState {
                 read_view: std::sync::OnceLock::new(),
                 read_view_wanted: std::sync::atomic::AtomicBool::new(read_view_env()),
                 reader_keep_cap: std::sync::atomic::AtomicU64::new(reader_keep_cap_env()),
+                canonical_number: std::sync::atomic::AtomicU64::new(0),
+                lag_warned: std::sync::atomic::AtomicU64::new(0),
+                lag_logged_at: std::sync::atomic::AtomicU64::new(0),
             }),
         }
     }
@@ -505,6 +520,7 @@ impl QmdbNodeState {
                 }
             }
         }
+        self.note_reader_lag();
     }
 
     /// The database unwound the state above `number`: the read view steps
@@ -522,6 +538,49 @@ impl QmdbNodeState {
             });
         } else {
             self.release_reader_records();
+        }
+    }
+
+    /// The reader's lag -- the canonical head minus the read view's head, which
+    /// is the block the database has persisted -- said out loud before it is
+    /// fatal.
+    ///
+    /// The lag is what the keep cap bounds: at the cap the forest prunes the
+    /// record of the view's next block, and the view is invalidated the moment
+    /// the database persists it (loop183 V2a, where nothing was logged until
+    /// blocks were being refused). So a WARN at half the cap in force and
+    /// again at three quarters, once per crossing -- a node whose persistence
+    /// has stalled stays over the threshold for every block it mines, and one
+    /// line a block is a flood -- re-armed when the lag falls back under it.
+    /// Both readings are cheap: the canonical number is kept beside the forest
+    /// rather than in it, and the view's head is its own lock.
+    fn note_reader_lag(&self) {
+        let Some(view) = self.inner.read_view.get() else { return };
+        if !view.is_valid() {
+            return;
+        }
+        use std::sync::atomic::Ordering::Relaxed;
+        let canonical = self.inner.canonical_number.load(Relaxed);
+        let view_head = view.head().0;
+        let reader_lag = canonical.saturating_sub(view_head);
+        let cap = self.reader_keep_cap();
+        let reached = match reader_lag {
+            lag if lag >= cap / 4 * 3 => cap / 4 * 3,
+            lag if lag >= cap / 2 => cap / 2,
+            _ => 0,
+        };
+        if reached != self.inner.lag_warned.swap(reached, Relaxed) && reached > 0 {
+            warn!(
+                target: "n42.qmdb",
+                reader_lag, view_head, canonical, keep_cap = cap,
+                "the QMDB read view is falling behind the chain; at the cap its records are pruned and it is invalidated",
+            );
+        }
+        let logged_at = self.inner.lag_logged_at.load(Relaxed);
+        if canonical.saturating_sub(logged_at) >= READER_LAG_LOG_EVERY
+            && self.inner.lag_logged_at.compare_exchange(logged_at, canonical, Relaxed, Relaxed).is_ok()
+        {
+            info!(target: "n42.qmdb", reader_lag, view_head, canonical, keep_cap = cap, "the QMDB read view's lag");
         }
     }
 
@@ -1069,10 +1128,16 @@ impl QmdbNodeState {
         // stand at the next block's build by now. Otherwise -- a branch switch,
         // a restored forest, a block whose delta went by the other path -- the
         // difference is measured by standing the tree at the head as before.
-        let ready = self.with_forest(|forest| {
+        // The head's number comes back with the deltas: the reader-lag check
+        // below needs it, and this is the lock it is already under. (The
+        // checkpoint path above runs only for the first canonical block of a
+        // fresh log, where the lag is zero.)
+        let (number, ready) = self.with_forest(|forest| {
             forest.set_canonical(block_hash)?;
-            Ok(forest.take_block_deltas(cursor.head, cursor.next_slot, block_hash))
+            Ok((forest.head().0, forest.take_block_deltas(cursor.head, cursor.next_slot, block_hash)))
         })?;
+        self.inner.canonical_number.store(number, std::sync::atomic::Ordering::Relaxed);
+        self.note_reader_lag();
         if let Some(deltas) = ready {
             self.sync_entries_if_file()?;
             for delta in &deltas {

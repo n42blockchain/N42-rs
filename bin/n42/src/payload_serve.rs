@@ -64,24 +64,39 @@ where
     B: reth_primitives_traits::Block,
     B::Body: reth_primitives_traits::BlockBody<Transaction: Encodable2718 + Sync>,
 {
+    encode_block_parallel_keeping_transactions(block).0
+}
+
+/// [`encode_block_parallel`], handing back the EIP-2718 encoding of each
+/// transaction as well -- the bytes it makes on the way to the block's RLP and
+/// used to drop. A payload lists transactions in exactly that form, so the
+/// leader's own block is served from these instead of encoding its 163,000
+/// transactions a second time a few milliseconds later (`request::OWN_BLOCK`).
+pub fn encode_block_parallel_keeping_transactions<B>(block: &SealedBlock<B>) -> (Vec<u8>, Vec<alloy_primitives::Bytes>)
+where
+    B: reth_primitives_traits::Block,
+    B::Body: reth_primitives_traits::BlockBody<Transaction: Encodable2718 + Sync>,
+{
     use rayon::prelude::*;
     let header = alloy_rlp::encode(block.header());
-    let transactions: Vec<Vec<u8>> = block
+    let (transactions, listed): (Vec<Vec<u8>>, Vec<alloy_primitives::Bytes>) = block
         .body()
         .transactions()
         .par_iter()
         .map(|tx| {
             let inner = tx.encoded_2718();
-            if tx.type_flag().is_some() {
+            let listed = alloy_primitives::Bytes::from(inner.clone());
+            let encoded = if tx.type_flag().is_some() {
                 let mut out = Vec::with_capacity(inner.len() + 4);
                 alloy_rlp::Header { list: false, payload_length: inner.len() }.encode(&mut out);
                 out.extend_from_slice(&inner);
                 out
             } else {
                 inner
-            }
+            };
+            (encoded, listed)
         })
-        .collect();
+        .unzip();
     let transactions_len: usize = transactions.iter().map(Vec::len).sum();
     let transactions_header = alloy_rlp::Header { list: true, payload_length: transactions_len };
     let ommers: &[u8] = &[0xc0];
@@ -101,7 +116,7 @@ where
     if let Some(withdrawals) = withdrawals {
         out.extend_from_slice(&withdrawals);
     }
-    out
+    (out, listed)
 }
 
 /// Serves built blocks and imports on `addr` until the process ends.
@@ -249,6 +264,29 @@ where
         return None;
     }
     hand_off_own_build::<T>(reuse, built_hash, built, sealed_header, converted).await
+}
+
+/// The transactions of the last blocks this node served, in the form a payload
+/// lists them, kept from the encoding the service already did for the block's
+/// RLP. Two entries: the own-block import follows its `getPayload` by a few
+/// milliseconds, and a build ahead may put one more block in between.
+static LISTED_TRANSACTIONS: std::sync::Mutex<Vec<(alloy_primitives::B256, std::sync::Arc<Vec<alloy_primitives::Bytes>>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Keeps `listed` for `block`, dropping all but the last two.
+fn remember_listed(block: alloy_primitives::B256, listed: Vec<alloy_primitives::Bytes>) {
+    let mut kept = LISTED_TRANSACTIONS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    kept.retain(|(held, _)| *held != block);
+    kept.push((block, std::sync::Arc::new(listed)));
+    if kept.len() > 2 {
+        kept.remove(0);
+    }
+}
+
+/// What [`remember_listed`] kept for `block`, if it is still held.
+fn listed_for(block: alloy_primitives::B256) -> Option<std::sync::Arc<Vec<alloy_primitives::Bytes>>> {
+    let kept = LISTED_TRANSACTIONS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    kept.iter().find(|(held, _)| *held == block).map(|(_, listed)| std::sync::Arc::clone(listed))
 }
 
 /// A block's transactions in their EIP-2718 encoding, as a payload lists them,
@@ -486,11 +524,17 @@ where
     // none of its state changes in the tree, and every block this node built
     // on it carried nonces the chain had mined (loop157 V3/C4/V4, loop158 V5).
     // Encoded on the worker pool, a few milliseconds at 163,000.
-    let raw_transactions = {
-        let block = std::sync::Arc::clone(&built.block);
-        tokio::task::spawn_blocking(move || encoded_transactions(&block))
-            .await
-            .map_err(|err| format!("encoding the transactions: {err}"))?
+    let raw_transactions = match listed_for(built_hash) {
+        // Kept from the `getPayload` that served this very block a few
+        // milliseconds ago: the same 163,000 encodings, and the leader's
+        // worker pool is wanted by the next build by now.
+        Some(listed) => listed.as_ref().clone(),
+        None => {
+            let block = std::sync::Arc::clone(&built.block);
+            tokio::task::spawn_blocking(move || encoded_transactions(&block))
+                .await
+                .map_err(|err| format!("encoding the transactions: {err}"))?
+        }
     };
     // A block that forks from the engine's head (a sibling re-proposed
     // after a TC): the head goes back to the parent first, or the tree
@@ -645,7 +689,8 @@ async fn build_on_own_block(
 /// how long the encoding took.
 fn push_built_payload(out: &mut Vec<u8>, payload: &N42BuiltPayload) -> (usize, std::time::Duration) {
     let encode_at = std::time::Instant::now();
-    let block = encode_block_parallel(payload.block());
+    let (block, listed) = encode_block_parallel_keeping_transactions(payload.block());
+    remember_listed(payload.block().hash(), listed);
     let encoded = encode_at.elapsed();
     out.reserve(block.len() + 64);
     out.push(1);
@@ -1395,6 +1440,49 @@ mod tests {
         let block = Block { header, body: BlockBody { transactions: txs, ommers: Vec::new(), withdrawals: Some(withdrawals) } };
         let sealed = SealedBlock::seal_slow(block);
         assert_eq!(encode_block_parallel(&sealed), alloy_rlp::encode(&sealed));
+    }
+
+    /// The encodings the service keeps when it answers `getPayload` are the
+    /// ones the own-block import would have made for itself, byte for byte --
+    /// a payload lists transactions in their EIP-2718 form, which is what the
+    /// block's RLP is built from.
+    #[test]
+    fn the_kept_encodings_are_the_ones_a_payload_lists() {
+        let txs: Vec<TransactionSigned> = (0..12u64)
+            .map(|n| {
+                if n % 4 == 0 {
+                    let tx = TxLegacy { chain_id: Some(1), nonce: n, gas_price: 10, gas_limit: 21_000, to: TxKind::Call(Address::repeat_byte(3)), value: U256::from(n), ..Default::default() };
+                    Signed::new_unchecked(tx, Signature::test_signature(), Default::default()).into()
+                } else {
+                    let tx = TxEip1559 { chain_id: 1, nonce: n, gas_limit: 21_000, max_fee_per_gas: 10, max_priority_fee_per_gas: 1, to: TxKind::Call(Address::repeat_byte(2)), value: U256::from(n), ..Default::default() };
+                    Signed::new_unchecked(tx, Signature::test_signature(), Default::default()).into()
+                }
+            })
+            .collect();
+        let header = Header { number: 11, base_fee_per_gas: Some(7), ..Default::default() };
+        let block = Block { header, body: BlockBody { transactions: txs.clone(), ommers: Vec::new(), withdrawals: None } };
+        let sealed = SealedBlock::seal_slow(block);
+        let (rlp, listed) = encode_block_parallel_keeping_transactions(&sealed);
+        assert_eq!(rlp, alloy_rlp::encode(&sealed), "the block's RLP is unchanged");
+
+        let n42: Vec<n42_tx_types::N42TxEnvelope> = txs.iter().cloned().map(n42_tx_types::N42TxEnvelope::from).collect();
+        let n42_block = n42_tx_types::Block {
+            header: sealed.header().clone(),
+            body: n42_tx_types::BlockBody { transactions: n42, ommers: Vec::new(), withdrawals: None },
+        };
+        let recovered = reth_primitives_traits::RecoveredBlock::new_sealed(
+            SealedBlock::seal_slow(n42_block),
+            vec![Address::repeat_byte(1); txs.len()],
+        );
+        assert_eq!(listed, encoded_transactions(&recovered), "the same bytes the import used to encode for itself");
+
+        let hash = sealed.hash();
+        remember_listed(hash, listed.clone());
+        assert_eq!(listed_for(hash).as_deref(), Some(&listed), "kept for the import that follows");
+        // Two blocks later it is gone, and the import encodes for itself again.
+        remember_listed(alloy_primitives::B256::repeat_byte(1), Vec::new());
+        remember_listed(alloy_primitives::B256::repeat_byte(2), Vec::new());
+        assert!(listed_for(hash).is_none(), "only the last two are kept");
     }
 
     /// A sibling on the same parent -- another leader's empty block after a

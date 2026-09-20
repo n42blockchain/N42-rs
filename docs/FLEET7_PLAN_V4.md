@@ -129,6 +129,37 @@ process. They are RAM for as long as they exist. Removing them is the cheapest c
 reads the floor of free memory and windows 2-3 before anything else is judged; what is left of the decay after that
 is the execution layer's own resident set, which a heap profile (`scripts/fleet7-profile.sh --alloc`) has to split.
 
+## 2c. Steps 1 and 2 on the fleet (loop183, pacing 275 ms, the tmpfs cleared of 21.8 GB)
+
+| leg | window 1 | round (M tx) | view total ms | R1 ms | invalid blocks | free memory floor |
+| --- | --- | --- | --- | --- | --- | --- |
+| V0a today | 339,784 | 26.02 | 313 | 153 | 0 | 51.7 GB |
+| V0b | 391,021 | 24.29 | 279 | 7 | 0 | 8.8 GB |
+| V1a check on the parent's output | 388,814 | 26.36 | 288 | 106 | 0 | 15.4 GB |
+| V1b | **401,741** | 27.51 | 285 | 13 | 0 | 24.5 GB |
+| V2a execute on the parent's output | 390,935 | 23.94 | 430 | 219 | **29, 3 TCs** | **2.7 GB** |
+| V2b | 390,539 | **28.13** | 284 | 8 | 0 | 11.0 GB |
+
+Window 1 passes 400k and the round 28M for the first time at this block shape (25.4M before the pacing and the tmpfs).
+
+**Step 1: passes.** Both legs lead their pair on window 1 and the round, R1 153 -> 106 where the pair is comparable,
+no invalid block in these two legs or in loop169's three.
+
+**Step 2: no gain to show, and one leg to explain.** The two roads overlap by 0-1 ms at the median over 164 and 232
+blocks: at this pacing the parent's fields are already filed when the child's sender check passes, so the vote road
+has nothing to wait for and the execution was not waiting on the root either. The step's premise does not hold at a
+275 ms pacing; it would at a cycle short enough for the child to arrive while its parent is still importing. V2a's
+29 invalid blocks are one event on one node: node0's read view was invalidated at block 289 ("a persisted block's
+changes are not on the tree's path"), which with the tables off turns the next read the view cannot answer into a
+refused block (359) and refuses its 28 descendants by their link. Whether executing on the parent's output made that
+invalidation or the tables-off mode carries it anyway is being read from the logs; the flag stays off either way
+until it is known.
+
+**The memory floor is not fixed by the tmpfs.** Three of six legs still bottom under 12 GB with 22 GB more to start
+from, and the floor does not follow the configuration (V0a 51.7, V0b 8.8). The next runner samples resident memory
+by process class through the leg; until then the floor is a hazard in its own right (a node under 3 GB free is one
+allocation from the OOM killer).
+
 ## 3. What not to do
 
 - Do not judge a cycle-shortening change at a pacing above the natural cycle; do not judge any change without R1.

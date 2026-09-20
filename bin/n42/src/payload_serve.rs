@@ -652,12 +652,24 @@ async fn build_on_own_block(
     // which finds nothing left to forget when it runs.
     if let Some(queue) = n42_tx_queue::global::<n42_engine_types::N42PooledTransaction>() {
         let at = std::time::Instant::now();
+        let txs = built.block.body().transactions().count();
         let mined = built
             .block
             .transactions_with_sender()
             .map(|(sender, tx)| (*sender, alloy_consensus::Transaction::nonce(tx)));
         let dropped = queue.forget_mined(built.block.header().parent_hash, mined);
-        debug!(target: "n42.payload_serve", forgotten = dropped.len(), "own block's transactions forgotten by the queue ahead of the build");
+        // At info: `forgotten` far below `txs` is the shape of the queue
+        // defect this pairs with -- the build's take was already given back
+        // to the lanes by a second build on the same parent, so there is
+        // nothing left here to forget and nothing to hold (round 44).
+        info!(
+            target: "n42.payload_serve",
+            number = built.block.number(),
+            txs,
+            forgotten = dropped.len(),
+            parent = ?built.block.header().parent_hash,
+            "own block's transactions forgotten by the queue ahead of the build"
+        );
         queue.hold_own_block(built.block.number(), sealed_hash, dropped);
         times.queue_ms = at.elapsed().as_millis() as u64;
     }

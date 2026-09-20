@@ -778,6 +778,11 @@ where
     // executor's finish reports, built beside the parallel step instead of one executor commit
     // per transaction (see `direct_receipts_enabled`); taken by the finish behind the seal.
     let mut direct_receipts: Option<(Vec<n42_tx_types::Receipt>, u64)> = None;
+    // The block's body as the same parallel pass leaves it, already split into
+    // the transactions and their senders: the seal wants those two vectors and
+    // used to make them by moving 163,000 recovered transactions through one
+    // serial `unzip` (most of a 24 ms `tx_root_ms`).
+    let mut direct_body: Option<(Vec<TransactionSigned>, Vec<alloy_primitives::Address>)> = None;
     let deferred_now = reth_chainspec::qmdb::deferred_execution_active_at(chain_spec.genesis(), attributes.timestamp);
     // What the seal-first path needs of the chain and the block, short of
     // the block being full (known after the parallel step).
@@ -883,7 +888,7 @@ where
                                 U256::from(tip) * U256::from(built.gas_used)
                             })
                             .reduce(|| U256::ZERO, |a, b| a + b);
-                        let (transactions, receipts): (Vec<_>, Vec<_>) = run
+                        let (transactions, rest): (Vec<TransactionSigned>, Vec<(alloy_primitives::Address, n42_tx_types::Receipt)>) = run
                             .executed
                             .into_par_iter()
                             .zip(cumulative.into_par_iter())
@@ -895,12 +900,18 @@ where
                                     cumulative_gas_used,
                                     logs: built.result.into_logs(),
                                 };
-                                (built.tx, receipt)
+                                // Split here, on the pool, where the transaction
+                                // is already in hand: the seal takes the two
+                                // vectors as they are.
+                                let (tx, sender) = built.tx.into_parts();
+                                (tx, (sender, receipt))
                             })
                             .unzip();
+                        let (senders, receipts): (Vec<alloy_primitives::Address>, Vec<n42_tx_types::Receipt>) =
+                            rest.into_par_iter().unzip();
                         cumulative_gas_used += executed_gas;
                         tx_count += executed_count as u64;
-                        builder.transactions = transactions;
+                        direct_body = Some((transactions, senders));
                         direct_receipts = Some((receipts, tx_gas));
                     } else {
                         // The receipts and the gas, one transfer at a time, with
@@ -958,9 +969,15 @@ where
                     let bundles = run.bundles;
                     let staged = staged.map(|staged| staged.into_inner().expect("the staged graft's lock"));
                     let (graft, early_root) = std::thread::scope(|scope| {
-                        let root = sealing_early.then(|| {
-                            let txs: &[reth_primitives_traits::Recovered<TransactionSigned>] = &builder.transactions;
-                            scope.spawn(move || crate::assembler::parallel_transaction_root_recovered(txs))
+                        let root = sealing_early.then(|| match direct_body.as_ref() {
+                            Some((transactions, _)) => {
+                                let txs: &[TransactionSigned] = transactions;
+                                scope.spawn(move || crate::assembler::parallel_transaction_root(txs))
+                            }
+                            None => {
+                                let txs: &[reth_primitives_traits::Recovered<TransactionSigned>] = &builder.transactions;
+                                scope.spawn(move || crate::assembler::parallel_transaction_root_recovered(txs))
+                            }
                         });
                         let db = builder.executor.evm_mut().db_mut();
                         let graft = match staged {
@@ -1020,7 +1037,12 @@ where
                     }
                 }
                 Err(why) => {
-                    debug!(target: "payload_builder", %why, candidates = cands.len(), "parallel build declined; building serially");
+                    // Counted, and said out loud: a leg that reads the phase
+                    // medians of the parallel step has no way of knowing that
+                    // some of its blocks never took it.
+                    static DECLINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let declined = DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    tracing::info!(target: "payload_builder", %why, candidates = cands.len(), declined, "parallel build declined; building serially");
                     for tx in cands.into_iter().rev() {
                         lookahead.push_front(tx);
                     }
@@ -1059,9 +1081,13 @@ where
             drop(pulled.take());
             // The transactions out of the builder: the body is the sealed
             // block's; nothing here assembles a block from them again.
-            let txs = std::mem::take(&mut builder.transactions);
-            let (transactions, senders): (Vec<TransactionSigned>, Vec<alloy_primitives::Address>) =
-                txs.into_iter().map(|tx| tx.into_parts()).unzip();
+            let (transactions, senders): (Vec<TransactionSigned>, Vec<alloy_primitives::Address>) = match direct_body.take() {
+                Some(body) => body,
+                None => {
+                    let txs = std::mem::take(&mut builder.transactions);
+                    txs.into_iter().map(|tx| tx.into_parts()).unzip()
+                }
+            };
             let transactions_root = match early_transactions_root {
                 Some(root) => root,
                 None => crate::assembler::parallel_transaction_root(&transactions),

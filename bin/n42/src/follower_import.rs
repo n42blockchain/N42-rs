@@ -609,7 +609,14 @@ where
                 );
                 output = Some(out);
             }
-            Err(why) => tracing::debug!(target: "n42.follower_import", number, %why, "not parallel; executing serially"),
+            Err(why) => {
+                // Counted like the builder's: a block that fell back to the
+                // serial path costs several times its import, and a leg that
+                // reads medians cannot see it otherwise.
+                static DECLINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let declined = DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                tracing::info!(target: "n42.follower_import", number, %why, declined, "not parallel; executing serially");
+            }
         }
     }
     // A block executed on the worker pool read its transfers' accounts

@@ -19,11 +19,21 @@
 //! gossip, off the builder's path.
 //!
 //! What goes out for a build is remembered until the next build. A build on
-//! the same parent again means the previous block was not committed, and its
-//! transactions go back to the front; a build on a new parent means it was,
-//! and they are dropped. Canonical blocks prune the queue on every node by
-//! (sender, nonce), so a follower that becomes leader does not offer what the
-//! chain already holds.
+//! the same parent again usually means the previous block was not committed,
+//! and its transactions go back to the front; a build on a new parent means
+//! it was, and they are dropped. Canonical blocks prune the queue on every
+//! node by (sender, nonce), so a follower that becomes leader does not offer
+//! what the chain already holds.
+//!
+//! Neither rule is proof on its own -- two builds can be in flight on one
+//! parent, and the block from the first can be committed and pruned before
+//! the second asks -- so every lane carries the highest nonce the chain has
+//! mined for its sender, and nothing at or below it is ever queued again,
+//! whichever door it comes in by. Without that, a give-back after the prune
+//! left the mined transactions queued for good: every later build of that
+//! leader took them, refused each for a stale nonce and gave them back
+//! (round 44: 814,431 refusals on one node, builds of 3.4-4.1 s against
+//! 250 ms, and the chain's cycle 1.7-2.7 s against 0.42).
 //!
 //! Enabled by `N42_TX_QUEUE=1`. The queue is fed from the pool's
 //! new-transaction listener, so a transaction that came in by the ingest,
@@ -49,11 +59,58 @@ struct Lane<T: PoolTransaction> {
     /// Whether the sender is in the arrival order right now.
     queued: bool,
     id: SenderId,
+    /// The highest nonce the chain is known to have mined for this sender,
+    /// from a canonical block or a build's stale refusal. Nothing at or
+    /// below it may re-enter the lane through a give-back: the chain has
+    /// made it unusable for good, and a build that is offered it pays a
+    /// full refusal for it -- every build, for as long as it is queued
+    /// (round 44: 814,431 refusals on one node against 17,300 on a healthy
+    /// one, and a leader's build at 3.4-4.1 s instead of 250 ms).
+    mined: Option<u64>,
+}
+
+impl<T: PoolTransaction> Lane<T> {
+    /// Whether the chain has passed this nonce, so the lane must not hold it.
+    fn is_stale(&self, nonce: u64) -> bool {
+        self.mined.is_some_and(|mined| nonce <= mined)
+    }
+
+    /// Records that the chain mined this nonce. The watermark only rises:
+    /// blocks arrive in order, and a later build's refusal says no less
+    /// than an earlier block did.
+    fn mine(&mut self, nonce: u64) {
+        self.mined = Some(self.mined.map_or(nonce, |mined| mined.max(nonce)));
+    }
+
+    /// A reorg took this nonce back off the chain: the watermark drops below
+    /// it, or the transactions the reverted blocks give back would be
+    /// filtered as mined the first time a build handed them back.
+    fn unmine(&mut self, nonce: u64) {
+        if self.mined.is_some_and(|mined| mined >= nonce) {
+            self.mined = nonce.checked_sub(1);
+        }
+    }
+}
+
+/// What a give-back did: how many went back to the lanes, and how many were
+/// dropped because the chain had already mined them (or their sender has no
+/// lane left to go back to).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct GaveBack {
+    offered: usize,
+    filtered: usize,
 }
 
 struct Inner<T: PoolTransaction> {
     // Keyed by address with alloy's fixed-bytes hasher: the builder looks a
     // lane up per transaction, and std's SipHash was 3% of its thread.
+    //
+    // A lane never holds a transaction at or below its sender's mined
+    // watermark, whichever door it came in by -- an arrival, a build's
+    // give-back, an own block the chain settled elsewhere. The give-back is
+    // the door that mattered: what a build took is outside the lanes, so a
+    // canonical prune cannot see it, and a take handed back after its block
+    // was pruned used to stay queued for the rest of the leg.
     lanes: AddressHashMap<Lane<T>>,
     /// Senders with queued transactions, in the order their queued run began;
     /// a sender taken from the front goes to the back if it has more.
@@ -217,15 +274,38 @@ impl<T: PoolTransaction> TxQueue<T> {
         self.staged.fetch_add(count, std::sync::atomic::Ordering::AcqRel);
     }
 
-    /// Drops everything at or below `nonce` for `sender`: a block carrying
-    /// (sender, nonce) has made every lower nonce unusable as well.
+    /// Queues the transactions of reverted blocks. The chain no longer holds
+    /// them, so each sender's mined watermark drops below what comes back:
+    /// otherwise the give-back filter would treat them as mined the first
+    /// time a build handed one back, and the reorg's whole point (round 43:
+    /// half-empty blocks for the rest of the leg) would be lost again.
+    pub fn push_reverted(&self, transactions: Vec<T>) {
+        {
+            let mut inner = self.inner.lock();
+            for transaction in &transactions {
+                let sender = transaction.sender();
+                let nonce = transaction.nonce();
+                if let Some(lane) = inner.lanes.get_mut(&sender) {
+                    lane.unmine(nonce);
+                }
+            }
+        }
+        self.push(transactions);
+    }
+
+    /// Drops everything at or below `nonce` for `sender`, and records it as
+    /// the sender's mined watermark: a block carrying (sender, nonce) has
+    /// made every lower nonce unusable as well, for good.
     pub fn remove_mined(&self, sender: Address, nonce: u64) {
         let mut inner = self.inner.lock();
         self.drain_inbox(&mut inner);
         inner.remove_mined(sender, nonce);
     }
 
-    /// Drops a batch of mined (sender, nonce) pairs.
+    /// Drops a batch of mined (sender, nonce) pairs and raises the senders'
+    /// mined watermarks, so nothing at or below them can be queued again.
+    /// For canonical blocks only -- see [`Self::remove_mined_batch_collecting`]
+    /// for a block of this node's that consensus has not committed yet.
     pub fn remove_mined_batch(&self, mined: impl IntoIterator<Item = (Address, u64)>) {
         let mut inner = self.inner.lock();
         self.drain_inbox(&mut inner);
@@ -255,6 +335,11 @@ impl<T: PoolTransaction> TxQueue<T> {
 
     /// [`Self::remove_mined_batch`], returning what it removed from the
     /// lanes and from the build's taken list, for [`Self::hold_own_block`].
+    ///
+    /// The block is this node's own and not committed yet, so unlike the
+    /// canonical prune this does *not* raise the senders' mined watermarks:
+    /// [`Self::settle_own_block`] has to be able to give these back if
+    /// consensus commits another block at the height.
     pub fn remove_mined_batch_collecting(
         &self,
         mined: impl IntoIterator<Item = (Address, u64)>,
@@ -322,11 +407,14 @@ impl<T: PoolTransaction> TxQueue<T> {
             // The same hash, or a height already behind the chain: dropped.
         }
         inner.held = kept;
-        let count = back.len();
-        if count > 0 {
-            inner.give_back(back);
+        if back.is_empty() {
+            return 0;
         }
-        count
+        // The committed block at this height may have mined a higher nonce
+        // for a sender than the held one carries; `carried` is an exact
+        // (sender, nonce) test, so the lane's watermark is what catches
+        // those.
+        inner.give_back(back).offered
     }
 
     /// Forgets the transactions the build on `parent` took that a block has
@@ -392,6 +480,16 @@ impl<T: PoolTransaction> TxQueue<T> {
             let mut inner = self.inner.lock();
             self.drain_inbox(&mut inner);
             match inner.last_build.take() {
+                // "The same parent again" does not mean the block built from
+                // that take was not committed: with two builds in flight on
+                // one parent the first one's block can be committed and
+                // pruned before this call, and everything re-offered here
+                // would then be stale for the rest of the leg -- the
+                // canonical pruner never revisits that block (round 44:
+                // 169,293 re-offered against a block of 163,000, then
+                // 814,431 stale refusals and builds of 3.4-4.1 s). The
+                // lanes' mined watermark decides, per sender, inside
+                // `give_back`.
                 Some((previous, taken)) if previous == parent => {
                     let count = taken.len();
                     inner.give_back(taken);
@@ -399,9 +497,9 @@ impl<T: PoolTransaction> TxQueue<T> {
                 }
                 // A build on another parent -- a build ahead superseded by the
                 // next block -- took transactions the queue must not lose: they
-                // go back too, and the canonical pruner removes the ones the
-                // chain has meanwhile mined. Dropping them here starved the
-                // builder while the pool sat at its gate (round 38).
+                // go back too, minus the ones the chain has meanwhile mined.
+                // Dropping them all here starved the builder while the pool
+                // sat at its gate (round 38).
                 Some((previous, taken)) if !taken.is_empty() => {
                     let count = taken.len();
                     inner.give_back(taken);
@@ -424,9 +522,9 @@ impl<T: PoolTransaction> Inner<T> {
         let lane = self.lanes.entry(sender).or_insert_with(|| {
             let id = SenderId::from(*next_id);
             *next_id += 1;
-            Lane { by_nonce: BTreeMap::new(), queued: false, id }
+            Lane { by_nonce: BTreeMap::new(), queued: false, id, mined: None }
         });
-        if lane.by_nonce.contains_key(&nonce) {
+        if lane.by_nonce.contains_key(&nonce) || lane.is_stale(nonce) {
             return;
         }
         let valid = Arc::new(ValidPoolTransaction {
@@ -452,9 +550,9 @@ impl<T: PoolTransaction> Inner<T> {
         let lane = self.lanes.entry(sender).or_insert_with(|| {
             let id = SenderId::from(*next_id);
             *next_id += 1;
-            Lane { by_nonce: BTreeMap::new(), queued: false, id }
+            Lane { by_nonce: BTreeMap::new(), queued: false, id, mined: None }
         });
-        if lane.by_nonce.contains_key(&nonce) {
+        if lane.by_nonce.contains_key(&nonce) || lane.is_stale(nonce) {
             return;
         }
         lane.by_nonce.insert(nonce, valid);
@@ -467,12 +565,30 @@ impl<T: PoolTransaction> Inner<T> {
 
     /// Puts transactions a build took back at their nonces; their senders go
     /// to the front so they are offered before anything newer.
-    fn give_back(&mut self, taken: Vec<Arc<ValidPoolTransaction<T>>>) {
+    ///
+    /// Everything that comes back passes the lane's mined watermark, the
+    /// same filter the canonical prune applies: a transaction the chain has
+    /// mined must not re-enter the lanes by any door. It can reach here
+    /// after its block was pruned -- a build that took it before the block
+    /// committed hands its leftovers back when it ends, a second build on
+    /// one parent gives the first build's take back, an own block held at a
+    /// height the chain settled elsewhere comes back -- and nothing would
+    /// remove it a second time.
+    fn give_back(&mut self, taken: Vec<Arc<ValidPoolTransaction<T>>>) -> GaveBack {
         let mut senders: Vec<Address> = Vec::new();
+        let mut gave = GaveBack::default();
         for valid in taken {
             let sender = valid.sender();
             let nonce = valid.nonce();
-            let Some(lane) = self.lanes.get_mut(&sender) else { continue };
+            let Some(lane) = self.lanes.get_mut(&sender) else {
+                gave.filtered += 1;
+                continue;
+            };
+            if lane.is_stale(nonce) {
+                gave.filtered += 1;
+                continue;
+            }
+            gave.offered += 1;
             if lane.by_nonce.insert(nonce, valid).is_none() {
                 self.len += 1;
             }
@@ -484,10 +600,12 @@ impl<T: PoolTransaction> Inner<T> {
         for sender in senders.into_iter().rev() {
             self.arrivals.push_front(sender);
         }
+        gave
     }
 
     fn remove_mined(&mut self, sender: Address, nonce: u64) {
         let Some(lane) = self.lanes.get_mut(&sender) else { return };
+        lane.mine(nonce);
         let keep = lane.by_nonce.split_off(&(nonce + 1));
         self.len -= lane.by_nonce.len();
         lane.by_nonce = keep;
@@ -675,11 +793,28 @@ impl<T: PoolTransaction> BestTransactions for QueueBest<T> {
     /// one (nonce below the account's) is dropped instead.
     fn mark_invalid(&mut self, transaction: &Self::Item, kind: InvalidPoolTransactionError) {
         let sender = transaction.sender();
-        self.skipped.insert(sender);
         let stale = matches!(&kind, InvalidPoolTransactionError::Consensus(err) if err.is_nonce_too_low());
         if stale {
+            // The chain is past this nonce. It used to be left in the build's
+            // taken list -- not given back, but not forgotten either -- so the
+            // next give-back on that parent put it in the lanes again, and
+            // every build of this leader took it, refused it and gave it back
+            // (round 44). Drop it and everything below it for this sender,
+            // and mark the lane so no give-back can bring it back.
+            //
+            // The sender is deliberately not skipped for the rest of this
+            // build: its higher nonces are what the chain wants next, and
+            // this one being stale says nothing against them.
+            let mut inner = self.queue.inner.lock();
+            if let Some((_, taken)) = inner.last_build.as_mut()
+                && let Some(at) = taken.iter().rposition(|t| Arc::ptr_eq(t, transaction))
+            {
+                taken.remove(at);
+            }
+            inner.remove_mined(sender, transaction.nonce());
             return;
         }
+        self.skipped.insert(sender);
         let mut inner = self.queue.inner.lock();
         if let Some((_, taken)) = inner.last_build.as_mut() {
             // The refused transaction is the one just yielded or one of the
@@ -872,6 +1007,124 @@ mod tests {
         ]);
         let mut best = queue.best_for_build(B256::repeat_byte(9));
         assert!(best.next().is_none());
+    }
+
+    /// The fleet's sequence (round 44): two builds in flight on one parent.
+    /// The second build's start gives the first's take back to the lanes, the
+    /// first seals its block from that take anyway, and the chain commits and
+    /// prunes it -- after which the second build's leftovers come back. A
+    /// mined transaction that lands in the lanes here is never removed again:
+    /// the canonical pruner does not revisit that block.
+    #[test]
+    fn a_take_the_chain_mined_is_not_offered_again_on_the_same_parent() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
+        queue.push([tx(1, 0), tx(1, 1), tx(2, 0)]);
+        let parent = B256::repeat_byte(3);
+        let mut first = queue.best_for_build(parent);
+        let took: Vec<_> = std::iter::from_fn(|| first.next()).collect();
+        assert_eq!(took.len(), 3);
+        // The second build on the same parent: the first's take goes back.
+        let mut second = queue.best_for_build(parent);
+        let retook: Vec<_> = std::iter::from_fn(|| second.next()).collect();
+        assert_eq!(retook.len(), 3, "the take was offered again: nothing was mined yet");
+        // The first build's block is committed and pruned as mined.
+        queue.remove_mined_batch([(Address::repeat_byte(1), 1), (Address::repeat_byte(2), 0)]);
+        // The second build ends and hands back what it did not build, as the
+        // builder's leftovers do -- after the prune.
+        for transaction in &retook {
+            second.mark_invalid(transaction, InvalidPoolTransactionError::ExceedsGasLimit(21_000, 30_000_000));
+        }
+        drop(second);
+        assert!(queue.is_empty(), "mined transactions were offered again");
+        // And a build on the same parent again offers none of them.
+        let mut third = queue.best_for_build(parent);
+        assert!(third.next().is_none());
+    }
+
+    /// The give-back the same-parent arm is there for: nothing was committed,
+    /// so the whole take is offered again.
+    #[test]
+    fn a_take_the_chain_did_not_mine_is_offered_again_on_the_same_parent() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
+        queue.push([tx(1, 0), tx(1, 1), tx(2, 0)]);
+        let parent = B256::repeat_byte(3);
+        let mut first = queue.best_for_build(parent);
+        let took: Vec<(u8, u64)> = std::iter::from_fn(|| first.next()).map(|t| (t.sender().as_slice()[0], t.nonce())).collect();
+        assert_eq!(took.len(), 3);
+        drop(first);
+        let mut second = queue.best_for_build(parent);
+        let again: Vec<(u8, u64)> = std::iter::from_fn(|| second.next()).map(|t| (t.sender().as_slice()[0], t.nonce())).collect();
+        assert_eq!(again, took);
+    }
+
+    /// The superseded-parent arm with a take the chain mined part of: only
+    /// the unmined part comes back.
+    #[test]
+    fn a_superseded_build_offers_back_only_what_the_chain_did_not_mine() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
+        queue.push([tx(1, 0), tx(1, 1), tx(1, 2), tx(2, 0)]);
+        let parent = B256::repeat_byte(1);
+        let mut build = queue.best_for_build(parent);
+        let took: Vec<_> = std::iter::from_fn(|| build.next()).collect();
+        assert_eq!(took.len(), 4);
+        // The account is at nonce 2: the build refuses (1,1) as stale, which
+        // makes (1,0) -- still in the take -- stale as well.
+        let stale = took
+            .iter()
+            .find(|t| t.sender() == Address::repeat_byte(1) && t.nonce() == 1)
+            .expect("taken");
+        build.mark_invalid(
+            stale,
+            InvalidPoolTransactionError::Consensus(InvalidTransactionError::NonceNotConsistent { tx: 1, state: 2 }),
+        );
+        drop(build);
+        // Superseded by a block on another parent: the take goes back, minus
+        // what the chain has passed.
+        let mut next = queue.best_for_build(B256::repeat_byte(2));
+        let mut again: Vec<(u8, u64)> = std::iter::from_fn(|| next.next()).map(|t| (t.sender().as_slice()[0], t.nonce())).collect();
+        again.sort_unstable();
+        assert_eq!(again, vec![(1, 2), (2, 0)]);
+    }
+
+    /// A stale refusal takes the transaction out of the queue for good: no
+    /// give-back and no later arrival brings it back, and the sender's higher
+    /// nonces are still offered in the same build.
+    #[test]
+    fn a_stale_refusal_is_not_offered_again() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
+        queue.push([tx(1, 0), tx(1, 1), tx(1, 2)]);
+        let parent = B256::repeat_byte(5);
+        let mut build = queue.best_for_build(parent);
+        let first = build.next().expect("one queued");
+        assert_eq!(first.nonce(), 0);
+        build.mark_invalid(
+            &first,
+            InvalidPoolTransactionError::Consensus(InvalidTransactionError::NonceNotConsistent { tx: 0, state: 1 }),
+        );
+        assert_eq!(build.next().map(|t| t.nonce()), Some(1), "the sender's higher nonces are still offered");
+        drop(build);
+        // The ingest offers it again: the lane refuses it.
+        queue.push([tx(1, 0)]);
+        let mut next = queue.best_for_build(parent);
+        let again: Vec<u64> = std::iter::from_fn(|| next.next()).map(|t| t.nonce()).collect();
+        assert_eq!(again, vec![1, 2]);
+    }
+
+    /// A reorg puts back what the reverted blocks carried, watermark and all:
+    /// the chain no longer holds those nonces (round 43).
+    #[test]
+    fn a_reorg_gives_back_what_the_watermark_would_have_filtered() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
+        queue.push([tx(1, 0), tx(1, 1)]);
+        let parent = B256::repeat_byte(6);
+        let mut build = queue.best_for_build(parent);
+        assert_eq!(std::iter::from_fn(|| build.next()).count(), 2);
+        drop(build);
+        queue.remove_mined_batch([(Address::repeat_byte(1), 1)]);
+        queue.push_reverted(vec![tx(1, 0), tx(1, 1)]);
+        let mut next = queue.best_for_build(B256::repeat_byte(7));
+        let again: Vec<u64> = std::iter::from_fn(|| next.next()).map(|t| t.nonce()).collect();
+        assert_eq!(again, vec![0, 1]);
     }
 
     #[test]

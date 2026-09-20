@@ -708,6 +708,9 @@ where
     // did for them before. Whatever was pulled and not built is returned
     // by the puller when the build ends, and by the queue's give-back at
     // the next build in any case.
+    // Whether the transactions come from the queue: the selector took it if
+    // one is installed. Only the queue needs to hear about a stale nonce.
+    let from_queue = n42_tx_queue::global::<Pool::Transaction>().is_some();
     let puller = builder_puller();
     let mut pulled: Option<Puller<Pool::Transaction>> = None;
     let mut best_txs = if puller == 0 {
@@ -1488,6 +1491,26 @@ where
                 if error.is_nonce_too_low() {
                     // if the nonce is too low, we can skip this transaction
                     trace!(target: "payload_builder", %error, tx = ?tx_hash, "skipping nonce too low transaction");
+                    // Skipping is enough for the pool, which prunes itself
+                    // against the state. The queue prunes only by canonical
+                    // blocks, so one it offered stale would come back at the
+                    // next give-back and be taken, refused and given back by
+                    // every build of this leader for the rest of the leg
+                    // (round 44: 814,431 refusals on one node, builds of
+                    // 3.4-4.1 s). Told once, it drops that nonce and every
+                    // lower one for the sender for good; the sender's higher
+                    // nonces are still offered.
+                    if from_queue
+                        && let Some(revm::context_interface::result::InvalidTransaction::NonceTooLow { tx, state }) =
+                            reth_evm::InvalidTxError::as_invalid_tx_err(&*error)
+                    {
+                        refuse!(
+                            &pool_tx,
+                            InvalidPoolTransactionError::Consensus(
+                                InvalidTransactionError::NonceNotConsistent { tx: *tx, state: *state }
+                            )
+                        );
+                    }
                 } else {
                     // if the transaction is invalid, we can skip it and all of its
                     // descendants

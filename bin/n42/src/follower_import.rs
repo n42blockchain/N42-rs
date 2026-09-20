@@ -95,24 +95,33 @@ static PARENT_OUTPUTS: Mutex<std::collections::VecDeque<(B256, reth_primitives_t
 /// How many published outputs are kept: the check reads only the parent's.
 const PARENT_OUTPUTS_KEPT: usize = 4;
 
-/// `N42_CHECK_ON_PARENT_OUTPUT=1`: under deferred execution a block's check
-/// reads its senders from the parent's execution output, published by the
-/// parent's import as soon as its execution ends, instead of waiting for the
-/// parent to land in the engine. A follower's vote waited ~200 ms for the
-/// previous import to finish (loop155 A2: its carry, hashed post-state and
-/// engine insert included) although the check reads ~6,000 senders' nonces and
-/// balances, all in the parent's bundle after execution.
+/// Under deferred execution a block's check reads its senders from the
+/// parent's execution output, published by the parent's import as soon as its
+/// execution ends, instead of waiting for the parent to land in the engine. On
+/// by default; `N42_CHECK_ON_PARENT_OUTPUT=0` turns it off.
+///
+/// A follower's vote waited ~200 ms for the previous import to finish
+/// (loop155 A2: its carry, hashed post-state and engine insert included)
+/// although the check reads ~6,000 senders' nonces and balances, all in the
+/// parent's bundle after execution.
 ///
 /// The output is published before the parent's QMDB root, so the includability
 /// half of the check runs while that root is still being computed; the header's
 /// fields -- the parent's state root among them -- are still compared against
 /// this node's result for the parent before the vote, which is what waits for
 /// the root (plan v4 step 1). This block's execution still waits for the parent
-/// in the engine unless [`exec_on_parent_output`] is on. Off until a fleet leg
-/// measures it.
+/// in the engine unless [`exec_on_parent_output`] is on.
+///
+/// Measured on five fleet legs with no invalid block: loop169's three, and
+/// loop183's two at a 275 ms pacing. The pacing is why it read neutral the
+/// first time -- at loop169's 350 ms the pacing sat above the natural cycle,
+/// so nothing that shortens the vote path could show. At 275 ms window 1 reads
+/// 388,814 and 401,741 against 339,784 and 391,021 without it, the round
+/// 26.36M and 27.51M transactions against 26.02M and 24.29M, and R1 vote
+/// collection 153 -> 106 ms where the pair is comparable.
 fn check_on_parent_output() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_CHECK_ON_PARENT_OUTPUT").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var("N42_CHECK_ON_PARENT_OUTPUT").map_or(true, |v| v != "0"))
 }
 
 /// `N42_FOLLOWER_EXEC_ON_PARENT_OUTPUT=1`: the block is *executed* on the
@@ -124,9 +133,12 @@ fn check_on_parent_output() -> bool {
 /// for it on top).
 ///
 /// It reads the same published output as [`check_on_parent_output`], so it
-/// implies that path; with it on and the check's flag off the check still runs
+/// implies that path; with it on and that flag set to 0 the check still runs
 /// on the output, because the parent whose state it would otherwise read is by
-/// construction not in the tree. Off until a fleet leg measures it.
+/// construction not in the tree. Off by default, and it stays off: loop183
+/// measured a 0-1 ms median overlap of its two roads at a 275 ms pacing (the
+/// parent's fields are filed before the child's check passes), so it has
+/// nothing to gain until the cycle is shorter.
 fn exec_on_parent_output() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("N42_FOLLOWER_EXEC_ON_PARENT_OUTPUT").is_ok_and(|v| v == "1"))

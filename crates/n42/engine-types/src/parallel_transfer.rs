@@ -647,6 +647,128 @@ impl StagedGraft {
     }
 }
 
+/// A staged graft split across shards, one lock each, so the batches fold
+/// into it at the same time instead of queueing on one mutex.
+///
+/// Which shard an account belongs to is the top byte of its address, so a
+/// batch's accounts spread over every shard and two batches collide only on
+/// the shard, never on the account -- the fold itself is the same work as
+/// [`StagedGraft`]'s, done in parallel. What the shards cannot do is become
+/// reth's `BundleState`, which is one map: [`ShardedGraft::merge`] builds that
+/// and is the cost this design has to move off the chain rather than remove
+/// (see `docs/FLEET7_PATH_AUDIT.md`, the graft's representation).
+#[derive(Debug)]
+pub struct ShardedGraft {
+    beneficiary: Address,
+    shards: Vec<std::sync::Mutex<GraftShard>>,
+    capacity: usize,
+}
+
+/// One shard's accounts and the reverts of the blocks that filled it.
+#[derive(Debug, Default)]
+pub struct GraftShard {
+    state: alloy_primitives::map::AddressHashMap<BundleAccount>,
+    state_size: usize,
+    reverts: Vec<(Address, AccountRevert)>,
+    beneficiary_delta: U256,
+}
+
+impl ShardedGraft {
+    /// `shards` locks over an expected `capacity` accounts.
+    pub fn new(beneficiary: Address, capacity: usize, shards: usize) -> Self {
+        let shards = (0..shards.max(1))
+            .map(|_| std::sync::Mutex::new(GraftShard::default()))
+            .collect();
+        Self { beneficiary, shards, capacity }
+    }
+
+    fn shard_of(&self, address: &Address) -> usize {
+        (address.0[0] as usize) * self.shards.len() / 256
+    }
+
+    /// Folds one batch's bundle in, taking each shard's lock once for the run
+    /// of accounts that belongs to it.
+    pub fn add(&self, bundle: BundleState) {
+        let BundleState { state: accounts, mut reverts, .. } = bundle;
+        let taken = std::mem::take(&mut *reverts);
+        // Sorted into the shards first, with no lock held: the locks are then
+        // taken once each rather than once an account.
+        let mut by_shard: Vec<Vec<(Address, BundleAccount)>> = vec![Vec::new(); self.shards.len()];
+        for (address, account) in accounts {
+            by_shard[self.shard_of(&address)].push((address, account));
+        }
+        let mut reverts_by_shard: Vec<Vec<(Address, AccountRevert)>> = vec![Vec::new(); self.shards.len()];
+        for (address, revert) in taken.into_iter().flatten() {
+            reverts_by_shard[self.shard_of(&address)].push((address, revert));
+        }
+        let per_shard = self.capacity / self.shards.len() + 1;
+        for (index, run) in by_shard.into_iter().enumerate() {
+            let reverts = std::mem::take(&mut reverts_by_shard[index]);
+            if run.is_empty() && reverts.is_empty() {
+                continue;
+            }
+            let mut shard = self.shards[index].lock().expect("a graft shard's lock");
+            if shard.state.is_empty() {
+                shard.state.reserve(per_shard);
+                shard.reverts.reserve(per_shard);
+            }
+            let mut repeated: alloy_primitives::map::AddressHashSet = Default::default();
+            for (address, account) in run {
+                let Some(info) = account.info.as_ref() else { continue };
+                let (new_balance, new_nonce) = (info.balance, info.nonce);
+                let (old_balance, old_nonce) = match &account.original_info {
+                    Some(orig) => (orig.balance, orig.nonce),
+                    None => (U256::ZERO, 0),
+                };
+                if address == self.beneficiary {
+                    shard.beneficiary_delta = shard.beneficiary_delta.saturating_add(new_balance.saturating_sub(old_balance));
+                    repeated.insert(address);
+                    continue;
+                }
+                if let Some(staged) = shard.state.get_mut(&address).and_then(|a| a.info.as_mut()) {
+                    repeated.insert(address);
+                    staged.balance = if new_balance >= old_balance {
+                        staged.balance.saturating_add(new_balance - old_balance)
+                    } else {
+                        staged.balance.saturating_sub(old_balance - new_balance)
+                    };
+                    staged.nonce += new_nonce - old_nonce;
+                    continue;
+                }
+                shard.state_size += account.size_hint();
+                shard.state.insert(address, account);
+            }
+            for (address, revert) in reverts {
+                if !repeated.contains(&address) {
+                    shard.reverts.push((address, revert));
+                }
+            }
+        }
+    }
+
+    /// The one map reth's `BundleState` is: every shard's accounts moved into
+    /// it. This is the part the shards do not remove.
+    pub fn merge(self) -> (alloy_primitives::map::AddressHashMap<BundleAccount>, usize, Vec<(Address, AccountRevert)>, U256) {
+        let mut state: alloy_primitives::map::AddressHashMap<BundleAccount> = Default::default();
+        state.reserve(self.capacity);
+        let mut reverts = Vec::with_capacity(self.capacity);
+        let (mut size, mut delta) = (0usize, U256::ZERO);
+        for shard in self.shards {
+            let shard = shard.into_inner().expect("a graft shard's lock");
+            size += shard.state_size;
+            delta = delta.saturating_add(shard.beneficiary_delta);
+            state.extend(shard.state);
+            reverts.extend(shard.reverts);
+        }
+        (state, size, reverts, delta)
+    }
+
+    /// The accounts staged, over every shard.
+    pub fn accounts(&self) -> usize {
+        self.shards.iter().map(|shard| shard.lock().expect("a graft shard's lock").state.len()).sum()
+    }
+}
+
 /// Puts a [`StagedGraft`] on the block's state: its bundle becomes the block's
 /// where the block has none yet (the usual case for a block whose transfers
 /// all ran in the parallel step), and is grafted account by account where it
@@ -1913,8 +2035,32 @@ mod tests {
             assert_eq!(installed.accounts, graft.accounts, "the staged graft holds the same accounts");
             assert_eq!(installed.beneficiary_delta, graft.beneficiary_delta);
             assert_eq!(streamed_run.executed.len(), run.executed.len());
+            // The same block again with the fold spread over shards, one lock
+            // each: what the single mutex costs the parallel step is the
+            // question (loop176: +65 ms on the fleet), and what the shards
+            // cannot remove is the one map reth's bundle is.
+            let shard_count: usize = std::env::var("BENCH_GRAFT_SHARDS").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+            let at = std::time::Instant::now();
+            let sharded = ShardedGraft::new(beneficiary, keys.len(), shard_count);
+            let shard_sink = |bundle: BundleState| sharded.add(bundle);
+            let sharded_run =
+                execute_for_build_with(&evm_env, &keys, &|i| ((), envs[i].clone()), &|| Some(db.clone()), Some(&shard_sink))
+                    .expect("a block of transfers");
+            let sharded_groups = at.elapsed();
+            let staged_accounts = sharded.accounts();
+            let at = std::time::Instant::now();
+            let (merged_state, _size, merged_reverts, merged_delta) = sharded.merge();
+            let merged_ms = at.elapsed();
+            assert_eq!(sharded_run.executed.len(), run.executed.len());
+            assert_eq!(merged_state.len(), graft.accounts, "the shards hold what the graft does");
+            assert_eq!(staged_accounts, graft.accounts);
+            assert_eq!(merged_delta, graft.beneficiary_delta);
+            assert_eq!(merged_reverts.len(), graft.reverts.len());
             eprintln!(
                 "round {round}: streamed: execution+fold {streamed_groups:?} (exec alone was {groups:?}), install {installed_ms:?}  ==  after: execution {groups:?} + graft {grafted:?}"
+            );
+            eprintln!(
+                "round {round}: sharded ({shard_count} shards): execution+fold {sharded_groups:?}, merge to one map {merged_ms:?}"
             );
             let at = std::time::Instant::now();
             state.merge_transitions(BundleRetention::Reverts);

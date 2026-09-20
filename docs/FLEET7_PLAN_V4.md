@@ -52,8 +52,11 @@ constraint went unseen for ten loops.
 **Step 1 -- the check reads the parent's output the moment its execution ends.** `N42_CHECK_ON_PARENT_OUTPUT`
 publishes the parent's execution output when the parent's QMDB root is filed; publish it when the execution
 finishes instead (the check needs ~6,000 senders' nonces and balances, all in the bundle) and turn it on. This takes
-the root (27 ms) and the engine insert (38 ms) out of R1. Expect R1 ~287 -> ~200. Falsified if R1 does not move with
-the pacing out of the way, or any invalid block or gas-used mismatch appears.
+the engine insert (38 ms) out of R1 and lets the sender check overlap the root (27 ms) rather than follow it. The
+root itself stays on the vote path: the child's header carries the parent's state root and a follower must compare
+it with its own before it votes. Expect R1 ~287 -> ~220. The flag as it stands was only ever judged under the 350 ms
+pacing (loop169), so its first leg is a rerun at the pacing step 0 settles on, with no code. Falsified if R1 does not
+move with the pacing out of the way, or any invalid block or gas-used mismatch appears.
 
 **Step 2 -- a follower executes N+1 on N's output, not on the engine's tree.** The follower-side twin of
 build-on-seal: lay N's execution output over the state at N-1 (`opener_on_built_parent` already does this for the
@@ -92,3 +95,14 @@ that is the number this box can give, and the rest of the way is a machine per n
   and, after step 2, the build-to-build chain count.
 - Do not kill a runner without its fleet, or edit a crate between a runner's build and its claim: the runner's
   cleanup takes the fleet down now and its guard refuses a stale binary, but both cost a box window when tripped.
+
+## 4. How this plan is run
+
+One session holds the plan and the box: it decides the order, launches every runner, reads each leg against its
+step's criterion, merges, and amends this document. Implementation goes to agents that start from nothing but a
+brief: each works in its own git worktree, builds into `target/agents`, runs no cargo while a measurement holds the
+box, never touches a runner, the claim files or a process, and hands back a branch (`plan-v4/<step>`) and a report
+of what changed, what was tested and what could not be verified. Nothing reaches `feat/native-fleet7` unmerged by
+the commander, and no crate is edited in the main checkout between a runner's build and its claim. Results are
+appended to `FLEET7_PATH_AUDIT.md` section 9 as each step is judged; a step that fails its criterion is recorded
+there with its numbers and dropped.

@@ -248,11 +248,21 @@ moved from ~308k to ~340-360k and the round to 33.36M. The WAL sync adds a littl
 By-hash RPC lookups (`eth_getTransactionByHash`, receipts by hash) do not work on a node run this way: for a
 validator that is a fair trade, for an RPC node it is not, so it is a role's setting rather than a default.
 
-**Two legs of six fell into a slow regime that is none of the things measured so far**: full blocks, memory free,
-no serial fallback, no invalid block, no TC, the pools at their gate -- and a cycle of 1.7-2.7 s, with the leaders'
-early-seal builds stopping. It appears only in legs with the 1e24 fee cap (loop186 G1a may be the same thing rather
-than the memory stall it was read as), so the base fee's magnitude late in a full round is the first suspect. Being
-traced.
+**Two legs of six fell into a slow regime: defect 10, the queue gives a mined block's transactions back.** Full
+blocks, memory free, no serial fallback, no invalid block, no TC -- and a cycle of 1.7-2.7 s. It is not the fee cap
+(the first suspect: healthy legs cycle at 0.46 s with the base fee at 1.8e19, K1a fell at 1e8, and every fee, balance
+and arithmetic refusal is 0 in all five legs). At a tenure handover a node had two builds in flight on one parent;
+the block from the first had been committed and its 163,000 transactions pruned as mined, and the second
+`best_for_build` on the same parent took the arm "previous build on the same parent was not committed; its
+transactions are offered again" -- `count=169293` (K1a node3), `166216` (K2a node6), where healthy legs log 0
+(`crates/n42/tx-queue/src/lib.rs` ~386). Nothing removes them again. From then on every build of that leader meets
+them: each is refused for a stale nonce (814,431 and 743,464 refusals against <= 17,300 anywhere else), a refusal
+skips the rest of its sender's group, any skip in the parallel step disables the early seal, and the serial tail
+waits ~2.8 s in the puller getting past them: a 250 ms build becomes 3.4-4.1 s. Followers' imports and the votes stay
+flat throughout. loop186 G1a and loop177's two "stalled" legs read the same way and were probably this. A weak form
+(7-17k stale transactions that clear) shows on healthy legs from the superseded-parent give-back a few lines below.
+Fix in progress (branch `plan-v4/queue-giveback`): nothing at or below a sender's mined nonce re-enters the lanes,
+and a stale-nonce refusal removes the transaction for good.
 
 ## 3. What not to do
 

@@ -48,6 +48,12 @@ RPCBATCH=100
 # and this genesis funds its accounts with far more than any round can spend.
 # At 1e14 the cap is not reached until roughly ninety-eight consecutive full
 # blocks, which covers three thirty-second windows.
+# The flood's fee cap. Full blocks raise the base fee 12.5% each, so ANY cap is a block count: from the ~800 wei a
+# round starts at, 1e14 is reached after ~156 full blocks -- inside the third window of every round since the chain
+# passed ~2.5 blocks a second. From there the flood is priced out, the blocks run half empty around the cap
+# (occupancy 53-55%, loop179-185) and the round's total reads 156 full blocks whatever was being measured. A round
+# that means to stay full for its 90 s passes --gasprice 1000000000000000000000000 (1e24: ~412 full blocks; the
+# funding stays inside u128 at 6,000 senders x 10,000 transactions).
 GASPRICE=100000000000000
 GASCEIL=
 PROFILE_NODE=-1
@@ -359,7 +365,9 @@ if (( BASEFEE > DECAY_TARGET )); then
   exit 1
 fi
 echo "base fee     : $BASEFEE wei against a $GASPRICE cap"
-if (( BASEFEE >= GASPRICE )); then
+# Compared as big integers: a price cap above 2^63 is an ordinary thing to ask for (see the note on
+# GASPRICE above) and bash arithmetic wraps there.
+if python3 -c "import sys; sys.exit(0 if int(sys.argv[1]) >= int(sys.argv[2]) else 1)" "$BASEFEE" "$GASPRICE"; then
   echo "REFUSING: the base fee is at or above the flood's price; this round would die in funding"
   exit 1
 fi

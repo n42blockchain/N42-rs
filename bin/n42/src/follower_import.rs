@@ -86,8 +86,8 @@ pub fn note_import_landed() {
 /// The execution output of a block imported here, as its child's check reads it.
 type ParentOutput = Arc<reth_provider::BlockExecutionOutput<n42_tx_types::Receipt>>;
 
-/// The last blocks imported here, published once their QMDB root is filed and
-/// before the engine takes them (`N42_CHECK_ON_PARENT_OUTPUT`).
+/// The last blocks imported here, published as soon as their execution ends
+/// and before the engine takes them (`N42_CHECK_ON_PARENT_OUTPUT`).
 static PARENT_OUTPUTS: Mutex<std::collections::VecDeque<(B256, reth_primitives_traits::SealedHeader, ParentOutput)>> =
     Mutex::new(std::collections::VecDeque::new());
 
@@ -96,13 +96,18 @@ const PARENT_OUTPUTS_KEPT: usize = 4;
 
 /// `N42_CHECK_ON_PARENT_OUTPUT=1`: under deferred execution a block's check
 /// reads its senders from the parent's execution output, published by the
-/// parent's import as soon as its root is filed, instead of waiting for the
+/// parent's import as soon as its execution ends, instead of waiting for the
 /// parent to land in the engine. A follower's vote waited ~200 ms for the
 /// previous import to finish (loop155 A2: its carry, hashed post-state and
 /// engine insert included) although the check reads ~6,000 senders' nonces and
-/// balances, all in the parent's bundle after execution. The parent's
-/// execution fields must still be recorded, and this block's execution still
-/// waits for the parent in the engine. Off until a fleet leg measures it.
+/// balances, all in the parent's bundle after execution.
+///
+/// The output is published before the parent's QMDB root, so the includability
+/// half of the check runs while that root is still being computed; the header's
+/// fields -- the parent's state root among them -- are still compared against
+/// this node's result for the parent before the vote, which is what waits for
+/// the root (plan v4 step 1). This block's execution still waits for the parent
+/// in the engine. Off until a fleet leg measures it.
 fn check_on_parent_output() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("N42_CHECK_ON_PARENT_OUTPUT").is_ok_and(|v| v == "1"))
@@ -121,14 +126,19 @@ fn publish_parent_output(block_hash: B256, header: reth_primitives_traits::Seale
     note_import_landed();
 }
 
-/// The parent's header and published execution output, once its execution
-/// fields are recorded; `None` as soon as `parent_in` says the parent is in
+/// The parent's header and published execution output, as soon as its
+/// execution ends; `None` as soon as `parent_in` says the parent is in
 /// the engine without one, or if neither happens within [`PARENT_WAIT`].
 /// Only this path publishes: a parent this node built, or one the engine
 /// imported by its own path, never appears, and waiting the whole
 /// [`PARENT_WAIT`] for it put three seconds before the child's vote. Behind
 /// a 350 ms cycle the child then missed its own import, went by the engine's
 /// path too, and so did every block after it (loop156 C1).
+///
+/// The parent's execution *fields* are not waited for here: they complete
+/// with its QMDB root, and the whole point is that the child's includability
+/// check runs while that root is computed. The comparison that needs them
+/// ([`wait_for_parent_fields`]) waits for them before the vote.
 fn wait_for_parent_output(
     parent_hash: B256,
     parent_in: impl Fn() -> bool,
@@ -144,9 +154,7 @@ fn wait_for_parent_output(
             .find(|(hash, _, _)| *hash == parent_hash)
             .map(|(_, header, output)| (header.clone(), Arc::clone(output)));
         if let Some(found) = found {
-            if n42_engine_types::executed_fields::get(&parent_hash).is_some() {
-                return Some(found);
-            }
+            return Some(found);
         }
         if parent_in() {
             return None;
@@ -161,6 +169,20 @@ fn wait_for_parent_output(
             .unwrap_or_else(|p| p.into_inner());
         seen = *guard;
     }
+}
+
+/// Waits for the parent's execution fields, the half of the check the
+/// includability pass does not cover: the header carries the parent's state
+/// root, receipts root, logs bloom and gas, and
+/// `validate_header_against_parent` compares them against what this node
+/// executed. The state root is filed by the parent's own QMDB root job, so
+/// on the published-output path this is the one thing the vote still owes the
+/// parent's root -- run after the includability check, which the root
+/// computes beside.
+fn wait_for_parent_fields(parent_hash: B256) -> Result<(), String> {
+    n42_engine_types::executed_fields::wait_for(&parent_hash, PARENT_WAIT)
+        .map(|_| ())
+        .ok_or_else(|| format!("parent {parent_hash}'s execution fields not recorded within {PARENT_WAIT:?}"))
 }
 
 /// A sender's account after the parent, from the parent's execution output:
@@ -540,11 +562,29 @@ where
             None => (wait_for_parent(provider, parent_hash, chain_spec.genesis(), deferred)?, None),
         },
     };
-    consensus
-        .validate_header_against_parent(recovered.sealed_header(), &parent)
-        .map_err(|err| format!("header against parent: {err}"))?;
-    if deferred {
+    let against_parent = || {
+        consensus
+            .validate_header_against_parent(recovered.sealed_header(), &parent)
+            .map_err(|err| format!("header against parent: {err}"))
+    };
+    if !deferred {
+        against_parent()?;
+    } else {
+        // What the vote attests: the header's execution fields are this
+        // node's result for the parent, and every transaction is includable
+        // on the parent's post-state.
+        //
+        // On the parent's published output the two run in the other order and
+        // overlap. The includability check reads ~6,000 senders' nonces and
+        // balances, all of them in the parent's bundle the moment its
+        // execution ends; the fields comparison needs the parent's state
+        // root, which its QMDB root job files while this check runs (plan v4
+        // step 1: the parent's root and engine insert were 65 ms of a 287 ms
+        // R1 vote collection, loop179).
         let check_at = std::time::Instant::now();
+        if parent_output.is_none() {
+            against_parent()?;
+        }
         check_includable(
             provider,
             parent_hash,
@@ -553,10 +593,16 @@ where
             chain_spec.chain().id(),
             spec_for_intrinsic_gas(chain_spec, recovered.timestamp),
         )?;
+        let fields_at = std::time::Instant::now();
+        if parent_output.is_some() {
+            wait_for_parent_fields(parent_hash)?;
+            against_parent()?;
+        }
         tracing::debug!(
             target: "n42.follower_import",
             number,
             check_ms = check_at.elapsed().as_millis() as u64,
+            fields_ms = fields_at.elapsed().as_millis() as u64,
             "checked: the header carries the parent's result and the transactions are includable"
         );
         if let Some(checked) = checked {
@@ -638,6 +684,17 @@ where
         .validate_block_post_execution(&recovered, &output.result, None, None)
         .map_err(|err| format!("post-execution: {err}"))?;
     let checks_ms = checks_at.elapsed().as_millis() as u64;
+    let execution_output = Arc::new(output);
+    // The child's check can start now: its ~6,000 senders are in this
+    // bundle, and it has no use for the QMDB root below -- only the fields
+    // comparison has, and that one waits for it on its own
+    // ([`wait_for_parent_fields`]). Published after the post-execution
+    // checks, so nothing is published for a block whose receipts or gas were
+    // refused, and before the root, which is the ~27 ms the child's check now
+    // runs beside (plan v4 step 1).
+    if deferred && check_on_parent_output() {
+        publish_parent_output(block_hash, recovered.clone_sealed_header(), Arc::clone(&execution_output));
+    }
     // The carry for the next block: this block's post-state over the reads.
     // The carry: this block's post-state over the reads, for the next block.
     // Nothing reads it until the next import, ~650 ms away, so with
@@ -649,7 +706,7 @@ where
     let carry_at = std::time::Instant::now();
     let carry_async = carry_async();
     if !carry_async && !parallel_executed {
-        fill_carry(&mut cached, &output.state, block_hash, carry);
+        fill_carry(&mut cached, &execution_output.state, block_hash, carry);
     }
     let carry_ms = carry_at.elapsed().as_millis() as u64;
 
@@ -662,7 +719,7 @@ where
     // needs the other's result, but they run one after the other: 63 and 26 ms
     // of a 438 ms import (round 43, loop99). `N42_ROOT_HASHED_PARALLEL=1` puts
     // them on the worker pool together.
-    let bundle = &output.state;
+    let bundle = &execution_output.state;
     let root_job = || -> Result<B256, String> {
         if deferred {
             // The header carries the parent's root (checked against the
@@ -737,10 +794,6 @@ where
         (both, 0, hashed?)
     };
 
-    let execution_output = Arc::new(output);
-    if deferred && check_on_parent_output() {
-        publish_parent_output(block_hash, recovered.clone_sealed_header(), Arc::clone(&execution_output));
-    }
     if carry_async && !parallel_executed {
         let state = Arc::clone(&execution_output);
         let carry = Arc::clone(carry);
@@ -877,6 +930,47 @@ mod parent_output_tests {
         let account = account_after_parent(&bundle, &destroyed).expect("destroyed by the parent");
         assert_eq!((account.nonce, account.balance), (0, U256::ZERO));
         assert!(account_after_parent(&bundle, &untouched).is_none());
+    }
+
+    /// The two halves of a follower's vote, overlapped (plan v4 step 1): the
+    /// parent's output is published when its execution ends, so the
+    /// includability check reads its senders' nonces and balances while the
+    /// parent's QMDB root is still being computed -- and the comparison of the
+    /// header's execution fields, which needs that root, waits for it.
+    #[test]
+    fn the_output_is_published_before_the_root_and_only_the_fields_wait_for_it() {
+        let parent_hash = B256::with_last_byte(0x51);
+        let sender = Address::with_last_byte(0x52);
+        let bundle = BundleState::new(
+            [(
+                sender,
+                Some(AccountInfo { nonce: 4, balance: U256::from(10), ..Default::default() }),
+                Some(AccountInfo { nonce: 5, balance: U256::from(7), ..Default::default() }),
+                Default::default(),
+            )],
+            Vec::<Vec<(Address, Option<Option<AccountInfo>>, Vec<(U256, U256)>)>>::new(),
+            Vec::new(),
+        );
+        let header = reth_primitives_traits::SealedHeader::seal_slow(alloy_consensus::Header::default());
+        let output = Arc::new(reth_provider::BlockExecutionOutput { result: Default::default(), state: bundle });
+        publish_parent_output(parent_hash, header, output);
+
+        // What the check needs is there with no root filed.
+        let (_, output) = wait_for_parent_output(parent_hash, || false).expect("published when the execution ended");
+        assert_eq!(account_after_parent(&output.state, &sender).map(|account| account.nonce), Some(5));
+        assert!(n42_engine_types::executed_fields::get(&parent_hash).is_none(), "the parent's root is not filed yet");
+
+        // What the fields comparison needs arrives with that root.
+        let filed = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            n42_engine_types::executed_fields::remember_receipts(parent_hash, B256::with_last_byte(0x53), Default::default(), 21_000);
+            n42_engine_types::executed_fields::remember_state_root(parent_hash, B256::with_last_byte(0x54));
+        });
+        let started = std::time::Instant::now();
+        wait_for_parent_fields(parent_hash).expect("the fields complete with the parent's root");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(50), "the comparison did not wait: {:?}", started.elapsed());
+        assert!(started.elapsed() < PARENT_WAIT, "and it woke on the root, not on the deadline");
+        filed.join().expect("the root thread");
     }
 
     /// A parent already in the engine that nothing published (one this node

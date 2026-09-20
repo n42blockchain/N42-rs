@@ -87,7 +87,8 @@ pub fn note_import_landed() {
 type ParentOutput = Arc<reth_provider::BlockExecutionOutput<n42_tx_types::Receipt>>;
 
 /// The last blocks imported here, published as soon as their execution ends
-/// and before the engine takes them (`N42_CHECK_ON_PARENT_OUTPUT`).
+/// and before the engine takes them (`N42_CHECK_ON_PARENT_OUTPUT`,
+/// `N42_FOLLOWER_EXEC_ON_PARENT_OUTPUT`).
 static PARENT_OUTPUTS: Mutex<std::collections::VecDeque<(B256, reth_primitives_traits::SealedHeader, ParentOutput)>> =
     Mutex::new(std::collections::VecDeque::new());
 
@@ -107,10 +108,33 @@ const PARENT_OUTPUTS_KEPT: usize = 4;
 /// fields -- the parent's state root among them -- are still compared against
 /// this node's result for the parent before the vote, which is what waits for
 /// the root (plan v4 step 1). This block's execution still waits for the parent
-/// in the engine. Off until a fleet leg measures it.
+/// in the engine unless [`exec_on_parent_output`] is on. Off until a fleet leg
+/// measures it.
 fn check_on_parent_output() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("N42_CHECK_ON_PARENT_OUTPUT").is_ok_and(|v| v == "1"))
+}
+
+/// `N42_FOLLOWER_EXEC_ON_PARENT_OUTPUT=1`: the block is *executed* on the
+/// parent's published output as well -- the parent's bundle laid over the
+/// chain's state at the grandparent -- instead of waiting for the parent to
+/// land in the engine's tree. The follower-side twin of the leader's
+/// `opener_on_built_parent` (plan v4 step 2: the parent's engine insert was
+/// 38 ms of a 287 ms R1 vote collection, loop179, and N+1's execution waited
+/// for it on top).
+///
+/// It reads the same published output as [`check_on_parent_output`], so it
+/// implies that path; with it on and the check's flag off the check still runs
+/// on the output, because the parent whose state it would otherwise read is by
+/// construction not in the tree. Off until a fleet leg measures it.
+fn exec_on_parent_output() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_EXEC_ON_PARENT_OUTPUT").is_ok_and(|v| v == "1"))
+}
+
+/// Whether an import publishes its execution output for its child at all.
+fn publish_parent_outputs() -> bool {
+    check_on_parent_output() || exec_on_parent_output()
 }
 
 /// Publishes a block's execution output for its child's check.
@@ -403,6 +427,61 @@ where
     checked.into_iter().collect()
 }
 
+/// The parent as an executed block this import reads its post-state from
+/// (`N42_FOLLOWER_EXEC_ON_PARENT_OUTPUT`), or `None` -- with the reason -- to
+/// wait for the parent in the engine as before.
+///
+/// Depth one: everything the parent did not touch is read from the chain's
+/// state at the grandparent, so the grandparent must be in -- known to the
+/// provider and executed here. Two published outputs stacked would need the
+/// grandparent's bundle in the overlay too, and a follower two blocks behind
+/// the chain has a larger problem than the parent's engine insert.
+///
+/// Sound with `N42_HASHED_TABLES=off`, where an import hands the engine an
+/// empty hashed post-state, because the overlay answers `basic_account` and
+/// `storage` from the executed block's *bundle*, not from its hashed state
+/// (reth v2.5.1 `crates/chain-state/src/memory_overlay.rs:114-124` and
+/// `:237-251`; `bytecode_by_hash` at `:253-262` likewise). The only reader of
+/// the hashed state through an overlay is reth's Merkle-Patricia pass
+/// (`trie_input`, `:52-63`, reached from `hashed_post_state` for an account
+/// this block destroyed) -- so while that pass is on, this path is not taken:
+/// the parent's hashed state is not published and the overlay's would be
+/// empty.
+fn overlay_parent<Provider>(
+    provider: &Provider,
+    parent: &reth_primitives_traits::SealedHeader,
+    output: &ParentOutput,
+    genesis: &alloy_genesis::Genesis,
+    deferred: bool,
+    number: u64,
+) -> Option<n42_engine_types::direct_build::ExecutedParent>
+where
+    Provider: StateProviderFactory + HeaderProvider<Header = alloy_consensus::Header> + Sync,
+{
+    let decline = |why: &'static str| {
+        // Counted like the parallel execution's refusals: a leg that reads
+        // medians cannot see a path that quietly never runs.
+        static DECLINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let declined = DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        tracing::info!(target: "n42.follower_import", number, why, declined, "not executing on the parent's output; waiting for the parent in the engine");
+        None
+    };
+    if hashed_state_enabled() {
+        return decline("the hashed post-state pass is on and the parent's is not published");
+    }
+    let grandparent = parent.parent_hash;
+    if !matches!(parent_in(provider, grandparent, genesis, deferred), Ok(Some(_))) {
+        return decline("the grandparent is not imported here");
+    }
+    // The overlay's fallback, opened once here so a missing state is this
+    // fallback rather than a failed import.
+    if let Err(err) = provider.state_by_block_hash(grandparent) {
+        tracing::debug!(target: "n42.follower_import", number, %err, "no state at the grandparent");
+        return decline("no state at the grandparent");
+    }
+    Some(n42_engine_types::direct_build::executed_from_output(parent, Arc::clone(output)))
+}
+
 struct ImportStage(u64);
 
 impl ImportStage {
@@ -550,7 +629,7 @@ where
     // against its post-state.
     let (parent, parent_output) = match parent_known {
         Some(parent) => (parent, None),
-        None => match (deferred && check_on_parent_output())
+        None => match (deferred && publish_parent_outputs())
             .then(|| {
                 wait_for_parent_output(parent_hash, || {
                     parent_in(provider, parent_hash, chain_spec.genesis(), deferred).ok().flatten().is_some()
@@ -610,17 +689,44 @@ where
         }
     }
 
-    // Checked on the parent's published output: its execution still needs
-    // the parent in the engine.
-    if parent_output.is_some() {
-        wait_for_parent(provider, parent_hash, chain_spec.genesis(), deferred)?;
+    // Checked on the parent's published output. Its execution reads the
+    // parent's post-state: the engine's tree at the parent, or -- under
+    // `N42_FOLLOWER_EXEC_ON_PARENT_OUTPUT` -- that same output laid over the
+    // chain's state at the grandparent, which starts this execution when the
+    // parent's ends instead of when the parent reaches the tree.
+    let mut executed_parent = None;
+    if let Some(output) = &parent_output {
+        // The parent may have landed while this block was being checked, and
+        // the engine's tree is the cheaper state when it has it.
+        if exec_on_parent_output() && parent_in(provider, parent_hash, chain_spec.genesis(), deferred)?.is_none() {
+            executed_parent = overlay_parent(provider, &parent, output, chain_spec.genesis(), deferred, number);
+        }
+        if executed_parent.is_none() {
+            wait_for_parent(provider, parent_hash, chain_spec.genesis(), deferred)?;
+        }
     }
     drop(parent_output);
 
     // Execution on the parent's state, then gas, receipts root and bloom
     // against the header.
     let state_at = std::time::Instant::now();
-    let state = provider.state_by_block_hash(parent_hash).map_err(|err| format!("parent state: {err}"))?;
+    // One view of the parent's post-state per caller: the block's own
+    // executor takes the first, each group of a parallel execution one of its
+    // own. Both must be the *same* state -- a group that opened the engine's
+    // tree while the block's executor read the overlay would execute half the
+    // block one block behind.
+    let open_parent_state = || -> Result<reth_provider::StateProviderBox, String> {
+        match &executed_parent {
+            Some(executed) => {
+                let historical = provider
+                    .state_by_block_hash(parent.parent_hash)
+                    .map_err(|err| format!("grandparent state: {err}"))?;
+                Ok(n42_engine_types::direct_build::overlay_on_executed(historical, executed.clone()))
+            }
+            None => provider.state_by_block_hash(parent_hash).map_err(|err| format!("parent state: {err}")),
+        }
+    };
+    let state = open_parent_state()?;
     let state_ms = state_at.elapsed().as_millis() as u64;
     let executed_at = std::time::Instant::now();
     stage.at(3);
@@ -633,7 +739,7 @@ where
     // touches; anything it cannot take falls back to the serial executor.
     let mut output = None;
     if follower_parallel() {
-        let open = || provider.state_by_block_hash(parent_hash).ok().map(StateProviderDatabase::new);
+        let open = || open_parent_state().ok().map(StateProviderDatabase::new);
         match n42_engine_types::parallel_transfer::execute_transfers(
             evm_config,
             &recovered,
@@ -692,7 +798,7 @@ where
     // checks, so nothing is published for a block whose receipts or gas were
     // refused, and before the root, which is the ~27 ms the child's check now
     // runs beside (plan v4 step 1).
-    if deferred && check_on_parent_output() {
+    if deferred && publish_parent_outputs() {
         publish_parent_output(block_hash, recovered.clone_sealed_header(), Arc::clone(&execution_output));
     }
     // The carry for the next block: this block's post-state over the reads.
@@ -709,6 +815,16 @@ where
         fill_carry(&mut cached, &execution_output.state, block_hash, carry);
     }
     let carry_ms = carry_at.elapsed().as_millis() as u64;
+
+    // Executed on the parent's output: the forest computes this block's tree
+    // from the parent's record, which the parent's own root job files, and
+    // nothing has waited for it on this path. It is there by now in the
+    // ordinary case -- the check above already waited for the fields the
+    // parent's root completes -- so this states the ordering rather than
+    // paying for it.
+    if executed_parent.is_some() {
+        wait_for_parent_fields(parent_hash)?;
+    }
 
     // The QMDB root against the header's, which also files the block's tree
     // under its hash for the engine and the next block.
@@ -801,6 +917,16 @@ where
             let mut cached = cached;
             fill_carry(&mut cached, &state.state, block_hash, &carry);
         });
+    }
+
+    // The engine takes an executed block on top of its parent, so the
+    // hand-offs must stay in chain order: a block executed on the parent's
+    // output, rather than on the engine's tree, waits here for the parent to
+    // land. By this point the parent landed long ago -- this block's own
+    // execution and root have run since -- and the wait is the invariant, not
+    // a cost.
+    if executed_parent.is_some() {
+        wait_for_parent(provider, parent_hash, chain_spec.genesis(), deferred)?;
     }
 
     Ok((

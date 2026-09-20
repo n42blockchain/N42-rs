@@ -88,6 +88,54 @@ pub fn executed_under_seal(parent: &SealedHeader, execution: &BuiltExecution) ->
     }
 }
 
+/// The parent as an executed block, as a follower's import holds it while it
+/// executes the next block on it.
+pub type ExecutedParent = ExecutedBlock<N42Primitives>;
+
+/// The follower-side twin of [`executed_under_seal`]: the parent as an
+/// executed block built from the execution output a follower's import
+/// produced for it, under the header consensus sealed.
+///
+/// A follower's import publishes that output when the parent's execution ends
+/// (`bin/n42/src/follower_import.rs`), so the next block can be executed on it
+/// instead of waiting for the parent to reach the engine's tree -- the leader
+/// has built on its own block this way since phase A.
+///
+/// The body is left empty, and that is not a shortcut with a hazard behind
+/// it: the overlay reads accounts, storage and bytecode from
+/// `execution_output` and touches the block only for `BLOCKHASH`, which is
+/// the sealed header's hash and number
+/// (reth v2.5.1 `crates/chain-state/src/memory_overlay.rs:73-82`, `:114-124`,
+/// `:237-262`). It saves the copy of 163,000 transactions
+/// [`executed_under_seal`] pays (~10 ms a block).
+///
+/// The trie data is empty for the same reason: nothing on the read path
+/// consults it, and the caller must keep reth's Merkle-Patricia passes off
+/// (`N42_HASHED_TABLES=off`), since a follower's published output carries no
+/// hashed post-state to put here.
+pub fn executed_from_output(
+    parent: &SealedHeader,
+    output: Arc<reth_execution_types::BlockExecutionOutput<n42_tx_types::Receipt>>,
+) -> ExecutedParent {
+    let sealed = SealedBlock::from_sealed_parts(parent.clone(), n42_tx_types::BlockBody::default());
+    ExecutedBlock {
+        recovered_block: Arc::new(RecoveredBlock::new_sealed(sealed, Vec::new())),
+        execution_output: output,
+        trie_data: LazyTrieData::ready(ComputedTrieData::new(
+            Arc::new(reth_trie::HashedPostState::default().into_sorted()),
+            Arc::new(reth_trie::updates::TrieUpdates::default().into_sorted()),
+        )),
+    }
+}
+
+/// The parent's post-state: `executed` laid over `historical`, the chain's
+/// state at the grandparent. The caller-owned twin of
+/// [`opener_on_built_parent`], for a follower's import, which holds its
+/// provider by reference and opens one view per execution batch.
+pub fn overlay_on_executed(historical: StateProviderBox, executed: ExecutedParent) -> StateProviderBox {
+    Box::new(MemoryOverlayStateProvider::<N42Primitives>::new(historical, vec![executed]))
+}
+
 /// An opener for the parent's post-state: the chain's state at the
 /// grandparent with the parent's bundle laid over it.
 pub fn opener_on_built_parent<C>(client: C, grandparent: B256, executed: ExecutedBlock<N42Primitives>) -> ParentStateOpener
@@ -181,5 +229,49 @@ mod tests {
         assert_eq!(account(&created).map(|a| a.balance), Some(U256::from(7)), "an account the parent created exists");
         assert_eq!(account(&untouched).map(|a| a.nonce), Some(4), "an untouched account reads through to the grandparent");
         assert_eq!(state.block_hash(11).expect("read"), Some(sealed.hash()), "BLOCKHASH of the parent is the sealed hash");
+    }
+
+    /// The same hazard on the follower's side: a block executed on its
+    /// parent's published output must read the parent's post-state, not the
+    /// grandparent's -- and must do so with the empty hashed post-state an
+    /// import produces under `N42_HASHED_TABLES=off`, which is what makes the
+    /// overlay usable there at all.
+    #[test]
+    fn a_read_on_the_parents_output_sees_its_post_state_with_an_empty_hashed_state() {
+        let sender = Address::with_last_byte(1);
+        let created = Address::with_last_byte(2);
+        let untouched = Address::with_last_byte(3);
+        let grandparent = B256::with_last_byte(9);
+
+        // The chain's state at the grandparent, which is what the engine's
+        // tree can answer while the parent is still being imported.
+        let client = MockEthProvider::default();
+        client.add_account(sender, ExtendedAccount::new(4, U256::from(100)));
+        client.add_account(untouched, ExtendedAccount::new(1, U256::from(40)));
+
+        // The parent as the follower's import executed it.
+        let bundle = BundleState::builder(12..=12)
+            .state_present_account_info(sender, AccountInfo { nonce: 5, balance: U256::from(60), ..Default::default() })
+            .state_present_account_info(created, AccountInfo { nonce: 0, balance: U256::from(7), ..Default::default() })
+            .build();
+        let parent = SealedHeader::seal_slow(Header {
+            number: 12,
+            parent_hash: grandparent,
+            extra_data: b"view 9".as_slice().into(),
+            ..Default::default()
+        });
+        let output = Arc::new(BlockExecutionOutput { result: Default::default(), state: bundle });
+
+        let executed = executed_from_output(&parent, output);
+        assert!(executed.trie_data.hashed_state().is_empty(), "an import under N42_HASHED_TABLES=off publishes no hashed state");
+        assert_eq!(executed.recovered_block.hash(), parent.hash(), "the overlay's block carries the hash consensus sealed");
+
+        let state = overlay_on_executed(client.state_by_block_hash(grandparent).expect("the grandparent's state"), executed);
+        let account = |a: &Address| state.basic_account(a).expect("read");
+        assert_eq!(account(&sender).map(|a| a.nonce), Some(5), "the nonce the parent advanced, not the grandparent's 4");
+        assert_eq!(account(&sender).map(|a| a.balance), Some(U256::from(60)));
+        assert_eq!(account(&created).map(|a| a.balance), Some(U256::from(7)), "an account the parent created exists");
+        assert_eq!(account(&untouched).map(|a| a.nonce), Some(1), "an untouched account reads through to the grandparent");
+        assert_eq!(state.block_hash(12).expect("read"), Some(parent.hash()), "BLOCKHASH of the parent is the sealed hash");
     }
 }

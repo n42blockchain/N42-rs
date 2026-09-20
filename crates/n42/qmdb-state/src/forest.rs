@@ -43,8 +43,10 @@ use crate::{BlockChanges, StateError};
 pub const DEFAULT_RETAIN_DEPTH: u64 = 16;
 
 /// The most blocks below the head a reader's keep ([`QmdbForest::set_keep_from`])
-/// holds records for: the retention depth the fleet ran with before it was
-/// lowered to 16, so a database that far behind costs no more than it did then.
+/// holds records for by default: the retention depth the fleet ran with before
+/// it was lowered to 16, so a database that far behind costs no more than it
+/// did then. Raised through [`QmdbForest::set_reader_keep_cap`] when a pruned
+/// record is worse than the memory it frees -- see that method.
 pub const READER_KEEP_CAP: u64 = 64;
 
 /// A block's root and operations, computed but not yet filed under its hash.
@@ -283,6 +285,9 @@ pub struct QmdbForest {
     /// The lowest block a reader still needs the record of; see
     /// [`Self::set_keep_from`].
     keep_from: Option<u64>,
+    /// How far below the head that keep reaches; see
+    /// [`Self::set_reader_keep_cap`].
+    reader_keep_cap: u64,
     /// Slots the tree has deactivated or revived since the last delta was
     /// taken. Every move of the tree goes through a [`BlockUndo`], and an undo
     /// record names exactly the slots it flips, so recording them here — on the
@@ -426,6 +431,7 @@ impl QmdbForest {
             head: (number, hash),
             retain_depth: DEFAULT_RETAIN_DEPTH,
             keep_from: None,
+            reader_keep_cap: READER_KEEP_CAP,
             trim_twigs: true,
             dirty_slots: Vec::new(),
             dirty_slots_deduped: 0,
@@ -452,13 +458,28 @@ impl QmdbForest {
     }
 
     /// Keeps the records of blocks from `number` up past the retention depth
-    /// (up to [`READER_KEEP_CAP`] below the head), for a reader that still has
-    /// to list their changes when the database persists them; `None` releases
-    /// them to the retention depth at the next head move. Under load the
-    /// database persists 17-18 blocks behind the head, past a depth of 16, and
-    /// the read view lost the next block's changes on every node (loop156 V1).
+    /// (up to [`Self::set_reader_keep_cap`] below the head), for a reader that
+    /// still has to list their changes when the database persists them; `None`
+    /// releases them to the retention depth at the next head move. Under load
+    /// the database persists 17-18 blocks behind the head, past a depth of 16,
+    /// and the read view lost the next block's changes on every node
+    /// (loop156 V1).
     pub const fn set_keep_from(&mut self, number: Option<u64>) {
         self.keep_from = number;
+    }
+
+    /// How far below the head [`Self::set_keep_from`] reaches
+    /// ([`READER_KEEP_CAP`] by default).
+    ///
+    /// The cap is a memory bound, and cutting the keep at it is not free: the
+    /// record the reader is waiting for is gone for good, so the reader is
+    /// invalidated -- with the hashed tables off that costs the node every
+    /// read it can no longer answer. A block's record (its sorted operations
+    /// and undo) is ~30 MB at the fleet7 bench tier, so the caller trades tens
+    /// of MB a block against a node that survives a persistence stall; see
+    /// `QmdbNodeState`, which sets it.
+    pub const fn set_reader_keep_cap(&mut self, cap: u64) {
+        self.reader_keep_cap = cap;
     }
 
     /// What a filed block changed, as the entry file holds it: for each of its
@@ -803,7 +824,7 @@ impl QmdbForest {
         self.head = (number, block_hash);
         let mut cutoff = number.saturating_sub(self.retain_depth);
         if let Some(keep) = self.keep_from {
-            cutoff = cutoff.min(keep.max(number.saturating_sub(READER_KEEP_CAP)));
+            cutoff = cutoff.min(keep.max(number.saturating_sub(self.reader_keep_cap)));
         }
         self.records
             .retain(|hash, record| record.number >= cutoff || *hash == block_hash);

@@ -45,6 +45,16 @@ use reth_primitives_traits::Account;
 use tracing::{info, warn};
 
 /// How many blocks behind its head the view answers for.
+///
+/// This is a distance between a *reader* and the view's head, not between the
+/// view's head and the canonical head: the head is the database's persisted
+/// block, and a reader reads at the block its own transaction sees as
+/// persisted, so the depth it needs is only how far persistence moved between
+/// that transaction opening and its read -- one advance, or a persistence
+/// batch. It is therefore independent of the forest's reader keep cap
+/// (`QmdbForest::set_reader_keep_cap`), which bounds how far the *view* may
+/// fall behind the chain, and does not follow it: a view 1024 blocks behind
+/// the canonical head still answers its readers at depth 0.
 pub const JOURNAL_DEPTH: usize = 64;
 
 /// For one block, sorted by key: the offset of each key's live record before the block.

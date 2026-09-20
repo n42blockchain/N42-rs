@@ -47,7 +47,7 @@ pub mod forest;
 use alloy_primitives::{Address, B256, U256};
 pub use alloc::changes_from_alloc;
 pub use forest::{ForestCheckpoint, ForestDelta, ForestSnapshot, PreparedBlock, QmdbForest, StateProofProvider,
-    DEFAULT_RETAIN_DEPTH,
+    DEFAULT_RETAIN_DEPTH, READER_KEEP_CAP,
 };
 use n42_twig_core::qmdb_compat::{
     encode_gov5_account_value, gov5_account_key, gov5_storage_key, QmdbCompatTree, QmdbOperation,

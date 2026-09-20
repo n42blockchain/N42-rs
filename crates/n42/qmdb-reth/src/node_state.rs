@@ -186,6 +186,40 @@ fn read_view_env() -> bool {
     std::env::var("N42_QMDB_READS").is_ok_and(|v| !v.is_empty() && v != "off")
 }
 
+/// How far below the canonical head the forest keeps a block's record for the
+/// read view (`QmdbForest::set_reader_keep_cap`).
+///
+/// The keep is memory -- a block's operations and undo, ~30 MB at the fleet7
+/// bench tier, so 64 blocks is ~2 GB and 1024 would be ~30 GB were the node
+/// ever that far behind; in practice persistence runs 17-18 blocks back and the
+/// deep end of the range is reached only during a stall. What the cap buys by
+/// being small is that memory; what it costs when it bites is the view itself,
+/// since a pruned record cannot be listed when the database finally persists
+/// that block and the view is invalidated for good. With the hashed tables off
+/// that is fatal to the node -- the next read the view cannot answer refuses a
+/// block, and its descendants follow (loop183 V2a: a 33 s persistence stall,
+/// the chain 68 blocks past the view, 29 refused blocks). So the cap is 1024
+/// with the tables off and the default 64 with them on, and
+/// `N42_QMDB_READER_KEEP_CAP=<blocks>` overrides either.
+fn reader_keep_cap_env() -> u64 {
+    static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("N42_QMDB_READER_KEEP_CAP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| {
+                if reth_storage_api::n42_state::hashed_tables_off() {
+                    TABLES_OFF_READER_KEEP_CAP
+                } else {
+                    n42_qmdb_state::READER_KEEP_CAP
+                }
+            })
+    })
+}
+
+/// The reader keep cap with the hashed tables off; see [`reader_keep_cap_env`].
+const TABLES_OFF_READER_KEEP_CAP: u64 = 1024;
+
 fn entry_file_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("N42_QMDB_ENTRY_FILE").is_ok_and(|v| v == "1"))
@@ -289,6 +323,9 @@ struct Inner {
     /// Whether `initialize` builds the read view (`N42_QMDB_READS` set to
     /// anything but `off`, or `set_read_view_wanted`).
     read_view_wanted: std::sync::atomic::AtomicBool,
+    /// How far below the canonical head the forest keeps records for the view
+    /// ([`reader_keep_cap_env`], or `set_reader_keep_cap`).
+    reader_keep_cap: std::sync::atomic::AtomicU64,
 }
 
 /// The delta log's position, as the node last left it.
@@ -360,6 +397,7 @@ impl QmdbNodeState {
                 entry_file,
                 read_view: std::sync::OnceLock::new(),
                 read_view_wanted: std::sync::atomic::AtomicBool::new(read_view_env()),
+                reader_keep_cap: std::sync::atomic::AtomicU64::new(reader_keep_cap_env()),
             }),
         }
     }
@@ -380,11 +418,15 @@ impl QmdbNodeState {
             Ok(view) => {
                 forest.set_truncation_guard(Some(view.clone()));
                 // The records of the blocks the database has yet to persist are
-                // what the view advances by; keep them past the retention depth.
+                // what the view advances by; keep them past the retention depth,
+                // as far below the head as this node's cap reaches.
+                let cap = self.reader_keep_cap();
+                forest.set_reader_keep_cap(cap);
                 forest.set_keep_from(Some(head.0 + 1));
                 info!(
                     target: "n42.qmdb",
-                    block = head.0, keys = view.len(), build_ms = started.elapsed().as_millis() as u64,
+                    block = head.0, keys = view.len(), keep_cap = cap,
+                    build_ms = started.elapsed().as_millis() as u64,
                     "built the QMDB read view",
                 );
                 let _ = self.inner.read_view.set(view);
@@ -396,6 +438,18 @@ impl QmdbNodeState {
     /// Whether `initialize` builds the read view (overrides `N42_QMDB_READS`).
     pub fn set_read_view_wanted(&self, on: bool) {
         self.inner.read_view_wanted.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How far below the canonical head the forest keeps records for the read
+    /// view; see [`reader_keep_cap_env`] for what the choice costs.
+    pub fn reader_keep_cap(&self) -> u64 {
+        self.inner.reader_keep_cap.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Overrides [`reader_keep_cap_env`] for this node state; takes effect
+    /// when the read view is built.
+    pub fn set_reader_keep_cap(&self, cap: u64) {
+        self.inner.reader_keep_cap.store(cap, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The read view, if one was built, borrowed.
@@ -2111,52 +2165,77 @@ mod tests {
     /// A database persisting further behind the head than the forest's
     /// retention depth (16) leaves the view valid: the records of the blocks it
     /// has not persisted are kept for the view (loop156 V1: 17-18 behind
-    /// invalidated it on every node), up to the reader cap of 64 blocks, past
-    /// which the view is invalidated as before.
+    /// invalidated it on every node), up to the reader keep cap, past which the
+    /// view is invalidated as before. That cap is 64 by default and 1024 with
+    /// the hashed tables off, where losing the view costs the node every read
+    /// it can no longer answer (loop183 V2a): a database 110 blocks behind
+    /// invalidates the view at 64 and leaves it answering at 1024.
     #[test]
     fn the_read_view_follows_a_database_behind_the_retention_depth() {
         use alloy_primitives::{keccak256, Address, KECCAK256_EMPTY, U256};
         use n42_qmdb_state::AccountState;
         use reth_primitives_traits::Account;
 
-        let chain = qmdb_chain();
-        let state = QmdbNodeState::new_with_entry_file(chain.clone(), scratch("read-view-behind"), true);
-        state.set_read_view_wanted(true);
-        state.initialize((0, chain.genesis_hash())).unwrap();
-        let view = state.read_view().expect("the view is built at initialisation");
-        let extend = |hashes: &mut Vec<B256>, to: usize| {
-            for n in hashes.len()..=to {
-                let mut changes = BlockChanges::new();
-                changes.set_account(
-                    Address::with_last_byte((n % 40) as u8 + 1),
-                    AccountState { nonce: n as u64, balance: U256::from(n), code_hash: KECCAK256_EMPTY },
+        // Runs the same database-behind-the-head story under `cap`, and
+        // returns whether the view survived it.
+        let leg = |name: &str, cap: u64| -> bool {
+            let chain = qmdb_chain();
+            let state = QmdbNodeState::new_with_entry_file(chain.clone(), scratch(name), true);
+            state.set_read_view_wanted(true);
+            state.set_reader_keep_cap(cap);
+            state.initialize((0, chain.genesis_hash())).unwrap();
+            let view = state.read_view().expect("the view is built at initialisation");
+            let extend = |hashes: &mut Vec<B256>, to: usize| {
+                for n in hashes.len()..=to {
+                    let mut changes = BlockChanges::new();
+                    changes.set_account(
+                        Address::with_last_byte((n % 40) as u8 + 1),
+                        AccountState { nonce: n as u64, balance: U256::from(n), code_hash: KECCAK256_EMPTY },
+                    );
+                    let parent = hashes[n - 1];
+                    let hash = keccak256((n as u64).to_be_bytes());
+                    let root = state.compute(parent, &changes).unwrap().root;
+                    state.validate_block(parent, hash, n as u64, &changes, root).unwrap();
+                    state.on_canonical(hash).unwrap();
+                    hashes.push(hash);
+                }
+            };
+            let mut hashes = vec![chain.genesis_hash()];
+
+            // 40 blocks canonical before the database persists any: 39 past a depth of 16.
+            extend(&mut hashes, 40);
+            let persisted: Vec<(u64, B256)> = (1..=40).map(|n| (n as u64, hashes[n])).collect();
+            state.on_persisted(&persisted);
+            assert!(view.is_valid(), "the records the view needed were kept");
+            assert_eq!(view.head(), (40, hashes[40]));
+            assert_eq!(
+                view.account(&Address::with_last_byte(1), 40),
+                Some(Some(Account { nonce: 40, balance: U256::from(40), bytecode_hash: None }))
+            );
+
+            // 70 more before the next persistence: past a cap of 64, within one of 1024.
+            extend(&mut hashes, 110);
+            let persisted: Vec<(u64, B256)> = (41..=110).map(|n| (n as u64, hashes[n])).collect();
+            state.on_persisted(&persisted);
+            if view.is_valid() {
+                assert_eq!(view.head(), (110, hashes[110]));
+                assert_eq!(
+                    view.account(&Address::with_last_byte(110 % 40 + 1), 110),
+                    Some(Some(Account { nonce: 110, balance: U256::from(110), bytecode_hash: None })),
+                    "and it still answers at its head",
                 );
-                let parent = hashes[n - 1];
-                let hash = keccak256((n as u64).to_be_bytes());
-                let root = state.compute(parent, &changes).unwrap().root;
-                state.validate_block(parent, hash, n as u64, &changes, root).unwrap();
-                state.on_canonical(hash).unwrap();
-                hashes.push(hash);
             }
+            view.is_valid()
         };
-        let mut hashes = vec![chain.genesis_hash()];
 
-        // 40 blocks canonical before the database persists any: 39 past a depth of 16.
-        extend(&mut hashes, 40);
-        let persisted: Vec<(u64, B256)> = (1..=40).map(|n| (n as u64, hashes[n])).collect();
-        state.on_persisted(&persisted);
-        assert!(view.is_valid(), "the records the view needed were kept");
-        assert_eq!(view.head(), (40, hashes[40]));
-        assert_eq!(
-            view.account(&Address::with_last_byte(1), 40),
-            Some(Some(Account { nonce: 40, balance: U256::from(40), bytecode_hash: None }))
+        assert!(
+            !leg("read-view-behind", n42_qmdb_state::READER_KEEP_CAP),
+            "a database further behind than the cap invalidates the view",
         );
-
-        // 70 more before the next persistence: past the cap of 64.
-        extend(&mut hashes, 110);
-        let persisted: Vec<(u64, B256)> = (41..=110).map(|n| (n as u64, hashes[n])).collect();
-        state.on_persisted(&persisted);
-        assert!(!view.is_valid(), "a database further behind than the cap invalidates the view");
+        assert!(
+            leg("read-view-behind-deep", TABLES_OFF_READER_KEEP_CAP),
+            "the cap the tables-off mode raises reaches 110 blocks back",
+        );
     }
 
     /// The database unwinding below the view's head steps the view back

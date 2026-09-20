@@ -65,6 +65,16 @@ block-to-block chain becomes its execution alone (~140 ms on the fleet). Expect 
 -> ~200, at which point the leader's build-to-build chain (~253 ms) is what binds. Falsified by any divergence in
 roots across nodes (`scripts/fleet7-verify.py`), or if R1 does not fall below the leader's chain.
 
+*As implemented (branch `plan-v4/step1-2`, flag `N42_FOLLOWER_EXEC_ON_PARENT_OUTPUT=1`), three things the step did not
+say.* The overlay is sound with the hashed tables off because reth's `MemoryOverlayStateProvider` answers accounts,
+storage and code from the executed block's bundle (`memory_overlay.rs` 114-124, 237-262) and reaches the hashed
+state only for its trie methods -- which is also why the leader's build-on-seal is valid on the fleet; the path is
+refused unless `N42_HASHED_TABLES=off`, since a destroyed account's storage zeroing does go through the hashed state.
+The flag implies the check-on-output path: both read the same publication. And the import is one serial function --
+check, the parent's fields, the vote, then the execution -- so the execution still starts after the parent's root
+and only the engine insert leaves its wait; the step's full claim needs the vote road and the execution road side by
+side once the sender check has passed (branch `plan-v4/step2b`, in progress).
+
 **Step 3 -- the leader's chain, once it binds.** Three cuts, each independent:
 - *No map on the chain.* The next build does not need reth's one map, it needs an answer per address. Keep the
   batches' bundles as they are and build only an index `address -> batch` (24 bytes an entry and cache-resident,

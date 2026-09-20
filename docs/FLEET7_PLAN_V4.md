@@ -160,6 +160,33 @@ from, and the floor does not follow the configuration (V0a 51.7, V0b 8.8). The n
 by process class through the leg; until then the floor is a hazard in its own right (a node under 3 GB free is one
 allocation from the OOM killer).
 
+## 2d. The memory is the execution layers' (loop184), and the read view's lag is survivable now
+
+The 29 refused blocks of loop183 V2a were not the new flag's: free memory reached its 2.7 GB floor, 11 s later node0's
+persistence stalled for 33 s, the chain ran 68 blocks past the read view, the forest pruned the view's next record
+at its 64-block cap, and with the tables off the first read the dead view could not answer refused a block and its
+descendants by their link. loop156 V1 logged the same reason on seven nodes with no such flag. It is a hazard of the
+tables-off mode, which every leg runs. Merged since (536c1de84, c26764bfc): the cap is a setting, 1024 with the
+tables off (a pruned record is a dead node, a kept one is memory); a WARN at half and three quarters of the cap, and
+the lag logged every 64 blocks -- that leg said nothing before it was fatal. Step 1 is the default (bd827ed73).
+
+loop184, three legs of that build, resident memory sampled by process class every 5 s:
+
+| leg | execution layers, peak of their sum | largest one | validators | free floor | reader lag, max | window 1 | round (M tx) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| M0a | 98.6 GB | 16.3 GB | 6.0 GB | 32.7 GB | 24 | 352,967 | 26.73 |
+| M0b | 95.0 GB | 15.3 GB | 6.1 GB | 33.3 GB | 32 | 400,896 | 27.68 |
+| M0c | 117.2 GB | 20.1 GB | 6.1 GB | 11.6 GB | 30 | 392,068 | 26.06 |
+
+Seven execution layers go from ~1 GB to 15-20 GB each inside a 90 s round, 150-200 MB a second a node, and are
+95-117 GB of a 136 GB box at their peak; nothing else on the box matters. That growth is what takes the page cache,
+stalls persistence and slows the phases that move bodies (section 2b), so it is the round's ceiling on this box and
+the next thing to split: a jemalloc heap profile of a leg (`--features jemalloc-prof`, `scripts/fleet7-profile.sh
+--alloc`). The candidates, by arithmetic: the blocks held in memory until persisted (the reader lag says 24-32 of
+them, each a 24.7 MB body, a ~45 MB bundle, its reverts and receipts, and the forest's record -- ~4 GB), the QMDB
+index and forest growing by ~147,000 keys a block, the pool and queue at 489,000 slots, the 4M-entry sender cache,
+and what the allocator keeps for two seconds at this churn.
+
 ## 3. What not to do
 
 - Do not judge a cycle-shortening change at a pacing above the natural cycle; do not judge any change without R1.

@@ -209,6 +209,71 @@ fn wait_for_parent_fields(parent_hash: B256) -> Result<(), String> {
         .ok_or_else(|| format!("parent {parent_hash}'s execution fields not recorded within {PARENT_WAIT:?}"))
 }
 
+/// The header against the parent, by the consensus rules: under deferred
+/// execution the parent's execution fields, which this node filed itself, are
+/// what the header's copies are compared with. A free function rather than a
+/// closure because the vote road calls it from a thread of its own.
+fn validate_against_parent(
+    consensus: &(dyn FullConsensus<EthPrimitives> + Send + Sync),
+    header: &reth_primitives_traits::SealedHeader,
+    parent: &reth_primitives_traits::SealedHeader,
+) -> Result<(), String> {
+    consensus.validate_header_against_parent(header, parent).map_err(|err| format!("header against parent: {err}"))
+}
+
+/// Runs the vote road beside the block's execution, once the includability
+/// check has passed and the block is to be executed on the parent's published
+/// output (`N42_FOLLOWER_EXEC_ON_PARENT_OUTPUT`, plan v4 step 2).
+///
+/// `vote` waits for the parent's execution fields, compares the header against
+/// them and releases the vote; `execute` needs nothing but the parent's bundle,
+/// which is already in hand, so it starts at the same instant instead of after
+/// the parent's QMDB root (~27 ms) and its header check.
+///
+/// The vote road's error wins: a header this node's own result refuses is not
+/// imported, whatever the execution beside it produced -- the executed block is
+/// dropped here and the import reports the header error, exactly as when the
+/// two ran one after the other. A vote already released is *not* taken back
+/// when the execution then fails; that is the rule as it stands, not a new one,
+/// because the vote has preceded the execution since deferred execution went in
+/// (`import_foreign_block` below). The import's error sends the block down the
+/// engine's own path (`bin/n42/src/payload_serve.rs`, "direct import failed"),
+/// and it is the driver's verdict, not the check, that moves the head
+/// (`crates/n42/h2-execution/src/driver.rs`, `finish_execute`).
+///
+/// The vote road is a plain scoped thread and never a rayon job: it blocks on a
+/// condvar another thread satisfies, and a rayon worker that blocks steals
+/// other jobs -- the deadlock the QMDB root job runs on a thread of its own for
+/// (loop164 O17). The execution road keeps the worker pool to itself.
+fn two_roads<T>(
+    number: u64,
+    roads_at: std::time::Instant,
+    vote: impl FnOnce() -> Result<(), String> + Send,
+    execute: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let (voted, executed, exec_ms) = std::thread::scope(|scope| {
+        let voted = std::thread::Builder::new()
+            .name("vote-road".into())
+            .spawn_scoped(scope, || vote().map(|()| roads_at.elapsed().as_millis() as u64))
+            .expect("a thread for the vote road");
+        let executed = execute();
+        let exec_ms = roads_at.elapsed().as_millis() as u64;
+        (voted.join().unwrap_or_else(|_| Err("the vote road thread panicked".to_string())), executed, exec_ms)
+    });
+    let vote_ms = voted?;
+    let executed = executed?;
+    // Both roads started at `roads_at`, so the shorter one is the overlap.
+    tracing::info!(
+        target: "n42.follower_import",
+        number,
+        exec_ms,
+        vote_ms,
+        overlap_ms = exec_ms.min(vote_ms),
+        "two roads: the execution ran beside the vote"
+    );
+    Ok(executed)
+}
+
 /// A sender's account after the parent, from the parent's execution output:
 /// `None` when the parent did not touch it (its state is then the
 /// grandparent's), a default account when the parent destroyed it.
@@ -502,6 +567,20 @@ impl Drop for ImportStage {
 /// without bound.
 const CARRY_CAP: usize = 1_000_000;
 
+/// What a block's execution produced, so the execution can be run as one
+/// piece beside the vote road: the view of the parent's post-state it read
+/// (the hashed post-state pass still needs it), the read cache the carry is
+/// made from, the output, whether the worker pool took the block, and the two
+/// phase timings.
+struct Executed {
+    state: reth_provider::StateProviderBox,
+    cached: CachedReads,
+    output: reth_provider::BlockExecutionOutput<n42_tx_types::Receipt>,
+    parallel: bool,
+    state_ms: u64,
+    exec_ms: u64,
+}
+
 /// Executes and checks `sealed` on its parent's state. See the module docs.
 /// Returns the executed block and the phase timings in milliseconds:
 /// header checks, senders, execution, the post-execution checks, state root,
@@ -523,7 +602,7 @@ pub fn import_foreign_block<Provider, Evm, ChainSpec>(
     qmdb: Option<&n42_qmdb_reth::QmdbNodeState>,
     consensus: &(dyn FullConsensus<EthPrimitives> + Send + Sync),
     chain_spec: &ChainSpec,
-    checked: Option<tokio::sync::oneshot::Sender<()>>,
+    mut checked: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(Box<BuiltPayloadExecutedBlock<EthPrimitives>>, [u64; 9]), String>
 where
     Provider: StateProviderFactory + HeaderProvider<Header = alloy_consensus::Header> + Sync,
@@ -641,11 +720,12 @@ where
             None => (wait_for_parent(provider, parent_hash, chain_spec.genesis(), deferred)?, None),
         },
     };
-    let against_parent = || {
-        consensus
-            .validate_header_against_parent(recovered.sealed_header(), &parent)
-            .map_err(|err| format!("header against parent: {err}"))
-    };
+    let against_parent = || validate_against_parent(consensus, recovered.sealed_header(), &parent);
+    // Set on the exec-on-parent-output path: the parent as an executed block
+    // this import lays over the chain's state at the grandparent, and the
+    // instant the vote road and the execution started together.
+    let mut executed_parent = None;
+    let mut roads_at = None;
     if !deferred {
         against_parent()?;
     } else {
@@ -672,118 +752,166 @@ where
             chain_spec.chain().id(),
             spec_for_intrinsic_gas(chain_spec, recovered.timestamp),
         )?;
-        let fields_at = std::time::Instant::now();
-        if parent_output.is_some() {
-            wait_for_parent_fields(parent_hash)?;
-            against_parent()?;
+        let check_ms = check_at.elapsed().as_millis() as u64;
+
+        // Where this block's execution will read the parent's post-state,
+        // decided here because it decides whether that execution can run
+        // beside the rest of the vote road or has to follow it: the parent's
+        // published output laid over the chain's state at the grandparent
+        // (`N42_FOLLOWER_EXEC_ON_PARENT_OUTPUT`), or the engine's tree at the
+        // parent. The parent may have landed while this block was being
+        // checked, and the engine's tree is the cheaper state when it has it.
+        if let Some(output) = &parent_output
+            && exec_on_parent_output()
+            && parent_in(provider, parent_hash, chain_spec.genesis(), deferred)?.is_none()
+        {
+            executed_parent = overlay_parent(provider, &parent, output, chain_spec.genesis(), deferred, number);
         }
-        tracing::debug!(
-            target: "n42.follower_import",
-            number,
-            check_ms = check_at.elapsed().as_millis() as u64,
-            fields_ms = fields_at.elapsed().as_millis() as u64,
-            "checked: the header carries the parent's result and the transactions are includable"
-        );
-        if let Some(checked) = checked {
-            let _ = checked.send(());
+
+        if executed_parent.is_none() {
+            // The rest of the vote road, then the execution: it has to wait
+            // for the parent in the engine anyway, so there is nothing for it
+            // to run beside.
+            let fields_at = std::time::Instant::now();
+            if parent_output.is_some() {
+                wait_for_parent_fields(parent_hash)?;
+                against_parent()?;
+            }
+            tracing::debug!(
+                target: "n42.follower_import",
+                number,
+                check_ms,
+                fields_ms = fields_at.elapsed().as_millis() as u64,
+                "checked: the header carries the parent's result and the transactions are includable"
+            );
+            if let Some(checked) = checked.take() {
+                let _ = checked.send(());
+            }
+        } else {
+            // Two roads from here (plan v4 step 2, [`two_roads`]): the rest of
+            // the vote road -- the parent's execution fields and the header
+            // against them -- and this block's execution, which needs nothing
+            // but the parent's bundle and so waits for neither.
+            roads_at = Some(std::time::Instant::now());
+            tracing::debug!(
+                target: "n42.follower_import",
+                number,
+                check_ms,
+                "the transactions are includable on the parent's output; the vote road and the execution run side by side"
+            );
         }
     }
 
-    // Checked on the parent's published output. Its execution reads the
-    // parent's post-state: the engine's tree at the parent, or -- under
-    // `N42_FOLLOWER_EXEC_ON_PARENT_OUTPUT` -- that same output laid over the
-    // chain's state at the grandparent, which starts this execution when the
-    // parent's ends instead of when the parent reaches the tree.
-    let mut executed_parent = None;
-    if let Some(output) = &parent_output {
-        // The parent may have landed while this block was being checked, and
-        // the engine's tree is the cheaper state when it has it.
-        if exec_on_parent_output() && parent_in(provider, parent_hash, chain_spec.genesis(), deferred)?.is_none() {
-            executed_parent = overlay_parent(provider, &parent, output, chain_spec.genesis(), deferred, number);
-        }
-        if executed_parent.is_none() {
-            wait_for_parent(provider, parent_hash, chain_spec.genesis(), deferred)?;
-        }
+    // The parent in the engine, for a block whose execution reads it there.
+    if parent_output.is_some() && executed_parent.is_none() {
+        wait_for_parent(provider, parent_hash, chain_spec.genesis(), deferred)?;
     }
     drop(parent_output);
 
     // Execution on the parent's state, then gas, receipts root and bloom
-    // against the header.
-    let state_at = std::time::Instant::now();
-    // One view of the parent's post-state per caller: the block's own
-    // executor takes the first, each group of a parallel execution one of its
-    // own. Both must be the *same* state -- a group that opened the engine's
-    // tree while the block's executor read the overlay would execute half the
-    // block one block behind.
-    let open_parent_state = || -> Result<reth_provider::StateProviderBox, String> {
-        match &executed_parent {
-            Some(executed) => {
-                let historical = provider
-                    .state_by_block_hash(parent.parent_hash)
-                    .map_err(|err| format!("grandparent state: {err}"))?;
-                Ok(n42_engine_types::direct_build::overlay_on_executed(historical, executed.clone()))
+    // against the header. One piece, because on the exec-on-parent-output path
+    // it runs on this thread while the vote road runs on another.
+    let execute_block = || -> Result<Executed, String> {
+        let state_at = std::time::Instant::now();
+        // One view of the parent's post-state per caller: the block's own
+        // executor takes the first, each group of a parallel execution one of
+        // its own. Both must be the *same* state -- a group that opened the
+        // engine's tree while the block's executor read the overlay would
+        // execute half the block one block behind.
+        let open_parent_state = || -> Result<reth_provider::StateProviderBox, String> {
+            match &executed_parent {
+                Some(executed) => {
+                    let historical = provider
+                        .state_by_block_hash(parent.parent_hash)
+                        .map_err(|err| format!("grandparent state: {err}"))?;
+                    Ok(n42_engine_types::direct_build::overlay_on_executed(historical, executed.clone()))
+                }
+                None => provider.state_by_block_hash(parent_hash).map_err(|err| format!("parent state: {err}")),
             }
-            None => provider.state_by_block_hash(parent_hash).map_err(|err| format!("parent state: {err}")),
+        };
+        let state = open_parent_state()?;
+        let state_ms = state_at.elapsed().as_millis() as u64;
+        let executed_at = std::time::Instant::now();
+        stage.at(3);
+        let mut cached = match carry.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            Some((of, cached)) if of == parent_hash => cached,
+            _ => CachedReads::default(),
+        };
+        // `N42_FOLLOWER_PARALLEL=1`: a block of plain transfers executes on the
+        // worker pool (`parallel_transfer`), partitioned by the accounts it
+        // touches; anything it cannot take falls back to the serial executor.
+        let mut output = None;
+        if follower_parallel() {
+            let open = || open_parent_state().ok().map(StateProviderDatabase::new);
+            match n42_engine_types::parallel_transfer::execute_transfers(
+                evm_config,
+                &recovered,
+                cached.as_db_mut(StateProviderDatabase::new(&state)),
+                &open,
+            )
+            .map_err(|err| format!("parallel execution: {err}"))?
+            {
+                Ok((out, phases)) => {
+                    tracing::info!(
+                        target: "n42.follower_import",
+                        number,
+                        groups = phases.groups,
+                        partition_ms = phases.partition_ms,
+                        groups_ms = phases.groups_ms,
+                        merge_ms = phases.merge_ms,
+                        finish_ms = phases.finish_ms,
+                        "parallel import phases"
+                    );
+                    output = Some(out);
+                }
+                Err(why) => {
+                    // Counted like the builder's: a block that fell back to the
+                    // serial path costs several times its import, and a leg that
+                    // reads medians cannot see it otherwise.
+                    static DECLINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let declined = DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    tracing::info!(target: "n42.follower_import", number, %why, declined, "not parallel; executing serially");
+                }
+            }
+        }
+        // A block executed on the worker pool read its transfers' accounts
+        // through providers of its own, not through `cached`: the carry below
+        // would copy ~147,000 accounts (26 ms on the import, loop155) that the
+        // next import barely reads.
+        let parallel = output.is_some();
+        let output = match output {
+            Some(out) => out,
+            None => evm_config
+                .executor(cached.as_db_mut(StateProviderDatabase::new(&state)))
+                .execute(&recovered)
+                .map_err(|err| format!("execution: {err}"))?,
+        };
+        Ok(Executed { state, cached, output, parallel, state_ms, exec_ms: executed_at.elapsed().as_millis() as u64 })
+    };
+    let Executed { state, mut cached, output, parallel: parallel_executed, state_ms, exec_ms } = match roads_at {
+        None => execute_block()?,
+        Some(roads_at) => {
+            // References rather than the values: the vote road's closure is
+            // `move`, and the execution road needs the same block and parent.
+            let header = recovered.sealed_header();
+            let parent_header = &parent;
+            let vote_checked = checked.take();
+            two_roads(
+                number,
+                roads_at,
+                move || {
+                    wait_for_parent_fields(parent_hash)?;
+                    validate_against_parent(consensus, header, parent_header)?;
+                    // The vote, with this block's execution still running.
+                    if let Some(checked) = vote_checked {
+                        let _ = checked.send(());
+                    }
+                    Ok(())
+                },
+                execute_block,
+            )?
         }
     };
-    let state = open_parent_state()?;
-    let state_ms = state_at.elapsed().as_millis() as u64;
-    let executed_at = std::time::Instant::now();
-    stage.at(3);
-    let mut cached = match carry.lock().unwrap_or_else(|p| p.into_inner()).take() {
-        Some((of, cached)) if of == parent_hash => cached,
-        _ => CachedReads::default(),
-    };
-    // `N42_FOLLOWER_PARALLEL=1`: a block of plain transfers executes on the
-    // worker pool (`parallel_transfer`), partitioned by the accounts it
-    // touches; anything it cannot take falls back to the serial executor.
-    let mut output = None;
-    if follower_parallel() {
-        let open = || open_parent_state().ok().map(StateProviderDatabase::new);
-        match n42_engine_types::parallel_transfer::execute_transfers(
-            evm_config,
-            &recovered,
-            cached.as_db_mut(StateProviderDatabase::new(&state)),
-            &open,
-        )
-        .map_err(|err| format!("parallel execution: {err}"))?
-        {
-            Ok((out, phases)) => {
-                tracing::info!(
-                    target: "n42.follower_import",
-                    number,
-                    groups = phases.groups,
-                    partition_ms = phases.partition_ms,
-                    groups_ms = phases.groups_ms,
-                    merge_ms = phases.merge_ms,
-                    finish_ms = phases.finish_ms,
-                    "parallel import phases"
-                );
-                output = Some(out);
-            }
-            Err(why) => {
-                // Counted like the builder's: a block that fell back to the
-                // serial path costs several times its import, and a leg that
-                // reads medians cannot see it otherwise.
-                static DECLINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let declined = DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                tracing::info!(target: "n42.follower_import", number, %why, declined, "not parallel; executing serially");
-            }
-        }
-    }
-    // A block executed on the worker pool read its transfers' accounts
-    // through providers of its own, not through `cached`: the carry below
-    // would copy ~147,000 accounts (26 ms on the import, loop155) that the
-    // next import barely reads.
-    let parallel_executed = output.is_some();
-    let output = match output {
-        Some(out) => out,
-        None => evm_config
-            .executor(cached.as_db_mut(StateProviderDatabase::new(&state)))
-            .execute(&recovered)
-            .map_err(|err| format!("execution: {err}"))?,
-    };
-    let exec_ms = executed_at.elapsed().as_millis() as u64;
     let checks_at = std::time::Instant::now();
     stage.at(4);
     consensus
@@ -1097,6 +1225,90 @@ mod parent_output_tests {
         assert!(started.elapsed() >= std::time::Duration::from_millis(50), "the comparison did not wait: {:?}", started.elapsed());
         assert!(started.elapsed() < PARENT_WAIT, "and it woke on the root, not on the deadline");
         filed.join().expect("the root thread");
+    }
+
+    /// The two roads (plan v4 step 2): on the exec-on-parent-output path the
+    /// block's execution starts when the parent's *output* is published, not
+    /// when its QMDB root files the parent's execution fields -- so it runs,
+    /// and finishes, while those fields do not yet exist, and the vote road
+    /// waits for them beside it.
+    #[test]
+    fn the_execution_starts_before_the_parents_fields_exist() {
+        let parent_hash = B256::with_last_byte(0x61);
+        let header = reth_primitives_traits::SealedHeader::seal_slow(alloy_consensus::Header::default());
+        let output = Arc::new(reth_provider::BlockExecutionOutput {
+            result: Default::default(),
+            state: BundleState::default(),
+        });
+        publish_parent_output(parent_hash, header, output);
+        // The parent's execution has ended -- its output is published -- but
+        // its root has not run, so its fields are not filed.
+        assert!(wait_for_parent_output(parent_hash, || false).is_some());
+        assert!(n42_engine_types::executed_fields::get(&parent_hash).is_none());
+
+        let filed = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            n42_engine_types::executed_fields::remember_receipts(parent_hash, B256::with_last_byte(0x62), Default::default(), 21_000);
+            n42_engine_types::executed_fields::remember_state_root(parent_hash, B256::with_last_byte(0x63));
+        });
+        let roads_at = std::time::Instant::now();
+        let fields_at_execution = std::sync::atomic::AtomicBool::new(true);
+        let executed = two_roads(
+            0x61,
+            roads_at,
+            || wait_for_parent_fields(parent_hash),
+            || {
+                // The execution road, as short as a test can make it: what it
+                // records is whether the parent's fields were there while it
+                // ran.
+                fields_at_execution.store(
+                    n42_engine_types::executed_fields::get(&parent_hash).is_some(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                Ok::<_, String>(21_000u64)
+            },
+        )
+        .expect("the header is this node's result for the parent");
+        assert_eq!(executed, 21_000);
+        assert!(!fields_at_execution.load(std::sync::atomic::Ordering::Relaxed), "the execution waited for the parent's root");
+        assert!(roads_at.elapsed() >= std::time::Duration::from_millis(100), "the vote road did not wait for the fields");
+        filed.join().expect("the root thread");
+    }
+
+    /// A header this node's own result for the parent refuses is not imported,
+    /// however the execution beside it ended: the vote road's error is what
+    /// the import reports and the executed block is dropped. (The vote itself
+    /// is not released on that road, so nothing was attested.)
+    #[test]
+    fn a_header_validation_failure_discards_the_execution() {
+        let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran = std::sync::Arc::clone(&executed);
+        let outcome = two_roads(
+            0x71,
+            std::time::Instant::now(),
+            || Err("header against parent: state root mismatch".to_string()),
+            move || {
+                ran.store(true, std::sync::atomic::Ordering::Relaxed);
+                Ok::<_, String>("the executed block")
+            },
+        );
+        assert_eq!(outcome, Err("header against parent: state root mismatch".to_string()));
+        assert!(executed.load(std::sync::atomic::Ordering::Relaxed), "the execution did run -- and its result was dropped");
+    }
+
+    /// The vote road's error wins over the execution's, so a block refused by
+    /// both is reported by its header, as it was when the header check ran
+    /// first.
+    #[test]
+    fn the_header_error_wins_over_the_executions() {
+        let outcome: Result<(), String> = two_roads(
+            0x72,
+            std::time::Instant::now(),
+            || Err("header against parent: gas used mismatch".to_string()),
+            || Err("execution: out of gas".to_string()),
+        );
+        assert_eq!(outcome, Err("header against parent: gas used mismatch".to_string()));
     }
 
     /// A parent already in the engine that nothing published (one this node

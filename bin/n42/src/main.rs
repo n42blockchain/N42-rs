@@ -476,7 +476,10 @@ fn main() {
                                     let reverted_blocks = old.blocks_iter().count();
                                     let back = n42::queue_reorg::reverted_transactions(old, new);
                                     let offered = back.len();
-                                    queue.push(back);
+                                    // Through the reverted door: it lowers the
+                                    // senders' mined watermarks, which the
+                                    // reverted blocks no longer justify.
+                                    queue.push_reverted(back);
                                     warn!(target: "n42.tx_queue", reverted_blocks, offered, new_blocks = new.blocks_iter().count(), "reorg: the reverted blocks' transactions are offered again");
                                 }
                                 let mut mined = 0usize;

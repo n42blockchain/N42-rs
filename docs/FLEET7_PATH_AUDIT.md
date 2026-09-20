@@ -613,6 +613,39 @@ threads were contending for is what the build and the import needed.
 
 Twelve is the fleet's setting from here on.
 
+### The three architecture items, sized (2026-09-20)
+
+**1. The duplicate work inside a node -- done, and smaller than it looked (be02ef278).** The leader's own-block
+round trip is 36 ms at the median (p90 139), not the 90-105 ms the validator sees: the registry lookup and the
+transaction encoding are ~11 ms, the engine's insert of the executed block 25 ms (p90 69), and the header-only
+`newPayload` under a millisecond, because the engine's conversion finds the sealed block rather than decoding. No
+block is executed twice here. What was duplicated is the encoding: the service encodes the block's 163,000
+transactions into its RLP for the validator that asked for the payload, and the own-block import encoded the same
+163,000 again into the `Vec<Bytes>` a payload lists. The encoder hands those back now and the import takes them.
+The engine's insert is not duplication -- the tree has to hold the block.
+
+**2. The graft's representation -- the shape of the change is now known, and it is not small.** The graft builds one
+`HashMap<Address, BundleAccount>` of every account the block touched, 45-67 ms of serial memory movement that no
+thread count changes (8, 16, 32 and 64 threads all read 43-45 ms in the bench). Two things pin it there:
+
+- reth's `BundleState.state` is that one map, and an `ExecutedBlock` carries it into the engine's tree;
+- the next build reads the parent's post-state through `opener_on_built_parent`, which lays that `ExecutedBlock`
+  over the grandparent with reth's `MemoryOverlayStateProvider`. So the merged map is not behind the seal, it is
+  between one build and the next.
+
+Which makes the change a real one, in four parts: a sharded bundle the batches fill in parallel (per-shard locks
+rather than loop176's single one -- that leg's 65 ms of extra parallel time is what a single mutex costs); our own
+overlay state provider reading it, in place of reth's, since `opener_on_built_parent` is ours to return; the QMDB
+operations built from the shards in parallel; and the merge into reth's `BundleState` kept for the engine's insert,
+behind the seal and off the build-to-build chain. The first part can be measured in the bench before any of the
+rest is written: if a sharded fold does not beat the single mutex, the design is wrong and the 45-67 ms stay.
+
+**3. Pipelining -- blocked on the supply measurement.** The leader's pull is 17-21 ms of every build, and the walk
+that fills it starts when the build does. Starting it during the previous block's fold would hide it, but a walk
+that starts before the pool is pruned of the block just sealed hands back transactions already mined, and whether
+that is even the thing to fix depends on loop180's supply legs: if the flood and the ingest are what the build
+waits for, an earlier walk finds nothing earlier.
+
 ## 10. Where the work stopped (2026-09-15)
 
 - Defects 5-9 are fixed and confirmed on the fleet (e5d859d82, 2ce2f60e5, b902caff1, bdb8a802e; loop159, loop162,

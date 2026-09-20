@@ -100,6 +100,35 @@ and measured the pacing. Redo it at 10 ms with 10,000-transaction blocks. With s
 should sit near 200 ms (~800k TPS of block capacity); what the seven nodes' shared memory system lets them keep of
 that is the number this box can give, and the rest of the way is a machine per node.
 
+## 2b. The round's decay is the vote path under a memory squeeze (loop182, 2026-09-20)
+
+Step 0's legs held at every pacing (350 / 300 / 275 / 250 ms: no TC past the start-up one, no invalid block; 300
+collapsed at loop141 and does not now), and the view's total followed the pacing down, 367 -> 313-334 ms. But the
+round did not move: 25.43M, 25.41M, 25.43M, 25.10M transactions -- 156 full blocks in 90 s, a 577 ms average cycle
+against 400 in window 1. **The round is set by windows 2 and 3, not by window 1, and no pacing reaches them.**
+
+What grows across the windows of one leg (loop182 P350a, medians of all nodes; `target/fleet-runs/decay.py`):
+
+| | window 1 | window 2 | window 3 |
+| --- | --- | --- | --- |
+| cycle | 404 | 490 | 520 ms |
+| R1 vote collection | 280 | 322 | 386 ms |
+| proposal path | 109 | 136 | 139 ms |
+| a follower's import, total | 325 | 324 | 305 ms |
+| the leader's build, total | 307 | 309 | 311 ms |
+| free memory, lowest | 30.5 | 18.1 | 15.8 GB |
+| direct-compaction stalls per 30 s | 657 | 635 | 974 |
+| QMDB compaction, median (max) | 10 (118) | 29 (134) | 50 (289) ms |
+
+The compute does not slow down at all; the two phases that move 24.7 MB bodies between processes do, together with
+the ingest's reply times, while the box runs out of memory: seven execution layers at 10-12.6 GB resident are 82-88 GB
+of anonymous memory on a 136 GB box, the page cache is what gives, and the kernel's compaction stalls climb. Of that
+136 GB, **22 GB is held by stale files on the `/tmp` tmpfs**: 19,908 `erigon-lfp-buf-*` and 151
+`erigon-sortable-buf-*` ETL buffers left by the Go client's runs between 2026-09-09 and 2026-09-19, open in no
+process. They are RAM for as long as they exist. Removing them is the cheapest cut on this list, and the leg after it
+reads the floor of free memory and windows 2-3 before anything else is judged; what is left of the decay after that
+is the execution layer's own resident set, which a heap profile (`scripts/fleet7-profile.sh --alloc`) has to split.
+
 ## 3. What not to do
 
 - Do not judge a cycle-shortening change at a pacing above the natural cycle; do not judge any change without R1.

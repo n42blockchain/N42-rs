@@ -225,6 +225,35 @@ grows by ~17 blocks per 64 -- persistence runs at 70-80% of the chain's rate -- 
 for. Being read now: where a save's time goes, whether the save is one busy thread or one that waits, and what the
 threshold 8 / buffer 6 settings do to it.
 
+## 2f. Persistence, made cheaper by configuration (loop187)
+
+Every leg full to the end (fee cap 1e24), each node's metrics scraped before the fleet goes down. K1 = the adopted
+configuration with `F7_SENDER_CACHE_MULT=1`; K2 = K1 + `--prune.transaction-lookup.full`; K3 = K2 +
+`N42_ROCKSDB_NOSYNC=1` (bench only).
+
+| leg | reader lag, max | execution layers, peak sum | free floor | window 2 | window 3 | round (M tx) | saves: seconds / count |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| K1b | 22 | 88.9 GB | 49.0 GB | 304,066 | 298,824 | 28.85 | 165.2 / 84 |
+| K2b | 9 | 72.8 GB | 65.2 GB | 336,781 | 336,833 | 31.72 | 93.9 / 162 |
+| K3a | 9 | 72.2 GB | 65.3 GB | 369,451 | 352,406 | **33.36** | 93.9 / 170 |
+| K3b | 9 | 72.7 GB | 63.4 GB | 369,453 | 336,776 | 32.90 | 94.3 / 161 |
+| K1a, K2a | 12, 9 | 66.1, 74.0 GB | 59.9, 63.5 GB | a regime of 1.7-2.7 s cycles with full blocks; see below |
+
+**Dropping the transaction-hash index is the cut.** 163,000 `TransactionHashNumbers` puts a block were the largest
+single write of a save; without them persistence keeps up -- the lag sits at 9, the minimum the threshold 8 / buffer
+6 settings allow, where it ran to 22-44 -- the seven execution layers peak at 72-74 GB instead of 89-117, the box
+keeps 63-65 GB free instead of 11-49, and windows 2 and 3 read 337-369k where they read ~300k. The sustained rate
+moved from ~308k to ~340-360k and the round to 33.36M. The WAL sync adds a little on top (K3 against K2: window 2
+369k against 337k, one pair each) and is bench-only. The sender-cache multiplier at 1 costs nothing measurable.
+By-hash RPC lookups (`eth_getTransactionByHash`, receipts by hash) do not work on a node run this way: for a
+validator that is a fair trade, for an RPC node it is not, so it is a role's setting rather than a default.
+
+**Two legs of six fell into a slow regime that is none of the things measured so far**: full blocks, memory free,
+no serial fallback, no invalid block, no TC, the pools at their gate -- and a cycle of 1.7-2.7 s, with the leaders'
+early-seal builds stopping. It appears only in legs with the 1e24 fee cap (loop186 G1a may be the same thing rather
+than the memory stall it was read as), so the base fee's magnitude late in a full round is the first suspect. Being
+traced.
+
 ## 3. What not to do
 
 - Do not judge a cycle-shortening change at a pacing above the natural cycle; do not judge any change without R1.

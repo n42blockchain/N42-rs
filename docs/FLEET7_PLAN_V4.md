@@ -187,6 +187,44 @@ them, each a 24.7 MB body, a ~45 MB bundle, its reverts and receipts, and the fo
 index and forest growing by ~147,000 keys a block, the pool and queue at 489,000 slots, the 4M-entry sender cache,
 and what the allocator keeps for two seconds at this churn.
 
+## 2e. Window 3 was the flood's fee cap; the sustained ceiling is persistence (loop185-186)
+
+**Every round's third window was the harness.** The flood's fee cap is 1e14 wei; full blocks raise the base fee
+12.5% each, and ~156 of them from a round's starting fee reach the cap. From there the flood is priced out and the
+blocks run 53-62% full around the cap -- in every leg since the chain passed ~2.5 blocks a second. "The round does not
+move with the pacing" (section 2b) was this: 156 full blocks is 25.4M transactions. Window 3's cycle was the
+SHORTEST of the three (0.36-0.45 s), with half-empty blocks. Round totals from loop179 to loop185 are not comparable
+with anything; windows 1 and 2 are. `fleet7-bench.sh` compares the cap as a big integer now and a round that means
+to stay full passes `--gasprice 1e24` (~412 full blocks).
+
+loop186, the old cap (G0) against 1e24 (G1), tps / occupancy:
+
+| leg | window 1 | window 2 | window 3 | round (M tx) |
+| --- | --- | --- | --- | --- |
+| G0a | 390,533 / 98.6% | 274,635 / 99.2% | 211,446 / 52.7% | 26.33 |
+| G0b | 382,753 / 98.0% | 302,923 / 99.6% | 232,704 / 61.8% | 27.58 |
+| G1b | 399,298 / 98.0% | 307,560 / 99.3% | **309,277 / 100%** | **30.51** |
+| G1a | 390,969 / 98.7% | 72,852 / 32.0% | 54,331 / 36.0% | 15.55 (stalled) |
+
+G1b is the first round full from end to end: ~400k in window 1, then a steady 0.527 s cycle and ~308k in windows 2
+AND 3 -- the chain settles, it does not keep decaying. G1a is what the settling costs on this box: at +65 s the seven
+execution layers were 109 GB, the page cache 1.8 GB of a 136 GB machine, the fleet stalled as one (ingest replies
+0.5 s -> 5 s on all seven nodes), and the backlog drained to 28 GB once blocks stopped.
+
+**The heap (loop185, `target/fleet-runs/heap-read.py`).** The 15-20 GB a node reaches is live data, not the
+allocator's, and it is backlog, not a leak: node0 falls 14.9 -> 6 GB inside the load the moment blocks stop being
+full. Of the 9.5 GB it grows by: the bundles of executed blocks 42%, the blocks themselves (bodies, recovered
+transactions) 32%, QMDB 15% (its per-block records bounded; the twig tree's young twigs grow with the state),
+RocksDB memtables 9%. 1.5 GB is sender caches, flat from start-up, 1 GB of it `F7_SENDER_CACHE_MULT=4`, which the
+code's own comment puts inside the noise: 7 GB of the box for nothing measured.
+
+**Persistence does not keep up with full blocks.** The lag between the canonical head and the persisted block on
+node0 through G1b: 7, 9, 22, 13, 11, 33, 44 at the end of the load, 9 and 7 after it. Over the last 128 blocks it
+grows by ~17 blocks per 64 -- persistence runs at 70-80% of the chain's rate -- and every block it is behind is
+130-200 MB of heap. So on this box the sustained rate is persistence's, and window 1 is a sprint the memory pays
+for. Being read now: where a save's time goes, whether the save is one busy thread or one that waits, and what the
+threshold 8 / buffer 6 settings do to it.
+
 ## 3. What not to do
 
 - Do not judge a cycle-shortening change at a pacing above the natural cycle; do not judge any change without R1.

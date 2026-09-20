@@ -78,8 +78,12 @@ roots across nodes (`scripts/fleet7-verify.py`), or if R1 does not fall below th
   latency; the queue's hold on an own block's transactions is what keeps a walk from re-taking them, and the test
   for this step is exactly that no mined transaction is taken twice.
 
-**Step 4 -- eight threads a pool, a node** (loop181 measures it). Not a cycle cut but a traffic cut: what the pools
-were oversubscribed by is what the ingest and the imports are short of.
+**Step 4 -- eight threads a pool, a node: FALSIFIED (loop181), dropped.** Two legs each: with both pools at 8 the
+leader's parallel step is 110-115 ms against 79-82 at 16, a follower's import 371-373 against 302-320, window 1
+308-340k against 331-337k; cutting the ingest to 8 as well changes nothing (111-114, 362-373). The pinned bench
+measures a parallel speed-up, and that does saturate at eight threads; on a node the pools share 32 CPUs with the
+ingest, tokio and the engine, and what a wider pool buys there is its share of the scheduler. Conclusions about
+thread counts come from fleet legs only.
 
 **Then measure the floor.** The protocol's fixed cost has never been read: loop180's leg for it ran at 100 ms pacing
 and measured the pacing. Redo it at 10 ms with 10,000-transaction blocks. With steps 1-3 done the cycle on this box

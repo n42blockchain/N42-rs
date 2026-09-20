@@ -549,6 +549,26 @@ pub struct ProposalContext {
 /// could not record.
 type CheckpointWriter = dyn Fn(&ConsensusEngine) -> Result<(), String> + Send + Sync;
 
+/// The head's timestamp for a proposal: what this node remembers of the block,
+/// and the header's own stamp when it remembers nothing.
+///
+/// It remembers nothing after a restart -- the maps of blocks seen are built
+/// as blocks arrive -- while the header is still there, because the proposal
+/// path asks the execution layer for it. The chain's timestamps are a grid of
+/// `genesis + N * period`, and at this fleet's pacing that grid runs ahead of
+/// the wall clock: a leader that fell back to the clock stamped its block at
+/// or below its parent, and the execution layer refused every one of them for
+/// as long as it took another member to produce a block this node could see.
+/// N42-26 met the same failure from the other side and fixed it the same way
+/// (its devlog-144: a restart whose leader never resumed).
+const fn head_stamp(remembered: Option<u64>, header: Option<&Header>) -> Option<u64> {
+    match (remembered, header) {
+        (Some(stamp), _) => Some(stamp),
+        (None, Some(header)) => Some(header.timestamp),
+        (None, None) => None,
+    }
+}
+
 impl<E> std::fmt::Debug for H2Service<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("H2Service")
@@ -1773,11 +1793,12 @@ impl<E: ExecutionLayer> H2Service<E> {
         // Marked before the build, not after: a build that fails should not be
         // retried on every subsequent event in the same view, which would pin
         // the loop against a broken execution layer.
+        let head_timestamp = head_stamp(self.block_timestamps.get(&head).copied(), head_header.as_ref());
         let context = ProposalContext {
             view,
             preparing: false,
             head,
-            head_timestamp: self.block_timestamps.get(&head).copied(),
+            head_timestamp,
             head_header,
             head_seen: self.block_seen.get(&head).copied(),
         };
@@ -2673,4 +2694,20 @@ fn body_request_grace() -> Duration {
     Duration::from_millis(*MS.get_or_init(|| {
         std::env::var("N42_BODY_REQUEST_GRACE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(120)
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// After a restart this node remembers no block, so the head's stamp has
+    /// to come from the header the execution layer served -- never from the
+    /// wall clock, which on this chain runs behind the timestamps.
+    #[test]
+    fn the_heads_stamp_falls_back_to_its_header() {
+        let header = Header { timestamp: 1_700_000_042, ..Default::default() };
+        assert_eq!(head_stamp(Some(1_700_000_000), Some(&header)), Some(1_700_000_000), "what the node saw wins");
+        assert_eq!(head_stamp(None, Some(&header)), Some(1_700_000_042), "a restart reads the header");
+        assert_eq!(head_stamp(None, None), None, "genesis, which has no parent at all");
+    }
 }

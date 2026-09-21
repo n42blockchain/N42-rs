@@ -1066,11 +1066,16 @@ where
     // Full, or the queue had no more to give: either way the serial loop
     // would add nothing now.
     let block_full = block_gas_limit.saturating_sub(cumulative_gas_used) < MIN_TRANSACTION_GAS || par_drained;
+    // Read before the early seal is taken: a build that does not seal early
+    // drops the `EarlySeal` on the way past, and with it the only record of
+    // which hash the builder gave this block's parent. The ordinary finish
+    // needs it for exactly the same reason the early seal does.
+    let parent_built = early_seal.as_ref().and_then(|early| early.parent_built);
     if let Some(early) = early_seal.take() {
         if deferred_now && hotstuff && !is_amsterdam && block_full && par_txs > 0 && block_blob_count == 0 && qmdb.is_some() {
             use reth_evm::execute::BlockExecutor as _;
             use reth_storage_api::HashedPostStateProvider as _;
-            let EarlySeal { hook, parent_built } = early;
+            let EarlySeal { hook, parent_built: _ } = early;
             let qmdb_state = qmdb.clone().expect("checked above");
             let seal_at = std::time::Instant::now();
             // Whatever was taken ahead and not built goes back to the queue,
@@ -1100,16 +1105,15 @@ where
             // The parent's execution, as this header carries it: recorded
             // under its sealed hash, or -- a parent finishing behind its own
             // seal -- arriving under the builder's hash a moment from now.
-            let parent_fields = crate::hotstuff_consensus::parent_executed_fields(chain_spec.genesis(), &parent_header)
-                .or_else(|| {
-                    let built = parent_built?;
-                    let fields = crate::executed_fields::wait_for(&built, std::time::Duration::from_secs(2))?;
-                    crate::executed_fields::remember(parent_sealed, fields);
-                    Some(fields)
-                })
-                .ok_or_else(|| {
-                    PayloadBuilderError::other(crate::hotstuff_consensus::DeferredExecutionError::ParentUnknown(parent_sealed))
-                })?;
+            let parent_fields = crate::hotstuff_consensus::parent_executed_fields_or_built(
+                chain_spec.genesis(),
+                &parent_header,
+                parent_built,
+                crate::hotstuff_consensus::PARENT_FIELDS_WAIT,
+            )
+            .ok_or_else(|| {
+                PayloadBuilderError::other(crate::hotstuff_consensus::DeferredExecutionError::ParentUnknown(parent_sealed))
+            })?;
             let fields_ms = (seal_at.elapsed().as_millis() as u64).saturating_sub(root_ms);
             header.transactions_root = transactions_root;
             header.state_root = parent_fields.state_root;
@@ -1702,8 +1706,19 @@ where
         // what this node executed for the parent, or the parent's own header
         // before the fork -- the first header past the fork repeats its
         // parent's fields, the invariant at the switch.
-        let parent_fields = crate::hotstuff_consensus::parent_executed_fields(chain_spec.genesis(), &parent_header)
-            .ok_or_else(|| PayloadBuilderError::other(crate::hotstuff_consensus::DeferredExecutionError::ParentUnknown(parent_header.hash())))?;
+        // The same fallback the early seal has. Without it every build whose
+        // parallel step came up empty -- which is every build made while the
+        // queue is dry -- refused outright on a parent this node had built
+        // itself moments earlier, because its execution was still filed only
+        // under the builder's hash (loop193 W1b: 289 of 347 refusals, each
+        // 0.4-1.3 ms after the request).
+        let parent_fields = crate::hotstuff_consensus::parent_executed_fields_or_built(
+            chain_spec.genesis(),
+            &parent_header,
+            parent_built,
+            crate::hotstuff_consensus::PARENT_FIELDS_WAIT,
+        )
+        .ok_or_else(|| PayloadBuilderError::other(crate::hotstuff_consensus::DeferredExecutionError::ParentUnknown(parent_header.hash())))?;
         header.state_root = parent_fields.state_root;
         header.receipts_root = parent_fields.receipts_root;
         header.logs_bloom = parent_fields.logs_bloom;

@@ -146,6 +146,45 @@ pub fn parent_executed_fields(genesis: &alloy_genesis::Genesis, parent: &SealedH
     crate::executed_fields::get(&parent.hash())
 }
 
+/// How long [`parent_executed_fields_or_built`] waits for a parent that is
+/// still finishing behind its own seal. Generous: it is a stall guard, not a
+/// budget, and the parent's finish is ~65 ms at the bench tier.
+pub const PARENT_FIELDS_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// [`parent_executed_fields`], falling back to the hash the *builder* gave
+/// the parent and waiting for it.
+///
+/// A block's execution is filed under the builder's hash the moment its build
+/// ends (`payload.rs`, both finishes) and copied to the hash consensus sealed
+/// only when the own-block hand-off runs -- which is after the leader has
+/// proposed the block. Anything that builds on that block earlier than the
+/// hand-off therefore asks under a hash nothing has filed yet, and the build
+/// chain (`N42_BUILD_CHAIN`) does exactly that: it starts the next build at
+/// the parent's early seal, ~275 ms before the hand-off.
+///
+/// Measured on loop193 W1b: 289 of 347 refused chained builds were this, all
+/// of them blocks the parallel step left empty -- an empty block skips the
+/// early seal, and the ordinary finish was the one path that looked only
+/// under the sealed hash. The refusal came 0.4-1.3 ms after the request,
+/// which is how it was told apart from a wait that timed out.
+///
+/// The found fields are filed under the sealed hash as well, so the next
+/// caller on that parent needs no fallback.
+pub fn parent_executed_fields_or_built(
+    genesis: &alloy_genesis::Genesis,
+    parent: &SealedHeader,
+    parent_built: Option<B256>,
+    timeout: std::time::Duration,
+) -> Option<crate::executed_fields::ExecutedFields> {
+    if let Some(fields) = parent_executed_fields(genesis, parent) {
+        return Some(fields);
+    }
+    let built = parent_built?;
+    let fields = crate::executed_fields::wait_for(&built, timeout)?;
+    crate::executed_fields::remember(parent.hash(), fields);
+    Some(fields)
+}
+
 pub fn gov5_receipt_root_bloom(receipts: &[Receipt]) -> ReceiptRootBloom {
     let root = gov5_receipts_root(receipts.iter().map(|receipt| ReceiptView {
         success: receipt.success,
@@ -542,6 +581,98 @@ mod tests {
     use alloy_consensus::EMPTY_OMMER_ROOT_HASH;
     use alloy_primitives::Log;
     use n42_h2_consensus::GOV5_NIL_HASH;
+
+    /// A genesis on which every header carries its parent's execution.
+    fn deferred_genesis() -> alloy_genesis::Genesis {
+        let mut genesis = alloy_genesis::Genesis::default();
+        genesis.config.extra_fields.insert(
+            reth_chainspec::qmdb::DEFERRED_EXECUTION_TIME_KEY.to_owned(),
+            serde_json::json!(0),
+        );
+        genesis
+    }
+
+    fn fields(byte: u8) -> crate::executed_fields::ExecutedFields {
+        crate::executed_fields::ExecutedFields {
+            state_root: B256::repeat_byte(byte),
+            receipts_root: B256::repeat_byte(byte + 1),
+            logs_bloom: Default::default(),
+            gas_used: 21_000,
+        }
+    }
+
+    /// The build chain's refusal, in one test: a parent this node built and
+    /// has not yet handed to the engine has its execution filed under the
+    /// hash the *builder* gave it and under no other, and a build that asks
+    /// only under the hash consensus sealed gets nothing.
+    ///
+    /// This is what 289 of 347 refused chained builds on loop193 W1b were.
+    /// The header a chain builds on is sealed ~275 ms before the own-block
+    /// hand-off copies the fields across, so the fallback is not an
+    /// optimisation -- without it the ordinary finish cannot build on a
+    /// parent of this node's own making at all.
+    #[test]
+    fn a_parent_filed_under_the_builders_hash_is_found_through_the_fallback() {
+        let genesis = deferred_genesis();
+        // Distinct per test: the registry is process-wide.
+        let built_hash = B256::repeat_byte(0x71);
+        let sealed = SealedHeader::new(
+            Header { number: 41, timestamp: 1_700_000_000, ..Default::default() },
+            B256::repeat_byte(0x72),
+        );
+        let wait = std::time::Duration::from_millis(50);
+
+        // Nothing filed anywhere: the build must fail, not hang.
+        let at = std::time::Instant::now();
+        assert_eq!(parent_executed_fields_or_built(&genesis, &sealed, Some(built_hash), wait), None);
+        assert!(at.elapsed() >= wait, "a parent that never arrives is waited for, then refused");
+
+        // As the builder leaves it: under the hash it gave the block.
+        crate::executed_fields::remember(built_hash, fields(0xA0));
+        assert_eq!(
+            parent_executed_fields(&genesis, &sealed),
+            None,
+            "the sealed hash is what the hand-off files, and it has not run"
+        );
+        assert_eq!(
+            parent_executed_fields_or_built(&genesis, &sealed, Some(built_hash), wait),
+            Some(fields(0xA0))
+        );
+        // And filed under the sealed hash on the way out, so the next build
+        // on this parent -- and the header check -- need no fallback.
+        assert_eq!(parent_executed_fields(&genesis, &sealed), Some(fields(0xA0)));
+
+        // Without a builder hash there is nothing to fall back to.
+        let other = SealedHeader::new(
+            Header { number: 42, timestamp: 1_700_000_001, ..Default::default() },
+            B256::repeat_byte(0x73),
+        );
+        assert_eq!(parent_executed_fields_or_built(&genesis, &other, None, wait), None);
+    }
+
+    /// A block before the fork carries its own execution, so neither the
+    /// registry nor the fallback is consulted.
+    #[test]
+    fn a_parent_before_the_fork_answers_from_its_own_header() {
+        let mut genesis = alloy_genesis::Genesis::default();
+        genesis.config.extra_fields.insert(
+            reth_chainspec::qmdb::DEFERRED_EXECUTION_TIME_KEY.to_owned(),
+            serde_json::json!(9_000_000_000u64),
+        );
+        let header = Header {
+            number: 41,
+            timestamp: 1_700_000_000,
+            state_root: B256::repeat_byte(0xC1),
+            receipts_root: B256::repeat_byte(0xC2),
+            gas_used: 42_000,
+            ..Default::default()
+        };
+        let sealed = SealedHeader::new(header, B256::repeat_byte(0xC9));
+        let found = parent_executed_fields_or_built(&genesis, &sealed, None, std::time::Duration::ZERO)
+            .expect("its own header is the answer");
+        assert_eq!(found.state_root, B256::repeat_byte(0xC1));
+        assert_eq!(found.gas_used, 42_000);
+    }
 
     #[test]
     fn an_empty_block_commits_to_gov5s_nil_hash_and_an_empty_bloom() {

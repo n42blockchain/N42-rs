@@ -289,6 +289,9 @@ pub struct H2Service<E> {
     /// the whole body after all -- then the copy that arrives is the one
     /// that imports it.
     compact_bodies: HashSet<B256>,
+    /// The order [`Self::compact_bodies`] was filled in, so the oldest is
+    /// what the bound drops.
+    compact_order: std::collections::VecDeque<B256>,
     /// Bodies a proposal named that this node has not seen, with when it
     /// first missed them: the request to peers goes out only after
     /// `body_grace`, because the leader's direct push is normally 30-40 ms
@@ -724,6 +727,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             native_wire: false,
             awaiting_bodies: HashSet::new(),
             compact_bodies: HashSet::new(),
+            compact_order: std::collections::VecDeque::new(),
             body_wait: std::collections::HashMap::new(),
             body_grace: body_request_grace(),
             direct_push: false,
@@ -2265,12 +2269,19 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // than one line.
                 // A compact body this node could not assemble ends here:
                 // forget that it was taken, or the whole body that arrives
-                // next would be recognised as a duplicate and dropped.
-                if self.compact_bodies.remove(&block_hash) {
+                // next would be recognised as a duplicate and dropped. And
+                // ask for the body at once rather than through the grace
+                // below: the grace is for a body still in flight, and this
+                // one has arrived and been read.
+                let compact_fallback = self.compact_bodies.remove(&block_hash);
+                if compact_fallback {
+                    self.compact_order.retain(|hash| hash != &block_hash);
+                }
+                if compact_fallback {
                     self.driver.forget_payload(block_hash);
                     info!(target: "n42.h2.node", ?block_hash, "the compact body did not assemble here; asking for the whole body");
                 }
-                if !self.body_grace.is_zero() && !self.body_store.contains_key(&block_hash) {
+                if !compact_fallback && !self.body_grace.is_zero() && !self.body_store.contains_key(&block_hash) {
                     // Deferred: `request_overdue_bodies` asks once the grace
                     // has passed without the body arriving on its own.
                     self.body_wait.entry(block_hash).or_insert_with(std::time::Instant::now);
@@ -2804,15 +2815,15 @@ impl<E: ExecutionLayer> H2Service<E> {
         if self.body_store.contains_key(&block_hash) || !self.compact_bodies.insert(block_hash) {
             return Ok((block_hash, header, false));
         }
-        while self.compact_bodies.len() > REMEMBERED_TIMESTAMPS {
-            // Bounded the way the other per-block maps are; the oldest is
-            // whichever the set hands back, since this only guards against
-            // a double import within a few views.
-            let Some(oldest) = self.compact_bodies.iter().next().copied() else { break };
-            if oldest == block_hash {
-                break;
+        // Bounded the way the other per-block maps are, oldest first: what
+        // this guards against is a double import of a block whose gossip
+        // copy follows its push, and anything this far back is long
+        // committed.
+        self.compact_order.push_back(block_hash);
+        while self.compact_order.len() > REMEMBERED_TIMESTAMPS {
+            if let Some(oldest) = self.compact_order.pop_front() {
+                self.compact_bodies.remove(&oldest);
             }
-            self.compact_bodies.remove(&oldest);
         }
         self.remember_block(block_hash, &header);
         self.driver.cache_body(n42_h2_execution::ForeignBody {

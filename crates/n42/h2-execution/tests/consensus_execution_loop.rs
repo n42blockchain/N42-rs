@@ -456,6 +456,7 @@ fn body_for(hash: B256, number: u64) -> n42_h2_execution::ForeignBody {
         // is which request the driver makes, not the wire format, which has
         // its own tests in `n42-h2-consensus` and `n42-engine-types`.
         rlp: alloy_primitives::Bytes::from_static(&[0xc0]),
+        compact: false,
     }
 }
 

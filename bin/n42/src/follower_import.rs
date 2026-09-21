@@ -2026,6 +2026,126 @@ mod tests {
         }
     }
 
+    /// The two vote roads on the bench's block shape, side by side: today's
+    /// gossip body (decode the block out of 26 MB, then look every sender
+    /// up) against the compact body (find the block's transactions in this
+    /// node's queue by hash, then recompute the transactions root over what
+    /// was found).
+    ///
+    /// Pinned the way a fleet node runs: `RAYON_NUM_THREADS=16 taskset -c
+    /// 0-31 cargo test --release -p n42 --lib bench_compact_body_road --
+    /// --ignored --nocapture`.
+    ///
+    /// The caveat every bench in this file carries, and this one most: an
+    /// idle pinned box understates what these passes cost on seven nodes.
+    /// Both roads walk tens of megabytes -- one of body bytes, one of queue
+    /// entries scattered across the heap -- and on a node whose six
+    /// neighbours are faulting pages of their own they cost more, never
+    /// less. The transfer this replaces (26 MB to six peers, 43 ms at
+    /// loop194) is not here at all, and neither is the hand-off to the
+    /// blocking pool.
+    #[test]
+    #[ignore = "timing"]
+    fn bench_compact_body_road() {
+        use alloy_consensus::transaction::TxHashRef as _;
+        use alloy_eips::Encodable2718;
+        use n42_h2_consensus::header_profile::N42HeaderProfile;
+        use rayon::prelude::*;
+        use reth_transaction_pool::PoolTransaction as _;
+
+        let (block, _) = bench_fixture(6_000, 27, 2_000_000, 64);
+        let txs = block.body().transactions.clone();
+        let senders: Vec<Address> = block.senders().to_vec();
+        let count = txs.len();
+        let mut header = block.header().clone();
+        header.transactions_root = alloy_consensus::proofs::calculate_transaction_root(&txs);
+        let announced = header.hash_slow();
+        let raw: Vec<alloy_primitives::Bytes> =
+            txs.par_iter().map(|tx| alloy_primitives::Bytes::from(tx.encoded_2718())).collect();
+        let body = n42_h2_consensus::encode_block_rlp_raw(&header, &raw, &[], None);
+        let hashes: Vec<B256> = txs.iter().map(|tx| *tx.tx_hash()).collect();
+        let compact = n42_h2_consensus::encode_compact_body(&body, &hashes, N42HeaderProfile::Ethereum)
+            .expect("the compact body encodes");
+
+        // The queue as this node's ingest leaves it: every transaction of
+        // the block, with the sender the ingest recovered.
+        let queue = n42_tx_queue::TxQueue::<n42_engine_types::N42PooledTransaction>::with_run_length(64)
+            .with_hash_index(count * 2);
+        let fill_at = std::time::Instant::now();
+        queue.push(txs.iter().zip(&senders).map(|(tx, sender)| {
+            n42_engine_types::N42PooledTransaction::new(
+                reth_primitives_traits::Recovered::new_unchecked(tx.clone(), *sender),
+                tx.encoded_2718().len(),
+            )
+        }));
+        queue.drain_now();
+        let fill_ms = fill_at.elapsed().as_millis() as u64;
+
+        let validator = n42_engine_types::engine_validator::N42EngineValidator::new(
+            std::sync::Arc::new((*reth_chainspec::MAINNET).clone()),
+            N42HeaderProfile::Ethereum,
+        );
+        let ms = |at: std::time::Instant| at.elapsed().as_micros() as f64 / 1000.0;
+        println!(
+            "fixture: {count} transactions, body {} MB, compact {} MB, queue filled in {fill_ms} ms",
+            body.len() / 1_000_000,
+            compact.len() / 1_000_000,
+        );
+
+        for round in 0..3 {
+            // Today's road: the body decoded once into the block, then a
+            // sender per transaction out of the recovery cache. The cache is
+            // filled first, because on the fleet the ingest filled it before
+            // the block existed -- a leg that measured recovery here would
+            // be measuring something no follower does.
+            let decode_at = std::time::Instant::now();
+            let (decoded, _) = validator
+                .convert_body_to_block(announced, N42HeaderProfile::Ethereum, &body)
+                .expect("the body converts");
+            let decode_ms = ms(decode_at);
+            let cache = reth_evm::SenderRecoveryCache::new(count.next_power_of_two() * 2);
+            let filled: usize = decoded
+                .body()
+                .transactions
+                .par_iter()
+                .filter(|tx| cache.recover(*tx).is_ok())
+                .count();
+            let senders_at = std::time::Instant::now();
+            let found = decoded
+                .body()
+                .transactions
+                .par_iter()
+                .filter(|tx| cache.get(tx.tx_hash()).is_some())
+                .count();
+            let senders_ms = ms(senders_at);
+
+            // The compact road: the hashes looked up in the queue, the
+            // transactions root recomputed over what came back, and the
+            // block put together from it.
+            let compact_at = std::time::Instant::now();
+            let assembled = validator
+                .convert_compact_body_to_block(
+                    announced,
+                    N42HeaderProfile::Ethereum,
+                    &compact,
+                    &queue,
+                    std::time::Duration::ZERO,
+                )
+                .expect("the compact body assembles");
+            let compact_ms = ms(compact_at);
+            assert_eq!(assembled.block.hash(), decoded.hash(), "the two roads are the same block");
+            assert_eq!(assembled.senders, senders, "and the senders are the queue's");
+            println!(
+                "round {round}: body decode {decode_ms:.1} + senders {senders_ms:.1} (cached {filled},                  found {found}) = {:.1} | compact {compact_ms:.1} = assemble {:.1} + root {:.1} +                  rest {:.1}, misses {}",
+                decode_ms + senders_ms,
+                assembled.assemble_us as f64 / 1000.0,
+                assembled.root_us as f64 / 1000.0,
+                (assembled.total_us.saturating_sub(assembled.assemble_us + assembled.root_us)) as f64 / 1000.0,
+                assembled.misses,
+            );
+        }
+    }
+
     /// The copies the vote road makes of a bench-tier block, each on its own.
     /// loop190 read 50 ms of a 167 ms road that no named part accounted for;
     /// these are the candidates on it that are work rather than a wait, and

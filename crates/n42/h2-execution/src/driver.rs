@@ -1323,7 +1323,10 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                 // on is the whole body from a peer. Reported as "not yet",
                 // which is what makes the loop ask for it.
                 if answered.is_none() && body.compact && payload.is_none() {
-                    info!(
+                    // Debug: the node logs one info line per fallback where
+                    // the whole body is asked for, and two lines for one
+                    // event in one process is noise.
+                    debug!(
                         target: "n42.h2.el",
                         block = ?block_hash,
                         bytes = body.rlp.len(),

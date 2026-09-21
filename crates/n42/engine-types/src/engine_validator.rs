@@ -397,14 +397,22 @@ where
             });
         }
         let unzip_at = std::time::Instant::now();
+        // The transactions and the senders this node recorded for them when
+        // it ingested them. `flatten` rather than an unwrap: the loop above
+        // returned on any miss, and a list shorter than the body's is
+        // checked for below rather than trusted to be impossible.
         let (transactions, senders): (Vec<TransactionSigned>, Vec<alloy_primitives::Address>) = held
             .into_iter()
-            .map(|held| {
-                let held = held.expect("every hash resolved above");
-                let (tx, sender) = held.transaction.clone_into_consensus().into_parts();
-                (tx, sender)
-            })
+            .flatten()
+            .map(|held| held.transaction.clone_into_consensus().into_parts())
             .unzip();
+        if transactions.len() != body.hashes.len() {
+            return Err(CompactBodyError::Missing {
+                missing: body.hashes.len() - transactions.len(),
+                first: body.hashes.first().copied().unwrap_or_default(),
+                waited: waited_at.elapsed(),
+            });
+        }
         let assemble_us = (first_pass + unzip_at.elapsed()).as_micros() as u64;
 
         // What binds the assembled list to the header: the trie over the

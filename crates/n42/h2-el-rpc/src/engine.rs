@@ -153,7 +153,6 @@ enum BuildFrame {
     Built(Box<Result<BuiltBlock, ElError>>),
 }
 
-/// Reads one frame of a build-on-own answer.
 /// The transaction-hash tail the execution layer appends when the request
 /// asked for it (`request::GET_PAYLOAD_HASHED`, `BUILD_ON_OWN`'s hash tail).
 ///
@@ -177,6 +176,7 @@ async fn read_hash_tail(
     Ok(raw.chunks_exact(32).map(B256::from_slice).collect())
 }
 
+/// Reads one frame of a build-on-own answer.
 async fn read_build_frame(
     stream: &mut tokio::net::TcpStream,
     beacon_root: B256,

@@ -193,8 +193,8 @@ enum Staged<T: PoolTransaction> {
 
 /// How many shards the by-hash index is split into. A block's assembly looks
 /// up 163,000 hashes at once on the worker pool while the drain is inserting
-/// the next block's worth; one lock for both made the two wait on each
-/// other, and the hashes spread evenly over the shards by their first byte.
+/// the next block's worth, and the hashes spread evenly over the shards by
+/// their first byte. One lock for the whole index serialises the two.
 const HASH_INDEX_SHARDS: usize = 64;
 
 /// One shard of the by-hash index: the transactions under their hashes, and
@@ -220,7 +220,7 @@ struct HashShard<T: PoolTransaction> {
 /// that was leader a moment ago must be able to assemble its successor's
 /// block. Only the bound drops them.
 struct HashIndex<T: PoolTransaction> {
-    shards: Vec<Mutex<HashShard<T>>>,
+    shards: Vec<parking_lot::RwLock<HashShard<T>>>,
     /// The bound per shard: the whole index holds `HASH_INDEX_SHARDS` times
     /// this many.
     per_shard: usize,
@@ -231,19 +231,23 @@ impl<T: PoolTransaction> HashIndex<T> {
         let per_shard = cap.div_ceil(HASH_INDEX_SHARDS).max(1);
         Self {
             shards: (0..HASH_INDEX_SHARDS)
-                .map(|_| Mutex::new(HashShard { by_hash: Default::default(), order: VecDeque::new() }))
+                .map(|_| {
+                    parking_lot::RwLock::new(HashShard { by_hash: Default::default(), order: VecDeque::new() })
+                })
                 .collect(),
             per_shard,
         }
     }
 
-    fn shard_of(&self, hash: &B256) -> &Mutex<HashShard<T>> {
+    fn shard_of(&self, hash: &B256) -> &parking_lot::RwLock<HashShard<T>> {
+        // A transaction hash is a keccak output, so any byte of it spreads
+        // evenly; the first is as good as any.
         &self.shards[usize::from(hash.0[0]) % HASH_INDEX_SHARDS]
     }
 
     fn insert(&self, transaction: &Arc<ValidPoolTransaction<T>>) {
         let hash = *transaction.hash();
-        let mut shard = self.shard_of(&hash).lock();
+        let mut shard = self.shard_of(&hash).write();
         if shard.by_hash.insert(hash, Arc::clone(transaction)).is_none() {
             shard.order.push_back(hash);
             while shard.order.len() > self.per_shard {
@@ -255,11 +259,15 @@ impl<T: PoolTransaction> HashIndex<T> {
     }
 
     fn get(&self, hash: &B256) -> Option<Arc<ValidPoolTransaction<T>>> {
-        self.shard_of(hash).lock().by_hash.get(hash).cloned()
+        // A read lock, so the worker pool's 163,000 look-ups do not
+        // serialise against each other while the drain writes the next
+        // block's worth into another shard: 41-47 ns each at the bench tier
+        // (`bench_hash_index`).
+        self.shard_of(hash).read().by_hash.get(hash).cloned()
     }
 
     fn len(&self) -> usize {
-        self.shards.iter().map(|shard| shard.lock().by_hash.len()).sum()
+        self.shards.iter().map(|shard| shard.read().by_hash.len()).sum()
     }
 }
 
@@ -1065,12 +1073,141 @@ mod tests {
         EthPooledTransaction::new(recovered, 120)
     }
 
+    /// [`tx_of`] with a hash of its own. The fixtures here leave the cached
+    /// hash at zero, which is fine for a queue keyed by sender and nonce and
+    /// not for one looked up by hash.
+    fn tx_hashed(sender: Address, nonce: u64) -> EthPooledTransaction {
+        use alloy_consensus::{Signed, TxEip1559};
+        let inner = TxEip1559 { chain_id: 1, nonce, gas_limit: 21_000, max_fee_per_gas: 10, max_priority_fee_per_gas: 1, to: TxKind::Call(Address::repeat_byte(9)), value: U256::from(1), ..Default::default() };
+        // Keccak, because a real transaction hash is one: the index shards
+        // on the hash's first byte, and a fixture whose hashes all begin
+        // with the same byte would measure one shard rather than the index.
+        let mut seed = [0u8; 28];
+        seed[..20].copy_from_slice(sender.as_slice());
+        seed[20..].copy_from_slice(&nonce.to_be_bytes());
+        let signed = Signed::new_unchecked(inner, Signature::test_signature(), alloy_primitives::keccak256(seed));
+        let recovered = reth_primitives_traits::Recovered::new_unchecked(reth_ethereum_primitives::TransactionSigned::from(signed), sender);
+        EthPooledTransaction::new(recovered, 120)
+    }
+
     fn tx_of(sender: Address, nonce: u64) -> EthPooledTransaction {
         use alloy_consensus::{Signed, TxEip1559};
         let inner = TxEip1559 { chain_id: 1, nonce, gas_limit: 21_000, max_fee_per_gas: 10, max_priority_fee_per_gas: 1, to: TxKind::Call(Address::repeat_byte(9)), value: U256::from(1), ..Default::default() };
         let signed = Signed::new_unchecked(inner, Signature::test_signature(), Default::default());
         let recovered = reth_primitives_traits::Recovered::new_unchecked(reth_ethereum_primitives::TransactionSigned::from(signed), sender);
         EthPooledTransaction::new(recovered, 120)
+    }
+
+    /// What the by-hash index costs the side that fills it, and what it
+    /// gives the side that reads it, at the bench tier.
+    ///
+    /// The drain is the fleet's supply path: a microsecond a transaction
+    /// here is 163 ms a block of one core, so this is the number that says
+    /// whether the compact body may be turned on at all. Pinned:
+    /// `RAYON_NUM_THREADS=16 taskset -c 0-31 cargo test --release -p
+    /// n42-tx-queue --lib bench_hash_index -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing"]
+    fn bench_hash_index() {
+        let senders = 6_000u64;
+        let per = 27u64;
+        let count = (senders * per) as usize;
+        let build = || {
+            let mut all = Vec::with_capacity(count);
+            for n in 0..per {
+                for s in 0..senders {
+                    let mut a = [0u8; 20];
+                    a[..8].copy_from_slice(&(s + 1).to_be_bytes());
+                    all.push(tx_hashed(Address::from(a), n));
+                }
+            }
+            all
+        };
+        for (what, queue) in [
+            ("without", TxQueue::<EthPooledTransaction>::with_run_length(64)),
+            ("with   ", TxQueue::<EthPooledTransaction>::with_run_length(64).with_hash_index(count * 2)),
+        ] {
+            let all = build();
+            let hashes: Vec<B256> = all.iter().map(|t| *t.hash()).collect();
+            queue.push(all);
+            let at = std::time::Instant::now();
+            queue.drain_now();
+            let drain = at.elapsed();
+            let at = std::time::Instant::now();
+            let found = queue.get_by_hashes(&hashes).iter().filter(|t| t.is_some()).count();
+            let lookup = at.elapsed();
+            eprintln!(
+                "{what} index: drain {count} in {drain:?} = {:.0} ns/tx | look {count} up in \
+                 {lookup:?} = {:.0} ns/tx, found {found}",
+                drain.as_nanos() as f64 / count as f64,
+                lookup.as_nanos() as f64 / count as f64,
+            );
+        }
+    }
+
+    /// A transaction a build has taken, and one an own block is holding, are
+    /// still found by hash: a follower that was leader a moment ago has to
+    /// assemble the block after its own out of the same queue, and both of
+    /// those have left the lanes.
+    #[test]
+    fn the_index_still_holds_what_a_build_took_and_what_a_block_holds() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(1).with_hash_index(64);
+        let first = tx_hashed(Address::repeat_byte(1), 0);
+        let second = tx_hashed(Address::repeat_byte(2), 0);
+        let (taken, held) = (*first.hash(), *second.hash());
+        queue.push(vec![first, second]);
+        queue.drain_now();
+
+        // One goes out with a build and stays out until the build is given
+        // back; the other is carried away by an own block the chain has not
+        // settled yet.
+        let mut best = queue.best_for_build(B256::repeat_byte(1));
+        let taken_tx = best.next().expect("a build takes one");
+        let held_tx = best.next().expect("and the other");
+        drop(best);
+        let removed = queue.remove_mined_batch_collecting([(held_tx.sender(), held_tx.nonce())]);
+        queue.hold_own_block(1, B256::repeat_byte(9), removed);
+        assert_eq!(taken_tx.hash(), &taken);
+
+        let found = queue.get_by_hashes(&[taken, held]);
+        assert!(found[0].is_some(), "the build's transaction is still findable");
+        assert!(found[1].is_some(), "and so is the held block's");
+        assert_eq!(queue.hash_index_len(), 2);
+    }
+
+    /// The index is a cache: what it does not hold is a miss, never a wrong
+    /// transaction, and a queue that keeps none misses everything.
+    #[test]
+    fn a_queue_without_an_index_finds_nothing_and_says_so() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(1);
+        let one = tx_hashed(Address::repeat_byte(1), 0);
+        let hash = *one.hash();
+        queue.push(vec![one]);
+        queue.drain_now();
+        assert!(!queue.has_hash_index());
+        assert_eq!(queue.hash_index_len(), 0);
+        assert!(queue.get_by_hashes(&[hash])[0].is_none());
+        assert_eq!(queue.len(), 1, "and the queue itself is untouched");
+    }
+
+    /// The bound drops the oldest and keeps the newest, so an index sized
+    /// above the queue's depth always holds what the next block names.
+    #[test]
+    fn the_index_is_bounded_by_what_it_was_sized_for() {
+        // One entry per shard, so the bound bites wherever the hashes fall.
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(1).with_hash_index(HASH_INDEX_SHARDS);
+        let mut hashes = Vec::new();
+        for n in 0..400u64 {
+            let t = tx_hashed(Address::repeat_byte(7), n);
+            hashes.push(*t.hash());
+            queue.push(vec![t]);
+            queue.drain_now();
+        }
+        assert!(queue.hash_index_len() <= HASH_INDEX_SHARDS, "the bound holds");
+        assert!(queue.hash_index_len() > 0);
+        assert_eq!(queue.len(), 400, "and the queue itself is not bounded by it");
+        let found = queue.get_by_hashes(&hashes);
+        assert!(found.last().expect("the newest").is_some(), "the newest is kept");
     }
 
     /// The queue's own cost per transaction at the bench tier's shape

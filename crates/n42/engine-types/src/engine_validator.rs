@@ -73,6 +73,166 @@ impl<ChainSpec> N42EngineValidator<ChainSpec> {
     }
 }
 
+impl<ChainSpec> N42EngineValidator<ChainSpec>
+where
+    ChainSpec: EthChainSpec + EthereumHardforks + 'static,
+{
+    /// The block a gossip body describes, decoded once
+    /// (`request::FOREIGN_BODY`).
+    ///
+    /// The twin of [`PayloadValidator::convert_payload_to_block`] for the
+    /// bytes a follower actually received: `[header, transactions,
+    /// verifiers, rewards]` as the producer put them on the wire. It ends
+    /// where the payload conversion ends -- the same [`SealedBlock`] the
+    /// import takes -- and hands back the [`ExecutionData`] beside it,
+    /// because the engine's own pass still wants a payload and building one
+    /// from parts already decoded costs a copy of the transaction bytes
+    /// rather than a second parse.
+    ///
+    /// Every check the payload path runs is here, against the same values:
+    ///
+    /// - the header profile, and the rewards against the header's
+    ///   withdrawals root (`decode_raw_block_body`);
+    /// - the block hash the consensus layer voted on, twice: once against
+    ///   the keccak of the header bytes as they arrived, before anything
+    ///   expensive, and once against the sealed header, which also rejects a
+    ///   header whose RLP is not canonical;
+    /// - the transactions root. On the payload path the root is *computed*
+    ///   and written into the reconstructed header, so the block hash binds
+    ///   it; here the header arrives with its own root and the computed one
+    ///   is compared against it, which binds the transactions to the block
+    ///   the same way;
+    /// - reth's well-formedness checks for Shanghai, Cancun and Prague, on
+    ///   the same block and the same sidecar.
+    ///
+    /// What it does *not* do is reconstruct gov5's header by trying the
+    /// variants against the hash: the body carries the header the producer
+    /// sealed, ommers hash and difficulty included.
+    ///
+    /// The transactions are decoded from slices of `rlp` and their bytes
+    /// copied for the payload in the same parallel pass. The copy is
+    /// deliberate: a slice keeps the whole ~25 MB body alive for as long as
+    /// anything downstream holds one transaction's bytes, which grew this
+    /// process by ~19 MB a block when the payload frame was decoded that way
+    /// (loop60N1). The body itself is dropped when this returns.
+    pub fn convert_body_to_block(
+        &self,
+        announced: B256,
+        profile: N42HeaderProfile,
+        rlp: &alloy_primitives::Bytes,
+    ) -> Result<(SealedBlock<EthBlock>, ExecutionData), NewPayloadError> {
+        use alloy_eips::eip4895::Withdrawals;
+        let other = |message: String| NewPayloadError::Other(message.into());
+        if profile != self.profile {
+            return Err(other(format!(
+                "body read under the {profile:?} header profile, this chain is {:?}",
+                self.profile
+            )));
+        }
+        let started = std::time::Instant::now();
+        // One walk of the body: the header, the transactions as slices of
+        // it, the rewards as withdrawals, the access list.
+        let body = n42_h2_consensus::decode_raw_block_body(rlp, Some(rlp), profile)
+            .map_err(|err| other(err.to_string()))?;
+        if body.block_hash != announced {
+            return Err(other(format!(
+                "body is block {} and not the announced {announced}",
+                body.block_hash
+            )));
+        }
+        let walked = started.elapsed();
+        let tx_count = body.transactions.len();
+
+        // The root and the transactions, together, as the payload
+        // conversion does it -- and the owned copies of the bytes in the
+        // same pass, since it is already touching them.
+        let (transactions_root, decoded) = rayon::join(
+            || crate::assembler::parallel_ordered_trie_root(&body.transactions),
+            || {
+                use rayon::prelude::*;
+                // Into a `Vec<Result>`, which rayon writes in place;
+                // collecting straight into a `Result<Vec>` takes its
+                // short-circuiting path and cost three times as much at
+                // 163,000 items (round 43, `bench_convert_payload`).
+                body.transactions
+                    .par_iter()
+                    .map(|tx| {
+                        let decoded = <TransactionSigned as alloy_eips::Decodable2718>::decode_2718_exact(
+                            tx.as_ref(),
+                        )
+                        .map_err(alloy_rlp::Error::from)
+                        .map_err(PayloadError::from)?;
+                        Ok::<_, PayloadError>((decoded, alloy_primitives::Bytes::copy_from_slice(tx)))
+                    })
+                    .collect::<Vec<Result<_, _>>>()
+            },
+        );
+        let joined = started.elapsed();
+        let (transactions, raw_transactions): (Vec<_>, Vec<_>) =
+            decoded.into_iter().collect::<Result<Vec<_>, _>>()?.into_iter().unzip();
+        if transactions_root != body.header.transactions_root {
+            return Err(PayloadError::BlockHash {
+                execution: transactions_root,
+                consensus: body.header.transactions_root,
+            }
+            .into());
+        }
+
+        // The payload the engine's own pass will take, built from the same
+        // parts rather than parsed again.
+        let payload = n42_h2_consensus::execution_data_from_raw_parts(
+            body.block_hash,
+            &body.header,
+            raw_transactions,
+            body.withdrawals.clone(),
+            body.bal.clone(),
+        );
+
+        let withdrawals = body.header.withdrawals_root.map(|_| Withdrawals(body.withdrawals));
+        let block = alloy_consensus::Block {
+            header: body.header,
+            body: alloy_consensus::BlockBody { transactions, ommers: Vec::new(), withdrawals },
+        };
+        let sealed = SealedBlock::seal_slow(block);
+        if sealed.hash() != announced {
+            return Err(PayloadError::BlockHash { execution: sealed.hash(), consensus: announced }.into());
+        }
+        let sealed_at = started.elapsed();
+
+        // reth's checks on the block and its sidecar, the same three the
+        // payload conversion runs.
+        let timestamp = sealed.timestamp;
+        reth_payload_validator::shanghai::ensure_well_formed_fields(
+            sealed.body(),
+            self.chain_spec.is_shanghai_active_at_timestamp(timestamp),
+        )?;
+        reth_payload_validator::cancun::ensure_well_formed_fields(
+            &sealed,
+            payload.sidecar.cancun(),
+            self.chain_spec.is_cancun_active_at_timestamp(timestamp),
+        )?;
+        reth_payload_validator::prague::ensure_well_formed_fields(
+            sealed.body(),
+            payload.sidecar.prague(),
+            self.chain_spec.is_prague_active_at_timestamp(timestamp),
+        )?;
+        if tx_count >= 10_000 {
+            tracing::info!(
+                target: "n42::engine_validator",
+                number = sealed.number,
+                txs = tx_count,
+                walk_ms = walked.as_millis() as u64,
+                join_ms = joined.saturating_sub(walked).as_millis() as u64,
+                seal_ms = sealed_at.saturating_sub(joined).as_millis() as u64,
+                checks_ms = started.elapsed().saturating_sub(sealed_at).as_millis() as u64,
+                total_ms = started.elapsed().as_millis() as u64,
+                "body converted"
+            );
+        }
+        Ok((sealed, payload))
+    }
+}
+
 impl<ChainSpec, Types> PayloadValidator<Types> for N42EngineValidator<ChainSpec>
 where
     ChainSpec: EthChainSpec + EthereumHardforks + 'static,
@@ -448,6 +608,218 @@ mod tests {
     /// access-list hash is EIP-7928's, its slot number set -- converts back
     /// to the same hash through the parallel conversion. Round ams4k refused
     /// every Amsterdam block at number 1 with "no gov5 header variant".
+
+    /// The wire form of a block whose payload is `payload`, as a producer
+    /// puts it on gov5's block topic: `[header, txs, verifiers, rewards]`.
+    fn body_for(payload: &ExecutionData, header: &Header) -> Bytes {
+        let rewards = n42_h2_consensus::withdrawals_to_rewards(
+            payload.payload.as_v2().map_or(&[][..], |v2| v2.withdrawals.as_slice()),
+        );
+        let bal = match &payload.payload {
+            alloy_rpc_types_engine::ExecutionPayload::V4(v4) => Some(v4.block_access_list.clone()),
+            _ => None,
+        };
+        Bytes::from(n42_h2_consensus::encode_block_rlp_raw(
+            header,
+            &payload.payload.as_v1().transactions,
+            &rewards,
+            bal.as_ref(),
+        ))
+    }
+
+    /// Transactions of every type this chain carries, so the body path and
+    /// the payload path are compared on all three decoders: legacy,
+    /// EIP-1559, and N42's 0x50 (AltSig).
+    fn mixed_transactions() -> Vec<TransactionSigned> {
+        use alloy_consensus::{Signed, TxEip1559, TxLegacy};
+        use alloy_primitives::{Address, Signature, TxKind};
+        let legacy = TxLegacy {
+            chain_id: Some(1),
+            nonce: 1,
+            gas_price: 10_000_000_000,
+            gas_limit: 21_000,
+            to: TxKind::Call(Address::repeat_byte(0x11)),
+            value: U256::from(1),
+            input: Bytes::new(),
+        };
+        let eip1559 = TxEip1559 {
+            chain_id: 1,
+            nonce: 2,
+            gas_limit: 21_000,
+            max_fee_per_gas: 10_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            to: TxKind::Call(Address::repeat_byte(0x22)),
+            value: U256::from(2),
+            ..Default::default()
+        };
+        // The signature is never checked by a decode; what is under test is
+        // that the body path and the payload path read the same bytes the
+        // same way.
+        let alt = n42_tx_types::AltSigTx::new(
+            n42_tx_types::TxAltSig {
+                chain_id: 1,
+                nonce: 3,
+                max_priority_fee_per_gas: 1_000_000_000,
+                max_fee_per_gas: 10_000_000_000,
+                gas_limit: 21_000,
+                to: Address::repeat_byte(0x66),
+                value: U256::from(3),
+                input: Bytes::new(),
+                access_list: Default::default(),
+                alg_type: n42_tx_types::ALG_ED25519,
+                pubkey: Bytes::from(vec![7u8; 32]),
+            },
+            Bytes::from(vec![8u8; 64]),
+        );
+        vec![
+            TransactionSigned::Eth(alloy_consensus::TxEnvelope::Legacy(Signed::new_unchecked(
+                legacy,
+                Signature::test_signature(),
+                B256::repeat_byte(0x33),
+            )).into()),
+            TransactionSigned::Eth(alloy_consensus::TxEnvelope::Eip1559(Signed::new_unchecked(
+                eip1559,
+                Signature::test_signature(),
+                B256::repeat_byte(0x44),
+            )).into()),
+            TransactionSigned::AltSig(alt),
+        ]
+    }
+
+    /// The whole point: a block decoded from the bytes the gossip delivered
+    /// is the block the payload conversion produces from the same block --
+    /// same hash, same transactions, same withdrawals -- for every
+    /// transaction type this chain carries.
+    #[test]
+    fn a_body_converts_to_the_block_the_payload_conversion_produces() {
+        use alloy_eips::Encodable2718;
+        let transactions = mixed_transactions();
+        let raw: Vec<Bytes> = transactions.iter().map(|tx| Bytes::from(tx.encoded_2718())).collect();
+        let mut header = gov5_header(B256::ZERO, U256::ZERO);
+        header.transactions_root = alloy_consensus::proofs::calculate_transaction_root(&transactions);
+        header.gas_used = 63_000;
+        let withdrawals = vec![alloy_eips::eip4895::Withdrawal {
+            index: 0,
+            validator_index: 0,
+            address: alloy_primitives::Address::repeat_byte(0x55),
+            amount: 1_000_000_000,
+        }];
+        header.withdrawals_root =
+            Some(n42_h2_consensus::gov5_rewards_root(n42_h2_consensus::withdrawals_to_rewards(&withdrawals)));
+        let payload = n42_h2_consensus::execution_data_from_raw_parts(
+            B256::ZERO,
+            &header,
+            raw,
+            withdrawals,
+            None,
+        );
+        let hash = header.hash_slow();
+        let mut payload = payload;
+        payload.payload.as_v1_mut().block_hash = hash;
+        let body = body_for(&payload, &header);
+
+        let validator = validator(N42HeaderProfile::Gov5H2);
+        let from_payload = convert(&validator, payload.clone()).expect("the payload converts");
+        let (from_body, rebuilt) = validator
+            .convert_body_to_block(hash, N42HeaderProfile::Gov5H2, &body)
+            .expect("the body converts");
+
+        assert_eq!(from_body.hash(), from_payload.hash());
+        assert_eq!(from_body.hash(), hash);
+        assert_eq!(from_body.header(), from_payload.header());
+        assert_eq!(from_body.body().transactions, from_payload.body().transactions);
+        assert_eq!(from_body.body().withdrawals, from_payload.body().withdrawals);
+        // And the payload it hands back is the one the validator would have
+        // sent, so the engine's own pass sees no difference.
+        assert_eq!(format!("{rebuilt:?}"), format!("{payload:?}"));
+    }
+
+    #[test]
+    fn a_body_that_is_not_the_announced_block_is_refused() {
+        let header = gov5_header(B256::ZERO, U256::ZERO);
+        let payload = payload_for(header.clone());
+        let body = body_for(&payload, &header);
+        let validator = validator(N42HeaderProfile::Gov5H2);
+        assert!(validator
+            .convert_body_to_block(B256::repeat_byte(0xEE), N42HeaderProfile::Gov5H2, &body)
+            .is_err());
+        // And the right hash still converts, so the refusal is the hash and
+        // nothing else.
+        assert!(validator
+            .convert_body_to_block(header.hash_slow(), N42HeaderProfile::Gov5H2, &body)
+            .is_ok());
+    }
+
+    #[test]
+    fn a_corrupted_body_is_refused_rather_than_decoded_into_something_else() {
+        use alloy_eips::Encodable2718;
+        let transactions = mixed_transactions();
+        let raw: Vec<Bytes> = transactions.iter().map(|tx| Bytes::from(tx.encoded_2718())).collect();
+        let mut header = gov5_header(B256::ZERO, U256::ZERO);
+        header.transactions_root = alloy_consensus::proofs::calculate_transaction_root(&transactions);
+        header.gas_used = 63_000;
+        let payload = n42_h2_consensus::execution_data_from_raw_parts(
+            B256::ZERO,
+            &header,
+            raw,
+            Vec::new(),
+            None,
+        );
+        let hash = header.hash_slow();
+        let body = body_for(&payload, &header);
+        let validator = validator(N42HeaderProfile::Gov5H2);
+        assert!(validator.convert_body_to_block(hash, N42HeaderProfile::Gov5H2, &body).is_ok());
+
+        // Truncated, padded, and a byte flipped inside the transactions: none
+        // of these may produce a block.
+        let mut truncated = body.to_vec();
+        truncated.pop();
+        assert!(validator
+            .convert_body_to_block(hash, N42HeaderProfile::Gov5H2, &Bytes::from(truncated))
+            .is_err());
+        let mut padded = body.to_vec();
+        padded.push(0);
+        assert!(validator
+            .convert_body_to_block(hash, N42HeaderProfile::Gov5H2, &Bytes::from(padded))
+            .is_err());
+        let mut flipped = body.to_vec();
+        let last = flipped.len() - 8;
+        flipped[last] ^= 0xff;
+        assert!(validator
+            .convert_body_to_block(hash, N42HeaderProfile::Gov5H2, &Bytes::from(flipped))
+            .is_err());
+    }
+
+    /// A body whose transactions are not the ones the header commits to --
+    /// the check the payload path gets for free, because there the root is
+    /// computed into the header the hash is taken over.
+    #[test]
+    fn transactions_that_do_not_hash_to_the_headers_root_are_refused() {
+        use alloy_eips::Encodable2718;
+        let transactions = mixed_transactions();
+        let raw: Vec<Bytes> = transactions.iter().map(|tx| Bytes::from(tx.encoded_2718())).collect();
+        let mut header = gov5_header(B256::ZERO, U256::ZERO);
+        // The root of a *different* list, sealed into the header.
+        header.transactions_root =
+            alloy_consensus::proofs::calculate_transaction_root(&transactions[..1]);
+        header.gas_used = 63_000;
+        let rewards: Vec<(alloy_primitives::Address, U256)> = Vec::new();
+        let body = Bytes::from(n42_h2_consensus::encode_block_rlp_raw(&header, &raw, &rewards, None));
+        let hash = header.hash_slow();
+        assert!(validator(N42HeaderProfile::Gov5H2)
+            .convert_body_to_block(hash, N42HeaderProfile::Gov5H2, &body)
+            .is_err());
+    }
+
+    #[test]
+    fn a_body_read_under_the_wrong_profile_is_refused() {
+        let header = gov5_header(B256::ZERO, U256::ZERO);
+        let payload = payload_for(header.clone());
+        let body = body_for(&payload, &header);
+        assert!(validator(N42HeaderProfile::Gov5H2)
+            .convert_body_to_block(header.hash_slow(), N42HeaderProfile::Ethereum, &body)
+            .is_err());
+    }
     #[test]
     fn an_amsterdam_block_converts_through_the_parallel_path() {
         let bal = Bytes::from(alloy_rlp::encode(&alloy_eip7928::BlockAccessList::default()));

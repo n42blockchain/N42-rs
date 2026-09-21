@@ -1246,14 +1246,16 @@ impl<E: ExecutionLayer> H2Service<E> {
                             self.accept_body_once(alloy_primitives::Bytes::from(rlp))
                                 .map_err(|err| err.to_string())
                         }) {
-                        Ok((block_hash, header)) => {
+                        Ok((block_hash, header, fresh)) => {
                             if let Some(peer) = from {
                                 self.note_peer_height(peer, header.number);
                             }
-                            self.import_eagerly(block_hash);
-                            self.body_arrived.insert(block_hash, std::time::Instant::now());
-                            info!(target: "n42.h2.node", ?block_hash, "block body received (header only)");
-                            self.received_bodies.push(block_hash);
+                            if fresh {
+                                self.import_eagerly(block_hash);
+                                self.body_arrived.insert(block_hash, std::time::Instant::now());
+                                info!(target: "n42.h2.node", ?block_hash, "block body received (header only)");
+                                self.received_bodies.push(block_hash);
+                            }
                         }
                         Err(err) => {
                             let head = data.iter().take(256).map(|b| format!("{b:02x}")).collect::<String>();
@@ -1320,11 +1322,11 @@ impl<E: ExecutionLayer> H2Service<E> {
                     // The same path a gossiped body takes; the hash the peer
                     // sent it under is checked by the decode, not trusted.
                     match self.accept_body_once(chunk.rlp) {
-                        Ok((block_hash, _)) if block_hash == hash => {
+                        Ok((block_hash, _, _)) if block_hash == hash => {
                             self.import_eagerly(hash);
                             self.received_bodies.push(hash);
                         }
-                        Ok((got, _)) => {
+                        Ok((got, _, _)) => {
                             debug!(target: "n42.h2.node", %peer, ?hash, ?got, "peer answered a block request with the wrong block");
                         }
                         Err(err) => {
@@ -1357,17 +1359,14 @@ impl<E: ExecutionLayer> H2Service<E> {
             },
             TransportEvent::BlockPushed { peer, chunk } if n42_h2_execution::body_once() => {
                 // As below, with only the header read here.
-                match n42_h2_consensus::decode_block_body_header(&chunk.rlp, self.header_profile) {
-                    Ok((hash, _)) if self.body_store.contains_key(&hash) => {
+                match self.accept_body_once(chunk.rlp) {
+                    Ok((hash, _, true)) => {
+                        self.import_eagerly(hash);
+                        self.received_bodies.push(hash);
+                    }
+                    Ok((hash, _, false)) => {
                         debug!(target: "n42.h2.node", %peer, ?hash, "a pushed body this node already holds");
                     }
-                    Ok(_) => match self.accept_body_once(chunk.rlp.clone()) {
-                        Ok((hash, _)) => {
-                            self.import_eagerly(hash);
-                            self.received_bodies.push(hash);
-                        }
-                        Err(err) => debug!(target: "n42.h2.node", %peer, %err, "a pushed body could not be read"),
-                    },
                     Err(err) => debug!(target: "n42.h2.node", %peer, %err, "a pushed body could not be read"),
                 }
             }
@@ -2473,12 +2472,18 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// store serves peers from these same bytes, and the payload is made --
     /// off the vote road, on the import's own task -- only if the execution
     /// layer refuses the body.
+    /// Idempotent, and says whether this body was new: a body arrives twice
+    /// on a fleet that pushes and gossips, and the second copy must not be
+    /// imported again.
     fn accept_body_once(
         &mut self,
         rlp: alloy_primitives::Bytes,
-    ) -> Result<(B256, Header), n42_h2_consensus::BlockBodyError> {
+    ) -> Result<(B256, Header, bool), n42_h2_consensus::BlockBodyError> {
         let (block_hash, header) =
             n42_h2_consensus::decode_block_body_header(&rlp, self.header_profile)?;
+        if self.body_store.contains_key(&block_hash) {
+            return Ok((block_hash, header, false));
+        }
         self.remember_block(block_hash, &header);
         self.driver.cache_body(n42_h2_execution::ForeignBody {
             block_hash,
@@ -2488,7 +2493,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             rlp: rlp.clone(),
         });
         self.remember_body(block_hash, rlp);
-        Ok((block_hash, header))
+        Ok((block_hash, header, true))
     }
 
     fn remember_block(&mut self, block_hash: B256, header: &Header) {
@@ -2658,19 +2663,16 @@ impl<E: ExecutionLayer> H2Service<E> {
             // the driver and the frame the execution layer is sent.
             let shared = alloy_primitives::Bytes::copy_from_slice(&rlp[..]);
             drop(rlp);
-            match n42_h2_consensus::decode_block_body_header(&shared, self.header_profile) {
-                Ok((hash, _)) if self.body_store.contains_key(&hash) => {
+            match self.accept_body_once(shared) {
+                Ok((hash, _, true)) => {
+                    self.import_eagerly(hash);
+                    self.body_arrived.insert(hash, std::time::Instant::now());
+                    self.received_bodies.push(hash);
+                    info!(target: "n42.h2.node", block_hash = ?hash, decode_ms = started.elapsed().as_millis() as u64, "block body received (header only)");
+                }
+                Ok((hash, _, false)) => {
                     debug!(target: "n42.h2.node", block_hash = ?hash, "a body from the channel this node already holds");
                 }
-                Ok(_) => match self.accept_body_once(shared) {
-                    Ok((hash, _)) => {
-                        self.import_eagerly(hash);
-                        self.body_arrived.insert(hash, std::time::Instant::now());
-                        self.received_bodies.push(hash);
-                        info!(target: "n42.h2.node", block_hash = ?hash, decode_ms = started.elapsed().as_millis() as u64, "block body received (header only)");
-                    }
-                    Err(err) => debug!(target: "n42.h2.node", %err, "a body from the channel could not be read"),
-                },
                 Err(err) => debug!(target: "n42.h2.node", %err, "a body from the channel could not be read"),
             }
             return;

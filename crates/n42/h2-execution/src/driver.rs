@@ -797,11 +797,18 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// offer the direct build, or no longer holds the parent, falls back to
     /// the forkchoice path inside the same task, so the prepared build is
     /// there either way.
+    /// `chain` says the height after the one being built is this node's as
+    /// well (`N42_BUILD_CHAIN`): the execution layer may hand the block's
+    /// header back the moment it seals it, and the build after it starts on
+    /// that header instead of on the request the proposal makes ~110 ms
+    /// later (loop190/191: 68-84 ms with the builder idle, then 33-42 ms of
+    /// request overhead). `None` chains nothing.
     pub async fn prepare_build_on_sealed(
         &mut self,
         parent: B256,
         header: alloy_consensus::Header,
         attrs: PayloadAttributes,
+        chain: Option<crate::el::ChainAhead>,
     ) -> Result<(), ElError> {
         if self.prepared.as_ref().is_some_and(|ahead| ahead.covers(parent, &attrs)) {
             return Ok(());
@@ -820,7 +827,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         info!(target: "n42.h2.el", ?parent, "starting a build ahead on the sealed block");
         let task = tokio::spawn(async move {
             let started = std::time::Instant::now();
-            match el.build_on_own_block(&header, task_attrs).await {
+            match el.build_on_own_block_chaining(&header, task_attrs, chain).await {
                 Some(Ok(built)) => {
                     // The same line the forkchoice path logs, so the leader
                     // analysis reads both; `fcu_ms` is zero here by design.

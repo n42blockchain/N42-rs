@@ -25,6 +25,6 @@ pub use driver::{
     body_once, commit_fcu_async, BodyDecoder, CommitReport, DriverAction, ExecutionDriver,
     ImportReport, ImportVerdict,
 };
-pub use el::{ChainBlock, BuiltBlock, ElError, ExecutionLayer, ForeignBody, ResolveKind};
+pub use el::{ChainAhead, ChainBlock, ChainSealer, BuiltBlock, ElError, ExecutionLayer, ForeignBody, ResolveKind};
 pub use execution_path::{ExecutionPath, ExecutionScheduling, ExecutionWorkload};
 pub use mock::{ElCall, MockBehaviour, MockExecutionLayer};

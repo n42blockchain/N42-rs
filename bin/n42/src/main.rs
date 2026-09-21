@@ -484,9 +484,21 @@ fn main() {
                                 }
                                 let mut mined = 0usize;
                                 for (_, block) in notification.committed().blocks_iter().map(|b| (b.number(), b)) {
+                                    // One walk for both: the (sender, nonce)
+                                    // pairs the lanes are pruned by, and the
+                                    // hashes the by-hash index is pruned by
+                                    // (`N42_COMPACT_BODY`; nothing will ever
+                                    // name a committed block's transactions
+                                    // again, and an index that carries them
+                                    // until its bound reaches them evicts
+                                    // what the next block needs).
+                                    let mut hashes: Vec<alloy_primitives::B256> = Vec::new();
                                     let pairs: Vec<(alloy_primitives::Address, u64)> = block
                                         .transactions_with_sender()
-                                        .map(|(sender, tx)| (*sender, alloy_consensus::Transaction::nonce(tx)))
+                                        .map(|(sender, tx)| {
+                                            hashes.push(*alloy_consensus::transaction::TxHashRef::tx_hash(tx));
+                                            (*sender, alloy_consensus::Transaction::nonce(tx))
+                                        })
                                         .collect();
                                     mined += pairs.len();
                                     // An own block held at this height: the same
@@ -506,6 +518,13 @@ fn main() {
                                         warn!(target: "n42.tx_queue", number = block.number(), back, "an own block at this height was not the one committed; its transactions are offered again");
                                     }
                                     queue.remove_mined_batch(pairs);
+                                    // Out of the by-hash index too: nothing
+                                    // will ever name a committed block's
+                                    // transactions again, and an index that
+                                    // carries them until its bound reaches
+                                    // them evicts what the next block needs.
+                                    // A no-op without an index.
+                                    queue.forget_hashes(hashes);
                                 }
                                 if mined > 10_000 {
                                     info!(target: "n42.tx_queue", mined, queued = queue.len(), prune_ms = started.elapsed().as_millis() as u64, "canonical blocks pruned from the queue");

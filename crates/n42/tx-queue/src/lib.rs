@@ -185,10 +185,31 @@ fn hash_index_capacity() -> Option<usize> {
     })
 }
 
-/// A transaction handed in but not yet in its lane.
-enum Staged<T: PoolTransaction> {
-    Raw(T, std::time::Instant),
-    Valid(Arc<ValidPoolTransaction<T>>),
+/// Wraps a transaction the way a lane holds it.
+///
+/// `transaction_id`'s sender part is derived from the address rather than
+/// handed out by the lane, because the lane is not known here and nothing in
+/// this queue or its builder ever reads it -- reth's `ValidPoolTransaction`
+/// requires one, and its pool, which does read it, is not this. Two senders
+/// may share it; nothing compares them.
+fn valid_for<T: PoolTransaction>(
+    transaction: T,
+    now: std::time::Instant,
+    origin: TransactionOrigin,
+) -> Arc<ValidPoolTransaction<T>> {
+    let sender = transaction.sender();
+    let nonce = transaction.nonce();
+    let id = SenderId::from(u64::from_be_bytes(
+        sender.as_slice()[12..20].try_into().unwrap_or([0u8; 8]),
+    ));
+    Arc::new(ValidPoolTransaction {
+        transaction,
+        transaction_id: TransactionId::new(id, nonce),
+        propagate: false,
+        timestamp: now,
+        origin,
+        authority_ids: None,
+    })
 }
 
 /// How many shards the by-hash index is split into. A block's assembly looks
@@ -202,6 +223,9 @@ const HASH_INDEX_SHARDS: usize = 64;
 struct HashShard<T: PoolTransaction> {
     by_hash: alloy_primitives::map::B256HashMap<Arc<ValidPoolTransaction<T>>>,
     order: VecDeque<B256>,
+    /// Hashes dropped by [`TxQueue::forget_hashes`] whose place in `order`
+    /// is still there; the bound skips them.
+    removed: usize,
 }
 
 /// A by-hash view of the transactions that have passed through this queue.
@@ -232,7 +256,11 @@ impl<T: PoolTransaction> HashIndex<T> {
         Self {
             shards: (0..HASH_INDEX_SHARDS)
                 .map(|_| {
-                    parking_lot::RwLock::new(HashShard { by_hash: Default::default(), order: VecDeque::new() })
+                    parking_lot::RwLock::new(HashShard {
+                        by_hash: Default::default(),
+                        order: VecDeque::new(),
+                        removed: 0,
+                    })
                 })
                 .collect(),
             per_shard,
@@ -250,11 +278,25 @@ impl<T: PoolTransaction> HashIndex<T> {
         let mut shard = self.shard_of(&hash).write();
         if shard.by_hash.insert(hash, Arc::clone(transaction)).is_none() {
             shard.order.push_back(hash);
-            while shard.order.len() > self.per_shard {
-                if let Some(oldest) = shard.order.pop_front() {
-                    shard.by_hash.remove(&oldest);
+            // The bound counts what is *held*, so the places a canonical
+            // prune has already emptied are stepped over rather than
+            // counted.
+            while shard.order.len().saturating_sub(shard.removed) > self.per_shard {
+                let Some(oldest) = shard.order.pop_front() else { break };
+                if shard.by_hash.remove(&oldest).is_none() {
+                    shard.removed = shard.removed.saturating_sub(1);
                 }
             }
+        }
+    }
+
+    fn remove(&self, hash: &B256) {
+        let mut shard = self.shard_of(hash).write();
+        if shard.by_hash.remove(hash).is_some() {
+            // The order list is walked only when the bound bites, and a hash
+            // that is no longer in the map is skipped there, so a removal
+            // costs one map operation rather than a scan.
+            shard.removed = shard.removed.saturating_add(1);
         }
     }
 
@@ -281,7 +323,7 @@ impl<T: PoolTransaction> HashIndex<T> {
 /// prof3: 72% of a follower's samples on one kernel address).
 pub struct TxQueue<T: PoolTransaction> {
     inner: Arc<Mutex<Inner<T>>>,
-    inbox: Arc<Mutex<Vec<Staged<T>>>>,
+    inbox: Arc<Mutex<Vec<Arc<ValidPoolTransaction<T>>>>>,
     staged: Arc<std::sync::atomic::AtomicUsize>,
     /// The by-hash index, when this queue keeps one. `None` is the default
     /// and costs the drain nothing at all -- not a lock, not a hash.
@@ -400,18 +442,10 @@ impl<T: PoolTransaction> TxQueue<T> {
         let staged = std::mem::take(&mut *inbox);
         self.staged.fetch_sub(staged.len(), Ordering::AcqRel);
         drop(inbox);
-        // Indexed as they go into the lanes, and only when an index is kept.
-        // Measured on the ingest's own path (`bench_drain_with_and_without_the_hash_index`)
-        // because the drain is the fleet's supply: a microsecond a
-        // transaction here is 163 ms a block of one core.
-        for item in staged {
-            let queued = match item {
-                Staged::Raw(transaction, at) => inner.insert(transaction, at, TransactionOrigin::External),
-                Staged::Valid(valid) => inner.insert_valid(valid),
-            };
-            if let (Some(index), Some(queued)) = (self.by_hash.as_ref(), queued) {
-                index.insert(queued);
-            }
+        // Lanes only. Nothing here touches the by-hash index: this runs
+        // under the lanes' lock, with the builder's puller waiting on it.
+        for valid in staged {
+            inner.insert_valid(valid);
         }
     }
 
@@ -435,9 +469,42 @@ impl<T: PoolTransaction> TxQueue<T> {
 
     /// Queues validated, recovered transactions. A (sender, nonce) already
     /// queued keeps its first arrival.
+    ///
+    /// The `Arc` a lane will hold is made here, on the caller's thread --
+    /// the ingest's -- rather than in the drain: the drain runs under the
+    /// lanes' lock, and the builder's puller is what waits behind it
+    /// (`QueueBest::next`). Making it here also lets the by-hash index be
+    /// written here, off every lock this queue has. See [`HashIndex`].
     pub fn push(&self, transactions: impl IntoIterator<Item = T>) {
         let now = std::time::Instant::now();
-        let staged: Vec<Staged<T>> = transactions.into_iter().map(|t| Staged::Raw(t, now)).collect();
+        self.index_and_stage(
+            transactions
+                .into_iter()
+                .map(|transaction| valid_for(transaction, now, TransactionOrigin::External))
+                .collect(),
+        );
+    }
+
+    /// Queues transactions the pool has already validated, as the pool holds
+    /// them. What the pool's new-transaction listener yields; the queue is a
+    /// view of the pool's arrivals, whichever door they came in by.
+    pub fn push_valid(&self, transactions: impl IntoIterator<Item = Arc<ValidPoolTransaction<T>>>) {
+        self.index_and_stage(transactions.into_iter().collect());
+    }
+
+    /// Indexes what was pushed and puts it in the inbox.
+    ///
+    /// The index first and outside the inbox's lock, because it is the one
+    /// thing here that another thread can be reading at the same time: a
+    /// block's assembly takes 163,000 read locks across the worker pool, and
+    /// a writer that held the queue's lock while waiting for them put the
+    /// builder's pull from 22 ms to 103 (loop195 P2).
+    fn index_and_stage(&self, staged: Vec<Arc<ValidPoolTransaction<T>>>) {
+        if let Some(index) = self.by_hash.as_ref() {
+            for transaction in &staged {
+                index.insert(transaction);
+            }
+        }
         let count = staged.len();
         // Counted under the inbox's lock, so the counter and the inbox
         // always agree for a drain that holds it (see `drain_inbox`).
@@ -446,16 +513,19 @@ impl<T: PoolTransaction> TxQueue<T> {
         self.staged.fetch_add(count, std::sync::atomic::Ordering::AcqRel);
     }
 
-    /// Queues transactions the pool has already validated, as the pool holds
-    /// them. What the pool's new-transaction listener yields; the queue is a
-    /// view of the pool's arrivals, whichever door they came in by.
-    pub fn push_valid(&self, transactions: impl IntoIterator<Item = Arc<ValidPoolTransaction<T>>>) {
-        let staged: Vec<Staged<T>> = transactions.into_iter().map(Staged::Valid).collect();
-        let count = staged.len();
-        // Under the inbox's lock, as [`Self::push`].
-        let mut inbox = self.inbox.lock();
-        inbox.extend(staged);
-        self.staged.fetch_add(count, std::sync::atomic::Ordering::AcqRel);
+    /// Forgets `hashes`, for a block the chain has committed: nothing will
+    /// ever name those transactions in a new block again, so the index need
+    /// not carry them until its bound reaches them.
+    ///
+    /// Only for canonical blocks. An own block whose height the chain has
+    /// not settled must stay findable: its transactions go back to the lanes
+    /// if another block takes the height, and the block after that names
+    /// them.
+    pub fn forget_hashes(&self, hashes: impl IntoIterator<Item = B256>) {
+        let Some(index) = self.by_hash.as_ref() else { return };
+        for hash in hashes {
+            index.remove(&hash);
+        }
     }
 
     /// Queues the transactions of reverted blocks. The chain no longer holds
@@ -705,44 +775,7 @@ impl<T: PoolTransaction> TxQueue<T> {
 }
 
 impl<T: PoolTransaction> Inner<T> {
-    /// Queues one transaction, handing back what was queued so the caller
-    /// can index it; `None` when the lane refused it (already queued at that
-    /// nonce, or the chain has passed it).
-    fn insert(
-        &mut self,
-        transaction: T,
-        now: std::time::Instant,
-        origin: TransactionOrigin,
-    ) -> Option<&Arc<ValidPoolTransaction<T>>> {
-        let sender = transaction.sender();
-        let nonce = transaction.nonce();
-        let next_id = &mut self.next_sender_id;
-        let lane = self.lanes.entry(sender).or_insert_with(|| {
-            let id = SenderId::from(*next_id);
-            *next_id += 1;
-            Lane { by_nonce: BTreeMap::new(), queued: false, id, mined: None }
-        });
-        if lane.by_nonce.contains_key(&nonce) || lane.is_stale(nonce) {
-            return None;
-        }
-        let valid = Arc::new(ValidPoolTransaction {
-            transaction,
-            transaction_id: TransactionId::new(lane.id, nonce),
-            propagate: false,
-            timestamp: now,
-            origin,
-            authority_ids: None,
-        });
-        lane.by_nonce.insert(nonce, valid);
-        self.len += 1;
-        if !lane.queued {
-            lane.queued = true;
-            self.arrivals.push_back(sender);
-        }
-        lane.by_nonce.get(&nonce)
-    }
-
-    /// [`Self::insert`] for a transaction the pool has already validated.
+    /// Queues one transaction the pusher has already wrapped.
     fn insert_valid(
         &mut self,
         valid: Arc<ValidPoolTransaction<T>>,
@@ -1073,6 +1106,23 @@ mod tests {
         EthPooledTransaction::new(recovered, 120)
     }
 
+    /// A block's worth of transactions for `round`: one lane per sender,
+    /// `per` nonces each, with addresses that do not collide across rounds.
+    /// A free function rather than a closure, because the bench's ingest
+    /// thread builds them too.
+    fn block_of(senders: u64, per: u64, round: u64) -> Vec<EthPooledTransaction> {
+        let mut all = Vec::with_capacity((senders * per) as usize);
+        for n in 0..per {
+            for sn in 0..senders {
+                let mut a = [0u8; 20];
+                a[..8].copy_from_slice(&(sn + 1).to_be_bytes());
+                a[8..12].copy_from_slice(&(round as u32).to_be_bytes());
+                all.push(tx_hashed(Address::from(a), n));
+            }
+        }
+        all
+    }
+
     /// [`tx_of`] with a hash of its own. The fixtures here leave the cached
     /// hash at zero, which is fine for a queue keyed by sender and nonce and
     /// not for one looked up by hash.
@@ -1098,49 +1148,131 @@ mod tests {
         EthPooledTransaction::new(recovered, 120)
     }
 
-    /// What the by-hash index costs the side that fills it, and what it
-    /// gives the side that reads it, at the bench tier.
+    /// What the by-hash index costs the two sides that matter, at the bench
+    /// tier and with an ingest running at the same time.
     ///
-    /// The drain is the fleet's supply path: a microsecond a transaction
-    /// here is 163 ms a block of one core, so this is the number that says
-    /// whether the compact body may be turned on at all. Pinned:
+    /// The builder's pull is the number that decides whether the compact
+    /// body may be turned on at all: loop195 P2 read `par_pull_ms` 98-106
+    /// against P1's 17-26, and an idle single-threaded drain measurement
+    /// (+30-44 ns a transaction) had not predicted it. What it measures, in
+    /// order: the pusher's own cost, the drain into the lanes, the builder's
+    /// walk over a block's worth, and a block's assembly look-ups -- the
+    /// last two with an ingest thread pushing into the same queue
+    /// throughout, because that is the only way the contention this is
+    /// about appears at all.
+    ///
     /// `RAYON_NUM_THREADS=16 taskset -c 0-31 cargo test --release -p
     /// n42-tx-queue --lib bench_hash_index -- --ignored --nocapture`.
     #[test]
     #[ignore = "timing"]
     fn bench_hash_index() {
+        use std::sync::atomic::{AtomicBool, Ordering};
         let senders = 6_000u64;
         let per = 27u64;
-        let count = (senders * per) as usize;
-        let build = || {
-            let mut all = Vec::with_capacity(count);
-            for n in 0..per {
-                for s in 0..senders {
-                    let mut a = [0u8; 20];
-                    a[..8].copy_from_slice(&(s + 1).to_be_bytes());
-                    all.push(tx_hashed(Address::from(a), n));
-                }
-            }
-            all
-        };
-        for (what, queue) in [
+        let block = (senders * per) as usize;
+        // Four blocks in the lanes before the build, as the bench's pool is
+        // sized (loop194 X2), so the walk is over a deep queue.
+        let depth = 4u64;
+        let build = |round: u64| block_of(senders, per, round);
+        // Both orders, because the second leg in a process runs on a warmer
+        // and more fragmented heap than the first and that alone is worth a
+        // few milliseconds of the builder's walk.
+        let legs: Vec<(&str, TxQueue<EthPooledTransaction>)> = vec![
             ("without", TxQueue::<EthPooledTransaction>::with_run_length(64)),
-            ("with   ", TxQueue::<EthPooledTransaction>::with_run_length(64).with_hash_index(count * 2)),
-        ] {
-            let all = build();
-            let hashes: Vec<B256> = all.iter().map(|t| *t.hash()).collect();
-            queue.push(all);
+            (
+                "with   ",
+                TxQueue::<EthPooledTransaction>::with_run_length(64).with_hash_index(block * 8),
+            ),
+            (
+                "with   ",
+                TxQueue::<EthPooledTransaction>::with_run_length(64).with_hash_index(block * 8),
+            ),
+            ("without", TxQueue::<EthPooledTransaction>::with_run_length(64)),
+        ];
+        for (what, queue) in legs {
+            // The lanes, filled to the bench's depth.
+            for round in 0..depth {
+                queue.push(build(round));
+            }
+            queue.drain_now();
+            let wanted = build(depth);
+            let hashes: Vec<B256> = wanted.iter().map(|t| *t.hash()).collect();
+            let at = std::time::Instant::now();
+            queue.push(wanted);
+            let push = at.elapsed();
             let at = std::time::Instant::now();
             queue.drain_now();
             let drain = at.elapsed();
+
+            // An ingest pushing throughout the two measurements below, as
+            // one runs on the fleet: batches of 500, the shape a flood frame
+            // arrives in, and transactions built *before* the thread starts
+            // -- a thread that built them itself spent the whole measurement
+            // building and pushed nothing.
+            let feed: Vec<EthPooledTransaction> =
+                (depth + 1..depth + 3).flat_map(|round| block_of(senders, per, round)).collect();
+            let started = Arc::new(AtomicBool::new(false));
+            let stop = Arc::new(AtomicBool::new(false));
+            let pusher = {
+                let queue = queue.clone();
+                let stop = Arc::clone(&stop);
+                let started = Arc::clone(&started);
+                std::thread::spawn(move || {
+                    let mut pushed = 0usize;
+                    for chunk in feed.chunks(500) {
+                        started.store(true, Ordering::Relaxed);
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        queue.push(chunk.to_vec());
+                        pushed += chunk.len();
+                    }
+                    pushed
+                })
+            };
+            // Let it get going, so the measurements below overlap it rather
+            // than race its first push.
+            while !started.load(Ordering::Relaxed) {
+                std::hint::spin_loop();
+            }
+
+            // The builder's walk: a block's worth out of the queue, the way
+            // the puller thread takes it.
+            let at = std::time::Instant::now();
+            let mut best = queue.best_for_build(B256::repeat_byte(1));
+            let mut taken = 0usize;
+            while taken < block {
+                match best.next() {
+                    Some(t) => {
+                        std::hint::black_box(&t);
+                        taken += 1;
+                    }
+                    None => break,
+                }
+            }
+            let pull = at.elapsed();
+            drop(best);
+
+            // A block's assembly, on the worker pool, against the same
+            // queue the ingest is still writing to.
             let at = std::time::Instant::now();
             let found = queue.get_by_hashes(&hashes).iter().filter(|t| t.is_some()).count();
             let lookup = at.elapsed();
+            stop.store(true, Ordering::Relaxed);
+            let pushed = pusher.join().unwrap_or(0);
+
             eprintln!(
-                "{what} index: drain {count} in {drain:?} = {:.0} ns/tx | look {count} up in \
-                 {lookup:?} = {:.0} ns/tx, found {found}",
-                drain.as_nanos() as f64 / count as f64,
-                lookup.as_nanos() as f64 / count as f64,
+                "{what} index: push {:>7.1} ms ({:>4.0} ns/tx) | drain {:>7.1} ms ({:>4.0} ns/tx) | \
+                 builder pull {taken} in {:>7.1} ms ({:>4.0} ns/tx) | look {block} up in {:>6.1} ms \
+                 ({:>4.0} ns/tx), found {found} | ingest pushed {pushed} meanwhile",
+                push.as_secs_f64() * 1e3,
+                push.as_nanos() as f64 / block as f64,
+                drain.as_secs_f64() * 1e3,
+                drain.as_nanos() as f64 / block as f64,
+                pull.as_secs_f64() * 1e3,
+                pull.as_nanos() as f64 / taken.max(1) as f64,
+                lookup.as_secs_f64() * 1e3,
+                lookup.as_nanos() as f64 / block as f64,
             );
         }
     }

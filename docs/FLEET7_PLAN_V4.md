@@ -386,9 +386,17 @@ Three changes, each judged on the confirmed configuration with the cycle dissect
   33-42 ms between that request and the build starting. The consensus chain (B+C+D+F) is ~290-330 ms, right behind.
 - The vote road's line sums to ~130 of its ~180 ms on both roads; the unnamed 50 ms is not a wait for the parent (its
   root and engine insert are done before the child's check ends). `plan-v4/vote-road-sum` names and measures it.
-- loop190 Y1a lost window 3 to the harness: the flood stopped sending at +128 s with every worker blocked on an ingest
-  reply that never came (no read timeout), the queue drained and the chain built 48 empty blocks -- the ingest's gate
-  did not reopen. Seen once in twelve legs. `plan-v4/ingest-gate` (defect 11).
+- loop190 Y1a lost window 3, and not to the harness alone (`plan-v4/ingest-gate`, merged 331b7c11c..59f8f7cfb).
+  **node5's execution layer stopped at block 382**, at the handover after its own tenure: its validator went on
+  receiving every body and every Decide, and never started another import (defect 12, open; the leg ran with
+  `N42_BODY_ONCE=1`, once in five such legs and never in seven without). Its queue froze at 411,428 against an ingest
+  gate of 407,500; nothing but a canonical block on that node lowers the queue, so the gate stayed shut; the flood sends
+  every frame to all seven nodes and read the replies with no timeout, so all 64 workers blocked; the six healthy nodes
+  drained into two last blocks and then built empty ones, which prune nothing. The gate had no liveness of its own:
+  it now lets a frame through after 15 s (`N42_TX_INGEST_GATE_MAX_WAIT_MS`, `gate_forced` in the stats line, a WARN
+  after 2 s -- a leg with `gate_forced > 0` is not comparable), and the flood's ingest read times out after 10 s,
+  names the node and reconnects. A counter race in the queue's inbox (`staged` wrapping for a few nanoseconds) was
+  found and fixed on the way; it was not the stall.
 - `/home` filled during loop190 Y0a (the runner's memory sampler lost lines; the node logs are on `/data`). Build
   output now goes to `/data/n42-build`.
 

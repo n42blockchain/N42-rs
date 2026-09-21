@@ -423,7 +423,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
     /// have produced. Nothing is patched up to make a near-miss fit.
     async fn take_chained(
         &self,
-        parent: B256,
+        header: &alloy_consensus::Header,
         attrs: &PayloadAttributes,
     ) -> Option<Result<BuiltBlock, ElError>> {
         let (chained, generation) = {
@@ -432,6 +432,9 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
             let mut state = self.chain.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             (state.slot.take()?, state.generation)
         };
+        // Hashed only once there is something to compare it with, so a node
+        // that never chains pays nothing for the chain being here.
+        let parent = header.hash_slow();
         let lead_ms = chained.started.elapsed().as_millis() as u64;
         let reason = if chained.generation != generation {
             // A task from an abandoned branch filed this after the discard
@@ -882,7 +885,7 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
         // these attributes is the block this request would have asked for,
         // and it has had a head start of `lead_ms`. Anything else in the
         // slot is discarded before the ordinary request goes out.
-        if let Some(built) = self.take_chained(header.hash_slow(), &attrs).await {
+        if let Some(built) = self.take_chained(header, &attrs).await {
             return Some(built);
         }
         self.build_on_own_over_channel(header, attrs, chain).await

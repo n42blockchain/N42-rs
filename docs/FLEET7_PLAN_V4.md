@@ -539,6 +539,48 @@ Window 1, full blocks; P0 = confirmed configuration, P1 = chain configuration (l
 - A merged branch broke an integration test of the branch before it (`build_chain.rs`, a tuple grew); the runner's
   test stage caught it before the claim. Agents now run the touched crates' full test targets.
 
+## 2n. The compact body, second build -- and three configurations with one window 1 (loop196)
+
+`plan-v4/compact-body-2` (merged d6926ad75..a1a553c20). The 81 ms was the by-hash index written inside the queue's
+critical section (the builder's puller drains the inbox under the lanes' lock; the drain took a shard write lock per
+transaction while an assembly held 163,000 read locks); the ingest's thread writes it now, outside every queue lock.
+The missing transactions were not 8 a block (that was the mean over the blocks that assembled): a refused block missed a
+median of ~570, whole senders -- **the frames this node's ingest gate is holding**, which the leader, its queue just
+drained by its own build, admitted and built from. No wait could bring them; a miss is now answered by asking a peer
+for those transactions by index.
+
+A warm-up leg first, then alternating (window 1, full blocks, medians); Q1 = chain configuration, Q2 = Q1 + compact:
+
+| | Q1 a / b | Q2 a / b / c | Q0 |
+| --- | --- | --- | --- |
+| `par_pull_ms` | 20 / 21 | **20 / 20 / 22** | 19 |
+| compact share of foreign blocks | -- | 92% / 92% / 95% | -- |
+| B | 281 / 259 | **213 / 197 / 187** | 217 |
+| D | 47 / 61 | 88 / 86 / 116 | 73 |
+| E | 11 / 9 | 11 / 11 / 10 | 43 |
+| cycle | 361 / 350 | 350 / 360 / 349 | 357 |
+| win1 TPS | 429k / 436k | 417k / (338k) / 435k | 438k |
+
+- The index fix holds (`par_pull_ms` 20-22) and the compact road carries 92-95% of the blocks; **B is 60-80 ms shorter**.
+- **Three things still wrong with it.** The fill asks the first connected peer, which under a compact body does not
+  hold the whole body either: 229-331 "could not supply" a leg against 13-46 fills, each ending in the whole body. The
+  assembly reads 112-116 ms on the fleet against 22 on the idle bench, so the road's execution-layer part is no shorter
+  than the decode it replaces (197-202 ms total against ~178); B's gain is the transfer and the validator's side. And D
+  grows by what B loses (47-61 -> 86-116 ms): nothing is logged on the leader between `block committed` and the next
+  `proposal preamble`, the build is ready before the commit, so those are 70-110 ms of the validator's own loop --
+  suspected, not shown: serving the fill and whole-body requests on it.
+- **Every configuration reads the same window 1: 429-439k at a 349-361 ms cycle** -- confirmed, chain, chain + compact
+  -- whichever of B, D, E is cut. Windows 2-3 read 325-365k in all of them, all night. In these legs the ingest's gate
+  stands open for stretches of 25 s (`gate_us_per_frame` 250-500 us against 40-55 ms when it gates) with every node
+  ingesting 345-390k/s: in those stretches **the harness is the limit**, and window 1 is its stock (the pool filled
+  during the decay) plus its rate. The flood spends 8% of its workers' time signing and 63% waiting for seven replies
+  to a frame; the ingest's recover slots are ~40% busy. loop197 asks it directly: the same configuration at 64, 128
+  and 192 flood workers.
+- With `dropcache` covering the agents' build directory every leg starts with 3.8-5.7 GB cached, and the pool's size at
+  the start no longer predicts window 1 (Q0 at 13,268 order-9 blocks read 438k). What predicted the slow legs of
+  section 2m was the cached residue (10-12 GB) behind the small pool, not the pool's count: reclaim needs something to
+  reclaim.
+
 ## 3. What not to do
 
 - Do not judge a cycle-shortening change at a pacing above the natural cycle; do not judge any change without R1.

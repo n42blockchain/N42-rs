@@ -374,7 +374,7 @@ where
         .is_some()
         .then(|| recovered.body().transactions().map(|tx| *tx.tx_hash()).collect::<Vec<B256>>());
     if let Some(qmdb) = &reuse.qmdb {
-        if let Err(err) = qmdb.rename(built_hash, sealed_hash) {
+        if let Err(err) = n42_engine_types::chain_alias::rename(qmdb, built_hash, sealed_hash) {
             warn!(target: "n42.payload_serve", %err, %built_hash, %sealed_hash, "could not file the build's QMDB root under the sealed hash; importing the ordinary way");
             return None;
         }
@@ -590,11 +590,20 @@ where
 }
 
 /// Where a build on an own block spent its time, for the log line.
+///
+/// `decode_ms` .. `spawn_ms` are the road from the request landing to the
+/// builder actually starting, which loop190/191 measured at 33-42 ms without
+/// naming it: `queue_ms` was the only piece with a name and the rest was read
+/// off the difference between two other lines. With `frame_ms` (added in the
+/// serving arm, from the request's first byte) they sum to exactly that road,
+/// so a leg can say where it went instead of inferring it.
 #[derive(Debug, Default, Clone, Copy)]
 struct BuildOnOwnTimes {
+    decode_ms: u64,
     find_ms: u64,
     queue_ms: u64,
     rename_ms: u64,
+    spawn_ms: u64,
     build_ms: u64,
 }
 
@@ -617,14 +626,15 @@ struct BuildOnOwnTimes {
 async fn build_on_own_block(
     reuse: Option<&OwnBlockReuse>,
     frame: &[u8],
-) -> Result<(N42BuiltPayload, BuildOnOwnTimes), String> {
+) -> Result<(N42BuiltPayload, BuildOnOwnTimes, Option<raw_engine::ChainHint>), String> {
+    let decode_at = std::time::Instant::now();
     let reuse = reuse.ok_or("no own-block reuse on this node")?;
     let builder = n42_engine_types::direct_build::get().ok_or("no direct builder")?;
-    let (header, attributes) = raw_engine::decode_build_on_own(frame)?;
+    let (header, attributes, chain) = raw_engine::decode_build_on_own(frame)?;
     if header.block_access_list_hash.is_some() {
         return Err("unknown build: block access list".to_owned());
     }
-    let mut times = BuildOnOwnTimes::default();
+    let mut times = BuildOnOwnTimes { decode_ms: decode_at.elapsed().as_millis() as u64, ..Default::default() };
     let at = std::time::Instant::now();
     // The parent's post-state is what the build needs (`StateReady`); a
     // parent sealed before its finish is waited for, on a thread.
@@ -684,17 +694,22 @@ async fn build_on_own_block(
         use n42_engine_types::built_executions::{stage_of, Stage};
         let finishing = matches!(stage_of(built_hash), Some(Stage::Sealed | Stage::StateReady));
         if !finishing && qmdb.root_of(&built_hash).is_some() {
-            qmdb.rename(built_hash, sealed_hash).map_err(|err| format!("qmdb rename: {err}"))?;
+            n42_engine_types::chain_alias::rename(qmdb, built_hash, sealed_hash)
+                .map_err(|err| format!("qmdb rename: {err}"))?;
         }
         times.rename_ms = at.elapsed().as_millis() as u64;
     }
     let at = std::time::Instant::now();
     let request = n42_engine_types::direct_build::BuildOnOwnRequest { parent, parent_execution: built, attributes };
-    let payload = tokio::task::spawn_blocking(move || builder.build_on_own(request))
-        .await
-        .map_err(|err| format!("build task: {err}"))??;
+    // `spawn_ms` is the hop onto the blocking pool. Named because it was the
+    // last unnamed piece of the request-to-start road, and because a blocking
+    // pool with every thread busy is somewhere a leader's build can wait with
+    // nothing saying so.
+    let handle = tokio::task::spawn_blocking(move || builder.build_on_own(request));
+    times.spawn_ms = at.elapsed().as_millis() as u64;
+    let payload = handle.await.map_err(|err| format!("build task: {err}"))??;
     times.build_ms = at.elapsed().as_millis() as u64;
-    Ok((payload, times))
+    Ok((payload, times, chain))
 }
 
 /// Writes a built payload in the channel's answer shape (status 1, the
@@ -1362,18 +1377,42 @@ where
             let mut buf = vec![0u8; len];
             stream.read_exact(&mut buf).await?;
             out.clear();
+            let frame_ms = started_at.elapsed().as_millis() as u64;
             let started = std::time::Instant::now();
             match build_on_own_block(reuse.as_ref(), &buf).await {
-                Ok((payload, times)) => {
+                Ok((payload, times, chain)) => {
+                    // The builder answers on its early seal, so the block's
+                    // header exists here and the block does not have to be
+                    // encoded for it to travel. A caller that asked to chain
+                    // (`request::BUILD_ON_OWN`'s hint) gets the header on its
+                    // own frame first: it stamps and seals it for the view it
+                    // will propose under and sends the next build's request
+                    // at once, instead of waiting for this block's ~30 ms
+                    // encode, its ~26 MB over the socket, and the proposal
+                    // that follows -- 68-84 ms of a 360 ms cycle with the
+                    // builder idle (loop190/191).
+                    if chain.is_some() {
+                        let rlp = alloy_rlp::encode(payload.block().header());
+                        let mut frame = Vec::with_capacity(rlp.len() + 5);
+                        frame.push(raw_engine::reply::CHAIN_HEADER);
+                        frame.extend_from_slice(&(rlp.len() as u32).to_le_bytes());
+                        frame.extend_from_slice(&rlp);
+                        stream.write_all(&frame).await?;
+                    }
                     let (bytes, encoded) = push_built_payload(&mut out, &payload);
                     info!(
                         target: "n42.payload_serve",
                         number = payload.block().number(),
                         txs = payload.block().body().transactions.len(),
                         bytes,
+                        chained = chain.is_some_and(|hint| hint.chained),
+                        chain_ahead = chain.is_some(),
+                        frame_ms,
+                        decode_ms = times.decode_ms,
                         find_ms = times.find_ms,
                         queue_ms = times.queue_ms,
                         rename_ms = times.rename_ms,
+                        spawn_ms = times.spawn_ms,
                         build_ms = times.build_ms,
                         encode_ms = encoded.as_millis() as u64,
                         total_ms = started.elapsed().as_millis() as u64,

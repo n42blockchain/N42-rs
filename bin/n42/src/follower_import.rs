@@ -593,6 +593,43 @@ struct Executed {
     exec_ms: u64,
 }
 
+/// What the block's road to this node's vote cost before the import began,
+/// and which request carried it.
+///
+/// The road crosses two processes -- the validator receives the body, the
+/// execution layer imports it -- and reading it used to mean joining two
+/// logs by block hash. The pieces the validator knows are carried in here
+/// so the whole road is one line, written where the vote is released.
+#[derive(Debug, Clone, Copy)]
+pub struct VoteRoad {
+    /// Which request carried the block: `foreign_body` or `new_payload`.
+    pub request: &'static str,
+    /// Reading the frame off the loopback socket.
+    pub recv_ms: u64,
+    /// Turning it into the block this import takes.
+    pub decode_ms: u64,
+    /// When the request's first byte arrived, for the total.
+    pub started: std::time::Instant,
+}
+
+/// The one line a bench leg greps: where a block's road to this node's vote
+/// went. Written once per block, at the point the vote is released.
+fn log_vote_road(road: VoteRoad, number: u64, txs: usize, senders_ms: u64, parent_wait_ms: u64, check_ms: u64) {
+    tracing::info!(
+        target: "n42.follower_import",
+        number,
+        txs,
+        request = road.request,
+        recv_ms = road.recv_ms,
+        decode_ms = road.decode_ms,
+        senders_ms,
+        parent_wait_ms,
+        check_ms,
+        total_ms = road.started.elapsed().as_millis() as u64,
+        "vote road"
+    );
+}
+
 /// Executes and checks `sealed` on its parent's state. See the module docs.
 /// Returns the executed block and the phase timings in milliseconds:
 /// header checks, senders, execution, the post-execution checks, state root,
@@ -615,6 +652,7 @@ pub fn import_foreign_block<Provider, Evm, ChainSpec>(
     consensus: &(dyn FullConsensus<EthPrimitives> + Send + Sync),
     chain_spec: &ChainSpec,
     mut checked: Option<tokio::sync::oneshot::Sender<()>>,
+    road: VoteRoad,
 ) -> Result<(Box<BuiltPayloadExecutedBlock<EthPrimitives>>, [u64; 9]), String>
 where
     Provider: StateProviderFactory + HeaderProvider<Header = alloy_consensus::Header> + Sync,
@@ -631,6 +669,7 @@ where
     let parent_hash = sealed.parent_hash;
     let number = sealed.number;
     let block_hash = sealed.hash();
+    let tx_count = sealed.body().transactions.len();
 
     let deferred = reth_chainspec::qmdb::deferred_execution_active_at(chain_spec.genesis(), sealed.timestamp);
     // Before the fork the parent must be in already, as it always was: an
@@ -718,6 +757,7 @@ where
     // The parent: in, and under deferred execution executed here, since the
     // header's fields are checked against its result and the transactions
     // against its post-state.
+    let parent_at = std::time::Instant::now();
     let (parent, parent_output) = match parent_known {
         Some(parent) => (parent, None),
         None => match (deferred && publish_parent_outputs())
@@ -732,6 +772,10 @@ where
             None => (wait_for_parent(provider, parent_hash, chain_spec.genesis(), deferred)?, None),
         },
     };
+    let parent_wait_ms = parent_at.elapsed().as_millis() as u64;
+    // Set on the deferred path, where the vote is the check; zero before the
+    // fork, where the vote is the import itself.
+    let mut check_ms = 0u64;
     let against_parent = || validate_against_parent(consensus, recovered.sealed_header(), &parent);
     // Set on the exec-on-parent-output path: the parent as an executed block
     // this import lays over the chain's state at the grandparent, and the
@@ -764,7 +808,7 @@ where
             chain_spec.chain().id(),
             spec_for_intrinsic_gas(chain_spec, recovered.timestamp),
         )?;
-        let check_ms = check_at.elapsed().as_millis() as u64;
+        check_ms = check_at.elapsed().as_millis() as u64;
 
         // Where this block's execution will read the parent's post-state,
         // decided here because it decides whether that execution can run
@@ -799,6 +843,7 @@ where
             if let Some(checked) = checked.take() {
                 let _ = checked.send(());
             }
+            log_vote_road(road, number, tx_count, senders_ms, parent_wait_ms, check_ms);
         } else {
             // Two roads from here (plan v4 step 2, [`two_roads`]): the rest of
             // the vote road -- the parent's execution fields and the header
@@ -918,6 +963,7 @@ where
                     if let Some(checked) = vote_checked {
                         let _ = checked.send(());
                     }
+                    log_vote_road(road, number, tx_count, senders_ms, parent_wait_ms, check_ms);
                     Ok(())
                 },
                 execute_block,
@@ -1067,6 +1113,12 @@ where
     // a cost.
     if executed_parent.is_some() {
         wait_for_parent(provider, parent_hash, chain_spec.genesis(), deferred)?;
+    }
+
+    // Before the deferred-execution fork the vote is this import's answer,
+    // so the road ends here rather than at a check.
+    if !deferred {
+        log_vote_road(road, number, tx_count, senders_ms, parent_wait_ms, check_ms);
     }
 
     Ok((

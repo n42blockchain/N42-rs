@@ -303,9 +303,9 @@ fn main() {
                                     let qmdb = qmdb_for_startup.clone();
                                     let consensus = consensus.clone();
                                     let chain_spec = node.chain_spec();
-                                    std::sync::Arc::new(move |sealed: reth_primitives_traits::SealedBlock<n42_tx_types::Block>, checked| {
+                                    std::sync::Arc::new(move |sealed: reth_primitives_traits::SealedBlock<n42_tx_types::Block>, checked, road| {
                                         n42::follower_import::import_foreign_block(
-                                            sealed, &provider, &evm_config, senders_cache.as_ref(), &carry, qmdb.as_ref(), consensus.as_ref(), &chain_spec, checked,
+                                            sealed, &provider, &evm_config, senders_cache.as_ref(), &carry, qmdb.as_ref(), consensus.as_ref(), &chain_spec, checked, road,
                                         )
                                     }) as std::sync::Arc<n42::payload_serve::ForeignImport>
                                 }),

@@ -55,6 +55,10 @@ pub struct MockBehaviour {
     /// binary, or one without the direct import -- and the driver must send
     /// the payload instead.
     pub take_bodies: bool,
+    /// When set, an attribute-less forkchoice waits for a permit before it
+    /// reaches the mock (and is recorded): a test holds a commit's forkchoice
+    /// open, which is the whole point of running it off the consensus loop.
+    pub forkchoice_gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl Default for MockBehaviour {
@@ -66,6 +70,7 @@ impl Default for MockBehaviour {
             forkchoice_status: PayloadStatusEnum::Valid,
             resolve_gate: None,
             take_bodies: false,
+            forkchoice_gate: None,
         }
     }
 }
@@ -262,6 +267,12 @@ impl ExecutionLayer for MockExecutionLayer {
         &self,
         state: ForkchoiceState,
     ) -> Result<ForkchoiceUpdated, ElError> {
+        let gate = self.behaviour.lock().unwrap_or_else(|p| p.into_inner()).forkchoice_gate.clone();
+        if let Some(gate) = gate
+            && let Ok(permit) = gate.acquire().await
+        {
+            permit.forget();
+        }
         self.record(ElCall::ForkchoiceUpdated(state));
         let status = self.behaviour.lock().unwrap_or_else(|p| p.into_inner()).forkchoice_status.clone();
         Ok(ForkchoiceUpdated {

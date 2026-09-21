@@ -949,6 +949,37 @@ mod tests {
     }
 
     #[test]
+    /// What the ingest's gate measures (`n42-tx-ingest`: the gate reads
+    /// `TxQueue::len()`) is what the *next build* can still use, and nothing
+    /// else: a transaction a build has taken, and one held for an own block
+    /// the chain has not settled, are both outside it.
+    ///
+    /// Asked of this file because the build chain leaves three own blocks
+    /// outstanding instead of two, and the question was whether that starves
+    /// the gate. It does not -- held transactions were already out of `len`
+    /// when the build took them.
+    #[test]
+    fn the_gates_depth_counts_neither_what_a_build_took_nor_what_is_held() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
+        queue.push([tx(1, 0), tx(1, 1), tx(2, 0), tx(2, 1)]);
+        assert_eq!(queue.len(), 4);
+        let parent = B256::repeat_byte(3);
+        let mut best = queue.best_for_build(parent);
+        let taken: Vec<_> = std::iter::from_fn(|| best.next()).collect();
+        drop(best);
+        assert_eq!(taken.len(), 4);
+        assert_eq!(queue.len(), 0, "a build's take leaves the gate's depth as it is taken");
+        let dropped = queue.forget_mined(parent, [(Address::repeat_byte(1), 1), (Address::repeat_byte(2), 1)]);
+        assert_eq!(dropped.len(), 4);
+        queue.hold_own_block(11, B256::repeat_byte(9), dropped);
+        assert_eq!(queue.len(), 0, "holding an own block's transactions does not put them back in the gate's depth");
+        // And the gate sees new arrivals at once, which is what makes it a
+        // gate on the refill rather than on the blocks in flight.
+        queue.push([tx(3, 0)]);
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
     fn forget_mined_keeps_what_the_build_took_but_did_not_mine() {
         let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
         queue.push([tx(1, 0), tx(1, 1), tx(1, 2), tx(2, 0), tx(2, 1)]);

@@ -429,3 +429,90 @@ async fn a_build_ahead_given_up_still_resolves_its_payload_job() {
     assert_eq!(count(|c| matches!(c, ElCall::ForkchoiceUpdatedWithAttrs(_))), 2);
     assert_eq!(count(|c| matches!(c, ElCall::ResolvePayload(_))), 2, "the given-up build's job was resolved too");
 }
+
+/// A body the driver holds and a decoder for it, as the node installs.
+fn body_for(hash: B256, number: u64) -> n42_h2_execution::ForeignBody {
+    n42_h2_execution::ForeignBody {
+        block_hash: hash,
+        number,
+        timestamp: 1_700_000_000 + number,
+        profile: n42_h2_consensus::N42HeaderProfile::Ethereum,
+        // The decoder below never looks at these: what is being pinned here
+        // is which request the driver makes, not the wire format, which has
+        // its own tests in `n42-h2-consensus` and `n42-engine-types`.
+        rlp: alloy_primitives::Bytes::from_static(&[0xc0]),
+    }
+}
+
+fn with_decoder(driver: &mut ExecutionDriver<MockExecutionLayer>) {
+    driver.set_body_decoder(n42_h2_execution::BodyDecoder::new(|body: &n42_h2_execution::ForeignBody| {
+        Ok(MockExecutionLayer::payload_for(body.block_hash, body.number))
+    }));
+}
+
+/// The point of the whole path: an execution layer that takes the body is
+/// never sent the same block a second time as a payload.
+#[tokio::test]
+async fn a_body_the_execution_layer_takes_is_never_re_encoded_as_a_payload() {
+    let el = MockExecutionLayer::with_behaviour(MockBehaviour { take_bodies: true, ..Default::default() });
+    let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    with_decoder(&mut driver);
+    driver.set_deferred_execution_time(Some(0));
+    let mut reports = driver.take_foreign_imports().expect("the report channel");
+    let hash = B256::repeat_byte(0xab);
+
+    driver.cache_body(body_for(hash, 1));
+    driver.handle_output(&execute(hash)).await;
+
+    // The check releases the vote, then the import's verdict lands.
+    let checked = reports.recv().await.expect("a check");
+    let actions = driver.finish_execute(checked).await;
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        n42_h2_execution::DriverAction::Consensus(event)
+            if matches!(event.as_ref(), n42_h2_consensus::ConsensusEvent::BlockChecked(h) if *h == hash)
+    )));
+    let done = reports.recv().await.expect("a verdict");
+    let actions = driver.finish_execute(done).await;
+    assert_eq!(actions[0].imported_block(), Some(hash));
+    assert_eq!(el.calls(), vec![ElCall::NewPayloadBody(hash)]);
+    assert_eq!(driver.head(), hash);
+}
+
+/// An execution layer that does not serve the request -- an older binary --
+/// refuses before it has answered anything, and the block goes as a payload.
+#[tokio::test]
+async fn a_refused_body_falls_back_to_the_payload() {
+    let el = MockExecutionLayer::new();
+    let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    with_decoder(&mut driver);
+    driver.set_deferred_execution_time(Some(0));
+    let mut reports = driver.take_foreign_imports().expect("the report channel");
+    let hash = B256::repeat_byte(0xcd);
+
+    driver.cache_body(body_for(hash, 1));
+    driver.handle_output(&execute(hash)).await;
+
+    let done = reports.recv().await.expect("a verdict");
+    let actions = driver.finish_execute(done).await;
+    assert_eq!(actions[0].imported_block(), Some(hash));
+    assert_eq!(el.calls(), vec![ElCall::NewPayload(hash)], "the payload, once, after the refusal");
+}
+
+/// The paths without a body request of their own -- the awaited import --
+/// decode a held body rather than asking for the block again.
+#[tokio::test]
+async fn an_awaited_import_decodes_a_held_body() {
+    let el = MockExecutionLayer::new();
+    let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    let hash = B256::repeat_byte(0xef);
+
+    // No decoder yet: nothing can be made of the body.
+    driver.cache_body(body_for(hash, 1));
+    assert_eq!(driver.handle_output(&execute(hash)).await.missing_block(), Some(hash));
+
+    with_decoder(&mut driver);
+    let action = driver.handle_output(&execute(hash)).await;
+    assert_eq!(action.imported_block(), Some(hash));
+    assert_eq!(el.calls(), vec![ElCall::NewPayload(hash)]);
+}

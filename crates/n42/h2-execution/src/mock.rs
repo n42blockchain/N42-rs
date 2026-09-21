@@ -29,6 +29,9 @@ pub enum ElCall {
     ForkchoiceUpdatedWithAttrs(ForkchoiceState),
     /// A build being resolved.
     ResolvePayload(PayloadId),
+    /// A foreign block handed over as its gossip body
+    /// (`request::FOREIGN_BODY`).
+    NewPayloadBody(B256),
 }
 
 /// Behaviour a test wants from the execution layer.
@@ -47,6 +50,11 @@ pub struct MockBehaviour {
     /// is recorded): a test holds a build between its forkchoice and its
     /// resolve, where a task that is aborted never resolves its job.
     pub resolve_gate: Option<Arc<tokio::sync::Semaphore>>,
+    /// Whether this execution layer takes a block as its gossip body. `false`
+    /// is an execution layer that does not serve the request -- an older
+    /// binary, or one without the direct import -- and the driver must send
+    /// the payload instead.
+    pub take_bodies: bool,
 }
 
 impl Default for MockBehaviour {
@@ -57,6 +65,7 @@ impl Default for MockBehaviour {
             new_payload_error: None,
             forkchoice_status: PayloadStatusEnum::Valid,
             resolve_gate: None,
+            take_bodies: false,
         }
     }
 }
@@ -188,6 +197,35 @@ impl MockExecutionLayer {
 
 #[async_trait::async_trait]
 impl ExecutionLayer for MockExecutionLayer {
+    async fn new_payload_body_checked(
+        &self,
+        _path: crate::ExecutionPath,
+        body: &crate::el::ForeignBody,
+        checked: tokio::sync::oneshot::Sender<PayloadStatus>,
+    ) -> Option<Result<PayloadStatus, ElError>> {
+        if !self.behaviour.lock().expect("mock behaviour lock").take_bodies {
+            // Refused before anything was answered: the caller sends the
+            // payload, and nothing has been checked.
+            return None;
+        }
+        self.record(ElCall::NewPayloadBody(body.block_hash));
+        let behaviour = self.behaviour.lock().expect("mock behaviour lock").clone();
+        if let Some(error) = behaviour.new_payload_error {
+            return Some(Err(ElError(error)));
+        }
+        // The check first, as the real channel does: it is the vote, and it
+        // arrives before the import's verdict.
+        let _ = checked.send(PayloadStatus::from_status(PayloadStatusEnum::Valid));
+        // The real channel answers the check while the block is still
+        // executing; without a gap here the two would race in the caller's
+        // select and a test could not say which it saw.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        Some(Ok(PayloadStatus {
+            status: behaviour.new_payload_status,
+            latest_valid_hash: Some(body.block_hash),
+        }))
+    }
+
     async fn new_payload(&self, payload: ExecutionData) -> Result<PayloadStatus, ElError> {
         let hash = payload.payload.block_hash();
         self.record(ElCall::NewPayload(hash));

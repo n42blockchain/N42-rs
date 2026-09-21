@@ -811,6 +811,447 @@ fn fresh_buffers() -> bool {
     *FRESH.get_or_init(|| std::env::var("N42_PAYLOAD_SERVE_FRESH_BUFFERS").is_ok())
 }
 
+/// Imports one block the validator handed over, whatever request carried it.
+///
+/// `data` is the payload the engine's own pass takes; `converted` is the
+/// block itself when the caller already has it -- which the foreign-body
+/// request does, because it decoded the body straight into one and there is
+/// nothing left for `convert_payload_to_block` to do. Everything after that
+/// point is the same for both: the direct import, the check answered ahead
+/// of the execution, the queue and pool bookkeeping, and the engine's pass.
+///
+/// Writes the answer on `stream` itself, since under deferred execution the
+/// check goes out before the verdict does.
+#[allow(clippy::too_many_arguments)]
+async fn import_for_validator<T>(
+    stream: &mut TcpStream,
+    out: &mut Vec<u8>,
+    engine: &ConsensusEngineHandle<T>,
+    reuse: Option<&OwnBlockReuse>,
+    data: alloy_rpc_types_engine::ExecutionData,
+    pre_converted: Option<SealedBlock<n42_tx_types::Block>>,
+    started: std::time::Instant,
+    decoded: std::time::Duration,
+) -> std::io::Result<()>
+where
+    T: PayloadTypes<BuiltPayload = N42BuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
+{
+    let number = data.payload.block_number();
+    let txs = data.payload.as_v1().transactions.len();
+    // One of ours, sealed: hand the engine the build's execution
+    // first, and the newPayload below finds the block known.
+    let reused = match reuse {
+        Some(reuse) => reuse_own_build::<T>(reuse, &data).await.is_some(),
+        None => false,
+    };
+    // The transactions' bytes, kept for the prune below; the
+    // payload itself goes to the engine.
+    let raw_transactions = data.payload.as_v1().transactions.clone();
+    let probe = reuse.and_then(|r| r.exec_probe.clone()).filter(|_| !reused && txs > 10_000);
+    let probe_data = probe.as_ref().map(|_| data.clone());
+    // Another node's block: executed here and handed to the
+    // engine as executed, when configured. Any failure logs
+    // and leaves the block to the engine's own path.
+    let mut direct_ms: Option<[u64; 13]> = None;
+    // The block's transaction hashes, known once the direct
+    // import converted the payload: the prune below then
+    // needs no keccak over the raw bytes.
+    let mut mined_hashes: Option<Vec<B256>> = None;
+    // The executed block kept for the engine's own conversion when
+    // the answer goes out before that pass.
+    let mut remembered: Option<std::sync::Arc<reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>>> = None;
+    let fast_taken = direct_fast_answer();
+    if let Some(reuse) = reuse.filter(|r| !reused && r.import_foreign.is_some()) {
+        let import = reuse.import_foreign.clone().expect("checked");
+        let validator = reuse.validator.clone();
+        let inserts = reuse.inserts.clone();
+        // The block, when the caller decoded it from a body
+        // (`request::FOREIGN_BODY`); otherwise the payload, converted on the
+        // worker thread as before.
+        let pre = pre_converted;
+        let payload = pre.is_none().then(|| data.clone());
+        let fast = direct_fast_answer();
+        let started = std::time::Instant::now();
+        // Under deferred execution the import says when the
+        // block is checked, and the validator hears it on a
+        // CHECKED frame before the import's answer.
+        let (checked_tx, checked_rx) = tokio::sync::oneshot::channel::<()>();
+        let handed = tokio::task::spawn_blocking(move || {
+            let sealed = match (pre, payload) {
+                (Some(sealed), _) => sealed,
+                (None, Some(payload)) => <n42_engine_types::engine_validator::N42EngineValidator<reth_chainspec::ChainSpec> as reth_engine_primitives::PayloadValidator<T>>::convert_payload_to_block(&validator, payload)
+                    .map_err(|err| format!("conversion: {err}"))?,
+                (None, None) => return Err("no block and no payload to import".to_string()),
+            };
+            let converted = started.elapsed().as_millis() as u64;
+            // The engine's newPayload, next, converts the same
+            // payload: let it take this block instead.
+            // The engine's own conversion of the same payload takes
+            // this instead of decoding 163,000 transactions again.
+            // With the fast answer the clone moves off this path
+            // instead: the block is remembered from the executed
+            // block's `Arc` on a worker thread below, well before
+            // the engine's pass runs.
+            if !fast {
+                n42_engine_types::built_executions::remember_sealed(sealed.hash(), sealed.clone());
+            }
+            let (executed, phases) = import(sealed, Some(checked_tx))?;
+            Ok::<_, String>((executed, phases, converted))
+        });
+        tokio::pin!(handed);
+        let mut finished = None;
+        tokio::select! {
+            checked = checked_rx => {
+                if checked.is_ok() {
+                    let status = alloy_rpc_types_engine::PayloadStatus::from_status(
+                        alloy_rpc_types_engine::PayloadStatusEnum::Valid,
+                    )
+                    .with_latest_valid_hash(data.payload.block_hash());
+                    let encoded = raw_engine::encode_payload_status(&status);
+                    let mut frame = Vec::with_capacity(encoded.len() + 5);
+                    frame.push(raw_engine::reply::CHECKED);
+                    frame.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+                    frame.extend_from_slice(&encoded);
+                    stream.write_all(&frame).await?;
+                    info!(
+                        target: "n42.payload_serve",
+                        number,
+                        txs,
+                        checked_ms = started.elapsed().as_millis() as u64,
+                        "checked: answered before the execution"
+                    );
+                }
+            }
+            done = &mut handed => finished = Some(done),
+        }
+        let handed = match finished {
+            Some(done) => done,
+            None => handed.await,
+        }
+        .map_err(|err| err.to_string())
+        .and_then(|r| r);
+        match handed {
+            Ok((executed, phases, converted)) => {
+                let handed_at = std::time::Instant::now();
+                // The block's transactions leave the queue now, not
+                // when the canonical pruner gets to them: a build
+                // ahead starts the moment this import returns and
+                // would otherwise take them again (87,800 stale
+                // transactions in one build, round 38).
+                // `N42_QUEUE_WORK_OFFLOAD=1`: the queue's and the
+                // pool's bookkeeping goes to a worker thread holding
+                // the block, because the two walks of a 163,000-
+                // transaction block (one for the mined senders and
+                // nonces, one for the hashes) sit on the vote's path
+                // and nothing reads their result before the answer.
+                // Off by default: it also delays the queue's removal
+                // by those walks, and a build ahead that starts before
+                // the removal takes the mined transactions again
+                // (87,800 stale ones in one build, round 38).
+                // The block for the engine's own conversion, taken
+                // from the executed block before it is handed over.
+                if fast_taken {
+                    remembered = Some(std::sync::Arc::clone(&executed.recovered_block));
+                }
+                let queue_offloaded = queue_work_offload();
+                if let Some(queue) = n42_tx_queue::global::<n42_engine_types::N42PooledTransaction>() {
+                    if queue_offloaded {
+                        let block = std::sync::Arc::clone(&executed.recovered_block);
+                        let prune = reuse.prune_pool.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let at = std::time::Instant::now();
+                            let mined: Vec<(alloy_primitives::Address, u64)> = block
+                                .transactions_with_sender()
+                                .map(|(sender, tx)| (*sender, alloy_consensus::Transaction::nonce(tx)))
+                                .collect();
+                            let (number, hash) = (block.number(), block.hash());
+                            let removed = queue.remove_mined_batch_collecting(mined);
+                            // Held until the chain settles the height (round 43).
+                            queue.hold_own_block(number, hash, removed);
+                            let count = block.body().transactions().count();
+                            if let Some(prune) = prune {
+                                prune(block.body().transactions().map(|tx| *tx.tx_hash()).collect());
+                            }
+                            if count > 10_000 {
+                                info!(
+                                    target: "n42.payload_serve",
+                                    number,
+                                    count,
+                                    queue_ms = at.elapsed().as_millis() as u64,
+                                    "imported block's transactions taken out of the queue and the pool"
+                                );
+                            }
+                        });
+                    } else {
+                        let mined: Vec<(alloy_primitives::Address, u64)> = executed
+                            .recovered_block
+                            .transactions_with_sender()
+                            .map(|(sender, tx)| (*sender, alloy_consensus::Transaction::nonce(tx)))
+                            .collect();
+                        let (number, hash) =
+                            (executed.recovered_block.number(), executed.recovered_block.hash());
+                        mined_hashes = Some(
+                            executed.recovered_block.body().transactions().map(|tx| *tx.tx_hash()).collect(),
+                        );
+                        tokio::task::spawn_blocking(move || {
+                            let removed = queue.remove_mined_batch_collecting(mined);
+                            queue.hold_own_block(number, hash, removed);
+                        });
+                    }
+                }
+                // The mined-transaction bookkeeping above walks the
+                // block twice; time it and the engine's acknowledgement
+                // apart, because together they were most of the ~78 ms
+                // of a 438 ms import that no phase accounted for.
+                let mined_ms = handed_at.elapsed().as_millis() as u64;
+                let insert_at = std::time::Instant::now();
+                let (done, handed) = tokio::sync::oneshot::channel();
+                let sent = inserts
+                    .send(reth_node_builder::executed_inserts::ExecutedInsert { block: executed, done })
+                    .is_ok();
+                let landed = sent
+                    && matches!(tokio::time::timeout(std::time::Duration::from_secs(2), handed).await, Ok(Ok(true)));
+                if landed {
+                    crate::follower_import::note_import_landed();
+                    direct_ms = Some([
+                        converted,
+                        phases[0],
+                        phases[1],
+                        phases[2],
+                        phases[3],
+                        phases[4],
+                        phases[5],
+                        started.elapsed().as_millis() as u64,
+                        phases[6],
+                        phases[7],
+                        phases[8],
+                        mined_ms,
+                        insert_at.elapsed().as_millis() as u64,
+                    ]);
+                } else {
+                    warn!(target: "n42.payload_serve", number, "direct import: the engine did not take the executed block; importing the ordinary way");
+                }
+            }
+            Err(err) => warn!(target: "n42.payload_serve", number, %err, "direct import failed; importing the ordinary way"),
+        }
+    }
+    // The fast answer (`N42_DIRECT_FAST_ANSWER=1`): this node
+    // executed the block and the engine holds it as executed, so
+    // the validator's vote does not wait for the engine's own
+    // pass. Everything the pass would check has been checked here
+    // -- the header against its parent, the transactions root, the
+    // receipts root, the gas, and the QMDB state root -- so it is
+    // bookkeeping; it runs below, after the answer is on the wire,
+    // and a verdict other than VALID is logged loudly.
+    if direct_ms.is_some() && direct_fast_answer() {
+        let hash = data.payload.block_hash();
+        let status = alloy_rpc_types_engine::PayloadStatus::from_status(
+            alloy_rpc_types_engine::PayloadStatusEnum::Valid,
+        )
+        .with_latest_valid_hash(hash);
+        let encoded = raw_engine::encode_payload_status(&status);
+        out.push(1);
+        out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+        out.extend_from_slice(&encoded);
+        stream.write_all(&out).await?;
+        let answered = started.elapsed().saturating_sub(decoded).as_millis() as u64;
+        if let Some(ms) = direct_ms {
+            info!(
+                target: "n42.payload_serve",
+                number,
+                txs,
+                convert_ms = ms[0],
+                header_ms = ms[1],
+                senders_ms = ms[2],
+                exec_ms = ms[3],
+                checks_ms = ms[4],
+                root_ms = ms[5],
+                hashed_ms = ms[6],
+                total_ms = ms[7],
+                senders_cached = ms[8],
+                state_ms = ms[9],
+                carry_ms = ms[10],
+                mined_ms = ms[11],
+                insert_ms = ms[12],
+                answered_ms = answered,
+                "direct import: answered before the engine's own pass"
+            );
+        }
+        // The engine's pass would otherwise decode the payload's
+        // 163,000 transactions again (round 43, loop100: its pass
+        // went 35 -> 102 ms without the remembered block). The
+        // clone is made here, off the answered path, and always
+        // finishes before the pass below reads it.
+        if let Some(block) = remembered.take() {
+            let hash = block.hash();
+            let cloned = tokio::task::spawn_blocking(move || {
+                n42_engine_types::built_executions::remember_sealed(hash, block.sealed_block().clone());
+            })
+            .await;
+            if let Err(err) = cloned {
+                warn!(target: "n42.payload_serve", number, %err, "remembering the sealed block failed; the engine will decode it again");
+            }
+        }
+        let engine_at = std::time::Instant::now();
+        match engine.new_payload(data).await {
+            Ok(status) if !status.status.is_valid() => warn!(
+                target: "n42.payload_serve", number, status = ?status.status,
+                "the engine disagreed with a block this node executed and answered VALID for"
+            ),
+            Err(err) => warn!(target: "n42.payload_serve", number, %err, "the engine's own pass failed after the fast answer"),
+            _ => {}
+        }
+        // Only when the walks stayed on this path; the worker thread
+        // above prunes for itself otherwise.
+        if let (Some(prune), Some(hashes)) = (reuse.and_then(|r| r.prune_pool.clone()), mined_hashes.take()) {
+            let count = hashes.len();
+            let pruned_at = std::time::Instant::now();
+            let _ = tokio::task::spawn_blocking(move || {
+                prune(hashes);
+                if count > 10_000 {
+                    info!(
+                        target: "n42.payload_serve",
+                        number,
+                        count,
+                        prune_ms = pruned_at.elapsed().as_millis() as u64,
+                        "imported block's transactions taken out of the pool"
+                    );
+                }
+            });
+        }
+        if txs > 10_000 {
+            info!(
+                target: "n42.payload_serve",
+                number,
+                txs,
+                engine_after_ms = engine_at.elapsed().as_millis() as u64,
+                "the engine's own pass, behind the answer"
+            );
+        }
+        return Ok(());
+    }
+    match engine.new_payload(data).await {
+        Ok(status) => {
+            if let (Some(probe), Some(probe_data)) = (probe, probe_data) {
+                let validator = reuse.map(|r| r.validator.clone());
+                if let Some(validator) = validator {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let converted = match <n42_engine_types::engine_validator::N42EngineValidator<reth_chainspec::ChainSpec> as reth_engine_primitives::PayloadValidator<T>>::convert_payload_to_block(&validator, probe_data) {
+                            Ok(block) => block,
+                            Err(err) => { warn!(target: "n42.payload_serve", %err, "exec probe: conversion failed"); return; }
+                        };
+                        let recovered = match converted.try_recover() {
+                            Ok(block) => block,
+                            Err(_) => { warn!(target: "n42.payload_serve", "exec probe: sender recovery failed"); return; }
+                        };
+                        let header_gas = recovered.gas_used;
+                        match probe(recovered) {
+                            Ok((exec_ms, gas, receipts)) => info!(
+                                target: "n42.payload_serve",
+                                number, txs, exec_ms, gas, header_gas, receipts,
+                                "follower exec probe: the block executed again with the plain executor"
+                            ),
+                            Err(err) => warn!(target: "n42.payload_serve", %err, "exec probe failed"),
+                        }
+                    })
+                    .await;
+                }
+            }
+            // A block this node now holds: its transactions
+            // leave the pool at once rather than when the
+            // pool's maintenance gets to them. On a follower
+            // that is what keeps `pending` honest -- the
+            // ingest gate reads it, and a block's 163,000
+            // still counted as pending after the block was
+            // imported is what stalled the whole fleet's
+            // supply for the length of one node's maintenance.
+            if status.status == alloy_rpc_types_engine::PayloadStatusEnum::Valid
+                && !reused
+                && (mined_hashes.is_some() || direct_ms.is_none())
+                && let Some(prune) = reuse.and_then(|r| r.prune_pool.clone())
+            {
+                let pruned_at = std::time::Instant::now();
+                let count = raw_transactions.len();
+                // Not awaited: the answer to this payload is
+                // what the validator's vote waits for, and the
+                // prune of a full block was 66 ms of it (round
+                // 43, loop94). The pool is a few tens of
+                // milliseconds behind the chain instead of the
+                // length of its maintenance, which is what the
+                // `pending` the ingest gate reads needed.
+                let mined_hashes = mined_hashes.take();
+                let pruning = tokio::task::spawn_blocking(move || {
+                    let hashes: Vec<B256> = mined_hashes.unwrap_or_else(|| {
+                        use rayon::prelude::*;
+                        raw_transactions.par_iter().map(|tx| alloy_primitives::keccak256(tx)).collect()
+                    });
+                    prune(hashes);
+                    if count > 10_000 {
+                        info!(
+                            target: "n42.payload_serve",
+                            number,
+                            count,
+                            prune_ms = pruned_at.elapsed().as_millis() as u64,
+                            "imported block's transactions taken out of the pool"
+                        );
+                    }
+                });
+                // `N42_PRUNE_ASYNC=0`: the answer waits for the prune, as before round 43's loop98.
+                if !prune_async() {
+                    let _ = pruning.await;
+                }
+            }
+            if let Some(ms) = direct_ms {
+                info!(
+                    target: "n42.payload_serve",
+                    number,
+                    txs,
+                    convert_ms = ms[0],
+                    header_ms = ms[1],
+                    senders_ms = ms[2],
+                    exec_ms = ms[3],
+                    checks_ms = ms[4],
+                    root_ms = ms[5],
+                    hashed_ms = ms[6],
+                    total_ms = ms[7],
+                    senders_cached = ms[8],
+                    state_ms = ms[9],
+                    carry_ms = ms[10],
+                    mined_ms = ms[11],
+                    insert_ms = ms[12],
+                    engine_ms = (started.elapsed().saturating_sub(decoded).as_millis() as u64).saturating_sub(ms[7]),
+                    status = ?status.status,
+                    "direct import: executed here, handed to the engine as executed"
+                );
+            }
+            if txs > 10_000 {
+                info!(
+                    target: "n42.payload_serve",
+                    number,
+                    txs,
+                    decode_ms = decoded.as_millis() as u64,
+                    engine_ms = started.elapsed().saturating_sub(decoded).as_millis() as u64,
+                    status = ?status.status,
+                    reused,
+                    "raw newPayload"
+                );
+            }
+            let encoded = raw_engine::encode_payload_status(&status);
+            out.push(1);
+            out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+            out.extend_from_slice(&encoded);
+        }
+        Err(err) => {
+            let message = err.to_string();
+            out.push(2);
+            out.extend_from_slice(&(message.len() as u32).to_le_bytes());
+            out.extend_from_slice(message.as_bytes());
+        }
+    }
+    stream.write_all(out).await?;
+    Ok(())
+}
+
 pub async fn serve<T>(
     addr: SocketAddr,
     payloads: PayloadBuilderHandle<T>,
@@ -872,6 +1313,9 @@ where
             Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(err) => return Err(err),
         };
+        // When the request's first byte landed: what follows it is ~25 MB
+        // over the loopback socket, and the vote road starts here.
+        let started_at = std::time::Instant::now();
         if kind == request::OWN_BLOCK {
             let len = stream.read_u32_le().await? as usize;
             if len > 1 << 20 {
@@ -944,6 +1388,73 @@ where
             stream.write_all(&out).await?;
             continue;
         }
+        if kind == request::FOREIGN_BODY {
+            let len = stream.read_u32_le().await? as usize;
+            if len > 256 << 20 {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "body frame too large"));
+            }
+            frame.clear();
+            frame.resize(len, 0);
+            stream.read_exact(&mut frame[..]).await?;
+            let recv = started_at.elapsed();
+            let started = std::time::Instant::now();
+            out.clear();
+            // The frame as shared bytes once, so the body inside it -- and
+            // every transaction inside that -- is a slice rather than a
+            // copy. The copies that matter are made deliberately, per
+            // transaction, in `convert_body_to_block`: what a slice would
+            // keep alive is the whole 25 MB body.
+            let shared = alloy_primitives::Bytes::copy_from_slice(&frame[..]);
+            let decoded = match raw_engine::decode_foreign_body(&shared)
+                .map_err(|err| format!("foreign body frame: {err}"))
+                .and_then(|(announced, profile, body)| {
+                    // Only with the direct import configured: the body path
+                    // exists to put the block straight into it, and without
+                    // it the engine's own pass would have to convert the
+                    // payload again anyway.
+                    let reuse = reuse
+                        .as_ref()
+                        .filter(|reuse| reuse.import_foreign.is_some())
+                        .ok_or_else(|| "no direct import; send the payload".to_string())?;
+                    let validator = std::sync::Arc::clone(&reuse.validator);
+                    tokio::task::block_in_place(|| {
+                        validator
+                            .convert_body_to_block(announced, profile, &body)
+                            .map_err(|err| format!("body: {err}"))
+                    })
+                }) {
+                Ok(decoded) => decoded,
+                Err(message) => {
+                    // "Not this way": the validator sends the same block as
+                    // a NEW_PAYLOAD payload. A body that does not decode is
+                    // refused here rather than voted on; the validator's
+                    // fallback decodes it too, fails the same way, and asks
+                    // its peers for the block again.
+                    debug!(target: "n42.payload_serve", %message, "foreign body refused");
+                    out.push(2);
+                    out.extend_from_slice(&(message.len() as u32).to_le_bytes());
+                    out.extend_from_slice(message.as_bytes());
+                    stream.write_all(&out).await?;
+                    continue;
+                }
+            };
+            let (sealed, data) = decoded;
+            // The body's bytes are not held past the conversion: the
+            // transactions own their own.
+            drop(shared);
+            info!(
+                target: "n42.payload_serve",
+                number = sealed.number,
+                txs = sealed.body().transactions.len(),
+                bytes = len,
+                recv_ms = recv.as_millis() as u64,
+                decode_ms = started.elapsed().as_millis() as u64,
+                "foreign body decoded once"
+            );
+            let decoded_in = started.elapsed();
+            import_for_validator::<T>(&mut stream, &mut out, &engine, reuse.as_ref(), data, Some(sealed), started, decoded_in).await?;
+            continue;
+        }
         if kind == request::NEW_PAYLOAD {
             let len = stream.read_u32_le().await? as usize;
             if len > 256 << 20 {
@@ -981,411 +1492,18 @@ where
                     out.extend_from_slice(err.as_bytes());
                 }
                 Ok(data) => {
-                    let decoded = started.elapsed();
-                    let number = data.payload.block_number();
-                    let txs = data.payload.as_v1().transactions.len();
-                    // One of ours, sealed: hand the engine the build's execution
-                    // first, and the newPayload below finds the block known.
-                    let reused = match &reuse {
-                        Some(reuse) => reuse_own_build::<T>(reuse, &data).await.is_some(),
-                        None => false,
-                    };
-                    // The transactions' bytes, kept for the prune below; the
-                    // payload itself goes to the engine.
-                    let raw_transactions = data.payload.as_v1().transactions.clone();
-                    let probe = reuse.as_ref().and_then(|r| r.exec_probe.clone()).filter(|_| !reused && txs > 10_000);
-                    let probe_data = probe.as_ref().map(|_| data.clone());
-                    // Another node's block: executed here and handed to the
-                    // engine as executed, when configured. Any failure logs
-                    // and leaves the block to the engine's own path.
-                    let mut direct_ms: Option<[u64; 13]> = None;
-                    // The block's transaction hashes, known once the direct
-                    // import converted the payload: the prune below then
-                    // needs no keccak over the raw bytes.
-                    let mut mined_hashes: Option<Vec<B256>> = None;
-                    // The executed block kept for the engine's own conversion when
-                    // the answer goes out before that pass.
-                    let mut remembered: Option<std::sync::Arc<reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>>> = None;
-                    let fast_taken = direct_fast_answer();
-                    if let Some(reuse) = reuse.as_ref().filter(|r| !reused && r.import_foreign.is_some()) {
-                        let import = reuse.import_foreign.clone().expect("checked");
-                        let validator = reuse.validator.clone();
-                        let inserts = reuse.inserts.clone();
-                        let payload = data.clone();
-                        let fast = direct_fast_answer();
-                        let started = std::time::Instant::now();
-                        // Under deferred execution the import says when the
-                        // block is checked, and the validator hears it on a
-                        // CHECKED frame before the import's answer.
-                        let (checked_tx, checked_rx) = tokio::sync::oneshot::channel::<()>();
-                        let handed = tokio::task::spawn_blocking(move || {
-                            let sealed = <n42_engine_types::engine_validator::N42EngineValidator<reth_chainspec::ChainSpec> as reth_engine_primitives::PayloadValidator<T>>::convert_payload_to_block(&validator, payload)
-                                .map_err(|err| format!("conversion: {err}"))?;
-                            let converted = started.elapsed().as_millis() as u64;
-                            // The engine's newPayload, next, converts the same
-                            // payload: let it take this block instead.
-                            // The engine's own conversion of the same payload takes
-                            // this instead of decoding 163,000 transactions again.
-                            // With the fast answer the clone moves off this path
-                            // instead: the block is remembered from the executed
-                            // block's `Arc` on a worker thread below, well before
-                            // the engine's pass runs.
-                            if !fast {
-                                n42_engine_types::built_executions::remember_sealed(sealed.hash(), sealed.clone());
-                            }
-                            let (executed, phases) = import(sealed, Some(checked_tx))?;
-                            Ok::<_, String>((executed, phases, converted))
-                        });
-                        tokio::pin!(handed);
-                        let mut finished = None;
-                        tokio::select! {
-                            checked = checked_rx => {
-                                if checked.is_ok() {
-                                    let status = alloy_rpc_types_engine::PayloadStatus::from_status(
-                                        alloy_rpc_types_engine::PayloadStatusEnum::Valid,
-                                    )
-                                    .with_latest_valid_hash(data.payload.block_hash());
-                                    let encoded = raw_engine::encode_payload_status(&status);
-                                    let mut frame = Vec::with_capacity(encoded.len() + 5);
-                                    frame.push(raw_engine::reply::CHECKED);
-                                    frame.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
-                                    frame.extend_from_slice(&encoded);
-                                    stream.write_all(&frame).await?;
-                                    info!(
-                                        target: "n42.payload_serve",
-                                        number,
-                                        txs,
-                                        checked_ms = started.elapsed().as_millis() as u64,
-                                        "checked: answered before the execution"
-                                    );
-                                }
-                            }
-                            done = &mut handed => finished = Some(done),
-                        }
-                        let handed = match finished {
-                            Some(done) => done,
-                            None => handed.await,
-                        }
-                        .map_err(|err| err.to_string())
-                        .and_then(|r| r);
-                        match handed {
-                            Ok((executed, phases, converted)) => {
-                                let handed_at = std::time::Instant::now();
-                                // The block's transactions leave the queue now, not
-                                // when the canonical pruner gets to them: a build
-                                // ahead starts the moment this import returns and
-                                // would otherwise take them again (87,800 stale
-                                // transactions in one build, round 38).
-                                // `N42_QUEUE_WORK_OFFLOAD=1`: the queue's and the
-                                // pool's bookkeeping goes to a worker thread holding
-                                // the block, because the two walks of a 163,000-
-                                // transaction block (one for the mined senders and
-                                // nonces, one for the hashes) sit on the vote's path
-                                // and nothing reads their result before the answer.
-                                // Off by default: it also delays the queue's removal
-                                // by those walks, and a build ahead that starts before
-                                // the removal takes the mined transactions again
-                                // (87,800 stale ones in one build, round 38).
-                                // The block for the engine's own conversion, taken
-                                // from the executed block before it is handed over.
-                                if fast_taken {
-                                    remembered = Some(std::sync::Arc::clone(&executed.recovered_block));
-                                }
-                                let queue_offloaded = queue_work_offload();
-                                if let Some(queue) = n42_tx_queue::global::<n42_engine_types::N42PooledTransaction>() {
-                                    if queue_offloaded {
-                                        let block = std::sync::Arc::clone(&executed.recovered_block);
-                                        let prune = reuse.prune_pool.clone();
-                                        tokio::task::spawn_blocking(move || {
-                                            let at = std::time::Instant::now();
-                                            let mined: Vec<(alloy_primitives::Address, u64)> = block
-                                                .transactions_with_sender()
-                                                .map(|(sender, tx)| (*sender, alloy_consensus::Transaction::nonce(tx)))
-                                                .collect();
-                                            let (number, hash) = (block.number(), block.hash());
-                                            let removed = queue.remove_mined_batch_collecting(mined);
-                                            // Held until the chain settles the height (round 43).
-                                            queue.hold_own_block(number, hash, removed);
-                                            let count = block.body().transactions().count();
-                                            if let Some(prune) = prune {
-                                                prune(block.body().transactions().map(|tx| *tx.tx_hash()).collect());
-                                            }
-                                            if count > 10_000 {
-                                                info!(
-                                                    target: "n42.payload_serve",
-                                                    number,
-                                                    count,
-                                                    queue_ms = at.elapsed().as_millis() as u64,
-                                                    "imported block's transactions taken out of the queue and the pool"
-                                                );
-                                            }
-                                        });
-                                    } else {
-                                        let mined: Vec<(alloy_primitives::Address, u64)> = executed
-                                            .recovered_block
-                                            .transactions_with_sender()
-                                            .map(|(sender, tx)| (*sender, alloy_consensus::Transaction::nonce(tx)))
-                                            .collect();
-                                        let (number, hash) =
-                                            (executed.recovered_block.number(), executed.recovered_block.hash());
-                                        mined_hashes = Some(
-                                            executed.recovered_block.body().transactions().map(|tx| *tx.tx_hash()).collect(),
-                                        );
-                                        tokio::task::spawn_blocking(move || {
-                                            let removed = queue.remove_mined_batch_collecting(mined);
-                                            queue.hold_own_block(number, hash, removed);
-                                        });
-                                    }
-                                }
-                                // The mined-transaction bookkeeping above walks the
-                                // block twice; time it and the engine's acknowledgement
-                                // apart, because together they were most of the ~78 ms
-                                // of a 438 ms import that no phase accounted for.
-                                let mined_ms = handed_at.elapsed().as_millis() as u64;
-                                let insert_at = std::time::Instant::now();
-                                let (done, handed) = tokio::sync::oneshot::channel();
-                                let sent = inserts
-                                    .send(reth_node_builder::executed_inserts::ExecutedInsert { block: executed, done })
-                                    .is_ok();
-                                let landed = sent
-                                    && matches!(tokio::time::timeout(std::time::Duration::from_secs(2), handed).await, Ok(Ok(true)));
-                                if landed {
-                                    crate::follower_import::note_import_landed();
-                                    direct_ms = Some([
-                                        converted,
-                                        phases[0],
-                                        phases[1],
-                                        phases[2],
-                                        phases[3],
-                                        phases[4],
-                                        phases[5],
-                                        started.elapsed().as_millis() as u64,
-                                        phases[6],
-                                        phases[7],
-                                        phases[8],
-                                        mined_ms,
-                                        insert_at.elapsed().as_millis() as u64,
-                                    ]);
-                                } else {
-                                    warn!(target: "n42.payload_serve", number, "direct import: the engine did not take the executed block; importing the ordinary way");
-                                }
-                            }
-                            Err(err) => warn!(target: "n42.payload_serve", number, %err, "direct import failed; importing the ordinary way"),
-                        }
-                    }
-                    // The fast answer (`N42_DIRECT_FAST_ANSWER=1`): this node
-                    // executed the block and the engine holds it as executed, so
-                    // the validator's vote does not wait for the engine's own
-                    // pass. Everything the pass would check has been checked here
-                    // -- the header against its parent, the transactions root, the
-                    // receipts root, the gas, and the QMDB state root -- so it is
-                    // bookkeeping; it runs below, after the answer is on the wire,
-                    // and a verdict other than VALID is logged loudly.
-                    if direct_ms.is_some() && direct_fast_answer() {
-                        let hash = data.payload.block_hash();
-                        let status = alloy_rpc_types_engine::PayloadStatus::from_status(
-                            alloy_rpc_types_engine::PayloadStatusEnum::Valid,
-                        )
-                        .with_latest_valid_hash(hash);
-                        let encoded = raw_engine::encode_payload_status(&status);
-                        out.push(1);
-                        out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
-                        out.extend_from_slice(&encoded);
-                        stream.write_all(&out).await?;
-                        let answered = started.elapsed().saturating_sub(decoded).as_millis() as u64;
-                        if let Some(ms) = direct_ms {
-                            info!(
-                                target: "n42.payload_serve",
-                                number,
-                                txs,
-                                convert_ms = ms[0],
-                                header_ms = ms[1],
-                                senders_ms = ms[2],
-                                exec_ms = ms[3],
-                                checks_ms = ms[4],
-                                root_ms = ms[5],
-                                hashed_ms = ms[6],
-                                total_ms = ms[7],
-                                senders_cached = ms[8],
-                                state_ms = ms[9],
-                                carry_ms = ms[10],
-                                mined_ms = ms[11],
-                                insert_ms = ms[12],
-                                answered_ms = answered,
-                                "direct import: answered before the engine's own pass"
-                            );
-                        }
-                        // The engine's pass would otherwise decode the payload's
-                        // 163,000 transactions again (round 43, loop100: its pass
-                        // went 35 -> 102 ms without the remembered block). The
-                        // clone is made here, off the answered path, and always
-                        // finishes before the pass below reads it.
-                        if let Some(block) = remembered.take() {
-                            let hash = block.hash();
-                            let cloned = tokio::task::spawn_blocking(move || {
-                                n42_engine_types::built_executions::remember_sealed(hash, block.sealed_block().clone());
-                            })
-                            .await;
-                            if let Err(err) = cloned {
-                                warn!(target: "n42.payload_serve", number, %err, "remembering the sealed block failed; the engine will decode it again");
-                            }
-                        }
-                        let engine_at = std::time::Instant::now();
-                        match engine.new_payload(data).await {
-                            Ok(status) if !status.status.is_valid() => warn!(
-                                target: "n42.payload_serve", number, status = ?status.status,
-                                "the engine disagreed with a block this node executed and answered VALID for"
-                            ),
-                            Err(err) => warn!(target: "n42.payload_serve", number, %err, "the engine's own pass failed after the fast answer"),
-                            _ => {}
-                        }
-                        // Only when the walks stayed on this path; the worker thread
-                        // above prunes for itself otherwise.
-                        if let (Some(prune), Some(hashes)) = (reuse.as_ref().and_then(|r| r.prune_pool.clone()), mined_hashes.take()) {
-                            let count = hashes.len();
-                            let pruned_at = std::time::Instant::now();
-                            let _ = tokio::task::spawn_blocking(move || {
-                                prune(hashes);
-                                if count > 10_000 {
-                                    info!(
-                                        target: "n42.payload_serve",
-                                        number,
-                                        count,
-                                        prune_ms = pruned_at.elapsed().as_millis() as u64,
-                                        "imported block's transactions taken out of the pool"
-                                    );
-                                }
-                            });
-                        }
-                        if txs > 10_000 {
-                            info!(
-                                target: "n42.payload_serve",
-                                number,
-                                txs,
-                                engine_after_ms = engine_at.elapsed().as_millis() as u64,
-                                "the engine's own pass, behind the answer"
-                            );
-                        }
-                        continue;
-                    }
-                    match engine.new_payload(data).await {
-                        Ok(status) => {
-                            if let (Some(probe), Some(probe_data)) = (probe, probe_data) {
-                                let validator = reuse.as_ref().map(|r| r.validator.clone());
-                                if let Some(validator) = validator {
-                                    let _ = tokio::task::spawn_blocking(move || {
-                                        let converted = match <n42_engine_types::engine_validator::N42EngineValidator<reth_chainspec::ChainSpec> as reth_engine_primitives::PayloadValidator<T>>::convert_payload_to_block(&validator, probe_data) {
-                                            Ok(block) => block,
-                                            Err(err) => { warn!(target: "n42.payload_serve", %err, "exec probe: conversion failed"); return; }
-                                        };
-                                        let recovered = match converted.try_recover() {
-                                            Ok(block) => block,
-                                            Err(_) => { warn!(target: "n42.payload_serve", "exec probe: sender recovery failed"); return; }
-                                        };
-                                        let header_gas = recovered.gas_used;
-                                        match probe(recovered) {
-                                            Ok((exec_ms, gas, receipts)) => info!(
-                                                target: "n42.payload_serve",
-                                                number, txs, exec_ms, gas, header_gas, receipts,
-                                                "follower exec probe: the block executed again with the plain executor"
-                                            ),
-                                            Err(err) => warn!(target: "n42.payload_serve", %err, "exec probe failed"),
-                                        }
-                                    })
-                                    .await;
-                                }
-                            }
-                            // A block this node now holds: its transactions
-                            // leave the pool at once rather than when the
-                            // pool's maintenance gets to them. On a follower
-                            // that is what keeps `pending` honest -- the
-                            // ingest gate reads it, and a block's 163,000
-                            // still counted as pending after the block was
-                            // imported is what stalled the whole fleet's
-                            // supply for the length of one node's maintenance.
-                            if status.status == alloy_rpc_types_engine::PayloadStatusEnum::Valid
-                                && !reused
-                                && (mined_hashes.is_some() || direct_ms.is_none())
-                                && let Some(prune) = reuse.as_ref().and_then(|r| r.prune_pool.clone())
-                            {
-                                let pruned_at = std::time::Instant::now();
-                                let count = raw_transactions.len();
-                                // Not awaited: the answer to this payload is
-                                // what the validator's vote waits for, and the
-                                // prune of a full block was 66 ms of it (round
-                                // 43, loop94). The pool is a few tens of
-                                // milliseconds behind the chain instead of the
-                                // length of its maintenance, which is what the
-                                // `pending` the ingest gate reads needed.
-                                let mined_hashes = mined_hashes.take();
-                                let pruning = tokio::task::spawn_blocking(move || {
-                                    let hashes: Vec<B256> = mined_hashes.unwrap_or_else(|| {
-                                        use rayon::prelude::*;
-                                        raw_transactions.par_iter().map(|tx| alloy_primitives::keccak256(tx)).collect()
-                                    });
-                                    prune(hashes);
-                                    if count > 10_000 {
-                                        info!(
-                                            target: "n42.payload_serve",
-                                            number,
-                                            count,
-                                            prune_ms = pruned_at.elapsed().as_millis() as u64,
-                                            "imported block's transactions taken out of the pool"
-                                        );
-                                    }
-                                });
-                                // `N42_PRUNE_ASYNC=0`: the answer waits for the prune, as before round 43's loop98.
-                                if !prune_async() {
-                                    let _ = pruning.await;
-                                }
-                            }
-                            if let Some(ms) = direct_ms {
-                                info!(
-                                    target: "n42.payload_serve",
-                                    number,
-                                    txs,
-                                    convert_ms = ms[0],
-                                    header_ms = ms[1],
-                                    senders_ms = ms[2],
-                                    exec_ms = ms[3],
-                                    checks_ms = ms[4],
-                                    root_ms = ms[5],
-                                    hashed_ms = ms[6],
-                                    total_ms = ms[7],
-                                    senders_cached = ms[8],
-                                    state_ms = ms[9],
-                                    carry_ms = ms[10],
-                                    mined_ms = ms[11],
-                                    insert_ms = ms[12],
-                                    engine_ms = (started.elapsed().saturating_sub(decoded).as_millis() as u64).saturating_sub(ms[7]),
-                                    status = ?status.status,
-                                    "direct import: executed here, handed to the engine as executed"
-                                );
-                            }
-                            if txs > 10_000 {
-                                info!(
-                                    target: "n42.payload_serve",
-                                    number,
-                                    txs,
-                                    decode_ms = decoded.as_millis() as u64,
-                                    engine_ms = started.elapsed().saturating_sub(decoded).as_millis() as u64,
-                                    status = ?status.status,
-                                    reused,
-                                    "raw newPayload"
-                                );
-                            }
-                            let encoded = raw_engine::encode_payload_status(&status);
-                            out.push(1);
-                            out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
-                            out.extend_from_slice(&encoded);
-                        }
-                        Err(err) => {
-                            let message = err.to_string();
-                            out.push(2);
-                            out.extend_from_slice(&(message.len() as u32).to_le_bytes());
-                            out.extend_from_slice(message.as_bytes());
-                        }
-                    }
+                    import_for_validator::<T>(
+                        &mut stream,
+                        &mut out,
+                        &engine,
+                        reuse.as_ref(),
+                        data,
+                        None,
+                        started,
+                        started.elapsed(),
+                    )
+                    .await?;
+                    continue;
                 }
             }
             stream.write_all(&out).await?;

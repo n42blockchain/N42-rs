@@ -197,59 +197,9 @@ pub fn encode_block_rlp_parts(
 
 /// The same wire form, from transactions that are already EIP-2718 bytes.
 ///
-/// What a node that *built* the block has: the payload it got back from the
-/// execution layer carries every transaction as the bytes this encoding wants,
-/// and the header came out of sealing. Going through [`TxEnvelope`] to get here
-/// decodes each of them and encodes it straight back — 346-401 ms for a
-/// 163,000-transaction block, against 9-10 ms to compress the nineteen
-/// megabytes that come out.
-pub fn encode_block_rlp_raw(
-    header: &Header,
-    transaction_bytes: &[Bytes],
-    rewards: &[(Address, U256)],
-    bal: Option<&Bytes>,
-) -> Vec<u8> {
-    let mut header_rlp = Vec::new();
-    header.encode(&mut header_rlp);
-    let verifiers = Vec::<Bytes>::new();
-    let rewards = rewards
-        .iter()
-        .map(|(address, amount)| RewardRlp { address: *address, amount: *amount })
-        .collect::<Vec<_>>();
-    // The transaction list encoded by hand, because a slice of `Bytes` is not
-    // `Encodable` and collecting it into a `Vec` to borrow the impl would
-    // allocate a second copy of every transaction in the block. This is what
-    // `Vec<Bytes>` encodes to: an RLP list of RLP strings.
-    let items_length: usize = transaction_bytes.iter().map(Encodable::length).sum();
-    let transactions_length =
-        RlpHeader { list: true, payload_length: items_length }.length_with_payload();
-    let bal_length = bal.map_or(0, alloy_rlp::Encodable::length);
-    let payload_length = header_rlp.len()
-        + transactions_length
-        + verifiers.length()
-        + rewards.length()
-        + bal_length;
-    let mut encoded = Vec::with_capacity(payload_length + 16);
-    RlpHeader {
-        list: true,
-        payload_length,
-    }
-    .encode(&mut encoded);
-    encoded.extend_from_slice(&header_rlp);
-    RlpHeader { list: true, payload_length: items_length }.encode(&mut encoded);
-    for raw in transaction_bytes {
-        raw.encode(&mut encoded);
-    }
-    verifiers.encode(&mut encoded);
-    rewards.encode(&mut encoded);
-    // Fifth, and only when there is one: the decoder has always tolerated a
-    // trailing item, so a producer that sends none stays byte-identical to what
-    // it sent before.
-    if let Some(bal) = bal {
-        bal.encode(&mut encoded);
-    }
-    encoded
-}
+/// Defined with the decoder the execution layer shares; re-exported here
+/// because this is the crate that owns the transport.
+pub use n42_h2_consensus::block_body::encode_block_rlp_raw;
 
 /// Decodes the uncompressed wire form.
 ///

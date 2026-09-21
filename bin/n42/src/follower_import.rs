@@ -396,6 +396,57 @@ fn spec_for_intrinsic_gas<ChainSpec: reth_chainspec::EthereumHardforks>(chain_sp
     }
 }
 
+/// The first thing wrong with a block, at the transaction it is wrong at.
+/// Sorting these by index picks the same transaction the serial loops this
+/// replaced would have stopped at.
+#[derive(Debug)]
+struct Fault {
+    index: usize,
+    message: String,
+}
+
+/// A stretch of consecutive transactions of one sender, folded as the scan
+/// walks the block: the queue lays a sender's transactions out in runs, so
+/// 162,000 transactions fold into ~6,000 of these and the sender map is
+/// built over the runs rather than over every transaction.
+#[derive(Debug)]
+struct SenderRun {
+    sender: Address,
+    first_index: usize,
+    first_nonce: u64,
+    len: u64,
+    /// Value plus gas at the fee cap plus blob gas at its cap, saturating.
+    cost: alloy_primitives::U256,
+    /// The first transaction of this run that is wrong on its own terms:
+    /// its nonce does not continue the run, or its gas limit does not cover
+    /// its intrinsic gas. Boxed: a block in error is the rare case and a run
+    /// is otherwise 80 bytes.
+    fault: Option<Box<Fault>>,
+}
+
+/// What one chunk of the block's transactions came to.
+#[derive(Debug, Default)]
+struct ChunkScan {
+    gas_total: u64,
+    /// The first transaction of this chunk refused on its own terms, before
+    /// any sender is looked at: chain id, fee cap, priority fee, empty
+    /// authorization list. These outrank everything else, as they did when
+    /// they were a serial pass that returned early.
+    refused: Option<Fault>,
+    runs: Vec<SenderRun>,
+}
+
+/// A sender's whole share of the block, its runs folded together.
+#[derive(Debug)]
+struct SenderTotal {
+    first_index: usize,
+    first_nonce: u64,
+    next_nonce: u64,
+    count: u64,
+    cost: alloy_primitives::U256,
+    fault: Option<Fault>,
+}
+
 fn check_includable<Provider>(
     provider: &Provider,
     parent_hash: B256,
@@ -407,71 +458,199 @@ fn check_includable<Provider>(
 where
     Provider: StateProviderFactory + Sync,
 {
-    let groups = group_by_sender(block, chain_id)?;
-    check_sender_groups(provider, parent_hash, parent_output, block, &groups, spec)
+    let scans = scan_transactions(block, chain_id, spec);
+    if let Some(refused) = scans.iter().filter_map(|scan| scan.refused.as_ref()).min_by_key(|fault| fault.index) {
+        return Err(refused.message.clone());
+    }
+    let gas_total = scans.iter().fold(0u64, |total, scan| total.saturating_add(scan.gas_total));
+    let gas_limit = block.header().gas_limit;
+    if gas_total > gas_limit {
+        return Err(format!("gas limits sum to {gas_total}, over the block's {gas_limit}"));
+    }
+    let senders = fold_runs(scans);
+    check_senders(provider, parent_hash, parent_output, &senders)
 }
 
-/// The block's transactions grouped by sender, in block order, with the
-/// checks that need nothing but the transaction itself done on the way: the
-/// chain id, the fee cap against the block's base fee, the priority fee under
-/// the cap, a non-empty authorization list, and the gas limits' sum against
-/// the header's. A serial pass over 163,000 transactions.
-fn group_by_sender(block: &RecoveredBlock<Block>, chain_id: u64) -> Result<Vec<(Address, Vec<usize>)>, String> {
+/// One pass over the block's transactions, on the worker pool: everything
+/// that can be decided from a transaction alone, and the per-sender fold the
+/// account reads then need. This used to be a serial pass that grouped the
+/// transactions by sender and a parallel pass that walked them a second time
+/// through those groups; the block's transaction data is ~33 MB at the bench
+/// tier and streaming it once rather than twice is the point of the fold.
+fn scan_transactions(
+    block: &RecoveredBlock<Block>,
+    chain_id: u64,
+    spec: reth_revm::primitives::hardfork::SpecId,
+) -> Vec<ChunkScan> {
+    use alloy_consensus::Transaction as _;
+    use rayon::prelude::*;
+
+    let base_fee = u128::from(block.header().base_fee_per_gas.unwrap_or(0));
+    let txs = &block.body().transactions;
+    let senders = block.senders();
+    let chunk = txs.len().div_ceil(32).max(1);
+    txs.par_chunks(chunk)
+        .enumerate()
+        .map(|(nth, txs)| {
+            let base = nth * chunk;
+            let senders = &senders[base..base + txs.len()];
+            let mut scan = ChunkScan { runs: Vec::with_capacity(txs.len() / 8 + 1), ..Default::default() };
+            for (offset, (tx, sender)) in txs.iter().zip(senders).enumerate() {
+                let index = base + offset;
+                if let Some(id) = tx.chain_id()
+                    && id != chain_id
+                {
+                    scan.refused =
+                        Some(Fault { index, message: format!("transaction {index}: chain id {id}, the chain's is {chain_id}") });
+                    break;
+                }
+                let cap = tx.max_fee_per_gas();
+                if cap < base_fee {
+                    scan.refused = Some(Fault {
+                        index,
+                        message: format!("transaction {index}: fee cap {cap} under the base fee {base_fee}"),
+                    });
+                    break;
+                }
+                if tx.max_priority_fee_per_gas().is_some_and(|tip| tip > cap) {
+                    scan.refused =
+                        Some(Fault { index, message: format!("transaction {index}: priority fee over the fee cap") });
+                    break;
+                }
+                if tx.authorization_list().is_some_and(|list| list.is_empty()) {
+                    scan.refused =
+                        Some(Fault { index, message: format!("transaction {index}: empty authorization list") });
+                    break;
+                }
+                scan.gas_total = scan.gas_total.saturating_add(tx.gas_limit());
+
+                if !matches!(scan.runs.last(), Some(run) if run.sender == *sender) {
+                    scan.runs.push(SenderRun {
+                        sender: *sender,
+                        first_index: index,
+                        first_nonce: tx.nonce(),
+                        len: 0,
+                        cost: alloy_primitives::U256::ZERO,
+                        fault: None,
+                    });
+                }
+                let run = scan.runs.last_mut().expect("a run for this sender");
+                // The nonce before the intrinsic gas, the order the
+                // per-sender loop checked them in: a transaction wrong in
+                // both ways still reports its nonce.
+                if run.fault.is_none() {
+                    let expected = run.first_nonce.saturating_add(run.len);
+                    if tx.nonce() != expected {
+                        run.fault = Some(Box::new(Fault {
+                            index,
+                            message: format!("transaction {index}: nonce {}, {sender} is at {expected}", tx.nonce()),
+                        }));
+                    } else if let Some(needed) = intrinsic_gas_shortfall(tx, spec) {
+                        run.fault = Some(Box::new(Fault {
+                            index,
+                            message: format!("transaction {index}: gas limit {} under the intrinsic {needed}", tx.gas_limit()),
+                        }));
+                    }
+                }
+                run.len += 1;
+                let gas = alloy_primitives::U256::from(tx.gas_limit()) * alloy_primitives::U256::from(tx.max_fee_per_gas());
+                let blobs = alloy_primitives::U256::from(tx.blob_gas_used().unwrap_or(0))
+                    * alloy_primitives::U256::from(tx.max_fee_per_blob_gas().unwrap_or(0));
+                run.cost = run.cost.saturating_add(tx.value()).saturating_add(gas).saturating_add(blobs);
+            }
+            scan
+        })
+        .collect()
+}
+
+/// The intrinsic gas -- the transaction's kind, calldata, access list and
+/// authorizations under this fork -- that its gas limit does not cover, or
+/// `None` if it does. A block that fails this fails at execution, and the
+/// vote that let it through was wrong.
+fn intrinsic_gas_shortfall(tx: &TransactionSigned, spec: reth_revm::primitives::hardfork::SpecId) -> Option<u64> {
     use alloy_consensus::Transaction as _;
 
-    let header = block.header();
-    let base_fee = u128::from(header.base_fee_per_gas.unwrap_or(0));
-    let mut gas_total: u64 = 0;
-    // The addresses' own bytes as the hash: SipHash over 163,000 transactions
-    // was ~29 ms of the check, serially, before the vote.
-    let mut by_sender: alloy_primitives::map::AddressHashMap<Vec<usize>> = Default::default();
-    for (index, (sender, tx)) in block.transactions_with_sender().enumerate() {
-        if let Some(id) = tx.chain_id() {
-            if id != chain_id {
-                return Err(format!("transaction {index}: chain id {id}, the chain's is {chain_id}"));
-            }
-        }
-        let cap = tx.max_fee_per_gas();
-        if cap < base_fee {
-            return Err(format!("transaction {index}: fee cap {cap} under the base fee {base_fee}"));
-        }
-        if tx.max_priority_fee_per_gas().is_some_and(|tip| tip > cap) {
-            return Err(format!("transaction {index}: priority fee over the fee cap"));
-        }
-        if tx.authorization_list().is_some_and(|list| list.is_empty()) {
-            return Err(format!("transaction {index}: empty authorization list"));
-        }
-        gas_total = gas_total.saturating_add(tx.gas_limit());
-        by_sender.entry(*sender).or_default().push(index);
-    }
-    if gas_total > header.gas_limit {
-        return Err(format!("gas limits sum to {gas_total}, over the block's {}", header.gas_limit));
-    }
-    Ok(by_sender.into_iter().collect())
+    let (al_accounts, al_storages) = tx
+        .access_list()
+        .map(|list| (list.len() as u64, list.iter().map(|item| item.storage_keys.len() as u64).sum::<u64>()))
+        .unwrap_or((0, 0));
+    let intrinsic = reth_revm::context_interface::cfg::gas::calculate_initial_tx_gas(
+        spec,
+        tx.input(),
+        tx.kind().is_create(),
+        al_accounts,
+        al_storages,
+        tx.authorization_list().map_or(0, |list| list.len() as u64),
+        None,
+    );
+    let needed = (intrinsic.initial_regular_gas + intrinsic.initial_state_gas).max(intrinsic.floor_gas);
+    (tx.gas_limit() < needed).then_some(needed)
 }
 
-/// Each sender's group against the parent's post-state: one account read, the
-/// nonces contiguous from the account's, the intrinsic gas within every
-/// transaction's gas limit, and the balance covering the whole group. On the
-/// worker pool, each chunk on a state provider of its own.
-fn check_sender_groups<Provider>(
+/// The chunks' runs folded per sender. The chunks are in block order and so
+/// are the runs inside them, so a sender's runs arrive in the order its
+/// transactions sit in the block and the nonces chain across the joins.
+fn fold_runs(scans: Vec<ChunkScan>) -> Vec<(Address, SenderTotal)> {
+    let mut by_sender: alloy_primitives::map::AddressHashMap<SenderTotal> = Default::default();
+    for scan in scans {
+        for run in scan.runs {
+            match by_sender.entry(run.sender) {
+                alloy_primitives::map::Entry::Vacant(slot) => {
+                    slot.insert(SenderTotal {
+                        first_index: run.first_index,
+                        first_nonce: run.first_nonce,
+                        next_nonce: run.first_nonce.saturating_add(run.len),
+                        count: run.len,
+                        cost: run.cost,
+                        fault: run.fault.map(|fault| *fault),
+                    });
+                }
+                alloy_primitives::map::Entry::Occupied(mut slot) => {
+                    let total = slot.get_mut();
+                    // The joint between two runs of one sender is a nonce
+                    // check like any other, at the first transaction of the
+                    // later run -- which is before anything that run itself
+                    // has to say, and after anything the sender already had.
+                    if total.fault.is_none() && run.first_nonce != total.next_nonce {
+                        total.fault = Some(Fault {
+                            index: run.first_index,
+                            message: format!(
+                                "transaction {}: nonce {}, {} is at {}",
+                                run.first_index, run.first_nonce, run.sender, total.next_nonce
+                            ),
+                        });
+                    }
+                    if total.fault.is_none() {
+                        total.fault = run.fault.map(|fault| *fault);
+                    }
+                    total.next_nonce = run.first_nonce.saturating_add(run.len);
+                    total.count += run.len;
+                    total.cost = total.cost.saturating_add(run.cost);
+                }
+            }
+        }
+    }
+    by_sender.into_iter().collect()
+}
+
+/// Each sender's total against the parent's post-state: one account read, the
+/// nonces contiguous from the account's, the balance covering the whole
+/// share. On the worker pool, each chunk on a state provider of its own; the
+/// block's transactions are not touched again here.
+fn check_senders<Provider>(
     provider: &Provider,
     parent_hash: B256,
     parent_output: Option<(&reth_revm::db::BundleState, B256)>,
-    block: &RecoveredBlock<Block>,
-    groups: &[(Address, Vec<usize>)],
-    spec: reth_revm::primitives::hardfork::SpecId,
+    senders: &[(Address, SenderTotal)],
 ) -> Result<(), String>
 where
     Provider: StateProviderFactory + Sync,
 {
-    use alloy_consensus::Transaction as _;
     use rayon::prelude::*;
     use reth_provider::AccountReader as _;
 
-    let txs: Vec<&TransactionSigned> = block.body().transactions().collect();
-    let chunk = groups.len().div_ceil(32).max(1);
-    let checked: Vec<Result<(), String>> = groups
+    let chunk = senders.len().div_ceil(32).max(1);
+    let faults: Vec<Result<Option<Fault>, String>> = senders
         .par_chunks(chunk)
         .map(|chunk| {
             // With the parent's output, an untouched sender is read at the
@@ -479,7 +658,8 @@ where
             // read its state there.
             let state_at = parent_output.map_or(parent_hash, |(_, grandparent)| grandparent);
             let state = provider.state_by_block_hash(state_at).map_err(|err| format!("parent state: {err}"))?;
-            for (sender, indexes) in chunk {
+            let mut first: Option<Fault> = None;
+            for (sender, total) in chunk {
                 let after_parent = parent_output.and_then(|(bundle, _)| account_after_parent(bundle, sender));
                 let account = match after_parent {
                     Some(account) => account,
@@ -488,49 +668,52 @@ where
                         .map_err(|err| format!("account {sender}: {err}"))?
                         .unwrap_or_default(),
                 };
-                let mut nonce = account.nonce;
-                let mut cost = alloy_primitives::U256::ZERO;
-                for &index in indexes {
-                    let tx = txs[index];
-                    if tx.nonce() != nonce {
-                        return Err(format!("transaction {index}: nonce {}, {sender} is at {nonce}", tx.nonce()));
-                    }
-                    nonce += 1;
-                    // The intrinsic gas -- the transaction's kind, calldata,
-                    // access list and authorizations under this fork -- must
-                    // fit the gas limit, or the block fails at execution and
-                    // the vote was wrong. Here on the worker pool: serially
-                    // it was ~40 ms of the check (loop143).
-                    let (al_accounts, al_storages) = tx
-                        .access_list()
-                        .map(|list| (list.len() as u64, list.iter().map(|item| item.storage_keys.len() as u64).sum::<u64>()))
-                        .unwrap_or((0, 0));
-                    let intrinsic = reth_revm::context_interface::cfg::gas::calculate_initial_tx_gas(
-                        spec,
-                        tx.input(),
-                        tx.kind().is_create(),
-                        al_accounts,
-                        al_storages,
-                        tx.authorization_list().map_or(0, |list| list.len() as u64),
-                        None,
-                    );
-                    let needed = (intrinsic.initial_regular_gas + intrinsic.initial_state_gas).max(intrinsic.floor_gas);
-                    if tx.gas_limit() < needed {
-                        return Err(format!("transaction {index}: gas limit {} under the intrinsic {needed}", tx.gas_limit()));
-                    }
-                    let gas = alloy_primitives::U256::from(tx.gas_limit()) * alloy_primitives::U256::from(tx.max_fee_per_gas());
-                    let blobs = alloy_primitives::U256::from(tx.blob_gas_used().unwrap_or(0))
-                        * alloy_primitives::U256::from(tx.max_fee_per_blob_gas().unwrap_or(0));
-                    cost = cost.saturating_add(tx.value()).saturating_add(gas).saturating_add(blobs);
-                }
-                if cost > account.balance {
-                    return Err(format!("{sender}: {} transactions cost {cost} of a balance of {}", indexes.len(), account.balance));
+                // The account's own nonce is the sender's first transaction,
+                // so a mismatch here outranks anything found later in its
+                // share.
+                let fault = if account.nonce != total.first_nonce {
+                    Some(Fault {
+                        index: total.first_index,
+                        message: format!(
+                            "transaction {}: nonce {}, {sender} is at {}",
+                            total.first_index, total.first_nonce, account.nonce
+                        ),
+                    })
+                } else if let Some(fault) = &total.fault {
+                    Some(Fault { index: fault.index, message: fault.message.clone() })
+                } else if total.cost > account.balance {
+                    // Checked after every transaction of the sender, so it
+                    // loses to any of them: the block's last word about it.
+                    Some(Fault {
+                        index: usize::MAX,
+                        message: format!(
+                            "{sender}: {} transactions cost {} of a balance of {}",
+                            total.count, total.cost, account.balance
+                        ),
+                    })
+                } else {
+                    None
+                };
+                if let Some(fault) = fault
+                    && first.as_ref().is_none_or(|held| fault.index < held.index)
+                {
+                    first = Some(fault);
                 }
             }
-            Ok(())
+            Ok(first)
         })
         .collect();
-    checked.into_iter().collect()
+    let mut first: Option<Fault> = None;
+    for chunk in faults {
+        // A provider that cannot answer is not a verdict on the block, so it
+        // is reported whatever the block itself says.
+        if let Some(fault) = chunk?
+            && first.as_ref().is_none_or(|held| fault.index < held.index)
+        {
+            first = Some(fault);
+        }
+    }
+    first.map_or(Ok(()), |fault| Err(fault.message))
 }
 
 /// The parent as an executed block this import reads its post-state from
@@ -1426,6 +1609,147 @@ mod tests {
     use reth_revm::primitives::hardfork::SpecId;
     use reth_revm::state::AccountInfo;
 
+    /// The implementation the fused scan replaced, kept as the oracle the
+    /// property tests compare against: a serial pass that grouped the block's
+    /// transactions by sender, then a parallel pass that walked them a second
+    /// time through those groups.
+    fn check_includable_oracle<Provider>(
+        provider: &Provider,
+        parent_hash: B256,
+        parent_output: Option<(&reth_revm::db::BundleState, B256)>,
+        block: &RecoveredBlock<Block>,
+        chain_id: u64,
+        spec: reth_revm::primitives::hardfork::SpecId,
+    ) -> Result<(), String>
+    where
+        Provider: StateProviderFactory + Sync,
+    {
+        let groups = group_by_sender(block, chain_id)?;
+        check_sender_groups(provider, parent_hash, parent_output, block, &groups, spec)
+    }
+
+    /// The block's transactions grouped by sender, in block order, with the
+    /// checks that need nothing but the transaction itself done on the way: the
+    /// chain id, the fee cap against the block's base fee, the priority fee under
+    /// the cap, a non-empty authorization list, and the gas limits' sum against
+    /// the header's. A serial pass over 163,000 transactions.
+    fn group_by_sender(block: &RecoveredBlock<Block>, chain_id: u64) -> Result<Vec<(Address, Vec<usize>)>, String> {
+        use alloy_consensus::Transaction as _;
+
+        let header = block.header();
+        let base_fee = u128::from(header.base_fee_per_gas.unwrap_or(0));
+        let mut gas_total: u64 = 0;
+        // The addresses' own bytes as the hash: SipHash over 163,000 transactions
+        // was ~29 ms of the check, serially, before the vote.
+        let mut by_sender: alloy_primitives::map::AddressHashMap<Vec<usize>> = Default::default();
+        for (index, (sender, tx)) in block.transactions_with_sender().enumerate() {
+            if let Some(id) = tx.chain_id() {
+                if id != chain_id {
+                    return Err(format!("transaction {index}: chain id {id}, the chain's is {chain_id}"));
+                }
+            }
+            let cap = tx.max_fee_per_gas();
+            if cap < base_fee {
+                return Err(format!("transaction {index}: fee cap {cap} under the base fee {base_fee}"));
+            }
+            if tx.max_priority_fee_per_gas().is_some_and(|tip| tip > cap) {
+                return Err(format!("transaction {index}: priority fee over the fee cap"));
+            }
+            if tx.authorization_list().is_some_and(|list| list.is_empty()) {
+                return Err(format!("transaction {index}: empty authorization list"));
+            }
+            gas_total = gas_total.saturating_add(tx.gas_limit());
+            by_sender.entry(*sender).or_default().push(index);
+        }
+        if gas_total > header.gas_limit {
+            return Err(format!("gas limits sum to {gas_total}, over the block's {}", header.gas_limit));
+        }
+        Ok(by_sender.into_iter().collect())
+    }
+
+    /// Each sender's group against the parent's post-state: one account read, the
+    /// nonces contiguous from the account's, the intrinsic gas within every
+    /// transaction's gas limit, and the balance covering the whole group. On the
+    /// worker pool, each chunk on a state provider of its own.
+    fn check_sender_groups<Provider>(
+        provider: &Provider,
+        parent_hash: B256,
+        parent_output: Option<(&reth_revm::db::BundleState, B256)>,
+        block: &RecoveredBlock<Block>,
+        groups: &[(Address, Vec<usize>)],
+        spec: reth_revm::primitives::hardfork::SpecId,
+    ) -> Result<(), String>
+    where
+        Provider: StateProviderFactory + Sync,
+    {
+        use alloy_consensus::Transaction as _;
+        use rayon::prelude::*;
+        use reth_provider::AccountReader as _;
+
+        let txs: Vec<&TransactionSigned> = block.body().transactions().collect();
+        let chunk = groups.len().div_ceil(32).max(1);
+        let checked: Vec<Result<(), String>> = groups
+            .par_chunks(chunk)
+            .map(|chunk| {
+                // With the parent's output, an untouched sender is read at the
+                // grandparent, which is in the engine: the parent's own execution
+                // read its state there.
+                let state_at = parent_output.map_or(parent_hash, |(_, grandparent)| grandparent);
+                let state = provider.state_by_block_hash(state_at).map_err(|err| format!("parent state: {err}"))?;
+                for (sender, indexes) in chunk {
+                    let after_parent = parent_output.and_then(|(bundle, _)| account_after_parent(bundle, sender));
+                    let account = match after_parent {
+                        Some(account) => account,
+                        None => state
+                            .basic_account(sender)
+                            .map_err(|err| format!("account {sender}: {err}"))?
+                            .unwrap_or_default(),
+                    };
+                    let mut nonce = account.nonce;
+                    let mut cost = alloy_primitives::U256::ZERO;
+                    for &index in indexes {
+                        let tx = txs[index];
+                        if tx.nonce() != nonce {
+                            return Err(format!("transaction {index}: nonce {}, {sender} is at {nonce}", tx.nonce()));
+                        }
+                        nonce += 1;
+                        // The intrinsic gas -- the transaction's kind, calldata,
+                        // access list and authorizations under this fork -- must
+                        // fit the gas limit, or the block fails at execution and
+                        // the vote was wrong. Here on the worker pool: serially
+                        // it was ~40 ms of the check (loop143).
+                        let (al_accounts, al_storages) = tx
+                            .access_list()
+                            .map(|list| (list.len() as u64, list.iter().map(|item| item.storage_keys.len() as u64).sum::<u64>()))
+                            .unwrap_or((0, 0));
+                        let intrinsic = reth_revm::context_interface::cfg::gas::calculate_initial_tx_gas(
+                            spec,
+                            tx.input(),
+                            tx.kind().is_create(),
+                            al_accounts,
+                            al_storages,
+                            tx.authorization_list().map_or(0, |list| list.len() as u64),
+                            None,
+                        );
+                        let needed = (intrinsic.initial_regular_gas + intrinsic.initial_state_gas).max(intrinsic.floor_gas);
+                        if tx.gas_limit() < needed {
+                            return Err(format!("transaction {index}: gas limit {} under the intrinsic {needed}", tx.gas_limit()));
+                        }
+                        let gas = alloy_primitives::U256::from(tx.gas_limit()) * alloy_primitives::U256::from(tx.max_fee_per_gas());
+                        let blobs = alloy_primitives::U256::from(tx.blob_gas_used().unwrap_or(0))
+                            * alloy_primitives::U256::from(tx.max_fee_per_blob_gas().unwrap_or(0));
+                        cost = cost.saturating_add(tx.value()).saturating_add(gas).saturating_add(blobs);
+                    }
+                    if cost > account.balance {
+                        return Err(format!("{sender}: {} transactions cost {cost} of a balance of {}", indexes.len(), account.balance));
+                    }
+                }
+                Ok(())
+            })
+            .collect();
+        checked.into_iter().collect()
+    }
+
     const CHAIN_ID: u64 = 1;
     const BASE_FEE: u64 = 1_000_000_000;
     /// A transfer's fee cap; with a 21,000 gas limit a transaction costs
@@ -1472,7 +1796,9 @@ mod tests {
             ..Default::default()
         };
         let body = n42_tx_types::BlockBody { transactions: txs, ommers: Vec::new(), withdrawals: Some(Vec::new().into()) };
-        RecoveredBlock::new_sealed(SealedBlock::seal_slow(Block { header, body }), senders)
+        // Unhashed: the check never asks the block for its hash, and
+        // hashing a body of 162,000 transactions dominates the fixtures.
+        RecoveredBlock::new_sealed(SealedBlock::new_unhashed(Block { header, body }), senders)
     }
 
     /// The bench tier's block shape: `senders x per` transfers to recipients
@@ -1543,6 +1869,13 @@ mod tests {
     /// and from the provider. Pinned the way a fleet node runs:
     /// `RAYON_NUM_THREADS=16 taskset -c 0-31 cargo test --release -p n42 --lib
     /// bench_check_includable -- --ignored --nocapture`.
+    ///
+    /// Two things this bench cannot show. The provider leg's `senders` figure
+    /// is the mock's one mutex under 32 chunks at once, not what a state
+    /// provider costs -- at `RAYON_NUM_THREADS=1` it is 0.5 ms. And an idle
+    /// box flatters a pass this memory-bound: sixteen threads return 1.6x
+    /// here, so on a fleet node whose pool is already full the check costs
+    /// what it costs in total, which is what the one-thread legs read.
     #[test]
     #[ignore = "timing"]
     fn bench_check_includable() {
@@ -1551,23 +1884,40 @@ mod tests {
         let parent = bundle(&accounts);
         let grandparent = B256::random();
         let parent_hash = B256::random();
-        println!("block: {} transactions, {} senders", block.body().transactions.len(), accounts.len());
+        let ms = |at: std::time::Instant| at.elapsed().as_micros() as f64 / 1000.0;
+        println!(
+            "block: {} transactions, {} senders, {} bytes a transaction",
+            block.body().transactions.len(),
+            accounts.len(),
+            std::mem::size_of::<TransactionSigned>(),
+        );
         for (name, output) in [("parent-output", Some((&parent, grandparent))), ("provider", None)] {
             for round in 0..5 {
                 let group_at = std::time::Instant::now();
                 let groups = group_by_sender(&block, CHAIN_ID).expect("groups");
-                let group_us = group_at.elapsed().as_micros();
+                let group_ms = ms(group_at);
                 let check_at = std::time::Instant::now();
                 check_sender_groups(&mock, parent_hash, output, &block, &groups, SpecId::OSAKA).expect("includable");
-                let check_us = check_at.elapsed().as_micros();
-                let whole_at = std::time::Instant::now();
+                let check_ms = ms(check_at);
+                let old_at = std::time::Instant::now();
+                check_includable_oracle(&mock, parent_hash, output, &block, CHAIN_ID, SpecId::OSAKA).expect("includable");
+                let old_ms = ms(old_at);
+
+                let scan_at = std::time::Instant::now();
+                let scans = scan_transactions(&block, CHAIN_ID, SpecId::OSAKA);
+                let scan_ms = ms(scan_at);
+                let fold_at = std::time::Instant::now();
+                let folded = fold_runs(scans);
+                let fold_ms = ms(fold_at);
+                let senders_at = std::time::Instant::now();
+                check_senders(&mock, parent_hash, output, &folded).expect("includable");
+                let senders_ms = ms(senders_at);
+                let new_at = std::time::Instant::now();
                 check_includable(&mock, parent_hash, output, &block, CHAIN_ID, SpecId::OSAKA).expect("includable");
-                let whole_us = whole_at.elapsed().as_micros();
+                let new_ms = ms(new_at);
                 println!(
-                    "{name} round {round}: group {:.1} ms, check {:.1} ms, whole {:.1} ms",
-                    group_us as f64 / 1000.0,
-                    check_us as f64 / 1000.0,
-                    whole_us as f64 / 1000.0,
+                    "{name} round {round}: old group {group_ms:.1} check {check_ms:.1} whole {old_ms:.1} | \
+                     new scan {scan_ms:.1} fold {fold_ms:.1} senders {senders_ms:.1} whole {new_ms:.1}",
                 );
             }
         }
@@ -1642,5 +1992,350 @@ mod tests {
         for (sender, indexes) in &groups {
             assert_eq!(indexes.len(), counts[sender]);
         }
+    }
+
+    /// A xorshift, so a case is a seed and a failing case is reproducible.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        /// A number in `0..n`.
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// One thing wrong with a generated block, so a case can be built with
+    /// exactly one and its error message compared word for word.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Flaw {
+        /// A sender skips a nonce part-way through its share.
+        NonceGap,
+        /// A sender repeats the nonce before it.
+        DuplicateNonce,
+        /// A sender's balance covers all but its last transaction.
+        ShortBalance,
+        /// A sender neither the state nor the parent's output knows.
+        AbsentSender,
+        /// A sender the parent's output funded and the state has never seen.
+        OnlyInParentOutput,
+        /// A transaction of another chain.
+        ForeignChainId,
+        /// A gas limit under a transfer's intrinsic gas.
+        UnderIntrinsicGas,
+        /// A fee cap under the block's base fee.
+        FeeCapUnderBase,
+        /// A priority fee over the fee cap.
+        PriorityOverCap,
+    }
+
+    /// A transaction before it is signed, so a flaw can be applied to it.
+    #[derive(Clone)]
+    struct Planned {
+        nonce: u64,
+        value: u128,
+        gas_limit: u64,
+        fee_cap: u128,
+        priority: u128,
+        chain_id: u64,
+    }
+
+    /// A generated block with the two states the check can read it against.
+    struct Case {
+        block: RecoveredBlock<Block>,
+        /// What the chain's state at the parent holds.
+        state: Vec<(Address, Account)>,
+        /// What the parent's published output holds.
+        output: Vec<(Address, Account)>,
+    }
+
+    /// A block of a few senders' shares, interleaved in short runs so a
+    /// sender's transactions straddle the scan's chunks, with `flaws`
+    /// applied to senders drawn from the seed.
+    fn random_case(seed: u64, flaws: &[Flaw]) -> Case {
+        let mut rng = Rng(seed | 1);
+        let count = 1 + rng.below(10) as usize;
+        let beneficiary = addr(1);
+        // The beneficiary sends in a third of the cases: it is a sender like
+        // any other here, and the check has no special case for it.
+        let sender_at = |i: usize| if i == 0 && seed % 3 == 0 { beneficiary } else { addr(100 + i as u64) };
+        let mut lanes: Vec<Vec<Planned>> = Vec::with_capacity(count);
+        let mut starts = Vec::with_capacity(count);
+        for _ in 0..count {
+            let start = rng.below(4);
+            let per = 1 + rng.below(5);
+            starts.push(start);
+            lanes.push(
+                (0..per)
+                    .map(|k| Planned {
+                        nonce: start + k,
+                        value: u128::from(rng.below(1_000)),
+                        gas_limit: 21_000,
+                        fee_cap: FEE_CAP,
+                        priority: 1_000_000_000,
+                        chain_id: CHAIN_ID,
+                    })
+                    .collect(),
+            );
+        }
+        let mut state: Vec<(Address, Account)> = (0..count)
+            .map(|i| (sender_at(i), Account { nonce: starts[i], balance: U256::from(10u128.pow(21)), bytecode_hash: None }))
+            .collect();
+        let mut output = state.clone();
+
+        for flaw in flaws {
+            let s = rng.below(count as u64) as usize;
+            let lane = &mut lanes[s];
+            match flaw {
+                Flaw::NonceGap => {
+                    let k = 1 + rng.below(lane.len() as u64);
+                    for planned in lane.iter_mut().skip(k as usize - 1) {
+                        planned.nonce += 1;
+                    }
+                }
+                Flaw::DuplicateNonce => {
+                    if lane.len() > 1 {
+                        let k = 1 + rng.below(lane.len() as u64 - 1) as usize;
+                        lane[k].nonce = lane[k - 1].nonce;
+                    } else {
+                        lane[0].nonce += 1;
+                    }
+                }
+                Flaw::ShortBalance => {
+                    // Everything but the last transaction: value plus the
+                    // gas at the fee cap.
+                    let covered: u128 = lane[..lane.len() - 1].iter().map(|p| p.value + u128::from(p.gas_limit) * p.fee_cap).sum();
+                    let short = U256::from(covered);
+                    for (address, account) in state.iter_mut().chain(output.iter_mut()) {
+                        if *address == sender_at(s) {
+                            account.balance = short;
+                        }
+                    }
+                }
+                Flaw::AbsentSender => {
+                    // An unknown account reads as nonce 0 and no balance, so
+                    // the share has to start at 0 for the balance to be what
+                    // it fails on.
+                    for planned in lane.iter_mut().enumerate() {
+                        planned.1.nonce = planned.0 as u64;
+                    }
+                    state.retain(|(address, _)| *address != sender_at(s));
+                    output.retain(|(address, _)| *address != sender_at(s));
+                }
+                Flaw::OnlyInParentOutput => {
+                    state.retain(|(address, _)| *address != sender_at(s));
+                }
+                Flaw::ForeignChainId => {
+                    let k = rng.below(lane.len() as u64) as usize;
+                    lane[k].chain_id = CHAIN_ID + 1;
+                }
+                Flaw::UnderIntrinsicGas => {
+                    let k = rng.below(lane.len() as u64) as usize;
+                    lane[k].gas_limit = 20_000;
+                }
+                Flaw::FeeCapUnderBase => {
+                    let k = rng.below(lane.len() as u64) as usize;
+                    lane[k].fee_cap = u128::from(BASE_FEE) - 1;
+                    lane[k].priority = 0;
+                }
+                Flaw::PriorityOverCap => {
+                    let k = rng.below(lane.len() as u64) as usize;
+                    lane[k].priority = lane[k].fee_cap + 1;
+                }
+            }
+        }
+
+        let signed: Vec<Vec<TransactionSigned>> = lanes
+            .iter()
+            .map(|lane| {
+                lane.iter()
+                    .map(|p| {
+                        let inner = TxEip1559 {
+                            chain_id: p.chain_id,
+                            nonce: p.nonce,
+                            gas_limit: p.gas_limit,
+                            max_fee_per_gas: p.fee_cap,
+                            max_priority_fee_per_gas: p.priority,
+                            to: TxKind::Call(addr(900_000)),
+                            value: U256::from(p.value),
+                            input: Bytes::new(),
+                            ..Default::default()
+                        };
+                        let tx = Signed::new_unchecked(inner, Signature::test_signature(), B256::random());
+                        TransactionSigned::from(reth_ethereum_primitives::TransactionSigned::from(tx))
+                    })
+                    .collect()
+            })
+            .collect();
+        // Runs of one to three, so a sender's share is split across runs and
+        // the runs have to chain back together.
+        let run = 1 + rng.below(3) as usize;
+        let longest = signed.iter().map(Vec::len).max().unwrap_or(0);
+        let mut txs = Vec::new();
+        let mut senders = Vec::new();
+        let mut k = 0;
+        while k < longest {
+            for (s, lane) in signed.iter().enumerate() {
+                for tx in lane.iter().skip(k).take(run) {
+                    txs.push(tx.clone());
+                    senders.push(sender_at(s));
+                }
+            }
+            k += run;
+        }
+        Case { block: seal(txs, senders, beneficiary), state, output }
+    }
+
+    /// Both implementations' verdicts on a case, from both the provider and
+    /// the parent's output. `state` is reused across cases: building one
+    /// holds a clone of the mainnet chain spec, which dominates a run of
+    /// hundreds of small cases.
+    fn verdicts(state: &MockEthProvider, case: &Case) -> [(Result<(), String>, Result<(), String>); 2] {
+        {
+            let mut accounts = state.accounts.lock();
+            accounts.clear();
+            accounts.extend(
+                case.state.iter().map(|(address, account)| (*address, ExtendedAccount::new(account.nonce, account.balance))),
+            );
+        }
+        let parent = bundle(&case.output);
+        let grandparent = B256::random();
+        let hash = B256::random();
+        let read = |output| {
+            (
+                check_includable_oracle(state, hash, output, &case.block, CHAIN_ID, SpecId::OSAKA),
+                check_includable(state, hash, output, &case.block, CHAIN_ID, SpecId::OSAKA),
+            )
+        };
+        [read(None), read(Some((&parent, grandparent)))]
+    }
+
+    /// Every flaw, one at a time: the new check refuses the block for the
+    /// same transaction and in the same words as the implementation it
+    /// replaced, on both the provider and the parent's output.
+    #[test]
+    fn one_flaw_reports_the_same_error_as_the_oracle() {
+        let flaws = [
+            Flaw::NonceGap,
+            Flaw::DuplicateNonce,
+            Flaw::ShortBalance,
+            Flaw::AbsentSender,
+            Flaw::OnlyInParentOutput,
+            Flaw::ForeignChainId,
+            Flaw::UnderIntrinsicGas,
+            Flaw::FeeCapUnderBase,
+            Flaw::PriorityOverCap,
+        ];
+        let state = provider(&[]);
+        let mut refused = 0;
+        for flaw in flaws {
+            for seed in 1..60u64 {
+                let case = random_case(seed * 7919, &[flaw]);
+                let read = verdicts(&state, &case);
+                for (old, new) in &read {
+                    assert_eq!(old, new, "{flaw:?}, seed {seed}");
+                }
+                refused += usize::from(read[0].0.is_err());
+            }
+        }
+        // `OnlyInParentOutput` is no flaw at all on the parent's output, so
+        // not every case is refused -- but most are.
+        assert!(refused > 400, "{refused} of 531 cases refused");
+    }
+
+    /// A clean block is accepted by both, whatever its shape.
+    #[test]
+    fn a_clean_block_is_accepted() {
+        let state = provider(&[]);
+        for seed in 1..200u64 {
+            let case = random_case(seed * 104_729, &[]);
+            for (old, new) in verdicts(&state, &case) {
+                assert_eq!(old, Ok(()), "seed {seed}");
+                assert_eq!(new, Ok(()), "seed {seed}");
+            }
+        }
+    }
+
+    /// Blocks wrong in several ways at once: both implementations refuse the
+    /// same blocks. Which of the failures is named can differ -- the
+    /// implementation this replaced picked the sender group its hash map
+    /// happened to iterate first, and the new one names the earliest failing
+    /// transaction in block order -- so only the verdict is compared.
+    #[test]
+    fn many_flaws_give_the_same_verdict_as_the_oracle() {
+        let all = [
+            Flaw::NonceGap,
+            Flaw::DuplicateNonce,
+            Flaw::ShortBalance,
+            Flaw::AbsentSender,
+            Flaw::OnlyInParentOutput,
+            Flaw::ForeignChainId,
+            Flaw::UnderIntrinsicGas,
+            Flaw::FeeCapUnderBase,
+            Flaw::PriorityOverCap,
+        ];
+        let state = provider(&[]);
+        for seed in 1..400u64 {
+            let mut rng = Rng(seed * 2_654_435_761);
+            let flaws: Vec<Flaw> = (0..2 + rng.below(3)).map(|_| all[rng.below(all.len() as u64) as usize]).collect();
+            let case = random_case(seed * 15_485_863, &flaws);
+            for (old, new) in verdicts(&state, &case) {
+                assert_eq!(old.is_ok(), new.is_ok(), "seed {seed}, {flaws:?}: {old:?} against {new:?}");
+                if let Err(new) = new {
+                    // Whatever it names, it names a transaction of this
+                    // block or one of its senders.
+                    assert!(new.starts_with("transaction ") || new.starts_with("0x"), "{new}");
+                }
+            }
+        }
+    }
+
+    /// An empty block is includable, and neither implementation opens a
+    /// state provider for it.
+    #[test]
+    fn an_empty_block_is_includable() {
+        let block = seal(Vec::new(), Vec::new(), addr(1));
+        let empty = provider(&[]);
+        let hash = B256::random();
+        assert_eq!(check_includable_oracle(&empty, hash, None, &block, CHAIN_ID, SpecId::OSAKA), Ok(()));
+        assert_eq!(check_includable(&empty, hash, None, &block, CHAIN_ID, SpecId::OSAKA), Ok(()));
+    }
+
+    /// The gas limits' sum against the header's, which outranks every
+    /// per-sender failure and is reported in the same words.
+    #[test]
+    fn the_gas_limits_sum_is_checked_before_the_senders() {
+        let mut case = random_case(31, &[Flaw::NonceGap]);
+        let mut block = case.block.clone_block();
+        block.header.gas_limit = 1;
+        case.block = RecoveredBlock::new_sealed(SealedBlock::new_unhashed(block), case.block.senders().to_vec());
+        for (old, new) in verdicts(&provider(&[]), &case) {
+            assert!(old.as_ref().is_err_and(|err| err.starts_with("gas limits sum to")), "{old:?}");
+            assert_eq!(old, new);
+        }
+    }
+
+    /// A sender whose share is split across the scan's chunks: the nonces
+    /// have to chain across the joins, and a break at a join is reported at
+    /// the transaction the join starts with.
+    #[test]
+    fn a_share_split_across_chunks_chains_its_nonces() {
+        // One sender, enough transactions that the scan's 32 chunks each
+        // hold several of them.
+        let (block, accounts) = bench_fixture(1, 2_000, 64, 1);
+        let state = provider(&accounts);
+        let hash = B256::random();
+        assert_eq!(check_includable(&state, hash, None, &block, CHAIN_ID, SpecId::OSAKA), Ok(()));
+        // The account one nonce ahead: the very first transaction is stale.
+        let ahead = provider(&[(accounts[0].0, Account { nonce: 1, ..accounts[0].1 })]);
+        let refused = check_includable(&ahead, hash, None, &block, CHAIN_ID, SpecId::OSAKA).expect_err("stale");
+        assert_eq!(refused, check_includable_oracle(&ahead, hash, None, &block, CHAIN_ID, SpecId::OSAKA).expect_err("stale"));
+        assert!(refused.starts_with("transaction 0: nonce 0,"), "{refused}");
     }
 }

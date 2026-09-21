@@ -136,6 +136,48 @@ pub fn overlay_on_executed(historical: StateProviderBox, executed: ExecutedParen
     Box::new(MemoryOverlayStateProvider::<N42Primitives>::new(historical, vec![executed]))
 }
 
+/// How long [`opener_on_built_parent`] waits for the grandparent to reach the
+/// engine before giving up on the build.
+///
+/// The build chain (`N42_BUILD_CHAIN`) starts a build at its parent's early
+/// seal, which on a leader with a tenure is *before* the engine has finished
+/// importing the grandparent -- the block this node proposed one view ago.
+/// Measured on loop193 W1b: 56 of 347 refused chained builds were exactly
+/// this, and the block they named was added to the canonical chain a median
+/// of 18 ms later (p90 68, max 209). Refusing costs the whole build and the
+/// ~275 ms of lead it was for; waiting costs the wait. Bounded, because a
+/// grandparent that is not coming must end as a refusal and not as a builder
+/// thread that never returns.
+const GRANDPARENT_WAIT: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// How often the wait looks again.
+const GRANDPARENT_POLL: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// The state at `block`, waiting up to [`GRANDPARENT_WAIT`] for an import
+/// that is already in flight to land.
+///
+/// Only "this node does not hold that state" is waited on; every other error
+/// is the provider saying something is wrong, and waiting would only make the
+/// build slower before it failed anyway.
+fn state_at_soon<C>(client: &C, block: B256) -> ProviderResult<StateProviderBox>
+where
+    C: StateProviderFactory,
+{
+    let deadline = std::time::Instant::now() + GRANDPARENT_WAIT;
+    loop {
+        let err = match client.state_by_block_hash(block) {
+            Ok(state) => return Ok(state),
+            Err(err) => err,
+        };
+        if !matches!(err, reth_storage_api::errors::ProviderError::StateForHashNotFound(_))
+            || std::time::Instant::now() >= deadline
+        {
+            return Err(err);
+        }
+        std::thread::sleep(GRANDPARENT_POLL);
+    }
+}
+
 /// An opener for the parent's post-state: the chain's state at the
 /// grandparent with the parent's bundle laid over it.
 pub fn opener_on_built_parent<C>(client: C, grandparent: B256, executed: ExecutedBlock<N42Primitives>) -> ParentStateOpener
@@ -143,7 +185,7 @@ where
     C: StateProviderFactory + Send + Sync + 'static,
 {
     Arc::new(move || {
-        let historical = client.state_by_block_hash(grandparent)?;
+        let historical = state_at_soon(&client, grandparent)?;
         Ok(Box::new(MemoryOverlayStateProvider::<N42Primitives>::new(historical, vec![executed.clone()])) as StateProviderBox)
     })
 }

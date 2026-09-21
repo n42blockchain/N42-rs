@@ -868,10 +868,9 @@ where
     // import converted the payload: the prune below then
     // needs no keccak over the raw bytes.
     let mut mined_hashes: Option<Vec<B256>> = None;
-    // The executed block kept for the engine's own conversion when
-    // the answer goes out before that pass.
-    let mut remembered: Option<std::sync::Arc<reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>>> = None;
-    let fast_taken = direct_fast_answer();
+    // The sealed block being copied for the engine's own conversion, on a
+    // worker thread; awaited before the pass that reads it.
+    let mut remembering: Option<tokio::task::JoinHandle<()>> = None;
     if let Some(reuse) = reuse.filter(|r| !reused && r.import_foreign.is_some()) {
         let import = reuse.import_foreign.clone().expect("checked");
         let validator = reuse.validator.clone();
@@ -881,7 +880,6 @@ where
         // worker thread as before.
         let pre = pre_converted;
         let payload = pre.is_none().then(|| data.clone());
-        let fast = direct_fast_answer();
         let started = std::time::Instant::now();
         // Under deferred execution the import says when the
         // block is checked, and the validator hears it on a
@@ -907,19 +905,10 @@ where
             // `convert_ms` the direct-import line has always reported; the
             // vote road's line names the two apart.
             let converted = (road.dispatch_us + road.convert_us) / 1000;
-            // The engine's newPayload, next, converts the same
-            // payload: let it take this block instead.
-            // The engine's own conversion of the same payload takes
-            // this instead of decoding 163,000 transactions again.
-            // With the fast answer the clone moves off this path
-            // instead: the block is remembered from the executed
-            // block's `Arc` on a worker thread below, well before
-            // the engine's pass runs.
-            if !fast {
-                let remember_at = std::time::Instant::now();
-                n42_engine_types::built_executions::remember_sealed(sealed.hash(), sealed.clone());
-                road.remember_us = remember_at.elapsed().as_micros() as u64;
-            }
+            // The block the engine's own conversion takes instead of decoding
+            // 163,000 transactions again is filed below, from the executed
+            // block's `Arc` on a worker thread -- not here, where the clone
+            // was on the vote road itself.
             let (executed, phases) = import(sealed, Some(checked_tx), road)?;
             Ok::<_, String>((executed, phases, converted))
         });
@@ -962,6 +951,20 @@ where
         .and_then(|r| r);
         match handed {
             Ok((executed, phases, converted)) => {
+                // The block the engine's own pass takes instead of decoding
+                // the payload again, copied from the executed block on a
+                // worker thread and awaited just before that pass. It used to
+                // be cloned ahead of the import, on the vote road: 14 ms to
+                // copy a 163,000-transaction block and 3 more to free the one
+                // `remember_sealed` evicts, of a road whose whole median was
+                // 186-200 ms (`bench_vote_road_copies`, loop190). Nothing
+                // reads it before the pass below, which is an insert and the
+                // queue's bookkeeping away; the fast answer has taken the
+                // block from this same `Arc` since b14304a73.
+                let block = std::sync::Arc::clone(&executed.recovered_block);
+                remembering = Some(tokio::task::spawn_blocking(move || {
+                    n42_engine_types::built_executions::remember_sealed(block.hash(), block.sealed_block().clone());
+                }));
                 let handed_at = std::time::Instant::now();
                 // The block's transactions leave the queue now, not
                 // when the canonical pruner gets to them: a build
@@ -978,11 +981,6 @@ where
                 // by those walks, and a build ahead that starts before
                 // the removal takes the mined transactions again
                 // (87,800 stale ones in one build, round 38).
-                // The block for the engine's own conversion, taken
-                // from the executed block before it is handed over.
-                if fast_taken {
-                    remembered = Some(std::sync::Arc::clone(&executed.recovered_block));
-                }
                 let queue_offloaded = queue_work_offload();
                 if let Some(queue) = n42_tx_queue::global::<n42_engine_types::N42PooledTransaction>() {
                     if queue_offloaded {
@@ -1110,17 +1108,12 @@ where
         // The engine's pass would otherwise decode the payload's
         // 163,000 transactions again (round 43, loop100: its pass
         // went 35 -> 102 ms without the remembered block). The
-        // clone is made here, off the answered path, and always
-        // finishes before the pass below reads it.
-        if let Some(block) = remembered.take() {
-            let hash = block.hash();
-            let cloned = tokio::task::spawn_blocking(move || {
-                n42_engine_types::built_executions::remember_sealed(hash, block.sealed_block().clone());
-            })
-            .await;
-            if let Err(err) = cloned {
-                warn!(target: "n42.payload_serve", number, %err, "remembering the sealed block failed; the engine will decode it again");
-            }
+        // clone started when the import returned, off the answered
+        // path; this is where it has to be finished.
+        if let Some(remembering) = remembering.take()
+            && let Err(err) = remembering.await
+        {
+            warn!(target: "n42.payload_serve", number, %err, "remembering the sealed block failed; the engine will decode it again");
         }
         let engine_at = std::time::Instant::now();
         match engine.new_payload(data).await {
@@ -1159,6 +1152,15 @@ where
             );
         }
         return Ok(());
+    }
+    // Without the fast answer the engine's pass is what the validator's
+    // payload answer waits for, and it is the only reader of the block the
+    // import started copying when it returned. Awaited here rather than
+    // before the import, which is where it was on the vote road.
+    if let Some(remembering) = remembering.take()
+        && let Err(err) = remembering.await
+    {
+        warn!(target: "n42.payload_serve", number, %err, "remembering the sealed block failed; the engine will decode it again");
     }
     match engine.new_payload(data).await {
         Ok(status) => {
@@ -1744,8 +1746,9 @@ fn queue_work_offload() -> bool {
 /// the engine's own `newPayload` run behind the answer (`N42_DIRECT_FAST_ANSWER=1`,
 /// off by default). The block was validated here; the engine's pass is
 /// bookkeeping. Round 43: the engine's pass was 35 ms of a 533 ms import
-/// barrier, and remembering the sealed block for it cost a deep clone of the
-/// block's 163,000 transactions on the same path.
+/// barrier. The deep clone of the block's 163,000 transactions that
+/// remembering it cost is no longer part of this choice -- both answers copy
+/// it from the executed block after the import, off the vote road.
 fn direct_fast_answer() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("N42_DIRECT_FAST_ANSWER").is_ok_and(|v| v == "1"))

@@ -144,6 +144,12 @@ struct Args {
     /// sender's later nonces unbuildable for the whole tenure, and the fleet's
     /// other pools fill with them until the ingest gate stops the generator.
     ingest_all: bool,
+    /// Seconds a worker waits for one node's answer to a frame before it
+    /// gives up on the connection and opens it again (`--ingest-timeout`,
+    /// 10; 0 waits for ever, as this did before). The node holds a frame at
+    /// its gate rather than refusing it, so a slow answer is expected and a
+    /// missing one means the node stopped draining its queue.
+    ingest_timeout: u64,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -258,7 +264,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         vec![args.ingest[worker % args.ingest.len()].as_str()]
                     };
-                    match Ingest::connect(&addrs) {
+                    // 0 keeps the old blocking read; anything else gives a
+                    // worker a way out of a node that has stopped answering.
+                    let read_timeout = match args.ingest_timeout {
+                        0 => Duration::from_secs(u64::from(u32::MAX)),
+                        secs => Duration::from_secs(secs),
+                    };
+                    match Ingest::connect(&addrs, read_timeout) {
                         Ok(conn) => Some(conn),
                         Err(err) => {
                             eprintln!("ingest {}: {err}", addrs.join(","));
@@ -429,6 +441,10 @@ fn flood_over_ingest(
     // could not keep up from a chain that was full the whole time.
     let mut deepest = 0usize;
     let mut batch: Vec<Vec<u8>> = Vec::with_capacity(args.rpc_batch);
+    // Connections this worker gave up on and opened again, and when it last
+    // said so.
+    let mut timeouts = 0u32;
+    let mut last_warn = Instant::now();
     loop {
         let mut wrote = false;
         for (index, key) in part.iter().enumerate() {
@@ -495,9 +511,30 @@ fn flood_over_ingest(
                 }
             }
             Ok(None) => {}
+            // A node that has not answered within the timeout is not going
+            // to: its gate is shut and only the chain reopens it. Say so
+            // once, drop the frames in flight and carry on rather than
+            // taking the whole round down with it (loop190Y1a).
+            Err(err) if is_read_timeout(&err) => {
+                timeouts += 1;
+                if timeouts == 1 || last_warn.elapsed() >= Duration::from_secs(30) {
+                    last_warn = Instant::now();
+                    eprintln!("ingest       : no answer from {err}; reconnecting (timeout {timeouts})");
+                }
+                inflight.fill(false);
+                if conn.reconnect().is_err() {
+                    return;
+                }
+            }
             Err(_) => return,
         }
     }
+}
+
+/// Whether a read failed because nothing arrived in time; `SO_RCVTIMEO`
+/// reports that as `WouldBlock` on Unix and `TimedOut` elsewhere.
+fn is_read_timeout(err: &std::io::Error) -> bool {
+    matches!(err.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
 }
 
 /// One connection to a node's binary transaction ingest.
@@ -517,10 +554,24 @@ struct Ingest {
     /// One node's ingest, or every node's at once (`--ingest-all`): a frame
     /// goes to each stream, and a reply is read from each in the same order.
     streams: Vec<std::net::TcpStream>,
+    /// The addresses the streams were opened on, so a connection that has
+    /// stopped answering can be opened again.
+    addrs: Vec<String>,
     /// Senders with a frame in flight, in the order the frames were written.
     /// Replies come back in the same order, so this is what matches an answer
     /// to the sender it belongs to.
     inflight: std::collections::VecDeque<(usize, usize, Instant)>,
+    /// How long a worker waits for one node's answer before it gives up on
+    /// the connection (`--ingest-timeout`).
+    ///
+    /// The node's gate holds a frame rather than refusing it, so a slow
+    /// answer is normal and a missing one is not: in leg loop190Y1a one
+    /// node's gate shut for good and every worker blocked here, without a
+    /// timeout, for the last 35 seconds of the round -- the round's own
+    /// `reply ms/node` went empty and nothing said why. A harness that hangs
+    /// silently costs the whole leg, so it gives up, says so once and opens
+    /// the connection again.
+    read_timeout: Duration,
 }
 
 /// Per stream (node), the answers' latency summed since the start and their
@@ -529,16 +580,38 @@ static REPLY_NS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 static REPLY_N: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 impl Ingest {
-    fn connect(addrs: &[&str]) -> std::io::Result<Self> {
+    fn connect(addrs: &[&str], read_timeout: Duration) -> std::io::Result<Self> {
+        let owned: Vec<String> = addrs.iter().map(|a| (*a).to_owned()).collect();
+        let streams = Self::open(&owned, read_timeout)?;
+        Ok(Self { streams, addrs: owned, inflight: std::collections::VecDeque::new(), read_timeout })
+    }
+
+    fn open(addrs: &[String], read_timeout: Duration) -> std::io::Result<Vec<std::net::TcpStream>> {
         let mut streams = Vec::with_capacity(addrs.len());
         for addr in addrs {
-            let stream = std::net::TcpStream::connect(addr)?;
+            let stream = std::net::TcpStream::connect(addr.as_str())?;
             // Without this the kernel holds a frame back waiting for company,
             // and the pipelining above turns back into a round trip per batch.
             stream.set_nodelay(true)?;
+            stream.set_read_timeout(Some(read_timeout))?;
             streams.push(stream);
         }
-        Ok(Self { streams, inflight: std::collections::VecDeque::new() })
+        Ok(streams)
+    }
+
+    /// Opens every connection again and forgets what was in flight on the
+    /// old ones.
+    ///
+    /// A timeout can also leave a stream half-read (the answer is eight
+    /// bytes and `read_exact` may have taken some of them), so the stream is
+    /// replaced rather than reused. Nothing is lost by dropping the frames
+    /// in flight: a sender's nonce only advances on an answer, so those
+    /// transactions are simply sent again, and a node that did admit them
+    /// the first time drops the duplicates by (sender, nonce).
+    fn reconnect(&mut self) -> std::io::Result<()> {
+        self.streams = Self::open(&self.addrs, self.read_timeout)?;
+        self.inflight.clear();
+        Ok(())
     }
 
     /// Writes one frame: `u32` count, then each transaction as `u32` length and
@@ -580,7 +653,13 @@ impl Ingest {
         let mut pending = 0usize;
         for (node, stream) in self.streams.iter_mut().enumerate() {
             let mut buf = [0u8; 8];
-            stream.read_exact(&mut buf)?;
+            // Which node did not answer is the whole point of the message:
+            // the gate is per node and only one of them has to be stuck.
+            if let Err(err) = stream.read_exact(&mut buf) {
+                let kind = err.kind();
+                let addr = self.addrs.get(node).map_or("?", String::as_str);
+                return Err(std::io::Error::new(kind, format!("{addr}: {err}")));
+            }
             accepted = accepted.min(u32::from_le_bytes(buf[0..4].try_into().expect("4 bytes")) as usize);
             pending = pending.max(u32::from_le_bytes(buf[4..8].try_into().expect("4 bytes")) as usize);
             if node < REPLY_NS.len() {
@@ -863,6 +942,7 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
         skip_funding: false,
         ingest: Vec::new(),
         ingest_all: false,
+        ingest_timeout: 10,
         recipients: 1,
     };
     let mut it = std::env::args().skip(1);
@@ -883,6 +963,7 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
             "--window" => args.window = next()?.parse::<usize>()?.clamp(1, 4096),
             "--ingest" => args.ingest = next()?.split(',').map(str::to_owned).collect(),
             "--ingest-all" => args.ingest_all = true,
+            "--ingest-timeout" => args.ingest_timeout = next()?.parse()?,
             "--recipients" => args.recipients = next()?.parse()?,
             "--shard-senders" => args.shard_senders = true,
             "--legacy-recipients" => args.legacy_recipients = true,
@@ -921,6 +1002,8 @@ tx_flood — fund a derived sender set and flood the fleet with transfers
   --legacy-recipients     ingest path: recipients by the worker-local sender index (the
                           pre-round-43 shape, ~13,000 accounts a full block), for comparison
   --alg <secp256k1|ed25519>  signature scheme of the senders (default secp256k1; ed25519 sends 0x50 transactions)
+  --ingest-timeout <s>    seconds to wait for a node's answer to a frame before giving
+                          up on the connection and opening it again (default 10, 0 never)
   --skip-funding      the senders are already funded
 ";
 

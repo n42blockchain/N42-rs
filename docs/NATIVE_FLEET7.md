@@ -7379,3 +7379,52 @@ copy per transaction. Eight tokio workers instead of thirty-two read
 the node's tokio threads went 84 -> 47) and +1% on the later windows:
 adopted for the fleet's environment. Sixteen rayon threads read +3% on
 window 1, inside the band; left at the default.
+
+## loop190Y1a (2026-09-21): one node's ingest gate took the whole round
+
+Window 3 of loop190Y1a read 0 TPS over 48 blocks, every one of them
+empty, and the flood's `sent` froze at 45,845,500 of 60,000,000 with
+`reply ms/node []` -- no answer from any node -- for the last 35
+seconds. No WARN or ERROR on any of the seven nodes.
+
+The sequence, from the logs:
+
+- node5 led views 380-383 and its execution layer stopped at block 382
+  (`node5-el.log` ends at 02:29:02.496 with `canonical blocks pruned
+  from the queue mined=163000 queued=411428`; `Status ... latest_block=382`
+  at 02:30:07). Its validator kept running to view 542, receiving
+  bodies and committing -- but `n42.h2.node: import starting` never
+  appears again on node5, where every healthy follower logs it for
+  every block. The six other nodes reached block 540, node5 stopped at
+  382.
+- The ingest gate for the leg was 407,500 (`tier sizing` line) and
+  node5's queue stood at 411,428 with nothing left to prune it. The gate
+  reopens on one event only -- a canonical block taking transactions out
+  of *this node's* queue -- so it was shut for good.
+- The flood ran `--ingest-all`: every worker writes each frame to all
+  seven nodes and reads all seven answers in order
+  (`Ingest::recv`). One node that never answers blocks the worker, and
+  all 64 blocked. That is the empty `reply ms/node`.
+- With the flood stopped, the other six drained what they held into
+  blocks 385 (163,000) and 386 (117,500) and then built empty blocks.
+  Empty blocks prune nothing, so even a node5 that recovered could not
+  have reopened its gate: the only source of work for the chain was the
+  generator the gate was holding. A closed loop.
+
+The gate is backpressure, not a rule, so it now has a deadline:
+`N42_TX_INGEST_GATE_MAX_WAIT_MS` (15,000 by default, 0 for the old
+behaviour) lets a frame through after that long and says so, and a
+frame held more than 2 s draws one WARN with the depth and the limit.
+The stats line carries `gate_forced`; non-zero means a node stopped
+draining its queue and the round is not comparable. On the harness
+side `tx_flood --ingest-timeout <s>` (10 by default) gives the read an
+`SO_RCVTIMEO`, after which the worker names the node, reopens its
+connections and carries on -- a harness that hangs silently costs the
+whole leg.
+
+What is *not* fixed is why node5's import stopped. The block after its
+last own block never reaches `driver.handle_output`: the candidates in
+`crates/n42/h2-node/src/service.rs` are the `far_ahead` hold ("block
+runs ahead of the execution layer; held until the pull reaches it",
+debug only, so invisible at the fleet's level) and `imported_tip`
+being stale for a leader that imported its own blocks by header.

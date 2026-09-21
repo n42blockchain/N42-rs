@@ -83,6 +83,19 @@ pub mod reply {
     /// before the fork, or one this execution layer does not check ahead,
     /// gets no such frame.
     pub const CHECKED: u8 = 3;
+    /// [`super::request::BUILD_ON_OWN`] only, and only when the request
+    /// carried a chain hint (see [`super::ChainHint`]): the block was sealed
+    /// early by the builder and its *built* header follows (`u32` length and
+    /// the header's RLP), before the block itself. The caller stamps and
+    /// seals that header for the view it will propose it under and can send
+    /// the next build's request at once -- the chain -- instead of waiting
+    /// for the ~26 MB block to be encoded, to travel, and for the proposal
+    /// to go out (measured at loop190/191 as 68-84 ms of a 360 ms cycle with
+    /// the builder idle, plus 33-42 ms of request overhead after it).
+    ///
+    /// A request without a hint gets no such frame, which is what makes the
+    /// whole path opt-in and an old caller's traffic unchanged.
+    pub const CHAIN_HEADER: u8 = 4;
 }
 
 struct Writer(Vec<u8>);
@@ -335,9 +348,53 @@ pub fn decode_foreign_body(buf: &[u8]) -> Result<(B256, N42HeaderProfile, &[u8])
     Ok((block_hash, profile, body))
 }
 
+/// What a caller adds to a build-on-own request when the height after the
+/// one being built is its own as well.
+///
+/// The hint is what licenses the execution layer to answer with a
+/// [`reply::CHAIN_HEADER`] frame; without one it behaves exactly as before.
+/// It is never a guess on the execution layer's side: the caller knows the
+/// leader schedule, the execution layer does not, so the chain only ever
+/// runs where consensus said it may.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChainHint {
+    /// The view the block being built now will be proposed under, which is
+    /// what its header's extra data is stamped with. The caller needs it
+    /// back with the early-sealed header to produce the very header it will
+    /// propose; carrying it here means the execution layer never has to
+    /// know what a view is.
+    pub view: u64,
+    /// Whether this request is itself one the chain issued rather than one
+    /// the proposal path made. Carried only so the execution layer's build
+    /// line says `chained=true` beside the phase numbers; nothing on the
+    /// execution side behaves differently for it.
+    pub chained: bool,
+}
+
+/// The tag of the chain hint in a request's optional tail. A tail whose tag
+/// is not known is skipped rather than refused: the tail is additive, and a
+/// peer that learns a new one must not break an older one.
+const TAIL_CHAIN_HINT: u8 = 1;
+
 /// Encodes a build-on-own request: the sealed header of the block just built
 /// (RLP) and the attributes of the block to build on it.
 pub fn encode_build_on_own(header: &alloy_consensus::Header, attrs: &PayloadAttributes) -> Vec<u8> {
+    encode_build_on_own_chaining(header, attrs, None)
+}
+
+/// [`encode_build_on_own`] with a chain hint appended.
+///
+/// The hint goes in a tail *after* every field the first version of this
+/// frame had, and the decoder stops at the end of the buffer, so the two
+/// directions of a mixed fleet both fail safe: an execution layer that
+/// predates the tail reads the fields it knows and ignores the rest (no
+/// chaining), and one that knows the tail reads no hint out of a frame that
+/// has none (no chaining). Nothing chains unless both ends agree.
+pub fn encode_build_on_own_chaining(
+    header: &alloy_consensus::Header,
+    attrs: &PayloadAttributes,
+    chain: Option<ChainHint>,
+) -> Vec<u8> {
     let rlp = alloy_rlp::encode(header);
     let mut w = Writer(Vec::with_capacity(rlp.len() + 128 + attrs.withdrawals.as_ref().map_or(0, |w| w.len() * 44)));
     w.u8(VERSION);
@@ -367,11 +424,19 @@ pub fn encode_build_on_own(header: &alloy_consensus::Header, attrs: &PayloadAttr
         Some(limit) => { w.u8(1); w.u64(limit); }
         None => w.u8(0),
     }
+    if let Some(hint) = chain {
+        w.u8(TAIL_CHAIN_HINT);
+        w.u64(hint.view);
+        w.u8(u8::from(hint.chained));
+    }
     w.0
 }
 
-/// Decodes what [`encode_build_on_own`] produced.
-pub fn decode_build_on_own(buf: &[u8]) -> Result<(alloy_consensus::Header, PayloadAttributes), String> {
+/// Decodes what [`encode_build_on_own`] produced, with the chain hint when
+/// the frame carries one.
+pub fn decode_build_on_own(
+    buf: &[u8],
+) -> Result<(alloy_consensus::Header, PayloadAttributes, Option<ChainHint>), String> {
     use alloy_rlp::Decodable;
     let mut r = Reader { rest: buf, shared: None };
     if r.u8()? != VERSION { return Err("unknown raw engine version".into()); }
@@ -393,7 +458,20 @@ pub fn decode_build_on_own(buf: &[u8]) -> Result<(alloy_consensus::Header, Paylo
     let parent_beacon_block_root = if r.u8()? == 1 { Some(r.b256()?) } else { None };
     let slot_number = if r.u8()? == 1 { Some(r.u64()?) } else { None };
     let target_gas_limit = if r.u8()? == 1 { Some(r.u64()?) } else { None };
-    Ok((header, PayloadAttributes { timestamp, prev_randao, suggested_fee_recipient, withdrawals, parent_beacon_block_root, slot_number, target_gas_limit }))
+    // The tail. Empty in every frame written before it existed, so its
+    // absence is "no hint" rather than a truncated frame.
+    let mut chain = None;
+    while !r.rest.is_empty() {
+        match r.u8()? {
+            TAIL_CHAIN_HINT => chain = Some(ChainHint { view: r.u64()?, chained: r.u8()? == 1 }),
+            // A tag from a newer peer. Its length is not known here, so
+            // there is nothing to skip to: stop reading and keep what was
+            // understood. Fields are only ever appended, so everything
+            // before this point is still exactly right.
+            _ => break,
+        }
+    }
+    Ok((header, PayloadAttributes { timestamp, prev_randao, suggested_fee_recipient, withdrawals, parent_beacon_block_root, slot_number, target_gas_limit }, chain))
 }
 
 /// Encodes a [`PayloadStatus`] for the channel.
@@ -477,9 +555,25 @@ mod tests {
         };
         let bare = PayloadAttributes { withdrawals: None, parent_beacon_block_root: None, slot_number: None, target_gas_limit: None, ..full.clone() };
         for attrs in [full, bare] {
-            let (h, a) = decode_build_on_own(&encode_build_on_own(&header, &attrs)).expect("decodes");
+            let (h, a, chain) = decode_build_on_own(&encode_build_on_own(&header, &attrs)).expect("decodes");
             assert_eq!(h, header);
             assert_eq!(a, attrs);
+            assert_eq!(chain, None, "a frame without a tail hints nothing");
+            let hinted = encode_build_on_own_chaining(&header, &attrs, Some(ChainHint { view: 4242, chained: true }));
+            let (h, a, chain) = decode_build_on_own(&hinted).expect("decodes");
+            assert_eq!(h, header);
+            assert_eq!(a, attrs);
+            assert_eq!(chain, Some(ChainHint { view: 4242, chained: true }));
+            // The hint is a tail: everything before it is the frame an
+            // execution layer that predates it reads, byte for byte.
+            let plain = encode_build_on_own(&header, &attrs);
+            assert_eq!(&hinted[..plain.len()], &plain[..], "the hint only appends");
+            // And a tag this build does not know leaves the fields intact.
+            let mut unknown = plain.clone();
+            unknown.push(0xfe);
+            unknown.extend_from_slice(&7u64.to_le_bytes());
+            let (h, a, chain) = decode_build_on_own(&unknown).expect("decodes");
+            assert_eq!((h, a, chain), (header.clone(), attrs.clone(), None));
         }
     }
     #[test]

@@ -26,7 +26,7 @@ use alloy_consensus::{proofs::calculate_transaction_root, Block, Header, TxEnvel
 use alloy_eips::eip2718::{Decodable2718, Encodable2718};
 use alloy_eips::eip4895::{Withdrawal, Withdrawals};
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
-use alloy_rlp::{Decodable, Encodable, Header as RlpHeader, RlpDecodable, RlpEncodable};
+use alloy_rlp::{Decodable, Encodable, Header as RlpHeader};
 use n42_h2_consensus::{rewards_to_withdrawals, withdrawals_to_rewards};
 use alloy_rpc_types_engine::ExecutionData;
 use libp2p::gossipsub::IdentTopic;
@@ -98,6 +98,18 @@ pub enum BlockGossipError {
     RewardsRootMismatch,
 }
 
+impl From<n42_h2_consensus::BlockBodyError> for BlockGossipError {
+    fn from(error: n42_h2_consensus::BlockBodyError) -> Self {
+        use n42_h2_consensus::BlockBodyError as E;
+        match error {
+            E::InvalidRlp | E::NotTheAnnouncedBlock(_) => Self::InvalidRlp,
+            E::HeaderProfile(profile, reason) => Self::HeaderProfile(profile, reason),
+            E::InvalidRewards(reason) => Self::InvalidRewards(reason),
+            E::RewardsRootMismatch => Self::RewardsRootMismatch,
+        }
+    }
+}
+
 /// The view a gov5 H2 header was proposed in.
 pub fn gov5_header_view(header: &Header) -> Result<u64, BlockGossipError> {
     n42_h2_consensus::header_view(header)
@@ -106,23 +118,7 @@ pub fn gov5_header_view(header: &Header) -> Result<u64, BlockGossipError> {
 
 /// Checks a header against a profile.
 pub fn validate_header(header: &Header, profile: HeaderProfile) -> Result<(), BlockGossipError> {
-    let violation = |reason: &str| {
-        Err(BlockGossipError::HeaderProfile(profile, reason.to_owned()))
-    };
-    match profile {
-        HeaderProfile::Ethereum => {
-            if header.ommers_hash != alloy_consensus::EMPTY_OMMER_ROOT_HASH {
-                return violation("ommers hash is not the empty-list hash");
-            }
-            if header.extra_data.len() > MAX_GOV5_HEADER_EXTRA_BYTES {
-                return violation("extra data exceeds 4096 bytes");
-            }
-            Ok(())
-        }
-        HeaderProfile::Gov5H2 => n42_h2_consensus::validate_gov5_h2_header(header)
-            .map(|_| ())
-            .map_err(|e| BlockGossipError::HeaderProfile(profile, e.to_string())),
-    }
+    Ok(n42_h2_consensus::validate_body_header(header, profile)?)
 }
 
 /// Encodes a locally built payload as gov5's block gossip form, compressed the
@@ -181,12 +177,9 @@ pub fn encode_block_rlp(
 }
 
 /// One reward on the wire: gov5's `Reward{Address, Amount}` under
-/// reflective RLP, `[address, amount]`.
-#[derive(RlpEncodable, RlpDecodable)]
-struct RewardRlp {
-    address: Address,
-    amount: U256,
-}
+/// reflective RLP, `[address, amount]`. Defined beside the decoder the
+/// execution layer shares, so both ends of the wire read one definition.
+use n42_h2_consensus::block_body::RewardRlp;
 
 /// The uncompressed wire form for a header, its transactions and its
 /// rewards as they stand — what a node that already holds the block serves.
@@ -334,18 +327,7 @@ pub fn decode_block_rlp(
 
 /// The rewards list: `[[address, amount], ...]`.
 fn decode_rewards(encoded: &[u8]) -> Result<Vec<(Address, U256)>, BlockGossipError> {
-    let mut cursor = encoded;
-    let list = RlpHeader::decode(&mut cursor).map_err(|_| BlockGossipError::InvalidRlp)?;
-    if !list.list || list.payload_length != cursor.len() {
-        return Err(BlockGossipError::InvalidRlp);
-    }
-    let mut rewards = Vec::new();
-    while !cursor.is_empty() {
-        let reward = RewardRlp::decode(&mut cursor)
-            .map_err(|error| BlockGossipError::InvalidRewards(error.to_string()))?;
-        rewards.push((reward.address, reward.amount));
-    }
-    Ok(rewards)
+    Ok(n42_h2_consensus::block_body::decode_rewards(encoded)?)
 }
 
 impl GossipBlock {
@@ -373,39 +355,10 @@ impl GossipBlock {
 
 /// [`GossipBlock`] with the transactions left as the bytes they arrived as.
 ///
-/// What a follower needs: the header to remember and vote on, the bytes to
-/// hand to its execution layer. Decoding 163,000 transactions into envelopes
-/// and encoding them back was ~200 ms on the follower's critical path, and
-/// the transactions-root check that decoding enabled is one the execution
-/// layer repeats before it accepts the block.
-#[derive(Debug, Clone)]
-pub struct RawGossipBlock {
-    /// Keccak of the header RLP, which is the hash the proposal named.
-    pub block_hash: B256,
-    /// The header, exactly as the producer sealed it.
-    pub header: Header,
-    /// Each transaction's EIP-2718 bytes, in block order.
-    pub transactions: Vec<Bytes>,
-    /// gov5's rewards, as sent.
-    pub rewards: Vec<(Address, U256)>,
-    /// The rewards as the withdrawals this node's execution layer credits.
-    pub withdrawals: Vec<Withdrawal>,
-    /// The EIP-7928 block access list, when the producer sent one.
-    pub bal: Option<Bytes>,
-}
-
-impl RawGossipBlock {
-    /// The Engine API form of this block, straight from the bytes.
-    pub fn execution_data(&self) -> ExecutionData {
-        n42_h2_consensus::execution_data_from_raw_parts(
-            self.block_hash,
-            &self.header,
-            self.transactions.clone(),
-            self.withdrawals.clone(),
-            self.bal.clone(),
-        )
-    }
-}
+/// The decode itself lives in `n42-h2-consensus`, because the execution
+/// layer reads the same bytes on the `FOREIGN_BODY` path and cannot link
+/// libp2p to do it.
+pub use n42_h2_consensus::block_body::RawBlockBody as RawGossipBlock;
 
 /// [`decode_block_rlp`] without decoding the transactions. See
 /// [`RawGossipBlock`].
@@ -413,7 +366,7 @@ pub fn decode_block_rlp_raw(
     encoded: &[u8],
     profile: HeaderProfile,
 ) -> Result<RawGossipBlock, BlockGossipError> {
-    decode_block_rlp_raw_with(encoded, None, profile)
+    Ok(n42_h2_consensus::decode_raw_block_body(encoded, None, profile)?)
 }
 
 /// [`decode_block_rlp_raw`] over a shared buffer: the transactions (and the
@@ -423,77 +376,7 @@ pub fn decode_block_rlp_shared(
     encoded: &Bytes,
     profile: HeaderProfile,
 ) -> Result<RawGossipBlock, BlockGossipError> {
-    decode_block_rlp_raw_with(encoded, Some(encoded), profile)
-}
-
-/// A slice of `whole` for `part`, which must lie inside it.
-fn shared_slice(whole: &Bytes, part: &[u8]) -> Bytes {
-    let start = part.as_ptr() as usize - whole.as_ptr() as usize;
-    whole.slice(start..start + part.len())
-}
-
-fn decode_block_rlp_raw_with(
-    encoded: &[u8],
-    shared: Option<&Bytes>,
-    profile: HeaderProfile,
-) -> Result<RawGossipBlock, BlockGossipError> {
-    let mut payload = encoded;
-    let outer = RlpHeader::decode(&mut payload).map_err(|_| BlockGossipError::InvalidRlp)?;
-    if !outer.list || outer.payload_length != payload.len() {
-        return Err(BlockGossipError::InvalidRlp);
-    }
-    let header_rlp = take_rlp_item(&mut payload).ok_or(BlockGossipError::InvalidRlp)?;
-    let mut header_cursor = header_rlp;
-    let header = Header::decode(&mut header_cursor).map_err(|_| BlockGossipError::InvalidRlp)?;
-    if !header_cursor.is_empty() {
-        return Err(BlockGossipError::InvalidRlp);
-    }
-    validate_header(&header, profile)?;
-
-    let transactions_rlp = take_rlp_item(&mut payload).ok_or(BlockGossipError::InvalidRlp)?;
-    let mut cursor = transactions_rlp;
-    let list = RlpHeader::decode(&mut cursor).map_err(|_| BlockGossipError::InvalidRlp)?;
-    if !list.list || list.payload_length != cursor.len() {
-        return Err(BlockGossipError::InvalidRlp);
-    }
-    let mut transactions = Vec::with_capacity(cursor.len() / 100);
-    while !cursor.is_empty() {
-        let bytes = take_rlp_bytes(&mut cursor).ok_or(BlockGossipError::InvalidRlp)?;
-        if bytes.is_empty() {
-            return Err(BlockGossipError::InvalidRlp);
-        }
-        transactions.push(match shared {
-            Some(whole) => shared_slice(whole, bytes),
-            None => Bytes::copy_from_slice(bytes),
-        });
-    }
-
-    take_rlp_list_item(&mut payload).ok_or(BlockGossipError::InvalidRlp)?;
-    let rewards_rlp = take_rlp_list_item(&mut payload).ok_or(BlockGossipError::InvalidRlp)?;
-    let rewards = decode_rewards(rewards_rlp)?;
-    let bal = if payload.is_empty() {
-        None
-    } else {
-        take_rlp_bytes(&mut payload)
-            .ok_or(BlockGossipError::InvalidRlp)
-            .map(|bytes| Some(match shared {
-                Some(whole) => shared_slice(whole, bytes),
-                None => Bytes::copy_from_slice(bytes),
-            }))?
-    };
-    if !payload.is_empty() {
-        return Err(BlockGossipError::InvalidRlp);
-    }
-    if profile == HeaderProfile::Gov5H2
-        && let Some(root) = header.withdrawals_root
-        && root != n42_h2_consensus::gov5_rewards_root(rewards.iter().copied())
-        && !(rewards.is_empty() && root == alloy_consensus::EMPTY_ROOT_HASH)
-    {
-        return Err(BlockGossipError::RewardsRootMismatch);
-    }
-    let withdrawals = rewards_to_withdrawals(&rewards)
-        .map_err(|error| BlockGossipError::InvalidRewards(error.to_string()))?;
-    Ok(RawGossipBlock { block_hash: keccak256(header_rlp), header, transactions, rewards, withdrawals, bal })
+    Ok(n42_h2_consensus::decode_raw_block_body(encoded, Some(encoded), profile)?)
 }
 
 /// Rebuilds the block a payload describes, under a profile.

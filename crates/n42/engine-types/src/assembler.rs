@@ -316,7 +316,11 @@ mod tests {
     /// the boundaries between them.
     #[test]
     fn parallel_ordered_trie_is_alloys_at_every_key_shape() {
-        for n in [0usize, 1, 2, 3, 127, 128, 129, 255, 256, 257, 2_047, 2_048, 2_049, 4_096, 4_097, 65_535, 65_536, 65_537, 70_000, 163_000] {
+        // 163,000 -- a full bench-tier block -- is rooted twice here and is
+        // most of this test's cost in a debug build; it is covered in the
+        // `#[ignore]` sweep beside this one, and 70,000 already exercises
+        // four-byte keys past the boundary.
+        for n in [0usize, 1, 2, 3, 127, 128, 129, 255, 256, 257, 2_047, 2_048, 2_049, 4_096, 4_097, 65_535, 65_536, 65_537, 70_000] {
             let items: Vec<Vec<u8>> = (0..n)
                 .map(|i| {
                     let len = 40 + (i * 7) % 90;
@@ -328,24 +332,49 @@ mod tests {
         }
     }
 
+    /// The items block 319's sweep is run over: a transfer's encoded length,
+    /// and a different byte pattern per size.
+    fn residue_items(n: usize) -> Vec<Vec<u8>> {
+        (0..n)
+            .map(|i| {
+                let len = 108 + (i * 7) % 12;
+                (0..len).map(|j| ((i * 31 + j * 17 + n) % 251) as u8).collect()
+            })
+            .collect()
+    }
+
+    fn assert_parallel_root_is_alloys(n: usize) {
+        let items = residue_items(n);
+        let want = alloy_trie::root::ordered_trie_root_with_encoder(&items, |item, buf| buf.extend_from_slice(item));
+        assert_eq!(parallel_ordered_trie_root(&items), want, "n = {n}");
+    }
+
     /// Block 319 of round direct1 (8,200 transfers) sealed a transactions root
     /// no follower could reproduce. Every size around it, at a transfer's
     /// encoded length.
+    ///
+    /// Every residue of the item count modulo 256 -- the size of a full
+    /// group -- is covered at three-byte keys, where a size costs
+    /// milliseconds. At four-byte keys only the boundary itself is swept
+    /// here: 300 sizes of 65,536 items, each rooted twice, is nine minutes
+    /// of a debug build, and the runner's pre-claim test stage pays it on
+    /// every branch. The exhaustive four-byte sweep is the `#[ignore]` test
+    /// below and is the one to run when this code is touched.
     #[test]
     fn parallel_ordered_trie_is_alloys_at_every_residue_mod_256() {
-        // Every residue of the item count modulo 256 -- the size of a full
-        // group -- at three-byte keys (past 2,048) and at four-byte keys
-        // (past 65,536), plus the sizes around block 319's 8,200.
-        let sizes = (2_048..2_048 + 300).chain(65_536 - 20..65_536 + 300).chain(8_150..8_250);
-        for n in sizes {
-            let items: Vec<Vec<u8>> = (0..n)
-                .map(|i| {
-                    let len = 108 + (i * 7) % 12;
-                    (0..len).map(|j| ((i * 31 + j * 17 + n) % 251) as u8).collect()
-                })
-                .collect();
-            let want = alloy_trie::root::ordered_trie_root_with_encoder(&items, |item, buf| buf.extend_from_slice(item));
-            assert_eq!(parallel_ordered_trie_root(&items), want, "n = {n}");
+        for n in (2_048..2_048 + 300).chain(8_150..8_250).chain(65_536 - 4..65_536 + 4) {
+            assert_parallel_root_is_alloys(n);
+        }
+    }
+
+    /// The same sweep at four-byte keys, exhaustively: every residue mod 256
+    /// from the boundary up. `cargo test -p n42-engine-types --release --
+    /// --ignored parallel_ordered_trie_is_alloys_at_four_byte_keys`.
+    #[test]
+    #[ignore = "slow: 320 roots of 65,000 items, each computed twice"]
+    fn parallel_ordered_trie_is_alloys_at_four_byte_keys() {
+        for n in 65_536 - 20..65_536 + 300 {
+            assert_parallel_root_is_alloys(n);
         }
     }
 
@@ -375,6 +404,8 @@ mod trie_bench {
     #[test]
     #[ignore]
     fn bench_parallel_trie_root() {
+        // Also the place a full block's root is checked against alloy's,
+        // since the default run no longer does it at this size.
         let items: Vec<Vec<u8>> = (0..163_000u32).map(|i| { let mut v = vec![0xb8u8; 110]; v[..4].copy_from_slice(&i.to_be_bytes()); v }).collect();
         for round in 0..3 {
             let at = std::time::Instant::now();

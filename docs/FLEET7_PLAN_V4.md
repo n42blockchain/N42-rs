@@ -264,6 +264,34 @@ flat throughout. loop186 G1a and loop177's two "stalled" legs read the same way 
 Fix in progress (branch `plan-v4/queue-giveback`): nothing at or below a sender's mined nonce re-enters the lanes,
 and a stale-nonce refusal removes the transaction for good.
 
+## 2g. Defect 10 fixed, and the configuration confirmed (loop188)
+
+The queue's fix (aefd9384d): every lane keeps the highest nonce the chain has mined for its sender, and every way
+into the lanes -- arrivals, both give-back arms, an own block's settlement, `mark_invalid` -- refuses at or below it;
+a stale-nonce refusal from the builder, which used to be dropped on the floor while the transaction was offered
+again forever, is final; a reverted block lowers the watermark. Six legs, full to the end, because the defect had
+fired in two of six: Q2 = `--prune.transaction-lookup.full`, Q3 = Q2 + `N42_ROCKSDB_NOSYNC=1`.
+
+| | window 1 | window 2 | window 3 | round (M tx) |
+| --- | --- | --- | --- | --- |
+| six legs, range | 406,575 - 434,437 | 325,519 - 385,745 | 307,088 - 331,420 | 31.26 - 33.63 |
+| mean | 426,055 | 355,452 | 318,886* | 32.82 |
+
+(*one window 3 was cut short by the end of its flood.) No window's cycle left 0.375-0.526 s; 361-366 early-sealed
+builds a leg (none in the tenures defect 10 took); reader lag 9-10; the execution layers 74-80 GB at their peak and
+the box 61-70 GB free; no invalid block. The give-back never offered a transaction in these six legs, so the fix was
+not exercised on the fleet -- at the rate the defect fired that is a one-in-eleven chance, and what holds it is the
+unit tests (the three that reproduce it fail with the filter stubbed out). Q3 is not distinguishable from Q2 over
+three legs each, so **the confirmed configuration is Q2**: pacing 275 ms, check on the parent's output, the follower's
+streamed graft, the tables off, the allocator settings, 12 ingest recovery threads, the sender-cache multiplier at 1,
+no transaction-hash index, and a flood whose fee cap outlasts the round.
+
+Where a cycle goes in it (Q2c, medians per window): the leader's build seals at 211-229 ms and is not what binds; a
+follower's import is convert 52-55, senders 29-31, **execution 141 -> 167**, root 32-33, engine insert 50-54, ~400 ms in
+all -- not shorter than window 1's cycle -- and R1 reads 259 -> 297 ms, which is that import's state-dependent chain
+(execution + root + insert, 226-252) plus the check. The child now arrives while its parent is still importing: the
+premise step 2 lacked at loop183's cycle. loop189 judges it again.
+
 ## 3. What not to do
 
 - Do not judge a cycle-shortening change at a pacing above the natural cycle; do not judge any change without R1.

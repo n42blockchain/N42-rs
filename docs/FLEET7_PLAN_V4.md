@@ -502,6 +502,39 @@ sender look-ups -- and the hash of the assembled block against the proposal's is
 fall back to the full body. This is `DIRECT_PUSH`'s channel, Rust-only and opt-in already; gov5's block topic is
 untouched. After it the build (period ~260-310 under the chain) binds again, and plan step 3 is next.
 
+## 2m. The compact body: the road is 50-75 ms shorter, and the way it was built costs more than that (loop195)
+
+`N42_COMPACT_BODY=1` (`plan-v4/compact-body`, merged 0063b60db..4a31eadd7): the execution layer returns a built block's
+transaction hashes with it, the leader pushes header + hashes (5.2 MB against 26 MB) to peers whose body channel greeted
+for it, the follower's execution layer assembles the block from its own queue without removing anything, recomputes
+the transactions root against the header's, takes the senders as given, and on a miss waits 20 ms and then asks for the
+whole body. gov5's topic and RPCs are untouched. On an idle pinned box the two roads cost the same (37 against 38 ms);
+the implementer said so, and said what the bench could not show.
+
+Window 1, full blocks; P0 = confirmed configuration, P1 = chain configuration (loop194 X2), P2 = P1 + compact body:
+
+| | P0 a / b | P1 a / b | P2 a / b |
+| --- | --- | --- | --- |
+| cycle | 411 / 364 | 371 / 375 | 456 / 477 |
+| B | 246 / 227 | 278 / 254 | **206 / 202** |
+| E | 59 / 53 | 12 / 12 | **115 / 181** |
+| win1 TPS | 379k / 433k | 391k / 402k | 201k / 321k |
+
+- **The mechanism holds: B is 50-75 ms shorter with only 72% of the blocks assembled.** No invalid block, verify agrees.
+- **As built it fails.** The by-hash index sits in the queue: the builder's pull went 22 -> 103 ms (`par_pull_ms`; build
+  313 -> 414 ms), which is E; the follower's assembly reads 102-105 ms against the bench's 22 (it contends with the
+  ingest inserting into the same structure); and 28% of the compact bodies were refused for about 8 missing
+  transactions each, every refusal costing the whole body. `plan-v4/compact-body-2`: the index out of the queue's lock
+  with the builder's pull back at 22 ms as the acceptance number, what the missing eight are, and a request for the
+  missing transactions alone.
+- **The chain configuration is not distinguishable from the baseline in this run** (P1 391k/402k, P0 379k/433k; cycle
+  371/375 against 411/364). loop194 read +3..6%. The baseline itself spans 364-411 ms within one run; the builder's own
+  phases were slower tonight than yesterday evening with the same code path (build 313 ms against 250-271; exec 81
+  against 72, fold 86 against 76). Until that spread is understood a difference under ~10% between configurations is
+  not a finding (CLAUDE.md's rule, relearned). The chain's effect that IS beyond noise: E 53-59 -> 12 ms, every leg.
+- A merged branch broke an integration test of the branch before it (`build_chain.rs`, a tuple grew); the runner's
+  test stage caught it before the claim. Agents now run the touched crates' full test targets.
+
 ## 3. What not to do
 
 - Do not judge a cycle-shortening change at a pacing above the natural cycle; do not judge any change without R1.

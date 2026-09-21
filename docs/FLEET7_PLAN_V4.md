@@ -388,8 +388,14 @@ Three changes, each judged on the confirmed configuration with the cycle dissect
   root and engine insert are done before the child's check ends). `plan-v4/vote-road-sum` names and measures it.
 - loop190 Y1a lost window 3, and not to the harness alone (`plan-v4/ingest-gate`, merged 331b7c11c..59f8f7cfb).
   **node5's execution layer stopped at block 382**, at the handover after its own tenure: its validator went on
-  receiving every body and every Decide, and never started another import (defect 12, open; the leg ran with
-  `N42_BODY_ONCE=1`, once in five such legs and never in seven without). Its queue froze at 411,428 against an ingest
+  receiving every body and every Decide, and never started another import. **Defect 12, fixed (644b60fea), latent on
+  both roads:** an own block's import reports on its own channel and never re-entered the driver, so a commit answered
+  SYNCING because it beat that import (5-8 a leg, with or without the flag) was parked in `pending_commits` and never
+  run again; the driver's head stayed one block back; harmless while the tenure goes on, since the next own commit
+  moves the head, and fatal on the LAST block of a tenure: the next leader's first block is then two above the tip,
+  `far_ahead` holds it (at debug level), and every block after it. The own import now replays a parked commit and
+  moves the tip itself, `far_ahead` lets through a block whose parent this node imported, and a held body says so
+  (info, and a WARN after 2 s). Its queue froze at 411,428 against an ingest
   gate of 407,500; nothing but a canonical block on that node lowers the queue, so the gate stayed shut; the flood sends
   every frame to all seven nodes and read the replies with no timeout, so all 64 workers blocked; the six healthy nodes
   drained into two last blocks and then built empty ones, which prune nothing. The gate had no liveness of its own:

@@ -58,7 +58,6 @@ struct Lane<T: PoolTransaction> {
     by_nonce: BTreeMap<u64, Arc<ValidPoolTransaction<T>>>,
     /// Whether the sender is in the arrival order right now.
     queued: bool,
-    id: SenderId,
     /// The highest nonce the chain is known to have mined for this sender,
     /// from a canonical block or a build's stale refusal. Nothing at or
     /// below it may re-enter the lane through a give-back: the chain has
@@ -115,7 +114,6 @@ struct Inner<T: PoolTransaction> {
     /// Senders with queued transactions, in the order their queued run began;
     /// a sender taken from the front goes to the back if it has more.
     arrivals: VecDeque<Address>,
-    next_sender_id: u64,
     len: usize,
     /// What the last build took, and the parent it built on.
     last_build: Option<(B256, Vec<Arc<ValidPoolTransaction<T>>>)>,
@@ -408,7 +406,6 @@ impl<T: PoolTransaction> TxQueue<T> {
             inner: Arc::new(Mutex::new(Inner {
                 lanes: AddressHashMap::default(),
                 arrivals: VecDeque::new(),
-                next_sender_id: 1,
                 len: 0,
                 last_build: None,
                 gaps: Vec::new(),
@@ -782,12 +779,10 @@ impl<T: PoolTransaction> Inner<T> {
     ) -> Option<&Arc<ValidPoolTransaction<T>>> {
         let sender = valid.sender();
         let nonce = valid.nonce();
-        let next_id = &mut self.next_sender_id;
-        let lane = self.lanes.entry(sender).or_insert_with(|| {
-            let id = SenderId::from(*next_id);
-            *next_id += 1;
-            Lane { by_nonce: BTreeMap::new(), queued: false, id, mined: None }
-        });
+        let lane = self
+            .lanes
+            .entry(sender)
+            .or_insert_with(|| Lane { by_nonce: BTreeMap::new(), queued: false, mined: None });
         if lane.by_nonce.contains_key(&nonce) || lane.is_stale(nonce) {
             return None;
         }
@@ -1241,13 +1236,11 @@ mod tests {
             let at = std::time::Instant::now();
             let mut best = queue.best_for_build(B256::repeat_byte(1));
             let mut taken = 0usize;
-            while taken < block {
-                match best.next() {
-                    Some(t) => {
-                        std::hint::black_box(&t);
-                        taken += 1;
-                    }
-                    None => break,
+            for t in best.by_ref() {
+                std::hint::black_box(&t);
+                taken += 1;
+                if taken == block {
+                    break;
                 }
             }
             let pull = at.elapsed();
@@ -1387,7 +1380,6 @@ mod tests {
         eprintln!("remove_mined_batch of 163,000 taken: {:?}", at.elapsed());
     }
 
-    #[test]
     /// What the ingest's gate measures (`n42-tx-ingest`: the gate reads
     /// `TxQueue::len()`) is what the *next build* can still use, and nothing
     /// else: a transaction a build has taken, and one held for an own block

@@ -241,7 +241,7 @@ where
 /// nothing recorded one for it: recovered here, the way the foreign-body
 /// road recovers every sender it does not find cached.
 fn sender_of(tx: &TransactionSigned) -> Result<alloy_primitives::Address, String> {
-    use reth_primitives_traits::{SignedTransaction, SignerRecoverable};
+    use reth_primitives_traits::SignerRecoverable;
     match tx {
         TransactionSigned::AltSig(alt) => {
             let cache = n42_tx_types::AltSigSenderCache::global();
@@ -251,7 +251,7 @@ fn sender_of(tx: &TransactionSigned) -> Result<alloy_primitives::Address, String
             let sender = n42_tx_types::verify_batch(&[alt])
                 .into_iter()
                 .next()
-                .unwrap_or_else(|| Err(n42_tx_types::AltSigError::UnknownAlgorithm(0)))
+                .unwrap_or(Err(n42_tx_types::AltSigError::UnknownAlgorithm(0)))
                 .map_err(|err| err.to_string())?;
             cache.insert(*alt.hash(), sender);
             Ok(sender)

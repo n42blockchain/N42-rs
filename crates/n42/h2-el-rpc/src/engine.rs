@@ -173,7 +173,7 @@ async fn read_hash_tail(
     let n = stream.read_u32_le().await? as usize;
     let mut raw = vec![0u8; n * 32];
     stream.read_exact(&mut raw).await?;
-    Ok(raw.chunks_exact(32).map(B256::from_slice).collect())
+    Ok(raw.as_chunks::<32>().0.iter().copied().map(B256::from).collect())
 }
 
 /// Reads one frame of a build-on-own answer.

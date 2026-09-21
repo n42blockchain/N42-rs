@@ -408,7 +408,7 @@ mod tests {
     #[test]
     fn a_compact_body_round_trips_and_names_the_same_block() {
         let txs = transactions();
-        let hashes: Vec<B256> = txs.iter().map(|tx| keccak256(tx)).collect();
+        let hashes: Vec<B256> = txs.iter().map(keccak256).collect();
         let body = encode_block_rlp_raw(&header(), &txs, &[], None);
         let compact = encode_compact_body(&body, &hashes, N42HeaderProfile::Ethereum).expect("encodes");
         assert!(is_compact_body(&compact));
@@ -433,7 +433,7 @@ mod tests {
     #[test]
     fn a_truncated_padded_or_mistagged_compact_body_is_refused() {
         let txs = transactions();
-        let hashes: Vec<B256> = txs.iter().map(|tx| keccak256(tx)).collect();
+        let hashes: Vec<B256> = txs.iter().map(keccak256).collect();
         let body = encode_block_rlp_raw(&header(), &txs, &[], None);
         let frame = encode_compact_body(&body, &hashes, N42HeaderProfile::Ethereum).expect("encodes");
         assert!(decode_compact_body(&frame[..frame.len() - 1], N42HeaderProfile::Ethereum).is_err());
@@ -455,7 +455,7 @@ mod tests {
     #[test]
     fn a_fill_round_trips_and_only_a_well_formed_one_is_read() {
         let txs = transactions();
-        let hashes: Vec<B256> = txs.iter().map(|tx| keccak256(tx)).collect();
+        let hashes: Vec<B256> = txs.iter().map(keccak256).collect();
         let body = encode_block_rlp_raw(&header(), &txs, &[], None);
         let frame = encode_compact_body(&body, &hashes, N42HeaderProfile::Ethereum).expect("encodes");
         assert!(decode_compact_body(&frame, N42HeaderProfile::Ethereum).expect("decodes").fill.is_empty());
@@ -501,7 +501,7 @@ mod tests {
         header.ommers_hash = B256::ZERO;
         header.receipts_root = crate::header_profile::GOV5_NIL_HASH;
         let txs = transactions();
-        let hashes: Vec<B256> = txs.iter().map(|tx| keccak256(tx)).collect();
+        let hashes: Vec<B256> = txs.iter().map(keccak256).collect();
         let body = encode_block_rlp_raw(&header, &txs, &rewards, None);
         let frame = encode_compact_body(&body, &hashes, N42HeaderProfile::Gov5H2).expect("encodes");
         assert!(decode_compact_body(&frame, N42HeaderProfile::Gov5H2).is_ok());

@@ -183,6 +183,26 @@ pub struct ForeignBody {
     pub compact: bool,
 }
 
+/// What the execution layer did with a body handed to it.
+///
+/// A compact body has a third answer the full one does not: it named
+/// transactions this node does not hold, and it will take the same body
+/// again once they are supplied. That is BIP-152's `getblocktxn` and it is
+/// what a miss costs instead of the whole 26 MB body -- on this fleet a
+/// median of 448 transactions of 163,000 (loop195).
+#[derive(Debug)]
+pub enum BodyOutcome {
+    /// The execution layer took the body; this is the import's answer.
+    Answered(Result<PayloadStatus, ElError>),
+    /// "Not this way", before anything was checked: no channel, an
+    /// execution layer that does not serve the request, or one that refused
+    /// this body. The caller sends the block by another road.
+    NotThisWay,
+    /// A compact body it could not assemble: these positions of the block,
+    /// in block order, are transactions it does not hold.
+    NeedTxns(Vec<u32>),
+}
+
 /// How to resolve a started build — the node-neutral stand-in for reth's
 /// `PayloadKind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -356,18 +376,16 @@ pub trait ExecutionLayer: Send + Sync + 'static {
     ///
     /// Otherwise [`Self::new_payload_checked`]: `checked` releases the vote
     /// when the execution layer has checked the block, and the returned
-    /// status is the import. `None` means "not this way" -- no channel, an
-    /// execution layer that does not serve the request, or one that refused
-    /// this body -- and the caller sends the same block as a payload. The
+    /// status is the import. See [`BodyOutcome`] for the three answers. The
     /// default offers nothing.
     async fn new_payload_body_checked(
         &self,
         path: ExecutionPath,
         body: &ForeignBody,
         checked: tokio::sync::oneshot::Sender<PayloadStatus>,
-    ) -> Option<Result<PayloadStatus, ElError>> {
+    ) -> BodyOutcome {
         let _ = (path, body, checked);
-        None
+        BodyOutcome::NotThisWay
     }
 
     /// Engine-API `forkchoiceUpdated` without attributes — the finalise and

@@ -52,6 +52,7 @@ use reth_payload_primitives::{BuiltPayload, PayloadKind, PayloadTypes};
 use reth_primitives_traits::{Block as _, BlockBody as _, SealedBlock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use n42_engine_types::engine_validator::CompactBodyError;
 use tracing::{debug, info, warn};
 
 /// The block's RLP, `[header, transactions, ommers, withdrawals]`, with the
@@ -851,6 +852,40 @@ fn raw_shared_decode() -> bool {
     *ON.get_or_init(|| std::env::var("N42_RAW_SHARED_DECODE").is_ok_and(|v| v == "1"))
 }
 
+/// What a compact body's assembly refused with: the assembler's own verdict,
+/// or something this side said before it ever got there.
+enum CompactRefusal {
+    Refused(CompactBodyError),
+    Said(String),
+}
+
+impl std::fmt::Display for CompactRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(err) => write!(f, "{err}"),
+            Self::Said(message) => f.write_str(message),
+        }
+    }
+}
+
+/// The largest miss worth asking for, as one part in `N42_COMPACT_BODY_FILL`
+/// of the block: 2 by default, so up to half a block is fetched by index.
+///
+/// Above it the fill approaches the whole body's size and no longer pays for
+/// a round trip and a second assembly; below it a fill is tens of kilobytes
+/// against 26 megabytes (loop195: a median miss of 448 transactions of
+/// 163,000, a p90 of ~7,000).
+fn fill_share() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("N42_COMPACT_BODY_FILL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n: &usize| *n > 0)
+            .unwrap_or(2)
+    })
+}
+
 /// How long a compact body waits for this node's ingest to land a
 /// transaction it named and the queue did not have: `N42_COMPACT_BODY_WAIT`
 /// in milliseconds, 20 by default.
@@ -1536,25 +1571,74 @@ where
             // milliseconds of rayon work a runtime worker must not sit on.
             let assembled = tokio::task::block_in_place(|| {
                 let (announced, profile, body) = raw_engine::decode_foreign_body(&frame)
-                    .map_err(|err| format!("compact body frame: {err}"))?;
-                let validator = validator.ok_or_else(|| "no direct import; send the payload".to_string())?;
+                    .map_err(|err| CompactRefusal::Said(format!("compact body frame: {err}")))?;
+                let validator = validator.ok_or_else(|| {
+                    CompactRefusal::Said("no direct import; send the payload".to_owned())
+                })?;
                 let queue = n42_tx_queue::global::<n42_engine_types::N42PooledTransaction>()
-                    .ok_or_else(|| "no transaction queue; send the whole body".to_string())?;
+                    .ok_or_else(|| {
+                        CompactRefusal::Said("no transaction queue; send the whole body".to_owned())
+                    })?;
                 validator
                     .convert_compact_body_to_block(announced, profile, body, &queue, miss_wait())
-                    .map_err(|err| err.to_string())
+                    .map_err(CompactRefusal::Refused)
             });
+            // A miss small enough to be worth asking for: the positions go
+            // back on their own frame and the validator fetches just those
+            // (`reply::NEED_TXNS`). Beyond the threshold the saving over the
+            // whole body no longer pays for a round trip and a second
+            // assembly, and a node missing that much of a block is behind in
+            // a way one fill will not fix.
             let assembled = match assembled {
+                Err(CompactRefusal::Refused(CompactBodyError::Missing { indices, total, sample, waited }))
+                    if !indices.is_empty() && indices.len() <= total / fill_share() =>
+                {
+                    let number = raw_engine::decode_foreign_body(&frame)
+                        .ok()
+                        .and_then(|(_, profile, body)| {
+                            n42_h2_consensus::decode_compact_body_header(body, profile).ok()
+                        })
+                        .map_or(0, |(_, header)| header.number);
+                    info!(
+                        target: "n42.payload_serve",
+                        number,
+                        wanted = indices.len(),
+                        total,
+                        first = ?indices.first(),
+                        last = ?indices.last(),
+                        ?sample,
+                        waited_ms = waited.as_millis() as u64,
+                        "compact body: asking for the transactions this node does not hold"
+                    );
+                    let encoded = raw_engine::encode_need_txns(
+                        &indices.iter().map(|&i| i as u32).collect::<Vec<_>>(),
+                    );
+                    out.push(raw_engine::reply::NEED_TXNS);
+                    out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&encoded);
+                    stream.write_all(&out).await?;
+                    continue;
+                }
                 Ok(assembled) => assembled,
-                Err(message) => {
-                    // "Not this way". A miss -- this node's ingest has not
-                    // landed one of the block's transactions -- and a body
-                    // that is not the block it claims to be both end here,
-                    // and both leave the validator to ask its peers for the
-                    // whole body. Said at info level with the reason,
-                    // because a leg where this happens often is a leg whose
-                    // compact bodies are not doing their job.
-                    info!(target: "n42.payload_serve", %message, "compact body refused");
+                Err(refusal) => {
+                    let message = refusal.to_string();
+                    // "Not this way". A miss too large to be worth asking
+                    // for, and a body that is not the block it claims to be,
+                    // both end here, and both leave the validator to ask its
+                    // peers for the whole body. Said at info level with the
+                    // reason, because a leg where this happens often is a leg
+                    // whose compact bodies are not doing their job.
+                    // The block number costs one header decode on a path
+                    // that is about to pay a whole-body road: a leg's logs
+                    // are unreadable without it, which is what loop195's
+                    // refusal lines showed.
+                    let number = raw_engine::decode_foreign_body(&frame)
+                        .ok()
+                        .and_then(|(_, profile, body)| {
+                            n42_h2_consensus::decode_compact_body_header(body, profile).ok()
+                        })
+                        .map_or(0, |(_, header)| header.number);
+                    info!(target: "n42.payload_serve", number, %message, "compact body refused");
                     out.push(2);
                     out.extend_from_slice(&(message.len() as u32).to_le_bytes());
                     out.extend_from_slice(message.as_bytes());
@@ -1570,6 +1654,8 @@ where
                 root_us,
                 miss_wait_us,
                 misses,
+                fill_us,
+                filled,
                 total_us,
             } = assembled;
             info!(
@@ -1582,6 +1668,8 @@ where
                 root_ms = root_us / 1000,
                 miss_wait_ms = miss_wait_us / 1000,
                 misses,
+                fill_ms = fill_us / 1000,
+                filled,
                 decode_ms = started.elapsed().as_millis() as u64,
                 "compact body assembled from the queue"
             );
@@ -1592,7 +1680,7 @@ where
                 // What the assembly cost that the named parts below do not:
                 // the compact frame's decode, the seal, and reth's fork
                 // checks.
-                decode_us: total_us.saturating_sub(assemble_us + root_us + miss_wait_us),
+                decode_us: total_us.saturating_sub(assemble_us + root_us + miss_wait_us + fill_us),
                 reuse_us: 0,
                 prepare_us: 0,
                 dispatch_us: 0,
@@ -1602,6 +1690,8 @@ where
                 root_us,
                 miss_wait_us,
                 misses: misses as u64,
+                fill_us,
+                filled: filled as u64,
                 started: started_at,
             };
             import_for_validator::<T>(
@@ -1697,6 +1787,8 @@ where
                 root_us: 0,
                 miss_wait_us: 0,
                 misses: 0,
+                fill_us: 0,
+                filled: 0,
                 started: started_at,
             };
             import_for_validator::<T>(&mut stream, &mut out, &engine, reuse.as_ref(), data, Some(sealed), None, started, decoded_in, road).await?;
@@ -1763,6 +1855,8 @@ where
                             root_us: 0,
                             miss_wait_us: 0,
                             misses: 0,
+                            fill_us: 0,
+                            filled: 0,
                             started: started_at,
                         },
                     )

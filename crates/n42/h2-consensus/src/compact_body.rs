@@ -23,6 +23,13 @@
 //! `[header, transactions, verifiers, rewards]` byte for byte, as they
 //! always have -- they are a cross-client contract.
 //!
+//! A hash the receiver does not hold is a miss, and a miss is answered by
+//! asking for those transactions alone -- BIP-152's `getblocktxn` shape. The
+//! answer comes back as the frame's *fill*: the transactions for the
+//! positions that were missing, appended to the same frame and handed back
+//! to the side that assembles. Only that side ever sees a filled frame; what
+//! travels between nodes never carries one.
+//!
 //! ```text
 //! frame := "N42C" | u8 version
 //!        | u32 len, header RLP
@@ -30,7 +37,11 @@
 //!        | u32 len, the verifiers item as it stands in the gov5 body
 //!        | u32 len, the rewards item as it stands in the gov5 body
 //!        | u8 present, [u32 len, the EIP-7928 access list]
+//!        | [u8 1, u32 count, count * (u32 index, u32 len, EIP-2718 bytes)]
 //! ```
+//!
+//! The fill is the only optional section and it ends the frame, so a frame
+//! without one is byte for byte what a frame was before it existed.
 //!
 //! Little-endian lengths, as on the raw engine channel; the RLP items are
 //! carried whole so nothing about gov5's body has to be re-encoded here and
@@ -55,6 +66,11 @@ const MAGIC: [u8; 4] = *b"N42C";
 /// than guessed at: both ends of the direct channel are this binary, and a
 /// peer that has not negotiated the capability is never sent one.
 const VERSION: u8 = 1;
+
+/// Introduces the fill section. A frame either ends after the access list or
+/// carries exactly this and then the fill; anything else is refused, so the
+/// optional section cannot be read out of trailing rubbish.
+const FILL_PRESENT: u8 = 1;
 
 /// Why a compact body could not be read. Kept as [`BlockBodyError`] so a
 /// caller handles one failure, not two.
@@ -86,6 +102,10 @@ pub struct CompactBlockBody<'a> {
     pub verifiers_rlp: &'a [u8],
     /// The rewards item, carried for the same reason.
     pub rewards_rlp: &'a [u8],
+    /// Transactions supplied for positions the receiver could not fill from
+    /// its own queue, as EIP-2718 bytes: `(index, bytes)` in index order.
+    /// Empty on every frame that crossed the wire.
+    pub fill: Vec<(usize, &'a [u8])>,
 }
 
 struct Writer(Vec<u8>);
@@ -194,6 +214,29 @@ pub fn write_compact(
     w.0
 }
 
+/// The same frame with `fill` appended: the transactions for the positions
+/// the receiver could not fill from its own queue, in index order.
+///
+/// Appended rather than spliced in, because the frame the peer sent is the
+/// one whose header and hashes were already checked, and this keeps those
+/// bytes untouched.
+pub fn with_fill(frame: &[u8], fill: &[(usize, alloy_primitives::Bytes)]) -> Vec<u8> {
+    let mut out =
+        Vec::with_capacity(frame.len() + 8 + fill.iter().map(|(_, tx)| tx.len() + 8).sum::<usize>());
+    out.extend_from_slice(frame);
+    if fill.is_empty() {
+        return out;
+    }
+    let mut w = Writer(out);
+    w.u8(FILL_PRESENT);
+    w.u32(fill.len() as u32);
+    for (index, tx) in fill {
+        w.u32(*index as u32);
+        w.bytes(tx);
+    }
+    w.0
+}
+
 /// Whether these bytes claim to be a compact body. Cheap, and the only thing
 /// that tells the two shapes apart on a channel that carries both.
 pub fn is_compact_body(bytes: &[u8]) -> bool {
@@ -251,8 +294,33 @@ pub fn decode_compact_body(
     let verifiers_rlp = r.bytes()?;
     let rewards_rlp = r.bytes()?;
     let bal = if r.u8()? == 1 { Some(r.bytes()?) } else { None };
+    // The fill, when the side that assembles appended one. Strict: the
+    // marker must be exactly right and the section must end the frame.
+    let mut fill = Vec::new();
     if !r.0.is_empty() {
-        return Err(invalid());
+        if r.u8()? != FILL_PRESENT {
+            return Err(invalid());
+        }
+        let n = r.u32()? as usize;
+        if n > count {
+            return Err(invalid());
+        }
+        fill.reserve(n);
+        let mut previous: Option<usize> = None;
+        for _ in 0..n {
+            let index = r.u32()? as usize;
+            if index >= count || previous.is_some_and(|last| index <= last) {
+                // Out of range, or not in strictly increasing index order:
+                // a fill that names a position twice would let one
+                // transaction stand for two.
+                return Err(invalid());
+            }
+            previous = Some(index);
+            fill.push((index, r.bytes()?));
+        }
+        if !r.0.is_empty() {
+            return Err(invalid());
+        }
     }
     let rewards = decode_rewards(rewards_rlp)?;
     // gov5's rewards commitment, exactly as the full body's decode checks
@@ -277,6 +345,7 @@ pub fn decode_compact_body(
         bal,
         verifiers_rlp,
         rewards_rlp,
+        fill,
     })
 }
 
@@ -381,6 +450,46 @@ mod tests {
         assert!(!is_compact_body(&wrong_magic));
         // And a gov5 body is not a compact one however it is read.
         assert!(decode_compact_body(&body, N42HeaderProfile::Ethereum).is_err());
+    }
+
+    #[test]
+    fn a_fill_round_trips_and_only_a_well_formed_one_is_read() {
+        let txs = transactions();
+        let hashes: Vec<B256> = txs.iter().map(|tx| keccak256(tx)).collect();
+        let body = encode_block_rlp_raw(&header(), &txs, &[], None);
+        let frame = encode_compact_body(&body, &hashes, N42HeaderProfile::Ethereum).expect("encodes");
+        assert!(decode_compact_body(&frame, N42HeaderProfile::Ethereum).expect("decodes").fill.is_empty());
+
+        // A frame with no fill is the frame itself, byte for byte.
+        assert_eq!(with_fill(&frame, &[]), frame);
+
+        let filled = with_fill(&frame, &[(0, txs[0].clone()), (2, txs[2].clone())]);
+        let decoded = decode_compact_body(&filled, N42HeaderProfile::Ethereum).expect("decodes");
+        assert_eq!(decoded.hashes, hashes, "the frame under the fill is unchanged");
+        assert_eq!(decoded.fill.len(), 2);
+        assert_eq!(decoded.fill[0], (0, &txs[0][..]));
+        assert_eq!(decoded.fill[1], (2, &txs[2][..]));
+
+        // Out of order, repeated, out of range, and truncated: all refused.
+        assert!(decode_compact_body(
+            &with_fill(&frame, &[(2, txs[2].clone()), (0, txs[0].clone())]),
+            N42HeaderProfile::Ethereum
+        )
+        .is_err());
+        assert!(decode_compact_body(
+            &with_fill(&frame, &[(1, txs[1].clone()), (1, txs[1].clone())]),
+            N42HeaderProfile::Ethereum
+        )
+        .is_err());
+        assert!(decode_compact_body(
+            &with_fill(&frame, &[(9, txs[0].clone())]),
+            N42HeaderProfile::Ethereum
+        )
+        .is_err());
+        assert!(decode_compact_body(&filled[..filled.len() - 1], N42HeaderProfile::Ethereum).is_err());
+        let mut wrong_marker = filled.clone();
+        wrong_marker[frame.len()] = FILL_PRESENT + 1;
+        assert!(decode_compact_body(&wrong_marker, N42HeaderProfile::Ethereum).is_err());
     }
 
     #[test]

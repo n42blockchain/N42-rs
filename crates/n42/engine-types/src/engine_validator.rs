@@ -237,17 +237,47 @@ where
     }
 }
 
+/// The sender of a transaction that never reached this node's ingest, so
+/// nothing recorded one for it: recovered here, the way the foreign-body
+/// road recovers every sender it does not find cached.
+fn sender_of(tx: &TransactionSigned) -> Result<alloy_primitives::Address, String> {
+    use reth_primitives_traits::{SignedTransaction, SignerRecoverable};
+    match tx {
+        TransactionSigned::AltSig(alt) => {
+            let cache = n42_tx_types::AltSigSenderCache::global();
+            if let Some(sender) = cache.get(alt.hash()) {
+                return Ok(sender);
+            }
+            let sender = n42_tx_types::verify_batch(&[alt])
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| Err(n42_tx_types::AltSigError::UnknownAlgorithm(0)))
+                .map_err(|err| err.to_string())?;
+            cache.insert(*alt.hash(), sender);
+            Ok(sender)
+        }
+        TransactionSigned::Eth(_) => tx.recover_signer().map_err(|err| err.to_string()),
+    }
+}
+
 /// Why a compact body did not become a block.
 #[derive(Debug)]
 pub enum CompactBodyError {
     /// This node does not hold every transaction the body names, even after
     /// waiting for its ingest. Not a fault of the block: the caller asks for
-    /// the whole body and takes the ordinary road.
+    /// what is missing and, failing that, for the whole body.
+    ///
+    /// It carries enough for a leg's logs to say *which* transactions they
+    /// are without another instrument: how many of how many, where they sit
+    /// in the block, and a few hashes to look up in the flood's own record.
+    /// loop195 wanted exactly this and had only a count.
     Missing {
-        /// How many of the block's hashes are not here.
-        missing: usize,
-        /// The first one, in block order, for the log line.
-        first: B256,
+        /// The block's positions this node cannot fill, in block order.
+        indices: Vec<usize>,
+        /// How many transactions the block has.
+        total: usize,
+        /// The first few missing hashes, for the log line.
+        sample: Vec<B256>,
         /// How long the wait for the ingest lasted.
         waited: std::time::Duration,
     },
@@ -259,11 +289,22 @@ pub enum CompactBodyError {
 impl std::fmt::Display for CompactBodyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Missing { missing, first, waited } => write!(
-                f,
-                "compact body: {missing} transactions not held here (first {first}), waited {} ms",
-                waited.as_millis()
-            ),
+            Self::Missing { indices, total, sample, waited } => {
+                write!(
+                    f,
+                    "compact body: {} of {total} transactions not held here, at {}, first",
+                    indices.len(),
+                    match (indices.first(), indices.last()) {
+                        (Some(first), Some(last)) if first == last => format!("index {first}"),
+                        (Some(first), Some(last)) => format!("indices {first}..{last}"),
+                        _ => "no index".to_owned(),
+                    },
+                )?;
+                for hash in sample {
+                    write!(f, " {hash}")?;
+                }
+                write!(f, ", waited {} ms", waited.as_millis())
+            }
             Self::Invalid(err) => write!(f, "compact body: {err}"),
         }
     }
@@ -289,6 +330,12 @@ pub struct AssembledBlock {
     pub root_us: u64,
     /// Waiting for the ingest to catch up on a first-pass miss.
     pub miss_wait_us: u64,
+    /// Checking, decoding and recovering the transactions the frame
+    /// supplied for positions this node could not fill (the second attempt
+    /// at a block whose first one missed); 0 on a frame with no fill.
+    pub fill_us: u64,
+    /// How many positions the frame supplied.
+    pub filled: usize,
     /// How many of the hashes the first pass did not find.
     pub misses: usize,
 }
@@ -357,15 +404,64 @@ where
             )));
         }
 
-        // The transactions, out of this node's queue by the hashes the body
-        // names. Nothing is removed: the canonical prune is still what takes
-        // a block's transactions out of the queue, exactly as on the body
-        // road.
+        // The transactions supplied with the frame, for the positions a
+        // first attempt could not fill from the queue (see
+        // `compact_body::with_fill`). Each is checked against the hash the
+        // body names for its position before it is used: a peer that answers
+        // a request for index 7 with something else is refused here, by name,
+        // rather than left to the transactions root to catch as a mismatch.
+        let filled_at = std::time::Instant::now();
+        let supplied: Vec<(usize, TransactionSigned)> = {
+            use rayon::prelude::*;
+            let checked: Vec<Result<(usize, TransactionSigned), String>> = body
+                .fill
+                .par_iter()
+                .map(|(index, bytes)| {
+                    let want = body.hashes.get(*index).copied().ok_or_else(|| {
+                        format!("the fill names index {index}, which the body does not have")
+                    })?;
+                    if alloy_primitives::keccak256(bytes) != want {
+                        return Err(format!(
+                            "the transaction supplied for index {index} is not {want}"
+                        ));
+                    }
+                    <TransactionSigned as alloy_eips::Decodable2718>::decode_2718_exact(bytes)
+                        .map(|tx| (*index, tx))
+                        .map_err(|err| format!("the transaction supplied for index {index}: {err}"))
+                })
+                .collect();
+            checked.into_iter().collect::<Result<Vec<_>, String>>().map_err(other)?
+        };
+        // Their senders, recovered here: they never reached this node's
+        // ingest, so nothing recorded one for them.
+        let supplied: Vec<(usize, alloy_primitives::Address, TransactionSigned)> = {
+            use rayon::prelude::*;
+            let recovered: Vec<Result<_, String>> = supplied
+                .into_par_iter()
+                .map(|(index, tx)| {
+                    let sender = sender_of(&tx)
+                        .map_err(|err| format!("the sender of the transaction at index {index}: {err}"))?;
+                    Ok((index, sender, tx))
+                })
+                .collect();
+            recovered.into_iter().collect::<Result<Vec<_>, String>>().map_err(other)?
+        };
+        let fill_us = filled_at.elapsed().as_micros() as u64;
+
+        // The rest, out of this node's queue by the hashes the body names.
+        // Nothing is removed: the canonical prune is still what takes a
+        // block's transactions out of the queue, exactly as on the body road.
         let lookup_at = std::time::Instant::now();
         let mut held = queue.get_by_hashes(&body.hashes);
         let first_pass = lookup_at.elapsed();
-        let mut misses: Vec<usize> =
-            held.iter().enumerate().filter(|(_, tx)| tx.is_none()).map(|(i, _)| i).collect();
+        let covered: std::collections::HashSet<usize> =
+            supplied.iter().map(|(index, _, _)| *index).collect();
+        let mut misses: Vec<usize> = held
+            .iter()
+            .enumerate()
+            .filter(|(i, tx)| tx.is_none() && !covered.contains(i))
+            .map(|(i, _)| i)
+            .collect();
         let first_misses = misses.len();
         let waited_at = std::time::Instant::now();
         // A miss is usually this node's ingest being a few milliseconds
@@ -389,27 +485,39 @@ where
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         let miss_wait_us = if first_misses == 0 { 0 } else { waited_at.elapsed().as_micros() as u64 };
-        if let Some(&first) = misses.first() {
+        if !misses.is_empty() {
             return Err(CompactBodyError::Missing {
-                missing: misses.len(),
-                first: body.hashes[first],
+                sample: misses.iter().take(4).map(|&i| body.hashes[i]).collect(),
+                total: body.hashes.len(),
+                indices: misses,
                 waited: waited_at.elapsed(),
             });
         }
         let unzip_at = std::time::Instant::now();
         // The transactions and the senders this node recorded for them when
-        // it ingested them. `flatten` rather than an unwrap: the loop above
-        // returned on any miss, and a list shorter than the body's is
-        // checked for below rather than trusted to be impossible.
-        let (transactions, senders): (Vec<TransactionSigned>, Vec<alloy_primitives::Address>) = held
+        // it ingested them, with the supplied ones in their own positions.
+        // `flatten` rather than an unwrap: the loop above returned on any
+        // miss, and a list shorter than the body's is checked for below
+        // rather than trusted to be impossible.
+        let mut slots: Vec<Option<(TransactionSigned, alloy_primitives::Address)>> = held
             .into_iter()
-            .flatten()
-            .map(|held| held.transaction.clone_into_consensus().into_parts())
-            .unzip();
+            .map(|held| held.map(|held| held.transaction.clone_into_consensus().into_parts()))
+            .collect();
+        for (index, sender, tx) in supplied {
+            if let Some(slot) = slots.get_mut(index) {
+                *slot = Some((tx, sender));
+            }
+        }
+        let (transactions, senders): (Vec<TransactionSigned>, Vec<alloy_primitives::Address>) =
+            slots.into_iter().flatten().unzip();
         if transactions.len() != body.hashes.len() {
+            // Unreachable: the loop above returned on any miss. Checked
+            // rather than assumed, because the alternative to a check here
+            // is an unwrap on the vote road.
             return Err(CompactBodyError::Missing {
-                missing: body.hashes.len() - transactions.len(),
-                first: body.hashes.first().copied().unwrap_or_default(),
+                indices: (transactions.len()..body.hashes.len()).collect(),
+                total: body.hashes.len(),
+                sample: body.hashes.get(transactions.len()).copied().into_iter().collect(),
                 waited: waited_at.elapsed(),
             });
         }
@@ -481,6 +589,8 @@ where
             root_us,
             miss_wait_us,
             misses: first_misses,
+            fill_us,
+            filled: body.fill.len(),
             total_us: started.elapsed().as_micros() as u64,
         })
     }
@@ -1178,9 +1288,10 @@ mod tests {
             .convert_compact_body_to_block(hash, N42HeaderProfile::Gov5H2, &compact, &queue, SHORT_WAIT)
             .expect_err("one transaction is not held here")
         {
-            CompactBodyError::Missing { missing, first, .. } => {
-                assert_eq!(missing, 1);
-                assert_eq!(first, hashes_of(&transactions)[2]);
+            CompactBodyError::Missing { indices, total, sample, .. } => {
+                assert_eq!(indices, vec![2], "the last transaction is the one missing");
+                assert_eq!(total, 3);
+                assert_eq!(sample, vec![hashes_of(&transactions)[2]]);
             }
             other => panic!("a miss, not {other}"),
         }
@@ -1191,8 +1302,109 @@ mod tests {
             validator
                 .convert_compact_body_to_block(hash, N42HeaderProfile::Gov5H2, &compact, &blind, SHORT_WAIT)
                 .expect_err("nothing is held"),
-            CompactBodyError::Missing { missing: 3, .. }
+            CompactBodyError::Missing { total: 3, .. }
         ));
+    }
+
+    /// The second attempt at a block whose first one missed: the peer
+    /// supplies the transactions for the positions this node could not fill,
+    /// and the block assembles from the queue and the fill together.
+    #[test]
+    fn a_fill_completes_a_block_the_queue_could_not() {
+        use alloy_eips::Encodable2718;
+        let (_, hash, body, _, transactions) = mixed_block();
+        let senders = senders_for(&transactions);
+        // This node holds all but one, which is what the ingest gate leaves
+        // behind on the fleet (loop195: a median of 448 of 163,000, sitting
+        // in frames the gate has not admitted). The one it misses is an
+        // Ethereum transaction, because a supplied transaction's sender is
+        // recovered here and these fixtures' 0x50 signature is a
+        // placeholder -- the test below pins what happens to one of those.
+        let held = vec![transactions[0].clone(), transactions[2].clone()];
+        let held_senders = vec![senders[0], senders[2]];
+        let queue = queue_holding(&held, &held_senders);
+        let hashes = hashes_of(&transactions);
+        let frame = n42_h2_consensus::encode_compact_body(&body, &hashes, N42HeaderProfile::Gov5H2)
+            .expect("encodes");
+        let validator = validator(N42HeaderProfile::Gov5H2);
+
+        // Without the fill: a miss that names the position to ask for.
+        let indices = match validator
+            .convert_compact_body_to_block(hash, N42HeaderProfile::Gov5H2, &frame, &queue, SHORT_WAIT)
+            .expect_err("one transaction is not held here")
+        {
+            CompactBodyError::Missing { indices, .. } => indices,
+            other => panic!("a miss, not {other}"),
+        };
+        assert_eq!(indices, vec![1]);
+
+        // With it: the same block the body road decodes, and the supplied
+        // transaction's sender is recovered here rather than taken on trust.
+        let fill: Vec<(usize, Bytes)> = indices
+            .iter()
+            .map(|&i| (i, Bytes::from(transactions[i].encoded_2718())))
+            .collect();
+        let filled = n42_h2_consensus::with_fill(&frame, &fill);
+        let assembled = validator
+            .convert_compact_body_to_block(hash, N42HeaderProfile::Gov5H2, &filled, &queue, SHORT_WAIT)
+            .expect("the fill completes it");
+        let (from_body, _) = validator
+            .convert_body_to_block(hash, N42HeaderProfile::Gov5H2, &body)
+            .expect("the body converts");
+        assert_eq!(assembled.block.hash(), from_body.hash());
+        assert_eq!(assembled.block.body().transactions, from_body.body().transactions);
+        assert_eq!(assembled.filled, 1);
+        assert_eq!(assembled.senders[0], senders[0], "the queue's senders are used as they are");
+        assert_eq!(assembled.senders[2], senders[2]);
+    }
+
+    /// A peer that answers a request for one position with a different
+    /// transaction is refused by name, before the transactions root ever
+    /// sees it.
+    #[test]
+    fn a_fill_that_is_not_the_transaction_asked_for_is_refused() {
+        use alloy_eips::Encodable2718;
+        let (_, hash, body, _, transactions) = mixed_block();
+        let senders = senders_for(&transactions);
+        let queue = queue_holding(&transactions[..2], &senders[..2]);
+        let frame = n42_h2_consensus::encode_compact_body(
+            &body,
+            &hashes_of(&transactions),
+            N42HeaderProfile::Gov5H2,
+        )
+        .expect("encodes");
+        let validator = validator(N42HeaderProfile::Gov5H2);
+
+        // The right shape, the wrong transaction.
+        let wrong = Bytes::from(as_ingested(&other_transaction()).encoded_2718());
+        let filled = n42_h2_consensus::with_fill(&frame, &[(2, wrong)]);
+        let refused = validator
+            .convert_compact_body_to_block(hash, N42HeaderProfile::Gov5H2, &filled, &queue, SHORT_WAIT)
+            .expect_err("that is not the transaction that was asked for");
+        assert!(
+            matches!(refused, CompactBodyError::Invalid(_)),
+            "a wrong fill is the peer being wrong, not a miss: {refused}"
+        );
+
+        // And bytes that are not a transaction at all.
+        let filled = n42_h2_consensus::with_fill(&frame, &[(2, Bytes::from_static(&[0x99, 0x01]))]);
+        assert!(validator
+            .convert_compact_body_to_block(hash, N42HeaderProfile::Gov5H2, &filled, &queue, SHORT_WAIT)
+            .is_err());
+
+        // A supplied 0x50 transaction whose sender cannot be recovered is
+        // refused too: a transaction that never reached this node's ingest
+        // has no recorded sender, so the fill path recovers it and a
+        // signature that does not verify ends here rather than in the block.
+        let alt = Bytes::from(transactions[2].encoded_2718());
+        let filled = n42_h2_consensus::with_fill(&frame, &[(2, alt)]);
+        let refused = validator
+            .convert_compact_body_to_block(hash, N42HeaderProfile::Gov5H2, &filled, &queue, SHORT_WAIT)
+            .expect_err("its signature does not verify");
+        assert!(
+            refused.to_string().contains("sender"),
+            "the refusal says which transaction and why: {refused}"
+        );
     }
 
     /// The announced hash and the header profile are checked before

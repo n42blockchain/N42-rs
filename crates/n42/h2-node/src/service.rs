@@ -315,6 +315,14 @@ pub struct H2Service<E> {
     ready_bodies: Vec<B256>,
     /// Every body that arrived since the last drain, for reporting.
     received_bodies: Vec<B256>,
+    /// When each held block was first held, for the lines `say_held` writes.
+    held_since: std::collections::HashMap<B256, std::time::Instant>,
+    /// Blocks the WARN has already been written for, so it is written once.
+    held_warned: HashSet<B256>,
+    /// When the last held-block line was written, to rate-limit them.
+    last_held_log: Option<std::time::Instant>,
+    /// The same for the WARN, which is louder and rarer.
+    last_held_warn: Option<std::time::Instant>,
     /// Block bodies the mesh would not accept yet; retried like `outbox`.
     body_outbox: Vec<Vec<u8>>,
     /// Peers whose status arrived since the last drain, with the height
@@ -457,6 +465,13 @@ const TX_FORWARD_QUEUE: usize = 4;
 const INBOUND_TX_CAP: usize = 8000;
 
 const MAX_HELD_BODIES: usize = 4096;
+
+/// At most one held-block line this often, however many are held.
+const HELD_LOG_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// A block held this long is not waiting for a pull, it is a node that has
+/// stopped importing. One WARN per block, with what decides the hold.
+const HELD_TOO_LONG: std::time::Duration = std::time::Duration::from_secs(2);
 /// Imported hashes remembered; older commits never arrive.
 const MAX_IMPORTED: usize = 8192;
 /// Between the end of one catch-up and the start of the next.
@@ -575,6 +590,27 @@ const fn head_stamp(remembered: Option<u64>, header: Option<&Header>) -> Option<
     }
 }
 
+/// Whether a block runs more than [`FAR_AHEAD_BLOCKS`] past the execution
+/// layer's tip, and is therefore held rather than sent to it.
+///
+/// One block of slack, not none: under deferred execution the next block
+/// arrives while its parent is still executing. Two is a block whose parent
+/// this node has not even started, and sending it would make the engine
+/// backfill from peers it does not have.
+const fn runs_far_ahead(number: u64, tip: u64) -> bool {
+    number > tip + FAR_AHEAD_BLOCKS
+}
+
+/// The execution layer's height from the two things that know it: the head
+/// the driver has moved to, and the highest block whose import is in flight.
+const fn tip_of(head: Option<u64>, in_flight: Option<u64>) -> Option<u64> {
+    match (head, in_flight) {
+        (Some(a), Some(b)) => Some(if a > b { a } else { b }),
+        (Some(a), None) => Some(a),
+        (None, b) => b,
+    }
+}
+
 impl<E> std::fmt::Debug for H2Service<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("H2Service")
@@ -648,6 +684,10 @@ impl<E: ExecutionLayer> H2Service<E> {
             body_requested_order: std::collections::VecDeque::new(),
             imported_height: None,
             held_bodies: Vec::new(),
+            held_since: std::collections::HashMap::new(),
+            held_warned: HashSet::new(),
+            last_held_log: None,
+            last_held_warn: None,
             peer_heights: std::collections::HashMap::new(),
             catch_up_retry_after: None,
             failed_peer: None,
@@ -1012,6 +1052,19 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // next build ahead wants. Flushed at the end of this step.
                 if let Some(hash) = imported {
                     self.prepare_on = Some(hash);
+                    // And it is a block the execution layer holds, which is
+                    // the two things a follower import would have moved: the
+                    // height the next block is judged against, and a commit
+                    // for it that was answered SYNCING while it was landing.
+                    // Without them the head stays at the block before this
+                    // node's own last one and every block after it is held
+                    // for ever (defect 12).
+                    if let Some(header) = self.block_headers.get(&hash) {
+                        self.note_imported(header.number);
+                    }
+                    if let Some(action) = self.driver.own_block_imported(hash).await {
+                        self.apply_driver_action(action, &mut events)?;
+                    }
                 }
             }
             () = &mut timeout => {
@@ -1554,7 +1607,10 @@ impl<E: ExecutionLayer> H2Service<E> {
         for block_hash in std::mem::take(&mut self.held_bodies) {
             if self.far_ahead(block_hash) {
                 self.held_bodies.push(block_hash);
+                self.say_held(block_hash);
             } else {
+                self.held_since.remove(&block_hash);
+                self.held_warned.remove(&block_hash);
                 self.ready_bodies.push(block_hash);
             }
         }
@@ -1645,11 +1701,13 @@ impl<E: ExecutionLayer> H2Service<E> {
         {
             if !self.held_bodies.contains(block_hash) {
                 if self.held_bodies.len() >= MAX_HELD_BODIES {
-                    self.held_bodies.remove(0);
+                    let oldest = self.held_bodies.remove(0);
+                    self.held_since.remove(&oldest);
+                    self.held_warned.remove(&oldest);
                 }
                 self.held_bodies.push(*block_hash);
             }
-            debug!(target: "n42.h2.node", ?block_hash, tip = ?self.imported_height, "block runs ahead of the execution layer; held until the pull reaches it");
+            self.say_held(*block_hash);
             return Ok(());
         }
         if let EngineOutput::ExecuteBlock(block_hash) = &output
@@ -2391,8 +2449,57 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// import. Unknown either way is not far.
     fn far_ahead(&self, block_hash: B256) -> bool {
         match (self.block_headers.get(&block_hash), self.imported_tip()) {
-            (Some(header), Some(tip)) => header.number > tip + FAR_AHEAD_BLOCKS,
+            // A block whose parent this node has imported can be executed
+            // here whatever the height says, and holding it is how a node
+            // that has stopped importing stays stopped: the tip is read from
+            // the head, and the head only moves when a block is imported or a
+            // commit lands (defect 12).
+            (Some(header), _) if self.imported.contains(&header.parent_hash) => false,
+            (Some(header), Some(tip)) => runs_far_ahead(header.number, tip),
             _ => false,
+        }
+    }
+
+    /// Says that a block is being held, without saying it for every block on
+    /// every drain: once when the block is first held, at most one line every
+    /// [`HELD_LOG_EVERY`], and one WARN per block once it has been held for
+    /// [`HELD_TOO_LONG`] -- which no healthy node ever reaches, and which is
+    /// the line that would have named defect 12 in one leg instead of five.
+    fn say_held(&mut self, block_hash: B256) {
+        let now = std::time::Instant::now();
+        let since = *self.held_since.entry(block_hash).or_insert(now);
+        let number = self.block_headers.get(&block_hash).map(|header| header.number);
+        let held_ms = now.duration_since(since).as_millis() as u64;
+        // Once per block, and at most one every `HELD_TOO_LONG`: a node
+        // genuinely catching up holds thousands of blocks, and the line is
+        // there to name a node that has stopped, not to narrate a pull.
+        let warn_due = self.last_held_warn.is_none_or(|at| now.duration_since(at) >= HELD_TOO_LONG);
+        if held_ms >= HELD_TOO_LONG.as_millis() as u64 && warn_due && self.held_warned.insert(block_hash) {
+            self.last_held_warn = Some(now);
+            warn!(
+                target: "n42.h2.node",
+                ?block_hash,
+                ?number,
+                tip = ?self.imported_tip(),
+                head = ?self.driver.head(),
+                held_ms,
+                held = self.held_bodies.len(),
+                reason = "the execution layer's tip has not moved; this node is importing nothing",
+                "a block body has been held far too long"
+            );
+            return;
+        }
+        if self.last_held_log.is_none_or(|at| now.duration_since(at) >= HELD_LOG_EVERY) {
+            self.last_held_log = Some(now);
+            info!(
+                target: "n42.h2.node",
+                ?block_hash,
+                ?number,
+                tip = ?self.imported_tip(),
+                held_ms,
+                held = self.held_bodies.len(),
+                "block runs ahead of the execution layer; held until the pull reaches it"
+            );
         }
     }
 
@@ -2423,10 +2530,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             .filter_map(|hash| self.block_headers.get(hash))
             .map(|header| header.number)
             .max();
-        match (head, in_flight) {
-            (Some(a), Some(b)) => Some(a.max(b)),
-            (a, b) => a.or(b),
-        }
+        tip_of(head, in_flight)
     }
 
 
@@ -2872,6 +2976,33 @@ mod tests {
     /// After a restart this node remembers no block, so the head's stamp has
     /// to come from the header the execution layer served -- never from the
     /// wall clock, which on this chain runs behind the timestamps.
+    /// Defect 12's arithmetic, with the numbers loop190 Y1a node5 had: its
+    /// own last block was 382 and the driver's head stayed at 381, because
+    /// that block's commit was answered SYNCING and nothing ran it again.
+    /// The next leader's block is 383 -- two past a tip of 381 -- so it was
+    /// held, and so was every block after it, for the rest of the leg.
+    #[test]
+    fn a_head_one_behind_this_nodes_own_last_block_holds_everything_after_it() {
+        assert!(runs_far_ahead(383, 381), "the shape of the stall");
+        // With the head where it belongs, nothing is held.
+        assert!(!runs_far_ahead(383, 382));
+        // And the slack deferred execution needs stays: the next block
+        // arrives while its parent is still executing.
+        assert!(!runs_far_ahead(383, 382), "one block of slack");
+        assert!(runs_far_ahead(384, 382), "two is not");
+    }
+
+    /// The tip is the higher of the head and the imports in flight, and
+    /// exists as soon as either does.
+    #[test]
+    fn the_tip_is_the_furthest_of_what_the_node_knows() {
+        assert_eq!(tip_of(Some(381), None), Some(381));
+        assert_eq!(tip_of(Some(381), Some(382)), Some(382), "an import in flight counts");
+        assert_eq!(tip_of(Some(383), Some(382)), Some(383));
+        assert_eq!(tip_of(None, Some(382)), Some(382));
+        assert_eq!(tip_of(None, None), None, "nothing known: nothing is far ahead");
+    }
+
     #[test]
     fn the_heads_stamp_falls_back_to_its_header() {
         let header = Header { timestamp: 1_700_000_042, ..Default::default() };

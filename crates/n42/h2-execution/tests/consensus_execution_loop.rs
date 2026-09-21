@@ -750,3 +750,90 @@ async fn the_default_keeps_the_commit_on_the_loop() {
     assert!(!driver.is_committing());
     assert!(reports.try_recv().is_err(), "the awaited path reports nothing");
 }
+
+/// Defect 12, loop190 Y1a node5: the last block of a tenure, committed while
+/// its own import was still landing.
+///
+/// The exact order the leg has: the leader builds and proposes its own block;
+/// the commit's forkchoice reaches the engine before the import does and is
+/// answered SYNCING; the own import lands a moment later; the tenure hands
+/// over and the next leader's block arrives as a body. Before the fix the
+/// commit was never run again -- nothing runs it, an own import does not go
+/// through the driver -- so the head stayed at the block *before* this node's
+/// own last one, and the node's `far_ahead` held every block after it for
+/// ever: it received bodies and Decides for 160 views and imported nothing.
+#[tokio::test]
+async fn an_own_blocks_commit_answered_syncing_is_run_again_when_its_import_lands() {
+    // An engine that has not got the block yet answers SYNCING to its
+    // forkchoice, and the driver keeps the commit.
+    let el = MockExecutionLayer::with_behaviour(MockBehaviour {
+        forkchoice_status: PayloadStatusEnum::Syncing,
+        ..Default::default()
+    });
+    let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    let built = driver.build_block(attrs(), 1).await.unwrap();
+
+    // The commit, ahead of the import.
+    driver.handle_output(&committed(built.hash)).await;
+    assert_ne!(driver.head(), built.hash, "the engine has not got it; the head cannot move yet");
+
+    // The import lands. The engine now holds the block, so the forkchoice
+    // that failed would succeed -- and it is this call that runs it.
+    el.set_behaviour(MockBehaviour::default());
+    let action = driver.own_block_imported(built.hash).await;
+    assert!(action.is_some(), "the commit that was kept must run");
+    assert_eq!(driver.head(), built.hash, "the head follows this node's own last block");
+    assert_eq!(driver.finalized(), built.hash);
+
+    // The handover: the next leader's block, which extends it, imports.
+    let next = B256::repeat_byte(0xab);
+    driver.cache_payload(next, MockExecutionLayer::payload_for(next, 2));
+    assert_eq!(driver.handle_output(&execute(next)).await.imported_block(), Some(next));
+}
+
+/// The ordinary order -- the import lands first, the commit runs on its own
+/// afterwards -- must not pay a second forkchoice for it.
+#[tokio::test]
+async fn an_own_import_that_beat_its_commit_sends_no_second_forkchoice() {
+    let el = MockExecutionLayer::new();
+    let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    let built = driver.build_block(attrs(), 1).await.unwrap();
+
+    assert!(driver.own_block_imported(built.hash).await.is_none(), "no commit is waiting");
+    let before = el.calls().iter().filter(|c| matches!(c, ElCall::ForkchoiceUpdated(_))).count();
+    driver.handle_output(&committed(built.hash)).await;
+    let after = el.calls().iter().filter(|c| matches!(c, ElCall::ForkchoiceUpdated(_))).count();
+    assert_eq!(after, before + 1, "the commit's forkchoice, once");
+    assert_eq!(driver.head(), built.hash);
+}
+
+/// The same defect with the body road: the block that arrives at the
+/// handover is a body, not a payload.
+#[tokio::test]
+async fn the_block_after_a_recovered_own_commit_imports_from_its_body() {
+    let el = MockExecutionLayer::with_behaviour(MockBehaviour {
+        forkchoice_status: PayloadStatusEnum::Syncing,
+        take_bodies: true,
+        ..Default::default()
+    });
+    let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    with_decoder(&mut driver);
+    let built = driver.build_block(attrs(), 1).await.unwrap();
+    driver.handle_output(&committed(built.hash)).await;
+    assert_ne!(driver.head(), built.hash);
+
+    el.set_behaviour(MockBehaviour { take_bodies: true, ..Default::default() });
+    driver.own_block_imported(built.hash).await;
+    assert_eq!(driver.head(), built.hash);
+
+    driver.set_deferred_execution_time(Some(0));
+    let mut reports = driver.take_foreign_imports().expect("the report channel");
+    let next = B256::repeat_byte(0xcd);
+    driver.cache_body(body_for(next, 2));
+    driver.handle_output(&execute(next)).await;
+    let checked = reports.recv().await.expect("a check");
+    driver.finish_execute(checked).await;
+    let done = reports.recv().await.expect("a verdict");
+    assert_eq!(driver.finish_execute(done).await[0].imported_block(), Some(next));
+    assert_eq!(el.calls().last(), Some(&ElCall::NewPayloadBody(next)));
+}

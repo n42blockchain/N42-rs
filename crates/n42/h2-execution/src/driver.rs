@@ -1110,6 +1110,39 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         }
     }
 
+    /// This node's own block has reached the execution layer.
+    ///
+    /// The own import runs on a task of its own
+    /// ([`Self::spawn_import_own_block`]) and never came back through the
+    /// driver, so the state a follower import moves did not move for it: the
+    /// block was not recorded as imported, and a commit for it that was
+    /// answered SYNCING -- because the forkchoice reached the engine while
+    /// the import was still landing -- was kept in `pending_commits` and
+    /// never run again. Nothing else ever runs it, and the driver's head
+    /// then stays at the block *before* this node's own last one for the
+    /// rest of the node's life. The node keeps receiving bodies and Decides
+    /// and never imports another block, because every block after it looks
+    /// like it runs ahead of the execution layer (defect 12, loop190 Y1a
+    /// node5: head stuck at 381, block 383 and everything after it held).
+    ///
+    /// Returns the action the replayed commit produced, if there was one.
+    pub async fn own_block_imported(&mut self, block_hash: B256) -> Option<DriverAction> {
+        self.note_imported(block_hash);
+        // Only a commit that is still waiting. In the ordinary order the
+        // import lands first and the commit runs on its own a moment later,
+        // so there is nothing here and no second forkchoice is sent.
+        self.commits_ahead.remove(&block_hash);
+        if !self.pending_commits.remove(&block_hash) {
+            return None;
+        }
+        info!(
+            target: "n42.h2.el",
+            block = ?block_hash,
+            "our own block landed; the commit that was answered SYNCING runs again"
+        );
+        Some(self.commit(block_hash).await)
+    }
+
     /// Whether this node's own block `block_hash` is still on its way into the
     /// execution layer ([`Self::spawn_import_own_block`]). A leader whose next
     /// proposal builds on it is answered SYNCING until it lands, and asks again

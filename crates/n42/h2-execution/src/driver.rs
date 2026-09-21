@@ -397,7 +397,7 @@ pub fn body_once() -> bool {
 fn release_check(
     report: &tokio::sync::mpsc::UnboundedSender<ImportReport>,
     block_hash: B256,
-    txs: usize,
+    size: BlockSize,
     started: std::time::Instant,
     checked: Option<alloy_rpc_types_engine::PayloadStatus>,
 ) {
@@ -405,10 +405,27 @@ fn release_check(
     if !matches!(status.status, PayloadStatusEnum::Valid) {
         return;
     }
-    if txs >= 10_000 {
-        info!(target: "n42.h2.el", block = ?block_hash, txs, check_ms = started.elapsed().as_millis() as u64, "checked a block; executing");
+    if size.worth_logging() {
+        info!(target: "n42.h2.el", block = ?block_hash, txs = size.txs, bytes = size.bytes, check_ms = started.elapsed().as_millis() as u64, "checked a block; executing");
     }
     let _ = report.send(ImportReport::Checked(block_hash));
+}
+
+/// How big the block being imported is, in whichever unit this node knows
+/// it: a payload's transaction count, or a body's bytes -- a body is held
+/// undecoded, which is the whole point, so its transactions have not been
+/// counted.
+#[derive(Debug, Clone, Copy, Default)]
+struct BlockSize {
+    txs: usize,
+    bytes: usize,
+}
+
+impl BlockSize {
+    /// Big enough for the per-block lines, which exist for the bench tier.
+    const fn worth_logging(self) -> bool {
+        self.txs >= 10_000 || self.bytes >= 1_000_000
+    }
 }
 
 impl<E: ExecutionLayer> ExecutionDriver<E> {
@@ -1056,9 +1073,10 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         let el = std::sync::Arc::clone(&self.el);
         let report = self.foreign_imports.clone();
         let guard = ReportGuard { block_hash, report: Some(report.clone()) };
-        // A body's transaction count is not known here -- that is the point
-        // of not decoding it -- so it counts as a big block for the logs.
-        let txs = payload.as_ref().map_or(usize::MAX, |p| p.payload.as_v1().transactions.len());
+        let size = BlockSize {
+            txs: payload.as_ref().map_or(0, |p| p.payload.as_v1().transactions.len()),
+            bytes: body.as_ref().map_or(0, |b| b.rlp.len()),
+        };
         let decoder = self.body_decoder.clone();
         tokio::spawn(async move {
             let started = std::time::Instant::now();
@@ -1074,7 +1092,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                 tokio::pin!(call);
                 answered = tokio::select! {
                     checked = checked_rx => {
-                        release_check(&report, block_hash, txs, started, checked.ok());
+                        release_check(&report, block_hash, size, started, checked.ok());
                         call.await
                     }
                     answer = &mut call => answer,
@@ -1112,7 +1130,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                             // not, and the vote waits for the import as before.
                             tokio::select! {
                                 checked = checked_rx => {
-                                    release_check(&report, block_hash, txs, started, checked.ok());
+                                    release_check(&report, block_hash, size, started, checked.ok());
                                     import.await
                                 }
                                 outcome = &mut import => outcome,
@@ -1125,8 +1143,8 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                     }
                 }
             };
-            if txs >= 10_000 {
-                info!(target: "n42.h2.el", block = ?block_hash, txs, import_ms = started.elapsed().as_millis() as u64, "imported a block");
+            if size.worth_logging() {
+                info!(target: "n42.h2.el", block = ?block_hash, txs = size.txs, bytes = size.bytes, import_ms = started.elapsed().as_millis() as u64, "imported a block");
             }
             guard.done(ImportVerdict::of(outcome));
         });

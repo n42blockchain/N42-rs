@@ -182,6 +182,12 @@ pub struct H2Service<E> {
     /// Verdicts of follower imports the driver ran on a task (bench only,
     /// `N42_VOTE_BEFORE_IMPORT=1`).
     foreign_imports: Option<tokio::sync::mpsc::UnboundedReceiver<n42_h2_execution::ImportReport>>,
+    /// Outcomes of commit forkchoices the driver ran on a task
+    /// (`N42_COMMIT_FCU_ASYNC=1`). Awaiting one inside this loop was 37 ms of
+    /// the 51 ms between a view opening and the leader's proposal preamble
+    /// (loop189 X0a segment D), during which no proposal, vote or body was
+    /// read.
+    commit_reports: Option<tokio::sync::mpsc::UnboundedReceiver<n42_h2_execution::CommitReport>>,
     outputs: mpsc::Receiver<EngineOutput>,
     identity: H2V4ChainIdentity,
     /// The size the signer bitmaps on the wire are read against. A message
@@ -609,6 +615,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             engine,
             own_imports: driver.take_own_imports(),
             foreign_imports: driver.take_foreign_imports(),
+            commit_reports: driver.take_commit_reports(),
             driver,
             outputs,
             identity,
@@ -909,6 +916,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 }
                 () = std::future::ready(()) => {}
             }
+            self.drain_commit_reports(&mut events).await?;
             self.drain_outputs(&mut events).await?;
             self.forward_inbound_transactions();
             self.flush_outbox(&mut events);
@@ -924,8 +932,24 @@ impl<E: ExecutionLayer> H2Service<E> {
         let body_rx = self.body_rx.as_mut();
         let own_imports = self.own_imports.as_mut();
         let foreign_imports = self.foreign_imports.as_mut();
+        let commit_reports = self.commit_reports.as_mut();
 
         tokio::select! {
+            commit = async {
+                match commit_reports {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                // A commit forkchoice the driver sent from a task: the head,
+                // the payload removal and the `Finalized` the awaited call
+                // applied when it returned, applied now.
+                if let Some(report) = commit {
+                    for action in self.driver.finish_commit(report).await {
+                        self.apply_driver_action(action, &mut events)?;
+                    }
+                }
+            }
             verdict = async {
                 match foreign_imports {
                     Some(rx) => rx.recv().await,
@@ -1025,6 +1049,10 @@ impl<E: ExecutionLayer> H2Service<E> {
             }
         }
         self.request_overdue_bodies(&mut events);
+        // Any other commit forkchoice that has been answered meanwhile: the
+        // select takes one event, and a commit whose head has not been
+        // applied is a block short of canonical.
+        self.drain_commit_reports(&mut events).await?;
 
         // Everything the transport already has, not one event per step.
         //
@@ -1538,6 +1566,27 @@ impl<E: ExecutionLayer> H2Service<E> {
             self.handle_output(output, events).await?;
         }
         Ok(())
+    }
+
+    /// Applies every commit forkchoice the driver has already been answered
+    /// for, without waiting for another. Nothing when the driver runs the
+    /// forkchoice on the loop, which is the default: the channel is then
+    /// never written to.
+    async fn drain_commit_reports(
+        &mut self,
+        events: &mut Vec<ServiceEvent>,
+    ) -> Result<(), ServiceError> {
+        loop {
+            let Some(rx) = self.commit_reports.as_mut() else {
+                return Ok(());
+            };
+            let Ok(report) = rx.try_recv() else {
+                return Ok(());
+            };
+            for action in self.driver.finish_commit(report).await {
+                self.apply_driver_action(action, events)?;
+            }
+        }
     }
 
     async fn handle_output(

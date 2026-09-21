@@ -102,7 +102,7 @@ impl FakeEl {
                     if stream.read_exact(&mut frame).await.is_err() {
                         return;
                     }
-                    let (parent, attrs, hint) =
+                    let (parent, attrs, hint, _want_hashes) =
                         raw_engine::decode_build_on_own(&frame).expect("the frame decodes");
                     el.asked.lock().expect("not poisoned").push(Asked {
                         parent: parent.hash_slow(),

@@ -482,28 +482,37 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
         let waited = std::time::Instant::now();
         let built = chained.answer.await.ok().flatten();
         let wait_ms = waited.elapsed().as_millis() as u64;
-        match &built {
-            Some(Ok(block)) => info!(
-                target: "n42.h2.el",
-                chained = true,
-                number = block.number,
-                ?parent,
-                lead_ms,
-                wait_ms,
-                "built ahead on the chain"
-            ),
-            // The execution layer refused it or the connection failed: the
-            // caller asks the ordinary way, as it would without a chain.
-            _ => info!(
+        let Some(Ok(block)) = built else {
+            // The execution layer refused it, or the connection failed. The
+            // request goes to the execution layer the ordinary way -- a
+            // chain that could not deliver must cost nothing more than a
+            // chain that was never there -- and the branch is abandoned,
+            // since anything started behind this build stands on a block
+            // that does not exist.
+            {
+                let mut state = self.chain.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.generation = state.generation.wrapping_add(1);
+            }
+            info!(
                 target: "n42.h2.el",
                 reason = "the chained build produced nothing",
                 number = chained.number,
                 lead_ms,
                 wait_ms,
                 "chain discarded"
-            ),
-        }
-        built
+            );
+            return None;
+        };
+        info!(
+            target: "n42.h2.el",
+            chained = true,
+            number = block.number,
+            ?parent,
+            lead_ms,
+            wait_ms,
+            "built ahead on the chain"
+        );
+        Some(Ok(block))
     }
 
     /// Records the beacon root a build was started under.

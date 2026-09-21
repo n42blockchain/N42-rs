@@ -1319,7 +1319,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 Ok(chunk) if n42_h2_execution::body_once() => {
                     // The same path a gossiped body takes; the hash the peer
                     // sent it under is checked by the decode, not trusted.
-                    match self.accept_body_once(chunk.rlp.clone()) {
+                    match self.accept_body_once(chunk.rlp) {
                         Ok((block_hash, _)) if block_hash == hash => {
                             self.import_eagerly(hash);
                             self.received_bodies.push(hash);

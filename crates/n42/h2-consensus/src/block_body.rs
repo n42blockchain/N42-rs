@@ -214,6 +214,51 @@ pub fn decode_raw_block_body(
     shared: Option<&Bytes>,
     profile: N42HeaderProfile,
 ) -> Result<RawBlockBody, BlockBodyError> {
+    let body = decode_raw_block_body_ref(encoded, profile)?;
+    let own = |part: &[u8]| match shared {
+        Some(whole) => shared_slice(whole, part),
+        None => Bytes::copy_from_slice(part),
+    };
+    Ok(RawBlockBody {
+        block_hash: body.block_hash,
+        header: body.header,
+        transactions: body.transactions.iter().map(|tx| own(tx)).collect(),
+        rewards: body.rewards,
+        withdrawals: body.withdrawals,
+        bal: body.bal.map(own),
+    })
+}
+
+/// The same body with its transactions left as slices of `encoded`.
+///
+/// What the execution layer decodes: it copies each transaction's bytes
+/// itself, on the worker pool, in the pass that decodes them -- so nothing
+/// here has to allocate per transaction, and the ~25 MB buffer `encoded`
+/// points into is a reusable one the caller keeps, not a copy made per
+/// block. Nothing this returns may outlive `encoded`, which is the point:
+/// a slice that did would pin the whole body behind one transaction.
+#[derive(Debug)]
+pub struct RawBlockBodyRef<'a> {
+    /// Keccak of the header RLP, which is the hash the proposal named.
+    pub block_hash: B256,
+    /// The header, exactly as the producer sealed it.
+    pub header: Header,
+    /// Each transaction's EIP-2718 bytes, in block order.
+    pub transactions: Vec<&'a [u8]>,
+    /// gov5's rewards, as sent.
+    pub rewards: Vec<(Address, U256)>,
+    /// The rewards as the withdrawals this node's execution layer credits.
+    pub withdrawals: Vec<Withdrawal>,
+    /// The EIP-7928 block access list, when the producer sent one.
+    pub bal: Option<&'a [u8]>,
+}
+
+/// [`decode_raw_block_body`] without owning anything. See
+/// [`RawBlockBodyRef`].
+pub fn decode_raw_block_body_ref(
+    encoded: &[u8],
+    profile: N42HeaderProfile,
+) -> Result<RawBlockBodyRef<'_>, BlockBodyError> {
     let mut payload = encoded;
     let outer = RlpHeader::decode(&mut payload).map_err(|_| BlockBodyError::InvalidRlp)?;
     if !outer.list || outer.payload_length != payload.len() {
@@ -239,10 +284,7 @@ pub fn decode_raw_block_body(
         if bytes.is_empty() {
             return Err(BlockBodyError::InvalidRlp);
         }
-        transactions.push(match shared {
-            Some(whole) => shared_slice(whole, bytes),
-            None => Bytes::copy_from_slice(bytes),
-        });
+        transactions.push(bytes);
     }
 
     take_rlp_list_item(&mut payload).ok_or(BlockBodyError::InvalidRlp)?;
@@ -251,14 +293,7 @@ pub fn decode_raw_block_body(
     let bal = if payload.is_empty() {
         None
     } else {
-        take_rlp_bytes(&mut payload)
-            .ok_or(BlockBodyError::InvalidRlp)
-            .map(|bytes| {
-                Some(match shared {
-                    Some(whole) => shared_slice(whole, bytes),
-                    None => Bytes::copy_from_slice(bytes),
-                })
-            })?
+        Some(take_rlp_bytes(&mut payload).ok_or(BlockBodyError::InvalidRlp)?)
     };
     if !payload.is_empty() {
         return Err(BlockBodyError::InvalidRlp);
@@ -277,7 +312,7 @@ pub fn decode_raw_block_body(
     }
     let withdrawals = rewards_to_withdrawals(&rewards)
         .map_err(|error| BlockBodyError::InvalidRewards(error.to_string()))?;
-    Ok(RawBlockBody {
+    Ok(RawBlockBodyRef {
         block_hash: keccak256(header_rlp),
         header,
         transactions,

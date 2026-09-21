@@ -312,10 +312,12 @@ pub fn encode_foreign_body(block_hash: B256, profile: N42HeaderProfile, body: &[
 
 /// Decodes what [`encode_foreign_body`] produced.
 ///
-/// The body comes back as a slice of `buf` when `buf` is shared bytes, so
-/// the ~25 MB frame is not copied to be read.
-pub fn decode_foreign_body(buf: &Bytes) -> Result<(B256, N42HeaderProfile, Bytes), String> {
-    let mut r = Reader { rest: buf, shared: Some(buf) };
+/// The body comes back as a slice of `buf`: the ~25 MB frame is read where
+/// it was received, never copied to be read. The caller's buffer therefore
+/// outlives nothing it hands on -- see `convert_body_to_block`, which copies
+/// what it keeps.
+pub fn decode_foreign_body(buf: &[u8]) -> Result<(B256, N42HeaderProfile, &[u8]), String> {
+    let mut r = Reader { rest: buf, shared: None };
     if r.u8()? != VERSION {
         return Err("unknown raw engine version".into());
     }
@@ -325,7 +327,8 @@ pub fn decode_foreign_body(buf: &Bytes) -> Result<(B256, N42HeaderProfile, Bytes
         1 => N42HeaderProfile::Gov5H2,
         other => return Err(format!("unknown header profile {other}")),
     };
-    let body = r.bytes()?;
+    let len = r.u32()? as usize;
+    let body = r.take(len)?;
     if !r.rest.is_empty() {
         return Err(format!("foreign body frame has {} trailing bytes", r.rest.len()));
     }
@@ -481,32 +484,31 @@ mod tests {
     }
     #[test]
     fn a_foreign_body_round_trips_and_is_not_copied() {
-        let body: Bytes = Bytes::from(vec![0xab; 4096]);
+        let body = vec![0xab; 4096];
         let hash = B256::repeat_byte(0x5a);
         for profile in [N42HeaderProfile::Ethereum, N42HeaderProfile::Gov5H2] {
-            let frame = Bytes::from(encode_foreign_body(hash, profile, &body));
+            let frame = encode_foreign_body(hash, profile, &body);
             let (back_hash, back_profile, back_body) = decode_foreign_body(&frame).expect("decodes");
             assert_eq!(back_hash, hash);
             assert_eq!(back_profile, profile);
-            assert_eq!(back_body, body);
-            // A slice of the frame, not a copy of the body.
-            assert!(
-                back_body.as_ptr() >= frame.as_ptr()
-                    && back_body.as_ptr() < unsafe { frame.as_ptr().add(frame.len()) }
-            );
+            assert_eq!(back_body, &body[..]);
+            // A slice of the frame, not a copy of the body: the whole point
+            // is that the ~25 MB it carries is read where it landed.
+            let start = back_body.as_ptr() as usize - frame.as_ptr() as usize;
+            assert!(start + back_body.len() <= frame.len());
         }
     }
 
     #[test]
     fn a_truncated_or_padded_foreign_body_is_refused() {
         let frame = encode_foreign_body(B256::ZERO, N42HeaderProfile::Gov5H2, &[1, 2, 3]);
-        assert!(decode_foreign_body(&Bytes::from(frame[..frame.len() - 1].to_vec())).is_err());
+        assert!(decode_foreign_body(&frame[..frame.len() - 1]).is_err());
         let mut padded = frame.clone();
         padded.push(0);
-        assert!(decode_foreign_body(&Bytes::from(padded)).is_err());
+        assert!(decode_foreign_body(&padded).is_err());
         let mut wrong_version = frame;
         wrong_version[0] = VERSION + 1;
-        assert!(decode_foreign_body(&Bytes::from(wrong_version)).is_err());
+        assert!(decode_foreign_body(&wrong_version).is_err());
     }
 
     #[test]

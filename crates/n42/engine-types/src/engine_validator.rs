@@ -109,17 +109,20 @@ where
     /// variants against the hash: the body carries the header the producer
     /// sealed, ommers hash and difficulty included.
     ///
-    /// The transactions are decoded from slices of `rlp` and their bytes
-    /// copied for the payload in the same parallel pass. The copy is
-    /// deliberate: a slice keeps the whole ~25 MB body alive for as long as
-    /// anything downstream holds one transaction's bytes, which grew this
-    /// process by ~19 MB a block when the payload frame was decoded that way
-    /// (loop60N1). The body itself is dropped when this returns.
+    /// `rlp` is borrowed, never kept: the transactions are decoded from
+    /// slices of it and their bytes copied for the payload in the same
+    /// parallel pass, and the access list is copied too. The copies are
+    /// deliberate. A slice would keep the whole ~25 MB body alive for as
+    /// long as anything downstream held one transaction's bytes, which grew
+    /// this process by ~19 MB a block when the payload frame was decoded
+    /// that way (loop60N1) -- and borrowing lets the caller keep one buffer
+    /// and reuse it for every block instead of allocating a body's worth
+    /// per block.
     pub fn convert_body_to_block(
         &self,
         announced: B256,
         profile: N42HeaderProfile,
-        rlp: &alloy_primitives::Bytes,
+        rlp: &[u8],
     ) -> Result<(SealedBlock<EthBlock>, ExecutionData), NewPayloadError> {
         use alloy_eips::eip4895::Withdrawals;
         let other = |message: String| NewPayloadError::Other(message.into());
@@ -132,7 +135,7 @@ where
         let started = std::time::Instant::now();
         // One walk of the body: the header, the transactions as slices of
         // it, the rewards as withdrawals, the access list.
-        let body = n42_h2_consensus::decode_raw_block_body(rlp, Some(rlp), profile)
+        let body = n42_h2_consensus::decode_raw_block_body_ref(rlp, profile)
             .map_err(|err| other(err.to_string()))?;
         if body.block_hash != announced {
             return Err(other(format!(
@@ -157,11 +160,9 @@ where
                 body.transactions
                     .par_iter()
                     .map(|tx| {
-                        let decoded = <TransactionSigned as alloy_eips::Decodable2718>::decode_2718_exact(
-                            tx.as_ref(),
-                        )
-                        .map_err(alloy_rlp::Error::from)
-                        .map_err(PayloadError::from)?;
+                        let decoded = <TransactionSigned as alloy_eips::Decodable2718>::decode_2718_exact(tx)
+                            .map_err(alloy_rlp::Error::from)
+                            .map_err(PayloadError::from)?;
                         Ok::<_, PayloadError>((decoded, alloy_primitives::Bytes::copy_from_slice(tx)))
                     })
                     .collect::<Vec<Result<_, _>>>()
@@ -179,13 +180,16 @@ where
         }
 
         // The payload the engine's own pass will take, built from the same
-        // parts rather than parsed again.
+        // parts rather than parsed again. The access list is copied for the
+        // same reason the transactions are: it is a slice of the body, and a
+        // payload that outlives this call must not pin 25 MB behind one
+        // field of it.
         let payload = n42_h2_consensus::execution_data_from_raw_parts(
             body.block_hash,
             &body.header,
             raw_transactions,
             body.withdrawals.clone(),
-            body.bal.clone(),
+            body.bal.map(alloy_primitives::Bytes::copy_from_slice),
         );
 
         let withdrawals = body.header.withdrawals_root.map(|_| Withdrawals(body.withdrawals));

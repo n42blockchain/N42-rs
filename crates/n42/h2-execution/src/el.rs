@@ -93,6 +93,41 @@ pub struct BuiltBlock {
     pub header: Option<alloy_consensus::Header>,
 }
 
+/// What a caller passes with a build request when it will want the block
+/// after this one too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChainAhead {
+    /// The view the block being built now will be proposed under. The
+    /// execution layer hands it straight back with the sealed-early header,
+    /// because it is the consensus side that needs it: the header's extra
+    /// data is stamped with it, and the chained build's parent hash is that
+    /// stamped header's hash.
+    pub view: u64,
+}
+
+/// Turns a block's built header, the attributes it was built with and the
+/// view it will be proposed under into the header this node will propose and
+/// the attributes of the block after it.
+///
+/// The attributes are passed because sealing needs the block's withdrawals --
+/// its rewards on this chain -- and they are not recoverable from the header,
+/// which carries only their root.
+///
+/// Both halves must be the very functions the proposal uses, or a chained
+/// build is a block the leader cannot propose: the parent hash would differ
+/// from the one it seals, and every chained build would be discarded. The
+/// node wires its own sealing and its own attributes builder in here for
+/// exactly that reason. `None` declines -- no chain this time.
+pub type ChainSealer = std::sync::Arc<
+    dyn Fn(
+            &alloy_consensus::Header,
+            &PayloadAttributes,
+            u64,
+        ) -> Option<(alloy_consensus::Header, PayloadAttributes)>
+        + Send
+        + Sync,
+>;
+
 /// A block as the execution layer holds it: header, transactions and, on a
 /// post-Shanghai chain, its withdrawals — which on a gov5 chain are its
 /// rewards.
@@ -223,6 +258,34 @@ pub trait ExecutionLayer: Send + Sync + 'static {
     ) -> Option<Result<BuiltBlock, ElError>> {
         let _ = (header, attrs);
         None
+    }
+
+    /// [`Self::build_on_own_block`] told that the height *after* the one
+    /// being built is this node's as well, so the execution layer may be
+    /// asked to hand back the block's header the moment it seals it and the
+    /// next build may be started on it without waiting for the proposal --
+    /// the build chain (`N42_BUILD_CHAIN`).
+    ///
+    /// `chain` is `None` whenever consensus has not said the next height is
+    /// ours: the chain is never started on a guess. The default ignores it
+    /// entirely, which is what an execution layer without the chain does.
+    async fn build_on_own_block_chaining(
+        &self,
+        header: &alloy_consensus::Header,
+        attrs: PayloadAttributes,
+        chain: Option<ChainAhead>,
+    ) -> Option<Result<BuiltBlock, ElError>> {
+        let _ = chain;
+        self.build_on_own_block(header, attrs).await
+    }
+
+    /// Installs what turns a block's *built* header into the header this node
+    /// will propose, and into the next block's attributes. Only the consensus
+    /// side can do that -- the view and the seal key live there -- so the
+    /// build chain asks for it rather than guessing at a hash. Without a
+    /// sealer nothing chains.
+    fn set_chain_sealer(&self, sealer: ChainSealer) {
+        let _ = sealer;
     }
 
     /// Classified Engine-API `newPayload` call.

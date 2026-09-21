@@ -50,9 +50,9 @@ use alloy_rpc_types_engine::{
     ForkchoiceUpdated,
     PayloadAttributes, PayloadId, PayloadStatus, PraguePayloadFields,
 };
-use n42_h2_execution::{ChainBlock, BuiltBlock, ElError, ExecutionLayer, ExecutionPath, ResolveKind};
+use n42_h2_execution::{ChainAhead, ChainBlock, ChainSealer, BuiltBlock, ElError, ExecutionLayer, ExecutionPath, ResolveKind};
 use serde_json::{json, Value};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::transport::{
     JsonRpcTransport, TransportError, INVALID_PAYLOAD_ATTRIBUTES, METHOD_NOT_FOUND,
@@ -66,6 +66,289 @@ use crate::transport::{
 /// dropped rather than accumulating, since a build nobody collected is never
 /// coming back.
 const MAX_TRACKED_BUILDS: usize = 16;
+
+/// How long a chained build may sit unclaimed before it is thrown away.
+///
+/// A tenure that ends leaves exactly one behind: the chain starts the block
+/// after the one it has just seen sealed, and the proposal for it never
+/// comes. That one is discarded by the next request naming another parent;
+/// this bound is for the case where no request comes at all, so a node that
+/// stops leading does not hold a block's worth of state for the rest of the
+/// leg.
+const CHAIN_STALE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How long a discarded chained build is waited out before the request that
+/// replaced it goes ahead regardless. Long enough for a build at the bench
+/// tier (~250 ms) and several times over; short enough that an execution
+/// layer that has stopped answering does not take the leader with it.
+const CHAIN_DRAIN: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// A build the chain started before the proposal path asked for it.
+///
+/// At most one exists: the chain runs exactly one block ahead of the last
+/// block a request named, because a block is ~1-2 GB of live state at the
+/// bench tier and two of them ahead would be memory the leader cannot spare.
+/// The successor is only started once this one has been taken.
+#[derive(Debug)]
+struct Chained {
+    /// The generation it belongs to.
+    generation: u64,
+    /// The parent it was started on: the hash of the header this client
+    /// sealed for the block the execution layer had just built.
+    parent: B256,
+    /// The attributes it was started with.
+    attrs: PayloadAttributes,
+    /// The block's number, for the log line.
+    number: u64,
+    /// When the request went out, which is what `lead_ms` measures from.
+    started: std::time::Instant,
+    /// The built block, when the chain task has it.
+    answer: tokio::sync::oneshot::Receiver<Option<Result<BuiltBlock, ElError>>>,
+}
+
+/// The one chained build, if any.
+#[derive(Debug, Default)]
+struct ChainState {
+    slot: Option<Chained>,
+    /// Bumped whenever a chained build is thrown away. A task from a branch
+    /// that has been abandoned still reads its own answer to the end, and
+    /// would otherwise start the build after it: the generation is how it
+    /// finds out that nobody is following it any more, so a single wrong
+    /// guess costs one build and not every build after it.
+    generation: u64,
+    /// Connections the chain has finished with, for the next one to take.
+    ///
+    /// Not a detail: a chained build's answer is ~26 MB, and both ends keep
+    /// their buffers per connection. A fresh connection a block would be a
+    /// fresh ~26 MB buffer a block on each side, first-touched every time --
+    /// which is the page-fault rate that made `serve_connection` hold its
+    /// buffers in the first place. Two is enough: one generation's
+    /// connection is still reading when the next one is made.
+    spare: Vec<tokio::net::TcpStream>,
+}
+
+/// Chain connections kept for reuse.
+const CHAIN_SPARES: usize = 2;
+
+/// The sealer, kept in a `Debug` client.
+struct Sealer(ChainSealer);
+
+impl std::fmt::Debug for Sealer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ChainSealer")
+    }
+}
+
+/// One frame of a build-on-own answer.
+#[derive(Debug)]
+enum BuildFrame {
+    /// The execution layer offers nothing.
+    Nothing,
+    /// A refusal, with its message.
+    Refused(String),
+    /// The *built* header of the block being built, sent the moment the
+    /// builder sealed it early. Only ever sent to a request that hinted.
+    ChainHeader(Box<alloy_consensus::Header>),
+    /// The block.
+    Built(Box<Result<BuiltBlock, ElError>>),
+}
+
+/// Reads one frame of a build-on-own answer.
+async fn read_build_frame(
+    stream: &mut tokio::net::TcpStream,
+    beacon_root: B256,
+) -> std::io::Result<BuildFrame> {
+    use tokio::io::AsyncReadExt;
+    match stream.read_u8().await? {
+        0 => Ok(BuildFrame::Nothing),
+        2 => {
+            let len = stream.read_u32_le().await? as usize;
+            let mut message = vec![0u8; len];
+            stream.read_exact(&mut message).await?;
+            Ok(BuildFrame::Refused(String::from_utf8_lossy(&message).into_owned()))
+        }
+        n42_h2_execution::raw_engine::reply::CHAIN_HEADER => {
+            use alloy_rlp::Decodable as _;
+            let len = stream.read_u32_le().await? as usize;
+            let mut rlp = vec![0u8; len];
+            stream.read_exact(&mut rlp).await?;
+            let header = alloy_consensus::Header::decode(&mut &rlp[..])
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("chain header: {err}")))?;
+            Ok(BuildFrame::ChainHeader(Box::new(header)))
+        }
+        1 => {
+            let len = stream.read_u32_le().await? as usize;
+            let mut block = vec![0u8; len];
+            stream.read_exact(&mut block).await?;
+            let requests = if stream.read_u8().await? == 1 {
+                let n = stream.read_u32_le().await? as usize;
+                let mut requests = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let len = stream.read_u32_le().await? as usize;
+                    let mut request = vec![0u8; len];
+                    stream.read_exact(&mut request).await?;
+                    requests.push(alloy_primitives::Bytes::from(request));
+                }
+                Some(requests)
+            } else {
+                None
+            };
+            let bal = if stream.read_u8().await? == 1 {
+                let len = stream.read_u32_le().await? as usize;
+                let mut bal = vec![0u8; len];
+                stream.read_exact(&mut bal).await?;
+                Some(alloy_primitives::Bytes::from(bal))
+            } else {
+                None
+            };
+            Ok(BuildFrame::Built(Box::new(built_block_from_parts(block.into(), requests, bal, beacon_root))))
+        }
+        other => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("status {other}"))),
+    }
+}
+
+/// Starts the build on a block the execution layer has just sealed early --
+/// the chain -- when the caller said the height after it is this node's too.
+///
+/// The parent hash the next block carries is the hash of the header this node
+/// will *propose*, not the one the builder made: consensus stamps the view
+/// into the extra data and seals it with the leader's key, and that changes
+/// the hash. Only the consensus side can do that, which is why the chain runs
+/// through `sealer` -- the very functions the proposal uses -- rather than the
+/// execution layer guessing at a parent. The view is the one the caller named
+/// in its hint; if the fleet ends up proposing that block under another view
+/// the seal differs, the parent differs, and the request that arrives
+/// discards this build instead of taking it.
+fn start_chain(
+    chain: &std::sync::Arc<std::sync::Mutex<ChainState>>,
+    sealer: &ChainSealer,
+    addr: std::net::SocketAddr,
+    built: &alloy_consensus::Header,
+    built_with: &PayloadAttributes,
+    view: u64,
+    generation: u64,
+) {
+    // Synchronous on purpose. It is called from the very task it starts, one
+    // generation on, and an `async fn` that spawned its own future type
+    // would be a future containing itself.
+    let mut state = chain.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state.generation != generation {
+        debug!(
+            target: "n42.h2.el",
+            number = built.number,
+            "no chain: this one's branch was abandoned"
+        );
+        return;
+    }
+    if let Some(waiting) = &state.slot {
+        // One ahead, never two: the previous chained build has not been
+        // taken, so the proposal is behind and a second would be a block of
+        // state nobody asked for.
+        debug!(
+            target: "n42.h2.el",
+            number = waiting.number,
+            "no chain: the previous chained build has not been taken"
+        );
+        return;
+    }
+    let Some((sealed, attrs)) = (sealer)(built, built_with, view) else {
+        debug!(target: "n42.h2.el", number = built.number, view, "no chain: the sealer declined");
+        return;
+    };
+    let parent = sealed.hash_slow();
+    let number = sealed.number.saturating_add(1);
+    // The chained request hints in turn, so the chain carries on; `chained`
+    // is only so the execution layer's build line says which builds came
+    // this way.
+    let next_view = view.saturating_add(1);
+    let hint = n42_h2_execution::raw_engine::ChainHint { view: next_view, chained: true };
+    let frame = n42_h2_execution::raw_engine::encode_build_on_own_chaining(&sealed, &attrs, Some(hint));
+    let beacon_root = attrs.parent_beacon_block_root.unwrap_or_default();
+    let (tx, answer) = tokio::sync::oneshot::channel();
+    let chain_for_task = std::sync::Arc::clone(chain);
+    let sealer_for_task = std::sync::Arc::clone(sealer);
+    let attrs_for_task = attrs.clone();
+    tokio::spawn(async move {
+        let built = chain_request(
+            chain_for_task,
+            sealer_for_task,
+            addr,
+            frame,
+            attrs_for_task,
+            beacon_root,
+            next_view,
+            generation,
+        )
+        .await;
+        // The receiver is gone when the build was discarded before it
+        // finished; the block is dropped with it.
+        let _ = tx.send(built);
+    });
+    info!(target: "n42.h2.el", number, ?parent, view = next_view, "chain started");
+    state.slot =
+        Some(Chained { generation, parent, attrs, number, started: std::time::Instant::now(), answer });
+}
+
+/// One chained build: its own connection, its own request, its own answer.
+///
+/// A connection of its own rather than the pooled one, because the request
+/// the proposal makes for the *previous* block is still being answered on
+/// that one when this goes out -- that overlap is the whole gain.
+async fn chain_request(
+    chain: std::sync::Arc<std::sync::Mutex<ChainState>>,
+    sealer: ChainSealer,
+    addr: std::net::SocketAddr,
+    frame: Vec<u8>,
+    attrs: PayloadAttributes,
+    beacon_root: B256,
+    view: u64,
+    generation: u64,
+) -> Option<Result<BuiltBlock, ElError>> {
+    use tokio::io::AsyncWriteExt;
+    let spare = chain.lock().unwrap_or_else(std::sync::PoisonError::into_inner).spare.pop();
+    let attempt: std::io::Result<(Option<Result<BuiltBlock, ElError>>, tokio::net::TcpStream)> = async {
+        let mut conn = match spare {
+            Some(conn) => conn,
+            None => {
+                let conn = tokio::net::TcpStream::connect(addr).await?;
+                conn.set_nodelay(true)?;
+                conn
+            }
+        };
+        conn.write_u8(n42_h2_execution::raw_engine::request::BUILD_ON_OWN).await?;
+        conn.write_u32_le(frame.len() as u32).await?;
+        conn.write_all(&frame).await?;
+        let answer = loop {
+            match read_build_frame(&mut conn, beacon_root).await? {
+                BuildFrame::Nothing => break None,
+                BuildFrame::Refused(message) => {
+                    debug!(target: "n42.h2.el", %message, "the chained build was refused");
+                    break None;
+                }
+                // This build has sealed: the one after it can start now.
+                BuildFrame::ChainHeader(header) => {
+                    start_chain(&chain, &sealer, addr, &header, &attrs, view, generation);
+                }
+                BuildFrame::Built(built) => break Some(*built),
+            }
+        };
+        Ok((answer, conn))
+    }
+    .await;
+    match attempt {
+        Ok((built, conn)) => {
+            let mut state = chain.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.spare.len() < CHAIN_SPARES {
+                state.spare.push(conn);
+            }
+            built
+        }
+        Err(err) => {
+            debug!(target: "n42.h2.el", %err, "the chained build failed on the channel");
+            None
+        }
+    }
+}
 
 /// An [`ExecutionLayer`] speaking the Engine API over `T`.
 #[derive(Debug)]
@@ -98,6 +381,17 @@ pub struct EngineApiClient<T> {
     /// The build on a sealed own block: its own connection, because it runs
     /// while the own-block import holds `raw_import`.
     raw_build: tokio::sync::Mutex<RawChannel>,
+    /// What turns a built header into the header this node will propose and
+    /// into the next block's attributes. Installed by the consensus side;
+    /// without it nothing chains, which is what makes an execution layer
+    /// driven by anything else behave exactly as before.
+    chain_sealer: std::sync::OnceLock<Sealer>,
+    /// The one build the chain has started ahead of the request for it.
+    ///
+    /// A plain mutex: it is only ever held to put a build in or take one out,
+    /// never across a wait, and `start_chain` has to be callable from a task
+    /// that is itself a chained build.
+    chain: std::sync::Arc<std::sync::Mutex<ChainState>>,
 }
 
 /// State of the raw payload channel. See `payload_serve` in `bin/n42`.
@@ -120,7 +414,102 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
             raw_channel: tokio::sync::Mutex::new(RawChannel::default()),
             raw_import: tokio::sync::Mutex::new(RawChannel::default()),
             raw_build: tokio::sync::Mutex::new(RawChannel::default()),
+            chain_sealer: std::sync::OnceLock::new(),
+            chain: std::sync::Arc::new(std::sync::Mutex::new(ChainState::default())),
         }
+    }
+
+    /// The chained build for `(parent, attrs)`, if the chain started exactly
+    /// that one. Anything else in the slot is discarded, with the reason, and
+    /// the caller asks the execution layer the ordinary way.
+    ///
+    /// The comparison is the whole safety argument: a chained build is taken
+    /// only when its parent *hash* and its attributes are the ones the
+    /// request names, so the block it produced is the block the request would
+    /// have produced. Nothing is patched up to make a near-miss fit.
+    async fn take_chained(
+        &self,
+        parent: B256,
+        attrs: &PayloadAttributes,
+    ) -> Option<Result<BuiltBlock, ElError>> {
+        let (chained, generation) = {
+            // Taken under the lock and waited for outside it: the task that
+            // is finishing this build puts the next one in the same slot.
+            let mut state = self.chain.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            (state.slot.take()?, state.generation)
+        };
+        let lead_ms = chained.started.elapsed().as_millis() as u64;
+        let reason = if chained.generation != generation {
+            // A task from an abandoned branch filed this after the discard
+            // that abandoned it.
+            Some("its branch was abandoned")
+        } else if chained.parent != parent {
+            Some("the request names another parent")
+        } else if chained.attrs != *attrs {
+            Some("the request's attributes differ")
+        } else if chained.started.elapsed() > CHAIN_STALE {
+            Some("unclaimed past the bound")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            // Abandon the branch first: the task finishing this build would
+            // otherwise start the one after it, and a single wrong guess
+            // would cost a build on every view that followed.
+            {
+                let mut state = self.chain.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.generation = state.generation.wrapping_add(1);
+            }
+            info!(
+                target: "n42.h2.el",
+                reason,
+                number = chained.number,
+                started_on = ?chained.parent,
+                asked_for = ?parent,
+                lead_ms,
+                "chain discarded"
+            );
+            // Waited out, not just dropped. The request that follows starts
+            // another build on this execution layer, and two builds drawing
+            // from the transaction queue at once is the shape that cost
+            // round 44 a leg: one build's take handed back while the other
+            // was still taking. The block itself is thrown away -- only the
+            // builder finishing is waited for -- and the bound is there so a
+            // hung execution layer cannot hold the leader here.
+            let drained = std::time::Instant::now();
+            let _ = tokio::time::timeout(CHAIN_DRAIN, chained.answer).await;
+            debug!(
+                target: "n42.h2.el",
+                drain_ms = drained.elapsed().as_millis() as u64,
+                "the discarded chained build finished"
+            );
+            return None;
+        }
+        let waited = std::time::Instant::now();
+        let built = chained.answer.await.ok().flatten();
+        let wait_ms = waited.elapsed().as_millis() as u64;
+        match &built {
+            Some(Ok(block)) => info!(
+                target: "n42.h2.el",
+                chained = true,
+                number = block.number,
+                ?parent,
+                lead_ms,
+                wait_ms,
+                "built ahead on the chain"
+            ),
+            // The execution layer refused it or the connection failed: the
+            // caller asks the ordinary way, as it would without a chain.
+            _ => info!(
+                target: "n42.h2.el",
+                reason = "the chained build produced nothing",
+                number = chained.number,
+                lead_ms,
+                wait_ms,
+                "chain discarded"
+            ),
+        }
+        built
     }
 
     /// Records the beacon root a build was started under.
@@ -477,7 +866,27 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
         header: &alloy_consensus::Header,
         attrs: PayloadAttributes,
     ) -> Option<Result<BuiltBlock, ElError>> {
-        self.build_on_own_over_channel(header, attrs).await
+        self.build_on_own_over_channel(header, attrs, None).await
+    }
+
+    async fn build_on_own_block_chaining(
+        &self,
+        header: &alloy_consensus::Header,
+        attrs: PayloadAttributes,
+        chain: Option<ChainAhead>,
+    ) -> Option<Result<BuiltBlock, ElError>> {
+        // A build the chain already started for exactly this parent and
+        // these attributes is the block this request would have asked for,
+        // and it has had a head start of `lead_ms`. Anything else in the
+        // slot is discarded before the ordinary request goes out.
+        if let Some(built) = self.take_chained(header.hash_slow(), &attrs).await {
+            return Some(built);
+        }
+        self.build_on_own_over_channel(header, attrs, chain).await
+    }
+
+    fn set_chain_sealer(&self, sealer: ChainSealer) {
+        let _ = self.chain_sealer.set(Sealer(sealer));
     }
 
     async fn import_own_block(
@@ -773,13 +1182,29 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
         &self,
         header: &alloy_consensus::Header,
         attrs: PayloadAttributes,
+        chain: Option<ChainAhead>,
     ) -> Option<Result<BuiltBlock, ElError>> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
         let mut channel = self.raw_build.lock().await;
         let addr = self.raw_endpoint(&mut channel).await?;
         let started = std::time::Instant::now();
         let beacon_root = attrs.parent_beacon_block_root.unwrap_or_default();
-        let frame = n42_h2_execution::raw_engine::encode_build_on_own(header, &attrs);
+        // The hint goes out only when consensus said the height after this
+        // one is ours *and* a sealer is installed: the chain needs both ends,
+        // and without the hint the execution layer answers exactly as it did
+        // before any of this existed.
+        let sealer = self.chain_sealer.get().map(|sealer| std::sync::Arc::clone(&sealer.0));
+        let hint = chain.zip(sealer.as_ref()).map(|(chain, _)| n42_h2_execution::raw_engine::ChainHint {
+            view: chain.view,
+            chained: false,
+        });
+        let frame = n42_h2_execution::raw_engine::encode_build_on_own_chaining(header, &attrs, hint);
+        let chain_state = std::sync::Arc::clone(&self.chain);
+        // The generation as it stands now: a discard just before this call
+        // has already bumped it, so a chain started from here belongs to the
+        // branch the proposal is actually on.
+        let generation =
+            chain_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).generation;
         let taken = channel.stream.take();
         let attempt: std::io::Result<(Option<Result<BuiltBlock, ElError>>, tokio::net::TcpStream)> = async {
             let mut conn = match taken {
@@ -790,60 +1215,37 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
                     stream
                 }
             };
-            let stream = &mut conn;
-            stream.write_u8(n42_h2_execution::raw_engine::request::BUILD_ON_OWN).await?;
-            stream.write_u32_le(frame.len() as u32).await?;
-            stream.write_all(&frame).await?;
-            let answer = match stream.read_u8().await? {
-                0 => None,
-                2 => {
-                    let len = stream.read_u32_le().await? as usize;
-                    let mut message = vec![0u8; len];
-                    stream.read_exact(&mut message).await?;
-                    debug!(
-                        target: "n42.h2.el",
-                        message = %String::from_utf8_lossy(&message),
-                        "build on the sealed block refused; building ahead the ordinary way"
-                    );
-                    None
-                }
-                1 => {
-                    let len = stream.read_u32_le().await? as usize;
-                    let mut block = vec![0u8; len];
-                    stream.read_exact(&mut block).await?;
-                    let requests = if stream.read_u8().await? == 1 {
-                        let n = stream.read_u32_le().await? as usize;
-                        let mut requests = Vec::with_capacity(n);
-                        for _ in 0..n {
-                            let len = stream.read_u32_le().await? as usize;
-                            let mut request = vec![0u8; len];
-                            stream.read_exact(&mut request).await?;
-                            requests.push(alloy_primitives::Bytes::from(request));
+            conn.write_u8(n42_h2_execution::raw_engine::request::BUILD_ON_OWN).await?;
+            conn.write_u32_le(frame.len() as u32).await?;
+            conn.write_all(&frame).await?;
+            let answer = loop {
+                match read_build_frame(&mut conn, beacon_root).await? {
+                    BuildFrame::Nothing => break None,
+                    BuildFrame::Refused(message) => {
+                        debug!(
+                            target: "n42.h2.el",
+                            %message,
+                            "build on the sealed block refused; building ahead the ordinary way"
+                        );
+                        break None;
+                    }
+                    // This block is sealed; the one after it can start now,
+                    // before this one is encoded and sent (~30 ms and ~26 MB)
+                    // and before the proposal that follows.
+                    BuildFrame::ChainHeader(built) => {
+                        if let (Some(sealer), Some(chain)) = (sealer.as_ref(), chain) {
+                            start_chain(&chain_state, sealer, addr, &built, &attrs, chain.view, generation);
                         }
-                        Some(requests)
-                    } else {
-                        None
-                    };
-                    let bal = if stream.read_u8().await? == 1 {
-                        let len = stream.read_u32_le().await? as usize;
-                        let mut bal = vec![0u8; len];
-                        stream.read_exact(&mut bal).await?;
-                        Some(alloy_primitives::Bytes::from(bal))
-                    } else {
-                        None
-                    };
-                    let received = started.elapsed();
-                    let built = built_block_from_parts(block.into(), requests, bal, beacon_root);
-                    debug!(
-                        target: "n42.h2.el",
-                        bytes = len,
-                        channel_ms = received.as_millis() as u64,
-                        split_ms = started.elapsed().saturating_sub(received).as_millis() as u64,
-                        "block built on the sealed block collected"
-                    );
-                    Some(built)
+                    }
+                    BuildFrame::Built(built) => {
+                        debug!(
+                            target: "n42.h2.el",
+                            channel_ms = started.elapsed().as_millis() as u64,
+                            "block built on the sealed block collected"
+                        );
+                        break Some(*built);
+                    }
                 }
-                other => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("status {other}"))),
             };
             Ok((answer, conn))
         }

@@ -16,6 +16,7 @@ went with it.
 ```bash
 cargo build --release -p n42 -p n42-h2-node --bins --examples
 scripts/fleet7.sh up --fresh     # seven nodes from genesis
+scripts/fleet7.sh print          # every command line and CPU set, starting nothing
 scripts/fleet7.sh status         # heights and head hashes, and whether they agree
 scripts/fleet7.sh watch 300      # a measured window: blocks, memory, disk, loopback
 scripts/fleet7.sh roll 3         # stop and restart one node; check it rejoins
@@ -24,6 +25,120 @@ scripts/fleet7.sh down           # SIGTERM, and wait
 
 Data lives under `/data/blockchain/rust-fleet7` — deliberately not `/tmp`, which
 on this host is a 69 GB tmpfs, where a datadir *is* resident memory.
+
+## Four nodes
+
+The fleet's size is `F7_NODES`, and everything that follows from it — the
+quorum, the core layout, the ports, the static mesh, the flood's target list —
+follows from that one variable. `scripts/fleet4-env.sh` sets it to four and
+nothing else about the fleet changes:
+
+```bash
+source scripts/fleet4-env.sh           # bench tier; `lean` for the 3 s chain
+scripts/fleet7.sh print                # read the layout before starting anything
+scripts/fleet7-bench.sh --tag fourA --gasceil 3423000000 --senders 6000 --pertx 12000
+```
+
+That is the whole switch. The same binaries, the same scripts, the same levers;
+`scripts/fleet7.sh`, `fleet7-bench.sh`, `fleet7-repeat.sh` and every
+`fleet7-*.py` take the size from the environment and are unchanged for seven
+when the file is not sourced.
+
+### Why
+
+Seven nodes at 16 physical cores each read 429–443k TPS, and section 2o of
+`docs/FLEET7_PLAN_V4.md` says what binds: every node verifies every transaction
+(`F7_INGEST_ALL`) on the cores its import and its build run on, so at ~11 µs of
+ingest per transaction 435k/s is about five of a node's sixteen cores before a
+block is touched, and what is left of the vote road and of the build are slices
+of one budget — cutting one hands its time to another. Four nodes at 28
+physical cores each change the budget without changing a line of the node.
+
+### The core layout
+
+Both fleets pin whole physical cores: node `i` takes cores
+`F7_CORE_OFFSET + i * F7_CORES_PER_NODE / 2` upward, each with its SMT sibling
+at +128 on this 1-socket / 128-core / 256-CPU host. `scripts/fleet7.sh print`
+prints the table; it is the same arithmetic `f7_pin` and `f7_flood_cores` use,
+so the nodes and the generator cannot disagree about who owns a core.
+
+| | seven nodes (32 CPUs each) | four nodes (56 CPUs each) |
+| --- | --- | --- |
+| node 0 | `0-15,128-143` | `0-27,128-155` |
+| node 1 | `16-31,144-159` | `28-55,156-183` |
+| node 2 | `32-47,160-175` | `56-83,184-211` |
+| node 3 | `48-63,176-191` | `84-111,212-239` |
+| node 4 | `64-79,192-207` | — |
+| node 5 | `80-95,208-223` | — |
+| node 6 | `96-111,224-239` | — |
+| flood | `112-127,240-255` | `112-127,240-255` |
+| physical cores to the nodes | 112 | 112 |
+| quorum | 5 of 7 (f = 2) | 3 of 4 (f = 1) |
+
+The generator's sixteen physical cores are **the same sixteen in both**, which
+is what makes the two fleets comparable: neither has a node sharing a physical
+core with another node or with the flood, and the supply side is pinned
+identically. `f7_check_layout` refuses a size that would not fit — `up` runs it
+before it wipes anything, because two nodes on one core is not a crash, it is a
+node that runs 2–3× slower with nothing in any log saying so.
+
+### What differs in the genesis
+
+`crates/chainspec/res/genesis/n42_fleet4.json` and `n42_fleet4_bench.json` are
+their seven-node counterparts with `hotstuff.validators` truncated to the first
+four entries, and **nothing else touched** — chain id, forks, gas limit,
+period, `alloc`, `extraData`, the committee pool and `altSigTx` are all
+byte-identical. `scripts/fleet-genesis.py --nodes 4` regenerates them and
+`--check` verifies the checked-in files; three unit tests in
+`crates/n42/qmdb-reth/src/hotstuff.rs` assert the rest.
+
+That works because `h2_keygen` derives validator `i` from
+`keccak256("<seed>-<i>")` — the index alone, never the count — so the first
+four keys of the seven-key set *are* the four-key set from the same seed. Both
+fleets therefore keep `F7_SEED=n42-fleet7-validator`, node `i` holds the same
+BLS key and the same libp2p identity in either, and `f7_place_keys` reproduces
+them with `--count $F7_NODES`. `f = (n-1)/3` and the quorum `n - f` are computed
+by the node from the list's length; neither is written in the file.
+
+Two consequences worth holding on to:
+
+- **The two chains share a genesis hash, and therefore a fork digest.** The
+  `hotstuff` block lives in `config`, which the genesis header does not cover.
+  Members of the two fleets would mesh on the wire and diverge only at the
+  committee-evidence link. That is why `fleet4-env.sh` gives the fleet a root of
+  its own (`/data/blockchain/rust-fleet4-bench`) and why the **ports are
+  deliberately not changed**: `fleet7.sh down` refuses while anything still
+  listens on them, so a seven-node member that outlived its round stops a
+  four-node round instead of quietly running beside it.
+- **Pointing a four-node fleet at the seven-validator genesis is the quiet
+  failure of the whole switch.** The three absent members never vote, so the
+  quorum the present ones compute from the list is five, which four nodes cannot
+  reach: the chain proposes and never commits, and nothing says why.
+  `f7_check_validator_count` refuses it at `up` and names the file to use.
+
+### What to read first
+
+Not TPS. Two tables, both of which say where a node's cores go:
+
+1. **`scripts/fleet7-runs/threadcpu.py <seconds>`** — per-thread-name CPU of
+   every execution layer, validator and the flood, every 5 s. It reads the fleet
+   from `F7_ROOT`, so export it (sourcing `fleet4-env.sh` does) or pass the root
+   as the second argument; pointed at the wrong root it finds nothing and says
+   so. loop198's table at 16 cores against the same table at 28 is the
+   comparison: the segments that were slices of one budget should separate
+   again.
+2. **`scripts/fleet7-runs/dissect190.py <leg>`** — the window-1 cycle, segment
+   by segment. Node count and quorum come from the leg's own `node<i>-el.log`
+   files (`--nodes N` overrides), and the gating follower follows the quorum:
+   the 4th-fastest of six at seven nodes, the **2nd-fastest of three** at four,
+   because the leader's own vote is already one of the quorum. The header line
+   states which it used.
+
+Then `scripts/fleet7-quorum.py` (quorum from the logs found, not a constant) and
+`scripts/fleet7-verify.py` (`F7_NODES` from the environment). A four-node round
+gates on three votes out of four, so one slow importer now holds the chain up
+where at seven nodes two could lag for free — that is the first thing a leg can
+falsify, and `fleet7-quorum.py`'s "slowest minus quorum" is where it shows.
 
 ## Where it stands today: 365,399 TPS (2026-09-05)
 

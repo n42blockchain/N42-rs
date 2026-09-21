@@ -23,11 +23,13 @@ one table is a comparison of nothing, and it has been made twice here.
 
 import datetime
 import glob
+import os
 import re
 import sys
 from collections import defaultdict
 
-ROOT = sys.argv[1] if len(sys.argv) > 1 else '/data/blockchain/rust-fleet7-bench'
+ROOT = sys.argv[1] if len(sys.argv) > 1 else os.environ.get(
+    'F7_ROOT', '/data/blockchain/rust-fleet7-bench')
 CLEAN = re.compile(r'\x1b\[[0-9;]*m')
 STAMP = re.compile(r'^(\d{4}-\d{2}-\d{2}T[\d:.]+)Z')
 HASH = re.compile(r'(?:decide\.)?block_hash="?(0x[0-9a-f]+)"?')

@@ -1,11 +1,54 @@
 #!/usr/bin/env python3
 # Copyright (c) 2017-2025 N42 Contributors
 # SPDX-License-Identifier: MIT OR Apache-2.0
-import re, sys, statistics, datetime, os
+"""Where a window-1 cycle goes, segment by segment, from a leg's archived logs.
 
-ROOT = "/data/blockchain/rust-fleet7-bench"
+    dissect190.py [--nodes N] [--root DIR] <leg> [<leg> ...]
+
+Node count and quorum are not constants. `--nodes` overrides; otherwise the
+leg's own `node<i>-el.log` files are counted, so a four-node leg dissects as a
+four-node leg without a flag. Everything derived from the fleet's size is
+derived from that one number:
+
+  * `f = (n - 1) / 3` and the quorum `n - f` -- 5 of 7, 3 of 4 -- the same
+    arithmetic as `ValidatorSet::quorum_size` and `f7_quorum`.
+  * the GATING follower. The leader's own vote is one of the quorum, so what a
+    commit waits for is the `(quorum - 1)`th fastest follower: the 4th of six
+    at seven nodes, the 2nd of three at four. Reading the 4th of three would
+    silently report nothing at all, and reading the median would report a
+    follower the chain never waits for.
+"""
+import re, sys, statistics, datetime, os, glob
+
+ROOT = os.environ.get('F7_ROOT', '/data/blockchain/rust-fleet7-bench')
+NODES = 0        # filled by resolve_nodes(), from --nodes or the leg's logs
+QUORUM = 0       # n - (n - 1) // 3
+GATE_RANK = 0    # 0-based index into the sorted followers: quorum - 2
 ANSI = re.compile(r'\x1b\[[0-9;]*m')
 TS = re.compile(r'^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)')
+
+
+def set_nodes(n):
+    """Fix the fleet's size and everything the protocol derives from it."""
+    global NODES, QUORUM, GATE_RANK
+    NODES = n
+    QUORUM = n - (n - 1) // 3
+    # The leader votes for its own proposal, so `quorum - 1` follower votes
+    # complete it; sorted ascending, that is index `quorum - 2`.
+    GATE_RANK = QUORUM - 2
+    return n
+
+
+def resolve_nodes(leg, override=None):
+    """--nodes, else however many node<i>-el.log the leg archived."""
+    if override:
+        return set_nodes(override)
+    found = len(glob.glob(os.path.join(ROOT, leg, 'node*-el.log')))
+    if found < 2:
+        raise SystemExit(
+            f"{leg}: found {found} node*-el.log under {ROOT}; pass --nodes N or --root DIR"
+        )
+    return set_nodes(found)
 
 def parse_ts(s):
     # 2026-09-21T02:31:20.245860Z
@@ -40,7 +83,7 @@ def leg_dir(name):
 def parse_leg(name):
     d = leg_dir(name)
     nodes = {}
-    for n in range(7):
+    for n in range(NODES):
         v = load(os.path.join(d, f"node{n}-v.log"))
         e = load(os.path.join(d, f"node{n}-el.log"))
         nodes[n] = {'v': v, 'el': e}
@@ -60,9 +103,9 @@ def collect(nodes):
         'vote_road': [],# (ts, number, txs, request, recv, decode, senders, parent_wait, check, total)
         'direct': [],   # (ts, number, txs, convert, header, senders, exec, checks, root, hashed, total)
         'own_handed': [], # (ts, number)
-    } for n in range(7)}
+    } for n in range(NODES)}
 
-    for n in range(7):
+    for n in range(NODES):
         for line in nodes[n]['v']:
             t = ts_of(line)
             if t is None:
@@ -112,7 +155,7 @@ def analyze_leg(name):
     # block number -> txs, via vote_road (any follower)
     num_txs = {}
     num_time = {}  # earliest vote_road ts per number (rough)
-    for n in range(7):
+    for n in range(NODES):
         for (t, num, txs, *_rest) in data[n]['vote_road']:
             if num is None: continue
             num_txs.setdefault(num, txs)
@@ -131,7 +174,7 @@ def analyze_leg(name):
 
     # leader identity per block number: from own_handed events
     leader_of = {}
-    for n in range(7):
+    for n in range(NODES):
         for (t, num) in data[n]['own_handed']:
             if num is None: continue
             leader_of[num] = n
@@ -143,7 +186,7 @@ def analyze_leg(name):
     # (not a full block, or BP missing) -- skip it.
     num_bp_ts = {}   # (leader,view) -> bp ts
     leader_view_num = {}  # (leader,view) -> block number == view, kept explicit for clarity
-    for ld in range(7):
+    for ld in range(NODES):
         bps = sorted(data[ld]['bp'])
         for view, (lbp_ts, fcu, build_ms, seal, E) in data[ld]['lbp'].items():
             import bisect
@@ -156,7 +199,7 @@ def analyze_leg(name):
             num_bp_ts[(ld, view)] = bp_ts
 
     results = []
-    for ld in range(7):
+    for ld in range(NODES):
         views = sorted(v for (l, v) in num_bp_ts if l == ld)
         for view in views:
             nxt = view + 1
@@ -199,7 +242,7 @@ def summarize(name):
         print(f"{name}: {err}")
         return None
     r = res['results']
-    print(f"=== {name} ===  window1 full blocks: {len(res['window_nums'])}  matched cycles(A-F): {len(r)}  leaders in window: {sorted(set(res['leader_of'].get(n) for n in res['window_nums']))}")
+    print(f"=== {name} ===  {NODES} nodes, quorum {QUORUM}  window1 full blocks: {len(res['window_nums'])}  matched cycles(A-F): {len(r)}  leaders in window: {sorted(set(res['leader_of'].get(n) for n in res['window_nums']))}")
     if not r:
         print("  no matched consecutive same-leader full-block pairs")
         return res
@@ -223,28 +266,28 @@ def follower_breakdown(name, res):
     leader_of = res['leader_of']
     # hash -> number, from any leader's commit dict
     hash_num = {}
-    for ld in range(7):
+    for ld in range(NODES):
         for view, c in data[ld]['commit'].items():
             if len(c) > 7 and c[7]:
                 hash_num[c[7]] = view
     # per-node vote_road restricted to window full blocks, keyed by number
-    per_node_by_num = {n: {} for n in range(7)}
-    for n in range(7):
+    per_node_by_num = {n: {} for n in range(NODES)}
+    for n in range(NODES):
         for (t, num, txs, req, recv, dec, snd, pw, chk, tot) in data[n]['vote_road']:
             if num is None or not (t_start <= t < t_end):
                 continue
             if num_is_full(res, num):
                 per_node_by_num[n][num] = (t, req, recv, dec, snd, pw, chk, tot)
     # per-node body_recv by hash -> ts (first occurrence in window +/- margin)
-    per_node_recv_by_hash = {n: {} for n in range(7)}
-    for n in range(7):
+    per_node_recv_by_hash = {n: {} for n in range(NODES)}
+    for n in range(NODES):
         for (t, h) in data[n]['body_recv']:
             if h and (t_start - datetime.timedelta(seconds=2)) <= t < (t_end + datetime.timedelta(seconds=2)):
                 per_node_recv_by_hash[n].setdefault(h, t)
 
     print(f"--- {name}: per-follower vote-road (window1 full blocks) ---")
     ranks_per_block = {}
-    for n in range(7):
+    for n in range(NODES):
         rows = per_node_by_num[n]
         if not rows:
             continue
@@ -272,20 +315,26 @@ def follower_breakdown(name, res):
               f"check={med(6):.1f} total={med(7):.1f}")
         for num, v in rows.items():
             ranks_per_block.setdefault(num, []).append((n, v[7]))
-    # gating rank: for each block, sort followers (exclude leader) by total_ms, find 4th smallest
+    # Gating rank: for each block, sort the followers (the leader excluded --
+    # its own vote is already one of the quorum) by total_ms and take the
+    # (quorum - 1)th. Seven nodes: the 4th of six. Four nodes: the 2nd of
+    # three. Anything slower than that the chain does not wait for.
     gate_ranks = []
     for num, lst in ranks_per_block.items():
         ld = leader_of.get(num)
         followers = sorted((tot, n) for (n, tot) in lst if n != ld)
-        if len(followers) >= 4:
-            gate_ranks.append(followers[3])  # 4th fastest (0-indexed 3)
+        if len(followers) > GATE_RANK:
+            gate_ranks.append(followers[GATE_RANK])
     if gate_ranks:
         vals = [g[0] for g in gate_ranks]
         from collections import Counter
         who = Counter(g[1] for g in gate_ranks)
-        print(f"  4th-fastest-follower total_ms: n={len(vals)} median={statistics.median(vals):.1f} mean={statistics.mean(vals):.1f}  which node gates (count): {dict(who)}")
+        ordinal = {1: '1st', 2: '2nd', 3: '3rd'}.get(GATE_RANK + 1, f'{GATE_RANK + 1}th')
+        print(f"  {ordinal}-fastest-follower total_ms (quorum {QUORUM} of {NODES}): n={len(vals)} "
+              f"median={statistics.median(vals):.1f} mean={statistics.mean(vals):.1f}  "
+              f"which node gates (count): {dict(who)}")
     # convert_ms from 'direct' entries (new_payload legs only, mostly)
-    for n in range(7):
+    for n in range(NODES):
         rows = [d for d in data[n]['direct'] if d[1] is not None and t_start <= d[0] < t_end and num_is_full(res, d[1])]
         if rows:
             conv = statistics.median(d[3] for d in rows)
@@ -293,7 +342,7 @@ def follower_breakdown(name, res):
             print(f"  node{n} convert_ms={conv:.1f} header_ms={header_ms:.1f} (direct-import path, n={len(rows)})")
     # gap check: vote_road total - named parts, vs convert_ms+header_ms
     gaps = []
-    for n in range(7):
+    for n in range(NODES):
         rows = per_node_by_num[n]
         direct_by_num = {d[1]: d for d in data[n]['direct'] if d[1] is not None}
         for num, v in rows.items():
@@ -314,9 +363,25 @@ def num_is_full(res, num):
     return txs is not None and txs >= 150000
 
 if __name__ == '__main__':
-    legs = sys.argv[1:] or ['bench-loop190Y0b','bench-loop190Y0c','bench-loop190Y1b','bench-loop190Y1c']
+    args = sys.argv[1:]
+    override = None
+    legs = []
+    i = 0
+    while i < len(args):
+        if args[i] == '--nodes':
+            override = int(args[i + 1]); i += 2
+        elif args[i] == '--root':
+            ROOT = args[i + 1]; i += 2
+        elif args[i] in ('-h', '--help'):
+            print(__doc__); sys.exit(0)
+        else:
+            legs.append(args[i]); i += 1
+    legs = legs or ['bench-loop190Y0b','bench-loop190Y0c','bench-loop190Y1b','bench-loop190Y1c']
     all_res = {}
     for leg in legs:
+        # Per leg, so a seven-node leg and a four-node one can be dissected in
+        # one command and each read with its own quorum.
+        resolve_nodes(leg, override)
         all_res[leg] = summarize(leg)
         if all_res[leg]:
             follower_breakdown(leg, all_res[leg])

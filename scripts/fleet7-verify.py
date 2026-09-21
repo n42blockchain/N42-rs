@@ -62,9 +62,16 @@ def main():
     parser.add_argument("--quiet", action="store_true", help="print nothing; the exit status is the answer")
     args = parser.parse_args()
 
+    # The same defaults fleet7-env.sh declares. `18545` was neither of them:
+    # every caller passed F7_HTTP_BASE, so an invocation that forgot it read
+    # ports nothing is listening on and reported "no node answered" -- which
+    # looks exactly like a dead fleet.
     nodes = int(os.environ.get("F7_NODES", "7"))
-    base = int(os.environ.get("F7_HTTP_BASE", "18545"))
+    base = int(os.environ.get("F7_HTTP_BASE", "8700"))
     ports = [base + i for i in range(nodes)]
+    # A QC needs `n - f` votes with `f = (n - 1) / 3`; printed beside the
+    # authorship count so a four-node leg's output states its own quorum.
+    quorum = nodes - (nodes - 1) // 3
 
     say = (lambda *a, **k: None) if args.quiet else print
 
@@ -107,6 +114,7 @@ def main():
 
     result = {
         "nodes": nodes,
+        "quorum": quorum,
         "answering": answering,
         "common_height": common,
         "commitments": {str(i): rows[i] for i in sorted(rows)},
@@ -139,7 +147,10 @@ def main():
         say(f"    {bad['commitment']}:")
         for i, value in sorted(bad["values"].items()):
             say(f"      node {i} {value}")
-    say(f"authors over blocks {low}-{common}: {len(authors)}")
+    # A window shorter than `nodes * leaderTenure` blocks cannot contain every
+    # member's tenure, so a low count here is the window's fault before it is
+    # the fleet's. Not a failing check for that reason; read it with --window.
+    say(f"authors over blocks {low}-{common}: {len(authors)} of {nodes} (quorum {quorum})")
     for miner, count in sorted(authors.items(), key=lambda kv: -kv[1]):
         say(f"  {miner} {count}")
     say(f"advanced in {args.settle:.0f}s: {len(advanced)}/{len(answering)}")

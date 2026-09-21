@@ -385,13 +385,10 @@ fi
 # signature per transaction, and it re-signs a batch it has to retry -- so an
 # unpinned generator competes with the nodes it is measuring and the round
 # reports the contention as the chain's.
-if [[ ${F7_PIN_PHYSICAL:-1} == 1 ]]; then
-  # The physical cores the nodes left, with their siblings (see f7_pin).
-  _off=$(f7_smt_offset); _lo=$((F7_CORE_OFFSET + F7_NODES * F7_CORES_PER_NODE / 2)); _hi=$((_off - 1))
-  FLOOD_CORES=${F7_FLOOD_CORES:-$_lo-$_hi,$((_lo + _off))-$((_hi + _off))}
-else
-  FLOOD_CORES=${F7_FLOOD_CORES:-$((F7_CORE_OFFSET + F7_NODES * F7_CORES_PER_NODE))-$(($(nproc) - 1))}
-fi
+# The physical cores the nodes left, with their siblings (see f7_pin). The
+# arithmetic lives in fleet7-env.sh with f7_pin's, so a fleet of another size
+# cannot have the nodes and the generator disagree about who owns which core.
+FLOOD_CORES=$(f7_flood_cores)
 FLOOD_PIN=""
 [[ $F7_PIN == 1 ]] && FLOOD_PIN="taskset -c $FLOOD_CORES"
 echo "flood cores  : ${FLOOD_CORES}"

@@ -286,4 +286,119 @@ mod tests {
         .unwrap();
         assert!(matches!(HotStuffGenesisConfig::from_genesis(&genesis), Err(HotStuffConfigError::Missing)));
     }
+
+    // ------------------------------------------------------------- the bench fleets --
+    // The genesis files `scripts/fleet7.sh` and `scripts/fleet7-bench.sh` run
+    // on. They reach a node only through `--chain <path>`, so nothing in
+    // `reth_chainspec::spec` names them and nothing else would notice if one
+    // stopped parsing, stopped being a QMDB chain, or lost a validator.
+
+    const FLEET7: &str = include_str!("../../../chainspec/res/genesis/n42_fleet7.json");
+    const FLEET7_BENCH: &str = include_str!("../../../chainspec/res/genesis/n42_fleet7_bench.json");
+    const FLEET4: &str = include_str!("../../../chainspec/res/genesis/n42_fleet4.json");
+    const FLEET4_BENCH: &str = include_str!("../../../chainspec/res/genesis/n42_fleet4_bench.json");
+
+    /// The seed `scripts/fleet7-env.sh` derives every fleet's keys from.
+    const FLEET_SEED: &str = "n42-fleet7-validator";
+
+    fn spec_of(json: &str) -> reth_chainspec::ChainSpec {
+        let genesis: Genesis = serde_json::from_str(json).expect("the fleet genesis parses");
+        // `--chain <path>` reaches the same place: `N42ChainSpecParser::parse`
+        // builds the spec from the `Genesis` and `From<Genesis>` puts the QMDB
+        // root in the header.
+        reth_chainspec::ChainSpec::from(genesis)
+    }
+
+    /// Both fleets must build the same header from the same alloc, or a leg run
+    /// on one is not comparable with a leg run on the other.
+    fn assert_qmdb_header(spec: &reth_chainspec::ChainSpec) {
+        use reth_chainspec::qmdb::{qmdb_genesis_root, state_scheme, StateScheme};
+        assert_eq!(state_scheme(&spec.genesis), StateScheme::Qmdb);
+        assert_eq!(
+            spec.genesis_header.header().state_root,
+            qmdb_genesis_root(&spec.genesis).expect("a QMDB root for the alloc")
+        );
+    }
+
+    fn assert_fleet(json: &str, nodes: usize, period: u64, gas_limit: u64) {
+        use n42_h2_consensus::ValidatorSet;
+
+        let spec = spec_of(json);
+        assert_qmdb_header(&spec);
+        assert_eq!(spec.chain().id(), 1143);
+        assert_eq!(spec.genesis.gas_limit, gas_limit);
+
+        let config = HotStuffGenesisConfig::from_genesis(&spec.genesis).expect("a hotstuff block");
+        assert_eq!(config.period, period);
+        assert!(config.interop_v4, "the fleet speaks the v4 cross-client profile");
+
+        let set = config.validator_set().expect("valid keys");
+        assert_eq!(set.len(), nodes);
+        let f = config.fault_tolerance();
+        assert_eq!(f, (nodes as u32 - 1) / 3);
+        let validators = ValidatorSet::try_new(&set, f).expect("f is within the set's tolerance");
+        assert_eq!(validators.quorum_size(), nodes - f as usize);
+
+        // Order is bitmap order and must survive parsing untouched.
+        for (index, info) in set.iter().enumerate() {
+            assert_eq!(info.address, config.validators[index].address);
+        }
+
+        // The keys are `h2_keygen --seed n42-fleet7-validator`'s, which derives
+        // validator `i` from the index alone. That is why `f7_place_keys` can
+        // write a four-key set with `--count 4` and node `i` still holds the key
+        // this file names -- and why a smaller fleet's file is the larger one's
+        // list truncated rather than a new set.
+        for (index, info) in set.iter().enumerate() {
+            let ikm: [u8; 32] = alloy_primitives::keccak256(format!("{FLEET_SEED}-{index}")).0;
+            let secret = n42_h2_primitives::BlsSecretKey::key_gen(&ikm).expect("a derived key");
+            assert_eq!(
+                secret.public_key(),
+                info.bls_public_key,
+                "validator {index} is not the seed's key; the genesis and f7_place_keys disagree"
+            );
+        }
+    }
+
+    #[test]
+    fn the_seven_node_fleet_genesis_is_a_seven_validator_qmdb_chain() {
+        assert_fleet(FLEET7, 7, 3, 0x1c9c380);
+        assert_fleet(FLEET7_BENCH, 7, 1, 0x1c9c3800);
+    }
+
+    #[test]
+    fn the_four_node_fleet_genesis_is_a_four_validator_qmdb_chain() {
+        // Quorum 3 of 4: the leader's own vote plus two followers' (f = 1).
+        assert_fleet(FLEET4, 4, 3, 0x1c9c380);
+        assert_fleet(FLEET4_BENCH, 4, 1, 0x1c9c3800);
+    }
+
+    /// The four-node files are the seven-node ones with the validator list
+    /// truncated and NOTHING else touched (`scripts/fleet-genesis.py`). Read as
+    /// JSON rather than through `Genesis`, so a field this node ignores today --
+    /// a committee-pool setting, a fork time -- cannot drift between the fleets
+    /// unnoticed.
+    #[test]
+    fn the_four_node_fleet_differs_from_the_seven_only_in_its_validators() {
+        for (seven, four) in [(FLEET7, FLEET4), (FLEET7_BENCH, FLEET4_BENCH)] {
+            let mut seven: serde_json::Value = serde_json::from_str(seven).unwrap();
+            let four: serde_json::Value = serde_json::from_str(four).unwrap();
+            let list = seven["config"]["hotstuff"]["validators"].as_array().unwrap();
+            assert_eq!(list.len(), 7);
+            let truncated = serde_json::Value::Array(list[..4].to_vec());
+            seven["config"]["hotstuff"]["validators"] = truncated;
+            assert_eq!(seven, four, "re-run scripts/fleet-genesis.py --nodes 4");
+        }
+    }
+
+    /// The `hotstuff` block lives in `config`, which the genesis header does not
+    /// cover, so the two fleets share a genesis hash and therefore a fork digest:
+    /// their members would mesh on the wire and diverge only at the committee
+    /// evidence. Asserted rather than merely written down -- it is why the two
+    /// fleets get separate `F7_ROOT`s and are never run at the same time.
+    #[test]
+    fn the_two_fleets_share_a_genesis_hash() {
+        assert_eq!(spec_of(FLEET7).genesis_hash(), spec_of(FLEET4).genesis_hash());
+        assert_eq!(spec_of(FLEET7_BENCH).genesis_hash(), spec_of(FLEET4_BENCH).genesis_hash());
+    }
 }

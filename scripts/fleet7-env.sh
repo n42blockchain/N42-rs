@@ -53,8 +53,30 @@ f7_check_binary_fresh() {
   echo "  (F7_SKIP_STALE_CHECK=1 to run anyway)" >&2
   return 1
 }
+# How many members the fleet has. Seven is this file's own default and the
+# shape the whole campaign was measured on; `scripts/fleet4-env.sh` sets four
+# and nothing else about this file changes.
+#
+# It is not only a loop bound. The quorum, the core layout, the flood's core
+# range and the validators' static mesh all follow it, so a script that writes
+# `7` anywhere is a script that breaks silently at another size -- and "breaks
+# silently" here means a leg that runs and reports a number.
 : "${F7_NODES:=7}"
+# The seed is deliberately NOT per fleet. `h2_keygen` derives validator `i`
+# from `keccak256("<seed>-<i>")`, the index alone, so node `i` holds the same
+# BLS key in every fleet derived from this seed and a four-node genesis is the
+# seven-node one's validator list truncated (scripts/fleet-genesis.py).
 : "${F7_SEED:=n42-fleet7-validator}"
+
+# f7_quorum -- votes a QC needs: n - f, with f = (n - 1) / 3.
+#
+# The same arithmetic as `ValidatorSet::quorum_size`
+# (crates/n42/h2-consensus/src/validator/set.rs) and
+# `HotStuffGenesisConfig::fault_tolerance`. Seven nodes need five, four need
+# three. The leader's own vote is one of them, so what a leader waits for is
+# the (quorum - 1)th fastest FOLLOWER: the 4th of 6 at seven nodes, the 2nd of
+# 3 at four. Every tool that reads a gating rank gets it from here.
+f7_quorum() { echo $(( F7_NODES - (F7_NODES - 1) / 3 )); }
 
 # ------------------------------------------------------------------ ports ---
 # All below 32768, so none of them can be claimed by an outbound connection
@@ -244,6 +266,14 @@ F7_NETKEYS=(
   "$(printf '55%.0s' {1..32})" "$(printf '66%.0s' {1..32})"
   "$(printf '77%.0s' {1..32})"
 )
+# A fleet larger than the list would index past its end. Under `set -u` that is
+# an "unbound variable" from inside `f7_peer_id`, three call levels from the
+# cause; said here it names the fix.
+if ((F7_NODES > ${#F7_NETKEYS[@]})); then
+  echo "fleet7-env: F7_NODES=$F7_NODES but only ${#F7_NETKEYS[@]} network keys are defined." >&2
+  echo "            Add keys to F7_NETKEYS (0x11..0x77 repeated 32 times, gov5's fleet keys)." >&2
+  return 1 2>/dev/null || exit 1
+fi
 
 # f7_peer_id <index> -- the peer id that node's fixed network key yields.
 f7_peer_id() { "$F7_BIN/examples/h2_keygen" --libp2p-peer-id "${F7_NETKEYS[$1]}"; }
@@ -263,6 +293,39 @@ f7_node_dir() { echo "$F7_ROOT/node$1"; }
 # rolled after the genesis had been edited mid-run. Recording the file at `up`
 # and refusing to roll against a different one turns it into a sentence.
 f7_genesis_fingerprint() { sha256sum "$F7_GENESIS" | cut -d' ' -f1; }
+
+# f7_genesis_validator_count -- validators the chain names, or 0.
+f7_genesis_validator_count() {
+  python3 -c "
+import json, sys
+try:
+    print(len(json.load(open(sys.argv[1]))['config']['hotstuff']['validators']))
+except Exception:
+    print(0)" "$F7_GENESIS"
+}
+
+# f7_check_validator_count -- the fleet's size must be the chain's.
+#
+# A genesis with more validators than the fleet has members is the quiet
+# failure of this whole switch: the absent members never vote, the quorum the
+# present ones compute from the list is `n - (n-1)/3` of the LIST, and with
+# four of seven running that is five votes from four nodes. The chain proposes
+# and never commits, and no log line says "the genesis names seven". Fewer
+# validators than members is the other direction -- the extra nodes have no
+# index to run at -- and h2_validator refuses that one itself.
+f7_check_validator_count() {
+  local declared
+  declared=$(f7_genesis_validator_count)
+  ((declared == F7_NODES)) && return 0
+  echo "fleet7-env: $F7_GENESIS names $declared validators, but F7_NODES=$F7_NODES." >&2
+  if ((declared > F7_NODES)); then
+    echo "            The $((declared - F7_NODES)) absent members never vote, so a quorum of" >&2
+    echo "            $(( declared - (declared - 1) / 3 )) can never form: the chain would propose and never commit." >&2
+  fi
+  echo "            Point F7_GENESIS at the ${F7_NODES}-validator file" >&2
+  echo "            (scripts/fleet-genesis.py --nodes $F7_NODES writes it)." >&2
+  return 1
+}
 
 f7_record_genesis() { f7_genesis_fingerprint > "$F7_ROOT/genesis.sha256"; }
 
@@ -291,6 +354,19 @@ f7_place_keys() {
       --out-dir "$F7_ROOT/keys" > /dev/null
   }
   ( umask 077; printf '%s' "${F7_NETKEYS[$i]}" > "$d/consensus/network-key" )
+}
+
+# f7_bls_key <index> -- the validator's derived BLS secret, as the launch line
+# carries it.
+#
+# `f7_place_keys` has always run before a node is launched, so the file is
+# there; `fleet7.sh print` builds the same arguments without touching the root,
+# and a `cat` of a file that does not exist would abort it under `set -e`. The
+# placeholder keeps `print` usable on a root that has never been started while
+# still being obviously not a key.
+f7_bls_key() {
+  local f=$F7_ROOT/keys/validator-$1.key
+  if [[ -r $f ]]; then cat "$f"; else echo "<$f not generated yet>"; fi
 }
 
 # ------------------------------------------------------------ launch args ---
@@ -499,7 +575,7 @@ f7_validator_args() {
   F7_V_ARGS=(
     --chain "$F7_GENESIS"
     --index "$i"
-    --bls-key "$(cat "$F7_ROOT/keys/validator-$i.key")"
+    --bls-key "$(f7_bls_key "$i")"
     --el "http://127.0.0.1:$((F7_AUTH_BASE + i))"
     --jwt "$F7_ROOT/jwt.hex"
     --listen "/ip4/127.0.0.1/tcp/$((F7_P2P_BASE + i))"
@@ -588,6 +664,64 @@ f7_pin() {
   lo=$((F7_CORE_OFFSET + i * F7_CORES_PER_NODE))
   hi=$((lo + F7_CORES_PER_NODE - 1))
   echo "taskset -c $lo-$hi"
+}
+
+# f7_flood_cores -- the CPUs left for the load generator, in taskset syntax.
+#
+# The same arithmetic `fleet7-bench.sh` pins the flood with, lifted here so
+# `fleet7.sh print` and the bench cannot disagree about it. With
+# F7_PIN_PHYSICAL=1 the nodes take the first `F7_NODES * F7_CORES_PER_NODE / 2`
+# physical cores and their siblings, and what is left is everything from there
+# to the last physical core, plus those siblings: 7 x 32 leaves 112-127,240-255
+# and 4 x 56 leaves exactly the same sixteen physical cores. Both fit 256
+# without a node and the generator ever sharing one.
+f7_flood_cores() {
+  local off lo hi
+  if [[ ${F7_PIN_PHYSICAL:-1} == 1 ]]; then
+    off=$(f7_smt_offset)
+    lo=$((F7_CORE_OFFSET + F7_NODES * F7_CORES_PER_NODE / 2))
+    hi=$((off - 1))
+    echo "${F7_FLOOD_CORES:-$lo-$hi,$((lo + off))-$((hi + off))}"
+    return 0
+  fi
+  echo "${F7_FLOOD_CORES:-$((F7_CORE_OFFSET + F7_NODES * F7_CORES_PER_NODE))-$(($(nproc) - 1))}"
+}
+
+# f7_check_layout -- refuse a core layout that does not fit, and say why.
+#
+# Two nodes sharing a physical core is not a crash, it is a slow node: measured
+# here before the physical pinning existed, node 2's builder executed the same
+# blocks 2-3x slower than node 0's and nothing said so. So the arithmetic is
+# checked where it is written rather than discovered in a leg's numbers.
+f7_check_layout() {
+  local off cpus phys used
+  [[ $F7_PIN == 1 ]] || return 0
+  cpus=$(nproc)
+  if [[ ${F7_PIN_PHYSICAL:-1} == 1 ]]; then
+    off=$(f7_smt_offset)
+    ((off > 0)) || { echo "fleet7-env: F7_PIN_PHYSICAL=1 on a host without SMT siblings" >&2; return 1; }
+    ((F7_CORES_PER_NODE % 2 == 0)) || {
+      echo "fleet7-env: F7_CORES_PER_NODE=$F7_CORES_PER_NODE is odd; a physical core is two CPUs" >&2
+      return 1
+    }
+    # `f7_pin`'s layout is: physical cores are 0..off-1 and their siblings are
+    # off..2*off-1, so the sibling offset IS the physical core count.
+    phys=$((F7_NODES * F7_CORES_PER_NODE / 2))
+    used=$((F7_CORE_OFFSET + phys))
+    ((used <= off)) || {
+      echo "fleet7-env: $F7_NODES nodes x $F7_CORES_PER_NODE CPUs need $used physical cores" >&2
+      echo "            but this host has $off of $cpus CPUs (siblings at +$off)." >&2
+      echo "            Nodes would share physical cores; lower F7_CORES_PER_NODE or F7_NODES." >&2
+      return 1
+    }
+  else
+    used=$((F7_CORE_OFFSET + F7_NODES * F7_CORES_PER_NODE))
+    ((used <= cpus)) || {
+      echo "fleet7-env: $F7_NODES x $F7_CORES_PER_NODE CPUs from $F7_CORE_OFFSET exceed $cpus" >&2
+      return 1
+    }
+  fi
+  return 0
 }
 
 # ------------------------------------------------------------ process ops ---

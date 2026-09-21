@@ -315,7 +315,14 @@ if [ "$F7_DROP_CACHE" = 1 ]; then
   # started with 20-30 GB cached and a 36-38 GB pool, and read the slow mode
   # on every leg (loop128). Clean pages of a fleet that is down; theirs is
   # never running when this gate has passed.
-  python3 "$HERE/dropcache.py" "$HERE/../target" "$HOME/.cargo" "$F7_ROOT" /data/blockchain/qs-node* 2>&1 | tail -1
+  # And the agents' build directory: since 2026-09-21 build output lives under
+  # /data/n42-build, and what is built outside this checkout's `target` was
+  # not in the list -- every first leg after a build then started with ~10 GB
+  # cached that nothing advised away, a pool of 13,000-14,700 order-9 blocks
+  # instead of 16,500-19,000, and read 369-390k where the same configuration
+  # reads 427-433k (loop193-195, eleven baseline legs: window 1 follows the
+  # pool at the leg's start within a run and across runs).
+  python3 "$HERE/dropcache.py" "$HERE/../target" /data/n42-build/agents "$HOME/.cargo" "$F7_ROOT" /data/blockchain/qs-node* 2>&1 | tail -1
 fi
 if [ "$F7_HUGEPREP" != 0 ]; then
   # Working set 30 GB (what the box can collapse whole), two passes, repeated

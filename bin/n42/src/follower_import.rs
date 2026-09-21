@@ -812,32 +812,90 @@ struct Executed {
 /// execution layer imports it -- and reading it used to mean joining two
 /// logs by block hash. The pieces the validator knows are carried in here
 /// so the whole road is one line, written where the vote is released.
+///
+/// Every field is microseconds and the line prints milliseconds: `other_ms`
+/// is what the named parts leave over, and computed from millisecond fields
+/// it would be mostly the truncation of the twelve it subtracts.
 #[derive(Debug, Clone, Copy)]
 pub struct VoteRoad {
     /// Which request carried the block: `foreign_body` or `new_payload`.
     pub request: &'static str,
     /// Reading the frame off the loopback socket.
-    pub recv_ms: u64,
-    /// Turning it into the block this import takes.
-    pub decode_ms: u64,
+    pub recv_us: u64,
+    /// Turning it into the block this import takes: the payload decode, and
+    /// on the body road the conversion to a block with it.
+    pub decode_us: u64,
+    /// The own-build check every block pays before the import is dispatched.
+    pub reuse_us: u64,
+    /// What is copied between that check and the hand-off.
+    pub prepare_us: u64,
+    /// The hand-off to the blocking pool: submitted -> the closure running.
+    pub dispatch_us: u64,
+    /// `convert_payload_to_block`; 0 on the body road, which arrives converted.
+    pub convert_us: u64,
+    /// The sealed block filed for the engine's own conversion; 0 when that
+    /// clone is made off this path.
+    pub remember_us: u64,
     /// When the request's first byte arrived, for the total.
     pub started: std::time::Instant,
 }
 
+/// What the import itself spent on the road, in microseconds. Carried whole
+/// so a part added here reaches the line without another argument.
+#[derive(Debug, Clone, Copy, Default)]
+struct RoadPhases {
+    /// The header and body consensus checks, and before the deferred fork the
+    /// parent lookup ahead of them.
+    header_us: u64,
+    /// Sender recovery and the recovered block.
+    senders_us: u64,
+    /// Waiting for the parent header or for its published output.
+    parent_wait_us: u64,
+    /// `validate_against_parent` and `check_includable`: what the vote attests.
+    check_us: u64,
+    /// Waiting for the parent's execution fields, and the header against them.
+    fields_us: u64,
+}
+
 /// The one line a bench leg greps: where a block's road to this node's vote
 /// went. Written once per block, at the point the vote is released.
-fn log_vote_road(road: VoteRoad, number: u64, txs: usize, senders_ms: u64, parent_wait_ms: u64, check_ms: u64) {
+///
+/// The named parts are meant to add up to `total_ms`, and `other_ms` is what
+/// they do not cover -- so a road that grows a part nobody named shows it as
+/// a gap instead of hiding it (loop190: 50 ms of a 167 ms road had no name).
+fn log_vote_road(road: VoteRoad, number: u64, txs: usize, phases: RoadPhases) {
+    let total = road.started.elapsed().as_micros() as u64;
+    let named = road.recv_us
+        + road.decode_us
+        + road.reuse_us
+        + road.prepare_us
+        + road.dispatch_us
+        + road.convert_us
+        + road.remember_us
+        + phases.header_us
+        + phases.senders_us
+        + phases.parent_wait_us
+        + phases.check_us
+        + phases.fields_us;
     tracing::info!(
         target: "n42.follower_import",
         number,
         txs,
         request = road.request,
-        recv_ms = road.recv_ms,
-        decode_ms = road.decode_ms,
-        senders_ms,
-        parent_wait_ms,
-        check_ms,
-        total_ms = road.started.elapsed().as_millis() as u64,
+        recv_ms = road.recv_us / 1000,
+        decode_ms = road.decode_us / 1000,
+        reuse_ms = road.reuse_us / 1000,
+        prepare_ms = road.prepare_us / 1000,
+        dispatch_ms = road.dispatch_us / 1000,
+        convert_ms = road.convert_us / 1000,
+        remember_ms = road.remember_us / 1000,
+        header_ms = phases.header_us / 1000,
+        senders_ms = phases.senders_us / 1000,
+        parent_wait_ms = phases.parent_wait_us / 1000,
+        check_ms = phases.check_us / 1000,
+        fields_ms = phases.fields_us / 1000,
+        other_ms = total.saturating_sub(named) / 1000,
+        total_ms = total / 1000,
         "vote road"
     );
 }
@@ -907,7 +965,8 @@ where
     consensus
         .validate_block_pre_execution_with_tx_root(&sealed, Some(sealed.transactions_root))
         .map_err(|err| format!("body: {err}"))?;
-    let header_ms = started.elapsed().as_millis() as u64;
+    let mut phases = RoadPhases { header_us: started.elapsed().as_micros() as u64, ..Default::default() };
+    let header_ms = phases.header_us / 1000;
     let senders_at = std::time::Instant::now();
     stage.at(2);
 
@@ -964,7 +1023,8 @@ where
     let senders: Vec<Address> = senders.into_iter().map(|s| s.expect("every sender resolved")).collect();
     let cache_hits = cache_hits.into_inner();
     let recovered = RecoveredBlock::new_sealed(sealed, senders);
-    let senders_ms = senders_at.elapsed().as_millis() as u64;
+    phases.senders_us = senders_at.elapsed().as_micros() as u64;
+    let senders_ms = phases.senders_us / 1000;
 
     // The parent: in, and under deferred execution executed here, since the
     // header's fields are checked against its result and the transactions
@@ -984,10 +1044,7 @@ where
             None => (wait_for_parent(provider, parent_hash, chain_spec.genesis(), deferred)?, None),
         },
     };
-    let parent_wait_ms = parent_at.elapsed().as_millis() as u64;
-    // Set on the deferred path, where the vote is the check; zero before the
-    // fork, where the vote is the import itself.
-    let mut check_ms = 0u64;
+    phases.parent_wait_us = parent_at.elapsed().as_micros() as u64;
     let against_parent = || validate_against_parent(consensus, recovered.sealed_header(), &parent);
     // Set on the exec-on-parent-output path: the parent as an executed block
     // this import lays over the chain's state at the grandparent, and the
@@ -1020,7 +1077,9 @@ where
             chain_spec.chain().id(),
             spec_for_intrinsic_gas(chain_spec, recovered.timestamp),
         )?;
-        check_ms = check_at.elapsed().as_millis() as u64;
+        // Set on the deferred path, where the vote is the check; zero before
+        // the fork, where the vote is the import itself.
+        phases.check_us = check_at.elapsed().as_micros() as u64;
 
         // Where this block's execution will read the parent's post-state,
         // decided here because it decides whether that execution can run
@@ -1045,17 +1104,18 @@ where
                 wait_for_parent_fields(parent_hash)?;
                 against_parent()?;
             }
+            phases.fields_us = fields_at.elapsed().as_micros() as u64;
             tracing::debug!(
                 target: "n42.follower_import",
                 number,
-                check_ms,
-                fields_ms = fields_at.elapsed().as_millis() as u64,
+                check_ms = phases.check_us / 1000,
+                fields_ms = phases.fields_us / 1000,
                 "checked: the header carries the parent's result and the transactions are includable"
             );
             if let Some(checked) = checked.take() {
                 let _ = checked.send(());
             }
-            log_vote_road(road, number, tx_count, senders_ms, parent_wait_ms, check_ms);
+            log_vote_road(road, number, tx_count, phases);
         } else {
             // Two roads from here (plan v4 step 2, [`two_roads`]): the rest of
             // the vote road -- the parent's execution fields and the header
@@ -1065,7 +1125,7 @@ where
             tracing::debug!(
                 target: "n42.follower_import",
                 number,
-                check_ms,
+                check_ms = phases.check_us / 1000,
                 "the transactions are includable on the parent's output; the vote road and the execution run side by side"
             );
         }
@@ -1169,13 +1229,16 @@ where
                 number,
                 roads_at,
                 move || {
+                    let fields_at = std::time::Instant::now();
                     wait_for_parent_fields(parent_hash)?;
                     validate_against_parent(consensus, header, parent_header)?;
+                    let mut phases = phases;
+                    phases.fields_us = fields_at.elapsed().as_micros() as u64;
                     // The vote, with this block's execution still running.
                     if let Some(checked) = vote_checked {
                         let _ = checked.send(());
                     }
-                    log_vote_road(road, number, tx_count, senders_ms, parent_wait_ms, check_ms);
+                    log_vote_road(road, number, tx_count, phases);
                     Ok(())
                 },
                 execute_block,
@@ -1330,7 +1393,7 @@ where
     // Before the deferred-execution fork the vote is this import's answer,
     // so the road ends here rather than at a check.
     if !deferred {
-        log_vote_road(road, number, tx_count, senders_ms, parent_wait_ms, check_ms);
+        log_vote_road(road, number, tx_count, phases);
     }
 
     Ok((
@@ -1920,6 +1983,85 @@ mod tests {
                      new scan {scan_ms:.1} fold {fold_ms:.1} senders {senders_ms:.1} whole {new_ms:.1}",
                 );
             }
+        }
+    }
+
+    /// The copies the vote road makes of a bench-tier block, each on its own.
+    /// loop190 read 50 ms of a 167 ms road that no named part accounted for;
+    /// these are the candidates on it that are work rather than a wait, and
+    /// this says which of them is worth moving off. Pinned the way a fleet
+    /// node runs: `RAYON_NUM_THREADS=16 taskset -c 0-31 cargo test --release
+    /// -p n42 --lib bench_vote_road_copies -- --ignored --nocapture`.
+    ///
+    /// Two things it cannot show. Every one of these walks tens of megabytes
+    /// of freshly allocated memory, and an idle box with a warm allocator
+    /// flatters them: on a node whose six neighbours are faulting pages of
+    /// their own they cost more, never less. And the hand-off to the blocking
+    /// pool is not here at all -- that is a runtime's queue, and only the
+    /// fleet's `dispatch_ms` measures it.
+    #[test]
+    #[ignore = "timing"]
+    fn bench_vote_road_copies() {
+        let (block, _) = bench_fixture(6_000, 27, 2_000_000, 64);
+        let count = block.body().transactions.len();
+        let sealed = block.sealed_block().clone();
+        // Memoized before the rounds, as it is on the road: the conversion
+        // sealed the block with its hash, and `remember_sealed` only reads it.
+        let _ = sealed.hash();
+        let senders: Vec<Address> = block.senders().to_vec();
+        let optional: Vec<Option<Address>> = senders.iter().copied().map(Some).collect();
+        // The payload's transaction bytes, which the serve path copies twice
+        // per block before the import is dispatched.
+        let raw: Vec<Bytes> = {
+            use alloy_eips::eip2718::Encodable2718 as _;
+            block.body().transactions.iter().map(|tx| Bytes::from(tx.encoded_2718())).collect()
+        };
+        let ms = |at: std::time::Instant| at.elapsed().as_micros() as f64 / 1000.0;
+        println!("block: {count} transactions, {} bytes of transactions", raw.iter().map(|b| b.len()).sum::<usize>());
+        for round in 0..5 {
+            let at = std::time::Instant::now();
+            let cloned = sealed.clone();
+            let sealed_ms = ms(at);
+            // The other half of `remember_sealed`: it keeps three blocks, so
+            // every call also frees the one it evicts, under its mutex.
+            let at = std::time::Instant::now();
+            drop(cloned);
+            let drop_ms = ms(at);
+
+            let at = std::time::Instant::now();
+            let refs: Vec<&TransactionSigned> = sealed.body().transactions().collect();
+            let refs_ms = ms(at);
+            drop(refs);
+
+            let at = std::time::Instant::now();
+            let misses: Vec<usize> =
+                optional.iter().enumerate().filter(|(_, s)| s.is_none()).map(|(i, _)| i).collect();
+            let misses_ms = ms(at);
+            drop(misses);
+
+            let owned = optional.clone();
+            let at = std::time::Instant::now();
+            let flat: Vec<Address> = owned.into_iter().map(|s| s.expect("every sender resolved")).collect();
+            let flat_ms = ms(at);
+            drop(flat);
+
+            let one = sealed.clone();
+            let these = senders.clone();
+            let at = std::time::Instant::now();
+            let recovered = RecoveredBlock::new_sealed(one, these);
+            let new_sealed_ms = ms(at);
+            drop(recovered);
+
+            let at = std::time::Instant::now();
+            let copy = raw.clone();
+            let raw_ms = ms(at);
+            drop(copy);
+
+            println!(
+                "round {round}: sealed.clone {sealed_ms:.1} sealed.drop {drop_ms:.1} txs-collect {refs_ms:.1} \
+                 misses {misses_ms:.1} senders-flatten {flat_ms:.1} new_sealed {new_sealed_ms:.1} \
+                 raw-transactions.clone {raw_ms:.1}",
+            );
         }
     }
 

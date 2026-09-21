@@ -833,7 +833,7 @@ async fn import_for_validator<T>(
     pre_converted: Option<SealedBlock<n42_tx_types::Block>>,
     started: std::time::Instant,
     decoded: std::time::Duration,
-    road: crate::follower_import::VoteRoad,
+    mut road: crate::follower_import::VoteRoad,
 ) -> std::io::Result<()>
 where
     T: PayloadTypes<BuiltPayload = N42BuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
@@ -842,10 +842,19 @@ where
     let txs = data.payload.as_v1().transactions.len();
     // One of ours, sealed: hand the engine the build's execution
     // first, and the newPayload below finds the block known.
+    //
+    // Timed on its own (`reuse_ms`): a foreign block pays this check too, and
+    // it is a round trip to the blocking pool before the vote road's own
+    // hand-off has even been made.
+    let reuse_at = std::time::Instant::now();
     let reused = match reuse {
         Some(reuse) => reuse_own_build::<T>(reuse, &data).await.is_some(),
         None => false,
     };
+    road.reuse_us = reuse_at.elapsed().as_micros() as u64;
+    // Everything copied between that check and the hand-off below is
+    // `prepare_ms` in the vote road's line.
+    let prepare_at = std::time::Instant::now();
     // The transactions' bytes, kept for the prune below; the
     // payload itself goes to the engine.
     let raw_transactions = data.payload.as_v1().transactions.clone();
@@ -878,14 +887,26 @@ where
         // block is checked, and the validator hears it on a
         // CHECKED frame before the import's answer.
         let (checked_tx, checked_rx) = tokio::sync::oneshot::channel::<()>();
+        road.prepare_us = prepare_at.elapsed().as_micros() as u64;
+        // The hand-off itself: what the blocking pool costs before the import
+        // runs is `dispatch_ms`, and nothing on the road can shorten it from
+        // this side.
+        let spawned = std::time::Instant::now();
         let handed = tokio::task::spawn_blocking(move || {
+            let mut road = road;
+            road.dispatch_us = spawned.elapsed().as_micros() as u64;
+            let convert_at = std::time::Instant::now();
             let sealed = match (pre, payload) {
                 (Some(sealed), _) => sealed,
                 (None, Some(payload)) => <n42_engine_types::engine_validator::N42EngineValidator<reth_chainspec::ChainSpec> as reth_engine_primitives::PayloadValidator<T>>::convert_payload_to_block(&validator, payload)
                     .map_err(|err| format!("conversion: {err}"))?,
                 (None, None) => return Err("no block and no payload to import".to_string()),
             };
-            let converted = started.elapsed().as_millis() as u64;
+            road.convert_us = convert_at.elapsed().as_micros() as u64;
+            // The hand-off and the conversion together, so this stays the
+            // `convert_ms` the direct-import line has always reported; the
+            // vote road's line names the two apart.
+            let converted = (road.dispatch_us + road.convert_us) / 1000;
             // The engine's newPayload, next, converts the same
             // payload: let it take this block instead.
             // The engine's own conversion of the same payload takes
@@ -895,7 +916,9 @@ where
             // block's `Arc` on a worker thread below, well before
             // the engine's pass runs.
             if !fast {
+                let remember_at = std::time::Instant::now();
                 n42_engine_types::built_executions::remember_sealed(sealed.hash(), sealed.clone());
+                road.remember_us = remember_at.elapsed().as_micros() as u64;
             }
             let (executed, phases) = import(sealed, Some(checked_tx), road)?;
             Ok::<_, String>((executed, phases, converted))
@@ -920,6 +943,11 @@ where
                         number,
                         txs,
                         checked_ms = started.elapsed().as_millis() as u64,
+                        // The vote road's `total_ms` ends where the import
+                        // released the check; this ends where the frame is on
+                        // the wire, so the two together name the wake-up and
+                        // the write as well.
+                        released_ms = road.started.elapsed().as_millis() as u64,
                         "checked: answered before the execution"
                     );
                 }
@@ -1455,8 +1483,15 @@ where
             let decoded_in = started.elapsed();
             let road = crate::follower_import::VoteRoad {
                 request: "foreign_body",
-                recv_ms: recv.as_millis() as u64,
-                decode_ms: decoded_in.as_millis() as u64,
+                recv_us: recv.as_micros() as u64,
+                // The frame's decode and the body's conversion to a block
+                // both: this road arrives converted, so its `convert_ms` is 0.
+                decode_us: decoded_in.as_micros() as u64,
+                reuse_us: 0,
+                prepare_us: 0,
+                dispatch_us: 0,
+                convert_us: 0,
+                remember_us: 0,
                 started: started_at,
             };
             import_for_validator::<T>(&mut stream, &mut out, &engine, reuse.as_ref(), data, Some(sealed), started, decoded_in, road).await?;
@@ -1511,8 +1546,13 @@ where
                         started.elapsed(),
                         crate::follower_import::VoteRoad {
                             request: "new_payload",
-                            recv_ms: recv.as_millis() as u64,
-                            decode_ms: started.elapsed().as_millis() as u64,
+                            recv_us: recv.as_micros() as u64,
+                            decode_us: started.elapsed().as_micros() as u64,
+                            reuse_us: 0,
+                            prepare_us: 0,
+                            dispatch_us: 0,
+                            convert_us: 0,
+                            remember_us: 0,
                             started: started_at,
                         },
                     )

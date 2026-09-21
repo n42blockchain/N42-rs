@@ -453,8 +453,54 @@ W3 = W2 at a pacing of 225:
   to 226-243 in the baseline legs -- where E promptly absorbed it (35 -> 60), as section 2j says it must.
 - Pacing at 225 ms (W3) reads no better than 275 (W2); not the binding term yet.
 
-In progress: `plan-v4/build-chain-2` -- chain on a chained parent (three builds in a row in a test that files fields the
-way the real execution layer does), a refusal known at once, the pool's size for chain legs.
+## 2l. The chain whole, the pool sized for it -- and the constraint back on the vote road (loop194)
+
+`plan-v4/build-chain-2` (merged 9f481bf04..f618e663d) corrected section 2k's reading: the refusals were not half of
+everything, they were **every empty block and no full one** (ten-second buckets: 16/0 refused/taken before the flood,
+0/13 in it). An empty block takes the builder's ordinary finish (the early seal needs transactions), and that finish
+never looked for the parent's execution under its build hash; 56 more wanted the grandparent's state a median of 18 ms
+before its import landed. Both fixed; a refusal is acted on when it arrives. The short blocks were not the gate
+counting held transactions (`TxQueue::len()` counts neither what a build took nor what is held; pinned by a test): the
+chained pull comes ~275 ms earlier in the queue's refill, the queue's median is unchanged and its trough halves.
+
+Window 1; X0 = confirmed configuration, X1 = chain + async forkchoice + body-once at the bench's pool of 3 blocks,
+X2 = the same at 4 blocks (`F7_BENCH_POOL_SLOTS=652000`), X3 = at 5:
+
+| | X0 a / b | X1 a / b | X2 a / b | X3 a / b |
+| --- | --- | --- | --- | --- |
+| chains taken / started | -- | 455/466, 455/464 | 441/453, 459/467 | 407/415, 429/437 |
+| queue trough (p5) | 198k / 191k | 67k / 86k | 166k / 102k | 224k / 243k |
+| full blocks of window 1 | 70/72, 72/73 | 55/80, 52/83 | **73/75, 76/78** | 73/75, (31/33) |
+| cycle, full blocks (dissected) | 409 / 398 | 332 / 341 | **367 / 373** | 391 / -- |
+| B | 242 / 228 | 198 / 216 | 249 / 240 | 286 / -- |
+| D | 68 / 69 | 72 / 79 | 68 / 101 | 66 / -- |
+| E | 41 / 65 | 20 / 14 | **11 / 10** | 10 / -- |
+| win1 TPS | 390k / 397k | 397k / 408k | **403k / 423k** | 403k / (175k) |
+
+- **The chain does what it was built for: E is gone (10 ms), the refusals are gone (2-9 a leg, 5-8 discards).** The
+  build chain no longer pins the cycle.
+- **It fails the criterion I set (full blocks above 90% at a cycle under 345 ms): at full blocks the cycle is 367-373,
+  -30..-35 ms on the baseline, and window 1 reads +3..6%.** X1's 332-341 ms were blocks 10% short.
+- **The constraint is B again, and B grows with the pool:** the vote road's decode reads 72 -> 82 -> 85 ms and its
+  sender look-ups 27 -> 38 -> 43 ms at 3 -> 4 -> 5 blocks of pool (B 198-216 -> 240-249 -> 286). Every node ingests every
+  transaction (`F7_INGEST_ALL`), so a deeper gate is more signature verification in flight on the 16 cores the import
+  runs on. Supply and the vote road compete for one pool of threads; the pool's size is a trade, and 4 blocks is where
+  it stands.
+- Where B goes now (X2b, fourth-fastest follower, from the leader's body leaving): body at the follower's execution
+  layer +43 ms (26 MB to six peers), decode 82, sender look-ups 38, check 6, vote released at +237.
+- The baseline itself drifted over the night (window 1: 429k loop190, 402-427k loop191, 369-415k loop193, 390-397k
+  here; memory headers alike). Pairs within a run are the comparison; across runs a baseline is +-7%.
+- X3 (5 blocks): two legs with a stretch of 1-4 s cycles, in X3b at blocks 127-140 -- the second tenure handover.
+  Not seen at 3 or 4 blocks. Open; not the configuration.
+- Pacing 225 (loop193 W3) no better than 275.
+
+**What follows.** Of B's ~240 ms, ~160 are spent moving and re-deriving what the follower already holds: with
+`F7_INGEST_ALL` every follower has verified every transaction of the block and recorded its sender before the block
+exists. A proposal body that names the transactions (hashes in block order, 5 MB instead of 26 MB -- or short ids, 1.3
+MB) lets the follower assemble the block from its own queue: no 26 MB transfer, no decode of 163,000 transactions, no
+sender look-ups -- and the hash of the assembled block against the proposal's is the whole check. Missing transactions
+fall back to the full body. This is `DIRECT_PUSH`'s channel, Rust-only and opt-in already; gov5's block topic is
+untouched. After it the build (period ~260-310 under the chain) binds again, and plan step 3 is next.
 
 ## 3. What not to do
 

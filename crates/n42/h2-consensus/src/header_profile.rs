@@ -653,6 +653,39 @@ pub fn normalize_to_gov5_h2(
     normalize_to_gov5_h2_with_header(execution, view, sealer).map(|(data, _)| data)
 }
 
+/// The gov5 header a built header becomes when it is stamped for `view` and
+/// sealed: the whole header side of [`normalize_to_gov5_h2_from_header`],
+/// with the block's withdrawals passed directly rather than read out of a
+/// payload.
+///
+/// Split out so a caller that has the built header and knows the rewards --
+/// the build chain, which seals a block the execution layer has just sealed
+/// early, before the payload has travelled -- produces the *same* header,
+/// byte for byte, as the proposal will. The chained build's parent hash is
+/// that header's hash, and a hash that differed by one field would be a
+/// block the leader could not propose.
+pub fn gov5_h2_header_for_view(
+    mut header: alloy_consensus::Header,
+    withdrawals: &[alloy_eips::eip4895::Withdrawal],
+    view: u64,
+    sealer: Option<&BlsSecretKey>,
+) -> Result<alloy_consensus::Header, HeaderProfileError> {
+    header.ommers_hash = B256::ZERO;
+    header.difficulty = U256::ZERO;
+    header.nonce = Default::default();
+    header.extra_data = HeaderExtra::for_view(view).encode();
+    if header.withdrawals_root.is_some() {
+        header.withdrawals_root = Some(gov5_rewards_root(withdrawals_to_rewards(withdrawals)));
+    }
+    if header.requests_hash.is_some_and(is_empty_requests_hash) {
+        header.requests_hash = Some(GOV5_EMPTY_REQUESTS_HASH);
+    }
+    if let Some(key) = sealer {
+        seal_header(&mut header, key)?;
+    }
+    Ok(header)
+}
+
 /// [`normalize_to_gov5_h2_with_header`] for a caller that already has the
 /// header, which is the leader on the raw payload path.
 ///
@@ -663,25 +696,13 @@ pub fn normalize_to_gov5_h2(
 /// touched: the general path decodes 163,000 of them to construct this same
 /// header and encodes them back, 130 ms at that tier, for two fields.
 pub fn normalize_to_gov5_h2_from_header(
-    mut header: alloy_consensus::Header,
+    header: alloy_consensus::Header,
     execution: &ExecutionData,
     view: u64,
     sealer: Option<&BlsSecretKey>,
 ) -> Result<(ExecutionData, alloy_consensus::Header), HeaderProfileError> {
-    header.ommers_hash = B256::ZERO;
-    header.difficulty = U256::ZERO;
-    header.nonce = Default::default();
-    header.extra_data = HeaderExtra::for_view(view).encode();
-    if header.withdrawals_root.is_some() {
-        let withdrawals = execution.payload.as_v2().map_or(&[][..], |v2| v2.withdrawals.as_slice());
-        header.withdrawals_root = Some(gov5_rewards_root(withdrawals_to_rewards(withdrawals)));
-    }
-    if header.requests_hash.is_some_and(is_empty_requests_hash) {
-        header.requests_hash = Some(GOV5_EMPTY_REQUESTS_HASH);
-    }
-    if let Some(key) = sealer {
-        seal_header(&mut header, key)?;
-    }
+    let withdrawals = execution.payload.as_v2().map_or(&[][..], |v2| v2.withdrawals.as_slice());
+    let header = gov5_h2_header_for_view(header, withdrawals, view, sealer)?;
     let hash = header.hash_slow();
     let mut data = execution.clone();
     let v1 = data.payload.as_v1_mut();
@@ -1019,6 +1040,64 @@ mod tests {
         assert_eq!(fast.block_hash(), general.block_hash());
         assert_eq!(fast.payload.as_v1(), general.payload.as_v1(), "the patched payload differs from the rebuilt one");
         assert_eq!(fast.payload.as_v2().map(|v| &v.withdrawals), general.payload.as_v2().map(|v| &v.withdrawals));
+    }
+
+    /// The build chain's whole safety argument in one assertion: the header
+    /// it seals from the built header and the block's rewards is the header
+    /// the proposal seals from the payload, byte for byte -- sealed and
+    /// unsealed. A chained build stands on that header's hash, so a single
+    /// field out of place would be a block the leader could not propose.
+    #[test]
+    fn the_chain_seals_the_header_the_proposal_will() {
+        let withdrawals = vec![alloy_eips::eip4895::Withdrawal {
+            index: 3,
+            validator_index: 4,
+            address: alloy_primitives::Address::repeat_byte(0x42),
+            amount: 5,
+        }];
+        let header = Header {
+            number: 41,
+            parent_hash: B256::repeat_byte(1),
+            gas_limit: 30_000_000,
+            gas_used: 21_000,
+            timestamp: 1_700_000_000,
+            base_fee_per_gas: Some(7),
+            withdrawals_root: Some(alloy_consensus::proofs::calculate_withdrawals_root(
+                &Withdrawals(withdrawals.clone()),
+            )),
+            blob_gas_used: Some(0),
+            excess_blob_gas: Some(0),
+            parent_beacon_block_root: Some(B256::repeat_byte(9)),
+            requests_hash: Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH),
+            difficulty: U256::from(1),
+            ommers_hash: alloy_consensus::EMPTY_OMMER_ROOT_HASH,
+            ..Default::default()
+        };
+        let block = Block {
+            header: header.clone(),
+            body: alloy_consensus::BlockBody {
+                transactions: Vec::<TxEnvelope>::new(),
+                ommers: Vec::new(),
+                withdrawals: Some(Withdrawals(withdrawals.clone())),
+            },
+        };
+        let data = execution_data_for_block(block.header.hash_slow(), &block);
+        let key = BlsSecretKey::from_bytes(&[7u8; 32]).ok();
+        for sealer in [None, key.as_ref()] {
+            // What the proposal does, from the payload.
+            let (_, proposed) =
+                normalize_to_gov5_h2_from_header(header.clone(), &data, 11, sealer).unwrap();
+            // What the chain does, from the built header and the rewards it
+            // asked the block to be built with.
+            let chained = gov5_h2_header_for_view(header.clone(), &withdrawals, 11, sealer).unwrap();
+            assert_eq!(chained, proposed);
+            assert_eq!(chained.hash_slow(), proposed.hash_slow());
+        }
+        // And a different view is a different header: the chain's guess at
+        // the view is what a mismatch is made of, and it must be visible.
+        let seven = gov5_h2_header_for_view(header.clone(), &withdrawals, 7, key.as_ref()).unwrap();
+        let eight = gov5_h2_header_for_view(header, &withdrawals, 8, key.as_ref()).unwrap();
+        assert_ne!(seven.hash_slow(), eight.hash_slow());
     }
 
     #[test]

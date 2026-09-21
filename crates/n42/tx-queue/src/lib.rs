@@ -231,8 +231,18 @@ impl<T: PoolTransaction> TxQueue<T> {
         if self.staged.load(Ordering::Acquire) == 0 {
             return;
         }
-        let staged = std::mem::take(&mut *self.inbox.lock());
+        // Taken and counted down under the inbox's lock, as a push adds
+        // under it: a drain that took a batch a push had already put in the
+        // inbox but not yet counted subtracted more than the counter held,
+        // and `staged` -- which the ingest gate reads through `len` --
+        // wrapped to about 2^64 until the push's own increment landed. It
+        // healed itself in a few nanoseconds, but a gate that reads it in
+        // that window shuts, and a debug build's `inner.len + staged`
+        // overflows.
+        let mut inbox = self.inbox.lock();
+        let staged = std::mem::take(&mut *inbox);
         self.staged.fetch_sub(staged.len(), Ordering::AcqRel);
+        drop(inbox);
         for item in staged {
             match item {
                 Staged::Raw(transaction, at) => inner.insert(transaction, at, TransactionOrigin::External),
@@ -265,7 +275,10 @@ impl<T: PoolTransaction> TxQueue<T> {
         let now = std::time::Instant::now();
         let staged: Vec<Staged<T>> = transactions.into_iter().map(|t| Staged::Raw(t, now)).collect();
         let count = staged.len();
-        self.inbox.lock().extend(staged);
+        // Counted under the inbox's lock, so the counter and the inbox
+        // always agree for a drain that holds it (see `drain_inbox`).
+        let mut inbox = self.inbox.lock();
+        inbox.extend(staged);
         self.staged.fetch_add(count, std::sync::atomic::Ordering::AcqRel);
     }
 
@@ -275,7 +288,9 @@ impl<T: PoolTransaction> TxQueue<T> {
     pub fn push_valid(&self, transactions: impl IntoIterator<Item = Arc<ValidPoolTransaction<T>>>) {
         let staged: Vec<Staged<T>> = transactions.into_iter().map(Staged::Valid).collect();
         let count = staged.len();
-        self.inbox.lock().extend(staged);
+        // Under the inbox's lock, as [`Self::push`].
+        let mut inbox = self.inbox.lock();
+        inbox.extend(staged);
         self.staged.fetch_add(count, std::sync::atomic::Ordering::AcqRel);
     }
 

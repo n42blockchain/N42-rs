@@ -188,6 +188,10 @@ pub struct OwnBlockReuse {
 /// parent-state lookup.
 pub type ForeignImport = dyn Fn(
         SealedBlock<n42_tx_types::Block>,
+        // The senders, when the caller already has them: the compact body
+        // road assembles the block out of this node's own queue, which holds
+        // each transaction with the sender its ingest recovered.
+        Option<Vec<alloy_primitives::Address>>,
         Option<tokio::sync::oneshot::Sender<()>>,
         crate::follower_import::VoteRoad,
     ) -> Result<
@@ -626,11 +630,11 @@ struct BuildOnOwnTimes {
 async fn build_on_own_block(
     reuse: Option<&OwnBlockReuse>,
     frame: &[u8],
-) -> Result<(N42BuiltPayload, BuildOnOwnTimes, Option<raw_engine::ChainHint>), String> {
+) -> Result<(N42BuiltPayload, BuildOnOwnTimes, Option<raw_engine::ChainHint>, bool), String> {
     let decode_at = std::time::Instant::now();
     let reuse = reuse.ok_or("no own-block reuse on this node")?;
     let builder = n42_engine_types::direct_build::get().ok_or("no direct builder")?;
-    let (header, attributes, chain) = raw_engine::decode_build_on_own(frame)?;
+    let (header, attributes, chain, want_hashes) = raw_engine::decode_build_on_own(frame)?;
     if header.block_access_list_hash.is_some() {
         return Err("unknown build: block access list".to_owned());
     }
@@ -709,12 +713,38 @@ async fn build_on_own_block(
     times.spawn_ms = at.elapsed().as_millis() as u64;
     let payload = handle.await.map_err(|err| format!("build task: {err}"))??;
     times.build_ms = at.elapsed().as_millis() as u64;
-    Ok((payload, times, chain))
+    Ok((payload, times, chain, want_hashes))
 }
 
 /// Writes a built payload in the channel's answer shape (status 1, the
 /// block's RLP, the requests, the access list); returns the block's size and
 /// how long the encoding took.
+/// [`push_built_payload`] with the block's transaction hashes appended, for
+/// a caller that will build a compact body out of them
+/// (`request::GET_PAYLOAD_HASHED`, `BUILD_ON_OWN`'s hash tail).
+///
+/// The hashes are the ones already cached on the transactions the builder
+/// selected -- `tx_hash()` is a read, not a keccak -- so this is 32 bytes a
+/// transaction copied, against a keccak over the block's 26 MB if the
+/// caller had to find them for itself on its proposal path.
+fn push_built_payload_hashed(
+    out: &mut Vec<u8>,
+    payload: &N42BuiltPayload,
+    with_hashes: bool,
+) -> (usize, std::time::Duration) {
+    let answer = push_built_payload(out, payload);
+    if with_hashes {
+        use alloy_consensus::transaction::TxHashRef as _;
+        let transactions = &payload.block().body().transactions;
+        out.push(1);
+        out.extend_from_slice(&(transactions.len() as u32).to_le_bytes());
+        for tx in transactions {
+            out.extend_from_slice(tx.tx_hash().as_slice());
+        }
+    }
+    answer
+}
+
 fn push_built_payload(out: &mut Vec<u8>, payload: &N42BuiltPayload) -> (usize, std::time::Duration) {
     let encode_at = std::time::Instant::now();
     let (block, listed) = encode_block_parallel_keeping_transactions(payload.block());
@@ -821,6 +851,24 @@ fn raw_shared_decode() -> bool {
     *ON.get_or_init(|| std::env::var("N42_RAW_SHARED_DECODE").is_ok_and(|v| v == "1"))
 }
 
+/// How long a compact body waits for this node's ingest to land a
+/// transaction it named and the queue did not have: `N42_COMPACT_BODY_WAIT`
+/// in milliseconds, 20 by default.
+///
+/// The ingest runs a few milliseconds behind the leader's block at worst --
+/// the flood sends every transaction to every node -- so the wait is there
+/// for that gap and not for a transaction that was never sent here. Waiting
+/// longer than a view is worse than falling back: the fallback costs the
+/// ordinary road, the wait costs the vote.
+fn miss_wait() -> std::time::Duration {
+    static WAIT: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *WAIT.get_or_init(|| {
+        std::time::Duration::from_millis(
+            std::env::var("N42_COMPACT_BODY_WAIT").ok().and_then(|v| v.parse().ok()).unwrap_or(20),
+        )
+    })
+}
+
 /// `N42_PAYLOAD_SERVE_FRESH_BUFFERS`, read once.
 fn fresh_buffers() -> bool {
     static FRESH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -846,6 +894,10 @@ async fn import_for_validator<T>(
     reuse: Option<&OwnBlockReuse>,
     data: alloy_rpc_types_engine::ExecutionData,
     pre_converted: Option<SealedBlock<n42_tx_types::Block>>,
+    // The senders the caller already has: the compact body road's, out of
+    // this node's queue. `None` and the import recovers them as it always
+    // did.
+    pre_senders: Option<Vec<alloy_primitives::Address>>,
     started: std::time::Instant,
     decoded: std::time::Duration,
     mut road: crate::follower_import::VoteRoad,
@@ -894,6 +946,7 @@ where
         // (`request::FOREIGN_BODY`); otherwise the payload, converted on the
         // worker thread as before.
         let pre = pre_converted;
+        let pre_senders = pre.is_some().then_some(pre_senders).flatten();
         let payload = pre.is_none().then(|| data.clone());
         let started = std::time::Instant::now();
         // Under deferred execution the import says when the
@@ -924,7 +977,7 @@ where
             // 163,000 transactions again is filed below, from the executed
             // block's `Arc` on a worker thread -- not here, where the clone
             // was on the vote road itself.
-            let (executed, phases) = import(sealed, Some(checked_tx), road)?;
+            let (executed, phases) = import(sealed, pre_senders, Some(checked_tx), road)?;
             Ok::<_, String>((executed, phases, converted))
         });
         tokio::pin!(handed);
@@ -1410,7 +1463,7 @@ where
             let frame_ms = started_at.elapsed().as_millis() as u64;
             let started = std::time::Instant::now();
             match build_on_own_block(reuse.as_ref(), &buf).await {
-                Ok((payload, times, chain)) => {
+                Ok((payload, times, chain, want_hashes)) => {
                     // The builder answers on its early seal, so the block's
                     // header exists here and the block does not have to be
                     // encoded for it to travel. A caller that asked to chain
@@ -1429,12 +1482,13 @@ where
                         frame.extend_from_slice(&rlp);
                         stream.write_all(&frame).await?;
                     }
-                    let (bytes, encoded) = push_built_payload(&mut out, &payload);
+                    let (bytes, encoded) = push_built_payload_hashed(&mut out, &payload, want_hashes);
                     info!(
                         target: "n42.payload_serve",
                         number = payload.block().number(),
                         txs = payload.block().body().transactions.len(),
                         bytes,
+                        hashed = want_hashes,
                         chained = chain.is_some_and(|hint| hint.chained),
                         chain_ahead = chain.is_some(),
                         frame_ms,
@@ -1457,6 +1511,112 @@ where
                 }
             }
             stream.write_all(&out).await?;
+            continue;
+        }
+        if kind == request::COMPACT_BODY {
+            let len = stream.read_u32_le().await? as usize;
+            if len > 256 << 20 {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "compact body frame too large"));
+            }
+            frame.clear();
+            frame.resize(len, 0);
+            stream.read_exact(&mut frame[..]).await?;
+            let recv = started_at.elapsed();
+            let started = std::time::Instant::now();
+            out.clear();
+            // Only with the direct import configured, as the body road: the
+            // point of assembling the block here is to put it straight into
+            // that import.
+            let validator = reuse
+                .as_ref()
+                .filter(|reuse| reuse.import_foreign.is_some())
+                .map(|reuse| std::sync::Arc::clone(&reuse.validator));
+            // `block_in_place` for the same reason the body road uses it:
+            // this borrows the connection's frame buffer and is tens of
+            // milliseconds of rayon work a runtime worker must not sit on.
+            let assembled = tokio::task::block_in_place(|| {
+                let (announced, profile, body) = raw_engine::decode_foreign_body(&frame)
+                    .map_err(|err| format!("compact body frame: {err}"))?;
+                let validator = validator.ok_or_else(|| "no direct import; send the payload".to_string())?;
+                let queue = n42_tx_queue::global::<n42_engine_types::N42PooledTransaction>()
+                    .ok_or_else(|| "no transaction queue; send the whole body".to_string())?;
+                validator
+                    .convert_compact_body_to_block(announced, profile, body, &queue, miss_wait())
+                    .map_err(|err| err.to_string())
+            });
+            let assembled = match assembled {
+                Ok(assembled) => assembled,
+                Err(message) => {
+                    // "Not this way". A miss -- this node's ingest has not
+                    // landed one of the block's transactions -- and a body
+                    // that is not the block it claims to be both end here,
+                    // and both leave the validator to ask its peers for the
+                    // whole body. Said at info level with the reason,
+                    // because a leg where this happens often is a leg whose
+                    // compact bodies are not doing their job.
+                    info!(target: "n42.payload_serve", %message, "compact body refused");
+                    out.push(2);
+                    out.extend_from_slice(&(message.len() as u32).to_le_bytes());
+                    out.extend_from_slice(message.as_bytes());
+                    stream.write_all(&out).await?;
+                    continue;
+                }
+            };
+            let n42_engine_types::engine_validator::AssembledBlock {
+                block: sealed,
+                payload: data,
+                senders,
+                assemble_us,
+                root_us,
+                miss_wait_us,
+                misses,
+                total_us,
+            } = assembled;
+            info!(
+                target: "n42.payload_serve",
+                number = sealed.number,
+                txs = sealed.body().transactions.len(),
+                bytes = len,
+                recv_ms = recv.as_millis() as u64,
+                assemble_ms = assemble_us / 1000,
+                root_ms = root_us / 1000,
+                miss_wait_ms = miss_wait_us / 1000,
+                misses,
+                decode_ms = started.elapsed().as_millis() as u64,
+                "compact body assembled from the queue"
+            );
+            let decoded_in = started.elapsed();
+            let road = crate::follower_import::VoteRoad {
+                request: "compact_body",
+                recv_us: recv.as_micros() as u64,
+                // What the assembly cost that the named parts below do not:
+                // the compact frame's decode, the seal, and reth's fork
+                // checks.
+                decode_us: total_us.saturating_sub(assemble_us + root_us + miss_wait_us),
+                reuse_us: 0,
+                prepare_us: 0,
+                dispatch_us: 0,
+                convert_us: 0,
+                remember_us: 0,
+                assemble_us,
+                root_us,
+                miss_wait_us,
+                misses: misses as u64,
+                started: started_at,
+            };
+            import_for_validator::<T>(
+                &mut stream,
+                &mut out,
+                &engine,
+                reuse.as_ref(),
+                data,
+                Some(sealed),
+                Some(senders),
+                started,
+                decoded_in,
+                road,
+            )
+            .await?;
             continue;
         }
         if kind == request::FOREIGN_BODY {
@@ -1533,9 +1693,13 @@ where
                 dispatch_us: 0,
                 convert_us: 0,
                 remember_us: 0,
+                assemble_us: 0,
+                root_us: 0,
+                miss_wait_us: 0,
+                misses: 0,
                 started: started_at,
             };
-            import_for_validator::<T>(&mut stream, &mut out, &engine, reuse.as_ref(), data, Some(sealed), started, decoded_in, road).await?;
+            import_for_validator::<T>(&mut stream, &mut out, &engine, reuse.as_ref(), data, Some(sealed), None, started, decoded_in, road).await?;
             continue;
         }
         if kind == request::NEW_PAYLOAD {
@@ -1583,6 +1747,7 @@ where
                         reuse.as_ref(),
                         data,
                         None,
+                        None,
                         started,
                         started.elapsed(),
                         crate::follower_import::VoteRoad {
@@ -1594,6 +1759,10 @@ where
                             dispatch_us: 0,
                             convert_us: 0,
                             remember_us: 0,
+                            assemble_us: 0,
+                            root_us: 0,
+                            miss_wait_us: 0,
+                            misses: 0,
                             started: started_at,
                         },
                     )
@@ -1604,9 +1773,10 @@ where
             stream.write_all(&out).await?;
             continue;
         }
-        if kind != request::GET_PAYLOAD {
+        if kind != request::GET_PAYLOAD && kind != request::GET_PAYLOAD_HASHED {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("request kind {kind}")));
         }
+        let with_hashes = kind == request::GET_PAYLOAD_HASHED;
         let id = stream.read_u64_le().await?;
         let id = alloy_rpc_types_engine::PayloadId::new(id.to_le_bytes());
         let started = std::time::Instant::now();
@@ -1622,7 +1792,7 @@ where
                 out.extend_from_slice(message.as_bytes());
             }
             Some(Ok(payload)) => {
-                let (bytes, encoded) = push_built_payload(&mut out, &payload);
+                let (bytes, encoded) = push_built_payload_hashed(&mut out, &payload, with_hashes);
                 if bytes > 1_000_000 {
                     info!(
                         target: "n42.payload_serve",

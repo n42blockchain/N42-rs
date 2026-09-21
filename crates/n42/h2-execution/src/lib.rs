@@ -22,7 +22,7 @@ pub mod mock;
 pub mod raw_engine;
 
 pub use driver::{
-    body_once, commit_fcu_async, BodyDecoder, CommitReport, DriverAction, ExecutionDriver,
+    body_once, commit_fcu_async, compact_body, BodyDecoder, CommitReport, DriverAction, ExecutionDriver,
     ImportReport, ImportVerdict,
 };
 pub use el::{ChainAhead, ChainBlock, ChainSealer, BuiltBlock, ElError, ExecutionLayer, ForeignBody, ResolveKind};

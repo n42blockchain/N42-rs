@@ -1208,7 +1208,8 @@ where
                 if let Some(built) = parent_built {
                     let _ = crate::built_executions::wait_for(built, crate::built_executions::Stage::Complete);
                     if qmdb_state.root_of(&parent_sealed).is_none() {
-                        qmdb_state.rename(built, parent_sealed).map_err(PayloadBuilderError::other)?;
+                        crate::chain_alias::rename(&qmdb_state, built, parent_sealed)
+                            .map_err(PayloadBuilderError::other)?;
                     }
                 }
             }

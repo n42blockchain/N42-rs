@@ -527,11 +527,15 @@ Window 1, full blocks; P0 = confirmed configuration, P1 = chain configuration (l
   transactions each, every refusal costing the whole body. `plan-v4/compact-body-2`: the index out of the queue's lock
   with the builder's pull back at 22 ms as the acceptance number, what the missing eight are, and a request for the
   missing transactions alone.
-- **The chain configuration is not distinguishable from the baseline in this run** (P1 391k/402k, P0 379k/433k; cycle
-  371/375 against 411/364). loop194 read +3..6%. The baseline itself spans 364-411 ms within one run; the builder's own
-  phases were slower tonight than yesterday evening with the same code path (build 313 ms against 250-271; exec 81
-  against 72, fold 86 against 76). Until that spread is understood a difference under ~10% between configurations is
-  not a finding (CLAUDE.md's rule, relearned). The chain's effect that IS beyond noise: E 53-59 -> 12 ms, every leg.
+- **The "drifting baseline" of tonight is the huge-page pool at the leg's start, again** (CLAUDE.md, round 43). Eleven
+  baseline legs, order-9+ blocks free at the start against window 1: 16,800-18,900 -> 427-433k (five legs); 16,200 ->
+  402k; 15,500-15,900 -> 397-415k; 14,700 -> 390k; 13,200-13,500 -> 369-379k. The weak starts are every round's first
+  leg -- the one after the runner's build -- and I made them weaker tonight: build output moved to `/data/n42-build`,
+  the agents' directory there was not in `dropcache`'s list, ~10 GB stayed cached, and `hugeprep` stopped at 37-38 GB
+  of its 40. Fixed in `fleet7-bench.sh` (341e636a6). A round's first leg was the baseline in every runner since
+  loop190, so **loop193-194's "+3..6% for the chain configuration" is the pool, not the chain**: at matched pools the
+  chain configuration reads 397-428k against 390-415k, inside the spread. What the chain does beyond doubt is E:
+  53-62 -> 10-12 ms in every leg; the cycle then waits on B instead.
 - A merged branch broke an integration test of the branch before it (`build_chain.rs`, a tuple grew); the runner's
   test stage caught it before the claim. Agents now run the touched crates' full test targets.
 

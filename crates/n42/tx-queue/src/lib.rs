@@ -160,10 +160,107 @@ fn run_length() -> usize {
     })
 }
 
+/// The by-hash index's bound, when one is kept: `N42_COMPACT_BODY=1` turns
+/// it on and `N42_COMPACT_BODY_INDEX` sets the bound.
+///
+/// The default holds about six full blocks at the bench tier, against a pool
+/// the bench sizes at four (loop194 X2): the index must comfortably outlast
+/// the deepest the queue runs, because the transactions a block names are
+/// the *oldest* the queue holds and an index evicting in arrival order would
+/// drop exactly those first. Only the map entries are new memory -- the
+/// transactions themselves are the lanes' -- about 56 bytes each.
+fn hash_index_capacity() -> Option<usize> {
+    static CAP: OnceLock<Option<usize>> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        if !std::env::var("N42_COMPACT_BODY").is_ok_and(|v| v == "1") {
+            return None;
+        }
+        Some(
+            std::env::var("N42_COMPACT_BODY_INDEX")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|n: &usize| *n > 0)
+                .unwrap_or(1_000_000),
+        )
+    })
+}
+
 /// A transaction handed in but not yet in its lane.
 enum Staged<T: PoolTransaction> {
     Raw(T, std::time::Instant),
     Valid(Arc<ValidPoolTransaction<T>>),
+}
+
+/// How many shards the by-hash index is split into. A block's assembly looks
+/// up 163,000 hashes at once on the worker pool while the drain is inserting
+/// the next block's worth; one lock for both made the two wait on each
+/// other, and the hashes spread evenly over the shards by their first byte.
+const HASH_INDEX_SHARDS: usize = 64;
+
+/// One shard of the by-hash index: the transactions under their hashes, and
+/// the order they were indexed in, so the oldest are evicted first.
+struct HashShard<T: PoolTransaction> {
+    by_hash: alloy_primitives::map::B256HashMap<Arc<ValidPoolTransaction<T>>>,
+    order: VecDeque<B256>,
+}
+
+/// A by-hash view of the transactions that have passed through this queue.
+///
+/// Only ever a cache: a miss costs the caller a fallback, never correctness,
+/// which is why eviction is a plain bound rather than a removal wired into
+/// every path that takes a transaction out of the lanes. What it is for is
+/// the compact block body (`N42_COMPACT_BODY`): a follower that has already
+/// ingested, verified and queued every transaction of the block a leader is
+/// proposing assembles that block from here, by the hashes the proposal
+/// names, instead of receiving and decoding 26 MB of transactions it holds.
+///
+/// It deliberately keeps what a *build* took and what an own block holds:
+/// those leave the lanes (`best_for_build`, `remove_mined_batch_collecting`)
+/// but are exactly the transactions the next block names, and a follower
+/// that was leader a moment ago must be able to assemble its successor's
+/// block. Only the bound drops them.
+struct HashIndex<T: PoolTransaction> {
+    shards: Vec<Mutex<HashShard<T>>>,
+    /// The bound per shard: the whole index holds `HASH_INDEX_SHARDS` times
+    /// this many.
+    per_shard: usize,
+}
+
+impl<T: PoolTransaction> HashIndex<T> {
+    fn new(cap: usize) -> Self {
+        let per_shard = cap.div_ceil(HASH_INDEX_SHARDS).max(1);
+        Self {
+            shards: (0..HASH_INDEX_SHARDS)
+                .map(|_| Mutex::new(HashShard { by_hash: Default::default(), order: VecDeque::new() }))
+                .collect(),
+            per_shard,
+        }
+    }
+
+    fn shard_of(&self, hash: &B256) -> &Mutex<HashShard<T>> {
+        &self.shards[usize::from(hash.0[0]) % HASH_INDEX_SHARDS]
+    }
+
+    fn insert(&self, transaction: &Arc<ValidPoolTransaction<T>>) {
+        let hash = *transaction.hash();
+        let mut shard = self.shard_of(&hash).lock();
+        if shard.by_hash.insert(hash, Arc::clone(transaction)).is_none() {
+            shard.order.push_back(hash);
+            while shard.order.len() > self.per_shard {
+                if let Some(oldest) = shard.order.pop_front() {
+                    shard.by_hash.remove(&oldest);
+                }
+            }
+        }
+    }
+
+    fn get(&self, hash: &B256) -> Option<Arc<ValidPoolTransaction<T>>> {
+        self.shard_of(hash).lock().by_hash.get(hash).cloned()
+    }
+
+    fn len(&self) -> usize {
+        self.shards.iter().map(|shard| shard.lock().by_hash.len()).sum()
+    }
 }
 
 /// The queue. Cheap to clone; every clone is the same queue.
@@ -178,11 +275,19 @@ pub struct TxQueue<T: PoolTransaction> {
     inner: Arc<Mutex<Inner<T>>>,
     inbox: Arc<Mutex<Vec<Staged<T>>>>,
     staged: Arc<std::sync::atomic::AtomicUsize>,
+    /// The by-hash index, when this queue keeps one. `None` is the default
+    /// and costs the drain nothing at all -- not a lock, not a hash.
+    by_hash: Option<Arc<HashIndex<T>>>,
 }
 
 impl<T: PoolTransaction> Clone for TxQueue<T> {
     fn clone(&self) -> Self {
-        Self { inner: Arc::clone(&self.inner), inbox: Arc::clone(&self.inbox), staged: Arc::clone(&self.staged) }
+        Self {
+            inner: Arc::clone(&self.inner),
+            inbox: Arc::clone(&self.inbox),
+            staged: Arc::clone(&self.staged),
+            by_hash: self.by_hash.clone(),
+        }
     }
 }
 
@@ -199,9 +304,52 @@ impl<T: PoolTransaction> Default for TxQueue<T> {
 }
 
 impl<T: PoolTransaction> TxQueue<T> {
-    /// An empty queue, taking runs of `N42_TX_QUEUE_RUN` per sender.
+    /// An empty queue, taking runs of `N42_TX_QUEUE_RUN` per sender, with
+    /// the by-hash index iff `N42_COMPACT_BODY=1` asked for one.
     pub fn new() -> Self {
-        Self::with_run_length(run_length())
+        let queue = Self::with_run_length(run_length());
+        match hash_index_capacity() {
+            Some(cap) => queue.with_hash_index(cap),
+            None => queue,
+        }
+    }
+
+    /// The same queue keeping a by-hash index of up to `cap` transactions.
+    /// What a test uses to choose the path without the process environment
+    /// deciding for it.
+    #[must_use]
+    pub fn with_hash_index(mut self, cap: usize) -> Self {
+        self.by_hash = Some(Arc::new(HashIndex::new(cap)));
+        self
+    }
+
+    /// Whether this queue keeps a by-hash index.
+    pub const fn has_hash_index(&self) -> bool {
+        self.by_hash.is_some()
+    }
+
+    /// How many transactions the by-hash index holds; 0 without one.
+    pub fn hash_index_len(&self) -> usize {
+        self.by_hash.as_ref().map_or(0, |index| index.len())
+    }
+
+    /// The transactions for `hashes`, in the same order, `None` where the
+    /// index does not hold one -- the transaction never reached this node,
+    /// is still in the inbox, or has been evicted. Nothing is removed: the
+    /// canonical prune is what takes a block's transactions out, as it
+    /// always was.
+    ///
+    /// Looked up on the worker pool: 163,000 of them sequentially is 10-16
+    /// ms of a vote road whose whole budget is ~140.
+    pub fn get_by_hashes(&self, hashes: &[B256]) -> Vec<Option<Arc<ValidPoolTransaction<T>>>>
+    where
+        T: Send + Sync,
+    {
+        let Some(index) = self.by_hash.as_ref() else {
+            return vec![None; hashes.len()];
+        };
+        use rayon::prelude::*;
+        hashes.par_iter().map(|hash| index.get(hash)).collect()
     }
 
     /// An empty queue taking `run` consecutive nonces per sender per turn.
@@ -221,6 +369,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             })),
             inbox: Arc::new(Mutex::new(Vec::new())),
             staged: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            by_hash: None,
         }
     }
 
@@ -243,10 +392,17 @@ impl<T: PoolTransaction> TxQueue<T> {
         let staged = std::mem::take(&mut *inbox);
         self.staged.fetch_sub(staged.len(), Ordering::AcqRel);
         drop(inbox);
+        // Indexed as they go into the lanes, and only when an index is kept.
+        // Measured on the ingest's own path (`bench_drain_with_and_without_the_hash_index`)
+        // because the drain is the fleet's supply: a microsecond a
+        // transaction here is 163 ms a block of one core.
         for item in staged {
-            match item {
+            let queued = match item {
                 Staged::Raw(transaction, at) => inner.insert(transaction, at, TransactionOrigin::External),
                 Staged::Valid(valid) => inner.insert_valid(valid),
+            };
+            if let (Some(index), Some(queued)) = (self.by_hash.as_ref(), queued) {
+                index.insert(queued);
             }
         }
     }
@@ -541,7 +697,15 @@ impl<T: PoolTransaction> TxQueue<T> {
 }
 
 impl<T: PoolTransaction> Inner<T> {
-    fn insert(&mut self, transaction: T, now: std::time::Instant, origin: TransactionOrigin) {
+    /// Queues one transaction, handing back what was queued so the caller
+    /// can index it; `None` when the lane refused it (already queued at that
+    /// nonce, or the chain has passed it).
+    fn insert(
+        &mut self,
+        transaction: T,
+        now: std::time::Instant,
+        origin: TransactionOrigin,
+    ) -> Option<&Arc<ValidPoolTransaction<T>>> {
         let sender = transaction.sender();
         let nonce = transaction.nonce();
         let next_id = &mut self.next_sender_id;
@@ -551,7 +715,7 @@ impl<T: PoolTransaction> Inner<T> {
             Lane { by_nonce: BTreeMap::new(), queued: false, id, mined: None }
         });
         if lane.by_nonce.contains_key(&nonce) || lane.is_stale(nonce) {
-            return;
+            return None;
         }
         let valid = Arc::new(ValidPoolTransaction {
             transaction,
@@ -567,9 +731,14 @@ impl<T: PoolTransaction> Inner<T> {
             lane.queued = true;
             self.arrivals.push_back(sender);
         }
+        lane.by_nonce.get(&nonce)
     }
 
-    fn insert_valid(&mut self, valid: Arc<ValidPoolTransaction<T>>) {
+    /// [`Self::insert`] for a transaction the pool has already validated.
+    fn insert_valid(
+        &mut self,
+        valid: Arc<ValidPoolTransaction<T>>,
+    ) -> Option<&Arc<ValidPoolTransaction<T>>> {
         let sender = valid.sender();
         let nonce = valid.nonce();
         let next_id = &mut self.next_sender_id;
@@ -579,7 +748,7 @@ impl<T: PoolTransaction> Inner<T> {
             Lane { by_nonce: BTreeMap::new(), queued: false, id, mined: None }
         });
         if lane.by_nonce.contains_key(&nonce) || lane.is_stale(nonce) {
-            return;
+            return None;
         }
         lane.by_nonce.insert(nonce, valid);
         self.len += 1;
@@ -587,6 +756,7 @@ impl<T: PoolTransaction> Inner<T> {
             lane.queued = true;
             self.arrivals.push_back(sender);
         }
+        lane.by_nonce.get(&nonce)
     }
 
     /// Puts transactions a build took back at their nonces; their senders go

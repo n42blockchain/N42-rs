@@ -108,6 +108,30 @@ pub struct ChainBlock {
     pub withdrawals: Option<Vec<alloy_eips::eip4895::Withdrawal>>,
 }
 
+/// Another node's block as the bytes the gossip delivered it in.
+///
+/// The body is gov5's wire form, `[header, transactions, verifiers,
+/// rewards]` (plus the EIP-7928 access list when the producer sent one) --
+/// the same bytes a peer asking `block_by_hash` is served. Everything an
+/// Engine API payload carries is derived from it, so nothing travels beside
+/// it but the identity the consensus layer voted on: the block hash the
+/// proposal named, and the header profile this chain reads headers under.
+/// `number` and `timestamp` are the header's, kept here so the driver can
+/// key and classify the block without decoding the body again.
+#[derive(Debug, Clone)]
+pub struct ForeignBody {
+    /// The hash the proposal named; the decoded header must hash to it.
+    pub block_hash: B256,
+    /// The block number.
+    pub number: u64,
+    /// The block timestamp, which decides the deferred-execution path.
+    pub timestamp: u64,
+    /// The header profile the body was read under.
+    pub profile: n42_h2_consensus::header_profile::N42HeaderProfile,
+    /// The body, exactly as received.
+    pub rlp: alloy_primitives::Bytes,
+}
+
 /// How to resolve a started build — the node-neutral stand-in for reth's
 /// `PayloadKind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,6 +269,26 @@ pub trait ExecutionLayer: Send + Sync + 'static {
     ) -> Result<PayloadStatus, ElError> {
         drop(checked);
         self.new_payload_for(path, payload).await
+    }
+
+    /// Hands the execution layer a foreign block as the bytes it arrived in
+    /// ([`ForeignBody`]), to be decoded once there instead of decoded here,
+    /// re-encoded as a payload and parsed again on the other side.
+    ///
+    /// Otherwise [`Self::new_payload_checked`]: `checked` releases the vote
+    /// when the execution layer has checked the block, and the returned
+    /// status is the import. `None` means "not this way" -- no channel, an
+    /// execution layer that does not serve the request, or one that refused
+    /// this body -- and the caller sends the same block as a payload. The
+    /// default offers nothing.
+    async fn new_payload_body_checked(
+        &self,
+        path: ExecutionPath,
+        body: &ForeignBody,
+        checked: tokio::sync::oneshot::Sender<PayloadStatus>,
+    ) -> Option<Result<PayloadStatus, ElError>> {
+        let _ = (path, body, checked);
+        None
     }
 
     /// Engine-API `forkchoiceUpdated` without attributes — the finalise and

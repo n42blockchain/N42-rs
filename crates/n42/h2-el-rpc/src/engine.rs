@@ -52,7 +52,7 @@ use alloy_rpc_types_engine::{
 };
 use n42_h2_execution::{ChainBlock, BuiltBlock, ElError, ExecutionLayer, ExecutionPath, ResolveKind};
 use serde_json::{json, Value};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::transport::{
     JsonRpcTransport, TransportError, INVALID_PAYLOAD_ATTRIBUTES, METHOD_NOT_FOUND,
@@ -525,6 +525,18 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
         self.new_payload_for(path, payload).await
     }
 
+    async fn new_payload_body_checked(
+        &self,
+        path: ExecutionPath,
+        body: &n42_h2_execution::ForeignBody,
+        checked: tokio::sync::oneshot::Sender<PayloadStatus>,
+    ) -> Option<Result<PayloadStatus, ElError>> {
+        if !path.uses_current_engine_api() || !n42_h2_execution::body_once() {
+            return None;
+        }
+        self.foreign_body_over_channel(body, checked).await
+    }
+
     async fn fork_choice_updated(
         &self,
         state: ForkchoiceState,
@@ -936,6 +948,125 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
             }
             Err(err) => {
                 debug!(target: "n42.h2.el", %err, "raw newPayload channel failed; using JSON for this block");
+                None
+            }
+        }
+    }
+
+    /// The foreign-body import (`request::FOREIGN_BODY`): the block goes to
+    /// the execution layer as the bytes the gossip delivered it in, and is
+    /// decoded there once instead of here, re-encoded as a payload, and
+    /// parsed again on the other side -- 51.5 ms of hand-off and 55 ms of
+    /// `convert_payload_to_block` on a 261 ms R1 (loop179).
+    ///
+    /// `None` is "not this way", and only ever before the execution layer
+    /// has answered anything: no channel, an execution layer that does not
+    /// serve the request, one that refused this body, or a connection that
+    /// failed before the first frame. The caller then sends the block as a
+    /// `NEW_PAYLOAD` payload. A failure *after* the check has been released
+    /// is `Some(Err(..))`: that block is already being imported over there
+    /// and must not be sent a second time.
+    async fn foreign_body_over_channel(
+        &self,
+        body: &n42_h2_execution::ForeignBody,
+        checked: tokio::sync::oneshot::Sender<PayloadStatus>,
+    ) -> Option<Result<PayloadStatus, ElError>> {
+        use n42_h2_execution::raw_engine::reply;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (addr, taken) = {
+            let mut channel = self.raw_import.lock().await;
+            let addr = self.raw_endpoint(&mut channel).await?;
+            (addr, channel.stream.take())
+        };
+        let started = std::time::Instant::now();
+        let frame = n42_h2_execution::raw_engine::encode_foreign_body(
+            body.block_hash,
+            body.profile,
+            &body.rlp,
+        );
+        let mut checked = Some(checked);
+        // Set once the execution layer has said anything about this block:
+        // from there on a failure is this block's failure, not a reason to
+        // send it again.
+        let mut committed = false;
+        let attempt: std::io::Result<(PayloadStatus, tokio::net::TcpStream)> = async {
+            let mut conn = match taken {
+                Some(stream) => stream,
+                None => {
+                    let stream = tokio::net::TcpStream::connect(addr).await?;
+                    stream.set_nodelay(true)?;
+                    stream
+                }
+            };
+            conn.write_u8(n42_h2_execution::raw_engine::request::FOREIGN_BODY).await?;
+            conn.write_u32_le(frame.len() as u32).await?;
+            conn.write_all(&frame).await?;
+            loop {
+                let kind = conn.read_u8().await?;
+                let len = conn.read_u32_le().await? as usize;
+                let mut buf = vec![0u8; len];
+                conn.read_exact(&mut buf).await?;
+                match kind {
+                    reply::CHECKED | reply::VALUE => {
+                        let status = n42_h2_execution::raw_engine::decode_payload_status(&buf)
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                        committed = true;
+                        if kind == reply::VALUE {
+                            return Ok((status, conn));
+                        }
+                        if let Some(sender) = checked.take() {
+                            debug!(
+                                target: "n42.h2.el",
+                                check_ms = started.elapsed().as_millis() as u64,
+                                status = ?status.status,
+                                "raw foreign body: checked"
+                            );
+                            let _ = sender.send(status);
+                        }
+                    }
+                    reply::ERROR => {
+                        let message = String::from_utf8_lossy(&buf).into_owned();
+                        // The execution layer declining the request itself
+                        // (an older binary, no direct import, a body it
+                        // cannot read) -- the caller sends the payload.
+                        return Err(std::io::Error::other(message));
+                    }
+                    other => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("status {other}"),
+                        ));
+                    }
+                }
+            }
+        }
+        .await;
+        match attempt {
+            Ok((status, conn)) => {
+                let mut channel = self.raw_import.lock().await;
+                if channel.stream.is_none() {
+                    channel.stream = Some(conn);
+                }
+                debug!(
+                    target: "n42.h2.el",
+                    bytes = frame.len(),
+                    round_trip_ms = started.elapsed().as_millis() as u64,
+                    status = ?status.status,
+                    "raw foreign body"
+                );
+                Some(Ok(status))
+            }
+            Err(err) if committed => {
+                warn!(
+                    target: "n42.h2.el",
+                    block = ?body.block_hash,
+                    %err,
+                    "the foreign body failed after the execution layer took it; not sending it again"
+                );
+                Some(Err(ElError::new(err)))
+            }
+            Err(err) => {
+                debug!(target: "n42.h2.el", %err, "foreign body refused; sending the payload for this block");
                 None
             }
         }

@@ -23,6 +23,7 @@ use alloy_rpc_types_engine::{
     ExecutionPayloadV2, ExecutionPayloadV3, ExecutionPayloadV4, PayloadAttributes, PayloadStatus,
     PayloadStatusEnum, PraguePayloadFields,
 };
+use n42_h2_consensus::header_profile::N42HeaderProfile;
 
 const VERSION: u8 = 1;
 
@@ -48,6 +49,22 @@ pub mod request {
     /// (`unknown build`, `no direct builder`) telling the caller to start
     /// the build the ordinary way.
     pub const BUILD_ON_OWN: u8 = 4;
+    /// `u32` length and an encoded foreign-body request follow (see
+    /// [`super::encode_foreign_body`]): another node's block **as the bytes
+    /// the gossip delivered it in**, `[header, txs, verifiers, rewards]`,
+    /// plus the block hash consensus voted on and the header profile the
+    /// sender read it under. The execution layer decodes that once, in
+    /// parallel, straight into the block its import takes -- where
+    /// `NEW_PAYLOAD` has the validator decode the body, re-encode 163,000
+    /// transactions into a frame of their own and the execution layer parse
+    /// them a second time (51.5 ms of hand-off and 55 ms of
+    /// `convert_payload_to_block` on a 261 ms R1, loop179).
+    ///
+    /// The answers are `NEW_PAYLOAD`'s -- a [`super::reply::CHECKED`] frame
+    /// then a [`super::reply::VALUE`] one -- with [`super::reply::ERROR`]
+    /// meaning "not this way": the caller sends the same block as a
+    /// `NEW_PAYLOAD` payload, as the own-block path falls back today.
+    pub const FOREIGN_BODY: u8 = 5;
 }
 
 /// Reply kinds on the channel.
@@ -265,6 +282,56 @@ fn decode_with(mut r: Reader<'_>) -> Result<ExecutionData, String> {
     Ok(ExecutionData::new(payload, sidecar))
 }
 
+/// Which header shape the body was read under, on the wire.
+///
+/// Both ends derive it from the same genesis, so a mismatch is a
+/// misconfiguration rather than something to negotiate -- it is sent so the
+/// execution layer can say so and refuse, instead of decoding a header under
+/// the wrong rules.
+const fn profile_byte(profile: N42HeaderProfile) -> u8 {
+    match profile {
+        N42HeaderProfile::Ethereum => 0,
+        N42HeaderProfile::Gov5H2 => 1,
+    }
+}
+
+/// Encodes a foreign block's gossip body for [`request::FOREIGN_BODY`].
+///
+/// `block_hash` is the hash the proposal named and consensus voted on; the
+/// body is the wire form exactly as it arrived, one opaque field. Nothing in
+/// it is re-encoded: the whole point is that these bytes are parsed once, on
+/// the other side.
+pub fn encode_foreign_body(block_hash: B256, profile: N42HeaderProfile, body: &[u8]) -> Vec<u8> {
+    let mut w = Writer(Vec::with_capacity(body.len() + 64));
+    w.u8(VERSION);
+    w.fixed(block_hash.as_slice());
+    w.u8(profile_byte(profile));
+    w.bytes(body);
+    w.0
+}
+
+/// Decodes what [`encode_foreign_body`] produced.
+///
+/// The body comes back as a slice of `buf` when `buf` is shared bytes, so
+/// the ~25 MB frame is not copied to be read.
+pub fn decode_foreign_body(buf: &Bytes) -> Result<(B256, N42HeaderProfile, Bytes), String> {
+    let mut r = Reader { rest: buf, shared: Some(buf) };
+    if r.u8()? != VERSION {
+        return Err("unknown raw engine version".into());
+    }
+    let block_hash = r.b256()?;
+    let profile = match r.u8()? {
+        0 => N42HeaderProfile::Ethereum,
+        1 => N42HeaderProfile::Gov5H2,
+        other => return Err(format!("unknown header profile {other}")),
+    };
+    let body = r.bytes()?;
+    if !r.rest.is_empty() {
+        return Err(format!("foreign body frame has {} trailing bytes", r.rest.len()));
+    }
+    Ok((block_hash, profile, body))
+}
+
 /// Encodes a build-on-own request: the sealed header of the block just built
 /// (RLP) and the attributes of the block to build on it.
 pub fn encode_build_on_own(header: &alloy_consensus::Header, attrs: &PayloadAttributes) -> Vec<u8> {
@@ -412,6 +479,36 @@ mod tests {
             assert_eq!(a, attrs);
         }
     }
+    #[test]
+    fn a_foreign_body_round_trips_and_is_not_copied() {
+        let body: Bytes = Bytes::from(vec![0xab; 4096]);
+        let hash = B256::repeat_byte(0x5a);
+        for profile in [N42HeaderProfile::Ethereum, N42HeaderProfile::Gov5H2] {
+            let frame = Bytes::from(encode_foreign_body(hash, profile, &body));
+            let (back_hash, back_profile, back_body) = decode_foreign_body(&frame).expect("decodes");
+            assert_eq!(back_hash, hash);
+            assert_eq!(back_profile, profile);
+            assert_eq!(back_body, body);
+            // A slice of the frame, not a copy of the body.
+            assert!(
+                back_body.as_ptr() >= frame.as_ptr()
+                    && back_body.as_ptr() < unsafe { frame.as_ptr().add(frame.len()) }
+            );
+        }
+    }
+
+    #[test]
+    fn a_truncated_or_padded_foreign_body_is_refused() {
+        let frame = encode_foreign_body(B256::ZERO, N42HeaderProfile::Gov5H2, &[1, 2, 3]);
+        assert!(decode_foreign_body(&Bytes::from(frame[..frame.len() - 1].to_vec())).is_err());
+        let mut padded = frame.clone();
+        padded.push(0);
+        assert!(decode_foreign_body(&Bytes::from(padded)).is_err());
+        let mut wrong_version = frame;
+        wrong_version[0] = VERSION + 1;
+        assert!(decode_foreign_body(&Bytes::from(wrong_version)).is_err());
+    }
+
     #[test]
     fn payload_status_round_trips() {
         for status in [

@@ -26,7 +26,7 @@ use n42_h2_consensus::{ConsensusEvent, EngineOutput};
 use tracing::{debug, info, warn};
 
 use crate::{
-    el::{BuiltBlock, ElError, ExecutionLayer, ResolveKind},
+    el::{BuiltBlock, ElError, ExecutionLayer, ForeignBody, ResolveKind},
     ExecutionPath,
 };
 
@@ -189,6 +189,34 @@ pub type PayloadNormalizer = dyn Fn(&ExecutionData, Option<&alloy_consensus::Hea
     + Send
     + Sync;
 
+/// Decodes a held [`ForeignBody`] into the payload the `NEW_PAYLOAD`
+/// fallback sends. The wire form belongs to the node (`n42-h2-net`), not
+/// here, so the node installs it.
+#[derive(Clone)]
+pub struct BodyDecoder(
+    std::sync::Arc<dyn Fn(&ForeignBody) -> Result<ExecutionData, String> + Send + Sync>,
+);
+
+impl BodyDecoder {
+    /// Wraps the node's decode.
+    pub fn new(
+        decode: impl Fn(&ForeignBody) -> Result<ExecutionData, String> + Send + Sync + 'static,
+    ) -> Self {
+        Self(std::sync::Arc::new(decode))
+    }
+
+    /// The payload a held body describes.
+    pub fn decode(&self, body: &ForeignBody) -> Result<ExecutionData, String> {
+        (self.0)(body)
+    }
+}
+
+impl std::fmt::Debug for BodyDecoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BodyDecoder")
+    }
+}
+
 struct Normalizer(Box<PayloadNormalizer>);
 
 impl std::fmt::Debug for Normalizer {
@@ -315,6 +343,17 @@ pub struct ExecutionDriver<E> {
     /// Payloads seen but not yet executed, keyed by block hash. Populated from
     /// proposals, direct pushes, and our own builds.
     payloads: HashMap<B256, ExecutionData>,
+    /// Foreign blocks held as the bytes they arrived in, for
+    /// [`ExecutionLayer::new_payload_body_checked`] (`N42_BODY_ONCE=1`). A
+    /// block here has no entry in `payloads`: the whole point is that the
+    /// body is decoded once, on the execution layer's side. If that side
+    /// refuses the request the body is decoded here instead -- on the
+    /// import's task, off the consensus loop -- by `body_decoder`.
+    bodies: HashMap<B256, ForeignBody>,
+    /// Turns a held body into the payload the fallback sends. Installed by
+    /// the node, which owns the wire format; without one a refused body
+    /// cannot fall back and the block is asked for again.
+    body_decoder: Option<BodyDecoder>,
     /// Current head, as consensus understands it.
     head: B256,
     /// Last block consensus committed.
@@ -344,6 +383,34 @@ pub struct ExecutionDriver<E> {
     payload_order: Vec<B256>,
 }
 
+/// `N42_BODY_ONCE`, read once: opt-in, and read on the validator's side,
+/// because that is the side that stops decoding the body. Off, everything
+/// takes the `NEW_PAYLOAD` path it always took.
+pub fn body_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_BODY_ONCE").is_ok_and(|v| v == "1"))
+}
+
+/// Releases a deferred block's vote: the execution layer said the header
+/// carries its result for the parent and the transactions are includable.
+/// Anything but VALID is not a vote and is left to the import's verdict.
+fn release_check(
+    report: &tokio::sync::mpsc::UnboundedSender<ImportReport>,
+    block_hash: B256,
+    txs: usize,
+    started: std::time::Instant,
+    checked: Option<alloy_rpc_types_engine::PayloadStatus>,
+) {
+    let Some(status) = checked else { return };
+    if !matches!(status.status, PayloadStatusEnum::Valid) {
+        return;
+    }
+    if txs >= 10_000 {
+        info!(target: "n42.h2.el", block = ?block_hash, txs, check_ms = started.elapsed().as_millis() as u64, "checked a block; executing");
+    }
+    let _ = report.send(ImportReport::Checked(block_hash));
+}
+
 impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// Default payload cache size — a few views' worth of blocks.
     pub const DEFAULT_MAX_CACHED_PAYLOADS: usize = 16;
@@ -365,6 +432,8 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             foreign_imports_rx: Some(foreign_rx),
             import_queue: std::collections::VecDeque::new(),
             payloads: HashMap::new(),
+            bodies: HashMap::new(),
+            body_decoder: None,
             head: genesis,
             finalized: genesis,
             executing: std::collections::HashSet::new(),
@@ -415,6 +484,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             while self.payload_order.len() > self.max_cached_payloads {
                 let oldest = self.payload_order.remove(0);
                 self.payloads.remove(&oldest);
+                self.bodies.remove(&oldest);
             }
         }
     }
@@ -422,6 +492,50 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// Whether a payload is cached for `block_hash`.
     pub fn has_payload(&self, block_hash: &B256) -> bool {
         self.payloads.contains_key(block_hash)
+    }
+
+    /// Records a foreign block as the bytes it arrived in, so its import
+    /// can hand the execution layer those bytes rather than a payload
+    /// re-encoded from them. Bounded exactly as the payload cache is.
+    pub fn cache_body(&mut self, body: ForeignBody) {
+        let block_hash = body.block_hash;
+        if self.bodies.insert(block_hash, body).is_none() {
+            self.payload_order.push(block_hash);
+            while self.payload_order.len() > self.max_cached_payloads {
+                let oldest = self.payload_order.remove(0);
+                self.payloads.remove(&oldest);
+                self.bodies.remove(&oldest);
+            }
+        }
+    }
+
+    /// Installs the decoder the `NEW_PAYLOAD` fallback needs. See
+    /// [`BodyDecoder`].
+    pub fn set_body_decoder(&mut self, decoder: BodyDecoder) {
+        self.body_decoder = Some(decoder);
+    }
+
+    /// The payload for a block on the paths that have no body request of
+    /// their own (the awaited import, the queued one): the cached payload,
+    /// or a held body decoded here. Decoding on the loop is the price of
+    /// those paths; the deferred path, the one the fleet runs, decodes only
+    /// on its own task and only when the execution layer refused the body.
+    fn payload_for(&self, block_hash: B256) -> Result<ExecutionData, DriverAction> {
+        if let Some(payload) = self.payloads.get(&block_hash) {
+            return Ok(payload.clone());
+        }
+        match (self.bodies.get(&block_hash), &self.body_decoder) {
+            (Some(body), Some(decode)) => decode.decode(body).map_err(|err| {
+                warn!(target: "n42.h2.el", block = ?block_hash, %err, "a held body could not be decoded");
+                DriverAction::Rejected { block_hash, reason: err }
+            }),
+            _ => Err(DriverAction::PayloadMissing { block_hash }),
+        }
+    }
+
+    /// Whether a body is held for `block_hash`.
+    pub fn has_body(&self, block_hash: &B256) -> bool {
+        self.bodies.contains_key(block_hash)
     }
 
     /// The forkchoice this driver would send right now.
@@ -930,35 +1044,86 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             }
             return DriverAction::Ignored;
         }
-        let Some(payload) = self.payloads.get(&block_hash).cloned() else {
+        // The body when this node kept one (`N42_BODY_ONCE=1`), the payload
+        // otherwise; a body's payload is only made if the execution layer
+        // refuses the body.
+        let body = self.bodies.get(&block_hash).cloned();
+        let payload = self.payloads.get(&block_hash).cloned();
+        if body.is_none() && payload.is_none() {
             return DriverAction::PayloadMissing { block_hash };
-        };
+        }
         self.executing.insert(block_hash);
         let el = std::sync::Arc::clone(&self.el);
         let report = self.foreign_imports.clone();
         let guard = ReportGuard { block_hash, report: Some(report.clone()) };
-        let txs = payload.payload.as_v1().transactions.len();
+        // A body's transaction count is not known here -- that is the point
+        // of not decoding it -- so it counts as a big block for the logs.
+        let txs = payload.as_ref().map_or(usize::MAX, |p| p.payload.as_v1().transactions.len());
+        let decoder = self.body_decoder.clone();
         tokio::spawn(async move {
             let started = std::time::Instant::now();
-            let (checked_tx, checked_rx) = tokio::sync::oneshot::channel();
-            let import = el.new_payload_checked(ExecutionPath::LIVE_SEQUENTIAL, payload, checked_tx);
-            tokio::pin!(import);
-            // The check, when the execution layer offers one, arrives while
-            // the import is still running; a dropped sender means it does
-            // not, and the vote waits for the import as before.
-            let outcome = tokio::select! {
-                checked = checked_rx => {
-                    if let Ok(status) = checked {
-                        if matches!(status.status, PayloadStatusEnum::Valid) {
-                            if txs >= 10_000 {
-                                info!(target: "n42.h2.el", block = ?block_hash, txs, check_ms = started.elapsed().as_millis() as u64, "checked a block; executing");
+            // The body first. `None` is the execution layer saying "not this
+            // way" before it answered anything, so nothing has been checked
+            // and the payload below is the same block sent again; a failure
+            // after the check comes back as `Some(Err(..))` and is not
+            // retried.
+            let mut answered = None;
+            if let Some(body) = &body {
+                let (checked_tx, checked_rx) = tokio::sync::oneshot::channel();
+                let call = el.new_payload_body_checked(ExecutionPath::LIVE_SEQUENTIAL, body, checked_tx);
+                tokio::pin!(call);
+                answered = tokio::select! {
+                    checked = checked_rx => {
+                        release_check(&report, block_hash, txs, started, checked.ok());
+                        call.await
+                    }
+                    answer = &mut call => answer,
+                };
+                if answered.is_none() {
+                    debug!(
+                        target: "n42.h2.el",
+                        block = ?block_hash,
+                        "the execution layer would not take the body; sending the payload"
+                    );
+                }
+            }
+            let outcome = match answered {
+                Some(outcome) => outcome,
+                None => {
+                    // The payload: the one this node already held, or the
+                    // body decoded here -- on this task, not on the loop.
+                    let payload = match payload {
+                        Some(payload) => Ok(payload),
+                        None => match (&body, &decoder) {
+                            (Some(body), Some(decode)) => decode.decode(body).map_err(ElError::new),
+                            (Some(_), None) => Err(ElError::new(
+                                "the body cannot be sent as a payload: no decoder installed",
+                            )),
+                            (None, _) => Err(ElError::new("no payload and no body for this block")),
+                        },
+                    };
+                    match payload {
+                        Ok(payload) => {
+                            let (checked_tx, checked_rx) = tokio::sync::oneshot::channel();
+                            let import = el.new_payload_checked(ExecutionPath::LIVE_SEQUENTIAL, payload, checked_tx);
+                            tokio::pin!(import);
+                            // The check, when the execution layer offers one, arrives while
+                            // the import is still running; a dropped sender means it does
+                            // not, and the vote waits for the import as before.
+                            tokio::select! {
+                                checked = checked_rx => {
+                                    release_check(&report, block_hash, txs, started, checked.ok());
+                                    import.await
+                                }
+                                outcome = &mut import => outcome,
                             }
-                            let _ = report.send(ImportReport::Checked(block_hash));
+                        }
+                        Err(err) => {
+                            warn!(target: "n42.h2.el", block = ?block_hash, %err, "a held body could not be sent");
+                            Err(err)
                         }
                     }
-                    import.await
                 }
-                outcome = &mut import => outcome,
             };
             if txs >= 10_000 {
                 info!(target: "n42.h2.el", block = ?block_hash, txs, import_ms = started.elapsed().as_millis() as u64, "imported a block");
@@ -982,8 +1147,9 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             }
             return DriverAction::Ignored;
         }
-        let Some(payload) = self.payloads.get(&block_hash).cloned() else {
-            return DriverAction::PayloadMissing { block_hash };
+        let payload = match self.payload_for(block_hash) {
+            Ok(payload) => payload,
+            Err(missing) => return missing,
         };
         self.executing.insert(block_hash);
         let el = std::sync::Arc::clone(&self.el);
@@ -1059,7 +1225,8 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// Drops a cached payload (a rejected block's), so a block seen again
     /// is fetched and executed afresh.
     pub fn forget_payload(&mut self, block_hash: B256) {
-        if self.payloads.remove(&block_hash).is_some() {
+        let had_body = self.bodies.remove(&block_hash).is_some();
+        if self.payloads.remove(&block_hash).is_some() || had_body {
             self.payload_order.retain(|h| h != &block_hash);
         }
     }
@@ -1146,7 +1313,12 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     /// Follower path: executes a proposed block and, on acceptance, produces the
     /// event that releases the import-gated vote.
     async fn execute(&mut self, block_hash: B256) -> DriverAction {
-        if let Some(timestamp) = self.payloads.get(&block_hash).map(|p| p.payload.timestamp()) {
+        let timestamp = self
+            .payloads
+            .get(&block_hash)
+            .map(|p| p.payload.timestamp())
+            .or_else(|| self.bodies.get(&block_hash).map(|body| body.timestamp));
+        if let Some(timestamp) = timestamp {
             if self.deferred_at(timestamp) {
                 return self.spawn_execute_deferred(block_hash);
             }
@@ -1154,8 +1326,9 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         if self.spawn_imports {
             return self.spawn_execute(block_hash);
         }
-        let Some(payload) = self.payloads.get(&block_hash).cloned() else {
-            return DriverAction::PayloadMissing { block_hash };
+        let payload = match self.payload_for(block_hash) {
+            Ok(payload) => payload,
+            Err(missing) => return missing,
         };
         let txs = payload.payload.as_v1().transactions.len();
         let started = std::time::Instant::now();
@@ -1282,6 +1455,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                     self.head = block_hash;
                     // Committed blocks never need re-execution.
                     self.payloads.remove(&block_hash);
+                    self.bodies.remove(&block_hash);
                     self.payload_order.retain(|h| h != &block_hash);
                     DriverAction::Finalized { block_hash }
                 }

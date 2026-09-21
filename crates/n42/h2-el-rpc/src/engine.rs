@@ -219,6 +219,54 @@ async fn read_build_frame(
 /// in its hint; if the fleet ends up proposing that block under another view
 /// the seal differs, the parent differs, and the request that arrives
 /// discards this build instead of taking it.
+/// Which build a chain task is, so it can take its own entry out of the slot
+/// the moment the execution layer says no.
+#[derive(Clone, Copy, Debug)]
+struct ChainWho {
+    parent: B256,
+    number: u64,
+    started: std::time::Instant,
+}
+
+/// Takes a chained build out of the slot the moment its own task knows it
+/// produced nothing, instead of leaving it there until the proposal asks.
+///
+/// The execution layer refuses in 0.4-1.3 ms (loop193 W1b) and the proposal's
+/// request comes ~275 ms later, so a slot left full is 275 ms in which the
+/// chain is known to be dead and nothing may replace it. The branch is
+/// abandoned with it: nothing can follow a build that does not exist.
+fn abandon_chain(
+    chain: &std::sync::Arc<std::sync::Mutex<ChainState>>,
+    generation: u64,
+    who: ChainWho,
+    el_reason: &str,
+) {
+    let mut state = chain.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // The lock is what orders this against `start_chain`, which holds it from
+    // spawning this task until the slot is filled.
+    let mine = state
+        .slot
+        .as_ref()
+        .is_some_and(|waiting| waiting.generation == generation && waiting.parent == who.parent);
+    if mine {
+        state.slot = None;
+    }
+    if state.generation == generation {
+        state.generation = state.generation.wrapping_add(1);
+    }
+    drop(state);
+    info!(
+        target: "n42.h2.el",
+        reason = "the execution layer produced nothing",
+        el_reason,
+        number = who.number,
+        parent = ?who.parent,
+        lead_ms = who.started.elapsed().as_millis() as u64,
+        taken_from_the_slot = mine,
+        "chain discarded"
+    );
+}
+
 /// What a chain task needs to carry the chain on past its own build.
 #[derive(Clone)]
 struct ChainCtx {
@@ -274,18 +322,23 @@ fn start_chain(
     let frame = n42_h2_execution::raw_engine::encode_build_on_own_chaining(&sealed, &attrs, Some(hint));
     let beacon_root = attrs.parent_beacon_block_root.unwrap_or_default();
     let (tx, answer) = tokio::sync::oneshot::channel();
+    let started = std::time::Instant::now();
+    let who = ChainWho { parent, number, started };
     let ctx = ctx.clone();
     let attrs_for_task = attrs.clone();
     tokio::spawn(async move {
-        let built = chain_request(ctx, frame, attrs_for_task, beacon_root, next_view).await;
+        let built = chain_request(ctx, who, frame, attrs_for_task, beacon_root, next_view).await;
         // The receiver is gone when the build was discarded before it
         // finished; the block is dropped with it.
         let _ = tx.send(built);
     });
     info!(target: "n42.h2.el", number, ?parent, view = next_view, "chain started");
-    state.slot =
-        Some(Chained { generation, parent, attrs, number, started: std::time::Instant::now(), answer });
+    state.slot = Some(Chained { generation, parent, attrs, number, started, answer });
 }
+
+/// What a chained build's connection came back with: the block, or the
+/// execution layer's reason for there not being one.
+type ChainAnswer = (Option<Result<BuiltBlock, ElError>>, String);
 
 /// One chained build: its own connection, its own request, its own answer.
 ///
@@ -294,15 +347,16 @@ fn start_chain(
 /// that one when this goes out -- that overlap is the whole gain.
 async fn chain_request(
     ctx: ChainCtx,
+    who: ChainWho,
     frame: Vec<u8>,
     attrs: PayloadAttributes,
     beacon_root: B256,
     view: u64,
 ) -> Option<Result<BuiltBlock, ElError>> {
     use tokio::io::AsyncWriteExt;
-    let (chain, addr) = (std::sync::Arc::clone(&ctx.chain), ctx.addr);
+    let (chain, addr, generation) = (std::sync::Arc::clone(&ctx.chain), ctx.addr, ctx.generation);
     let spare = chain.lock().unwrap_or_else(std::sync::PoisonError::into_inner).spare.pop();
-    let attempt: std::io::Result<(Option<Result<BuiltBlock, ElError>>, tokio::net::TcpStream)> = async {
+    let attempt: std::io::Result<(ChainAnswer, tokio::net::TcpStream)> = async {
         let mut conn = match spare {
             Some(conn) => conn,
             None => {
@@ -314,31 +368,42 @@ async fn chain_request(
         conn.write_u8(n42_h2_execution::raw_engine::request::BUILD_ON_OWN).await?;
         conn.write_u32_le(frame.len() as u32).await?;
         conn.write_all(&frame).await?;
-        let answer = loop {
+        let answer: ChainAnswer = loop {
             match read_build_frame(&mut conn, beacon_root).await? {
-                BuildFrame::Nothing => break None,
-                BuildFrame::Refused(message) => {
-                    debug!(target: "n42.h2.el", %message, "the chained build was refused");
-                    break None;
-                }
+                BuildFrame::Nothing => break (None, String::from("the execution layer offers no build on an own block")),
+                BuildFrame::Refused(message) => break (None, message),
                 // This build has sealed: the one after it can start now.
                 BuildFrame::ChainHeader(header) => start_chain(&ctx, &header, &attrs, view),
-                BuildFrame::Built(built) => break Some(*built),
+                BuildFrame::Built(built) => break (Some(*built), String::new()),
             }
         };
         Ok((answer, conn))
     }
     .await;
     match attempt {
-        Ok((built, conn)) => {
-            let mut state = chain.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.spare.len() < CHAIN_SPARES {
-                state.spare.push(conn);
+        Ok(((built, refusal), conn)) => {
+            {
+                let mut state = chain.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.spare.len() < CHAIN_SPARES {
+                    state.spare.push(conn);
+                }
             }
-            built
+            match built {
+                Some(Ok(block)) => Some(Ok(block)),
+                // A build that came back as an error is no more use than one
+                // that was refused, and the proposal must not inherit it.
+                Some(Err(err)) => {
+                    abandon_chain(&chain, generation, who, &err.to_string());
+                    None
+                }
+                None => {
+                    abandon_chain(&chain, generation, who, &refusal);
+                    None
+                }
+            }
         }
         Err(err) => {
-            debug!(target: "n42.h2.el", %err, "the chained build failed on the channel");
+            abandon_chain(&chain, generation, who, &err.to_string());
             None
         }
     }

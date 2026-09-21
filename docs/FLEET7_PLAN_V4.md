@@ -292,6 +292,23 @@ all -- not shorter than window 1's cycle -- and R1 reads 259 -> 297 ms, which is
 (execution + root + insert, 226-252) plus the check. The child now arrives while its parent is still importing: the
 premise step 2 lacked at loop183's cycle. loop189 judges it again.
 
+## 2h. Step 2 judged again: dropped (loop189)
+
+Three pairs on the confirmed configuration, X1 = `N42_FOLLOWER_EXEC_ON_PARENT_OUTPUT=1`:
+
+| | R1 ms | view total ms | import total ms | window 1 | round (M tx) |
+| --- | --- | --- | --- | --- | --- |
+| X0, mean of three | 202 | 296 | 393 | 430,584 | 32.10 |
+| X1, mean of three | 208 | 312 | 370 | 429,489 | 32.92 |
+
+The import is 22 ms shorter and nothing that binds moved; over 1,264 two-road blocks the roads still overlap by 0 ms
+at the median, so the parent's fields are filed before the child's sender check passes even at a 0.375-0.40 s cycle.
+No invalid block, no gas-used mismatch, the fleet's commitments agree. **The step is dropped**: the code stays, off.
+What section 2g read into R1 -- the follower's execution + root + insert -- was wrong: those are not what the vote
+waits for. What a cycle consists of in this configuration is being read event by event from a leg's logs, because
+the medians do not add up (the leader proposes ~250 ms into a view at a 275 ms pacing, which a pacing counted from
+the parent's proposal should not produce).
+
 ## 3. What not to do
 
 - Do not judge a cycle-shortening change at a pacing above the natural cycle; do not judge any change without R1.

@@ -407,9 +407,17 @@ fn check_includable<Provider>(
 where
     Provider: StateProviderFactory + Sync,
 {
+    let groups = group_by_sender(block, chain_id)?;
+    check_sender_groups(provider, parent_hash, parent_output, block, &groups, spec)
+}
+
+/// The block's transactions grouped by sender, in block order, with the
+/// checks that need nothing but the transaction itself done on the way: the
+/// chain id, the fee cap against the block's base fee, the priority fee under
+/// the cap, a non-empty authorization list, and the gas limits' sum against
+/// the header's. A serial pass over 163,000 transactions.
+fn group_by_sender(block: &RecoveredBlock<Block>, chain_id: u64) -> Result<Vec<(Address, Vec<usize>)>, String> {
     use alloy_consensus::Transaction as _;
-    use rayon::prelude::*;
-    use reth_provider::AccountReader as _;
 
     let header = block.header();
     let base_fee = u128::from(header.base_fee_per_gas.unwrap_or(0));
@@ -439,8 +447,29 @@ where
     if gas_total > header.gas_limit {
         return Err(format!("gas limits sum to {gas_total}, over the block's {}", header.gas_limit));
     }
+    Ok(by_sender.into_iter().collect())
+}
+
+/// Each sender's group against the parent's post-state: one account read, the
+/// nonces contiguous from the account's, the intrinsic gas within every
+/// transaction's gas limit, and the balance covering the whole group. On the
+/// worker pool, each chunk on a state provider of its own.
+fn check_sender_groups<Provider>(
+    provider: &Provider,
+    parent_hash: B256,
+    parent_output: Option<(&reth_revm::db::BundleState, B256)>,
+    block: &RecoveredBlock<Block>,
+    groups: &[(Address, Vec<usize>)],
+    spec: reth_revm::primitives::hardfork::SpecId,
+) -> Result<(), String>
+where
+    Provider: StateProviderFactory + Sync,
+{
+    use alloy_consensus::Transaction as _;
+    use rayon::prelude::*;
+    use reth_provider::AccountReader as _;
+
     let txs: Vec<&TransactionSigned> = block.body().transactions().collect();
-    let groups: Vec<(Address, Vec<usize>)> = by_sender.into_iter().collect();
     let chunk = groups.len().div_ceil(32).max(1);
     let checked: Vec<Result<(), String>> = groups
         .par_chunks(chunk)
@@ -1383,5 +1412,235 @@ mod parent_output_tests {
         let started = std::time::Instant::now();
         assert!(wait_for_parent_output(B256::with_last_byte(0xee), || true).is_none());
         assert!(started.elapsed() < PARENT_WAIT / 10, "waited {:?}", started.elapsed());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_consensus::{Header, Signed, TxEip1559};
+    use alloy_primitives::{map::AddressHashMap, Bytes, Signature, TxKind, U256};
+    use reth_primitives_traits::{Account, SealedBlock};
+    use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
+    use reth_revm::db::BundleState;
+    use reth_revm::primitives::hardfork::SpecId;
+    use reth_revm::state::AccountInfo;
+
+    const CHAIN_ID: u64 = 1;
+    const BASE_FEE: u64 = 1_000_000_000;
+    /// A transfer's fee cap; with a 21,000 gas limit a transaction costs
+    /// 2.1e14 wei of the sender's balance.
+    const FEE_CAP: u128 = 10_000_000_000;
+
+    fn addr(i: u64) -> Address {
+        let mut a = [0u8; 20];
+        a[12..].copy_from_slice(&i.to_be_bytes());
+        Address::from(a)
+    }
+
+    /// One transfer, signed with a placeholder signature: the check never
+    /// recovers a sender, it is handed one.
+    fn transfer(nonce: u64, to: Address, value: u128, gas_limit: u64) -> TransactionSigned {
+        let inner = TxEip1559 {
+            chain_id: CHAIN_ID,
+            nonce,
+            gas_limit,
+            max_fee_per_gas: FEE_CAP,
+            max_priority_fee_per_gas: 1_000_000_000,
+            to: TxKind::Call(to),
+            value: U256::from(value),
+            input: Bytes::new(),
+            ..Default::default()
+        };
+        let signed = Signed::new_unchecked(inner, Signature::test_signature(), B256::random());
+        TransactionSigned::from(reth_ethereum_primitives::TransactionSigned::from(signed))
+    }
+
+    /// A block from transactions already paired with their senders.
+    fn seal(txs: Vec<TransactionSigned>, senders: Vec<Address>, beneficiary: Address) -> RecoveredBlock<Block> {
+        let header = Header {
+            number: 20_000_000,
+            beneficiary,
+            gas_limit: 10_000_000_000,
+            base_fee_per_gas: Some(BASE_FEE),
+            timestamp: 1_800_000_000,
+            parent_beacon_block_root: Some(B256::ZERO),
+            withdrawals_root: Some(alloy_consensus::EMPTY_ROOT_HASH),
+            blob_gas_used: Some(0),
+            excess_blob_gas: Some(0),
+            requests_hash: Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH),
+            ..Default::default()
+        };
+        let body = n42_tx_types::BlockBody { transactions: txs, ommers: Vec::new(), withdrawals: Some(Vec::new().into()) };
+        RecoveredBlock::new_sealed(SealedBlock::seal_slow(Block { header, body }), senders)
+    }
+
+    /// The bench tier's block shape: `senders x per` transfers to recipients
+    /// drawn at random from `space` accounts, laid out as the queue lays them
+    /// out -- `run` transactions of one sender, then the next sender's.
+    /// Returns the block and every sender's account at the parent.
+    fn bench_fixture(senders: u64, per: u64, space: u64, run: usize) -> (RecoveredBlock<Block>, Vec<(Address, Account)>) {
+        let mut lanes: Vec<Vec<TransactionSigned>> = Vec::with_capacity(senders as usize);
+        let mut accounts = Vec::with_capacity(senders as usize);
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for s in 0..senders {
+            let sender = addr(100 + s);
+            accounts.push((sender, Account { nonce: 0, balance: U256::from(10u128.pow(21)), bytecode_hash: None }));
+            let mut lane = Vec::with_capacity(per as usize);
+            for k in 0..per {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                lane.push(transfer(k, addr(1_000_000 + seed % space), 1_000 + u128::from(k), 21_000));
+            }
+            lanes.push(lane);
+        }
+        let mut txs = Vec::with_capacity((senders * per) as usize);
+        let mut recovered = Vec::with_capacity((senders * per) as usize);
+        let mut k = 0usize;
+        while k < per as usize {
+            for (s, lane) in lanes.iter().enumerate() {
+                for tx in &lane[k..(k + run).min(per as usize)] {
+                    txs.push(tx.clone());
+                    recovered.push(addr(100 + s as u64));
+                }
+            }
+            k += run;
+        }
+        (seal(txs, recovered, addr(1)), accounts)
+    }
+
+    /// A provider whose state holds `accounts`.
+    fn provider(accounts: &[(Address, Account)]) -> MockEthProvider {
+        let mock = MockEthProvider::default();
+        mock.extend_accounts(
+            accounts.iter().map(|(address, account)| (*address, ExtendedAccount::new(account.nonce, account.balance))),
+        );
+        mock
+    }
+
+    /// The same accounts as a parent block's output, so the check reads them
+    /// from the bundle and never touches the provider -- the fleet's path
+    /// when the parent's output is published.
+    fn bundle(accounts: &[(Address, Account)]) -> BundleState {
+        BundleState::new(
+            accounts.iter().map(|(address, account)| {
+                (
+                    *address,
+                    None,
+                    Some(AccountInfo { balance: account.balance, nonce: account.nonce, ..Default::default() }),
+                    Default::default(),
+                )
+            }),
+            Vec::<Vec<(Address, Option<Option<AccountInfo>>, Vec<(U256, U256)>)>>::new(),
+            Vec::new(),
+        )
+    }
+
+    /// Where the includability check goes on a bench-tier block: the serial
+    /// grouping pass, the parallel per-sender pass, and the whole check, with
+    /// the senders read from the parent's published output (the fleet's path)
+    /// and from the provider. Pinned the way a fleet node runs:
+    /// `RAYON_NUM_THREADS=16 taskset -c 0-31 cargo test --release -p n42 --lib
+    /// bench_check_includable -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing"]
+    fn bench_check_includable() {
+        let (block, accounts) = bench_fixture(6_000, 27, 2_000_000, 64);
+        let mock = provider(&accounts);
+        let parent = bundle(&accounts);
+        let grandparent = B256::random();
+        let parent_hash = B256::random();
+        println!("block: {} transactions, {} senders", block.body().transactions.len(), accounts.len());
+        for (name, output) in [("parent-output", Some((&parent, grandparent))), ("provider", None)] {
+            for round in 0..5 {
+                let group_at = std::time::Instant::now();
+                let groups = group_by_sender(&block, CHAIN_ID).expect("groups");
+                let group_us = group_at.elapsed().as_micros();
+                let check_at = std::time::Instant::now();
+                check_sender_groups(&mock, parent_hash, output, &block, &groups, SpecId::OSAKA).expect("includable");
+                let check_us = check_at.elapsed().as_micros();
+                let whole_at = std::time::Instant::now();
+                check_includable(&mock, parent_hash, output, &block, CHAIN_ID, SpecId::OSAKA).expect("includable");
+                let whole_us = whole_at.elapsed().as_micros();
+                println!(
+                    "{name} round {round}: group {:.1} ms, check {:.1} ms, whole {:.1} ms",
+                    group_us as f64 / 1000.0,
+                    check_us as f64 / 1000.0,
+                    whole_us as f64 / 1000.0,
+                );
+            }
+        }
+    }
+
+    /// The groups are the block's transactions, per sender in block order.
+    #[test]
+    fn groups_are_block_order() {
+        let (block, _) = bench_fixture(8, 5, 64, 3);
+        let groups = group_by_sender(&block, CHAIN_ID).expect("groups");
+        assert_eq!(groups.len(), 8);
+        let mut seen = 0;
+        for (sender, indexes) in &groups {
+            assert!(indexes.windows(2).all(|w| w[0] < w[1]), "block order");
+            for &index in indexes {
+                assert_eq!(block.senders()[index], *sender);
+            }
+            seen += indexes.len();
+        }
+        assert_eq!(seen, block.body().transactions.len());
+    }
+
+    /// A block every sender can pay for is includable; one whose senders are
+    /// unknown to the state is not.
+    #[test]
+    fn accepts_a_funded_block_and_refuses_an_unfunded_one() {
+        let (block, accounts) = bench_fixture(8, 5, 64, 3);
+        let funded = provider(&accounts);
+        let hash = B256::random();
+        check_includable(&funded, hash, None, &block, CHAIN_ID, SpecId::OSAKA).expect("includable");
+        let empty = provider(&[]);
+        let refused = check_includable(&empty, hash, None, &block, CHAIN_ID, SpecId::OSAKA).expect_err("unfunded");
+        assert!(refused.contains("of a balance of 0"), "{refused}");
+    }
+
+    /// The parent's output answers for a sender the chain's state does not
+    /// know yet.
+    #[test]
+    fn reads_the_parent_output_before_the_state() {
+        let (block, accounts) = bench_fixture(8, 5, 64, 3);
+        let empty = provider(&[]);
+        let parent = bundle(&accounts);
+        check_includable(&empty, B256::random(), Some((&parent, B256::random())), &block, CHAIN_ID, SpecId::OSAKA)
+            .expect("includable on the parent's output");
+    }
+
+    /// A transaction of another chain is refused, and by its index.
+    #[test]
+    fn refuses_a_foreign_chain_id() {
+        let (block, accounts) = bench_fixture(4, 3, 64, 2);
+        let refused = check_includable(&provider(&accounts), B256::random(), None, &block, CHAIN_ID + 1, SpecId::OSAKA)
+            .expect_err("foreign chain");
+        assert!(refused.starts_with("transaction 0: chain id 1,"), "{refused}");
+    }
+
+    /// The senders of a block, to keep the fixtures readable.
+    fn senders_of(block: &RecoveredBlock<Block>) -> AddressHashMap<usize> {
+        let mut counts: AddressHashMap<usize> = Default::default();
+        for sender in block.senders() {
+            *counts.entry(*sender).or_default() += 1;
+        }
+        counts
+    }
+
+    /// Every sender is grouped once.
+    #[test]
+    fn every_sender_grouped_once() {
+        let (block, _) = bench_fixture(16, 4, 64, 5);
+        let groups = group_by_sender(&block, CHAIN_ID).expect("groups");
+        let counts = senders_of(&block);
+        assert_eq!(groups.len(), counts.len());
+        for (sender, indexes) in &groups {
+            assert_eq!(indexes.len(), counts[sender]);
+        }
     }
 }

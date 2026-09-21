@@ -22,12 +22,14 @@ followers are the cycle. A change to the leader's side is judged by this
 column first and by TPS second.
 """
 import glob
+import os
 import re
 import statistics as st
 import sys
 from datetime import datetime
 
-ROOT = sys.argv[1] if len(sys.argv) > 1 else '/data/blockchain/rust-fleet7-bench'
+ROOT = sys.argv[1] if len(sys.argv) > 1 else os.environ.get(
+    'F7_ROOT', '/data/blockchain/rust-fleet7-bench')
 BIG_BODY = 10_000_000
 CLEAN = re.compile(r'\x1b\[[0-9;]*m')
 TS = re.compile(r'^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d+)Z')

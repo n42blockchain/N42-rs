@@ -11,9 +11,10 @@ For consecutive full blocks h -> h+1 (leader L1 published h, leader L2 published
 These four sum to publish(h+1) - publish(h) exactly (one cross-node hop at the start).
 usage: viewcycle.py <fleet root> [log suffix, e.g. .20260901-230122]
 """
-import glob, re, statistics, sys
+import glob, os, re, statistics, sys
 from datetime import datetime
-ROOT = sys.argv[1] if len(sys.argv) > 1 else '/data/blockchain/rust-fleet7-bench'
+ROOT = sys.argv[1] if len(sys.argv) > 1 else os.environ.get(
+    'F7_ROOT', '/data/blockchain/rust-fleet7-bench')
 SUF = sys.argv[2] if len(sys.argv) > 2 else ''
 CLEAN = re.compile(r'\x1b\[[0-9;]*m'); STAMP = re.compile(r'^(\d{4}-\d{2}-\d{2}T[\d:.]+)Z')
 HASH = re.compile(r'(?:decide\.)?block_hash="?(0x[0-9a-f]+)"?'); BYTES = re.compile(r'bytes=(\d+)')

@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
 # The all-Rust seven-node fleet: start, stop, watch, measure.
 #
-#   scripts/fleet7.sh up [--fresh]     start seven nodes (--fresh wipes the datadirs)
+#   scripts/fleet7.sh up [--fresh]     start the fleet (--fresh wipes the datadirs)
 #   scripts/fleet7.sh down             stop them, gracefully
+#   scripts/fleet7.sh print            every command line and CPU set, starting nothing
 #   scripts/fleet7.sh status           heights, hashes, agreement
 #   scripts/fleet7.sh stats            resident memory, threads, disk written
 #   scripts/fleet7.sh watch <seconds>  sample stats over a window and report
 #   scripts/fleet7.sh roll <i>         stop and restart one node, and check it rejoins
 #
 # Every launch argument comes from scripts/fleet7-env.sh; see the comment at
-# the top of that file for why.
+# the top of that file for why. `print` is how a change to that file is
+# reviewed: diff its output before and after.
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fleet7-env.sh"
 
-usage() { sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; }
+usage() { sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; }
 
 # --------------------------------------------------------------------- up ---
 cmd_up() {
@@ -22,6 +24,14 @@ cmd_up() {
 
   [[ -x $F7_BIN/n42 ]] || { echo "no $F7_BIN/n42 -- cargo build --release -p n42 -p n42-h2-node --bins --examples" >&2; exit 1; }
   [[ -r $F7_GENESIS ]] || { echo "no genesis at $F7_GENESIS" >&2; exit 1; }
+  # Before anything is wiped or started: a layout where two nodes share a
+  # physical core is a leg that runs and reports the contention as the chain's.
+  f7_check_layout || exit 1
+  # And a genesis that names a different number of validators than the fleet
+  # has members. The extra validators would never vote, so the quorum the
+  # others compute from the list is one the fleet cannot reach: the chain makes
+  # its first block and stops, with nothing in any log naming the cause.
+  f7_check_validator_count || exit 1
 
   cmd_down >/dev/null 2>&1 || true
 
@@ -77,6 +87,65 @@ cmd_up() {
     RUST_LOG="$F7_LOG_V" f7_spawn "$d/v.pid" "$d/v.log" $pin "$F7_BIN/examples/h2_validator" "${F7_V_ARGS[@]}"
   done
   echo "validators up"
+}
+
+# ------------------------------------------------------------------ print ---
+# Everything `up` would run, and nothing else.
+#
+# The launch arguments are assembled by a hundred lines of conditionals in
+# fleet7-env.sh, and the only honest way to review a change to them -- a new
+# profile, a fleet of another size -- is to read what comes out. Diff this
+# output before and after: for a fleet whose size did not change it must be
+# empty, and for one whose size did it must differ in exactly the ports, the
+# core sets and the peer list.
+#
+# Touches nothing: no datadir, no key, no jwt, no pidfile. Safe to run against
+# a root another fleet is using, and safe to run with no box at all.
+cmd_print() {
+  local i d pin quorum
+  quorum=$(f7_quorum)
+  f7_check_layout || true
+  echo "# fleet    : $F7_NODES nodes, quorum $quorum of $F7_NODES (f = $(( (F7_NODES - 1) / 3 )))"
+  echo "# profile  : $F7_PROFILE, root $F7_ROOT"
+  echo "# genesis  : $F7_GENESIS"
+  echo "#            sha256 $(f7_genesis_fingerprint)"
+  echo "#            validators $(python3 -c "
+import json,sys
+print(len(json.load(open(sys.argv[1]))['config']['hotstuff']['validators']))" "$F7_GENESIS")"
+  echo "# binaries : $F7_BIN/n42, $F7_BIN/examples/h2_validator"
+  if [[ $F7_PIN == 1 ]]; then
+    echo "# cores    : $F7_CORES_PER_NODE CPUs a node from offset $F7_CORE_OFFSET, physical=${F7_PIN_PHYSICAL:-1}, SMT sibling at +$(f7_smt_offset) of $(nproc) CPUs"
+    echo "# flood    : $(f7_flood_cores)"
+  else
+    echo "# cores    : unpinned"
+  fi
+  # The genesis must be readable to count its validators, but the peer ids need
+  # the keygen binary; without it the mesh is printed as an unresolved key.
+  if [[ -x $F7_BIN/examples/h2_keygen ]]; then
+    f7_load_peerids
+  else
+    echo "# note     : no $F7_BIN/examples/h2_keygen; peer ids shown as their network keys" >&2
+    F7_PEERIDS=()
+    for ((i = 0; i < F7_NODES; i++)); do F7_PEERIDS+=("<peerid-of-${F7_NETKEYS[$i]:0:8}...>"); done
+  fi
+  for ((i = 0; i < F7_NODES; i++)); do
+    d=$(f7_node_dir "$i")
+    pin=$(f7_pin "$i")
+    f7_el_args "$i"
+    f7_validator_args "$i"
+    echo
+    echo "## node $i  (datadir $d)"
+    # The environment `f7_spawn` is called with, then the command itself, in
+    # the order the shell sees them -- so this pastes into a terminal and runs.
+    printf 'el  : %s RUST_LOG=%q N42_TX_INGEST=%q N42_PAYLOAD_SERVE=%q N42_SENDER_CACHE_MULT=%q %s' \
+      "$pin" "$F7_LOG_EL" "${F7_INGEST:+127.0.0.1:$((F7_INGEST_BASE + i))}" \
+      "127.0.0.1:$((F7_PAYLOAD_BASE + i))" "${F7_SENDER_CACHE_MULT:-2}" "$F7_BIN/n42"
+    printf ' %q' "${F7_EL_ARGS[@]}"
+    echo
+    printf 'val : %s RUST_LOG=%q %s' "$pin" "$F7_LOG_V" "$F7_BIN/examples/h2_validator"
+    printf ' %q' "${F7_V_ARGS[@]}"
+    echo
+  done
 }
 
 # ------------------------------------------------------------------- down ---
@@ -252,6 +321,7 @@ cmd_roll() {
 case ${1:-} in
   up) shift; cmd_up "$@" ;;
   down) cmd_down ;;
+  print) cmd_print ;;
   status) cmd_status ;;
   stats) cmd_stats ;;
   watch) shift; cmd_watch "$@" ;;

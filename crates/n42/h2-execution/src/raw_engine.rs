@@ -65,6 +65,30 @@ pub mod request {
     /// meaning "not this way": the caller sends the same block as a
     /// `NEW_PAYLOAD` payload, as the own-block path falls back today.
     pub const FOREIGN_BODY: u8 = 5;
+    /// [`FOREIGN_BODY`]'s frame, carrying a *compact* body instead of the
+    /// gossip one: the same block with its transactions named by hash
+    /// rather than carried (`n42_h2_consensus::compact_body`,
+    /// `N42_COMPACT_BODY=1`). The execution layer assembles the block from
+    /// its own transaction queue -- where every one of them already sits,
+    /// decoded, with the sender its ingest recovered -- and checks the
+    /// transactions root of what it assembled against the header's.
+    ///
+    /// Answers are [`FOREIGN_BODY`]'s. [`super::reply::ERROR`] is again
+    /// "not this way", and it covers one case the full body has not: a
+    /// transaction this node does not hold. The caller then asks its peers
+    /// for the whole body and the ordinary road takes over.
+    pub const COMPACT_BODY: u8 = 6;
+    /// [`GET_PAYLOAD`], with the block's transaction hashes appended to the
+    /// answer: what the compact body names its transactions by. The builder
+    /// has them cached on the transactions it built the block from, so they
+    /// cost a copy of 32 bytes each there and a keccak over 26 MB on the
+    /// proposal path here.
+    ///
+    /// A kind of its own rather than a flag, because the answer's shape has
+    /// to follow the request on a connection that is reused: an execution
+    /// layer that predates it refuses the request, the caller's channel
+    /// falls back to JSON for that build, and no compact body is made.
+    pub const GET_PAYLOAD_HASHED: u8 = 7;
 }
 
 /// Reply kinds on the channel.
@@ -376,10 +400,15 @@ pub struct ChainHint {
 /// peer that learns a new one must not break an older one.
 const TAIL_CHAIN_HINT: u8 = 1;
 
+/// The tag that asks for the built block's transaction hashes to be
+/// appended to the answer (see [`request::GET_PAYLOAD_HASHED`]). No
+/// payload of its own: the tag is the request.
+const TAIL_WANT_HASHES: u8 = 2;
+
 /// Encodes a build-on-own request: the sealed header of the block just built
 /// (RLP) and the attributes of the block to build on it.
 pub fn encode_build_on_own(header: &alloy_consensus::Header, attrs: &PayloadAttributes) -> Vec<u8> {
-    encode_build_on_own_chaining(header, attrs, None)
+    encode_build_on_own_chaining(header, attrs, None, false)
 }
 
 /// [`encode_build_on_own`] with a chain hint appended.
@@ -394,6 +423,7 @@ pub fn encode_build_on_own_chaining(
     header: &alloy_consensus::Header,
     attrs: &PayloadAttributes,
     chain: Option<ChainHint>,
+    want_hashes: bool,
 ) -> Vec<u8> {
     let rlp = alloy_rlp::encode(header);
     let mut w = Writer(Vec::with_capacity(rlp.len() + 128 + attrs.withdrawals.as_ref().map_or(0, |w| w.len() * 44)));
@@ -429,6 +459,9 @@ pub fn encode_build_on_own_chaining(
         w.u64(hint.view);
         w.u8(u8::from(hint.chained));
     }
+    if want_hashes {
+        w.u8(TAIL_WANT_HASHES);
+    }
     w.0
 }
 
@@ -436,7 +469,7 @@ pub fn encode_build_on_own_chaining(
 /// the frame carries one.
 pub fn decode_build_on_own(
     buf: &[u8],
-) -> Result<(alloy_consensus::Header, PayloadAttributes, Option<ChainHint>), String> {
+) -> Result<(alloy_consensus::Header, PayloadAttributes, Option<ChainHint>, bool), String> {
     use alloy_rlp::Decodable;
     let mut r = Reader { rest: buf, shared: None };
     if r.u8()? != VERSION { return Err("unknown raw engine version".into()); }
@@ -461,9 +494,11 @@ pub fn decode_build_on_own(
     // The tail. Empty in every frame written before it existed, so its
     // absence is "no hint" rather than a truncated frame.
     let mut chain = None;
+    let mut want_hashes = false;
     while !r.rest.is_empty() {
         match r.u8()? {
             TAIL_CHAIN_HINT => chain = Some(ChainHint { view: r.u64()?, chained: r.u8()? == 1 }),
+            TAIL_WANT_HASHES => want_hashes = true,
             // A tag from a newer peer. Its length is not known here, so
             // there is nothing to skip to: stop reading and keep what was
             // understood. Fields are only ever appended, so everything
@@ -471,7 +506,7 @@ pub fn decode_build_on_own(
             _ => break,
         }
     }
-    Ok((header, PayloadAttributes { timestamp, prev_randao, suggested_fee_recipient, withdrawals, parent_beacon_block_root, slot_number, target_gas_limit }, chain))
+    Ok((header, PayloadAttributes { timestamp, prev_randao, suggested_fee_recipient, withdrawals, parent_beacon_block_root, slot_number, target_gas_limit }, chain, want_hashes))
 }
 
 /// Encodes a [`PayloadStatus`] for the channel.
@@ -555,15 +590,17 @@ mod tests {
         };
         let bare = PayloadAttributes { withdrawals: None, parent_beacon_block_root: None, slot_number: None, target_gas_limit: None, ..full.clone() };
         for attrs in [full, bare] {
-            let (h, a, chain) = decode_build_on_own(&encode_build_on_own(&header, &attrs)).expect("decodes");
+            let (h, a, chain, hashes) = decode_build_on_own(&encode_build_on_own(&header, &attrs)).expect("decodes");
             assert_eq!(h, header);
             assert_eq!(a, attrs);
             assert_eq!(chain, None, "a frame without a tail hints nothing");
-            let hinted = encode_build_on_own_chaining(&header, &attrs, Some(ChainHint { view: 4242, chained: true }));
-            let (h, a, chain) = decode_build_on_own(&hinted).expect("decodes");
+            assert!(!hashes, "and asks for nothing");
+            let hinted = encode_build_on_own_chaining(&header, &attrs, Some(ChainHint { view: 4242, chained: true }), true);
+            let (h, a, chain, hashes) = decode_build_on_own(&hinted).expect("decodes");
             assert_eq!(h, header);
             assert_eq!(a, attrs);
             assert_eq!(chain, Some(ChainHint { view: 4242, chained: true }));
+            assert!(hashes, "the hash tail is read beside the hint");
             // The hint is a tail: everything before it is the frame an
             // execution layer that predates it reads, byte for byte.
             let plain = encode_build_on_own(&header, &attrs);
@@ -572,8 +609,8 @@ mod tests {
             let mut unknown = plain.clone();
             unknown.push(0xfe);
             unknown.extend_from_slice(&7u64.to_le_bytes());
-            let (h, a, chain) = decode_build_on_own(&unknown).expect("decodes");
-            assert_eq!((h, a, chain), (header.clone(), attrs.clone(), None));
+            let (h, a, chain, hashes) = decode_build_on_own(&unknown).expect("decodes");
+            assert_eq!((h, a, chain, hashes), (header.clone(), attrs.clone(), None, false));
         }
     }
     #[test]

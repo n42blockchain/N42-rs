@@ -507,6 +507,19 @@ pub fn body_once() -> bool {
     *ON.get_or_init(|| std::env::var("N42_BODY_ONCE").is_ok_and(|v| v == "1"))
 }
 
+/// `N42_COMPACT_BODY`, read once: opt-in, and read on the leader's side,
+/// because that is the side that decides what a block's body looks like on
+/// the direct push channel. Off, a body carries its transactions exactly as
+/// it always did.
+///
+/// It implies [`body_once`]: a compact body has no payload road to fall
+/// back to on this node, so the whole path only exists where the body is
+/// handed to the execution layer as it arrived.
+pub fn compact_body() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_COMPACT_BODY").is_ok_and(|v| v == "1") && body_once())
+}
+
 /// `N42_COMMIT_FCU_ASYNC`, read once: opt-in, and only the *default* for a
 /// driver -- [`ExecutionDriver::set_commit_fcu_async`] is what a test uses,
 /// so the two paths are exercised without the process environment deciding
@@ -678,6 +691,10 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             return Ok(payload.clone());
         }
         match (self.bodies.get(&block_hash), &self.body_decoder) {
+            // A compact body names its transactions instead of carrying
+            // them, so there is no payload to be made from it here: the
+            // block is missing until a peer sends the whole body.
+            (Some(body), _) if body.compact => Err(DriverAction::PayloadMissing { block_hash }),
             (Some(body), Some(decode)) => decode.decode(body).map_err(|err| {
                 warn!(target: "n42.h2.el", block = ?block_hash, %err, "a held body could not be decoded");
                 DriverAction::Rejected { block_hash, reason: err }
@@ -1296,8 +1313,24 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                     debug!(
                         target: "n42.h2.el",
                         block = ?block_hash,
+                        compact = body.compact,
                         "the execution layer would not take the body; sending the payload"
                     );
+                }
+                // A compact body has no payload road on this node: the
+                // transactions it names are ones this node does not hold
+                // (or the execution layer refused the shape), and the way
+                // on is the whole body from a peer. Reported as "not yet",
+                // which is what makes the loop ask for it.
+                if answered.is_none() && body.compact && payload.is_none() {
+                    info!(
+                        target: "n42.h2.el",
+                        block = ?block_hash,
+                        bytes = body.rlp.len(),
+                        "the compact body could not be assembled here; asking for the whole body"
+                    );
+                    guard.done(ImportVerdict::NotYet);
+                    return;
                 }
             }
             let outcome = match answered {

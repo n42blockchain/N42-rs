@@ -818,7 +818,8 @@ struct Executed {
 /// it would be mostly the truncation of the twelve it subtracts.
 #[derive(Debug, Clone, Copy)]
 pub struct VoteRoad {
-    /// Which request carried the block: `foreign_body` or `new_payload`.
+    /// Which request carried the block: `foreign_body`, `compact_body` or
+    /// `new_payload`.
     pub request: &'static str,
     /// Reading the frame off the loopback socket.
     pub recv_us: u64,
@@ -836,6 +837,21 @@ pub struct VoteRoad {
     /// The sealed block filed for the engine's own conversion; 0 when that
     /// clone is made off this path.
     pub remember_us: u64,
+    /// Compact body road only: finding the block's transactions in this
+    /// node's queue by the hashes the body named.
+    pub assemble_us: u64,
+    /// Compact body road only: encoding the assembled transactions and
+    /// building the trie whose root is compared with the header's -- what
+    /// binds the assembled list to the block consensus voted on.
+    pub root_us: u64,
+    /// Compact body road only: waiting for this node's ingest to land a
+    /// transaction the first pass did not find.
+    pub miss_wait_us: u64,
+    /// Compact body road only: how many of the block's hashes the first
+    /// pass did not find. Nonzero with a vote released means the wait was
+    /// enough; a road that gave up logs a line of its own and is not this
+    /// one.
+    pub misses: u64,
     /// When the request's first byte arrived, for the total.
     pub started: std::time::Instant,
 }
@@ -872,6 +888,9 @@ fn log_vote_road(road: VoteRoad, number: u64, txs: usize, phases: RoadPhases) {
         + road.dispatch_us
         + road.convert_us
         + road.remember_us
+        + road.assemble_us
+        + road.root_us
+        + road.miss_wait_us
         + phases.header_us
         + phases.senders_us
         + phases.parent_wait_us
@@ -889,6 +908,10 @@ fn log_vote_road(road: VoteRoad, number: u64, txs: usize, phases: RoadPhases) {
         dispatch_ms = road.dispatch_us / 1000,
         convert_ms = road.convert_us / 1000,
         remember_ms = road.remember_us / 1000,
+        assemble_ms = road.assemble_us / 1000,
+        root_ms = road.root_us / 1000,
+        miss_wait_ms = road.miss_wait_us / 1000,
+        misses = road.misses,
         header_ms = phases.header_us / 1000,
         senders_ms = phases.senders_us / 1000,
         parent_wait_ms = phases.parent_wait_us / 1000,
@@ -917,6 +940,7 @@ pub fn import_foreign_block<Provider, Evm, ChainSpec>(
     provider: &Provider,
     evm_config: &Evm,
     senders_cache: Option<&reth_evm::SenderRecoveryCache>,
+    given_senders: Option<Vec<Address>>,
     carry: &Arc<CarriedReads>,
     qmdb: Option<&n42_qmdb_reth::QmdbNodeState>,
     consensus: &(dyn FullConsensus<EthPrimitives> + Send + Sync),
@@ -970,59 +994,75 @@ where
     let senders_at = std::time::Instant::now();
     stage.at(2);
 
-    // Senders: the recovery cache the ingest fills (what the engine's own
-    // path reads), the rest recovered on the worker pool. 0x50 transactions
-    // read the shared Ed25519 sender cache; the misses are verified in
-    // batches rather than one signature at a time.
-    let cache_hits = std::sync::atomic::AtomicU64::new(0);
-    let alt_cache = n42_tx_types::AltSigSenderCache::global();
-    let txs: Vec<&TransactionSigned> = sealed.body().transactions().collect();
-    let mut senders: Vec<Option<Address>> = {
-        use rayon::prelude::*;
-        // Collected into a `Vec<Result>` (written in place) and checked after:
-        // a parallel collect straight into `Result<Vec>` takes rayon's
-        // short-circuiting path, three times the cost at 163,000 items
-        // (round 43, `bench_convert_payload`).
-        let looked_up: Vec<Result<Option<Address>, String>> = txs
-            .par_iter()
-            .map(|tx| match tx {
-                TransactionSigned::AltSig(alt) => Ok(alt_cache.get(alt.hash()).inspect(|_| {
-                    cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                })),
-                TransactionSigned::Eth(_) => {
-                    if let Some(sender) = senders_cache.and_then(|cache| cache.get(tx.tx_hash())) {
-                        cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        return Ok(Some(sender));
-                    }
-                    tx.recover_signer().map(Some).map_err(|err| format!("sender of {}: {err}", tx.tx_hash()))
-                }
-            })
-            .collect();
-        looked_up.into_iter().collect::<Result<Vec<_>, String>>()?
-    };
-    let misses: Vec<usize> = senders.iter().enumerate().filter(|(_, s)| s.is_none()).map(|(i, _)| i).collect();
-    if !misses.is_empty() {
-        use rayon::prelude::*;
-        let batch = n42_tx_types::ed25519_batch_size();
-        let verified: Vec<(usize, Result<Address, n42_tx_types::AltSigError>)> = misses
-            .par_chunks(batch)
-            .flat_map_iter(|chunk| {
-                let refs: Vec<&n42_tx_types::AltSigTx> = chunk
-                    .iter()
-                    .filter_map(|&i| txs[i].as_alt_sig())
-                    .collect();
-                chunk.iter().copied().zip(n42_tx_types::verify_batch(&refs)).collect::<Vec<_>>()
-            })
-            .collect();
-        for (i, verdict) in verified {
-            let sender = verdict.map_err(|err| format!("sender of {}: {err}", txs[i].tx_hash()))?;
-            alt_cache.insert(*txs[i].tx_hash(), sender);
-            senders[i] = Some(sender);
+    // Senders, when the caller has not already got them. The compact body
+    // road has (`N42_COMPACT_BODY`): it assembled the block out of this
+    // node's queue, where every transaction sits with the sender the ingest
+    // recovered when it arrived, so the whole pass below is skipped -- 27-43
+    // ms of a 240 ms binding term at the bench tier (loop194 X2b). The
+    // senders are the queue's own, not the body's: nothing a peer sent is
+    // taken on trust here, and the transactions they belong to are bound to
+    // the header by the transactions root the assembly checked.
+    // The recovery pass writes its cache-hit count out here, because the
+    // arm that skips the pass entirely has none to report.
+    let cache_hits_out = std::sync::atomic::AtomicU64::new(0);
+    let recovered = match given_senders {
+        Some(senders) if senders.len() != tx_count => {
+            return Err(format!("given {} senders for {tx_count} transactions", senders.len()));
         }
-    }
-    let senders: Vec<Address> = senders.into_iter().map(|s| s.expect("every sender resolved")).collect();
-    let cache_hits = cache_hits.into_inner();
-    let recovered = RecoveredBlock::new_sealed(sealed, senders);
+        Some(senders) => RecoveredBlock::new_sealed(sealed, senders),
+        None => {
+            let cache_hits = std::sync::atomic::AtomicU64::new(0);
+            let alt_cache = n42_tx_types::AltSigSenderCache::global();
+            let txs: Vec<&TransactionSigned> = sealed.body().transactions().collect();
+            let mut senders: Vec<Option<Address>> = {
+                use rayon::prelude::*;
+                // Collected into a `Vec<Result>` (written in place) and checked after:
+                // a parallel collect straight into `Result<Vec>` takes rayon's
+                // short-circuiting path, three times the cost at 163,000 items
+                // (round 43, `bench_convert_payload`).
+                let looked_up: Vec<Result<Option<Address>, String>> = txs
+                    .par_iter()
+                    .map(|tx| match tx {
+                        TransactionSigned::AltSig(alt) => Ok(alt_cache.get(alt.hash()).inspect(|_| {
+                            cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        })),
+                        TransactionSigned::Eth(_) => {
+                            if let Some(sender) = senders_cache.and_then(|cache| cache.get(tx.tx_hash())) {
+                                cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                return Ok(Some(sender));
+                            }
+                            tx.recover_signer().map(Some).map_err(|err| format!("sender of {}: {err}", tx.tx_hash()))
+                        }
+                    })
+                    .collect();
+                looked_up.into_iter().collect::<Result<Vec<_>, String>>()?
+            };
+            let misses: Vec<usize> = senders.iter().enumerate().filter(|(_, s)| s.is_none()).map(|(i, _)| i).collect();
+            if !misses.is_empty() {
+                use rayon::prelude::*;
+                let batch = n42_tx_types::ed25519_batch_size();
+                let verified: Vec<(usize, Result<Address, n42_tx_types::AltSigError>)> = misses
+                    .par_chunks(batch)
+                    .flat_map_iter(|chunk| {
+                        let refs: Vec<&n42_tx_types::AltSigTx> = chunk
+                            .iter()
+                            .filter_map(|&i| txs[i].as_alt_sig())
+                            .collect();
+                        chunk.iter().copied().zip(n42_tx_types::verify_batch(&refs)).collect::<Vec<_>>()
+                    })
+                    .collect();
+                for (i, verdict) in verified {
+                    let sender = verdict.map_err(|err| format!("sender of {}: {err}", txs[i].tx_hash()))?;
+                    alt_cache.insert(*txs[i].tx_hash(), sender);
+                    senders[i] = Some(sender);
+                }
+            }
+            let senders: Vec<Address> = senders.into_iter().map(|s| s.expect("every sender resolved")).collect();
+            cache_hits_out.store(cache_hits.into_inner(), std::sync::atomic::Ordering::Relaxed);
+            RecoveredBlock::new_sealed(sealed, senders)
+        }
+    };
+    let cache_hits = cache_hits_out.load(std::sync::atomic::Ordering::Relaxed);
     phases.senders_us = senders_at.elapsed().as_micros() as u64;
     let senders_ms = phases.senders_us / 1000;
 

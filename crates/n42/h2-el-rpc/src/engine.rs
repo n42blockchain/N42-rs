@@ -154,9 +154,33 @@ enum BuildFrame {
 }
 
 /// Reads one frame of a build-on-own answer.
+/// The transaction-hash tail the execution layer appends when the request
+/// asked for it (`request::GET_PAYLOAD_HASHED`, `BUILD_ON_OWN`'s hash tail).
+///
+/// Read only when this side asked, because the answer's shape follows the
+/// request and the connection is reused: reading a tail that was not sent
+/// would take the next answer's first bytes for it.
+async fn read_hash_tail(
+    stream: &mut tokio::net::TcpStream,
+    asked: bool,
+) -> std::io::Result<Vec<B256>> {
+    use tokio::io::AsyncReadExt;
+    if !asked {
+        return Ok(Vec::new());
+    }
+    if stream.read_u8().await? != 1 {
+        return Ok(Vec::new());
+    }
+    let n = stream.read_u32_le().await? as usize;
+    let mut raw = vec![0u8; n * 32];
+    stream.read_exact(&mut raw).await?;
+    Ok(raw.chunks_exact(32).map(B256::from_slice).collect())
+}
+
 async fn read_build_frame(
     stream: &mut tokio::net::TcpStream,
     beacon_root: B256,
+    hashed: bool,
 ) -> std::io::Result<BuildFrame> {
     use tokio::io::AsyncReadExt;
     match stream.read_u8().await? {
@@ -201,7 +225,12 @@ async fn read_build_frame(
             } else {
                 None
             };
-            Ok(BuildFrame::Built(Box::new(built_block_from_parts(block.into(), requests, bal, beacon_root))))
+            let tx_hashes = read_hash_tail(stream, hashed).await?;
+            let mut built = built_block_from_parts(block.into(), requests, bal, beacon_root);
+            if let Ok(built) = built.as_mut() {
+                built.tx_hashes = tx_hashes;
+            }
+            Ok(BuildFrame::Built(Box::new(built)))
         }
         other => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("status {other}"))),
     }
@@ -319,7 +348,12 @@ fn start_chain(
     // this way.
     let next_view = view.saturating_add(1);
     let hint = n42_h2_execution::raw_engine::ChainHint { view: next_view, chained: true };
-    let frame = n42_h2_execution::raw_engine::encode_build_on_own_chaining(&sealed, &attrs, Some(hint));
+    let frame = n42_h2_execution::raw_engine::encode_build_on_own_chaining(
+        &sealed,
+        &attrs,
+        Some(hint),
+        n42_h2_execution::compact_body(),
+    );
     let beacon_root = attrs.parent_beacon_block_root.unwrap_or_default();
     let (tx, answer) = tokio::sync::oneshot::channel();
     let started = std::time::Instant::now();
@@ -369,7 +403,7 @@ async fn chain_request(
         conn.write_u32_le(frame.len() as u32).await?;
         conn.write_all(&frame).await?;
         let answer: ChainAnswer = loop {
-            match read_build_frame(&mut conn, beacon_root).await? {
+            match read_build_frame(&mut conn, beacon_root, n42_h2_execution::compact_body()).await? {
                 BuildFrame::Nothing => break (None, String::from("the execution layer offers no build on an own block")),
                 BuildFrame::Refused(message) => break (None, message),
                 // This build has sealed: the one after it can start now.
@@ -849,6 +883,7 @@ pub fn built_block_from_envelope(
         execution_data: ExecutionData::new(payload, sidecar),
         blob_tx_hashes,
         header: None,
+        tx_hashes: Vec::new(),
     })
 }
 
@@ -1269,7 +1304,12 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
             view: chain.view,
             chained: false,
         });
-        let frame = n42_h2_execution::raw_engine::encode_build_on_own_chaining(header, &attrs, hint);
+        // The transaction hashes come back with the block when this node
+        // makes compact bodies: they are what one names its transactions by,
+        // and only the builder has them without hashing 26 MB again.
+        let hashed = n42_h2_execution::compact_body();
+        let frame =
+            n42_h2_execution::raw_engine::encode_build_on_own_chaining(header, &attrs, hint, hashed);
         let chain_state = std::sync::Arc::clone(&self.chain);
         // The generation as it stands now: a discard just before this call
         // has already bumped it, so a chain started from here belongs to the
@@ -1290,7 +1330,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
             conn.write_u32_le(frame.len() as u32).await?;
             conn.write_all(&frame).await?;
             let answer = loop {
-                match read_build_frame(&mut conn, beacon_root).await? {
+                match read_build_frame(&mut conn, beacon_root, hashed).await? {
                     BuildFrame::Nothing => break None,
                     BuildFrame::Refused(message) => {
                         debug!(
@@ -1477,7 +1517,14 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
                     stream
                 }
             };
-            conn.write_u8(n42_h2_execution::raw_engine::request::FOREIGN_BODY).await?;
+            // The same frame either way; the request kind says which shape
+            // the body inside it has.
+            let kind = if body.compact {
+                n42_h2_execution::raw_engine::request::COMPACT_BODY
+            } else {
+                n42_h2_execution::raw_engine::request::FOREIGN_BODY
+            };
+            conn.write_u8(kind).await?;
             conn.write_u32_le(frame.len() as u32).await?;
             conn.write_all(&frame).await?;
             loop {
@@ -1548,7 +1595,13 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
                 // Said where a fleet's logs show it: a body that falls back
                 // costs the whole payload road, and a leg that fell back
                 // silently would be read as the body road's number.
-                warn!(target: "n42.h2.el", block = ?body.block_hash, %err, "foreign body refused; sending the payload for this block");
+                warn!(
+                    target: "n42.h2.el",
+                    block = ?body.block_hash,
+                    compact = body.compact,
+                    %err,
+                    "foreign body refused; sending the payload for this block"
+                );
                 None
             }
         }
@@ -1650,7 +1703,16 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
                 }
             };
             let stream = &mut conn;
-            stream.write_u8(n42_h2_execution::raw_engine::request::GET_PAYLOAD).await?;
+            // The hashed kind when this node makes compact bodies; otherwise
+            // byte for byte the request it always sent.
+            let hashed = n42_h2_execution::compact_body();
+            stream
+                .write_u8(if hashed {
+                    n42_h2_execution::raw_engine::request::GET_PAYLOAD_HASHED
+                } else {
+                    n42_h2_execution::raw_engine::request::GET_PAYLOAD
+                })
+                .await?;
             stream.write_all(&id.0 .0).await?;
             let answer = match stream.read_u8().await? {
                 0 => None,
@@ -1685,8 +1747,12 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
                     } else {
                         None
                     };
+                    let tx_hashes = read_hash_tail(stream, hashed).await?;
                     let received = started.elapsed();
-                    let built = built_block_from_parts(block.into(), requests, bal, beacon_root);
+                    let mut built = built_block_from_parts(block.into(), requests, bal, beacon_root);
+                    if let Ok(built) = built.as_mut() {
+                        built.tx_hashes = tx_hashes;
+                    }
                     if len > 1_000_000 {
                         debug!(
                             target: "n42.h2.el",
@@ -1884,6 +1950,7 @@ pub fn built_block_from_parts(
         execution_data: ExecutionData::new(payload, sidecar),
         blob_tx_hashes: Vec::new(),
         header: Some(header),
+        tx_hashes: Vec::new(),
     })
 }
 

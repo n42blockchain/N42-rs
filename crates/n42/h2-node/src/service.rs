@@ -280,6 +280,15 @@ pub struct H2Service<E> {
     /// for one of these re-runs the execution instead of waiting for the next
     /// proposal to mention the block again, which it may never do.
     awaiting_bodies: HashSet<B256>,
+    /// Blocks this node took as a *compact* body (`N42_COMPACT_BODY`).
+    ///
+    /// They are not in `body_store`, because what is stored there is served
+    /// to peers as a gov5 body and a compact one is not that. This is what
+    /// keeps the same block from being imported twice when the gossip copy
+    /// follows the push, and it is cleared when the block turns out to need
+    /// the whole body after all -- then the copy that arrives is the one
+    /// that imports it.
+    compact_bodies: HashSet<B256>,
     /// Bodies a proposal named that this node has not seen, with when it
     /// first missed them: the request to peers goes out only after
     /// `body_grace`, because the leader's direct push is normally 30-40 ms
@@ -672,6 +681,12 @@ impl<E: ExecutionLayer> H2Service<E> {
         // outlives the payload here (the driver holds it until the block
         // commits), so nothing is kept alive that was not already.
         driver.set_body_decoder(n42_h2_execution::BodyDecoder::new(|body: &n42_h2_execution::ForeignBody| {
+            if body.compact {
+                // A compact body names its transactions instead of carrying
+                // them; there is no payload in it. The driver asks for the
+                // whole body instead, and this says so if it ever gets here.
+                return Err("a compact body cannot be sent as a payload".to_owned());
+            }
             n42_h2_consensus::decode_raw_block_body(&body.rlp, Some(&body.rlp), body.profile)
                 .map(|decoded| decoded.execution_data())
                 .map_err(|err| err.to_string())
@@ -708,6 +723,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             header_profile: HeaderProfile::Ethereum,
             native_wire: false,
             awaiting_bodies: HashSet::new(),
+            compact_bodies: HashSet::new(),
             body_wait: std::collections::HashMap::new(),
             body_grace: body_request_grace(),
             direct_push: false,
@@ -2140,7 +2156,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                         Err(err) => debug!(target: "n42.h2.node", %err, "built payload has no header to remember"),
                     }
                 }
-                self.publish_body(&built.execution_data, built.header.as_ref());
+                self.publish_body(&built.execution_data, built.header.as_ref(), &built.tx_hashes);
                 if let Err(err) = self
                     .engine
                     .process_event(ConsensusEvent::BlockReady(built.hash, None))
@@ -2247,6 +2263,13 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // schedule, because a caller that logs every pass is how the
                 // spin was found and a gigabyte of log is not a better signal
                 // than one line.
+                // A compact body this node could not assemble ends here:
+                // forget that it was taken, or the whole body that arrives
+                // next would be recognised as a duplicate and dropped.
+                if self.compact_bodies.remove(&block_hash) {
+                    self.driver.forget_payload(block_hash);
+                    info!(target: "n42.h2.node", ?block_hash, "the compact body did not assemble here; asking for the whole body");
+                }
                 if !self.body_grace.is_zero() && !self.body_store.contains_key(&block_hash) {
                     // Deferred: `request_overdue_bodies` asks once the grace
                     // has passed without the body arriving on its own.
@@ -2741,6 +2764,15 @@ impl<E: ExecutionLayer> H2Service<E> {
         if self.body_store.contains_key(&block_hash) {
             return Ok((block_hash, header, false));
         }
+        if self.compact_bodies.contains(&block_hash) {
+            // The compact body reached this node first and its import is
+            // under way or done. The bytes are still worth keeping -- this
+            // is what a peer asking `block_by_hash` is served -- but the
+            // block must not be imported a second time.
+            self.remember_block(block_hash, &header);
+            self.remember_body(block_hash, rlp);
+            return Ok((block_hash, header, false));
+        }
         self.remember_block(block_hash, &header);
         self.driver.cache_body(n42_h2_execution::ForeignBody {
             block_hash,
@@ -2748,8 +2780,49 @@ impl<E: ExecutionLayer> H2Service<E> {
             timestamp: header.timestamp,
             profile: self.header_profile,
             rlp: rlp.clone(),
+            compact: false,
         });
         self.remember_body(block_hash, rlp);
+        Ok((block_hash, header, true))
+    }
+
+    /// A *compact* body that arrived on the direct channel
+    /// (`N42_COMPACT_BODY=1`): the header is read here, as for a body once,
+    /// and the transactions -- which this body names rather than carries --
+    /// are found by the execution layer in its own queue.
+    ///
+    /// Nothing goes into the body store: what is stored there is served to
+    /// peers as gov5's body, and this is not that. A peer asking for this
+    /// block by hash is answered from the execution layer, the way a range
+    /// is served, once the block is imported.
+    fn accept_compact_body(
+        &mut self,
+        bytes: alloy_primitives::Bytes,
+    ) -> Result<(B256, Header, bool), n42_h2_consensus::BlockBodyError> {
+        let (block_hash, header) =
+            n42_h2_consensus::decode_compact_body_header(&bytes, self.header_profile)?;
+        if self.body_store.contains_key(&block_hash) || !self.compact_bodies.insert(block_hash) {
+            return Ok((block_hash, header, false));
+        }
+        while self.compact_bodies.len() > REMEMBERED_TIMESTAMPS {
+            // Bounded the way the other per-block maps are; the oldest is
+            // whichever the set hands back, since this only guards against
+            // a double import within a few views.
+            let Some(oldest) = self.compact_bodies.iter().next().copied() else { break };
+            if oldest == block_hash {
+                break;
+            }
+            self.compact_bodies.remove(&oldest);
+        }
+        self.remember_block(block_hash, &header);
+        self.driver.cache_body(n42_h2_execution::ForeignBody {
+            block_hash,
+            number: header.number,
+            timestamp: header.timestamp,
+            profile: self.header_profile,
+            rlp: bytes,
+            compact: true,
+        });
         Ok((block_hash, header, true))
     }
 
@@ -2774,6 +2847,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         &mut self,
         execution: &alloy_rpc_types_engine::ExecutionData,
         sealed: Option<&alloy_consensus::Header>,
+        tx_hashes: &[B256],
     ) {
         let block_hash = execution.block_hash();
         // Timed in three because the gap between a leader finishing a block and
@@ -2822,7 +2896,28 @@ impl<E: ExecutionLayer> H2Service<E> {
         // hold the same bytes; the leader used to copy the 19 MB once more
         // for the pushers.
         let rlp = alloy_primitives::Bytes::from(rlp);
-        pushed_to_all = self.push_body(&rlp, block_hash);
+        // Beside the body, not instead of it: the compact form for the
+        // members that read it, the whole body for everyone else and for
+        // the topic, the store and every peer that asks by hash.
+        //
+        // The hashes are the execution layer's, sent with the block it
+        // built. Without them there is no compact body for this block --
+        // hashing its 26 MB here to find them again is most of what the
+        // compact body saves -- and the fleet simply gets the body.
+        let compact_at = std::time::Instant::now();
+        let compact = (n42_h2_execution::compact_body()
+            && tx_hashes.len() == execution.payload.as_v1().transactions.len())
+        .then(|| {
+            n42_h2_consensus::encode_compact_body(&rlp, tx_hashes, self.header_profile)
+                .inspect_err(|err| {
+                    warn!(target: "n42.h2.node", %err, ?block_hash, "cannot make a compact body for our own block");
+                })
+                .ok()
+                .map(alloy_primitives::Bytes::from)
+        })
+        .flatten();
+        let compact_ms = compact_at.elapsed().as_millis() as u64;
+        pushed_to_all = self.push_body(&rlp, compact.as_ref(), block_hash);
         let pushed = started.elapsed();
         // Compressed only for the topic: when the push reached every member
         // the topic is not used, and snappy over 19 MB is ~15 ms of the
@@ -2844,6 +2939,8 @@ impl<E: ExecutionLayer> H2Service<E> {
                 target: "n42.h2.node",
                 ?block_hash,
                 bytes = rlp.len(),
+                compact_bytes = compact.as_ref().map_or(0, |b| b.len()),
+                compact_ms,
                 wire = data.as_ref().map_or(0, Vec::len),
                 encode_ms = encoded.as_millis() as u64,
                 push_ms = pushed.saturating_sub(encoded).as_millis() as u64,
@@ -2891,14 +2988,25 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// libp2p push is not used either. Otherwise the libp2p push covers
     /// everyone, at the cost of a duplicate to the peers the channel reached,
     /// which the receiver's body store absorbs.
-    fn push_body(&mut self, rlp: &alloy_primitives::Bytes, block_hash: B256) -> bool {
+    fn push_body(
+        &mut self,
+        rlp: &alloy_primitives::Bytes,
+        compact: Option<&alloy_primitives::Bytes>,
+        block_hash: B256,
+    ) -> bool {
         if !self.direct_push {
             return false;
         }
         if let Some(pushers) = &self.body_pushers
             && !pushers.is_empty()
         {
-            let taken = pushers.push(rlp.clone());
+            // Both shapes are offered; each peer's own task sends the one
+            // that peer greeted for, so a member that does not read compact
+            // bodies is sent exactly what it was always sent.
+            let taken = pushers.push(crate::body_channel::OfferedBody {
+                full: rlp.clone(),
+                compact: compact.cloned(),
+            });
             debug!(target: "n42.h2.node", ?block_hash, taken, peers = pushers.len(), "offered the body to the channel");
             if taken == pushers.len() {
                 return true;
@@ -2914,6 +3022,26 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// bookkeeping as a pushed one, identified by what it decodes to.
     fn handle_direct_body(&mut self, rlp: crate::body_channel::BodyBuf) {
         let started = std::time::Instant::now();
+        if rlp.is_compact() {
+            // 5.2 MB instead of 26: the block with its transactions named by
+            // hash, which this node already holds, decoded and with their
+            // senders, because it ingests every transaction the leader does.
+            let shared = alloy_primitives::Bytes::copy_from_slice(&rlp[..]);
+            drop(rlp);
+            match self.accept_compact_body(shared) {
+                Ok((hash, _, true)) => {
+                    self.import_eagerly(hash);
+                    self.body_arrived.insert(hash, std::time::Instant::now());
+                    self.received_bodies.push(hash);
+                    info!(target: "n42.h2.node", block_hash = ?hash, decode_ms = started.elapsed().as_millis() as u64, "compact block body received (header only)");
+                }
+                Ok((hash, _, false)) => {
+                    debug!(target: "n42.h2.node", block_hash = ?hash, "a compact body for a block this node already holds");
+                }
+                Err(err) => debug!(target: "n42.h2.node", %err, "a compact body from the channel could not be read"),
+            }
+            return;
+        }
         if n42_h2_execution::body_once() {
             // Out of the channel's pooled buffer once, so the buffer goes
             // straight back and one allocation is shared by the body store,

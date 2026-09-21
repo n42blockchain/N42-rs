@@ -91,6 +91,15 @@ pub struct BuiltBlock {
     /// block -- 648 ms at the 163,000-transaction tier, on a path where sealing
     /// itself is 150 ms.
     pub header: Option<alloy_consensus::Header>,
+    /// Every transaction's hash, in block order, when the execution layer
+    /// sent them (`N42_COMPACT_BODY`). Empty otherwise.
+    ///
+    /// Carried for the same reason the header is: the builder already has
+    /// them -- they are cached on the transactions it built the block from
+    /// -- and the compact body is exactly this list. Re-deriving them here
+    /// would be a keccak over the block's 26 MB on the proposal path, which
+    /// is most of what the compact body saves.
+    pub tx_hashes: Vec<B256>,
 }
 
 /// What a caller passes with a build request when it will want the block
@@ -165,6 +174,13 @@ pub struct ForeignBody {
     pub profile: n42_h2_consensus::header_profile::N42HeaderProfile,
     /// The body, exactly as received.
     pub rlp: alloy_primitives::Bytes,
+    /// Whether `rlp` is a *compact* body -- the block with its transactions
+    /// named by hash instead of carried
+    /// (`n42_h2_consensus::compact_body`). It goes to the execution layer
+    /// on a request of its own and cannot be turned into a payload here, so
+    /// a refusal means asking peers for the whole body rather than falling
+    /// back to `NEW_PAYLOAD`.
+    pub compact: bool,
 }
 
 /// How to resolve a started build — the node-neutral stand-in for reth's

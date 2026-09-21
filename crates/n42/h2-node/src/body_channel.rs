@@ -20,8 +20,18 @@
 //! libp2p push.
 //!
 //! ```text
-//! frame := u32 len (little-endian), len bytes of gov5 block RLP
+//! greeting := "N42P", u8 version, u32 features   (receiver -> sender, once)
+//! frame    := u32 len (little-endian), len bytes of gov5 block RLP
+//!           | u32 0xffffffff, u32 len, len bytes of compact body
 //! ```
+//!
+//! The greeting is what makes the compact body (`N42_COMPACT_BODY`) safe in
+//! a mixed fleet. It goes the other way down the same connection, which
+//! carried nothing in that direction before: a sender that predates it
+//! ignores the nine bytes, and a receiver that predates it sends none, so
+//! the sender's read times out and it offers that peer the whole body as it
+//! always did. Nothing is ever sent in a shape the other end did not say it
+//! reads.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -67,12 +77,51 @@ pub struct BodyBuf {
     /// A body that arrived as shared bytes (a pushed or fetched chunk) is
     /// kept as those bytes, not copied into `buf`.
     shared: Option<alloy_primitives::Bytes>,
+    /// Whether these bytes are a compact body rather than a gov5 one. Only
+    /// the channel ever sets it; everything else builds full bodies.
+    compact: bool,
+}
+
+/// What the greeting starts with, so a stray connection is not read as one.
+const GREETING_MAGIC: [u8; 4] = *b"N42P";
+
+/// The greeting's version. A sender that does not know it reads no
+/// features and offers whole bodies.
+const GREETING_VERSION: u8 = 1;
+
+/// Feature bit 0: this receiver reads compact bodies.
+const FEATURE_COMPACT: u32 = 1;
+
+/// The length field that says "a compact body follows" instead of a length.
+/// Out of range for a real one -- [`MAX_BODY_BYTES`] is 256 MB -- and only
+/// ever written to a peer whose greeting asked for it.
+const COMPACT_MARKER: u32 = u32::MAX;
+
+/// How long a sender waits for a receiver's greeting before deciding it has
+/// none. Paid once per connection, and only against a peer that predates
+/// the greeting; the channel is a LAN or one host.
+const GREETING_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// One body offered to the peers: the gov5 body every peer can read, and
+/// the compact form for the peers that said they read it.
+#[derive(Clone, Debug)]
+pub struct OfferedBody {
+    /// The gov5 body, `[header, transactions, verifiers, rewards]`.
+    pub full: alloy_primitives::Bytes,
+    /// The same block with its transactions named by hash, when this node
+    /// built one.
+    pub compact: Option<alloy_primitives::Bytes>,
 }
 
 impl BodyBuf {
     /// The bytes as an owned `Vec`, copied.
     pub fn to_vec(&self) -> Vec<u8> {
         self.as_slice().to_vec()
+    }
+
+    /// Whether these bytes are a compact body.
+    pub const fn is_compact(&self) -> bool {
+        self.compact
     }
 
     fn as_slice(&self) -> &[u8] {
@@ -92,13 +141,13 @@ impl std::ops::Deref for BodyBuf {
 
 impl From<Vec<u8>> for BodyBuf {
     fn from(buf: Vec<u8>) -> Self {
-        Self { buf, pool: None, shared: None }
+        Self { buf, pool: None, shared: None, compact: false }
     }
 }
 
 impl From<alloy_primitives::Bytes> for BodyBuf {
     fn from(bytes: alloy_primitives::Bytes) -> Self {
-        Self { buf: Vec::new(), pool: None, shared: Some(bytes) }
+        Self { buf: Vec::new(), pool: None, shared: Some(bytes), compact: false }
     }
 }
 
@@ -149,19 +198,30 @@ pub async fn listen(addr: SocketAddr, sink: mpsc::Sender<BodyBuf>) -> std::io::R
 
 async fn receive(mut stream: TcpStream, sink: mpsc::Sender<BodyBuf>, pool: Arc<BufPool>) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
+    // What this node reads, said before anything is asked of it. A sender
+    // that does not read it is unaffected: it never read this direction.
+    let features = if n42_h2_execution::compact_body() { FEATURE_COMPACT } else { 0 };
+    let mut greeting = Vec::with_capacity(9);
+    greeting.extend_from_slice(&GREETING_MAGIC);
+    greeting.push(GREETING_VERSION);
+    greeting.extend_from_slice(&features.to_le_bytes());
+    stream.write_all(&greeting).await?;
+    stream.flush().await?;
     loop {
         let len = match stream.read_u32_le().await {
             Ok(len) => len,
             Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(err) => return Err(err),
         };
+        let compact = len == COMPACT_MARKER;
+        let len = if compact { stream.read_u32_le().await? } else { len };
         if len == 0 || len > MAX_BODY_BYTES {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("body of {len} bytes")));
         }
         let mut body = pool.take();
         body.resize(len as usize, 0);
         stream.read_exact(&mut body).await?;
-        let body = BodyBuf { buf: body, pool: Some(Arc::clone(&pool)), shared: None };
+        let body = BodyBuf { buf: body, pool: Some(Arc::clone(&pool)), shared: None, compact };
         if sink.send(body).await.is_err() {
             return Ok(());
         }
@@ -172,7 +232,7 @@ async fn receive(mut stream: TcpStream, sink: mpsc::Sender<BodyBuf>, pool: Arc<B
 /// its own task.
 #[derive(Debug, Clone)]
 pub struct BodyPushers {
-    peers: Vec<(SocketAddr, mpsc::Sender<alloy_primitives::Bytes>)>,
+    peers: Vec<(SocketAddr, mpsc::Sender<OfferedBody>)>,
 }
 
 impl BodyPushers {
@@ -204,18 +264,42 @@ impl BodyPushers {
     /// Offers `body` to every peer's queue without waiting. Returns how many
     /// queues took it; a full queue means that peer is behind and gets the
     /// libp2p push instead.
-    pub fn push(&self, body: alloy_primitives::Bytes) -> usize {
+    ///
+    /// Both shapes are offered and each peer's own task picks: only that
+    /// task knows what its peer greeted with, and the pick therefore
+    /// follows the connection rather than a guess made here. Offering both
+    /// costs two refcounts, not two copies.
+    pub fn push(&self, body: OfferedBody) -> usize {
         self.peers.iter().filter(|(_, tx)| tx.try_send(body.clone()).is_ok()).count()
     }
 }
 
-async fn push_loop(addr: SocketAddr, mut rx: mpsc::Receiver<alloy_primitives::Bytes>) {
+/// Reads a receiver's greeting, or decides it has none.
+///
+/// A peer that predates the greeting writes nothing in this direction, so
+/// the wait is what tells the two apart. Anything unexpected is read as "no
+/// features": the whole body always works.
+async fn read_greeting(stream: &mut TcpStream) -> u32 {
+    let mut greeting = [0u8; 9];
+    match tokio::time::timeout(GREETING_WAIT, stream.read_exact(&mut greeting)).await {
+        Ok(Ok(_)) if greeting[..4] == GREETING_MAGIC && greeting[4] == GREETING_VERSION => {
+            u32::from_le_bytes([greeting[5], greeting[6], greeting[7], greeting[8]])
+        }
+        _ => 0,
+    }
+}
+
+async fn push_loop(addr: SocketAddr, mut rx: mpsc::Receiver<OfferedBody>) {
     let mut stream: Option<TcpStream> = None;
+    let mut features = 0u32;
     while let Some(body) = rx.recv().await {
         if stream.is_none() {
             match tokio::time::timeout(std::time::Duration::from_secs(1), TcpStream::connect(addr)).await {
                 Ok(Ok(connected)) => {
                     let _ = connected.set_nodelay(true);
+                    let mut connected = connected;
+                    features = read_greeting(&mut connected).await;
+                    debug!(target: "n42.h2.node", %addr, features, "body channel connected");
                     stream = Some(connected);
                 }
                 Ok(Err(err)) => {
@@ -230,16 +314,23 @@ async fn push_loop(addr: SocketAddr, mut rx: mpsc::Receiver<alloy_primitives::By
         }
         let sock = stream.as_mut().expect("connected above");
         let started = std::time::Instant::now();
+        // The compact body only to a peer that greeted for it; everyone
+        // else gets the bytes they have always been sent.
+        let compact = (features & FEATURE_COMPACT != 0).then(|| body.compact.as_ref()).flatten();
+        let sent = compact.unwrap_or(&body.full);
         let result = async {
-            sock.write_u32_le(body.len() as u32).await?;
-            sock.write_all(&body).await?;
+            if compact.is_some() {
+                sock.write_u32_le(COMPACT_MARKER).await?;
+            }
+            sock.write_u32_le(sent.len() as u32).await?;
+            sock.write_all(sent).await?;
             sock.flush().await
         }
         .await;
         match result {
             Ok(()) => {
-                if body.len() > 1_000_000 {
-                    debug!(target: "n42.h2.node", %addr, bytes = body.len(), ms = started.elapsed().as_millis() as u64, "body sent over the channel");
+                if sent.len() > 1_000_000 {
+                    debug!(target: "n42.h2.node", %addr, bytes = sent.len(), compact = compact.is_some(), ms = started.elapsed().as_millis() as u64, "body sent over the channel");
                 }
             }
             Err(err) => {
@@ -290,11 +381,44 @@ mod tests {
         listen(addr, tx).await.unwrap();
         let pushers = BodyPushers::connect(vec![addr]);
         let body: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
-        assert_eq!(pushers.push(alloy_primitives::Bytes::from(body.clone())), 1);
+        let offer = |bytes: Vec<u8>| OfferedBody { full: alloy_primitives::Bytes::from(bytes), compact: None };
+        assert_eq!(pushers.push(offer(body.clone())), 1);
         let got = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
         assert_eq!(&got[..], &body[..]);
-        assert_eq!(pushers.push(alloy_primitives::Bytes::from(vec![7u8; 10])), 1);
+        assert!(!got.is_compact());
+        assert_eq!(pushers.push(offer(vec![7u8; 10])), 1);
         let got = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
         assert_eq!(&got[..], &[7u8; 10][..]);
+    }
+
+    /// A peer that did not greet for compact bodies is sent the whole body,
+    /// and one that did is sent the compact one -- the same offer, decided
+    /// per connection. The receiver here greets with whatever this build's
+    /// `N42_COMPACT_BODY` says, so the test asserts the pair rather than
+    /// one branch: the bytes that arrive are the compact ones exactly when
+    /// the arriving frame says it is compact.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_offer_arrives_in_the_shape_the_receiver_greeted_for() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let (tx, mut rx) = mpsc::channel(4);
+        listen(addr, tx).await.unwrap();
+        let pushers = BodyPushers::connect(vec![addr]);
+        let full = vec![1u8; 4096];
+        let compact = vec![2u8; 64];
+        assert_eq!(
+            pushers.push(OfferedBody {
+                full: alloy_primitives::Bytes::from(full.clone()),
+                compact: Some(alloy_primitives::Bytes::from(compact.clone())),
+            }),
+            1
+        );
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+        if got.is_compact() {
+            assert_eq!(&got[..], &compact[..]);
+        } else {
+            assert_eq!(&got[..], &full[..]);
+        }
     }
 }

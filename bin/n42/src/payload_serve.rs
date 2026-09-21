@@ -189,6 +189,7 @@ pub struct OwnBlockReuse {
 pub type ForeignImport = dyn Fn(
         SealedBlock<n42_tx_types::Block>,
         Option<tokio::sync::oneshot::Sender<()>>,
+        crate::follower_import::VoteRoad,
     ) -> Result<
         (Box<reth_payload_primitives::BuiltPayloadExecutedBlock<n42_tx_types::N42Primitives>>, [u64; 9]),
         String,
@@ -832,6 +833,7 @@ async fn import_for_validator<T>(
     pre_converted: Option<SealedBlock<n42_tx_types::Block>>,
     started: std::time::Instant,
     decoded: std::time::Duration,
+    road: crate::follower_import::VoteRoad,
 ) -> std::io::Result<()>
 where
     T: PayloadTypes<BuiltPayload = N42BuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
@@ -895,7 +897,7 @@ where
             if !fast {
                 n42_engine_types::built_executions::remember_sealed(sealed.hash(), sealed.clone());
             }
-            let (executed, phases) = import(sealed, Some(checked_tx))?;
+            let (executed, phases) = import(sealed, Some(checked_tx), road)?;
             Ok::<_, String>((executed, phases, converted))
         });
         tokio::pin!(handed);
@@ -1452,7 +1454,13 @@ where
                 "foreign body decoded once"
             );
             let decoded_in = started.elapsed();
-            import_for_validator::<T>(&mut stream, &mut out, &engine, reuse.as_ref(), data, Some(sealed), started, decoded_in).await?;
+            let road = crate::follower_import::VoteRoad {
+                request: "foreign_body",
+                recv_ms: recv.as_millis() as u64,
+                decode_ms: decoded_in.as_millis() as u64,
+                started: started_at,
+            };
+            import_for_validator::<T>(&mut stream, &mut out, &engine, reuse.as_ref(), data, Some(sealed), started, decoded_in, road).await?;
             continue;
         }
         if kind == request::NEW_PAYLOAD {
@@ -1469,6 +1477,7 @@ where
             frame.clear();
             frame.resize(len, 0);
             stream.read_exact(&mut frame[..]).await?;
+            let recv = started_at.elapsed();
             let started = std::time::Instant::now();
             out.clear();
             // Decoded with a copy per transaction, deliberately: decoding the
@@ -1501,6 +1510,12 @@ where
                         None,
                         started,
                         started.elapsed(),
+                        crate::follower_import::VoteRoad {
+                            request: "new_payload",
+                            recv_ms: recv.as_millis() as u64,
+                            decode_ms: started.elapsed().as_millis() as u64,
+                            started: started_at,
+                        },
                     )
                     .await?;
                     continue;

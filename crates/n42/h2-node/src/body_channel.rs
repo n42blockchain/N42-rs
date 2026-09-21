@@ -298,7 +298,16 @@ async fn push_loop(addr: SocketAddr, mut rx: mpsc::Receiver<OfferedBody>) {
                 Ok(Ok(connected)) => {
                     let _ = connected.set_nodelay(true);
                     let mut connected = connected;
-                    features = read_greeting(&mut connected).await;
+                    // Only a sender that has a compact body to offer needs
+                    // to know what the other end reads, so with the flag off
+                    // this connection is made and used exactly as it always
+                    // was -- no read, and no wait for a peer that greets
+                    // with nothing.
+                    features = if n42_h2_execution::compact_body() {
+                        read_greeting(&mut connected).await
+                    } else {
+                        0
+                    };
                     debug!(target: "n42.h2.node", %addr, features, "body channel connected");
                     stream = Some(connected);
                 }

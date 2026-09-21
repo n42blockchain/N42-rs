@@ -245,7 +245,9 @@ pub fn decode_compact_body(
     validate_body_header(&header, profile)?;
     let count = r.u32()? as usize;
     let raw = r.take(count.checked_mul(32).ok_or_else(invalid)?)?;
-    let hashes: Vec<B256> = raw.chunks_exact(32).map(B256::from_slice).collect();
+    // Exactly `count` whole hashes: the take above sized the slice, so the
+    // remainder `as_chunks` hands back is empty.
+    let hashes: Vec<B256> = raw.as_chunks::<32>().0.iter().copied().map(B256::from).collect();
     let verifiers_rlp = r.bytes()?;
     let rewards_rlp = r.bytes()?;
     let bal = if r.u8()? == 1 { Some(r.bytes()?) } else { None };

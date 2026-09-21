@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# loop180: two of the ceilings, one at a time.
+#
+# E, the supply. The flood sustains ~280k tx/s over a round while window 1 reads 350-370k, so the load generator and
+# the ingest may be what the chain is waiting for -- and if they are, every chain-side number since loop170 is an
+# underestimate. E0 is today's flood (64 workers, 500 a batch, 6 frames in flight), E1 doubles all three. If the
+# round does not move, supply is not the ceiling.
+#
+# A, the fixed cost of a cycle: proposal, votes, QC, body push. It is ~90-100 ms by subtraction (cycle 393-399 ms
+# against a 290-303 ms build) and has never been measured on its own. A1 runs 10,000-transaction blocks with the
+# pacing out of the way (100 ms), so the cycle floor is what the protocol costs per block whatever it carries.
+#
+# Legs: E0a E1a A1a E0b E1b. Every leg on the adopted allocator, the direct receipts and the follower's streamed
+# graft. Tests and the build run BEFORE the claim; released on any exit.
+cd /home/n42/src/n42/n42-rs
+S=/home/n42/src/n42/n42-rs/target/fleet-runs
+B=/data/blockchain/rust-fleet7-bench
+NEW=/home/n42/src/n42/n42-rs/target/deferred/release
+CLAIM=/data/blockchain/.box-claim-rust; CLAIM2=/data/blockchain/wr-logs/.box-claim-rust
+cleanup() {
+  rm -f $CLAIM $CLAIM2
+  # The fleet this runner started goes with it. Killing the runner alone left
+  # seven nodes and seven validators running for four and a half hours on
+  # 2026-09-19: they held the box against this runner's own quiet check and
+  # against whoever claimed it next.
+  for p in $(pgrep -f '/n4[2] node'; pgrep -f 'h2_validato[r]'; pgrep -f 'tx_floo[d]'); do kill $p 2>/dev/null; done
+}
+trap cleanup EXIT
+if ! grep -q 'fn follower_graft_stream' crates/n42/engine-types/src/parallel_transfer.rs || ! grep -q 'fn sort_reverts' crates/n42/engine-types/src/parallel_transfer.rs || ! grep -q 'fn graft_stream' crates/n42/engine-types/src/parallel_transfer.rs || ! grep -q 'install_staged' crates/n42/engine-types/src/payload.rs || ! grep -q 'fn direct_receipts_enabled' crates/n42/engine-types/src/payload.rs || ! grep -q 'tx_count += executed_count as u64' crates/n42/engine-types/src/payload.rs || ! grep -q 'fn batch_equation_holds' crates/n42/tx-types/src/alt_sig.rs || ! grep -q 'spawn_scoped(scope, root_job)' bin/n42/src/follower_import.rs; then echo "INSTRUMENTATION MISSING in the working tree; nothing built"; echo ALLDONE; exit 1; fi
+T=$S/tests-loop180.log; : > $T
+BUILD_FROM=$(date -u +%s)
+tst() { echo "== $*" >> $T; nice -n 19 systemd-run --user --scope -q -p MemoryMax=40G -p MemorySwapMax=0 "$@" >> $T 2>&1; }
+echo "tests from $(date +%H:%M) (no claim)"
+for spec in "-p n42-engine-types --lib payload" "-p n42-tx-types --lib" "-p n42-qmdb-reth --lib" "-p n42-h2-execution --lib driver" "-p n42-h2-execution --test consensus_execution_loop" "-p n42 --lib payload_serve::tests" "-p n42 --lib follower_import::parent_output_tests"; do
+  if ! tst cargo test -j8 --target-dir target/deferred $spec; then echo "TESTS FAILED: $spec (see $T)"; echo ALLDONE; exit 1; fi
+done
+if ! tst cargo clippy -j8 --target-dir target/deferred -p n42-h2-execution -p n42-h2-node -p n42-engine-types -p n42-qmdb-reth -p n42-tx-types -p n42 --lib --bins; then echo "CLIPPY FAILED (see $T)"; echo ALLDONE; exit 1; fi
+echo "tests passed at $(date +%H:%M): $(grep -E '^test result:' $T | sed -E 's/test result: ok. ([0-9]+) passed.*/\1/' | paste -sd+ | bc) tests"
+if ! nice -n 19 cargo build -j8 --release --target-dir target/deferred -p n42 --bin n42 -p n42-h2-node --example h2_validator --example tx_flood --example h2_keygen --example send_tx > $S/build-loop180.log 2>&1; then echo "BUILD FAILED"; echo ALLDONE; exit 1; fi
+echo "built $(git rev-parse --short HEAD)+tree at $(date +%H:%M)"
+until grep -q ALLDONE $S/run-scaling.out 2>/dev/null; do sleep 60; done
+WAITED_FROM=$(date -u +%s)
+good() { local cpus; cpus=$(nproc)
+  [ "$(pgrep -fc 'bin/n42-[a-z]+ --chai[n]')" = "0" ] && [ "$(pgrep -fc 'n42-[a-z0-9]+ --chai[n]')" = "0" ] \
+    && [ "$(pgrep -fc 'n4[2] node')" = "0" ] && [ "$(pgrep -fc 'n42-dat[c]')" = "0" ] && [ "$(pgrep -fc 'eth-el-frame[d]')" = "0" ] \
+    && { [ "$(pgrep -fc 'txfloo[d]')" = "0" ] || [ $(( $(date -u +%s) - ${WAITED_FROM:-0} )) -gt 600 ]; } \
+    && [ "$(free -g | awk '/Mem:/{print $7}')" -ge 80 ] \
+    && [ "$(awk '{printf "%d", $1}' /proc/loadavg)" -lt $(( cpus / 4 )) ]; }
+theirs_claim() { local f n=""; for f in /data/blockchain/.box-claim-* /data/blockchain/wr-logs/.box-claim-*; do [ -e "$f" ] || continue; case "$f" in *box-claim-rust) continue;; esac; v=$(tr -c '0-9\n' ' ' < "$f" | tr -s ' ' '\n' | grep -E '^[0-9]+$' | sort -n | tail -1); [ -z "$v" ] && v=9999999999; n="$n $v"; done; echo $n | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -n | tail -1; }
+quiet() { local n=0; while [ $n -lt 3 ]; do [ -z "$(theirs_claim)" ] || return 1; good || return 1; n=$((n+1)); [ $n -lt 3 ] && sleep 30; done; return 0; }
+mkdir -p /data/blockchain/wr-logs
+echo "waiting for a quiet box from $(date +%H:%M)"
+while true; do
+  until quiet; do sleep 30; done
+  mine=$(date -u +%s); echo "$mine" | tee $CLAIM > $CLAIM2
+  sleep $((20 + RANDOM % 31))
+  theirs=$(theirs_claim)
+  [ -n "$theirs" ] && [ "$theirs" -lt "$mine" ] && [ $(( mine - theirs )) -gt 5400 ] && theirs=""
+  if good && { [ -z "$theirs" ] || [ "$theirs" -gt "$mine" ]; }; then break; fi
+  rm -f $CLAIM $CLAIM2; echo "stood down at $(date +%H:%M): another claim or the box got busy"; sleep 60
+done
+echo "claimed at $(date +%H:%M) ($mine): avail $(free -g | awk '/Mem:/{print $7}')G load $(awk '{print $1}' /proc/loadavg)"
+CLAIMED_AT=$(date -u +%s)
+newer=$(find crates bin -name '*.rs' -newer $NEW/n42 2>/dev/null | head -3)
+if [ -n "$newer" ]; then echo "SOURCE NEWER THAN THE BINARY ($newer); released without a leg"; echo ALLDONE; exit 1; fi
+export F7_LEADER_TENURE=16 F7_INGEST=1 F7_INGEST_ALL=1 F7_NO_TX_GOSSIP=1 N42_TX_INGEST_ASYNC=1
+export F7_DIRECT_PUSH=1 F7_BLOCK_INTERVAL_MS=250 F7_SKIP_STALE_CHECK=1 F7_METRICS_BASE=19300 N42_TX_QUEUE=1
+export N42_TX_INGEST_RECOVER_NICE=10 N42_TX_INGEST_RECOVER_PARALLEL=8 N42_TX_INGEST_DIRECT=1
+elpid() { ps -eo pid,args | grep -E '/n4[2] node' | grep -E 'rust-fleet7-bench/node3' | awk '{print $1}' | head -1; }
+sample() { local p v; p=$(elpid); v=$(pgrep -f 'h2_validato[r]' | head -1)
+  for i in $(seq 1 40); do echo "$(date +%H:%M:%S) el_rss=$(awk '/VmRSS/{printf "%.2f", $2/1e6}' /proc/$p/status 2>/dev/null)G val_rss=$(awk '/VmRSS/{printf "%.2f", $2/1e6}' /proc/$v/status 2>/dev/null)G $(awk '/^MemAvailable|^MemFree|^Cached:|^Dirty:|^Writeback:|^AnonPages|^Shmem:/{printf "%s%.1fG ", $1, $2/1e6}' /proc/meminfo) pgpgin=$(awk '/^pgpgin /{print $2}' /proc/vmstat) fleet_majflt=$(for q in $(pgrep -f "/n4[2] node"; pgrep -f "h2_validato[r]"); do awk '{print $12}' /proc/$q/stat 2>/dev/null; done | paste -sd+ | bc) compact_stall=$(awk '/^compact_stall/{print $2}' /proc/vmstat) flood=$(tail -1 $B/bench-$tag/flood.log 2>/dev/null | grep -oE '\+ *[0-9]+s' | tr -d ' ')"; sleep 5; done
+}
+median() { sort -n | awk '{a[NR]=$1} END{print (NR ? a[int(NR/2)+1] : "-")}'; }
+run() { local tag=$1; shift
+  ( n=0; until grep -q 'funding' $B/bench-$tag/flood.log 2>/dev/null; do sleep 1; n=$((n+1)); [ $n -gt 300 ] && exit 0; done; sample $tag ) > $S/mem-$tag.txt &
+  echo "leg $tag start $(date +%H:%M:%S) load $(awk '{print $1}' /proc/loadavg)"
+  local ceil=${F7_GASCEIL_OVERRIDE:-3423000000} conc=${F7_FLOOD_CONC:-64} batch=${F7_FLOOD_RPCBATCH:-500}
+  for kv in "$@"; do case "$kv" in F7_GASCEIL_OVERRIDE=*) ceil=${kv#*=};; F7_FLOOD_CONC=*) conc=${kv#*=};; F7_FLOOD_RPCBATCH=*) batch=${kv#*=};; esac; done
+  env "$@" timeout -k 30 600 scripts/fleet7-bench.sh --tag "$tag" --gasceil "$ceil" --senders 6000 --pertx 10000 --conc "$conc" --rpcbatch "$batch" > $S/bench-$tag.out 2>&1; echo "round $tag exit $? at $(date +%H:%M:%S)"
+  e=$(pgrep -f '/n4[2] node' | head -1); [ -n "$e" ] && echo "el binary: $(readlink /proc/$e/exe) env: $(tr '\0' '\n' < /proc/$e/environ | grep -E 'QMDB_READS|HASHED_TABLES|GRAFT_STREAM|FOLLOWER_GRAFT_STREAM|RAYON_NUM_THREADS|PARALLEL_BUILD_THREADS|INGEST_RECOVER_PARALLEL|DIRECT_RECEIPTS|MALLOC_CONF' | paste -sd' ')"
+  wait
+  echo "$tag tc=$(cat $B/node*/v.log | grep -c 'TC formed') invalid_blocks=$(cat $B/node*/el.log | grep -c 'Encountered invalid block') incomplete=$(cat $B/node*/el.log | grep -c 'an incomplete execution result') gas_mismatch=$(cat $B/node*/el.log | grep -c 'gas used mismatch') direct_imports_failed=$(cat $B/node*/el.log | grep -c 'direct import failed') stuck_at_hashed_state=$(cat $B/node*/el.log | grep -c 'import_stage="hashed-state"') engine_idles_over_5s=$(cat $B/node*/el.log | grep -cE 'branch="orchestrator".*idle_before_ms=([5-9][0-9]{3}|[0-9]{5})') proposals_given_up=$(cat $B/node*/v.log | grep -c 'could not build a block to propose') tables_off_nodes=$(cat $B/node*/el.log | grep -c 'hashed state tables are not written') unanswered_reads=$(cat $B/node*/el.log | grep -c 'N42_HASHED_TABLES=off leaves no table') seal_first_total=$(cat $B/node*/el.log | grep -c 'seal-first build phases') seal_first_direct=$(cat $B/node*/el.log | grep 'seal-first build phases' | grep -c 'direct_receipts=true') direct_guard_errors=$(cat $B/node*/el.log | grep -c 'early seal that did not happen') commit_ms_median=$(cat $B/node*/el.log | grep 'seal-first build phases' | grep -oE 'par_commit_ms=[0-9]+' | cut -d= -f2 | median) fold_ms_median=$(cat $B/node*/el.log | grep 'seal-first build phases' | grep -oE 'par_fold_ms=[0-9]+' | cut -d= -f2 | median) sealed_at_ms_median=$(cat $B/node*/el.log | grep 'seal-first build phases' | grep -oE 'sealed_at_ms=[0-9]+' | cut -d= -f2 | median) state_ready_ms_median=$(cat $B/node*/el.log | grep 'seal-first build phases' | grep -oE 'state_ready_ms=[0-9]+' | cut -d= -f2 | median) build_total_ms_median=$(cat $B/node*/el.log | grep 'seal-first build phases' | grep -oE 'total_ms=[0-9]+' | cut -d= -f2 | median) recover_us_median=$(cat $B/node*/el.log | grep -oE 'recover_us_per_tx=[0-9]+' | cut -d= -f2 | median) par_exec_ms_median=$(cat $B/node*/el.log | grep 'seal-first build phases' | grep -oE 'par_exec_ms=[0-9]+' | cut -d= -f2 | median) import_exec_ms_median=$(cat $B/node*/el.log | grep 'handed to the engine as executed' | grep 'txs=1[0-9]\{5\}' | grep -oE 'exec_ms=[0-9]+' | cut -d= -f2 | median) import_total_ms_median=$(cat $B/node*/el.log | grep 'handed to the engine as executed' | grep 'txs=1[0-9]\{5\}' | grep -oE 'total_ms=[0-9]+' | cut -d= -f2 | median) import_senders_ms_median=$(cat $B/node*/el.log | grep 'handed to the engine as executed' | grep 'txs=1[0-9]\{5\}' | grep -oE 'senders_ms=[0-9]+' | cut -d= -f2 | median) import_convert_ms_median=$(cat $B/node*/el.log | grep 'handed to the engine as executed' | grep 'txs=1[0-9]\{5\}' | grep -oE 'convert_ms=[0-9]+' | cut -d= -f2 | median) import_groups_median=$(cat $B/node*/el.log | grep 'parallel import phases' | grep -oE 'groups=[0-9]+' | cut -d= -f2 | sort -rn | head -200 | median) imports_over_600ms=$(cat $B/node*/el.log | grep 'handed to the engine as executed' | grep 'txs=1[0-9]\{5\}' | grep -oE 'total_ms=[0-9]+' | cut -d= -f2 | awk '$1>600' | wc -l) min_avail_g=$(grep -oE 'MemAvailable:[0-9.]+' $S/mem-$tag.txt | cut -d: -f2 | sort -n | head -1)"
+  low=$(grep -oE 'MemAvailable:[0-9.]+' $S/mem-$tag.txt 2>/dev/null | cut -d: -f2 | sort -n | head -1)
+  awk -v l="${low:-999}" -v t="$tag" 'BEGIN { if (l+0 < 10) printf "MEMORY FLOOR %s: %.1f G free at its lowest\n", t, l }'
+  for i in 0 1 2 3 4 5 6; do cp $B/node$i/el.log $B/bench-$tag/node$i-el.log; cp $B/node$i/v.log $B/bench-$tag/node$i-v.log; done
+  python3 scripts/fleet7-phases.py $B > $B/bench-$tag/phases.txt 2>&1; python3 scripts/fleet7-windows.py $B/bench-$tag $S/mem-$tag.txt > $B/bench-$tag/windows.txt 2>&1; python3 scripts/fleet7-cycles.py $B/bench-$tag > $B/bench-$tag/cycles.txt 2>&1
+  echo "$tag flood_peak_per_s=$(grep -oE '\(([0-9]+)/s\)' $B/bench-$tag/flood.log 2>/dev/null | tr -d '(/s)' | sort -rn | head -1) flood_sent=$(grep -oE 'sent [0-9]+' $B/bench-$tag/flood.log 2>/dev/null | tail -1 | cut -d' ' -f2) cycle_median_w1=$(awk '/^w1 /{print $4}' $B/bench-$tag/cycles.txt 2>/dev/null) blocks_w1=$(awk '/^w1 /{print $2}' $B/bench-$tag/cycles.txt 2>/dev/null)"
+  echo "$tag $(grep -E '^win1 ' $B/bench-$tag/round.txt | grep -oE 'tps= *[0-9,]+' | tr -d ' ') round_txs=$(grep -E '^win[123] ' $B/bench-$tag/round.txt | grep -oE 'txs=[0-9,]+' | cut -d= -f2 | tr -d , | paste -sd+ | bc) cycles_w1=$(awk '/^w1 /{print $4}' $B/bench-$tag/cycles.txt)"
+  for p in $(pgrep -f '/n4[2] node'; pgrep -f 'h2_validato[r]'; pgrep -f 'tx_floo[d]'); do kill -9 $p 2>/dev/null; done; sleep 2
+}
+leg() {
+  if [ $(( $(date -u +%s) - CLAIMED_AT )) -gt 4500 ]; then echo "leg loop180$1 skipped: 75 minutes of the claim used"; return; fi
+  local tag=$1; shift
+  run loop180$tag F7_EL_EXTRA="--builder.interval 60 --builder.deadline 3" N42_FAST_TRANSFER=1 N42_FOLLOWER_DIRECT_IMPORT=1 F7_SENDER_CACHE_MULT=4 N42_TX_QUEUE_BATCH=1024 N42_TX_QUEUE_DRAINER=1 F7_FLOOD_WINDOW=6 N42_TX_INGEST_RECOVER_PARALLEL=12 F7_BLOCK_INTERVAL_MS=350 "$@"
+}
+C='N42_BUILDER_PULLER=1024 N42_TX_QUEUE_RUN=64 MALLOC_CONF=thp:always N42_FOLLOWER_PARALLEL=1 TOKIO_WORKER_THREADS=8 F7_FLOOD_ALG=ed25519 N42_ALTSIG_SENDER_CACHE=4194304 N42_ED25519_BATCH=128'
+R='N42_PARALLEL_BUILD=1 N42_FOLLOWER_GRAFT=1 F7_STRAGGLER_GRACE_MS=600 RAYON_NUM_THREADS=16 N42_BUILD_ON_SEAL=1 F7_LEADER_TENURE=64 N42_QMDB_RETAIN_DEPTH=16 N42_QMDB_ENTRY_FILE=1'
+A2='MALLOC_CONF=thp:always,oversize_threshold:0,dirty_decay_ms:2000,background_thread:true'
+D='N42_QMDB_READS=on N42_HASHED_TABLES=off'
+leg E0a F7_BIN=$NEW $C $R $D $A2
+leg E1a F7_BIN=$NEW $C $R $D $A2 F7_FLOOD_WINDOW=12 F7_FLOOD_CONC=128 F7_FLOOD_RPCBATCH=1000
+leg A1a F7_BIN=$NEW $C $R $D $A2 F7_GASCEIL_OVERRIDE=210000000 F7_BLOCK_INTERVAL_MS=100
+leg E0b F7_BIN=$NEW $C $R $D $A2
+leg E1b F7_BIN=$NEW $C $R $D $A2 F7_FLOOD_WINDOW=12 F7_FLOOD_CONC=128 F7_FLOOD_RPCBATCH=1000
+cleanup
+echo "released at $(date +%H:%M)"
+echo ALLDONE

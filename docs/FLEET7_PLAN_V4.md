@@ -581,6 +581,60 @@ A warm-up leg first, then alternating (window 1, full blocks, medians); Q1 = cha
   section 2m was the cached residue (10-12 GB) behind the small pool, not the pool's count: reclaim needs something to
   reclaim.
 
+## 2o. More supply is a slower chain: the limit is a node's sixteen cores (loop197)
+
+Section 2n asked whether the harness was the limit. It is not, and the answer is more useful than that. The chain
+configuration at 64, 128 and 192 flood workers, a warm-up leg first, alternating:
+
+| flood workers | window 1 | cycle | window 2 | the gate open (5 s samples) | queue trough (p5) |
+| --- | --- | --- | --- | --- | --- |
+| 64 (three legs) | 435-443k | 0.366 s | 369-380k | 5 | 101-104k |
+| 128 (two legs) | 397-401k | 0.40-0.41 s | 320-331k | 4-5 | 266-292k |
+| 192 (one leg) | 380k | 0.429 s | 326k | 0 | 408k |
+
+- **The deeper the queue is kept, the slower the fleet.** Supply and the chain are not two resources: every node
+  verifies every transaction (`F7_INGEST_ALL`) on the cores its import and its build run on, and a fuller gate is more
+  of that in flight. The fleet is fastest at 64 workers *because* the flood then falls short in stretches and leaves
+  the nodes their cores. loop194 had already shown the other face of it (the vote road's decode 72 -> 85 ms and its
+  sender look-ups 27 -> 43 ms as the pool went from 3 to 5 blocks).
+- So every configuration reads 429-443k for one reason, and it is not B, D or E: at ~11 us of ingest per transaction
+  435k/s is about five of a node's sixteen cores before a block is touched; at 1M/s it would be eleven. **What is left
+  of the vote road and of the build are slices of one budget**, and cutting one hands its time to another (E absorbed
+  B and D in 2j, D absorbed B in 2n) until the budget itself is addressed.
+- The legs at 64 workers ran out of transactions in window 3 (6,000 senders x 10,000); later runners use 12,000.
+- loop198 (queued behind gov5's claim when this was written): the chain and the confirmed configurations with
+  `threadcpu.py` beside them -- per-thread-name CPU of every execution layer, validator and the flood, the table that
+  says where the sixteen cores go.
+
+## 2p. Checkpoint, 2026-09-21: where the seven-node campaign stands
+
+Tagged `fleet7-plan-v4-7node-20260921`. One night's work in the commander/agent mode of section 4: eleven agent branches
+judged and merged, nine rounds of legs (loop190-198), every round's runner and printout under `scripts/fleet7-runs/`.
+
+| | state | flag (all opt-in; no default changed) |
+| --- | --- | --- |
+| `check_includable` in one pass | kept, unconditional: 5 ms on the fleet | -- |
+| vote road line that sums; sealed copy off the road | kept: the road 185 -> 150 ms | -- |
+| body handed to the execution layer as received | works, B -26 ms | `N42_BODY_ONCE=1` |
+| commit forkchoice off the service loop | works, D -17 ms | `N42_COMMIT_FCU_ASYNC=1` |
+| the leader's builds chained | works, E 60 -> 10 ms; needs a pool of 4 blocks | `N42_BUILD_CHAIN=1`, `F7_BENCH_POOL_SLOTS=652000` |
+| compact body (hashes; follower assembles from its queue) | B -60..80 ms; three defects open | `N42_COMPACT_BODY=1` |
+| defect 10 (stale give-back), 11 (gate without liveness, flood without a timeout), 12 (own block's parked commit) | fixed | -- |
+| harness: fee cap, `dropcache` list, warm-up leg, pool-matched comparison | fixed / adopted | -- |
+
+Window 1 on the confirmed configuration went 350k -> 426k before this plan's section 2j (loop188); since then every
+structural step has worked in its own segment and none has moved window 1 beyond 429-443k, for the reason section 2o
+gives. Open on the compact body: the fill asks a peer that holds no whole body (ask the proposer, or serve from the
+imported block); the assembly is 112-116 ms on the fleet against 22 idle; the leader's loop spends 70-110 ms between a
+commit and the next preamble once B is short (suspected: serving fills and bodies on the loop). Open elsewhere: pool 5
+blocks stalls at a handover; 2 x "no QMDB tree for parent" a leg under the chain.
+
+**Next: four nodes.** Seven nodes at 16 cores each leave ~11 cores for a block at today's rate and ~5 at 1M. Four nodes
+at 28 cores each (quorum 3 of 4) change the budget, not the code: the same binaries, a four-validator genesis, the
+launch arguments in one env file as `fleet7-env.sh` has them. What to read first there: loop198's per-thread table
+at 16 cores against the same table at 28, then the dissection -- the segments that were slices of one budget should
+separate again.
+
 ## 3. What not to do
 
 - Do not judge a cycle-shortening change at a pacing above the natural cycle; do not judge any change without R1.

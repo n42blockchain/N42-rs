@@ -245,9 +245,38 @@ fn direct_to_queue() -> bool {
     *DIRECT.get_or_init(|| std::env::var("N42_TX_INGEST_DIRECT").is_ok())
 }
 
+/// What the gate sees at one instant: whether it is open, the depth it
+/// measured and the limit that depth was tested against. The two numbers are
+/// only for the warning below -- a gate that is shut for good has to be able
+/// to say what it is shut on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GateView {
+    open: bool,
+    depth: u64,
+    limit: u64,
+}
+
 /// Whether the gate lets a frame through: the queue's depth (the pool's
 /// pending without a queue) against the high-water mark, plus one block's
 /// allowance for each block the chain is ahead of the pool.
+fn gate_view<P: TransactionPool + 'static>(
+    pool: &P,
+    head: &std::sync::Arc<AtomicU64>,
+    gate: usize,
+    allowance: u64,
+) -> GateView
+where
+    P::Transaction: 'static,
+{
+    let lag = head
+        .load(Ordering::Relaxed)
+        .saturating_sub(pool.block_info().last_seen_block_number)
+        .min(4);
+    let depth = u64::try_from(queue_depth(pool)).unwrap_or(u64::MAX);
+    let limit = gate as u64 + lag * allowance;
+    GateView { open: depth < limit, depth, limit }
+}
+
 fn gate_open<P: TransactionPool + 'static>(
     pool: &P,
     head: &std::sync::Arc<AtomicU64>,
@@ -257,11 +286,7 @@ fn gate_open<P: TransactionPool + 'static>(
 where
     P::Transaction: 'static,
 {
-    let lag = head
-        .load(Ordering::Relaxed)
-        .saturating_sub(pool.block_info().last_seen_block_number)
-        .min(4);
-    u64::try_from(queue_depth(pool)).unwrap_or(u64::MAX) < gate as u64 + lag * allowance
+    gate_view(pool, head, gate, allowance).open
 }
 
 /// The node's gate: connections held at the high-water mark wait here, and
@@ -273,6 +298,170 @@ struct Gate {
 }
 
 static GATE: Gate = Gate { open: tokio::sync::Notify::const_new(), waiting: AtomicU64::new(0) };
+
+/// How long a frame may sit at the gate before one WARN names the counters.
+///
+/// A healthy leg's worst frame waits ~200 ms here (loop190Y1a read
+/// `gate_us_per_frame` between 583 and 192,683 us). Two seconds is an order
+/// of magnitude past that and never fires on a chain that is moving.
+const GATE_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long a frame may sit at the gate before it is let through anyway:
+/// `N42_TX_INGEST_GATE_MAX_WAIT_MS`, 15 seconds by default, 0 to wait for
+/// ever (the behaviour before this).
+///
+/// The gate is backpressure, not a rule: waiting is how a generator is told
+/// to slow down, and nothing about correctness depends on it. But the only
+/// thing that reopens it is a canonical block pruning this node's queue, so
+/// a node that stops following the chain holds its gate shut for good -- and
+/// because every flood worker sends each frame to all seven nodes and reads
+/// all seven answers, one such node stops the whole generator. The chain then
+/// runs its queues dry and builds empty blocks, which prune nothing, so the
+/// gate can never reopen: a closed loop. That is leg loop190Y1a
+/// (2026-09-21), where node5's execution layer stopped at block 382 with
+/// `queued=411428` against a gate of 407,500, all 64 flood workers blocked,
+/// and the fleet produced 48 empty blocks to the end of the round.
+///
+/// Letting a stuck frame through costs the memory of one frame per connection
+/// per deadline -- at 500 transactions a frame and 64 connections, ~32,000
+/// transactions every 15 seconds on the node that is stuck, which is a
+/// trickle and not a flood. Blocking for ever costs the round and hides the
+/// node that failed.
+fn gate_max_wait() -> Option<std::time::Duration> {
+    static MAX: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        let ms = std::env::var("N42_TX_INGEST_GATE_MAX_WAIT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(15_000);
+        (ms > 0).then(|| std::time::Duration::from_millis(ms))
+    })
+}
+
+/// How a frame's wait at the gate ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GateExit {
+    /// The gate opened; the wait.
+    Open(std::time::Duration),
+    /// The deadline passed with the gate still shut; the wait.
+    Forced(std::time::Duration),
+}
+
+/// Frames let through a shut gate by [`gate_max_wait`], since the process
+/// started. Non-zero at the end of a round means a node stopped draining its
+/// queue and the round is not comparable.
+static GATE_FORCED: AtomicU64 = AtomicU64::new(0);
+
+/// Milliseconds since the process's first gate wait, for the warning's rate
+/// limit: 64 connections reach the same deadline in the same millisecond and
+/// only one of them needs to say so.
+fn gate_clock_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+/// Whether this caller may log a gate warning now; at most one per second
+/// node-wide.
+fn gate_warn_allowed() -> bool {
+    static NEXT_MS: AtomicU64 = AtomicU64::new(0);
+    let now = gate_clock_ms();
+    let next = NEXT_MS.load(Ordering::Acquire);
+    now >= next
+        && NEXT_MS.compare_exchange(next, now + 1_000, Ordering::AcqRel, Ordering::Acquire).is_ok()
+}
+
+/// Holds a frame until `view` says the gate is open, or until `max_wait`
+/// has passed with it still shut.
+///
+/// Taking the gate's reading as a closure keeps the waiting testable without
+/// a pool: the stall this guards against is a reading that never changes.
+///
+/// Every sleep is capped by whatever deadline comes next (the warning, then
+/// the maximum wait), so the wait ends on time even if the watcher's
+/// notification never arrives -- which is the other way this could hang, and
+/// one a test cannot see.
+async fn wait_at_gate(
+    view: impl Fn() -> GateView,
+    max_wait: Option<std::time::Duration>,
+) -> GateExit {
+    // The runtime's clock, not the system's: it is the one the sleeps below
+    // are measured against, so the deadline and the sleeps cannot disagree --
+    // and a test can drive both by pausing it.
+    let started = tokio::time::Instant::now();
+    let mut warned = false;
+    loop {
+        // Registered before the reading is taken: a waiter that checks first
+        // and registers after can miss the notification that answers it.
+        let notified = GATE.open.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let seen = view();
+        if seen.open {
+            return GateExit::Open(started.elapsed());
+        }
+        let waited = started.elapsed();
+        if !warned && waited >= GATE_WARN_AFTER {
+            // Set whether or not the line is emitted: it is what takes the
+            // warning off the sleep cap below, and a waiter that keeps the
+            // deadline after the rate limit swallowed its line would spin on
+            // a cap of zero.
+            warned = true;
+            if gate_warn_allowed() {
+                warn!(
+                    target: "n42.tx_ingest",
+                    waited_ms = waited.as_millis() as u64,
+                    depth = seen.depth,
+                    limit = seen.limit,
+                    waiting = GATE.waiting.load(Ordering::Relaxed),
+                    "a frame has been held at the ingest gate; only a canonical block pruning this node's queue reopens it"
+                );
+            }
+        }
+        if let Some(max) = max_wait
+            && waited >= max
+        {
+            let forced = GATE_FORCED.fetch_add(1, Ordering::Relaxed) + 1;
+            if gate_warn_allowed() {
+                warn!(
+                    target: "n42.tx_ingest",
+                    waited_ms = waited.as_millis() as u64,
+                    depth = seen.depth,
+                    limit = seen.limit,
+                    forced,
+                    "the ingest gate did not reopen within its maximum wait; letting the frame through so the generator is not blocked for ever"
+                );
+            }
+            return GateExit::Forced(waited);
+        }
+        GATE.waiting.fetch_add(1, Ordering::Relaxed);
+        match gate_sleep_cap(waited, warned, max_wait) {
+            Some(cap) => {
+                // A lapsed timeout is the deadline, not an error: the loop
+                // re-reads the gate and decides.
+                let _ = tokio::time::timeout(cap, notified).await;
+            }
+            None => notified.await,
+        }
+        GATE.waiting.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// How long this waiter may sleep before it must look again: the time left
+/// to the next deadline, or `None` when there is none and the watcher's
+/// notification is the only thing to wait for.
+fn gate_sleep_cap(
+    waited: std::time::Duration,
+    warned: bool,
+    max_wait: Option<std::time::Duration>,
+) -> Option<std::time::Duration> {
+    let to_warn = (!warned).then(|| GATE_WARN_AFTER.saturating_sub(waited));
+    let to_max = max_wait.map(|max| max.saturating_sub(waited));
+    match (to_warn, to_max) {
+        (Some(warn), Some(max)) => Some(warn.min(max)),
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
+    }
+}
 
 /// Polls the gate every `GATE_POLL` while anyone is waiting on it, and wakes
 /// every waiter when it is open; idles at a slower rate otherwise.
@@ -385,6 +574,10 @@ fn spawn_stats_reporter() {
                     spawn_us_per_frame = spawn_us,
                     altsig_txs = STATS.altsig_txs.load(Ordering::Relaxed),
                     altsig_batches = STATS.altsig_batches.load(Ordering::Relaxed),
+                    // Non-zero means the gate stopped reopening and frames
+                    // were let through on the deadline; the round is not
+                    // comparable and a node has stopped draining its queue.
+                    gate_forced = GATE_FORCED.load(Ordering::Relaxed),
                     "ingest"
                 );
             }
@@ -558,19 +751,14 @@ where
         // when a backlog has formed, which is when the followers' import was
         // seen to double (80% of a follower's samples on the runtime's threads
         // in one kernel address). One watcher polls; the waiters sleep.
+        // The wait has a deadline: see [`gate_max_wait`]. Nothing here
+        // reopens the gate by itself, so a node that has stopped taking
+        // blocks would otherwise hold every connection for the rest of the
+        // round.
         let frame_read = std::time::Instant::now();
-        loop {
-            let notified = GATE.open.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if gate_open(&pool, &head, gate, allowance) {
-                break;
-            }
-            GATE.waiting.fetch_add(1, Ordering::Relaxed);
-            notified.await;
-            GATE.waiting.fetch_sub(1, Ordering::Relaxed);
-        }
-        STATS.gate_ns.fetch_add(frame_read.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let (GateExit::Open(at_gate) | GateExit::Forced(at_gate)) =
+            wait_at_gate(|| gate_view(&pool, &head, gate, allowance), gate_max_wait()).await;
+        STATS.gate_ns.fetch_add(at_gate.as_nanos() as u64, Ordering::Relaxed);
         if asynchronous {
             let offered = u32::try_from(raws.len()).unwrap_or(u32::MAX);
             let pending = u32::try_from(queue_depth(&pool)).unwrap_or(u32::MAX);
@@ -871,4 +1059,113 @@ where
         }
     }
     recovered
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// A gate reading a test drives: `depth` against a fixed limit, exactly
+    /// the shape [`gate_view`] returns from the queue.
+    fn view_of(depth: Arc<AtomicUsize>, limit: u64) -> impl Fn() -> GateView {
+        move || {
+            let depth = depth.load(Ordering::Relaxed) as u64;
+            GateView { open: depth < limit, depth, limit }
+        }
+    }
+
+    /// loop190Y1a: node5's execution layer stopped at block 382 with
+    /// `queued=411428` against a gate of 407,500, so nothing pruned its
+    /// queue again and the depth never fell. The chain's other nodes then
+    /// ran dry and built empty blocks, which prune nothing -- so no reading
+    /// this gate ever takes can differ from the last one. Without a deadline
+    /// the frame waits for the rest of the round, and with it every flood
+    /// worker, which reads all seven nodes' answers to every frame.
+    #[tokio::test(start_paused = true)]
+    async fn a_gate_that_never_reopens_holds_a_frame_for_ever() {
+        let depth = Arc::new(AtomicUsize::new(411_428));
+        let held = tokio::time::timeout(
+            Duration::from_secs(600),
+            wait_at_gate(view_of(depth, 407_500), None),
+        )
+        .await;
+        assert!(held.is_err(), "the frame was let through, but nothing had reopened the gate");
+    }
+
+    /// The same stall with the deadline: the frame goes through, so the
+    /// generator keeps running and the node that stopped is named in a WARN
+    /// instead of silently taking the round with it.
+    #[tokio::test(start_paused = true)]
+    async fn a_gate_that_never_reopens_lets_a_frame_through_on_the_deadline() {
+        let forced_before = GATE_FORCED.load(Ordering::Relaxed);
+        let depth = Arc::new(AtomicUsize::new(411_428));
+        let max = Duration::from_secs(15);
+        match wait_at_gate(view_of(depth, 407_500), Some(max)).await {
+            GateExit::Forced(waited) => assert!(waited >= max, "{waited:?} is short of {max:?}"),
+            GateExit::Open(waited) => {
+                panic!("the gate was shut the whole time, yet it opened after {waited:?}")
+            }
+        }
+        assert!(
+            GATE_FORCED.load(Ordering::Relaxed) > forced_before,
+            "the forced frame was not counted for the round's stats line"
+        );
+    }
+
+    /// The healthy path is unchanged: an open gate holds nothing.
+    #[tokio::test(start_paused = true)]
+    async fn an_open_gate_does_not_hold_a_frame() {
+        let depth = Arc::new(AtomicUsize::new(10));
+        let exit = wait_at_gate(view_of(depth, 407_500), Some(Duration::from_secs(15))).await;
+        assert!(
+            matches!(exit, GateExit::Open(waited) if waited < Duration::from_millis(1)),
+            "{exit:?}"
+        );
+    }
+
+    /// A gate the chain does reopen is waited on and then passed: the
+    /// deadline must not turn ordinary backpressure into a forced admission.
+    #[tokio::test(start_paused = true)]
+    async fn a_gate_the_chain_reopens_is_passed_not_forced() {
+        let depth = Arc::new(AtomicUsize::new(411_428));
+        let draining = Arc::clone(&depth);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            draining.store(248_428, Ordering::Relaxed);
+            GATE.open.notify_waiters();
+        });
+        match wait_at_gate(view_of(depth, 407_500), Some(Duration::from_secs(15))).await {
+            GateExit::Open(waited) => assert!(waited >= Duration::from_millis(400), "{waited:?}"),
+            GateExit::Forced(waited) => {
+                panic!("a gate that reopened after 400 ms was forced at {waited:?}")
+            }
+        }
+    }
+
+    /// The deadline does not depend on the watcher's notification: every
+    /// sleep is capped by whichever deadline comes next, so a waiter whose
+    /// wake-up is lost still reaches the warning and the maximum wait.
+    #[test]
+    fn a_sleep_is_capped_by_the_next_deadline() {
+        let max = Some(Duration::from_secs(15));
+        assert_eq!(gate_sleep_cap(Duration::ZERO, false, max), Some(GATE_WARN_AFTER));
+        assert_eq!(
+            gate_sleep_cap(Duration::from_secs(3), true, max),
+            Some(Duration::from_secs(12)),
+            "past the warning, what is left of the maximum wait is the cap"
+        );
+        assert_eq!(
+            gate_sleep_cap(Duration::from_secs(30), true, max),
+            Some(Duration::ZERO),
+            "past the deadline a waiter must not sleep at all"
+        );
+        assert_eq!(
+            gate_sleep_cap(Duration::from_secs(30), true, None),
+            None,
+            "with no deadline there is nothing to wake for but the watcher"
+        );
+    }
 }

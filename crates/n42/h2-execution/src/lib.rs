@@ -21,7 +21,10 @@ pub mod execution_path;
 pub mod mock;
 pub mod raw_engine;
 
-pub use driver::{body_once, BodyDecoder, DriverAction, ExecutionDriver, ImportReport, ImportVerdict};
+pub use driver::{
+    body_once, commit_fcu_async, BodyDecoder, CommitReport, DriverAction, ExecutionDriver,
+    ImportReport, ImportVerdict,
+};
 pub use el::{ChainBlock, BuiltBlock, ElError, ExecutionLayer, ForeignBody, ResolveKind};
 pub use execution_path::{ExecutionPath, ExecutionScheduling, ExecutionWorkload};
 pub use mock::{ElCall, MockBehaviour, MockExecutionLayer};

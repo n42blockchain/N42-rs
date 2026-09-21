@@ -106,6 +106,90 @@ impl Drop for ReportGuard {
 /// sender recovery and an executed state held at once.
 const DEFERRED_IN_FLIGHT: usize = 2;
 
+/// A commit whose forkchoice has not been sent yet
+/// (`N42_COMMIT_FCU_ASYNC=1`). One forkchoice is in flight at a time and
+/// this is what goes next, so the engine never sees two commits out of
+/// order.
+#[derive(Debug)]
+struct PendingCommit {
+    block_hash: B256,
+    /// Where this block sits in the order the driver heard commits (see
+    /// [`ExecutionDriver::commit_order_of`]). The slot keeps the highest,
+    /// because a commit for a lower order is a commit for an ancestor.
+    order: u64,
+    /// When the commit was heard, for the `queued_ms` of the measurement
+    /// line.
+    heard_at: std::time::Instant,
+    /// Commits folded into this one, oldest first. Each has a lower commit
+    /// order than `block_hash` and is therefore an ancestor of it: HotStuff-2
+    /// commits a chain, one block per decided view, so the block committed at
+    /// an earlier view is an ancestor of the one committed later. A forkchoice
+    /// to a descendant makes its ancestors canonical and finalised too, so
+    /// these need no forkchoice of their own -- only their bookkeeping, which
+    /// [`ExecutionDriver::finish_commit`] does when the answer arrives.
+    skipped: Vec<B256>,
+}
+
+/// What a commit forkchoice sent from a task reports back to the loop,
+/// through the channel [`ExecutionDriver::take_commit_reports`] hands out.
+///
+/// The loop feeds it to [`ExecutionDriver::finish_commit`], which applies
+/// every state effect the awaited `commit` applied when it returned.
+#[derive(Debug)]
+pub struct CommitReport {
+    block_hash: B256,
+    /// The commit order this forkchoice was sent under (see
+    /// [`ExecutionDriver::commit_order_of`]).
+    order: u64,
+    skipped: Vec<B256>,
+    /// Whether this commit ran before the block's import landed, for the log
+    /// line the awaited path writes.
+    ahead_of_import: bool,
+    answer: Result<alloy_rpc_types_engine::ForkchoiceUpdated, ElError>,
+    /// Heard to sent.
+    queued: std::time::Duration,
+    /// Sent to answered.
+    in_flight: std::time::Duration,
+}
+
+/// Reports a commit forkchoice whose task ended without an answer (a panic,
+/// a dropped runtime), so the one-in-flight slot is never held for good.
+struct CommitGuard {
+    report: Option<tokio::sync::mpsc::UnboundedSender<CommitReport>>,
+    block_hash: B256,
+    order: u64,
+    skipped: Vec<B256>,
+    ahead_of_import: bool,
+    queued: std::time::Duration,
+    started: std::time::Instant,
+}
+
+impl CommitGuard {
+    fn answer(mut self, answer: Result<alloy_rpc_types_engine::ForkchoiceUpdated, ElError>) {
+        self.send(answer);
+    }
+
+    fn send(&mut self, answer: Result<alloy_rpc_types_engine::ForkchoiceUpdated, ElError>) {
+        if let Some(report) = self.report.take() {
+            let _ = report.send(CommitReport {
+                block_hash: self.block_hash,
+                order: self.order,
+                skipped: std::mem::take(&mut self.skipped),
+                ahead_of_import: self.ahead_of_import,
+                answer,
+                queued: self.queued,
+                in_flight: self.started.elapsed(),
+            });
+        }
+    }
+}
+
+impl Drop for CommitGuard {
+    fn drop(&mut self) {
+        self.send(Err(ElError::new("the commit forkchoice ended without an answer")));
+    }
+}
+
 #[derive(Debug)]
 pub enum DriverAction {
     /// Feed this back into [`n42_h2_consensus::ConsensusEngine::process_event`].
@@ -381,6 +465,38 @@ pub struct ExecutionDriver<E> {
     max_cached_payloads: usize,
     /// Insertion order, for evicting the oldest cached payload.
     payload_order: Vec<B256>,
+    /// `N42_COMMIT_FCU_ASYNC`: send the commit's forkchoice from a task and
+    /// apply its outcome when the report arrives, instead of awaiting it
+    /// inside the consensus loop. Measured (loop189 X0a) as 37 ms of the
+    /// 51 ms between the next view opening and the leader's proposal
+    /// preamble -- time in which the loop processes no proposal, no vote and
+    /// no body. Off, every commit takes the awaited path byte for byte.
+    commit_async: bool,
+    /// The commit whose forkchoice is on the wire, if any. One at a time, so
+    /// the engine never sees two out of order.
+    commit_in_flight: Option<B256>,
+    /// The commit that goes next (see [`PendingCommit`]).
+    commit_pending: Option<PendingCommit>,
+    /// The order the driver first heard each block's commit in, so a commit
+    /// re-asked for an ancestor (the pending-commit replay after an import
+    /// lands) is never sent after a descendant's.
+    commit_orders: HashMap<B256, u64>,
+    /// Insertion order of `commit_orders`, for bounding it.
+    commit_order_seen: std::collections::VecDeque<B256>,
+    /// The next commit order to hand out.
+    commit_seq: u64,
+    /// The highest commit order whose forkchoice the engine has taken. A
+    /// commit re-asked for a block at or below it is a commit for a block
+    /// already canonical, and sending it would move the engine's head
+    /// backwards.
+    commit_landed: u64,
+    /// Commit forkchoices answered so far, for rate-limiting the
+    /// measurement line to every sixteenth.
+    commits_answered: u64,
+    /// Where a spawned commit forkchoice reports.
+    commit_reports: tokio::sync::mpsc::UnboundedSender<CommitReport>,
+    /// The receiving end, until the loop takes it.
+    commit_reports_rx: Option<tokio::sync::mpsc::UnboundedReceiver<CommitReport>>,
 }
 
 /// `N42_BODY_ONCE`, read once: opt-in, and read on the validator's side,
@@ -389,6 +505,15 @@ pub struct ExecutionDriver<E> {
 pub fn body_once() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("N42_BODY_ONCE").is_ok_and(|v| v == "1"))
+}
+
+/// `N42_COMMIT_FCU_ASYNC`, read once: opt-in, and only the *default* for a
+/// driver -- [`ExecutionDriver::set_commit_fcu_async`] is what a test uses,
+/// so the two paths are exercised without the process environment deciding
+/// for them.
+pub fn commit_fcu_async() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_COMMIT_FCU_ASYNC").is_ok_and(|v| v == "1"))
 }
 
 /// Releases a deferred block's vote: the execution layer said the header
@@ -436,6 +561,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
     pub fn new(el: E, genesis: B256) -> Self {
         let (own_imports_tx, own_imports_rx) = tokio::sync::mpsc::unbounded_channel();
         let (foreign_tx, foreign_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (commit_tx, commit_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             el: std::sync::Arc::new(el),
             normalizer: None,
@@ -459,6 +585,16 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             commits_ahead: std::collections::HashSet::new(),
             max_cached_payloads: Self::DEFAULT_MAX_CACHED_PAYLOADS,
             payload_order: Vec::new(),
+            commit_async: commit_fcu_async(),
+            commit_in_flight: None,
+            commit_pending: None,
+            commit_orders: HashMap::new(),
+            commit_order_seen: std::collections::VecDeque::new(),
+            commit_seq: 0,
+            commit_landed: 0,
+            commits_answered: 0,
+            commit_reports: commit_tx,
+            commit_reports_rx: Some(commit_rx),
         }
     }
 
@@ -996,6 +1132,25 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         self.foreign_imports_rx.take()
     }
 
+    /// The channel a spawned commit forkchoice reports on, once. A loop that
+    /// does not take it must leave [`Self::set_commit_fcu_async`] off, or the
+    /// commits' outcomes are never applied.
+    pub fn take_commit_reports(&mut self) -> Option<tokio::sync::mpsc::UnboundedReceiver<CommitReport>> {
+        self.commit_reports_rx.take()
+    }
+
+    /// Runs the commit's forkchoice on a task instead of awaiting it (see the
+    /// `commit_async` field). The default is [`commit_fcu_async`]; this is how
+    /// a test picks the path without the process environment.
+    pub fn set_commit_fcu_async(&mut self, on: bool) {
+        self.commit_async = on;
+    }
+
+    /// Whether a commit forkchoice is on the wire or waiting to go.
+    pub fn is_committing(&self) -> bool {
+        self.commit_in_flight.is_some() || self.commit_pending.is_some()
+    }
+
     /// **Bench only**: run follower imports on a task (see the field).
     pub fn set_spawn_imports(&mut self, on: bool) {
         self.spawn_imports = on;
@@ -1422,6 +1577,14 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             // to this forkchoice, it runs again when the import lands.
             self.remember_commit_ahead(block_hash);
         }
+        if self.commit_async {
+            // Off the loop from here: the forkchoice goes on a task and its
+            // outcome is applied in `finish_commit`. Everything above happens
+            // at send time either way, because none of it depends on the
+            // answer.
+            self.queue_commit(block_hash, Vec::new());
+            return DriverAction::Ignored;
+        }
         let state = ForkchoiceState {
             head_block_hash: block_hash,
             safe_block_hash: block_hash,
@@ -1433,28 +1596,177 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             .el
             .fork_choice_updated_for(ExecutionPath::LIVE_SEQUENTIAL, state)
             .await;
-        // A commit's forkchoice that is slow or not Valid is what leaves an
-        // imported block short of canonical, and the next block's direct
-        // import then waits out its parent (loop158 W: no forkchoice for block
-        // 188 reached the engine for 6.5 s). Said when it happens.
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-        let valid = matches!(&answer, Ok(updated) if matches!(updated.payload_status.status, PayloadStatusEnum::Valid));
-        if elapsed_ms >= 500 || !valid {
-            let outcome = match &answer {
-                Ok(updated) => format!("{:?}", updated.payload_status.status),
-                Err(error) => format!("error: {error}"),
-            };
-            info!(target: "n42.h2.el", block = ?block_hash, elapsed_ms, ahead_of_import = ahead, %outcome, "commit forkchoice");
+        say_slow_commit(block_hash, started.elapsed(), ahead, &answer);
+        self.apply_commit(block_hash, Vec::new(), answer)
+            .into_iter()
+            .next()
+            .unwrap_or(DriverAction::Ignored)
+    }
+
+    /// The commit order of `block_hash`: the position, in the order this
+    /// driver first heard commits, that decides which of two commits waiting
+    /// to be sent is the descendant. Stable per block, so the replay of a
+    /// commit whose block was still importing keeps the order it was heard
+    /// in rather than jumping ahead of a later one.
+    fn commit_order_of(&mut self, block_hash: B256) -> u64 {
+        if let Some(order) = self.commit_orders.get(&block_hash) {
+            return *order;
         }
-        match answer
-        {
+        self.commit_seq = self.commit_seq.saturating_add(1);
+        let order = self.commit_seq;
+        self.commit_orders.insert(block_hash, order);
+        self.commit_order_seen.push_back(block_hash);
+        while self.commit_order_seen.len() > 256 {
+            if let Some(oldest) = self.commit_order_seen.pop_front() {
+                self.commit_orders.remove(&oldest);
+            }
+        }
+        order
+    }
+
+    /// Puts a commit in the pending slot and sends it if nothing is in
+    /// flight. `skipped` are commits already folded into this one.
+    ///
+    /// Only one commit is ever pending: the one with the highest commit
+    /// order, which is the descendant of every other (see
+    /// [`PendingCommit::skipped`]). The rest are folded into it, so their
+    /// bookkeeping still runs -- and so no forkchoice is ever sent to a block
+    /// a later commit has already moved past, which reth reads as a reorg.
+    fn queue_commit(&mut self, block_hash: B256, skipped: Vec<B256>) {
+        let order = self.commit_order_of(block_hash);
+        if order <= self.commit_landed && self.commit_pending.is_none() {
+            // A commit re-asked for a block a later commit has already made
+            // canonical: the pending-commit or commit-ahead replay, running
+            // after the descendant's forkchoice landed. That forkchoice
+            // finalised this block with it, and sending one to an ancestor
+            // now would move the engine's head backwards -- which reth
+            // unwinds as a reorg (the same hazard `prepare_build_on` guards
+            // against for builds).
+            debug!(target: "n42.h2.el", block = ?block_hash, order, landed = self.commit_landed, "a commit for a block a later one already finalised; nothing to send");
+            return;
+        }
+        let heard_at = std::time::Instant::now();
+        self.commit_pending = Some(match self.commit_pending.take() {
+            None => PendingCommit { block_hash, order, heard_at, skipped },
+            Some(mut pending) if pending.order >= order => {
+                // The pending commit is for the descendant: this one rides
+                // on its forkchoice.
+                for hash in skipped.into_iter().chain(
+                    (pending.block_hash != block_hash).then_some(block_hash),
+                ) {
+                    if !pending.skipped.contains(&hash) {
+                        pending.skipped.push(hash);
+                    }
+                }
+                pending
+            }
+            Some(pending) => {
+                let mut folded = pending.skipped;
+                folded.push(pending.block_hash);
+                for hash in skipped {
+                    if !folded.contains(&hash) {
+                        folded.push(hash);
+                    }
+                }
+                PendingCommit { block_hash, order, heard_at, skipped: folded }
+            }
+        });
+        self.send_next_commit();
+    }
+
+    /// Sends the pending commit's forkchoice from a task, unless one is
+    /// already in flight -- in which case its report sends this one.
+    fn send_next_commit(&mut self) {
+        if self.commit_in_flight.is_some() {
+            return;
+        }
+        let Some(pending) = self.commit_pending.take() else {
+            return;
+        };
+        self.commit_in_flight = Some(pending.block_hash);
+        let block_hash = pending.block_hash;
+        let state = ForkchoiceState {
+            head_block_hash: block_hash,
+            safe_block_hash: block_hash,
+            finalized_block_hash: block_hash,
+        };
+        let el = std::sync::Arc::clone(&self.el);
+        let guard = CommitGuard {
+            report: Some(self.commit_reports.clone()),
+            block_hash,
+            order: pending.order,
+            skipped: pending.skipped,
+            ahead_of_import: self.commits_ahead.contains(&block_hash),
+            queued: pending.heard_at.elapsed(),
+            started: std::time::Instant::now(),
+        };
+        tokio::spawn(async move {
+            let answer = el
+                .fork_choice_updated_for(ExecutionPath::LIVE_SEQUENTIAL, state)
+                .await;
+            guard.answer(answer);
+        });
+    }
+
+    /// A spawned commit forkchoice's report: the same state effects the
+    /// awaited path applies when it returns, plus the ancestors this one
+    /// finalised on its way.
+    pub async fn finish_commit(&mut self, report: CommitReport) -> Vec<DriverAction> {
+        let CommitReport { block_hash, order, skipped, ahead_of_import, answer, queued, in_flight } = report;
+        // Exactly one report per forkchoice sent, guard included, so this is
+        // always the one that was in flight.
+        self.commit_in_flight = None;
+        say_slow_commit(block_hash, queued + in_flight, ahead_of_import, &answer);
+        // What the forkchoice now costs, where it now lies: off the loop, so
+        // it no longer shows up as the loop's own time (loop189 X0a segment
+        // D). Every sixteenth, because a full bench leg commits thousands of
+        // blocks and one line each is not a better signal than one in
+        // sixteen.
+        self.commits_answered = self.commits_answered.wrapping_add(1);
+        if self.commits_answered.is_multiple_of(16) {
+            info!(
+                target: "n42.h2.el",
+                block = ?block_hash,
+                elapsed_ms = (queued + in_flight).as_millis() as u64,
+                in_flight_ms = in_flight.as_millis() as u64,
+                queued_ms = queued.as_millis() as u64,
+                "commit forkchoice answered"
+            );
+        }
+        let landed = matches!(&answer, Ok(updated) if !matches!(updated.payload_status.status, PayloadStatusEnum::Invalid { .. } | PayloadStatusEnum::Syncing));
+        let actions = if landed {
+            self.commit_landed = self.commit_landed.max(order);
+            self.apply_commit(block_hash, skipped, answer)
+        } else {
+            let actions = self.apply_commit(block_hash, Vec::new(), answer);
+            // The forkchoice did not land, so the ancestors it would have
+            // finalised did not either: the newest of them goes on its own,
+            // carrying the rest.
+            if let Some((newest, rest)) = skipped.split_last() {
+                self.queue_commit(*newest, rest.to_vec());
+            }
+            actions
+        };
+        self.send_next_commit();
+        actions
+    }
+
+    /// The outcome of one commit forkchoice, on either path. `skipped` are
+    /// the ancestors a Valid answer finalises along with `block_hash`.
+    fn apply_commit(
+        &mut self,
+        block_hash: B256,
+        skipped: Vec<B256>,
+        answer: Result<alloy_rpc_types_engine::ForkchoiceUpdated, ElError>,
+    ) -> Vec<DriverAction> {
+        match answer {
             Ok(updated) => match updated.payload_status.status {
                 PayloadStatusEnum::Invalid { validation_error } => {
                     // A forkchoice the engine refused is not an execution
                     // verdict on the block (`Rejected` withdraws a block's
                     // import evidence): logged, and the next commit moves on.
                     warn!(target: "n42.h2.el", block = ?block_hash, %validation_error, "forkchoice to a committed block refused");
-                    DriverAction::Ignored
+                    Vec::new()
                 }
                 PayloadStatusEnum::Syncing => {
                     // The engine does not have the block: the Decide came
@@ -1467,21 +1779,57 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                     // for the import that follows.
                     info!(target: "n42.h2.el", block = ?block_hash, "forkchoice to a committed block the engine does not have yet; the commit waits for its import");
                     self.pending_commits.insert(block_hash);
-                    DriverAction::Ignored
+                    Vec::new()
                 }
                 _ => {
+                    let mut actions = Vec::with_capacity(skipped.len() + 1);
+                    // The ancestors this forkchoice finalised on its way: no
+                    // head of their own (the descendant is the head), but the
+                    // same payload removal and the same `Finalized` the
+                    // awaited path produced for each.
+                    for ancestor in skipped {
+                        self.forget_committed(ancestor);
+                        actions.push(DriverAction::Finalized { block_hash: ancestor });
+                    }
                     self.head = block_hash;
-                    // Committed blocks never need re-execution.
-                    self.payloads.remove(&block_hash);
-                    self.bodies.remove(&block_hash);
-                    self.payload_order.retain(|h| h != &block_hash);
-                    DriverAction::Finalized { block_hash }
+                    self.forget_committed(block_hash);
+                    actions.push(DriverAction::Finalized { block_hash });
+                    actions
                 }
             },
             Err(error) => {
                 warn!(target: "n42.h2.el", block = ?block_hash, %error, "forkchoice to a committed block failed");
-                DriverAction::Ignored
+                Vec::new()
             }
         }
+    }
+
+    /// Drops what a committed block no longer needs: it will never be
+    /// re-executed.
+    fn forget_committed(&mut self, block_hash: B256) {
+        self.payloads.remove(&block_hash);
+        self.bodies.remove(&block_hash);
+        self.payload_order.retain(|h| h != &block_hash);
+    }
+}
+
+/// A commit's forkchoice that is slow or not Valid is what leaves an
+/// imported block short of canonical, and the next block's direct import then
+/// waits out its parent (loop158 W: no forkchoice for block 188 reached the
+/// engine for 6.5 s). Said when it happens, on both paths.
+fn say_slow_commit(
+    block_hash: B256,
+    elapsed: std::time::Duration,
+    ahead_of_import: bool,
+    answer: &Result<alloy_rpc_types_engine::ForkchoiceUpdated, ElError>,
+) {
+    let elapsed_ms = elapsed.as_millis() as u64;
+    let valid = matches!(answer, Ok(updated) if matches!(updated.payload_status.status, PayloadStatusEnum::Valid));
+    if elapsed_ms >= 500 || !valid {
+        let outcome = match answer {
+            Ok(updated) => format!("{:?}", updated.payload_status.status),
+            Err(error) => format!("error: {error}"),
+        };
+        info!(target: "n42.h2.el", block = ?block_hash, elapsed_ms, ahead_of_import, %outcome, "commit forkchoice");
     }
 }

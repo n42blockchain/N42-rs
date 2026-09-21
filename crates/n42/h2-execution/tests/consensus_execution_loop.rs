@@ -220,6 +220,9 @@ async fn unsupported_or_non_live_paths_fail_before_the_engine_adapter() {
 async fn commit_finalizes_head_safe_and_finalized_together() {
     let el = MockExecutionLayer::new();
     let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    // The awaited commit path is what this test is about; the process
+    // environment does not get to decide it (`N42_COMMIT_FCU_ASYNC`).
+    driver.set_commit_fcu_async(false);
     let hash = B256::repeat_byte(0x22);
     driver.cache_payload(hash, MockExecutionLayer::payload_for(hash, 1));
     driver.handle_output(&execute(hash)).await;
@@ -305,6 +308,9 @@ async fn a_commit_the_engine_does_not_have_yet_waits_for_the_import() {
         ..Default::default()
     });
     let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    // The awaited commit path is what this test is about; the process
+    // environment does not get to decide it (`N42_COMMIT_FCU_ASYNC`).
+    driver.set_commit_fcu_async(false);
     let hash = B256::repeat_byte(0x33);
 
     // The Decide first: the forkchoice is refused with SYNCING, nothing is final.
@@ -335,6 +341,9 @@ async fn a_commit_the_engine_does_not_have_yet_waits_for_the_import() {
 async fn a_commit_that_ran_before_the_import_is_repeated_when_the_import_lands() {
     let el = MockExecutionLayer::new();
     let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    // The awaited commit path is what this test is about; the process
+    // environment does not get to decide it (`N42_COMMIT_FCU_ASYNC`).
+    driver.set_commit_fcu_async(false);
     let hash = B256::repeat_byte(0x44);
     let action = driver.handle_output(&committed(hash)).await;
     assert_eq!(action.finalized_block(), Some(hash));
@@ -357,6 +366,9 @@ async fn a_commit_that_ran_before_the_import_is_repeated_when_the_import_lands()
 async fn commits_ahead_of_their_imports_are_each_repeated_when_the_import_lands() {
     let el = MockExecutionLayer::new();
     let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    // The awaited commit path is what this test is about; the process
+    // environment does not get to decide it (`N42_COMMIT_FCU_ASYNC`).
+    driver.set_commit_fcu_async(false);
     let a = B256::repeat_byte(0x55);
     let b = B256::repeat_byte(0x56);
     driver.handle_output(&committed(a)).await;
@@ -383,6 +395,9 @@ async fn commits_ahead_of_their_imports_are_each_repeated_when_the_import_lands(
 async fn a_commit_heard_before_the_import_started_runs_when_the_import_lands() {
     let el = MockExecutionLayer::new();
     let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    // The awaited commit path is what this test is about; the process
+    // environment does not get to decide it (`N42_COMMIT_FCU_ASYNC`).
+    driver.set_commit_fcu_async(false);
     let hash = B256::repeat_byte(0x57);
     let forkchoices_to = |hash: B256| {
         el.calls()
@@ -515,4 +530,223 @@ async fn an_awaited_import_decodes_a_held_body() {
     let action = driver.handle_output(&execute(hash)).await;
     assert_eq!(action.imported_block(), Some(hash));
     assert_eq!(el.calls(), vec![ElCall::NewPayload(hash)]);
+}
+
+/// Holds every commit forkchoice until the test lets it through, so what the
+/// loop does *while* one is open can be asserted on.
+fn gated_forkchoices() -> (MockExecutionLayer, std::sync::Arc<tokio::sync::Semaphore>) {
+    let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let el = MockExecutionLayer::with_behaviour(MockBehaviour {
+        forkchoice_gate: Some(std::sync::Arc::clone(&gate)),
+        ..Default::default()
+    });
+    (el, gate)
+}
+
+/// Lets the runtime run the tasks that are ready, without a clock.
+async fn settle() {
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+}
+
+fn forkchoices_to(el: &MockExecutionLayer, hash: B256) -> usize {
+    el.calls()
+        .into_iter()
+        .filter(|c| matches!(c, ElCall::ForkchoiceUpdated(state) if state.head_block_hash == hash))
+        .count()
+}
+
+fn forkchoice_order(el: &MockExecutionLayer) -> Vec<B256> {
+    el.calls()
+        .into_iter()
+        .filter_map(|call| match call {
+            ElCall::ForkchoiceUpdated(state) => Some(state.head_block_hash),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The point of the flag (loop189 X0a segment D): the commit returns to the
+/// consensus loop before its forkchoice has reached the engine, and the same
+/// state the awaited call left behind is left behind when the report lands.
+#[tokio::test]
+async fn an_async_commit_returns_before_its_forkchoice_and_finalises_on_the_report() {
+    let (el, gate) = gated_forkchoices();
+    let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    driver.set_commit_fcu_async(true);
+    let mut reports = driver.take_commit_reports().expect("the commit report channel");
+    let hash = B256::repeat_byte(0x71);
+    driver.cache_payload(hash, MockExecutionLayer::payload_for(hash, 1));
+
+    let action = driver.handle_output(&committed(hash)).await;
+    settle().await;
+    assert_eq!(action.finalized_block(), None, "the loop is not told anything yet");
+    assert_eq!(forkchoices_to(&el, hash), 0, "the forkchoice has not reached the engine");
+    assert_eq!(driver.head(), GENESIS, "the head follows the answer, not the request");
+    // Everything that does not depend on the answer happened at send time,
+    // exactly as on the awaited path.
+    assert_eq!(driver.finalized(), hash);
+    assert!(driver.is_committing());
+
+    gate.add_permits(1);
+    let report = reports.recv().await.expect("a commit report");
+    let actions = driver.finish_commit(report).await;
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].finalized_block(), Some(hash));
+    // The same driver state the awaited path leaves.
+    assert_eq!(driver.head(), hash);
+    assert_eq!(driver.finalized(), hash);
+    assert!(!driver.has_payload(&hash), "a committed block's payload is dropped");
+    assert!(!driver.is_committing());
+    assert_eq!(forkchoices_to(&el, hash), 1);
+}
+
+/// One forkchoice in flight at a time, in commit order: three commits, each
+/// answered before the next goes out.
+#[tokio::test]
+async fn async_commits_reach_the_engine_one_at_a_time_in_order() {
+    let (el, gate) = gated_forkchoices();
+    let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    driver.set_commit_fcu_async(true);
+    let mut reports = driver.take_commit_reports().expect("the commit report channel");
+    let blocks = [B256::repeat_byte(0x81), B256::repeat_byte(0x82), B256::repeat_byte(0x83)];
+
+    for hash in blocks {
+        driver.handle_output(&committed(hash)).await;
+        gate.add_permits(1);
+        let report = reports.recv().await.expect("a commit report");
+        let actions = driver.finish_commit(report).await;
+        assert_eq!(actions[0].finalized_block(), Some(hash));
+    }
+    assert_eq!(forkchoice_order(&el), blocks.to_vec(), "in commit order, none lost");
+    assert_eq!(driver.head(), blocks[2]);
+}
+
+/// Commits that pile up behind one in flight are folded into the newest,
+/// because a forkchoice to a descendant finalises its ancestors -- but their
+/// bookkeeping still happens, block by block, when the answer arrives.
+#[tokio::test]
+async fn commits_behind_one_in_flight_are_folded_into_the_newest_and_still_finalised() {
+    let (el, gate) = gated_forkchoices();
+    let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    driver.set_commit_fcu_async(true);
+    let mut reports = driver.take_commit_reports().expect("the commit report channel");
+    let [a, b, c] = [B256::repeat_byte(0x91), B256::repeat_byte(0x92), B256::repeat_byte(0x93)];
+    for (number, hash) in [a, b, c].into_iter().enumerate() {
+        driver.cache_payload(hash, MockExecutionLayer::payload_for(hash, number as u64 + 1));
+    }
+
+    // A goes out and is held; B and C queue behind it.
+    driver.handle_output(&committed(a)).await;
+    driver.handle_output(&committed(b)).await;
+    driver.handle_output(&committed(c)).await;
+    settle().await;
+    assert!(el.calls().is_empty(), "nothing reached the engine while the gate is shut");
+
+    gate.add_permits(1);
+    let report = reports.recv().await.expect("A's report");
+    let actions = driver.finish_commit(report).await;
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].finalized_block(), Some(a));
+
+    // C, not B: B is A's descendant and C's ancestor, and C's forkchoice
+    // finalises it.
+    gate.add_permits(1);
+    let report = reports.recv().await.expect("C's report");
+    let actions = driver.finish_commit(report).await;
+    let finalised: Vec<B256> = actions.iter().filter_map(|action| action.finalized_block()).collect();
+    assert_eq!(finalised, vec![b, c], "the skipped ancestor is finalised too, before its descendant");
+    assert_eq!(driver.head(), c);
+    assert!(!driver.has_payload(&b), "the skipped ancestor's payload is dropped too");
+    assert!(!driver.has_payload(&c));
+    assert_eq!(
+        forkchoice_order(&el),
+        vec![a, c],
+        "two forkchoices, in order, never one to a block already passed"
+    );
+}
+
+/// SYNCING on the async path is what it is on the awaited one: not done. The
+/// commit waits for the block's import and runs again when it lands.
+#[tokio::test]
+async fn an_async_commit_the_engine_does_not_have_waits_for_the_import() {
+    let el = MockExecutionLayer::with_behaviour(MockBehaviour {
+        forkchoice_status: PayloadStatusEnum::Syncing,
+        ..Default::default()
+    });
+    let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    driver.set_commit_fcu_async(true);
+    let mut reports = driver.take_commit_reports().expect("the commit report channel");
+    let hash = B256::repeat_byte(0xa1);
+
+    driver.handle_output(&committed(hash)).await;
+    let report = reports.recv().await.expect("the refused commit's report");
+    let actions = driver.finish_commit(report).await;
+    assert!(actions.is_empty(), "nothing is final");
+    assert_eq!(driver.head(), GENESIS);
+
+    // The body arrives and the block imports: the commit that waited runs.
+    el.set_behaviour(MockBehaviour::default());
+    driver.cache_payload(hash, MockExecutionLayer::payload_for(hash, 1));
+    assert_eq!(driver.handle_output(&execute(hash)).await.imported_block(), Some(hash));
+    let report = reports.recv().await.expect("the repeated commit's report");
+    let actions = driver.finish_commit(report).await;
+    assert_eq!(actions[0].finalized_block(), Some(hash));
+    assert_eq!(driver.head(), hash);
+    assert_eq!(forkchoices_to(&el, hash), 2, "the refused forkchoice and the one after the import");
+}
+
+/// A commit re-asked for a block a later commit has already made canonical
+/// (the commit-ahead replay when the block's import finally lands) sends no
+/// forkchoice: it would move the engine's head back to an ancestor, which
+/// reth unwinds as a reorg.
+#[tokio::test]
+async fn a_commit_replayed_after_a_later_one_landed_sends_no_forkchoice() {
+    let el = MockExecutionLayer::new();
+    let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    driver.set_commit_fcu_async(true);
+    let mut reports = driver.take_commit_reports().expect("the commit report channel");
+    let a = B256::repeat_byte(0xc1);
+    let b = B256::repeat_byte(0xc2);
+
+    // A is committed before this node has it, then B on top of it.
+    for hash in [a, b] {
+        driver.handle_output(&committed(hash)).await;
+        let report = reports.recv().await.expect("a commit report");
+        driver.finish_commit(report).await;
+    }
+    assert_eq!(driver.head(), b);
+
+    // A's body finally arrives: the import lands and replays A's commit.
+    driver.cache_payload(a, MockExecutionLayer::payload_for(a, 1));
+    assert_eq!(driver.handle_output(&execute(a)).await.imported_block(), Some(a));
+    settle().await;
+    assert_eq!(forkchoices_to(&el, a), 1, "only the first one; B's forkchoice finalised A too");
+    assert_eq!(forkchoice_order(&el).last().copied(), Some(b), "the engine's head was never moved back");
+    assert!(!driver.is_committing());
+}
+
+/// The flag off is the default, and the default is the awaited path: the
+/// commit's forkchoice has reached the engine before `handle_output` returns,
+/// and nothing is ever written to the report channel.
+#[tokio::test]
+async fn the_default_keeps_the_commit_on_the_loop() {
+    if n42_h2_execution::commit_fcu_async() {
+        // The process asked for the other path; that one has its own tests.
+        return;
+    }
+    let el = MockExecutionLayer::new();
+    let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    let mut reports = driver.take_commit_reports().expect("the commit report channel");
+    let hash = B256::repeat_byte(0xb1);
+    driver.cache_payload(hash, MockExecutionLayer::payload_for(hash, 1));
+    driver.handle_output(&execute(hash)).await;
+
+    let action = driver.handle_output(&committed(hash)).await;
+    assert_eq!(action.finalized_block(), Some(hash));
+    assert_eq!(driver.head(), hash);
+    assert_eq!(forkchoices_to(&el, hash), 1);
+    assert!(!driver.is_committing());
+    assert!(reports.try_recv().is_err(), "the awaited path reports nothing");
 }

@@ -50,6 +50,7 @@
 //! looks connected into one that silently stops voting.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use alloy_consensus::Header;
@@ -200,7 +201,21 @@ pub struct H2Service<E> {
     outbox: Vec<n42_h2_primitives::consensus::ConsensusMessage>,
     /// Builds the payload attributes for a block this node proposes. `None`
     /// means this node never proposes — see the module docs.
-    payload_attributes: Option<Box<PayloadAttributesBuilder>>,
+    ///
+    /// Shared rather than owned because the build chain calls the very same
+    /// closure from the execution layer's client, off this loop: a chained
+    /// build that used any other rule for the attributes would be a block
+    /// the proposal could not use.
+    payload_attributes: Option<Arc<PayloadAttributesBuilder>>,
+    /// The key this node seals its headers with, when it runs gov5's header
+    /// profile. Kept so the build chain can produce the header this node will
+    /// propose -- the chained block's parent hash -- before the proposal
+    /// path gets there. `None` on any other profile, and then nothing chains.
+    chain_seal_key: Option<n42_h2_primitives::bls::BlsSecretKey>,
+    /// Whether the chain sealer has been handed to the execution layer. Once
+    /// per process; it captures the attributes builder and the seal key,
+    /// which are both set before the first build ahead.
+    chain_sealer_installed: bool,
     /// How long to wait before asking the builder again; see [`PROPOSE_RETRY`].
     propose_retry: Duration,
     /// How long a leader waits, after the previous view was decided, for the
@@ -567,6 +582,21 @@ type CheckpointWriter = dyn Fn(&ConsensusEngine) -> Result<(), String> + Send + 
 /// as long as it took another member to produce a block this node could see.
 /// N42-26 met the same failure from the other side and fixed it the same way
 /// (its devlog-144: a restart whose leader never resumed).
+/// `N42_BUILD_CHAIN=1`: the execution layer hands a block's header back the
+/// moment it seals it early, and the build after that block starts on it --
+/// the chain -- instead of waiting for the block to be encoded, to travel,
+/// for the proposal to go out and for the request that follows. Measured at
+/// loop190/191 as 68-84 ms of a 360 ms cycle with the builder idle, plus
+/// 33-42 ms of request overhead after it.
+///
+/// Off by default, read once: with the flag off the request carries no hint,
+/// the execution layer sends no header, and every byte on the channel is what
+/// it was.
+fn build_chain() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_BUILD_CHAIN").is_ok_and(|value| value != "0"))
+}
+
 const fn head_stamp(remembered: Option<u64>, header: Option<&Header>) -> Option<u64> {
     match (remembered, header) {
         (Some(stamp), _) => Some(stamp),
@@ -622,6 +652,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             validator_count,
             outbox: Vec::new(),
             payload_attributes: None,
+            chain_seal_key: None,
+            chain_sealer_installed: false,
             propose_retry: PROPOSE_RETRY,
             straggler_grace: None,
             last_drain: (0, 0, 0, ""),
@@ -684,6 +716,10 @@ impl<E: ExecutionLayer> H2Service<E> {
     pub fn with_gov5_h2_profile(mut self, key: n42_h2_primitives::bls::BlsSecretKey) -> Self {
         self.header_profile = HeaderProfile::Gov5H2;
         self.native_wire = true;
+        // The build chain seals a header with this key before the proposal
+        // path does, and must produce the identical header; it is kept only
+        // for the profile whose sealing rule is known here.
+        self.chain_seal_key = Some(key.clone());
         self.driver.set_payload_normalizer(move |payload, header, view| {
             match header {
                 Some(header) => n42_h2_consensus::normalize_to_gov5_h2_from_header(
@@ -755,7 +791,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         mut self,
         attributes: impl Fn(ProposalContext) -> Option<PayloadAttributes> + Send + Sync + 'static,
     ) -> Self {
-        self.payload_attributes = Some(Box::new(attributes));
+        self.payload_attributes = Some(Arc::new(attributes));
         self
     }
 
@@ -1796,13 +1832,24 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// proposal built on the critical path (loop111 S2: 2-3 a window, 410-670
     /// ms each); that parent takes the forkchoice path directly.
     async fn prepare_next_build(&mut self, parent: B256, on_seal: bool) {
-        let Some(build_attributes) = self.payload_attributes.as_ref() else {
+        // Cloned, not borrowed: installing the chain sealer below needs
+        // `&mut self`, and it is one `Arc`.
+        let Some(build_attributes) = self.payload_attributes.clone() else {
             return;
         };
         let next = self.engine.current_view().saturating_add(1);
         if !self.engine.is_leader_for_view(next) {
             return;
         }
+        // The chain runs only where consensus says the height after the one
+        // being built is ours as well -- the tenure. The execution layer is
+        // never told to guess: no hint, no chain.
+        let chain = (on_seal
+            && self.build_on_seal
+            && build_chain()
+            && self.engine.is_leader_for_view(next.saturating_add(1))
+            && self.install_chain_sealer())
+        .then_some(n42_h2_execution::ChainAhead { view: next });
         let Some(header) = self.block_headers.get(&parent).cloned() else {
             info!(target: "n42.h2.node", ?parent, next, "no build ahead: the parent's header is not remembered");
             return;
@@ -1822,15 +1869,72 @@ impl<E: ExecutionLayer> H2Service<E> {
             return;
         };
         let on_seal = on_seal && self.build_on_seal;
-        info!(target: "n42.h2.node", ?parent, next, on_seal, "build ahead requested");
+        info!(target: "n42.h2.node", ?parent, next, on_seal, chain = chain.is_some(), "build ahead requested");
         let started = if on_seal {
-            self.driver.prepare_build_on_sealed(parent, header, attrs).await
+            self.driver.prepare_build_on_sealed(parent, header, attrs, chain).await
         } else {
             self.driver.prepare_build_on(parent, attrs).await
         };
         if let Err(err) = started {
             warn!(target: "n42.h2.node", %err, ?parent, "could not start a build ahead of leading");
         }
+    }
+
+    /// Hands the execution layer's client what it needs to run the build
+    /// chain: the header this node will propose for a block the builder has
+    /// just sealed, and the attributes of the block after it.
+    ///
+    /// Both halves are the very functions the proposal path uses -- gov5's
+    /// header profile with this node's seal key, and the same attributes
+    /// closure `propose_if_leader` calls -- because a chained build is only
+    /// worth anything if it is the block the request would have asked for.
+    /// The parent hash it carries is the hash of the header sealed here, so
+    /// one field out of place would be a block this node could not propose;
+    /// the request that arrives compares parent and attributes and discards
+    /// the build rather than repairing it.
+    ///
+    /// Returns whether the chain can run at all. It cannot on a profile whose
+    /// sealing rule is not known here (any custom normalizer), which is the
+    /// safe answer: no sealer, no hint, no chain.
+    fn install_chain_sealer(&mut self) -> bool {
+        if self.chain_sealer_installed {
+            return true;
+        }
+        let (Some(key), Some(attributes)) = (self.chain_seal_key.clone(), self.payload_attributes.clone())
+        else {
+            return false;
+        };
+        if self.header_profile != HeaderProfile::Gov5H2 {
+            return false;
+        }
+        let sealer: n42_h2_execution::ChainSealer = Arc::new(move |built, built_with, view| {
+            // The withdrawals are the block's rewards and live in the
+            // attributes it was built with; the header carries only their
+            // root, so they cannot be recovered from it.
+            let withdrawals = built_with.withdrawals.clone().unwrap_or_default();
+            let sealed = n42_h2_consensus::gov5_h2_header_for_view(built.clone(), &withdrawals, view, Some(&key))
+                .map_err(|err| {
+                    warn!(target: "n42.h2.node", %err, number = built.number, "the chain could not seal the built header");
+                })
+                .ok()?;
+            let head = sealed.hash_slow();
+            // `preparing` is what tells the builder to leave the pacing to
+            // the proposal, exactly as a build ahead asks for it; and with
+            // it the "when was the head seen" pacing input is unread, which
+            // is why the chain does not have to invent one.
+            let next = attributes(ProposalContext {
+                view: view.saturating_add(1),
+                preparing: true,
+                head,
+                head_timestamp: Some(sealed.timestamp),
+                head_header: Some(sealed.clone()),
+                head_seen: None,
+            })?;
+            Some((sealed, next))
+        });
+        self.driver.execution_layer().set_chain_sealer(sealer);
+        self.chain_sealer_installed = true;
+        true
     }
 
     /// Builds and announces a block when this node is the leader of a view it

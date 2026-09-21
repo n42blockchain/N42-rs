@@ -192,10 +192,10 @@ pub type PayloadNormalizer = dyn Fn(&ExecutionData, Option<&alloy_consensus::Hea
 /// Decodes a held [`ForeignBody`] into the payload the `NEW_PAYLOAD`
 /// fallback sends. The wire form belongs to the node (`n42-h2-net`), not
 /// here, so the node installs it.
+type Decode = dyn Fn(&ForeignBody) -> Result<ExecutionData, String> + Send + Sync;
+
 #[derive(Clone)]
-pub struct BodyDecoder(
-    std::sync::Arc<dyn Fn(&ForeignBody) -> Result<ExecutionData, String> + Send + Sync>,
-);
+pub struct BodyDecoder(std::sync::Arc<Decode>);
 
 impl BodyDecoder {
     /// Wraps the node's decode.
@@ -1318,10 +1318,10 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             .get(&block_hash)
             .map(|p| p.payload.timestamp())
             .or_else(|| self.bodies.get(&block_hash).map(|body| body.timestamp));
-        if let Some(timestamp) = timestamp {
-            if self.deferred_at(timestamp) {
-                return self.spawn_execute_deferred(block_hash);
-            }
+        if let Some(timestamp) = timestamp
+            && self.deferred_at(timestamp)
+        {
+            return self.spawn_execute_deferred(block_hash);
         }
         if self.spawn_imports {
             return self.spawn_execute(block_hash);

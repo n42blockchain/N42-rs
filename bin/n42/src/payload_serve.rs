@@ -1401,34 +1401,36 @@ where
             let recv = started_at.elapsed();
             let started = std::time::Instant::now();
             out.clear();
-            // The frame as shared bytes once, so the body inside it -- and
-            // every transaction inside that -- is a slice rather than a
-            // copy. The copies that matter are made deliberately, per
-            // transaction, in `convert_body_to_block`: what a slice would
-            // keep alive is the whole 25 MB body.
-            let shared = alloy_primitives::Bytes::copy_from_slice(&frame[..]);
-            let decoded = match raw_engine::decode_foreign_body(&shared)
-                .map_err(|err| format!("foreign body frame: {err}"))
-                .and_then(|(announced, profile, body)| {
-                    // Only with the direct import configured: the body path
-                    // exists to put the block straight into it, and without
-                    // it the engine's own pass would have to convert the
-                    // payload again anyway.
-                    let reuse = reuse
-                        .as_ref()
-                        .filter(|reuse| reuse.import_foreign.is_some())
-                        .ok_or_else(|| "no direct import; send the payload".to_string())?;
-                    let validator = std::sync::Arc::clone(&reuse.validator);
-                    tokio::task::block_in_place(|| {
-                        validator
-                            .convert_body_to_block(announced, profile, &body)
-                            .map_err(|err| format!("body: {err}"))
-                    })
-                }) {
+            // Only with the direct import configured: the body path exists to
+            // put the block straight into it, and without it the engine's own
+            // pass would convert a payload again anyway.
+            let validator = reuse
+                .as_ref()
+                .filter(|reuse| reuse.import_foreign.is_some())
+                .map(|reuse| std::sync::Arc::clone(&reuse.validator));
+            // Read where it landed: the frame buffer is the one this
+            // connection reuses for every block, the body is a slice of it,
+            // and every transaction is a slice of that. Nothing that leaves
+            // this block borrows it -- `convert_body_to_block` copies what it
+            // keeps -- so the buffer is reused rather than a body's worth of
+            // fresh pages being faulted in per block.
+            //
+            // `block_in_place`, not `spawn_blocking`: the conversion borrows
+            // the frame, and it is tens of milliseconds of rayon work that a
+            // runtime worker must not sit on.
+            let decoded = tokio::task::block_in_place(|| {
+                let (announced, profile, body) = raw_engine::decode_foreign_body(&frame)
+                    .map_err(|err| format!("foreign body frame: {err}"))?;
+                let validator = validator.ok_or_else(|| "no direct import; send the payload".to_string())?;
+                validator
+                    .convert_body_to_block(announced, profile, body)
+                    .map_err(|err| format!("body: {err}"))
+            });
+            let decoded = match decoded {
                 Ok(decoded) => decoded,
                 Err(message) => {
-                    // "Not this way": the validator sends the same block as
-                    // a NEW_PAYLOAD payload. A body that does not decode is
+                    // "Not this way": the validator sends the same block as a
+                    // NEW_PAYLOAD payload. A body that does not decode is
                     // refused here rather than voted on; the validator's
                     // fallback decodes it too, fails the same way, and asks
                     // its peers for the block again.
@@ -1441,9 +1443,6 @@ where
                 }
             };
             let (sealed, data) = decoded;
-            // The body's bytes are not held past the conversion: the
-            // transactions own their own.
-            drop(shared);
             info!(
                 target: "n42.payload_serve",
                 number = sealed.number,

@@ -32,8 +32,8 @@ pub mod wire_bridge;
 pub mod block_body;
 pub mod committee_pool;
 pub use block_body::{
-    decode_block_body_header, encode_block_rlp_raw, decode_raw_block_body, validate_body_header, BlockBodyError,
-    RawBlockBody,
+    decode_block_body_header, decode_raw_block_body, decode_raw_block_body_ref,
+    encode_block_rlp_raw, validate_body_header, BlockBodyError, RawBlockBody, RawBlockBodyRef,
 };
 pub use committee_pool::{CommitteePoolConfig, CommitteePoolError, ConsensusEvidence, SimulatedCommitteePool};
 pub use error::{ConsensusError, ConsensusResult};

@@ -26,7 +26,7 @@ use alloy_consensus::{proofs::calculate_transaction_root, Block, Header, TxEnvel
 use alloy_eips::eip2718::{Decodable2718, Encodable2718};
 use alloy_eips::eip4895::{Withdrawal, Withdrawals};
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
-use alloy_rlp::{Decodable, Encodable, Header as RlpHeader};
+use alloy_rlp::{Decodable, Header as RlpHeader};
 use n42_h2_consensus::{rewards_to_withdrawals, withdrawals_to_rewards};
 use alloy_rpc_types_engine::ExecutionData;
 use libp2p::gossipsub::IdentTopic;
@@ -175,11 +175,6 @@ pub fn encode_block_rlp(
     let rewards = withdrawals_to_rewards(block.body.withdrawals.as_ref().map_or(&[][..], |w| w.as_slice()));
     Ok(encode_block_rlp_raw(&block.header, &block.body.transactions, &rewards, None))
 }
-
-/// One reward on the wire: gov5's `Reward{Address, Amount}` under
-/// reflective RLP, `[address, amount]`. Defined beside the decoder the
-/// execution layer shares, so both ends of the wire read one definition.
-use n42_h2_consensus::block_body::RewardRlp;
 
 /// The uncompressed wire form for a header, its transactions and its
 /// rewards as they stand — what a node that already holds the block serves.

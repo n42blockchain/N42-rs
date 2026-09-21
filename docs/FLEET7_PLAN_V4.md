@@ -413,6 +413,49 @@ again: legs with build-chain + body-once + async forkchoice, and the pacing belo
 cycle is under ~300). (3) The vote road's unnamed 50 ms and the 30 ms of sender look-ups. At 163,000 transactions a
 290 ms cycle is 560k TPS.
 
+## 2k. The build chain, half working, already moves the cycle (loop193)
+
+`N42_BUILD_CHAIN=1` (`plan-v4/build-chain`, merged e2192590d..59a5e0c60). The brief's premise was wrong and the
+implementer said so instead of guessing: the execution layer cannot start block n+1 by itself, because n+1's parent is
+the hash consensus seals -- the built header plus the view's extra data and the leader's BLS signature -- and that hash
+goes into the EIP-2935 and EIP-4788 writes before execution. So the execution layer says *when* and the validator says
+*what*: a hinted `BUILD_ON_OWN` is answered with the built header the moment it seals, before the encode and the 26 MB
+push; the validator's client seals it for the view it will be proposed under and sends the next `BUILD_ON_OWN` on a
+connection of its own; the proposal's request compares parent hash and attributes and takes the build in flight. The one
+guess is the view, checked, never repaired. No change to the queue.
+
+Window 1, full blocks, medians (ms); W0 = confirmed configuration, W1 = +chain, W2 = +async forkchoice +body-once,
+W3 = W2 at a pacing of 225:
+
+| | W0 a / b | W1 a / b | W2 a / b | W3 a / b |
+| --- | --- | --- | --- | --- |
+| cycle | 391.6 / 375.9 | 351.2 / 341.1 | 339.7 / 326.3 | 351.3 / 325.6 |
+| B | 243 / 226 | 210 / 225 | 229 / 185 | 202 / 173.5 |
+| D | 67 / 70 | 79 / 64 | 75 / 89 | 55 / 68 |
+| E | 59 / 62 | **9 / 15** | 15 / 15 | 64 / 31 |
+| full blocks of window 1 | 67/68, 75/77 | 61/83, 64/80 | 56/80, 58/86 | 53/80, 56/85 |
+| win1 TPS | 369k / 415k | 427k / 409k | 402k / 428k | 394k / 425k |
+
+- **It passes its criterion** (the cycle down 35-50 ms, E from ~60 to 9-15) **with half the chain refused.** Per leg
+  620-733 chains started, 239-322 taken, and all but 3-6 of the rest discarded because the execution layer refused the
+  chained request: "the parent's execution result is not known here" (289 of 347 in W1b), "no state found" (56). A
+  chained request names the predicted sealed parent; what the builder filed, it filed under the built hash. A refusal
+  is only noticed when the proposal's request arrives, ~275 ms later. When it works the build is slower than an
+  unchained one (344 ms against 307): it now overlaps its parent's roots and encode on the same pool.
+- **The blocks come out short** (full blocks 75/77 -> ~58/82), so TPS does not follow the cycle: three own blocks are
+  outstanding under the chain and the bench sizes the pool at three blocks with the gate at 5/6 of it. To be settled
+  with the fix: whether the gate counts held transactions (then the pool is sized at ~5 blocks for chain legs) or the
+  pull simply comes earlier than the refill.
+- No invalid block, verify agrees, no alias warning, no body held, `gate_forced` 0 in seven legs (7 in W2a, whose
+  window 2 is therefore void). Defects 11 and 12 did not show.
+- **The vote road's copy off the road was worth more than predicted**: the fourth-fastest follower's road is 142-155 ms
+  against 180-187 in loop191 (the microbench said 17 ms; the fleet says ~32), the line sums (`other_ms` 0), and B fell
+  to 226-243 in the baseline legs -- where E promptly absorbed it (35 -> 60), as section 2j says it must.
+- Pacing at 225 ms (W3) reads no better than 275 (W2); not the binding term yet.
+
+In progress: `plan-v4/build-chain-2` -- chain on a chained parent (three builds in a row in a test that files fields the
+way the real execution layer does), a refusal known at once, the pool's size for chain legs.
+
 ## 3. What not to do
 
 - Do not judge a cycle-shortening change at a pacing above the natural cycle; do not judge any change without R1.

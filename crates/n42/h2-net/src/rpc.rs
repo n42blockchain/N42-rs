@@ -439,6 +439,235 @@ pub fn encode_block_reply(reply: &BlockReply) -> Result<Vec<u8>, crate::status::
 /// The request-response behaviour for the protocol.
 pub type BlockByHashBehaviour = request_response::Behaviour<BlockByHashCodec>;
 
+/// Asking a peer for named transactions of a block, BIP-152's `getblocktxn`.
+///
+/// A compact body names its transactions by hash and the receiver assembles
+/// the block out of its own queue. What it does not hold it asks for -- and
+/// on this fleet that is a real fraction of every block, because a follower
+/// whose queue is above the ingest gate's high-water mark holds frames the
+/// leader has already admitted and built from (loop195: a median of 448
+/// transactions of 163,000, a p90 of ~7,000). Asking for those alone is tens
+/// of kilobytes where the whole body is 26 megabytes.
+///
+/// N42's own, not gov5's: a member that does not speak it fails to negotiate
+/// the protocol, the request errors, and the caller asks for the whole body
+/// as it always did.
+pub const BLOCK_TXNS_PROTOCOL: &str = "/n42/block_txns/1/snappy";
+
+/// The protocol as libp2p names it.
+pub fn block_txns_protocol() -> StreamProtocol {
+    StreamProtocol::new(BLOCK_TXNS_PROTOCOL)
+}
+
+/// Which transactions of which block are wanted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockTxnsRequest {
+    /// The block, by the hash the proposal named.
+    pub hash: B256,
+    /// The positions wanted, in block order.
+    pub indices: Vec<u32>,
+}
+
+/// The transactions asked for, in the order they were asked for, as EIP-2718
+/// bytes -- or the peer's error message.
+pub type BlockTxnsReply = Result<Vec<alloy_primitives::Bytes>, String>;
+
+/// Bound on one answer: a fill that approaches a whole block is not worth
+/// asking for, and the caller has a threshold of its own well below this.
+pub const MAX_BLOCK_TXNS_BYTES: u64 = 32 << 20;
+
+/// Bound on the indices a peer may ask for, so a request cannot make this
+/// node allocate without bound.
+pub const MAX_BLOCK_TXNS_INDICES: usize = 1 << 20;
+
+/// The codec for [`BLOCK_TXNS_PROTOCOL`].
+#[derive(Debug, Clone, Default)]
+pub struct BlockTxnsCodec;
+
+/// The indices as they travel: a count and that many little-endian `u32`.
+fn encode_indices(indices: &[u32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + indices.len() * 4);
+    out.extend_from_slice(&(indices.len() as u32).to_le_bytes());
+    for index in indices {
+        out.extend_from_slice(&index.to_le_bytes());
+    }
+    out
+}
+
+fn decode_indices(bytes: &[u8]) -> io::Result<Vec<u32>> {
+    let bad = |what: &str| io::Error::new(io::ErrorKind::InvalidData, what.to_owned());
+    let (count, rest) = bytes.split_at_checked(4).ok_or_else(|| bad("truncated index count"))?;
+    let count = u32::from_le_bytes(count.try_into().map_err(|_| bad("index count"))?) as usize;
+    if count > MAX_BLOCK_TXNS_INDICES || rest.len() != count * 4 {
+        return Err(bad("index list does not match its count"));
+    }
+    Ok(rest.as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes(*b)).collect())
+}
+
+/// The transactions as they travel: a count, then a length and the bytes of
+/// each.
+fn encode_txns(txns: &[alloy_primitives::Bytes]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + txns.iter().map(|tx| tx.len() + 4).sum::<usize>());
+    out.extend_from_slice(&(txns.len() as u32).to_le_bytes());
+    for tx in txns {
+        out.extend_from_slice(&(tx.len() as u32).to_le_bytes());
+        out.extend_from_slice(tx);
+    }
+    out
+}
+
+fn decode_txns(bytes: &[u8]) -> io::Result<Vec<alloy_primitives::Bytes>> {
+    let bad = |what: &str| io::Error::new(io::ErrorKind::InvalidData, what.to_owned());
+    let (count, mut rest) = bytes.split_at_checked(4).ok_or_else(|| bad("truncated count"))?;
+    let count = u32::from_le_bytes(count.try_into().map_err(|_| bad("count"))?) as usize;
+    if count > MAX_BLOCK_TXNS_INDICES {
+        return Err(bad("more transactions than any block has"));
+    }
+    let mut txns = Vec::with_capacity(count);
+    for _ in 0..count {
+        let (len, after) = rest.split_at_checked(4).ok_or_else(|| bad("truncated length"))?;
+        let len = u32::from_le_bytes(len.try_into().map_err(|_| bad("length"))?) as usize;
+        let (tx, after) = after.split_at_checked(len).ok_or_else(|| bad("truncated transaction"))?;
+        txns.push(alloy_primitives::Bytes::copy_from_slice(tx));
+        rest = after;
+    }
+    if !rest.is_empty() {
+        return Err(bad("trailing bytes after the transactions"));
+    }
+    Ok(txns)
+}
+
+#[async_trait]
+impl request_response::Codec for BlockTxnsCodec {
+    type Protocol = StreamProtocol;
+    type Request = BlockTxnsRequest;
+    type Response = BlockTxnsReply;
+
+    async fn read_request<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Request>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let mut hash = [0u8; 32];
+        io.read_exact(&mut hash).await?;
+        let payload = read_framed_limit(io, MAX_BLOCK_TXNS_BYTES as usize, MAX_BLOCK_TXNS_BYTES).await?;
+        Ok(BlockTxnsRequest { hash: B256::from(hash), indices: decode_indices(&payload)? })
+    }
+
+    async fn read_response<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Response>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let mut code = [0u8; 1];
+        io.read_exact(&mut code).await?;
+        let payload =
+            read_framed_limit(io, MAX_BLOCK_TXNS_BYTES as usize, MAX_BLOCK_TXNS_BYTES).await?;
+        if code[0] != RESPONSE_CODE_SUCCESS {
+            return Ok(Err(format!("code {}: {}", code[0], String::from_utf8_lossy(&payload))));
+        }
+        Ok(Ok(decode_txns(&payload)?))
+    }
+
+    async fn write_request<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+        request: Self::Request,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        io.write_all(request.hash.as_slice()).await?;
+        io.write_all(&frame_payload(&encode_indices(&request.indices)).map_err(to_io)?).await?;
+        io.close().await
+    }
+
+    async fn write_response<T>(
+        &mut self,
+        _: &Self::Protocol,
+        io: &mut T,
+        reply: Self::Response,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        let (code, payload) = match &reply {
+            Ok(txns) => (RESPONSE_CODE_SUCCESS, encode_txns(txns)),
+            Err(message) => (RESPONSE_CODE_SERVER_ERROR, message.as_bytes().to_vec()),
+        };
+        io.write_all(&[code]).await?;
+        io.write_all(&frame_payload(&payload).map_err(to_io)?).await?;
+        io.close().await
+    }
+}
+
+/// The behaviour for [`BLOCK_TXNS_PROTOCOL`].
+pub type BlockTxnsBehaviour = request_response::Behaviour<BlockTxnsCodec>;
+
+/// Serving and requesting named transactions.
+pub fn block_txns_behaviour() -> BlockTxnsBehaviour {
+    request_response::Behaviour::with_codec(
+        BlockTxnsCodec,
+        [(block_txns_protocol(), request_response::ProtocolSupport::Full)],
+        request_response::Config::default(),
+    )
+}
+
+#[cfg(test)]
+mod block_txns_tests {
+    use super::*;
+    use futures::executor::block_on;
+    use libp2p::request_response::Codec as _;
+
+    fn txns() -> Vec<alloy_primitives::Bytes> {
+        vec![
+            alloy_primitives::Bytes::from_static(&[0x02, 0x01, 0x02]),
+            alloy_primitives::Bytes::from_static(&[0xf8, 0x44]),
+            alloy_primitives::Bytes::new(),
+        ]
+    }
+
+    #[test]
+    fn a_request_round_trips() {
+        let request = BlockTxnsRequest {
+            hash: B256::repeat_byte(0x5a),
+            indices: vec![0, 7, 162_999],
+        };
+        let mut wire = Vec::new();
+        block_on(BlockTxnsCodec.write_request(&block_txns_protocol(), &mut wire, request.clone()))
+            .expect("write");
+        let back = block_on(BlockTxnsCodec.read_request(&block_txns_protocol(), &mut wire.as_slice()))
+            .expect("read");
+        assert_eq!(back, request);
+    }
+
+    #[test]
+    fn an_answer_round_trips_in_both_shapes() {
+        for reply in [Ok(txns()), Ok(Vec::new()), Err("no such block".to_owned())] {
+            let mut wire = Vec::new();
+            block_on(BlockTxnsCodec.write_response(&block_txns_protocol(), &mut wire, reply.clone()))
+                .expect("write");
+            let back =
+                block_on(BlockTxnsCodec.read_response(&block_txns_protocol(), &mut wire.as_slice()))
+                    .expect("read");
+            match (back, reply) {
+                (Ok(got), Ok(want)) => assert_eq!(got, want),
+                (Err(got), Err(want)) => assert!(got.contains(&want), "{got} carries {want}"),
+                (got, want) => panic!("{got:?} is not {want:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_malformed_index_list_or_answer_is_refused() {
+        assert!(decode_indices(&[]).is_err());
+        assert!(decode_indices(&[2, 0, 0, 0, 1, 0, 0, 0]).is_err(), "count says two, one follows");
+        assert!(decode_txns(&[1, 0, 0, 0, 9, 0, 0, 0, 1]).is_err(), "length runs past the end");
+        let mut trailing = encode_txns(&txns());
+        trailing.push(0);
+        assert!(decode_txns(&trailing).is_err());
+    }
+}
+
 /// A leader handing its block body straight to each member, unasked.
 ///
 /// The block topic is a mesh: the leader publishes once and the body reaches

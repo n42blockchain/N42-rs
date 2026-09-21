@@ -215,7 +215,9 @@ impl H2V4Observer {
             | TransportEvent::BlockFetched { peer, .. }
             | TransportEvent::BlockFetchFailed { peer, .. }
             | TransportEvent::RangeRequest { peer, .. }
-            | TransportEvent::RangeFetched { peer, .. } => {
+            | TransportEvent::RangeFetched { peer, .. }
+            | TransportEvent::BlockTxnsRequested { peer, .. }
+            | TransportEvent::BlockTxnsFetched { peer, .. } => {
                 ObserverEvent::NonDecide { from: Some(peer) }
             }
             TransportEvent::Subscribed => ObserverEvent::Subscribed,

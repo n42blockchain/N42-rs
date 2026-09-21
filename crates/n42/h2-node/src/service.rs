@@ -280,15 +280,17 @@ pub struct H2Service<E> {
     /// for one of these re-runs the execution instead of waiting for the next
     /// proposal to mention the block again, which it may never do.
     awaiting_bodies: HashSet<B256>,
-    /// Blocks this node took as a *compact* body (`N42_COMPACT_BODY`).
+    /// Blocks this node took as a *compact* body (`N42_COMPACT_BODY`), with
+    /// the frame they arrived in.
     ///
     /// They are not in `body_store`, because what is stored there is served
     /// to peers as a gov5 body and a compact one is not that. This is what
     /// keeps the same block from being imported twice when the gossip copy
-    /// follows the push, and it is cleared when the block turns out to need
-    /// the whole body after all -- then the copy that arrives is the one
-    /// that imports it.
-    compact_bodies: HashSet<B256>,
+    /// follows the push; it is cleared when the block turns out to need the
+    /// whole body after all -- then the copy that arrives is the one that
+    /// imports it -- and the frame itself is what a fill is appended to when
+    /// a peer answers with the transactions this node did not hold.
+    compact_bodies: std::collections::HashMap<B256, alloy_primitives::Bytes>,
     /// The order [`Self::compact_bodies`] was filled in, so the oldest is
     /// what the bound drops.
     compact_order: std::collections::VecDeque<B256>,
@@ -549,6 +551,11 @@ fn remembered_bodies() -> usize {
 
 /// How many block timestamps to remember. Far more than any head-selection
 /// needs; the bound is against a peer flooding bodies, not a working set.
+/// How many compact frames are kept. Fewer than the other per-block maps,
+/// because each is ~5 MB: enough for a fill's round trip and for the gossip
+/// copy of a block already imported, not a history.
+const REMEMBERED_COMPACT_BODIES: usize = 8;
+
 const REMEMBERED_TIMESTAMPS: usize = 256;
 
 /// What a leader knows when deciding whether, and how, to propose.
@@ -726,7 +733,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             header_profile: HeaderProfile::Ethereum,
             native_wire: false,
             awaiting_bodies: HashSet::new(),
-            compact_bodies: HashSet::new(),
+            compact_bodies: std::collections::HashMap::new(),
             compact_order: std::collections::VecDeque::new(),
             body_wait: std::collections::HashMap::new(),
             body_grace: body_request_grace(),
@@ -1427,6 +1434,104 @@ impl<E: ExecutionLayer> H2Service<E> {
                         // a wire-format difference with the producer.
                         let head = data.iter().take(256).map(|b| format!("{b:02x}")).collect::<String>();
                         debug!(target: "n42.h2.node", %err, len = data.len(), head, "dropped a block body");
+                    }
+                }
+            }
+            TransportEvent::BlockTxnsRequested { peer, request, channel } => {
+                // Served from the body this node holds whole. A node that
+                // took the block as a compact body has none and says so;
+                // the asker then has the whole-body road.
+                let reply = match self.body_store.get(&request.hash) {
+                    Some(body) => {
+                        match n42_h2_consensus::decode_raw_block_body_ref(body, self.header_profile) {
+                            Ok(decoded) => request
+                                .indices
+                                .iter()
+                                .map(|&i| {
+                                    decoded
+                                        .transactions
+                                        .get(i as usize)
+                                        .map(|tx| alloy_primitives::Bytes::copy_from_slice(tx))
+                                        .ok_or_else(|| format!("block {} has no index {i}", request.hash))
+                                })
+                                .collect::<Result<Vec<_>, String>>(),
+                            Err(err) => Err(err.to_string()),
+                        }
+                    }
+                    None => Err(format!("block {} is not held here whole", request.hash)),
+                };
+                debug!(
+                    target: "n42.h2.node",
+                    %peer,
+                    hash = ?request.hash,
+                    wanted = request.indices.len(),
+                    served = reply.as_ref().map(Vec::len).unwrap_or(0),
+                    "peer asked for named transactions"
+                );
+                self.transport.respond_block_txns(channel, reply);
+            }
+            TransportEvent::BlockTxnsFetched { peer, request, reply } => {
+                match reply {
+                    Ok(txns) if txns.len() == request.indices.len() => {
+                        let Some(frame) = self.compact_bodies.get(&request.hash).cloned() else {
+                            debug!(target: "n42.h2.node", hash = ?request.hash, "the compact body this fill is for is gone");
+                            return Ok(());
+                        };
+                        let fill: Vec<(usize, alloy_primitives::Bytes)> = request
+                            .indices
+                            .iter()
+                            .map(|&i| i as usize)
+                            .zip(txns)
+                            .collect();
+                        let filled = alloy_primitives::Bytes::from(
+                            n42_h2_consensus::with_fill(&frame, &fill),
+                        );
+                        info!(
+                            target: "n42.h2.node",
+                            hash = ?request.hash,
+                            filled = fill.len(),
+                            bytes = filled.len(),
+                            %peer,
+                            "the peer supplied the missing transactions; assembling the block again"
+                        );
+                        // The same block, the same frame, with the holes
+                        // filled: the execution layer checks every one of
+                        // them against the hash the body names for its
+                        // position and the transactions root as before.
+                        let (number, timestamp) = self
+                            .block_headers
+                            .get(&request.hash)
+                            .map_or((0, 0), |header| (header.number, header.timestamp));
+                        self.driver.cache_body(n42_h2_execution::ForeignBody {
+                            block_hash: request.hash,
+                            number,
+                            timestamp,
+                            profile: self.header_profile,
+                            rlp: filled,
+                            compact: true,
+                        });
+                        self.import_eagerly(request.hash);
+                    }
+                    Ok(txns) => {
+                        warn!(
+                            target: "n42.h2.node",
+                            %peer,
+                            hash = ?request.hash,
+                            wanted = request.indices.len(),
+                            got = txns.len(),
+                            "a peer answered a named-transaction request with the wrong number of them"
+                        );
+                        self.forget_compact_body(request.hash);
+                    }
+                    Err(reason) => {
+                        info!(
+                            target: "n42.h2.node",
+                            %peer,
+                            hash = ?request.hash,
+                            reason,
+                            "a peer could not supply the missing transactions; asking for the whole body"
+                        );
+                        self.forget_compact_body(request.hash);
                     }
                 }
             }
@@ -2256,6 +2361,30 @@ impl<E: ExecutionLayer> H2Service<E> {
                     debug!(target: "n42.h2.node", %err, "engine rejected an execution event");
                 }
             }
+            DriverAction::TransactionsMissing { block_hash, indices } => {
+                // The compact body is this block; it is only incomplete
+                // here. Ask a peer for those positions alone -- tens of
+                // kilobytes against the 26 MB body -- and hand the frame
+                // back with them filled in. A peer that cannot answer, or
+                // does not speak the protocol, leaves the whole-body road.
+                let peers = self.transport.connected_peer_ids();
+                let Some(peer) = peers.first().copied() else {
+                    debug!(target: "n42.h2.node", ?block_hash, "no peer to ask for the missing transactions");
+                    self.forget_compact_body(block_hash);
+                    return Ok(());
+                };
+                info!(
+                    target: "n42.h2.node",
+                    ?block_hash,
+                    wanted = indices.len(),
+                    %peer,
+                    "asking a peer for the transactions this node does not hold"
+                );
+                self.transport.request_block_txns(
+                    peer,
+                    n42_h2_net::BlockTxnsRequest { hash: block_hash, indices },
+                );
+            }
             DriverAction::PayloadMissing { block_hash } => {
                 // The body may still be in flight on the block topic; ask
                 // for it too, as gov5 does, from everyone connected. An
@@ -2273,11 +2402,10 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // ask for the body at once rather than through the grace
                 // below: the grace is for a body still in flight, and this
                 // one has arrived and been read.
-                let compact_fallback = self.compact_bodies.remove(&block_hash);
+                let compact_fallback = self.compact_bodies.contains_key(&block_hash);
                 if compact_fallback {
+                    self.compact_bodies.remove(&block_hash);
                     self.compact_order.retain(|hash| hash != &block_hash);
-                }
-                if compact_fallback {
                     self.driver.forget_payload(block_hash);
                     info!(target: "n42.h2.node", ?block_hash, "the compact body did not assemble here; asking for the whole body");
                 }
@@ -2775,7 +2903,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         if self.body_store.contains_key(&block_hash) {
             return Ok((block_hash, header, false));
         }
-        if self.compact_bodies.contains(&block_hash) {
+        if self.compact_bodies.contains_key(&block_hash) {
             // The compact body reached this node first and its import is
             // under way or done. The bytes are still worth keeping -- this
             // is what a peer asking `block_by_hash` is served -- but the
@@ -2797,6 +2925,21 @@ impl<E: ExecutionLayer> H2Service<E> {
         Ok((block_hash, header, true))
     }
 
+    /// Gives up on a block's compact body: the whole body is asked for
+    /// instead, and the copy that arrives is the one that imports it.
+    fn forget_compact_body(&mut self, block_hash: B256) {
+        if self.compact_bodies.remove(&block_hash).is_some() {
+            self.compact_order.retain(|hash| hash != &block_hash);
+            self.driver.forget_payload(block_hash);
+        }
+        if self.body_request_due(block_hash) {
+            self.awaiting_bodies.insert(block_hash);
+            for peer in self.transport.connected_peer_ids() {
+                self.transport.request_block(peer, block_hash);
+            }
+        }
+    }
+
     /// A *compact* body that arrived on the direct channel
     /// (`N42_COMPACT_BODY=1`): the header is read here, as for a body once,
     /// and the transactions -- which this body names rather than carries --
@@ -2812,7 +2955,9 @@ impl<E: ExecutionLayer> H2Service<E> {
     ) -> Result<(B256, Header, bool), n42_h2_consensus::BlockBodyError> {
         let (block_hash, header) =
             n42_h2_consensus::decode_compact_body_header(&bytes, self.header_profile)?;
-        if self.body_store.contains_key(&block_hash) || !self.compact_bodies.insert(block_hash) {
+        if self.body_store.contains_key(&block_hash)
+            || self.compact_bodies.insert(block_hash, bytes.clone()).is_some()
+        {
             return Ok((block_hash, header, false));
         }
         // Bounded the way the other per-block maps are, oldest first: what
@@ -2820,7 +2965,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         // copy follows its push, and anything this far back is long
         // committed.
         self.compact_order.push_back(block_hash);
-        while self.compact_order.len() > REMEMBERED_TIMESTAMPS {
+        while self.compact_order.len() > REMEMBERED_COMPACT_BODIES {
             if let Some(oldest) = self.compact_order.pop_front() {
                 self.compact_bodies.remove(&oldest);
             }

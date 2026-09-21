@@ -1045,9 +1045,9 @@ impl<T: JsonRpcTransport> ExecutionLayer for EngineApiClient<T> {
         path: ExecutionPath,
         body: &n42_h2_execution::ForeignBody,
         checked: tokio::sync::oneshot::Sender<PayloadStatus>,
-    ) -> Option<Result<PayloadStatus, ElError>> {
+    ) -> n42_h2_execution::BodyOutcome {
         if !path.uses_current_engine_api() || !n42_h2_execution::body_once() {
-            return None;
+            return n42_h2_execution::BodyOutcome::NotThisWay;
         }
         self.foreign_body_over_channel(body, checked).await
     }
@@ -1489,12 +1489,15 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
         &self,
         body: &n42_h2_execution::ForeignBody,
         checked: tokio::sync::oneshot::Sender<PayloadStatus>,
-    ) -> Option<Result<PayloadStatus, ElError>> {
+    ) -> n42_h2_execution::BodyOutcome {
         use n42_h2_execution::raw_engine::reply;
+        use n42_h2_execution::BodyOutcome;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (addr, taken) = {
             let mut channel = self.raw_import.lock().await;
-            let addr = self.raw_endpoint(&mut channel).await?;
+            let Some(addr) = self.raw_endpoint(&mut channel).await else {
+                return BodyOutcome::NotThisWay;
+            };
             (addr, channel.stream.take())
         };
         let started = std::time::Instant::now();
@@ -1508,6 +1511,10 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
         // from there on a failure is this block's failure, not a reason to
         // send it again.
         let mut committed = false;
+        // Set when the execution layer asked for named transactions instead
+        // of answering: not a failure, and not a reason to send the block
+        // another way.
+        let mut needs: Option<Vec<u32>> = None;
         let attempt: std::io::Result<(PayloadStatus, tokio::net::TcpStream)> = async {
             let mut conn = match taken {
                 Some(stream) => stream,
@@ -1550,6 +1557,16 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
                             let _ = sender.send(status);
                         }
                     }
+                    reply::NEED_TXNS => {
+                        // Not a refusal: the block is this block, and the
+                        // execution layer will take it again once these
+                        // positions are supplied.
+                        needs = Some(
+                            n42_h2_execution::raw_engine::decode_need_txns(&buf)
+                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+                        );
+                        return Err(std::io::Error::other("needs transactions"));
+                    }
                     reply::ERROR => {
                         let message = String::from_utf8_lossy(&buf).into_owned();
                         // The execution layer declining the request itself
@@ -1580,7 +1597,17 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
                     status = ?status.status,
                     "raw foreign body"
                 );
-                Some(Ok(status))
+                BodyOutcome::Answered(Ok(status))
+            }
+            Err(_) if needs.is_some() => {
+                let indices = needs.unwrap_or_default();
+                debug!(
+                    target: "n42.h2.el",
+                    block = ?body.block_hash,
+                    wanted = indices.len(),
+                    "the execution layer wants named transactions of this block"
+                );
+                BodyOutcome::NeedTxns(indices)
             }
             Err(err) if committed => {
                 warn!(
@@ -1589,7 +1616,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
                     %err,
                     "the foreign body failed after the execution layer took it; not sending it again"
                 );
-                Some(Err(ElError::new(err)))
+                BodyOutcome::Answered(Err(ElError::new(err)))
             }
             Err(err) => {
                 // Said where a fleet's logs show it: a body that falls back
@@ -1602,7 +1629,7 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
                     %err,
                     "foreign body refused; sending the payload for this block"
                 );
-                None
+                BodyOutcome::NotThisWay
             }
         }
     }

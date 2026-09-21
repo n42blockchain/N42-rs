@@ -59,6 +59,11 @@ pub enum ImportVerdict {
     NotYet,
     /// The execution layer refused it, or the import could not run.
     Invalid(String),
+    /// A compact body the execution layer could not assemble: these
+    /// positions of the block are transactions it does not hold, and it will
+    /// take the same body again with them supplied. Nothing was checked and
+    /// no vote went out.
+    NeedTxns(Vec<u32>),
 }
 
 impl ImportVerdict {
@@ -203,6 +208,15 @@ pub enum DriverAction {
     Finalized {
         /// The finalised block.
         block_hash: B256,
+    },
+    /// A compact body named transactions this node does not hold. The loop
+    /// asks a peer for those positions alone and hands the body back with
+    /// them supplied; the whole body stays the last resort.
+    TransactionsMissing {
+        /// The block.
+        block_hash: B256,
+        /// The positions wanted, in block order.
+        indices: Vec<u32>,
     },
     /// Consensus asked to execute a block whose payload the driver has not seen.
     ///
@@ -1302,13 +1316,23 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                 let (checked_tx, checked_rx) = tokio::sync::oneshot::channel();
                 let call = el.new_payload_body_checked(ExecutionPath::LIVE_SEQUENTIAL, body, checked_tx);
                 tokio::pin!(call);
-                answered = tokio::select! {
+                let outcome = tokio::select! {
                     checked = checked_rx => {
                         release_check(&report, block_hash, size, started, checked.ok());
                         call.await
                     }
                     answer = &mut call => answer,
                 };
+                match outcome {
+                    crate::BodyOutcome::Answered(answer) => answered = Some(answer),
+                    crate::BodyOutcome::NotThisWay => {}
+                    // The block is this block; it is only incomplete here.
+                    // The loop fetches what is named and hands the body back.
+                    crate::BodyOutcome::NeedTxns(indices) => {
+                        guard.done(ImportVerdict::NeedTxns(indices));
+                        return;
+                    }
+                }
                 if answered.is_none() {
                     debug!(
                         target: "n42.h2.el",
@@ -1450,6 +1474,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             // Not executed: asked for again, as the awaited path does. A
             // commit that waited keeps waiting for the import that follows.
             ImportVerdict::NotYet => DriverAction::PayloadMissing { block_hash },
+            ImportVerdict::NeedTxns(indices) => DriverAction::TransactionsMissing { block_hash, indices },
             ImportVerdict::Invalid(reason) => {
                 // A commit for it can never run; a payload for it is dropped
                 // so a fresh copy is executed again, not this outcome.

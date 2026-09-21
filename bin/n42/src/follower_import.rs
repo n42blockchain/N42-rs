@@ -847,6 +847,12 @@ pub struct VoteRoad {
     /// Compact body road only: waiting for this node's ingest to land a
     /// transaction the first pass did not find.
     pub miss_wait_us: u64,
+    /// Compact body road only: checking, decoding and recovering the
+    /// transactions the peer supplied for the positions this node could not
+    /// fill. 0 on a first attempt.
+    pub fill_us: u64,
+    /// How many positions the peer supplied.
+    pub filled: u64,
     /// Compact body road only: how many of the block's hashes the first
     /// pass did not find. Nonzero with a vote released means the wait was
     /// enough; a road that gave up logs a line of its own and is not this
@@ -891,6 +897,7 @@ fn log_vote_road(road: VoteRoad, number: u64, txs: usize, phases: RoadPhases) {
         + road.assemble_us
         + road.root_us
         + road.miss_wait_us
+        + road.fill_us
         + phases.header_us
         + phases.senders_us
         + phases.parent_wait_us
@@ -912,6 +919,8 @@ fn log_vote_road(road: VoteRoad, number: u64, txs: usize, phases: RoadPhases) {
         root_ms = road.root_us / 1000,
         miss_wait_ms = road.miss_wait_us / 1000,
         misses = road.misses,
+        fill_ms = road.fill_us / 1000,
+        filled = road.filled,
         header_ms = phases.header_us / 1000,
         senders_ms = phases.senders_us / 1000,
         parent_wait_ms = phases.parent_wait_us / 1000,

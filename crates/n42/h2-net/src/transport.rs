@@ -39,7 +39,8 @@ use crate::config::gov5_gossipsub_config;
 use crate::rpc::{
     block_by_hash_behaviour, block_push_behaviour, bodies_by_range_behaviour, status_behaviour,
     BlockByHashBehaviour, BlockPushBehaviour,
-    BlockChunk, BlockReply, BodiesByRangeBehaviour, RangeReply, RangeRequest, StatusBehaviour,
+    BlockChunk, BlockReply, BlockTxnsBehaviour, BlockTxnsReply, BlockTxnsRequest,
+    BodiesByRangeBehaviour, RangeReply, RangeRequest, StatusBehaviour,
 };
 use crate::status::Status;
 use crate::block_gossip::gov5_block_topic;
@@ -173,6 +174,10 @@ pub struct BlockRequestChannel(request_response::ResponseChannel<BlockReply>);
 #[derive(Debug)]
 pub struct RangeRequestChannel(request_response::ResponseChannel<RangeReply>);
 
+/// Where an answer to a named-transactions request goes.
+#[derive(Debug)]
+pub struct BlockTxnsChannel(request_response::ResponseChannel<BlockTxnsReply>);
+
 /// What the transport saw.
 #[derive(Debug)]
 pub enum TransportEvent {
@@ -264,6 +269,26 @@ pub enum TransportEvent {
         /// The blocks, in order, or the peer's error.
         reply: RangeReply,
     },
+    /// A peer wants named transactions of a block it could not assemble
+    /// from its own queue (`BLOCK_TXNS_PROTOCOL`).
+    BlockTxnsRequested {
+        /// Who asked.
+        peer: PeerId,
+        /// Which block and which positions.
+        request: BlockTxnsRequest,
+        /// Where the answer goes.
+        channel: BlockTxnsChannel,
+    },
+    /// Named transactions this node asked for came back -- or the peer said
+    /// no, which includes a peer that does not speak the protocol at all.
+    BlockTxnsFetched {
+        /// Who answered.
+        peer: PeerId,
+        /// What was asked.
+        request: BlockTxnsRequest,
+        /// The transactions in the order they were asked for, or the error.
+        reply: BlockTxnsReply,
+    },
     /// A leader handed this node a block body directly, without being asked.
     ///
     /// The payload is what `block_by_hash` would have answered with, so a
@@ -339,6 +364,9 @@ pub(crate) struct H2Behaviour {
     pushes: BlockPushBehaviour,
     /// gov5's range sync, served from the execution layer's chain.
     ranges: BodiesByRangeBehaviour,
+    /// N42's own: the transactions of a block a peer could not assemble from
+    /// its queue. See [`crate::rpc::BLOCK_TXNS_PROTOCOL`].
+    block_txns: BlockTxnsBehaviour,
     /// Not decoration either. go-libp2p-pubsub learns which peers speak
     /// gossipsub from the identify exchange (`EvtPeerIdentificationCompleted`,
     /// `peer_notify.go`): a peer that connects after startup and never
@@ -369,6 +397,8 @@ pub struct H2V4Transport {
     block_requests: HashMap<request_response::OutboundRequestId, B256>,
     /// Range requests this node sent, by request id.
     range_requests: HashMap<request_response::OutboundRequestId, RangeRequest>,
+    /// Named-transaction requests this node sent, by request id.
+    txns_requests: HashMap<request_response::OutboundRequestId, BlockTxnsRequest>,
     /// The head height this node advertises in its own status messages.
     advertised_height: u64,
 }
@@ -399,6 +429,7 @@ impl H2V4Transport {
             blocks: block_by_hash_behaviour(),
             pushes: block_push_behaviour(),
             ranges: bodies_by_range_behaviour(),
+            block_txns: crate::rpc::block_txns_behaviour(),
             identify: libp2p::identify::Behaviour::new(
                 libp2p::identify::Config::new(IDENTIFY_PROTOCOL_VERSION.into(), keypair.public())
                     .with_agent_version(format!("n42-rs/h2-net/{}", env!("CARGO_PKG_VERSION"))),
@@ -494,6 +525,7 @@ impl H2V4Transport {
             pending_events: dial_errors,
             block_requests: HashMap::new(),
             range_requests: HashMap::new(),
+            txns_requests: HashMap::new(),
             advertised_height: 0,
         })
     }
@@ -594,6 +626,20 @@ impl H2V4Transport {
     pub fn request_range(&mut self, peer: PeerId, request: RangeRequest) {
         let id = self.swarm.behaviour_mut().ranges.send_request(&peer, request);
         self.range_requests.insert(id, request);
+    }
+
+    /// Asks `peer` for named transactions of a block. The answer arrives as
+    /// [`TransportEvent::BlockTxnsFetched`], including when the peer does not
+    /// speak the protocol -- then it is the error, and the caller asks for
+    /// the whole body as it always did.
+    pub fn request_block_txns(&mut self, peer: PeerId, request: BlockTxnsRequest) {
+        let id = self.swarm.behaviour_mut().block_txns.send_request(&peer, request.clone());
+        self.txns_requests.insert(id, request);
+    }
+
+    /// Answers a [`TransportEvent::BlockTxnsRequested`].
+    pub fn respond_block_txns(&mut self, channel: BlockTxnsChannel, reply: BlockTxnsReply) {
+        let _ = self.swarm.behaviour_mut().block_txns.send_response(channel.0, reply);
     }
 
     /// Answers a [`TransportEvent::RangeRequest`] with the blocks this node
@@ -856,6 +902,34 @@ impl H2V4Transport {
                     }
                 }
                 SwarmEvent::Behaviour(H2BehaviourEvent::Ranges(_)) => {}
+                SwarmEvent::Behaviour(H2BehaviourEvent::BlockTxns(
+                    request_response::Event::Message { peer, message, .. },
+                )) => match message {
+                    request_response::Message::Request { request, channel, .. } => {
+                        return Some(TransportEvent::BlockTxnsRequested {
+                            peer,
+                            request,
+                            channel: BlockTxnsChannel(channel),
+                        });
+                    }
+                    request_response::Message::Response { request_id, response } => {
+                        if let Some(request) = self.txns_requests.remove(&request_id) {
+                            return Some(TransportEvent::BlockTxnsFetched { peer, request, reply: response });
+                        }
+                    }
+                },
+                SwarmEvent::Behaviour(H2BehaviourEvent::BlockTxns(
+                    request_response::Event::OutboundFailure { peer, request_id, error, .. },
+                )) => {
+                    if let Some(request) = self.txns_requests.remove(&request_id) {
+                        return Some(TransportEvent::BlockTxnsFetched {
+                            peer,
+                            request,
+                            reply: Err(error.to_string()),
+                        });
+                    }
+                }
+                SwarmEvent::Behaviour(H2BehaviourEvent::BlockTxns(_)) => {}
                 SwarmEvent::Behaviour(H2BehaviourEvent::Status(
                     request_response::Event::Message { peer, message, .. },
                 )) => {

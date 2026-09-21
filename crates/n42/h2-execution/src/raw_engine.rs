@@ -120,6 +120,41 @@ pub mod reply {
     /// A request without a hint gets no such frame, which is what makes the
     /// whole path opt-in and an old caller's traffic unchanged.
     pub const CHAIN_HEADER: u8 = 4;
+    /// [`super::request::COMPACT_BODY`] only: the block's transactions at
+    /// these positions are ones this node does not hold, and it will take
+    /// the same body again with them supplied (`compact_body::with_fill`).
+    /// `u32` length, then a `u32` count and that many little-endian `u32`
+    /// indices in block order.
+    ///
+    /// Sent instead of [`ERROR`] while the miss is small enough to be worth
+    /// asking for; a block that is mostly missing gets the error and the
+    /// whole-body road, as before. Nothing has been checked and no vote has
+    /// been released when this frame goes out.
+    pub const NEED_TXNS: u8 = 5;
+}
+
+/// Encodes the indices of [`reply::NEED_TXNS`].
+pub fn encode_need_txns(indices: &[u32]) -> Vec<u8> {
+    let mut w = Writer(Vec::with_capacity(4 + indices.len() * 4));
+    w.u32(indices.len() as u32);
+    for index in indices {
+        w.u32(*index);
+    }
+    w.0
+}
+
+/// Decodes what [`encode_need_txns`] produced.
+pub fn decode_need_txns(buf: &[u8]) -> Result<Vec<u32>, String> {
+    let mut r = Reader { rest: buf, shared: None };
+    let n = r.u32()? as usize;
+    let mut indices = Vec::with_capacity(n.min(1 << 20));
+    for _ in 0..n {
+        indices.push(r.u32()?);
+    }
+    if !r.rest.is_empty() {
+        return Err(format!("need-txns frame has {} trailing bytes", r.rest.len()));
+    }
+    Ok(indices)
 }
 
 struct Writer(Vec<u8>);
@@ -640,6 +675,18 @@ mod tests {
         let mut wrong_version = frame;
         wrong_version[0] = VERSION + 1;
         assert!(decode_foreign_body(&wrong_version).is_err());
+    }
+
+    #[test]
+    fn the_indices_of_a_need_txns_frame_round_trip() {
+        for indices in [vec![], vec![0u32], vec![0, 7, 162_999]] {
+            assert_eq!(decode_need_txns(&encode_need_txns(&indices)).expect("decodes"), indices);
+        }
+        let frame = encode_need_txns(&[1, 2, 3]);
+        assert!(decode_need_txns(&frame[..frame.len() - 1]).is_err());
+        let mut padded = frame;
+        padded.push(0);
+        assert!(decode_need_txns(&padded).is_err());
     }
 
     #[test]

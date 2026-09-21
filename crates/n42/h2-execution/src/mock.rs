@@ -55,6 +55,10 @@ pub struct MockBehaviour {
     /// binary, or one without the direct import -- and the driver must send
     /// the payload instead.
     pub take_bodies: bool,
+    /// When set, a body handed to this layer is answered with
+    /// [`crate::BodyOutcome::NeedTxns`] for these positions instead of being
+    /// imported: the compact body's third answer.
+    pub body_needs_txns: Option<Vec<u32>>,
     /// When set, an attribute-less forkchoice waits for a permit before it
     /// reaches the mock (and is recorded): a test holds a commit's forkchoice
     /// open, which is the whole point of running it off the consensus loop.
@@ -70,6 +74,7 @@ impl Default for MockBehaviour {
             forkchoice_status: PayloadStatusEnum::Valid,
             resolve_gate: None,
             take_bodies: false,
+            body_needs_txns: None,
             forkchoice_gate: None,
         }
     }
@@ -208,16 +213,19 @@ impl ExecutionLayer for MockExecutionLayer {
         _path: crate::ExecutionPath,
         body: &crate::el::ForeignBody,
         checked: tokio::sync::oneshot::Sender<PayloadStatus>,
-    ) -> Option<Result<PayloadStatus, ElError>> {
+    ) -> crate::BodyOutcome {
         if !self.behaviour.lock().expect("mock behaviour lock").take_bodies {
             // Refused before anything was answered: the caller sends the
             // payload, and nothing has been checked.
-            return None;
+            return crate::BodyOutcome::NotThisWay;
         }
         self.record(ElCall::NewPayloadBody(body.block_hash));
         let behaviour = self.behaviour.lock().expect("mock behaviour lock").clone();
+        if let Some(indices) = behaviour.body_needs_txns.clone() {
+            return crate::BodyOutcome::NeedTxns(indices);
+        }
         if let Some(error) = behaviour.new_payload_error {
-            return Some(Err(ElError(error)));
+            return crate::BodyOutcome::Answered(Err(ElError(error)));
         }
         // The check first, as the real channel does: it is the vote, and it
         // arrives before the import's verdict.
@@ -226,7 +234,7 @@ impl ExecutionLayer for MockExecutionLayer {
         // executing; without a gap here the two would race in the caller's
         // select and a test could not say which it saw.
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        Some(Ok(PayloadStatus {
+        crate::BodyOutcome::Answered(Ok(PayloadStatus {
             status: behaviour.new_payload_status,
             latest_valid_hash: Some(body.block_hash),
         }))

@@ -345,6 +345,60 @@ decoded once (`plan-v4/body-once`, with a `vote road:` log line so this table ne
 logs); `check_includable` measured on its own and cut (`plan-v4/check-parallel`). After them: the commit forkchoice
 off the service loop's await (37 ms of D), then the leader's chain.
 
+## 2j. The vote road cut, the commit forkchoice off the loop -- and the cycle pinned by the leader's build chain (loop190-191)
+
+Three changes, each judged on the confirmed configuration with the cycle dissected the way section 2i did it
+(window 1, full blocks, the segments summing to the cycle exactly; `scratchpad/dissect190.py`):
+
+| ms, medians | loop189 X0 | Z0 a / b | Z1 (+`N42_COMMIT_FCU_ASYNC`) a / b | Z2 (+`N42_BODY_ONCE`) a / b |
+| --- | --- | --- | --- | --- |
+| cycle | 369.8 | 375.5 / 356.0 | 372.8 / 362.5 | 359.9 / 360.7 |
+| B proposal -> R1 quorum | 261.0 | 259.5 / 247.0 | 252.0 / 242.0 | **226.0 / 224.0** |
+| D view open -> preamble | 51.1 | 63.3 / 57.0 | **41.9 / 43.2** | 49.5 / 59.4 |
+| E preamble -> sealed | 14.6 | 35.5 / 25.5 | **59.0 / 58.0** | **59.5 / 61.0** |
+| C, F | 8.7, 6.5 | 8, 6 | 9, 6 | 8, 6 |
+| win1 TPS | 407-434k | 402k / 427k | 407k / 431k | 434k / 432k |
+
+(loop190's three Y0/Y1 pairs read the same: B 248-255 -> 224-226, D+E ~90 -> ~120, cycle 358-364 -> 355-358.)
+
+- **`check_includable` in one pass (1173a69b4 on the branch, unconditional): kept.** 5 ms on the fleet. Section 2i's
+  "`check_includable` 91.5" was the whole stretch from the conversion's end to the vote -- header, 163,000 sender
+  look-ups (30 ms), the check, and ~50 ms that no field names -- not the check. On an idle pinned box the old check
+  was 9 ms (11 ms of CPU at one thread); the new one is 5 ms either way. 531 single-flaw blocks match the old
+  implementation's error string for string; a block wrong in several ways now names the earliest transaction in block
+  order, where the old one named whichever sender group the hash map reached first.
+- **`N42_BODY_ONCE=1` (the gossip body handed to the execution layer as received, decoded once): works, kept opt-in.**
+  B falls by ~26 ms (the validator no longer decodes and re-encodes 163,000 transactions); on the execution layer's
+  side the road is no shorter (one decode of 63-73 ms against receive 13 + decode 13 + convert 54). 0 bodies refused
+  in 11,557 foreign-body blocks, no invalid block, verify clean. Before it becomes the default: a body whose header is
+  right and whose transactions are not stays in the validator's body store under that hash, and the real body is then
+  dropped as one "already held" -- evict on the execution layer's refusal.
+- **`N42_COMMIT_FCU_ASYNC=1` (one commit forkchoice in flight, in commit order, the answer applied as a report): works,
+  kept opt-in.** D falls by ~17 ms (the forkchoice is 23-34 ms in flight, never queued behind another: queued_ms 0 in
+  1,183 samples), no refused forkchoice, no body held.
+- **Neither moves the cycle, and the dissection says why: every millisecond taken from B or D came back as E**, the
+  leader waiting at its preamble for its own build-ahead (25-35 -> 58-61 ms). The falsification criterion I set for the
+  forkchoice step (`proposal=@` down by 20 ms) was the wrong one -- `proposal=@` is D+E+F, and E absorbs D.
+- **The cycle is the leader's build chain.** On the window-1 leaders' execution layers the period from one build's start
+  to the next is 351-360 ms -- the cycle -- and only 267-294 ms of it is the build (`sealed_at` 204-222, state ready
+  ~19 later, encode 30). The rest: 68-84 ms between a block's state being ready and the validator's `BUILD_ON_OWN`
+  request for the next one arriving (the builder idle, waiting for the block to be shipped, sealed and asked for), and
+  33-42 ms between that request and the build starting. The consensus chain (B+C+D+F) is ~290-330 ms, right behind.
+- The vote road's line sums to ~130 of its ~180 ms on both roads; the unnamed 50 ms is not a wait for the parent (its
+  root and engine insert are done before the child's check ends). `plan-v4/vote-road-sum` names and measures it.
+- loop190 Y1a lost window 3 to the harness: the flood stopped sending at +128 s with every worker blocked on an ingest
+  reply that never came (no read timeout), the queue drained and the chain built 48 empty blocks -- the ingest's gate
+  did not reopen. Seen once in twelve legs. `plan-v4/ingest-gate` (defect 11).
+- `/home` filled during loop190 Y0a (the runner's memory sampler lost lines; the node logs are on `/data`). Build
+  output now goes to `/data/n42-build`.
+
+**Order of work from here.** (1) `plan-v4/build-chain`: the execution layer starts block n+1 the moment block n's state
+is ready, on the validator's hint that the next height is its own, and the `BUILD_ON_OWN` request takes the build in
+flight -- a build period of ~245 ms instead of ~355. (2) With the build chain under the consensus chain, B and D count
+again: legs with build-chain + body-once + async forkchoice, and the pacing below 275 ms (its floor binds once the
+cycle is under ~300). (3) The vote road's unnamed 50 ms and the 30 ms of sender look-ups. At 163,000 transactions a
+290 ms cycle is 560k TPS.
+
 ## 3. What not to do
 
 - Do not judge a cycle-shortening change at a pacing above the natural cycle; do not judge any change without R1.

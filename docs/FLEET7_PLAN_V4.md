@@ -309,6 +309,42 @@ waits for. What a cycle consists of in this configuration is being read event by
 the medians do not add up (the leader proposes ~250 ms into a view at a 275 ms pacing, which a pacing counted from
 the parent's proposal should not produce).
 
+## 2i. A cycle, event by event (loop189 X0a, window 1) -- and what follows from it
+
+58 consecutive full blocks under one leader; the per-block sums have a median of 369.8 ms, which is the measured
+cycle. t = 0 is the leader's `block body prepared` for N.
+
+| segment | median ms | what it is |
+| --- | --- | --- |
+| A body out -> proposal sent | 1.7 | work |
+| **B proposal -> R1 quorum** | **261.0** | the followers' road to a vote, below |
+| C R1 -> the next view opens | 8.7 | the R2 round trip |
+| D view open -> `proposal preamble` | 51.1 | 37 of it the leader's own commit forkchoice, awaited inside the service loop; 11 retry granularity |
+| E preamble -> sealed | 14.6 (mean 36.5) | the leader's own build-ahead: done at +334 against a preamble at +328, a coin flip |
+| F -> the next body | 6.5 | RLP encode |
+
+B, per follower: gossip transfer + the validator's decode 36.6 (19 decode) -> hand-off to the execution layer **51.5**
+-> `convert_payload_to_block` **55.0** -> `check_includable` **91.5** -> vote 0.8. The quorum (5 of 7: the leader and
+four followers) is gated by the fourth-fastest follower at +258.9; the straggler grace was the gate on 1 block of 57.
+
+What this settles:
+- **`check_ms` ~200 is work, not a wait.** The parent's execution output is filed ~80 ms before the child's payload
+  reaches the execution layer. That is why steps 1 and 2 moved nothing: there was no wait on the road for them to
+  remove. Section 2g's reading of R1 is withdrawn.
+- **The pacing is worth 3%.** Its rule has a hard floor at 275.6 ms from the leader's previous build and binds on
+  23 of 57 blocks, at a median wait of 0; at a pacing of 0 the cycle would be 367 ms.
+- **The block is serialised twice on the vote road.** The validator decodes the gossip body, re-encodes 163,000
+  transactions into a `NEW_PAYLOAD` frame, pushes 26 MB over the socket, and the execution layer parses them again:
+  107 ms, 29% of the cycle. The leader's own block avoids exactly this with `OWN_BLOCK`; a follower's has no such
+  request.
+- **The leader's build-ahead is the next thing in line.** It finishes at +334 ms; once B is ~100 ms shorter it is
+  what the cycle waits for, and step 3 (the leader's chain) stops being premature.
+
+In progress, in the order of what they are worth: the gossip body handed to the execution layer as received and
+decoded once (`plan-v4/body-once`, with a `vote road:` log line so this table never has to be rebuilt from seven
+logs); `check_includable` measured on its own and cut (`plan-v4/check-parallel`). After them: the commit forkchoice
+off the service loop's await (37 ms of D), then the leader's chain.
+
 ## 3. What not to do
 
 - Do not judge a cycle-shortening change at a pacing above the natural cycle; do not judge any change without R1.

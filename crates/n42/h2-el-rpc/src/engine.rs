@@ -1066,7 +1066,10 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
                 Some(Err(ElError::new(err)))
             }
             Err(err) => {
-                debug!(target: "n42.h2.el", %err, "foreign body refused; sending the payload for this block");
+                // Said where a fleet's logs show it: a body that falls back
+                // costs the whole payload road, and a leg that fell back
+                // silently would be read as the body road's number.
+                warn!(target: "n42.h2.el", block = ?body.block_hash, %err, "foreign body refused; sending the payload for this block");
                 None
             }
         }

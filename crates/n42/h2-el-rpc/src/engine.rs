@@ -219,15 +219,24 @@ async fn read_build_frame(
 /// in its hint; if the fleet ends up proposing that block under another view
 /// the seal differs, the parent differs, and the request that arrives
 /// discards this build instead of taking it.
-fn start_chain(
-    chain: &std::sync::Arc<std::sync::Mutex<ChainState>>,
-    sealer: &ChainSealer,
+/// What a chain task needs to carry the chain on past its own build.
+#[derive(Clone)]
+struct ChainCtx {
+    chain: std::sync::Arc<std::sync::Mutex<ChainState>>,
+    sealer: ChainSealer,
     addr: std::net::SocketAddr,
+    /// The branch this task belongs to; a discard abandons it.
+    generation: u64,
+}
+
+fn start_chain(
+    ctx: &ChainCtx,
     built: &alloy_consensus::Header,
     built_with: &PayloadAttributes,
     view: u64,
-    generation: u64,
 ) {
+    let ChainCtx { chain, sealer, generation, .. } = ctx;
+    let generation = *generation;
     // Synchronous on purpose. It is called from the very task it starts, one
     // generation on, and an `async fn` that spawned its own future type
     // would be a future containing itself.
@@ -265,21 +274,10 @@ fn start_chain(
     let frame = n42_h2_execution::raw_engine::encode_build_on_own_chaining(&sealed, &attrs, Some(hint));
     let beacon_root = attrs.parent_beacon_block_root.unwrap_or_default();
     let (tx, answer) = tokio::sync::oneshot::channel();
-    let chain_for_task = std::sync::Arc::clone(chain);
-    let sealer_for_task = std::sync::Arc::clone(sealer);
+    let ctx = ctx.clone();
     let attrs_for_task = attrs.clone();
     tokio::spawn(async move {
-        let built = chain_request(
-            chain_for_task,
-            sealer_for_task,
-            addr,
-            frame,
-            attrs_for_task,
-            beacon_root,
-            next_view,
-            generation,
-        )
-        .await;
+        let built = chain_request(ctx, frame, attrs_for_task, beacon_root, next_view).await;
         // The receiver is gone when the build was discarded before it
         // finished; the block is dropped with it.
         let _ = tx.send(built);
@@ -295,16 +293,14 @@ fn start_chain(
 /// the proposal makes for the *previous* block is still being answered on
 /// that one when this goes out -- that overlap is the whole gain.
 async fn chain_request(
-    chain: std::sync::Arc<std::sync::Mutex<ChainState>>,
-    sealer: ChainSealer,
-    addr: std::net::SocketAddr,
+    ctx: ChainCtx,
     frame: Vec<u8>,
     attrs: PayloadAttributes,
     beacon_root: B256,
     view: u64,
-    generation: u64,
 ) -> Option<Result<BuiltBlock, ElError>> {
     use tokio::io::AsyncWriteExt;
+    let (chain, addr) = (std::sync::Arc::clone(&ctx.chain), ctx.addr);
     let spare = chain.lock().unwrap_or_else(std::sync::PoisonError::into_inner).spare.pop();
     let attempt: std::io::Result<(Option<Result<BuiltBlock, ElError>>, tokio::net::TcpStream)> = async {
         let mut conn = match spare {
@@ -326,9 +322,7 @@ async fn chain_request(
                     break None;
                 }
                 // This build has sealed: the one after it can start now.
-                BuildFrame::ChainHeader(header) => {
-                    start_chain(&chain, &sealer, addr, &header, &attrs, view, generation);
-                }
+                BuildFrame::ChainHeader(header) => start_chain(&ctx, &header, &attrs, view),
                 BuildFrame::Built(built) => break Some(*built),
             }
         };
@@ -1233,8 +1227,14 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
                     // before this one is encoded and sent (~30 ms and ~26 MB)
                     // and before the proposal that follows.
                     BuildFrame::ChainHeader(built) => {
-                        if let (Some(sealer), Some(chain)) = (sealer.as_ref(), chain) {
-                            start_chain(&chain_state, sealer, addr, &built, &attrs, chain.view, generation);
+                        if let (Some(sealer), Some(ahead)) = (sealer.as_ref(), chain) {
+                            let ctx = ChainCtx {
+                                chain: std::sync::Arc::clone(&chain_state),
+                                sealer: std::sync::Arc::clone(sealer),
+                                addr,
+                                generation,
+                            };
+                            start_chain(&ctx, &built, &attrs, ahead.view);
                         }
                     }
                     BuildFrame::Built(built) => {

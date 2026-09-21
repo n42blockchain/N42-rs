@@ -16,6 +16,7 @@ reth-transaction-pool.workspace = true
 reth-primitives-traits.workspace = true
 alloy-primitives.workspace = true
 parking_lot.workspace = true
+rayon.workspace = true
 tracing.workspace = true
 # Feature unification: the vendored reth-revm needs revm's serde when this
 # crate is built on its own, as bin/n42 enables it anyway.

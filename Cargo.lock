@@ -8386,6 +8386,7 @@ dependencies = [
  "alloy-consensus 2.4.1",
  "alloy-primitives 1.7.1",
  "parking_lot 0.12.5",
+ "rayon",
  "reth-ethereum-primitives",
  "reth-primitives-traits",
  "reth-transaction-pool",

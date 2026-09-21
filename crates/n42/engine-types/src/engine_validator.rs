@@ -237,6 +237,247 @@ where
     }
 }
 
+/// Why a compact body did not become a block.
+#[derive(Debug)]
+pub enum CompactBodyError {
+    /// This node does not hold every transaction the body names, even after
+    /// waiting for its ingest. Not a fault of the block: the caller asks for
+    /// the whole body and takes the ordinary road.
+    Missing {
+        /// How many of the block's hashes are not here.
+        missing: usize,
+        /// The first one, in block order, for the log line.
+        first: B256,
+        /// How long the wait for the ingest lasted.
+        waited: std::time::Duration,
+    },
+    /// The body is not the block it says it is. The caller must not vote on
+    /// it and must not go looking for a better copy of the same thing.
+    Invalid(NewPayloadError),
+}
+
+impl std::fmt::Display for CompactBodyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing { missing, first, waited } => write!(
+                f,
+                "compact body: {missing} transactions not held here (first {first}), waited {} ms",
+                waited.as_millis()
+            ),
+            Self::Invalid(err) => write!(f, "compact body: {err}"),
+        }
+    }
+}
+
+/// A block assembled from a compact body, with what the assembly cost.
+#[derive(Debug)]
+pub struct AssembledBlock {
+    /// The block, sealed and checked against the hash consensus voted on.
+    pub block: SealedBlock<EthBlock>,
+    /// The payload the engine's own pass takes, from the same parts.
+    pub payload: ExecutionData,
+    /// Every transaction's sender, as this node recorded it when it ingested
+    /// the transaction -- so the import does not look them up again.
+    pub senders: Vec<alloy_primitives::Address>,
+    /// Finding the transactions in the queue and unpacking them, without
+    /// the wait: the four timings are disjoint and sum to `total_us`.
+    pub assemble_us: u64,
+    /// The whole call, so a caller's line can name what the parts leave
+    /// over instead of hiding it.
+    pub total_us: u64,
+    /// Encoding them and building the transactions trie.
+    pub root_us: u64,
+    /// Waiting for the ingest to catch up on a first-pass miss.
+    pub miss_wait_us: u64,
+    /// How many of the hashes the first pass did not find.
+    pub misses: usize,
+}
+
+impl<ChainSpec> N42EngineValidator<ChainSpec>
+where
+    ChainSpec: EthChainSpec + EthereumHardforks + 'static,
+{
+    /// The block a *compact* body describes, assembled from this node's own
+    /// transaction queue (`N42_COMPACT_BODY`).
+    ///
+    /// The twin of [`Self::convert_body_to_block`] for a body that names its
+    /// transactions instead of carrying them. On a fleet where every node
+    /// ingests every transaction the follower has already decoded each of
+    /// them, verified its signature and recorded its sender before the block
+    /// exists; this finds them by hash and puts the block together, which is
+    /// what takes the 26 MB transfer, the 163,000-transaction decode and the
+    /// sender look-ups off the vote road (43 + 82 + 38 ms of a 240 ms
+    /// binding term, loop194 X2b).
+    ///
+    /// The checks are the ones the body road makes, against the same values:
+    ///
+    /// - the header profile, and the rewards against the header's
+    ///   withdrawals root (`decode_compact_body`);
+    /// - the block hash consensus voted on, against the keccak of the header
+    ///   bytes as they arrived and again against the sealed header;
+    /// - **the transactions root, recomputed over the list assembled here
+    ///   and compared with the header's.** On this road that is the whole
+    ///   binding between the hashes the body named and the block that was
+    ///   voted on: a reordered, duplicated or substituted list produces a
+    ///   different root and is refused here. It is not optional and it is not
+    ///   implied by anything else;
+    /// - reth's well-formedness checks for Shanghai, Cancun and Prague.
+    ///
+    /// A hash this node does not hold is not a fault: `miss_wait` is spent
+    /// letting the ingest land (it is a few milliseconds behind the leader's
+    /// block at most, and the queue's inbox is drained here rather than
+    /// waited for), and after it the caller is told to ask for the whole
+    /// body. Nothing is ever voted on that was not fully assembled and
+    /// root-checked.
+    pub fn convert_compact_body_to_block(
+        &self,
+        announced: B256,
+        profile: N42HeaderProfile,
+        compact: &[u8],
+        queue: &n42_tx_queue::TxQueue<crate::N42PooledTransaction>,
+        miss_wait: std::time::Duration,
+    ) -> Result<AssembledBlock, CompactBodyError> {
+        use alloy_eips::eip4895::Withdrawals;
+        use rayon::prelude::*;
+        use reth_transaction_pool::PoolTransaction as _;
+        let other = |message: String| CompactBodyError::Invalid(NewPayloadError::Other(message.into()));
+        if profile != self.profile {
+            return Err(other(format!(
+                "body read under the {profile:?} header profile, this chain is {:?}",
+                self.profile
+            )));
+        }
+        let started = std::time::Instant::now();
+        let body = n42_h2_consensus::decode_compact_body(compact, profile)
+            .map_err(|err| other(err.to_string()))?;
+        if body.block_hash != announced {
+            return Err(other(format!(
+                "body is block {} and not the announced {announced}",
+                body.block_hash
+            )));
+        }
+
+        // The transactions, out of this node's queue by the hashes the body
+        // names. Nothing is removed: the canonical prune is still what takes
+        // a block's transactions out of the queue, exactly as on the body
+        // road.
+        let lookup_at = std::time::Instant::now();
+        let mut held = queue.get_by_hashes(&body.hashes);
+        let first_pass = lookup_at.elapsed();
+        let mut misses: Vec<usize> =
+            held.iter().enumerate().filter(|(_, tx)| tx.is_none()).map(|(i, _)| i).collect();
+        let first_misses = misses.len();
+        let waited_at = std::time::Instant::now();
+        // A miss is usually this node's ingest being a few milliseconds
+        // behind the leader's block, so the inbox is drained and the misses
+        // asked for again rather than waited out.
+        while !misses.is_empty() && waited_at.elapsed() < miss_wait {
+            queue.drain_now();
+            let again: Vec<B256> = misses.iter().map(|&i| body.hashes[i]).collect();
+            let found = queue.get_by_hashes(&again);
+            let mut still = Vec::new();
+            for (slot, found) in misses.iter().copied().zip(found) {
+                match found {
+                    Some(tx) => held[slot] = Some(tx),
+                    None => still.push(slot),
+                }
+            }
+            misses = still;
+            if misses.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let miss_wait_us = if first_misses == 0 { 0 } else { waited_at.elapsed().as_micros() as u64 };
+        if let Some(&first) = misses.first() {
+            return Err(CompactBodyError::Missing {
+                missing: misses.len(),
+                first: body.hashes[first],
+                waited: waited_at.elapsed(),
+            });
+        }
+        let unzip_at = std::time::Instant::now();
+        let (transactions, senders): (Vec<TransactionSigned>, Vec<alloy_primitives::Address>) = held
+            .into_iter()
+            .map(|held| {
+                let held = held.expect("every hash resolved above");
+                let (tx, sender) = held.transaction.clone_into_consensus().into_parts();
+                (tx, sender)
+            })
+            .unzip();
+        let assemble_us = (first_pass + unzip_at.elapsed()).as_micros() as u64;
+
+        // What binds the assembled list to the header: the trie over the
+        // transactions' EIP-2718 encodings, against the root the producer
+        // sealed. The encodings are kept, because the payload the engine's
+        // own pass takes lists transactions in exactly that form.
+        let root_at = std::time::Instant::now();
+        let encoded: Vec<alloy_primitives::Bytes> = transactions
+            .par_iter()
+            .map(|tx| alloy_primitives::Bytes::from(alloy_eips::Encodable2718::encoded_2718(tx)))
+            .collect();
+        let transactions_root = crate::assembler::parallel_ordered_trie_root(&encoded);
+        let root_us = root_at.elapsed().as_micros() as u64;
+        if transactions_root != body.header.transactions_root {
+            return Err(CompactBodyError::Invalid(
+                PayloadError::BlockHash {
+                    execution: transactions_root,
+                    consensus: body.header.transactions_root,
+                }
+                .into(),
+            ));
+        }
+
+        let payload = n42_h2_consensus::execution_data_from_raw_parts(
+            body.block_hash,
+            &body.header,
+            encoded,
+            body.withdrawals.clone(),
+            body.bal.map(alloy_primitives::Bytes::copy_from_slice),
+        );
+        let withdrawals = body.header.withdrawals_root.map(|_| Withdrawals(body.withdrawals.clone()));
+        let block = alloy_consensus::Block {
+            header: body.header.clone(),
+            body: alloy_consensus::BlockBody { transactions, ommers: Vec::new(), withdrawals },
+        };
+        let sealed = SealedBlock::seal_slow(block);
+        if sealed.hash() != announced {
+            return Err(CompactBodyError::Invalid(
+                PayloadError::BlockHash { execution: sealed.hash(), consensus: announced }.into(),
+            ));
+        }
+        let timestamp = sealed.timestamp;
+        let checks = |err: PayloadError| CompactBodyError::Invalid(err.into());
+        reth_payload_validator::shanghai::ensure_well_formed_fields(
+            sealed.body(),
+            self.chain_spec.is_shanghai_active_at_timestamp(timestamp),
+        )
+        .map_err(checks)?;
+        reth_payload_validator::cancun::ensure_well_formed_fields(
+            &sealed,
+            payload.sidecar.cancun(),
+            self.chain_spec.is_cancun_active_at_timestamp(timestamp),
+        )
+        .map_err(checks)?;
+        reth_payload_validator::prague::ensure_well_formed_fields(
+            sealed.body(),
+            payload.sidecar.prague(),
+            self.chain_spec.is_prague_active_at_timestamp(timestamp),
+        )
+        .map_err(checks)?;
+        Ok(AssembledBlock {
+            block: sealed,
+            payload,
+            senders,
+            assemble_us,
+            root_us,
+            miss_wait_us,
+            misses: first_misses,
+            total_us: started.elapsed().as_micros() as u64,
+        })
+    }
+}
+
 impl<ChainSpec, Types> PayloadValidator<Types> for N42EngineValidator<ChainSpec>
 where
     ChainSpec: EthChainSpec + EthereumHardforks + 'static,
@@ -736,6 +977,246 @@ mod tests {
         // And the payload it hands back is the one the validator would have
         // sent, so the engine's own pass sees no difference.
         assert_eq!(format!("{rebuilt:?}"), format!("{payload:?}"));
+    }
+
+    /// A queue holding `transactions` under the senders given, the way a
+    /// node's ingest leaves them: this is what the compact body road
+    /// assembles a block out of.
+    fn queue_holding(
+        transactions: &[TransactionSigned],
+        senders: &[alloy_primitives::Address],
+    ) -> n42_tx_queue::TxQueue<crate::N42PooledTransaction> {
+        use alloy_eips::Encodable2718;
+        let queue = n42_tx_queue::TxQueue::<crate::N42PooledTransaction>::with_run_length(1)
+            .with_hash_index(1024);
+        queue.push(transactions.iter().zip(senders).map(|(tx, sender)| {
+            crate::N42PooledTransaction::new(
+                reth_primitives_traits::Recovered::new_unchecked(tx.clone(), *sender),
+                tx.encoded_2718().len(),
+            )
+        }));
+        queue.drain_now();
+        queue
+    }
+
+    /// The senders the queue is filled with: one per transaction, distinct,
+    /// so a block assembled out of the queue can be checked to carry the
+    /// queue's senders rather than anything the body claimed.
+    fn senders_for(transactions: &[TransactionSigned]) -> Vec<alloy_primitives::Address> {
+        (0..transactions.len()).map(|i| alloy_primitives::Address::repeat_byte(0x90 + i as u8)).collect()
+    }
+
+    /// A transaction of this chain that is not in the block under test.
+    fn other_transaction() -> TransactionSigned {
+        use alloy_consensus::{Signed, TxEip1559};
+        use alloy_primitives::{Address, Signature, TxKind};
+        let tx = TxEip1559 {
+            chain_id: 1,
+            nonce: 9,
+            gas_limit: 21_000,
+            max_fee_per_gas: 10_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            to: TxKind::Call(Address::repeat_byte(0x77)),
+            value: U256::from(9),
+            ..Default::default()
+        };
+        TransactionSigned::Eth(
+            alloy_consensus::TxEnvelope::Eip1559(Signed::new_unchecked(
+                tx,
+                Signature::test_signature(),
+                B256::repeat_byte(0x99),
+            ))
+            .into(),
+        )
+    }
+
+    /// A transaction as this node's ingest holds it: decoded from the bytes
+    /// it arrived in, so its hash is the hash of those bytes. The fixtures
+    /// above are built with a made-up cached hash, which is fine for a
+    /// decode-against-decode comparison and not for a road that finds a
+    /// transaction *by* its hash.
+    fn as_ingested(tx: &TransactionSigned) -> TransactionSigned {
+        use alloy_eips::{Decodable2718, Encodable2718};
+        TransactionSigned::decode_2718_exact(&tx.encoded_2718()).expect("its own encoding decodes")
+    }
+
+    /// A block, its hash, the gov5 body and the payload, as
+    /// `a_body_converts_to_the_block_the_payload_conversion_produces`
+    /// builds them.
+    fn mixed_block() -> (Header, B256, Bytes, ExecutionData, Vec<TransactionSigned>) {
+        use alloy_eips::Encodable2718;
+        let transactions: Vec<TransactionSigned> = mixed_transactions().iter().map(as_ingested).collect();
+        let raw: Vec<Bytes> = transactions.iter().map(|tx| Bytes::from(tx.encoded_2718())).collect();
+        let mut header = gov5_header(B256::ZERO, U256::ZERO);
+        header.transactions_root = alloy_consensus::proofs::calculate_transaction_root(&transactions);
+        header.gas_used = 63_000;
+        let withdrawals = vec![alloy_eips::eip4895::Withdrawal {
+            index: 0,
+            validator_index: 0,
+            address: alloy_primitives::Address::repeat_byte(0x55),
+            amount: 1_000_000_000,
+        }];
+        header.withdrawals_root =
+            Some(n42_h2_consensus::gov5_rewards_root(n42_h2_consensus::withdrawals_to_rewards(&withdrawals)));
+        let mut payload =
+            n42_h2_consensus::execution_data_from_raw_parts(B256::ZERO, &header, raw, withdrawals, None);
+        let hash = header.hash_slow();
+        payload.payload.as_v1_mut().block_hash = hash;
+        let body = body_for(&payload, &header);
+        (header, hash, body, payload, transactions)
+    }
+
+    fn hashes_of(transactions: &[TransactionSigned]) -> Vec<B256> {
+        use alloy_consensus::transaction::TxHashRef;
+        transactions.iter().map(|tx| *tx.tx_hash()).collect()
+    }
+
+    /// Long enough that a test never trips over a scheduling hiccup, short
+    /// enough that the missing-transaction tests stay instant.
+    const SHORT_WAIT: std::time::Duration = std::time::Duration::from_millis(5);
+
+    /// The whole point of the compact body: a block assembled out of this
+    /// node's queue from the hashes the body named is the block the
+    /// foreign-body road decodes from the same block's bytes -- same hash,
+    /// same header, same transactions -- for every transaction type this
+    /// chain carries, and its senders are the queue's.
+    #[test]
+    fn a_compact_body_assembles_the_block_the_body_road_decodes() {
+        let (_, hash, body, payload, transactions) = mixed_block();
+        let senders = senders_for(&transactions);
+        let queue = queue_holding(&transactions, &senders);
+        let compact = n42_h2_consensus::encode_compact_body(
+            &body,
+            &hashes_of(&transactions),
+            N42HeaderProfile::Gov5H2,
+        )
+        .expect("encodes");
+
+        let validator = validator(N42HeaderProfile::Gov5H2);
+        let (from_body, body_payload) = validator
+            .convert_body_to_block(hash, N42HeaderProfile::Gov5H2, &body)
+            .expect("the body converts");
+        let assembled = validator
+            .convert_compact_body_to_block(hash, N42HeaderProfile::Gov5H2, &compact, &queue, SHORT_WAIT)
+            .expect("the compact body assembles");
+
+        assert_eq!(assembled.block.hash(), from_body.hash());
+        assert_eq!(assembled.block.hash(), hash);
+        assert_eq!(assembled.block.header(), from_body.header());
+        assert_eq!(assembled.block.body().transactions, from_body.body().transactions);
+        assert_eq!(assembled.block.body().withdrawals, from_body.body().withdrawals);
+        assert_eq!(assembled.senders, senders);
+        assert_eq!(assembled.misses, 0);
+        // And the payload both roads hand the engine is the same one.
+        assert_eq!(format!("{:?}", assembled.payload), format!("{body_payload:?}"));
+        assert_eq!(format!("{:?}", assembled.payload), format!("{payload:?}"));
+    }
+
+    /// A hash list that is not the block's is refused by the transactions
+    /// root, which is the only thing binding the list to the header.
+    #[test]
+    fn a_hash_list_that_is_not_the_blocks_is_refused_by_the_root() {
+        let (_, hash, body, _, transactions) = mixed_block();
+        let senders = senders_for(&transactions);
+        // A fourth transaction the queue holds and the block does not, so
+        // "a hash the assembler can resolve" and "a hash of this block" are
+        // told apart.
+        let mut held = transactions.clone();
+        held.push(as_ingested(&other_transaction()));
+        let mut held_senders = senders.clone();
+        held_senders.push(alloy_primitives::Address::repeat_byte(0xC1));
+        let queue = queue_holding(&held, &held_senders);
+        let validator = validator(N42HeaderProfile::Gov5H2);
+        let hashes = hashes_of(&transactions);
+        let outsider = hashes_of(&held)[3];
+
+        let mut reordered = hashes.clone();
+        reordered.swap(0, 1);
+        let mut duplicated = hashes.clone();
+        duplicated[2] = duplicated[0];
+        let mut substituted = hashes.clone();
+        substituted[1] = outsider;
+        for (what, list) in
+            [("reordered", reordered), ("duplicated", duplicated), ("substituted", substituted)]
+        {
+            let compact = n42_h2_consensus::encode_compact_body(&body, &list, N42HeaderProfile::Gov5H2)
+                .expect("encodes");
+            let refused = validator
+                .convert_compact_body_to_block(hash, N42HeaderProfile::Gov5H2, &compact, &queue, SHORT_WAIT)
+                .expect_err(what);
+            assert!(
+                matches!(refused, CompactBodyError::Invalid(_)),
+                "a {what} list is the block being wrong, not a miss: {refused}"
+            );
+        }
+    }
+
+    /// A hash this node does not hold is a miss, not a fault: the caller is
+    /// told how many and asks for the whole body.
+    #[test]
+    fn a_hash_the_queue_does_not_hold_is_a_miss() {
+        let (_, hash, body, _, transactions) = mixed_block();
+        let senders = senders_for(&transactions);
+        // Everything but the last transaction.
+        let queue = queue_holding(&transactions[..2], &senders[..2]);
+        let compact = n42_h2_consensus::encode_compact_body(
+            &body,
+            &hashes_of(&transactions),
+            N42HeaderProfile::Gov5H2,
+        )
+        .expect("encodes");
+        let validator = validator(N42HeaderProfile::Gov5H2);
+        match validator
+            .convert_compact_body_to_block(hash, N42HeaderProfile::Gov5H2, &compact, &queue, SHORT_WAIT)
+            .expect_err("one transaction is not held here")
+        {
+            CompactBodyError::Missing { missing, first, .. } => {
+                assert_eq!(missing, 1);
+                assert_eq!(first, hashes_of(&transactions)[2]);
+            }
+            other => panic!("a miss, not {other}"),
+        }
+        // A queue that keeps no index at all is every hash missing, never a
+        // wrong block.
+        let blind = n42_tx_queue::TxQueue::<crate::N42PooledTransaction>::with_run_length(1);
+        assert!(matches!(
+            validator
+                .convert_compact_body_to_block(hash, N42HeaderProfile::Gov5H2, &compact, &blind, SHORT_WAIT)
+                .expect_err("nothing is held"),
+            CompactBodyError::Missing { missing: 3, .. }
+        ));
+    }
+
+    /// The announced hash and the header profile are checked before
+    /// anything is looked up, exactly as on the body road.
+    #[test]
+    fn a_compact_body_that_is_not_the_announced_block_is_refused() {
+        let (_, hash, body, _, transactions) = mixed_block();
+        let senders = senders_for(&transactions);
+        let queue = queue_holding(&transactions, &senders);
+        let compact = n42_h2_consensus::encode_compact_body(
+            &body,
+            &hashes_of(&transactions),
+            N42HeaderProfile::Gov5H2,
+        )
+        .expect("encodes");
+        let validator = validator(N42HeaderProfile::Gov5H2);
+        assert!(validator
+            .convert_compact_body_to_block(
+                B256::repeat_byte(0xEE),
+                N42HeaderProfile::Gov5H2,
+                &compact,
+                &queue,
+                SHORT_WAIT,
+            )
+            .is_err());
+        assert!(validator
+            .convert_compact_body_to_block(hash, N42HeaderProfile::Ethereum, &compact, &queue, SHORT_WAIT)
+            .is_err());
+        // And a full gov5 body is not a compact one.
+        assert!(validator
+            .convert_compact_body_to_block(hash, N42HeaderProfile::Gov5H2, &body, &queue, SHORT_WAIT)
+            .is_err());
     }
 
     #[test]

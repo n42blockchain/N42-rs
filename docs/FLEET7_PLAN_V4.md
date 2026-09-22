@@ -1213,5 +1213,19 @@ Four sizes at four nodes (tenure 256; each size paced near 0.9x its cycle; windo
   1M at any block size means the three per-transaction chains (1-3 of the table) cut by ~40% together; nothing in the
   fixed part is worth more than 5% of the way.
 
+### 5.3 Attempt B, falsified on the bench: verification is a relocation, not a saving
+
+`plan-v5/supply-off-followers` (merged, `N42_INGEST_VERIFY=leader` off by default): followers queue a transaction under
+the sender its frame claims, the builder verifies what it includes in batches, the vote road verifies every claimed
+sender itself and compares. The bench (`n42-tx-types/tests/road_senders`, 163,000 transactions, 16 threads): 0x50
+batch verification **132-135 ms** (13.0 us of CPU a transaction; one at a time 379), secp256k1 recovery 308-310; the
+ingest's own cost with verification off 0.72 us (0x50) / 0.16 (secp256k1). The bar was 25 ms (2.45 us a
+transaction); the cheapest signature is 5.3x that. And the arithmetic: the ingest gives back 550k/s x 13 us = 7.2
+cores a node, and the road takes +132 ms on a B of 217 in a 252 ms cycle -- a third off the rate before the cores do
+anything. Every node verifies each transaction once either way; B moves that work from a background pool onto the
+binding path. Not run on the fleet: the bench and the arithmetic agree and are not close. What does clear the bar is a
+cheaper signature -- aggregation -- and, as configuration, the ingest's pool made smaller and lower-priority so it
+contends less with the import (`N42_TX_INGEST_RECOVER_PARALLEL`, `N42_TX_INGEST_RECOVER_NICE`): loop217.
+
 Each attempt is one agent brief and one runner; the bar for adopting any is the same as plan v4's: window 2 in every leg,
 verify 4/4, and the number it targets moving on the fleet, not on a bench.

@@ -532,6 +532,23 @@ fn refuse_stale_parent() -> bool {
     *ON.get_or_init(|| std::env::var("N42_BUILD_REFUSE_STALE_PARENT").is_ok_and(|v| v == "1"))
 }
 
+/// Whether a build for a height the chain has already committed is
+/// cancelled before it takes anything from the queue;
+/// `N42_BUILD_SKIP_DECIDED=0` turns it off.
+///
+/// Such a build cannot produce a payload anyone will ask for -- the height
+/// is decided -- and what it does instead is harmful. loop214 Pd node2 ran
+/// three at once for heights 637-639 while 635-638 were already committed:
+/// each took a block's worth out of the queue, each stood on a block of its
+/// own that consensus replaced, and each then refused a sender's run as
+/// behind the chain on the strength of that state. Twenty-nine senders were
+/// left with their account at nonce 0 and their lane starting at 64, 192 or
+/// 320, and the node built eighteen empty blocks over a queue of 400,000.
+fn skip_decided_builds() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_BUILD_SKIP_DECIDED").map_or(true, |v| v != "0"))
+}
+
 /// At most one line a second per call site, so a defect that repeats every
 /// build does not become a line every 250 ms.
 fn say_once_a_second(last: &std::sync::atomic::AtomicU64) -> bool {
@@ -769,6 +786,22 @@ where
     // block, canonical and committed before the build ran. Counted so a leg
     // can say whether the case exists; acted on only under
     // `N42_BUILD_REFUSE_STALE_PARENT`.
+    // A height the chain has already committed: nothing will ask for this
+    // payload, and building it costs a block's worth of the queue and a
+    // build's worth of verdicts about a state consensus did not keep. Taken
+    // before anything is selected, so the queue is not touched at all.
+    if skip_decided_builds() && crate::canonical_head::already_decided(parent_header.number + 1) {
+        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if say_once_a_second(&LAST) {
+            tracing::info!(
+                target: "payload_builder",
+                number = parent_header.number + 1,
+                head = crate::canonical_head::number(),
+                "a build for a height the chain has already decided was cancelled"
+            );
+        }
+        return Ok(BuildOutcome::Cancelled);
+    }
     let pruned_through = n42_tx_queue::global::<Pool::Transaction>().map_or(0, |queue| queue.pruned_through());
     let parent_behind = pruned_through > parent_header.number;
     if parent_behind {

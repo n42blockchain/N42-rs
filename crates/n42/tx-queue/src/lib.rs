@@ -158,8 +158,31 @@ fn run_length() -> usize {
     })
 }
 
-/// The by-hash index's bound, when one is kept: `N42_COMPACT_BODY=1` turns
-/// it on and `N42_COMPACT_BODY_INDEX` sets the bound.
+/// `N42_COMPACT_BODY`, read once: the compact block body assembles a block
+/// out of the by-hash index.
+fn compact_body() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_COMPACT_BODY").is_ok_and(|v| v == "1"))
+}
+
+/// `N42_SENDERS_FROM_QUEUE`, read once: a follower takes the senders of a
+/// foreign block out of the by-hash index instead of looking each one up in
+/// the recovery caches. The whole block arrives as it always did; only the
+/// senders come from here.
+///
+/// Read in this crate because the index it needs is this crate's, and the
+/// follower's import asks the same function: one flag, one reading of the
+/// environment, no way for the two to disagree about whether the index is
+/// being kept.
+pub fn senders_from_queue() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_SENDERS_FROM_QUEUE").is_ok_and(|v| v == "1"))
+}
+
+/// The by-hash index's bound, when one is kept: `N42_COMPACT_BODY=1` or
+/// `N42_SENDERS_FROM_QUEUE=1` turns it on and `N42_COMPACT_BODY_INDEX` sets
+/// the bound. Either reader wants the same index over the same window, so
+/// they share the bound as well as the switch.
 ///
 /// The default holds about six full blocks at the bench tier, against a pool
 /// the bench sizes at four (loop194 X2): the index must comfortably outlast
@@ -170,7 +193,7 @@ fn run_length() -> usize {
 fn hash_index_capacity() -> Option<usize> {
     static CAP: OnceLock<Option<usize>> = OnceLock::new();
     *CAP.get_or_init(|| {
-        if !std::env::var("N42_COMPACT_BODY").is_ok_and(|v| v == "1") {
+        if !(compact_body() || senders_from_queue()) {
             return None;
         }
         Some(
@@ -306,6 +329,16 @@ impl<T: PoolTransaction> HashIndex<T> {
         self.shard_of(hash).read().by_hash.get(hash).cloned()
     }
 
+    /// The sender alone, copied out under the read lock.
+    ///
+    /// Deliberately not `get(..).map(..)`: that clones the `Arc` -- a write
+    /// to a refcount 163,000 times, on a line sixteen workers share with
+    /// the ingest -- to read twenty bytes and drop it again. Here nothing
+    /// leaves the index but the address.
+    fn sender_of(&self, hash: &B256) -> Option<Address> {
+        self.shard_of(hash).read().by_hash.get(hash).map(|held| held.transaction.sender())
+    }
+
     fn len(&self) -> usize {
         self.shards.iter().map(|shard| shard.read().by_hash.len()).sum()
     }
@@ -398,6 +431,19 @@ impl<T: PoolTransaction> TxQueue<T> {
         };
         use rayon::prelude::*;
         hashes.par_iter().map(|hash| index.get(hash)).collect()
+    }
+
+    /// The sender this node recorded for `hash` when the transaction came
+    /// in, or `None` where the index does not hold it -- no index kept, the
+    /// transaction never reached this node, it is still in the inbox, or it
+    /// has been evicted.
+    ///
+    /// The sender is this node's own recovery from the signature (the
+    /// ingest's, the pool's, or a reverted block's), never a peer's word for
+    /// it: nothing puts a transaction in this queue without having recovered
+    /// its sender first. Copies nothing but the address.
+    pub fn sender_of(&self, hash: &B256) -> Option<Address> {
+        self.by_hash.as_ref().and_then(|index| index.sender_of(hash))
     }
 
     /// [`Self::get_by_hashes`], handing back what a block's assembly
@@ -1327,6 +1373,29 @@ mod tests {
         assert!(found[0].is_some(), "the build's transaction is still findable");
         assert!(found[1].is_some(), "and so is the held block's");
         assert_eq!(queue.hash_index_len(), 2);
+    }
+
+    /// The sender look-up the follower's import uses: the address this node
+    /// recorded when the transaction arrived, for what the index holds, and
+    /// a plain miss for everything else -- a transaction that never came
+    /// this way, and a queue that keeps no index at all.
+    #[test]
+    fn the_index_hands_back_the_sender_it_recorded() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(1).with_hash_index(64);
+        let sender = Address::repeat_byte(3);
+        let one = tx_hashed(sender, 0);
+        let hash = *one.hash();
+        let elsewhere = *tx_hashed(Address::repeat_byte(4), 0).hash();
+        queue.push(vec![one]);
+        queue.drain_now();
+
+        assert_eq!(queue.sender_of(&hash), Some(sender), "the sender the ingest recovered");
+        assert_eq!(queue.sender_of(&elsewhere), None, "and a miss for one that never came this way");
+
+        let without: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(1);
+        without.push(vec![tx_hashed(sender, 0)]);
+        without.drain_now();
+        assert_eq!(without.sender_of(&hash), None, "a queue without an index misses everything");
     }
 
     /// The index is a cache: what it does not hold is a miss, never a wrong

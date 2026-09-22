@@ -862,10 +862,17 @@ pub struct VoteRoad {
     pub started: std::time::Instant,
 }
 
-/// What the import itself spent on the road, in microseconds. Carried whole
-/// so a part added here reaches the line without another argument.
+/// What the import itself spent on the road, in microseconds -- with the one
+/// exception named below. Carried whole so a part added here reaches the line
+/// without another argument.
 #[derive(Debug, Clone, Copy, Default)]
 struct RoadPhases {
+    /// Not a duration: how many of the block's senders came out of the
+    /// transaction queue's by-hash index rather than a cache look-up or a
+    /// recovery (`N42_SENDERS_FROM_QUEUE`). It rides here because it belongs
+    /// beside `senders_us` on the line, and it is left out of the sum the
+    /// line's `other_ms` is made from.
+    senders_indexed: u64,
     /// The header and body consensus checks, and before the deferred fork the
     /// parent lookup ahead of them.
     header_us: u64,
@@ -923,6 +930,7 @@ fn log_vote_road(road: VoteRoad, number: u64, txs: usize, phases: RoadPhases) {
         filled = road.filled,
         header_ms = phases.header_us / 1000,
         senders_ms = phases.senders_us / 1000,
+        senders_indexed = phases.senders_indexed,
         parent_wait_ms = phases.parent_wait_us / 1000,
         check_ms = phases.check_us / 1000,
         fields_ms = phases.fields_us / 1000,
@@ -930,6 +938,49 @@ fn log_vote_road(road: VoteRoad, number: u64, txs: usize, phases: RoadPhases) {
         total_ms = total / 1000,
         "vote road"
     );
+}
+
+/// The senders this node's transaction queue holds for `txs`, by hash, and
+/// `None` wherever it holds none. One parallel pass; the block's hashes are
+/// already computed, so it reads a hash off each transaction and a shard of
+/// the index, and copies out an address.
+///
+/// Why the queue's sender may be taken as the transaction's: nothing enters
+/// this queue without this node having recovered its sender from the
+/// signature -- the ingest's batch verification, the pool's validation, or a
+/// reverted block's own recovered senders. A wrong sender here would be a
+/// wrong sender in the ingest, and the same wrong sender would already be in
+/// the block the ingest's own node built.
+///
+/// What catches one all the same: `check_includable`, which reads each
+/// sender's account and refuses a block whose nonces do not continue the
+/// chain's -- a sender invented here has the wrong nonce almost surely, and
+/// the vote is not released until that check has passed. The block's hash
+/// and transactions root bind the *transactions* to the header the members
+/// voted on; they say nothing about senders, so the nonce check is the one
+/// that does.
+///
+/// A miss costs a fall back to the caches and a recovery, never correctness:
+/// the index is a cache, and the ingest running a few milliseconds behind
+/// the block, or a transaction that never came through this node at all, is
+/// an ordinary miss.
+fn senders_in_queue(
+    queue: &n42_tx_queue::TxQueue<n42_engine_types::N42PooledTransaction>,
+    txs: &[&TransactionSigned],
+) -> Vec<Option<Address>> {
+    use rayon::prelude::*;
+    txs.par_iter().map(|tx| queue.sender_of(tx.tx_hash())).collect()
+}
+
+/// The queue to take senders from on a foreign block's road, when
+/// `N42_SENDERS_FROM_QUEUE=1` and this node keeps a by-hash index (the queue
+/// itself is `N42_TX_QUEUE`). `None` and the senders are looked up as they
+/// always were.
+fn queue_for_senders() -> Option<n42_tx_queue::TxQueue<n42_engine_types::N42PooledTransaction>> {
+    if !n42_tx_queue::senders_from_queue() {
+        return None;
+    }
+    n42_tx_queue::global::<n42_engine_types::N42PooledTransaction>().filter(|queue| queue.has_hash_index())
 }
 
 /// Executes and checks `sealed` on its parent's state. See the module docs.
@@ -1023,7 +1074,24 @@ where
             let cache_hits = std::sync::atomic::AtomicU64::new(0);
             let alt_cache = n42_tx_types::AltSigSenderCache::global();
             let txs: Vec<&TransactionSigned> = sealed.body().transactions().collect();
-            let mut senders: Vec<Option<Address>> = {
+            // The transaction queue's by-hash index first, where it is kept:
+            // every transaction of a block this node's ingest has already
+            // seen sits there with the sender that ingest recovered, and
+            // reading one is a shard's read lock rather than a look-up in a
+            // cache sixteen other threads are writing to (34 ms a block on
+            // the fleet at 163,000 transactions, loop202). See
+            // [`senders_in_queue`] for why it may be trusted and what would
+            // catch it if it could not be.
+            let indexed: Vec<Option<Address>> =
+                queue_for_senders().map_or_else(Vec::new, |queue| senders_in_queue(&queue, &txs));
+            let from_index = indexed.iter().flatten().count();
+            phases.senders_indexed = from_index as u64;
+            let mut senders: Vec<Option<Address>> = if from_index == tx_count {
+                // Nothing left to look up: the pass below would walk 33 MB
+                // of transactions to read a discriminant per transaction and
+                // decide it already has the answer.
+                indexed
+            } else {
                 use rayon::prelude::*;
                 // Collected into a `Vec<Result>` (written in place) and checked after:
                 // a parallel collect straight into `Result<Vec>` takes rayon's
@@ -1031,16 +1099,24 @@ where
                 // (round 43, `bench_convert_payload`).
                 let looked_up: Vec<Result<Option<Address>, String>> = txs
                     .par_iter()
-                    .map(|tx| match tx {
-                        TransactionSigned::AltSig(alt) => Ok(alt_cache.get(alt.hash()).inspect(|_| {
-                            cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        })),
-                        TransactionSigned::Eth(_) => {
-                            if let Some(sender) = senders_cache.and_then(|cache| cache.get(tx.tx_hash())) {
+                    .enumerate()
+                    .map(|(at, tx)| {
+                        if let Some(sender) = indexed.get(at).copied().flatten() {
+                            return Ok(Some(sender));
+                        }
+                        match tx {
+                            TransactionSigned::AltSig(alt) => Ok(alt_cache.get(alt.hash()).inspect(|_| {
                                 cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                return Ok(Some(sender));
+                            })),
+                            TransactionSigned::Eth(_) => {
+                                if let Some(sender) = senders_cache.and_then(|cache| cache.get(tx.tx_hash())) {
+                                    cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    return Ok(Some(sender));
+                                }
+                                tx.recover_signer()
+                                    .map(Some)
+                                    .map_err(|err| format!("sender of {}: {err}", tx.tx_hash()))
                             }
-                            tx.recover_signer().map(Some).map_err(|err| format!("sender of {}: {err}", tx.tx_hash()))
                         }
                     })
                     .collect();
@@ -2055,11 +2131,51 @@ mod tests {
         }
     }
 
-    /// The two vote roads on the bench's block shape, side by side: today's
+    /// The pass the follower's import runs first with
+    /// `N42_SENDERS_FROM_QUEUE` on: every transaction this node's ingest
+    /// queued answers with the sender it recovered, and one that never came
+    /// this way answers `None` -- the miss that sends the import back to the
+    /// caches for that position and nothing else. The environment is not
+    /// read here: the queue is handed in, as the import hands in the one it
+    /// found.
+    #[test]
+    fn the_index_answers_the_senders_it_holds() {
+        use alloy_eips::Encodable2718;
+        let (block, _) = bench_fixture(4, 3, 16, 1);
+        let txs: Vec<TransactionSigned> = block.body().transactions.clone();
+        let senders: Vec<Address> = block.senders().to_vec();
+        let queue =
+            n42_tx_queue::TxQueue::<n42_engine_types::N42PooledTransaction>::with_run_length(4).with_hash_index(64);
+        // All but the last, so the block holds one transaction this node
+        // never saw -- the ingest a few milliseconds behind the leader.
+        let last = txs.len() - 1;
+        queue.push(txs.iter().zip(&senders).take(last).map(|(tx, sender)| {
+            n42_engine_types::N42PooledTransaction::new(
+                reth_primitives_traits::Recovered::new_unchecked(tx.clone(), *sender),
+                tx.encoded_2718().len(),
+            )
+        }));
+        queue.drain_now();
+
+        let refs: Vec<&TransactionSigned> = txs.iter().collect();
+        let found = senders_in_queue(&queue, &refs);
+        assert_eq!(found.len(), txs.len(), "one answer per transaction, in the block's order");
+        for (at, got) in found.iter().enumerate() {
+            if at == last {
+                assert_eq!(*got, None, "the one that never reached this node");
+            } else {
+                assert_eq!(*got, Some(senders[at]), "the sender this node recovered");
+            }
+        }
+    }
+
+    /// The vote roads on the bench's block shape, side by side: today's
     /// gossip body (decode the block out of 26 MB, then look every sender
     /// up) against the compact body (find the block's transactions in this
     /// node's queue by hash, then recompute the transactions root over what
-    /// was found).
+    /// was found) -- and, between them, the body road with only its senders
+    /// taken from the queue's index (`N42_SENDERS_FROM_QUEUE`), which copies
+    /// no transaction at all.
     ///
     /// Pinned the way a fleet node runs: `RAYON_NUM_THREADS=16 taskset -c
     /// 0-31 cargo test --release -p n42 --lib bench_compact_body_road --
@@ -2244,6 +2360,28 @@ mod tests {
                 .count();
             let senders_ms = ms(senders_at);
 
+            // The same road with the senders taken from the queue's by-hash
+            // index instead (`N42_SENDERS_FROM_QUEUE`): the same block, the
+            // same order, and only the sender pass changes. The reference
+            // list is collected outside the measurement, as the import has
+            // it before its pass begins.
+            //
+            // Over the fixture's own transactions rather than the decoded
+            // ones: a fixture transaction is signed `new_unchecked` with a
+            // random hash, so decoding it computes a hash the queue has
+            // never seen and every look-up would miss for a reason no node
+            // has. On a node the two are the same transaction and the same
+            // hash, which is what the compact road's `hashes` assume too.
+            let refs: Vec<&TransactionSigned> = txs.iter().collect();
+            let index_at = std::time::Instant::now();
+            let from_index = senders_in_queue(&queue, &refs);
+            let index_ms = ms(index_at);
+            let indexed = from_index.iter().flatten().count();
+            assert!(
+                from_index.iter().zip(&senders).all(|(got, want)| got.is_none_or(|got| got == *want)),
+                "what the index holds is the sender the ingest recovered",
+            );
+
             // The compact road: the hashes looked up in the queue, the
             // transactions root recomputed over what came back, and the
             // block put together from it.
@@ -2261,7 +2399,7 @@ mod tests {
             assert_eq!(assembled.block.hash(), decoded.hash(), "the two roads are the same block");
             assert_eq!(assembled.senders, senders, "and the senders are the queue's");
             println!(
-                "round {round}: body decode {decode_ms:.1} + senders {senders_ms:.1} (cached {filled},                  found {found}) = {:.1} | compact {compact_ms:.1} = assemble {:.1} + root {:.1} +                  rest {:.1}, misses {}",
+                "round {round}: body decode {decode_ms:.1} + senders {senders_ms:.1} (cached {filled},                  found {found}) = {:.1} | from the index {index_ms:.1} (indexed {indexed}) | compact {compact_ms:.1} = assemble {:.1} + root {:.1} +                  rest {:.1}, misses {}",
                 decode_ms + senders_ms,
                 assembled.assemble_us as f64 / 1000.0,
                 assembled.root_us as f64 / 1000.0,

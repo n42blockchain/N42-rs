@@ -487,7 +487,8 @@ fn main() {
                                     // One walk for both: the (sender, nonce)
                                     // pairs the lanes are pruned by, and the
                                     // hashes the by-hash index is pruned by
-                                    // (`N42_COMPACT_BODY`; nothing will ever
+                                    // (`N42_COMPACT_BODY` or
+                                    // `N42_SENDERS_FROM_QUEUE`; nothing will ever
                                     // name a committed block's transactions
                                     // again, and an index that carries them
                                     // until its bound reaches them evicts

@@ -748,10 +748,10 @@ where
     // unusable -- lanes parked behind a hole, or emptied -- and loop207's
     // defect 13 was the second: `queued=334-360k` on every build while the
     // leader proposed empty blocks. One walk of the lanes, once a build.
-    let queue_depth = || -> (usize, usize) {
+    let queue_depth = || -> (usize, usize, usize) {
         match n42_tx_queue::global::<Pool::Transaction>() {
-            Some(queue) => (queue.len(), queue.usable()),
-            None => (0, 0),
+            Some(queue) => (queue.len(), queue.usable(), queue.parked().1),
+            None => (0, 0, 0),
         }
     };
     let puller = builder_puller();
@@ -1104,27 +1104,47 @@ where
                     for i in run.skipped {
                         deferred.push(Arc::clone(&cands[i]));
                     }
-                    // Why each skipped sender's head was refused, read once
-                    // from the parent's state so the give-back below can say
-                    // it. Handing every skipped candidate back with
-                    // `ExceedsGasLimit` tells the queue nothing, and its
-                    // lowest nonce is what the next build is offered first:
-                    // on loop207 Pb node3 the same 256-512 candidates were
-                    // skipped on all 63 builds of the tenure (`refused[6]`
-                    // +1 a build, `par_skipped` flat), and on Ob node1 the
-                    // skipped set grew 2,880 -> 163,000 over twenty blocks
-                    // until every block was empty with 334-360k queued.
-                    // A stale head lets the queue drop it and everything
-                    // below, so the lane is usable at the *next* build; a
-                    // head above the account's nonce parks the lane
-                    // (`n42_tx_queue::Parked`) so the budget goes to lanes
-                    // that can execute.
+                    // Why each skipped sender's head was refused, so the
+                    // give-back below can say it. Handing every skipped
+                    // candidate back with `ExceedsGasLimit` tells the queue
+                    // nothing, and its lowest nonce is what the next build
+                    // is offered first: on loop207 Pb node3 the same 256-512
+                    // candidates were skipped on all 63 builds of the tenure
+                    // (`refused[6]` +1 a build, `par_skipped` flat), and on
+                    // Ob node1 the skipped set grew 2,880 -> 163,000 over
+                    // twenty blocks until every block was empty with
+                    // 334-360k queued. A stale head lets the queue drop it
+                    // and everything below, so the lane is usable at the
+                    // *next* build; a head above the account's nonce parks
+                    // the lane (`n42_tx_queue::Parked`) so the budget goes
+                    // to lanes that can execute.
                     //
-                    // One account read per skipped sender, off the warm
-                    // reads the step just made, and only when something was
-                    // skipped at all; bounded because a pathological build
-                    // skips every sender it was offered.
+                    // Read from *this block's* state, not the parent's, and
+                    // that distinction is the whole correctness of the
+                    // thing. The parallel step drops a sender's whole run
+                    // from wherever it first failed, and the common reason
+                    // is not a hole at all: a batch's view of a sender lacks
+                    // what other groups credit it in the same block, so the
+                    // run stops part-way and the rest is left to the serial
+                    // loop. Those heads sit exactly `k` above the *parent's*
+                    // nonce, where `k` is what this block already executed
+                    // for that sender -- against the parent they look
+                    // gapped, against the block they are the next nonce.
+                    // Reading the parent parked them all: loop209 Pa node3
+                    // parked its whole lane set over two such builds
+                    // (`par_skipped=144000`, then `145936`), its depth stuck
+                    // at 569,520 with `usable=0`, the ingest gate shut on
+                    // the parked depth, and the node proposed empty blocks
+                    // for fifteen seconds until its tenure ended. The graft
+                    // is installed by here, so the builder's own database is
+                    // the block's state.
+                    //
+                    // One account read per skipped sender, off reads the
+                    // step just made, and only when something was skipped at
+                    // all; bounded because a pathological build skips every
+                    // sender it was offered.
                     const DIAGNOSE_MAX: usize = 1024;
+                    let db = builder.executor.evm_mut().db_mut();
                     for pool_tx in &deferred {
                         if skipped_heads.len() >= DIAGNOSE_MAX {
                             break;
@@ -1133,9 +1153,25 @@ where
                         if skipped_heads.contains_key(&sender) {
                             continue;
                         }
-                        let account = reth_storage_api::AccountReader::basic_account(&state_provider, &sender);
-                        if let Ok(account) = account {
-                            skipped_heads.insert(sender, (pool_tx.nonce(), account.map_or(0, |a| a.nonce)));
+                        // The graft writes the block's accounts into the
+                        // bundle, and into the state's cache only when
+                        // something after it may read them (`keep_cache`
+                        // above) -- which for a block that seals early is
+                        // nothing at all. So the bundle first, and the
+                        // database only for a sender this block has not
+                        // touched.
+                        let grafted = db
+                            .bundle_state
+                            .state
+                            .get(&sender)
+                            .and_then(|account| account.info.as_ref())
+                            .map(|info| info.nonce);
+                        let nonce = match grafted {
+                            Some(nonce) => Some(nonce),
+                            None => db.basic(sender).ok().map(|account| account.map_or(0, |a| a.nonce)),
+                        };
+                        if let Some(nonce) = nonce {
+                            skipped_heads.insert(sender, (pool_tx.nonce(), nonce));
                         }
                     }
                 }
@@ -1425,13 +1461,14 @@ where
             );
             build_stage.at(7);
             if tx_count >= 1000 {
-                let (queued, usable) = queue_depth();
+                let (queued, usable, parked) = queue_depth();
                 tracing::info!(
                     target: "payload_builder",
                     number = block_number,
                     txs = tx_count,
                     queued,
                     usable,
+                    parked,
                     setup_ms = setup_took.as_millis() as u64,
                     par_ms,
                     par_pull_ms,
@@ -1972,7 +2009,7 @@ where
     // 250 ms would otherwise be a line every 250 ms.
     let total = build_started.elapsed();
     let assemble_ms = total.saturating_sub(finished_at).as_millis() as u64;
-    let (queued, usable) = queue_depth();
+    let (queued, usable, parked) = queue_depth();
     // A build that came out under a tenth of a block while the queue held
     // more than a block. This is the only path such a build can take (an
     // empty block never passes the early seal's `par_txs > 0`), and on
@@ -1993,6 +2030,7 @@ where
                     par_skipped,
                     queued,
                     usable,
+                    parked,
                     "a build found almost nothing usable while the queue held more than a block"
                 );
             }
@@ -2024,6 +2062,7 @@ where
             refused = ?crate::fast_transfer::rejected(),
             queued,
             usable,
+            parked,
             exec_ms = (exec_ns / 1_000_000) as u64,
             tail_ms = (tail_ns / 1_000_000) as u64,
             loop_ms = loop_done.as_millis() as u64,

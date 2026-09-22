@@ -47,7 +47,8 @@ async fn a_peer_gets_the_body_it_asks_for_or_gov5s_not_found() {
         loop {
             match server.next_event().await {
                 Some(TransportEvent::BlockRequest { hash, channel, .. }) => {
-                    let reply = (hash == known).then(|| body_for_server.clone());
+                    let reply = (hash == known)
+                        .then(|| alloy_primitives::Bytes::from(body_for_server.clone()));
                     server.respond_block(channel, reply);
                 }
                 Some(_) => {}

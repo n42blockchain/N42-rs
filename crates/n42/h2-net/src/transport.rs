@@ -687,11 +687,18 @@ impl H2V4Transport {
         peers.len()
     }
 
-    pub fn respond_block(&mut self, channel: BlockRequestChannel, rlp: Option<Vec<u8>>) {
+    /// `rlp` is shared bytes, not a `Vec`: a body is 26 MB and the store
+    /// already holds it as shared, so answering a peer is a refcount rather
+    /// than a copy made on the consensus loop.
+    pub fn respond_block(
+        &mut self,
+        channel: BlockRequestChannel,
+        rlp: Option<alloy_primitives::Bytes>,
+    ) {
         let reply = match rlp {
             Some(rlp) => Ok(BlockChunk {
                 fork_digest: self.our_status().fork_digest(),
-                rlp: rlp.into(),
+                rlp,
             }),
             None => Err("block not found".to_owned()),
         };

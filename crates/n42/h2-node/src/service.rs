@@ -294,6 +294,28 @@ pub struct H2Service<E> {
     /// The order [`Self::compact_bodies`] was filled in, so the oldest is
     /// what the bound drops.
     compact_order: std::collections::VecDeque<B256>,
+    /// Who pushed a block's body, when the sender named itself on the
+    /// channel: the member that built it, and so the one member certain to
+    /// hold every transaction of it. Asked first for a fill.
+    body_from: std::collections::HashMap<B256, PeerId>,
+    /// Peers not yet asked for a block's fill, newest request last. A fill
+    /// is asked of one peer at a time -- loop196 asked one arbitrary peer
+    /// and then every peer for the whole body, 229-331 times a leg.
+    fill_peers: std::collections::HashMap<B256, Vec<PeerId>>,
+    /// Requests for named transactions this node holds only as an imported
+    /// block: served from the execution layer on the next drain, the way a
+    /// whole body is.
+    pending_txns_requests: Vec<(n42_h2_net::BlockTxnsRequest, n42_h2_net::BlockTxnsChannel)>,
+    /// What this loop did between a commit and the next proposal. See
+    /// [`LoopSpend`].
+    loop_spend: LoopSpend,
+    /// Fills prepared on a worker thread, waiting to be handed to the peer
+    /// that asked. Only the swarm can answer, and only this loop drives the
+    /// swarm, so the *work* goes off the loop and the answer comes back.
+    served_txns: (
+        tokio::sync::mpsc::UnboundedSender<(n42_h2_net::BlockTxnsChannel, n42_h2_net::BlockTxnsReply)>,
+        tokio::sync::mpsc::UnboundedReceiver<(n42_h2_net::BlockTxnsChannel, n42_h2_net::BlockTxnsReply)>,
+    ),
     /// Bodies a proposal named that this node has not seen, with when it
     /// first missed them: the request to peers goes out only after
     /// `body_grace`, because the leader's direct push is normally 30-40 ms
@@ -551,6 +573,81 @@ fn remembered_bodies() -> usize {
 
 /// How many block timestamps to remember. Far more than any head-selection
 /// needs; the bound is against a peer flooding bodies, not a working set.
+/// Where the leader's service loop goes between committing one view and
+/// opening its proposal for the next.
+///
+/// Segment D of the cycle, and the only one with nothing in the logs: with
+/// the vote road 60-80 ms shorter (loop196) it grew from 47-61 to 86-116 ms
+/// and no line says why. This accumulates, per kind, what the loop handled
+/// in that window, and prints one line per view when the window is wide
+/// enough to matter.
+#[derive(Debug, Default)]
+struct LoopSpend {
+    /// The view whose commit opened the window, and when it opened.
+    since: Option<(u64, std::time::Instant)>,
+    /// What was handled: kind, how many, how long in microseconds.
+    spent: Vec<(&'static str, u32, u64)>,
+}
+
+impl LoopSpend {
+    /// A commit for `view` was applied: everything until the proposal for
+    /// `view + 1` belongs to this window.
+    fn open(&mut self, view: u64) {
+        self.since = Some((view, std::time::Instant::now()));
+        self.spent.clear();
+    }
+
+    /// Records one thing the loop did, if a window is open.
+    fn note(&mut self, kind: &'static str, at: std::time::Instant) {
+        if self.since.is_none() {
+            return;
+        }
+        let us = at.elapsed().as_micros() as u64;
+        match self.spent.iter_mut().find(|(name, _, _)| *name == kind) {
+            Some(entry) => {
+                entry.1 += 1;
+                entry.2 += us;
+            }
+            None => self.spent.push((kind, 1, us)),
+        }
+    }
+
+    /// The proposal for `view` is being made: closes the window the commit
+    /// for `view - 1` opened and hands back what it cost, when that is worth
+    /// a line.
+    fn close(&mut self, view: u64) -> Option<(u64, Vec<(&'static str, u32, u64)>)> {
+        let (opened, at) = self.since.take()?;
+        if opened + 1 != view {
+            return None;
+        }
+        let gap = at.elapsed().as_micros() as u64;
+        // Only the views that are actually slow: a leader proposes several
+        // times a second and a line per view would bury the ones that matter.
+        (gap >= 40_000).then(|| (gap, std::mem::take(&mut self.spent)))
+    }
+}
+
+/// The transactions a `block_txns` request names, out of a gov5 body.
+fn fill_from_body(
+    body: &[u8],
+    profile: HeaderProfile,
+    request: &n42_h2_net::BlockTxnsRequest,
+) -> n42_h2_net::BlockTxnsReply {
+    let decoded = n42_h2_consensus::decode_raw_block_body_ref(body, profile)
+        .map_err(|err| err.to_string())?;
+    request
+        .indices
+        .iter()
+        .map(|&i| {
+            decoded
+                .transactions
+                .get(i as usize)
+                .map(|tx| alloy_primitives::Bytes::copy_from_slice(tx))
+                .ok_or_else(|| format!("block {} has no index {i}", request.hash))
+        })
+        .collect()
+}
+
 /// How many compact frames are kept. Fewer than the other per-block maps,
 /// because each is ~5 MB: enough for a fill's round trip and for the gossip
 /// copy of a block already imported, not a history.
@@ -735,6 +832,11 @@ impl<E: ExecutionLayer> H2Service<E> {
             awaiting_bodies: HashSet::new(),
             compact_bodies: std::collections::HashMap::new(),
             compact_order: std::collections::VecDeque::new(),
+            body_from: std::collections::HashMap::new(),
+            fill_peers: std::collections::HashMap::new(),
+            pending_txns_requests: Vec::new(),
+            loop_spend: LoopSpend::default(),
+            served_txns: tokio::sync::mpsc::unbounded_channel(),
             body_wait: std::collections::HashMap::new(),
             body_grace: body_request_grace(),
             direct_push: false,
@@ -1048,9 +1150,11 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // the payload removal and the `Finalized` the awaited call
                 // applied when it returned, applied now.
                 if let Some(report) = commit {
+                    let at = std::time::Instant::now();
                     for action in self.driver.finish_commit(report).await {
                         self.apply_driver_action(action, &mut events)?;
                     }
+                    self.loop_spend.note("commit_report", at);
                 }
             }
             verdict = async {
@@ -1062,9 +1166,11 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // A follower import that ran on a task: the same action an
                 // awaited import returns, applied now.
                 if let Some(report) = verdict {
+                    let at = std::time::Instant::now();
                     for action in self.driver.finish_execute(report).await {
                         self.apply_driver_action(action, &mut events)?;
                     }
+                    self.loop_spend.note("import_verdict", at);
                 }
             }
             body = async {
@@ -1074,7 +1180,9 @@ impl<E: ExecutionLayer> H2Service<E> {
                 }
             } => {
                 if let Some(body) = body {
+                    let at = std::time::Instant::now();
                     self.handle_direct_body(body);
+                    self.loop_spend.note("body_in", at);
                 }
             }
             event = self.transport.next_event() => {
@@ -1343,6 +1451,26 @@ impl<E: ExecutionLayer> H2Service<E> {
     }
 
     fn handle_transport_event(&mut self, event: TransportEvent) -> Result<(), ServiceError> {
+        let at = std::time::Instant::now();
+        // Named for the leader-loop line: what a kind costs the loop is the
+        // question, and "a transport event" is not an answer.
+        let kind = match &event {
+            TransportEvent::BlockRequest { .. } => "body_served",
+            TransportEvent::BlockTxnsRequested { .. } => "txns_served",
+            TransportEvent::BlockTxnsFetched { .. } => "txns_fetched",
+            TransportEvent::BlockFetched { .. } | TransportEvent::BlockFetchFailed { .. } => "body_fetched",
+            TransportEvent::BlockPushed { .. } | TransportEvent::Block { .. } => "body_in",
+            TransportEvent::RangeRequest { .. } | TransportEvent::RangeFetched { .. } => "range",
+            TransportEvent::Transactions { .. } => "tx_gossip",
+            TransportEvent::Native { .. } | TransportEvent::Rejected { .. } => "consensus_msg",
+            _ => "transport_other",
+        };
+        let answer = self.handle_transport_event_inner(event);
+        self.loop_spend.note(kind, at);
+        answer
+    }
+
+    fn handle_transport_event_inner(&mut self, event: TransportEvent) -> Result<(), ServiceError> {
         match event {
             TransportEvent::Envelope { envelope, .. } => self.accept_envelope(&envelope),
             TransportEvent::Native { message, .. } => {
@@ -1441,34 +1569,44 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // Served from the body this node holds whole. A node that
                 // took the block as a compact body has none and says so;
                 // the asker then has the whole-body road.
-                let reply = match self.body_store.get(&request.hash) {
+                let held = self.body_store.get(&request.hash).map(|body| body.to_shared());
+                match held {
                     Some(body) => {
-                        match n42_h2_consensus::decode_raw_block_body_ref(body, self.header_profile) {
-                            Ok(decoded) => request
-                                .indices
-                                .iter()
-                                .map(|&i| {
-                                    decoded
-                                        .transactions
-                                        .get(i as usize)
-                                        .map(|tx| alloy_primitives::Bytes::copy_from_slice(tx))
-                                        .ok_or_else(|| format!("block {} has no index {i}", request.hash))
-                                })
-                                .collect::<Result<Vec<_>, String>>(),
-                            Err(err) => Err(err.to_string()),
-                        }
+                        // The body is shared, not copied, and the walk that
+                        // picks the named transactions out of its 26 MB
+                        // happens on a worker: this loop is the leader's
+                        // between committing one view and proposing the
+                        // next, and loop196 put 230-330 of these a leg on it.
+                        let profile = self.header_profile;
+                        let back = self.served_txns.0.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let reply = fill_from_body(&body, profile, &request);
+                            debug!(
+                                target: "n42.h2.node",
+                                %peer,
+                                hash = ?request.hash,
+                                wanted = request.indices.len(),
+                                served = reply.as_ref().map(Vec::len).unwrap_or(0),
+                                "peer asked for named transactions; served from the stored body"
+                            );
+                            let _ = back.send((channel, reply));
+                        });
                     }
-                    None => Err(format!("block {} is not held here whole", request.hash)),
-                };
-                debug!(
-                    target: "n42.h2.node",
-                    %peer,
-                    hash = ?request.hash,
-                    wanted = request.indices.len(),
-                    served = reply.as_ref().map(Vec::len).unwrap_or(0),
-                    "peer asked for named transactions"
-                );
-                self.transport.respond_block_txns(channel, reply);
+                    // A member that took this block as a compact body holds
+                    // no whole body -- and on a fleet where every member
+                    // does that, "not held here whole" was every answer
+                    // (loop196: 229-331 refusals a leg). It does hold the
+                    // block itself once imported, so the execution layer
+                    // answers instead, on the next drain.
+                    //
+                    // A last resort, and asked for as one: the execution
+                    // layer hands back the whole block to serve a few
+                    // hundred transactions of it. The member that built the
+                    // block has the body in its store and is the one this
+                    // node asks first, so this runs when that member is
+                    // gone.
+                    None => self.pending_txns_requests.push((request, channel)),
+                }
             }
             TransportEvent::BlockTxnsFetched { peer, request, reply } => {
                 match reply {
@@ -1521,17 +1659,10 @@ impl<E: ExecutionLayer> H2Service<E> {
                             got = txns.len(),
                             "a peer answered a named-transaction request with the wrong number of them"
                         );
-                        self.forget_compact_body(request.hash);
+                        self.ask_next_for_fill(request, "the wrong number of transactions");
                     }
                     Err(reason) => {
-                        info!(
-                            target: "n42.h2.node",
-                            %peer,
-                            hash = ?request.hash,
-                            reason,
-                            "a peer could not supply the missing transactions; asking for the whole body"
-                        );
-                        self.forget_compact_body(request.hash);
+                        self.ask_next_for_fill(request, &reason);
                     }
                 }
             }
@@ -1539,7 +1670,10 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // The store holds recent bodies byte for byte; anything older
                 // is rebuilt from the execution layer on the next drain, the
                 // way ranges are served.
-                match self.body_store.get(&hash).map(|body| body.to_vec()) {
+                // Shared, not copied: a 26 MB `to_vec()` per request sat on
+                // this loop, and loop196 asked for whole bodies 230-330
+                // times a leg because every fill was refused.
+                match self.body_store.get(&hash).map(|body| body.to_shared()) {
                     Some(body) => {
                         debug!(target: "n42.h2.node", %peer, ?hash, "peer asked for a block; served from the store");
                         self.transport.respond_block(channel, Some(body));
@@ -1731,16 +1865,17 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// Not a `while let Some(..) = recv().await` loop: that would block waiting
     /// for the *next* output rather than stopping when the channel runs dry.
     async fn drain_outputs(&mut self, events: &mut Vec<ServiceEvent>) -> Result<(), ServiceError> {
+        let drain_at = std::time::Instant::now();
         self.consider_catch_up(events).await;
         self.import_ranges(events).await;
         for (peer, hash, channel) in std::mem::take(&mut self.pending_block_requests) {
             let body = match self.driver.execution_layer().block_by_hash(hash).await {
-                Ok(Some(block)) => Some(n42_h2_net::encode_block_rlp_raw(
+                Ok(Some(block)) => Some(alloy_primitives::Bytes::from(n42_h2_net::encode_block_rlp_raw(
                     &block.header,
                     &block.transactions,
                     &withdrawals_to_rewards(block.withdrawals.as_deref().unwrap_or(&[])),
                     None,
-                )),
+                ))),
                 Ok(None) => None,
                 Err(err) => {
                     debug!(target: "n42.h2.node", ?hash, %err, "execution layer could not serve a block");
@@ -1749,6 +1884,34 @@ impl<E: ExecutionLayer> H2Service<E> {
             };
             debug!(target: "n42.h2.node", peer, ?hash, found = body.is_some(), "peer asked for a block; execution layer consulted");
             self.transport.respond_block(channel, body);
+        }
+        while let Ok((channel, reply)) = self.served_txns.1.try_recv() {
+            self.transport.respond_block_txns(channel, reply);
+        }
+        for (request, channel) in std::mem::take(&mut self.pending_txns_requests) {
+            let reply = match self.driver.execution_layer().block_by_hash(request.hash).await {
+                Ok(Some(block)) => request
+                    .indices
+                    .iter()
+                    .map(|&i| {
+                        block
+                            .transactions
+                            .get(i as usize)
+                            .cloned()
+                            .ok_or_else(|| format!("block {} has no index {i}", request.hash))
+                    })
+                    .collect::<Result<Vec<_>, String>>(),
+                Ok(None) => Err(format!("block {} is not here", request.hash)),
+                Err(err) => Err(err.to_string()),
+            };
+            debug!(
+                target: "n42.h2.node",
+                hash = ?request.hash,
+                wanted = request.indices.len(),
+                served = reply.as_ref().map(Vec::len).unwrap_or(0),
+                "peer asked for named transactions; execution layer consulted"
+            );
+            self.transport.respond_block_txns(channel, reply);
         }
         for (peer, request, channel) in std::mem::take(&mut self.pending_ranges) {
             // Only the execution layer is held across the await: the
@@ -1782,6 +1945,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         while let Ok(output) = self.outputs.try_recv() {
             self.handle_output(output, events).await?;
         }
+        self.loop_spend.note("driver_outputs", drain_at);
         Ok(())
     }
 
@@ -1903,6 +2067,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 if let Some(number) = self.block_numbers.get(&block_hash).copied() {
                     self.transport.set_advertised_height(number);
                 }
+                self.loop_spend.open(view);
                 events.push(ServiceEvent::Committed {
                     view,
                     block_hash,
@@ -1974,6 +2139,9 @@ impl<E: ExecutionLayer> H2Service<E> {
         pushers: crate::body_channel::BodyPushers,
     ) -> Self {
         self.body_rx = Some(rx);
+        // The receivers learn who pushed them a body, so a member that
+        // cannot assemble one knows exactly whom to ask for the rest.
+        pushers.announce(self.transport.local_peer_id().to_string());
         self.body_pushers = Some(pushers);
         self
     }
@@ -2223,6 +2391,25 @@ impl<E: ExecutionLayer> H2Service<E> {
             from_el,
             "proposal preamble"
         );
+        if let Some((gap_us, spent)) = self.loop_spend.close(view) {
+            // One line per slow view, naming every kind the loop handled in
+            // the window and what it cost. `unnamed_ms` is the window minus
+            // the parts -- a wait, or work no kind covers.
+            let named: u64 = spent.iter().map(|(_, _, us)| us).sum();
+            let parts = spent
+                .iter()
+                .map(|(kind, count, us)| format!("{kind}={count}/{}ms", us / 1000))
+                .collect::<Vec<_>>()
+                .join(" ");
+            info!(
+                target: "n42.h2.node",
+                view,
+                gap_ms = gap_us / 1000,
+                unnamed_ms = gap_us.saturating_sub(named) / 1000,
+                parts,
+                "leader loop between commit and preamble"
+            );
+        }
         match self.driver.build_block_on(head, attrs, view).await {
             Ok(built) => {
                 // The QC may have moved while the block was being built -- a
@@ -2367,8 +2554,22 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // kilobytes against the 26 MB body -- and hand the frame
                 // back with them filled in. A peer that cannot answer, or
                 // does not speak the protocol, leaves the whole-body road.
-                let peers = self.transport.connected_peer_ids();
-                let Some(peer) = peers.first().copied() else {
+                // The member that pushed the body built the block, so it is
+                // the one certain to hold every transaction of it; the rest
+                // are tried in turn behind it, one at a time. loop196 asked
+                // whichever peer came first and was refused 229-331 times a
+                // leg, each refusal then asking every peer for the whole
+                // 26 MB body.
+                let built_by = self.body_from.get(&block_hash).copied();
+                let mut rest: Vec<PeerId> = self
+                    .transport
+                    .connected_peer_ids()
+                    .into_iter()
+                    .filter(|peer| Some(*peer) != built_by)
+                    .collect();
+                rest.reverse();
+                let next = built_by.or_else(|| rest.pop());
+                let Some(peer) = next else {
                     debug!(target: "n42.h2.node", ?block_hash, "no peer to ask for the missing transactions");
                     self.forget_compact_body(block_hash);
                     return Ok(());
@@ -2378,8 +2579,10 @@ impl<E: ExecutionLayer> H2Service<E> {
                     ?block_hash,
                     wanted = indices.len(),
                     %peer,
+                    proposer = built_by.is_some(),
                     "asking a peer for the transactions this node does not hold"
                 );
+                self.fill_peers.insert(block_hash, rest);
                 self.transport.request_block_txns(
                     peer,
                     n42_h2_net::BlockTxnsRequest { hash: block_hash, indices },
@@ -2925,6 +3128,34 @@ impl<E: ExecutionLayer> H2Service<E> {
         Ok((block_hash, header, true))
     }
 
+    /// Asks the next peer for a fill this one could not answer, and only
+    /// when none is left gives up on the compact body.
+    fn ask_next_for_fill(&mut self, request: n42_h2_net::BlockTxnsRequest, reason: &str) {
+        let next = self.fill_peers.get_mut(&request.hash).and_then(Vec::pop);
+        match next {
+            Some(peer) => {
+                debug!(
+                    target: "n42.h2.node",
+                    hash = ?request.hash,
+                    %peer,
+                    reason,
+                    "asking the next peer for the missing transactions"
+                );
+                self.transport.request_block_txns(peer, request);
+            }
+            None => {
+                info!(
+                    target: "n42.h2.node",
+                    hash = ?request.hash,
+                    wanted = request.indices.len(),
+                    reason,
+                    "no peer could supply the missing transactions; asking for the whole body"
+                );
+                self.forget_compact_body(request.hash);
+            }
+        }
+    }
+
     /// Gives up on a block's compact body: the whole body is asked for
     /// instead, and the copy that arrives is the one that imports it.
     fn forget_compact_body(&mut self, block_hash: B256) {
@@ -2934,7 +3165,16 @@ impl<E: ExecutionLayer> H2Service<E> {
         }
         if self.body_request_due(block_hash) {
             self.awaiting_bodies.insert(block_hash);
-            for peer in self.transport.connected_peer_ids() {
+            // One peer, not every peer: a whole body is 26 MB, and six of
+            // them answering at once is 156 MB read off six consensus loops
+            // for one block. The member that pushed the compact body is
+            // asked, since it built the block.
+            let peer = self
+                .body_from
+                .get(&block_hash)
+                .copied()
+                .or_else(|| self.transport.connected_peer_ids().first().copied());
+            if let Some(peer) = peer {
                 self.transport.request_block(peer, block_hash);
             }
         }
@@ -2952,6 +3192,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     fn accept_compact_body(
         &mut self,
         bytes: alloy_primitives::Bytes,
+        from: Option<PeerId>,
     ) -> Result<(B256, Header, bool), n42_h2_consensus::BlockBodyError> {
         let (block_hash, header) =
             n42_h2_consensus::decode_compact_body_header(&bytes, self.header_profile)?;
@@ -2964,10 +3205,15 @@ impl<E: ExecutionLayer> H2Service<E> {
         // this guards against is a double import of a block whose gossip
         // copy follows its push, and anything this far back is long
         // committed.
+        if let Some(from) = from {
+            self.body_from.insert(block_hash, from);
+        }
         self.compact_order.push_back(block_hash);
         while self.compact_order.len() > REMEMBERED_COMPACT_BODIES {
             if let Some(oldest) = self.compact_order.pop_front() {
                 self.compact_bodies.remove(&oldest);
+                self.body_from.remove(&oldest);
+                self.fill_peers.remove(&oldest);
             }
         }
         self.remember_block(block_hash, &header);
@@ -3183,8 +3429,9 @@ impl<E: ExecutionLayer> H2Service<E> {
             // hash, which this node already holds, decoded and with their
             // senders, because it ingests every transaction the leader does.
             let shared = alloy_primitives::Bytes::copy_from_slice(&rlp[..]);
+            let from = rlp.from().and_then(|id| id.parse::<PeerId>().ok());
             drop(rlp);
-            match self.accept_compact_body(shared) {
+            match self.accept_compact_body(shared, from) {
                 Ok((hash, _, true)) => {
                     self.import_eagerly(hash);
                     self.body_arrived.insert(hash, std::time::Instant::now());

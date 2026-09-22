@@ -79,6 +79,37 @@ pub fn set_alt_sig_enabled(enabled: bool) {
     ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether this node takes an ingested transaction's sender from the frame
+/// that carried it instead of recovering it from the signature:
+/// `N42_INGEST_VERIFY=leader`, against the default `all`.
+///
+/// The supply is a ceiling every member pays alike: each one ingests every
+/// transaction and verifies its signature there -- ~11 us of CPU each -- on
+/// the same cores its import and its build run on. Only a node about to
+/// *build* needs the sender at ingest. A follower meets every transaction
+/// again inside a block, where the vote road resolves senders anyway, so it
+/// can hold the frame's word for the sender -- a claim -- and pay the
+/// signature once, in batch, where the block is checked.
+///
+/// A claim is never an answer:
+///
+/// * the queue's lane is keyed by the claimed sender, so a wrong claim can
+///   only misplace that one transaction in that one lane; it cannot be
+///   mined, because nothing downstream takes the lane's key for a sender;
+/// * a build on this node verifies every claimed transaction before it
+///   includes it, in batch, and drops one whose signature says otherwise;
+/// * the vote road verifies every transaction of a block whose sender it
+///   holds only as a claim, compares the two, and refuses the block on a
+///   mismatch -- all before the vote is released.
+///
+/// Read once, so a node's mode cannot change under a build.
+pub fn senders_claimed_at_ingest() -> bool {
+    static CLAIMED: OnceLock<bool> = OnceLock::new();
+    *CLAIMED.get_or_init(|| {
+        std::env::var("N42_INGEST_VERIFY").is_ok_and(|mode| mode.eq_ignore_ascii_case("leader"))
+    })
+}
+
 /// The batch size for Ed25519 verification, from `N42_ED25519_BATCH`
 /// (default 64, at most 256: the per-signature gain flattens past 64 and a
 /// failed batch is retried one by one).

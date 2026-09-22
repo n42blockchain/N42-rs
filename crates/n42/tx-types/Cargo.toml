@@ -43,3 +43,8 @@ fixed-cache = "0.1.8"
 [dev-dependencies]
 serde_json.workspace = true
 hex.workspace = true
+# `tests/road_senders.rs`: what a block's senders cost when the ingest did
+# not recover them (the pool the vote road runs on, and a signer for the
+# secp256k1 side).
+rayon.workspace = true
+secp256k1.workspace = true

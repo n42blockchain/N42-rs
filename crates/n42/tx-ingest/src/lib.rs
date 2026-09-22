@@ -20,12 +20,34 @@
 //! # Wire
 //!
 //! ```text
-//! frame   := u32 count, then `count` x (u32 len, len bytes of EIP-2718)
+//! frame   := u32 header, then `count` x entry
+//! header  := count, or count | 0x8000_0000 for a frame that claims senders
+//! entry   := u32 len, len bytes of EIP-2718
+//!         := u32 len, 20 bytes of claimed sender, len bytes   (claiming frame)
 //! reply   := u32 accepted, u32 pool_pending      -- one per frame, in order
 //! ```
 //!
 //! Little-endian, because both ends of this are the same machine or the same
 //! LAN and nothing here is a consensus artefact.
+//!
+//! The claim is additive and versioned by that one bit: `count` is bounded by
+//! [`MAX_FRAME_TXS`], so the top bit was free, and a server that predates it
+//! reads a claiming frame's header as a count far past the bound and closes
+//! the connection with the reason named -- a loud failure rather than a
+//! silently misread stream. A frame that does not claim is read exactly as
+//! before.
+//!
+//! # The claim, and why it is not trust
+//!
+//! A generator knows the sender it signed with; recovering it again costs
+//! ~11 us of this node's CPU. With `N42_INGEST_VERIFY=leader`
+//! ([`n42_tx_types::senders_claimed_at_ingest`]) a claiming frame's sender is
+//! taken as the *claim* the transaction is queued under -- the key of its
+//! lane, nothing more -- and the signature is paid once later, in batch,
+//! where it is needed: the builder verifies what it includes, the vote road
+//! verifies what a block carries. Off (the default `all`), the claim is read
+//! off the wire and discarded, and every transaction is verified here as it
+//! always was.
 //!
 //! # Backpressure, which is the point of the reply
 //!
@@ -62,7 +84,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use alloy_primitives::Bytes;
+use alloy_primitives::{Address, Bytes};
 use n42_tx_types::{ed25519_batch_size, AltSigSenderCache, AltSigTx, N42PooledTxEnvelope};
 use reth_primitives_traits::Recovered;
 use reth_transaction_pool::{PoolTransaction, TransactionOrigin, TransactionPool};
@@ -76,6 +98,23 @@ use tracing::{debug, info, warn};
 /// what one connection can make the node allocate. Ten thousand transfers is
 /// about 1.1 MB and comfortably more than one block of any tier here.
 const MAX_FRAME_TXS: u32 = 10_000;
+
+/// The bit a frame's header sets to say that each of its entries carries the
+/// sender the generator signed with, ahead of the transaction's bytes.
+///
+/// Free because [`MAX_FRAME_TXS`] bounds the count far below it; see the
+/// wire section of the module docs.
+const FRAME_CLAIMS_SENDERS: u32 = 0x8000_0000;
+
+/// The bit has to be out of the count's range, or a claiming frame and a
+/// large plain one would be the same header.
+const _: () = assert!(MAX_FRAME_TXS < FRAME_CLAIMS_SENDERS);
+
+/// Splits a frame's header into "does each entry carry a claimed sender" and
+/// the transaction count.
+const fn frame_header(header: u32) -> (bool, u32) {
+    (header & FRAME_CLAIMS_SENDERS != 0, header & !FRAME_CLAIMS_SENDERS)
+}
 
 /// Frames one connection may have admitting in the background under
 /// `N42_TX_INGEST_ASYNC`. At 100 transactions a frame and 64 connections
@@ -594,6 +633,11 @@ fn spawn_stats_reporter() {
                     spawn_us_per_frame = spawn_us,
                     altsig_txs = STATS.altsig_txs.load(Ordering::Relaxed),
                     altsig_batches = STATS.altsig_batches.load(Ordering::Relaxed),
+                    // The supply's split: what this node paid a signature
+                    // for here, and what it queued on the frame's word and
+                    // will pay for at its builder or on its vote road.
+                    verified_at_ingest = STATS.verified_at_ingest.load(Ordering::Relaxed),
+                    claimed = STATS.claimed.load(Ordering::Relaxed),
                     // Any of these non-zero is a hole: the frame was
                     // acknowledged and the transaction never reached the
                     // queue.
@@ -642,6 +686,7 @@ where
         buffered_reads = !unbuffered_reads(),
         direct_to_queue = direct_to_queue(),
         asynchronous = std::env::var("N42_TX_INGEST_ASYNC").is_ok(),
+        senders_claimed = n42_tx_types::senders_claimed_at_ingest(),
         "binary transaction ingest listening"
     );
     loop {
@@ -688,6 +733,9 @@ where
     // which is right for a generator that only sends valid transactions and
     // wrong for anything else, so this is not the default.
     let asynchronous = std::env::var("N42_TX_INGEST_ASYNC").is_ok();
+    // `N42_INGEST_VERIFY=leader`: a claiming frame's sender is kept as the
+    // claim the transaction is queued under, and nothing here verifies it.
+    let claimed_senders = n42_tx_types::senders_claimed_at_ingest();
     // Recovery runs in parallel, ASYNC_FRAMES_IN_FLIGHT frames at a time, but
     // the pool takes a connection's frames in the order they arrived: one
     // admitter per connection drains them in sequence. Admitting each frame
@@ -724,12 +772,16 @@ where
     let capacity = if unbuffered_reads() { 0 } else { 1 << 20 };
     let mut stream = tokio::io::BufReader::with_capacity(capacity, read_half);
     loop {
-        let count = match stream.read_u32_le().await {
-            Ok(count) => count,
+        let header = match stream.read_u32_le().await {
+            Ok(header) => header,
             // A generator that has finished simply closes.
             Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(err) => return Err(err),
         };
+        // A claiming frame carries a sender ahead of each transaction. The
+        // bytes are read either way -- the stream has to be walked past them
+        // -- and kept only where this node is going to use them.
+        let (claiming, count) = frame_header(header);
         if count == 0 || count > MAX_FRAME_TXS {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -740,6 +792,8 @@ where
         // rather than its own allocation (500 a frame, ~350,000 a second a
         // node at the bench tier).
         let mut raws = Vec::with_capacity(count as usize);
+        let keep_claims = claiming && claimed_senders;
+        let mut claims: Vec<Address> = if keep_claims { Vec::with_capacity(count as usize) } else { Vec::new() };
         let mut frame_buf = bytes::BytesMut::with_capacity(count as usize * 160);
         for _ in 0..count {
             let len = stream.read_u32_le().await? as usize;
@@ -748,6 +802,13 @@ where
                     std::io::ErrorKind::InvalidData,
                     format!("transaction of {len} bytes"),
                 ));
+            }
+            if claiming {
+                let mut claim = [0u8; 20];
+                stream.read_exact(&mut claim).await?;
+                if keep_claims {
+                    claims.push(Address::from(claim));
+                }
             }
             frame_buf.resize(len, 0);
             stream.read_exact(&mut frame_buf[..]).await?;
@@ -794,7 +855,7 @@ where
             // taken: the slots are the ingest's bound (16 a node at 94-99%
             // busy, 48-50 us a transaction, round 39), and the RLP decode is
             // not secp256k1's work to wait for.
-            let pooled = decode_frame::<P>(raws);
+            let (pooled, claims) = decode_frame::<P>(raws, claims);
             // What is acknowledged, and it is the decoded count and not the
             // offered one: the generator advances a sender's nonce by the
             // answer, so acknowledging a transaction this node then threw
@@ -816,7 +877,7 @@ where
                 apply_recovery_affinity();
                 let busy = std::time::Instant::now();
                 STATS.spawn_ns.fetch_add(busy.duration_since(granted).as_nanos() as u64, Ordering::Relaxed);
-                let decoded = recover_decoded::<P>(pooled, cache.as_ref());
+                let decoded = recover_decoded::<P>(pooled, claims, cache.as_ref());
                 STATS.busy_ns.fetch_add(busy.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 decoded
             });
@@ -832,7 +893,7 @@ where
             STATS.reply_ns.fetch_add(frame_read.elapsed().as_nanos() as u64, Ordering::Relaxed);
             continue;
         }
-        let accepted = admit(&pool, raws, cache.clone()).await;
+        let accepted = admit(&pool, raws, claims, cache.clone()).await;
         let pending = u32::try_from(queue_depth(&pool)).unwrap_or(u32::MAX);
         write_half.write_u32_le(accepted).await?;
         write_half.write_u32_le(pending).await?;
@@ -869,6 +930,13 @@ struct IngestStats {
     /// 0x50 transactions verified here, and the batches they went through.
     altsig_txs: AtomicU64,
     altsig_batches: AtomicU64,
+    /// Senders this ingest computed from the signature, and senders it took
+    /// as the frame's claim without checking one
+    /// (`N42_INGEST_VERIFY=leader`). Their sum is what reached the queue,
+    /// and `claimed` is the work this node moved to its builder and its
+    /// vote road.
+    verified_at_ingest: AtomicU64,
+    claimed: AtomicU64,
     gate_ns: AtomicU64,
     chan_ns: AtomicU64,
     /// Waiting for a recovery slot (`acq_ns`), and from the slot granted to
@@ -910,12 +978,15 @@ static STATS: IngestStats = IngestStats {
     spawn_ns: AtomicU64::new(0),
     altsig_batches: AtomicU64::new(0),
     altsig_txs: AtomicU64::new(0),
+    verified_at_ingest: AtomicU64::new(0),
+    claimed: AtomicU64::new(0),
 };
 
 
 async fn admit<P>(
     pool: &P,
     raws: Vec<Bytes>,
+    claims: Vec<Address>,
     cache: Option<reth_evm::SenderRecoveryCache>,
 ) -> u32
 where
@@ -928,7 +999,7 @@ where
     // on that thread, and the pool's own futures, waited behind them. Blocking
     // threads are for exactly this.
     let started = std::time::Instant::now();
-    let pooled = decode_frame::<P>(raws);
+    let (pooled, claims) = decode_frame::<P>(raws, claims);
     let slot = std::sync::Arc::clone(recovery_slots())
         .acquire_owned()
         .await
@@ -938,7 +1009,7 @@ where
         apply_recovery_nice();
         apply_recovery_affinity();
         let busy = std::time::Instant::now();
-        let decoded = recover_decoded::<P>(pooled, cache.as_ref());
+        let decoded = recover_decoded::<P>(pooled, claims, cache.as_ref());
         STATS.busy_ns.fetch_add(busy.elapsed().as_nanos() as u64, Ordering::Relaxed);
         decoded
     })
@@ -1022,14 +1093,26 @@ type PooledOf<P> = <<P as TransactionPool>::Transaction as PoolTransaction>::Poo
 
 /// Decodes a frame's raw transactions; an undecodable one is dropped with a
 /// debug line rather than closing the connection. No signature work here.
-fn decode_frame<P>(raws: Vec<Bytes>) -> Vec<PooledOf<P>>
+///
+/// `claims` is either empty -- the frame claimed nothing, or this node does
+/// not take claims -- or one entry per raw transaction, and what comes back
+/// beside the decoded transactions is the same list with the undecodable
+/// ones removed, so the two stay aligned.
+fn decode_frame<P>(raws: Vec<Bytes>, claims: Vec<Address>) -> (Vec<PooledOf<P>>, Vec<Address>)
 where
     P: TransactionPool,
 {
+    let claimed = claims.len() == raws.len() && !claims.is_empty();
     let mut decoded = Vec::with_capacity(raws.len());
-    for raw in raws {
+    let mut kept = if claimed { Vec::with_capacity(raws.len()) } else { Vec::new() };
+    for (at, raw) in raws.into_iter().enumerate() {
         match <PooledOf<P> as alloy_eips::Decodable2718>::decode_2718_exact(raw.as_ref()) {
-            Ok(pooled) => decoded.push(pooled),
+            Ok(pooled) => {
+                decoded.push(pooled);
+                if claimed {
+                    kept.push(claims[at]);
+                }
+            }
             Err(err) => {
                 let dropped = STATS.dropped_decode.fetch_add(1, Ordering::Relaxed) + 1;
                 if drop_warn_allowed() {
@@ -1038,7 +1121,7 @@ where
             }
         }
     }
-    decoded
+    (decoded, kept)
 }
 
 /// Recovers the senders of decoded transactions, on a recovery slot.
@@ -1055,17 +1138,45 @@ where
 /// against 29-63 us of ecrecover on this host), a failed batch retried one
 /// by one. Their senders go to the shared [`AltSigSenderCache`], which the
 /// block import and the engine's payload conversion read.
+/// `claims`, when it is not empty, is one sender per transaction and this
+/// node is in `N42_INGEST_VERIFY=leader`: the transaction is queued under
+/// the claim without a signature being checked here. Nothing downstream
+/// takes a claim for an answer -- the builder verifies what it includes and
+/// the vote road verifies what a block carries -- so the only thing a wrong
+/// claim can do is put one transaction in the wrong lane, where no build can
+/// use it.
 fn recover_decoded<P>(
     pooled: Vec<PooledOf<P>>,
+    claims: Vec<Address>,
     cache: Option<&reth_evm::SenderRecoveryCache>,
 ) -> Vec<P::Transaction>
 where
     P: TransactionPool,
     P::Transaction: PoolTransaction<Pooled = N42PooledTxEnvelope>,
 {
+    let claimed = claims.len() == pooled.len() && !claims.is_empty();
     let mut recovered = Vec::with_capacity(pooled.len());
     let mut alt: Vec<N42PooledTxEnvelope> = Vec::new();
-    for tx in pooled {
+    // Counted per frame rather than per transaction: these are two lines on
+    // one cache line that a dozen recovery threads would otherwise write to
+    // half a million times a second between them.
+    let mut claimed_here = 0u64;
+    let mut verified_here = 0u64;
+    for (at, tx) in pooled.into_iter().enumerate() {
+        if claimed {
+            // The 0x50 gate stays where it is: a chain that does not admit
+            // the type must not hold one, claim or no claim.
+            if tx.is_alt_sig() && !n42_tx_types::alt_sig_enabled() {
+                STATS.dropped_altsig_disabled.fetch_add(1, Ordering::Relaxed);
+                if drop_warn_allowed() {
+                    warn!(target: "n42.tx_ingest", dropped = 1, "a 0x50 transaction on a chain that does not enable them");
+                }
+                continue;
+            }
+            recovered.push(P::Transaction::from_pooled(Recovered::new_unchecked(tx, claims[at])));
+            claimed_here += 1;
+            continue;
+        }
         if tx.is_alt_sig() {
             alt.push(tx);
             continue;
@@ -1075,7 +1186,10 @@ where
             None => <P::Transaction as PoolTransaction>::try_recover(tx),
         };
         match result {
-            Ok(tx) => recovered.push(tx),
+            Ok(tx) => {
+                recovered.push(tx);
+                verified_here += 1;
+            }
             Err(_) => {
                 let dropped = STATS.dropped_signature.fetch_add(1, Ordering::Relaxed) + 1;
                 if drop_warn_allowed() {
@@ -1085,6 +1199,7 @@ where
         }
     }
     if alt.is_empty() {
+        count_senders(claimed_here, verified_here);
         return recovered;
     }
     if !n42_tx_types::alt_sig_enabled() {
@@ -1092,13 +1207,19 @@ where
         if drop_warn_allowed() {
             warn!(target: "n42.tx_ingest", dropped = alt.len(), "0x50 transactions on a chain that does not enable them");
         }
+        count_senders(claimed_here, verified_here);
         return recovered;
     }
     let senders = AltSigSenderCache::global();
     let mut todo: Vec<N42PooledTxEnvelope> = Vec::with_capacity(alt.len());
     for tx in alt {
         match senders.get(tx.hash()) {
-            Some(sender) => recovered.push(P::Transaction::from_pooled(Recovered::new_unchecked(tx, sender))),
+            Some(sender) => {
+                // A hit is this node's own earlier verification of the same
+                // signature, so it counts as verified here.
+                recovered.push(P::Transaction::from_pooled(Recovered::new_unchecked(tx, sender)));
+                verified_here += 1;
+            }
             None => todo.push(tx),
         }
     }
@@ -1133,6 +1254,7 @@ where
             Ok(sender) => {
                 senders.insert(*tx.hash(), sender);
                 recovered.push(P::Transaction::from_pooled(Recovered::new_unchecked(tx, sender)));
+                verified_here += 1;
             }
             Err(err) => {
                 let dropped = STATS.dropped_altsig.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1145,7 +1267,19 @@ where
             }
         }
     }
+    count_senders(claimed_here, verified_here);
     recovered
+}
+
+/// Adds a frame's tally to the ingest's sender counters: how many senders it
+/// took as a claim, and how many it computed from the signature.
+fn count_senders(claimed: u64, verified: u64) {
+    if claimed != 0 {
+        STATS.claimed.fetch_add(claimed, Ordering::Relaxed);
+    }
+    if verified != 0 {
+        STATS.verified_at_ingest.fetch_add(verified, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -1200,6 +1334,16 @@ mod tests {
             GATE_FORCED.load(Ordering::Relaxed) > forced_before,
             "the forced frame was not counted for the round's stats line"
         );
+    }
+
+    /// A frame that claims nothing reads exactly as it always did, and one
+    /// that claims is the same count with one bit set. The bit is above
+    /// every count this server accepts, so the two can never be confused.
+    #[test]
+    fn a_frame_header_says_whether_it_claims() {
+        assert_eq!(frame_header(500), (false, 500));
+        assert_eq!(frame_header(500 | FRAME_CLAIMS_SENDERS), (true, 500));
+        assert_eq!(frame_header(MAX_FRAME_TXS), (false, MAX_FRAME_TXS));
     }
 
     /// The healthy path is unchanged: an open gate holds nothing.

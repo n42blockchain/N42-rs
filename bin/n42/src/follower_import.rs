@@ -45,6 +45,13 @@ pub static IMPORT_STAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// Names the stages of [`IMPORT_STAGE`].
 pub const IMPORT_STAGES: [&str; 8] = ["idle", "header", "senders", "execution", "checks", "carry", "qmdb-root", "hashed-state"];
 
+/// Blocks this node refused because a transaction's signature named a
+/// different sender than the claim its own queue was given for it
+/// (`N42_INGEST_VERIFY=leader`). On the `vote road` line, where a healthy
+/// leg reads 0 for the whole round: anything else is a proposer that built
+/// on a sender nothing had verified.
+pub static CLAIM_MISMATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The leader's own-block hand-off in progress, `(block number << 8) | stage`
 /// into [`HANDOFF_STAGES`], 0 when none: the header-only import's lookup,
 /// the hand-off to the engine and the engine's `newPayload`. The watchdog
@@ -999,6 +1006,16 @@ struct RoadPhases {
     /// beside `senders_us` on the line, and it is left out of the sum the
     /// line's `other_ms` is made from.
     senders_indexed: u64,
+    /// Not durations either, and for the same reason. Under
+    /// `N42_INGEST_VERIFY=leader` the ingest took its senders from the frame
+    /// without checking a signature, so the road pays for them here:
+    /// `verified_on_road` is how many of the block's senders this node
+    /// computed from the signature (0x50 in batches, secp256k1 by recovery),
+    /// and `claims_checked` how many of those it could compare against the
+    /// claim its own queue holds. A block whose claim and signature disagree
+    /// never gets this far -- the import fails before the vote.
+    verified_on_road: u64,
+    claims_checked: u64,
     /// The header and body consensus checks, and before the deferred fork the
     /// parent lookup ahead of them.
     header_us: u64,
@@ -1057,6 +1074,9 @@ fn log_vote_road(road: VoteRoad, number: u64, txs: usize, phases: RoadPhases) {
         header_ms = phases.header_us / 1000,
         senders_ms = phases.senders_us / 1000,
         senders_indexed = phases.senders_indexed,
+        verified_on_road = phases.verified_on_road,
+        claims_checked = phases.claims_checked,
+        claim_mismatch = CLAIM_MISMATCH.load(std::sync::atomic::Ordering::Relaxed),
         parent_wait_ms = phases.parent_wait_us / 1000,
         check_ms = phases.check_us / 1000,
         fields_ms = phases.fields_us / 1000,
@@ -1077,6 +1097,12 @@ fn log_vote_road(road: VoteRoad, number: u64, txs: usize, phases: RoadPhases) {
 /// reverted block's own recovered senders. A wrong sender here would be a
 /// wrong sender in the ingest, and the same wrong sender would already be in
 /// the block the ingest's own node built.
+///
+/// That holds everywhere but one mode: under `N42_INGEST_VERIFY=leader` the
+/// ingest queues a transaction under the sender its frame claimed, without
+/// checking a signature, so what this returns there is a claim. The caller
+/// knows which it asked for -- in that mode it verifies every sender and
+/// uses these only to check the claim against the signature.
 ///
 /// What catches one all the same: `check_includable`, which reads each
 /// sender's account and refuses a block whose nonces do not continue the
@@ -1103,7 +1129,11 @@ fn senders_in_queue(
 /// itself is `N42_TX_QUEUE`). `None` and the senders are looked up as they
 /// always were.
 fn queue_for_senders() -> Option<n42_tx_queue::TxQueue<n42_engine_types::N42PooledTransaction>> {
-    if !n42_tx_queue::senders_from_queue() {
+    // In the claimed mode the index is read for the claim rather than for
+    // the answer, and that is worth doing whenever the index exists at all
+    // -- it is what lets a wrong claim be named instead of merely failing
+    // the block somewhere downstream.
+    if !n42_tx_queue::senders_from_queue() && !n42_tx_types::senders_claimed_at_ingest() {
         return None;
     }
     n42_tx_queue::global::<n42_engine_types::N42PooledTransaction>().filter(|queue| queue.has_hash_index())
@@ -1192,6 +1222,20 @@ where
     // the header by the transactions root the assembly checked.
     // The recovery pass writes its cache-hit count out here, because the
     // arm that skips the pass entirely has none to report.
+    // Under `N42_INGEST_VERIFY=leader` the queue's senders are the frames'
+    // claims rather than this node's recoveries, so the compact body's
+    // answer stops being an answer: it becomes the claim list the pass below
+    // checks the signatures against. Everything else about that road is
+    // unchanged.
+    let (given_senders, given_claims) = match given_senders {
+        Some(senders) if n42_tx_types::senders_claimed_at_ingest() => (None, Some(senders)),
+        given => (given, None),
+    };
+    if let Some(claims) = &given_claims
+        && claims.len() != tx_count
+    {
+        return Err(format!("given {} senders for {tx_count} transactions", claims.len()));
+    }
     let cache_hits_out = std::sync::atomic::AtomicU64::new(0);
     let recovered = match given_senders {
         Some(senders) if senders.len() != tx_count => {
@@ -1200,6 +1244,10 @@ where
         Some(senders) => RecoveredBlock::new_sealed(sealed, senders),
         None => {
             let cache_hits = std::sync::atomic::AtomicU64::new(0);
+            // Senders this road computed from a signature rather than read
+            // out of a cache or an index: what the ingest no longer pays for
+            // under `N42_INGEST_VERIFY=leader`.
+            let verified_here = std::sync::atomic::AtomicU64::new(0);
             let alt_cache = n42_tx_types::AltSigSenderCache::global();
             let txs: Vec<&TransactionSigned> = sealed.body().transactions().collect();
             // The transaction queue's by-hash index first, where it is kept:
@@ -1210,11 +1258,27 @@ where
             // the fleet at 163,000 transactions, loop202). See
             // [`senders_in_queue`] for why it may be trusted and what would
             // catch it if it could not be.
-            let indexed: Vec<Option<Address>> =
-                queue_for_senders().map_or_else(Vec::new, |queue| senders_in_queue(&queue, &txs));
+            let indexed: Vec<Option<Address>> = match given_claims {
+                // The compact body's assembly already read every one of them
+                // out of this node's queue; the index is not asked twice.
+                Some(claims) => claims.into_iter().map(Some).collect(),
+                None => queue_for_senders().map_or_else(Vec::new, |queue| senders_in_queue(&queue, &txs)),
+            };
             let from_index = indexed.iter().flatten().count();
-            phases.senders_indexed = from_index as u64;
-            let mut senders: Vec<Option<Address>> = if from_index == tx_count {
+            // Under `N42_INGEST_VERIFY=leader` the queue holds the frame's
+            // word for a sender, not this node's recovery of it, so what the
+            // index gives is a claim: something to check the signature
+            // against, never the answer to take. Everything below then falls
+            // through to the caches and, on a miss, to the verification --
+            // which is the whole point of the mode.
+            let (claims, indexed) = if n42_tx_types::senders_claimed_at_ingest() {
+                phases.claims_checked = from_index as u64;
+                (indexed, Vec::new())
+            } else {
+                phases.senders_indexed = from_index as u64;
+                (Vec::new(), indexed)
+            };
+            let mut senders: Vec<Option<Address>> = if !indexed.is_empty() && from_index == tx_count {
                 // Nothing left to look up: the pass below would walk 33 MB
                 // of transactions to read a discriminant per transaction and
                 // decide it already has the answer.
@@ -1241,6 +1305,10 @@ where
                                     cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     return Ok(Some(sender));
                                 }
+                                // ecrecover is the verification: a sender
+                                // that comes out of it is this node's own,
+                                // whatever the frame claimed.
+                                verified_here.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 tx.recover_signer()
                                     .map(Some)
                                     .map_err(|err| format!("sender of {}: {err}", tx.tx_hash()))
@@ -1270,7 +1338,32 @@ where
                     senders[i] = Some(sender);
                 }
             }
+            phases.verified_on_road =
+                verified_here.load(std::sync::atomic::Ordering::Relaxed) + misses.len() as u64;
             let senders: Vec<Address> = senders.into_iter().map(|s| s.expect("every sender resolved")).collect();
+            // The claim against the signature, where this node holds both.
+            // A disagreement is the proposer's error -- it built a block on
+            // a sender nothing verified -- and the vote is not released for
+            // it. Nothing here depends on the claim being right; this is
+            // what says so out loud instead of letting the block fail later
+            // on a nonce nobody can explain.
+            if !claims.is_empty() {
+                use rayon::prelude::*;
+                let mismatch = claims
+                    .par_iter()
+                    .zip(senders.par_iter())
+                    .position_any(|(claim, sender)| matches!(claim, Some(claimed) if claimed != sender));
+                if let Some(at) = mismatch
+                    && let Some(claimed) = claims[at]
+                {
+                    CLAIM_MISMATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Err(format!(
+                        "transaction {at} ({}): its signature says {}, this node's queue was told {claimed}",
+                        txs[at].tx_hash(),
+                        senders[at],
+                    ));
+                }
+            }
             cache_hits_out.store(cache_hits.into_inner(), std::sync::atomic::Ordering::Relaxed);
             RecoveredBlock::new_sealed(sealed, senders)
         }

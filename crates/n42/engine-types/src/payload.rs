@@ -246,7 +246,13 @@ where
                 // selection is a walk and taking is a pop, against 116-220 ms
                 // a build from the pool's ordered sets on a tenure leader.
                 match n42_tx_queue::global::<Pool::Transaction>() {
-                    Some(queue) => Box::new(queue.best_for_build(parent_hash)),
+                    // With `N42_INGEST_VERIFY=leader` the queue's senders
+                    // are the frames' claims; the wrapper verifies each one
+                    // before the build can include it (`claimed_build`).
+                    Some(queue) => {
+                        let best = queue.best_for_build(parent_hash);
+                        crate::claimed_build::selection(&queue, best)
+                    }
                     None => self.pool.best_transactions_with_attributes(attributes),
                 }
             },
@@ -366,7 +372,10 @@ where
         );
         let select_pool = pool.clone();
         let select = move |attributes| match n42_tx_queue::global::<Pool::Transaction>() {
-            Some(queue) => Box::new(queue.best_for_build(parent_hash)) as BestTransactionsIter<Pool>,
+            Some(queue) => {
+                let best = queue.best_for_build(parent_hash);
+                crate::claimed_build::selection(&queue, best)
+            }
             None => select_pool.best_transactions_with_attributes(attributes),
         };
         let unwrap = |outcome: Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError>| -> Result<EthBuiltPayload, String> {
@@ -734,6 +743,15 @@ where
     let mut lookahead: std::collections::VecDeque<_> = std::collections::VecDeque::new();
     let mut prefetch_ns: u128 = 0;
     let fast_hits_before = crate::fast_transfer::hits();
+    // The claimed senders this build verifies and refuses, and what it
+    // spends doing so (`N42_INGEST_VERIFY=leader`; all three are 0 with the
+    // mode off). Read as a difference over the build, like the fast-transfer
+    // hits above, and smeared the same way when two builds overlap.
+    let (verified_before, dropped_before, verify_ms_before) = (
+        crate::claimed_build::verified(),
+        crate::claimed_build::dropped(),
+        crate::claimed_build::verify_ms(),
+    );
     let ticks_at_start = ticks();
     let mut pool_ticks: u64 = 0;
     let mut exec_ticks: u64 = 0;
@@ -2202,6 +2220,9 @@ where
             pool_ms = (pool_ns / 1_000_000) as u64,
             prefetch_ms = (prefetch_ns / 1_000_000) as u64,
             fast = crate::fast_transfer::hits().saturating_sub(fast_hits_before),
+            verified_by_builder = crate::claimed_build::verified().saturating_sub(verified_before),
+            builder_dropped_bad_claim = crate::claimed_build::dropped().saturating_sub(dropped_before),
+            verify_ms = crate::claimed_build::verify_ms().saturating_sub(verify_ms_before),
             par_txs,
             par_groups,
             par_batches,

@@ -255,9 +255,15 @@ pub enum Dropped {
     /// that makes a hole** when the watermark came from a build's verdict
     /// about a block consensus never committed.
     StaleGiveBack,
-    /// A build refused it for a nonce the chain is past, so the lane drops
-    /// it and everything below.
+    /// A build refused it for a nonce a canonical block confirms is behind
+    /// the chain, so the lane drops it and everything below.
     StaleRefusal,
+    /// A build refused it as behind the chain, but no canonical block says
+    /// so: the build was standing on a block of its own that consensus did
+    /// not keep. Given back rather than dropped -- acting on that verdict
+    /// is what made loop214's holes. Not a loss; a reading of how often a
+    /// build's state runs ahead of the chain.
+    StaleUnconfirmed,
     /// A give-back for a sender with no lane at all.
     NoLane,
     /// An own block pushed past the bound on held blocks before the chain
@@ -269,12 +275,13 @@ pub enum Dropped {
 
 impl Dropped {
     /// Every reason, in report order.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Duplicate,
         Self::Mined,
         Self::StaleArrival,
         Self::StaleGiveBack,
         Self::StaleRefusal,
+        Self::StaleUnconfirmed,
         Self::NoLane,
         Self::HeldEvicted,
         Self::HeldBehind,
@@ -288,6 +295,7 @@ impl Dropped {
             Self::StaleArrival => "stale_arrival",
             Self::StaleGiveBack => "stale_give_back",
             Self::StaleRefusal => "stale_refusal",
+            Self::StaleUnconfirmed => "stale_unconfirmed",
             Self::NoLane => "no_lane",
             Self::HeldEvicted => "held_evicted",
             Self::HeldBehind => "held_behind",
@@ -301,9 +309,10 @@ impl Dropped {
             Self::StaleArrival => 2,
             Self::StaleGiveBack => 3,
             Self::StaleRefusal => 4,
-            Self::NoLane => 5,
-            Self::HeldEvicted => 6,
-            Self::HeldBehind => 7,
+            Self::StaleUnconfirmed => 5,
+            Self::NoLane => 6,
+            Self::HeldEvicted => 7,
+            Self::HeldBehind => 8,
         }
     }
 }
@@ -313,7 +322,7 @@ impl Dropped {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DropReport {
     /// Counts in [`Dropped::ALL`] order.
-    pub counts: [u64; 8],
+    pub counts: [u64; 9],
     /// The first few, as (reason, sender, nonce): enough to take one sender
     /// to the generator's own log and see which nonce went missing.
     pub samples: Vec<(Dropped, Address, u64)>,
@@ -1730,6 +1739,44 @@ impl<T: PoolTransaction> BestTransactions for QueueBest<T> {
         let sender = transaction.sender();
         let stale = matches!(&kind, InvalidPoolTransactionError::Consensus(err) if err.is_nonce_too_low());
         if stale {
+            let nonce = transaction.nonce();
+            let mut inner = self.queue.inner.lock();
+            // Only the chain can say a nonce is behind it.
+            //
+            // A build's state is its parent's, and a parent is not always a
+            // block consensus keeps. loop214 Pd node2 ran three builds at
+            // once for heights 637-639 that were already committed
+            // (`a build on another parent was superseded` twice in half a
+            // second, `forgotten=0` on the hand-off of 639); each stood on a
+            // block of its own that the chain replaced, and each was offered
+            // a sender's run of 64 that its own state had already executed.
+            // It refused them one at a time as behind the chain, and each
+            // refusal took one more nonce out of the queue for good. The
+            // chain had mined none of them: the sender's account stayed at 0
+            // while its lane started at 64, 192, 320 -- whole multiples of
+            // the run a build takes -- and every later nonce of that sender
+            // queued behind the hole for the rest of the leg. Twenty-nine
+            // senders on that node, `(sender, 0, 64)` and `(sender, 0, 256)`
+            // on the holes line, and none of them gapped on any other node.
+            //
+            // So the verdict is acted on only as far as a canonical block
+            // has confirmed it. Past that the transaction goes back the
+            // ordinary way, to be offered again and removed by the prune if
+            // the chain really does mine it.
+            let confirmed = inner.lanes.get(&sender).is_some_and(|lane| lane.chain_mined(nonce));
+            if !confirmed {
+                inner.dropped(Dropped::StaleUnconfirmed, sender, nonce);
+                drop(inner);
+                self.skipped.insert(sender);
+                let mut inner = self.queue.inner.lock();
+                if let Some((_, taken)) = inner.last_build.as_mut()
+                    && let Some(at) = taken.iter().rposition(|t| Arc::ptr_eq(t, transaction))
+                {
+                    taken.remove(at);
+                }
+                inner.give_back(vec![Arc::clone(transaction)]);
+                return;
+            }
             // The chain is past this nonce. It used to be left in the build's
             // taken list -- not given back, but not forgotten either -- so the
             // next give-back on that parent put it in the lanes again, and
@@ -1740,16 +1787,13 @@ impl<T: PoolTransaction> BestTransactions for QueueBest<T> {
             // The sender is deliberately not skipped for the rest of this
             // build: its higher nonces are what the chain wants next, and
             // this one being stale says nothing against them.
-            let mut inner = self.queue.inner.lock();
             if let Some((_, taken)) = inner.last_build.as_mut()
                 && let Some(at) = taken.iter().rposition(|t| Arc::ptr_eq(t, transaction))
             {
                 taken.remove(at);
             }
-            inner.dropped(Dropped::StaleRefusal, sender, transaction.nonce());
-            // A build's verdict, not a block's: the watermark rises, but the
-            // lane remembers that no canonical block said so.
-            inner.remove_mined_from(sender, transaction.nonce(), false);
+            inner.dropped(Dropped::StaleRefusal, sender, nonce);
+            inner.remove_mined_from(sender, nonce, true);
             return;
         }
         self.skipped.insert(sender);
@@ -2301,43 +2345,53 @@ mod tests {
         queue.push(vec![tx(1, 0)]);
         queue.drain_now();
         // An arrival a canonical block is past: `mined`, not a suspect.
-        queue.remove_mined(Address::repeat_byte(1), 1);
+        queue.remove_mined_batch([(Address::repeat_byte(1), 1)]);
         queue.push(vec![tx(1, 1)]);
         queue.drain_now();
-        // A build's stale refusal, which raises a watermark no block put
-        // there; an arrival filtered by *that* is `stale_arrival`, and it
-        // is the shape a hole takes.
+        // A build's verdict a canonical block confirms: `stale_refusal`.
         queue.push(vec![tx(2, 5), tx(2, 6)]);
         let mut best = queue.best_for_build(B256::repeat_byte(1));
         let head = best.next().expect("the lane's head");
+        queue.remove_mined_batch([(Address::repeat_byte(2), 5)]);
         best.mark_invalid(
             &head,
             InvalidPoolTransactionError::Consensus(InvalidTransactionError::NonceNotConsistent { tx: 5, state: 9 }),
         );
         drop(best);
-        queue.push(vec![tx(2, 5)]);
-        queue.drain_now();
+        // A build's verdict no block confirms: `stale_unconfirmed`, and the
+        // transaction goes back rather than out.
+        queue.push(vec![tx(3, 0), tx(3, 1)]);
+        let mut best = queue.best_for_build(B256::repeat_byte(2));
+        let head = std::iter::from_fn(|| best.next())
+            .find(|t| t.sender() == Address::repeat_byte(3))
+            .expect("the third sender");
+        best.mark_invalid(
+            &head,
+            InvalidPoolTransactionError::Consensus(InvalidTransactionError::NonceNotConsistent { tx: 0, state: 7 }),
+        );
+        drop(best);
 
         let report = queue.take_drops();
         assert!(report.interesting(), "{report:?}");
         let named: alloy_primitives::map::HashMap<&str, u64> = report.named().into_iter().collect();
-        assert_eq!(named.get("duplicate"), Some(&1));
+        assert_eq!(named.get("duplicate"), Some(&1), "{named:?}");
         assert_eq!(named.get("mined"), Some(&1), "{named:?}");
-        assert_eq!(named.get("stale_arrival"), Some(&1), "{named:?}");
-        assert_eq!(named.get("stale_refusal"), Some(&1));
-        assert!(report.samples.iter().any(|(r, _, n)| *r == Dropped::StaleArrival && *n == 5));
+        assert_eq!(named.get("stale_refusal"), Some(&1), "{named:?}");
+        assert_eq!(named.get("stale_unconfirmed"), Some(&1), "{named:?}");
         assert!(
             !report.samples.iter().any(|(r, _, _)| *r == Dropped::Mined),
             "a transaction the chain holds is not a suspect"
         );
+        // The unconfirmed one is still in the queue.
+        let mut after = queue.best_for_build(B256::repeat_byte(3));
+        let offered: Vec<(u8, u64)> =
+            std::iter::from_fn(|| after.next()).map(|t| (t.sender().as_slice()[0], t.nonce())).collect();
+        drop(after);
+        assert!(offered.contains(&(3, 0)), "an unconfirmed verdict took it out of the queue: {offered:?}");
         // Taking it clears it.
         assert_eq!(queue.take_drops(), DropReport::default());
     }
 
-    /// Every door that can change a parked lane, against the walk.
-    ///
-    /// `parked_len` is the ingest gate's number and it is maintained
-    /// incrementally, so nothing but a test can say it is right.
     #[test]
     fn the_parked_total_matches_the_walk_through_every_door() {
         let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(4).with_park_lanes(64);
@@ -2615,6 +2669,9 @@ mod tests {
         let mut best = queue.best_for_build(B256::repeat_byte(1));
         let head = best.next().expect("the lane's head");
         assert_eq!(head.nonce(), 3);
+        // A canonical block carried this sender through nonce 3, so the
+        // build's verdict about it is one the queue acts on.
+        queue.remove_mined_batch([(Address::repeat_byte(1), 3)]);
         // The account is at nonce 5: the head and everything below it are
         // behind the chain.
         best.mark_invalid(&head, gap(3, 5));
@@ -2773,8 +2830,10 @@ mod tests {
         let mut build = queue.best_for_build(parent);
         let took: Vec<_> = std::iter::from_fn(|| build.next()).collect();
         assert_eq!(took.len(), 4);
-        // The account is at nonce 2: the build refuses (1,1) as stale, which
-        // makes (1,0) -- still in the take -- stale as well.
+        // A canonical block carried (1,1); the account is at nonce 2, and
+        // the build refuses (1,1) as stale, which makes (1,0) -- still in
+        // the take -- stale as well.
+        queue.remove_mined_batch([(Address::repeat_byte(1), 1)]);
         let stale = took
             .iter()
             .find(|t| t.sender() == Address::repeat_byte(1) && t.nonce() == 1)
@@ -2803,6 +2862,9 @@ mod tests {
         let mut build = queue.best_for_build(parent);
         let first = build.next().expect("one queued");
         assert_eq!(first.nonce(), 0);
+        // The chain mines it while the build holds it, which is how a build
+        // comes to be holding something the chain is past at all.
+        queue.remove_mined_batch([(Address::repeat_byte(1), 0)]);
         build.mark_invalid(
             &first,
             InvalidPoolTransactionError::Consensus(InvalidTransactionError::NonceNotConsistent { tx: 0, state: 1 }),
@@ -2816,8 +2878,55 @@ mod tests {
         assert_eq!(again, vec![1, 2]);
     }
 
-    /// A reorg puts back what the reverted blocks carried, watermark and all:
-    /// the chain no longer holds those nonces (round 43).
+    /// loop214 Pd node2: a build standing on a block of its own that
+    /// consensus replaced refuses a sender's whole run as behind the chain,
+    /// and every refusal used to take one more nonce out of the queue for
+    /// good -- the sender's account left at 0 with its lane starting at 64,
+    /// and every later nonce of that sender stuck behind the hole for the
+    /// rest of the leg.
+    ///
+    /// No canonical block ever carried any of it, so nothing the build says
+    /// about it is something the queue may act on.
+    #[test]
+    fn a_verdict_no_block_confirms_does_not_take_the_lane_with_it() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(64);
+        queue.push((0..64).map(|n| tx(1, n)).collect::<Vec<_>>());
+
+        // A build takes the run and its block is superseded; the next build
+        // is offered it again.
+        let mut first = queue.best_for_build(B256::repeat_byte(1));
+        let took: Vec<_> = std::iter::from_fn(|| first.next()).collect();
+        assert_eq!(took.len(), 64);
+        drop(first);
+
+        // That next build stands on the superseded block, whose state has
+        // the sender at 64, and refuses the head as behind the chain. The
+        // sender is then skipped for the rest of this build -- one refusal,
+        // not one per nonce, which is the walk-up the old path paid.
+        let mut build = queue.best_for_build(B256::repeat_byte(2));
+        let head = build.next().expect("the lane's head");
+        assert_eq!(head.nonce(), 0);
+        build.mark_invalid(
+            &head,
+            InvalidPoolTransactionError::Consensus(InvalidTransactionError::NonceNotConsistent { tx: 0, state: 64 }),
+        );
+        assert!(build.next().is_none(), "the sender was offered again inside the same build");
+        drop(build);
+
+        // The chain mined none of it, so the queue still holds all of it and
+        // the next build is offered the sender from nonce 0.
+        let mut after = queue.best_for_build(B256::repeat_byte(3));
+        let offered: Vec<u64> = std::iter::from_fn(|| after.next()).map(|t| t.nonce()).collect();
+        drop(after);
+        assert_eq!(offered.first().copied(), Some(0), "the lane's head was taken by an unconfirmed verdict");
+        assert_eq!(offered.len(), 64, "the run was lost: {} left", offered.len());
+
+        let report = queue.take_drops();
+        let named: alloy_primitives::map::HashMap<&str, u64> = report.named().into_iter().collect();
+        assert_eq!(named.get("stale_unconfirmed"), Some(&1), "{named:?}");
+        assert_eq!(named.get("stale_refusal"), None, "no block confirmed any of it");
+    }
+
     #[test]
     fn a_reorg_gives_back_what_the_watermark_would_have_filtered() {
         let queue: TxQueue<EthPooledTransaction> = TxQueue::new();

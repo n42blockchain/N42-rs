@@ -1196,5 +1196,22 @@ to find out (8), before any code.
 - lane-holes-4 on the fleet: `the heads a build could not use` with account nonce 0 -- **0 in every leg** (the fix's
   signature); `stale_unconfirmed` 310-6,061 says how often a build stood on a state consensus did not keep, a reading.
 
+### 5.2 The block size's sweet spot (loop216): 163k, and the cycle is per-transaction
+
+Four sizes at four nodes (tenure 256; each size paced near 0.9x its cycle; window 1 / window 2, medians of the legs):
+
+| transfers a block | 120,000 | 163,000 | 200,000 | 260,000 |
+| --- | --- | --- | --- | --- |
+| cycle (window 1) | 0.195-0.197 s | 0.252 s | 0.319 s | 0.435-0.476 s |
+| TPS, window 1 / 2 | 607-616k / 588-596k | 646-663k / 619-647k | 619-620k / 479-598k | 532-591k / 430-481k |
+| R1 / import / build (ms) | 105-110 / 138-140 / 212-216 | 145-153 / 189-198 / 274-283 | 188-197 / 255-305 / 343-379 | 265-276 / 312-366 / 358-410 |
+
+- **163,000 is the sweet spot, and it is flat**: 616k below it, 620k above it, 560k at 260k. Not a lever.
+- **The cycle is per-transaction with a ~35 ms fixed part**: 120k -> 163k adds 1.33 us a transaction, 163k -> 200k
+  1.8, 200k -> 260k 2.3 (the pool deeper, the body larger, the passes less cache-friendly); the intercept of the first
+  segment is 35 ms -- 14% of the cycle. R1 scales at 0.9 us a transaction, the import at 1.4, the build at 1.6. So
+  1M at any block size means the three per-transaction chains (1-3 of the table) cut by ~40% together; nothing in the
+  fixed part is worth more than 5% of the way.
+
 Each attempt is one agent brief and one runner; the bar for adopting any is the same as plan v4's: window 2 in every leg,
 verify 4/4, and the number it targets moving on the fleet, not on a bench.

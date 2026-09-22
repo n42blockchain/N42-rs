@@ -36,6 +36,8 @@ alloy-eips.workspace = true
 reth-trie.workspace = true
 revm-database.workspace = true
 bincode.workspace = true
+# The delta log's per-record tear digest; see `frame_delta`.
+crc32fast = "1.5"
 libc.workspace = true
 eyre.workspace = true
 serde = { workspace = true, features = ["derive", "std"] }

@@ -23,7 +23,17 @@
 //! greeting := "N42P", u8 version, u32 features   (receiver -> sender, once)
 //! frame    := u32 len (little-endian), len bytes of gov5 block RLP
 //!           | u32 0xffffffff, u32 len, len bytes of compact body
+//!           | u32 0xfffffffe, u32 len, len bytes of the sender's peer id
 //! ```
+//!
+//! The sender names itself once per connection, before its first body. A
+//! receiver that takes a *compact* body has to ask someone for the
+//! transactions it does not hold, and the one member certain to have them is
+//! the one that built the block -- which is the member that pushed it here.
+//! Without this the receiver could only guess among its peers, and loop196
+//! measured what guessing costs: 229-331 refusals a leg against 13-46 fills
+//! that worked, each refusal then asking every peer for the whole 26 MB
+//! body.
 //!
 //! The greeting is what makes the compact body (`N42_COMPACT_BODY`) safe in
 //! a mixed fleet. It goes the other way down the same connection, which
@@ -80,6 +90,10 @@ pub struct BodyBuf {
     /// Whether these bytes are a compact body rather than a gov5 one. Only
     /// the channel ever sets it; everything else builds full bodies.
     compact: bool,
+    /// The peer that pushed it, when it named itself. For a block's body
+    /// that is the member that built it, which is the one member certain to
+    /// hold every transaction of it.
+    from: Option<Arc<str>>,
 }
 
 /// What the greeting starts with, so a stray connection is not read as one.
@@ -96,6 +110,15 @@ const FEATURE_COMPACT: u32 = 1;
 /// Out of range for a real one -- [`MAX_BODY_BYTES`] is 256 MB -- and only
 /// ever written to a peer whose greeting asked for it.
 const COMPACT_MARKER: u32 = u32::MAX;
+
+/// The length field that says "the sender's peer id follows". Written once
+/// per connection, before the first body; a sender that predates it writes
+/// none and its bodies simply arrive unattributed.
+const HELLO_MARKER: u32 = u32::MAX - 1;
+
+/// Longest peer id accepted, so a stray connection cannot make this node
+/// allocate on a whim. A libp2p peer id is ~50 bytes as text.
+const MAX_PEER_ID_BYTES: u32 = 256;
 
 /// How long a sender waits for a receiver's greeting before deciding it has
 /// none. Paid once per connection, and only against a peer that predates
@@ -119,9 +142,26 @@ impl BodyBuf {
         self.as_slice().to_vec()
     }
 
+    /// The bytes as shared bytes: a refcount when they already are some
+    /// (every body that arrived on this channel or over libp2p), a copy
+    /// only for one that lives in a pooled buffer. Serving a peer used to
+    /// copy 26 MB on the consensus loop for every request.
+    pub fn to_shared(&self) -> alloy_primitives::Bytes {
+        match &self.shared {
+            Some(bytes) => bytes.clone(),
+            None => alloy_primitives::Bytes::copy_from_slice(&self.buf),
+        }
+    }
+
     /// Whether these bytes are a compact body.
     pub const fn is_compact(&self) -> bool {
         self.compact
+    }
+
+    /// The peer that pushed it, as it named itself; `None` from any source
+    /// but the channel, and from a sender that does not name itself.
+    pub fn from(&self) -> Option<&str> {
+        self.from.as_deref()
     }
 
     fn as_slice(&self) -> &[u8] {
@@ -141,13 +181,13 @@ impl std::ops::Deref for BodyBuf {
 
 impl From<Vec<u8>> for BodyBuf {
     fn from(buf: Vec<u8>) -> Self {
-        Self { buf, pool: None, shared: None, compact: false }
+        Self { buf, pool: None, shared: None, compact: false, from: None }
     }
 }
 
 impl From<alloy_primitives::Bytes> for BodyBuf {
     fn from(bytes: alloy_primitives::Bytes) -> Self {
-        Self { buf: Vec::new(), pool: None, shared: Some(bytes), compact: false }
+        Self { buf: Vec::new(), pool: None, shared: Some(bytes), compact: false, from: None }
     }
 }
 
@@ -207,12 +247,38 @@ async fn receive(mut stream: TcpStream, sink: mpsc::Sender<BodyBuf>, pool: Arc<B
     greeting.extend_from_slice(&features.to_le_bytes());
     stream.write_all(&greeting).await?;
     stream.flush().await?;
+    // Whoever is on the other end, once it has said so.
+    let mut from: Option<Arc<str>> = None;
     loop {
         let len = match stream.read_u32_le().await {
             Ok(len) => len,
             Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(err) => return Err(err),
         };
+        if len == HELLO_MARKER {
+            let len = stream.read_u32_le().await?;
+            if len == 0 || len > MAX_PEER_ID_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("peer id of {len} bytes"),
+                ));
+            }
+            let mut id = vec![0u8; len as usize];
+            stream.read_exact(&mut id).await?;
+            match String::from_utf8(id) {
+                Ok(id) => {
+                    debug!(target: "n42.h2.node", %id, "a body-channel sender named itself");
+                    from = Some(Arc::from(id.as_str()));
+                }
+                Err(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "peer id is not text",
+                    ))
+                }
+            }
+            continue;
+        }
         let compact = len == COMPACT_MARKER;
         let len = if compact { stream.read_u32_le().await? } else { len };
         if len == 0 || len > MAX_BODY_BYTES {
@@ -221,7 +287,13 @@ async fn receive(mut stream: TcpStream, sink: mpsc::Sender<BodyBuf>, pool: Arc<B
         let mut body = pool.take();
         body.resize(len as usize, 0);
         stream.read_exact(&mut body).await?;
-        let body = BodyBuf { buf: body, pool: Some(Arc::clone(&pool)), shared: None, compact };
+        let body = BodyBuf {
+            buf: body,
+            pool: Some(Arc::clone(&pool)),
+            shared: None,
+            compact,
+            from: from.clone(),
+        };
         if sink.send(body).await.is_err() {
             return Ok(());
         }
@@ -233,6 +305,9 @@ async fn receive(mut stream: TcpStream, sink: mpsc::Sender<BodyBuf>, pool: Arc<B
 #[derive(Debug, Clone)]
 pub struct BodyPushers {
     peers: Vec<(SocketAddr, mpsc::Sender<OfferedBody>)>,
+    /// What this node calls itself on the channel, once it knows. Shared
+    /// with every push task, which sends it on each connection it makes.
+    me: Arc<std::sync::OnceLock<String>>,
 }
 
 impl BodyPushers {
@@ -240,15 +315,23 @@ impl BodyPushers {
     /// any error, so a member that is down or not yet up costs nothing but
     /// the frames it missed.
     pub fn connect(addrs: Vec<SocketAddr>) -> Self {
+        let me: Arc<std::sync::OnceLock<String>> = Arc::new(std::sync::OnceLock::new());
         let peers = addrs
             .into_iter()
             .map(|addr| {
                 let (tx, rx) = mpsc::channel(PER_PEER_QUEUE);
-                tokio::spawn(push_loop(addr, rx));
+                tokio::spawn(push_loop(addr, rx, Arc::clone(&me)));
                 (addr, tx)
             })
             .collect();
-        Self { peers }
+        Self { peers, me }
+    }
+
+    /// Tells the push tasks what to call this node on the channel, so a
+    /// receiver knows who pushed a body. Set once, before anything is
+    /// pushed; a connection made before it stays unnamed.
+    pub fn announce(&self, id: impl Into<String>) {
+        let _ = self.me.set(id.into());
     }
 
     /// How many peers this pushes to.
@@ -289,7 +372,11 @@ async fn read_greeting(stream: &mut TcpStream) -> u32 {
     }
 }
 
-async fn push_loop(addr: SocketAddr, mut rx: mpsc::Receiver<OfferedBody>) {
+async fn push_loop(
+    addr: SocketAddr,
+    mut rx: mpsc::Receiver<OfferedBody>,
+    me: Arc<std::sync::OnceLock<String>>,
+) {
     let mut stream: Option<TcpStream> = None;
     let mut features = 0u32;
     while let Some(body) = rx.recv().await {
@@ -309,6 +396,20 @@ async fn push_loop(addr: SocketAddr, mut rx: mpsc::Receiver<OfferedBody>) {
                         0
                     };
                     debug!(target: "n42.h2.node", %addr, features, "body channel connected");
+                    // Name this node before the first body: the receiver
+                    // needs to know who built the block it is about to get.
+                    if let Some(me) = me.get() {
+                        let hello = async {
+                            connected.write_u32_le(HELLO_MARKER).await?;
+                            connected.write_u32_le(me.len() as u32).await?;
+                            connected.write_all(me.as_bytes()).await
+                        }
+                        .await;
+                        if let Err(err) = hello {
+                            debug!(target: "n42.h2.node", %addr, %err, "body channel: could not name this node");
+                            continue;
+                        }
+                    }
                     stream = Some(connected);
                 }
                 Ok(Err(err)) => {
@@ -398,6 +499,35 @@ mod tests {
         assert_eq!(pushers.push(offer(vec![7u8; 10])), 1);
         let got = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
         assert_eq!(&got[..], &[7u8; 10][..]);
+    }
+
+    /// A sender that names itself is remembered, and every body from that
+    /// connection carries it; one that does not leaves its bodies
+    /// unattributed, which is what an older member does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_named_sender_is_carried_with_its_bodies() {
+        for name in [Some("12D3KooWtheLeader"), None] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            drop(listener);
+            let (tx, mut rx) = mpsc::channel(4);
+            listen(addr, tx).await.unwrap();
+            let pushers = BodyPushers::connect(vec![addr]);
+            if let Some(name) = name {
+                pushers.announce(name);
+            }
+            assert_eq!(
+                pushers.push(OfferedBody {
+                    full: alloy_primitives::Bytes::from_static(&[1, 2, 3]),
+                    compact: None,
+                }),
+                1
+            );
+            let got =
+                tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+            assert_eq!(&got[..], &[1u8, 2, 3][..]);
+            assert_eq!(got.from(), name);
+        }
     }
 
     /// A peer that did not greet for compact bodies is sent the whole body,

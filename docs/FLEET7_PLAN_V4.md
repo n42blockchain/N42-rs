@@ -1060,6 +1060,21 @@ the queue -- the queue pruned by blocks the parent does not have (a chained buil
 handover build on a parent this node has not imported). The move is then to refuse the build and rebuild on the head,
 not to refuse 163,000 candidates or park the senders: `plan-v4/stale-parent`.
 
+## 2ah. The stale-parent hypothesis falsified: the collapse is node-local, gradual, and in the lanes
+
+`plan-v4/stale-parent` (merged: instrumentation; the refusal built and off). loop213 Pe's 26 empty builds were chained
+builds on the node's own previous block, canonical and committed before each build ran -- not a replaced block, not
+a handover parent, not a stale parent (no reorg, no replaced own block, no pruner lag, no ingest drop, no generator
+timeout in the leg). What the leg shows instead: on the stalling node `par_groups` -- the distinct senders a build was
+offered -- falls 387 -> 326 -> 301 -> 251 -> 36 over twenty blocks while the queue holds 380-535k, so 383,412
+transactions sit in ~36 lanes of ~10,600 each with every head refused (`NonceTooHigh`, 270k a leg); the committed
+blocks go 165k -> 26k -> 9k -> 0 for twenty-four views, and the moment the tenure ends the next leader mines 163k a
+block from the same flood. The two nodes that stalled carry `stale_refusal` 14-15k and `stale_give_back` 8-20k; the
+two that did not, 6-18 and 0. What no line could say is which nonce is missing and on which side of the account nonce
+a head sits: `the heads a build could not use` (sender, lane head, account nonce, head - nonce) and `holes a build ran
+into that the pool cannot fill` (with `N42_TX_INGEST_DIRECT` the pool never has them, so the gap feed has dropped
+every such hole silently since it was written) say it now. loop214 reads them.
+
 ## 3. What not to do
 
 - Do not judge a cycle-shortening change at a pacing above the natural cycle; do not judge any change without R1.

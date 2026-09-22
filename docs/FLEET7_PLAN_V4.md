@@ -635,6 +635,43 @@ launch arguments in one env file as `fleet7-env.sh` has them. What to read first
 at 16 cores against the same table at 28, then the dissection -- the segments that were slices of one budget should
 separate again.
 
+## 2q. Four nodes: 538-543k at the pacing floor, ~600k below it, and the follower's import is the bound (loop199-200)
+
+`plan-v4/fleet4` (merged 2aba0c93c): the same binaries, `n42_fleet4_bench.json` (fleet7's with validators 0-3, the
+same keys), 4 x 56 CPUs (28 physical cores each; the flood on the same sixteen cores as before), quorum 3 of 4, a root
+of its own. The smoke leg passed every check (4/4 agree, no invalid block, no committee-evidence error, the CPU sets as
+printed). Where the sixteen cores of a seven-node member went 13.7 (tokio 5.8, rayon 3.8, jemalloc 1.9, storage 1.7),
+a four-node member's twenty-eight go 17.9 (tokio 9.0, rayon 5.1, storage 3.0): the same work spread wider, ten cores
+to spare.
+
+| four nodes, chain configuration | pacing 275 (loop199 x5, loop200 x2) | 225 | 175 | 125 |
+| --- | --- | --- | --- | --- |
+| window 1 | 532-543k at 0.300-0.303 s | 578k / 603k | 579k / 600k | 599k / 436k |
+| window 2 | 527-543k | 429k / 549k | 345k / 579k | 562k / 572k |
+| cycle, full blocks (dissected) | 288 | -- | 261 | 263 |
+| B / D / E | 150 / 120 / 7 | | 216 / 25 / 8 | 216 / 19 / 8 |
+| follower import (total / exec / root) | 195 / 96 / 26 | 390 | 372 / 135 / 34 | 379 |
+| queue trough (p5) | 138-208k | 90-97k | 88-91k | 90k |
+
+- **At 275 ms every configuration reads the same 0.300 s** -- chain or not, rayon 16 or 28 -- because the pacing
+  binds: D is 120 ms of waiting. Window 1 and 2 are the same 538-543k, the first time window 2 has matched window 1.
+- **Below 275 the cycle reaches 261-263 ms (600k) and window 2 becomes erratic**: the follower's import goes 195 ->
+  370-390 ms (execution 96 -> 135, root 26 -> 34, and the rest waiting), longer than the cycle, so the backlog grows
+  and a window collapses (345k, 429k, 436k) or does not. The vote (deferred) is released at +180 ms; what cannot keep
+  up is the execution behind it. R1 rises 145 -> 166-203 as the import's threads take the cores the vote road runs on.
+  This is the seven-node limit at a higher rate: at 28 cores a node still spends 17-18 of them, and the pacing at 275
+  was hiding the import behind the wait.
+- **The flood keeps up**: 538-548k/s delivered with the queue's median at 486k; at 20,000 tx a sender, window 3 is no
+  longer the flood running dry.
+- Peak memory 57-60 GB for four execution layers (75-90 for seven).
+
+**What follows.** The floor at four nodes is the follower's import, 195 ms with slack and 370 ms without: its
+execution (96-135 ms for 163,000 transfers on the 16-28-thread pool) and root. Two directions, both in this plan:
+the compact body (the road's decode and sender look-ups gone; `plan-v4/compact-body-3`, whose two commits are in but
+unverified) frees cores the import can use; and the import's own execution -- the grafted parallel transfer at 96 ms
+against ~50 ms of pure execution in the builder -- is plan step 3's other half. Pacing stays at 275 until the import
+is under the cycle at 225.
+
 ## 3. What not to do
 
 - Do not judge a cycle-shortening change at a pacing above the natural cycle; do not judge any change without R1.

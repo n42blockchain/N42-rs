@@ -1083,6 +1083,29 @@ lines appear only on the nodes that stall (Pd node2: 22 `heads`, 32 `holes`; nod
 the instrument is on the defect. The stale-parent refusal, on, would have fired twice in four legs: not that. Being
 read: the sign of head - nonce per sender, whether the missing nonce ever reached the node or any other node's block.
 
+## 2aj. The door: a build's "behind the chain" verdict acted on for a block consensus did not keep
+
+`plan-v4/lane-holes-4` (merged 0a107ef68). The heads a stalling node could not use had **account nonce 0** and lane
+heads at 64, 192, 320 -- whole runs of `N42_TX_QUEUE_RUN` -- fixed from the moment they appeared, the same 29 senders
+for forty builds; no other node ever reported those senders, and no canonical block ever carried their nonce 0: the
+generator delivered them everywhere and one node's queue lost them. The door: three builds ran at once for heights
+the chain had already committed, each on an own block consensus replaced; re-offered the sender's first run, each
+refused it as "behind the chain" (its parent's state had the sender past that run), and `mark_invalid`'s stale branch
+dropped the transaction and everything below it and raised the watermark so no give-back could return it -- 64
+refusals removed the run for good. Fixed: a "behind the chain" verdict is acted on only as far as a canonical block
+confirms it (`chain_mined`); past that the transaction goes back and the sender is skipped for the rest of that build
+(one refusal a sender a build, which also removes the `stale_refusal` walk-ups); and a build for a height the chain
+has already committed is cancelled before it selects anything (`N42_BUILD_SKIP_DECIDED=0` disables). Why three
+builds ran for committed heights is not addressed; the cancel counts them. Confirmed on the fleet: pending (loop215
+carries it).
+
+**Checkpoint, tag `fleet4-plan-v4-p-20260922`, merged to `main`.** Four nodes, the P configuration
+(`scripts/fleet7-runs/run-loop214.sh`'s `CH`, parking off): window 1 630-646k, window 2 619-636k when nothing stalls
+(fourteen of fifteen legs over loop210-212), cycle 0.252-0.263 s. Known: `n42-testing`'s
+`test_altsig_transfer__is_mined_and_typed_0x50` fails when the suite runs in parallel and passes alone or with
+`--test-threads=1`, at this tag and at the previous one -- a process-wide flag another test sets first, not a
+regression of this work; to be made order-independent.
+
 ## 3. What not to do
 
 - Do not judge a cycle-shortening change at a pacing above the natural cycle; do not judge any change without R1.
@@ -1103,3 +1126,56 @@ of what changed, what was tested and what could not be verified. Nothing reaches
 the commander, and no crate is edited in the main checkout between a runner's build and its claim. Results are
 appended to `FLEET7_PATH_AUDIT.md` section 9 as each step is judged; a step that fails its criterion is recorded
 there with its numbers and dropped.
+
+## 5. Plan v5: the ceilings between 640k and 1M, and the attempts (2026-09-22)
+
+Where the four-node fleet stands after plan v4: window 1 630-646k, window 2 619-636k when nothing stalls, at a
+0.252-0.263 s cycle with 163,000-transfer blocks (`docs/FLEET7_PLAN_V4.md` 2q-2ai). 1M TPS is either the same block at
+a 0.163 s cycle, or a 260,000-transfer block at today's cycle, or anything between. Every number below is a
+measurement from loop207-214 unless marked; the ceilings are given as the rate each would allow on its own, so the
+lowest is the one that binds and the order of work is the order of the table.
+
+| # | ceiling | measured today | rate it allows alone | what would move it |
+| --- | --- | --- | --- | --- |
+| 1 | **B, the followers' road to the 2nd vote** (proposal -> quorum) | 217 ms of the 252 ms cycle: transfer to the follower's EL 43, decode 63-73, sender look-ups 34 (5 with the queue index), check 5, hand-off/verify ~50 | ~750k at B = 217; B must be ~150 for 1M at 163k | the block described by hashes and assembled from the queue (B -60..80 measured, but the assembly copies; a sender-only look-up is 3 ms); the decode in the transport thread while the frame streams; the vote released before the body is fully materialised |
+| 2 | **the leader's build period** (start of build n -> start of n+1) | 250-300 ms (par 213: pull 21, prep 11, exec 72, collect 18, commit 18, fold 76; seal at 225; encode 30) -- hidden by the chain today, but it is the block rate's floor | ~600-650k at 163k; must be ~160 ms, or the block must be 260k | the fold (76) and the collect/commit (36) are the graft's representation (plan v4 step 3: address -> batch index, tx root beside exec); the pull (21) is the queue's lock; the encode (30) is off the path with the chain |
+| 3 | **the follower's import** (execute + root + insert) | 178-202 ms, no waits: exec 83-96 (groups 50 memory-bound: 32x threads = 2.4x), root 30-33 (tails 60-113), engine insert 49 | ~850k at 163k if it must stay under the cycle; a block behind is allowed (deferred execution), so it bounds throughput, not latency | the groups phase is memory-bound: fewer, larger accounts per group or a state layout that keeps a sender's runs local; the engine insert (49) is reth's tree -- keep the executed block out of it (`N42_FOLLOWER_DIRECT_IMPORT` already hands it in executed; what remains is the notification/canonical update) |
+| 4 | **the supply**: every node verifies every transaction | ingest ~11 us CPU a transaction, 4 nodes x 550k/s = 6 cores a node at today's rate, 11 at 1M; the flood delivers 550k/s at 64 workers and more workers slowed the chain (loop197) | ~900k/s before the ingest's cores collide with the import's (28-core node: 18-19 used now) | the leader alone verifies at ingest; followers take senders from the block's evidence (the 0x50 batch verification is 3-4x cheaper than secp256k1 already); or a signature scheme with aggregation; or the flood's frames carrying pre-recovered senders that a follower checks in batch |
+| 5 | **the leader's own commit / handover tax** | tenure handover 0.6-1.8 s each (64 blocks), 2-3% of the leg; `the parent is still importing` retried 22-82 times a leg | ~3% | the new leader building on the parent's published output (the leader twin, section 2v/2w: not cheap -- three pieces) or a longer tenure (`F7_LEADER_TENURE` 64 -> 256: 4x fewer handovers; a wire contract? no -- a fleet setting) |
+| 6 | **consensus fixed costs** C (R2) + F (encode) + D (view open -> preamble) | 5 + 5 + 25-60 ms | ~1.2M at C+F alone; D is the pacing wait today | D is the pacing (225): at 1M the pacing is 150 and D is real -- the commit forkchoice is already off the loop |
+| 7 | **memory and persistence** | 4 ELs 57-63 GB of 136; persistence keeps up with tx-lookup pruned | not binding at 4 nodes | -- |
+| 8 | **the block's size itself** | 163,000 transfers at 3.423G gas; the cycle is linear in accounts touched (0.40 s + 2.8 us/account at 7 nodes, `docs/BLOCK_SHAPE_SURVEY.md`) | a 260k block at the same cycle IS 1M -- if 1-4 scale linearly with the block (they are per-transaction passes) the cycle grows ~1.6x and nothing is gained; if the fixed parts (C, D, F, handover, the pull's lock, the encode) are a third of the cycle, 1.3x | measure it: one leg at 5.4G gas (260k) with the current configuration says how much of the cycle is per-transaction |
+
+**Reading it.** 1 and 2 are the two chains that alternate as the binding one (2j-2x); 3 is under the cycle now and
+becomes the bound once 1 and 2 are cut by a third; 4 is the wall behind all three, because 1-3 run on the cores 4
+spends. Nothing in 5-7 is worth a round before 1-4. **1M at 163k blocks needs B, the build and the import each cut by
+~35-40% at once; 1M at 260k blocks needs the fixed parts to be a third of today's cycle** -- and that is a single leg
+to find out (8), before any code.
+
+**The attempts, in order, each with its falsification:**
+
+- **A. The 260k block (8), one round, no code.** `--gasceil 5460000000` (260k transfers), pool 4 blocks scaled
+  (`F7_BENCH_POOL_SLOTS` 1,040,000), `--pertx` raised, index bound raised. Read the cycle and its dissection. If the
+  cycle is under 0.34 s the per-transaction share is under two thirds and the rest of this plan is about the block size
+  as much as the cycle; if it is 0.40+ the per-transaction passes are everything and the plan is 1-4 only.
+- **B. Supply off the followers' cores (4).** Followers stop verifying signatures at ingest for transactions they will
+  only see again in a block: the ingest keeps the raw transaction and its hash, recovery happens on the road from the
+  block's sender list (0x50: the batch verification the follower runs today for misses, 128 a batch; secp256k1:
+  `recover_signer` on the pool). This turns 6-11 cores of ingest into ~1 on three of four nodes and moves the work to
+  the vote road, where it is batched. Falsified if B grows by more than the ingest's cores buy (the leg's per-thread
+  table decides: tokio-rt 9.7 -> ?).
+- **C. B by the block's description (1).** The compact body's assembly copied transactions and lost (2r); a body that
+  carries hashes and the follower's road that looks up sender + the transaction's *bytes offset in its own ingest log*
+  (no copy, no decode: the ingest keeps the frame) and computes the root from the kept bytes. The vote needs the
+  root, the senders and the includability check -- none needs the transactions decoded if the ingest kept the decoded
+  form. Target B 217 -> 150. Falsified if the road's execution-layer part is not under 60 ms on the fleet (2r's was 197).
+- **D. The graft's representation (2), plan v4 step 3.** fold 76 + collect/commit 36 of the leader's 213 ms `par`:
+  address -> batch index instead of per-address maps, the tx root beside the execution, the pull pre-walked. Target
+  the build period 250-300 -> 180. Falsified if `par_fold_ms` does not halve on the fleet.
+- **E. The import's groups (3).** Memory-bound at 50 ms; the state layout (QMDB slots by first touch) makes a sender's
+  accounts scattered; a per-block prefetch of the ~150k touched accounts before the groups run (the block names them)
+  converts random reads into a streaming pass. Falsified if `groups_ms` does not fall under 35 with prefetch on.
+- **F. Handovers (5).** `F7_LEADER_TENURE=256` -- one leg, no code; then the leader twin if the 3% matters at the end.
+
+Each attempt is one agent brief and one runner; the bar for adopting any is the same as plan v4's: window 2 in every leg,
+verify 4/4, and the number it targets moving on the fleet, not on a bench.

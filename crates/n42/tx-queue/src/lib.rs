@@ -418,6 +418,14 @@ struct Inner<T: PoolTransaction> {
     /// How many lanes this queue may park at once; 0 is no parking.
     /// [`park_lane_cap`] unless a test said otherwise.
     park_lanes: usize,
+    /// The highest block number a canonical prune has taken out of the
+    /// lanes.
+    ///
+    /// A build standing on a parent below this is standing behind its own
+    /// queue: the lanes no longer hold what that parent's state is waiting
+    /// for, so every lane's head is above its account nonce and the build
+    /// can use none of them. See [`TxQueue::pruned_through`].
+    pruned_through: u64,
     /// The sender a build is taking a run from, and how much of the run is
     /// left. See [`run_length`].
     current: Option<(Address, usize)>,
@@ -787,6 +795,7 @@ impl<T: PoolTransaction> TxQueue<T> {
                 drops: DropReport::default(),
                 park_capped: 0,
                 park_lanes: park_lane_cap(),
+                pruned_through: 0,
                 current: None,
                 run: run.max(1),
                 builds: 0,
@@ -821,6 +830,23 @@ impl<T: PoolTransaction> TxQueue<T> {
         for valid in staged {
             inner.insert_valid(valid);
         }
+    }
+
+    /// Records that a canonical block at `number` has been pruned out of the
+    /// lanes. Only the highest is kept.
+    pub fn note_pruned(&self, number: u64) {
+        let mut inner = self.inner.lock();
+        inner.pruned_through = inner.pruned_through.max(number);
+    }
+
+    /// The highest block a canonical prune has taken out of the lanes.
+    ///
+    /// What a build compares its parent against: a parent below this is
+    /// behind the queue, and every lane will look gapped to it whatever the
+    /// lanes actually hold. Nothing here acts on that -- it is a reading for
+    /// the builder to take.
+    pub fn pruned_through(&self) -> u64 {
+        self.inner.lock().pruned_through
     }
 
     /// The holes builds ran into since the last call: (sender, first missing
@@ -2394,6 +2420,35 @@ mod tests {
         );
         assert!(queue.parked().1 > 0);
         assert!(!queue.is_empty(), "the queue still holds them");
+    }
+
+    /// A build standing on a parent below what the prune has taken out of
+    /// the lanes is standing behind its own queue.
+    ///
+    /// loop213 Pe was read against this and it did *not* hold: node3's 26
+    /// empty builds were chained builds whose parent was its own previous
+    /// block, canonical and committed 100-200 ms before the build ran. The
+    /// reading is kept because it is O(1) and it is the one question the
+    /// logs could not answer at the time.
+    #[test]
+    fn the_queue_says_what_it_has_been_pruned_through() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(4);
+        assert_eq!(queue.pruned_through(), 0);
+        queue.push((0..4).map(|n| tx(1, n)).collect::<Vec<_>>());
+        queue.drain_now();
+        // Two blocks a parent at height 7 does not have.
+        queue.remove_mined_batch([(Address::repeat_byte(1), 1)]);
+        queue.note_pruned(8);
+        queue.remove_mined_batch([(Address::repeat_byte(1), 2)]);
+        queue.note_pruned(9);
+        assert_eq!(queue.pruned_through(), 9);
+        assert!(queue.pruned_through() > 7, "a build on block 7 is behind the queue");
+        // And the lane now starts above what that parent's state would be
+        // waiting for, which is what such a build sees.
+        let mut best = queue.best_for_build(B256::repeat_byte(1));
+        let offered: Vec<u64> = std::iter::from_fn(|| best.next()).map(|t| t.nonce()).collect();
+        drop(best);
+        assert_eq!(offered, vec![3]);
     }
 
     /// Parking is off unless a caller asks for it: a build reporting a hole

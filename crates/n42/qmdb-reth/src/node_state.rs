@@ -338,6 +338,16 @@ struct Inner {
     lag_warned: std::sync::atomic::AtomicU64,
     /// The canonical number the last periodic lag line was logged at.
     lag_logged_at: std::sync::atomic::AtomicU64,
+    /// What the compactions have cost so far: how many ran, the last one's
+    /// checkpoint size and wall time, and the sum of those times. The log
+    /// line carries the same numbers; these are here so a bench can show the
+    /// growth without a log to parse.
+    compactions: std::sync::atomic::AtomicU64,
+    compaction_bytes: std::sync::atomic::AtomicU64,
+    compaction_ms: std::sync::atomic::AtomicU64,
+    compaction_ms_total: std::sync::atomic::AtomicU64,
+    /// The last compaction's phases: read, replay, encode, write, sync.
+    compaction_phases: Mutex<[u64; 5]>,
 }
 
 /// The delta log's position, as the node last left it.
@@ -413,6 +423,11 @@ impl QmdbNodeState {
                 canonical_number: std::sync::atomic::AtomicU64::new(0),
                 lag_warned: std::sync::atomic::AtomicU64::new(0),
                 lag_logged_at: std::sync::atomic::AtomicU64::new(0),
+                compactions: std::sync::atomic::AtomicU64::new(0),
+                compaction_bytes: std::sync::atomic::AtomicU64::new(0),
+                compaction_ms: std::sync::atomic::AtomicU64::new(0),
+                compaction_ms_total: std::sync::atomic::AtomicU64::new(0),
+                compaction_phases: Mutex::new([0; 5]),
             }),
         }
     }
@@ -854,7 +869,7 @@ impl QmdbNodeState {
         forest.sync_entries()?;
         let ckpt = forest.checkpoint()?;
         forest.forget_changes();
-        let checkpoint_len = write_ckpt(&self.ckpt_path(), &ckpt)?;
+        let checkpoint_len = write_ckpt(&self.ckpt_path(), &ckpt, &mut CompactPhases::default())?;
         let _ = std::fs::remove_file(self.delta_log_path());
         let _ = std::fs::remove_file(self.sealed_log_path());
         *cursor = PersistCursor {
@@ -922,7 +937,7 @@ impl QmdbNodeState {
             return Ok(());
         }
         let snapshot = forest.snapshot()?;
-        let checkpoint_len = write_snapshot(&self.snapshot_path(), &snapshot)?;
+        let checkpoint_len = write_snapshot(&self.snapshot_path(), &snapshot, &mut CompactPhases::default())?;
         // Any log left in this datadir describes a different chain of states.
         // Its first delta would be refused for standing on the wrong cursor,
         // which is safe but reads as corruption; removing it is the truth.
@@ -1285,6 +1300,7 @@ impl QmdbNodeState {
         let started = std::time::Instant::now();
         let path = self.snapshot_path();
         let sealed_path = self.sealed_log_path();
+        let mut phases = CompactPhases::default();
         let result = (|| -> Result<(u64, u64), NodeStateError> {
             if self.inner.entry_file {
                 let ckpt_path = self.ckpt_path();
@@ -1293,7 +1309,9 @@ impl QmdbNodeState {
                     head_number: sealed_head.0,
                 })?;
                 let read_ms = started.elapsed().as_millis() as u64;
+                let replay_at = std::time::Instant::now();
                 let (ckpt, _) = replay_delta_log(&sealed_path, ckpt, Some(sealed_head.1))?;
+                phases.replay_ms = replay_at.elapsed().as_millis() as u64;
                 if ckpt.head_hash != sealed_head.1 {
                     return Err(NodeStateError::SnapshotMismatch {
                         snapshot_number: ckpt.head_number,
@@ -1302,7 +1320,7 @@ impl QmdbNodeState {
                         head_hash: sealed_head.1,
                     });
                 }
-                let len = write_ckpt(&ckpt_path, &ckpt)?;
+                let len = write_ckpt(&ckpt_path, &ckpt, &mut phases)?;
                 let _ = std::fs::remove_file(&sealed_path);
                 return Ok((len, read_ms));
             }
@@ -1311,7 +1329,9 @@ impl QmdbNodeState {
                 head_number: sealed_head.0,
             })?;
             let read_ms = started.elapsed().as_millis() as u64;
+            let replay_at = std::time::Instant::now();
             let (snapshot, _) = replay_delta_log(&sealed_path, checkpoint, Some(sealed_head.1))?;
+            phases.replay_ms = replay_at.elapsed().as_millis() as u64;
             if snapshot.head_hash != sealed_head.1 {
                 return Err(NodeStateError::SnapshotMismatch {
                     snapshot_number: snapshot.head_number,
@@ -1320,7 +1340,7 @@ impl QmdbNodeState {
                     head_hash: sealed_head.1,
                 });
             }
-            let len = write_snapshot(&path, &snapshot)?;
+            let len = write_snapshot(&path, &snapshot, &mut phases)?;
             // The segment goes only once the checkpoint that covers it is on
             // disk; a crash in between leaves a segment a restart skips.
             let _ = std::fs::remove_file(&sealed_path);
@@ -1331,10 +1351,13 @@ impl QmdbNodeState {
         match result {
             Ok((len, read_ms)) => {
                 cursor.checkpoint_len = len;
+                let total_ms = started.elapsed().as_millis() as u64;
+                self.note_compaction(len, total_ms, &phases, read_ms);
                 info!(
                     target: "n42.qmdb",
                     block = sealed_head.0, block_hash = %sealed_head.1, bytes = len,
-                    read_ms, total_ms = started.elapsed().as_millis() as u64,
+                    read_ms, replay_ms = phases.replay_ms, encode_ms = phases.encode_ms,
+                    write_ms = phases.write_ms, sync_ms = phases.sync_ms, total_ms,
                     "compacted the QMDB log into a new checkpoint",
                 );
             }
@@ -1344,6 +1367,39 @@ impl QmdbNodeState {
                 warn!(target: "n42.qmdb", %err, "QMDB compaction failed; the sealed segment is kept");
             }
         }
+    }
+
+    /// `(compactions, last checkpoint bytes, last total ms, summed total ms)`.
+    ///
+    /// The `compacted the QMDB log into a new checkpoint` log line carries
+    /// the same numbers; this is the same history without a log to parse, so
+    /// a bench can show the checkpoint's growth off the fleet.
+    pub fn compaction_stats(&self) -> (u64, u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.inner.compactions.load(Relaxed),
+            self.inner.compaction_bytes.load(Relaxed),
+            self.inner.compaction_ms.load(Relaxed),
+            self.inner.compaction_ms_total.load(Relaxed),
+        )
+    }
+
+    /// The last compaction's phases in milliseconds: reading the checkpoint,
+    /// replaying the sealed segment onto it, encoding it, writing it, making
+    /// it durable. The same numbers the log line carries.
+    pub fn compaction_phases(&self) -> [u64; 5] {
+        *self.inner.compaction_phases.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Records what a compaction cost; see [`Self::compaction_stats`].
+    fn note_compaction(&self, bytes: u64, total_ms: u64, phases: &CompactPhases, read_ms: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.inner.compactions.fetch_add(1, Relaxed);
+        self.inner.compaction_bytes.store(bytes, Relaxed);
+        self.inner.compaction_ms.store(total_ms, Relaxed);
+        self.inner.compaction_ms_total.fetch_add(total_ms, Relaxed);
+        *self.inner.compaction_phases.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            [read_ms, phases.replay_ms, phases.encode_ms, phases.write_ms, phases.sync_ms];
     }
 
     /// Waits for a background compaction, if one is running. For tests and
@@ -1370,7 +1426,8 @@ impl QmdbNodeState {
                 forest.forget_changes();
                 Ok(ckpt)
             })?;
-            let len = write_ckpt(&self.ckpt_path(), &ckpt)?;
+            let mut phases = CompactPhases::default();
+            let len = write_ckpt(&self.ckpt_path(), &ckpt, &mut phases)?;
             let _ = std::fs::remove_file(self.delta_log_path());
             *cursor = PersistCursor {
                 head: block_hash,
@@ -1379,10 +1436,11 @@ impl QmdbNodeState {
                 checkpoint_len: len,
                 compacting: cursor.compacting,
             };
+            let total_ms = started.elapsed().as_millis() as u64;
+            self.note_compaction(len, total_ms, &phases, 0);
             info!(
                 target: "n42.qmdb",
-                block = ckpt.head_number, %block_hash, bytes = len,
-                total_ms = started.elapsed().as_millis() as u64,
+                block = ckpt.head_number, %block_hash, bytes = len, total_ms,
                 "checkpointed the QMDB head (entry file)",
             );
             return Ok(());
@@ -1396,7 +1454,8 @@ impl QmdbNodeState {
             Ok(snapshot)
         })?;
         let path = self.snapshot_path();
-        let len = write_snapshot(&path, &snapshot)?;
+        let mut phases = CompactPhases::default();
+        let len = write_snapshot(&path, &snapshot, &mut phases)?;
         // Order matters: the log is emptied only once the checkpoint that
         // supersedes it is on disk, so a crash between the two leaves a log
         // that is merely redundant rather than a state with neither.
@@ -1408,10 +1467,11 @@ impl QmdbNodeState {
             checkpoint_len: len,
             compacting: cursor.compacting,
         };
+        let total_ms = started.elapsed().as_millis() as u64;
+        self.note_compaction(len, total_ms, &phases, 0);
         info!(
             target: "n42.qmdb",
-            block = snapshot.head_number, %block_hash, bytes = len,
-            total_ms = started.elapsed().as_millis() as u64,
+            block = snapshot.head_number, %block_hash, bytes = len, total_ms,
             "checkpointed the QMDB head",
         );
         Ok(())
@@ -1486,30 +1546,53 @@ fn read_ckpt(path: &Path) -> Result<Option<ForestCheckpoint>, NodeStateError> {
     bincode::deserialize(&bytes).map(Some).map_err(|source| NodeStateError::Decode { path: path.to_path_buf(), source })
 }
 
+/// Where a compaction's wall time went, so the log line says which part of
+/// it grew with the state rather than only that the whole did. At 13 MB of
+/// checkpoint on the four-node bench shape it reads replay 36, encode 2,
+/// write 0, sync 3 of a 44 ms whole -- the checkpoint's write is not the
+/// cost, replaying the sealed segment onto it is.
+#[derive(Debug, Default, Clone, Copy)]
+struct CompactPhases {
+    /// Reading the sealed segment and folding its deltas in.
+    replay_ms: u64,
+    /// Serialising the checkpoint.
+    encode_ms: u64,
+    /// Writing its bytes.
+    write_ms: u64,
+    /// Making them durable, with the rename and the directory's fsync.
+    sync_ms: u64,
+}
+
 /// Writes `bytes` to `temp`, syncs it, renames it over `path` and syncs the
 /// directory: after a crash the checkpoint is the old file or the new one,
 /// whole. `fs::write` plus `rename` left both the data and the rename to the
 /// page cache.
-fn write_durably(temp: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+fn write_durably(temp: &Path, path: &Path, bytes: &[u8], phases: &mut CompactPhases) -> std::io::Result<()> {
     use std::io::Write;
+    let write_at = std::time::Instant::now();
     let mut file = std::fs::File::create(temp)?;
     file.write_all(bytes)?;
+    phases.write_ms = write_at.elapsed().as_millis() as u64;
+    let sync_at = std::time::Instant::now();
     file.sync_all()?;
     std::fs::rename(temp, path)?;
     if let Some(dir) = path.parent() {
         std::fs::File::open(dir)?.sync_all()?;
     }
+    phases.sync_ms = sync_at.elapsed().as_millis() as u64;
     Ok(())
 }
 
-fn write_ckpt(path: &Path, ckpt: &ForestCheckpoint) -> Result<u64, NodeStateError> {
+fn write_ckpt(path: &Path, ckpt: &ForestCheckpoint, phases: &mut CompactPhases) -> Result<u64, NodeStateError> {
     let io = |source| NodeStateError::Io { path: path.to_path_buf(), source };
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(io)?;
     }
+    let encode_at = std::time::Instant::now();
     let bytes = bincode::serialize(ckpt).map_err(|source| NodeStateError::Decode { path: path.to_path_buf(), source })?;
+    phases.encode_ms = encode_at.elapsed().as_millis() as u64;
     let temp = path.with_extension("ckpt.tmp");
-    write_durably(&temp, path, &bytes).map_err(io)?;
+    write_durably(&temp, path, &bytes, phases).map_err(io)?;
     Ok(bytes.len() as u64)
 }
 
@@ -1536,7 +1619,7 @@ fn read_snapshot(path: &Path) -> Result<Option<ForestSnapshot>, NodeStateError> 
 /// previous snapshot rather than a truncated one. A truncated snapshot would
 /// fail to decode and stop the node; a stale one is merely behind, which the
 /// startup check reports.
-fn write_snapshot(path: &Path, snapshot: &ForestSnapshot) -> Result<u64, NodeStateError> {
+fn write_snapshot(path: &Path, snapshot: &ForestSnapshot, phases: &mut CompactPhases) -> Result<u64, NodeStateError> {
     let io = |source| NodeStateError::Io {
         path: path.to_path_buf(),
         source,
@@ -1544,12 +1627,14 @@ fn write_snapshot(path: &Path, snapshot: &ForestSnapshot) -> Result<u64, NodeSta
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(io)?;
     }
+    let encode_at = std::time::Instant::now();
     let bytes = bincode::serialize(snapshot).map_err(|source| NodeStateError::Decode {
         path: path.to_path_buf(),
         source,
     })?;
+    phases.encode_ms = encode_at.elapsed().as_millis() as u64;
     let temp = path.with_extension("bin.tmp");
-    write_durably(&temp, path, &bytes).map_err(io)?;
+    write_durably(&temp, path, &bytes, phases).map_err(io)?;
     Ok(bytes.len() as u64)
 }
 
@@ -1561,17 +1646,36 @@ fn write_snapshot(path: &Path, snapshot: &ForestSnapshot) -> Result<u64, NodeSta
 /// which, applied, would give a tree that never existed and a root nothing
 /// could explain. A record that does not hash to its header is discarded, and
 /// with it everything after it.
+///
+/// The digest is a CRC-32, not a keccak. Detecting a tear wants a checksum,
+/// not a cryptographic hash — nothing here is adversarial, the log is the
+/// node's own file — and keccak over the payload was **the** cost of a
+/// compaction: the sealed segment is as long as the checkpoint by
+/// construction ([`checkpoint_due`]), so at the four-node bench tier it is
+/// 13 MB of keccak, 36 ms of a 44 ms compaction against 2 ms of encoding and
+/// 3 of fsync, and it grows with the chain. A log written before
+/// 2026-09-22 carries the keccak digest, so a record is accepted on either,
+/// which costs a second pass only over records that fail the first.
 const RECORD_HEADER: usize = 12;
+
+/// Whether `header` is the digest of `payload` under either scheme: the
+/// CRC-32 written now, or the keccak prefix written before it. A torn record
+/// matches neither, with the same probability as before to within a factor
+/// of two.
+fn digest_matches(header: &[u8], payload: &[u8]) -> bool {
+    header == crc32fast::hash(payload).to_le_bytes()
+        || header == &alloy_primitives::keccak256(payload)[..4]
+}
 
 fn frame_delta(delta: &ForestDelta) -> Result<Vec<u8>, NodeStateError> {
     let payload = bincode::serialize(delta).map_err(|source| NodeStateError::Decode {
         path: PathBuf::from(DELTA_LOG_FILE),
         source,
     })?;
-    let digest = alloy_primitives::keccak256(&payload);
+    let digest = crc32fast::hash(&payload).to_le_bytes();
     let mut record = Vec::with_capacity(RECORD_HEADER + payload.len());
     record.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-    record.extend_from_slice(&digest[..4]);
+    record.extend_from_slice(&digest);
     record.extend_from_slice(&payload);
     Ok(record)
 }
@@ -1653,7 +1757,7 @@ fn replay_delta_log<T: DeltaTarget>(
         let start = at + RECORD_HEADER;
         let Some(end) = start.checked_add(len) else { break };
         let Some(payload) = bytes.get(start..end) else { break };
-        if alloy_primitives::keccak256(payload)[..4] != bytes[at + 8..start] {
+        if !digest_matches(&bytes[at + 8..start], payload) {
             warn!(target: "n42.qmdb", offset = at, "QMDB delta log is torn here; ignoring the rest");
             break;
         }
@@ -2048,6 +2152,55 @@ mod tests {
         // Its export is the full slot history, dead entries included.
         let portable = again.portable_export(1143, chain.genesis_hash()).unwrap();
         assert!(!portable.is_empty());
+    }
+
+    /// Both digests say the same thing about an intact record, and a torn
+    /// one matches neither.
+    #[test]
+    fn a_record_is_accepted_on_either_digest() {
+        let payload = b"what a delta serialises to";
+        assert!(digest_matches(&crc32fast::hash(payload).to_le_bytes(), payload));
+        assert!(digest_matches(&alloy_primitives::keccak256(payload)[..4], payload));
+        assert!(!digest_matches(&[0xAB; 4], payload));
+    }
+
+    /// A delta log written before 2026-09-22 frames its records with the
+    /// first four bytes of a keccak. A node that upgrades has to replay it:
+    /// rejecting it would drop every block since the checkpoint, leave the
+    /// forest behind the database head, and refuse to start.
+    #[test]
+    fn a_keccak_framed_delta_log_still_replays() {
+        let dir = scratch("keccak-log");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ckpt = ForestCheckpoint {
+            version: ForestCheckpoint::VERSION,
+            head_number: 1,
+            head_hash: B256::repeat_byte(1),
+            next_slot: 128,
+            active: vec![u64::MAX, u64::MAX],
+        };
+        let delta = ForestDelta {
+            version: ForestDelta::VERSION,
+            head_number: 2,
+            head_hash: B256::repeat_byte(2),
+            base_next_slot: 128,
+            next_slot: 200,
+            appended: Vec::new(),
+            changed: vec![(7, false)],
+        };
+        let payload = bincode::serialize(&delta).unwrap();
+        let mut record = Vec::new();
+        record.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        record.extend_from_slice(&alloy_primitives::keccak256(&payload)[..4]);
+        record.extend_from_slice(&payload);
+        let path = dir.join(DELTA_LOG_FILE);
+        std::fs::write(&path, &record).unwrap();
+
+        let (state, good) = replay_delta_log(&path, ckpt, None).unwrap();
+        assert_eq!(good, record.len() as u64);
+        assert_eq!((state.head_number, state.next_slot), (2, 200));
+        assert!(!state.active[0] & (1 << 7) != 0, "the delta's retirement landed");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A datadir written in heap mode (a version-1 checkpoint with every

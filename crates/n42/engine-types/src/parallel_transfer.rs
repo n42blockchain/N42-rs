@@ -49,8 +49,25 @@ pub type FastExecutorFactory = crate::n42_evm::N42BlockExecutorFactory<reth_chai
 pub struct Phases {
     /// Partitioning the transactions into conflict-free groups.
     pub partition_ms: u64,
+    /// Of `partition_ms`: the transactions' EVM environments, built on the
+    /// worker pool.
+    pub env_us: u64,
+    /// Packing the groups into batches and staging the graft, between the
+    /// partition and the execution.
+    pub batch_us: u64,
     /// The groups' execution on the worker pool, wall time.
     pub groups_ms: u64,
+    /// The batches' gas placed in block order after the execution.
+    pub gas_us: u64,
+    /// The block's receipts, built in block order from that gas.
+    pub receipts_us: u64,
+    /// Freeing the transactions' environments, the groups and the batches'
+    /// bundles, done here rather than at the return so the line can name it.
+    pub drop_us: u64,
+    /// The whole call, so a caller's `exec_ms` minus this is what it spends
+    /// outside the executor (loop202: 40 of the follower's 133 ms had no
+    /// name because the line stopped at the four phases below).
+    pub total_us: u64,
     /// Folding the groups' changes into the block's state.
     pub merge_ms: u64,
     /// Of `merge_ms`: the graft (or fold) of the batches' bundles.
@@ -101,8 +118,16 @@ struct Groups {
 }
 
 impl Groups {
-    fn new(n: usize) -> Self {
-        Self { parent: (0..n).collect() }
+    fn with_capacity(n: usize) -> Self {
+        Self { parent: Vec::with_capacity(n) }
+    }
+    /// A party of its own, returned as its index. The forest grows with the
+    /// map of addresses rather than after it, so the partition needs no
+    /// second pass over the block to union what the first pass already saw.
+    fn add(&mut self) -> usize {
+        let next = self.parent.len();
+        self.parent.push(next);
+        next
     }
     fn find(&mut self, mut x: usize) -> usize {
         while self.parent[x] != x {
@@ -123,14 +148,35 @@ impl Groups {
 /// Partitions transfers into groups that share no sender or recipient: the
 /// groups can execute in any order relative to each other. Returns the groups
 /// (indices into `txs`, in order) and the number of distinct parties.
+///
+/// [`partition_shared`] is the same partition with the search for the
+/// addresses that repeat done on the worker pool; `N42_FOLLOWER_PARTITION_HASH=1`
+/// picks it.
+///
+/// Three things this does that the straightforward version did not, all of
+/// them the same partition (loop202: the phase was 31-33 ms on a four-node
+/// leg, 190 ns a transfer for what is two hash look-ups and a union):
+///
+/// - **The sender's party is memoised across a run.** The queue lays a
+///   sender's transactions out in runs (`N42_TX_QUEUE_RUN`, 64 on the fleet;
+///   a block's 163,000 transfers come from ~380 senders), so the previous
+///   transaction's sender is the same address almost every time and half the
+///   hashing is a comparison instead. The memo returns what the map would,
+///   so the parties, the unions and the groups are identical.
+/// - **The map is sized for the parties a block has, not two per
+///   transaction.** A full transfer block has ~380 senders and ~150,000
+///   distinct recipients (a leg's `updated`), so `txs.len() * 2` asked for
+///   twice the buckets it ever fills, and this phase is memory-bound.
+/// - **The forest grows with the map** and the unions happen in the first
+///   pass, in the same order, which removes the edge list (2.6 MB a block)
+///   and a pass over it. Only the sender's party is kept per transaction,
+///   since that is all the grouping pass reads.
 pub fn partition(txs: &[TxEnv], beneficiary: Address) -> Result<(Vec<Vec<usize>>, usize), NotParallel> {
     let mut index_of: alloy_primitives::map::AddressHashMap<usize> = alloy_primitives::map::AddressHashMap::default();
-    index_of.reserve(txs.len() * 2);
-    let mut party = |a: Address| -> usize {
-        let next = index_of.len();
-        *index_of.entry(a).or_insert(next)
-    };
-    let mut edges: Vec<(usize, usize)> = Vec::with_capacity(txs.len());
+    index_of.reserve(txs.len());
+    let mut sets = Groups::with_capacity(txs.len());
+    let mut of_tx: Vec<usize> = Vec::with_capacity(txs.len());
+    let mut last_caller: Option<(Address, usize)> = None;
     for (i, tx) in txs.iter().enumerate() {
         let alloy_primitives::TxKind::Call(to) = tx.kind else {
             return Err(NotParallel::NotATransfer(i));
@@ -141,23 +187,174 @@ pub fn partition(txs: &[TxEnv], beneficiary: Address) -> Result<(Vec<Vec<usize>>
         if tx.caller == beneficiary || to == beneficiary {
             return Err(NotParallel::TouchesBeneficiary(i));
         }
-        edges.push((party(tx.caller), party(to)));
+        let from = match last_caller {
+            Some((address, party)) if address == tx.caller => party,
+            _ => {
+                let party = *index_of.entry(tx.caller).or_insert_with(|| sets.add());
+                last_caller = Some((tx.caller, party));
+                party
+            }
+        };
+        let to_party = *index_of.entry(to).or_insert_with(|| sets.add());
+        sets.union(from, to_party);
+        of_tx.push(from);
     }
-    let mut sets = Groups::new(index_of.len());
-    for (a, b) in &edges {
-        sets.union(*a, *b);
-    }
-    let mut group_of_root: Vec<usize> = vec![usize::MAX; index_of.len()];
+    let parties = index_of.len();
+    drop(index_of);
+    let mut group_of_root: Vec<usize> = vec![usize::MAX; parties];
     let mut groups: Vec<Vec<usize>> = Vec::new();
-    for (i, (a, _)) in edges.iter().enumerate() {
-        let root = sets.find(*a);
+    for (i, from) in of_tx.iter().enumerate() {
+        let root = sets.find(*from);
         if group_of_root[root] == usize::MAX {
             group_of_root[root] = groups.len();
             groups.push(Vec::new());
         }
         groups[group_of_root[root]].push(i);
     }
-    Ok((groups, index_of.len()))
+    Ok((groups, parties))
+}
+
+/// Whether `N42_FOLLOWER_PARTITION_HASH=1` is set: the follower's partition
+/// finds the addresses a block repeats on the worker pool
+/// ([`partition_shared`]) instead of probing one map per transaction.
+///
+/// Off by default until a leg reads it: the partition is 31-33 ms of a
+/// four-node follower's 131-136 ms execution (loop202) and the bench says
+/// this halves it, but loop91 is the warning -- a partition made 20 ms
+/// cheaper by grouping differently gave every millisecond back in the
+/// batches. This one returns the same groups, so there is nothing to give
+/// back, which is exactly what a leg has to confirm.
+pub fn partition_hash() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_PARTITION_HASH").is_ok_and(|v| v == "1"))
+}
+
+/// A 64-bit hash of an address, for [`partition_shared`]'s duplicate search.
+/// The address's own bytes are already a hash; the multiply is there so that
+/// two accounts differing only in their low bytes -- which the flood's
+/// recipients do -- do not collide.
+#[inline]
+fn address_hash(address: &Address) -> u64 {
+    let mut low = [0u8; 8];
+    low.copy_from_slice(&address.0[12..]);
+    let mut high = [0u8; 8];
+    high.copy_from_slice(&address.0[4..12]);
+    let a = u64::from_le_bytes(low).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let b = u64::from_le_bytes(high).wrapping_mul(0xc2b2_ae3d_27d4_eb4f);
+    let mut h = a ^ b.rotate_left(31) ^ u64::from(u32::from_le_bytes([address.0[0], address.0[1], address.0[2], address.0[3]]));
+    h ^= h >> 29;
+    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h ^ (h >> 32)
+}
+
+/// [`partition`] with the search for the addresses a block repeats done on
+/// the worker pool.
+///
+/// The serial partition is one random probe of a ~260,000-bucket map per
+/// transaction, and almost every one of them is wasted: of a full block's
+/// 163,000 recipients ~150,000 appear once and so join nothing. What the
+/// grouping needs is only the addresses that appear more than once, or that
+/// are also senders, and those come out of sorting 163,000 hashes on the
+/// pool -- sequential work that scales -- leaving a serial pass that probes
+/// a table of ~10,000 entries, which is L2-resident.
+///
+/// Two addresses whose hashes collide land in one group. That is sound: a
+/// group is a set of transactions that must not run beside another, and a
+/// coarser partition is still one -- the transactions of a group execute in
+/// block order on a state of their own either way. At 163,000 addresses the
+/// chance of one collision is about 1 in 10^9.
+pub fn partition_shared(txs: &[TxEnv], beneficiary: Address) -> Result<(Vec<Vec<usize>>, usize), NotParallel> {
+    use rayon::prelude::*;
+
+    // The shape checks, on the pool, reported at the earliest index the
+    // serial partition would have reached.
+    let refused = txs
+        .par_iter()
+        .enumerate()
+        .filter_map(|(i, tx)| {
+            let alloy_primitives::TxKind::Call(to) = tx.kind else {
+                return Some((i, NotParallel::NotATransfer(i)));
+            };
+            if !tx.data.is_empty() {
+                return Some((i, NotParallel::NotATransfer(i)));
+            }
+            if tx.caller == beneficiary || to == beneficiary {
+                return Some((i, NotParallel::TouchesBeneficiary(i)));
+            }
+            None
+        })
+        .min_by_key(|(i, _)| *i);
+    if let Some((_, why)) = refused {
+        return Err(why);
+    }
+    let to_hash: Vec<u64> =
+        txs.par_iter().map(|tx| tx.kind.to().map_or(0, address_hash)).collect();
+
+    // The senders and their parties: ~380 a block, and the queue lays each
+    // one's transactions out in a run, so the memo answers nearly every
+    // transaction with a comparison.
+    let mut sets = Groups::with_capacity(txs.len() / 8 + 64);
+    let mut party_of: alloy_primitives::map::AddressHashMap<usize> = alloy_primitives::map::AddressHashMap::default();
+    let mut of_tx: Vec<usize> = Vec::with_capacity(txs.len());
+    let mut last_caller: Option<(Address, usize)> = None;
+    for tx in txs {
+        let from = match last_caller {
+            Some((address, party)) if address == tx.caller => party,
+            _ => {
+                let party = *party_of.entry(tx.caller).or_insert_with(|| sets.add());
+                last_caller = Some((tx.caller, party));
+                party
+            }
+        };
+        of_tx.push(from);
+    }
+
+    // The addresses that can join two senders: a recipient the block names
+    // twice, or one that is a sender. A sender starts in the table under its
+    // own party, so a transfer to it unions with that sender and not with a
+    // party of its own.
+    let mut shared: std::collections::HashMap<u64, usize, alloy_primitives::map::FbBuildHasher<8>> =
+        std::collections::HashMap::with_capacity_and_hasher(party_of.len() * 2, Default::default());
+    for (address, party) in &party_of {
+        shared.insert(address_hash(address), *party);
+    }
+    let mut sorted = to_hash.clone();
+    sorted.par_sort_unstable();
+    let mut i = 0;
+    while i < sorted.len() {
+        let mut j = i + 1;
+        while j < sorted.len() && sorted[j] == sorted[i] {
+            j += 1;
+        }
+        if j - i > 1 {
+            let next = &mut sets;
+            shared.entry(sorted[i]).or_insert_with(|| next.add());
+        }
+        i = j;
+    }
+    drop(sorted);
+
+    // The unions, over a table small enough to stay in cache.
+    for (i, hash) in to_hash.iter().enumerate() {
+        if let Some(party) = shared.get(hash) {
+            sets.union(of_tx[i], *party);
+        }
+    }
+    let parties = sets.parent.len();
+    drop(shared);
+    drop(to_hash);
+
+    let mut group_of_root: Vec<usize> = vec![usize::MAX; parties];
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (i, from) in of_tx.iter().enumerate() {
+        let root = sets.find(*from);
+        if group_of_root[root] == usize::MAX {
+            group_of_root[root] = groups.len();
+            groups.push(Vec::new());
+        }
+        groups[group_of_root[root]].push(i);
+    }
+    Ok((groups, parties))
 }
 
 /// Groups candidate transfers by sender: every sender's transfers, in
@@ -1140,6 +1337,21 @@ fn graft_base_swap() -> bool {
     *ON.get_or_init(|| std::env::var("N42_GRAFT_BASE_SWAP").map_or(true, |v| v != "0"))
 }
 
+/// Whether `N42_FOLLOWER_FREE_ASYNC=1` is set: the executor's own working
+/// memory -- the transactions' environments, the groups, the batches'
+/// bundles -- is freed on the worker pool rather than on the thread that
+/// executed the block.
+///
+/// Off by default: on an idle bench it is worth 5-6 ms of a 120 ms call
+/// ([`Phases::drop_us`]), and whether it is worth more on a node, where the
+/// same 32 MB of environments is freed under the fleet's allocator settings
+/// while the import thread is the chain's critical path, is a leg's question.
+/// Nothing reads any of it again, so the only cost is a job on the pool.
+pub fn free_async() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_FREE_ASYNC").is_ok_and(|v| v == "1"))
+}
+
 /// Whether `N42_FOLLOWER_GRAFT=1` is set: the follower folds the groups'
 /// bundles into the block's state with [`graft_bundles`] instead of one
 /// commit of the folded changes (round 43: the commit and its transition
@@ -1169,6 +1381,7 @@ where
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
     let mut phases = Phases::default();
+    let call_at = std::time::Instant::now();
     let evm_env = evm_config.evm_env(block.header()).map_err(BlockExecutionError::other)?;
     let beneficiary = evm_env.block_env.beneficiary;
 
@@ -1181,6 +1394,7 @@ where
         let recovered: Vec<_> = block.transactions_recovered().collect();
         recovered.par_iter().map(|tx| evm_config.tx_env(*tx)).collect()
     };
+    phases.env_us = at.elapsed().as_micros() as u64;
     // Address-keyed with the fixed-bytes hasher: the default hasher was
     // ~29 ms of a 163,000-transfer block's partition.
     let groups: Vec<Vec<usize>> = if sender_groups {
@@ -1197,13 +1411,15 @@ where
             Err(why) => return Ok(Err(why)),
         }
     } else {
-        match partition(&txs, beneficiary) {
+        let components = if partition_hash() { partition_shared(&txs, beneficiary) } else { partition(&txs, beneficiary) };
+        match components {
             Ok((groups, _)) => groups,
             Err(why) => return Ok(Err(why)),
         }
     };
     phases.partition_ms = at.elapsed().as_millis() as u64;
     phases.groups = groups.len();
+    let at = std::time::Instant::now();
     // By sender the groups are many and small: packed into batches like the
     // builder's. By component each group is its own batch.
     let batches: Vec<Vec<&Vec<usize>>> = if sender_groups {
@@ -1219,6 +1435,7 @@ where
     // there and then ([`StagedGraft`]) and yields only the gas.
     let staged = (graft && follower_graft_stream())
         .then(|| std::sync::Mutex::new(StagedGraft::new(beneficiary, txs.len())));
+    phases.batch_us = at.elapsed().as_micros() as u64;
     let at = std::time::Instant::now();
     let results: Vec<Result<(Option<revm::database::BundleState>, Vec<(usize, u64)>), NotParallel>> = {
         use rayon::prelude::*;
@@ -1255,6 +1472,7 @@ where
             .collect()
     };
     phases.groups_ms = at.elapsed().as_millis() as u64;
+    let at = std::time::Instant::now();
     let mut bundles = Vec::with_capacity(results.len());
     let mut gas_of = vec![0u64; txs.len()];
     for r in results {
@@ -1270,6 +1488,7 @@ where
             Err(why) => return Ok(Err(why)),
         }
     }
+    phases.gas_us = at.elapsed().as_micros() as u64;
 
     // The block's own executor: pre-execution changes (the system calls),
     // then -- with no transactions -- the post-execution changes (the
@@ -1295,7 +1514,10 @@ where
         let grafted = install_staged(&mut state, staged, false).map_err(|e| err(&e))?;
         (revm::state::EvmState::default(), grafted.beneficiary_delta, Some(grafted.reverts))
     } else if graft {
-        let grafted = graft_bundles_with(&mut state, bundles, beneficiary, false).map_err(|e| err(&e))?;
+        // Taken rather than moved so the teardown below can free whatever
+        // the chosen fold left behind.
+        let grafted =
+            graft_bundles_with(&mut state, std::mem::take(&mut bundles), beneficiary, false).map_err(|e| err(&e))?;
         (revm::state::EvmState::default(), grafted.beneficiary_delta, Some(grafted.reverts))
     } else {
         let (changes, delta) = fold_bundles(&mut state, &bundles, beneficiary).map_err(|e| err(&e))?;
@@ -1328,6 +1550,7 @@ where
     phases.reverts_ms = phases.merge_ms - taken;
 
     // Receipts in block order, gas cumulated.
+    let at = std::time::Instant::now();
     let mut cumulative = 0u64;
     let receipts: Vec<Receipt> = block
         .body()
@@ -1338,7 +1561,38 @@ where
             Receipt { tx_type: tx.tx_type(), success: true, cumulative_gas_used: cumulative, logs: Vec::new() }
         })
         .collect();
+    phases.receipts_us = at.elapsed().as_micros() as u64;
     let result = reth_execution_types::BlockExecutionResult { receipts, gas_used: cumulative, ..result };
+
+    // The teardown, here rather than at the return: 163,000 transaction
+    // environments, the groups and the batches' bundles are freed either way,
+    // and a caller that reads `total_us` against its own `exec_ms` would
+    // otherwise see them as time nothing named.
+    //
+    // `N42_FOLLOWER_FREE_ASYNC=1` hands the owned parts to the pool. The
+    // environments alone are ~32 MB a full block, and with the fleet's
+    // allocator settings (`oversize_threshold:0, dirty_decay_ms:2000`) a
+    // block's worth of them is page work, not free-list work: 5 ms on an idle
+    // bench, and the import thread is the one place it must not be. The
+    // batches only borrow the groups, so they are freed here either way.
+    let at = std::time::Instant::now();
+    drop(batches);
+    if free_async() {
+        rayon::spawn(move || {
+            drop(txs);
+            drop(groups);
+            drop(bundles);
+            drop(gas_of);
+        });
+    } else {
+        drop(groups);
+        drop(txs);
+        drop(bundles);
+        drop(gas_of);
+    }
+    phases.drop_us = at.elapsed().as_micros() as u64;
+
+    phases.total_us = call_at.elapsed().as_micros() as u64;
     Ok(Ok((BlockExecutionOutput { state: bundle, result }, phases)))
 }
 
@@ -1358,6 +1612,39 @@ mod tests {
         let mut a = [0u8; 20];
         a[12..].copy_from_slice(&i.to_be_bytes());
         Address::from(a)
+    }
+
+    /// One shared copy of a bench's accounts, read through an `Arc`.
+    ///
+    /// The parallel executor opens a database per batch, and the benches
+    /// below hand it a `CacheDB`. Cloning one that holds the flood's two
+    /// million accounts, 240 times a block, would be all the bench measured;
+    /// on a node every batch opens a state provider over the same store.
+    #[derive(Debug, Clone)]
+    struct SharedDb(std::sync::Arc<CacheDB<EmptyDB>>);
+
+    impl Database for SharedDb {
+        type Error = <CacheDB<EmptyDB> as revm::DatabaseRef>::Error;
+
+        fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+            revm::DatabaseRef::basic_ref(&*self.0, address)
+        }
+
+        fn code_by_hash(&mut self, code_hash: B256) -> Result<revm::state::Bytecode, Self::Error> {
+            revm::DatabaseRef::code_by_hash_ref(&*self.0, code_hash)
+        }
+
+        fn storage(
+            &mut self,
+            address: Address,
+            index: U256,
+        ) -> Result<U256, Self::Error> {
+            revm::DatabaseRef::storage_ref(&*self.0, address, index)
+        }
+
+        fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
+            revm::DatabaseRef::block_hash_ref(&*self.0, number)
+        }
     }
 
     /// A block of `n` transfers among `senders` accounts, every sender
@@ -1828,7 +2115,7 @@ mod tests {
     /// from `space` accounts (the bench's shape: 6,000 x 27 over 2,000,000
     /// gives ~147,000 distinct accounts), the senders interleaved as the
     /// queue lays them out.
-    fn random_fixture(senders: u64, per: u64, space: u64, run: usize) -> (RecoveredBlock<Block>, CacheDB<EmptyDB>) {
+    fn random_fixture(senders: u64, per: u64, space: u64, run: usize, spread: u64) -> (RecoveredBlock<Block>, CacheDB<EmptyDB>) {
         let mut db = CacheDB::new(EmptyDB::default());
         let beneficiary = addr(1);
         db.insert_account_info(beneficiary, AccountInfo { balance: U256::from(7), ..Default::default() });
@@ -1842,12 +2129,13 @@ mod tests {
                 seed ^= seed << 13;
                 seed ^= seed >> 7;
                 seed ^= seed << 17;
-                // `space` 0: each sender draws from its own range of 2 x per
-                // addresses (repeats only within a sender, as the fleet's
-                // flood mostly produces: ~210 components a block); otherwise a
-                // shared space, where a few thousand repeats join every sender
-                // into one component.
-                let to = if space == 0 { addr(1_000_000 + s * per * 2 + seed % (per * 2)) } else { addr(1_000_000 + seed % space) };
+                // `space` 0: each sender draws from its own range of
+                // `spread` x per addresses (repeats only within a sender, as
+                // the fleet's flood mostly produces: ~210 components a
+                // block); otherwise a shared space, where a few thousand
+                // repeats join every sender into one component.
+                let to =
+                    if space == 0 { addr(1_000_000 + s * per * spread + seed % (per * spread)) } else { addr(1_000_000 + seed % space) };
                 let inner = TxEip1559 {
                     chain_id: 1,
                     nonce: k,
@@ -1898,16 +2186,43 @@ mod tests {
 
     /// Where the follower's parallel execution of a bench-shaped block goes,
     /// by component groups (the follower's default) and by sender groups,
-    /// with the graft. `cargo test --release -p n42-engine-types --lib
-    /// bench_follower_import -- --ignored --nocapture`.
+    /// with the graft.
+    ///
+    /// ```text
+    /// RAYON_NUM_THREADS=16 taskset -c 0-31 \
+    ///   cargo test --release -p n42-engine-types --lib bench_follower_import -- --ignored --nocapture
+    /// ```
+    ///
+    /// The line it prints carries the same fields as a node's
+    /// `parallel import phases`, so a leg and a bench can be read against
+    /// each other. What it reads against loop202 (four nodes, pacing 225,
+    /// 163,000-transfer blocks, `RAYON_NUM_THREADS=16`): the executor's whole
+    /// call 121 ms against the leg's `exec_ms` 131-136, partition 17 against
+    /// 31-33, groups 88 against 55-56, merge 6 against 8-10. So it
+    /// reproduces the phases inside 2x and the leg is the slower box; what it
+    /// does *not* reproduce is the unnamed part, 6-8 ms here against ~37 on a
+    /// node, which is why `drop_us` is worth a flag and a leg
+    /// ([`free_async`]).
+    ///
+    /// `BENCH_SENDERS`/`BENCH_PER`/`BENCH_RUN`/`BENCH_SPREAD` shape the block
+    /// and `BENCH_PREFILL`/`BENCH_SPARE` the state it executes on; the
+    /// defaults are the fleet's.
     #[test]
     #[ignore = "timing"]
     fn bench_follower_import() {
         let env = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
-        // Defaults: the fleet's block shape (~380 senders in runs of 64 -- the
-        // queue's `N42_TX_QUEUE_RUN` -- over 2M recipients: ~147k accounts).
-        let (senders, per, space, run) = (env("BENCH_SENDERS", 380), env("BENCH_PER", 429), env("BENCH_SPACE", 0), env("BENCH_RUN", 64));
-        let (block, db) = random_fixture(senders, per, space, run as usize);
+        // `BENCH_SPREAD` 8: a sender's 429 transfers draw from 3,432
+        // addresses, so ~400 of them are distinct and the block touches
+        // ~150,000 accounts, the leg's `updated`.
+        // Defaults: the fleet's block shape. A leg's own numbers pin it --
+        // the builder's `par_groups` is 378-384 distinct senders a block and
+        // its `updated` is 150,800-151,535 accounts (loop202 C225a), so a
+        // block is ~380 senders paying ~429 recipients each, nearly all of
+        // them distinct, which the follower's component partition reads as
+        // the 222-345 groups its line reports.
+        let (senders, per, space, run) =
+            (env("BENCH_SENDERS", 380), env("BENCH_PER", 429), env("BENCH_SPACE", 0), env("BENCH_RUN", 64));
+        let (block, mut db) = random_fixture(senders, per, space, run as usize, env("BENCH_SPREAD", 8));
         let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
         let mut distinct: std::collections::HashSet<Address> = Default::default();
         for (sender, tx) in block.transactions_with_sender() {
@@ -1916,7 +2231,33 @@ mod tests {
                 distinct.insert(to);
             }
         }
-        println!("block: {} transfers, {} distinct accounts", block.transaction_count(), distinct.len());
+        // `BENCH_PREFILL=1` (the default): every account the block touches is
+        // already in the database, and beside it `BENCH_SPARE` more. A fleet
+        // node reads the recipients of a full block from a state that holds
+        // the flood's two million accounts; a database that answers `None`
+        // without touching memory makes the groups phase look cheaper than it
+        // is on a node.
+        if env("BENCH_PREFILL", 1) == 1 {
+            // The senders are already there with the balance and nonce the
+            // block needs; only the recipients are added, and the spare
+            // accounts beside them are what makes the look-up miss its cache.
+            for address in &distinct {
+                if !db.cache.accounts.contains_key(address) {
+                    db.insert_account_info(*address, AccountInfo { balance: U256::from(1u64), ..Default::default() });
+                }
+            }
+            for i in 0..env("BENCH_SPARE", 2_000_000) {
+                db.insert_account_info(addr(30_000_000 + i), AccountInfo { balance: U256::from(1u64), ..Default::default() });
+            }
+        }
+        println!(
+            "block: {} transfers, {} distinct accounts, {} in the database, {} rayon threads",
+            block.transaction_count(),
+            distinct.len(),
+            db.cache.accounts.len(),
+            rayon::current_num_threads(),
+        );
+        let db = SharedDb(std::sync::Arc::new(db));
         for (label, graft, sender_groups) in [("components+graft", true, false), ("senders+graft", true, true), ("components+fold", false, false)] {
             for round in 0..3 {
                 let at = std::time::Instant::now();
@@ -1924,18 +2265,35 @@ mod tests {
                     execute_transfers_with(&evm_config, &block, db.clone(), &|| Some(db.clone()), graft, sender_groups)
                         .expect("no execution error")
                         .expect("the block qualifies");
+                // The same fields the node's `parallel import phases` line
+                // carries, in the same order, so a bench table and a leg's
+                // line can be read against each other.
+                let named = phases.partition_ms * 1_000
+                    + phases.batch_us
+                    + phases.groups_ms * 1_000
+                    + phases.gas_us
+                    + phases.finish_ms * 1_000
+                    + phases.merge_ms * 1_000
+                    + phases.receipts_us
+                    + phases.drop_us;
                 println!(
-                    "{label} #{round}: total {} ms  partition {} groups {} ({} groups, {} batches) merge {} [graft {} take {} reverts {}] finish {}  -> {} accounts, {} reverts",
+                    "{label} #{round}: call {} ms  partition {} (env {}) batch {} groups {} ({} groups, {} batches) gas {} merge {} [graft {} take {} reverts {}] finish {} receipts {} drop {} other {}  -> {} accounts, {} reverts",
                     at.elapsed().as_millis(),
                     phases.partition_ms,
+                    phases.env_us / 1000,
+                    phases.batch_us / 1000,
                     phases.groups_ms,
                     phases.groups,
                     phases.batches,
+                    phases.gas_us / 1000,
                     phases.merge_ms,
                     phases.graft_ms,
                     phases.take_ms,
                     phases.reverts_ms,
                     phases.finish_ms,
+                    phases.receipts_us / 1000,
+                    phases.drop_us / 1000,
+                    phases.total_us.saturating_sub(named) / 1000,
                     out.state.state.len(),
                     out.state.reverts.iter().map(Vec::len).sum::<usize>(),
                 );
@@ -2072,6 +2430,159 @@ mod tests {
                 run.phases.partition_ms, run.phases.groups, run.phases.batches, run.phases.groups_ms, run.skipped.len(), graft.accounts, graft.committed, bundle.state.len(), bundle.reverts[0].len()
             );
         }
+    }
+
+    /// [`partition`] memoises a sender's party across the run the queue lays
+    /// its transactions out in, which is only sound if it still returns the
+    /// connected components of the block's sender/recipient graph. Checked
+    /// as the three properties that define them, at run lengths 1, 7 and 64,
+    /// so no layout can pass by accident.
+    #[test]
+    fn the_partition_is_the_components_whatever_the_run_length() {
+        let beneficiary = addr(1);
+        let env_for =
+            |from: Address, to: Address| TxEnv { caller: from, kind: TxKind::Call(to), gas_limit: 21_000, ..Default::default() };
+        for run in [1usize, 7, 64] {
+            // 40 senders, 12 transfers each; every third recipient is another
+            // sender's, so some senders share a component and some do not.
+            let senders = 40u64;
+            let per = 12u64;
+            let mut lanes: Vec<Vec<TxEnv>> = Vec::new();
+            for s in 0..senders {
+                let from = addr(100 + s);
+                let mut lane = Vec::new();
+                for k in 0..per {
+                    let to = if k % 3 == 0 { addr(100 + (s * 7 + k) % senders) } else { addr(10_000 + s * per + k) };
+                    if to == from {
+                        lane.push(env_for(from, addr(20_000 + s * per + k)));
+                    } else {
+                        lane.push(env_for(from, to));
+                    }
+                }
+                lanes.push(lane);
+            }
+            let mut txs: Vec<TxEnv> = Vec::new();
+            let mut k = 0usize;
+            while k < per as usize {
+                for lane in &lanes {
+                    txs.extend_from_slice(&lane[k..(k + run).min(per as usize)]);
+                }
+                k += run;
+            }
+            let (groups, parties) = partition(&txs, beneficiary).expect("a block of transfers");
+
+            // Every transaction in exactly one group, in block order.
+            let mut seen: Vec<usize> = groups.iter().flatten().copied().collect();
+            assert_eq!(seen.len(), txs.len(), "run {run}: every transaction once");
+            seen.sort_unstable();
+            seen.dedup();
+            assert_eq!(seen.len(), txs.len(), "run {run}: no transaction twice");
+            for group in &groups {
+                let mut order = group.clone();
+                order.sort_unstable();
+                assert_eq!(*group, order, "run {run}: a group is in block order");
+            }
+
+            // No address in two groups, and two transactions that share one
+            // in the same group: together, the connected components.
+            let mut group_of: std::collections::HashMap<Address, usize> = Default::default();
+            for (g, group) in groups.iter().enumerate() {
+                for &i in group {
+                    for address in [txs[i].caller, txs[i].kind.to().copied().expect("a call")] {
+                        let held = *group_of.entry(address).or_insert(g);
+                        assert_eq!(held, g, "run {run}: {address} is in two groups");
+                    }
+                }
+            }
+            assert_eq!(group_of.len(), parties, "run {run}: the parties counted are the addresses touched");
+        }
+    }
+
+    /// `N42_FOLLOWER_PARTITION_HASH=1` ([`partition_shared`]) must be the
+    /// same partition as [`partition`], not merely a valid one: the groups,
+    /// in the same order, and the same refusal at the same index. Chosen by
+    /// calling the two functions, so the test does not depend on the flag.
+    #[test]
+    fn the_hash_partition_is_the_serial_one() {
+        let beneficiary = addr(1);
+        let env_for =
+            |from: Address, to: Address| TxEnv { caller: from, kind: TxKind::Call(to), gas_limit: 21_000, ..Default::default() };
+        // Three shapes: recipients of their own, recipients two senders
+        // share, and recipients that are senders.
+        for (senders, per, run, shape) in [(40u64, 12u64, 1usize, 0u8), (40, 12, 7, 1), (37, 23, 64, 2), (5, 3, 2, 2)] {
+            let mut lanes: Vec<Vec<TxEnv>> = Vec::new();
+            for s in 0..senders {
+                let from = addr(100 + s);
+                let mut lane = Vec::new();
+                for k in 0..per {
+                    let to = match shape {
+                        0 => addr(10_000 + s * per + k),
+                        1 => {
+                            if k % 4 == 0 {
+                                addr(10_000 + (s * per + k) % 17)
+                            } else {
+                                addr(10_000 + s * per + k)
+                            }
+                        }
+                        _ => {
+                            if k % 3 == 0 {
+                                addr(100 + (s * 7 + k) % senders)
+                            } else {
+                                addr(10_000 + s * per + k)
+                            }
+                        }
+                    };
+                    lane.push(env_for(from, if to == from { addr(20_000 + s * per + k) } else { to }));
+                }
+                lanes.push(lane);
+            }
+            let mut txs: Vec<TxEnv> = Vec::new();
+            let mut k = 0usize;
+            while k < per as usize {
+                for lane in &lanes {
+                    txs.extend_from_slice(&lane[k..(k + run).min(per as usize)]);
+                }
+                k += run;
+            }
+            let (serial, _) = partition(&txs, beneficiary).expect("a block of transfers");
+            let (shared, _) = partition_shared(&txs, beneficiary).expect("a block of transfers");
+            assert_eq!(shared, serial, "shape {shape}, run {run}: the same groups in the same order");
+
+            // The same refusal, at the same index, for a block that is not
+            // all transfers and for one that pays the beneficiary.
+            let mut not_a_transfer = txs.clone();
+            not_a_transfer[3].data = alloy_primitives::Bytes::from_static(&[1]);
+            assert!(
+                matches!(
+                    (partition(&not_a_transfer, beneficiary), partition_shared(&not_a_transfer, beneficiary)),
+                    (Err(NotParallel::NotATransfer(a)), Err(NotParallel::NotATransfer(b))) if a == 3 && b == 3
+                ),
+                "shape {shape}: both refuse transaction 3"
+            );
+            let mut pays_beneficiary = txs.clone();
+            pays_beneficiary[2].kind = TxKind::Call(beneficiary);
+            assert!(
+                matches!(
+                    (partition(&pays_beneficiary, beneficiary), partition_shared(&pays_beneficiary, beneficiary)),
+                    (Err(NotParallel::TouchesBeneficiary(a)), Err(NotParallel::TouchesBeneficiary(b))) if a == 2 && b == 2
+                ),
+                "shape {shape}: both refuse transaction 2"
+            );
+        }
+    }
+
+    /// The bench's block shape through both partitions: 163,000 transfers is
+    /// where they could differ and a 500-transfer fixture could not show it.
+    #[test]
+    fn the_hash_partition_is_the_serial_one_on_a_full_block() {
+        let (block, _) = random_fixture(64, 200, 0, 64, 8);
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_env = evm_config.evm_env(block.header()).expect("an environment");
+        let txs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
+        let beneficiary = evm_env.block_env.beneficiary;
+        let (serial, _) = partition(&txs, beneficiary).expect("a block of transfers");
+        let (shared, _) = partition_shared(&txs, beneficiary).expect("a block of transfers");
+        assert_eq!(shared, serial, "the same groups in the same order");
     }
 
     #[test]

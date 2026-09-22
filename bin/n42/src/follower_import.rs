@@ -1230,14 +1230,34 @@ where
             .map_err(|err| format!("parallel execution: {err}"))?
             {
                 Ok((out, phases)) => {
+                    // The line adds up now: `total_ms` is the executor's whole
+                    // call and `other_ms` is what the named parts leave of it,
+                    // the way `vote road` reports its own gap. At loop202 the
+                    // four phases named 95 of a 133 ms execution and the rest
+                    // had no name at all.
+                    let named = phases.partition_ms * 1_000
+                        + phases.batch_us
+                        + phases.groups_ms * 1_000
+                        + phases.gas_us
+                        + phases.finish_ms * 1_000
+                        + phases.merge_ms * 1_000
+                        + phases.receipts_us
+                        + phases.drop_us;
                     tracing::info!(
                         target: "n42.follower_import",
                         number,
                         groups = phases.groups,
                         partition_ms = phases.partition_ms,
+                        env_ms = phases.env_us / 1000,
+                        batch_ms = phases.batch_us / 1000,
                         groups_ms = phases.groups_ms,
+                        gas_ms = phases.gas_us / 1000,
                         merge_ms = phases.merge_ms,
                         finish_ms = phases.finish_ms,
+                        receipts_ms = phases.receipts_us / 1000,
+                        drop_ms = phases.drop_us / 1000,
+                        other_ms = phases.total_us.saturating_sub(named) / 1000,
+                        total_ms = phases.total_us / 1000,
                         "parallel import phases"
                     );
                     output = Some(out);

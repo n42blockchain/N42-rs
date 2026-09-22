@@ -1013,6 +1013,22 @@ a decided height (`canonical_head`, one atomic fed by the canonical subscriber),
 parks capped at 64 lanes (`N42_TX_QUEUE_PARK_LANES`); `superseded=` on the build line. Pd's window 2 was two such
 parks inside it.
 
+## 2ae. The park costs more than the defect; five of five at 619-636k when it stays small (loop211-212)
+
+loop211 (lane-holes-2 in): Pa / Pb 625-630k on both windows with `parked` 0 / 137k -- the cleanest legs yet -- and Pd
+lost both windows (407k, then 75k at 24% occupancy: 55 empty builds, `parked` 559k despite the 64-lane cap,
+`park_capped` 283k, one `stale_give_back` event of 6,464), Pe its window 3 (129k, `parked` 561k). loop212, an A/B on
+`N42_TX_QUEUE_PARK_LANES=0` (which turned out to mean "no cap", not "off"): window 2 held in five of five (636k / 619k /
+625k / 619k / 619k, window 1 630-636k), and the run's one bad window 3 (NPb, 75%) again carried a mass park (677k).
+
+- Over loop210-212, fourteen of fifteen legs hold window 2 at 619-636k; the one that did not, and every lost window 3,
+  carried a mass park of the sender set. The park was built to survive a hole; what it does at scale is manufacture a
+  starvation. It goes off by default (`plan-v4/lane-holes-3`), keeping what the same work put right: the seal gate's
+  shortfall, the stale-head diagnosis on the block's own state, the unmined give-back door, the ingest's ack by decoded
+  count, the drop counters, `superseded=`.
+- The four-node state, then: **window 1 630-646k, window 2 619-636k, cycle 0.252-0.263 s** on the P configuration
+  (`run-loop212.sh`'s `CH`), the follower's import 178-202 ms with no waits, early seal 94-97%.
+
 ## 3. What not to do
 
 - Do not judge a cycle-shortening change at a pacing above the natural cycle; do not judge any change without R1.

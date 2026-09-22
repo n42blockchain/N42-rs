@@ -66,6 +66,16 @@ struct Lane<T: PoolTransaction> {
     /// (round 44: 814,431 refusals on one node against 17,300 on a healthy
     /// one, and a leader's build at 3.4-4.1 s instead of 250 ms).
     mined: Option<u64>,
+    /// Of that watermark, the part a canonical block put there.
+    ///
+    /// The rest of it comes from a build's refusal, which is a verdict
+    /// about a state that may include blocks consensus has not committed.
+    /// Both filter the same way -- they have to -- but only one of them is
+    /// a fact, and a transaction filtered on the other is the shape a hole
+    /// takes. Kept apart so the drop counters can say which
+    /// ([`Dropped::Mined`] against [`Dropped::StaleGiveBack`]) instead of
+    /// reporting every mined transaction as a suspect.
+    chain_mined: Option<u64>,
     /// A build found a hole below this lane's head: the account is at
     /// `Parked::wanted` and the lowest nonce here is above it, so nothing
     /// in this lane can execute until the missing nonce arrives. See
@@ -109,6 +119,28 @@ struct Parked {
 /// re-offered to every build.
 const PARK_BUILDS: u64 = 8;
 
+/// How many lanes may be parked at once; 0 turns the cap off.
+/// `N42_TX_QUEUE_PARK_LANES`.
+///
+/// A park is a guess, and a guess must not be able to take the node's whole
+/// supply out. On loop210 one build a leg did exactly that -- 384 lanes and
+/// 631,212 transactions in Pb, 375,456 in Pd -- and the four blocks that
+/// followed carried 8,500 to 65,828 transactions instead of 163,000. The
+/// builder's guard (`crates/n42/engine-types/src/payload.rs`) is what stops
+/// that build from asking; this is the bound that holds whatever any caller
+/// asks for, and it is counted in lanes because that is the one thing a
+/// park knows reliably at the moment it is made -- the lane's own depth is
+/// whatever the build in flight has not taken out of it yet.
+///
+/// Sixty-four is generous for a hole, which is a handful of senders, and at
+/// the bench tier holds the parked depth under one block.
+fn park_lane_cap() -> usize {
+    static LANES: OnceLock<usize> = OnceLock::new();
+    *LANES.get_or_init(|| {
+        std::env::var("N42_TX_QUEUE_PARK_LANES").ok().and_then(|v| v.parse().ok()).unwrap_or(64)
+    })
+}
+
 impl<T: PoolTransaction> Lane<T> {
     /// Whether the chain has passed this nonce, so the lane must not hold it.
     fn is_stale(&self, nonce: u64) -> bool {
@@ -118,8 +150,27 @@ impl<T: PoolTransaction> Lane<T> {
     /// Records that the chain mined this nonce. The watermark only rises:
     /// blocks arrive in order, and a later build's refusal says no less
     /// than an earlier block did.
-    fn mine(&mut self, nonce: u64) {
+    fn mine(&mut self, nonce: u64, from_chain: bool) {
         self.mined = Some(self.mined.map_or(nonce, |mined| mined.max(nonce)));
+        if from_chain {
+            self.chain_mined = Some(self.chain_mined.map_or(nonce, |mined| mined.max(nonce)));
+        }
+    }
+
+    /// Whether a canonical block is known to have mined this nonce, as
+    /// against a build having said so.
+    fn chain_mined(&self, nonce: u64) -> bool {
+        self.chain_mined.is_some_and(|mined| nonce <= mined)
+    }
+
+    /// Why this lane will not take the nonce back: because the chain holds
+    /// it, or only because a build said so.
+    fn why_stale(&self, nonce: u64, give_back: bool) -> Dropped {
+        match (self.chain_mined(nonce), give_back) {
+            (true, _) => Dropped::Mined,
+            (false, true) => Dropped::StaleGiveBack,
+            (false, false) => Dropped::StaleArrival,
+        }
     }
 
     /// A reorg took this nonce back off the chain: the watermark drops below
@@ -128,6 +179,9 @@ impl<T: PoolTransaction> Lane<T> {
     fn unmine(&mut self, nonce: u64) {
         if self.mined.is_some_and(|mined| mined >= nonce) {
             self.mined = nonce.checked_sub(1);
+        }
+        if self.chain_mined.is_some_and(|mined| mined >= nonce) {
+            self.chain_mined = nonce.checked_sub(1);
         }
     }
 
@@ -166,6 +220,10 @@ pub enum Dropped {
     /// The lane already held that (sender, nonce). Harmless: the generator
     /// re-sends a frame whose answer it did not hear.
     Duplicate,
+    /// A canonical block carries that (sender, nonce). Harmless, and the
+    /// common one: a build hands its leftovers back after another build has
+    /// mined them, which under the build chain is every block.
+    Mined,
     /// An arrival at or below the lane's mined watermark.
     StaleArrival,
     /// A build's give-back at or below the watermark. **This is the one
@@ -186,8 +244,9 @@ pub enum Dropped {
 
 impl Dropped {
     /// Every reason, in report order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Duplicate,
+        Self::Mined,
         Self::StaleArrival,
         Self::StaleGiveBack,
         Self::StaleRefusal,
@@ -200,6 +259,7 @@ impl Dropped {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Duplicate => "duplicate",
+            Self::Mined => "mined",
             Self::StaleArrival => "stale_arrival",
             Self::StaleGiveBack => "stale_give_back",
             Self::StaleRefusal => "stale_refusal",
@@ -212,12 +272,13 @@ impl Dropped {
     const fn index(self) -> usize {
         match self {
             Self::Duplicate => 0,
-            Self::StaleArrival => 1,
-            Self::StaleGiveBack => 2,
-            Self::StaleRefusal => 3,
-            Self::NoLane => 4,
-            Self::HeldEvicted => 5,
-            Self::HeldBehind => 6,
+            Self::Mined => 1,
+            Self::StaleArrival => 2,
+            Self::StaleGiveBack => 3,
+            Self::StaleRefusal => 4,
+            Self::NoLane => 5,
+            Self::HeldEvicted => 6,
+            Self::HeldBehind => 7,
         }
     }
 }
@@ -227,16 +288,23 @@ impl Dropped {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DropReport {
     /// Counts in [`Dropped::ALL`] order.
-    pub counts: [u64; 7],
+    pub counts: [u64; 8],
     /// The first few, as (reason, sender, nonce): enough to take one sender
     /// to the generator's own log and see which nonce went missing.
     pub samples: Vec<(Dropped, Address, u64)>,
 }
 
 impl DropReport {
-    /// Whether anything but harmless duplicates was let go of.
+    /// Whether anything was let go of that a hole could be hiding behind.
+    ///
+    /// A duplicate is the generator re-sending, and a transaction the chain
+    /// holds is the build chain handing back what the next build mined:
+    /// both are the queue working. Everything else is worth a line.
     pub fn interesting(&self) -> bool {
-        self.counts.iter().enumerate().any(|(i, n)| i != Dropped::Duplicate.index() && *n > 0)
+        self.counts
+            .iter()
+            .enumerate()
+            .any(|(i, n)| i != Dropped::Duplicate.index() && i != Dropped::Mined.index() && *n > 0)
     }
 
     /// The reasons that fired, as `name=count` pairs.
@@ -317,6 +385,10 @@ struct Inner<T: PoolTransaction> {
     parked_len: usize,
     /// What the queue has let go of since the last report ([`Dropped`]).
     drops: DropReport,
+    /// Parks refused by the cap since the process started; on the prune
+    /// line, because a cap that keeps firing means something is asking for
+    /// far more parking than a hole would explain.
+    park_capped: u64,
     /// The sender a build is taking a run from, and how much of the run is
     /// left. See [`run_length`].
     current: Option<(Address, usize)>,
@@ -675,6 +747,7 @@ impl<T: PoolTransaction> TxQueue<T> {
                 parked_order: VecDeque::new(),
                 parked_len: 0,
                 drops: DropReport::default(),
+                park_capped: 0,
                 current: None,
                 run: run.max(1),
                 builds: 0,
@@ -764,10 +837,11 @@ impl<T: PoolTransaction> TxQueue<T> {
         std::mem::take(&mut self.inner.lock().drops)
     }
 
-    /// The lanes parked behind a hole and how many transactions they hold.
-    pub fn parked(&self) -> (usize, usize) {
+    /// The lanes parked behind a hole, how many transactions they hold, and
+    /// how many parks the cap has refused since the process started.
+    pub fn parked(&self) -> (usize, usize, u64) {
         let inner = self.inner.lock();
-        (inner.parked_order.len(), inner.parked_len)
+        (inner.parked_order.len(), inner.parked_len, inner.park_capped)
     }
 
     /// Whether nothing is queued.
@@ -1145,13 +1219,14 @@ impl<T: PoolTransaction> Inner<T> {
         let lane = self
             .lanes
             .entry(sender)
-            .or_insert_with(|| Lane { by_nonce: BTreeMap::new(), queued: false, mined: None, parked: None });
+            .or_insert_with(|| Lane { by_nonce: BTreeMap::new(), queued: false, mined: None, chain_mined: None, parked: None });
         if lane.by_nonce.contains_key(&nonce) {
             self.dropped(Dropped::Duplicate, sender, nonce);
             return;
         }
         if lane.is_stale(nonce) {
-            self.dropped(Dropped::StaleArrival, sender, nonce);
+            let reason = lane.why_stale(nonce, false);
+            self.dropped(reason, sender, nonce);
             return;
         }
         // The hole a build parked this lane behind, filled: the ingest saw
@@ -1206,7 +1281,8 @@ impl<T: PoolTransaction> Inner<T> {
             };
             if lane.is_stale(nonce) {
                 gave.filtered += 1;
-                self.dropped(Dropped::StaleGiveBack, sender, nonce);
+                let reason = lane.why_stale(nonce, true);
+                self.dropped(reason, sender, nonce);
                 continue;
             }
             gave.offered += 1;
@@ -1248,7 +1324,10 @@ impl<T: PoolTransaction> Inner<T> {
     /// Records that a transaction left the queue, or never entered it.
     fn dropped(&mut self, reason: Dropped, sender: Address, nonce: u64) {
         self.drops.counts[reason.index()] += 1;
-        if self.drops.samples.len() < DROP_SAMPLES && reason != Dropped::Duplicate {
+        if self.drops.samples.len() < DROP_SAMPLES
+            && reason != Dropped::Duplicate
+            && reason != Dropped::Mined
+        {
             self.drops.samples.push((reason, sender, nonce));
         }
     }
@@ -1281,6 +1360,16 @@ impl<T: PoolTransaction> Inner<T> {
         // not the entry's.
         let fresh = lane.parked.is_none();
         let held = lane.by_nonce.len();
+        if fresh {
+            // The cap: past it the lane is not parked at all. It stays in
+            // the order and a build pays one refusal for its head, which is
+            // what it did before parks existed.
+            let cap = park_lane_cap();
+            if cap > 0 && self.parked_order.len() >= cap {
+                self.park_capped = self.park_capped.saturating_add(1);
+                return;
+            }
+        }
         lane.parked = Some(Parked { wanted, until_build });
         if fresh {
             self.parked_len += held;
@@ -1347,9 +1436,17 @@ impl<T: PoolTransaction> Inner<T> {
             .fold((0, 0), |(lanes, txs), lane| (lanes + 1, txs + lane.by_nonce.len()))
     }
 
+    /// [`Self::remove_mined_from`] for a canonical block.
     fn remove_mined(&mut self, sender: Address, nonce: u64) {
+        self.remove_mined_from(sender, nonce, true);
+    }
+
+    /// Drops everything at or below `nonce` and raises the watermark;
+    /// `from_chain` says whether a canonical block put it there or a build
+    /// did ([`Lane::chain_mined`]).
+    fn remove_mined_from(&mut self, sender: Address, nonce: u64, from_chain: bool) {
         let Some(lane) = self.lanes.get_mut(&sender) else { return };
-        lane.mine(nonce);
+        lane.mine(nonce, from_chain);
         // The chain has reached or passed the hole: whatever is left in the
         // lane above it is the next thing this sender wants mined.
         let ends_park = lane.chain_passed(nonce);
@@ -1580,7 +1677,9 @@ impl<T: PoolTransaction> BestTransactions for QueueBest<T> {
                 taken.remove(at);
             }
             inner.dropped(Dropped::StaleRefusal, sender, transaction.nonce());
-            inner.remove_mined(sender, transaction.nonce());
+            // A build's verdict, not a block's: the watermark rises, but the
+            // lane remembers that no canonical block said so.
+            inner.remove_mined_from(sender, transaction.nonce(), false);
             return;
         }
         self.skipped.insert(sender);
@@ -1989,6 +2088,8 @@ mod tests {
         parent: B256,
         account_nonce: &dyn Fn(u8) -> u64,
     ) -> Vec<(u8, u64)> {
+        // `account_nonce` is keyed by the address's first byte, which is
+        // all the fixtures here need.
         let mut best = queue.best_for_build(parent);
         let taken: Vec<_> = std::iter::from_fn(|| best.next()).collect();
         let handed: Vec<(u8, u64)> = taken.iter().map(|t| (t.sender().as_slice()[0], t.nonce())).collect();
@@ -2021,10 +2122,12 @@ mod tests {
     #[test]
     fn a_build_steps_over_lanes_parked_behind_a_hole_and_finds_the_next_nonces() {
         let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(4);
-        // Senders 1..=20 are gapped: the chain has them at nonce 0 and the
-        // queue's lowest nonce for each is 5. Senders 21..=24 are whole.
-        let gapped: Vec<u8> = (1..=20).collect();
-        let whole: Vec<u8> = (21..=24).collect();
+        // Senders 1..=4 are gapped: the chain has them at nonce 0 and the
+        // queue's lowest nonce for each is 5. Senders 5..=40 are whole --
+        // a minority gapped, which is the shape a hole takes and the shape
+        // the park's cap allows.
+        let gapped: Vec<u8> = (1..=4).collect();
+        let whole: Vec<u8> = (5..=40).collect();
         let mut all = Vec::new();
         for s in &gapped {
             for n in 5..15 {
@@ -2045,7 +2148,7 @@ mod tests {
         // The first build is offered the gapped heads and refuses them; the
         // whole lanes start at nonce 0 and are never refused.
         let first = build_refusing_gaps(&queue, B256::repeat_byte(1), &account_nonce);
-        assert!(first.iter().any(|(s, _)| *s <= 20), "the first build was offered the gapped lanes");
+        assert!(first.iter().any(|(s, _)| *s <= 4), "the first build was offered the gapped lanes");
 
         // The next build: its start gives the first build's take back, so
         // everything is in the lanes again -- and the depth and what a
@@ -2057,7 +2160,7 @@ mod tests {
         let second: Vec<(u8, u64)> =
             std::iter::from_fn(|| best.next()).map(|t| (t.sender().as_slice()[0], t.nonce())).collect();
         drop(best);
-        assert!(second.iter().all(|(s, _)| *s > 20), "a parked lane was offered again: {second:?}");
+        assert!(second.iter().all(|(s, _)| *s > 4), "a parked lane was offered again: {second:?}");
         assert_eq!(second.len(), whole.len() * 10, "the build did not find the nonces it could mine");
     }
 
@@ -2127,12 +2230,14 @@ mod tests {
         // A duplicate.
         queue.push(vec![tx(1, 0)]);
         queue.drain_now();
-        // An arrival the chain is past.
+        // An arrival a canonical block is past: `mined`, not a suspect.
         queue.remove_mined(Address::repeat_byte(1), 1);
         queue.push(vec![tx(1, 1)]);
         queue.drain_now();
-        // A build's stale refusal.
-        queue.push(vec![tx(2, 5)]);
+        // A build's stale refusal, which raises a watermark no block put
+        // there; an arrival filtered by *that* is `stale_arrival`, and it
+        // is the shape a hole takes.
+        queue.push(vec![tx(2, 5), tx(2, 6)]);
         let mut best = queue.best_for_build(B256::repeat_byte(1));
         let head = best.next().expect("the lane's head");
         best.mark_invalid(
@@ -2140,14 +2245,21 @@ mod tests {
             InvalidPoolTransactionError::Consensus(InvalidTransactionError::NonceNotConsistent { tx: 5, state: 9 }),
         );
         drop(best);
+        queue.push(vec![tx(2, 5)]);
+        queue.drain_now();
 
         let report = queue.take_drops();
         assert!(report.interesting(), "{report:?}");
         let named: alloy_primitives::map::HashMap<&str, u64> = report.named().into_iter().collect();
         assert_eq!(named.get("duplicate"), Some(&1));
-        assert_eq!(named.get("stale_arrival"), Some(&1));
+        assert_eq!(named.get("mined"), Some(&1), "{named:?}");
+        assert_eq!(named.get("stale_arrival"), Some(&1), "{named:?}");
         assert_eq!(named.get("stale_refusal"), Some(&1));
-        assert!(report.samples.iter().any(|(r, _, n)| *r == Dropped::StaleArrival && *n == 1));
+        assert!(report.samples.iter().any(|(r, _, n)| *r == Dropped::StaleArrival && *n == 5));
+        assert!(
+            !report.samples.iter().any(|(r, _, _)| *r == Dropped::Mined),
+            "a transaction the chain holds is not a suspect"
+        );
         // Taking it clears it.
         assert_eq!(queue.take_drops(), DropReport::default());
     }
@@ -2198,7 +2310,7 @@ mod tests {
             let _ = queue.best_for_build(B256::from([i as u8 + 40; 32]));
             check(&queue, "after a build");
         }
-        assert_eq!(queue.parked(), (0, 0), "a park outlived its expiry");
+        assert_eq!((queue.parked().0, queue.parked().1), (0, 0), "a park outlived its expiry");
     }
 
     /// The gate's depth leaves out what a parked lane holds, so a hole
@@ -2212,12 +2324,55 @@ mod tests {
         for s in 1..=3u8 {
             all.extend((5..15).map(|n| tx(s, n)));
         }
+        // Enough whole lanes that the gapped three are a minority the cap
+        // allows to park.
+        for s in 4..=40u8 {
+            all.extend((0..10).map(|n| tx(s, n)));
+        }
+        let queued = all.len();
         queue.push(all);
-        assert_eq!(queue.gate_len(), 30);
+        assert_eq!(queue.gate_len(), queued);
         build_refusing_gaps(&queue, B256::repeat_byte(1), &|_| 0);
         assert_eq!(queue.parked().0, 3);
-        assert_eq!(queue.gate_len(), 0, "the gate was held against transactions no build can take");
+        assert_eq!(
+            queue.len() - queue.gate_len(),
+            queue.parked().1,
+            "the gate was held against transactions no build can take"
+        );
+        assert!(queue.parked().1 > 0);
         assert!(!queue.is_empty(), "the queue still holds them");
+    }
+
+    /// No build can park more than the cap's worth of lanes, whatever it
+    /// reports.
+    ///
+    /// On loop210 one build a leg parked the node's whole sender set -- 384
+    /// lanes, 631,212 transactions in Pb node3 -- and the four blocks after
+    /// it carried 8,500 to 65,828 instead of 163,000. The builder no longer
+    /// asks for that; this is the bound that holds if anything ever does
+    /// again.
+    #[test]
+    fn no_build_parks_more_lanes_than_the_cap() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(4);
+        let lanes = park_lane_cap() + 40;
+        let mut all = Vec::new();
+        for s in 0..lanes {
+            let mut a = [0u8; 20];
+            a[..8].copy_from_slice(&(s as u64 + 1).to_be_bytes());
+            all.extend((5..9).map(|n| tx_of(Address::from(a), n)));
+        }
+        queue.push(all);
+        // Every lane gapped, which is what a build on a parent the chain has
+        // moved past reports.
+        build_refusing_gaps(&queue, B256::repeat_byte(1), &|_| 0);
+        assert_eq!(queue.parked().0, park_lane_cap(), "the cap did not hold");
+        assert!(queue.parked().2 >= 40, "the refused parks were not counted");
+        // The lanes the cap refused are still walked, so the node is not
+        // left with nothing to build from.
+        let mut best = queue.best_for_build(B256::repeat_byte(2));
+        let offered: Vec<_> = std::iter::from_fn(|| best.next()).collect();
+        drop(best);
+        assert!(!offered.is_empty(), "every lane was taken out of the order");
     }
 
     /// A park is a guess about state the queue cannot see, so it expires:

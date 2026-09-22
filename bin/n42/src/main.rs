@@ -484,6 +484,10 @@ fn main() {
                                 }
                                 let mut mined = 0usize;
                                 for (_, block) in notification.committed().blocks_iter().map(|b| (b.number(), b)) {
+                                    // What the builder reads to tell a build
+                                    // for a height the chain has already
+                                    // decided from a build that is starving.
+                                    n42_engine_types::canonical_head::saw(block.number());
                                     // One walk for both: the (sender, nonce)
                                     // pairs the lanes are pruned by, and the
                                     // hashes the by-hash index is pruned by
@@ -535,8 +539,8 @@ fn main() {
                                     // 13 was -- 334-360k queued, empty blocks,
                                     // and no line saying which of the two it
                                     // was.
-                                    let (parked_lanes, parked) = queue.parked();
-                                    info!(target: "n42.tx_queue", mined, queued = queue.len(), usable = queue.usable(), parked, parked_lanes, prune_ms = started.elapsed().as_millis() as u64, "canonical blocks pruned from the queue");
+                                    let (parked_lanes, parked, park_capped) = queue.parked();
+                                    info!(target: "n42.tx_queue", mined, queued = queue.len(), usable = queue.usable(), parked, parked_lanes, park_capped, prune_ms = started.elapsed().as_millis() as u64, "canonical blocks pruned from the queue");
                                     // What the queue let go of since the last
                                     // block, by reason, with the first few
                                     // named. A lane's hole -- a nonce the

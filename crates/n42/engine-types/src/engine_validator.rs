@@ -451,8 +451,10 @@ where
         // The rest, out of this node's queue by the hashes the body names.
         // Nothing is removed: the canonical prune is still what takes a
         // block's transactions out of the queue, exactly as on the body road.
+        // One pass: the look-up and the copy the block needs, on the worker
+        // that did the look-up. See `TxQueue::recovered_by_hashes`.
         let lookup_at = std::time::Instant::now();
-        let mut held = queue.get_by_hashes(&body.hashes);
+        let mut held = queue.recovered_by_hashes(&body.hashes);
         let first_pass = lookup_at.elapsed();
         let covered: std::collections::HashSet<usize> =
             supplied.iter().map(|(index, _, _)| *index).collect();
@@ -470,7 +472,7 @@ where
         while !misses.is_empty() && waited_at.elapsed() < miss_wait {
             queue.drain_now();
             let again: Vec<B256> = misses.iter().map(|&i| body.hashes[i]).collect();
-            let found = queue.get_by_hashes(&again);
+            let found = queue.recovered_by_hashes(&again);
             let mut still = Vec::new();
             for (slot, found) in misses.iter().copied().zip(found) {
                 match found {
@@ -494,22 +496,19 @@ where
             });
         }
         let unzip_at = std::time::Instant::now();
-        // The transactions and the senders this node recorded for them when
-        // it ingested them, with the supplied ones in their own positions.
-        // `flatten` rather than an unwrap: the loop above returned on any
-        // miss, and a list shorter than the body's is checked for below
-        // rather than trusted to be impossible.
-        let mut slots: Vec<Option<(TransactionSigned, alloy_primitives::Address)>> = held
-            .into_iter()
-            .map(|held| held.map(|held| held.transaction.clone_into_consensus().into_parts()))
-            .collect();
+        // The supplied ones take their own positions, and the two vectors
+        // the block and its import want come out in parallel: a serial
+        // `unzip` moves 163,000 transactions a second time, ~45 MB, on one
+        // core.
         for (index, sender, tx) in supplied {
-            if let Some(slot) = slots.get_mut(index) {
+            if let Some(slot) = held.get_mut(index) {
                 *slot = Some((tx, sender));
             }
         }
-        let (transactions, senders): (Vec<TransactionSigned>, Vec<alloy_primitives::Address>) =
-            slots.into_iter().flatten().unzip();
+        let (transactions, senders): (Vec<TransactionSigned>, Vec<alloy_primitives::Address>) = {
+            use rayon::prelude::*;
+            held.into_par_iter().flatten().unzip()
+        };
         if transactions.len() != body.hashes.len() {
             // Unreachable: the loop above returned on any miss. Checked
             // rather than assumed, because the alternative to a check here

@@ -400,6 +400,35 @@ impl<T: PoolTransaction> TxQueue<T> {
         hashes.par_iter().map(|hash| index.get(hash)).collect()
     }
 
+    /// [`Self::get_by_hashes`], handing back what a block's assembly
+    /// actually wants -- the transaction and the sender this node recorded
+    /// for it -- rather than the queue's `Arc`.
+    ///
+    /// One pass, not two. Taking the `Arc`s first and copying out of them
+    /// afterwards touches each of 163,000 transactions twice, and the second
+    /// touch is a serial walk over objects a dozen ingest threads allocated
+    /// at arbitrary times: on the fleet that pass was most of a 112-116 ms
+    /// assembly (loop196) against 22 ms on an idle box, where the same
+    /// objects are contiguous and warm. Here the copy happens on the worker
+    /// that did the look-up, while the transaction is in its cache.
+    pub fn recovered_by_hashes(
+        &self,
+        hashes: &[B256],
+    ) -> Vec<Option<(T::Consensus, Address)>>
+    where
+        T: Send + Sync,
+        T::Consensus: Send,
+    {
+        let Some(index) = self.by_hash.as_ref() else {
+            return (0..hashes.len()).map(|_| None).collect();
+        };
+        use rayon::prelude::*;
+        hashes
+            .par_iter()
+            .map(|hash| index.get(hash).map(|held| held.transaction.clone_into_consensus().into_parts()))
+            .collect()
+    }
+
     /// An empty queue taking `run` consecutive nonces per sender per turn.
     pub fn with_run_length(run: usize) -> Self {
         Self {

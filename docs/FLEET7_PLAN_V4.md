@@ -1042,6 +1042,24 @@ over a 370k queue. The legs that never parked were the cleanest of the campaign.
 left the pruned part counted for ever. loop211 Pd's `stale_give_back` samples are not holes (133 distinct of 133;
 ascending runs a prune confirmed a moment later, or lanes behind the chain).
 
+## 2ag. Parking off is worse: a gapped lane refused every build (loop213)
+
+| parking off | Pa | Pb | Pc | Pd | Pe |
+| --- | --- | --- | --- | --- | --- |
+| window 1 | 630k | 641k | 641k | 631k | 641k |
+| window 2 | 488k | 369k | 608k | 614k | 353k |
+| early seal | 96% | 82% | 94% | 97% | 81% |
+| gapped heads reported (parks declined) | 28k | 221k | 93k | 8k | 270k |
+| `gas=0` builds, not superseded | 0 | 0 | 0 | 0 | 26 |
+
+Two of five against five of five with parks on (loop212) and four of five (loop210-211). Pb and Pe stalled at t+90-120
+(cycle 0.61-0.86 s, the import at 0.12-0.14: the leader): with nothing parked, a lane whose head looks gapped is
+refused by every build, and at 220-270k refusals a leg the serial loop churns and the builds go late or empty.
+Neither mechanism is right, because both treat the symptom: a build sees most heads gapped when its PARENT is behind
+the queue -- the queue pruned by blocks the parent does not have (a chained build on a block the chain replaced, a
+handover build on a parent this node has not imported). The move is then to refuse the build and rebuild on the head,
+not to refuse 163,000 candidates or park the senders: `plan-v4/stale-parent`.
+
 ## 3. What not to do
 
 - Do not judge a cycle-shortening change at a pacing above the natural cycle; do not judge any change without R1.

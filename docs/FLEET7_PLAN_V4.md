@@ -976,6 +976,26 @@ and permanent -- a frame is acknowledged by count -- and the async path answered
 it answers with what it decoded now, and every drop the queue or the ingest makes is counted by reason and named.
 The generator is ruled out (accepted = min across the four streams; a timeout re-sends).
 
+## 2ac. Four of five at 625-634k; the doors are counted and not yet closed (loop210)
+
+| | Pa | Pb | Pc | Pd | Pe |
+| --- | --- | --- | --- | --- | --- |
+| window 1 | 641k | 641k | 641k | 646k | 638k |
+| window 2 | **634k** | **625k** | **625k** | 407k | **625k** |
+| early seal | 96% | 96% | 96% | 94% | 96% |
+| `gas=0` over a deep queue | 3 | 2 | 2 | 2 | 0 |
+| ingest drops | 0 | 0 | 0 | 0 | 0 |
+| `let go` events (stale_give_back per event) | 13 (776-828) | 20 (584-776) | 8 (8-680) | 52 (448-648) | 11 (776-840) |
+| parked, max | 50,600 | 631,212 | 130,816 | 375,456 | 159,672 |
+
+- **Four of five legs at 625-634k on window 2, all five at 638-646k on window 1**: the best run of the campaign, and
+  the cycle/import trace flat at 0.24-0.26 s for 90 s in every leg. Pd lost its window 2 at t+90 with the import at
+  0.18 s -- the leader again, in the leg with the most let-go events.
+- The ingest's doors are shut (0 drops in five legs). The queue's are not: `stale_give_back` still lets go of 450-840
+  transactions an event, 8-52 events a leg -- a give-back path the fix of 2ab did not route -- and whole lane sets are
+  still parked at some moment of every leg (up to 631k). `plan-v4/lane-holes-2`: which give-back, what parks, Pd's
+  stall. The bar stands: window 2 >= 600k in every leg.
+
 ## 3. What not to do
 
 - Do not judge a cycle-shortening change at a pacing above the natural cycle; do not judge any change without R1.

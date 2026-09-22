@@ -954,6 +954,28 @@ Five P legs on the merged tree (import pipelined, checkpoint replay CRC, early s
   section 2z left open.
 - The checkpoint's replay is 2 ms at the end of a leg (was 36 at 13 MB); root p90 64-85 as before.
 
+## 2ab. The holes: my own park, the gate it shut, and a give-back through the wrong door
+
+`plan-v4/lane-holes` (merged 184de30f7). loop209's thirteen empty builds were one node, one 15-second window, and the
+park of section 2z turned against itself: the skipped head was diagnosed against the PARENT's state, but the parallel
+step drops a sender's run wherever a batch's view lacks what other groups credit it in the same block, so the head sits
+k above the parent's nonce -- the block's own progress, not a hole -- and two builds with `par_skipped` 144-146k parked
+the node's whole lane set (`usable=0`, `queued=569,520`). The ingest's gate counted the parked transactions, shut,
+nothing arrived, the empty blocks pruned nothing, and the depth froze until the chain moved past the tenure. Fixed at
+both ends: the diagnosis reads the block's own state (the graft's bundle, then the db), and the gate's depth
+(`gate_len`) leaves parked lanes out.
+
+The hole's origin, reproduced by a test: an own block B sealed at height h and held; a later build on B is re-offered
+a nonce B carries and refuses it as behind the chain, and the lane's watermark rises on that verdict (it must -- round
+44); consensus commits another block at h; `settle_own_block` gives B's transactions back through `give_back`, which
+filters them against that watermark, and the nonce is in neither the queue nor a block, with every later nonce of the
+sender queued behind it. B was never committed, so the give-back now goes through the unmined door, lowering the
+watermark first, and the prune for the block that was committed re-raises it from what was mined. Three more doors in
+the ingest (an undecodable transaction, a signature that did not recover, a 0x50 that did not verify) were `debug!`
+and permanent -- a frame is acknowledged by count -- and the async path answered with the raw count before decoding;
+it answers with what it decoded now, and every drop the queue or the ingest makes is counted by reason and named.
+The generator is ruled out (accepted = min across the four streams; a timeout re-sends).
+
 ## 3. What not to do
 
 - Do not judge a cycle-shortening change at a pacing above the natural cycle; do not judge any change without R1.

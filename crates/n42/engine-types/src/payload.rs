@@ -517,6 +517,21 @@ fn seal_shortfall(block_gas_limit: u64) -> u64 {
     block_gas_limit.checked_div(div).unwrap_or(0)
 }
 
+/// `N42_BUILD_REFUSE_STALE_PARENT=1`: a build whose parent is below what
+/// the queue has been pruned through answers "parent stale" instead of
+/// pulling a block's worth of candidates it cannot use.
+///
+/// Off, because the reading it acts on has not been seen to fire. loop213
+/// Pe node3 built 26 empty blocks over a queue of 383,412 and every one of
+/// them was a chained build on its own previous block, canonical and
+/// committed 100-200 ms earlier -- the parent was the head, not behind it.
+/// The detector below is on and counted so the next leg can say whether
+/// the case exists at all; the refusal waits for a leg that shows it.
+fn refuse_stale_parent() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_BUILD_REFUSE_STALE_PARENT").is_ok_and(|v| v == "1"))
+}
+
 /// At most one line a second per call site, so a defect that repeats every
 /// build does not become a line every 250 ms.
 fn say_once_a_second(last: &std::sync::atomic::AtomicU64) -> bool {
@@ -743,6 +758,36 @@ where
     // Whether the transactions come from the queue: the selector took it if
     // one is installed. Only the queue needs to hear about a stale nonce.
     let from_queue = n42_tx_queue::global::<Pool::Transaction>().is_some();
+    // Is this build standing behind its own queue? The lanes are pruned by
+    // every canonical block; a parent below the highest of those is a parent
+    // whose state is waiting for nonces the lanes no longer hold, and every
+    // lane will look gapped to it whatever it holds. O(1), taken before a
+    // block's worth of candidates is pulled and refused.
+    //
+    // The reading is kept even though loop213 said it does not fire: Pe
+    // node3's 26 empty builds were chained builds on their own previous
+    // block, canonical and committed before the build ran. Counted so a leg
+    // can say whether the case exists; acted on only under
+    // `N42_BUILD_REFUSE_STALE_PARENT`.
+    let pruned_through = n42_tx_queue::global::<Pool::Transaction>().map_or(0, |queue| queue.pruned_through());
+    let parent_behind = pruned_through > parent_header.number;
+    if parent_behind {
+        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if say_once_a_second(&LAST) {
+            warn!(
+                target: "payload_builder",
+                number = parent_header.number + 1,
+                parent = %parent_header.hash(),
+                parent_number = parent_header.number,
+                pruned_through,
+                refusing = refuse_stale_parent(),
+                "build on own block refused: parent stale, the queue is pruned past it"
+            );
+        }
+        if refuse_stale_parent() {
+            return Ok(BuildOutcome::Cancelled);
+        }
+    }
     // What the queue holds and what a build could take of it. `queued`
     // alone cannot tell a queue that ran dry from one that is deep and
     // unusable -- lanes parked behind a hole, or emptied -- and loop207's
@@ -1195,6 +1240,33 @@ where
                         };
                         if let Some(nonce) = nonce {
                             skipped_heads.insert(sender, (pool_tx.nonce(), nonce));
+                        }
+                    }
+                    // What the gap actually is, for the first few senders:
+                    // the nonce the account is at, the lowest the lane
+                    // holds, and how far apart they are. `par_skipped` says
+                    // a build could use nothing; this says why, and it is
+                    // the one thing loop207 through loop213 could not read
+                    // off any line.
+                    if !skipped_heads.is_empty() {
+                        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                        if say_once_a_second(&LAST) {
+                            let named: Vec<(alloy_primitives::Address, u64, u64, i64)> = skipped_heads
+                                .iter()
+                                .take(4)
+                                .map(|(sender, (head, state))| {
+                                    (*sender, *head, *state, (*head as i64) - (*state as i64))
+                                })
+                                .collect();
+                            tracing::info!(
+                                target: "payload_builder",
+                                number = header.number,
+                                senders = skipped_heads.len(),
+                                par_groups,
+                                par_skipped,
+                                first = ?named,
+                                "the heads a build could not use: (sender, lane head, account nonce, head - nonce)"
+                            );
                         }
                     }
                     if skipped_heads.len().saturating_mul(DIAGNOSE_SHARE) > par_groups {

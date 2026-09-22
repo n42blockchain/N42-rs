@@ -417,12 +417,16 @@ fn main() {
                 let pool_for_gaps = node.pool.clone();
                 tokio::spawn(async move {
                     let mut batch = Vec::with_capacity(256);
+                    let mut last_gap_warn: Option<std::time::Instant> = None;
                     loop {
                         // Holes the builder ran into: the pool's listener drops
                         // events on a full channel, so a nonce can be in the
                         // pool and not here. Look those up; one still on its
                         // way in is simply not found yet.
+                        let mut unfilled: Vec<(alloy_primitives::Address, u64, u64)> = Vec::new();
+                        let mut holes = 0usize;
                         for (sender, from, to) in feed.take_gaps() {
+                            holes += 1;
                             let to = to.min(from.saturating_add(256));
                             let found: Vec<_> = (from..to)
                                 .filter_map(|nonce| {
@@ -433,8 +437,33 @@ fn main() {
                                     )
                                 })
                                 .collect();
-                            if !found.is_empty() {
+                            if found.is_empty() {
+                                if unfilled.len() < 4 {
+                                    unfilled.push((sender, from, to));
+                                }
+                            } else {
                                 feed.push_valid(found);
+                            }
+                        }
+                        // A hole this feed cannot fill is a nonce that is in
+                        // neither the queue nor the pool, and with the ingest
+                        // going straight to the queue
+                        // (`N42_TX_INGEST_DIRECT`) the pool never has it, so
+                        // every one of them lands here. Said out loud, at
+                        // most once a second, with the first few named: a
+                        // build reports these by the hundred thousand on a
+                        // node that has stalled (loop213 Pe: 269,522 in a
+                        // leg) and nothing has ever named one.
+                        if !unfilled.is_empty() {
+                            let now = std::time::Instant::now();
+                            if last_gap_warn.is_none_or(|last: std::time::Instant| now.duration_since(last).as_secs() >= 1) {
+                                last_gap_warn = Some(now);
+                                warn!(
+                                    target: "n42.tx_queue",
+                                    holes,
+                                    first = ?unfilled,
+                                    "holes a build ran into that the pool cannot fill: (sender, account nonce, lowest queued above it)"
+                                );
                             }
                         }
                         let event = match tokio::time::timeout(std::time::Duration::from_millis(50), arrivals.recv()).await {
@@ -488,6 +517,10 @@ fn main() {
                                     // for a height the chain has already
                                     // decided from a build that is starving.
                                     n42_engine_types::canonical_head::saw(block.number());
+                                    // What the builder compares its parent
+                                    // against: a build below this is behind
+                                    // its own queue.
+                                    queue.note_pruned(block.number());
                                     // One walk for both: the (sender, nonce)
                                     // pairs the lanes are pruned by, and the
                                     // hashes the by-hash index is pruned by

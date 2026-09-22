@@ -386,7 +386,6 @@ where
     ) -> Result<AssembledBlock, CompactBodyError> {
         use alloy_eips::eip4895::Withdrawals;
         use rayon::prelude::*;
-        use reth_transaction_pool::PoolTransaction as _;
         let other = |message: String| CompactBodyError::Invalid(NewPayloadError::Other(message.into()));
         if profile != self.profile {
             return Err(other(format!(

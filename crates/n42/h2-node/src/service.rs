@@ -312,10 +312,7 @@ pub struct H2Service<E> {
     /// Fills prepared on a worker thread, waiting to be handed to the peer
     /// that asked. Only the swarm can answer, and only this loop drives the
     /// swarm, so the *work* goes off the loop and the answer comes back.
-    served_txns: (
-        tokio::sync::mpsc::UnboundedSender<(n42_h2_net::BlockTxnsChannel, n42_h2_net::BlockTxnsReply)>,
-        tokio::sync::mpsc::UnboundedReceiver<(n42_h2_net::BlockTxnsChannel, n42_h2_net::BlockTxnsReply)>,
-    ),
+    served_txns: (ServedTxnsTx, ServedTxnsRx),
     /// Bodies a proposal named that this node has not seen, with when it
     /// first missed them: the request to peers goes out only after
     /// `body_grace`, because the leader's direct push is normally 30-40 ms
@@ -626,6 +623,13 @@ impl LoopSpend {
         (gap >= 40_000).then(|| (gap, std::mem::take(&mut self.spent)))
     }
 }
+
+/// A fill prepared on a worker, with the channel it goes back on.
+type ServedTxns = (n42_h2_net::BlockTxnsChannel, n42_h2_net::BlockTxnsReply);
+/// Where a worker puts one.
+type ServedTxnsTx = tokio::sync::mpsc::UnboundedSender<ServedTxns>;
+/// Where the loop takes it.
+type ServedTxnsRx = tokio::sync::mpsc::UnboundedReceiver<ServedTxns>;
 
 /// The transactions a `block_txns` request names, out of a gov5 body.
 fn fill_from_body(

@@ -426,7 +426,7 @@ async fn push_loop(
         let started = std::time::Instant::now();
         // The compact body only to a peer that greeted for it; everyone
         // else gets the bytes they have always been sent.
-        let compact = (features & FEATURE_COMPACT != 0).then(|| body.compact.as_ref()).flatten();
+        let compact = (features & FEATURE_COMPACT != 0).then_some(body.compact.as_ref()).flatten();
         let sent = compact.unwrap_or(&body.full);
         let result = async {
             if compact.is_some() {

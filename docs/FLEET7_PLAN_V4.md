@@ -739,6 +739,36 @@ grafted execution (partition 31, groups 54-59, merge 9 of the 133 -- and ~40 ms 
 look-ups (34 ms a block, on every follower, for transactions the ingest already recovered -- the compact body's one
 part worth keeping on its own). Then jemalloc's background thread (1.9 cores a member at seven nodes).
 
+## 2t. The follower's execution, named and cut: window 2 at 590-614k (loop203)
+
+`plan-v4/follower-exec` (merged 9ebcbeb95): `parallel import phases` sums to `exec_ms` (env, batch, gas, receipts,
+drop, other added); the partition memoises the sender's party across the queue's runs and grows its map with the
+block (unconditional); `N42_FOLLOWER_PARTITION_HASH=1` finds the addresses that can join two senders on the pool and
+probes a small table serially; `N42_FOLLOWER_FREE_ASYNC=1` frees the 32 MB of transaction environments on the pool.
+The bench was built to the leg's shape first (380 senders, 154,000 accounts, the state served from one shared map)
+and read every phase within 2x of the fleet; it also showed the groups phase memory-bound (32x the threads, 2.4x the
+speed), so 28 rayon threads buy nothing there.
+
+Four nodes, pacing 225; E0 = no new flag, E1 = + partition hash, E2 = + both:
+
+| | E0 a / b | E1 a / b | E2 a / b |
+| --- | --- | --- | --- |
+| window 1 | 596k / 595k | 615k / 608k | 624k / **636k** |
+| window 2 | 492k / 569k | 396k / 453k | **590k / 614k** |
+| cycle | 0.273 / 0.270 | 0.263 / 0.266 | 0.259 / 0.256 |
+| import total | 350 / 321 | 303 / 302 | 262 / **209** |
+| exec_ms (phases' total) | 123 (96) / 115 (91) | 102 (82) / 106 (81) | 96 (80) / 83 (75) |
+| partition / groups / drop | 21 / 50 / 2 | 12 / 50 / 2 | 11 / 50 / 0 |
+
+- **Both flags: the import 350 -> 209-262 ms, under the cycle, and window 2 at 590-614k, the best two legs of the
+  campaign.** Window 1 624-636k. Adopted into the chain configuration pending loop204's three more legs.
+- The ~37 ms outside the old phases: env 5, receipts 2, drop 2, other 1 named inside the executor; the rest --
+  `exec_ms` minus the executor's total, 24-27 ms with the drop in place, 8-16 with `FREE_ASYNC` -- is the freeing
+  that ran after the executor's own timers stopped. The bench's 6-8 was the same thing on an allocator with nothing
+  else to do.
+- E1 alone lost both window 2s (396k, 453k); with the free off the pool as well it held twice. Two legs each; the
+  alternation was E0 E1 E2, so the E2 legs were never first after a warm-up. loop204 confirms.
+
 ## 3. What not to do
 
 - Do not judge a cycle-shortening change at a pacing above the natural cycle; do not judge any change without R1.

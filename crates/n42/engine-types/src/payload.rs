@@ -1096,6 +1096,9 @@ where
                     par_part_ms = run.phases.partition_ms;
                     par_exec_ms = run.phases.groups_ms;
                     par_skipped = run.skipped.len();
+                    // Read by the diagnosis below, which must see what this
+                    // step actually built.
+                    debug_assert_eq!(par_txs, tx_count);
                     // Not offered to the serial loop: what the transfer path
                     // refused it would refuse too, one full validation per
                     // transaction -- 5.2 s for a block's worth when the
@@ -1139,13 +1142,33 @@ where
                     // is installed by here, so the builder's own database is
                     // the block's state.
                     //
-                    // One account read per skipped sender, off reads the
-                    // step just made, and only when something was skipped at
-                    // all; bounded because a pathological build skips every
-                    // sender it was offered.
+                    // Only for a build whose own view is sound, and that
+                    // is what `par_txs > 0` says. A build standing on a
+                    // parent the chain has moved past sees *every* lane as
+                    // gapped -- the queue was pruned by blocks that parent
+                    // does not have, so every head is above its state -- and
+                    // it is not the queue that is wrong. loop210 had one or
+                    // two such builds a leg, all of the same shape
+                    // (`par_txs=0 par_groups=384 par_skipped=163000 gas=0`,
+                    // a superseded build at a tenure handover whose payload
+                    // was never proposed), and each parked the node's whole
+                    // sender set: Pb node3 parked 384 lanes holding 631,212
+                    // transactions and the next four blocks carried 8,500 to
+                    // 65,828 instead of 163,000. A build that executed
+                    // nothing has learned nothing about any sender.
+                    //
+                    // And even then only a minority: a hole is a few senders
+                    // among the hundreds a block draws on, so a build
+                    // reporting most of them is describing itself.
                     const DIAGNOSE_MAX: usize = 1024;
+                    const DIAGNOSE_SHARE: usize = 4;
                     let db = builder.executor.evm_mut().db_mut();
-                    for pool_tx in &deferred {
+                    // ... and never for a height the chain has already
+                    // decided: that build's parent is behind the queue's
+                    // pruning by construction, which is the same thing said
+                    // a second way.
+                    let diagnose = par_txs > 0 && !crate::canonical_head::already_decided(header.number);
+                    for pool_tx in diagnose.then_some(&deferred).into_iter().flatten() {
                         if skipped_heads.len() >= DIAGNOSE_MAX {
                             break;
                         }
@@ -1173,6 +1196,25 @@ where
                         if let Some(nonce) = nonce {
                             skipped_heads.insert(sender, (pool_tx.nonce(), nonce));
                         }
+                    }
+                    if skipped_heads.len().saturating_mul(DIAGNOSE_SHARE) > par_groups {
+                        // Most of the senders this build was offered: the
+                        // build is the odd one out, not the queue. The
+                        // leftovers go back the way they did before parks
+                        // existed.
+                        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                        if say_once_a_second(&LAST) {
+                            warn!(
+                                target: "payload_builder",
+                                number = header.number,
+                                heads = skipped_heads.len(),
+                                par_groups,
+                                par_txs,
+                                par_skipped,
+                                "most of the senders a build was offered looked gapped; reporting none of them"
+                            );
+                        }
+                        skipped_heads.clear();
                     }
                 }
                 Err(why) => {
@@ -2010,6 +2052,12 @@ where
     let total = build_started.elapsed();
     let assemble_ms = total.saturating_sub(finished_at).as_millis() as u64;
     let (queued, usable, parked) = queue_depth();
+    // Whether the chain decided this height while the build was being set
+    // up. Such a build reads exactly like a starved one -- its candidates
+    // are the queue's, and the queue was pruned by the blocks its parent
+    // does not have, so every lane looks gapped -- and it is neither
+    // proposed nor a symptom of anything.
+    let superseded = crate::canonical_head::already_decided(block_number);
     // A build that came out under a tenth of a block while the queue held
     // more than a block. This is the only path such a build can take (an
     // empty block never passes the early seal's `par_txs > 0`), and on
@@ -2018,7 +2066,7 @@ where
     // saying the queue was deep and unusable rather than dry.
     {
         let block_txs = block_gas_limit / MIN_TRANSACTION_GAS;
-        if cumulative_gas_used.saturating_mul(10) < block_gas_limit && queued as u64 >= block_txs {
+        if !superseded && cumulative_gas_used.saturating_mul(10) < block_gas_limit && queued as u64 >= block_txs {
             static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             if say_once_a_second(&LAST) {
                 warn!(
@@ -2063,6 +2111,7 @@ where
             queued,
             usable,
             parked,
+            superseded,
             exec_ms = (exec_ns / 1_000_000) as u64,
             tail_ms = (tail_ns / 1_000_000) as u64,
             loop_ms = loop_done.as_millis() as u64,

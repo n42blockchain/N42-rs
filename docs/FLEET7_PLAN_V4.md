@@ -830,6 +830,36 @@ output as the default with the outputs stacked to the nearest canonical ancestor
 node. A fix must move, at t = 90-120 s: the wait 125-190 -> under 30, exec 120-190 -> 90, import total 330-450 -> under
 250, slow-proposal seconds in a tenure 7.5-11.4 -> under 1, window 2 >= 600k in every leg.
 
+## 2w. The import pipelined: the engine wait gone, window 2 at 614-630k in two legs of three (loop207)
+
+`plan-v4/import-pipeline` (merged 269b83377, 2d21ea238): block n+1 executes on n's published output by default, the
+outputs stacked as reth overlay providers (newest first; no bundle merge -- merging two blocks' bundles is 94 ms,
+composing them 6-180 ns a read) down to the nearest ancestor the engine holds, at most four deep; one execution in
+flight per node; the includability check reads the same stack; the engine wait, the gate and the wait for the parent's
+root are named on the `direct import` line. The vote and the root are where they were.
+
+Four nodes, E2 at 225; P = the default, O = `N42_FOLLOWER_EXEC_ON_PARENT_OUTPUT=0`:
+
+| | P a / b / c | O a / b |
+| --- | --- | --- |
+| window 1 | 636k / 630k / 630k | 628k / 624k |
+| window 2 | **630k / 466k / 614k** | 564k / 284k |
+| import total / exec | 190-211 / 88-96 | 280-305 / 97-106 |
+| `parent_engine_wait_ms` p50 / p90 | 0 / 0 | 60-61 / 123 |
+| `two roads` blocks | 692-791 (nearly all) | 0 |
+| root p50 / p90 | 32 / 65-113 | 32-34 / 57-63 |
+| checkpoint ms, first / last quarter | 13-17 / 13-14 | 13-14 / 12-14 |
+
+- **The mechanism of section 2v is removed**: the import no longer waits for the engine (0 against 60-123), the
+  execution runs beside the vote on nearly every block, the import is 190-211 ms with 50-60 ms of slack under the
+  cycle, and the gate never queued (`gate_ms` 0). Two of three P legs held window 2 at 614-630k, the best yet; the
+  warm-up read 630k as well.
+- **The checkpoint's cost did not grow on the uncongested box** (12-17 ms throughout; its bytes still 10.7-12.6 MB by
+  the end): the 5 -> 169 ms of loop206 was that work under the congestion, a symptom. The root's p90 tails (57-113)
+  remain and are the entry the analysis named; `plan-v4/qmdb-checkpoint` is on what accumulates in the bytes.
+- Pb lost its window 2 with the import at 0.17-0.30 s -- the chain slowed while the followers were not behind: a
+  different cause from 2v's, being read. loop208 runs P four more times with `root_wait_ms` on the line.
+
 ## 3. What not to do
 
 - Do not judge a cycle-shortening change at a pacing above the natural cycle; do not judge any change without R1.

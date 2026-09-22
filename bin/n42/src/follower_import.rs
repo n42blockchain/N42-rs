@@ -2076,17 +2076,58 @@ mod tests {
         let compact = n42_h2_consensus::encode_compact_body(&body, &hashes, N42HeaderProfile::Ethereum)
             .expect("the compact body encodes");
 
-        // The queue as this node's ingest leaves it: every transaction of
-        // the block, with the sender the ingest recovered.
-        let queue = n42_tx_queue::TxQueue::<n42_engine_types::N42PooledTransaction>::with_run_length(64)
-            .with_hash_index(count * 2);
-        let fill_at = std::time::Instant::now();
-        queue.push(txs.iter().zip(&senders).map(|(tx, sender)| {
+        // The queue as this node's ingest leaves it -- and *left by the
+        // ingest*, on twelve threads of its own, with three more blocks'
+        // worth pushed around it. That is the whole point of this fixture:
+        // an assembly reads 163,000 objects a dozen other threads allocated
+        // at arbitrary times, and a bench that allocates them on its own
+        // thread a moment earlier reads them contiguous and warm. loop196
+        // measured 112-116 ms on the fleet where this bench had said 22.
+        let queue = std::sync::Arc::new(
+            n42_tx_queue::TxQueue::<n42_engine_types::N42PooledTransaction>::with_run_length(64)
+                .with_hash_index(count * 8),
+        );
+        let pooled = |tx: &TransactionSigned, sender: Address| {
             n42_engine_types::N42PooledTransaction::new(
-                reth_primitives_traits::Recovered::new_unchecked(tx.clone(), *sender),
+                reth_primitives_traits::Recovered::new_unchecked(tx.clone(), sender),
                 tx.encoded_2718().len(),
             )
-        }));
+        };
+        let fill_at = std::time::Instant::now();
+        {
+            // Twelve ingest threads, the fleet's `N42_TX_INGEST_RECOVER_PARALLEL`,
+            // pushing this block interleaved with noise of their own so the
+            // block's transactions end up scattered through the heap rather
+            // than laid out in one run.
+            let noise = bench_fixture(6_000, 27, 2_000_000, 64).0;
+            let noise_txs = noise.body().transactions.clone();
+            let noise_senders: Vec<Address> = noise.senders().to_vec();
+            std::thread::scope(|scope| {
+                for lane in 0..12usize {
+                    let queue = std::sync::Arc::clone(&queue);
+                    let txs = &txs;
+                    let senders = &senders;
+                    let noise_txs = &noise_txs;
+                    let noise_senders = &noise_senders;
+                    scope.spawn(move || {
+                        let mut at = lane * 500;
+                        while at < txs.len() {
+                            let end = (at + 500).min(txs.len());
+                            queue.push(
+                                (at..end).map(|i| pooled(&txs[i], senders[i])),
+                            );
+                            // Noise between the block's own batches: other
+                            // senders arriving, as the flood delivers them.
+                            let nend = end.min(noise_txs.len());
+                            if at < nend {
+                                queue.push((at..nend).map(|i| pooled(&noise_txs[i], noise_senders[i])));
+                            }
+                            at += 12 * 500;
+                        }
+                    });
+                }
+            });
+        }
         queue.drain_now();
         let fill_ms = fill_at.elapsed().as_millis() as u64;
 
@@ -2100,6 +2141,61 @@ mod tests {
             body.len() / 1_000_000,
             compact.len() / 1_000_000,
         );
+
+        // The rayon pool busy, as it is on a node: the parent's import runs
+        // on the same sixteen threads the assembly's look-ups want, and an
+        // idle pool is the other half of why this bench said 22 ms.
+        let busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        // And the ingest still running, as it is on a node: twelve threads
+        // pushing while the assembly reads, so the shards are written to
+        // and the heap keeps moving under it. The fleet's rate is ~400k
+        // transactions a second across those twelve.
+        let mut ingest = Vec::new();
+        for lane in 0..12usize {
+            let queue = std::sync::Arc::clone(&queue);
+            let busy = std::sync::Arc::clone(&busy);
+            let more = bench_fixture(500, 27, 2_000_000, 64).0;
+            ingest.push(std::thread::spawn(move || {
+                let txs = more.body().transactions.clone();
+                let senders: Vec<Address> = more.senders().to_vec();
+                let mut at = 0usize;
+                let mut pushed = 0usize;
+                while busy.load(std::sync::atomic::Ordering::Relaxed) {
+                    let end = (at + 500).min(txs.len());
+                    if at >= end {
+                        at = 0;
+                        // Nonces already queued are refused by the lanes and
+                        // indexed all the same, which is the write traffic
+                        // this is here for.
+                        continue;
+                    }
+                    queue.push((at..end).map(|i| {
+                        n42_engine_types::N42PooledTransaction::new(
+                            reth_primitives_traits::Recovered::new_unchecked(txs[i].clone(), senders[i]),
+                            120,
+                        )
+                    }));
+                    pushed += end - at;
+                    at = end;
+                    // ~400k a second across twelve lanes is ~33k each, so a
+                    // 500-transaction batch every 15 ms.
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                }
+                let _ = lane;
+                pushed
+            }));
+        }
+        let load: Vec<u8> = (0..64 << 20).map(|i| (i % 251) as u8).collect();
+        {
+            let busy = std::sync::Arc::clone(&busy);
+            let load = load.clone();
+            std::thread::spawn(move || {
+                while busy.load(std::sync::atomic::Ordering::Relaxed) {
+                    let sum: u64 = load.par_chunks(4096).map(|c| c.iter().map(|b| u64::from(*b)).sum::<u64>()).sum();
+                    std::hint::black_box(sum);
+                }
+            });
+        }
 
         for round in 0..3 {
             // Today's road: the body decoded once into the block, then a
@@ -2153,6 +2249,9 @@ mod tests {
                 assembled.misses,
             );
         }
+        busy.store(false, std::sync::atomic::Ordering::Relaxed);
+        let pushed: usize = ingest.into_iter().filter_map(|h| h.join().ok()).sum();
+        println!("the ingest pushed {pushed} transactions while the rounds ran");
     }
 
     /// The copies the vote road makes of a bench-tier block, each on its own.

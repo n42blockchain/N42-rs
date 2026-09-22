@@ -783,6 +783,43 @@ Four nodes, pacing 225; E0 = no new flag, E1 = + partition hash, E2 = + both:
   and lost a window 2. Both stay as they are.
 - Where a member's twenty-eight cores go at E2: 18.4-19.2 in use (tokio 9.7-9.9, rayon ~5, storage ~2.5).
 
+## 2v. The collapse has a mechanism: the import waits for the engine, then the imports collide (loop205-206)
+
+`plan-v4/senders-from-queue` (merged 81d8202fe, `N42_SENDERS_FROM_QUEUE=1`): the follower takes a foreign block's
+senders from the tx-queue's by-hash index the ingest already fills (3.3 ms for 162,000 on the bench under load; every
+one of 163,000 found on the fleet). It does what it says -- `senders_ms` 34 -> 5, R1 150 -> 116-126, window 1 640-652k
+at 0.250 s -- and every S leg lost window 2 (369-451k at 225; 505k / 423k at 250; 522k at 275 with a 1.2 s stall in
+window 3), while E2 in the same runs held 2 of 4 (620k, 589k against 451k, 467k).
+
+A read-only analysis of eleven legs (seven collapsed, four held; scripts under the session's scratchpad) found:
+- **The bench's "window 2" is t = 90-120 s of the leg and "window 3" t = 190-220**, not the second and third 30 s:
+  window 2 reads the chain after 90 s, and the chain oscillates between two regimes with a 65-80 s period.
+- **The import has one untimed region, and it is the mechanism.** `wait_for_parent` (follower_import.rs:1259): block
+  n+1's execution waits for block n to be canonical in the engine with its fields recorded -- n's root, hashed state,
+  mined bookkeeping and engine hand-off (~115-190 ms) -- because `state_by_block_hash(parent)` needs the parent
+  canonical. Clean, the wait is 10-14 ms; once the import exceeds the cycle the waits stack, several imports run at
+  once, their rayon work collides and **exec inflates 1.5-2.5x** (0 overlapping imports: exec 79-83, groups 52-55,
+  total 140-156; two or more: exec 116-149, groups 74-108, total 340-403; with S, exec 155-203). Root (25-35) and the
+  engine insert (49-55) are flat through it. The loop breaks only when a tenure handover stalls the chain long enough
+  to drain it, and re-enters within ~30 s. After a drain exec is back at 82 on a state that only grew: a congestion
+  term, not a state term.
+- The vote road is already off the engine (`check_on_parent_output`, `parent_wait_ms=0`); only the execution waits.
+  `N42_FOLLOWER_EXEC_ON_PARENT_OUTPUT` -- plan step 2, dropped at seven nodes in section 2h because there was no wait
+  then -- is the path that does not: n+1 executes on n's published bundle over the state at the grandparent. Today it
+  declines when the grandparent is not canonical either, which under a backlog is exactly when it is needed.
+- **Tenure handovers cost 0.6-1.8 s each in every leg** (the new leader's parent still importing, `forkchoiceUpdated`
+  Syncing, retried 64-170 times a leg) -- a constant tax; a leader entering its tenure with a backlog costs 7.5-11.4 s
+  in its 64 blocks, and that is what separates the held legs from the collapsed ones (node3's tenure at views
+  448-511). Memory, the huge-page pool and the starting baseline are not the separator.
+- **S trades 28 ms of clean road for 40-80 ms of congested exec**; off until the import is pipelined. And loop206
+  showed the entry into the slow regime is a step (import 0.12 -> 0.31 between two 15 s buckets), at pacing 275 as at
+  225, with 0.18 s of slack and 67-80 GB free: what triggers it is being chased (the analysis' follow-up).
+
+In progress: `plan-v4/import-pipeline` -- the wait timed (`parent_engine_wait_ms`), execution on the parent's published
+output as the default with the outputs stacked to the nearest canonical ancestor, at most one execution in flight per
+node. A fix must move, at t = 90-120 s: the wait 125-190 -> under 30, exec 120-190 -> 90, import total 330-450 -> under
+250, slow-proposal seconds in a tenure 7.5-11.4 -> under 1, window 2 >= 600k in every leg.
+
 ## 3. What not to do
 
 - Do not judge a cycle-shortening change at a pacing above the natural cycle; do not judge any change without R1.

@@ -1075,6 +1075,14 @@ a head sits: `the heads a build could not use` (sender, lane head, account nonce
 into that the pool cannot fill` (with `N42_TX_INGEST_DIRECT` the pool never has them, so the gap feed has dropped
 every such hole silently since it was written) say it now. loop214 reads them.
 
+## 2ai. The heads and the holes, on the fleet (loop214)
+
+Four P legs with the two lines: window 2 625k / 636k / 538k / 598k, window 1 630-641k; Pd stalled in window 3
+(287k: early seal 82%, 18 empty builds on canonical parents, `par_groups` p5 29, 281k `NonceTooHigh` reported). The
+lines appear only on the nodes that stall (Pd node2: 22 `heads`, 32 `holes`; node0 11 / 9; healthy nodes 0 / 0), so
+the instrument is on the defect. The stale-parent refusal, on, would have fired twice in four legs: not that. Being
+read: the sign of head - nonce per sender, whether the missing nonce ever reached the node or any other node's block.
+
 ## 3. What not to do
 
 - Do not judge a cycle-shortening change at a pacing above the natural cycle; do not judge any change without R1.

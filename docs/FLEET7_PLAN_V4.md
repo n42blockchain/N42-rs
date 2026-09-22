@@ -931,6 +931,29 @@ a near-empty build over a deep queue. Open: where an individual hole below a lan
 `N42_TX_INGEST_DIRECT=1` the transaction is in neither the queue nor the pool, so the gap-repair feed cannot fill it;
 the fix makes the build survive a hole rather than prevent one, and `usable=` now shows whether holes accumulate.
 
+## 2aa. Defect 13 mostly gone: 94-97% of builds early-seal, window 2 570-647k (loop209)
+
+Five P legs on the merged tree (import pipelined, checkpoint replay CRC, early seal fixed):
+
+| | Pa | Pb | Pc | Pd | Pe |
+| --- | --- | --- | --- | --- | --- |
+| window 1 | (421k) | **647k** | 630k | 636k | 636k |
+| window 2 | **647k** | **641k** | 570k | 581k | 619k |
+| window 3 | 565k | 532k | 432k | 478k | (428k) |
+| builds that early-sealed | 94% | 97% | 95% | 96% | 95% |
+| `gas=0` builds with a deep queue / near-empty WARNs | 13 / 8 | 3 / 0 | 0 / 2 | 1 / 2 | 0 / 4 |
+| import total / root p90 | 189 / 67 | 194 / 69 | 206 / 85 | 197 / 73 | 183 / 64 |
+| checkpoint replay, last quarter | 2 ms | 2 | 2 | 2 | 2 |
+
+- **The early seal holds**: 94-97% of a leg's builds against 60-75% before, and no tenure at 0-1 of 64. The
+  cycle/import trace is flat at 0.24-0.28 s through most of every leg. Window 2 reads 570-647k -- the two best legs of
+  the campaign (647k / 641k and 647k / 646k on windows 1-2) -- against the bar of 600k in every leg: three of five.
+- **The empty-build residue remains**: Pa's window 1 (occupancy 64%, 13 builds at `gas=0` over a deep queue, `why=the
+  parallel step built nothing` x6), Pe's window 3 (71%). The queue's usable depth (p5 137-178k) says the lanes were
+  there; what the parallel step found nothing in is the next question -- the hole below a lane's lowest nonce that
+  section 2z left open.
+- The checkpoint's replay is 2 ms at the end of a leg (was 36 at 13 MB); root p90 64-85 as before.
+
 ## 3. What not to do
 
 - Do not judge a cycle-shortening change at a pacing above the natural cycle; do not judge any change without R1.

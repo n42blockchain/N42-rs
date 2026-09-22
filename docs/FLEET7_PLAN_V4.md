@@ -1177,5 +1177,24 @@ to find out (8), before any code.
   converts random reads into a streaming pass. Falsified if `groups_ms` does not fall under 35 with prefetch on.
 - **F. Handovers (5).** `F7_LEADER_TENURE=256` -- one leg, no code; then the leader twin if the 3% matters at the end.
 
+### 5.1 Attempts A and F (loop215): the block size is not a lever; the tenure is
+
+| | P (reference) | G260 a / b (260,000-tx blocks) | T256 a / b (tenure 256) |
+| --- | --- | --- | --- |
+| window 1 | 635k | 532k / 591k | **663k / 663k** |
+| window 2 | 625k | 481k / 430k | 625k / 647k |
+| cycle | 0.257 | **0.476 / 0.435** | 0.246 |
+| R1 / import / build | 150 / 185 / 274 | 265-276 / 312-366 / 358-410 | 145-148 / 189 / 274-275 |
+| handovers (`still importing`) | 35 | 131 / 163 | 13 / 54 |
+| early seal | 96% | 94-96% | 98-99% |
+
+- **A, falsified.** A block 1.6x larger costs a cycle 1.7-1.9x longer: R1 x1.8, the import x1.7-2.0, the build x1.3-1.5.
+  The per-transaction passes are the whole cycle and then some (the queue's deeper pool and the 26 -> 42 MB body cost
+  more than proportionally). The block size stays at 163,000; 1M is the cycle, and 1-4 of the table are the plan.
+- **F, adopted.** `F7_LEADER_TENURE=256`: 663k on window 1 in both legs (the best yet), window 2 625k / 647k, the
+  handover tax a quarter of before, early seal 98-99%. The configuration carries it from here.
+- lane-holes-4 on the fleet: `the heads a build could not use` with account nonce 0 -- **0 in every leg** (the fix's
+  signature); `stale_unconfirmed` 310-6,061 says how often a build stood on a state consensus did not keep, a reading.
+
 Each attempt is one agent brief and one runner; the bar for adopting any is the same as plan v4's: window 2 in every leg,
 verify 4/4, and the number it targets moving on the fleet, not on a bench.

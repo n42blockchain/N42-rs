@@ -909,6 +909,28 @@ unverified: `FileEntries::seal_tail` maps 256 MB with `MAP_POPULATE` under the f
 3 at 532, 557, 577, 608, 622) -- a property of the block, not of a node's background work. With the follower no longer
 the bound (2x), neither is chased before defect 13.
 
+## 2z. Defect 13: one refused candidate cost a tenure its early seal
+
+`plan-v4/leader-early-seal` (merged 31fa789e4). The mechanism, from nine legs' build lines: the parallel step drops a
+candidate its transfer path refuses and every later candidate of that sender's run (`parallel_transfer.rs:1220-1231`);
+the early-seal gate required `block_full`, computed before the serial loop as "under 21,000 gas left or the pull
+drained", so one skipped candidate left the block 21,000 gas short and the gate fell through -- silently. The skipped
+head went back to the queue as `ExceedsGasLimit`, which tells the queue nothing, and a lane's lowest nonce is what
+every build is offered first: the same unusable head, refused again, its run skipped again, until a handover raised
+the lane's watermark. Pb node3 (views 448-511): `refused[6]` (the fast path's `sender.nonce != tx.nonce`) +1 per
+build, `par_skipped` 256-512 every build, 1 seal of 62, the same node/blocks in Pa 62 of 62. Ob node1: `par_skipped`
+2,880 -> 163,000 over twenty builds while `par_groups` fell 384 -> 59, then `gas=0` blocks with 334-360k queued.
+Across nine legs a tenure seals 61-64 of 64 or 0-1 of 64; every collapsed tenure has `par_skipped > 0` on every build;
+not node-specific; later tenures (t5-t12).
+
+The fix: the gate allows a shortfall of `block_gas_limit / 64` (`N42_SEAL_SHORTFALL_DIV`; the remainder goes to the
+next block); a skipped head is diagnosed with one account read and returned as `NonceNotConsistent`, so a stale head
+is dropped with everything below it and a head above the account's nonce parks the lane (`Parked`, up to 8 builds, or
+until the hole fills or the chain passes it); `usable=` beside `queued=`; `a build did not seal early why=`; a WARN for
+a near-empty build over a deep queue. Open: where an individual hole below a lane's lowest nonce comes from -- with
+`N42_TX_INGEST_DIRECT=1` the transaction is in neither the queue nor the pool, so the gap-repair feed cannot fill it;
+the fix makes the build survive a hole rather than prevent one, and `usable=` now shows whether holes accumulate.
+
 ## 3. What not to do
 
 - Do not judge a cycle-shortening change at a pacing above the natural cycle; do not judge any change without R1.

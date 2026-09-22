@@ -672,6 +672,40 @@ unverified) frees cores the import can use; and the import's own execution -- th
 against ~50 ms of pure execution in the builder -- is plan step 3's other half. Pacing stays at 275 until the import
 is under the cycle at 225.
 
+## 2r. The compact body at four nodes: a shorter road and a slower import (loop201)
+
+`plan-v4/compact-body-3` (merged a4306d8ba..58a0e3487): the assembly in one parallel pass (look-up and copy on the
+worker that found the transaction), the fill asked of the member that built the block (the body channel names its
+sender), a fill served from the imported block when no whole body is held, serving off the consensus loop, and a
+`leader loop between commit and preamble` line naming where D goes. Under a load that reproduces the fleet's (twelve
+ingest threads pushing, a busy pool) the assembly is 51-63 ms, not the 40 the brief asked; what remains is the random
+read of 163,000 queue objects other threads allocated, and closing it is an arena, not a tweak -- the implementer
+stopped there.
+
+Four nodes, chain configuration; C = body road, K = + `N42_COMPACT_BODY=1`; windows 1 / 2 / 3:
+
+| | C275 a / b | K275 a / b | C225 a / b | K225 a / b |
+| --- | --- | --- | --- | --- |
+| window 1 | 537k / 538k | 543k / 532k | 578k / 579k | **597k / 619k** |
+| window 2 | 543k / 538k | **467k / 494k** | 577k / 563k | **445k / 440k** |
+| window 3 | 456k / 516k | 396k / 413k | 523k / 498k | 407k / 396k |
+| R1 | 145 / 145 | 122 / 126 | 207 / 203 | 143 / 136 |
+| follower import total / exec | 190 / 98 | 227-240 / 132-134 | 361-369 / 132-135 | 301-306 / 147 |
+| assemble | -- | 65 / 67 | -- | 75 / 71 |
+| fills: proposer asked / failed | -- | 186 / 0 | -- | 130 / 0 |
+
+- **The road is shorter** (R1 -20..65 ms; the fill works: every one asked of the proposer, none failed, 1-2 whole-body
+  fallbacks a leg; assembly 65-75 ms against 112-116) **and the block executes slower**: the import's execution 96-98
+  -> 132-134 ms at 275 (the parallel phases themselves +6 ms; the rest outside them) -- and windows 2-3 read 15-20% under
+  the body road in all four legs. Memory peaks are the same (57-60 GB). Suspected, not shown: the assembled block's
+  163,000 transactions are copies made by sixteen workers, scattered where a decoded body's are contiguous.
+- **Set aside at four nodes**: opt-in as it is, with the three fixes in; not the constraint here and a loss on windows
+  2-3. Its instrument stays: `unnamed_ms` is most of every `leader loop` line (121-216 ms), so serving peers was not
+  where D went -- at pacing 275 D is the pacing wait itself.
+- **Pacing 225 without it: 578k / 577k and 579k / 563k** on windows 1 / 2 (loop200's two legs: 603k / 429k, 578k / 549k)
+  -- three of four hold at a follower import of 361-369 ms against a 278 ms cycle. loop202 confirms it over more legs
+  and tries 200.
+
 ## 3. What not to do
 
 - Do not judge a cycle-shortening change at a pacing above the natural cycle; do not judge any change without R1.

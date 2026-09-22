@@ -150,6 +150,13 @@ struct Args {
     /// its gate rather than refusing it, so a slow answer is expected and a
     /// missing one means the node stopped draining its queue.
     ingest_timeout: u64,
+    /// `--claim-sender` (or `N42_FLOOD_CLAIM_SENDER=1`): each ingest frame
+    /// carries the address that signed each transaction, so a node running
+    /// `N42_INGEST_VERIFY=leader` can file it in a lane without recovering
+    /// the sender. The node still verifies every signature — in its builder
+    /// before it includes one, and on its vote road before it votes — so
+    /// this changes where the work is done, never whether it is done.
+    claim_sender: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -473,7 +480,12 @@ fn flood_over_ingest(
             );
             SIGN_NS.fetch_add(at.elapsed().as_nanos() as u64, Ordering::Relaxed);
             let at = Instant::now();
-            if conn.send(index, &batch).is_err() {
+            // The sender this worker signed with, so a node in
+            // `N42_INGEST_VERIFY=leader` need not recover it to file the
+            // transaction in a lane. It is a claim, not a credential: every
+            // node verifies the signature where it uses the sender.
+            let claim = args.claim_sender.then(|| key.address());
+            if conn.send(index, &batch, claim).is_err() {
                 return;
             }
             SEND_NS.fetch_add(at.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -574,6 +586,27 @@ struct Ingest {
     read_timeout: Duration,
 }
 
+/// One ingest frame's bytes: `u32` count, then each transaction as `u32`
+/// length and its raw EIP-2718 bytes.
+///
+/// With `claim`, the count carries `0x8000_0000` and the twenty bytes of the
+/// claimed sender sit between each length and its transaction. See the
+/// server's wire section (`n42-tx-ingest`).
+fn frame_bytes(batch: &[Vec<u8>], claim: Option<Address>) -> Vec<u8> {
+    let per_claim = if claim.is_some() { 20 } else { 0 };
+    let mut frame = Vec::with_capacity(4 + batch.iter().map(|t| 4 + per_claim + t.len()).sum::<usize>());
+    let count = batch.len() as u32 | if claim.is_some() { 0x8000_0000 } else { 0 };
+    frame.extend_from_slice(&count.to_le_bytes());
+    for raw in batch {
+        frame.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+        if let Some(claim) = claim {
+            frame.extend_from_slice(claim.as_slice());
+        }
+        frame.extend_from_slice(raw);
+    }
+    frame
+}
+
 /// Per stream (node), the answers' latency summed since the start and their
 /// count: send to answer read, in nanoseconds. Eight slots for seven nodes.
 static REPLY_NS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
@@ -616,14 +649,15 @@ impl Ingest {
 
     /// Writes one frame: `u32` count, then each transaction as `u32` length and
     /// its raw EIP-2718 bytes.
-    fn send(&mut self, sender: usize, batch: &[Vec<u8>]) -> std::io::Result<()> {
+    ///
+    /// With `claim`, the count carries `0x8000_0000` and each transaction is
+    /// preceded by the twenty bytes of the sender that signed it — what a
+    /// node running `N42_INGEST_VERIFY=leader` files the transaction under
+    /// instead of recovering it. An older node reads the header as a count
+    /// past its frame bound and closes the connection saying so.
+    fn send(&mut self, sender: usize, batch: &[Vec<u8>], claim: Option<Address>) -> std::io::Result<()> {
         use std::io::Write;
-        let mut frame = Vec::with_capacity(4 + batch.iter().map(|t| 4 + t.len()).sum::<usize>());
-        frame.extend_from_slice(&(batch.len() as u32).to_le_bytes());
-        for raw in batch {
-            frame.extend_from_slice(&(raw.len() as u32).to_le_bytes());
-            frame.extend_from_slice(raw);
-        }
+        let frame = frame_bytes(batch, claim);
         // One write for the whole frame: a frame split across writes is a
         // frame the server reads in two syscalls.
         for stream in &mut self.streams {
@@ -944,6 +978,7 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
         ingest_all: false,
         ingest_timeout: 10,
         recipients: 1,
+        claim_sender: std::env::var("N42_FLOOD_CLAIM_SENDER").is_ok_and(|v| v != "0"),
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -964,6 +999,7 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
             "--ingest" => args.ingest = next()?.split(',').map(str::to_owned).collect(),
             "--ingest-all" => args.ingest_all = true,
             "--ingest-timeout" => args.ingest_timeout = next()?.parse()?,
+            "--claim-sender" => args.claim_sender = true,
             "--recipients" => args.recipients = next()?.parse()?,
             "--shard-senders" => args.shard_senders = true,
             "--legacy-recipients" => args.legacy_recipients = true,
@@ -1004,6 +1040,8 @@ tx_flood — fund a derived sender set and flood the fleet with transfers
   --alg <secp256k1|ed25519>  signature scheme of the senders (default secp256k1; ed25519 sends 0x50 transactions)
   --ingest-timeout <s>    seconds to wait for a node's answer to a frame before giving
                           up on the connection and opening it again (default 10, 0 never)
+  --claim-sender          ingest frames carry the sender that signed each transaction, for a
+                          node running N42_INGEST_VERIFY=leader (N42_FLOOD_CLAIM_SENDER=1)
   --skip-funding      the senders are already funded
 ";
 
@@ -1021,5 +1059,33 @@ mod tests {
             assert_eq!(fast, slow, "sender {i}: libsecp256k1 and k256 disagree");
             assert_eq!(fast.recover_address_from_prehash(&hash).expect("recover"), key.address());
         }
+    }
+
+    /// The frame the ingest reads back: a plain one byte for byte as before,
+    /// and a claiming one with the bit set and the sender ahead of each
+    /// transaction's bytes.
+    #[test]
+    fn a_frame_carries_the_claim_where_the_server_reads_it() {
+        let batch = vec![vec![1u8, 2, 3], vec![4u8, 5]];
+        assert_eq!(
+            frame_bytes(&batch, None),
+            [&2u32.to_le_bytes()[..], &3u32.to_le_bytes(), &[1, 2, 3], &2u32.to_le_bytes(), &[4, 5]].concat()
+        );
+        let claim = Address::repeat_byte(0xab);
+        let claiming = frame_bytes(&batch, Some(claim));
+        assert_eq!(
+            claiming,
+            [
+                &(2u32 | 0x8000_0000).to_le_bytes()[..],
+                &3u32.to_le_bytes(),
+                claim.as_slice(),
+                &[1, 2, 3],
+                &2u32.to_le_bytes(),
+                claim.as_slice(),
+                &[4, 5],
+            ]
+            .concat()
+        );
+        assert_eq!(claiming.len(), frame_bytes(&batch, None).len() + 40);
     }
 }

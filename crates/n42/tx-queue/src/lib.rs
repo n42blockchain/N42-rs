@@ -984,6 +984,53 @@ impl<T: PoolTransaction> TxQueue<T> {
         }
     }
 
+    /// Puts transactions a build took but will not offer to the builder back
+    /// where they were, and forgets that the build took them.
+    ///
+    /// What [`QueueBest`] does for its own buffer when a build ends early,
+    /// for a caller that buffers between the two -- the builder's check of
+    /// claimed senders, which pulls a batch ahead of what the build asks
+    /// for. Without it those transactions would sit in the build's taken
+    /// list for ever: not in a lane, not in a block.
+    pub fn untake(&self, transactions: Vec<Arc<ValidPoolTransaction<T>>>) {
+        if transactions.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.lock();
+        for transaction in &transactions {
+            if let Some((_, taken)) = inner.last_build.as_mut()
+                && let Some(at) = taken.iter().rposition(|t| Arc::ptr_eq(t, transaction))
+            {
+                taken.remove(at);
+            }
+        }
+        inner.give_back(transactions);
+    }
+
+    /// Forgets a transaction a build took and will not use: it leaves the
+    /// build's taken list without going back to the lanes, and its hash
+    /// leaves the by-hash index.
+    ///
+    /// The one caller is the builder's check of a claimed sender
+    /// (`N42_INGEST_VERIFY=leader`): a transaction whose signature names a
+    /// different sender than the frame claimed can never be mined under the
+    /// lane it sits in, so giving it back would offer it to every later
+    /// build, and leaving it in the taken list would let the next give-back
+    /// put it in the lanes again (the shape section 2ad of the plan took
+    /// apart). Its sender's other nonces are untouched: the claim was wrong
+    /// about this transaction and says nothing about them.
+    pub fn forget_taken(&self, transaction: &Arc<ValidPoolTransaction<T>>) {
+        {
+            let mut inner = self.inner.lock();
+            if let Some((_, taken)) = inner.last_build.as_mut()
+                && let Some(at) = taken.iter().rposition(|t| Arc::ptr_eq(t, transaction))
+            {
+                taken.remove(at);
+            }
+        }
+        self.forget_hashes([*transaction.hash()]);
+    }
+
     /// Queues the transactions of reverted blocks. The chain no longer holds
     /// them, so each sender's mined watermark drops below what comes back:
     /// otherwise the give-back filter would treat them as mined the first
@@ -2390,6 +2437,39 @@ mod tests {
         assert!(offered.contains(&(3, 0)), "an unconfirmed verdict took it out of the queue: {offered:?}");
         // Taking it clears it.
         assert_eq!(queue.take_drops(), DropReport::default());
+    }
+
+    /// The two doors the builder's claim check uses: a transaction it pulled
+    /// ahead and never offered goes back to its lane, and one whose claim
+    /// the signature contradicted leaves for good -- without taking the rest
+    /// of its sender's lane with it.
+    #[test]
+    fn untake_puts_it_back_and_forget_taken_does_not() {
+        // Roomy, because the bound is per shard: a capacity of one shard's
+        // worth would let one of these three evict another.
+        let queue = TxQueue::<EthPooledTransaction>::with_run_length(64).with_hash_index(4_096);
+        queue.push(vec![
+            tx_hashed(Address::repeat_byte(1), 0),
+            tx_hashed(Address::repeat_byte(1), 1),
+            tx_hashed(Address::repeat_byte(1), 2),
+        ]);
+        queue.drain_now();
+
+        let mut best = queue.best_for_build(B256::repeat_byte(1));
+        let first = best.next().expect("the lane's head");
+        let second = best.next().expect("the lane's second");
+        drop(best);
+        assert_eq!(queue.len(), 1, "the build took two of the three");
+
+        queue.untake(vec![Arc::clone(&second)]);
+        assert_eq!(queue.sender_of(second.hash()), Some(Address::repeat_byte(1)));
+        queue.forget_taken(&first);
+        assert_eq!(queue.sender_of(first.hash()), None, "a forgotten transaction leaves the index");
+
+        let mut after = queue.best_for_build(B256::repeat_byte(2));
+        let offered: Vec<u64> = std::iter::from_fn(|| after.next()).map(|t| t.nonce()).collect();
+        drop(after);
+        assert_eq!(offered, vec![1, 2], "the untaken one is offered again, the forgotten one is not");
     }
 
     #[test]

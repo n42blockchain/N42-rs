@@ -34,6 +34,7 @@ pub mod direct_build;
 //mod metrics;
 mod consensus;
 pub mod engine_validator;
+pub mod claimed_build;
 pub mod fast_transfer;
 pub mod parallel_transfer;
 pub mod hotstuff_consensus;

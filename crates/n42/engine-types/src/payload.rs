@@ -495,6 +495,38 @@ pub fn seal_first() -> bool {
     *ON.get_or_init(|| std::env::var("N42_SEAL_FIRST").map_or(true, |v| v != "0"))
 }
 
+/// How short of the gas limit the parallel step may leave a block and still
+/// seal it early: `block_gas_limit / N42_SEAL_SHORTFALL_DIV`, 0 to require
+/// the block to be full to the last transaction.
+///
+/// The parallel step leaves out a candidate its transfer path refused and
+/// every later candidate of that sender with it, so a block it filled is
+/// 21,000 gas short per skipped candidate and the old exact test
+/// (`gas left < MIN_TRANSACTION_GAS`) called it not full. One stuck sender
+/// then cost the early seal for a whole tenure: loop207 Pb node3 built 63
+/// blocks with `par_skipped=256-512`, all through the ordinary finish, and
+/// proposed at p50 185 / p90 315 ms against 80-87 for the same node and
+/// tenure in the legs beside it. The remainder is not lost -- it goes back
+/// to the queue and the next block takes it -- so the trade is under 1.6%
+/// of one block's occupancy against ~100 ms of proposal on a 250 ms cycle.
+fn seal_shortfall(block_gas_limit: u64) -> u64 {
+    static DIV: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let div = *DIV.get_or_init(|| {
+        std::env::var("N42_SEAL_SHORTFALL_DIV").ok().and_then(|v| v.parse().ok()).unwrap_or(64)
+    });
+    block_gas_limit.checked_div(div).unwrap_or(0)
+}
+
+/// At most one line a second per call site, so a defect that repeats every
+/// build does not become a line every 250 ms.
+fn say_once_a_second(last: &std::sync::atomic::AtomicU64) -> bool {
+    use std::sync::atomic::Ordering;
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let now = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
+    let seen = last.load(Ordering::Relaxed);
+    now.saturating_sub(seen) >= 1_000 && last.compare_exchange(seen, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+}
+
 /// Constructs an Ethereum transaction payload using the best transactions from the pool.
 ///
 /// Given build arguments including an Ethereum client, transaction pool,
@@ -711,6 +743,17 @@ where
     // Whether the transactions come from the queue: the selector took it if
     // one is installed. Only the queue needs to hear about a stale nonce.
     let from_queue = n42_tx_queue::global::<Pool::Transaction>().is_some();
+    // What the queue holds and what a build could take of it. `queued`
+    // alone cannot tell a queue that ran dry from one that is deep and
+    // unusable -- lanes parked behind a hole, or emptied -- and loop207's
+    // defect 13 was the second: `queued=334-360k` on every build while the
+    // leader proposed empty blocks. One walk of the lanes, once a build.
+    let queue_depth = || -> (usize, usize) {
+        match n42_tx_queue::global::<Pool::Transaction>() {
+            Some(queue) => (queue.len(), queue.usable()),
+            None => (0, 0),
+        }
+    };
     let puller = builder_puller();
     let mut pulled: Option<Puller<Pool::Transaction>> = None;
     let mut best_txs = if puller == 0 {
@@ -719,6 +762,24 @@ where
         pulled = Some(Puller::start(best_txs, puller));
         None
     };
+    // What a candidate the parallel step skipped goes back with: the
+    // truthful nonce error when the diagnosis above found one, so the queue
+    // can drop a stale head or park a gapped lane, and the old
+    // `ExceedsGasLimit` for everything else (a sender's later candidates,
+    // which say nothing on their own).
+    macro_rules! deferred_refusal {
+        ($heads:expr, $tx:expr) => {
+            match $heads.get(&$tx.sender()) {
+                Some((head, state)) if *head == $tx.nonce() && *head != *state => {
+                    InvalidPoolTransactionError::Consensus(InvalidTransactionError::NonceNotConsistent {
+                        tx: *head,
+                        state: *state,
+                    })
+                }
+                _ => InvalidPoolTransactionError::ExceedsGasLimit($tx.gas_limit(), block_gas_limit),
+            }
+        };
+    }
     macro_rules! refuse {
         ($tx:expr, $err:expr) => {
             match (best_txs.as_mut(), pulled.as_ref()) {
@@ -768,6 +829,11 @@ where
     let mut par_fold_ms = 0u64;
     let mut par_committed = 0usize;
     let mut deferred: Vec<Arc<reth_transaction_pool::ValidPoolTransaction<Pool::Transaction>>> = Vec::new();
+    // The head the parallel step refused per skipped sender, with the nonce
+    // the parent's state has for it: what the give-back below tells the
+    // queue instead of a refusal that says nothing. See the diagnosis after
+    // the parallel step.
+    let mut skipped_heads: alloy_primitives::map::AddressHashMap<(u64, u64)> = Default::default();
     let mut par_reverts: Vec<(alloy_primitives::Address, revm::database::AccountRevert)> = Vec::new();
     let mut par_drained = false;
     let mut par_prep_ms = 0u64;
@@ -1038,6 +1104,40 @@ where
                     for i in run.skipped {
                         deferred.push(Arc::clone(&cands[i]));
                     }
+                    // Why each skipped sender's head was refused, read once
+                    // from the parent's state so the give-back below can say
+                    // it. Handing every skipped candidate back with
+                    // `ExceedsGasLimit` tells the queue nothing, and its
+                    // lowest nonce is what the next build is offered first:
+                    // on loop207 Pb node3 the same 256-512 candidates were
+                    // skipped on all 63 builds of the tenure (`refused[6]`
+                    // +1 a build, `par_skipped` flat), and on Ob node1 the
+                    // skipped set grew 2,880 -> 163,000 over twenty blocks
+                    // until every block was empty with 334-360k queued.
+                    // A stale head lets the queue drop it and everything
+                    // below, so the lane is usable at the *next* build; a
+                    // head above the account's nonce parks the lane
+                    // (`n42_tx_queue::Parked`) so the budget goes to lanes
+                    // that can execute.
+                    //
+                    // One account read per skipped sender, off the warm
+                    // reads the step just made, and only when something was
+                    // skipped at all; bounded because a pathological build
+                    // skips every sender it was offered.
+                    const DIAGNOSE_MAX: usize = 1024;
+                    for pool_tx in &deferred {
+                        if skipped_heads.len() >= DIAGNOSE_MAX {
+                            break;
+                        }
+                        let sender = pool_tx.sender();
+                        if skipped_heads.contains_key(&sender) {
+                            continue;
+                        }
+                        let account = reth_storage_api::AccountReader::basic_account(&state_provider, &sender);
+                        if let Ok(account) = account {
+                            skipped_heads.insert(sender, (pool_tx.nonce(), account.map_or(0, |a| a.nonce)));
+                        }
+                    }
                 }
                 Err(why) => {
                     // Counted, and said out loud: a leg that reads the phase
@@ -1064,15 +1164,69 @@ where
     // the next build on this block waits for the state, the engine's handoff
     // for the rest.
     // Full, or the queue had no more to give: either way the serial loop
-    // would add nothing now.
-    let block_full = block_gas_limit.saturating_sub(cumulative_gas_used) < MIN_TRANSACTION_GAS || par_drained;
+    // would add nothing worth the seal now. "Full" allows the shortfall the
+    // parallel step's skipped candidates leave behind
+    // ([`seal_shortfall`]): requiring the last 21,000 gas cost loop207 Pb
+    // node3 the early seal on all 63 builds of a tenure, over 256-512
+    // candidates of one stuck sender.
+    let gas_left = block_gas_limit.saturating_sub(cumulative_gas_used);
+    let block_full = gas_left < MIN_TRANSACTION_GAS
+        || par_drained
+        || (par_txs > 0 && gas_left <= seal_shortfall(block_gas_limit));
     // Read before the early seal is taken: a build that does not seal early
     // drops the `EarlySeal` on the way past, and with it the only record of
     // which hash the builder gave this block's parent. The ordinary finish
     // needs it for exactly the same reason the early seal does.
     let parent_built = early_seal.as_ref().and_then(|early| early.parent_built);
+    // Why this build will not seal early, decided from the same inputs as
+    // the gate below and said once a second. Until loop207 nothing named
+    // it: `build on own block refused` and `early seal that did not happen`
+    // never fired in five legs while two of them lost the seal for a whole
+    // tenure, because the gate simply falls through to the ordinary finish.
+    let no_seal_why = if early_seal.is_none() {
+        // The reth payload service's own path (`try_build`) asks for no
+        // early seal; that is the first build of a tenure, not a defect.
+        "no early seal asked for this build"
+    } else if !deferred_now {
+        "deferred execution is not active at this timestamp"
+    } else if !hotstuff {
+        "not a hotstuff chain"
+    } else if is_amsterdam {
+        "amsterdam"
+    } else if qmdb.is_none() {
+        "no qmdb state"
+    } else if block_blob_count != 0 {
+        "the block carries blobs"
+    } else if par_txs == 0 {
+        "the parallel step built nothing"
+    } else if !block_full {
+        "the parallel step left the block short of the gas limit"
+    } else {
+        ""
+    };
+    // `par_skipped` as well as `tx_count`: a build that skipped everything
+    // it was offered has `tx_count` 0, and that is the build this line
+    // exists for.
+    if !no_seal_why.is_empty() && early_seal.is_some() && (tx_count >= 1000 || par_skipped >= 1000) {
+        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if say_once_a_second(&LAST) {
+            tracing::info!(
+                target: "payload_builder",
+                number = header.number,
+                why = no_seal_why,
+                par_txs,
+                par_skipped,
+                gas_left,
+                shortfall = seal_shortfall(block_gas_limit),
+                "a build did not seal early"
+            );
+        }
+    }
     if let Some(early) = early_seal.take() {
-        if deferred_now && hotstuff && !is_amsterdam && block_full && par_txs > 0 && block_blob_count == 0 && qmdb.is_some() {
+        // The gate is `no_seal_why` above, so the line that says why a
+        // build did not seal early cannot drift from the test that decided
+        // it.
+        if no_seal_why.is_empty() {
             use reth_evm::execute::BlockExecutor as _;
             use reth_storage_api::HashedPostStateProvider as _;
             let EarlySeal { hook, parent_built: _ } = early;
@@ -1080,11 +1234,15 @@ where
             let seal_at = std::time::Instant::now();
             // Whatever was taken ahead and not built goes back to the queue,
             // as the loop's end does; the puller stops at its next batch.
-            for pool_tx in lookahead.into_iter().rev().chain(deferred.into_iter().rev()) {
+            for pool_tx in lookahead.into_iter().rev() {
                 refuse!(
                     &pool_tx,
                     InvalidPoolTransactionError::ExceedsGasLimit(pool_tx.gas_limit(), block_gas_limit)
                 );
+            }
+            for pool_tx in deferred.into_iter().rev() {
+                let err = deferred_refusal!(skipped_heads, pool_tx);
+                refuse!(&pool_tx, err);
             }
             drop(pulled.take());
             // The transactions out of the builder: the body is the sealed
@@ -1267,10 +1425,13 @@ where
             );
             build_stage.at(7);
             if tx_count >= 1000 {
+                let (queued, usable) = queue_depth();
                 tracing::info!(
                     target: "payload_builder",
                     number = block_number,
                     txs = tx_count,
+                    queued,
+                    usable,
                     setup_ms = setup_took.as_millis() as u64,
                     par_ms,
                     par_pull_ms,
@@ -1564,11 +1725,15 @@ where
     debug!(target: "payload_builder", tx_count, ?cumulative_gas_used, ?total_fees, "payload builder finished processing transactions");
     // Whatever was taken ahead and not built goes back to the queue, last
     // taken first so each is the queue's last and the return is O(1).
-    for pool_tx in lookahead.into_iter().rev().chain(deferred.into_iter().rev()) {
+    for pool_tx in lookahead.into_iter().rev() {
         refuse!(
             &pool_tx,
             InvalidPoolTransactionError::ExceedsGasLimit(pool_tx.gas_limit(), block_gas_limit)
         );
+    }
+    for pool_tx in deferred.into_iter().rev() {
+        let err = deferred_refusal!(skipped_heads, pool_tx);
+        refuse!(&pool_tx, err);
     }
     // The puller stops at its next batch; what it pulled meanwhile it
     // returns itself.
@@ -1807,6 +1972,32 @@ where
     // 250 ms would otherwise be a line every 250 ms.
     let total = build_started.elapsed();
     let assemble_ms = total.saturating_sub(finished_at).as_millis() as u64;
+    let (queued, usable) = queue_depth();
+    // A build that came out under a tenth of a block while the queue held
+    // more than a block. This is the only path such a build can take (an
+    // empty block never passes the early seal's `par_txs > 0`), and on
+    // loop207 Ob node1 it was every build for twenty views -- `txs=0`,
+    // `par_skipped=163000`, `queued=334-360k` -- with nothing in the logs
+    // saying the queue was deep and unusable rather than dry.
+    {
+        let block_txs = block_gas_limit / MIN_TRANSACTION_GAS;
+        if cumulative_gas_used.saturating_mul(10) < block_gas_limit && queued as u64 >= block_txs {
+            static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if say_once_a_second(&LAST) {
+                warn!(
+                    target: "payload_builder",
+                    number = block_number,
+                    gas = cumulative_gas_used,
+                    block_gas_limit,
+                    candidates = tx_count,
+                    par_skipped,
+                    queued,
+                    usable,
+                    "a build found almost nothing usable while the queue held more than a block"
+                );
+            }
+        }
+    }
     if tx_count >= 1000 {
         tracing::info!(
             target: "payload_builder",
@@ -1831,6 +2022,8 @@ where
             par_committed,
             par_ms,
             refused = ?crate::fast_transfer::rejected(),
+            queued,
+            usable,
             exec_ms = (exec_ns / 1_000_000) as u64,
             tail_ms = (tail_ns / 1_000_000) as u64,
             loop_ms = loop_done.as_millis() as u64,

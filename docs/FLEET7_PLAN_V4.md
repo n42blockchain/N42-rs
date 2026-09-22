@@ -769,6 +769,20 @@ Four nodes, pacing 225; E0 = no new flag, E1 = + partition hash, E2 = + both:
 - E1 alone lost both window 2s (396k, 453k); with the free off the pool as well it held twice. Two legs each; the
   alternation was E0 E1 E2, so the E2 legs were never first after a warm-up. loop204 confirms.
 
+## 2u. E2 confirmed: 586-636k / 590-619k; pacing 200 and the allocator's thread off do not help (loop204)
+
+| four nodes, 225, both follower flags | E2 (five legs, loop203-204) | E2 at pacing 200 | E2, `background_thread:false` |
+| --- | --- | --- | --- |
+| window 1 | 586-636k | 636k / 637k | 607k / 618k |
+| window 2 | **590k, 614k, 619k, 606k, 607k** | 574k / 385k | 573k / 451k |
+| import total / exec | 209-297 / 83-99 | 304-323 / 102-110 | 304-342 / 104-116 |
+
+- **Five of five E2 legs hold window 2 at 590k or better: this is the four-node configuration** (`run-loop204.sh`'s
+  `CH`). Pacing 200 gains 0-1% on window 1 and lost a window 2 again; the allocator's background thread costs nothing
+  measurable at four nodes (it is under 0.15 of a core in the thread table) and turning it off lengthened the import
+  and lost a window 2. Both stay as they are.
+- Where a member's twenty-eight cores go at E2: 18.4-19.2 in use (tokio 9.7-9.9, rayon ~5, storage ~2.5).
+
 ## 3. What not to do
 
 - Do not judge a cycle-shortening change at a pacing above the natural cycle; do not judge any change without R1.

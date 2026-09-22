@@ -996,6 +996,23 @@ The generator is ruled out (accepted = min across the four streams; a timeout re
   still parked at some moment of every leg (up to 631k). `plan-v4/lane-holes-2`: which give-back, what parks, Pd's
   stall. The bar stands: window 2 >= 600k in every leg.
 
+## 2ad. The counter was the chain working; the mass parks were a build for a decided height
+
+`plan-v4/lane-holes-2` (merged). `stale_give_back` was not a hole: its samples are contiguous descending runs of one
+sender -- the builder's own end-of-build give-back -- and nothing is ever dropped twice (a hole is re-offered and
+re-dropped every build, as defect 13 showed). Under the build chain the puller applies a build's refusals late, by
+which time the next build has taken those transactions, built them and the prune has raised the watermark. The lane
+now keeps the chain's watermark apart from what a build's verdict raised; a transaction the chain's part filters is
+`mined`, unsampled; `stale_*` now means "no block ever confirmed this", the shape a hole takes.
+
+The nine mass parks in five legs were one shape: a second build for a height the chain had already decided, at a
+handover, on the superseded parent -- behind the queue's pruning by two committed blocks, so every lane's lowest nonce
+looked gapped and all 384 senders were parked (`parked` 537k -> 631k, `usable` 2,000, blocks at 8-118k for 1.4 s:
+~half a million transactions an event). Guards: the diagnosis runs only when the build executed something, never for
+a decided height (`canonical_head`, one atomic fed by the canonical subscriber), never when most senders look gapped;
+parks capped at 64 lanes (`N42_TX_QUEUE_PARK_LANES`); `superseded=` on the build line. Pd's window 2 was two such
+parks inside it.
+
 ## 3. What not to do
 
 - Do not judge a cycle-shortening change at a pacing above the natural cycle; do not judge any change without R1.

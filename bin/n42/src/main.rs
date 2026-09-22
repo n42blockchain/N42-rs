@@ -535,7 +535,24 @@ fn main() {
                                     // 13 was -- 334-360k queued, empty blocks,
                                     // and no line saying which of the two it
                                     // was.
-                                    info!(target: "n42.tx_queue", mined, queued = queue.len(), usable = queue.usable(), prune_ms = started.elapsed().as_millis() as u64, "canonical blocks pruned from the queue");
+                                    let (parked_lanes, parked) = queue.parked();
+                                    info!(target: "n42.tx_queue", mined, queued = queue.len(), usable = queue.usable(), parked, parked_lanes, prune_ms = started.elapsed().as_millis() as u64, "canonical blocks pruned from the queue");
+                                    // What the queue let go of since the last
+                                    // block, by reason, with the first few
+                                    // named. A lane's hole -- a nonce the
+                                    // generator was told this node had taken
+                                    // and that is in neither the queue nor a
+                                    // block -- can only be made at one of
+                                    // these; before this nothing counted them.
+                                    let drops = queue.take_drops();
+                                    if drops.interesting() {
+                                        warn!(
+                                            target: "n42.tx_queue",
+                                            by_reason = ?drops.named(),
+                                            first = ?drops.samples,
+                                            "the queue let go of transactions"
+                                        );
+                                    }
                                 }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {

@@ -362,6 +362,18 @@ fn gate_clock_ms() -> u64 {
 
 /// Whether this caller may log a gate warning now; at most one per second
 /// node-wide.
+/// Whether a dropped-transaction warning may be written now; at most one a
+/// second across every door, because a systematic drop is a drop per
+/// transaction at half a million a second. The counts on the `ingest` line
+/// are the complete record; these lines are the first few, named.
+fn drop_warn_allowed() -> bool {
+    static NEXT_MS: AtomicU64 = AtomicU64::new(0);
+    let now = gate_clock_ms();
+    let next = NEXT_MS.load(Ordering::Acquire);
+    now >= next
+        && NEXT_MS.compare_exchange(next, now + 1_000, Ordering::AcqRel, Ordering::Acquire).is_ok()
+}
+
 fn gate_warn_allowed() -> bool {
     static NEXT_MS: AtomicU64 = AtomicU64::new(0);
     let now = gate_clock_ms();
@@ -490,12 +502,20 @@ fn unbuffered_reads() -> bool {
     *UNBUFFERED.get_or_init(|| std::env::var("N42_TX_INGEST_UNBUFFERED").is_ok())
 }
 
+/// What the gate and the frame's answer report as the node's depth.
+///
+/// `gate_len`, not `len`: a lane parked behind a hole holds transactions no
+/// build can take until the hole is filled, and counting them shuts the gate
+/// on supply the node is starving for. loop209 Pa node3 spent fifteen
+/// seconds in exactly that state -- depth 569,520 against a gate of 543,333,
+/// all of it parked, `rate` down to 30,591/s, its own blocks empty so
+/// nothing pruned it, and only the tenure change let it out.
 fn queue_depth<P: TransactionPool + 'static>(pool: &P) -> usize
 where
     P::Transaction: 'static,
 {
     match n42_tx_queue::global::<P::Transaction>() {
-        Some(queue) => queue.len(),
+        Some(queue) => queue.gate_len(),
         None => pool.pool_size().pending,
     }
 }
@@ -574,6 +594,13 @@ fn spawn_stats_reporter() {
                     spawn_us_per_frame = spawn_us,
                     altsig_txs = STATS.altsig_txs.load(Ordering::Relaxed),
                     altsig_batches = STATS.altsig_batches.load(Ordering::Relaxed),
+                    // Any of these non-zero is a hole: the frame was
+                    // acknowledged and the transaction never reached the
+                    // queue.
+                    dropped_decode = STATS.dropped_decode.load(Ordering::Relaxed),
+                    dropped_signature = STATS.dropped_signature.load(Ordering::Relaxed),
+                    dropped_altsig = STATS.dropped_altsig.load(Ordering::Relaxed),
+                    dropped_altsig_disabled = STATS.dropped_altsig_disabled.load(Ordering::Relaxed),
                     // Non-zero means the gate stopped reopening and frames
                     // were let through on the deadline; the round is not
                     // comparable and a node has stopped draining its queue.
@@ -760,7 +787,6 @@ where
             wait_at_gate(|| gate_view(&pool, &head, gate, allowance), gate_max_wait()).await;
         STATS.gate_ns.fetch_add(at_gate.as_nanos() as u64, Ordering::Relaxed);
         if asynchronous {
-            let offered = u32::try_from(raws.len()).unwrap_or(u32::MAX);
             let pending = u32::try_from(queue_depth(&pool)).unwrap_or(u32::MAX);
             let cache = cache.clone();
             let acquiring = std::time::Instant::now();
@@ -769,6 +795,15 @@ where
             // busy, 48-50 us a transaction, round 39), and the RLP decode is
             // not secp256k1's work to wait for.
             let pooled = decode_frame::<P>(raws);
+            // What is acknowledged, and it is the decoded count and not the
+            // offered one: the generator advances a sender's nonce by the
+            // answer, so acknowledging a transaction this node then threw
+            // away leaves that nonce in neither the queue nor a block, and
+            // every later nonce of that sender queues behind the hole for
+            // good. The recovery still runs after the answer -- that is what
+            // the async path is -- so what it drops is counted in the
+            // `ingest` line's `dropped_*` instead.
+            let offered = u32::try_from(pooled.len()).unwrap_or(u32::MAX);
             let slot = std::sync::Arc::clone(recovery_slots())
                 .acquire_owned()
                 .await
@@ -841,6 +876,21 @@ struct IngestStats {
     /// the hand-off through the runtime, paid once per frame.
     acq_ns: AtomicU64,
     spawn_ns: AtomicU64,
+    /// Transactions this ingest took off a frame and never queued, by door:
+    /// undecodable, a signature that did not recover, a 0x50 signature that
+    /// did not verify, and 0x50 on a chain that does not admit it.
+    ///
+    /// A frame is acknowledged by count, and the generator advances a
+    /// sender's nonce by what was acknowledged, so every one of these is a
+    /// permanent hole in that sender's lane on this node -- and every one of
+    /// them used to be a `debug!` nobody runs at. On the async path the
+    /// answer goes out before the recovery has run, so these can only be
+    /// counted here; the decode is the one that now happens first, so the
+    /// answer can tell the truth about it.
+    dropped_decode: AtomicU64,
+    dropped_signature: AtomicU64,
+    dropped_altsig: AtomicU64,
+    dropped_altsig_disabled: AtomicU64,
 }
 
 static STATS: IngestStats = IngestStats {
@@ -852,6 +902,10 @@ static STATS: IngestStats = IngestStats {
     reply_ns: AtomicU64::new(0),
     gate_ns: AtomicU64::new(0),
     chan_ns: AtomicU64::new(0),
+    dropped_decode: AtomicU64::new(0),
+    dropped_signature: AtomicU64::new(0),
+    dropped_altsig: AtomicU64::new(0),
+    dropped_altsig_disabled: AtomicU64::new(0),
     acq_ns: AtomicU64::new(0),
     spawn_ns: AtomicU64::new(0),
     altsig_batches: AtomicU64::new(0),
@@ -976,7 +1030,12 @@ where
     for raw in raws {
         match <PooledOf<P> as alloy_eips::Decodable2718>::decode_2718_exact(raw.as_ref()) {
             Ok(pooled) => decoded.push(pooled),
-            Err(err) => debug!(target: "n42.tx_ingest", %err, "undecodable transaction"),
+            Err(err) => {
+                let dropped = STATS.dropped_decode.fetch_add(1, Ordering::Relaxed) + 1;
+                if drop_warn_allowed() {
+                    warn!(target: "n42.tx_ingest", %err, dropped, "undecodable transaction: a hole in its sender's lane");
+                }
+            }
         }
     }
     decoded
@@ -1017,14 +1076,22 @@ where
         };
         match result {
             Ok(tx) => recovered.push(tx),
-            Err(_) => debug!(target: "n42.tx_ingest", "invalid signature"),
+            Err(_) => {
+                let dropped = STATS.dropped_signature.fetch_add(1, Ordering::Relaxed) + 1;
+                if drop_warn_allowed() {
+                    warn!(target: "n42.tx_ingest", dropped, "a signature did not recover: a hole in its sender's lane");
+                }
+            }
         }
     }
     if alt.is_empty() {
         return recovered;
     }
     if !n42_tx_types::alt_sig_enabled() {
-        debug!(target: "n42.tx_ingest", dropped = alt.len(), "0x50 transactions on a chain that does not enable them");
+        STATS.dropped_altsig_disabled.fetch_add(alt.len() as u64, Ordering::Relaxed);
+        if drop_warn_allowed() {
+            warn!(target: "n42.tx_ingest", dropped = alt.len(), "0x50 transactions on a chain that does not enable them");
+        }
         return recovered;
     }
     let senders = AltSigSenderCache::global();
@@ -1049,13 +1116,33 @@ where
         STATS.altsig_batches.fetch_add(1, Ordering::Relaxed);
     }
     STATS.altsig_txs.fetch_add(todo.len() as u64, Ordering::Relaxed);
+    // One verdict per transaction, or the zip below would silently drop the
+    // tail: `refs` filters, and a filter that ever removed anything would
+    // make every later transaction of the batch a hole.
+    if verdicts.len() != todo.len() {
+        STATS.dropped_altsig.fetch_add((todo.len() - verdicts.len()) as u64, Ordering::Relaxed);
+        warn!(
+            target: "n42.tx_ingest",
+            verdicts = verdicts.len(),
+            txs = todo.len(),
+            "the 0x50 batch returned fewer verdicts than it was given"
+        );
+    }
     for (tx, verdict) in todo.into_iter().zip(verdicts) {
         match verdict {
             Ok(sender) => {
                 senders.insert(*tx.hash(), sender);
                 recovered.push(P::Transaction::from_pooled(Recovered::new_unchecked(tx, sender)));
             }
-            Err(err) => debug!(target: "n42.tx_ingest", %err, "invalid 0x50 signature"),
+            Err(err) => {
+                let dropped = STATS.dropped_altsig.fetch_add(1, Ordering::Relaxed) + 1;
+                if drop_warn_allowed() {
+                    // No sender to name -- that is what failed -- so the
+                    // hash and the nonce, which is what the generator's own
+                    // log can be read against.
+                    warn!(target: "n42.tx_ingest", %err, dropped, hash = ?tx.hash(), "a 0x50 signature did not verify: a hole in its sender's lane");
+                }
+            }
         }
     }
     recovered

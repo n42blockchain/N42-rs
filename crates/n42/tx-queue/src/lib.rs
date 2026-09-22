@@ -131,38 +131,126 @@ impl<T: PoolTransaction> Lane<T> {
         }
     }
 
-    /// Whether the arrival order should step over this lane at build
-    /// `build`. A park that has expired is cleared here, so the lane is
-    /// offered again and re-parked only if a build still finds the hole.
-    const fn park_holds(&mut self, build: u64) -> bool {
-        match self.parked {
-            Some(parked) if parked.until_build > build => true,
-            Some(_) => {
-                self.parked = None;
-                false
-            }
-            None => false,
-        }
+    /// Whether this lane's park is still holding at build `build`.
+    ///
+    /// A pure test: every park is ended through [`Inner::unpark`], which is
+    /// what keeps `Inner::parked_len` honest.
+    fn park_holds(&self, build: u64) -> bool {
+        self.parked.is_some_and(|parked| parked.until_build > build)
     }
 
     /// A transaction reached the lane by some door: at or below the nonce
     /// the account was waiting for, it is the hole (or what is left of it),
     /// so the lane can be walked again.
-    fn hole_filled_by(&mut self, nonce: u64) {
-        if self.parked.is_some_and(|parked| nonce <= parked.wanted) {
-            self.parked = None;
-        }
+    fn hole_filled_by(&self, nonce: u64) -> bool {
+        self.parked.is_some_and(|parked| nonce <= parked.wanted)
     }
 
     /// The chain mined this nonce for the sender: at or above the hole,
     /// there is no hole left -- another leader mined what was missing, and
     /// what the lane still holds above it is next.
-    fn chain_passed(&mut self, nonce: u64) {
-        if self.parked.is_some_and(|parked| nonce >= parked.wanted) {
-            self.parked = None;
+    fn chain_passed(&self, nonce: u64) -> bool {
+        self.parked.is_some_and(|parked| nonce >= parked.wanted)
+    }
+}
+
+/// Why the queue let go of a transaction.
+///
+/// A hole in a lane -- a nonce the generator delivered and got an
+/// acknowledgement for, which is then in neither the queue nor a block --
+/// can only be made at one of these, so none of them is silent any more.
+/// Everything the queue holds is reachable through a lane, and the lane
+/// only ever loses a transaction here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Dropped {
+    /// The lane already held that (sender, nonce). Harmless: the generator
+    /// re-sends a frame whose answer it did not hear.
+    Duplicate,
+    /// An arrival at or below the lane's mined watermark.
+    StaleArrival,
+    /// A build's give-back at or below the watermark. **This is the one
+    /// that makes a hole** when the watermark came from a build's verdict
+    /// about a block consensus never committed.
+    StaleGiveBack,
+    /// A build refused it for a nonce the chain is past, so the lane drops
+    /// it and everything below.
+    StaleRefusal,
+    /// A give-back for a sender with no lane at all.
+    NoLane,
+    /// An own block pushed past the bound on held blocks before the chain
+    /// settled its height.
+    HeldEvicted,
+    /// An own block still held at a height the chain had already passed.
+    HeldBehind,
+}
+
+impl Dropped {
+    /// Every reason, in report order.
+    pub const ALL: [Self; 7] = [
+        Self::Duplicate,
+        Self::StaleArrival,
+        Self::StaleGiveBack,
+        Self::StaleRefusal,
+        Self::NoLane,
+        Self::HeldEvicted,
+        Self::HeldBehind,
+    ];
+
+    /// The name this reason is reported under.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Duplicate => "duplicate",
+            Self::StaleArrival => "stale_arrival",
+            Self::StaleGiveBack => "stale_give_back",
+            Self::StaleRefusal => "stale_refusal",
+            Self::NoLane => "no_lane",
+            Self::HeldEvicted => "held_evicted",
+            Self::HeldBehind => "held_behind",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Duplicate => 0,
+            Self::StaleArrival => 1,
+            Self::StaleGiveBack => 2,
+            Self::StaleRefusal => 3,
+            Self::NoLane => 4,
+            Self::HeldEvicted => 5,
+            Self::HeldBehind => 6,
         }
     }
 }
+
+/// How many transactions the queue let go of since the last report, by
+/// reason, with the first few named.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DropReport {
+    /// Counts in [`Dropped::ALL`] order.
+    pub counts: [u64; 7],
+    /// The first few, as (reason, sender, nonce): enough to take one sender
+    /// to the generator's own log and see which nonce went missing.
+    pub samples: Vec<(Dropped, Address, u64)>,
+}
+
+impl DropReport {
+    /// Whether anything but harmless duplicates was let go of.
+    pub fn interesting(&self) -> bool {
+        self.counts.iter().enumerate().any(|(i, n)| i != Dropped::Duplicate.index() && *n > 0)
+    }
+
+    /// The reasons that fired, as `name=count` pairs.
+    pub fn named(&self) -> Vec<(&'static str, u64)> {
+        Dropped::ALL
+            .into_iter()
+            .filter(|reason| self.counts[reason.index()] > 0)
+            .map(|reason| (reason.name(), self.counts[reason.index()]))
+            .collect()
+    }
+}
+
+/// How many (reason, sender, nonce) triples a report carries.
+const DROP_SAMPLES: usize = 8;
 
 /// What a give-back did: how many went back to the lanes, and how many were
 /// dropped because the chain had already mined them (or their sender has no
@@ -214,6 +302,21 @@ struct Inner<T: PoolTransaction> {
     /// start of every build ([`Inner::readmit_parked`]), which is also what
     /// makes a park impossible to lose.
     parked_order: VecDeque<Address>,
+    /// How many transactions the parked lanes hold, as a running total.
+    ///
+    /// The ingest's gate reads the queue's depth once per frame -- thousands
+    /// of times a second -- and what it must not count is supply no build
+    /// can take. On loop209 Pa it did: node3's lanes parked, its depth stayed
+    /// at 569,520 above the gate's 543,333, the gate shut, nothing arrived,
+    /// its own blocks were empty so nothing was pruned, and the node
+    /// proposed empty blocks for fifteen seconds until the tenure changed
+    /// (`usable=0 queued=569520` on every build, `ingest ... rate=30591
+    /// gate_us_per_frame=86660`). Walking the lanes per frame is not an
+    /// option, so this is kept up to date at the few places a parked lane's
+    /// contents or its park can change, and a test pins it against the walk.
+    parked_len: usize,
+    /// What the queue has let go of since the last report ([`Dropped`]).
+    drops: DropReport,
     /// The sender a build is taking a run from, and how much of the run is
     /// left. See [`run_length`].
     current: Option<(Address, usize)>,
@@ -570,6 +673,8 @@ impl<T: PoolTransaction> TxQueue<T> {
                 gaps: Vec::new(),
                 held: VecDeque::new(),
                 parked_order: VecDeque::new(),
+                parked_len: 0,
+                drops: DropReport::default(),
                 current: None,
                 run: run.max(1),
                 builds: 0,
@@ -636,6 +741,33 @@ impl<T: PoolTransaction> TxQueue<T> {
         // it. The drainer task normally leaves nothing to do here.
         self.drain_inbox(&mut inner);
         inner.usable()
+    }
+
+    /// The depth the ingest's gate is held against: everything queued, less
+    /// what no build can take because its lane is parked behind a hole
+    /// ([`Parked`]).
+    ///
+    /// O(1) -- the gate asks once per frame. Counting the parked lanes here
+    /// is what stops a hole from starving a node: on loop209 Pa node3's
+    /// parked lanes held its depth at 569,520 against a gate of 543,333,
+    /// the flood was held off, nothing was mined so nothing was pruned, and
+    /// the node built empty blocks until its tenure ended.
+    pub fn gate_len(&self) -> usize {
+        let inner = self.inner.lock();
+        (inner.len + self.staged.load(std::sync::atomic::Ordering::Acquire)).saturating_sub(inner.parked_len)
+    }
+
+    /// What the queue has let go of since the last call, by reason, with
+    /// the first few named ([`Dropped`]). Taking it clears it, so a caller
+    /// logging this reports a window and not a running total.
+    pub fn take_drops(&self) -> DropReport {
+        std::mem::take(&mut self.inner.lock().drops)
+    }
+
+    /// The lanes parked behind a hole and how many transactions they hold.
+    pub fn parked(&self) -> (usize, usize) {
+        let inner = self.inner.lock();
+        (inner.parked_order.len(), inner.parked_len)
     }
 
     /// Whether nothing is queued.
@@ -786,7 +918,15 @@ impl<T: PoolTransaction> TxQueue<T> {
             if let Some(lane) = inner.lanes.get_mut(sender) {
                 let keep = lane.by_nonce.split_off(&(nonce + 1));
                 let gone = std::mem::replace(&mut lane.by_nonce, keep);
+                // A parked lane keeps its park here -- this block is this
+                // node's own and not committed, so it says nothing about
+                // the hole -- but what it no longer holds must leave the
+                // parked total.
+                let parked = lane.parked.is_some();
                 inner.len -= gone.len();
+                if parked {
+                    inner.parked_len = inner.parked_len.saturating_sub(gone.len());
+                }
                 removed.extend(gone.into_values());
             }
         }
@@ -811,7 +951,20 @@ impl<T: PoolTransaction> TxQueue<T> {
         }
         let mut inner = self.inner.lock();
         while inner.held.len() >= HELD_BLOCKS {
-            inner.held.pop_front();
+            let Some((evicted, _, gone)) = inner.held.pop_front() else { break };
+            // Nothing else holds these: the block they were taken for was
+            // never settled, so this is a hole in every lane they came
+            // from. Said out loud rather than counted alone.
+            for valid in &gone {
+                inner.dropped(Dropped::HeldEvicted, valid.sender(), valid.nonce());
+            }
+            tracing::warn!(
+                target: "n42.tx_queue",
+                number = evicted,
+                txs = gone.len(),
+                holding = number,
+                "an own block was still held when the bound was reached; its transactions are lost to the queue"
+            );
         }
         inner.held.push_back((number, hash, transactions));
     }
@@ -828,23 +981,53 @@ impl<T: PoolTransaction> TxQueue<T> {
         }
         let mut back = Vec::new();
         let mut kept = VecDeque::with_capacity(inner.held.len());
+        let mut behind: Vec<(u64, Vec<Arc<ValidPoolTransaction<T>>>)> = Vec::new();
         for (held_number, held_hash, transactions) in std::mem::take(&mut inner.held) {
             if held_number == number && held_hash != hash {
                 back.extend(transactions.into_iter().filter(|t| !carried(&t.sender(), t.nonce())));
             } else if held_number > number {
                 kept.push_back((held_number, held_hash, transactions));
+            } else if held_number < number {
+                // A height the chain has passed with this block still held:
+                // the pruner should have settled it at its own height, so
+                // this is a hole and not housekeeping.
+                behind.push((held_number, transactions));
             }
-            // The same hash, or a height already behind the chain: dropped.
+            // The same hash at this height: settled, and mined.
         }
         inner.held = kept;
+        for (held_number, gone) in behind {
+            for valid in &gone {
+                inner.dropped(Dropped::HeldBehind, valid.sender(), valid.nonce());
+            }
+            tracing::warn!(
+                target: "n42.tx_queue",
+                number = held_number,
+                txs = gone.len(),
+                settling = number,
+                "an own block was still held at a height the chain had passed; its transactions are lost to the queue"
+            );
+        }
         if back.is_empty() {
             return 0;
         }
-        // The committed block at this height may have mined a higher nonce
-        // for a sender than the held one carries; `carried` is an exact
-        // (sender, nonce) test, so the lane's watermark is what catches
-        // those.
-        inner.give_back(back).offered
+        // Through the reverted door, which lowers the senders' watermarks
+        // first.
+        //
+        // This block of ours was never committed, so nothing it carried was
+        // ever mined -- but a build of ours may already have said otherwise:
+        // a build standing on it refuses a re-offered (sender, nonce) it
+        // carries as "the chain is past this", and `mark_invalid` raises the
+        // lane's watermark on that verdict (round 44, and it has to: without
+        // it a mined transaction is re-offered to every build for the rest
+        // of the leg). When the height then goes to another block, the
+        // give-back meets that watermark and the nonce is filtered out for
+        // good -- in neither the queue nor a block, and every later nonce of
+        // that sender unusable behind the hole. The canonical prune for the
+        // committed block runs immediately after this and re-raises each
+        // watermark from what the chain actually mined, so lowering it here
+        // cannot re-admit anything the chain holds.
+        inner.give_back_unmined(back).offered
     }
 
     /// Forgets the transactions the build on `parent` took that a block has
@@ -956,34 +1139,46 @@ impl<T: PoolTransaction> TxQueue<T> {
 
 impl<T: PoolTransaction> Inner<T> {
     /// Queues one transaction the pusher has already wrapped.
-    fn insert_valid(
-        &mut self,
-        valid: Arc<ValidPoolTransaction<T>>,
-    ) -> Option<&Arc<ValidPoolTransaction<T>>> {
+    fn insert_valid(&mut self, valid: Arc<ValidPoolTransaction<T>>) {
         let sender = valid.sender();
         let nonce = valid.nonce();
         let lane = self
             .lanes
             .entry(sender)
             .or_insert_with(|| Lane { by_nonce: BTreeMap::new(), queued: false, mined: None, parked: None });
-        if lane.by_nonce.contains_key(&nonce) || lane.is_stale(nonce) {
-            return None;
+        if lane.by_nonce.contains_key(&nonce) {
+            self.dropped(Dropped::Duplicate, sender, nonce);
+            return;
+        }
+        if lane.is_stale(nonce) {
+            self.dropped(Dropped::StaleArrival, sender, nonce);
+            return;
         }
         // The hole a build parked this lane behind, filled: the ingest saw
         // the missing nonce after all, so the lane is offered again at once
         // rather than at the park's expiry.
-        lane.hole_filled_by(nonce);
+        let fills = lane.hole_filled_by(nonce);
+        let parked = lane.parked.is_some();
         lane.by_nonce.insert(nonce, valid);
         self.len += 1;
         // A lane still parked stays out of the order whatever arrives: the
         // flood keeps feeding a gapped sender its *later* nonces, and
         // putting the lane back for each of them would undo the park a few
-        // thousand times a second. `readmit_parked` is its door back.
-        if !lane.queued && lane.parked.is_none() {
+        // thousand times a second. `readmit_parked` is its other door back.
+        if !parked && !lane.queued {
             lane.queued = true;
             self.arrivals.push_back(sender);
         }
-        lane.by_nonce.get(&nonce)
+        // Counted into the parked total first, then out of it with the
+        // rest of the lane: `unpark` subtracts what the lane holds, and by
+        // here that includes this transaction.
+        if parked {
+            self.parked_len += 1;
+        }
+        if fills {
+            self.unpark(sender);
+            self.requeue(sender);
+        }
     }
 
     /// Puts transactions a build took back at their nonces; their senders go
@@ -999,38 +1194,76 @@ impl<T: PoolTransaction> Inner<T> {
     /// remove it a second time.
     fn give_back(&mut self, taken: Vec<Arc<ValidPoolTransaction<T>>>) -> GaveBack {
         let mut senders: Vec<Address> = Vec::new();
+        let mut unparked: Vec<Address> = Vec::new();
         let mut gave = GaveBack::default();
         for valid in taken {
             let sender = valid.sender();
             let nonce = valid.nonce();
             let Some(lane) = self.lanes.get_mut(&sender) else {
                 gave.filtered += 1;
+                self.dropped(Dropped::NoLane, sender, nonce);
                 continue;
             };
             if lane.is_stale(nonce) {
                 gave.filtered += 1;
+                self.dropped(Dropped::StaleGiveBack, sender, nonce);
                 continue;
             }
             gave.offered += 1;
             // An own block the chain settled elsewhere comes back through
             // here, and it can carry the very nonce a lane is parked
             // behind.
-            lane.hole_filled_by(nonce);
-            if lane.by_nonce.insert(nonce, valid).is_none() {
+            let fills = lane.hole_filled_by(nonce);
+            let fresh = lane.by_nonce.insert(nonce, valid).is_none();
+            if fresh {
                 self.len += 1;
             }
+            let parked = lane.parked.is_some();
             // As in `insert_valid`: a parked lane comes back through
             // `readmit_parked` and not through a give-back of the very
             // transactions the build could not use.
-            if !lane.queued && lane.parked.is_none() {
+            if !lane.queued && !parked {
                 lane.queued = true;
                 senders.push(sender);
             }
+            // As in `insert_valid`: into the parked total first, then out
+            // of it with the rest of the lane.
+            if parked && fresh {
+                self.parked_len += 1;
+            }
+            if fills {
+                self.unpark(sender);
+                unparked.push(sender);
+            }
+        }
+        for sender in unparked {
+            self.requeue(sender);
         }
         for sender in senders.into_iter().rev() {
             self.arrivals.push_front(sender);
         }
         gave
+    }
+
+    /// Records that a transaction left the queue, or never entered it.
+    fn dropped(&mut self, reason: Dropped, sender: Address, nonce: u64) {
+        self.drops.counts[reason.index()] += 1;
+        if self.drops.samples.len() < DROP_SAMPLES && reason != Dropped::Duplicate {
+            self.drops.samples.push((reason, sender, nonce));
+        }
+    }
+
+    /// [`Self::give_back`] for transactions no block of the chain ever
+    /// carried: each sender's watermark drops below the nonce coming back
+    /// first, so a watermark raised from a verdict about a block that was
+    /// never committed cannot swallow it.
+    fn give_back_unmined(&mut self, back: Vec<Arc<ValidPoolTransaction<T>>>) -> GaveBack {
+        for valid in &back {
+            if let Some(lane) = self.lanes.get_mut(&valid.sender()) {
+                lane.unmine(valid.nonce());
+            }
+        }
+        self.give_back(back)
     }
 
     /// A build found a hole below this sender's head: the account is at
@@ -1047,9 +1280,21 @@ impl<T: PoolTransaction> Inner<T> {
         // there keeps that entry -- the walk reads the lane's own expiry,
         // not the entry's.
         let fresh = lane.parked.is_none();
+        let held = lane.by_nonce.len();
         lane.parked = Some(Parked { wanted, until_build });
         if fresh {
+            self.parked_len += held;
             self.parked_order.push_back(sender);
+        }
+    }
+
+    /// Ends a lane's park, whatever ended it, and takes what it holds back
+    /// out of [`Inner::parked_len`]. The one door out of a park.
+    fn unpark(&mut self, sender: Address) {
+        let Some(lane) = self.lanes.get_mut(&sender) else { return };
+        if lane.parked.take().is_some() {
+            let held = lane.by_nonce.len();
+            self.parked_len = self.parked_len.saturating_sub(held);
         }
     }
 
@@ -1071,27 +1316,17 @@ impl<T: PoolTransaction> Inner<T> {
     fn readmit_parked(&mut self) {
         while let Some(sender) = self.parked_order.front().copied() {
             let build = self.builds;
-            let Some(parked) = self.lanes.get(&sender).map(|lane| lane.parked) else {
-                self.parked_order.pop_front();
-                continue;
-            };
-            match parked {
-                // Parks end in the order they were made, so once one is
-                // still held the rest are too.
-                Some(parked) if parked.until_build > build => break,
-                // Expired, or unparked by a door of its own (the hole
-                // filled, the chain past it); in the second case the lane
-                // may be back in the order already, which `requeue` sees.
-                other => {
-                    if other.is_some()
-                        && let Some(lane) = self.lanes.get_mut(&sender)
-                    {
-                        lane.parked = None;
-                    }
-                    self.parked_order.pop_front();
-                    self.requeue(sender);
-                }
+            // Parks end in the order they were made, so once one is still
+            // held the rest are too.
+            if self.lanes.get(&sender).is_some_and(|lane| lane.park_holds(build)) {
+                break;
             }
+            // Expired, or unparked by a door of its own (the hole filled,
+            // the chain past it); in the second case the lane may be back
+            // in the order already, which `requeue` sees.
+            self.unpark(sender);
+            self.parked_order.pop_front();
+            self.requeue(sender);
         }
     }
 
@@ -1102,20 +1337,33 @@ impl<T: PoolTransaction> Inner<T> {
         self.lanes.values().filter(|lane| lane.queued).map(|lane| lane.by_nonce.len()).sum()
     }
 
+    /// The parked lanes and what they hold, walked. What
+    /// [`Inner::parked_len`] tracks incrementally; the two must agree.
+    #[cfg(test)]
+    fn parked_walked(&self) -> (usize, usize) {
+        self.lanes
+            .values()
+            .filter(|lane| lane.parked.is_some())
+            .fold((0, 0), |(lanes, txs), lane| (lanes + 1, txs + lane.by_nonce.len()))
+    }
+
     fn remove_mined(&mut self, sender: Address, nonce: u64) {
         let Some(lane) = self.lanes.get_mut(&sender) else { return };
         lane.mine(nonce);
         // The chain has reached or passed the hole: whatever is left in the
         // lane above it is the next thing this sender wants mined.
-        let was_parked = lane.parked.is_some();
-        lane.chain_passed(nonce);
-        let unparked = was_parked && lane.parked.is_none();
+        let ends_park = lane.chain_passed(nonce);
+        let parked = lane.parked.is_some();
         let keep = lane.by_nonce.split_off(&(nonce + 1));
-        self.len -= lane.by_nonce.len();
+        let dropped = lane.by_nonce.len();
+        self.len -= dropped;
         lane.by_nonce = keep;
         // A now-empty lane leaves the arrival order when its turn comes.
-        if unparked {
+        if ends_park {
+            self.unpark(sender);
             self.requeue(sender);
+        } else if parked {
+            self.parked_len = self.parked_len.saturating_sub(dropped);
         }
     }
 
@@ -1177,7 +1425,6 @@ impl<T: PoolTransaction> Inner<T> {
             }
         }
         let run = self.run;
-        let build = self.builds;
         let mut passes = self.arrivals.len();
         while passes > 0 {
             passes -= 1;
@@ -1195,7 +1442,12 @@ impl<T: PoolTransaction> Inner<T> {
             // arrival order, so the build's whole candidate budget goes to
             // lanes that can execute. `park` filed it in `parked_order`
             // already, and that is the door back.
-            if lane.park_holds(build) {
+            //
+            // The expiry is not tested here: a park this walk meets was set
+            // during this build (a park from an earlier build took the lane
+            // out of the order the first time the walk reached it, which is
+            // within one build), so it cannot have expired yet.
+            if lane.parked.is_some() {
                 lane.queued = false;
                 continue;
             }
@@ -1327,6 +1579,7 @@ impl<T: PoolTransaction> BestTransactions for QueueBest<T> {
             {
                 taken.remove(at);
             }
+            inner.dropped(Dropped::StaleRefusal, sender, transaction.nonce());
             inner.remove_mined(sender, transaction.nonce());
             return;
         }
@@ -1806,6 +2059,165 @@ mod tests {
         drop(best);
         assert!(second.iter().all(|(s, _)| *s > 20), "a parked lane was offered again: {second:?}");
         assert_eq!(second.len(), whole.len() * 10, "the build did not find the nonces it could mine");
+    }
+
+    /// The hole, reproduced: a nonce the queue held, that no block of the
+    /// chain ever carried, and that the queue would have lost for good.
+    ///
+    /// A build of ours seals block B at height 10 and the queue holds B's
+    /// transactions until the chain settles that height. A later build --
+    /// standing on B, whose state has the sender past that nonce -- is
+    /// offered it again and refuses it as behind the chain, which raises the
+    /// lane's watermark (round 44: without that, a mined transaction is
+    /// re-offered to every build for the rest of the leg). Consensus then
+    /// commits somebody else's block at height 10. The give-back meets the
+    /// watermark, the nonce is filtered out, and the sender's lane starts
+    /// above the chain's nonce with every later nonce stranded behind the
+    /// hole -- which is exactly the state the leader's builds ran into.
+    #[test]
+    fn an_own_block_the_chain_replaced_gives_back_a_nonce_a_build_called_stale() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(64);
+        let sender = Address::repeat_byte(1);
+        queue.push((0..4).map(|n| tx(1, n)).collect::<Vec<_>>());
+
+        // The build that becomes our block at height 10 takes nonces 0-1.
+        let parent = B256::repeat_byte(3);
+        let mut best = queue.best_for_build(parent);
+        let ours: Vec<_> = (0..2).map(|_| best.next().expect("the lane's head")).collect();
+        drop(best);
+        let mined = queue.forget_mined(parent, ours.iter().map(|t| (t.sender(), t.nonce())));
+        assert_eq!(mined.len(), 2);
+        let block = B256::repeat_byte(10);
+        queue.hold_own_block(10, block, mined);
+
+        // A later build on our block is offered nonce 0 again -- a second
+        // build on the same parent gives the first build's take back -- and
+        // refuses it, because the state it stands on is past it.
+        queue.push(vec![tx(1, 0)]);
+        let mut best = queue.best_for_build(B256::repeat_byte(4));
+        let head = best.next().expect("offered again");
+        assert_eq!(head.nonce(), 0);
+        best.mark_invalid(
+            &head,
+            InvalidPoolTransactionError::Consensus(InvalidTransactionError::NonceNotConsistent { tx: 0, state: 2 }),
+        );
+        drop(best);
+
+        // Consensus commits another block at height 10, carrying nothing of
+        // ours.
+        let back = queue.settle_own_block(10, B256::repeat_byte(11), |_, _| false);
+        assert_eq!(back, 2, "the held block's nonces did not come back");
+
+        // The chain is at nonce 0 for this sender, and so is the queue.
+        let mut best = queue.best_for_build(B256::repeat_byte(5));
+        let offered: Vec<u64> = std::iter::from_fn(|| best.next()).map(|t| t.nonce()).collect();
+        drop(best);
+        assert_eq!(offered.first().copied(), Some(0), "a hole was left at the head of the lane");
+        assert_eq!(offered, vec![0, 1, 2, 3]);
+        let _ = sender;
+    }
+
+    /// Whatever the queue lets go of is counted and the first few are
+    /// named, so a hole is never silent.
+    #[test]
+    fn what_the_queue_lets_go_of_is_counted_by_reason() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(64);
+        queue.push(vec![tx(1, 0), tx(1, 1)]);
+        queue.drain_now();
+        // A duplicate.
+        queue.push(vec![tx(1, 0)]);
+        queue.drain_now();
+        // An arrival the chain is past.
+        queue.remove_mined(Address::repeat_byte(1), 1);
+        queue.push(vec![tx(1, 1)]);
+        queue.drain_now();
+        // A build's stale refusal.
+        queue.push(vec![tx(2, 5)]);
+        let mut best = queue.best_for_build(B256::repeat_byte(1));
+        let head = best.next().expect("the lane's head");
+        best.mark_invalid(
+            &head,
+            InvalidPoolTransactionError::Consensus(InvalidTransactionError::NonceNotConsistent { tx: 5, state: 9 }),
+        );
+        drop(best);
+
+        let report = queue.take_drops();
+        assert!(report.interesting(), "{report:?}");
+        let named: alloy_primitives::map::HashMap<&str, u64> = report.named().into_iter().collect();
+        assert_eq!(named.get("duplicate"), Some(&1));
+        assert_eq!(named.get("stale_arrival"), Some(&1));
+        assert_eq!(named.get("stale_refusal"), Some(&1));
+        assert!(report.samples.iter().any(|(r, _, n)| *r == Dropped::StaleArrival && *n == 1));
+        // Taking it clears it.
+        assert_eq!(queue.take_drops(), DropReport::default());
+    }
+
+    /// Every door that can change a parked lane, against the walk.
+    ///
+    /// `parked_len` is the ingest gate's number and it is maintained
+    /// incrementally, so nothing but a test can say it is right.
+    #[test]
+    fn the_parked_total_matches_the_walk_through_every_door() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(4);
+        let check = |queue: &TxQueue<EthPooledTransaction>, what: &str| {
+            let inner = queue.inner.lock();
+            let (_, walked) = inner.parked_walked();
+            assert_eq!(inner.parked_len, walked, "{what}");
+        };
+        // Three gapped lanes and one whole one.
+        let mut all = Vec::new();
+        for s in 1..=3u8 {
+            all.extend((5..15).map(|n| tx(s, n)));
+        }
+        all.extend((0..10).map(|n| tx(9, n)));
+        queue.push(all);
+        build_refusing_gaps(&queue, B256::repeat_byte(1), &|_| 0);
+        check(&queue, "after the parks");
+        assert!(queue.parked().1 > 0, "nothing was parked");
+        assert_eq!(queue.gate_len() + queue.parked().1, queue.len());
+
+        // A later nonce arriving at a parked lane.
+        queue.push(vec![tx(1, 20)]);
+        queue.drain_now();
+        check(&queue, "after an arrival above the hole");
+        // The hole filled.
+        queue.push(vec![tx(2, 0)]);
+        queue.drain_now();
+        check(&queue, "after the hole was filled");
+        // The chain passing another lane's hole.
+        queue.remove_mined(Address::repeat_byte(3), 4);
+        check(&queue, "after the chain passed a hole");
+        // An own block taking part of a parked lane out.
+        queue.push(vec![tx(1, 0), tx(1, 1)]);
+        queue.drain_now();
+        let removed = queue.remove_mined_batch_collecting([(Address::repeat_byte(1), 1)]);
+        assert!(!removed.is_empty());
+        check(&queue, "after an own block took part of a lane");
+        // And the expiry.
+        for i in 0..PARK_BUILDS + 1 {
+            let _ = queue.best_for_build(B256::from([i as u8 + 40; 32]));
+            check(&queue, "after a build");
+        }
+        assert_eq!(queue.parked(), (0, 0), "a park outlived its expiry");
+    }
+
+    /// The gate's depth leaves out what a parked lane holds, so a hole
+    /// cannot hold the ingest off a node that is starving for supply
+    /// (loop209 Pa node3: depth 569,520 against a gate of 543,333, all of
+    /// it parked, and fifteen seconds of empty blocks).
+    #[test]
+    fn the_gates_depth_leaves_out_the_parked_lanes() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(4);
+        let mut all = Vec::new();
+        for s in 1..=3u8 {
+            all.extend((5..15).map(|n| tx(s, n)));
+        }
+        queue.push(all);
+        assert_eq!(queue.gate_len(), 30);
+        build_refusing_gaps(&queue, B256::repeat_byte(1), &|_| 0);
+        assert_eq!(queue.parked().0, 3);
+        assert_eq!(queue.gate_len(), 0, "the gate was held against transactions no build can take");
+        assert!(!queue.is_empty(), "the queue still holds them");
     }
 
     /// A park is a guess about state the queue cannot see, so it expires:

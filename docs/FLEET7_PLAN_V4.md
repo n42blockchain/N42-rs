@@ -857,8 +857,15 @@ Four nodes, E2 at 225; P = the default, O = `N42_FOLLOWER_EXEC_ON_PARENT_OUTPUT=
 - **The checkpoint's cost did not grow on the uncongested box** (12-17 ms throughout; its bytes still 10.7-12.6 MB by
   the end): the 5 -> 169 ms of loop206 was that work under the congestion, a symptom. The root's p90 tails (57-113)
   remain and are the entry the analysis named; `plan-v4/qmdb-checkpoint` is on what accumulates in the bytes.
-- Pb lost its window 2 with the import at 0.17-0.30 s -- the chain slowed while the followers were not behind: a
-  different cause from 2v's, being read. loop208 runs P four more times with `root_wait_ms` on the line.
+- **Pb and Ob lost their windows to a third defect, on the leader (defect 13).** In each, the node leading one
+  64-view tenure lost the seal-first build path for the whole tenure (1 and 0 `seal-first build phases` of 62 builds,
+  against 61-62 in every other tenure of the five legs): with a full pool it proposed late (Pb node3, views 448-511:
+  proposal@ p50 185 against 80-87 for the same node in Pa/Pc, `fcu_ms` 113, the chain's `wait_ms` 401, cycle 0.366),
+  and with the chained builds having taken and held several blocks' worth it proposed EMPTY blocks (Ob node1, views
+  362-382: `txs=3912` then `txs=0` while its queue held 334-360k -- later nonces of the same senders, unusable until
+  the held blocks commit). Nothing on today's lines says why; `plan-v4/leader-early-seal`. The root tail's new coupling
+  through the vote road's `fields_ms` (root 635 on view 442 -> fields 440-512 on 443) is real, two-block, and recovers.
+  loop208 runs P four more times with `root_wait_ms` on the line.
 
 ## 3. What not to do
 

@@ -815,6 +815,16 @@ A read-only analysis of eleven legs (seven collapsed, four held; scripts under t
   showed the entry into the slow regime is a step (import 0.12 -> 0.31 between two 15 s buckets), at pacing 275 as at
   225, with 0.18 s of slack and 67-80 GB free: what triggers it is being chased (the analysis' follow-up).
 
+**The entry is a root tail, and the root tracks a cost that grows through the leg.** Twenty steps (five legs x four
+nodes) share no event -- not a handover, the gate, a prune, a lag -- but every leg's `compacted the QMDB log into a new
+checkpoint` grows monotonically (bytes 0.6 -> 12.2 MB, `total_ms` p50 5 -> 150-169 over ~900 blocks) and the
+follower's `root_ms` tracks it (p50 24 -> 38-50, tails of 150-319). The first slow import of a leg is one outsized
+root (S250a nodes 1 and 3: `root_ms` 319 / 284 at block 385, exec normal) into which the next block's vote road runs;
+the wait and the exec inflation follow one block later and then sustain themselves. So two fixes, not one: the
+pipeline stops the regime sustaining itself (a step becomes a ramp), and the checkpoint's growth has to be bounded or
+taken off the root's path, or window 3 goes anyway -- `plan-v4/qmdb-checkpoint`. Also measured: the S flag's index
+removal doubles the canonical prune (`prune_ms` 39 -> 94), which is why its queue sits 80k deeper.
+
 In progress: `plan-v4/import-pipeline` -- the wait timed (`parent_engine_wait_ms`), execution on the parent's published
 output as the default with the outputs stacked to the nearest canonical ancestor, at most one execution in flight per
 node. A fix must move, at t = 90-120 s: the wait 125-190 -> under 30, exec 120-190 -> 90, import total 330-450 -> under

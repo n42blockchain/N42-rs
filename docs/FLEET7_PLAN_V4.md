@@ -1029,6 +1029,19 @@ lost both windows (407k, then 75k at 24% occupancy: 55 empty builds, `parked` 55
 - The four-node state, then: **window 1 630-646k, window 2 619-636k, cycle 0.252-0.263 s** on the P configuration
   (`run-loop212.sh`'s `CH`), the follower's import 178-202 ms with no waits, early seal 94-97%.
 
+## 2af. Parking off: a parked lane is a sink
+
+`plan-v4/lane-holes-3` (merged). `N42_TX_QUEUE_PARK_LANES=0` removed the cap, not the park; it now means off, and off is
+the default. The mass parks did not come from the diagnosis the guards protect: the serial loop turns every
+`NonceTooHigh` it meets into `NonceNotConsistent`, and `mark_invalid`'s gap branch parked once per transaction -- 329
+lanes from one decided-height build in loop212 NPb, correctly labelled `superseded=true` and correctly ignored by the
+diagnosis. And the cap could not have saved it: loop211 Pd held exactly 64 parked lanes while what they held grew
+1,434 -> 5,505 transactions each (92k -> 560k), because a parked lane is a sink -- nothing drains it, the generator
+keeps feeding its sender, and `gate_len` hides it from the ingest -- until ten consecutive empty blocks were committed
+over a 370k queue. The legs that never parked were the cleanest of the campaign. Also fixed: a prune that ended a park
+left the pruned part counted for ever. loop211 Pd's `stale_give_back` samples are not holes (133 distinct of 133;
+ascending runs a prune confirmed a moment later, or lanes behind the chain).
+
 ## 3. What not to do
 
 - Do not judge a cycle-shortening change at a pacing above the natural cycle; do not judge any change without R1.

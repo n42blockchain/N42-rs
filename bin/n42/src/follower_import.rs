@@ -1114,7 +1114,7 @@ fn queue_for_senders() -> Option<n42_tx_queue::TxQueue<n42_engine_types::N42Pool
 /// checks, senders, execution, the post-execution checks, state root, hashed
 /// state; then the number of senders the recovery cache held, the parent-state
 /// lookup, the carry, the wait for the parent to be canonical in the engine,
-/// and the wait for the execution gate.
+/// the wait for the execution gate, and the wait for the parent's own root.
 ///
 /// Under deferred execution (a block stamped at or past the chain's
 /// `deferredExecutionTime`) the block is *checked* first -- its header's
@@ -1135,7 +1135,7 @@ pub fn import_foreign_block<Provider, Evm, ChainSpec>(
     chain_spec: &ChainSpec,
     mut checked: Option<tokio::sync::oneshot::Sender<()>>,
     road: VoteRoad,
-) -> Result<(Box<BuiltPayloadExecutedBlock<EthPrimitives>>, [u64; 11]), String>
+) -> Result<(Box<BuiltPayloadExecutedBlock<EthPrimitives>>, [u64; 12]), String>
 where
     Provider: StateProviderFactory + HeaderProvider<Header = alloy_consensus::Header> + Sync,
     Evm: ConfigureEvm<
@@ -1593,15 +1593,24 @@ where
     }
     let carry_ms = carry_at.elapsed().as_millis() as u64;
 
-    // Executed on the parent's output: the forest computes this block's tree
-    // from the parent's record, which the parent's own root job files, and
-    // nothing has waited for it on this path. It is there by now in the
-    // ordinary case -- the check above already waited for the fields the
-    // parent's root completes -- so this states the ordering rather than
-    // paying for it.
+    // Executed on the published outputs: the forest computes this block's tree
+    // from the parent's record, which the parent's own root job files, so this
+    // block's *root* needs the parent's -- and nothing before this point did.
+    // The execution above ran on the parent's bundle while that root was still
+    // running, which is the whole point of the path: a parent whose root took
+    // 150-319 ms instead of the 24-30 ms baseline (the QMDB log checkpoint,
+    // plan v4) must not hold the next block's execution, only the next block's
+    // root.
+    //
+    // Timed apart from [`parent_engine_wait_us`] because the two say different
+    // things: this is the parent's root running long, that is the parent's
+    // engine insert not having happened. A leg that cannot tell them apart
+    // cannot say which one a slow import waited on.
+    let root_wait_at = std::time::Instant::now();
     if executed_parent.is_some() {
         wait_for_parent_fields(parent_hash)?;
     }
+    let root_wait_ms = root_wait_at.elapsed().as_millis() as u64;
 
     // The QMDB root against the header's, which also files the block's tree
     // under its hash for the engine and the next block.
@@ -1735,6 +1744,7 @@ where
             carry_ms,
             parent_engine_wait_us / 1000,
             gate_ms,
+            root_wait_ms,
         ],
     ))
 }

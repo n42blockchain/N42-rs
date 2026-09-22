@@ -706,6 +706,39 @@ Four nodes, chain configuration; C = body road, K = + `N42_COMPACT_BODY=1`; wind
   -- three of four hold at a follower import of 361-369 ms against a 278 ms cycle. loop202 confirms it over more legs
   and tries 200.
 
+## 2s. Four nodes at pacing 225: the configuration (loop202)
+
+Chain configuration, no compact body, `--pertx 20000`; a warm-up leg then C225 x3, C200 x2, C275 x1 interleaved:
+
+| | C275 | C225 a / b / c | C200 a / b |
+| --- | --- | --- | --- |
+| window 1 | 542k | 589k / 575k / 583k | 602k / 594k |
+| window 2 | 538k | **571k / 562k / 556k** | 557k / 464k |
+| window 3 | 500k | 508k / 475k / 482k | 497k / 462k |
+| cycle, full blocks (dissected) | 288 | 262 (B 217, D 32, E 8) | -- |
+| R1 | 144 | 190-201 | 166-196 |
+| follower import total / exec / root | 189 / 96 / 26 | 361-370 / 131-133 / 33 | 370-374 / 133-136 |
+| queue trough (p5) | 158k | 88-91k | 90-91k |
+
+- **225 is the four-node configuration: 575-589k on window 1 and 556-571k on window 2, three of three** (five of six
+  with loop201's; loop200's one collapse to 429k stays the one exception in seven legs). 200 buys nothing beyond 225
+  (the cycle is the same 262-270 ms) and lost a window 2 (464k). `F7_BLOCK_INTERVAL_MS=225` from here.
+- The cycle at 225 is B: 217 of 262 ms is the followers' road to the second-fastest vote, and behind the vote the
+  import runs 361-370 ms (execution 131-133, root 33, sender look-ups 34, engine 49; the remaining ~115 waiting for
+  its parent) -- a block behind the chain and steady there, which is what deferred execution allows.
+- A member's twenty-eight cores at 225: 17.4 in use (tokio 9.2, rayon 4.9, storage 2.4), the same as at 275: the rate
+  went up 7% on the same CPU; the rest is waiting.
+
+**Checkpoint, 2026-09-22, tag `fleet4-plan-v4-20260922`.** Seven nodes: 429-443k (16 cores each, the CPU budget). Four
+nodes: 556-589k at 28 cores each, pacing 225, quorum 3 of 4. Every step of this plan is merged, opt-in; the chain,
+body-once and async-forkchoice flags are the configuration; the compact body is in the tree and off.
+
+**Next.** The follower's import is a block behind and its execution is 131-136 ms for 163,000 transfers where the
+builder's parallel step is 72 ms of execution in a 213 ms `par` phase: plan step 3's other half, the follower's
+grafted execution (partition 31, groups 54-59, merge 9 of the 133 -- and ~40 ms outside the phases). Then the sender
+look-ups (34 ms a block, on every follower, for transactions the ingest already recovered -- the compact body's one
+part worth keeping on its own). Then jemalloc's background thread (1.9 cores a member at seven nodes).
+
 ## 3. What not to do
 
 - Do not judge a cycle-shortening change at a pacing above the natural cycle; do not judge any change without R1.

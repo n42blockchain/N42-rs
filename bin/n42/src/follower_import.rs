@@ -2144,8 +2144,12 @@ mod tests {
         let (block, _) = bench_fixture(4, 3, 16, 1);
         let txs: Vec<TransactionSigned> = block.body().transactions.clone();
         let senders: Vec<Address> = block.senders().to_vec();
-        let queue =
-            n42_tx_queue::TxQueue::<n42_engine_types::N42PooledTransaction>::with_run_length(4).with_hash_index(64);
+        // The index's bound is per shard (`cap / HASH_INDEX_SHARDS`, at least
+        // one): at 64 the shards hold one entry each and the fixture's random
+        // hashes evict one another as they collide, and the test passed or
+        // failed by the draw. Bounded well above a shard a hash.
+        let queue = n42_tx_queue::TxQueue::<n42_engine_types::N42PooledTransaction>::with_run_length(4)
+            .with_hash_index(1 << 16);
         // All but the last, so the block holds one transaction this node
         // never saw -- the ingest a few milliseconds behind the leader.
         let last = txs.len() - 1;

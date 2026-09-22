@@ -119,25 +119,50 @@ struct Parked {
 /// re-offered to every build.
 const PARK_BUILDS: u64 = 8;
 
-/// How many lanes may be parked at once; 0 turns the cap off.
+/// How many lanes may be parked at once. **0, the default, is no parking at
+/// all**; a positive value turns it on with that many lanes as the bound.
 /// `N42_TX_QUEUE_PARK_LANES`.
 ///
-/// A park is a guess, and a guess must not be able to take the node's whole
-/// supply out. On loop210 one build a leg did exactly that -- 384 lanes and
-/// 631,212 transactions in Pb, 375,456 in Pd -- and the four blocks that
-/// followed carried 8,500 to 65,828 transactions instead of 163,000. The
-/// builder's guard (`crates/n42/engine-types/src/payload.rs`) is what stops
-/// that build from asking; this is the bound that holds whatever any caller
-/// asks for, and it is counted in lanes because that is the one thing a
-/// park knows reliably at the moment it is made -- the lane's own depth is
-/// whatever the build in flight has not taken out of it yet.
+/// Parking is off because a parked lane is a sink. Nothing drains it -- that
+/// is the point -- but the generator keeps feeding its sender at full rate,
+/// `insert_valid` keeps adding to it, and [`TxQueue::gate_len`] leaves it
+/// out, so the ingest never pushes back on it either. loop211 Pd node1 held
+/// its parked lanes at exactly the 64 the cap allows and watched them grow
+/// from 1,434 transactions each to 5,505 over fourteen blocks -- 91,764 to
+/// 355,700 in all, with `usable` falling 322,574 -> 10,132 in step. The node
+/// then built 55 empty blocks over a queue of 370,000 and lost both windows
+/// (407k, then 75k at 24% occupancy); Pe lost window 3 the same way
+/// (parked 561,429). The two legs of that round that never parked at all,
+/// Pa and Pb, were the cleanest of the campaign at 625-630k on both windows.
 ///
-/// Sixty-four is generous for a hole, which is a handful of senders, and at
-/// the bench tier holds the parked depth under one block.
+/// A cap in lanes cannot fix that: it bounds how many sinks there are, not
+/// how large each one grows, and the lane's own depth is not knowable when
+/// the park is made -- whatever the build in flight has not taken out of it
+/// yet is not there to count.
+///
+/// Nor could a guard on the builder's side have bounded it. A park is asked
+/// for by `QueueBest::mark_invalid`, which is the ordinary refusal path:
+/// the serial loop reports every `NonceTooHigh` it meets
+/// (`payload.rs`, one per transaction), so the three guards on the
+/// builder's *diagnosis* never applied to it. On loop211 Pd node1 those
+/// guards worked -- the "most of the senders a build was offered looked
+/// gapped" warning fired and the diagnosis reported nothing -- while 43,229
+/// parks were asked for in the same second by the serial loop alone.
+///
+/// So the machinery stays, off. What a hole actually needed is the
+/// stale-head diagnosis beside it, which drops a head the chain has passed
+/// so the lane is usable at the next build and the early seal recovers, and
+/// which does not depend on parking; and within a build a refused sender is
+/// already skipped for the rest of it (`QueueBest::skipped`). What
+/// parking added was persistence across builds, and that is what turned a
+/// per-build cost into a node-wide outage. Turning it on again wants a
+/// different rule -- a lane parked only after the same head has been
+/// reported gapped by several consecutive builds, and drained or bounded
+/// while it is parked -- and a leg that shows the cost it saves.
 fn park_lane_cap() -> usize {
     static LANES: OnceLock<usize> = OnceLock::new();
     *LANES.get_or_init(|| {
-        std::env::var("N42_TX_QUEUE_PARK_LANES").ok().and_then(|v| v.parse().ok()).unwrap_or(64)
+        std::env::var("N42_TX_QUEUE_PARK_LANES").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
     })
 }
 
@@ -387,8 +412,12 @@ struct Inner<T: PoolTransaction> {
     drops: DropReport,
     /// Parks refused by the cap since the process started; on the prune
     /// line, because a cap that keeps firing means something is asking for
-    /// far more parking than a hole would explain.
+    /// far more parking than a hole would explain. With parking off it
+    /// counts every park that was asked for, which is the same reading.
     park_capped: u64,
+    /// How many lanes this queue may park at once; 0 is no parking.
+    /// [`park_lane_cap`] unless a test said otherwise.
+    park_lanes: usize,
     /// The sender a build is taking a run from, and how much of the run is
     /// left. See [`run_length`].
     current: Option<(Address, usize)>,
@@ -663,6 +692,15 @@ impl<T: PoolTransaction> TxQueue<T> {
         self
     }
 
+    /// The same queue parking at most `lanes` lanes behind a hole; 0 is no
+    /// parking, which is the default ([`park_lane_cap`]). What a test uses
+    /// to choose the path without the process environment deciding for it.
+    #[must_use]
+    pub fn with_park_lanes(self, lanes: usize) -> Self {
+        self.inner.lock().park_lanes = lanes;
+        self
+    }
+
     /// Whether this queue keeps a by-hash index.
     pub const fn has_hash_index(&self) -> bool {
         self.by_hash.is_some()
@@ -748,6 +786,7 @@ impl<T: PoolTransaction> TxQueue<T> {
                 parked_len: 0,
                 drops: DropReport::default(),
                 park_capped: 0,
+                park_lanes: park_lane_cap(),
                 current: None,
                 run: run.max(1),
                 builds: 0,
@@ -1361,11 +1400,10 @@ impl<T: PoolTransaction> Inner<T> {
         let fresh = lane.parked.is_none();
         let held = lane.by_nonce.len();
         if fresh {
-            // The cap: past it the lane is not parked at all. It stays in
-            // the order and a build pays one refusal for its head, which is
-            // what it did before parks existed.
-            let cap = park_lane_cap();
-            if cap > 0 && self.parked_order.len() >= cap {
+            // Off, or past the cap: the lane is not parked. It stays in the
+            // order and a build pays one refusal for its head, which is what
+            // it did before parks existed.
+            if self.park_lanes == 0 || self.parked_order.len() >= self.park_lanes {
                 self.park_capped = self.park_capped.saturating_add(1);
                 return;
             }
@@ -1455,12 +1493,18 @@ impl<T: PoolTransaction> Inner<T> {
         let dropped = lane.by_nonce.len();
         self.len -= dropped;
         lane.by_nonce = keep;
+        // What left the lane leaves the parked total first, whatever
+        // happens to the park itself: `unpark` subtracts what the lane
+        // *still* holds, so a park ended in the same breath as a prune
+        // used to leave the pruned part counted for ever (loop212 NPb:
+        // `parked=640 parked_lanes=0`).
+        if parked {
+            self.parked_len = self.parked_len.saturating_sub(dropped);
+        }
         // A now-empty lane leaves the arrival order when its turn comes.
         if ends_park {
             self.unpark(sender);
             self.requeue(sender);
-        } else if parked {
-            self.parked_len = self.parked_len.saturating_sub(dropped);
         }
     }
 
@@ -2121,7 +2165,7 @@ mod tests {
     /// finds the nonces it can actually mine.
     #[test]
     fn a_build_steps_over_lanes_parked_behind_a_hole_and_finds_the_next_nonces() {
-        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(4);
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(4).with_park_lanes(64);
         // Senders 1..=4 are gapped: the chain has them at nonce 0 and the
         // queue's lowest nonce for each is 5. Senders 5..=40 are whole --
         // a minority gapped, which is the shape a hole takes and the shape
@@ -2270,7 +2314,7 @@ mod tests {
     /// incrementally, so nothing but a test can say it is right.
     #[test]
     fn the_parked_total_matches_the_walk_through_every_door() {
-        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(4);
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(4).with_park_lanes(64);
         let check = |queue: &TxQueue<EthPooledTransaction>, what: &str| {
             let inner = queue.inner.lock();
             let (_, walked) = inner.parked_walked();
@@ -2296,9 +2340,18 @@ mod tests {
         queue.push(vec![tx(2, 0)]);
         queue.drain_now();
         check(&queue, "after the hole was filled");
-        // The chain passing another lane's hole.
-        queue.remove_mined(Address::repeat_byte(3), 4);
+        // The chain passing another lane's hole, with part of that lane at
+        // or below the nonce it passed: the prune and the unpark happen in
+        // one call and both have to be accounted for.
+        queue.push(vec![tx(3, 2), tx(3, 3)]);
+        queue.drain_now();
+        check(&queue, "after an arrival below a parked lane's hole");
+        queue.remove_mined(Address::repeat_byte(3), 6);
         check(&queue, "after the chain passed a hole");
+        assert_eq!(queue.parked().1, {
+            let inner = queue.inner.lock();
+            inner.parked_walked().1
+        });
         // An own block taking part of a parked lane out.
         queue.push(vec![tx(1, 0), tx(1, 1)]);
         queue.drain_now();
@@ -2319,7 +2372,7 @@ mod tests {
     /// it parked, and fifteen seconds of empty blocks).
     #[test]
     fn the_gates_depth_leaves_out_the_parked_lanes() {
-        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(4);
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(4).with_park_lanes(64);
         let mut all = Vec::new();
         for s in 1..=3u8 {
             all.extend((5..15).map(|n| tx(s, n)));
@@ -2343,6 +2396,65 @@ mod tests {
         assert!(!queue.is_empty(), "the queue still holds them");
     }
 
+    /// Parking is off unless a caller asks for it: a build reporting a hole
+    /// costs one refusal and the lane keeps its turn, which is what the
+    /// queue did before parks existed.
+    #[test]
+    fn parking_is_off_by_default() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(4);
+        queue.push((5..15).map(|n| tx(1, n)).collect::<Vec<_>>());
+        build_refusing_gaps(&queue, B256::repeat_byte(1), &|_| 0);
+        assert_eq!(queue.parked(), (0, 0, 1), "a lane was parked with parking off");
+        // And the lane is still walked, head and all.
+        let mut best = queue.best_for_build(B256::repeat_byte(2));
+        let offered: Vec<u64> = std::iter::from_fn(|| best.next()).map(|t| t.nonce()).collect();
+        drop(best);
+        assert_eq!(offered.first().copied(), Some(5));
+        assert_eq!(offered.len(), 10);
+    }
+
+    /// Why parking is off: a parked lane is a sink, and the cap bounds how
+    /// many sinks there are rather than how large each one grows.
+    ///
+    /// This is loop211 Pd node1 in miniature. Its parked lanes sat at
+    /// exactly the 64 the cap allows while what they held went from 1,434
+    /// transactions each to 5,505 over fourteen blocks -- 91,764 to 355,700
+    /// -- because the generator keeps feeding a gapped sender at full rate,
+    /// nothing drains a parked lane, and `gate_len` leaves it out, so the
+    /// ingest never pushes back either. `usable` fell 322,574 -> 10,132 in
+    /// step and the node built 55 empty blocks over a queue of 370,000.
+    #[test]
+    fn a_parked_lane_grows_without_bound_while_the_cap_holds() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(4).with_park_lanes(2);
+        // Two gapped senders and enough whole ones that a build has work.
+        let mut all = Vec::new();
+        for s in 1..=2u8 {
+            all.extend((5..9).map(|n| tx(s, n)));
+        }
+        for s in 3..=20u8 {
+            all.extend((0..4).map(|n| tx(s, n)));
+        }
+        queue.push(all);
+        build_refusing_gaps(&queue, B256::repeat_byte(1), &|_| 0);
+        assert_eq!(queue.parked().0, 2, "the two gapped lanes did not park");
+        let after_park = queue.parked().1;
+
+        // The generator goes on feeding those two senders; nothing drains
+        // them, and the gate is not told about them.
+        for round in 0..8u64 {
+            queue.push((0..2u8).flat_map(|s| (20 + round * 10..30 + round * 10).map(move |n| tx(s + 1, n))).collect::<Vec<_>>());
+            queue.drain_now();
+        }
+        let grown = queue.parked().1;
+        assert!(grown > after_park + 100, "the sink did not grow: {after_park} -> {grown}");
+        assert_eq!(queue.parked().0, 2, "the cap moved");
+        assert_eq!(
+            queue.len() - queue.gate_len(),
+            grown,
+            "the ingest gate was told nothing about what the sinks hold"
+        );
+    }
+
     /// No build can park more than the cap's worth of lanes, whatever it
     /// reports.
     ///
@@ -2353,8 +2465,9 @@ mod tests {
     /// again.
     #[test]
     fn no_build_parks_more_lanes_than_the_cap() {
-        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(4);
-        let lanes = park_lane_cap() + 40;
+        const CAP: usize = 64;
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(4).with_park_lanes(CAP);
+        let lanes = CAP + 40;
         let mut all = Vec::new();
         for s in 0..lanes {
             let mut a = [0u8; 20];
@@ -2365,7 +2478,7 @@ mod tests {
         // Every lane gapped, which is what a build on a parent the chain has
         // moved past reports.
         build_refusing_gaps(&queue, B256::repeat_byte(1), &|_| 0);
-        assert_eq!(queue.parked().0, park_lane_cap(), "the cap did not hold");
+        assert_eq!(queue.parked().0, CAP, "the cap did not hold");
         assert!(queue.parked().2 >= 40, "the refused parks were not counted");
         // The lanes the cap refused are still walked, so the node is not
         // left with nothing to build from.
@@ -2381,7 +2494,7 @@ mod tests {
     /// stranded lane.
     #[test]
     fn a_park_expires_so_no_lane_is_stranded() {
-        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(4);
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(4).with_park_lanes(64);
         queue.push((5..10).map(|n| tx(1, n)).collect::<Vec<_>>());
         build_refusing_gaps(&queue, B256::repeat_byte(1), &|_| 0);
         assert_eq!(queue.usable(), 0);
@@ -2401,7 +2514,7 @@ mod tests {
     /// from the nonce that was missing.
     #[test]
     fn a_parked_lane_comes_back_when_the_hole_is_filled() {
-        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(4);
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(4).with_park_lanes(64);
         queue.push((5..10).map(|n| tx(1, n)).collect::<Vec<_>>());
         build_refusing_gaps(&queue, B256::repeat_byte(1), &|_| 0);
         assert_eq!(queue.usable(), 0);
@@ -2421,7 +2534,7 @@ mod tests {
     /// the missing nonces, and what is left in the lane is next.
     #[test]
     fn a_parked_lane_comes_back_when_the_chain_passes_the_hole() {
-        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(4);
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(4).with_park_lanes(64);
         queue.push((5..10).map(|n| tx(1, n)).collect::<Vec<_>>());
         build_refusing_gaps(&queue, B256::repeat_byte(1), &|_| 0);
         assert_eq!(queue.usable(), 0);

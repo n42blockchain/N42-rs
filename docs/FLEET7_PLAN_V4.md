@@ -867,6 +867,26 @@ Four nodes, E2 at 225; P = the default, O = `N42_FOLLOWER_EXEC_ON_PARENT_OUTPUT=
   through the vote road's `fields_ms` (root 635 on view 442 -> fields 440-512 on 443) is real, two-block, and recovers.
   loop208 runs P four more times with `root_wait_ms` on the line.
 
+## 2x. The follower is fixed; the leader is the bar (loop208)
+
+Four more P legs (E2 at 225, the import pipelined, `root_wait_ms` on the line):
+
+| | Pa | Pb | Pc | Pd |
+| --- | --- | --- | --- | --- |
+| window 1 | 630k | 641k | 625k | 642k |
+| window 2 | **630k** | 489k | **619k** | 391k |
+| import total / engine wait / root wait | 177 / 0 / 0 | 188 / 0 / 0 | 188 / 0 / 0 | 185 / 0 / 0 |
+| root p50 / p90 | 29 / 60 | 30 / 65 | 30 / 65 | 30 / 65 |
+| `seal-first build phases` of ~850 blocks | 520 | 499 | 641 | 532 |
+
+- **The follower's import is done as a bound**: 177-188 ms with no engine wait and no root wait, on every leg, and the
+  cycle/import trace shows the import flat at 0.16-0.25 s through every collapse. Over seven P legs (loop207-208)
+  window 1 reads 625-642k, and window 2 holds at 614-630k in four and collapses in three.
+- **Every collapse is now the leader's**: the cycle steps to 0.40-0.77 s with the import at 0.14-0.15 (Pd t+90, Pa
+  t+135, Pb t+105), and only 60-75% of a leg's builds early-seal (499-641 of ~850) -- section 2w's defect 13 is not
+  rare, it is most tenures at some point. `plan-v4/leader-early-seal` is the work; window 2 >= 600k in every leg is the
+  bar it has to meet.
+
 ## 3. What not to do
 
 - Do not judge a cycle-shortening change at a pacing above the natural cycle; do not judge any change without R1.

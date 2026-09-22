@@ -854,9 +854,10 @@ Four nodes, E2 at 225; P = the default, O = `N42_FOLLOWER_EXEC_ON_PARENT_OUTPUT=
   execution runs beside the vote on nearly every block, the import is 190-211 ms with 50-60 ms of slack under the
   cycle, and the gate never queued (`gate_ms` 0). Two of three P legs held window 2 at 614-630k, the best yet; the
   warm-up read 630k as well.
-- **The checkpoint's cost did not grow on the uncongested box** (12-17 ms throughout; its bytes still 10.7-12.6 MB by
-  the end): the 5 -> 169 ms of loop206 was that work under the congestion, a symptom. The root's p90 tails (57-113)
-  remain and are the entry the analysis named; `plan-v4/qmdb-checkpoint` is on what accumulates in the bytes.
+- The checkpoint's cost grows less on the uncongested box (first-quarter median 4-5 ms, last-quarter 35-91 in all 24
+  logs, against 169 under loop206's congestion -- the runner's own first/last-quarter counter misread it as flat). The
+  root's p90 tails (57-113) remain and are the entry the analysis named; `plan-v4/qmdb-checkpoint` went to what
+  accumulates in the bytes (section 2y).
 - **Pb and Ob lost their windows to a third defect, on the leader (defect 13).** In each, the node leading one
   64-view tenure lost the seal-first build path for the whole tenure (1 and 0 `seal-first build phases` of 62 builds,
   against 61-62 in every other tenure of the five legs): with a full pool it proposed late (Pb node3, views 448-511:
@@ -886,6 +887,27 @@ Four more P legs (E2 at 225, the import pipelined, `root_wait_ms` on the line):
   t+135, Pb t+105), and only 60-75% of a leg's builds early-seal (499-641 of ~850) -- section 2w's defect 13 is not
   rare, it is most tenures at some point. `plan-v4/leader-early-seal` is the work; window 2 >= 600k in every leg is the
   bar it has to meet.
+
+## 2y. The checkpoint is the active-bit set; its replay was keccak; the root tail is not the checkpoint
+
+`plan-v4/qmdb-checkpoint` (merged): the QMDB checkpoint is exactly one bit per slot the tree has ever appended
+(`ForestCheckpoint.active`, `next_slot/8 + 52` bytes: 18,750 B a block for 150,000 touched accounts, 61,940 B at block
+101 -> 9.2 MB at block 584 on the fleet and 18,750 B a block exactly on the bench). QMDB appends only, so it grows with
+the chain by construction, cannot be bounded without recycling slots -- which changes every root -- and compresses 9%
+(78% of the words of a 29M-slot checkpoint are non-zero). Its cost was not the write (0 ms) but the replay of the
+sealed delta-log segment behind it, as long as the checkpoint itself, with a keccak256 over every record: the
+per-record tear digest is a CRC-32 now (either digest accepted on read, so an older datadir still replays; a downgrade
+would see the new log as torn). Bench (`checkpoint_growth.rs`, reproducing the fleet to the megabyte and millisecond):
+compaction at 13.3 MB 45-48 -> 28-30 ms (replay 36 -> 9), 3.2 s -> 1.8 s a leg; root unchanged at ~52. The
+`compacted the QMDB log` line carries `replay_ms encode_ms write_ms sync_ms`.
+
+**The root tail is not the checkpoint.** The compaction takes no forest lock and runs on its own thread; 0 of 124 root
+tails in loop206 and 13 of 643 (2%) in loop207 overlapped a compaction, fewer than ordinary imports do; root p50
+tracking the checkpoint's ms over a leg was common cause (both grow with the leg). Two leads left for the import, both
+unverified: `FileEntries::seal_tail` maps 256 MB with `MAP_POPULATE` under the forest lock inside the root job once per
+~43 blocks (39.6 B an entry); and root tails land on the same block numbers on different nodes (loop206 E2 nodes 2 and
+3 at 532, 557, 577, 608, 622) -- a property of the block, not of a node's background work. With the follower no longer
+the bound (2x), neither is chased before defect 13.
 
 ## 3. What not to do
 

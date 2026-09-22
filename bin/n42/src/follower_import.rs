@@ -124,24 +124,32 @@ fn check_on_parent_output() -> bool {
     *ON.get_or_init(|| std::env::var("N42_CHECK_ON_PARENT_OUTPUT").map_or(true, |v| v != "0"))
 }
 
-/// `N42_FOLLOWER_EXEC_ON_PARENT_OUTPUT=1`: the block is *executed* on the
-/// parent's published output as well -- the parent's bundle laid over the
-/// chain's state at the grandparent -- instead of waiting for the parent to
-/// land in the engine's tree. The follower-side twin of the leader's
-/// `opener_on_built_parent` (plan v4 step 2: the parent's engine insert was
-/// 38 ms of a 287 ms R1 vote collection, loop179, and N+1's execution waited
-/// for it on top).
+/// The block is *executed* on the parent's published output as well -- the
+/// parent's bundle, and under a backlog its own parent's bundle too, laid over
+/// the chain's state at the nearest ancestor the engine holds -- instead of
+/// waiting for the parent to land in the engine's tree. On by default;
+/// `N42_FOLLOWER_EXEC_ON_PARENT_OUTPUT=0` turns it off. The follower-side twin
+/// of the leader's `opener_on_built_parent` (plan v4 step 2).
 ///
 /// It reads the same published output as [`check_on_parent_output`], so it
 /// implies that path; with it on and that flag set to 0 the check still runs
 /// on the output, because the parent whose state it would otherwise read is by
-/// construction not in the tree. Off by default, and it stays off: loop183
-/// measured a 0-1 ms median overlap of its two roads at a 275 ms pacing (the
-/// parent's fields are filed before the child's check passes), so it has
-/// nothing to gain until the cycle is shorter.
+/// construction not in the tree.
+///
+/// Why it is on now, having been dropped at seven nodes (section 2h): there
+/// was nothing to gain then -- loop183 measured a 0-1 ms median overlap of its
+/// two roads, because at a 275 ms pacing the parent's fields were filed before
+/// the child's check passed. At four nodes and a 225 ms pacing the wait it
+/// removes is the import's largest unnamed term: `total_ms` minus every named
+/// field is 10-14 ms when the chain has slack and 125-190 ms once the import
+/// exceeds the cycle, and it is that wait, not the execution, that makes the
+/// imports stack up (with two or more in flight the execution itself inflates
+/// from 79-83 to 116-149 ms, because their worker pools collide). The wait is
+/// named now ([`import_foreign_block`]'s `parent_engine_wait_ms`), so a leg
+/// says what this path is worth instead of leaving it in the gap.
 fn exec_on_parent_output() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_EXEC_ON_PARENT_OUTPUT").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_EXEC_ON_PARENT_OUTPUT").map_or(true, |v| v != "0"))
 }
 
 /// Whether an import publishes its execution output for its child at all.
@@ -299,6 +307,32 @@ fn account_after_parent(bundle: &reth_revm::db::BundleState, sender: &Address) -
     })
 }
 
+/// The parent's post-state as the includability check reads it while the
+/// parent is not in the engine: the bundles this node published for the
+/// parent and, under a backlog, for its ancestors, newest first, over the
+/// nearest ancestor the engine does hold.
+///
+/// Newest first because the newest bundle that touched an account is that
+/// account's state -- the same rule reth's `MemoryOverlayStateProvider`
+/// applies to the same bundles on the execution side, and the reason the two
+/// agree by construction.
+#[derive(Debug, Clone, Copy)]
+struct ParentBundles<'a> {
+    /// The parent's bundle first, then its parent's, ...
+    stack: &'a [&'a reth_revm::db::BundleState],
+    /// The nearest ancestor in the engine: where a read that none of the
+    /// bundles answers goes.
+    anchor: B256,
+}
+
+impl ParentBundles<'_> {
+    /// A sender's account after the newest bundle that touched it, or `None`
+    /// when none did -- in which case the ancestor's state has it unchanged.
+    fn account(&self, sender: &Address) -> Option<reth_primitives_traits::Account> {
+        self.stack.iter().find_map(|bundle| account_after_parent(bundle, sender))
+    }
+}
+
 /// How long a check waits for the block's parent to land before giving the
 /// block up to the engine's ordinary path (which answers SYNCING).
 const PARENT_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
@@ -450,7 +484,7 @@ struct SenderTotal {
 fn check_includable<Provider>(
     provider: &Provider,
     parent_hash: B256,
-    parent_output: Option<(&reth_revm::db::BundleState, B256)>,
+    parent_output: Option<ParentBundles<'_>>,
     block: &RecoveredBlock<Block>,
     chain_id: u64,
     spec: reth_revm::primitives::hardfork::SpecId,
@@ -640,7 +674,7 @@ fn fold_runs(scans: Vec<ChunkScan>) -> Vec<(Address, SenderTotal)> {
 fn check_senders<Provider>(
     provider: &Provider,
     parent_hash: B256,
-    parent_output: Option<(&reth_revm::db::BundleState, B256)>,
+    parent_output: Option<ParentBundles<'_>>,
     senders: &[(Address, SenderTotal)],
 ) -> Result<(), String>
 where
@@ -653,14 +687,14 @@ where
     let faults: Vec<Result<Option<Fault>, String>> = senders
         .par_chunks(chunk)
         .map(|chunk| {
-            // With the parent's output, an untouched sender is read at the
-            // grandparent, which is in the engine: the parent's own execution
-            // read its state there.
-            let state_at = parent_output.map_or(parent_hash, |(_, grandparent)| grandparent);
+            // With the parent's output, a sender none of the published
+            // bundles touched is read at the nearest ancestor the engine
+            // holds: the oldest of those executions read its state there.
+            let state_at = parent_output.map_or(parent_hash, |bundles| bundles.anchor);
             let state = provider.state_by_block_hash(state_at).map_err(|err| format!("parent state: {err}"))?;
             let mut first: Option<Fault> = None;
             for (sender, total) in chunk {
-                let after_parent = parent_output.and_then(|(bundle, _)| account_after_parent(bundle, sender));
+                let after_parent = parent_output.and_then(|bundles| bundles.account(sender));
                 let account = match after_parent {
                     Some(account) => account,
                     None => state
@@ -716,59 +750,150 @@ where
     first.map_or(Ok(()), |fault| Err(fault.message))
 }
 
-/// The parent as an executed block this import reads its post-state from
-/// (`N42_FOLLOWER_EXEC_ON_PARENT_OUTPUT`), or `None` -- with the reason -- to
-/// wait for the parent in the engine as before.
+/// Says a path was not taken and why, once per import and counted: a leg that
+/// reads medians cannot see a path that quietly never runs. The message is the
+/// one the runners count (`exec_on_output_declined`).
+fn decline_on_output(number: u64, why: &'static str) {
+    static DECLINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let declined = DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    tracing::info!(target: "n42.follower_import", number, why, declined, "not executing on the parent's output; waiting for the parent in the engine");
+}
+
+/// The published output of a block imported here, if it is still kept.
+fn published_output(hash: B256) -> Option<(reth_primitives_traits::SealedHeader, ParentOutput)> {
+    PARENT_OUTPUTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .find(|(kept, _, _)| *kept == hash)
+        .map(|(_, header, output)| (header.clone(), Arc::clone(output)))
+}
+
+/// The parent's post-state while the parent is not in the engine: the outputs
+/// this node published for the parent and, under a backlog, for its ancestors,
+/// newest first, over the nearest ancestor the engine does hold.
 ///
-/// Depth one: everything the parent did not touch is read from the chain's
-/// state at the grandparent, so the grandparent must be in -- known to the
-/// provider and executed here. Two published outputs stacked would need the
-/// grandparent's bundle in the overlay too, and a follower two blocks behind
-/// the chain has a larger problem than the parent's engine insert.
+/// One block deep is the ordinary case -- the parent executed here a moment
+/// ago and its engine insert has not run. Deeper is the congested case, and it
+/// is exactly the case the wait was worst in: with the import over the cycle,
+/// block N+1 waited for N's root, hashed state and engine insert before it
+/// could open a state provider at all, and the waits stacked
+/// ([`exec_on_parent_output`]). Stacking the outputs instead costs a hash
+/// look-up per bundle on a read none of the newer ones answered.
+#[derive(Debug)]
+struct Ancestry {
+    /// The parent first, then its parent, ... -- the order reth's overlay
+    /// expects (`memory_overlay.rs`: "Expected order is newest to oldest") and
+    /// the order a read has to take them in.
+    outputs: Vec<(reth_primitives_traits::SealedHeader, ParentOutput)>,
+    /// The nearest ancestor in the engine, whose state a read none of the
+    /// bundles answers falls through to.
+    anchor: B256,
+}
+
+impl Ancestry {
+    /// The bundles, newest first, for the includability check.
+    fn bundles(&self) -> Vec<&reth_revm::db::BundleState> {
+        self.outputs.iter().map(|(_, output)| &output.state).collect()
+    }
+
+    /// The same outputs as executed blocks, newest first, for the overlay the
+    /// execution reads.
+    fn executed(&self) -> Vec<n42_engine_types::direct_build::ExecutedParent> {
+        self.outputs
+            .iter()
+            .map(|(header, output)| n42_engine_types::direct_build::executed_from_output(header, Arc::clone(output)))
+            .collect()
+    }
+}
+
+/// Walks back from the parent over the published outputs to the nearest
+/// ancestor the engine holds; `None` -- with the reason -- to read the parent
+/// in the engine instead, which means waiting for it.
 ///
-/// Sound with `N42_HASHED_TABLES=off`, where an import hands the engine an
-/// empty hashed post-state, because the overlay answers `basic_account` and
-/// `storage` from the executed block's *bundle*, not from its hashed state
-/// (reth v2.5.1 `crates/chain-state/src/memory_overlay.rs:114-124` and
-/// `:237-251`; `bytecode_by_hash` at `:253-262` likewise). The only reader of
-/// the hashed state through an overlay is reth's Merkle-Patricia pass
-/// (`trie_input`, `:52-63`, reached from `hashed_post_state` for an account
-/// this block destroyed) -- so while that pass is on, this path is not taken:
-/// the parent's hashed state is not published and the overlay's would be
-/// empty.
-fn overlay_parent<Provider>(
+/// At most [`PARENT_OUTPUTS_KEPT`] outputs, because that is how many are kept:
+/// a follower further behind than that will not catch up by stacking bundles,
+/// and the wait is the honest answer.
+fn ancestry_of<Provider>(
     provider: &Provider,
     parent: &reth_primitives_traits::SealedHeader,
     output: &ParentOutput,
     genesis: &alloy_genesis::Genesis,
     deferred: bool,
     number: u64,
-) -> Option<n42_engine_types::direct_build::ExecutedParent>
+) -> Option<Ancestry>
 where
     Provider: StateProviderFactory + HeaderProvider<Header = alloy_consensus::Header> + Sync,
 {
-    let decline = |why: &'static str| {
-        // Counted like the parallel execution's refusals: a leg that reads
-        // medians cannot see a path that quietly never runs.
-        static DECLINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let declined = DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        tracing::info!(target: "n42.follower_import", number, why, declined, "not executing on the parent's output; waiting for the parent in the engine");
-        None
-    };
+    let mut outputs = vec![(parent.clone(), Arc::clone(output))];
+    let mut anchor = parent.parent_hash;
+    loop {
+        match parent_in(provider, anchor, genesis, deferred) {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(err) => {
+                tracing::debug!(target: "n42.follower_import", number, %err, "looking for the ancestor the parent's output is laid over");
+                decline_on_output(number, "the provider could not answer for an ancestor");
+                return None;
+            }
+        }
+        if outputs.len() >= PARENT_OUTPUTS_KEPT {
+            decline_on_output(number, "more unimported ancestors than there are published outputs");
+            return None;
+        }
+        let Some((header, published)) = published_output(anchor) else {
+            decline_on_output(number, "an ancestor is neither in the engine nor published here");
+            return None;
+        };
+        anchor = header.parent_hash;
+        outputs.push((header, published));
+    }
+    // The fall-through state, opened once here so a state this node does not
+    // hold is this refusal rather than a failed import halfway through the
+    // block's senders.
+    if let Err(err) = provider.state_by_block_hash(anchor) {
+        tracing::debug!(target: "n42.follower_import", number, %err, "no state at the ancestor the outputs are laid over");
+        decline_on_output(number, "no state at the nearest ancestor in the engine");
+        return None;
+    }
+    Some(Ancestry { outputs, anchor })
+}
+
+/// The ancestry as the overlay the block's execution reads -- the ancestor's
+/// hash and the published outputs over it -- or `None`, with the reason, to
+/// wait for the parent in the engine.
+///
+/// Sound with `N42_HASHED_TABLES=off`, where an import hands the engine an
+/// empty hashed post-state, because the overlay answers `basic_account` and
+/// `storage` from each executed block's *bundle*, not from its hashed state
+/// (reth v2.5.1 `crates/chain-state/src/memory_overlay.rs:114-124` and
+/// `:237-251`; `bytecode_by_hash` at `:253-262` likewise), and takes the first
+/// answer -- which, with the outputs newest first, is the newest bundle that
+/// touched the account: the state the engine would have had. The only reader
+/// of the hashed state through an overlay is reth's Merkle-Patricia pass
+/// (`trie_input`, `:52-63`, reached from `hashed_post_state` for an account
+/// this block destroyed) -- so while that pass is on, this path is not taken:
+/// no published output carries a hashed state and the overlay's would be empty.
+fn overlay_parent(
+    ancestry: &Ancestry,
+    number: u64,
+) -> Option<(B256, Vec<n42_engine_types::direct_build::ExecutedParent>)> {
     if hashed_state_enabled() {
-        return decline("the hashed post-state pass is on and the parent's is not published");
+        // A setting, not a property of this block, so it is said once: with
+        // the pass on every block would otherwise print a refusal, and the
+        // count of refusals is meant to name the blocks that could not take
+        // the path.
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::info!(
+                target: "n42.follower_import",
+                number,
+                "not executing on the parent's output: the hashed post-state pass is on and no output carries one (N42_HASHED_TABLES=off is what this path needs)"
+            );
+        });
+        return None;
     }
-    let grandparent = parent.parent_hash;
-    if !matches!(parent_in(provider, grandparent, genesis, deferred), Ok(Some(_))) {
-        return decline("the grandparent is not imported here");
-    }
-    // The overlay's fallback, opened once here so a missing state is this
-    // fallback rather than a failed import.
-    if let Err(err) = provider.state_by_block_hash(grandparent) {
-        tracing::debug!(target: "n42.follower_import", number, %err, "no state at the grandparent");
-        return decline("no state at the grandparent");
-    }
-    Some(n42_engine_types::direct_build::executed_from_output(parent, Arc::clone(output)))
+    Some((ancestry.anchor, ancestry.executed()))
 }
 
 struct ImportStage(u64);
@@ -794,13 +919,14 @@ const CARRY_CAP: usize = 1_000_000;
 /// What a block's execution produced, so the execution can be run as one
 /// piece beside the vote road: the view of the parent's post-state it read
 /// (the hashed post-state pass still needs it), the read cache the carry is
-/// made from, the output, whether the worker pool took the block, and the two
-/// phase timings.
+/// made from, the output, whether the worker pool took the block, and the
+/// phase timings -- the wait for the execution gate among them.
 struct Executed {
     state: reth_provider::StateProviderBox,
     cached: CachedReads,
     output: reth_provider::BlockExecutionOutput<n42_tx_types::Receipt>,
     parallel: bool,
+    gate_ms: u64,
     state_ms: u64,
     exec_ms: u64,
 }
@@ -984,9 +1110,11 @@ fn queue_for_senders() -> Option<n42_tx_queue::TxQueue<n42_engine_types::N42Pool
 }
 
 /// Executes and checks `sealed` on its parent's state. See the module docs.
-/// Returns the executed block and the phase timings in milliseconds:
-/// header checks, senders, execution, the post-execution checks, state root,
-/// hashed state; then the number of senders the recovery cache held.
+/// Returns the executed block and the phase timings in milliseconds: header
+/// checks, senders, execution, the post-execution checks, state root, hashed
+/// state; then the number of senders the recovery cache held, the parent-state
+/// lookup, the carry, the wait for the parent to be canonical in the engine,
+/// and the wait for the execution gate.
 ///
 /// Under deferred execution (a block stamped at or past the chain's
 /// `deferredExecutionTime`) the block is *checked* first -- its header's
@@ -1007,7 +1135,7 @@ pub fn import_foreign_block<Provider, Evm, ChainSpec>(
     chain_spec: &ChainSpec,
     mut checked: Option<tokio::sync::oneshot::Sender<()>>,
     road: VoteRoad,
-) -> Result<(Box<BuiltPayloadExecutedBlock<EthPrimitives>>, [u64; 9]), String>
+) -> Result<(Box<BuiltPayloadExecutedBlock<EthPrimitives>>, [u64; 11]), String>
 where
     Provider: StateProviderFactory + HeaderProvider<Header = alloy_consensus::Header> + Sync,
     Evm: ConfigureEvm<
@@ -1171,9 +1299,41 @@ where
     };
     phases.parent_wait_us = parent_at.elapsed().as_micros() as u64;
     let against_parent = || validate_against_parent(consensus, recovered.sealed_header(), &parent);
-    // Set on the exec-on-parent-output path: the parent as an executed block
-    // this import lays over the chain's state at the grandparent, and the
-    // instant the vote road and the execution started together.
+
+    // How long this import waited for its parent to be *canonical in the
+    // engine*, with its execution recorded. This was the one region of the
+    // import nothing timed: `total_ms` minus every named field read 10-14 ms
+    // with slack in the chain and 125-190 ms once the import passed the cycle,
+    // which is where the four-node collapse lived (plan v4, loop199-204). It
+    // is a sum because a block can wait in two places -- before its check when
+    // there is nothing published to read the parent's state through, and
+    // before its execution when that execution reads the engine's tree.
+    let mut parent_engine_wait_us = 0u64;
+
+    // The parent's post-state without the parent in the engine: what this node
+    // published for the parent and, under a backlog, for its ancestors, over
+    // the nearest ancestor the engine holds. `None` and both the check and the
+    // execution read the engine's state at the parent, which means waiting for
+    // it.
+    let ancestry = parent_output
+        .as_ref()
+        .and_then(|output| ancestry_of(provider, &parent, output, chain_spec.genesis(), deferred, number));
+    if parent_output.is_some() && ancestry.is_none() {
+        // Published, but with no ancestor to read through: the engine's state
+        // at the parent is the only one left, and the check below opens it.
+        let wait_at = std::time::Instant::now();
+        wait_for_parent(provider, parent_hash, chain_spec.genesis(), deferred)?;
+        parent_engine_wait_us += wait_at.elapsed().as_micros() as u64;
+    }
+    let stack = ancestry.as_ref().map(Ancestry::bundles);
+    let parent_state = match (&stack, &ancestry) {
+        (Some(stack), Some(ancestry)) => Some(ParentBundles { stack, anchor: ancestry.anchor }),
+        _ => None,
+    };
+
+    // Set on the exec-on-parent-output path: the ancestor whose state the
+    // published outputs are laid over and those outputs as executed blocks,
+    // and the instant the vote road and the execution started together.
     let mut executed_parent = None;
     let mut roads_at = None;
     if !deferred {
@@ -1191,13 +1351,13 @@ where
         // step 1: the parent's root and engine insert were 65 ms of a 287 ms
         // R1 vote collection, loop179).
         let check_at = std::time::Instant::now();
-        if parent_output.is_none() {
+        if parent_state.is_none() {
             against_parent()?;
         }
         check_includable(
             provider,
             parent_hash,
-            parent_output.as_ref().map(|output| (&output.state, parent.parent_hash)),
+            parent_state,
             &recovered,
             chain_spec.chain().id(),
             spec_for_intrinsic_gas(chain_spec, recovered.timestamp),
@@ -1208,16 +1368,17 @@ where
 
         // Where this block's execution will read the parent's post-state,
         // decided here because it decides whether that execution can run
-        // beside the rest of the vote road or has to follow it: the parent's
-        // published output laid over the chain's state at the grandparent
-        // (`N42_FOLLOWER_EXEC_ON_PARENT_OUTPUT`), or the engine's tree at the
-        // parent. The parent may have landed while this block was being
-        // checked, and the engine's tree is the cheaper state when it has it.
-        if let Some(output) = &parent_output
+        // beside the rest of the vote road or has to follow it: the published
+        // outputs laid over the chain's state at the nearest ancestor the
+        // engine holds (`N42_FOLLOWER_EXEC_ON_PARENT_OUTPUT`), or the engine's
+        // tree at the parent. The parent may have landed while this block was
+        // being checked, and the engine's tree is the cheaper state when it
+        // has it.
+        if let Some(ancestry) = &ancestry
             && exec_on_parent_output()
             && parent_in(provider, parent_hash, chain_spec.genesis(), deferred)?.is_none()
         {
-            executed_parent = overlay_parent(provider, &parent, output, chain_spec.genesis(), deferred, number);
+            executed_parent = overlay_parent(ancestry, number);
         }
 
         if executed_parent.is_none() {
@@ -1225,7 +1386,7 @@ where
             // for the parent in the engine anyway, so there is nothing for it
             // to run beside.
             let fields_at = std::time::Instant::now();
-            if parent_output.is_some() {
+            if parent_state.is_some() {
                 wait_for_parent_fields(parent_hash)?;
                 against_parent()?;
             }
@@ -1257,8 +1418,10 @@ where
     }
 
     // The parent in the engine, for a block whose execution reads it there.
-    if parent_output.is_some() && executed_parent.is_none() {
+    if parent_state.is_some() && executed_parent.is_none() {
+        let wait_at = std::time::Instant::now();
         wait_for_parent(provider, parent_hash, chain_spec.genesis(), deferred)?;
+        parent_engine_wait_us += wait_at.elapsed().as_micros() as u64;
     }
     drop(parent_output);
 
@@ -1266,6 +1429,14 @@ where
     // against the header. One piece, because on the exec-on-parent-output path
     // it runs on this thread while the vote road runs on another.
     let execute_block = || -> Result<Executed, String> {
+        // One block executes here at a time (see [`exec_gate`]). The gate is
+        // taken before the state is opened and released when this closure
+        // returns -- before the block's QMDB root, its hashed post-state and
+        // its engine insert, which are meant to run beside the next block's
+        // execution.
+        let gate_at = std::time::Instant::now();
+        let _gate = exec_gate();
+        let gate_ms = gate_at.elapsed().as_millis() as u64;
         let state_at = std::time::Instant::now();
         // One view of the parent's post-state per caller: the block's own
         // executor takes the first, each group of a parallel execution one of
@@ -1274,10 +1445,10 @@ where
         // execute half the block one block behind.
         let open_parent_state = || -> Result<reth_provider::StateProviderBox, String> {
             match &executed_parent {
-                Some(executed) => {
+                Some((anchor, executed)) => {
                     let historical = provider
-                        .state_by_block_hash(parent.parent_hash)
-                        .map_err(|err| format!("grandparent state: {err}"))?;
+                        .state_by_block_hash(*anchor)
+                        .map_err(|err| format!("the state the published outputs are laid over: {err}"))?;
                     Ok(n42_engine_types::direct_build::overlay_on_executed(historical, executed.clone()))
                 }
                 None => provider.state_by_block_hash(parent_hash).map_err(|err| format!("parent state: {err}")),
@@ -1360,9 +1531,9 @@ where
                 .execute(&recovered)
                 .map_err(|err| format!("execution: {err}"))?,
         };
-        Ok(Executed { state, cached, output, parallel, state_ms, exec_ms: executed_at.elapsed().as_millis() as u64 })
+        Ok(Executed { state, cached, output, parallel, gate_ms, state_ms, exec_ms: executed_at.elapsed().as_millis() as u64 })
     };
-    let Executed { state, mut cached, output, parallel: parallel_executed, state_ms, exec_ms } = match roads_at {
+    let Executed { state, mut cached, output, parallel: parallel_executed, gate_ms, state_ms, exec_ms } = match roads_at {
         None => execute_block()?,
         Some(roads_at) => {
             // References rather than the values: the vote road's closure is
@@ -1526,13 +1697,17 @@ where
     }
 
     // The engine takes an executed block on top of its parent, so the
-    // hand-offs must stay in chain order: a block executed on the parent's
-    // output, rather than on the engine's tree, waits here for the parent to
-    // land. By this point the parent landed long ago -- this block's own
-    // execution and root have run since -- and the wait is the invariant, not
-    // a cost.
+    // hand-offs must stay in chain order: a block executed on the published
+    // outputs, rather than on the engine's tree, waits here for the parent to
+    // land. This block's execution and root have run since the parent's, so in
+    // the ordinary case the parent landed long ago and this states the
+    // ordering rather than paying for it -- but it is timed into
+    // `parent_engine_wait_ms` all the same, because under a backlog it is
+    // where what the execution no longer waits for reappears.
     if executed_parent.is_some() {
+        let wait_at = std::time::Instant::now();
         wait_for_parent(provider, parent_hash, chain_spec.genesis(), deferred)?;
+        parent_engine_wait_us += wait_at.elapsed().as_micros() as u64;
     }
 
     // Before the deferred-execution fork the vote is this import's answer,
@@ -1548,7 +1723,19 @@ where
             hashed_state: Arc::new(hashed_state),
             trie_updates: Arc::new(TrieUpdates::default()),
         }),
-        [header_ms, senders_ms, exec_ms, checks_ms, root_ms, hashed_ms, cache_hits, state_ms, carry_ms],
+        [
+            header_ms,
+            senders_ms,
+            exec_ms,
+            checks_ms,
+            root_ms,
+            hashed_ms,
+            cache_hits,
+            state_ms,
+            carry_ms,
+            parent_engine_wait_us / 1000,
+            gate_ms,
+        ],
     ))
 }
 
@@ -1602,6 +1789,36 @@ fn hashed_state_enabled() -> bool {
     })
 }
 
+/// The gate that keeps one block executing here at a time (see [`exec_gate`]).
+static EXEC_GATE: Mutex<()> = Mutex::new(());
+
+/// Takes the execution gate; `N42_FOLLOWER_EXEC_GATE=0` runs without one.
+///
+/// **One, not two.** The imports of several blocks are in flight at once by
+/// design -- a block's road and check run while its parent executes, and its
+/// parent's root, hashed post-state and engine insert run while it executes --
+/// but their *executions* must not overlap, because they share one worker pool
+/// and collide on it. Bucketed by how many imports overlapped, a four-node leg
+/// read execution 79-83 ms, groups 52-55 and import total 140-156 with none
+/// overlapping, against execution 116-149, groups 74-108 and total 340-403
+/// with two or more (plan v4, loop199-204): the execution inflates 1.5-2.5x
+/// and the import passes the cycle, which is the collapse. Allowing two would
+/// be allowing exactly that.
+///
+/// The ordering is the publication's, not the gate's: a block cannot reach its
+/// execution before its parent's output is published, and that happens when
+/// the parent's execution ends. So on the ordinary path the gate is taken
+/// uncontended and `gate_ms` is 0; it is the paths that do not read a
+/// published output -- a block whose parent came in by the engine's own way,
+/// an import retried after a refusal -- that it holds back. A leg reads
+/// `gate_ms` on the `direct import` line and sees whether it ever waited.
+fn exec_gate() -> Option<std::sync::MutexGuard<'static, ()>> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var("N42_FOLLOWER_EXEC_GATE").map_or(true, |v| v != "0"));
+    // A thread that panicked under the gate poisoned nothing but `()`.
+    on.then(|| EXEC_GATE.lock().unwrap_or_else(|p| p.into_inner()))
+}
+
 /// Whether the carry is filled on the worker pool after the import returns
 /// (`N42_CARRY_ASYNC=1`) instead of on the path the validator's vote waits
 /// for. Nothing reads the carry until the next block, ~650 ms later.
@@ -1646,6 +1863,17 @@ mod parent_output_tests {
     use reth_revm::db::BundleState;
     use reth_revm::revm::state::AccountInfo;
 
+    /// [`PARENT_OUTPUTS`] is one process-wide queue of [`PARENT_OUTPUTS_KEPT`]
+    /// entries, and `cargo test` runs these in threads of one process: two
+    /// publishing tests at once would evict each other's parent. Every test
+    /// that publishes takes this first.
+    static PUBLISHING: Mutex<()> = Mutex::new(());
+
+    /// Holds [`PUBLISHING`] for the length of a test.
+    fn publishing() -> std::sync::MutexGuard<'static, ()> {
+        PUBLISHING.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// A sender the parent changed reads its post-state; one it destroyed
     /// reads empty; one it never touched is left to the grandparent's state.
     #[test]
@@ -1677,6 +1905,7 @@ mod parent_output_tests {
     /// header's execution fields, which needs that root, waits for it.
     #[test]
     fn the_output_is_published_before_the_root_and_only_the_fields_wait_for_it() {
+        let _one_at_a_time = publishing();
         let parent_hash = B256::with_last_byte(0x51);
         let sender = Address::with_last_byte(0x52);
         let bundle = BundleState::new(
@@ -1718,6 +1947,7 @@ mod parent_output_tests {
     /// waits for them beside it.
     #[test]
     fn the_execution_starts_before_the_parents_fields_exist() {
+        let _one_at_a_time = publishing();
         let parent_hash = B256::with_last_byte(0x61);
         let header = reth_primitives_traits::SealedHeader::seal_slow(alloy_consensus::Header::default());
         let output = Arc::new(reth_provider::BlockExecutionOutput {
@@ -1795,6 +2025,115 @@ mod parent_output_tests {
         assert_eq!(outcome, Err("header against parent: gas used mismatch".to_string()));
     }
 
+    /// The congested case the wait was worst in: neither the parent nor the
+    /// grandparent is in the engine, both published their output here, and the
+    /// block reads its senders through both, over the state at the
+    /// great-grandparent -- which is the one the walk anchors on.
+    #[test]
+    fn the_ancestry_stacks_the_published_outputs_down_to_the_ancestor_in_the_engine() {
+        let _one_at_a_time = publishing();
+        use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
+
+        let moved_by_both = Address::with_last_byte(0x81);
+        let moved_by_the_grandparent = Address::with_last_byte(0x82);
+        let untouched = Address::with_last_byte(0x83);
+
+        // The chain's state at the great-grandparent, the only block of the
+        // three the engine holds.
+        let provider = MockEthProvider::default();
+        provider.add_account(moved_by_both, ExtendedAccount::new(1, U256::from(100)));
+        provider.add_account(moved_by_the_grandparent, ExtendedAccount::new(5, U256::from(50)));
+        provider.add_account(untouched, ExtendedAccount::new(9, U256::from(9)));
+        let anchor = alloy_consensus::Header { number: 10, ..Default::default() };
+        let anchor = reth_primitives_traits::SealedHeader::seal_slow(anchor);
+        provider.add_header(anchor.hash(), anchor.header().clone());
+
+        let account = |nonce: u64, balance: u64| AccountInfo { nonce, balance: U256::from(balance), ..Default::default() };
+        let publish = |number: u64, parent: B256, changes: Vec<(Address, AccountInfo)>| {
+            let header = reth_primitives_traits::SealedHeader::seal_slow(alloy_consensus::Header {
+                number,
+                parent_hash: parent,
+                extra_data: number.to_be_bytes().to_vec().into(),
+                ..Default::default()
+            });
+            let bundle = BundleState::new(
+                changes.into_iter().map(|(address, info)| (address, None, Some(info), Default::default())),
+                Vec::<Vec<(Address, Option<Option<AccountInfo>>, Vec<(U256, U256)>)>>::new(),
+                Vec::new(),
+            );
+            let output = Arc::new(reth_provider::BlockExecutionOutput { result: Default::default(), state: bundle });
+            publish_parent_output(header.hash(), header.clone(), Arc::clone(&output));
+            (header, output)
+        };
+        let (grandparent, _) = publish(
+            11,
+            anchor.hash(),
+            vec![(moved_by_both, account(2, 90)), (moved_by_the_grandparent, account(6, 40))],
+        );
+        let (parent, parent_output) = publish(12, grandparent.hash(), vec![(moved_by_both, account(3, 80))]);
+
+        let genesis = alloy_genesis::Genesis::default();
+        let ancestry = ancestry_of(&provider, &parent, &parent_output, &genesis, true, 13)
+            .expect("the parent and the grandparent are published and the great-grandparent is in");
+        assert_eq!(ancestry.outputs.len(), 2, "both unimported blocks are in the stack");
+        assert_eq!(ancestry.anchor, anchor.hash(), "the walk stops at the block the engine holds");
+
+        let stack = ancestry.bundles();
+        let bundles = ParentBundles { stack: &stack, anchor: ancestry.anchor };
+        assert_eq!(
+            bundles.account(&moved_by_both).map(|a| (a.nonce, a.balance)),
+            Some((3, U256::from(80))),
+            "the newest bundle that touched the sender wins"
+        );
+        assert_eq!(
+            bundles.account(&moved_by_the_grandparent).map(|a| (a.nonce, a.balance)),
+            Some((6, U256::from(40))),
+            "a sender only the older block touched is read from it"
+        );
+        assert!(bundles.account(&untouched).is_none(), "a sender neither touched is left to the ancestor's state");
+        // And the same outputs, in the same order, are what the execution's
+        // overlay is built from.
+        let executed = ancestry.executed();
+        assert_eq!(executed.len(), 2);
+        assert_eq!(executed[0].recovered_block.hash(), parent.hash(), "newest first");
+        assert_eq!(executed[1].recovered_block.hash(), grandparent.hash());
+    }
+
+    /// Deeper than the published outputs go, the walk refuses and the block
+    /// waits for its parent in the engine: a follower that far behind does not
+    /// catch up by stacking bundles it does not have.
+    #[test]
+    fn an_ancestry_deeper_than_the_outputs_kept_is_refused() {
+        let _one_at_a_time = publishing();
+        use reth_provider::test_utils::MockEthProvider;
+
+        // A chain of headers none of which the provider knows, each published.
+        let provider = MockEthProvider::default();
+        let mut parent_hash = B256::with_last_byte(0x91);
+        let mut last = None;
+        for number in 1..=(PARENT_OUTPUTS_KEPT as u64 + 1) {
+            let header = reth_primitives_traits::SealedHeader::seal_slow(alloy_consensus::Header {
+                number,
+                parent_hash,
+                extra_data: b"deep".to_vec().into(),
+                ..Default::default()
+            });
+            let output = Arc::new(reth_provider::BlockExecutionOutput {
+                result: Default::default(),
+                state: BundleState::default(),
+            });
+            publish_parent_output(header.hash(), header.clone(), Arc::clone(&output));
+            parent_hash = header.hash();
+            last = Some((header, output));
+        }
+        let (parent, output) = last.expect("a chain was built");
+        let genesis = alloy_genesis::Genesis::default();
+        assert!(
+            ancestry_of(&provider, &parent, &output, &genesis, true, 99).is_none(),
+            "no ancestor in the engine within the outputs kept"
+        );
+    }
+
     /// A parent already in the engine that nothing published (one this node
     /// built, or one the engine imported by its own path) ends the wait at
     /// once instead of after [`PARENT_WAIT`] (loop156 C1).
@@ -1824,7 +2163,7 @@ mod tests {
     fn check_includable_oracle<Provider>(
         provider: &Provider,
         parent_hash: B256,
-        parent_output: Option<(&reth_revm::db::BundleState, B256)>,
+        parent_output: Option<ParentBundles<'_>>,
         block: &RecoveredBlock<Block>,
         chain_id: u64,
         spec: reth_revm::primitives::hardfork::SpecId,
@@ -1882,7 +2221,7 @@ mod tests {
     fn check_sender_groups<Provider>(
         provider: &Provider,
         parent_hash: B256,
-        parent_output: Option<(&reth_revm::db::BundleState, B256)>,
+        parent_output: Option<ParentBundles<'_>>,
         block: &RecoveredBlock<Block>,
         groups: &[(Address, Vec<usize>)],
         spec: reth_revm::primitives::hardfork::SpecId,
@@ -1902,10 +2241,10 @@ mod tests {
                 // With the parent's output, an untouched sender is read at the
                 // grandparent, which is in the engine: the parent's own execution
                 // read its state there.
-                let state_at = parent_output.map_or(parent_hash, |(_, grandparent)| grandparent);
+                let state_at = parent_output.map_or(parent_hash, |bundles| bundles.anchor);
                 let state = provider.state_by_block_hash(state_at).map_err(|err| format!("parent state: {err}"))?;
                 for (sender, indexes) in chunk {
-                    let after_parent = parent_output.and_then(|(bundle, _)| account_after_parent(bundle, sender));
+                    let after_parent = parent_output.and_then(|bundles| bundles.account(sender));
                     let account = match after_parent {
                         Some(account) => account,
                         None => state
@@ -2099,7 +2438,8 @@ mod tests {
             accounts.len(),
             std::mem::size_of::<TransactionSigned>(),
         );
-        for (name, output) in [("parent-output", Some((&parent, grandparent))), ("provider", None)] {
+        let stack = [&parent];
+        for (name, output) in [("parent-output", Some(ParentBundles { stack: &stack, anchor: grandparent })), ("provider", None)] {
             for round in 0..5 {
                 let group_at = std::time::Instant::now();
                 let groups = group_by_sender(&block, CHAIN_ID).expect("groups");
@@ -2532,8 +2872,15 @@ mod tests {
         let (block, accounts) = bench_fixture(8, 5, 64, 3);
         let empty = provider(&[]);
         let parent = bundle(&accounts);
-        check_includable(&empty, B256::random(), Some((&parent, B256::random())), &block, CHAIN_ID, SpecId::OSAKA)
-            .expect("includable on the parent's output");
+        check_includable(
+            &empty,
+            B256::random(),
+            Some(ParentBundles { stack: &[&parent], anchor: B256::random() }),
+            &block,
+            CHAIN_ID,
+            SpecId::OSAKA,
+        )
+        .expect("includable on the parent's output");
     }
 
     /// A transaction of another chain is refused, and by its index.
@@ -2785,7 +3132,7 @@ mod tests {
                 check_includable(state, hash, output, &case.block, CHAIN_ID, SpecId::OSAKA),
             )
         };
-        [read(None), read(Some((&parent, grandparent)))]
+        [read(None), read(Some(ParentBundles { stack: &[&parent], anchor: grandparent }))]
     }
 
     /// Every flaw, one at a time: the new check refuses the block for the

@@ -185,8 +185,9 @@ pub struct OwnBlockReuse {
 /// Executes and checks another node's block; see [`OwnBlockReuse::import_foreign`].
 /// Returns the executed block for the engine and the phase timings in
 /// milliseconds: header checks, senders, execution, post-execution checks,
-/// state root, hashed state, then the senders served from the cache and the
-/// parent-state lookup.
+/// state root, hashed state, then the senders served from the cache, the
+/// parent-state lookup, the carry, the wait for the parent to be canonical in
+/// the engine, and the wait for the execution gate.
 pub type ForeignImport = dyn Fn(
         SealedBlock<n42_tx_types::Block>,
         // The senders, when the caller already has them: the compact body
@@ -196,7 +197,7 @@ pub type ForeignImport = dyn Fn(
         Option<tokio::sync::oneshot::Sender<()>>,
         crate::follower_import::VoteRoad,
     ) -> Result<
-        (Box<reth_payload_primitives::BuiltPayloadExecutedBlock<n42_tx_types::N42Primitives>>, [u64; 9]),
+        (Box<reth_payload_primitives::BuiltPayloadExecutedBlock<n42_tx_types::N42Primitives>>, [u64; 11]),
         String,
     > + Send
     + Sync;
@@ -965,7 +966,7 @@ where
     // Another node's block: executed here and handed to the
     // engine as executed, when configured. Any failure logs
     // and leaves the block to the engine's own path.
-    let mut direct_ms: Option<[u64; 13]> = None;
+    let mut direct_ms: Option<[u64; 15]> = None;
     // The block's transaction hashes, known once the direct
     // import converted the payload: the prune below then
     // needs no keccak over the raw bytes.
@@ -1158,6 +1159,8 @@ where
                         phases[8],
                         mined_ms,
                         insert_at.elapsed().as_millis() as u64,
+                        phases[9],
+                        phases[10],
                     ]);
                 } else {
                     warn!(target: "n42.payload_serve", number, "direct import: the engine did not take the executed block; importing the ordinary way");
@@ -1204,6 +1207,8 @@ where
                 carry_ms = ms[10],
                 mined_ms = ms[11],
                 insert_ms = ms[12],
+                parent_engine_wait_ms = ms[13],
+                gate_ms = ms[14],
                 answered_ms = answered,
                 "direct import: answered before the engine's own pass"
             );
@@ -1354,6 +1359,8 @@ where
                     carry_ms = ms[10],
                     mined_ms = ms[11],
                     insert_ms = ms[12],
+                    parent_engine_wait_ms = ms[13],
+                    gate_ms = ms[14],
                     engine_ms = (started.elapsed().saturating_sub(decoded).as_millis() as u64).saturating_sub(ms[7]),
                     status = ?status.status,
                     "direct import: executed here, handed to the engine as executed"

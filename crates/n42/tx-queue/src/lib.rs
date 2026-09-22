@@ -66,7 +66,48 @@ struct Lane<T: PoolTransaction> {
     /// (round 44: 814,431 refusals on one node against 17,300 on a healthy
     /// one, and a leader's build at 3.4-4.1 s instead of 250 ms).
     mined: Option<u64>,
+    /// A build found a hole below this lane's head: the account is at
+    /// `Parked::wanted` and the lowest nonce here is above it, so nothing
+    /// in this lane can execute until the missing nonce arrives. See
+    /// [`Parked`].
+    parked: Option<Parked>,
 }
+
+/// A lane held out of the arrival order because a build found a hole below
+/// its head.
+///
+/// With the ingest going straight to the queue (`N42_TX_INGEST_DIRECT`) a
+/// missing nonce is not in the pool either, so a gapped lane's head is
+/// unusable for as long as the hole lasts -- and it is the lane's *lowest*
+/// nonce, which is what every build is offered first. On loop207 Ob node1
+/// that cost the whole tenure: `par_skipped` climbed 2,880 -> 163,000 over
+/// twenty blocks while the queue held 334-360k, and the leader proposed
+/// `txs=0` blocks for the last twenty views of its tenure with the builder
+/// refusing the same heads every build (`refused[6]` +3,971 a build).
+/// Stepping the lane over until the hole is filled leaves the build's
+/// candidate budget for lanes that can execute.
+///
+/// The park always expires ([`PARK_BUILDS`]), because a lane that is
+/// offered to nothing again is the stranded-lane defect of loop144, and a
+/// park is a guess about state the queue cannot see.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Parked {
+    /// The nonce the account is at, as the build that parked the lane read
+    /// it: the lane is usable again as soon as this nonce is queued or the
+    /// chain passes it.
+    wanted: u64,
+    /// The build counter this lane is offered again at, whatever the hole.
+    until_build: u64,
+}
+
+/// For how many builds a lane stays parked before it is offered again
+/// regardless.
+///
+/// Small enough that a park which was wrong -- the hole filled by a door
+/// this lane does not hear about -- costs one refusal every eight builds
+/// rather than a stranded lane, and large enough that a real hole is not
+/// re-offered to every build.
+const PARK_BUILDS: u64 = 8;
 
 impl<T: PoolTransaction> Lane<T> {
     /// Whether the chain has passed this nonce, so the lane must not hold it.
@@ -87,6 +128,38 @@ impl<T: PoolTransaction> Lane<T> {
     fn unmine(&mut self, nonce: u64) {
         if self.mined.is_some_and(|mined| mined >= nonce) {
             self.mined = nonce.checked_sub(1);
+        }
+    }
+
+    /// Whether the arrival order should step over this lane at build
+    /// `build`. A park that has expired is cleared here, so the lane is
+    /// offered again and re-parked only if a build still finds the hole.
+    const fn park_holds(&mut self, build: u64) -> bool {
+        match self.parked {
+            Some(parked) if parked.until_build > build => true,
+            Some(_) => {
+                self.parked = None;
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// A transaction reached the lane by some door: at or below the nonce
+    /// the account was waiting for, it is the hole (or what is left of it),
+    /// so the lane can be walked again.
+    fn hole_filled_by(&mut self, nonce: u64) {
+        if self.parked.is_some_and(|parked| nonce <= parked.wanted) {
+            self.parked = None;
+        }
+    }
+
+    /// The chain mined this nonce for the sender: at or above the hole,
+    /// there is no hole left -- another leader mined what was missing, and
+    /// what the lane still holds above it is next.
+    fn chain_passed(&mut self, nonce: u64) {
+        if self.parked.is_some_and(|parked| nonce >= parked.wanted) {
+            self.parked = None;
         }
     }
 }
@@ -130,6 +203,17 @@ struct Inner<T: PoolTransaction> {
     /// pruner: the same hash drops them, another hash at the height gives
     /// back the ones it does not carry. Bounded to the last few blocks.
     held: VecDeque<(u64, B256, Vec<Arc<ValidPoolTransaction<T>>>)>,
+    /// Lanes stepped over behind a hole ([`Parked`]), roughly in the order
+    /// their parks expire -- a park always ends `PARK_BUILDS` builds after
+    /// the build that set it, and this is walked from the front, so an
+    /// entry behind a younger one waits at most a few builds longer. A
+    /// parked lane is out of `arrivals` entirely, so the walk does not step
+    /// over it once per transaction: at the bench tier a build takes
+    /// 163,000 transactions, and re-walking even a few hundred parked lanes
+    /// for each of them would cost more than the defect. Drained at the
+    /// start of every build ([`Inner::readmit_parked`]), which is also what
+    /// makes a park impossible to lose.
+    parked_order: VecDeque<Address>,
     /// The sender a build is taking a run from, and how much of the run is
     /// left. See [`run_length`].
     current: Option<(Address, usize)>,
@@ -485,6 +569,7 @@ impl<T: PoolTransaction> TxQueue<T> {
                 last_build: None,
                 gaps: Vec::new(),
                 held: VecDeque::new(),
+                parked_order: VecDeque::new(),
                 current: None,
                 run: run.max(1),
                 builds: 0,
@@ -532,6 +617,25 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// How many transactions are queued.
     pub fn len(&self) -> usize {
         self.inner.lock().len + self.staged.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// How many of them a build could take now: what [`Self::len`] counts,
+    /// less the lanes parked behind a hole ([`Parked`]) and less the inbox,
+    /// which the next drain moves into the lanes.
+    ///
+    /// Beside `queued` this is what says whether a short block was the
+    /// queue running dry or the queue being deep and unusable -- the two
+    /// look identical from the builder's side, and loop207's defect 13 was
+    /// the second (`queued=334-360k` with every build finding nothing).
+    /// One walk of the lanes (~6,000 at the bench tier), so it belongs on a
+    /// per-block line and not in a loop.
+    pub fn usable(&self) -> usize {
+        let mut inner = self.inner.lock();
+        // What is in the inbox is a build away from the lanes -- the next
+        // pull drains it -- so it counts, and counting it means draining
+        // it. The drainer task normally leaves nothing to do here.
+        self.drain_inbox(&mut inner);
+        inner.usable()
     }
 
     /// Whether nothing is queued.
@@ -841,6 +945,10 @@ impl<T: PoolTransaction> TxQueue<T> {
             }
             inner.last_build = Some((parent, Vec::new()));
             inner.end_run();
+            // Every lane whose park has ended is offered again before this
+            // build walks: a park that outlived its reason must never cost
+            // a build the lane behind it.
+            inner.readmit_parked();
         }
         QueueBest { queue: self.clone(), skipped: AddressHashSet::default(), buffer: VecDeque::new(), batch: queue_batch() }
     }
@@ -857,13 +965,21 @@ impl<T: PoolTransaction> Inner<T> {
         let lane = self
             .lanes
             .entry(sender)
-            .or_insert_with(|| Lane { by_nonce: BTreeMap::new(), queued: false, mined: None });
+            .or_insert_with(|| Lane { by_nonce: BTreeMap::new(), queued: false, mined: None, parked: None });
         if lane.by_nonce.contains_key(&nonce) || lane.is_stale(nonce) {
             return None;
         }
+        // The hole a build parked this lane behind, filled: the ingest saw
+        // the missing nonce after all, so the lane is offered again at once
+        // rather than at the park's expiry.
+        lane.hole_filled_by(nonce);
         lane.by_nonce.insert(nonce, valid);
         self.len += 1;
-        if !lane.queued {
+        // A lane still parked stays out of the order whatever arrives: the
+        // flood keeps feeding a gapped sender its *later* nonces, and
+        // putting the lane back for each of them would undo the park a few
+        // thousand times a second. `readmit_parked` is its door back.
+        if !lane.queued && lane.parked.is_none() {
             lane.queued = true;
             self.arrivals.push_back(sender);
         }
@@ -896,10 +1012,17 @@ impl<T: PoolTransaction> Inner<T> {
                 continue;
             }
             gave.offered += 1;
+            // An own block the chain settled elsewhere comes back through
+            // here, and it can carry the very nonce a lane is parked
+            // behind.
+            lane.hole_filled_by(nonce);
             if lane.by_nonce.insert(nonce, valid).is_none() {
                 self.len += 1;
             }
-            if !lane.queued {
+            // As in `insert_valid`: a parked lane comes back through
+            // `readmit_parked` and not through a give-back of the very
+            // transactions the build could not use.
+            if !lane.queued && lane.parked.is_none() {
                 lane.queued = true;
                 senders.push(sender);
             }
@@ -910,13 +1033,90 @@ impl<T: PoolTransaction> Inner<T> {
         gave
     }
 
+    /// A build found a hole below this sender's head: the account is at
+    /// `wanted` and the lane's lowest nonce is above it. The lane is
+    /// stepped over until the hole is filled, the chain passes it, or the
+    /// park expires ([`Parked`]).
+    fn park(&mut self, sender: Address, wanted: u64) {
+        let until_build = self.builds.saturating_add(PARK_BUILDS);
+        let Some(lane) = self.lanes.get_mut(&sender) else { return };
+        // The entry is made here and nowhere else, so a lane cannot be
+        // parked without one: a lane that is in neither `arrivals` nor
+        // `parked_order` is offered to nothing again, which is loop144's
+        // stranded lane. A lane parked again while its entry is still
+        // there keeps that entry -- the walk reads the lane's own expiry,
+        // not the entry's.
+        let fresh = lane.parked.is_none();
+        lane.parked = Some(Parked { wanted, until_build });
+        if fresh {
+            self.parked_order.push_back(sender);
+        }
+    }
+
+    /// Puts a lane back in the arrival order if it holds anything and is
+    /// not there already. The one door back for a parked lane.
+    fn requeue(&mut self, sender: Address) {
+        let Some(lane) = self.lanes.get_mut(&sender) else { return };
+        if lane.queued || lane.by_nonce.is_empty() {
+            return;
+        }
+        lane.queued = true;
+        self.arrivals.push_back(sender);
+    }
+
+    /// Offers again every lane whose park has ended -- filled, passed by
+    /// the chain, or expired. Run once per build, from
+    /// [`TxQueue::best_for_build`]; a prefix walk rather than a scan,
+    /// because `parked_order` is all but sorted by expiry.
+    fn readmit_parked(&mut self) {
+        while let Some(sender) = self.parked_order.front().copied() {
+            let build = self.builds;
+            let Some(parked) = self.lanes.get(&sender).map(|lane| lane.parked) else {
+                self.parked_order.pop_front();
+                continue;
+            };
+            match parked {
+                // Parks end in the order they were made, so once one is
+                // still held the rest are too.
+                Some(parked) if parked.until_build > build => break,
+                // Expired, or unparked by a door of its own (the hole
+                // filled, the chain past it); in the second case the lane
+                // may be back in the order already, which `requeue` sees.
+                other => {
+                    if other.is_some()
+                        && let Some(lane) = self.lanes.get_mut(&sender)
+                    {
+                        lane.parked = None;
+                    }
+                    self.parked_order.pop_front();
+                    self.requeue(sender);
+                }
+            }
+        }
+    }
+
+    /// What a build could take from the lanes right now: a parked lane's
+    /// transactions are queued and unusable, and so are those of a lane the
+    /// arrival order does not offer.
+    fn usable(&self) -> usize {
+        self.lanes.values().filter(|lane| lane.queued).map(|lane| lane.by_nonce.len()).sum()
+    }
+
     fn remove_mined(&mut self, sender: Address, nonce: u64) {
         let Some(lane) = self.lanes.get_mut(&sender) else { return };
         lane.mine(nonce);
+        // The chain has reached or passed the hole: whatever is left in the
+        // lane above it is the next thing this sender wants mined.
+        let was_parked = lane.parked.is_some();
+        lane.chain_passed(nonce);
+        let unparked = was_parked && lane.parked.is_none();
         let keep = lane.by_nonce.split_off(&(nonce + 1));
         self.len -= lane.by_nonce.len();
         lane.by_nonce = keep;
         // A now-empty lane leaves the arrival order when its turn comes.
+        if unparked {
+            self.requeue(sender);
+        }
     }
 
     /// Ends the run in progress: the sender it was taking from goes back to
@@ -977,6 +1177,7 @@ impl<T: PoolTransaction> Inner<T> {
             }
         }
         let run = self.run;
+        let build = self.builds;
         let mut passes = self.arrivals.len();
         while passes > 0 {
             passes -= 1;
@@ -988,6 +1189,14 @@ impl<T: PoolTransaction> Inner<T> {
             }
             if skipped.contains(&sender) {
                 self.arrivals.push_back(sender);
+                continue;
+            }
+            // Parked behind a hole a build found ([`Parked`]): out of the
+            // arrival order, so the build's whole candidate budget goes to
+            // lanes that can execute. `park` filed it in `parked_order`
+            // already, and that is the door back.
+            if lane.park_holds(build) {
+                lane.queued = false;
                 continue;
             }
             let (_, valid) = lane.by_nonce.pop_first()?;
@@ -1139,6 +1348,10 @@ impl<T: PoolTransaction> BestTransactions for QueueBest<T> {
         {
             if tx > state {
                 inner.gaps.push((sender, *state, *tx));
+                // Nothing in this lane can execute until the hole is
+                // filled, and its head is what every build is offered
+                // first: stepped over until then ([`Parked`]).
+                inner.park(sender, *state);
             }
         }
         inner.give_back(vec![Arc::clone(transaction)]);
@@ -1506,6 +1719,178 @@ mod tests {
         // gate on the refill rather than on the blocks in flight.
         queue.push([tx(3, 0)]);
         assert_eq!(queue.len(), 1);
+    }
+
+    /// A gapped nonce as a build's refusal reports it: the account is at
+    /// `state`, the lane's head is `tx`, and nothing between them exists.
+    fn gap(tx: u64, state: u64) -> InvalidPoolTransactionError {
+        InvalidPoolTransactionError::Consensus(InvalidTransactionError::NonceNotConsistent { tx, state })
+    }
+
+    /// Takes a whole build's worth and refuses every head the way the
+    /// builder's parallel step now does: the account's nonce against the
+    /// lane's head. Returns what the build was handed, as (sender byte,
+    /// nonce).
+    fn build_refusing_gaps(
+        queue: &TxQueue<EthPooledTransaction>,
+        parent: B256,
+        account_nonce: &dyn Fn(u8) -> u64,
+    ) -> Vec<(u8, u64)> {
+        let mut best = queue.best_for_build(parent);
+        let taken: Vec<_> = std::iter::from_fn(|| best.next()).collect();
+        let handed: Vec<(u8, u64)> = taken.iter().map(|t| (t.sender().as_slice()[0], t.nonce())).collect();
+        // The head per sender, as the builder's parallel step reports it:
+        // the first candidate it was handed for that sender, and only that
+        // one.
+        let mut seen: AddressHashSet = Default::default();
+        for t in &taken {
+            if !seen.insert(t.sender()) {
+                continue;
+            }
+            let state = account_nonce(t.sender().as_slice()[0]);
+            if t.nonce() != state {
+                best.mark_invalid(t, gap(t.nonce(), state));
+            }
+        }
+        drop(best);
+        handed
+    }
+
+    /// The deep-and-unusable queue of loop207 Ob node1: most lanes hold a
+    /// run whose head is above the account's nonce, a few are whole, and
+    /// the build's whole budget was going to the gapped heads -- the same
+    /// ones, build after build, because a refusal handed them straight back
+    /// to their lanes and a lane's head is what every build is offered
+    /// first.
+    ///
+    /// With the gap reported, those lanes are parked and the next build
+    /// finds the nonces it can actually mine.
+    #[test]
+    fn a_build_steps_over_lanes_parked_behind_a_hole_and_finds_the_next_nonces() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(4);
+        // Senders 1..=20 are gapped: the chain has them at nonce 0 and the
+        // queue's lowest nonce for each is 5. Senders 21..=24 are whole.
+        let gapped: Vec<u8> = (1..=20).collect();
+        let whole: Vec<u8> = (21..=24).collect();
+        let mut all = Vec::new();
+        for s in &gapped {
+            for n in 5..15 {
+                all.push(tx(*s, n));
+            }
+        }
+        for s in &whole {
+            for n in 0..10 {
+                all.push(tx(*s, n));
+            }
+        }
+        let queued = all.len();
+        queue.push(all);
+        assert_eq!(queue.len(), queued);
+        assert_eq!(queue.usable(), queued, "nothing is parked before a build says so");
+
+        let account_nonce = |_s: u8| 0;
+        // The first build is offered the gapped heads and refuses them; the
+        // whole lanes start at nonce 0 and are never refused.
+        let first = build_refusing_gaps(&queue, B256::repeat_byte(1), &account_nonce);
+        assert!(first.iter().any(|(s, _)| *s <= 20), "the first build was offered the gapped lanes");
+
+        // The next build: its start gives the first build's take back, so
+        // everything is in the lanes again -- and the depth and what a
+        // build could take of it part company, which is what `usable=`
+        // says.
+        let mut best = queue.best_for_build(B256::repeat_byte(2));
+        assert_eq!(queue.len(), queued);
+        assert_eq!(queue.usable(), whole.len() * 10);
+        let second: Vec<(u8, u64)> =
+            std::iter::from_fn(|| best.next()).map(|t| (t.sender().as_slice()[0], t.nonce())).collect();
+        drop(best);
+        assert!(second.iter().all(|(s, _)| *s > 20), "a parked lane was offered again: {second:?}");
+        assert_eq!(second.len(), whole.len() * 10, "the build did not find the nonces it could mine");
+    }
+
+    /// A park is a guess about state the queue cannot see, so it expires:
+    /// after [`PARK_BUILDS`] builds the lane is offered again whatever the
+    /// hole. Nothing here may be unreachable for good -- that is loop144's
+    /// stranded lane.
+    #[test]
+    fn a_park_expires_so_no_lane_is_stranded() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(4);
+        queue.push((5..10).map(|n| tx(1, n)).collect::<Vec<_>>());
+        build_refusing_gaps(&queue, B256::repeat_byte(1), &|_| 0);
+        assert_eq!(queue.usable(), 0);
+        for i in 0..PARK_BUILDS {
+            let mut best = queue.best_for_build(B256::from([i as u8 + 2; 32]));
+            let offered: Vec<_> = std::iter::from_fn(|| best.next()).collect();
+            drop(best);
+            if i + 1 < PARK_BUILDS {
+                assert!(offered.is_empty(), "build {i} was offered a parked lane");
+            } else {
+                assert_eq!(offered.len(), 5, "the park did not expire");
+            }
+        }
+    }
+
+    /// The hole filled by the ingest: the lane is offered again at once,
+    /// from the nonce that was missing.
+    #[test]
+    fn a_parked_lane_comes_back_when_the_hole_is_filled() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(4);
+        queue.push((5..10).map(|n| tx(1, n)).collect::<Vec<_>>());
+        build_refusing_gaps(&queue, B256::repeat_byte(1), &|_| 0);
+        assert_eq!(queue.usable(), 0);
+        queue.push((0..5).map(|n| tx(1, n)).collect::<Vec<_>>());
+        // The lane is walked again at once: nonces 0-4 and the head the
+        // first build handed back. The rest (6-9) is still that build's
+        // take and comes back at the next build's start.
+        assert_eq!(queue.usable(), 6);
+        let mut best = queue.best_for_build(B256::repeat_byte(2));
+        let offered: Vec<u64> = std::iter::from_fn(|| best.next()).map(|t| t.nonce()).collect();
+        drop(best);
+        assert_eq!(offered.len(), 10);
+        assert_eq!(offered.first().copied(), Some(0));
+    }
+
+    /// The chain passing the hole ends the park too: another leader mined
+    /// the missing nonces, and what is left in the lane is next.
+    #[test]
+    fn a_parked_lane_comes_back_when_the_chain_passes_the_hole() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(4);
+        queue.push((5..10).map(|n| tx(1, n)).collect::<Vec<_>>());
+        build_refusing_gaps(&queue, B256::repeat_byte(1), &|_| 0);
+        assert_eq!(queue.usable(), 0);
+        queue.remove_mined(Address::repeat_byte(1), 4);
+        // The head the first build handed back, offered again; the rest is
+        // that build's take until the next build's start.
+        assert_eq!(queue.usable(), 1);
+        let mut best = queue.best_for_build(B256::repeat_byte(2));
+        let offered: Vec<u64> = std::iter::from_fn(|| best.next()).map(|t| t.nonce()).collect();
+        drop(best);
+        assert_eq!(offered, vec![5, 6, 7, 8, 9]);
+    }
+
+    /// A stale head -- the chain is past it -- is dropped rather than
+    /// parked, so the lane is usable at the *next* build. This is the
+    /// refusal the builder's parallel step now reports for the head it
+    /// skipped; before it the head went back with `ExceedsGasLimit`, which
+    /// says nothing, and was offered first to every build of the tenure.
+    #[test]
+    fn a_stale_head_is_dropped_so_the_next_build_finds_the_sender_usable() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::with_run_length(64);
+        queue.push((3..8).map(|n| tx(1, n)).collect::<Vec<_>>());
+        let mut best = queue.best_for_build(B256::repeat_byte(1));
+        let head = best.next().expect("the lane's head");
+        assert_eq!(head.nonce(), 3);
+        // The account is at nonce 5: the head and everything below it are
+        // behind the chain.
+        best.mark_invalid(&head, gap(3, 5));
+        drop(best);
+        let mut best = queue.best_for_build(B256::repeat_byte(2));
+        let offered: Vec<u64> = std::iter::from_fn(|| best.next()).map(|t| t.nonce()).collect();
+        drop(best);
+        // Nonce 3 and everything below it are gone and the lane starts at
+        // 4: the sender is usable again at this build, where before it was
+        // offered the same refused head for the rest of the tenure.
+        assert_eq!(offered, vec![4, 5, 6, 7], "the stale head was offered again");
     }
 
     #[test]

@@ -528,7 +528,14 @@ fn main() {
                                     queue.forget_hashes(hashes);
                                 }
                                 if mined > 10_000 {
-                                    info!(target: "n42.tx_queue", mined, queued = queue.len(), prune_ms = started.elapsed().as_millis() as u64, "canonical blocks pruned from the queue");
+                                    // `usable` beside `queued`: what a build
+                                    // could take of the depth. The two part
+                                    // company when lanes are parked behind a
+                                    // hole, which is what loop207-208's defect
+                                    // 13 was -- 334-360k queued, empty blocks,
+                                    // and no line saying which of the two it
+                                    // was.
+                                    info!(target: "n42.tx_queue", mined, queued = queue.len(), usable = queue.usable(), prune_ms = started.elapsed().as_millis() as u64, "canonical blocks pruned from the queue");
                                 }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {

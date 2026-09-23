@@ -1261,5 +1261,20 @@ uncommitted state is saved as a WIP commit on the branch (unbuilt, untested) to 
   adopted (loop215-218 = the tenure-256 legs; 4 of 22 legs). Being read: what a view timeout at tenure 256 looks like
   -- the leader's build, the parent's import, the queue -- and whether it is the tenure or the pacing.
 
+### 5.6 The stall that stopped the chain: a `Cancelled` that panicked the execution layer (defect 14, fixed)
+
+The analysis of loop217 Pb and loop218 P200c: in both, node2's execution layer crashed -- reth's payload-builder
+service hit `unreachable!("the cancel signal never fired")` (basic/src/lib.rs:493) because the build for a height the
+chain had already decided (0a107ef68, `N42_BUILD_SKIP_DECIDED`, on by default) answered `BuildOutcome::Cancelled`, an
+outcome reth reserves for its own cancel signal. The process exited; the leader rule is `(view / tenure) % n` and a TC
+moves the chain on by one view, so the dead node stayed leader for the rest of its tenure with timeouts backing off
+6 -> 12 -> 24 -> 30 s: at tenure 256 that is ~2 h, at 64 ~30 min -- the tenure sets how long the stall lasts, not
+whether it happens. The same panic is in six legs since loop215 (215warm, 215P, 216S120b, 217R6a, 217Pb, 218P200c) and
+none of the thirty before; the counter "2 of 22" undercounted it. Every timeout reads `proposed=true` though no
+proposal was sent (a label to fix). Followers were idle and clean; the queue held 436-564k usable; the flood ran until
+the crash. Fixed (a41862b95): both early returns answer `Aborted` (a build that chose not to produce), which the job
+logs at debug and retries; the rate limiter's first call prints now. A liveness backstop (skip a leader after a TC)
+would change `verify_leader`, a rule shared with gov5 -- not taken. loop219 confirms.
+
 Each attempt is one agent brief and one runner; the bar for adopting any is the same as plan v4's: window 2 in every leg,
 verify 4/4, and the number it targets moving on the fleet, not on a bench.

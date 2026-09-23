@@ -918,6 +918,9 @@ where
     let mut par_collect_ms = 0u64;
     // Of the fold: the receipts loop, before the graft.
     let mut par_commit_ms = 0u64;
+    // Of the fold: the graft alone. `par_fold_ms` covers the receipts loop
+    // and then the longer of the graft and the transactions root beside it.
+    let mut par_graft_ms = 0u64;
     // The transactions root, computed beside the graft for a block that
     // will seal early.
     let mut early_transactions_root: Option<B256> = None;
@@ -1115,6 +1118,11 @@ where
                     // 60-100 ms hide it (loop139: 42 ms on the seal path).
                     let bundles = run.bundles;
                     let staged = staged.map(|staged| staged.into_inner().expect("the staged graft's lock"));
+                    // Of the fold: the graft alone, without the transactions
+                    // root that runs beside it -- `par_fold_ms` is the longer
+                    // of the two, so a graft that falls under the root would
+                    // not show in it (plan v5 attempt D).
+                    let mut graft_ms = 0u64;
                     let (graft, early_root) = std::thread::scope(|scope| {
                         let root = sealing_early.then(|| match direct_body.as_ref() {
                             Some((transactions, _)) => {
@@ -1127,12 +1135,21 @@ where
                             }
                         });
                         let db = builder.executor.evm_mut().db_mut();
+                        let at = std::time::Instant::now();
                         let graft = match staged {
                             Some(staged) => crate::parallel_transfer::install_staged(db, staged, keep_cache),
-                            None => crate::parallel_transfer::graft_bundles_with(db, bundles, beneficiary, keep_cache),
+                            None => crate::parallel_transfer::graft_bundles_folded(
+                                db,
+                                bundles,
+                                beneficiary,
+                                keep_cache,
+                                crate::parallel_transfer::build_graft_fold(),
+                            ),
                         };
+                        graft_ms = at.elapsed().as_millis() as u64;
                         (graft, root.map(|job| job.join().expect("the transactions root job does not panic")))
                     });
+                    par_graft_ms = graft_ms;
                     early_transactions_root = early_root;
                     let graft = graft.map_err(PayloadBuilderError::other)?;
                     let db = builder.executor.evm_mut().db_mut();
@@ -1625,6 +1642,7 @@ where
                     par_collect_ms,
                     par_commit_ms,
                     direct_receipts = direct_receipts_used,
+                    par_graft_ms,
                     par_fold_ms,
                     tx_root_ms = root_ms,
                     parent_fields_ms = fields_ms,
@@ -2209,6 +2227,7 @@ where
             par_pull_ms,
             par_part_ms,
             par_exec_ms,
+            par_graft_ms,
             par_fold_ms,
             par_committed,
             par_ms,

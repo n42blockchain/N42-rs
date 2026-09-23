@@ -565,7 +565,11 @@ fn say_once_a_second(last: &std::sync::atomic::AtomicU64) -> bool {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     let now = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
     let seen = last.load(Ordering::Relaxed);
-    now.saturating_sub(seen) >= 1_000 && last.compare_exchange(seen, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+    // `seen == 0` is "never said": the first call must print, and it did
+    // not while `now` was still under a second (the decided-height line
+    // never appeared in six legs where it fired).
+    (seen == 0 || now.saturating_sub(seen) >= 1_000)
+        && last.compare_exchange(seen, now.max(1), Ordering::Relaxed, Ordering::Relaxed).is_ok()
 }
 
 /// Constructs an Ethereum transaction payload using the best transactions from the pool.
@@ -818,7 +822,14 @@ where
                 "a build for a height the chain has already decided was cancelled"
             );
         }
-        return Ok(BuildOutcome::Cancelled);
+        // Not `Cancelled`: reth's payload job treats that outcome as
+        // unreachable unless its own cancel signal fired, and panics the
+        // payload service -- which took the execution layer down on six
+        // legs of loop215-218 and left the dead node leader for the rest of
+        // its tenure (a TC moves the chain on by one view only). `Aborted`
+        // is a build that chose not to produce a block; the job logs it at
+        // debug and moves on.
+        return Ok(BuildOutcome::Aborted { fees: U256::ZERO, cached_reads });
     }
     let pruned_through = n42_tx_queue::global::<Pool::Transaction>().map_or(0, |queue| queue.pruned_through());
     let parent_behind = pruned_through > parent_header.number;
@@ -836,7 +847,8 @@ where
             );
         }
         if refuse_stale_parent() {
-            return Ok(BuildOutcome::Cancelled);
+            // See above: never `Cancelled` from here.
+            return Ok(BuildOutcome::Aborted { fees: U256::ZERO, cached_reads });
         }
     }
     // What the queue holds and what a build could take of it. `queued`

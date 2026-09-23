@@ -1227,5 +1227,24 @@ binding path. Not run on the fleet: the bench and the arithmetic agree and are n
 cheaper signature -- aggregation -- and, as configuration, the ingest's pool made smaller and lower-priority so it
 contends less with the import (`N42_TX_INGEST_RECOVER_PARALLEL`, `N42_TX_INGEST_RECOVER_NICE`): loop217.
 
+### 5.4 The ingest's pool as configuration (loop217): not a lever either
+
+| | P (12 threads, nice 10) a / b | R6 (6 threads) a / b | R8 | R12N19 (nice 19) |
+| --- | --- | --- | --- | --- |
+| window 1 / 2 | 652k / 630k, 657k / 560k | 534k / 526k, 531k / 523k | 627k / 605k | 657k / 635k |
+| occupancy | 99% | **77%** | 92-94% | 99% |
+| ingest slots busy | 62-63% | 92-93% | 87% | 64% |
+| R1 / import / build | 150-153 / 206-212 / 260-271 | 82-94 / 133-137 / 177-180 | 133 / 180 / 243 | 146 / 205 / 263 |
+
+- Six recover threads starve the queue (occupancy 77%, the pool 92% busy: the ingest cannot keep up with 650k/s at
+  13 us a transaction on six threads) and every chain phase is faster because the blocks are three-quarters full --
+  the same shape as loop197's "more supply is a slower chain", from the other side. Eight threads: 92% full, no gain.
+  Nice 19 against nice 10: identical. **Ceiling 4 is what the bench said: the signature's cost, not its scheduling**,
+  and only a cheaper signature moves it.
+- Pb's window 3: six blocks in 30 s (a 5 s cycle, 5 timeouts) -- a stall shape not seen before; one leg, read later.
+
+Attempt D (`plan-v5/graft-representation`) was interrupted mid-implementation by the account's spend limit; its
+uncommitted state is saved as a WIP commit on the branch (unbuilt, untested) to be resumed. C and E wait for the same.
+
 Each attempt is one agent brief and one runner; the bar for adopting any is the same as plan v4's: window 2 in every leg,
 verify 4/4, and the number it targets moving on the fleet, not on a bench.

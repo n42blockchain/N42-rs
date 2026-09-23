@@ -1246,5 +1246,20 @@ contends less with the import (`N42_TX_INGEST_RECOVER_PARALLEL`, `N42_TX_INGEST_
 Attempt D (`plan-v5/graft-representation`) was interrupted mid-implementation by the account's spend limit; its
 uncommitted state is saved as a WIP commit on the branch (unbuilt, untested) to be resumed. C and E wait for the same.
 
+### 5.5 Pacing 200 with tenure 256 (loop218): the cycle is B's now, not the pacing's -- and a stall that stops the chain
+
+| | P225 | P200 a / b / c |
+| --- | --- | --- |
+| window 1 | 663k at 0.246 s | 663k / 657k / 663k at 0.244-0.248 s |
+| window 2 | 614k | 636k / 440k / 375k |
+| window 3 | 630k | 619k / 597k / **0 (the chain stopped; 6 TCs)** |
+
+- **Pacing stays at 225.** At 200 the cycle does not move (0.244-0.248 against 0.246): B (~217) plus the fixed parts
+  is the cycle, and the pacing no longer binds; what 200 does is lose windows (two of three).
+- **A stall that stops the chain, twice now**: loop217 Pb's window 3 (six blocks in 30 s, five TCs) and loop218
+  P200c's (no block at all in window 3, six TCs, the chain 510 blocks against ~970). Not seen before tenure 256 was
+  adopted (loop215-218 = the tenure-256 legs; 4 of 22 legs). Being read: what a view timeout at tenure 256 looks like
+  -- the leader's build, the parent's import, the queue -- and whether it is the tenure or the pacing.
+
 Each attempt is one agent brief and one runner; the bar for adopting any is the same as plan v4's: window 2 in every leg,
 verify 4/4, and the number it targets moving on the fleet, not on a bench.

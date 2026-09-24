@@ -1650,3 +1650,26 @@ state hid that; under G3 the child pulled from holed lanes, built short, fell to
 to 0.29-0.39 s. A short block also refuses the ahead seal, which is why the seal count is below the build count.
 **Fix**: the lookahead and the puller are given back right after the ahead seal, before the graft (a few ms; the
 skipped senders' heads, rare on a full block, keep their late give-back with the diagnosis). Re-run as loop233.
+
+### 6.9 G2+G3 with the lookahead given back at the seal (loop233): the build's wait is gone and the pacing is what is left
+
+| leg | win1 | win2 | sealed_at | state_wait | cycle (full, dissected) | B | D | E | short builds / holes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| warm | 726,647 | 660,976 | 223 | -- | 215 | 73 | 97 | 25 | -- |
+| G23a | 731,733 | 668,194 | **179** | 23 | **197** | 79 | 85 | **10** | 30 / 39 |
+| R | 706,118 | 655,985 | 221 | -- | 220 | 71.5 | 95.5 | 30.5 | -- |
+| G23b | 659,464 | 258,008 (stall) | **178** | 20 | 204 | 83 | 89 | 11 | 57 / 74 |
+
+Sealed at 178-179 instead of 221-223, as 6.7 sized it, and the dissected full-block cycle is 197 against 220: the
+segment that fell is E, the leader waiting for its own build (30 -> 10). B did not move (the follower's road does
+not depend on the leader's fold). What is left of the cycle is **D, the wait between the view opening and the
+proposal's preamble, 85-95 ms in every leg -- the 175 ms pacing**: with the build ready at ~180 the leader sits on
+the interval. The throughput did not follow the cycle (731k against 706-727k) because the G23 legs' blocks were not
+all full (occupancy 96-98%, 30-57 builds short of the gas limit, 39-74 hole warnings, TCs 3-4 against 1): the
+lookahead give-back now runs behind the hook and the puller's own walk gives back when its thread ends, which is
+after `done` is set and asynchronous -- one batch of one sender (the holes are 256 nonces wide) is still out when
+the chained build's hand-off runs. Fixed: the give-back before the proposal, and the puller's drop joins its thread.
+
+Next: the pacing. Every earlier trial below 175 (6.3) stalled with the build at the wall; the build now ends at
+~180 and the pacing at 175 is what the leader waits on. loop234 runs G23 at 175, 150 and 125. Falsified if 150 does
+not lift win1 above 780k, or if it stalls as 6.3's did.

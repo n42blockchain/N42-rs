@@ -1187,6 +1187,8 @@ where
     // long the step's end waited for it.
     let mut tx_root_ahead = false;
     let mut tx_root_wait_ms = 0u64;
+    // The lookahead and the puller given back before the ahead seal, ms.
+    let mut give_back_ms = 0u64;
     // `N42_SEAL_AT_EXEC=1`: the block sealed and proposed at the parallel
     // step's end -- the payload, the block, its hash and number, and the seal's
     // timers -- for the fold and the finish that follow it.
@@ -1296,7 +1298,7 @@ where
         let (all_transfers, keys, prep_done) = crate::parallel_transfer::build_pool().in_place_scope(|scope| {
             if let Some(puller) = pulled.as_ref() {
                 while cands.len() < budget {
-                    match puller.batches.recv() {
+                    match puller.batches().recv() {
                         Ok(batch) if !batch.is_empty() => {
                             if let Some(warm) = warm_ref {
                                 // Senders first, then recipients: a sender's
@@ -1628,18 +1630,18 @@ where
                                 body_matches_pull(transactions, &cands, |tx| *tx.tx_hash(), |tx| *tx.hash())
                             });
                         tx_root_ahead = matches;
-                        let sealed = seal_block!(hook, seal_at, if matches { root_ahead } else { None });
-                        sealed_ahead_id = Some((sealed.2, sealed.3));
-                        sealed_ahead = Some(sealed);
                         // What the puller took ahead and this block did not
-                        // build goes back to the queue now, not behind the
-                        // graft: the chained build pulls at the seal
-                        // (`N42_STATE_AFTER_PULL`), and on loop232 it found
-                        // the lanes holed by this build's lookahead still
-                        // checked out (117 of 180 builds short of the gas
-                        // limit, every one from a hole the pool could not
-                        // fill). The skipped senders' heads, rare on a full
-                        // block, are given back below with their diagnosis.
+                        // build goes back to the queue before the proposal,
+                        // not behind the graft: the chained build pulls at
+                        // the seal (`N42_STATE_AFTER_PULL`), and on loop232
+                        // it found the lanes holed by this build's lookahead
+                        // still checked out (117 of 180 builds short of the
+                        // gas limit, every one from a hole the pool could
+                        // not fill); on loop233, with the give-back after the
+                        // hook, by the puller's walk still ending. The
+                        // puller's drop joins its thread. The skipped
+                        // senders' heads, rare on a full block, are given
+                        // back below with their diagnosis.
                         for pool_tx in std::mem::take(&mut lookahead).into_iter().rev() {
                             refuse!(
                                 &pool_tx,
@@ -1647,6 +1649,10 @@ where
                             );
                         }
                         drop(pulled.take());
+                        give_back_ms = seal_at.elapsed().as_millis() as u64;
+                        let sealed = seal_block!(hook, seal_at, if matches { root_ahead } else { None });
+                        sealed_ahead_id = Some((sealed.2, sealed.3));
+                        sealed_ahead = Some(sealed);
                         seal_took = seal_at.elapsed();
                     }
                     // The transactions root beside the graft when the block
@@ -2225,6 +2231,7 @@ where
                     seal_at_exec = seal_at_exec_used,
                     tx_root_ahead,
                     tx_root_wait_ms,
+                    give_back_ms,
                     // `N42_STATE_AFTER_PULL=1` (plan v6 G3): the parent's state
                     // opened after the pull, prep and partition, and the time
                     // inside that open (0 with the flag off: the open is then
@@ -2281,7 +2288,7 @@ where
         }
         let pool_tx = if let Some(puller) = pulled.as_ref() {
             if lookahead.is_empty() {
-                match puller.batches.recv() {
+                match puller.batches().recv() {
                     Ok(batch) => lookahead.extend(batch),
                     Err(_) => break,
                 }
@@ -3017,9 +3024,15 @@ enum Refusal<T: reth_transaction_pool::PoolTransaction> {
 /// The pool walk on its own thread: batches ahead of the execution, refusals
 /// back. Dropping it ends the walk; the thread returns what it still holds.
 struct Puller<T: reth_transaction_pool::PoolTransaction> {
-    batches: std::sync::mpsc::Receiver<Vec<Arc<reth_transaction_pool::ValidPoolTransaction<T>>>>,
+    /// `None` only while the puller is being dropped: the receiver goes
+    /// first, so a thread blocked on a full channel sees the send fail.
+    batches: Option<std::sync::mpsc::Receiver<Vec<Arc<reth_transaction_pool::ValidPoolTransaction<T>>>>>,
     refusals: std::sync::mpsc::Sender<Refusal<T>>,
     done: Arc<std::sync::atomic::AtomicBool>,
+    /// Joined on drop: the walk's give-back happens when the thread ends,
+    /// and a build that seals must have it done before the chained build
+    /// pulls (loop233: holes of one batch, the thread still running).
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl<T: reth_transaction_pool::PoolTransaction> Puller<T> {
@@ -3057,10 +3070,18 @@ impl<T: reth_transaction_pool::PoolTransaction> Puller<T> {
             // The build's last refusals, then the walk's own give-back on drop.
             apply(&mut best);
         });
-        if let Err(err) = spawned {
-            warn!(target: "payload_builder", %err, "could not start the pool puller; the build has no transactions");
-        }
-        Self { batches, refusals, done }
+        let thread = match spawned {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                warn!(target: "payload_builder", %err, "could not start the pool puller; the build has no transactions");
+                None
+            }
+        };
+        Self { batches: Some(batches), refusals, done, thread }
+    }
+
+    fn batches(&self) -> &std::sync::mpsc::Receiver<Vec<Arc<reth_transaction_pool::ValidPoolTransaction<T>>>> {
+        self.batches.as_ref().expect("the puller's receiver is taken only on drop")
     }
 
     fn refuse(&self, refusal: Refusal<T>) {
@@ -3072,6 +3093,13 @@ impl<T: reth_transaction_pool::PoolTransaction> Puller<T> {
 impl<T: reth_transaction_pool::PoolTransaction> Drop for Puller<T> {
     fn drop(&mut self) {
         self.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        // The receiver first: a thread blocked sending a batch wakes with an
+        // error and ends; then the join, so the walk's give-back is complete
+        // when this returns.
+        drop(self.batches.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 

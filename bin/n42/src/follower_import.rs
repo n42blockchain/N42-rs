@@ -986,6 +986,10 @@ pub struct VoteRoad {
     pub fill_us: u64,
     /// How many positions the peer supplied.
     pub filled: u64,
+    /// Block by description only (`N42_BLOCK_BY_DESCRIPTION`): copying the
+    /// block's transactions out of the queue into the owned block reth's
+    /// execution takes, after the description was checked by reference.
+    pub copy_us: u64,
     /// Compact body road only: how many of the block's hashes the first
     /// pass did not find. Nonzero with a vote released means the wait was
     /// enough; a road that gave up logs a line of its own and is not this
@@ -1048,6 +1052,7 @@ fn log_vote_road(road: VoteRoad, number: u64, txs: usize, phases: RoadPhases) {
         + road.root_us
         + road.miss_wait_us
         + road.fill_us
+        + road.copy_us
         + phases.header_us
         + phases.senders_us
         + phases.parent_wait_us
@@ -1071,6 +1076,7 @@ fn log_vote_road(road: VoteRoad, number: u64, txs: usize, phases: RoadPhases) {
         misses = road.misses,
         fill_ms = road.fill_us / 1000,
         filled = road.filled,
+        copy_ms = road.copy_us / 1000,
         header_ms = phases.header_us / 1000,
         senders_ms = phases.senders_us / 1000,
         senders_indexed = phases.senders_indexed,
@@ -3361,3 +3367,6 @@ mod tests {
         assert!(refused.starts_with("transaction 0: nonce 0,"), "{refused}");
     }
 }
+
+#[cfg(test)]
+mod by_description_bench;

@@ -464,10 +464,22 @@ fn run_length() -> usize {
 }
 
 /// `N42_COMPACT_BODY`, read once: the compact block body assembles a block
-/// out of the by-hash index.
+/// out of the by-hash index. `N42_BLOCK_BY_DESCRIPTION=1` implies it: that
+/// road reads the same index, by reference instead of by copy.
 fn compact_body() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_COMPACT_BODY").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var("N42_COMPACT_BODY").is_ok_and(|v| v == "1") || block_by_description())
+}
+
+/// `N42_BLOCK_BY_DESCRIPTION`, read once: a follower checks a compact body
+/// against the block's transactions held by reference in this queue, and
+/// copies them out for the execution beside the rest of its vote road.
+///
+/// Read here, as [`senders_from_queue`] is, so the execution layer's road and
+/// the index it needs cannot disagree about whether the index is kept.
+pub fn block_by_description() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_BLOCK_BY_DESCRIPTION").is_ok_and(|v| v == "1"))
 }
 
 /// `N42_SENDERS_FROM_QUEUE`, read once: a follower takes the senders of a
@@ -484,9 +496,9 @@ pub fn senders_from_queue() -> bool {
     *ON.get_or_init(|| std::env::var("N42_SENDERS_FROM_QUEUE").is_ok_and(|v| v == "1"))
 }
 
-/// The by-hash index's bound, when one is kept: `N42_COMPACT_BODY=1` or
-/// `N42_SENDERS_FROM_QUEUE=1` turns it on and `N42_COMPACT_BODY_INDEX` sets
-/// the bound. Either reader wants the same index over the same window, so
+/// The by-hash index's bound, when one is kept: `N42_COMPACT_BODY=1`,
+/// `N42_BLOCK_BY_DESCRIPTION=1` or `N42_SENDERS_FROM_QUEUE=1` turns it on
+/// and `N42_COMPACT_BODY_INDEX` sets the bound. Either reader wants the same index over the same window, so
 /// they share the bound as well as the switch.
 ///
 /// The default holds about six full blocks at the bench tier, against a pool
@@ -745,6 +757,14 @@ impl<T: PoolTransaction> TxQueue<T> {
         };
         use rayon::prelude::*;
         hashes.par_iter().map(|hash| index.get(hash)).collect()
+    }
+
+    /// [`Self::get_by_hashes`] for one hash, on the caller's thread: what a
+    /// caller that walks a block in chunks on the worker pool uses, so the
+    /// look-up and whatever it does with the transaction happen on the same
+    /// worker while the transaction is in its cache.
+    pub fn get_by_hash(&self, hash: &B256) -> Option<Arc<ValidPoolTransaction<T>>> {
+        self.by_hash.as_ref().and_then(|index| index.get(hash))
     }
 
     /// The sender this node recorded for `hash` when the transaction came

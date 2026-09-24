@@ -1864,7 +1864,16 @@ import was not what the cycle was made of at pacing 175, as 6.11 said: it is the
 hand-off) and the supply (736-744k/s; p10 blocks 142-161k).
 
 `N42_ED25519_BATCH=128` is void: `busy_us_per_tx` stayed 12 and the leg had **11 invalid blocks** and 45 short
-builds -- the larger batch breaks something in the verification path (not read further; the default stays 64).
+builds: the followers rejected the leader's blocks with `deferred execution: header carries ExecutedFields {..} for
+parent .., this node ..` (123 such lines) -- a **state-root disagreement**, so the batch size changes which
+transactions a node accepts or how it executes them. That is a correctness defect in the verification path
+(**defect 16**, not on the 1M path, to be read before any batch-size change; the default stays 64).
+
+The road at `--conc 128` (6.12) is not the queue's lock after all: the follower's `vote road` grew only 66 -> 80
+(assemble 16 -> 18, root 21-22) while B grew 77 -> 167, so the other ~75 ms sit between the execution layer's
+road and the validator -- the Engine API calls and the ingest's HTTP frames share the execution layer's eight
+tokio workers (`TOKIO_WORKER_THREADS=8`), and 128 frames of 500 in flight starve the engine's calls. **Q1 is
+therefore first a configuration probe**: `TOKIO_WORKER_THREADS=16` with and without `--conc 128`.
 
 Where the campaign stands after plan v6's attempts G2, G3, seal-gap, F1: the four-node fleet reads 720-753k on
 window 1 at a ~196 ms cycle with 96-97% occupancy, up from 690-735k at 220 ms when plan v6 began. Every term is

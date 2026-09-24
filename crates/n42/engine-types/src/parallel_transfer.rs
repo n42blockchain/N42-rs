@@ -454,12 +454,61 @@ pub struct BuildRun<T> {
     pub bundles: Vec<BundleState>,
     /// Phase timings.
     pub phases: Phases,
+    /// [`execute_for_build_in_place`] only: the transfers where the batches
+    /// left them, one slot per candidate, a slot empty for a skipped one.
+    /// `executed` is then empty; [`BuildRun::executed_refs`] reads them in
+    /// block order and [`BuildRun::take_executed`] collects them.
+    pub slots: Vec<std::sync::OnceLock<BuiltTransfer<T>>>,
 }
 
 impl<T> Default for BuildRun<T> {
     fn default() -> Self {
-        Self { executed: Vec::new(), skipped: Vec::new(), bundles: Vec::new(), phases: Phases::default() }
+        Self {
+            executed: Vec::new(),
+            skipped: Vec::new(),
+            bundles: Vec::new(),
+            phases: Phases::default(),
+            slots: Vec::new(),
+        }
     }
+}
+
+impl<T> BuildRun<T> {
+    /// The executed transfers in block order, whether collected or still in
+    /// their slots.
+    pub fn executed_refs(&self) -> Vec<&BuiltTransfer<T>> {
+        if self.slots.is_empty() {
+            self.executed.iter().collect()
+        } else {
+            self.slots.iter().filter_map(std::sync::OnceLock::get).collect()
+        }
+    }
+
+    /// The executed transfers in block order, collected out of their slots
+    /// if [`execute_for_build_in_place`] left them there: the move
+    /// [`execute_for_build`] makes before it returns.
+    pub fn take_executed(&mut self) -> Vec<BuiltTransfer<T>> {
+        if !self.slots.is_empty() {
+            self.executed = std::mem::take(&mut self.slots).into_iter().filter_map(|slot| slot.into_inner()).collect();
+        }
+        std::mem::take(&mut self.executed)
+    }
+}
+
+/// Whether the builder leaves the executed transfers in their slots
+/// (`N42_BUILD_COLLECT_IN_PLACE=1`) instead of moving them into one vector
+/// before the receipts and the body are built from them.
+///
+/// The collect is one serial move of every transfer -- the transaction, its
+/// result, ~470 bytes each, 77 MB for a 163,000-transfer block -- and it was
+/// 18 ms of the leader's build on the four-node fleet (loop214-218,
+/// `par_collect_ms`). In place, the order is a vector of references built by
+/// one pass over the slots, and the block's body and receipts are made from
+/// those on the worker pool, where the move was going to happen anyway. Off
+/// by default until a four-node leg measures it.
+pub fn build_collect_in_place() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_BUILD_COLLECT_IN_PLACE").is_ok_and(|v| v == "1"))
 }
 
 /// Folds bundles that were each computed against the parent's state into
@@ -536,6 +585,20 @@ pub struct Graft {
     /// Accounts the block's state already held and that went in as deltas
     /// through a commit instead.
     pub committed: usize,
+    /// [`graft_bundles_indexed`] only, microseconds: the batches' maps
+    /// emptied into lists with the bucket of each account, on the pool.
+    pub prepare_us: u64,
+    /// [`graft_bundles_indexed`] only: sorting that list into the order the
+    /// block's map lays its buckets out.
+    pub sort_us: u64,
+    /// [`graft_bundles_indexed`] only: the merge pass -- what each account
+    /// turns out to be -- which the ranges run on the pool.
+    pub merge_us: u64,
+    /// [`graft_bundles_indexed`] only: the writes into the block's map.
+    pub apply_us: u64,
+    /// [`graft_bundles_indexed`] only: the batches' reverts filtered on the
+    /// pool and appended in whole.
+    pub reverts_us: u64,
 }
 
 /// Grafts the batches' bundles onto the block's state directly: each account
@@ -560,6 +623,67 @@ pub fn graft_bundles<DB: Database>(
     graft_bundles_with(state, bundles, beneficiary, true)
 }
 
+/// The largest bundle becomes the block's bundle instead of being copied
+/// into an empty one, when nothing stands in its way: the follower's
+/// partition by connected component puts most of a block of random
+/// transfers into one giant group (round 43: 317 groups, one of them
+/// nearly the whole block), and re-inserting its 140,000 accounts was the
+/// bulk of an 84 ms merge. Only when the cache is not kept (the builder's
+/// state needs the cache entries), the block's bundle is still empty and
+/// no account of it is one the block's state already holds or the
+/// beneficiary -- those go through the delta paths of the fold that follows.
+///
+/// The bundle taken is removed from `bundles`; what is left is the fold's
+/// work, whichever fold runs ([`graft_bundles_with`], [`graft_bundles_indexed`]).
+fn take_base_bundle<DB: Database>(
+    state: &mut State<DB>,
+    bundles: &mut Vec<BundleState>,
+    beneficiary: Address,
+    keep_cache: bool,
+    graft: &mut Graft,
+) {
+    if keep_cache || !state.bundle_state.state.is_empty() || !graft_base_swap() {
+        return;
+    }
+    let Some(largest) = (0..bundles.len()).max_by_key(|&i| bundles[i].state.len()) else { return };
+    let clear = {
+        let base = &bundles[largest];
+        !base.state.is_empty()
+            && !base
+                .state
+                .keys()
+                .any(|address| *address != beneficiary && state.cache.accounts.contains_key(address))
+    };
+    if !clear {
+        return;
+    }
+    let base = bundles.swap_remove(largest);
+    let BundleState { state: mut accounts, contracts, mut reverts, mut state_size, .. } = base;
+    // The beneficiary -- every transfer's fee lands on it, so every bundle
+    // holds it -- goes as a delta like everywhere else in the fold, and its
+    // revert is dropped with it.
+    if let Some(account) = accounts.remove(&beneficiary) {
+        state_size -= account.size_hint();
+        let new_balance = account.info.as_ref().map(|i| i.balance).unwrap_or_default();
+        let old_balance = account.original_info.as_ref().map(|i| i.balance).unwrap_or_default();
+        graft.beneficiary_delta = graft.beneficiary_delta.saturating_add(new_balance.saturating_sub(old_balance));
+    }
+    graft.accounts += accounts.len();
+    if state.bundle_state.state.capacity() >= accounts.len() {
+        // Memory mapped for the graft ([`GraftTarget`]): the base goes into
+        // it rather than replacing it -- the same accounts, and the map the
+        // rest of the graft writes stays the one whose pages are resident.
+        state.bundle_state.state.extend(accounts);
+    } else {
+        state.bundle_state.state = accounts;
+    }
+    state.bundle_state.state_size = state_size;
+    state.bundle_state.contracts.extend(contracts);
+    graft
+        .reverts
+        .extend(std::mem::take(&mut *reverts).into_iter().flatten().filter(|(address, _)| *address != beneficiary));
+}
+
 /// [`graft_bundles`] with a say over the state's cache: a follower's block
 /// state is read again only for the beneficiary's credit and discarded once
 /// its bundle is taken, so it can skip the cache insert per account
@@ -571,49 +695,34 @@ pub fn graft_bundles_with<DB: Database>(
     beneficiary: Address,
     keep_cache: bool,
 ) -> Result<Graft, <State<DB> as Database>::Error> {
-    let mut graft = Graft::default();
-    let mut bundles = bundles;
-    // The largest bundle becomes the block's bundle instead of being copied
-    // into an empty one, when nothing stands in its way: the follower's
-    // partition by connected component puts most of a block of random
-    // transfers into one giant group (round 43: 317 groups, one of them
-    // nearly the whole block), and re-inserting its 140,000 accounts was the
-    // bulk of an 84 ms merge. Only when the cache is not kept (the builder's
-    // state needs the cache entries), the block's bundle is still empty and
-    // no account of it is one the block's state already holds or the
-    // beneficiary -- those go through the delta paths below.
-    if !keep_cache && state.bundle_state.state.is_empty() && graft_base_swap() {
-        if let Some(largest) = (0..bundles.len()).max_by_key(|&i| bundles[i].state.len()) {
-            let clear = {
-                let base = &bundles[largest];
-                !base.state.is_empty()
-                    && !base
-                        .state
-                        .keys()
-                        .any(|address| *address != beneficiary && state.cache.accounts.contains_key(address))
-            };
-            if clear {
-                let base = bundles.swap_remove(largest);
-                let BundleState { state: mut accounts, contracts, mut reverts, mut state_size, .. } = base;
-                // The beneficiary -- every transfer's fee lands on it, so
-                // every bundle holds it -- goes as a delta like everywhere
-                // else in this function, and its revert is dropped with it.
-                if let Some(account) = accounts.remove(&beneficiary) {
-                    state_size -= account.size_hint();
-                    let new_balance = account.info.as_ref().map(|i| i.balance).unwrap_or_default();
-                    let old_balance = account.original_info.as_ref().map(|i| i.balance).unwrap_or_default();
-                    graft.beneficiary_delta = graft.beneficiary_delta.saturating_add(new_balance.saturating_sub(old_balance));
-                }
-                graft.accounts += accounts.len();
-                state.bundle_state.state = accounts;
-                state.bundle_state.state_size = state_size;
-                state.bundle_state.contracts.extend(contracts);
-                graft.reverts.extend(
-                    std::mem::take(&mut *reverts).into_iter().flatten().filter(|(address, _)| *address != beneficiary),
-                );
-            }
+    graft_bundles_direct(state, bundles, beneficiary, keep_cache, None)
+}
+
+/// Puts a [`GraftTarget`]'s memory in as the block's bundle map and the
+/// graft's revert list, if the block's bundle is still empty and has no
+/// memory of its own. The largest bundle may still become the base after
+/// this: [`take_base_bundle`] moves it into the target's map rather than
+/// putting its own map in the target's place.
+fn install_target<DB: Database>(state: &mut State<DB>, target: Option<GraftTarget>, graft: &mut Graft) {
+    if let Some(target) = target {
+        if state.bundle_state.state.is_empty() && state.bundle_state.state.capacity() == 0 {
+            state.bundle_state.state = target.accounts;
+            graft.reverts = target.reverts;
         }
     }
+}
+
+fn graft_bundles_direct<DB: Database>(
+    state: &mut State<DB>,
+    bundles: Vec<BundleState>,
+    beneficiary: Address,
+    keep_cache: bool,
+    target: Option<GraftTarget>,
+) -> Result<Graft, <State<DB> as Database>::Error> {
+    let mut graft = Graft::default();
+    let mut bundles = bundles;
+    install_target(state, target, &mut graft);
+    take_base_bundle(state, &mut bundles, beneficiary, keep_cache, &mut graft);
     let total: usize = bundles.iter().map(|b| b.state.len()).sum();
     if keep_cache {
         state.cache.accounts.reserve(total);
@@ -645,27 +754,34 @@ pub fn graft_bundles_with<DB: Database>(
                 repeated.insert(address);
                 continue;
             }
-            if state.bundle_state.state.contains_key(&address) {
-                // An earlier bundle put it in (or an earlier merge did, in
-                // which case the cache holds the block's view too): added to
-                // what is there, in both places.
-                repeated.insert(address);
-                let add = |info: &mut revm::state::AccountInfo| {
-                    info.balance = if new_balance >= old_balance {
-                        info.balance.saturating_add(new_balance - old_balance)
-                    } else {
-                        info.balance.saturating_sub(old_balance - new_balance)
+            // One probe of the block's map per account: the entry both says
+            // whether an earlier bundle put the account in and is where a new
+            // one goes (a look-up and then an insert was two probes into a
+            // 43 MB table, each a cache miss).
+            let vacant = match state.bundle_state.state.entry(address) {
+                revm::primitives::hash_map::Entry::Occupied(mut held) => {
+                    // An earlier bundle put it in (or an earlier merge did, in
+                    // which case the cache holds the block's view too): added
+                    // to what is there, in both places.
+                    repeated.insert(address);
+                    let add = |info: &mut revm::state::AccountInfo| {
+                        info.balance = if new_balance >= old_balance {
+                            info.balance.saturating_add(new_balance - old_balance)
+                        } else {
+                            info.balance.saturating_sub(old_balance - new_balance)
+                        };
+                        info.nonce += new_nonce - old_nonce;
                     };
-                    info.nonce += new_nonce - old_nonce;
-                };
-                if let Some(info) = state.bundle_state.state.get_mut(&address).and_then(|a| a.info.as_mut()) {
-                    add(info);
+                    if let Some(info) = held.get_mut().info.as_mut() {
+                        add(info);
+                    }
+                    if let Some(info) = state.cache.accounts.get_mut(&address).and_then(|a| a.account.as_mut()) {
+                        add(&mut info.info);
+                    }
+                    continue;
                 }
-                if let Some(info) = state.cache.accounts.get_mut(&address).and_then(|a| a.account.as_mut()) {
-                    add(&mut info.info);
-                }
-                continue;
-            }
+                revm::primitives::hash_map::Entry::Vacant(vacant) => vacant,
+            };
             if state.cache.accounts.contains_key(&address) {
                 // The block's state has its own view of this account; a
                 // delta through the ordinary path, summed with any other
@@ -691,7 +807,7 @@ pub fn graft_bundles_with<DB: Database>(
                 );
             }
             state.bundle_state.state_size += account.size_hint();
-            state.bundle_state.state.insert(address, account);
+            vacant.insert(account);
             graft.accounts += 1;
         }
         let mut reverts = reverts;
@@ -705,6 +821,611 @@ pub fn graft_bundles_with<DB: Database>(
         let mut changes: revm::state::EvmState = Default::default();
         for (address, (add, sub, nonce, original_absent)) in slow {
             let cached = state.cache.accounts.get(&address).expect("only an address the cache holds is summed here");
+            let existed = cached.account.is_some();
+            let mut merged = cached.account.as_ref().map(|a| a.info.clone()).unwrap_or_default();
+            merged.balance = merged.balance.saturating_add(add).saturating_sub(sub);
+            merged.nonce += nonce;
+            let mut acc = Account::from(merged);
+            acc.status = AccountStatus::Touched;
+            if !existed && original_absent {
+                acc.status |= AccountStatus::Created;
+            }
+            changes.insert(address, acc);
+        }
+        graft.committed = changes.len();
+        state.commit(changes);
+    }
+    Ok(graft)
+}
+
+/// How the batches' bundles become the block's one bundle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GraftFold {
+    /// [`graft_bundles_with`]: bundle after bundle, account after account,
+    /// each one probed in the block's map and written where its hash puts it.
+    /// A full block's map is ~50 MB, so every account is two probes and a
+    /// write into a line nothing has touched: 56-64 ms of the leader's build
+    /// (loop214, `par_fold_ms` less `par_commit_ms`), and no thread count
+    /// moves it because it is memory latency, not work.
+    #[default]
+    Direct,
+    /// [`graft_bundles_indexed`]: every batch's accounts are listed once with
+    /// the bucket the block's map will put each of them in, the list is
+    /// sorted on the worker pool, and the merge walks it in that order -- so
+    /// the writes into the block's map go region by region instead of all
+    /// over it, and an account two batches touched is its own neighbour in
+    /// the list rather than a probe that finds it.
+    Indexed,
+    /// [`graft_bundles_indexed`] with the merge pass split over ranges of
+    /// that same order and run on the worker pool. The sharded graft's lock
+    /// traffic is not here: a range shares no structure with the others, it
+    /// folds its own slice of every batch's bundle and the ranges' outputs
+    /// are concatenated in order.
+    IndexedRanges,
+}
+
+fn fold_from_env(index: &str, ranges: &str) -> GraftFold {
+    if std::env::var(ranges).is_ok_and(|v| v == "1") {
+        GraftFold::IndexedRanges
+    } else if std::env::var(index).is_ok_and(|v| v == "1") {
+        GraftFold::Indexed
+    } else {
+        GraftFold::Direct
+    }
+}
+
+/// The fold the leader's build uses: `N42_GRAFT_INDEX=1` for
+/// [`GraftFold::Indexed`], `N42_GRAFT_RANGES=1` for
+/// [`GraftFold::IndexedRanges`] (which implies the index), neither for the
+/// fold that is in place. Both off by default until a four-node leg says
+/// `par_fold_ms` fell and the roots agree.
+///
+/// The bench does not say it will (`bench_build_run`, 162,000 transfers,
+/// 16 threads pinned, three rounds each): into a freshly reserved map the
+/// fold in place grafts in 42-45 ms, the index in 60-62 and the index over
+/// ranges in 53-55; into memory mapped beside the execution
+/// ([`GraftTarget`]) 26.5-27, 43 and 35.5-36. Writing the map in bucket
+/// order saves less than listing, sorting and moving every account a second
+/// time costs; what the graft was paying for was the page faults, and
+/// those go for any order. Kept, switched off, for a leg on a loaded node,
+/// where locality may be worth more than on an idle one.
+pub fn build_graft_fold() -> GraftFold {
+    static FOLD: std::sync::OnceLock<GraftFold> = std::sync::OnceLock::new();
+    *FOLD.get_or_init(|| fold_from_env("N42_GRAFT_INDEX", "N42_GRAFT_RANGES"))
+}
+
+/// The same for a follower's import (`N42_FOLLOWER_GRAFT_INDEX`,
+/// `N42_FOLLOWER_GRAFT_RANGES`), switched apart from the leader's: the two
+/// sides of the graft have never wanted the same setting ([`graft_stream`]
+/// against [`follower_graft_stream`]). It is read only where the follower
+/// grafts the bundles after the execution -- with the streamed graft on,
+/// which is the follower's default, the fold is [`StagedGraft`]'s.
+pub fn follower_graft_fold() -> GraftFold {
+    static FOLD: std::sync::OnceLock<GraftFold> = std::sync::OnceLock::new();
+    *FOLD.get_or_init(|| fold_from_env("N42_FOLLOWER_GRAFT_INDEX", "N42_FOLLOWER_GRAFT_RANGES"))
+}
+
+/// [`graft_bundles_with`] or [`graft_bundles_indexed`], by `fold`. Every
+/// fold leaves the same block: the same accounts with the same values, the
+/// same reverts, the same beneficiary credit (`the_indexed_fold_equals_the_graft`).
+///
+/// `target`: memory mapped for the block's bundle ahead of the graft
+/// ([`GraftTarget::prefaulted`]), taken if the block's bundle is still
+/// empty. It changes where the accounts are written, never what is written.
+pub fn graft_bundles_folded<DB: Database>(
+    state: &mut State<DB>,
+    bundles: Vec<BundleState>,
+    beneficiary: Address,
+    keep_cache: bool,
+    fold: GraftFold,
+    target: Option<GraftTarget>,
+) -> Result<Graft, <State<DB> as Database>::Error> {
+    match fold {
+        GraftFold::Direct => graft_bundles_direct(state, bundles, beneficiary, keep_cache, target),
+        GraftFold::Indexed => graft_indexed_into(state, bundles, beneficiary, keep_cache, false, target),
+        GraftFold::IndexedRanges => graft_indexed_into(state, bundles, beneficiary, keep_cache, true, target),
+    }
+}
+
+/// The memory a graft writes, mapped before the graft runs: the block's
+/// bundle map and the graft's revert list, each sized for the block and
+/// each page of it already touched once, then emptied.
+///
+/// The graft's cost is mostly first touches, not probes. One full block's
+/// worth of accounts (161,760, 264 bytes an entry) inserted into a map the
+/// graft has just reserved: 27-30 ms in random order and 29-30 in the order
+/// of the map's buckets; into the same map once its pages are mapped: 18 ms
+/// in random order and 7.5-7.7 in bucket order (`bench_map_insert`, 16
+/// threads pinned, idle box). The fleet's allocator hands a table this size
+/// fresh pages every block (`oversize_threshold:0`, `thp:never`), so on the
+/// leader's chain the graft pays a page fault for every fifteen accounts --
+/// unless the pages were faulted while the batches executed, which is what
+/// this is for: [`GraftTarget::prefaulted`] runs beside the parallel step
+/// (`N42_GRAFT_PREFAULT=1`, [`graft_prefault`]).
+#[derive(Debug, Default)]
+pub struct GraftTarget {
+    accounts: revm::primitives::AddressMap<BundleAccount>,
+    reverts: Vec<(Address, AccountRevert)>,
+    /// How long the prefault took, microseconds.
+    pub prefault_us: u64,
+}
+
+impl GraftTarget {
+    /// A bundle map with room for `accounts` accounts and a revert list with
+    /// room for as many reverts, both mapped: one entry inserted into every
+    /// run of seven buckets of the map (a 4 KB page holds fifteen entries,
+    /// so every page holds a whole run and is written at least once), the
+    /// revert list filled with empty reverts; then both emptied. What is
+    /// left is capacity whose pages are resident.
+    pub fn prefaulted(accounts: usize) -> Self {
+        use std::hash::BuildHasher as _;
+        let at = std::time::Instant::now();
+        let mut map: revm::primitives::AddressMap<BundleAccount> = Default::default();
+        map.reserve(accounts);
+        let buckets = destination_buckets(map.capacity());
+        let mask = buckets - 1;
+        let entry = std::mem::size_of::<(Address, BundleAccount)>().max(1) as u64;
+        let run = (4096 / entry / 2).max(1);
+        let runs = buckets.div_ceil(run) as usize;
+        let mut touched = vec![false; runs];
+        let mut left = runs;
+        let hasher = map.hasher().clone();
+        let empty = BundleAccount::new(None, None, Default::default(), revm::database::AccountStatus::LoadedNotExisting);
+        // A key per run, found by trying keys until each run has one: about
+        // `runs x ln(runs)` hashes (~0.4M for a full block's map), bounded so
+        // that a hasher that never reaches some run cannot keep this going.
+        let limit = buckets.saturating_mul(64);
+        let mut k = 0u64;
+        while left > 0 && k < limit {
+            let mut bytes = [0u8; 20];
+            bytes[..8].copy_from_slice(&k.to_le_bytes());
+            bytes[19] = 0xfa;
+            let address = Address::from(bytes);
+            let run_of = ((hasher.hash_one(address) & mask) / run) as usize;
+            if let Some(seen) = touched.get_mut(run_of) {
+                if !*seen {
+                    *seen = true;
+                    left -= 1;
+                    map.insert(address, empty.clone());
+                }
+            }
+            k += 1;
+        }
+        map.clear();
+        let mut reverts: Vec<(Address, AccountRevert)> = Vec::with_capacity(accounts);
+        reverts.resize_with(accounts, Default::default);
+        reverts.clear();
+        Self { accounts: map, reverts, prefault_us: at.elapsed().as_micros() as u64 }
+    }
+
+    /// The accounts the map has room for without growing.
+    pub fn capacity(&self) -> usize {
+        self.accounts.capacity()
+    }
+}
+
+/// Whether the leader's build maps the graft's memory beside the parallel
+/// step (`N42_GRAFT_PREFAULT=1`, [`GraftTarget`]). Off by default until a
+/// four-node leg says the execution beside it does not pay for it.
+pub fn graft_prefault() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_GRAFT_PREFAULT").is_ok_and(|v| v == "1"))
+}
+
+/// The bucket count of a hash table that reports `capacity`: hashbrown puts
+/// a key at `hash & (buckets - 1)` and a table of eight buckets or more
+/// reports `buckets * 7 / 8`. It orders the fold's writes and nothing else,
+/// so a wrong answer would cost locality, never correctness.
+const fn destination_buckets(capacity: usize) -> u64 {
+    if capacity == 0 {
+        return 1;
+    }
+    (capacity.saturating_mul(8).saturating_add(6) / 7).next_power_of_two() as u64
+}
+
+/// One batch's touch of one account: the bucket the block's map will put it
+/// in, which batch holds it and where in that batch's list of accounts.
+/// Sorted by (bucket, address, batch, position), which puts every touch of
+/// one account together, in batch order, inside the run of touches that
+/// share a region of the block's map.
+#[derive(Debug, Clone, Copy)]
+struct Touch {
+    bucket: u32,
+    address: Address,
+    part: u32,
+    pos: u32,
+}
+
+/// What one address's touches turned out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Touched {
+    /// The block's map already held it when the fold began: a delta on what
+    /// is there, in the map and in the cache.
+    Held,
+    /// The block's *cache* held it: a delta the fold commits at the end,
+    /// through the state's own machinery.
+    Cached,
+    /// Neither: the first batch's account goes in as it is and the rest are
+    /// added to it.
+    Fresh,
+}
+
+/// One range of the fold's order, folded on its own.
+#[derive(Debug, Default)]
+struct FoldRange {
+    /// The accounts no one held, in the order the block's map wants them:
+    /// the batch, the bin and the position its value is taken from. Twelve
+    /// bytes an account, because nearly every one of a block's 147,000 is
+    /// here.
+    fresh: Vec<(u32, u32, u32)>,
+    /// What the batches after the first added to a few of those accounts:
+    /// the index into `fresh`, then what to add, subtract and bump. About
+    /// one account in ten on a bench-shaped block.
+    fresh_deltas: Vec<(u32, U256, U256, u64)>,
+    held: Vec<(Address, (U256, U256, u64))>,
+    cached: Vec<(Address, (U256, U256, u64, bool))>,
+    /// (batch, address) for every touch whose revert the block does not
+    /// take, because another touch of that account carries it already.
+    repeated: Vec<(u32, Address)>,
+    beneficiary_delta: U256,
+}
+
+/// How many bins one batch's accounts are split into as they leave its map.
+/// A bin is a contiguous range of the block's map's buckets, so a bin of a
+/// full block is ~1 MB of accounts against the ~57 MB the block touches: the
+/// merge and the apply both walk the touches in bucket order, and binning
+/// the accounts the same way keeps what they read inside one bin.
+const FOLD_BINS: usize = 64;
+
+/// The accounts of one batch, taken out of its bundle's map and split into
+/// [`FOLD_BINS`] bins so the fold can address them by (bin, position).
+type PartAccounts = Vec<Vec<Option<(Address, BundleAccount)>>>;
+
+/// One batch's bundle, opened for the fold on that batch's own thread.
+#[derive(Debug)]
+struct Prepared {
+    entries: PartAccounts,
+    touches: Vec<Touch>,
+    reverts: Vec<(Address, AccountRevert)>,
+    contracts: alloy_primitives::map::B256HashMap<revm::bytecode::Bytecode>,
+}
+
+/// Folds one range of the sorted touches. Reads the batches' accounts and
+/// the block's two maps, writes nothing: every change it finds is in the
+/// [`FoldRange`] it returns, which is what lets the ranges run beside each
+/// other. The rules are [`graft_bundles_with`]'s, per address instead of per
+/// touch -- the block's map is probed once for an account rather than once
+/// for each batch that touched it.
+fn fold_range(
+    touches: &[Touch],
+    parts: &[PartAccounts],
+    bin_shift: u32,
+    held: &(dyn Fn(&Address) -> bool + Sync),
+    cached: &(dyn Fn(&Address) -> bool + Sync),
+    beneficiary: Address,
+) -> FoldRange {
+    let mut out = FoldRange { fresh: Vec::with_capacity(touches.len()), ..Default::default() };
+    let mut i = 0usize;
+    while i < touches.len() {
+        let address = touches[i].address;
+        let mut j = i + 1;
+        while j < touches.len() && touches[j].address == address {
+            j += 1;
+        }
+        let mut kind: Option<Touched> = None;
+        let mut inserter: Option<(u32, u32, u32)> = None;
+        let (mut add, mut sub, mut nonce) = (U256::ZERO, U256::ZERO, 0u64);
+        let mut original_absent = true;
+        for touch in &touches[i..j] {
+            let Some((_, account)) =
+                parts[touch.part as usize][(touch.bucket >> bin_shift) as usize][touch.pos as usize].as_ref()
+            else {
+                continue;
+            };
+            // An account with nothing left of it contributes no value and no
+            // repetition -- its revert is the block's, as it is in
+            // `graft_bundles_with`.
+            let Some(info) = account.info.as_ref() else { continue };
+            let (new_balance, new_nonce) = (info.balance, info.nonce);
+            let (old_balance, old_nonce) = match &account.original_info {
+                Some(orig) => (orig.balance, orig.nonce),
+                None => (U256::ZERO, 0),
+            };
+            if address == beneficiary {
+                out.beneficiary_delta =
+                    out.beneficiary_delta.saturating_add(new_balance.saturating_sub(old_balance));
+                out.repeated.push((touch.part, address));
+                continue;
+            }
+            let settled = *kind.get_or_insert_with(|| {
+                if held(&address) {
+                    Touched::Held
+                } else if cached(&address) {
+                    Touched::Cached
+                } else {
+                    Touched::Fresh
+                }
+            });
+            if settled == Touched::Fresh && inserter.is_none() {
+                inserter = Some((touch.part, touch.bucket >> bin_shift, touch.pos));
+                continue;
+            }
+            if new_balance >= old_balance {
+                add = add.saturating_add(new_balance - old_balance);
+            } else {
+                sub = sub.saturating_add(old_balance - new_balance);
+            }
+            nonce += new_nonce - old_nonce;
+            original_absent &= account.original_info.is_none();
+            out.repeated.push((touch.part, address));
+        }
+        match kind {
+            None => {}
+            Some(Touched::Held) => out.held.push((address, (add, sub, nonce))),
+            Some(Touched::Cached) => out.cached.push((address, (add, sub, nonce, original_absent))),
+            Some(Touched::Fresh) => {
+                if let Some(at) = inserter {
+                    if !add.is_zero() || !sub.is_zero() || nonce != 0 {
+                        out.fresh_deltas.push((out.fresh.len() as u32, add, sub, nonce));
+                    }
+                    out.fresh.push(at);
+                }
+            }
+        }
+        i = j;
+    }
+    out
+}
+
+/// [`graft_bundles_with`] over an index of where the block's map will put
+/// each account, instead of over the map itself.
+///
+/// The graft's cost is not the work, it is the shape: a full block's bundle
+/// map is ~50 MB and the accounts arrive in the order their batches
+/// executed, so every one of 158,000 accounts is a probe and a write into
+/// memory nothing has touched -- 56-64 ms that no thread count moves
+/// (`docs/FLEET7_PATH_AUDIT.md`, the graft's representation). Here each
+/// batch's accounts are taken out of its map once, on the worker pool, and
+/// listed with the bucket the block's map will put them in; the list is
+/// sorted there too; and the merge then walks the block's map region by
+/// region. Two batches that touched one account are neighbours in that list,
+/// so the duplicate is found by looking left rather than by probing.
+///
+/// `ranges`: the merge pass itself split over ranges of the same order and
+/// run on the pool ([`GraftFold::IndexedRanges`]). A range folds its own
+/// slice, shares nothing, and the outputs are concatenated -- only the
+/// writes into the block's one map stay on this thread, because that map is
+/// one map.
+///
+/// The block it leaves is [`graft_bundles_with`]'s, account for account,
+/// revert for revert. Two things are stated rather than implied: the deltas
+/// of an account several batches touched are summed and applied once (where
+/// the fold in place applies each in turn -- the same value unless a balance
+/// saturates, which a transfer cannot make happen), and a batch's contracts
+/// are carried over (the fold in place drops them, which is invisible while
+/// only transfers take this path).
+pub fn graft_bundles_indexed<DB: Database>(
+    state: &mut State<DB>,
+    bundles: Vec<BundleState>,
+    beneficiary: Address,
+    keep_cache: bool,
+    ranges: bool,
+) -> Result<Graft, <State<DB> as Database>::Error> {
+    graft_indexed_into(state, bundles, beneficiary, keep_cache, ranges, None)
+}
+
+fn graft_indexed_into<DB: Database>(
+    state: &mut State<DB>,
+    bundles: Vec<BundleState>,
+    beneficiary: Address,
+    keep_cache: bool,
+    ranges: bool,
+    target: Option<GraftTarget>,
+) -> Result<Graft, <State<DB> as Database>::Error> {
+    use rayon::prelude::*;
+    use std::hash::BuildHasher as _;
+
+    let mut graft = Graft::default();
+    let mut bundles = bundles;
+    install_target(state, target, &mut graft);
+    take_base_bundle(state, &mut bundles, beneficiary, keep_cache, &mut graft);
+    let total: usize = bundles.iter().map(|b| b.state.len()).sum();
+    if total == 0 {
+        for bundle in &mut bundles {
+            graft.reverts.extend(std::mem::take(&mut *bundle.reverts).into_iter().flatten());
+        }
+        return Ok(graft);
+    }
+    if keep_cache {
+        state.cache.accounts.reserve(total);
+    }
+    state.bundle_state.state.reserve(total);
+    graft.reverts.reserve(total);
+    // Read after the reserve: what the block's map will be while the fold
+    // fills it, so the buckets the touches are sorted by are the buckets it
+    // uses. Nothing below makes it grow again.
+    let hasher = state.bundle_state.state.hasher().clone();
+    let buckets = destination_buckets(state.bundle_state.state.capacity());
+    let mask = buckets - 1;
+    // A bin is `buckets / FOLD_BINS` of the block's map, so an account's bin
+    // is the top bits of its bucket.
+    let bin_shift = buckets.trailing_zeros().saturating_sub(FOLD_BINS.trailing_zeros());
+
+    // Each batch's accounts out of its map and into a list, on the batch's
+    // own thread, with the bucket of each. This is the one copy the index
+    // costs, and it is the only part of the graft that parallelises.
+    let at = std::time::Instant::now();
+    let prepared: Vec<Prepared> = bundles
+        .into_par_iter()
+        .enumerate()
+        .map(|(part, bundle)| {
+            let BundleState { state: accounts, contracts, mut reverts, .. } = bundle;
+            let reverts: Vec<(Address, AccountRevert)> = std::mem::take(&mut *reverts).into_iter().flatten().collect();
+            // Counted off the keys alone first (one cache line of an
+            // account's six), so every bin is allocated at its exact size
+            // and nothing is grown or moved twice. The hash is taken again
+            // below rather than kept, because two passes over a map are
+            // only in the same order by implementation, and a hash of
+            // twenty bytes is two nanoseconds.
+            let mut counts = [0u32; FOLD_BINS];
+            for address in accounts.keys() {
+                counts[((hasher.hash_one(*address) & mask) >> bin_shift) as usize] += 1;
+            }
+            let mut entries: PartAccounts =
+                counts.iter().map(|count| Vec::with_capacity(*count as usize)).collect();
+            let mut touches: Vec<Touch> = Vec::with_capacity(accounts.len());
+            for (address, account) in accounts {
+                let bucket = (hasher.hash_one(address) & mask) as u32;
+                let bin = (bucket >> bin_shift) as usize;
+                touches.push(Touch { bucket, address, part: part as u32, pos: entries[bin].len() as u32 });
+                entries[bin].push(Some((address, account)));
+            }
+            Prepared { entries, touches, reverts, contracts }
+        })
+        .collect();
+    let mut parts: Vec<PartAccounts> = Vec::with_capacity(prepared.len());
+    let mut revert_lists: Vec<Vec<(Address, AccountRevert)>> = Vec::with_capacity(prepared.len());
+    let mut touches: Vec<Touch> = Vec::with_capacity(total);
+    for part in prepared {
+        parts.push(part.entries);
+        revert_lists.push(part.reverts);
+        touches.extend(part.touches);
+        state.bundle_state.contracts.extend(part.contracts);
+    }
+    graft.prepare_us = at.elapsed().as_micros() as u64;
+    let at = std::time::Instant::now();
+    touches.par_sort_unstable_by(|a, b| {
+        a.bucket.cmp(&b.bucket).then_with(|| a.address.cmp(&b.address)).then_with(|| (a.part, a.pos).cmp(&(b.part, b.pos)))
+    });
+
+    graft.sort_us = at.elapsed().as_micros() as u64;
+    let at = std::time::Instant::now();
+    // The ranges, cut on an address boundary so no account is folded twice.
+    let workers = rayon::current_num_threads().max(1);
+    let span = if ranges { (touches.len() / (workers * 4).max(1)).max(1) } else { touches.len() };
+    let mut bounds: Vec<usize> = vec![0];
+    let mut cut = span;
+    while cut < touches.len() {
+        while cut < touches.len() && touches[cut].address == touches[cut - 1].address {
+            cut += 1;
+        }
+        if cut >= touches.len() {
+            break;
+        }
+        bounds.push(cut);
+        cut += span;
+    }
+    bounds.push(touches.len());
+
+    let folded: Vec<FoldRange> = {
+        let in_bundle = &state.bundle_state.state;
+        let in_cache = &state.cache.accounts;
+        let held = |address: &Address| in_bundle.contains_key(address);
+        let cached = |address: &Address| in_cache.contains_key(address);
+        let cuts: Vec<(usize, usize)> = bounds.windows(2).map(|w| (w[0], w[1])).collect();
+        if ranges {
+            cuts.into_par_iter()
+                .map(|(from, to)| fold_range(&touches[from..to], &parts, bin_shift, &held, &cached, beneficiary))
+                .collect()
+        } else {
+            cuts.into_iter()
+                .map(|(from, to)| fold_range(&touches[from..to], &parts, bin_shift, &held, &cached, beneficiary))
+                .collect()
+        }
+    };
+    drop(touches);
+    graft.merge_us = at.elapsed().as_micros() as u64;
+    let at = std::time::Instant::now();
+
+    // The ranges are in the order the block's map lays its buckets out, and
+    // so are the accounts inside each: this loop writes the map from one end
+    // to the other rather than all over it.
+    let mut slow: alloy_primitives::map::AddressHashMap<(U256, U256, u64, bool)> = Default::default();
+    let mut repeated: Vec<alloy_primitives::map::AddressHashSet> =
+        (0..parts.len()).map(|_| Default::default()).collect();
+    for range in folded {
+        graft.beneficiary_delta = graft.beneficiary_delta.saturating_add(range.beneficiary_delta);
+        let mut deltas = range.fresh_deltas.into_iter().peekable();
+        for (at, (part, bin, pos)) in range.fresh.into_iter().enumerate() {
+            let delta = if deltas.peek().is_some_and(|(which, ..)| *which as usize == at) {
+                deltas.next()
+            } else {
+                None
+            };
+            let Some((address, mut account)) = parts[part as usize][bin as usize][pos as usize].take() else {
+                continue;
+            };
+            if let Some((_, add, sub, nonce)) = delta {
+                if let Some(info) = account.info.as_mut() {
+                    info.balance = info.balance.saturating_add(add).saturating_sub(sub);
+                    info.nonce += nonce;
+                }
+            }
+            if keep_cache {
+                if let Some(info) = account.info.as_ref() {
+                    state.cache.accounts.insert(
+                        address,
+                        CacheAccount {
+                            account: Some(PlainAccount { info: info.clone(), storage: Default::default() }),
+                            status: account.status,
+                        },
+                    );
+                }
+            }
+            state.bundle_state.state_size += account.size_hint();
+            state.bundle_state.state.insert(address, account);
+            graft.accounts += 1;
+        }
+        for (address, (add, sub, nonce)) in range.held {
+            if let Some(info) = state.bundle_state.state.get_mut(&address).and_then(|a| a.info.as_mut()) {
+                info.balance = info.balance.saturating_add(add).saturating_sub(sub);
+                info.nonce += nonce;
+            }
+            if let Some(cached) = state.cache.accounts.get_mut(&address).and_then(|a| a.account.as_mut()) {
+                cached.info.balance = cached.info.balance.saturating_add(add).saturating_sub(sub);
+                cached.info.nonce += nonce;
+            }
+        }
+        for (address, entry) in range.cached {
+            slow.insert(address, entry);
+        }
+        for (part, address) in range.repeated {
+            if let Some(set) = repeated.get_mut(part as usize) {
+                set.insert(address);
+            }
+        }
+    }
+    drop(parts);
+    graft.apply_us = at.elapsed().as_micros() as u64;
+
+    // The reverts, batch by batch and in the order the fold in place leaves
+    // them: the ones whose account another touch carries are dropped. The
+    // dropping is done on the pool, a batch to itself, and what is left is
+    // appended in whole -- a memcpy a batch rather than a push and a
+    // look-up per revert. A full block has as many reverts as accounts and
+    // each is ~210 bytes, which made this a third of the fold (bench: 16 ms
+    // of 51).
+    let at = std::time::Instant::now();
+    let mut kept = revert_lists;
+    kept.par_iter_mut().zip(repeated.par_iter()).for_each(|(reverts, repeated)| {
+        if !repeated.is_empty() {
+            reverts.retain(|(address, _)| !repeated.contains(address));
+        }
+    });
+    for mut part in kept {
+        graft.reverts.append(&mut part);
+    }
+    graft.reverts_us = at.elapsed().as_micros() as u64;
+
+    if !slow.is_empty() {
+        let mut changes: revm::state::EvmState = Default::default();
+        for (address, (add, sub, nonce, original_absent)) in slow {
+            let Some(cached) = state.cache.accounts.get(&address) else {
+                // Only an address the cache held is summed here; if that ever
+                // stops being true the block would silently lose a change.
+                tracing::error!(target: "payload_builder", %address, "the indexed fold summed an address the cache does not hold");
+                continue;
+            };
             let existed = cached.account.is_some();
             let mut merged = cached.account.as_ref().map(|a| a.info.clone()).unwrap_or_default();
             merged.balance = merged.balance.saturating_add(add).saturating_sub(sub);
@@ -1156,6 +1877,26 @@ where
     execute_for_build_with(evm_env, keys, convert, open, None)
 }
 
+/// [`execute_for_build_with`], with the executed transfers left in their
+/// slots ([`BuildRun::slots`]) rather than collected into
+/// [`BuildRun::executed`] when `in_place` is set
+/// ([`build_collect_in_place`]).
+pub fn execute_for_build_in_place<T, G>(
+    evm_env: &reth_evm::EvmEnv,
+    keys: &[(Address, Address)],
+    convert: &(dyn Fn(usize) -> (T, TxEnv) + Sync),
+    open: &(dyn Fn() -> Option<G> + Sync),
+    on_bundle: Option<&(dyn Fn(BundleState) + Sync)>,
+    in_place: bool,
+) -> Result<BuildRun<T>, NotParallel>
+where
+    T: Send + Sync,
+    G: Database + std::fmt::Debug + Send,
+    G::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    execute_for_build_run(evm_env, keys, convert, open, on_bundle, in_place)
+}
+
 /// [`execute_for_build`] with somewhere for each batch's bundle to go as that
 /// batch finishes: `on_bundle` is called on the batch's own thread, while the
 /// others are still executing ([`StagedGraft`]). With a sink the run's
@@ -1167,6 +1908,22 @@ pub fn execute_for_build_with<T, G>(
     convert: &(dyn Fn(usize) -> (T, TxEnv) + Sync),
     open: &(dyn Fn() -> Option<G> + Sync),
     on_bundle: Option<&(dyn Fn(BundleState) + Sync)>,
+) -> Result<BuildRun<T>, NotParallel>
+where
+    T: Send + Sync,
+    G: Database + std::fmt::Debug + Send,
+    G::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    execute_for_build_run(evm_env, keys, convert, open, on_bundle, false)
+}
+
+fn execute_for_build_run<T, G>(
+    evm_env: &reth_evm::EvmEnv,
+    keys: &[(Address, Address)],
+    convert: &(dyn Fn(usize) -> (T, TxEnv) + Sync),
+    open: &(dyn Fn() -> Option<G> + Sync),
+    on_bundle: Option<&(dyn Fn(BundleState) + Sync)>,
+    in_place: bool,
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
@@ -1260,7 +2017,11 @@ where
     // (each sender's transfers were run in that order, and the graft does
     // not care): round 43's followers imported a sender-grouped block 35%
     // slower than the serial builder's. The slots are in that order already.
-    run.executed = slots.into_iter().filter_map(|slot| slot.into_inner()).collect();
+    if in_place {
+        run.slots = slots;
+    } else {
+        run.executed = slots.into_iter().filter_map(|slot| slot.into_inner()).collect();
+    }
     run.skipped.sort_unstable();
     run.phases.collect_ms = at.elapsed().as_millis() as u64;
     Ok(run)
@@ -1517,7 +2278,8 @@ where
         // Taken rather than moved so the teardown below can free whatever
         // the chosen fold left behind.
         let grafted =
-            graft_bundles_with(&mut state, std::mem::take(&mut bundles), beneficiary, false).map_err(|e| err(&e))?;
+            graft_bundles_folded(&mut state, std::mem::take(&mut bundles), beneficiary, false, follower_graft_fold(), None)
+                .map_err(|e| err(&e))?;
         (revm::state::EvmState::default(), grafted.beneficiary_delta, Some(grafted.reverts))
     } else {
         let (changes, delta) = fold_bundles(&mut state, &bundles, beneficiary).map_err(|e| err(&e))?;
@@ -1818,6 +2580,341 @@ mod tests {
         let after = state.cache.accounts.get(&held).and_then(|a| a.account.as_ref()).expect("the account").info.clone();
         assert_eq!(after.balance, U256::from(115), "both batches' credits, not just the last one's");
         assert_eq!(after.nonce, 1, "the first batch's nonce bump");
+    }
+
+    /// Everything the fold leaves behind, in an order that does not depend
+    /// on which fold left it: a hash map's iteration order does, and nothing
+    /// downstream of the graft reads it (the QMDB operations and the hashed
+    /// post-state are both sorted by their own key).
+    #[derive(Debug, PartialEq, Eq)]
+    struct FoldSnapshot {
+        accounts: Vec<(Address, Option<AccountInfo>, Option<AccountInfo>, revm::database::AccountStatus)>,
+        state_size: usize,
+        cache: Vec<(Address, Option<AccountInfo>)>,
+        reverts: Vec<(Address, AccountRevert)>,
+        grafted: usize,
+        committed: usize,
+        beneficiary_delta: U256,
+    }
+
+    fn fold_fixture_info(balance: u64, nonce: u64) -> AccountInfo {
+        AccountInfo { balance: U256::from(balance), nonce, ..Default::default() }
+    }
+
+    /// Four batches of a block whose accounts overlap the way a real one's
+    /// do: two recipients every batch pays, a recipient that is another
+    /// batch's sender, the beneficiary every batch credits from the same
+    /// starting balance, one account the block's own state may already hold,
+    /// and a revert for every one of them.
+    fn fold_fixture_bundles(beneficiary: Address, held: Address, batches: u64) -> Vec<BundleState> {
+        let info = fold_fixture_info;
+        let mut bundles = Vec::new();
+        for batch in 0..batches {
+            let mut b = BundleState::builder(0..=0);
+            let sender = addr(100 + batch);
+            b = b
+                .state_present_account_info(sender, info(1_000 - 10 * (batch + 1), batch + 1))
+                .state_original_account_info(sender, info(1_000, 0))
+                .revert_account_info(0, sender, Some(Some(info(1_000, 0))));
+            for k in 0..6u64 {
+                // The first two are shared by every batch; the rest are this
+                // batch's own.
+                let to = if k < 2 { addr(1_000 + k) } else { addr(2_000 + batch * 6 + k) };
+                b = b.state_present_account_info(to, info(1 + batch, 0)).revert_account_info(0, to, Some(None));
+            }
+            // Another batch's sender, paid here: an account two batches hold
+            // with the same original.
+            let cross = addr(100 + (batch + 1) % batches);
+            b = b
+                .state_present_account_info(cross, info(1_007, 0))
+                .state_original_account_info(cross, info(1_000, 0))
+                .revert_account_info(0, cross, Some(Some(info(1_000, 0))));
+            b = b
+                .state_present_account_info(held, info(100 + batch + 1, 0))
+                .state_original_account_info(held, info(100, 0))
+                .revert_account_info(0, held, Some(Some(info(100, 0))));
+            b = b
+                .state_present_account_info(beneficiary, info(7 + batch + 1, 0))
+                .state_original_account_info(beneficiary, info(7, 0))
+                .revert_account_info(0, beneficiary, Some(Some(info(7, 0))));
+            bundles.push(b.build());
+        }
+        bundles
+    }
+
+    /// The fixture folded in two goes -- so the second one finds the block's
+    /// bundle already carrying the first's accounts, which is the path a
+    /// builder takes when its serial loop ran before the graft.
+    fn fold_fixture_run(fold: GraftFold, keep_cache: bool, held_in_cache: bool) -> FoldSnapshot {
+        let beneficiary = addr(9);
+        let held = addr(5);
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(held, fold_fixture_info(100, 0));
+        let mut state = State::builder().with_database(db).with_bundle_update().build();
+        if held_in_cache {
+            // Read by the block's own state before the graft: the account is
+            // in the cache, so the fold must take the delta path for it.
+            assert_eq!(state.basic(held).expect("the held account").map(|a| a.balance), Some(U256::from(100)));
+        }
+        let mut bundles = fold_fixture_bundles(beneficiary, held, 4);
+        let rest = bundles.split_off(2);
+        let mut grafted = 0usize;
+        let mut committed = 0usize;
+        let mut delta = U256::ZERO;
+        let mut reverts = Vec::new();
+        for half in [bundles, rest] {
+            let graft = graft_bundles_folded(&mut state, half, beneficiary, keep_cache, fold, None).expect("the fold");
+            grafted += graft.accounts;
+            committed += graft.committed;
+            delta = delta.saturating_add(graft.beneficiary_delta);
+            reverts.extend(graft.reverts);
+        }
+        let mut accounts: Vec<(Address, Option<AccountInfo>, Option<AccountInfo>, revm::database::AccountStatus)> = state
+            .bundle_state
+            .state
+            .iter()
+            .map(|(address, account)| (*address, account.info.clone(), account.original_info.clone(), account.status))
+            .collect();
+        accounts.sort_by_key(|(address, ..)| *address);
+        let mut cache: Vec<(Address, Option<AccountInfo>)> = state
+            .cache
+            .accounts
+            .iter()
+            .map(|(address, account)| (*address, account.account.as_ref().map(|a| a.info.clone())))
+            .collect();
+        cache.sort_by_key(|(address, _)| *address);
+        reverts.sort_by_key(|(address, _)| *address);
+        FoldSnapshot {
+            accounts,
+            state_size: state.bundle_state.state_size,
+            cache,
+            reverts,
+            grafted,
+            committed,
+            beneficiary_delta: delta,
+        }
+    }
+
+    /// The indexed fold leaves the block exactly where the fold in place
+    /// does -- the same accounts with the same values and originals, the
+    /// same size, the same cache, the same reverts, the same beneficiary
+    /// credit -- with the cache kept and not, and with the held account in
+    /// the block's state and not (which is also the base swap on and off).
+    #[test]
+    fn the_indexed_fold_equals_the_graft() {
+        for keep_cache in [false, true] {
+            for held_in_cache in [false, true] {
+                let direct = fold_fixture_run(GraftFold::Direct, keep_cache, held_in_cache);
+                assert!(!direct.accounts.is_empty(), "the fixture folds something");
+                for fold in [GraftFold::Indexed, GraftFold::IndexedRanges] {
+                    let other = fold_fixture_run(fold, keep_cache, held_in_cache);
+                    assert_eq!(other, direct, "{fold:?}, keep_cache {keep_cache}, held in cache {held_in_cache}");
+                }
+            }
+        }
+    }
+
+    /// The same, on a block big enough for the index to sort and for the
+    /// ranges to be more than one: 4,000 accounts over sixteen batches,
+    /// with the shared recipients a real block has.
+    #[test]
+    fn the_indexed_fold_equals_the_graft_on_a_block() {
+        let beneficiary = addr(9);
+        let info = fold_fixture_info;
+        let bundles = |batches: u64, per: u64| -> Vec<BundleState> {
+            let mut out = Vec::new();
+            let mut seed = 0x9e3779b97f4a7c15u64;
+            for batch in 0..batches {
+                let mut b = BundleState::builder(0..=0);
+                let sender = addr(100 + batch);
+                b = b
+                    .state_present_account_info(sender, info(1_000_000 - per * (batch + 1), per))
+                    .state_original_account_info(sender, info(1_000_000, 0))
+                    .revert_account_info(0, sender, Some(Some(info(1_000_000, 0))));
+                for _ in 0..per {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    // Drawn from a space a tenth the size of the block, so
+                    // most accounts are one batch's and some are several.
+                    let to = addr(1_000_000 + seed % (batches * per / 10));
+                    b = b.state_present_account_info(to, info(1 + batch, 0)).revert_account_info(0, to, Some(None));
+                }
+                b = b
+                    .state_present_account_info(beneficiary, info(7 + batch + 1, 0))
+                    .state_original_account_info(beneficiary, info(7, 0))
+                    .revert_account_info(0, beneficiary, Some(Some(info(7, 0))));
+                out.push(b.build());
+            }
+            out
+        };
+        let make = |fold: GraftFold, prefault: bool| {
+            let mut state =
+                State::builder().with_database(CacheDB::new(EmptyDB::default())).with_bundle_update().build();
+            // A target smaller than the block, so the graft also grows it.
+            let target = prefault.then(|| GraftTarget::prefaulted(1_000));
+            let graft =
+                graft_bundles_folded(&mut state, bundles(16, 500), beneficiary, false, fold, target).expect("the fold");
+            let mut accounts: Vec<(Address, Option<AccountInfo>, revm::database::AccountStatus)> = state
+                .bundle_state
+                .state
+                .iter()
+                .map(|(address, account)| (*address, account.info.clone(), account.status))
+                .collect();
+            accounts.sort_by_key(|(address, ..)| *address);
+            let mut reverts = graft.reverts;
+            reverts.sort_by_key(|(address, _)| *address);
+            (accounts, state.bundle_state.state_size, reverts, graft.accounts, graft.beneficiary_delta)
+        };
+        let direct = make(GraftFold::Direct, false);
+        assert!(direct.0.len() > 500, "the fixture is a block, not a handful");
+        for fold in [GraftFold::Direct, GraftFold::Indexed, GraftFold::IndexedRanges] {
+            for prefault in [false, true] {
+                assert_eq!(make(fold, prefault), direct, "{fold:?}, prefault {prefault}, on a block");
+            }
+        }
+    }
+
+    /// An account a batch created and destroyed again -- no present value,
+    /// no original, a revert of its own -- alone and as another batch's
+    /// recipient, beside a sender that is also paid: every fold leaves the
+    /// block what the fold in place does, including the reverts it keeps
+    /// for the account that has no value.
+    #[test]
+    fn the_indexed_fold_equals_the_graft_on_a_destroyed_account() {
+        let beneficiary = addr(9);
+        let info = fold_fixture_info;
+        let destroyed = addr(700);
+        let destroyed_then_paid = addr(701);
+        let bundles = || -> Vec<BundleState> {
+            let first = BundleState::builder(0..=0)
+                .state_present_account_info(addr(100), info(900, 1))
+                .state_original_account_info(addr(100), info(1_000, 0))
+                .revert_account_info(0, addr(100), Some(Some(info(1_000, 0))))
+                .state_address(destroyed)
+                .revert_address(0, destroyed)
+                .state_address(destroyed_then_paid)
+                .revert_address(0, destroyed_then_paid)
+                .state_present_account_info(addr(101), info(1_050, 0))
+                .state_original_account_info(addr(101), info(1_000, 0))
+                .revert_account_info(0, addr(101), Some(Some(info(1_000, 0))))
+                .state_present_account_info(beneficiary, info(8, 0))
+                .state_original_account_info(beneficiary, info(7, 0))
+                .revert_account_info(0, beneficiary, Some(Some(info(7, 0))))
+                .build();
+            let second = BundleState::builder(0..=0)
+                .state_present_account_info(addr(101), info(940, 1))
+                .state_original_account_info(addr(101), info(1_000, 0))
+                .revert_account_info(0, addr(101), Some(Some(info(1_000, 0))))
+                .state_present_account_info(destroyed_then_paid, info(10, 0))
+                .revert_account_info(0, destroyed_then_paid, Some(None))
+                .state_present_account_info(addr(100), info(1_010, 0))
+                .state_original_account_info(addr(100), info(1_000, 0))
+                .revert_account_info(0, addr(100), Some(Some(info(1_000, 0))))
+                .state_present_account_info(beneficiary, info(9, 0))
+                .state_original_account_info(beneficiary, info(7, 0))
+                .revert_account_info(0, beneficiary, Some(Some(info(7, 0))))
+                .build();
+            vec![first, second]
+        };
+        let make = |fold: GraftFold, keep_cache: bool, prefault: bool| {
+            let mut state =
+                State::builder().with_database(CacheDB::new(EmptyDB::default())).with_bundle_update().build();
+            let target = prefault.then(|| GraftTarget::prefaulted(64));
+            let graft =
+                graft_bundles_folded(&mut state, bundles(), beneficiary, keep_cache, fold, target).expect("the fold");
+            let mut accounts: Vec<(Address, Option<AccountInfo>, Option<AccountInfo>, revm::database::AccountStatus)> = state
+                .bundle_state
+                .state
+                .iter()
+                .map(|(address, account)| (*address, account.info.clone(), account.original_info.clone(), account.status))
+                .collect();
+            accounts.sort_by_key(|(address, ..)| *address);
+            let mut reverts = graft.reverts;
+            reverts.sort_by_key(|(address, _)| *address);
+            (accounts, state.bundle_state.state_size, reverts, graft.accounts, graft.beneficiary_delta)
+        };
+        for keep_cache in [false, true] {
+            let direct = make(GraftFold::Direct, keep_cache, false);
+            assert!(direct.2.iter().any(|(address, _)| *address == destroyed), "the destroyed account's revert is kept");
+            assert_eq!(direct.4, U256::from(3), "the beneficiary's credit from both batches");
+            let sender = direct.0.iter().find(|(address, ..)| *address == addr(101)).expect("the paid sender");
+            assert_eq!(sender.1.as_ref().map(|i| (i.balance, i.nonce)), Some((U256::from(990), 1)));
+            for fold in [GraftFold::Direct, GraftFold::Indexed, GraftFold::IndexedRanges] {
+                for prefault in [false, true] {
+                    assert_eq!(make(fold, keep_cache, prefault), direct, "{fold:?}, keep_cache {keep_cache}, prefault {prefault}");
+                }
+            }
+        }
+    }
+
+    /// What one full block's worth of inserts into the block's bundle map
+    /// costs, taken apart: a fresh table against one whose pages are already
+    /// mapped, and accounts in random order against the order of the
+    /// table's buckets. Plan v5 attempt D's question -- is the graft the
+    /// probes, the page faults or the bytes.
+    #[test]
+    #[ignore = "timing"]
+    fn bench_map_insert() {
+        use std::hash::BuildHasher as _;
+        let n = 161_760usize;
+        let info = AccountInfo { balance: U256::from(5u64), nonce: 1, ..Default::default() };
+        let account = BundleAccount::new(Some(info.clone()), Some(info), Default::default(), revm::database::AccountStatus::Changed);
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let addresses: Vec<Address> = (0..n)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                addr(seed)
+            })
+            .collect();
+        eprintln!("BundleAccount {} bytes, (Address, BundleAccount) {} bytes", std::mem::size_of::<BundleAccount>(), std::mem::size_of::<(Address, BundleAccount)>());
+        for round in 0..3 {
+            let mut fresh: BundleState = BundleState::default();
+            let at = std::time::Instant::now();
+            fresh.state.reserve(n);
+            let reserve = at.elapsed();
+            let at = std::time::Instant::now();
+            for address in &addresses {
+                fresh.state.insert(*address, account.clone());
+            }
+            let random_fresh = at.elapsed();
+            fresh.state.clear();
+            let at = std::time::Instant::now();
+            for address in &addresses {
+                fresh.state.insert(*address, account.clone());
+            }
+            let random_mapped = at.elapsed();
+            let hasher = fresh.state.hasher().clone();
+            let mut sorted = addresses.clone();
+            let mask = (fresh.state.capacity() * 8 / 7).next_power_of_two() as u64 - 1;
+            sorted.sort_by_key(|a| hasher.hash_one(*a) & mask);
+            fresh.state.clear();
+            let at = std::time::Instant::now();
+            for address in &sorted {
+                fresh.state.insert(*address, account.clone());
+            }
+            let sorted_mapped = at.elapsed();
+            let mut other: BundleState = BundleState::default();
+            other.state.reserve(n);
+            let at = std::time::Instant::now();
+            for address in &sorted {
+                other.state.insert(*address, account.clone());
+            }
+            let sorted_fresh = at.elapsed();
+            // The bytes alone: a vector of the same entries written in order.
+            let at = std::time::Instant::now();
+            let mut flat: Vec<(Address, BundleAccount)> = Vec::with_capacity(n);
+            for address in &addresses {
+                flat.push((*address, account.clone()));
+            }
+            let flat_fresh = at.elapsed();
+            eprintln!(
+                "round {round}: reserve {reserve:?}; random into fresh {random_fresh:?}, into mapped {random_mapped:?}; bucket order into fresh {sorted_fresh:?}, into mapped {sorted_mapped:?}; a flat vector {flat_fresh:?}"
+            );
+            drop((fresh, other, flat));
+        }
     }
 
     /// The build-mode run, committed in its order with the beneficiary
@@ -2301,10 +3398,38 @@ mod tests {
         }
     }
 
-    /// bench_build_run -- --ignored --nocapture`.
+    /// A full bench-tier block (162,000 transfers, 6,000 senders, recipients
+    /// drawn from two million) through the serial transfer path and through
+    /// [`execute_for_build`], timed -- with the three phases the build pays
+    /// after the execution named apart, because those are what plan v5
+    /// attempt D is about: the *collect* (the batches' results placed in
+    /// candidate order), the *commit* (the receipts and the block's body) and
+    /// the *fold* (the graft of the batches' bundles).
+    ///
+    /// ```text
+    /// RAYON_NUM_THREADS=16 taskset -c 0-31 \
+    ///   cargo test --release -p n42-engine-types --lib bench_build_run -- --ignored --nocapture
+    /// ```
+    ///
+    /// The transactions are the builder's own (`Recovered<N42TxEnvelope>`,
+    /// ~400 bytes each): with a unit payload the collect moves nothing and
+    /// reads a tenth of what a node's does.
+    ///
+    /// What it reads against loop214 (four nodes, 163,000-transfer blocks,
+    /// `RAYON_NUM_THREADS=16`): the leg's `par_exec_ms` 72-81,
+    /// `par_collect_ms` 18, `par_commit_ms` 18-22 and the graft
+    /// (`par_fold_ms` less `par_commit_ms`) 56-64. The bench, idle box
+    /// (2026-09-23): exec 94-96, collect 4-5, commit 9.5-10.5, graft 42-54,
+    /// the transactions root beside it 13.5-16 -- the graft within 1.3x of
+    /// the leg's, the commit at half, the collect at a quarter (the node's
+    /// transactions are the pool's, allocated by other threads, and its
+    /// memory is shared with three other nodes). With the transfers left
+    /// in their slots and the graft's memory mapped beside the execution:
+    /// collect 0, commit 5, graft 26.5-27, exec +2-3.
     #[test]
     #[ignore = "timing"]
     fn bench_build_run() {
+        use rayon::prelude::*;
         let senders = 6_000u64;
         let per = 27u64;
         let mut db = CacheDB::new(EmptyDB::default());
@@ -2339,9 +3464,32 @@ mod tests {
             }
         }
         let envs = order;
+        // The transactions themselves, as the builder hands them to the
+        // batches: the collect and the commit move these, not the envs.
+        let signed: Vec<n42_tx_types::N42TxEnvelope> = envs
+            .iter()
+            .map(|env| {
+                let inner = TxEip1559 {
+                    chain_id: 1,
+                    nonce: env.nonce,
+                    gas_limit: env.gas_limit,
+                    max_fee_per_gas: env.gas_price,
+                    max_priority_fee_per_gas: env.gas_priority_fee.unwrap_or_default(),
+                    to: env.kind,
+                    value: env.value,
+                    input: Bytes::new(),
+                    ..Default::default()
+                };
+                let signed = Signed::new_unchecked(inner, Signature::test_signature(), B256::random());
+                n42_tx_types::N42TxEnvelope::from(TransactionSigned::from(signed))
+            })
+            .collect();
         let header = Header { number: 20_000_000, beneficiary, gas_limit: 5_000_000_000, base_fee_per_gas: Some(1_000_000_000), timestamp: 1_800_000_000, ..Default::default() };
         let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
         let evm_env = evm_config.evm_env(&header).expect("env");
+        let keys: Vec<(Address, Address)> = envs.iter().map(|e| (e.caller, e.kind.to().copied().unwrap_or_default())).collect();
+        let convert = |i: usize| (Recovered::new_unchecked(signed[i].clone(), envs[i].caller), envs[i].clone());
+        println!("block: {} transfers, {} rayon threads", envs.len(), rayon::current_num_threads());
         for round in 0..3 {
             let at = std::time::Instant::now();
             let mut state = State::builder().with_database(db.clone()).with_bundle_update().build();
@@ -2364,25 +3512,163 @@ mod tests {
             let bundle = state.take_bundle();
             let merge = at.elapsed();
             eprintln!("serial: transfer {in_transfer:?} commit {in_commit:?} merge {merge:?} ({} accounts)", bundle.state.len());
-            let at = std::time::Instant::now();
-            let keys: Vec<(Address, Address)> = envs.iter().map(|e| (e.caller, e.kind.to().copied().unwrap())).collect();
-            let run = execute_for_build(&evm_env, &keys, &|i| ((), envs[i].clone()), &|| Some(db.clone())).expect("a block of transfers");
-            let groups = at.elapsed();
-            let at = std::time::Instant::now();
-            let mut state = State::builder().with_database(db.clone()).with_bundle_update().build();
-            // `keep_cache` false: what a block that seals early and a
-            // follower's import both use (nothing reads the cache after).
-            let graft = graft_bundles_with(&mut state, run.bundles, beneficiary, false).unwrap();
-            let grafted = at.elapsed();
+
+            // The build's own phases, once per fold, each on its own run of
+            // the same block. The fold is the one that differs; the others
+            // are printed so a leg's line can be read against this.
+            let mut direct: Option<(usize, usize, U256, usize, usize)> = None;
+            // (fold, collect in place, graft memory mapped beside the step)
+            let configs = [
+                (GraftFold::Direct, false, false),
+                (GraftFold::Indexed, false, false),
+                (GraftFold::IndexedRanges, false, false),
+                (GraftFold::Direct, true, false),
+                (GraftFold::Direct, true, true),
+                (GraftFold::Indexed, true, true),
+                (GraftFold::IndexedRanges, true, true),
+            ];
+            for (fold, in_place, prefault) in configs {
+                let at = std::time::Instant::now();
+                let (run, target) = std::thread::scope(|scope| {
+                    let target = prefault.then(|| scope.spawn(|| GraftTarget::prefaulted(keys.len() + keys.len() / 4)));
+                    let run = execute_for_build_in_place(&evm_env, &keys, &convert, &|| Some(db.clone()), None, in_place)
+                        .expect("a block of transfers");
+                    (run, target.map(|job| job.join().expect("the prefault does not panic")))
+                });
+                let par = at.elapsed();
+                let prefault_us = target.as_ref().map_or(0, |t| t.prefault_us);
+                let BuildRun { executed, bundles, skipped, phases, slots } = run;
+                // The receipts and the body, as the builder builds them for a
+                // block that seals early (`par_commit_ms`): out of the
+                // collected vector, or out of the slots by reference
+                // (`N42_BUILD_COLLECT_IN_PLACE`).
+                let at = std::time::Instant::now();
+                let (executed_count, transactions, tx_senders, receipts) = if in_place {
+                    let refs: Vec<&BuiltTransfer<_>> = slots.iter().filter_map(std::sync::OnceLock::get).collect();
+                    let mut cumulative = Vec::with_capacity(refs.len());
+                    let mut tx_gas = 0u64;
+                    for built in &refs {
+                        tx_gas += built.gas_used;
+                        cumulative.push(tx_gas);
+                    }
+                    let transactions: Vec<n42_tx_types::N42TxEnvelope> =
+                        refs.par_iter().map(|built| built.tx.inner().clone()).collect();
+                    let tx_senders: Vec<Address> = refs.par_iter().map(|built| built.tx.signer()).collect();
+                    let receipts: Vec<Receipt> = refs
+                        .par_iter()
+                        .zip(cumulative.par_iter())
+                        .map(|(built, cumulative_gas_used)| Receipt {
+                            tx_type: <n42_tx_types::N42TxEnvelope as alloy_consensus::TransactionEnvelope>::tx_type(built.tx.inner()),
+                            success: built.result.is_success(),
+                            cumulative_gas_used: *cumulative_gas_used,
+                            logs: built.result.logs().to_vec(),
+                        })
+                        .collect();
+                    (refs.len(), transactions, tx_senders, receipts)
+                } else {
+                    let executed_count = executed.len();
+                    let mut cumulative = Vec::with_capacity(executed_count);
+                    let mut tx_gas = 0u64;
+                    for built in &executed {
+                        tx_gas += built.gas_used;
+                        cumulative.push(tx_gas);
+                    }
+                    let (transactions, rest): (Vec<n42_tx_types::N42TxEnvelope>, Vec<(Address, Receipt)>) = executed
+                        .into_par_iter()
+                        .zip(cumulative.into_par_iter())
+                        .map(|(built, cumulative_gas_used)| {
+                            let tx_type =
+                                <n42_tx_types::N42TxEnvelope as alloy_consensus::TransactionEnvelope>::tx_type(built.tx.inner());
+                            let receipt = Receipt {
+                                tx_type,
+                                success: built.result.is_success(),
+                                cumulative_gas_used,
+                                logs: built.result.into_logs(),
+                            };
+                            let (tx, sender) = built.tx.into_parts();
+                            (tx, (sender, receipt))
+                        })
+                        .unzip();
+                    let (tx_senders, receipts): (Vec<Address>, Vec<Receipt>) = rest.into_par_iter().unzip();
+                    (executed_count, transactions, tx_senders, receipts)
+                };
+                let commit = at.elapsed();
+                // Freed off the chain, as the builder frees them.
+                build_pool().spawn(move || drop(slots));
+                // The fold, on a state of the block's own: `keep_cache` false
+                // is what a block that seals early uses.
+                // The transactions root runs beside it on the global pool,
+                // as the builder runs it for a block that seals early:
+                // `par_fold_ms` is the longer of the two.
+                let mut state = State::builder().with_database(db.clone()).with_bundle_update().build();
+                let at = std::time::Instant::now();
+                let (graft, grafted, root_took) = std::thread::scope(|scope| {
+                    let txs: &[n42_tx_types::N42TxEnvelope] = &transactions;
+                    let root = scope.spawn(move || {
+                        let at = std::time::Instant::now();
+                        let root = crate::assembler::parallel_transaction_root(txs);
+                        (root, at.elapsed())
+                    });
+                    let graft = graft_bundles_folded(&mut state, bundles, beneficiary, false, fold, target).expect("the fold");
+                    let grafted = at.elapsed();
+                    let (_root, root_took) = root.join().expect("the transactions root job does not panic");
+                    (graft, grafted, root_took)
+                });
+                let beside = at.elapsed();
+                let at = std::time::Instant::now();
+                state.merge_transitions(BundleRetention::Reverts);
+                let mut bundle = state.take_bundle();
+                let reverts = graft.reverts.len();
+                let accounts = graft.accounts;
+                let delta = graft.beneficiary_delta;
+                let inside = format!(
+                    "prepare {} sort {} merge {} apply {} reverts {}",
+                    graft.prepare_us / 1000,
+                    graft.sort_us / 1000,
+                    graft.merge_us / 1000,
+                    graft.apply_us / 1000,
+                    graft.reverts_us / 1000,
+                );
+                append_reverts(&mut bundle, graft.reverts);
+                let merge = at.elapsed();
+                // The first half of the builder's `roots_ms`: the QMDB
+                // operations, walked out of the bundle and sorted by key.
+                let at = std::time::Instant::now();
+                let ops = n42_qmdb_reth::sorted_operations_from_execution(&bundle, true);
+                let ops_took = at.elapsed();
+                eprintln!(
+                    "round {round} {fold:?} in_place {in_place} prefault {prefault} ({} ms beside): par {par:?} (partition {} ms, {} groups in {} batches, exec {} ms, collect {} ms, skipped {}) commit {commit:?} graft {grafted:?} [{inside}] tx root {root_took:?} graft|root {beside:?} (fold ~ commit + this) state_ready merge {merge:?} qmdb ops {ops_took:?} ({} ops) -> {} accounts, {} committed, {} reverts, {} txs, {} receipts",
+                    prefault_us / 1000,
+                    phases.partition_ms,
+                    phases.groups,
+                    phases.batches,
+                    phases.groups_ms,
+                    phases.collect_ms,
+                    skipped.len(),
+                    ops.len(),
+                    bundle.state.len(),
+                    graft.committed,
+                    bundle.reverts[0].len(),
+                    transactions.len(),
+                    receipts.len(),
+                );
+                assert_eq!(tx_senders.len(), transactions.len());
+                let here = (bundle.state.len(), accounts, delta, reverts, executed_count);
+                match &direct {
+                    None => direct = Some(here),
+                    Some(theirs) => assert_eq!(&here, theirs, "{fold:?} folds the block the way the fold in place does"),
+                }
+            }
 
             // The same block again, with each batch folding its bundle into
             // the staged graft as it finishes: what the execution hides and
             // what is left for the install.
+            let (_, grafted_accounts, delta, revert_count, executed_count) = direct.expect("the direct fold ran");
             let at = std::time::Instant::now();
             let staged = std::sync::Mutex::new(StagedGraft::new(beneficiary, keys.len()));
             let sink = |bundle: BundleState| staged.lock().expect("the staged graft's lock").add(bundle);
             let streamed_run =
-                execute_for_build_with(&evm_env, &keys, &|i| ((), envs[i].clone()), &|| Some(db.clone()), Some(&sink))
+                execute_for_build_with(&evm_env, &keys, &convert, &|| Some(db.clone()), Some(&sink))
                     .expect("a block of transfers");
             let streamed_groups = at.elapsed();
             let at = std::time::Instant::now();
@@ -2390,9 +3676,9 @@ mod tests {
             let installed =
                 install_staged(&mut streamed_state, staged.into_inner().expect("the staged graft's lock"), false).unwrap();
             let installed_ms = at.elapsed();
-            assert_eq!(installed.accounts, graft.accounts, "the staged graft holds the same accounts");
-            assert_eq!(installed.beneficiary_delta, graft.beneficiary_delta);
-            assert_eq!(streamed_run.executed.len(), run.executed.len());
+            assert_eq!(installed.accounts, grafted_accounts, "the staged graft holds the same accounts");
+            assert_eq!(installed.beneficiary_delta, delta);
+            assert_eq!(streamed_run.executed.len(), executed_count);
             // The same block again with the fold spread over shards, one lock
             // each: what the single mutex costs the parallel step is the
             // question (loop176: +65 ms on the fleet), and what the shards
@@ -2402,32 +3688,23 @@ mod tests {
             let sharded = ShardedGraft::new(beneficiary, keys.len(), shard_count);
             let shard_sink = |bundle: BundleState| sharded.add(bundle);
             let sharded_run =
-                execute_for_build_with(&evm_env, &keys, &|i| ((), envs[i].clone()), &|| Some(db.clone()), Some(&shard_sink))
+                execute_for_build_with(&evm_env, &keys, &convert, &|| Some(db.clone()), Some(&shard_sink))
                     .expect("a block of transfers");
             let sharded_groups = at.elapsed();
             let staged_accounts = sharded.accounts();
             let at = std::time::Instant::now();
             let (merged_state, _size, merged_reverts, merged_delta) = sharded.merge();
             let merged_ms = at.elapsed();
-            assert_eq!(sharded_run.executed.len(), run.executed.len());
-            assert_eq!(merged_state.len(), graft.accounts, "the shards hold what the graft does");
-            assert_eq!(staged_accounts, graft.accounts);
-            assert_eq!(merged_delta, graft.beneficiary_delta);
-            assert_eq!(merged_reverts.len(), graft.reverts.len());
+            assert_eq!(sharded_run.executed.len(), executed_count);
+            assert_eq!(merged_state.len(), grafted_accounts, "the shards hold what the graft does");
+            assert_eq!(staged_accounts, grafted_accounts);
+            assert_eq!(merged_delta, delta);
+            assert_eq!(merged_reverts.len(), revert_count);
             eprintln!(
-                "round {round}: streamed: execution+fold {streamed_groups:?} (exec alone was {groups:?}), install {installed_ms:?}  ==  after: execution {groups:?} + graft {grafted:?}"
+                "round {round}: serial {serial:?}; streamed: execution+fold {streamed_groups:?}, install {installed_ms:?}"
             );
             eprintln!(
                 "round {round}: sharded ({shard_count} shards): execution+fold {sharded_groups:?}, merge to one map {merged_ms:?}"
-            );
-            let at = std::time::Instant::now();
-            state.merge_transitions(BundleRetention::Reverts);
-            let mut bundle = state.take_bundle();
-            append_reverts(&mut bundle, graft.reverts);
-            let merge = at.elapsed();
-            eprintln!(
-                "round {round}: serial {serial:?}; parallel {groups:?} (partition {} ms, {} groups in {} batches, exec {} ms, skipped {}) + graft {grafted:?} ({} accounts, {} committed) + merge {merge:?} ({} accounts, {} reverts)",
-                run.phases.partition_ms, run.phases.groups, run.phases.batches, run.phases.groups_ms, run.skipped.len(), graft.accounts, graft.committed, bundle.state.len(), bundle.reverts[0].len()
             );
         }
     }

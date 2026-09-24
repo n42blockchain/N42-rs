@@ -912,6 +912,32 @@ fn fresh_buffers() -> bool {
     *FRESH.get_or_init(|| std::env::var("N42_PAYLOAD_SERVE_FRESH_BUFFERS").is_ok())
 }
 
+/// Puts the block by description's transaction list into its payload, once
+/// the copy running beside the import has finished; nothing to do on every
+/// other road. A copy that failed leaves the list empty, and the engine's
+/// own pass then refuses the payload rather than executing an empty block
+/// under the header: logged, because the direct import has already answered.
+async fn complete_listing(
+    data: &mut alloy_rpc_types_engine::ExecutionData,
+    raw_transactions: &mut Vec<alloy_primitives::Bytes>,
+    listing: &mut Option<tokio::task::JoinHandle<Vec<alloy_primitives::Bytes>>>,
+    number: u64,
+) {
+    let Some(pending) = listing.take() else { return };
+    let waited_at = std::time::Instant::now();
+    match pending.await {
+        Ok(list) => {
+            raw_transactions.clone_from(&list);
+            data.payload.as_v1_mut().transactions = list;
+        }
+        Err(err) => warn!(target: "n42.payload_serve", number, %err, "the described block's payload list was not copied out"),
+    }
+    let waited_ms = waited_at.elapsed().as_millis() as u64;
+    if waited_ms > 0 {
+        debug!(target: "n42.payload_serve", number, waited_ms, "waited for the described block's payload list");
+    }
+}
+
 /// Imports one block the validator handed over, whatever request carried it.
 ///
 /// `data` is the payload the engine's own pass takes; `converted` is the
@@ -935,6 +961,11 @@ async fn import_for_validator<T>(
     // this node's queue. `None` and the import recovers them as it always
     // did.
     pre_senders: Option<Vec<alloy_primitives::Address>>,
+    // The block by description's payload list (`N42_BLOCK_BY_DESCRIPTION`):
+    // `data` then lists no transactions, and they are copied out of the
+    // encoded chunks beside the import and put back before the engine's own
+    // pass -- the only reader of the list.
+    payload_list: Option<n42_engine_types::engine_validator::PayloadList>,
     started: std::time::Instant,
     decoded: std::time::Duration,
     mut road: crate::follower_import::VoteRoad,
@@ -942,8 +973,15 @@ async fn import_for_validator<T>(
 where
     T: PayloadTypes<BuiltPayload = N42BuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
 {
+    let mut data = data;
     let number = data.payload.block_number();
-    let txs = data.payload.as_v1().transactions.len();
+    let txs = match (&payload_list, &pre_converted) {
+        (Some(_), Some(block)) => block.body().transactions.len(),
+        _ => data.payload.as_v1().transactions.len(),
+    };
+    // Copied on the blocking pool while the import runs; joined where the
+    // list is first read.
+    let mut listing = payload_list.map(|list| tokio::task::spawn_blocking(move || list.copy_out()));
     // One of ours, sealed: hand the engine the build's execution
     // first, and the newPayload below finds the block known.
     //
@@ -951,7 +989,10 @@ where
     // it is a round trip to the blocking pool before the vote road's own
     // hand-off has even been made.
     let reuse_at = std::time::Instant::now();
-    let reused = match reuse {
+    // Not on the described road: its payload has no list yet, and a
+    // compact body is never one of this node's own builds (those arrive as
+    // `request::OWN_BLOCK`).
+    let reused = match reuse.filter(|_| listing.is_none()) {
         Some(reuse) => reuse_own_build::<T>(reuse, &data).await.is_some(),
         None => false,
     };
@@ -961,8 +1002,8 @@ where
     let prepare_at = std::time::Instant::now();
     // The transactions' bytes, kept for the prune below; the
     // payload itself goes to the engine.
-    let raw_transactions = data.payload.as_v1().transactions.clone();
-    let probe = reuse.and_then(|r| r.exec_probe.clone()).filter(|_| !reused && txs > 10_000);
+    let mut raw_transactions = data.payload.as_v1().transactions.clone();
+    let probe = reuse.and_then(|r| r.exec_probe.clone()).filter(|_| !reused && txs > 10_000 && listing.is_none());
     let probe_data = probe.as_ref().map(|_| data.clone());
     // Another node's block: executed here and handed to the
     // engine as executed, when configured. Any failure logs
@@ -1226,6 +1267,7 @@ where
         {
             warn!(target: "n42.payload_serve", number, %err, "remembering the sealed block failed; the engine will decode it again");
         }
+        complete_listing(&mut data, &mut raw_transactions, &mut listing, number).await;
         let engine_at = std::time::Instant::now();
         match engine.new_payload(data).await {
             Ok(status) if !status.status.is_valid() => warn!(
@@ -1273,6 +1315,7 @@ where
     {
         warn!(target: "n42.payload_serve", number, %err, "remembering the sealed block failed; the engine will decode it again");
     }
+    complete_listing(&mut data, &mut raw_transactions, &mut listing, number).await;
     match engine.new_payload(data).await {
         Ok(status) => {
             if let (Some(probe), Some(probe_data)) = (probe, probe_data) {
@@ -1590,9 +1633,53 @@ where
                     .ok_or_else(|| {
                         CompactRefusal::Said("no transaction queue; send the whole body".to_owned())
                     })?;
-                validator
-                    .convert_compact_body_to_block(announced, profile, body, &queue, miss_wait())
-                    .map_err(CompactRefusal::Refused)
+                if !n42_tx_queue::block_by_description() {
+                    return validator
+                        .convert_compact_body_to_block(announced, profile, body, &queue, miss_wait())
+                        .map(|assembled| (assembled, None))
+                        .map_err(CompactRefusal::Refused);
+                }
+                // `N42_BLOCK_BY_DESCRIPTION`: the list checked against the
+                // header with the queue's transactions held by reference,
+                // then the one copy reth's block type forces.
+                let mut described = validator
+                    .describe_compact_body(announced, profile, body, &queue, miss_wait())
+                    .map_err(CompactRefusal::Refused)?;
+                let make_at = std::time::Instant::now();
+                // The payload travels with an empty list until the import
+                // has answered; the list is copied out of the encoded
+                // transactions beside it (`import_for_validator`).
+                let payload = described.header_payload();
+                let list = described.take_payload_list();
+                let made = described.maker(&payload).make(&validator).map_err(CompactRefusal::Refused)?;
+                let senders = std::mem::take(&mut described.senders);
+                let make_us = make_at.elapsed().as_micros() as u64;
+                let (describe_us, root_us, miss_wait_us, misses, fill_us, filled, described_us) = (
+                    described.describe_us,
+                    described.root_us,
+                    described.miss_wait_us,
+                    described.misses,
+                    described.fill_us,
+                    described.filled,
+                    described.total_us,
+                );
+                // 163,000 references released, ~4 ms: not on the road.
+                rayon::spawn(move || drop(described));
+                Ok((
+                    n42_engine_types::engine_validator::AssembledBlock {
+                        block: made.block,
+                        payload,
+                        senders,
+                        assemble_us: describe_us.saturating_sub(root_us),
+                        root_us,
+                        miss_wait_us,
+                        misses,
+                        fill_us,
+                        filled,
+                        total_us: described_us + make_us,
+                    },
+                    Some((made.copy_us, list)),
+                ))
             });
             // A miss small enough to be worth asking for: the positions go
             // back on their own frame and the validator fetches just those
@@ -1657,6 +1744,11 @@ where
                     continue;
                 }
             };
+            let (assembled, described) = assembled;
+            let (copied, payload_list) = match described {
+                Some((copy_us, list)) => (Some(copy_us), Some(list)),
+                None => (None, None),
+            };
             let n42_engine_types::engine_validator::AssembledBlock {
                 block: sealed,
                 payload: data,
@@ -1671,6 +1763,8 @@ where
             } = assembled;
             info!(
                 target: "n42.payload_serve",
+                by_description = copied.is_some(),
+                copy_ms = copied.unwrap_or(0) / 1000,
                 number = sealed.number,
                 txs = sealed.body().transactions.len(),
                 bytes = len,
@@ -1686,12 +1780,14 @@ where
             );
             let decoded_in = started.elapsed();
             let road = crate::follower_import::VoteRoad {
-                request: "compact_body",
+                request: if copied.is_some() { "block_by_description" } else { "compact_body" },
                 recv_us: recv.as_micros() as u64,
                 // What the assembly cost that the named parts below do not:
                 // the compact frame's decode, the seal, and reth's fork
                 // checks.
-                decode_us: total_us.saturating_sub(assemble_us + root_us + miss_wait_us + fill_us),
+                decode_us: total_us
+                    .saturating_sub(assemble_us + root_us + miss_wait_us + fill_us + copied.unwrap_or(0)),
+                copy_us: copied.unwrap_or(0),
                 reuse_us: 0,
                 prepare_us: 0,
                 dispatch_us: 0,
@@ -1713,6 +1809,7 @@ where
                 data,
                 Some(sealed),
                 Some(senders),
+                payload_list,
                 started,
                 decoded_in,
                 road,
@@ -1799,10 +1896,11 @@ where
                 miss_wait_us: 0,
                 misses: 0,
                 fill_us: 0,
+                copy_us: 0,
                 filled: 0,
                 started: started_at,
             };
-            import_for_validator::<T>(&mut stream, &mut out, &engine, reuse.as_ref(), data, Some(sealed), None, started, decoded_in, road).await?;
+            import_for_validator::<T>(&mut stream, &mut out, &engine, reuse.as_ref(), data, Some(sealed), None, None, started, decoded_in, road).await?;
             continue;
         }
         if kind == request::NEW_PAYLOAD {
@@ -1851,6 +1949,7 @@ where
                         data,
                         None,
                         None,
+                        None,
                         started,
                         started.elapsed(),
                         crate::follower_import::VoteRoad {
@@ -1867,6 +1966,7 @@ where
                             miss_wait_us: 0,
                             misses: 0,
                             fill_us: 0,
+                            copy_us: 0,
                             filled: 0,
                             started: started_at,
                         },

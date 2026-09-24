@@ -529,9 +529,16 @@ pub fn body_once() -> bool {
 /// It implies [`body_once`]: a compact body has no payload road to fall
 /// back to on this node, so the whole path only exists where the body is
 /// handed to the execution layer as it arrived.
+///
+/// `N42_BLOCK_BY_DESCRIPTION=1` implies it as well: the wire is the same
+/// compact body, and only the follower's execution layer reads it otherwise.
 pub fn compact_body() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("N42_COMPACT_BODY").is_ok_and(|v| v == "1") && body_once())
+    *ON.get_or_init(|| {
+        (std::env::var("N42_COMPACT_BODY").is_ok_and(|v| v == "1")
+            || std::env::var("N42_BLOCK_BY_DESCRIPTION").is_ok_and(|v| v == "1"))
+            && body_once()
+    })
 }
 
 /// `N42_COMMIT_FCU_ASYNC`, read once: opt-in, and only the *default* for a

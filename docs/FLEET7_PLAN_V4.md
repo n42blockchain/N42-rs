@@ -1406,3 +1406,42 @@ What a four-node leg must read, `N42_BUILD_COLLECT_IN_PLACE=1 N42_GRAFT_PREFAULT
 
 Each attempt is one agent brief and one runner; the bar for adopting any is the same as plan v4's: window 2 in every leg,
 verify 4/4, and the number it targets moving on the fleet, not on a bench.
+
+## 6. Plan v6: the ceilings between 690k and 1M, redrawn after plan v5 (2026-09-24)
+
+Where it stands: four nodes, the configuration of 5.8 plus `N42_BUILD_COLLECT_IN_PLACE=1`, window 1 674-690k, window 2
+614-655k, cycle 229-236 ms, 163,000-transfer blocks. 1M is this block at a 163 ms cycle (5.2: the block size is not a
+lever; the cycle is per-transaction). What plan v5 settled: B is halved (C), the supply's cost is the signature and
+not its scheduling (B, 5.3-5.4), the tenure is 256 (F), the follower's import is pipelined and under the cycle. What
+binds now is one thing.
+
+| # | ceiling | measured (loop221-223) | rate it allows alone | to 163 ms |
+| --- | --- | --- | --- | --- |
+| 1 | **the leader's parallel step + the chain's restart** = the build period | `sealed_at` 186 = pull 21 + prep 11 + exec 65 + commit 16 + fold/graft 73; the next build starts ~45 after the seal (waits for the parent's state, `find_ms` 15-20, `queue_ms` 16); period ~230 | **~710k** | the step to ~120 and the restart to ~15: graft 73 -> ~15, exec 65 -> ~35, pull+prep 32 -> ~20 |
+| 2 | B, the road to the 2nd vote | 72-83 (transfer 43 is most of it now) | ~1.5M | nothing until 1 is done |
+| 3 | the follower's import | 160-186 (exec 84-96, root 30, insert 49), pipelined | ~900k; must stay under the cycle | at 163 ms it is level: exec's groups (50, memory-bound) need the prefetch |
+| 4 | the supply's signatures | 13 us CPU a transaction (0x50 batch), 550k/s = 7 cores a node of 28 | ~1M before the ingest collides with 1 and 3 (13 cores at 1M) | a cheaper signature only; not this plan |
+| 5 | fixed parts: C + F + the pacing floor | ~12 ms + pacing 175 (the cycle is 230 anyway) | -- | pacing to 125 once 1 moves |
+
+**The attempts, in order of what they are worth, each with its falsification:**
+
+- **G. The graft's 55 ms, named on the fleet first** (loop224, a perf leg of the leader's execution layer; no agent
+  until it is read). Then the representation: for transfers every recipient update is an ADD -- commutative -- so the
+  batches need not carry bundle states to merge: a batch keeps (sender: final nonce, balance) and (recipient: delta);
+  the block's bundle is one parallel sort of ~300k (address, delta) keys and a linear sum, not 163,000 probes into a
+  43 MB map. The fast-transfer path (`N42_FAST_TRANSFER`) already knows a transaction is a plain transfer.
+  Falsified if `par_fold_ms` does not fall under 25 on the fleet with roots identical on four nodes.
+- **H. The leader's execution at 65 ms** = 6.4 us of CPU a transfer on 16 threads: a plain transfer is ~1 us of
+  work, the rest is the state read (QMDB read view, cache misses on 150k scattered accounts). The pull knows every
+  sender and recipient before the execution: prefetch the block's accounts into the cache on the pool while the pull
+  and prep run (`N42_BUILD_PREFETCH=1`), so the execution reads warm memory. Falsified if `par_exec_ms` does not fall
+  under 45 with the prefetch hidden behind pull+prep.
+- **J. The chain's restart at ~45 ms**: the next build waits for the parent's state to be installed (`StateReady`,
+  15-20) and the queue's hand-off (16); a build on the parent's *published output* (as the follower executes, 2w) would
+  start at the seal. Falsified if `find_ms` + `queue_ms` on chained builds do not fall under 10.
+- **I. pull + prep at 32 ms**: the puller's batches and the transaction environments could be made during the previous
+  block's fold (the queue's next run is known). Last, smallest.
+- **E (import prefetch)** is needed at 163 ms, not before: the import is level with the cycle then.
+
+If G + H + J land as sized, the parallel step is ~120 and the restart ~15: a 135 ms period, and the cycle is then B
+(72) + D/E small + fixed ~12 = ~100-135 ms -- 1.2M at this block. The pacing then goes to 125 or off.

@@ -1506,3 +1506,23 @@ groups on the fleet.
   answered per overlay depth settles it (L). If so the 65 ms of the leader's execution and the follower's 65-70 of
   groups are the overlay's depth, and the lever is a flatter overlay (one merged map kept incrementally) or a view
   that runs closer to the head.
+
+### 6.5 The overlay's depth as configuration (loop228): not it, and the counter says the reads go elsewhere
+
+| | R | PT2 a / b (persist at 2, buffer 2) | PT4 | Dc (counts on) |
+| --- | --- | --- | --- | --- |
+| leader exec / `sealed_at` | 61 / 213 | 69 / 227, 71 / 227 | 68 / 222 | 66 / 225 |
+| follower groups / import exec | -- | 68 / 108, 69 / 110 | 58 / 102 | 69 / 109 |
+| `reader_lag` max | 14 | 19 / 18 | 12 | 30 |
+| cycle / E | 220 / 38 | 227 / 40, 224 / 40 | 225 / 43 | -- |
+| window 1 / 2 | -- | 690k / 670k (b) | 630k / 500k | 616k (2) |
+
+- Persisting within two blocks moves nothing (exec 69-71, groups 68-69) and the view's lag barely (18-19): the
+  in-memory overlay's depth is not the cost. Falsified as configuration.
+- The counter: the leader's build makes ~3,966 counted account reads a block, the follower's import ~3,128, all at
+  depth 0 and none historical -- against ~150,000 distinct accounts a block. **The execution's reads do not go through
+  the overlay provider the counter wraps**: the fast-transfer path reads through another door (K's report: the hot
+  callers reach the view through `N42StateReader`, a vendored trait). So neither the view's lock (K) nor the overlay's
+  depth (L) is what 65 ms of execution and 60-70 of groups are made of, and the two benches that "reproduced" the
+  numbers reproduced them by other causes. The instrument that says where those milliseconds go is a profile of the
+  running leader; failing that, timers inside the fast path (reads / EVM / write-back) and inside the graft.

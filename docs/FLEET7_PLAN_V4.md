@@ -1584,3 +1584,44 @@ and attempt E (import prefetch) becomes the next term.
 follower's or the chained build's path. Falsified if `sealed_at_ms` does not fall under 140 on full blocks, or if it
 does and win1 does not rise above 760k because the chained build's exec waits for the parent's fold (a relocation:
 read `par_exec_ms` and the chained build's wait on the parent).
+
+### 6.7 G2 on the fleet (loop230, loop231): the seal moves 70 ms earlier and the chained build's setup absorbs all of it
+
+`plan-v6/seal-at-exec` (merged f2d104590, `N42_SEAL_AT_EXEC=1` off): the transactions root is computed on its own
+thread from the pulled set while the batches execute and taken at the seal when nothing was skipped
+(`tx_root_ahead`, `tx_root_wait_ms`); the seal follows the body's collection; the commit, the graft, the fee credit,
+the withdrawal put-back and the give-backs run behind the proposal under `failed_after_seal`.
+
+**loop230 was void**: every ahead seal was refused by the later gate as "no early seal asked for this build" -- the
+seal had taken `early_seal` with it, and the gate's first test was `early_seal.is_none()`. Each such build was
+proposed and then failed behind the seal, the chain fell back to the ordinary import at a 0.41 s cycle, 397k. Fixed
+in the gate (a block sealed at the step's end counts as asked) and re-run as loop231:
+
+| leg | win1 | win2 | sealed_at | setup | pull+prep+part | exec | fold | tx_root_wait |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| warm | 619,373 | 418,316 (stall) | 224 | 14 | 25+11+3 | 64 | 79 | -- |
+| G2a | 722,368 | 564,925 | **217** | **74** | 24+11+3 | 70 | 75 | 0 |
+| R | 727,729 | 666,859 | 225 | 14 | 24+11+3 | 65 | 77 | -- |
+| G2b | 732,843 | 211,707 (stall) | **217** | **76** | 26+11+3 | 65 | 77 | 0 |
+
+No errors on either G2 leg; 810 / 419 builds sealed ahead with the root ahead every time (its wait 0). The seal did
+move: on a G2 build it comes right after the execution, ~70 ms earlier in the build than before -- and the build's
+`setup_ms` grew from 14 to 74-76, so `sealed_at_ms` is 217 against 224 and win1 is the same 722-733k. The
+relocation the plan named, exactly: the chained build (J) starts at the parent's seal and its first act is
+`open_parent_state()` (payload.rs ~723, `opener_on_sealed_parent` waiting for the parent's `StateReady`), which
+now comes ~70 ms *after* the seal instead of ~15 ms before it. The pull, the prep and the partition (38 ms), which
+need the queue and the parent header but not the parent's state, sit behind that wait. **The period is the chain
+exec -> fold -> state ready -> (next) exec, ~65 + 77 + 16 + the setup's residue, and where the seal sits inside it
+does not change its length.**
+
+What G2 bought is the *place* to overlap: with the seal at the exec's end, the next build's pull+prep+part can run
+during the parent's fold if the state is opened only when the exec needs it. Attempt **G3** (`plan-v6/state-after-pull`,
+flag `N42_STATE_AFTER_PULL=1`): move `open_parent_state()` and everything that needs it (the executor over the
+state provider, the cached reads) to just before the parallel step's execution, after the pull, the prep and the
+partition. Expected: setup ~15, the state wait ~30 (70 minus the 38 the pull covers), sealed_at ~180, period ~180
+-> ~880k at this block if the follower's import (179-213) does not become the wall first -- which it will at ~200;
+attempt E (import prefetch) is then the next term. Falsified if `setup_ms` + the new `state_wait_ms` on a G2+G3
+build are not under 45, or if they are and win1 stays under 760k.
+
+The stall on G2b's window 2 (39 blocks at 0.77 s, tc=1) and on the warm leg's (77 blocks at 0.39 s, tc=1, flag off)
+are the pacing-175 stall that recurs at random since loop226; still unread.

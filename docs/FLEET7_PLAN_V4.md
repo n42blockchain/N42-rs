@@ -1786,3 +1786,35 @@ the follower's import (207+) is longer than the cycle it must keep up with, and 
    of it: it moves the followers' verification onto the vote road (13 us x 163k a block, 5.x's relocation), so
    the leg would measure the road, not the contention. The design question for 1M on this box is where
    signatures are verified -- once, or by a quorum's worth of nodes rather than all -- not how fast.
+
+### 6.13 The gap before the ahead seal, named (loop237): the parent's state wait and the build's first 19 ms, not the seal
+
+`plan-v6/seal-gap` (merged 32f111136; timers on by default, the pooled slot passes and the deferred cumulative gas
+on the flag-on path): the leader's build now accounts for itself. On a full G2+G3 block (medians over the leg):
+
+| par_start | pull | prep | pre_exec | par_run = part + state_wait + exec | scope_join | commit | seal | residue | sealed_at |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 18-20 | 21-22 | 11-12 | 0 | 91-98 = 3 + 19-26 + 68-69 | 0 | 9 (was 15) | 7 | ~8 | **171-177** |
+
+So the "39 ms" of 6.11 was three things already on the line or just off it: the commit (15, now 9), the wait for
+the parent's state (`state_wait_ms` 19-26 -- the parent's fold of 76 and its `state_ready` of 20 end ~25 ms after
+the child has pulled, prepped and partitioned), and **`par_start_ms` 18-20: the build's first 19 ms, before the
+pull** (the puller's start, `cons.prepare`, the block environment; it was under `setup_ms` 0 because that timer
+ended earlier). The seal itself is 7. The period did not move (sealed_at 171-177 against 173-183).
+
+| leg | win1 | win2 | cycle (full) | B | D | txs p10 | note |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| warm | 555,146 | 733,628 | 199 | 77 | 90 | 148,000 | window-1 stall, flood 0/s at 45 s |
+| G175 | 548,127 | 660,826 | 195 | 78 | 90 | 146,500 | window-1 stall |
+| G150 | **746,060** | 645,772 | 202 | 87 | 64 | 149,000 | the best window 1 to date, 95% occupancy |
+| G175b | 551,396 | 694,508 | 195 | 72 | 99 | 146,500 | window-1 stall |
+
+Three of four legs lost window 1 to the stall (cycle 0.288 over the window, `engine_idles_over_5s` 2-3): it is
+now the largest source of variance in the campaign and is read next (a log pass: what the nodes and the flood do
+in the 7 s). G150's 746k came at 95% occupancy -- every block short of 163k because the supply is 730-750k/s.
+
+What the leader's period is made of now, and what each term needs: par_start 19 (name it; likely the pool's
+`best_transactions` snapshot and the puller's thread), pull+prep 33 (attempt I: the queue's next run prepared
+during the parent's fold), state_wait 22 (the parent's graft insert, 40 of the fold's 76, single-threaded: attempt
+G proper, a sharded insert on the pool -- it also shortens the follower's merge 18), exec 69 (the reads, 6.6), the
+rest 30. The follower's import (207-229) is F1, in flight.

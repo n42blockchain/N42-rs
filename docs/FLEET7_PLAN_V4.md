@@ -1920,3 +1920,22 @@ Supply is the binding term for throughput: at full blocks the fleet reads what t
 as today, half the requests) -- loop240. On the leader's side the period's terms are G proper (the parent's
 graft insert sharded so the chained build's `state_wait` 20 goes to 0), `par_start` 19 named and cut, and
 attempt I (pull + prep during the parent's fold, 33) -- together ~70 of the 161, in flight as one agent.
+
+### 6.17 The flood's frame size (loop240): it is the transactions in flight, not the requests
+
+| leg | in flight | win1 | win2 | flood win1 (k/s) | reply ms | cycle | B | TCs |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| warm (64 x 500) | 32k | 736,067 | 622,842 | 751 | 240-254 | 196 | 77 | 1 |
+| RB1000 (64 x 1000) | 64k | 525,262 | 228,226 | 644 | 521-577 | 236 | **160** | 8 |
+| RB1000C32 (32 x 1000) | 32k | **761,971** | 662,336 | 740 | 228-242 | 196 | 82 | 1 |
+| RB1000b (64 x 1000) | 64k | 84,039 | 336,845 | 619 | 517-599 | -- | 122 | 23 |
+
+Sixty-four thousand transactions in flight at the ingest -- whether as 128 requests of 500 (6.12, 6.16) or 64 of
+1000 -- cost the followers' road B ~80 ms and the flood its rate (the replies go from 240 to 550 ms, the same
+transactions a second arrive later); thirty-two thousand as 32 requests of 1000 behave exactly like 64 of 500
+(762k, B 82). So the supply is not bound by the request count, the frame size, the recovery slots or the runtime's
+workers: **something on the follower's proposal-to-vote path is slowed by the transactions waiting at its ingest**,
+by ~80 ms for 32k more of them, and the execution layer's own `vote road` line shows only +14 of it (6.15). What
+that is -- the queue's lock held by the admission, the validator's request for the body waiting behind ingest
+frames on the same HTTP server, the pool's memory -- is read next from RB1000 against RB1000C32 (same frames, twice
+the in-flight). Until it is named the supply stays at ~750k/s, and the throughput at ~770k.

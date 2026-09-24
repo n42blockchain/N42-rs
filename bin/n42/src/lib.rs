@@ -30,6 +30,13 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
+// The library's tests run on the node's allocator: the benches below time
+// passes over memory a dozen threads allocated, and the system allocator
+// lays that memory out differently from the jemalloc the node runs on.
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: reth_cli_util::allocator::Allocator = reth_cli_util::allocator::new_allocator();
+
 pub mod cli;
 
 pub mod consensus_ext;

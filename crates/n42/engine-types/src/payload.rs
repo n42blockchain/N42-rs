@@ -1798,9 +1798,11 @@ where
     // it: `build on own block refused` and `early seal that did not happen`
     // never fired in five legs while two of them lost the seal for a whole
     // tenure, because the gate simply falls through to the ordinary finish.
-    let no_seal_why = if early_seal.is_none() {
+    let no_seal_why = if early_seal.is_none() && sealed_ahead.is_none() {
         // The reth payload service's own path (`try_build`) asks for no
         // early seal; that is the first build of a tenure, not a defect.
+        // A block sealed at the parallel step's end took `early_seal` with
+        // it (loop230: every such build was refused here as "not asked").
         "no early seal asked for this build"
     } else if !deferred_now {
         "deferred execution is not active at this timestamp"

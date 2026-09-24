@@ -704,11 +704,12 @@ pub fn graft_bundles_with<DB: Database>(
 /// this: [`take_base_bundle`] moves it into the target's map rather than
 /// putting its own map in the target's place.
 fn install_target<DB: Database>(state: &mut State<DB>, target: Option<GraftTarget>, graft: &mut Graft) {
-    if let Some(target) = target {
-        if state.bundle_state.state.is_empty() && state.bundle_state.state.capacity() == 0 {
-            state.bundle_state.state = target.accounts;
-            graft.reverts = target.reverts;
-        }
+    if let Some(target) = target
+        && state.bundle_state.state.is_empty()
+        && state.bundle_state.state.capacity() == 0
+    {
+        state.bundle_state.state = target.accounts;
+        graft.reverts = target.reverts;
     }
 }
 
@@ -982,12 +983,12 @@ impl GraftTarget {
             bytes[19] = 0xfa;
             let address = Address::from(bytes);
             let run_of = ((hasher.hash_one(address) & mask) / run) as usize;
-            if let Some(seen) = touched.get_mut(run_of) {
-                if !*seen {
-                    *seen = true;
-                    left -= 1;
-                    map.insert(address, empty.clone());
-                }
+            if let Some(seen) = touched.get_mut(run_of)
+                && !*seen
+            {
+                *seen = true;
+                left -= 1;
+                map.insert(address, empty.clone());
             }
             k += 1;
         }
@@ -1355,22 +1356,20 @@ fn graft_indexed_into<DB: Database>(
             let Some((address, mut account)) = parts[part as usize][bin as usize][pos as usize].take() else {
                 continue;
             };
-            if let Some((_, add, sub, nonce)) = delta {
-                if let Some(info) = account.info.as_mut() {
-                    info.balance = info.balance.saturating_add(add).saturating_sub(sub);
-                    info.nonce += nonce;
-                }
+            if let Some((_, add, sub, nonce)) = delta
+                && let Some(info) = account.info.as_mut()
+            {
+                info.balance = info.balance.saturating_add(add).saturating_sub(sub);
+                info.nonce += nonce;
             }
-            if keep_cache {
-                if let Some(info) = account.info.as_ref() {
-                    state.cache.accounts.insert(
-                        address,
-                        CacheAccount {
-                            account: Some(PlainAccount { info: info.clone(), storage: Default::default() }),
-                            status: account.status,
-                        },
-                    );
-                }
+            if keep_cache && let Some(info) = account.info.as_ref() {
+                state.cache.accounts.insert(
+                    address,
+                    CacheAccount {
+                        account: Some(PlainAccount { info: info.clone(), storage: Default::default() }),
+                        status: account.status,
+                    },
+                );
             }
             state.bundle_state.state_size += account.size_hint();
             state.bundle_state.state.insert(address, account);

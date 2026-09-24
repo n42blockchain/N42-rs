@@ -438,4 +438,99 @@ mod tests {
         assert_eq!(decode_account(&[]), None);
         assert_eq!(decode_account(&[2, 5, 1]), None, "a truncated balance");
     }
+
+    /// Concurrent reads of the view (plan v6, the read view's contention):
+    /// 160k distinct keys of a 2M-key view read at 1, 4 and 16 threads, at the
+    /// head (no journal walked) and 16 blocks behind it (16 journals walked),
+    /// each on a fresh mapping (`cold`: every page faulted in by the reads) and
+    /// again on the same mapping (`warm`), beside the same reads with no
+    /// versions lock (`raw`: index and record only). Pinned:
+    /// `taskset -c 0-31 cargo test -p n42-qmdb-reth --release --lib bench_concurrent_reads -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing"]
+    fn bench_concurrent_reads() {
+        use alloy_primitives::keccak256;
+        use n42_twig_core::qmdb_compat::GOV5_EMPTY_CODE_HASH;
+        use std::io::Write as _;
+        let keys = 2_000_000u64;
+        let reads = 160_000usize;
+        let behind = 16u64;
+        let per_block = 10_000u64;
+        let address_of = |i: u64| Address::from_slice(&keccak256(i.to_be_bytes())[12..]);
+        let dir = std::env::temp_dir().join(format!("n42-bench-view-reads-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let path = dir.join("entries.log");
+        let mut file = std::io::BufWriter::new(std::fs::File::create(&path).expect("the entry file"));
+        let mut offset = 0u64;
+        let mut put = |file: &mut std::io::BufWriter<std::fs::File>, address: &Address, nonce: u64| {
+            let key = gov5_account_key(&address.0 .0);
+            let value = encode_gov5_account_value(nonce, &U256::from(nonce + 1).to_be_bytes::<32>(), &GOV5_EMPTY_CODE_HASH);
+            file.write_all(&key).expect("write");
+            file.write_all(&(value.len() as u32).to_le_bytes()).expect("write");
+            file.write_all(&value).expect("write");
+            let at = offset;
+            offset += 36 + value.len() as u64;
+            (key, at)
+        };
+        let live: Vec<(Hash, u64)> = (0..keys).map(|i| put(&mut file, &address_of(i), 0)).collect();
+        file.flush().expect("flush");
+        // Blocks 2..=17 each rewrite `per_block` keys, so a reader at block 1 walks 16 journals.
+        let mut blocks = Vec::new();
+        for b in 0..behind {
+            let mut changes: Vec<(Hash, Option<u64>)> = (0..per_block)
+                .map(|j| put(&mut file, &address_of((b * 7_919 + j * 199) % keys), b + 1))
+                .map(|(key, at)| (key, Some(at)))
+                .collect();
+            changes.sort_unstable_by_key(|(key, _)| *key);
+            changes.dedup_by_key(|(key, _)| *key);
+            blocks.push(changes);
+        }
+        file.flush().expect("flush");
+        drop(file);
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut picks: Vec<u64> = Vec::with_capacity(reads * 2);
+        let mut seen = std::collections::HashSet::new();
+        while picks.len() < reads * 2 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            if seen.insert(seed % keys) {
+                picks.push(seed % keys);
+            }
+        }
+        let addresses: Vec<Address> = picks.iter().map(|i| address_of(*i)).collect();
+        let (first, second) = addresses.split_at(reads);
+        let build = || {
+            let view = QmdbReadView::build(&path, (1, B256::ZERO), live.clone()).expect("the view");
+            for (b, changes) in blocks.iter().enumerate() {
+                let raised = view.raise_floor(changes);
+                view.advance(b as u64 + 2, B256::with_last_byte(b as u8 + 2), changes, raised);
+            }
+            view
+        };
+        let time = |threads: usize, f: &(dyn Fn(&Address) -> bool + Sync), addresses: &[Address]| {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().expect("a pool");
+            let start = std::time::Instant::now();
+            let found = pool.install(|| addresses.par_iter().with_min_len(64).filter(|a| f(a)).count());
+            assert_eq!(found, addresses.len(), "every key answers");
+            start.elapsed().as_secs_f64() * 1e6 * threads as f64 / addresses.len() as f64
+        };
+        println!("us a read of pool time (wall x threads / reads), {reads} distinct keys of {keys}");
+        println!("{:>7} {:>6} {:>9} {:>9} {:>9}", "threads", "at", "cold", "warm", "raw warm");
+        for threads in [1usize, 4, 16] {
+            for at in [1 + behind, 1] {
+                let view = build();
+                let read = |a: &Address| matches!(view.account(a, at), Some(Some(_)));
+                let raw = |a: &Address| {
+                    let key = gov5_account_key(&a.0 .0);
+                    view.index.get(&key, |o| view.file.key(o)).is_some_and(|o| decode_account(view.file.record(o).1).is_some())
+                };
+                let cold = time(threads, &read, first);
+                let warm = time(threads, &read, second);
+                let raw_warm = time(threads, &raw, second);
+                println!("{threads:>7} {:>6} {cold:>9.3} {warm:>9.3} {raw_warm:>9.3}", if at == 1 { "-16" } else { "head" });
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

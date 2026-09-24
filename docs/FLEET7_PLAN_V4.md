@@ -1326,5 +1326,45 @@ C on (B 71-96), the pacing swept:
   fold, collect and commit are on it; the roots and finish are hidden if the next build's state read waits for them
   (`find_ms` on the chained request says). E (the import's prefetch) is not on the path any more.
 
+### 5.9 Attempt D on the bench: the graft was page faults, not probes (`plan-v5/graft-representation-2`)
+
+`bench_build_run` (162,000 transfers, 6,000 senders in runs of 27, recipients from two million, `RAYON_NUM_THREADS=16
+taskset -c 0-31`, idle box, three rounds) now prints the leader's phases apart. Against the four-node legs it
+reproduces the graft (42-54 ms against 56-64), the commit at half (9.5-10.5 against 18-22) and the collect at a
+quarter (4-5 against 18): the last two are moves of pool-allocated transactions on a node whose memory three others
+share, which an idle bench does not have. The transactions root beside the graft is 13.5-16 ms, under the graft.
+
+`bench_map_insert` took the graft apart: 161,760 accounts inserted into a map just reserved cost 27-30 ms in random
+order and 29-30 in the map's bucket order; into the same map once its pages are mapped, 18 and 7.5. The fleet's
+allocator hands a table this size fresh pages every block (`oversize_threshold:0`, `thp:never`), so the leader paid a
+page fault for every fifteen accounts inside its build chain. Hence the three switches (all off by default):
+
+| bench, ms (three rounds) | collect | commit | graft | exec |
+| --- | --- | --- | --- | --- |
+| today (fold in place) | 4-5 | 9.5-10.5 | 42-45 | 94-96 |
+| `N42_GRAFT_INDEX=1` (the WIP: sorted (bucket, address, batch) touches, one pass) | 5 | 9.5 | 60-62 | 95 |
+| `N42_GRAFT_RANGES=1` (the same, the merge pass on the pool in address ranges) | 5 | 9.5-10 | 53-55 | 94-96 |
+| `N42_BUILD_COLLECT_IN_PLACE=1` | **0** | **5** | 44.5-46 | 95-96 |
+| + `N42_GRAFT_PREFAULT=1` (map and revert list mapped beside the execution, 31-37 ms on its own thread) | 0 | 5 | **26.5-27** | 97-98 |
+| + prefault + `N42_GRAFT_RANGES=1` | 0 | 5 | 35.5-36 | 97-98 |
+
+- **Direction 1 (address -> batch index) and 2 (ranges on the pool) are falsified on the bench.** Writing the block's
+  map in bucket order saves less than listing, sorting and moving every account a second time costs, with or without
+  mapped memory. Kept behind their switches for one leg on a loaded node, where locality may be worth more.
+- **What pays is not the representation but the memory**: the prefault takes the graft 42-45 -> 26.5-27 for 2-3 ms
+  of execution, and leaving the transfers in their slots takes collect + commit 14-15 -> 5 (the body is copied out of
+  the slots once, on the pool; the order is a vector of pointers). One probe per account in the graft (`entry` in
+  place of a look-up and an insert, behaviour-neutral, in the default path) is another 2 ms.
+- **Direction 3 is not there to take**: the QMDB operations are sorted by gov5's key, a hash of the address, so no
+  order the fold can leave helps `roots_ms`; `state_ready`'s merge is 5-7 ms on the bench. Direction 4 is not needed
+  while the root (14 ms) stays under the graft (27).
+- The bench's leader chain, collect + commit + graft: 58-60 -> 31.5-32 ms. On the fleet that is 112 -> ~45-55 if the
+  leg's collect and commit shrink as the bench's do; the prefault's cost to `par_exec_ms` is the thing a leg must read.
+
+What a four-node leg must read, `N42_BUILD_COLLECT_IN_PLACE=1 N42_GRAFT_PREFAULT=1` against the reference:
+`seal-first build phases` `par_collect_ms` 18 -> ~0, `par_commit_ms` 18-22 -> ~10, `par_graft_ms` (new) and
+`par_fold_ms` 76-86 -> ~40, `par_exec_ms` not up by more than ~5, `par_prefault_ms` (new, beside) under `par_exec_ms`,
+`sealed_at_ms` and the build period down by ~50; window 2 >= 600k; verify 4/4.
+
 Each attempt is one agent brief and one runner; the bar for adopting any is the same as plan v4's: window 2 in every leg,
 verify 4/4, and the number it targets moving on the fleet, not on a bench.

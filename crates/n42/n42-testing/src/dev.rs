@@ -68,6 +68,21 @@ pub struct CliqueTest {
 /// The fleet runs with 128 MB; a dev chain needs far less.
 const TEST_CROSS_BLOCK_CACHE_MB: usize = 64;
 
+#[cfg(test)]
+/// `n42_tx_types::alt_sig_enabled()` is a process-wide flag, written by every
+/// node's `NodeBuilder::launch()` (from its own chain spec's `altSigTx`) and
+/// read live by block validation. In this test binary every test launches a
+/// node in the same process, so with the default parallel runner one test's
+/// `launch()` can flip the flag under another test that is mid-launch or
+/// mid-validation on a different chain. Only `test_altsig_transfer__…` reads
+/// the flag's *value* (through a block that actually carries a 0x50
+/// transaction); every other test is indifferent to it but still writes it
+/// as a side effect of launching. Serializing just the `launch()` call --
+/// held by the altsig test for its whole body, since that is the span in
+/// which the value must stay `true` -- is enough to make the suite order
+/// independent without serializing the tests themselves.
+static ALT_SIG_FLAG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn get_addresses_from_extra_data(extra_data: Bytes) -> Vec<Address> {
     let signers_count = (extra_data.len() - EXTRA_VANITY - SIGNATURE_LENGTH) / Address::len_bytes();
 
@@ -370,20 +385,23 @@ impl CliqueTest {
         node_config.engine.cross_block_cache_size = TEST_CROSS_BLOCK_CACHE_MB;
 
         let capturing_consensus = CapturingConsensusBuilder::default();
-        let NodeHandle { node, .. } = NodeBuilder::new(node_config.clone())
-            .testing_node(runtime.clone())
-            .with_types::<N42Node>()
-            .with_components(
-                N42Node::default()
-                    .components_builder()
-                    .consensus(capturing_consensus.clone())
-                    .payload(n42_engine_types::N42PayloadServiceBuilder::new(
-                        capturing_consensus.clone(),
-                    )),
-            )
-            .with_add_ons(N42Node::default().add_ons())
-            .launch()
-            .await?;
+        let NodeHandle { node, .. } = {
+            let _alt_sig_guard = ALT_SIG_FLAG_LOCK.lock().await;
+            NodeBuilder::new(node_config.clone())
+                .testing_node(runtime.clone())
+                .with_types::<N42Node>()
+                .with_components(
+                    N42Node::default()
+                        .components_builder()
+                        .consensus(capturing_consensus.clone())
+                        .payload(n42_engine_types::N42PayloadServiceBuilder::new(
+                            capturing_consensus.clone(),
+                        )),
+                )
+                .with_add_ons(N42Node::default().add_ons())
+                .launch()
+                .await?
+        };
 
         let payload_events = node.payload_builder_handle.subscribe().await?;
         let mut payload_event_stream = payload_events.into_stream();
@@ -1410,21 +1428,24 @@ async fn test_qmdb_chain__read_view_verifies_against_the_hashed_tables() -> eyre
     node_config.engine.cross_block_cache_size = TEST_CROSS_BLOCK_CACHE_MB;
     let capturing_consensus = CapturingConsensusBuilder::default();
     let types = N42Node::with_qmdb(Some(qmdb.clone()));
-    let NodeHandle { node, .. } = NodeBuilder::new(node_config)
-        .testing_node(runtime.clone())
-        .with_types::<N42Node>()
-        .with_components(
-            types
-                .components_builder()
-                .consensus(capturing_consensus.clone())
-                .payload(
-                    n42_engine_types::N42PayloadServiceBuilder::new(capturing_consensus.clone())
-                        .with_qmdb(Some(qmdb.clone())),
-                ),
-        )
-        .with_add_ons(types.add_ons())
-        .launch()
-        .await?;
+    let NodeHandle { node, .. } = {
+        let _alt_sig_guard = ALT_SIG_FLAG_LOCK.lock().await;
+        NodeBuilder::new(node_config)
+            .testing_node(runtime.clone())
+            .with_types::<N42Node>()
+            .with_components(
+                types
+                    .components_builder()
+                    .consensus(capturing_consensus.clone())
+                    .payload(
+                        n42_engine_types::N42PayloadServiceBuilder::new(capturing_consensus.clone())
+                            .with_qmdb(Some(qmdb.clone())),
+                    ),
+            )
+            .with_add_ons(types.add_ons())
+            .launch()
+            .await?
+    };
 
     let genesis_hash = node.provider.block_hash(0)?.expect("genesis is stored");
     qmdb.initialize((0, genesis_hash))?;
@@ -1579,21 +1600,24 @@ async fn test_qmdb_chain__headers_carry_the_forest_root_and_validate() -> eyre::
 
     let capturing_consensus = CapturingConsensusBuilder::default();
     let types = N42Node::with_qmdb(Some(qmdb.clone()));
-    let NodeHandle { node, .. } = NodeBuilder::new(node_config)
-        .testing_node(runtime.clone())
-        .with_types::<N42Node>()
-        .with_components(
-            types
-                .components_builder()
-                .consensus(capturing_consensus.clone())
-                .payload(
-                    n42_engine_types::N42PayloadServiceBuilder::new(capturing_consensus.clone())
-                        .with_qmdb(Some(qmdb.clone())),
-                ),
-        )
-        .with_add_ons(types.add_ons())
-        .launch()
-        .await?;
+    let NodeHandle { node, .. } = {
+        let _alt_sig_guard = ALT_SIG_FLAG_LOCK.lock().await;
+        NodeBuilder::new(node_config)
+            .testing_node(runtime.clone())
+            .with_types::<N42Node>()
+            .with_components(
+                types
+                    .components_builder()
+                    .consensus(capturing_consensus.clone())
+                    .payload(
+                        n42_engine_types::N42PayloadServiceBuilder::new(capturing_consensus.clone())
+                            .with_qmdb(Some(qmdb.clone())),
+                    ),
+            )
+            .with_add_ons(types.add_ons())
+            .launch()
+            .await?
+    };
 
     let genesis_hash = node.provider.block_hash(0)?.expect("genesis is stored");
     assert_eq!(genesis_hash, chainspec.genesis_hash(), "the database holds the QMDB genesis");
@@ -1759,21 +1783,24 @@ async fn test_deferred_execution__headers_carry_the_parents_execution_across_the
 
     let capturing_consensus = CapturingConsensusBuilder::default();
     let types = N42Node::with_qmdb(Some(qmdb.clone()));
-    let NodeHandle { node, .. } = NodeBuilder::new(node_config)
-        .testing_node(runtime.clone())
-        .with_types::<N42Node>()
-        .with_components(
-            types
-                .components_builder()
-                .consensus(capturing_consensus.clone())
-                .payload(
-                    n42_engine_types::N42PayloadServiceBuilder::new(capturing_consensus.clone())
-                        .with_qmdb(Some(qmdb.clone())),
-                ),
-        )
-        .with_add_ons(types.add_ons())
-        .launch()
-        .await?;
+    let NodeHandle { node, .. } = {
+        let _alt_sig_guard = ALT_SIG_FLAG_LOCK.lock().await;
+        NodeBuilder::new(node_config)
+            .testing_node(runtime.clone())
+            .with_types::<N42Node>()
+            .with_components(
+                types
+                    .components_builder()
+                    .consensus(capturing_consensus.clone())
+                    .payload(
+                        n42_engine_types::N42PayloadServiceBuilder::new(capturing_consensus.clone())
+                            .with_qmdb(Some(qmdb.clone())),
+                    ),
+            )
+            .with_add_ons(types.add_ons())
+            .launch()
+            .await?
+    };
 
     let genesis_hash = node.provider.block_hash(0)?.expect("genesis is stored");
     assert_eq!(genesis_hash, chainspec.genesis_hash(), "the database holds the QMDB genesis");
@@ -2004,6 +2031,14 @@ async fn test_altsig_transfer__is_mined_and_typed_0x50() -> eyre::Result<()> {
 
     let capturing_consensus = CapturingConsensusBuilder::default();
     let types = N42Node::with_qmdb(Some(qmdb.clone()));
+    // Held from before this test's own launch (which writes `true`) through
+    // its own block-1 import (which reads the flag while validating the 0x50
+    // transfer): the one window in the suite where the value actually has to
+    // stay `true`. Every other node-launching test only takes this lock
+    // briefly around its own `launch()` (see `ALT_SIG_FLAG_LOCK`), so this
+    // does not serialize the suite -- just excludes other launches from this
+    // test's critical section.
+    let _alt_sig_guard = ALT_SIG_FLAG_LOCK.lock().await;
     let NodeHandle { node, .. } = NodeBuilder::new(node_config)
         .testing_node(runtime.clone())
         .with_types::<N42Node>()

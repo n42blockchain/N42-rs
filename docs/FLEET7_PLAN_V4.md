@@ -1488,3 +1488,20 @@ groups on the fleet.
 - What the wall is made of, with J: the leader's parallel step (pull 21 + prep 11 + exec 65 + commit 16 + graft 73 =
   186) plus the seal and the next build's setup. K (the read view under concurrency: exec 65) and G (the graft 73)
   are the two cuts; each is worth ~30-40 ms of the 220.
+
+### 6.4 Attempt K on the fleet (loop227): the leader's exec barely moves, the follower's import slows
+
+| | J175 reference (loop225-226) | K a / b / c / d |
+| --- | --- | --- |
+| leader `par_exec_ms` / `sealed_at` | 65 / 220-223 | 60-64 / 211-223 |
+| follower `groups_ms` / import exec / total | ~50 / 84-96 / 192-203 | **65-70 / 102-110** / 180-209 |
+| cycle / E | 220 / 35 | 215-220 / 18-34 |
+| window 1 / 2 | 678-723k / 650-665k | 723-728k / 632-654k |
+
+- The striped reader lock takes ~3 ms off the leader's execution and puts ~15 ms onto the follower's groups and
+  import, in all four legs. The bench's 6x at 16 threads was the bench's: on the fleet the view's reads were not
+  the leader's bound, and something in the striping costs the follower (the writer's `exclusive()` over 64 lines on
+  every advance and publish, or a shared refcount on the snapshot -- not measured). Reverted (the bench stays); if it
+  comes back it comes back behind a flag with the follower's numbers on the leg.
+- Where the leader's 65 ms of execution goes is therefore still open, and so is the graft's 73: G's perf leg (waiting
+  on `perf_event_paranoid`) is the instrument for both.

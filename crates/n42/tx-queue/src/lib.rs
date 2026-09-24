@@ -317,6 +317,17 @@ impl Dropped {
     }
 }
 
+/// Where [`TxQueue::forget_mined_timed`] spent its time, in microseconds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ForgetTimes {
+    /// Folding the block's (sender, nonce) pairs into a map, outside the lock.
+    pub fold_us: u64,
+    /// Waiting for the queue's lock, both times it is taken.
+    pub lock_us: u64,
+    /// Splitting the taken list into mined and kept, under the lock.
+    pub partition_us: u64,
+}
+
 /// How many transactions the queue let go of since the last report, by
 /// reason, with the first few named.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1258,32 +1269,53 @@ impl<T: PoolTransaction> TxQueue<T> {
         parent: B256,
         mined: impl IntoIterator<Item = (Address, u64)>,
     ) -> Vec<Arc<ValidPoolTransaction<T>>> {
+        self.forget_mined_timed(parent, mined).0
+    }
+
+    /// [`Self::forget_mined`], saying where its time went: the fold of the
+    /// block's nonces (outside the lock), the waits for the lock, and the
+    /// partition of the taken list under it -- whether a slow hand-off is
+    /// the walk or the lock.
+    pub fn forget_mined_timed(
+        &self,
+        parent: B256,
+        mined: impl IntoIterator<Item = (Address, u64)>,
+    ) -> (Vec<Arc<ValidPoolTransaction<T>>>, ForgetTimes) {
+        let mut times = ForgetTimes::default();
         // The hand-off calls this after build-on-seal already has: the build
         // then stands on another parent and there is nothing to forget. Look
         // before folding a block's nonces (a 163,000-entry map), and fold
         // outside the lock the puller needs.
         {
+            let at = std::time::Instant::now();
             let inner = self.inner.lock();
+            times.lock_us += at.elapsed().as_micros() as u64;
             match inner.last_build.as_ref() {
                 Some((built_on, taken)) if *built_on == parent && !taken.is_empty() => {}
-                _ => return Vec::new(),
+                _ => return (Vec::new(), times),
             }
         }
+        let at = std::time::Instant::now();
         let mut highest: AddressHashMap<u64> = AddressHashMap::default();
         for (sender, nonce) in mined {
             let entry = highest.entry(sender).or_insert(nonce);
             *entry = (*entry).max(nonce);
         }
+        times.fold_us = at.elapsed().as_micros() as u64;
+        let at = std::time::Instant::now();
         let mut inner = self.inner.lock();
-        let Some((built_on, taken)) = inner.last_build.as_mut() else { return Vec::new() };
+        times.lock_us += at.elapsed().as_micros() as u64;
+        let at = std::time::Instant::now();
+        let Some((built_on, taken)) = inner.last_build.as_mut() else { return (Vec::new(), times) };
         if *built_on != parent || taken.is_empty() {
-            return Vec::new();
+            return (Vec::new(), times);
         }
         let (mined, kept): (Vec<_>, Vec<_>) = std::mem::take(taken)
             .into_iter()
             .partition(|t| highest.get(&t.sender()).is_some_and(|nonce| t.nonce() <= *nonce));
         *taken = kept;
-        mined
+        times.partition_us = at.elapsed().as_micros() as u64;
+        (mined, times)
     }
 
     /// Moves what the inbox holds into the lanes now. The builder does this

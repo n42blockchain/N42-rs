@@ -36,15 +36,47 @@ use crate::{built_executions::BuiltExecution, engine_types::N42BuiltPayload};
 pub type ParentStateOpener = Arc<dyn Fn() -> ProviderResult<StateProviderBox> + Send + Sync>;
 
 /// What a build on an own block needs.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct BuildOnOwnRequest {
     /// The parent, under the hash consensus sealed it with.
     pub parent: SealedHeader,
     /// The parent's execution, as the builder kept it (its block is under
-    /// the builder's own hash).
-    pub parent_execution: BuiltExecution,
+    /// the builder's own hash) -- or, on a build started at the parent's
+    /// seal (`N42_BUILD_ON_OUTPUT`), only the name it will be kept under.
+    pub parent_execution: ParentExecution,
     /// The attributes of the block to build.
     pub attributes: PayloadAttributes,
+    /// Signalled (or dropped) once the parent's transactions have left the
+    /// queue's taken list: the build waits for it before its first pull, so
+    /// the queue's hand-off runs beside the build's setup instead of ahead
+    /// of it, and the order the queue depends on -- the parent's
+    /// transactions held before the next build pulls -- is kept. `None`
+    /// pulls at once, as every build did before.
+    pub before_pull: Option<std::sync::mpsc::Receiver<()>>,
+}
+
+/// The parent's execution as a build on it receives it.
+#[derive(Debug, Clone)]
+pub enum ParentExecution {
+    /// Found at `StateReady` or later: its post-state is in hand.
+    Ready(BuiltExecution),
+    /// Found at its seal: the post-state is still being filed behind it, and
+    /// the build's state opener waits for it under this, the builder's hash
+    /// ([`opener_on_sealed_parent`]).
+    Sealed {
+        /// The hash the builder gave the parent.
+        built_hash: B256,
+    },
+}
+
+impl ParentExecution {
+    /// The hash the builder gave the parent.
+    pub fn built_hash(&self) -> B256 {
+        match self {
+            Self::Ready(execution) => execution.block.hash(),
+            Self::Sealed { built_hash } => *built_hash,
+        }
+    }
 }
 
 /// A builder the raw payload channel can call directly.
@@ -198,6 +230,48 @@ where
     Arc::new(move || {
         let historical = state_at_soon(&client, grandparent)?;
         Ok(Box::new(MemoryOverlayStateProvider::<N42Primitives>::new(historical, vec![executed.clone()])) as StateProviderBox)
+    })
+}
+
+/// An opener for the parent's post-state on a build started at the parent's
+/// seal (`N42_BUILD_ON_OUTPUT`): the parent's published output laid over the
+/// chain's state at the grandparent -- the overlay of
+/// [`opener_on_built_parent`] and of the follower's import -- with the output
+/// waited for here, when the build first opens its state, rather than before
+/// the build is started. Between the seal and `StateReady` the parent's
+/// finish appends its ~147,000 reverts (`state_ready_ms` 15-19 on a full
+/// block, loop223); the next build's queue hand-off and setup now run in
+/// that time instead of after it.
+///
+/// The parent is laid under its sealed header with an empty body
+/// ([`executed_from_output`]): the overlay reads the output and the header
+/// only, so the body copy [`executed_under_seal`] makes (163,000
+/// transactions, ~10 ms) is saved. The first open files the parent; every
+/// later open (one per execution batch) reuses it.
+pub fn opener_on_sealed_parent<C>(client: C, parent: SealedHeader, built_hash: B256) -> ParentStateOpener
+where
+    C: StateProviderFactory + Send + Sync + 'static,
+{
+    let filed: Arc<OnceLock<ExecutedParent>> = Arc::new(OnceLock::new());
+    Arc::new(move || {
+        let executed = match filed.get() {
+            Some(executed) => executed.clone(),
+            None => {
+                let at = std::time::Instant::now();
+                let execution =
+                    crate::built_executions::wait_for(built_hash, crate::built_executions::Stage::StateReady)
+                        .ok_or(reth_storage_api::errors::ProviderError::StateForHashNotFound(parent.hash()))?;
+                tracing::debug!(
+                    target: "payload_builder",
+                    number = parent.number,
+                    wait_ms = at.elapsed().as_millis() as u64,
+                    "the sealed parent's output is filed; the build opens its state on it"
+                );
+                filed.get_or_init(|| executed_from_output(&parent, execution.execution_output)).clone()
+            }
+        };
+        let historical = state_at_soon(&client, parent.parent_hash)?;
+        Ok(overlay_on_executed(historical, vec![executed]))
     })
 }
 
@@ -559,5 +633,74 @@ mod tests {
             merge_at.elapsed().as_millis(),
             merged.state.len()
         );
+    }
+
+    /// Attempt J (`N42_BUILD_ON_OUTPUT`): a build started at its parent's
+    /// seal, before the parent's output is filed, must open exactly the state
+    /// the ordinary path opens at `StateReady` -- and the state the engine
+    /// holds once the parent is installed. A build reads nothing of its
+    /// parent but that state and `BLOCKHASH`, so equal reads are an equal
+    /// block and equal roots; this compares the three readers on every
+    /// account the parent touched, one it did not, and the parent's hash.
+    #[test]
+    fn a_build_started_at_the_seal_opens_the_state_the_ordinary_path_opens() {
+        let sender = Address::with_last_byte(0x31);
+        let created = Address::with_last_byte(0x32);
+        let untouched = Address::with_last_byte(0x33);
+        let grandparent = B256::with_last_byte(0x3a);
+        let grandparent_state = || {
+            let client = MockEthProvider::default();
+            client.add_account(sender, ExtendedAccount::new(0, U256::from(100)));
+            client.add_account(untouched, ExtendedAccount::new(4, U256::from(40)));
+            client
+        };
+        // The engine's state once the parent is installed.
+        let installed = MockEthProvider::default();
+        installed.add_account(sender, ExtendedAccount::new(5, U256::from(50)));
+        installed.add_account(created, ExtendedAccount::new(0, U256::from(7)));
+        installed.add_account(untouched, ExtendedAccount::new(4, U256::from(40)));
+
+        let bundle = BundleState::builder(41..=41)
+            .state_present_account_info(sender, AccountInfo { nonce: 5, balance: U256::from(50), ..Default::default() })
+            .state_present_account_info(created, AccountInfo { nonce: 0, balance: U256::from(7), ..Default::default() })
+            .build();
+        let header = Header { number: 41, parent_hash: grandparent, gas_used: 41_000, ..Default::default() };
+        let execution = execution_of(&header, bundle);
+        let built_hash = execution.block.hash();
+        let sealed = SealedHeader::seal_slow(Header { extra_data: b"view 41".as_slice().into(), ..header.clone() });
+
+        // Sealed, its output not yet filed: found at once, without an execution.
+        crate::built_executions::remember_pending(built_hash, execution.block.clone());
+        let (found, _, filed) =
+            crate::built_executions::find_kept_sealed(grandparent, 41, header.state_root, header.receipts_root, 41_000, None)
+                .expect("a sealed build is found before its state is ready");
+        assert_eq!(found, built_hash);
+        assert!(filed.is_none(), "nothing is filed at the seal");
+
+        // The finish files the output a moment later, while the opener waits.
+        let finish = {
+            let execution = execution.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                crate::built_executions::state_ready(built_hash, execution);
+            })
+        };
+        let on_seal = opener_on_sealed_parent(grandparent_state(), sealed.clone(), built_hash)()
+            .expect("the parent's state opens once its output is filed");
+        finish.join().expect("the finish thread");
+        let ordinary = opener_on_built_parent(grandparent_state(), grandparent, executed_under_seal(&sealed, &execution))()
+            .expect("the ordinary opener");
+        let installed = installed.state_by_block_hash(B256::ZERO).expect("the installed state");
+
+        for address in [sender, created, untouched, Address::with_last_byte(0x34)] {
+            let read = |state: &StateProviderBox| state.basic_account(&address).expect("read");
+            assert_eq!(read(&on_seal), read(&ordinary), "{address}: the seal's opener reads as the ordinary one");
+            assert_eq!(read(&on_seal), read(&installed), "{address}: and as the installed state");
+        }
+        assert_eq!(on_seal.block_hash(41).expect("read"), Some(sealed.hash()), "BLOCKHASH is the sealed hash");
+        assert_eq!(on_seal.block_hash(41).expect("read"), ordinary.block_hash(41).expect("read"));
+        // A second open (one per execution batch) reuses the filed parent.
+        let again = opener_on_sealed_parent(grandparent_state(), sealed, built_hash)().expect("opens again");
+        assert_eq!(again.basic_account(&sender).expect("read").map(|a| a.nonce), Some(5));
     }
 }

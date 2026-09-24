@@ -258,6 +258,35 @@ fn handed() -> &'static Mutex<VecDeque<(B256, BuiltExecution)>> {
     HANDED.get_or_init(|| Mutex::new(VecDeque::with_capacity(KEEP)))
 }
 
+/// The kept build matching these fields, at whatever stage it has reached,
+/// without waiting: its builder hash, its block, and its execution when it
+/// has one (`StateReady` on). A build is filed before its seal is handed out
+/// (`remember_pending`), so a request naming the sealed header always finds
+/// it here -- what a build started at the parent's seal needs
+/// (`N42_BUILD_ON_OUTPUT`), which waits for the state only when it opens it.
+pub fn find_kept_sealed(
+    parent: B256,
+    number: u64,
+    state_root: B256,
+    receipts_root: B256,
+    gas_used: u64,
+    transactions_root: Option<B256>,
+) -> Option<(B256, Arc<RecoveredBlock<Block>>, Option<BuiltExecution>)> {
+    {
+        let handed = handed().lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((hash, built)) = handed.iter().rev().find(|(_, built)| matches_build(built, parent, number, state_root, receipts_root, gas_used, transactions_root)) {
+            return Some((*hash, built.block.clone(), Some(built.clone())));
+        }
+    }
+    let (store, _) = store();
+    let store = store.lock().unwrap_or_else(|p| p.into_inner());
+    store
+        .iter()
+        .rev()
+        .find(|(_, entry)| matches_block(&entry.block, parent, number, state_root, receipts_root, gas_used, transactions_root))
+        .map(|(hash, entry)| (*hash, entry.block.clone(), entry.execution.clone()))
+}
+
 /// [`find`], also among the builds already taken by the engine's import --
 /// what a build on the sealed block wants, whichever of the two requests the
 /// execution layer served first.

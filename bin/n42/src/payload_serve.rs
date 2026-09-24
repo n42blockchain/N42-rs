@@ -612,6 +612,14 @@ struct BuildOnOwnTimes {
     rename_ms: u64,
     spawn_ms: u64,
     build_ms: u64,
+    /// Built at the parent's seal (`N42_BUILD_ON_OUTPUT`): `queue_ms` ran
+    /// beside the build then, not ahead of it.
+    on_output: bool,
+    /// `queue_ms` split: the fold of the block's nonces, the lock waits, the
+    /// partition under the lock (`TxQueue::forget_mined_timed`).
+    queue_fold_us: u64,
+    queue_lock_us: u64,
+    queue_partition_us: u64,
 }
 
 /// The next block, built on a block this node built and consensus has just
@@ -642,6 +650,9 @@ async fn build_on_own_block(
         return Err("unknown build: block access list".to_owned());
     }
     let mut times = BuildOnOwnTimes { decode_ms: decode_at.elapsed().as_millis() as u64, ..Default::default() };
+    if build_on_output() {
+        return build_on_sealed_output(reuse, builder, header, attributes, chain, want_hashes, times).await;
+    }
     let at = std::time::Instant::now();
     // The parent's post-state is what the build needs (`StateReady`); a
     // parent sealed before its finish is waited for, on a thread.
@@ -675,7 +686,9 @@ async fn build_on_own_block(
             .block
             .transactions_with_sender()
             .map(|(sender, tx)| (*sender, alloy_consensus::Transaction::nonce(tx)));
-        let dropped = queue.forget_mined(built.block.header().parent_hash, mined);
+        let (dropped, forget) = queue.forget_mined_timed(built.block.header().parent_hash, mined);
+        (times.queue_fold_us, times.queue_lock_us, times.queue_partition_us) =
+            (forget.fold_us, forget.lock_us, forget.partition_us);
         // At info: `forgotten` far below `txs` is the shape of the queue
         // defect this pairs with -- the build's take was already given back
         // to the lanes by a second build on the same parent, so there is
@@ -707,7 +720,12 @@ async fn build_on_own_block(
         times.rename_ms = at.elapsed().as_millis() as u64;
     }
     let at = std::time::Instant::now();
-    let request = n42_engine_types::direct_build::BuildOnOwnRequest { parent, parent_execution: built, attributes };
+    let request = n42_engine_types::direct_build::BuildOnOwnRequest {
+        parent,
+        parent_execution: n42_engine_types::direct_build::ParentExecution::Ready(built),
+        attributes,
+        before_pull: None,
+    };
     // `spawn_ms` is the hop onto the blocking pool. Named because it was the
     // last unnamed piece of the request-to-start road, and because a blocking
     // pool with every thread busy is somewhere a leader's build can wait with
@@ -717,6 +735,112 @@ async fn build_on_own_block(
     let payload = handle.await.map_err(|err| format!("build task: {err}"))??;
     times.build_ms = at.elapsed().as_millis() as u64;
     Ok((payload, times, chain, want_hashes))
+}
+
+/// `N42_BUILD_ON_OUTPUT=1`: a build on an own block starts at the parent's
+/// seal instead of at its `StateReady` (plan v6 attempt J). Off by default.
+fn build_on_output() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_BUILD_ON_OUTPUT").is_ok_and(|v| v == "1"))
+}
+
+/// [`build_on_own_block`] started at the parent's seal (`N42_BUILD_ON_OUTPUT`).
+///
+/// The chained request arrives a few ms after the parent's early seal, and
+/// the parent's finish then still has 15-19 ms to go before its post-state
+/// is filed (`state_ready_ms`, the ~147,000 reverts appended), which the
+/// ordinary path waited out (`find_ms` 15-20 on chained builds, loop223)
+/// before the queue's hand-off (`queue_ms` 13-16) and only then the build.
+/// Here the parent is found at its seal without waiting, the hand-off runs
+/// on a thread of its own, and the build starts at once: it waits for the
+/// parent's output where it opens its state (`opener_on_sealed_parent`, the
+/// same overlay on the same output) and for the hand-off before its first
+/// pull, so the queue's order is the ordinary path's. The build's root
+/// still stands on the parent's installed tree: its finish waits for that
+/// behind its own seal, as before.
+async fn build_on_sealed_output(
+    reuse: &OwnBlockReuse,
+    builder: std::sync::Arc<dyn n42_engine_types::direct_build::DirectBuilder>,
+    header: alloy_consensus::Header,
+    attributes: alloy_rpc_types_engine::PayloadAttributes,
+    chain: Option<raw_engine::ChainHint>,
+    want_hashes: bool,
+    mut times: BuildOnOwnTimes,
+) -> Result<(N42BuiltPayload, BuildOnOwnTimes, Option<raw_engine::ChainHint>, bool), String> {
+    use n42_engine_types::built_executions::{find_kept_sealed, stage_of, Stage};
+    times.on_output = true;
+    let at = std::time::Instant::now();
+    let (built_hash, block, _) = find_kept_sealed(
+        header.parent_hash,
+        header.number,
+        header.state_root,
+        header.receipts_root,
+        header.gas_used,
+        Some(header.transactions_root),
+    )
+    .ok_or("unknown build")?;
+    times.find_ms = at.elapsed().as_millis() as u64;
+    let sealed_hash = header.hash_slow();
+    let parent = reth_primitives_traits::SealedHeader::new(header, sealed_hash);
+    // The parent's transactions leave the build's taken list, held until the
+    // chain settles the height -- the ordinary path's bookkeeping, beside the
+    // build rather than ahead of it; the build's pull waits for `handed`.
+    let (hand_off, before_pull) = match n42_tx_queue::global::<n42_engine_types::N42PooledTransaction>() {
+        Some(queue) => {
+            let (done, handed) = std::sync::mpsc::sync_channel::<()>(1);
+            let task = tokio::task::spawn_blocking(move || {
+                let at = std::time::Instant::now();
+                let txs = block.body().transactions().count();
+                let mined = block.transactions_with_sender().map(|(sender, tx)| (*sender, alloy_consensus::Transaction::nonce(tx)));
+                let (dropped, forget) = queue.forget_mined_timed(block.header().parent_hash, mined);
+                info!(
+                    target: "n42.payload_serve",
+                    number = block.number(),
+                    txs,
+                    forgotten = dropped.len(),
+                    parent = ?block.header().parent_hash,
+                    "own block's transactions forgotten by the queue beside the build"
+                );
+                queue.hold_own_block(block.number(), sealed_hash, dropped);
+                let _ = done.send(());
+                (at.elapsed().as_millis() as u64, forget)
+            });
+            (Some(task), Some(handed))
+        }
+        None => (None, None),
+    };
+    if let Some(qmdb) = &reuse.qmdb {
+        let at = std::time::Instant::now();
+        // As the ordinary path: a parent still behind its seal has filed no
+        // tree yet, and its successor's finish renames it when it needs it.
+        let finishing = matches!(stage_of(built_hash), Some(Stage::Sealed | Stage::StateReady));
+        if !finishing && qmdb.root_of(&built_hash).is_some() {
+            n42_engine_types::chain_alias::rename(qmdb, built_hash, sealed_hash)
+                .map_err(|err| format!("qmdb rename: {err}"))?;
+        }
+        times.rename_ms = at.elapsed().as_millis() as u64;
+    }
+    let at = std::time::Instant::now();
+    let request = n42_engine_types::direct_build::BuildOnOwnRequest {
+        parent,
+        parent_execution: n42_engine_types::direct_build::ParentExecution::Sealed { built_hash },
+        attributes,
+        before_pull,
+    };
+    let handle = tokio::task::spawn_blocking(move || builder.build_on_own(request));
+    times.spawn_ms = at.elapsed().as_millis() as u64;
+    let payload = handle.await.map_err(|err| format!("build task: {err}"));
+    times.build_ms = at.elapsed().as_millis() as u64;
+    // The hand-off ended before the build pulled; its times are for the line.
+    if let Some(task) = hand_off
+        && let Ok((queue_ms, forget)) = task.await
+    {
+        times.queue_ms = queue_ms;
+        times.queue_fold_us = forget.fold_us;
+        times.queue_lock_us = forget.lock_us;
+        times.queue_partition_us = forget.partition_us;
+    }
+    Ok((payload??, times, chain, want_hashes))
 }
 
 /// Writes a built payload in the channel's answer shape (status 1, the
@@ -1584,6 +1708,10 @@ where
                         decode_ms = times.decode_ms,
                         find_ms = times.find_ms,
                         queue_ms = times.queue_ms,
+                        queue_fold_us = times.queue_fold_us,
+                        queue_lock_us = times.queue_lock_us,
+                        queue_partition_us = times.queue_partition_us,
+                        on_output = times.on_output,
                         rename_ms = times.rename_ms,
                         spawn_ms = times.spawn_ms,
                         build_ms = times.build_ms,

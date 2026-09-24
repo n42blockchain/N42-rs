@@ -1626,6 +1626,29 @@ pub async fn serve<T>(
 where
     T: PayloadTypes<BuiltPayload = N42BuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
 {
+    // `N42_ROAD_RUNTIME=1`: the accept loop and every connection it serves on
+    // the road's own runtime, so their tasks, `spawn_blocking` calls and
+    // `block_in_place` hand-offs use that runtime's workers and blocking pool
+    // and not the ones the ingest saturates (`road_runtime`).
+    if let Some(road) = crate::road_runtime::handle() {
+        return match road.spawn(serve_here(addr, payloads, engine, reuse)).await {
+            Ok(served) => served,
+            Err(err) => Err(std::io::Error::other(format!("the road runtime's accept loop: {err}"))),
+        };
+    }
+    serve_here(addr, payloads, engine, reuse).await
+}
+
+/// The channel's accept loop on the runtime it is polled on.
+async fn serve_here<T>(
+    addr: SocketAddr,
+    payloads: PayloadBuilderHandle<T>,
+    engine: ConsensusEngineHandle<T>,
+    reuse: Option<OwnBlockReuse>,
+) -> std::io::Result<()>
+where
+    T: PayloadTypes<BuiltPayload = N42BuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
+{
     let listener = TcpListener::bind(addr).await?;
     // Said at start-up so a round can grep that its switch reached this
     // process: a variable that is set but never arrived measures nothing.
@@ -1634,6 +1657,8 @@ where
         %addr,
         fresh_buffers = fresh_buffers(),
         own_block_reuse = reuse.is_some(),
+        road_runtime = crate::road_runtime::enabled(),
+        dispatch_wait = crate::road_runtime::measure_dispatch_wait(),
         "raw payload channel listening"
     );
     loop {
@@ -1665,6 +1690,15 @@ where
     T: PayloadTypes<BuiltPayload = N42BuiltPayload, ExecutionData = alloy_rpc_types_engine::ExecutionData> + 'static,
 {
     stream.set_nodelay(true)?;
+    // Measured only when asked: the socket's receive timestamps, read with
+    // the request's first byte. A socket that refuses them serves as before.
+    let mut stamped = crate::road_runtime::measure_dispatch_wait();
+    if stamped {
+        if let Err(err) = crate::road_runtime::enable_receive_timestamps(&stream) {
+            warn!(target: "n42.payload_serve", %err, "no receive timestamps; dispatch_wait_ms reads 0");
+            stamped = false;
+        }
+    }
     // Buffers retained across frames. A newPayload frame is ~19 MB at the
     // bench tier and a served payload the same; allocated fresh per block
     // they are fresh pages first-touched on every block on every node --
@@ -1673,14 +1707,21 @@ where
     let mut frame: Vec<u8> = Vec::new();
     let mut out: Vec<u8> = Vec::new();
     loop {
-        let kind = match stream.read_u8().await {
-            Ok(kind) => kind,
+        let read = if stamped {
+            crate::road_runtime::read_kind_timed(&stream).await
+        } else {
+            stream.read_u8().await.map(|kind| (kind, None))
+        };
+        let (kind, dispatch_wait) = match read {
+            Ok(read) => read,
             Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(err) => return Err(err),
         };
         // When the request's first byte landed: what follows it is ~25 MB
         // over the loopback socket, and the vote road starts here.
         let started_at = std::time::Instant::now();
+        // Before it: the byte in the socket, waiting for this task to run.
+        let dispatch_wait_us = dispatch_wait.map_or(0, |waited| waited.as_micros() as u64);
         if kind == request::OWN_BLOCK {
             let len = stream.read_u32_le().await? as usize;
             if len > 1 << 20 {
@@ -1979,6 +2020,7 @@ where
                 misses: misses as u64,
                 fill_us,
                 filled: filled as u64,
+                dispatch_wait_us,
                 started: started_at,
             };
             import_for_validator::<T>(
@@ -2078,6 +2120,7 @@ where
                 fill_us: 0,
                 copy_us: 0,
                 filled: 0,
+                dispatch_wait_us,
                 started: started_at,
             };
             import_for_validator::<T>(&mut stream, &mut out, &engine, reuse.as_ref(), data, Some(sealed), None, None, started, decoded_in, road).await?;
@@ -2148,6 +2191,7 @@ where
                             fill_us: 0,
                             copy_us: 0,
                             filled: 0,
+                            dispatch_wait_us,
                             started: started_at,
                         },
                     )

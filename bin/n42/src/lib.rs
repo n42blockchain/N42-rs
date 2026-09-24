@@ -44,6 +44,7 @@ pub mod engine_ext;
 pub mod follower_import;
 pub mod payload_serve;
 pub mod queue_reorg;
+pub mod road_runtime;
 pub mod stacks;
 
 /// Re-exported utils.

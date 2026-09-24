@@ -995,6 +995,11 @@ pub struct VoteRoad {
     /// enough; a road that gave up logs a line of its own and is not this
     /// one.
     pub misses: u64,
+    /// How long the request's first byte sat in the channel's socket before
+    /// the road read it: from the kernel's receive timestamp to `started`.
+    /// Not part of `total_ms`, which starts where this ends. 0 unless measured
+    /// (`N42_ROAD_RUNTIME=1` or `N42_ROAD_DISPATCH_WAIT=1`).
+    pub dispatch_wait_us: u64,
     /// When the request's first byte arrived, for the total.
     pub started: std::time::Instant,
 }
@@ -1063,6 +1068,7 @@ fn log_vote_road(road: VoteRoad, number: u64, txs: usize, phases: RoadPhases) {
         number,
         txs,
         request = road.request,
+        dispatch_wait_ms = road.dispatch_wait_us / 1000,
         recv_ms = road.recv_us / 1000,
         decode_ms = road.decode_us / 1000,
         reuse_ms = road.reuse_us / 1000,

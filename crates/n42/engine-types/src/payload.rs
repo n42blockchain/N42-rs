@@ -345,21 +345,30 @@ where
     Cons: FullConsensus<EthPrimitives> + SignerManager + Clone + Unpin + Send + Sync + 'static,
 {
     fn build_on_own(&self, request: crate::direct_build::BuildOnOwnRequest) -> Result<EthBuiltPayload, String> {
-        let crate::direct_build::BuildOnOwnRequest { parent, parent_execution, attributes } = request;
+        let crate::direct_build::BuildOnOwnRequest { parent, parent_execution, attributes, before_pull } = request;
         let pre_at = std::time::Instant::now();
         let parent_hash = parent.hash();
-        let executed = crate::direct_build::executed_under_seal(&parent, &parent_execution);
-        let opener = crate::direct_build::opener_on_built_parent(self.client.clone(), parent.parent_hash, executed);
+        let parent_built = parent_execution.built_hash();
+        let opener = match &parent_execution {
+            crate::direct_build::ParentExecution::Ready(execution) => {
+                let executed = crate::direct_build::executed_under_seal(&parent, execution);
+                crate::direct_build::opener_on_built_parent(self.client.clone(), parent.parent_hash, executed)
+            }
+            // Started at the parent's seal: its output is waited for when the
+            // build opens its state (`N42_BUILD_ON_OUTPUT`).
+            crate::direct_build::ParentExecution::Sealed { built_hash } => {
+                crate::direct_build::opener_on_sealed_parent(self.client.clone(), parent.clone(), *built_hash)
+            }
+        };
         // The reads the parent's build cached, filed under the builder's own
         // hash: warm exactly where this block's senders are.
         let cached_reads = self
             .cons
-            .get_cached_reads(parent_execution.block.hash())
+            .get_cached_reads(parent_built)
             .ok()
             .flatten()
             .unwrap_or_default();
         let payload_id = reth_payload_primitives::payload_id(&parent_hash, &attributes);
-        let parent_built = parent_execution.block.hash();
         let config = PayloadConfig::new(Arc::new(parent), attributes, payload_id);
         let args = BuildArguments::new(cached_reads, None, None, config, Default::default(), None);
         let (evm_config, client, pool, builder_config, cons, qmdb) = (
@@ -373,6 +382,19 @@ where
         let select_pool = pool.clone();
         let select = move |attributes| match n42_tx_queue::global::<Pool::Transaction>() {
             Some(queue) => {
+                // The parent's transactions leave the taken list before this
+                // build takes: the hand-off ran beside the setup, and a pull
+                // ahead of it would give the parent's block back to the lanes.
+                // A hand-off that died drops its sender, which ends the wait.
+                if let Some(handed) = before_pull {
+                    let at = std::time::Instant::now();
+                    let _ = handed.recv();
+                    tracing::debug!(
+                        target: "payload_builder",
+                        wait_ms = at.elapsed().as_millis() as u64,
+                        "the parent's queue hand-off is done; the build pulls"
+                    );
+                }
                 let best = queue.best_for_build(parent_hash);
                 crate::claimed_build::selection(&queue, best)
             }

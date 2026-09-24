@@ -1939,3 +1939,19 @@ by ~80 ms for 32k more of them, and the execution layer's own `vote road` line s
 that is -- the queue's lock held by the admission, the validator's request for the body waiting behind ingest
 frames on the same HTTP server, the pool's memory -- is read next from RB1000 against RB1000C32 (same frames, twice
 the in-flight). Until it is named the supply stays at ~750k/s, and the throughput at ~770k.
+
+### 6.18 The coupling, named: the road's request queues behind the ingest on the execution layer's runtime
+
+A Sonnet pass over RB1000 (64k in flight) against RB1000C32 (32k), follower node2, window 1: from the validator's
+"body received" to "checked" is 138.9 ms against 69.5 (n=37 / 107), the vote follows within 0.6 ms in both, and the
+execution layer's own road timers read 76 against 72. **The request waits ~65-70 ms before the road's first timer
+starts.** On the ingest side at 64k in flight, `reply_us_per_frame` 44-90k against 32-38k, `gate_us_per_frame`
+11-40k against 6-10k, `acq_us_per_frame` 35-49k against 26-29k, eight `held at the ingest gate` warnings against
+one. The ingest's frames (`tx-ingest`, recovery on `spawn_blocking`) and the road's serving (`payload_serve.rs`,
+its `spawn_blocking` calls and the loopback Engine-API channel) share the execution-layer process's one tokio
+runtime and blocking pool; with 64k frames in flight the road's dispatch sits in that queue. Sixteen workers did not
+change it (6.16), so it is the blocking pool, the channel or the scheduler rather than the async workers alone.
+Attempt **Q2** (`plan-v6/road-runtime`, `N42_ROAD_RUNTIME=1`): the road's path on its own runtime and blocking
+pool, with `dispatch_wait_ms` on the `vote road` line to prove the decoupling: falsified if, at 64k in flight,
+`dispatch_wait_ms` does not fall under 10 and B under 100 while the ingest's own frame times stay elevated.
+If it holds, `--conc 128` (or 64 x 1000) fills the blocks at ~1M tx/s of supply, and the cycle is the term again.

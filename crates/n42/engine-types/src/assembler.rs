@@ -95,6 +95,17 @@ pub fn parallel_transaction_root_recovered<T: Encodable2718 + Sync>(transactions
     parallel_ordered_trie_root(&encoded)
 }
 
+/// [`parallel_transaction_root`] over `len` transactions that are not laid
+/// out as a slice: `encode(i)` is the EIP-2718 encoding of the `i`-th. The
+/// seal at the execution's end (`N42_SEAL_AT_EXEC=1`) computes the root this
+/// way over the pulled candidates, beside the parallel step, before the
+/// block's body exists.
+pub fn parallel_transaction_root_by(len: usize, encode: impl Fn(usize) -> Vec<u8> + Sync) -> B256 {
+    use rayon::prelude::*;
+    let encoded: Vec<Vec<u8>> = (0..len).into_par_iter().map(&encode).collect();
+    parallel_ordered_trie_root(&encoded)
+}
+
 pub fn parallel_transaction_root<T: Encodable2718 + Sync>(transactions: &[T]) -> B256 {
     use rayon::prelude::*;
     let encoded: Vec<Vec<u8>> = transactions.par_iter().map(|tx| tx.encoded_2718()).collect();

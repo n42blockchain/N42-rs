@@ -1673,3 +1673,40 @@ the chained build's hand-off runs. Fixed: the give-back before the proposal, and
 Next: the pacing. Every earlier trial below 175 (6.3) stalled with the build at the wall; the build now ends at
 ~180 and the pacing at 175 is what the leader waits on. loop234 runs G23 at 175, 150 and 125. Falsified if 150 does
 not lift win1 above 780k, or if it stalls as 6.3's did.
+
+### 6.10 G2+G3 at pacing 175 / 150 / 125 (loop234): the holes are gone, the cycle is 200, and the flood cannot fill it
+
+With the puller joined on drop and the give-back before the proposal (`give_back_ms` 1), the holes are gone (2-10
+warnings a leg against 39-74) and no G23 build was short for that reason.
+
+| leg | win1 | win2 | sealed_at | cycle (full, dissected) | B | D | E | txs/block p10 | TCs |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| warm (no G2/G3) | 684,567 | 670,157 | 222 | 219 | 73 | 96 | 35 | 163,000 | 2 |
+| P175 | 716,575 | 658,402 | 173 | **200** | 81 | 91 | 10 | **151,000** | 1 |
+| P150 | 508,230 (5 s stall) | 661,865 | 182 | 201 | 87 | 61.5 | 11 | 156,000 | 1 |
+| P125 | 267,473 | 705,896 | 181 | 195 | 77 | 58 | 27 | -- | 4 |
+
+The pacing is not it: at 150 and 125 the wait D falls by the 25-35 ms taken off the interval and the dissected
+cycle does not move (200 -> 201 -> 195), while the legs stall (P150's window 1 holds a 5 s cycle; P125 four TCs)
+as 6.3's did. What holds the cycle at ~200 with the build ending at 173-182 is two things the dissection shows and
+one it does not:
+
+- **the follower's import is 207 ms a block** (`direct import` on a full block: the execution 122 = partition 19 +
+  env 8 + groups 75 + merge 18 + receipts 6; the QMDB root 75; the engine's insert 46; mined 9, checks 7). One import
+  a cycle, so the cycle cannot go under it for long: at pacing 150 the follower falls behind, B grows (81 -> 87)
+  and the view times out;
+- **the supply**: at a 200 ms cycle the chain wants 163k x 5 = 815k tx/s. The leader's ingest reads 680k/s (busy
+  12 us a transaction; 12 recovery slots, so not its bound), and the flood's log says why: `sign 1143s` at 75 s is
+  **15 signing thread-seconds a second, on the 16 physical cores (112-127) that four 56-core nodes leave it**, and
+  its window-1 rate is 736-750k/s. So 10% of P175's blocks are 151k instead of 163k (occupancy 97% against 99%),
+  which is where the cycle's gain went: 716k is 163k x 0.97 / 0.222. R legs at the 220 ms cycle want 740k/s and
+  get it.
+
+**Decision**: the flood's core budget first (loop235: `F7_CORES_PER_NODE=48`, 32 physical cores for the flood, with
+and without G2+G3 -- a configuration change, no code; falsified if the flood's window-1 rate does not pass 800k/s
+or win1 stays under 780k), then the follower's import: the QMDB root (75) and the engine insert (46) run serially
+after the execution on the import thread, and neither is needed by the *next* block's execution, only by the vote on
+the block after (the root) and by persistence (the insert). Attempt **E2**: the root and the insert of block n behind
+the execution of n+1 (`bin/n42/src/follower_import.rs`, `root_wait_ms` / `parent_engine_wait_ms` already gate the
+cases where the next block needs them), so the import's serial term is the execution, ~122. That is the follower's
+term of the 1M plan: 163k at a 160 ms cycle needs the import under 160.

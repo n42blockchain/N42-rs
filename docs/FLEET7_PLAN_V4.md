@@ -1834,8 +1834,18 @@ serial loop, which pulled afresh and executed 163,000 transfers one at a time (`
 ingest gate closed on a pool over its limit. In G150 the same transition took 0.8 s. The window-1 numbers of
 three legs in 6.13 (548-555k) are this defect, not the configuration; **defect 15**, fixed on
 `plan-v6/stale-build-serial` (a build whose parallel step skipped everything it was offered declines with
-`Aborted` when its parent is no longer the head or its height is decided; the serial loop is never entered with a
-full parallel step's worth of skipped work on a chained build).
+`Aborted`, and the consensus client builds the ordinary way; the serial loop is never entered with a full parallel
+step's worth of skipped work on a chained build; merged 1944a01f2).
+
+**Correction from the fix's author (the views and the heights differ by one)**: the 9 s build was not the stale
+request but the *legitimate* chained build on the new leader's first block (the one its ordinary `try_build` had
+just sealed): its parallel step saw every sender's account nonce one block behind the queue's lane (10828 against
+10892, exactly the block's 64 a sender), skipped all 163,000 as "gapped", and the serial loop then pulled afresh
+and built a valid block at 55 us a transfer. In every one of the twelve loop237 builds over 1 s, `fast` equals
+`par_skipped`. So the gapped verdict was spurious, and the open question is why the chained build on a parent
+built by the ordinary path reads a state one block behind (`opener_on_sealed_parent` on a `try_build` parent, the
+parent build's `cached_reads`, or the warm layer; `forget_mined` also reported `forgotten=0` for that block) --
+**defect 15b**, to read next; the decline makes the handover cost ~0.3 s instead of 9.
 
 Also seen on the way: `canonical blocks pruned from the queue ... prune_ms=82-114` on every node at every block --
 ~100 ms of queue pruning a block, whose thread and lock are worth knowing before the follower's road is tuned.

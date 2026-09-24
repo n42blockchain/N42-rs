@@ -1893,3 +1893,30 @@ wait 22, exec 69, 6.13). The next attempts, in order: **Q1** -- the queue's lock
 assembly and the ~100 ms per-block prune all under it): shard it by sender so `--conc 128` fills the blocks without
 B growing; **G proper** -- the graft insert sharded on the pool (state wait 22 -> 0 and the follower's merge);
 **I** -- the next run pulled and prepped during the parent's fold; and par_start's 19 ms, named.
+
+### 6.16 Defect 15 closed, sixteen tokio workers fill the blocks (loop239): 769,447
+
+Configuration: G2+G3 + F1 parts 1 and 3 (`N42_FOLLOWER_PARTITION_AHEAD=1 N42_ENGINE_TAKE_SEALED=1`), pacing 175.
+
+| leg | win1 | win2 | occupancy | txs p10 | sealed_at | import total | cycle | B | D | declined | TCs |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| warm | 748,062 | 677,263 | 96.3% | 158,000 | 166 | 192 | 195 | 78 | 88 | 3 | 1 |
+| T16 (`TOKIO_WORKER_THREADS=16`) | **769,447** | 638,553 | **98.3%** | **163,000** | 161 | 178 | 195 | 77 | 90 | 3 | 1 |
+| T16C128 (+ `--conc 128`) | 559,612 | 635,604 | 99.0% | 163,000 | 148 | 151 | 244 | **161** | 60 | 4 | 7 |
+| P150 | 726,328 | 653,593 | 95.5% | 151,500 | 163 | 194 | 194 | 81 | 70 | 7 | 2 |
+
+Defect 15's decline holds: no window was lost to the handover (3-7 declines a leg, each ~0.3 s; `stuck` 0), and
+the four windows read within 3% of each other for the first time today. Sixteen tokio workers fill the blocks
+(p10 163,000, occupancy 98.3%) at the same cycle: **769,447 on window 1, the campaign's best**, and the
+configuration from here on. `--conc 128` is falsified a third time and the tokio workers were not its cause
+either: B 161 with sixteen as with eight, while the flood itself starved (window-1 rate 99k/s, seven TCs). What
+couples the frames in flight to the proposal's road is still unnamed; it is not the execution layer's road
+(+14 ms, 6.15) and not the runtime's workers. Pacing 150 is now stable (no stall, cycle 194) and no faster: the
+cycle is the leader's period plus the hand-off, 161-166 + ~30.
+
+Supply is the binding term for throughput: at full blocks the fleet reads what the flood delivers (750k/s at
+`--conc 64 --rpcbatch 500`, reply-bound at ~45 ms). The next probe is the frame, not the concurrency:
+`--rpcbatch 1000` at 64 in flight (twice the transactions a reply), and at 32 (the same in-flight transactions
+as today, half the requests) -- loop240. On the leader's side the period's terms are G proper (the parent's
+graft insert sharded so the chained build's `state_wait` 20 goes to 0), `par_start` 19 named and cut, and
+attempt I (pull + prep during the parent's fold, 33) -- together ~70 of the 161, in flight as one agent.

@@ -400,6 +400,179 @@ pub fn build_pool() -> &'static rayon::ThreadPool {
     })
 }
 
+/// Whether the leader's parallel build reads the block's accounts ahead of
+/// its execution (`N42_BUILD_PREFETCH=1`, [`WarmAccounts`]): each batch the
+/// puller hands over is read on the worker pool while the pull and the prep
+/// run, and the execution's batches read those accounts from memory rather
+/// than through the parent's state provider. Off by default until a leg says
+/// the execution falls by more than the pool time it costs.
+pub fn build_prefetch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_BUILD_PREFETCH").is_ok_and(|v| v == "1"))
+}
+
+/// Shards of [`WarmAccounts`]: enough that the pool's prefetch jobs seldom
+/// meet on one lock, few enough that each job takes every lock once.
+const WARM_SHARDS: usize = 64;
+
+/// The shard an address lands in: its first byte, which is uniform for the
+/// flood's addresses and for anything derived from a hash.
+#[inline]
+fn warm_shard(address: &Address) -> usize {
+    address.0[0] as usize % WARM_SHARDS
+}
+
+/// An account as the parent's state answers it.
+type WarmInfo = Option<revm::state::AccountInfo>;
+
+/// The block's accounts as the parent's state has them, read ahead of the
+/// execution (`N42_BUILD_PREFETCH=1`).
+///
+/// The layer the parallel build's batches read is the parent's state
+/// provider itself -- `StateProviderDatabase<StateProviderBox>`, a
+/// `MemoryOverlayStateProvider` over the chain's state at the grandparent,
+/// whose base answers from the QMDB read view -- behind each batch's own
+/// `State` cache, which starts empty. Nothing there can be warmed from
+/// another thread: the read view (`QmdbReadView`) keeps no cache, only an
+/// offset index and a mapping of the entry file, and a batch's `State` is
+/// made on the batch's thread. So the prefetch keeps its own layer: what the
+/// provider answered for each address, consulted by [`WarmDb`] before the
+/// provider. Written by the pool's jobs through per-shard locks while the
+/// pull runs, then [`frozen`](Self::freeze) into plain maps the batches read
+/// without a lock.
+#[derive(Debug)]
+pub struct WarmAccounts {
+    shards: Vec<std::sync::Mutex<alloy_primitives::map::AddressHashMap<WarmInfo>>>,
+    /// The jobs' own time, summed over the pool's threads.
+    busy_us: std::sync::atomic::AtomicU64,
+}
+
+impl Default for WarmAccounts {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WarmAccounts {
+    /// An empty layer.
+    pub fn new() -> Self {
+        Self { shards: (0..WARM_SHARDS).map(|_| Default::default()).collect(), busy_us: Default::default() }
+    }
+
+    /// Reads `addresses` from `db` and keeps what it answered. A read that
+    /// fails is left out: the batch that needs the account reads it from the
+    /// provider itself and meets the error there, as it would without the
+    /// prefetch. Repeats next to each other (a sender's run) are read once.
+    pub fn fill<G: Database>(&self, addresses: &[Address], db: &mut G) {
+        let at = std::time::Instant::now();
+        let mut by_shard: Vec<Vec<(Address, WarmInfo)>> = vec![Vec::new(); WARM_SHARDS];
+        let mut last: Option<Address> = None;
+        for &address in addresses {
+            if last == Some(address) {
+                continue;
+            }
+            last = Some(address);
+            if let Ok(info) = db.basic(address) {
+                by_shard[warm_shard(&address)].push((address, info));
+            }
+        }
+        for (shard, found) in self.shards.iter().zip(by_shard) {
+            if found.is_empty() {
+                continue;
+            }
+            shard.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(found);
+        }
+        self.busy_us.fetch_add(at.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The jobs' own time so far, in microseconds, summed over threads.
+    pub fn busy_us(&self) -> u64 {
+        self.busy_us.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The layer, read-only, once every job that fills it is done.
+    pub fn freeze(self) -> FrozenWarm {
+        FrozenWarm {
+            shards: self
+                .shards
+                .into_iter()
+                .map(|shard| shard.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner))
+                .collect(),
+        }
+    }
+}
+
+/// [`WarmAccounts`] after the prefetch: plain maps, read without a lock.
+#[derive(Debug, Default)]
+pub struct FrozenWarm {
+    shards: Vec<alloy_primitives::map::AddressHashMap<WarmInfo>>,
+}
+
+impl FrozenWarm {
+    /// What the prefetch read for `address`: `None` if it did not read it,
+    /// `Some(None)` for an account the parent's state does not have.
+    #[inline]
+    pub fn get(&self, address: &Address) -> Option<&WarmInfo> {
+        self.shards.get(warm_shard(address))?.get(address)
+    }
+
+    /// How many accounts it holds.
+    pub fn len(&self) -> usize {
+        self.shards.iter().map(|shard| shard.len()).sum()
+    }
+
+    /// Whether it holds none.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// A batch's view of the parent's state with the prefetched accounts in
+/// front: an account the prefetch read is answered from memory, anything
+/// else -- code, storage, block hashes, an account it did not read -- from
+/// `inner`. The answers are the parent's either way, so the block is the
+/// same byte for byte.
+#[derive(Debug)]
+pub struct WarmDb<'a, G> {
+    warm: &'a FrozenWarm,
+    inner: G,
+}
+
+impl<'a, G> WarmDb<'a, G> {
+    /// `inner` behind `warm`.
+    pub const fn new(warm: &'a FrozenWarm, inner: G) -> Self {
+        Self { warm, inner }
+    }
+}
+
+impl<G: Database> Database for WarmDb<'_, G> {
+    type Error = G::Error;
+
+    #[inline]
+    fn basic(&mut self, address: Address) -> Result<WarmInfo, Self::Error> {
+        match self.warm.get(&address) {
+            Some(info) => Ok(info.clone()),
+            None => self.inner.basic(address),
+        }
+    }
+
+    fn code_by_hash(&mut self, code_hash: alloy_primitives::B256) -> Result<revm::state::Bytecode, Self::Error> {
+        self.inner.code_by_hash(code_hash)
+    }
+
+    fn storage(
+        &mut self,
+        address: Address,
+        index: revm::primitives::StorageKey,
+    ) -> Result<revm::primitives::StorageValue, Self::Error> {
+        self.inner.storage(address, index)
+    }
+
+    fn block_hash(&mut self, number: u64) -> Result<alloy_primitives::B256, Self::Error> {
+        self.inner.block_hash(number)
+    }
+}
+
 /// Whole groups packed into at most `2 x workers` batches of about equal
 /// size (a couple of thousand transfers each), in group order: what one
 /// worker executes on one view of the parent's state.
@@ -3878,5 +4051,266 @@ mod tests {
         let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
         let out = execute_transfers(&evm_config, &block, db.clone(), &|| Some(db.clone())).expect("no execution error");
         assert!(matches!(out, Err(NotParallel::TouchesBeneficiary(0))), "{out:?}");
+    }
+
+    /// A run's block as the builder takes it: each transfer's gas and
+    /// outcome in candidate order, and the batches' bundles grafted onto the
+    /// parent's state with the graft's reverts appended.
+    fn grafted_run(run: BuildRun<()>, db: &CacheDB<EmptyDB>, beneficiary: Address) -> (Vec<(usize, u64, bool)>, BundleState, U256) {
+        let executed: Vec<(usize, u64, bool)> = run
+            .slots
+            .iter()
+            .filter_map(std::sync::OnceLock::get)
+            .map(|built| (built.index, built.gas_used, built.result.is_success()))
+            .collect();
+        let mut state = State::builder().with_database(db.clone()).with_bundle_update().build();
+        let graft = graft_bundles(&mut state, run.bundles, beneficiary).expect("the graft reads a CacheDB");
+        state.merge_transitions(BundleRetention::Reverts);
+        let mut bundle = state.take_bundle();
+        append_reverts(&mut bundle, graft.reverts);
+        (executed, bundle, graft.beneficiary_delta)
+    }
+
+    /// `N42_BUILD_PREFETCH`: a build whose batches read the prefetched layer
+    /// first -- with some accounts prefetched and the rest not, and one
+    /// account the parent does not have -- builds the same block as a build
+    /// that reads the parent's state alone: the same transfers, gas and
+    /// outcomes in the same order, and the same grafted state and reverts.
+    #[test]
+    fn a_prefetched_build_equals_the_plain_one() {
+        let (block, mut db) = random_fixture(40, 30, 2_000, 8, 8);
+        // Some recipients the parent already holds, so the prefetch reads
+        // both present and absent accounts.
+        for r in (0..2_000u64).step_by(3) {
+            db.insert_account_info(addr(1_000_000 + r), AccountInfo { balance: U256::from(5 + r), nonce: r % 4, ..Default::default() });
+        }
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_env = evm_config.evm_env(block.header()).expect("env");
+        let beneficiary = evm_env.block_env.beneficiary;
+        let envs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
+        let keys: Vec<(Address, Address)> = envs.iter().map(|e| (e.caller, e.kind.to().copied().unwrap_or_default())).collect();
+        let convert = |i: usize| ((), envs[i].clone());
+
+        let plain = execute_for_build_in_place(&evm_env, &keys, &convert, &|| Some(db.clone()), None, true).expect("a block of transfers");
+        assert!(plain.skipped.is_empty(), "{:?}", plain.skipped);
+
+        // Every other pulled batch of 64 prefetched, on the pool, as the
+        // builder does it.
+        let warm = WarmAccounts::new();
+        build_pool().in_place_scope(|scope| {
+            for (n, chunk) in keys.chunks(64).enumerate() {
+                if n % 2 == 1 {
+                    continue;
+                }
+                let addresses: Vec<Address> =
+                    chunk.iter().map(|(sender, _)| *sender).chain(chunk.iter().map(|(_, to)| *to)).collect();
+                let (warm, db) = (&warm, &db);
+                scope.spawn(move |_| warm.fill(&addresses, &mut db.clone()));
+            }
+        });
+        let warm = warm.freeze();
+        assert!(!warm.is_empty() && warm.len() < 40 + 2_000, "a partial prefetch: {}", warm.len());
+        let prefetched = execute_for_build_in_place(&evm_env, &keys, &convert, &|| Some(WarmDb::new(&warm, db.clone())), None, true)
+            .expect("a block of transfers");
+        assert!(prefetched.skipped.is_empty(), "{:?}", prefetched.skipped);
+
+        let (ours, our_bundle, our_fees) = grafted_run(prefetched, &db, beneficiary);
+        let (theirs, their_bundle, their_fees) = grafted_run(plain, &db, beneficiary);
+        assert_eq!(ours.len(), envs.len());
+        assert_eq!(ours, theirs, "transfers, gas and outcomes");
+        assert_eq!(our_fees, their_fees, "the beneficiary's tips");
+        assert_eq!(our_bundle.state.len(), their_bundle.state.len(), "accounts");
+        for (address, theirs) in &their_bundle.state {
+            assert_eq!(our_bundle.state.get(address), Some(theirs), "account {address}");
+        }
+        assert_eq!(our_bundle.reverts.len(), their_bundle.reverts.len());
+        for (ours, theirs) in our_bundle.reverts.iter().zip(their_bundle.reverts.iter()) {
+            let ours: std::collections::BTreeMap<_, _> = ours.iter().cloned().collect();
+            let theirs: std::collections::BTreeMap<_, _> = theirs.iter().cloned().collect();
+            assert_eq!(ours, theirs, "reverts");
+        }
+    }
+
+    /// The parent's state as the fleet's leader reads it, in miniature: the
+    /// parent block's changes (a hash map probe, as reth's in-memory overlay
+    /// makes one per block it holds) over the QMDB read view
+    /// (`N42_QMDB_READS=on`), which reads an offset index and then the
+    /// record out of a mapping of the entry file.
+    #[derive(Debug, Clone)]
+    struct ViewDb {
+        view: std::sync::Arc<n42_qmdb_reth::QmdbReadView>,
+        head: u64,
+        overlay: std::sync::Arc<alloy_primitives::map::AddressHashMap<Option<AccountInfo>>>,
+    }
+
+    impl Database for ViewDb {
+        type Error = std::convert::Infallible;
+
+        fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+            if let Some(info) = self.overlay.get(&address) {
+                return Ok(info.clone());
+            }
+            // As `StateProviderDatabase` converts it: no code loaded.
+            Ok(self.view.account(&address, self.head).flatten().map(AccountInfo::from))
+        }
+
+        fn code_by_hash(&mut self, _code_hash: B256) -> Result<revm::state::Bytecode, Self::Error> {
+            Ok(revm::state::Bytecode::default())
+        }
+
+        fn storage(
+            &mut self,
+            _address: Address,
+            _index: revm::primitives::StorageKey,
+        ) -> Result<revm::primitives::StorageValue, Self::Error> {
+            Ok(U256::ZERO)
+        }
+
+        fn block_hash(&mut self, _number: u64) -> Result<B256, Self::Error> {
+            Ok(B256::ZERO)
+        }
+    }
+
+    /// Plan v6 attempt H on the bench: a full block of the fleet's shape --
+    /// 163,008 transfers in runs of 64 (2,547 senders of 6,000), recipients
+    /// drawn from two million -- executed on the build's pool with its state
+    /// served from a QMDB read view over a two-million-account entry file,
+    /// behind the parent block's changes (150,000 accounts), and executed
+    /// again with the block's accounts prefetched (`N42_BUILD_PREFETCH`), in
+    /// pulled batches of 1,024 as the fleet's puller hands them over.
+    ///
+    /// ```text
+    /// RAYON_NUM_THREADS=16 taskset -c 0-31 \
+    ///   cargo test --release -p n42-engine-types --lib bench_build_prefetch -- --ignored --nocapture
+    /// ```
+    ///
+    /// Prints the execution (`par_exec_ms`) without and with the prefetch,
+    /// and the prefetch's wall time and summed pool time (`par_prefetch_ms`).
+    /// Idle here, the prefetch is extra wall time; on the fleet it runs beside
+    /// the pull and the prep (32 ms).
+    ///
+    /// What it reads (2026-09-24, idle box): exec 32-35 without the prefetch,
+    /// 16-17 with it -- half the leg's 65, so the fleet's read path is the
+    /// heavier one -- and the prefetch 35-37 ms of wall, 545-585 ms of pool
+    /// time for 159,230 accounts: 3.5 us a read with sixteen threads reading,
+    /// where one thread alone reads the same accounts at ~0.7 us. The reads
+    /// contend with each other; what on (the view's one `versions` lock is
+    /// the only state every read shares) is not measured here.
+    #[test]
+    #[ignore = "timing"]
+    fn bench_build_prefetch() {
+        use n42_twig_core::qmdb_compat::{encode_gov5_account_value, gov5_account_key, GOV5_EMPTY_CODE_HASH};
+        use std::io::Write as _;
+        let senders = 6_000u64;
+        let recipients = 2_000_000u64;
+        let run = 64u64;
+        let block_senders = 2_547u64;
+        let sender_of = |s: u64| addr(100 + s);
+        let recipient_of = |r: u64| addr(1_000_000 + r);
+
+        // The entry file: `[key 32][len u32 LE][value]` per account.
+        let dir = std::env::temp_dir().join(format!("n42-bench-build-prefetch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let path = dir.join("entries.log");
+        let mut live = Vec::with_capacity((senders + recipients) as usize);
+        {
+            let mut out = std::io::BufWriter::new(std::fs::File::create(&path).expect("the entry file"));
+            let mut offset = 0u64;
+            let mut put = |address: Address, nonce: u64, balance: U256| {
+                let key = gov5_account_key(&address.0 .0);
+                let value = encode_gov5_account_value(nonce, &balance.to_be_bytes::<32>(), &GOV5_EMPTY_CODE_HASH);
+                out.write_all(&key).expect("write");
+                out.write_all(&(value.len() as u32).to_le_bytes()).expect("write");
+                out.write_all(&value).expect("write");
+                live.push((key, offset));
+                offset += 36 + value.len() as u64;
+            };
+            // The beneficiary exists, as on the chain (the fast path leaves
+            // an empty coinbase to the interpreter).
+            put(addr(1), 0, U256::from(7));
+            for s in 0..senders {
+                put(sender_of(s), 0, U256::from(10u128.pow(21)));
+            }
+            for r in 0..recipients {
+                put(recipient_of(r), r % 3, U256::from(1 + r));
+            }
+            out.flush().expect("flush");
+        }
+        let view = n42_qmdb_reth::QmdbReadView::build(&path, (1, B256::ZERO), live).expect("the read view");
+        // The parent block's changes: 150,000 accounts it touched.
+        let mut overlay = alloy_primitives::map::AddressHashMap::default();
+        for i in 0..150_000u64 {
+            let r = (i * 13) % recipients;
+            let account = reth_primitives_traits::Account { nonce: r % 3, balance: U256::from(2 + r), bytecode_hash: None };
+            overlay.insert(recipient_of(r), Some(AccountInfo::from(account)));
+        }
+        let db = ViewDb { view, head: 1, overlay: std::sync::Arc::new(overlay) };
+
+        let beneficiary = addr(1);
+        let mut envs = Vec::new();
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        for s in 0..block_senders {
+            for k in 0..run {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let mut env = TxEnv::default();
+                env.caller = sender_of(s);
+                env.kind = TxKind::Call(recipient_of(seed % recipients));
+                env.value = U256::from(1_000 + k);
+                env.gas_limit = 21_000;
+                env.gas_price = 10_000_000_000;
+                env.gas_priority_fee = Some(1_000_000_000);
+                env.nonce = k;
+                env.tx_type = 2;
+                env.chain_id = Some(1);
+                envs.push(env);
+            }
+        }
+        let header = Header { number: 20_000_000, beneficiary, gas_limit: 5_000_000_000, base_fee_per_gas: Some(1_000_000_000), timestamp: 1_800_000_000, ..Default::default() };
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_env = evm_config.evm_env(&header).expect("env");
+        let keys: Vec<(Address, Address)> = envs.iter().map(|e| (e.caller, e.kind.to().copied().unwrap_or_default())).collect();
+        let convert = |i: usize| ((), envs[i].clone());
+        println!("block: {} transfers, {} pool threads", envs.len(), build_pool().current_num_threads());
+        // One thread alone reading the same accounts: what a read costs
+        // without the other fifteen reading beside it.
+        {
+            let addresses: Vec<Address> = keys[..20_480].iter().map(|(_, to)| *to).collect();
+            let warm = WarmAccounts::new();
+            warm.fill(&addresses, &mut db.clone());
+            println!("serial prefetch: {} reads in {} us ({} ns a read)", addresses.len(), warm.busy_us(), warm.busy_us() * 1000 / addresses.len() as u64);
+        }
+        for round in 0..4 {
+            let plain = execute_for_build_in_place(&evm_env, &keys, &convert, &|| Some(db.clone()), None, true).expect("a block of transfers");
+            let at = std::time::Instant::now();
+            let warm = WarmAccounts::new();
+            build_pool().in_place_scope(|scope| {
+                for chunk in keys.chunks(1_024) {
+                    let addresses: Vec<Address> =
+                        chunk.iter().map(|(sender, _)| *sender).chain(chunk.iter().map(|(_, to)| *to)).collect();
+                    let (warm, db) = (&warm, &db);
+                    scope.spawn(move |_| warm.fill(&addresses, &mut db.clone()));
+                }
+            });
+            let prefetch_wall = at.elapsed();
+            let busy_ms = warm.busy_us() / 1000;
+            let warm = warm.freeze();
+            let prefetched = execute_for_build_in_place(&evm_env, &keys, &convert, &|| Some(WarmDb::new(&warm, db.clone())), None, true)
+                .expect("a block of transfers");
+            assert_eq!(plain.skipped.len(), prefetched.skipped.len());
+            let executed = plain.slots.iter().filter(|slot| slot.get().is_some()).count();
+            assert_eq!(executed, envs.len(), "every transfer executed");
+            println!(
+                "round {round}: exec plain {} ms, prefetched {} ms; prefetch wall {} ms, pool {} ms ({} accounts); batches {}",
+                plain.phases.groups_ms,
+                prefetched.phases.groups_ms,
+                prefetch_wall.as_millis(),
+                busy_ms,
+                warm.len(),
+                plain.phases.batches,
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

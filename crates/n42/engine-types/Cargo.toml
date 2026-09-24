@@ -99,3 +99,5 @@ serde_json.workspace = true
 # `claimed_build`'s tests sign the transactions they check the claim of.
 ed25519-dalek = { version = "2.2", default-features = false, features = ["std", "fast"] }
 secp256k1.workspace = true
+# `bench_build_prefetch` serves its state from a QMDB read view over an entry file it writes.
+n42-twig-core.workspace = true

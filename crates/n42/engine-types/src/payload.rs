@@ -954,6 +954,11 @@ where
     // `N42_GRAFT_PREFAULT=1`: how long the graft's memory took to map, on its
     // own thread beside the parallel step (not on the chain).
     let mut par_prefault_ms = 0u64;
+    // `N42_BUILD_PREFETCH=1`: the prefetch's own time on the worker pool,
+    // summed over its jobs, and how long the build waited for it after the
+    // pull and the prep.
+    let mut par_prefetch_ms = 0u64;
+    let mut par_prefetch_wait_ms = 0u64;
     // The transactions root, computed beside the graft for a block that
     // will seal early.
     let mut early_transactions_root: Option<B256> = None;
@@ -975,50 +980,87 @@ where
         let budget = (block_gas_limit.saturating_sub(cumulative_gas_used) / MIN_TRANSACTION_GAS) as usize;
         let mut cands: Vec<Arc<reth_transaction_pool::ValidPoolTransaction<Pool::Transaction>>> =
             Vec::with_capacity(budget.min(262_144));
-        if let Some(puller) = pulled.as_ref() {
-            while cands.len() < budget {
-                match puller.batches.recv() {
-                    Ok(batch) if !batch.is_empty() => cands.extend(batch),
-                    _ => break,
+        // `N42_BUILD_PREFETCH=1`: each batch the puller hands over has its
+        // senders' and recipients' accounts read on the worker pool while the
+        // rest of the block is pulled and prepared, into a layer the
+        // execution's batches read before the parent's state provider
+        // (`WarmAccounts`). The addresses are copied out here, on this
+        // thread, from transactions the build already holds: the jobs touch
+        // neither the queue nor its locks.
+        let open_db = || open_parent_state().ok().map(StateProviderDatabase::new);
+        let warm_fill = crate::parallel_transfer::build_prefetch().then(crate::parallel_transfer::WarmAccounts::new);
+        let (warm_ref, open_ref) = (warm_fill.as_ref(), &open_db);
+        let (all_transfers, keys, prep_done) = crate::parallel_transfer::build_pool().in_place_scope(|scope| {
+            if let Some(puller) = pulled.as_ref() {
+                while cands.len() < budget {
+                    match puller.batches.recv() {
+                        Ok(batch) if !batch.is_empty() => {
+                            if let Some(warm) = warm_ref {
+                                // Senders first, then recipients: a sender's
+                                // run is read once.
+                                let addresses: Vec<alloy_primitives::Address> = batch
+                                    .iter()
+                                    .map(|tx| tx.sender())
+                                    .chain(batch.iter().map(|tx| tx.transaction.to().unwrap_or_default()))
+                                    .collect();
+                                scope.spawn(move |_| {
+                                    if let Some(mut db) = open_ref() {
+                                        warm.fill(&addresses, &mut db);
+                                    }
+                                });
+                            }
+                            cands.extend(batch)
+                        }
+                        _ => break,
+                    }
                 }
             }
-        }
-        // The queue had less than a block: nothing more will come this build.
-        par_drained = cands.len() < budget;
-        par_pull_ms = par_at.elapsed().as_millis() as u64;
-        let prep_at = std::time::Instant::now();
-        if cands.len() > budget {
-            let extra = cands.split_off(budget);
-            for tx in extra.into_iter().rev() {
-                lookahead.push_front(tx);
+            // The queue had less than a block: nothing more will come this build.
+            par_drained = cands.len() < budget;
+            par_pull_ms = par_at.elapsed().as_millis() as u64;
+            let prep_at = std::time::Instant::now();
+            if cands.len() > budget {
+                let extra = cands.split_off(budget);
+                for tx in extra.into_iter().rev() {
+                    lookahead.push_front(tx);
+                }
             }
-        }
-        let all_transfers = !cands.is_empty()
-            && cands.iter().all(|tx| {
-                let tx = &tx.transaction;
-                tx.gas_limit() == MIN_TRANSACTION_GAS
-                    && tx.input().is_empty()
-                    && !tx.is_create()
-                    && tx.access_list().is_none_or(|list| list.is_empty())
-                    && !tx.is_eip4844()
-                    && !tx.is_eip7702()
-            });
+            let all_transfers = !cands.is_empty()
+                && cands.iter().all(|tx| {
+                    let tx = &tx.transaction;
+                    tx.gas_limit() == MIN_TRANSACTION_GAS
+                        && tx.input().is_empty()
+                        && !tx.is_create()
+                        && tx.access_list().is_none_or(|list| list.is_empty())
+                        && !tx.is_eip4844()
+                        && !tx.is_eip7702()
+                });
+            let keys: Vec<(alloy_primitives::Address, alloy_primitives::Address)> = if all_transfers {
+                cands.iter().map(|tx| (tx.sender(), tx.transaction.to().unwrap_or_default())).collect()
+            } else {
+                Vec::new()
+            };
+            par_prep_ms = prep_at.elapsed().as_millis() as u64;
+            (all_transfers, keys, std::time::Instant::now())
+        });
+        // The scope waited here for the prefetch's last jobs: 0 when the
+        // pull and the prep hid it.
+        par_prefetch_wait_ms = prep_done.elapsed().as_millis() as u64;
+        par_prefetch_ms = warm_fill.as_ref().map_or(0, |warm| warm.busy_us() / 1000);
+        let warm = warm_fill.map(crate::parallel_transfer::WarmAccounts::freeze).unwrap_or_default();
         if !all_transfers {
             for tx in cands.into_iter().rev() {
                 lookahead.push_front(tx);
             }
         } else {
-            let keys: Vec<(alloy_primitives::Address, alloy_primitives::Address)> = cands
-                .iter()
-                .map(|tx| (tx.sender(), tx.transaction.to().unwrap_or_default()))
-                .collect();
             let convert = |i: usize| {
                 let recovered: reth_primitives_traits::Recovered<TransactionSigned> = cands[i].to_consensus();
                 let env = evm_config.tx_env(recovered.as_recovered_ref());
                 (recovered, env)
             };
-            let open = || open_parent_state().ok().map(StateProviderDatabase::new);
-            par_prep_ms = prep_at.elapsed().as_millis() as u64;
+            // Without the prefetch the layer is empty and every read goes
+            // to the provider, as before.
+            let open = || open_db().map(|db| crate::parallel_transfer::WarmDb::new(&warm, db));
             // `N42_GRAFT_STREAM=1`: each batch's bundle is folded into the
             // block's graft as that batch finishes, on the worker pool, rather
             // than all of them on this thread once the execution is over (the
@@ -1745,6 +1787,8 @@ where
                     direct_receipts = direct_receipts_used,
                     par_graft_ms,
                     par_prefault_ms,
+                    par_prefetch_ms,
+                    par_prefetch_wait_ms,
                     par_fold_ms,
                     tx_root_ms = root_ms,
                     parent_fields_ms = fields_ms,

@@ -1473,3 +1473,18 @@ groups on the fleet.
   earlier and its `setup` includes the wait for the parent's bundle; the period is what counts. Adopted.
 - `queue_ms` 18 is the fold of 163k nonces (`queue_fold_us` 6-7 ms) plus the walk, lock 0: now beside the build.
 - With the period at 220 the pacing (175) is binding again: D 92-95. loop226 lowers it with J on.
+
+### 6.3 Pacing below 175 with J (loop226): the wall is at 218-222 ms, and the low pacings lose windows
+
+| pacing | 175 | 150 a / b | 125 a / b |
+| --- | --- | --- | --- |
+| cycle (dissected) / D / E | 221 / 89 / 35 | 222 / 71 / 46, 219 / 71 / 52 | 218 / 49 / 61, 222 / 50 / 58 |
+| window 1 / 2 | 619k / 424k | 673k / (87k, a 1.9 s stall), **727k** / 652k | 718k / 672k, **735k** / (255k, a 0.64 s stall) |
+
+- The cycle floors at 218-222 ms whatever the pacing: the pacing wait (D) becomes the wait for the build (E). The
+  build period with J is ~220 -- the wall. Window 1 reads 727-735k at 125-150 (the best legs yet) and two of four low
+  pacing legs lost their window 2 to a stall (1.9 s and 0.64 s cycles, no panic, 1-2 TCs); 175 lost one too this
+  round. **The pacing stays at 175** until the wall moves; the stall shape at 150/125 is read once it recurs at 175.
+- What the wall is made of, with J: the leader's parallel step (pull 21 + prep 11 + exec 65 + commit 16 + graft 73 =
+  186) plus the seal and the next build's setup. K (the read view under concurrency: exec 65) and G (the graft 73)
+  are the two cuts; each is worth ~30-40 ms of the 220.

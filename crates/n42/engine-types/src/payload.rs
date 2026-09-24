@@ -1791,6 +1791,12 @@ where
             build_stage.at(7);
             if tx_count >= 1000 {
                 let (queued, usable, parked) = queue_depth();
+                // `N42_READ_DEPTH_COUNTS=1`: how many of this block's account
+                // reads the parent's overlay answered at each depth of its own
+                // executed-block stack versus falling through to the
+                // historical provider (plan v6 6.4, `crate::direct_build::read_depth`).
+                let read_depth = crate::direct_build::read_depth::snapshot();
+                let overlay_depth = crate::direct_build::read_depth::overlay_depth();
                 tracing::info!(
                     target: "payload_builder",
                     number = block_number,
@@ -1821,6 +1827,15 @@ where
                     roots_ms,
                     finish_ms = finish_at.elapsed().as_millis() as u64,
                     total_ms = build_started.elapsed().as_millis() as u64,
+                    reads_d0 = read_depth[0],
+                    reads_d1 = read_depth[1],
+                    reads_d2 = read_depth[2],
+                    reads_d3 = read_depth[3],
+                    reads_d4_7 = read_depth[4],
+                    reads_d8_15 = read_depth[5],
+                    reads_d16p = read_depth[6],
+                    reads_hist = read_depth[7],
+                    overlay_depth,
                     "seal-first build phases"
                 );
             }

@@ -1550,7 +1550,13 @@ where
                         .map_err(|err| format!("the state the published outputs are laid over: {err}"))?;
                     Ok(n42_engine_types::direct_build::overlay_on_executed(historical, executed.clone()))
                 }
-                None => provider.state_by_block_hash(parent_hash).map_err(|err| format!("parent state: {err}")),
+                None => {
+                    // No published-output overlay on this path: every read
+                    // reaches the engine's own state at the parent directly,
+                    // depth 0 by definition.
+                    n42_engine_types::direct_build::read_depth::note_overlay_depth(0);
+                    provider.state_by_block_hash(parent_hash).map_err(|err| format!("parent state: {err}"))
+                }
             }
         };
         let state = open_parent_state()?;
@@ -1589,6 +1595,10 @@ where
                         + phases.merge_ms * 1_000
                         + phases.receipts_us
                         + phases.drop_us;
+                    // `N42_READ_DEPTH_COUNTS=1`: see
+                    // `n42_engine_types::direct_build::read_depth` (plan v6 6.4).
+                    let read_depth = n42_engine_types::direct_build::read_depth::snapshot();
+                    let overlay_depth = n42_engine_types::direct_build::read_depth::overlay_depth();
                     tracing::info!(
                         target: "n42.follower_import",
                         number,
@@ -1604,6 +1614,15 @@ where
                         drop_ms = phases.drop_us / 1000,
                         other_ms = phases.total_us.saturating_sub(named) / 1000,
                         total_ms = phases.total_us / 1000,
+                        reads_d0 = read_depth[0],
+                        reads_d1 = read_depth[1],
+                        reads_d2 = read_depth[2],
+                        reads_d3 = read_depth[3],
+                        reads_d4_7 = read_depth[4],
+                        reads_d8_15 = read_depth[5],
+                        reads_d16p = read_depth[6],
+                        reads_hist = read_depth[7],
+                        overlay_depth,
                         "parallel import phases"
                     );
                     output = Some(out);

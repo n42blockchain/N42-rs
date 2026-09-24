@@ -1445,3 +1445,16 @@ binds now is one thing.
 
 If G + H + J land as sized, the parallel step is ~120 and the restart ~15: a 135 ms period, and the cycle is then B
 (72) + D/E small + fixed ~12 = ~100-135 ms -- 1.2M at this block. The pacing then goes to 125 or off.
+
+### 6.1 Attempt H on the bench: the leader's reads contend on the read view (plan v6, ceiling 1)
+
+`plan-v6/build-prefetch` (merged d644bdbe5, `N42_BUILD_PREFETCH=1` off): the parallel build uses no `CachedReads`; each
+batch opens its own `State` over a `MemoryOverlayStateProvider` on the QMDB read view, so every account's first read
+in a batch goes to the view. Warming the builder's own layer halves the execution on the bench (32-35 -> 16-17 ms;
+the bench's exec is 0.5x the fleet's 65) -- but the prefetch itself costs 35-37 ms of wall and 545-585 ms of pool
+time for 159,230 accounts: **3.5 us a read with sixteen threads reading at once against 0.7 us alone**. That is the
+finding, and it is bigger than H: the leader's execution (65) and the follower's groups (50, "memory-bound": 32x the
+threads gave 2.4x, 2t) are concurrent reads of the view contending -- the suspect is `read_at`'s global `versions`
+RwLock, taken and held for every read (read_view.rs:218). `plan-v6/read-view-concurrency` (K): a snapshot per batch of
+reads, the record read outside any lock, truncation kept safe; the bar is 16 threads at ~1 us a read, then exec and
+groups on the fleet.

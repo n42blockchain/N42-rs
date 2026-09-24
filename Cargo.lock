@@ -7919,6 +7919,7 @@ dependencies = [
  "n42-h2-consensus",
  "n42-primitives",
  "n42-qmdb-reth",
+ "n42-twig-core",
  "n42-tx-queue",
  "n42-tx-types",
  "rayon",

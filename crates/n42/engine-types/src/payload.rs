@@ -621,6 +621,20 @@ fn body_matches_pull<A, P>(body: &[A], pulled: &[P], body_hash: impl Fn(&A) -> B
     [0, last / 2, last].into_iter().all(|i| body_hash(&body[i]) == pulled_hash(&pulled[i]))
 }
 
+/// The cumulative gas through each transaction of a block the parallel step
+/// left in its slots, in block order, and the block's gas.
+fn cumulative_gas(
+    refs: &[&crate::parallel_transfer::BuiltTransfer<reth_primitives_traits::Recovered<TransactionSigned>>],
+) -> (Vec<u64>, u64) {
+    let mut cumulative = Vec::with_capacity(refs.len());
+    let mut tx_gas = 0u64;
+    for built in refs {
+        tx_gas += built.result.gas().tx_gas_used();
+        cumulative.push(tx_gas);
+    }
+    (cumulative, tx_gas)
+}
+
 /// The receipts of a block the parallel step left in its slots, in block
 /// order, with `cumulative[i]` the block's gas through transaction `i`.
 fn receipts_from_slots(
@@ -1189,6 +1203,42 @@ where
     let mut tx_root_wait_ms = 0u64;
     // The lookahead and the puller given back before the ahead seal, ms.
     let mut give_back_ms = 0u64;
+    // Where the leader's time from the build's start to the seal goes, beside
+    // the fields that already name it (plan v6, the seal gap). With the
+    // parallel step taken, `sealed_at_ms` is, within a ms or two of rounding:
+    // par_start + par_pull + par_prep + par_prefetch_wait + pre_exec +
+    // par_run + scope_join + par_commit + sealed; `par_run` is itself
+    // par_part + state_wait + par_exec + par_collect + par_release.
+    // Build start to the parallel step's start (the setup, the puller's
+    // start, the header's preparation).
+    let mut par_start_ms = 0u64;
+    // The pull and prep's end to the execution's call (the prefetch layer
+    // frozen, the graft sink, the threads beside the batches spawned).
+    let mut pre_exec_ms = 0u64;
+    // The execution's call, whole: partition, the deferred state's open,
+    // the batches, the collect and the release.
+    let mut par_run_ms = 0u64;
+    // Of `par_run_ms`: the partition's per-sender vectors released.
+    let mut par_release_ms = 0u64;
+    // The execution's return to the fold's start: the transactions-root
+    // and prefault threads joined, the scope's end, the deferred state's
+    // re-check.
+    let mut scope_join_ms = 0u64;
+    // Of `par_commit_ms` on the slots path: the references to the filled
+    // slots and the block's gas; the cumulative gas per transaction (behind
+    // the seal on the ahead path, 0 there); the fees; the body and senders.
+    let mut commit_refs_ms = 0u64;
+    let mut commit_cumulative_ms = 0u64;
+    let mut commit_fees_ms = 0u64;
+    let mut commit_body_ms = 0u64;
+    // Of `give_back_ms`: the body checked against the pulled set.
+    let mut match_ms = 0u64;
+    // Of `sealed_ms`: the header filled and `cons.seal`; the sealed and
+    // recovered block made; `remember_pending`; the payload and the hook.
+    let mut seal_header_ms = 0u64;
+    let mut seal_block_ms = 0u64;
+    let mut seal_remember_ms = 0u64;
+    let mut seal_hook_ms = 0u64;
     // `N42_SEAL_AT_EXEC=1`: the block sealed and proposed at the parallel
     // step's end -- the payload, the block, its hash and number, and the seal's
     // timers -- for the fold and the finish that follow it.
@@ -1260,14 +1310,21 @@ where
             header.parent_beacon_block_root = attributes.parent_beacon_block_root;
             let block_number = header.number;
             cons.seal(&mut header).map_err(|err| PayloadBuilderError::Internal(err.into()))?;
+            seal_header_ms = (seal_at.elapsed().as_millis() as u64).saturating_sub(root_ms + fields_ms);
+            let step_at = std::time::Instant::now();
             let body = alloy_consensus::BlockBody { transactions, ommers: Vec::new(), withdrawals };
             let sealed_block = SealedBlock::seal_parts(header.clone(), body);
             let block_hash = SealedBlock::hash(&sealed_block);
             let recovered: Arc<reth_primitives_traits::RecoveredBlock<n42_tx_types::Block>> =
                 Arc::new(reth_primitives_traits::RecoveredBlock::new_sealed(sealed_block, senders));
+            seal_block_ms = step_at.elapsed().as_millis() as u64;
+            let step_at = std::time::Instant::now();
             crate::built_executions::remember_pending(block_hash, recovered.clone());
+            seal_remember_ms = step_at.elapsed().as_millis() as u64;
+            let step_at = std::time::Instant::now();
             let payload = EthBuiltPayload::new(recovered.clone(), total_fees, None, None);
             ($hook)(payload.clone());
+            seal_hook_ms = step_at.elapsed().as_millis() as u64;
             let sealed_ms = seal_at.elapsed().as_millis() as u64;
             let sealed_at_ms = build_started.elapsed().as_millis() as u64;
             build_stage.at(5);
@@ -1276,6 +1333,7 @@ where
     }
     if parallel_build() && pulled.is_some() {
         let par_at = std::time::Instant::now();
+        par_start_ms = build_started.elapsed().as_millis() as u64;
         let budget = (block_gas_limit.saturating_sub(cumulative_gas_used) / MIN_TRANSACTION_GAS) as usize;
         let mut cands: Vec<Arc<reth_transaction_pool::ValidPoolTransaction<Pool::Transaction>>> =
             Vec::with_capacity(budget.min(262_144));
@@ -1351,6 +1409,7 @@ where
         // The scope waited here for the prefetch's last jobs: 0 when the
         // pull and the prep hid it.
         par_prefetch_wait_ms = prep_done.elapsed().as_millis() as u64;
+        let pre_exec_at = std::time::Instant::now();
         par_prefetch_ms = warm_fill.as_ref().map_or(0, |warm| warm.busy_us() / 1000);
         let warm = warm_fill.map(crate::parallel_transfer::WarmAccounts::freeze).unwrap_or_default();
         if !all_transfers {
@@ -1406,6 +1465,7 @@ where
             // `N42_STATE_AFTER_PULL=1`: an error from the deferred open, raised
             // once the step's threads are joined.
             let mut deferred_state_err: Option<PayloadBuilderError> = None;
+            let mut exec_returned: Option<std::time::Instant> = None;
             let (executed, mut graft_target, root_ahead) = std::thread::scope(|scope| {
                 let target = prefault.then(|| {
                     let accounts = keys.len() + keys.len() / 4;
@@ -1420,6 +1480,8 @@ where
                         })
                     })
                 });
+                pre_exec_ms = pre_exec_at.elapsed().as_millis() as u64;
+                let run_at = std::time::Instant::now();
                 let executed = if defer_state {
                     // After the partition, before the batches: the builder's
                     // own state opened (the wait for a sealed parent's output
@@ -1444,6 +1506,8 @@ where
                     crate::parallel_transfer::execute_for_build_in_place(&group_env, &keys, &convert, &open, sink, in_place)
                 };
                 let exec_done = std::time::Instant::now();
+                par_run_ms = exec_done.duration_since(run_at).as_millis() as u64;
+                exec_returned = Some(exec_done);
                 let root_ahead = root_job.and_then(|job| job.join().ok());
                 tx_root_wait_ms = exec_done.elapsed().as_millis() as u64;
                 (executed, target.and_then(|job| job.join().ok()), root_ahead)
@@ -1455,20 +1519,41 @@ where
             // A partition that failed returned before the hook: the serial
             // path below needs the state all the same.
             open_deferred_state!()?;
+            scope_join_ms = exec_returned.map_or(0, |at| at.elapsed().as_millis() as u64);
             match executed {
                 Ok(mut run) => {
                     use reth_evm::execute::BlockExecutor as _;
                     let beneficiary = group_env.block_env.beneficiary;
                     par_collect_ms = run.phases.collect_ms;
+                    par_release_ms = run.phases.release_ms;
                     let fold_at = std::time::Instant::now();
+                    // `N42_SEAL_AT_EXEC=1`: the passes over the slots between the
+                    // execution's end and the seal run on the build pool (each
+                    // serial pass strides 163k slots of ~470 bytes).
+                    let on_pool = seal_at_exec();
                     // Block order, by reference: a pointer a transfer, where the
                     // collect moved ~470 bytes of each.
-                    let refs = (!run.slots.is_empty())
-                        .then(|| run.slots.iter().filter_map(std::sync::OnceLock::get).collect::<Vec<_>>());
+                    let refs = (!run.slots.is_empty()).then(|| {
+                        if on_pool {
+                            use rayon::prelude::*;
+                            let slots = &run.slots;
+                            crate::parallel_transfer::build_pool()
+                                .install(|| slots.par_iter().filter_map(std::sync::OnceLock::get).collect::<Vec<_>>())
+                        } else {
+                            run.slots.iter().filter_map(std::sync::OnceLock::get).collect::<Vec<_>>()
+                        }
+                    });
                     let (executed_count, executed_gas) = match refs.as_ref() {
+                        Some(refs) if on_pool => {
+                            use rayon::prelude::*;
+                            let gas = crate::parallel_transfer::build_pool()
+                                .install(|| refs.par_iter().map(|built| built.gas_used).sum::<u64>());
+                            (refs.len(), gas)
+                        }
                         Some(refs) => (refs.len(), refs.iter().map(|built| built.gas_used).sum::<u64>()),
                         None => (run.executed.len(), run.executed.iter().map(|built| built.gas_used).sum::<u64>()),
                     };
+                    commit_refs_ms = fold_at.elapsed().as_millis() as u64;
                     // This block seals early -- full or drained after this step,
                     // with nothing committed before it -- so nothing executes on
                     // this builder again: the executor's commit per transfer
@@ -1490,20 +1575,19 @@ where
                     // here is never handed to the serial loop.
                     let ahead = seal_at_exec() && seals_early_here && direct_receipts_enabled();
                     // With the slots left in place, the receipts are built from
-                    // them behind the seal, beside the graft: the cumulative gas
-                    // per transaction and the block's gas.
-                    let mut receipts_behind: Option<(Vec<u64>, u64)> = None;
+                    // them behind the seal, beside the graft, and with them the
+                    // cumulative gas per transaction and the block's gas: the
+                    // seal needs neither.
+                    let mut receipts_behind = false;
                     if let (true, true, Some(refs)) = (seals_early_here, direct_receipts_enabled(), refs.as_ref()) {
                         // The same body and receipts as the branch below, made
                         // from the slots: the transaction is copied out of its
                         // slot once, on the pool, straight into the body.
                         use rayon::prelude::*;
-                        let mut cumulative = Vec::with_capacity(executed_count);
-                        let mut tx_gas = 0u64;
-                        for built in refs {
-                            tx_gas += built.result.gas().tx_gas_used();
-                            cumulative.push(tx_gas);
-                        }
+                        let step_at = std::time::Instant::now();
+                        let cumulative = (!ahead).then(|| cumulative_gas(refs));
+                        commit_cumulative_ms = step_at.elapsed().as_millis() as u64;
+                        let step_at = std::time::Instant::now();
                         total_fees += refs
                             .par_iter()
                             .map(|built| {
@@ -1511,19 +1595,29 @@ where
                                 U256::from(tip) * U256::from(built.gas_used)
                             })
                             .reduce(|| U256::ZERO, |a, b| a + b);
-                        let transactions: Vec<TransactionSigned> =
-                            refs.par_iter().map(|built| built.tx.inner().clone()).collect();
-                        let senders: Vec<alloy_primitives::Address> = refs.par_iter().map(|built| built.tx.signer()).collect();
+                        commit_fees_ms = step_at.elapsed().as_millis() as u64;
+                        let step_at = std::time::Instant::now();
+                        // Ahead: one pass on the build pool for both vectors.
+                        let (transactions, senders): (Vec<TransactionSigned>, Vec<alloy_primitives::Address>) = if ahead {
+                            crate::parallel_transfer::build_pool()
+                                .install(|| refs.par_iter().map(|built| (built.tx.inner().clone(), built.tx.signer())).unzip())
+                        } else {
+                            (
+                                refs.par_iter().map(|built| built.tx.inner().clone()).collect(),
+                                refs.par_iter().map(|built| built.tx.signer()).collect(),
+                            )
+                        };
+                        commit_body_ms = step_at.elapsed().as_millis() as u64;
                         cumulative_gas_used += executed_gas;
                         tx_count += executed_count as u64;
                         direct_body = Some((transactions, senders));
-                        if ahead {
-                            receipts_behind = Some((cumulative, tx_gas));
-                        } else {
+                        if let Some((cumulative, tx_gas)) = cumulative {
                             direct_receipts = Some((receipts_from_slots(refs, &cumulative), tx_gas));
                             // The slots' 77 MB are freed on the pool, off this thread.
                             let slots = std::mem::take(&mut run.slots);
                             crate::parallel_transfer::build_pool().spawn(move || drop(slots));
+                        } else {
+                            receipts_behind = true;
                         }
                     } else if seals_early_here && direct_receipts_enabled() {
                         use rayon::prelude::*;
@@ -1629,6 +1723,7 @@ where
                             && direct_body.as_ref().is_some_and(|(transactions, _)| {
                                 body_matches_pull(transactions, &cands, |tx| *tx.tx_hash(), |tx| *tx.hash())
                             });
+                        match_ms = seal_at.elapsed().as_millis() as u64;
                         tx_root_ahead = matches;
                         // What the puller took ahead and this block did not
                         // build goes back to the queue before the proposal,
@@ -1668,11 +1763,12 @@ where
                     let (graft, early_root, receipts) = std::thread::scope(|scope| {
                         // Sealed at the execution's end: the receipts from the
                         // slots, beside the graft, instead of the root.
-                        let receipts_job = receipts_behind.as_ref().map(|(cumulative, _)| {
-                            let (slots, cumulative): (&[_], &[u64]) = (&run.slots, cumulative);
+                        let receipts_job = receipts_behind.then(|| {
+                            let slots: &[_] = &run.slots;
                             scope.spawn(move || {
                                 let refs: Vec<_> = slots.iter().filter_map(std::sync::OnceLock::get).collect();
-                                receipts_from_slots(&refs, cumulative)
+                                let (cumulative, tx_gas) = cumulative_gas(&refs);
+                                (receipts_from_slots(&refs, &cumulative), tx_gas)
                             })
                         });
                         let root = (sealing_early && sealed_ahead.is_none()).then(|| match direct_body.as_ref() {
@@ -1707,8 +1803,8 @@ where
                     });
                     par_graft_ms = graft_ms;
                     early_transactions_root = early_root;
-                    if let (Some(receipts), Some((_, tx_gas))) = (receipts, receipts_behind.take()) {
-                        let receipts = receipts.map_err(|_| {
+                    if let Some(receipts) = receipts {
+                        let (receipts, tx_gas) = receipts.map_err(|_| {
                             failed_after_seal(
                                 sealed_ahead_id,
                                 PayloadBuilderError::other(std::io::Error::other("the receipts job behind the seal panicked")),
@@ -2232,6 +2328,22 @@ where
                     tx_root_ahead,
                     tx_root_wait_ms,
                     give_back_ms,
+                    // The seal gap (plan v6): see the declarations of these
+                    // timers for how they sum to `sealed_at_ms`.
+                    par_start_ms,
+                    pre_exec_ms,
+                    par_run_ms,
+                    par_release_ms,
+                    scope_join_ms,
+                    commit_refs_ms,
+                    commit_cumulative_ms,
+                    commit_fees_ms,
+                    commit_body_ms,
+                    match_ms,
+                    seal_header_ms,
+                    seal_block_ms,
+                    seal_remember_ms,
+                    seal_hook_ms,
                     // `N42_STATE_AFTER_PULL=1` (plan v6 G3): the parent's state
                     // opened after the pull, prep and partition, and the time
                     // inside that open (0 with the flag off: the open is then

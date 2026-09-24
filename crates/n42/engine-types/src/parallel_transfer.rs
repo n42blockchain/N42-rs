@@ -78,6 +78,10 @@ pub struct Phases {
     pub reverts_ms: u64,
     /// The batches' results placed in candidate order (the build).
     pub collect_ms: u64,
+    /// The build's partition (one vector per sender) and batch lists
+    /// released at the run's end. With `N42_SEAL_AT_EXEC=1` they are handed
+    /// to the worker pool to free and this is only the hand-off.
+    pub release_ms: u64,
     /// Pre- and post-execution changes and the bundle.
     pub finish_ms: u64,
     /// How many groups there were.
@@ -2292,6 +2296,18 @@ where
     }
     run.skipped.sort_unstable();
     run.phases.collect_ms = at.elapsed().as_millis() as u64;
+    // The partition holds one vector per sender (~160k on a full block of
+    // distinct senders): freeing them here sat between the execution's end
+    // and the ahead seal. With the seal taken there (`N42_SEAL_AT_EXEC=1`)
+    // they are freed on the pool instead, off the builder's thread.
+    let at = std::time::Instant::now();
+    drop(batches);
+    if crate::payload::seal_at_exec() {
+        pool.spawn(move || drop(groups));
+    } else {
+        drop(groups);
+    }
+    run.phases.release_ms = at.elapsed().as_millis() as u64;
     Ok(run)
 }
 

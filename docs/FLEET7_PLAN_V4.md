@@ -1625,3 +1625,28 @@ build are not under 45, or if they are and win1 stays under 760k.
 
 The stall on G2b's window 2 (39 blocks at 0.77 s, tc=1) and on the warm leg's (77 blocks at 0.39 s, tc=1, flag off)
 are the pacing-175 stall that recurs at random since loop226; still unread.
+
+### 6.8 G3 on the fleet (loop232): the state opens after the pull, and the pull finds the parent's lookahead still out
+
+`plan-v6/state-after-pull` (merged 4b9ef6ca2, `N42_STATE_AFTER_PULL=1` off): the builder's `State` sits over a
+`LazyParentDb`; the parent's state (and the pre-execution system calls, the only thing in setup that read it) is
+opened in a hook after the pull, the prep and the partition, just before the batches run; `state_wait_ms` and
+`state_after_pull` on the phases lines.
+
+| leg | win1 | win2 | sealed_at | setup | state_wait | ahead seals / full builds |
+| --- | --- | --- | --- | --- | --- | --- |
+| warm | 721,791 | 630,238 | 226 | 14 | -- | -- |
+| G23a (G2+G3) | **407,153** | 564,650 | **166** | 0 | 0 | 107 / 180 |
+| R | 725,111 | 655,278 | 225 | 15 | -- | -- |
+| G23b | **558,424** | 542,706 | **171** | 0 | 0 | 167 / 284 |
+
+The mechanism worked as designed -- setup 0, the state wait 0, a block sealed at 166-171 ms instead of 225 -- and
+the leg was slower: 117 of the G23a builds did not seal ahead because "the parallel step left the block short of the
+gas limit", each preceded by `holes a build ran into that the pool cannot fill` (a sender's account nonce 692, the
+queue's lowest 820: 128 transactions of one sender checked out). The chained build now pulls *at* the parent's seal,
+and the parent's lookahead -- what its puller took beyond the block -- is given back only behind the graft, ~60 ms
+later (`refuse!` of `lookahead`, `drop(pulled)`, payload.rs ~2006). Under G2 alone the child's 70 ms wait for the
+state hid that; under G3 the child pulled from holed lanes, built short, fell to the serial loop and the cycle went
+to 0.29-0.39 s. A short block also refuses the ahead seal, which is why the seal count is below the build count.
+**Fix**: the lookahead and the puller are given back right after the ahead seal, before the graft (a few ms; the
+skipped senders' heads, rare on a full block, keep their late give-back with the diagnosis). Re-run as loop233.

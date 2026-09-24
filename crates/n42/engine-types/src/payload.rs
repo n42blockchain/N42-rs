@@ -540,6 +540,68 @@ pub fn seal_at_exec() -> bool {
     *ON.get_or_init(|| std::env::var("N42_SEAL_AT_EXEC").is_ok_and(|v| v == "1"))
 }
 
+/// `N42_STATE_AFTER_PULL=1` (plan v6 attempt G3, `FLEET7_PLAN_V4.md` 6.7):
+/// with the parallel build and the puller on, the builder opens the parent's
+/// state -- and applies the pre-execution changes, the one thing before the
+/// execution that reads it -- after the parallel step's pull, prep and
+/// partition rather than at the build's start. A chained build started at
+/// its parent's seal (`N42_BUILD_ON_OUTPUT=1`) waits in that open for the
+/// parent's `StateReady`; the pull, the prep and the partition need only the
+/// queue, the parent header and the block environment, and now run during
+/// that wait. Off by default; with it off, or on any build that does not
+/// take the parallel step, the state is opened where it always was.
+pub fn state_after_pull() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_STATE_AFTER_PULL").is_ok_and(|v| v == "1"))
+}
+
+/// The builder's database over the parent's state: the provider in `slot`,
+/// opened through `open` on the first read if nothing opened it before
+/// (`N42_STATE_AFTER_PULL=1` opens it explicitly, timed, before the
+/// parallel step's batches; a read ahead of that point would open it here).
+/// With the flag off the slot is filled at the build's start and every read
+/// is the provider's, as it was with `StateProviderDatabase` directly.
+struct LazyParentDb<'a> {
+    slot: &'a std::cell::OnceCell<reth_storage_api::StateProviderBox>,
+    open: &'a dyn Fn() -> Result<reth_storage_api::StateProviderBox, reth_storage_api::errors::ProviderError>,
+}
+
+impl std::fmt::Debug for LazyParentDb<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LazyParentDb").field("opened", &self.slot.get().is_some()).finish()
+    }
+}
+
+impl LazyParentDb<'_> {
+    fn provider(&self) -> Result<&reth_storage_api::StateProviderBox, reth_storage_api::errors::ProviderError> {
+        if let Some(provider) = self.slot.get() {
+            return Ok(provider);
+        }
+        let opened = (self.open)()?;
+        Ok(self.slot.get_or_init(|| opened))
+    }
+}
+
+impl revm::DatabaseRef for LazyParentDb<'_> {
+    type Error = reth_storage_api::errors::ProviderError;
+
+    fn basic_ref(&self, address: alloy_primitives::Address) -> Result<Option<revm::state::AccountInfo>, Self::Error> {
+        StateProviderDatabase::new(self.provider()?).basic_ref(address)
+    }
+
+    fn code_by_hash_ref(&self, code_hash: B256) -> Result<revm::state::Bytecode, Self::Error> {
+        StateProviderDatabase::new(self.provider()?).code_by_hash_ref(code_hash)
+    }
+
+    fn storage_ref(&self, address: alloy_primitives::Address, index: U256) -> Result<U256, Self::Error> {
+        StateProviderDatabase::new(self.provider()?).storage_ref(address, index)
+    }
+
+    fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
+        StateProviderDatabase::new(self.provider()?).block_hash_ref(number)
+    }
+}
+
 /// Whether the body the parallel step left is the pulled candidate set in
 /// pull order, so that a transactions root computed over the pulled set
 /// ahead of the execution is the body's root.
@@ -720,8 +782,22 @@ where
             None => client.state_by_block_hash(parent_hash_for_state),
         }
     };
-    let state_provider = open_parent_state()?;
-    let state = StateProviderDatabase::new(&state_provider);
+    // `N42_STATE_AFTER_PULL=1`: opened after the parallel step's pull, prep
+    // and partition instead of here (see `state_after_pull`). Only a build
+    // that takes the parallel step defers; every other opens it here.
+    let defer_state = state_after_pull() && parallel_build() && builder_puller() != 0;
+    let parent_state_slot: std::cell::OnceCell<reth_storage_api::StateProviderBox> = std::cell::OnceCell::new();
+    if !defer_state {
+        let _ = parent_state_slot.set(open_parent_state()?);
+    }
+    let state = LazyParentDb { slot: &parent_state_slot, open: &open_parent_state };
+    // The parent's state once it is open: after the deferred open under
+    // `N42_STATE_AFTER_PULL=1`, from the start otherwise.
+    let parent_state_ref = || {
+        parent_state_slot
+            .get()
+            .ok_or(reth_storage_api::errors::ProviderError::StateForHashNotFound(parent_hash_for_state))
+    };
     // The block access list, when the chain is past Amsterdam.
     //
     // EIP-7928, and the reason to build one here is not the EIP: reth executes
@@ -993,10 +1069,41 @@ where
         header.beneficiary = coinbase;
     }
 
-    builder.apply_pre_execution_changes().map_err(|err| {
-        warn!(target: "payload_builder", %err, "failed to apply pre-execution changes");
-        PayloadBuilderError::Internal(err.into())
-    })?;
+    // `N42_STATE_AFTER_PULL=1`: the parent's state opened and the
+    // pre-execution changes applied once, just before the parallel step's
+    // batches (or wherever the step leaves for the serial path first). The
+    // time inside the open is `state_wait_ms`: a chained build's wait for its
+    // parent's `StateReady`.
+    let state_pending = std::cell::Cell::new(defer_state);
+    let mut state_wait_ms = 0u64;
+    macro_rules! open_deferred_state {
+        () => {{
+            if state_pending.get() {
+                let at = std::time::Instant::now();
+                let opened = open_parent_state();
+                state_wait_ms += at.elapsed().as_millis() as u64;
+                match opened {
+                    Err(err) => Err(PayloadBuilderError::from(err)),
+                    Ok(provider) => {
+                        let _ = parent_state_slot.set(provider);
+                        state_pending.set(false);
+                        builder.apply_pre_execution_changes().map_err(|err| {
+                            warn!(target: "payload_builder", %err, "failed to apply pre-execution changes");
+                            PayloadBuilderError::Internal(err.into())
+                        })
+                    }
+                }
+            } else {
+                Ok::<(), PayloadBuilderError>(())
+            }
+        }};
+    }
+    if !defer_state {
+        builder.apply_pre_execution_changes().map_err(|err| {
+            warn!(target: "payload_builder", %err, "failed to apply pre-execution changes");
+            PayloadBuilderError::Internal(err.into())
+        })?;
+    }
 
     let mut block_blob_count = 0;
     let blob_params = chain_spec.blob_params_at_timestamp(attributes.timestamp);
@@ -1245,6 +1352,7 @@ where
         par_prefetch_ms = warm_fill.as_ref().map_or(0, |warm| warm.busy_us() / 1000);
         let warm = warm_fill.map(crate::parallel_transfer::WarmAccounts::freeze).unwrap_or_default();
         if !all_transfers {
+            open_deferred_state!()?;
             for tx in cands.into_iter().rev() {
                 lookahead.push_front(tx);
             }
@@ -1293,6 +1401,9 @@ where
             // computing one after the execution.
             let root_ahead_wanted =
                 seal_at_exec() && seal_early_possible && block_blob_count == 0 && direct_receipts_enabled();
+            // `N42_STATE_AFTER_PULL=1`: an error from the deferred open, raised
+            // once the step's threads are joined.
+            let mut deferred_state_err: Option<PayloadBuilderError> = None;
             let (executed, mut graft_target, root_ahead) = std::thread::scope(|scope| {
                 let target = prefault.then(|| {
                     let accounts = keys.len() + keys.len() / 4;
@@ -1307,14 +1418,41 @@ where
                         })
                     })
                 });
-                let executed =
-                    crate::parallel_transfer::execute_for_build_in_place(&group_env, &keys, &convert, &open, sink, in_place);
+                let executed = if defer_state {
+                    // After the partition, before the batches: the builder's
+                    // own state opened (the wait for a sealed parent's output
+                    // happens here) and the pre-execution changes applied.
+                    let mut before_batches = || match open_deferred_state!() {
+                        Ok(()) => true,
+                        Err(err) => {
+                            deferred_state_err = Some(err);
+                            false
+                        }
+                    };
+                    crate::parallel_transfer::execute_for_build_in_place_after(
+                        &group_env,
+                        &keys,
+                        &convert,
+                        &open,
+                        sink,
+                        in_place,
+                        &mut before_batches,
+                    )
+                } else {
+                    crate::parallel_transfer::execute_for_build_in_place(&group_env, &keys, &convert, &open, sink, in_place)
+                };
                 let exec_done = std::time::Instant::now();
                 let root_ahead = root_job.and_then(|job| job.join().ok());
                 tx_root_wait_ms = exec_done.elapsed().as_millis() as u64;
                 (executed, target.and_then(|job| job.join().ok()), root_ahead)
             });
             par_prefault_ms = graft_target.as_ref().map_or(0, |target| target.prefault_us / 1000);
+            if let Some(err) = deferred_state_err.take() {
+                return Err(err);
+            }
+            // A partition that failed returned before the hook: the serial
+            // path below needs the state all the same.
+            open_deferred_state!()?;
             match executed {
                 Ok(mut run) => {
                     use reth_evm::execute::BlockExecutor as _;
@@ -1774,6 +1912,10 @@ where
         }
         par_ms = par_at.elapsed().as_millis() as u64;
     }
+    // `N42_STATE_AFTER_PULL=1`: every way out of the parallel step opened the
+    // state already; this is a no-op kept so the serial loop and the finish
+    // below never run on a state without its pre-execution changes.
+    open_deferred_state!()?;
 
     // Sealed before it finishes (`EarlySeal`, docs/PHASE_D_DEFERRED_EXECUTION.md
     // section 13): under deferred execution the header carries the parent's
@@ -1965,7 +2107,7 @@ where
                 let hashed = if n42_qmdb_reth::n42_state::hashed_tables_off() {
                     Ok(Default::default())
                 } else {
-                    state_provider.hashed_post_state(bundle_ref)
+                    parent_state_ref().and_then(|state_provider| state_provider.hashed_post_state(bundle_ref))
                 };
                 let prepared = root.join().expect("the QMDB root job does not panic");
                 let roots = receipts.join().expect("the receipts root job does not panic");
@@ -2067,6 +2209,12 @@ where
                     seal_at_exec = seal_at_exec_used,
                     tx_root_ahead,
                     tx_root_wait_ms,
+                    // `N42_STATE_AFTER_PULL=1` (plan v6 G3): the parent's state
+                    // opened after the pull, prep and partition, and the time
+                    // inside that open (0 with the flag off: the open is then
+                    // inside `setup_ms`).
+                    state_after_pull = defer_state,
+                    state_wait_ms,
                     "seal-first build phases"
                 );
             }
@@ -2397,7 +2545,7 @@ where
         Some(state) => {
             let finish_at = std::time::Instant::now();
             let outcome =
-                builder.finish(&state_provider, Some((B256::ZERO, TrieUpdates::default())))?;
+                builder.finish(parent_state_ref()?, Some((B256::ZERO, TrieUpdates::default())))?;
             let finish_took = finish_at.elapsed();
             let root_at = std::time::Instant::now();
             // Computed during assembly (see `assembler`); the fallback below
@@ -2420,7 +2568,7 @@ where
         }
         None => {
             let finish_at = std::time::Instant::now();
-            let outcome = builder.finish(&state_provider, None)?;
+            let outcome = builder.finish(parent_state_ref()?, None)?;
             (outcome, None, finish_at.elapsed(), std::time::Duration::ZERO)
         }
     };
@@ -2649,6 +2797,8 @@ where
             par_fold_ms,
             par_committed,
             par_ms,
+            state_after_pull = defer_state,
+            state_wait_ms,
             refused = ?crate::fast_transfer::rejected(),
             queued,
             usable,

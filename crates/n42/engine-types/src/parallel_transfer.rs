@@ -2123,7 +2123,30 @@ where
     G: Database + std::fmt::Debug + Send,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_run(evm_env, keys, convert, open, on_bundle, in_place)
+    execute_for_build_run(evm_env, keys, convert, open, on_bundle, in_place, None)
+}
+
+/// [`execute_for_build_in_place`] with `before_batches` called on this
+/// thread after the partition and before any batch opens the parent's state
+/// (`N42_STATE_AFTER_PULL=1`: the builder opens its own state there, after
+/// the pull, the prep and the partition). A hook that answers `false` fails
+/// the run with [`NotParallel::NoState`] before anything executes; a
+/// partition that fails returns before the hook is called.
+pub fn execute_for_build_in_place_after<T, G>(
+    evm_env: &reth_evm::EvmEnv,
+    keys: &[(Address, Address)],
+    convert: &(dyn Fn(usize) -> (T, TxEnv) + Sync),
+    open: &(dyn Fn() -> Option<G> + Sync),
+    on_bundle: Option<&(dyn Fn(BundleState) + Sync)>,
+    in_place: bool,
+    before_batches: &mut dyn FnMut() -> bool,
+) -> Result<BuildRun<T>, NotParallel>
+where
+    T: Send + Sync,
+    G: Database + std::fmt::Debug + Send,
+    G::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    execute_for_build_run(evm_env, keys, convert, open, on_bundle, in_place, Some(before_batches))
 }
 
 /// [`execute_for_build`] with somewhere for each batch's bundle to go as that
@@ -2143,7 +2166,7 @@ where
     G: Database + std::fmt::Debug + Send,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_for_build_run(evm_env, keys, convert, open, on_bundle, false)
+    execute_for_build_run(evm_env, keys, convert, open, on_bundle, false, None)
 }
 
 fn execute_for_build_run<T, G>(
@@ -2153,6 +2176,7 @@ fn execute_for_build_run<T, G>(
     open: &(dyn Fn() -> Option<G> + Sync),
     on_bundle: Option<&(dyn Fn(BundleState) + Sync)>,
     in_place: bool,
+    before_batches: Option<&mut dyn FnMut() -> bool>,
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
@@ -2172,6 +2196,11 @@ where
     let batches = batch_groups(&groups, keys.len(), workers);
     phases.batches = batches.len();
     phases.partition_ms = at.elapsed().as_millis() as u64;
+    if let Some(hook) = before_batches
+        && !hook()
+    {
+        return Err(NotParallel::NoState);
+    }
 
     let at = std::time::Instant::now();
     // Each result goes into its candidate's slot from the batch's own

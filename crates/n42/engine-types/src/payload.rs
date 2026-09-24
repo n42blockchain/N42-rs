@@ -1631,6 +1631,22 @@ where
                         let sealed = seal_block!(hook, seal_at, if matches { root_ahead } else { None });
                         sealed_ahead_id = Some((sealed.2, sealed.3));
                         sealed_ahead = Some(sealed);
+                        // What the puller took ahead and this block did not
+                        // build goes back to the queue now, not behind the
+                        // graft: the chained build pulls at the seal
+                        // (`N42_STATE_AFTER_PULL`), and on loop232 it found
+                        // the lanes holed by this build's lookahead still
+                        // checked out (117 of 180 builds short of the gas
+                        // limit, every one from a hole the pool could not
+                        // fill). The skipped senders' heads, rare on a full
+                        // block, are given back below with their diagnosis.
+                        for pool_tx in std::mem::take(&mut lookahead).into_iter().rev() {
+                            refuse!(
+                                &pool_tx,
+                                InvalidPoolTransactionError::ExceedsGasLimit(pool_tx.gas_limit(), block_gas_limit)
+                            );
+                        }
+                        drop(pulled.take());
                         seal_took = seal_at.elapsed();
                     }
                     // The transactions root beside the graft when the block

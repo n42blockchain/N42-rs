@@ -1489,19 +1489,20 @@ groups on the fleet.
   186) plus the seal and the next build's setup. K (the read view under concurrency: exec 65) and G (the graft 73)
   are the two cuts; each is worth ~30-40 ms of the 220.
 
-### 6.4 Attempt K on the fleet (loop227): the leader's exec barely moves, the follower's import slows
+### 6.4 Attempt K on the fleet (loop227): neutral -- the reads were never the bound there
 
-| | J175 reference (loop225-226) | K a / b / c / d |
+| | J175 legs without the change (loop225-226) | K a / b / c / d |
 | --- | --- | --- |
-| leader `par_exec_ms` / `sealed_at` | 65 / 220-223 | 60-64 / 211-223 |
-| follower `groups_ms` / import exec / total | ~50 / 84-96 / 192-203 | **65-70 / 102-110** / 180-209 |
-| cycle / E | 220 / 35 | 215-220 / 18-34 |
+| leader `par_exec_ms` | 62-65 | 60-64 |
+| follower `groups_ms` / import exec | 60-71 / 103-111 | 65-70 / 102-110 |
 | window 1 / 2 | 678-723k / 650-665k | 723-728k / 632-654k |
 
-- The striped reader lock takes ~3 ms off the leader's execution and puts ~15 ms onto the follower's groups and
-  import, in all four legs. The bench's 6x at 16 threads was the bench's: on the fleet the view's reads were not
-  the leader's bound, and something in the striping costs the follower (the writer's `exclusive()` over 64 lines on
-  every advance and publish, or a shared refcount on the snapshot -- not measured). Reverted (the bench stays); if it
-  comes back it comes back behind a flag with the follower's numbers on the leg.
-- Where the leader's 65 ms of execution goes is therefore still open, and so is the graft's 73: G's perf leg (waiting
-  on `perf_event_paranoid`) is the instrument for both.
+- The striped lock is noise on the fleet in both directions (my first reading of a follower regression compared
+  against loop203-209's numbers, before C and J; the J legs already read 103-111 / 60-71). Reverted as neutral; the
+  bench commit stays. The bench's 6x at 16 threads is the idle box's, where every read reaches the view.
+- The lead it leaves: on the fleet the view's head sits ~20 blocks behind the chain (`reader_lag` 21-26 with the
+  hashed tables off), so most of a block's account reads are answered by the in-memory overlay of unpersisted blocks
+  -- a walk of up to ~20 bundle maps per account -- before any read reaches the view. Unmeasured; a counter of reads
+  answered per overlay depth settles it (L). If so the 65 ms of the leader's execution and the follower's 65-70 of
+  groups are the overlay's depth, and the lever is a flatter overlay (one merged map kept incrementally) or a view
+  that runs closer to the head.

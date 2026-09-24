@@ -1386,5 +1386,23 @@ What a four-node leg must read, `N42_BUILD_COLLECT_IN_PLACE=1 N42_GRAFT_PREFAULT
   185-195. Next, as configuration first: the leader's streamed graft (`N42_GRAFT_STREAM=1`, falsified as a default at
   seven nodes with 16 cores, untested at 28) and the builder's pool at 28 threads now that the build is the wall.
 
+### 5.11 The build as configuration (loop223): the streamed graft moves the cost, the wider pool adds to it
+
+| `seal-first build phases`, medians | R | S (graft stream) a / b | T (rayon 28) | ST |
+| --- | --- | --- | --- | --- |
+| exec / fold (graft) / commit | 65 / 73 (55) / 16 | 106 / 41 (0) / 15, 104 / 42 / 16 | 67 / 73 (56) / 15 | 103 / 38 / 15 |
+| sealed_at / total | **186** / 243 | 197 / 253, 194 / 251 | 202 / 258 | 193 / 250 |
+| cycle / E | 229 / 40 | 232 / 47, 236 / 53 | 243 / 57 | 240 / 55 |
+| window 1 / 2 | **690k** / 636k | 685k / 614k, 674k / 636k | 652k / 598k | 657k / 619k |
+
+- The streamed graft takes the fold from 73 to 41 and puts 40 ms into exec (65 -> 104-106): the graft's work moved
+  onto the execution's threads, the seal is 8-11 ms later. Falsified again, at 28 cores as at 16. The pool at 28
+  threads is slower everywhere (seal 202). Both stay off. The reference read 690k on window 1, the best leg yet.
+- **The parallel step is the wall**: `sealed_at` 186 = pull 21 + prep 11 + exec 65 + commit 16 + fold 73, and the build
+  period is that plus ~45. The chain hides the roots and the finish already. To 160 ms the graft (55 ms, the same on
+  the fleet whether the map's pages are touched ahead or not, whether the fold is indexed or ranged) must be
+  understood on the fleet, not the bench: a profiled leg (`cargo build --profile profiling`, `perf` on the leader's
+  execution layer during window 1, `--no-inline`) is the next step, and no agent until it has been read.
+
 Each attempt is one agent brief and one runner; the bar for adopting any is the same as plan v4's: window 2 in every leg,
 verify 4/4, and the number it targets moving on the fleet, not on a bench.

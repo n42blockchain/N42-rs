@@ -19,15 +19,24 @@
 //! in the engine's tree. The engine's import and forkchoice still happen --
 //! beside the build instead of ahead of it.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use alloy_primitives::B256;
+use alloy_primitives::{Address, BlockNumber, Bytes, StorageKey, StorageValue, B256};
 use alloy_rpc_types_engine::PayloadAttributes;
 use n42_tx_types::N42Primitives;
-use reth_chain_state::{ExecutedBlock, MemoryOverlayStateProvider};
-use reth_primitives_traits::{RecoveredBlock, SealedBlock, SealedHeader};
-use reth_storage_api::{errors::ProviderResult, StateProviderBox, StateProviderFactory};
-use reth_trie::{ComputedTrieData, LazyTrieData};
+use reth_chain_state::{ExecutedBlock, MemoryOverlayStateProvider, MemoryOverlayStateProviderRef};
+use reth_primitives_traits::{Account, Bytecode, RecoveredBlock, SealedBlock, SealedHeader};
+use reth_storage_api::{
+    errors::ProviderResult, AccountReader, BlockHashReader, BytecodeReader, HashedPostStateProvider,
+    StateProofProvider, StateProvider, StateProviderBox, StateProviderFactory, StateRootProvider,
+    StorageRootProvider,
+};
+use reth_trie::{
+    updates::TrieUpdates, AccountProof, ComputedTrieData, ExecutionWitnessMode, HashedPostState, HashedStorage,
+    LazyTrieData, MultiProof, MultiProofTargets, StorageMultiProof, StorageProof, TrieInput,
+};
+use revm::database::BundleState;
 
 use crate::{built_executions::BuiltExecution, engine_types::N42BuiltPayload};
 
@@ -176,7 +185,170 @@ pub fn executed_from_output(
 /// engine, and whose grandparent is not either, lays both over the state at
 /// the nearest ancestor that is.
 pub fn overlay_on_executed(historical: StateProviderBox, executed: Vec<ExecutedParent>) -> StateProviderBox {
+    if read_depth::enabled() {
+        read_depth::note_overlay_depth(executed.len());
+        return Box::new(read_depth::CountingStateProvider { historical, executed });
+    }
     Box::new(MemoryOverlayStateProvider::<N42Primitives>::new(historical, executed))
+}
+
+/// `N42_READ_DEPTH_COUNTS=1`: a per-depth count of the `basic_account` reads
+/// [`overlay_on_executed`]'s provider answers, settling plan v6's ceiling-4
+/// lead (`docs/FLEET7_PLAN_V4.md` 6.4) -- whether the leader's 65 ms execution
+/// and the follower's 65-70 ms of groups are spent walking this overlay's own
+/// stack of executed blocks (the leader's parent chain, one deep; the
+/// follower's published-output ancestry,
+/// `bin/n42/src/follower_import.rs::PARENT_OUTPUTS_KEPT` deep) rather than
+/// reaching `historical`, the caller-supplied provider this overlay falls
+/// through to.
+///
+/// `historical` is itself whatever `StateProviderFactory::state_by_block_hash`
+/// returned -- on this chain, reth's engine in-memory state over the QMDB read
+/// view when the view lags the chain (`reader_lag`, plan v6 6.4), which may be
+/// another overlay of its own. That code is vendored reth
+/// (`crates/storage/provider`, `reth-chain-state`), out of scope for this
+/// counter: every read that does not land in `executed` is bucketed
+/// `historical` without being decomposed further.
+///
+/// Off by default (an atomic load per call to check, nothing else); each
+/// `basic_account` read costs one more atomic add when on.
+pub mod read_depth {
+    use super::*;
+
+    /// Depth buckets: 0, 1, 2, 3, 4-7, 8-15, 16+, historical.
+    pub const BUCKETS: usize = 8;
+    const HISTORICAL: usize = BUCKETS - 1;
+
+    fn bucket_of(depth: usize) -> usize {
+        match depth {
+            0..=3 => depth,
+            4..=7 => 4,
+            8..=15 => 5,
+            _ => 6,
+        }
+    }
+
+    static COUNTS: [AtomicU64; BUCKETS] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+    static OVERLAY_DEPTH: AtomicU64 = AtomicU64::new(0);
+
+    /// Whether `N42_READ_DEPTH_COUNTS=1` is set. Read once; the env var is
+    /// not re-checked after the first call.
+    pub fn enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("N42_READ_DEPTH_COUNTS").is_ok_and(|v| v == "1"))
+    }
+
+    fn record(depth: usize) {
+        COUNTS[bucket_of(depth)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records the depth of `executed` an [`overlay_on_executed`] call was
+    /// built with -- the number of executed blocks the overlay's own stack
+    /// holds, before any read falls through to `historical` -- or `0` for a
+    /// caller reading the engine's state directly, with no overlay at all.
+    /// A no-op unless [`enabled`].
+    pub fn note_overlay_depth(depth: usize) {
+        if enabled() {
+            OVERLAY_DEPTH.store(depth as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// The eight bucket counts and the last-seen overlay depth, summed since
+    /// the previous snapshot: `(reads_d0, reads_d1, reads_d2, reads_d3,
+    /// reads_d4_7, reads_d8_15, reads_d16p, reads_hist, overlay_depth)`. Reads
+    /// and resets the counts; leaves `overlay_depth` (a gauge, not a counter)
+    /// as it was.
+    pub fn snapshot() -> [u64; BUCKETS] {
+        let mut out = [0u64; BUCKETS];
+        for (slot, counter) in out.iter_mut().zip(&COUNTS) {
+            *slot = counter.swap(0, Ordering::Relaxed);
+        }
+        out
+    }
+
+    /// The overlay depth the most recent [`overlay_on_executed`] call was
+    /// built with.
+    pub fn overlay_depth() -> u64 {
+        OVERLAY_DEPTH.load(Ordering::Relaxed)
+    }
+
+    /// The counting `StateProvider` [`overlay_on_executed`] returns under the
+    /// flag: `basic_account` walks `executed` itself (the same newest-first
+    /// order `MemoryOverlayStateProviderRef::basic_account` uses) to learn
+    /// which depth answered, then falls through to `historical` unchanged.
+    /// Every other method delegates to a fresh `MemoryOverlayStateProviderRef`
+    /// built from the same two fields -- exactly what
+    /// `MemoryOverlayStateProvider::as_ref` does -- so behaviour off the
+    /// account-read path is unchanged.
+    #[expect(missing_debug_implementations)]
+    pub struct CountingStateProvider {
+        pub(super) historical: StateProviderBox,
+        pub(super) executed: Vec<ExecutedParent>,
+    }
+
+    impl CountingStateProvider {
+        /// The overlay every method but `basic_account` delegates to, freshly
+        /// built each call (as [`MemoryOverlayStateProvider::as_ref`] does)
+        /// since `historical`'s borrow cannot be cached alongside it.
+        fn as_ref(&self) -> MemoryOverlayStateProviderRef<'_, N42Primitives> {
+            MemoryOverlayStateProviderRef::new(Box::new(self.historical.as_ref()), self.executed.clone())
+        }
+    }
+
+    impl AccountReader for CountingStateProvider {
+        fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
+            for (depth, block) in self.executed.iter().enumerate() {
+                if let Some(account) = block.execution_output.account(address) {
+                    record(depth);
+                    return Ok(account);
+                }
+            }
+            record(HISTORICAL);
+            self.historical.basic_account(address)
+        }
+    }
+
+    reth_storage_api::macros::delegate_impls_to_as_ref!(
+        for CountingStateProvider =>
+        BlockHashReader {
+            fn block_hash(&self, number: u64) -> ProviderResult<Option<B256>>;
+            fn canonical_hashes_range(&self, start: BlockNumber, end: BlockNumber) -> ProviderResult<Vec<B256>>;
+        }
+        StateProvider {
+            fn storage(&self, account: Address, storage_key: StorageKey) -> ProviderResult<Option<StorageValue>>;
+        }
+        BytecodeReader {
+            fn bytecode_by_hash(&self, code_hash: &B256) -> ProviderResult<Option<Bytecode>>;
+        }
+        StateRootProvider {
+            fn state_root(&self, state: HashedPostState) -> ProviderResult<B256>;
+            fn state_root_from_nodes(&self, input: TrieInput) -> ProviderResult<B256>;
+            fn state_root_with_updates(&self, state: HashedPostState) -> ProviderResult<(B256, TrieUpdates)>;
+            fn state_root_from_nodes_with_updates(&self, input: TrieInput) -> ProviderResult<(B256, TrieUpdates)>;
+        }
+        StorageRootProvider {
+            fn storage_root(&self, address: Address, storage: HashedStorage) -> ProviderResult<B256>;
+            fn storage_proof(&self, address: Address, slot: B256, storage: HashedStorage) -> ProviderResult<StorageProof>;
+            fn storage_multiproof(&self, address: Address, slots: &[B256], storage: HashedStorage) -> ProviderResult<StorageMultiProof>;
+        }
+        StateProofProvider {
+            fn proof(&self, input: TrieInput, address: Address, slots: &[B256]) -> ProviderResult<AccountProof>;
+            fn multiproof(&self, input: TrieInput, targets: MultiProofTargets) -> ProviderResult<MultiProof>;
+            fn witness(&self, input: TrieInput, target: HashedPostState, mode: ExecutionWitnessMode) -> ProviderResult<Vec<Bytes>>;
+        }
+        HashedPostStateProvider {
+            fn hashed_post_state(&self, bundle_state: &BundleState) -> ProviderResult<HashedPostState>;
+        }
+    );
 }
 
 /// How long [`opener_on_built_parent`] waits for the grandparent to reach the
@@ -229,7 +401,7 @@ where
 {
     Arc::new(move || {
         let historical = state_at_soon(&client, grandparent)?;
-        Ok(Box::new(MemoryOverlayStateProvider::<N42Primitives>::new(historical, vec![executed.clone()])) as StateProviderBox)
+        Ok(overlay_on_executed(historical, vec![executed.clone()]))
     })
 }
 
@@ -633,6 +805,71 @@ mod tests {
             merge_at.elapsed().as_millis(),
             merged.state.len()
         );
+    }
+
+    /// The per-depth cost `read_depth` (plan v6 6.4) exists to explain: a
+    /// single `basic_account` walking a stack of 1 executed block against one
+    /// walking 20, on an otherwise idle box, every read missing every block
+    /// so it pays the whole walk before falling through to `historical` --
+    /// the worst case, and the one `reader_lag` puts most of a fleet block's
+    /// reads through if the overlay's own depth is where the leader's 65 ms
+    /// and the follower's 65-70 ms of groups (plan v6 6.4) are spent.
+    ///
+    /// `cargo test -p n42-engine-types --lib
+    /// direct_build::tests::bench_read_depth_1_vs_20 -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timing"]
+    fn bench_read_depth_1_vs_20() {
+        use std::time::Instant;
+
+        const READS: u64 = 100_000;
+        let address = |i: u64| {
+            let mut bytes = [0u8; 20];
+            bytes[12..].copy_from_slice(&i.to_be_bytes());
+            Address::from(bytes)
+        };
+        let info = || AccountInfo { nonce: 1, balance: U256::from(1u64), ..Default::default() };
+
+        // Each stacked block touches its own disjoint 10 accounts, well clear
+        // of the `READS` addresses read below -- every read misses every
+        // block in the stack and falls through to `historical`, the walk
+        // this bench times.
+        let stack_of = |depth: usize| -> Vec<ExecutedParent> {
+            (0..depth)
+                .map(|d| {
+                    let header = SealedHeader::seal_slow(Header { number: (d + 1) as u64, ..Default::default() });
+                    let bundle = BundleState::new(
+                        (0..10u64).map(|i| (address(10_000_000 + d as u64 * 10 + i), None, Some(info()), Default::default())),
+                        Vec::<Vec<(Address, Option<Option<AccountInfo>>, Vec<(U256, U256)>)>>::new(),
+                        Vec::new(),
+                    );
+                    executed_from_output(&header, Arc::new(BlockExecutionOutput { result: Default::default(), state: bundle }))
+                })
+                .collect()
+        };
+
+        let client = MockEthProvider::default();
+        for i in 0..READS {
+            client.add_account(address(i), ExtendedAccount::new(1, U256::from(5u64)));
+        }
+        let anchor = B256::with_last_byte(0x99);
+
+        let bench = |depth: usize| {
+            let historical = client.state_by_block_hash(anchor).expect("state");
+            let state =
+                Box::new(MemoryOverlayStateProvider::<N42Primitives>::new(historical, stack_of(depth))) as StateProviderBox;
+            let at = Instant::now();
+            let mut found = 0u64;
+            for i in 0..READS {
+                if state.basic_account(&address(i)).expect("read").is_some() {
+                    found += 1;
+                }
+            }
+            let ns_per_read = at.elapsed().as_nanos() as f64 / READS as f64;
+            println!("depth {depth}: {ns_per_read:.0} ns a read, {found} of {READS} found through `historical`");
+        };
+        bench(1);
+        bench(20);
     }
 
     /// Attempt J (`N42_BUILD_ON_OUTPUT`): a build started at its parent's

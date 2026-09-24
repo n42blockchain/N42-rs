@@ -948,6 +948,12 @@ where
     let mut par_collect_ms = 0u64;
     // Of the fold: the receipts loop, before the graft.
     let mut par_commit_ms = 0u64;
+    // Of the fold: the graft alone. `par_fold_ms` covers the receipts loop
+    // and then the longer of the graft and the transactions root beside it.
+    let mut par_graft_ms = 0u64;
+    // `N42_GRAFT_PREFAULT=1`: how long the graft's memory took to map, on its
+    // own thread beside the parallel step (not on the chain).
+    let mut par_prefault_ms = 0u64;
     // The transactions root, computed beside the graft for a block that
     // will seal early.
     let mut early_transactions_root: Option<B256> = None;
@@ -1027,14 +1033,44 @@ where
             });
             let sink: Option<&(dyn Fn(revm::database::BundleState) + Sync)> =
                 sink.as_ref().map(|sink| sink as &(dyn Fn(revm::database::BundleState) + Sync));
-            match crate::parallel_transfer::execute_for_build_with(&group_env, &keys, &convert, &open, sink) {
-                Ok(run) => {
+            // `N42_BUILD_COLLECT_IN_PLACE=1`: the transfers stay in the slots the
+            // batches wrote them to; the body and the receipts below are made from
+            // there on the worker pool rather than after a serial move of all of
+            // them (`par_collect_ms` 18 on the four-node fleet, loop214-218).
+            let in_place = crate::parallel_transfer::build_collect_in_place();
+            // `N42_GRAFT_PREFAULT=1`: the graft's memory -- the block's bundle
+            // map and its revert list -- mapped on a thread of its own while
+            // the batches execute, so the graft below writes into resident
+            // pages rather than faulting one in for every fifteen accounts
+            // (`GraftTarget`). Room for a quarter more accounts than
+            // transfers: a block of distinct senders and recipients touches
+            // at most twice as many, the bench's shape 1.04x, and a map that
+            // turns out short grows in the graft as it does today.
+            let prefault = crate::parallel_transfer::graft_prefault() && staged.is_none();
+            let (executed, mut graft_target) = std::thread::scope(|scope| {
+                let target = prefault.then(|| {
+                    let accounts = keys.len() + keys.len() / 4;
+                    scope.spawn(move || crate::parallel_transfer::GraftTarget::prefaulted(accounts))
+                });
+                let executed =
+                    crate::parallel_transfer::execute_for_build_in_place(&group_env, &keys, &convert, &open, sink, in_place);
+                (executed, target.and_then(|job| job.join().ok()))
+            });
+            par_prefault_ms = graft_target.as_ref().map_or(0, |target| target.prefault_us / 1000);
+            match executed {
+                Ok(mut run) => {
                     use reth_evm::execute::BlockExecutor as _;
                     let beneficiary = group_env.block_env.beneficiary;
                     par_collect_ms = run.phases.collect_ms;
                     let fold_at = std::time::Instant::now();
-                    let executed_count = run.executed.len();
-                    let executed_gas: u64 = run.executed.iter().map(|built| built.gas_used).sum();
+                    // Block order, by reference: a pointer a transfer, where the
+                    // collect moved ~470 bytes of each.
+                    let refs = (!run.slots.is_empty())
+                        .then(|| run.slots.iter().filter_map(std::sync::OnceLock::get).collect::<Vec<_>>());
+                    let (executed_count, executed_gas) = match refs.as_ref() {
+                        Some(refs) => (refs.len(), refs.iter().map(|built| built.gas_used).sum::<u64>()),
+                        None => (run.executed.len(), run.executed.iter().map(|built| built.gas_used).sum::<u64>()),
+                    };
                     // This block seals early -- full or drained after this step,
                     // with nothing committed before it -- so nothing executes on
                     // this builder again: the executor's commit per transfer
@@ -1049,24 +1085,61 @@ where
                         && cumulative_gas_used == 0
                         && builder.transactions.is_empty()
                         && (block_gas_limit.saturating_sub(executed_gas) < MIN_TRANSACTION_GAS || par_drained);
-                    if seals_early_here && direct_receipts_enabled() {
+                    if let (true, true, Some(refs)) = (seals_early_here, direct_receipts_enabled(), refs.as_ref()) {
+                        // The same body and receipts as the branch below, made
+                        // from the slots: the transaction is copied out of its
+                        // slot once, on the pool, straight into the body.
                         use rayon::prelude::*;
                         let mut cumulative = Vec::with_capacity(executed_count);
                         let mut tx_gas = 0u64;
-                        for built in &run.executed {
+                        for built in refs {
                             tx_gas += built.result.gas().tx_gas_used();
                             cumulative.push(tx_gas);
                         }
-                        total_fees += run
-                            .executed
+                        total_fees += refs
                             .par_iter()
                             .map(|built| {
                                 let tip = built.tx.effective_tip_per_gas(base_fee).unwrap_or_default();
                                 U256::from(tip) * U256::from(built.gas_used)
                             })
                             .reduce(|| U256::ZERO, |a, b| a + b);
-                        let (transactions, rest): (Vec<TransactionSigned>, Vec<(alloy_primitives::Address, n42_tx_types::Receipt)>) = run
-                            .executed
+                        let transactions: Vec<TransactionSigned> =
+                            refs.par_iter().map(|built| built.tx.inner().clone()).collect();
+                        let senders: Vec<alloy_primitives::Address> = refs.par_iter().map(|built| built.tx.signer()).collect();
+                        let receipts: Vec<n42_tx_types::Receipt> = refs
+                            .par_iter()
+                            .zip(cumulative.par_iter())
+                            .map(|(built, cumulative_gas_used)| n42_tx_types::Receipt {
+                                tx_type: <TransactionSigned as alloy_consensus::TransactionEnvelope>::tx_type(built.tx.inner()),
+                                success: built.result.is_success(),
+                                cumulative_gas_used: *cumulative_gas_used,
+                                logs: built.result.logs().to_vec(),
+                            })
+                            .collect();
+                        cumulative_gas_used += executed_gas;
+                        tx_count += executed_count as u64;
+                        direct_body = Some((transactions, senders));
+                        direct_receipts = Some((receipts, tx_gas));
+                        // The slots' 77 MB are freed on the pool, off this thread.
+                        let slots = std::mem::take(&mut run.slots);
+                        crate::parallel_transfer::build_pool().spawn(move || drop(slots));
+                    } else if seals_early_here && direct_receipts_enabled() {
+                        use rayon::prelude::*;
+                        let executed = run.take_executed();
+                        let mut cumulative = Vec::with_capacity(executed_count);
+                        let mut tx_gas = 0u64;
+                        for built in &executed {
+                            tx_gas += built.result.gas().tx_gas_used();
+                            cumulative.push(tx_gas);
+                        }
+                        total_fees += executed
+                            .par_iter()
+                            .map(|built| {
+                                let tip = built.tx.effective_tip_per_gas(base_fee).unwrap_or_default();
+                                U256::from(tip) * U256::from(built.gas_used)
+                            })
+                            .reduce(|| U256::ZERO, |a, b| a + b);
+                        let (transactions, rest): (Vec<TransactionSigned>, Vec<(alloy_primitives::Address, n42_tx_types::Receipt)>) = executed
                             .into_par_iter()
                             .zip(cumulative.into_par_iter())
                             .map(|(built, cumulative_gas_used)| {
@@ -1093,7 +1166,7 @@ where
                     } else {
                         // The receipts and the gas, one transfer at a time, with
                         // no state to commit: the state comes in one piece below.
-                        for built in run.executed {
+                        for built in run.take_executed() {
                             let recovered = built.tx;
                             let tip = recovered.effective_tip_per_gas(base_fee).unwrap_or_default();
                             total_fees += U256::from(tip) * U256::from(built.gas_used);
@@ -1145,6 +1218,11 @@ where
                     // 60-100 ms hide it (loop139: 42 ms on the seal path).
                     let bundles = run.bundles;
                     let staged = staged.map(|staged| staged.into_inner().expect("the staged graft's lock"));
+                    // Of the fold: the graft alone, without the transactions
+                    // root that runs beside it -- `par_fold_ms` is the longer
+                    // of the two, so a graft that falls under the root would
+                    // not show in it (plan v5 attempt D).
+                    let mut graft_ms = 0u64;
                     let (graft, early_root) = std::thread::scope(|scope| {
                         let root = sealing_early.then(|| match direct_body.as_ref() {
                             Some((transactions, _)) => {
@@ -1157,12 +1235,22 @@ where
                             }
                         });
                         let db = builder.executor.evm_mut().db_mut();
+                        let at = std::time::Instant::now();
                         let graft = match staged {
                             Some(staged) => crate::parallel_transfer::install_staged(db, staged, keep_cache),
-                            None => crate::parallel_transfer::graft_bundles_with(db, bundles, beneficiary, keep_cache),
+                            None => crate::parallel_transfer::graft_bundles_folded(
+                                db,
+                                bundles,
+                                beneficiary,
+                                keep_cache,
+                                crate::parallel_transfer::build_graft_fold(),
+                                graft_target.take(),
+                            ),
                         };
+                        graft_ms = at.elapsed().as_millis() as u64;
                         (graft, root.map(|job| job.join().expect("the transactions root job does not panic")))
                     });
+                    par_graft_ms = graft_ms;
                     early_transactions_root = early_root;
                     let graft = graft.map_err(PayloadBuilderError::other)?;
                     let db = builder.executor.evm_mut().db_mut();
@@ -1655,6 +1743,8 @@ where
                     par_collect_ms,
                     par_commit_ms,
                     direct_receipts = direct_receipts_used,
+                    par_graft_ms,
+                    par_prefault_ms,
                     par_fold_ms,
                     tx_root_ms = root_ms,
                     parent_fields_ms = fields_ms,
@@ -2242,6 +2332,7 @@ where
             par_pull_ms,
             par_part_ms,
             par_exec_ms,
+            par_graft_ms,
             par_fold_ms,
             par_committed,
             par_ms,

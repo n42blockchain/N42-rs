@@ -1276,5 +1276,9 @@ the crash. Fixed (a41862b95): both early returns answer `Aborted` (a build that 
 logs at debug and retries; the rate limiter's first call prints now. A liveness backstop (skip a leader after a TC)
 would change `verify_leader`, a rule shared with gov5 -- not taken. loop219 confirms.
 
+Confirmed (loop219, four P legs): 0 panics, tc = 1 in every leg, every window over 90 blocks (min 92-114); the decided-
+height line now prints (1); window 1 646-668k, window 2 522-646k. The leg-to-leg spread of window 2 (2 of 4 under
+600k, the import and R1 unchanged) is the residue plan v5's C/D/E address, not a stall.
+
 Each attempt is one agent brief and one runner; the bar for adopting any is the same as plan v4's: window 2 in every leg,
 verify 4/4, and the number it targets moving on the fleet, not on a bench.

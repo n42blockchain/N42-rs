@@ -1304,5 +1304,27 @@ force is ~3 ms.
   build the chain can hide and where E reappears.
 - Window 3 is lower with C (483-565k against 603-613k): to read when the pacing legs are in.
 
+### 5.8 Below the pacing, the build period is the wall at ~232 ms (loop221)
+
+C on (B 71-96), the pacing swept:
+
+| pacing | 225 | 175 a / b | 150 | 125 |
+| --- | --- | --- | --- | --- |
+| cycle | 241.6 | 229.8 / 233.6 | 235.0 | 232.6 |
+| D (pacing wait) / E (waiting for the build) | 146 / 9 | 92 / 46, 90 / 50 | 44 / 74 | 45 / 81 |
+| window 1 / 2 | 668k / 641k | 679k / 630k, 679k / 636k | 674k / 641k | **685k / 652k** |
+| build total / the chain's lead / wait | 270 / 109 / 190 | 269-277 / 80 / 212-217 | 275 / 82 / 216 | 271 / 86 / 208 |
+
+- **The cycle stops at 230-235 ms whatever the pacing below 225**: the pacing wait (D) turns into the wait for the
+  leader's own build (E, 9 -> 80). The build period the chain hides is ~232 ms -- the wall. B (72), the import
+  (160-186) and everything else are under it now. Window 1 679-685k, window 2 630-652k, no window lost in five legs.
+- **Pacing 175 and C join the configuration** (125 read the best leg but one; it is tried again once the build moves).
+- **Attempt D is the whole plan from here**: the build period 232 -> 160 is 1M at this block (163k / 0.16 = 1.02M),
+  with B and the import already under 160. Its parts on the leader's line: par 213-241 (pull 21, prep 11, exec 72-81,
+  collect 18, commit 18-22, fold 76-86), seal, state_ready 18-20, roots 44-48, finish 65-73. The chain starts the
+  next build at the seal (lead ~85 ms), so the period is `sealed_at` + (the next build's wait for the state) -- the
+  fold, collect and commit are on it; the roots and finish are hidden if the next build's state read waits for them
+  (`find_ms` on the chained request says). E (the import's prefetch) is not on the path any more.
+
 Each attempt is one agent brief and one runner; the bar for adopting any is the same as plan v4's: window 2 in every leg,
 verify 4/4, and the number it targets moving on the fleet, not on a bench.

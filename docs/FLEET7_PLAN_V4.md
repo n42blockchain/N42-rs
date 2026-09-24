@@ -1458,3 +1458,18 @@ threads gave 2.4x, 2t) are concurrent reads of the view contending -- the suspec
 RwLock, taken and held for every read (read_view.rs:218). `plan-v6/read-view-concurrency` (K): a snapshot per batch of
 reads, the record read outside any lock, truncation kept safe; the bar is 16 threads at ~1 us a read, then exec and
 groups on the fleet.
+
+### 6.2 Attempt J on the fleet (loop225): the restart at the seal, 723k
+
+| | R a / b | J (`N42_BUILD_ON_OUTPUT=1`) a / b |
+| --- | --- | --- |
+| window 1 / 2 | 690k / 636k, 685k / 636k | **723k / 650k, 678k / 665k** |
+| cycle (dissected) / E | 230 / 44, 229 / 45 | **220 / 36, 219 / 33** |
+| chained `find_ms` / `queue_ms` / total | 15 / 16 / 272, 15 / 17 / 270 | **0** / 18 / 258, 0 / 18 / 256 |
+| `sealed_at` / total | 190 / 247, 186 / 243 | 223 / 288, 223 / 285 |
+
+- The chained build starts at the parent's seal (`find_ms` 0), the build period 230 -> 220, window 1 723k -- the
+  best leg of the campaign -- and window 2 650-665k. `sealed_at` reads 33 ms later because the build now begins
+  earlier and its `setup` includes the wait for the parent's bundle; the period is what counts. Adopted.
+- `queue_ms` 18 is the fold of 163k nonces (`queue_fold_us` 6-7 ms) plus the walk, lock 0: now beside the build.
+- With the period at 220 the pacing (175) is binding again: D 92-95. loop226 lowers it with J on.

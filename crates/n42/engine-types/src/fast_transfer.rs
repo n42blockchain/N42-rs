@@ -77,6 +77,277 @@ pub fn enabled() -> bool {
     *ON.get_or_init(|| std::env::var("N42_FAST_TRANSFER").map(|v| v == "1").unwrap_or(false))
 }
 
+/// Whether `N42_PHASE_TIMERS=1` is set (plan v6 6.5/6.6): per-batch phase
+/// timers for the fast-transfer path -- where a transfer's time goes between
+/// its account reads, its arithmetic and the state it writes back, and which
+/// door each read took (the batch's own `State` cache, the state provider, or
+/// the QMDB view through [`reth_storage_api::n42_state`]).
+///
+/// Off by default, and off leaves the per-transaction path exactly as it was:
+/// every check below is `if timers`, so with the flag unset [`transfer`]
+/// makes no [`std::time::Instant`] call and touches no thread-local, and
+/// [`self::doors::CountedDb`] in `parallel_transfer` skips straight to its
+/// inner database.
+pub fn phase_timers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_PHASE_TIMERS").is_ok_and(|v| v == "1"))
+}
+
+/// Per-batch phase timers for [`N42Evm::transfer`] (`N42_PHASE_TIMERS=1`).
+///
+/// The nanosecond fields are sampled, not measured on every call: reading
+/// [`std::time::Instant::now`] on every one of a batch's transfers was itself
+/// a meaningful fraction of a transfer's ~400 ns (loop228's question was
+/// exactly how little there is to measure), so only every
+/// [`SAMPLE_STRIDE`]-th transfer is timed in full and the sum is scaled by
+/// `calls / samples` when drained -- the plan's own allowance ("per-batch
+/// sampling... is acceptable"). The read-door counts are exact: they cost one
+/// thread-local increment per `db.basic` call, no clock read, so every
+/// transfer's reads are counted whether or not that transfer was sampled.
+///
+/// Error this introduces: the scaled nanosecond totals are a batch-level
+/// estimate (coefficient of variation on the order of `1/sqrt(samples)`,
+/// a few percent at a batch's few thousand transfers) and assume the sampled
+/// transfers are representative of the batch's un-sampled ones, which holds
+/// for a block of plain transfers between similar accounts but would not for
+/// one where the fast path's cost varied a lot by address. The read-door
+/// split (cache / provider / view) is exact for reads that reach
+/// [`self::doors`] on this thread, but the view-vs-provider call there reads
+/// a process-wide counter ([`reth_storage_api::n42_state::stats`]) before and
+/// after its own call: on a fleet with several batches reading concurrently,
+/// another thread's read landing in that same narrow window can misattribute
+/// one read in either direction. Neither error affects the block's actual
+/// execution or its root; both are diagnostic only.
+mod timers {
+    use std::cell::Cell;
+
+    /// One fine timing in `SAMPLE_STRIDE`.
+    pub(super) const SAMPLE_STRIDE: u64 = 64;
+
+    thread_local! {
+        /// `transfer` calls on this thread since the last drain.
+        static CALLS: Cell<u64> = const { Cell::new(0) };
+        /// Of those, how many were sampled in full.
+        static SAMPLES: Cell<u64> = const { Cell::new(0) };
+        /// Sampled nanoseconds in the accounts' reads.
+        static READ_NS: Cell<u64> = const { Cell::new(0) };
+        /// Sampled nanoseconds in the qualification checks and the arithmetic.
+        static EVM_NS: Cell<u64> = const { Cell::new(0) };
+        /// Sampled nanoseconds building the touched accounts.
+        static WRITE_NS: Cell<u64> = const { Cell::new(0) };
+        /// Sampled nanoseconds after the write, before the call returns.
+        static OTHER_NS: Cell<u64> = const { Cell::new(0) };
+        /// `db.basic` calls `transfer` made on this thread, exact (every call,
+        /// not only sampled ones).
+        static READS_ATTEMPTED: Cell<u64> = const { Cell::new(0) };
+        /// Of those, how many reached [`super::doors`] and were answered by
+        /// the state provider (not the QMDB view).
+        static READS_PROVIDER: Cell<u64> = const { Cell::new(0) };
+        /// Of those, how many reached [`super::doors`] and were answered by
+        /// the QMDB view (`N42StateReader`).
+        static READS_VIEW: Cell<u64> = const { Cell::new(0) };
+    }
+
+    #[inline]
+    fn add(cell: &'static std::thread::LocalKey<Cell<u64>>, ns: u64) {
+        cell.with(|c| c.set(c.get() + ns));
+    }
+
+    /// Whether the call about to start should be timed in full: every
+    /// `SAMPLE_STRIDE`-th call on this thread.
+    #[inline]
+    pub(super) fn begin_call() -> bool {
+        let n = CALLS.with(|c| {
+            let n = c.get() + 1;
+            c.set(n);
+            n
+        });
+        n % SAMPLE_STRIDE == 1
+    }
+
+    #[inline]
+    pub(super) fn sample_done() {
+        SAMPLES.with(|c| c.set(c.get() + 1));
+    }
+
+    #[inline]
+    pub(super) fn add_read_ns(ns: u64) {
+        add(&READ_NS, ns);
+    }
+    #[inline]
+    pub(super) fn add_evm_ns(ns: u64) {
+        add(&EVM_NS, ns);
+    }
+    #[inline]
+    pub(super) fn add_write_ns(ns: u64) {
+        add(&WRITE_NS, ns);
+    }
+    #[inline]
+    pub(super) fn add_other_ns(ns: u64) {
+        add(&OTHER_NS, ns);
+    }
+
+    #[inline]
+    pub(super) fn note_read_attempted() {
+        READS_ATTEMPTED.with(|c| c.set(c.get() + 1));
+    }
+    #[inline]
+    pub(super) fn note_read_provider() {
+        READS_PROVIDER.with(|c| c.set(c.get() + 1));
+    }
+    #[inline]
+    pub(super) fn note_read_view() {
+        READS_VIEW.with(|c| c.set(c.get() + 1));
+    }
+
+    /// This thread's timers since the last drain, zeroing them.
+    pub(super) fn drain() -> super::TransferTimers {
+        let calls = CALLS.with(|c| c.replace(0));
+        let samples = SAMPLES.with(|c| c.replace(0));
+        let read = READ_NS.with(|c| c.replace(0));
+        let evm = EVM_NS.with(|c| c.replace(0));
+        let write = WRITE_NS.with(|c| c.replace(0));
+        let other = OTHER_NS.with(|c| c.replace(0));
+        let attempted = READS_ATTEMPTED.with(|c| c.replace(0));
+        let provider = READS_PROVIDER.with(|c| c.replace(0));
+        let view = READS_VIEW.with(|c| c.replace(0));
+        // Scaled from the sample to the thread's whole call count; 0 samples
+        // (a batch smaller than the stride, or the flag toggled mid-batch)
+        // leaves the nanosecond fields at 0 rather than dividing by it.
+        let scale = if samples == 0 { 0.0 } else { calls as f64 / samples as f64 };
+        super::TransferTimers {
+            read_ns: (read as f64 * scale) as u64,
+            evm_ns: (evm as f64 * scale) as u64,
+            write_ns: (write as f64 * scale) as u64,
+            other_ns: (other as f64 * scale) as u64,
+            reads_attempted: attempted,
+            reads_provider: provider,
+            reads_view: view,
+        }
+    }
+}
+
+/// A door a `db.basic` call inside [`N42Evm::transfer`] can take, counted by
+/// [`doors::CountedDb`] when [`phase_timers`] is on: the batch's own `State`
+/// cache (never reaches here), the state provider (the hashed tables, or the
+/// QMDB view declining), or the QMDB view itself
+/// (`reth_storage_api::n42_state`, `N42StateReader`).
+pub mod doors {
+    use alloy_primitives::Address;
+    use revm::{state::AccountInfo, Database};
+
+    /// Wraps a batch's database and counts, per [`super::timers`], whether
+    /// each `basic` call it answers was the QMDB view or the state provider
+    /// otherwise. A call this wrapper never sees (answered by the batch's own
+    /// `State` cache, or by a warmed layer in front of it such as
+    /// `parallel_transfer::WarmDb`) is what [`super::TransferTimers`]
+    /// attributes to the cache: `reads_attempted` less `reads_provider` and
+    /// `reads_view`.
+    #[derive(Debug)]
+    pub struct CountedDb<G> {
+        inner: G,
+    }
+
+    impl<G> CountedDb<G> {
+        /// `inner`, with its `basic` calls counted by door when
+        /// [`super::phase_timers`] is on.
+        pub const fn new(inner: G) -> Self {
+            Self { inner }
+        }
+    }
+
+    impl<G: Database> Database for CountedDb<G> {
+        type Error = G::Error;
+
+        #[inline]
+        fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+            if !super::phase_timers() {
+                return self.inner.basic(address);
+            }
+            // The QMDB view's own answered-reads counter, read before and
+            // after this call: if it moved, this call is what moved it. A
+            // concurrent batch's read landing in the same window can
+            // misattribute one read either way -- see [`super::phase_timers`].
+            let before = reth_storage_api::n42_state::stats().3;
+            let out = self.inner.basic(address);
+            let after = reth_storage_api::n42_state::stats().3;
+            if after != before {
+                super::timers::note_read_view();
+            } else {
+                super::timers::note_read_provider();
+            }
+            out
+        }
+
+        #[inline]
+        fn code_by_hash(&mut self, code_hash: alloy_primitives::B256) -> Result<revm::state::Bytecode, Self::Error> {
+            self.inner.code_by_hash(code_hash)
+        }
+
+        #[inline]
+        fn storage(&mut self, address: Address, index: revm::primitives::StorageKey) -> Result<revm::primitives::StorageValue, Self::Error> {
+            self.inner.storage(address, index)
+        }
+
+        #[inline]
+        fn block_hash(&mut self, number: u64) -> Result<alloy_primitives::B256, Self::Error> {
+            self.inner.block_hash(number)
+        }
+    }
+}
+
+/// [`timers`]'s totals for one thread since the last drain
+/// ([`drain_timers`]): nanoseconds are sampled and scaled, read-door counts
+/// are exact. Zero in every field when [`phase_timers`] is off.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TransferTimers {
+    /// Nanoseconds in the accounts' reads (all doors), sampled.
+    pub read_ns: u64,
+    /// Nanoseconds in the qualification checks and the arithmetic, sampled.
+    pub evm_ns: u64,
+    /// Nanoseconds building the touched accounts, sampled.
+    pub write_ns: u64,
+    /// Nanoseconds this sampling method cannot place in the three above,
+    /// sampled.
+    pub other_ns: u64,
+    /// `db.basic` calls made, exact.
+    pub reads_attempted: u64,
+    /// Of those, answered by the state provider (not the QMDB view), exact.
+    pub reads_provider: u64,
+    /// Of those, answered by the QMDB view, exact.
+    pub reads_view: u64,
+}
+
+impl TransferTimers {
+    /// Adds `other`'s counts into `self`: a batch's whole [`TransferTimers`]
+    /// is the sum of what every thread that ran part of it drained.
+    pub fn add(&mut self, other: Self) {
+        self.read_ns += other.read_ns;
+        self.evm_ns += other.evm_ns;
+        self.write_ns += other.write_ns;
+        self.other_ns += other.other_ns;
+        self.reads_attempted += other.reads_attempted;
+        self.reads_provider += other.reads_provider;
+        self.reads_view += other.reads_view;
+    }
+
+    /// `reads_attempted` less `reads_provider` and `reads_view`: calls a
+    /// `db.basic` in [`N42Evm::transfer`] made that never reached
+    /// [`doors::CountedDb`], answered by the batch's own `State` cache (or a
+    /// warm layer in front of it).
+    pub fn reads_cache(&self) -> u64 {
+        self.reads_attempted.saturating_sub(self.reads_provider).saturating_sub(self.reads_view)
+    }
+}
+
+/// Drains this thread's [`TransferTimers`] since the last call, zeroing them.
+/// Call once per batch, on the batch's own thread, right after its transfers
+/// are done -- the caller sums what every batch's thread drained into the
+/// block's phases.
+pub fn drain_timers() -> TransferTimers {
+    timers::drain()
+}
+
 /// [`EthEvmFactory`](reth_evm::EthEvmFactory) with the transfer path in front
 /// of the interpreter.
 #[derive(Debug, Clone, Copy, Default)]
@@ -205,9 +476,26 @@ impl<DB: Database, I: Inspector<EthEvmContext<DB>>> N42Evm<DB, I> {
 
         // The accounts, loaded the way the journal would load them: through
         // the same database, so its cache holds them as the pre-state.
+        //
+        // `N42_PHASE_TIMERS=1` (plan v6 6.5/6.6): checkpoints around each
+        // read and around the arithmetic and the write that follow it, kept
+        // only on a sampled call (see `timers`) so the clock is read at most
+        // once in `SAMPLE_STRIDE` transfers; a refusal anywhere below simply
+        // returns before its later checkpoints run, and that call's sample
+        // (if it was one) contributes nothing to `read_ns`/`evm_ns`/etc,
+        // which is the intended target for these timers: the qualifying,
+        // fully-executed transfer this path exists for.
         let value = tx.value;
         let db = self.inner.db_mut();
+        let timers = phase_timers();
+        let sample = timers && timers::begin_call();
+        let now = || sample.then(std::time::Instant::now);
+        let t0 = now();
+        if timers {
+            timers::note_read_attempted();
+        }
         let Some(sender) = db.basic(caller)? else { return refused(6) };
+        let t1 = now();
         if !sender.is_code_hash_empty_or_zero() || sender.nonce != tx.nonce || sender.nonce == u64::MAX {
             return refused(6);
         }
@@ -215,7 +503,12 @@ impl<DB: Database, I: Inspector<EthEvmContext<DB>>> N42Evm<DB, I> {
         if max_spending > sender.balance {
             return refused(7);
         }
+        let t2 = now();
+        if timers {
+            timers::note_read_attempted();
+        }
         let recipient = db.basic(to)?;
+        let t3 = now();
         match &recipient {
             Some(info) if !info.is_code_hash_empty_or_zero() => return refused(8),
             // An account that stays empty after being touched is deleted
@@ -224,7 +517,12 @@ impl<DB: Database, I: Inspector<EthEvmContext<DB>>> N42Evm<DB, I> {
             None if value.is_zero() => return refused(8),
             _ => {}
         }
+        let t4 = now();
+        if timers {
+            timers::note_read_attempted();
+        }
         let Some(coinbase) = db.basic(beneficiary)? else { return refused(9) };
+        let t5 = now();
         if coinbase.is_empty() {
             return refused(9);
         }
@@ -245,6 +543,7 @@ impl<DB: Database, I: Inspector<EthEvmContext<DB>>> N42Evm<DB, I> {
         let tip = effective_price.saturating_sub(basefee);
         let Some(reward) = tip.checked_mul(TRANSFER_GAS as u128) else { return refused(10) };
         let Some(coinbase_balance) = coinbase.balance.checked_add(U256::from(reward)) else { return refused(10) };
+        let t6 = now();
 
         // The accounts as the journal would return them: touched, with the
         // pre-state kept as the original, and a recipient that did not exist
@@ -269,6 +568,7 @@ impl<DB: Database, I: Inspector<EthEvmContext<DB>>> N42Evm<DB, I> {
         coinbase_account.info.balance = coinbase_balance;
         coinbase_account.mark_touch();
         state.insert(beneficiary, coinbase_account);
+        let t7 = now();
 
         // The result revm's handler builds for a call into an account without
         // code: it stops, spends the base cost, refunds nothing, and the
@@ -279,7 +579,18 @@ impl<DB: Database, I: Inspector<EthEvmContext<DB>>> N42Evm<DB, I> {
             logs: Vec::new(),
             output: Output::Call(Bytes::new()),
         };
-        Ok(Some(ResultAndState::new(result, state)))
+        let out = Ok(Some(ResultAndState::new(result, state)));
+        if let (Some(t0), Some(t1), Some(t2), Some(t3), Some(t4), Some(t5), Some(t6), Some(t7)) =
+            (t0, t1, t2, t3, t4, t5, t6, t7)
+        {
+            let ns = |a: std::time::Instant, b: std::time::Instant| b.saturating_duration_since(a).as_nanos() as u64;
+            timers::add_read_ns(ns(t0, t1) + ns(t2, t3) + ns(t4, t5));
+            timers::add_evm_ns(ns(t1, t2) + ns(t3, t4) + ns(t5, t6));
+            timers::add_write_ns(ns(t6, t7));
+            timers::add_other_ns(ns(t7, std::time::Instant::now()));
+            timers::sample_done();
+        }
+        out
     }
 }
 

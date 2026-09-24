@@ -973,6 +973,15 @@ where
     // Of the fold: the graft alone. `par_fold_ms` covers the receipts loop
     // and then the longer of the graft and the transactions root beside it.
     let mut par_graft_ms = 0u64;
+    // `N42_PHASE_TIMERS=1` (plan v6 6.5): the graft's own sub-phases, the
+    // default in-place fold only (`graft_bundles_direct`), and the parallel
+    // step's transfers by phase and read door -- see `Phases::transfer_timers`.
+    let mut par_graft_base_ms = 0u64;
+    let mut par_graft_reserve_ms = 0u64;
+    let mut par_graft_insert_ms = 0u64;
+    let mut par_graft_reverts_ms = 0u64;
+    let mut par_graft_other_ms = 0u64;
+    let mut par_transfer_timers = crate::fast_transfer::TransferTimers::default();
     // `N42_GRAFT_PREFAULT=1`: how long the graft's memory took to map, on its
     // own thread beside the parallel step (not on the chain).
     let mut par_prefault_ms = 0u64;
@@ -1009,7 +1018,13 @@ where
         // (`WarmAccounts`). The addresses are copied out here, on this
         // thread, from transactions the build already holds: the jobs touch
         // neither the queue nor its locks.
-        let open_db = || open_parent_state().ok().map(StateProviderDatabase::new);
+        // `N42_PHASE_TIMERS=1`: counts each batch's reads by door (plan v6
+        // 6.5/6.6). `CountedDb` is a passthrough when the flag is off.
+        let open_db = || {
+            open_parent_state()
+                .ok()
+                .map(|s| crate::fast_transfer::doors::CountedDb::new(StateProviderDatabase::new(s)))
+        };
         let warm_fill = crate::parallel_transfer::build_prefetch().then(crate::parallel_transfer::WarmAccounts::new);
         let (warm_ref, open_ref) = (warm_fill.as_ref(), &open_db);
         let (all_transfers, keys, prep_done) = crate::parallel_transfer::build_pool().in_place_scope(|scope| {
@@ -1317,6 +1332,15 @@ where
                     par_graft_ms = graft_ms;
                     early_transactions_root = early_root;
                     let graft = graft.map_err(PayloadBuilderError::other)?;
+                    // Zero on `install_staged`'s streamed graft
+                    // (`N42_GRAFT_STREAM=1`) and on `GraftFold::Indexed`/
+                    // `IndexedRanges`: only the default in-place fold
+                    // (`graft_bundles_direct`) fills these.
+                    par_graft_base_ms = graft.direct_base_ms;
+                    par_graft_reserve_ms = graft.direct_reserve_ms;
+                    par_graft_insert_ms = graft.direct_insert_ms;
+                    par_graft_reverts_ms = graft.direct_reverts_ms;
+                    par_graft_other_ms = graft.direct_other_ms;
                     let db = builder.executor.evm_mut().db_mut();
                     if !keep_cache {
                         if let Some(withdrawals) = attributes.withdrawals.as_ref() {
@@ -1355,6 +1379,7 @@ where
                     par_batches = run.phases.batches;
                     par_part_ms = run.phases.partition_ms;
                     par_exec_ms = run.phases.groups_ms;
+                    par_transfer_timers = run.phases.transfer_timers;
                     par_skipped = run.skipped.len();
                     // Read by the diagnosis below, which must see what this
                     // step actually built.
@@ -1836,6 +1861,23 @@ where
                     reads_d16p = read_depth[6],
                     reads_hist = read_depth[7],
                     overlay_depth,
+                    // `N42_PHASE_TIMERS=1` (plan v6 6.5/6.6): where the
+                    // parallel step's wall time (`par_exec_ms` above) goes
+                    // inside `N42Evm::transfer`, which door each account read
+                    // took, and the graft's own sub-phases (the default
+                    // in-place fold only). Zero when the flag is off.
+                    exec_read_ms = par_transfer_timers.read_ns / 1_000_000,
+                    exec_evm_ms = par_transfer_timers.evm_ns / 1_000_000,
+                    exec_write_ms = par_transfer_timers.write_ns / 1_000_000,
+                    exec_other_ms = par_transfer_timers.other_ns / 1_000_000,
+                    reads_cache = par_transfer_timers.reads_cache(),
+                    reads_provider = par_transfer_timers.reads_provider,
+                    reads_view = par_transfer_timers.reads_view,
+                    graft_base_ms = par_graft_base_ms,
+                    graft_reserve_ms = par_graft_reserve_ms,
+                    graft_insert_ms = par_graft_insert_ms,
+                    graft_reverts_ms = par_graft_reverts_ms,
+                    graft_other_ms = par_graft_other_ms,
                     "seal-first build phases"
                 );
             }

@@ -1572,7 +1572,14 @@ where
         // touches; anything it cannot take falls back to the serial executor.
         let mut output = None;
         if follower_parallel() {
-            let open = || open_parent_state().ok().map(StateProviderDatabase::new);
+            // `N42_PHASE_TIMERS=1`: counts each batch's reads by door (plan
+            // v6 6.5/6.6). `CountedDb` is a passthrough when the flag is
+            // off, so this costs nothing extra on that path.
+            let open = || {
+                open_parent_state()
+                    .ok()
+                    .map(|s| n42_engine_types::fast_transfer::doors::CountedDb::new(StateProviderDatabase::new(s)))
+            };
             match n42_engine_types::parallel_transfer::execute_transfers(
                 evm_config,
                 &recovered,
@@ -1623,6 +1630,17 @@ where
                         reads_d16p = read_depth[6],
                         reads_hist = read_depth[7],
                         overlay_depth,
+                        // `N42_PHASE_TIMERS=1` (plan v6 6.5/6.6): where the
+                        // groups' wall time (`groups_ms` above) goes inside
+                        // `N42Evm::transfer`, and which door each account
+                        // read took. Zero when the flag is off.
+                        exec_read_ms = phases.transfer_timers.read_ns / 1_000_000,
+                        exec_evm_ms = phases.transfer_timers.evm_ns / 1_000_000,
+                        exec_write_ms = phases.transfer_timers.write_ns / 1_000_000,
+                        exec_other_ms = phases.transfer_timers.other_ns / 1_000_000,
+                        reads_cache = phases.transfer_timers.reads_cache(),
+                        reads_provider = phases.transfer_timers.reads_provider,
+                        reads_view = phases.transfer_timers.reads_view,
                         "parallel import phases"
                     );
                     output = Some(out);

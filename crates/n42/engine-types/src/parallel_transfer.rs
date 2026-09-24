@@ -85,6 +85,10 @@ pub struct Phases {
     /// How many batches of groups ran (the build's [`execute_for_build`]
     /// runs a sender per group and several groups per batch).
     pub batches: usize,
+    /// `N42_PHASE_TIMERS=1` (plan v6 6.5/6.6): the block's transfers summed
+    /// over every batch that ran part of it -- see
+    /// [`crate::fast_transfer::TransferTimers`]. Zero when the flag is off.
+    pub transfer_timers: crate::fast_transfer::TransferTimers,
 }
 
 /// Why the parallel path did not run; the caller executes serially.
@@ -772,6 +776,24 @@ pub struct Graft {
     /// [`graft_bundles_indexed`] only: the batches' reverts filtered on the
     /// pool and appended in whole.
     pub reverts_us: u64,
+    /// `N42_PHASE_TIMERS=1` (plan v6 6.5): [`graft_bundles_direct`] only (the
+    /// default in-place fold) -- [`install_target`] and [`take_base_bundle`],
+    /// the base bundle's swap or move into the block's map. Zero otherwise
+    /// (including on [`GraftFold::Indexed`]/[`GraftFold::IndexedRanges`] and
+    /// [`install_staged`], which have their own phases above or none).
+    pub direct_base_ms: u64,
+    /// `N42_PHASE_TIMERS=1`, [`graft_bundles_direct`] only: the map and
+    /// revert-list `reserve` calls sized for what is left after the base.
+    pub direct_reserve_ms: u64,
+    /// `N42_PHASE_TIMERS=1`, [`graft_bundles_direct`] only: each bundle's
+    /// accounts probed into the block's map and inserted or added.
+    pub direct_insert_ms: u64,
+    /// `N42_PHASE_TIMERS=1`, [`graft_bundles_direct`] only: each bundle's
+    /// reverts, filtered against the accounts already grafted and appended.
+    pub direct_reverts_ms: u64,
+    /// `N42_PHASE_TIMERS=1`, [`graft_bundles_direct`] only: the accounts the
+    /// block's own cache already held, summed as deltas and committed once.
+    pub direct_other_ms: u64,
 }
 
 /// Grafts the batches' bundles onto the block's state directly: each account
@@ -893,16 +915,35 @@ fn graft_bundles_direct<DB: Database>(
     keep_cache: bool,
     target: Option<GraftTarget>,
 ) -> Result<Graft, <State<DB> as Database>::Error> {
+    // `N42_PHASE_TIMERS=1` (plan v6 6.5): checkpoints at the granularity this
+    // function already works at -- once around the base swap, once around
+    // the reserves, twice per bundle (insert, then reverts) -- so timing
+    // costs one `Instant::now` pair per phase per bundle (tens of them a
+    // block), not one per account or per transfer.
+    let timers = crate::fast_transfer::phase_timers();
+    let now = || timers.then(std::time::Instant::now);
+    let ns = |a: std::time::Instant, b: std::time::Instant| b.saturating_duration_since(a).as_nanos();
     let mut graft = Graft::default();
     let mut bundles = bundles;
+    let t0 = now();
     install_target(state, target, &mut graft);
     take_base_bundle(state, &mut bundles, beneficiary, keep_cache, &mut graft);
+    let t1 = now();
+    if let (Some(a), Some(b)) = (t0, t1) {
+        graft.direct_base_ms = (ns(a, b) / 1_000_000) as u64;
+    }
     let total: usize = bundles.iter().map(|b| b.state.len()).sum();
     if keep_cache {
         state.cache.accounts.reserve(total);
     }
     state.bundle_state.state.reserve(total);
     graft.reverts.reserve(total);
+    let t2 = now();
+    if let (Some(a), Some(b)) = (t1, t2) {
+        graft.direct_reserve_ms = (ns(a, b) / 1_000_000) as u64;
+    }
+    let mut insert_ns = 0u128;
+    let mut reverts_ns = 0u128;
     // Accounts the block's state already holds: their deltas are summed here
     // and applied in one commit at the end. Summed, because the block's cache
     // is what each delta is computed against and it does not change until that
@@ -916,6 +957,7 @@ fn graft_bundles_direct<DB: Database>(
         // Addresses this bundle changed that an earlier one had already put
         // in: their reverts are the earlier one's.
         let mut repeated: alloy_primitives::map::AddressHashSet = Default::default();
+        let t_insert_start = now();
         for (address, account) in accounts {
             let Some(info) = account.info.as_ref() else { continue };
             let (new_balance, new_nonce) = (info.balance, info.nonce);
@@ -984,13 +1026,24 @@ fn graft_bundles_direct<DB: Database>(
             vacant.insert(account);
             graft.accounts += 1;
         }
+        let t_insert_end = now();
+        if let (Some(a), Some(b)) = (t_insert_start, t_insert_end) {
+            insert_ns += ns(a, b);
+        }
         let mut reverts = reverts;
         for (address, revert) in std::mem::take(&mut *reverts).into_iter().flatten() {
             if !repeated.contains(&address) {
                 graft.reverts.push((address, revert));
             }
         }
+        let t_reverts_end = now();
+        if let (Some(a), Some(b)) = (t_insert_end, t_reverts_end) {
+            reverts_ns += ns(a, b);
+        }
     }
+    graft.direct_insert_ms = (insert_ns / 1_000_000) as u64;
+    graft.direct_reverts_ms = (reverts_ns / 1_000_000) as u64;
+    let t3 = now();
     if !slow.is_empty() {
         let mut changes: revm::state::EvmState = Default::default();
         for (address, (add, sub, nonce, original_absent)) in slow {
@@ -1008,6 +1061,10 @@ fn graft_bundles_direct<DB: Database>(
         }
         graft.committed = changes.len();
         state.commit(changes);
+    }
+    let t4 = now();
+    if let (Some(a), Some(b)) = (t3, t4) {
+        graft.direct_other_ms = (ns(a, b) / 1_000_000) as u64;
     }
     Ok(graft)
 }
@@ -2122,7 +2179,8 @@ where
     // 80-150 ms of a full block's build (loop138-139).
     let slots: Vec<std::sync::OnceLock<BuiltTransfer<T>>> = (0..keys.len()).map(|_| std::sync::OnceLock::new()).collect();
     let slots_ref = &slots;
-    let results: Vec<Result<(Vec<usize>, Option<BundleState>), NotParallel>> = pool.install(|| {
+    type BatchResult = (Vec<usize>, Option<BundleState>, crate::fast_transfer::TransferTimers);
+    let results: Vec<Result<BatchResult, NotParallel>> = pool.install(|| {
         use rayon::prelude::*;
         batches
             .par_iter()
@@ -2161,15 +2219,23 @@ where
                 }
                 state.merge_transitions(BundleRetention::Reverts);
                 let bundle = state.take_bundle();
+                // Drained here, on the batch's own thread, right after its
+                // transfers are done: `N42_PHASE_TIMERS=1` only (see
+                // `fast_transfer::drain_timers`; zero and free otherwise). An
+                // error path above returns before this and leaves whatever it
+                // accumulated for a later call on this thread to drain --
+                // rare (`NotParallel`, which sends the whole block to the
+                // serial executor) and diagnostic-only.
+                let timers = crate::fast_transfer::drain_timers();
                 match on_bundle {
                     // Folded into the staged graft here, on this batch's
                     // thread: the work is off the builder's chain, and the
                     // sink's lock only ever holds one batch at a time.
                     Some(sink) => {
                         sink(bundle);
-                        Ok((skipped, None))
+                        Ok((skipped, None, timers))
                     }
-                    None => Ok((skipped, Some(bundle))),
+                    None => Ok((skipped, Some(bundle), timers)),
                 }
             })
             .collect()
@@ -2179,11 +2245,12 @@ where
     let at = std::time::Instant::now();
     let mut run = BuildRun { phases, ..Default::default() };
     for r in results {
-        let (skipped, bundle) = r?;
+        let (skipped, bundle, timers) = r?;
         run.skipped.extend(skipped);
         if let Some(bundle) = bundle {
             run.bundles.push(bundle);
         }
+        run.phases.transfer_timers.add(timers);
     }
     // Candidate order, as the serial builder would have laid the block out
     // (each sender's transfers were run in that order, and the graft does
@@ -2370,7 +2437,9 @@ where
         .then(|| std::sync::Mutex::new(StagedGraft::new(beneficiary, txs.len())));
     phases.batch_us = at.elapsed().as_micros() as u64;
     let at = std::time::Instant::now();
-    let results: Vec<Result<(Option<revm::database::BundleState>, Vec<(usize, u64)>), NotParallel>> = {
+    type FollowerBatchResult =
+        (Option<revm::database::BundleState>, Vec<(usize, u64)>, crate::fast_transfer::TransferTimers);
+    let results: Vec<Result<FollowerBatchResult, NotParallel>> = {
         use rayon::prelude::*;
         batches
             .par_iter()
@@ -2394,12 +2463,15 @@ where
                 }
                 state.merge_transitions(BundleRetention::Reverts);
                 let bundle = state.take_bundle();
+                // See the leader's batch loop above: drained here, on the
+                // batch's own thread, `N42_PHASE_TIMERS=1` only.
+                let timers = crate::fast_transfer::drain_timers();
                 match staged.as_ref() {
                     Some(staged) => {
                         staged.lock().expect("the staged graft's lock").add(bundle);
-                        Ok((None, gas))
+                        Ok((None, gas, timers))
                     }
-                    None => Ok((Some(bundle), gas)),
+                    None => Ok((Some(bundle), gas, timers)),
                 }
             })
             .collect()
@@ -2410,13 +2482,14 @@ where
     let mut gas_of = vec![0u64; txs.len()];
     for r in results {
         match r {
-            Ok((bundle, gas)) => {
+            Ok((bundle, gas, timers)) => {
                 for (i, g) in gas {
                     gas_of[i] = g;
                 }
                 if let Some(bundle) = bundle {
                     bundles.push(bundle);
                 }
+                phases.transfer_timers.add(timers);
             }
             Err(why) => return Ok(Err(why)),
         }

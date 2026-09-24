@@ -1280,5 +1280,29 @@ Confirmed (loop219, four P legs): 0 panics, tc = 1 in every leg, every window ov
 height line now prints (1); window 1 646-668k, window 2 522-646k. The leg-to-leg spread of window 2 (2 of 4 under
 600k, the import and R1 unchanged) is the residue plan v5's C/D/E address, not a stall.
 
+### 5.7 Attempt C on the fleet (loop220): B halved, and the pacing is the cycle again
+
+`N42_BLOCK_BY_DESCRIPTION=1` (merged ce965a896): the follower's execution layer resolves the block's hashes to the
+queue's own `Arc`'d transactions, encodes them into chunk buffers and roots over those; the owned clone reth's types
+force is ~3 ms.
+
+| | P a / b | C a / b / c |
+| --- | --- | --- |
+| vote road total | 120 / 121 ms | **69 / 69 / 65** |
+| R1 | 148 / 148 | **77 / 76 / 73** |
+| B (dissected, window 1) | 139.5 | **71-73** |
+| D (view open -> preamble) | 81 | **147** |
+| cycle | 0.246-0.248 | 0.242-0.244 |
+| window 1 / 2 | 657k / 636k, 663k / 636k | 668k / 641k, 674k / 641k, 668k / 641k |
+| window 3 | 603k / 613k | 483k / 494k / 565k |
+
+- **The road is halved** (B 140 -> 72; the fill asks the proposer 370-390 times a leg, none fails, 2-3 whole-body
+  fallbacks) **and the cycle does not move**, because every millisecond B lost went to D: at pacing 225 the leader
+  waits at the preamble for the pacing, and the cycle is 225 + ~15. Window 1 +1.5%, window 2 +1%.
+- So the pacing binds again -- and below it the build period (250-300, hidden by the chain until now) is the next
+  wall, which is what attempt D is cutting. loop221 lowers the pacing with C on (175 / 150) to measure how much of the
+  build the chain can hide and where E reappears.
+- Window 3 is lower with C (483-565k against 603-613k): to read when the pacing legs are in.
+
 Each attempt is one agent brief and one runner; the bar for adopting any is the same as plan v4's: window 2 in every leg,
 verify 4/4, and the number it targets moving on the fleet, not on a bench.

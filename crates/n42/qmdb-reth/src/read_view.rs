@@ -24,13 +24,20 @@
 //! newest block whose records survive -- the index is rewritten while every record it compares
 //! is still in the file. It is invalidated for good only when the journals do not reach that
 //! far, or when a persisted block is not the one it holds.
+//!
+//! Readers do not share a lock word: each thread reads under one of [`STRIPES`] read locks, each
+//! on its own cache line and holding a snapshot of the versions, and a writer takes every stripe
+//! for writing whenever it changes the versions (plan v6, `bench_concurrent_reads`: sixteen threads
+//! reading under one `RwLock` paid 2.4 us of pool time a read against 0.4 us alone; on stripes 0.5).
+//! A read still holds its lock through the record read, so the ordering is the one lock's: a
+//! truncation waits for every read in flight.
 
 use std::{
     collections::VecDeque,
     path::Path,
     sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex, PoisonError, RwLock,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex, PoisonError, RwLock, RwLockWriteGuard,
     },
 };
 
@@ -84,6 +91,77 @@ struct Versions {
     pending: Option<Journal>,
 }
 
+/// What a reader needs of [`Versions`], published to every stripe whenever the
+/// versions change.
+#[derive(Debug)]
+struct Snapshot {
+    valid: bool,
+    head: u64,
+    /// The journals of blocks `head - len + 1 ..= head`, oldest first.
+    journals: Vec<Journal>,
+    pending: Option<Journal>,
+}
+
+impl Snapshot {
+    fn of(versions: &Versions) -> Arc<Self> {
+        Arc::new(Self {
+            valid: versions.valid,
+            head: versions.head.0,
+            journals: versions.journals.iter().map(|step| step.journal.clone()).collect(),
+            pending: versions.pending.clone(),
+        })
+    }
+}
+
+/// How many read locks the readers spread over. A reader takes only its
+/// thread's stripe, so readers on different threads write different cache
+/// lines; a writer takes them all.
+const STRIPES: usize = 64;
+
+/// One reader lock on a cache line of its own.
+#[derive(Debug)]
+#[repr(align(128))]
+struct Stripe(RwLock<Arc<Snapshot>>);
+
+/// The stripe this thread reads under: threads are dealt stripes in turn.
+fn my_stripe() -> usize {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    thread_local! {
+        static STRIPE: usize = NEXT.fetch_add(1, Ordering::Relaxed) % STRIPES;
+    }
+    STRIPE.with(|stripe| *stripe)
+}
+
+/// The versions held for writing, with every stripe: no reader is between
+/// its snapshot and its record read. Dropping it publishes the versions to
+/// the stripes.
+struct Exclusive<'a> {
+    versions: RwLockWriteGuard<'a, Versions>,
+    stripes: Vec<RwLockWriteGuard<'a, Arc<Snapshot>>>,
+}
+
+impl std::ops::Deref for Exclusive<'_> {
+    type Target = Versions;
+    fn deref(&self) -> &Versions {
+        &self.versions
+    }
+}
+
+impl std::ops::DerefMut for Exclusive<'_> {
+    fn deref_mut(&mut self) -> &mut Versions {
+        &mut self.versions
+    }
+}
+
+impl Drop for Exclusive<'_> {
+    fn drop(&mut self) {
+        let snapshot = Snapshot::of(&self.versions);
+        for stripe in &mut self.stripes {
+            **stripe = snapshot.clone();
+        }
+    }
+}
+
 /// Where a persisted block stands against the view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Position {
@@ -112,7 +190,12 @@ pub struct Raised {
 pub struct QmdbReadView {
     file: EntryFileView,
     index: SharedOffsetIndex,
+    /// The writers' versions. Readers do not take this lock: they read the
+    /// snapshot of it in their stripe, under the stripe's read lock, which a
+    /// writer holds for writing (with every other stripe) whenever it changes
+    /// the versions -- one lock word per thread instead of one for all.
     versions: RwLock<Versions>,
+    stripes: Box<[Stripe]>,
     /// Bytes of the entry file the view may read: past its newest block's last record,
     /// including a block whose floor was raised and that has not advanced yet.
     floor: AtomicU64,
@@ -177,16 +260,13 @@ impl QmdbReadView {
         let changes: Vec<(Hash, Option<u64>)> = live.into_iter().map(|(key, offset)| (key, Some(offset))).collect();
         let index = SharedOffsetIndex::default();
         index.apply_sorted(&changes, |offset| file.key(offset));
+        let versions = Versions { valid: true, head, head_floor: floor, journals: VecDeque::new(), pending: None };
+        let snapshot = Snapshot::of(&versions);
         Ok(Arc::new(Self {
             file,
             index,
-            versions: RwLock::new(Versions {
-                valid: true,
-                head,
-                head_floor: floor,
-                journals: VecDeque::new(),
-                pending: None,
-            }),
+            versions: RwLock::new(versions),
+            stripes: (0..STRIPES).map(|_| Stripe(RwLock::new(snapshot.clone()))).collect(),
             floor: AtomicU64::new(floor),
             cuts: AtomicU64::new(0),
             advancing: Mutex::new(()),
@@ -213,15 +293,27 @@ impl QmdbReadView {
         self.index.is_empty()
     }
 
+    /// The versions for writing, every reader excluded until the result drops
+    /// and publishes them. Lock order: the versions, then the stripes in turn;
+    /// a reader takes one stripe and nothing else.
+    fn exclusive(&self) -> Exclusive<'_> {
+        let versions = self.versions.write().unwrap_or_else(PoisonError::into_inner);
+        let stripes = self.stripes.iter().map(|stripe| stripe.0.write().unwrap_or_else(PoisonError::into_inner)).collect();
+        Exclusive { versions, stripes }
+    }
+
     /// Reads `key` as of block `at`: `None` when the view cannot answer
     /// exactly, `Some(None)` for an absent key, else the decoded value. The
-    /// versions lock is held through the record read, so a truncation waits.
+    /// thread's stripe is read-locked through the record read, and every
+    /// change of the versions write-locks every stripe, so a truncation waits
+    /// for the read, and the read sees versions no writer is between.
     fn read_at<T>(&self, key: &Hash, at: u64, decode: impl FnOnce(&[u8]) -> T) -> Option<Option<T>> {
-        let versions = self.versions.read().unwrap_or_else(PoisonError::into_inner);
-        if !versions.valid || at > versions.head.0 {
+        let stripe = self.stripes[my_stripe()].0.read().unwrap_or_else(PoisonError::into_inner);
+        let versions: &Snapshot = &stripe;
+        if !versions.valid || at > versions.head {
             return None;
         }
-        let behind = (versions.head.0 - at) as usize;
+        let behind = (versions.head - at) as usize;
         if behind > versions.journals.len() {
             return None;
         }
@@ -229,7 +321,6 @@ impl QmdbReadView {
             .journals
             .iter()
             .skip(versions.journals.len() - behind)
-            .map(|step| &step.journal)
             .chain(versions.pending.iter())
             .find_map(|journal| journal.binary_search_by(|(k, _)| k.cmp(key)).ok().map(|i| journal[i].1));
         let offset = match undone {
@@ -315,9 +406,9 @@ impl QmdbReadView {
         let journal: Vec<(Hash, Option<u64>)> =
             changes.par_iter().with_min_len(1024).map(|(key, _)| (*key, self.index.get(key, key_at))).collect();
         let journal = Arc::new(journal);
-        self.versions.write().unwrap_or_else(PoisonError::into_inner).pending = Some(journal.clone());
+        self.exclusive().pending = Some(journal.clone());
         self.index.apply_sorted(changes, key_at);
-        let mut versions = self.versions.write().unwrap_or_else(PoisonError::into_inner);
+        let mut versions = self.exclusive();
         versions.pending = None;
         let floor_before = versions.head_floor;
         versions.journals.push_back(Step { number, hash, journal, floor_before });
@@ -333,7 +424,7 @@ impl QmdbReadView {
     /// afterwards; a view whose journals do not reach that far is invalidated.
     pub fn revert_to(&self, number: u64) -> bool {
         let _one = self.advancing.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut versions = self.versions.write().unwrap_or_else(PoisonError::into_inner);
+        let mut versions = self.exclusive();
         if !versions.valid {
             return false;
         }
@@ -382,7 +473,7 @@ impl QmdbReadView {
 
     /// Stops the view answering, for good.
     pub fn invalidate(&self, why: &str) {
-        let mut versions = self.versions.write().unwrap_or_else(PoisonError::into_inner);
+        let mut versions = self.exclusive();
         Self::invalidate_locked(&mut versions, why);
     }
 
@@ -406,7 +497,7 @@ impl TruncationGuard for QmdbReadView {
         }
         let _one = self.advancing.lock().unwrap_or_else(PoisonError::into_inner);
         self.cuts.fetch_add(1, Ordering::SeqCst);
-        let mut versions = self.versions.write().unwrap_or_else(PoisonError::into_inner);
+        let mut versions = self.exclusive();
         if !versions.valid || versions.head_floor <= new_len {
             return;
         }

@@ -1526,3 +1526,61 @@ groups on the fleet.
   depth (L) is what 65 ms of execution and 60-70 of groups are made of, and the two benches that "reproduced" the
   numbers reproduced them by other causes. The instrument that says where those milliseconds go is a profile of the
   running leader; failing that, timers inside the fast path (reads / EVM / write-back) and inside the graft.
+
+### 6.6 Timers inside the fast path and the graft (loop229): the reads are the execution, the insert is the graft, and the seal waits for neither
+
+`plan-v6/fast-path-timers` (merged 81288dda4, `N42_PHASE_TIMERS=1` off): every 64th `transfer` call on a worker is
+timed in full (reads / qualification+arithmetic / touched-account build / rest) and the sum scaled by the call count;
+the read doors are counted exactly (cache, state provider, QMDB view). The graft's in-place fold is split into base
+swap / reserve / insert / reverts. loop229, four nodes at the CH configuration, pacing 175:
+
+| leg | win1 | win2 | note |
+| --- | --- | --- | --- |
+| warm | 717,169 | 645,717 | |
+| T (`N42_PHASE_TIMERS=1`) | 722,546 | 634,320 | the timers cost nothing visible |
+| R | 657,255 | 700,826 | win1 a bad window; win2 the leg's number |
+
+The leader's `seal-first build phases` on a full block (medians of the T leg; pool time is the sum over the 16
+build threads):
+
+| | wall ms | pool ms | of which |
+| --- | --- | --- | --- |
+| `par_exec` (the transfers) | 66 | 436 | reads 379, EVM 15, write 32, other 10 |
+| `par_graft` (the fold) | 58 | -- | base 1, reserve 9, **insert 40**, reverts 6 |
+
+Reads a block: 488,612 attempted -- 325,585 answered by the batch's own cache, 59,089 by the state provider,
+103,938 by the QMDB view. So the doors are hit once per account the block touches (~163k) and the other two reads a
+transaction are cache hits; 379 ms of pool time over ~163k door reads is **~2.3 us a read**, the same number 6.1
+measured on the bench for sixteen threads reading at once (3.5 us, against 0.7 alone). The follower's
+`parallel import phases` say the same (groups 69: reads 261, EVM 15, write 31, other 10; 72,682 provider, 70,647
+view). Two facts follow. (1) **87% of the execution's pool time is the account reads**, not the EVM and not the
+write-back; K's striped lock did not change them, so the contention is below the lock -- the view's lookup itself
+under sixteen readers, or the provider door (the overlay stack over MDBX) which the fleet uses for a third of the
+door reads and the bench does not. (2) 436 ms of pool time over a 66 ms wall is 6.6 threads of 16 busy inside
+`transfer`: the remaining 60% of the wall is outside the timed region (per-batch `State` and environment setup,
+receipts, scheduling, or waiting) and the timers cannot see it. A profile still owes that split (perf is blocked:
+`kernel.perf_event_paranoid` = 4).
+
+The graft is one thing: **the single-threaded insert of the block's ~147k touched accounts into the block's bundle
+state, 40 of 58 ms, 270 ns an account** -- two or three cache-missing probes into a map of that size, memory latency,
+not computation. A parallel representation (attempt G as sized) would shard that map and save perhaps 25-30 ms.
+
+But the bigger thing is where the seal sits. The seal-first path (payload.rs ~1285-1700) needs, of the block's own
+execution, only the transaction set and the transactions root, which is computed *beside* the graft precisely because
+the graft's 60-100 ms hide it (loop139); the state root, receipts root, logs bloom and gas used it writes are the
+parent's. The commit (14-18), the graft (40-59), the beneficiary credit and the withdrawal put-back all run before
+`hook(payload)` -- the proposal -- by code order alone, and the same machinery that already runs the roots behind the
+seal (`behind_the_seal`, `parent_executed_fields_or_built` with its wait, `StateReady` for the chained build) would
+carry them. Sealed at 185-197 today; pull 26 + prep 11 + part 3 + exec 55-63 + the seal's own 4-7 puts it at
+**~115-125 if the transactions root is started at the prep's end** (the body is the executed set in slot order; with
+no skipped sender it is the pulled set, so the root can be computed ahead and re-done only when `run.skipped` is not
+empty) and ~140 if it stays beside the exec's end. The chained build then waits for the parent's output instead of its
+pull+prep: state ready at seal + ~80 against pull+prep+part 40, so the period is ~145 rather than 220. The follower's
+road B starts 70 ms earlier too. After that the follower's import (180-209: exec 102-110, groups 58-70) is the wall,
+and attempt E (import prefetch) becomes the next term.
+
+**Decision**: attempt G is redrawn as **G2, the seal at the execution's end** (`plan-v6/seal-at-exec`, flag
+`N42_SEAL_AT_EXEC=1`), before any graft representation work; the graft's own 40 ms matters only once it is on the
+follower's or the chained build's path. Falsified if `sealed_at_ms` does not fall under 140 on full blocks, or if it
+does and win1 does not rise above 760k because the chained build's exec waits for the parent's fold (a relocation:
+read `par_exec_ms` and the chained build's wait on the parent).

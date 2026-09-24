@@ -317,6 +317,21 @@ impl Dropped {
     }
 }
 
+/// The pool [`TxQueue::forget_mined_parallel`] runs on: eight threads of
+/// the queue's own, so no job on it ever waits for the queue's lock (the
+/// partition runs under it). `None` if the threads could not be started.
+fn forget_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .thread_name(|i| format!("n42-queue-forget-{i}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
 /// Where [`TxQueue::forget_mined_timed`] spent its time, in microseconds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ForgetTimes {
@@ -1313,6 +1328,79 @@ impl<T: PoolTransaction> TxQueue<T> {
         let (mined, kept): (Vec<_>, Vec<_>) = std::mem::take(taken)
             .into_iter()
             .partition(|t| highest.get(&t.sender()).is_some_and(|nonce| t.nonce() <= *nonce));
+        *taken = kept;
+        times.partition_us = at.elapsed().as_micros() as u64;
+        (mined, times)
+    }
+
+    /// [`Self::forget_mined_timed`] with the fold of the block's nonces and
+    /// the partition of the taken list run on a small pool of the queue's
+    /// own (plan v6, the seal gap's first term; `N42_BUILD_START_ASYNC=1` in
+    /// the node). A chained build's first pull waits for this hand-off: at a
+    /// full block its fold (7 ms) and partition (12 ms, under the lock) were
+    /// all of the 19-21 ms before the build's parallel step (loop239,
+    /// `queue_ms` against `par_start_ms`), a serial walk over 163,000 cold
+    /// transactions. The block's `(sender, nonce)` pairs are read by index
+    /// (`mined_at(i)` for `i < len`), so those reads spread over the pool too.
+    ///
+    /// The pool is the queue's alone -- nothing on it ever takes the queue's
+    /// lock -- so the partition can run under the lock without a worker
+    /// waiting on it. The result is the serial one's: the same mined and
+    /// kept transactions in the same order (rayon's partition keeps it). A
+    /// pool that could not be built falls back to the serial walk.
+    pub fn forget_mined_parallel<F>(
+        &self,
+        parent: B256,
+        len: usize,
+        mined_at: F,
+    ) -> (Vec<Arc<ValidPoolTransaction<T>>>, ForgetTimes)
+    where
+        T: Send + Sync,
+        F: Fn(usize) -> (Address, u64) + Sync + Send,
+    {
+        use rayon::prelude::*;
+        let Some(pool) = forget_pool() else {
+            return self.forget_mined_timed(parent, (0..len).map(&mined_at));
+        };
+        let mut times = ForgetTimes::default();
+        {
+            let at = std::time::Instant::now();
+            let inner = self.inner.lock();
+            times.lock_us += at.elapsed().as_micros() as u64;
+            match inner.last_build.as_ref() {
+                Some((built_on, taken)) if *built_on == parent && !taken.is_empty() => {}
+                _ => return (Vec::new(), times),
+            }
+        }
+        let at = std::time::Instant::now();
+        let fold_one = |mut highest: AddressHashMap<u64>, (sender, nonce): (Address, u64)| {
+            let entry = highest.entry(sender).or_insert(nonce);
+            *entry = (*entry).max(nonce);
+            highest
+        };
+        let highest: AddressHashMap<u64> = pool.install(|| {
+            (0..len)
+                .into_par_iter()
+                .map(&mined_at)
+                .fold(AddressHashMap::default, fold_one)
+                .reduce(AddressHashMap::default, |a, b| {
+                    let (big, small) = if a.len() >= b.len() { (a, b) } else { (b, a) };
+                    small.into_iter().fold(big, fold_one)
+                })
+        });
+        times.fold_us = at.elapsed().as_micros() as u64;
+        let at = std::time::Instant::now();
+        let mut inner = self.inner.lock();
+        times.lock_us += at.elapsed().as_micros() as u64;
+        let at = std::time::Instant::now();
+        let Some((built_on, taken)) = inner.last_build.as_mut() else { return (Vec::new(), times) };
+        if *built_on != parent || taken.is_empty() {
+            return (Vec::new(), times);
+        }
+        let all = std::mem::take(taken);
+        let (mined, kept): (Vec<_>, Vec<_>) = pool.install(|| {
+            all.into_par_iter().partition(|t| highest.get(&t.sender()).is_some_and(|nonce| t.nonce() <= *nonce))
+        });
         *taken = kept;
         times.partition_us = at.elapsed().as_micros() as u64;
         (mined, times)
@@ -2835,6 +2923,49 @@ mod tests {
         let mut again: Vec<(u8, u64)> = std::iter::from_fn(|| best.next()).map(|t| (t.sender().as_slice()[0], t.nonce())).collect();
         again.sort();
         assert_eq!(again, vec![(1, 2), (2, 1)]);
+    }
+
+    /// The hand-off on the queue's pool (`N42_BUILD_START_ASYNC=1`) forgets
+    /// what the serial one does, in the same order, and leaves the same
+    /// taken-but-unmined transactions for the next build.
+    #[test]
+    fn forget_mined_parallel_is_the_serial_forget() {
+        let run = |parallel: bool| {
+            let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
+            let mut all = Vec::new();
+            for sender in 1..=40u8 {
+                for nonce in 0..6u64 {
+                    all.push(tx(sender, nonce));
+                }
+            }
+            queue.push(all);
+            let parent = B256::repeat_byte(3);
+            let mut best = queue.best_for_build(parent);
+            let taken: Vec<_> = std::iter::from_fn(|| best.next()).collect();
+            drop(best);
+            // The block mines up to nonce 3 of the even senders and nonce 1
+            // of the odd ones, listed out of order.
+            let mut mined: Vec<(Address, u64)> = Vec::new();
+            for sender in (1..=40u8).rev() {
+                for nonce in 0..=(if sender % 2 == 0 { 3 } else { 1 }) {
+                    mined.push((Address::repeat_byte(sender), nonce));
+                }
+            }
+            let dropped = if parallel {
+                queue.forget_mined_parallel(parent, mined.len(), |i| mined[i]).0
+            } else {
+                queue.forget_mined(parent, mined.iter().copied())
+            };
+            let dropped: Vec<(u8, u64)> = dropped.iter().map(|t| (t.sender().as_slice()[0], t.nonce())).collect();
+            let mut best = queue.best_for_build(B256::repeat_byte(4));
+            let mut again: Vec<(u8, u64)> =
+                std::iter::from_fn(|| best.next()).map(|t| (t.sender().as_slice()[0], t.nonce())).collect();
+            again.sort();
+            (taken.len(), dropped, again)
+        };
+        let serial = run(false);
+        assert_eq!(serial.1.len(), 20 * 4 + 20 * 2);
+        assert_eq!(run(true), serial);
     }
 
     #[test]

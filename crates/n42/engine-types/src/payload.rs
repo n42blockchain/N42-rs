@@ -389,6 +389,7 @@ where
                 if let Some(handed) = before_pull {
                     let at = std::time::Instant::now();
                     let _ = handed.recv();
+                    note_handoff_wait(at.elapsed());
                     tracing::debug!(
                         target: "payload_builder",
                         wait_ms = at.elapsed().as_millis() as u64,
@@ -777,6 +778,19 @@ fn after_parallel_step(
     AfterParallelStep::Serial
 }
 
+/// Thread-local: how long this thread's build waited in its selector for the
+/// parent's queue hand-off (`BuildOnOwnRequest::before_pull`), microseconds;
+/// reset at the build's selection and reported as `start_handoff_ms`.
+thread_local! {
+    static HANDOFF_WAIT_US: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Records the selector's wait for the parent's queue hand-off on this
+/// thread (see [`HANDOFF_WAIT_US`]).
+fn note_handoff_wait(waited: std::time::Duration) {
+    HANDOFF_WAIT_US.with(|cell| cell.set(cell.get().saturating_add(waited.as_micros() as u64)));
+}
+
 /// Whether a build for a height the chain has already committed is
 /// cancelled before it takes anything from the queue;
 /// `N42_BUILD_SKIP_DECIDED=0` turns it off.
@@ -1018,6 +1032,12 @@ where
 
     debug!(target: "payload_builder", ?block_gas_limit, ?base_fee, "payload builder block config");
 
+    // The seal gap's first term named (plan v6 6.13, `par_start_ms`): the
+    // selection, of which the wait for the parent's queue hand-off (set by
+    // a chained build's selector, [`note_handoff_wait`]), the checks, the
+    // puller's start and the header's preparation, each timed.
+    HANDOFF_WAIT_US.with(|cell| cell.set(0));
+    let start_best_at = std::time::Instant::now();
     let mut best_txs = best_txs(BestTransactionsAttributes::new(
         base_fee,
         builder
@@ -1026,6 +1046,9 @@ where
             .blob_gasprice()
             .map(|gasprice| gasprice as u64),
     ));
+    let start_best_ms = start_best_at.elapsed().as_millis() as u64;
+    let start_handoff_ms = HANDOFF_WAIT_US.with(std::cell::Cell::get) / 1_000;
+    let start_check_at = std::time::Instant::now();
     // Tried and measured inert: `best_txs.no_updates()`, dropping the
     // iterator's live feed of new transactions. The pool phase stayed at
     // 66-82 ms a block either way, so the cost is the ordered sets
@@ -1112,6 +1135,8 @@ where
             None => (0, 0, 0),
         }
     };
+    let start_check_ms = start_check_at.elapsed().as_millis() as u64;
+    let start_puller_at = std::time::Instant::now();
     let puller = builder_puller();
     let mut pulled: Option<Puller<Pool::Transaction>> = None;
     let mut best_txs = if puller == 0 {
@@ -1120,6 +1145,7 @@ where
         pulled = Some(Puller::start(best_txs, puller));
         None
     };
+    let start_puller_ms = start_puller_at.elapsed().as_millis() as u64;
     // What a candidate the parallel step skipped goes back with: the
     // truthful nonce error when the diagnosis above found one, so the queue
     // can drop a stale head or park a gapped lane, and the old
@@ -1150,12 +1176,14 @@ where
     let mut tx_count = 0u64;
     let mut total_fees = U256::ZERO;
 
+    let start_prepare_at = std::time::Instant::now();
     let mut header = cons
         .prepare(&parent_header)
         .map_err(|err| PayloadBuilderError::Internal(err.into()))?;
     if hotstuff {
         header.beneficiary = coinbase;
     }
+    let start_prepare_ms = start_prepare_at.elapsed().as_millis() as u64;
 
     // `N42_STATE_AFTER_PULL=1`: the parent's state opened and the
     // pre-execution changes applied once, just before the parallel step's
@@ -1243,6 +1271,12 @@ where
     let mut par_graft_insert_ms = 0u64;
     let mut par_graft_reverts_ms = 0u64;
     let mut par_graft_other_ms = 0u64;
+    // `N42_GRAFT_SHARDED=1` (plan v6 attempt G proper): whether the graft's
+    // insert ran sharded on the build pool, and its three phases in us.
+    let mut par_graft_sharded = false;
+    let mut par_graft_split_us = 0u64;
+    let mut par_graft_build_us = 0u64;
+    let mut par_graft_merge_us = 0u64;
     let mut par_transfer_timers = crate::fast_transfer::TransferTimers::default();
     // `N42_GRAFT_PREFAULT=1`: how long the graft's memory took to map, on its
     // own thread beside the parallel step (not on the chain).
@@ -1289,6 +1323,9 @@ where
     // Build start to the parallel step's start (the setup, the puller's
     // start, the header's preparation).
     let mut par_start_ms = 0u64;
+    // Of `par_start_ms`: what the named start timers do not cover (the
+    // setup before the selection, the macros' set-up, rounding).
+    let mut start_other_ms = 0u64;
     // The pull and prep's end to the execution's call (the prefetch layer
     // frozen, the graft sink, the threads beside the batches spawned).
     let mut pre_exec_ms = 0u64;
@@ -1411,6 +1448,8 @@ where
     if parallel_build() && pulled.is_some() {
         let par_at = std::time::Instant::now();
         par_start_ms = build_started.elapsed().as_millis() as u64;
+        start_other_ms =
+            par_start_ms.saturating_sub(start_best_ms + start_check_ms + start_puller_ms + start_prepare_ms);
         let budget = (block_gas_limit.saturating_sub(cumulative_gas_used) / MIN_TRANSACTION_GAS) as usize;
         par_budget = budget;
         let mut cands: Vec<Arc<reth_transaction_pool::ValidPoolTransaction<Pool::Transaction>>> =
@@ -1903,6 +1942,10 @@ where
                     par_graft_insert_ms = graft.direct_insert_ms;
                     par_graft_reverts_ms = graft.direct_reverts_ms;
                     par_graft_other_ms = graft.direct_other_ms;
+                    par_graft_sharded = graft.sharded;
+                    par_graft_split_us = graft.sharded_split_us;
+                    par_graft_build_us = graft.sharded_build_us;
+                    par_graft_merge_us = graft.sharded_merge_us;
                     let db = builder.executor.evm_mut().db_mut();
                     if !keep_cache {
                         if let Some(withdrawals) = attributes.withdrawals.as_ref() {
@@ -2397,6 +2440,10 @@ where
                     graft_insert_ms = par_graft_insert_ms,
                     graft_reverts_ms = par_graft_reverts_ms,
                     graft_other_ms = par_graft_other_ms,
+                    graft_sharded = par_graft_sharded,
+                    graft_split_us = par_graft_split_us,
+                    graft_build_us = par_graft_build_us,
+                    graft_merge_us = par_graft_merge_us,
                     // `N42_SEAL_AT_EXEC=1` (plan v6 G2): sealed at the parallel
                     // step's end with the fold behind the proposal; the
                     // transactions root computed over the pulled set beside
@@ -2409,6 +2456,17 @@ where
                     // The seal gap (plan v6): see the declarations of these
                     // timers for how they sum to `sealed_at_ms`.
                     par_start_ms,
+                    // Of `par_start_ms`: the selection (`best_txs`, which on a
+                    // chained build waits for the parent's queue hand-off --
+                    // `start_handoff_ms` of it -- and then takes the queue's
+                    // lock for `best_for_build`), the decided/stale checks,
+                    // the puller's thread, `cons.prepare`, and the rest.
+                    start_best_ms,
+                    start_handoff_ms,
+                    start_check_ms,
+                    start_puller_ms,
+                    start_prepare_ms,
+                    start_other_ms,
                     pre_exec_ms,
                     par_run_ms,
                     par_release_ms,

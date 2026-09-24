@@ -812,6 +812,19 @@ pub struct Graft {
     /// `N42_PHASE_TIMERS=1`, [`graft_bundles_direct`] only: the accounts the
     /// block's own cache already held, summed as deltas and committed once.
     pub direct_other_ms: u64,
+    /// `N42_GRAFT_SHARDED=1` (plan v6 attempt G proper): the insert ran
+    /// sharded by address on the build pool ([`graft_insert_sharded`]).
+    /// The three phases below are measured whenever it ran, timers or not.
+    pub sharded: bool,
+    /// Sharded insert, microseconds: the bundles' accounts moved into
+    /// per-shard lists, one bundle a job.
+    pub sharded_split_us: u64,
+    /// Sharded insert: each shard's accounts folded into its own map, one
+    /// shard a job.
+    pub sharded_build_us: u64,
+    /// Sharded insert: the shards' maps extended into the block's one map
+    /// (and the cache), on the calling thread.
+    pub sharded_merge_us: u64,
 }
 
 /// Grafts the batches' bundles onto the block's state directly: each account
@@ -911,6 +924,28 @@ pub fn graft_bundles_with<DB: Database>(
     graft_bundles_direct(state, bundles, beneficiary, keep_cache, None)
 }
 
+/// Whether `N42_GRAFT_SHARDED=1` is set: the in-place fold's insert
+/// ([`graft_bundles_direct`]) runs sharded by address on the build pool
+/// ([`graft_insert_sharded`]) -- plan v6 attempt G proper. The block it
+/// leaves is the serial insert's, map for map and revert for revert in the
+/// same order (`the_sharded_graft_equals_the_direct_one`). Off by default.
+pub fn graft_sharded() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_GRAFT_SHARDED").is_ok_and(|v| v == "1"))
+}
+
+/// Below this many accounts left to insert the sharded insert is not worth
+/// its jobs: a block of a few thousand transfers inserts in well under a ms.
+const GRAFT_SHARDED_MIN: usize = 8_192;
+
+/// Shards of the sharded insert: a power of two, twice the build pool's
+/// default sixteen threads so one slow shard does not hold the rest.
+const GRAFT_SHARDS: usize = 32;
+
+fn graft_shard_of(address: &Address) -> usize {
+    address.0[0] as usize & (GRAFT_SHARDS - 1)
+}
+
 /// Puts a [`GraftTarget`]'s memory in as the block's bundle map and the
 /// graft's revert list, if the block's bundle is still empty and has no
 /// memory of its own. The largest bundle may still become the base after
@@ -932,6 +967,20 @@ fn graft_bundles_direct<DB: Database>(
     beneficiary: Address,
     keep_cache: bool,
     target: Option<GraftTarget>,
+) -> Result<Graft, <State<DB> as Database>::Error> {
+    let sharded = graft_sharded() && bundles.iter().map(|b| b.state.len()).sum::<usize>() >= GRAFT_SHARDED_MIN;
+    graft_bundles_direct_as(state, bundles, beneficiary, keep_cache, target, sharded)
+}
+
+/// [`graft_bundles_direct`] with the insert's shape chosen by the caller:
+/// `sharded` runs it through [`graft_insert_sharded`] on the build pool.
+fn graft_bundles_direct_as<DB: Database>(
+    state: &mut State<DB>,
+    bundles: Vec<BundleState>,
+    beneficiary: Address,
+    keep_cache: bool,
+    target: Option<GraftTarget>,
+    sharded: bool,
 ) -> Result<Graft, <State<DB> as Database>::Error> {
     // `N42_PHASE_TIMERS=1` (plan v6 6.5): checkpoints at the granularity this
     // function already works at -- once around the base swap, once around
@@ -970,6 +1019,14 @@ fn graft_bundles_direct<DB: Database>(
     // Per address: what to add, what to subtract, the nonce to add, and
     // whether every batch saw the account absent.
     let mut slow: alloy_primitives::map::HashMap<Address, (U256, U256, u64, bool)> = Default::default();
+    // `N42_GRAFT_SHARDED=1`: the whole insert and the reverts done sharded;
+    // the serial loop below then has nothing to walk.
+    let bundles = if sharded {
+        slow = graft_insert_sharded(state, bundles, beneficiary, keep_cache, &mut graft);
+        Vec::new()
+    } else {
+        bundles
+    };
     for bundle in bundles {
         let BundleState { state: accounts, reverts, .. } = bundle;
         // Addresses this bundle changed that an earlier one had already put
@@ -1059,8 +1116,10 @@ fn graft_bundles_direct<DB: Database>(
             reverts_ns += ns(a, b);
         }
     }
-    graft.direct_insert_ms = (insert_ns / 1_000_000) as u64;
-    graft.direct_reverts_ms = (reverts_ns / 1_000_000) as u64;
+    if !sharded {
+        graft.direct_insert_ms = (insert_ns / 1_000_000) as u64;
+        graft.direct_reverts_ms = (reverts_ns / 1_000_000) as u64;
+    }
     let t3 = now();
     if !slow.is_empty() {
         let mut changes: revm::state::EvmState = Default::default();
@@ -1085,6 +1144,251 @@ fn graft_bundles_direct<DB: Database>(
         graft.direct_other_ms = (ns(a, b) / 1_000_000) as u64;
     }
     Ok(graft)
+}
+
+/// One shard's share of [`graft_insert_sharded`]: what the serial insert
+/// would have done to the accounts whose address falls in this shard.
+#[derive(Default)]
+struct InsertShard {
+    /// Accounts neither the block's map nor its cache held, as the serial
+    /// insert would leave them in the block's map (a later bundle's change
+    /// added to an earlier one's).
+    fresh: revm::primitives::HashMap<Address, BundleAccount>,
+    /// With `keep_cache`: the cache entries of `fresh`, as the serial insert
+    /// leaves them (its first view with every later change added).
+    cache: Vec<(Address, CacheAccount)>,
+    /// Changes to accounts the block's map held before the graft: (address,
+    /// new balance, old balance, new nonce, old nonce), in bundle order.
+    held: Vec<(Address, U256, U256, u64, u64)>,
+    /// Accounts only the block's cache held: summed deltas, committed once.
+    slow: alloy_primitives::map::HashMap<Address, (U256, U256, u64, bool)>,
+    /// Per bundle: the addresses of this shard whose revert is dropped.
+    repeated: Vec<alloy_primitives::map::AddressHashSet>,
+    beneficiary_delta: U256,
+    state_size: usize,
+    accounts: usize,
+}
+
+/// The insert of [`graft_bundles_direct_as`] sharded by address on the build
+/// pool (`N42_GRAFT_SHARDED=1`, plan v6 attempt G proper). The serial insert
+/// is ~270 ns an account of memory latency on one thread (40 ms of a full
+/// block's 58 ms fold, 6.6); here the bundles are split by shard (a job a
+/// bundle), each shard folds its accounts in bundle order into a map of its
+/// own (a job a shard, so every account's probes and hashing run on the
+/// pool), and the shards' maps are then extended into the block's one map
+/// on this thread, into memory reserved for them. The reverts are filtered
+/// a job a bundle beside that extend and appended in bundle order.
+///
+/// Every rule is the serial insert's, per address -- an address is seen by
+/// its own shard only, so the shards share nothing but read-only looks at
+/// the block's map and cache as they were before the graft: the
+/// beneficiary's credit summed, an account the block's map held added to in
+/// place (in bundle order, on this thread), an account only the cache held
+/// summed as a delta for the commit, anything else inserted by its first
+/// bundle and added to by the later ones. The reverts kept are the same, in
+/// the same order. Returns the summed deltas for the caller's commit.
+fn graft_insert_sharded<DB: Database>(
+    state: &mut State<DB>,
+    bundles: Vec<BundleState>,
+    beneficiary: Address,
+    keep_cache: bool,
+    graft: &mut Graft,
+) -> alloy_primitives::map::HashMap<Address, (U256, U256, u64, bool)> {
+    use rayon::prelude::*;
+    type ShardSplit = (Vec<Vec<(Address, BundleAccount)>>, Vec<(Address, AccountRevert)>);
+    let pool = build_pool();
+    let at = std::time::Instant::now();
+    // Per bundle: its accounts by shard, and its reverts flattened.
+    let split: Vec<ShardSplit> = pool.install(|| {
+        bundles
+            .into_par_iter()
+            .map(|bundle| {
+                let BundleState { state: accounts, mut reverts, .. } = bundle;
+                let per = accounts.len() / GRAFT_SHARDS + 1;
+                let mut shards: Vec<Vec<(Address, BundleAccount)>> =
+                    (0..GRAFT_SHARDS).map(|_| Vec::with_capacity(per + per / 4)).collect();
+                for (address, account) in accounts {
+                    shards[graft_shard_of(&address)].push((address, account));
+                }
+                let reverts: Vec<(Address, AccountRevert)> = std::mem::take(&mut *reverts).into_iter().flatten().collect();
+                (shards, reverts)
+            })
+            .collect()
+    });
+    let bundle_count = split.len();
+    let mut by_shard: Vec<Vec<Vec<(Address, BundleAccount)>>> =
+        (0..GRAFT_SHARDS).map(|_| Vec::with_capacity(bundle_count)).collect();
+    let mut bundle_reverts: Vec<Vec<(Address, AccountRevert)>> = Vec::with_capacity(bundle_count);
+    for (shards, reverts) in split {
+        for (shard, accounts) in shards.into_iter().enumerate() {
+            by_shard[shard].push(accounts);
+        }
+        bundle_reverts.push(reverts);
+    }
+    graft.sharded_split_us = at.elapsed().as_micros() as u64;
+
+    let at = std::time::Instant::now();
+    let held_map = &state.bundle_state.state;
+    let held_cache = &state.cache.accounts;
+    let shards: Vec<InsertShard> = pool.install(|| {
+        by_shard
+            .into_par_iter()
+            .map(|per_bundle| {
+                let size: usize = per_bundle.iter().map(Vec::len).sum();
+                let mut shard = InsertShard {
+                    fresh: revm::primitives::HashMap::with_capacity_and_hasher(size, Default::default()),
+                    repeated: Vec::with_capacity(per_bundle.len()),
+                    ..Default::default()
+                };
+                for accounts in per_bundle {
+                    let mut repeated: alloy_primitives::map::AddressHashSet = Default::default();
+                    for (address, account) in accounts {
+                        let Some(info) = account.info.as_ref() else { continue };
+                        let (new_balance, new_nonce) = (info.balance, info.nonce);
+                        let (old_balance, old_nonce) = match &account.original_info {
+                            Some(orig) => (orig.balance, orig.nonce),
+                            None => (U256::ZERO, 0),
+                        };
+                        if address == beneficiary {
+                            shard.beneficiary_delta =
+                                shard.beneficiary_delta.saturating_add(new_balance.saturating_sub(old_balance));
+                            repeated.insert(address);
+                            continue;
+                        }
+                        if held_map.contains_key(&address) {
+                            repeated.insert(address);
+                            shard.held.push((address, new_balance, old_balance, new_nonce, old_nonce));
+                            continue;
+                        }
+                        match shard.fresh.entry(address) {
+                            revm::primitives::hash_map::Entry::Occupied(mut earlier) => {
+                                repeated.insert(address);
+                                if let Some(info) = earlier.get_mut().info.as_mut() {
+                                    graft_add(info, new_balance, old_balance, new_nonce, old_nonce);
+                                }
+                            }
+                            revm::primitives::hash_map::Entry::Vacant(vacant) => {
+                                if held_cache.contains_key(&address) {
+                                    repeated.insert(address);
+                                    let entry = shard.slow.entry(address).or_insert((U256::ZERO, U256::ZERO, 0, true));
+                                    if new_balance >= old_balance {
+                                        entry.0 = entry.0.saturating_add(new_balance - old_balance);
+                                    } else {
+                                        entry.1 = entry.1.saturating_add(old_balance - new_balance);
+                                    }
+                                    entry.2 += new_nonce - old_nonce;
+                                    entry.3 &= account.original_info.is_none();
+                                    continue;
+                                }
+                                shard.state_size += account.size_hint();
+                                shard.accounts += 1;
+                                vacant.insert(account);
+                            }
+                        }
+                    }
+                    shard.repeated.push(repeated);
+                }
+                if keep_cache {
+                    shard.cache = shard
+                        .fresh
+                        .iter()
+                        .filter_map(|(address, account)| {
+                            account.info.as_ref().map(|info| {
+                                let plain = PlainAccount { info: info.clone(), storage: Default::default() };
+                                (*address, CacheAccount { account: Some(plain), status: account.status })
+                            })
+                        })
+                        .collect();
+                }
+                shard
+            })
+            .collect()
+    });
+    graft.sharded_build_us = at.elapsed().as_micros() as u64;
+
+    let mut fresh_maps = Vec::with_capacity(shards.len());
+    let mut caches = Vec::with_capacity(shards.len());
+    let mut helds = Vec::with_capacity(shards.len());
+    let mut repeated_by_shard = Vec::with_capacity(shards.len());
+    let mut slow: alloy_primitives::map::HashMap<Address, (U256, U256, u64, bool)> = Default::default();
+    for shard in shards {
+        graft.beneficiary_delta = graft.beneficiary_delta.saturating_add(shard.beneficiary_delta);
+        graft.accounts += shard.accounts;
+        state.bundle_state.state_size += shard.state_size;
+        slow.extend(shard.slow);
+        fresh_maps.push(shard.fresh);
+        caches.push(shard.cache);
+        helds.push(shard.held);
+        repeated_by_shard.push(shard.repeated);
+    }
+    // The extend into the block's map on this thread; the reverts filtered
+    // on the pool beside it.
+    let merge_at = std::time::Instant::now();
+    let mut merge_us = 0u64;
+    let repeated_ref = &repeated_by_shard;
+    let filtered: Vec<Vec<(Address, AccountRevert)>> = pool.in_place_scope(|scope| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        scope.spawn(move |_| {
+            let filtered: Vec<Vec<(Address, AccountRevert)>> = bundle_reverts
+                .into_par_iter()
+                .enumerate()
+                .map(|(bundle, reverts)| {
+                    reverts
+                        .into_iter()
+                        .filter(|(address, _)| !repeated_ref[graft_shard_of(address)][bundle].contains(address))
+                        .collect()
+                })
+                .collect();
+            let _ = tx.send(filtered);
+        });
+        let fresh_total: usize = fresh_maps.iter().map(|m| m.len()).sum();
+        state.bundle_state.state.reserve(fresh_total);
+        for fresh in fresh_maps {
+            state.bundle_state.state.extend(fresh);
+        }
+        if keep_cache {
+            state.cache.accounts.reserve(fresh_total);
+            for cache in caches {
+                state.cache.accounts.extend(cache);
+            }
+        }
+        // Accounts the block's map held before the graft: added to in place,
+        // each shard's list in bundle order, in both the map and the cache.
+        for held in helds {
+            for (address, new_balance, old_balance, new_nonce, old_nonce) in held {
+                if let Some(info) = state.bundle_state.state.get_mut(&address).and_then(|a| a.info.as_mut()) {
+                    graft_add(info, new_balance, old_balance, new_nonce, old_nonce);
+                }
+                if let Some(info) = state.cache.accounts.get_mut(&address).and_then(|a| a.account.as_mut()) {
+                    graft_add(&mut info.info, new_balance, old_balance, new_nonce, old_nonce);
+                }
+            }
+        }
+        merge_us = merge_at.elapsed().as_micros() as u64;
+        // A panicking job propagates out of the scope; a closed channel
+        // otherwise cannot happen.
+        rx.recv().unwrap_or_default()
+    });
+    // What the reverts took beyond the extend they ran beside.
+    graft.direct_reverts_ms = (merge_at.elapsed().as_micros() as u64).saturating_sub(merge_us) / 1_000;
+    for reverts in filtered {
+        graft.reverts.extend(reverts);
+    }
+    graft.sharded_merge_us = merge_us;
+    graft.sharded = true;
+    graft.direct_insert_ms = (graft.sharded_split_us + graft.sharded_build_us + graft.sharded_merge_us) / 1_000;
+    slow
+}
+
+/// The serial insert's addition of one bundle's change to an account an
+/// earlier bundle (or the block) already holds.
+fn graft_add(info: &mut revm::state::AccountInfo, new_balance: U256, old_balance: U256, new_nonce: u64, old_nonce: u64) {
+    info.balance = if new_balance >= old_balance {
+        info.balance.saturating_add(new_balance - old_balance)
+    } else {
+        info.balance.saturating_sub(old_balance - new_balance)
+    };
+    info.nonce += new_nonce - old_nonce;
 }
 
 /// How the batches' bundles become the block's one bundle.
@@ -3343,6 +3647,134 @@ mod tests {
             grafted,
             committed,
             beneficiary_delta: delta,
+        }
+    }
+
+    /// The fold in place with its insert sharded (`N42_GRAFT_SHARDED=1`) or
+    /// serial, over `bundles` grafted in `parts` goes (a later go finds the
+    /// block's map holding the earlier ones' accounts): the block's map, its
+    /// size, the cache with its statuses, the reverts *in the order they were
+    /// appended*, and the counts.
+    #[allow(clippy::type_complexity)]
+    fn sharded_fixture_run(
+        sharded: bool,
+        keep_cache: bool,
+        held_in_cache: bool,
+        mut bundles: Vec<BundleState>,
+        parts: usize,
+    ) -> (FoldSnapshot, Vec<(Address, revm::database::AccountStatus)>) {
+        let beneficiary = addr(9);
+        let held = addr(5);
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(held, fold_fixture_info(100, 0));
+        let mut state = State::builder().with_database(db).with_bundle_update().build();
+        if held_in_cache {
+            assert_eq!(state.basic(held).expect("the held account").map(|a| a.balance), Some(U256::from(100)));
+        }
+        let per = bundles.len().div_ceil(parts.max(1));
+        let mut goes = Vec::new();
+        while !bundles.is_empty() {
+            let rest = bundles.split_off(per.min(bundles.len()));
+            goes.push(std::mem::replace(&mut bundles, rest));
+        }
+        let (mut grafted, mut committed, mut delta, mut reverts) = (0usize, 0usize, U256::ZERO, Vec::new());
+        for go in goes {
+            let graft = graft_bundles_direct_as(&mut state, go, beneficiary, keep_cache, None, sharded).expect("the graft");
+            assert_eq!(graft.sharded, sharded);
+            grafted += graft.accounts;
+            committed += graft.committed;
+            delta = delta.saturating_add(graft.beneficiary_delta);
+            reverts.extend(graft.reverts);
+        }
+        let mut accounts: Vec<_> = state
+            .bundle_state
+            .state
+            .iter()
+            .map(|(address, account)| (*address, account.info.clone(), account.original_info.clone(), account.status))
+            .collect();
+        accounts.sort_by_key(|(address, ..)| *address);
+        let mut cache: Vec<(Address, Option<AccountInfo>)> = state
+            .cache
+            .accounts
+            .iter()
+            .map(|(address, account)| (*address, account.account.as_ref().map(|a| a.info.clone())))
+            .collect();
+        cache.sort_by_key(|(address, _)| *address);
+        let mut statuses: Vec<_> = state.cache.accounts.iter().map(|(address, account)| (*address, account.status)).collect();
+        statuses.sort_by_key(|(address, _)| *address);
+        let snapshot = FoldSnapshot {
+            accounts,
+            state_size: state.bundle_state.state_size,
+            cache,
+            // Not sorted: the sharded insert must keep the serial order.
+            reverts,
+            grafted,
+            committed,
+            beneficiary_delta: delta,
+        };
+        (snapshot, statuses)
+    }
+
+    /// Sixteen batches of 500 transfers into a space a tenth the block's
+    /// size (most recipients one batch's, some several batches'), each
+    /// batch also paying the held account and crediting the beneficiary.
+    fn sharded_block_bundles(batches: u64, per: u64) -> Vec<BundleState> {
+        let (beneficiary, held, info) = (addr(9), addr(5), fold_fixture_info);
+        let mut out = Vec::new();
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        for batch in 0..batches {
+            let mut b = BundleState::builder(0..=0);
+            let sender = addr(100 + batch);
+            b = b
+                .state_present_account_info(sender, info(1_000_000 - per * (batch + 1), per))
+                .state_original_account_info(sender, info(1_000_000, 0))
+                .revert_account_info(0, sender, Some(Some(info(1_000_000, 0))));
+            for _ in 0..per {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let to = addr(1_000_000 + seed % (batches * per / 10));
+                b = b.state_present_account_info(to, info(1 + batch, 0)).revert_account_info(0, to, Some(None));
+            }
+            b = b
+                .state_present_account_info(held, info(100 + batch + 1, 0))
+                .state_original_account_info(held, info(100, 0))
+                .revert_account_info(0, held, Some(Some(info(100, 0))));
+            b = b
+                .state_present_account_info(beneficiary, info(7 + batch + 1, 0))
+                .state_original_account_info(beneficiary, info(7, 0))
+                .revert_account_info(0, beneficiary, Some(Some(info(7, 0))));
+            out.push(b.build());
+        }
+        out
+    }
+
+    /// The sharded insert leaves the block exactly where the serial one
+    /// does -- the same map, size, cache (values and statuses), beneficiary
+    /// credit and counts, and the same reverts in the same order -- with the
+    /// cache kept and not (the base swap on and off), with the held account
+    /// in the block's cache and not, in one go and in several (a later go
+    /// adds to accounts the block's map already holds).
+    #[test]
+    fn the_sharded_graft_equals_the_direct_one() {
+        let fixtures: [(&str, fn() -> Vec<BundleState>); 2] = [
+            ("fixture", || fold_fixture_bundles(addr(9), addr(5), 4)),
+            ("block", || sharded_block_bundles(16, 500)),
+        ];
+        for (name, bundles) in fixtures {
+            for keep_cache in [false, true] {
+                for held_in_cache in [false, true] {
+                    for parts in [1usize, 2, 3] {
+                        let direct = sharded_fixture_run(false, keep_cache, held_in_cache, bundles(), parts);
+                        assert!(!direct.0.accounts.is_empty() && !direct.0.reverts.is_empty(), "{name}: the fixture grafts something");
+                        let sharded = sharded_fixture_run(true, keep_cache, held_in_cache, bundles(), parts);
+                        assert_eq!(
+                            sharded, direct,
+                            "{name}, keep_cache {keep_cache}, held in cache {held_in_cache}, {parts} goes"
+                        );
+                    }
+                }
+            }
         }
     }
 

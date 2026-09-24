@@ -682,11 +682,18 @@ async fn build_on_own_block(
     if let Some(queue) = n42_tx_queue::global::<n42_engine_types::N42PooledTransaction>() {
         let at = std::time::Instant::now();
         let txs = built.block.body().transactions().count();
-        let mined = built
-            .block
-            .transactions_with_sender()
-            .map(|(sender, tx)| (*sender, alloy_consensus::Transaction::nonce(tx)));
-        let (dropped, forget) = queue.forget_mined_timed(built.block.header().parent_hash, mined);
+        let (dropped, forget) = if build_start_async() {
+            let (body, senders): (&[_], &[_]) = (&built.block.body().transactions, built.block.senders());
+            queue.forget_mined_parallel(built.block.header().parent_hash, body.len().min(senders.len()), |i| {
+                (senders[i], alloy_consensus::Transaction::nonce(&body[i]))
+            })
+        } else {
+            let mined = built
+                .block
+                .transactions_with_sender()
+                .map(|(sender, tx)| (*sender, alloy_consensus::Transaction::nonce(tx)));
+            queue.forget_mined_timed(built.block.header().parent_hash, mined)
+        };
         (times.queue_fold_us, times.queue_lock_us, times.queue_partition_us) =
             (forget.fold_us, forget.lock_us, forget.partition_us);
         // At info: `forgotten` far below `txs` is the shape of the queue
@@ -735,6 +742,19 @@ async fn build_on_own_block(
     let payload = handle.await.map_err(|err| format!("build task: {err}"))??;
     times.build_ms = at.elapsed().as_millis() as u64;
     Ok((payload, times, chain, want_hashes))
+}
+
+/// `N42_BUILD_START_ASYNC=1` (plan v6, the seal gap's first term): the
+/// queue's hand-off of an own block -- the fold of its nonces and the
+/// partition of the build's taken list -- runs on the queue's own pool
+/// (`TxQueue::forget_mined_parallel`) instead of on one thread. A chained
+/// build's first pull waits for that hand-off, and it was all of the
+/// 19-21 ms before the build's parallel step (loop239: `queue_ms` 19-21
+/// against `par_start_ms` 19-21; `start_handoff_ms` on the build's line
+/// now says so directly). Off by default.
+fn build_start_async() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_BUILD_START_ASYNC").is_ok_and(|v| v == "1"))
 }
 
 /// `N42_BUILD_ON_OUTPUT=1`: a build on an own block starts at the parent's
@@ -791,8 +811,17 @@ async fn build_on_sealed_output(
             let task = tokio::task::spawn_blocking(move || {
                 let at = std::time::Instant::now();
                 let txs = block.body().transactions().count();
-                let mined = block.transactions_with_sender().map(|(sender, tx)| (*sender, alloy_consensus::Transaction::nonce(tx)));
-                let (dropped, forget) = queue.forget_mined_timed(block.header().parent_hash, mined);
+                let (dropped, forget) = if build_start_async() {
+                    let (body, senders): (&[_], &[_]) = (&block.body().transactions, block.senders());
+                    queue.forget_mined_parallel(block.header().parent_hash, body.len().min(senders.len()), |i| {
+                        (senders[i], alloy_consensus::Transaction::nonce(&body[i]))
+                    })
+                } else {
+                    let mined = block
+                        .transactions_with_sender()
+                        .map(|(sender, tx)| (*sender, alloy_consensus::Transaction::nonce(tx)));
+                    queue.forget_mined_timed(block.header().parent_hash, mined)
+                };
                 info!(
                     target: "n42.payload_serve",
                     number = block.number(),

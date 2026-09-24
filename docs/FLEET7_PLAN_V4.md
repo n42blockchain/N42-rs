@@ -1366,5 +1366,25 @@ What a four-node leg must read, `N42_BUILD_COLLECT_IN_PLACE=1 N42_GRAFT_PREFAULT
 `par_fold_ms` 76-86 -> ~40, `par_exec_ms` not up by more than ~5, `par_prefault_ms` (new, beside) under `par_exec_ms`,
 `sealed_at_ms` and the build period down by ~50; window 2 >= 600k; verify 4/4.
 
+### 5.10 Attempt D on the fleet (loop222): the prefault buys nothing there
+
+| `seal-first build phases`, medians | R a / b | G (collect in place + prefault) a / b | GR (+ ranges) |
+| --- | --- | --- | --- |
+| collect / commit / fold (graft) | 9 / 12 / 63 (49), 8 / 14 / 65 (48) | 0 / 16 / 67 (48), 0 / 17 / 68 (48) | 0 / 17 / 87 (66) |
+| exec / prefault (own thread) | 63 / --, 69 / -- | 69 / 36, 71 / 37 | 82 / 38 |
+| sealed_at / total | 185 / 235, 195 / 255 | 188 / 249, 191 / 253 | 224 / 292 |
+| cycle (dissected) / E | (stalled) / --, -- | 239 / 55, 233 / 51 | 257 / 70 |
+| window 1 / 2 | 650k / 509k (b) | 684k / 655k, 685k / 575k | 619k / 418k |
+
+- **The collect in place is real (9 -> 0) and the prefault is not**: the graft reads 48 ms with the pages touched
+  ahead exactly as without, `sealed_at` does not move, and the build's total is 10-15 ms longer for the thread. The
+  bench's page-fault reading (fresh pages every block) does not hold on the fleet -- its heaps run `thp:always` with a
+  2 s dirty decay, so the map's pages are resident already; what the fleet's 48 ms graft is remains unmeasured on the
+  fleet (the bench's 42-45 reproduced the number but not the cause). Ranges are worse under load (87), as idle.
+- Kept: `N42_BUILD_COLLECT_IN_PLACE=1` (collect 0; commit +3 for it, net ~-6). `N42_GRAFT_PREFAULT` and the folds stay
+  off. The build period is still ~232; par is exec 63-71 + graft 48 + commit 16 + pull 21 + prep 11 with the seal at
+  185-195. Next, as configuration first: the leader's streamed graft (`N42_GRAFT_STREAM=1`, falsified as a default at
+  seven nodes with 16 cores, untested at 28) and the builder's pool at 28 threads now that the build is the wall.
+
 Each attempt is one agent brief and one runner; the bar for adopting any is the same as plan v4's: window 2 in every leg,
 verify 4/4, and the number it targets moving on the fleet, not on a bench.

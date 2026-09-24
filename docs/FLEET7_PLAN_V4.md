@@ -1782,7 +1782,7 @@ the follower's import (207+) is longer than the cycle it must keep up with, and 
 2. **the leader's period** has the 39 ms gap before the ahead seal (6.11's last paragraph; `plan-v6/seal-gap`
    in flight) -- with it the build ends at ~140 and pacing 150 is a leader-side possibility;
 3. **the supply** is CPU: verification on every node is the largest per-transaction term the fleet pays four
-   times over (12 us x 4 nodes x 1M/s = 48 cores of the box's 128). A probe leg with `N42_INGEST_VERIFY=leader`
-   (followers accept the leader's frame claims; not adoptable as is -- 5.x's "verify on the road" was a
-   relocation) says how much of the follower's B and import is that contention; if it is most of it, the design
-   question for 1M on this box is where signatures are verified, not how fast.
+   times over (12 us x 4 nodes x 1M/s = 48 cores of the box's 128). `N42_INGEST_VERIFY=leader` is not a probe
+   of it: it moves the followers' verification onto the vote road (13 us x 163k a block, 5.x's relocation), so
+   the leg would measure the road, not the contention. The design question for 1M on this box is where
+   signatures are verified -- once, or by a quorum's worth of nodes rather than all -- not how fast.

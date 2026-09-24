@@ -666,7 +666,10 @@ where
         let expected_hash = payload.block_hash();
         // A block this node built and has just handed to the engine as
         // executed: the payload is its own, and the block is already made.
-        if let Some(block) = crate::built_executions::find_sealed(expected_hash) {
+        if let Some(block) = crate::built_executions::find_or_take_sealed(
+            expected_hash,
+            payload.payload.as_v1().transactions.len(),
+        ) {
             let payload_transactions = payload.payload.as_v1().transactions.len();
             if payload_transactions == 0 || payload_transactions != block.body().transactions.len() {
                 tracing::info!(
@@ -674,6 +677,12 @@ where
                     number = block.number, block = ?expected_hash, sealed_transactions = block.body().transactions.len(), payload_transactions,
                     "payload converted from the sealed block kept for it"
                 );
+            }
+            // The payload's own list is not read on this path: with
+            // `N42_ENGINE_TAKE_SEALED=1` its 163,000 `Bytes` are freed on the
+            // worker pool rather than on the engine's thread.
+            if crate::built_executions::take_sealed_enabled() && payload_transactions > 0 {
+                rayon::spawn(move || drop(payload));
             }
             return Ok(block);
         }

@@ -1046,12 +1046,19 @@ async fn complete_listing(
     raw_transactions: &mut Vec<alloy_primitives::Bytes>,
     listing: &mut Option<tokio::task::JoinHandle<Vec<alloy_primitives::Bytes>>>,
     number: u64,
+    // Whether anything reads `raw_transactions` after this: not once the
+    // direct import has landed, which has the block's hashes already. The
+    // copy is 163,000 `Bytes` clones (each an allocation, the first time a
+    // `Vec`-backed one is shared) and as many releases when both are freed.
+    keep_raw: bool,
 ) {
     let Some(pending) = listing.take() else { return };
     let waited_at = std::time::Instant::now();
     match pending.await {
         Ok(list) => {
-            raw_transactions.clone_from(&list);
+            if keep_raw {
+                raw_transactions.clone_from(&list);
+            }
             data.payload.as_v1_mut().transactions = list;
         }
         Err(err) => warn!(target: "n42.payload_serve", number, %err, "the described block's payload list was not copied out"),
@@ -1391,7 +1398,7 @@ where
         {
             warn!(target: "n42.payload_serve", number, %err, "remembering the sealed block failed; the engine will decode it again");
         }
-        complete_listing(&mut data, &mut raw_transactions, &mut listing, number).await;
+        complete_listing(&mut data, &mut raw_transactions, &mut listing, number, false).await;
         let engine_at = std::time::Instant::now();
         match engine.new_payload(data).await {
             Ok(status) if !status.status.is_valid() => warn!(
@@ -1434,13 +1441,24 @@ where
     // payload answer waits for, and it is the only reader of the block the
     // import started copying when it returned. Awaited here rather than
     // before the import, which is where it was on the vote road.
+    //
+    // The three steps of the direct import's `engine_ms` are timed apart
+    // (`engine_remember_ms`, `engine_listing_ms`, `engine_new_payload_ms`):
+    // at 163,000 transactions it was 46 ms with no name (loop234).
+    let remember_at = std::time::Instant::now();
     if let Some(remembering) = remembering.take()
         && let Err(err) = remembering.await
     {
         warn!(target: "n42.payload_serve", number, %err, "remembering the sealed block failed; the engine will decode it again");
     }
-    complete_listing(&mut data, &mut raw_transactions, &mut listing, number).await;
-    match engine.new_payload(data).await {
+    let remember_ms = remember_at.elapsed().as_millis() as u64;
+    let listing_at = std::time::Instant::now();
+    complete_listing(&mut data, &mut raw_transactions, &mut listing, number, direct_ms.is_none()).await;
+    let listing_ms = listing_at.elapsed().as_millis() as u64;
+    let new_payload_at = std::time::Instant::now();
+    let new_payload = engine.new_payload(data).await;
+    let new_payload_ms = new_payload_at.elapsed().as_millis() as u64;
+    match new_payload {
         Ok(status) => {
             if let (Some(probe), Some(probe_data)) = (probe, probe_data) {
                 let validator = reuse.map(|r| r.validator.clone());
@@ -1481,7 +1499,9 @@ where
                 && let Some(prune) = reuse.and_then(|r| r.prune_pool.clone())
             {
                 let pruned_at = std::time::Instant::now();
-                let count = raw_transactions.len();
+                // The mined hashes' count when the direct import has them:
+                // the raw list is then not copied out of the payload.
+                let count = mined_hashes.as_ref().map_or(raw_transactions.len(), Vec::len);
                 // Not awaited: the answer to this payload is
                 // what the validator's vote waits for, and the
                 // prune of a full block was 66 ms of it (round
@@ -1533,6 +1553,9 @@ where
                     gate_ms = ms[14],
                     root_wait_ms = ms[15],
                     engine_ms = (started.elapsed().saturating_sub(decoded).as_millis() as u64).saturating_sub(ms[7]),
+                    engine_remember_ms = remember_ms,
+                    engine_listing_ms = listing_ms,
+                    engine_new_payload_ms = new_payload_ms,
                     status = ?status.status,
                     "direct import: executed here, handed to the engine as executed"
                 );

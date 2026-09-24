@@ -86,6 +86,20 @@ pub struct Phases {
     pub finish_ms: u64,
     /// How many groups there were.
     pub groups: usize,
+    /// Whether the environments and the partition came from a plan made
+    /// ahead of the call ([`plan_transfers`]); `partition_ms` is then only
+    /// the plan's hand-over.
+    pub planned_ahead: bool,
+    /// The plan's environments, made ahead of the call, microseconds.
+    pub ahead_env_us: u64,
+    /// The plan's environments and partition, made ahead of the call,
+    /// microseconds.
+    pub ahead_plan_us: u64,
+    /// [`follower_merge_behind`]: the grafted reverts' sort on its own
+    /// thread, microseconds, and how long the merge waited for it at the end.
+    pub reverts_sort_us: u64,
+    /// See `reverts_sort_us`.
+    pub reverts_wait_us: u64,
     /// How many batches of groups ran (the build's [`execute_for_build`]
     /// runs a sender per group and several groups per batch).
     pub batches: usize,
@@ -2023,15 +2037,24 @@ pub fn append_reverts(bundle: &mut BundleState, reverts: Vec<(Address, AccountRe
     if reverts.is_empty() {
         return;
     }
-    if bundle.reverts.is_empty() {
-        bundle.reverts.push(Vec::new());
-    }
-    let last = bundle.reverts.len() - 1;
     // Sorted by address as revm's own merge leaves them; on the worker pool,
     // a block's 147,000 reverts being too many for one thread on the
     // follower's critical path.
     let mut reverts = reverts;
     sort_reverts(&mut reverts);
+    append_sorted_reverts(bundle, reverts);
+}
+
+/// [`append_reverts`] for a set already sorted by address.
+fn append_sorted_reverts(bundle: &mut BundleState, reverts: Vec<(Address, AccountRevert)>) {
+    if reverts.is_empty() {
+        return;
+    }
+    if bundle.reverts.is_empty() {
+        bundle.reverts.push(Vec::new());
+    }
+    let last = bundle.reverts.len() - 1;
+    let mut reverts = reverts;
     let merged = &mut bundle.reverts[last];
     if merged.is_empty() {
         // The block's merge had nothing of its own to revert: the graft's set
@@ -2063,6 +2086,80 @@ pub fn append_reverts(bundle: &mut BundleState, reverts: Vec<(Address, AccountRe
         *merged = reverts;
     }
     bundle.reverts_size = bundle.reverts.iter().map(Vec::len).sum();
+}
+
+/// A graft's reverts being sorted by address on a thread of their own
+/// ([`follower_merge_behind`]): a plain thread, not a rayon job, so that its
+/// wait is never a worker's; its sort still runs on the worker pool. If no
+/// thread can be had the set is sorted where it is collected.
+#[derive(Debug)]
+enum RevertsSort {
+    /// On its thread; the answer is the sorted set and the sort's time.
+    Thread(std::sync::mpsc::Receiver<(Vec<(Address, AccountRevert)>, u64)>),
+    /// No thread: sorted in [`RevertsSort::finish`].
+    Here(Vec<(Address, AccountRevert)>),
+}
+
+impl RevertsSort {
+    fn start(reverts: Vec<(Address, AccountRevert)>) -> Self {
+        let (to_sort, sorting) = std::sync::mpsc::channel::<Vec<(Address, AccountRevert)>>();
+        let (sorted, answer) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new().name("graft-reverts".into()).spawn(move || {
+            if let Ok(mut reverts) = sorting.recv() {
+                let at = std::time::Instant::now();
+                sort_reverts_indexed(&mut reverts);
+                let _ = sorted.send((reverts, at.elapsed().as_micros() as u64));
+            }
+        });
+        match spawned {
+            Ok(_) => match to_sort.send(reverts) {
+                Ok(()) => Self::Thread(answer),
+                Err(std::sync::mpsc::SendError(reverts)) => Self::Here(reverts),
+            },
+            Err(_) => Self::Here(reverts),
+        }
+    }
+
+    fn finish(self) -> Result<(Vec<(Address, AccountRevert)>, u64), String> {
+        match self {
+            Self::Thread(answer) => answer.recv().map_err(|_| "the reverts' sort thread ended without an answer".to_string()),
+            Self::Here(mut reverts) => {
+                let at = std::time::Instant::now();
+                sort_reverts_indexed(&mut reverts);
+                Ok((reverts, at.elapsed().as_micros() as u64))
+            }
+        }
+    }
+}
+
+/// [`sort_reverts`] by an index: the addresses and positions (24 bytes an
+/// entry) are sorted on the worker pool and the reverts (~200 bytes an entry)
+/// are then moved once each, along the permutation's cycles, instead of being
+/// swapped at every level of the sort. The order is the same: a graft's set
+/// holds each address once.
+fn sort_reverts_indexed(reverts: &mut [(Address, AccountRevert)]) {
+    if reverts.len() < 4096 || reverts.len() > u32::MAX as usize {
+        sort_reverts(reverts);
+        return;
+    }
+    use rayon::prelude::*;
+    let mut order: Vec<(Address, u32)> =
+        reverts.par_iter().enumerate().map(|(at, (address, _))| (*address, at as u32)).collect();
+    order.par_sort_unstable_by_key(|(address, _)| *address);
+    // `source[k]`: the position whose revert belongs at `k`.
+    let mut source: Vec<u32> = order.into_iter().map(|(_, at)| at).collect();
+    for start in 0..source.len() {
+        let mut at = start;
+        loop {
+            let from = source[at] as usize;
+            source[at] = at as u32;
+            if from == start {
+                break;
+            }
+            reverts.swap(at, from);
+            at = from;
+        }
+    }
 }
 
 /// By address, on the worker pool where there are enough of them to pay for it.
@@ -2328,7 +2425,60 @@ where
     G: Database + std::fmt::Debug + Send,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    execute_transfers_with(evm_config, block, main_db, open, follower_graft(), follower_sender_groups())
+    execute_transfers_planned(evm_config, block, main_db, open, None)
+}
+
+/// [`execute_transfers`] with the block's transfers planned ahead
+/// ([`plan_transfers`], `N42_FOLLOWER_PARTITION_AHEAD=1`): the plan's
+/// environments and groups are used when it is this block's, and the
+/// executor plans for itself otherwise.
+pub fn execute_transfers_planned<EvmConfig, DB, G>(
+    evm_config: &EvmConfig,
+    block: &RecoveredBlock<Block>,
+    main_db: DB,
+    open: &(dyn Fn() -> Option<G> + Sync),
+    plan: Option<TransferPlan>,
+) -> Result<Result<(BlockExecutionOutput<Receipt>, Phases), NotParallel>, BlockExecutionError>
+where
+    EvmConfig: ConfigureEvm<Primitives = EthPrimitives, BlockExecutorFactory = FastExecutorFactory>,
+    DB: Database + std::fmt::Debug,
+    DB::Error: Send + Sync + 'static,
+    G: Database + std::fmt::Debug + Send,
+    G::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    execute_transfers_with_plan(
+        evm_config,
+        block,
+        main_db,
+        open,
+        follower_graft(),
+        follower_sender_groups(),
+        plan,
+        follower_merge_behind(),
+    )
+}
+
+/// Whether `N42_FOLLOWER_PARTITION_AHEAD=1` is set: the follower plans a
+/// block's transfers ([`plan_transfers`]: the environments and the partition,
+/// 19 ms of a 122 ms execution at 163,000 transfers, loop234) on the worker
+/// pool as soon as the block's senders are known, beside the includability
+/// check and the wait for the parent, instead of inside the execution gate.
+pub fn follower_partition_ahead() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_PARTITION_AHEAD").is_ok_and(|v| v == "1"))
+}
+
+/// Whether `N42_FOLLOWER_MERGE_BEHIND=1` is set: with the streamed graft, the
+/// grafted reverts (one per account the block touched, ~147,000 at the bench
+/// tier) are sorted on a thread of their own from the moment the batches end,
+/// beside the block's own executor and the install of the staged accounts,
+/// instead of after them. The next block reads only the merged account map
+/// (its includability check and its overlay read `BundleState::state`), so
+/// the map's install stays where it is; the reverts are read by no one before
+/// the engine's insert, and their sort is what leaves the gated part.
+pub fn follower_merge_behind() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_MERGE_BEHIND").is_ok_and(|v| v == "1"))
 }
 
 /// Whether `N42_FOLLOWER_SENDER_GROUPS=1` is set: the follower groups a
@@ -2407,6 +2557,100 @@ pub fn follower_graft() -> bool {
     *ON.get_or_init(|| std::env::var("N42_FOLLOWER_GRAFT").is_ok_and(|v| v == "1"))
 }
 
+/// A block's transfers planned ahead of their execution: the transactions'
+/// EVM environments and the groups they execute in, made where the block's
+/// senders are first known (`N42_FOLLOWER_PARTITION_AHEAD=1`) rather than
+/// inside the follower's execution gate. [`execute_transfers_planned`] uses
+/// it only for the block, beneficiary and grouping it was made for, and plans
+/// again otherwise, so a stale or mismatched plan costs time, never a result.
+#[derive(Debug)]
+pub struct TransferPlan {
+    block_hash: alloy_primitives::B256,
+    beneficiary: Address,
+    sender_groups: bool,
+    txs: Vec<TxEnv>,
+    groups: Result<Vec<Vec<usize>>, NotParallel>,
+    /// The environments, microseconds.
+    pub env_us: u64,
+    /// The environments and the partition together, microseconds.
+    pub plan_us: u64,
+}
+
+/// Plans `block`'s transfers for the follower's parallel execution with the
+/// grouping the follower's flags pick; see [`TransferPlan`].
+pub fn plan_transfers<EvmConfig>(evm_config: &EvmConfig, block: &RecoveredBlock<Block>) -> Result<TransferPlan, BlockExecutionError>
+where
+    EvmConfig: ConfigureEvm<Primitives = EthPrimitives, BlockExecutorFactory = FastExecutorFactory>,
+{
+    let at = std::time::Instant::now();
+    let beneficiary = evm_config.evm_env(block.header()).map_err(BlockExecutionError::other)?.block_env.beneficiary;
+    let sender_groups = follower_sender_groups();
+    let (txs, groups, env_us) = plan_with(evm_config, block, beneficiary, sender_groups);
+    Ok(TransferPlan {
+        block_hash: block.hash(),
+        beneficiary,
+        sender_groups,
+        txs,
+        groups,
+        env_us,
+        plan_us: at.elapsed().as_micros() as u64,
+    })
+}
+
+/// The transactions' environments and their partition into groups, with the
+/// environments' time in microseconds. The partition is `Err` when the block
+/// cannot take the parallel path.
+fn plan_with<EvmConfig>(
+    evm_config: &EvmConfig,
+    block: &RecoveredBlock<Block>,
+    beneficiary: Address,
+    sender_groups: bool,
+) -> (Vec<TxEnv>, Result<Vec<Vec<usize>>, NotParallel>, u64)
+where
+    EvmConfig: ConfigureEvm<Primitives = EthPrimitives, BlockExecutorFactory = FastExecutorFactory>,
+{
+    let at = std::time::Instant::now();
+    // The environments on the worker pool: serially they were a third of a
+    // 163,000-transfer block's 50 ms partition phase (round 43, loop94).
+    let txs: Vec<TxEnv> = {
+        use rayon::prelude::*;
+        let recovered: Vec<_> = block.transactions_recovered().collect();
+        recovered.par_iter().map(|tx| evm_config.tx_env(*tx)).collect()
+    };
+    let env_us = at.elapsed().as_micros() as u64;
+    // Address-keyed with the fixed-bytes hasher: the default hasher was
+    // ~29 ms of a 163,000-transfer block's partition.
+    let groups: Vec<Vec<usize>> = if sender_groups {
+        let mut keys: Vec<(Address, Address)> = Vec::with_capacity(txs.len());
+        let mut refused = None;
+        for (i, tx) in txs.iter().enumerate() {
+            let alloy_primitives::TxKind::Call(to) = tx.kind else {
+                refused = Some(i);
+                break;
+            };
+            if !tx.data.is_empty() {
+                refused = Some(i);
+                break;
+            }
+            keys.push((tx.caller, to));
+        }
+        if let Some(i) = refused {
+            return (txs, Err(NotParallel::NotATransfer(i)), env_us);
+        }
+        match partition_by_sender(&keys, beneficiary) {
+            Ok(groups) => groups,
+            Err(why) => return (txs, Err(why), env_us),
+        }
+    } else {
+        let components = if partition_hash() { partition_shared(&txs, beneficiary) } else { partition(&txs, beneficiary) };
+        match components {
+            Ok((groups, _)) => groups,
+            Err(why) => return (txs, Err(why), env_us),
+        }
+    };
+    (txs, Ok(groups), env_us)
+}
+
 /// [`execute_transfers`] with the fold chosen by the caller: `graft` folds
 /// the groups' bundles with [`graft_bundles`], otherwise they are folded
 /// with [`fold_bundles`] and committed.
@@ -2425,42 +2669,62 @@ where
     G: Database + std::fmt::Debug + Send,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
+    execute_transfers_with_plan(evm_config, block, main_db, open, graft, sender_groups, None, false)
+}
+
+/// [`execute_transfers_with`] with a plan made ahead ([`plan_transfers`]) and
+/// the grafted reverts' sort beside the rest of the merge
+/// ([`follower_merge_behind`]).
+#[allow(clippy::too_many_arguments)]
+pub fn execute_transfers_with_plan<EvmConfig, DB, G>(
+    evm_config: &EvmConfig,
+    block: &RecoveredBlock<Block>,
+    main_db: DB,
+    open: &(dyn Fn() -> Option<G> + Sync),
+    graft: bool,
+    sender_groups: bool,
+    plan: Option<TransferPlan>,
+    merge_behind: bool,
+) -> Result<Result<(BlockExecutionOutput<Receipt>, Phases), NotParallel>, BlockExecutionError>
+where
+    EvmConfig: ConfigureEvm<Primitives = EthPrimitives, BlockExecutorFactory = FastExecutorFactory>,
+    DB: Database + std::fmt::Debug,
+    DB::Error: Send + Sync + 'static,
+    G: Database + std::fmt::Debug + Send,
+    G::Error: std::fmt::Display + Send + Sync + 'static,
+{
     let mut phases = Phases::default();
     let call_at = std::time::Instant::now();
     let evm_env = evm_config.evm_env(block.header()).map_err(BlockExecutionError::other)?;
     let beneficiary = evm_env.block_env.beneficiary;
 
-    // The transactions' environments, and the partition.
+    // The transactions' environments, and the partition: planned here, or
+    // taken from a plan made ahead of the execution gate
+    // (`N42_FOLLOWER_PARTITION_AHEAD=1`, [`plan_transfers`]) when that plan is
+    // this block's and was made for the same beneficiary and grouping.
     let at = std::time::Instant::now();
-    // The environments on the worker pool: serially they were a third of a
-    // 163,000-transfer block's 50 ms partition phase (round 43, loop94).
-    let txs: Vec<TxEnv> = {
-        use rayon::prelude::*;
-        let recovered: Vec<_> = block.transactions_recovered().collect();
-        recovered.par_iter().map(|tx| evm_config.tx_env(*tx)).collect()
+    let ahead = plan.filter(|plan| {
+        plan.block_hash == block.hash()
+            && plan.beneficiary == beneficiary
+            && plan.sender_groups == sender_groups
+            && plan.txs.len() == block.body().transactions.len()
+    });
+    let (txs, groups) = match ahead {
+        Some(plan) => {
+            phases.planned_ahead = true;
+            phases.ahead_env_us = plan.env_us;
+            phases.ahead_plan_us = plan.plan_us;
+            (plan.txs, plan.groups)
+        }
+        None => {
+            let (txs, groups, env_us) = plan_with(evm_config, block, beneficiary, sender_groups);
+            phases.env_us = env_us;
+            (txs, groups)
+        }
     };
-    phases.env_us = at.elapsed().as_micros() as u64;
-    // Address-keyed with the fixed-bytes hasher: the default hasher was
-    // ~29 ms of a 163,000-transfer block's partition.
-    let groups: Vec<Vec<usize>> = if sender_groups {
-        let mut keys: Vec<(Address, Address)> = Vec::with_capacity(txs.len());
-        for (i, tx) in txs.iter().enumerate() {
-            let alloy_primitives::TxKind::Call(to) = tx.kind else { return Ok(Err(NotParallel::NotATransfer(i))) };
-            if !tx.data.is_empty() {
-                return Ok(Err(NotParallel::NotATransfer(i)));
-            }
-            keys.push((tx.caller, to));
-        }
-        match partition_by_sender(&keys, beneficiary) {
-            Ok(groups) => groups,
-            Err(why) => return Ok(Err(why)),
-        }
-    } else {
-        let components = if partition_hash() { partition_shared(&txs, beneficiary) } else { partition(&txs, beneficiary) };
-        match components {
-            Ok((groups, _)) => groups,
-            Err(why) => return Ok(Err(why)),
-        }
+    let groups = match groups {
+        Ok(groups) => groups,
+        Err(why) => return Ok(Err(why)),
     };
     phases.partition_ms = at.elapsed().as_millis() as u64;
     phases.groups = groups.len();
@@ -2541,6 +2805,18 @@ where
     }
     phases.gas_us = at.elapsed().as_micros() as u64;
 
+    // `N42_FOLLOWER_MERGE_BEHIND=1`: the grafted reverts leave the staged
+    // graft now and are sorted on a thread of their own while the block's
+    // executor and the install below run; the merge collects them at its end.
+    let (staged, mut reverts_sort) = match staged {
+        Some(staged) if merge_behind => {
+            let mut staged = staged.into_inner().expect("the staged graft's lock");
+            let sort = RevertsSort::start(std::mem::take(&mut staged.reverts));
+            (Some(std::sync::Mutex::new(staged)), Some(sort))
+        }
+        staged => (staged, None),
+    };
+
     // The block's own executor: pre-execution changes (the system calls),
     // then -- with no transactions -- the post-execution changes (the
     // rewards), on the main state.
@@ -2560,8 +2836,20 @@ where
     // an account a reward reached and a transfer touched gets both.
     let at = std::time::Instant::now();
     let err = |e: &dyn std::fmt::Display| BlockExecutionError::other(std::io::Error::other(e.to_string()));
+    // The accounts whose reverts the install drops from the graft's set (see
+    // [`install_staged`]), dropped here from the set being sorted apart.
+    let mut dropped_reverts: Vec<Address> = Vec::new();
     let (mut changes, beneficiary_delta, grafted) = if let Some(staged) = staged {
         let staged = staged.into_inner().expect("the staged graft's lock");
+        if reverts_sort.is_some() {
+            dropped_reverts = state
+                .cache
+                .accounts
+                .keys()
+                .filter(|address| staged.state.get(*address).is_some_and(|account| account.info.is_some()))
+                .copied()
+                .collect();
+        }
         let grafted = install_staged(&mut state, staged, false).map_err(|e| err(&e))?;
         (revm::state::EvmState::default(), grafted.beneficiary_delta, Some(grafted.reverts))
     } else if graft {
@@ -2595,7 +2883,21 @@ where
     let mut bundle = state.take_bundle();
     let taken = at.elapsed().as_millis() as u64;
     phases.take_ms = taken - phases.graft_ms;
-    if let Some(reverts) = grafted {
+    if let Some(sort) = reverts_sort.take() {
+        let wait_at = std::time::Instant::now();
+        let (mut reverts, sort_us) = sort.finish().map_err(|e| err(&e))?;
+        phases.reverts_wait_us = wait_at.elapsed().as_micros() as u64;
+        phases.reverts_sort_us = sort_us;
+        if !dropped_reverts.is_empty() {
+            reverts.retain(|(address, _)| !dropped_reverts.contains(address));
+        }
+        // The install's own set is empty here: its reverts were taken above.
+        if let Some(rest) = grafted.filter(|rest| !rest.is_empty()) {
+            reverts.extend(rest);
+            sort_reverts(&mut reverts);
+        }
+        append_sorted_reverts(&mut bundle, reverts);
+    } else if let Some(reverts) = grafted {
         append_reverts(&mut bundle, reverts);
     }
     phases.merge_ms = at.elapsed().as_millis() as u64;
@@ -2779,13 +3081,72 @@ mod tests {
         parallel_matches_serial_with(false, true);
     }
 
+    #[test]
+    fn parallel_matches_serial_planned_ahead_and_merged_behind() {
+        for (graft, sender_groups) in [(true, false), (true, true), (false, false)] {
+            parallel_matches_serial_planned(graft, sender_groups, true, true);
+            parallel_matches_serial_planned(graft, sender_groups, true, false);
+            parallel_matches_serial_planned(graft, sender_groups, false, true);
+        }
+    }
+
+    #[test]
+    fn the_indexed_reverts_sort_matches_the_plain_one() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let reverts: Vec<(Address, AccountRevert)> = (0..20_000u64)
+            .map(|i| {
+                let mut a = [0u8; 20];
+                a[..8].copy_from_slice(&next().to_be_bytes());
+                a[12..].copy_from_slice(&i.to_be_bytes());
+                let revert = AccountRevert {
+                    account: revm::database::states::reverts::AccountInfoRevert::RevertTo(AccountInfo {
+                        nonce: i,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                (Address::from(a), revert)
+            })
+            .collect();
+        let mut plain = reverts.clone();
+        sort_reverts(&mut plain);
+        let mut indexed = reverts;
+        sort_reverts_indexed(&mut indexed);
+        assert_eq!(plain, indexed);
+    }
+
     fn parallel_matches_serial_with(graft: bool, sender_groups: bool) {
+        parallel_matches_serial_planned(graft, sender_groups, false, false);
+    }
+
+    fn parallel_matches_serial_planned(graft: bool, sender_groups: bool, ahead: bool, merge_behind: bool) {
         let (block, db) = fixture(8, 6);
         let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
         let serial = evm_config.executor(db.clone()).execute(&block).expect("serial execution");
-        let (parallel, phases) = execute_transfers_with(&evm_config, &block, db.clone(), &|| Some(db.clone()), graft, sender_groups)
-            .expect("no execution error")
-            .expect("the block qualifies");
+        // A plan made the way the follower makes it ahead; used only when its
+        // grouping is the one asked for.
+        let plan = ahead.then(|| plan_transfers(&evm_config, &block).expect("a plan"));
+        let (parallel, phases) = execute_transfers_with_plan(
+            &evm_config,
+            &block,
+            db.clone(),
+            &|| Some(db.clone()),
+            graft,
+            sender_groups,
+            plan,
+            merge_behind,
+        )
+        .expect("no execution error")
+        .expect("the block qualifies");
+        if ahead {
+            assert_eq!(phases.planned_ahead, sender_groups == follower_sender_groups(), "the plan used when it fits");
+        }
         assert!(phases.groups >= 1);
         assert_eq!(parallel.result.gas_used, serial.result.gas_used, "gas used");
         assert_eq!(parallel.result.receipts, serial.result.receipts, "receipts");

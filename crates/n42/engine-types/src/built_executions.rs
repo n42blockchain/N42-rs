@@ -391,3 +391,28 @@ pub fn find_sealed(sealed_hash: B256) -> Option<SealedBlock<Block>> {
     let store = sealed_store().lock().unwrap_or_else(|p| p.into_inner());
     store.iter().find(|(hash, _)| *hash == sealed_hash).map(|(_, block)| block.clone())
 }
+
+/// [`find_sealed`] for a caller whose payload carries `transactions` in full:
+/// with `N42_ENGINE_TAKE_SEALED=1`, a remembered block of that many
+/// transactions is moved out of the store instead of copied (14 ms and 3 more
+/// to free the copy at 163,000 transactions, `bench_vote_road_copies`), since
+/// a repeat of the same payload can decode its own list. A payload with no
+/// list (the header-only own block) or a different count gets the copy, as
+/// before; so does every caller with the flag off.
+pub fn find_or_take_sealed(sealed_hash: B256, transactions: usize) -> Option<SealedBlock<Block>> {
+    if !take_sealed_enabled() || transactions == 0 {
+        return find_sealed(sealed_hash);
+    }
+    let mut store = sealed_store().lock().unwrap_or_else(|p| p.into_inner());
+    let at = store.iter().position(|(hash, _)| *hash == sealed_hash)?;
+    if store[at].1.body().transactions.len() != transactions {
+        return Some(store[at].1.clone());
+    }
+    store.remove(at).map(|(_, block)| block)
+}
+
+/// Whether `N42_ENGINE_TAKE_SEALED=1` is set; see [`find_or_take_sealed`].
+pub fn take_sealed_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_ENGINE_TAKE_SEALED").is_ok_and(|v| v == "1"))
+}

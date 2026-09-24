@@ -1177,7 +1177,7 @@ where
     Evm: ConfigureEvm<
         Primitives = EthPrimitives,
         BlockExecutorFactory = n42_engine_types::parallel_transfer::FastExecutorFactory,
-    >,
+    > + 'static,
     ChainSpec: reth_chainspec::EthereumHardforks + reth_chainspec::EthChainSpec,
 {
     let qmdb = qmdb.ok_or("no QMDB state: the direct import needs the chain's root")?;
@@ -1377,6 +1377,28 @@ where
     let cache_hits = cache_hits_out.load(std::sync::atomic::Ordering::Relaxed);
     phases.senders_us = senders_at.elapsed().as_micros() as u64;
     let senders_ms = phases.senders_us / 1000;
+    // Shared from here on: the executed block hands the engine this same
+    // `Arc`, and a plan made ahead of the execution holds it meanwhile.
+    let recovered = Arc::new(recovered);
+
+    // `N42_FOLLOWER_PARTITION_AHEAD=1`: the block's senders are known from
+    // this point (the compact body's assembly read them out of the queue),
+    // so its transfers' environments and partition are made now, on the
+    // worker pool, beside the wait for the parent and the includability
+    // check, instead of inside the execution gate (19 ms of a 122 ms gated
+    // execution at 163,000 transfers, loop234). The execution takes the plan
+    // just before the gate; one it cannot use is planned again there.
+    let plan_ahead = (follower_parallel() && n42_engine_types::parallel_transfer::follower_partition_ahead()).then(|| {
+        let (planned, plan) = std::sync::mpsc::sync_channel(1);
+        let block = Arc::clone(&recovered);
+        let evm_config = evm_config.clone();
+        rayon::spawn(move || {
+            let made = n42_engine_types::parallel_transfer::plan_transfers(&evm_config, &block);
+            drop(block);
+            let _ = planned.send(made);
+        });
+        plan
+    });
 
     // The parent: in, and under deferred execution executed here, since the
     // header's fields are checked against its result and the transactions
@@ -1533,6 +1555,18 @@ where
         // returns -- before the block's QMDB root, its hashed post-state and
         // its engine insert, which are meant to run beside the next block's
         // execution.
+        // The plan made ahead, collected before the gate so that a plan
+        // still running never holds another block's execution.
+        let ahead_at = std::time::Instant::now();
+        let plan = plan_ahead.as_ref().and_then(|plan| match plan.recv() {
+            Ok(Ok(plan)) => Some(plan),
+            Ok(Err(err)) => {
+                tracing::debug!(target: "n42.follower_import", number, %err, "the plan made ahead failed; planning in the execution");
+                None
+            }
+            Err(_) => None,
+        });
+        let ahead_wait_us = ahead_at.elapsed().as_micros() as u64;
         let gate_at = std::time::Instant::now();
         let _gate = exec_gate();
         let gate_ms = gate_at.elapsed().as_millis() as u64;
@@ -1580,11 +1614,12 @@ where
                     .ok()
                     .map(|s| n42_engine_types::fast_transfer::doors::CountedDb::new(StateProviderDatabase::new(s)))
             };
-            match n42_engine_types::parallel_transfer::execute_transfers(
+            match n42_engine_types::parallel_transfer::execute_transfers_planned(
                 evm_config,
                 &recovered,
                 cached.as_db_mut(StateProviderDatabase::new(&state)),
                 &open,
+                plan,
             )
             .map_err(|err| format!("parallel execution: {err}"))?
             {
@@ -1641,6 +1676,22 @@ where
                         reads_cache = phases.transfer_timers.reads_cache(),
                         reads_provider = phases.transfer_timers.reads_provider,
                         reads_view = phases.transfer_timers.reads_view,
+                        // Of `merge_ms`: the install of the staged graft, the
+                        // state's merge and take, and the reverts' append.
+                        graft_ms = phases.graft_ms,
+                        take_ms = phases.take_ms,
+                        reverts_ms = phases.reverts_ms,
+                        // `N42_FOLLOWER_PARTITION_AHEAD=1`: whether the plan
+                        // made ahead was used, what it cost off the gate, and
+                        // how long the execution waited for it.
+                        planned_ahead = phases.planned_ahead,
+                        ahead_plan_ms = phases.ahead_plan_us / 1000,
+                        ahead_env_ms = phases.ahead_env_us / 1000,
+                        ahead_wait_ms = ahead_wait_us / 1000,
+                        // `N42_FOLLOWER_MERGE_BEHIND=1`: the reverts' sort on
+                        // its own thread, and the merge's wait for it.
+                        reverts_sort_ms = phases.reverts_sort_us / 1000,
+                        reverts_wait_ms = phases.reverts_wait_us / 1000,
                         "parallel import phases"
                     );
                     output = Some(out);
@@ -1863,7 +1914,7 @@ where
 
     Ok((
         Box::new(BuiltPayloadExecutedBlock {
-            recovered_block: Arc::new(recovered),
+            recovered_block: recovered,
             execution_output,
             hashed_state: Arc::new(hashed_state),
             trie_updates: Arc::new(TrieUpdates::default()),

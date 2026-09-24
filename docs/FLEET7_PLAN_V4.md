@@ -1839,3 +1839,38 @@ full parallel step's worth of skipped work on a chained build).
 
 Also seen on the way: `canonical blocks pruned from the queue ... prune_ms=82-114` on every node at every block --
 ~100 ms of queue pruning a block, whose thread and lock are worth knowing before the follower's road is tuned.
+
+### 6.15 F1 on the fleet (loop238): the follower's gate 105 -> 95 and the engine 46 -> 25, and the cycle does not move
+
+`plan-v6/follower-import` (merged fe8fe0c14): the partition and the environments planned on the road
+(`N42_FOLLOWER_PARTITION_AHEAD=1`), the reverts sorted on their own thread beside the finish
+(`N42_FOLLOWER_MERGE_BEHIND=1`), the remembered block moved into the engine instead of copied
+(`N42_ENGINE_TAKE_SEALED=1`; the transaction-list copy removed for everyone).
+
+| leg | win1 | win2 | gated exec (part+env+groups+merge) | reverts wait | engine | root | import total | cycle | B |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| warm (G2+G3) | **752,708** | 659,515 | 105 = 13+6+70+12 | -- | 46 (remember 16, new_payload 22) | 49 | 224 | 198 | 77 |
+| F175 | 721,036 | 680,871 | 95 = 0+0+69+18 | 15 | 27 (11, 6) | 49 | 214 | 196 | 81 |
+| F150 | 466,908 (defect 15) | 716,584 | 93 = 0+0+68+18 | 15 | 22 | 55 | 229 | 186 | 80 |
+| B128 (`N42_ED25519_BATCH=128`) | 731,256 | 653,018 | 101 | -- | 47 | 46 | 214 | 195 | 74 | 
+
+Parts 1 and 3 did what they were sized to do: the partition and the environments are gone from the gate
+(19 -> 0, `ahead_wait_ms` 3-4, the plan is ready when the gate opens) and the engine's 46 is 22-27 (the list copy
+and the block copy). Part 2 is negative: the reverts sorted on a separate thread are *waited for* (`reverts_wait_ms`
+15) and `merge_ms` reads 18 against 12 inline -- the sort does not overlap the finish, it contends with it; the
+flag stays off. Net, the gated execution is 105 -> 95 and the import 224 -> 214, and the fleet's cycle is 196
+against 198 and win1 721k against 752k (noise; warm's 752,708 is the campaign's best window). The follower's
+import was not what the cycle was made of at pacing 175, as 6.11 said: it is the leader's period (172-176 + the
+hand-off) and the supply (736-744k/s; p10 blocks 142-161k).
+
+`N42_ED25519_BATCH=128` is void: `busy_us_per_tx` stayed 12 and the leg had **11 invalid blocks** and 45 short
+builds -- the larger batch breaks something in the verification path (not read further; the default stays 64).
+
+Where the campaign stands after plan v6's attempts G2, G3, seal-gap, F1: the four-node fleet reads 720-753k on
+window 1 at a ~196 ms cycle with 96-97% occupancy, up from 690-735k at 220 ms when plan v6 began. Every term is
+now known to the millisecond, and the two that bind are the supply (the flood's reply-bound 740k/s against the
+ingest and the road sharing the queue's lock, 6.12) and the leader's period (par_start 19, pull+prep 33, state
+wait 22, exec 69, 6.13). The next attempts, in order: **Q1** -- the queue's lock (ingest inserts, the road's
+assembly and the ~100 ms per-block prune all under it): shard it by sender so `--conc 128` fills the blocks without
+B growing; **G proper** -- the graft insert sharded on the pool (state wait 22 -> 0 and the follower's merge);
+**I** -- the next run pulled and prepped during the parent's fold; and par_start's 19 ms, named.

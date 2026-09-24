@@ -1745,3 +1745,44 @@ env 8, groups 68, merge 18, receipts 6) = 170-197**, which is the cycle. The roo
 road only just: when it spikes (block 415, 103 ms) the next vote waits on it (`two roads` vote_ms 76). The
 follower's terms of the 1M plan are therefore the execution's partition and merge (37 of 122, both derivable from
 the queue and the groups the way the leader's are) and the road's transactions root beside its assembly.
+
+### 6.12 The supply's knobs (loop236): more concurrency slows the followers' road, and the ceiling at four nodes is the node's CPU
+
+G2+G3 at 56 cores, pacing 175; the flood at `--conc 64` / 12 recovery slots is the warm leg.
+
+| leg | win1 | win2 | flood win1 (k/s) | reply ms | acq us/frame | slots busy | txs p10 | cycle (full) | B | D |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| warm | 705,820 | 351,184 (stall) | 740 | 224-242 | 28,261 | 68% | 157,000 | 198 | 77 | 90 |
+| C128 (`--conc 128`) | 569,393 | 619,371 | 628 | 538-603 | 51,279 | 62% | 163,000 | 252 | **167** | 64 |
+| C128S20 (+20 slots) | 613,878 | 592,125 | 615 | 537-587 | 32,654 | 38% | 163,000 | 260 | **167** | 70 |
+| S20 (20 slots) | 559,796 (flood stall) | 717,626 | -- | -- | 18,177 | 42% | 163,000 | 200 | 87 | 87 |
+
+Falsified, and instructively. Doubling the flood's concurrency filled every block (p10 163,000) and *lowered* the
+flood's rate (740 -> 628k/s, replies 240 -> 570 ms) while the follower's road B went from 77 to 167 ms and the
+cycle from 198 to 252-260: the ingest's work (12 us a transaction, verified on every node) is on the same cores as
+the road's assembly and the execution, and more of it in flight is less chain. Twenty slots alone did not change
+the rate (the flood is reply-bound at 64 in flight, 45 ms a reply, ~710-740k/s) and its window 1 fell to a
+fleet-wide 7 s stall at 25-40 s (replies of 6.9-7.5 s on every node, `engine_idles_over_5s` 3; the same stall took
+F48b in 6.11 and the warm leg's window 2 here) -- the memory-reclaim stall of round 43, still with us.
+
+(The huge-page pool was 47-66 GB at every leg's start today by the bench's own `hugeprep:` line; the `order9+`
+count in the `memory :` line undercounts it because order-10 blocks are 4 MB. Today's legs are comparable.)
+
+**Where this leaves the four-node ceiling.** At a 200 ms cycle each node ingests and verifies 815k tx/s
+(~10 cores of the node's 28 physical), the follower imports a block in 207-225 ms (execution 122 gated one at a
+time, the QMDB root 47-75 and the engine insert 46 beside the next execution) on the same cores, and the leader
+builds in ~180 (16 threads for ~70 ms, the fold behind). The cycle is stable at 175 pacing and not at 150, because
+the follower's import (207+) is longer than the cycle it must keep up with, and the supply at ~740k/s cannot fill
+163k blocks faster than every 220 ms. Three things follow, in order:
+
+1. **the follower's import must go under the cycle**: partition (19) and merge (18) out of the gated execution
+   (both derivable from the queue's lanes and the groups, the way the leader's are), and the engine insert (46) --
+   what it copies for a 147k-account block, and whether the executed block can carry the bundle by `Arc` --
+   attempt **F1**;
+2. **the leader's period** has the 39 ms gap before the ahead seal (6.11's last paragraph; `plan-v6/seal-gap`
+   in flight) -- with it the build ends at ~140 and pacing 150 is a leader-side possibility;
+3. **the supply** is CPU: verification on every node is the largest per-transaction term the fleet pays four
+   times over (12 us x 4 nodes x 1M/s = 48 cores of the box's 128). A probe leg with `N42_INGEST_VERIFY=leader`
+   (followers accept the leader's frame claims; not adoptable as is -- 5.x's "verify on the road" was a
+   relocation) says how much of the follower's B and import is that contention; if it is most of it, the design
+   question for 1M on this box is where signatures are verified, not how fast.

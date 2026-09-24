@@ -703,6 +703,80 @@ fn refuse_stale_parent() -> bool {
     *ON.get_or_init(|| std::env::var("N42_BUILD_REFUSE_STALE_PARENT").is_ok_and(|v| v == "1"))
 }
 
+/// `N42_BUILD_DECLINE_EMPTY_STEP=0` turns off [`after_parallel_step`] (the
+/// serial loop always runs); on by default.
+fn decline_empty_step() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_BUILD_DECLINE_EMPTY_STEP").map_or(true, |v| v != "0"))
+}
+
+/// The fewest skipped candidates that make an empty parallel step a verdict
+/// on the build rather than a shallow queue.
+const DECLINE_MIN_SKIPPED: usize = 1000;
+
+/// What a build does after a parallel step that skipped much of what it was
+/// offered (defect 15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterParallelStep {
+    /// The serial loop runs as it always did.
+    Serial,
+    /// The serial loop is not entered: the block is finished with what the
+    /// parallel step built, the skipped candidates go back to the queue.
+    Finish(&'static str),
+    /// The build answers `Aborted` at once, everything taken given back.
+    Decline(&'static str),
+}
+
+/// [`after_parallel_step`] under `N42_BUILD_DECLINE_EMPTY_STEP`.
+fn after_parallel_step_now(
+    par_txs: u64,
+    par_skipped: usize,
+    par_budget: usize,
+    direct: bool,
+    height_decided: bool,
+) -> AfterParallelStep {
+    after_parallel_step(decline_empty_step(), par_txs, par_skipped, par_budget, direct, height_decided)
+}
+
+/// Whether the serial loop may take over what the parallel step skipped.
+///
+/// It re-executes every skipped candidate one at a time (~55 us each), and
+/// on loop237 it did exactly that for the whole skipped set every time:
+/// `fast == par_skipped` on all twelve builds with `loop_ms` over a second,
+/// 9.0-10.6 s where the step built nothing or 6-8k of a block. A skip that
+/// large says the step's view of the parent is wrong, not the queue.
+///
+/// `par_budget` is what the step asked the queue for (a block's worth at its
+/// start), `direct` a build on an own block from its own post-state
+/// (`direct_build`: the build ahead on the sealed block, the chain), and
+/// `height_decided` whether the chain has committed a block at this height,
+/// i.e. the parent is no longer the head. The ordinary build (`try_build`:
+/// not direct, height open) always keeps its serial loop -- it is the path
+/// the consensus client falls back to when a direct build declines.
+fn after_parallel_step(
+    enabled: bool,
+    par_txs: u64,
+    par_skipped: usize,
+    par_budget: usize,
+    direct: bool,
+    height_decided: bool,
+) -> AfterParallelStep {
+    if !enabled || par_skipped < DECLINE_MIN_SKIPPED {
+        return AfterParallelStep::Serial;
+    }
+    if height_decided {
+        return AfterParallelStep::Decline("the height is decided; the parent is no longer the head");
+    }
+    // Half a block or more skipped on a build on an own block.
+    if direct && par_budget > 0 && par_skipped.saturating_mul(2) >= par_budget {
+        if par_txs == 0 {
+            return AfterParallelStep::Decline("a build on an own block executed nothing of a block's worth");
+        }
+        return AfterParallelStep::Finish("a build on an own block skipped most of a block's worth");
+    }
+    AfterParallelStep::Serial
+}
+
 /// Whether a build for a height the chain has already committed is
 /// cancelled before it takes anything from the queue;
 /// `N42_BUILD_SKIP_DECIDED=0` turns it off.
@@ -1138,6 +1212,9 @@ where
     let mut par_groups = 0usize;
     let mut par_batches = 0usize;
     let mut par_skipped = 0usize;
+    // The candidates the parallel step asked the queue for: a block's worth
+    // at the step's start (`budget` there), 0 when the step did not run.
+    let mut par_budget = 0usize;
     let mut par_pull_ms = 0u64;
     let mut par_part_ms = 0u64;
     let mut par_exec_ms = 0u64;
@@ -1335,6 +1412,7 @@ where
         let par_at = std::time::Instant::now();
         par_start_ms = build_started.elapsed().as_millis() as u64;
         let budget = (block_gas_limit.saturating_sub(cumulative_gas_used) / MIN_TRANSACTION_GAS) as usize;
+        par_budget = budget;
         let mut cands: Vec<Arc<reth_transaction_pool::ValidPoolTransaction<Pool::Transaction>>> =
             Vec::with_capacity(budget.min(262_144));
         // `N42_BUILD_PREFETCH=1`: each batch the puller hands over has its
@@ -2378,6 +2456,52 @@ where
             "receipts were built for an early seal that did not happen",
         )));
     }
+    // A parallel step that skipped a block's worth, on a build whose view is
+    // suspect, never hands it to the serial loop (defect 15). loop237 (three
+    // legs of four, the new leader's build ahead on its own first block of a
+    // tenure): the step skipped all 163,000 candidates as gapped, and the
+    // serial loop then executed 163,000 transfers one at a time -- 9.0 s
+    // (`fast=163000 loop_ms=9025`) while the payload service, the next
+    // view's forkchoice and the ingest gate waited on it and the followers
+    // timed the view out. A build that built nothing declines, everything
+    // taken given back: a build on an own block lets the consensus client
+    // build the ordinary way on the imported parent, and a decided height
+    // asks for nothing at all. `Aborted`, never `Cancelled` (defect 14). A
+    // build that built some of it finishes with that and gives the rest back.
+    let height_decided = crate::canonical_head::already_decided(header.number);
+    let after_step = after_parallel_step_now(par_txs, par_skipped, par_budget, parent_state.is_some(), height_decided);
+    let serial_closed = after_step != AfterParallelStep::Serial;
+    if let AfterParallelStep::Finish(why) | AfterParallelStep::Decline(why) = after_step {
+        tracing::info!(
+            target: "payload_builder",
+            number = header.number,
+            parent = %parent_header.hash(),
+            head = crate::canonical_head::number(),
+            par_txs,
+            par_skipped,
+            par_budget,
+            par_groups,
+            direct = parent_state.is_some(),
+            declined = matches!(after_step, AfterParallelStep::Decline(_)),
+            why,
+            "a parallel step skipped a block's worth; the serial loop is not entered"
+        );
+    }
+    if matches!(after_step, AfterParallelStep::Decline(_)) {
+        for pool_tx in lookahead.into_iter().rev() {
+            refuse!(
+                &pool_tx,
+                InvalidPoolTransactionError::ExceedsGasLimit(pool_tx.gas_limit(), block_gas_limit)
+            );
+        }
+        for pool_tx in deferred.into_iter().rev() {
+            let err = deferred_refusal!(skipped_heads, pool_tx);
+            refuse!(&pool_tx, err);
+        }
+        drop(pulled.take());
+        drop(builder);
+        return Ok(BuildOutcome::Aborted { fees: U256::ZERO, cached_reads });
+    }
 
     loop {
         // Once the block cannot fit even the smallest transaction there is
@@ -2385,7 +2509,9 @@ where
         // refused, one refusal per queued sender -- thousands of them at the
         // end of every full block (round 37). Checked before taking, so that
         // nothing is taken from the queue and left neither built nor returned.
-        if block_gas_limit.saturating_sub(cumulative_gas_used) < MIN_TRANSACTION_GAS {
+        // Closed as well after a parallel step that skipped a block's worth
+        // (`AfterParallelStep::Finish`): what was taken goes back below.
+        if serial_closed || block_gas_limit.saturating_sub(cumulative_gas_used) < MIN_TRANSACTION_GAS {
             break;
         }
         // The pool/execution split is timed with the cycle counter, not the
@@ -3233,6 +3359,52 @@ fn ticks() -> u64 {
     {
         static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
         START.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
+    }
+}
+
+#[cfg(test)]
+mod empty_step_tests {
+    use super::{after_parallel_step, AfterParallelStep};
+
+    fn verdict(par_txs: u64, par_skipped: usize, direct: bool, decided: bool) -> AfterParallelStep {
+        after_parallel_step(true, par_txs, par_skipped, 163_000, direct, decided)
+    }
+
+    #[test]
+    fn a_direct_build_that_built_nothing_of_a_block_declines() {
+        // loop237 warm/G175 node1: the build ahead on the sealed block, 163,000 of 163,000 skipped.
+        assert!(matches!(verdict(0, 163_000, true, false), AfterParallelStep::Decline(_)));
+    }
+
+    #[test]
+    fn a_direct_build_that_skipped_most_of_a_block_finishes_without_the_serial_loop() {
+        // loop237 G175b node1 (6,144 built, 156,856 skipped) and G175 node3 (7,916 / 155,084).
+        assert!(matches!(verdict(6_144, 156_856, true, false), AfterParallelStep::Finish(_)));
+        assert!(matches!(verdict(7_916, 155_084, true, false), AfterParallelStep::Finish(_)));
+    }
+
+    #[test]
+    fn a_decided_height_declines_on_any_path() {
+        assert!(matches!(verdict(0, 163_000, false, true), AfterParallelStep::Decline(_)));
+        assert!(matches!(verdict(120_000, 5_000, false, true), AfterParallelStep::Decline(_)));
+    }
+
+    #[test]
+    fn the_ordinary_build_on_an_open_height_keeps_its_serial_loop() {
+        // The first build of a tenure (`try_build`), and the fallback of a declined direct build.
+        assert_eq!(verdict(0, 163_000, false, false), AfterParallelStep::Serial);
+    }
+
+    #[test]
+    fn a_minority_skip_keeps_the_serial_loop() {
+        // loop237 G150: 131,640 built, 31,360 skipped.
+        assert_eq!(verdict(131_640, 31_360, true, false), AfterParallelStep::Serial);
+        assert_eq!(verdict(0, 999, true, true), AfterParallelStep::Serial);
+    }
+
+    #[test]
+    fn the_switch_turns_it_off() {
+        assert_eq!(after_parallel_step(false, 0, 163_000, 163_000, true, true), AfterParallelStep::Serial);
     }
 }
 

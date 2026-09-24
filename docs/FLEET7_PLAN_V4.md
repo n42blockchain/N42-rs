@@ -1818,3 +1818,24 @@ What the leader's period is made of now, and what each term needs: par_start 19 
 during the parent's fold), state_wait 22 (the parent's graft insert, 40 of the fold's 76, single-threaded: attempt
 G proper, a sharded insert on the pool -- it also shortens the follower's merge 18), exec 69 (the reads, 6.6), the
 rest 30. The follower's import (207-229) is F1, in flight.
+
+### 6.14 The window-1 stall, read (loop237): a stale build at the tenure handover grinds 163,000 transfers serially (defect 15)
+
+A Sonnet pass over the three stalled legs and the one that did not: every stall is the same transition, the new
+leader's second block after the handover (256 -> 257, node1), 8.7-9.0 s long, with the leader silent and the
+followers timing the view out at +5.9 s; memory is not it (MemFree 55-69 GB throughout, `compact_stall` flat, the
+execution layers' RSS *falls* 11 GB as the stalled build's allocations are freed). The leader's own log then says
+what it did for 9 s: block 256 was built by the ordinary path (`leader build path view=256 ahead=false build_ms=299`)
+and sealed; a build-ahead request on the *old* parent 255 arrived 3 ms after the chained one on 256 and was
+declared stale -- but a build on parent 255 for height 256 ran anyway: its parallel step skipped all 163,000
+candidates (their lanes "looked gapped" because block 256 had just mined them), and the build fell into the
+serial loop, which pulled afresh and executed 163,000 transfers one at a time (`fast=163000`, 55 us each: 9.2 s,
+`build_ms=9216`), holding the payload service while view 257's forkchoice waited 9 s (`fcu_ms=9051`) and the
+ingest gate closed on a pool over its limit. In G150 the same transition took 0.8 s. The window-1 numbers of
+three legs in 6.13 (548-555k) are this defect, not the configuration; **defect 15**, fixed on
+`plan-v6/stale-build-serial` (a build whose parallel step skipped everything it was offered declines with
+`Aborted` when its parent is no longer the head or its height is decided; the serial loop is never entered with a
+full parallel step's worth of skipped work on a chained build).
+
+Also seen on the way: `canonical blocks pruned from the queue ... prune_ms=82-114` on every node at every block --
+~100 ms of queue pruning a block, whose thread and lock are worth knowing before the follower's road is tuned.

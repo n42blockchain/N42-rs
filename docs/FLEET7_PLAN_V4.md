@@ -1710,3 +1710,38 @@ the block after (the root) and by persistence (the insert). Attempt **E2**: the 
 the execution of n+1 (`bin/n42/src/follower_import.rs`, `root_wait_ms` / `parent_engine_wait_ms` already gate the
 cases where the next block needs them), so the import's serial term is the execution, ~122. That is the follower's
 term of the 1M plan: 163k at a 160 ms cycle needs the import under 160.
+
+### 6.11 The flood's core budget (loop235) and the follower's real chain: neither the cores nor the root and insert
+
+| leg | win1 | win2 | sealed_at | cycle (full) | E | txs/block p10 | flood win1 (k/s) | sign thread-s/s | TCs |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| warm (56 cores, G2+G3) | 722,585 | 504,360 | 224 | 220 | 35 | 163,000 | 704-739 | 15 | 2 |
+| F48a (48, G2+G3) | 719,410 | 647,441 | 187 | 209 | 11 | 152,500 | 667-733 | 12 | 3 |
+| R48 (48, no G2/G3) | 689,987 | 179,293 (stall) | 226 | 229 | 43 | 163,000 | 660-719 | 12 | 7, 1 invalid block |
+| F48b (48, G2+G3) | 549,315 | 280,757 | 185 | 203 | 11 | 144,000 | 0-96 (!) | 5 | 4 |
+
+(The warm leg ran without the G2/G3 flags by the runner's construction; it is the R at 56.) Falsified twice over:
+the flood signed *less* with 32 cores than with 16 (12 and 5 thread-seconds a second against 15), so it was never
+core-bound, and the 48-core nodes were slower (R48's cycle 229 against 220, E 43 against 35, seven TCs and one
+invalid block: "the QMDB reader did not answer slot", a read-view timeout under the tighter budget, seen once and
+noted). F48b's flood hardly sent at all in window 1 (its log shows 0-96k/s and an empty reply vector: the flood
+itself stalled, 79 builds short) -- a void leg.
+
+What the flood *is* bound by is its replies: 64 requests of 500 transactions in flight (`--conc 64 --rpcbatch 500`)
+at ~45 ms a reply is ~710k/s, and every leg reads 660-740k/s in window 1 whatever the cores. On the node the
+ingest's line says where the 45 ms go: `acq_us_per_frame` 25,000 (a frame waits 25 ms for one of the 12 recovery
+slots, `slots_busy_pct` 70), `gate_us_per_frame` 10,500, `recover_ms_per_frame` 6 (12 us a transaction). So the
+supply's knobs are the flood's concurrency and the ingest's slot count, not cores: loop236 runs G2+G3 at 56 cores
+with `--conc 128`, with 20 slots, and with both. Falsified if the flood's window-1 rate does not pass 800k/s, or if
+it does and the blocks are still short (p10 under 163,000) or win1 stays under 780k.
+
+**The follower's chain, read from P175's logs** (a Sonnet pass over node2, window 1, n=143 full blocks): the vote
+on n+1 needs only n's execution *fields* (the state root the QMDB root job files, checked by
+`wait_for_parent_fields`), not n's engine insert; n+1's execution is gated on n's by `EXEC_GATE` while n's root and
+insert run beside it (`root_wait_ms` and `parent_engine_wait_ms` medians 0). So the root (47, spikes to 103) and the
+insert (46) are already off the chain, and 6.10's E2 is moot. The chain per cycle is **the road (65-75: assemble
+18, the transactions root over the assembled body 24, copy 10, check 7) + the execution (104-122: partition 19,
+env 8, groups 68, merge 18, receipts 6) = 170-197**, which is the cycle. The root is hidden under the next block's
+road only just: when it spikes (block 415, 103 ms) the next vote waits on it (`two roads` vote_ms 76). The
+follower's terms of the 1M plan are therefore the execution's partition and merge (37 of 122, both derivable from
+the queue and the groups the way the leader's are) and the road's transactions root beside its assembly.

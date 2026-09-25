@@ -2114,3 +2114,26 @@ Two levers, one taken now: the pool's limit (loop245 runs three nodes with `F7_B
 gate does not close under an 880k/s supply that the chain consumes at ~860k/s), and the peer fetch, which should
 not take seconds for 900 transactions (a code path to read if the gate holds persist). A taller view timeout would
 mask the same thing at the cost of every real fault. `F7_STRAGGLER_GRACE_MS` is not involved (a pre-vote stall).
+
+### 7.3 Three nodes with a 1,000,000-slot pool at pacing 175 / 150 / 125 (loop245): 904,491 on a window, and still no round
+
+| leg | pacing | win1 | win2 | occupancy | cycle (dissected) | B | D | import | sealed_at | flood win1 | gate holds | peer fetch | TCs |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| warm | 175 | 787,804 | **820,385** | 100% | 190 | 69 | 101 | 138 | 131 | 650k/s | 18 | 0 | 14 |
+| P150 | 150 | 336,854 (10 s stall) | 478,064 | 95% | 167 | 73 | 71 | 152 | 135 | 326k/s | 32 | 0 | 26 |
+| P125 | 125 | **904,491** | 367,972 | 99% | **164** | **123** | 12 | **172** | 136 | 888k/s | 22 | 0 | 12 |
+| P150b | 150 | 380,919 | 409,855 | 99% | 167 | 63.5 | 81 | 154 | 134 | 246k/s | 21 | 0 | 11 |
+
+The bigger pool removed the peer fetches (0 in every leg, from up to 5.8 s) and the warm leg held two full
+windows for the first time on three nodes (788k / 820k). At pacing 125 window 1 reads **904,491 at a 164 ms cycle
+with 99% occupancy -- the campaign's best window by 8%** -- and the shape says where it stops: B is 123 (against
+66-73) because the follower's import grew to 172 ms, longer than the cycle it must keep up with, so the followers
+fall behind and their votes arrive late; at pacing 150 the legs stalled for 10 s inside window 1 (the same
+early stall as 6.3's, on three nodes now with no spare vote). TCs are 11-26 a leg with gate holds 18-32, and the
+two no longer correlate one to one (no fetch follows a hold). The logs of the first TCs are being read.
+
+What 1M needs from three nodes, in numbers: a cycle of 163 ms at 163k with the follower's import under it. At
+pacing 125 the leader seals at 136 and the road is 67, so the cycle would be ~150 if the followers kept up; the
+follower's import at that pace is 172 (136 at 190 ms), so it is the follower's pipeline -- the gated execution
+(6.15: 95 of it) and what contends with it when blocks come every 164 ms -- that has to lose ~20-30 ms, or the
+straggler must not cost a view (a fourth node with a 3-of-4 quorum has the vote to spare but not the cores).

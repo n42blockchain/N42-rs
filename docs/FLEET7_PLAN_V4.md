@@ -2415,3 +2415,16 @@ its AVX2 / AVX-512 one. That is the 5% lever at the least risk, and loop254 runs
 the node, the validator and the flood; generic control). Batch 256 is 10.2 us against 13.0 in sigbench (21%) but
 defect 16 (batch 128 -> state-root disagreements) must be read first. `ed25519-zebra` is unevaluated. Anything
 past ~25% is verification paid once fleet-wide -- a protocol change, not a knob.
+
+**18b, corrected from the code and the logs** (`plan-v6/tenure-first-build`, d632e0bf1, not yet merged): the parent
+lands in the new leader's engine ~60 ms after the first `Syncing`; what takes 5-9 s is the payload job the next
+`forkchoiceUpdated` starts -- its first build finishes in 0.7 s and then `getPayload` hangs until it returns
+"no payload build for id" 5.1-9.0 s later (`engine service loop ... idle_before_ms` 5516-9057), the payload-job /
+persistence stall of loop161. So it is a stuck payload job at the handover, not the import backlog; the follower's
+import over the cycle is real but is not what the TC is made of. The fix avoids the job altogether: with
+`N42_TENURE_FIRST_ON_OUTPUT=1` (validator and execution layer both) the tenure's first build goes through the
+chained path on the parent's *published* output -- the follower's outputs are filed in `PARENT_OUTPUTS` /
+`executed_fields` under the sealed hash, not in `built_executions`, so a new opener (`opener_on_published_parent`)
+reads them, the parent's transactions leave the queue from its bundle, and the forkchoice build stays as the
+fallback. To be run after loop254; the stuck job itself (why `getPayload` hangs at a handover) still owes a
+reading.

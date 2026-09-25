@@ -2275,3 +2275,17 @@ at the median, holes 5-9 a leg -- **the chain is supply-bound at 900k**. At 950k
 at ~925k from either side, 4% under 1M, with the leader at 136 ms and the followers' road at 70 when not coupled.
 What is left: the remaining 4-6 TCs a leg (being read), and the coupling at 950k -- the followers' ingest at that
 rate (recovery slots, the queue's lock) beside the road.
+
+### 7.10 The remaining TCs (loop249, read): the fill churns without converging (defect 18), plus two smaller shapes
+
+Of 13 TCs across R950b, R900b and R900, **8 are one new shape**: with the proposer now answering every fill in
+2-7 ms, the asking follower re-asks every 35-40 ms for the same two `wanted=` counts alternately (2828 / 137,
+2159 / 626, 2990 / 25 ...), 340-360 rounds over the 6.9 s to the view timeout, and afterwards `foreign body
+refused ... of 163000 not held here` shows the block still nearly whole missing; the whole-body fallback then
+completes it in 1.0-1.2 s -- after the TC. No gate hold is involved (0 in those legs). Each fill is applied to
+something the next miss check does not read: **defect 18**, on `plan-v6/fill-converge` (the fill written into the
+one frame the next assembly reads; a bound of 3 rounds before the whole-body fetch). The other two shapes: R900's
+window-1 stall was 7.4's gate deadlock from the start-up transient (the supply outran consumption for ~30 s, the
+pool crossed the line to 1,031,644, replies 6-13 s until +55 s); and one TC where the leader proposed 4.6 s late
+because "the parent is still importing; proposing once it lands" (view 768) -- a leader-side wait on its own
+import, noted as 18b.

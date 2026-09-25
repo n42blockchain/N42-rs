@@ -382,6 +382,10 @@ fn gate_max_wait() -> Option<std::time::Duration> {
 enum GateExit {
     /// The gate opened; the wait.
     Open(std::time::Duration),
+    /// The gate was shut, but this node's vote road is assembling a proposed
+    /// block and misses some of its transactions ([`open_gate_for_block`]);
+    /// the wait.
+    ForBlock(std::time::Duration),
     /// The deadline passed with the gate still shut; the wait.
     Forced(std::time::Duration),
 }
@@ -390,6 +394,91 @@ enum GateExit {
 /// started. Non-zero at the end of a round means a node stopped draining its
 /// queue and the round is not comparable.
 static GATE_FORCED: AtomicU64 = AtomicU64::new(0);
+
+/// Defect 17 (loop245, three nodes): the gate against the block it waits for.
+///
+/// The gate reopens only when a canonical block prunes this node's queue. A
+/// follower's vote road assembles the proposed block from that queue by
+/// description, and the transactions it misses (`compact body: asking for
+/// the transactions this node does not hold wanted=124`) are exactly the ones
+/// in the frames held here: the flood sent them to every node, and this
+/// node's copy is waiting at its own gate. The block cannot be voted until
+/// they are admitted, the gate cannot reopen until a block is committed, and
+/// the stall ends only at the view timeout -- with a quorum of three of
+/// three, a TC every time (every one of five inspected).
+///
+/// So while the road reports misses, the gate lets frames through. The
+/// window is [`GATE_FOR_BLOCK_WINDOW_MS`] from the road's last miss: the road
+/// retries every 40-80 ms while it still misses, so the window is renewed
+/// for as long as the block is incomplete and lapses on its own once the
+/// block has been assembled. The trade-off: for that window the pool grows
+/// past its high-water mark by whatever the generator offers (at ~900k/s,
+/// ~450,000 transactions per window at most, in practice far fewer because
+/// the block completes within a retry or two and its commit prunes a block's
+/// worth). The backpressure the gate exists for is untouched whenever no
+/// block is pending, which is the steady state: a pool that is full because
+/// the chain is slow still holds the generator. `N42_TX_INGEST_GATE_STRICT=1`
+/// restores the old gate, which deadlocks as described.
+const GATE_FOR_BLOCK_WINDOW_MS: u64 = 500;
+
+/// [`gate_clock_ms`] until which a block's misses keep the gate open; zero
+/// when no block has asked.
+static BLOCK_PENDING_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+
+/// The transactions the road's last miss wanted, for the INFO line.
+static BLOCK_PENDING_WANTED: AtomicU64 = AtomicU64::new(0);
+
+/// Pending-block episodes: bumped when a miss arrives with no window open,
+/// so the INFO line is written once per episode and not once per frame.
+static BLOCK_PENDING_EPISODE: AtomicU64 = AtomicU64::new(0);
+
+/// The last episode an INFO line was written for.
+static BLOCK_PENDING_LOGGED: AtomicU64 = AtomicU64::new(0);
+
+/// Frames let through a shut gate because a block was pending, since the
+/// process started (`gate_opened_for_block` on the `ingest` line).
+static GATE_OPENED_FOR_BLOCK: AtomicU64 = AtomicU64::new(0);
+
+/// `N42_TX_INGEST_GATE_STRICT`, read once: the gate before defect 17's fix.
+fn gate_strict() -> bool {
+    static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *STRICT.get_or_init(|| {
+        std::env::var("N42_TX_INGEST_GATE_STRICT").is_ok_and(|value| value == "1")
+    })
+}
+
+/// Whether a block is pending at `now_ms`, given the window's end.
+const fn block_pending_at(now_ms: u64, until_ms: u64) -> bool {
+    now_ms < until_ms
+}
+
+/// Called by the vote road when it is assembling a proposed block from the
+/// queue and misses `wanted` of its transactions: opens the gate for
+/// [`GATE_FOR_BLOCK_WINDOW_MS`] and wakes every held frame, so the missing
+/// transactions reach the queue before the road's next attempt. A no-op
+/// under `N42_TX_INGEST_GATE_STRICT=1`. See [`GATE_FOR_BLOCK_WINDOW_MS`].
+pub fn open_gate_for_block(wanted: usize) {
+    if gate_strict() {
+        return;
+    }
+    let now = gate_clock_ms();
+    let previous = BLOCK_PENDING_UNTIL_MS.swap(now + GATE_FOR_BLOCK_WINDOW_MS, Ordering::AcqRel);
+    BLOCK_PENDING_WANTED.store(u64::try_from(wanted).unwrap_or(u64::MAX), Ordering::Relaxed);
+    if !block_pending_at(now, previous) {
+        BLOCK_PENDING_EPISODE.fetch_add(1, Ordering::AcqRel);
+    }
+    GATE.open.notify_waiters();
+}
+
+/// Whether the gate is open for a pending block now: `Some(wanted)` while
+/// the road's last miss is inside its window.
+fn block_pending_now() -> Option<u64> {
+    if gate_strict() {
+        return None;
+    }
+    block_pending_at(gate_clock_ms(), BLOCK_PENDING_UNTIL_MS.load(Ordering::Acquire))
+        .then(|| BLOCK_PENDING_WANTED.load(Ordering::Relaxed))
+}
 
 /// Milliseconds since the process's first gate wait, for the warning's rate
 /// limit: 64 connections reach the same deadline in the same millisecond and
@@ -431,8 +520,13 @@ fn gate_warn_allowed() -> bool {
 /// the maximum wait), so the wait ends on time even if the watcher's
 /// notification never arrives -- which is the other way this could hang, and
 /// one a test cannot see.
+///
+/// `for_block` says whether a proposed block is waiting on this node's held
+/// frames (`Some(wanted)`, see [`open_gate_for_block`]); a shut gate lets the
+/// frame through while it does.
 async fn wait_at_gate(
     view: impl Fn() -> GateView,
+    for_block: impl Fn() -> Option<u64>,
     max_wait: Option<std::time::Duration>,
 ) -> GateExit {
     // The runtime's clock, not the system's: it is the one the sleeps below
@@ -451,6 +545,22 @@ async fn wait_at_gate(
             return GateExit::Open(started.elapsed());
         }
         let waited = started.elapsed();
+        if let Some(wanted) = for_block() {
+            GATE_OPENED_FOR_BLOCK.fetch_add(1, Ordering::Relaxed);
+            let episode = BLOCK_PENDING_EPISODE.load(Ordering::Acquire);
+            if BLOCK_PENDING_LOGGED.swap(episode, Ordering::AcqRel) != episode {
+                info!(
+                    target: "n42.tx_ingest",
+                    depth = seen.depth,
+                    limit = seen.limit,
+                    wanted,
+                    waited_ms = waited.as_millis() as u64,
+                    waiting = GATE.waiting.load(Ordering::Relaxed),
+                    "the ingest gate opened for a proposed block this node misses transactions of"
+                );
+            }
+            return GateExit::ForBlock(waited);
+        }
         if !warned && waited >= GATE_WARN_AFTER {
             // Set whether or not the line is emitted: it is what takes the
             // warning off the sleep cap below, and a waiter that keeps the
@@ -649,6 +759,10 @@ fn spawn_stats_reporter() {
                     // were let through on the deadline; the round is not
                     // comparable and a node has stopped draining its queue.
                     gate_forced = GATE_FORCED.load(Ordering::Relaxed),
+                    // Frames let through a shut gate because this node's
+                    // vote road missed a proposed block's transactions
+                    // (defect 17); cumulative.
+                    gate_opened_for_block = GATE_OPENED_FOR_BLOCK.load(Ordering::Relaxed),
                     "ingest"
                 );
             }
@@ -844,8 +958,13 @@ where
         // blocks would otherwise hold every connection for the rest of the
         // round.
         let frame_read = std::time::Instant::now();
-        let (GateExit::Open(at_gate) | GateExit::Forced(at_gate)) =
-            wait_at_gate(|| gate_view(&pool, &head, gate, allowance), gate_max_wait()).await;
+        let (GateExit::Open(at_gate) | GateExit::ForBlock(at_gate) | GateExit::Forced(at_gate)) =
+            wait_at_gate(
+                || gate_view(&pool, &head, gate, allowance),
+                block_pending_now,
+                gate_max_wait(),
+            )
+            .await;
         STATS.gate_ns.fetch_add(at_gate.as_nanos() as u64, Ordering::Relaxed);
         if asynchronous {
             let pending = u32::try_from(queue_depth(&pool)).unwrap_or(u32::MAX);
@@ -1310,7 +1429,7 @@ mod tests {
         let depth = Arc::new(AtomicUsize::new(411_428));
         let held = tokio::time::timeout(
             Duration::from_secs(600),
-            wait_at_gate(view_of(depth, 407_500), None),
+            wait_at_gate(view_of(depth, 407_500), || None, None),
         )
         .await;
         assert!(held.is_err(), "the frame was let through, but nothing had reopened the gate");
@@ -1324,9 +1443,9 @@ mod tests {
         let forced_before = GATE_FORCED.load(Ordering::Relaxed);
         let depth = Arc::new(AtomicUsize::new(411_428));
         let max = Duration::from_secs(15);
-        match wait_at_gate(view_of(depth, 407_500), Some(max)).await {
+        match wait_at_gate(view_of(depth, 407_500), || None, Some(max)).await {
             GateExit::Forced(waited) => assert!(waited >= max, "{waited:?} is short of {max:?}"),
-            GateExit::Open(waited) => {
+            GateExit::Open(waited) | GateExit::ForBlock(waited) => {
                 panic!("the gate was shut the whole time, yet it opened after {waited:?}")
             }
         }
@@ -1350,7 +1469,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_open_gate_does_not_hold_a_frame() {
         let depth = Arc::new(AtomicUsize::new(10));
-        let exit = wait_at_gate(view_of(depth, 407_500), Some(Duration::from_secs(15))).await;
+        let exit = wait_at_gate(view_of(depth, 407_500), || None, Some(Duration::from_secs(15))).await;
         assert!(
             matches!(exit, GateExit::Open(waited) if waited < Duration::from_millis(1)),
             "{exit:?}"
@@ -1368,12 +1487,43 @@ mod tests {
             draining.store(248_428, Ordering::Relaxed);
             GATE.open.notify_waiters();
         });
-        match wait_at_gate(view_of(depth, 407_500), Some(Duration::from_secs(15))).await {
+        match wait_at_gate(view_of(depth, 407_500), || None, Some(Duration::from_secs(15))).await {
             GateExit::Open(waited) => assert!(waited >= Duration::from_millis(400), "{waited:?}"),
-            GateExit::Forced(waited) => {
+            GateExit::Forced(waited) | GateExit::ForBlock(waited) => {
                 panic!("a gate that reopened after 400 ms was forced at {waited:?}")
             }
         }
+    }
+
+    /// Defect 17: a shut gate that no canonical block will reopen, because
+    /// the block it waits for misses the held frames' transactions. Once
+    /// the road says so, the frame goes through -- well before the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_shut_gate_opens_for_a_block_that_misses_its_frames() {
+        let depth = Arc::new(AtomicUsize::new(872_000));
+        let pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let road = Arc::clone(&pending);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            road.store(true, Ordering::Relaxed);
+            GATE.open.notify_waiters();
+        });
+        let for_block = move || pending.load(Ordering::Relaxed).then_some(124);
+        match wait_at_gate(view_of(depth, 833_333), for_block, Some(Duration::from_secs(2))).await {
+            GateExit::ForBlock(waited) => {
+                assert!(waited >= Duration::from_millis(60), "{waited:?}");
+                assert!(waited < Duration::from_secs(2), "{waited:?}");
+            }
+            other => panic!("the gate should have opened for the pending block: {other:?}"),
+        }
+    }
+
+    /// The window: open while the road's last miss is recent, shut after.
+    #[test]
+    fn a_block_is_pending_only_inside_its_window() {
+        assert!(!block_pending_at(1_000, 0), "no miss yet");
+        assert!(block_pending_at(1_000, 1_000 + GATE_FOR_BLOCK_WINDOW_MS));
+        assert!(!block_pending_at(1_000 + GATE_FOR_BLOCK_WINDOW_MS, 1_000 + GATE_FOR_BLOCK_WINDOW_MS));
     }
 
     /// The deadline does not depend on the watcher's notification: every

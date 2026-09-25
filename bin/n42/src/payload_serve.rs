@@ -1929,6 +1929,11 @@ where
                         waited_ms = waited.as_millis() as u64,
                         "compact body: asking for the transactions this node does not hold"
                     );
+                    // Defect 17: the missing transactions are, at depth,
+                    // the ones this node's own ingest gate is holding, and
+                    // only this block's commit would reopen it. Open it for
+                    // as long as the road keeps missing (`n42_tx_ingest`).
+                    n42_tx_ingest::open_gate_for_block(indices.len());
                     let encoded = raw_engine::encode_need_txns(
                         &indices.iter().map(|&i| i as u32).collect::<Vec<_>>(),
                     );

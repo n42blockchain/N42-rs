@@ -2220,3 +2220,24 @@ a fraction of the pool's depth (p10 blocks 99,000 with 833k queued -- the queue'
 so "supply under consumption" never became "pool under the limit". **Defect 17b**, on `plan-v6/fill-past-gate`:
 the fill of a proposed block's missing transactions is admitted regardless of depth. Raising the flood's rate
 (loop248) will not help until it lands -- it tightens the same margin.
+
+### 7.8 Three nodes at pacing 125, the supply at 900k-1.0M (loop248): 926,931 and 919,764 on windows, and the same cascade
+
+| leg | rate | win1 | win2 | occupancy | txs p10 | cycle | B | D | import | root | TCs | idles >5 s |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| R900 | 900k | **919,764** | 315,372 | 91.6% | 118,500 | **153.5** | 75 | 41.5 | 171 | 45 | 9 | 11 |
+| R950 | 950k | 874,368 | 20,189 | 99.3% | 163,000 | 169 | **133** | 9 | 171 | 45 | 12 | 12 |
+| R1000 | 1.0M | 849,203 | 22,348 | 99.5% | 162,552 | 157.5 | 83 | 33 | 154 | 33 | 16 | 15 |
+| R950b | 950k | **926,931** | 375,304 | 99.6% | 163,000 | 162.8 | 120 | 17.6 | 173 | 43 | 22 | 21 |
+
+Two windows over 900k for the first time -- 926,931 at 950k/s with every block full at a 163 ms cycle, 919,764 at
+900k/s where the chain ran a **153.5 ms cycle** (163k in 153 ms is 1.06M/s) and the supply left the blocks 92%
+full. The shape between the two: at 900k the road B is 75 and the leader waits 41 ms on the pacing; at 950k and
+above B is 83-133 -- the followers' road stretches as the ingest carries more (the per-node CPU coupling of 6.20,
+now at 950k rather than 64k in flight), and D falls to nothing. So the chain's own cycle is ~153 ms at this shape
+and the supply that fills it without slowing the road is somewhere between 900k and 950k/s: **the 1M window is
+within ~7% of what this fleet shows, and the round is not held** (window 2 at 20-375k, 9-22 TCs, 11-21 idles over
+5 s -- defect 17b in every case, the fill of a block's missing transactions behind the gate, in flight on
+`plan-v6/fill-past-gate`). The next leg is this table again with the fill admitted past the gate; if a round then
+holds at 900-950k, the remaining terms are B at 950k (the ingest's CPU beside the road) and the pool's usable
+fraction (p10 118,500 at 900k with 833k queued).

@@ -1955,3 +1955,34 @@ Attempt **Q2** (`plan-v6/road-runtime`, `N42_ROAD_RUNTIME=1`): the road's path o
 pool, with `dispatch_wait_ms` on the `vote road` line to prove the decoupling: falsified if, at 64k in flight,
 `dispatch_wait_ms` does not fall under 10 and B under 100 while the ingest's own frame times stay elevated.
 If it holds, `--conc 128` (or 64 x 1000) fills the blocks at ~1M tx/s of supply, and the cycle is the term again.
+
+### 6.19 The sharded graft and the hand-off off the lock (loop241, on a box that was not quiet)
+
+Run at 01:37-01:56 on 2026-09-25 with a foreign `rbtcd` soak on the box (a Bitcoin node at ~3.5 cores, MemAvailable
+97 GB at the claim): every leg, the warm one included, is ~15% slower than the same configuration the day before
+(exec 86 against 64-69, the follower's import 272 against 190, B 102 against 77, window 2 under 500k), so only the
+differences within the run are read.
+
+| leg | win1 | par_start | hand-off `queue_ms` | state_wait | graft_insert (split / build / merge) | par_graft | sealed_at |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| warm | 756,451 | 13 | 12 | 29 | 40 (--) | 62 | 200 |
+| GS (`N42_GRAFT_SHARDED=1`) | 640,678 | 16 | 15 | **83** | **106** (7 / 61 / 37) | 121 | 240 |
+| SA (`N42_BUILD_START_ASYNC=1`) | 659,774 | **5** | **4** | 37 | 40 | 62 | 197 |
+| GSSA | 622,221 | 6 | 5 | 92 | 105 (7 / 62 / 36) | 121 | 257 |
+
+**G proper is falsified as built**: the sharded insert is 2.6x slower than the single-threaded one -- 61 ms to build
+32 shard maps on the pool and 37 to merge them into the block's map, against 40 for the plain insert -- and the
+chained build's `state_wait` triples. The parallel build does not win because the per-account cost is not
+computation but the cache-missing probe into a large map, and thirty-two smaller maps built on sixteen threads
+plus a serial merge of 147k entries do more of those probes, not fewer. The flag stays off; a graft that avoids
+the merge (per-shard maps read by the consumers) is the only parallel form left, and it is invasive.
+
+**SA works as sized and moves nothing**: the hand-off's fold and partition off the queue's lock cut `par_start`
+13 -> 5 and `queue_ms` 12 -> 4, and `state_wait` grew by the same 8 (29 -> 37): the chained build merely reaches
+the wait for the parent's state earlier, as the author predicted without a shorter fold. Adopted anyway (the lock
+is held 8 ms less per block on the leader, which the ingest and the road share).
+
+So the leader's period is the parent's fold (62 + `state_ready` 15) reaching the child's execution, and the fold
+is the graft insert's 40 ms of memory latency. What is left for it: the insert into a pre-sized map is already
+`reserve`d (9 ms); the probe cost itself would need a different map (an open-addressing table keyed by a prefix,
+or the shards kept unmerged) -- deferred behind Q2, because the supply binds first.

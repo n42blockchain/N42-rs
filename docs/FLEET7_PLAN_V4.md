@@ -2096,3 +2096,21 @@ builds short. Quorum 3 of 3 has no straggler to spare: whatever one node does fo
 a TC, where on four nodes the fourth vote covered it. Read next from the logs (the first TC after window 1: which
 node, what it was doing, memory at that moment) before any pacing leg -- a three-node fleet that holds for a
 round, at pacing 150, is the 1M measurement.
+
+### 7.2 Why three nodes do not hold: the ingest gate, a peer fetch, and no spare vote
+
+A Sonnet pass over loop244's first TCs: in every failing leg the sequence is the same. The flood delivers
+840-880k/s to three pools instead of four; a node's pool crosses its limit (543,333 transactions), the ingest gate
+holds new frames for 2 s at a time (`a frame has been held at the ingest gate ... depth=581792 limit=543333`);
+the next block's description names transactions that node has not ingested yet (`asking a peer for the
+transactions this node does not hold ... wanted=896`), the fetch-and-reassemble takes up to 5.8 s, and the view
+times out before that node votes -- with quorum 3 of 3 that is a TC every time (R: view 375, node0; warm: view
+423, nodes 0 and 2). Memory is not it (MemFree 44-50 GB at the moment). The four-node leg with the same
+configuration (loop243 W163) shows the same gate holds at the same depths and one TC in three windows: the
+3-of-4 quorum absorbed the straggler. Gate holds then recur every 6-20 s for the rest of the leg (a chronic
+backlog, not a one-off), so the collapse is structural at this supply and pool size.
+
+Two levers, one taken now: the pool's limit (loop245 runs three nodes with `F7_BENCH_POOL_SLOTS=1000000`, so the
+gate does not close under an 880k/s supply that the chain consumes at ~860k/s), and the peer fetch, which should
+not take seconds for 900 transactions (a code path to read if the gate holds persist). A taller view timeout would
+mask the same thing at the cost of every real fault. `F7_STRAGGLER_GRACE_MS` is not involved (a pre-vote stall).

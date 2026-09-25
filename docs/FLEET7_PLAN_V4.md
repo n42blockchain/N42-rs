@@ -2554,3 +2554,35 @@ flight per node at ~180 ms a reply). The nodes at 70/68 cores are not hurt (cycl
 generator's structure -- the requests in flight and the frame -- is the last supply term, and a rated flood
 with more in flight no longer risks 6.17's coupling (the token bucket bounds what is in flight): loop260 runs
 `--rpcbatch 1000` and `--conc 96` at a 1.0M offer.
+
+### 7.24 Bigger frames and more requests in flight (loop260): the coupling returns under the token bucket too
+
+| leg | frame x in flight | offer | win1 | win2 | flood win1 (k/s) | reply ms | cycle | B |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| RB1000 | 1000 x 64 | 1.0M | 907,326 | 782,366 | 866 | 398-456 | 176 | 143 |
+| C96 | 500 x 96 | 1.0M | 928,311 | 755,157 | 869 | 275-319 | 171.5 | 137 |
+| C950 | 500 x 64 | 950k | **975,788** | 679,340 | 950 | 170-171 | **155.5** | **97.5** |
+| RB1000C96 | 1000 x 96 | 1.0M | 844,589 | 760,623 | 807 | 614-716 | 186 | 150 |
+
+Falsified: with 48k or 64k transactions in flight the followers' road stretches (B 137-150), the replies 300-700 ms,
+and the flood delivers *less* (807-869k) -- 6.17's coupling is about what sits in the ingest at once, and the token
+bucket does not lower that. The control at 500 x 64 is the shape: 975,788 at a 155.5 ms cycle, B 97.5 -- the
+generator delivering 950k/s and the fleet consuming all of it.
+
+## 8 (continued). The four-node-to-three-node campaign, closed (2026-09-25 19:00)
+
+Twenty-one rounds on three nodes (loop244-260). Window 1 stands at **977,627** (loop257) with 966-976k on every
+control since; the fleet consumes what the generator delivers at 950k/s with every block full, at a 155-165 ms
+cycle (163k in 155 ms is 1.05M/s of capacity). The 2.2% to 1M on a window is the supply: the ingest of every node
+admits ~800-840k/s at 10 us a signature with 12 slots, and any attempt to push more through it (more in flight,
+bigger frames, more slots, more cores, a lower priority) stretches the followers' road by the CPU it takes. Rounds
+read 780-830k on window 2 as the state grows (7.15). Adopted along the way: three nodes, pool 1,000,000, the
+supply rated, the fills converging (17b, 18), the tenure's first build on the published output (18b), tenure
+1024, the node built for its CPU, ed25519 batch 256. Falsified: the gate opened for a block, slots 16/20, nice 0/19,
+cores to the flood, frames of 1000, 96 requests, offers above 950k.
+
+What would cross 1M on a window is not a knob: verification paid once per transaction fleet-wide (the leader's
+inclusion as the claim, checked by followers in batch off the vote path, or verification sharded with a quorum's
+coverage) -- a protocol design with a safety argument to write first -- or a generator on another box, so the
+flood's 17 cores stop competing with the nodes' ingest for the same memory bandwidth. Both are decisions, not
+measurements; the measurements are in this document.

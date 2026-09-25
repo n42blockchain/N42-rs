@@ -2305,3 +2305,14 @@ cores the road and the execution need, exactly 6.20's coupling. Twelve stays. Th
 best round: **926,383 on window 1 and 768,641 on window 2** at 950k/s, and R925's second window 907,303. The
 per-node ingest at 12 slots admits ~800-810k/s of a 925-950k/s offer, and that, with the road at 98-123 while it
 does, is the supply wall on this box: verification and decode at 11-12 us a transaction on every node.
+
+**Defect 18, read from the code and fixed** (`plan-v6/fill-converge`, merged d48670bbc): when a peer's answer came
+back, the validator took the compact body *as it first arrived* from its cache, appended the fill and passed the
+result to the driver -- and never stored it back. Round two's fill therefore replaced round one's on the original
+holed frame (the filled frame's size alternating 5,686,269 / 5,239,563 bytes in the log), and the execution layer,
+counting misses correctly on what it was given, asked for the other set again. Now `merge_fill` combines every fill
+into the frame of record in index order, a duplicate body no longer overwrites it, and a miss report after
+`N42_FILL_ROUNDS_MAX` rounds (3) or naming a position already supplied goes straight to the whole-body fetch
+(`fill converged rounds=..` / `fill did not converge; asking for the whole body`). Why the queue lost the second set
+(137 transactions there at the first assembly, gone at the second -- the parent's commit 40 ms earlier?) is not
+confirmed; the bound covers it. 18b untouched.

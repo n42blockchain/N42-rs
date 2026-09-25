@@ -2361,3 +2361,21 @@ already builds that way; only the first build of a tenure goes through `forkchoi
 the new leader proposes at once and its engine catches up beside it -- in flight. The follower's import itself
 (the root at 45-51 beside the next execution) is the term that makes the backlog, and shortening it is what
 1M needs anyway.
+
+### 7.14 The ingest at nice 19 (loop252): no effect on B; the window record 936,737
+
+| leg | rate | nice | win1 | win2 | cycle | B | ingest rate / node | TCs |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| N19a | 950k | 19 | 575,963 (stall) | 793,232 | 156 | 107 | 750k | 2 |
+| N19b | 925k | 19 | **936,737** | 755,202 | 162 | 113 | 771k | 2 |
+| C950 | 950k | 10 | 923,211 | 760,638 | 163 | 109 | 802k | 2 |
+| N19c | 950k | 19 | 910,927 | 755,209 | 168 | 112.5 | 803k | 1 |
+
+Falsified: the recovery threads' priority does not move B (107-113 at nice 19 against 109 at 10), so the road is
+not losing the cores to *those* threads by scheduling -- the contention is the ingest's whole footprint (decode,
+recovery, admission, the HTTP replies) on the node, or the memory bandwidth it takes, not a priority. The window
+record moved to **936,737** (N19b, 925k/s, 99.4% occupancy, 162 ms cycle), the rounds read 755-793k on window 2
+with 1-2 TCs a leg (18b, the handover). So: the leader at 134-140, the chain at 156-168, the road at 107-113 under
+a 925-950k/s ingest, the windows at 911-937k, and the round a handover short. loop253 (the tenure at 1024) and
+18b's fix are what turn a window into a round; the window itself is the ingest's footprint against the road,
+which is the design question (verification paid once).

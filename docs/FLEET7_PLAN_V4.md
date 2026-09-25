@@ -2137,3 +2137,21 @@ pacing 125 the leader seals at 136 and the road is 67, so the cycle would be ~15
 follower's import at that pace is 172 (136 at 190 ms), so it is the follower's pipeline -- the gated execution
 (6.15: 95 of it) and what contends with it when blocks come every 164 ms -- that has to lose ~20-30 ms, or the
 straggler must not cost a view (a fourth node with a 3-of-4 quorum has the vote to spare but not the cores).
+
+### 7.4 The three-node TCs, read (loop245): the ingest gate deadlocks against the block it is waiting for (defect 17), and the follower's root grows at 164 ms
+
+Every TC inspected (5 of 5, warm and P125; P150's 10 s stall is the same) is one mechanism: the pool's depth
+crosses the gate's limit (833,333 of the 1,000,000 slots -- a fixed fraction), the ingest holds new frames, the
+follower's road assembling the proposed block by description wants transactions that sit in the held frames
+(`asking for the transactions this node does not hold wanted=124`, retried every 40-80 ms, no peer fetch), and
+the gate reopens only on a canonical block's prune -- which needs this block. The stall lasts the view timeout
+(5.9-6.0 s, `idle_before_ms` 5995-6227) and with no spare vote is a TC every time. Not an import backlog (the
+follower's imports were steady before it), not the leader (its build 7-8 ms), not memory. **Defect 17**, on
+`plan-v6/gate-deadlock`: the gate opens for a pending block's missing transactions.
+
+The second, independent bound at pacing 125: the follower's import averages 208 ms against the 164 ms cycle, and
+the term that grew is the QMDB root -- 68 ms against 39 at pacing 175 (execution 78 against 73, the engine insert
+18 against 34, `parent_engine_wait` 11 against 1) -- the root runs beside the next block's execution and at this
+pace they contend. B 123 is that lag (the leader's collect samples 71-197 against 67-108). So a three-node round at
+pacing 125 needs both: the gate fixed, and the follower's root ~30 ms cheaper or off the contended cores (the
+parallel state commit's pool against the execution's), which is the follower-side term of the 1M plan.

@@ -650,6 +650,24 @@ async fn build_on_own_block(
         return Err("unknown build: block access list".to_owned());
     }
     let mut times = BuildOnOwnTimes { decode_ms: decode_at.elapsed().as_millis() as u64, ..Default::default() };
+    // A parent this node did not build -- the previous leader's last block,
+    // at a tenure's first build -- is not in the build registry; with the
+    // flag it is built on the output this node's follower execution of it
+    // published, instead of the request being refused and the leader going
+    // through the forkchoice and the payload job.
+    if tenure_first_on_output()
+        && n42_engine_types::built_executions::find_kept_sealed(
+            header.parent_hash,
+            header.number,
+            header.state_root,
+            header.receipts_root,
+            header.gas_used,
+            Some(header.transactions_root),
+        )
+        .is_none()
+    {
+        return build_on_published_output(builder, header, attributes, chain, want_hashes, times).await;
+    }
     if build_on_output() {
         return build_on_sealed_output(reuse, builder, header, attributes, chain, want_hashes, times).await;
     }
@@ -762,6 +780,121 @@ fn build_start_async() -> bool {
 fn build_on_output() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("N42_BUILD_ON_OUTPUT").is_ok_and(|v| v == "1"))
+}
+
+/// `N42_TENURE_FIRST_ON_OUTPUT=1` (defect 18b, `docs/FLEET7_PLAN_V4.md`
+/// 7.13): a build request on a sealed parent this node did not build is served
+/// on the parent's published follower output ([`build_on_published_output`])
+/// instead of being refused. The validator sends such a request for the first
+/// build of its tenure. Off by default.
+fn tenure_first_on_output() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_TENURE_FIRST_ON_OUTPUT").is_ok_and(|v| v == "1"))
+}
+
+/// How long the first build of a tenure waits for this node's follower
+/// execution of the parent to publish its output. The execution runs beside
+/// the vote and ends ~80-160 ms after it on a full block; a parent not
+/// executed by then is refused, and the leader builds the ordinary way.
+const PUBLISHED_OUTPUT_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The first build of a tenure: the next block on a peer's block this node
+/// executed as a follower (`N42_TENURE_FIRST_ON_OUTPUT`).
+///
+/// The new leader's engine may not hold the parent yet -- a follower's
+/// import runs behind its votes -- and the forkchoice the ordinary path
+/// starts its build with is answered SYNCING until it does (loop251: 5.3-9.1 s
+/// at every tenure handover, the view timing out). This node has already
+/// executed the parent, though: its import published the output for the
+/// child's check (`follower_import::publish_parent_output`). The build reads
+/// that output (and any unimported ancestors' outputs) laid over the chain's
+/// state at the nearest ancestor below them -- the follower's own overlay --
+/// and the header's parent fields come from the follower's filed execution
+/// fields under the parent's sealed hash, as for any parent.
+///
+/// The queue learns of the parent's transactions from its bundle: every
+/// account in it whose nonce moved has its lane cut below its post-state
+/// nonce (the follower's own hand-off, which follows, finds nothing left),
+/// and the cut transactions are held until the chain settles the height.
+async fn build_on_published_output(
+    builder: std::sync::Arc<dyn n42_engine_types::direct_build::DirectBuilder>,
+    header: alloy_consensus::Header,
+    attributes: alloy_rpc_types_engine::PayloadAttributes,
+    chain: Option<raw_engine::ChainHint>,
+    want_hashes: bool,
+    mut times: BuildOnOwnTimes,
+) -> Result<(N42BuiltPayload, BuildOnOwnTimes, Option<raw_engine::ChainHint>, bool), String> {
+    times.on_output = true;
+    let at = std::time::Instant::now();
+    let sealed_hash = header.hash_slow();
+    let number = header.number;
+    let ancestry = tokio::task::spawn_blocking(move || {
+        crate::follower_import::published_ancestry(sealed_hash, PUBLISHED_OUTPUT_WAIT)
+    })
+    .await
+    .map_err(|err| format!("published output lookup: {err}"))?
+    .map_err(|why| {
+        info!(target: "n42.payload_serve", number, parent = ?sealed_hash, why, "first build of the tenure not on the parent's published output");
+        format!("unknown build: no published output for the parent ({why})")
+    })?;
+    times.find_ms = at.elapsed().as_millis() as u64;
+    info!(
+        target: "n42.payload_serve",
+        number,
+        parent = ?sealed_hash,
+        waited_ms = ancestry.waited.as_millis() as u64,
+        depth = ancestry.executed.len(),
+        anchor = ?ancestry.anchor,
+        "first build of the tenure on the parent's published output"
+    );
+    let (hand_off, before_pull) = match n42_tx_queue::global::<n42_engine_types::N42PooledTransaction>() {
+        Some(queue) => {
+            let (done, handed) = std::sync::mpsc::sync_channel::<()>(1);
+            let output = std::sync::Arc::clone(&ancestry.output);
+            let task = tokio::task::spawn_blocking(move || {
+                let at = std::time::Instant::now();
+                let mined = output.state.state.iter().filter_map(|(sender, account)| {
+                    account.info.as_ref().filter(|info| info.nonce > 0).map(|info| (*sender, info.nonce - 1))
+                });
+                let removed = queue.remove_mined_batch_collecting(mined);
+                let forgotten = removed.len();
+                queue.hold_own_block(number, sealed_hash, removed);
+                let _ = done.send(());
+                info!(
+                    target: "n42.payload_serve",
+                    number,
+                    forgotten,
+                    queue_ms = at.elapsed().as_millis() as u64,
+                    "the parent's transactions taken out of the queue from its published bundle"
+                );
+                at.elapsed().as_millis() as u64
+            });
+            (Some(task), Some(handed))
+        }
+        None => (None, None),
+    };
+    let parent = reth_primitives_traits::SealedHeader::new(header, sealed_hash);
+    let at = std::time::Instant::now();
+    let request = n42_engine_types::direct_build::BuildOnOwnRequest {
+        parent,
+        parent_execution: n42_engine_types::direct_build::ParentExecution::Published {
+            parent_hash: sealed_hash,
+            executed: ancestry.executed,
+            anchor: ancestry.anchor,
+        },
+        attributes,
+        before_pull,
+    };
+    let handle = tokio::task::spawn_blocking(move || builder.build_on_own(request));
+    times.spawn_ms = at.elapsed().as_millis() as u64;
+    let payload = handle.await.map_err(|err| format!("build task: {err}"));
+    times.build_ms = at.elapsed().as_millis() as u64;
+    if let Some(task) = hand_off
+        && let Ok(queue_ms) = task.await
+    {
+        times.queue_ms = queue_ms;
+    }
+    Ok((payload??, times, chain, want_hashes))
 }
 
 /// [`build_on_own_block`] started at the parent's seal (`N42_BUILD_ON_OUTPUT`).

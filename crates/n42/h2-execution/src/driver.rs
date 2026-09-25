@@ -408,6 +408,9 @@ pub struct ExecutionDriver<E> {
     /// A build started before this node needed the block. See
     /// [`Self::prepare_build_on`].
     prepared: Option<AheadBuild>,
+    /// What the last [`Self::build_block_on`] did: whether it took a build
+    /// prepared ahead and, when it did not, why. See [`Self::last_build_path`].
+    last_build: (bool, Option<String>),
     /// Where [`Self::spawn_import_own_block`] reports a block the execution
     /// layer has taken, for the loop to build ahead on: a leader's own block
     /// raises no `BlockImported` -- that event belongs to the follower path
@@ -600,6 +603,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             el: std::sync::Arc::new(el),
             normalizer: None,
             prepared: None,
+            last_build: (false, None),
             own_imports: own_imports_tx,
             own_imports_rx: Some(own_imports_rx),
             own_importing: Default::default(),
@@ -901,6 +905,52 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         Ok(())
     }
 
+    /// The first build of a tenure on the parent's published output
+    /// (`N42_TENURE_FIRST_ON_OUTPUT`, defect 18b): a build request on the
+    /// sealed parent -- a peer's block, which the execution layer serves from
+    /// its follower execution of it -- in place of the forkchoice the ordinary
+    /// path starts with, which is answered SYNCING until the engine's tree has
+    /// the parent and then waits on a payload job.
+    ///
+    /// A build already prepared on this parent with these attributes is kept
+    /// when it cannot be the slow kind: a build on the sealed block, or a
+    /// forkchoice build that has already finished. Anything else is discarded
+    /// (a forkchoice build's job is resolved at once) and replaced. A refusal
+    /// is not an error here: [`Self::build_block_on`] then builds the ordinary
+    /// way, and [`Self::last_build_path`] says why.
+    ///
+    /// Returns what was done, for the caller's line.
+    pub async fn prepare_first_build_on_output(
+        &mut self,
+        parent: B256,
+        header: alloy_consensus::Header,
+        attrs: PayloadAttributes,
+        chain: Option<crate::el::ChainAhead>,
+    ) -> Result<&'static str, ElError> {
+        if let Some(prepared) = self.prepared.as_ref()
+            && prepared.covers(parent, &attrs)
+            && !prepared.refused.load(std::sync::atomic::Ordering::Acquire)
+        {
+            if prepared.give_up.is_none() {
+                return Ok("a build on the sealed parent is already prepared");
+            }
+            if prepared.task.is_finished() {
+                return Ok("a forkchoice build ahead on this parent has already finished");
+            }
+        }
+        if let Some(stale) = self.prepared.take() {
+            stale.discard();
+        }
+        self.prepare_build_on_sealed(parent, header, attrs, chain).await?;
+        Ok("requested")
+    }
+
+    /// Whether the last [`Self::build_block_on`] took a build prepared ahead,
+    /// and, when it did not, why.
+    pub fn last_build_path(&self) -> (bool, Option<&str>) {
+        (self.last_build.0, self.last_build.1.as_deref())
+    }
+
     /// Leader path: builds a block on top of the current head.
     ///
     /// Returns the built block *and* caches its payload, so the subsequent
@@ -966,6 +1016,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         // twice (so the work is not done twice). Guessing between them is how
         // this file has been wrong before.
         let started = std::time::Instant::now();
+        let mut miss: Option<String> = None;
         // A build prepared earlier counts only if it was started on this exact
         // parent with these exact attributes. Anything else and the block it
         // assembled is not the block this node is about to propose. One that
@@ -976,6 +1027,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             // that nothing replaced: the same as no build ahead.
             Some(prepared) if prepared.refused.load(std::sync::atomic::Ordering::Acquire) => {
                 prepared.discard();
+                miss = Some("the execution layer refused the build on the sealed parent".to_owned());
                 None
             }
             Some(prepared) if prepared.parent == parent && prepared.attrs == attrs => {
@@ -983,10 +1035,12 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                     Ok(Ok(built)) => Some(built),
                     Ok(Err(err)) => {
                         warn!(target: "n42.h2.el", %err, ?parent, "the build prepared ahead failed; building now");
+                        miss = Some(format!("the build prepared ahead failed: {err}"));
                         None
                     }
                     Err(err) => {
                         warn!(target: "n42.h2.el", %err, ?parent, "the build prepared ahead was lost; building now");
+                        miss = Some(format!("the build prepared ahead was lost: {err}"));
                         None
                     }
                 }
@@ -1001,9 +1055,13 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                     "a build prepared ahead does not match the proposal; discarded"
                 );
                 prepared.discard();
+                miss = Some("a build prepared ahead did not match the proposal".to_owned());
                 None
             }
-            None => None,
+            None => {
+                miss = Some("no build was prepared ahead".to_owned());
+                None
+            }
         };
         // With a build from ahead, fcu_ms below is the wait for one still in
         // flight and build_ms is nothing. Without, the status is reported
@@ -1023,10 +1081,12 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                     block = ?built.hash,
                     "the build prepared ahead extends another parent; building now"
                 );
+                miss = Some("the build prepared ahead extends another parent".to_owned());
                 None
             }
             None => None,
         };
+        self.last_build = (ahead.is_some(), miss);
         let (mut built, after_fcu, after_resolve, ahead) = match ahead {
             Some(built) => (built, started.elapsed(), started.elapsed(), true),
             None => {

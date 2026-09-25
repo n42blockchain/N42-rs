@@ -342,6 +342,11 @@ pub struct H2Service<E> {
     /// its execution layer has imported the block and answered a forkchoice
     /// on it. Off by default until a round has read it.
     build_on_seal: bool,
+    /// The view whose first build of a tenure was last asked for on the
+    /// parent's published output (`N42_TENURE_FIRST_ON_OUTPUT`): asked once
+    /// a view, so the retries of a leader whose build fell back do not send
+    /// the request again every step.
+    first_on_output_view: Option<u64>,
     body_requested_at: std::collections::HashMap<B256, std::time::Instant>,
     body_requested_order: std::collections::VecDeque<B256>,
     /// Height of the last block the execution layer is known to have
@@ -811,6 +816,20 @@ fn build_chain() -> bool {
     *ON.get_or_init(|| std::env::var("N42_BUILD_CHAIN").is_ok_and(|value| value != "0"))
 }
 
+/// `N42_TENURE_FIRST_ON_OUTPUT=1` (defect 18b, `docs/FLEET7_PLAN_V4.md`
+/// 7.13): the first build of a tenure is asked for on the parent's published
+/// output -- the execution layer's follower execution of the previous
+/// leader's last block -- through the same build-on-sealed request the
+/// chained path uses, instead of through a forkchoice that is answered
+/// SYNCING until the engine's tree has the parent and then waits on a payload
+/// job (loop251: 5.3-9.1 s at every handover). A refused request falls back
+/// to the forkchoice build. Needs `N42_BUILD_ON_SEAL`, and the same variable
+/// set on the execution layer, which serves the request. Off by default.
+fn tenure_first_on_output() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_TENURE_FIRST_ON_OUTPUT").is_ok_and(|value| value == "1"))
+}
+
 const fn head_stamp(remembered: Option<u64>, header: Option<&Header>) -> Option<u64> {
     match (remembered, header) {
         (Some(stamp), _) => Some(stamp),
@@ -926,6 +945,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             body_grace: body_request_grace(),
             direct_push: false,
             build_on_seal: std::env::var("N42_BUILD_ON_SEAL").is_ok_and(|v| v != "0"),
+            first_on_output_view: None,
             body_requested_at: std::collections::HashMap::new(),
             body_requested_order: std::collections::VecDeque::new(),
             imported_height: None,
@@ -2542,7 +2562,52 @@ impl<E: ExecutionLayer> H2Service<E> {
                 "leader loop between commit and preamble"
             );
         }
-        match self.driver.build_block_on(head, attrs, view).await {
+        // The first build of a tenure: the parent is the previous leader's
+        // last block, which this node executed as a follower but whose import
+        // into the engine's tree may still be behind. Asked for on that
+        // execution's published output instead of through the forkchoice.
+        let first_header = (self.build_on_seal
+            && tenure_first_on_output()
+            && self.first_on_output_view != Some(view)
+            && view > 1
+            && !self.engine.is_leader_for_view(view - 1))
+        .then(|| self.block_headers.get(&head).cloned())
+        .flatten();
+        let first_on_output = match first_header {
+            Some(header) => {
+                self.first_on_output_view = Some(view);
+                let chain = (build_chain()
+                    && self.engine.is_leader_for_view(view.saturating_add(1))
+                    && self.install_chain_sealer())
+                .then_some(n42_h2_execution::ChainAhead { view });
+                match self.driver.prepare_first_build_on_output(head, header, attrs.clone(), chain).await {
+                    Ok(what) => {
+                        info!(target: "n42.h2.node", view, parent = ?head, what, chain = chain.is_some(), "first build of the tenure asked for on the parent's published output");
+                        Some(what)
+                    }
+                    Err(err) => {
+                        info!(target: "n42.h2.node", %err, view, parent = ?head, "first build of the tenure not on the parent's published output: the request could not be started; building the ordinary way");
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        let built = self.driver.build_block_on(head, attrs, view).await;
+        if let Some(via) = first_on_output {
+            let waited_ms = decided.elapsed().as_millis() as u64;
+            match (self.driver.last_build_path(), &built) {
+                ((true, _), Ok(_)) => {
+                    info!(target: "n42.h2.node", view, parent = ?head, waited_ms, via, "first build of the tenure on the parent's published output");
+                }
+                ((_, why), result) => {
+                    let why = why.unwrap_or("the build failed after it was taken");
+                    let fallback_err = result.as_ref().err().map(ToString::to_string);
+                    info!(target: "n42.h2.node", view, parent = ?head, waited_ms, why, ?fallback_err, "first build of the tenure fell back to the forkchoice build");
+                }
+            }
+        }
+        match built {
             Ok(built) => {
                 // The QC may have moved while the block was being built -- a
                 // leader that was behind when its tenure began sees Decides

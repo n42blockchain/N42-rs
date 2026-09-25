@@ -76,6 +76,22 @@ pub enum ParentExecution {
         /// The hash the builder gave the parent.
         built_hash: B256,
     },
+    /// A parent this node did not build: a peer's block this node executed as
+    /// a follower and published the output of (`N42_TENURE_FIRST_ON_OUTPUT`,
+    /// the first build of a tenure). `executed` is that output and, when the
+    /// engine is behind, the published outputs of its ancestors, **newest
+    /// first**, each laid under its sealed header ([`executed_from_output`]);
+    /// `anchor` is the parent of the oldest, whose state the reads none of
+    /// them answers fall through to.
+    Published {
+        /// The parent's sealed hash: a peer's block has no builder hash, and
+        /// its execution fields are filed under the hash consensus sealed.
+        parent_hash: B256,
+        /// The published outputs, newest first.
+        executed: Vec<ExecutedParent>,
+        /// The nearest ancestor below them.
+        anchor: B256,
+    },
 }
 
 impl ParentExecution {
@@ -84,6 +100,7 @@ impl ParentExecution {
         match self {
             Self::Ready(execution) => execution.block.hash(),
             Self::Sealed { built_hash } => *built_hash,
+            Self::Published { parent_hash, .. } => *parent_hash,
         }
     }
 }
@@ -402,6 +419,21 @@ where
     Arc::new(move || {
         let historical = state_at_soon(&client, grandparent)?;
         Ok(overlay_on_executed(historical, vec![executed.clone()]))
+    })
+}
+
+/// An opener for a parent this node executed as a follower
+/// ([`ParentExecution::Published`]): the published outputs, newest first,
+/// over the chain's state at `anchor` -- the follower's own overlay
+/// ([`overlay_on_executed`]), so the build reads exactly the state the
+/// follower's execution of the parent produced.
+pub fn opener_on_published_parent<C>(client: C, anchor: B256, executed: Vec<ExecutedParent>) -> ParentStateOpener
+where
+    C: StateProviderFactory + Send + Sync + 'static,
+{
+    Arc::new(move || {
+        let historical = state_at_soon(&client, anchor)?;
+        Ok(overlay_on_executed(historical, executed.clone()))
     })
 }
 

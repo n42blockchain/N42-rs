@@ -359,6 +359,12 @@ where
             crate::direct_build::ParentExecution::Sealed { built_hash } => {
                 crate::direct_build::opener_on_sealed_parent(self.client.clone(), parent.clone(), *built_hash)
             }
+            // A peer's block this node executed as a follower: its published
+            // output (and any unimported ancestors') over the anchor's state
+            // (`N42_TENURE_FIRST_ON_OUTPUT`).
+            crate::direct_build::ParentExecution::Published { executed, anchor, .. } => {
+                crate::direct_build::opener_on_published_parent(self.client.clone(), *anchor, executed.clone())
+            }
         };
         // The reads the parent's build cached, filed under the builder's own
         // hash: warm exactly where this block's senders are.
@@ -2318,8 +2324,12 @@ where
             // The parent's tree under its sealed hash: a parent that finished
             // behind its seal after this build began has it under the
             // builder's hash still.
+            // A parent this node executed as a follower
+            // (`ParentExecution::Published`) has no builder hash: its tree is
+            // filed under the sealed hash by its own import, and there is
+            // nothing to rename.
             if qmdb_state.root_of(&parent_sealed).is_none() {
-                if let Some(built) = parent_built {
+                if let Some(built) = parent_built.filter(|built| *built != parent_sealed) {
                     let _ = crate::built_executions::wait_for(built, crate::built_executions::Stage::Complete);
                     if qmdb_state.root_of(&parent_sealed).is_none() {
                         crate::chain_alias::rename(&qmdb_state, built, parent_sealed)

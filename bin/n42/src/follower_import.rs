@@ -194,7 +194,16 @@ fn wait_for_parent_output(
     parent_hash: B256,
     parent_in: impl Fn() -> bool,
 ) -> Option<(reth_primitives_traits::SealedHeader, ParentOutput)> {
-    let deadline = std::time::Instant::now() + PARENT_WAIT;
+    wait_for_output_within(parent_hash, parent_in, PARENT_WAIT)
+}
+
+/// [`wait_for_parent_output`] with the wait bounded by `wait`.
+fn wait_for_output_within(
+    parent_hash: B256,
+    parent_in: impl Fn() -> bool,
+    wait: std::time::Duration,
+) -> Option<(reth_primitives_traits::SealedHeader, ParentOutput)> {
+    let deadline = std::time::Instant::now() + wait;
     let (count, landed) = &IMPORT_LANDED;
     let mut seen = *count.lock().unwrap_or_else(|p| p.into_inner());
     loop {
@@ -774,6 +783,51 @@ fn published_output(hash: B256) -> Option<(reth_primitives_traits::SealedHeader,
         .iter()
         .find(|(kept, _, _)| *kept == hash)
         .map(|(_, header, output)| (header.clone(), Arc::clone(output)))
+}
+
+/// What a build on a peer's block needs of this node's follower execution of
+/// it (`N42_TENURE_FIRST_ON_OUTPUT`, the first build of a tenure): the
+/// parent's published output, the outputs to lay over the chain's state
+/// (the parent's, then its unimported ancestors', newest first) and the
+/// ancestor below them.
+#[derive(Debug)]
+pub struct PublishedAncestry {
+    /// The parent's execution output (its bundle names the nonces it mined).
+    pub output: ParentOutput,
+    /// The outputs, newest first, each under its sealed header.
+    pub executed: Vec<n42_engine_types::direct_build::ExecutedParent>,
+    /// The parent of the oldest output: the state the overlay falls through to.
+    pub anchor: B256,
+    /// How long the parent's output was waited for.
+    pub waited: std::time::Duration,
+}
+
+/// The published outputs a build on `parent_hash` can stand on, waiting up to
+/// `wait` for the parent's own output (its execution may still be running
+/// beside the vote when this node becomes leader). The walk back stops at the
+/// first ancestor with no output kept here, which becomes the anchor; at most
+/// [`PARENT_OUTPUTS_KEPT`] outputs are stacked, as the follower's own path.
+///
+/// Blocking: the caller runs it off the async runtime.
+pub fn published_ancestry(parent_hash: B256, wait: std::time::Duration) -> Result<PublishedAncestry, &'static str> {
+    if !publish_parent_outputs() {
+        return Err("this node publishes no execution outputs (N42_CHECK_ON_PARENT_OUTPUT and N42_FOLLOWER_EXEC_ON_PARENT_OUTPUT off)");
+    }
+    if hashed_state_enabled() {
+        return Err("the hashed post-state pass is on and no published output carries one (N42_HASHED_TABLES=off is what this path needs)");
+    }
+    let started = std::time::Instant::now();
+    let (header, output) =
+        wait_for_output_within(parent_hash, || false, wait).ok_or("the parent's output was not published here in time")?;
+    let waited = started.elapsed();
+    let mut executed = vec![n42_engine_types::direct_build::executed_from_output(&header, Arc::clone(&output))];
+    let mut anchor = header.parent_hash;
+    while executed.len() < PARENT_OUTPUTS_KEPT {
+        let Some((older, published)) = published_output(anchor) else { break };
+        executed.push(n42_engine_types::direct_build::executed_from_output(&older, published));
+        anchor = older.parent_hash;
+    }
+    Ok(PublishedAncestry { output, executed, anchor, waited })
 }
 
 /// The parent's post-state while the parent is not in the engine: the outputs

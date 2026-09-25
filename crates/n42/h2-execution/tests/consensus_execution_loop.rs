@@ -838,3 +838,46 @@ async fn the_block_after_a_recovered_own_commit_imports_from_its_body() {
     assert_eq!(driver.finish_execute(done).await[0].imported_block(), Some(next));
     assert_eq!(el.calls().last(), Some(&ElCall::NewPayloadBody(next)));
 }
+
+/// The first build of a tenure on the parent's published output
+/// (`N42_TENURE_FIRST_ON_OUTPUT`): an execution layer that does not serve it
+/// refuses the request, and the proposal is built the ordinary way -- a
+/// forkchoice with attributes, then its resolve -- with the reason recorded
+/// for the leader's line.
+#[tokio::test]
+async fn a_refused_first_build_on_output_falls_back_to_the_forkchoice_build() {
+    let el = MockExecutionLayer::new();
+    let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    let header = alloy_consensus::Header::default();
+    let what = driver
+        .prepare_first_build_on_output(GENESIS, header, attrs(), None)
+        .await
+        .expect("the request is started");
+    assert_eq!(what, "requested");
+    let built = driver.build_block_on(GENESIS, attrs(), 1).await.expect("built the ordinary way");
+    assert_eq!(built.number, 1);
+    let (ahead, why) = driver.last_build_path();
+    assert!(!ahead, "the refused build was not the one proposed");
+    assert!(why.is_some_and(|why| why.contains("refused") || why.contains("failed")), "{why:?}");
+    let count = |call: fn(&ElCall) -> bool| el.calls().iter().filter(|c| call(c)).count();
+    assert_eq!(count(|c| matches!(c, ElCall::ForkchoiceUpdatedWithAttrs(_))), 1);
+}
+
+/// A forkchoice build ahead on the same parent that has already finished is
+/// kept rather than replaced: it is the block the request would build.
+#[tokio::test]
+async fn a_finished_build_ahead_is_kept_for_the_first_build_of_a_tenure() {
+    let el = MockExecutionLayer::new();
+    let mut driver = ExecutionDriver::new(el.clone(), GENESIS);
+    driver.prepare_build_on(GENESIS, attrs()).await.expect("build ahead started");
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    let what = driver
+        .prepare_first_build_on_output(GENESIS, alloy_consensus::Header::default(), attrs(), None)
+        .await
+        .expect("nothing to start");
+    assert_eq!(what, "a forkchoice build ahead on this parent has already finished");
+    driver.build_block_on(GENESIS, attrs(), 1).await.expect("built");
+    assert_eq!(driver.last_build_path(), (true, None));
+}

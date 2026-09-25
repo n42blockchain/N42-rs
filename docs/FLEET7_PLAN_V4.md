@@ -2466,3 +2466,28 @@ the handover falls in window 3, so windows 1-2 do not change by it: 944-969k and
 decay across windows is the state's growth, not consensus. The window stands at 969-970k; the last 3% is the
 verifier: `curve25519-dalek` 4 selects its AVX2 backend only with `--cfg curve25519_dalek_backend="simd"` (not by
 `target-cpu` alone), which loop256 builds.
+
+### 7.19 The verifier's simd backend (loop256): no change to the cost, the ingest at ~820k/s a node whatever is offered
+
+| leg | build | rate | win1 | win2 | cycle | B | ingest rate / node | busy us/tx | slots busy |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| SIMDa | native + simd cfg | 950k | 958,416 | 760,449 | 162 | 124 | 786k | 11 | 72% |
+| NATc | native | 950k | 933,807 | 760,632 | 163 | 104 | 806k | 11 | 76% |
+| SIMDb | native + simd cfg | 950k | 948,974 | 766,053 | 167 | 129 | 810k | 11 | 76% |
+| SIMD1000 | native + simd cfg | 1.0M | 957,634 | 749,766 | 165 | 107 | **822k** | 11 | 77% |
+
+`--cfg curve25519_dalek_backend="simd"` on top of `target-cpu=native` leaves `busy_us_per_tx` at 11 (the batch
+equation's multiscalar multiplication is not where that backend helps, or the cfg did not take -- the build log
+shows no such warning either way), and the windows are the same 949-958k; at a 1.0M/s offer each node admits
+822k/s, so **the per-node ingest ceiling is ~800-820k/s at 11 us a signature, whatever the flood offers**, and the
+window is ~950-970k. The last levers inside the protocol are the batch size (sigbench: 256 is 21% cheaper a
+signature, blocked by defect 16 -- read next) and the verifier crate itself; past those, verification once fleet-wide.
+
+## 8. Where the campaign stands (2026-09-25, after loop256)
+
+Three nodes on this box, the node built for its CPU, tenure 1024, the supply rated at 925-950k/s, the fills and
+the handover fixed: **970,277 on a window (loop254), 950-970k on every window 1 since, 750-790k on window 2 as the
+state grows, one TC a leg (view 1)**. Four nodes stood at 769k when the day began. Tags:
+`fleet3-970k-window-20260925`, main at the same commit. The 3% to 1M on a window is the ingest's 11 us a signature
+on every node against the road that shares its cores; the round past 1M is a different matter (the state's growth
+over a leg, a protocol's verification design). `docs/FLEET7_PLAN_V4.md` sections 6-7 carry every measurement.

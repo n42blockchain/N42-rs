@@ -2538,3 +2538,19 @@ window is now bound by the generator, not the chain**: the chain's cycle is 157-
 109-128. The one configuration left is the cores: three nodes at 70 logical (35 physical) instead of 74 leave the
 flood 23 physical cores (+35% of signing), at 68 it has 26 -- loop259, at a 1.05M offer, with the 74-core control.
 Falsified if the nodes lose more than the flood gains (the cycle over 175, B over 130) or the window stays under 990k.
+
+### 7.23 Cores from the nodes to the flood (loop259): the flood does not sign faster with them
+
+| leg | node cores | flood cores (physical) | offer | win1 | win2 | flood win1 (k/s) | sign thread-s | cycle | B | TCs |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| N70a | 70 | 23 | 1.05M | 955,799 | 787,790 | 903 | 824 | 164 | 125.5 | 5 |
+| C74 | 74 | 17 | 950k | 945,979 | 744,332 | 896 | 918 | 161 | 115 | 1 |
+| N70b | 70 | 23 | 1.05M | 958,509 | 776,932 | 877 | 823 | 161 | 123 | 2 |
+| N68 | 68 | 26 | 1.05M | 944,552 | 771,195 | 905 | 793 | 162 | 126 | 1 |
+
+Falsified: with 23-26 physical cores the flood delivers the same 877-905k/s and signs *less* (793-824
+thread-seconds against 918) -- it is not signing-bound but bound by its send-and-reply loop (64 requests of 500 in
+flight per node at ~180 ms a reply). The nodes at 70/68 cores are not hurt (cycle 161-164, B 123-126). So the
+generator's structure -- the requests in flight and the frame -- is the last supply term, and a rated flood
+with more in flight no longer risks 6.17's coupling (the token bucket bounds what is in flight): loop260 runs
+`--rpcbatch 1000` and `--conc 96` at a 1.0M offer.

@@ -722,15 +722,18 @@ mod merged_batch_tests {
     }
 
     /// Per-signature cost of ed25519-dalek's batch verification and the merged equation, for a
-    /// batch from one sender and a batch from 128 senders. A measurement, not a check:
-    /// `cargo test --release -p n42-tx-types --lib merged_batch_timing -- --ignored --nocapture`.
+    /// batch from one sender and a batch from up to 128 senders, at the batch size
+    /// `N42_ED25519_BATCH` names (default 128). A measurement, not a check:
+    /// `N42_ED25519_BATCH=256 cargo test --release -p n42-tx-types --lib merged_batch_timing -- --ignored --nocapture`.
     #[test]
     #[ignore = "timing; run by hand"]
     fn merged_batch_timing() {
+        let size: usize = std::env::var("N42_ED25519_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
         let shapes: [(&str, Vec<AltSigTx>); 2] = [
-            ("one sender", (0..128).map(|nonce| signed(9, nonce)).collect()),
-            ("128 senders", (0..128u64).map(|nonce| signed((nonce % 128) as u8 + 100, nonce)).collect()),
+            ("one sender", (0..size as u64).map(|nonce| signed(9, nonce)).collect()),
+            ("distinct senders", (0..size as u64).map(|nonce| signed((nonce % 128) as u8 + 100, nonce)).collect()),
         ];
+        println!("batch {size}");
         for (name, txs) in shapes {
             let (hashes, signatures, keys) = parts(&txs);
             let messages: Vec<&[u8]> = hashes.iter().map(|hash| hash.as_slice()).collect();
@@ -739,7 +742,7 @@ mod merged_batch_tests {
                     .map(|_| {
                         let started = std::time::Instant::now();
                         assert!(f());
-                        started.elapsed().as_secs_f64() * 1e6 / 128.0
+                        started.elapsed().as_secs_f64() * 1e6 / size as f64
                     })
                     .collect();
                 runs.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
@@ -748,6 +751,48 @@ mod merged_batch_tests {
             let dalek = per_signature(&|| ed25519_dalek::verify_batch(&messages, &signatures, &keys).is_ok());
             let merged = per_signature(&|| batch_equation_holds(&messages, &signatures, &keys));
             println!("{name}: ed25519-dalek {dalek:.1} us a signature, merged {merged:.1} us ({:.0}% less)", (1.0 - merged / dalek) * 100.0);
+        }
+    }
+
+    /// Verdicts for `txs` cut into chunks of `batch`, as the ingest, the claimed build and the
+    /// follower import cut their lists (`chunks(ed25519_batch_size())`).
+    fn chunked(txs: &[AltSigTx], batch: usize) -> Vec<Result<Address, AltSigError>> {
+        let refs: Vec<&AltSigTx> = txs.iter().collect();
+        refs.chunks(batch).flat_map(verify_batch).collect()
+    }
+
+    /// Defect 16's question: does the batch size change which transactions verify, or the
+    /// sender a verified one records? A 200-transaction frame from seven senders (each
+    /// sender repeated across chunk boundaries), with one corrupted signature, one
+    /// non-canonical s (a shape failure) and one signature over another transaction's
+    /// message, verified at 1, 64, 128, 200 and 256: every size gives each transaction the
+    /// verdict and the sender `AltSigTx::verify` gives it alone.
+    #[test]
+    fn the_batch_size_changes_no_verdict_and_no_sender() {
+        let mut txs: Vec<AltSigTx> = (0..200u64).map(|nonce| signed((nonce % 7) as u8 + 40, nonce)).collect();
+        // Corrupted inside the first 64-chunk, the second 128-chunk and the last 64-chunk.
+        let (fields, signature, _) = txs[63].clone().into_parts();
+        let mut corrupted = signature.to_vec();
+        corrupted[40] ^= 1;
+        txs[63] = AltSigTx::new(fields, Bytes::from(corrupted));
+        let (fields, signature, _) = txs[130].clone().into_parts();
+        let mut non_canonical = signature.to_vec();
+        non_canonical[32..].copy_from_slice(&[0xff; 32]);
+        txs[130] = AltSigTx::new(fields, Bytes::from(non_canonical));
+        let (fields, _, _) = txs[199].clone().into_parts();
+        let (_, other, _) = txs[192].clone().into_parts(); // the same sender, another nonce
+        txs[199] = AltSigTx::new(fields, other);
+
+        let alone: Vec<Option<Address>> = txs.iter().map(|tx| tx.verify().ok()).collect();
+        assert_eq!(alone.iter().filter(|v| v.is_none()).count(), 3);
+        for (tx, verdict) in txs.iter().zip(&alone) {
+            if let Some(sender) = verdict {
+                assert_eq!(*sender, tx.tx.sender());
+            }
+        }
+        for batch in [1, 64, 128, 200, 256] {
+            let verdicts: Vec<Option<Address>> = chunked(&txs, batch).into_iter().map(Result::ok).collect();
+            assert_eq!(verdicts, alone, "batch {batch}");
         }
     }
 

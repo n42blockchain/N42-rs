@@ -2021,3 +2021,53 @@ cycle** -- 200k transactions a block at 195 ms is 1.0M if the supply follows, an
 old cycle; the balance has moved); (b) **three nodes** (quorum 2 of 3, 37 physical cores each), which gives the
 ingest and the consensus path room without changing a line. Both need a quiet box (the day's second run was 15%
 under the first for a foreign soak), and the box is shared by turns.
+
+### 6.21 The block's size at the 195 ms cycle (loop243, quiet box): 200k is not a step
+
+| leg | block | win1 | win2 | occupancy | cycle | B | exec | graft | road | import |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| warm | 163k | 740,323 | 623,007 | 97.3% | 195 | 76 | 65 | 62 | 76 | 199 |
+| B200 | 200k | 784,064 | 571,193 | **91.5%** | 221 | 96 | 81 | 70 | 112 | 264 |
+| B200b | 200k | 741,544 | 601,743 | 93.9% | 226 | 98 | 76 | 70 | 97 | 256 |
+| W163 | 163k | 763,730 | 620,965 | 97.6% | 196 | 75 | 68 | 60 | 81 | 206 |
+
+A 200k block costs the cycle its per-transaction terms back (exec +12, graft +8, the road +25, B +20: 195 -> 221-226)
+and the supply cannot fill it (91-94% occupancy at 745-770k/s), so it reads 742-784k against 740-764k: inside the
+spread. 163k stays.
+
+## 7. Where plan v6 ends (2026-09-25)
+
+Four nodes, the native chain, 163k-transfer blocks, pacing 175, the configuration of loop239 T16 plus SA
+(`N42_SEAL_AT_EXEC=1 N42_STATE_AFTER_PULL=1 N42_FOLLOWER_PARTITION_AHEAD=1 N42_ENGINE_TAKE_SEALED=1
+N42_BUILD_START_ASYNC=1 TOKIO_WORKER_THREADS=16` on the CH configuration): **740-770k on window 1 on a quiet box**
+(769,447 the best), a 195 ms cycle with 97-98% occupancy, and no window lost to a stall since defect 15. Plan v6
+began at 690-735k and 220 ms.
+
+Every millisecond of the cycle is named. The leader's period (161-172 to the seal, ~195 with the hand-off): the
+queue hand-off 5, pull 22, prep 12, partition 3, the wait for the parent's state 20-29, execution 64-69 (87% of it
+the account reads at ~2.3 us under sixteen threads), commit 9, seal 7. Behind the seal the parent's fold (graft
+insert 40 of memory latency, 62 in all) and `state_ready` 15 set the child's wait. The follower's road B 75-77
+(assemble 16, the transactions root 22, copy 8, check 7, transport), its gated execution 95, its import 190-206.
+
+What was tried and falsified in plan v6, in one line each: verifying on the road (relocation); the read view's
+lock (K, neutral); the overlay's depth (L); the graft's index/ranges/prefault/stream; pacing under 175 (stalls,
+then no gain); the flood's cores (reply-bound); `--conc 128` / 64 x 1000 (B +80 from per-node CPU); twenty recovery
+slots; ed25519 batch 128 (defect 16); the sharded graft (2.6x slower); the reverts sorted beside the finish
+(waited for); the road on its own runtime and at nice 0; 200k blocks. What was adopted: G2, G3, F1 parts 1 and 3,
+SA, sixteen tokio workers; defects 10-15 fixed.
+
+The two walls, and what 1M needs from each:
+1. **Supply.** Every node decodes and verifies every transaction (12 us each) on the same 28 physical cores as its
+   consensus path; at ~750k/s the flood is reply-bound and any more in flight slows the road by the CPU it takes.
+   1M needs verification paid once per transaction fleet-wide (a claim the leader's inclusion certifies and a
+   follower checks in batch off the vote path, or a sharded verification with a quorum's coverage) -- a protocol
+   design, not a knob -- or more cores per node (three nodes).
+2. **The cycle.** At 163k a block, 1M is 163 ms. The leader's period is bounded below by the parent's fold reaching
+   the child (graft 40 + state_ready 15 + the child's pull/prep 34 in parallel) plus execution 65 plus ~25 of
+   seal, hand-off and transport: ~150 if the graft's memory latency yields (a different map, or the shards kept
+   unmerged and read by the consumers), and the follower's B (75) must fall with it (the transactions root beside
+   the assembly, the copy removed).
+
+The next probe is three nodes (quorum 2 of 3, 37 physical cores each; no code), which loosens the first wall and
+says whether the second then binds where 6.13-6.19 predict. After it, the work is design: where signatures are
+verified, and what the block's state map is.

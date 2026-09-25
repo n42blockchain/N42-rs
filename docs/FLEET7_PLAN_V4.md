@@ -2289,3 +2289,19 @@ window-1 stall was 7.4's gate deadlock from the start-up transient (the supply o
 pool crossed the line to 1,031,644, replies 6-13 s until +55 s); and one TC where the leader proposed 4.6 s late
 because "the parent is still importing; proposing once it lands" (view 768) -- a leader-side wait on its own
 import, noted as 18b.
+
+### 7.11 The ingest's slots at 950k (loop250): more slots is worse, and the best round so far
+
+| leg | rate | slots | win1 | win2 | cycle | B | ingest rate / node | slots busy | fills | TCs |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| S16 | 950k | 16 | 461,601 | 603,954 | 164 | 123 | 751k | 57% | 1,202 | 8 |
+| S20 | 950k | 20 | 397,092 | 565,355 | 167 | 122 | 429k | 27% | 4,768 | 13 |
+| R925 | 925k | 12 | 279,955 (stall) | **907,303** | 163 | 98 | 811k | 76% | 951 | 6 |
+| R950 | 950k | 12 | **926,383** | **768,641** | 168 | 118.5 | 802k | 75% | 1,507 | 9 |
+
+Falsified: with 16 or 20 recovery slots the nodes admit *less* (751k and 429k/s against 802-811k with 12), B is
+122-123 either way and the fills multiply (up to 4,768: more churn, defect 18) -- the ingest's threads take the
+cores the road and the execution need, exactly 6.20's coupling. Twelve stays. The control leg is the campaign's
+best round: **926,383 on window 1 and 768,641 on window 2** at 950k/s, and R925's second window 907,303. The
+per-node ingest at 12 slots admits ~800-810k/s of a 925-950k/s offer, and that, with the road at 98-123 while it
+does, is the supply wall on this box: verification and decode at 11-12 us a transaction on every node.

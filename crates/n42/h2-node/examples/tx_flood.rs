@@ -44,7 +44,7 @@
 //! 12.5% climb; past that, let the chain idle or raise the price.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
@@ -157,6 +157,11 @@ struct Args {
     /// before it includes one, and on its vote road before it votes — so
     /// this changes where the work is done, never whether it is done.
     claim_sender: bool,
+    /// `--rate` (tx/s across the whole process, every node and every worker
+    /// combined; 0, the default, is unlimited). `scripts/fleet7-bench.sh`
+    /// divides this among `F7_FLOOD_PROCS` processes before it gets here, so
+    /// nothing in this file has to know about that split.
+    rate: f64,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -181,6 +186,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.offset,
         keys.first().map_or_else(|| "-".into(), |k| k.address().to_string())
     );
+    println!(
+        "rate         : {}",
+        if args.rate > 0.0 { format!("rate={:.0}/s", args.rate) } else { "rate=0/s (unlimited)".to_string() }
+    );
+    let limiter = Arc::new(RateLimiter::new(args.rate));
 
     if !args.skip_funding {
         fund(&client, &args, &keys)?;
@@ -241,8 +251,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let chunk = args.senders.div_ceil(args.conc.max(1));
     std::thread::scope(|scope| {
         for (worker, part) in keys.chunks(chunk).enumerate() {
-            let (client, sent, rejected, args) =
-                (Arc::clone(&client), Arc::clone(&sent), Arc::clone(&rejected), &args);
+            let (client, sent, rejected, limiter, args) =
+                (Arc::clone(&client), Arc::clone(&sent), Arc::clone(&rejected), Arc::clone(&limiter), &args);
             scope.spawn(move || {
                 let mut batch: Vec<String> = Vec::with_capacity(args.rpc_batch);
                 // Every sender this thread owns is in flight at once, a batch at
@@ -286,7 +296,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
                 if let Some(conn) = ingest.as_mut() {
-                    flood_over_ingest(conn, part, worker * chunk, &mut nonce, &mut stalls, args, &sent, &rejected);
+                    flood_over_ingest(
+                        conn, part, worker * chunk, &mut nonce, &mut stalls, args, &sent, &rejected, &limiter,
+                    );
                     return;
                 }
                 while live > 0 {
@@ -324,6 +336,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     signed(key, n, args.chain_id, args.gas_price, args.gas, 1, to)
                                 }),
                         );
+                        // Wait for the bucket before the batch leaves, not
+                        // after: a frame is sent only when it can take its
+                        // full `rpcbatch` worth of tokens at once.
+                        limiter.take(batch.len());
                         let accepted = submit(&client, rpc, &batch, &sent, &rejected);
                         nonce[index] += accepted as u64;
                         if accepted < batch.len() {
@@ -360,6 +376,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // number.
     println!("note         : the submission rate above is this harness's ceiling, not the chain's");
     Ok(())
+}
+
+/// A process-wide token bucket that caps how many transactions the whole
+/// flood may *send* per second, across every worker thread and every node it
+/// floods.
+///
+/// Refill is continuous (by elapsed wall time, not by tick), so the achieved
+/// rate tracks the target smoothly rather than stair-stepping once a second.
+/// Capacity is one second of tokens: enough that a frame is never split to
+/// fit under the cap, small enough that a worker that stalled behind a slow
+/// node cannot spend a burst of built-up tokens on a wall of frames once it
+/// frees up. `rate <= 0` disables the bucket entirely — `take` returns at
+/// once, exactly like the no-limiter behaviour this replaces.
+struct RateLimiter {
+    rate: f64,
+    state: Mutex<RateLimiterState>,
+}
+
+struct RateLimiterState {
+    tokens: f64,
+    last: Instant,
+}
+
+impl RateLimiter {
+    fn new(rate: f64) -> Self {
+        Self { rate, state: Mutex::new(RateLimiterState { tokens: rate.max(0.0), last: Instant::now() }) }
+    }
+
+    /// Blocks the calling thread until `n` tokens can be taken from the
+    /// bucket, then takes them. A frame is sent only after this returns, so
+    /// the total send rate across every caller never exceeds `rate`.
+    fn take(&self, n: usize) {
+        if self.rate <= 0.0 {
+            return;
+        }
+        let capacity = self.rate;
+        let n = (n as f64).min(capacity);
+        loop {
+            let wait = {
+                let mut state = self.state.lock().expect("rate limiter lock");
+                let now = Instant::now();
+                let elapsed = now.duration_since(state.last).as_secs_f64();
+                state.tokens = (state.tokens + elapsed * self.rate).min(capacity);
+                state.last = now;
+                if state.tokens >= n {
+                    state.tokens -= n;
+                    return;
+                }
+                Duration::from_secs_f64((n - state.tokens) / self.rate)
+            };
+            // Never sleep past a short slice: another thread may free up
+            // tokens (or take them) in the meantime, and a long single sleep
+            // would make this thread's own wait imprecise.
+            std::thread::sleep(wait.clamp(Duration::from_millis(1), Duration::from_millis(50)));
+        }
+    }
 }
 
 /// A flood sender: a secp256k1 key for EIP-1559 transfers, or an Ed25519 key
@@ -433,6 +505,7 @@ fn flood_over_ingest(
     args: &Args,
     sent: &AtomicU64,
     rejected: &AtomicU64,
+    limiter: &RateLimiter,
 ) {
     /// Frames a worker may have unanswered at once.
     ///
@@ -485,6 +558,9 @@ fn flood_over_ingest(
             // transaction in a lane. It is a claim, not a credential: every
             // node verifies the signature where it uses the sender.
             let claim = args.claim_sender.then(|| key.address());
+            // Same bucket as the RPC path: a frame goes out only once it can
+            // take its transaction count in tokens.
+            limiter.take(batch.len());
             if conn.send(index, &batch, claim).is_err() {
                 return;
             }
@@ -979,6 +1055,7 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
         ingest_timeout: 10,
         recipients: 1,
         claim_sender: std::env::var("N42_FLOOD_CLAIM_SENDER").is_ok_and(|v| v != "0"),
+        rate: 0.0,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -1004,6 +1081,7 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
             "--shard-senders" => args.shard_senders = true,
             "--legacy-recipients" => args.legacy_recipients = true,
             "--skip-funding" => args.skip_funding = true,
+            "--rate" => args.rate = next()?.parse()?,
             "--help" | "-h" => {
                 eprintln!("{USAGE}");
                 std::process::exit(0);
@@ -1043,6 +1121,9 @@ tx_flood — fund a derived sender set and flood the fleet with transfers
   --claim-sender          ingest frames carry the sender that signed each transaction, for a
                           node running N42_INGEST_VERIFY=leader (N42_FLOOD_CLAIM_SENDER=1)
   --skip-funding      the senders are already funded
+  --rate <tx/s>       cap the whole process's send rate across every worker and every
+                      node (default 0, unlimited); F7_FLOOD_PROCS splits this before
+                      it reaches this flag, so one process's --rate is its own share
 ";
 
 #[cfg(test)]
@@ -1087,5 +1168,32 @@ mod tests {
             .concat()
         );
         assert_eq!(claiming.len(), frame_bytes(&batch, None).len() + 40);
+    }
+
+    /// A disabled bucket (`rate <= 0`) never blocks, whatever it is asked
+    /// for.
+    #[test]
+    fn rate_limiter_disabled_never_blocks() {
+        let limiter = RateLimiter::new(0.0);
+        let start = Instant::now();
+        limiter.take(1_000_000);
+        assert!(start.elapsed() < Duration::from_millis(10));
+    }
+
+    /// A full bucket takes its first second's worth at once, then the
+    /// bucket's own rate paces the rest: asking for another half-second's
+    /// worth right after takes about half a second to refill.
+    #[test]
+    fn rate_limiter_bursts_to_capacity_then_paces_at_the_rate() {
+        let limiter = RateLimiter::new(1000.0); // 1000 tok/s, capacity 1000
+        let start = Instant::now();
+        limiter.take(1000);
+        assert!(start.elapsed() < Duration::from_millis(50), "the initial burst should not wait");
+        limiter.take(500);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(400) && elapsed < Duration::from_millis(700),
+            "expected ~500ms to refill 500 tokens at 1000/s, got {elapsed:?}"
+        );
     }
 }

@@ -2316,3 +2316,26 @@ into the frame of record in index order, a duplicate body no longer overwrites i
 (`fill converged rounds=..` / `fill did not converge; asking for the whole body`). Why the queue lost the second set
 (137 transactions there at the first assembly, gone at the second -- the parent's commit 40 ms earlier?) is not
 confirmed; the bound covers it. 18b untouched.
+
+### 7.12 The fill converging (loop251): 931,787 on a window, TCs 1-3 a leg, the round at 730-850k
+
+| leg | rate | win1 | win2 | cycle | B | D | fills (rounds 1 / 2) | fallbacks | gate holds | TCs | idles >5 s |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| A950 | 950k | 830,719 | 727,828 | 159 | 114.5 | 14 | 61 (54 / 7) | 0 | 10 | 2 | 2 |
+| A925 | 925k | 655,791 | **853,006** | 164 | 116 | 11.5 | 87 (83 / 7) | 0 | 3 | 2 | 2 |
+| B950 | 950k | **931,787** | 651,771 | 161 | 110 | 25 | 62 (52 / 10) | 0 | 5 | 1 | 1 |
+| B925 | 925k | 464,138 (stall) | 782,363 | 163 | 89.5 | 31 | 81 (65 / 16) | 0 | 20 | 3 | 3 |
+
+Every fill converges in one or two rounds (no fallback), the TCs are 1-3 a leg (from 4-6, from 9-22 before
+17b), and the window record is **931,787** at a 161 ms cycle with 99% occupancy. A round still loses ~6 s to each
+remaining TC (a window 2 of 652-853k against a window 1 of 831-932k), and B sits at 110-116 at 925-950k: the
+per-node ingest admits 690-800k/s of the offer with the road stretched by the same contention (6.20, 7.11).
+Tagged `fleet3-930k-window-20260925`; main fast-forwarded.
+
+Where the 1M stands after the three-node campaign (loop244-251): the leader seals at 136-142; the chain's cycle
+is 153-163 (1.0-1.06M/s of capacity at 163k); the window tops at ~930k because the followers' ingest at
+925-950k/s takes the cores the road needs (B 79 -> 110-123 between 900k and 950k); and a round is a window minus
+6 s per remaining TC. The three levers, in order of cost: the remaining TCs (1-3 a leg; the leader waiting on its
+own parent's import, 18b, and the start-up transient); the ingest's priority against the road (a probe: the
+recovery threads at nice 19, loop252); and, for the window past 1M, verification paid once per transaction
+fleet-wide rather than on every node -- the design question, unchanged since 6.12.

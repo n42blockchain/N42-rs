@@ -417,8 +417,9 @@ static GATE_FORCED: AtomicU64 = AtomicU64::new(0);
 /// the block completes within a retry or two and its commit prunes a block's
 /// worth). The backpressure the gate exists for is untouched whenever no
 /// block is pending, which is the steady state: a pool that is full because
-/// the chain is slow still holds the generator. `N42_TX_INGEST_GATE_STRICT=1`
-/// restores the old gate, which deadlocks as described.
+/// the chain is slow still holds the generator. The opening is opt-in
+/// (`N42_TX_INGEST_GATE_FOR_BLOCK=1`, see [`gate_strict`]); without it the
+/// old gate, which deadlocks as described, is what runs.
 const GATE_FOR_BLOCK_WINDOW_MS: u64 = 500;
 
 /// [`gate_clock_ms`] until which a block's misses keep the gate open; zero
@@ -439,11 +440,21 @@ static BLOCK_PENDING_LOGGED: AtomicU64 = AtomicU64::new(0);
 /// process started (`gate_opened_for_block` on the `ingest` line).
 static GATE_OPENED_FOR_BLOCK: AtomicU64 = AtomicU64::new(0);
 
-/// `N42_TX_INGEST_GATE_STRICT`, read once: the gate before defect 17's fix.
+/// Whether the gate stays shut for a pending block. Off unless
+/// `N42_TX_INGEST_GATE_FOR_BLOCK=1`: on loop246 (three nodes, the generator
+/// at 880k/s against a chain consuming 860k/s) the road missed something on
+/// most blocks, the window never lapsed, 16-26 thousand frames a leg went
+/// past the limit and the pool grew without bound -- the fleet then died
+/// faster than with the deadlock. The supply has to be rated at or under
+/// the chain's consumption (plan v4 7.5); the opening is kept for a fleet
+/// that is. `N42_TX_INGEST_GATE_STRICT=1` is the same as leaving the opt-in
+/// unset and is read for the older runners.
 fn gate_strict() -> bool {
     static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *STRICT.get_or_init(|| {
-        std::env::var("N42_TX_INGEST_GATE_STRICT").is_ok_and(|value| value == "1")
+        let opt_in = std::env::var("N42_TX_INGEST_GATE_FOR_BLOCK").is_ok_and(|value| value == "1");
+        let strict = std::env::var("N42_TX_INGEST_GATE_STRICT").is_ok_and(|value| value == "1");
+        strict || !opt_in
     })
 }
 

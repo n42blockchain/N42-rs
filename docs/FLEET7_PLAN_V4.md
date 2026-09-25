@@ -1986,3 +1986,38 @@ So the leader's period is the parent's fold (62 + `state_ready` 15) reaching the
 is the graft insert's 40 ms of memory latency. What is left for it: the insert into a pre-sized map is already
 `reserve`d (9 ms); the probe cost itself would need a different map (an open-addressing table keyed by a prefix,
 or the shards kept unmerged) -- deferred behind Q2, because the supply binds first.
+
+### 6.20 Q2 on the fleet (loop242): the road's runtime and the nice level are not it either
+
+`plan-v6/road-runtime` (merged 314756c9a): the validator's channel served on a dedicated 4-worker runtime
+(`N42_ROAD_RUNTIME=1`), `dispatch_wait_ms` from the kernel's receive stamp to the road's first timer
+(`N42_ROAD_DISPATCH_WAIT=1` for the baseline). The author's suspicion was the ingest's nice-10 recovery threads
+being reused by tokio as workers; `N42_TX_INGEST_RECOVER_NICE=0` is the probe. Same unquiet box as 6.19.
+
+| leg | in flight | win1 | win2 | cycle | B | dispatch_wait | road total | flood 45 s |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| warm | 32k | 671,029 | 466,936 | 212 | 102 | 0 | 117 | 432k/s, replies 390-427 ms |
+| RR | 32k | 650,855 | 476,970 | 218 | 92 | 0 | 107 | 387k/s |
+| RRC128 | 64k | 564,663 | 505,283 | 261 | **166** | 0 | 85 | 32k/s (replies 8-9 s: a flood stall) |
+| N0C128 (nice 0) | 64k | 558,113 | 565,045 | 259 | **166** | 0 | 83 | 642k/s |
+
+Falsified twice: with the road on its own runtime B is 166 at 64k in flight as before, and at nice 0 the same
+166; `dispatch_wait_ms` reads 0 everywhere -- either the request truly does not wait in the socket, or the counter
+cannot see it (the validator opens a new connection whenever the previous reply is still out, and the first segment
+on a fresh socket predates the timestamp option; the author flagged this). Either way the ~70 ms between the
+validator's "body received" and the road's first timer (6.18) are not the execution layer's runtime, its
+blocking pool, its thread priorities or its socket queue. What is left is the plainest reading: **CPU contention on
+the node's 28 physical cores** -- twice the frames being decoded and recovered at once slows every other thread on
+the node, the validator's included, by the same ~70 ms, and no runtime split changes that. The supply is therefore
+bound by per-node CPU as 6.12 said: verification on every node at 12 us a transaction, plus decode, against the
+consensus path on the same cores.
+
+Where this leaves the 1M question after plan v6 (2026-09-25): four nodes read 750-770k on a quiet box at a
+~195 ms cycle with full blocks; the cycle's terms are all named (6.13-6.19) and the two that bind -- the parent's
+graft insert (40 ms of memory latency) and the supply (750k/s of CPU-bound ingest) -- do not yield to the
+parallel forms tried. Two configuration probes remain before any further code: (a) **the block's size at this
+cycle** -- 200k transactions a block at 195 ms is 1.0M if the supply follows, and the per-block fixed terms (B
+~77, the hand-off, the seal) now weigh more than the per-transaction ones (5.x found 163k flat against 200k at the
+old cycle; the balance has moved); (b) **three nodes** (quorum 2 of 3, 37 physical cores each), which gives the
+ingest and the consensus path room without changing a line. Both need a quiet box (the day's second run was 15%
+under the first for a foreign soak), and the box is shared by turns.

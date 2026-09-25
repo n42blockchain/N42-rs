@@ -237,6 +237,73 @@ pub fn with_fill(frame: &[u8], fill: &[(usize, alloy_primitives::Bytes)]) -> Vec
     w.0
 }
 
+/// The frame with `fill` merged into whatever fill it already carries: one
+/// fill section, the union of both, in strictly increasing index order.
+///
+/// What the side that assembles keeps as a block's frame of record across
+/// fill rounds (defect 18). [`with_fill`] appends a section to a frame that
+/// must not have one yet; applying each round's answer to the frame as it
+/// arrived from the peer -- not to the one the last round filled -- lost
+/// every earlier round's fill, and loop249's followers asked for the same
+/// two sets of positions in turn, 340-360 times, until the view timed out.
+/// A position supplied twice keeps the first supply: both are checked
+/// against the hash the frame names for that position, so they are the same
+/// bytes or the assembly refuses the frame.
+pub fn merge_fill(
+    frame: &[u8],
+    fill: &[(usize, alloy_primitives::Bytes)],
+) -> Result<Vec<u8>, BlockBodyError> {
+    let mut r = Reader(frame);
+    if r.take(MAGIC.len())? != MAGIC || r.u8()? != VERSION {
+        return Err(invalid());
+    }
+    r.bytes()?;
+    let count = r.u32()? as usize;
+    r.take(count.checked_mul(32).ok_or_else(invalid)?)?;
+    r.bytes()?;
+    r.bytes()?;
+    if r.u8()? == 1 {
+        r.bytes()?;
+    }
+    let base = frame.len() - r.0.len();
+    let mut merged: std::collections::BTreeMap<usize, &[u8]> = std::collections::BTreeMap::new();
+    if !r.0.is_empty() {
+        if r.u8()? != FILL_PRESENT {
+            return Err(invalid());
+        }
+        let n = r.u32()? as usize;
+        for _ in 0..n {
+            let index = r.u32()? as usize;
+            if index >= count || merged.insert(index, r.bytes()?).is_some() {
+                return Err(invalid());
+            }
+        }
+        if !r.0.is_empty() {
+            return Err(invalid());
+        }
+    }
+    for (index, tx) in fill {
+        if *index >= count {
+            return Err(invalid());
+        }
+        merged.entry(*index).or_insert(&tx[..]);
+    }
+    let mut w = Writer(Vec::with_capacity(
+        base + 8 + merged.values().map(|tx| tx.len() + 8).sum::<usize>(),
+    ));
+    w.0.extend_from_slice(&frame[..base]);
+    if merged.is_empty() {
+        return Ok(w.0);
+    }
+    w.u8(FILL_PRESENT);
+    w.u32(merged.len() as u32);
+    for (index, tx) in merged {
+        w.u32(index as u32);
+        w.bytes(tx);
+    }
+    Ok(w.0)
+}
+
 /// Whether these bytes claim to be a compact body. Cheap, and the only thing
 /// that tells the two shapes apart on a channel that carries both.
 pub fn is_compact_body(bytes: &[u8]) -> bool {
@@ -490,6 +557,53 @@ mod tests {
         let mut wrong_marker = filled.clone();
         wrong_marker[frame.len()] = FILL_PRESENT + 1;
         assert!(decode_compact_body(&wrong_marker, N42HeaderProfile::Ethereum).is_err());
+    }
+
+    /// Defect 18: fills across rounds converge. The queue here loses a
+    /// transaction between rounds, so the second round asks for a position
+    /// the first did not; with each answer merged into the frame of record,
+    /// the next miss report is empty. Applied to the frame as it arrived
+    /// (the old road), the second answer drops the first and the round
+    /// after asks for round one's positions again -- the alternation
+    /// loop249 saw.
+    #[test]
+    fn fills_merged_into_the_frame_of_record_converge() {
+        let txs = transactions();
+        let hashes: Vec<B256> = txs.iter().map(keccak256).collect();
+        let body = encode_block_rlp_raw(&header(), &txs, &[], None);
+        let frame = encode_compact_body(&body, &hashes, N42HeaderProfile::Ethereum).expect("encodes");
+        // What the assembler asks for: every position neither its queue
+        // holds nor the frame's fill covers.
+        let misses = |frame: &[u8], queue: &[usize]| -> Vec<usize> {
+            let decoded = decode_compact_body(frame, N42HeaderProfile::Ethereum).expect("decodes");
+            let covered: Vec<usize> = decoded.fill.iter().map(|(i, _)| *i).collect();
+            (0..decoded.hashes.len()).filter(|i| !queue.contains(i) && !covered.contains(i)).collect()
+        };
+        let supply = |indices: &[usize]| -> Vec<(usize, alloy_primitives::Bytes)> {
+            indices.iter().map(|&i| (i, txs[i].clone())).collect()
+        };
+        assert!(txs.len() >= 3);
+        let last = txs.len() - 1;
+        let mut queue: Vec<usize> = (1..txs.len()).collect();
+        let first = misses(&frame, &queue);
+        assert_eq!(first, vec![0]);
+        let mut record = merge_fill(&frame, &supply(&first)).expect("merges");
+        assert!(misses(&record, &queue).is_empty(), "one fill, and nothing is missing");
+        // The queue loses a transaction before the assembly runs again.
+        queue.retain(|&i| i != last);
+        let second = misses(&record, &queue);
+        assert_eq!(second, vec![last], "only what the queue lost, not round one's positions");
+        record = merge_fill(&record, &supply(&second)).expect("merges");
+        assert!(misses(&record, &queue).is_empty(), "converged");
+        let decoded = decode_compact_body(&record, N42HeaderProfile::Ethereum).expect("decodes");
+        assert_eq!(decoded.fill, vec![(0, &txs[0][..]), (last, &txs[last][..])]);
+        // The old road: the second answer applied to the frame as it arrived.
+        let old = with_fill(&frame, &supply(&second));
+        assert_eq!(misses(&old, &queue), first, "round one's positions asked again");
+        // A merge of nothing new is the frame; a position out of range is refused.
+        assert_eq!(merge_fill(&frame, &[]).expect("merges"), frame);
+        assert_eq!(merge_fill(&record, &supply(&first)).expect("merges"), record);
+        assert!(merge_fill(&frame, &[(txs.len(), txs[0].clone())]).is_err());
     }
 
     #[test]

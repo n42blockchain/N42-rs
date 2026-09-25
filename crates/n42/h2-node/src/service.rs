@@ -305,6 +305,11 @@ pub struct H2Service<E> {
     /// When this node asked for a block's missing transactions, for the
     /// `waited_ms` on the line that reports the answer (defect 17b).
     fill_asked: std::collections::HashMap<B256, std::time::Instant>,
+    /// A block's fill rounds so far (defect 18): how many times this node
+    /// asked, what it asked for first and last, and every position a peer
+    /// has supplied. What bounds the rounds before the whole-body fetch and
+    /// what the `fill converged` line reports once the block assembles.
+    fill_rounds: std::collections::HashMap<B256, FillRounds>,
     /// Requests for named transactions this node holds only as an imported
     /// block: served from the execution layer on the next drain, the way a
     /// whole body is.
@@ -654,6 +659,57 @@ type ServedTxnsTx = tokio::sync::mpsc::UnboundedSender<ServedTxns>;
 /// Where the loop takes it.
 type ServedTxnsRx = tokio::sync::mpsc::UnboundedReceiver<ServedTxns>;
 
+/// One block's fill rounds; see `fill_rounds` on the service.
+#[derive(Debug, Default)]
+struct FillRounds {
+    /// Requests made for this block, one per miss report.
+    rounds: u32,
+    /// The first report's count.
+    wanted_first: usize,
+    /// The latest report's count.
+    wanted_last: usize,
+    /// Every position a peer has supplied and the frame of record carries.
+    supplied: std::collections::HashSet<u32>,
+}
+
+/// What to do with a block's latest miss report.
+#[derive(Debug, PartialEq, Eq)]
+enum FillStep {
+    /// Ask a peer for these positions: round `round` of at most the bound.
+    Ask { round: u32 },
+    /// Stop filling and fetch the whole body: the bound is reached, or the
+    /// report names positions already supplied (the fill is not reaching
+    /// the assembly, as in defect 18).
+    WholeBody { resupplied: usize },
+}
+
+impl FillRounds {
+    /// Records a miss report and says whether to ask for it.
+    fn next(&mut self, indices: &[u32], max_rounds: u32) -> FillStep {
+        let resupplied = indices.iter().filter(|i| self.supplied.contains(i)).count();
+        if self.rounds == 0 {
+            self.wanted_first = indices.len();
+        }
+        self.wanted_last = indices.len();
+        if resupplied > 0 || self.rounds >= max_rounds {
+            return FillStep::WholeBody { resupplied };
+        }
+        self.rounds += 1;
+        FillStep::Ask { round: self.rounds }
+    }
+}
+
+/// `N42_FILL_ROUNDS_MAX`: how many times a follower asks peers for a block's
+/// missing transactions before it fetches the whole body instead (defect
+/// 18: loop249 asked 340-360 times over the 6.9 s to the view timeout).
+/// Default 3; at least 1.
+fn fill_rounds_max() -> u32 {
+    static MAX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("N42_FILL_ROUNDS_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(3).max(1)
+    })
+}
+
 /// The transactions a `block_txns` request names, out of a gov5 body.
 fn fill_from_body(
     body: &[u8],
@@ -862,6 +918,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             body_from: std::collections::HashMap::new(),
             fill_peers: std::collections::HashMap::new(),
             fill_asked: std::collections::HashMap::new(),
+            fill_rounds: std::collections::HashMap::new(),
             pending_txns_requests: Vec::new(),
             loop_spend: LoopSpend::default(),
             served_txns: tokio::sync::mpsc::unbounded_channel(),
@@ -1667,9 +1724,31 @@ impl<E: ExecutionLayer> H2Service<E> {
                             .map(|&i| i as usize)
                             .zip(txns)
                             .collect();
-                        let filled = alloy_primitives::Bytes::from(
-                            n42_h2_consensus::with_fill(&frame, &fill),
-                        );
+                        // Merged into the frame of record, which is then
+                        // replaced by it: the next miss report is computed
+                        // from every round's fill, not only this one's.
+                        // Defect 18 appended each answer to the frame as it
+                        // arrived and never kept the result, so each round
+                        // undid the one before and the rounds alternated
+                        // between two sets until the view timed out.
+                        let filled = match n42_h2_consensus::merge_fill(&frame, &fill) {
+                            Ok(filled) => alloy_primitives::Bytes::from(filled),
+                            Err(err) => {
+                                warn!(target: "n42.h2.node", hash = ?request.hash, %err, %peer, "a fill could not be merged into the compact body; asking for the whole body");
+                                self.fill_asked.remove(&request.hash);
+                                self.fill_rounds.remove(&request.hash);
+                                self.forget_compact_body(request.hash);
+                                return Ok(());
+                            }
+                        };
+                        self.compact_bodies.insert(request.hash, filled.clone());
+                        let round = match self.fill_rounds.get_mut(&request.hash) {
+                            Some(rounds) => {
+                                rounds.supplied.extend(request.indices.iter().copied());
+                                rounds.rounds
+                            }
+                            None => 0,
+                        };
                         let waited_ms = self
                             .fill_asked
                             .remove(&request.hash)
@@ -1679,6 +1758,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                             hash = ?request.hash,
                             wanted = request.indices.len(),
                             filled = fill.len(),
+                            round,
                             bytes = filled.len(),
                             waited_ms,
                             %peer,
@@ -2580,6 +2660,22 @@ impl<E: ExecutionLayer> H2Service<E> {
             DriverAction::Consensus(event) => {
                 // The engine's extends rule reads the parent of an imported
                 // block; every block imported here came with its header.
+                if let ConsensusEvent::BlockImported(block_hash) | ConsensusEvent::BlockChecked(block_hash) =
+                    event.as_ref()
+                    && let Some(rounds) = self.fill_rounds.remove(block_hash)
+                {
+                    info!(
+                        target: "n42.h2.node",
+                        ?block_hash,
+                        rounds = rounds.rounds,
+                        wanted_first = rounds.wanted_first,
+                        // The block assembled: nothing is missing now.
+                        wanted_last = 0u64,
+                        last_asked = rounds.wanted_last,
+                        supplied = rounds.supplied.len(),
+                        "fill converged"
+                    );
+                }
                 if let ConsensusEvent::BlockImported(block_hash) = event.as_ref() {
                     self.remember_imported(*block_hash);
                     if let Some(header) = self.block_headers.get(block_hash) {
@@ -2601,6 +2697,24 @@ impl<E: ExecutionLayer> H2Service<E> {
                 }
             }
             DriverAction::TransactionsMissing { block_hash, indices } => {
+                let max_rounds = fill_rounds_max();
+                let rounds = self.fill_rounds.entry(block_hash).or_default();
+                if let FillStep::WholeBody { resupplied } = rounds.next(&indices, max_rounds) {
+                    info!(
+                        target: "n42.h2.node",
+                        ?block_hash,
+                        rounds = rounds.rounds,
+                        max_rounds,
+                        wanted_first = rounds.wanted_first,
+                        wanted_last = rounds.wanted_last,
+                        resupplied,
+                        "fill did not converge; asking for the whole body"
+                    );
+                    self.fill_rounds.remove(&block_hash);
+                    self.fill_asked.remove(&block_hash);
+                    self.forget_compact_body(block_hash);
+                    return Ok(());
+                }
                 // The compact body is this block; it is only incomplete
                 // here. Ask a peer for those positions alone -- tens of
                 // kilobytes against the 26 MB body -- and hand the frame
@@ -3229,6 +3343,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     /// Gives up on a block's compact body: the whole body is asked for
     /// instead, and the copy that arrives is the one that imports it.
     fn forget_compact_body(&mut self, block_hash: B256) {
+        self.fill_rounds.remove(&block_hash);
         if self.compact_bodies.remove(&block_hash).is_some() {
             self.compact_order.retain(|hash| hash != &block_hash);
             self.driver.forget_payload(block_hash);
@@ -3266,11 +3381,12 @@ impl<E: ExecutionLayer> H2Service<E> {
     ) -> Result<(B256, Header, bool), n42_h2_consensus::BlockBodyError> {
         let (block_hash, header) =
             n42_h2_consensus::decode_compact_body_header(&bytes, self.header_profile)?;
-        if self.body_store.contains_key(&block_hash)
-            || self.compact_bodies.insert(block_hash, bytes.clone()).is_some()
-        {
+        // A second copy must not replace the frame of record: that one may
+        // carry fills this one does not (defect 18).
+        if self.body_store.contains_key(&block_hash) || self.compact_bodies.contains_key(&block_hash) {
             return Ok((block_hash, header, false));
         }
+        self.compact_bodies.insert(block_hash, bytes.clone());
         // Bounded the way the other per-block maps are, oldest first: what
         // this guards against is a double import of a block whose gossip
         // copy follows its push, and anything this far back is long
@@ -3285,6 +3401,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 self.body_from.remove(&oldest);
                 self.fill_peers.remove(&oldest);
                 self.fill_asked.remove(&oldest);
+                self.fill_rounds.remove(&oldest);
             }
         }
         self.remember_block(block_hash, &header);
@@ -3678,6 +3795,29 @@ fn body_request_grace() -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Defect 18's bound: three rounds are asked, a fourth fetches the whole
+    /// body, and a report naming a position already supplied does at once.
+    #[test]
+    fn fill_rounds_are_bounded_and_a_resupply_falls_back_at_once() {
+        let mut rounds = FillRounds::default();
+        assert_eq!(rounds.next(&[1, 2, 3], 3), FillStep::Ask { round: 1 });
+        rounds.supplied.extend([1, 2, 3]);
+        assert_eq!(rounds.next(&[7], 3), FillStep::Ask { round: 2 });
+        rounds.supplied.insert(7);
+        assert_eq!(rounds.next(&[8], 3), FillStep::Ask { round: 3 });
+        rounds.supplied.insert(8);
+        assert_eq!(rounds.next(&[9], 3), FillStep::WholeBody { resupplied: 0 });
+        assert_eq!((rounds.wanted_first, rounds.wanted_last), (3, 1));
+
+        let mut churn = FillRounds::default();
+        assert_eq!(churn.next(&[10, 11], 3), FillStep::Ask { round: 1 });
+        churn.supplied.extend([10, 11]);
+        assert_eq!(churn.next(&[5], 3), FillStep::Ask { round: 2 });
+        churn.supplied.insert(5);
+        // loop249's alternation: round one's positions asked again.
+        assert_eq!(churn.next(&[10, 11], 3), FillStep::WholeBody { resupplied: 2 });
+    }
 
     /// After a restart this node remembers no block, so the head's stamp has
     /// to come from the header the execution layer served -- never from the

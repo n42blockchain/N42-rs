@@ -38,7 +38,7 @@ pub use block_body::{
 };
 pub use compact_body::{
     decode_compact_body, decode_compact_body_header, encode_compact_body, is_compact_body,
-    rebuild_gov5_body, with_fill, write_compact, CompactBlockBody,
+    merge_fill, rebuild_gov5_body, with_fill, write_compact, CompactBlockBody,
 };
 pub use committee_pool::{CommitteePoolConfig, CommitteePoolError, ConsensusEvidence, SimulatedCommitteePool};
 pub use error::{ConsensusError, ConsensusResult};

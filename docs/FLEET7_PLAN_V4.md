@@ -2446,3 +2446,23 @@ did: B 86-103 against 120, the cycle 158-167, and the windows **970,277 / 960,06
 3% under 1M with every block full, one TC a leg (view 1). Adopted: the native build is the fleet's binary from
 here. Tagged `fleet3-970k-window-20260925`. Next: 18b's first build on the published output (the round), and the
 dalek `simd` backend for the verifier (the window's last 3%).
+
+### 7.18 The tenure's first build on the published output (loop255): the handover costs nothing, 969,028
+
+`plan-v6/tenure-first-build` (merged 5a3e4af7f, `N42_TENURE_FIRST_ON_OUTPUT=1` on validator and execution layer),
+native build, three nodes, tenure 1024, pacing 125.
+
+| leg | flag | rate | win1 | win2 | cycle | B | first build on output / fallback | `still importing` | invalid |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| TFa | on | 950k | 959,205 | 771,494 | 165 | 112.5 | 1 / 0 | 1 | 0 |
+| C950 | off | 950k | 965,495 | 679,132 | 162 | 103.5 | -- | 29 | 0 |
+| TFb | on | 950k | **969,028** | 700,866 | 161 | 102 | 1 / 0 | 0 | 0 |
+| TF925 | on | 925k | 944,350 | 766,043 | 166 | 97 | 1 / 0 | 0 | 0 |
+
+The path works: at the one handover a leg (view 1024) the new leader built on the parent's published output
+with no fallback, no `still importing` retries (0-1 against 29) and no invalid block; the flag is adopted in the
+runners (the code default stays off until a shorter-tenure leg confirms it at every handover). With tenure 1024
+the handover falls in window 3, so windows 1-2 do not change by it: 944-969k and 679-771k as before -- the
+decay across windows is the state's growth, not consensus. The window stands at 969-970k; the last 3% is the
+verifier: `curve25519-dalek` 4 selects its AVX2 backend only with `--cfg curve25519_dalek_backend="simd"` (not by
+`target-cpu` alone), which loop256 builds.

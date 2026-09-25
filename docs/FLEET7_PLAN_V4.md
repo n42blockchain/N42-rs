@@ -2428,3 +2428,21 @@ chained path on the parent's *published* output -- the follower's outputs are fi
 reads them, the parent's transactions leave the queue from its bundle, and the forkchoice build stays as the
 fallback. To be run after loop254; the stuck job itself (why `getPayload` hangs at a handover) still owes a
 reading.
+
+### 7.17 The node built for this CPU (loop254): 970,277 on a window
+
+`target/native` (`RUSTFLAGS="-C target-cpu=native"`, 913 crates in 3.5 min), three nodes, tenure 1024, pacing 125.
+
+| leg | build | rate | win1 | win2 | occupancy | cycle | B | ingest rate / node | busy us/tx |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| NATa | native | 950k | **970,277** | 787,802 | 99.2% | 159 | **87** | 726k | 11 |
+| C950 | generic | 950k | 948,067 | 793,230 | 99.4% | 165.5 | 120 | 772k | 11 |
+| NATb | native | 950k | 960,064 | 743,854 | 99.3% | 167 | 103 | 813k | 11 |
+| NAT925 | native | 925k | 952,213 | 603,067 | 94.0% | 158 | 86 | 803k | 11 |
+
+The verifier's cost did not move (`busy_us_per_tx` 11 either way: `curve25519-dalek` 4's AVX backend is not
+selected by target features alone -- it needs its `simd` backend cfg, to be checked), but the rest of the node
+did: B 86-103 against 120, the cycle 158-167, and the windows **970,277 / 960,064 / 952,213 against 948,067** --
+3% under 1M with every block full, one TC a leg (view 1). Adopted: the native build is the fleet's binary from
+here. Tagged `fleet3-970k-window-20260925`. Next: 18b's first build on the published output (the round), and the
+dalek `simd` backend for the verifier (the window's last 3%).

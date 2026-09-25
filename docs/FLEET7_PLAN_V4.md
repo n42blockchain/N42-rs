@@ -2253,3 +2253,25 @@ serving side logs `served a peer the transactions it was missing` with `waited_m
 `the peer supplied the missing transactions` line gains `wanted` and `waited_ms`. The pool pinned at the gate line
 is real but was not the cause; 7.4's gate deadlock (17) remains a second, slower path when the gate does close on a
 block's own transactions.
+
+### 7.9 Three nodes with the fill reply woken at once (loop249): the round holds, 922k on a window, and the supply-bound shape
+
+`plan-v6/fill-past-gate` (c2e59d151): the proposer's prepared fill goes out on the step it is ready. Three nodes,
+pacing 125, pool 1,000,000, rates 900k / 950k / 900k / 950k. Tagged `fleet3-900k-window-20260925`.
+
+| leg | rate | win1 | win2 | occupancy | cycle | B | D | fills served | gate holds | TCs | idles >5 s |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| R900 | 900k | 281,370 (stall) | 668,107 | 94-99% | 153 | 80 | 34 | 245 | 26 | 5 | 5 |
+| R950 | 950k | 892,651 | 657,410 | 99% | 164 | 122.5 | 12 | 852 | 10 | 5 | 4 |
+| R900b | 900k | **922,277** | 641,261 | **90%** | **154.8** | 79 | 44 | 983 | 17 | 6 | 6 |
+| R950b | 950k | 898,390 | 608,484 | 99.5% | 164.6 | 118 | 13 | 612 | 6 | 4 | 4 |
+
+The fill works (245-983 served a leg, no 6 s waits on it), TCs are 4-6 a leg instead of 9-22, and **window 2 holds
+at 608-668k in every leg** -- the first three-node rounds with both windows substantive; each remaining TC still
+costs ~6 s of a 30 s window, which is the whole difference between the two windows. The cycle at 900k is 153-155
+(163k in 155 ms is 1.05M/s of capacity) and the blocks are 90% full because 900k/s arrive: `usable` is 389-406k
+at the median, holes 5-9 a leg -- **the chain is supply-bound at 900k**. At 950k the blocks fill and B goes to
+118-122 (from 79), the cycle to 164: the coupling of 6.20 and 7.8, at the followers' ingest. So the window tops out
+at ~925k from either side, 4% under 1M, with the leader at 136 ms and the followers' road at 70 when not coupled.
+What is left: the remaining 4-6 TCs a leg (being read), and the coupling at 950k -- the followers' ingest at that
+rate (recovery slots, the queue's lock) beside the road.

@@ -2071,3 +2071,28 @@ The two walls, and what 1M needs from each:
 The next probe is three nodes (quorum 2 of 3, 37 physical cores each; no code), which loosens the first wall and
 says whether the second then binds where 6.13-6.19 predict. After it, the work is design: where signatures are
 verified, and what the block's state map is.
+
+### 7.1 Three nodes (loop244): 836,695 on window 1, and a fleet that does not hold
+
+Quorum 3 of 3 on `n42_fleet3_bench.json`, 37 physical cores a node (74 logical), the flood on the 17 left;
+the loop239-T16 + SA configuration at 163k, pacing 175. Quiet box (load 2.3, 120 GB).
+
+| leg | win1 | win2 | occupancy | cycle | B | D | E | sealed_at | exec | graft | import | road | flood win1 | TCs | short |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| warm | **836,695** | 494,132 | 100% | 190 | 66 | 103 | 8 | 128 | 52 | 45 | 134 | 58 | 837-878k/s | 12 | 63 |
+| R | **831,207** | 29,817 | 100% | 190 | 66.5 | 101 | 8 | 127 | 52 | 43 | 136 | 58 | 690k/s | 9 | 7 |
+| C128 | 18,133 | 347 | -- | -- | -- | -- | -- | 88 | 43 | 41 | 102 | 55 | 0 (replies 15 s) | 32 | 25 |
+| R2 | 374,886 | 5,505 | -- | 190 | 66 | 104 | 8 | 119 | 51 | 41 | 122 | 55 | 0 | 20 | 85 |
+
+Window 1 is the campaign's best by 9% and every term moved the way section 7 predicted when the node has cores:
+the leader seals at 127-128 (execution 52 against 65-68, the graft 43-45 against 60-62), the follower's road is
+58 and its import 134-136, B is 66, the flood delivers 837-878k/s and every block is full. **The cycle is 190
+because the leader waits: D is 101-104 ms -- the 175 ms pacing.** At pacing 150 this shape is ~165 ms and 990k;
+at 125, if the followers keep up (import 136 < 150), ~1.08M.
+
+And the fleet does not hold: after window 1 every leg collapses (R's window 2 is 8 blocks; C128 died with the
+flood's replies at 15 s; R2 never reached full speed), with 9-32 TCs a leg against 1-2 on four nodes and 63-85
+builds short. Quorum 3 of 3 has no straggler to spare: whatever one node does for longer than the view timeout is
+a TC, where on four nodes the fourth vote covered it. Read next from the logs (the first TC after window 1: which
+node, what it was doing, memory at that moment) before any pacing leg -- a three-node fleet that holds for a
+round, at pacing 150, is the 1M measurement.

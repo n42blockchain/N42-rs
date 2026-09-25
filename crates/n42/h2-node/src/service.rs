@@ -302,6 +302,9 @@ pub struct H2Service<E> {
     /// is asked of one peer at a time -- loop196 asked one arbitrary peer
     /// and then every peer for the whole body, 229-331 times a leg.
     fill_peers: std::collections::HashMap<B256, Vec<PeerId>>,
+    /// When this node asked for a block's missing transactions, for the
+    /// `waited_ms` on the line that reports the answer (defect 17b).
+    fill_asked: std::collections::HashMap<B256, std::time::Instant>,
     /// Requests for named transactions this node holds only as an imported
     /// block: served from the execution layer on the next drain, the way a
     /// whole body is.
@@ -625,7 +628,27 @@ impl LoopSpend {
 }
 
 /// A fill prepared on a worker, with the channel it goes back on.
-type ServedTxns = (n42_h2_net::BlockTxnsChannel, n42_h2_net::BlockTxnsReply);
+struct ServedTxns {
+    channel: n42_h2_net::BlockTxnsChannel,
+    reply: n42_h2_net::BlockTxnsReply,
+    hash: B256,
+    wanted: usize,
+    /// When the request reached this loop.
+    asked_at: std::time::Instant,
+    /// When the worker had the answer ready.
+    ready_at: std::time::Instant,
+}
+
+/// Whether a fill prepared on a worker waits for the loop's next drain
+/// instead of waking the loop (`N42_FILL_REPLY_ON_DRAIN=1`, the behaviour
+/// before defect 17b). The drain runs only after some other event wakes the
+/// loop, and a leader that has proposed and is waiting for the votes has
+/// none coming: loop247 held every such answer until the view timed out,
+/// 5.5-5.9 s, and the follower that needed it could not vote in time.
+fn fill_reply_on_drain() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_FILL_REPLY_ON_DRAIN").is_ok_and(|v| v == "1"))
+}
 /// Where a worker puts one.
 type ServedTxnsTx = tokio::sync::mpsc::UnboundedSender<ServedTxns>;
 /// Where the loop takes it.
@@ -838,6 +861,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             compact_order: std::collections::VecDeque::new(),
             body_from: std::collections::HashMap::new(),
             fill_peers: std::collections::HashMap::new(),
+            fill_asked: std::collections::HashMap::new(),
             pending_txns_requests: Vec::new(),
             loop_spend: LoopSpend::default(),
             served_txns: tokio::sync::mpsc::unbounded_channel(),
@@ -1217,6 +1241,14 @@ impl<E: ExecutionLayer> H2Service<E> {
                 };
                 self.handle_output(output, &mut events).await?;
             }
+            // Defect 17b: a fill a worker has prepared for a peer goes out
+            // now, not on the drain after whatever event comes next. The
+            // sender half lives on `self`, so this never ends.
+            served = self.served_txns.1.recv(), if !fill_reply_on_drain() => {
+                if let Some(served) = served {
+                    self.respond_served_txns(served);
+                }
+            }
             imported = async {
                 match own_imports {
                     Some(rx) => rx.recv().await,
@@ -1583,6 +1615,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                         // next, and loop196 put 230-330 of these a leg on it.
                         let profile = self.header_profile;
                         let back = self.served_txns.0.clone();
+                        let asked_at = std::time::Instant::now();
                         tokio::task::spawn_blocking(move || {
                             let reply = fill_from_body(&body, profile, &request);
                             debug!(
@@ -1593,7 +1626,16 @@ impl<E: ExecutionLayer> H2Service<E> {
                                 served = reply.as_ref().map(Vec::len).unwrap_or(0),
                                 "peer asked for named transactions; served from the stored body"
                             );
-                            let _ = back.send((channel, reply));
+                            // The loop wakes on this (see the step's select):
+                            // a follower is waiting on it to vote.
+                            let _ = back.send(ServedTxns {
+                                channel,
+                                reply,
+                                hash: request.hash,
+                                wanted: request.indices.len(),
+                                asked_at,
+                                ready_at: std::time::Instant::now(),
+                            });
                         });
                     }
                     // A member that took this block as a compact body holds
@@ -1628,11 +1670,17 @@ impl<E: ExecutionLayer> H2Service<E> {
                         let filled = alloy_primitives::Bytes::from(
                             n42_h2_consensus::with_fill(&frame, &fill),
                         );
+                        let waited_ms = self
+                            .fill_asked
+                            .remove(&request.hash)
+                            .map_or(0, |at| at.elapsed().as_millis() as u64);
                         info!(
                             target: "n42.h2.node",
                             hash = ?request.hash,
+                            wanted = request.indices.len(),
                             filled = fill.len(),
                             bytes = filled.len(),
+                            waited_ms,
                             %peer,
                             "the peer supplied the missing transactions; assembling the block again"
                         );
@@ -1889,8 +1937,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             debug!(target: "n42.h2.node", peer, ?hash, found = body.is_some(), "peer asked for a block; execution layer consulted");
             self.transport.respond_block(channel, body);
         }
-        while let Ok((channel, reply)) = self.served_txns.1.try_recv() {
-            self.transport.respond_block_txns(channel, reply);
+        while let Ok(served) = self.served_txns.1.try_recv() {
+            self.respond_served_txns(served);
         }
         for (request, channel) in std::mem::take(&mut self.pending_txns_requests) {
             let reply = match self.driver.execution_layer().block_by_hash(request.hash).await {
@@ -2587,6 +2635,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                     "asking a peer for the transactions this node does not hold"
                 );
                 self.fill_peers.insert(block_hash, rest);
+                self.fill_asked.insert(block_hash, std::time::Instant::now());
                 self.transport.request_block_txns(
                     peer,
                     n42_h2_net::BlockTxnsRequest { hash: block_hash, indices },
@@ -3132,6 +3181,23 @@ impl<E: ExecutionLayer> H2Service<E> {
         Ok((block_hash, header, true))
     }
 
+    /// Hands a fill prepared on a worker to the swarm, and says how long it
+    /// took: `walk_ms` on the worker, `waited_ms` from ready to handed over
+    /// (the wait defect 17b was, 5.5-5.9 s in loop247).
+    fn respond_served_txns(&mut self, served: ServedTxns) {
+        let ServedTxns { channel, reply, hash, wanted, asked_at, ready_at } = served;
+        info!(
+            target: "n42.h2.node",
+            ?hash,
+            wanted,
+            served = reply.as_ref().map(Vec::len).unwrap_or(0),
+            walk_ms = ready_at.saturating_duration_since(asked_at).as_millis() as u64,
+            waited_ms = ready_at.elapsed().as_millis() as u64,
+            "served a peer the transactions it was missing"
+        );
+        self.transport.respond_block_txns(channel, reply);
+    }
+
     /// Asks the next peer for a fill this one could not answer, and only
     /// when none is left gives up on the compact body.
     fn ask_next_for_fill(&mut self, request: n42_h2_net::BlockTxnsRequest, reason: &str) {
@@ -3218,6 +3284,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 self.compact_bodies.remove(&oldest);
                 self.body_from.remove(&oldest);
                 self.fill_peers.remove(&oldest);
+                self.fill_asked.remove(&oldest);
             }
         }
         self.remember_block(block_hash, &header);

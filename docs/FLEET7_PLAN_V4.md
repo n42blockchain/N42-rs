@@ -2205,3 +2205,18 @@ rather than fills, so the gate should stay open). **And the cascade still starts
 be the first cause; something else stalls a view (a handover decline, a follower's root spike, an import over the
 view timeout), the chain pauses, the pool fills in the pause, the gate closes on the next block's transactions,
 and 7.4's deadlock does the rest. The first TC of P125 and P150b is being read for that first cause.
+
+### 7.7 The cascade's first cause (loop247, read): the fill of a block's missing transactions waits at the gate (defect 17b)
+
+Every TC inspected (3 of 3, P125 / P150b / warm) begins the same way, without a prior stall: the leader proposes
+in 6-11 ms; one follower's road misses a residue of the block (510 / 1796 / 553 of 163,000) and asks a peer at
++80 ms; the peer answers; the follower logs `the peer supplied the missing transactions ... filled=510` **5.9 s
+later, 4-8 ms after the view timed out** and the NewView's prune reopened its gate (the follower's own gate hold
+began 80 ms after the ask, at depth 871,500 against 833,333). The other follower votes normally; the stuck one
+rotates (node1, node1, node2). So the peer's supply enters the follower through the gated path, and a proposed
+block's own transactions are held by the backpressure meant for the flood. The pool, under a flood rated at
+850k/s, sits pinned at the gate line (833,176 for the whole window) rather than draining: the chain's usable set is
+a fraction of the pool's depth (p10 blocks 99,000 with 833k queued -- the queue's lanes hold far-future nonces),
+so "supply under consumption" never became "pool under the limit". **Defect 17b**, on `plan-v6/fill-past-gate`:
+the fill of a proposed block's missing transactions is admitted regardless of depth. Raising the flood's rate
+(loop248) will not help until it lands -- it tightens the same margin.

@@ -2491,3 +2491,19 @@ state grows, one TC a leg (view 1)**. Four nodes stood at 769k when the day bega
 `fleet3-970k-window-20260925`, main at the same commit. The 3% to 1M on a window is the ingest's 11 us a signature
 on every node against the road that shares its cores; the round past 1M is a different matter (the state's growth
 over a leg, a protocol's verification design). `docs/FLEET7_PLAN_V4.md` sections 6-7 carry every measurement.
+
+### 7.20 Defect 16 re-read: not the batch size -- every leg since loop238 has run at batch 128
+
+The runner's shared `C` string has carried `N42_ED25519_BATCH=128` since loop238, so the "B128" leg differed from its
+siblings in nothing (the ingest lines agree: ~125 transactions a batch in every leg), and the 11-12 us a signature
+measured all day is batch 128. What that leg showed instead: the tenure's first build stuck 8 s (18b), two sibling
+blocks at 768, a reorg, two concurrent builds of 769 on the surviving sibling, and 770 built on the *output* of
+the 769 that was not the one committed -- the followers refused 771 on its state root alone (receipts and gas
+agree). **Defect 16 is therefore a build-on-output sibling defect at a handover (18c)**: a lookup that can take the
+wrong sibling's build out of the registry (`reuse_own_build`, `take(.., None)` in `payload_serve.rs`) is the
+suspect; 18b's fix removes the stuck first build that produced the siblings and may remove the trigger. The
+verifier maps verdicts by index correctly at every batch size (a new test, `the_batch_size_changes_no_verdict_and_no_sender`,
+200 transactions, 7 senders across chunk boundaries, three bad signatures, chunks of 1 / 64 / 128 / 200 / 256).
+The batch-size claims in 6.15, 7.16 and 7.19 are withdrawn; batch 256 (sigbench: 10.2 us against 11.x at 128) is a
+plain configuration leg, loop257, together with a short-tenure leg (256) under 18b's path to see whether the
+sibling shape recurs.

@@ -2522,3 +2522,19 @@ The short tenure under 18b's path is clean: six handovers a leg on the published
 block, and the best window 2 on record (831,105), so `N42_TENURE_FIRST_ON_OUTPUT=1` meets its own bar and 18c's
 sibling shape did not recur. Tagged `fleet3-977k-window-20260925`. The next and last configuration leg is the
 offer above 950k with batch 256 (the ingest admitted 835k/s here and 822k at a 1.0M offer in 7.19): loop258.
+
+### 7.22 The offer at 1.0M and 1.05M (loop258): the generator itself tops out at ~925k/s
+
+| leg | offer | win1 | win2 | flood win1 (k/s) | ingest rate / node | gate holds | cycle | B |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| R1000a | 1.0M | 967,097 | 776,922 | 926 | 821k | 8 | 157 | 109.5 |
+| C950 | 950k | 966,900 | 744,333 | 925 | 824k | 0 | 164 | 125.5 |
+| R1000b | 1.0M | 957,398 | 760,637 | 913 | 784k | 2 | 161.5 | 115 |
+| R1050 | 1.05M | 959,364 | 700,876 | 921 | 723k | 0 | 169 | 128.5 |
+
+Whatever is asked of it, the flood delivers 913-926k/s in window 1 (`sign` ~900 thread-seconds over a leg on its
+17 physical cores: it signs at the pace it sends), and the windows sit at 957-977k with every block full. **The
+window is now bound by the generator, not the chain**: the chain's cycle is 157-169 with the blocks full, and B
+109-128. The one configuration left is the cores: three nodes at 70 logical (35 physical) instead of 74 leave the
+flood 23 physical cores (+35% of signing), at 68 it has 26 -- loop259, at a 1.05M offer, with the 74-core control.
+Falsified if the nodes lose more than the flood gains (the cycle over 175, B over 130) or the window stays under 990k.

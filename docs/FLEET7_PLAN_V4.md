@@ -2182,3 +2182,26 @@ gate must close, and the block being assembled is then behind the gate. On four 
 absorbed by the spare vote and a 6 s stall a leg. What a fleet needs is a supply at or just under its consumption:
 `tx_flood --rate` (a fleet-wide token bucket, like the txgen's `--rate`), run at ~850k/s on three nodes -- then no
 gate, no deadlock, and the pacing legs measure the chain rather than the backpressure. That is the next leg.
+
+### 7.6 Three nodes with the supply rated at 850k/s (loop247): 863k / 841k on two windows, and a cascade that still starts
+
+`tx_flood --rate` (56f1ca7ee, a process-wide token bucket; `F7_FLOOD_RATE` in the bench), the gate strict,
+pool 1,000,000, three nodes, pacing 175 / 150 / 125 / 150. The flood held its rate exactly (849,978-849,980/s in
+every leg, replies 188 ms).
+
+| leg | pacing | win1 | win2 | occupancy | txs p10 | cycle | B | D | import | root | TCs | idles >5 s | gate holds |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| warm | 175 | 608,515 | 65,498 | 99% | 163,000 | 190 | 67 | 103 | 133 | 28 | 12 | 10 | 21 |
+| P150 | 150 | 842,664 | 500,291 | 96% | 113,000 | 166 | 67 | 76 | 156 | 37 | 9 | 14 | 19 |
+| P125 | 125 | **863,245** | **841,305** | 93-96% | 99,000 | **158** | 87 | 32 | 169 | 51 | 12 | 13 | 21 |
+| P150b | 150 | 876,275 | 676,581 | 95-99% | 119,500 | 167 | 66 | 78 | 154 | 37 | 8 | 10 | 23 |
+
+Two things at once. **At pacing 125 the chain runs a 158 ms cycle and holds two windows at 863k / 841k** -- the
+first time a three-node leg keeps its second window -- and the blocks are short (p10 99,000, occupancy 93%)
+because 850k/s is now the supply cap: the chain would consume ~1.03M/s at that cycle. So the rate, not the chain,
+is what these windows measure, and the next leg raises it (950k and 1.0M at pacing 125: the pool then drains
+rather than fills, so the gate should stay open). **And the cascade still starts**: 8-12 TCs and 10-14 idles over
+5 s a leg, 19-23 gate holds, the warm leg's window 2 at 65k -- with the supply under consumption the gate cannot
+be the first cause; something else stalls a view (a handover decline, a follower's root spike, an import over the
+view timeout), the chain pauses, the pool fills in the pause, the gate closes on the next block's transactions,
+and 7.4's deadlock does the rest. The first TC of P125 and P150b is being read for that first cause.

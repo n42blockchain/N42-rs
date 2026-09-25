@@ -2379,3 +2379,26 @@ with 1-2 TCs a leg (18b, the handover). So: the leader at 134-140, the chain at 
 a 925-950k/s ingest, the windows at 911-937k, and the round a handover short. loop253 (the tenure at 1024) and
 18b's fix are what turn a window into a round; the window itself is the ingest's footprint against the road,
 which is the design question (verification paid once).
+
+### 7.15 The tenure at 1024 (loop253): 953,423 on a window, one TC a leg, and the windows that decay without any
+
+| leg | rate | tenure | win1 | win2 | win3 | cycle (win1) | B | TCs | `still importing` |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| T950a | 950k | 1024 | 935,253 | 771,508 | 597,272 | 168 | 130 | 1 (start-up) | 0 |
+| T925 | 925k | 1024 | 919,922 | 717,167 | 706,273 | 167 | 122 | 1 | 0 |
+| T950b | 950k | 1024 | **953,423** | 776,926 | 542,866 | **164** | 118 | 1 | 26 |
+| C950 | 950k | 256 | 918,583 | 722,442 | 592,210 | 161.5 | 107 | 1 | 18 |
+
+With one handover a leg the in-window TCs are gone (the one TC each is view 1, before the flood) and the window
+record is **953,423** at a 169 ms cycle with every block full -- 4.7% under 1M. And the round still decays: every
+leg, the control included and with no TC in it, reads ~770k on window 2 and 540-700k on window 3 at 100%
+occupancy, the cycle stretching 0.17 -> 0.21 -> 0.27-0.30 s. That decay is not consensus; it is the chain getting
+slower as the leg runs -- the state grows by ~147k fresh accounts a block (the flood's recipients), so the QMDB
+root, the reads and the follower's import all lengthen, and the heaps grow with them -- the same slope every
+campaign has seen (window 1 is the metric for that reason; CLAUDE.md). Tagged `fleet3-950k-window-20260925`.
+
+What 1M on a window needs now is 5%: the ingest admits ~750-800k/s a node of a 950k offer with B at 118-130
+while it does. Either the ingest's cost per transaction falls (the ed25519 batch verifier's backend and batch
+size -- `docs/SIGNATURE_AND_BATCH_TX_SURVEY.md` has this host's numbers -- or verification paid once fleet-wide),
+or the road's B is decoupled from it (nothing tried has: runtime, nice, slots). 18b's proper fix (in flight) is
+for the round, not the window.

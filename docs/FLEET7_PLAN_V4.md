@@ -2402,3 +2402,16 @@ while it does. Either the ingest's cost per transaction falls (the ed25519 batch
 size -- `docs/SIGNATURE_AND_BATCH_TX_SURVEY.md` has this host's numbers -- or verification paid once fleet-wide),
 or the road's B is decoupled from it (nothing tried has: runtime, nice, slots). 18b's proper fix (in flight) is
 for the round, not the window.
+
+### 7.16 The verifier's cost, surveyed: the node is built for generic x86-64
+
+A Sonnet pass over the verifier and `docs/SIGNATURE_AND_BATCH_TX_SURVEY.md`: `busy_us_per_tx` 11-12 is the
+signature alone -- the decode, the hash and the sender cache run before the recovery slot is taken and cost under
+1 us (5.3's `road_senders` bench: 13.0 us with verification, 0.72 without); it matches sigbench's batch-64 figure
+(12.99 us a signature) on this host, an AMD EPYC 9B45. The merged batch equation and the decompressed-key cache are
+already in (`alt_sig.rs`, `sender_cache.rs`). **Neither the node nor sigbench is built with `-C target-cpu=native`**
+(no `.cargo/config.toml`, no `RUSTFLAGS` in the bench scripts): `curve25519-dalek` runs its generic backend and never
+its AVX2 / AVX-512 one. That is the 5% lever at the least risk, and loop254 runs it (a `target/native` build for
+the node, the validator and the flood; generic control). Batch 256 is 10.2 us against 13.0 in sigbench (21%) but
+defect 16 (batch 128 -> state-root disagreements) must be read first. `ed25519-zebra` is unevaluated. Anything
+past ~25% is verification paid once fleet-wide -- a protocol change, not a knob.

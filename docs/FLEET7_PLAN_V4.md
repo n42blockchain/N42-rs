@@ -2155,3 +2155,30 @@ the term that grew is the QMDB root -- 68 ms against 39 at pacing 175 (execution
 pace they contend. B 123 is that lag (the leader's collect samples 71-197 against 67-108). So a three-node round at
 pacing 125 needs both: the gate fixed, and the follower's root ~30 ms cheaper or off the contended cores (the
 parallel state commit's pool against the execution's), which is the follower-side term of the 1M plan.
+
+### 7.5 The gate opened for a pending block (loop246): the pool then grows without bound, and the fleet dies faster
+
+`plan-v6/gate-deadlock` (4c703eb06): the ingest gate opens for 500 ms from the road's last miss, renewed by each
+retry. Three nodes, pool 1,000,000, pacing 175 / 150 / 125 / 125:
+
+| leg | win1 | win2 | cycle | B | TCs | `engine_idles_over_5s` | gate opened (episodes / frames) | flood at 45 s |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| warm | 603,079 | 124,962 | 189 | 71 | 25 | 23 | 48 / 19,004 | 0/s |
+| P150 | **880,163** | 103,230 | 168 | 75 | 13 | 13 | 40 / 17,159 | 411k/s |
+| P125 | 378,570 | 54,398 | 178 | 142 | 13 | 13 | 43 / 15,953 | 0/s |
+| P125b | 394,984 | 130,395 | 172 | 135 | 14 | 14 | 56 / 25,988 | 38k/s |
+
+Worse, not better: the deadlock is gone (no 6 s waits on a held frame), but with the road missing something on
+most blocks the window never closes -- 16-26 thousand frames (8-13 million transactions) admitted past the limit
+a leg -- the pool grows without bound, the flood's replies stop (0/s at 45 s in three legs), and the fleet collapses
+in window 2 to 54-130k with 13-25 TCs. P150's window 1 (880,163 at a 168 ms cycle, every block full) is the second
+best window on record and says again what the shape can do for thirty seconds. The fix as built is turned off by
+default (`N42_TX_INGEST_GATE_FOR_BLOCK=1` opts in); a bounded form (admit only the frames the road wants, or a
+cap per episode) is possible but it treats the symptom.
+
+The cause is the supply itself: the flood sends as fast as the nodes reply, and on three nodes that is 880k/s
+against a chain that consumes 860k/s at 190 ms (and less whenever anything hiccups), so the pool must fill, the
+gate must close, and the block being assembled is then behind the gate. On four nodes the same excess was
+absorbed by the spare vote and a 6 s stall a leg. What a fleet needs is a supply at or just under its consumption:
+`tx_flood --rate` (a fleet-wide token bucket, like the txgen's `--rate`), run at ~850k/s on three nodes -- then no
+gate, no deadlock, and the pacing legs measure the chain rather than the backpressure. That is the next leg.

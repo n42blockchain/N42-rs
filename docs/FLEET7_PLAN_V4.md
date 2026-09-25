@@ -2339,3 +2339,25 @@ is 153-163 (1.0-1.06M/s of capacity at 163k); the window tops at ~930k because t
 own parent's import, 18b, and the start-up transient); the ingest's priority against the road (a probe: the
 recovery threads at nice 19, loop252); and, for the window past 1M, verification paid once per transaction
 fleet-wide rather than on every node -- the design question, unchanged since 6.12.
+
+### 7.13 The last TCs (loop251, read): every one is the new leader waiting on its own execution layer at the handover (18b)
+
+Eight TCs in four legs. Four are view 1 in every leg (peers dialled before the mesh formed: harmless, before the
+windows). **The other four are all one shape, at views 256 and 1024 -- the tenure boundaries**: the new leader's
+first proposal waits on its own execution layer (`the parent is still importing; proposing once it lands`,
+`forkchoiceUpdated returned no payload id (status Syncing)`, `no payload build for id ...`,
+`crates/n42/h2-node/src/service.rs` ~2634-2644) for 5.3-9.1 s, and proposes as the view times out. One leg shows
+the reason directly: `imported a block ... import_ms=7091` on the new leader -- its import of the parent took
+7 s where a follower's import is 180-200 ms. **The follower's import is longer than the cycle (171-197 against
+159-164, 7.12), so a follower falls behind by 20-40 ms a block across a tenure; at the handover the new leader must
+have the parent in its engine's tree before `forkchoiceUpdated` can start its first build, and it drains the
+tenure's backlog first** -- 256 blocks x 20-40 ms is the 5-9 s observed. B925's window-1 stall is that TC (one
+7.4 s cycle) with gate holds following it, not preceding. Defect 18 is confirmed gone; 18b is the whole remainder.
+
+Two ways out, one taken now: a longer tenure (loop253: `F7_LEADER_TENURE=1024`, one handover per 164 s instead
+of four per leg; the backlog then drains once a leg rather than four times -- the same loss per handover, fewer
+handovers) and the proper fix, the tenure's first build on the parent's *published output* (the chained path
+already builds that way; only the first build of a tenure goes through `forkchoiceUpdated` on the engine's tree) so
+the new leader proposes at once and its engine catches up beside it -- in flight. The follower's import itself
+(the root at 45-51 beside the next execution) is the term that makes the backlog, and shortening it is what
+1M needs anyway.

@@ -2485,10 +2485,10 @@ signature, blocked by defect 16 -- read next) and the verifier crate itself; pas
 
 ## 8. Where the campaign stands (2026-09-25, after loop256)
 
-Three nodes on this box, the node built for its CPU, tenure 1024, the supply rated at 925-950k/s, the fills and
-the handover fixed: **970,277 on a window (loop254), 950-970k on every window 1 since, 750-790k on window 2 as the
+Three nodes on this box, the node built for its CPU, batch 256, tenure 1024 (or 256 under 18b), the supply rated at
+925-950k/s, the fills and the handover fixed: **977,627 on a window (loop257), 950-970k on every window 1 since, 750-790k on window 2 as the
 state grows, one TC a leg (view 1)**. Four nodes stood at 769k when the day began. Tags:
-`fleet3-970k-window-20260925`, main at the same commit. The 3% to 1M on a window is the ingest's 11 us a signature
+`fleet3-977k-window-20260925`, main at the same commit. The 2.3% to 1M on a window is the ingest's 11 us a signature
 on every node against the road that shares its cores; the round past 1M is a different matter (the state's growth
 over a leg, a protocol's verification design). `docs/FLEET7_PLAN_V4.md` sections 6-7 carry every measurement.
 
@@ -2507,3 +2507,18 @@ verifier maps verdicts by index correctly at every batch size (a new test, `the_
 The batch-size claims in 6.15, 7.16 and 7.19 are withdrawn; batch 256 (sigbench: 10.2 us against 11.x at 128) is a
 plain configuration leg, loop257, together with a short-tenure leg (256) under 18b's path to see whether the
 sibling shape recurs.
+
+### 7.21 Batch 256 and the short tenure under 18b (loop257): 977,627 on a window, four handovers clean
+
+| leg | batch | tenure | win1 | win2 | cycle | B | ingest rate / node | busy us/tx | handovers on output / fallback | invalid | TCs |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| B256a | 256 | 1024 | 953,036 | 727,338 | 161.5 | 122 | 679k | **10** | 1 / 0 | 0 | 1 |
+| C128 | 128 | 1024 | 955,156 | 766,069 | 163 | 95.5 | 756k | 11 | 1 / 0 | 0 | 1 |
+| B256b | 256 | 1024 | **977,627** | 776,936 | 162 | 119.5 | 835k | **10** | 1 / 0 | 0 | 2 |
+| T256 | 256 | 256 | 942,811 | **831,105** | 159 | 124 | 826k | 10 | **6 / 0** | 0 | 3 |
+
+Batch 256 takes the signature to 10 us (from 11) and the window to **977,627** -- 2.3% under 1M -- and is adopted.
+The short tenure under 18b's path is clean: six handovers a leg on the published output, no fallback, no invalid
+block, and the best window 2 on record (831,105), so `N42_TENURE_FIRST_ON_OUTPUT=1` meets its own bar and 18c's
+sibling shape did not recur. Tagged `fleet3-977k-window-20260925`. The next and last configuration leg is the
+offer above 950k with batch 256 (the ingest admitted 835k/s here and 822k at a 1.0M offer in 7.19): loop258.

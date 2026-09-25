@@ -2241,3 +2241,15 @@ within ~7% of what this fleet shows, and the round is not held** (window 2 at 20
 `plan-v6/fill-past-gate`). The next leg is this table again with the fill admitted past the gate; if a round then
 holds at 900-950k, the remaining terms are B at 950k (the ingest's CPU beside the road) and the pool's usable
 fraction (p10 118,500 at 900k with 833k queued).
+
+**Correction (the fix's author, from the code)**: the fill never goes through the ingest gate. The follower's
+execution layer reports the miss, its validator asks the proposer (`request_block_txns`), the proposer's validator
+prepares the answer from its body store on a blocking task and puts it on a `served_txns` channel -- **which the
+event loop drained only when something else woke its `select!`**. A leader waiting for votes has nothing else to
+wake it, so the prepared reply sat until the view timeout (node2 logged nothing from 45.80 to 51.72; `filled=510`
+8 ms after the TC). Defect 17b is that missing wake: the loop now selects on the channel and the reply goes out at
+once (`plan-v6/fill-past-gate`, merged c2e59d151; `N42_FILL_REPLY_ON_DRAIN=1` restores the old behaviour); the
+serving side logs `served a peer the transactions it was missing` with `waited_ms`, the asking side's
+`the peer supplied the missing transactions` line gains `wanted` and `waited_ms`. The pool pinned at the gate line
+is real but was not the cause; 7.4's gate deadlock (17) remains a second, slower path when the gate does close on a
+block's own transactions.

@@ -2663,3 +2663,22 @@ Which is also 6.17-6.20 in another form (more in flight = a deeper queue = the g
 the gate line out of reach (pool 2,000,000) and the offer at or under consumption -- loop264 -- to see whether the
 cheaper ingest then reaches the window, and, independently, whether the gate should hold frames at all on a
 follower whose queue the next block will prune (a bounded, non-blocking backpressure instead of a hold).
+
+### 9.5 The shard probe with a 2M pool (loop264): the queue's depth is the cost
+
+| leg | mode / pool | offer | win1 | win2 | cycle | B | queue depth (median) | gate us/frame | reply us/frame | road total | busy us/tx |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| SH950 | shard / 2M | 950k | 603,078 | 559,613 | 269 | 246 | **1,700,000** | 43,323 | 54,607 | **152** | 4 |
+| C950 | all / 1M | 950k | **965,669** | 700,852 | 162 | 118.5 | 678,500 | 7,367 | 34,188 | 77 | 10 |
+| SH1000 | shard / 2M | 1.0M | 461,820 | 554,179 | 400 | 382 | 1,699,500 | 42,986 | 54,434 | 147 | 4 |
+| SH1050 | shard / 2M | 1.05M | 456,381 | 554,179 | 290 | 255 | 1,698,500 | 44,058 | 55,456 | 149 | 4 |
+
+Worse again, and it names the term: with the cap at 2,000,000 the follower's queue sits at 1,700,000 -- the new
+gate line -- and now the **road itself is 147-152 ms against 77**: the vote road assembles the block from the queue,
+and the queue's work grows with its depth (the assembly, the copy, the prune over 1.7M entries), so a deeper queue
+is a slower road, a later vote, a slower chain, a deeper queue. The cheaper ingest buys nothing because it only lets
+the queue fill to whatever line the gate draws, and every line above ~550k costs the road more than the
+verification saved. Under `all` the verification throttles admission before the queue deepens; that accident is
+why `all` is faster. The lever is therefore the *depth*, not the CPU: backpressure at a shallow queue (a few
+blocks' worth, ~400-500k), held cheaply, with the flood's token bucket pacing the offer to consumption.
+loop265: shard and all at a 500,000-slot pool (gate 417k) and at 650,000, 950k/s.

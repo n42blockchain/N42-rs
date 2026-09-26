@@ -147,3 +147,12 @@ Steps 1 and 2 are the breakthrough: they remove the two loops the campaign hit (
 and the closed-loop supply) instead of shaving them, and each is a week of work with a leg that says yes or no.
 Steps 3-5 are the second half of the cycle. Together they put the chain's capacity at 1.5-2M/s of transfers on
 this box; whether the window shows it depends on step 2's supply.
+
+## 10. Execution order (agreed 2026-09-26): 1 -> 2 -> 3 -> 4/5 -> 6
+
+Step 1 is built in two phases: **A** -- frames first-class in the ingest and the queue (frame id = a binary Merkle
+root over the frame's transaction hashes, computed once at admission; a frame index in the queue with whole-usable
+tracking; the genesis flag `frameBlocks` and the root rule: the frame-tree root for a frame-aligned body, the MPT
+root otherwise) -- and **B** -- the builder pulls whole frames in arrival order, the description names frame ids
+and the last frame's prefix length, the road assembles by reference and checks the frame-tree root. The first leg
+(loop266) reads B and the road's `assemble_ms` / `root_ms` against loop265's control.

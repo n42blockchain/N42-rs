@@ -2628,3 +2628,20 @@ its `N42_INGEST_SHARD=i/n` by `fleet7.sh`. The legs read `shard_verified=0 shard
 applies to a *claiming* frame, and the bench's flood sends none unless asked (`tx_flood --claim-sender`), so every
 transaction went through the full verification as under `all` -- the four legs are four more controls (967-976k
 on window 1, C950's window 2 825,835). `F7_FLOOD_CLAIM=1` now passes the flag; loop263 repeats the legs with it.
+
+### 9.3 The sharded-verification probe (loop263): a third of the verification, and the fleet is slower
+
+| leg | mode | offer | win1 | win2 | cycle | B | busy us/tx | slots busy | ingest rate / node | flood win1 | reply ms | road total | import |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| SH950 | shard (1/3 verified) | 950k | 863,871 | 760,642 | 179 | **137.5** | **4** | 28% | 784k | 819k | 195-216 | 67 | 148 |
+| C950 | all | 950k | **975,932** | 863,852 | 153.5 | **77.5** | 10 | 73% | 817k | 950k | 169 | 67 | 164 |
+| SH1000 | shard | 1.0M | 836,687 | 760,633 | 191 | 143.5 | 4 | 27% | 751k | 819k | 195-216 | 66 | 140 |
+| SH1050 | shard | 1.05M | 847,567 | 771,504 | 187 | 143 | 4 | 27% | 755k | 813k | 196-216 | 66 | 141 |
+
+The probe engaged (64M verified, 128M admitted on the claim; the ingest's busy time 4 us against 10, the slots
+27% against 73%, `verified_on_road` 0) and **the fleet lost 11%**: B 137-144 against 77.5 while the execution
+layer's own road stayed at 66-67 and the leader's seal at 135-138; the flood delivered 813-843k/s with replies
+195-216 ms against 169. So the verification's CPU was not what couples the ingest with the road: the claim path
+costs the road ~60 ms somewhere before its own timers, and slows the ingest's replies with a third of the work.
+That falsifies the design note's premise as stated (section 2.B's saving is real in CPU and does not reach the
+window on this fleet) until the coupling is named -- being read from the two legs.

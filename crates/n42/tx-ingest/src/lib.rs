@@ -84,7 +84,8 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use alloy_primitives::{Address, Bytes};
+use alloy_primitives::{Address, Bytes, B256};
+use n42_tx_queue::NewFrame;
 use n42_tx_types::{ed25519_batch_size, AltSigSenderCache, AltSigTx, N42PooledTxEnvelope};
 use reth_primitives_traits::Recovered;
 use reth_transaction_pool::{PoolTransaction, TransactionOrigin, TransactionPool};
@@ -768,6 +769,10 @@ fn spawn_stats_reporter() {
                     dropped_signature = STATS.dropped_signature.load(Ordering::Relaxed),
                     dropped_altsig = STATS.dropped_altsig.load(Ordering::Relaxed),
                     dropped_altsig_disabled = STATS.dropped_altsig_disabled.load(Ordering::Relaxed),
+                    // Cumulative: frames noted in the queue's frame index,
+                    // and frames with a dropped transaction (never whole).
+                    frames_admitted = STATS.frames_admitted.load(Ordering::Relaxed),
+                    frames_unaligned = STATS.frames_unaligned.load(Ordering::Relaxed),
                     // Non-zero means the gate stopped reopening and frames
                     // were let through on the deadline; the round is not
                     // comparable and a node has stopped draining its queue.
@@ -872,15 +877,15 @@ where
     // its frame k; a builder reading the queue in nonce order then stopped
     // at the hole, and half of a full queue sat behind one (rounds queue3-4).
     let (admit_tx, mut admit_rx) =
-        tokio::sync::mpsc::channel::<tokio::task::JoinHandle<Vec<P::Transaction>>>(ASYNC_FRAMES_IN_FLIGHT);
+        tokio::sync::mpsc::channel::<tokio::task::JoinHandle<(Vec<P::Transaction>, Option<NewFrame>)>>(ASYNC_FRAMES_IN_FLIGHT);
     if asynchronous {
         let pool = pool.clone();
         tokio::spawn(async move {
             while let Some(recovering) = admit_rx.recv().await {
                 let started = std::time::Instant::now();
                 match recovering.await {
-                    Ok(decoded) => {
-                        let _ = admit_decoded(&pool, decoded, started).await;
+                    Ok((decoded, frame)) => {
+                        let _ = admit_decoded(&pool, decoded, frame, started).await;
                     }
                     Err(err) => warn!(target: "n42.tx_ingest", %err, "sender recovery task failed"),
                 }
@@ -989,6 +994,7 @@ where
             // taken: the slots are the ingest's bound (16 a node at 94-99%
             // busy, 48-50 us a transaction, round 39), and the RLP decode is
             // not secp256k1's work to wait for.
+            let sent = raws.len();
             let (pooled, claims) = decode_frame::<P>(raws, claims);
             // What is acknowledged, and it is the decoded count and not the
             // offered one: the generator advances a sender's nonce by the
@@ -1011,7 +1017,7 @@ where
                 apply_recovery_affinity();
                 let busy = std::time::Instant::now();
                 STATS.spawn_ns.fetch_add(busy.duration_since(granted).as_nanos() as u64, Ordering::Relaxed);
-                let decoded = recover_decoded::<P>(pooled, claims, cache.as_ref());
+                let decoded = recover_frame::<P>(sent, pooled, claims, cache.as_ref());
                 STATS.busy_ns.fetch_add(busy.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 decoded
             });
@@ -1099,6 +1105,11 @@ struct IngestStats {
     dropped_signature: AtomicU64,
     dropped_altsig: AtomicU64,
     dropped_altsig_disabled: AtomicU64,
+    /// Frames the ingest kept every transaction of, noted in the queue's
+    /// frame index.
+    frames_admitted: AtomicU64,
+    /// Frames it dropped any transaction of: never referenceable whole.
+    frames_unaligned: AtomicU64,
 }
 
 static STATS: IngestStats = IngestStats {
@@ -1114,6 +1125,8 @@ static STATS: IngestStats = IngestStats {
     dropped_signature: AtomicU64::new(0),
     dropped_altsig: AtomicU64::new(0),
     dropped_altsig_disabled: AtomicU64::new(0),
+    frames_admitted: AtomicU64::new(0),
+    frames_unaligned: AtomicU64::new(0),
     acq_ns: AtomicU64::new(0),
     spawn_ns: AtomicU64::new(0),
     altsig_batches: AtomicU64::new(0),
@@ -1141,6 +1154,7 @@ where
     // on that thread, and the pool's own futures, waited behind them. Blocking
     // threads are for exactly this.
     let started = std::time::Instant::now();
+    let sent = raws.len();
     let (pooled, claims) = decode_frame::<P>(raws, claims);
     let slot = std::sync::Arc::clone(recovery_slots())
         .acquire_owned()
@@ -1151,7 +1165,7 @@ where
         apply_recovery_nice();
         apply_recovery_affinity();
         let busy = std::time::Instant::now();
-        let decoded = recover_decoded::<P>(pooled, claims, cache.as_ref());
+        let decoded = recover_frame::<P>(sent, pooled, claims, cache.as_ref());
         STATS.busy_ns.fetch_add(busy.elapsed().as_nanos() as u64, Ordering::Relaxed);
         decoded
     })
@@ -1163,12 +1177,18 @@ where
             return 0;
         }
     };
-    admit_decoded(pool, decoded, started).await
+    let (decoded, frame) = decoded;
+    admit_decoded(pool, decoded, frame, started).await
 }
 
 /// Puts recovered transactions into the pool and counts them; `started` is
 /// when their frame's recovery began.
-async fn admit_decoded<P>(pool: &P, decoded: Vec<P::Transaction>, started: std::time::Instant) -> u32
+async fn admit_decoded<P>(
+    pool: &P,
+    decoded: Vec<P::Transaction>,
+    frame: Option<NewFrame>,
+    started: std::time::Instant,
+) -> u32
 where
     P: TransactionPool + 'static,
     P::Transaction: 'static,
@@ -1176,6 +1196,15 @@ where
     if decoded.is_empty() {
         return 0;
     }
+    // A frame admitted whole, for the queue's frame index: noted after its
+    // transactions, whichever door they take into the queue. Nothing reads
+    // the index unless the chain builds frame blocks.
+    let note_frame = |queue: &n42_tx_queue::TxQueue<P::Transaction>, frame: Option<NewFrame>| {
+        if let Some(frame) = frame {
+            queue.note_frame(frame);
+            STATS.frames_admitted.fetch_add(1, Ordering::Relaxed);
+        }
+    };
     let recovered_at = started.elapsed();
     let count = decoded.len() as u64;
     // N42_TX_INGEST_DIRECT=1: straight into the builder's queue, past the
@@ -1192,6 +1221,7 @@ where
     if direct_to_queue() {
         if let Some(queue) = n42_tx_queue::global::<P::Transaction>() {
             queue.push(decoded);
+            note_frame(&queue, frame);
             STATS.frames.fetch_add(1, Ordering::Relaxed);
             STATS.txs.fetch_add(count, Ordering::Relaxed);
             STATS.recover_ns.fetch_add(recovered_at.as_nanos() as u64, Ordering::Relaxed);
@@ -1203,6 +1233,9 @@ where
     // transaction that did not come from this node: it is validated, priced and
     // gossiped exactly as one that arrived over RPC.
     let results = pool.add_transactions(TransactionOrigin::External, decoded).await;
+    if let Some(queue) = n42_tx_queue::global::<P::Transaction>() {
+        note_frame(&queue, frame);
+    }
     STATS.frames.fetch_add(1, Ordering::Relaxed);
     STATS.txs.fetch_add(count, Ordering::Relaxed);
     STATS.recover_ns.fetch_add(recovered_at.as_nanos() as u64, Ordering::Relaxed);
@@ -1264,6 +1297,62 @@ where
         }
     }
     (decoded, kept)
+}
+
+/// [`recover_decoded`], and the frame it was: `sent` is how many raw
+/// transactions the frame carried, and a frame the ingest kept every one of
+/// comes back described for the queue's frame index ([`frame_of`]).
+fn recover_frame<P>(
+    sent: usize,
+    pooled: Vec<PooledOf<P>>,
+    claims: Vec<Address>,
+    cache: Option<&reth_evm::SenderRecoveryCache>,
+) -> (Vec<P::Transaction>, Option<NewFrame>)
+where
+    P: TransactionPool,
+    P::Transaction: PoolTransaction<Pooled = N42PooledTxEnvelope>,
+{
+    let hashes: Vec<B256> = pooled.iter().map(|tx| *tx.hash()).collect();
+    let recovered = recover_decoded::<P>(pooled, claims, cache);
+    let frame = frame_of(sent, hashes, &recovered);
+    if frame.is_none() {
+        STATS.frames_unaligned.fetch_add(1, Ordering::Relaxed);
+    }
+    (recovered, frame)
+}
+
+/// A frame's record for the queue's frame index, or `None` when the frame
+/// is *unaligned*: the ingest dropped one of its `sent` transactions (an
+/// undecodable one, a signature that did not verify, a type the chain does
+/// not enable), so the frame can never be referenced whole.
+///
+/// `hashes` are the decoded transactions' hashes in frame order; the
+/// recovery may return them in another order (a frame's 0x50 transactions
+/// come back after its secp256k1 ones), so they are matched by hash. The
+/// frame's id is its root over `hashes` ([`n42_tx_types::frame_root`]).
+fn frame_of<T: PoolTransaction>(sent: usize, hashes: Vec<B256>, recovered: &[T]) -> Option<NewFrame> {
+    if hashes.is_empty() || hashes.len() != sent || recovered.len() != hashes.len() {
+        return None;
+    }
+    let in_order = recovered.iter().zip(&hashes).all(|(tx, hash)| tx.hash() == hash);
+    let mut members = Vec::with_capacity(hashes.len());
+    let mut gas = 0u64;
+    if in_order {
+        for tx in recovered {
+            members.push((tx.sender(), tx.nonce()));
+            gas = gas.saturating_add(tx.gas_limit());
+        }
+    } else {
+        let by_hash: alloy_primitives::map::B256HashMap<&T> =
+            recovered.iter().map(|tx| (*tx.hash(), tx)).collect();
+        for hash in &hashes {
+            let tx = by_hash.get(hash)?;
+            members.push((tx.sender(), tx.nonce()));
+            gas = gas.saturating_add(tx.gas_limit());
+        }
+    }
+    let id = n42_tx_types::frame_root(&hashes);
+    Some(NewFrame { id, hashes, members, gas })
 }
 
 /// Recovers the senders of decoded transactions, on a recovery slot.
@@ -1513,6 +1602,32 @@ mod shard_tests {
             pubkey: Bytes::copy_from_slice(key.verifying_key().as_bytes()),
         }
         .sign_ed25519(&key)
+    }
+
+    /// A frame the ingest kept whole is described in frame order, whatever
+    /// order the recovery returned it in; one it dropped from is unaligned.
+    #[test]
+    fn a_frame_is_described_in_frame_order_and_a_dropped_one_is_unaligned() {
+        n42_tx_types::set_alt_sig_enabled(true);
+        let txs: Vec<AltSigTx> = (0..6u64).map(|i| signed(1 + (i % 2) as u8, 50 + i / 2)).collect();
+        let pooled: Vec<N42PooledTxEnvelope> = txs.into_iter().map(N42PooledTxEnvelope::AltSig).collect();
+        let hashes: Vec<B256> = pooled.iter().map(|tx| *tx.hash()).collect();
+        let (recovered, frame) =
+            recover_frame::<NoopTransactionPool<N42PooledTransaction>>(6, pooled.clone(), Vec::new(), None);
+        assert_eq!(recovered.len(), 6);
+        let frame = frame.expect("every transaction kept");
+        assert_eq!(frame.id, n42_tx_types::frame_root(&hashes));
+        assert_eq!(frame.hashes, hashes);
+        assert_eq!(frame.gas, 6 * 21_000);
+        let nonces: Vec<u64> = frame.members.iter().map(|(_, nonce)| *nonce).collect();
+        assert_eq!(nonces, vec![50, 50, 51, 51, 52, 52]);
+        // Reversed recovery order: still described in frame order.
+        let reversed: Vec<_> = recovered.iter().rev().cloned().collect();
+        assert_eq!(frame_of(6, hashes.clone(), &reversed), Some(frame));
+        // The frame carried seven and one was undecodable: unaligned.
+        assert_eq!(frame_of(7, hashes.clone(), &recovered), None);
+        // One did not verify: unaligned.
+        assert_eq!(frame_of(6, hashes, &recovered[..5]), None);
     }
 
     /// A claiming frame in shard mode: exactly the transactions whose hash

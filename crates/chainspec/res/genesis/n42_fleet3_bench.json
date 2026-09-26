@@ -48,6 +48,7 @@
     "stateScheme": "qmdb",
     "consensus": "hotstuff",
     "altSigTx": true,
+    "frameBlocks": true,
     "hotstuff": {
       "period": 1,
       "baseTimeout": 6000,

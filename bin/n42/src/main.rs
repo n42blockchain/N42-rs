@@ -579,7 +579,7 @@ fn main() {
                                     // and no line saying which of the two it
                                     // was.
                                     let (parked_lanes, parked, park_capped) = queue.parked();
-                                    info!(target: "n42.tx_queue", mined, queued = queue.len(), usable = queue.usable(), parked, parked_lanes, park_capped, prune_ms = started.elapsed().as_millis() as u64, "canonical blocks pruned from the queue");
+                                    info!(target: "n42.tx_queue", mined, queued = queue.len(), usable = queue.usable(), parked, parked_lanes, park_capped, frames_indexed = queue.frames_indexed(), prune_ms = started.elapsed().as_millis() as u64, "canonical blocks pruned from the queue");
                                     // What the queue let go of since the last
                                     // block, by reason, with the first few
                                     // named. A lane's hole -- a nonce the

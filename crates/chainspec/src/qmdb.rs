@@ -65,6 +65,23 @@ pub fn alt_sig_tx_enabled(genesis: &Genesis) -> bool {
         .unwrap_or(false)
 }
 
+/// Genesis `config` key that makes a frame-aligned block's transactions root
+/// the frame tree (`docs/BREAKTHROUGH_DESIGN.md` step 1): the binary Merkle
+/// root over its frames' roots (`n42_tx_types::frame_tree_root`) instead of
+/// the ordered MPT root. A body that is not frame-aligned keeps the MPT root.
+pub const FRAME_BLOCKS_KEY: &str = "frameBlocks";
+
+/// Whether a genesis enables frame blocks. Absent or anything but `true`
+/// means disabled: every block's transactions root is the MPT root.
+pub fn frame_blocks_enabled(genesis: &Genesis) -> bool {
+    genesis
+        .config
+        .extra_fields
+        .get_deserialized::<bool>(FRAME_BLOCKS_KEY)
+        .and_then(Result::ok)
+        .unwrap_or(false)
+}
+
 /// Genesis `config` key: the timestamp from which headers carry the
 /// execution of their *parent* -- deferred execution
 /// (`docs/PHASE_D_DEFERRED_EXECUTION.md`). Absent means never.
@@ -111,4 +128,30 @@ pub fn genesis_header(genesis: &Genesis, hardforks: &ChainHardforks) -> Header {
             .expect("a genesis allocation always has a QMDB root");
     }
     header
+}
+
+#[cfg(test)]
+mod frame_blocks_tests {
+    use super::*;
+
+    fn genesis(json: &str) -> Genesis {
+        serde_json::from_str(json).expect("a bundled genesis parses")
+    }
+
+    #[test]
+    fn frame_blocks_are_on_for_the_bench_chains_only() {
+        for bench in [
+            include_str!("../res/genesis/n42_fleet3_bench.json"),
+            include_str!("../res/genesis/n42_fleet4_bench.json"),
+            include_str!("../res/genesis/n42_fleet7_bench.json"),
+        ] {
+            assert!(frame_blocks_enabled(&genesis(bench)));
+        }
+        for other in [
+            include_str!("../res/genesis/n42_fleet7.json"),
+            include_str!("../res/genesis/n42_devnet.json"),
+        ] {
+            assert!(!frame_blocks_enabled(&genesis(other)));
+        }
+    }
 }

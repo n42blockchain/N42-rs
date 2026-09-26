@@ -106,6 +106,41 @@ pub fn parallel_transaction_root_by(len: usize, encode: impl Fn(usize) -> Vec<u8
     parallel_ordered_trie_root(&encoded)
 }
 
+/// The block's transactions root by the chain's rule -- the one place that
+/// decides between the two constructions (`docs/BREAKTHROUGH_DESIGN.md`
+/// step 1).
+///
+/// `frame_blocks` is the chain's `frameBlocks` genesis flag
+/// (`reth_chainspec::qmdb::frame_blocks_enabled`); `frame_layout` is the
+/// body's frames, each frame's length in body order, when the body is laid
+/// out as frames. With the flag on and a layout that covers the body exactly
+/// (whole frames in order, the last one possibly truncated to a prefix) the
+/// root is the frame tree: the binary Merkle root over each frame's root,
+/// the truncated last frame rooted over its prefix's hashes alone
+/// ([`n42_tx_types::frame_tree_root_of`]). Anything else -- the flag off, no
+/// layout, a layout that does not cover the body -- is the ordered MPT root,
+/// byte for byte what [`parallel_transaction_root`] gives.
+///
+/// That the layout's frames are the frames the block's description names
+/// (each whole frame's root equal to its id, the last one a prefix of its
+/// frame) is the caller's check, not this function's.
+pub fn transactions_root_by_rule<T: Encodable2718 + Sync>(
+    frame_blocks: bool,
+    frame_layout: Option<&[usize]>,
+    transactions: &[T],
+) -> B256 {
+    if frame_blocks {
+        if let Some(layout) = frame_layout {
+            use rayon::prelude::*;
+            let hashes: Vec<B256> = transactions.par_iter().map(|tx| tx.trie_hash()).collect();
+            if let Some(root) = n42_tx_types::frame_tree_root_of(&hashes, layout) {
+                return root;
+            }
+        }
+    }
+    parallel_transaction_root(transactions)
+}
+
 pub fn parallel_transaction_root<T: Encodable2718 + Sync>(transactions: &[T]) -> B256 {
     use rayon::prelude::*;
     let encoded: Vec<Vec<u8>> = transactions.par_iter().map(|tx| tx.encoded_2718()).collect();
@@ -406,6 +441,39 @@ mod tests {
             .collect();
         assert_eq!(parallel_transaction_root(&txs), alloy_consensus::proofs::calculate_transaction_root(&txs));
         assert_eq!(parallel_transaction_root::<TxEnvelope>(&[]), alloy_consensus::proofs::calculate_transaction_root::<TxEnvelope>(&[]));
+    }
+
+    fn transfers(n: u64) -> Vec<TxEnvelope> {
+        (0..n)
+            .map(|n| {
+                let tx = TxEip1559 { chain_id: 1, nonce: n, gas_limit: 21_000, max_fee_per_gas: 10, max_priority_fee_per_gas: 1, to: TxKind::Call(Address::repeat_byte(2)), value: U256::from(n), ..Default::default() };
+                TxEnvelope::Eip1559(Signed::new_unchecked(tx, Signature::test_signature(), Default::default()))
+            })
+            .collect()
+    }
+
+    /// Three whole frames and a two-transaction prefix of a fourth: with
+    /// the flag on the rule's root is the frame tree (the prefix rooted over
+    /// its own hashes); with the flag off, or without a layout, or with a
+    /// layout that does not cover the body, it is the MPT root.
+    #[test]
+    fn the_root_rule_is_the_frame_tree_only_for_a_frame_aligned_body_on_a_frame_chain() {
+        let body = transfers(3 * 5 + 2);
+        let layout = [5usize, 5, 5, 2];
+        let hashes: Vec<B256> = body.iter().map(|tx| tx.trie_hash()).collect();
+        let frames = [
+            n42_tx_types::frame_root(&hashes[0..5]),
+            n42_tx_types::frame_root(&hashes[5..10]),
+            n42_tx_types::frame_root(&hashes[10..15]),
+            n42_tx_types::frame_root(&hashes[15..17]),
+        ];
+        let tree = n42_tx_types::frame_tree_root(&frames);
+        let mpt = alloy_consensus::proofs::calculate_transaction_root(&body);
+        assert_ne!(tree, mpt);
+        assert_eq!(transactions_root_by_rule(true, Some(&layout), &body), tree);
+        assert_eq!(transactions_root_by_rule(false, Some(&layout), &body), mpt);
+        assert_eq!(transactions_root_by_rule(true, None, &body), mpt);
+        assert_eq!(transactions_root_by_rule(true, Some(&[5, 5, 5]), &body), mpt);
     }
 }
 

@@ -162,6 +162,15 @@ struct Args {
     /// divides this among `F7_FLOOD_PROCS` processes before it gets here, so
     /// nothing in this file has to know about that split.
     rate: f64,
+    /// `--pregen-out <dir>`: write a pre-generated set there and exit,
+    /// sending nothing (see [`pregen`]).
+    pregen_out: Option<std::path::PathBuf>,
+    /// `--pregen-txs <n>`: how many transactions the set holds, across every
+    /// worker (capped at `--senders` x `--pertx`).
+    pregen_txs: u64,
+    /// `--replay <dir>`: send a pre-generated set's frames instead of
+    /// signing (see [`replay_over_ingest`]).
+    replay: Option<std::path::PathBuf>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -192,8 +201,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let limiter = Arc::new(RateLimiter::new(args.rate));
 
+    if let Some(dir) = args.pregen_out.clone() {
+        return pregen(&args, &keys, &dir);
+    }
+    // One thread owns a disjoint set of senders (see the spawn below); a
+    // pre-generated set was cut the same way, so it is opened and checked
+    // against these arguments before anything is funded.
+    let chunk = args.senders.div_ceil(args.conc.max(1));
+    let workers = args.senders.div_ceil(chunk);
+    let mut replay_files: Vec<Option<ReplayFile>> = match &args.replay {
+        Some(dir) => {
+            let set = open_replay_set(dir, &args, chunk)?;
+            let (txs, frames) = set.iter().fold((0u64, 0u64), |(t, f), file| (t + file.header.txs, f + file.header.frames));
+            println!("replay       : {} files from {}, {txs} transactions in {frames} frames", set.len(), dir.display());
+            set.into_iter().map(Some).collect()
+        }
+        None => (0..workers).map(|_| None).collect(),
+    };
+
     if !args.skip_funding {
         fund(&client, &args, &keys)?;
+    }
+    if args.replay.is_some() {
+        check_fresh_senders(&client, &args, &keys, chunk)?;
     }
 
     let started = Instant::now();
@@ -248,11 +278,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // One thread owns a disjoint set of senders, so a sender's nonces are
     // produced in order by one place. Sharing a sender across threads is how a
     // flood generates its own nonce holes.
-    let chunk = args.senders.div_ceil(args.conc.max(1));
     std::thread::scope(|scope| {
         for (worker, part) in keys.chunks(chunk).enumerate() {
             let (client, sent, rejected, limiter, args) =
                 (Arc::clone(&client), Arc::clone(&sent), Arc::clone(&rejected), Arc::clone(&limiter), &args);
+            let replay_file = replay_files.get_mut(worker).and_then(Option::take);
             scope.spawn(move || {
                 let mut batch: Vec<String> = Vec::with_capacity(args.rpc_batch);
                 // Every sender this thread owns is in flight at once, a batch at
@@ -295,6 +325,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 };
+                if let (Some(conn), Some(mut file)) = (ingest.as_mut(), replay_file) {
+                    let end = replay_over_ingest(conn, &mut file.reader, part.len(), args, &sent, &rejected, &limiter);
+                    if end.exhausted {
+                        EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+                        eprintln!(
+                            "replay       : worker {worker} sent all {} frames of {}; the set ran out",
+                            end.frames,
+                            file.path.display()
+                        );
+                    }
+                    return;
+                }
                 if let Some(conn) = ingest.as_mut() {
                     flood_over_ingest(
                         conn, part, worker * chunk, &mut nonce, &mut stalls, args, &sent, &rejected, &limiter,
@@ -375,6 +417,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // measured itself. Saying so is the difference between a result and a
     // number.
     println!("note         : the submission rate above is this harness's ceiling, not the chain's");
+    if args.replay.is_some() {
+        let ran_out = EXHAUSTED.load(Ordering::Relaxed);
+        println!(
+            "replay       : {ran_out} of {workers} workers ran out of pre-generated frames{}",
+            if ran_out > 0 { " -- the set was smaller than the leg" } else { "" }
+        );
+    }
     Ok(())
 }
 
@@ -539,18 +588,10 @@ fn flood_over_ingest(
             let upto = (from + args.rpc_batch as u64).min(args.per_tx);
             batch.clear();
             let at = Instant::now();
-            // The recipient's index is the sender's *global* index: with the
-            // worker's local one, the 64 workers' senders at one local index
-            // paid the same recipients at the same nonces, and a "full" block
-            // of 163,000 transfers touched 13,000 recipients (found in round
-            // 43, after every round through 42 had measured that shape).
-            batch.extend(
-                (from..upto).map(|n| {
-                    let base = if args.legacy_recipients { 0 } else { first_sender };
-                    let to = recipient(args.recipients, (base + index) as u64 * args.per_tx + n);
-                    signed_raw(key, n, args.chain_id, args.gas_price, args.gas, 1, to)
-                }),
-            );
+            // Built by the same function a pre-generated set is, so a
+            // replayed set is byte for byte this path's frames (recipients by
+            // the sender's global index; see `sign_batch`).
+            sign_batch(key, first_sender, index, from, upto, args, &mut batch);
             SIGN_NS.fetch_add(at.elapsed().as_nanos() as u64, Ordering::Relaxed);
             let at = Instant::now();
             // The sender this worker signed with, so a node in
@@ -732,14 +773,19 @@ impl Ingest {
     /// instead of recovering it. An older node reads the header as a count
     /// past its frame bound and closes the connection saying so.
     fn send(&mut self, sender: usize, batch: &[Vec<u8>], claim: Option<Address>) -> std::io::Result<()> {
+        self.send_frame(sender, &frame_bytes(batch, claim), batch.len())
+    }
+
+    /// Writes one frame already encoded (by [`frame_bytes`], live or read
+    /// back from a pre-generated set) that carries `count` transactions.
+    fn send_frame(&mut self, sender: usize, frame: &[u8], count: usize) -> std::io::Result<()> {
         use std::io::Write;
-        let frame = frame_bytes(batch, claim);
         // One write for the whole frame: a frame split across writes is a
         // frame the server reads in two syscalls.
         for stream in &mut self.streams {
-            stream.write_all(&frame)?;
+            stream.write_all(frame)?;
         }
-        self.inflight.push_back((sender, batch.len(), Instant::now()));
+        self.inflight.push_back((sender, count, Instant::now()));
         Ok(())
     }
 
@@ -1032,8 +1078,9 @@ fn fund(
     Err("funding did not mine within 120s; check the base fee against --gasprice".into())
 }
 
-fn parse() -> Result<Args, Box<dyn std::error::Error>> {
-    let mut args = Args {
+/// The flood's arguments before the command line is read.
+fn default_args() -> Args {
+    Args {
         alg: "secp256k1".into(),
         rpcs: vec!["http://127.0.0.1:8700".into()],
         chain_id: 1143,
@@ -1056,7 +1103,14 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
         recipients: 1,
         claim_sender: std::env::var("N42_FLOOD_CLAIM_SENDER").is_ok_and(|v| v != "0"),
         rate: 0.0,
-    };
+        pregen_out: None,
+        pregen_txs: 0,
+        replay: None,
+    }
+}
+
+fn parse() -> Result<Args, Box<dyn std::error::Error>> {
+    let mut args = default_args();
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut next = || it.next().ok_or_else(|| format!("{arg} needs a value"));
@@ -1082,6 +1136,9 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
             "--legacy-recipients" => args.legacy_recipients = true,
             "--skip-funding" => args.skip_funding = true,
             "--rate" => args.rate = next()?.parse()?,
+            "--pregen-out" => args.pregen_out = Some(next()?.into()),
+            "--pregen-txs" => args.pregen_txs = next()?.parse()?,
+            "--replay" => args.replay = Some(next()?.into()),
             "--help" | "-h" => {
                 eprintln!("{USAGE}");
                 std::process::exit(0);
@@ -1094,6 +1151,15 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
     }
     if args.rpcs.is_empty() {
         return Err("--rpc needs at least one URL".into());
+    }
+    if args.pregen_out.is_some() && args.pregen_txs == 0 {
+        return Err("--pregen-out needs --pregen-txs <n>".into());
+    }
+    if args.pregen_out.is_some() && args.replay.is_some() {
+        return Err("--pregen-out and --replay are two different runs".into());
+    }
+    if args.replay.is_some() && args.ingest.is_empty() {
+        return Err("--replay sends ingest frames; it needs --ingest".into());
     }
     Ok(args)
 }
@@ -1124,7 +1190,726 @@ tx_flood — fund a derived sender set and flood the fleet with transfers
   --rate <tx/s>       cap the whole process's send rate across every worker and every
                       node (default 0, unlimited); F7_FLOOD_PROCS splits this before
                       it reaches this flag, so one process's --rate is its own share
+  --pregen-out <dir>  sign nothing live: write --pregen-txs transactions, framed exactly as
+  --pregen-txs <n>    the ingest path sends them, one file per worker, and exit. The set is
+                      bound to --alg --chain-id --senders --pertx --offset --gas --gasprice
+                      --recipients --rpcbatch --conc --claim-sender (and --legacy-recipients),
+                      and is valid only on a chain where those senders start at nonce 0
+  --replay <dir>      send a pre-generated set (same arguments, --ingest required) instead of
+                      signing; funding works as without it
 ";
+
+/// Signs the transactions of one ingest frame: sender `index` of the worker
+/// whose first sender is `first_sender`, nonces `from..upto`.
+///
+/// The live ingest path and the pre-generated set both build their frames
+/// here, so a replayed set is byte for byte what the live flood would have
+/// sent for the same arguments.
+fn sign_batch(
+    key: &Signer,
+    first_sender: usize,
+    index: usize,
+    from: u64,
+    upto: u64,
+    args: &Args,
+    batch: &mut Vec<Vec<u8>>,
+) {
+    // The recipient's index is the sender's *global* index: with the
+    // worker's local one, the 64 workers' senders at one local index paid the
+    // same recipients at the same nonces, and a "full" block of 163,000
+    // transfers touched 13,000 recipients (found in round 43, after every
+    // round through 42 had measured that shape).
+    let base = if args.legacy_recipients { 0 } else { first_sender };
+    batch.clear();
+    batch.extend((from..upto).map(|n| {
+        let to = recipient(args.recipients, (base + index) as u64 * args.per_tx + n);
+        signed_raw(key, n, args.chain_id, args.gas_price, args.gas, 1, to)
+    }));
+}
+
+/// The frame the live ingest path sends for sender `index` at nonce `from`
+/// (the next `--rpcbatch` nonces, cut at `--pertx`), and how many
+/// transactions it carries.
+fn live_frame(key: &Signer, first_sender: usize, index: usize, from: u64, args: &Args) -> (Vec<u8>, usize) {
+    let upto = (from + args.rpc_batch as u64).min(args.per_tx);
+    let mut batch = Vec::with_capacity(args.rpc_batch);
+    sign_batch(key, first_sender, index, from, upto, args, &mut batch);
+    (frame_bytes(&batch, args.claim_sender.then(|| key.address())), batch.len())
+}
+
+/// How many transactions a frame built by [`frame_bytes`] carries.
+fn frame_count(frame: &[u8]) -> usize {
+    frame.get(..4).map_or(0, |b| (u32::from_le_bytes([b[0], b[1], b[2], b[3]]) & 0x7fff_ffff) as usize)
+}
+
+/// The same frame without its first `skip` transactions: what a sender sends
+/// again after a node accepted only a prefix of it. `None` for a frame that
+/// does not parse, which only a corrupt set could produce.
+fn frame_suffix(frame: &[u8], skip: usize) -> Option<Vec<u8>> {
+    let head = u32::from_le_bytes(frame.get(..4)?.try_into().ok()?);
+    let (claim, count) = (head & 0x8000_0000, (head & 0x7fff_ffff) as usize);
+    if skip >= count {
+        return None;
+    }
+    let per_claim = if claim != 0 { 20 } else { 0 };
+    let mut at = 4usize;
+    for _ in 0..skip {
+        let len = u32::from_le_bytes(frame.get(at..at + 4)?.try_into().ok()?) as usize;
+        at += 4 + per_claim + len;
+    }
+    let rest = frame.get(at..)?;
+    let mut out = Vec::with_capacity(4 + rest.len());
+    out.extend_from_slice(&((count - skip) as u32 | claim).to_le_bytes());
+    out.extend_from_slice(rest);
+    Some(out)
+}
+
+// ---------------------------------------------------------------------------
+// Pre-generated sets (`--pregen-out`, `--replay`).
+//
+// The flood signs every transaction as it sends it, on the cores left beside
+// the nodes, and tops out there (FLEET7_PLAN_V4 7.22-7.24). A pre-generated
+// set moves the signing off the leg: the frames are built once, exactly as the
+// live ingest path builds them, and a replay only reads and sends them.
+//
+// One file per worker thread, `o<offset>-w<worker, 4 digits>.flood`, all
+// integers little-endian:
+//
+//   header, PREGEN_HEADER_LEN bytes: magic "N42FLOOD", u32 version, u8 alg
+//     (0 secp256k1, 1 ed25519), u8 claim-sender, u8 legacy-recipients, u8 0,
+//     u64 chain id, u64 senders, u64 offset, u64 per_tx, u32 rpcbatch,
+//     u32 workers, u32 worker, u32 senders in this worker, u64 its first
+//     sender, u64 gas, u128 gas price, u32 recipients, u32 0, u64 transactions,
+//     u64 frames, 8 bytes 0;
+//   then `frames` records: u32 sender (index within the worker), u32 length,
+//     and the frame exactly as `frame_bytes` builds it.
+//
+// The frames are in pass order: pass k holds nonces k*rpcbatch.. of every one
+// of the worker's senders, in sender order -- the live flood's round robin with
+// every frame accepted whole. The worker split is the live one
+// (`--senders` in chunks of ceil(senders / conc)), and the recipients are the
+// live derivation, so a replayed set is indistinguishable from a live one to
+// the nodes.
+//
+// A set is valid ONLY against a chain on which its senders are at nonce 0 --
+// a fresh datadir, funded by this flood's own funding step (or already funded
+// for `--skip-funding`). Every transaction carries its nonce, so a sender that
+// has sent anything before makes the set's frames for it stale: the replay
+// reads the first sender of every worker back over RPC before it sends and
+// refuses a non-zero nonce. `--offset` is part of the set: a leg that replays
+// it must pass the offset it was generated with.
+// ---------------------------------------------------------------------------
+
+const PREGEN_MAGIC: [u8; 8] = *b"N42FLOOD";
+const PREGEN_VERSION: u32 = 1;
+const PREGEN_HEADER_LEN: usize = 128;
+
+/// Workers whose pre-generated set ran out before the leg ended.
+static EXHAUSTED: AtomicU64 = AtomicU64::new(0);
+
+/// A pre-generated file's header: the arguments it was built for, and what it
+/// holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PregenHeader {
+    alg: u8,
+    claim_sender: bool,
+    legacy_recipients: bool,
+    chain_id: u64,
+    senders: u64,
+    offset: u64,
+    per_tx: u64,
+    rpc_batch: u32,
+    workers: u32,
+    worker: u32,
+    part_len: u32,
+    first_sender: u64,
+    gas: u64,
+    gas_price: u128,
+    recipients: u32,
+    txs: u64,
+    frames: u64,
+}
+
+impl PregenHeader {
+    /// What a file for this worker has to say, given the flood's arguments;
+    /// the totals are zero.
+    fn for_args(args: &Args, workers: usize, worker: usize, first_sender: usize, part_len: usize) -> Self {
+        Self {
+            alg: u8::from(args.alg == "ed25519"),
+            claim_sender: args.claim_sender,
+            legacy_recipients: args.legacy_recipients,
+            chain_id: args.chain_id,
+            senders: args.senders as u64,
+            offset: args.offset,
+            per_tx: args.per_tx,
+            rpc_batch: args.rpc_batch as u32,
+            workers: workers as u32,
+            worker: worker as u32,
+            part_len: part_len as u32,
+            first_sender: first_sender as u64,
+            gas: args.gas,
+            gas_price: args.gas_price,
+            recipients: args.recipients,
+            txs: 0,
+            frames: 0,
+        }
+    }
+
+    fn encode(&self) -> [u8; PREGEN_HEADER_LEN] {
+        let mut out = [0u8; PREGEN_HEADER_LEN];
+        out[0..8].copy_from_slice(&PREGEN_MAGIC);
+        out[8..12].copy_from_slice(&PREGEN_VERSION.to_le_bytes());
+        out[12] = self.alg;
+        out[13] = u8::from(self.claim_sender);
+        out[14] = u8::from(self.legacy_recipients);
+        out[16..24].copy_from_slice(&self.chain_id.to_le_bytes());
+        out[24..32].copy_from_slice(&self.senders.to_le_bytes());
+        out[32..40].copy_from_slice(&self.offset.to_le_bytes());
+        out[40..48].copy_from_slice(&self.per_tx.to_le_bytes());
+        out[48..52].copy_from_slice(&self.rpc_batch.to_le_bytes());
+        out[52..56].copy_from_slice(&self.workers.to_le_bytes());
+        out[56..60].copy_from_slice(&self.worker.to_le_bytes());
+        out[60..64].copy_from_slice(&self.part_len.to_le_bytes());
+        out[64..72].copy_from_slice(&self.first_sender.to_le_bytes());
+        out[72..80].copy_from_slice(&self.gas.to_le_bytes());
+        out[80..96].copy_from_slice(&self.gas_price.to_le_bytes());
+        out[96..100].copy_from_slice(&self.recipients.to_le_bytes());
+        out[104..112].copy_from_slice(&self.txs.to_le_bytes());
+        out[112..120].copy_from_slice(&self.frames.to_le_bytes());
+        out
+    }
+
+    fn decode(raw: &[u8; PREGEN_HEADER_LEN]) -> Result<Self, String> {
+        if raw[0..8] != PREGEN_MAGIC {
+            return Err("not a tx_flood pre-generated set (bad magic)".into());
+        }
+        let u32_at = |at: usize| u32::from_le_bytes([raw[at], raw[at + 1], raw[at + 2], raw[at + 3]]);
+        let u64_at = |at: usize| {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&raw[at..at + 8]);
+            u64::from_le_bytes(b)
+        };
+        let version = u32_at(8);
+        if version != PREGEN_VERSION {
+            return Err(format!("set version {version}, this flood reads {PREGEN_VERSION}"));
+        }
+        let mut price = [0u8; 16];
+        price.copy_from_slice(&raw[80..96]);
+        Ok(Self {
+            alg: raw[12],
+            claim_sender: raw[13] != 0,
+            legacy_recipients: raw[14] != 0,
+            chain_id: u64_at(16),
+            senders: u64_at(24),
+            offset: u64_at(32),
+            per_tx: u64_at(40),
+            rpc_batch: u32_at(48),
+            workers: u32_at(52),
+            worker: u32_at(56),
+            part_len: u32_at(60),
+            first_sender: u64_at(64),
+            gas: u64_at(72),
+            gas_price: u128::from_le_bytes(price),
+            recipients: u32_at(96),
+            txs: u64_at(104),
+            frames: u64_at(112),
+        })
+    }
+
+    /// Every field on which this file and the flood's arguments disagree
+    /// (the totals are not arguments).
+    fn mismatches(&self, want: &Self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut compare = |flag: &str, have: String, wants: String| {
+            if have != wants {
+                out.push(format!("{flag}: the set has {have}, this flood has {wants}"));
+            }
+        };
+        compare("--alg (0 secp256k1, 1 ed25519)", self.alg.to_string(), want.alg.to_string());
+        compare("--claim-sender", self.claim_sender.to_string(), want.claim_sender.to_string());
+        compare("--legacy-recipients", self.legacy_recipients.to_string(), want.legacy_recipients.to_string());
+        compare("--chain-id", self.chain_id.to_string(), want.chain_id.to_string());
+        compare("--senders", self.senders.to_string(), want.senders.to_string());
+        compare("--offset", self.offset.to_string(), want.offset.to_string());
+        compare("--pertx", self.per_tx.to_string(), want.per_tx.to_string());
+        compare("--rpcbatch", self.rpc_batch.to_string(), want.rpc_batch.to_string());
+        compare("workers (--conc)", self.workers.to_string(), want.workers.to_string());
+        compare("worker", self.worker.to_string(), want.worker.to_string());
+        compare("senders of this worker (--conc)", self.part_len.to_string(), want.part_len.to_string());
+        compare("first sender of this worker (--conc)", self.first_sender.to_string(), want.first_sender.to_string());
+        compare("--gas", self.gas.to_string(), want.gas.to_string());
+        compare("--gasprice", self.gas_price.to_string(), want.gas_price.to_string());
+        compare("--recipients", self.recipients.to_string(), want.recipients.to_string());
+        out
+    }
+}
+
+/// Where worker `worker`'s file of the set for `offset` lives.
+fn pregen_path(dir: &std::path::Path, offset: u64, worker: usize) -> std::path::PathBuf {
+    dir.join(format!("o{offset}-w{worker:04}.flood"))
+}
+
+/// Reads a set's frame records in order.
+struct FrameReader<R> {
+    inner: R,
+    /// Records the header promised and not yet read: the end of the file
+    /// before this is a truncated set, not a finished one.
+    frames_left: u64,
+}
+
+impl<R: std::io::Read> FrameReader<R> {
+    /// The next record: the sender (within the worker), the frame, and the
+    /// transactions it carries; `None` once the header's frames are read.
+    fn next(&mut self) -> std::io::Result<Option<(usize, Vec<u8>, usize)>> {
+        if self.frames_left == 0 {
+            return Ok(None);
+        }
+        let truncated = |err: std::io::Error| {
+            std::io::Error::new(err.kind(), format!("pre-generated set truncated or unreadable: {err}"))
+        };
+        let mut head = [0u8; 8];
+        self.inner.read_exact(&mut head).map_err(truncated)?;
+        let sender = u32::from_le_bytes([head[0], head[1], head[2], head[3]]) as usize;
+        let len = u32::from_le_bytes([head[4], head[5], head[6], head[7]]) as usize;
+        if len < 4 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "a frame record shorter than its count"));
+        }
+        let mut frame = vec![0u8; len];
+        self.inner.read_exact(&mut frame).map_err(truncated)?;
+        self.frames_left -= 1;
+        let count = frame_count(&frame);
+        Ok(Some((sender, frame, count)))
+    }
+}
+
+/// One worker's file, opened and checked.
+struct ReplayFile {
+    path: std::path::PathBuf,
+    header: PregenHeader,
+    reader: FrameReader<std::io::BufReader<std::fs::File>>,
+}
+
+/// Opens every worker's file of the set in `dir` and checks each header
+/// against the flood's arguments; any disagreement refuses the whole set.
+fn open_replay_set(
+    dir: &std::path::Path,
+    args: &Args,
+    chunk: usize,
+) -> Result<Vec<ReplayFile>, Box<dyn std::error::Error>> {
+    use std::io::Read;
+    let workers = args.senders.div_ceil(chunk);
+    let mut set = Vec::with_capacity(workers);
+    for worker in 0..workers {
+        let first_sender = worker * chunk;
+        let part_len = chunk.min(args.senders - first_sender);
+        let path = pregen_path(dir, args.offset, worker);
+        let file = std::fs::File::open(&path).map_err(|err| {
+            format!(
+                "REFUSING --replay: {}: {err} (no set for --offset {} split over {workers} workers here)",
+                path.display(),
+                args.offset
+            )
+        })?;
+        let mut inner = std::io::BufReader::with_capacity(8 << 20, file);
+        let mut raw = [0u8; PREGEN_HEADER_LEN];
+        inner.read_exact(&mut raw).map_err(|err| format!("REFUSING --replay: {}: {err}", path.display()))?;
+        let header =
+            PregenHeader::decode(&raw).map_err(|err| format!("REFUSING --replay: {}: {err}", path.display()))?;
+        let bad = header.mismatches(&PregenHeader::for_args(args, workers, worker, first_sender, part_len));
+        if !bad.is_empty() {
+            return Err(format!(
+                "REFUSING --replay: {} was generated for other arguments:\n  {}",
+                path.display(),
+                bad.join("\n  ")
+            )
+            .into());
+        }
+        let frames_left = header.frames;
+        set.push(ReplayFile { path, header, reader: FrameReader { inner, frames_left } });
+    }
+    let extra = pregen_path(dir, args.offset, workers);
+    if extra.exists() {
+        return Err(
+            format!("REFUSING --replay: {} exists, so the set has more workers than --conc gives", extra.display())
+                .into(),
+        );
+    }
+    Ok(set)
+}
+
+/// A replay set is valid only where its senders start at nonce 0: reads the
+/// first sender of every worker back and refuses anything else. An RPC that
+/// cannot answer is a warning, not a refusal.
+fn check_fresh_senders(
+    client: &reqwest::blocking::Client,
+    args: &Args,
+    keys: &[Signer],
+    chunk: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let rpc = &args.rpcs[0];
+    for first in (0..keys.len()).step_by(chunk.max(1)) {
+        let address = keys[first].address();
+        let body =
+            json!({"jsonrpc": "2.0", "id": 1, "method": "eth_getTransactionCount", "params": [address, "latest"]});
+        let answer = client
+            .post(rpc)
+            .json(&body)
+            .send()
+            .and_then(reqwest::blocking::Response::json::<Value>)
+            .map_err(|err| err.to_string())
+            .and_then(|v| {
+                v.get("result")
+                    .and_then(Value::as_str)
+                    .and_then(|hex| u64::from_str_radix(hex.trim_start_matches("0x"), 16).ok())
+                    .ok_or_else(|| format!("no nonce in {v}"))
+            });
+        match answer {
+            Ok(0) => {}
+            Ok(nonce) => {
+                return Err(format!(
+                    "REFUSING --replay: sender {first} ({address}) is at nonce {nonce}, not 0 -- a pre-generated set \
+                     replays only against a chain where its senders are fresh (fresh datadirs; a new --offset needs a new set)"
+                )
+                .into())
+            }
+            Err(err) => {
+                eprintln!("WARN replay   : could not read sender {first}'s nonce ({err}); assuming a fresh chain");
+                return Ok(());
+            }
+        }
+    }
+    println!("replay       : every worker's first sender is at nonce 0");
+    Ok(())
+}
+
+/// Writes a pre-generated set: `--pregen-txs` transactions (at most
+/// `--senders` x `--pertx`) split over the live flood's workers, each
+/// worker's share in proportion to its senders.
+fn pregen(args: &Args, keys: &[Signer], dir: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    use rayon::prelude::*;
+    std::fs::create_dir_all(dir)?;
+    let chunk = args.senders.div_ceil(args.conc.max(1));
+    let workers = args.senders.div_ceil(chunk);
+    let capacity = args.senders as u64 * args.per_tx;
+    let total = if args.pregen_txs > capacity {
+        println!(
+            "pregen       : --pregen-txs {} is more than --senders x --pertx = {capacity}; writing {capacity}",
+            args.pregen_txs
+        );
+        capacity
+    } else {
+        args.pregen_txs
+    };
+    println!(
+        "pregen       : {total} transactions, {workers} workers of up to {chunk} senders, {} a frame, into {}",
+        args.rpc_batch,
+        dir.display()
+    );
+    let started = Instant::now();
+    let progress = (AtomicU64::new(0), AtomicU64::new(0));
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let results: Vec<Result<(u64, u64, u64), String>> = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let mut last = (Instant::now(), 0u64);
+            while !done.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(200));
+                if last.0.elapsed() < Duration::from_secs(5) {
+                    continue;
+                }
+                let txs = progress.0.load(Ordering::Relaxed);
+                eprintln!(
+                    "pregen +{:>4}s: {txs} of {total} ({:.0}/s), {:.1} GB",
+                    started.elapsed().as_secs(),
+                    (txs - last.1) as f64 / last.0.elapsed().as_secs_f64(),
+                    progress.1.load(Ordering::Relaxed) as f64 / 1e9
+                );
+                last = (Instant::now(), txs);
+            }
+        });
+        let results: Vec<Result<(u64, u64, u64), String>> = (0..workers)
+            .into_par_iter()
+            .map(|worker| {
+                let first = worker * chunk;
+                let part = &keys[first..(first + chunk).min(keys.len())];
+                // Exact shares: the workers' quotas sum to `total`.
+                let share = |upto: usize| (u128::from(total) * upto as u128 / keys.len() as u128) as u64;
+                let quota = share(first + part.len()) - share(first);
+                pregen_worker(dir, args, part, workers, worker, first, quota, &progress)
+                    .map_err(|err| format!("worker {worker}: {err}"))
+            })
+            .collect();
+        done.store(true, Ordering::Relaxed);
+        results
+    });
+    let (mut txs, mut frames, mut bytes) = (0u64, 0u64, 0u64);
+    for result in results {
+        let (t, f, b) = result?;
+        txs += t;
+        frames += f;
+        bytes += b;
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    println!(
+        "pregen       : {txs} transactions in {frames} frames, {workers} files, {:.2} GB ({:.1} bytes a transaction), {elapsed:.1}s, {:.0}/s",
+        bytes as f64 / 1e9,
+        bytes as f64 / txs.max(1) as f64,
+        txs as f64 / elapsed
+    );
+    println!(
+        "pregen       : replay with the same --alg --chain-id --senders --pertx --offset {} --gas --gasprice --recipients --rpcbatch --conc, on fresh datadirs",
+        args.offset
+    );
+    Ok(())
+}
+
+/// One worker's file: its senders' frames in pass order until `quota`
+/// transactions are written (whole frames, so the last may pass it), written
+/// under a temporary name and renamed once complete, so a set cut short is
+/// never replayed. Returns transactions, frames and bytes written.
+#[allow(clippy::too_many_arguments)]
+fn pregen_worker(
+    dir: &std::path::Path,
+    args: &Args,
+    part: &[Signer],
+    workers: usize,
+    worker: usize,
+    first_sender: usize,
+    quota: u64,
+    progress: &(AtomicU64, AtomicU64),
+) -> std::io::Result<(u64, u64, u64)> {
+    use rayon::prelude::*;
+    use std::io::{Seek, Write};
+    let path = pregen_path(dir, args.offset, worker);
+    let partial = path.with_extension("flood.partial");
+    let mut out = std::io::BufWriter::with_capacity(8 << 20, std::fs::File::create(&partial)?);
+    let mut header = PregenHeader::for_args(args, workers, worker, first_sender, part.len());
+    out.write_all(&header.encode())?;
+    let mut bytes = PREGEN_HEADER_LEN as u64;
+
+    // The live round robin with every frame accepted whole: pass k is nonces
+    // k*rpcbatch.. of every sender, in sender order.
+    let step = args.rpc_batch as u64;
+    let mut plan: Vec<(usize, u64)> = Vec::new();
+    let mut planned = 0u64;
+    'passes: for from in (0..args.per_tx).step_by(args.rpc_batch.max(1)) {
+        for index in 0..part.len() {
+            if planned >= quota {
+                break 'passes;
+            }
+            plan.push((index, from));
+            planned += (from + step).min(args.per_tx) - from;
+        }
+    }
+    // Signed in parallel a slab at a time and written in order, so the file
+    // streams and the memory held is one slab of frames.
+    for slab in plan.chunks(256) {
+        let frames: Vec<(usize, Vec<u8>, usize)> = slab
+            .par_iter()
+            .map(|&(index, from)| {
+                let (frame, count) = live_frame(&part[index], first_sender, index, from, args);
+                (index, frame, count)
+            })
+            .collect();
+        for (index, frame, count) in frames {
+            out.write_all(&(index as u32).to_le_bytes())?;
+            out.write_all(&(frame.len() as u32).to_le_bytes())?;
+            out.write_all(&frame)?;
+            header.txs += count as u64;
+            header.frames += 1;
+            bytes += 8 + frame.len() as u64;
+            progress.0.fetch_add(count as u64, Ordering::Relaxed);
+            progress.1.fetch_add(8 + frame.len() as u64, Ordering::Relaxed);
+        }
+    }
+    let mut file = out.into_inner().map_err(std::io::IntoInnerError::into_error)?;
+    file.seek(std::io::SeekFrom::Start(0))?;
+    file.write_all(&header.encode())?;
+    file.flush()?;
+    drop(file);
+    std::fs::rename(&partial, &path)?;
+    Ok((header.txs, header.frames, bytes))
+}
+
+/// Where a replay sends its frames: the ingest connection, or a test's sink.
+trait FrameSink {
+    fn in_flight(&self) -> usize;
+    fn send_frame(&mut self, sender: usize, frame: &[u8], count: usize) -> std::io::Result<()>;
+    fn recv(&mut self) -> std::io::Result<Option<(usize, usize, usize, usize)>>;
+    fn reconnect(&mut self) -> std::io::Result<()>;
+}
+
+impl FrameSink for Ingest {
+    fn in_flight(&self) -> usize {
+        self.inflight.len()
+    }
+
+    fn send_frame(&mut self, sender: usize, frame: &[u8], count: usize) -> std::io::Result<()> {
+        Self::send_frame(self, sender, frame, count)
+    }
+
+    fn recv(&mut self) -> std::io::Result<Option<(usize, usize, usize, usize)>> {
+        Self::recv(self)
+    }
+
+    fn reconnect(&mut self) -> std::io::Result<()> {
+        Self::reconnect(self)
+    }
+}
+
+/// How a worker's replay ended.
+#[derive(Debug)]
+struct ReplayEnd {
+    /// Every frame of the file was sent and answered.
+    exhausted: bool,
+    /// Frames of the file sent (resends not counted).
+    frames: u64,
+}
+
+/// Sends one worker's pre-generated frames, in the file's order, through the
+/// same discipline as [`flood_over_ingest`]: at most `--window` frames
+/// unanswered, one frame in flight per sender, the rate limiter before every
+/// frame, and the counters and clocks the status line reads.
+///
+/// A sender's next frame waits for the answer to its last, so its nonces stay
+/// serial exactly as on the live path. A frame a node accepted only part of is
+/// sent again from the first refused transaction (cut from the frame, not
+/// re-signed) before that sender's next frame; a sender refused 600 times in a
+/// row is given up on, as the live path does, and its remaining frames are
+/// skipped.
+fn replay_over_ingest<S: FrameSink, R: std::io::Read>(
+    conn: &mut S,
+    reader: &mut FrameReader<R>,
+    part_len: usize,
+    args: &Args,
+    sent: &AtomicU64,
+    rejected: &AtomicU64,
+    limiter: &RateLimiter,
+) -> ReplayEnd {
+    let window = args.window.max(1);
+    // The frame each sender has in flight, kept to cut a resend from.
+    let mut inflight: Vec<Option<Vec<u8>>> = vec![None; part_len];
+    let mut stalls = vec![0u32; part_len];
+    let mut dead = vec![false; part_len];
+    let mut retry: std::collections::VecDeque<(usize, Vec<u8>, usize)> = std::collections::VecDeque::new();
+    // The file's next frame, read but waiting on its sender's last answer.
+    let mut held: Option<(usize, Vec<u8>, usize)> = None;
+    let mut exhausted = false;
+    let mut frames = 0u64;
+    let mut deepest = 0usize;
+    let mut timeouts = 0u32;
+    let mut last_warn = Instant::now();
+    loop {
+        // What a node refused part of goes again first.
+        let mut i = 0;
+        while i < retry.len() && conn.in_flight() < window {
+            if inflight[retry[i].0].is_some() {
+                i += 1;
+                continue;
+            }
+            let Some((sender, frame, count)) = retry.remove(i) else { break };
+            limiter.take(count);
+            let at = Instant::now();
+            if conn.send_frame(sender, &frame, count).is_err() {
+                return ReplayEnd { exhausted: false, frames };
+            }
+            SEND_NS.fetch_add(at.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            inflight[sender] = Some(frame);
+        }
+        // Then the file, in order.
+        while !exhausted && conn.in_flight() < window {
+            let next = match held.take() {
+                Some(next) => Some(next),
+                None => match reader.next() {
+                    Ok(next) => next,
+                    Err(err) => {
+                        eprintln!("replay       : {err}");
+                        return ReplayEnd { exhausted: false, frames };
+                    }
+                },
+            };
+            let Some((sender, frame, count)) = next else {
+                exhausted = true;
+                break;
+            };
+            if sender >= part_len {
+                eprintln!("replay       : a frame names sender {sender} of a worker with {part_len}; corrupt set");
+                return ReplayEnd { exhausted: false, frames };
+            }
+            if dead[sender] {
+                continue;
+            }
+            if inflight[sender].is_some() || retry.iter().any(|r| r.0 == sender) {
+                held = Some((sender, frame, count));
+                break;
+            }
+            limiter.take(count);
+            let at = Instant::now();
+            if conn.send_frame(sender, &frame, count).is_err() {
+                return ReplayEnd { exhausted: false, frames };
+            }
+            SEND_NS.fetch_add(at.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            inflight[sender] = Some(frame);
+            frames += 1;
+        }
+        if conn.in_flight() == 0 {
+            if exhausted && held.is_none() && retry.is_empty() {
+                if deepest > 0 {
+                    eprintln!("ingest       : deepest pool seen {deepest} pending");
+                }
+                return ReplayEnd { exhausted: true, frames };
+            }
+            continue;
+        }
+        let at = Instant::now();
+        let answer = conn.recv();
+        WAIT_NS.fetch_add(at.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        match answer {
+            Ok(Some((sender, offered, accepted, pending))) => {
+                deepest = deepest.max(pending);
+                DEEPEST.fetch_max(pending as u64, Ordering::Relaxed);
+                let frame = inflight.get_mut(sender).and_then(Option::take);
+                sent.fetch_add(accepted as u64, Ordering::Relaxed);
+                rejected.fetch_add((offered - accepted) as u64, Ordering::Relaxed);
+                if accepted < offered {
+                    stalls[sender] += 1;
+                    if stalls[sender] > 600 {
+                        dead[sender] = true;
+                        retry.retain(|r| r.0 != sender);
+                        if held.as_ref().is_some_and(|h| h.0 == sender) {
+                            held = None;
+                        }
+                    } else if let Some(rest) = frame.and_then(|f| frame_suffix(&f, accepted)) {
+                        retry.push_back((sender, rest, offered - accepted));
+                    }
+                } else {
+                    stalls[sender] = 0;
+                }
+            }
+            Ok(None) => {}
+            // As on the live path: a node that has not answered within the
+            // timeout is not going to. Every frame in flight goes again on a
+            // new connection; a node that did admit one drops the duplicates
+            // by (sender, nonce).
+            Err(err) if is_read_timeout(&err) => {
+                timeouts += 1;
+                if timeouts == 1 || last_warn.elapsed() >= Duration::from_secs(30) {
+                    last_warn = Instant::now();
+                    eprintln!("ingest       : no answer from {err}; reconnecting (timeout {timeouts})");
+                }
+                for (sender, slot) in inflight.iter_mut().enumerate() {
+                    if let Some(frame) = slot.take() {
+                        let count = frame_count(&frame);
+                        retry.push_back((sender, frame, count));
+                    }
+                }
+                if conn.reconnect().is_err() {
+                    return ReplayEnd { exhausted: false, frames };
+                }
+            }
+            Err(_) => return ReplayEnd { exhausted: false, frames },
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1168,6 +1953,150 @@ mod tests {
             .concat()
         );
         assert_eq!(claiming.len(), frame_bytes(&batch, None).len() + 40);
+    }
+
+    /// Answers every frame at once, accepting all of it except where
+    /// `short` says to accept only a prefix of the n-th frame sent.
+    struct MemorySink {
+        sent: Vec<(usize, Vec<u8>)>,
+        queue: std::collections::VecDeque<(usize, usize)>,
+        short: Option<(usize, usize)>,
+    }
+
+    impl FrameSink for MemorySink {
+        fn in_flight(&self) -> usize {
+            self.queue.len()
+        }
+
+        fn send_frame(&mut self, sender: usize, frame: &[u8], count: usize) -> std::io::Result<()> {
+            self.sent.push((sender, frame.to_vec()));
+            self.queue.push_back((sender, count));
+            Ok(())
+        }
+
+        fn recv(&mut self) -> std::io::Result<Option<(usize, usize, usize, usize)>> {
+            let answered = self.sent.len() - self.queue.len();
+            Ok(self.queue.pop_front().map(|(sender, count)| {
+                let accepted = match self.short {
+                    Some((nth, prefix)) if nth == answered => prefix.min(count),
+                    _ => count,
+                };
+                (sender, count, accepted, 0)
+            }))
+        }
+
+        fn reconnect(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        std::env::temp_dir().join(format!("tx_flood_{tag}_{}_{nanos}", std::process::id()))
+    }
+
+    fn tiny_args(alg: &str, rpc_batch: usize, claim: bool) -> Args {
+        let mut args = default_args();
+        args.alg = alg.into();
+        args.senders = 6;
+        args.conc = 2;
+        args.per_tx = 4;
+        args.offset = 77;
+        args.rpc_batch = rpc_batch;
+        args.recipients = 1000;
+        args.claim_sender = claim;
+        args.chain_id = 1143;
+        args
+    }
+
+    fn replay_all(args: &Args, dir: &std::path::Path, short: Option<(usize, usize)>) -> Vec<Vec<(usize, Vec<u8>)>> {
+        let chunk = args.senders.div_ceil(args.conc);
+        let set = open_replay_set(dir, args, chunk).expect("open the set");
+        let (sent, rejected, limiter) = (AtomicU64::new(0), AtomicU64::new(0), RateLimiter::new(0.0));
+        let mut out = Vec::new();
+        for mut file in set {
+            let mut sink = MemorySink { sent: Vec::new(), queue: Default::default(), short };
+            let end = replay_over_ingest(
+                &mut sink,
+                &mut file.reader,
+                file.header.part_len as usize,
+                args,
+                &sent,
+                &rejected,
+                &limiter,
+            );
+            assert!(end.exhausted, "a replay into a sink that accepts ends with the file");
+            assert_eq!(end.frames, file.header.frames);
+            out.push(sink.sent);
+        }
+        assert_eq!(sent.load(Ordering::Relaxed), (args.senders as u64) * args.per_tx);
+        out
+    }
+
+    /// A pre-generated set replays byte for byte the frames the live ingest
+    /// path builds for the same arguments, in its round-robin order, one
+    /// file per worker; for both signature schemes, with and without the
+    /// sender claim, and with frames that split a sender's nonces.
+    #[test]
+    fn a_replayed_set_is_the_live_flood_byte_for_byte() {
+        for (alg, rpc_batch, claim) in [("ed25519", 5, false), ("secp256k1", 5, false), ("ed25519", 3, true), ("secp256k1", 3, false)] {
+            let args = tiny_args(alg, rpc_batch, claim);
+            let keys: Vec<Signer> = (0..args.senders).map(|i| derive(args.offset, i, alg == "ed25519")).collect();
+            let dir = scratch_dir("pregen");
+            let mut made = tiny_args(alg, rpc_batch, claim);
+            made.pregen_txs = 24;
+            pregen(&made, &keys, &dir).expect("generate");
+            let replayed = replay_all(&args, &dir, None);
+            let chunk = args.senders.div_ceil(args.conc);
+            assert_eq!(replayed.len(), 2);
+            for (worker, frames) in replayed.iter().enumerate() {
+                let first = worker * chunk;
+                let mut want = Vec::new();
+                for from in (0..args.per_tx).step_by(rpc_batch) {
+                    for index in 0..chunk {
+                        want.push((index, live_frame(&keys[first + index], first, index, from, &args).0));
+                    }
+                }
+                assert_eq!(frames, &want, "{alg} rpcbatch {rpc_batch}: worker {worker}'s frames");
+            }
+            let bytes: u64 = std::fs::read_dir(&dir).expect("dir").map(|e| e.expect("entry").metadata().expect("meta").len()).sum();
+            eprintln!("{alg} rpcbatch {rpc_batch} claim {claim}: {bytes} bytes for 24 transactions");
+            std::fs::remove_dir_all(&dir).expect("clean up");
+        }
+    }
+
+    /// A frame accepted only in part goes again from the first refused
+    /// transaction, before that sender's next frame; and a set made for other
+    /// arguments is refused.
+    #[test]
+    fn a_partial_answer_resends_the_rest_and_a_foreign_set_is_refused() {
+        let args = tiny_args("ed25519", 3, false);
+        let keys: Vec<Signer> = (0..args.senders).map(|i| derive(args.offset, i, true)).collect();
+        let dir = scratch_dir("partial");
+        let mut made = tiny_args("ed25519", 3, false);
+        made.pregen_txs = 24;
+        pregen(&made, &keys, &dir).expect("generate");
+        // The first frame (sender 0, nonces 0..3) accepted one transaction.
+        let replayed = replay_all(&args, &dir, Some((0, 1)));
+        let mut batch = Vec::new();
+        sign_batch(&keys[0], 0, 0, 1, 3, &args, &mut batch);
+        let rest = frame_bytes(&batch, None);
+        let worker0 = &replayed[0];
+        let resend = worker0.iter().position(|(s, f)| *s == 0 && *f == rest).expect("the rest was sent again");
+        let next = worker0
+            .iter()
+            .position(|(s, f)| *s == 0 && *f == live_frame(&keys[0], 0, 0, 3, &args).0)
+            .expect("sender 0's next frame");
+        assert!(resend < next, "the rest goes before the sender's next frame");
+
+        let mut other = tiny_args("ed25519", 3, false);
+        other.chain_id = 1144;
+        let err = open_replay_set(&dir, &other, 3).err().expect("refused").to_string();
+        assert!(err.contains("--chain-id"), "{err}");
+        other = tiny_args("ed25519", 3, false);
+        other.conc = 3;
+        assert!(open_replay_set(&dir, &other, 2).is_err(), "a set cut for two workers is not three");
+        std::fs::remove_dir_all(&dir).expect("clean up");
     }
 
     /// A disabled bucket (`rate <= 0`) never blocks, whatever it is asked

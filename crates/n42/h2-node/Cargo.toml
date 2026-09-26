@@ -34,6 +34,7 @@ libc.workspace = true
 alloy-signer.workspace = true
 alloy-signer-local.workspace = true
 secp256k1.workspace = true
+rayon.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 futures.workspace = true
 hex.workspace = true

@@ -49,7 +49,7 @@ pub use header_profile::{
     normalize_to_gov5_h2,
     normalize_to_gov5_h2_with_header, normalize_to_gov5_h2_from_header,
     execution_data_for_block_with_bal, execution_data_from_raw_parts,
-    reconstruct_gov5_h2_block, reconstruct_gov5_h2_block_from, rewards_to_withdrawals, seal_hash, seal_header,
+    reconstruct_gov5_h2_block, reconstruct_gov5_h2_block_from, reconstruct_gov5_h2_block_from_or_tx_root, rewards_to_withdrawals, seal_hash, seal_header,
     withdrawals_to_rewards,
     validate_gov5_h2_header, verify_seal, HeaderExtra, HeaderProfileError, N42HeaderProfile,
     ReceiptView,

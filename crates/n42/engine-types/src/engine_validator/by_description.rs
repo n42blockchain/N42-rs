@@ -204,11 +204,9 @@ where
         if body.frames.is_some() {
             return self.describe_frames(body, queue, miss_wait, started, supplied, fill_us);
         }
-        if crate::frame_blocks::active() {
-            return Err(other(
-                "a frame chain's block described by hashes: not frame-aligned (N42_FRAME_BLOCKS=1)".to_owned(),
-            ));
-        }
+        // Under `N42_FRAME_BLOCKS=1` a block described by hashes is one whose
+        // body is not a run of frames: it carries the MPT root, checked below
+        // exactly as without the flag.
         let covered: std::collections::HashSet<usize> = supplied.iter().map(|(index, _, _)| *index).collect();
 
         // The look-up and the encoding in one pass, a chunk per worker. A
@@ -536,6 +534,10 @@ where
                     .into(),
             ));
         }
+        // Verified from the layout and the body's own hashes, whatever this
+        // node's frame index holds (a supplied frame's transactions included):
+        // kept so a later whole-body check of the block verifies it the same way.
+        crate::frame_blocks::remember_verified(body.block_hash, transactions_root, body.frames.as_deref().unwrap_or_default());
         let describe_us = (first_pass + second_at.elapsed()).as_micros() as u64;
         Ok(DescribedBlock {
             hash: body.block_hash,

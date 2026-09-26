@@ -339,14 +339,14 @@ where
             // A root the caller has already computed and matched against the
             // sealed hash (the payload's conversion did): not computed twice.
             Some(root) => root,
-            // `N42_FRAME_BLOCKS=1`: the frame tree over the layout this
-            // node's frame index finds; a body that is not a run of
-            // indexed frames is not valid on a frame chain.
+            // `N42_FRAME_BLOCKS=1`: the frame tree when a layout this node
+            // can check covers the body (one it verified or built for that
+            // root, or its frame index's), the MPT root otherwise -- aligned
+            // or not is each block's own property.
             None if crate::frame_blocks::active() => {
                 use alloy_consensus::transaction::TxHashRef as _;
                 let hashes: Vec<B256> = body.transactions.iter().map(|tx| *tx.tx_hash()).collect();
-                crate::frame_blocks::body_root(&hashes)
-                    .map_err(|err| ConsensusError::Other(Arc::new(std::io::Error::other(format!("frame blocks: {err}")))))?
+                crate::frame_blocks::root_for_body(Some(header.transactions_root), &hashes, || body.calculate_tx_root()).0
             }
             None => body.calculate_tx_root(),
         };

@@ -1392,18 +1392,20 @@ where
                 }
             };
             let early_root: Option<B256> = $early_root;
-            let transactions_root = match (frame_plan.as_ref(), early_root) {
-                // A frame build: the frame tree over the body's layout, and
-                // a body that is not a prefix of the plan is refused here,
-                // before anything is sealed.
-                (Some(plan), _) => {
-                    use alloy_consensus::transaction::TxHashRef as _;
-                    let hashes: Vec<B256> = transactions.iter().map(|tx| *tx.tx_hash()).collect();
-                    crate::frame_blocks::sealed_root(plan, &hashes, &transactions)
-                        .map_err(|err| PayloadBuilderError::other(std::io::Error::other(err)))?
+            let transactions_root = if crate::frame_blocks::active() {
+                // Under the flag: the frame tree when the sealed body is a
+                // run of frames (by the build's plan or this node's frame
+                // index), the MPT root for any other body.
+                use alloy_consensus::transaction::TxHashRef as _;
+                let hashes: Vec<B256> = transactions.iter().map(|tx| *tx.tx_hash()).collect();
+                crate::frame_blocks::seal_root(frame_plan.as_ref(), &hashes, &transactions, || {
+                    early_root.unwrap_or_else(|| crate::assembler::parallel_transaction_root(&transactions))
+                })
+            } else {
+                match early_root {
+                    Some(root) => root,
+                    None => crate::assembler::parallel_transaction_root(&transactions),
                 }
-                (None, Some(root)) => root,
-                (None, None) => crate::assembler::parallel_transaction_root(&transactions),
             };
             let root_ms = seal_at.elapsed().as_millis() as u64;
             let parent_sealed = parent_header.hash();
@@ -3009,17 +3011,15 @@ where
         header.logs_bloom = own_logs_bloom;
         header.gas_used = own_gas_used;
     }
-    header.transactions_root = match frame_plan.as_ref() {
-        // A frame build: the assembler's root is the MPT root; the header's
-        // is the frame tree over the body's layout.
-        Some(plan) => {
-            use alloy_consensus::transaction::TxHashRef as _;
-            let transactions = &block.body().transactions;
-            let hashes: Vec<B256> = transactions.iter().map(|tx| *tx.tx_hash()).collect();
-            crate::frame_blocks::sealed_root(plan, &hashes, transactions)
-                .map_err(|err| PayloadBuilderError::other(std::io::Error::other(err)))?
-        }
-        None => block.header().transactions_root,
+    // Under the flag the assembler's root is the MPT root; the header's is
+    // the frame tree when the sealed body is a run of frames.
+    header.transactions_root = if crate::frame_blocks::active() {
+        use alloy_consensus::transaction::TxHashRef as _;
+        let transactions = &block.body().transactions;
+        let hashes: Vec<B256> = transactions.iter().map(|tx| *tx.tx_hash()).collect();
+        crate::frame_blocks::seal_root(frame_plan.as_ref(), &hashes, transactions, || block.header().transactions_root)
+    } else {
+        block.header().transactions_root
     };
     if hotstuff {
         header.ommers_hash = B256::ZERO;

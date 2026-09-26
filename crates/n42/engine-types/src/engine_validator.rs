@@ -20,7 +20,6 @@
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::{ExecutionData, PayloadAttributes as EthPayloadAttributes, PayloadError};
 use n42_h2_consensus::header_profile::N42HeaderProfile;
-use n42_h2_consensus::reconstruct_gov5_h2_block_from;
 use n42_qmdb_reth::HotStuffGenesisConfig;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_engine_primitives::{EngineApiValidator, EngineTypes, PayloadValidator};
@@ -180,7 +179,12 @@ where
             decoded.into_iter().collect::<Result<Vec<_>, _>>()?.into_iter().unzip();
         let transactions_root = match transactions_root {
             Some(root) => root,
-            None => frame_body_root(&transactions).map_err(other)?,
+            None => {
+                frame_body_root(Some(body.header.transactions_root), &transactions, || {
+                    crate::assembler::parallel_ordered_trie_root(&body.transactions)
+                })
+                .0
+            }
         };
         if transactions_root != body.header.transactions_root {
             return Err(PayloadError::BlockHash {
@@ -412,7 +416,7 @@ where
             )));
         }
 
-        if body.frames.is_some() || crate::frame_blocks::active() {
+        if body.frames.is_some() {
             // Frame descriptions are assembled by reference only
             // (`describe_compact_body`); refused here, the caller asks for
             // the whole body.
@@ -604,14 +608,18 @@ where
 }
 
 /// A whole body's transactions root on a frame chain
-/// (`crate::frame_blocks::body_root`): the frame tree over the layout this
-/// node's frame index finds for it; a body that is not a run of indexed
-/// frames is refused.
-fn frame_body_root(transactions: &[TransactionSigned]) -> Result<B256, String> {
+/// (`crate::frame_blocks::root_for_body`): the frame tree when a layout this
+/// node can check covers the body, the MPT root (`mpt`) otherwise; and
+/// whether it is the frame tree.
+fn frame_body_root(
+    claimed: Option<B256>,
+    transactions: &[TransactionSigned],
+    mpt: impl FnOnce() -> B256,
+) -> (B256, bool) {
     use alloy_consensus::transaction::TxHashRef as _;
     use rayon::prelude::*;
     let hashes: Vec<B256> = transactions.par_iter().map(|tx| *tx.tx_hash()).collect();
-    crate::frame_blocks::body_root(&hashes).map_err(|err| format!("frame blocks: {err}"))
+    crate::frame_blocks::root_for_body(claimed, &hashes, mpt)
 }
 
 /// The transactions supplied with a compact frame, for the positions a first
@@ -772,10 +780,17 @@ where
         );
         let joined = started.elapsed();
         let decoded_transactions = decoded_transactions.into_iter().collect::<Result<Vec<_>, _>>()?;
-        let transactions_root = match transactions_root {
-            Some(root) => root,
-            None => frame_body_root(&decoded_transactions).map_err(|err| NewPayloadError::Other(err.into()))?,
+        // Under the flag the payload does not carry the header's root: the
+        // one verified for this block's description if there was one, else
+        // the frame tree by this node's index, else the MPT root; a frame
+        // root the hash does not confirm falls back to the MPT root below.
+        let (transactions_root, frame_root) = match transactions_root {
+            Some(root) => (root, false),
+            None => frame_body_root(crate::frame_blocks::root_of_block(&expected_hash), &decoded_transactions, || {
+                crate::assembler::parallel_ordered_trie_root(&raw_transactions)
+            }),
         };
+        let mpt_alternate = || frame_root.then(|| crate::assembler::parallel_ordered_trie_root(&raw_transactions));
         let raw_block = payload
             .payload
             .clone()
@@ -816,8 +831,12 @@ where
         // difficulty restored, hash confirmed -- header arithmetic on the
         // block already decoded.
         let checked = started.elapsed();
-        let block = reconstruct_gov5_h2_block_from(ethereum_shaped.into_block(), &payload)
-            .map_err(|err| NewPayloadError::Other(err.into()))?;
+        let block = n42_h2_consensus::reconstruct_gov5_h2_block_from_or_tx_root(
+            ethereum_shaped.into_block(),
+            &payload,
+            mpt_alternate,
+        )
+        .map_err(|err| NewPayloadError::Other(err.into()))?;
 
         let sealed = SealedBlock::seal_slow(block);
         if tx_count >= 10_000 {
@@ -2002,7 +2021,8 @@ mod tests {
             let (want, layout) = frame_block_parts(&frames);
             assert_eq!(plan.skipped, 1, "frame B is behind a hole");
             assert_eq!(hashes_of(&body), hashes_of(&want), "the body is the frames end to end");
-            let root = crate::frame_blocks::sealed_root(&plan, &hashes_of(&body), &body).expect("frame-aligned");
+            let mpt = alloy_consensus::proofs::calculate_transaction_root(&body);
+            let root = crate::frame_blocks::seal_root(Some(&plan), &hashes_of(&body), &body, || mpt);
             let tree = n42_tx_types::frame_tree_root(&[
                 n42_tx_types::frame_root(&hashes_of(&frames[0].1)),
                 n42_tx_types::frame_root(&hashes_of(&frames[2].1)),
@@ -2012,9 +2032,12 @@ mod tests {
             assert_eq!(root, crate::assembler::transactions_root_by_rule(true, Some(&[3, 2, 2]), &body));
             assert_ne!(root, alloy_consensus::proofs::calculate_transaction_root(&body));
             assert_eq!(crate::frame_blocks::layout_by_root(&root), Some(layout));
-            // A body that is not a prefix of the plan is refused before a seal.
+            // A body that is not a prefix of the plan (the execution skipped
+            // a planned transaction) is not refused: it seals with the MPT root.
             let holed: Vec<TransactionSigned> = body.iter().skip(1).cloned().collect();
-            assert!(crate::frame_blocks::sealed_root(&plan, &hashes_of(&holed), &holed).is_err());
+            let holed_mpt = alloy_consensus::proofs::calculate_transaction_root(&holed);
+            assert_eq!(crate::frame_blocks::seal_root(Some(&plan), &hashes_of(&holed), &holed, || holed_mpt), holed_mpt);
+            assert!(crate::frame_blocks::layout_by_root(&holed_mpt).is_none());
         });
         // Off, the selection is the walk and leaves no plan.
         let (queue, _) = frame_queue();
@@ -2075,17 +2098,18 @@ mod tests {
         });
     }
 
-    /// Validation under the flag: a header whose root is not the frame tree
-    /// of its frame-aligned body (the MPT root, or a layout that cuts a
-    /// frame anywhere but last) is refused, and so is a block described by
-    /// hashes, which names no layout at all.
+    /// Validation under the flag: a frame description (version 2) binds only
+    /// the frame tree of the layout it names -- a header with the MPT root,
+    /// or a layout that cuts a frame anywhere but last, is refused -- while a
+    /// block described by hashes (version 1) is acceptable and checked with
+    /// the MPT root, so it is refused only when its header carries another.
     #[test]
-    fn a_body_that_is_not_frame_aligned_is_refused_under_the_flag() {
+    fn under_the_flag_a_frame_description_binds_the_frame_tree_and_a_hash_one_the_mpt_root() {
         let (queue, frames) = frame_queue();
         let (body, layout) = frame_block_parts(&frames);
         let validator = validator(N42HeaderProfile::Gov5H2);
         crate::frame_blocks::with_active(true, || {
-            // The MPT root on a frame chain.
+            // The MPT root under a frame description.
             let mpt = alloy_consensus::proofs::calculate_transaction_root(&body);
             let (hash, gov5, _) = frame_block(&body, mpt);
             let compact =
@@ -2094,6 +2118,16 @@ mod tests {
                 validator.describe_compact_body(hash, N42HeaderProfile::Gov5H2, &compact, &queue, SHORT_WAIT),
                 Err(CompactBodyError::Invalid(_))
             ));
+            // The same block described by hashes: accepted, the MPT root.
+            let listed = n42_h2_consensus::encode_compact_body(&gov5, &hashes_of(&body), N42HeaderProfile::Gov5H2)
+                .expect("encodes");
+            let described = validator
+                .describe_compact_body(hash, N42HeaderProfile::Gov5H2, &listed, &queue, SHORT_WAIT)
+                .expect("a hash description is acceptable under the flag");
+            assert_eq!(described.frames, 0);
+            let made = described.into_block(&validator).expect("the block is made");
+            assert_eq!(made.block.hash(), hash);
+
             // A layout that cuts frame A short in the middle of the body.
             let root = crate::assembler::transactions_root_by_rule(true, Some(&[3, 2, 2]), &body);
             let (hash, gov5, _) = frame_block(&body, root);
@@ -2104,7 +2138,7 @@ mod tests {
                 validator.describe_compact_body(hash, N42HeaderProfile::Gov5H2, &compact, &queue, SHORT_WAIT),
                 Err(CompactBodyError::Invalid(_))
             ));
-            // Described by hashes: no layout, not frame-aligned.
+            // A frame root described by hashes: checked with the MPT root, refused.
             let listed = n42_h2_consensus::encode_compact_body(&gov5, &hashes_of(&body), N42HeaderProfile::Gov5H2)
                 .expect("encodes");
             assert!(matches!(
@@ -2118,5 +2152,68 @@ mod tests {
         let compact =
             n42_h2_consensus::encode_compact_frame_body(&gov5, &layout, N42HeaderProfile::Gov5H2).expect("encodes");
         assert!(validator.describe_compact_body(hash, N42HeaderProfile::Gov5H2, &compact, &queue, SHORT_WAIT).is_err());
+    }
+
+    /// A block that is not frame-aligned under the flag -- the funding
+    /// block, transactions that came by RPC and belong to no frame -- seals
+    /// with the MPT root, goes out by hashes and validates everywhere:
+    /// as a whole body and in the engine's conversion.
+    #[test]
+    fn a_body_that_is_not_frame_aligned_seals_and_validates_with_the_mpt_root_under_the_flag() {
+        // Transfers in no frame.
+        let body: Vec<TransactionSigned> = (0..3).map(|nonce| frame_transfer(nonce, 0x77)).collect();
+        let mpt = alloy_consensus::proofs::calculate_transaction_root(&body);
+        let validator = validator(N42HeaderProfile::Gov5H2);
+        crate::frame_blocks::with_active(true, || {
+            // No usable frame: the selection is the walk, and no plan is left.
+            let empty = n42_tx_queue::TxQueue::<crate::N42PooledTransaction>::with_run_length(1).with_hash_index(1024);
+            let _ = crate::frame_blocks::select(&empty, B256::repeat_byte(1), 7 * 21_000);
+            assert!(crate::frame_blocks::take_plan().is_none(), "no frame, no frame build");
+
+            assert_eq!(crate::frame_blocks::seal_root(None, &hashes_of(&body), &body, || mpt), mpt);
+            let (hash, _, payload) = frame_block(&body, mpt);
+            let (root, frame) = crate::frame_blocks::root_for_body(Some(mpt), &hashes_of(&body), || mpt);
+            assert_eq!((root, frame), (mpt, false));
+            let sealed = validator.convert_payload_to_block(payload).expect("the MPT root converts under the flag");
+            assert_eq!(sealed.hash(), hash);
+        });
+    }
+
+    /// An aligned block seals with the frame tree; a follower that holds the
+    /// whole body but indexed none of its frames (every position supplied
+    /// by the proposer's fill) verifies the frame tree from the version-2
+    /// layout and the transactions' own hashes, and the engine's conversion
+    /// of the same block then confirms it without any frame index.
+    #[test]
+    fn a_follower_without_the_frames_verifies_a_frame_block_from_its_layout() {
+        use alloy_eips::Encodable2718;
+        let (_, frames) = frame_queue();
+        let (body, layout) = frame_block_parts(&frames);
+        let counts: Vec<usize> = layout.iter().map(|(_, count)| *count as usize).collect();
+        let root = crate::assembler::transactions_root_by_rule(true, Some(&counts), &body);
+        let (hash, gov5, payload) = frame_block(&body, root);
+        let compact =
+            n42_h2_consensus::encode_compact_frame_body(&gov5, &layout, N42HeaderProfile::Gov5H2).expect("encodes");
+        let fill: Vec<(usize, Bytes)> =
+            body.iter().enumerate().map(|(index, tx)| (index, Bytes::from(tx.encoded_2718()))).collect();
+        let filled = n42_h2_consensus::with_fill(&compact, &fill);
+        let validator = validator(N42HeaderProfile::Gov5H2);
+        crate::frame_blocks::with_active(true, || {
+            let blind = n42_tx_queue::TxQueue::<crate::N42PooledTransaction>::with_run_length(1).with_hash_index(1024);
+            let described = validator
+                .describe_compact_body(hash, N42HeaderProfile::Gov5H2, &filled, &blind, SHORT_WAIT)
+                .expect("verified from the layout");
+            assert_eq!((described.frames, described.len()), (3, 7));
+            let made = described.into_block(&validator).expect("the block is made");
+            assert_eq!(made.block.hash(), hash);
+            // The whole-body check and the engine's conversion: the layout
+            // verified for this root, checked again over the body's hashes.
+            assert_eq!(
+                crate::frame_blocks::root_for_body(Some(root), &hashes_of(&body), || B256::ZERO),
+                (root, true)
+            );
+            let sealed = validator.convert_payload_to_block(payload).expect("converts with the frame root");
+            assert_eq!(sealed.hash(), hash);
+        });
     }
 }

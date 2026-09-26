@@ -553,8 +553,22 @@ pub fn reconstruct_gov5_h2_block<T: alloy_eips::Decodable2718>(
 /// function does on top is header arithmetic: a handful of candidate headers,
 /// each hashed once.
 pub fn reconstruct_gov5_h2_block_from<T>(
+    block: Block<T>,
+    execution: &ExecutionData,
+) -> Result<Block<T>, HeaderProfileError> {
+    reconstruct_gov5_h2_block_from_or_tx_root(block, execution, || None)
+}
+
+/// [`reconstruct_gov5_h2_block_from`], and when no variant of the header
+/// hashes to the payload's block hash, once more with the transactions root
+/// `alternate` gives (if any). A frame chain's block carries the frame-tree
+/// root or the MPT root by whether its body is frame-aligned; a node that
+/// guessed the frame tree for a block its sealer rooted by MPT (their frame
+/// indexes differ) confirms the other root by the hash.
+pub fn reconstruct_gov5_h2_block_from_or_tx_root<T>(
     mut block: Block<T>,
     execution: &ExecutionData,
+    alternate: impl FnOnce() -> Option<B256>,
 ) -> Result<Block<T>, HeaderProfileError> {
     let expected = execution.block_hash();
     validate_gov5_h2_header(&block.header)?;
@@ -604,25 +618,32 @@ pub fn reconstruct_gov5_h2_block_from<T>(
     // Amsterdam block with both access-list-hash candidates equal -- the one
     // dimension not tried was this one.
     let slot_numbers = if block.header.slot_number.is_some() { vec![block.header.slot_number, None] } else { vec![None] };
-    for ommers_hash in [B256::ZERO, EMPTY_OMMER_ROOT_HASH] {
-        for difficulty in [U256::ZERO, U256::from(1)] {
-            for withdrawals_root in &withdrawals_roots {
-                for requests_hash in &requests_hashes {
-                    for bal_hash in &bal_hashes {
-                        for slot_number in &slot_numbers {
-                            block.header.ommers_hash = ommers_hash;
-                            block.header.difficulty = difficulty;
-                            block.header.withdrawals_root = *withdrawals_root;
-                            block.header.requests_hash = *requests_hash;
-                            block.header.block_access_list_hash = *bal_hash;
-                            block.header.slot_number = *slot_number;
-                            if block.header.hash_slow() == expected {
-                                return Ok(block);
+    let mut alternate = Some(alternate);
+    loop {
+        for ommers_hash in [B256::ZERO, EMPTY_OMMER_ROOT_HASH] {
+            for difficulty in [U256::ZERO, U256::from(1)] {
+                for withdrawals_root in &withdrawals_roots {
+                    for requests_hash in &requests_hashes {
+                        for bal_hash in &bal_hashes {
+                            for slot_number in &slot_numbers {
+                                block.header.ommers_hash = ommers_hash;
+                                block.header.difficulty = difficulty;
+                                block.header.withdrawals_root = *withdrawals_root;
+                                block.header.requests_hash = *requests_hash;
+                                block.header.block_access_list_hash = *bal_hash;
+                                block.header.slot_number = *slot_number;
+                                if block.header.hash_slow() == expected {
+                                    return Ok(block);
+                                }
                             }
                         }
                     }
                 }
             }
+        }
+        match alternate.take().and_then(|alternate| alternate()) {
+            Some(root) if root != block.header.transactions_root => block.header.transactions_root = root,
+            _ => break,
         }
     }
     // What was tried, so a refusal in the field says which dimension is off

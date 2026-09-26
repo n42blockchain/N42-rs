@@ -2682,3 +2682,25 @@ verification saved. Under `all` the verification throttles admission before the 
 why `all` is faster. The lever is therefore the *depth*, not the CPU: backpressure at a shallow queue (a few
 blocks' worth, ~400-500k), held cheaply, with the flood's token bucket pacing the offer to consumption.
 loop265: shard and all at a 500,000-slot pool (gate 417k) and at 650,000, 950k/s.
+
+### 9.6 Shallow pools (loop265): the gate throttles the supply where the verification used to
+
+| leg | mode / pool | win1 | win2 | occupancy | txs p10 | cycle | B | queue (median) | gate us/frame | flood win1 | ingest rate / node | road |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| SH500 | shard / 500k | 899,729 | 646,653 | 92% | 129,000 | 150 | 90 | 433,000 | 24,204 | 862k | 747k | 75 |
+| C500 | all / 500k | 886,003 | 642,056 | 87% | 108,000 | 156 | 69 | 298,000 | 11,983 | 849k | 618k | 77 |
+| SH650 | shard / 650k | 939,982 | 649,355 | 98% | 163,000 | 160.5 | 96 | 551,000 | 23,539 | 909k | 677k | 80 |
+| C1M | all / 1M | **963,123** | 766,052 | 99% | 163,000 | 163 | 123.5 | 685,000 | 8,992 | 891k | 802k | 70 |
+
+At a shallow pool the road is back to 75-80 and B to 69-96 -- and the blocks are short (87-92% at 500k), because
+the gate now throttles the supply: 24 ms a frame held on the shard legs, and the flood, closed-loop on the
+replies, delivers 850-909k/s. At 650k the shard mode fills the blocks (98%) with B 96 against the control's 123,
+and still reads 940k against 963k because it received 909k/s against 891k/s -- the same supply, a cheaper ingest,
+a cheaper road, and no more transactions. **The probe's verdict**: on this fleet a third of the verification buys
+nothing at the window, because what limits the supply is not the CPU the ingest spends but the *loop* the
+generator and the ingest form -- every transaction admitted must be either verified (10 us, which throttles), or
+held at a gate (which the flood measures as latency and throttles itself on), or let into a deeper queue (which
+the road pays for at every block). The design note's form B would save CPU and not throughput here; what would
+is a supply that is not closed-loop on the ingest's replies (an open-loop offer at the chain's consumption, the
+ingest dropping rather than holding when over a shallow depth) -- a generator and backpressure design, not a
+verification one. Recorded, not built: the campaign's window stands at 977,627.

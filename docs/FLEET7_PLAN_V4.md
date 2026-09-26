@@ -2645,3 +2645,21 @@ layer's own road stayed at 66-67 and the leader's seal at 135-138; the flood del
 costs the road ~60 ms somewhere before its own timers, and slows the ingest's replies with a third of the work.
 That falsifies the design note's premise as stated (section 2.B's saving is real in CPU and does not reach the
 window on this fleet) until the coupling is named -- being read from the two legs.
+
+### 9.4 Why a third of the verification made the fleet slower (loop263, read): the ingest gate, again
+
+Over window 1 on the follower (node1): the road's own timers hardly moved (`vote road` 63 -> 71, `checked` 65 ->
+73), the leader's collect grew 85 -> 148 -- and the follower's ingest line says why: `gate_us_per_frame` ~280 ->
+~26,000, `reply_us_per_frame` ~1,600 -> ~36,700, `acq_us_per_frame` 1,300-4,100 -> 9,500-10,800, with
+`busy_us_per_tx` 10 -> 4 and the slots 82-85% -> 29-31%. The follower's queue sits at 867,000 against 552,000
+under `all` (from the first block: 646k against 482k; the pool's cap 1,000,000, the gate line 833,333); the gate
+reopens only on a canonical block's prune, so near the cap every frame is held, the replies the flood measures
+stretch (169 -> 195-216 ms), the follower's vote slips, the leader's collect grows, the next prune comes later
+and the queue creeps further -- a feedback loop. The leader's own ingest shows none of it (gate 350-590 us both
+legs). **The coupling between the ingest and the road is the follower's backpressure gate, not the CPU**: under
+`all` the verification itself throttles admission (slots 73-85% busy) and the queue stays at 550k, under the
+gate line; make admission cheaper and the queue rises to the gate, which then costs every frame and every vote.
+Which is also 6.17-6.20 in another form (more in flight = a deeper queue = the gate). Next: the same probe with
+the gate line out of reach (pool 2,000,000) and the offer at or under consumption -- loop264 -- to see whether the
+cheaper ingest then reaches the window, and, independently, whether the gate should hold frames at all on a
+follower whose queue the next block will prune (a bounded, non-blocking backpressure instead of a hold).

@@ -452,7 +452,7 @@ for ((fp = 0; fp < FLOOD_PROCS; fp++)); do
   setsid $FLOOD_PIN "$F7_BIN/examples/tx_flood" --rpc "$RPCS" --chain-id "$CHAIN" \
     "${INGEST_ARG[@]}" --recipients "$RECIPIENTS" ${F7_FLOOD_LEGACY_RECIPIENTS:+--legacy-recipients} \
     --senders "$fp_senders" --pertx "$PERTX" --offset "$fp_offset" --gasprice "$GASPRICE" --gas "$F7_TX_GAS" \
-    --conc "$fp_conc" --rpcbatch "$RPCBATCH" ${F7_FLOOD_RATE:+--rate "$(( F7_FLOOD_RATE / FLOOD_PROCS ))"} ${F7_FLOOD_REPLAY:+--replay "$F7_FLOOD_REPLAY"} ${F7_FLOOD_WINDOW:+--window "$F7_FLOOD_WINDOW"} $SHARD \
+    --conc "$fp_conc" --rpcbatch "$RPCBATCH" ${F7_FLOOD_RATE:+--rate "$(( F7_FLOOD_RATE / FLOOD_PROCS ))"} ${F7_FLOOD_REPLAY:+--replay "$F7_FLOOD_REPLAY"} ${F7_FLOOD_CLAIM:+--claim-sender} ${F7_FLOOD_WINDOW:+--window "$F7_FLOOD_WINDOW"} $SHARD \
     ${F7_FLOOD_ALG:+--alg "$F7_FLOOD_ALG"} \
     > "$fp_log" 2>&1 < /dev/null 9>&- &
   FLOODS+=($!)

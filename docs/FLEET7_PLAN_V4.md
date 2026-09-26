@@ -2620,3 +2620,11 @@ requests of 500 per node, a reply every 170-220 ms), and the nodes admit ~820-85
 made. The replay is kept (deterministic supply, no signing cores, a leg's flood reproducible byte for byte) but
 it does not move the window. **The supply term is the node's ingest, full stop** -- the 10 us a signature on
 every node and the CPU the followers' road shares with it -- and past it lies the design question of section 8.
+
+### 9.2 The sharded-verification probe, first try (loop262): the shard path needs a claiming flood
+
+`plan-v6/ingest-shard` (merged 7319c655d + the cache fix): `N42_INGEST_VERIFY=shard`, each execution layer told
+its `N42_INGEST_SHARD=i/n` by `fleet7.sh`. The legs read `shard_verified=0 shard_claimed=0`: the shard rule
+applies to a *claiming* frame, and the bench's flood sends none unless asked (`tx_flood --claim-sender`), so every
+transaction went through the full verification as under `all` -- the four legs are four more controls (967-976k
+on window 1, C950's window 2 825,835). `F7_FLOOD_CLAIM=1` now passes the flag; loop263 repeats the legs with it.

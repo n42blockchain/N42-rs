@@ -63,6 +63,7 @@ cmd_up() {
     N42_TX_INGEST="${F7_INGEST:+127.0.0.1:$((F7_INGEST_BASE + i))}" \
     N42_PAYLOAD_SERVE="127.0.0.1:$((F7_PAYLOAD_BASE + i))" \
     N42_SENDER_CACHE_MULT="${F7_SENDER_CACHE_MULT:-2}" \
+    N42_INGEST_SHARD="$i/$F7_NODES" \
       RUST_LOG="$F7_LOG_EL" f7_spawn "$d/el.pid" "$d/el.log" $pin "$F7_BIN/n42" "${F7_EL_ARGS[@]}"
   done
 

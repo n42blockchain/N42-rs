@@ -2586,3 +2586,16 @@ inclusion as the claim, checked by followers in batch off the vote path, or veri
 coverage) -- a protocol design with a safety argument to write first -- or a generator on another box, so the
 flood's 17 cores stop competing with the nodes' ingest for the same memory bandwidth. Both are decisions, not
 measurements; the measurements are in this document.
+
+## 9. The generator off the signing path (2026-09-26)
+
+The user's direction after section 8: pre-generate the transactions -- signed and encoded exactly as the flood
+sends them -- into files on disk once (tens of GB on /data), and have the flood read and send them, so the 17 cores
+beside the nodes sign nothing and the generator's rate is the send loop alone. `tx_flood --pregen-out <dir>
+--pregen-txs <n>` writes one file per worker in the live send order (frames of `--rpcbatch`, length-prefixed, a
+header the replay checks against its arguments); `tx_flood --replay <dir>` sends them through the unchanged send
+loop (`--conc`, `--rate`, the same summary lines); the bench passes `F7_FLOOD_REPLAY=<dir>`. A replay set is valid
+against a fresh chain only (the derived senders at nonce 0 after funding), which every leg is. The first leg
+repeats 7.24's control with the replayed set at 950k and then raises the offer, to see whether the send loop
+alone delivers 1M/s and whether the followers' road stays at ~100 when the generator no longer competes for the
+box's memory bandwidth. In flight on `plan-v6/flood-pregen`.

@@ -203,3 +203,20 @@ full (p10 128-131k) because the flood delivers ~950k/s and the chain would take 
 145 ms); the 1.0M offer delivered 949k like the rest (9.1: the generator's loop). Two levers are now open that
 were closed before: pacing under 125 (the leader is waiting), and more requests in flight from the flood -- 6.17 and
 9.5's coupling came from the road's per-transaction and per-depth costs, both gone. loop269 runs them.
+
+### 10.4 The reopened levers (loop269): the supply is pinned at ~950k/s by the ingest, whatever the flood does
+
+| leg | conc | pacing | offer | win1 | win2 | occupancy | cycle | B | D | E | flood win1 | reply ms | ingest rate / node | TCs |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| FC96 | 96 | 125 | 1.1M | 975,214 | **900,520** | 89.5% | 154 | 53 | 61.5 | 13 | 956k | 257-286 | 915k | 7 |
+| FC128 | 128 | 125 | 1.1M | 971,765 | 707,708 | 89.9% | 151 | 49.5 | 70.7 | 11.5 | 945k | 384-396 | 752k | 1 |
+| FP100 | 64 | 100 | 950k | 974,022 | 624,395 | 83.1% | 163 | 45 | 51.6 | 47 | 950k | 169 | 683k | 1 |
+| FR950 | 64 | 125 | 950k | 974,302 | 652,308 | 88.6% | 154.5 | 49 | 74.4 | 13 | 950k | 169 | 795k | 2 |
+
+B stays at 45-53 with 96 or 128 requests in flight -- the old coupling is gone, as step 1 predicted -- and the
+window does not move: 972-975k in every leg, the flood delivering 945-956k/s whatever is asked, its replies
+stretching from 169 to 257-396 ms as more is in flight. Pacing 100 only empties the blocks further (83%). So
+the supply is pinned by the nodes' ingest: at 950k/s the twelve recovery slots are ~75% busy, and above it the
+frames queue at the slots and the replies lengthen instead of the rate rising. **That is step 2's term exactly**:
+verification paid once, at the edge, so a frame costs a node one signature check instead of five hundred.
+Step 1 is adopted (`N42_FRAME_BLOCKS=1`, conc 64, pacing 125); the window stands at 981,318.

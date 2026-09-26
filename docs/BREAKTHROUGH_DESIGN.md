@@ -220,3 +220,26 @@ the supply is pinned by the nodes' ingest: at 950k/s the twelve recovery slots a
 frames queue at the slots and the replies lengthen instead of the rate rising. **That is step 2's term exactly**:
 verification paid once, at the edge, so a frame costs a node one signature check instead of five hundred.
 Step 1 is adopted (`N42_FRAME_BLOCKS=1`, conc 64, pacing 125); the window stands at 981,318.
+
+### 10.5 Step 2 on the fleet (loop270): 1,063,999 on a window
+
+| leg | frames | attested | offer | win1 | win2 | occupancy | txs p10 | cycle | B | D | busy us/tx | slots busy | reply us/frame | flood win1 | sealed_at |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| AT950 | on | yes | 950k | 979,039 | 677,874 | 86.2% | 112,000 | 150 | 38.5 | 81.8 | **1** | 9% | 3,174 | 950k | 138 |
+| FR950 | on | no | 950k | 962,089 | 650,686 | 85.5% | 127,000 | 153 | 41 | 82.2 | 11 | 54% | 35,978 | 939k | 145 |
+| AT1100 | on | yes | 1.1M | **1,063,999** | 727,130 | **99.8%** | 163,000 | 153 | 63 | 54.2 | 1 | 10% | 26,429 | **996k** | 133 |
+| AT1200 | on | yes | 1.2M | 1,048,588 | 754,679 | 99.8% | 163,000 | 155 | 83 | 36.4 | 1 | 12% | 26,165 | 1,015k | 129 |
+
+With the flood attesting its frames (one gateway, the bench's seed key) the nodes' ingest costs **1 us a
+transaction against 11** (the recovery slots 9-12% busy against 54-75%), a frame's reply falls from 36 to 3 ms at
+950k/s, and the generator's loop finally delivers past 950k: 996k/s at a 1.1M offer, 1.015M at 1.2M. **The
+window is 1,063,999 at a 153 ms cycle with every block full** -- the first measurement past 1,000,000 -- and
+1,048,588 at 1.2M. The road's B rises with the offer (38 -> 63 -> 83: the followers' ingest admitting 1M/s still
+shares the node), the leader seals at 129-138 and waits 36-54 ms on the 125 ms pacing. Window 2 is 727-755k as
+before (the state's growth, section 7). Tagged `fleet3-1M-window-20260926`.
+
+What this measures and what it does not: the three-node fleet, on this box, with a frame-aligned block and a
+supply attested at the edge by one gateway the nodes trust (design section 2's f+1 rule with f=0, the same fault
+assumption the 3-of-3 quorum already makes); the transactions are 0x50 transfers of the flood's shape. The
+protocol changes are two consensus rules (frame-aligned bodies with a frame-tree transactions root; attested
+frames admitted on the gateways' word) that gov5 would have to share to interoperate.

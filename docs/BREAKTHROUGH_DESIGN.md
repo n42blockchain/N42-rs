@@ -167,3 +167,21 @@ unaligned). The rule was written as a chain property; it has to be a block prope
 frame-tree root and a version-2 description, any other body the MPT root and a version-1 description, both
 acceptable under the flag, and a follower with a whole body verifies a version-2 layout from the transactions'
 hashes without its own index. Being fixed (`step1/aligned-per-block`); loop267 repeats the legs.
+
+### 10.2 Second leg of step 1 (loop267): frame blocks work end to end, and rehash what the index already holds
+
+| leg | flag | win1 | win2 | occupancy | frames / block | missing | cycle | B | E | sealed_at | road total | frame_root_ms | import |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| FRa | on | 754,422 | 706,288 | 100% | 326 | 0 | 212 | 138 | 56 | 224 | 139 | **96** | 127 |
+| C950 | off | **965,582** | 728,462 | 98.5% | -- | -- | 162 | 115.5 | 9 | 140 | 74 | (MPT 25) | 178 |
+| FRb | on | 749,752 | 711,744 | 99.9% | 326 | 0 | 218 | 137 | 59 | 224 | 138 | 96 | 126 |
+| FR1000 | on | 749,764 | 728,041 | 100% | 326 | 0 | 215 | 143 | 57 | 230 | 140 | 96 | 124 |
+
+The mechanism holds: every block is 326 whole frames, nothing missing, the pull is 1 ms (`par_pull` 25 -> 1), the
+follower's import is 124-127 against 178 (a frame-ordered body executes with better locality). And the fleet is
+22% slower, for one reason on each side: the road recomputes every frame's root from the transactions (96 ms,
+serially) where the design has it read the id the ingest already computed (a 326-leaf tree, microseconds), and
+the leader's seal does the same on its way to the root (+85 ms between the execution and the seal). Both are the
+index-lookup the design describes, being fixed (`step1/frame-roots-indexed`). What the leg promises once they
+are: the road at ~45 (assemble 20 + copy 5 + check + transport), B toward ~60, the leader's seal back at ~140 with
+the pull gone, and the follower's import already 50 ms shorter.

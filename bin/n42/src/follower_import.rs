@@ -1199,7 +1199,13 @@ fn queue_for_senders() -> Option<n42_tx_queue::TxQueue<n42_engine_types::N42Pool
     // the answer, and that is worth doing whenever the index exists at all
     // -- it is what lets a wrong claim be named instead of merely failing
     // the block somewhere downstream.
-    if !n42_tx_queue::senders_from_queue() && !n42_tx_types::senders_claimed_at_ingest() {
+    // `N42_INGEST_VERIFY=shard` (an unsafe benchmark probe): the index holds
+    // claims nothing re-verifies, and they are read as the answer -- the
+    // claimed mode's check below stays off, which is the probe's point.
+    if !n42_tx_queue::senders_from_queue()
+        && !n42_tx_types::senders_claimed_at_ingest()
+        && n42_tx_types::ingest_shard().is_none()
+    {
         return None;
     }
     n42_tx_queue::global::<n42_engine_types::N42PooledTransaction>().filter(|queue| queue.has_hash_index())

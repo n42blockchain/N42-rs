@@ -122,6 +122,10 @@ pub fn selection<T>(
 where
     T: PoolTransaction<Consensus = N42TxEnvelope> + 'static,
 {
+    // Under `N42_INGEST_VERIFY=shard` this is deliberately the plain
+    // selection: the claims outside the node's shard are built on without a
+    // check (an unsafe benchmark probe; the ingest's `shard_claimed` counts
+    // them).
     if n42_tx_types::senders_claimed_at_ingest() {
         Box::new(VerifyClaims::new(queue.clone(), best))
     } else {

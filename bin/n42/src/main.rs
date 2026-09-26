@@ -29,6 +29,12 @@ use tracing::{debug, error, info, warn};
 const DEFAULT_BLOCK_TIME_SECS: u64 = 8;
 
 fn main() {
+    // `N42_INGEST_VERIFY=shard` without a well-formed `N42_INGEST_SHARD=<i>/<n>`
+    // would silently verify everything (or nothing); refuse to start instead.
+    if let Err(err) = n42_tx_types::ingest_verify_mode() {
+        eprintln!("error: {err}");
+        std::process::exit(2);
+    }
     // `N42_THP_DISABLE=1`: no transparent huge pages for this process. With
     // the box's THP at `always`, a fleet allocating ~45 GB of anonymous
     // memory drove 5.8M direct-compaction stalls that tore the page cache

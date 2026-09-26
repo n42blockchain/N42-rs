@@ -110,6 +110,90 @@ pub fn senders_claimed_at_ingest() -> bool {
     })
 }
 
+/// `N42_INGEST_VERIFY=shard` with `N42_INGEST_SHARD=<i>/<n>`: this node's
+/// shard of the ingest's signature work, as `(i, n)`, or `None` in any other
+/// mode.
+///
+/// **A benchmark probe, unsafe under any fault** (form C of
+/// `docs/VERIFY_ONCE_DESIGN.md`). A transaction whose hash falls in shard
+/// `i` ([`shard_owner`]) is verified at ingest as under `all`; every other
+/// one is admitted under the sender its frame claimed and recorded under
+/// that claim in the sender cache -- and, unlike `leader`, *nothing
+/// downstream re-verifies it*: not the builder (`claimed_build` sees the mode
+/// off), not the vote road (it reads the cache's claim as an answer). A
+/// generator that lies, or one faulty node, puts an unverified sender in a
+/// block. It exists to measure what the sharded design (form B, with f+1
+/// owners per shard and attestations) would deliver, and nothing else.
+///
+/// A malformed or missing `N42_INGEST_SHARD` reads as `None` here; the node
+/// refuses to start on it first ([`ingest_verify_mode`]).
+pub fn ingest_shard() -> Option<(u64, u64)> {
+    static SHARD: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+    *SHARD.get_or_init(|| match ingest_verify_mode() {
+        Ok(IngestVerify::Shard { index, count }) => Some((index, count)),
+        _ => None,
+    })
+}
+
+/// The ingest's verification mode, from `N42_INGEST_VERIFY` (and
+/// `N42_INGEST_SHARD` for `shard`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestVerify {
+    /// Every signature verified at ingest (the default, and any value this
+    /// does not name).
+    All,
+    /// Claims queued unverified; the builder and the vote road verify them.
+    Leader,
+    /// This node verifies shard `index` of `count` at ingest and trusts the
+    /// claim for the rest, with no re-verification anywhere (a probe).
+    Shard {
+        /// This node's shard.
+        index: u64,
+        /// The number of shards (nodes).
+        count: u64,
+    },
+}
+
+/// Reads the ingest's mode from the environment. An error only for `shard`
+/// with `N42_INGEST_SHARD` missing or not `<i>/<n>` with `i < n`; the node
+/// checks this at start and refuses to run on an error.
+pub fn ingest_verify_mode() -> Result<IngestVerify, String> {
+    parse_ingest_verify(
+        std::env::var("N42_INGEST_VERIFY").ok().as_deref(),
+        std::env::var("N42_INGEST_SHARD").ok().as_deref(),
+    )
+}
+
+/// [`ingest_verify_mode`] on given values rather than the environment.
+pub fn parse_ingest_verify(verify: Option<&str>, shard: Option<&str>) -> Result<IngestVerify, String> {
+    let Some(verify) = verify else { return Ok(IngestVerify::All) };
+    if verify.eq_ignore_ascii_case("leader") {
+        return Ok(IngestVerify::Leader);
+    }
+    if !verify.eq_ignore_ascii_case("shard") {
+        return Ok(IngestVerify::All);
+    }
+    let shard = shard.ok_or_else(|| {
+        "N42_INGEST_VERIFY=shard needs N42_INGEST_SHARD=<index>/<count> (e.g. 0/3)".to_string()
+    })?;
+    let malformed = || format!("N42_INGEST_SHARD={shard:?} is not <index>/<count> with index < count (e.g. 0/3)");
+    let (index, count) = shard.trim().split_once('/').ok_or_else(malformed)?;
+    let index: u64 = index.trim().parse().map_err(|_| malformed())?;
+    let count: u64 = count.trim().parse().map_err(|_| malformed())?;
+    if count == 0 || index >= count {
+        return Err(malformed());
+    }
+    Ok(IngestVerify::Shard { index, count })
+}
+
+/// The shard a transaction belongs to among `count`: the first eight bytes of
+/// its hash, little-endian, modulo `count`.
+pub fn shard_owner(hash: &B256, count: u64) -> u64 {
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&hash[..8]);
+    u64::from_le_bytes(first) % count.max(1)
+}
+
 /// The batch size for Ed25519 verification, from `N42_ED25519_BATCH`
 /// (default 64, at most 256: the per-signature gain flattens past 64 and a
 /// failed batch is retried one by one).
@@ -173,5 +257,45 @@ pub fn verifying_key(bytes: &[u8; 32]) -> Option<ed25519_dalek::VerifyingKey> {
     }
     shard.insert(*bytes, key);
     Some(key)
+}
+
+#[cfg(test)]
+mod shard_tests {
+    use super::*;
+
+    /// The owner is the hash's first eight bytes, little-endian, modulo the
+    /// count -- the rule every node of the probe must share.
+    #[test]
+    fn a_hash_belongs_to_the_shard_its_first_eight_bytes_name() {
+        let mut hash = B256::ZERO;
+        hash[0] = 7; // little-endian: the lowest byte
+        assert_eq!(shard_owner(&hash, 3), 7 % 3);
+        assert_eq!(shard_owner(&hash, 1), 0);
+        hash[8] = 0xff; // past the first eight bytes: ignored
+        assert_eq!(shard_owner(&hash, 3), 1);
+        let mut high = B256::ZERO;
+        high[7] = 1; // 1 << 56
+        assert_eq!(shard_owner(&high, 3), (1u64 << 56) % 3);
+        // Every shard gets a share of a spread of hashes.
+        let mut seen = [0u32; 3];
+        for i in 0u64..300 {
+            seen[shard_owner(&alloy_primitives::keccak256(i.to_le_bytes()), 3) as usize] += 1;
+        }
+        assert!(seen.iter().all(|&n| n > 60), "{seen:?}");
+    }
+
+    #[test]
+    fn the_mode_is_parsed_and_a_bad_shard_is_refused() {
+        assert_eq!(parse_ingest_verify(None, None), Ok(IngestVerify::All));
+        assert_eq!(parse_ingest_verify(Some("all"), Some("0/3")), Ok(IngestVerify::All));
+        assert_eq!(parse_ingest_verify(Some("LEADER"), None), Ok(IngestVerify::Leader));
+        assert_eq!(
+            parse_ingest_verify(Some("shard"), Some("2/3")),
+            Ok(IngestVerify::Shard { index: 2, count: 3 })
+        );
+        for bad in [None, Some("3/3"), Some("0/0"), Some("1"), Some("a/3"), Some("-1/3"), Some("")] {
+            assert!(parse_ingest_verify(Some("shard"), bad).is_err(), "{bad:?}");
+        }
+    }
 }
 

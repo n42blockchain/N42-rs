@@ -36,7 +36,8 @@ pub use envelope::{N42PooledTxEnvelope, N42PooledTxType, N42TxEnvelope, N42TxTyp
 pub use primitives::{Block, BlockBody, N42Primitives, Receipt};
 pub use rpc::{AltSigRpcReceipt, N42RpcReceipt};
 pub use sender_cache::{
-    alt_sig_enabled, ed25519_batch_size, senders_claimed_at_ingest, set_alt_sig_enabled, AltSigSenderCache,
+    alt_sig_enabled, ed25519_batch_size, ingest_shard, ingest_verify_mode, parse_ingest_verify,
+    senders_claimed_at_ingest, set_alt_sig_enabled, shard_owner, AltSigSenderCache, IngestVerify,
 };
 
 #[cfg(test)]

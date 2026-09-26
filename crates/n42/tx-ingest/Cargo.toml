@@ -27,3 +27,7 @@ tracing.workspace = true
 [dev-dependencies]
 # `start_paused` drives the gate's deadline without a test that sleeps.
 tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
+# The shard-mode test runs a frame through the real recovery on the node's
+# pool transaction type, with signed 0x50 transactions.
+n42-engine-types.workspace = true
+ed25519-dalek = { version = "2.2", default-features = false, features = ["std"] }

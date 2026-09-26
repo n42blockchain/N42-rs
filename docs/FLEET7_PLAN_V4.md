@@ -2599,3 +2599,24 @@ against a fresh chain only (the derived senders at nonce 0 after funding), which
 repeats 7.24's control with the replayed set at 950k and then raises the offer, to see whether the send loop
 alone delivers 1M/s and whether the followers' road stays at ~100 when the generator no longer competes for the
 box's memory bandwidth. In flight on `plan-v6/flood-pregen`.
+
+### 9.1 The replayed flood (loop261): the generator was never the bound
+
+`plan-v6/flood-pregen` (merged b67478347): 192M ed25519 transfers in the live send order, 64 files, 29 GB, made in
+about a minute; the flood's own tests pass (6, byte-identical frames); replay checked every header and every
+worker's first sender at nonce 0 and signed nothing (`sign 0s`).
+
+| leg | flood | offer | win1 | win2 | flood win1 (k/s) | ingest rate / node | cycle | B | reply ms |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| REP950 | replay | 950k | 950,035 | 684,892 | 897 | 824k | 170 | 134 | 184-220 |
+| C950 | live | 950k | **975,487** | **869,281** | 950 | 853k | 157 | 113 | 168 |
+| REP1000 | replay | 1.0M | 956,023 | 782,374 | 910 | 770k | 164 | 127.5 | 176-211 |
+| REP1050 | replay | 1.05M | 967,100 | 717,354 | 935 | 671k | 163.5 | 126.5 | 171-206 |
+
+Falsified: with signing removed the flood delivers 897-935k/s -- no more than the live one at 950k -- and the
+windows sit at 950-967k with B 127-134, while the live control reads 975,487 / 869,281 (the best window 2 on
+record). The generator's rate was never its CPU: it is the send-and-reply loop against the nodes' ingest (64
+requests of 500 per node, a reply every 170-220 ms), and the nodes admit ~820-850k/s each however the frames are
+made. The replay is kept (deterministic supply, no signing cores, a leg's flood reproducible byte for byte) but
+it does not move the window. **The supply term is the node's ingest, full stop** -- the 10 us a signature on
+every node and the CPU the followers' road shares with it -- and past it lies the design question of section 8.

@@ -88,6 +88,197 @@ pub fn frame_blocks_requested() -> bool {
     *ON.get_or_init(|| std::env::var("N42_FRAME_BLOCKS").is_ok_and(|v| v == "1"))
 }
 
+// ---------------------------------------------------------------------------
+// Attested frames (`docs/BREAKTHROUGH_DESIGN.md` step 2): verification paid
+// once, at the edge.
+//
+// The ingress that assembles a frame (a gateway; the flood on the bench)
+// verifies its transactions' signatures once and signs the frame's root. A
+// node that trusts at least `min` distinct configured gateways admits a frame
+// carrying their valid attestations without verifying its transactions.
+//
+// SAFETY OF THE TRUST: an attested frame's transactions are taken to be
+// validly signed on the gateways' word; nothing at the node checks them. The
+// attestation covers the frame root, i.e. every transaction's hash (and so
+// its signature bytes), in frame order -- not any sender a frame claims on
+// the side, which stays a claim. With `min` = f+1 over a gateway set of which
+// at most f are faulty, the f+1 signatures include an honest gateway's, and
+// an honest gateway signs only frames whose signatures it verified: the same
+// bound the consensus already assumes. With `min` = 1 (the bench: one
+// gateway, the flood itself) the node trusts that one gateway entirely.
+// A frame with fewer valid attestations is verified as any other, never
+// dropped for it.
+// ---------------------------------------------------------------------------
+
+/// The domain an attestation's message starts with.
+pub const FRAME_ATTEST_DOMAIN: &[u8] = b"n42-frame-attest";
+
+/// Bytes one attestation takes on the wire: the gateway's 32-byte Ed25519
+/// public key, then its 64-byte signature.
+pub const FRAME_ATTESTATION_LEN: usize = 96;
+
+/// Most attestations a frame may carry; bounds what a node reads.
+pub const MAX_FRAME_ATTESTATIONS: usize = 16;
+
+/// What a gateway signs for a frame:
+/// `keccak256("n42-frame-attest" || chain_id as u64 big-endian || frame_root)`.
+pub fn frame_attest_message(chain_id: u64, root: B256) -> B256 {
+    let mut buf = [0u8; 16 + 8 + 32];
+    buf[..16].copy_from_slice(FRAME_ATTEST_DOMAIN);
+    buf[16..24].copy_from_slice(&chain_id.to_be_bytes());
+    buf[24..].copy_from_slice(root.as_slice());
+    keccak256(buf)
+}
+
+/// One gateway's attestation of a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameAttestation {
+    /// The gateway's Ed25519 public key.
+    pub gateway: [u8; 32],
+    /// Its Ed25519 signature over [`frame_attest_message`].
+    pub signature: [u8; 64],
+}
+
+impl FrameAttestation {
+    /// Signs the frame with root `root` on chain `chain_id` as `key`.
+    pub fn sign(key: &ed25519_dalek::SigningKey, chain_id: u64, root: B256) -> Self {
+        use ed25519_dalek::Signer;
+        let message = frame_attest_message(chain_id, root);
+        Self { gateway: key.verifying_key().to_bytes(), signature: key.sign(message.as_slice()).to_bytes() }
+    }
+
+    /// The wire bytes: gateway key, then signature.
+    pub fn to_bytes(&self) -> [u8; FRAME_ATTESTATION_LEN] {
+        let mut out = [0u8; FRAME_ATTESTATION_LEN];
+        out[..32].copy_from_slice(&self.gateway);
+        out[32..].copy_from_slice(&self.signature);
+        out
+    }
+
+    /// From the wire bytes ([`Self::to_bytes`]).
+    pub fn from_bytes(raw: &[u8; FRAME_ATTESTATION_LEN]) -> Self {
+        let mut gateway = [0u8; 32];
+        let mut signature = [0u8; 64];
+        gateway.copy_from_slice(&raw[..32]);
+        signature.copy_from_slice(&raw[32..]);
+        Self { gateway, signature }
+    }
+}
+
+/// What a frame's attestations came to at a node.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AttestVerdict {
+    /// Distinct configured gateways whose signature verified.
+    pub valid: usize,
+    /// Attestations by a configured gateway whose signature did not verify.
+    pub bad: usize,
+    /// Attestations by a key this node does not trust, or a repeat of a
+    /// gateway already counted; not checked.
+    pub ignored: usize,
+    /// Whether `valid` reached the node's minimum: the frame is admitted
+    /// without per-transaction verification.
+    pub attested: bool,
+}
+
+/// The gateways a node trusts and how many of them a frame needs.
+#[derive(Debug, Clone)]
+pub struct FrameGateways {
+    keys: Vec<ed25519_dalek::VerifyingKey>,
+    min: usize,
+}
+
+impl FrameGateways {
+    /// `keys` (duplicates removed) and a minimum of at least one.
+    pub fn new(keys: Vec<ed25519_dalek::VerifyingKey>, min: usize) -> Self {
+        let mut unique: Vec<ed25519_dalek::VerifyingKey> = Vec::with_capacity(keys.len());
+        for key in keys {
+            if !unique.contains(&key) {
+                unique.push(key);
+            }
+        }
+        Self { keys: unique, min: min.max(1) }
+    }
+
+    /// From a comma-separated list of hex public keys (`0x` optional) and a
+    /// minimum. An empty list is `Ok(None)`: no gateway, every frame verified.
+    pub fn parse(list: &str, min: usize) -> Result<Option<Self>, String> {
+        let mut keys = Vec::new();
+        for item in list.split(',').map(str::trim).filter(|item| !item.is_empty()) {
+            let hex = item.strip_prefix("0x").unwrap_or(item);
+            let raw = alloy_primitives::hex::decode(hex).map_err(|err| format!("gateway key {item}: {err}"))?;
+            let raw: [u8; 32] = raw.try_into().map_err(|_| format!("gateway key {item}: not 32 bytes"))?;
+            let key =
+                ed25519_dalek::VerifyingKey::from_bytes(&raw).map_err(|err| format!("gateway key {item}: {err}"))?;
+            keys.push(key);
+        }
+        let this = Self::new(keys, min);
+        if this.keys.is_empty() {
+            return Ok(None);
+        }
+        if this.min > this.keys.len() {
+            return Err(format!(
+                "N42_FRAME_ATTEST_MIN {} is more than the {} distinct gateways configured",
+                this.min,
+                this.keys.len()
+            ));
+        }
+        Ok(Some(this))
+    }
+
+    /// `N42_FRAME_GATEWAYS` and `N42_FRAME_ATTEST_MIN` (default 1).
+    pub fn from_env() -> Result<Option<Self>, String> {
+        let Ok(list) = std::env::var("N42_FRAME_GATEWAYS") else { return Ok(None) };
+        let min = match std::env::var("N42_FRAME_ATTEST_MIN") {
+            Ok(value) => {
+                value.trim().parse::<usize>().map_err(|err| format!("N42_FRAME_ATTEST_MIN {value}: {err}"))?
+            }
+            Err(_) => 1,
+        };
+        Self::parse(&list, min)
+    }
+
+    /// How many distinct gateways a frame needs.
+    pub const fn min(&self) -> usize {
+        self.min
+    }
+
+    /// The configured gateways.
+    pub fn keys(&self) -> &[ed25519_dalek::VerifyingKey] {
+        &self.keys
+    }
+
+    /// Checks `attestations` of the frame with root `root` on chain
+    /// `chain_id`: one Ed25519 verification (strict) per attestation by a
+    /// configured gateway not yet counted, stopping once the minimum is met.
+    pub fn check(&self, chain_id: u64, root: B256, attestations: &[FrameAttestation]) -> AttestVerdict {
+        let mut verdict = AttestVerdict::default();
+        let mut counted: Vec<[u8; 32]> = Vec::with_capacity(self.min);
+        let message = frame_attest_message(chain_id, root);
+        for attestation in attestations {
+            if verdict.valid >= self.min {
+                break;
+            }
+            let Some(key) = self.keys.iter().find(|key| key.as_bytes() == &attestation.gateway) else {
+                verdict.ignored += 1;
+                continue;
+            };
+            if counted.contains(&attestation.gateway) {
+                verdict.ignored += 1;
+                continue;
+            }
+            let signature = ed25519_dalek::Signature::from_bytes(&attestation.signature);
+            if key.verify_strict(message.as_slice(), &signature).is_ok() {
+                counted.push(attestation.gateway);
+                verdict.valid += 1;
+            } else {
+                verdict.bad += 1;
+            }
+        }
+        verdict.attested = verdict.valid >= self.min;
+        verdict
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,5 +332,68 @@ mod tests {
         assert_eq!(frame_tree_root_of(&hashes, &[3, 3, 1]), Some(expected));
         assert_eq!(frame_tree_root_of(&hashes, &[3, 3]), None);
         assert_eq!(frame_tree_root_of(&hashes, &[3, 0, 3, 1]), None);
+    }
+
+    fn gateway(seed: u8) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+    }
+
+    #[test]
+    fn an_attestation_verifies_only_over_its_root_and_chain() {
+        let root = leaf(7);
+        let one = gateway(1);
+        let gateways = FrameGateways::new(vec![one.verifying_key()], 1);
+        let good = FrameAttestation::sign(&one, 94, root);
+        assert_eq!(FrameAttestation::from_bytes(&good.to_bytes()), good);
+        assert!(gateways.check(94, root, &[good]).attested);
+        // Another root, another chain: bad, not attested.
+        let other_root = gateways.check(94, leaf(8), &[good]);
+        assert_eq!((other_root.attested, other_root.bad), (false, 1));
+        assert_eq!(gateways.check(95, root, &[good]).bad, 1);
+        // An unknown key is ignored, never verified.
+        let stranger = FrameAttestation::sign(&gateway(2), 94, root);
+        let verdict = gateways.check(94, root, &[stranger]);
+        assert_eq!((verdict.attested, verdict.bad, verdict.ignored), (false, 0, 1));
+        // A flipped signature bit is bad.
+        let mut flipped = good;
+        flipped.signature[3] ^= 1;
+        assert_eq!(gateways.check(94, root, &[flipped]).bad, 1);
+    }
+
+    #[test]
+    fn a_minimum_counts_distinct_gateways() {
+        let root = leaf(3);
+        let (one, two) = (gateway(1), gateway(2));
+        let gateways = FrameGateways::new(vec![one.verifying_key(), two.verifying_key()], 2);
+        let a = FrameAttestation::sign(&one, 1, root);
+        let b = FrameAttestation::sign(&two, 1, root);
+        assert!(!gateways.check(1, root, &[a]).attested);
+        assert!(!gateways.check(1, root, &[a, a]).attested, "a repeat is one gateway");
+        assert!(gateways.check(1, root, &[a, b]).attested);
+    }
+
+    #[test]
+    fn gateways_parse_from_hex() {
+        let key = gateway(9).verifying_key();
+        let hex = alloy_primitives::hex::encode_prefixed(key.as_bytes());
+        let parsed = FrameGateways::parse(&format!("{hex}, {hex}"), 1).expect("parses").expect("some");
+        assert_eq!(parsed.keys(), &[key]);
+        assert!(FrameGateways::parse("", 1).expect("parses").is_none());
+        assert!(FrameGateways::parse(&hex, 2).is_err());
+        assert!(FrameGateways::parse("0x1234", 1).is_err());
+    }
+
+    /// Pinned bytes of the attestation message, so the wire contract cannot
+    /// drift as a refactor.
+    #[test]
+    fn the_attest_message_vector() {
+        let expected = {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(b"n42-frame-attest");
+            buf.extend_from_slice(&94u64.to_be_bytes());
+            buf.extend_from_slice(leaf(0).as_slice());
+            keccak256(buf)
+        };
+        assert_eq!(frame_attest_message(94, leaf(0)), expected);
     }
 }

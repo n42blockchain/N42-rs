@@ -20,10 +20,15 @@
 //! # Wire
 //!
 //! ```text
-//! frame   := u32 header, then `count` x entry
-//! header  := count, or count | 0x8000_0000 for a frame that claims senders
+//! frame   := u32 header, then `count` x entry, then the attestations
+//!            (attested frame only)
+//! header  := count, | 0x8000_0000 for a frame that claims senders,
+//!                   | 0x4000_0000 for a frame that carries attestations
 //! entry   := u32 len, len bytes of EIP-2718
 //!         := u32 len, 20 bytes of claimed sender, len bytes   (claiming frame)
+//! attests := u8 n (1..=16), then n x (32-byte Ed25519 gateway key,
+//!            64-byte Ed25519 signature over
+//!            keccak256("n42-frame-attest" || u64 chain id BE || frame root))
 //! reply   := u32 accepted, u32 pool_pending      -- one per frame, in order
 //! ```
 //!
@@ -36,6 +41,24 @@
 //! the connection with the reason named -- a loud failure rather than a
 //! silently misread stream. A frame that does not claim is read exactly as
 //! before.
+//!
+//! The attestation bit is versioned the same way: a server that predates it
+//! reads an attested frame's header as a count past the bound and closes the
+//! connection; a frame without it is read exactly as before.
+//!
+//! # Attested frames: verification paid once, at the edge
+//!
+//! `docs/BREAKTHROUGH_DESIGN.md` step 2. The gateway that assembled a frame
+//! (the flood on the bench) verified its transactions' signatures and signed
+//! the frame root ([`n42_tx_types::frame_root`], the frame's id here). With
+//! `N42_FRAME_GATEWAYS=<pubkey hex>[,...]` and `N42_FRAME_ATTEST_MIN=<n>`
+//! (default 1) a frame whose attestations include valid signatures of at
+//! least `n` distinct configured gateways is admitted without verifying its
+//! transactions: a 0x50 transaction's sender is derived from its own public
+//! key (no signature check), any other takes the frame's claimed sender where
+//! this node takes claims, and is verified otherwise. A frame short of `n` is
+//! verified as any other -- never dropped for it. See [`n42_tx_types::frame`]
+//! for the safety argument (f+1 of gateways at most f of which are faulty).
 //!
 //! # The claim, and why it is not trust
 //!
@@ -107,14 +130,66 @@ const MAX_FRAME_TXS: u32 = 10_000;
 /// wire section of the module docs.
 const FRAME_CLAIMS_SENDERS: u32 = 0x8000_0000;
 
+/// The bit a frame's header sets to say that an attestation section follows
+/// its transactions ([`n42_tx_types::FrameAttestation`]). Also out of the
+/// count's range, so a server that predates it refuses the frame loudly.
+const FRAME_ATTESTED: u32 = 0x4000_0000;
+
+const _: () = assert!(MAX_FRAME_TXS < FRAME_ATTESTED);
+
 /// The bit has to be out of the count's range, or a claiming frame and a
 /// large plain one would be the same header.
 const _: () = assert!(MAX_FRAME_TXS < FRAME_CLAIMS_SENDERS);
 
 /// Splits a frame's header into "does each entry carry a claimed sender" and
 /// the transaction count.
-const fn frame_header(header: u32) -> (bool, u32) {
-    (header & FRAME_CLAIMS_SENDERS != 0, header & !FRAME_CLAIMS_SENDERS)
+const fn frame_header(header: u32) -> (bool, bool, u32) {
+    (
+        header & FRAME_CLAIMS_SENDERS != 0,
+        header & FRAME_ATTESTED != 0,
+        header & !(FRAME_CLAIMS_SENDERS | FRAME_ATTESTED),
+    )
+}
+
+/// The gateways this node trusts and its chain id, read once by [`serve`]
+/// (`N42_FRAME_GATEWAYS`, `N42_FRAME_ATTEST_MIN`); `None` means no gateway
+/// is configured and every frame is verified as before.
+#[derive(Debug)]
+struct FrameAttest {
+    gateways: n42_tx_types::FrameGateways,
+    chain_id: u64,
+}
+
+static FRAME_ATTEST: std::sync::OnceLock<Option<FrameAttest>> = std::sync::OnceLock::new();
+
+/// This node's attestation settings; `None` until [`serve`] read them, and
+/// when no gateway is configured (or the configuration is malformed, which
+/// [`init_frame_attest`] reports).
+fn frame_attest() -> Option<&'static FrameAttest> {
+    FRAME_ATTEST.get().and_then(Option::as_ref)
+}
+
+/// Reads the gateway settings for chain `chain_id`, once. A malformed
+/// setting is an ERROR line and no gateway: frames are then verified, not
+/// trusted, which is the safe side.
+fn init_frame_attest(chain_id: u64) {
+    FRAME_ATTEST.get_or_init(|| match n42_tx_types::FrameGateways::from_env() {
+        Ok(Some(gateways)) => {
+            info!(
+                target: "n42.tx_ingest",
+                gateways = gateways.keys().len(),
+                min = gateways.min(),
+                chain_id,
+                "attested frames: a frame with enough valid gateway attestations is admitted without per-transaction verification"
+            );
+            Some(FrameAttest { gateways, chain_id })
+        }
+        Ok(None) => None,
+        Err(err) => {
+            tracing::error!(target: "n42.tx_ingest", %err, "N42_FRAME_GATEWAYS is malformed; every frame will be verified");
+            None
+        }
+    });
 }
 
 /// Frames one connection may have admitting in the background under
@@ -773,6 +848,16 @@ fn spawn_stats_reporter() {
                     // and frames with a dropped transaction (never whole).
                     frames_admitted = STATS.frames_admitted.load(Ordering::Relaxed),
                     frames_unaligned = STATS.frames_unaligned.load(Ordering::Relaxed),
+                    // Cumulative, step 2: frames admitted on their gateways'
+                    // attestations (and their transactions), frames with a
+                    // bad attestation signature and frames that carried
+                    // attestations but fell short of the minimum (both
+                    // verified normally), and the time the checks took.
+                    frames_attested = STATS.frames_attested.load(Ordering::Relaxed),
+                    attested_txs = STATS.attested_txs.load(Ordering::Relaxed),
+                    frames_attest_bad = STATS.frames_attest_bad.load(Ordering::Relaxed),
+                    frames_attest_short = STATS.frames_attest_short.load(Ordering::Relaxed),
+                    attest_verify_us = STATS.attest_verify_ns.load(Ordering::Relaxed) / 1_000,
                     // Non-zero means the gate stopped reopening and frames
                     // were let through on the deadline; the round is not
                     // comparable and a node has stopped draining its queue.
@@ -804,11 +889,13 @@ pub async fn serve<P>(
     pool: P,
     cache: Option<reth_evm::SenderRecoveryCache>,
     head: std::sync::Arc<AtomicU64>,
+    chain_id: u64,
 ) -> std::io::Result<()>
 where
     P: TransactionPool + Clone + 'static,
     P::Transaction: PoolTransaction<Pooled = N42PooledTxEnvelope>,
 {
+    init_frame_attest(chain_id);
     spawn_stats_reporter();
     spawn_gate_watcher(pool.clone(), std::sync::Arc::clone(&head), high_water(), block_txs_allowance());
     let listener = TcpListener::bind(addr).await?;
@@ -877,7 +964,9 @@ where
     // its frame k; a builder reading the queue in nonce order then stopped
     // at the hole, and half of a full queue sat behind one (rounds queue3-4).
     let (admit_tx, mut admit_rx) =
-        tokio::sync::mpsc::channel::<tokio::task::JoinHandle<(Vec<P::Transaction>, Option<NewFrame>)>>(ASYNC_FRAMES_IN_FLIGHT);
+        tokio::sync::mpsc::channel::<tokio::task::JoinHandle<(Vec<P::Transaction>, Option<NewFrame>)>>(
+            ASYNC_FRAMES_IN_FLIGHT,
+        );
     if asynchronous {
         let pool = pool.clone();
         tokio::spawn(async move {
@@ -915,7 +1004,7 @@ where
         // A claiming frame carries a sender ahead of each transaction. The
         // bytes are read either way -- the stream has to be walked past them
         // -- and kept only where this node is going to use them.
-        let (claiming, count) = frame_header(header);
+        let (claiming, attested, count) = frame_header(header);
         if count == 0 || count > MAX_FRAME_TXS {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -947,6 +1036,27 @@ where
             frame_buf.resize(len, 0);
             stream.read_exact(&mut frame_buf[..]).await?;
             raws.push(Bytes::from(frame_buf.split_to(len).freeze()));
+        }
+        // The attestation section, read either way and kept only where this
+        // node trusts gateways; a node without them verifies the frame as if
+        // it carried none.
+        let mut attestations: Vec<n42_tx_types::FrameAttestation> = Vec::new();
+        if attested {
+            let n = stream.read_u8().await? as usize;
+            if n == 0 || n > n42_tx_types::MAX_FRAME_ATTESTATIONS {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("frame of {n} attestations"),
+                ));
+            }
+            let keep = frame_attest().is_some();
+            for _ in 0..n {
+                let mut raw = [0u8; n42_tx_types::FRAME_ATTESTATION_LEN];
+                stream.read_exact(&mut raw).await?;
+                if keep {
+                    attestations.push(n42_tx_types::FrameAttestation::from_bytes(&raw));
+                }
+            }
         }
         // The gate. Not a refusal and not a drop: the frame is held until the
         // chain has taken a block out of the pool, and the client hears nothing
@@ -1017,7 +1127,7 @@ where
                 apply_recovery_affinity();
                 let busy = std::time::Instant::now();
                 STATS.spawn_ns.fetch_add(busy.duration_since(granted).as_nanos() as u64, Ordering::Relaxed);
-                let decoded = recover_frame::<P>(sent, pooled, claims, cache.as_ref());
+                let decoded = recover_frame::<P>(sent, pooled, claims, &attestations, cache.as_ref());
                 STATS.busy_ns.fetch_add(busy.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 decoded
             });
@@ -1033,7 +1143,7 @@ where
             STATS.reply_ns.fetch_add(frame_read.elapsed().as_nanos() as u64, Ordering::Relaxed);
             continue;
         }
-        let accepted = admit(&pool, raws, claims, cache.clone()).await;
+        let accepted = admit(&pool, raws, claims, attestations, cache.clone()).await;
         let pending = u32::try_from(queue_depth(&pool)).unwrap_or(u32::MAX);
         write_half.write_u32_le(accepted).await?;
         write_half.write_u32_le(pending).await?;
@@ -1110,6 +1220,18 @@ struct IngestStats {
     frames_admitted: AtomicU64,
     /// Frames it dropped any transaction of: never referenceable whole.
     frames_unaligned: AtomicU64,
+    /// Frames admitted on their gateways' attestations, and the
+    /// transactions they carried (no per-transaction verification here).
+    frames_attested: AtomicU64,
+    attested_txs: AtomicU64,
+    /// Frames with at least one attestation signature that did not verify.
+    frames_attest_bad: AtomicU64,
+    /// Frames that carried attestations but not enough valid ones (unknown
+    /// keys, bad signatures, fewer than the minimum, a transaction dropped
+    /// at decode so the root is not the gateways').
+    frames_attest_short: AtomicU64,
+    /// Time spent checking attestations, nanoseconds.
+    attest_verify_ns: AtomicU64,
 }
 
 static STATS: IngestStats = IngestStats {
@@ -1127,6 +1249,11 @@ static STATS: IngestStats = IngestStats {
     dropped_altsig_disabled: AtomicU64::new(0),
     frames_admitted: AtomicU64::new(0),
     frames_unaligned: AtomicU64::new(0),
+    frames_attested: AtomicU64::new(0),
+    attested_txs: AtomicU64::new(0),
+    frames_attest_bad: AtomicU64::new(0),
+    frames_attest_short: AtomicU64::new(0),
+    attest_verify_ns: AtomicU64::new(0),
     acq_ns: AtomicU64::new(0),
     spawn_ns: AtomicU64::new(0),
     altsig_batches: AtomicU64::new(0),
@@ -1142,6 +1269,7 @@ async fn admit<P>(
     pool: &P,
     raws: Vec<Bytes>,
     claims: Vec<Address>,
+    attestations: Vec<n42_tx_types::FrameAttestation>,
     cache: Option<reth_evm::SenderRecoveryCache>,
 ) -> u32
 where
@@ -1165,7 +1293,7 @@ where
         apply_recovery_nice();
         apply_recovery_affinity();
         let busy = std::time::Instant::now();
-        let decoded = recover_frame::<P>(sent, pooled, claims, cache.as_ref());
+        let decoded = recover_frame::<P>(sent, pooled, claims, &attestations, cache.as_ref());
         STATS.busy_ns.fetch_add(busy.elapsed().as_nanos() as u64, Ordering::Relaxed);
         decoded
     })
@@ -1299,26 +1427,87 @@ where
     (decoded, kept)
 }
 
-/// [`recover_decoded`], and the frame it was: `sent` is how many raw
+/// [`recover_decoded_in`], and the frame it was: `sent` is how many raw
 /// transactions the frame carried, and a frame the ingest kept every one of
 /// comes back described for the queue's frame index ([`frame_of`]).
 fn recover_frame<P>(
     sent: usize,
     pooled: Vec<PooledOf<P>>,
     claims: Vec<Address>,
+    attestations: &[n42_tx_types::FrameAttestation],
     cache: Option<&reth_evm::SenderRecoveryCache>,
 ) -> (Vec<P::Transaction>, Option<NewFrame>)
 where
     P: TransactionPool,
     P::Transaction: PoolTransaction<Pooled = N42PooledTxEnvelope>,
 {
+    recover_frame_with::<P>(sent, pooled, claims, attestations, frame_attest(), cache, n42_tx_types::ingest_shard())
+}
+
+/// [`recover_frame`] with the attestation settings and the shard given
+/// rather than read.
+///
+/// An attested frame ([`frame_attested`]) goes through
+/// [`recover_decoded_in`] with `attested` set; everything else is the
+/// step-1 path unchanged. The root computed for the check is the frame's id,
+/// so a frame is rooted once either way.
+fn recover_frame_with<P>(
+    sent: usize,
+    pooled: Vec<PooledOf<P>>,
+    claims: Vec<Address>,
+    attestations: &[n42_tx_types::FrameAttestation],
+    attest: Option<&FrameAttest>,
+    cache: Option<&reth_evm::SenderRecoveryCache>,
+    shard: Option<(u64, u64)>,
+) -> (Vec<P::Transaction>, Option<NewFrame>)
+where
+    P: TransactionPool,
+    P::Transaction: PoolTransaction<Pooled = N42PooledTxEnvelope>,
+{
     let hashes: Vec<B256> = pooled.iter().map(|tx| *tx.hash()).collect();
-    let recovered = recover_decoded::<P>(pooled, claims, cache);
-    let frame = frame_of(sent, hashes, &recovered);
+    let (attested, root) = frame_attested(sent, &hashes, attestations, attest);
+    let recovered = recover_decoded_in::<P>(pooled, claims, cache, shard, attested);
+    let frame = frame_of(sent, hashes, root, &recovered);
     if frame.is_none() {
         STATS.frames_unaligned.fetch_add(1, Ordering::Relaxed);
     }
     (recovered, frame)
+}
+
+/// Whether a frame is admitted on its attestations, and its root when this
+/// computed it (reused as the frame's id).
+///
+/// Only a frame the ingest decoded whole can be attested: the gateways
+/// signed the root over every transaction they sent, and a root over fewer
+/// is not theirs. Nothing here refuses a frame -- a frame short of the
+/// minimum is verified as any other.
+fn frame_attested(
+    sent: usize,
+    hashes: &[B256],
+    attestations: &[n42_tx_types::FrameAttestation],
+    attest: Option<&FrameAttest>,
+) -> (bool, Option<B256>) {
+    let Some(attest) = attest.filter(|_| !attestations.is_empty()) else { return (false, None) };
+    if hashes.is_empty() || hashes.len() != sent {
+        STATS.frames_attest_short.fetch_add(1, Ordering::Relaxed);
+        return (false, None);
+    }
+    let at = std::time::Instant::now();
+    let root = n42_tx_types::frame_root(hashes);
+    let verdict = attest.gateways.check(attest.chain_id, root, attestations);
+    STATS.attest_verify_ns.fetch_add(at.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    if verdict.bad > 0 {
+        STATS.frames_attest_bad.fetch_add(1, Ordering::Relaxed);
+        if drop_warn_allowed() {
+            warn!(target: "n42.tx_ingest", bad = verdict.bad, %root, "a frame attestation did not verify; verifying the frame's transactions");
+        }
+    }
+    if verdict.attested {
+        STATS.frames_attested.fetch_add(1, Ordering::Relaxed);
+    } else {
+        STATS.frames_attest_short.fetch_add(1, Ordering::Relaxed);
+    }
+    (verdict.attested, Some(root))
 }
 
 /// A frame's record for the queue's frame index, or `None` when the frame
@@ -1329,8 +1518,15 @@ where
 /// `hashes` are the decoded transactions' hashes in frame order; the
 /// recovery may return them in another order (a frame's 0x50 transactions
 /// come back after its secp256k1 ones), so they are matched by hash. The
-/// frame's id is its root over `hashes` ([`n42_tx_types::frame_root`]).
-fn frame_of<T: PoolTransaction>(sent: usize, hashes: Vec<B256>, recovered: &[T]) -> Option<NewFrame> {
+/// frame's id is its root over `hashes` ([`n42_tx_types::frame_root`]);
+/// `root`, when given, is that root already computed (by the attestation
+/// check).
+fn frame_of<T: PoolTransaction>(
+    sent: usize,
+    hashes: Vec<B256>,
+    root: Option<B256>,
+    recovered: &[T],
+) -> Option<NewFrame> {
     if hashes.is_empty() || hashes.len() != sent || recovered.len() != hashes.len() {
         return None;
     }
@@ -1351,8 +1547,14 @@ fn frame_of<T: PoolTransaction>(sent: usize, hashes: Vec<B256>, recovered: &[T])
             gas = gas.saturating_add(tx.gas_limit());
         }
     }
-    let id = n42_tx_types::frame_root(&hashes);
+    let id = root.unwrap_or_else(|| n42_tx_types::frame_root(&hashes));
     Some(NewFrame { id, hashes, members, gas })
+}
+
+/// Whether, under `N42_INGEST_VERIFY=shard` as shard `(index, count)`, the
+/// transaction `hash` is this node's to verify at ingest.
+fn in_my_shard(hash: &alloy_primitives::B256, (index, count): (u64, u64)) -> bool {
+    n42_tx_types::shard_owner(hash, count) == index
 }
 
 /// Recovers the senders of decoded transactions, on a recovery slot.
@@ -1376,25 +1578,7 @@ fn frame_of<T: PoolTransaction>(sent: usize, hashes: Vec<B256>, recovered: &[T])
 /// the vote road verifies what a block carries -- so the only thing a wrong
 /// claim can do is put one transaction in the wrong lane, where no build can
 /// use it.
-fn recover_decoded<P>(
-    pooled: Vec<PooledOf<P>>,
-    claims: Vec<Address>,
-    cache: Option<&reth_evm::SenderRecoveryCache>,
-) -> Vec<P::Transaction>
-where
-    P: TransactionPool,
-    P::Transaction: PoolTransaction<Pooled = N42PooledTxEnvelope>,
-{
-    recover_decoded_in::<P>(pooled, claims, cache, n42_tx_types::ingest_shard())
-}
-
-/// Whether, under `N42_INGEST_VERIFY=shard` as shard `(index, count)`, the
-/// transaction `hash` is this node's to verify at ingest.
-fn in_my_shard(hash: &alloy_primitives::B256, (index, count): (u64, u64)) -> bool {
-    n42_tx_types::shard_owner(hash, count) == index
-}
-
-/// [`recover_decoded`] with this node's shard given rather than read.
+///
 ///
 /// `shard` is `Some` only under `N42_INGEST_VERIFY=shard`, and matters only
 /// for a claiming frame: a transaction in this node's shard goes through the
@@ -1404,11 +1588,24 @@ fn in_my_shard(hash: &alloy_primitives::B256, (index, count): (u64, u64)) -> boo
 /// verifies it anywhere afterwards** -- this is the unsafe benchmark probe of
 /// `docs/VERIFY_ONCE_DESIGN.md` form C, correct only while no node and no
 /// generator lies. With `shard` `None` this is `leader`/`all` unchanged.
+///
+/// `attested` is set for a frame admitted on its gateways' attestations
+/// ([`frame_attested`]): its 0x50 transactions are admitted under the sender
+/// their own public key derives, **with no signature check here**, and that
+/// sender is recorded in the 0x50 sender cache, so the vote road and the
+/// payload conversion take it too. This trusts the gateways' word that each
+/// signature verified: with `N42_FRAME_ATTEST_MIN` = f+1 over gateways at
+/// most f of which are faulty, an honest gateway verified them (the bench
+/// runs one gateway, the flood, with a minimum of one, and trusts it). The
+/// attestation covers the transactions' hashes, not a claimed sender, so any
+/// other transaction takes the existing claim path where this node takes
+/// claims and is verified otherwise. With `attested` false nothing changes.
 fn recover_decoded_in<P>(
     pooled: Vec<PooledOf<P>>,
     claims: Vec<Address>,
     cache: Option<&reth_evm::SenderRecoveryCache>,
     shard: Option<(u64, u64)>,
+    attested: bool,
 ) -> Vec<P::Transaction>
 where
     P: TransactionPool,
@@ -1429,7 +1626,26 @@ where
     // half a million times a second between them.
     let mut claimed_here = 0u64;
     let mut verified_here = 0u64;
+    let mut attested_here = 0u64;
     for (at, tx) in pooled.into_iter().enumerate() {
+        if attested && let N42PooledTxEnvelope::AltSig(alt_tx) = &tx {
+            // The 0x50 gate stays where it is: attested or not, a chain that
+            // does not admit the type must not hold one.
+            if !n42_tx_types::alt_sig_enabled() {
+                STATS.dropped_altsig_disabled.fetch_add(1, Ordering::Relaxed);
+                if drop_warn_allowed() {
+                    warn!(target: "n42.tx_ingest", dropped = 1, "a 0x50 transaction on a chain that does not enable them");
+                }
+                continue;
+            }
+            // The sender the key controls; cheap, no signature check.
+            // Trusted on the gateways' attestation (see above).
+            let sender = alt_tx.sender();
+            AltSigSenderCache::global().insert(*tx.hash(), sender);
+            recovered.push(P::Transaction::from_pooled(Recovered::new_unchecked(tx, sender)));
+            attested_here += 1;
+            continue;
+        }
         // Shard mode: this node's shard falls through to the verification
         // below, as if the frame had claimed nothing.
         let verify_mine = shard.is_some_and(|shard| in_my_shard(tx.hash(), shard));
@@ -1478,6 +1694,9 @@ where
                 }
             }
         }
+    }
+    if attested_here != 0 {
+        STATS.attested_txs.fetch_add(attested_here, Ordering::Relaxed);
     }
     if alt.is_empty() {
         count_senders(claimed_here, verified_here);
@@ -1613,7 +1832,7 @@ mod shard_tests {
         let pooled: Vec<N42PooledTxEnvelope> = txs.into_iter().map(N42PooledTxEnvelope::AltSig).collect();
         let hashes: Vec<B256> = pooled.iter().map(|tx| *tx.hash()).collect();
         let (recovered, frame) =
-            recover_frame::<NoopTransactionPool<N42PooledTransaction>>(6, pooled.clone(), Vec::new(), None);
+            recover_frame::<NoopTransactionPool<N42PooledTransaction>>(6, pooled.clone(), Vec::new(), &[], None);
         assert_eq!(recovered.len(), 6);
         let frame = frame.expect("every transaction kept");
         assert_eq!(frame.id, n42_tx_types::frame_root(&hashes));
@@ -1623,11 +1842,11 @@ mod shard_tests {
         assert_eq!(nonces, vec![50, 50, 51, 51, 52, 52]);
         // Reversed recovery order: still described in frame order.
         let reversed: Vec<_> = recovered.iter().rev().cloned().collect();
-        assert_eq!(frame_of(6, hashes.clone(), &reversed), Some(frame));
+        assert_eq!(frame_of(6, hashes.clone(), None, &reversed), Some(frame));
         // The frame carried seven and one was undecodable: unaligned.
-        assert_eq!(frame_of(7, hashes.clone(), &recovered), None);
+        assert_eq!(frame_of(7, hashes.clone(), None, &recovered), None);
         // One did not verify: unaligned.
-        assert_eq!(frame_of(6, hashes, &recovered[..5]), None);
+        assert_eq!(frame_of(6, hashes, None, &recovered[..5]), None);
     }
 
     /// A claiming frame in shard mode: exactly the transactions whose hash
@@ -1662,6 +1881,7 @@ mod shard_tests {
             vec![bogus; 48],
             None,
             Some(shard),
+            false,
         );
         assert_eq!(out.len(), 48);
         for tx in out.iter() {
@@ -1673,6 +1893,132 @@ mod shard_tests {
         // exactly this frame.
         assert_eq!(STATS.shard_verified.load(Ordering::Relaxed) - verified_before, owned);
         assert_eq!(STATS.shard_claimed.load(Ordering::Relaxed) - claimed_before, 48 - owned);
+    }
+
+    const CHAIN: u64 = 94;
+
+    fn gateway(seed: u8) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn attest_config(keys: &[&ed25519_dalek::SigningKey], min: usize) -> FrameAttest {
+        FrameAttest {
+            gateways: n42_tx_types::FrameGateways::new(keys.iter().map(|key| key.verifying_key()).collect(), min),
+            chain_id: CHAIN,
+        }
+    }
+
+    /// A frame of 0x50 transactions whose signatures do NOT verify (one
+    /// signature byte flipped) but whose keys are genuine: an attested frame
+    /// admits every one of them, which is only possible with no
+    /// per-transaction verification; a frame verified normally drops them.
+    fn unverifiable_frame(nonce_base: u64) -> (Vec<N42PooledTxEnvelope>, Vec<B256>, Vec<Address>) {
+        let pooled: Vec<N42PooledTxEnvelope> = (0..8u64)
+            .map(|i| {
+                let (tx, signature, _) = signed(30 + (i % 4) as u8, nonce_base + i).into_parts();
+                let mut bad = signature.to_vec();
+                bad[10] ^= 0x40;
+                N42PooledTxEnvelope::AltSig(AltSigTx::new(tx, Bytes::from(bad)))
+            })
+            .collect();
+        let hashes: Vec<B256> = pooled.iter().map(|tx| *tx.hash()).collect();
+        let senders: Vec<Address> = pooled
+            .iter()
+            .map(|tx| match tx {
+                N42PooledTxEnvelope::AltSig(tx) => tx.sender(),
+                N42PooledTxEnvelope::Eth(_) => Address::ZERO,
+            })
+            .collect();
+        (pooled, hashes, senders)
+    }
+
+    fn run(
+        pooled: Vec<N42PooledTxEnvelope>,
+        attestations: &[n42_tx_types::FrameAttestation],
+        attest: &FrameAttest,
+    ) -> (Vec<N42PooledTransaction>, Option<NewFrame>) {
+        let sent = pooled.len();
+        recover_frame_with::<NoopTransactionPool<N42PooledTransaction>>(
+            sent,
+            pooled,
+            Vec::new(),
+            attestations,
+            Some(attest),
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn an_attested_frame_is_admitted_without_verification() {
+        n42_tx_types::set_alt_sig_enabled(true);
+        let key = gateway(7);
+        let config = attest_config(&[&key], 1);
+        let (pooled, hashes, senders) = unverifiable_frame(9_000);
+        let root = n42_tx_types::frame_root(&hashes);
+        let attestation = n42_tx_types::FrameAttestation::sign(&key, CHAIN, root);
+        let (recovered, frame) = run(pooled, &[attestation], &config);
+        // Every transaction in, under the sender its key derives, in frame
+        // order: nothing was verified (every signature here is broken).
+        assert_eq!(recovered.len(), 8);
+        let got: Vec<Address> = recovered.iter().map(|tx| tx.sender()).collect();
+        assert_eq!(got, senders);
+        for tx in &recovered {
+            assert_eq!(AltSigSenderCache::global().get(tx.hash()), Some(tx.sender()));
+        }
+        // The frame index is step 1's, unchanged: the same id and hashes.
+        let frame = frame.expect("admitted whole");
+        assert_eq!(frame.id, root);
+        assert_eq!(frame.hashes, hashes);
+    }
+
+    #[test]
+    fn an_unknown_or_bad_attestation_is_verified_normally() {
+        n42_tx_types::set_alt_sig_enabled(true);
+        let (trusted, stranger) = (gateway(7), gateway(8));
+        let config = attest_config(&[&trusted], 1);
+        // Unknown gateway: verified, and every broken signature dropped.
+        let (pooled, hashes, _) = unverifiable_frame(9_100);
+        let root = n42_tx_types::frame_root(&hashes);
+        let unknown = n42_tx_types::FrameAttestation::sign(&stranger, CHAIN, root);
+        let (recovered, frame) = run(pooled, &[unknown], &config);
+        assert!(recovered.is_empty());
+        assert!(frame.is_none());
+        // A trusted key with a bad signature (signed another root): the same.
+        let (pooled, _, _) = unverifiable_frame(9_200);
+        let wrong = n42_tx_types::FrameAttestation::sign(&trusted, CHAIN, B256::repeat_byte(1));
+        let bad_before = STATS.frames_attest_bad.load(Ordering::Relaxed);
+        let (recovered, _) = run(pooled, &[wrong], &config);
+        assert!(recovered.is_empty());
+        assert!(STATS.frames_attest_bad.load(Ordering::Relaxed) > bad_before);
+        // A validly signed frame with a bad attestation is still admitted,
+        // by verification, under its real senders.
+        let txs: Vec<N42PooledTxEnvelope> =
+            (0..4u64).map(|i| N42PooledTxEnvelope::AltSig(signed(40, 9_300 + i))).collect();
+        let (recovered, frame) = run(txs, &[wrong], &config);
+        assert_eq!(recovered.len(), 4);
+        assert!(frame.is_some());
+    }
+
+    #[test]
+    fn a_minimum_of_two_with_one_attestation_is_verified_normally() {
+        n42_tx_types::set_alt_sig_enabled(true);
+        let (one, two) = (gateway(7), gateway(9));
+        let config = attest_config(&[&one, &two], 2);
+        let (pooled, hashes, _) = unverifiable_frame(9_400);
+        let root = n42_tx_types::frame_root(&hashes);
+        let only_one = n42_tx_types::FrameAttestation::sign(&one, CHAIN, root);
+        let (recovered, _) = run(pooled, &[only_one], &config);
+        assert!(recovered.is_empty(), "one of two is not enough: verified, and the broken ones dropped");
+        // Both: admitted.
+        let (pooled, hashes, _) = unverifiable_frame(9_500);
+        let root = n42_tx_types::frame_root(&hashes);
+        let both = [
+            n42_tx_types::FrameAttestation::sign(&one, CHAIN, root),
+            n42_tx_types::FrameAttestation::sign(&two, CHAIN, root),
+        ];
+        let (recovered, _) = run(pooled, &both, &config);
+        assert_eq!(recovered.len(), 8);
     }
 }
 
@@ -1735,9 +2081,11 @@ mod tests {
     /// every count this server accepts, so the two can never be confused.
     #[test]
     fn a_frame_header_says_whether_it_claims() {
-        assert_eq!(frame_header(500), (false, 500));
-        assert_eq!(frame_header(500 | FRAME_CLAIMS_SENDERS), (true, 500));
-        assert_eq!(frame_header(MAX_FRAME_TXS), (false, MAX_FRAME_TXS));
+        assert_eq!(frame_header(500), (false, false, 500));
+        assert_eq!(frame_header(500 | FRAME_CLAIMS_SENDERS), (true, false, 500));
+        assert_eq!(frame_header(500 | FRAME_ATTESTED), (false, true, 500));
+        assert_eq!(frame_header(500 | FRAME_CLAIMS_SENDERS | FRAME_ATTESTED), (true, true, 500));
+        assert_eq!(frame_header(MAX_FRAME_TXS), (false, false, MAX_FRAME_TXS));
     }
 
     /// The healthy path is unchanged: an open gate holds nothing.

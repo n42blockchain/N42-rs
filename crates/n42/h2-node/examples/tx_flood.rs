@@ -171,10 +171,54 @@ struct Args {
     /// `--replay <dir>`: send a pre-generated set's frames instead of
     /// signing (see [`replay_over_ingest`]).
     replay: Option<std::path::PathBuf>,
+    /// `--gateway-key` / `--gateway-key-file`: the Ed25519 key this flood
+    /// attests its ingest frames with, as the gateway of design step 2
+    /// (`docs/BREAKTHROUGH_DESIGN.md`). It signed every transaction itself,
+    /// so it verifies nothing more: it signs each frame's root. A node given
+    /// the public key in `N42_FRAME_GATEWAYS` admits such a frame without
+    /// verifying its transactions.
+    gateway: Option<ed25519_dalek::SigningKey>,
+    /// `--print-gateway-pubkey`: print the gateway's public key and exit, so
+    /// a bench can hand it to the nodes before it starts the flood.
+    print_gateway_pubkey: bool,
+}
+
+impl Args {
+    /// The gateway key and the chain its attestations are for.
+    fn gateway(&self) -> Option<(&ed25519_dalek::SigningKey, u64)> {
+        self.gateway.as_ref().map(|key| (key, self.chain_id))
+    }
+}
+
+/// A gateway key from `--gateway-key`: 32 bytes of hex (`0x` optional), or
+/// `seed:<text>` for the deterministic key `keccak256(<text>)` -- the bench
+/// uses `seed:n42-bench-gateway`, a public seed, so bench only.
+fn parse_gateway_key(value: &str) -> Result<ed25519_dalek::SigningKey, String> {
+    let value = value.trim();
+    let secret: [u8; 32] = if let Some(seed) = value.strip_prefix("seed:") {
+        keccak256(seed.as_bytes()).0
+    } else {
+        let hex = value.strip_prefix("0x").unwrap_or(value);
+        alloy_primitives::hex::decode(hex)
+            .map_err(|err| format!("--gateway-key: {err}"))?
+            .try_into()
+            .map_err(|_| "--gateway-key: not 32 bytes".to_string())?
+    };
+    Ok(ed25519_dalek::SigningKey::from_bytes(&secret))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse()?;
+    if let Some(key) = &args.gateway {
+        let pubkey = alloy_primitives::hex::encode_prefixed(key.verifying_key().as_bytes());
+        if args.print_gateway_pubkey {
+            println!("{pubkey}");
+            return Ok(());
+        }
+        println!("gateway      : {pubkey} (pass it to the nodes as N42_FRAME_GATEWAYS)");
+    } else if args.print_gateway_pubkey {
+        return Err("--print-gateway-pubkey needs --gateway-key or --gateway-key-file".into());
+    }
     let client = Arc::new(
         reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -599,10 +643,11 @@ fn flood_over_ingest(
             // transaction in a lane. It is a claim, not a credential: every
             // node verifies the signature where it uses the sender.
             let claim = args.claim_sender.then(|| key.address());
+            let gateway = args.gateway();
             // Same bucket as the RPC path: a frame goes out only once it can
             // take its transaction count in tokens.
             limiter.take(batch.len());
-            if conn.send(index, &batch, claim).is_err() {
+            if conn.send(index, &batch, claim, gateway).is_err() {
                 return;
             }
             SEND_NS.fetch_add(at.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -707,12 +752,21 @@ struct Ingest {
 /// length and its raw EIP-2718 bytes.
 ///
 /// With `claim`, the count carries `0x8000_0000` and the twenty bytes of the
-/// claimed sender sit between each length and its transaction. See the
+/// claimed sender sit between each length and its transaction. With
+/// `gateway`, the count carries `0x4000_0000` and the frame ends in one
+/// attestation: `u8 1`, the gateway's 32-byte Ed25519 public key and its
+/// 64-byte signature over `keccak256("n42-frame-attest" || u64 chain id BE
+/// || frame root)`, the root over the transactions' hashes
+/// ([`n42_tx_types::frame_root`], the id the node gives the frame). See the
 /// server's wire section (`n42-tx-ingest`).
-fn frame_bytes(batch: &[Vec<u8>], claim: Option<Address>) -> Vec<u8> {
+fn frame_bytes(batch: &[Vec<u8>], claim: Option<Address>, gateway: Option<(&ed25519_dalek::SigningKey, u64)>) -> Vec<u8> {
     let per_claim = if claim.is_some() { 20 } else { 0 };
-    let mut frame = Vec::with_capacity(4 + batch.iter().map(|t| 4 + per_claim + t.len()).sum::<usize>());
-    let count = batch.len() as u32 | if claim.is_some() { 0x8000_0000 } else { 0 };
+    let attest_len = if gateway.is_some() { 1 + n42_tx_types::FRAME_ATTESTATION_LEN } else { 0 };
+    let mut frame =
+        Vec::with_capacity(4 + batch.iter().map(|t| 4 + per_claim + t.len()).sum::<usize>() + attest_len);
+    let count = batch.len() as u32
+        | if claim.is_some() { FRAME_CLAIMS } else { 0 }
+        | if gateway.is_some() { FRAME_ATTESTED } else { 0 };
     frame.extend_from_slice(&count.to_le_bytes());
     for raw in batch {
         frame.extend_from_slice(&(raw.len() as u32).to_le_bytes());
@@ -721,8 +775,21 @@ fn frame_bytes(batch: &[Vec<u8>], claim: Option<Address>) -> Vec<u8> {
         }
         frame.extend_from_slice(raw);
     }
+    if let Some((key, chain_id)) = gateway {
+        // A transaction's hash is keccak256 of its EIP-2718 bytes, 0x50
+        // included; the root is the one the node computes at admission.
+        let hashes: Vec<B256> = batch.iter().map(keccak256).collect();
+        let root = n42_tx_types::frame_root(&hashes);
+        frame.push(1);
+        frame.extend_from_slice(&n42_tx_types::FrameAttestation::sign(key, chain_id, root).to_bytes());
+    }
     frame
 }
+
+/// The frame header's bits above the count (`n42-tx-ingest`'s wire).
+const FRAME_CLAIMS: u32 = 0x8000_0000;
+const FRAME_ATTESTED: u32 = 0x4000_0000;
+const FRAME_COUNT_MASK: u32 = !(FRAME_CLAIMS | FRAME_ATTESTED);
 
 /// Per stream (node), the answers' latency summed since the start and their
 /// count: send to answer read, in nanoseconds. Eight slots for seven nodes.
@@ -772,8 +839,14 @@ impl Ingest {
     /// node running `N42_INGEST_VERIFY=leader` files the transaction under
     /// instead of recovering it. An older node reads the header as a count
     /// past its frame bound and closes the connection saying so.
-    fn send(&mut self, sender: usize, batch: &[Vec<u8>], claim: Option<Address>) -> std::io::Result<()> {
-        self.send_frame(sender, &frame_bytes(batch, claim), batch.len())
+    fn send(
+        &mut self,
+        sender: usize,
+        batch: &[Vec<u8>],
+        claim: Option<Address>,
+        gateway: Option<(&ed25519_dalek::SigningKey, u64)>,
+    ) -> std::io::Result<()> {
+        self.send_frame(sender, &frame_bytes(batch, claim, gateway), batch.len())
     }
 
     /// Writes one frame already encoded (by [`frame_bytes`], live or read
@@ -1106,6 +1179,8 @@ fn default_args() -> Args {
         pregen_out: None,
         pregen_txs: 0,
         replay: None,
+        gateway: None,
+        print_gateway_pubkey: false,
     }
 }
 
@@ -1139,12 +1214,22 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
             "--pregen-out" => args.pregen_out = Some(next()?.into()),
             "--pregen-txs" => args.pregen_txs = next()?.parse()?,
             "--replay" => args.replay = Some(next()?.into()),
+            "--gateway-key" => args.gateway = Some(parse_gateway_key(&next()?)?),
+            "--gateway-key-file" => {
+                let path = next()?;
+                let text = std::fs::read_to_string(&path).map_err(|err| format!("--gateway-key-file {path}: {err}"))?;
+                args.gateway = Some(parse_gateway_key(&text)?);
+            }
+            "--print-gateway-pubkey" => args.print_gateway_pubkey = true,
             "--help" | "-h" => {
                 eprintln!("{USAGE}");
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument {other}\n\n{USAGE}").into()),
         }
+    }
+    if args.print_gateway_pubkey {
+        return Ok(args);
     }
     if args.senders == 0 {
         return Err(format!("--senders is required\n\n{USAGE}").into());
@@ -1197,6 +1282,13 @@ tx_flood — fund a derived sender set and flood the fleet with transfers
                       and is valid only on a chain where those senders start at nonce 0
   --replay <dir>      send a pre-generated set (same arguments, --ingest required) instead of
                       signing; funding works as without it
+  --gateway-key <k>   attest every ingest frame as a gateway (design step 2): k is a 32-byte
+                      Ed25519 secret in hex, or seed:<text> for keccak256(<text>) (the bench:
+                      seed:n42-bench-gateway, public, bench only). Nodes admit the frames
+                      without verifying them when N42_FRAME_GATEWAYS names the public key,
+                      printed at start. A pre-generated set is bound to the key
+  --gateway-key-file <path>  the same, read from a file
+  --print-gateway-pubkey     print the gateway's public key (hex) and exit
 ";
 
 /// Signs the transactions of one ingest frame: sender `index` of the worker
@@ -1234,34 +1326,43 @@ fn live_frame(key: &Signer, first_sender: usize, index: usize, from: u64, args: 
     let upto = (from + args.rpc_batch as u64).min(args.per_tx);
     let mut batch = Vec::with_capacity(args.rpc_batch);
     sign_batch(key, first_sender, index, from, upto, args, &mut batch);
-    (frame_bytes(&batch, args.claim_sender.then(|| key.address())), batch.len())
+    (frame_bytes(&batch, args.claim_sender.then(|| key.address()), args.gateway()), batch.len())
 }
 
 /// How many transactions a frame built by [`frame_bytes`] carries.
 fn frame_count(frame: &[u8]) -> usize {
-    frame.get(..4).map_or(0, |b| (u32::from_le_bytes([b[0], b[1], b[2], b[3]]) & 0x7fff_ffff) as usize)
+    frame.get(..4).map_or(0, |b| (u32::from_le_bytes([b[0], b[1], b[2], b[3]]) & FRAME_COUNT_MASK) as usize)
 }
 
 /// The same frame without its first `skip` transactions: what a sender sends
 /// again after a node accepted only a prefix of it. `None` for a frame that
 /// does not parse, which only a corrupt set could produce.
-fn frame_suffix(frame: &[u8], skip: usize) -> Option<Vec<u8>> {
+///
+/// An attested frame's attestation is over the whole frame's root, so the
+/// suffix is attested afresh with `gateway` (the replay's own key), or sent
+/// unattested without one -- a node verifies an unattested frame itself.
+fn frame_suffix(frame: &[u8], skip: usize, gateway: Option<(&ed25519_dalek::SigningKey, u64)>) -> Option<Vec<u8>> {
     let head = u32::from_le_bytes(frame.get(..4)?.try_into().ok()?);
-    let (claim, count) = (head & 0x8000_0000, (head & 0x7fff_ffff) as usize);
+    let (claiming, count) = (head & FRAME_CLAIMS != 0, (head & FRAME_COUNT_MASK) as usize);
     if skip >= count {
         return None;
     }
-    let per_claim = if claim != 0 { 20 } else { 0 };
+    let per_claim = if claiming { 20 } else { 0 };
     let mut at = 4usize;
-    for _ in 0..skip {
+    let mut claim = None;
+    let mut rest = Vec::with_capacity(count - skip);
+    for index in 0..count {
         let len = u32::from_le_bytes(frame.get(at..at + 4)?.try_into().ok()?) as usize;
+        if claiming {
+            // One sender a frame: every entry claims the same address.
+            claim = Some(Address::from_slice(frame.get(at + 4..at + 24)?));
+        }
+        if index >= skip {
+            rest.push(frame.get(at + 4 + per_claim..at + 4 + per_claim + len)?.to_vec());
+        }
         at += 4 + per_claim + len;
     }
-    let rest = frame.get(at..)?;
-    let mut out = Vec::with_capacity(4 + rest.len());
-    out.extend_from_slice(&((count - skip) as u32 | claim).to_le_bytes());
-    out.extend_from_slice(rest);
-    Some(out)
+    Some(frame_bytes(&rest, claim, gateway))
 }
 
 // ---------------------------------------------------------------------------
@@ -1280,7 +1381,9 @@ fn frame_suffix(frame: &[u8], skip: usize) -> Option<Vec<u8>> {
 //     u64 chain id, u64 senders, u64 offset, u64 per_tx, u32 rpcbatch,
 //     u32 workers, u32 worker, u32 senders in this worker, u64 its first
 //     sender, u64 gas, u128 gas price, u32 recipients, u32 0, u64 transactions,
-//     u64 frames, 8 bytes 0;
+//     u64 frames, 8 bytes: the gateway's public key's first 8 bytes (zero
+//     when unattested); byte 15 is 1 when the frames are attested
+//     (`--gateway-key`, version 2; a version-1 set reads as unattested);
 //   then `frames` records: u32 sender (index within the worker), u32 length,
 //     and the frame exactly as `frame_bytes` builds it.
 //
@@ -1301,7 +1404,7 @@ fn frame_suffix(frame: &[u8], skip: usize) -> Option<Vec<u8>> {
 // ---------------------------------------------------------------------------
 
 const PREGEN_MAGIC: [u8; 8] = *b"N42FLOOD";
-const PREGEN_VERSION: u32 = 1;
+const PREGEN_VERSION: u32 = 2;
 const PREGEN_HEADER_LEN: usize = 128;
 
 /// Workers whose pre-generated set ran out before the leg ended.
@@ -1328,6 +1431,9 @@ struct PregenHeader {
     recipients: u32,
     txs: u64,
     frames: u64,
+    /// The first 8 bytes of the gateway's public key when the frames are
+    /// attested (`--gateway-key`).
+    gateway: Option<[u8; 8]>,
 }
 
 impl PregenHeader {
@@ -1352,6 +1458,11 @@ impl PregenHeader {
             recipients: args.recipients,
             txs: 0,
             frames: 0,
+            gateway: args.gateway.as_ref().map(|key| {
+                let mut prefix = [0u8; 8];
+                prefix.copy_from_slice(&key.verifying_key().as_bytes()[..8]);
+                prefix
+            }),
         }
     }
 
@@ -1376,6 +1487,10 @@ impl PregenHeader {
         out[96..100].copy_from_slice(&self.recipients.to_le_bytes());
         out[104..112].copy_from_slice(&self.txs.to_le_bytes());
         out[112..120].copy_from_slice(&self.frames.to_le_bytes());
+        if let Some(prefix) = self.gateway {
+            out[15] = 1;
+            out[120..128].copy_from_slice(&prefix);
+        }
         out
     }
 
@@ -1390,9 +1505,16 @@ impl PregenHeader {
             u64::from_le_bytes(b)
         };
         let version = u32_at(8);
-        if version != PREGEN_VERSION {
-            return Err(format!("set version {version}, this flood reads {PREGEN_VERSION}"));
+        // Version 1 predates attestations: its byte 15 and last 8 bytes are
+        // zero, so it reads as an unattested set.
+        if version != PREGEN_VERSION && version != 1 {
+            return Err(format!("set version {version}, this flood reads 1 and {PREGEN_VERSION}"));
         }
+        let gateway = (raw[15] != 0).then(|| {
+            let mut prefix = [0u8; 8];
+            prefix.copy_from_slice(&raw[120..128]);
+            prefix
+        });
         let mut price = [0u8; 16];
         price.copy_from_slice(&raw[80..96]);
         Ok(Self {
@@ -1413,6 +1535,7 @@ impl PregenHeader {
             recipients: u32_at(96),
             txs: u64_at(104),
             frames: u64_at(112),
+            gateway,
         })
     }
 
@@ -1440,6 +1563,10 @@ impl PregenHeader {
         compare("--gas", self.gas.to_string(), want.gas.to_string());
         compare("--gasprice", self.gas_price.to_string(), want.gas_price.to_string());
         compare("--recipients", self.recipients.to_string(), want.recipients.to_string());
+        let key = |gateway: Option<[u8; 8]>| {
+            gateway.map_or_else(|| "none".to_string(), |p| format!("{}..", alloy_primitives::hex::encode(p)))
+        };
+        compare("--gateway-key (public key prefix)", key(self.gateway), key(want.gateway));
         out
     }
 }
@@ -1878,7 +2005,7 @@ fn replay_over_ingest<S: FrameSink, R: std::io::Read>(
                         if held.as_ref().is_some_and(|h| h.0 == sender) {
                             held = None;
                         }
-                    } else if let Some(rest) = frame.and_then(|f| frame_suffix(&f, accepted)) {
+                    } else if let Some(rest) = frame.and_then(|f| frame_suffix(&f, accepted, args.gateway())) {
                         retry.push_back((sender, rest, offered - accepted));
                     }
                 } else {
@@ -1934,11 +2061,11 @@ mod tests {
     fn a_frame_carries_the_claim_where_the_server_reads_it() {
         let batch = vec![vec![1u8, 2, 3], vec![4u8, 5]];
         assert_eq!(
-            frame_bytes(&batch, None),
+            frame_bytes(&batch, None, None),
             [&2u32.to_le_bytes()[..], &3u32.to_le_bytes(), &[1, 2, 3], &2u32.to_le_bytes(), &[4, 5]].concat()
         );
         let claim = Address::repeat_byte(0xab);
-        let claiming = frame_bytes(&batch, Some(claim));
+        let claiming = frame_bytes(&batch, Some(claim), None);
         assert_eq!(
             claiming,
             [
@@ -1952,7 +2079,38 @@ mod tests {
             ]
             .concat()
         );
-        assert_eq!(claiming.len(), frame_bytes(&batch, None).len() + 40);
+        assert_eq!(claiming.len(), frame_bytes(&batch, None, None).len() + 40);
+    }
+
+    /// An attested frame: the bit set, the transactions as before, then one
+    /// attestation a node's gateway check accepts over the frame's root.
+    #[test]
+    fn an_attested_frame_ends_in_an_attestation_over_its_root() {
+        let batch = vec![vec![1u8, 2, 3], vec![4u8, 5]];
+        let key = parse_gateway_key("seed:n42-bench-gateway").expect("key");
+        let attested = frame_bytes(&batch, None, Some((&key, 94)));
+        let plain = frame_bytes(&batch, None, None);
+        assert_eq!(attested[..4], (2u32 | FRAME_ATTESTED).to_le_bytes());
+        assert_eq!(attested[4..plain.len()], plain[4..]);
+        assert_eq!(attested.len(), plain.len() + 1 + 96);
+        assert_eq!(attested[plain.len()], 1);
+        let mut raw = [0u8; 96];
+        raw.copy_from_slice(&attested[plain.len() + 1..]);
+        let attestation = n42_tx_types::FrameAttestation::from_bytes(&raw);
+        let hashes: Vec<B256> = batch.iter().map(keccak256).collect();
+        let root = n42_tx_types::frame_root(&hashes);
+        let gateways = n42_tx_types::FrameGateways::new(vec![key.verifying_key()], 1);
+        assert!(gateways.check(94, root, &[attestation]).attested);
+        assert!(!gateways.check(95, root, &[attestation]).attested);
+        assert_eq!(frame_count(&attested), 2);
+        // A suffix is attested afresh over its own root.
+        let suffix = frame_suffix(&attested, 1, Some((&key, 94))).expect("suffix");
+        assert_eq!(suffix, frame_bytes(&batch[1..], None, Some((&key, 94))));
+        assert_eq!(frame_suffix(&attested, 1, None).expect("suffix"), frame_bytes(&batch[1..], None, None));
+        // The hex form of the same key is the same key.
+        let hex = alloy_primitives::hex::encode(key.to_bytes());
+        assert_eq!(parse_gateway_key(&hex).expect("hex").to_bytes(), key.to_bytes());
+        assert!(parse_gateway_key("0x1234").is_err());
     }
 
     /// Answers every frame at once, accepting all of it except where
@@ -2073,6 +2231,7 @@ mod tests {
         let args = tiny_args("ed25519", 3, false);
         let keys: Vec<Signer> = (0..args.senders).map(|i| derive(args.offset, i, true)).collect();
         let dir = scratch_dir("partial");
+        // (The attested variant of this is `an_attested_set_replays_its_attestations`.)
         let mut made = tiny_args("ed25519", 3, false);
         made.pregen_txs = 24;
         pregen(&made, &keys, &dir).expect("generate");
@@ -2080,7 +2239,7 @@ mod tests {
         let replayed = replay_all(&args, &dir, Some((0, 1)));
         let mut batch = Vec::new();
         sign_batch(&keys[0], 0, 0, 1, 3, &args, &mut batch);
-        let rest = frame_bytes(&batch, None);
+        let rest = frame_bytes(&batch, None, None);
         let worker0 = &replayed[0];
         let resend = worker0.iter().position(|(s, f)| *s == 0 && *f == rest).expect("the rest was sent again");
         let next = worker0
@@ -2096,6 +2255,39 @@ mod tests {
         other = tiny_args("ed25519", 3, false);
         other.conc = 3;
         assert!(open_replay_set(&dir, &other, 2).is_err(), "a set cut for two workers is not three");
+        std::fs::remove_dir_all(&dir).expect("clean up");
+    }
+
+    /// A set made with `--gateway-key` replays attested frames byte for byte
+    /// as the live flood attests them, a partially accepted frame's rest is
+    /// attested afresh, and the set is refused to a flood without the key
+    /// (or with another).
+    #[test]
+    fn an_attested_set_replays_its_attestations() {
+        let with_key = |mut args: Args| {
+            args.gateway = Some(parse_gateway_key("seed:n42-bench-gateway").expect("key"));
+            args
+        };
+        let args = with_key(tiny_args("ed25519", 3, false));
+        let keys: Vec<Signer> = (0..args.senders).map(|i| derive(args.offset, i, true)).collect();
+        let dir = scratch_dir("attested");
+        let mut made = with_key(tiny_args("ed25519", 3, false));
+        made.pregen_txs = 24;
+        pregen(&made, &keys, &dir).expect("generate");
+        let replayed = replay_all(&args, &dir, Some((0, 1)));
+        let first = &replayed[0][0].1;
+        assert_eq!(first, &live_frame(&keys[0], 0, 0, 0, &args).0);
+        assert_ne!(u32::from_le_bytes(first[..4].try_into().expect("4")) & FRAME_ATTESTED, 0);
+        let mut batch = Vec::new();
+        sign_batch(&keys[0], 0, 0, 1, 3, &args, &mut batch);
+        let rest = frame_bytes(&batch, None, args.gateway());
+        assert!(replayed[0].iter().any(|(s, f)| *s == 0 && *f == rest), "the rest, attested afresh");
+        let plain = tiny_args("ed25519", 3, false);
+        let err = open_replay_set(&dir, &plain, 3).err().expect("refused").to_string();
+        assert!(err.contains("--gateway-key"), "{err}");
+        let mut other = tiny_args("ed25519", 3, false);
+        other.gateway = Some(parse_gateway_key("seed:another").expect("key"));
+        assert!(open_replay_set(&dir, &other, 3).is_err());
         std::fs::remove_dir_all(&dir).expect("clean up");
     }
 

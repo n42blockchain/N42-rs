@@ -346,7 +346,7 @@ where
                 use alloy_consensus::transaction::TxHashRef as _;
                 let hashes: Vec<B256> = body.transactions.iter().map(|tx| *tx.tx_hash()).collect();
                 crate::frame_blocks::body_root(&hashes)
-                    .map_err(|err| ConsensusError::Other(format!("frame blocks: {err}")))?
+                    .map_err(|err| ConsensusError::Other(Arc::new(std::io::Error::other(format!("frame blocks: {err}")))))?
             }
             None => body.calculate_tx_root(),
         };

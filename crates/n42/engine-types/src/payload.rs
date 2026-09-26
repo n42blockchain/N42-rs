@@ -234,6 +234,7 @@ where
     ) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError> {
         let started = std::time::Instant::now();
         let parent_hash = args.config.parent_header.hash();
+        let parent_gas_limit = args.config.parent_header.gas_limit;
     let block_number = args.config.parent_header.number + 1;
         let result = default_n42_payload(
             self.evm_config.clone(),
@@ -250,7 +251,9 @@ where
                     // are the frames' claims; the wrapper verifies each one
                     // before the build can include it (`claimed_build`).
                     Some(queue) => {
-                        let best = queue.best_for_build(parent_hash);
+                        // `N42_FRAME_BLOCKS=1`: whole frames in arrival
+                        // order instead of the walk (`frame_blocks`).
+                        let best = crate::frame_blocks::select(&queue, parent_hash, parent_gas_limit);
                         crate::claimed_build::selection(&queue, best)
                     }
                     None => self.pool.best_transactions_with_attributes(attributes),
@@ -348,6 +351,7 @@ where
         let crate::direct_build::BuildOnOwnRequest { parent, parent_execution, attributes, before_pull } = request;
         let pre_at = std::time::Instant::now();
         let parent_hash = parent.hash();
+        let parent_gas_limit = parent.gas_limit;
         let parent_built = parent_execution.built_hash();
         let opener = match &parent_execution {
             crate::direct_build::ParentExecution::Ready(execution) => {
@@ -402,7 +406,7 @@ where
                         "the parent's queue hand-off is done; the build pulls"
                     );
                 }
-                let best = queue.best_for_build(parent_hash);
+                let best = crate::frame_blocks::select(&queue, parent_hash, parent_gas_limit);
                 crate::claimed_build::selection(&queue, best)
             }
             None => select_pool.best_transactions_with_attributes(attributes),
@@ -1053,6 +1057,11 @@ where
             .map(|gasprice| gasprice as u64),
     ));
     let start_best_ms = start_best_at.elapsed().as_millis() as u64;
+    // `N42_FRAME_BLOCKS=1`: the frames the selector just took, whose layout
+    // the transactions root is sealed over (`frame_blocks::sealed_root`).
+    // The roots computed ahead over the pulled set are the MPT root and are
+    // not computed for a frame build.
+    let frame_plan = crate::frame_blocks::take_plan();
     let start_handoff_ms = HANDOFF_WAIT_US.with(std::cell::Cell::get) / 1_000;
     let start_check_at = std::time::Instant::now();
     // Tried and measured inert: `best_txs.no_updates()`, dropping the
@@ -1383,9 +1392,18 @@ where
                 }
             };
             let early_root: Option<B256> = $early_root;
-            let transactions_root = match early_root {
-                Some(root) => root,
-                None => crate::assembler::parallel_transaction_root(&transactions),
+            let transactions_root = match (frame_plan.as_ref(), early_root) {
+                // A frame build: the frame tree over the body's layout, and
+                // a body that is not a prefix of the plan is refused here,
+                // before anything is sealed.
+                (Some(plan), _) => {
+                    use alloy_consensus::transaction::TxHashRef as _;
+                    let hashes: Vec<B256> = transactions.iter().map(|tx| *tx.tx_hash()).collect();
+                    crate::frame_blocks::sealed_root(plan, &hashes, &transactions)
+                        .map_err(|err| PayloadBuilderError::other(std::io::Error::other(err)))?
+                }
+                (None, Some(root)) => root,
+                (None, None) => crate::assembler::parallel_transaction_root(&transactions),
             };
             let root_ms = seal_at.elapsed().as_millis() as u64;
             let parent_sealed = parent_header.hash();
@@ -1583,8 +1601,11 @@ where
             // With nothing skipped the body is exactly that set in that order
             // (`body_matches_pull`), and the seal takes this root instead of
             // computing one after the execution.
-            let root_ahead_wanted =
-                seal_at_exec() && seal_early_possible && block_blob_count == 0 && direct_receipts_enabled();
+            let root_ahead_wanted = seal_at_exec()
+                && seal_early_possible
+                && block_blob_count == 0
+                && direct_receipts_enabled()
+                && frame_plan.is_none();
             // `N42_STATE_AFTER_PULL=1`: an error from the deferred open, raised
             // once the step's threads are joined.
             let mut deferred_state_err: Option<PayloadBuilderError> = None;
@@ -1894,7 +1915,7 @@ where
                                 (receipts_from_slots(&refs, &cumulative), tx_gas)
                             })
                         });
-                        let root = (sealing_early && sealed_ahead.is_none()).then(|| match direct_body.as_ref() {
+                        let root = (sealing_early && sealed_ahead.is_none() && frame_plan.is_none()).then(|| match direct_body.as_ref() {
                             Some((transactions, _)) => {
                                 let txs: &[TransactionSigned] = transactions;
                                 scope.spawn(move || crate::assembler::parallel_transaction_root(txs))
@@ -2988,7 +3009,18 @@ where
         header.logs_bloom = own_logs_bloom;
         header.gas_used = own_gas_used;
     }
-    header.transactions_root = block.header().transactions_root;
+    header.transactions_root = match frame_plan.as_ref() {
+        // A frame build: the assembler's root is the MPT root; the header's
+        // is the frame tree over the body's layout.
+        Some(plan) => {
+            use alloy_consensus::transaction::TxHashRef as _;
+            let transactions = &block.body().transactions;
+            let hashes: Vec<B256> = transactions.iter().map(|tx| *tx.tx_hash()).collect();
+            crate::frame_blocks::sealed_root(plan, &hashes, transactions)
+                .map_err(|err| PayloadBuilderError::other(std::io::Error::other(err)))?
+        }
+        None => block.header().transactions_root,
+    };
     if hotstuff {
         header.ommers_hash = B256::ZERO;
         header.difficulty = U256::ZERO;

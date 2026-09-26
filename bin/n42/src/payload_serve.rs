@@ -1025,10 +1025,24 @@ fn push_built_payload_hashed(
     if with_hashes {
         use alloy_consensus::transaction::TxHashRef as _;
         let transactions = &payload.block().body().transactions;
-        out.push(1);
+        // A block built from whole frames (`N42_FRAME_BLOCKS=1`): marker 2,
+        // the hashes as ever and the frame layout after them, for the frame
+        // description (`n42_h2_consensus::encode_compact_frame_body`).
+        let layout = n42_engine_types::frame_blocks::active()
+            .then(|| n42_engine_types::frame_blocks::layout_by_root(&payload.block().header().transactions_root))
+            .flatten()
+            .filter(|layout| !layout.is_empty());
+        out.push(if layout.is_some() { 2 } else { 1 });
         out.extend_from_slice(&(transactions.len() as u32).to_le_bytes());
         for tx in transactions {
             out.extend_from_slice(tx.tx_hash().as_slice());
+        }
+        if let Some(layout) = layout {
+            out.extend_from_slice(&(layout.len() as u32).to_le_bytes());
+            for (id, count) in &layout {
+                out.extend_from_slice(id.as_slice());
+                out.extend_from_slice(&count.to_le_bytes());
+            }
         }
     }
     answer
@@ -2008,6 +2022,7 @@ where
                 let made = described.maker(&payload).make(&validator).map_err(CompactRefusal::Refused)?;
                 let senders = std::mem::take(&mut described.senders);
                 let make_us = make_at.elapsed().as_micros() as u64;
+                let (frames, frames_missing) = (described.frames, described.frames_missing);
                 let (describe_us, root_us, miss_wait_us, misses, fill_us, filled, described_us) = (
                     described.describe_us,
                     described.root_us,
@@ -2032,7 +2047,7 @@ where
                         filled,
                         total_us: described_us + make_us,
                     },
-                    Some((made.copy_us, list)),
+                    Some((made.copy_us, list, frames, frames_missing)),
                 ))
             });
             // A miss small enough to be worth asking for: the positions go
@@ -2104,9 +2119,9 @@ where
                 }
             };
             let (assembled, described) = assembled;
-            let (copied, payload_list) = match described {
-                Some((copy_us, list)) => (Some(copy_us), Some(list)),
-                None => (None, None),
+            let (copied, payload_list, frames, frames_missing) = match described {
+                Some((copy_us, list, frames, frames_missing)) => (Some(copy_us), Some(list), frames, frames_missing),
+                None => (None, None, 0, 0),
             };
             let n42_engine_types::engine_validator::AssembledBlock {
                 block: sealed,
@@ -2158,6 +2173,8 @@ where
                 misses: misses as u64,
                 fill_us,
                 filled: filled as u64,
+                frames: frames as u64,
+                frames_missing: frames_missing as u64,
                 dispatch_wait_us,
                 started: started_at,
             };
@@ -2258,6 +2275,8 @@ where
                 fill_us: 0,
                 copy_us: 0,
                 filled: 0,
+                frames: 0,
+                frames_missing: 0,
                 dispatch_wait_us,
                 started: started_at,
             };
@@ -2329,6 +2348,8 @@ where
                             fill_us: 0,
                             copy_us: 0,
                             filled: 0,
+                            frames: 0,
+                            frames_missing: 0,
                             dispatch_wait_us,
                             started: started_at,
                         },

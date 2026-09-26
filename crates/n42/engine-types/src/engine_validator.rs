@@ -152,8 +152,12 @@ where
         // The root and the transactions, together, as the payload
         // conversion does it -- and the owned copies of the bytes in the
         // same pass, since it is already touching them.
+        // `N42_FRAME_BLOCKS=1`: the root is the frame tree over the layout
+        // this node's frame index finds for the body, computed once the
+        // transactions are decoded (their hashes are what it is over).
+        let frame_blocks = crate::frame_blocks::active();
         let (transactions_root, decoded) = rayon::join(
-            || crate::assembler::parallel_ordered_trie_root(&body.transactions),
+            || (!frame_blocks).then(|| crate::assembler::parallel_ordered_trie_root(&body.transactions)),
             || {
                 use rayon::prelude::*;
                 // Into a `Vec<Result>`, which rayon writes in place;
@@ -174,6 +178,10 @@ where
         let joined = started.elapsed();
         let (transactions, raw_transactions): (Vec<_>, Vec<_>) =
             decoded.into_iter().collect::<Result<Vec<_>, _>>()?.into_iter().unzip();
+        let transactions_root = match transactions_root {
+            Some(root) => root,
+            None => frame_body_root(&transactions).map_err(other)?,
+        };
         if transactions_root != body.header.transactions_root {
             return Err(PayloadError::BlockHash {
                 execution: transactions_root,
@@ -404,6 +412,14 @@ where
             )));
         }
 
+        if body.frames.is_some() || crate::frame_blocks::active() {
+            // Frame descriptions are assembled by reference only
+            // (`describe_compact_body`); refused here, the caller asks for
+            // the whole body.
+            return Err(other(
+                "frame blocks travel on the by-description road (N42_BLOCK_BY_DESCRIPTION=1)".to_owned(),
+            ));
+        }
         let filled_at = std::time::Instant::now();
         let supplied = supplied_from_fill(&body)?;
         let fill_us = filled_at.elapsed().as_micros() as u64;
@@ -587,6 +603,17 @@ where
     }
 }
 
+/// A whole body's transactions root on a frame chain
+/// (`crate::frame_blocks::body_root`): the frame tree over the layout this
+/// node's frame index finds for it; a body that is not a run of indexed
+/// frames is refused.
+fn frame_body_root(transactions: &[TransactionSigned]) -> Result<B256, String> {
+    use alloy_consensus::transaction::TxHashRef as _;
+    use rayon::prelude::*;
+    let hashes: Vec<B256> = transactions.par_iter().map(|tx| *tx.tx_hash()).collect();
+    crate::frame_blocks::body_root(&hashes).map_err(|err| format!("frame blocks: {err}"))
+}
+
 /// The transactions supplied with a compact frame, for the positions a first
 /// attempt could not fill from the queue (see `compact_body::with_fill`),
 /// with their senders.
@@ -607,13 +634,22 @@ fn supplied_from_fill(
                 .fill
                 .par_iter()
                 .map(|(index, bytes)| {
-                    let want = body.hashes.get(*index).copied().ok_or_else(|| {
-                        format!("the fill names index {index}, which the body does not have")
-                    })?;
-                    if alloy_primitives::keccak256(bytes) != want {
-                        return Err(format!(
-                            "the transaction supplied for index {index} is not {want}"
-                        ));
+                    // A frame description names no hash per position: the
+                    // index is checked against the block's length, and the
+                    // frame-tree root over what is assembled binds the rest.
+                    if body.frames.is_some() {
+                        if *index >= body.len() {
+                            return Err(format!("the fill names index {index}, which the body does not have"));
+                        }
+                    } else {
+                        let want = body.hashes.get(*index).copied().ok_or_else(|| {
+                            format!("the fill names index {index}, which the body does not have")
+                        })?;
+                        if alloy_primitives::keccak256(bytes) != want {
+                            return Err(format!(
+                                "the transaction supplied for index {index} is not {want}"
+                            ));
+                        }
                     }
                     <TransactionSigned as alloy_eips::Decodable2718>::decode_2718_exact(bytes)
                         .map(|tx| (*index, tx))
@@ -713,8 +749,10 @@ where
         // follower's import at the 163,000-transaction tier; here the root is
         // computed while the decodes run on the worker pool.
         let raw_transactions = payload.payload.as_v1().transactions.clone();
+        // `N42_FRAME_BLOCKS=1`: the frame tree, once the hashes are known.
+        let frame_blocks = crate::frame_blocks::active();
         let (transactions_root, decoded_transactions) = rayon::join(
-            || crate::assembler::parallel_ordered_trie_root(&raw_transactions),
+            || (!frame_blocks).then(|| crate::assembler::parallel_ordered_trie_root(&raw_transactions)),
             || {
                 use rayon::prelude::*;
                 // Into a `Vec<Result>`, which rayon writes in place; collecting
@@ -734,6 +772,10 @@ where
         );
         let joined = started.elapsed();
         let decoded_transactions = decoded_transactions.into_iter().collect::<Result<Vec<_>, _>>()?;
+        let transactions_root = match transactions_root {
+            Some(root) => root,
+            None => frame_body_root(&decoded_transactions).map_err(|err| NewPayloadError::Other(err.into()))?,
+        };
         let raw_block = payload
             .payload
             .clone()
@@ -1877,5 +1919,204 @@ mod tests {
                 assert_eq!(*sender, senders[at], "the queue's sender at {at}");
             }
         }
+    }
+
+    // ---- frame blocks (`N42_FRAME_BLOCKS=1`, docs/BREAKTHROUGH_DESIGN.md step 1) ----
+
+    /// A transfer of `sender`'s at `nonce`, with the hash of its bytes.
+    fn frame_transfer(nonce: u64, to: u8) -> TransactionSigned {
+        use alloy_consensus::{Signed, TxEip1559};
+        use alloy_primitives::{Address, Signature, TxKind};
+        let tx = TxEip1559 {
+            chain_id: 1,
+            nonce,
+            gas_limit: 21_000,
+            max_fee_per_gas: 10_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            to: TxKind::Call(Address::repeat_byte(to)),
+            value: U256::from(nonce + 1),
+            ..Default::default()
+        };
+        as_ingested(&TransactionSigned::Eth(
+            alloy_consensus::TxEnvelope::Eip1559(Signed::new_unchecked(tx, Signature::test_signature(), B256::ZERO))
+                .into(),
+        ))
+    }
+
+    /// Four frames as the ingest leaves them, in arrival order: A (three
+    /// senders), B (behind a hole: its sender's lane holds 0 and 2, the
+    /// frame is 2), C (two), D (three). Returns the queue and each frame's
+    /// id and transactions.
+    #[allow(clippy::type_complexity)]
+    fn frame_queue() -> (n42_tx_queue::TxQueue<crate::N42PooledTransaction>, Vec<(B256, Vec<TransactionSigned>)>) {
+        use alloy_eips::Encodable2718;
+        use alloy_primitives::Address;
+        let queue = n42_tx_queue::TxQueue::<crate::N42PooledTransaction>::with_run_length(1).with_hash_index(1024);
+        let pooled = |tx: &TransactionSigned, sender: Address| {
+            crate::N42PooledTransaction::new(
+                reth_primitives_traits::Recovered::new_unchecked(tx.clone(), sender),
+                tx.encoded_2718().len(),
+            )
+        };
+        let layout: [&[(u8, u64)]; 4] = [&[(1, 0), (2, 0), (3, 0)], &[(4, 2)], &[(5, 0), (5, 1)], &[(6, 0), (7, 0), (6, 1)]];
+        // Sender 4's nonce 0, in no frame: frame B's nonce 2 sits behind a hole.
+        queue.push([pooled(&frame_transfer(0, 0x40), Address::repeat_byte(4))]);
+        let mut frames = Vec::new();
+        for members in layout {
+            let txs: Vec<TransactionSigned> = members.iter().map(|(s, n)| frame_transfer(*n, *s)).collect();
+            let hashes = hashes_of(&txs);
+            queue.push(txs.iter().zip(members).map(|(tx, (s, _))| pooled(tx, Address::repeat_byte(*s))));
+            let id = n42_tx_types::frame_root(&hashes);
+            queue.note_frame(n42_tx_queue::NewFrame {
+                id,
+                hashes,
+                members: members.iter().map(|(s, n)| (Address::repeat_byte(*s), *n)).collect(),
+                gas: 21_000 * members.len() as u64,
+            });
+            frames.push((id, txs));
+        }
+        queue.drain_now();
+        (queue, frames)
+    }
+
+    /// The block a frame build of room for seven transfers makes: A whole,
+    /// B skipped (not whole-usable), C whole, D cut to its first two.
+    fn frame_block_parts(frames: &[(B256, Vec<TransactionSigned>)]) -> (Vec<TransactionSigned>, Vec<(B256, u32)>) {
+        let body: Vec<TransactionSigned> =
+            frames[0].1.iter().chain(&frames[2].1).chain(&frames[3].1[..2]).cloned().collect();
+        (body, vec![(frames[0].0, 3), (frames[2].0, 2), (frames[3].0, 2)])
+    }
+
+    /// The builder's selection under the flag: whole frames in arrival
+    /// order, the one that is not whole-usable skipped, the last cut to the
+    /// block's gas; the seal's root is the frame tree over that layout, and
+    /// the layout is remembered under it for the description.
+    #[test]
+    fn a_frame_build_pulls_whole_frames_and_seals_the_frame_tree() {
+        let (queue, frames) = frame_queue();
+        crate::frame_blocks::with_active(true, || {
+            let best = crate::frame_blocks::select(&queue, B256::repeat_byte(1), 7 * 21_000);
+            let plan = crate::frame_blocks::take_plan().expect("a frame build leaves its plan");
+            let body: Vec<TransactionSigned> =
+                best.map(|queued| queued.transaction.transaction.inner().clone()).collect();
+            let (want, layout) = frame_block_parts(&frames);
+            assert_eq!(plan.skipped, 1, "frame B is behind a hole");
+            assert_eq!(hashes_of(&body), hashes_of(&want), "the body is the frames end to end");
+            let root = crate::frame_blocks::sealed_root(&plan, &hashes_of(&body), &body).expect("frame-aligned");
+            let tree = n42_tx_types::frame_tree_root(&[
+                n42_tx_types::frame_root(&hashes_of(&frames[0].1)),
+                n42_tx_types::frame_root(&hashes_of(&frames[2].1)),
+                n42_tx_types::frame_root(&hashes_of(&frames[3].1[..2])),
+            ]);
+            assert_eq!(root, tree);
+            assert_eq!(root, crate::assembler::transactions_root_by_rule(true, Some(&[3, 2, 2]), &body));
+            assert_ne!(root, alloy_consensus::proofs::calculate_transaction_root(&body));
+            assert_eq!(crate::frame_blocks::layout_by_root(&root), Some(layout));
+            // A body that is not a prefix of the plan is refused before a seal.
+            let holed: Vec<TransactionSigned> = body.iter().skip(1).cloned().collect();
+            assert!(crate::frame_blocks::sealed_root(&plan, &hashes_of(&holed), &holed).is_err());
+        });
+        // Off, the selection is the walk and leaves no plan.
+        let (queue, _) = frame_queue();
+        let _ = crate::frame_blocks::select(&queue, B256::repeat_byte(1), 7 * 21_000);
+        assert!(crate::frame_blocks::take_plan().is_none());
+    }
+
+    /// A frame block's header, gov5 body and hash.
+    fn frame_block(body: &[TransactionSigned], transactions_root: B256) -> (B256, Bytes, ExecutionData) {
+        use alloy_eips::Encodable2718;
+        let raw: Vec<Bytes> = body.iter().map(|tx| Bytes::from(tx.encoded_2718())).collect();
+        let mut header = gov5_header(B256::ZERO, U256::ZERO);
+        header.transactions_root = transactions_root;
+        header.gas_used = 21_000 * body.len() as u64;
+        header.withdrawals_root = Some(n42_h2_consensus::gov5_rewards_root(std::iter::empty()));
+        let mut payload = n42_h2_consensus::execution_data_from_raw_parts(B256::ZERO, &header, raw, Vec::new(), None);
+        let hash = header.hash_slow();
+        payload.payload.as_v1_mut().block_hash = hash;
+        let gov5 = body_for(&payload, &header);
+        (hash, gov5, payload)
+    }
+
+    /// The road: the same block described by its frames is assembled by
+    /// reference out of a follower's queue (one look-up per frame, the last
+    /// cut to its prefix) and its root, the frame tree, is the header's; the
+    /// block made from it is the block the body names. A frame the follower
+    /// does not hold is a miss of exactly its positions.
+    #[test]
+    fn a_frame_description_is_assembled_by_reference_to_the_same_root() {
+        let (queue, frames) = frame_queue();
+        let (body, layout) = frame_block_parts(&frames);
+        let counts: Vec<usize> = layout.iter().map(|(_, count)| *count as usize).collect();
+        let root = crate::assembler::transactions_root_by_rule(true, Some(&counts), &body);
+        let (hash, gov5, _) = frame_block(&body, root);
+        let compact =
+            n42_h2_consensus::encode_compact_frame_body(&gov5, &layout, N42HeaderProfile::Gov5H2).expect("encodes");
+        let validator = validator(N42HeaderProfile::Gov5H2);
+        crate::frame_blocks::with_active(true, || {
+            let described = validator
+                .describe_compact_body(hash, N42HeaderProfile::Gov5H2, &compact, &queue, SHORT_WAIT)
+                .expect("assembled from the frames");
+            assert_eq!((described.frames, described.frames_missing, described.len()), (3, 0, 7));
+            assert_eq!(described.header.transactions_root, root);
+            let made = described.into_block(&validator).expect("the block is made");
+            assert_eq!(made.block.hash(), hash);
+            assert_eq!(hashes_of(&made.block.body().transactions), hashes_of(&body));
+
+            // A follower that holds none of the frames: every position of
+            // every frame is the miss, for the proposer's fill.
+            let empty = n42_tx_queue::TxQueue::<crate::N42PooledTransaction>::with_run_length(1).with_hash_index(1024);
+            match validator.describe_compact_body(hash, N42HeaderProfile::Gov5H2, &compact, &empty, SHORT_WAIT) {
+                Err(CompactBodyError::Missing { indices, total, .. }) => {
+                    assert_eq!(total, 7);
+                    assert_eq!(indices, (0..7).collect::<Vec<_>>());
+                }
+                other => panic!("expected a miss, got {other:?}"),
+            }
+        });
+    }
+
+    /// Validation under the flag: a header whose root is not the frame tree
+    /// of its frame-aligned body (the MPT root, or a layout that cuts a
+    /// frame anywhere but last) is refused, and so is a block described by
+    /// hashes, which names no layout at all.
+    #[test]
+    fn a_body_that_is_not_frame_aligned_is_refused_under_the_flag() {
+        let (queue, frames) = frame_queue();
+        let (body, layout) = frame_block_parts(&frames);
+        let validator = validator(N42HeaderProfile::Gov5H2);
+        crate::frame_blocks::with_active(true, || {
+            // The MPT root on a frame chain.
+            let mpt = alloy_consensus::proofs::calculate_transaction_root(&body);
+            let (hash, gov5, _) = frame_block(&body, mpt);
+            let compact =
+                n42_h2_consensus::encode_compact_frame_body(&gov5, &layout, N42HeaderProfile::Gov5H2).expect("encodes");
+            assert!(matches!(
+                validator.describe_compact_body(hash, N42HeaderProfile::Gov5H2, &compact, &queue, SHORT_WAIT),
+                Err(CompactBodyError::Invalid(_))
+            ));
+            // A layout that cuts frame A short in the middle of the body.
+            let root = crate::assembler::transactions_root_by_rule(true, Some(&[3, 2, 2]), &body);
+            let (hash, gov5, _) = frame_block(&body, root);
+            let cut = [(layout[0].0, 2), (layout[1].0, 2), (layout[2].0, 2)];
+            let compact =
+                n42_h2_consensus::encode_compact_frame_body(&gov5, &cut, N42HeaderProfile::Gov5H2).expect("encodes");
+            assert!(matches!(
+                validator.describe_compact_body(hash, N42HeaderProfile::Gov5H2, &compact, &queue, SHORT_WAIT),
+                Err(CompactBodyError::Invalid(_))
+            ));
+            // Described by hashes: no layout, not frame-aligned.
+            let listed = n42_h2_consensus::encode_compact_body(&gov5, &hashes_of(&body), N42HeaderProfile::Gov5H2)
+                .expect("encodes");
+            assert!(matches!(
+                validator.describe_compact_body(hash, N42HeaderProfile::Gov5H2, &listed, &queue, SHORT_WAIT),
+                Err(CompactBodyError::Invalid(_))
+            ));
+        });
+        // Off, the frame description is refused and the hash road is as before.
+        let root = crate::assembler::transactions_root_by_rule(true, Some(&[3, 2, 2]), &body);
+        let (hash, gov5, _) = frame_block(&body, root);
+        let compact =
+            n42_h2_consensus::encode_compact_frame_body(&gov5, &layout, N42HeaderProfile::Gov5H2).expect("encodes");
+        assert!(validator.describe_compact_body(hash, N42HeaderProfile::Gov5H2, &compact, &queue, SHORT_WAIT).is_err());
     }
 }

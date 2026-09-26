@@ -1040,6 +1040,11 @@ pub struct VoteRoad {
     pub fill_us: u64,
     /// How many positions the peer supplied.
     pub filled: u64,
+    /// A frame description's frames (`N42_FRAME_BLOCKS=1`); 0 on every
+    /// other road. With frames, `root_us` is the frame tree's.
+    pub frames: u64,
+    /// Of those, how many the first look-up did not find whole.
+    pub frames_missing: u64,
     /// Block by description only (`N42_BLOCK_BY_DESCRIPTION`): copying the
     /// block's transactions out of the queue into the owned block reth's
     /// execution takes, after the description was checked by reference.
@@ -1136,6 +1141,9 @@ fn log_vote_road(road: VoteRoad, number: u64, txs: usize, phases: RoadPhases) {
         misses = road.misses,
         fill_ms = road.fill_us / 1000,
         filled = road.filled,
+        frames = road.frames,
+        frames_missing = road.frames_missing,
+        frame_root_ms = if road.frames > 0 { road.root_us / 1000 } else { 0 },
         copy_ms = road.copy_us / 1000,
         header_ms = phases.header_us / 1000,
         senders_ms = phases.senders_us / 1000,

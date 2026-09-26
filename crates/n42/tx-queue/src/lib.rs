@@ -42,7 +42,7 @@
 
 mod frames;
 
-pub use frames::{FrameRef, NewFrame, MAX_FRAMES};
+pub use frames::{FramePlan, FrameRef, NewFrame, PlannedFrame, MAX_FRAMES};
 
 use std::any::Any;
 use std::collections::{BTreeMap, VecDeque};
@@ -1522,7 +1522,66 @@ impl<T: PoolTransaction> TxQueue<T> {
     pub fn best_for_build(&self, parent: B256) -> QueueBest<T> {
         {
             let mut inner = self.inner.lock();
-            self.drain_inbox(&mut inner);
+            self.begin_build(&mut inner, parent);
+        }
+        QueueBest {
+            queue: self.clone(),
+            skipped: AddressHashSet::default(),
+            buffer: VecDeque::new(),
+            batch: queue_batch(),
+            frame_mode: false,
+            frames_ended: false,
+        }
+    }
+
+    /// The transactions for a frame build on `parent`
+    /// (`docs/BREAKTHROUGH_DESIGN.md` step 1): whole frames in the order
+    /// they arrived, each taken only if a build could take it whole right
+    /// now and its every sender's run starts at that sender's lane head
+    /// (after the frames before it in the plan were taken), until the
+    /// transactions' gas limits reach `gas_limit`; the frame they run out
+    /// in is cut to the prefix that fits, and the plan ends there.
+    ///
+    /// The frames are taken out of the lanes into the build's taken list at
+    /// once, exactly as the walk takes a transaction, and handed out in
+    /// plan order by the returned iterator, which offers nothing else: its
+    /// first refusal ends it (a body with a hole in a frame is not
+    /// frame-aligned), and what it has not handed out goes back when it is
+    /// dropped, as the walk's buffer does. What it handed out and the build
+    /// did not use goes back through the builder's refusals and the next
+    /// build's give-back, as for the walk.
+    pub fn frames_for_build(&self, parent: B256, gas_limit: u64) -> (QueueBest<T>, FramePlan) {
+        let (buffer, plan) = {
+            let mut inner = self.inner.lock();
+            self.begin_build(&mut inner, parent);
+            inner.plan_frames(gas_limit)
+        };
+        let best = QueueBest {
+            queue: self.clone(),
+            skipped: AddressHashSet::default(),
+            buffer: buffer.into(),
+            batch: 1,
+            frame_mode: true,
+            frames_ended: false,
+        };
+        (best, plan)
+    }
+
+    /// The frame layout of a body, from this node's frame index: each
+    /// frame's id and how much of it the body holds, in body order. `None`
+    /// when the body is not a run of frames this node indexed.
+    pub fn frame_layout_of(&self, hashes: &[B256]) -> Option<Vec<(B256, usize)>> {
+        let mut inner = self.inner.lock();
+        self.drain_inbox(&mut inner);
+        inner.frames.layout_of(hashes)
+    }
+
+    /// What every build does first, under the lanes' lock: the previous
+    /// build's take given back, this build's taken list opened, the parked
+    /// lanes whose park ended offered again.
+    fn begin_build(&self, inner: &mut Inner<T>, parent: B256) {
+        {
+            self.drain_inbox(inner);
             inner.builds += 1;
             let build = inner.builds;
             match inner.last_build.take() {
@@ -1564,11 +1623,95 @@ impl<T: PoolTransaction> TxQueue<T> {
             // a build the lane behind it.
             inner.readmit_parked();
         }
-        QueueBest { queue: self.clone(), skipped: AddressHashSet::default(), buffer: VecDeque::new(), batch: queue_batch() }
     }
 }
 
 impl<T: PoolTransaction> Inner<T> {
+    /// The frame plan of [`TxQueue::frames_for_build`], taken out of the
+    /// lanes: the transactions in plan order and the plan.
+    fn plan_frames(&mut self, gas_limit: u64) -> (Vec<Arc<ValidPoolTransaction<T>>>, FramePlan) {
+        let mut out = Vec::new();
+        let mut plan = FramePlan::default();
+        let mut gas_left = gas_limit;
+        for frame in self.frames.in_arrival_order(&self.lanes) {
+            if gas_left == 0 {
+                break;
+            }
+            if !frame.whole_usable {
+                plan.skipped += 1;
+                continue;
+            }
+            let Some(members) = self.frames.members_of(&frame.id) else {
+                plan.skipped += 1;
+                continue;
+            };
+            // Checked before anything is taken: each position at its
+            // sender's lane head, counting this frame's earlier positions
+            // of the same sender, and the prefix the gas left allows.
+            let mut at_head: AddressHashMap<u64> = AddressHashMap::default();
+            let mut usable = true;
+            let mut prefix = members.len();
+            let mut gas = 0u64;
+            for (at, (sender, nonce, hash)) in members.iter().enumerate() {
+                let before = at_head.entry(*sender).or_insert(0);
+                let Some(lane) = self.lanes.get(sender) else {
+                    usable = false;
+                    break;
+                };
+                let head = lane.by_nonce.first_key_value().map(|(nonce, _)| *nonce);
+                let held = lane.by_nonce.get(nonce);
+                if lane.parked.is_some()
+                    || head.and_then(|head| head.checked_add(*before)) != Some(*nonce)
+                    || held.is_none_or(|held| held.hash() != hash)
+                {
+                    usable = false;
+                    break;
+                }
+                let tx_gas = held.map_or(0, |held| held.gas_limit());
+                if gas.saturating_add(tx_gas) > gas_left {
+                    prefix = at;
+                    break;
+                }
+                gas += tx_gas;
+                *before += 1;
+            }
+            if !usable {
+                plan.skipped += 1;
+                continue;
+            }
+            if prefix == 0 {
+                break;
+            }
+            let mut taken = 0usize;
+            for (sender, nonce, hash) in &members[..prefix] {
+                let Some(lane) = self.lanes.get_mut(sender) else { break };
+                if lane.by_nonce.first_key_value().map(|(n, _)| *n) != Some(*nonce) {
+                    break;
+                }
+                let Some((_, valid)) = lane.by_nonce.pop_first() else { break };
+                self.len -= 1;
+                if lane.by_nonce.is_empty() {
+                    lane.queued = false;
+                }
+                if let Some((_, list)) = self.last_build.as_mut() {
+                    list.push(Arc::clone(&valid));
+                }
+                out.push(valid);
+                plan.hashes.push(*hash);
+                taken += 1;
+            }
+            if taken == 0 {
+                break;
+            }
+            plan.frames.push(PlannedFrame { id: frame.id, len: members.len(), taken });
+            gas_left = gas_left.saturating_sub(gas);
+            if taken < members.len() {
+                break;
+            }
+        }
+        (out, plan)
+    }
+
     /// Queues one transaction the pusher has already wrapped.
     fn insert_valid(&mut self, valid: Arc<ValidPoolTransaction<T>>) {
         let sender = valid.sender();
@@ -1941,6 +2084,12 @@ pub struct QueueBest<T: PoolTransaction> {
     /// and the inbox drain alone.
     buffer: VecDeque<Arc<ValidPoolTransaction<T>>>,
     batch: usize,
+    /// A frame build ([`TxQueue::frames_for_build`]): only the planned
+    /// frames, already in `buffer`, are offered; the lanes are not walked.
+    frame_mode: bool,
+    /// A frame build's first refusal: nothing more is offered, since a body
+    /// with a hole in a frame is not frame-aligned.
+    frames_ended: bool,
 }
 
 /// `N42_TX_QUEUE_BATCH`, read once.
@@ -1985,6 +2134,10 @@ impl<T: PoolTransaction> Iterator for QueueBest<T> {
     type Item = Arc<ValidPoolTransaction<T>>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.frame_mode {
+            // What is left in the buffer after the end goes back on drop.
+            return if self.frames_ended { None } else { self.buffer.pop_front() };
+        }
         loop {
             if let Some(transaction) = self.buffer.pop_front() {
                 // A sender the build refused meanwhile: its buffered
@@ -2019,6 +2172,9 @@ impl<T: PoolTransaction> BestTransactions for QueueBest<T> {
     /// sender's later nonces are not offered again in this build. A stale
     /// one (nonce below the account's) is dropped instead.
     fn mark_invalid(&mut self, transaction: &Self::Item, kind: InvalidPoolTransactionError) {
+        if self.frame_mode {
+            self.frames_ended = true;
+        }
         let sender = transaction.sender();
         let stale = matches!(&kind, InvalidPoolTransactionError::Consensus(err) if err.is_nonce_too_low());
         if stale {
@@ -3393,6 +3549,44 @@ mod tests {
         assert_eq!(frames.iter().map(|f| f.id).collect::<Vec<_>>(), vec![B256::repeat_byte(0xa2)]);
         assert!(frames[0].whole_usable);
         assert_eq!(queue.frames_indexed(), 1);
+    }
+
+    /// A frame build takes whole frames in arrival order, skips one that is
+    /// not whole-usable and one whose run is not at its lane head once the
+    /// earlier frames are taken, cuts the last to the gas left, and gives
+    /// back what it did not hand out when dropped.
+    #[test]
+    fn a_frame_build_takes_whole_frames_and_cuts_the_last_to_the_gas() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
+        let (a, b, c, d) = (Address::repeat_byte(1), Address::repeat_byte(2), Address::repeat_byte(3), Address::repeat_byte(4));
+        let first = push_frame(&queue, 0xd1, &[(a, 0), (a, 1), (b, 0)]);
+        // Behind a hole: c's lane holds 0 and 2..=3.
+        queue.push([tx_hashed(c, 0)]);
+        push_frame(&queue, 0xd2, &[(c, 2), (c, 3)]);
+        let third = push_frame(&queue, 0xd3, &[(b, 1), (d, 0)]);
+        let fourth = push_frame(&queue, 0xd4, &[(d, 1), (d, 2), (d, 3), (a, 2)]);
+        // Room for 3 + 2 + 2 transactions of 21,000.
+        let (best, plan) = queue.frames_for_build(B256::repeat_byte(9), 7 * 21_000);
+        assert_eq!(plan.skipped, 1);
+        assert_eq!(
+            plan.frames.iter().map(|f| (f.id, f.len, f.taken)).collect::<Vec<_>>(),
+            vec![(B256::repeat_byte(0xd1), 3, 3), (B256::repeat_byte(0xd3), 2, 2), (B256::repeat_byte(0xd4), 4, 2)]
+        );
+        let want: Vec<B256> = first.iter().chain(&third).chain(&fourth[..2]).copied().collect();
+        assert_eq!(plan.hashes, want);
+        assert_eq!(plan.layout_for(&want[..4]), Some(vec![(B256::repeat_byte(0xd1), 3), (B256::repeat_byte(0xd3), 1)]));
+        assert_eq!(plan.layout_for(&[want[1]]), None, "not a prefix: not frame-aligned");
+        let mut best = best;
+        let handed: Vec<B256> = best.by_ref().take(5).map(|t| *t.hash()).collect();
+        assert_eq!(handed, want[..5]);
+        // c's 3, 2 of d's and a's last one remain; the two the iterator
+        // still buffers go back on drop.
+        assert_eq!(queue.len(), 5);
+        drop(best);
+        assert_eq!(queue.len(), 7);
+        // The index finds the layout of a body made of its frames.
+        assert_eq!(queue.frame_layout_of(&want), Some(vec![(B256::repeat_byte(0xd1), 3), (B256::repeat_byte(0xd3), 2), (B256::repeat_byte(0xd4), 2)]));
+        assert_eq!(queue.frame_layout_of(&want[1..]), None);
     }
 
     #[test]

@@ -67,6 +67,57 @@ pub struct FrameRef {
     pub whole_usable: bool,
 }
 
+/// One frame of a build's frame plan ([`crate::TxQueue::frames_for_build`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlannedFrame {
+    /// The frame's id (its root over all of its transactions).
+    pub id: B256,
+    /// How many transactions the frame holds.
+    pub len: usize,
+    /// How many of them the build took, from the frame's start: `len`, or
+    /// fewer for the plan's last frame when the block's gas ran out in it.
+    pub taken: usize,
+}
+
+/// What a frame build took, in the order its transactions are handed to
+/// the builder: whole frames in arrival order, the last one possibly cut
+/// to a prefix.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FramePlan {
+    /// The frames, in body order.
+    pub frames: Vec<PlannedFrame>,
+    /// The transactions' hashes, in body order: the frames' taken parts
+    /// end to end.
+    pub hashes: Vec<B256>,
+    /// Indexed frames the plan passed over: not whole-usable, or not at
+    /// their senders' lane heads once the frames before them were taken.
+    pub skipped: usize,
+}
+
+impl FramePlan {
+    /// The layout of a body built from this plan, as (frame id, length) in
+    /// body order: `Some` when the body's hashes are a prefix of the plan's
+    /// (a build that stopped early, or took everything), with the frame the
+    /// body ends in cut to what it holds of it; `None` when the body is not
+    /// a prefix of the plan -- it is not frame-aligned.
+    pub fn layout_for(&self, body: &[B256]) -> Option<Vec<(B256, usize)>> {
+        if body.len() > self.hashes.len() || self.hashes[..body.len()] != *body {
+            return None;
+        }
+        let mut layout = Vec::new();
+        let mut left = body.len();
+        for frame in &self.frames {
+            if left == 0 {
+                break;
+            }
+            let take = frame.taken.min(left);
+            layout.push((frame.id, take));
+            left -= take;
+        }
+        (left == 0).then_some(layout)
+    }
+}
+
 /// A stretch of a frame with one sender at consecutive nonces.
 #[derive(Debug, Clone, Copy)]
 struct SenderRun {
@@ -121,6 +172,10 @@ impl FrameEntry {
 #[derive(Debug, Default)]
 pub(crate) struct FrameIndex {
     frames: B256HashMap<FrameEntry>,
+    /// Each indexed frame's id by its first transaction's hash: how a body
+    /// that arrived whole is matched back to the frames it was built from
+    /// ([`FrameIndex::layout_of`]).
+    by_first: B256HashMap<B256>,
     /// Ids in arrival order; an id no longer in `frames` is skipped, and the
     /// order is compacted when the skipped ones outnumber the live ones.
     order: VecDeque<B256>,
@@ -143,11 +198,19 @@ impl FrameIndex {
             self.refused += 1;
             return;
         };
+        if let Some(first) = entry.hashes.first() {
+            self.by_first.insert(*first, id);
+        }
         self.frames.insert(id, entry);
         self.order.push_back(id);
         while self.frames.len() > MAX_FRAMES {
             let Some(oldest) = self.order.pop_front() else { break };
-            self.frames.remove(&oldest);
+            if let Some(gone) = self.frames.remove(&oldest)
+                && let Some(first) = gone.hashes.first()
+                && self.by_first.get(first) == Some(&oldest)
+            {
+                self.by_first.remove(first);
+            }
         }
         self.compact();
     }
@@ -171,6 +234,8 @@ impl FrameIndex {
         });
         let gone = before - self.frames.len();
         if gone > 0 {
+            let frames = &self.frames;
+            self.by_first.retain(|_, id| frames.contains_key(id));
             self.compact();
         }
         gone
@@ -204,6 +269,32 @@ impl FrameIndex {
             out.push((sender, nonce, *entry.hashes.get(at)?));
         }
         Some(out)
+    }
+
+    /// A frame's transactions' hashes, in frame order.
+    pub(crate) fn hashes_of(&self, id: &B256) -> Option<&[B256]> {
+        self.frames.get(id).map(|entry| entry.hashes.as_slice())
+    }
+
+    /// The frame layout of a body given by its transactions' hashes: the
+    /// ids and lengths of the indexed frames it is made of, in order, the
+    /// last one possibly a prefix of its frame. `None` when the body is not
+    /// a run of indexed frames (a position that starts no indexed frame, a
+    /// frame the body leaves before its end anywhere but last).
+    pub(crate) fn layout_of(&self, hashes: &[B256]) -> Option<Vec<(B256, usize)>> {
+        let mut layout = Vec::new();
+        let mut at = 0usize;
+        while at < hashes.len() {
+            let id = *self.by_first.get(&hashes[at])?;
+            let frame = &self.frames.get(&id)?.hashes;
+            let take = frame.len().min(hashes.len() - at);
+            if frame[..take] != hashes[at..at + take] {
+                return None;
+            }
+            layout.push((id, take));
+            at += take;
+        }
+        Some(layout)
     }
 }
 

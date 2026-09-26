@@ -2649,7 +2649,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                         Err(err) => debug!(target: "n42.h2.node", %err, "built payload has no header to remember"),
                     }
                 }
-                self.publish_body(&built.execution_data, built.header.as_ref(), &built.tx_hashes);
+                self.publish_body(&built.execution_data, built.header.as_ref(), &built.tx_hashes, &built.frame_layout);
                 if let Err(err) = self
                     .engine
                     .process_event(ConsensusEvent::BlockReady(built.hash, None))
@@ -3503,6 +3503,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         execution: &alloy_rpc_types_engine::ExecutionData,
         sealed: Option<&alloy_consensus::Header>,
         tx_hashes: &[B256],
+        frame_layout: &[(B256, u32)],
     ) {
         let block_hash = execution.block_hash();
         // Timed in three because the gap between a leader finishing a block and
@@ -3560,10 +3561,21 @@ impl<E: ExecutionLayer> H2Service<E> {
         // hashing its 26 MB here to find them again is most of what the
         // compact body saves -- and the fleet simply gets the body.
         let compact_at = std::time::Instant::now();
-        let compact = (n42_h2_execution::compact_body()
-            && tx_hashes.len() == execution.payload.as_v1().transactions.len())
+        // `N42_FRAME_BLOCKS=1`: a block built from whole frames goes out as
+        // its frame description (the frame ids and counts, version 2), which
+        // the members' execution layers assemble by reference.
+        let transactions = execution.payload.as_v1().transactions.len();
+        let frames = n42_tx_types::frame_blocks_requested()
+            && !frame_layout.is_empty()
+            && frame_layout.iter().map(|(_, count)| *count as usize).sum::<usize>() == transactions;
+        let compact = (n42_h2_execution::compact_body() && (frames || tx_hashes.len() == transactions))
         .then(|| {
-            n42_h2_consensus::encode_compact_body(&rlp, tx_hashes, self.header_profile)
+            let encoded = if frames {
+                n42_h2_consensus::encode_compact_frame_body(&rlp, frame_layout, self.header_profile)
+            } else {
+                n42_h2_consensus::encode_compact_body(&rlp, tx_hashes, self.header_profile)
+            };
+            encoded
                 .inspect_err(|err| {
                     warn!(target: "n42.h2.node", %err, ?block_hash, "cannot make a compact body for our own block");
                 })

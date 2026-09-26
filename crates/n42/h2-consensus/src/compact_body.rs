@@ -43,6 +43,26 @@
 //! The fill is the only optional section and it ends the frame, so a frame
 //! without one is byte for byte what a frame was before it existed.
 //!
+//! Version 2 is the *frame description* of a frame-aligned block
+//! (`N42_FRAME_BLOCKS=1` on a `frameBlocks` chain, `docs/BREAKTHROUGH_DESIGN.md`
+//! step 1): the hash list is replaced by the block's ingest frames, named by
+//! id, each with the number of its transactions the block holds -- the whole
+//! frame's for every frame but the last, the prefix length for the last --
+//! and the block's transaction count, which must be their sum:
+//!
+//! ```text
+//! frame := "N42C" | u8 2
+//!        | u32 len, header RLP
+//!        | u32 frames, frames * (32 bytes of frame id, u32 count)
+//!        | u32 transactions (= the sum of the counts)
+//!        | ... the rest exactly as version 1 (verifiers, rewards, access
+//!          list, the optional fill, whose indices are block positions)
+//! ```
+//!
+//! ~36 bytes a frame: 11.7 KB for a block of 326 frames against 5.2 MB of
+//! hashes. Version 1 is untouched and a node without the flag never writes
+//! version 2.
+//!
 //! Little-endian lengths, as on the raw engine channel; the RLP items are
 //! carried whole so nothing about gov5's body has to be re-encoded here and
 //! the receiver checks them exactly as it checks a full body's.
@@ -67,6 +87,9 @@ const MAGIC: [u8; 4] = *b"N42C";
 /// peer that has not negotiated the capability is never sent one.
 const VERSION: u8 = 1;
 
+/// The frame-description version (see the module docs).
+const VERSION_FRAMES: u8 = 2;
+
 /// Introduces the fill section. A frame either ends after the access list or
 /// carries exactly this and then the fill; anything else is refused, so the
 /// optional section cannot be read out of trailing rubbish.
@@ -89,8 +112,13 @@ pub struct CompactBlockBody<'a> {
     /// The header's RLP as it arrived, for a caller that has to hand the
     /// same bytes on.
     pub header_rlp: &'a [u8],
-    /// Each transaction's hash, in block order.
+    /// Each transaction's hash, in block order. Empty for a frame
+    /// description, which names frames instead ([`Self::frames`]).
     pub hashes: Vec<B256>,
+    /// A frame description's frames: (frame id, how many of its
+    /// transactions the block holds), in block order. `None` for a body
+    /// that lists hashes.
+    pub frames: Option<Vec<(B256, u32)>>,
     /// gov5's rewards, as sent.
     pub rewards: Vec<(Address, U256)>,
     /// The rewards as the withdrawals this node's execution layer credits.
@@ -106,6 +134,22 @@ pub struct CompactBlockBody<'a> {
     /// its own queue, as EIP-2718 bytes: `(index, bytes)` in index order.
     /// Empty on every frame that crossed the wire.
     pub fill: Vec<(usize, &'a [u8])>,
+}
+
+impl CompactBlockBody<'_> {
+    /// How many transactions the block holds: the hashes listed, or the
+    /// frames' counts summed.
+    pub fn len(&self) -> usize {
+        match &self.frames {
+            Some(frames) => frames.iter().map(|(_, count)| *count as usize).sum(),
+            None => self.hashes.len(),
+        }
+    }
+
+    /// Whether the block holds no transactions.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 struct Writer(Vec<u8>);
@@ -144,6 +188,48 @@ impl<'a> Reader<'a> {
         let n = self.u32()? as usize;
         self.take(n)
     }
+    /// The magic and a version this module reads; the version.
+    fn start(&mut self) -> Result<u8, BlockBodyError> {
+        if self.take(MAGIC.len())? != MAGIC {
+            return Err(invalid());
+        }
+        match self.u8()? {
+            version @ (VERSION | VERSION_FRAMES) => Ok(version),
+            _ => Err(invalid()),
+        }
+    }
+    /// The transactions' listing: the hashes (version 1) or the frames
+    /// (version 2), and the block's transaction count.
+    #[allow(clippy::type_complexity)]
+    fn listing(&mut self, version: u8) -> Result<(Vec<B256>, Option<Vec<(B256, u32)>>, usize), BlockBodyError> {
+        if version == VERSION {
+            let count = self.u32()? as usize;
+            let raw = self.take(count.checked_mul(32).ok_or_else(invalid)?)?;
+            // Exactly `count` whole hashes: the take above sized the slice,
+            // so the remainder `as_chunks` hands back is empty.
+            let hashes: Vec<B256> = raw.as_chunks::<32>().0.iter().copied().map(B256::from).collect();
+            return Ok((hashes, None, count));
+        }
+        let n = self.u32()? as usize;
+        let raw = self.take(n.checked_mul(36).ok_or_else(invalid)?)?;
+        let mut frames = Vec::with_capacity(n);
+        let mut sum = 0usize;
+        for entry in raw.chunks_exact(36) {
+            let id = B256::from_slice(&entry[..32]);
+            let count = u32::from_le_bytes(entry[32..].try_into().map_err(|_| invalid())?);
+            // An empty frame is no frame: a layout with one does not
+            // describe a frame-aligned body.
+            if count == 0 {
+                return Err(invalid());
+            }
+            sum = sum.checked_add(count as usize).ok_or_else(invalid)?;
+            frames.push((id, count));
+        }
+        if self.u32()? as usize != sum {
+            return Err(invalid());
+        }
+        Ok((Vec::new(), Some(frames), sum))
+    }
 }
 
 /// The compact form of a gov5 block body, given that body's bytes and its
@@ -160,6 +246,51 @@ pub fn encode_compact_body(
     hashes: &[B256],
     profile: N42HeaderProfile,
 ) -> Result<Vec<u8>, BlockBodyError> {
+    let (header_rlp, verifiers_rlp, rewards_rlp, bal) = body_parts(gov5_body, profile)?;
+    Ok(write_compact(header_rlp, hashes, verifiers_rlp, rewards_rlp, bal))
+}
+
+/// The frame description (version 2) of a gov5 block body, given that
+/// body's bytes and its frame layout: (frame id, how many of the frame's
+/// transactions the block holds) in block order.
+pub fn encode_compact_frame_body(
+    gov5_body: &[u8],
+    frames: &[(B256, u32)],
+    profile: N42HeaderProfile,
+) -> Result<Vec<u8>, BlockBodyError> {
+    if frames.iter().any(|(_, count)| *count == 0) {
+        return Err(invalid());
+    }
+    let (header_rlp, verifiers_rlp, rewards_rlp, bal) = body_parts(gov5_body, profile)?;
+    let mut w = Writer(Vec::with_capacity(
+        64 + header_rlp.len() + frames.len() * 36 + verifiers_rlp.len() + rewards_rlp.len(),
+    ));
+    w.0.extend_from_slice(&MAGIC);
+    w.u8(VERSION_FRAMES);
+    w.bytes(header_rlp);
+    w.u32(frames.len() as u32);
+    let mut total = 0u32;
+    for (id, count) in frames {
+        w.0.extend_from_slice(id.as_slice());
+        w.u32(*count);
+        total = total.checked_add(*count).ok_or_else(invalid)?;
+    }
+    w.u32(total);
+    write_tail(&mut w, verifiers_rlp, rewards_rlp, bal);
+    Ok(w.0)
+}
+
+/// Whether a compact body is a frame description (version 2).
+pub fn is_compact_frame_body(bytes: &[u8]) -> bool {
+    is_compact_body(bytes) && bytes.get(MAGIC.len()) == Some(&VERSION_FRAMES)
+}
+
+/// The header, verifiers, rewards and access list of a gov5 body, walked.
+#[allow(clippy::type_complexity)]
+fn body_parts(
+    gov5_body: &[u8],
+    profile: N42HeaderProfile,
+) -> Result<(&[u8], &[u8], &[u8], Option<&[u8]>), BlockBodyError> {
     let mut payload = gov5_body;
     let outer = RlpHeader::decode(&mut payload).map_err(|_| invalid())?;
     if !outer.list || outer.payload_length != payload.len() {
@@ -181,7 +312,19 @@ pub fn encode_compact_body(
     if !payload.is_empty() {
         return Err(invalid());
     }
-    Ok(write_compact(header_rlp, hashes, verifiers_rlp, rewards_rlp, bal))
+    Ok((header_rlp, verifiers_rlp, rewards_rlp, bal))
+}
+
+fn write_tail(w: &mut Writer, verifiers_rlp: &[u8], rewards_rlp: &[u8], bal: Option<&[u8]>) {
+    w.bytes(verifiers_rlp);
+    w.bytes(rewards_rlp);
+    match bal {
+        Some(bal) => {
+            w.u8(1);
+            w.bytes(bal);
+        }
+        None => w.u8(0),
+    }
 }
 
 /// The bytes of a compact body, from parts already in hand.
@@ -202,15 +345,7 @@ pub fn write_compact(
     for hash in hashes {
         w.0.extend_from_slice(hash.as_slice());
     }
-    w.bytes(verifiers_rlp);
-    w.bytes(rewards_rlp);
-    match bal {
-        Some(bal) => {
-            w.u8(1);
-            w.bytes(bal);
-        }
-        None => w.u8(0),
-    }
+    write_tail(&mut w, verifiers_rlp, rewards_rlp, bal);
     w.0
 }
 
@@ -254,12 +389,9 @@ pub fn merge_fill(
     fill: &[(usize, alloy_primitives::Bytes)],
 ) -> Result<Vec<u8>, BlockBodyError> {
     let mut r = Reader(frame);
-    if r.take(MAGIC.len())? != MAGIC || r.u8()? != VERSION {
-        return Err(invalid());
-    }
+    let version = r.start()?;
     r.bytes()?;
-    let count = r.u32()? as usize;
-    r.take(count.checked_mul(32).ok_or_else(invalid)?)?;
+    let (_, _, count) = r.listing(version)?;
     r.bytes()?;
     r.bytes()?;
     if r.u8()? == 1 {
@@ -318,9 +450,7 @@ pub fn decode_compact_body_header(
     profile: N42HeaderProfile,
 ) -> Result<(B256, Header), BlockBodyError> {
     let mut r = Reader(encoded);
-    if r.take(MAGIC.len())? != MAGIC || r.u8()? != VERSION {
-        return Err(invalid());
-    }
+    r.start()?;
     let header_rlp = r.bytes()?;
     let mut cursor = header_rlp;
     let header = Header::decode(&mut cursor).map_err(|_| invalid())?;
@@ -343,9 +473,7 @@ pub fn decode_compact_body(
     profile: N42HeaderProfile,
 ) -> Result<CompactBlockBody<'_>, BlockBodyError> {
     let mut r = Reader(encoded);
-    if r.take(MAGIC.len())? != MAGIC || r.u8()? != VERSION {
-        return Err(invalid());
-    }
+    let version = r.start()?;
     let header_rlp = r.bytes()?;
     let mut cursor = header_rlp;
     let header = Header::decode(&mut cursor).map_err(|_| invalid())?;
@@ -353,11 +481,7 @@ pub fn decode_compact_body(
         return Err(invalid());
     }
     validate_body_header(&header, profile)?;
-    let count = r.u32()? as usize;
-    let raw = r.take(count.checked_mul(32).ok_or_else(invalid)?)?;
-    // Exactly `count` whole hashes: the take above sized the slice, so the
-    // remainder `as_chunks` hands back is empty.
-    let hashes: Vec<B256> = raw.as_chunks::<32>().0.iter().copied().map(B256::from).collect();
+    let (hashes, frames, count) = r.listing(version)?;
     let verifiers_rlp = r.bytes()?;
     let rewards_rlp = r.bytes()?;
     let bal = if r.u8()? == 1 { Some(r.bytes()?) } else { None };
@@ -407,6 +531,7 @@ pub fn decode_compact_body(
         header,
         header_rlp,
         hashes,
+        frames,
         rewards,
         withdrawals,
         bal,
@@ -497,6 +622,43 @@ mod tests {
         assert_eq!(rebuild_gov5_body(&decoded, &txs), body);
     }
 
+    /// The frame description: frames and their counts round-trip, the
+    /// block's transaction count is their sum, a fill indexes block
+    /// positions, and a description with an empty frame or a count that is
+    /// not the sum is refused.
+    #[test]
+    fn a_frame_description_round_trips_and_a_malformed_one_is_refused() {
+        let txs = transactions();
+        let body = encode_block_rlp_raw(&header(), &txs, &[], None);
+        let frames = [(B256::repeat_byte(1), 2u32), (B256::repeat_byte(2), 1u32)];
+        let compact = encode_compact_frame_body(&body, &frames, N42HeaderProfile::Ethereum).expect("encodes");
+        assert!(is_compact_body(&compact) && is_compact_frame_body(&compact));
+        let decoded = decode_compact_body(&compact, N42HeaderProfile::Ethereum).expect("decodes");
+        assert_eq!(decoded.frames.as_deref(), Some(&frames[..]));
+        assert!(decoded.hashes.is_empty());
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded.header, header());
+        assert_eq!(rebuild_gov5_body(&decoded, &txs), body);
+        let (hash, _) = decode_compact_body_header(&compact, N42HeaderProfile::Ethereum).expect("decodes");
+        assert_eq!(hash, header().hash_slow());
+        // A fill by block position, merged and read back.
+        let filled = merge_fill(&compact, &[(2, txs[2].clone())]).expect("merges");
+        let decoded = decode_compact_body(&filled, N42HeaderProfile::Ethereum).expect("decodes");
+        assert_eq!(decoded.fill, vec![(2usize, &txs[2][..])]);
+        assert!(merge_fill(&compact, &[(3, txs[2].clone())]).is_err(), "past the block's count");
+        // An empty frame, and a total that is not the counts' sum.
+        assert!(encode_compact_frame_body(&body, &[(B256::ZERO, 0)], N42HeaderProfile::Ethereum).is_err());
+        let total_at = MAGIC.len() + 1 + 4 + decoded.header_rlp.len() + 4 + 2 * 36;
+        let mut wrong_total = compact.clone();
+        wrong_total[total_at] = 4;
+        assert!(decode_compact_body(&wrong_total, N42HeaderProfile::Ethereum).is_err());
+        // Version 1 is untouched by any of this.
+        let hashes: Vec<B256> = txs.iter().map(keccak256).collect();
+        let v1 = encode_compact_body(&body, &hashes, N42HeaderProfile::Ethereum).expect("encodes");
+        assert!(!is_compact_frame_body(&v1));
+        assert_eq!(v1[MAGIC.len()], VERSION);
+    }
+
     #[test]
     fn a_truncated_padded_or_mistagged_compact_body_is_refused() {
         let txs = transactions();
@@ -508,7 +670,7 @@ mod tests {
         padded.push(0);
         assert!(decode_compact_body(&padded, N42HeaderProfile::Ethereum).is_err());
         let mut wrong_version = frame.clone();
-        wrong_version[MAGIC.len()] = VERSION + 1;
+        wrong_version[MAGIC.len()] = VERSION_FRAMES + 1;
         assert!(decode_compact_body(&wrong_version, N42HeaderProfile::Ethereum).is_err());
         assert!(decode_compact_body_header(&wrong_version, N42HeaderProfile::Ethereum).is_err());
         let mut wrong_magic = frame;

@@ -168,6 +168,7 @@ impl MockExecutionLayer {
         let hash = block.header.hash_slow();
         BuiltBlock {
             tx_hashes: Vec::new(),
+            frame_layout: Vec::new(),
             hash,
             number,
             timestamp: block.header.timestamp,

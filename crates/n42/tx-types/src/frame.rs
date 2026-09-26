@@ -79,6 +79,15 @@ pub fn frame_tree_root_of(tx_hashes: &[B256], layout: &[usize]) -> Option<B256> 
     Some(frame_tree_root(&roots))
 }
 
+/// `N42_FRAME_BLOCKS=1`, read once: this node builds, describes and checks
+/// frame-aligned blocks (phase B of step 1). Meaningful only on a chain whose
+/// genesis sets `frameBlocks`; the execution layer refuses to start with it
+/// on any other.
+pub fn frame_blocks_requested() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_FRAME_BLOCKS").is_ok_and(|v| v == "1"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

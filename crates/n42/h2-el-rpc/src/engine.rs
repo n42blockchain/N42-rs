@@ -159,21 +159,41 @@ enum BuildFrame {
 /// Read only when this side asked, because the answer's shape follows the
 /// request and the connection is reused: reading a tail that was not sent
 /// would take the next answer's first bytes for it.
+/// The hash tail of a build answer: `u8 1 | u32 n | n * 32 hashes`, or,
+/// from an execution layer building frame blocks (`N42_FRAME_BLOCKS=1`),
+/// `u8 2 | u32 n | n * 32 hashes | u32 frames | frames * (32 id | u32 count)`
+/// -- the same hashes and the block's frame layout after them.
 async fn read_hash_tail(
     stream: &mut tokio::net::TcpStream,
     asked: bool,
-) -> std::io::Result<Vec<B256>> {
+) -> std::io::Result<(Vec<B256>, Vec<(B256, u32)>)> {
     use tokio::io::AsyncReadExt;
     if !asked {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
-    if stream.read_u8().await? != 1 {
-        return Ok(Vec::new());
+    let marker = stream.read_u8().await?;
+    if marker != 1 && marker != 2 {
+        return Ok((Vec::new(), Vec::new()));
     }
     let n = stream.read_u32_le().await? as usize;
     let mut raw = vec![0u8; n * 32];
     stream.read_exact(&mut raw).await?;
-    Ok(raw.as_chunks::<32>().0.iter().copied().map(B256::from).collect())
+    let hashes = raw.as_chunks::<32>().0.iter().copied().map(B256::from).collect();
+    let mut frames = Vec::new();
+    if marker == 2 {
+        let n = stream.read_u32_le().await? as usize;
+        let mut raw = vec![0u8; n * 36];
+        stream.read_exact(&mut raw).await?;
+        frames = raw
+            .chunks_exact(36)
+            .map(|entry| {
+                let mut count = [0u8; 4];
+                count.copy_from_slice(&entry[32..]);
+                (B256::from_slice(&entry[..32]), u32::from_le_bytes(count))
+            })
+            .collect();
+    }
+    Ok((hashes, frames))
 }
 
 /// Reads one frame of a build-on-own answer.
@@ -225,10 +245,11 @@ async fn read_build_frame(
             } else {
                 None
             };
-            let tx_hashes = read_hash_tail(stream, hashed).await?;
+            let (tx_hashes, frame_layout) = read_hash_tail(stream, hashed).await?;
             let mut built = built_block_from_parts(block.into(), requests, bal, beacon_root);
             if let Ok(built) = built.as_mut() {
                 built.tx_hashes = tx_hashes;
+                built.frame_layout = frame_layout;
             }
             Ok(BuildFrame::Built(Box::new(built)))
         }
@@ -884,6 +905,7 @@ pub fn built_block_from_envelope(
         blob_tx_hashes,
         header: None,
         tx_hashes: Vec::new(),
+        frame_layout: Vec::new(),
     })
 }
 
@@ -1774,11 +1796,12 @@ impl<T: JsonRpcTransport> EngineApiClient<T> {
                     } else {
                         None
                     };
-                    let tx_hashes = read_hash_tail(stream, hashed).await?;
+                    let (tx_hashes, frame_layout) = read_hash_tail(stream, hashed).await?;
                     let received = started.elapsed();
                     let mut built = built_block_from_parts(block.into(), requests, bal, beacon_root);
                     if let Ok(built) = built.as_mut() {
                         built.tx_hashes = tx_hashes;
+                        built.frame_layout = frame_layout;
                     }
                     if len > 1_000_000 {
                         debug!(
@@ -1978,6 +2001,7 @@ pub fn built_block_from_parts(
         blob_tx_hashes: Vec::new(),
         header: Some(header),
         tx_hashes: Vec::new(),
+        frame_layout: Vec::new(),
     })
 }
 

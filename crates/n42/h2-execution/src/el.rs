@@ -100,6 +100,11 @@ pub struct BuiltBlock {
     /// would be a keccak over the block's 26 MB on the proposal path, which
     /// is most of what the compact body saves.
     pub tx_hashes: Vec<B256>,
+    /// The block's frame layout when the execution layer built it from whole
+    /// frames (`N42_FRAME_BLOCKS=1`): (frame id, how many of the frame's
+    /// transactions the block holds) in block order. What the frame
+    /// description names. Empty otherwise.
+    pub frame_layout: Vec<(B256, u32)>,
 }
 
 /// What a caller passes with a build request when it will want the block

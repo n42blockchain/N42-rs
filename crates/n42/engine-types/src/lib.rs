@@ -36,6 +36,7 @@ mod consensus;
 pub mod engine_validator;
 pub mod claimed_build;
 pub mod fast_transfer;
+pub mod frame_blocks;
 pub mod parallel_transfer;
 pub mod hotstuff_consensus;
 mod network;

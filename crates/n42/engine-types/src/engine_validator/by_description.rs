@@ -133,6 +133,10 @@ pub struct DescribedBlock {
     pub filled: usize,
     /// The whole call.
     pub total_us: u64,
+    /// A frame description's frames (0 for a body that lists hashes).
+    pub frames: usize,
+    /// Of those, how many the first look-up did not find whole.
+    pub frames_missing: usize,
 }
 
 /// The owned block a [`DescribedBlock`] becomes, with what that cost.
@@ -197,6 +201,14 @@ where
         let filled_at = std::time::Instant::now();
         let supplied = super::supplied_from_fill(&body)?;
         let fill_us = filled_at.elapsed().as_micros() as u64;
+        if body.frames.is_some() {
+            return self.describe_frames(body, queue, miss_wait, started, supplied, fill_us);
+        }
+        if crate::frame_blocks::active() {
+            return Err(other(
+                "a frame chain's block described by hashes: not frame-aligned (N42_FRAME_BLOCKS=1)".to_owned(),
+            ));
+        }
         let covered: std::collections::HashSet<usize> = supplied.iter().map(|(index, _, _)| *index).collect();
 
         // The look-up and the encoding in one pass, a chunk per worker. A
@@ -356,6 +368,192 @@ where
             fill_us,
             filled: body.fill.len(),
             total_us: started.elapsed().as_micros() as u64,
+            frames: 0,
+            frames_missing: 0,
+        })
+    }
+
+    /// [`Self::describe_compact_body`] for a frame description
+    /// (`N42_FRAME_BLOCKS=1`): the block assembled by reference from the
+    /// frames this node's queue indexed, one look-up per frame
+    /// ([`n42_tx_queue::TxQueue::take_frames`]), the last one cut to the
+    /// prefix the description names; its transactions root is the frame tree
+    /// over that layout (~326 leaves for a full block, not a 163,000-leaf
+    /// trie), compared with the header's.
+    ///
+    /// A frame this node does not hold whole is a miss: its positions --
+    /// the description carries every frame's count, so they are known --
+    /// go back to the caller as [`CompactBodyError::Missing`] after
+    /// `miss_wait`, exactly as the hash road's, and the proposer's fill
+    /// supplies them. A supplied transaction is not checked against a hash
+    /// here (a missing frame's hashes are not known); the root over what
+    /// was assembled binds it to the header all the same.
+    ///
+    /// The encoding the payload's list needs is still made, one pass on the
+    /// worker pool; what this road does not do is the 163,000 look-ups by
+    /// hash and the trie.
+    fn describe_frames(
+        &self,
+        body: n42_h2_consensus::CompactBlockBody<'_>,
+        queue: &n42_tx_queue::TxQueue<crate::N42PooledTransaction>,
+        miss_wait: std::time::Duration,
+        started: std::time::Instant,
+        supplied: Vec<(usize, Address, TransactionSigned)>,
+        fill_us: u64,
+    ) -> Result<DescribedBlock, CompactBodyError> {
+        use rayon::prelude::*;
+        let other = |message: String| CompactBodyError::Invalid(NewPayloadError::Other(message.into()));
+        if !crate::frame_blocks::active() {
+            return Err(other("a frame description on a node without N42_FRAME_BLOCKS=1".to_owned()));
+        }
+        let frames: Vec<(B256, usize)> =
+            body.frames.as_deref().unwrap_or_default().iter().map(|(id, count)| (*id, *count as usize)).collect();
+        let total = body.len();
+        let mut starts = Vec::with_capacity(frames.len());
+        let mut at = 0usize;
+        for (_, count) in &frames {
+            starts.push(at);
+            at += count;
+        }
+        let last = frames.len().saturating_sub(1);
+        let covered: std::collections::HashSet<usize> = supplied.iter().map(|(index, _, _)| *index).collect();
+
+        let describe_at = std::time::Instant::now();
+        let mut held: Vec<Found> = Vec::with_capacity(total);
+        held.resize_with(total, || None);
+        let mut pending: Vec<usize> = (0..frames.len()).collect();
+        let mut frames_missing: Option<usize> = None;
+        let mut first_pass = std::time::Duration::ZERO;
+        let waited_at = loop {
+            let ids: Vec<B256> = pending.iter().map(|&k| frames[k].0).collect();
+            let found = queue.take_frames(&ids);
+            let mut still = Vec::new();
+            for (k, found) in pending.iter().copied().zip(found) {
+                let (id, count) = frames[k];
+                match found {
+                    // Whole, or the last frame's prefix.
+                    Some(txs) if txs.len() == count || (k == last && txs.len() > count) => {
+                        for (offset, queued) in txs.into_iter().take(count).enumerate() {
+                            let sender = queued.transaction.transaction.signer();
+                            held[starts[k] + offset] = Some((queued, sender));
+                        }
+                    }
+                    Some(txs) => {
+                        return Err(other(format!(
+                            "frame {id} holds {} transactions, the description names {count} of it",
+                            txs.len()
+                        )));
+                    }
+                    None => still.push(k),
+                }
+            }
+            pending = still;
+            if frames_missing.is_none() {
+                frames_missing = Some(pending.len());
+                first_pass = describe_at.elapsed();
+            }
+            // Frames whose every position the fill covers are not missing.
+            pending.retain(|&k| (starts[k]..starts[k] + frames[k].1).any(|index| !covered.contains(&index)));
+            if pending.is_empty() || describe_at.elapsed() >= miss_wait + first_pass {
+                break std::time::Instant::now();
+            }
+            queue.drain_now();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        let frames_missing = frames_missing.unwrap_or(0);
+        let miss_wait_us = if frames_missing == 0 {
+            0
+        } else {
+            waited_at.duration_since(describe_at).saturating_sub(first_pass).as_micros() as u64
+        };
+        if !pending.is_empty() {
+            let indices: Vec<usize> = pending
+                .iter()
+                .flat_map(|&k| starts[k]..starts[k] + frames[k].1)
+                .filter(|index| !covered.contains(index))
+                .collect();
+            return Err(CompactBodyError::Missing {
+                sample: pending.iter().take(4).map(|&k| frames[k].0).collect(),
+                total,
+                indices,
+                waited: waited_at.duration_since(describe_at),
+            });
+        }
+        let misses = (0..total).filter(|index| held[*index].is_none() && !covered.contains(index)).count();
+
+        // Every position held: the list in block order, the senders beside it.
+        let second_at = std::time::Instant::now();
+        let mut supplied_at: std::collections::HashMap<usize, (Address, TransactionSigned)> =
+            supplied.into_iter().map(|(index, sender, tx)| (index, (sender, tx))).collect();
+        let mut transactions = Vec::with_capacity(total);
+        let mut senders = Vec::with_capacity(total);
+        for (index, slot) in held.into_iter().enumerate() {
+            let supplied = if supplied_at.is_empty() { None } else { supplied_at.remove(&index) };
+            match (slot, supplied) {
+                (_, Some((sender, tx))) => {
+                    senders.push(sender);
+                    transactions.push(DescribedTx::Supplied(Box::new(tx)));
+                }
+                (Some((queued, sender)), None) => {
+                    senders.push(sender);
+                    transactions.push(DescribedTx::Queued(queued));
+                }
+                (None, None) => {
+                    return Err(CompactBodyError::Missing {
+                        indices: vec![index],
+                        total,
+                        sample: Vec::new(),
+                        waited: waited_at.elapsed(),
+                    });
+                }
+            }
+        }
+        // The payload's list: every chunk encoded, on the worker pool.
+        let encoded: Vec<EncodedChunk> = transactions
+            .par_chunks(CHUNK)
+            .map(|chunk| {
+                let mut fresh = EncodedChunk::with_capacity(chunk.len());
+                for tx in chunk {
+                    fresh.push(tx.transaction());
+                }
+                fresh
+            })
+            .collect();
+
+        // What binds the list to the header: the frame tree.
+        let root_at = std::time::Instant::now();
+        let hashes: Vec<B256> = {
+            use alloy_consensus::transaction::TxHashRef as _;
+            transactions.par_iter().map(|tx| *tx.transaction().tx_hash()).collect()
+        };
+        let counts: Vec<usize> = frames.iter().map(|(_, count)| *count).collect();
+        let transactions_root = crate::frame_blocks::root_of_hashes(&hashes, &counts)
+            .ok_or_else(|| other("the frame layout does not cover the assembled body".to_owned()))?;
+        let root_us = root_at.elapsed().as_micros() as u64;
+        if transactions_root != body.header.transactions_root {
+            return Err(CompactBodyError::Invalid(
+                PayloadError::BlockHash { execution: transactions_root, consensus: body.header.transactions_root }
+                    .into(),
+            ));
+        }
+        let describe_us = (first_pass + second_at.elapsed()).as_micros() as u64;
+        Ok(DescribedBlock {
+            hash: body.block_hash,
+            header: body.header,
+            transactions: Arc::new(transactions),
+            senders,
+            withdrawals: body.withdrawals,
+            bal: body.bal.map(Bytes::copy_from_slice),
+            encoded,
+            describe_us,
+            root_us,
+            miss_wait_us,
+            misses,
+            fill_us,
+            filled: body.fill.len(),
+            total_us: started.elapsed().as_micros() as u64,
+            frames: frames.len(),
+            frames_missing,
         })
     }
 }

@@ -33,7 +33,7 @@ pub use alt_sig::{
     verify_batch, AltSigError, AltSigTx, TxAltSig, ALG_ED25519, ALT_SIG_TX_TYPE_ID,
     ED25519_PUBKEY_LEN, ED25519_SIGNATURE_LEN,
 };
-pub use frame::{binary_merkle_root, frame_root, frame_tree_root, frame_tree_root_of};
+pub use frame::{binary_merkle_root, frame_blocks_requested, frame_root, frame_tree_root, frame_tree_root_of};
 pub use envelope::{N42PooledTxEnvelope, N42PooledTxType, N42TxEnvelope, N42TxType};
 pub use primitives::{Block, BlockBody, N42Primitives, Receipt};
 pub use rpc::{AltSigRpcReceipt, N42RpcReceipt};

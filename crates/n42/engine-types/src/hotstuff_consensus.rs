@@ -339,6 +339,15 @@ where
             // A root the caller has already computed and matched against the
             // sealed hash (the payload's conversion did): not computed twice.
             Some(root) => root,
+            // `N42_FRAME_BLOCKS=1`: the frame tree over the layout this
+            // node's frame index finds; a body that is not a run of
+            // indexed frames is not valid on a frame chain.
+            None if crate::frame_blocks::active() => {
+                use alloy_consensus::transaction::TxHashRef as _;
+                let hashes: Vec<B256> = body.transactions.iter().map(|tx| *tx.tx_hash()).collect();
+                crate::frame_blocks::body_root(&hashes)
+                    .map_err(|err| ConsensusError::Other(format!("frame blocks: {err}")))?
+            }
             None => body.calculate_tx_root(),
         };
         if header.transactions_root != tx_root {

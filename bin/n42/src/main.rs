@@ -174,6 +174,16 @@ fn main() {
                 .launch_with_debug_capabilities()
                 .await?;
 
+            // `N42_FRAME_BLOCKS=1` (docs/BREAKTHROUGH_DESIGN.md step 1): whole
+            // frames in the builder, frame-tree roots, frame descriptions on
+            // the road. Refused outright on a chain whose genesis does not set
+            // `frameBlocks`: the node would build blocks no other node accepts.
+            if n42_engine_types::frame_blocks::init(reth_chainspec::qmdb::frame_blocks_enabled(node.chain_spec().genesis()))
+                .map_err(|err| eyre::eyre!(err))?
+            {
+                info!(target: "reth::cli", "frame blocks on: the builder pulls whole frames and roots are frame trees");
+            }
+
             // Get the stored consensus instance
             let consensus = consensus_holder
                 .lock()

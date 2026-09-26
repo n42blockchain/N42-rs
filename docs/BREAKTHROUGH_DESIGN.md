@@ -156,3 +156,14 @@ tracking; the genesis flag `frameBlocks` and the root rule: the frame-tree root 
 root otherwise) -- and **B** -- the builder pulls whole frames in arrival order, the description names frame ids
 and the last frame's prefix length, the road assembles by reference and checks the frame-tree root. The first leg
 (loop266) reads B and the road's `assemble_ms` / `root_ms` against loop265's control.
+
+### 10.1 First leg of step 1 (loop266): no block -- alignment must be per block
+
+With `N42_FRAME_BLOCKS=1` on every node no block was committed: the chain's first blocks (the funding
+transactions arrive by RPC and belong to no frame) are not frame-aligned, the builder described them by hashes,
+and the followers under the flag refused every hash description as "not frame-aligned" -- 3,438 refusals, the
+view timing out from view 1. The control leg ran normally (950,299; the ingest indexed 278,879 frames, 0
+unaligned). The rule was written as a chain property; it has to be a block property: an aligned body carries the
+frame-tree root and a version-2 description, any other body the MPT root and a version-1 description, both
+acceptable under the flag, and a follower with a whole body verifies a version-2 layout from the transactions'
+hashes without its own index. Being fixed (`step1/aligned-per-block`); loop267 repeats the legs.

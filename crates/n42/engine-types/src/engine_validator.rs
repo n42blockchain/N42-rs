@@ -2174,7 +2174,8 @@ mod tests {
             let (hash, _, payload) = frame_block(&body, mpt);
             let (root, frame) = crate::frame_blocks::root_for_body(Some(mpt), &hashes_of(&body), || mpt);
             assert_eq!((root, frame), (mpt, false));
-            let sealed = validator.convert_payload_to_block(payload).expect("the MPT root converts under the flag");
+            let sealed = <N42EngineValidator<ChainSpec> as PayloadValidator<EthEngineTypes>>::convert_payload_to_block(&validator, payload)
+                .expect("the MPT root converts under the flag");
             assert_eq!(sealed.hash(), hash);
         });
     }
@@ -2212,7 +2213,8 @@ mod tests {
                 crate::frame_blocks::root_for_body(Some(root), &hashes_of(&body), || B256::ZERO),
                 (root, true)
             );
-            let sealed = validator.convert_payload_to_block(payload).expect("converts with the frame root");
+            let sealed = <N42EngineValidator<ChainSpec> as PayloadValidator<EthEngineTypes>>::convert_payload_to_block(&validator, payload)
+                .expect("converts with the frame root");
             assert_eq!(sealed.hash(), hash);
         });
     }

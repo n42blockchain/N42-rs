@@ -243,3 +243,20 @@ supply attested at the edge by one gateway the nodes trust (design section 2's f
 assumption the 3-of-3 quorum already makes); the transactions are 0x50 transfers of the flood's shape. The
 protocol changes are two consensus rules (frame-aligned bodies with a frame-tree transactions root; attested
 frames admitted on the gateways' word) that gov5 would have to share to interoperate.
+
+### 10.6 The 1M window repeated (loop271): four legs at 1.037-1.059M, and the gate line is the next wall
+
+| leg | offer | pacing | win1 | win2 | occupancy | cycle | B | D | queue (median) | gate us/frame | reply us/frame | flood win1 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| AT1100a | 1.1M | 125 | **1,054,006** | 673,141 | 99.9% | 146 | 97 | 30 | 834,500 | 19,854 | 25,611 | 1,010k |
+| AT1100P100 | 1.1M | 100 | 1,037,700 | 733,313 | 100% | 155 | 122 | 3.8 | 834,500 | 21,900 | 26,765 | 1,003k |
+| AT1200P100 | 1.2M | 100 | **1,059,321** | 689,306 | 99.9% | 150 | 107.5 | 6.2 | 834,000 | 20,076 | 25,362 | 995k |
+| AT1100b | 1.1M | 125 | 1,036,935 | 792,859 | 99.8% | 148 | 95 | 27 | 836,000 | 23,153 | 29,060 | 977k |
+
+The window holds: with loop270's 1,063,999 and 1,048,588 that is six legs in a row between 1.037M and 1.064M
+(a 2.5% spread), every block full, the ingest at 1 us a transaction. Pacing 100 buys nothing because the cycle is
+no longer the leader's wait but B: 95-122 ms against 38-63 at 950k, with the followers' queue sitting at
+834-836k -- exactly the gate line of the 1,000,000-slot pool (9.4: the gate holds every frame 20-23 ms, the replies
+25-29 ms, the vote slips). The depth's old cost on the road is gone (the road is O(frames), 55-62 ms here), so the
+lever 9.5 closed is open again: a pool whose gate line the supply cannot reach. loop272: pool 2,000,000 at 1.1M,
+1.2M and 1.3M, pacing 100 and 125.

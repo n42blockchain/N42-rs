@@ -1330,7 +1330,11 @@ where
     let mut shard_claimed_here = 0u64;
     let mut shard_verified_here = 0u64;
     let mut recovered = Vec::with_capacity(pooled.len());
-    let mut alt: Vec<N42PooledTxEnvelope> = Vec::new();
+    // The 0x50 transactions for the batch below, each with whether it is in
+    // this node's shard: those never take a cache hit, because in shard mode
+    // the cache also holds claims (unverified senders) and a claim must not
+    // stand in for this node's own verification.
+    let mut alt: Vec<(N42PooledTxEnvelope, bool)> = Vec::new();
     // Counted per frame rather than per transaction: these are two lines on
     // one cache line that a dozen recovery threads would otherwise write to
     // half a million times a second between them.
@@ -1366,7 +1370,7 @@ where
             continue;
         }
         if tx.is_alt_sig() {
-            alt.push(tx);
+            alt.push((tx, verify_mine));
             continue;
         }
         let result = match cache {
@@ -1402,8 +1406,8 @@ where
     }
     let senders = AltSigSenderCache::global();
     let mut todo: Vec<N42PooledTxEnvelope> = Vec::with_capacity(alt.len());
-    for tx in alt {
-        match senders.get(tx.hash()) {
+    for (tx, mine) in alt {
+        match (!mine).then(|| senders.get(tx.hash())).flatten() {
             Some(sender) => {
                 // A hit is this node's own earlier verification of the same
                 // signature, so it counts as verified here.
@@ -1526,6 +1530,13 @@ mod shard_tests {
             .map(|tx| n42_tx_types::verify_batch(&[tx]).pop().expect("one verdict").expect("signed"))
             .collect();
         let mine: Vec<bool> = txs.iter().map(|tx| in_my_shard(tx.hash(), shard)).collect();
+        // The recovery returns claimed transactions first and the verified
+        // batch after them, so the output is matched by hash, not by index.
+        let expected_by_hash: std::collections::HashMap<alloy_primitives::B256, (Address, bool)> = txs
+            .iter()
+            .enumerate()
+            .map(|(at, tx)| (*tx.hash(), (if mine[at] { real[at] } else { bogus }, mine[at])))
+            .collect();
         let owned = mine.iter().filter(|m| **m).count() as u64;
         assert!(owned > 0 && owned < 48, "a spread across shards: {owned}");
         let pooled: Vec<N42PooledTxEnvelope> = txs.into_iter().map(N42PooledTxEnvelope::AltSig).collect();
@@ -1538,9 +1549,9 @@ mod shard_tests {
             Some(shard),
         );
         assert_eq!(out.len(), 48);
-        for (at, tx) in out.iter().enumerate() {
-            let expected = if mine[at] { real[at] } else { bogus };
-            assert_eq!(tx.sender(), expected, "transaction {at}, in shard: {}", mine[at]);
+        for tx in out.iter() {
+            let (expected, in_shard) = expected_by_hash[tx.hash()];
+            assert_eq!(tx.sender(), expected, "transaction {:?}, in shard: {in_shard}", tx.hash());
             assert_eq!(AltSigSenderCache::global().get(tx.hash()), Some(expected));
         }
         // Only this test runs the shard path, so the global counters move by

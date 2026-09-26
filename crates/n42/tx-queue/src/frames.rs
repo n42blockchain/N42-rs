@@ -271,6 +271,32 @@ impl FrameIndex {
         Some(out)
     }
 
+    /// The live frame ids in arrival order, without the whole-usable check
+    /// [`FrameIndex::in_arrival_order`] makes of every one of them: a build
+    /// checks only the frames it gets to.
+    pub(crate) fn ids_in_arrival_order(&self) -> Vec<B256> {
+        self.order.iter().filter(|id| self.frames.contains_key(*id)).copied().collect()
+    }
+
+    /// For each (id, length) of a layout over `body`, in order: `Some(id)`
+    /// when the index holds that frame with exactly the body's hashes at
+    /// those positions, whole -- so the id is the root over them -- `None`
+    /// otherwise (not indexed, a prefix, different hashes, or a layout that
+    /// runs past the body).
+    pub(crate) fn held_whole(&self, layout: &[(B256, usize)], body: &[B256]) -> Vec<Option<B256>> {
+        let mut at = 0usize;
+        layout
+            .iter()
+            .map(|(id, len)| {
+                let start = at;
+                at = at.saturating_add(*len);
+                let slice = body.get(start..at)?;
+                let frame = self.frames.get(id)?;
+                (frame.hashes.as_slice() == slice).then_some(*id)
+            })
+            .collect()
+    }
+
     /// A frame's transactions' hashes, in frame order.
     pub(crate) fn hashes_of(&self, id: &B256) -> Option<&[B256]> {
         self.frames.get(id).map(|entry| entry.hashes.as_slice())

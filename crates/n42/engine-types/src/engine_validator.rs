@@ -2022,7 +2022,11 @@ mod tests {
             assert_eq!(plan.skipped, 1, "frame B is behind a hole");
             assert_eq!(hashes_of(&body), hashes_of(&want), "the body is the frames end to end");
             let mpt = alloy_consensus::proofs::calculate_transaction_root(&body);
-            let root = crate::frame_blocks::seal_root(Some(&plan), &hashes_of(&body), &body, || mpt);
+            let sealed = crate::frame_blocks::seal_root_timed(Some(&plan), &hashes_of(&body), || mpt);
+            // A and C are whole: their leaves are the plan's ids; D is cut
+            // and its prefix is the one frame hashed.
+            assert_eq!((sealed.indexed, sealed.hashed), (2, 1));
+            let root = sealed.root;
             let tree = n42_tx_types::frame_tree_root(&[
                 n42_tx_types::frame_root(&hashes_of(&frames[0].1)),
                 n42_tx_types::frame_root(&hashes_of(&frames[2].1)),
@@ -2032,11 +2036,18 @@ mod tests {
             assert_eq!(root, crate::assembler::transactions_root_by_rule(true, Some(&[3, 2, 2]), &body));
             assert_ne!(root, alloy_consensus::proofs::calculate_transaction_root(&body));
             assert_eq!(crate::frame_blocks::layout_by_root(&root), Some(layout));
+            // A body that ends on a frame boundary reads every leaf.
+            let whole: Vec<TransactionSigned> = body[..5].to_vec();
+            let sealed = crate::frame_blocks::seal_root_timed(Some(&plan), &hashes_of(&whole), || B256::ZERO);
+            assert_eq!((sealed.indexed, sealed.hashed), (2, 0));
+            assert_eq!(sealed.root, crate::assembler::transactions_root_by_rule(true, Some(&[3, 2]), &whole));
+            // The hashed construction over the same layout agrees.
+            assert_eq!(crate::frame_blocks::root_of_hashes(&hashes_of(&body), &[3, 2, 2]), Some(root));
             // A body that is not a prefix of the plan (the execution skipped
             // a planned transaction) is not refused: it seals with the MPT root.
             let holed: Vec<TransactionSigned> = body.iter().skip(1).cloned().collect();
             let holed_mpt = alloy_consensus::proofs::calculate_transaction_root(&holed);
-            assert_eq!(crate::frame_blocks::seal_root(Some(&plan), &hashes_of(&holed), &holed, || holed_mpt), holed_mpt);
+            assert_eq!(crate::frame_blocks::seal_root(Some(&plan), &hashes_of(&holed), || holed_mpt), holed_mpt);
             assert!(crate::frame_blocks::layout_by_root(&holed_mpt).is_none());
         });
         // Off, the selection is the walk and leaves no plan.
@@ -2080,6 +2091,8 @@ mod tests {
                 .describe_compact_body(hash, N42HeaderProfile::Gov5H2, &compact, &queue, SHORT_WAIT)
                 .expect("assembled from the frames");
             assert_eq!((described.frames, described.frames_missing, described.len()), (3, 0, 7));
+            // A and C taken whole: their ids are the leaves; D is cut and hashed.
+            assert_eq!((described.frame_roots_indexed, described.frame_roots_hashed), (2, 1));
             assert_eq!(described.header.transactions_root, root);
             let made = described.into_block(&validator).expect("the block is made");
             assert_eq!(made.block.hash(), hash);
@@ -2170,7 +2183,7 @@ mod tests {
             let _ = crate::frame_blocks::select(&empty, B256::repeat_byte(1), 7 * 21_000);
             assert!(crate::frame_blocks::take_plan().is_none(), "no frame, no frame build");
 
-            assert_eq!(crate::frame_blocks::seal_root(None, &hashes_of(&body), &body, || mpt), mpt);
+            assert_eq!(crate::frame_blocks::seal_root(None, &hashes_of(&body), || mpt), mpt);
             let (hash, _, payload) = frame_block(&body, mpt);
             let (root, frame) = crate::frame_blocks::root_for_body(Some(mpt), &hashes_of(&body), || mpt);
             assert_eq!((root, frame), (mpt, false));
@@ -2205,6 +2218,8 @@ mod tests {
                 .describe_compact_body(hash, N42HeaderProfile::Gov5H2, &filled, &blind, SHORT_WAIT)
                 .expect("verified from the layout");
             assert_eq!((described.frames, described.len()), (3, 7));
+            // Every frame supplied: every leaf hashed from the body.
+            assert_eq!((described.frame_roots_indexed, described.frame_roots_hashed), (0, 3));
             let made = described.into_block(&validator).expect("the block is made");
             assert_eq!(made.block.hash(), hash);
             // The whole-body check and the engine's conversion: the layout

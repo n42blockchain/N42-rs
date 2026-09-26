@@ -1576,6 +1576,18 @@ impl<T: PoolTransaction> TxQueue<T> {
         inner.frames.layout_of(hashes)
     }
 
+    /// For each (frame id, length) of `layout` over the body `hashes`:
+    /// the id when this node's index holds that frame whole with exactly
+    /// those hashes at those positions (its id is then the root over them,
+    /// computed at ingest), `None` otherwise. One map lookup and one
+    /// comparison per frame; what a whole-body check reads instead of
+    /// rehashing the frames.
+    pub fn frames_held(&self, layout: &[(B256, usize)], hashes: &[B256]) -> Vec<Option<B256>> {
+        let mut inner = self.inner.lock();
+        self.drain_inbox(&mut inner);
+        inner.frames.held_whole(layout, hashes)
+    }
+
     /// What every build does first, under the lanes' lock: the previous
     /// build's take given back, this build's taken list opened, the parked
     /// lanes whose park ended offered again.
@@ -1633,15 +1645,17 @@ impl<T: PoolTransaction> Inner<T> {
         let mut out = Vec::new();
         let mut plan = FramePlan::default();
         let mut gas_left = gas_limit;
-        for frame in self.frames.in_arrival_order(&self.lanes) {
+        // The ids only: the per-position check below is at least as strict
+        // as the index's whole-usable test (each position at its sender's
+        // lane head, unparked, holding the frame's hash), so the frames past
+        // the block's gas are never examined. Computing whole-usable for
+        // every indexed frame first cost ~50 ms a build at a 500k queue
+        // (loop267, `start_best_ms`).
+        for id in self.frames.ids_in_arrival_order() {
             if gas_left == 0 {
                 break;
             }
-            if !frame.whole_usable {
-                plan.skipped += 1;
-                continue;
-            }
-            let Some(members) = self.frames.members_of(&frame.id) else {
+            let Some(members) = self.frames.members_of(&id) else {
                 plan.skipped += 1;
                 continue;
             };
@@ -1703,7 +1717,7 @@ impl<T: PoolTransaction> Inner<T> {
             if taken == 0 {
                 break;
             }
-            plan.frames.push(PlannedFrame { id: frame.id, len: members.len(), taken });
+            plan.frames.push(PlannedFrame { id, len: members.len(), taken });
             gas_left = gas_left.saturating_sub(gas);
             if taken < members.len() {
                 break;
@@ -3587,6 +3601,18 @@ mod tests {
         // The index finds the layout of a body made of its frames.
         assert_eq!(queue.frame_layout_of(&want), Some(vec![(B256::repeat_byte(0xd1), 3), (B256::repeat_byte(0xd3), 2), (B256::repeat_byte(0xd4), 2)]));
         assert_eq!(queue.frame_layout_of(&want[1..]), None);
+        // What a whole-body check reads instead of rehashing: the ids of the
+        // frames held whole at exactly those positions; the cut last frame,
+        // a frame with other hashes and a layout past the body are not.
+        let layout = [(B256::repeat_byte(0xd1), 3), (B256::repeat_byte(0xd3), 2), (B256::repeat_byte(0xd4), 2)];
+        assert_eq!(
+            queue.frames_held(&layout, &want),
+            vec![Some(B256::repeat_byte(0xd1)), Some(B256::repeat_byte(0xd3)), None]
+        );
+        let mut swapped = want.clone();
+        swapped.swap(3, 4);
+        assert_eq!(queue.frames_held(&layout, &swapped)[1], None);
+        assert_eq!(queue.frames_held(&layout, &want[..4]), vec![Some(B256::repeat_byte(0xd1)), None, None]);
     }
 
     #[test]

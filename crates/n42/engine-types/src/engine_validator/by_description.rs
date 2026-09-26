@@ -137,6 +137,11 @@ pub struct DescribedBlock {
     pub frames: usize,
     /// Of those, how many the first look-up did not find whole.
     pub frames_missing: usize,
+    /// Of the frame tree's leaves, how many were the frame's id from this
+    /// node's index (taken whole, computed at ingest).
+    pub frame_roots_indexed: usize,
+    /// And how many were hashed here: a filled frame, the cut last frame.
+    pub frame_roots_hashed: usize,
 }
 
 /// The owned block a [`DescribedBlock`] becomes, with what that cost.
@@ -368,6 +373,8 @@ where
             total_us: started.elapsed().as_micros() as u64,
             frames: 0,
             frames_missing: 0,
+            frame_roots_indexed: 0,
+            frame_roots_hashed: 0,
         })
     }
 
@@ -421,6 +428,10 @@ where
         held.resize_with(total, || None);
         let mut pending: Vec<usize> = (0..frames.len()).collect();
         let mut frames_missing: Option<usize> = None;
+        // Frame k's root when this node took it whole out of its index: the
+        // id the ingest computed over exactly the hashes `take_frames`
+        // fetched by, so the frame tree reads it instead of rehashing.
+        let mut known: Vec<Option<B256>> = vec![None; frames.len()];
         let mut first_pass = std::time::Duration::ZERO;
         let waited_at = loop {
             let ids: Vec<B256> = pending.iter().map(|&k| frames[k].0).collect();
@@ -431,6 +442,9 @@ where
                 match found {
                     // Whole, or the last frame's prefix.
                     Some(txs) if txs.len() == count || (k == last && txs.len() > count) => {
+                        if txs.len() == count {
+                            known[k] = Some(id);
+                        }
                         for (offset, queued) in txs.into_iter().take(count).enumerate() {
                             let sender = queued.transaction.transaction.signer();
                             held[starts[k] + offset] = Some((queued, sender));
@@ -520,13 +534,24 @@ where
 
         // What binds the list to the header: the frame tree.
         let root_at = std::time::Instant::now();
-        let hashes: Vec<B256> = {
-            use alloy_consensus::transaction::TxHashRef as _;
-            transactions.par_iter().map(|tx| *tx.transaction().tx_hash()).collect()
-        };
+        // A frame any of whose positions the fill supplied is hashed: its
+        // transactions are not (all) the indexed ones.
+        if !covered.is_empty() {
+            for (k, leaf) in known.iter_mut().enumerate() {
+                if leaf.is_some() && (starts[k]..starts[k] + frames[k].1).any(|index| covered.contains(&index)) {
+                    *leaf = None;
+                }
+            }
+        }
         let counts: Vec<usize> = frames.iter().map(|(_, count)| *count).collect();
-        let transactions_root = crate::frame_blocks::root_of_hashes(&hashes, &counts)
-            .ok_or_else(|| other("the frame layout does not cover the assembled body".to_owned()))?;
+        let tree = {
+            use alloy_consensus::transaction::TxHashRef as _;
+            crate::frame_blocks::frame_tree_root_known(&counts, &known, transactions.len(), |index| {
+                *transactions[index].transaction().tx_hash()
+            })
+        }
+        .ok_or_else(|| other("the frame layout does not cover the assembled body".to_owned()))?;
+        let transactions_root = tree.root;
         let root_us = root_at.elapsed().as_micros() as u64;
         if transactions_root != body.header.transactions_root {
             return Err(CompactBodyError::Invalid(
@@ -556,6 +581,8 @@ where
             total_us: started.elapsed().as_micros() as u64,
             frames: frames.len(),
             frames_missing,
+            frame_roots_indexed: tree.indexed,
+            frame_roots_hashed: tree.hashed,
         })
     }
 }

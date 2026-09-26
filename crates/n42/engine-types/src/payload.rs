@@ -1367,6 +1367,13 @@ where
     let mut seal_header_ms = 0u64;
     let mut seal_block_ms = 0u64;
     let mut seal_remember_ms = 0u64;
+    // Of `tx_root_ms` under `N42_FRAME_BLOCKS=1`: the body's frame layout
+    // found (the plan's prefix check, or the index's per-frame lookups) and
+    // the frame tree over it; its leaves read from the plan's ids or hashed.
+    let mut seal_layout_ms = 0u64;
+    let mut seal_root_ms = 0u64;
+    let mut seal_frames_indexed = 0usize;
+    let mut seal_frames_hashed = 0usize;
     let mut seal_hook_ms = 0u64;
     // `N42_SEAL_AT_EXEC=1`: the block sealed and proposed at the parallel
     // step's end -- the payload, the block, its hash and number, and the seal's
@@ -1398,9 +1405,14 @@ where
                 // index), the MPT root for any other body.
                 use alloy_consensus::transaction::TxHashRef as _;
                 let hashes: Vec<B256> = transactions.iter().map(|tx| *tx.tx_hash()).collect();
-                crate::frame_blocks::seal_root(frame_plan.as_ref(), &hashes, &transactions, || {
+                let sealed = crate::frame_blocks::seal_root_timed(frame_plan.as_ref(), &hashes, || {
                     early_root.unwrap_or_else(|| crate::assembler::parallel_transaction_root(&transactions))
-                })
+                });
+                seal_layout_ms = sealed.layout_us / 1000;
+                seal_root_ms = sealed.root_us / 1000;
+                seal_frames_indexed = sealed.indexed;
+                seal_frames_hashed = sealed.hashed;
+                sealed.root
             } else {
                 match early_root {
                     Some(root) => root,
@@ -2513,6 +2525,10 @@ where
                     seal_block_ms,
                     seal_remember_ms,
                     seal_hook_ms,
+                    seal_layout_ms,
+                    seal_root_ms,
+                    seal_frames_indexed,
+                    seal_frames_hashed,
                     // `N42_STATE_AFTER_PULL=1` (plan v6 G3): the parent's state
                     // opened after the pull, prep and partition, and the time
                     // inside that open (0 with the flag off: the open is then
@@ -3017,7 +3033,7 @@ where
         use alloy_consensus::transaction::TxHashRef as _;
         let transactions = &block.body().transactions;
         let hashes: Vec<B256> = transactions.iter().map(|tx| *tx.tx_hash()).collect();
-        crate::frame_blocks::seal_root(frame_plan.as_ref(), &hashes, transactions, || block.header().transactions_root)
+        crate::frame_blocks::seal_root(frame_plan.as_ref(), &hashes, || block.header().transactions_root)
     } else {
         block.header().transactions_root
     };

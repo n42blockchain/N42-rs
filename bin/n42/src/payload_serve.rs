@@ -2022,7 +2022,8 @@ where
                 let made = described.maker(&payload).make(&validator).map_err(CompactRefusal::Refused)?;
                 let senders = std::mem::take(&mut described.senders);
                 let make_us = make_at.elapsed().as_micros() as u64;
-                let (frames, frames_missing) = (described.frames, described.frames_missing);
+                let (frames, frames_missing) =
+                    (described.frames, (described.frames_missing, described.frame_roots_indexed, described.frame_roots_hashed));
                 let (describe_us, root_us, miss_wait_us, misses, fill_us, filled, described_us) = (
                     described.describe_us,
                     described.root_us,
@@ -2121,7 +2122,7 @@ where
             let (assembled, described) = assembled;
             let (copied, payload_list, frames, frames_missing) = match described {
                 Some((copy_us, list, frames, frames_missing)) => (Some(copy_us), Some(list), frames, frames_missing),
-                None => (None, None, 0, 0),
+                None => (None, None, 0, (0, 0, 0)),
             };
             let n42_engine_types::engine_validator::AssembledBlock {
                 block: sealed,
@@ -2174,7 +2175,9 @@ where
                 fill_us,
                 filled: filled as u64,
                 frames: frames as u64,
-                frames_missing: frames_missing as u64,
+                frames_missing: frames_missing.0 as u64,
+                frame_roots_indexed: frames_missing.1 as u64,
+                frame_roots_hashed: frames_missing.2 as u64,
                 dispatch_wait_us,
                 started: started_at,
             };
@@ -2277,6 +2280,8 @@ where
                 filled: 0,
                 frames: 0,
                 frames_missing: 0,
+                frame_roots_indexed: 0,
+                frame_roots_hashed: 0,
                 dispatch_wait_us,
                 started: started_at,
             };
@@ -2350,6 +2355,8 @@ where
                             filled: 0,
                             frames: 0,
                             frames_missing: 0,
+                            frame_roots_indexed: 0,
+                            frame_roots_hashed: 0,
                             dispatch_wait_us,
                             started: started_at,
                         },

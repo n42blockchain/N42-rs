@@ -1045,6 +1045,12 @@ pub struct VoteRoad {
     pub frames: u64,
     /// Of those, how many the first look-up did not find whole.
     pub frames_missing: u64,
+    /// Of the frame tree's leaves, how many were the frame's id read from
+    /// this node's index (computed at ingest), and how many were hashed
+    /// from the body (a filled frame, the cut last frame).
+    pub frame_roots_indexed: u64,
+    /// See `frame_roots_indexed`.
+    pub frame_roots_hashed: u64,
     /// Block by description only (`N42_BLOCK_BY_DESCRIPTION`): copying the
     /// block's transactions out of the queue into the owned block reth's
     /// execution takes, after the description was checked by reference.
@@ -1144,6 +1150,9 @@ fn log_vote_road(road: VoteRoad, number: u64, txs: usize, phases: RoadPhases) {
         frames = road.frames,
         frames_missing = road.frames_missing,
         frame_root_ms = if road.frames > 0 { road.root_us / 1000 } else { 0 },
+        frame_root_us = if road.frames > 0 { road.root_us } else { 0 },
+        frame_root_indexed = road.frame_roots_indexed,
+        frame_root_hashed = road.frame_roots_hashed,
         copy_ms = road.copy_us / 1000,
         header_ms = phases.header_us / 1000,
         senders_ms = phases.senders_us / 1000,

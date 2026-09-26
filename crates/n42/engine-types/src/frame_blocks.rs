@@ -178,6 +178,93 @@ pub fn root_of_block(block: &B256) -> Option<B256> {
         .map(|(_, root)| *root)
 }
 
+/// What [`seal_root_timed`] did, for the build's phase line.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SealRoot {
+    /// The root the seal gives the body.
+    pub root: B256,
+    /// Microseconds spent finding the layout (the plan's prefix check, or
+    /// the frame index's per-frame lookups).
+    pub layout_us: u64,
+    /// Microseconds spent on the root over the layout (or the MPT root).
+    pub root_us: u64,
+    /// Frames whose leaf was the id the ingest computed.
+    pub indexed: usize,
+    /// Frames whose leaf was hashed from the body (the cut last frame).
+    pub hashed: usize,
+}
+
+/// A frame tree root and how its leaves were found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameTreeRoot {
+    /// The root.
+    pub root: B256,
+    /// Leaves that were the frame's id as this node's index holds it -- the
+    /// root the ingest computed once over the frame's hashes.
+    pub indexed: usize,
+    /// Leaves computed here over the body's hashes (a frame this node does
+    /// not hold whole, a supplied one, the cut last frame).
+    pub hashed: usize,
+}
+
+/// The frame tree over a body of `total` transactions laid out as `counts`
+/// (each frame's length, in body order), where `known[k]` is frame `k`'s
+/// root when this node already has it -- the frame's id from its index,
+/// computed at ingest over exactly those hashes -- and `hash_at(i)` is the
+/// body's `i`-th transaction hash. Only the frames without a known root are
+/// hashed, on the worker pool. An empty body is the empty MPT root. `None`
+/// when the layout does not cover the body.
+///
+/// A known root is only sound when the caller has established that the
+/// frame's positions in the body hold exactly the indexed frame's
+/// transactions (the queue's `take_frames` fetches them by hash; the index's
+/// `layout_of` / `frames_held` compare the hashes).
+pub fn frame_tree_root_known(
+    counts: &[usize],
+    known: &[Option<B256>],
+    total: usize,
+    hash_at: impl Fn(usize) -> B256 + Sync,
+) -> Option<FrameTreeRoot> {
+    use rayon::prelude::*;
+    if total == 0 {
+        return counts
+            .is_empty()
+            .then_some(FrameTreeRoot { root: alloy_consensus::EMPTY_ROOT_HASH, indexed: 0, hashed: 0 });
+    }
+    if counts.len() != known.len() || counts.contains(&0) || counts.iter().sum::<usize>() != total {
+        return None;
+    }
+    let mut starts = Vec::with_capacity(counts.len());
+    let mut at = 0usize;
+    for count in counts {
+        starts.push(at);
+        at += count;
+    }
+    let indexed = known.iter().filter(|leaf| leaf.is_some()).count();
+    let hashed = counts.len() - indexed;
+    let leaf = |k: usize| {
+        known[k].unwrap_or_else(|| {
+            let hashes: Vec<B256> = (starts[k]..starts[k] + counts[k]).map(&hash_at).collect();
+            n42_tx_types::frame_root(&hashes)
+        })
+    };
+    let leaves: Vec<B256> = if hashed <= 1 {
+        (0..counts.len()).map(leaf).collect()
+    } else {
+        (0..counts.len()).into_par_iter().map(leaf).collect()
+    };
+    Some(FrameTreeRoot { root: n42_tx_types::frame_tree_root(&leaves), indexed, hashed })
+}
+
+/// The known leaves of a layout the frame index found for a body
+/// (`frame_layout_of`, which compared every frame's hashes with the body's):
+/// every frame but the last is whole, so its id is its root; the last may be
+/// a prefix and is hashed (at most one frame's worth).
+fn known_from_index_layout(layout: &[(B256, usize)]) -> Vec<Option<B256>> {
+    let last = layout.len().saturating_sub(1);
+    layout.iter().enumerate().map(|(k, (id, _))| (k != last).then_some(*id)).collect()
+}
+
 /// The transactions root the seal gives a body under the flag, derived from
 /// the body it actually sealed: the frame tree when the body is a run of
 /// whole frames (the last possibly cut) -- by the build's plan, or else by
@@ -185,20 +272,49 @@ pub fn root_of_block(block: &B256) -> Option<B256> {
 /// the description; `mpt` (the ordinary root) for any other body. A frame
 /// build whose execution skipped or reordered a planned transaction is not
 /// refused: its body is sealed with the MPT root and described by hashes.
-pub fn seal_root<T: alloy_eips::eip2718::Encodable2718 + Sync>(
-    plan: Option<&FramePlan>,
-    body_hashes: &[B256],
-    transactions: &[T],
-    mpt: impl FnOnce() -> B256,
-) -> B256 {
+pub fn seal_root(plan: Option<&FramePlan>, body_hashes: &[B256], mpt: impl FnOnce() -> B256) -> B256 {
+    seal_root_timed(plan, body_hashes, mpt).root
+}
+
+/// [`seal_root`], with where its time went. The frame tree's leaves are the
+/// plan's frame ids (computed at ingest); only the frame the body ends in
+/// part-way through is hashed. The index's layout is consulted only when
+/// the body is not a prefix of the plan, and it costs one lookup per frame.
+pub fn seal_root_timed(plan: Option<&FramePlan>, body_hashes: &[B256], mpt: impl FnOnce() -> B256) -> SealRoot {
     // An empty body keeps the empty MPT root (see `root_of_hashes`).
     if body_hashes.is_empty() {
-        return mpt();
+        let at = std::time::Instant::now();
+        let root = mpt();
+        return SealRoot { root, root_us: at.elapsed().as_micros() as u64, ..SealRoot::default() };
     }
-    let layout = plan.and_then(|plan| plan.layout_for(body_hashes)).or_else(|| {
-        n42_tx_queue::global::<crate::N42PooledTransaction>().and_then(|queue| queue.frame_layout_of(body_hashes))
+    let layout_at = std::time::Instant::now();
+    let by_plan = plan.and_then(|plan| {
+        plan.layout_for(body_hashes).map(|layout| {
+            // `layout_for` walks the plan's frames in order, so entry k is
+            // frame k of the plan: whole when it holds all of that frame.
+            let known: Vec<Option<B256>> = layout
+                .iter()
+                .zip(&plan.frames)
+                .map(|((id, take), frame)| (*take == frame.len).then_some(*id))
+                .collect();
+            (layout, known)
+        })
     });
-    let Some(layout) = layout else {
+    let layout = by_plan.or_else(|| {
+        n42_tx_queue::global::<crate::N42PooledTransaction>()
+            .and_then(|queue| queue.frame_layout_of(body_hashes))
+            .map(|layout| {
+                let known = known_from_index_layout(&layout);
+                (layout, known)
+            })
+    });
+    let layout_us = layout_at.elapsed().as_micros() as u64;
+    let root_at = std::time::Instant::now();
+    let tree = layout.as_ref().and_then(|(layout, known)| {
+        let counts: Vec<usize> = layout.iter().map(|(_, count)| *count).collect();
+        frame_tree_root_known(&counts, known, body_hashes.len(), |i| body_hashes[i])
+    });
+    let (Some((layout, _)), Some(tree)) = (layout, tree) else {
         SEALED_MPT.fetch_add(1, Ordering::Relaxed);
         if let Some(plan) = plan {
             tracing::info!(
@@ -209,10 +325,10 @@ pub fn seal_root<T: alloy_eips::eip2718::Encodable2718 + Sync>(
                 "frame build's body is not a run of frames; sealed with the MPT root"
             );
         }
-        return mpt();
+        let root = mpt();
+        return SealRoot { root, layout_us, root_us: root_at.elapsed().as_micros() as u64, ..SealRoot::default() };
     };
-    let counts: Vec<usize> = layout.iter().map(|(_, count)| *count).collect();
-    let root = crate::assembler::transactions_root_by_rule(true, Some(&counts), transactions);
+    let root_us = root_at.elapsed().as_micros() as u64;
     SEALED_ALIGNED.fetch_add(1, Ordering::Relaxed);
     let described: Vec<(B256, u32)> =
         layout.iter().map(|(id, count)| (*id, u32::try_from(*count).unwrap_or(u32::MAX))).collect();
@@ -223,11 +339,28 @@ pub fn seal_root<T: alloy_eips::eip2718::Encodable2718 + Sync>(
             skipped = plan.map_or(0, |plan| plan.skipped),
             txs = body_hashes.len(),
             last = described.last().map_or(0, |(_, count)| *count),
+            indexed = tree.indexed,
+            hashed = tree.hashed,
+            layout_us,
+            root_us,
             "frame build sealed"
         );
     }
-    remember_layout(root, described);
-    root
+    remember_layout(tree.root, described);
+    SealRoot { root: tree.root, layout_us, root_us, indexed: tree.indexed, hashed: tree.hashed }
+}
+
+/// What [`root_for_body_counted`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BodyRoot {
+    /// The root accepted (or the MPT root, for the caller's mismatch).
+    pub root: B256,
+    /// Whether it is a frame-tree root.
+    pub frame: bool,
+    /// Leaves read from the frame index.
+    pub indexed: usize,
+    /// Leaves hashed from the body.
+    pub hashed: usize,
 }
 
 /// The transactions root a frame chain accepts for a body that arrived
@@ -242,46 +375,55 @@ pub fn seal_root<T: alloy_eips::eip2718::Encodable2718 + Sync>(
 /// layout, the MPT root otherwise (the caller checks the result against
 /// the block hash and falls back to the MPT root on a mismatch).
 ///
-/// Every frame-tree root accepted here is recomputed from the body's own
-/// hashes under a layout that covers them exactly, so it binds the body as
-/// the MPT root does; which of the two a block carries is the sealer's
-/// choice by its own index, and a follower whose index differs still
-/// agrees on the block.
+/// Every frame-tree root accepted here is computed from the body's own
+/// hashes under a layout that covers them exactly -- a frame's leaf is its
+/// indexed id only where the index holds that frame with exactly the body's
+/// hashes at its positions, so the id is the root over them -- and so binds
+/// the body as the MPT root does; which of the two a block carries is the
+/// sealer's choice by its own index, and a follower whose index differs
+/// still agrees on the block.
 pub fn root_for_body(claimed: Option<B256>, hashes: &[B256], mpt: impl FnOnce() -> B256) -> (B256, bool) {
-    if hashes.is_empty() {
-        return (alloy_consensus::EMPTY_ROOT_HASH, false);
-    }
-    if let Some(claimed) = claimed {
-        if let Some(layout) = layout_by_root(&claimed) {
-            let counts: Vec<usize> = layout.iter().map(|(_, count)| *count as usize).collect();
-            if root_of_hashes(hashes, &counts) == Some(claimed) {
-                CHECKED_FRAME_ROOT.fetch_add(1, Ordering::Relaxed);
-                return (claimed, true);
-            }
-        }
-    }
-    let indexed = n42_tx_queue::global::<crate::N42PooledTransaction>()
-        .and_then(|queue| queue.frame_layout_of(hashes))
-        .and_then(|layout| {
-            let counts: Vec<usize> = layout.iter().map(|(_, count)| *count).collect();
-            root_of_hashes(hashes, &counts)
-        });
-    if let Some(root) = indexed {
-        if claimed.is_none_or(|claimed| claimed == root) {
-            CHECKED_FRAME_ROOT.fetch_add(1, Ordering::Relaxed);
-            return (root, true);
-        }
-    }
-    CHECKED_MPT_ROOT.fetch_add(1, Ordering::Relaxed);
-    (mpt(), false)
+    let found = root_for_body_counted(claimed, hashes, mpt);
+    (found.root, found.frame)
 }
 
-/// The frame-tree root over a body's hashes laid out as `counts`; an empty
-/// body keeps the empty MPT root every empty block has, whichever path
-/// built it. `None` when the layout does not cover the body.
-pub fn root_of_hashes(hashes: &[B256], counts: &[usize]) -> Option<B256> {
+/// [`root_for_body`], with how many leaves were read and how many hashed.
+pub fn root_for_body_counted(claimed: Option<B256>, hashes: &[B256], mpt: impl FnOnce() -> B256) -> BodyRoot {
     if hashes.is_empty() {
-        return counts.is_empty().then_some(alloy_consensus::EMPTY_ROOT_HASH);
+        return BodyRoot { root: alloy_consensus::EMPTY_ROOT_HASH, frame: false, indexed: 0, hashed: 0 };
     }
-    n42_tx_types::frame_tree_root_of(hashes, counts)
+    let queue = n42_tx_queue::global::<crate::N42PooledTransaction>();
+    if let Some(claimed) = claimed
+        && let Some(layout) = layout_by_root(&claimed)
+    {
+        let layout: Vec<(B256, usize)> = layout.iter().map(|(id, count)| (*id, *count as usize)).collect();
+        let known = queue.as_ref().map_or_else(|| vec![None; layout.len()], |queue| queue.frames_held(&layout, hashes));
+        let counts: Vec<usize> = layout.iter().map(|(_, count)| *count).collect();
+        if let Some(tree) = frame_tree_root_known(&counts, &known, hashes.len(), |i| hashes[i])
+            && tree.root == claimed
+        {
+            CHECKED_FRAME_ROOT.fetch_add(1, Ordering::Relaxed);
+            return BodyRoot { root: claimed, frame: true, indexed: tree.indexed, hashed: tree.hashed };
+        }
+    }
+    let indexed = queue.and_then(|queue| queue.frame_layout_of(hashes)).and_then(|layout| {
+        let counts: Vec<usize> = layout.iter().map(|(_, count)| *count).collect();
+        frame_tree_root_known(&counts, &known_from_index_layout(&layout), hashes.len(), |i| hashes[i])
+    });
+    if let Some(tree) = indexed
+        && claimed.is_none_or(|claimed| claimed == tree.root)
+    {
+        CHECKED_FRAME_ROOT.fetch_add(1, Ordering::Relaxed);
+        return BodyRoot { root: tree.root, frame: true, indexed: tree.indexed, hashed: tree.hashed };
+    }
+    CHECKED_MPT_ROOT.fetch_add(1, Ordering::Relaxed);
+    BodyRoot { root: mpt(), frame: false, indexed: 0, hashed: 0 }
+}
+
+/// The frame-tree root over a body's hashes laid out as `counts`, every
+/// frame hashed (on the worker pool); an empty body keeps the empty MPT
+/// root every empty block has, whichever path built it. `None` when the
+/// layout does not cover the body.
+pub fn root_of_hashes(hashes: &[B256], counts: &[usize]) -> Option<B256> {
+    frame_tree_root_known(counts, &vec![None; counts.len()], hashes.len(), |i| hashes[i]).map(|tree| tree.root)
 }

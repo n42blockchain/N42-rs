@@ -882,3 +882,11 @@ false on every block: the parent's taken list is not the body position by positi
 leader waits ~50 after the quorum, and the pacing is 100. What the 25 between the seal and the cycle is (the
 proposal after the seal, the view's turn, the pacing's rounding) needs the leader's own timeline: build start,
 seal, proposal, quorum, next start, next seal, per block.
+
+The leader's timeline (loop289 LIVE, 217 full blocks, medians / p75): build start -> seal 107 / 125; seal ->
+proposal sent 90 / 111; proposal -> quorum 39 / 69; quorum -> next proposal 86 / 101; seal -> the next build's
+start 2.8 / 9.7 (the chain is real). The last event before the proposal of n+1, of {its seal, n's quorum, the
+pacing tick 100 ms after n's proposal}: **the pacing tick in 187 of 217 blocks**, the quorum in 23, the seal in
+7; and the proposal follows the last event by 23 ms (p75 43). The cycle is 125 = the pacing 100 + the leader's
+own 23-25 after the tick. So the chains are under the pacing and the pacing binds: 90, 80 and 70 ms next,
+and the leader's 23 ms from the tick to the send after that.

@@ -413,7 +413,8 @@ where
 /// The state at `grandparent` for a build on the sealed own parent filed
 /// under `built_hash`: [`state_at_soon`], and when the grandparent is still
 /// not in the engine while the parent's finish behind its seal is running,
-/// once more after that finish.
+/// once more after the parent's QMDB root is published, and once more after
+/// that finish.
 ///
 /// The grandparent is this node's own block, handed to the engine after its
 /// own finish, and that hand-off can be held behind the parent's finish: on
@@ -424,30 +425,53 @@ where
 /// the parent's roots start at its seal, before the grandparent's hand-off
 /// is through. The 150 ms wait then refused the chained build ("no state
 /// found for block" the grandparent: 1-3 a leg on the leader, 0 on every
-/// flag-off leg) and the leader lost the view (5-6 s, then a TC). Waiting is
-/// no loss: this build cannot seal before the parent's finish anyway -- its
-/// header carries the parent's execution (`PARENT_FIELDS_WAIT`).
+/// flag-off leg) and the leader lost the view (5-6 s, then a TC).
+///
+/// What held the hand-off is the QMDB forest's lock: the grandparent's rename
+/// to its sealed hash (`chain_alias::rename`) waits for the parent's root job
+/// (`compute_operations`) to let it go. So the first wait is for the parent's
+/// root, published the moment that job ends (`executed_fields`) -- which this
+/// build waits for anyway, its header carries the parent's execution
+/// (`PARENT_FIELDS_WAIT`). Only if the grandparent is still missing then does
+/// it wait for the parent's `Complete`, which since the shards' merge runs
+/// behind the root's publication (BREAKTHROUGH_DESIGN 10.16) comes ~55 ms
+/// later.
 fn grandparent_state<C>(client: &C, grandparent: B256, built_hash: B256) -> ProviderResult<StateProviderBox>
 where
     C: StateProviderFactory,
 {
     use crate::built_executions::Stage;
-    match state_at_soon(client, grandparent) {
-        Err(reth_storage_api::errors::ProviderError::StateForHashNotFound(_))
-            if crate::built_executions::stage_of(built_hash).is_some_and(|stage| stage < Stage::Complete) =>
-        {
-            let at = std::time::Instant::now();
-            let _ = crate::built_executions::wait_for(built_hash, Stage::Complete);
-            tracing::info!(
-                target: "payload_builder",
-                %grandparent,
-                waited_ms = at.elapsed().as_millis() as u64,
-                "the grandparent was not in the engine; waited for the parent's finish"
-            );
-            state_at_soon(client, grandparent)
-        }
-        other => other,
+    let finishing = || crate::built_executions::stage_of(built_hash).is_some_and(|stage| stage < Stage::Complete);
+    let missing = |result: &ProviderResult<StateProviderBox>| {
+        matches!(result, Err(reth_storage_api::errors::ProviderError::StateForHashNotFound(_)))
+    };
+    let first = state_at_soon(client, grandparent);
+    if !missing(&first) || !finishing() {
+        return first;
     }
+    let at = std::time::Instant::now();
+    let _ = crate::executed_fields::wait_for(&built_hash, crate::hotstuff_consensus::PARENT_FIELDS_WAIT);
+    let after_root = state_at_soon(client, grandparent);
+    let root_ms = at.elapsed().as_millis() as u64;
+    if !missing(&after_root) || !finishing() {
+        tracing::info!(
+            target: "payload_builder",
+            %grandparent,
+            waited_ms = root_ms,
+            found = after_root.is_ok(),
+            "the grandparent was not in the engine; waited for the parent's QMDB root"
+        );
+        return after_root;
+    }
+    let _ = crate::built_executions::wait_for(built_hash, Stage::Complete);
+    tracing::info!(
+        target: "payload_builder",
+        %grandparent,
+        root_ms,
+        waited_ms = at.elapsed().as_millis() as u64,
+        "the grandparent was not in the engine; waited for the parent's QMDB root and finish"
+    );
+    state_at_soon(client, grandparent)
 }
 
 /// An opener for the parent's post-state: the chain's state at the

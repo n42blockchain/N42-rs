@@ -670,7 +670,73 @@ fn check_includable<Provider>(
 where
     Provider: StateProviderFactory + Sync,
 {
-    let scans = scan_transactions(block, chain_id, spec);
+    check_includable_timed(provider, parent_hash, parent_output, block, chain_id, spec, &mut CheckTimes::default())
+}
+
+/// Where the includability check's time went (the vote road's `check_*`
+/// keys), and how many of the block's frames it read as summaries.
+#[derive(Debug, Clone, Copy, Default)]
+struct CheckTimes {
+    /// The per-transaction facts: a scan, or the frames' summaries.
+    scan_us: u64,
+    /// The runs folded per sender.
+    fold_us: u64,
+    /// Each sender's total against the parent's post-state.
+    senders_us: u64,
+    /// Frames read from their ingest summary (`N42_FOLLOWER_FRAME_SCAN=1`).
+    frames_summarized: u64,
+    /// Frames scanned transaction by transaction on the frame road.
+    frames_scanned: u64,
+}
+
+/// [`check_includable`], timed by part. Under `N42_FOLLOWER_FRAME_SCAN=1` a
+/// block the frame road checked is scanned per frame: a frame taken whole
+/// from this node's index whose summary answers for this block
+/// ([`n42_engine_types::frame_scan::FrameScan::usable`]) gives its runs and
+/// totals without its transactions being read; any other frame is scanned as
+/// before. The verdict and its message are the same either way (a summary
+/// exists only for a frame with nothing to refuse).
+#[allow(clippy::too_many_arguments)]
+fn check_includable_timed<Provider>(
+    provider: &Provider,
+    parent_hash: B256,
+    parent_output: Option<ParentBundles<'_>>,
+    block: &RecoveredBlock<Block>,
+    chain_id: u64,
+    spec: reth_revm::primitives::hardfork::SpecId,
+    times: &mut CheckTimes,
+) -> Result<(), String>
+where
+    Provider: StateProviderFactory + Sync,
+{
+    let layout = n42_engine_types::frame_scan::layout_of(&block.hash());
+    check_includable_laid_out(provider, parent_hash, parent_output, block, chain_id, spec, layout.as_deref().map(Vec::as_slice), times)
+}
+
+/// [`check_includable_timed`] on a given frame layout (`None`: the block's
+/// transactions scanned in 32 chunks, as without frames).
+#[allow(clippy::too_many_arguments)]
+fn check_includable_laid_out<Provider>(
+    provider: &Provider,
+    parent_hash: B256,
+    parent_output: Option<ParentBundles<'_>>,
+    block: &RecoveredBlock<Block>,
+    chain_id: u64,
+    spec: reth_revm::primitives::hardfork::SpecId,
+    layout: Option<&[(B256, usize, bool)]>,
+    times: &mut CheckTimes,
+) -> Result<(), String>
+where
+    Provider: StateProviderFactory + Sync,
+{
+    let scan_at = std::time::Instant::now();
+    let tx_count = block.body().transactions.len();
+    let layout = layout.filter(|layout| layout.iter().map(|(_, count, _)| *count).sum::<usize>() == tx_count);
+    let scans = match layout {
+        Some(layout) => scan_by_frames(block, layout, chain_id, spec, times),
+        None => scan_transactions(block, chain_id, spec),
+    };
+    times.scan_us = scan_at.elapsed().as_micros() as u64;
     if let Some(refused) = scans.iter().filter_map(|scan| scan.refused.as_ref()).min_by_key(|fault| fault.index) {
         return Err(refused.message.clone());
     }
@@ -679,8 +745,79 @@ where
     if gas_total > gas_limit {
         return Err(format!("gas limits sum to {gas_total}, over the block's {gas_limit}"));
     }
+    let fold_at = std::time::Instant::now();
     let senders = fold_runs(scans);
-    check_senders(provider, parent_hash, parent_output, &senders)
+    times.fold_us = fold_at.elapsed().as_micros() as u64;
+    let senders_at = std::time::Instant::now();
+    let checked = check_senders(provider, parent_hash, parent_output, &senders);
+    times.senders_us = senders_at.elapsed().as_micros() as u64;
+    checked
+}
+
+/// The block's scan, a frame per task: a frame's summary where it answers
+/// for this block, else its transactions scanned ([`scan_range`]). Chunked by
+/// frame rather than by a 32nd of the block; the chunking is invisible to the
+/// fold and to the verdict (the fold joins a sender's runs across chunks).
+fn scan_by_frames(
+    block: &RecoveredBlock<Block>,
+    layout: &[(B256, usize, bool)],
+    chain_id: u64,
+    spec: reth_revm::primitives::hardfork::SpecId,
+    times: &mut CheckTimes,
+) -> Vec<ChunkScan> {
+    use rayon::prelude::*;
+    let base_fee = u128::from(block.header().base_fee_per_gas.unwrap_or(0));
+    let txs = &block.body().transactions;
+    let senders = block.senders();
+    let summaries = n42_engine_types::frame_scan::lookup(layout.iter().map(|(id, _, _)| *id));
+    let mut starts = Vec::with_capacity(layout.len());
+    let mut at = 0usize;
+    for (_, count, _) in layout {
+        starts.push(at);
+        at += count;
+    }
+    let scans: Vec<(ChunkScan, bool)> = layout
+        .par_iter()
+        .zip(summaries.par_iter())
+        .zip(starts.par_iter())
+        .map(|(((_, count, whole), summary), &start)| {
+            let summary = summary.as_deref().filter(|summary| {
+                *whole
+                    && summary.len == *count
+                    && summary.usable(chain_id, spec, base_fee)
+                    && summary.runs.iter().all(|run| senders.get(start + run.offset as usize) == Some(&run.sender))
+            });
+            match summary {
+                Some(summary) => (
+                    ChunkScan {
+                        gas_total: summary.gas_total,
+                        refused: None,
+                        runs: summary
+                            .runs
+                            .iter()
+                            .map(|run| SenderRun {
+                                sender: run.sender,
+                                first_index: start + run.offset as usize,
+                                first_nonce: run.first_nonce,
+                                len: run.len,
+                                cost: run.cost,
+                                fault: None,
+                            })
+                            .collect(),
+                    },
+                    true,
+                ),
+                None => {
+                    let end = start + count;
+                    (scan_range(&txs[start..end], &senders[start..end], start, base_fee, chain_id, spec), false)
+                }
+            }
+        })
+        .collect();
+    let summarized = scans.iter().filter(|(_, summarized)| *summarized).count() as u64;
+    times.frames_summarized = summarized;
+    times.frames_scanned = scans.len() as u64 - summarized;
+    scans.into_iter().map(|(scan, _)| scan).collect()
 }
 
 /// One pass over the block's transactions, on the worker pool: everything
@@ -694,7 +831,6 @@ fn scan_transactions(
     chain_id: u64,
     spec: reth_revm::primitives::hardfork::SpecId,
 ) -> Vec<ChunkScan> {
-    use alloy_consensus::Transaction as _;
     use rayon::prelude::*;
 
     let base_fee = u128::from(block.header().base_fee_per_gas.unwrap_or(0));
@@ -705,74 +841,84 @@ fn scan_transactions(
         .enumerate()
         .map(|(nth, txs)| {
             let base = nth * chunk;
-            let senders = &senders[base..base + txs.len()];
-            let mut scan = ChunkScan { runs: Vec::with_capacity(txs.len() / 8 + 1), ..Default::default() };
-            for (offset, (tx, sender)) in txs.iter().zip(senders).enumerate() {
-                let index = base + offset;
-                if let Some(id) = tx.chain_id()
-                    && id != chain_id
-                {
-                    scan.refused =
-                        Some(Fault { index, message: format!("transaction {index}: chain id {id}, the chain's is {chain_id}") });
-                    break;
-                }
-                let cap = tx.max_fee_per_gas();
-                if cap < base_fee {
-                    scan.refused = Some(Fault {
-                        index,
-                        message: format!("transaction {index}: fee cap {cap} under the base fee {base_fee}"),
-                    });
-                    break;
-                }
-                if tx.max_priority_fee_per_gas().is_some_and(|tip| tip > cap) {
-                    scan.refused =
-                        Some(Fault { index, message: format!("transaction {index}: priority fee over the fee cap") });
-                    break;
-                }
-                if tx.authorization_list().is_some_and(|list| list.is_empty()) {
-                    scan.refused =
-                        Some(Fault { index, message: format!("transaction {index}: empty authorization list") });
-                    break;
-                }
-                scan.gas_total = scan.gas_total.saturating_add(tx.gas_limit());
-
-                if !matches!(scan.runs.last(), Some(run) if run.sender == *sender) {
-                    scan.runs.push(SenderRun {
-                        sender: *sender,
-                        first_index: index,
-                        first_nonce: tx.nonce(),
-                        len: 0,
-                        cost: alloy_primitives::U256::ZERO,
-                        fault: None,
-                    });
-                }
-                let run = scan.runs.last_mut().expect("a run for this sender");
-                // The nonce before the intrinsic gas, the order the
-                // per-sender loop checked them in: a transaction wrong in
-                // both ways still reports its nonce.
-                if run.fault.is_none() {
-                    let expected = run.first_nonce.saturating_add(run.len);
-                    if tx.nonce() != expected {
-                        run.fault = Some(Box::new(Fault {
-                            index,
-                            message: format!("transaction {index}: nonce {}, {sender} is at {expected}", tx.nonce()),
-                        }));
-                    } else if let Some(needed) = intrinsic_gas_shortfall(tx, spec) {
-                        run.fault = Some(Box::new(Fault {
-                            index,
-                            message: format!("transaction {index}: gas limit {} under the intrinsic {needed}", tx.gas_limit()),
-                        }));
-                    }
-                }
-                run.len += 1;
-                let gas = alloy_primitives::U256::from(tx.gas_limit()) * alloy_primitives::U256::from(tx.max_fee_per_gas());
-                let blobs = alloy_primitives::U256::from(tx.blob_gas_used().unwrap_or(0))
-                    * alloy_primitives::U256::from(tx.max_fee_per_blob_gas().unwrap_or(0));
-                run.cost = run.cost.saturating_add(tx.value()).saturating_add(gas).saturating_add(blobs);
-            }
-            scan
+            scan_range(txs, &senders[base..base + txs.len()], base, base_fee, chain_id, spec)
         })
         .collect()
+}
+
+/// One stretch of the block's transactions, `base` its first index: what
+/// [`scan_transactions`] computes per chunk.
+fn scan_range(
+    txs: &[TransactionSigned],
+    senders: &[Address],
+    base: usize,
+    base_fee: u128,
+    chain_id: u64,
+    spec: reth_revm::primitives::hardfork::SpecId,
+) -> ChunkScan {
+    use alloy_consensus::Transaction as _;
+    let mut scan = ChunkScan { runs: Vec::with_capacity(txs.len() / 8 + 1), ..Default::default() };
+    for (offset, (tx, sender)) in txs.iter().zip(senders).enumerate() {
+        let index = base + offset;
+        if let Some(id) = tx.chain_id()
+            && id != chain_id
+        {
+            scan.refused =
+                Some(Fault { index, message: format!("transaction {index}: chain id {id}, the chain's is {chain_id}") });
+            break;
+        }
+        let cap = tx.max_fee_per_gas();
+        if cap < base_fee {
+            scan.refused = Some(Fault {
+                index,
+                message: format!("transaction {index}: fee cap {cap} under the base fee {base_fee}"),
+            });
+            break;
+        }
+        if tx.max_priority_fee_per_gas().is_some_and(|tip| tip > cap) {
+            scan.refused =
+                Some(Fault { index, message: format!("transaction {index}: priority fee over the fee cap") });
+            break;
+        }
+        if tx.authorization_list().is_some_and(|list| list.is_empty()) {
+            scan.refused =
+                Some(Fault { index, message: format!("transaction {index}: empty authorization list") });
+            break;
+        }
+        scan.gas_total = scan.gas_total.saturating_add(tx.gas_limit());
+
+        if !matches!(scan.runs.last(), Some(run) if run.sender == *sender) {
+            scan.runs.push(SenderRun {
+                sender: *sender,
+                first_index: index,
+                first_nonce: tx.nonce(),
+                len: 0,
+                cost: alloy_primitives::U256::ZERO,
+                fault: None,
+            });
+        }
+        let run = scan.runs.last_mut().expect("a run for this sender");
+        // The nonce before the intrinsic gas, the order the
+        // per-sender loop checked them in: a transaction wrong in
+        // both ways still reports its nonce.
+        if run.fault.is_none() {
+            let expected = run.first_nonce.saturating_add(run.len);
+            if tx.nonce() != expected {
+                run.fault = Some(Box::new(Fault {
+                    index,
+                    message: format!("transaction {index}: nonce {}, {sender} is at {expected}", tx.nonce()),
+                }));
+            } else if let Some(needed) = intrinsic_gas_shortfall(tx, spec) {
+                run.fault = Some(Box::new(Fault {
+                    index,
+                    message: format!("transaction {index}: gas limit {} under the intrinsic {needed}", tx.gas_limit()),
+                }));
+            }
+        }
+        run.len += 1;
+        run.cost = run.cost.saturating_add(n42_engine_types::frame_scan::tx_cost(tx));
+    }
+    scan
 }
 
 /// The intrinsic gas -- the transaction's kind, calldata, access list and
@@ -780,23 +926,7 @@ fn scan_transactions(
 /// `None` if it does. A block that fails this fails at execution, and the
 /// vote that let it through was wrong.
 fn intrinsic_gas_shortfall(tx: &TransactionSigned, spec: reth_revm::primitives::hardfork::SpecId) -> Option<u64> {
-    use alloy_consensus::Transaction as _;
-
-    let (al_accounts, al_storages) = tx
-        .access_list()
-        .map(|list| (list.len() as u64, list.iter().map(|item| item.storage_keys.len() as u64).sum::<u64>()))
-        .unwrap_or((0, 0));
-    let intrinsic = reth_revm::context_interface::cfg::gas::calculate_initial_tx_gas(
-        spec,
-        tx.input(),
-        tx.kind().is_create(),
-        al_accounts,
-        al_storages,
-        tx.authorization_list().map_or(0, |list| list.len() as u64),
-        None,
-    );
-    let needed = (intrinsic.initial_regular_gas + intrinsic.initial_state_gas).max(intrinsic.floor_gas);
-    (tx.gas_limit() < needed).then_some(needed)
+    n42_engine_types::frame_scan::intrinsic_gas_shortfall(tx, spec)
 }
 
 /// The chunks' runs folded per sender. The chunks are in block order and so
@@ -1324,6 +1454,20 @@ struct RoadPhases {
     parent_wait_us: u64,
     /// `validate_against_parent` and `check_includable`: what the vote attests.
     check_us: u64,
+    /// Of `check_us`: the header against the parent (0 when the parent's
+    /// output is read, where the header waits for the fields instead).
+    check_header_us: u64,
+    /// Of `check_us`: `check_includable` whole; the rest of `check_us` is the
+    /// check pool's hand-off (`check_other_ms`).
+    check_include_us: u64,
+    /// Of `check_include_us`: the per-transaction facts, the fold per
+    /// sender, and the senders against the parent ([`CheckTimes`]). Not in
+    /// the line's sum, and neither are the frame counts below.
+    check_scan_us: u64,
+    check_fold_us: u64,
+    check_senders_us: u64,
+    check_frames_summarized: u64,
+    check_frames_scanned: u64,
     /// Waiting for the parent's execution fields, and the header against them.
     fields_us: u64,
     /// Of `fields_us` (or, under `N42_FOLLOWER_EXEC_EARLY=1`, of the check):
@@ -1337,6 +1481,45 @@ struct RoadPhases {
     /// What the check read the parent through: 0 the engine, 1 the merged
     /// output, 2 the shards ([`parent_read_name`]).
     parent_read: u64,
+}
+
+impl RoadPhases {
+    /// The check's parts, from one run of [`check_includable_timed`].
+    const fn note_check(&mut self, header_us: u64, include_us: u64, times: CheckTimes) {
+        self.check_header_us = header_us;
+        self.check_include_us = include_us;
+        self.check_scan_us = times.scan_us;
+        self.check_fold_us = times.fold_us;
+        self.check_senders_us = times.senders_us;
+        self.check_frames_summarized = times.frames_summarized;
+        self.check_frames_scanned = times.frames_scanned;
+    }
+}
+
+/// The header against the parent when `against` is set, then the
+/// includability, timed by part: (header us, includability us).
+#[allow(clippy::too_many_arguments)]
+fn timed_check<Provider>(
+    against: Option<(&(dyn FullConsensus<EthPrimitives> + Send + Sync), &reth_primitives_traits::SealedHeader, &reth_primitives_traits::SealedHeader)>,
+    provider: &Provider,
+    parent_hash: B256,
+    parent_output: Option<ParentBundles<'_>>,
+    block: &RecoveredBlock<Block>,
+    chain_id: u64,
+    spec: reth_revm::primitives::hardfork::SpecId,
+    times: &mut CheckTimes,
+) -> Result<(u64, u64), String>
+where
+    Provider: StateProviderFactory + Sync,
+{
+    let header_at = std::time::Instant::now();
+    if let Some((consensus, header, parent)) = against {
+        validate_against_parent(consensus, header, parent)?;
+    }
+    let header_us = header_at.elapsed().as_micros() as u64;
+    let include_at = std::time::Instant::now();
+    check_includable_timed(provider, parent_hash, parent_output, block, chain_id, spec, times)?;
+    Ok((header_us, include_at.elapsed().as_micros() as u64))
 }
 
 /// The one line a bench leg greps: where a block's road to this node's vote
@@ -1401,6 +1584,18 @@ fn log_vote_road(road: VoteRoad, number: u64, txs: usize, phases: RoadPhases) {
         claim_mismatch = CLAIM_MISMATCH.load(std::sync::atomic::Ordering::Relaxed),
         parent_wait_ms = phases.parent_wait_us / 1000,
         check_ms = phases.check_us / 1000,
+        // The check taken apart: the frame tree's root (on the road, before
+        // the check), the header against the parent, the includability
+        // (scan, fold, senders) and the rest (the check pool's hand-off).
+        check_root_us = if road.frames > 0 { road.root_us } else { 0 },
+        check_header_us = phases.check_header_us,
+        check_include_us = phases.check_include_us,
+        check_scan_us = phases.check_scan_us,
+        check_fold_us = phases.check_fold_us,
+        check_senders_us = phases.check_senders_us,
+        check_other_us = phases.check_us.saturating_sub(phases.check_header_us + phases.check_include_us),
+        check_frames_summarized = phases.check_frames_summarized,
+        check_frames_scanned = phases.check_frames_scanned,
         fields_ms = phases.fields_us / 1000,
         parent_fields_wait_ms = phases.parent_fields_wait_us / 1000,
         parent_output_wait_ms = phases.parent_output_wait_us / 1000,
@@ -1868,20 +2063,21 @@ where
             );
         } else {
             let check_at = std::time::Instant::now();
-            if parent_state.is_none() {
-                against_parent()?;
-            }
-            check_includable(
+            let mut times = CheckTimes::default();
+            let (header_us, include_us) = timed_check(
+                parent_state.is_none().then(|| (consensus, recovered.sealed_header(), &parent)),
                 provider,
                 parent_hash,
                 parent_state,
                 &recovered,
                 chain_spec.chain().id(),
                 spec_for_intrinsic_gas(chain_spec, recovered.timestamp),
+                &mut times,
             )?;
             // Set on the deferred path, where the vote is the check; zero before
             // the fork, where the vote is the import itself.
             phases.check_us = check_at.elapsed().as_micros() as u64;
+            phases.note_check(header_us, include_us, times);
 
             // Where this block's execution will read the parent's post-state,
             // decided here because it decides whether that execution can run
@@ -2278,13 +2474,21 @@ where
                         // pool of its own so the batches queued on the worker
                         // pool do not hold it.
                         let check_at = std::time::Instant::now();
-                        on_check_pool(|| {
-                            if parent_state.is_none() {
-                                validate_against_parent(consensus, header, parent_header)?;
-                            }
-                            check_includable(provider, parent_hash, parent_state, block, chain_id, spec)
+                        let mut times = CheckTimes::default();
+                        let (header_us, include_us) = on_check_pool(|| {
+                            timed_check(
+                                parent_state.is_none().then_some((consensus, header, parent_header)),
+                                provider,
+                                parent_hash,
+                                parent_state,
+                                block,
+                                chain_id,
+                                spec,
+                                &mut times,
+                            )
                         })?;
                         phases.check_us = check_at.elapsed().as_micros() as u64;
+                        phases.note_check(header_us, include_us, times);
                     }
                     let fields_at = std::time::Instant::now();
                     wait_for_parent_fields(parent_hash)?;
@@ -4375,6 +4579,73 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `N42_FOLLOWER_FRAME_SCAN=1`: the block cut into frames, every frame
+    /// with nothing to refuse summed as the ingest sums it, and the check on
+    /// those summaries gives the verdict and the words of the per-transaction
+    /// scan -- whole frames, a cut last frame, and frames with flaws alike.
+    #[test]
+    fn frame_summaries_give_the_scans_verdict() {
+        let all = [
+            Flaw::NonceGap,
+            Flaw::DuplicateNonce,
+            Flaw::ShortBalance,
+            Flaw::AbsentSender,
+            Flaw::OnlyInParentOutput,
+            Flaw::ForeignChainId,
+            Flaw::UnderIntrinsicGas,
+            Flaw::FeeCapUnderBase,
+            Flaw::PriorityOverCap,
+        ];
+        let state = provider(&[]);
+        let mut summarized_somewhere = false;
+        for seed in 1..200u64 {
+            let mut rng = Rng(seed * 2_654_435_761);
+            let flaws: Vec<Flaw> = (0..rng.below(3)).map(|_| all[rng.below(all.len() as u64) as usize]).collect();
+            let case = random_case(seed * 15_485_863, &flaws);
+            {
+                let mut accounts = state.accounts.lock();
+                accounts.clear();
+                accounts.extend(
+                    case.state.iter().map(|(address, account)| (*address, ExtendedAccount::new(account.nonce, account.balance))),
+                );
+            }
+            let txs = &case.block.body().transactions;
+            let senders = case.block.senders();
+            let frame = 1 + rng.below(9) as usize;
+            let mut layout = Vec::new();
+            let mut start = 0;
+            while start < txs.len() {
+                let count = frame.min(txs.len() - start);
+                let id = B256::random();
+                // The last frame cut, as a block ending in a prefix is.
+                let whole = count == frame;
+                if let Some(scan) = n42_engine_types::frame_scan::summarize(
+                    txs[start..start + count].iter().zip(senders[start..start + count].iter().copied()),
+                ) {
+                    n42_engine_types::frame_scan::remember(id, scan);
+                }
+                layout.push((id, count, whole));
+                start += count;
+            }
+            let hash = B256::random();
+            let scanned = check_includable(&state, hash, None, &case.block, CHAIN_ID, SpecId::OSAKA);
+            let mut times = CheckTimes::default();
+            let framed = check_includable_laid_out(
+                &state,
+                hash,
+                None,
+                &case.block,
+                CHAIN_ID,
+                SpecId::OSAKA,
+                Some(layout.as_slice()),
+                &mut times,
+            );
+            assert_eq!(scanned, framed, "seed {seed}, {flaws:?}");
+            summarized_somewhere |= times.frames_summarized > 0;
+        }
+        assert!(summarized_somewhere, "no frame was ever read from its summary");
     }
 
     /// An empty block is includable, and neither implementation opens a

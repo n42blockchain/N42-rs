@@ -1324,6 +1324,12 @@ where
     if decoded.is_empty() {
         return 0;
     }
+    // `N42_FOLLOWER_FRAME_SCAN=1`: the frame's includability facts, summed
+    // once here so the vote road's check reads them per frame
+    // (`n42_engine_types::frame_scan`).
+    if let Some(frame) = &frame {
+        n42_engine_types::frame_scan::note_admitted(frame.id, &frame.hashes, &decoded);
+    }
     // A frame admitted whole, for the queue's frame index: noted after its
     // transactions, whichever door they take into the queue. Nothing reads
     // the index unless the chain builds frame blocks.

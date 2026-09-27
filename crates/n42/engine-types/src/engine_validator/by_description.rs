@@ -636,6 +636,13 @@ where
         // node's frame index holds (a supplied frame's transactions included):
         // kept so a later whole-body check of the block verifies it the same way.
         crate::frame_blocks::remember_verified(body.block_hash, transactions_root, body.frames.as_deref().unwrap_or_default());
+        // `N42_FOLLOWER_FRAME_SCAN=1`: which positions are a frame's own
+        // transactions, taken whole from the index (a known leaf), for the
+        // includability check to read those frames' summaries.
+        crate::frame_scan::remember_layout(
+            body.block_hash,
+            frames.iter().zip(&known).map(|((id, count), leaf)| (*id, *count, leaf.is_some())).collect(),
+        );
         let describe_us = (first_pass + second_at.elapsed()).as_micros() as u64;
         Ok(DescribedBlock {
             hash: body.block_hash,

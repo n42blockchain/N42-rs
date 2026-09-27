@@ -582,3 +582,17 @@ gaps (the sender-group partition's balance, the batch's setup and its map, the s
 scheduling), and no field names it yet. So design A's ceiling on this shape is the read's ~280 pool ms (~15
 ms of wall at best), and the larger term is the batches' shape. Next: per-batch spans (max, min, CPU) on the
 phases line, then the read set (`N42_READ_SET=1`, built, untested until the box was free) in one leg.
+
+### 10.20 Design A off the fleet (bf8e01dfd): the pass costs more than it saves; the view's read is 5x slower under 16 threads
+
+`bench_build_prefetch` (163k transfers, a QMDB view over 2M accounts, 16 cores): plain execution 30-32 ms (batch
+max 14, median 13); with the read set (`N42_READ_SET=1`) 46-48 = the pass 23 (dedup 3, 159k accounts resolved
+in 20 at ~2 us of pool time each) + the batches 23-25 (max 9-10, median 8-9). Per-batch reading drops each batch
+from 14 to 9, but the pass costs 23 to save 8: **design A is falsified as a pass on the chain**. The resolve
+pass alone names design B's evidence: 395 ns a read on one thread, 781 on four, 1,964 on sixteen -- five times
+slower per read under sixteen threads, and the shared answer counter is 4% of it. What remains inside the view's
+lookup is the global `versions` read lock taken and held per read, the per-shard offset lock, a blake3 of the
+key and two random reads of the mapped entry file; the bench cannot tell the lock from the mmap/TLB misses
+(perf can). On the bench the batches run in two waves (32 batches on 16 threads, start skew one batch, no
+waits), so `par_exec` is two batch lengths -- loop282 (T, Tb) puts the same spans on the fleet's line to say
+whether its 59 ms is waves, imbalance, or per-batch overhead, and runs the read set once.

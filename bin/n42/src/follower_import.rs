@@ -673,6 +673,19 @@ where
     check_includable_timed(provider, parent_hash, parent_output, block, chain_id, spec, &mut CheckTimes::default())
 }
 
+/// The header and the body by the consensus rules the engine would apply,
+/// the transactions root taken as known (the payload's conversion, or the
+/// frame road, computed and matched it against the sealed hash).
+fn pre_execution_checks(
+    consensus: &(dyn FullConsensus<EthPrimitives> + Send + Sync),
+    sealed: &SealedBlock<Block>,
+) -> Result<(), String> {
+    consensus.validate_header(sealed.sealed_header()).map_err(|err| format!("header: {err}"))?;
+    consensus
+        .validate_block_pre_execution_with_tx_root(sealed, Some(sealed.transactions_root))
+        .map_err(|err| format!("body: {err}"))
+}
+
 /// Where the includability check's time went (the vote road's `check_*`
 /// keys), and how many of the block's frames it read as summaries.
 #[derive(Debug, Clone, Copy, Default)]
@@ -1734,12 +1747,17 @@ where
     };
     // The header and body, by the consensus rules the engine would apply;
     // what needs no parent first, so it overlaps the parent's import.
-    consensus.validate_header(sealed.sealed_header()).map_err(|err| format!("header: {err}"))?;
-    // The transactions root was computed and matched against the sealed hash
-    // by the payload's conversion; the body check takes it as known.
-    consensus
-        .validate_block_pre_execution_with_tx_root(&sealed, Some(sealed.transactions_root))
-        .map_err(|err| format!("body: {err}"))?;
+    //
+    // Under `N42_FOLLOWER_EXEC_EARLY=1` (deferred execution) they are the
+    // vote road's first step instead, beside the execution: nothing the
+    // execution reads depends on them, and the vote still waits for them. A
+    // block they refuse is refused by the vote road, whose error wins over
+    // the execution's ([`two_roads`]); only which error an already invalid
+    // block reports first can differ.
+    let header_on_vote_road = deferred && exec_early();
+    if !header_on_vote_road {
+        pre_execution_checks(consensus, &sealed)?;
+    }
     let mut phases = RoadPhases { header_us: started.elapsed().as_micros() as u64, ..Default::default() };
     let header_ms = phases.header_us / 1000;
     let senders_at = std::time::Instant::now();
@@ -1977,6 +1995,7 @@ where
         },
     };
     phases.parent_wait_us = parent_at.elapsed().as_micros() as u64;
+    let parent_done = std::time::Instant::now();
     // What the check and the early execution waited for the parent's output
     // (its shards or its merged bundle), and which one they read.
     let parent_read = parent_output.as_ref().map_or(0, ParentLayer::code);
@@ -2062,6 +2081,11 @@ where
                 "executing before the check; the check and the rest of the vote road run beside the execution"
             );
         } else {
+            if header_on_vote_road {
+                let header_at = std::time::Instant::now();
+                pre_execution_checks(consensus, recovered.sealed_block())?;
+                phases.header_us += header_at.elapsed().as_micros() as u64;
+            }
             let check_at = std::time::Instant::now();
             let mut times = CheckTimes::default();
             let (header_us, include_us) = timed_check(
@@ -2221,6 +2245,10 @@ where
         let mut sharded = None;
         let mut split = ExecSplit::default();
         if build_path {
+            // The root's thread, up before the execution: its spawn and its
+            // wait for the parent's fields happen beside the batches, and
+            // the root starts the instant the execution hands it the shards.
+            let root_slot = prespawn_early_root(parent_hash, block_hash, executed_parent.is_some())?;
             let open = || {
                 open_parent_state()
                     .ok()
@@ -2253,7 +2281,7 @@ where
                     let early_root = {
                         let (shards, residual, qmdb) = (Arc::clone(&shards), Arc::clone(&residual), qmdb.clone());
                         let prague = chain_spec.is_prague_active_at_timestamp(recovered.timestamp);
-                        spawn_early_root(parent_hash, block_hash, executed_parent.is_some(), move || {
+                        root_slot.start(move || {
                             let overlaps = shards.overlaps(&residual.state);
                             let view = shards.view(&residual.state, &overlaps);
                             let ops = n42_qmdb_reth::sorted_operations_from_accounts(&view, prague);
@@ -2297,6 +2325,23 @@ where
                         exec_receipts_ms = bp_split.receipts_us / 1000,
                         exec_receipts_wait_ms = bp_split.receipts_wait_us / 1000,
                         exec_drop_ms = phases.drop_us / 1000,
+                        // The execution's start after the road's, taken
+                        // apart: before the import (the description, the
+                        // owned block, the dispatch), the header and body
+                        // checks (0 when they ride the vote road), the
+                        // senders, the parent's layer, the set-up to the
+                        // execution (ancestry, the check's road), the plan,
+                        // the keys made ahead, the gate and the state.
+                        exec_start_gap_us = executed_at.saturating_duration_since(road_started).as_micros() as u64,
+                        gap_road_us = started.saturating_duration_since(road_started).as_micros() as u64,
+                        gap_header_us = senders_at.saturating_duration_since(started).as_micros() as u64,
+                        gap_senders_us = parent_at.saturating_duration_since(senders_at).as_micros() as u64,
+                        gap_parent_us = parent_done.saturating_duration_since(parent_at).as_micros() as u64,
+                        gap_setup_us = ahead_at.saturating_duration_since(parent_done).as_micros() as u64,
+                        gap_plan_wait_us = ahead_wait_us,
+                        gap_keys_wait_us = keys_wait_us,
+                        gap_gate_us = state_at.saturating_duration_since(gate_at).as_micros() as u64,
+                        gap_state_us = executed_at.saturating_duration_since(state_at).as_micros() as u64,
                         "build-path import phases"
                     );
                     sharded = Some(StartedShards { shards, residual, result, early_root, returned });
@@ -2469,6 +2514,11 @@ where
                 roads_at,
                 move || {
                     let mut phases = phases;
+                    if early_check && header_on_vote_road {
+                        let header_at = std::time::Instant::now();
+                        pre_execution_checks(consensus, block.sealed_block())?;
+                        phases.header_us += header_at.elapsed().as_micros() as u64;
+                    }
                     if early_check {
                         // What the vote attests, as on the path above, on a
                         // pool of its own so the batches queued on the worker
@@ -2874,6 +2924,62 @@ where
             Ok((ms_between(wait_at, root_at), root_at, std::time::Instant::now()))
         })
         .map_err(|err| format!("a thread for the early QMDB root: {err}"))
+}
+
+/// An early root's thread started ahead of the execution
+/// ([`prespawn_early_root`]), waiting for the root's work.
+struct RootSlot {
+    work: std::sync::mpsc::SyncSender<RootWork>,
+    handle: EarlyRoot,
+}
+
+/// What a [`RootSlot`]'s thread runs: the operations made and filed.
+type RootWork = Box<dyn FnOnce() -> Result<B256, String> + Send + 'static>;
+
+impl RootSlot {
+    /// Hands the thread its work; the handle answers as
+    /// [`spawn_early_root`]'s does, `began` the instant the work arrived.
+    fn start<F>(self, root_of: F) -> Result<EarlyRoot, String>
+    where
+        F: FnOnce() -> Result<B256, String> + Send + 'static,
+    {
+        match self.work.send(Box::new(root_of)) {
+            Ok(()) => Ok(self.handle),
+            // The thread ended before the work came: its own error (the
+            // parent's fields never filed) is the answer.
+            Err(_) => match self.handle.join() {
+                Ok(Err(err)) => Err(err),
+                Ok(Ok(_)) => Err("the early QMDB root thread ended without its work".to_string()),
+                Err(_) => Err("the early QMDB root thread panicked".to_string()),
+            },
+        }
+    }
+}
+
+/// [`spawn_early_root`] in two steps: the thread now, beside the execution,
+/// doing the wait for the parent's fields there; the work when the execution
+/// returns ([`RootSlot::start`]). Before, the root's start after the
+/// execution's end (`root_gap_ms`) held the thread's spawn and that wait. A
+/// slot dropped without work (the block left the build path, or failed)
+/// ends its thread.
+fn prespawn_early_root(parent_hash: B256, block_hash: B256, on_parent_output: bool) -> Result<RootSlot, String> {
+    let (work, arrives) = std::sync::mpsc::sync_channel::<RootWork>(1);
+    let handle = std::thread::Builder::new()
+        .name("qmdb-root-early".into())
+        .spawn(move || -> Result<(u64, std::time::Instant, std::time::Instant), String> {
+            let wait_at = std::time::Instant::now();
+            if on_parent_output {
+                wait_for_parent_fields(parent_hash)?;
+            }
+            let waited = wait_at.elapsed().as_millis() as u64;
+            let root_of = arrives.recv().map_err(|_| "no root work: the execution left the build path".to_string())?;
+            let root_at = std::time::Instant::now();
+            let root = on_root_pool(root_of)?;
+            n42_engine_types::executed_fields::remember_state_root(block_hash, root);
+            Ok((waited, root_at, std::time::Instant::now()))
+        })
+        .map_err(|err| format!("a thread for the early QMDB root: {err}"))?;
+    Ok(RootSlot { work, handle })
 }
 
 /// How many timings [`import_foreign_block`] returns (see its last lines).

@@ -269,8 +269,8 @@ impl LoopTimers {
     }
 
     /// `ns` of pool time as nanoseconds a transaction.
-    pub const fn per_tx(&self, ns: u64) -> u64 {
-        if self.txs == 0 { 0 } else { ns / self.txs }
+    pub fn per_tx(&self, ns: u64) -> u64 {
+        ns.checked_div(self.txs).unwrap_or(0)
     }
 }
 

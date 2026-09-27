@@ -989,6 +989,21 @@ fn fold_runs(scans: Vec<ChunkScan>) -> Vec<(Address, SenderTotal)> {
     by_sender.into_iter().collect()
 }
 
+/// A fault's sort key: its index, then its message. Two different senders'
+/// transactions never share an index, except at [`usize::MAX`] -- the
+/// balance fault every sender in error only that way ties at -- so the
+/// message (which leads with the sender's address) is what tells them apart.
+/// Without a total order here, which of two tied senders `check_senders`
+/// reports depended on the fold's hash map's iteration order: a per-process
+/// random seed, so a block with two such senders named a different one on
+/// different runs, and named a different one again when the includability
+/// check chunked the block by frame instead of by a plain 32nd (a different
+/// chunking folds the senders into the map in a different order). Both paths
+/// call this, so both settle on the same sender.
+fn fault_order(fault: &Fault) -> (usize, &str) {
+    (fault.index, fault.message.as_str())
+}
+
 /// Each sender's total against the parent's post-state: one account read, the
 /// nonces contiguous from the account's, the balance covering the whole
 /// share. On the worker pool, each chunk on a state provider of its own; the
@@ -1051,7 +1066,7 @@ where
                     None
                 };
                 if let Some(fault) = fault
-                    && first.as_ref().is_none_or(|held| fault.index < held.index)
+                    && first.as_ref().is_none_or(|held| fault_order(&fault) < fault_order(held))
                 {
                     first = Some(fault);
                 }
@@ -1064,7 +1079,7 @@ where
         // A provider that cannot answer is not a verdict on the block, so it
         // is reported whatever the block itself says.
         if let Some(fault) = chunk?
-            && first.as_ref().is_none_or(|held| fault.index < held.index)
+            && first.as_ref().is_none_or(|held| fault_order(&fault) < fault_order(held))
         {
             first = Some(fault);
         }

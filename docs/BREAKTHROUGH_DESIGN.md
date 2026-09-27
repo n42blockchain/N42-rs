@@ -782,3 +782,22 @@ the follower's execution is 2.5x the leader's for the same transactions (section
 leader's build path -- the sender partition, `BatchState`, the index shards, no graft, the build pool). Window 2
 falls to 619-738k at these offers (the base fee runs to 1e19 and the cycle to 0.22-0.26 s): window 1 is the
 metric, as always, but the second window's decay is steeper than at 1.1M and is noted.
+
+### 10.30 The follower through the leader's build path, off the fleet (b04460771..f5ec8b806)
+
+`bench_follower_import` (163k transfers, 154k accounts, 16 threads), ms:
+
+| path | exec | partition | batches wall (count, max / median) | fold | drop | merge |
+| --- | --- | --- | --- | --- | --- | --- |
+| components + graft (the fleet's path) | 86-88 | 12-14 | 58-59 (380, 8 / 2) | 5-7 | 5 | - |
+| senders + graft | 84-85 | 5-6 | 63-65 (32, 46-48 / 25) | 6-7 | 5 | - |
+| the build path (`N42_FOLLOWER_BUILD_PATH=1`) | **64-66** | 3-4 | 52 (32, 25 / 22-23) | 2 | 1 | 45 (one thread, beside the root) |
+
+The build path removes the partition (12-14 -> 3-4), the fold (5-7 -> 2) and the drop (5 -> 1) -- ~20 ms -- and
+the batches stay 23 ms each in two waves of 16, the leader's shape. The merge into one `BundleState` for the
+published output (which the child's check and early execution read) is 45 ms on one thread beside the root:
+longer than the root (35-38), so whether it pushes `fields_ready` or the child's vote later is the leg's
+question. The follower's threads with it: the build pool (16) + the check pool (4), then the root pool (8, or
+0 with `N42_FOLLOWER_ROOT_ON_BUILD_POOL=1`) + the merge thread beside the next block's 16. The fleet's 80-82
+against the leader's 32-34 is still not explained by the bench (its batches are the leader's 23). loop287:
+BASE / BP / BPR / BPb at the 1.25M offer.

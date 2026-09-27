@@ -3909,6 +3909,44 @@ pub struct ShardedExecution {
     pub residual: BundleState,
     /// Receipts and gas, as the serial executor's.
     pub result: reth_execution_types::BlockExecutionResult<Receipt>,
+    /// Where the call's time went around its batches.
+    pub split: BuildPathSplit,
+}
+
+/// Where a build-path execution ([`execute_transfers_build_path`]) spends
+/// the time its batches and its index do not: microseconds, always measured.
+/// The pieces the follower's `exec_ms` held unnamed (~14 ms of 72 on the
+/// fleet, loop288).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BuildPathSplit {
+    /// Before the partition: the block's environment and the output shards'
+    /// allocation.
+    pub setup_us: u64,
+    /// The (sender, recipient) keys read off the block; 0 when they were
+    /// made ahead ([`build_path_keys`]).
+    pub keys_us: u64,
+    /// The block's executor set up and its pre-execution changes (the
+    /// beacon-root and block-hash system calls).
+    pub pre_us: u64,
+    /// The executor's post-execution changes (withdrawals, requests).
+    pub post_us: u64,
+    /// How far the executor's pre- and post-execution outran the batches
+    /// when it runs beside them: 0 when they hid it.
+    pub executor_overrun_us: u64,
+    /// The run's own time outside the partition and the batch wall: the
+    /// slots' allocation, the results' hand-over, the partition's release.
+    pub sink_us: u64,
+    /// The executor's accounts taken out of the shards
+    /// ([`crate::output_shards::FrozenShards::take_cached`]).
+    pub cached_us: u64,
+    /// The fee credit, the transitions' merge and the residual's take.
+    pub residual_us: u64,
+    /// The receipts in block order.
+    pub receipts_us: u64,
+    /// What the receipts added after the index when built beside it.
+    pub receipts_wait_us: u64,
+    /// Whether the keys were made ahead of the call.
+    pub keys_ahead: bool,
 }
 
 impl ShardedExecution {
@@ -3967,6 +4005,7 @@ where
         keys.push((tx.signer(), to));
     }
     let keys_us = at.elapsed().as_micros() as u64;
+    let mut split = BuildPathSplit { keys_us, ..Default::default() };
 
     // The batches, as the leader's: the environment converted on the batch's
     // thread, each batch's bundle handed to the shards whole as it ends.
@@ -3977,10 +4016,13 @@ where
     let sink_shards = crate::output_shards::OutputShards::with_index(beneficiary, keys.len(), shard_count, true);
     let sink = |bundle: BundleState| sink_shards.add(bundle);
     let convert = |i: usize| ((), evm_config.tx_env(recovered[i]));
+    split.setup_us = (call_at.elapsed().as_micros() as u64).saturating_sub(keys_us);
+    let run_at = std::time::Instant::now();
     let run = match execute_for_build_run(&evm_env, &keys, &convert, open, Some(&sink), false, None) {
         Ok(run) => run,
         Err(why) => return Ok(Err(why)),
     };
+    split.sink_us = (run_at.elapsed().as_micros() as u64).saturating_sub((run.phases.partition_ms + run.phases.groups_ms) * 1000);
     if let Some(&first) = run.skipped.first() {
         // The build's refusal is a skip; for a sealed block it is the other
         // executor's to judge.
@@ -4004,14 +4046,20 @@ where
         let evm = evm_config.evm_with_env(&mut state, evm_env.clone());
         let mut executor = evm_config.create_executor(evm, ctx);
         executor.apply_pre_execution_changes()?;
+        split.pre_us = at.elapsed().as_micros() as u64;
+        let post_at = std::time::Instant::now();
         let (_, result) = executor.finish()?;
+        split.post_us = post_at.elapsed().as_micros() as u64;
         result
     };
     phases.finish_ms = at.elapsed().as_millis() as u64;
     let err = |e: &dyn std::fmt::Display| BlockExecutionError::other(std::io::Error::other(e.to_string()));
     // What the executor touched and the batches wrote: the batches' change
     // on top of the executor's value. The rest stays in the shards.
+    let cached_at = std::time::Instant::now();
     shards.take_cached(&mut state);
+    split.cached_us = cached_at.elapsed().as_micros() as u64;
+    let residual_at = std::time::Instant::now();
     let fees = shards.beneficiary_delta();
     if !fees.is_zero() {
         let current = state.basic(beneficiary).map_err(|e| err(&e))?;
@@ -4029,6 +4077,7 @@ where
     }
     state.merge_transitions(BundleRetention::Reverts);
     let residual = state.take_bundle();
+    split.residual_us = residual_at.elapsed().as_micros() as u64;
     // The index, the take and the fee: the executor's own part is `finish_ms`.
     phases.merge_ms = (merge_at.elapsed().as_millis() as u64).saturating_sub(phases.finish_ms);
     // Of `merge_ms`: the index over the batches' maps.
@@ -4046,13 +4095,14 @@ where
         })
         .collect();
     phases.receipts_us = at.elapsed().as_micros() as u64;
+    split.receipts_us = phases.receipts_us;
     let result = reth_execution_types::BlockExecutionResult { receipts, gas_used: cumulative, ..result };
     let at = std::time::Instant::now();
     drop(run);
     drop(keys);
     phases.drop_us = at.elapsed().as_micros() as u64;
     phases.total_us = call_at.elapsed().as_micros() as u64;
-    Ok(Ok((ShardedExecution { shards, residual, result }, phases)))
+    Ok(Ok((ShardedExecution { shards, residual, result, split }, phases)))
 }
 
 #[cfg(test)]
@@ -5447,7 +5497,7 @@ mod tests {
             let merged = sharded.merged();
             let merge_ms = merge_at.elapsed().as_millis();
             println!(
-                "build-path #{round}: call {call_ms} ms  partition {} batches {} ({} groups, {} batches, {} threads, batch max {} median {}) fold {} [index {}] finish {} receipts {} drop {}  -> merged behind {} ms, {} accounts",
+                "build-path #{round}: call {call_ms} ms  partition {} batches {} ({} groups, {} batches, {} threads, batch max {} median {}) fold {} [index {}] finish {} receipts {} drop {} | us: setup {} keys {} (ahead {}) pre {} post {} overrun {} sink {} cached {} residual {} receipts {} (wait {})  -> merged behind {} ms, {} accounts",
                 phases.partition_ms,
                 phases.groups_ms,
                 phases.groups,
@@ -5460,6 +5510,17 @@ mod tests {
                 phases.finish_ms,
                 phases.receipts_us / 1000,
                 phases.drop_us / 1000,
+                sharded.split.setup_us,
+                sharded.split.keys_us,
+                sharded.split.keys_ahead,
+                sharded.split.pre_us,
+                sharded.split.post_us,
+                sharded.split.executor_overrun_us,
+                sharded.split.sink_us,
+                sharded.split.cached_us,
+                sharded.split.residual_us,
+                sharded.split.receipts_us,
+                sharded.split.receipts_wait_us,
                 merge_ms,
                 merged.state.len(),
             );

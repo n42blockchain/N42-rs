@@ -2019,6 +2019,21 @@ where
                         reads_cache = phases.transfer_timers.reads_cache(),
                         reads_provider = phases.transfer_timers.reads_provider,
                         reads_view = phases.transfer_timers.reads_view,
+                        // Around the batches ([`BuildPathSplit`]): what
+                        // `exec_ms` holds beside the partition, the batch
+                        // wall and the index.
+                        exec_setup_ms = out.split.setup_us / 1000,
+                        exec_keys_ms = out.split.keys_us / 1000,
+                        keys_ahead = out.split.keys_ahead,
+                        exec_pre_ms = out.split.pre_us / 1000,
+                        exec_post_ms = out.split.post_us / 1000,
+                        exec_overrun_ms = out.split.executor_overrun_us / 1000,
+                        exec_sink_ms = out.split.sink_us / 1000,
+                        exec_cached_ms = out.split.cached_us / 1000,
+                        exec_residual_ms = out.split.residual_us / 1000,
+                        exec_receipts_ms = out.split.receipts_us / 1000,
+                        exec_receipts_wait_ms = out.split.receipts_wait_us / 1000,
+                        exec_drop_ms = phases.drop_us / 1000,
                         "build-path import phases"
                     );
                     sharded = Some(out);
@@ -2258,7 +2273,7 @@ where
             // check and the published output need is merged on a thread of
             // its own beside it, while this thread runs the post-execution
             // checks; the child's execution reads the shards themselves.
-            let n42_engine_types::parallel_transfer::ShardedExecution { shards, residual, result } = sharded;
+            let n42_engine_types::parallel_transfer::ShardedExecution { shards, residual, result, .. } = sharded;
             let shards = Arc::new(shards);
             let residual: ParentOutput = Arc::new(reth_provider::BlockExecutionOutput {
                 state: residual,

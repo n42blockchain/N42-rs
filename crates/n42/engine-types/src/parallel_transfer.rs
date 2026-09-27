@@ -103,6 +103,8 @@ pub struct Phases {
     /// How many batches of groups ran (the build's [`execute_for_build`]
     /// runs a sender per group and several groups per batch).
     pub batches: usize,
+    /// The threads of the pool the batches ran on.
+    pub threads: usize,
     /// `N42_PHASE_TIMERS=1` (plan v6 6.5/6.6): the block's transfers summed
     /// over every batch that ran part of it -- see
     /// [`crate::fast_transfer::TransferTimers`]. Zero when the flag is off.
@@ -3652,6 +3654,7 @@ where
         groups.iter().map(|g| vec![g]).collect()
     };
     phases.batches = batches.len();
+    phases.threads = rayon::current_num_threads();
 
     // The batches, on the worker pool. Each yields its bundle (the accounts
     // it changed, with their originals) and the gas each transaction used --
@@ -3662,12 +3665,17 @@ where
     phases.batch_us = at.elapsed().as_micros() as u64;
     let at = std::time::Instant::now();
     type FollowerBatchResult =
-        (Option<revm::database::BundleState>, Vec<(usize, u64)>, crate::fast_transfer::TransferTimers);
+        (Option<revm::database::BundleState>, Vec<(usize, u64)>, crate::fast_transfer::TransferTimers, BatchSpan);
+    // Each batch's span against this instant, as the build's ([`BatchSpans`]).
+    let batches_at = std::time::Instant::now();
     let results: Vec<Result<FollowerBatchResult, NotParallel>> = {
         use rayon::prelude::*;
         batches
             .par_iter()
             .map(|members| {
+                let start_us = batches_at.elapsed().as_micros() as u64;
+                let cpu_start = thread_cpu_ns();
+                let batch_txs = members.iter().map(|group| group.len()).sum::<usize>();
                 let db = open().ok_or(NotParallel::NoState)?;
                 let (bundle, gas) = if follower_batch_state() {
                     follower_batch(members, &txs, &evm_env, db)?
@@ -3694,23 +3702,27 @@ where
                 // See the leader's batch loop above: drained here, on the
                 // batch's own thread, `N42_PHASE_TIMERS=1` only.
                 let timers = crate::fast_transfer::drain_timers();
-                match staged.as_ref() {
+                let bundle = match staged.as_ref() {
                     Some(staged) => {
                         staged.lock().expect("the staged graft's lock").add(bundle);
-                        Ok((None, gas, timers))
+                        None
                     }
-                    None => Ok((Some(bundle), gas, timers)),
-                }
+                    None => Some(bundle),
+                };
+                Ok((bundle, gas, timers, BatchSpan::close(start_us, cpu_start, batch_txs, batches_at)))
             })
             .collect()
     };
+    let batches_us = batches_at.elapsed().as_micros() as u64;
     phases.groups_ms = at.elapsed().as_millis() as u64;
     let at = std::time::Instant::now();
     let mut bundles = Vec::with_capacity(results.len());
     let mut gas_of = vec![0u64; txs.len()];
+    let mut spans: Vec<BatchSpan> = Vec::with_capacity(results.len());
     for r in results {
         match r {
-            Ok((bundle, gas, timers)) => {
+            Ok((bundle, gas, timers, span)) => {
+                spans.push(span);
                 for (i, g) in gas {
                     gas_of[i] = g;
                 }
@@ -3722,6 +3734,7 @@ where
             Err(why) => return Ok(Err(why)),
         }
     }
+    phases.batch_spans = BatchSpans::of(&mut spans, batches_us);
     phases.gas_us = at.elapsed().as_micros() as u64;
 
     // `N42_FOLLOWER_MERGE_BEHIND=1`: the grafted reverts leave the staged
@@ -5150,7 +5163,7 @@ mod tests {
                     + phases.receipts_us
                     + phases.drop_us;
                 println!(
-                    "{label} #{round}: call {} ms  partition {} (env {}) batch {} groups {} ({} groups, {} batches) gas {} merge {} [graft {} take {} reverts {}] finish {} receipts {} drop {} other {}  -> {} accounts, {} reverts",
+                    "{label} #{round}: call {} ms  partition {} (env {}) batch {} groups {} ({} groups, {} batches, {} threads, batch max {} median {}) gas {} merge {} [graft {} take {} reverts {}] finish {} receipts {} drop {} other {}  -> {} accounts, {} reverts",
                     at.elapsed().as_millis(),
                     phases.partition_ms,
                     phases.env_us / 1000,
@@ -5158,6 +5171,9 @@ mod tests {
                     phases.groups_ms,
                     phases.groups,
                     phases.batches,
+                    phases.threads,
+                    phases.batch_spans.max_ms,
+                    phases.batch_spans.median_ms,
                     phases.gas_us / 1000,
                     phases.merge_ms,
                     phases.graft_ms,

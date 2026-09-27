@@ -994,6 +994,41 @@ struct Executed {
     /// opening) and ended, for the import's timeline.
     exec_started: std::time::Instant,
     exec_ended: std::time::Instant,
+    /// The parallel execution taken apart ([`ExecSplit`]); zeros on the
+    /// serial path.
+    split: ExecSplit,
+}
+
+/// The follower's parallel execution taken apart for the direct import's
+/// line, the leader's `par_*` fields' twins: the partition, the batches'
+/// wall, the graft or fold into the block's output (by component: the
+/// streamed graft's install, the take and the reverts; on the build path:
+/// the index over the batches' maps, the executor's take and the fee
+/// credit), the batch count, the
+/// pool's threads, and the longest and median batch, milliseconds.
+#[derive(Debug, Clone, Copy, Default)]
+struct ExecSplit {
+    part_ms: u64,
+    batches_ms: u64,
+    graft_ms: u64,
+    batches: u64,
+    threads: u64,
+    batch_max_ms: u64,
+    batch_median_ms: u64,
+}
+
+impl ExecSplit {
+    const fn of(phases: &n42_engine_types::parallel_transfer::Phases) -> Self {
+        Self {
+            part_ms: phases.partition_ms,
+            batches_ms: phases.groups_ms,
+            graft_ms: phases.merge_ms,
+            batches: phases.batches as u64,
+            threads: phases.threads as u64,
+            batch_max_ms: phases.batch_spans.max_ms,
+            batch_median_ms: phases.batch_spans.median_ms,
+        }
+    }
 }
 
 /// What the block's road to this node's vote cost before the import began,
@@ -1748,6 +1783,7 @@ where
         // worker pool (`parallel_transfer`), partitioned by the accounts it
         // touches; anything it cannot take falls back to the serial executor.
         let mut output = None;
+        let mut split = ExecSplit::default();
         if follower_parallel() {
             // `N42_PHASE_TIMERS=1`: counts each batch's reads by door (plan
             // v6 6.5/6.6). `CountedDb` is a passthrough when the flag is
@@ -1837,6 +1873,7 @@ where
                         reverts_wait_ms = phases.reverts_wait_us / 1000,
                         "parallel import phases"
                     );
+                    split = ExecSplit::of(&phases);
                     output = Some(out);
                 }
                 Err(why) => {
@@ -1872,6 +1909,7 @@ where
             exec_ms: exec_ended.duration_since(executed_at).as_millis() as u64,
             exec_started: executed_at,
             exec_ended,
+            split,
         })
     };
     let Executed {
@@ -1884,6 +1922,7 @@ where
         exec_ms,
         exec_started,
         exec_ended,
+        split,
     } = match roads_at {
         None => execute_block()?,
         Some(roads_at) => {
@@ -2182,12 +2221,20 @@ where
             ms_between(road_started, root_end),
             if deferred { ms_between(road_started, root_end.max(receipts_filed)) } else { 0 },
             parent_fields_wait_us.load(std::sync::atomic::Ordering::Relaxed) / 1000,
+            // The execution taken apart ([`ExecSplit`]).
+            split.part_ms,
+            split.batches_ms,
+            split.graft_ms,
+            split.batches,
+            split.threads,
+            split.batch_max_ms,
+            split.batch_median_ms,
         ],
     ))
 }
 
 /// How many timings [`import_foreign_block`] returns (see its last lines).
-pub const IMPORT_TIMES: usize = 18;
+pub const IMPORT_TIMES: usize = 25;
 
 /// Copies a block's post-state into the read cache the next import starts
 /// from, and files it under the block's hash.

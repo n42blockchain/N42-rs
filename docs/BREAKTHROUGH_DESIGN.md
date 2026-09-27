@@ -308,3 +308,32 @@ and the fold is S parallel tasks each building its own shard map with the exact 
 fold is one parallel pass of 147k / 16 threads (~3-5 ms wall) instead of a serialised insert. With that the
 leader's period is 128 - 42 - 10 = ~76 + the exec, and pacing 125 becomes the bound (loop272 showed pacing 100
 only raises B while the seal is 128; with the seal at ~80 the pacing can follow).
+
+### 10.9 Output shards v2 (loop274): the lock-free fold loses too; the flag-off legs read 1.076-1.081M
+
+Same configuration as 10.8; the shards are 8b48b24a4 (batch-local per-shard vectors, S parallel fold tasks
+with the capacity reserved, the QMDB root and the hashed post-state read the frozen shards, the merge on a
+thread beside the roots).
+
+| leg | win1 | cycle | B | D | E | par_exec | append (pool) | fold (wall) | graft | state_wait | sealed_at | roots | state_ready | merge |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| OFF | **1,080,927** | 142 | 57 | 52.6 | 8 | 56 | - | - | 42 | 11 | 129 | 39 | 10 | - |
+| S16 | 1,021,392 | 155 | 48 | 71.9 | 18 | 62 | 31 | 34 | 0 | 0 | 158 | 66 | 66 | 64 |
+| S64 | 1,026,844 | 159 | - | - | - | 65 | 33 | 33 | 0 | 0 | 161 | 67 | 67 | 64 |
+| S16P100 | 1,026,254 | 159 | - | - | - | 62 | 30 | 33 | 0 | 0 | 157 | 66 | 66 | 64 |
+| OFFb | 1,075,751 | 145 | - | - | - | 60 | - | - | 42 | 12 | 134 | 36 | 10 | - |
+
+The graft is 42 ms single-threaded for ~147k accounts -- 0.29 us an account, already memory speed -- and every
+partition of it costs another pass over the same accounts: the append 30-37 ms of pool time inside the execution
+(`par_exec` +6-9), the fold 33-34 ms wall (16 tasks each 9k inserts: not 3-5 -- the task's map build is as
+memory-bound as the graft and the pool's wake-up is in it), the roots 39 -> 66 reading the view over S maps, and
+the merge 64 beside them. The seal moved to 157-161 and the window fell 5% twice; pacing 100 changed nothing.
+**Step 3 is falsified twice** (the mutex fold in 10.8, the lock-free fold here); the code stays behind
+`N42_OUTPUT_SHARDS` (0 = off) and the graft stays. The leader's period is not to be split by address -- it is
+to be shortened where a term is not memory-bound: the selection (`start_best_ms` 25 -- the frame selector still
+walks transactions where the road now takes 326 Arcs), the prep 10, the commit 9 (the body copy 6), the seal 6.
+
+The two flag-off legs are the best windows so far: 1,080,927 and 1,075,751 (twelve legs now at 1.021-1.081M;
+tag `fleet3-1.08M-window-20260927`). The chain per block on the leader is start 26 + prep 10 + exec 56 + commit
+9 + seal 6 + state wait 10 = ~117 of the 129 `sealed_at`, and the cycle is that plus the handover to the next
+build (~15).

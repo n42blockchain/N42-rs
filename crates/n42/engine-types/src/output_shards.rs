@@ -10,12 +10,16 @@
 //! 20-29 ms for it (6.13). A sharded insert that then *merged* the shards into
 //! that one map was 2.6x slower (6.19): the merge was the cost.
 //!
-//! Here a batch splits the accounts it touched by the shard that owns each
-//! address (the address's top bits) into vectors of its own, as the batch
-//! ends, on the batch's thread: no lock, no map. When the batches are done the
-//! fold is one parallel pass on the build pool, a task a shard, each building
-//! its shard's map from every batch's vector for it with the exact capacity
-//! reserved -- nothing shared between the tasks, nothing locked. (loop273: the
+//! Here a batch hands its bundle over whole as it ends, with the addresses it
+//! touched listed by the shard that owns each (the address's top bits), on
+//! the batch's thread: no lock, no account moved. When the batches are done
+//! the fold is one parallel pass on the build pool, a task a shard, each
+//! copying its range's accounts out of every batch's map straight into its
+//! shard's map with the exact capacity reserved -- nothing written that
+//! another task reads, nothing locked. (v2 moved every account into a
+//! per-range vector inside the execution first: 55 ms of pool time on the
+//! bench's block for a 1 ms faster fold, `tests/output_shards_bench.rs`.)
+//! (loop273: the
 //! first shape, every batch inserting into the shard maps under per-shard
 //! locks as it ended, cost 122-138 ms of pool time and 535-637 ms of waiting,
 //! `docs/BREAKTHROUGH_DESIGN.md` 10.8.) Nothing is merged
@@ -95,9 +99,18 @@ impl Shard {
     /// out with its credit summed; an account an earlier batch wrote has this
     /// batch's change added to it (every batch read the parent, so each
     /// change is a delta on the same original) and keeps the first revert.
-    fn add(&mut self, beneficiary: Address, run: Vec<(Address, BundleAccount)>, reverts: Vec<(Address, AccountRevert)>) {
+    ///
+    /// The batch's map is read in place, shared with the other ranges'
+    /// tasks: an account is cloned once, into its slot of this range's map,
+    /// and only when it is new here (a repeated one adds its delta).
+    fn add<'a>(
+        &mut self,
+        beneficiary: Address,
+        run: impl Iterator<Item = (&'a Address, &'a BundleAccount)>,
+        reverts: impl Iterator<Item = &'a (Address, AccountRevert)>,
+    ) {
         let mut repeated: AddressHashSet = Default::default();
-        for (address, account) in run {
+        for (&address, account) in run {
             let Some(info) = account.info.as_ref() else { continue };
             let (new_balance, new_nonce) = (info.balance, info.nonce);
             let (old_balance, old_nonce) = match &account.original_info {
@@ -109,51 +122,74 @@ impl Shard {
                 repeated.insert(address);
                 continue;
             }
-            if let Some(staged) = self.state.get_mut(&address).and_then(|a| a.info.as_mut()) {
-                repeated.insert(address);
-                staged.balance = if new_balance >= old_balance {
-                    staged.balance.saturating_add(new_balance - old_balance)
-                } else {
-                    staged.balance.saturating_sub(old_balance - new_balance)
-                };
-                staged.nonce += new_nonce - old_nonce;
-                continue;
+            // One probe: the entry both says whether an earlier batch wrote
+            // the account and is where a new one goes.
+            match self.state.entry(address) {
+                alloy_primitives::map::hash_map::Entry::Occupied(mut held) => {
+                    repeated.insert(address);
+                    if let Some(staged) = held.get_mut().info.as_mut() {
+                        staged.balance = if new_balance >= old_balance {
+                            staged.balance.saturating_add(new_balance - old_balance)
+                        } else {
+                            staged.balance.saturating_sub(old_balance - new_balance)
+                        };
+                        staged.nonce += new_nonce - old_nonce;
+                        continue;
+                    }
+                    // Held without an info (never: only an account with
+                    // one is put in): replaced, as an insert would.
+                    repeated.remove(&address);
+                    self.state_size += account.size_hint();
+                    held.insert(account.clone());
+                }
+                alloy_primitives::map::hash_map::Entry::Vacant(slot) => {
+                    self.state_size += account.size_hint();
+                    slot.insert(account.clone());
+                }
             }
-            self.state_size += account.size_hint();
-            self.state.insert(address, account);
-        }
-        if repeated.is_empty() {
-            self.reverts.extend(reverts);
-            return;
         }
         for (address, revert) in reverts {
-            if !repeated.contains(&address) {
-                self.reverts.push((address, revert));
+            if repeated.is_empty() || !repeated.contains(address) {
+                self.reverts.push((*address, revert.clone()));
             }
         }
     }
 }
 
-/// One batch's accounts and reverts of one address range.
-type ShardRun = (Vec<(Address, BundleAccount)>, Vec<(Address, AccountRevert)>);
+/// One batch's output as the batch left it -- its account map, whole, and
+/// its reverts in one list -- with, for each address range, the addresses
+/// of its accounts there (in the map's order) and the positions of its
+/// reverts there.
+struct BatchOut {
+    accounts: AddressHashMap<BundleAccount>,
+    reverts: Vec<(Address, AccountRevert)>,
+    addresses: Vec<Vec<Address>>,
+    revert_at: Vec<Vec<u32>>,
+}
 
-/// The block's output while the batches run: each batch's accounts split by
-/// address range into vectors of its own, handed over once as the batch ends.
+impl std::fmt::Debug for BatchOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BatchOut").field("accounts", &self.accounts.len()).field("reverts", &self.reverts.len()).finish()
+    }
+}
+
+/// The block's output while the batches run: each batch's map handed over
+/// whole as the batch ends, split by address range only at the fold.
 #[derive(Debug)]
 pub struct OutputShards {
     beneficiary: Address,
     count: usize,
-    /// One entry a batch, in the order the batches ended: the batch's runs,
-    /// one a shard. The lock is taken once a batch, for one push.
-    batches: Mutex<Vec<Vec<ShardRun>>>,
+    /// One entry a batch, in the order the batches ended. The lock is taken
+    /// once a batch, for one push.
+    batches: Mutex<Vec<BatchOut>>,
     contracts: Mutex<B256HashMap<RevmBytecode>>,
-    /// Pool time inside [`Self::add`] (the split), nanoseconds.
+    /// Pool time inside [`Self::add`] (the hand-over), nanoseconds.
     append_ns: AtomicU64,
 }
 
 impl OutputShards {
     /// `shards` address ranges (at least one) for a block expected to touch
-    /// `_capacity` accounts (each shard's map is sized exactly at the fold).
+    /// `_capacity` accounts (each shard's map is sized at the fold).
     pub fn new(beneficiary: Address, _capacity: usize, shards: usize) -> Self {
         let count = shards.clamp(1, MAX_SHARDS);
         Self {
@@ -165,68 +201,108 @@ impl OutputShards {
         }
     }
 
-    /// One batch's bundle split by address range, on the batch's thread, into
-    /// vectors of its own: no shard map is touched and no shard lock taken.
+    /// One batch's bundle handed over whole, on the batch's thread, with its
+    /// addresses listed by range: no account is moved and no shard map
+    /// touched. (v2 moved every 264-byte account into a vector of its range
+    /// here, inside the execution: 55 ms of pool time on the bench's block,
+    /// 30-37 on the fleet's -- `tests/output_shards_bench.rs`. A list of
+    /// addresses is a twelfth of the bytes; the account is copied once, at
+    /// the fold, straight into its range's map.)
     pub fn add(&self, bundle: BundleState) {
         let at = std::time::Instant::now();
         let BundleState { state: accounts, contracts, mut reverts, .. } = bundle;
-        let taken = std::mem::take(&mut *reverts);
+        let mut taken = std::mem::take(&mut *reverts);
+        // One transition merge leaves one list: taken as it is.
+        let reverts = if taken.len() == 1 { taken.pop().unwrap_or_default() } else { taken.into_iter().flatten().collect() };
         if !contracts.is_empty() {
             self.contracts.lock().unwrap_or_else(PoisonError::into_inner).extend(contracts);
         }
         let count = self.count;
-        let each = accounts.len() / count + accounts.len() / (4 * count) + 1;
-        let mut runs: Vec<ShardRun> = (0..count).map(|_| (Vec::with_capacity(each), Vec::new())).collect();
-        for (address, account) in accounts {
-            runs[shard_index(&address, count)].0.push((address, account));
+        let each = |n: usize| n / count + n / (4 * count) + 1;
+        let mut addresses: Vec<Vec<Address>> = (0..count).map(|_| Vec::with_capacity(each(accounts.len()))).collect();
+        for address in accounts.keys() {
+            addresses[shard_index(address, count)].push(*address);
         }
-        for (address, revert) in taken.into_iter().flatten() {
-            runs[shard_index(&address, count)].1.push((address, revert));
+        let mut revert_at: Vec<Vec<u32>> = (0..count).map(|_| Vec::with_capacity(each(reverts.len()))).collect();
+        for (at, (address, _)) in reverts.iter().enumerate() {
+            revert_at[shard_index(address, count)].push(at as u32);
         }
-        self.batches.lock().unwrap_or_else(PoisonError::into_inner).push(runs);
+        let out = BatchOut { accounts, reverts, addresses, revert_at };
+        self.batches.lock().unwrap_or_else(PoisonError::into_inner).push(out);
         self.append_ns.fetch_add(at.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
     /// The batches are done: the fold. One task a shard on the build pool,
-    /// each taking every batch's run for its shard (in the order the batches
-    /// ended) and building the shard's map with the exact capacity reserved,
-    /// with `StagedGraft::add`'s rules. Every batch read the parent, so an
-    /// account several batches wrote gets their deltas summed in any order,
-    /// and each of their reverts is the same parent value.
+    /// each walking every batch's map (in the order the batches ended) for
+    /// the accounts of its range and building the shard's map with
+    /// `StagedGraft::add`'s rules. Every batch read the parent, so an account
+    /// several batches wrote gets their deltas summed in any order, and each
+    /// of their reverts is the same parent value. The batches' maps are
+    /// freed on the pool afterwards, off the caller's path.
     pub fn freeze(self) -> FrozenShards {
         let at = std::time::Instant::now();
         let beneficiary = self.beneficiary;
         let count = self.count;
         let batches = self.batches.into_inner().unwrap_or_else(PoisonError::into_inner);
-        // Transposed: shard `s` gets every batch's run for `s`. Only the
-        // vectors' headers move.
-        let mut per_shard: Vec<Vec<ShardRun>> = (0..count).map(|_| Vec::with_capacity(batches.len())).collect();
-        for runs in batches {
-            for (index, run) in runs.into_iter().enumerate() {
-                if !(run.0.is_empty() && run.1.is_empty()) {
-                    per_shard[index].push(run);
-                }
-            }
-        }
-        let fold = move |runs: Vec<ShardRun>| {
+        let transposed = std::time::Instant::now();
+        let batches_ref = &batches;
+        let fold = move |index: usize| {
+            let start = std::time::Instant::now();
             let mut shard = Shard::default();
-            shard.state.reserve(runs.iter().map(|run| run.0.len()).sum());
-            shard.reverts.reserve(runs.iter().map(|run| run.1.len()).sum());
-            for (run, reverts) in runs {
-                shard.add(beneficiary, run, reverts);
+            // The exact capacity: every batch listed its addresses here.
+            shard.state.reserve(batches_ref.iter().map(|batch| batch.addresses[index].len()).sum());
+            shard.reverts.reserve(batches_ref.iter().map(|batch| batch.revert_at[index].len()).sum());
+            for batch in batches_ref {
+                shard.add(
+                    beneficiary,
+                    batch.addresses[index].iter().filter_map(|address| batch.accounts.get_key_value(address)),
+                    batch.revert_at[index].iter().filter_map(|at| batch.reverts.get(*at as usize)),
+                );
             }
-            shard
+            (shard, start, std::time::Instant::now())
         };
-        let shards: Vec<Shard> = {
+        let folded: Vec<(Shard, std::time::Instant, std::time::Instant)> = {
             use rayon::prelude::*;
-            crate::parallel_transfer::build_pool().install(|| per_shard.into_par_iter().map(fold).collect())
+            crate::parallel_transfer::build_pool().install(|| (0..count).into_par_iter().map(fold).collect())
         };
+        let done = std::time::Instant::now();
+        // Freed on the pool, a job a batch, off the caller's path.
+        for batch in batches {
+            crate::parallel_transfer::build_pool().spawn(move || drop(batch));
+        }
+        // Where the fold's wall goes: the set-up, the wait for the pool's
+        // first thread, the spread of the tasks' starts, the slowest task's
+        // own work, and the collect after the last one.
+        let first = folded.iter().map(|(_, start, _)| *start).min().unwrap_or(done);
+        let last_start = folded.iter().map(|(_, start, _)| *start).max().unwrap_or(done);
+        let last_end = folded.iter().map(|(_, _, end)| *end).max().unwrap_or(done);
+        let task_max = folded.iter().map(|(_, start, end)| end.duration_since(*start)).max().unwrap_or_default();
+        let split = FoldSplit {
+            transpose_us: transposed.duration_since(at).as_micros() as u64,
+            queue_us: first.saturating_duration_since(transposed).as_micros() as u64,
+            skew_us: last_start.duration_since(first).as_micros() as u64,
+            task_max_us: task_max.as_micros() as u64,
+            tail_us: done.saturating_duration_since(last_end).as_micros() as u64,
+        };
+        let shards: Vec<Shard> = folded.into_iter().map(|(shard, _, _)| shard).collect();
+        let fold_ns = at.elapsed().as_nanos() as u64;
+        tracing::info!(
+            target: "payload_builder",
+            fold_us = fold_ns / 1000,
+            transpose_us = split.transpose_us,
+            queue_us = split.queue_us,
+            skew_us = split.skew_us,
+            task_max_us = split.task_max_us,
+            tail_us = split.tail_us,
+            "output shards folded"
+        );
         FrozenShards {
             beneficiary,
             shards,
             contracts: self.contracts.into_inner().unwrap_or_else(PoisonError::into_inner),
             append_ns: self.append_ns.into_inner(),
-            fold_ns: at.elapsed().as_nanos() as u64,
+            fold_ns,
+            split,
         }
     }
 }
@@ -239,9 +315,33 @@ pub struct FrozenShards {
     contracts: B256HashMap<RevmBytecode>,
     append_ns: u64,
     fold_ns: u64,
+    split: FoldSplit,
+}
+
+/// The fold's wall time taken apart ([`OutputShards::freeze`]), microseconds:
+/// what the node's fold number is made of, which a bench off the node cannot
+/// say (the fold itself is 3.5-5 ms of 16 threads on the block's shape,
+/// `tests/output_shards_bench.rs`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FoldSplit {
+    /// Batch-major runs moved to shard-major.
+    pub transpose_us: u64,
+    /// From the hand-off to the pool to the first task's start.
+    pub queue_us: u64,
+    /// From the first task's start to the last one's.
+    pub skew_us: u64,
+    /// The slowest task's own work.
+    pub task_max_us: u64,
+    /// From the last task's end to the pool handing the shards back.
+    pub tail_us: u64,
 }
 
 impl FrozenShards {
+    /// The fold's wall time taken apart.
+    pub const fn fold_split(&self) -> FoldSplit {
+        self.split
+    }
+
     /// How many address ranges.
     pub fn shard_count(&self) -> usize {
         self.shards.len()
@@ -372,41 +472,33 @@ impl FrozenShards {
     }
 
     /// [`Self::merged_with`] without taking the residual: the shards' accounts
-    /// copied out a task a shard on the build pool, then moved into the one
-    /// map with its capacity reserved. Built behind the seal, beside the
-    /// roots, which read [`Self::view`] instead.
+    /// cloned straight into the one map with its capacity reserved, on the
+    /// caller's thread (the build pool stays free for the next build). Built
+    /// behind the seal, beside the roots, which read [`Self::view`] instead.
     pub fn merged(&self, residual: &BundleState) -> BundleState {
-        use rayon::prelude::*;
         let newer = &residual.state;
-        // Per shard: its accounts (the newer value over any the executor
-        // changed again) and its change to the size hint.
-        let parts: Vec<(Vec<(Address, BundleAccount)>, i128)> = crate::parallel_transfer::build_pool().install(|| {
-            self.shards
-                .par_iter()
-                .map(|shard| {
-                    let mut out = Vec::with_capacity(shard.state.len());
-                    let mut size = shard.state_size as i128;
-                    for (address, account) in &shard.state {
-                        match (!newer.is_empty()).then(|| newer.get(address)).flatten() {
-                            Some(over) => {
-                                let merged = overlaid(account, over);
-                                size += merged.size_hint() as i128 - account.size_hint() as i128 - over.size_hint() as i128;
-                                out.push((*address, merged));
-                            }
-                            None => out.push((*address, account.clone())),
-                        }
-                    }
-                    (out, size)
-                })
-                .collect()
-        });
-        let total: usize = parts.iter().map(|(out, _)| out.len()).sum::<usize>() + newer.len();
+        let total: usize = self.accounts() + newer.len();
         let mut state: AddressHashMap<BundleAccount> = Default::default();
         state.reserve(total);
         let mut size = residual.state_size as i128;
-        for (out, part_size) in parts {
-            size += part_size;
-            state.extend(out);
+        // One pass, each account cloned straight into its slot of the one
+        // map: the copy into per-shard vectors on the build pool first, then
+        // moved into the map, wrote and read every account a second time and
+        // put sixteen threads of memory traffic beside the roots.
+        for shard in &self.shards {
+            size += shard.state_size as i128;
+            for (address, account) in &shard.state {
+                match (!newer.is_empty()).then(|| newer.get(address)).flatten() {
+                    Some(over) => {
+                        let merged = overlaid(account, over);
+                        size += merged.size_hint() as i128 - account.size_hint() as i128 - over.size_hint() as i128;
+                        state.insert(*address, merged);
+                    }
+                    None => {
+                        state.insert(*address, account.clone());
+                    }
+                }
+            }
         }
         for (address, account) in newer {
             if !self.holds(address) {

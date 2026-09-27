@@ -646,3 +646,20 @@ The bench does not reproduce the fleet's 3.3 us outside `transfer` (its loop was
 the fleet's loop spends is still to be named (loop283, the same keys on the fleet: the fetch's `to_consensus`
 clone and `tx_env`, `OutputShards::add` in the close, `open_db` in the setup are not in the bench). The view's
 per-read lock is the next term either way (step 4c: a snapshot per batch, the answer counter per thread).
+
+### 10.23 Step 4b on the fleet (loop283): the execution 58 -> 48, the seal 114-118, and the loop named
+
+| leg | win1 | cycle | par_exec | batch max / median | sealed_at | loop ns a transfer: fetch / transfer / other / sink / gas | batch close / setup ns | exec_read (pool ms) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| T | 1,074,392 | 152 | 48 | 23 / 17 | 114 | 451 / 1,704 / 302 / 137 / 25 | 490 / 9 | 191-265 |
+| Tb | **1,090,470** | 149 | 49 | 24 / 17 | 118 | 457 / 1,704 / 302 / 137 / 25 | 504 / 10 | 200-265 |
+| P100 (no timers) | 1,078,572 | 151 | 48 | 24 / 16 | 117 | - | - | - |
+
+The three cuts hold on the fleet: the batch 29 -> 23-24, `par_exec` 58 -> 48-49, `sealed_at` 123 -> 114-118.
+The loop on the fleet, per transfer: transfer 1.70 us (the reads' 1.2-1.6 with the sampler's bias still in the
+fleet build), **fetch 0.45** (the bench's 0.05: the pooled transaction's `to_consensus` clone and `tx_env` on a
+0x50 envelope), other 0.30, sink 0.14, gas 0.03, and the batch close 0.49 a transfer (the bundle build and the
+sink's hand-over) -- 3.1 us in all, of which 1.4 is outside `transfer`. The cycle did not follow the seal this
+time (149-152 against 114-118): the floor is elsewhere now -- the followers' import (205-207 for a full block,
+overlapped) and their vote after it (section 5), or the road twice (10.18). Next, in parallel: the view's
+per-read lock (4c, on both sides), the fetch and the close (4d), and section 5 on the followers.

@@ -982,3 +982,20 @@ batch dropped 28-44 blocks of records -- 163,000 ops each, one allocation a valu
 twig trees -- and freed them under the lock: 374 ms to free (0.1 ms under the lock once handed out). The fix
 hands the dropped records back and frees them on a release thread after the lock. `state_wait_on=` names the
 child's wait (block 804's 341 is not this lock). loop292: three P100 legs and a P90.
+
+### 10.39 Defect 22's fix on the fleet (loop292): worse -- the freeing moved, it did not shrink
+
+| leg | win1 | cycle | sealed_at median / p90 / over 130 | QMDB releases | follower fields | imports > 600 ms | win2 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| P100 | 1,075,288 | 151 | 121 / 224 / 507 | 290 | 119 | 54 | 646k |
+| P100b | 964,222 | 168 | 114 / 200 / 430 | 306 | 116 | 43 | 830k |
+| P100c | 1,195,725 | 135 | 108 / 174 / 358 | 332 | 108 | 34 | 814k |
+| P90 | 1,200,457 | 135 | 110 / 177 / 355 | 338 | 108 | 39 | 818k |
+
+Against loop291 (seal 102 / p90 153 / 167 over 130, 1,211k): the release fires 290-338 times a leg -- every
+three blocks, not once per batch -- and the seal's tail widened (p90 174-224, 355-507 builds over 130) with
+the legs erratic (964k to 1,200k). Freeing 163,000 one-per-value allocations a block (13 ms of `free` per
+block, 374 ms per 28) on a side thread beside sixteen build threads allocating is a contest for the allocator
+and the memory system; under the lock it was a burst every ~44 blocks, off the lock it is continuous. The
+fix is not where the freeing happens but that there is freeing: a block's records in one allocation (the
+values in one arena `Vec<u8>` with offsets, the twig trees pooled), so a head move drops a block in O(1).

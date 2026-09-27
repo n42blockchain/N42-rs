@@ -1086,6 +1086,139 @@ pub struct BuiltTransfer<T> {
     pub gas_used: u64,
 }
 
+/// A running sum a parallel `unzip` fills beside a collect, in the same
+/// pass: the block's gas (and, with [`FeeSum`], its fees) read from the
+/// slot or the transaction already in hand for the other side.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct GasSum(pub u64);
+
+impl rayon::iter::ParallelExtend<u64> for GasSum {
+    fn par_extend<I>(&mut self, iter: I)
+    where
+        I: rayon::iter::IntoParallelIterator<Item = u64>,
+    {
+        use rayon::prelude::*;
+        self.0 += iter.into_par_iter().sum::<u64>();
+    }
+}
+
+/// The fees' counterpart of [`GasSum`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FeeSum(pub U256);
+
+impl rayon::iter::ParallelExtend<U256> for FeeSum {
+    fn par_extend<I>(&mut self, iter: I)
+    where
+        I: rayon::iter::IntoParallelIterator<Item = U256>,
+    {
+        use rayon::prelude::*;
+        self.0 += iter.into_par_iter().reduce(|| U256::ZERO, |a, b| a + b);
+    }
+}
+
+/// The seal-first commit's first pass (docs/BREAKTHROUGH_DESIGN.md 10.32,
+/// `commit_refs_ms`): the filled slots by reference, in block order, and
+/// the block's gas, in one pass on the build pool -- the gas used to be a
+/// second pass over the same 163,000 slots.
+pub fn slot_refs_and_gas<T: Send + Sync>(slots: &[std::sync::OnceLock<BuiltTransfer<T>>]) -> (Vec<&BuiltTransfer<T>>, u64) {
+    use rayon::prelude::*;
+    let (refs, gas): (Vec<&BuiltTransfer<T>>, GasSum) = build_pool().install(|| {
+        slots.par_iter().filter_map(std::sync::OnceLock::get).map(|built| (built, built.gas_used)).unzip()
+    });
+    (refs, gas.0)
+}
+
+/// The seal-first commit's second pass (`commit_body_ms`): the body's
+/// transactions, their senders and the block's fees in one pass on the
+/// build pool over the transfers in block order. `each` returns a
+/// transfer's transaction (its copy for the body), sender and tip per gas,
+/// read off the candidate once -- the fees used to be a pass of their own
+/// over the same cold candidates before the body's copy.
+pub fn body_and_fees<T, Tx, F>(refs: &[&BuiltTransfer<T>], each: F) -> (Vec<Tx>, Vec<Address>, U256)
+where
+    T: Sync,
+    Tx: Send,
+    F: Fn(&BuiltTransfer<T>) -> (Tx, Address, u128) + Sync,
+{
+    use rayon::prelude::*;
+    let (transactions, (senders, fees)): (Vec<Tx>, (Vec<Address>, FeeSum)) = build_pool().install(|| {
+        refs.par_iter()
+            .map(|built| {
+                let (tx, sender, tip) = each(built);
+                (tx, (sender, U256::from(tip) * U256::from(built.gas_used)))
+            })
+            .unzip()
+    });
+    (transactions, senders, fees.0)
+}
+
+/// The block's body made ahead, in the build's prep pass
+/// ([`BodyAhead::make_keyed`]): every pulled candidate's transaction copied,
+/// its sender and its tip per gas, in pull order. The commit takes it when
+/// every candidate was executed in pull order ([`fees_from_tips`]), leaving
+/// the commit its pass over the slots alone: the copy was `commit_body_ms`
+/// 6 of the commit's 12 on the fleet (docs/BREAKTHROUGH_DESIGN.md 10.32),
+/// a second read of the same cold candidates the prep had just read. (A
+/// thread of its own beside the batches took 29 ms for the bench's block,
+/// longer than the batches.) `took_us` is the pass's time.
+#[derive(Debug)]
+pub struct BodyAhead<Tx> {
+    /// The body's transactions, one a candidate.
+    pub transactions: Vec<Tx>,
+    /// Their senders.
+    pub senders: Vec<Address>,
+    /// Their tips per gas at the block's base fee.
+    pub tips: Vec<u128>,
+    /// The job's own time, microseconds.
+    pub took_us: u64,
+}
+
+impl<Tx: Send> BodyAhead<Tx> {
+    /// The prep's pass on the build pool, over `cands`: `each` gives a
+    /// candidate's transfer key (`None`: not a plain transfer) and its body
+    /// parts. The keys and the body when every candidate is a transfer,
+    /// `None` otherwise.
+    #[allow(clippy::type_complexity)]
+    pub fn make_keyed<C: Sync>(
+        cands: &[C],
+        each: impl Fn(usize, &C) -> (Option<(Address, Address)>, Tx, Address, u128) + Sync,
+    ) -> Option<(Vec<(Address, Address)>, Self)> {
+        use rayon::prelude::*;
+        let at = std::time::Instant::now();
+        let (keys, (transactions, (senders, tips))): (Vec<Option<(Address, Address)>>, (Vec<Tx>, (Vec<Address>, Vec<u128>))) =
+            build_pool().install(|| {
+                cands
+                    .par_iter()
+                    .with_min_len(1024)
+                    .enumerate()
+                    .map(|(i, cand)| {
+                        let (key, tx, sender, tip) = each(i, cand);
+                        (key, (tx, (sender, tip)))
+                    })
+                    .unzip()
+            });
+        let keys: Vec<(Address, Address)> = keys.into_iter().collect::<Option<Vec<_>>>()?;
+        Some((keys, Self { transactions, senders, tips, took_us: at.elapsed().as_micros() as u64 }))
+    }
+}
+
+/// The block's fees from the tips made ahead, on the build pool: `None`
+/// unless the transfers are every candidate in pull order (the `i`-th
+/// reference is candidate `i`, as many as there are tips), when the body
+/// made ahead is exactly the body.
+pub fn fees_from_tips<T: Send + Sync>(refs: &[&BuiltTransfer<T>], tips: &[u128]) -> Option<U256> {
+    use rayon::prelude::*;
+    if refs.len() != tips.len() {
+        return None;
+    }
+    build_pool().install(|| {
+        refs.par_iter()
+            .enumerate()
+            .map(|(i, built)| (built.index == i).then(|| U256::from(tips[i]) * U256::from(built.gas_used)))
+            .try_reduce(|| U256::ZERO, |a, b| Some(a + b))
+    })
+}
+
 /// What [`execute_for_build`] produced.
 #[derive(Debug)]
 pub struct BuildRun<T> {
@@ -6488,8 +6621,17 @@ mod tests {
         let recipients = 2_000_000u64;
         let run = 64u64;
         let block_senders = 2_547u64;
-        let sender_of = |s: u64| addr(100 + s);
-        let recipient_of = |r: u64| addr(1_000_000 + r);
+        // Addresses spread over the whole key space as the fleet's are (the
+        // output shards split by the top 16 bits: `addr`'s leading zeros
+        // put every account in shard 0, one index task doing all the work).
+        let spread = |i: u64| {
+            let mut a = [0u8; 20];
+            a[..8].copy_from_slice(&i.wrapping_mul(0x9e37_79b9_7f4a_7c15).to_be_bytes());
+            a[12..].copy_from_slice(&i.to_be_bytes());
+            Address::from(a)
+        };
+        let sender_of = |s: u64| spread(100 + s);
+        let recipient_of = |r: u64| spread(1_000_000 + r);
         let (db, dir) = fleet_view_db("real-path", senders, recipients, sender_of, recipient_of);
 
         let beneficiary = addr(1);
@@ -6541,10 +6683,38 @@ mod tests {
         let convert =
             |i: usize| ((), evm_config.tx_env(reth_transaction_pool::PoolTransaction::consensus_ref(&cands[i].transaction)));
         println!("block: {} 0x50 transfers, {} pool threads", cands.len(), build_pool().current_num_threads());
-        for round in 0..6 {
-            let with_root = round % 2 == 1;
-            let shards = crate::output_shards::OutputShards::with_index(beneficiary, keys.len(), 16, true);
+        // Rounds 0-3 and 8-9 the index built at the freeze, 4-7 entered live
+        // by the batches (`N42_OUTPUT_INDEX_LIVE=1`); odd rounds of 0-7 with
+        // the root job (the MPT build's; a frame build has none), rounds 8-9
+        // with the body made in the prep's pass (`BodyAhead::make_keyed`),
+        // timed against the prep's pass alone.
+        let base_fee = 1_000_000_000u64;
+        let tip = |i: usize| {
+            alloy_consensus::Transaction::effective_tip_per_gas(
+                reth_transaction_pool::PoolTransaction::consensus_ref(&cands[i].transaction).into_inner(),
+                base_fee,
+            )
+            .unwrap_or_default()
+        };
+        let body_tx = |i: usize| reth_transaction_pool::PoolTransaction::consensus_ref(&cands[i].transaction).into_inner().clone();
+        for round in 0..10 {
+            let with_root = round % 2 == 1 && round < 8;
+            let with_body = round >= 8;
+            let live = (4..8).contains(&round);
+            let shards = crate::output_shards::OutputShards::with_index_live(beneficiary, keys.len(), 16, true, live);
             let sink = |bundle: BundleState| shards.add(bundle);
+            let key_of = |c: &std::sync::Arc<ValidPoolTransaction<crate::N42PooledTransaction>>| {
+                Some((c.sender(), alloy_consensus::Transaction::to(&c.transaction).unwrap_or_default()))
+            };
+            let prep = with_body.then(|| {
+                use rayon::prelude::*;
+                let at = std::time::Instant::now();
+                let keys_only: Option<Vec<(Address, Address)>> =
+                    build_pool().install(|| cands.par_iter().with_min_len(1024).map(key_of).collect());
+                let keys_us = at.elapsed().as_micros();
+                let made = BodyAhead::make_keyed(&cands, |i, c| (key_of(c), body_tx(i), c.sender(), tip(i)));
+                (keys_only.map(|k| k.len()), keys_us, made)
+            });
             let run = std::thread::scope(|scope| {
                 let root = with_root.then(|| {
                     let cands = &cands;
@@ -6564,11 +6734,71 @@ mod tests {
             });
             let executed = run.slots.iter().filter(|slot| slot.get().is_some()).count();
             assert_eq!(executed, cands.len(), "every transfer executed");
+            let freeze_at = std::time::Instant::now();
             let frozen = shards.freeze();
+            let freeze_us = freeze_at.elapsed().as_micros();
+            // The seal-first commit as it was (four passes: the references,
+            // the gas, the fees, the body) and as it is (two).
+            // Which runs first alternates every two rounds: the second reads
+            // candidates the first just brought in.
+            let old_pass = || {
+            let old_at = std::time::Instant::now();
+            let (old_body, old_fees, old_gas) = build_pool().install(|| {
+                use rayon::prelude::*;
+                let refs: Vec<_> = run.slots.par_iter().filter_map(std::sync::OnceLock::get).collect();
+                let gas = refs.par_iter().map(|built| built.gas_used).sum::<u64>();
+                let fees = refs
+                    .par_iter()
+                    .map(|built| U256::from(tip(built.index)) * U256::from(built.gas_used))
+                    .reduce(|| U256::ZERO, |a, b| a + b);
+                let body: (Vec<_>, Vec<Address>) =
+                    refs.par_iter().map(|built| (body_tx(built.index), cands[built.index].sender())).unzip();
+                (body, fees, gas)
+            });
+            (old_body, old_fees, old_gas, old_at.elapsed().as_micros())
+            };
+            let new_pass = || {
+            let new_at = std::time::Instant::now();
+            let (refs, new_gas) = slot_refs_and_gas(&run.slots);
+            let refs_us = new_at.elapsed().as_micros();
+            let (transactions, senders, new_fees) =
+                body_and_fees(&refs, |built| (body_tx(built.index), cands[built.index].sender(), tip(built.index)));
+            (transactions, senders, new_fees, new_gas, refs, refs_us, new_at.elapsed().as_micros())
+            };
+            let ((old_body, old_fees, old_gas, old_us), (transactions, senders, new_fees, new_gas, refs, refs_us, new_us)) =
+                if (round / 2) % 2 == 0 {
+                    let old = old_pass();
+                    (old, new_pass())
+                } else {
+                    let new = new_pass();
+                    (old_pass(), new)
+                };
+            assert_eq!((old_gas, old_fees), (new_gas, new_fees), "the fused commit's sums");
+            assert!(old_body.0 == transactions && old_body.1 == senders, "the fused commit's body");
+            // With the body made ahead: the references and gas, the fees
+            // from the tips.
+            let ahead_note = prep.and_then(|(_, keys_us, made)| made.map(|(_, made)| (keys_us, made))).map(|(keys_us, made)| {
+                let at = std::time::Instant::now();
+                let (refs, gas) = slot_refs_and_gas(&run.slots);
+                let fees = fees_from_tips(&refs, &made.tips);
+                let commit_us = at.elapsed().as_micros();
+                assert_eq!((fees, gas), (Some(old_fees), old_gas), "the body made ahead's sums");
+                assert!(made.transactions == transactions && made.senders == senders, "the body made ahead");
+                format!(", prep keys alone {keys_us} us / keys and body {} us, commit then {commit_us} us", made.took_us)
+            });
+            drop((old_body, transactions, senders, refs));
             println!(
-                "round {round} (root job {with_root}): exec {} ms, append {} ms of pool time, batches {:?}",
+                "round {round} (root job {with_root}, body job {with_body}, live {live}): exec {} ms, append {} ms of pool time, freeze {} us (index build {} us, conflicts {}), commit 4 passes {} us / fused {} us (refs+gas {} us){}, split {:?}, batches {:?}",
                 run.phases.groups_ms,
                 frozen.append_ms(),
+                freeze_us,
+                frozen.index_build_us(),
+                frozen.index_conflicts(),
+                old_us,
+                new_us,
+                refs_us,
+                ahead_note.unwrap_or_default(),
+                frozen.fold_split(),
                 run.phases.batch_spans
             );
             if crate::fast_transfer::phase_timers() {

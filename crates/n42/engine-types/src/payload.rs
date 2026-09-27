@@ -1402,6 +1402,8 @@ where
     let mut commit_cumulative_ms = 0u64;
     let mut commit_fees_ms = 0u64;
     let mut commit_body_ms = 0u64;
+    // Whether the commit took the body made in the prep's pass.
+    let mut commit_body_ahead_used = false;
     // Of `give_back_ms`: the body checked against the pulled set.
     let mut match_ms = 0u64;
     // Of `sealed_ms`: the header filled and `cons.seal`; the sealed and
@@ -1550,7 +1552,10 @@ where
         };
         let warm_fill = crate::parallel_transfer::build_prefetch().then(crate::parallel_transfer::WarmAccounts::new);
         let (warm_ref, open_ref) = (warm_fill.as_ref(), &open_db);
-        let (all_transfers, keys, prep_done) = crate::parallel_transfer::build_pool().in_place_scope(|scope| {
+        // The body's parts made in the prep's pass (`BodyAhead`), for a
+        // block that may seal at the execution's end.
+        let body_at_prep = seal_at_exec() && seal_early_possible && block_blob_count == 0 && direct_receipts_enabled();
+        let (all_transfers, keys, mut body_ahead, prep_done) = crate::parallel_transfer::build_pool().in_place_scope(|scope| {
             if let Some(puller) = pulled.as_ref() {
                 while cands.len() < budget {
                     match puller.batches().recv() {
@@ -1591,7 +1596,7 @@ where
             // other (`par_prep_ms` 10, loop274). The sender is the one the
             // ingest recorded (the attested frame's, for 0x50); nothing is
             // hashed or recovered here.
-            let (all_transfers, keys) = crate::parallel_transfer::build_pool().install(|| {
+            let (all_transfers, keys, body_made) = crate::parallel_transfer::build_pool().install(|| {
                 use rayon::prelude::*;
                 let transfer_key = |tx: &Arc<reth_transaction_pool::ValidPoolTransaction<Pool::Transaction>>| {
                     let inner = &tx.transaction;
@@ -1603,15 +1608,33 @@ where
                         && !inner.is_eip7702())
                     .then(|| (tx.sender(), inner.to().unwrap_or_default()))
                 };
+                if body_at_prep {
+                    // The body's parts read in the same pass, each candidate
+                    // once while its lines are in hand; the commit takes them
+                    // when the block seals at the execution's end.
+                    let made = crate::parallel_transfer::BodyAhead::make_keyed(&cands, |_, tx| {
+                        let consensus = pooled_consensus(tx);
+                        (
+                            transfer_key(tx),
+                            consensus.clone(),
+                            tx.sender(),
+                            consensus.effective_tip_per_gas(base_fee).unwrap_or_default(),
+                        )
+                    });
+                    return match made {
+                        Some((keys, made)) if !keys.is_empty() => (true, keys, Some(made)),
+                        _ => (false, Vec::new(), None),
+                    };
+                }
                 let keys: Option<Vec<(alloy_primitives::Address, alloy_primitives::Address)>> =
                     cands.par_iter().with_min_len(1024).map(transfer_key).collect();
                 match keys {
-                    Some(keys) if !keys.is_empty() => (true, keys),
-                    _ => (false, Vec::new()),
+                    Some(keys) if !keys.is_empty() => (true, keys, None),
+                    _ => (false, Vec::new(), None),
                 }
             });
             par_prep_ms = prep_at.elapsed().as_millis() as u64;
-            (all_transfers, keys, std::time::Instant::now())
+            (all_transfers, keys, body_made, std::time::Instant::now())
         });
         // The scope waited here for the prefetch's last jobs: 0 when the
         // pull and the prep hid it.
@@ -1764,25 +1787,20 @@ where
                     let on_pool = seal_at_exec();
                     // Block order, by reference: a pointer a transfer, where the
                     // collect moved ~470 bytes of each.
-                    let refs = (!run.slots.is_empty()).then(|| {
-                        if on_pool {
-                            use rayon::prelude::*;
-                            let slots = &run.slots;
-                            crate::parallel_transfer::build_pool()
-                                .install(|| slots.par_iter().filter_map(std::sync::OnceLock::get).collect::<Vec<_>>())
-                        } else {
-                            run.slots.iter().filter_map(std::sync::OnceLock::get).collect::<Vec<_>>()
-                        }
-                    });
-                    let (executed_count, executed_gas) = match refs.as_ref() {
-                        Some(refs) if on_pool => {
-                            use rayon::prelude::*;
-                            let gas = crate::parallel_transfer::build_pool()
-                                .install(|| refs.par_iter().map(|built| built.gas_used).sum::<u64>());
-                            (refs.len(), gas)
-                        }
-                        Some(refs) => (refs.len(), refs.iter().map(|built| built.gas_used).sum::<u64>()),
-                        None => (run.executed.len(), run.executed.iter().map(|built| built.gas_used).sum::<u64>()),
+                    // On the pool, the references and the block's gas are one
+                    // pass (`slot_refs_and_gas`).
+                    let (refs, pool_gas) = if run.slots.is_empty() {
+                        (None, None)
+                    } else if on_pool {
+                        let (refs, gas) = crate::parallel_transfer::slot_refs_and_gas(&run.slots);
+                        (Some(refs), Some(gas))
+                    } else {
+                        (Some(run.slots.iter().filter_map(std::sync::OnceLock::get).collect::<Vec<_>>()), None)
+                    };
+                    let (executed_count, executed_gas) = match (refs.as_ref(), pool_gas) {
+                        (Some(refs), Some(gas)) => (refs.len(), gas),
+                        (Some(refs), None) => (refs.len(), refs.iter().map(|built| built.gas_used).sum::<u64>()),
+                        (None, _) => (run.executed.len(), run.executed.iter().map(|built| built.gas_used).sum::<u64>()),
                     };
                     commit_refs_ms = fold_at.elapsed().as_millis() as u64;
                     // This block seals early -- full or drained after this step,
@@ -1819,19 +1837,37 @@ where
                         let cumulative = (!ahead).then(|| cumulative_gas(refs));
                         commit_cumulative_ms = step_at.elapsed().as_millis() as u64;
                         let step_at = std::time::Instant::now();
-                        total_fees += refs
-                            .par_iter()
-                            .map(|built| {
-                                let tip = pooled_consensus(&cands[built.index]).effective_tip_per_gas(base_fee).unwrap_or_default();
-                                U256::from(tip) * U256::from(built.gas_used)
-                            })
-                            .reduce(|| U256::ZERO, |a, b| a + b);
+                        // Ahead: the fees, the body and the senders in one pass
+                        // on the build pool, each candidate read once
+                        // (`body_and_fees`; `commit_fees_ms` is then 0).
+                        if !ahead {
+                            total_fees += refs
+                                .par_iter()
+                                .map(|built| {
+                                    let tip = pooled_consensus(&cands[built.index]).effective_tip_per_gas(base_fee).unwrap_or_default();
+                                    U256::from(tip) * U256::from(built.gas_used)
+                                })
+                                .reduce(|| U256::ZERO, |a, b| a + b);
+                        }
                         commit_fees_ms = step_at.elapsed().as_millis() as u64;
                         let step_at = std::time::Instant::now();
-                        // Ahead: one pass on the build pool for both vectors.
-                        let (transactions, senders): (Vec<TransactionSigned>, Vec<alloy_primitives::Address>) = if ahead {
-                            crate::parallel_transfer::build_pool()
-                                .install(|| refs.par_iter().map(|built| (pooled_consensus(&cands[built.index]).clone(), cands[built.index].sender())).unzip())
+                        // The body made ahead, when the transfers are every
+                        // candidate in pull order (the fees from its tips).
+                        let made = body_ahead.take().filter(|_| ahead).and_then(|made| {
+                            crate::parallel_transfer::fees_from_tips(refs, &made.tips).map(|fees| (made, fees))
+                        });
+                        let (transactions, senders): (Vec<TransactionSigned>, Vec<alloy_primitives::Address>) = if let Some((made, fees)) = made {
+                            total_fees += fees;
+                            commit_body_ahead_used = true;
+                            (made.transactions, made.senders)
+                        } else if ahead {
+                            let (transactions, senders, fees) = crate::parallel_transfer::body_and_fees(refs, |built| {
+                                let candidate = &cands[built.index];
+                                let tx = pooled_consensus(candidate);
+                                (tx.clone(), candidate.sender(), tx.effective_tip_per_gas(base_fee).unwrap_or_default())
+                            });
+                            total_fees += fees;
+                            (transactions, senders)
                         } else {
                             (
                                 refs.par_iter().map(|built| pooled_consensus(&cands[built.index]).clone()).collect(),
@@ -2833,6 +2869,7 @@ where
                     commit_cumulative_ms,
                     commit_fees_ms,
                     commit_body_ms,
+                    commit_body_ahead_used,
                     match_ms,
                     seal_header_ms,
                     seal_block_ms,

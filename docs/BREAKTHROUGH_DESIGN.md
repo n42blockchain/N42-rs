@@ -705,3 +705,22 @@ the `EvmState` map) and the QMDB root (38-46) in sequence -- ~150 -- and the lea
 the quorum. Section 5 is the step: start the follower's execution before the road ends (the frames are all
 held; the description names them in order), give its loop 4b's cuts (75 -> ~50), and put the root on the pool
 beside the last batches, so the follower's chain is ~80-90 and the leader's seal binds again.
+
+### 10.26 The fetch, the slot and the close off the fleet (step 4d): 42 -> 32 ms on the real-path bench
+
+`bench_build_real_path` (a full block of pooled 0x50 transfers through the builder's own `convert`, the sink in
+index mode, the transactions-root job beside the batches on odd rounds), ns a transfer at 16 threads:
+
+| | fetch | transfer | other | sink | gas | close | exec ms |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| base | 155 | 1,730 | 133 | 94 | 23 | 323 | 42 |
+| the TxEnv by reference, the result slot an index | 127 | 1,710 | 56 | 86 | 23 | 370 | 33 |
+| + the close in place (`BundleAccount` in `BatchState`, `take_bundle` one pass) | 110 | 1,787 | 52 | 80 | 23 | 130 | **32** |
+
+The envelope clone was not the fetch's cost (a unit slot read the same 170); what remains is the cold read of
+the pooled transaction (110 on the bench, 407-457 on the fleet where the pooled transactions are older and
+scattered -- unconfirmed). The 470-byte result slot was "other" (133 -> 52). The close is the in-place bundle
+(323 -> 130). A chunked fetch and a slot pre-read gained nothing and were dropped. A new test runs 16 batches
+through revm's `State` and through `BatchState` and compares the bundles through the graft and the index.
+On the fleet with the followers' chain as the cycle (10.25) this shows in `sealed_at`, not in the window, until
+section 5 lands; measured together with it.

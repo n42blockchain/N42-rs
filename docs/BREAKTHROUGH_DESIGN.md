@@ -663,3 +663,21 @@ sink's hand-over) -- 3.1 us in all, of which 1.4 is outside `transfer`. The cycl
 time (149-152 against 114-118): the floor is elsewhere now -- the followers' import (205-207 for a full block,
 overlapped) and their vote after it (section 5), or the road twice (10.18). Next, in parallel: the view's
 per-read lock (4c, on both sides), the fetch and the close (4d), and section 5 on the followers.
+
+### 10.24 The view's lock off the fleet (03b5ce507, ac71c4934): the 16-thread read 2.11 -> 0.57 us, the bench's execution halved
+
+The one `versions` read lock every read took is now 128 cache-line-padded per-thread reader slots, each an
+immutable copy of the versions owning the journals' Arcs; a reader holds only its slot's read lock through the
+record read, a writer swaps every slot under its write lock (so a writer still waits out every read in flight:
+a lock hoist, no change under a writer). The answer counter is 64 padded per-thread-slot counters summed on
+read. A per-batch lock-free snapshot was rejected: the offset index moves in place and a truncation cuts the
+mapped file (a SIGBUS for a reader without the lock).
+
+| us a read, warm | 1 thread | 4 | 16 |
+| --- | --- | --- | --- |
+| at the head, before -> after | 0.38 -> 0.38 | 0.82 -> 0.46 | 2.11 -> **0.57** |
+| 16 versions behind, before -> after | 1.97 -> 1.95 | 2.30 -> 2.02 | 4.16 -> 2.14 |
+
+`bench_build_prefetch`: the resolve pass 390 / 805 / 2,014 -> 391 / 482 / 659 ns a read at 1 / 4 / 16 threads;
+plain execution 28-32 -> 14 ms; batch max / median 14 / 13 -> 7 / 6. The 16-behind read is the walk through 16
+journals, untouched. loop284 runs it on the fleet (both sides read through the view).

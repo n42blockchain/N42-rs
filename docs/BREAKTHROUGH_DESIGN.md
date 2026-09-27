@@ -724,3 +724,23 @@ scattered -- unconfirmed). The 470-byte result slot was "other" (133 -> 52). The
 through revm's `State` and through `BatchState` and compares the bundles through the graft and the index.
 On the fleet with the followers' chain as the cycle (10.25) this shows in `sealed_at`, not in the window, until
 section 5 lands; measured together with it.
+
+### 10.27 The follower's chain read from loop284 (section 5a, 9baaa674e..dbb78b394)
+
+What the vote on n+1 waits for: all four of n's fields (state root, receipts root, logs bloom, gas), through
+`wait_for_parent_fields` in the follower's import before `validate_against_parent`; the receipt half is filed
+by the post-execution checks (7-9 ms), the state root last, by the QMDB root job. Timeline on node1, medians
+of 756 full blocks, ms after block n's road start: vote on n 38 (p75 105), exec start 38, exec end 113, root
+end 168 (p75 220), import end 228; n+1's road starts at 160 and its vote lands at 224. **Blocks alternate**: on
+every other block the root takes 100-106 instead of 36-38 because it queues on the worker pool behind n+1's
+execution batches, and n+1's vote then waits 66-85 for n's fields, landing at n's root end. The chain is
+road -> exec -> root (made slow by the next block's execution) -> vote.
+
+Four changes, one leg each: the timeline keys on the direct import line (`road_end_ms exec_start_ms exec_end_ms
+root_end_ms fields_ready_ms parent_fields_wait_ms`, always on); the follower's batches on the leader's
+`BatchState` + `transfer_plain` (`follower_batch`, on by default, `N42_FOLLOWER_BATCH_STATE=0` reverts; the
+import bench 93-96 -> 79-81 by component); `N42_FOLLOWER_EXEC_EARLY=1` (the execution starts before the
+includability check, which runs beside it on its own small pool; the check's error still wins, the vote still
+follows the check); `N42_FOLLOWER_FIELDS_EARLY=1` (the QMDB root starts on its own thread the instant the
+execution returns, hashed on a dedicated pool of 8, one root at a time). loop285 runs BASE / FIELDS / BOTH /
+BOTHb with step 4d on the leader.

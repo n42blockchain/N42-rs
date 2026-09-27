@@ -1037,3 +1037,19 @@ gap -- the followers' do: 26-58 imports over 600 ms a leg, each a half-second ho
 imports wait on (10.18 read the slow tail as an unnamed residual under overlap; since then the build path, the
 early root, the shards and the frame scan changed the import) is the next read, on the follower's
 `build-path import` line and its timeline keys.
+
+### 10.42 The followers' slow imports (loop294 P100): rare second-long roots, cascading
+
+Follower imports (`total_ms`): node1 p25 108, median 127, p75 156, p90 293, p99 446, max 1,505 (67 over 300,
+2 over 600); node2 median 131, p90 273, p99 583, max 1,352 (100 / 11). `fields_ready`: median 103, p90
+140-150, p99 316-493, max 1,150-1,517. The slow imports (>300) against the rest: the fields only +10-15, the
+execution +8-9, the batch +6-8, every named wait 0 -- and ~190 ms of the total that no field names (the
+named sum 173-193 against a total 362-365): the hand-off after the fields (the merge, the engine insert, the
+persistence), off the vote. They do not cluster across the followers (2 of 20 shared) nor with the leader's slow
+seals (0-3 of 20), and 4 of 5 have nothing else in the log around them. The vote's delay after a slow parent
+import is +24 ms median (43 against 19). **The cycle's tail is the rare cascade**: node1's block 1007 took
+1,505 with `root_ms` 1,034, so 1008 waited 917 for its parent's fields and the vote came 935 late -- a few
+second-long roots a leg (the leader had them too: 10.38's `roots_ms` 975) each costing the cycle a block or
+more, which is the mean's 135 against the median's 116. What holds a root for a second when the records are
+no longer freed under the forest lock is the next read: the lock's other holders (the head move itself, the
+journal hold, the read view's advance, the persistence batch) timed and named.

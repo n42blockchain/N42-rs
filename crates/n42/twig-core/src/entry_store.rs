@@ -64,10 +64,39 @@ pub fn seal_stats() -> (u64, u64) {
     (SEALS.load(Relaxed), SEAL_US.load(Relaxed))
 }
 
-/// One sealed, populated mapping of `[start, start + len)` of the file.
+/// One sealed mapping of `[start, start + len)` of the file. A chunk sealed
+/// at open is populated there; one sealed while the tree grows is populated
+/// on a thread of its own ([`populate_off_lock`]), which holds the mapping
+/// until it is done.
 struct Chunk {
     start: u64,
-    map: memmap2::Mmap,
+    map: std::sync::Arc<memmap2::Mmap>,
+}
+
+/// Faults a freshly sealed chunk's page tables in (`MADV_POPULATE_READ`) on a
+/// thread of its own, instead of with `MAP_POPULATE` in the `mmap` call.
+///
+/// The seal happens inside a block's apply -- the append that fills the
+/// chunk -- under the lock the tree lives behind, so a populate there (65,536
+/// pages, each read from the disk if the page cache has let it go since it
+/// was written, as it does under the heaps' reclaim) held that block's QMDB
+/// root, and every root behind it, for hundreds of milliseconds every ~13
+/// blocks (defect 24, loop294). Reads of the chunk before the thread
+/// is done take a fault of their own, as they would without the populate.
+/// Without the thread (it cannot be spawned, or not on Linux) the chunk is
+/// faulted in lazily.
+fn populate_off_lock(map: &std::sync::Arc<memmap2::Mmap>) {
+    #[cfg(target_os = "linux")]
+    {
+        let map = std::sync::Arc::clone(map);
+        let _ = std::thread::Builder::new().name("n42-qmdb-populate".into()).spawn(move || {
+            // A failure (an old kernel, a file cut under the mapping) leaves
+            // the pages to fault on first read.
+            let _ = map.advise(memmap2::Advice::PopulateRead);
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = map;
 }
 
 /// The append-only entry file, mapped for reads.
@@ -197,7 +226,7 @@ impl FileEntries {
             let map = unsafe {
                 memmap2::MmapOptions::new().offset(start).len((end - start) as usize).populate().map(&self.file)?
             };
-            self.chunks.push(Chunk { start, map });
+            self.chunks.push(Chunk { start, map: std::sync::Arc::new(map) });
             start = end;
             slot = end_slot;
         }
@@ -267,7 +296,17 @@ impl FileEntries {
     pub(crate) fn push(&mut self, key: &Hash, value: &[u8]) -> io::Result<()> {
         let slot = self.offsets.len();
         let record_len = KEY_LEN + LEN_LEN + value.len();
-        self.tail.reserve(record_len);
+        // Sealed before the record that would not fit rather than after the
+        // one that overflowed: the tail never outgrows `CHUNK_BYTES`, so its
+        // buffer, reserved once, is never reallocated. It used to grow past
+        // the chunk by doubling -- a 256 MiB copy into 512 MiB of fresh pages
+        // inside a block's apply, under the tree's lock, every chunk.
+        if !self.tail.is_empty() && self.tail.len() + record_len > CHUNK_BYTES {
+            self.seal_tail()?;
+        }
+        if self.tail.capacity() < CHUNK_BYTES {
+            self.tail.reserve_exact(CHUNK_BYTES.max(record_len) - self.tail.len());
+        }
         self.tail.extend_from_slice(key);
         self.tail.extend_from_slice(&(value.len() as u32).to_le_bytes());
         self.tail.extend_from_slice(value);
@@ -277,9 +316,6 @@ impl FileEntries {
         }
         self.set_active(slot, true);
         self.len_bytes += record_len as u64;
-        if self.tail.len() >= CHUNK_BYTES {
-            self.seal_tail()?;
-        }
         Ok(())
     }
 
@@ -311,13 +347,10 @@ impl FileEntries {
         // before this call and that nothing rewrites: the file is only ever
         // shortened, and a shortening below a chunk's start unmaps the chunk
         // first (`truncate`).
-        let map = unsafe {
-            memmap2::MmapOptions::new()
-                .offset(self.sealed_len)
-                .len(self.tail.len())
-                .populate()
-                .map(&self.file)?
-        };
+        let map = std::sync::Arc::new(unsafe {
+            memmap2::MmapOptions::new().offset(self.sealed_len).len(self.tail.len()).map(&self.file)?
+        });
+        populate_off_lock(&map);
         self.chunks.push(Chunk { start: self.sealed_len, map });
         self.sealed_len = self.len_bytes;
         self.tail.clear();
@@ -394,7 +427,7 @@ impl FileEntries {
             let map = unsafe {
                 memmap2::MmapOptions::new().offset(chunk.start).len(chunk.map.len()).populate().map(&file)?
             };
-            chunks.push(Chunk { start: chunk.start, map });
+            chunks.push(Chunk { start: chunk.start, map: std::sync::Arc::new(map) });
         }
         Ok(Self {
             path: self.path.clone(),

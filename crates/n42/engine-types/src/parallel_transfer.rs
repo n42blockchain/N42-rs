@@ -3882,6 +3882,179 @@ where
     Ok(Ok((BlockExecutionOutput { state: bundle, result }, phases)))
 }
 
+/// Whether `N42_FOLLOWER_BUILD_PATH=1` is set: a follower executes a block of
+/// plain transfers through the leader's own machinery
+/// ([`execute_transfers_build_path`]) -- the sender-group partition, the
+/// build pool, the batches on [`crate::batch_state::BatchState`] with
+/// `transfer_plain`, the index-mode [`crate::output_shards::OutputShards`]
+/// sink and no graft -- instead of [`execute_transfers_with_plan`]. Off by
+/// default.
+pub fn follower_build_path() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_BUILD_PATH").is_ok_and(|v| v == "1"))
+}
+
+/// A block executed on the build path ([`execute_transfers_build_path`]):
+/// the batches' output as frozen shards, the block's own executor's changes
+/// laid over them (the residual: the system calls, the withdrawals, the fee
+/// credit, and the accounts of theirs the batches also wrote), and the
+/// execution result (receipts in block order, gas). The block's one
+/// `BundleState` is [`Self::merged`]; the QMDB root and the hashed
+/// post-state can read [`crate::output_shards::FrozenShards::view`] without it.
+#[derive(Debug)]
+pub struct ShardedExecution {
+    /// The batches' output.
+    pub shards: crate::output_shards::FrozenShards,
+    /// The block's executor's changes, merged with their reverts.
+    pub residual: BundleState,
+    /// Receipts and gas, as the serial executor's.
+    pub result: reth_execution_types::BlockExecutionResult<Receipt>,
+}
+
+impl ShardedExecution {
+    /// The block's one `BundleState`: the shards with the residual over them.
+    pub fn merged(&self) -> BundleState {
+        self.shards.merged(&self.residual)
+    }
+}
+
+/// A follower's execution of `block` on the leader's build path
+/// ([`follower_build_path`]): the keys (sender, recipient) read off the
+/// recovered block, the batches run by [`execute_for_build_run`] -- the same
+/// partition, pool, batch loop and sink the leader's build runs, called
+/// rather than copied -- into index-mode output shards
+/// ([`crate::output_shards::output_shards`] of them, 16 when unset), then the
+/// block's own executor on `main_db` (pre- and post-execution changes), the
+/// accounts it touched taken out of the shards as deltas
+/// ([`crate::output_shards::FrozenShards::take_cached`]) and the fee credit
+/// committed: the rule [`execute_transfers_with_plan`] applies, with nothing
+/// grafted.
+///
+/// The build may skip a candidate; a sealed block may not, so a skip (the
+/// transfer path refused a transaction), a transaction that is not a plain
+/// transfer, or one touching the beneficiary returns `Ok(Err(_))` and the
+/// caller executes the block another way.
+pub fn execute_transfers_build_path<EvmConfig, DB, G>(
+    evm_config: &EvmConfig,
+    block: &RecoveredBlock<Block>,
+    main_db: DB,
+    open: &(dyn Fn() -> Option<G> + Sync),
+) -> Result<Result<(ShardedExecution, Phases), NotParallel>, BlockExecutionError>
+where
+    EvmConfig: ConfigureEvm<Primitives = EthPrimitives, BlockExecutorFactory = FastExecutorFactory> + Sync,
+    DB: Database + std::fmt::Debug,
+    DB::Error: Send + Sync + 'static,
+    G: Database + std::fmt::Debug + Send,
+    G::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    use alloy_consensus::Transaction as _;
+    let call_at = std::time::Instant::now();
+    let evm_env = evm_config.evm_env(block.header()).map_err(BlockExecutionError::other)?;
+    let beneficiary = evm_env.block_env.beneficiary;
+
+    // The keys the build's partition reads: every transaction a call with no
+    // input, its sender recovered.
+    let at = std::time::Instant::now();
+    let recovered: Vec<_> = block.transactions_recovered().collect();
+    let mut keys: Vec<(Address, Address)> = Vec::with_capacity(recovered.len());
+    for (i, tx) in recovered.iter().enumerate() {
+        let alloy_primitives::TxKind::Call(to) = tx.kind() else {
+            return Ok(Err(NotParallel::NotATransfer(i)));
+        };
+        if !tx.input().is_empty() {
+            return Ok(Err(NotParallel::NotATransfer(i)));
+        }
+        keys.push((tx.signer(), to));
+    }
+    let keys_us = at.elapsed().as_micros() as u64;
+
+    // The batches, as the leader's: the environment converted on the batch's
+    // thread, each batch's bundle handed to the shards whole as it ends.
+    let shard_count = match crate::output_shards::output_shards() {
+        0 => 16,
+        n => n,
+    };
+    let sink_shards = crate::output_shards::OutputShards::with_index(beneficiary, keys.len(), shard_count, true);
+    let sink = |bundle: BundleState| sink_shards.add(bundle);
+    let convert = |i: usize| ((), evm_config.tx_env(recovered[i]));
+    let run = match execute_for_build_run(&evm_env, &keys, &convert, open, Some(&sink), false, None) {
+        Ok(run) => run,
+        Err(why) => return Ok(Err(why)),
+    };
+    if let Some(&first) = run.skipped.first() {
+        // The build's refusal is a skip; for a sealed block it is the other
+        // executor's to judge.
+        return Ok(Err(NotParallel::NotATransfer(first)));
+    }
+    if run.executed.len() != keys.len() {
+        return Ok(Err(NotParallel::Failed(run.executed.len(), "a transfer's slot was left empty".to_string())));
+    }
+    let mut phases = run.phases;
+    phases.partition_ms += keys_us / 1000;
+    phases.threads = build_pool().current_num_threads();
+
+    // The batches are done: the index over their maps (on the build pool),
+    // then the block's own executor on the main state.
+    let merge_at = std::time::Instant::now();
+    let mut shards = sink_shards.freeze();
+    let at = std::time::Instant::now();
+    let mut state = State::builder().with_database(main_db).with_bundle_update().build();
+    let result = {
+        let ctx = evm_config.context_for_block(block.sealed_block()).map_err(BlockExecutionError::other)?;
+        let evm = evm_config.evm_with_env(&mut state, evm_env.clone());
+        let mut executor = evm_config.create_executor(evm, ctx);
+        executor.apply_pre_execution_changes()?;
+        let (_, result) = executor.finish()?;
+        result
+    };
+    phases.finish_ms = at.elapsed().as_millis() as u64;
+    let err = |e: &dyn std::fmt::Display| BlockExecutionError::other(std::io::Error::other(e.to_string()));
+    // What the executor touched and the batches wrote: the batches' change
+    // on top of the executor's value. The rest stays in the shards.
+    shards.take_cached(&mut state);
+    let fees = shards.beneficiary_delta();
+    if !fees.is_zero() {
+        let current = state.basic(beneficiary).map_err(|e| err(&e))?;
+        let existed = current.is_some();
+        let mut merged = current.unwrap_or_default();
+        merged.balance = merged.balance.saturating_add(fees);
+        let mut acc = Account::from(merged);
+        acc.status = AccountStatus::Touched;
+        if !existed {
+            acc.status |= AccountStatus::Created;
+        }
+        let mut changes = revm::state::EvmState::default();
+        changes.insert(beneficiary, acc);
+        state.commit(changes);
+    }
+    state.merge_transitions(BundleRetention::Reverts);
+    let residual = state.take_bundle();
+    // The index, the take and the fee: the executor's own part is `finish_ms`.
+    phases.merge_ms = (merge_at.elapsed().as_millis() as u64).saturating_sub(phases.finish_ms);
+    // Of `merge_ms`: the index over the batches' maps.
+    phases.graft_ms = at.duration_since(merge_at).as_millis() as u64;
+
+    // Receipts in block order, gas cumulated.
+    let at = std::time::Instant::now();
+    let mut cumulative = 0u64;
+    let receipts: Vec<Receipt> = recovered
+        .iter()
+        .zip(&run.executed)
+        .map(|(tx, built)| {
+            cumulative += built.gas_used;
+            Receipt { tx_type: tx.tx_type(), success: true, cumulative_gas_used: cumulative, logs: Vec::new() }
+        })
+        .collect();
+    phases.receipts_us = at.elapsed().as_micros() as u64;
+    let result = reth_execution_types::BlockExecutionResult { receipts, gas_used: cumulative, ..result };
+    let at = std::time::Instant::now();
+    drop(run);
+    drop(keys);
+    phases.drop_us = at.elapsed().as_micros() as u64;
+    phases.total_us = call_at.elapsed().as_micros() as u64;
+    Ok(Ok((ShardedExecution { shards, residual, result }, phases)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4051,6 +4224,79 @@ mod tests {
         let mut indexed = reverts;
         sort_reverts_indexed(&mut indexed);
         assert_eq!(plain, indexed);
+    }
+
+    /// Two bundles hold the same post-state: the same accounts with the same
+    /// info, original, status and storage, and the same reverts in any order.
+    fn assert_same_bundle(ours: &BundleState, theirs: &BundleState, what: &str) {
+        assert_eq!(ours.state.len(), theirs.state.len(), "{what}: accounts in the bundle");
+        for (address, account) in &theirs.state {
+            let mine = ours.state.get(address).unwrap_or_else(|| panic!("{what}: account {address} missing"));
+            assert_eq!(mine.info, account.info, "{what}: info {address}");
+            assert_eq!(mine.original_info, account.original_info, "{what}: original {address}");
+            assert_eq!(mine.status, account.status, "{what}: status {address}");
+            assert_eq!(mine.storage, account.storage, "{what}: storage {address}");
+        }
+        let flat = |b: &BundleState| {
+            let mut all: Vec<(Address, AccountRevert)> = b.reverts.iter().flatten().map(|(a, r)| (*a, r.clone())).collect();
+            all.sort_by_key(|(a, _)| *a);
+            all
+        };
+        assert_eq!(flat(ours), flat(theirs), "{what}: reverts");
+    }
+
+    /// The follower's build path ([`execute_transfers_build_path`]) and its
+    /// component path with the graft ([`execute_transfers_with`], the
+    /// default follower import) give the serial executor's receipts, gas and
+    /// post-state; the shards' view gives the QMDB operations and the hashed
+    /// post-state the merged bundle does. The fixture has a sender paid by
+    /// another sender's group and a withdrawal to a sender, so the shards'
+    /// summed deltas and the executor's take both run.
+    #[test]
+    fn the_build_path_matches_the_follower_path_and_the_serial_executor() {
+        let (block, db) = fixture(8, 6);
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let serial = evm_config.executor(db.clone()).execute(&block).expect("serial execution");
+        let (follower, _) = execute_transfers_with(&evm_config, &block, db.clone(), &|| Some(db.clone()), true, false)
+            .expect("no execution error")
+            .expect("the block qualifies");
+        let (sharded, phases) = execute_transfers_build_path(&evm_config, &block, db.clone(), &|| Some(db.clone()))
+            .expect("no execution error")
+            .expect("the block qualifies on the build path");
+        assert!(phases.batches >= 1 && phases.threads >= 1);
+        assert!(sharded.shards.is_indexed(), "the index-mode sink");
+        for (what, result) in [("serial", &serial.result), ("follower", &follower.result)] {
+            assert_eq!(sharded.result.gas_used, result.gas_used, "{what}: gas used");
+            assert_eq!(sharded.result.receipts, result.receipts, "{what}: receipts");
+            assert_eq!(sharded.result.requests, result.requests, "{what}: requests");
+        }
+        let merged = sharded.merged();
+        assert_same_bundle(&merged, &serial.state, "serial");
+        assert_same_bundle(&merged, &follower.state, "follower");
+
+        // What the root and the hashed post-state read: the view, not the merge.
+        let overlaps = sharded.shards.overlaps(&sharded.residual);
+        let view = sharded.shards.view(&sharded.residual, &overlaps);
+        assert_eq!(
+            n42_qmdb_reth::sorted_operations_from_accounts(&view, true),
+            n42_qmdb_reth::sorted_operations_from_execution(&follower.state, true),
+            "the QMDB operations"
+        );
+        let hashed = crate::output_shards::hashed_post_state_of(&view);
+        let theirs = reth_trie::HashedPostState::from_bundle_state::<reth_trie::KeccakKeyHasher>(follower.state.state.iter());
+        assert_eq!(hashed.accounts, theirs.accounts, "the hashed accounts");
+    }
+
+    /// A block the build path cannot reproduce exactly is refused, never
+    /// executed short: a transfer its sender cannot pay is a skip on the
+    /// leader's path and a `NotParallel` here.
+    #[test]
+    fn the_build_path_refuses_a_block_it_would_skip_a_transfer_of() {
+        let (block, mut db) = fixture(4, 3);
+        db.insert_account_info(addr(101), AccountInfo { balance: U256::from(1u64), nonce: 3, ..Default::default() });
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let refused = execute_transfers_build_path(&evm_config, &block, db.clone(), &|| Some(db.clone())).expect("no execution error");
+        assert!(refused.is_err(), "an unfunded transfer sends the block elsewhere");
     }
 
     fn parallel_matches_serial_with(graft: bool, sender_groups: bool) {
@@ -5187,6 +5433,36 @@ mod tests {
                     out.state.reverts.iter().map(Vec::len).sum::<usize>(),
                 );
             }
+        }
+        // The build path (`N42_FOLLOWER_BUILD_PATH=1`): the leader's
+        // partition, pool and batch loop into index-mode shards; the merge
+        // into one bundle, which the node builds off the chain, timed apart.
+        for round in 0..3 {
+            let at = std::time::Instant::now();
+            let (sharded, phases) = execute_transfers_build_path(&evm_config, &block, db.clone(), &|| Some(db.clone()))
+                .expect("no execution error")
+                .expect("the block qualifies on the build path");
+            let call_ms = at.elapsed().as_millis();
+            let merge_at = std::time::Instant::now();
+            let merged = sharded.merged();
+            let merge_ms = merge_at.elapsed().as_millis();
+            println!(
+                "build-path #{round}: call {call_ms} ms  partition {} batches {} ({} groups, {} batches, {} threads, batch max {} median {}) fold {} [index {}] finish {} receipts {} drop {}  -> merged behind {} ms, {} accounts",
+                phases.partition_ms,
+                phases.groups_ms,
+                phases.groups,
+                phases.batches,
+                phases.threads,
+                phases.batch_spans.max_ms,
+                phases.batch_spans.median_ms,
+                phases.merge_ms,
+                phases.graft_ms,
+                phases.finish_ms,
+                phases.receipts_us / 1000,
+                phases.drop_us / 1000,
+                merge_ms,
+                merged.state.len(),
+            );
         }
     }
 

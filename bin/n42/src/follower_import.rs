@@ -177,6 +177,41 @@ fn publish_parent_output(block_hash: B256, header: reth_primitives_traits::Seale
     note_import_landed();
 }
 
+/// The last blocks executed here on the build path
+/// (`N42_FOLLOWER_BUILD_PATH=1`): the batches' frozen shards and the block's
+/// executor's residual laid over them, under the block's hash. The child's
+/// execution reads its parent through these ([`ShardLayer`] under the
+/// residual), as the leader's chained build reads its sealed parent
+/// (`opener_on_sealed_parent`), rather than through the merged bundle.
+///
+/// [`ShardLayer`]: n42_engine_types::output_shards::ShardLayer
+type KeptShards = (B256, Arc<n42_engine_types::output_shards::FrozenShards>, ParentOutput);
+static FOLLOWER_SHARDS: Mutex<std::collections::VecDeque<KeptShards>> = Mutex::new(std::collections::VecDeque::new());
+
+/// How many blocks' shards are kept: the child reads only its parent's.
+const FOLLOWER_SHARDS_KEPT: usize = 2;
+
+/// Keeps a block's shards and residual for its child's execution.
+fn keep_follower_shards(block_hash: B256, shards: Arc<n42_engine_types::output_shards::FrozenShards>, residual: ParentOutput) {
+    let mut kept = FOLLOWER_SHARDS.lock().unwrap_or_else(|p| p.into_inner());
+    kept.retain(|(hash, _, _)| *hash != block_hash);
+    while kept.len() >= FOLLOWER_SHARDS_KEPT {
+        kept.pop_front();
+    }
+    kept.push_back((block_hash, shards, residual));
+}
+
+/// The shards and residual kept for `block_hash`, if it was executed here on
+/// the build path.
+fn follower_shards_of(block_hash: B256) -> Option<(Arc<n42_engine_types::output_shards::FrozenShards>, ParentOutput)> {
+    FOLLOWER_SHARDS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .find(|(hash, _, _)| *hash == block_hash)
+        .map(|(_, shards, residual)| (Arc::clone(shards), Arc::clone(residual)))
+}
+
 /// The parent's header and published execution output, as soon as its
 /// execution ends; `None` as soon as `parent_in` says the parent is in
 /// the engine without one, or if neither happens within [`PARENT_WAIT`].
@@ -985,7 +1020,10 @@ const CARRY_CAP: usize = 1_000_000;
 struct Executed {
     state: reth_provider::StateProviderBox,
     cached: CachedReads,
-    output: reth_provider::BlockExecutionOutput<n42_tx_types::Receipt>,
+    /// `None` on the build path, whose output is `sharded` until merged.
+    output: Option<reth_provider::BlockExecutionOutput<n42_tx_types::Receipt>>,
+    /// The build path's output (`N42_FOLLOWER_BUILD_PATH=1`).
+    sharded: Option<n42_engine_types::parallel_transfer::ShardedExecution>,
     parallel: bool,
     gate_ms: u64,
     state_ms: u64,
@@ -1535,7 +1573,13 @@ where
     // check, instead of inside the execution gate (19 ms of a 122 ms gated
     // execution at 163,000 transfers, loop234). The execution takes the plan
     // just before the gate; one it cannot use is planned again there.
-    let plan_ahead = (follower_parallel() && n42_engine_types::parallel_transfer::follower_partition_ahead()).then(|| {
+    // Not on the build path (`N42_FOLLOWER_BUILD_PATH=1`), which partitions by
+    // sender inside its call and converts each transaction on its batch's
+    // thread, as the leader does.
+    let plan_ahead = (follower_parallel()
+        && n42_engine_types::parallel_transfer::follower_partition_ahead()
+        && !(deferred && n42_engine_types::parallel_transfer::follower_build_path()))
+    .then(|| {
         let (planned, plan) = std::sync::mpsc::sync_channel(1);
         let block = Arc::clone(&recovered);
         let evm_config = evm_config.clone();
@@ -1724,6 +1768,16 @@ where
     }
     drop(parent_output);
 
+    // `N42_FOLLOWER_BUILD_PATH=1`: the block executes through the leader's
+    // build path (deferred execution only: the root is filed, not checked).
+    // Its parent, when it was executed here the same way and is read through
+    // its published output, is read through its shards.
+    let build_path = deferred && follower_parallel() && n42_engine_types::parallel_transfer::follower_build_path();
+    let parent_shards = executed_parent
+        .as_ref()
+        .filter(|(_, executed)| build_path && !executed.is_empty())
+        .and_then(|_| follower_shards_of(parent_hash));
+
     // Execution on the parent's state, then gas, receipts root and bloom
     // against the header. One piece, because on the exec-on-parent-output path
     // it runs on this thread while the vote road runs on another.
@@ -1760,7 +1814,25 @@ where
                     let historical = provider
                         .state_by_block_hash(*anchor)
                         .map_err(|err| format!("the state the published outputs are laid over: {err}"))?;
-                    Ok(n42_engine_types::direct_build::overlay_on_executed(historical, executed.clone()))
+                    match (&parent_shards, executed.split_first()) {
+                        // The parent's shards under its residual, over the
+                        // older published outputs: the chained build's layers.
+                        (Some((shards, residual)), Some((parent_block, older))) => {
+                            let below = if older.is_empty() {
+                                historical
+                            } else {
+                                n42_engine_types::direct_build::overlay_on_executed(historical, older.to_vec())
+                            };
+                            let layer: reth_provider::StateProviderBox =
+                                Box::new(n42_engine_types::output_shards::ShardLayer::new(below, Arc::clone(shards)));
+                            let top = n42_engine_types::direct_build::executed_from_output(
+                                &parent_block.recovered_block.clone_sealed_header(),
+                                Arc::clone(residual),
+                            );
+                            Ok(n42_engine_types::direct_build::overlay_on_executed(layer, vec![top]))
+                        }
+                        _ => Ok(n42_engine_types::direct_build::overlay_on_executed(historical, executed.clone())),
+                    }
                 }
                 None => {
                     // No published-output overlay on this path: every read
@@ -1783,8 +1855,55 @@ where
         // worker pool (`parallel_transfer`), partitioned by the accounts it
         // touches; anything it cannot take falls back to the serial executor.
         let mut output = None;
+        let mut sharded = None;
         let mut split = ExecSplit::default();
-        if follower_parallel() {
+        if build_path {
+            let open = || {
+                open_parent_state()
+                    .ok()
+                    .map(|s| n42_engine_types::fast_transfer::doors::CountedDb::new(StateProviderDatabase::new(s)))
+            };
+            match n42_engine_types::parallel_transfer::execute_transfers_build_path(
+                evm_config,
+                &recovered,
+                cached.as_db_mut(StateProviderDatabase::new(&state)),
+                &open,
+            )
+            .map_err(|err| format!("parallel execution: {err}"))?
+            {
+                Ok((out, phases)) => {
+                    split = ExecSplit::of(&phases);
+                    tracing::info!(
+                        target: "n42.follower_import",
+                        number,
+                        groups = phases.groups,
+                        partition_ms = phases.partition_ms,
+                        groups_ms = phases.groups_ms,
+                        batches = phases.batches,
+                        threads = phases.threads,
+                        batch_max_ms = phases.batch_spans.max_ms,
+                        batch_median_ms = phases.batch_spans.median_ms,
+                        batch_wait_ms = phases.batch_spans.wait_ms,
+                        index_ms = phases.graft_ms,
+                        merge_ms = phases.merge_ms,
+                        finish_ms = phases.finish_ms,
+                        receipts_ms = phases.receipts_us / 1000,
+                        total_ms = phases.total_us / 1000,
+                        parent_shards = parent_shards.is_some(),
+                        reads_cache = phases.transfer_timers.reads_cache(),
+                        reads_provider = phases.transfer_timers.reads_provider,
+                        reads_view = phases.transfer_timers.reads_view,
+                        "build-path import phases"
+                    );
+                    sharded = Some(out);
+                }
+                Err(why) => {
+                    static DECLINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let declined = DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    tracing::info!(target: "n42.follower_import", number, %why, declined, "not on the build path; executing serially");
+                }
+            }
+        } else if follower_parallel() {
             // `N42_PHASE_TIMERS=1`: counts each batch's reads by door (plan
             // v6 6.5/6.6). `CountedDb` is a passthrough when the flag is
             // off, so this costs nothing extra on that path.
@@ -1890,19 +2009,23 @@ where
         // through providers of its own, not through `cached`: the carry below
         // would copy ~147,000 accounts (26 ms on the import, loop155) that the
         // next import barely reads.
-        let parallel = output.is_some();
+        let parallel = output.is_some() || sharded.is_some();
         let output = match output {
-            Some(out) => out,
-            None => evm_config
-                .executor(cached.as_db_mut(StateProviderDatabase::new(&state)))
-                .execute(&recovered)
-                .map_err(|err| format!("execution: {err}"))?,
+            Some(out) => Some(out),
+            None if sharded.is_some() => None,
+            None => Some(
+                evm_config
+                    .executor(cached.as_db_mut(StateProviderDatabase::new(&state)))
+                    .execute(&recovered)
+                    .map_err(|err| format!("execution: {err}"))?,
+            ),
         };
         let exec_ended = std::time::Instant::now();
         Ok(Executed {
             state,
             cached,
             output,
+            sharded,
             parallel,
             gate_ms,
             state_ms,
@@ -1916,6 +2039,7 @@ where
         state,
         mut cached,
         output,
+        sharded,
         parallel: parallel_executed,
         gate_ms,
         state_ms,
@@ -1972,51 +2096,115 @@ where
             )?
         }
     };
-    let execution_output = Arc::new(output);
     let prague = chain_spec.is_prague_active_at_timestamp(recovered.timestamp);
-    // `N42_FOLLOWER_FIELDS_EARLY=1`: this block's QMDB root -- the half of its
-    // fields its child's vote waits for -- starts here, on a thread of its own
-    // with its hashing on a pool of its own ([`on_root_pool`]), beside the
-    // post-execution checks, the published output, the carry and the hashed
-    // post-state below instead of after them. The same operations on the same
-    // bundle, filed under the same hash as the root job below would file them.
-    // It answers the wait for the parent's fields it had to do first, when it
-    // began, and when it ended.
-    let early_root = if deferred && fields_early() {
-        let output = Arc::clone(&execution_output);
-        let qmdb = qmdb.clone();
-        let on_parent_output = executed_parent.is_some();
-        let spawned = std::thread::Builder::new().name("qmdb-root-early".into()).spawn(
-            move || -> Result<(u64, std::time::Instant, std::time::Instant), String> {
-                let wait_at = std::time::Instant::now();
-                // Executed on the published outputs, the parent's tree is
-                // filed by the parent's own root, which this one builds on.
-                if on_parent_output {
-                    wait_for_parent_fields(parent_hash)?;
-                }
-                let root_at = std::time::Instant::now();
-                let root = on_root_pool(|| {
+    let on_parent_output = executed_parent.is_some();
+    // The build path runs the post-execution checks beside its merge, and
+    // (with the pass on) builds the hashed post-state from the shards' view.
+    let mut pre_checked: Option<(u64, std::time::Instant)> = None;
+    let mut view_hashed: Option<reth_trie::HashedPostState> = None;
+    let (execution_output, early_root) = match (output, sharded) {
+        (Some(output), _) => {
+            let execution_output = Arc::new(output);
+            // `N42_FOLLOWER_FIELDS_EARLY=1`: this block's QMDB root -- the
+            // half of its fields its child's vote waits for -- starts here,
+            // on a thread of its own with its hashing on a pool of its own
+            // ([`on_root_pool`]), beside the post-execution checks, the
+            // published output, the carry and the hashed post-state below
+            // instead of after them. The same operations on the same bundle,
+            // filed under the same hash as the root job below would file them.
+            let early_root = if deferred && fields_early() {
+                let output = Arc::clone(&execution_output);
+                let qmdb = qmdb.clone();
+                Some(spawn_early_root(parent_hash, block_hash, on_parent_output, move || {
                     let ops = n42_qmdb_reth::sorted_operations_from_execution(&output.state, prague);
-                    qmdb.insert_block_operations(parent_hash, block_hash, number, ops)
-                })
-                .map_err(|err| format!("state root: {err}"))?;
-                n42_engine_types::executed_fields::remember_state_root(block_hash, root);
-                Ok((ms_between(wait_at, root_at), root_at, std::time::Instant::now()))
-            },
-        );
-        Some(spawned.map_err(|err| format!("a thread for the early QMDB root: {err}"))?)
-    } else {
-        None
+                    qmdb.insert_block_operations(parent_hash, block_hash, number, ops).map_err(|err| format!("state root: {err}"))
+                })?)
+            } else {
+                None
+            };
+            (execution_output, early_root)
+        }
+        (None, Some(sharded)) => {
+            // `N42_FOLLOWER_BUILD_PATH=1`: the block's output is the batches'
+            // shards under the executor's residual. The root reads their view
+            // on the root pool the instant the batches are done (the leader's
+            // finish after its seal); the one bundle the engine, the child's
+            // check and the published output need is merged on a thread of
+            // its own beside it, while this thread runs the post-execution
+            // checks; the child's execution reads the shards themselves.
+            let n42_engine_types::parallel_transfer::ShardedExecution { shards, residual, result } = sharded;
+            let shards = Arc::new(shards);
+            let residual: ParentOutput = Arc::new(reth_provider::BlockExecutionOutput {
+                state: residual,
+                result: reth_execution_types::BlockExecutionResult {
+                    receipts: Vec::new(),
+                    requests: Default::default(),
+                    gas_used: 0,
+                    blob_gas_used: 0,
+                },
+            });
+            keep_follower_shards(block_hash, Arc::clone(&shards), Arc::clone(&residual));
+            let early_root = {
+                let (shards, residual, qmdb) = (Arc::clone(&shards), Arc::clone(&residual), qmdb.clone());
+                spawn_early_root(parent_hash, block_hash, on_parent_output, move || {
+                    let overlaps = shards.overlaps(&residual.state);
+                    let view = shards.view(&residual.state, &overlaps);
+                    let ops = n42_qmdb_reth::sorted_operations_from_accounts(&view, prague);
+                    qmdb.insert_block_operations(parent_hash, block_hash, number, ops).map_err(|err| format!("state root: {err}"))
+                })?
+            };
+            let merger = {
+                let (shards, residual) = (Arc::clone(&shards), Arc::clone(&residual));
+                std::thread::Builder::new()
+                    .name("n42-follower-merge".into())
+                    .spawn(move || {
+                        let at = std::time::Instant::now();
+                        let merged = shards.merged(&residual.state);
+                        (merged, at.elapsed().as_millis() as u64)
+                    })
+                    .map_err(|err| format!("a thread for the shards' merge: {err}"))?
+            };
+            let checks_at = std::time::Instant::now();
+            stage.at(4);
+            consensus
+                .validate_block_post_execution(&recovered, &result, None, None)
+                .map_err(|err| format!("post-execution: {err}"))?;
+            pre_checked = Some((checks_at.elapsed().as_millis() as u64, std::time::Instant::now()));
+            if hashed_state_enabled() {
+                let overlaps = shards.overlaps(&residual.state);
+                let view = shards.view(&residual.state, &overlaps);
+                // A destroyed account's storage is zeroed from the database:
+                // the provider's own pass, on the merged bundle, below.
+                if !n42_engine_types::output_shards::any_destroyed(&view) {
+                    view_hashed = Some(n42_engine_types::output_shards::hashed_post_state_of(&view));
+                }
+            }
+            let wait_at = std::time::Instant::now();
+            let (merged, merge_ms) = merger.join().map_err(|_| "the shards' merge thread panicked".to_string())?;
+            tracing::debug!(
+                target: "n42.follower_import",
+                number,
+                merge_ms,
+                merge_wait_ms = wait_at.elapsed().as_millis() as u64,
+                "build path: the shards merged into the block's bundle"
+            );
+            (Arc::new(reth_provider::BlockExecutionOutput { state: merged, result }), Some(early_root))
+        }
+        (None, None) => return Err("the execution left no output".to_string()),
     };
-    let checks_at = std::time::Instant::now();
-    stage.at(4);
-    consensus
-        .validate_block_post_execution(&recovered, &execution_output.result, None, None)
-        .map_err(|err| format!("post-execution: {err}"))?;
-    // Under deferred execution the check above filed the receipt half of this
-    // block's fields; the root files the other.
-    let receipts_filed = std::time::Instant::now();
-    let checks_ms = checks_at.elapsed().as_millis() as u64;
+    let (checks_ms, receipts_filed) = match pre_checked {
+        Some(checked) => checked,
+        None => {
+            let checks_at = std::time::Instant::now();
+            stage.at(4);
+            consensus
+                .validate_block_post_execution(&recovered, &execution_output.result, None, None)
+                .map_err(|err| format!("post-execution: {err}"))?;
+            // Under deferred execution the check above filed the receipt half
+            // of this block's fields; the root files the other.
+            (checks_at.elapsed().as_millis() as u64, std::time::Instant::now())
+        }
+    };
     // The child's check can start now: its ~6,000 senders are in this
     // bundle, and it has no use for the QMDB root below -- only the fields
     // comparison has, and that one waits for it on its own
@@ -2122,7 +2310,10 @@ where
         // post-state here, then the root's answer.
         stage.at(7);
         let hashed_at = std::time::Instant::now();
-        let hashed_state = hashed_job()?;
+        let hashed_state = match view_hashed.take() {
+            Some(hashed) => hashed,
+            None => hashed_job()?,
+        };
         let hashed_ms = hashed_at.elapsed().as_millis() as u64;
         let (wait_ms, began, ended) =
             early_root.join().unwrap_or_else(|_| Err("the early QMDB root thread panicked".to_string()))?;
@@ -2231,6 +2422,39 @@ where
             split.batch_median_ms,
         ],
     ))
+}
+
+/// The early root's thread: the wait before it, its start and its end.
+type EarlyRoot = std::thread::JoinHandle<Result<(u64, std::time::Instant, std::time::Instant), String>>;
+
+/// This block's QMDB root on a thread of its own, its hashing on the root
+/// pool ([`on_root_pool`]): after the parent's fields when the block was
+/// executed on the parent's published output (the parent's tree is filed by
+/// the parent's own root, which this one builds on). `root_of` computes the
+/// operations and files them. The thread answers the wait it had to do
+/// first, when the root began, and when it ended.
+fn spawn_early_root<F>(
+    parent_hash: B256,
+    block_hash: B256,
+    on_parent_output: bool,
+    root_of: F,
+) -> Result<EarlyRoot, String>
+where
+    F: FnOnce() -> Result<B256, String> + Send + 'static,
+{
+    std::thread::Builder::new()
+        .name("qmdb-root-early".into())
+        .spawn(move || -> Result<(u64, std::time::Instant, std::time::Instant), String> {
+            let wait_at = std::time::Instant::now();
+            if on_parent_output {
+                wait_for_parent_fields(parent_hash)?;
+            }
+            let root_at = std::time::Instant::now();
+            let root = on_root_pool(root_of)?;
+            n42_engine_types::executed_fields::remember_state_root(block_hash, root);
+            Ok((ms_between(wait_at, root_at), root_at, std::time::Instant::now()))
+        })
+        .map_err(|err| format!("a thread for the early QMDB root: {err}"))
 }
 
 /// How many timings [`import_foreign_block`] returns (see its last lines).

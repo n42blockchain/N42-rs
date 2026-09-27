@@ -317,3 +317,136 @@ fn bench_output_shards_fold_pipelined() {
         median(behind_times)
     );
 }
+
+/// The fleet's liveness (`docs/BREAKTHROUGH_DESIGN.md` 10.12): block `k`'s
+/// frozen shards stay alive while block `k + 1` executes and folds (the
+/// child's overlay holds them, the merge reads them), and the merged bundle
+/// stays alive a few blocks (the executed-block cache); the batch maps are
+/// cloned on the build pool as the execution would allocate them; block
+/// `k`'s merge (its own thread) and roots (the global pool) run beside
+/// block `k + 1`'s append and fold. `BENCH_HOLD=<n>` blocks' shards and
+/// bundles are held (default 3); `BENCH_BEHIND_MS` delays the child behind
+/// the parent's merge; `BENCH_NO_BEHIND=1` runs no merge or roots beside.
+/// `BENCH_LOAD=<n>` runs n busy threads on the same cores. Run once as is
+/// (a fresh map a shard, every block) and once with `N42_SHARD_RECYCLE=1`
+/// (the maps recycled). Measured (16 cores, medians of 20; task wall / CPU
+/// ms, minor faults a block): load 0 5.3-5.9 / 4.3, 9; load 16 20.4 / 8.3,
+/// 2,055; load 24 26.6-27.2 / 9.0-9.3, ~2,000-2,400; load 32 31.3 / 8.5,
+/// 2,117 -- the task's 40 ms on the fleet is reproduced by the cores being
+/// shared (wall 2.5-3.7x its CPU, the CPU itself 2x), not by the maps'
+/// allocation.
+#[test]
+#[ignore = "a timing benchmark: run it pinned, release, on a quiet box"]
+fn bench_output_shards_fold_live() {
+    use rayon::prelude::*;
+    use std::sync::Arc;
+    let db = parent();
+    let bundles = batch_bundles(&db);
+    let accounts: usize = bundles.iter().map(|b| b.state.len()).sum();
+    let residual = Arc::new(BundleState::default());
+    let hold: usize = std::env::var("BENCH_HOLD").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+    let delay_ms: u64 = std::env::var("BENCH_BEHIND_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let behind_on = std::env::var("BENCH_NO_BEHIND").map_or(true, |v| v != "1");
+    // `BENCH_LOAD=<n>`: n threads walking a 64 MB buffer the whole time (the
+    // node's ingest, network and other blocks' work on the same cores).
+    let load: usize = std::env::var("BENCH_LOAD").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let loaders: Vec<_> = (0..load)
+        .map(|i| {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut buf = vec![0u64; 8 << 20];
+                let mut x = i as u64 | 1;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    for _ in 0..4096 {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        let at = (x as usize) & (buf.len() - 1);
+                        buf[at] = buf[at].wrapping_add(x);
+                    }
+                }
+                std::hint::black_box(buf);
+            })
+        })
+        .collect();
+    let mut held_shards: std::collections::VecDeque<Arc<n42_engine_types::output_shards::FrozenShards>> =
+        Default::default();
+    let held_merged: Arc<std::sync::Mutex<std::collections::VecDeque<BundleState>>> = Default::default();
+    let (mut walls, mut tasks, mut cpus, mut fsum, mut fmax, mut migrated, mut behind_t, mut preempted) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for round in 0..WARMUPS + ROUNDS {
+        let shards = OutputShards::new(beneficiary(), accounts, 16);
+        let parent_shards = held_shards.back().cloned();
+        let (fold, split, behind) = std::thread::scope(|scope| {
+            let behind = parent_shards.filter(|_| behind_on).map(|frozen| {
+                let residual = Arc::clone(&residual);
+                let held_merged = Arc::clone(&held_merged);
+                scope.spawn(move || {
+                    let at = Instant::now();
+                    let merged = std::thread::scope(|inner| {
+                        let merge = inner.spawn(|| frozen.merged(&residual));
+                        let overlaps = frozen.overlaps(&residual);
+                        let view = frozen.view(&residual, &overlaps);
+                        let ops = n42_qmdb_reth::sorted_operations_from_accounts(&view, true);
+                        let hashed = hashed_post_state_of(&view);
+                        drop((ops, hashed, view));
+                        merge.join().expect("the merge")
+                    });
+                    let t = at.elapsed();
+                    let mut kept = held_merged.lock().expect("the held bundles");
+                    kept.push_back(merged);
+                    while kept.len() > hold {
+                        kept.pop_front();
+                    }
+                    t
+                })
+            });
+            std::thread::sleep(Duration::from_millis(delay_ms));
+            // The execution: the batch maps allocated on the pool's threads,
+            // each handed to the shards as it ends.
+            build_pool().install(|| bundles.par_iter().for_each(|bundle| shards.add(bundle.clone())));
+            let at = Instant::now();
+            let frozen = shards.freeze();
+            let fold = at.elapsed();
+            let split = frozen.fold_split();
+            let behind = behind.map(|job| job.join().expect("the job behind the seal"));
+            held_shards.push_back(Arc::new(frozen));
+            while held_shards.len() > hold {
+                held_shards.pop_front();
+            }
+            (fold, split, behind)
+        });
+        if round >= WARMUPS {
+            walls.push(fold);
+            tasks.push(Duration::from_micros(split.task_max_us));
+            cpus.push(Duration::from_micros(split.task_cpu_max_us));
+            fsum.push(split.task_minflt_sum);
+            fmax.push(split.task_minflt_max);
+            migrated.push(split.task_migrated);
+            preempted.push(split.task_nivcsw_max);
+            behind_t.extend(behind);
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for loader in loaders {
+        loader.join().expect("a load thread");
+    }
+    let med = |mut v: Vec<u64>| {
+        v.sort_unstable();
+        v[v.len() / 2]
+    };
+    eprintln!(
+        "live (hold {hold}, behind {delay_ms} ms, load {load}{}, recycle {}): fold wall median {:.2} ms, task_max {:.2}, task_cpu_max {:.2}, minflt sum {} / max {}, migrated {}, nivcsw max {}, merge+roots behind {:.2}",
+        if behind_on { "" } else { ", no merge beside" },
+        n42_engine_types::output_shards::shard_recycle(),
+        median(walls),
+        median(tasks),
+        median(cpus),
+        med(fsum),
+        med(fmax),
+        med(migrated),
+        med(preempted),
+        if behind_t.is_empty() { 0.0 } else { median(behind_t) }
+    );
+}

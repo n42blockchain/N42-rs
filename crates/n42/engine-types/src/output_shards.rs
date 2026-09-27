@@ -247,10 +247,13 @@ impl OutputShards {
         let transposed = std::time::Instant::now();
         let batches_ref = &batches;
         let fold = move |index: usize| {
-            let start = std::time::Instant::now();
-            let mut shard = Shard::default();
+            let probe = TaskProbe::start();
+            // A map the pool kept from an earlier block (its pages resident),
+            // or a fresh one.
+            let mut shard = recycled_shard();
             // The exact capacity: every batch listed its addresses here.
-            shard.state.reserve(batches_ref.iter().map(|batch| batch.addresses[index].len()).sum());
+            let wanted: usize = batches_ref.iter().map(|batch| batch.addresses[index].len()).sum();
+            shard.state.reserve(wanted);
             shard.reverts.reserve(batches_ref.iter().map(|batch| batch.revert_at[index].len()).sum());
             for batch in batches_ref {
                 shard.add(
@@ -259,9 +262,9 @@ impl OutputShards {
                     batch.revert_at[index].iter().filter_map(|at| batch.reverts.get(*at as usize)),
                 );
             }
-            (shard, start, std::time::Instant::now())
+            (shard, probe.finish())
         };
-        let folded: Vec<(Shard, std::time::Instant, std::time::Instant)> = {
+        let folded: Vec<(Shard, TaskCost)> = {
             use rayon::prelude::*;
             crate::parallel_transfer::build_pool().install(|| (0..count).into_par_iter().map(fold).collect())
         };
@@ -272,19 +275,26 @@ impl OutputShards {
         }
         // Where the fold's wall goes: the set-up, the wait for the pool's
         // first thread, the spread of the tasks' starts, the slowest task's
-        // own work, and the collect after the last one.
-        let first = folded.iter().map(|(_, start, _)| *start).min().unwrap_or(done);
-        let last_start = folded.iter().map(|(_, start, _)| *start).max().unwrap_or(done);
-        let last_end = folded.iter().map(|(_, _, end)| *end).max().unwrap_or(done);
-        let task_max = folded.iter().map(|(_, start, end)| end.duration_since(*start)).max().unwrap_or_default();
+        // own work, and the collect after the last one; and what the tasks'
+        // own work is made of (CPU time, faults, migrations).
+        let costs = || folded.iter().map(|(_, cost)| cost);
+        let first = costs().map(|cost| cost.start).min().unwrap_or(done);
+        let last_start = costs().map(|cost| cost.start).max().unwrap_or(done);
+        let last_end = costs().map(|cost| cost.end).max().unwrap_or(done);
+        let task_max = costs().map(|cost| cost.end.duration_since(cost.start)).max().unwrap_or_default();
         let split = FoldSplit {
             transpose_us: transposed.duration_since(at).as_micros() as u64,
             queue_us: first.saturating_duration_since(transposed).as_micros() as u64,
             skew_us: last_start.duration_since(first).as_micros() as u64,
             task_max_us: task_max.as_micros() as u64,
             tail_us: done.saturating_duration_since(last_end).as_micros() as u64,
+            task_cpu_max_us: costs().map(|cost| cost.cpu_ns).max().unwrap_or(0) / 1000,
+            task_minflt_max: costs().map(|cost| cost.minflt).max().unwrap_or(0),
+            task_minflt_sum: costs().map(|cost| cost.minflt).sum(),
+            task_migrated: costs().filter(|cost| cost.migrated).count() as u64,
+            task_nivcsw_max: costs().map(|cost| cost.nivcsw).max().unwrap_or(0),
         };
-        let shards: Vec<Shard> = folded.into_iter().map(|(shard, _, _)| shard).collect();
+        let shards: Vec<Shard> = folded.into_iter().map(|(shard, _)| shard).collect();
         let fold_ns = at.elapsed().as_nanos() as u64;
         tracing::info!(
             target: "payload_builder",
@@ -294,6 +304,11 @@ impl OutputShards {
             skew_us = split.skew_us,
             task_max_us = split.task_max_us,
             tail_us = split.tail_us,
+            task_cpu_max_us = split.task_cpu_max_us,
+            task_minflt_max = split.task_minflt_max,
+            task_minflt_sum = split.task_minflt_sum,
+            task_migrated = split.task_migrated,
+            task_nivcsw_max = split.task_nivcsw_max,
             "output shards folded"
         );
         FrozenShards {
@@ -303,6 +318,63 @@ impl OutputShards {
             append_ns: self.append_ns.into_inner(),
             fold_ns,
             split,
+        }
+    }
+}
+
+/// Whether a block's shard maps go back to [`SHARD_POOL`] when its frozen
+/// shards drop, for a later block's fold to fill with its pages resident
+/// (`N42_SHARD_RECYCLE=1`; off by default). The fleet-liveness bench
+/// (`tests/output_shards_bench.rs`, `bench_output_shards_fold_live`: three
+/// blocks' shards and bundles held, the parent's merge and roots beside)
+/// takes 3-9 minor faults a block with fresh maps -- jemalloc reuses its
+/// dirty pages -- and ~2,000 only with 16-32 busy threads on the fold's
+/// cores, where recycling removes them but saves nothing measurable
+/// (task 26.6-27.2 -> 24.8-27.3 ms at 24 load threads) and the clearing
+/// thread costs the idle fold 2-3 ms. Kept for a fleet leg whose
+/// `task_minflt_sum` says the node faults where the bench does not.
+pub fn shard_recycle() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_SHARD_RECYCLE").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Shard maps kept with their capacity: a few blocks' worth (the parent's
+/// shards, the grandparent's in its merge, the one being folded).
+static SHARD_POOL: Mutex<Vec<Shard>> = Mutex::new(Vec::new());
+
+/// How many maps the pool keeps at most.
+const SHARD_POOL_MAX: usize = 4 * 16;
+
+/// A cleared shard from the pool, or a new one.
+fn recycled_shard() -> Shard {
+    if !shard_recycle() {
+        return Shard::default();
+    }
+    let kept = SHARD_POOL.lock().unwrap_or_else(PoisonError::into_inner).pop();
+    kept.unwrap_or_default()
+}
+
+impl Drop for FrozenShards {
+    fn drop(&mut self) {
+        if self.shards.is_empty() || !shard_recycle() {
+            return;
+        }
+        let mut shards = std::mem::take(&mut self.shards);
+        // Cleared off the dropping thread (a pass over every entry, a few ms
+        // for the fleet's block): the last holder may be a build.
+        let spawned = std::thread::Builder::new().name("n42-shard-recycle".into()).spawn(move || {
+            for shard in &mut shards {
+                shard.state.clear();
+                shard.reverts.clear();
+                shard.state_size = 0;
+                shard.beneficiary_delta = U256::ZERO;
+            }
+            let mut pool = SHARD_POOL.lock().unwrap_or_else(PoisonError::into_inner);
+            let room = SHARD_POOL_MAX.saturating_sub(pool.len());
+            pool.extend(shards.into_iter().take(room));
+        });
+        if let Err(error) = spawned {
+            tracing::debug!(target: "payload_builder", %error, "the shard maps were freed, not recycled");
         }
     }
 }
@@ -334,6 +406,88 @@ pub struct FoldSplit {
     pub task_max_us: u64,
     /// From the last task's end to the pool handing the shards back.
     pub tail_us: u64,
+    /// The largest CPU time one task used (its thread's CPU clock): against
+    /// `task_max_us`, wall much above CPU is a task blocked (faults waiting
+    /// on a lock, the thread descheduled), CPU near wall is work.
+    pub task_cpu_max_us: u64,
+    /// The most minor page faults one task took (`RUSAGE_THREAD`).
+    pub task_minflt_max: u64,
+    /// The minor page faults of every task together.
+    pub task_minflt_sum: u64,
+    /// Tasks that ended on another CPU than they started on.
+    pub task_migrated: u64,
+    /// The most involuntary context switches one task took (its thread
+    /// preempted by another runnable thread on its CPU).
+    pub task_nivcsw_max: u64,
+}
+
+/// One fold task's own cost, read from its thread: wall, CPU time, minor
+/// faults and the CPU it ran on at the start and the end.
+#[derive(Debug, Clone, Copy)]
+struct TaskProbe {
+    start: std::time::Instant,
+    cpu_ns: u64,
+    minflt: u64,
+    nivcsw: u64,
+    on_cpu: i32,
+}
+
+/// What [`TaskProbe::finish`] measured.
+#[derive(Debug, Clone, Copy)]
+struct TaskCost {
+    start: std::time::Instant,
+    end: std::time::Instant,
+    cpu_ns: u64,
+    minflt: u64,
+    nivcsw: u64,
+    migrated: bool,
+}
+
+impl TaskProbe {
+    fn start() -> Self {
+        let (cpu_ns, minflt, nivcsw, on_cpu) = thread_counters();
+        Self { start: std::time::Instant::now(), cpu_ns, minflt, nivcsw, on_cpu }
+    }
+
+    fn finish(self) -> TaskCost {
+        let end = std::time::Instant::now();
+        let (cpu_ns, minflt, nivcsw, on_cpu) = thread_counters();
+        TaskCost {
+            start: self.start,
+            end,
+            cpu_ns: cpu_ns.saturating_sub(self.cpu_ns),
+            minflt: minflt.saturating_sub(self.minflt),
+            nivcsw: nivcsw.saturating_sub(self.nivcsw),
+            migrated: on_cpu != self.on_cpu,
+        }
+    }
+}
+
+/// The calling thread's CPU time (ns), minor faults, involuntary context
+/// switches and current CPU.
+#[cfg(target_os = "linux")]
+fn thread_counters() -> (u64, u64, u64, i32) {
+    // SAFETY: both calls only write into the zeroed structs passed to them.
+    unsafe {
+        let mut ts: libc::timespec = std::mem::zeroed();
+        let cpu_ns = if libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) == 0 {
+            (ts.tv_sec as u64).saturating_mul(1_000_000_000).saturating_add(ts.tv_nsec as u64)
+        } else {
+            0
+        };
+        let mut usage: libc::rusage = std::mem::zeroed();
+        let (minflt, nivcsw) = if libc::getrusage(libc::RUSAGE_THREAD, &mut usage) == 0 {
+            (usage.ru_minflt.max(0) as u64, usage.ru_nivcsw.max(0) as u64)
+        } else {
+            (0, 0)
+        };
+        (cpu_ns, minflt, nivcsw, libc::sched_getcpu())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn thread_counters() -> (u64, u64, u64, i32) {
+    (0, 0, 0, -1)
 }
 
 impl FrozenShards {
@@ -445,19 +599,20 @@ impl FrozenShards {
     /// The shards folded into one map after all, for a build that needs the
     /// block's state in its executor (a serial loop, a cache-reading finish):
     /// installed by `install_staged` exactly as a streamed graft is.
-    pub fn into_staged(self) -> crate::parallel_transfer::StagedGraft {
+    pub fn into_staged(mut self) -> crate::parallel_transfer::StagedGraft {
         let total = self.accounts();
         let mut state: AddressHashMap<BundleAccount> = Default::default();
         state.reserve(total);
         let mut reverts = Vec::with_capacity(total);
         let (mut size, mut delta) = (0usize, U256::ZERO);
-        for shard in self.shards {
+        for shard in std::mem::take(&mut self.shards) {
             size += shard.state_size;
             delta = delta.saturating_add(shard.beneficiary_delta);
             state.extend(shard.state);
             reverts.extend(shard.reverts);
         }
-        crate::parallel_transfer::StagedGraft::from_parts(self.beneficiary, state, size, self.contracts, reverts, delta)
+        let contracts = std::mem::take(&mut self.contracts);
+        crate::parallel_transfer::StagedGraft::from_parts(self.beneficiary, state, size, contracts, reverts, delta)
     }
 
     /// The block's one `BundleState`: the shards' accounts with `residual` --

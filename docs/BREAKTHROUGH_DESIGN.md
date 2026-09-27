@@ -387,3 +387,24 @@ whole with per-shard address lists, so the fold copies from it (append 8, fold +
 remains, on the fleet, is the ordering in `payload.rs`: the merge and the roots must not share the build pool's
 cores with the child's execution and fold. loop276 runs v4 with the fold split logged ("output shards folded":
 queue / skew / task_max / tail) to name the fleet's fold.
+
+### 10.12 v4 on the fleet (loop276): the fold's tasks themselves take 40 ms there
+
+| leg | win1 | cycle | par_exec | append | fold (wall) | fold split: queue / skew / tail us, task_max ms | merge | roots | state_ready | state_wait | sealed_at |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| OFF | 1,064,865 | 153 | 59 | - | graft 45 | - | - | 36 | 9 | 28 | 134 |
+| S16 | 1,037,723 | 157 | 57 | 5 | 39 | 15 / 29 / 28, **39.7** | 58 | 60 | 61 | 0 | 147 |
+| S16b | 1,048,568 | 155 | 59 | 6 | 41 | 14 / 29 / 27, **41.8** | 61 | 64 | 63 | 0 | 151 |
+| OFFb | 1,070,302 | 152 | 57 | - | graft 45 | - | - | 35 | 9 | 28 | 131 |
+
+The append is now 5-6 ms of pool time (55 before) and the fold's queue, skew and tail are microseconds -- so
+it is not the pool's wake-up, not a descheduled task, not the transposition. The slowest task takes 40 ms for
+~9k inserts (4.4 us each) where the same task takes 3.5 ms off the fleet (0.38 us), and every task takes the
+same 40 (skew 29 us). A shared, serialised resource inside the tasks' own work: the likeliest is memory --
+the 16 tasks allocating and first-touching ~40 MB of fresh shard maps at once (page faults under one mmap lock,
+page zeroing) where the microbenchmark's warm rounds reuse freed memory, or the batch maps' accounts being
+read from other cores' caches. The merge (58-61) and roots (60-64) run beside the child's fold and execution and
+stay 1.7x their idle cost. The window is 1.038-1.049M against 1.065-1.070M off, the seal 147-151 against 131-134.
+Next: count the fold's minor faults and CPU time per task on the fleet, reproduce with the fleet's liveness
+(the parent's shards alive in the child's overlay while the child folds), and recycle the shard maps' allocations
+across blocks; if the tasks are then ~4 ms the seal is ~95 and the chain follows.

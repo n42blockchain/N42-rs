@@ -947,3 +947,12 @@ binds in 760 of 1,023 views yet the cycle is not the pacing plus 4.5 -- the tick
 measured from when the leader saw its own head, not from the previous proposal's send, so the interval carries
 B inside it. That is the next thing to read and set: the pacing from the send, or the pacing lowered to
 match (loop290's 70-90 were before 6b).
+
+The tick's origin, read: `block_seen[head]` is set in `remember_block` right after the leader's `build_block_on`
+returns, 0.8 ms before the send, and in the 760 tick-bound views the tick fell 99.2 ms after the previous
+send -- the pacing already counts from the send (the `N42_PACING_FROM_SEND` flag changes 0.8 ms and is not
+taken). The 128 is the tail: send-to-send is a median 103 in the tick-bound views and 163 in the other 261,
+where the tick arrived before the leader's own block had sealed (`take_sealed_us` 70-240 ms), and `publish_us`
+spikes to 18-26 on the vote log's fsync. No follower-side constraint refuses an early proposal (the header's
+timestamp is the parent's plus the period in whole seconds; `baseTimeout` is the view timeout). So the term
+is the seal chain's tail, not the tick: which phase inflates in the slow quarter of builds is the next read.

@@ -17,6 +17,13 @@
 //! - a block being applied publishes its journal before the index changes, so no reader at or
 //!   below H sees a half-applied block.
 //!
+//! Readers do not share a lock: what a read needs from the versions (validity, head, journals,
+//! the pending block) is published as one immutable [`Frozen`] to [`READER_SLOTS`] cache-line
+//! padded slots, and a reader takes only its own thread's slot's read lock, held through the
+//! record read. A writer replaces every slot under its write lock, so it waits for each slot's
+//! in-flight reads exactly as it waited for the one shared lock (a block's index is not touched
+//! until every slot holds its journal; a truncation's step back holds every slot until it is done).
+//!
 //! It moves as the database persists (`QmdbNodeState::on_persisted`) and declines what it cannot
 //! answer exactly (a reader ahead of it, or further behind than its journals). When the database
 //! unwinds below H, or the tree is about to cut records the view reads (a revert below H, told
@@ -29,8 +36,8 @@ use std::{
     collections::VecDeque,
     path::Path,
     sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex, PoisonError, RwLock,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex, PoisonError, RwLock, RwLockWriteGuard,
     },
 };
 
@@ -88,6 +95,51 @@ struct Versions {
     held_from: Option<u64>,
 }
 
+impl Versions {
+    /// What a read needs, as of now.
+    fn frozen(&self) -> Arc<Frozen> {
+        Arc::new(Frozen {
+            valid: self.valid,
+            head: self.head.0,
+            journals: self.journals.iter().map(|step| step.journal.clone()).collect(),
+            pending: self.pending.clone(),
+        })
+    }
+}
+
+/// The part of [`Versions`] a read uses, published to every reader slot. It
+/// owns its journals (`Arc`s), and a reader holds its slot's read lock for the
+/// whole read, so a writer can neither drop them nor move the index under it.
+#[derive(Debug)]
+struct Frozen {
+    valid: bool,
+    head: u64,
+    /// The journals of blocks `head - len + 1 ..= head`, oldest first.
+    journals: Vec<Journal>,
+    pending: Option<Journal>,
+}
+
+/// Reader slots: threads are spread over them round robin, so a read writes
+/// only its own slot's line (the one shared `versions` lock cost 1.8-2.1 us a
+/// read at sixteen threads against 0.38 alone, `bench_concurrent_reads`).
+const READER_SLOTS: usize = 128;
+
+/// One reader slot, on its own cache lines.
+#[derive(Debug)]
+#[repr(align(128))]
+struct Slot(RwLock<Arc<Frozen>>);
+
+/// The calling thread's reader slot.
+fn reader_slot() -> usize {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    thread_local! {
+        static SLOT: usize = NEXT.fetch_add(1, Ordering::Relaxed) % READER_SLOTS;
+    }
+    SLOT.try_with(|slot| *slot).unwrap_or(0)
+}
+
+type SlotsWrite<'a> = Vec<RwLockWriteGuard<'a, Arc<Frozen>>>;
+
 /// Where a persisted block stands against the view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Position {
@@ -117,6 +169,9 @@ pub struct QmdbReadView {
     file: EntryFileView,
     index: SharedOffsetIndex,
     versions: RwLock<Versions>,
+    /// [`Frozen`] copies of `versions`, one per reader slot (see the module documentation).
+    /// Taken after `versions` by a writer; a reader takes one slot and nothing else.
+    readers: Box<[Slot]>,
     /// Bytes of the entry file the view may read: past its newest block's last record,
     /// including a block whose floor was raised and that has not advanced yet.
     floor: AtomicU64,
@@ -181,17 +236,14 @@ impl QmdbReadView {
         let changes: Vec<(Hash, Option<u64>)> = live.into_iter().map(|(key, offset)| (key, Some(offset))).collect();
         let index = SharedOffsetIndex::default();
         index.apply_sorted(&changes, |offset| file.key(offset));
+        let versions =
+            Versions { valid: true, head, head_floor: floor, journals: VecDeque::new(), pending: None, held_from: None };
+        let frozen = versions.frozen();
         Ok(Arc::new(Self {
             file,
             index,
-            versions: RwLock::new(Versions {
-                valid: true,
-                head,
-                head_floor: floor,
-                journals: VecDeque::new(),
-                pending: None,
-                held_from: None,
-            }),
+            versions: RwLock::new(versions),
+            readers: (0..READER_SLOTS).map(|_| Slot(RwLock::new(frozen.clone()))).collect(),
             floor: AtomicU64::new(floor),
             cuts: AtomicU64::new(0),
             advancing: Mutex::new(()),
@@ -218,24 +270,43 @@ impl QmdbReadView {
         self.index.is_empty()
     }
 
+    /// Every reader slot's write lock, in order: a writer holding them has
+    /// waited out every in-flight read. Taken after `versions`.
+    fn lock_readers(&self) -> SlotsWrite<'_> {
+        self.readers.iter().map(|slot| slot.0.write().unwrap_or_else(PoisonError::into_inner)).collect()
+    }
+
+    /// Publishes `versions` to the slots `readers` holds.
+    fn publish_to(readers: &mut SlotsWrite<'_>, versions: &Versions) {
+        let frozen = versions.frozen();
+        for slot in readers.iter_mut() {
+            **slot = frozen.clone();
+        }
+    }
+
+    /// Publishes `versions` to every reader slot.
+    fn publish(&self, versions: &Versions) {
+        Self::publish_to(&mut self.lock_readers(), versions);
+    }
+
     /// Reads `key` as of block `at`: `None` when the view cannot answer
     /// exactly, `Some(None)` for an absent key, else the decoded value. The
-    /// versions lock is held through the record read, so a truncation waits.
+    /// thread's reader slot is held through the record read, so a truncation
+    /// (and an index change) waits.
     fn read_at<T>(&self, key: &Hash, at: u64, decode: impl FnOnce(&[u8]) -> T) -> Option<Option<T>> {
-        let versions = self.versions.read().unwrap_or_else(PoisonError::into_inner);
-        if !versions.valid || at > versions.head.0 {
+        let frozen = self.readers.get(reader_slot())?.0.read().unwrap_or_else(PoisonError::into_inner);
+        if !frozen.valid || at > frozen.head {
             return None;
         }
-        let behind = (versions.head.0 - at) as usize;
-        if behind > versions.journals.len() {
+        let behind = (frozen.head - at) as usize;
+        if behind > frozen.journals.len() {
             return None;
         }
-        let undone = versions
+        let undone = frozen
             .journals
             .iter()
-            .skip(versions.journals.len() - behind)
-            .map(|step| &step.journal)
-            .chain(versions.pending.iter())
+            .skip(frozen.journals.len() - behind)
+            .chain(frozen.pending.iter())
             .find_map(|journal| journal.binary_search_by(|(k, _)| k.cmp(key)).ok().map(|i| journal[i].1));
         let offset = match undone {
             Some(offset) => offset,
@@ -320,7 +391,12 @@ impl QmdbReadView {
         let journal: Vec<(Hash, Option<u64>)> =
             changes.par_iter().with_min_len(1024).map(|(key, _)| (*key, self.index.get(key, key_at))).collect();
         let journal = Arc::new(journal);
-        self.versions.write().unwrap_or_else(PoisonError::into_inner).pending = Some(journal.clone());
+        {
+            let mut versions = self.versions.write().unwrap_or_else(PoisonError::into_inner);
+            versions.pending = Some(journal.clone());
+            // Every slot holds the journal before the index changes.
+            self.publish(&versions);
+        }
         self.index.apply_sorted(changes, key_at);
         let mut versions = self.versions.write().unwrap_or_else(PoisonError::into_inner);
         versions.pending = None;
@@ -333,6 +409,7 @@ impl QmdbReadView {
         {
             versions.journals.pop_front();
         }
+        self.publish(&versions);
     }
 
     /// A persistence batch starts: the database's readers stand at `number`
@@ -363,18 +440,20 @@ impl QmdbReadView {
         if !versions.valid {
             return false;
         }
-        if self.step_back(&mut versions, number) {
-            return true;
+        let mut readers = self.lock_readers();
+        let held = self.step_back(&mut versions, number);
+        if !held {
+            Self::invalidate_locked(&mut versions, "the database unwound below the view's journals");
         }
-        Self::invalidate_locked(&mut versions, "the database unwound below the view's journals");
-        false
+        Self::publish_to(&mut readers, &versions);
+        held
     }
 
     /// Undoes the journals above `number`, newest first, one key at a time
     /// (the caller may hold the forest's lock: no work goes to the worker pool,
     /// whose threads could take that lock while this one waits). Every offset
     /// the index compares is the view's own, below its floor, so still in the
-    /// file. Callers hold `advancing` and the versions lock.
+    /// file. Callers hold `advancing`, the versions lock and every reader slot.
     fn step_back(&self, versions: &mut Versions, number: u64) -> bool {
         if number >= versions.head.0 {
             return true;
@@ -410,6 +489,7 @@ impl QmdbReadView {
     pub fn invalidate(&self, why: &str) {
         let mut versions = self.versions.write().unwrap_or_else(PoisonError::into_inner);
         Self::invalidate_locked(&mut versions, why);
+        self.publish(&versions);
     }
 
     fn invalidate_locked(versions: &mut Versions, why: &str) {
@@ -436,11 +516,13 @@ impl TruncationGuard for QmdbReadView {
         if !versions.valid || versions.head_floor <= new_len {
             return;
         }
+        let mut readers = self.lock_readers();
         let target = versions.journals.iter().rev().find(|step| step.floor_before <= new_len).map(|step| step.number - 1);
         match target {
             Some(number) if self.step_back(&mut versions, number) => {}
             _ => Self::invalidate_locked(&mut versions, "the tree cuts entry-file records older than the view's journals"),
         }
+        Self::publish_to(&mut readers, &versions);
     }
 }
 

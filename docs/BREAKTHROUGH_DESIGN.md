@@ -503,3 +503,22 @@ after the QMDB root instead of beside it. Still open: after a refused chained bu
 ends in "no payload build for id" ~5 s later (the actual stall), a separate defect. loop279: IDX (the handover
 check), then pacing 100, 110, 100.
 
+
+### 10.16 The handover holds (loop279); the merge behind the root moved the seal back to 131-135
+
+| leg | pacing | win1 | cycle | no-variant / own-not-committed / TCs | invalid blocks | fold | sealed_at | roots stage | state_ready | merge |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| IDX | 125 | 1,064,894 | 153 | 0 / 0 / 2 | 2 | 11 | 135 | 96 | 97 | 54 |
+| IDXP100 | 100 | 1,081,199 | 151 | 0 / 0 / 3 | 1 | 12 | 135 | 96 | 97 | 54 |
+| IDXP110 | 110 | 1,070,283 | 152 | 0 / 0 / 1 | 0 | 12 | 132 | 94 | 95 | 53 |
+| IDXP100b | 100 | 1,081,076 | 151 | 0 / 0 / 1 | 0 | 12 | 135 | 96 | 97 | 55 |
+
+The handover is clean in all four legs (0 refusals, 0 own blocks lost, 1-3 TCs, as the flag-off legs). But the
+seal went back from 119 (10.15) to 131-135 with every build phase unchanged (start 14, prep 4, exec 58, commit
+9, fold 19): the merge now runs inside the roots stage (96 against 61), and the child's header needs the
+parent's state root, so the seal waits for a root that is published 35 ms later than it is computed. Pacing
+100 therefore gave nothing again (cycle 151). Two of the legs also rejected a block after the windows
+("failed to apply blockhash contract call: the QMDB reader did not answer slot 0x0", then "links to previously
+rejected block") -- new, and the QMDB reader shares the timing the merge changed. Next: publish the parent's
+state root the moment the QMDB root job finishes and run the merge strictly after that, on a helper thread that
+is neither the builder's nor the reader's; find why the reader did not answer.

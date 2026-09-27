@@ -956,3 +956,18 @@ where the tick arrived before the leader's own block had sealed (`take_sealed_us
 spikes to 18-26 on the vote log's fsync. No follower-side constraint refuses an early proposal (the header's
 timestamp is the parent's plus the period in whole seconds; `baseTimeout` is the view timeout). So the term
 is the seal chain's tail, not the tick: which phase inflates in the slow quarter of builds is the next read.
+
+### 10.38 The seal chain's tail (loop291 P100): waits, not work
+
+`sealed_at` over the leg's 737 full builds: p25 83, median 102, p75 128, p90 153, max 906; 167 over 130. The
+slow builds (>130) against the rest, medians: `state_wait` 0 -> 49, `par_run` 44 -> 96, `par_ms` 89 -> 144;
+the execution +5, the index ±5, the start, the walk and the commit unchanged. The worst: block 925 (906 ms)
+is 74% `parent_fields` (670), block 1014 (692) 87% `parent_fields` (601), block 804 (436) 78% `state_wait`
+(341) -- and the validator's log before 925 and 1014 reads "own block imported by header round_trip_ms=1003"
+and "commit forkchoice ... outcome=Syncing ... waits for its import": the leader's own block took a second to
+enter its engine, and the child build waited for the parent's fields. The slow builds are scattered (gaps 7-72
+blocks, no period, no persistence batch, one TC in the run at view 1); the followers' `fields_ready` is p25 97,
+median 105-108, p75 120-126, p90 157-175, and their worst blocks are the leader's (925, 1014). **The tail is a
+wait on the previous block -- its own-import round trip through the engine and its state's readiness -- not
+execution, indexing or a periodic job.** Removing it is worth what the median says: the tick-bound views
+already run at 103 (1.58M/s of 163k blocks) against the leg's 128 average.

@@ -459,3 +459,31 @@ build only an *index* (address -> batch, slot: 16 bytes) as the block's map -- 2
 probe more on a read -- with the roots and the merge iterating the batches directly. That is a rewrite of the
 graft rather than of the shards, and it is the last step-3 attempt: if the index does not bring the fold under
 ~15 ms on the fleet, step 3 closes and the order moves to 4/5.
+
+### 10.15 The index graft on the fleet (loop278): the fold 40 -> 11, the seal 130 -> 119, the pacing now binds
+
+`N42_OUTPUT_SHARDS=16 N42_OUTPUT_INDEX=1` (2c6f18f06): the batch maps stay, the block's map is an index
+address -> batch (22 bytes an entry), conflicts (4.5-4.8k a block) summed into a small map.
+
+| leg | win1 | cycle | B | D | fold (index build) | task_max = CPU | graft | state_wait | par_exec | sealed_at | roots | merge |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| OFF | 1,053,566 | 146 | 89 | 31.5 | graft 45 | - | 45 | 29 | 55 | 130 | 37 | - |
+| IDX | **1,080,654** | 143 | 54 | 59.3 | 11 (10) | 10.4 | 0 | 0 | 58 | 119 | 61 | 59 |
+| IDXb | 1,059,438 | 143 | - | - | 11 (10) | 10.3 | 0 | 0 | 58 | 120 | 65 | 61 |
+| OFFb | 1,070,318 | 144 | - | - | graft 44 | - | 44 | 28 | 58 | 131 | 37 | - |
+
+Moving 22 bytes an account instead of 264 brought the fold from 40 to 11 on the fleet (the task 10.4 ms of
+CPU where the bench reads 0.6: the same memory-bound ratio as before, on a tenth of the bytes), the graft and
+the state wait are 0, and the seal moved 130 -> 119 with the reads through the index costing the execution ~3.
+The window did not move (1.059-1.081M against 1.054-1.070M) because the pacing now binds: D, the leader's wait
+for its 125 ms interval, rose 31 -> 59 and B fell 89 -> 54 -- the chain is under the pacing for the first time
+since 10.6. The roots are 61-65 beside the merge (59-61) as in v4; with the seal no longer waiting on them
+that is off the chain, but the merge should still follow the roots rather than share their cores.
+
+Two things to fix before pacing 100: **the tenure handover fails in the index mode** -- both IDX legs, at
+views 1028-1038, had 3-9 own blocks "not the one committed" and 7-11 direct imports failing with "no gov5
+header variant hashes to the payload's block hash" (a header the followers cannot reconstruct from the payload),
+7-8 TCs and 8-12 s lost, where the OFF legs had 0 / 0 / 1; the v4 shard legs (10.12-10.14) did not show it.
+It is after the windows, so the numbers above stand, but the mode is not sound until the new leader's first
+build (the path that does not seal early: the kept cache, `into_staged`, withdrawals put back) matches the
+direct graft's header. Then pacing 100 and 110 with the index.

@@ -167,8 +167,12 @@ fn direct(db: &CacheDB<EmptyDB>, bundles: Vec<BundleState>, keep_cache: bool) ->
     (bundle, state)
 }
 
-fn shards_of(bundles: Vec<BundleState>, count: usize) -> FrozenShards {
-    let shards = OutputShards::new(beneficiary(), (BATCHES * PER_BATCH) as usize, count);
+/// Both modes: the v4 shard maps and the index over the batches' maps
+/// (`N42_OUTPUT_INDEX`).
+const MODES: [bool; 2] = [false, true];
+
+fn shards_of(bundles: Vec<BundleState>, count: usize, index: bool) -> FrozenShards {
+    let shards = OutputShards::with_index(beneficiary(), (BATCHES * PER_BATCH) as usize, count, index);
     for bundle in bundles {
         shards.add(bundle);
     }
@@ -213,8 +217,10 @@ fn the_sharded_output_equals_the_direct_graft() {
     assert!(expected.state.contains_key(&addr(5_000_000)));
     assert!(expected.state.contains_key(&system()));
     for count in [1, 16, 64] {
-        let got = sharded(&db, shards_of(bundles.clone(), count));
-        assert_same(&format!("{count} shards"), &expected, &got);
+        for index in MODES {
+            let got = sharded(&db, shards_of(bundles.clone(), count, index));
+            assert_same(&format!("{count} shards, index {index}"), &expected, &got);
+        }
     }
 }
 
@@ -230,24 +236,28 @@ fn the_sharded_output_equals_the_staged_graft() {
     let graft = install_staged(&mut state, staged, false).expect("an in-memory database");
     let mut expected = finish(&mut state, graft.beneficiary_delta, false, from_bundle);
     append_reverts(&mut expected, graft.reverts);
-    let got = sharded(&db, shards_of(bundles, 16));
-    assert_same("staged", &expected, &got);
+    for index in MODES {
+        let got = sharded(&db, shards_of(bundles.clone(), 16, index));
+        assert_same(&format!("staged, index {index}"), &expected, &got);
+    }
 }
 
 #[test]
 fn batches_writing_at_once_give_the_same_output() {
     let db = parent();
     let bundles = batch_bundles(&db);
-    let expected = sharded(&db, shards_of(bundles.clone(), 16));
-    let shards = OutputShards::new(beneficiary(), (BATCHES * PER_BATCH) as usize, 16);
-    std::thread::scope(|scope| {
-        for bundle in bundles {
-            let shards = &shards;
-            scope.spawn(move || shards.add(bundle));
-        }
-    });
-    let got = sharded(&db, shards.freeze());
-    assert_same("concurrent", &expected, &got);
+    let expected = sharded(&db, shards_of(bundles.clone(), 16, false));
+    for index in MODES {
+        let shards = OutputShards::with_index(beneficiary(), (BATCHES * PER_BATCH) as usize, 16, index);
+        std::thread::scope(|scope| {
+            for bundle in bundles.clone() {
+                let shards = &shards;
+                scope.spawn(move || shards.add(bundle));
+            }
+        });
+        let got = sharded(&db, shards.freeze());
+        assert_same(&format!("concurrent, index {index}"), &expected, &got);
+    }
 }
 
 #[test]
@@ -255,14 +265,17 @@ fn the_fallback_with_the_cache_kept_equals_the_direct_graft() {
     let db = parent();
     let bundles = batch_bundles(&db);
     let (expected, expected_state) = direct(&db, bundles.clone(), true);
-    let mut state = block_state(&db);
-    let graft = install_staged(&mut state, shards_of(bundles, 16).into_staged(), true).expect("an in-memory database");
-    let mut got = finish(&mut state, graft.beneficiary_delta, true, from_bundle);
-    append_reverts(&mut got, graft.reverts);
-    assert_same("fallback", &expected, &got);
-    assert_eq!(expected_state.cache.accounts.len(), state.cache.accounts.len());
-    for (address, account) in &expected_state.cache.accounts {
-        assert_eq!(Some(&account.account), state.cache.accounts.get(address).map(|a| &a.account), "cache {address}");
+    for index in MODES {
+        let mut state = block_state(&db);
+        let staged = shards_of(bundles.clone(), 16, index).into_staged();
+        let graft = install_staged(&mut state, staged, true).expect("an in-memory database");
+        let mut got = finish(&mut state, graft.beneficiary_delta, true, from_bundle);
+        append_reverts(&mut got, graft.reverts);
+        assert_same(&format!("fallback, index {index}"), &expected, &got);
+        assert_eq!(expected_state.cache.accounts.len(), state.cache.accounts.len());
+        for (address, account) in &expected_state.cache.accounts {
+            assert_eq!(Some(&account.account), state.cache.accounts.get(address).map(|a| &a.account), "cache {address}");
+        }
     }
 }
 
@@ -271,16 +284,18 @@ fn a_read_probes_the_owning_shard() {
     let db = parent();
     let bundles = batch_bundles(&db);
     let (expected, _) = direct(&db, bundles.clone(), false);
-    let shards = shards_of(bundles, 64);
-    let (w1, _) = withdrawn();
-    for (address, account) in &expected.state {
-        if *address == beneficiary() || *address == system() || *address == w1 || *address == withdrawn().1 {
-            continue;
+    for index in MODES {
+        let shards = shards_of(bundles.clone(), 64, index);
+        let (w1, _) = withdrawn();
+        for (address, account) in &expected.state {
+            if *address == beneficiary() || *address == system() || *address == w1 || *address == withdrawn().1 {
+                continue;
+            }
+            assert_eq!(shards.get(address).map(|a| &a.info), Some(&account.info), "{address}, index {index}");
         }
-        assert_eq!(shards.get(address).map(|a| &a.info), Some(&account.info), "{address}");
+        assert!(shards.get(&beneficiary()).is_none());
+        assert!(shards.get(&addr(77_777_777)).is_none());
     }
-    assert!(shards.get(&beneficiary()).is_none());
-    assert!(shards.get(&addr(77_777_777)).is_none());
     assert_eq!(output_shards_off_by_default(), 0);
 }
 
@@ -298,10 +313,12 @@ fn the_fold_does_not_depend_on_the_order_the_batches_end() {
     let bundles = batch_bundles(&db);
     let (expected, _) = direct(&db, bundles.clone(), false);
     for count in [1, 16, 64] {
-        let mut reversed = bundles.clone();
-        reversed.reverse();
-        let got = sharded(&db, shards_of(reversed, count));
-        assert_same(&format!("{count} shards, reversed"), &expected, &got);
+        for index in MODES {
+            let mut reversed = bundles.clone();
+            reversed.reverse();
+            let got = sharded(&db, shards_of(reversed, count, index));
+            assert_same(&format!("{count} shards, reversed, index {index}"), &expected, &got);
+        }
     }
 }
 
@@ -311,8 +328,8 @@ fn the_roots_from_the_shards_equal_the_roots_from_the_merged_bundle() {
     let db = parent();
     let bundles = batch_bundles(&db);
     let (expected, _) = direct(&db, bundles.clone(), false);
-    for count in [1, 16, 64] {
-        let (shards, residual) = sharded_parts(&db, shards_of(bundles.clone(), count));
+    for (count, index) in [1, 16, 64].into_iter().flat_map(|count| MODES.map(|index| (count, index))) {
+        let (shards, residual) = sharded_parts(&db, shards_of(bundles.clone(), count, index));
         let merged = shards.merged(&residual);
         assert_same(&format!("{count} shards, merged"), &expected, &merged);
         // The withdrawal to an account the batches also paid.
@@ -330,6 +347,63 @@ fn the_roots_from_the_shards_equal_the_roots_from_the_merged_bundle() {
                 n42_qmdb_reth::sorted_operations_from_execution(&merged, prague),
                 "{count} shards: QMDB operations, prague {prague}"
             );
+        }
+        let from_merged = HashedPostState::from_bundle_state::<KeccakKeyHasher>(merged.state.iter());
+        assert_eq!(hashed_post_state_of(&view), from_merged, "{count} shards: hashed post-state");
+    }
+}
+
+/// Index mode against the direct graft and the v4 shards, with conflicts
+/// present (recipients every batch pays), a cached pre-execution account
+/// (taken out as a delta), the withdrawals and the beneficiary: every read,
+/// written or not, the roots' inputs, the hashed post-state and the merged
+/// bundle.
+#[test]
+fn the_index_reads_roots_and_merge_equal_the_graft() {
+    use reth_trie::{HashedPostState, KeccakKeyHasher};
+    let db = parent();
+    let bundles = batch_bundles(&db);
+    let (expected, _) = direct(&db, bundles.clone(), false);
+    for count in [1, 16, 64] {
+        let v4 = shards_of(bundles.clone(), count, false);
+        let indexed = shards_of(bundles.clone(), count, true);
+        assert!(indexed.is_indexed() && !v4.is_indexed());
+        assert_eq!(indexed.shard_count(), v4.shard_count());
+        // The 16 shared recipients every batch pays (the system account is
+        // paid by one batch only).
+        assert_eq!(indexed.index_conflicts(), 16, "{count} shards: conflicts");
+        assert_eq!(indexed.accounts(), v4.accounts(), "{count} shards: accounts");
+        assert_eq!(indexed.beneficiary_delta(), v4.beneficiary_delta());
+        // Every address the batches wrote, then a set they did not.
+        let none = BundleState::default();
+        let written: Vec<Address> = v4.view(&none, &[]).into_iter().map(|(address, _)| *address).collect();
+        assert_eq!(written.len(), v4.accounts());
+        for address in &written {
+            assert_eq!(indexed.get(address), v4.get(address), "{count} shards: read {address}");
+        }
+        for i in 0..2_000u64 {
+            let address = addr(70_000_000 + i);
+            assert!(indexed.get(&address).is_none() && v4.get(&address).is_none());
+        }
+        assert!(indexed.get(&beneficiary()).is_none());
+        let (v4, v4_residual) = sharded_parts(&db, v4);
+        let (indexed, residual) = sharded_parts(&db, indexed);
+        assert_eq!(residual, v4_residual, "{count} shards: residual");
+        assert!(indexed.get(&system()).is_none(), "{count} shards: the cached account taken out");
+        for address in &written {
+            assert_eq!(indexed.get(address), v4.get(address), "{count} shards: read {address} after the cache");
+        }
+        let merged = indexed.merged(&residual);
+        assert_same(&format!("{count} shards, index merged"), &expected, &merged);
+        let overlaps = indexed.overlaps(&residual);
+        let view = indexed.view(&residual, &overlaps);
+        assert_eq!(view.len(), merged.state.len());
+        let v4_overlaps = v4.overlaps(&residual);
+        let v4_view = v4.view(&residual, &v4_overlaps);
+        for prague in [false, true] {
+            let ops = n42_qmdb_reth::sorted_operations_from_accounts(&view, prague);
+            assert_eq!(ops, n42_qmdb_reth::sorted_operations_from_execution(&merged, prague), "{count}: ops");
+            assert_eq!(ops, n42_qmdb_reth::sorted_operations_from_accounts(&v4_view, prague), "{count}: v4 ops");
         }
         let from_merged = HashedPostState::from_bundle_state::<KeccakKeyHasher>(merged.state.iter());
         assert_eq!(hashed_post_state_of(&view), from_merged, "{count} shards: hashed post-state");

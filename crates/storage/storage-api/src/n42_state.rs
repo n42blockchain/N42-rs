@@ -27,7 +27,7 @@
 use alloc::sync::Arc;
 use alloy_eips::BlockNumHash;
 use alloy_primitives::{Address, BlockNumber, B256, U256};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use reth_primitives_traits::Account;
 use std::sync::OnceLock;
 
@@ -119,7 +119,41 @@ pub fn reader() -> Option<(&'static dyn N42StateReader, ReadsMode)> {
 static CHECKS: AtomicU64 = AtomicU64::new(0);
 static MISMATCHES: AtomicU64 = AtomicU64::new(0);
 static DECLINES: AtomicU64 = AtomicU64::new(0);
-static ANSWERS: AtomicU64 = AtomicU64::new(0);
+/// Answers, counted per thread slot: every answered read counts one, and a
+/// read runs at up to sixteen threads a block, so one shared counter was a
+/// cache line every read wrote (4% of a read at sixteen threads). A thread
+/// counts in its own slot; the total is their sum.
+static ANSWERS: [AnswerSlot; ANSWER_SLOTS] = [const { AnswerSlot(AtomicU64::new(0)) }; ANSWER_SLOTS];
+const ANSWER_SLOTS: usize = 64;
+/// The largest power of two of answers already said.
+static ANSWERS_SAID: AtomicU64 = AtomicU64::new(0);
+
+/// One answer counter, on its own cache lines.
+#[repr(align(128))]
+struct AnswerSlot(AtomicU64);
+
+/// The calling thread's answer slot.
+fn answer_slot() -> &'static AtomicU64 {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    std::thread_local! {
+        static SLOT: usize = NEXT.fetch_add(1, Ordering::Relaxed) % ANSWER_SLOTS;
+    }
+    let slot = SLOT.try_with(|slot| *slot).unwrap_or(0);
+    &ANSWERS[slot % ANSWER_SLOTS].0
+}
+
+/// Every answer since startup: the slots' sum.
+fn total_answers() -> u64 {
+    ANSWERS.iter().map(|slot| slot.0.load(Ordering::Relaxed)).sum()
+}
+
+/// The answers counted in the calling thread's slot: a caller comparing it
+/// before and after its own read sees whether the reader answered that read
+/// (another thread moves it only when it shares the slot, 64 slots round robin).
+pub fn thread_answers() -> u64 {
+    answer_slot().load(Ordering::Relaxed)
+}
+
 /// The first mismatches' descriptions, for a caller that cannot see the log.
 static RECENT: std::sync::Mutex<alloc::vec::Vec<alloc::string::String>> = std::sync::Mutex::new(alloc::vec::Vec::new());
 const RECENT_CAP: usize = 32;
@@ -136,7 +170,7 @@ pub fn stats() -> (u64, u64, u64, u64) {
         CHECKS.load(Ordering::Relaxed),
         MISMATCHES.load(Ordering::Relaxed),
         DECLINES.load(Ordering::Relaxed),
-        ANSWERS.load(Ordering::Relaxed),
+        total_answers(),
     )
 }
 
@@ -147,18 +181,26 @@ pub fn stats() -> (u64, u64, u64, u64) {
 pub fn record_decline() {
     let declines = DECLINES.fetch_add(1, Ordering::Relaxed) + 1;
     if declines.is_power_of_two() {
-        let answers = ANSWERS.load(Ordering::Relaxed);
+        let answers = total_answers();
         tracing::warn!(target: "n42::qmdb_reads", declines, answers, "QMDB reader declined a read; the database answered");
     }
 }
 
-/// Counts a read the reader answered, said at every power of two from 65,536.
+/// Counts a read the reader answered. Said once the total passes each power of
+/// two from 65,536 (the total is summed every 4,096 answers of a slot, so the
+/// line comes that many answers late at most).
 #[inline]
 pub fn record_answer() {
-    let answers = ANSWERS.fetch_add(1, Ordering::Relaxed) + 1;
-    if answers.is_power_of_two() && answers >= 1 << 16 {
-        let declines = DECLINES.load(Ordering::Relaxed);
-        tracing::info!(target: "n42::qmdb_reads", answers, declines, "QMDB reads served");
+    let counted = answer_slot().fetch_add(1, Ordering::Relaxed) + 1;
+    if counted.is_multiple_of(4096) {
+        let answers = total_answers();
+        if answers >= 1 << 16 {
+            let power = 1u64 << (63 - answers.leading_zeros());
+            if ANSWERS_SAID.fetch_max(power, Ordering::Relaxed) < power {
+                let declines = DECLINES.load(Ordering::Relaxed);
+                tracing::info!(target: "n42::qmdb_reads", answers, declines, "QMDB reads served");
+            }
+        }
     }
 }
 

@@ -267,13 +267,13 @@ pub mod doors {
             if !super::phase_timers() {
                 return self.inner.basic(address);
             }
-            // The QMDB view's own answered-reads counter, read before and
-            // after this call: if it moved, this call is what moved it. A
-            // concurrent batch's read landing in the same window can
-            // misattribute one read either way -- see [`super::phase_timers`].
-            let before = reth_storage_api::n42_state::stats().3;
+            // The QMDB view's answered-reads counter of this thread's slot,
+            // read before and after this call: if it moved, this call is what
+            // moved it. Only a thread sharing the slot (64, round robin) can
+            // misattribute a read -- see [`super::phase_timers`].
+            let before = reth_storage_api::n42_state::thread_answers();
             let out = self.inner.basic(address);
-            let after = reth_storage_api::n42_state::stats().3;
+            let after = reth_storage_api::n42_state::thread_answers();
             if after != before {
                 super::timers::note_read_view();
             } else {

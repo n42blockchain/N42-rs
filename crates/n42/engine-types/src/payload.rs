@@ -1298,8 +1298,8 @@ where
     // on it before the block's one bundle is built.
     let mut output_shards: Option<crate::output_shards::FrozenShards> = None;
     let mut out_shards = 0usize;
-    let mut shard_insert_ms = 0u64;
-    let mut shard_wait_ms = 0u64;
+    let mut shard_append_ms = 0u64;
+    let mut shard_fold_ms = 0u64;
     let mut par_transfer_timers = crate::fast_transfer::TransferTimers::default();
     // `N42_GRAFT_PREFAULT=1`: how long the graft's memory took to map, on its
     // own thread beside the parallel step (not on the chain).
@@ -1700,12 +1700,13 @@ where
                 Ok(mut run) => {
                     use reth_evm::execute::BlockExecutor as _;
                     let beneficiary = group_env.block_env.beneficiary;
-                    // The batches are done: the shards lose their locks.
+                    // The batches are done: the fold, a task a shard on the
+                    // build pool.
                     let sharded_out = sharded_out.map(crate::output_shards::OutputShards::freeze);
                     if let Some(shards) = sharded_out.as_ref() {
                         out_shards = shards.shard_count();
-                        shard_insert_ms = shards.insert_ms();
-                        shard_wait_ms = shards.wait_ms();
+                        shard_append_ms = shards.append_ms();
+                        shard_fold_ms = shards.fold_ms();
                     }
                     par_collect_ms = run.phases.collect_ms;
                     par_release_ms = run.phases.release_ms;
@@ -2397,48 +2398,6 @@ where
             // inside the 26 ms before the next build could start (loop138).
             // The hashed state comes with `complete`.
             let mut bundle = db.take_bundle();
-            // `N42_OUTPUT_SHARDS`: the executor's bundle holds only what it
-            // changed after the batches. The next build is let go on it laid
-            // over the shards, then the block's one bundle is built for the
-            // roots, the engine and every `StateReady` reader.
-            let mut shard_ready_ms = 0u64;
-            let mut shard_merge_ms = 0u64;
-            let mut shards_used = 0usize;
-            if let Some(shards) = output_shards.take() {
-                shards_used = out_shards;
-                let shards = Arc::new(shards);
-                let residual = Arc::new(reth_execution_types::BlockExecutionOutput {
-                    state: bundle.clone(),
-                    result: reth_execution_types::BlockExecutionResult {
-                        receipts: Vec::new(),
-                        requests: Default::default(),
-                        gas_used: 0,
-                        blob_gas_used: 0,
-                    },
-                });
-                crate::built_executions::shards_ready(
-                    block_hash,
-                    crate::built_executions::ShardedParent { residual, shards: Arc::clone(&shards) },
-                );
-                shard_ready_ms = finish_at.elapsed().as_millis() as u64;
-                let merge_at = std::time::Instant::now();
-                bundle = shards.merged_with(bundle);
-                shard_merge_ms = merge_at.elapsed().as_millis() as u64;
-            }
-            crate::parallel_transfer::append_reverts(&mut bundle, std::mem::take(&mut par_reverts));
-            let execution_output = Arc::new(reth_execution_types::BlockExecutionOutput {
-                state: bundle,
-                result: execution_result,
-            });
-            let execution_result = &execution_output.result;
-            let provisional = crate::built_executions::BuiltExecution {
-                block: recovered.clone(),
-                execution_output: Arc::clone(&execution_output),
-                hashed_state: Arc::new(Default::default()),
-                trie_updates: Arc::new(TrieUpdates::default()),
-            };
-            crate::built_executions::state_ready(block_hash, provisional);
-            let state_ready_ms = finish_at.elapsed().as_millis() as u64;
             if !execution_result.requests.is_empty() {
                 tracing::error!(
                     target: "payload_builder",
@@ -2454,22 +2413,53 @@ where
             // (`ParentExecution::Published`) has no builder hash: its tree is
             // filed under the sealed hash by its own import, and there is
             // nothing to rename.
-            if qmdb_state.root_of(&parent_sealed).is_none() {
-                if let Some(built) = parent_built.filter(|built| *built != parent_sealed) {
+            let rename_parent = || -> Result<(), PayloadBuilderError> {
+                if qmdb_state.root_of(&parent_sealed).is_none()
+                    && let Some(built) = parent_built.filter(|built| *built != parent_sealed)
+                {
                     let _ = crate::built_executions::wait_for(built, crate::built_executions::Stage::Complete);
                     if qmdb_state.root_of(&parent_sealed).is_none() {
                         crate::chain_alias::rename(&qmdb_state, built, parent_sealed)
                             .map_err(PayloadBuilderError::other)?;
                     }
                 }
-            }
+                Ok(())
+            };
             let prague = chain_spec.is_prague_active_at_timestamp(attributes.timestamp);
-            let roots_at = std::time::Instant::now();
+            // `N42_OUTPUT_SHARDS`: the executor's bundle holds only what it
+            // changed after the batches. The next build is let go on it laid
+            // over the shards; the QMDB root and the hashed post-state read
+            // the shards and it directly, while the block's one bundle (for
+            // the engine and every `StateReady` reader) is merged beside them
+            // on the build pool.
+            let mut shard_ready_ms = 0u64;
+            let mut shard_merge_ms = 0u64;
+            let mut shards_used = 0usize;
+            let roots_at;
+            let state_ready_ms;
+            let (execution_output, hashed_state, prepared, (own_receipts_root, own_logs_bloom)) = match output_shards.take() {
+                None => {
+            crate::parallel_transfer::append_reverts(&mut bundle, std::mem::take(&mut par_reverts));
+            let execution_output = Arc::new(reth_execution_types::BlockExecutionOutput {
+                state: bundle,
+                result: execution_result,
+            });
+            let execution_result = &execution_output.result;
+            let provisional = crate::built_executions::BuiltExecution {
+                block: recovered.clone(),
+                execution_output: Arc::clone(&execution_output),
+                hashed_state: Arc::new(Default::default()),
+                trie_updates: Arc::new(TrieUpdates::default()),
+            };
+            crate::built_executions::state_ready(block_hash, provisional);
+            state_ready_ms = finish_at.elapsed().as_millis() as u64;
+            rename_parent()?;
+            roots_at = std::time::Instant::now();
             let bundle_ref = &execution_output.state;
             // The state provider is `Send` but not `Sync`: the hashed
             // post-state stays on this thread while the root and the
             // receipts run beside it.
-            let (hashed_state, prepared, (own_receipts_root, own_logs_bloom)) = std::thread::scope(|scope| {
+            let (hashed_state, prepared, roots) = std::thread::scope(|scope| {
                 let receipts = &execution_result.receipts;
                 let qmdb_job = &qmdb_state;
                 let root = scope.spawn(move || {
@@ -2488,6 +2478,99 @@ where
                 let roots = receipts.join().expect("the receipts root job does not panic");
                 (hashed, prepared, roots)
             });
+            (execution_output, hashed_state, prepared, roots)
+                }
+                Some(shards) => {
+            shards_used = out_shards;
+            let shards = Arc::new(shards);
+            // The residual is filed as it is, not copied: the root, the
+            // hashed post-state and the merge below read it through the Arc.
+            let residual = Arc::new(reth_execution_types::BlockExecutionOutput {
+                state: bundle,
+                result: reth_execution_types::BlockExecutionResult {
+                    receipts: Vec::new(),
+                    requests: Default::default(),
+                    gas_used: 0,
+                    blob_gas_used: 0,
+                },
+            });
+            crate::built_executions::shards_ready(
+                block_hash,
+                crate::built_executions::ShardedParent { residual: Arc::clone(&residual), shards: Arc::clone(&shards) },
+            );
+            shard_ready_ms = finish_at.elapsed().as_millis() as u64;
+            let residual_state = &residual.state;
+            let overlaps = shards.overlaps(residual_state);
+            let view = shards.view(residual_state, &overlaps);
+            let destroyed = crate::output_shards::any_destroyed(&view);
+            let shard_reverts = std::mem::take(&mut par_reverts);
+            let shards_ref = &*shards;
+            let recovered_ref = &recovered;
+            let view_ref = &view;
+            let scoped = std::thread::scope(|scope| -> Result<_, PayloadBuilderError> {
+                let receipts = scope.spawn(move || {
+                    let roots = crate::hotstuff_consensus::gov5_receipt_root_bloom(&execution_result.receipts);
+                    (execution_result, roots)
+                });
+                // The merge, then `StateReady` with the one bundle: on a
+                // thread of its own (the copies on the build pool), beside the
+                // roots, which do not wait for it.
+                let filer = scope.spawn(move || {
+                    let merge_at = std::time::Instant::now();
+                    let mut merged = shards_ref.merged(residual_state);
+                    crate::parallel_transfer::append_reverts(&mut merged, shard_reverts);
+                    let merge_ms = merge_at.elapsed().as_millis() as u64;
+                    let (execution_result, roots) = receipts.join().ok()?;
+                    let execution_output =
+                        Arc::new(reth_execution_types::BlockExecutionOutput { state: merged, result: execution_result });
+                    crate::built_executions::state_ready(
+                        block_hash,
+                        crate::built_executions::BuiltExecution {
+                            block: recovered_ref.clone(),
+                            execution_output: Arc::clone(&execution_output),
+                            hashed_state: Arc::new(Default::default()),
+                            trie_updates: Arc::new(TrieUpdates::default()),
+                        },
+                    );
+                    Some((execution_output, roots, merge_ms, finish_at.elapsed().as_millis() as u64))
+                });
+                rename_parent()?;
+                let roots_from = std::time::Instant::now();
+                let qmdb_job = &qmdb_state;
+                let root = scope.spawn(move || {
+                    let ops = n42_qmdb_reth::sorted_operations_from_accounts(view_ref, prague);
+                    qmdb_job.compute_operations(parent_sealed, ops)
+                });
+                let hashed_off = n42_qmdb_reth::n42_state::hashed_tables_off();
+                let hashed = if hashed_off {
+                    Some(Ok(Default::default()))
+                } else if destroyed {
+                    // A destroyed account's storage is zeroed from the
+                    // database: the provider's own path, on the merged bundle.
+                    None
+                } else {
+                    Some(Ok(crate::output_shards::hashed_post_state_of(view_ref)))
+                };
+                let filed = filer.join().ok().flatten().ok_or_else(|| {
+                    PayloadBuilderError::other(std::io::Error::other("the shards' merge or the receipts root panicked"))
+                })?;
+                let hashed = match hashed {
+                    Some(hashed) => hashed,
+                    None => parent_state_ref().and_then(|state_provider| state_provider.hashed_post_state(&filed.0.state)),
+                };
+                let prepared = root.join().map_err(|_| {
+                    PayloadBuilderError::other(std::io::Error::other("the QMDB root job panicked"))
+                })?;
+                Ok((filed, hashed, prepared, roots_from))
+            });
+            let ((execution_output, roots, merge_ms, filed_ms), hashed_state, prepared, roots_from) = scoped?;
+            shard_merge_ms = merge_ms;
+            roots_at = roots_from;
+            state_ready_ms = filed_ms;
+            (execution_output, hashed_state, prepared, roots)
+                }
+            };
+            let execution_result = &execution_output.result;
             let hashed_state = hashed_state.map_err(PayloadBuilderError::other)?;
             let prepared = prepared.map_err(PayloadBuilderError::other)?;
             let own_state_root = prepared.root;
@@ -2582,13 +2665,18 @@ where
                     graft_merge_us = par_graft_merge_us,
                     // `N42_OUTPUT_SHARDS` (docs/BREAKTHROUGH_DESIGN.md section
                     // 3): the shard count (0 off, or folded after all), the
-                    // batches' pool time writing into the shards and waiting
-                    // for their locks (inside `par_exec_ms`), when the next
-                    // build was let go on them (from the finish's start), and
-                    // the lazy merge into the block's one bundle behind that.
+                    // batches' pool time splitting their accounts by range
+                    // (inside `par_exec_ms`), the fold's wall time building
+                    // the shard maps a task a shard, when the next build was
+                    // let go on them (from the finish's start), and the merge
+                    // into the block's one bundle beside the roots (which
+                    // read the shards). The insert/wait keys of the first,
+                    // locked shape stay at 0.
                     shards = shards_used,
-                    shard_insert_ms,
-                    shard_wait_ms,
+                    shard_insert_ms = 0u64,
+                    shard_wait_ms = 0u64,
+                    shard_append_ms,
+                    shard_fold_ms,
                     shard_ready_ms,
                     shard_merge_ms,
                     // `N42_SEAL_AT_EXEC=1` (plan v6 G2): sealed at the parallel

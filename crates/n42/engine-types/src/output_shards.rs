@@ -10,21 +10,29 @@
 //! 20-29 ms for it (6.13). A sharded insert that then *merged* the shards into
 //! that one map was 2.6x slower (6.19): the merge was the cost.
 //!
-//! Here a batch writes each account it touched into the shard that owns the
-//! address (the address's top bits), under that shard's own lock, as the batch
-//! ends -- inside the execution, on the batch's thread. Nothing is merged
+//! Here a batch splits the accounts it touched by the shard that owns each
+//! address (the address's top bits) into vectors of its own, as the batch
+//! ends, on the batch's thread: no lock, no map. When the batches are done the
+//! fold is one parallel pass on the build pool, a task a shard, each building
+//! its shard's map from every batch's vector for it with the exact capacity
+//! reserved -- nothing shared between the tasks, nothing locked. (loop273: the
+//! first shape, every batch inserting into the shard maps under per-shard
+//! locks as it ended, cost 122-138 ms of pool time and 535-637 ms of waiting,
+//! `docs/BREAKTHROUGH_DESIGN.md` 10.8.) Nothing is merged
 //! before the seal or before the next build can read the block's state: the
 //! chained build's overlay reads the shard set directly ([`ShardLayer`], one
 //! probe into one shard by prefix), under the few accounts the block's own
 //! executor changed after the batches (the fee credit, the withdrawals, the
-//! system calls), which are laid over it as an ordinary executed block. The one
-//! contiguous `BundleState` the engine, the QMDB root and the published
-//! execution need is built behind the seal ([`FrozenShards::merged_with`]),
-//! after the next build has been let go.
+//! system calls), which are laid over it as an ordinary executed block. The
+//! QMDB root and the hashed post-state read the shards directly
+//! ([`FrozenShards::view`]); the one contiguous `BundleState` the engine and the
+//! published execution need is built behind the seal beside them
+//! ([`FrozenShards::merged`], on the build pool), after the next build has been
+//! let go.
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc, Mutex, OnceLock, PoisonError, TryLockError,
+    Arc, Mutex, OnceLock, PoisonError,
 };
 
 use alloy_primitives::{
@@ -87,11 +95,7 @@ impl Shard {
     /// out with its credit summed; an account an earlier batch wrote has this
     /// batch's change added to it (every batch read the parent, so each
     /// change is a delta on the same original) and keeps the first revert.
-    fn add(&mut self, beneficiary: Address, run: Vec<(Address, BundleAccount)>, reverts: Vec<(Address, AccountRevert)>, reserve: usize) {
-        if self.state.is_empty() {
-            self.state.reserve(reserve);
-            self.reverts.reserve(reserve);
-        }
+    fn add(&mut self, beneficiary: Address, run: Vec<(Address, BundleAccount)>, reverts: Vec<(Address, AccountRevert)>) {
         let mut repeated: AddressHashSet = Default::default();
         for (address, account) in run {
             let Some(info) = account.info.as_ref() else { continue };
@@ -118,6 +122,10 @@ impl Shard {
             self.state_size += account.size_hint();
             self.state.insert(address, account);
         }
+        if repeated.is_empty() {
+            self.reverts.extend(reverts);
+            return;
+        }
         for (address, revert) in reverts {
             if !repeated.contains(&address) {
                 self.reverts.push((address, revert));
@@ -126,82 +134,99 @@ impl Shard {
     }
 }
 
-/// The block's output while the batches run: one lock a shard.
+/// One batch's accounts and reverts of one address range.
+type ShardRun = (Vec<(Address, BundleAccount)>, Vec<(Address, AccountRevert)>);
+
+/// The block's output while the batches run: each batch's accounts split by
+/// address range into vectors of its own, handed over once as the batch ends.
 #[derive(Debug)]
 pub struct OutputShards {
     beneficiary: Address,
-    shards: Vec<Mutex<Shard>>,
+    count: usize,
+    /// One entry a batch, in the order the batches ended: the batch's runs,
+    /// one a shard. The lock is taken once a batch, for one push.
+    batches: Mutex<Vec<Vec<ShardRun>>>,
     contracts: Mutex<B256HashMap<RevmBytecode>>,
-    per_shard: usize,
-    /// Pool time inside [`Self::add`], lock waits excluded, nanoseconds.
-    insert_ns: AtomicU64,
-    /// Pool time waiting for a shard's lock, nanoseconds.
-    wait_ns: AtomicU64,
+    /// Pool time inside [`Self::add`] (the split), nanoseconds.
+    append_ns: AtomicU64,
 }
 
 impl OutputShards {
     /// `shards` address ranges (at least one) for a block expected to touch
-    /// `capacity` accounts.
-    pub fn new(beneficiary: Address, capacity: usize, shards: usize) -> Self {
+    /// `_capacity` accounts (each shard's map is sized exactly at the fold).
+    pub fn new(beneficiary: Address, _capacity: usize, shards: usize) -> Self {
         let count = shards.clamp(1, MAX_SHARDS);
         Self {
             beneficiary,
-            shards: (0..count).map(|_| Mutex::new(Shard::default())).collect(),
+            count,
+            batches: Mutex::new(Vec::with_capacity(64)),
             contracts: Mutex::new(Default::default()),
-            per_shard: capacity / count + 1,
-            insert_ns: AtomicU64::new(0),
-            wait_ns: AtomicU64::new(0),
+            append_ns: AtomicU64::new(0),
         }
     }
 
-    /// One batch's bundle written into the shards, on the batch's thread:
-    /// sorted by range with no lock held, then each range's lock taken once.
+    /// One batch's bundle split by address range, on the batch's thread, into
+    /// vectors of its own: no shard map is touched and no shard lock taken.
     pub fn add(&self, bundle: BundleState) {
         let at = std::time::Instant::now();
-        let mut waited = std::time::Duration::ZERO;
         let BundleState { state: accounts, contracts, mut reverts, .. } = bundle;
         let taken = std::mem::take(&mut *reverts);
         if !contracts.is_empty() {
             self.contracts.lock().unwrap_or_else(PoisonError::into_inner).extend(contracts);
         }
-        let count = self.shards.len();
-        let mut by_shard: Vec<Vec<(Address, BundleAccount)>> = (0..count).map(|_| Vec::new()).collect();
+        let count = self.count;
+        let each = accounts.len() / count + accounts.len() / (4 * count) + 1;
+        let mut runs: Vec<ShardRun> = (0..count).map(|_| (Vec::with_capacity(each), Vec::new())).collect();
         for (address, account) in accounts {
-            by_shard[shard_index(&address, count)].push((address, account));
+            runs[shard_index(&address, count)].0.push((address, account));
         }
-        let mut reverts_by_shard: Vec<Vec<(Address, AccountRevert)>> = (0..count).map(|_| Vec::new()).collect();
         for (address, revert) in taken.into_iter().flatten() {
-            reverts_by_shard[shard_index(&address, count)].push((address, revert));
+            runs[shard_index(&address, count)].1.push((address, revert));
         }
-        for (index, (run, reverts)) in by_shard.into_iter().zip(reverts_by_shard).enumerate() {
-            if run.is_empty() && reverts.is_empty() {
-                continue;
-            }
-            let mut shard = match self.shards[index].try_lock() {
-                Ok(guard) => guard,
-                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-                Err(TryLockError::WouldBlock) => {
-                    let wait_at = std::time::Instant::now();
-                    let guard = self.shards[index].lock().unwrap_or_else(PoisonError::into_inner);
-                    waited += wait_at.elapsed();
-                    guard
-                }
-            };
-            shard.add(self.beneficiary, run, reverts, self.per_shard);
-        }
-        self.wait_ns.fetch_add(waited.as_nanos() as u64, Ordering::Relaxed);
-        self.insert_ns.fetch_add(at.elapsed().saturating_sub(waited).as_nanos() as u64, Ordering::Relaxed);
+        self.batches.lock().unwrap_or_else(PoisonError::into_inner).push(runs);
+        self.append_ns.fetch_add(at.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
-    /// The batches are done: the shards lose their locks, so every reader
-    /// after this probes without one.
+    /// The batches are done: the fold. One task a shard on the build pool,
+    /// each taking every batch's run for its shard (in the order the batches
+    /// ended) and building the shard's map with the exact capacity reserved,
+    /// with `StagedGraft::add`'s rules. Every batch read the parent, so an
+    /// account several batches wrote gets their deltas summed in any order,
+    /// and each of their reverts is the same parent value.
     pub fn freeze(self) -> FrozenShards {
+        let at = std::time::Instant::now();
+        let beneficiary = self.beneficiary;
+        let count = self.count;
+        let batches = self.batches.into_inner().unwrap_or_else(PoisonError::into_inner);
+        // Transposed: shard `s` gets every batch's run for `s`. Only the
+        // vectors' headers move.
+        let mut per_shard: Vec<Vec<ShardRun>> = (0..count).map(|_| Vec::with_capacity(batches.len())).collect();
+        for runs in batches {
+            for (index, run) in runs.into_iter().enumerate() {
+                if !(run.0.is_empty() && run.1.is_empty()) {
+                    per_shard[index].push(run);
+                }
+            }
+        }
+        let fold = move |runs: Vec<ShardRun>| {
+            let mut shard = Shard::default();
+            shard.state.reserve(runs.iter().map(|run| run.0.len()).sum());
+            shard.reverts.reserve(runs.iter().map(|run| run.1.len()).sum());
+            for (run, reverts) in runs {
+                shard.add(beneficiary, run, reverts);
+            }
+            shard
+        };
+        let shards: Vec<Shard> = {
+            use rayon::prelude::*;
+            crate::parallel_transfer::build_pool().install(|| per_shard.into_par_iter().map(fold).collect())
+        };
         FrozenShards {
-            beneficiary: self.beneficiary,
-            shards: self.shards.into_iter().map(|shard| shard.into_inner().unwrap_or_else(PoisonError::into_inner)).collect(),
+            beneficiary,
+            shards,
             contracts: self.contracts.into_inner().unwrap_or_else(PoisonError::into_inner),
-            insert_ns: self.insert_ns.into_inner(),
-            wait_ns: self.wait_ns.into_inner(),
+            append_ns: self.append_ns.into_inner(),
+            fold_ns: at.elapsed().as_nanos() as u64,
         }
     }
 }
@@ -212,8 +237,8 @@ pub struct FrozenShards {
     beneficiary: Address,
     shards: Vec<Shard>,
     contracts: B256HashMap<RevmBytecode>,
-    insert_ns: u64,
-    wait_ns: u64,
+    append_ns: u64,
+    fold_ns: u64,
 }
 
 impl FrozenShards {
@@ -222,14 +247,16 @@ impl FrozenShards {
         self.shards.len()
     }
 
-    /// Pool time the batches spent writing into the shards, milliseconds.
-    pub const fn insert_ms(&self) -> u64 {
-        self.insert_ns / 1_000_000
+    /// Pool time the batches spent splitting their accounts by range, summed
+    /// over the batches, milliseconds.
+    pub const fn append_ms(&self) -> u64 {
+        self.append_ns / 1_000_000
     }
 
-    /// Pool time the batches spent waiting for a shard's lock, milliseconds.
-    pub const fn wait_ms(&self) -> u64 {
-        self.wait_ns / 1_000_000
+    /// The fold's wall time, the parallel pass building the shard maps,
+    /// milliseconds.
+    pub const fn fold_ms(&self) -> u64 {
+        self.fold_ns / 1_000_000
     }
 
     /// The account `address` as the batches left it: one probe, into the
@@ -338,47 +365,145 @@ impl FrozenShards {
     /// with its reverts -- laid over them, and the shards' reverts appended
     /// to the block's revert set (`append_reverts`, which drops the second
     /// revert of an account both touched). The same bundle a graft followed
-    /// by the same executor changes leaves. Built behind the seal: the shards
-    /// are shared with the next build's overlay, so they are copied, not
-    /// moved.
+    /// by the same executor changes leaves. The shards are shared with the
+    /// next build's overlay, so they are copied, not moved.
     pub fn merged_with(&self, residual: BundleState) -> BundleState {
-        let BundleState { state: mut newer, contracts: newer_contracts, reverts: block_reverts, state_size: newer_size, .. } =
-            residual;
-        let total: usize = self.accounts() + newer.len();
+        self.merged(&residual)
+    }
+
+    /// [`Self::merged_with`] without taking the residual: the shards' accounts
+    /// copied out a task a shard on the build pool, then moved into the one
+    /// map with its capacity reserved. Built behind the seal, beside the
+    /// roots, which read [`Self::view`] instead.
+    pub fn merged(&self, residual: &BundleState) -> BundleState {
+        use rayon::prelude::*;
+        let newer = &residual.state;
+        // Per shard: its accounts (the newer value over any the executor
+        // changed again) and its change to the size hint.
+        let parts: Vec<(Vec<(Address, BundleAccount)>, i128)> = crate::parallel_transfer::build_pool().install(|| {
+            self.shards
+                .par_iter()
+                .map(|shard| {
+                    let mut out = Vec::with_capacity(shard.state.len());
+                    let mut size = shard.state_size as i128;
+                    for (address, account) in &shard.state {
+                        match (!newer.is_empty()).then(|| newer.get(address)).flatten() {
+                            Some(over) => {
+                                let merged = overlaid(account, over);
+                                size += merged.size_hint() as i128 - account.size_hint() as i128 - over.size_hint() as i128;
+                                out.push((*address, merged));
+                            }
+                            None => out.push((*address, account.clone())),
+                        }
+                    }
+                    (out, size)
+                })
+                .collect()
+        });
+        let total: usize = parts.iter().map(|(out, _)| out.len()).sum::<usize>() + newer.len();
         let mut state: AddressHashMap<BundleAccount> = Default::default();
         state.reserve(total);
-        let mut size = newer_size;
+        let mut size = residual.state_size as i128;
+        for (out, part_size) in parts {
+            size += part_size;
+            state.extend(out);
+        }
+        for (address, account) in newer {
+            if !self.holds(address) {
+                state.insert(*address, account.clone());
+            }
+        }
+        let mut contracts = self.contracts.clone();
+        contracts.extend(residual.contracts.iter().map(|(hash, code)| (*hash, code.clone())));
+        let block_reverts = residual.reverts.clone();
+        let reverts_size = block_reverts.iter().map(Vec::len).sum();
         let mut reverts = Vec::with_capacity(self.shards.iter().map(|shard| shard.reverts.len()).sum());
         for shard in &self.shards {
-            size += shard.state_size;
-            for (address, account) in &shard.state {
-                match newer.remove(address) {
-                    Some(mut over) => {
-                        // Changed again after the batches: the newer value,
-                        // against the parent's original the shard carries.
-                        size = size.saturating_sub(account.size_hint() + over.size_hint());
-                        over.original_info = account.original_info.clone();
-                        let mut storage = account.storage.clone();
-                        storage.extend(std::mem::take(&mut over.storage));
-                        over.storage = storage;
-                        size += over.size_hint();
-                        state.insert(*address, over);
-                    }
-                    None => {
-                        state.insert(*address, account.clone());
-                    }
-                }
-            }
             reverts.extend(shard.reverts.iter().cloned());
         }
-        state.extend(newer);
-        let mut contracts = self.contracts.clone();
-        contracts.extend(newer_contracts);
-        let reverts_size = block_reverts.iter().map(Vec::len).sum();
-        let mut bundle = BundleState { state, contracts, reverts: block_reverts, state_size: size, reverts_size };
+        let state_size = usize::try_from(size.max(0)).unwrap_or(usize::MAX);
+        let mut bundle = BundleState { state, contracts, reverts: block_reverts, state_size, reverts_size };
         crate::parallel_transfer::append_reverts(&mut bundle, reverts);
         bundle
     }
+
+    /// The accounts both the batches and the block's executor changed, as
+    /// the merge leaves them (the newer value against the parent's original,
+    /// the storage of both): the few [`Self::view`] cannot point into the
+    /// shards or the residual for. Usually none.
+    pub fn overlaps(&self, residual: &BundleState) -> Vec<(Address, BundleAccount)> {
+        residual
+            .state
+            .iter()
+            .filter_map(|(address, over)| self.get(address).map(|account| (*address, overlaid(account, over))))
+            .collect()
+    }
+
+    /// The block's post-state accounts without a merge: the shards' (less
+    /// the overlapping ones), the residual's not in the shards, and
+    /// `overlaps` ([`Self::overlaps`]) -- each address once, the same set of
+    /// values [`Self::merged`] holds. What the QMDB root
+    /// (`n42_qmdb_reth::sorted_operations_from_accounts`) and the hashed
+    /// post-state ([`hashed_post_state_of`]) read behind the seal.
+    pub fn view<'a>(
+        &'a self,
+        residual: &'a BundleState,
+        overlaps: &'a [(Address, BundleAccount)],
+    ) -> Vec<(&'a Address, &'a BundleAccount)> {
+        let mut view = Vec::with_capacity(self.accounts() + residual.state.len());
+        for shard in &self.shards {
+            if overlaps.is_empty() {
+                view.extend(shard.state.iter());
+            } else {
+                view.extend(shard.state.iter().filter(|(address, _)| !residual.state.contains_key(*address)));
+            }
+        }
+        view.extend(residual.state.iter().filter(|(address, _)| !self.holds(address)));
+        view.extend(overlaps.iter().map(|(address, account)| (address, account)));
+        view
+    }
+}
+
+/// An account the batches wrote and the executor changed again: the newer
+/// value, against the parent's original the shard carries, with the storage
+/// of both (the newer slots winning).
+fn overlaid(account: &BundleAccount, over: &BundleAccount) -> BundleAccount {
+    let mut merged = over.clone();
+    merged.original_info = account.original_info.clone();
+    let mut storage = account.storage.clone();
+    storage.extend(over.storage.iter().map(|(slot, value)| (*slot, *value)));
+    merged.storage = storage;
+    merged
+}
+
+/// The hashed post-state of a block's accounts given as a list
+/// ([`FrozenShards::view`]): the provider's chunked `hashed_post_state` over a
+/// bundle (`hashed_post_state_from_bundle`), without the bundle. It does not
+/// zero a destroyed account's storage from the database: a caller whose
+/// accounts include one (`BundleAccount::was_destroyed` with an original)
+/// goes through the provider instead.
+pub fn hashed_post_state_of(accounts: &[(&Address, &BundleAccount)]) -> HashedPostState {
+    const PARALLEL_FROM: usize = 8192;
+    if accounts.len() < PARALLEL_FROM {
+        return HashedPostState::from_bundle_state::<reth_trie::KeccakKeyHasher>(accounts.iter().copied());
+    }
+    use rayon::prelude::*;
+    let chunks: Vec<HashedPostState> = accounts
+        .par_chunks(4096)
+        .map(|chunk| HashedPostState::from_bundle_state::<reth_trie::KeccakKeyHasher>(chunk.iter().copied()))
+        .collect();
+    let mut hashed = HashedPostState::with_capacity(accounts.len());
+    for chunk in chunks {
+        hashed.extend(chunk);
+    }
+    hashed
+}
+
+/// Whether any of `accounts` was destroyed over an existing account: its
+/// storage has to be zeroed from the database, which only the provider's
+/// `hashed_post_state` does.
+pub fn any_destroyed(accounts: &[(&Address, &BundleAccount)]) -> bool {
+    accounts.iter().any(|(_, account)| account.was_destroyed() && account.original_info.is_some())
 }
 
 /// The parent's shard set as a state provider layer: an account or slot the

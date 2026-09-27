@@ -97,9 +97,21 @@ pub fn changes_from_execution(bundle: &BundleState, prague_active: bool) -> Bloc
 /// 190 ms root phase; here the leaves are keyed and encoded on the worker
 /// pool and sorted there too.
 pub fn sorted_operations_from_execution(bundle: &BundleState, prague_active: bool) -> Vec<QmdbOperation> {
+    let accounts: Vec<(&Address, &revm_database::BundleAccount)> = bundle.state.iter().collect();
+    sorted_operations_from_accounts(&accounts, prague_active)
+}
+
+/// [`sorted_operations_from_execution`] over a block's accounts given as a
+/// list rather than one bundle: each address at most once, as a bundle's map
+/// holds it. The leader's output shards (`N42_OUTPUT_SHARDS`) hand their
+/// accounts here directly, so the root does not wait for them to be merged
+/// into one `BundleState`.
+pub fn sorted_operations_from_accounts(
+    accounts: &[(&Address, &revm_database::BundleAccount)],
+    prague_active: bool,
+) -> Vec<QmdbOperation> {
     use n42_twig_core::qmdb_compat::{encode_gov5_account_value, gov5_account_key, gov5_storage_key};
     use rayon::prelude::*;
-    let accounts: Vec<(&Address, &revm_database::BundleAccount)> = bundle.state.iter().collect();
     let mut ops: Vec<QmdbOperation> = accounts
         .par_iter()
         .flat_map_iter(|(address, account)| {

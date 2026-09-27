@@ -35,7 +35,7 @@ pub use chainspec::{
     STATE_SCHEME_KEY, STATE_SCHEME_QMDB,
 };
 pub use changes::{
-    changes_from_alloc, changes_from_bundle, changes_from_execution, with_prague_system_caller, sorted_operations_from_execution,
+    changes_from_alloc, changes_from_bundle, changes_from_execution, with_prague_system_caller, sorted_operations_from_accounts, sorted_operations_from_execution,
 };
 pub use hotstuff::{GenesisValidator, HotStuffConfigError, HotStuffGenesisConfig};
 pub use reth_chainspec::qmdb::{deferred_execution_active_at, deferred_execution_time};

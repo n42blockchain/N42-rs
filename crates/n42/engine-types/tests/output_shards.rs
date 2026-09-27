@@ -7,7 +7,7 @@
 #![allow(missing_docs, unreachable_pub, unused_crate_dependencies)]
 
 use alloy_primitives::{Address, U256};
-use n42_engine_types::output_shards::{output_shards, FrozenShards, OutputShards};
+use n42_engine_types::output_shards::{any_destroyed, hashed_post_state_of, output_shards, FrozenShards, OutputShards};
 use n42_engine_types::parallel_transfer::{append_reverts, graft_bundles_folded, install_staged, GraftFold, StagedGraft};
 use reth_revm::db::State;
 use revm::database::BundleState;
@@ -176,14 +176,20 @@ fn shards_of(bundles: Vec<BundleState>, count: usize) -> FrozenShards {
 }
 
 /// The sharded path the builder takes when it seals early: no graft, the
-/// cached accounts as deltas, the finish on the block's own state, and
-/// the lazy merge.
-fn sharded(db: &CacheDB<EmptyDB>, mut shards: FrozenShards) -> BundleState {
+/// cached accounts as deltas, the finish on the block's own state; the
+/// shards and the executor's residual, before any merge.
+fn sharded_parts(db: &CacheDB<EmptyDB>, mut shards: FrozenShards) -> (FrozenShards, BundleState) {
     let mut state = block_state(db);
     assert!(state.bundle_state.state.is_empty());
     shards.take_cached(&mut state);
     let fees = shards.beneficiary_delta();
     let residual = finish(&mut state, fees, false, |_, address| shards.get(address).and_then(|a| a.info.clone()));
+    (shards, residual)
+}
+
+/// [`sharded_parts`] and the merge behind the seal.
+fn sharded(db: &CacheDB<EmptyDB>, shards: FrozenShards) -> BundleState {
+    let (shards, residual) = sharded_parts(db, shards);
     shards.merged_with(residual)
 }
 
@@ -283,5 +289,49 @@ fn output_shards_off_by_default() -> usize {
         0
     } else {
         output_shards()
+    }
+}
+
+#[test]
+fn the_fold_does_not_depend_on_the_order_the_batches_end() {
+    let db = parent();
+    let bundles = batch_bundles(&db);
+    let (expected, _) = direct(&db, bundles.clone(), false);
+    for count in [1, 16, 64] {
+        let mut reversed = bundles.clone();
+        reversed.reverse();
+        let got = sharded(&db, shards_of(reversed, count));
+        assert_same(&format!("{count} shards, reversed"), &expected, &got);
+    }
+}
+
+#[test]
+fn the_roots_from_the_shards_equal_the_roots_from_the_merged_bundle() {
+    use reth_trie::{HashedPostState, KeccakKeyHasher};
+    let db = parent();
+    let bundles = batch_bundles(&db);
+    let (expected, _) = direct(&db, bundles.clone(), false);
+    for count in [1, 16, 64] {
+        let (shards, residual) = sharded_parts(&db, shards_of(bundles.clone(), count));
+        let merged = shards.merged(&residual);
+        assert_same(&format!("{count} shards, merged"), &expected, &merged);
+        // The withdrawal to an account the batches also paid.
+        let overlaps = shards.overlaps(&residual);
+        assert!(overlaps.iter().any(|(address, _)| *address == withdrawn().0), "{count} shards: an overlap");
+        let view = shards.view(&residual, &overlaps);
+        assert_eq!(view.len(), merged.state.len(), "{count} shards: one entry an account");
+        for (address, account) in &view {
+            assert_eq!(merged.state.get(*address), Some(*account), "{count} shards: {address}");
+        }
+        assert!(!any_destroyed(&view));
+        for prague in [false, true] {
+            assert_eq!(
+                n42_qmdb_reth::sorted_operations_from_accounts(&view, prague),
+                n42_qmdb_reth::sorted_operations_from_execution(&merged, prague),
+                "{count} shards: QMDB operations, prague {prague}"
+            );
+        }
+        let from_merged = HashedPostState::from_bundle_state::<KeccakKeyHasher>(merged.state.iter());
+        assert_eq!(hashed_post_state_of(&view), from_merged, "{count} shards: hashed post-state");
     }
 }

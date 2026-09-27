@@ -68,13 +68,30 @@ fn loaded(info: Option<AccountInfo>) -> TransitionAccount {
         Some(info) if info.is_empty() => (Some(AccountInfo::default()), AccountStatus::LoadedEmptyEIP161),
         Some(info) => (Some(info), AccountStatus::Loaded),
     };
+    // `previous_info` is filled on the first change, by moving `info` there
+    // (`change`): a read-only account never needs it, and the close
+    // drops those.
     TransitionAccount {
-        info: info.clone(),
+        info,
         status,
-        previous_info: info,
+        previous_info: None,
         previous_status: status,
         storage: Default::default(),
         storage_was_destroyed: false,
+    }
+}
+
+/// `CacheAccount::change` merged into the batch's transition: the status
+/// moved on from the info as it stands, the info replaced. On the first
+/// change the loaded info becomes the transition's `previous_info`.
+#[inline]
+fn change(entry: &mut TransitionAccount, info: AccountInfo) {
+    let had_no_nonce_and_code = entry.info.as_ref().is_some_and(AccountInfo::has_no_code_and_nonce);
+    let first = entry.status == entry.previous_status;
+    entry.status = entry.status.on_changed(had_no_nonce_and_code);
+    let current = entry.info.replace(info);
+    if first {
+        entry.previous_info = current;
     }
 }
 
@@ -108,9 +125,7 @@ impl<G: Database> BatchState<G> {
                     loaded(Some(account.original_info().clone()))
                 }
             });
-            let had_no_nonce_and_code = entry.info.as_ref().is_some_and(AccountInfo::has_no_code_and_nonce);
-            entry.status = entry.status.on_changed(had_no_nonce_and_code);
-            entry.info = Some(account.info);
+            change(entry, account.info);
         }
         Ok(())
     }
@@ -133,9 +148,7 @@ impl<G: Database> BatchState<G> {
                 return Err(Unsupported(address));
             }
             let Some(entry) = self.accounts.get_mut(&address) else { return Err(Unsupported(address)) };
-            let had_no_nonce_and_code = entry.info.as_ref().is_some_and(AccountInfo::has_no_code_and_nonce);
-            entry.status = entry.status.on_changed(had_no_nonce_and_code);
-            entry.info = Some(info);
+            change(entry, info);
         }
         Ok(())
     }

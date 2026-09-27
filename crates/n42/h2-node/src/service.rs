@@ -1249,6 +1249,14 @@ impl<E: ExecutionLayer> H2Service<E> {
         // old view would fire late or not at all.
         let timeout = self.engine.pacemaker().timeout_sleep();
         tokio::pin!(timeout);
+        // The re-ask while a proposal is deferred, and the pacing tick when
+        // that is what it waits for: a sleep to the tick itself rather than a
+        // poll every `propose_retry` (10 ms at 100 ms pacing, the floor),
+        // which put the proposal a median 5.6 ms after the tick (loop289).
+        let retry_at = tokio::time::Instant::now() + self.propose_retry;
+        let tick = self.deferred_pacing_tick();
+        let propose_at = tick.map_or(retry_at, |tick| retry_at.min(tick));
+        let on_tick = tick.is_some_and(|tick| tick <= retry_at);
         let outbound = self.outbound_transactions.as_mut();
         let body_rx = self.body_rx.as_mut();
         let own_imports = self.own_imports.as_mut();
@@ -1388,9 +1396,14 @@ impl<E: ExecutionLayer> H2Service<E> {
                 }
                 self.engine.on_timeout()?;
             }
-            () = tokio::time::sleep(self.propose_retry), if self.proposal_deferred => {
-                // Nothing happened; the builder is asked again at the top of
-                // the next step.
+            () = tokio::time::sleep_until(propose_at), if self.proposal_deferred => {
+                // Nothing happened; the builder is asked again -- at once when
+                // this was the pacing tick, else at the top of the next step.
+                // Nothing arrived meanwhile, so the view is the one the
+                // declined proposal was for.
+                if on_tick {
+                    self.propose_if_leader(&mut events).await;
+                }
             }
             () = tokio::time::sleep(self.body_grace), if !self.body_wait.is_empty() => {
                 // A body's grace may have run out; checked below.
@@ -2459,6 +2472,22 @@ impl<E: ExecutionLayer> H2Service<E> {
         let pacing = self.block_pacing?;
         let seen = self.block_seen.get(head)?;
         seen.checked_add(pacing)
+    }
+
+    /// The pacing tick a deferred proposal waits for, when the attribute
+    /// builder declined this view for the pacing and the tick is still ahead.
+    fn deferred_pacing_tick(&self) -> Option<tokio::time::Instant> {
+        let view = self.engine.current_view();
+        if !self.proposal_deferred
+            || self.declined_view != Some(view)
+            || self.defer_reason != Some("the attribute builder declined")
+        {
+            return None;
+        }
+        let certified = self.engine.locked_qc().block_hash;
+        let head = if certified == B256::ZERO { self.driver.head() } else { certified };
+        let tick = self.pacing_tick(&head)?;
+        (tick > std::time::Instant::now()).then(|| tokio::time::Instant::from_std(tick))
     }
 
     /// Builds and announces a block when this node is the leader of a view it

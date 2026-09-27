@@ -1047,6 +1047,7 @@ where
     // a chained build's selector, [`note_handoff_wait`]), the checks, the
     // puller's start and the header's preparation, each timed.
     HANDOFF_WAIT_US.with(|cell| cell.set(0));
+    let _ = crate::frame_blocks::take_select_times();
     let start_best_at = std::time::Instant::now();
     let mut best_txs = best_txs(BestTransactionsAttributes::new(
         base_fee,
@@ -1056,13 +1057,26 @@ where
             .blob_gasprice()
             .map(|gasprice| gasprice as u64),
     ));
-    let start_best_ms = start_best_at.elapsed().as_millis() as u64;
+    let start_best_us = start_best_at.elapsed().as_micros() as u64;
+    let start_best_ms = start_best_us / 1_000;
     // `N42_FRAME_BLOCKS=1`: the frames the selector just took, whose layout
     // the transactions root is sealed over (`frame_blocks::sealed_root`).
     // The roots computed ahead over the pulled set are the MPT root and are
     // not computed for a frame build.
     let frame_plan = crate::frame_blocks::take_plan();
-    let start_handoff_ms = HANDOFF_WAIT_US.with(std::cell::Cell::get) / 1_000;
+    let start_handoff_us = HANDOFF_WAIT_US.with(std::cell::Cell::get);
+    let start_handoff_ms = start_handoff_us / 1_000;
+    // `start_best_ms` split: the queue's frame take opening (lock, build
+    // start), the plan (the frames checked and taken), the ordinary walk's
+    // opening, and the rest (the hand-off above is its own key).
+    let select_times = crate::frame_blocks::take_select_times();
+    let start_select_ms = select_times.select_us / 1_000;
+    let start_walk_ms = select_times.walk_us / 1_000;
+    let start_walk_check_ms = select_times.check_us / 1_000;
+    let start_pull_ms = select_times.pull_us / 1_000;
+    let start_best_other_ms = start_best_us
+        .saturating_sub(start_handoff_us + select_times.select_us + select_times.walk_us + select_times.pull_us)
+        / 1_000;
     let start_check_at = std::time::Instant::now();
     // Tried and measured inert: `best_txs.no_updates()`, dropping the
     // iterator's live feed of new transactions. The pool phase stayed at
@@ -1551,21 +1565,31 @@ where
                     lookahead.push_front(tx);
                 }
             }
-            let all_transfers = !cands.is_empty()
-                && cands.iter().all(|tx| {
-                    let tx = &tx.transaction;
-                    tx.gas_limit() == MIN_TRANSACTION_GAS
-                        && tx.input().is_empty()
-                        && !tx.is_create()
-                        && tx.access_list().is_none_or(|list| list.is_empty())
-                        && !tx.is_eip4844()
-                        && !tx.is_eip7702()
-                });
-            let keys: Vec<(alloy_primitives::Address, alloy_primitives::Address)> = if all_transfers {
-                cands.iter().map(|tx| (tx.sender(), tx.transaction.to().unwrap_or_default())).collect()
-            } else {
-                Vec::new()
-            };
+            // One pass over the candidates on the build pool: the check
+            // and the (sender, recipient) keys, in order. Serial, the two
+            // passes read 163,000 transactions' cold memory one after the
+            // other (`par_prep_ms` 10, loop274). The sender is the one the
+            // ingest recorded (the attested frame's, for 0x50); nothing is
+            // hashed or recovered here.
+            let (all_transfers, keys) = crate::parallel_transfer::build_pool().install(|| {
+                use rayon::prelude::*;
+                let transfer_key = |tx: &Arc<reth_transaction_pool::ValidPoolTransaction<Pool::Transaction>>| {
+                    let inner = &tx.transaction;
+                    (inner.gas_limit() == MIN_TRANSACTION_GAS
+                        && inner.input().is_empty()
+                        && !inner.is_create()
+                        && inner.access_list().is_none_or(|list| list.is_empty())
+                        && !inner.is_eip4844()
+                        && !inner.is_eip7702())
+                    .then(|| (tx.sender(), inner.to().unwrap_or_default()))
+                };
+                let keys: Option<Vec<(alloy_primitives::Address, alloy_primitives::Address)>> =
+                    cands.par_iter().with_min_len(1024).map(transfer_key).collect();
+                match keys {
+                    Some(keys) if !keys.is_empty() => (true, keys),
+                    _ => (false, Vec::new()),
+                }
+            });
             par_prep_ms = prep_at.elapsed().as_millis() as u64;
             (all_transfers, keys, std::time::Instant::now())
         });
@@ -2698,6 +2722,14 @@ where
                     // the puller's thread, `cons.prepare`, and the rest.
                     start_best_ms,
                     start_handoff_ms,
+                    // Of `start_best_ms` (`frame_blocks::SelectTimes`).
+                    start_select_ms,
+                    start_walk_ms,
+                    start_walk_check_ms,
+                    start_pull_ms,
+                    start_best_other_ms,
+                    start_frames_by_ref = select_times.by_ref,
+                    start_frames_slow = select_times.slow,
                     start_check_ms,
                     start_puller_ms,
                     start_prepare_ms,

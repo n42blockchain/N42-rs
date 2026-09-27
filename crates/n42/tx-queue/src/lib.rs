@@ -410,6 +410,10 @@ struct Inner<T: PoolTransaction> {
     len: usize,
     /// What the last build took, and the parent it built on.
     last_build: Option<(B256, Vec<Arc<ValidPoolTransaction<T>>>)>,
+    /// A frame build's takes not yet applied to the lanes: (frame id, how
+    /// many of its transactions from its start). Applied by
+    /// [`Inner::settle`] at the next lock ([`TxQueue::lock_inner`]).
+    pending: Vec<(B256, usize)>,
     /// Holes a build ran into: (sender, the account's next nonce, the lowest
     /// queued nonce above it). The feed fills them from the pool.
     gaps: Vec<(Address, u64, u64)>,
@@ -740,6 +744,10 @@ pub struct TxQueue<T: PoolTransaction> {
     /// second, and must not wait on the lanes.
     frame_inbox: FrameInbox<T>,
     frames_staged: Arc<std::sync::atomic::AtomicUsize>,
+    /// `Inner::pruned_through`, readable without the lanes' lock: a build
+    /// reads it right after its selection, while the selection's takes may
+    /// still be leaving the lanes ([`Inner::settle`]).
+    pruned_mirror: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Frames noted since the last drain, each with its transactions when the
@@ -754,6 +762,7 @@ impl<T: PoolTransaction> Clone for TxQueue<T> {
             staged: Arc::clone(&self.staged),
             by_hash: self.by_hash.clone(),
             frame_inbox: Arc::clone(&self.frame_inbox),
+            pruned_mirror: Arc::clone(&self.pruned_mirror),
             frames_staged: Arc::clone(&self.frames_staged),
         }
     }
@@ -796,7 +805,7 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// to choose the path without the process environment deciding for it.
     #[must_use]
     pub fn with_park_lanes(self, lanes: usize) -> Self {
-        self.inner.lock().park_lanes = lanes;
+        self.lock_inner().park_lanes = lanes;
         self
     }
 
@@ -887,6 +896,7 @@ impl<T: PoolTransaction> TxQueue<T> {
                 arrivals: VecDeque::new(),
                 len: 0,
                 last_build: None,
+                pending: Vec::new(),
                 gaps: Vec::new(),
                 held: VecDeque::new(),
                 parked_order: VecDeque::new(),
@@ -905,7 +915,17 @@ impl<T: PoolTransaction> TxQueue<T> {
             by_hash: None,
             frame_inbox: Arc::new(Mutex::new(Vec::new())),
             frames_staged: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            pruned_mirror: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// The lanes' lock, with a frame build's noted takes applied first
+    /// ([`Inner::settle`]): every lock of the queue goes through here, so
+    /// no caller ever sees the lanes before them.
+    fn lock_inner(&self) -> parking_lot::MutexGuard<'_, Inner<T>> {
+        let mut inner = self.inner.lock();
+        inner.settle();
+        inner
     }
 
     /// Moves what was pushed since the last drain into the lanes. Called
@@ -984,7 +1004,7 @@ impl<T: PoolTransaction> TxQueue<T> {
 
     /// How many frames the index holds, counting those still in its inbox.
     pub fn frames_indexed(&self) -> usize {
-        self.inner.lock().frames.len() + self.frames_staged.load(std::sync::atomic::Ordering::Acquire)
+        self.lock_inner().frames.len() + self.frames_staged.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The indexed frames in the order they arrived, each with its count,
@@ -996,7 +1016,7 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// one lane step per queued transaction -- a per-build call, not a
     /// per-transaction one.
     pub fn frames_in_arrival_order(&self) -> impl Iterator<Item = FrameRef> + use<T> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner();
         self.drain_inbox(&mut inner);
         inner.frames.in_arrival_order(&inner.lanes).into_iter()
     }
@@ -1017,7 +1037,7 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// the queue keeps one. `None` for a frame the index does not hold or
     /// one with any transaction found in neither place.
     pub fn take_frames(&self, ids: &[B256]) -> Vec<Option<FrameTxs<T>>> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner();
         self.drain_inbox(&mut inner);
         ids.iter()
             .map(|id| {
@@ -1044,7 +1064,7 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// How many indexed frames hold their transactions ([`Self::push_frame`]).
     /// For tests and the prune's report.
     pub fn frames_with_txs(&self) -> usize {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner();
         self.drain_inbox(&mut inner);
         inner.frames.with_txs()
     }
@@ -1052,8 +1072,9 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// Records that a canonical block at `number` has been pruned out of the
     /// lanes. Only the highest is kept.
     pub fn note_pruned(&self, number: u64) {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner();
         inner.pruned_through = inner.pruned_through.max(number);
+        self.pruned_mirror.fetch_max(number, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// The highest block a canonical prune has taken out of the lanes.
@@ -1063,7 +1084,7 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// lanes actually hold. Nothing here acts on that -- it is a reading for
     /// the builder to take.
     pub fn pruned_through(&self) -> u64 {
-        self.inner.lock().pruned_through
+        self.pruned_mirror.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The holes builds ran into since the last call: (sender, first missing
@@ -1071,12 +1092,12 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// queue never saw -- the pool's listener drops on a full channel -- or
     /// one still on its way in; the feed looks the pool up for it.
     pub fn take_gaps(&self) -> Vec<(Address, u64, u64)> {
-        std::mem::take(&mut self.inner.lock().gaps)
+        std::mem::take(&mut self.lock_inner().gaps)
     }
 
     /// How many transactions are queued.
     pub fn len(&self) -> usize {
-        self.inner.lock().len + self.staged.load(std::sync::atomic::Ordering::Acquire)
+        self.lock_inner().len + self.staged.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// How many of them a build could take now: what [`Self::len`] counts,
@@ -1090,7 +1111,7 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// One walk of the lanes (~6,000 at the bench tier), so it belongs on a
     /// per-block line and not in a loop.
     pub fn usable(&self) -> usize {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner();
         // What is in the inbox is a build away from the lanes -- the next
         // pull drains it -- so it counts, and counting it means draining
         // it. The drainer task normally leaves nothing to do here.
@@ -1108,7 +1129,7 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// the flood was held off, nothing was mined so nothing was pruned, and
     /// the node built empty blocks until its tenure ended.
     pub fn gate_len(&self) -> usize {
-        let inner = self.inner.lock();
+        let inner = self.lock_inner();
         (inner.len + self.staged.load(std::sync::atomic::Ordering::Acquire)).saturating_sub(inner.parked_len)
     }
 
@@ -1116,13 +1137,13 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// the first few named ([`Dropped`]). Taking it clears it, so a caller
     /// logging this reports a window and not a running total.
     pub fn take_drops(&self) -> DropReport {
-        std::mem::take(&mut self.inner.lock().drops)
+        std::mem::take(&mut self.lock_inner().drops)
     }
 
     /// The lanes parked behind a hole, how many transactions they hold, and
     /// how many parks the cap has refused since the process started.
     pub fn parked(&self) -> (usize, usize, u64) {
-        let inner = self.inner.lock();
+        let inner = self.lock_inner();
         (inner.parked_order.len(), inner.parked_len, inner.park_capped)
     }
 
@@ -1204,7 +1225,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         if transactions.is_empty() {
             return;
         }
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner();
         for transaction in &transactions {
             if let Some((_, taken)) = inner.last_build.as_mut()
                 && let Some(at) = taken.iter().rposition(|t| Arc::ptr_eq(t, transaction))
@@ -1229,7 +1250,7 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// about this transaction and says nothing about them.
     pub fn forget_taken(&self, transaction: &Arc<ValidPoolTransaction<T>>) {
         {
-            let mut inner = self.inner.lock();
+            let mut inner = self.lock_inner();
             if let Some((_, taken)) = inner.last_build.as_mut()
                 && let Some(at) = taken.iter().rposition(|t| Arc::ptr_eq(t, transaction))
             {
@@ -1246,7 +1267,7 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// half-empty blocks for the rest of the leg) would be lost again.
     pub fn push_reverted(&self, transactions: Vec<T>) {
         {
-            let mut inner = self.inner.lock();
+            let mut inner = self.lock_inner();
             for transaction in &transactions {
                 let sender = transaction.sender();
                 let nonce = transaction.nonce();
@@ -1262,7 +1283,7 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// the sender's mined watermark: a block carrying (sender, nonce) has
     /// made every lower nonce unusable as well, for good.
     pub fn remove_mined(&self, sender: Address, nonce: u64) {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner();
         self.drain_inbox(&mut inner);
         inner.remove_mined(sender, nonce);
         let Inner { frames, lanes, .. } = &mut *inner;
@@ -1274,7 +1295,7 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// For canonical blocks only -- see [`Self::remove_mined_batch_collecting`]
     /// for a block of this node's that consensus has not committed yet.
     pub fn remove_mined_batch(&self, mined: impl IntoIterator<Item = (Address, u64)>) {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner();
         self.drain_inbox(&mut inner);
         // Folded to the highest nonce per sender first: a lane is split once
         // per sender, not once per transaction. Splitting per transaction
@@ -1317,7 +1338,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         &self,
         mined: impl IntoIterator<Item = (Address, u64)>,
     ) -> Vec<Arc<ValidPoolTransaction<T>>> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner();
         self.drain_inbox(&mut inner);
         let mut highest: AddressHashMap<u64> = AddressHashMap::default();
         for (sender, nonce) in mined {
@@ -1360,7 +1381,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         if transactions.is_empty() {
             return;
         }
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner();
         while inner.held.len() >= HELD_BLOCKS {
             let Some((evicted, _, gone)) = inner.held.pop_front() else { break };
             // Nothing else holds these: the block they were taken for was
@@ -1386,7 +1407,7 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// says which (sender, nonce) it does) go back to the lanes. Returns how
     /// many went back. Heights the chain has passed are dropped too.
     pub fn settle_own_block(&self, number: u64, hash: B256, carried: impl Fn(&Address, u64) -> bool) -> usize {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner();
         if inner.held.is_empty() {
             return 0;
         }
@@ -1473,7 +1494,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         // outside the lock the puller needs.
         {
             let at = std::time::Instant::now();
-            let inner = self.inner.lock();
+            let inner = self.lock_inner();
             times.lock_us += at.elapsed().as_micros() as u64;
             match inner.last_build.as_ref() {
                 Some((built_on, taken)) if *built_on == parent && !taken.is_empty() => {}
@@ -1488,7 +1509,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         }
         times.fold_us = at.elapsed().as_micros() as u64;
         let at = std::time::Instant::now();
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner();
         times.lock_us += at.elapsed().as_micros() as u64;
         let at = std::time::Instant::now();
         let Some((built_on, taken)) = inner.last_build.as_mut() else { return (Vec::new(), times) };
@@ -1535,7 +1556,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         let mut times = ForgetTimes::default();
         {
             let at = std::time::Instant::now();
-            let inner = self.inner.lock();
+            let inner = self.lock_inner();
             times.lock_us += at.elapsed().as_micros() as u64;
             match inner.last_build.as_ref() {
                 Some((built_on, taken)) if *built_on == parent && !taken.is_empty() => {}
@@ -1560,7 +1581,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         });
         times.fold_us = at.elapsed().as_micros() as u64;
         let at = std::time::Instant::now();
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner();
         times.lock_us += at.elapsed().as_micros() as u64;
         let at = std::time::Instant::now();
         let Some((built_on, taken)) = inner.last_build.as_mut() else { return (Vec::new(), times) };
@@ -1586,7 +1607,7 @@ impl<T: PoolTransaction> TxQueue<T> {
         if self.staged.load(Ordering::Acquire) == 0 {
             return;
         }
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner();
         self.drain_inbox(&mut inner);
     }
 
@@ -1595,7 +1616,7 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// took, first.
     pub fn best_for_build(&self, parent: B256) -> QueueBest<T> {
         {
-            let mut inner = self.inner.lock();
+            let mut inner = self.lock_inner();
             self.begin_build(&mut inner, parent);
         }
         QueueBest {
@@ -1605,6 +1626,7 @@ impl<T: PoolTransaction> TxQueue<T> {
             batch: queue_batch(),
             frame_mode: false,
             frames_ended: false,
+            segments: VecDeque::new(),
         }
     }
 
@@ -1625,27 +1647,64 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// did not use goes back through the builder's refusals and the next
     /// build's give-back, as for the walk.
     pub fn frames_for_build(&self, parent: B256, gas_limit: u64) -> (QueueBest<T>, FramePlan) {
-        let (buffer, plan) = {
-            let mut inner = self.inner.lock();
+        let (best, plan, _) = self.frames_for_build_timed(parent, gas_limit);
+        (best, plan)
+    }
+
+    /// [`Self::frames_for_build`], with where its time went
+    /// ([`FrameSelectTimes`]).
+    pub fn frames_for_build_timed(&self, parent: B256, gas_limit: u64) -> (QueueBest<T>, FramePlan, FrameSelectTimes) {
+        let mode = if frame_select_parallel() { SelectMode::Parallel } else { SelectMode::Serial };
+        self.frames_for_build_in(parent, gas_limit, mode)
+    }
+
+    fn frames_for_build_in(
+        &self,
+        parent: B256,
+        gas_limit: u64,
+        mode: SelectMode,
+    ) -> (QueueBest<T>, FramePlan, FrameSelectTimes) {
+        let mut times = FrameSelectTimes::default();
+        let at = std::time::Instant::now();
+        let (segments, plan) = {
+            let mut inner = self.lock_inner();
+            times.lock_us = at.elapsed().as_micros() as u64;
+            let begin_at = std::time::Instant::now();
             self.begin_build(&mut inner, parent);
-            inner.plan_frames(gas_limit)
+            times.begin_us = begin_at.elapsed().as_micros() as u64;
+            let plan_at = std::time::Instant::now();
+            let planned = inner.plan_frames(gas_limit, &mut times, mode);
+            times.plan_us = plan_at.elapsed().as_micros() as u64;
+            planned
         };
+        // The takes the plan left noted leave the lanes on a thread of their
+        // own, off the build's start; any lock before that applies them first.
+        if mode == SelectMode::Parallel {
+            let queue = self.clone();
+            let spawned = std::thread::Builder::new()
+                .name("n42-frame-settle".to_owned())
+                .spawn(move || drop(queue.lock_inner()));
+            if spawned.is_err() {
+                drop(self.lock_inner());
+            }
+        }
         let best = QueueBest {
             queue: self.clone(),
             skipped: AddressHashSet::default(),
-            buffer: buffer.into(),
+            buffer: VecDeque::new(),
             batch: 1,
             frame_mode: true,
             frames_ended: false,
+            segments: segments.into_iter().map(|(txs, taken)| (txs, 0, taken)).collect(),
         };
-        (best, plan)
+        (best, plan, times)
     }
 
     /// The frame layout of a body, from this node's frame index: each
     /// frame's id and how much of it the body holds, in body order. `None`
     /// when the body is not a run of frames this node indexed.
     pub fn frame_layout_of(&self, hashes: &[B256]) -> Option<Vec<(B256, usize)>> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner();
         self.drain_inbox(&mut inner);
         inner.frames.layout_of(hashes)
     }
@@ -1657,7 +1716,7 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// comparison per frame; what a whole-body check reads instead of
     /// rehashing the frames.
     pub fn frames_held(&self, layout: &[(B256, usize)], hashes: &[B256]) -> Vec<Option<B256>> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.lock_inner();
         self.drain_inbox(&mut inner);
         inner.frames.held_whole(layout, hashes)
     }
@@ -1714,9 +1773,28 @@ impl<T: PoolTransaction> TxQueue<T> {
 
 impl<T: PoolTransaction> Inner<T> {
     /// The frame plan of [`TxQueue::frames_for_build`], taken out of the
-    /// lanes: the transactions in plan order and the plan.
-    fn plan_frames(&mut self, gas_limit: u64) -> (Vec<Arc<ValidPoolTransaction<T>>>, FramePlan) {
-        let mut out = Vec::new();
+    /// lanes: the transactions in plan order, as one segment per frame (the
+    /// frame's shared transactions and how many of them from its start),
+    /// and the plan.
+    ///
+    /// A frame noted with its transactions ([`TxQueue::push_frame`]) that
+    /// fits the gas left whole is checked and taken by reference
+    /// ([`frames::FrameIndex::check_by_ref`]): one lane look-up a sender
+    /// run, the lanes' entries compared with the frame's `Arc`s by pointer,
+    /// the frame's gas summed at admission, its segment one `Arc` clone and
+    /// its hashes one copy. Everything else -- a frame noted without its
+    /// transactions (the pool door, `N42_FRAME_ARCS=0`), the frame the gas
+    /// runs out in, a lane holding another allocation of a transaction --
+    /// goes through the per-transaction check ([`Self::plan_frame_slow`]),
+    /// which decides exactly as before; the two agree on every frame, so
+    /// the plan and the transactions are the same either way.
+    fn plan_frames(
+        &mut self,
+        gas_limit: u64,
+        times: &mut FrameSelectTimes,
+        mode: SelectMode,
+    ) -> (Vec<(FrameTxs<T>, usize)>, FramePlan) {
+        let mut segments: Vec<(FrameTxs<T>, usize)> = Vec::new();
         let mut plan = FramePlan::default();
         let mut gas_left = gas_limit;
         // The ids only: the per-position check below is at least as strict
@@ -1725,13 +1803,292 @@ impl<T: PoolTransaction> Inner<T> {
         // the block's gas are never examined. Computing whole-usable for
         // every indexed frame first cost ~50 ms a build at a 500k queue
         // (loop267, `start_best_ms`).
-        for id in self.frames.ids_in_arrival_order() {
-            if gas_left == 0 {
+        let ids_at = std::time::Instant::now();
+        let ids = self.frames.ids_in_arrival_order();
+        times.ids_us = ids_at.elapsed().as_micros() as u64;
+        let from = if mode == SelectMode::Parallel {
+            let (next, ended) = self.plan_parallel(&ids, &mut gas_left, &mut segments, &mut plan, times);
+            if ended {
+                return (segments, plan);
+            }
+            next
+        } else {
+            0
+        };
+        if from < ids.len() && gas_left > 0 {
+            // The serial check reads the lanes' heads: the parallel part's
+            // takes are applied first.
+            let settle_at = std::time::Instant::now();
+            self.settle();
+            times.settle_us += settle_at.elapsed().as_micros() as u64;
+            self.plan_serial(&ids[from..], &mut gas_left, &mut segments, &mut plan, times, mode == SelectMode::PerTx);
+        }
+        (segments, plan)
+    }
+
+    /// The first part of [`Self::plan_frames`]: the frames the block's gas
+    /// reaches (and a few past it, for the ones passed over) checked at
+    /// once on the worker pool against the lanes as they stand
+    /// ([`frames::FrameIndex::check_runs`]), then decided in arrival order
+    /// with one counter per sender that more than one of them draws on.
+    /// A taken frame is noted in `pending` and leaves the lanes at the next
+    /// [`Self::settle`] -- the next lock of the queue, or the helper
+    /// [`TxQueue::frames_for_build_timed`] starts -- so the build is handed
+    /// its frames without a transaction touched. Returns where the serial
+    /// part continues and whether the plan has ended.
+    fn plan_parallel(
+        &mut self,
+        ids: &[B256],
+        gas_left: &mut u64,
+        segments: &mut Vec<(FrameTxs<T>, usize)>,
+        plan: &mut FramePlan,
+        times: &mut FrameSelectTimes,
+    ) -> (usize, bool) {
+        use rayon::prelude::*;
+        // Past the gas, a margin for the frames the plan passes over; the
+        // serial part continues if they run out.
+        const MARGIN: usize = 16;
+        let check_at = std::time::Instant::now();
+        let mut end = 0usize;
+        let mut reach = 0u64;
+        let mut past = 0usize;
+        while end < ids.len() && past <= MARGIN {
+            if reach > *gas_left {
+                past += 1;
+            }
+            reach = reach.saturating_add(self.frames.txs_gas_of(&ids[end]).unwrap_or(u64::MAX));
+            end += 1;
+        }
+        let (frames, lanes) = (&self.frames, &self.lanes);
+        let checks: Vec<frames::RunCheck<T>> =
+            ids[..end].par_iter().with_min_len(4).map(|id| frames.check_runs(id, lanes)).collect();
+        // Senders some run needs entries below it taken of, and each frame's
+        // runs of those senders: what the decisions below count.
+        let shared: AddressHashSet = checks
+            .iter()
+            .filter_map(|check| match check {
+                frames::RunCheck::Ok { below, .. } => Some(below.iter().map(|(_, sender, _)| *sender)),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        let draws: Vec<Vec<(u32, Address, u32)>> = if shared.is_empty() {
+            Vec::new()
+        } else {
+            ids[..end]
+                .par_iter()
+                .zip(checks.par_iter())
+                .map(|(id, check)| match check {
+                    frames::RunCheck::Ok { .. } => frames.runs_and_hashes(id).map_or_else(Vec::new, |(runs, _)| {
+                        runs.iter()
+                            .enumerate()
+                            .filter(|(_, run)| shared.contains(&run.sender))
+                            .map(|(idx, run)| (idx as u32, run.sender, run.len))
+                            .collect()
+                    }),
+                    _ => Vec::new(),
+                })
+                .collect()
+        };
+        times.check_us = check_at.elapsed().as_micros() as u64;
+        let mut taken_of: AddressHashMap<u64> = AddressHashMap::default();
+        for (k, check) in checks.into_iter().enumerate() {
+            if *gas_left == 0 {
+                return (k, true);
+            }
+            let (txs, gas) = match check {
+                frames::RunCheck::Slow => return (k, false),
+                frames::RunCheck::Unusable { gas } => {
+                    // A frame the gas cuts is checked only as far as the
+                    // cut: the serial check decides it.
+                    if gas > *gas_left {
+                        return (k, false);
+                    }
+                    plan.skipped += 1;
+                    continue;
+                }
+                frames::RunCheck::Ok { txs, gas, below } => {
+                    let draws = draws.get(k).map_or(&[][..], Vec::as_slice);
+                    if !below.is_empty() {
+                        times.counted += 1;
+                    }
+                    let at_heads = draws.iter().all(|(idx, sender, _)| {
+                        let needs = below.iter().find(|(at, _, _)| at == idx).map_or(0, |(_, _, n)| *n);
+                        taken_of.get(sender).copied().unwrap_or(0) == needs
+                    });
+                    if !at_heads {
+                        if gas > *gas_left {
+                            return (k, false);
+                        }
+                        plan.skipped += 1;
+                        continue;
+                    }
+                    (txs, gas)
+                }
+            };
+            let id = ids[k];
+            let Some((_, hashes)) = self.frames.runs_and_hashes(&id) else { return (k, false) };
+            let (prefix, used) = if gas <= *gas_left {
+                (txs.len(), gas)
+            } else {
+                // The frame the block's gas runs out in, cut: its own
+                // transactions' gas, the one frame read here.
+                let mut used = 0u64;
+                let mut prefix = 0usize;
+                for tx in txs.iter() {
+                    let tx_gas = tx.gas_limit();
+                    if used.saturating_add(tx_gas) > *gas_left {
+                        break;
+                    }
+                    used += tx_gas;
+                    prefix += 1;
+                }
+                (prefix, used)
+            };
+            if prefix == 0 {
+                return (k, true);
+            }
+            for (_, sender, len) in draws.get(k).map_or(&[][..], Vec::as_slice) {
+                // Runs are in position order; a cut frame's runs past the cut
+                // take nothing, and the plan ends with it anyway.
+                *taken_of.entry(*sender).or_insert(0) += u64::from(*len);
+            }
+            self.len -= prefix;
+            plan.hashes.extend_from_slice(&hashes[..prefix]);
+            plan.frames.push(PlannedFrame { id, len: txs.len(), taken: prefix });
+            self.pending.push((id, prefix));
+            times.by_ref += 1;
+            segments.push((txs, prefix));
+            *gas_left = gas_left.saturating_sub(used);
+            if prefix < hashes.len() {
+                return (k + 1, true);
+            }
+        }
+        (end, false)
+    }
+
+    /// Applies the takes [`Self::plan_parallel`] noted: each planned
+    /// frame's transactions (its taken prefix) leave their lanes, by
+    /// (sender, nonce), into the build's taken list in plan order, exactly
+    /// as the serial take pops them. Every lock of the queue calls this
+    /// first ([`TxQueue::lock_inner`]), so nothing ever sees the lanes
+    /// before it.
+    fn settle(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending);
+        let mut list = self.last_build.as_mut().map(|(_, list)| list);
+        for (id, prefix) in pending {
+            let Some((runs, _)) = self.frames.runs_and_hashes(&id) else { continue };
+            if let Some(list) = list.as_mut() {
+                list.reserve(prefix);
+            }
+            for run in runs {
+                let start = run.start as usize;
+                if start >= prefix {
+                    break;
+                }
+                let count = (run.len as usize).min(prefix - start) as u64;
+                let Some(lane) = self.lanes.get_mut(&run.sender) else { continue };
+                for nonce in run.first_nonce..run.first_nonce + count {
+                    // The lane's own `Arc` moves to the taken list; the
+                    // build was handed the frame's, the same allocation.
+                    if let Some(valid) = lane.by_nonce.remove(&nonce)
+                        && let Some(list) = list.as_mut()
+                    {
+                        list.push(valid);
+                    }
+                }
+                if lane.by_nonce.is_empty() {
+                    lane.queued = false;
+                }
+            }
+        }
+    }
+
+    /// The serial part of [`Self::plan_frames`] over `ids`, with the lanes
+    /// settled: each frame by reference where [`frames::FrameIndex::check_by_ref`]
+    /// can decide it, else by the per-transaction check.
+    fn plan_serial(
+        &mut self,
+        ids: &[B256],
+        gas_left: &mut u64,
+        segments: &mut Vec<(FrameTxs<T>, usize)>,
+        plan: &mut FramePlan,
+        times: &mut FrameSelectTimes,
+        per_tx: bool,
+    ) {
+        for &id in ids {
+            if *gas_left == 0 {
                 break;
             }
+            let check =
+                if per_tx { frames::ByRef::Slow } else { self.frames.check_by_ref(&id, &self.lanes, *gas_left) };
+            match check {
+                frames::ByRef::Unusable => plan.skipped += 1,
+                frames::ByRef::Whole { txs, gas } => {
+                    let taken_list = self.last_build.as_mut().map(|(_, list)| list);
+                    let Some((runs, hashes)) = self.frames.runs_and_hashes(&id) else {
+                        plan.skipped += 1;
+                        continue;
+                    };
+                    let mut taken_list = taken_list;
+                    if let Some(list) = taken_list.as_mut() {
+                        list.reserve(txs.len());
+                    }
+                    let mut taken = 0usize;
+                    for run in runs {
+                        let Some(lane) = self.lanes.get_mut(&run.sender) else { break };
+                        for _ in 0..run.len {
+                            // The check under this same lock put each of
+                            // the run's nonces at the lane's head in turn.
+                            let Some((_, valid)) = lane.by_nonce.pop_first() else { break };
+                            self.len -= 1;
+                            taken += 1;
+                            if let Some(list) = taken_list.as_mut() {
+                                list.push(valid);
+                            }
+                        }
+                        if lane.by_nonce.is_empty() {
+                            lane.queued = false;
+                        }
+                    }
+                    debug_assert_eq!(taken, txs.len());
+                    plan.hashes.extend_from_slice(hashes);
+                    plan.frames.push(PlannedFrame { id, len: txs.len(), taken: txs.len() });
+                    times.by_ref += 1;
+                    segments.push((txs, taken));
+                    *gas_left = gas_left.saturating_sub(gas);
+                }
+                frames::ByRef::Slow => {
+                    times.slow += 1;
+                    match self.plan_frame_slow(id, gas_left, plan) {
+                        SlowFrame::Skipped => {}
+                        SlowFrame::Taken(out, whole) => {
+                            let taken = out.len();
+                            segments.push((FrameTxs::from(out), taken));
+                            if !whole {
+                                break;
+                            }
+                        }
+                        SlowFrame::End => break,
+                    }
+                }
+            }
+        }
+    }
+
+    /// One frame of [`Self::plan_frames`] by the per-transaction check: each
+    /// position found in its lane by (sender, nonce) and its hash compared,
+    /// the gas summed position by position and the frame cut where it runs
+    /// out.
+    fn plan_frame_slow(&mut self, id: B256, gas_left: &mut u64, plan: &mut FramePlan) -> SlowFrame<T> {
+        let mut out = Vec::new();
+        {
             let Some(members) = self.frames.members_of(&id) else {
                 plan.skipped += 1;
-                continue;
+                return SlowFrame::Skipped;
             };
             // Checked before anything is taken: each position at its
             // sender's lane head, counting this frame's earlier positions
@@ -1756,7 +2113,7 @@ impl<T: PoolTransaction> Inner<T> {
                     break;
                 }
                 let tx_gas = held.map_or(0, |held| held.gas_limit());
-                if gas.saturating_add(tx_gas) > gas_left {
+                if gas.saturating_add(tx_gas) > *gas_left {
                     prefix = at;
                     break;
                 }
@@ -1765,10 +2122,10 @@ impl<T: PoolTransaction> Inner<T> {
             }
             if !usable {
                 plan.skipped += 1;
-                continue;
+                return SlowFrame::Skipped;
             }
             if prefix == 0 {
-                break;
+                return SlowFrame::End;
             }
             let mut taken = 0usize;
             for (sender, nonce, hash) in &members[..prefix] {
@@ -1789,15 +2146,12 @@ impl<T: PoolTransaction> Inner<T> {
                 taken += 1;
             }
             if taken == 0 {
-                break;
+                return SlowFrame::End;
             }
             plan.frames.push(PlannedFrame { id, len: members.len(), taken });
-            gas_left = gas_left.saturating_sub(gas);
-            if taken < members.len() {
-                break;
-            }
+            *gas_left = gas_left.saturating_sub(gas);
+            SlowFrame::Taken(out, taken == members.len())
         }
-        (out, plan)
     }
 
     /// Queues one transaction the pusher has already wrapped.
@@ -2163,6 +2517,12 @@ impl<T: PoolTransaction> Inner<T> {
 /// [`BestTransactions`], so the payload builder takes it in place of the
 /// pool's.
 pub struct QueueBest<T: PoolTransaction> {
+    /// A frame build's frames not yet handed out, in plan order: each
+    /// frame's shared transactions, the next position to hand out and how
+    /// many were taken from its start. A transaction is cloned out of its
+    /// frame only when handed to the builder (on the builder's puller), so
+    /// the selection itself touches no transaction.
+    segments: VecDeque<(FrameTxs<T>, usize, usize)>,
     queue: TxQueue<T>,
     skipped: AddressHashSet,
     /// Transactions taken under one lock and not yet handed to the builder.
@@ -2178,6 +2538,68 @@ pub struct QueueBest<T: PoolTransaction> {
     /// A frame build's first refusal: nothing more is offered, since a body
     /// with a hole in a frame is not frame-aligned.
     frames_ended: bool,
+}
+
+/// Where a frame build's selection ([`TxQueue::frames_for_build_timed`])
+/// spent its time, in microseconds, and how it decided its frames.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FrameSelectTimes {
+    /// Waiting for the lanes' lock.
+    pub lock_us: u64,
+    /// The build's opening under it: the inbox drained, the previous
+    /// build's take given back, parked lanes readmitted.
+    pub begin_us: u64,
+    /// The plan: the frames checked and taken.
+    pub plan_us: u64,
+    /// Of `plan_us`, listing the live frame ids in arrival order.
+    pub ids_us: u64,
+    /// Of `plan_us`, the parallel check of the frames the gas reaches.
+    pub check_us: u64,
+    /// Of `plan_us`, applying the parallel part's takes before a serial
+    /// part (0 when the plan ended in the parallel part: the takes are
+    /// applied off the selection).
+    pub settle_us: u64,
+    /// Frames decided and taken by reference.
+    pub by_ref: usize,
+    /// Frames that went through the per-transaction check.
+    pub slow: usize,
+    /// Of `by_ref`, frames whose decision read the per-sender counters (a
+    /// sender with entries below the frame's run in its lane).
+    pub counted: usize,
+}
+
+/// How a frame build selects ([`Inner::plan_frames`]); the plan is the
+/// same in every mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectMode {
+    /// The frames the gas reaches checked at once, the lanes' update left
+    /// to [`Inner::settle`] (`N42_FRAME_SELECT_PARALLEL`, the default).
+    Parallel,
+    /// Each frame checked and taken in turn, by reference where it can be.
+    Serial,
+    /// Each frame by the per-transaction check (the selection before
+    /// frames were taken by reference); for the tests' comparison.
+    #[cfg_attr(not(test), allow(dead_code))]
+    PerTx,
+}
+
+/// What [`Inner::plan_frame_slow`] did with one frame.
+enum SlowFrame<T: PoolTransaction> {
+    /// Not whole-usable: passed over.
+    Skipped,
+    /// Taken, whole (`true`) or cut to the gas left (`false`, the plan's end).
+    Taken(Vec<Arc<ValidPoolTransaction<T>>>, bool),
+    /// Nothing of it fits or could be taken: the plan ends here.
+    End,
+}
+
+/// `N42_FRAME_SELECT_PARALLEL`, on unless `0`: a frame build checks the
+/// frames the gas reaches at once on the worker pool and leaves the lanes'
+/// update to [`Inner::settle`] ([`Inner::plan_parallel`]). Off, every frame
+/// is checked and taken in turn. The plan is the same either way.
+fn frame_select_parallel() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_FRAME_SELECT_PARALLEL").map_or(true, |v| v != "0"))
 }
 
 /// `N42_TX_QUEUE_BATCH`, read once.
@@ -2202,10 +2624,14 @@ impl<T: PoolTransaction> QueueBest<T> {
 
 impl<T: PoolTransaction> Drop for QueueBest<T> {
     fn drop(&mut self) {
+        // A frame build's frames not handed out go back as its buffer does.
+        for (txs, next, end) in std::mem::take(&mut self.segments) {
+            self.buffer.extend(txs.get(next..end).into_iter().flatten().cloned());
+        }
         if self.buffer.is_empty() {
             return;
         }
-        let mut inner = self.queue.inner.lock();
+        let mut inner = self.queue.lock_inner();
         for transaction in self.buffer.drain(..) {
             Self::untake(&mut inner, transaction);
         }
@@ -2224,20 +2650,32 @@ impl<T: PoolTransaction> Iterator for QueueBest<T> {
     fn next(&mut self) -> Option<Self::Item> {
         if self.frame_mode {
             // What is left in the buffer after the end goes back on drop.
-            return if self.frames_ended { None } else { self.buffer.pop_front() };
+            if self.frames_ended {
+                return None;
+            }
+            while let Some((txs, next, end)) = self.segments.front_mut() {
+                if *next < *end
+                    && let Some(transaction) = txs.get(*next)
+                {
+                    *next += 1;
+                    return Some(Arc::clone(transaction));
+                }
+                self.segments.pop_front();
+            }
+            return self.buffer.pop_front();
         }
         loop {
             if let Some(transaction) = self.buffer.pop_front() {
                 // A sender the build refused meanwhile: its buffered
                 // transactions go back rather than to the builder.
                 if self.skipped.contains(&transaction.sender()) {
-                    let mut inner = self.queue.inner.lock();
+                    let mut inner = self.queue.lock_inner();
                     Self::untake(&mut inner, transaction);
                     continue;
                 }
                 return Some(transaction);
             }
-            let mut inner = self.queue.inner.lock();
+            let mut inner = self.queue.lock_inner();
             self.queue.drain_inbox(&mut inner);
             if self.batch <= 1 {
                 return inner.next_ready(&self.skipped);
@@ -2267,7 +2705,7 @@ impl<T: PoolTransaction> BestTransactions for QueueBest<T> {
         let stale = matches!(&kind, InvalidPoolTransactionError::Consensus(err) if err.is_nonce_too_low());
         if stale {
             let nonce = transaction.nonce();
-            let mut inner = self.queue.inner.lock();
+            let mut inner = self.queue.lock_inner();
             // Only the chain can say a nonce is behind it.
             //
             // A build's state is its parent's, and a parent is not always a
@@ -2295,7 +2733,7 @@ impl<T: PoolTransaction> BestTransactions for QueueBest<T> {
                 inner.dropped(Dropped::StaleUnconfirmed, sender, nonce);
                 drop(inner);
                 self.skipped.insert(sender);
-                let mut inner = self.queue.inner.lock();
+                let mut inner = self.queue.lock_inner();
                 if let Some((_, taken)) = inner.last_build.as_mut()
                     && let Some(at) = taken.iter().rposition(|t| Arc::ptr_eq(t, transaction))
                 {
@@ -2324,7 +2762,7 @@ impl<T: PoolTransaction> BestTransactions for QueueBest<T> {
             return;
         }
         self.skipped.insert(sender);
-        let mut inner = self.queue.inner.lock();
+        let mut inner = self.queue.lock_inner();
         if let Some((_, taken)) = inner.last_build.as_mut() {
             // The refused transaction is the one just yielded or one of the
             // few buffered after it: found from the back. A scan of
@@ -3809,5 +4247,230 @@ mod tests {
         // By reference: the same allocation the lane holds.
         let again = queue.take_frames(&[B256::repeat_byte(0xc1)]);
         assert!(Arc::ptr_eq(&got[2].as_ref().unwrap()[0], &again[0].as_ref().unwrap()[0]));
+    }
+
+    /// A scenario of frames and loose transactions from `seed`: frames
+    /// with their transactions (senders interleaved, so a sender has more
+    /// than one run in a frame), frames noted without them (the pool door),
+    /// loose transactions at lane heads, gaps, and a transaction that came
+    /// in loose before its frame (the lane holds another allocation).
+    fn frame_scenario(seed: u64) -> TxQueue<EthPooledTransaction> {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
+        let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        let mut next = move |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        let senders: Vec<Address> = (1..=10u8).map(Address::repeat_byte).collect();
+        let mut nonces = [0u64; 10];
+        let mut frame_id = 0u32;
+        for _ in 0..40 {
+            match next(10) {
+                0 => {
+                    let s = next(10) as usize;
+                    queue.push([tx_hashed(senders[s], nonces[s])]);
+                    nonces[s] += 1;
+                }
+                1 => {
+                    // A gap: this nonce never arrives.
+                    nonces[next(10) as usize] += 1;
+                }
+                kind => {
+                    let len = 1 + next(6) as usize;
+                    let mut members = Vec::with_capacity(len);
+                    for _ in 0..len {
+                        let s = next(4 + (kind as u64 % 6)) as usize;
+                        members.push((senders[s], nonces[s]));
+                        nonces[s] += 1;
+                    }
+                    let txs: Vec<EthPooledTransaction> = members.iter().map(|(s, n)| tx_hashed(*s, *n)).collect();
+                    if next(12) == 0 {
+                        // One of them came in loose first.
+                        queue.push([txs[0].clone()]);
+                    }
+                    let hashes: Vec<B256> = txs.iter().map(|t| *t.hash()).collect();
+                    frame_id += 1;
+                    let mut id = [0u8; 32];
+                    id[..4].copy_from_slice(&frame_id.to_be_bytes());
+                    let frame = NewFrame { id: B256::from(id), hashes, members, gas: 21_000 * len as u64 };
+                    if kind == 2 {
+                        queue.push(txs);
+                        queue.note_frame(frame);
+                    } else {
+                        queue.push_frame(txs, Some(frame));
+                    }
+                }
+            }
+        }
+        queue
+    }
+
+    /// Everything a frame build decides, for comparing the modes: the plan,
+    /// what it hands out (hashes, and whether each is the frame index's own
+    /// allocation), the queue's depth, the build's taken list, and the same
+    /// again for a second build on another parent after the first gives
+    /// half of its frames back unused.
+    fn frame_outcome(
+        queue: &TxQueue<EthPooledTransaction>,
+        gas: u64,
+        mode: SelectMode,
+        seen: &mut FrameSelectTimes,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        for (round, parent) in [B256::repeat_byte(0x71), B256::repeat_byte(0x72)].into_iter().enumerate() {
+            let (mut best, plan, times) = queue.frames_for_build_in(parent, gas, mode);
+            seen.by_ref += times.by_ref;
+            seen.slow += times.slow;
+            seen.counted += times.counted;
+            seen.lock_us += plan.skipped as u64;
+            seen.begin_us += u64::from(plan.frames.last().is_some_and(|f| f.taken < f.len));
+            let ids: Vec<B256> = plan.frames.iter().map(|f| f.id).collect();
+            let own = queue.take_frames(&ids);
+            let mut handed = Vec::new();
+            let mut by_ref = Vec::new();
+            let keep = if round == 0 { plan.hashes.len() / 2 } else { plan.hashes.len() };
+            for tx in best.by_ref().take(keep) {
+                handed.push(*tx.hash());
+                by_ref.push(own.iter().flatten().any(|txs| txs.iter().any(|t| Arc::ptr_eq(t, &tx))));
+            }
+            drop(best);
+            let taken: Vec<B256> = queue
+                .lock_inner()
+                .last_build
+                .as_ref()
+                .map(|(_, list)| list.iter().map(|t| *t.hash()).collect())
+                .unwrap_or_default();
+            out.push(format!("{round} plan {:?} {:?} {}", plan.frames, plan.hashes, plan.skipped));
+            out.push(format!("{round} handed {handed:?}"));
+            out.push(format!("{round} len {} taken {taken:?}", queue.len()));
+            // Pointer identity: a transaction handed out is the frame
+            // index's own allocation in every mode, when its frame holds one.
+            out.push(format!("{round} own {by_ref:?}"));
+        }
+        out
+    }
+
+    /// The parallel selection, the serial one by reference and the
+    /// per-transaction one decide the same plan, hand out the same
+    /// transactions, and leave the queue the same, over many scenarios and
+    /// gas limits (whole frames, cut frames, skipped frames, the pool door).
+    #[test]
+    fn frame_selection_modes_agree() {
+        let mut seen = FrameSelectTimes::default();
+        let mut unused = FrameSelectTimes::default();
+        for seed in 1..=120u64 {
+            for gas_txs in [1u64, 3, 7, 12, 25, 60, 400] {
+                let gas = gas_txs * 21_000;
+                let reference = frame_outcome(&frame_scenario(seed), gas, SelectMode::PerTx, &mut unused);
+                let serial = frame_outcome(&frame_scenario(seed), gas, SelectMode::Serial, &mut unused);
+                assert_eq!(serial, reference, "seed {seed}, gas {gas_txs} txs, serial");
+                let parallel = frame_outcome(&frame_scenario(seed), gas, SelectMode::Parallel, &mut seen);
+                assert_eq!(parallel, reference, "seed {seed}, gas {gas_txs} txs, parallel");
+            }
+        }
+        // The scenarios reach every branch: frames by reference, by the
+        // counters, by the per-transaction check, passed over, and cut.
+        eprintln!("parallel: {seen:?} (lock_us = skipped, begin_us = cut)");
+        assert!(seen.by_ref > 0 && seen.counted > 0 && seen.slow > 0 && seen.lock_us > 0 && seen.begin_us > 0);
+    }
+
+    /// A frame noted with its transactions is selected by reference: the
+    /// build is handed the frame index's own allocations (pointer-equal
+    /// `Arc`s), the plan decides it without the per-transaction check, and
+    /// the frame's totals on the entry are its transactions'.
+    #[test]
+    fn frame_selection_hands_out_the_frames_own_arcs() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
+        let (a, b, c) = (Address::repeat_byte(1), Address::repeat_byte(2), Address::repeat_byte(3));
+        push_frame_with_txs(&queue, 0xf1, &[(a, 0), (b, 0), (a, 1), (c, 0)], None);
+        push_frame_with_txs(&queue, 0xf2, &[(b, 1), (a, 2)], Some(&[1, 0]));
+        push_frame_with_txs(&queue, 0xf3, &[(c, 1), (c, 2), (a, 3)], None);
+        {
+            let mut inner = queue.lock_inner();
+            queue.drain_inbox(&mut inner);
+            assert_eq!(inner.frames.txs_gas_of(&B256::repeat_byte(0xf1)), Some(4 * 21_000));
+            assert_eq!(inner.frames.txs_gas_of(&B256::repeat_byte(0xf3)), Some(3 * 21_000));
+        }
+        for mode in [SelectMode::Parallel, SelectMode::Serial] {
+            let parent = if mode == SelectMode::Parallel { B256::repeat_byte(0x81) } else { B256::repeat_byte(0x82) };
+            let (best, plan, times) = queue.frames_for_build_in(parent, 9 * 21_000, mode);
+            assert_eq!(times.slow, 0, "{mode:?}: no frame needed the per-transaction check");
+            assert_eq!(times.by_ref, 3);
+            assert_eq!(plan.frames.iter().map(|f| f.taken).collect::<Vec<_>>(), vec![4, 2, 3]);
+            let ids: Vec<B256> = plan.frames.iter().map(|f| f.id).collect();
+            let own: Vec<Arc<ValidPoolTransaction<EthPooledTransaction>>> =
+                queue.take_frames(&ids).into_iter().flatten().flat_map(|txs| txs.iter().cloned().collect::<Vec<_>>()).collect();
+            let handed: Vec<_> = best.collect();
+            assert_eq!(handed.len(), 9);
+            assert!(handed.iter().zip(&own).all(|(h, o)| Arc::ptr_eq(h, o)), "{mode:?}: the frames' own allocations");
+            // The lanes gave them up: the taken list holds the same ones.
+            let inner = queue.lock_inner();
+            let taken = &inner.last_build.as_ref().expect("a build").1;
+            assert_eq!(taken.len(), 9);
+            assert!(taken.iter().zip(&own).all(|(t, o)| Arc::ptr_eq(t, o)));
+            assert_eq!(inner.len, 0);
+        }
+    }
+
+    /// The leader's frame selection at the bench's shape: 480k queued in
+    /// frames of 500 (one transaction per sender per frame, as the flood's
+    /// ingest makes them), a 163k-transaction block of 326 frames, caches
+    /// cold. `cargo test -p n42-tx-queue --release --lib -- --ignored bench_frame_selection --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_frame_selection() {
+        let senders = 160_000u64;
+        let rounds = 3u64;
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
+        let mut all: Vec<(Address, u64)> = Vec::with_capacity((senders * rounds) as usize);
+        for n in 0..rounds {
+            for s in 0..senders {
+                let mut a = [0u8; 20];
+                a[..8].copy_from_slice(&(s.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1).to_be_bytes());
+                all.push((Address::from(a), n));
+            }
+        }
+        for (k, chunk) in all.chunks(500).enumerate() {
+            let txs: Vec<EthPooledTransaction> = chunk.iter().map(|(s, n)| tx_hashed(*s, *n)).collect();
+            let hashes: Vec<B256> = txs.iter().map(|t| *t.hash()).collect();
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&(k as u64 + 1).to_be_bytes());
+            queue.push_frame(
+                txs,
+                Some(NewFrame { id: B256::from(id), hashes, members: chunk.to_vec(), gas: 21_000 * chunk.len() as u64 }),
+            );
+        }
+        assert_eq!(queue.frames_indexed(), all.len() / 500);
+        for round in 0..3u8 {
+            // The previous round's take given back, outside the timing.
+            drop(queue.best_for_build(B256::repeat_byte(0x30 + round)));
+            // Evict the caches: 1 GB written.
+            let mut junk = vec![0u8; 1 << 30];
+            for i in (0..junk.len()).step_by(4096) {
+                junk[i] = round;
+            }
+            std::hint::black_box(&junk);
+            drop(junk);
+            let at = std::time::Instant::now();
+            let (mut best, plan, times) = queue.frames_for_build_timed(B256::repeat_byte(0x40 + round), 163_000 * 21_000);
+            let selected = at.elapsed();
+            let at = std::time::Instant::now();
+            drop(queue.lock_inner());
+            let settled = at.elapsed();
+            let at = std::time::Instant::now();
+            let mut n = 0usize;
+            for t in best.by_ref() {
+                std::hint::black_box(&t);
+                n += 1;
+            }
+            let pulled = at.elapsed();
+            assert_eq!(plan.frames.len(), 326);
+            assert_eq!(n, 163_000);
+            eprintln!("round {round}: select {selected:?} {times:?}, lock after (the settle) {settled:?}, pull {n} {pulled:?}");
+            drop(best);
+            // The next build on another parent gives this one back.
+        }
     }
 }

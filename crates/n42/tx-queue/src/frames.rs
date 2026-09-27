@@ -134,12 +134,64 @@ impl FramePlan {
 
 /// A stretch of a frame with one sender at consecutive nonces.
 #[derive(Debug, Clone, Copy)]
-struct SenderRun {
-    sender: Address,
-    first_nonce: u64,
+pub(crate) struct SenderRun {
+    pub(crate) sender: Address,
+    pub(crate) first_nonce: u64,
     /// The run's first position in the frame.
-    start: u32,
-    len: u32,
+    pub(crate) start: u32,
+    pub(crate) len: u32,
+    /// How many positions of the same sender the frame holds before this
+    /// run: a build can take the frame whole only when this run starts
+    /// `before` nonces past the sender's lane head. Fixed at admission, so
+    /// the build's check is one comparison a run.
+    pub(crate) before: u32,
+}
+
+/// What [`FrameIndex::check_runs`] found of a frame against the lanes as
+/// they stand before a build takes anything.
+#[derive(Debug)]
+pub(crate) enum RunCheck<T: PoolTransaction> {
+    /// Only the per-transaction check can say (see [`ByRef::Slow`]).
+    Slow,
+    /// No build can take it whole, whatever the frames before it take: a
+    /// lane missing or parked, a transaction missing, a run below its
+    /// lane's head. `gas` is the frame's gas (for the cut decision).
+    Unusable {
+        /// The frame's transactions' gas.
+        gas: u64,
+    },
+    /// Takeable whole once, for each run in `below`, exactly that many of
+    /// its sender's lane entries have been taken by the frames before it
+    /// (and none of any other sender of it).
+    Ok {
+        /// The frame's transactions, the lanes' very `Arc`s.
+        txs: FrameTxs<T>,
+        /// Their gas limits' sum.
+        gas: u64,
+        /// (run index, sender, lane entries below the run's target) for
+        /// every run whose target is above its lane's head.
+        below: Vec<(u32, Address, u64)>,
+    },
+}
+
+/// What [`FrameIndex::check_by_ref`] found of a frame for a build.
+#[derive(Debug)]
+pub(crate) enum ByRef<T: PoolTransaction> {
+    /// Not decidable by reference (a frame noted without its transactions,
+    /// one that does not fit the gas left whole, or a lane holding another
+    /// allocation of one of its transactions): the per-transaction check.
+    Slow,
+    /// A build cannot take it whole: the same verdict the per-transaction
+    /// check reaches.
+    Unusable,
+    /// Every transaction is in its lane, at the lane's head in frame order,
+    /// unparked, and is the frame's own allocation; the whole frame fits.
+    Whole {
+        /// The frame's transactions, the lanes' very `Arc`s.
+        txs: FrameTxs<T>,
+        /// Their gas limits' sum.
+        gas: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -151,6 +203,9 @@ struct FrameEntry<T: PoolTransaction> {
     /// noted with them ([`crate::TxQueue::push_frame`]); `None` and
     /// [`crate::TxQueue::take_frames`] finds them in the lanes.
     txs: Option<FrameTxs<T>>,
+    /// The sum of `txs`' gas limits, summed once at admission (0 without
+    /// them): a build tests a whole frame against the gas left with it.
+    txs_gas: u64,
 }
 
 impl<T: PoolTransaction> FrameEntry<T> {
@@ -173,11 +228,23 @@ impl<T: PoolTransaction> FrameEntry<T> {
                 {
                     run.len += 1;
                 }
-                _ => runs.push(SenderRun { sender, first_nonce: nonce, start: at, len: 1 }),
+                _ => runs.push(SenderRun { sender, first_nonce: nonce, start: at, len: 1, before: 0 }),
             }
         }
         debug_assert_eq!(runs.iter().map(|run| run.len).sum::<u32>(), len);
-        Some((frame.id, Self { hashes: frame.hashes, runs, gas: frame.gas, txs }))
+        // A sender with more than one run in the frame: each later run
+        // counts the positions its earlier ones hold.
+        if runs.len() > 1 {
+            let mut seen: AddressHashMap<u32> = AddressHashMap::default();
+            for run in &mut runs {
+                let count = seen.entry(run.sender).or_insert(0);
+                run.before = *count;
+                *count += run.len;
+            }
+        }
+        let txs_gas =
+            txs.as_ref().map_or(0, |txs| txs.iter().map(|tx| tx.gas_limit()).fold(0u64, u64::saturating_add));
+        Some((frame.id, Self { hashes: frame.hashes, runs, gas: frame.gas, txs, txs_gas }))
     }
 
     /// Every position's (sender, nonce), in frame order.
@@ -297,6 +364,114 @@ impl<T: PoolTransaction> FrameIndex<T> {
             out.push((sender, nonce, *entry.hashes.get(at)?));
         }
         Some(out)
+    }
+
+    /// A frame build's check of frame `id` by reference: per sender run,
+    /// one lane look-up, the head's nonce against the run's, and the lane's
+    /// entries compared with the frame's own `Arc`s by pointer -- no
+    /// transaction is dereferenced, no gas summed, nothing allocated.
+    /// [`ByRef::Whole`] exactly when the per-transaction check of
+    /// `Inner::plan_frames` would take the frame whole; [`ByRef::Unusable`]
+    /// exactly when it would skip it; [`ByRef::Slow`] when only it can say
+    /// (see there).
+    pub(crate) fn check_by_ref(&self, id: &B256, lanes: &AddressHashMap<Lane<T>>, gas_left: u64) -> ByRef<T> {
+        let Some(entry) = self.frames.get(id) else { return ByRef::Slow };
+        let Some(txs) = entry.txs.as_ref() else { return ByRef::Slow };
+        if entry.txs_gas > gas_left {
+            return ByRef::Slow;
+        }
+        for run in &entry.runs {
+            let Some(lane) = lanes.get(&run.sender) else { return ByRef::Unusable };
+            if lane.parked.is_some() {
+                return ByRef::Unusable;
+            }
+            let head = lane.by_nonce.first_key_value().map(|(nonce, _)| *nonce);
+            if head.and_then(|head| head.checked_add(u64::from(run.before))) != Some(run.first_nonce) {
+                return ByRef::Unusable;
+            }
+            let Some(last) = run.first_nonce.checked_add(u64::from(run.len)) else { return ByRef::Slow };
+            let mut expect = run.first_nonce;
+            for (at, (&nonce, held)) in (run.start as usize..).zip(lane.by_nonce.range(run.first_nonce..last)) {
+                if nonce != expect {
+                    // A missing nonce: the per-position check finds no
+                    // transaction there.
+                    return ByRef::Unusable;
+                }
+                let Some(own) = txs.get(at) else { return ByRef::Slow };
+                if !Arc::ptr_eq(held, own) {
+                    // Another allocation: equal or not, the hashes decide.
+                    return ByRef::Slow;
+                }
+                expect += 1;
+            }
+            if expect != last {
+                return ByRef::Unusable;
+            }
+        }
+        ByRef::Whole { txs: Arc::clone(txs), gas: entry.txs_gas }
+    }
+
+    /// [`Self::check_by_ref`] against the lanes before a build takes
+    /// anything, so it can run for many frames at once (read-only, on the
+    /// worker pool). A run with `before` positions of its sender earlier in
+    /// the frame is takeable once its lane's head is its target, its first
+    /// nonce less `before`; the head only rises as the build takes, by exactly the
+    /// entries the earlier frames take, so the run needs the lane to hold
+    /// `target` and the build to have taken exactly the entries below it
+    /// (`below`). Every other failure is final: takes neither park a lane
+    /// nor put a transaction back, and a lane entry is some one frame's own
+    /// allocation, so no other frame's take removes one this frame holds.
+    pub(crate) fn check_runs(&self, id: &B256, lanes: &AddressHashMap<Lane<T>>) -> RunCheck<T> {
+        let Some(entry) = self.frames.get(id) else { return RunCheck::Slow };
+        let Some(txs) = entry.txs.as_ref() else { return RunCheck::Slow };
+        let unusable = RunCheck::Unusable { gas: entry.txs_gas };
+        let mut below = Vec::new();
+        for (idx, run) in entry.runs.iter().enumerate() {
+            let Some(lane) = lanes.get(&run.sender) else { return unusable };
+            if lane.parked.is_some() {
+                return unusable;
+            }
+            let Some((&head, _)) = lane.by_nonce.first_key_value() else { return unusable };
+            let Some(target) = run.first_nonce.checked_sub(u64::from(run.before)) else { return unusable };
+            if target < head {
+                return unusable;
+            }
+            let Some(last) = run.first_nonce.checked_add(u64::from(run.len)) else { return RunCheck::Slow };
+            let mut expect = run.first_nonce;
+            for (at, (&nonce, held)) in (run.start as usize..).zip(lane.by_nonce.range(run.first_nonce..last)) {
+                if nonce != expect {
+                    return unusable;
+                }
+                let Some(own) = txs.get(at) else { return RunCheck::Slow };
+                if !Arc::ptr_eq(held, own) {
+                    return RunCheck::Slow;
+                }
+                expect += 1;
+            }
+            if expect != last {
+                return unusable;
+            }
+            if run.before > 0 && !lane.by_nonce.contains_key(&target) {
+                return unusable;
+            }
+            if target > head {
+                let Ok(idx) = u32::try_from(idx) else { return RunCheck::Slow };
+                below.push((idx, run.sender, lane.by_nonce.range(head..target).count() as u64));
+            }
+        }
+        RunCheck::Ok { txs: Arc::clone(txs), gas: entry.txs_gas, below }
+    }
+
+    /// The gas of a frame's own transactions, summed at admission: `None`
+    /// for a frame not indexed or noted without its transactions.
+    pub(crate) fn txs_gas_of(&self, id: &B256) -> Option<u64> {
+        self.frames.get(id).filter(|entry| entry.txs.is_some()).map(|entry| entry.txs_gas)
+    }
+
+    /// A frame's sender runs and hashes, for the take after
+    /// [`Self::check_by_ref`].
+    pub(crate) fn runs_and_hashes(&self, id: &B256) -> Option<(&[SenderRun], &[B256])> {
+        self.frames.get(id).map(|entry| (entry.runs.as_slice(), entry.hashes.as_slice()))
     }
 
     /// The transactions a frame was noted with, shared: `None` for a frame

@@ -91,20 +91,69 @@ pub fn select<T: reth_transaction_pool::PoolTransaction>(
     parent: B256,
     gas_limit: u64,
 ) -> n42_tx_queue::QueueBest<T> {
-    if !active() {
-        return queue.best_for_build(parent);
-    }
-    let (best, plan) = queue.frames_for_build(parent, gas_limit);
-    if plan.frames.is_empty() {
-        // No frame a build could take whole (the funding block, a thin pool,
-        // transactions that came by RPC): the ordinary walk, and the seal
-        // gives the body the MPT root unless it turns out aligned anyway.
-        drop(best);
-        FRAME_BUILDS_WALKED.fetch_add(1, Ordering::Relaxed);
-        return queue.best_for_build(parent);
-    }
-    PLAN.with(|slot| *slot.borrow_mut() = Some(plan));
+    let mut times = SelectTimes::default();
+    let best = if active() {
+        let (best, plan, took) = queue.frames_for_build_timed(parent, gas_limit);
+        times.select_us = took.lock_us + took.begin_us;
+        times.walk_us = took.plan_us;
+        times.check_us = took.check_us;
+        times.by_ref = took.by_ref;
+        times.slow = took.slow;
+        if plan.frames.is_empty() {
+            // No frame a build could take whole (the funding block, a thin
+            // pool, transactions that came by RPC): the ordinary walk, and
+            // the seal gives the body the MPT root unless it turns out
+            // aligned anyway.
+            drop(best);
+            FRAME_BUILDS_WALKED.fetch_add(1, Ordering::Relaxed);
+            let at = std::time::Instant::now();
+            let best = queue.best_for_build(parent);
+            times.pull_us = at.elapsed().as_micros() as u64;
+            best
+        } else {
+            PLAN.with(|slot| *slot.borrow_mut() = Some(plan));
+            best
+        }
+    } else {
+        let at = std::time::Instant::now();
+        let best = queue.best_for_build(parent);
+        times.pull_us = at.elapsed().as_micros() as u64;
+        best
+    };
+    SELECT_TIMES.with(|slot| slot.set(times));
     best
+}
+
+/// Where the last [`select`] on this thread spent its time, in
+/// microseconds: the build's phase line splits `start_best_ms` with it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SelectTimes {
+    /// The queue's frame take opening: the lanes' lock and the build's
+    /// start under it (inbox drain, give-back, parked lanes readmitted).
+    pub select_us: u64,
+    /// The frame plan: the frames checked and taken
+    /// ([`n42_tx_queue::FrameSelectTimes::plan_us`]).
+    pub walk_us: u64,
+    /// Of `walk_us`, the parallel check of the frames the gas reaches.
+    pub check_us: u64,
+    /// The ordinary walk's opening when no frame was usable, or the mode
+    /// is off (`best_for_build`).
+    pub pull_us: u64,
+    /// Frames decided and taken by reference.
+    pub by_ref: usize,
+    /// Frames that needed the per-transaction check.
+    pub slow: usize,
+}
+
+std::thread_local! {
+    static SELECT_TIMES: std::cell::Cell<SelectTimes> = const {
+        std::cell::Cell::new(SelectTimes { select_us: 0, walk_us: 0, check_us: 0, pull_us: 0, by_ref: 0, slow: 0 })
+    };
+}
+
+/// The times [`select`] left on this thread, taken (reset to zero).
+pub fn take_select_times() -> SelectTimes {
+    SELECT_TIMES.with(|slot| slot.replace(SelectTimes::default()))
 }
 
 /// Builds under the flag that found no usable frame and walked the queue.

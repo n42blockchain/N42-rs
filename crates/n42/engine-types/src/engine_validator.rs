@@ -2019,8 +2019,23 @@ mod tests {
         crate::frame_blocks::with_active(true, || {
             let best = crate::frame_blocks::select(&queue, B256::repeat_byte(1), 7 * 21_000);
             let plan = crate::frame_blocks::take_plan().expect("a frame build leaves its plan");
+            // Every frame decided by reference (A, C whole, D cut; B passed
+            // over), none by the per-transaction check.
+            let times = crate::frame_blocks::take_select_times();
+            assert_eq!((times.by_ref, times.slow), (3, 0), "{times:?}");
+            // The build is handed the frame index's own allocations.
+            let handed: Vec<_> = best.collect();
+            let ids: Vec<B256> = plan.frames.iter().map(|frame| frame.id).collect();
+            let own: Vec<_> = queue
+                .take_frames(&ids)
+                .into_iter()
+                .zip(&plan.frames)
+                .flat_map(|(txs, frame)| txs.map(|txs| txs[..frame.taken].to_vec()).unwrap_or_default())
+                .collect();
+            assert_eq!(handed.len(), own.len());
+            assert!(handed.iter().zip(&own).all(|(a, b)| std::sync::Arc::ptr_eq(a, b)));
             let body: Vec<TransactionSigned> =
-                best.map(|queued| queued.transaction.transaction.inner().clone()).collect();
+                handed.iter().map(|queued| queued.transaction.transaction.inner().clone()).collect();
             let (want, layout) = frame_block_parts(&frames);
             assert_eq!(plan.skipped, 1, "frame B is behind a hole");
             assert_eq!(hashes_of(&body), hashes_of(&want), "the body is the frames end to end");

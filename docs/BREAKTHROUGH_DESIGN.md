@@ -841,3 +841,24 @@ fold 24 (the index build 14 -- 1 ms on the bench, memory-bound on the fleet like
 10 around it), seal 7. Both flags (`N42_FOLLOWER_BUILD_PATH=1`, `N42_FOLLOWER_ROOT_ON_BUILD_POOL=1`) join the
 bench line. Next: the leader's non-execution terms (start, fold, commit: 51 of the 114) and the follower's
 execution overhead (exec 72 against batches 35: the partition 10, the fold 13, ~14 other).
+
+### 10.33 The leader's terms and the follower's overhead, off the fleet (steps 6a and 5d)
+
+A correction to 10.32's reading: `shard_fold_ms` (the index build, 14) is measured before the seal, between the
+batches' join and the commit; `par_fold_ms` (24) starts after the commit and holds the work behind the seal
+(the receipts job, `take_cached`, withdrawals, the fee commit). So the seal's own chain is start 15 + prep 4
++ exec 33 + index 14 + commit 12 + seal 7 = ~85 of the 114, and ~29 is elsewhere in the build's run.
+
+Step 6a (e06753ec9..444387ada), bench: the parent's taken list is handed over whole when it matches the body
+position by position (forget 3.9-4.4 -> 0.9-1.3 ms); `N42_OUTPUT_INDEX_LIVE=1` (off) enters each batch's
+addresses into the shard indexes as the batch ends under per-shard `try_lock`s in rotated order, leaving the
+freeze with the conflict sums (freeze 1.0-1.8 -> 0.5-0.6 on the bench, the append's pool time up 2-9 -> 9-21;
+the fleet's 14 is where it should pay); the commit in two passes with the body read in the prep (4.9-5.9 ->
+1.1-1.2, the prep +1.8); `next_start_gap_ms` / `next_entry_gap_ms` name the seal-to-next-start gap on the child's
+line. (The bench had put every account in shard 0 -- `addr()`'s leading zero bytes -- and is fixed.)
+
+Step 5d (057e8143e..832bf1f9e), bench: the build-path import's pieces named (`exec_setup/keys/pre/post/sink/
+cached/residual/receipts/drop_ms`, `keys_ahead`); the keys in one parallel pass on the build pool, made ahead on
+the road with `N42_FOLLOWER_PARTITION_AHEAD=1`; the executor's pre/post on the calling thread beside the batches,
+the results in place (no 163k collect), the receipts beside the freeze; the root spawned at the execution's
+return (`root_gap_ms`). The call 62-63 -> 56 with the keys ahead. loop289: A / LIVE / Ab / LIVEb.

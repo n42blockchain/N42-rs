@@ -15,6 +15,7 @@ pub mod entry_view;
 mod flat;
 mod index;
 pub mod qmdb_compat;
+pub mod qmdb_ops;
 mod simd;
 
 use flat::FlatIndex;

@@ -9,6 +9,8 @@
 use std::io::Read;
 
 use crate::entry_store::Entries;
+use crate::qmdb_ops::LeafOps;
+pub use crate::qmdb_ops::QmdbOps;
 use crate::{Hash, NULL_HASH, TWIG_HEIGHT, TWIG_SIZE, hash_leaf, hash_node, null_level};
 
 const BITS_PREFIX: u8 = 0x03;
@@ -47,33 +49,50 @@ pub fn gov5_storage_key(address: &[u8; 20], slot: &[u8; 32]) -> Hash {
 /// non-zero balance uses a one-byte length followed by minimal big-endian bytes; non-empty code
 /// hash is stored verbatim. The first byte is the presence bitmap (nonce=1, balance=2, code=8).
 pub fn encode_gov5_account_value(nonce: u64, balance: &[u8; 32], code_hash: &Hash) -> Vec<u8> {
+    let mut value = Vec::with_capacity(gov5_account_value_len(nonce, balance, code_hash));
+    encode_gov5_account_value_into(&mut value, nonce, balance, code_hash);
+    value
+}
+
+/// An upper bound on [`encode_gov5_account_value`]'s length (exact but for
+/// the nonce, counted at its longest).
+fn gov5_account_value_len(nonce: u64, balance: &[u8; 32], code_hash: &Hash) -> usize {
     let balance_start = balance.iter().position(|byte| *byte != 0);
     let has_code = *code_hash != NULL_HASH && *code_hash != GOV5_EMPTY_CODE_HASH;
-    let mut value = Vec::with_capacity(
-        1 + if nonce == 0 { 0 } else { 10 }
-            + balance_start.map_or(0, |start| 1 + balance.len() - start)
-            + if has_code { 32 } else { 0 },
-    );
-    value.push(0);
+    1 + if nonce == 0 { 0 } else { 10 }
+        + balance_start.map_or(0, |start| 1 + balance.len() - start)
+        + if has_code { 32 } else { 0 }
+}
+
+/// [`encode_gov5_account_value`] appended to `out` -- a block's value arena
+/// ([`QmdbOps::push_with`]) -- instead of a buffer of its own.
+pub fn encode_gov5_account_value_into(out: &mut Vec<u8>, nonce: u64, balance: &[u8; 32], code_hash: &Hash) {
+    let balance_start = balance.iter().position(|byte| *byte != 0);
+    let has_code = *code_hash != NULL_HASH && *code_hash != GOV5_EMPTY_CODE_HASH;
+    let head = out.len();
+    out.push(0);
+    let mut present = 0u8;
     if nonce != 0 {
-        value[0] |= 1;
+        present |= 1;
         let mut remaining = nonce;
         while remaining >= 0x80 {
-            value.push((remaining as u8) | 0x80);
+            out.push((remaining as u8) | 0x80);
             remaining >>= 7;
         }
-        value.push(remaining as u8);
+        out.push(remaining as u8);
     }
     if let Some(start) = balance_start {
-        value[0] |= 2;
-        value.push((balance.len() - start) as u8);
-        value.extend_from_slice(&balance[start..]);
+        present |= 2;
+        out.push((balance.len() - start) as u8);
+        out.extend_from_slice(&balance[start..]);
     }
     if has_code {
-        value[0] |= 8;
-        value.extend_from_slice(code_hash);
+        present |= 8;
+        out.extend_from_slice(code_hash);
     }
-    value
+    if let Some(byte) = out.get_mut(head) {
+        *byte = present;
+    }
 }
 
 /// One deterministic QMDB mutation. `None` deactivates the current live slot for `key`.
@@ -782,7 +801,19 @@ struct Twig {
 
 impl Twig {
     fn new(nulls: &[Hash; TWIG_HEIGHT + 1]) -> Self {
-        let mut nodes = Box::new([NULL_HASH; 2 * TWIG_SIZE]);
+        Self::new_in(nulls, None)
+    }
+
+    /// An empty twig, its leaf tree written into `spare` (a tree an evicted
+    /// twig gave up) when there is one: the same nodes a fresh one holds.
+    fn new_in(nulls: &[Hash; TWIG_HEIGHT + 1], spare: Option<TwigNodes>) -> Self {
+        let mut nodes = match spare {
+            Some(mut nodes) => {
+                nodes.fill(NULL_HASH);
+                nodes
+            }
+            None => Box::new([NULL_HASH; 2 * TWIG_SIZE]),
+        };
         for (index, node) in nodes.iter_mut().enumerate().take(TWIG_SIZE).skip(1) {
             let depth = (u32::BITS - 1 - (index as u32).leading_zeros()) as usize;
             *node = nulls[TWIG_HEIGHT - depth];
@@ -890,23 +921,26 @@ fn mark_dirty(dirty: &mut Vec<u8>, twig_id: usize, level: u8) {
 
 /// The leaf hash of every operation that writes a value, on the worker pool
 /// when the `rayon` feature is on.
-fn leaf_hashes(operations: &[QmdbOperation]) -> Vec<Option<Hash>> {
+fn leaf_hashes<O: LeafOps + ?Sized>(operations: &O) -> Vec<Option<Hash>> {
+    let count = operations.op_count();
     // A chunk at a time, its leaves batched across the SIMD lanes.
-    let chunk = |operations: &[QmdbOperation]| -> Vec<Option<Hash>> {
-        let jobs: Vec<(&Hash, &[u8])> = operations
-            .iter()
-            .filter_map(|operation| operation.value.as_deref().map(|value| (&operation.key, value)))
+    let chunk = |chunk: usize| -> Vec<Option<Hash>> {
+        let range = chunk * LEAF_CHUNK..((chunk + 1) * LEAF_CHUNK).min(count);
+        let jobs: Vec<(&Hash, &[u8])> = range
+            .clone()
+            .filter_map(|i| operations.op_value(i).map(|value| (operations.op_key(i), value)))
             .collect();
         let mut hashes = vec![NULL_HASH; jobs.len()];
         crate::simd::hash_leaves(&jobs, &mut hashes);
         let mut hashes = hashes.into_iter();
-        operations.iter().map(|operation| operation.value.as_ref().and_then(|_| hashes.next())).collect()
+        range.map(|i| operations.op_value(i).and_then(|_| hashes.next())).collect()
     };
+    let chunks = count.div_ceil(LEAF_CHUNK);
     #[cfg(feature = "rayon")]
     {
         use rayon::prelude::*;
-        let pieces: Vec<Vec<Option<Hash>>> = operations.par_chunks(LEAF_CHUNK).map(chunk).collect();
-        let mut out = Vec::with_capacity(operations.len());
+        let pieces: Vec<Vec<Option<Hash>>> = (0..chunks).into_par_iter().map(chunk).collect();
+        let mut out = Vec::with_capacity(count);
         for piece in pieces {
             out.extend(piece);
         }
@@ -914,7 +948,7 @@ fn leaf_hashes(operations: &[QmdbOperation]) -> Vec<Option<Hash>> {
     }
     #[cfg(not(feature = "rayon"))]
     {
-        operations.chunks(LEAF_CHUNK).flat_map(chunk).collect()
+        (0..chunks).flat_map(chunk).collect()
     }
 }
 
@@ -925,16 +959,16 @@ fn leaf_hashes(operations: &[QmdbOperation]) -> Vec<Option<Hash>> {
 const LEAF_CHUNK: usize = 1024;
 
 /// The slot each operation's key currently occupies, if any.
-fn held_slots(index: &KeyIndex, entries: &Entries, operations: &[QmdbOperation]) -> Vec<Option<u64>> {
-    let held = |operation: &QmdbOperation| index.get(&operation.key, |slot| entries.key(slot as usize));
+fn held_slots<O: LeafOps + ?Sized>(index: &KeyIndex, entries: &Entries, operations: &O) -> Vec<Option<u64>> {
+    let held = |i: usize| index.get(operations.op_key(i), |slot| entries.key(slot as usize));
     #[cfg(feature = "rayon")]
     {
         use rayon::prelude::*;
-        operations.par_iter().with_min_len(LEAF_CHUNK).map(held).collect()
+        (0..operations.op_count()).into_par_iter().with_min_len(LEAF_CHUNK).map(held).collect()
     }
     #[cfg(not(feature = "rayon"))]
     {
-        operations.iter().map(held).collect()
+        (0..operations.op_count()).map(held).collect()
     }
 }
 
@@ -1253,7 +1287,17 @@ pub struct QmdbCompatTree {
     evicted_below: usize,
     /// Told before `apply_undo` cuts the entry file.
     truncation_guard: Option<std::sync::Arc<dyn TruncationGuard>>,
+    /// Leaf trees evicted twigs gave up, reused by the next twigs the tree
+    /// opens ([`TWIG_POOL_CAP`] at most): the tree evicts full twigs about
+    /// as fast as it opens new ones, so a 128 KiB tree is recycled instead of
+    /// freed on the eviction and allocated again on the append.
+    spare_twig_nodes: Vec<TwigNodes>,
 }
+
+/// The most evicted leaf trees a tree keeps for reuse: 128 MiB. A head move
+/// after a persistence batch evicts up to a few thousand at once; the rest
+/// go back to the caller ([`QmdbCompatTree::evict_twig_nodes_into`]).
+pub const TWIG_POOL_CAP: usize = 1024;
 
 impl std::fmt::Debug for QmdbCompatTree {
     /// Summary only. The leaf set is the whole world state, so printing it would
@@ -1287,6 +1331,7 @@ impl Clone for QmdbCompatTree {
             upper: std::sync::Mutex::new(self.upper.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()),
             evicted_below: self.evicted_below,
             truncation_guard: self.truncation_guard.clone(),
+            spare_twig_nodes: Vec::new(),
         }
     }
 }
@@ -1302,6 +1347,7 @@ impl QmdbCompatTree {
             upper: std::sync::Mutex::new(UpperTree::default()),
             evicted_below: 0,
             truncation_guard: None,
+            spare_twig_nodes: Vec::new(),
         }
     }
 
@@ -1418,6 +1464,7 @@ impl QmdbCompatTree {
             upper: std::sync::Mutex::new(UpperTree::default()),
             evicted_below: full,
             truncation_guard: None,
+            spare_twig_nodes: Vec::new(),
         };
         for slot in 0..n {
             if tree.entries.is_active(slot)
@@ -1790,14 +1837,45 @@ impl QmdbCompatTree {
             sorted.sort_unstable_by_key(|operation| operation.key);
             return self.apply_sorted_slice_phased(&sorted);
         }
-        let mut phases = ApplyPhases::default();
-        let at = std::time::Instant::now();
-        for pair in operations.windows(2) {
-            if pair[0].key == pair[1].key {
-                return Err(QmdbOperationError::DuplicateKey(pair[0].key));
+        self.apply_sorted_leaf_ops(operations)
+    }
+
+    /// [`Self::apply_sorted_slice_recorded`] on a block's operations in one
+    /// arena ([`QmdbOps`]), which a block record keeps for a re-apply after
+    /// a revert. Unsorted operations are sorted in a copy.
+    pub fn apply_ops_recorded(&mut self, operations: &QmdbOps) -> Result<(Hash, BlockUndo), QmdbOperationError> {
+        self.start_undo_recording();
+        match self.apply_ops_phased(operations) {
+            Ok((root, _)) => Ok((root, self.recording.take().unwrap_or_default())),
+            Err(error) => {
+                // A refused batch mutates nothing, so there is nothing to undo.
+                self.recording = None;
+                Err(error)
             }
         }
-        phases.ops = operations.len();
+    }
+
+    /// [`Self::apply_sorted_slice_phased`] on a [`QmdbOps`].
+    pub fn apply_ops_phased(&mut self, operations: &QmdbOps) -> Result<(Hash, ApplyPhases), QmdbOperationError> {
+        if !operations.is_sorted() {
+            let mut sorted = operations.clone();
+            sorted.sort();
+            return self.apply_ops_phased(&sorted);
+        }
+        self.apply_sorted_leaf_ops(operations)
+    }
+
+    /// The block apply on sorted operations, whichever form holds them.
+    fn apply_sorted_leaf_ops<O: LeafOps + ?Sized>(&mut self, operations: &O) -> Result<(Hash, ApplyPhases), QmdbOperationError> {
+        let mut phases = ApplyPhases::default();
+        let at = std::time::Instant::now();
+        for i in 1..operations.op_count() {
+            if operations.op_key(i - 1) == operations.op_key(i) {
+                return Err(QmdbOperationError::DuplicateKey(*operations.op_key(i - 1)));
+            }
+        }
+        let count = operations.op_count();
+        phases.ops = count;
         phases.sort_us = at.elapsed().as_micros() as u64;
         // The same mutations as `set`/`delete` one after another, with the
         // hashing taken out of the sequence. Per operation those hash a leaf,
@@ -1839,9 +1917,9 @@ impl QmdbCompatTree {
         // Room for the block's appends up front: a rehash of a multi-million
         // entry index in the middle of the block was part of the 75 ms the
         // structural writes took at 147,000 operations.
-        self.index.reserve(operations.len());
-        self.entries.reserve(operations.len());
-        let mut dirty: Vec<u8> = Vec::with_capacity(self.twigs.len() + operations.len() / TWIG_SIZE + 2);
+        self.index.reserve(count);
+        self.entries.reserve(count);
+        let mut dirty: Vec<u8> = Vec::with_capacity(self.twigs.len() + count / TWIG_SIZE + 2);
         // The slots the block retires, cleared on the worker pool: every
         // entry and every twig checks its own against a bitmap, instead of
         // 133,000 random writes in sequence.
@@ -1851,16 +1929,17 @@ impl QmdbCompatTree {
         let at = std::time::Instant::now();
         // The appends' index entries, inserted per shard afterwards; the
         // block's keys are distinct, so no operation reads one.
-        let mut appended: Vec<(Hash, u64)> = Vec::with_capacity(operations.len());
-        for ((operation, leaf), old_slot) in operations.iter().zip(leaves).zip(held) {
-            match (operation.value.as_deref(), leaf) {
+        let mut appended: Vec<(Hash, u64)> = Vec::with_capacity(count);
+        for ((i, leaf), old_slot) in (0..count).zip(leaves).zip(held) {
+            let key = *operations.op_key(i);
+            match (operations.op_value(i), leaf) {
                 (Some(value), Some(leaf)) => {
-                    let slot = self.append_deferred(operation.key, value, leaf, &mut dirty)?;
-                    appended.push((operation.key, slot));
+                    let slot = self.append_deferred(key, value, leaf, &mut dirty)?;
+                    appended.push((key, slot));
                 }
                 _ => {
                     if old_slot.is_some() {
-                        self.index.remove(&operation.key, |slot| self.entries.key(slot as usize));
+                        self.index.remove(&key, |slot| self.entries.key(slot as usize));
                     }
                 }
             }
@@ -2073,7 +2152,7 @@ impl QmdbCompatTree {
         }
         let nulls = null_level();
         while self.twigs.len() <= twig_id {
-            self.twigs.push(Twig::new(&nulls));
+            self.twigs.push(Twig::new_in(&nulls, self.spare_twig_nodes.pop()));
         }
     }
 
@@ -2102,16 +2181,21 @@ impl QmdbCompatTree {
         self.evict_twig_nodes_into(before, &mut released)
     }
 
-    /// [`Self::evict_twig_nodes`], handing the evicted leaf trees to `out`
-    /// instead of freeing them here, so a caller under a lock frees them after
-    /// letting it go: a persistence batch's worth of twigs is thousands of
-    /// 128 KiB frees at once.
+    /// [`Self::evict_twig_nodes`], keeping the evicted leaf trees for the
+    /// twigs the tree opens next ([`TWIG_POOL_CAP`] of them) and handing the
+    /// rest to `out` instead of freeing them here, so a caller under a lock
+    /// frees them after letting it go: a persistence batch's worth of twigs
+    /// is thousands of 128 KiB trees at once.
     pub fn evict_twig_nodes_into(&mut self, before: u64, out: &mut Vec<TwigNodes>) -> usize {
         let full = ((self.next_slot.min(before) as usize) / TWIG_SIZE).min(self.twigs.len());
         let mut evicted = 0;
         for twig in &mut self.twigs[self.evicted_below.min(full)..full] {
             if let Some(nodes) = twig.nodes.take() {
-                out.push(nodes);
+                if self.spare_twig_nodes.len() < TWIG_POOL_CAP {
+                    self.spare_twig_nodes.push(nodes);
+                } else {
+                    out.push(nodes);
+                }
                 evicted += 1;
             }
         }
@@ -3042,5 +3126,43 @@ mod undo_tests {
         tree.evict_twig_nodes(tree.next_slot());
         assert_eq!(tree.root(), never.root());
         assert_eq!(tree.prove(&key(150)), never.prove(&key(150)));
+    }
+
+    /// A block applied from one arena ([`QmdbOps`]) is the block applied
+    /// from owned operations: the same root, the same undo, the same slots;
+    /// and twigs opened on leaf trees recycled from evicted ones hash as
+    /// fresh ones do.
+    #[test]
+    fn arena_operations_and_recycled_twigs_change_nothing() {
+        let mut tree = QmdbCompatTree::new();
+        let mut owned = QmdbCompatTree::new();
+        let mut never = QmdbCompatTree::new();
+        let mut next = 0u64;
+        for block in 0..6u64 {
+            let mut ops = sets(1000 + next..1000 + next + 3000, 0xD0 ^ block as u8);
+            ops.extend(sets(block * 100..block * 100 + 50, 0xE0 ^ block as u8));
+            ops.push(QmdbOperation { key: key(block * 100 + 60), value: None });
+            ops.push(QmdbOperation { key: key(block * 100 + 61), value: Some(Vec::new()) });
+            next += 3000;
+            // Unsorted on purpose: both forms sort a copy.
+            let arena = QmdbOps::from(ops.as_slice());
+            let (root, undo) = tree.apply_ops_recorded(&arena).unwrap();
+            let (root_owned, undo_owned) = owned.apply_sorted_slice_recorded(&ops).unwrap();
+            assert_eq!((root, &undo), (root_owned, &undo_owned), "block {block}");
+            assert_eq!(never.apply_sorted_ops(ops).unwrap(), root);
+            // Revert and re-apply from the arena: the same slots and root.
+            tree.apply_undo(&undo).unwrap();
+            assert_eq!(tree.apply_ops_recorded(&arena).unwrap(), (root, undo));
+            tree.evict_twig_nodes(tree.next_slot());
+            owned.evict_twig_nodes(owned.next_slot());
+        }
+        assert_eq!(tree.root(), never.root());
+        assert_eq!(tree.root_full(), never.root());
+        assert_eq!(tree.prove(&key(17_500)), never.prove(&key(17_500)));
+        let duplicate = QmdbOps::from(vec![
+            QmdbOperation { key: key(1), value: None },
+            QmdbOperation { key: key(1), value: Some(vec![1]) },
+        ]);
+        assert_eq!(tree.apply_ops_recorded(&duplicate).map(|_| ()), Err(QmdbOperationError::DuplicateKey(key(1))));
     }
 }

@@ -1,0 +1,268 @@
+// Copyright (c) 2017-2025 N42 Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! A block's QMDB leaf operations in one arena.
+//!
+//! [`QmdbOperation`] owns its value, so a block of 163,000 operations is
+//! 163,000 allocations -- built on the root job, kept in the forest's record
+//! of the block, and freed when the record leaves the window: 4.5 million
+//! `free`s for a persistence batch of 28 blocks, beside the build's threads
+//! allocating (BREAKTHROUGH_DESIGN 10.38-10.39). [`QmdbOps`] keeps the same
+//! operations as two vectors -- every value in one byte buffer, and a key with
+//! the value's span per operation -- so building a block's operations is a
+//! handful of allocations and dropping them is two `free`s.
+
+use crate::qmdb_compat::QmdbOperation;
+use crate::Hash;
+
+/// The span `len` of a deletion (`value: None`).
+const DELETE: usize = usize::MAX;
+
+#[derive(Debug, Clone, Copy)]
+struct OpSpan {
+    key: Hash,
+    /// Where the value starts in [`QmdbOps::values`]; unused for a deletion.
+    start: usize,
+    /// The value's length, or [`DELETE`].
+    len: usize,
+}
+
+/// A block's leaf operations: the keys with each value's span, and every
+/// value in one buffer. The same operations as a `Vec<QmdbOperation>`
+/// ([`Self::to_operations`], `From`), in two allocations.
+#[derive(Clone, Default)]
+pub struct QmdbOps {
+    ops: Vec<OpSpan>,
+    values: Vec<u8>,
+}
+
+impl QmdbOps {
+    /// No operations.
+    pub const fn new() -> Self {
+        Self { ops: Vec::new(), values: Vec::new() }
+    }
+
+    /// Room for `ops` operations whose values total `value_bytes`.
+    pub fn with_capacity(ops: usize, value_bytes: usize) -> Self {
+        Self { ops: Vec::with_capacity(ops), values: Vec::with_capacity(value_bytes) }
+    }
+
+    /// How many operations.
+    pub fn len(&self) -> usize {
+        self.ops.len()
+    }
+
+    /// Whether there are none.
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+
+    /// The bytes every value holds together.
+    pub fn value_bytes(&self) -> usize {
+        self.values.len()
+    }
+
+    /// Appends an operation: `Some` writes the value, `None` deletes the key.
+    pub fn push(&mut self, key: Hash, value: Option<&[u8]>) {
+        match value {
+            Some(value) => self.push_with(key, |out| out.extend_from_slice(value)),
+            None => self.ops.push(OpSpan { key, start: self.values.len(), len: DELETE }),
+        }
+    }
+
+    /// Appends a write whose value `write` appends to the buffer it is given
+    /// (the arena itself: no allocation for the value).
+    pub fn push_with(&mut self, key: Hash, write: impl FnOnce(&mut Vec<u8>)) {
+        let start = self.values.len();
+        write(&mut self.values);
+        // A closure can only grow the buffer; saturating keeps a misbehaving
+        // one from producing a span that is not in it.
+        let len = self.values.len().saturating_sub(start);
+        self.ops.push(OpSpan { key, start, len });
+    }
+
+    /// The `index`th operation's key.
+    pub fn key(&self, index: usize) -> Option<&Hash> {
+        self.ops.get(index).map(|op| &op.key)
+    }
+
+    /// The `index`th operation: its key and its value (`None` for a deletion).
+    pub fn get(&self, index: usize) -> Option<(&Hash, Option<&[u8]>)> {
+        self.ops.get(index).map(|op| (&op.key, self.value_of(op)))
+    }
+
+    fn value_of(&self, op: &OpSpan) -> Option<&[u8]> {
+        if op.len == DELETE {
+            None
+        } else {
+            self.values.get(op.start..op.start + op.len)
+        }
+    }
+
+    /// Every operation in order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = (&Hash, Option<&[u8]>)> + '_ {
+        self.ops.iter().map(|op| (&op.key, self.value_of(op)))
+    }
+
+    /// Whether the keys are in ascending order.
+    pub fn is_sorted(&self) -> bool {
+        self.ops.is_sorted_by_key(|op| op.key)
+    }
+
+    /// Sorts the operations by key. Only the spans move; the values stay
+    /// where they were written.
+    pub fn sort(&mut self) {
+        #[cfg(feature = "rayon")]
+        {
+            use rayon::prelude::*;
+            self.ops.par_sort_unstable_by_key(|op| op.key);
+        }
+        #[cfg(not(feature = "rayon"))]
+        {
+            self.ops.sort_unstable_by_key(|op| op.key);
+        }
+    }
+
+    /// Joins pieces built apart (a worker pool's chunks) into one, in order.
+    pub fn concat(pieces: Vec<Self>) -> Self {
+        let ops = pieces.iter().map(Self::len).sum();
+        let bytes = pieces.iter().map(Self::value_bytes).sum();
+        let mut out = Self::with_capacity(ops, bytes);
+        for piece in pieces {
+            let base = out.values.len();
+            out.values.extend_from_slice(&piece.values);
+            out.ops.extend(piece.ops.iter().map(|op| OpSpan { start: op.start + base, ..*op }));
+        }
+        out
+    }
+
+    /// The operations as owned [`QmdbOperation`]s, a value allocation apiece.
+    pub fn to_operations(&self) -> Vec<QmdbOperation> {
+        self.iter().map(|(key, value)| QmdbOperation { key: *key, value: value.map(<[u8]>::to_vec) }).collect()
+    }
+}
+
+impl From<&[QmdbOperation]> for QmdbOps {
+    fn from(operations: &[QmdbOperation]) -> Self {
+        let bytes = operations.iter().map(|op| op.value.as_ref().map_or(0, Vec::len)).sum();
+        let mut out = Self::with_capacity(operations.len(), bytes);
+        for op in operations {
+            out.push(op.key, op.value.as_deref());
+        }
+        out
+    }
+}
+
+impl From<Vec<QmdbOperation>> for QmdbOps {
+    fn from(operations: Vec<QmdbOperation>) -> Self {
+        Self::from(operations.as_slice())
+    }
+}
+
+impl FromIterator<QmdbOperation> for QmdbOps {
+    fn from_iter<I: IntoIterator<Item = QmdbOperation>>(iter: I) -> Self {
+        let mut out = Self::new();
+        for op in iter {
+            out.push(op.key, op.value.as_deref());
+        }
+        out
+    }
+}
+
+impl PartialEq for QmdbOps {
+    /// The same operations in the same order, wherever their values sit.
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().eq(other.iter())
+    }
+}
+
+impl Eq for QmdbOps {}
+
+impl std::fmt::Debug for QmdbOps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QmdbOps").field("ops", &self.ops.len()).field("value_bytes", &self.values.len()).finish()
+    }
+}
+
+/// The operations a block apply reads: by index, key and value. Implemented
+/// by a slice of [`QmdbOperation`]s and by [`QmdbOps`], so the tree applies
+/// either without converting.
+pub(crate) trait LeafOps: Sync {
+    fn op_count(&self) -> usize;
+    fn op_key(&self, index: usize) -> &Hash;
+    fn op_value(&self, index: usize) -> Option<&[u8]>;
+}
+
+impl LeafOps for [QmdbOperation] {
+    fn op_count(&self) -> usize {
+        self.len()
+    }
+
+    fn op_key(&self, index: usize) -> &Hash {
+        &self[index].key
+    }
+
+    fn op_value(&self, index: usize) -> Option<&[u8]> {
+        self[index].value.as_deref()
+    }
+}
+
+impl LeafOps for QmdbOps {
+    fn op_count(&self) -> usize {
+        self.ops.len()
+    }
+
+    fn op_key(&self, index: usize) -> &Hash {
+        &self.ops[index].key
+    }
+
+    fn op_value(&self, index: usize) -> Option<&[u8]> {
+        self.value_of(&self.ops[index])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(n: u8) -> Hash {
+        let mut k = [0u8; 32];
+        k[0] = n.wrapping_mul(37);
+        k[31] = n;
+        k
+    }
+
+    fn sample() -> Vec<QmdbOperation> {
+        (0..40u8)
+            .map(|n| QmdbOperation {
+                key: key(n),
+                value: (n % 5 != 0).then(|| vec![n; (n % 9) as usize]),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn round_trips_through_the_owned_form() {
+        let ops = sample();
+        let arena = QmdbOps::from(ops.as_slice());
+        assert_eq!(arena.len(), ops.len());
+        assert_eq!(arena.to_operations(), ops);
+        assert_eq!(arena.iter().filter(|(_, v)| v.is_some_and(<[u8]>::is_empty)).count(), 4, "empty values stay values");
+        assert_eq!(arena.get(5), Some((&key(5), None)));
+        assert_eq!(arena.get(40), None);
+    }
+
+    #[test]
+    fn sorts_and_joins_like_the_owned_form() {
+        let mut ops = sample();
+        let (a, b) = ops.split_at(17);
+        let mut arena = QmdbOps::concat(vec![QmdbOps::from(a), QmdbOps::from(b), QmdbOps::new()]);
+        assert_eq!(arena, QmdbOps::from(ops.as_slice()));
+        assert!(!arena.is_sorted());
+        arena.sort();
+        ops.sort_unstable_by_key(|op| op.key);
+        assert!(arena.is_sorted());
+        assert_eq!(arena.to_operations(), ops);
+        assert_eq!(ops.into_iter().collect::<QmdbOps>(), arena);
+    }
+}

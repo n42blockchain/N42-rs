@@ -345,6 +345,11 @@ pub struct ForgetTimes {
     pub lock_us: u64,
     /// Splitting the taken list into mined and kept, under the lock.
     pub partition_us: u64,
+    /// Whether the taken list was the block's body, position by position
+    /// (the same sender and nonce at every index): then every transaction
+    /// in it is mined and the list is handed over whole, without the fold
+    /// or the partition. `partition_us` is the comparison's time then.
+    pub whole: bool,
 }
 
 /// How many transactions the queue let go of since the last report, by
@@ -1556,11 +1561,31 @@ impl<T: PoolTransaction> TxQueue<T> {
         let mut times = ForgetTimes::default();
         {
             let at = std::time::Instant::now();
-            let inner = self.lock_inner();
+            let mut inner = self.lock_inner();
             times.lock_us += at.elapsed().as_micros() as u64;
-            match inner.last_build.as_ref() {
-                Some((built_on, taken)) if *built_on == parent && !taken.is_empty() => {}
-                _ => return (Vec::new(), times),
+            let Some((built_on, taken)) = inner.last_build.as_mut() else { return (Vec::new(), times) };
+            if *built_on != parent || taken.is_empty() {
+                return (Vec::new(), times);
+            }
+            // The common case on a leader: the build took exactly the block
+            // it sealed, in body order (a frame build of a full block). Then
+            // every taken transaction's own (sender, nonce) is in the block,
+            // so the partition below would call every one of them mined, in
+            // order, and keep nothing: one parallel pass comparing the two
+            // lists position by position decides that, instead of folding
+            // 163,000 pairs into a map and then partitioning the list
+            // (docs/BREAKTHROUGH_DESIGN.md 10.32, `start_handoff_ms`).
+            if taken.len() == len {
+                let at = std::time::Instant::now();
+                let list: &[Arc<ValidPoolTransaction<T>>] = taken;
+                let whole = pool.install(|| {
+                    list.par_iter().with_min_len(1024).enumerate().all(|(i, t)| mined_at(i) == (t.sender(), t.nonce()))
+                });
+                times.partition_us = at.elapsed().as_micros() as u64;
+                if whole {
+                    times.whole = true;
+                    return (std::mem::take(taken), times);
+                }
             }
         }
         let at = std::time::Instant::now();
@@ -3703,6 +3728,52 @@ mod tests {
         assert_eq!(again, vec![(1, 2), (2, 1)]);
     }
 
+    /// A taken list that is the block's body position by position goes
+    /// whole (no fold, no partition) and leaves what the serial forget
+    /// leaves; one that differs anywhere takes the fold and partition.
+    #[test]
+    fn forget_mined_parallel_whole_body_is_the_serial_forget() {
+        let run = |parallel: bool, swap: bool| {
+            let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
+            let mut all = Vec::new();
+            for sender in 1..=30u8 {
+                for nonce in 0..5u64 {
+                    all.push(tx(sender, nonce));
+                }
+            }
+            queue.push(all);
+            let parent = B256::repeat_byte(5);
+            let mut best = queue.best_for_build(parent);
+            let taken: Vec<_> = std::iter::from_fn(|| best.next()).collect();
+            drop(best);
+            let mut mined: Vec<(Address, u64)> = taken.iter().map(|t| (t.sender(), t.nonce())).collect();
+            if swap {
+                // The same set, two positions exchanged: not whole.
+                mined.swap(0, 7);
+            }
+            let (dropped, whole) = if parallel {
+                let (dropped, times) = queue.forget_mined_parallel(parent, mined.len(), |i| mined[i]);
+                (dropped, times.whole)
+            } else {
+                (queue.forget_mined(parent, mined.iter().copied()), false)
+            };
+            let dropped: Vec<(u8, u64)> = dropped.iter().map(|t| (t.sender().as_slice()[0], t.nonce())).collect();
+            let mut best = queue.best_for_build(B256::repeat_byte(6));
+            let again: Vec<(u8, u64)> =
+                std::iter::from_fn(|| best.next()).map(|t| (t.sender().as_slice()[0], t.nonce())).collect();
+            (taken.len(), dropped, again, whole)
+        };
+        let serial = run(false, false);
+        assert_eq!(serial.1.len(), 150);
+        assert!(serial.2.is_empty());
+        let whole = run(true, false);
+        assert!(whole.3, "the body is the taken list: handed over whole");
+        assert_eq!((whole.0, &whole.1, &whole.2), (serial.0, &serial.1, &serial.2));
+        let swapped = run(true, true);
+        assert!(!swapped.3, "a body out of the taken list's order is partitioned");
+        assert_eq!((swapped.0, &swapped.1, &swapped.2), (serial.0, &serial.1, &serial.2));
+    }
+
     /// The hand-off on the queue's pool (`N42_BUILD_START_ASYNC=1`) forgets
     /// what the serial one does, in the same order, and leaves the same
     /// taken-but-unmined transactions for the next build.
@@ -4411,6 +4482,49 @@ mod tests {
             assert_eq!(taken.len(), 9);
             assert!(taken.iter().zip(&own).all(|(t, o)| Arc::ptr_eq(t, o)));
             assert_eq!(inner.len, 0);
+        }
+    }
+
+    /// The chained build's hand-off (`forget_mined_parallel`) for a full
+    /// block the build took exactly (163,000 transactions, 2,547 senders of
+    /// 64), caches cold: the taken list compared whole against the body
+    /// (`ForgetTimes::whole`) against the fold and partition (the same body
+    /// offered in another order). `cargo test -p n42-tx-queue --release --lib
+    /// -- --ignored bench_forget_whole --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_forget_whole() {
+        for round in 0..4u8 {
+            let whole = round % 2 == 1;
+            let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
+            let mut all = Vec::with_capacity(163_000);
+            for s in 0..2_547u64 {
+                let mut a = [0u8; 20];
+                a[..8].copy_from_slice(&(s.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1).to_be_bytes());
+                for n in 0..64u64 {
+                    all.push(tx_hashed(Address::from(a), n));
+                }
+            }
+            queue.push(all);
+            let parent = B256::repeat_byte(0x50 + round);
+            let mut best = queue.best_for_build(parent);
+            let mut body: Vec<(Address, u64)> = std::iter::from_fn(|| best.next()).map(|t| (t.sender(), t.nonce())).collect();
+            drop(best);
+            if !whole {
+                body.reverse();
+            }
+            let mut junk = vec![0u8; 1 << 30];
+            for i in (0..junk.len()).step_by(4096) {
+                junk[i] = round;
+            }
+            std::hint::black_box(&junk);
+            drop(junk);
+            let at = std::time::Instant::now();
+            let (mined, times) = queue.forget_mined_parallel(parent, body.len(), |i| body[i]);
+            let took = at.elapsed();
+            assert_eq!(mined.len(), body.len());
+            assert_eq!(times.whole, whole);
+            eprintln!("round {round}: whole {whole}: forget of {} in {took:?} {times:?}", mined.len());
         }
     }
 

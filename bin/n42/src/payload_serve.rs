@@ -623,6 +623,10 @@ struct BuildOnOwnTimes {
     queue_fold_us: u64,
     queue_lock_us: u64,
     queue_partition_us: u64,
+    /// The taken list was the block's body position by position and went
+    /// whole (`ForgetTimes::whole`): no fold, `queue_partition_us` is the
+    /// comparison.
+    queue_whole: bool,
 }
 
 /// The next block, built on a block this node built and consensus has just
@@ -715,8 +719,8 @@ async fn build_on_own_block(
                 .map(|(sender, tx)| (*sender, alloy_consensus::Transaction::nonce(tx)));
             queue.forget_mined_timed(built.block.header().parent_hash, mined)
         };
-        (times.queue_fold_us, times.queue_lock_us, times.queue_partition_us) =
-            (forget.fold_us, forget.lock_us, forget.partition_us);
+        (times.queue_fold_us, times.queue_lock_us, times.queue_partition_us, times.queue_whole) =
+            (forget.fold_us, forget.lock_us, forget.partition_us, forget.whole);
         // At info: `forgotten` far below `txs` is the shape of the queue
         // defect this pairs with -- the build's take was already given back
         // to the lanes by a second build on the same parent, so there is
@@ -1004,6 +1008,7 @@ async fn build_on_sealed_output(
         times.queue_fold_us = forget.fold_us;
         times.queue_lock_us = forget.lock_us;
         times.queue_partition_us = forget.partition_us;
+        times.queue_whole = forget.whole;
     }
     Ok((payload??, times, chain, want_hashes))
 }
@@ -1999,6 +2004,7 @@ where
                         queue_fold_us = times.queue_fold_us,
                         queue_lock_us = times.queue_lock_us,
                         queue_partition_us = times.queue_partition_us,
+                        queue_whole = times.queue_whole,
                         on_output = times.on_output,
                         rename_ms = times.rename_ms,
                         spawn_ms = times.spawn_ms,

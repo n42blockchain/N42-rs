@@ -563,3 +563,22 @@ time, and the slow tail (>300 ms: 41-45 a leg, doubling from window 1 to 3) is a
 under that overlap. **Section 4 next**: the execution's reads, on both sides, with `N42_PHASE_TIMERS=1` for the
 current shape first (the 2.3 us / 87% figures are from plan v4), and design A (the per-block read set) built in
 parallel; the CPU profile still needs `kernel.perf_event_paranoid=1` on the host.
+
+### 10.19 The execution timed (loop281, `N42_PHASE_TIMERS=1`): the reads are 0.57 us, and the timers see a third of the wall
+
+| leg | win1 | par_exec (wall) | par_run | exec_read (pool ms) | evm | write | other | reads: cache / provider / view | sealed_at |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| T | 1,064,180 | 59 | 70 | 215-269 | 19-20 | 27-29 | 9-10 | 326k / 72-97k / 20-66k | 128 |
+| Tb | 1,080,524 | 60 | 70 | 222-281 | 19-20 | 27-30 | 9-10 | 326k / 69-88k / 19-75k | 129 |
+| P100 (no timers) | 1,067,839 | 58 | 67 | - | - | - | - | - | 121 |
+
+The timers cost nothing visible. A full block makes ~490k account reads (three a transfer: 326k from the
+batches' own cache, 70-97k from the parent/grandparent outputs, 20-87k from the QMDB view), and they take
+215-281 ms of pool time -- **0.57 us a read, not plan v4's 2.3**: the index-mode parent output and the read
+view are not the contended structures they were. The reads are still 80% of what the timers see (read 281, evm
+20, write 30, other 10 = ~340 pool ms) -- but 340 pool ms on 16 threads is 21 ms of wall, and `par_exec` is
+59. Two thirds of the execution's wall is outside the timed transfer: the batches' spans are unequal or have
+gaps (the sender-group partition's balance, the batch's setup and its map, the sink's append 8, the pool's
+scheduling), and no field names it yet. So design A's ceiling on this shape is the read's ~280 pool ms (~15
+ms of wall at best), and the larger term is the batches' shape. Next: per-batch spans (max, min, CPU) on the
+phases line, then the read set (`N42_READ_SET=1`, built, untested until the box was free) in one leg.

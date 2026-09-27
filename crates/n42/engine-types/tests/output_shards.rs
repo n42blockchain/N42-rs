@@ -178,12 +178,30 @@ fn direct(db: &CacheDB<EmptyDB>, bundles: Vec<BundleState>, keep_cache: bool) ->
     (bundle, state)
 }
 
-/// Both modes: the v4 shard maps and the index over the batches' maps
-/// (`N42_OUTPUT_INDEX`).
-const MODES: [bool; 2] = [false, true];
+/// A fold mode: the v4 shard maps, the index over the batches' maps
+/// (`N42_OUTPUT_INDEX`), and that index entered by the batches as they end
+/// (`N42_OUTPUT_INDEX_LIVE`).
+#[derive(Clone, Copy, Debug)]
+struct Mode {
+    index: bool,
+    live: bool,
+}
 
-fn shards_of(bundles: Vec<BundleState>, count: usize, index: bool) -> FrozenShards {
-    let shards = OutputShards::with_index(beneficiary(), (BATCHES * PER_BATCH) as usize, count, index);
+impl std::fmt::Display for Mode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}{}", self.index, if self.live { " live" } else { "" })
+    }
+}
+
+const MODES: [Mode; 3] =
+    [Mode { index: false, live: false }, Mode { index: true, live: false }, Mode { index: true, live: true }];
+
+fn shards_with(count: usize, mode: Mode) -> OutputShards {
+    OutputShards::with_index_live(beneficiary(), (BATCHES * PER_BATCH) as usize, count, mode.index, mode.live)
+}
+
+fn shards_of(bundles: Vec<BundleState>, count: usize, index: Mode) -> FrozenShards {
+    let shards = shards_with(count, index);
     for bundle in bundles {
         shards.add(bundle);
     }
@@ -257,9 +275,9 @@ fn the_sharded_output_equals_the_staged_graft() {
 fn batches_writing_at_once_give_the_same_output() {
     let db = parent();
     let bundles = batch_bundles(&db);
-    let expected = sharded(&db, shards_of(bundles.clone(), 16, false));
+    let expected = sharded(&db, shards_of(bundles.clone(), 16, MODES[0]));
     for index in MODES {
-        let shards = OutputShards::with_index(beneficiary(), (BATCHES * PER_BATCH) as usize, 16, index);
+        let shards = shards_with(16, index);
         std::thread::scope(|scope| {
             for bundle in bundles.clone() {
                 let shards = &shards;
@@ -376,8 +394,8 @@ fn the_index_reads_roots_and_merge_equal_the_graft() {
     let bundles = batch_bundles(&db);
     let (expected, _) = direct(&db, bundles.clone(), false);
     for count in [1, 16, 64] {
-        let v4 = shards_of(bundles.clone(), count, false);
-        let indexed = shards_of(bundles.clone(), count, true);
+        let v4 = shards_of(bundles.clone(), count, MODES[0]);
+        let indexed = shards_of(bundles.clone(), count, MODES[1]);
         assert!(indexed.is_indexed() && !v4.is_indexed());
         assert_eq!(indexed.shard_count(), v4.shard_count());
         // The 16 shared recipients every batch pays (the system account is
@@ -448,7 +466,7 @@ fn every_path_with_withdrawals_to_conflicts_and_the_beneficiary_equals_the_direc
     assert!(expected.state.contains_key(&addr(9_000_001)) && expected.state.contains_key(&addr(88_000_000)));
     assert_same("direct, cache kept", &expected, &direct_paying(true));
     for index in MODES {
-        if index {
+        if index.index {
             assert!(shards_of(bundles.clone(), 16, index).index_conflicts() > 0, "the shared recipients are conflicts");
         }
         // The early seal.
@@ -529,8 +547,8 @@ fn the_batch_states_bundles_equal_the_states_through_the_index() {
     let direct_theirs = direct(&db, theirs.clone(), false).0;
     let direct_ours = direct(&db, ours.clone(), false).0;
     assert_same("direct graft", &direct_ours, &direct_theirs);
-    let indexed_theirs = sharded(&db, shards_of(theirs, 16, true));
-    let indexed_ours = sharded(&db, shards_of(ours, 16, true));
+    let indexed_theirs = sharded(&db, shards_of(theirs, 16, MODES[2]));
+    let indexed_ours = sharded(&db, shards_of(ours, 16, MODES[1]));
     assert_same("index", &indexed_ours, &indexed_theirs);
     assert_same("index against the graft", &indexed_ours, &direct_theirs);
 }

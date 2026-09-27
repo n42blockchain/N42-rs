@@ -96,6 +96,25 @@ pub fn output_index() -> bool {
     *ON.get_or_init(|| std::env::var("N42_OUTPUT_INDEX").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// `N42_OUTPUT_INDEX_LIVE=1` (index mode only): each batch enters its
+/// addresses into the shards' indexes as it ends, on its own thread with its
+/// map still in its cache, under a lock a shard taken in an order rotated by
+/// the batch's number (a busy shard passed over and come back to), so the
+/// freeze is left with the conflicts alone. The index build after the last
+/// batch was 14 ms on the fleet (1 on the bench) for ~9,000 inserts a task
+/// (docs/BREAKTHROUGH_DESIGN.md 10.32): the address lists read cold, on
+/// the leader's chain before the seal. The same index, conflicts and kept
+/// reverts come out, with the batches numbered in the order they began their
+/// inserts rather than the order they were pushed -- as arbitrary an order
+/// as that one, and the one every rule here is indifferent to. Off by
+/// default: under contention the batches' ends can wait on each other
+/// (loop273's first shape, whole accounts moved under such locks, waited
+/// 535-637 ms a block; an entry here is 22 bytes). Read once.
+pub fn output_index_live() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_OUTPUT_INDEX_LIVE").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// The index's mark for an account several batches wrote: it is read from
 /// the shard's conflicts map, not from a batch's.
 const CONFLICT: u16 = u16::MAX;
@@ -211,6 +230,9 @@ struct BatchOut {
     size: usize,
     /// Index mode: the beneficiary's credit this batch made.
     beneficiary_delta: U256,
+    /// Live index mode: the number the batch's index entries carry (its
+    /// position in the frozen output), `usize::MAX` when not entered.
+    live_id: usize,
 }
 
 /// One batch's map and reverts kept as the block's output (index mode).
@@ -283,7 +305,7 @@ impl Indexed {
 }
 
 /// What one index task built for its shard.
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct IndexPart {
     index: AddressHashMap<u16>,
     conflicts: AddressHashMap<BundleAccount>,
@@ -316,6 +338,11 @@ pub struct OutputShards {
     /// Index mode ([`output_index`]): the fold builds an index over the
     /// batches' maps instead of copying their accounts into shard maps.
     index: bool,
+    /// Live index mode ([`output_index_live`]): the shards' indexes, filled
+    /// by the batches as they end; `None` otherwise.
+    live: Option<Vec<Mutex<IndexPart>>>,
+    /// The next live batch number.
+    live_next: std::sync::atomic::AtomicUsize,
 }
 
 impl OutputShards {
@@ -329,8 +356,27 @@ impl OutputShards {
     /// [`Self::new`] with the mode given: `index` builds an index over the
     /// batches' maps at the fold, otherwise the accounts are copied into
     /// shard maps (v4).
-    pub fn with_index(beneficiary: Address, _capacity: usize, shards: usize, index: bool) -> Self {
+    pub fn with_index(beneficiary: Address, capacity: usize, shards: usize, index: bool) -> Self {
+        Self::with_index_live(beneficiary, capacity, shards, index, index && output_index_live())
+    }
+
+    /// [`Self::with_index`] with the live index ([`output_index_live`])
+    /// given: each shard's index sized for its share of `capacity` accounts
+    /// and a quarter more (a fuller shard's map grows as any map does).
+    pub fn with_index_live(beneficiary: Address, capacity: usize, shards: usize, index: bool, live: bool) -> Self {
         let count = shards.clamp(1, MAX_SHARDS);
+        let each = capacity / count + capacity / (4 * count) + 16;
+        let live = (index && live).then(|| {
+            (0..count)
+                .map(|_| {
+                    Mutex::new(IndexPart {
+                        index: AddressHashMap::with_capacity_and_hasher(each, Default::default()),
+                        kept: Vec::with_capacity(each),
+                        ..Default::default()
+                    })
+                })
+                .collect()
+        });
         Self {
             beneficiary,
             count,
@@ -338,6 +384,64 @@ impl OutputShards {
             contracts: Mutex::new(Default::default()),
             append_ns: AtomicU64::new(0),
             index,
+            live,
+            live_next: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// The live index's inserts for one batch (see [`output_index_live`]):
+    /// its addresses and kept reverts entered into every shard's index under
+    /// that shard's lock, the shards visited from `id` on and a busy one
+    /// passed over while another is free. `StagedGraft::add`'s rules as the
+    /// frozen index build applies them, the conflicting accounts' sums left
+    /// to the freeze (their order is the order of `drops`).
+    fn enter_live(
+        live: &[Mutex<IndexPart>],
+        id: u16,
+        accounts: &AddressHashMap<BundleAccount>,
+        reverts: &[(Address, AccountRevert)],
+        addresses: &[Vec<Address>],
+        revert_at: &[Vec<u32>],
+    ) {
+        let count = live.len();
+        let enter = |part: &mut IndexPart, shard: usize| {
+            let mut repeated: AddressHashSet = Default::default();
+            for address in addresses.get(shard).map_or(&[][..], Vec::as_slice) {
+                match part.index.entry(*address) {
+                    alloy_primitives::map::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(id);
+                    }
+                    alloy_primitives::map::hash_map::Entry::Occupied(mut held) => {
+                        let Some(account) = accounts.get(address) else { continue };
+                        repeated.insert(*address);
+                        part.size_less += account.size_hint();
+                        let first = *held.get();
+                        if first != CONFLICT {
+                            part.drops.push((first, *address));
+                            held.insert(CONFLICT);
+                        }
+                        part.drops.push((id, *address));
+                    }
+                }
+            }
+            for &pos in revert_at.get(shard).map_or(&[][..], Vec::as_slice) {
+                let Some((address, _)) = reverts.get(pos as usize) else { continue };
+                if repeated.is_empty() || !repeated.contains(address) {
+                    part.kept.push((id, pos));
+                }
+            }
+        };
+        let mut left: Vec<usize> = Vec::new();
+        for k in 0..count {
+            let shard = (id as usize + k) % count;
+            match live[shard].try_lock() {
+                Ok(mut part) => enter(&mut part, shard),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => enter(&mut poisoned.into_inner(), shard),
+                Err(std::sync::TryLockError::WouldBlock) => left.push(shard),
+            }
+        }
+        for shard in left {
+            enter(&mut live[shard].lock().unwrap_or_else(PoisonError::into_inner), shard);
         }
     }
 
@@ -399,7 +503,18 @@ impl OutputShards {
             }
             revert_at[shard_index(address, count)].push(at as u32);
         }
-        let out = BatchOut { accounts, reverts, addresses, revert_at, size, beneficiary_delta };
+        // Live index: numbered and entered now, on this thread. A block of
+        // more batches than an index entry can name is frozen the ordinary
+        // way (every batch's lists are kept either way).
+        let mut live_id = usize::MAX;
+        if let Some(live) = self.live.as_deref() {
+            let id = self.live_next.fetch_add(1, Ordering::Relaxed);
+            if id < CONFLICT as usize {
+                live_id = id;
+                Self::enter_live(live, id as u16, &accounts, &reverts, &addresses, &revert_at);
+            }
+        }
+        let out = BatchOut { accounts, reverts, addresses, revert_at, size, beneficiary_delta, live_id };
         self.batches.lock().unwrap_or_else(PoisonError::into_inner).push(out);
         self.append_ns.fetch_add(at.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
@@ -418,6 +533,14 @@ impl OutputShards {
         let batches = self.batches.into_inner().unwrap_or_else(PoisonError::into_inner);
         if self.index && batches.len() < CONFLICT as usize {
             let contracts = self.contracts.into_inner().unwrap_or_else(PoisonError::into_inner);
+            let mut batches = batches;
+            // Live: every batch numbered 0..n and entered, in number order.
+            batches.sort_unstable_by_key(|batch| batch.live_id);
+            let entered = batches.iter().enumerate().all(|(i, batch)| batch.live_id == i);
+            if let (Some(live), true) = (self.live, entered) {
+                let parts = live.into_iter().map(|part| part.into_inner().unwrap_or_else(PoisonError::into_inner)).collect();
+                return freeze_live(at, beneficiary, count, batches, contracts, self.append_ns.into_inner(), parts);
+            }
             return freeze_indexed(at, beneficiary, count, batches, contracts, self.append_ns.into_inner());
         }
         let transposed = std::time::Instant::now();
@@ -452,7 +575,7 @@ impl OutputShards {
         let split = fold_split(folded.iter().map(|(_, cost)| cost), at, transposed, done);
         let shards: Vec<Shard> = folded.into_iter().map(|(shard, _)| shard).collect();
         let fold_ns = at.elapsed().as_nanos() as u64;
-        log_folded(fold_ns, &split, None);
+        log_folded(fold_ns, &split, None, false);
         FrozenShards {
             beneficiary,
             shards,
@@ -497,11 +620,14 @@ fn fold_split<'a>(
 
 /// The "output shards folded" line: `shard_fold_ms` is the fold's wall in
 /// either mode; `index` (index build wall, conflicts) in index mode.
-fn log_folded(fold_ns: u64, split: &FoldSplit, index: Option<(u64, usize)>) {
+fn log_folded(fold_ns: u64, split: &FoldSplit, index: Option<(u64, usize)>, live: bool) {
     let (index_build_ns, index_conflicts) = index.unwrap_or((0, 0));
     tracing::info!(
         target: "payload_builder",
         index = u8::from(index.is_some()),
+        // `N42_OUTPUT_INDEX_LIVE=1`: the index was entered by the batches;
+        // `index_build_us` is then the conflicts' sums alone.
+        index_live = u8::from(live),
         shard_fold_ms = fold_ns / 1_000_000,
         fold_us = fold_ns / 1000,
         index_build_ms = index_build_ns / 1_000_000,
@@ -589,6 +715,69 @@ fn freeze_indexed(
         crate::parallel_transfer::build_pool().install(|| (0..count).into_par_iter().map(build).collect())
     };
     let done = std::time::Instant::now();
+    finish_indexed(at, transposed, done, beneficiary, count, batches, contracts, append_ns, built, false)
+}
+
+/// The live index's freeze ([`output_index_live`]): the indexes and kept
+/// reverts are built; what is left is the conflicting accounts' sums, one
+/// task a shard with any, in `drops` order -- the first batch's account
+/// cloned, every later one's change added, as [`freeze_indexed`] does.
+fn freeze_live(
+    at: std::time::Instant,
+    beneficiary: Address,
+    count: usize,
+    batches: Vec<BatchOut>,
+    contracts: B256HashMap<RevmBytecode>,
+    append_ns: u64,
+    parts: Vec<IndexPart>,
+) -> FrozenShards {
+    let transposed = std::time::Instant::now();
+    let batches_ref = &batches;
+    let sum = move |mut part: IndexPart| {
+        let probe = TaskProbe::start();
+        for (id, address) in &part.drops {
+            let Some(account) = batches_ref.get(*id as usize).and_then(|b| b.accounts.get(address)) else { continue };
+            match part.conflicts.get_mut(address) {
+                Some(staged) => {
+                    if let Some(info) = staged.info.as_mut() {
+                        add_delta(info, account);
+                    }
+                }
+                None => {
+                    part.conflicts.insert(*address, account.clone());
+                }
+            }
+        }
+        (part, probe.finish())
+    };
+    let built: Vec<(IndexPart, TaskCost)> = {
+        use rayon::prelude::*;
+        if parts.iter().any(|part| !part.drops.is_empty()) {
+            crate::parallel_transfer::build_pool().install(|| parts.into_par_iter().map(sum).collect())
+        } else {
+            parts.into_iter().map(|part| (part, TaskProbe::start().finish())).collect()
+        }
+    };
+    let done = std::time::Instant::now();
+    finish_indexed(at, transposed, done, beneficiary, count, batches, contracts, append_ns, built, true)
+}
+
+/// What both index freezes end with: the batches' maps kept as the output,
+/// the conflicting accounts taken out of them, the sizes and the
+/// beneficiary's credit summed.
+#[allow(clippy::too_many_arguments)]
+fn finish_indexed(
+    at: std::time::Instant,
+    transposed: std::time::Instant,
+    done: std::time::Instant,
+    beneficiary: Address,
+    count: usize,
+    batches: Vec<BatchOut>,
+    contracts: B256HashMap<RevmBytecode>,
+    append_ns: u64,
+    built: Vec<(IndexPart, TaskCost)>,
+    live: bool,
+) -> FrozenShards {
     let index_build_ns = done.duration_since(transposed).as_nanos() as u64;
     let split = fold_split(built.iter().map(|(_, cost)| cost), at, transposed, done);
     let mut state_size = 0usize;
@@ -606,12 +795,37 @@ fn freeze_indexed(
     let (mut index, mut conflicts, mut kept) =
         (Vec::with_capacity(count), Vec::with_capacity(count), Vec::with_capacity(count));
     let mut conflict_count = 0usize;
-    for (part, _) in built {
+    // The conflicting accounts leave the batches' maps: grouped by batch
+    // here (the pairs alone), removed a batch a task on the build pool --
+    // serial, the removals read ~9,000 cold map slots on the seal's path.
+    let mut drops_of: Vec<Vec<Address>> = vec![Vec::new(); kept_batches.len()];
+    for (part, _) in &built {
         for (id, address) in &part.drops {
-            if let Some(batch) = kept_batches.get_mut(*id as usize) {
-                batch.accounts.remove(address);
+            if let Some(list) = drops_of.get_mut(*id as usize) {
+                list.push(*address);
             }
         }
+    }
+    {
+        use rayon::prelude::*;
+        let removals: usize = drops_of.iter().map(Vec::len).sum();
+        if removals >= 1024 {
+            crate::parallel_transfer::build_pool().install(|| {
+                kept_batches.par_iter_mut().zip(drops_of.par_iter()).for_each(|(batch, list)| {
+                    for address in list {
+                        batch.accounts.remove(address);
+                    }
+                })
+            });
+        } else {
+            for (batch, list) in kept_batches.iter_mut().zip(&drops_of) {
+                for address in list {
+                    batch.accounts.remove(address);
+                }
+            }
+        }
+    }
+    for (part, _) in built {
         state_size = state_size.saturating_sub(part.size_less);
         conflict_count += part.conflicts.len();
         index.push(part.index);
@@ -619,7 +833,7 @@ fn freeze_indexed(
         kept.push(part.kept);
     }
     let fold_ns = at.elapsed().as_nanos() as u64;
-    log_folded(fold_ns, &split, Some((index_build_ns, conflict_count)));
+    log_folded(fold_ns, &split, Some((index_build_ns, conflict_count)), live);
     FrozenShards {
         beneficiary,
         shards: Vec::new(),

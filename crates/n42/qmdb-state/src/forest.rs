@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use alloy_primitives::{Address, B256};
 use n42_twig_core::qmdb_compat::{
     gov5_account_key, gov5_storage_key, BlockUndo, QmdbCompatTree, QmdbEntrySnapshot,
-    QmdbOperation, QmdbProof, QmdbSnapshot,
+    QmdbOperation, QmdbProof, QmdbSnapshot, TwigNodes,
 };
 use serde::{Deserialize, Serialize};
 
@@ -268,6 +268,47 @@ struct BlockRecord {
     /// the first persistence that uses it; `None` for a restored head and for
     /// a block persisted already.
     delta: Option<ForestDelta>,
+}
+
+/// What [`QmdbForest::set_canonical_releasing`] took out of the forest: the
+/// records of the blocks that fell out of the window and the leaf trees of
+/// the twigs it evicted. Dropping it frees them; the point is to drop it
+/// outside whatever lock guards the forest.
+#[derive(Default)]
+pub struct Released {
+    records: Vec<BlockRecord>,
+    twig_nodes: Vec<TwigNodes>,
+}
+
+impl Released {
+    /// Whether nothing was released.
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty() && self.twig_nodes.is_empty()
+    }
+
+    /// How many block records were released.
+    pub fn records(&self) -> usize {
+        self.records.len()
+    }
+
+    /// How many twig leaf trees were released.
+    pub fn twigs(&self) -> usize {
+        self.twig_nodes.len()
+    }
+
+    /// How many leaf operations the released records held.
+    pub fn operations(&self) -> usize {
+        self.records.iter().map(|record| record.ops.len()).sum()
+    }
+}
+
+impl std::fmt::Debug for Released {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Released")
+            .field("records", &self.records.len())
+            .field("twigs", &self.twig_nodes.len())
+            .finish()
+    }
 }
 
 /// Trees for recent blocks, keyed by block hash, over one shared tree.
@@ -805,6 +846,23 @@ impl QmdbForest {
     /// The head must already be held: a block becomes canonical only after it
     /// was validated, and validation is what files it.
     pub fn set_canonical(&mut self, block_hash: B256) -> Result<(), StateError> {
+        self.set_canonical_releasing(block_hash).map(drop)
+    }
+
+    /// [`Self::set_canonical`], handing what falls out of the window -- the
+    /// dropped blocks' records and the evicted twigs' leaf trees -- to the
+    /// caller instead of freeing it here, so a caller holding the forest
+    /// behind a lock frees it after the lock is released.
+    ///
+    /// The reader's keep ([`Self::set_keep_from`]) moves once per persistence
+    /// batch, so the first head move after a batch drops the whole batch at
+    /// once: ~44 blocks of 163,000 operations each (a value allocation apiece)
+    /// with their undos, and thousands of 128 KiB twig trees. Freed under the
+    /// node's forest lock that was the 300-975 ms "slow QMDB root" every ~44
+    /// blocks (loop291 P100: the leader's root job waited for the lock, its own
+    /// block reached its engine a second late, and the chained child's seal
+    /// waited 600-670 ms for the parent's fields; BREAKTHROUGH_DESIGN 10.38).
+    pub fn set_canonical_releasing(&mut self, block_hash: B256) -> Result<Released, StateError> {
         let number = self
             .records
             .get(&block_hash)
@@ -826,8 +884,14 @@ impl QmdbForest {
         if let Some(keep) = self.keep_from {
             cutoff = cutoff.min(keep.max(number.saturating_sub(self.reader_keep_cap)));
         }
-        self.records
-            .retain(|hash, record| record.number >= cutoff || *hash == block_hash);
+        let mut released = Released {
+            records: self
+                .records
+                .extract_if(|hash, record| record.number < cutoff && *hash != block_hash)
+                .map(|(_, record)| record)
+                .collect(),
+            twig_nodes: Vec::new(),
+        };
         if self.trim_twigs {
             // Full twigs no retained undo (nor the pending block's) can cut
             // into keep only their root and bits: the oldest cursor any of
@@ -839,9 +903,9 @@ impl QmdbForest {
                 .chain(self.pending.as_ref().map(|(_, undo)| undo.prev_next_slot))
                 .min()
                 .unwrap_or_else(|| self.tree.next_slot());
-            self.tree.evict_twig_nodes(oldest);
+            self.tree.evict_twig_nodes_into(oldest, &mut released.twig_nodes);
         }
-        Ok(())
+        Ok(released)
     }
 
     /// Whether full twigs below the retention window drop their leaf nodes on
@@ -1607,5 +1671,87 @@ mod tests {
         forest.set_canonical(h(7)).unwrap();
         assert!(!forest.contains(&h(2)), "released with the keep");
         assert!(forest.contains(&h(5)));
+    }
+
+    /// A reader's keep that moves by a whole persistence batch releases the
+    /// batch's records in one head move, and they come back to the caller
+    /// (to be freed off the lock) rather than being freed inside the move;
+    /// the tree computes on as before.
+    #[test]
+    fn a_batch_of_records_released_by_the_keep_comes_back_to_the_caller() {
+        let mut forest = QmdbForest::genesis(GENESIS, &BlockChanges::new()).unwrap().with_retain_depth(2);
+        let mut reference = QmdbForest::genesis(GENESIS, &BlockChanges::new()).unwrap().with_retain_depth(2);
+        forest.set_keep_from(Some(0));
+        let mut parent = GENESIS;
+        for n in 1..=10u8 {
+            forest.apply(parent, h(n), n as u64, &changes(n)).unwrap();
+            reference.apply(parent, h(n), n as u64, &changes(n)).unwrap();
+            let released = forest.set_canonical_releasing(h(n)).unwrap();
+            assert!(released.is_empty(), "the keep holds every block");
+            reference.set_canonical(h(n)).unwrap();
+            parent = h(n);
+        }
+        // The batch persisted: the reader's keep moves past blocks 1-7.
+        forest.set_keep_from(Some(8));
+        forest.apply(h(10), h(11), 11, &changes(11)).unwrap();
+        let released = forest.set_canonical_releasing(h(11)).unwrap();
+        assert_eq!(released.records(), 8, "genesis and blocks 1-7 fall out at once");
+        assert_eq!(released.operations(), 7, "one operation a block, none for the restored genesis");
+        assert!(!forest.contains(&h(7)));
+        assert!(forest.contains(&h(8)));
+        drop(released);
+        reference.apply(h(10), h(11), 11, &changes(11)).unwrap();
+        reference.set_canonical(h(11)).unwrap();
+        assert_eq!(forest.root_of(&h(11)), reference.root_of(&h(11)));
+        forest.apply(h(11), h(12), 12, &changes(12)).unwrap();
+        reference.apply(h(11), h(12), 12, &changes(12)).unwrap();
+        assert_eq!(forest.root_of(&h(12)), reference.root_of(&h(12)));
+    }
+
+    /// The cost the release moves off the lock, at fleet size:
+    /// `cargo test --release -p n42-qmdb-state --lib released_batch_cost -- --ignored --nocapture`
+    /// (`N42_RELEASE_BENCH=<blocks>x<operations>`, default 44x163000).
+    #[test]
+    #[ignore = "a measurement, several GB of memory"]
+    fn released_batch_cost() {
+        let (blocks, per_block) = std::env::var("N42_RELEASE_BENCH")
+            .ok()
+            .and_then(|spec| {
+                let (b, o) = spec.split_once('x')?;
+                Some((b.parse::<u64>().ok()?, o.parse::<u64>().ok()?))
+            })
+            .unwrap_or((44, 163_000));
+        let mut forest = QmdbForest::genesis(GENESIS, &BlockChanges::new()).unwrap();
+        forest.set_keep_from(Some(1));
+        let mut parent = GENESIS;
+        let mut key_seed = 0u64;
+        for n in 1..=blocks + 1 {
+            let ops = (0..per_block)
+                .map(|_| {
+                    key_seed += 1;
+                    let key = *alloy_primitives::keccak256(key_seed.to_be_bytes());
+                    QmdbOperation { key, value: Some(vec![n as u8; 72]) }
+                })
+                .collect();
+            let prepared = forest.compute_operations(parent, ops).unwrap();
+            let hash = B256::from(alloy_primitives::keccak256(n.to_be_bytes()));
+            forest.insert(hash, n, prepared).unwrap();
+            if n == blocks + 1 {
+                forest.set_keep_from(Some(blocks));
+            }
+            let at = std::time::Instant::now();
+            let released = forest.set_canonical_releasing(hash).unwrap();
+            let move_ms = at.elapsed().as_secs_f64() * 1e3;
+            let (records, twigs, operations) = (released.records(), released.twigs(), released.operations());
+            let at = std::time::Instant::now();
+            drop(released);
+            let free_ms = at.elapsed().as_secs_f64() * 1e3;
+            if n == blocks + 1 || n % 10 == 0 {
+                println!(
+                    "block {n}: head move (under the lock) {move_ms:.1} ms; released {records} records, {twigs} twigs, {operations} operations; free {free_ms:.1} ms"
+                );
+            }
+            parent = hash;
+        }
     }
 }

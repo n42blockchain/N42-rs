@@ -69,7 +69,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use alloy_primitives::{Address, B256};
 use n42_qmdb_state::{
-    BlockChanges, ForestCheckpoint, ForestDelta, ForestSnapshot, PreparedBlock, QmdbForest,
+    BlockChanges, ForestCheckpoint, ForestDelta, ForestSnapshot, PreparedBlock, QmdbForest, Released,
     StateError, StateProofProvider,
 };
 use n42_twig_core::qmdb_compat::QmdbProof;
@@ -223,6 +223,58 @@ const TABLES_OFF_READER_KEEP_CAP: u64 = 1024;
 /// How many canonical blocks apart the reader's lag is logged, so a leg's log
 /// carries its history rather than only its accidents.
 const READER_LAG_LOG_EVERY: u64 = 64;
+
+/// A release at least this many block records deep is logged at INFO (the
+/// first head move after a persistence batch); smaller ones at DEBUG.
+const RELEASE_LOG_RECORDS: usize = 4;
+
+/// Frees what a head move took out of the forest ([`Released`]) on a thread
+/// of its own, after the forest's lock is released: neither the lock nor the
+/// caller -- the canonical follower, a tokio task -- waits for the frees.
+///
+/// After a persistence batch the reader's keep moves by the whole batch, and
+/// the next head move drops ~44 blocks of 163,000 operations (a value
+/// allocation apiece), their undos and thousands of 128 KiB twig trees. Freed
+/// under the lock, that held every QMDB root behind it for 300-975 ms every
+/// ~44 blocks (loop291 P100): the leader's own block reached its engine a
+/// second late ("own block imported by header round_trip_ms=1003") and the
+/// chained child's seal waited 600-670 ms for the parent's fields.
+fn release_off_lock(head: u64, released: Released) {
+    use std::sync::mpsc::Sender;
+    use std::sync::OnceLock;
+    static RELEASER: OnceLock<Option<Mutex<Sender<(u64, Released)>>>> = OnceLock::new();
+    if released.is_empty() {
+        return;
+    }
+    let releaser = RELEASER.get_or_init(|| {
+        let (sender, receiver) = std::sync::mpsc::channel::<(u64, Released)>();
+        std::thread::Builder::new()
+            .name("n42-qmdb-release".into())
+            .spawn(move || {
+                for (head, released) in receiver {
+                    let (records, twigs, operations) = (released.records(), released.twigs(), released.operations());
+                    let started = std::time::Instant::now();
+                    drop(released);
+                    let free_ms = started.elapsed().as_millis() as u64;
+                    if records >= RELEASE_LOG_RECORDS {
+                        info!(target: "n42.qmdb", head, records, twigs, operations, free_ms, "freed the QMDB records a head move released, off the forest's lock");
+                    } else {
+                        debug!(target: "n42.qmdb", head, records, twigs, operations, free_ms, "freed the QMDB records a head move released, off the forest's lock");
+                    }
+                }
+            })
+            .ok()
+            .map(|_| Mutex::new(sender))
+    });
+    // Without the thread (it could not be spawned, or it is gone) the frees
+    // happen here: still after the forest's lock is released.
+    if let Some(sender) = releaser {
+        let sent = sender.lock().unwrap_or_else(std::sync::PoisonError::into_inner).send((head, released));
+        if let Err(std::sync::mpsc::SendError(unsent)) = sent {
+            drop(unsent);
+        }
+    }
+}
 
 fn entry_file_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1150,10 +1202,15 @@ impl QmdbNodeState {
         // below needs it, and this is the lock it is already under. (The
         // checkpoint path above runs only for the first canonical block of a
         // fresh log, where the lag is zero.)
-        let (number, ready) = self.with_forest(|forest| {
-            forest.set_canonical(block_hash)?;
-            Ok((forest.head().0, forest.take_block_deltas(cursor.head, cursor.next_slot, block_hash)))
+        // What falls out of the window is freed after the lock is let go and
+        // off this thread (`release_off_lock`): after a persistence batch it
+        // is the whole batch, and freed under the lock it held every build's
+        // and import's QMDB root for up to a second (BREAKTHROUGH_DESIGN 10.38).
+        let (number, ready, released) = self.with_forest(|forest| {
+            let released = forest.set_canonical_releasing(block_hash)?;
+            Ok((forest.head().0, forest.take_block_deltas(cursor.head, cursor.next_slot, block_hash), released))
         })?;
+        release_off_lock(number, released);
         self.inner.canonical_number.store(number, std::sync::atomic::Ordering::Relaxed);
         self.note_reader_lag();
         if let Some(deltas) = ready {
@@ -1182,10 +1239,11 @@ impl QmdbNodeState {
             }
             return Ok(());
         }
-        let delta = self.with_forest(|forest| {
-            forest.set_canonical(block_hash)?;
-            forest.delta_since(cursor.next_slot)
+        let (delta, released) = self.with_forest(|forest| {
+            let released = forest.set_canonical_releasing(block_hash)?;
+            Ok((forest.delta_since(cursor.next_slot)?, released))
         })?;
+        release_off_lock(number, released);
         // Rewriting the checkpoint costs the whole state, so it is worth doing
         // only once the log it replaces has grown to the same size. That bounds
         // what a restart has to replay, bounds the disk to twice the state, and

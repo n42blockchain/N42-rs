@@ -758,13 +758,17 @@ fn read_bytes<'a>(
     Ok(out)
 }
 
+/// A twig's leaf merkle tree, as [`QmdbCompatTree::evict_twig_nodes_into`]
+/// hands it out.
+pub type TwigNodes = Box<[Hash; 2 * TWIG_SIZE]>;
+
 #[derive(Clone)]
 struct Twig {
     /// The leaf merkle tree: `None` once the twig is evicted (full and below
     /// the retention window, `evict_twig_nodes`; or every slot dead,
     /// `trim_dead_twigs`), when only `leaf_root` is kept -- 32 B instead of
     /// 128 KiB. The entries rehash it (`twig_leaf_nodes`).
-    nodes: Option<Box<[Hash; 2 * TWIG_SIZE]>>,
+    nodes: Option<TwigNodes>,
     /// `nodes[1]`, kept when the nodes are not.
     leaf_root: Hash,
     bits: [u8; BITS_BYTES],
@@ -2094,10 +2098,20 @@ impl QmdbCompatTree {
     /// a transfer chain's state has none. Starts where the last call stopped;
     /// returns how many twigs this call evicted.
     pub fn evict_twig_nodes(&mut self, before: u64) -> usize {
+        let mut released = Vec::new();
+        self.evict_twig_nodes_into(before, &mut released)
+    }
+
+    /// [`Self::evict_twig_nodes`], handing the evicted leaf trees to `out`
+    /// instead of freeing them here, so a caller under a lock frees them after
+    /// letting it go: a persistence batch's worth of twigs is thousands of
+    /// 128 KiB frees at once.
+    pub fn evict_twig_nodes_into(&mut self, before: u64, out: &mut Vec<TwigNodes>) -> usize {
         let full = ((self.next_slot.min(before) as usize) / TWIG_SIZE).min(self.twigs.len());
         let mut evicted = 0;
         for twig in &mut self.twigs[self.evicted_below.min(full)..full] {
-            if twig.nodes.take().is_some() {
+            if let Some(nodes) = twig.nodes.take() {
+                out.push(nodes);
                 evicted += 1;
             }
         }

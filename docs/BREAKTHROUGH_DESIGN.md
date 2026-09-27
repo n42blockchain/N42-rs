@@ -822,3 +822,22 @@ vote's chain. The fix is the leader's own: the child's check and execution read 
 (as `ShardLayer` does for the chained build) and the merge is only for the engine's hand-off, off the chain.
 Then the follower's chain is road 33 + exec 69 + root 38 = ~140 with nothing waiting on a merge, and the vote
 lands at the road's end as in BASE (B ~55) with the fields 40 ms earlier than BASE's.
+
+### 10.32 The check on the shards (loop288): 1,167,824; the follower's fields at 133-139; the leader's seal binds again
+
+| leg | win1 | cycle | B | D | follower: road end / exec start / exec end / fields | exec (batches wall) / root | leader par_exec / sealed_at | win2 | imports > 600 ms |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| BP (first leg) | 1,019,331 | 160 | - | - | 31 / 24 / 103 / 155 | 75 (38) / 42 | 38 / 123 | 645k | 66 |
+| BPb | **1,167,824** | 132 | 51 | 44 | 26 / 19 / 93 / 139 | 72 (35) / 41 | 33 / 114 | 803k | 25 |
+| BASE | 1,143,003 | 142 | - | - | 38 / 42 / 125 / 170 | 81 (63) / 38 | 34 / 111 | 592k | 71 |
+| BPR (root on the build pool) | 1,162,069 | 130 | - | - | 26 / 19 / 94 / 133 | 72 (35) / 34 | 34 / 113 | 722k | 45 |
+
+With the child's check and execution on the parent's shards, B is back to 51 (106 in 10.31) and the build path
+wins: 1,162-1,168k against BASE's 1,143k, the fields at 133-139 (BASE 170), the second window 722-803k against
+592k. The follower's chain is now road 26 -> exec 19..93 -> root -> fields 133-139, under the cycle; **the
+leader's seal binds again**: D (the leader's wait after the quorum) is 44 and the cycle 132 = `sealed_at` 114 +
+~18. Inside the seal: start 15 (walk 8, hand-off 5), prep 4, exec 33 (two waves of ~17), commit 12 (body 6),
+fold 24 (the index build 14 -- 1 ms on the bench, memory-bound on the fleet like everything else here -- and
+10 around it), seal 7. Both flags (`N42_FOLLOWER_BUILD_PATH=1`, `N42_FOLLOWER_ROOT_ON_BUILD_POOL=1`) join the
+bench line. Next: the leader's non-execution terms (start, fold, commit: 51 of the 114) and the follower's
+execution overhead (exec 72 against batches 35: the partition 10, the fold 13, ~14 other).

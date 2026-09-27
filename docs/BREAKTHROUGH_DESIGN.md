@@ -1019,3 +1019,21 @@ parent's shards under the parent's residual and then the grandparent *as an exec
 hashed state) and through the engine's own loop -- sometimes not yet there 100 ms after the parent's seal.
 The follower already keeps two generations of shards for this (`FOLLOWER_SHARDS`); the leader's opener should
 read the grandparent's frozen shards the same way and touch the engine only from the great-grandparent down.
+
+### 10.41 The grandparent from its shards (loop294): the seal's median 90, its wait gone; the cycle's mean still 135
+
+| leg | win1 | cycle mean / median (w1) | sealed_at median / p90 / over 130 | state_wait_split (top) | gp_layer / ggp_missing | follower fields | imports > 600 ms | win2 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| P100 | 1,206,763 | 135 / 116 | 90 / 128 / 111 | 0/0/0/0 x1,179 | 1,176 / 8 | 104 | 26 | 863k |
+| P100b (slow kind, gate 21 ms) | 1,113,333 | 144 / 125 | 91 / 169 / 206 | 0/0/0/0 x1,175 | 1,175 / 10 | 114 | 58 | 825k |
+| P100c | 1,190,786 | 136 / 119 | 90 / 160 / 170 | 0/0/0/0 x1,168 | 1,166 / 23 | 104 | 39 | 798k |
+| P90 | 1,196,395 | 135 / 118 | 91 / 164 / 182 | 0/0/0/0 x1,170 | 1,170 / 14 | 106 | 44 | 722k |
+
+The child reads its grandparent from the kept shards in 1,166-1,176 of ~1,180 builds (8-23 fell back to the
+engine), the state wait is 0 in all but two or three builds a leg, the seal's median is 90 (100 before) and its
+tail narrowed (over 130: 111-206 against 257-418). The window did not follow (1,113-1,207k against 1,226k):
+the cycle's median in window 1 is 116-119 but its mean 135-136, and the seal's tail no longer explains the
+gap -- the followers' do: 26-58 imports over 600 ms a leg, each a half-second hole in the votes. What those
+imports wait on (10.18 read the slow tail as an unnamed residual under overlap; since then the build path, the
+early root, the shards and the frame scan changed the import) is the next read, on the follower's
+`build-path import` line and its timeline keys.

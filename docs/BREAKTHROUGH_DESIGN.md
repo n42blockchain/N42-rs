@@ -890,3 +890,21 @@ pacing tick 100 ms after n's proposal}: **the pacing tick in 187 of 217 blocks**
 7; and the proposal follows the last event by 23 ms (p75 43). The cycle is 125 = the pacing 100 + the leader's
 own 23-25 after the tick. So the chains are under the pacing and the pacing binds: 90, 80 and 70 ms next,
 and the leader's 23 ms from the tick to the send after that.
+
+### 10.35 The pacing followed down (loop290): nothing below 100
+
+| leg | pacing | win1 | cycle | occupancy | queued / gate us | leader sealed_at / par_exec | follower: road end / exec / fields | win2 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| P90 | 90 | 1,157,927 | 140 | 99.4% | 807k / 22,072 | 98 / 41 | 29 / 47 / 117 | 771k |
+| P80 | 80 | 1,126,904 | 142 | 98.2% | 824k / 22,830 | 96 / 39 | 28 / 44 / 113 | 313k (37% full) |
+| P70 | 70 | 1,186,265 | 135 | 97.9% | 773k / 13,371 | 94 / 37 | 26 / 43 / 107 | 803k |
+| P80b | 80 | 1,142,572 | 141 | 98.6% | 812k / 22,271 | 97 / 40 | 28 / 45 / 113 | 739k |
+
+Below 100 the cycle does not follow the pacing (135-142 against 125 at 100) and the window stays 1,127-1,186k
+(P70 ties the record with 98% occupancy): as 10.18 read it, a proposal made before the followers have the parent's
+fields only lengthens B, and the followers' fields are ready at 107-117 after the road's start -- the follower's
+chain (road 26-29, execution 43-47, root 33-35, ~15 of gaps) is the floor under the pacing, with the leader's
+seal at 94-98 beside it. The queue sits at the gate line again at 80-90 (807-824k, the gate 22 ms) and P80's
+second window collapsed to 37% full blocks. So the pacing stays at 100 and the terms are the two chains'
+overheads: the leader's tick-to-send (step 6b, in flight), and the follower's road (26-29 for what the design
+priced at ~5) and the gaps between its execution's end, its root and its fields.

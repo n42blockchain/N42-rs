@@ -1318,7 +1318,7 @@ where
     // Another node's block: executed here and handed to the
     // engine as executed, when configured. Any failure logs
     // and leaves the block to the engine's own path.
-    let mut direct_ms: Option<[u64; 29]> = None;
+    let mut direct_ms: Option<[u64; 31]> = None;
     // The block's transaction hashes, known once the direct
     // import converted the payload: the prune below then
     // needs no keccak over the raw bytes.
@@ -1527,6 +1527,8 @@ where
                         phases[22],
                         phases[23],
                         phases[24],
+                        phases[25],
+                        phases[26],
                     ]);
                 } else {
                     warn!(target: "n42.payload_serve", number, "direct import: the engine did not take the executed block; importing the ordinary way");
@@ -1589,6 +1591,8 @@ where
                 exec_threads = ms[26],
                 exec_batch_max_ms = ms[27],
                 exec_batch_median_ms = ms[28],
+                parent_output_wait_ms = ms[29],
+                parent_read = crate::follower_import::parent_read_name(ms[30]),
                 answered_ms = answered,
                 "direct import: answered before the engine's own pass"
             );
@@ -1770,6 +1774,8 @@ where
                     exec_threads = ms[26],
                     exec_batch_max_ms = ms[27],
                     exec_batch_median_ms = ms[28],
+                    parent_output_wait_ms = ms[29],
+                    parent_read = crate::follower_import::parent_read_name(ms[30]),
                     engine_ms = (started.elapsed().saturating_sub(decoded).as_millis() as u64).saturating_sub(ms[7]),
                     engine_remember_ms = remember_ms,
                     engine_listing_ms = listing_ms,

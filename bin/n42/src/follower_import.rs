@@ -179,76 +179,203 @@ fn publish_parent_output(block_hash: B256, header: reth_primitives_traits::Seale
 
 /// The last blocks executed here on the build path
 /// (`N42_FOLLOWER_BUILD_PATH=1`): the batches' frozen shards and the block's
-/// executor's residual laid over them, under the block's hash. The child's
-/// execution reads its parent through these ([`ShardLayer`] under the
-/// residual), as the leader's chained build reads its sealed parent
-/// (`opener_on_sealed_parent`), rather than through the merged bundle.
+/// executor's residual laid over them, under the block's hash, kept the moment
+/// the block's post-execution checks pass -- before the merge into one bundle
+/// and before the root. The child's includability check and its execution read
+/// their parent through these ([`ShardLayer`] under the residual, as the
+/// leader's chained build reads its sealed parent in `opener_on_sealed_parent`),
+/// so the merge the published output ([`PARENT_OUTPUTS`]) waits for is off the
+/// vote's chain.
 ///
 /// [`ShardLayer`]: n42_engine_types::output_shards::ShardLayer
-type KeptShards = (B256, Arc<n42_engine_types::output_shards::FrozenShards>, ParentOutput);
+type KeptShards =
+    (B256, reth_primitives_traits::SealedHeader, Arc<n42_engine_types::output_shards::FrozenShards>, ParentOutput);
 static FOLLOWER_SHARDS: Mutex<std::collections::VecDeque<KeptShards>> = Mutex::new(std::collections::VecDeque::new());
 
-/// How many blocks' shards are kept: the child reads only its parent's.
+/// How many blocks' shards are kept: the child reads its parent's, and under
+/// a backlog its grandparent's when that one's merge is not yet published.
 const FOLLOWER_SHARDS_KEPT: usize = 2;
 
-/// Keeps a block's shards and residual for its child's execution.
-fn keep_follower_shards(block_hash: B256, shards: Arc<n42_engine_types::output_shards::FrozenShards>, residual: ParentOutput) {
-    let mut kept = FOLLOWER_SHARDS.lock().unwrap_or_else(|p| p.into_inner());
-    kept.retain(|(hash, _, _)| *hash != block_hash);
-    while kept.len() >= FOLLOWER_SHARDS_KEPT {
-        kept.pop_front();
-    }
-    kept.push_back((block_hash, shards, residual));
+/// Whether the child's check and execution read a parent executed here on the
+/// build path through its shards the moment they are kept, instead of waiting
+/// for the published (merged) output. On by default;
+/// `N42_FOLLOWER_CHECK_ON_SHARDS=0` restores the wait for the merge.
+fn check_on_shards() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_CHECK_ON_SHARDS").map_or(true, |v| v != "0"))
 }
 
-/// The shards and residual kept for `block_hash`, if it was executed here on
-/// the build path.
-fn follower_shards_of(block_hash: B256) -> Option<(Arc<n42_engine_types::output_shards::FrozenShards>, ParentOutput)> {
+/// Keeps a block's shards and residual for its child's check and execution,
+/// and wakes a child waiting for them.
+fn keep_follower_shards(
+    block_hash: B256,
+    header: reth_primitives_traits::SealedHeader,
+    shards: Arc<n42_engine_types::output_shards::FrozenShards>,
+    residual: ParentOutput,
+) {
+    {
+        let mut kept = FOLLOWER_SHARDS.lock().unwrap_or_else(|p| p.into_inner());
+        kept.retain(|(hash, _, _, _)| *hash != block_hash);
+        while kept.len() >= FOLLOWER_SHARDS_KEPT {
+            kept.pop_front();
+        }
+        kept.push_back((block_hash, header, shards, residual));
+    }
+    note_import_landed();
+}
+
+/// The header, shards and residual kept for `block_hash`, if it was executed
+/// here on the build path and the shards are read ([`check_on_shards`]).
+fn follower_shards_of(block_hash: B256) -> Option<(reth_primitives_traits::SealedHeader, ParentLayer)> {
+    if !check_on_shards() {
+        return None;
+    }
     FOLLOWER_SHARDS
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .iter()
-        .find(|(hash, _, _)| *hash == block_hash)
-        .map(|(_, shards, residual)| (Arc::clone(shards), Arc::clone(residual)))
+        .find(|(hash, _, _, _)| *hash == block_hash)
+        .map(|(_, header, shards, residual)| (header.clone(), ParentLayer::Shards(Arc::clone(shards), Arc::clone(residual))))
 }
 
-/// The parent's header and published execution output, as soon as its
-/// execution ends; `None` as soon as `parent_in` says the parent is in
-/// the engine without one, or if neither happens within [`PARENT_WAIT`].
-/// Only this path publishes: a parent this node built, or one the engine
-/// imported by its own path, never appears, and waiting the whole
-/// [`PARENT_WAIT`] for it put three seconds before the child's vote. Behind
-/// a 350 ms cycle the child then missed its own import, went by the engine's
-/// path too, and so did every block after it (loop156 C1).
+/// A block's post-state as its child reads it before the engine holds it.
+#[derive(Debug, Clone)]
+enum ParentLayer {
+    /// The one bundle published after the execution (and, on the build path,
+    /// after the merge of the shards).
+    Merged(ParentOutput),
+    /// The build path's frozen shards under the executor's residual, kept
+    /// before the merge: the accounts `FrozenShards::merged` would hold.
+    Shards(Arc<n42_engine_types::output_shards::FrozenShards>, ParentOutput),
+}
+
+impl ParentLayer {
+    /// A sender's account after this block, `None` when the block did not
+    /// touch it: the residual over the shards, as the merge overlays them
+    /// (the newer info wins), and as [`ShardLayer`] under the residual's
+    /// overlay answers it.
+    ///
+    /// [`ShardLayer`]: n42_engine_types::output_shards::ShardLayer
+    fn account(&self, sender: &Address) -> Option<reth_primitives_traits::Account> {
+        match self {
+            Self::Merged(output) => account_after_parent(&output.state, sender),
+            Self::Shards(shards, residual) => account_after_parent(&residual.state, sender).or_else(|| {
+                shards.get(sender).map(|account| {
+                    account
+                        .info
+                        .as_ref()
+                        .map(|info| reth_primitives_traits::Account {
+                            nonce: info.nonce,
+                            balance: info.balance,
+                            bytecode_hash: None,
+                        })
+                        .unwrap_or_default()
+                })
+            }),
+        }
+    }
+
+    /// Its code on the import's timings: 1 merged, 2 shards (0: no layer, the
+    /// engine's state at the parent).
+    const fn code(&self) -> u64 {
+        match self {
+            Self::Merged(_) => 1,
+            Self::Shards(..) => 2,
+        }
+    }
+}
+
+/// The name of a [`ParentLayer`] code on the log lines (`parent_read`).
+pub const fn parent_read_name(code: u64) -> &'static str {
+    match code {
+        1 => "merged",
+        2 => "shards",
+        _ => "engine",
+    }
+}
+
+/// `layers` (newest first, each under its sealed header) over `historical`:
+/// consecutive merged outputs as one overlay, a block held as shards as a
+/// [`ShardLayer`] with its residual overlaid on top -- the chained build's
+/// layering (`opener_on_sealed_parent`).
+///
+/// [`ShardLayer`]: n42_engine_types::output_shards::ShardLayer
+fn open_on_layers(
+    historical: reth_provider::StateProviderBox,
+    layers: &[(reth_primitives_traits::SealedHeader, ParentLayer)],
+) -> reth_provider::StateProviderBox {
+    use n42_engine_types::direct_build::{executed_from_output, overlay_on_executed};
+    let mut state = historical;
+    // Merged outputs still to be laid over `state`, newest first.
+    let mut pending: Vec<n42_engine_types::direct_build::ExecutedParent> = Vec::new();
+    for (header, layer) in layers.iter().rev() {
+        match layer {
+            ParentLayer::Merged(output) => pending.insert(0, executed_from_output(header, Arc::clone(output))),
+            ParentLayer::Shards(shards, residual) => {
+                if !pending.is_empty() {
+                    state = overlay_on_executed(state, std::mem::take(&mut pending));
+                }
+                let shard_layer: reth_provider::StateProviderBox =
+                    Box::new(n42_engine_types::output_shards::ShardLayer::new(state, Arc::clone(shards)));
+                state = overlay_on_executed(shard_layer, vec![executed_from_output(header, Arc::clone(residual))]);
+            }
+        }
+    }
+    if pending.is_empty() { state } else { overlay_on_executed(state, pending) }
+}
+
+/// The parent's header and post-state the moment it is readable without the
+/// engine: its shards when it was executed here on the build path (kept
+/// before the merge, [`keep_follower_shards`]), else its published output;
+/// `None` as soon as `parent_in` says the parent is in the engine without
+/// either, or if neither happens within [`PARENT_WAIT`]. Only this path keeps
+/// or publishes: a parent this node built, or one the engine imported by its
+/// own path, never appears, and waiting the whole [`PARENT_WAIT`] for it put
+/// three seconds before the child's vote. Behind a 350 ms cycle the child then
+/// missed its own import, went by the engine's path too, and so did every
+/// block after it (loop156 C1).
 ///
 /// The parent's execution *fields* are not waited for here: they complete
 /// with its QMDB root, and the whole point is that the child's includability
 /// check runs while that root is computed. The comparison that needs them
 /// ([`wait_for_parent_fields`]) waits for them before the vote.
-fn wait_for_parent_output(
+fn wait_for_parent_layer(
     parent_hash: B256,
     parent_in: impl Fn() -> bool,
-) -> Option<(reth_primitives_traits::SealedHeader, ParentOutput)> {
-    wait_for_output_within(parent_hash, parent_in, PARENT_WAIT)
+) -> Option<(reth_primitives_traits::SealedHeader, ParentLayer)> {
+    wait_for_layer_within(parent_hash, parent_in, PARENT_WAIT, layer_of)
 }
 
-/// [`wait_for_parent_output`] with the wait bounded by `wait`.
+/// A block's layer for its descendant's check and execution: its shards when
+/// held, else its published output.
+fn layer_of(hash: B256) -> Option<(reth_primitives_traits::SealedHeader, ParentLayer)> {
+    follower_shards_of(hash).or_else(|| published_output(hash).map(|(header, output)| (header, ParentLayer::Merged(output))))
+}
+
+/// The parent's published (merged) output, waited for up to `wait`: what a
+/// build on a peer's block reads ([`published_ancestry`]).
 fn wait_for_output_within(
     parent_hash: B256,
     parent_in: impl Fn() -> bool,
     wait: std::time::Duration,
 ) -> Option<(reth_primitives_traits::SealedHeader, ParentOutput)> {
+    wait_for_layer_within(parent_hash, parent_in, wait, published_output)
+}
+
+/// Waits up to `wait` for `find` to answer for `parent_hash`, woken by every
+/// landing ([`note_import_landed`]) and polling every 20 ms; `None` as soon
+/// as `parent_in` says the parent is in the engine.
+fn wait_for_layer_within<T>(
+    parent_hash: B256,
+    parent_in: impl Fn() -> bool,
+    wait: std::time::Duration,
+    find: impl Fn(B256) -> Option<T>,
+) -> Option<T> {
     let deadline = std::time::Instant::now() + wait;
     let (count, landed) = &IMPORT_LANDED;
     let mut seen = *count.lock().unwrap_or_else(|p| p.into_inner());
     loop {
-        let found = PARENT_OUTPUTS
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .find(|(hash, _, _)| *hash == parent_hash)
-            .map(|(_, header, output)| (header.clone(), Arc::clone(output)));
-        if let Some(found) = found {
+        if let Some(found) = find(parent_hash) {
             return Some(found);
         }
         if parent_in() {
@@ -369,8 +496,8 @@ fn account_after_parent(bundle: &reth_revm::db::BundleState, sender: &Address) -
 /// agree by construction.
 #[derive(Debug, Clone, Copy)]
 struct ParentBundles<'a> {
-    /// The parent's bundle first, then its parent's, ...
-    stack: &'a [&'a reth_revm::db::BundleState],
+    /// The parent's layer first, then its parent's, ...
+    stack: &'a [&'a ParentLayer],
     /// The nearest ancestor in the engine: where a read that none of the
     /// bundles answers goes.
     anchor: B256,
@@ -380,7 +507,7 @@ impl ParentBundles<'_> {
     /// A sender's account after the newest bundle that touched it, or `None`
     /// when none did -- in which case the ancestor's state has it unchanged.
     fn account(&self, sender: &Address) -> Option<reth_primitives_traits::Account> {
-        self.stack.iter().find_map(|bundle| account_after_parent(bundle, sender))
+        self.stack.iter().find_map(|layer| layer.account(sender))
     }
 }
 
@@ -881,25 +1008,19 @@ struct Ancestry {
     /// The parent first, then its parent, ... -- the order reth's overlay
     /// expects (`memory_overlay.rs`: "Expected order is newest to oldest") and
     /// the order a read has to take them in.
-    outputs: Vec<(reth_primitives_traits::SealedHeader, ParentOutput)>,
+    ///
+    /// Each is the block's shards under its residual when it was executed here
+    /// on the build path and they are still kept, else its merged output.
+    outputs: Vec<(reth_primitives_traits::SealedHeader, ParentLayer)>,
     /// The nearest ancestor in the engine, whose state a read none of the
     /// bundles answers falls through to.
     anchor: B256,
 }
 
 impl Ancestry {
-    /// The bundles, newest first, for the includability check.
-    fn bundles(&self) -> Vec<&reth_revm::db::BundleState> {
-        self.outputs.iter().map(|(_, output)| &output.state).collect()
-    }
-
-    /// The same outputs as executed blocks, newest first, for the overlay the
-    /// execution reads.
-    fn executed(&self) -> Vec<n42_engine_types::direct_build::ExecutedParent> {
-        self.outputs
-            .iter()
-            .map(|(header, output)| n42_engine_types::direct_build::executed_from_output(header, Arc::clone(output)))
-            .collect()
+    /// The layers, newest first, for the includability check.
+    fn layers(&self) -> Vec<&ParentLayer> {
+        self.outputs.iter().map(|(_, layer)| layer).collect()
     }
 }
 
@@ -913,7 +1034,7 @@ impl Ancestry {
 fn ancestry_of<Provider>(
     provider: &Provider,
     parent: &reth_primitives_traits::SealedHeader,
-    output: &ParentOutput,
+    layer: &ParentLayer,
     genesis: &alloy_genesis::Genesis,
     deferred: bool,
     number: u64,
@@ -921,7 +1042,7 @@ fn ancestry_of<Provider>(
 where
     Provider: StateProviderFactory + HeaderProvider<Header = alloy_consensus::Header> + Sync,
 {
-    let mut outputs = vec![(parent.clone(), Arc::clone(output))];
+    let mut outputs = vec![(parent.clone(), layer.clone())];
     let mut anchor = parent.parent_hash;
     loop {
         match parent_in(provider, anchor, genesis, deferred) {
@@ -937,7 +1058,7 @@ where
             decline_on_output(number, "more unimported ancestors than there are published outputs");
             return None;
         }
-        let Some((header, published)) = published_output(anchor) else {
+        let Some((header, published)) = layer_of(anchor) else {
             decline_on_output(number, "an ancestor is neither in the engine nor published here");
             return None;
         };
@@ -973,7 +1094,7 @@ where
 fn overlay_parent(
     ancestry: &Ancestry,
     number: u64,
-) -> Option<(B256, Vec<n42_engine_types::direct_build::ExecutedParent>)> {
+) -> Option<(B256, Vec<(reth_primitives_traits::SealedHeader, ParentLayer)>)> {
     if hashed_state_enabled() {
         // A setting, not a property of this block, so it is said once: with
         // the pass on every block would otherwise print a refusal, and the
@@ -989,7 +1110,7 @@ fn overlay_parent(
         });
         return None;
     }
-    Some((ancestry.anchor, ancestry.executed()))
+    Some((ancestry.anchor, ancestry.outputs.clone()))
 }
 
 struct ImportStage(u64);
@@ -1192,6 +1313,13 @@ struct RoadPhases {
     /// the wait alone for the parent's execution fields -- what the vote on
     /// this block waited for the parent's QMDB root. Not in the line's sum.
     parent_fields_wait_us: u64,
+    /// Of `parent_wait_us`: the wait for the parent's output (its shards on
+    /// the build path, else its published bundle) that the includability
+    /// check and the early execution read. Not in the line's sum.
+    parent_output_wait_us: u64,
+    /// What the check read the parent through: 0 the engine, 1 the merged
+    /// output, 2 the shards ([`parent_read_name`]).
+    parent_read: u64,
 }
 
 /// The one line a bench leg greps: where a block's road to this node's vote
@@ -1258,6 +1386,8 @@ fn log_vote_road(road: VoteRoad, number: u64, txs: usize, phases: RoadPhases) {
         check_ms = phases.check_us / 1000,
         fields_ms = phases.fields_us / 1000,
         parent_fields_wait_ms = phases.parent_fields_wait_us / 1000,
+        parent_output_wait_ms = phases.parent_output_wait_us / 1000,
+        parent_read = parent_read_name(phases.parent_read),
         other_ms = total.saturating_sub(named) / 1000,
         total_ms = total / 1000,
         "vote road"
@@ -1594,22 +1724,34 @@ where
     // The parent: in, and under deferred execution executed here, since the
     // header's fields are checked against its result and the transactions
     // against its post-state.
+    //
+    // Under the build path the parent's layer is its shards the moment its
+    // execution's post-execution checks pass, not its published output, which
+    // waits for the merge of those shards (45 ms on one thread, section 10.31
+    // of `docs/BREAKTHROUGH_DESIGN.md`): the merge is then only the engine's
+    // hand-off, and nothing on the vote's chain waits for it.
     let parent_at = std::time::Instant::now();
     let (parent, parent_output) = match parent_known {
         Some(parent) => (parent, None),
         None => match (deferred && publish_parent_outputs())
             .then(|| {
-                wait_for_parent_output(parent_hash, || {
+                wait_for_parent_layer(parent_hash, || {
                     parent_in(provider, parent_hash, chain_spec.genesis(), deferred).ok().flatten().is_some()
                 })
             })
             .flatten()
         {
-            Some((parent, output)) => (parent, Some(output)),
+            Some((parent, layer)) => (parent, Some(layer)),
             None => (wait_for_parent(provider, parent_hash, chain_spec.genesis(), deferred)?, None),
         },
     };
     phases.parent_wait_us = parent_at.elapsed().as_micros() as u64;
+    // What the check and the early execution waited for the parent's output
+    // (its shards or its merged bundle), and which one they read.
+    let parent_read = parent_output.as_ref().map_or(0, ParentLayer::code);
+    phases.parent_output_wait_us = if parent_output.is_some() { phases.parent_wait_us } else { 0 };
+    phases.parent_read = parent_read;
+    let parent_output_wait_ms = phases.parent_output_wait_us / 1000;
     let against_parent = || validate_against_parent(consensus, recovered.sealed_header(), &parent);
 
     // How long this import waited for its parent to be *canonical in the
@@ -1637,7 +1779,7 @@ where
         wait_for_parent(provider, parent_hash, chain_spec.genesis(), deferred)?;
         parent_engine_wait_us += wait_at.elapsed().as_micros() as u64;
     }
-    let stack = ancestry.as_ref().map(Ancestry::bundles);
+    let stack = ancestry.as_ref().map(Ancestry::layers);
     let parent_state = match (&stack, &ancestry) {
         (Some(stack), Some(ancestry)) => Some(ParentBundles { stack, anchor: ancestry.anchor }),
         _ => None,
@@ -1775,8 +1917,8 @@ where
     let build_path = deferred && follower_parallel() && n42_engine_types::parallel_transfer::follower_build_path();
     let parent_shards = executed_parent
         .as_ref()
-        .filter(|(_, executed)| build_path && !executed.is_empty())
-        .and_then(|_| follower_shards_of(parent_hash));
+        .and_then(|(_, layers)| layers.first())
+        .is_some_and(|(_, layer)| matches!(layer, ParentLayer::Shards(..)));
 
     // Execution on the parent's state, then gas, receipts root and bloom
     // against the header. One piece, because on the exec-on-parent-output path
@@ -1810,29 +1952,13 @@ where
         // execute half the block one block behind.
         let open_parent_state = || -> Result<reth_provider::StateProviderBox, String> {
             match &executed_parent {
-                Some((anchor, executed)) => {
+                Some((anchor, layers)) => {
                     let historical = provider
                         .state_by_block_hash(*anchor)
                         .map_err(|err| format!("the state the published outputs are laid over: {err}"))?;
-                    match (&parent_shards, executed.split_first()) {
-                        // The parent's shards under its residual, over the
-                        // older published outputs: the chained build's layers.
-                        (Some((shards, residual)), Some((parent_block, older))) => {
-                            let below = if older.is_empty() {
-                                historical
-                            } else {
-                                n42_engine_types::direct_build::overlay_on_executed(historical, older.to_vec())
-                            };
-                            let layer: reth_provider::StateProviderBox =
-                                Box::new(n42_engine_types::output_shards::ShardLayer::new(below, Arc::clone(shards)));
-                            let top = n42_engine_types::direct_build::executed_from_output(
-                                &parent_block.recovered_block.clone_sealed_header(),
-                                Arc::clone(residual),
-                            );
-                            Ok(n42_engine_types::direct_build::overlay_on_executed(layer, vec![top]))
-                        }
-                        _ => Ok(n42_engine_types::direct_build::overlay_on_executed(historical, executed.clone())),
-                    }
+                    // A block held as shards under its residual, merged
+                    // outputs as one overlay: the chained build's layers.
+                    Ok(open_on_layers(historical, layers))
                 }
                 None => {
                     // No published-output overlay on this path: every read
@@ -1889,7 +2015,7 @@ where
                         finish_ms = phases.finish_ms,
                         receipts_ms = phases.receipts_us / 1000,
                         total_ms = phases.total_us / 1000,
-                        parent_shards = parent_shards.is_some(),
+                        parent_shards,
                         reads_cache = phases.transfer_timers.reads_cache(),
                         reads_provider = phases.transfer_timers.reads_provider,
                         reads_view = phases.transfer_timers.reads_view,
@@ -2143,7 +2269,6 @@ where
                     blob_gas_used: 0,
                 },
             });
-            keep_follower_shards(block_hash, Arc::clone(&shards), Arc::clone(&residual));
             let early_root = {
                 let (shards, residual, qmdb) = (Arc::clone(&shards), Arc::clone(&residual), qmdb.clone());
                 spawn_early_root(parent_hash, block_hash, on_parent_output, move || {
@@ -2170,6 +2295,11 @@ where
                 .validate_block_post_execution(&recovered, &result, None, None)
                 .map_err(|err| format!("post-execution: {err}"))?;
             pre_checked = Some((checks_at.elapsed().as_millis() as u64, std::time::Instant::now()));
+            // The child's check and execution read this block from here on,
+            // through its shards: kept once its receipts and gas passed, as
+            // the published output is, but before the merge below, which
+            // only the engine's hand-off and the published output wait for.
+            keep_follower_shards(block_hash, recovered.clone_sealed_header(), Arc::clone(&shards), Arc::clone(&residual));
             if hashed_state_enabled() {
                 let overlaps = shards.overlaps(&residual.state);
                 let view = shards.view(&residual.state, &overlaps);
@@ -2211,7 +2341,10 @@ where
     // ([`wait_for_parent_fields`]). Published after the post-execution
     // checks, so nothing is published for a block whose receipts or gas were
     // refused, and before the root, which is the ~27 ms the child's check now
-    // runs beside (plan v4 step 1).
+    // runs beside (plan v4 step 1). On the build path the child reads the
+    // shards kept above instead, before this merged bundle exists; this copy
+    // is for the ordinary path and the leader's build on this block
+    // ([`published_ancestry`]).
     if deferred && publish_parent_outputs() {
         publish_parent_output(block_hash, recovered.clone_sealed_header(), Arc::clone(&execution_output));
     }
@@ -2420,6 +2553,10 @@ where
             split.threads,
             split.batch_max_ms,
             split.batch_median_ms,
+            // What the check and the execution waited for the parent's
+            // output, and what they read it through ([`parent_read_name`]).
+            parent_output_wait_ms,
+            parent_read,
         ],
     ))
 }
@@ -2458,7 +2595,7 @@ where
 }
 
 /// How many timings [`import_foreign_block`] returns (see its last lines).
-pub const IMPORT_TIMES: usize = 25;
+pub const IMPORT_TIMES: usize = 27;
 
 /// Copies a block's post-state into the read cache the next import starts
 /// from, and files it under the block's hash.
@@ -2780,7 +2917,7 @@ mod parent_output_tests {
         publish_parent_output(parent_hash, header, output);
 
         // What the check needs is there with no root filed.
-        let (_, output) = wait_for_parent_output(parent_hash, || false).expect("published when the execution ended");
+        let (_, output) = wait_for_output_within(parent_hash, || false, PARENT_WAIT).expect("published when the execution ended");
         assert_eq!(account_after_parent(&output.state, &sender).map(|account| account.nonce), Some(5));
         assert!(n42_engine_types::executed_fields::get(&parent_hash).is_none(), "the parent's root is not filed yet");
 
@@ -2814,7 +2951,7 @@ mod parent_output_tests {
         publish_parent_output(parent_hash, header, output);
         // The parent's execution has ended -- its output is published -- but
         // its root has not run, so its fields are not filed.
-        assert!(wait_for_parent_output(parent_hash, || false).is_some());
+        assert!(wait_for_output_within(parent_hash, || false, PARENT_WAIT).is_some());
         assert!(n42_engine_types::executed_fields::get(&parent_hash).is_none());
 
         let filed = std::thread::spawn(move || {
@@ -2930,12 +3067,12 @@ mod parent_output_tests {
         let (parent, parent_output) = publish(12, grandparent.hash(), vec![(moved_by_both, account(3, 80))]);
 
         let genesis = alloy_genesis::Genesis::default();
-        let ancestry = ancestry_of(&provider, &parent, &parent_output, &genesis, true, 13)
+        let ancestry = ancestry_of(&provider, &parent, &ParentLayer::Merged(parent_output), &genesis, true, 13)
             .expect("the parent and the grandparent are published and the great-grandparent is in");
         assert_eq!(ancestry.outputs.len(), 2, "both unimported blocks are in the stack");
         assert_eq!(ancestry.anchor, anchor.hash(), "the walk stops at the block the engine holds");
 
-        let stack = ancestry.bundles();
+        let stack = ancestry.layers();
         let bundles = ParentBundles { stack: &stack, anchor: ancestry.anchor };
         assert_eq!(
             bundles.account(&moved_by_both).map(|a| (a.nonce, a.balance)),
@@ -2950,10 +3087,10 @@ mod parent_output_tests {
         assert!(bundles.account(&untouched).is_none(), "a sender neither touched is left to the ancestor's state");
         // And the same outputs, in the same order, are what the execution's
         // overlay is built from.
-        let executed = ancestry.executed();
+        let executed = &ancestry.outputs;
         assert_eq!(executed.len(), 2);
-        assert_eq!(executed[0].recovered_block.hash(), parent.hash(), "newest first");
-        assert_eq!(executed[1].recovered_block.hash(), grandparent.hash());
+        assert_eq!(executed[0].0.hash(), parent.hash(), "newest first");
+        assert_eq!(executed[1].0.hash(), grandparent.hash());
     }
 
     /// Deeper than the published outputs go, the walk refuses and the block
@@ -2986,7 +3123,7 @@ mod parent_output_tests {
         let (parent, output) = last.expect("a chain was built");
         let genesis = alloy_genesis::Genesis::default();
         assert!(
-            ancestry_of(&provider, &parent, &output, &genesis, true, 99).is_none(),
+            ancestry_of(&provider, &parent, &ParentLayer::Merged(output), &genesis, true, 99).is_none(),
             "no ancestor in the engine within the outputs kept"
         );
     }
@@ -2997,7 +3134,7 @@ mod parent_output_tests {
     #[test]
     fn a_parent_in_the_engine_without_an_output_ends_the_wait_at_once() {
         let started = std::time::Instant::now();
-        assert!(wait_for_parent_output(B256::with_last_byte(0xee), || true).is_none());
+        assert!(wait_for_parent_layer(B256::with_last_byte(0xee), || true).is_none());
         assert!(started.elapsed() < PARENT_WAIT / 10, "waited {:?}", started.elapsed());
     }
 }
@@ -3267,6 +3404,96 @@ mod tests {
         )
     }
 
+    /// `state` as a published (merged) output.
+    fn merged(state: BundleState) -> ParentLayer {
+        ParentLayer::Merged(Arc::new(reth_provider::BlockExecutionOutput { result: Default::default(), state }))
+    }
+
+    /// `after` as the build path leaves it: the first two thirds in two
+    /// batches' shards, the last third in the executor's residual, and one
+    /// account of the residual also in the first batch with a stale value the
+    /// residual overrides -- the overlap the merge resolves. With the same
+    /// post-state merged into one bundle, as the published output carries it.
+    fn build_path_output(after: &[(Address, Account)], index: bool) -> (ParentLayer, ParentLayer) {
+        let third = after.len() / 3;
+        let (batched, residual) = after.split_at(2 * third);
+        let (first, second) = batched.split_at(third);
+        let mut first = first.to_vec();
+        if let Some((address, account)) = residual.first() {
+            first.push((*address, Account { nonce: account.nonce.saturating_sub(2), balance: U256::ZERO, bytecode_hash: None }));
+        }
+        let shards =
+            n42_engine_types::output_shards::OutputShards::with_index(Address::with_last_byte(0xbe), after.len(), 4, index);
+        shards.add(bundle(&first));
+        shards.add(bundle(second));
+        let shards = Arc::new(shards.freeze());
+        let residual = bundle(residual);
+        let published = merged(shards.merged(&residual));
+        let residual = Arc::new(reth_provider::BlockExecutionOutput { result: Default::default(), state: residual });
+        (ParentLayer::Shards(shards, residual), published)
+    }
+
+    /// The child's check through its parent's shards under the residual gives
+    /// the verdict -- and the words -- it gives through the merged output, on a
+    /// block whose senders' nonces the parent advanced (the state below the
+    /// parent refuses it), clean and with a flaw on either side of the split;
+    /// and the execution's view of the parent through the same layers
+    /// ([`open_on_layers`]) reads every sender as the check does.
+    #[test]
+    fn a_check_through_the_shards_gives_the_merged_outputs_verdict() {
+        use reth_provider::AccountReader as _;
+        let senders: Vec<Address> = (0..24).map(|s| addr(500 + s)).collect();
+        let mut txs = Vec::new();
+        let mut recovered = Vec::new();
+        for k in 0..3u64 {
+            for sender in &senders {
+                txs.push(transfer(5 + k, addr(9_000), 1_000, 21_000));
+                recovered.push(*sender);
+            }
+        }
+        let block = seal(txs, recovered, addr(1));
+        let rich = U256::from(10u128.pow(21));
+        let below: Vec<(Address, Account)> =
+            senders.iter().map(|s| (*s, Account { nonce: 2, balance: rich, bytecode_hash: None })).collect();
+        let state = provider(&below);
+        let anchor = B256::random();
+        let header = reth_primitives_traits::SealedHeader::seal_slow(Header { number: 7, ..Default::default() });
+        let verdict = |layer: &ParentLayer| {
+            check_includable(&state, anchor, Some(ParentBundles { stack: &[layer], anchor }), &block, CHAIN_ID, SpecId::OSAKA)
+        };
+        assert!(
+            check_includable(&state, anchor, None, &block, CHAIN_ID, SpecId::OSAKA).is_err(),
+            "below the parent the nonces are 2: the block needs the parent's"
+        );
+        // No flaw; a stale nonce in the shards; a short balance in the residual.
+        let flaws: [Option<(usize, Account)>; 3] = [
+            None,
+            Some((3, Account { nonce: 4, balance: rich, bytecode_hash: None })),
+            Some((20, Account { nonce: 5, balance: U256::from(1), bytecode_hash: None })),
+        ];
+        for index in [false, true] {
+            for flaw in &flaws {
+                let mut after: Vec<(Address, Account)> =
+                    senders.iter().map(|s| (*s, Account { nonce: 5, balance: rich, bytecode_hash: None })).collect();
+                if let Some((at, account)) = flaw {
+                    after[*at].1 = *account;
+                }
+                let (through_shards, published) = build_path_output(&after, index);
+                let (on_shards, on_merged) = (verdict(&through_shards), verdict(&published));
+                assert_eq!(on_shards, on_merged, "index {index}, flaw {flaw:?}");
+                assert_eq!(on_shards.is_ok(), flaw.is_none(), "index {index}, flaw {flaw:?}: {on_shards:?}");
+
+                let historical: reth_provider::StateProviderBox = Box::new(state.clone());
+                let view = open_on_layers(historical, &[(header.clone(), through_shards.clone())]);
+                for sender in &senders {
+                    let read = view.basic_account(sender).expect("the layers answer");
+                    assert_eq!(read, published.account(sender), "index {index}: {sender}");
+                    assert_eq!(read, through_shards.account(sender), "index {index}: {sender}");
+                }
+            }
+        }
+    }
+
     /// Where the includability check goes on a bench-tier block: the serial
     /// grouping pass, the parallel per-sender pass, and the whole check, with
     /// the senders read from the parent's published output (the fleet's path)
@@ -3285,7 +3512,7 @@ mod tests {
     fn bench_check_includable() {
         let (block, accounts) = bench_fixture(6_000, 27, 2_000_000, 64);
         let mock = provider(&accounts);
-        let parent = bundle(&accounts);
+        let parent = merged(bundle(&accounts));
         let grandparent = B256::random();
         let parent_hash = B256::random();
         let ms = |at: std::time::Instant| at.elapsed().as_micros() as f64 / 1000.0;
@@ -3728,7 +3955,7 @@ mod tests {
     fn reads_the_parent_output_before_the_state() {
         let (block, accounts) = bench_fixture(8, 5, 64, 3);
         let empty = provider(&[]);
-        let parent = bundle(&accounts);
+        let parent = merged(bundle(&accounts));
         check_includable(
             &empty,
             B256::random(),
@@ -3980,7 +4207,7 @@ mod tests {
                 case.state.iter().map(|(address, account)| (*address, ExtendedAccount::new(account.nonce, account.balance))),
             );
         }
-        let parent = bundle(&case.output);
+        let parent = merged(bundle(&case.output));
         let grandparent = B256::random();
         let hash = B256::random();
         let read = |output| {

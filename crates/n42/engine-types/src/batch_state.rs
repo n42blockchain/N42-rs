@@ -9,18 +9,19 @@
 //! looks the account up again in its transition map to merge it there (plus
 //! the block-access-list bookkeeping, a no-op here). For the leader's batch
 //! loop that was 0.41 us a transfer of pool time for three accounts
-//! (`N42_PHASE_TIMERS=1`, step 4b). Here each account is held as the merged
-//! transition itself: a read returns its info, a commit replaces the info and
-//! moves the status on with the same [`AccountStatus::on_changed`] revm's
-//! `CacheAccount::change` uses, and the close hands the map, less the
-//! accounts only read, to the same
-//! [`BundleState::apply_transitions_and_create_reverts`] `merge_transitions`
-//! calls.
+//! (`N42_PHASE_TIMERS=1`, step 4b). Here each account is held as the bundle
+//! account its merged transition becomes: a read returns its info, a commit
+//! replaces the info and moves the status on with the same
+//! [`AccountStatus::on_changed`] revm's `CacheAccount::change` uses, and the
+//! close keeps the map, less the accounts only read, as the bundle's state,
+//! each account's revert made by the same
+//! [`BundleAccount::update_and_create_revert`]
+//! [`BundleState::apply_transitions_and_create_reverts`] uses.
 
 use crate::fast_transfer::PlainTransfer;
 use alloy_primitives::{map::AddressMap, Address, B256};
 use revm::{
-    database::states::{bundle_state::BundleRetention, AccountStatus, BundleState, TransitionAccount, TransitionState},
+    database::states::{AccountStatus, BundleAccount, BundleState, TransitionAccount},
     state::{AccountInfo, Bytecode, EvmState},
     Database,
 };
@@ -42,12 +43,16 @@ impl std::fmt::Display for Unsupported {
 /// merges them, and [`BatchState::take_bundle`] is the bundle its
 /// `merge_transitions(BundleRetention::Reverts)` and `take_bundle` return.
 ///
-/// Each account is held as the transition `State` would have merged for it
-/// over the batch: `previous_*` as it was loaded, `info`/`status` as it
-/// stands. A loaded status (`Loaded`, `LoadedNotExisting`,
-/// `LoadedEmptyEIP161`) always moves on a change
+/// Each account is held as the bundle account the batch's transition becomes:
+/// `original_info` as it was loaded (the transition's `previous_info`),
+/// `info`/`status` as it stands; the loaded status is the one
+/// [`loaded_status`] reads off `original_info`. A loaded status (`Loaded`,
+/// `LoadedNotExisting`, `LoadedEmptyEIP161`) always moves on a change
 /// ([`AccountStatus::on_changed`]), so an account whose status still equals
-/// its previous one was only read, and the close leaves it out.
+/// its loaded one was only read, and the close leaves it out. The close
+/// keeps the map as the bundle's state: rebuilding every account into a
+/// fresh map there (`apply_transitions_and_create_reverts`) was most of a
+/// batch's close (490 ns a transfer on the fleet, loop283).
 ///
 /// Only the transfer path's changes are modelled -- an account touched, not
 /// destroyed, not created, not emptied, no storage written -- and any other
@@ -56,43 +61,40 @@ impl std::fmt::Display for Unsupported {
 #[derive(Debug)]
 pub struct BatchState<G> {
     inner: G,
-    accounts: AddressMap<TransitionAccount>,
+    accounts: AddressMap<BundleAccount>,
 }
 
 /// An account as `State` loads it into its cache (`load_cache_account`):
-/// its info as `CacheAccount::account_info` then returns it, and its status.
-fn loaded(info: Option<AccountInfo>) -> TransitionAccount {
-    let (info, status) = match info {
-        None => (None, AccountStatus::LoadedNotExisting),
+/// its info as `CacheAccount::account_info` then returns it, and its status;
+/// the same info kept as the original.
+fn loaded(info: Option<AccountInfo>) -> BundleAccount {
+    let info = match info {
         // `CacheAccount::new_loaded_empty_eip161`: an empty plain account.
-        Some(info) if info.is_empty() => (Some(AccountInfo::default()), AccountStatus::LoadedEmptyEIP161),
-        Some(info) => (Some(info), AccountStatus::Loaded),
+        Some(info) if info.is_empty() => Some(AccountInfo::default()),
+        info => info,
     };
-    // `previous_info` is filled on the first change, by moving `info` there
-    // (`change`): a read-only account never needs it, and the close
-    // drops those.
-    TransitionAccount {
-        info,
-        status,
-        previous_info: None,
-        previous_status: status,
-        storage: Default::default(),
-        storage_was_destroyed: false,
+    let status = loaded_status(info.as_ref());
+    BundleAccount { original_info: info.clone(), info, storage: Default::default(), status }
+}
+
+/// The status [`loaded`] gives an account whose loaded info is `original`:
+/// an entry's status before its first change.
+fn loaded_status(original: Option<&AccountInfo>) -> AccountStatus {
+    match original {
+        None => AccountStatus::LoadedNotExisting,
+        Some(info) if info.is_empty() => AccountStatus::LoadedEmptyEIP161,
+        Some(_) => AccountStatus::Loaded,
     }
 }
 
-/// `CacheAccount::change` merged into the batch's transition: the status
-/// moved on from the info as it stands, the info replaced. On the first
-/// change the loaded info becomes the transition's `previous_info`.
+/// `CacheAccount::change` merged into the batch's account: the status moved
+/// on from the info as it stands, the info replaced (the loaded info stays
+/// the original, the transition's `previous_info`).
 #[inline]
-fn change(entry: &mut TransitionAccount, info: AccountInfo) {
+fn change(entry: &mut BundleAccount, info: AccountInfo) {
     let had_no_nonce_and_code = entry.info.as_ref().is_some_and(AccountInfo::has_no_code_and_nonce);
-    let first = entry.status == entry.previous_status;
     entry.status = entry.status.on_changed(had_no_nonce_and_code);
-    let current = entry.info.replace(info);
-    if first {
-        entry.previous_info = current;
-    }
+    entry.info = Some(info);
 }
 
 impl<G: Database> BatchState<G> {
@@ -157,11 +159,50 @@ impl<G: Database> BatchState<G> {
     /// `State` returns from `merge_transitions(BundleRetention::Reverts)`
     /// then `take_bundle`. The batch holds nothing afterwards.
     pub fn take_bundle(&mut self) -> BundleState {
-        let mut transitions = std::mem::take(&mut self.accounts);
-        transitions.retain(|_, t| t.status != t.previous_status);
+        let mut accounts = std::mem::take(&mut self.accounts);
         let mut bundle = BundleState::default();
-        if !transitions.is_empty() {
-            bundle.apply_transitions_and_create_reverts(TransitionState { transitions }, BundleRetention::Reverts);
+        let mut reverts = Vec::with_capacity(accounts.len());
+        let (mut state_size, mut reverts_size, mut changed) = (0usize, 0usize, false);
+        // One pass, in place and in the map's order (the order the
+        // transitions map was walked in before): an account only read is
+        // dropped; a changed one gets the revert
+        // `apply_transitions_and_create_reverts` makes for an account new to
+        // the bundle (`TransitionAccount::create_revert`), and stays as its
+        // `present_bundle_account` only if that revert exists, as there.
+        accounts.retain(|address, entry| {
+            let previous_status = loaded_status(entry.original_info.as_ref());
+            if entry.status == previous_status {
+                return false;
+            }
+            changed = true;
+            let (present_info, present_status) = (entry.info.clone(), entry.status);
+            let transition = TransitionAccount {
+                info: entry.info.take(),
+                status: entry.status,
+                previous_info: entry.original_info.clone(),
+                previous_status,
+                storage: std::mem::take(&mut entry.storage),
+                storage_was_destroyed: false,
+            };
+            if let Some((hash, code)) = transition.has_new_contract() {
+                bundle.contracts.insert(hash, code.clone());
+            }
+            // `original_bundle_account`, updated by the transition.
+            entry.info = entry.original_info.clone();
+            entry.status = previous_status;
+            let Some(revert) = entry.update_and_create_revert(transition) else { return false };
+            entry.info = present_info;
+            entry.status = present_status;
+            state_size += entry.size_hint();
+            reverts_size += revert.size_hint();
+            reverts.push((*address, revert));
+            true
+        });
+        if changed {
+            bundle.state = accounts;
+            bundle.reverts.push(reverts);
+            bundle.state_size = state_size;
+            bundle.reverts_size = reverts_size;
         }
         bundle
     }
@@ -200,7 +241,7 @@ mod tests {
     use super::*;
     use alloy_primitives::U256;
     use revm::{
-        database::{CacheDB, EmptyDB, State},
+        database::{states::bundle_state::BundleRetention, CacheDB, EmptyDB, State},
         state::{Account, TransactionId},
         DatabaseCommit as _,
     };

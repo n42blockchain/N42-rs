@@ -478,3 +478,59 @@ fn every_path_with_withdrawals_to_conflicts_and_the_beneficiary_equals_the_direc
         }
     }
 }
+
+/// The batches' bundles as the builder's batches now close them
+/// (`BatchState::take_bundle`: the batch's own map kept as the bundle's
+/// state, so in that map's order and capacity) against revm's `State` over
+/// the same changes, through the index and through the direct graft: the
+/// same output either way, whatever order each bundle's map iterates in.
+#[test]
+fn the_batch_states_bundles_equal_the_states_through_the_index() {
+    use n42_engine_types::batch_state::BatchState;
+    let db = parent();
+    let (mut theirs, mut ours) = (Vec::new(), Vec::new());
+    for b in 0..BATCHES {
+        let mut state = State::builder().with_database(db.clone()).with_bundle_update().build();
+        let mut batch = BatchState::with_capacity(db.clone(), 8);
+        for k in 0..PER_BATCH / 2 {
+            let sender = addr(1_000_000 + b * PER_BATCH + k);
+            let to = if k % 4 == 0 { addr(5_000_000 + k % SHARED) } else { addr(9_000_000 + b * PER_BATCH + k) };
+            let value = U256::from(1_000 + k);
+            let changes = |db: &mut dyn FnMut(Address) -> Option<AccountInfo>| {
+                let mut changes: EvmState = Default::default();
+                for (address, delta, nonce) in [(sender, None, 1u64), (to, Some(value), 0), (beneficiary(), Some(U256::from(21)), 0)] {
+                    let loaded = db(address);
+                    let existed = loaded.is_some();
+                    let mut info = loaded.unwrap_or_default();
+                    match delta {
+                        Some(add) => info.balance += add,
+                        None => info.balance -= value,
+                    }
+                    info.nonce += nonce;
+                    let mut account = revm::state::Account::from(info);
+                    account.status = AccountStatus::Touched;
+                    if !existed {
+                        account.status |= AccountStatus::LoadedAsNotExisting;
+                    }
+                    changes.insert(address, account);
+                }
+                changes
+            };
+            let a = changes(&mut |address| state.basic(address).expect("an in-memory database"));
+            let c = changes(&mut |address| batch.basic(address).expect("an in-memory database"));
+            assert_eq!(a, c, "the same changes");
+            revm::DatabaseCommit::commit(&mut state, a);
+            batch.commit(c).expect("a plain transfer's changes");
+        }
+        state.merge_transitions(BundleRetention::Reverts);
+        theirs.push(state.take_bundle());
+        ours.push(batch.take_bundle());
+    }
+    let direct_theirs = direct(&db, theirs.clone(), false).0;
+    let direct_ours = direct(&db, ours.clone(), false).0;
+    assert_same("direct graft", &direct_ours, &direct_theirs);
+    let indexed_theirs = sharded(&db, shards_of(theirs, 16, true));
+    let indexed_ours = sharded(&db, shards_of(ours, 16, true));
+    assert_same("index", &indexed_ours, &indexed_theirs);
+    assert_same("index against the graft", &indexed_ours, &direct_theirs);
+}

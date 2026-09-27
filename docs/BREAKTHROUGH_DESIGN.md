@@ -337,3 +337,28 @@ The two flag-off legs are the best windows so far: 1,080,927 and 1,075,751 (twel
 tag `fleet3-1.08M-window-20260927`). The chain per block on the leader is start 26 + prep 10 + exec 56 + commit
 9 + seal 6 + state wait 10 = ~117 of the 129 `sealed_at`, and the cycle is that plus the handover to the next
 build (~15).
+
+### 10.10 The leader's selection by reference (loop275): the start halves, the wait for the parent's fold takes it
+
+dad16f613: the frame entry carries its gas total, the selection checks sender runs in parallel against the
+frame's own Arcs, the lanes are settled on a helper thread after the build has its frames (cold bench 30 -> 5).
+Same configuration as 10.9, shards off.
+
+| leg | pacing | win1 | cycle | start_best (walk / handoff) | prep | exec | commit | fold (graft) | state_wait | sealed_at |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| SEL | 125 | 1,074,749 | 152 | 13 (7 / 4) | 3 | 57 | 8 | 54 (44) | 27 | 130 |
+| SELP100 | 100 | 1,069,355 | 152 | 13 (7 / 4) | 4 | 56 | 9 | 54 (44) | 27 | 129 |
+| SELb | 125 | 1,059,455 | 154 | 13 (7 / 4) | 3 | 58 | 8 | 54 (45) | 28 | 131 |
+| SELP100b | 100 | **1,077,680** | 151 | 13 (7 / 4) | 3 | 59 | 8 | 53 (44) | 28 | 132 |
+
+The start fell 26 -> 13 and the prep 10 -> 3, and every millisecond of it moved into `state_wait` (10 -> 27-28):
+the chained build now reaches its execution before the parent's fold has published the state, so `sealed_at`
+stays 129-132 and the window 1.059-1.078M. The leader's chain is therefore, per block, the parent's fold (54:
+graft 44) running against the child's start + prep (16), then the child's exec 57 + commit 8 + seal 6 --
+**the fold is the exposed term** and the only one left that is not the execution itself. Step 3 attacked it
+by address partition and lost twice (10.8, 10.9), but the loss is not explained: the graft inserts 147k accounts
+in 44 ms single-threaded (300 ns each, i.e. cache misses, not bandwidth), while v2's 16 parallel tasks of 9k
+inserts each took 33 ms wall -- 3.6 us an insert, twelve times the graft's -- which points at the fold's shape
+(the transposition, per-task allocation, cloning in the add rules, the pool's wake-up), not at the idea. Next: a
+microbenchmark of the fold against the graft on the block's shape, off the fleet, until the fold is under ~8 ms
+wall, then one leg.

@@ -1051,6 +1051,16 @@ pub struct VoteRoad {
     pub frame_roots_indexed: u64,
     /// See `frame_roots_indexed`.
     pub frame_roots_hashed: u64,
+    /// Of `assemble_us`, a frame description's: the queue's frame look-ups
+    /// (`take_frames`), one per frame.
+    pub road_take_us: u64,
+    /// Of `assemble_us`, a frame description's: the list in block order and
+    /// its senders, out of the frames taken.
+    pub road_body_us: u64,
+    /// Of `assemble_us`, a frame description's: the payload list's share of
+    /// the road (its blob versioned hashes; the list itself is encoded beside
+    /// the import).
+    pub road_encode_us: u64,
     /// Block by description only (`N42_BLOCK_BY_DESCRIPTION`): copying the
     /// block's transactions out of the queue into the owned block reth's
     /// execution takes, after the description was checked by reference.
@@ -1153,6 +1163,9 @@ fn log_vote_road(road: VoteRoad, number: u64, txs: usize, phases: RoadPhases) {
         frame_root_us = if road.frames > 0 { road.root_us } else { 0 },
         frame_root_indexed = road.frame_roots_indexed,
         frame_root_hashed = road.frame_roots_hashed,
+        road_take_ms = road.road_take_us / 1000,
+        road_body_ms = road.road_body_us / 1000,
+        road_encode_ms = road.road_encode_us / 1000,
         copy_ms = road.copy_us / 1000,
         header_ms = phases.header_us / 1000,
         senders_ms = phases.senders_us / 1000,

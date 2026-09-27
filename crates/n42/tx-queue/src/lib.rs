@@ -42,7 +42,7 @@
 
 mod frames;
 
-pub use frames::{FramePlan, FrameRef, NewFrame, PlannedFrame, MAX_FRAMES};
+pub use frames::{FramePlan, FrameRef, FrameTxs, NewFrame, PlannedFrame, MAX_FRAMES};
 
 use std::any::Any;
 use std::collections::{BTreeMap, VecDeque};
@@ -476,7 +476,7 @@ struct Inner<T: PoolTransaction> {
     builds: u64,
     /// The frames the ingest admitted whole ([`frames`]). Kept whether or
     /// not the chain builds frame blocks; nothing reads it unless asked.
-    frames: frames::FrameIndex,
+    frames: frames::FrameIndex<T>,
 }
 
 /// How many consecutive nonces a build takes from one sender before moving
@@ -563,6 +563,32 @@ fn hash_index_capacity() -> Option<usize> {
 /// this queue or its builder ever reads it -- reth's `ValidPoolTransaction`
 /// requires one, and its pool, which does read it, is not this. Two senders
 /// may share it; nothing compares them.
+/// Whether the frame index keeps each frame's transactions
+/// ([`TxQueue::push_frame`]): `N42_FRAME_ARCS`, on unless `0`.
+fn frame_arcs() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_FRAME_ARCS").map_or(true, |v| v != "0"))
+}
+
+/// `staged` put in the order of `hashes`, the frame's: as it is when the
+/// recovery kept the frame's order, matched by hash when it did not.
+/// `None` when the two are not the same transactions.
+fn frame_txs_in_order<T: PoolTransaction>(
+    hashes: &[B256],
+    staged: &[Arc<ValidPoolTransaction<T>>],
+) -> Option<FrameTxs<T>> {
+    if hashes.len() != staged.len() || hashes.is_empty() {
+        return None;
+    }
+    if staged.iter().zip(hashes).all(|(tx, hash)| tx.hash() == hash) {
+        return Some(FrameTxs::from(staged));
+    }
+    let by_hash: alloy_primitives::map::B256HashMap<&Arc<ValidPoolTransaction<T>>> =
+        staged.iter().map(|tx| (*tx.hash(), tx)).collect();
+    let ordered: Option<Vec<_>> = hashes.iter().map(|hash| by_hash.get(hash).map(|tx| Arc::clone(tx))).collect();
+    ordered.map(FrameTxs::from)
+}
+
 fn valid_for<T: PoolTransaction>(
     transaction: T,
     now: std::time::Instant,
@@ -712,9 +738,13 @@ pub struct TxQueue<T: PoolTransaction> {
     /// Frames noted since the last drain, under their own lock for the same
     /// reason as `inbox`: the ingest notes one per frame, thousands a
     /// second, and must not wait on the lanes.
-    frame_inbox: Arc<Mutex<Vec<NewFrame>>>,
+    frame_inbox: FrameInbox<T>,
     frames_staged: Arc<std::sync::atomic::AtomicUsize>,
 }
+
+/// Frames noted since the last drain, each with its transactions when the
+/// ingest handed them over ([`TxQueue::push_frame`]).
+type FrameInbox<T> = Arc<Mutex<Vec<(NewFrame, Option<FrameTxs<T>>)>>>;
 
 impl<T: PoolTransaction> Clone for TxQueue<T> {
     fn clone(&self) -> Self {
@@ -887,8 +917,8 @@ impl<T: PoolTransaction> TxQueue<T> {
             let frames = std::mem::take(&mut *noted);
             self.frames_staged.fetch_sub(frames.len(), Ordering::AcqRel);
             drop(noted);
-            for frame in frames {
-                inner.frames.insert(frame);
+            for (frame, txs) in frames {
+                inner.frames.insert(frame, txs);
             }
         }
         if self.staged.load(Ordering::Acquire) == 0 {
@@ -920,9 +950,36 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// transactions do. A frame already indexed, or one whose record is
     /// malformed, is ignored.
     pub fn note_frame(&self, frame: NewFrame) {
+        self.stage_frame(frame, None);
+    }
+
+    fn stage_frame(&self, frame: NewFrame, txs: Option<FrameTxs<T>>) {
         let mut noted = self.frame_inbox.lock();
-        noted.push(frame);
+        noted.push((frame, txs));
         self.frames_staged.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// [`Self::push`] and then [`Self::note_frame`] for a frame the ingest
+    /// admitted whole, with the index keeping the queue's own `Arc`s of the
+    /// frame's transactions in frame order ([`FrameTxs`]): what
+    /// [`Self::take_frames`] then hands out, one clone a frame, instead of
+    /// finding each transaction in its lane.
+    ///
+    /// The transactions are matched to the frame's hashes here, on the
+    /// caller's thread (in order, or by hash when the recovery reordered
+    /// them); a list that does not match is not kept and the frame reads
+    /// from the lanes. `N42_FRAME_ARCS=0` keeps no `Arc`s at all.
+    pub fn push_frame(&self, transactions: Vec<T>, frame: Option<NewFrame>) {
+        let now = std::time::Instant::now();
+        let staged: Vec<Arc<ValidPoolTransaction<T>>> = transactions
+            .into_iter()
+            .map(|transaction| valid_for(transaction, now, TransactionOrigin::External))
+            .collect();
+        let txs = frame.as_ref().filter(|_| frame_arcs()).and_then(|frame| frame_txs_in_order(&frame.hashes, &staged));
+        self.index_and_stage(staged);
+        if let Some(frame) = frame {
+            self.stage_frame(frame, txs);
+        }
     }
 
     /// How many frames the index holds, counting those still in its inbox.
@@ -948,16 +1005,25 @@ impl<T: PoolTransaction> TxQueue<T> {
     /// reference: the queue's own `Arc`s, shared, nothing copied. Nothing
     /// is taken out of the lanes -- this is a read for the vote road.
     ///
-    /// Each transaction is found in its lane by (sender, nonce) and checked
-    /// against the frame's hash; one that is not there (a build took it) is
-    /// looked up in the by-hash index when the queue keeps one. `None` for
-    /// a frame the index does not hold or one with any transaction found in
-    /// neither place.
-    pub fn take_frames(&self, ids: &[B256]) -> Vec<Option<Vec<Arc<ValidPoolTransaction<T>>>>> {
+    /// A frame noted with its transactions ([`Self::push_frame`]) is one
+    /// map look-up and one clone of its [`FrameTxs`]: the transactions are
+    /// the frame's whatever has happened to the lanes since (a build took
+    /// them, an own block not yet committed holds them), and they leave
+    /// with the frame when the chain mines any of them.
+    ///
+    /// A frame noted without them: each transaction is found in its lane by
+    /// (sender, nonce) and checked against the frame's hash; one that is
+    /// not there (a build took it) is looked up in the by-hash index when
+    /// the queue keeps one. `None` for a frame the index does not hold or
+    /// one with any transaction found in neither place.
+    pub fn take_frames(&self, ids: &[B256]) -> Vec<Option<FrameTxs<T>>> {
         let mut inner = self.inner.lock();
         self.drain_inbox(&mut inner);
         ids.iter()
             .map(|id| {
+                if let Some(txs) = inner.frames.txs_of(id) {
+                    return Some(txs);
+                }
                 let members = inner.frames.members_of(id)?;
                 let mut out = Vec::with_capacity(members.len());
                 for (sender, nonce, hash) in members {
@@ -970,9 +1036,17 @@ impl<T: PoolTransaction> TxQueue<T> {
                         .or_else(|| self.by_hash.as_ref().and_then(|index| index.get(&hash)))?;
                     out.push(held);
                 }
-                Some(out)
+                Some(FrameTxs::from(out))
             })
             .collect()
+    }
+
+    /// How many indexed frames hold their transactions ([`Self::push_frame`]).
+    /// For tests and the prune's report.
+    pub fn frames_with_txs(&self) -> usize {
+        let mut inner = self.inner.lock();
+        self.drain_inbox(&mut inner);
+        inner.frames.with_txs()
     }
 
     /// Records that a canonical block at `number` has been pruned out of the
@@ -3629,6 +3703,94 @@ mod tests {
         assert!(queue.frames_in_arrival_order().all(|f| f.whole_usable));
     }
 
+    /// A frame of `members` through [`TxQueue::push_frame`], the ingest's
+    /// direct door: the index keeps the transactions. `order` is the order
+    /// they are pushed in (a recovery that reordered them), by position in
+    /// `members`.
+    fn push_frame_with_txs(
+        queue: &TxQueue<EthPooledTransaction>,
+        id: u8,
+        members: &[(Address, u64)],
+        order: Option<&[usize]>,
+    ) -> Vec<B256> {
+        let txs: Vec<EthPooledTransaction> = members.iter().map(|(s, n)| tx_hashed(*s, *n)).collect();
+        let hashes: Vec<B256> = txs.iter().map(|t| *t.hash()).collect();
+        let pushed: Vec<EthPooledTransaction> = match order {
+            Some(order) => order.iter().map(|&k| txs[k].clone()).collect(),
+            None => txs,
+        };
+        queue.push_frame(
+            pushed,
+            Some(NewFrame {
+                id: B256::repeat_byte(id),
+                hashes: hashes.clone(),
+                members: members.to_vec(),
+                gas: 21_000 * members.len() as u64,
+            }),
+        );
+        hashes
+    }
+
+    #[test]
+    fn take_frames_hands_out_the_frames_own_arcs_without_the_lanes() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
+        let (a, b) = (Address::repeat_byte(1), Address::repeat_byte(2));
+        let first = push_frame_with_txs(&queue, 0xe1, &[(b, 0), (a, 0), (b, 1), (a, 1)], None);
+        // Recovered out of order: matched back to the frame's by hash.
+        let second = push_frame_with_txs(&queue, 0xe2, &[(a, 2), (b, 2)], Some(&[1, 0]));
+        assert_eq!(queue.frames_with_txs(), 2);
+        let got = queue.take_frames(&[B256::repeat_byte(0xe1), B256::repeat_byte(0xe2), B256::repeat_byte(0xee)]);
+        let hashes = |txs: &FrameTxs<EthPooledTransaction>| txs.iter().map(|t| *t.hash()).collect::<Vec<_>>();
+        assert_eq!(got[0].as_ref().map(hashes), Some(first));
+        assert_eq!(got[1].as_ref().map(hashes), Some(second));
+        assert!(got[2].is_none());
+        // The lane's own allocation, and the index's list itself: a second
+        // take clones the frame's `Arc`, not its transactions.
+        let again = queue.take_frames(&[B256::repeat_byte(0xe1)]);
+        let (got0, again0) = (got[0].as_ref().unwrap(), again[0].as_ref().unwrap());
+        assert!(Arc::ptr_eq(got0, again0));
+        // A build takes every transaction out of the lanes (no by-hash
+        // index): the lane look-up would find none of them, the frame still
+        // hands out the same `Arc`s.
+        let mut best = queue.best_for_build(B256::repeat_byte(7));
+        let taken: Vec<_> = std::iter::from_fn(|| best.next()).collect();
+        drop(best);
+        assert_eq!(taken.len(), 6);
+        assert!(queue.is_empty());
+        let after = queue.take_frames(&[B256::repeat_byte(0xe1)]);
+        let after0 = after[0].as_ref().expect("the frame's own transactions");
+        for tx in after0.iter() {
+            assert!(taken.iter().any(|t| Arc::ptr_eq(t, tx)), "the queue's own allocation");
+        }
+        // Without them (the lane look-up), the same frame is not found.
+        let plain: TxQueue<EthPooledTransaction> = TxQueue::new();
+        push_frame(&plain, 0xe1, &[(b, 0), (a, 0)]);
+        let mut best = plain.best_for_build(B256::repeat_byte(7));
+        while best.next().is_some() {}
+        drop(best);
+        assert!(plain.take_frames(&[B256::repeat_byte(0xe1)])[0].is_none());
+    }
+
+    #[test]
+    fn a_pruned_frame_lets_go_of_its_transactions() {
+        let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
+        let (a, b) = (Address::repeat_byte(1), Address::repeat_byte(2));
+        push_frame_with_txs(&queue, 0xf1, &[(a, 0), (a, 1)], None);
+        push_frame_with_txs(&queue, 0xf2, &[(b, 0)], None);
+        let got = queue.take_frames(&[B256::repeat_byte(0xf1)]);
+        let weak: Vec<std::sync::Weak<ValidPoolTransaction<EthPooledTransaction>>> =
+            got[0].as_ref().unwrap().iter().map(Arc::downgrade).collect();
+        drop(got);
+        // The chain mines a's nonce 0: the frame leaves the index, and with
+        // the lanes' copies gone too nothing holds its transactions.
+        queue.remove_mined_batch([(a, 1)]);
+        assert!(queue.take_frames(&[B256::repeat_byte(0xf1)])[0].is_none());
+        assert_eq!(queue.frames_indexed(), 1);
+        assert_eq!(queue.frames_with_txs(), 1);
+        assert!(weak.iter().all(|w| w.upgrade().is_none()), "the index still held a pruned frame's transactions");
+        assert!(queue.take_frames(&[B256::repeat_byte(0xf2)])[0].is_some());
+    }
+
     #[test]
     fn take_frames_hands_back_the_queues_own_transactions_in_frame_order() {
         let queue: TxQueue<EthPooledTransaction> = TxQueue::new();
@@ -3638,7 +3800,7 @@ mod tests {
         let second = push_frame(&queue, 0xc2, &[(a, 2), (b, 2)]);
         let got = queue.take_frames(&[B256::repeat_byte(0xc2), B256::repeat_byte(0xee), B256::repeat_byte(0xc1)]);
         assert_eq!(got.len(), 3);
-        let hashes = |txs: &Vec<Arc<ValidPoolTransaction<EthPooledTransaction>>>| txs.iter().map(|t| *t.hash()).collect::<Vec<_>>();
+        let hashes = |txs: &FrameTxs<EthPooledTransaction>| txs.iter().map(|t| *t.hash()).collect::<Vec<_>>();
         assert_eq!(got[0].as_ref().map(hashes), Some(second));
         assert!(got[1].is_none(), "an unknown frame");
         assert_eq!(got[2].as_ref().map(hashes), Some(first));

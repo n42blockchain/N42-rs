@@ -117,6 +117,20 @@ pub struct DescribedBlock {
     withdrawals: Vec<Withdrawal>,
     bal: Option<Bytes>,
     encoded: Vec<EncodedChunk>,
+    /// The blob versioned hashes of a block whose payload list was not
+    /// encoded on the road (a frame description): `encoded` is then empty
+    /// and the list is encoded from `transactions` where it is read.
+    versioned: Option<Vec<B256>>,
+    /// Of `describe_us`, a frame description's: the queue's frame look-ups
+    /// (`take_frames`, every pass).
+    pub take_us: u64,
+    /// Of `describe_us`, a frame description's: the list in block order
+    /// and its senders, out of the frames taken.
+    pub body_us: u64,
+    /// Of `describe_us`: what the payload list cost on the road (a frame
+    /// description reads only its blob versioned hashes; 0 on the hash
+    /// road, whose encoding is inside its look-up pass).
+    pub encode_us: u64,
     /// Finding the transactions in the queue, encoding them and building the
     /// trie, in the one pass (plus a second over any chunk a miss or a fill
     /// touched).
@@ -364,6 +378,10 @@ where
             withdrawals: body.withdrawals,
             bal: body.bal.map(Bytes::copy_from_slice),
             encoded,
+            versioned: None,
+            take_us: 0,
+            body_us: 0,
+            encode_us: 0,
             describe_us,
             root_us,
             miss_wait_us,
@@ -394,9 +412,11 @@ where
     /// here (a missing frame's hashes are not known); the root over what
     /// was assembled binds it to the header all the same.
     ///
-    /// The encoding the payload's list needs is still made, one pass on the
-    /// worker pool; what this road does not do is the 163,000 look-ups by
-    /// hash and the trie.
+    /// A frame the ingest noted with its transactions is taken by reference
+    /// (one clone of its list), and the payload's list is not encoded here:
+    /// [`PayloadList::copy_out`] encodes it from the same transactions beside
+    /// the import, for the engine's own pass, its only reader. What this road
+    /// does per transaction is the list in block order and the senders.
     fn describe_frames(
         &self,
         body: n42_h2_consensus::CompactBlockBody<'_>,
@@ -424,8 +444,9 @@ where
         let covered: std::collections::HashSet<usize> = supplied.iter().map(|(index, _, _)| *index).collect();
 
         let describe_at = std::time::Instant::now();
-        let mut held: Vec<Found> = Vec::with_capacity(total);
-        held.resize_with(total, || None);
+        // Frame k's transactions as this node's index holds them, shared:
+        // the vote road's whole look-up is one clone per frame.
+        let mut got: Vec<Option<n42_tx_queue::FrameTxs<crate::N42PooledTransaction>>> = vec![None; frames.len()];
         let mut pending: Vec<usize> = (0..frames.len()).collect();
         let mut frames_missing: Option<usize> = None;
         // Frame k's root when this node took it whole out of its index: the
@@ -433,9 +454,12 @@ where
         // fetched by, so the frame tree reads it instead of rehashing.
         let mut known: Vec<Option<B256>> = vec![None; frames.len()];
         let mut first_pass = std::time::Duration::ZERO;
+        let mut take = std::time::Duration::ZERO;
         let waited_at = loop {
             let ids: Vec<B256> = pending.iter().map(|&k| frames[k].0).collect();
+            let take_at = std::time::Instant::now();
             let found = queue.take_frames(&ids);
+            take += take_at.elapsed();
             let mut still = Vec::new();
             for (k, found) in pending.iter().copied().zip(found) {
                 let (id, count) = frames[k];
@@ -445,10 +469,7 @@ where
                         if txs.len() == count {
                             known[k] = Some(id);
                         }
-                        for (offset, queued) in txs.into_iter().take(count).enumerate() {
-                            let sender = queued.transaction.transaction.signer();
-                            held[starts[k] + offset] = Some((queued, sender));
-                        }
+                        got[k] = Some(txs);
                     }
                     Some(txs) => {
                         return Err(other(format!(
@@ -491,47 +512,91 @@ where
                 waited: waited_at.duration_since(describe_at),
             });
         }
-        let misses = (0..total).filter(|index| held[*index].is_none() && !covered.contains(index)).count();
+        let misses = (0..frames.len())
+            .filter(|&k| got[k].is_none())
+            .flat_map(|k| starts[k]..starts[k] + frames[k].1)
+            .filter(|index| !covered.contains(index))
+            .count();
 
         // Every position held: the list in block order, the senders beside it.
         let second_at = std::time::Instant::now();
-        let mut supplied_at: std::collections::HashMap<usize, (Address, TransactionSigned)> =
-            supplied.into_iter().map(|(index, sender, tx)| (index, (sender, tx))).collect();
-        let mut transactions = Vec::with_capacity(total);
-        let mut senders = Vec::with_capacity(total);
-        for (index, slot) in held.into_iter().enumerate() {
-            let supplied = if supplied_at.is_empty() { None } else { supplied_at.remove(&index) };
-            match (slot, supplied) {
-                (_, Some((sender, tx))) => {
-                    senders.push(sender);
-                    transactions.push(DescribedTx::Supplied(Box::new(tx)));
-                }
-                (Some((queued, sender)), None) => {
-                    senders.push(sender);
-                    transactions.push(DescribedTx::Queued(queued));
-                }
-                (None, None) => {
-                    return Err(CompactBodyError::Missing {
-                        indices: vec![index],
-                        total,
-                        sample: Vec::new(),
-                        waited: waited_at.elapsed(),
-                    });
+        let (transactions, senders): (Vec<DescribedTx>, Vec<Address>) = if supplied.is_empty() {
+            // Every frame from the index: its transactions end to end, one
+            // frame per worker, nothing looked up.
+            let parts: Vec<(Vec<DescribedTx>, Vec<Address>)> = frames
+                .par_iter()
+                .zip(got.par_iter())
+                .map(|((_, count), txs)| {
+                    let txs = txs.as_deref().unwrap_or_default();
+                    let take = (*count).min(txs.len());
+                    let mut list = Vec::with_capacity(take);
+                    let mut senders = Vec::with_capacity(take);
+                    for queued in &txs[..take] {
+                        senders.push(queued.transaction.transaction.signer());
+                        list.push(DescribedTx::Queued(Arc::clone(queued)));
+                    }
+                    (list, senders)
+                })
+                .collect();
+            let mut transactions = Vec::with_capacity(total);
+            let mut senders = Vec::with_capacity(total);
+            for (list, from) in parts {
+                transactions.extend(list);
+                senders.extend(from);
+            }
+            (transactions, senders)
+        } else {
+            let mut held: Vec<Found> = Vec::with_capacity(total);
+            held.resize_with(total, || None);
+            for (k, txs) in got.iter().enumerate() {
+                let Some(txs) = txs else { continue };
+                for (offset, queued) in txs.iter().take(frames[k].1).enumerate() {
+                    held[starts[k] + offset] = Some((Arc::clone(queued), queued.transaction.transaction.signer()));
                 }
             }
-        }
-        // The payload's list: every chunk encoded, on the worker pool.
-        let encoded: Vec<EncodedChunk> = transactions
-            .par_chunks(CHUNK)
-            .map(|chunk| {
-                let mut fresh = EncodedChunk::with_capacity(chunk.len());
-                for tx in chunk {
-                    fresh.push(tx.transaction());
+            let mut supplied_at: std::collections::HashMap<usize, (Address, TransactionSigned)> =
+                supplied.into_iter().map(|(index, sender, tx)| (index, (sender, tx))).collect();
+            let mut transactions = Vec::with_capacity(total);
+            let mut senders = Vec::with_capacity(total);
+            for (index, slot) in held.into_iter().enumerate() {
+                let supplied = if supplied_at.is_empty() { None } else { supplied_at.remove(&index) };
+                match (slot, supplied) {
+                    (_, Some((sender, tx))) => {
+                        senders.push(sender);
+                        transactions.push(DescribedTx::Supplied(Box::new(tx)));
+                    }
+                    (Some((queued, sender)), None) => {
+                        senders.push(sender);
+                        transactions.push(DescribedTx::Queued(queued));
+                    }
+                    (None, None) => {
+                        return Err(CompactBodyError::Missing {
+                            indices: vec![index],
+                            total,
+                            sample: Vec::new(),
+                            waited: waited_at.elapsed(),
+                        });
+                    }
                 }
-                fresh
-            })
-            .collect();
-
+            }
+            (transactions, senders)
+        };
+        if transactions.len() != total {
+            return Err(other(format!(
+                "the frames assembled {} transactions, the description names {total}",
+                transactions.len()
+            )));
+        }
+        drop(got);
+        let body_us = second_at.elapsed().as_micros() as u64;
+        // The payload's list is not encoded here: nothing on the vote road
+        // reads it (the frame tree is over the hashes the transactions
+        // carry), and the engine's own pass gets it encoded from these same
+        // transactions beside the import ([`PayloadList::copy_out`]). What
+        // the payload's header needs of it now is its blob versioned hashes.
+        let encode_at = std::time::Instant::now();
+        let versioned = versioned_hashes(&transactions);
+        let encode_us = encode_at.elapsed().as_micros() as u64;
         // What binds the list to the header: the frame tree.
         let root_at = std::time::Instant::now();
         // A frame any of whose positions the fill supplied is hashed: its
@@ -571,7 +636,11 @@ where
             senders,
             withdrawals: body.withdrawals,
             bal: body.bal.map(Bytes::copy_from_slice),
-            encoded,
+            encoded: Vec::new(),
+            versioned: Some(versioned),
+            take_us: take.as_micros() as u64,
+            body_us,
+            encode_us,
             describe_us,
             root_us,
             miss_wait_us,
@@ -605,7 +674,11 @@ impl DescribedBlock {
     /// transaction's bytes (the loop60N1 growth).
     pub fn payload(&self) -> ExecutionData {
         let mut payload = self.header_payload();
-        payload.payload.as_v1_mut().transactions = copy_out(&self.encoded);
+        payload.payload.as_v1_mut().transactions = if self.versioned.is_some() {
+            encode_out(&self.transactions)
+        } else {
+            copy_out(&self.encoded)
+        };
         payload
     }
 
@@ -621,7 +694,10 @@ impl DescribedBlock {
             self.withdrawals.clone(),
             self.bal.clone(),
         );
-        let versioned: Vec<B256> = self.encoded.iter().flat_map(|chunk| chunk.versioned.iter().copied()).collect();
+        let versioned: Vec<B256> = match &self.versioned {
+            Some(versioned) => versioned.clone(),
+            None => self.encoded.iter().flat_map(|chunk| chunk.versioned.iter().copied()).collect(),
+        };
         if let Some(cancun) = payload.sidecar.cancun().cloned() {
             let cancun = alloy_rpc_types_engine::CancunPayloadFields { versioned_hashes: versioned, ..cancun };
             payload.sidecar = match payload.sidecar.into_prague() {
@@ -635,7 +711,10 @@ impl DescribedBlock {
     /// The encoded transactions, taken out for the payload's list. After
     /// this, [`Self::payload`] lists none.
     pub fn take_payload_list(&mut self) -> PayloadList {
-        PayloadList(std::mem::take(&mut self.encoded))
+        if self.versioned.is_some() {
+            return PayloadList(ListSource::Transactions(Arc::clone(&self.transactions)));
+        }
+        PayloadList(ListSource::Chunks(std::mem::take(&mut self.encoded)))
     }
 
     /// What makes the owned block, apart from this description: it shares
@@ -684,16 +763,71 @@ fn copy_out(chunks: &[EncodedChunk]) -> Vec<Bytes> {
     lists.into_iter().flatten().collect()
 }
 
+/// The payload's transaction list, each transaction encoded straight into
+/// its own allocation: the same bytes [`EncodedChunk::push`] writes, without
+/// the chunk in between. One pass on the worker pool.
+fn encode_out(transactions: &[DescribedTx]) -> Vec<Bytes> {
+    use alloy_eips::Encodable2718 as _;
+    use rayon::prelude::*;
+    let lists: Vec<Vec<Bytes>> = transactions
+        .par_chunks(CHUNK)
+        .map(|chunk| {
+            chunk
+                .iter()
+                .map(|tx| {
+                    let tx = tx.transaction();
+                    let mut bytes = Vec::with_capacity(tx.encode_2718_len());
+                    tx.encode_2718(&mut bytes);
+                    Bytes::from(bytes)
+                })
+                .collect()
+        })
+        .collect();
+    lists.into_iter().flatten().collect()
+}
+
+/// The blob versioned hashes of `transactions`, in order: what the payload's
+/// sidecar lists. A read of each transaction's type on the worker pool, and
+/// a collection only when a block carries any.
+fn versioned_hashes(transactions: &[DescribedTx]) -> Vec<B256> {
+    use rayon::prelude::*;
+    fn blob(tx: &DescribedTx) -> Option<&[B256]> {
+        alloy_consensus::Transaction::blob_versioned_hashes(tx.transaction())
+    }
+    if !transactions.par_iter().any(|tx| blob(tx).is_some_and(|hashes| !hashes.is_empty())) {
+        return Vec::new();
+    }
+    transactions.iter().filter_map(blob).flat_map(|hashes| hashes.iter().copied()).collect()
+}
+
 /// A described block's transactions as the payload lists them, encoded and
-/// not yet copied out.
-#[derive(Debug, Default)]
-pub struct PayloadList(Vec<EncodedChunk>);
+/// not yet copied out -- or, for a frame description, not yet encoded.
+#[derive(Debug)]
+pub struct PayloadList(ListSource);
+
+#[derive(Debug)]
+enum ListSource {
+    /// Encoded on the road (the hash road, whose root is over them).
+    Chunks(Vec<EncodedChunk>),
+    /// The block's transactions, shared, encoded where the list is read.
+    Transactions(Arc<Vec<DescribedTx>>),
+}
+
+impl Default for PayloadList {
+    fn default() -> Self {
+        Self(ListSource::Chunks(Vec::new()))
+    }
+}
 
 impl PayloadList {
     /// The payload's transaction list: 163,000 allocations and a contiguous
-    /// read, ~10 ms on the worker pool -- work for after the vote.
+    /// read, ~10 ms on the worker pool -- work for after the vote. A frame
+    /// description's is encoded here, from the transactions themselves.
     pub fn copy_out(&self) -> Vec<Bytes> {
-        copy_out(&self.0)
+        match &self.0 {
+            ListSource::Chunks(chunks) => copy_out(chunks),
+            ListSource::Transactions(transactions) => encode_out(transactions),
+        }
     }
 }
 

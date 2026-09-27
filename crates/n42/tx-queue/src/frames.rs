@@ -18,6 +18,15 @@
 //! bytes of map and order entry: ~16-17 KB a frame, ~33 MB for the ~2,000
 //! frames of a 1M-deep queue. Bounded by [`MAX_FRAMES`].
 //!
+//! A frame noted through [`crate::TxQueue::push_frame`] also keeps the
+//! queue's own `Arc`s of its transactions, in frame order (8 bytes a
+//! transaction, 4 KB a 500-frame, ~8 MB at 2,000 frames), so the vote
+//! road's [`crate::TxQueue::take_frames`] is one map look-up and one `Arc`
+//! clone a frame instead of a lane look-up a transaction. The transactions
+//! then live as long as their frame is indexed: the canonical prune that
+//! drops the frame drops them with it. `N42_FRAME_ARCS=0` keeps no `Arc`s
+//! (every frame is then fetched from the lanes, as before).
+//!
 //! A frame leaves the index when the chain mines any of its transactions
 //! (the canonical prune, [`FrameIndex::sweep`]): it can never be referenced
 //! whole again. What a build took, or an own block not yet committed, only
@@ -25,8 +34,10 @@
 
 use std::collections::VecDeque;
 
+use std::sync::Arc;
+
 use alloy_primitives::{map::{AddressHashMap, B256HashMap}, Address, B256};
-use reth_transaction_pool::PoolTransaction;
+use reth_transaction_pool::{PoolTransaction, ValidPoolTransaction};
 
 use crate::Lane;
 
@@ -34,6 +45,9 @@ use crate::Lane;
 /// frames of 500 is 8.2M transactions, far past any queue's gate, so the
 /// bound only bites when nothing prunes (a node whose chain has stopped).
 pub const MAX_FRAMES: usize = 16_384;
+
+/// A frame's transactions as the queue holds them, in frame order, shared.
+pub type FrameTxs<T> = Arc<[Arc<ValidPoolTransaction<T>>]>;
 
 /// A frame the ingest admitted whole, for [`crate::TxQueue::note_frame`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,17 +143,25 @@ struct SenderRun {
 }
 
 #[derive(Debug)]
-struct FrameEntry {
+struct FrameEntry<T: PoolTransaction> {
     hashes: Vec<B256>,
     runs: Vec<SenderRun>,
     gas: u64,
+    /// The transactions themselves, in frame order, when the frame was
+    /// noted with them ([`crate::TxQueue::push_frame`]); `None` and
+    /// [`crate::TxQueue::take_frames`] finds them in the lanes.
+    txs: Option<FrameTxs<T>>,
 }
 
-impl FrameEntry {
-    fn from_new(frame: NewFrame) -> Option<(B256, Self)> {
+impl<T: PoolTransaction> FrameEntry<T> {
+    fn from_new(frame: NewFrame, txs: Option<FrameTxs<T>>) -> Option<(B256, Self)> {
         if frame.hashes.len() != frame.members.len() || frame.hashes.is_empty() {
             return None;
         }
+        // A list of another length is not the frame's and is not kept: the
+        // frame then reads from the lanes. Hash for hash it was matched by
+        // `push_frame`, off the lanes' lock this runs under.
+        let txs = txs.filter(|txs| txs.len() == frame.hashes.len());
         let len = u32::try_from(frame.hashes.len()).ok()?;
         let mut runs: Vec<SenderRun> = Vec::new();
         for (at, (sender, nonce)) in frame.members.iter().copied().enumerate() {
@@ -155,7 +177,7 @@ impl FrameEntry {
             }
         }
         debug_assert_eq!(runs.iter().map(|run| run.len).sum::<u32>(), len);
-        Some((frame.id, Self { hashes: frame.hashes, runs, gas: frame.gas }))
+        Some((frame.id, Self { hashes: frame.hashes, runs, gas: frame.gas, txs }))
     }
 
     /// Every position's (sender, nonce), in frame order.
@@ -169,9 +191,9 @@ impl FrameEntry {
 }
 
 /// The index itself: a plain map plus the arrival order.
-#[derive(Debug, Default)]
-pub(crate) struct FrameIndex {
-    frames: B256HashMap<FrameEntry>,
+#[derive(Debug)]
+pub(crate) struct FrameIndex<T: PoolTransaction> {
+    frames: B256HashMap<FrameEntry<T>>,
     /// Each indexed frame's id by its first transaction's hash: how a body
     /// that arrived whole is matched back to the frames it was built from
     /// ([`FrameIndex::layout_of`]).
@@ -184,17 +206,23 @@ pub(crate) struct FrameIndex {
     pub(crate) refused: u64,
 }
 
-impl FrameIndex {
+impl<T: PoolTransaction> Default for FrameIndex<T> {
+    fn default() -> Self {
+        Self { frames: B256HashMap::default(), by_first: B256HashMap::default(), order: VecDeque::new(), refused: 0 }
+    }
+}
+
+impl<T: PoolTransaction> FrameIndex<T> {
     pub(crate) fn len(&self) -> usize {
         self.frames.len()
     }
 
-    pub(crate) fn insert(&mut self, frame: NewFrame) {
+    pub(crate) fn insert(&mut self, frame: NewFrame, txs: Option<FrameTxs<T>>) {
         if self.frames.contains_key(&frame.id) {
             self.refused += 1;
             return;
         }
-        let Some((id, entry)) = FrameEntry::from_new(frame) else {
+        let Some((id, entry)) = FrameEntry::from_new(frame, txs) else {
             self.refused += 1;
             return;
         };
@@ -225,7 +253,7 @@ impl FrameIndex {
     /// Drops every frame the chain has mined any transaction of: a lane
     /// whose canonical watermark is at or past a run's first nonce. Called
     /// after a canonical prune has raised the watermarks.
-    pub(crate) fn sweep<T: PoolTransaction>(&mut self, lanes: &AddressHashMap<Lane<T>>) -> usize {
+    pub(crate) fn sweep(&mut self, lanes: &AddressHashMap<Lane<T>>) -> usize {
         let before = self.frames.len();
         self.frames.retain(|_, entry| {
             !entry.runs.iter().any(|run| {
@@ -243,7 +271,7 @@ impl FrameIndex {
 
     /// The frames in arrival order, each with whether a build could take it
     /// whole from `lanes` right now.
-    pub(crate) fn in_arrival_order<T: PoolTransaction>(
+    pub(crate) fn in_arrival_order(
         &self,
         lanes: &AddressHashMap<Lane<T>>,
     ) -> Vec<FrameRef> {
@@ -269,6 +297,17 @@ impl FrameIndex {
             out.push((sender, nonce, *entry.hashes.get(at)?));
         }
         Some(out)
+    }
+
+    /// The transactions a frame was noted with, shared: `None` for a frame
+    /// the index does not hold or one noted without them.
+    pub(crate) fn txs_of(&self, id: &B256) -> Option<FrameTxs<T>> {
+        self.frames.get(id)?.txs.clone()
+    }
+
+    /// How many indexed frames hold their transactions.
+    pub(crate) fn with_txs(&self) -> usize {
+        self.frames.values().filter(|entry| entry.txs.is_some()).count()
     }
 
     /// The live frame ids in arrival order, without the whole-usable check
@@ -327,7 +366,7 @@ impl FrameIndex {
 /// Whether every transaction of `entry` is in its lane, the lane is not
 /// parked, and the lane's nonces run without a gap from its head through
 /// the frame's.
-fn whole_usable<T: PoolTransaction>(entry: &FrameEntry, lanes: &AddressHashMap<Lane<T>>) -> bool {
+fn whole_usable<T: PoolTransaction>(entry: &FrameEntry<T>, lanes: &AddressHashMap<Lane<T>>) -> bool {
     entry.runs.iter().all(|run| {
         let Some(lane) = lanes.get(&run.sender) else { return false };
         if lane.parked.is_some() {

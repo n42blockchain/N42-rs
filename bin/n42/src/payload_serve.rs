@@ -2024,6 +2024,7 @@ where
                 let make_us = make_at.elapsed().as_micros() as u64;
                 let (frames, frames_missing) =
                     (described.frames, (described.frames_missing, described.frame_roots_indexed, described.frame_roots_hashed));
+                let road_parts = (described.take_us, described.body_us, described.encode_us);
                 let (describe_us, root_us, miss_wait_us, misses, fill_us, filled, described_us) = (
                     described.describe_us,
                     described.root_us,
@@ -2048,7 +2049,7 @@ where
                         filled,
                         total_us: described_us + make_us,
                     },
-                    Some((made.copy_us, list, frames, frames_missing)),
+                    Some((made.copy_us, list, frames, frames_missing, road_parts)),
                 ))
             });
             // A miss small enough to be worth asking for: the positions go
@@ -2120,9 +2121,11 @@ where
                 }
             };
             let (assembled, described) = assembled;
-            let (copied, payload_list, frames, frames_missing) = match described {
-                Some((copy_us, list, frames, frames_missing)) => (Some(copy_us), Some(list), frames, frames_missing),
-                None => (None, None, 0, (0, 0, 0)),
+            let (copied, payload_list, frames, frames_missing, road_parts) = match described {
+                Some((copy_us, list, frames, frames_missing, road_parts)) => {
+                    (Some(copy_us), Some(list), frames, frames_missing, road_parts)
+                }
+                None => (None, None, 0, (0, 0, 0), (0, 0, 0)),
             };
             let n42_engine_types::engine_validator::AssembledBlock {
                 block: sealed,
@@ -2178,6 +2181,9 @@ where
                 frames_missing: frames_missing.0 as u64,
                 frame_roots_indexed: frames_missing.1 as u64,
                 frame_roots_hashed: frames_missing.2 as u64,
+                road_take_us: road_parts.0,
+                road_body_us: road_parts.1,
+                road_encode_us: road_parts.2,
                 dispatch_wait_us,
                 started: started_at,
             };
@@ -2282,6 +2288,9 @@ where
                 frames_missing: 0,
                 frame_roots_indexed: 0,
                 frame_roots_hashed: 0,
+                road_take_us: 0,
+                road_body_us: 0,
+                road_encode_us: 0,
                 dispatch_wait_us,
                 started: started_at,
             };
@@ -2357,6 +2366,9 @@ where
                             frames_missing: 0,
                             frame_roots_indexed: 0,
                             frame_roots_hashed: 0,
+                            road_take_us: 0,
+                            road_body_us: 0,
+                            road_encode_us: 0,
                             dispatch_wait_us,
                             started: started_at,
                         },

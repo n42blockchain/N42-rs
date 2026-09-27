@@ -1348,8 +1348,13 @@ where
     // opt-in.
     if direct_to_queue() {
         if let Some(queue) = n42_tx_queue::global::<P::Transaction>() {
-            queue.push(decoded);
-            note_frame(&queue, frame);
+            // The frame's transactions stay in its index entry, so the vote
+            // road takes the frame by reference (`TxQueue::push_frame`).
+            let noted = frame.is_some();
+            queue.push_frame(decoded, frame);
+            if noted {
+                STATS.frames_admitted.fetch_add(1, Ordering::Relaxed);
+            }
             STATS.frames.fetch_add(1, Ordering::Relaxed);
             STATS.txs.fetch_add(count, Ordering::Relaxed);
             STATS.recover_ns.fetch_add(recovered_at.as_nanos() as u64, Ordering::Relaxed);

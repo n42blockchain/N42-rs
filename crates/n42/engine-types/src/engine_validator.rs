@@ -1984,14 +1984,17 @@ mod tests {
         for members in layout {
             let txs: Vec<TransactionSigned> = members.iter().map(|(s, n)| frame_transfer(*n, *s)).collect();
             let hashes = hashes_of(&txs);
-            queue.push(txs.iter().zip(members).map(|(tx, (s, _))| pooled(tx, Address::repeat_byte(*s))));
             let id = n42_tx_types::frame_root(&hashes);
-            queue.note_frame(n42_tx_queue::NewFrame {
-                id,
-                hashes,
-                members: members.iter().map(|(s, n)| (Address::repeat_byte(*s), *n)).collect(),
-                gas: 21_000 * members.len() as u64,
-            });
+            // The ingest's direct door: the index keeps the frame's transactions.
+            queue.push_frame(
+                txs.iter().zip(members).map(|(tx, (s, _))| pooled(tx, Address::repeat_byte(*s))).collect(),
+                Some(n42_tx_queue::NewFrame {
+                    id,
+                    hashes,
+                    members: members.iter().map(|(s, n)| (Address::repeat_byte(*s), *n)).collect(),
+                    gas: 21_000 * members.len() as u64,
+                }),
+            );
             frames.push((id, txs));
         }
         queue.drain_now();
@@ -2094,9 +2097,27 @@ mod tests {
             // A and C taken whole: their ids are the leaves; D is cut and hashed.
             assert_eq!((described.frame_roots_indexed, described.frame_roots_hashed), (2, 1));
             assert_eq!(described.header.transactions_root, root);
+            // By reference: frame A's positions are the index's own `Arc`s.
+            let taken = queue.take_frames(&[layout[0].0]);
+            let frame_a = taken[0].as_ref().expect("frame A is indexed with its transactions");
+            for (queued, own) in described.transactions.iter().zip(frame_a.iter()) {
+                match queued {
+                    DescribedTx::Queued(queued) => assert!(std::sync::Arc::ptr_eq(queued, own)),
+                    other => panic!("expected the queue's transaction, got {other:?}"),
+                }
+            }
+            // The payload's list is not encoded on the road; encoded where it
+            // is read, it is the body's own encoding, byte for byte.
+            let want: Vec<alloy_primitives::Bytes> =
+                body.iter().map(|tx| alloy_eips::Encodable2718::encoded_2718(tx).into()).collect();
+            let mut described = described;
+            assert!(described.header_payload().payload.as_v1().transactions.is_empty());
+            assert_eq!(described.payload().payload.as_v1().transactions, want);
+            assert_eq!(described.take_payload_list().copy_out(), want);
             let made = described.into_block(&validator).expect("the block is made");
             assert_eq!(made.block.hash(), hash);
             assert_eq!(hashes_of(&made.block.body().transactions), hashes_of(&body));
+            assert_eq!(made.payload.payload.as_v1().transactions, want);
 
             // A follower that holds none of the frames: every position of
             // every frame is the miss, for the proposer's fill.

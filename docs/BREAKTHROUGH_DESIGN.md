@@ -483,7 +483,9 @@ that is off the chain, but the merge should still follow the roots rather than s
 Two things to fix before pacing 100: **the tenure handover fails in the index mode** -- both IDX legs, at
 views 1028-1038, had 3-9 own blocks "not the one committed" and 7-11 direct imports failing with "no gov5
 header variant hashes to the payload's block hash" (a header the followers cannot reconstruct from the payload),
-7-8 TCs and 8-12 s lost, where the OFF legs had 0 / 0 / 1; the v4 shard legs (10.12-10.14) did not show it.
+7-8 TCs and 8-12 s lost, where the OFF legs had 0 / 0 / 1; the v4 shard legs had it too (loop276 S16: 16 / 4 / 5,
+S16b 0 / 3 / 3), so it is the shard path's, not the index's, and the failing block was the new leader's small first
+build (1033: 14,000 transactions).
 It is after the windows, so the numbers above stand, but the mode is not sound until the new leader's first
 build (the path that does not seal early: the kept cache, `into_staged`, withdrawals put back) matches the
 direct graft's header. Then pacing 100 and 110 with the index.

@@ -1205,7 +1205,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         for remaining in (0..MAX_PROPOSALS_PER_STEP).rev() {
             self.drain_outputs(&mut events).await?;
             let before = self.engine.current_view();
-            self.propose_if_leader(&mut events).await;
+            self.propose_if_leader(&mut events).await?;
             self.drain_outputs(&mut events).await?;
             self.flush_prepare().await;
             // A commit lands in the drain *after* the proposal that caused it,
@@ -1402,7 +1402,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // Nothing arrived meanwhile, so the view is the one the
                 // declined proposal was for.
                 if on_tick {
-                    self.propose_if_leader(&mut events).await;
+                    self.propose_if_leader(&mut events).await?;
                 }
             }
             () = tokio::time::sleep(self.body_grace), if !self.body_wait.is_empty() => {
@@ -2474,6 +2474,23 @@ impl<E: ExecutionLayer> H2Service<E> {
         seen.checked_add(pacing)
     }
 
+    /// Handles the engine's outputs in order up to and including this
+    /// leader's proposal, so the proposal is published the moment the engine
+    /// makes it. What follows it stays for the step's drain.
+    async fn send_own_proposal(&mut self, events: &mut Vec<ServiceEvent>) -> Result<(), ServiceError> {
+        while let Ok(output) = self.outputs.try_recv() {
+            let proposal = matches!(
+                &output,
+                EngineOutput::BroadcastMessage(n42_h2_primitives::consensus::ConsensusMessage::Proposal(_))
+            );
+            self.handle_output(output, events).await?;
+            if proposal {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// The pacing tick a deferred proposal waits for, when the attribute
     /// builder declined this view for the pacing and the tick is still ahead.
     fn deferred_pacing_tick(&self) -> Option<tokio::time::Instant> {
@@ -2492,15 +2509,15 @@ impl<E: ExecutionLayer> H2Service<E> {
 
     /// Builds and announces a block when this node is the leader of a view it
     /// has not yet proposed for.
-    async fn propose_if_leader(&mut self, events: &mut Vec<ServiceEvent>) {
+    async fn propose_if_leader(&mut self, events: &mut Vec<ServiceEvent>) -> Result<(), ServiceError> {
         let Some(build_attributes) = self.payload_attributes.as_ref() else {
-            return;
+            return Ok(());
         };
         let view = self.engine.current_view();
         if self.proposed_view == Some(view) || !self.engine.is_current_leader() {
             self.proposal_deferred = false;
             self.defer_reason = None;
-            return;
+            return Ok(());
         }
         // The stragglers' grace: see `with_straggler_grace`.
         if let Some(grace) = self.straggler_grace {
@@ -2514,7 +2531,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                         if at.elapsed() < grace {
                             self.proposal_deferred = true;
                             self.defer_reason = Some("waiting for the stragglers' votes");
-                            return;
+                            return Ok(());
                         }
                         debug!(target: "n42.h2.node", view, seen, all, "stragglers' grace ran out; proposing without them");
                     }
@@ -2558,7 +2575,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             }
             self.proposal_deferred = true;
             self.defer_reason = Some("the QC's block is not imported here");
-            return;
+            return Ok(());
         }
         // Marked before the build, not after: a build that fails should not be
         // retried on every subsequent event in the same view, which would pin
@@ -2580,7 +2597,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             self.proposal_deferred = true;
             self.defer_reason = Some("the attribute builder declined");
             self.declined_view = Some(view);
-            return;
+            return Ok(());
         };
         let attrs_at = decided.elapsed();
         // The proposal's timeline from here: when the builder had declined
@@ -2686,7 +2703,7 @@ impl<E: ExecutionLayer> H2Service<E> {
                     self.proposed_view = None;
                     self.proposal_deferred = true;
                     self.defer_reason = Some("the QC moved during the build");
-                    return;
+                    return Ok(());
                 }
                 debug!(target: "n42.h2.node", view, block = ?built.hash, txs = built.tx_count, "built a block to propose");
                 self.remember_imported(built.hash);
@@ -2718,6 +2735,11 @@ impl<E: ExecutionLayer> H2Service<E> {
                 {
                     warn!(target: "n42.h2.node", %err, view, "engine refused our own block");
                 }
+                // The proposal is in the engine's output channel now; it used
+                // to wait there for the step's drain, behind the next build's
+                // request and the own import's spawn below. Handled here, in
+                // order, up to and including the proposal.
+                self.send_own_proposal(events).await?;
                 // Flush before importing, and import before returning.
                 //
                 // Before: the flush at the end of the step meant the 80 ms of
@@ -2792,13 +2814,14 @@ impl<E: ExecutionLayer> H2Service<E> {
                     self.proposed_view = None;
                     self.proposal_deferred = true;
                     self.defer_reason = Some("the parent is still importing");
-                    return;
+                    return Ok(());
                 }
                 // The view will time out and move on; that is the correct
                 // outcome for a leader that cannot produce.
                 warn!(target: "n42.h2.node", %err, view, "could not build a block to propose");
             }
         }
+        Ok(())
     }
 
     fn apply_driver_action(

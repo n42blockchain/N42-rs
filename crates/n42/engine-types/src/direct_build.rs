@@ -456,25 +456,42 @@ pub fn opener_on_sealed_parent<C>(client: C, parent: SealedHeader, built_hash: B
 where
     C: StateProviderFactory + Send + Sync + 'static,
 {
-    let filed: Arc<OnceLock<ExecutedParent>> = Arc::new(OnceLock::new());
+    // The parent as filed, and (`N42_OUTPUT_SHARDS`) the shard set its
+    // residual is laid over, when the shards came before `StateReady`.
+    type Filed = (ExecutedParent, Option<Arc<crate::output_shards::FrozenShards>>);
+    let filed: Arc<OnceLock<Filed>> = Arc::new(OnceLock::new());
     Arc::new(move || {
-        let executed = match filed.get() {
-            Some(executed) => executed.clone(),
+        let (executed, shards) = match filed.get() {
+            Some(filed) => filed.clone(),
             None => {
                 let at = std::time::Instant::now();
-                let execution =
-                    crate::built_executions::wait_for(built_hash, crate::built_executions::Stage::StateReady)
-                        .ok_or(reth_storage_api::errors::ProviderError::StateForHashNotFound(parent.hash()))?;
+                let state = crate::built_executions::wait_for_state(built_hash)
+                    .ok_or(reth_storage_api::errors::ProviderError::StateForHashNotFound(parent.hash()))?;
+                let sharded = matches!(state, crate::built_executions::ParentState::Sharded(_));
                 tracing::debug!(
                     target: "payload_builder",
                     number = parent.number,
                     wait_ms = at.elapsed().as_millis() as u64,
+                    sharded,
                     "the sealed parent's output is filed; the build opens its state on it"
                 );
-                filed.get_or_init(|| executed_from_output(&parent, execution.execution_output)).clone()
+                filed
+                    .get_or_init(|| match state {
+                        crate::built_executions::ParentState::Full(execution) => {
+                            (executed_from_output(&parent, execution.execution_output), None)
+                        }
+                        crate::built_executions::ParentState::Sharded(sharded) => {
+                            (executed_from_output(&parent, sharded.residual), Some(sharded.shards))
+                        }
+                    })
+                    .clone()
             }
         };
         let historical = state_at_soon(&client, parent.parent_hash)?;
+        let historical: StateProviderBox = match shards {
+            Some(shards) => Box::new(crate::output_shards::ShardLayer::new(historical, shards)),
+            None => historical,
+        };
         Ok(overlay_on_executed(historical, vec![executed]))
     })
 }
@@ -971,5 +988,54 @@ mod tests {
         // A second open (one per execution batch) reuses the filed parent.
         let again = opener_on_sealed_parent(grandparent_state(), sealed, built_hash)().expect("opens again");
         assert_eq!(again.basic_account(&sender).expect("read").map(|a| a.nonce), Some(5));
+    }
+
+    /// `N42_OUTPUT_SHARDS`: the parent's output as its shard set with the
+    /// executor's own changes over it, filed before `StateReady`, opens the
+    /// state the merged bundle does -- the executor's newer value first (a
+    /// withdrawal to a sender), the shards next, the grandparent last.
+    #[test]
+    fn a_build_on_the_parents_shards_reads_its_post_state() {
+        let sender = Address::with_last_byte(0x41);
+        let created = Address::with_last_byte(0x42);
+        let untouched = Address::with_last_byte(0x43);
+        let grandparent = B256::with_last_byte(0x4a);
+        let grandparent_state = || {
+            let client = MockEthProvider::default();
+            client.add_account(sender, ExtendedAccount::new(0, U256::from(100)));
+            client.add_account(untouched, ExtendedAccount::new(4, U256::from(40)));
+            client
+        };
+        let batch = BundleState::builder(42..=42)
+            .state_original_account_info(sender, AccountInfo { nonce: 0, balance: U256::from(100), ..Default::default() })
+            .state_present_account_info(sender, AccountInfo { nonce: 5, balance: U256::from(50), ..Default::default() })
+            .state_present_account_info(created, AccountInfo { nonce: 0, balance: U256::from(7), ..Default::default() })
+            .build();
+        let shards = crate::output_shards::OutputShards::new(Address::with_last_byte(0x01), 2, 16);
+        shards.add(batch);
+        let shards = std::sync::Arc::new(shards.freeze());
+        let residual = BundleState::builder(42..=42)
+            .state_original_account_info(sender, AccountInfo { nonce: 5, balance: U256::from(50), ..Default::default() })
+            .state_present_account_info(sender, AccountInfo { nonce: 5, balance: U256::from(55), ..Default::default() })
+            .build();
+        let header = Header { number: 42, parent_hash: grandparent, gas_used: 42_000, ..Default::default() };
+        let execution = execution_of(&header, residual);
+        let built_hash = execution.block.hash();
+        let sealed = SealedHeader::seal_slow(Header { extra_data: b"view 42".as_slice().into(), ..header.clone() });
+        crate::built_executions::remember_pending(built_hash, execution.block.clone());
+        crate::built_executions::shards_ready(
+            built_hash,
+            crate::built_executions::ShardedParent { residual: execution.execution_output.clone(), shards },
+        );
+        let on_shards = opener_on_sealed_parent(grandparent_state(), sealed.clone(), built_hash)()
+            .expect("the parent's state opens on its shards");
+        let read = |address: Address| {
+            on_shards.basic_account(&address).expect("read").map(|a| (a.nonce, a.balance))
+        };
+        assert_eq!(read(sender), Some((5, U256::from(55))), "the executor's change over the shard's");
+        assert_eq!(read(created), Some((0, U256::from(7))), "the shard's account");
+        assert_eq!(read(untouched), Some((4, U256::from(40))), "the grandparent's");
+        assert_eq!(read(Address::with_last_byte(0x44)), None);
+        assert_eq!(on_shards.block_hash(42).expect("read"), Some(sealed.hash()), "BLOCKHASH is the sealed hash");
     }
 }

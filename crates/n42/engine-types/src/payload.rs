@@ -1292,6 +1292,14 @@ where
     let mut par_graft_split_us = 0u64;
     let mut par_graft_build_us = 0u64;
     let mut par_graft_merge_us = 0u64;
+    // `N42_OUTPUT_SHARDS` (docs/BREAKTHROUGH_DESIGN.md section 3): the
+    // parallel step's output left in address-range shards and never grafted;
+    // carried to the finish behind the seal, where the next build is let go
+    // on it before the block's one bundle is built.
+    let mut output_shards: Option<crate::output_shards::FrozenShards> = None;
+    let mut out_shards = 0usize;
+    let mut shard_insert_ms = 0u64;
+    let mut shard_wait_ms = 0u64;
     let mut par_transfer_timers = crate::fast_transfer::TransferTimers::default();
     // `N42_GRAFT_PREFAULT=1`: how long the graft's memory took to map, on its
     // own thread beside the parallel step (not on the chain).
@@ -1587,14 +1595,24 @@ where
             // graft was 60 ms of the leader's serial chain, loop173-174). The
             // block's state is untouched until the install below, so a batch
             // that fails still leaves the serial path a clean state.
-            let staged = crate::parallel_transfer::graft_stream().then(|| {
+            // `N42_OUTPUT_SHARDS=<S>`: each batch writes its accounts into the
+            // shard that owns each address instead (the streamed graft is
+            // not used beside it).
+            let shard_count = crate::output_shards::output_shards();
+            let sharded_out = (shard_count > 0).then(|| {
+                crate::output_shards::OutputShards::new(group_env.block_env.beneficiary, keys.len(), shard_count)
+            });
+            let staged = (sharded_out.is_none() && crate::parallel_transfer::graft_stream()).then(|| {
                 std::sync::Mutex::new(crate::parallel_transfer::StagedGraft::new(group_env.block_env.beneficiary, keys.len()))
             });
             let sink = staged.as_ref().map(|staged| {
                 move |bundle: revm::database::BundleState| staged.lock().expect("the staged graft's lock").add(bundle)
             });
-            let sink: Option<&(dyn Fn(revm::database::BundleState) + Sync)> =
-                sink.as_ref().map(|sink| sink as &(dyn Fn(revm::database::BundleState) + Sync));
+            let shard_sink = sharded_out.as_ref().map(|shards| move |bundle: revm::database::BundleState| shards.add(bundle));
+            let sink: Option<&(dyn Fn(revm::database::BundleState) + Sync)> = match shard_sink.as_ref() {
+                Some(sink) => Some(sink as &(dyn Fn(revm::database::BundleState) + Sync)),
+                None => sink.as_ref().map(|sink| sink as &(dyn Fn(revm::database::BundleState) + Sync)),
+            };
             // `N42_BUILD_COLLECT_IN_PLACE=1`: the transfers stay in the slots the
             // batches wrote them to; the body and the receipts below are made from
             // there on the worker pool rather than after a serial move of all of
@@ -1608,7 +1626,7 @@ where
             // transfers: a block of distinct senders and recipients touches
             // at most twice as many, the bench's shape 1.04x, and a map that
             // turns out short grows in the graft as it does today.
-            let prefault = crate::parallel_transfer::graft_prefault() && staged.is_none();
+            let prefault = crate::parallel_transfer::graft_prefault() && staged.is_none() && sharded_out.is_none();
             // `N42_SEAL_AT_EXEC=1`: the transactions root over the pulled
             // candidates, in pull order, on a thread of its own (not the build
             // pool, whose threads the execution uses) while the batches run.
@@ -1682,6 +1700,13 @@ where
                 Ok(mut run) => {
                     use reth_evm::execute::BlockExecutor as _;
                     let beneficiary = group_env.block_env.beneficiary;
+                    // The batches are done: the shards lose their locks.
+                    let sharded_out = sharded_out.map(crate::output_shards::OutputShards::freeze);
+                    if let Some(shards) = sharded_out.as_ref() {
+                        out_shards = shards.shard_count();
+                        shard_insert_ms = shards.insert_ms();
+                        shard_wait_ms = shards.wait_ms();
+                    }
                     par_collect_ms = run.phases.collect_ms;
                     par_release_ms = run.phases.release_ms;
                     let fold_at = std::time::Instant::now();
@@ -1848,12 +1873,13 @@ where
                     // turns the skip on; the cache insert per account was
                     // ~a third of a 70 ms graft.
                     let block_full = block_gas_limit.saturating_sub(cumulative_gas_used) < MIN_TRANSACTION_GAS;
-                    let withdrawals_clear = attributes.withdrawals.as_ref().is_none_or(|ws| match staged.as_ref() {
-                        Some(staged) => {
+                    let withdrawals_clear = attributes.withdrawals.as_ref().is_none_or(|ws| match (staged.as_ref(), sharded_out.as_ref()) {
+                        (Some(staged), _) => {
                             let staged = staged.lock().expect("the staged graft's lock");
                             ws.iter().all(|w| !staged.holds(&w.address))
                         }
-                        None => ws.iter().all(|w| !run.bundles.iter().any(|b| b.state.contains_key(&w.address))),
+                        (None, Some(shards)) => ws.iter().all(|w| !shards.holds(&w.address)),
+                        (None, None) => ws.iter().all(|w| !run.bundles.iter().any(|b| b.state.contains_key(&w.address))),
                     });
                     // Sealed early, nothing after the graft reads the cache
                     // either: the serial loop never runs.
@@ -1912,6 +1938,23 @@ where
                     // will seal early: the seal needs it, and the graft's
                     // 60-100 ms hide it (loop139: 42 ms on the seal path).
                     let bundles = run.bundles;
+                    // `N42_OUTPUT_SHARDS`: no graft when the block seals early
+                    // (nothing after this reads the executor's cache) onto a
+                    // state with no bundle of its own; otherwise the shards are
+                    // folded into one staged map here and installed as the
+                    // streamed graft is.
+                    let (staged, mut sharded_out) = match sharded_out {
+                        Some(shards)
+                            if !keep_cache
+                                && sealing_early
+                                && tx_count > 0
+                                && builder.executor.evm_mut().db_mut().bundle_state.state.is_empty() =>
+                        {
+                            (None, Some(shards))
+                        }
+                        Some(shards) => (Some(std::sync::Mutex::new(shards.into_staged())), None),
+                        None => (staged, None),
+                    };
                     let staged = staged.map(|staged| staged.into_inner().expect("the staged graft's lock"));
                     // Of the fold: the graft alone, without the transactions
                     // root that runs beside it -- `par_fold_ms` is the longer
@@ -1941,9 +1984,20 @@ where
                         });
                         let db = builder.executor.evm_mut().db_mut();
                         let at = std::time::Instant::now();
-                        let graft = match staged {
-                            Some(staged) => crate::parallel_transfer::install_staged(db, staged, keep_cache),
-                            None => crate::parallel_transfer::graft_bundles_folded(
+                        let graft = match (staged, sharded_out.as_mut()) {
+                            // The block's output stays in its shards: only the
+                            // accounts a pre-execution call left in the cache
+                            // are committed, as deltas.
+                            (_, Some(shards)) => {
+                                let committed = shards.take_cached(db);
+                                Ok(crate::parallel_transfer::Graft {
+                                    beneficiary_delta: shards.beneficiary_delta(),
+                                    committed,
+                                    ..Default::default()
+                                })
+                            }
+                            (Some(staged), None) => crate::parallel_transfer::install_staged(db, staged, keep_cache),
+                            (None, None) => crate::parallel_transfer::graft_bundles_folded(
                                 db,
                                 bundles,
                                 beneficiary,
@@ -1952,7 +2006,8 @@ where
                                 graft_target.take(),
                             ),
                         };
-                        graft_ms = at.elapsed().as_millis() as u64;
+                        // Kept at 0 when nothing was grafted.
+                        graft_ms = if sharded_out.is_some() { 0 } else { at.elapsed().as_millis() as u64 };
                         (
                             graft,
                             root.map(|job| job.join().expect("the transactions root job does not panic")),
@@ -1995,7 +2050,13 @@ where
                                     .bundle_state
                                     .state
                                     .get(&withdrawal.address)
-                                    .and_then(|account| account.info.clone());
+                                    .and_then(|account| account.info.clone())
+                                    .or_else(|| {
+                                        sharded_out
+                                            .as_ref()
+                                            .and_then(|shards| shards.get(&withdrawal.address))
+                                            .and_then(|account| account.info.clone())
+                                    });
                                 if let Some(info) = grafted {
                                     db.insert_account(withdrawal.address, info);
                                 }
@@ -2021,6 +2082,7 @@ where
                         changes.insert(beneficiary, account);
                     }
                     revm::DatabaseCommit::commit(db, changes);
+                    output_shards = sharded_out;
                     par_fold_ms = fold_at.elapsed().saturating_sub(seal_took).as_millis() as u64;
                     par_txs = tx_count;
                     par_groups = run.phases.groups;
@@ -2120,6 +2182,7 @@ where
                             .bundle_state
                             .state
                             .get(&sender)
+                            .or_else(|| output_shards.as_ref().and_then(|shards| shards.get(&sender)))
                             .and_then(|account| account.info.as_ref())
                             .map(|info| info.nonce);
                         let nonce = match grafted {
@@ -2334,6 +2397,34 @@ where
             // inside the 26 ms before the next build could start (loop138).
             // The hashed state comes with `complete`.
             let mut bundle = db.take_bundle();
+            // `N42_OUTPUT_SHARDS`: the executor's bundle holds only what it
+            // changed after the batches. The next build is let go on it laid
+            // over the shards, then the block's one bundle is built for the
+            // roots, the engine and every `StateReady` reader.
+            let mut shard_ready_ms = 0u64;
+            let mut shard_merge_ms = 0u64;
+            let mut shards_used = 0usize;
+            if let Some(shards) = output_shards.take() {
+                shards_used = out_shards;
+                let shards = Arc::new(shards);
+                let residual = Arc::new(reth_execution_types::BlockExecutionOutput {
+                    state: bundle.clone(),
+                    result: reth_execution_types::BlockExecutionResult {
+                        receipts: Vec::new(),
+                        requests: Default::default(),
+                        gas_used: 0,
+                        blob_gas_used: 0,
+                    },
+                });
+                crate::built_executions::shards_ready(
+                    block_hash,
+                    crate::built_executions::ShardedParent { residual, shards: Arc::clone(&shards) },
+                );
+                shard_ready_ms = finish_at.elapsed().as_millis() as u64;
+                let merge_at = std::time::Instant::now();
+                bundle = shards.merged_with(bundle);
+                shard_merge_ms = merge_at.elapsed().as_millis() as u64;
+            }
             crate::parallel_transfer::append_reverts(&mut bundle, std::mem::take(&mut par_reverts));
             let execution_output = Arc::new(reth_execution_types::BlockExecutionOutput {
                 state: bundle,
@@ -2489,6 +2580,17 @@ where
                     graft_split_us = par_graft_split_us,
                     graft_build_us = par_graft_build_us,
                     graft_merge_us = par_graft_merge_us,
+                    // `N42_OUTPUT_SHARDS` (docs/BREAKTHROUGH_DESIGN.md section
+                    // 3): the shard count (0 off, or folded after all), the
+                    // batches' pool time writing into the shards and waiting
+                    // for their locks (inside `par_exec_ms`), when the next
+                    // build was let go on them (from the finish's start), and
+                    // the lazy merge into the block's one bundle behind that.
+                    shards = shards_used,
+                    shard_insert_ms,
+                    shard_wait_ms,
+                    shard_ready_ms,
+                    shard_merge_ms,
                     // `N42_SEAL_AT_EXEC=1` (plan v6 G2): sealed at the parallel
                     // step's end with the fold behind the proposal; the
                     // transactions root computed over the pulled set beside
@@ -2556,6 +2658,14 @@ where
     // Not sealable early: the hook goes unused and the caller waits for
     // the ordinary outcome. Dropped here, where the gate used to drop it.
     drop(early);
+    // The shards are kept ungrafted only for a block the gate above seals
+    // early (`sealing_early` with transactions implies it): one that reaches
+    // here would finish on a state missing the block's accounts.
+    if output_shards.is_some() {
+        return Err(PayloadBuilderError::other(std::io::Error::other(
+            "the block's output was left in its shards, but the block did not seal early",
+        )));
+    }
     // Receipts built for an early seal belong to its finish; this block's
     // executor committed none of those transactions, so it must not go on.
     if direct_receipts.is_some() {

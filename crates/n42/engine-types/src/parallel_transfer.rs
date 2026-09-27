@@ -2041,6 +2041,24 @@ impl StagedGraft {
         }
     }
 
+    /// A staged graft made of an already folded map: what
+    /// [`crate::output_shards::FrozenShards::into_staged`] hands back for a
+    /// build that needs the block's one map after all (a serial loop or a
+    /// cache-reading finish), so it installs through [`install_staged`]
+    /// exactly as a streamed graft would.
+    pub(crate) fn from_parts(
+        beneficiary: Address,
+        state: alloy_primitives::map::AddressHashMap<BundleAccount>,
+        state_size: usize,
+        contracts: alloy_primitives::map::B256HashMap<revm::bytecode::Bytecode>,
+        reverts: Vec<(Address, AccountRevert)>,
+        beneficiary_delta: U256,
+    ) -> Self {
+        let capacity = state.len();
+        let graft = Graft { beneficiary_delta, accounts: state.len(), ..Graft::default() };
+        Self { beneficiary, state, state_size, contracts, reverts, slow: Default::default(), graft, capacity }
+    }
+
     /// Whether the staged bundle carries `address`.
     pub fn holds(&self, address: &Address) -> bool {
         self.state.contains_key(address)

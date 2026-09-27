@@ -68,6 +68,32 @@ struct Entry {
     block: Arc<RecoveredBlock<Block>>,
     /// The execution, from `StateReady` on (provisional until `Complete`).
     execution: Option<BuiltExecution>,
+    /// `N42_OUTPUT_SHARDS`: the post-state as the shard set and the few
+    /// accounts the executor changed after it, between [`shards_ready`] and
+    /// `StateReady` (dropped then: the full bundle serves every later reader).
+    shards: Option<ShardedParent>,
+}
+
+/// A build's post-state before its one bundle exists: the batches' output
+/// shards and, laid over them, what the block's executor changed afterwards
+/// (`crate::output_shards`). Only the next build's overlay reads it.
+#[derive(Debug, Clone)]
+pub struct ShardedParent {
+    /// The executor's own changes (fee credit, withdrawals, system calls),
+    /// merged and taken; its receipts are empty.
+    pub residual: Arc<BlockExecutionOutput<Receipt>>,
+    /// The batches' accounts, by address range.
+    pub shards: Arc<crate::output_shards::FrozenShards>,
+}
+
+/// What [`wait_for_state`] found: the post-state as one bundle, or, earlier,
+/// as the shard set.
+#[derive(Debug, Clone)]
+pub enum ParentState {
+    /// `StateReady` or later.
+    Full(BuiltExecution),
+    /// [`shards_ready`], before `StateReady`.
+    Sharded(ShardedParent),
 }
 
 /// How long a caller waits for a stage a build has not reached: a finish
@@ -93,19 +119,34 @@ fn put(built_hash: B256, entry: Entry) {
 
 /// Remembers a finished build under the hash the builder gave it.
 pub fn remember(built_hash: B256, execution: BuiltExecution) {
-    put(built_hash, Entry { stage: Stage::Complete, block: execution.block.clone(), execution: Some(execution) });
+    put(built_hash, Entry { stage: Stage::Complete, block: execution.block.clone(), execution: Some(execution), shards: None });
 }
 
 /// A block sealed before its finish: known from here on, waited for by
 /// whoever needs its state or its execution.
 pub fn remember_pending(built_hash: B256, block: Arc<RecoveredBlock<Block>>) {
-    put(built_hash, Entry { stage: Stage::Sealed, block, execution: None });
+    put(built_hash, Entry { stage: Stage::Sealed, block, execution: None, shards: None });
 }
 
 /// The pending build's post-state is final (`execution` carries the bundle;
 /// receipts and hashed state are placeholders until [`complete`]).
 pub fn state_ready(built_hash: B256, execution: BuiltExecution) {
     advance(built_hash, Stage::StateReady, execution);
+}
+
+/// The pending build's post-state is final as a shard set
+/// (`N42_OUTPUT_SHARDS`): the next build may read it through
+/// [`wait_for_state`] before the one bundle `StateReady` carries is built.
+pub fn shards_ready(built_hash: B256, parent: ShardedParent) {
+    let (store, advanced) = store();
+    let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((_, entry)) = store.iter_mut().find(|(hash, _)| *hash == built_hash)
+        && entry.stage < Stage::StateReady
+    {
+        entry.shards = Some(parent);
+    }
+    drop(store);
+    advanced.notify_all();
 }
 
 /// The pending build is finished.
@@ -120,6 +161,7 @@ fn advance(built_hash: B256, stage: Stage, execution: BuiltExecution) {
         Some((_, entry)) => {
             entry.stage = stage;
             entry.execution = Some(execution);
+            entry.shards = None;
         }
         // Evicted (a finish that ran longer than KEEP builds), or never
         // pending: not re-filed -- that would evict a live build the engine
@@ -179,6 +221,36 @@ pub fn wait_for(built_hash: B256, stage: Stage) -> Option<BuiltExecution> {
                 drop(guard);
                 let handed = handed().lock().unwrap_or_else(|p| p.into_inner());
                 return handed.iter().rev().find(|(hash, _)| *hash == built_hash).map(|(_, built)| built.clone());
+            }
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        let (g, _) = advanced.wait_timeout(guard, deadline - now).unwrap_or_else(|p| p.into_inner());
+        guard = g;
+    }
+}
+
+/// [`wait_for`] `StateReady`, or the shard set if [`shards_ready`] comes
+/// first: the post-state the next build opens on.
+pub fn wait_for_state(built_hash: B256) -> Option<ParentState> {
+    let (store, advanced) = store();
+    let deadline = std::time::Instant::now() + WAIT;
+    let mut guard = store.lock().unwrap_or_else(|p| p.into_inner());
+    loop {
+        match guard.iter().find(|(hash, _)| *hash == built_hash) {
+            Some((_, entry)) if entry.stage >= Stage::StateReady => return entry.execution.clone().map(ParentState::Full),
+            Some((_, entry)) if entry.shards.is_some() => return entry.shards.clone().map(ParentState::Sharded),
+            Some(_) => {}
+            None => {
+                drop(guard);
+                let handed = handed().lock().unwrap_or_else(|p| p.into_inner());
+                return handed
+                    .iter()
+                    .rev()
+                    .find(|(hash, _)| *hash == built_hash)
+                    .map(|(_, built)| ParentState::Full(built.clone()));
             }
         }
         let now = std::time::Instant::now();

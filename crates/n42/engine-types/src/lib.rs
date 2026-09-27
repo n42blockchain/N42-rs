@@ -38,6 +38,7 @@ pub mod claimed_build;
 pub mod fast_transfer;
 pub mod frame_blocks;
 pub mod parallel_transfer;
+pub mod output_shards;
 pub mod hotstuff_consensus;
 mod network;
 

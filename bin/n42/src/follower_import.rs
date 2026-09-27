@@ -1933,16 +1933,51 @@ where
             )?
         }
     };
+    let execution_output = Arc::new(output);
+    let prague = chain_spec.is_prague_active_at_timestamp(recovered.timestamp);
+    // `N42_FOLLOWER_FIELDS_EARLY=1`: this block's QMDB root -- the half of its
+    // fields its child's vote waits for -- starts here, on a thread of its own
+    // with its hashing on a pool of its own ([`on_root_pool`]), beside the
+    // post-execution checks, the published output, the carry and the hashed
+    // post-state below instead of after them. The same operations on the same
+    // bundle, filed under the same hash as the root job below would file them.
+    // It answers the wait for the parent's fields it had to do first, when it
+    // began, and when it ended.
+    let early_root = if deferred && fields_early() {
+        let output = Arc::clone(&execution_output);
+        let qmdb = qmdb.clone();
+        let on_parent_output = executed_parent.is_some();
+        let spawned = std::thread::Builder::new().name("qmdb-root-early".into()).spawn(
+            move || -> Result<(u64, std::time::Instant, std::time::Instant), String> {
+                let wait_at = std::time::Instant::now();
+                // Executed on the published outputs, the parent's tree is
+                // filed by the parent's own root, which this one builds on.
+                if on_parent_output {
+                    wait_for_parent_fields(parent_hash)?;
+                }
+                let root_at = std::time::Instant::now();
+                let root = on_root_pool(|| {
+                    let ops = n42_qmdb_reth::sorted_operations_from_execution(&output.state, prague);
+                    qmdb.insert_block_operations(parent_hash, block_hash, number, ops)
+                })
+                .map_err(|err| format!("state root: {err}"))?;
+                n42_engine_types::executed_fields::remember_state_root(block_hash, root);
+                Ok((ms_between(wait_at, root_at), root_at, std::time::Instant::now()))
+            },
+        );
+        Some(spawned.map_err(|err| format!("a thread for the early QMDB root: {err}"))?)
+    } else {
+        None
+    };
     let checks_at = std::time::Instant::now();
     stage.at(4);
     consensus
-        .validate_block_post_execution(&recovered, &output.result, None, None)
+        .validate_block_post_execution(&recovered, &execution_output.result, None, None)
         .map_err(|err| format!("post-execution: {err}"))?;
     // Under deferred execution the check above filed the receipt half of this
-    // block's fields; the root below files the other.
+    // block's fields; the root files the other.
     let receipts_filed = std::time::Instant::now();
     let checks_ms = checks_at.elapsed().as_millis() as u64;
-    let execution_output = Arc::new(output);
     // The child's check can start now: its ~6,000 senders are in this
     // bundle, and it has no use for the QMDB root below -- only the fields
     // comparison has, and that one waits for it on its own
@@ -1982,16 +2017,15 @@ where
     // engine insert not having happened. A leg that cannot tell them apart
     // cannot say which one a slow import waited on.
     let root_wait_at = std::time::Instant::now();
-    if executed_parent.is_some() {
+    if executed_parent.is_some() && early_root.is_none() {
         wait_for_parent_fields(parent_hash)?;
     }
-    let root_wait_ms = root_wait_at.elapsed().as_millis() as u64;
+    let mut root_wait_ms = root_wait_at.elapsed().as_millis() as u64;
 
     // The QMDB root against the header's, which also files the block's tree
     // under its hash for the engine and the next block.
     let root_at = std::time::Instant::now();
     stage.at(6);
-    let prague = chain_spec.is_prague_active_at_timestamp(recovered.timestamp);
     // The QMDB root and the hashed post-state read the same bundle and neither
     // needs the other's result, but they run one after the other: 63 and 26 ms
     // of a 438 ms import (round 43, loop99). `N42_ROOT_HASHED_PARALLEL=1` puts
@@ -2044,7 +2078,19 @@ where
             Ok(reth_trie::HashedPostState::default())
         }
     };
-    let (root_ms, hashed_ms, hashed_state) = if !root_hashed_parallel() {
+    let (root_ms, hashed_ms, hashed_state) = if let Some(early_root) = early_root {
+        // The root has been running since the execution returned; the hashed
+        // post-state here, then the root's answer.
+        stage.at(7);
+        let hashed_at = std::time::Instant::now();
+        let hashed_state = hashed_job()?;
+        let hashed_ms = hashed_at.elapsed().as_millis() as u64;
+        let (wait_ms, began, ended) =
+            early_root.join().unwrap_or_else(|_| Err("the early QMDB root thread panicked".to_string()))?;
+        root_wait_ms = wait_ms;
+        let _ = root_filed.set(ended);
+        (ms_between(began, ended), hashed_ms, hashed_state)
+    } else if !root_hashed_parallel() {
         root_job()?;
         let root_ms = root_at.elapsed().as_millis() as u64;
         let hashed_at = std::time::Instant::now();
@@ -2279,6 +2325,38 @@ fn on_check_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     }
 }
 
+/// `N42_FOLLOWER_FIELDS_EARLY=1` (step 5a): under deferred execution this
+/// block's QMDB root -- the last of its execution fields, the one its child's
+/// vote waits for ([`wait_for_parent_fields`]) -- starts on a thread of its
+/// own the instant the execution returns, beside the post-execution checks,
+/// the published output and the carry instead of after them, and its hashing
+/// runs on a pool of its own ([`on_root_pool`]). loop284 read the root at
+/// 36-38 ms alone and 100-106 on every other block, where it shared the worker
+/// pool with the next block's execution batches, and the next block's vote
+/// waited those extra ~65 ms. The root is the same computation on the same
+/// bundle, filed under the same hash; only where and when it runs moves.
+fn fields_early() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_FIELDS_EARLY").is_ok_and(|v| v == "1"))
+}
+
+/// Runs the early QMDB root's hashing on its own pool
+/// (`N42_FOLLOWER_ROOT_THREADS`, default 8). One root at a time: the forest's
+/// mutex is taken inside, on one of this pool's workers, and a worker that
+/// holds it and waits for its own hashing may steal whatever else is queued
+/// here -- a second root would then wait for the lock its own thread holds
+/// (loop164 O17). Serialised, nothing else is ever queued on this pool.
+fn on_root_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    static ONE: Mutex<()> = Mutex::new(());
+    match POOL.get_or_init(|| side_pool("N42_FOLLOWER_ROOT_THREADS", "qmdb-root", 8)) {
+        Some(pool) => {
+            let _one = ONE.lock().unwrap_or_else(|p| p.into_inner());
+            pool.install(f)
+        }
+        None => f(),
+    }
+}
 /// Milliseconds from `from` to `to`, zero if `to` is earlier.
 fn ms_between(from: std::time::Instant, to: std::time::Instant) -> u64 {
     to.saturating_duration_since(from).as_millis() as u64
@@ -2301,6 +2379,51 @@ pub fn parallel_state_commit() -> bool {
     *ON.get_or_init(|| std::env::var("N42_PARALLEL_STATE_COMMIT").map_or(true, |v| v != "0"))
 }
 
+
+#[cfg(test)]
+mod side_pool_tests {
+    use super::*;
+
+    /// The early root's hashing runs on the root pool's threads, and two
+    /// roots at once -- each taking a lock inside, as the forest's mutex is
+    /// taken -- finish: the pool never hands one root's closure to a worker
+    /// that holds the other's lock.
+    #[test]
+    fn roots_run_on_their_pool_one_at_a_time() {
+        static FOREST: Mutex<u64> = Mutex::new(0);
+        let root = || {
+            on_root_pool(|| {
+                use rayon::prelude::*;
+                let mut forest = FOREST.lock().unwrap_or_else(|p| p.into_inner());
+                let names: Vec<bool> = (0..64u64)
+                    .into_par_iter()
+                    .map(|_| std::thread::current().name().is_some_and(|name| name.starts_with("qmdb-root-")))
+                    .collect();
+                *forest += 1;
+                names.into_iter().all(|on_pool| on_pool)
+            })
+        };
+        let (a, b) = std::thread::scope(|scope| {
+            let a = scope.spawn(root);
+            let b = scope.spawn(root);
+            (a.join().unwrap_or(false), b.join().unwrap_or(false))
+        });
+        assert!(a && b, "every piece of the roots' hashing ran on the root pool");
+        assert_eq!(*FOREST.lock().unwrap_or_else(|p| p.into_inner()), 2);
+    }
+
+    /// The early check's scan runs on the check pool's threads.
+    #[test]
+    fn checks_run_on_their_pool() {
+        let on_pool = on_check_pool(|| {
+            use rayon::prelude::*;
+            (0..64u64)
+                .into_par_iter()
+                .all(|_| std::thread::current().name().is_some_and(|name| name.starts_with("vote-check-")))
+        });
+        assert!(on_pool);
+    }
+}
 
 #[cfg(test)]
 mod parent_output_tests {

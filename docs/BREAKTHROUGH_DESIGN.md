@@ -862,3 +862,23 @@ cached/residual/receipts/drop_ms`, `keys_ahead`); the keys in one parallel pass 
 the road with `N42_FOLLOWER_PARTITION_AHEAD=1`; the executor's pre/post on the calling thread beside the batches,
 the results in place (no 163k collect), the receipts beside the freeze; the root spawned at the execution's
 return (`root_gap_ms`). The call 62-63 -> 56 with the keys ahead. loop289: A / LIVE / Ab / LIVEb.
+
+### 10.34 Steps 6a and 5d on the fleet (loop289): 1,186,528; the seal 98-103, the follower's fields 107-118
+
+| leg | win1 | cycle (dissect) | B | D | leader: start / prep / exec / index / commit / sealed_at | index append (pool) | follower: road end / exec / fields | win2 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| A | 1,166,093 | - | - | - | 13 / 8 / 35 / 11 / 1 / 103 | 5 | 28 / 50 / 118 | 700k |
+| LIVE | **1,186,528** | 125 | 39 | 55 | 14 / 9 / 38 / 3 / 1 / 98 | 52 | 26 / 44 / 107 | 760k |
+| Ab | 1,181,815 | 127 | 46 | 49 | 14 / 10 / 33 / 12 / 1 / 103 | 7 | 26 / 49 / 113 | 760k |
+| LIVEb (slow kind, gate 25 ms) | 1,112,102 | - | - | - | 13 / 9 / 41 / 3 / 1 / 99 | 49 | 29 / 47 / 118 | 711k |
+
+The leader's commit 12 -> 1 (the body from the prep: prep 4 -> 8-10), the index 11-12 -> 3 with the live entry
+(its append 5 -> 50 of pool time inside the execution: `par_exec` 35 -> 38-41, a wash on the seal), the seal
+114 -> 98-103. The follower's execution 72 -> 44-50 and its fields 133 -> 107-118 (the keys ahead, the pieces
+beside the batches, the root at the return). The whole hand-over never matched on the fleet (`queue_whole`
+false on every block: the parent's taken list is not the body position by position there), and
+`next_start_gap` is 0: the child starts at the parent's seal. **Neither chain is the cycle now**: the seal is
+~100, the follower's fields ~110, and the cycle 125-127 (window 1,182-1,187k) with B 39-46 and D 49-55 -- the
+leader waits ~50 after the quorum, and the pacing is 100. What the 25 between the seal and the cycle is (the
+proposal after the seal, the view's turn, the pacing's rounding) needs the leader's own timeline: build start,
+seal, proposal, quorum, next start, next seal, per block.

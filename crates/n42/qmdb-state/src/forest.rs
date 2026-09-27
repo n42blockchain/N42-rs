@@ -282,17 +282,17 @@ pub struct Released {
 
 impl Released {
     /// Whether nothing was released.
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.records.is_empty() && self.twig_nodes.is_empty()
     }
 
     /// How many block records were released.
-    pub fn records(&self) -> usize {
+    pub const fn records(&self) -> usize {
         self.records.len()
     }
 
     /// How many twig leaf trees were released.
-    pub fn twigs(&self) -> usize {
+    pub const fn twigs(&self) -> usize {
         self.twig_nodes.len()
     }
 
@@ -861,7 +861,7 @@ impl QmdbForest {
     /// node's forest lock that was the 300-975 ms "slow QMDB root" every ~44
     /// blocks (loop291 P100: the leader's root job waited for the lock, its own
     /// block reached its engine a second late, and the chained child's seal
-    /// waited 600-670 ms for the parent's fields; BREAKTHROUGH_DESIGN 10.38).
+    /// waited 600-670 ms for the parent's fields; `BREAKTHROUGH_DESIGN` 10.38).
     pub fn set_canonical_releasing(&mut self, block_hash: B256) -> Result<Released, StateError> {
         let number = self
             .records

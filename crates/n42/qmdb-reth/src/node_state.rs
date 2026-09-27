@@ -237,12 +237,12 @@ const RELEASE_LOG_RECORDS: usize = 4;
 /// allocation apiece), their undos and thousands of 128 KiB twig trees. Freed
 /// under the lock, that held every QMDB root behind it for 300-975 ms every
 /// ~44 blocks (loop291 P100): the leader's own block reached its engine a
-/// second late ("own block imported by header round_trip_ms=1003") and the
+/// second late (`own block imported by header round_trip_ms=1003`) and the
 /// chained child's seal waited 600-670 ms for the parent's fields.
 fn release_off_lock(head: u64, released: Released) {
     use std::sync::mpsc::Sender;
     use std::sync::OnceLock;
-    static RELEASER: OnceLock<Option<Mutex<Sender<(u64, Released)>>>> = OnceLock::new();
+    static RELEASER: OnceLock<Option<Sender<(u64, Released)>>> = OnceLock::new();
     if released.is_empty() {
         return;
     }
@@ -264,12 +264,12 @@ fn release_off_lock(head: u64, released: Released) {
                 }
             })
             .ok()
-            .map(|_| Mutex::new(sender))
+            .map(|_| sender)
     });
     // Without the thread (it could not be spawned, or it is gone) the frees
     // happen here: still after the forest's lock is released.
     if let Some(sender) = releaser {
-        let sent = sender.lock().unwrap_or_else(std::sync::PoisonError::into_inner).send((head, released));
+        let sent = sender.send((head, released));
         if let Err(std::sync::mpsc::SendError(unsent)) = sent {
             drop(unsent);
         }

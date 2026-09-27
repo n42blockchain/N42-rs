@@ -350,6 +350,7 @@ where
     fn build_on_own(&self, request: crate::direct_build::BuildOnOwnRequest) -> Result<EthBuiltPayload, String> {
         let crate::direct_build::BuildOnOwnRequest { parent, parent_execution, attributes, before_pull } = request;
         let pre_at = std::time::Instant::now();
+        OWN_ENTERED.with(|cell| cell.set(Some(pre_at)));
         let parent_hash = parent.hash();
         let parent_gas_limit = parent.gas_limit;
         let parent_built = parent_execution.built_hash();
@@ -807,6 +808,39 @@ thread_local! {
     static HANDOFF_WAIT_US: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+/// The leader's last seal-first seal: the block's number and when its hook
+/// answered. A chained build on it reads the gap from there to its own
+/// entry and start (`next_start_gap_ms`, `next_entry_gap_ms`): what lies
+/// between one block's seal and the next build's first step -- the proposal,
+/// the chained request's trip and the payload service's set-up -- is on the
+/// leader's cycle but in no build's own timers (docs/BREAKTHROUGH_DESIGN.md
+/// 10.32: the cycle 132 against `sealed_at_ms` 114).
+static LAST_SEAL: std::sync::Mutex<Option<(u64, std::time::Instant)>> = std::sync::Mutex::new(None);
+
+fn note_sealed(number: u64) {
+    let now = std::time::Instant::now();
+    if let Ok(mut last) = LAST_SEAL.lock() {
+        *last = Some((number, now));
+    }
+}
+
+/// The gap from the seal of block `number - 1` (this process's own) to `at`,
+/// ms; 0 when the parent was not sealed here or not just before.
+fn gap_from_parent_seal(number: u64, at: std::time::Instant) -> u64 {
+    match LAST_SEAL.lock().ok().and_then(|last| *last) {
+        Some((sealed, when)) if sealed.checked_add(1) == Some(number) => {
+            at.saturating_duration_since(when).as_millis() as u64
+        }
+        _ => 0,
+    }
+}
+
+thread_local! {
+    /// When this thread's chained build entered `build_on_own`, for
+    /// `next_entry_gap_ms`; taken at the build's start.
+    static OWN_ENTERED: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+
 /// Records the selector's wait for the parent's queue hand-off on this
 /// thread (see [`HANDOFF_WAIT_US`]).
 fn note_handoff_wait(waited: std::time::Duration) {
@@ -882,6 +916,7 @@ where
     // From the very top: the state provider and the cached reads are fetched
     // before anything is executed, and were outside every earlier timing.
     let build_started = std::time::Instant::now();
+    let own_entered = OWN_ENTERED.with(std::cell::Cell::take);
     let BuildArguments {
         mut cached_reads,
         config,
@@ -1520,6 +1555,7 @@ where
             let step_at = std::time::Instant::now();
             let payload = EthBuiltPayload::new(recovered.clone(), total_fees, None, None);
             ($hook)(payload.clone());
+            note_sealed(block_number);
             seal_hook_ms = step_at.elapsed().as_millis() as u64;
             let sealed_ms = seal_at.elapsed().as_millis() as u64;
             let sealed_at_ms = build_started.elapsed().as_millis() as u64;
@@ -2842,6 +2878,12 @@ where
                     // The seal gap (plan v6): see the declarations of these
                     // timers for how they sum to `sealed_at_ms`.
                     par_start_ms,
+                    // From the parent's seal (this process's, the block just
+                    // before) to this build's start and to its entry into
+                    // `build_on_own` (0 when not chained on an own seal):
+                    // the leader's cycle outside every build's timers.
+                    next_start_gap_ms = gap_from_parent_seal(block_number, build_started),
+                    next_entry_gap_ms = own_entered.map_or(0, |at| gap_from_parent_seal(block_number, at)),
                     // Of `par_start_ms`: the selection (`best_txs`, which on a
                     // chained build waits for the parent's queue hand-off --
                     // `start_handoff_ms` of it -- and then takes the queue's

@@ -971,3 +971,14 @@ median 105-108, p75 120-126, p90 157-175, and their worst blocks are the leader'
 wait on the previous block -- its own-import round trip through the engine and its state's readiness -- not
 execution, indexing or a periodic job.** Removing it is worth what the median says: the tick-bound views
 already run at 103 (1.58M/s of 163k blocks) against the leg's 128 average.
+
+Defect 22, read and fixed (198114f5f): view 925's timeline -- the seal at 0, "Canonical chain committed 923" at
++4 takes the QMDB forest lock in `on_canonical`, the root job for 924 queues behind it, the proposal goes out
+at +23, the quorum at +148, the forkchoice at +152 answers Syncing, the root is published at ~+940
+(`roots_ms` 975), the child seals at +939 with `parent_fields` 670, the own block reaches the engine at +1,019,
+"imported by header" at +1,029 (`round_trip_ms` 1,003). The forest keeps block records for the read view and
+moves that keep once per persistence batch (the view lags 30-50 blocks), so the first `set_canonical` after a
+batch dropped 28-44 blocks of records -- 163,000 ops each, one allocation a value, plus thousands of 128 KiB
+twig trees -- and freed them under the lock: 374 ms to free (0.1 ms under the lock once handed out). The fix
+hands the dropped records back and frees them on a release thread after the lock. `state_wait_on=` names the
+child's wait (block 804's 341 is not this lock). loop292: three P100 legs and a P90.

@@ -199,9 +199,11 @@ pub fn lookup(ids: impl IntoIterator<Item = B256>) -> Vec<Option<Arc<FrameScan>>
 /// (only then may the frame's summary stand for them).
 pub type Layout = Vec<(B256, usize, bool)>;
 
-fn layouts() -> &'static Mutex<std::collections::VecDeque<(B256, Arc<Layout>)>> {
-    static LAYOUTS: std::sync::OnceLock<Mutex<std::collections::VecDeque<(B256, Arc<Layout>)>>> =
-        std::sync::OnceLock::new();
+/// The last few blocks' layouts, newest last.
+type Layouts = Mutex<std::collections::VecDeque<(B256, Arc<Layout>)>>;
+
+fn layouts() -> &'static Layouts {
+    static LAYOUTS: std::sync::OnceLock<Layouts> = std::sync::OnceLock::new();
     LAYOUTS.get_or_init(Mutex::default)
 }
 
@@ -231,16 +233,19 @@ pub fn layout_of(block: &B256) -> Option<Arc<Layout>> {
 /// (in any order) and its hashes in frame order. Sums it when the flag is on,
 /// the transactions are this node's pooled type and they are exactly the
 /// frame's; otherwise does nothing.
-#[allow(clippy::ptr_arg)] // a `Vec`, because an unsized slice cannot be downcast
-pub fn note_admitted<T: 'static>(id: B256, hashes: &[B256], decoded: &Vec<T>) {
+/// `decoded` is the ingest's `Vec` of its pool's transaction type, as `Any`
+/// (`n42_tx_ingest::FrameHook`).
+pub fn note_admitted_any(id: B256, hashes: &[B256], decoded: &dyn std::any::Any) {
     use reth_transaction_pool::PoolTransaction as _;
-    if !enabled() || hashes.len() != decoded.len() {
+    if !enabled() {
         return;
     }
-    let Some(decoded) = (decoded as &dyn std::any::Any).downcast_ref::<Vec<N42PooledTransaction>>().map(Vec::as_slice)
-    else {
+    let Some(decoded) = decoded.downcast_ref::<Vec<N42PooledTransaction>>().map(Vec::as_slice) else {
         return;
     };
+    if hashes.len() != decoded.len() {
+        return;
+    }
     let in_order = decoded.iter().zip(hashes).all(|(tx, hash)| tx.hash() == hash);
     let ordered: Vec<&N42PooledTransaction> = if in_order {
         decoded.iter().collect()

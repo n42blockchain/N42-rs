@@ -659,6 +659,7 @@ struct SenderTotal {
     fault: Option<Fault>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // the tests' entry; the node calls the timed form
 fn check_includable<Provider>(
     provider: &Provider,
     parent_hash: B256,

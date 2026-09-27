@@ -1309,6 +1309,19 @@ where
     admit_decoded(pool, decoded, frame, started).await
 }
 
+/// What the node runs on every frame admitted whole, before it is queued:
+/// its id, its hashes in frame order and its decoded transactions (a
+/// `Vec` of the pool's transaction type). Set once, by the node
+/// (`n42_engine_types::frame_scan::note_admitted_any`).
+pub type FrameHook = fn(B256, &[B256], &dyn std::any::Any);
+
+static FRAME_HOOK: std::sync::OnceLock<FrameHook> = std::sync::OnceLock::new();
+
+/// Sets the [`FrameHook`]; a second call is ignored.
+pub fn set_frame_hook(hook: FrameHook) {
+    let _ = FRAME_HOOK.set(hook);
+}
+
 /// Puts recovered transactions into the pool and counts them; `started` is
 /// when their frame's recovery began.
 async fn admit_decoded<P>(
@@ -1327,8 +1340,8 @@ where
     // `N42_FOLLOWER_FRAME_SCAN=1`: the frame's includability facts, summed
     // once here so the vote road's check reads them per frame
     // (`n42_engine_types::frame_scan`).
-    if let Some(frame) = &frame {
-        n42_engine_types::frame_scan::note_admitted(frame.id, &frame.hashes, &decoded);
+    if let (Some(frame), Some(hook)) = (&frame, FRAME_HOOK.get()) {
+        hook(frame.id, &frame.hashes, &decoded as &dyn std::any::Any);
     }
     // A frame admitted whole, for the queue's frame index: noted after its
     // transactions, whichever door they take into the queue. Nothing reads

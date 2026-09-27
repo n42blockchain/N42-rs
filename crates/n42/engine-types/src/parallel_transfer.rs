@@ -3961,8 +3961,9 @@ impl ShardedExecution {
 /// recovered block, the batches run by [`execute_for_build_run`] -- the same
 /// partition, pool, batch loop and sink the leader's build runs, called
 /// rather than copied -- into index-mode output shards
-/// ([`crate::output_shards::output_shards`] of them, 16 when unset), then the
-/// block's own executor on `main_db` (pre- and post-execution changes), the
+/// ([`crate::output_shards::output_shards`] of them, 16 when unset), the
+/// block's own executor on `main_db` (pre- and post-execution changes) on
+/// the calling thread beside them, then the
 /// accounts it touched taken out of the shards as deltas
 /// ([`crate::output_shards::FrozenShards::take_cached`]) and the fee credit
 /// committed: the rule [`execute_transfers_with_plan`] applies, with nothing
@@ -4068,42 +4069,103 @@ where
     let sink = |bundle: BundleState| sink_shards.add(bundle);
     let convert = |i: usize| ((), evm_config.tx_env(reth_primitives_traits::Recovered::new_unchecked(&txs[i], senders[i])));
     split.setup_us = (call_at.elapsed().as_micros() as u64).saturating_sub(keys_us);
-    let run_at = std::time::Instant::now();
-    let run = match execute_for_build_run(&evm_env, &keys, &convert, open, Some(&sink), false, None) {
+    let thread_err = |what: &str| BlockExecutionError::other(std::io::Error::other(what.to_string()));
+
+    // The batches on a thread of their own (it waits on the build pool), the
+    // block's own executor on this one beside them: its pre-execution system
+    // calls and post-execution changes read the parent's state as the
+    // batches do and nothing the batches write -- their changes go on top
+    // of its values afterwards ([`crate::output_shards::FrozenShards::take_cached`])
+    // -- so the state sees the order the serial path gives it. The results
+    // stay in their slots (no collect): the receipts read the gas there.
+    let run_batches = || {
+        let at = std::time::Instant::now();
+        let run = execute_for_build_run(&evm_env, &keys, &convert, open, Some(&sink), true, None);
+        (run, at, std::time::Instant::now())
+    };
+    let run_executor = || -> Result<_, BlockExecutionError> {
+        let at = std::time::Instant::now();
+        let mut state = State::builder().with_database(main_db).with_bundle_update().build();
+        let (pre_us, post_us, result) = {
+            let ctx = evm_config.context_for_block(block.sealed_block()).map_err(BlockExecutionError::other)?;
+            let evm = evm_config.evm_with_env(&mut state, evm_env.clone());
+            let mut executor = evm_config.create_executor(evm, ctx);
+            executor.apply_pre_execution_changes()?;
+            let pre_us = at.elapsed().as_micros() as u64;
+            let post_at = std::time::Instant::now();
+            let (_, result) = executor.finish()?;
+            (pre_us, post_at.elapsed().as_micros() as u64, result)
+        };
+        Ok((state, result, pre_us, post_us, std::time::Instant::now()))
+    };
+    let (ran, executed) = std::thread::scope(|scope| {
+        let batches = std::thread::Builder::new().name("n42-follower-batches".into()).spawn_scoped(scope, || run_batches());
+        let executed = run_executor();
+        let ran = match batches {
+            Ok(handle) => handle.join().map_err(|_| thread_err("the build path's batches thread panicked")),
+            // No thread: the batches here, after the executor.
+            Err(_) => Ok(run_batches()),
+        };
+        (ran, executed)
+    });
+    let (run, run_at, batches_done) = ran?;
+    let run = match run {
         Ok(run) => run,
         Err(why) => return Ok(Err(why)),
     };
-    split.sink_us = (run_at.elapsed().as_micros() as u64).saturating_sub((run.phases.partition_ms + run.phases.groups_ms) * 1000);
+    let (mut state, result, pre_us, post_us, executor_done) = executed?;
+    split.pre_us = pre_us;
+    split.post_us = post_us;
+    split.executor_overrun_us = executor_done.saturating_duration_since(batches_done).as_micros() as u64;
+    split.sink_us = (batches_done.duration_since(run_at).as_micros() as u64)
+        .saturating_sub((run.phases.partition_ms + run.phases.groups_ms) * 1000);
     if let Some(&first) = run.skipped.first() {
         // The build's refusal is a skip; for a sealed block it is the other
         // executor's to judge.
         return Ok(Err(NotParallel::NotATransfer(first)));
     }
-    if run.executed.len() != keys.len() {
-        return Ok(Err(NotParallel::Failed(run.executed.len(), "a transfer's slot was left empty".to_string())));
+    if run.slots.len() != keys.len() {
+        return Ok(Err(NotParallel::Failed(run.slots.len(), "a transfer's slot was left empty".to_string())));
     }
     let mut phases = run.phases;
     phases.partition_ms += keys_us / 1000;
     phases.threads = build_pool().current_num_threads();
+    phases.finish_ms = (pre_us + post_us) / 1000;
 
-    // The batches are done: the index over their maps (on the build pool),
-    // then the block's own executor on the main state.
+    // The batches are done: the index over their maps (on the build pool)
+    // and, beside it, the receipts in block order with the gas cumulated.
     let merge_at = std::time::Instant::now();
-    let mut shards = sink_shards.freeze();
-    let at = std::time::Instant::now();
-    let mut state = State::builder().with_database(main_db).with_bundle_update().build();
-    let result = {
-        let ctx = evm_config.context_for_block(block.sealed_block()).map_err(BlockExecutionError::other)?;
-        let evm = evm_config.evm_with_env(&mut state, evm_env.clone());
-        let mut executor = evm_config.create_executor(evm, ctx);
-        executor.apply_pre_execution_changes()?;
-        split.pre_us = at.elapsed().as_micros() as u64;
-        let post_at = std::time::Instant::now();
-        let (_, result) = executor.finish()?;
-        split.post_us = post_at.elapsed().as_micros() as u64;
-        result
+    let receipts_of = || {
+        let at = std::time::Instant::now();
+        let mut cumulative = 0u64;
+        let mut receipts: Vec<Receipt> = Vec::with_capacity(txs.len());
+        for (i, (tx, slot)) in txs.iter().zip(&run.slots).enumerate() {
+            let Some(built) = slot.get() else { return (Err(i), at, std::time::Instant::now()) };
+            cumulative += built.gas_used;
+            receipts.push(Receipt { tx_type: tx.tx_type(), success: true, cumulative_gas_used: cumulative, logs: Vec::new() });
+        }
+        (Ok((receipts, cumulative)), at, std::time::Instant::now())
     };
-    phases.finish_ms = at.elapsed().as_millis() as u64;
+    let (mut shards, frozen, made) = std::thread::scope(|scope| {
+        let side = std::thread::Builder::new().name("n42-follower-receipts".into()).spawn_scoped(scope, || receipts_of());
+        let shards = sink_shards.freeze();
+        let frozen = std::time::Instant::now();
+        let made = match side {
+            Ok(handle) => handle.join().map_err(|_| thread_err("the build path's receipts thread panicked")),
+            Err(_) => Ok(receipts_of()),
+        };
+        (shards, frozen, made)
+    });
+    let (receipts, receipts_at, receipts_done) = made?;
+    let (receipts, gas_used) = match receipts {
+        Ok(made) => made,
+        Err(i) => return Ok(Err(NotParallel::Failed(i, "a transfer's slot was left empty".to_string()))),
+    };
+    phases.graft_ms = frozen.duration_since(merge_at).as_millis() as u64;
+    phases.receipts_us = receipts_done.duration_since(receipts_at).as_micros() as u64;
+    split.receipts_us = phases.receipts_us;
+    split.receipts_wait_us = receipts_done.saturating_duration_since(frozen).as_micros() as u64;
+
     let err = |e: &dyn std::fmt::Display| BlockExecutionError::other(std::io::Error::other(e.to_string()));
     // What the executor touched and the batches wrote: the batches' change
     // on top of the executor's value. The rest stays in the shards.
@@ -4129,28 +4191,18 @@ where
     state.merge_transitions(BundleRetention::Reverts);
     let residual = state.take_bundle();
     split.residual_us = residual_at.elapsed().as_micros() as u64;
-    // The index, the take and the fee: the executor's own part is `finish_ms`.
-    phases.merge_ms = (merge_at.elapsed().as_millis() as u64).saturating_sub(phases.finish_ms);
-    // Of `merge_ms`: the index over the batches' maps.
-    phases.graft_ms = at.duration_since(merge_at).as_millis() as u64;
+    // The index, the receipts' wait, the take and the fee: the executor's
+    // own part (`finish_ms`) ran beside the batches.
+    phases.merge_ms = merge_at.elapsed().as_millis() as u64;
+    let result = reth_execution_types::BlockExecutionResult { receipts, gas_used, ..result };
 
-    // Receipts in block order, gas cumulated.
+    // The slots (one per transfer) and the keys freed on the pool, off the
+    // chain.
     let at = std::time::Instant::now();
-    let mut cumulative = 0u64;
-    let receipts: Vec<Receipt> = txs
-        .iter()
-        .zip(&run.executed)
-        .map(|(tx, built)| {
-            cumulative += built.gas_used;
-            Receipt { tx_type: tx.tx_type(), success: true, cumulative_gas_used: cumulative, logs: Vec::new() }
-        })
-        .collect();
-    phases.receipts_us = at.elapsed().as_micros() as u64;
-    split.receipts_us = phases.receipts_us;
-    let result = reth_execution_types::BlockExecutionResult { receipts, gas_used: cumulative, ..result };
-    let at = std::time::Instant::now();
-    drop(run);
-    drop(keys);
+    build_pool().spawn(move || {
+        drop(run);
+        drop(keys);
+    });
     phases.drop_us = at.elapsed().as_micros() as u64;
     phases.total_us = call_at.elapsed().as_micros() as u64;
     Ok(Ok((ShardedExecution { shards, residual, result, split }, phases)))

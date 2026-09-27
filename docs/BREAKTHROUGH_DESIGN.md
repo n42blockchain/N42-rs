@@ -547,3 +547,19 @@ cycle -- the followers import in overlap and fall behind under load (`imports_ov
 follower cannot vote on N+1 until it has what N+1's header claims about N. Step 3 is therefore done as far as
 the leader is concerned (the fold 40 -> 11, graft and state wait 0, the chain 120-130 -> the pacing binds), and
 the order moves to the followers: B's 65 ms outside the road, and the import's 184 (steps 4 and 5).
+
+### 10.18 B dissected (loop280 IDXP100b): the road twice, and the leader's own wait for its seal
+
+Per full block of window 1 across the three nodes' logs (the hosts share a clock): the leader's body prepared ->
+the followers' receipt 0.17 ms; receipt -> vote road start 1.05; the road 37 (node1 31.5, node2 42); road end ->
+vote sent 0.8; the later follower's vote -> the leader's commit 5.3. So a block's vote is the slower follower's
+road plus ~7 ms of transit and aggregation -- ~50 -- and B's logged 103-111 is the rest: R1_collect starts at the
+view, and the view starts before the leader's own build has sealed (the chain 120-130 against pacing 100). The
+cycle is therefore still `sealed_at` + ~20 (loop278 119 -> 143, loop280 120 -> 146, 130 -> 153), and inside
+`sealed_at` the execution (57-62) is the largest term, then the fold (index 11 inside `par_fold` 19-20), the start
+(14), the commit (8), the seal (7). The follower's import is 172 (node1) / 199 (node2) with the named fields
+summing to the total (exec 71-73, checks 7, root 38-46, mined 4, engine 16-28); imports overlap 68-86% of the
+time, and the slow tail (>300 ms: 41-45 a leg, doubling from window 1 to 3) is an unnamed residual of 120-140
+under that overlap. **Section 4 next**: the execution's reads, on both sides, with `N42_PHASE_TIMERS=1` for the
+current shape first (the 2.3 us / 87% figures are from plan v4), and design A (the per-block read set) built in
+parallel; the CPU profile still needs `kernel.perf_event_paranoid=1` on the host.

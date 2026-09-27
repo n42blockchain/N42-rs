@@ -431,3 +431,31 @@ node's 74 logical CPUs (37 physical + siblings). The single-threaded graft is im
 not. loop277 logs each task's CPU, faults, migrations and preemptions on the fleet, and runs one S16 leg with
 fewer competing threads (rayon 8, ingest recover 4: attested frames need no verification) to see whether the
 fold, and the execution beside it, get their cores back.
+
+### 10.14 The fold's tasks on the fleet (loop277): CPU equals wall, no faults, no preemption -- memory
+
+| leg | win1 | cycle | fold (wall) | task_max / task_cpu_max ms | faults (max / sum) | migrated / preempted | merge | roots | sealed_at |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| OFF | 1,070,094 | 152 | graft 45 | - | - | - | - | 36 | 133 |
+| S16 | 1,053,399 | 155 | 40 | 40.8 / 40.8 | 452 / 453 | 0 / 0 | 58 | 60 | 145 |
+| S16Q (rayon 8, ingest 4) | 1,004,901 | 162 | 39 | 38.9 / 38.9 | 545 / 546 | 0 / 0 | 57 | 61 | 143 |
+| OFFb | **1,091,680** | 149 | graft 44 | - | - | - | - | 36 | 132 |
+
+The slowest task's CPU time is its wall time to the microsecond, it is never preempted or migrated, and single
+lines show tasks at 29.8 ms with one fault and 41.5 with 366: the faults are not it, the scheduler is not it,
+and fewer competing threads (S16Q) changed nothing. A task spends 30-40 ms of CPU on ~9k inserts -- 3.3-4.4 us
+each against 0.4 off the fleet -- and CPU time on a stalled load is still CPU time: **the fold is memory-bound
+under the fleet's memory load.** Each insert reads a 264-byte account from a batch map written ~50 ms earlier on
+another core (cold: the node's 60 threads have been through the caches since) and writes it into a fresh map --
+ten or so cache lines a piece, and under three nodes' worth of roots, merges, executions and floods on one
+socket the miss latency is what it is. The graft (44-45 on the fleet, 24 off) pays the same per-line price but
+misses one line at a time from one thread; sixteen threads missing at once do not go sixteen times faster on a
+saturated memory system. Closing 10.9's question: the partition was not slow by shape, it is slow by bytes.
+
+The loop's best window is now 1,091,680 (OFFb; sixteen legs at 1.005-1.092M). What the five step-3 legs
+establish is that the leader's fold is bound by the bytes it moves (147k x 264 B in, the same out) rather than
+by the thread count, so the way to shorten it is to move fewer bytes: keep the batches' maps as they are and
+build only an *index* (address -> batch, slot: 16 bytes) as the block's map -- 2.4 MB instead of 40, one
+probe more on a read -- with the roots and the merge iterating the batches directly. That is a rewrite of the
+graft rather than of the shards, and it is the last step-3 attempt: if the index does not bring the fold under
+~15 ms on the fleet, step 3 closes and the order moves to 4/5.

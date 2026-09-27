@@ -50,6 +50,8 @@ tracing.workspace = true
 reth-db = { workspace = true, features = ["mdbx"] }
 reth-db-api.workspace = true
 revm-state.workspace = true
+# `records_cost` runs on the allocator the node runs on (`MALLOC_CONF` read).
+tikv-jemallocator = { workspace = true, features = ["unprefixed_malloc_on_supported_platforms"] }
 
 [lints]
 workspace = true

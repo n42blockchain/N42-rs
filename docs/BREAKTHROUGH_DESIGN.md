@@ -522,3 +522,28 @@ parent's state root, so the seal waits for a root that is published 35 ms later 
 rejected block") -- new, and the QMDB reader shares the timing the merge changed. Next: publish the parent's
 state root the moment the QMDB root job finishes and run the merge strictly after that, on a helper thread that
 is neither the builder's nor the reader's; find why the reader did not answer.
+
+### 10.17 The root first (loop280): the leader's chain is under the pacing; B and the follower's import are the cycle
+
+5af5d3d17 (the state root published the moment the QMDB root job finishes, the merge after it on its own thread)
+and dee53c148 (the journals a persistence batch's readers need are held until the batch commits: the batch had
+grown past the 64-step journal depth, so every read until the commit was declined -- the "reader did not answer").
+
+| leg | pacing | win1 | cycle | B | D | E | sealed_at | roots | state_ready | merge | exec | invalid / refusals / TCs |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| IDXP100 | 100 | 1,075,734 | 147 | 107 | 8 | 8 | 128 | 36 | 97 | 52 | 62 | 0 / 0 / 1 |
+| IDXP100b | 100 | 1,075,741 | 146 | 103 | 8 | 9 | 120 | 35 | 95 | 52 | 57 | 0 / 0 / 1 |
+| IDX | 125 | 1,064,871 | 153 | - | - | - | 130 | 35 | 98 | 52 | 62 | 0 / 0 / 1 |
+| IDXP110 | 110 | 1,070,327 | 152 | - | - | - | 124 | 35 | 100 | 54 | 57 | 0 / 0 / 1 |
+
+Every leg clean. The roots are the root job alone again (35-36) and the seal 120-130 (it follows `par_exec`
+57-62). At pacing 100 the leader's wait D is 8: **the leader's chain is under the pacing for the first time**, and
+the cycle did not follow (146-147) because the term is now B, the proposal-to-quorum, at 103-107 -- of which
+the followers' vote road is 28-38 (frames all held: `frames_missing` 0, `miss_wait` 0, `parent_wait` 0, check 14,
+copy 8) and ~65 is outside the road, undissected: the description's transport, the validator's dispatch, the
+vote's signing and return, the leader's aggregation. Behind B sits the follower's import beside the loop:
+184 ms median for a full block (exec 72, checks 7, root 38, mined 4, engine 23, ~40 unnamed) against a 146 ms
+cycle -- the followers import in overlap and fall behind under load (`imports_over_600ms` 19-106 a leg), and a
+follower cannot vote on N+1 until it has what N+1's header claims about N. Step 3 is therefore done as far as
+the leader is concerned (the fold 40 -> 11, graft and state wait 0, the chain 120-130 -> the pacing binds), and
+the order moves to the followers: B's 65 ms outside the road, and the import's 184 (steps 4 and 5).

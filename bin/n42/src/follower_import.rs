@@ -1143,8 +1143,9 @@ struct Executed {
     cached: CachedReads,
     /// `None` on the build path, whose output is `sharded` until merged.
     output: Option<reth_provider::BlockExecutionOutput<n42_tx_types::Receipt>>,
-    /// The build path's output (`N42_FOLLOWER_BUILD_PATH=1`).
-    sharded: Option<n42_engine_types::parallel_transfer::ShardedExecution>,
+    /// The build path's output (`N42_FOLLOWER_BUILD_PATH=1`), its root
+    /// already started.
+    sharded: Option<StartedShards>,
     parallel: bool,
     gate_ms: u64,
     state_ms: u64,
@@ -1156,6 +1157,22 @@ struct Executed {
     /// The parallel execution taken apart ([`ExecSplit`]); zeros on the
     /// serial path.
     split: ExecSplit,
+}
+
+/// A build-path execution ([`execute_transfers_build_path_keyed`]) whose
+/// QMDB root was started the instant the call returned, on the execution's
+/// own thread -- before the execution's line, the join with the vote road
+/// and the output's hand-over (`root_gap_ms`, 5-6 ms between `exec_end_ms`
+/// and the root's start on the fleet, loop288).
+///
+/// [`execute_transfers_build_path_keyed`]: n42_engine_types::parallel_transfer::execute_transfers_build_path_keyed
+struct StartedShards {
+    shards: Arc<n42_engine_types::output_shards::FrozenShards>,
+    residual: ParentOutput,
+    result: reth_execution_types::BlockExecutionResult<n42_tx_types::Receipt>,
+    early_root: EarlyRoot,
+    /// When the execution returned: the root's start is timed against it.
+    returned: std::time::Instant,
 }
 
 /// The follower's parallel execution taken apart for the direct import's
@@ -2023,6 +2040,30 @@ where
             .map_err(|err| format!("parallel execution: {err}"))?
             {
                 Ok((out, phases)) => {
+                    // The root first: it reads the shards' view under the
+                    // residual, both final here.
+                    let returned = std::time::Instant::now();
+                    let n42_engine_types::parallel_transfer::ShardedExecution { shards, residual, result, split: bp_split } = out;
+                    let shards = Arc::new(shards);
+                    let residual: ParentOutput = Arc::new(reth_provider::BlockExecutionOutput {
+                        state: residual,
+                        result: reth_execution_types::BlockExecutionResult {
+                            receipts: Vec::new(),
+                            requests: Default::default(),
+                            gas_used: 0,
+                            blob_gas_used: 0,
+                        },
+                    });
+                    let early_root = {
+                        let (shards, residual, qmdb) = (Arc::clone(&shards), Arc::clone(&residual), qmdb.clone());
+                        let prague = chain_spec.is_prague_active_at_timestamp(recovered.timestamp);
+                        spawn_early_root(parent_hash, block_hash, executed_parent.is_some(), move || {
+                            let overlaps = shards.overlaps(&residual.state);
+                            let view = shards.view(&residual.state, &overlaps);
+                            let ops = n42_qmdb_reth::sorted_operations_from_accounts(&view, prague);
+                            qmdb.insert_block_operations(parent_hash, block_hash, number, ops).map_err(|err| format!("state root: {err}"))
+                        })?
+                    };
                     split = ExecSplit::of(&phases);
                     tracing::info!(
                         target: "n42.follower_import",
@@ -2047,22 +2088,22 @@ where
                         // Around the batches ([`BuildPathSplit`]): what
                         // `exec_ms` holds beside the partition, the batch
                         // wall and the index.
-                        exec_setup_ms = out.split.setup_us / 1000,
-                        exec_keys_ms = out.split.keys_us / 1000,
-                        keys_ahead = out.split.keys_ahead,
+                        exec_setup_ms = bp_split.setup_us / 1000,
+                        exec_keys_ms = bp_split.keys_us / 1000,
+                        keys_ahead = bp_split.keys_ahead,
                         keys_ahead_wait_ms = keys_wait_us / 1000,
-                        exec_pre_ms = out.split.pre_us / 1000,
-                        exec_post_ms = out.split.post_us / 1000,
-                        exec_overrun_ms = out.split.executor_overrun_us / 1000,
-                        exec_sink_ms = out.split.sink_us / 1000,
-                        exec_cached_ms = out.split.cached_us / 1000,
-                        exec_residual_ms = out.split.residual_us / 1000,
-                        exec_receipts_ms = out.split.receipts_us / 1000,
-                        exec_receipts_wait_ms = out.split.receipts_wait_us / 1000,
+                        exec_pre_ms = bp_split.pre_us / 1000,
+                        exec_post_ms = bp_split.post_us / 1000,
+                        exec_overrun_ms = bp_split.executor_overrun_us / 1000,
+                        exec_sink_ms = bp_split.sink_us / 1000,
+                        exec_cached_ms = bp_split.cached_us / 1000,
+                        exec_residual_ms = bp_split.residual_us / 1000,
+                        exec_receipts_ms = bp_split.receipts_us / 1000,
+                        exec_receipts_wait_ms = bp_split.receipts_wait_us / 1000,
                         exec_drop_ms = phases.drop_us / 1000,
                         "build-path import phases"
                     );
-                    sharded = Some(out);
+                    sharded = Some(StartedShards { shards, residual, result, early_root, returned });
                 }
                 Err(why) => {
                     static DECLINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2268,6 +2309,9 @@ where
     // The build path runs the post-execution checks beside its merge, and
     // (with the pass on) builds the hashed post-state from the shards' view.
     let mut pre_checked: Option<(u64, std::time::Instant)> = None;
+    // The build path: when its execution returned, which its root's start
+    // is timed against (`root_gap_ms`).
+    let mut root_returned: Option<std::time::Instant> = None;
     let mut view_hashed: Option<reth_trie::HashedPostState> = None;
     let (execution_output, early_root) = match (output, sharded) {
         (Some(output), _) => {
@@ -2299,26 +2343,8 @@ where
             // check and the published output need is merged on a thread of
             // its own beside it, while this thread runs the post-execution
             // checks; the child's execution reads the shards themselves.
-            let n42_engine_types::parallel_transfer::ShardedExecution { shards, residual, result, .. } = sharded;
-            let shards = Arc::new(shards);
-            let residual: ParentOutput = Arc::new(reth_provider::BlockExecutionOutput {
-                state: residual,
-                result: reth_execution_types::BlockExecutionResult {
-                    receipts: Vec::new(),
-                    requests: Default::default(),
-                    gas_used: 0,
-                    blob_gas_used: 0,
-                },
-            });
-            let early_root = {
-                let (shards, residual, qmdb) = (Arc::clone(&shards), Arc::clone(&residual), qmdb.clone());
-                spawn_early_root(parent_hash, block_hash, on_parent_output, move || {
-                    let overlaps = shards.overlaps(&residual.state);
-                    let view = shards.view(&residual.state, &overlaps);
-                    let ops = n42_qmdb_reth::sorted_operations_from_accounts(&view, prague);
-                    qmdb.insert_block_operations(parent_hash, block_hash, number, ops).map_err(|err| format!("state root: {err}"))
-                })?
-            };
+            let StartedShards { shards, residual, result, early_root, returned } = sharded;
+            root_returned = Some(returned);
             let merger = {
                 let (shards, residual) = (Arc::clone(&shards), Arc::clone(&residual));
                 std::thread::Builder::new()
@@ -2492,6 +2518,17 @@ where
         let (wait_ms, began, ended) =
             early_root.join().unwrap_or_else(|_| Err("the early QMDB root thread panicked".to_string()))?;
         root_wait_ms = wait_ms;
+        if let Some(returned) = root_returned {
+            tracing::info!(
+                target: "n42.follower_import",
+                number,
+                root_gap_ms = ms_between(returned, began),
+                root_gap_us = began.saturating_duration_since(returned).as_micros() as u64,
+                root_wait_ms = wait_ms,
+                root_ms = ms_between(began, ended),
+                "build path: the root's start after the execution"
+            );
+        }
         let _ = root_filed.set(ended);
         (ms_between(began, ended), hashed_ms, hashed_state)
     } else if !root_hashed_parallel() {

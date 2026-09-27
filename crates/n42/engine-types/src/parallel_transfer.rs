@@ -4036,7 +4036,6 @@ where
     G: Database + std::fmt::Debug + Send,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    use alloy_consensus::Transaction as _;
     let call_at = std::time::Instant::now();
     let evm_env = evm_config.evm_env(block.header()).map_err(BlockExecutionError::other)?;
     let beneficiary = evm_env.block_env.beneficiary;
@@ -4099,12 +4098,11 @@ where
         Ok((state, result, pre_us, post_us, std::time::Instant::now()))
     };
     let (ran, executed) = std::thread::scope(|scope| {
-        let batches = std::thread::Builder::new().name("n42-follower-batches".into()).spawn_scoped(scope, || run_batches());
+        let batches = std::thread::Builder::new().name("n42-follower-batches".into()).spawn_scoped(scope, run_batches);
         let executed = run_executor();
         let ran = match batches {
             Ok(handle) => handle.join().map_err(|_| thread_err("the build path's batches thread panicked")),
-            // No thread: the batches here, after the executor.
-            Err(_) => Ok(run_batches()),
+            Err(err) => Err(thread_err(&format!("a thread for the build path's batches: {err}"))),
         };
         (ran, executed)
     });
@@ -4147,12 +4145,12 @@ where
         (Ok((receipts, cumulative)), at, std::time::Instant::now())
     };
     let (mut shards, frozen, made) = std::thread::scope(|scope| {
-        let side = std::thread::Builder::new().name("n42-follower-receipts".into()).spawn_scoped(scope, || receipts_of());
+        let side = std::thread::Builder::new().name("n42-follower-receipts".into()).spawn_scoped(scope, receipts_of);
         let shards = sink_shards.freeze();
         let frozen = std::time::Instant::now();
         let made = match side {
             Ok(handle) => handle.join().map_err(|_| thread_err("the build path's receipts thread panicked")),
-            Err(_) => Ok(receipts_of()),
+            Err(err) => Err(thread_err(&format!("a thread for the build path's receipts: {err}"))),
         };
         (shards, frozen, made)
     });

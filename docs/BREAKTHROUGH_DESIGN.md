@@ -617,3 +617,32 @@ untimed and unnamed. That is the execution's largest term by a wide margin, on t
 loop, on the follower (`import_exec` 75). Next: time the batch loop's sections per transaction under
 `N42_PHASE_TIMERS=1`, read the loop for its per-transaction costs, and cut them; the bench (batch 13 ms for 5k
 = 2.6 us a transfer) can drive it off the fleet.
+
+### 10.22 The batch loop off the fleet (ffeeb1590..e69007bf9): 1.62 -> 1.26 us a transfer alone, 2.5 under sixteen threads
+
+The loop's sections under `N42_PHASE_TIMERS=1` (`loop_fetch/check/transfer/receipt/gas/sink/other_ns`,
+`batch_setup/close_ns`; the loop has no pre-checks and builds no receipt -- `transfer` does every check and the
+receipts come later) on the bench, ns a transfer of pool time, before -> after the cuts:
+
+| section | 1 thread | 16 threads |
+| --- | --- | --- |
+| fetch | 52 -> 48 | 60 -> 50 |
+| transfer (read / evm / write) | 714 -> 675 (620 -> 678 / 110 -> 75 / 105 -> 30) | 1,690 -> 2,030 (1,590 -> 2,020 / 110 -> 75 / 107 -> 31) |
+| gas | 23 | 23 |
+| sink | 390 -> 92 | 402 -> 93 |
+| other | 77 -> 54 | 82 -> 56 |
+| batch close | 365 -> 370 | 290 -> 268 |
+| total | **1.62 -> 1.26** | **2.56 -> 2.52** |
+
+Three cuts: the sink -- revm's `State::commit` looked each account up twice and rebuilt a plain account and a
+transition every time; a `BatchState` keeps each account as its merged transition in one map and hands the
+changed accounts to the same revert builder (be80847cc); the write -- `transfer_plain` returns the computed
+accounts instead of an `EvmState` with three boxed originals a transfer; the read's clone -- the loaded info is
+moved into `previous_info` on the first change instead of copied on every read (921de3899). The samplers had
+timed each batch's coldest transfer once in 64, inflating `read_ns` (the fleet's `exec_read` before this leg
+carries the same bias). Under sixteen threads the total barely moves because **the reads absorb what the loop
+gave up** (1.59 -> 2.02 us a transfer): less work between reads is more pressure on the view's shared line.
+The bench does not reproduce the fleet's 3.3 us outside `transfer` (its loop was 1.0 before the cuts), so what
+the fleet's loop spends is still to be named (loop283, the same keys on the fleet: the fetch's `to_consensus`
+clone and `tx_env`, `OutputShards::add` in the close, `open_db` in the setup are not in the bench). The view's
+per-read lock is the next term either way (step 4c: a snapshot per batch, the answer counter per thread).

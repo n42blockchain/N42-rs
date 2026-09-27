@@ -999,3 +999,23 @@ block, 374 ms per 28) on a side thread beside sixteen build threads allocating i
 and the memory system; under the lock it was a burst every ~44 blocks, off the lock it is continuous. The
 fix is not where the freeing happens but that there is freeing: a block's records in one allocation (the
 values in one arena `Vec<u8>` with offsets, the twig trees pooled), so a head move drops a block in O(1).
+
+### 10.40 Defect 22b on the fleet (loop293): 1,226,047; the median seal back to 96-100; the tail is the grandparent
+
+| leg | win1 | cycle | sealed_at median / p90 / over 130 | roots | QMDB releases | follower fields | imports > 600 ms | win2 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| P100 | **1,226,047** | 132 | 100 / 157 / 285 | 34 | 340 | 102 | 27 | 840k |
+| P100b | 1,193,030 | 136 | 96 / 166 / 257 | 30-33 | 321 | 107 | 30 | 558k (79% full) |
+| P100c (slow kind, gate 22 ms) | 1,102,965 | 146 | 108 / 196 / 418 | 35 | 337 | 115 | 46 | 776k |
+| P90 | 1,210,589 | 131 | 104 / 164 / 324 | 33 | 336 | 103 | 25 | 874k |
+
+With a block's records in one arena the free is nothing (the releases still fire every three blocks, now for
+0.3 ms), the roots are 30-35, the median seal 96-104 and the window 1,226k. The tail stayed: in P100, 161 of
+741 builds sealed after 130, and against the rest they differ in one field -- `state_wait` 0 -> 49 (`par_run`
+45 -> 98; the execution +6, the batch +4, nothing else) -- and `state_wait_split` says which wait: **the
+grandparent**, 16-35 ms in 22% of builds (out/gp/root/complete = 0/16-35/0/0). The chained child opens on the
+parent's shards under the parent's residual and then the grandparent *as an executed block in the engine*
+(`grandparent_state`), and the grandparent's hand-off to the engine comes after its `Complete` (the merge, the
+hashed state) and through the engine's own loop -- sometimes not yet there 100 ms after the parent's seal.
+The follower already keeps two generations of shards for this (`FOLLOWER_SHARDS`); the leader's opener should
+read the grandparent's frozen shards the same way and touch the engine only from the great-grandparent down.

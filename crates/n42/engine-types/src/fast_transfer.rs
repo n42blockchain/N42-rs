@@ -162,7 +162,10 @@ mod timers {
             c.set(n);
             n
         });
-        n % SAMPLE_STRIDE == 1
+        // Mid-stride: sampling a batch's first (coldest) call weighed it
+        // once in a stride instead of once in the batch (step 4b: `read_ns`
+        // read 3.1 us a transfer on the bench, more than the whole call).
+        n % SAMPLE_STRIDE == SAMPLE_STRIDE / 2
     }
 
     #[inline]

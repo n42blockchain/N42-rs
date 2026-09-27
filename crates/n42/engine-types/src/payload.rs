@@ -1322,6 +1322,7 @@ where
     let mut par_read_set_misses = 0u64;
     // The build's batches on the pool: imbalance, gaps, per-batch overhead.
     let mut par_batch_spans = crate::parallel_transfer::BatchSpans::default();
+    let mut par_loop_timers = crate::parallel_transfer::LoopTimers::default();
     // `N42_GRAFT_PREFAULT=1`: how long the graft's memory took to map, on its
     // own thread beside the parallel step (not on the chain).
     let mut par_prefault_ms = 0u64;
@@ -2126,6 +2127,7 @@ where
                     par_read_set_hits = run.phases.read_set_hits;
                     par_read_set_misses = run.phases.read_set_misses;
                     par_batch_spans = run.phases.batch_spans;
+                    par_loop_timers = run.phases.loop_timers;
                     par_skipped = run.skipped.len();
                     // Read by the diagnosis below, which must see what this
                     // step actually built.
@@ -2740,6 +2742,17 @@ where
                     batch_txs_min = par_batch_spans.txs_min,
                     batch_start_skew_ms = par_batch_spans.start_skew_ms,
                     batch_wait_ms = par_batch_spans.wait_ms,
+                    // `N42_PHASE_TIMERS=1`: the batch loop by section, ns of
+                    // pool time a transaction (`LoopTimers`); zero when off.
+                    loop_fetch_ns = par_loop_timers.per_tx(par_loop_timers.fetch_ns),
+                    loop_check_ns = par_loop_timers.per_tx(par_loop_timers.check_ns),
+                    loop_transfer_ns = par_loop_timers.per_tx(par_loop_timers.transfer_ns),
+                    loop_receipt_ns = par_loop_timers.per_tx(par_loop_timers.receipt_ns),
+                    loop_sink_ns = par_loop_timers.per_tx(par_loop_timers.sink_ns),
+                    loop_gas_ns = par_loop_timers.per_tx(par_loop_timers.gas_ns),
+                    loop_other_ns = par_loop_timers.per_tx(par_loop_timers.other_ns),
+                    batch_setup_ns = par_loop_timers.per_tx(par_loop_timers.batch_setup_ns),
+                    batch_close_ns = par_loop_timers.per_tx(par_loop_timers.batch_close_ns),
                     graft_base_ms = par_graft_base_ms,
                     graft_reserve_ms = par_graft_reserve_ms,
                     graft_insert_ms = par_graft_insert_ms,

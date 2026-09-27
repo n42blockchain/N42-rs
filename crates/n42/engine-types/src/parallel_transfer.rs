@@ -118,6 +118,10 @@ pub struct Phases {
     /// The build's batches on the pool, each from its start to its end:
     /// whether `groups_ms` is imbalance, gaps, or per-batch overhead.
     pub batch_spans: BatchSpans,
+    /// `N42_PHASE_TIMERS=1`: the build's batch loop by section, summed over
+    /// every batch (pool time) -- see [`LoopTimers`]. Zero when the flag is
+    /// off.
+    pub loop_timers: LoopTimers,
 }
 
 /// The calling thread's CPU time, nanoseconds (0 where it cannot be read).
@@ -205,6 +209,124 @@ impl BatchSpans {
             txs_min: spans.iter().map(|s| s.txs).min().unwrap_or(0),
             start_skew_ms: last_start.saturating_sub(first_start) / 1000,
             wait_ms: (first_start + total_us.saturating_sub(last_end)) / 1000,
+        }
+    }
+}
+
+/// `N42_PHASE_TIMERS=1`: the build's batch loop ([`execute_for_build`]) by
+/// section, nanoseconds of pool time summed over every batch. The per-
+/// transaction sections are sampled (one transaction in
+/// [`LOOP_SAMPLE_STRIDE`], scaled to the batch's count, as
+/// [`crate::fast_transfer::TransferTimers`] does); the per-batch ones are
+/// measured on every batch.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LoopTimers {
+    /// Transactions the loop executed (the scale's denominator).
+    pub txs: u64,
+    /// Getting the transaction and its EVM environment (`convert`: the
+    /// envelope's clone, the sender, the `TxEnv`).
+    pub fetch_ns: u64,
+    /// Pre-checks in the loop outside `transfer` (none today: `transfer`
+    /// makes every check itself).
+    pub check_ns: u64,
+    /// The `transfer` call as a whole (its own timers split it).
+    pub transfer_ns: u64,
+    /// A receipt built in the loop (none today: the receipts are built after
+    /// the execution, `direct_receipts`).
+    pub receipt_ns: u64,
+    /// The transfer's accounts committed into the batch's `State` (its cache
+    /// and transition map).
+    pub sink_ns: u64,
+    /// The transfer's gas read off its result.
+    pub gas_ns: u64,
+    /// The rest: the result placed in its slot, the loop's own control.
+    pub other_ns: u64,
+    /// Per batch, before its loop: the parent's view opened, the `State`
+    /// and the EVM built.
+    pub batch_setup_ns: u64,
+    /// Per batch, after its loop: the transitions merged, the bundle taken
+    /// and handed to the sink.
+    pub batch_close_ns: u64,
+}
+
+/// One transaction of the batch loop timed in this many, per batch (a prime,
+/// so it does not ride [`crate::fast_transfer`]'s own stride of 64).
+pub const LOOP_SAMPLE_STRIDE: u64 = 61;
+
+impl LoopTimers {
+    /// Adds `other` into `self`.
+    pub fn add(&mut self, other: Self) {
+        self.txs += other.txs;
+        self.fetch_ns += other.fetch_ns;
+        self.check_ns += other.check_ns;
+        self.transfer_ns += other.transfer_ns;
+        self.receipt_ns += other.receipt_ns;
+        self.sink_ns += other.sink_ns;
+        self.gas_ns += other.gas_ns;
+        self.other_ns += other.other_ns;
+        self.batch_setup_ns += other.batch_setup_ns;
+        self.batch_close_ns += other.batch_close_ns;
+    }
+
+    /// `ns` of pool time as nanoseconds a transaction.
+    pub const fn per_tx(&self, ns: u64) -> u64 {
+        if self.txs == 0 { 0 } else { ns / self.txs }
+    }
+}
+
+/// One batch's [`LoopTimers`] while it runs: sampled sums and their counts.
+#[derive(Debug, Default)]
+struct LoopSampler {
+    on: bool,
+    calls: u64,
+    samples: u64,
+    sums: [u64; 7],
+}
+
+impl LoopSampler {
+    fn new() -> Self {
+        Self { on: crate::fast_transfer::phase_timers(), ..Default::default() }
+    }
+
+    /// Whether the transaction about to run is timed.
+    #[inline]
+    fn begin(&mut self) -> bool {
+        if !self.on {
+            return false;
+        }
+        self.calls += 1;
+        // Mid-stride, not the first: a batch's first transaction is its
+        // coldest, and sampling it weighs it once in a stride instead of
+        // once in the batch.
+        self.calls % LOOP_SAMPLE_STRIDE == LOOP_SAMPLE_STRIDE / 2
+    }
+
+    /// A timed transaction's checkpoints: fetch, check, transfer, receipt,
+    /// gas, sink, other (in the order the loop passes them).
+    #[inline]
+    fn record(&mut self, marks: &[std::time::Instant; 8]) {
+        for (k, sum) in self.sums.iter_mut().enumerate() {
+            *sum += marks[k + 1].saturating_duration_since(marks[k]).as_nanos() as u64;
+        }
+        self.samples += 1;
+    }
+
+    fn finish(self, setup_ns: u64, close_ns: u64) -> LoopTimers {
+        if !self.on {
+            return LoopTimers::default();
+        }
+        let scale = |ns: u64| if self.samples == 0 { 0 } else { (ns as u128 * self.calls as u128 / self.samples as u128) as u64 };
+        LoopTimers {
+            txs: self.calls,
+            fetch_ns: scale(self.sums[0]),
+            check_ns: scale(self.sums[1]),
+            transfer_ns: scale(self.sums[2]),
+            receipt_ns: scale(self.sums[3]),
+            gas_ns: scale(self.sums[4]),
+            sink_ns: scale(self.sums[5]),
+            other_ns: scale(self.sums[6]),
+            batch_setup_ns: setup_ns,
+            batch_close_ns: close_ns,
         }
     }
 }
@@ -3007,7 +3129,7 @@ where
     // 80-150 ms of a full block's build (loop138-139).
     let slots: Vec<std::sync::OnceLock<BuiltTransfer<T>>> = (0..keys.len()).map(|_| std::sync::OnceLock::new()).collect();
     let slots_ref = &slots;
-    type BatchResult = (Vec<usize>, Option<BundleState>, crate::fast_transfer::TransferTimers, BatchSpan);
+    type BatchResult = (Vec<usize>, Option<BundleState>, crate::fast_transfer::TransferTimers, BatchSpan, LoopTimers);
     // Each batch's span on the pool, against this instant (`BatchSpans`).
     let batches_at = std::time::Instant::now();
     let results: Vec<Result<BatchResult, NotParallel>> = pool.install(|| {
@@ -3018,24 +3140,43 @@ where
                 let start_us = batches_at.elapsed().as_micros() as u64;
                 let cpu_start = thread_cpu_ns();
                 let txs = members.iter().map(|group| group.len()).sum::<usize>();
+                let mut sampler = LoopSampler::new();
+                let setup_at = sampler.on.then(std::time::Instant::now);
                 let db = ReadSetDb::new(read_set_ref, open().ok_or(NotParallel::NoState)?);
                 let mut state = State::builder().with_database(db).with_bundle_update().build();
                 let mut skipped = Vec::new();
+                let mut setup_ns = 0;
+                let close_at;
                 {
                     let mut evm = N42EvmFactory::with_fast_transfers(true).create_evm(&mut state, evm_env.clone());
+                    if let Some(at) = setup_at {
+                        setup_ns = at.elapsed().as_nanos() as u64;
+                    }
                     for group in members {
                         let mut rest = group.iter();
                         for &i in rest.by_ref() {
+                            // `N42_PHASE_TIMERS=1`: one transaction in
+                            // `LOOP_SAMPLE_STRIDE` timed by section.
+                            let timed = sampler.begin();
+                            let mark = || timed.then(std::time::Instant::now);
+                            let t0 = mark();
                             // Converted here, on the batch's thread: the
                             // conversion of a full block was 55-100 ms of
                             // the builder's own thread otherwise.
                             let (tx, env) = convert(i);
+                            let t1 = mark();
                             match evm.transfer(&env) {
                                 Ok(Some(out)) => {
+                                    let t2 = mark();
                                     let gas_used = out.result.gas_used();
+                                    let t3 = mark();
                                     evm.db_mut().commit(out.state);
+                                    let t4 = mark();
                                     if slots_ref[i].set(BuiltTransfer { index: i, tx, result: out.result, gas_used }).is_err() {
                                         return Err(NotParallel::Failed(i, "executed twice".to_string()));
+                                    }
+                                    if let (Some(t0), Some(t1), Some(t2), Some(t3), Some(t4)) = (t0, t1, t2, t3, t4) {
+                                        sampler.record(&[t0, t1, t1, t2, t2, t3, t4, std::time::Instant::now()]);
                                     }
                                 }
                                 Ok(None) => {
@@ -3049,6 +3190,7 @@ where
                         }
                         skipped.extend(rest.copied());
                     }
+                    close_at = sampler.on.then(std::time::Instant::now);
                 }
                 state.merge_transitions(BundleRetention::Reverts);
                 let bundle = state.take_bundle();
@@ -3066,12 +3208,14 @@ where
                     // sink's lock only ever holds one batch at a time.
                     Some(sink) => {
                         sink(bundle);
+                        let close_ns = close_at.map_or(0, |at| at.elapsed().as_nanos() as u64);
                         let span = BatchSpan::close(start_us, cpu_start, txs, batches_at);
-                        Ok((skipped, None, timers, span))
+                        Ok((skipped, None, timers, span, sampler.finish(setup_ns, close_ns)))
                     }
                     None => {
+                        let close_ns = close_at.map_or(0, |at| at.elapsed().as_nanos() as u64);
                         let span = BatchSpan::close(start_us, cpu_start, txs, batches_at);
-                        Ok((skipped, Some(bundle), timers, span))
+                        Ok((skipped, Some(bundle), timers, span, sampler.finish(setup_ns, close_ns)))
                     }
                 }
             })
@@ -3089,8 +3233,9 @@ where
     let mut run = BuildRun { phases, ..Default::default() };
     let mut spans: Vec<BatchSpan> = Vec::with_capacity(results.len());
     for r in results {
-        let (skipped, bundle, timers, span) = r?;
+        let (skipped, bundle, timers, span, loop_timers) = r?;
         spans.push(span);
+        run.phases.loop_timers.add(loop_timers);
         run.skipped.extend(skipped);
         if let Some(bundle) = bundle {
             run.bundles.push(bundle);
@@ -5742,6 +5887,27 @@ mod tests {
                     with.phases.read_set_misses,
                 );
                 println!("  batches plain {:?}", plain.phases.batch_spans);
+                if crate::fast_transfer::phase_timers() {
+                    let (l, t) = (plain.phases.loop_timers, plain.phases.transfer_timers);
+                    let per = |ns: u64| l.per_tx(ns);
+                    println!(
+                        "  loop ns a transfer (plain): fetch {} check {} transfer {} (read {} evm {} write {} other {}) receipt {} gas {} sink {} other {}; batch setup {} close {}; total {}",
+                        per(l.fetch_ns),
+                        per(l.check_ns),
+                        per(l.transfer_ns),
+                        per(t.read_ns),
+                        per(t.evm_ns),
+                        per(t.write_ns),
+                        per(t.other_ns),
+                        per(l.receipt_ns),
+                        per(l.gas_ns),
+                        per(l.sink_ns),
+                        per(l.other_ns),
+                        per(l.batch_setup_ns),
+                        per(l.batch_close_ns),
+                        per(l.fetch_ns + l.check_ns + l.transfer_ns + l.receipt_ns + l.gas_ns + l.sink_ns + l.other_ns + l.batch_setup_ns + l.batch_close_ns),
+                    );
+                }
                 println!("  batches set   {:?}", with.phases.batch_spans);
             }
         }

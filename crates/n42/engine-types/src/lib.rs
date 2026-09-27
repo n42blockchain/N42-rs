@@ -1,6 +1,10 @@
 // Copyright (c) 2017-2025 N42 Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+// The builder's phases line has more fields than `tracing`'s macros expand
+// under the default limit.
+#![recursion_limit = "256"]
+
 //mod addons;
 //pub use addons::N42NodeAddOns;
 

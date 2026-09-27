@@ -107,6 +107,14 @@ pub struct Phases {
     /// over every batch that ran part of it -- see
     /// [`crate::fast_transfer::TransferTimers`]. Zero when the flag is off.
     pub transfer_timers: crate::fast_transfer::TransferTimers,
+    /// `N42_READ_SET=1`: the read set's pass (inside `groups_ms`, before the
+    /// batches), its accounts, and the batches' reads it answered and those
+    /// that fell to the parent's state. Zero when the flag is off.
+    pub read_set: ReadSetPass,
+    /// See `read_set`.
+    pub read_set_hits: u64,
+    /// See `read_set`.
+    pub read_set_misses: u64,
 }
 
 /// Why the parallel path did not run; the caller executes serially.
@@ -576,6 +584,234 @@ impl<G: Database> Database for WarmDb<'_, G> {
             Some(info) => Ok(info.clone()),
             None => self.inner.basic(address),
         }
+    }
+
+    fn code_by_hash(&mut self, code_hash: alloy_primitives::B256) -> Result<revm::state::Bytecode, Self::Error> {
+        self.inner.code_by_hash(code_hash)
+    }
+
+    fn storage(
+        &mut self,
+        address: Address,
+        index: revm::primitives::StorageKey,
+    ) -> Result<revm::primitives::StorageValue, Self::Error> {
+        self.inner.storage(address, index)
+    }
+
+    fn block_hash(&mut self, number: u64) -> Result<alloy_primitives::B256, Self::Error> {
+        self.inner.block_hash(number)
+    }
+}
+
+/// Whether the leader's parallel build resolves the block's accounts once,
+/// before its batches run, into a read-only [`ReadSet`] they read instead of
+/// the parent's state (`N42_READ_SET=1`, `docs/BREAKTHROUGH_DESIGN.md`
+/// section 4, design A). Off by default.
+pub fn read_set() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_READ_SET").is_ok_and(|v| v == "1"))
+}
+
+/// What building a [`ReadSet`] cost and held.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReadSetPass {
+    /// The pass's wall time: the addresses gathered, sorted and deduplicated,
+    /// each resolved once, and the directory built. Microseconds.
+    pub wall_us: u64,
+    /// Of `wall_us`: gathering, sorting and deduplicating the addresses.
+    pub dedup_us: u64,
+    /// Of `wall_us`: resolving them through the parent's state.
+    pub resolve_us: u64,
+    /// Distinct accounts in the set.
+    pub accounts: usize,
+    /// Of those, accounts the parent's state failed to answer (or no state
+    /// could be opened for): left to the batches' own reads.
+    pub unresolved: usize,
+    /// `N42_PHASE_TIMERS=1`: the pass's reads by door (see
+    /// [`crate::fast_transfer::TransferTimers`]); zero otherwise.
+    pub reads_provider: u64,
+    /// See `reads_provider`.
+    pub reads_view: u64,
+}
+
+/// The block's accounts as the parent's state has them, resolved once before
+/// the execution and read-only afterwards ([`read_set`]).
+///
+/// A flat vector sorted by address, with a directory over the addresses'
+/// leading bits: a lookup is one directory probe and a search of a bucket of
+/// one or two entries. Nothing in it is written after the build -- no lock,
+/// no shared counter on the read path, no overlay walk. Each batch counts
+/// its hits and misses in its own [`ReadSetDb`] and adds them here once, when
+/// the batch's database is dropped.
+#[derive(Debug, Default)]
+pub struct ReadSet {
+    /// Distinct addresses, sorted, each with what the parent's state answered
+    /// (`None`: not resolved, the batch reads it itself).
+    entries: Vec<(Address, Option<WarmInfo>)>,
+    /// `dir[p] .. dir[p + 1]` is the run of `entries` whose address's leading
+    /// `bits` bits are `p`.
+    dir: Vec<u32>,
+    bits: u32,
+    hits: std::sync::atomic::AtomicU64,
+    misses: std::sync::atomic::AtomicU64,
+}
+
+impl ReadSet {
+    #[inline]
+    fn prefix(address: &Address, bits: u32) -> usize {
+        let lead = u32::from_be_bytes([address.0[0], address.0[1], address.0[2], address.0[3]]);
+        if bits == 0 {
+            0
+        } else {
+            (lead >> (32 - bits)) as usize
+        }
+    }
+
+    /// Builds the set for a block's `keys` (sender, recipient) and `extra`
+    /// addresses (the beneficiary), on `pool`: the addresses sorted and
+    /// deduplicated, then each resolved once through a state `open` yields,
+    /// one state per chunk of the sorted addresses.
+    pub fn build<G>(
+        keys: &[(Address, Address)],
+        extra: &[Address],
+        open: &(dyn Fn() -> Option<G> + Sync),
+        pool: &rayon::ThreadPool,
+    ) -> (Self, ReadSetPass)
+    where
+        G: Database + Send,
+    {
+        use rayon::prelude::*;
+        let at = std::time::Instant::now();
+        let mut pass = ReadSetPass::default();
+        let set = pool.install(|| {
+            let mut addresses: Vec<Address> = Vec::with_capacity(keys.len() * 2 + extra.len());
+            addresses.par_extend(keys.par_iter().with_min_len(4096).flat_map_iter(|(from, to)| [*from, *to]));
+            addresses.extend_from_slice(extra);
+            addresses.par_sort_unstable();
+            addresses.dedup();
+            pass.dedup_us = at.elapsed().as_micros() as u64;
+            let resolve_at = std::time::Instant::now();
+            let mut entries: Vec<(Address, Option<WarmInfo>)> =
+                addresses.par_iter().with_min_len(4096).map(|address| (*address, None)).collect();
+            drop(addresses);
+            let threads = pool.current_num_threads().max(1);
+            let chunk = entries.len().div_ceil(threads * 4).max(256);
+            let doors: (u64, u64) = entries
+                .par_chunks_mut(chunk)
+                .map(|part| {
+                    if let Some(mut db) = open() {
+                        for (address, info) in part.iter_mut() {
+                            *info = db.basic(*address).ok();
+                        }
+                    }
+                    // The pass's reads went through the door counters of the
+                    // batches' database: drained here so a batch on this
+                    // thread does not take them for its own.
+                    let timers = crate::fast_transfer::drain_timers();
+                    (timers.reads_provider, timers.reads_view)
+                })
+                .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+            pass.reads_provider = doors.0;
+            pass.reads_view = doors.1;
+            pass.resolve_us = resolve_at.elapsed().as_micros() as u64;
+            pass.unresolved = entries.iter().filter(|(_, info)| info.is_none()).count();
+            Self::from_sorted(entries)
+        });
+        pass.accounts = set.entries.len();
+        pass.wall_us = at.elapsed().as_micros() as u64;
+        (set, pass)
+    }
+
+    /// A set over `entries`, sorted by address and distinct.
+    fn from_sorted(entries: Vec<(Address, Option<WarmInfo>)>) -> Self {
+        // About one entry a bucket, the directory at most 4 MB.
+        let bits = entries.len().max(1).next_power_of_two().trailing_zeros().clamp(8, 20);
+        let buckets = 1usize << bits;
+        let mut dir = Vec::with_capacity(buckets + 1);
+        let mut at = 0usize;
+        for p in 0..buckets {
+            dir.push(at as u32);
+            while at < entries.len() && Self::prefix(&entries[at].0, bits) == p {
+                at += 1;
+            }
+        }
+        dir.push(at as u32);
+        Self { entries, dir, bits, hits: Default::default(), misses: Default::default() }
+    }
+
+    /// What the set holds for `address`: `None` if it was not in the block's
+    /// set or not resolved, `Some(None)` for an account the parent's state
+    /// does not have.
+    #[inline]
+    pub fn get(&self, address: &Address) -> Option<&WarmInfo> {
+        let p = Self::prefix(address, self.bits);
+        let (lo, hi) = (*self.dir.get(p)? as usize, *self.dir.get(p + 1)? as usize);
+        let run = self.entries.get(lo..hi)?;
+        let i = run.binary_search_by(|(key, _)| key.cmp(address)).ok()?;
+        run[i].1.as_ref()
+    }
+
+    /// Distinct accounts held.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether it holds none.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Reads the batches answered from the set, and reads that fell to the
+    /// parent's state, over every [`ReadSetDb`] dropped so far.
+    pub fn counts(&self) -> (u64, u64) {
+        (
+            self.hits.load(std::sync::atomic::Ordering::Relaxed),
+            self.misses.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+}
+
+/// A batch's database with the block's [`ReadSet`] in front: an account the
+/// set holds is answered from it, anything else -- code, storage, block
+/// hashes, an account outside the set -- from `inner`. With no set it is
+/// `inner` itself. The answers are the parent's either way.
+#[derive(Debug)]
+pub struct ReadSetDb<'a, G> {
+    set: Option<&'a ReadSet>,
+    inner: G,
+    hits: u64,
+    misses: u64,
+}
+
+impl<'a, G> ReadSetDb<'a, G> {
+    /// `inner` behind `set`.
+    pub const fn new(set: Option<&'a ReadSet>, inner: G) -> Self {
+        Self { set, inner, hits: 0, misses: 0 }
+    }
+}
+
+impl<G> Drop for ReadSetDb<'_, G> {
+    fn drop(&mut self) {
+        if let Some(set) = self.set {
+            set.hits.fetch_add(self.hits, std::sync::atomic::Ordering::Relaxed);
+            set.misses.fetch_add(self.misses, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+impl<G: Database> Database for ReadSetDb<'_, G> {
+    type Error = G::Error;
+
+    #[inline]
+    fn basic(&mut self, address: Address) -> Result<WarmInfo, Self::Error> {
+        if let Some(set) = self.set {
+            if let Some(info) = set.get(&address) {
+                self.hits += 1;
+                return Ok(info.clone());
+            }
+            self.misses += 1;
+        }
+        self.inner.basic(address)
     }
 
     fn code_by_hash(&mut self, code_hash: alloy_primitives::B256) -> Result<revm::state::Bytecode, Self::Error> {
@@ -2592,6 +2828,24 @@ where
     execute_for_build_run(evm_env, keys, convert, open, on_bundle, false, None)
 }
 
+/// [`execute_for_build`] with the read set ([`read_set`], `N42_READ_SET`)
+/// chosen by the caller rather than the environment: for benches and tests
+/// that compare both paths in one process.
+pub fn execute_for_build_read_set<T, G>(
+    evm_env: &reth_evm::EvmEnv,
+    keys: &[(Address, Address)],
+    convert: &(dyn Fn(usize) -> (T, TxEnv) + Sync),
+    open: &(dyn Fn() -> Option<G> + Sync),
+    with_read_set: bool,
+) -> Result<BuildRun<T>, NotParallel>
+where
+    T: Send + Sync,
+    G: Database + std::fmt::Debug + Send,
+    G::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    execute_for_build_opts(evm_env, keys, convert, open, None, false, None, with_read_set)
+}
+
 fn execute_for_build_run<T, G>(
     evm_env: &reth_evm::EvmEnv,
     keys: &[(Address, Address)],
@@ -2600,6 +2854,25 @@ fn execute_for_build_run<T, G>(
     on_bundle: Option<&(dyn Fn(BundleState) + Sync)>,
     in_place: bool,
     before_batches: Option<&mut dyn FnMut() -> bool>,
+) -> Result<BuildRun<T>, NotParallel>
+where
+    T: Send + Sync,
+    G: Database + std::fmt::Debug + Send,
+    G::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    execute_for_build_opts(evm_env, keys, convert, open, on_bundle, in_place, before_batches, read_set())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_for_build_opts<T, G>(
+    evm_env: &reth_evm::EvmEnv,
+    keys: &[(Address, Address)],
+    convert: &(dyn Fn(usize) -> (T, TxEnv) + Sync),
+    open: &(dyn Fn() -> Option<G> + Sync),
+    on_bundle: Option<&(dyn Fn(BundleState) + Sync)>,
+    in_place: bool,
+    before_batches: Option<&mut dyn FnMut() -> bool>,
+    with_read_set: bool,
 ) -> Result<BuildRun<T>, NotParallel>
 where
     T: Send + Sync,
@@ -2626,6 +2899,17 @@ where
     }
 
     let at = std::time::Instant::now();
+    // `N42_READ_SET=1`: every account the batches will read -- the senders,
+    // the recipients, the beneficiary -- resolved once through the parent's
+    // state, before any batch runs; the batches then read that set, falling
+    // to the parent's state only for what it does not hold. Inside
+    // `groups_ms`, so `par_exec_ms` compares with the plain path.
+    let block_read_set = with_read_set.then(|| {
+        let (set, pass) = ReadSet::build(keys, &[beneficiary], open, pool);
+        phases.read_set = pass;
+        set
+    });
+    let read_set_ref = block_read_set.as_ref();
     // Each result goes into its candidate's slot from the batch's own
     // thread: collecting the batches' vectors and sorting them by index was
     // 80-150 ms of a full block's build (loop138-139).
@@ -2637,7 +2921,7 @@ where
         batches
             .par_iter()
             .map(|members| {
-                let db = open().ok_or(NotParallel::NoState)?;
+                let db = ReadSetDb::new(read_set_ref, open().ok_or(NotParallel::NoState)?);
                 let mut state = State::builder().with_database(db).with_bundle_update().build();
                 let mut skipped = Vec::new();
                 {
@@ -2693,6 +2977,11 @@ where
             .collect()
     });
     phases.groups_ms = at.elapsed().as_millis() as u64;
+    if let Some(set) = block_read_set {
+        (phases.read_set_hits, phases.read_set_misses) = set.counts();
+        // ~147,000 entries on a full block: freed on the pool, off the chain.
+        pool.spawn(move || drop(set));
+    }
 
     let at = std::time::Instant::now();
     let mut run = BuildRun { phases, ..Default::default() };
@@ -4096,6 +4385,84 @@ mod tests {
         }
     }
 
+    /// `N42_READ_SET=1`: the batches reading the block's read set produce the
+    /// run the plain path does -- the same transfers, gas, skips, and grafted
+    /// state and reverts -- and every account read hits the set.
+    #[test]
+    fn the_read_set_run_equals_the_plain_run() {
+        let (block, db) = random_fixture(40, 12, 300, 3, 5);
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_env = evm_config.evm_env(block.header()).expect("env");
+        let envs: Vec<TxEnv> = block.transactions_recovered().map(|tx| evm_config.tx_env(tx)).collect();
+        let keys: Vec<(Address, Address)> = envs.iter().map(|e| (e.caller, e.kind.to().copied().unwrap())).collect();
+        let beneficiary = evm_env.block_env.beneficiary;
+        let run_with = |with: bool| {
+            let run =
+                execute_for_build_read_set(&evm_env, &keys, &|i| ((), envs[i].clone()), &|| Some(db.clone()), with).expect("a block of transfers");
+            let executed: Vec<(usize, u64, bool)> = run.executed.iter().map(|b| (b.index, b.gas_used, b.result.is_success())).collect();
+            let mut state = State::builder().with_database(db.clone()).with_bundle_update().build();
+            let graft = graft_bundles(&mut state, run.bundles, beneficiary).unwrap();
+            state.merge_transitions(BundleRetention::Reverts);
+            let mut bundle = state.take_bundle();
+            append_reverts(&mut bundle, graft.reverts);
+            let accounts: std::collections::BTreeMap<_, _> =
+                bundle.state.iter().map(|(a, acc)| (*a, (acc.info.clone(), acc.original_info.clone(), acc.status))).collect();
+            let reverts: std::collections::BTreeMap<_, _> = bundle.reverts.iter().flatten().cloned().collect();
+            (executed, run.skipped, graft.beneficiary_delta, accounts, reverts, run.phases)
+        };
+        let plain = run_with(false);
+        let with = run_with(true);
+        assert!(!plain.0.is_empty());
+        assert_eq!(plain.0, with.0, "executed transfers");
+        assert_eq!(plain.1, with.1, "skipped");
+        assert_eq!(plain.2, with.2, "beneficiary delta");
+        assert_eq!(plain.3, with.3, "grafted accounts");
+        assert_eq!(plain.4, with.4, "reverts");
+        assert_eq!(plain.5.read_set.accounts, 0, "no set on the plain path");
+        let mut distinct: Vec<Address> = keys.iter().flat_map(|(from, to)| [*from, *to]).chain([beneficiary]).collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let phases = with.5;
+        assert_eq!(phases.read_set.accounts, distinct.len(), "one entry per distinct account");
+        assert_eq!(phases.read_set.unresolved, 0);
+        assert!(phases.read_set_hits > 0);
+        assert_eq!(phases.read_set_misses, 0, "every account a transfer reads is in the set");
+    }
+
+    /// A read set answers exactly its members, absent accounts as absent,
+    /// and nothing for an address outside it -- including addresses that
+    /// share a member's directory bucket.
+    #[test]
+    fn a_read_set_answers_its_members_only() {
+        let mut members: Vec<Address> = (0..5_000u64).map(|i| addr(i * 3 + 1)).collect();
+        // A run in one bucket: the same leading bytes.
+        members.extend((0..50u8).map(|i| Address::with_last_byte(i)));
+        members.sort_unstable();
+        members.dedup();
+        let entries: Vec<(Address, Option<WarmInfo>)> = members
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                let info = match i % 3 {
+                    0 => Some(None),
+                    1 => Some(Some(AccountInfo { balance: U256::from(i), nonce: i as u64, ..Default::default() })),
+                    _ => None,
+                };
+                (*a, info)
+            })
+            .collect();
+        let set = ReadSet::from_sorted(entries.clone());
+        assert_eq!(set.len(), members.len());
+        for (address, info) in &entries {
+            assert_eq!(set.get(address), info.as_ref(), "{address}");
+        }
+        for i in 17..5_000u64 {
+            assert!(set.get(&addr(i * 3 + 2)).is_none());
+        }
+        assert!(set.get(&Address::with_last_byte(200)).is_none());
+        assert!(ReadSet::from_sorted(Vec::new()).get(&addr(1)).is_none());
+    }
+
     /// An account the block's state already holds leaves the staged bundle at
     /// the install and becomes a delta, exactly as the graft after the
     /// execution makes it one -- including its revert, which is the block's
@@ -5070,6 +5437,9 @@ mod tests {
         view: std::sync::Arc<n42_qmdb_reth::QmdbReadView>,
         head: u64,
         overlay: std::sync::Arc<alloy_primitives::map::AddressHashMap<Option<AccountInfo>>>,
+        /// Counts each answer the view gives in the process-wide counter, as
+        /// the node's provider door does (`n42_state::record_answer`).
+        count: bool,
     }
 
     impl Database for ViewDb {
@@ -5080,7 +5450,11 @@ mod tests {
                 return Ok(info.clone());
             }
             // As `StateProviderDatabase` converts it: no code loaded.
-            Ok(self.view.account(&address, self.head).flatten().map(AccountInfo::from))
+            let answer = self.view.account(&address, self.head);
+            if self.count && answer.is_some() {
+                reth_storage_api::n42_state::record_answer();
+            }
+            Ok(answer.flatten().map(AccountInfo::from))
         }
 
         fn code_by_hash(&mut self, _code_hash: B256) -> Result<revm::state::Bytecode, Self::Error> {
@@ -5173,7 +5547,7 @@ mod tests {
             let account = reth_primitives_traits::Account { nonce: r % 3, balance: U256::from(2 + r), bytecode_hash: None };
             overlay.insert(recipient_of(r), Some(AccountInfo::from(account)));
         }
-        let db = ViewDb { view, head: 1, overlay: std::sync::Arc::new(overlay) };
+        let db = ViewDb { view, head: 1, overlay: std::sync::Arc::new(overlay), count: false };
 
         let beneficiary = addr(1);
         let mut envs = Vec::new();
@@ -5239,6 +5613,48 @@ mod tests {
                 warm.len(),
                 plain.phases.batches,
             );
+            // `N42_READ_SET=1` (docs/BREAKTHROUGH_DESIGN.md section 4, design
+            // A): the block's accounts resolved once, then the batches read
+            // the set. Without and with the node's shared answer counter.
+            for count in [false, true] {
+                let db = ViewDb { count, ..db.clone() };
+                let plain = execute_for_build_read_set(&evm_env, &keys, &convert, &|| Some(db.clone()), false).expect("a block of transfers");
+                let with = execute_for_build_read_set(&evm_env, &keys, &convert, &|| Some(db.clone()), true).expect("a block of transfers");
+                assert_eq!(plain.skipped, with.skipped);
+                assert_eq!(plain.executed.len(), with.executed.len());
+                let pass = with.phases.read_set;
+                println!(
+                    "round {round} read set (counter {count}): exec plain {} ms, with the set {} ms = pass {} ms (dedup {} us, resolve {} us; {} accounts, {} ns a read of pool time) + batches {} ms; hits {} misses {}",
+                    plain.phases.groups_ms,
+                    with.phases.groups_ms,
+                    pass.wall_us / 1000,
+                    pass.dedup_us,
+                    pass.resolve_us,
+                    pass.accounts,
+                    pass.resolve_us * 1000 * build_pool().current_num_threads() as u64 / pass.accounts.max(1) as u64,
+                    with.phases.groups_ms.saturating_sub(pass.wall_us / 1000),
+                    with.phases.read_set_hits,
+                    with.phases.read_set_misses,
+                );
+            }
+        }
+        // The read pass alone at 1, 4 and 16 threads, without and with the
+        // shared answer counter: whether sixteen readers slow each read.
+        let mut addresses: Vec<Address> = keys.iter().flat_map(|(from, to)| [*from, *to]).collect();
+        addresses.sort_unstable();
+        addresses.dedup();
+        for threads in [1usize, 4, 16] {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().expect("a pool");
+            for count in [false, true] {
+                let db = ViewDb { count, ..db.clone() };
+                let (_set, pass) = ReadSet::build(&[], &addresses, &|| Some(db.clone()), &pool);
+                println!(
+                    "resolve alone: {threads:>2} threads, counter {count}: {} accounts in {} us wall, {} ns a read of pool time",
+                    pass.accounts,
+                    pass.resolve_us,
+                    pass.resolve_us * 1000 * threads as u64 / pass.accounts.max(1) as u64,
+                );
+            }
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

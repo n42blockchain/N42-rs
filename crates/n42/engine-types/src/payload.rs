@@ -1315,6 +1315,11 @@ where
     let mut shard_append_ms = 0u64;
     let mut shard_fold_ms = 0u64;
     let mut par_transfer_timers = crate::fast_transfer::TransferTimers::default();
+    // `N42_READ_SET=1` (docs/BREAKTHROUGH_DESIGN.md section 4, design A): the
+    // read set's pass and what the batches read from it.
+    let mut par_read_set = crate::parallel_transfer::ReadSetPass::default();
+    let mut par_read_set_hits = 0u64;
+    let mut par_read_set_misses = 0u64;
     // `N42_GRAFT_PREFAULT=1`: how long the graft's memory took to map, on its
     // own thread beside the parallel step (not on the chain).
     let mut par_prefault_ms = 0u64;
@@ -2115,6 +2120,9 @@ where
                     par_part_ms = run.phases.partition_ms;
                     par_exec_ms = run.phases.groups_ms;
                     par_transfer_timers = run.phases.transfer_timers;
+                    par_read_set = run.phases.read_set;
+                    par_read_set_hits = run.phases.read_set_hits;
+                    par_read_set_misses = run.phases.read_set_misses;
                     par_skipped = run.skipped.len();
                     // Read by the diagnosis below, which must see what this
                     // step actually built.
@@ -2708,6 +2716,18 @@ where
                     reads_cache = par_transfer_timers.reads_cache(),
                     reads_provider = par_transfer_timers.reads_provider,
                     reads_view = par_transfer_timers.reads_view,
+                    // `N42_READ_SET=1`: the pass (inside `par_exec_ms`), its
+                    // accounts, the batches' reads it answered and those that
+                    // fell to the parent's state. Zero when the flag is off.
+                    read_set_ms = par_read_set.wall_us / 1000,
+                    read_set_dedup_us = par_read_set.dedup_us,
+                    read_set_resolve_us = par_read_set.resolve_us,
+                    read_set_accounts = par_read_set.accounts,
+                    read_set_unresolved = par_read_set.unresolved,
+                    read_set_hits = par_read_set_hits,
+                    read_set_misses = par_read_set_misses,
+                    read_set_reads_provider = par_read_set.reads_provider,
+                    read_set_reads_view = par_read_set.reads_view,
                     graft_base_ms = par_graft_base_ms,
                     graft_reserve_ms = par_graft_reserve_ms,
                     graft_insert_ms = par_graft_insert_ms,

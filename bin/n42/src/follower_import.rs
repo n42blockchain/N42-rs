@@ -1569,6 +1569,8 @@ where
     // and the instant the vote road and the execution started together.
     let mut executed_parent = None;
     let mut roads_at = None;
+    // `N42_FOLLOWER_EXEC_EARLY=1` took this block: the check runs on the vote road.
+    let mut early_check = false;
     if !deferred {
         against_parent()?;
     } else {
@@ -1583,73 +1585,99 @@ where
         // root, which its QMDB root job files while this check runs (plan v4
         // step 1: the parent's root and engine insert were 65 ms of a 287 ms
         // R1 vote collection, loop179).
-        let check_at = std::time::Instant::now();
-        if parent_state.is_none() {
-            against_parent()?;
-        }
-        check_includable(
-            provider,
-            parent_hash,
-            parent_state,
-            &recovered,
-            chain_spec.chain().id(),
-            spec_for_intrinsic_gas(chain_spec, recovered.timestamp),
-        )?;
-        // Set on the deferred path, where the vote is the check; zero before
-        // the fork, where the vote is the import itself.
-        phases.check_us = check_at.elapsed().as_micros() as u64;
-
-        // Where this block's execution will read the parent's post-state,
-        // decided here because it decides whether that execution can run
-        // beside the rest of the vote road or has to follow it: the published
-        // outputs laid over the chain's state at the nearest ancestor the
-        // engine holds (`N42_FOLLOWER_EXEC_ON_PARENT_OUTPUT`), or the engine's
-        // tree at the parent. The parent may have landed while this block was
-        // being checked, and the engine's tree is the cheaper state when it
-        // has it.
-        if let Some(ancestry) = &ancestry
-            && exec_on_parent_output()
-            && parent_in(provider, parent_hash, chain_spec.genesis(), deferred)?.is_none()
-        {
-            executed_parent = overlay_parent(ancestry, number);
-        }
-
-        if executed_parent.is_none() {
-            // The rest of the vote road, then the execution: it has to wait
-            // for the parent in the engine anyway, so there is nothing for it
-            // to run beside.
-            let fields_at = std::time::Instant::now();
-            if parent_state.is_some() {
-                wait_for_parent_fields(parent_hash)?;
-                phases.parent_fields_wait_us = fields_at.elapsed().as_micros() as u64;
-                parent_fields_wait_us.store(phases.parent_fields_wait_us, std::sync::atomic::Ordering::Relaxed);
-                against_parent()?;
+        // `N42_FOLLOWER_EXEC_EARLY=1`: where the execution reads the
+        // parent's post-state is decided first, and when it needs no wait --
+        // the published outputs over the nearest ancestor the engine holds,
+        // or the engine's tree with the parent already in it -- the execution
+        // starts now and the whole vote road, the includability check
+        // included, runs beside it ([`two_roads`]). The check's verdict is the
+        // same and still comes before the vote; only the execution no longer
+        // waits for it.
+        early_check = exec_early() && {
+            if let Some(ancestry) = &ancestry
+                && exec_on_parent_output()
+                && parent_in(provider, parent_hash, chain_spec.genesis(), deferred)?.is_none()
+            {
+                executed_parent = overlay_parent(ancestry, number);
             }
-            phases.fields_us = fields_at.elapsed().as_micros() as u64;
-            tracing::debug!(
-                target: "n42.follower_import",
-                number,
-                check_ms = phases.check_us / 1000,
-                fields_ms = phases.fields_us / 1000,
-                "checked: the header carries the parent's result and the transactions are includable"
-            );
-            if let Some(checked) = checked.take() {
-                let _ = checked.send(());
-            }
-            let _ = vote_at.set(std::time::Instant::now());
-            log_vote_road(road, number, tx_count, phases);
-        } else {
-            // Two roads from here (plan v4 step 2, [`two_roads`]): the rest of
-            // the vote road -- the parent's execution fields and the header
-            // against them -- and this block's execution, which needs nothing
-            // but the parent's bundle and so waits for neither.
+            executed_parent.is_some() || parent_state.is_none()
+        };
+        if early_check {
             roads_at = Some(std::time::Instant::now());
             tracing::debug!(
                 target: "n42.follower_import",
                 number,
-                check_ms = phases.check_us / 1000,
-                "the transactions are includable on the parent's output; the vote road and the execution run side by side"
+                "executing before the check; the check and the rest of the vote road run beside the execution"
             );
+        } else {
+            let check_at = std::time::Instant::now();
+            if parent_state.is_none() {
+                against_parent()?;
+            }
+            check_includable(
+                provider,
+                parent_hash,
+                parent_state,
+                &recovered,
+                chain_spec.chain().id(),
+                spec_for_intrinsic_gas(chain_spec, recovered.timestamp),
+            )?;
+            // Set on the deferred path, where the vote is the check; zero before
+            // the fork, where the vote is the import itself.
+            phases.check_us = check_at.elapsed().as_micros() as u64;
+
+            // Where this block's execution will read the parent's post-state,
+            // decided here because it decides whether that execution can run
+            // beside the rest of the vote road or has to follow it: the published
+            // outputs laid over the chain's state at the nearest ancestor the
+            // engine holds (`N42_FOLLOWER_EXEC_ON_PARENT_OUTPUT`), or the engine's
+            // tree at the parent. The parent may have landed while this block was
+            // being checked, and the engine's tree is the cheaper state when it
+            // has it.
+            if let Some(ancestry) = &ancestry
+                && exec_on_parent_output()
+                && parent_in(provider, parent_hash, chain_spec.genesis(), deferred)?.is_none()
+            {
+                executed_parent = overlay_parent(ancestry, number);
+            }
+
+            if executed_parent.is_none() {
+                // The rest of the vote road, then the execution: it has to wait
+                // for the parent in the engine anyway, so there is nothing for it
+                // to run beside.
+                let fields_at = std::time::Instant::now();
+                if parent_state.is_some() {
+                    wait_for_parent_fields(parent_hash)?;
+                    phases.parent_fields_wait_us = fields_at.elapsed().as_micros() as u64;
+                    parent_fields_wait_us.store(phases.parent_fields_wait_us, std::sync::atomic::Ordering::Relaxed);
+                    against_parent()?;
+                }
+                phases.fields_us = fields_at.elapsed().as_micros() as u64;
+                tracing::debug!(
+                    target: "n42.follower_import",
+                    number,
+                    check_ms = phases.check_us / 1000,
+                    fields_ms = phases.fields_us / 1000,
+                    "checked: the header carries the parent's result and the transactions are includable"
+                );
+                if let Some(checked) = checked.take() {
+                    let _ = checked.send(());
+                }
+                let _ = vote_at.set(std::time::Instant::now());
+                log_vote_road(road, number, tx_count, phases);
+            } else {
+                // Two roads from here (plan v4 step 2, [`two_roads`]): the rest of
+                // the vote road -- the parent's execution fields and the header
+                // against them -- and this block's execution, which needs nothing
+                // but the parent's bundle and so waits for neither.
+                roads_at = Some(std::time::Instant::now());
+                tracing::debug!(
+                    target: "n42.follower_import",
+                    number,
+                    check_ms = phases.check_us / 1000,
+                    "the transactions are includable on the parent's output; the vote road and the execution run side by side"
+                );
+            }
         }
     }
 
@@ -1866,13 +1894,29 @@ where
             let vote_checked = checked.take();
             let vote_at = &vote_at;
             let parent_fields_wait_us = &parent_fields_wait_us;
+            let block: &RecoveredBlock<Block> = &recovered;
+            let chain_id = chain_spec.chain().id();
+            let spec = spec_for_intrinsic_gas(chain_spec, recovered.timestamp);
             two_roads(
                 number,
                 roads_at,
                 move || {
+                    let mut phases = phases;
+                    if early_check {
+                        // What the vote attests, as on the path above, on a
+                        // pool of its own so the batches queued on the worker
+                        // pool do not hold it.
+                        let check_at = std::time::Instant::now();
+                        on_check_pool(|| {
+                            if parent_state.is_none() {
+                                validate_against_parent(consensus, header, parent_header)?;
+                            }
+                            check_includable(provider, parent_hash, parent_state, block, chain_id, spec)
+                        })?;
+                        phases.check_us = check_at.elapsed().as_micros() as u64;
+                    }
                     let fields_at = std::time::Instant::now();
                     wait_for_parent_fields(parent_hash)?;
-                    let mut phases = phases;
                     phases.parent_fields_wait_us = fields_at.elapsed().as_micros() as u64;
                     parent_fields_wait_us.store(phases.parent_fields_wait_us, std::sync::atomic::Ordering::Relaxed);
                     validate_against_parent(consensus, header, parent_header)?;
@@ -2196,6 +2240,43 @@ fn carry_async() -> bool {
 fn root_hashed_parallel() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("N42_ROOT_HASHED_PARALLEL").map_or(true, |v| v != "0"))
+}
+
+/// `N42_FOLLOWER_EXEC_EARLY=1` (section 5 of `docs/BREAKTHROUGH_DESIGN.md`,
+/// step 5a): under deferred execution the block's execution starts the moment
+/// the parent's post-state is known -- before the includability check, which
+/// then runs beside it on the vote road ([`two_roads`]) instead of in front of
+/// it. The check still decides the vote and the import exactly as before: its
+/// error wins over the execution's result, which is then dropped. The check's
+/// parallel scan runs on a pool of its own ([`on_check_pool`]), so the
+/// execution's batches, queued on the worker pool, do not hold the vote.
+fn exec_early() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_EXEC_EARLY").is_ok_and(|v| v == "1"))
+}
+
+/// A small pool of its own, sized by `var` (default `default`), or `None` if
+/// it cannot be built -- the caller then runs on the worker pool as before.
+fn side_pool(var: &str, name: &'static str, default: usize) -> Option<rayon::ThreadPool> {
+    let threads = std::env::var(var).ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0).unwrap_or(default);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(move |i| format!("{name}-{i}"))
+        .build()
+        .inspect_err(|err| tracing::warn!(target: "n42.follower_import", %err, name, "no side pool; on the worker pool"))
+        .ok()
+}
+
+
+/// Runs the early includability check's scan on its own pool
+/// (`N42_FOLLOWER_CHECK_THREADS`, default 4), away from the execution's
+/// batches. The check takes no lock another check could hold.
+fn on_check_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    match POOL.get_or_init(|| side_pool("N42_FOLLOWER_CHECK_THREADS", "vote-check", 4)) {
+        Some(pool) => pool.install(f),
+        None => f(),
+    }
 }
 
 /// Milliseconds from `from` to `to`, zero if `to` is earlier.

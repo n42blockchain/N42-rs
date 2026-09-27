@@ -408,3 +408,26 @@ stay 1.7x their idle cost. The window is 1.038-1.049M against 1.065-1.070M off, 
 Next: count the fold's minor faults and CPU time per task on the fleet, reproduce with the fleet's liveness
 (the parent's shards alive in the child's overlay while the child folds), and recycle the shard maps' allocations
 across blocks; if the tasks are then ~4 ms the seal is ~95 and the chain follows.
+
+### 10.13 The fold with the fleet's liveness, off the fleet (2769bc095): not the faults -- the cores
+
+The pipelined bench (`bench_output_shards_fold_live`: three blocks' shards and merged bundles held, the parent's
+merge and roots beside the child's add and fold, `BENCH_LOAD=n` busy threads on the fold's 16 cores), release,
+medians of 20, per fold task:
+
+| busy threads | task wall / CPU ms, minor faults a block | with map recycling |
+| --- | --- | --- |
+| 0 | 4.9-5.9 / 4.3, 3-9 | 6.8-7.0 / 4.6, 2-3 |
+| 16 | 20.4 / 8.3, 2,055 | 19.4 / 8.1, 4 |
+| 24 | 26.6-27.2 / 9.0-9.3, ~2,000 | 24.8-27.3 / 8.1-8.7, 7-9 |
+| 32 | 31.3 / 8.5, 2,117 | 26.8 / 7.6, 36 |
+
+With the fleet's liveness and no load a task is 5 ms and faults almost never (jemalloc reuses its dirty
+pages); the 40 comes back only with busy threads on its cores, where wall is 2.5-3.7x CPU and the CPU itself
+doubles (SMT siblings, memory). Recycling the maps (`N42_SHARD_RECYCLE=1`, off) saves nothing under load and
+costs the idle fold 2-3. So the fold's cost on the fleet is the node's other threads -- the parent's roots (the
+global rayon pool, 16), the merge, the ingest (12), tokio (16) -- on the build pool's cores: 60 busy threads on a
+node's 74 logical CPUs (37 physical + siblings). The single-threaded graft is immune to that; sixteen tasks are
+not. loop277 logs each task's CPU, faults, migrations and preemptions on the fleet, and runs one S16 leg with
+fewer competing threads (rayon 8, ingest recover 4: attested frames need no verification) to see whether the
+fold, and the execution beside it, get their cores back.

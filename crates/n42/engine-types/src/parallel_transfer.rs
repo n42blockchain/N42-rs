@@ -115,6 +115,98 @@ pub struct Phases {
     pub read_set_hits: u64,
     /// See `read_set`.
     pub read_set_misses: u64,
+    /// The build's batches on the pool, each from its start to its end:
+    /// whether `groups_ms` is imbalance, gaps, or per-batch overhead.
+    pub batch_spans: BatchSpans,
+}
+
+/// The calling thread's CPU time, nanoseconds (0 where it cannot be read).
+fn thread_cpu_ns() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: the call only writes into the zeroed struct passed to it.
+        unsafe {
+            let mut ts: libc::timespec = std::mem::zeroed();
+            if libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) == 0 {
+                return (ts.tv_sec as u64).saturating_mul(1_000_000_000).saturating_add(ts.tv_nsec as u64);
+            }
+        }
+    }
+    0
+}
+
+/// One batch of the build on the pool: its start and end against the
+/// batches' start (microseconds), the CPU time its thread spent in it, and
+/// its transactions.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BatchSpan {
+    /// Start, microseconds after the batches' start.
+    pub start_us: u64,
+    /// End, microseconds after the batches' start.
+    pub end_us: u64,
+    /// The thread's CPU time inside the batch, microseconds.
+    pub cpu_us: u64,
+    /// Transactions in the batch.
+    pub txs: usize,
+}
+
+impl BatchSpan {
+    fn close(start_us: u64, cpu_start: u64, txs: usize, batches_at: std::time::Instant) -> Self {
+        Self {
+            start_us,
+            end_us: batches_at.elapsed().as_micros() as u64,
+            cpu_us: thread_cpu_ns().saturating_sub(cpu_start) / 1000,
+            txs,
+        }
+    }
+}
+
+/// The batches' spans summed up for the phases line (milliseconds unless
+/// named otherwise).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BatchSpans {
+    /// The longest batch, start to end.
+    pub max_ms: u64,
+    /// The shortest.
+    pub min_ms: u64,
+    /// The median.
+    pub median_ms: u64,
+    /// The CPU time of the longest batch.
+    pub cpu_max_ms: u64,
+    /// The most transactions in a batch.
+    pub txs_max: usize,
+    /// The fewest.
+    pub txs_min: usize,
+    /// The last batch's start less the first's.
+    pub start_skew_ms: u64,
+    /// The batches' start to the first batch's start, plus the last batch's
+    /// end to the batches' end.
+    pub wait_ms: u64,
+}
+
+impl BatchSpans {
+    /// `spans` over batches that took `total_us` from start to end.
+    pub fn of(spans: &mut [BatchSpan], total_us: u64) -> Self {
+        if spans.is_empty() {
+            return Self::default();
+        }
+        let wall = |s: &BatchSpan| s.end_us.saturating_sub(s.start_us);
+        let slowest = spans.iter().copied().max_by_key(wall).unwrap_or_default();
+        let first_start = spans.iter().map(|s| s.start_us).min().unwrap_or(0);
+        let last_start = spans.iter().map(|s| s.start_us).max().unwrap_or(0);
+        let last_end = spans.iter().map(|s| s.end_us).max().unwrap_or(0);
+        spans.sort_unstable_by_key(wall);
+        Self {
+            max_ms: wall(&slowest) / 1000,
+            min_ms: wall(&spans[0]) / 1000,
+            median_ms: wall(&spans[spans.len() / 2]) / 1000,
+            cpu_max_ms: slowest.cpu_us / 1000,
+            txs_max: spans.iter().map(|s| s.txs).max().unwrap_or(0),
+            txs_min: spans.iter().map(|s| s.txs).min().unwrap_or(0),
+            start_skew_ms: last_start.saturating_sub(first_start) / 1000,
+            wait_ms: (first_start + total_us.saturating_sub(last_end)) / 1000,
+        }
+    }
 }
 
 /// Why the parallel path did not run; the caller executes serially.
@@ -2915,12 +3007,17 @@ where
     // 80-150 ms of a full block's build (loop138-139).
     let slots: Vec<std::sync::OnceLock<BuiltTransfer<T>>> = (0..keys.len()).map(|_| std::sync::OnceLock::new()).collect();
     let slots_ref = &slots;
-    type BatchResult = (Vec<usize>, Option<BundleState>, crate::fast_transfer::TransferTimers);
+    type BatchResult = (Vec<usize>, Option<BundleState>, crate::fast_transfer::TransferTimers, BatchSpan);
+    // Each batch's span on the pool, against this instant (`BatchSpans`).
+    let batches_at = std::time::Instant::now();
     let results: Vec<Result<BatchResult, NotParallel>> = pool.install(|| {
         use rayon::prelude::*;
         batches
             .par_iter()
             .map(|members| {
+                let start_us = batches_at.elapsed().as_micros() as u64;
+                let cpu_start = thread_cpu_ns();
+                let txs = members.iter().map(|group| group.len()).sum::<usize>();
                 let db = ReadSetDb::new(read_set_ref, open().ok_or(NotParallel::NoState)?);
                 let mut state = State::builder().with_database(db).with_bundle_update().build();
                 let mut skipped = Vec::new();
@@ -2969,13 +3066,18 @@ where
                     // sink's lock only ever holds one batch at a time.
                     Some(sink) => {
                         sink(bundle);
-                        Ok((skipped, None, timers))
+                        let span = BatchSpan::close(start_us, cpu_start, txs, batches_at);
+                        Ok((skipped, None, timers, span))
                     }
-                    None => Ok((skipped, Some(bundle), timers)),
+                    None => {
+                        let span = BatchSpan::close(start_us, cpu_start, txs, batches_at);
+                        Ok((skipped, Some(bundle), timers, span))
+                    }
                 }
             })
             .collect()
     });
+    let batches_us = batches_at.elapsed().as_micros() as u64;
     phases.groups_ms = at.elapsed().as_millis() as u64;
     if let Some(set) = block_read_set {
         (phases.read_set_hits, phases.read_set_misses) = set.counts();
@@ -2985,14 +3087,17 @@ where
 
     let at = std::time::Instant::now();
     let mut run = BuildRun { phases, ..Default::default() };
+    let mut spans: Vec<BatchSpan> = Vec::with_capacity(results.len());
     for r in results {
-        let (skipped, bundle, timers) = r?;
+        let (skipped, bundle, timers, span) = r?;
+        spans.push(span);
         run.skipped.extend(skipped);
         if let Some(bundle) = bundle {
             run.bundles.push(bundle);
         }
         run.phases.transfer_timers.add(timers);
     }
+    run.phases.batch_spans = BatchSpans::of(&mut spans, batches_us);
     // Candidate order, as the serial builder would have laid the block out
     // (each sender's transfers were run in that order, and the graft does
     // not care): round 43's followers imported a sender-grouped block 35%
@@ -5636,6 +5741,8 @@ mod tests {
                     with.phases.read_set_hits,
                     with.phases.read_set_misses,
                 );
+                println!("  batches plain {:?}", plain.phases.batch_spans);
+                println!("  batches set   {:?}", with.phases.batch_spans);
             }
         }
         // The read pass alone at 1, 4 and 16 threads, without and with the

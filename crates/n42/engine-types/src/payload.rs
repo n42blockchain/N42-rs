@@ -1320,6 +1320,8 @@ where
     let mut par_read_set = crate::parallel_transfer::ReadSetPass::default();
     let mut par_read_set_hits = 0u64;
     let mut par_read_set_misses = 0u64;
+    // The build's batches on the pool: imbalance, gaps, per-batch overhead.
+    let mut par_batch_spans = crate::parallel_transfer::BatchSpans::default();
     // `N42_GRAFT_PREFAULT=1`: how long the graft's memory took to map, on its
     // own thread beside the parallel step (not on the chain).
     let mut par_prefault_ms = 0u64;
@@ -2123,6 +2125,7 @@ where
                     par_read_set = run.phases.read_set;
                     par_read_set_hits = run.phases.read_set_hits;
                     par_read_set_misses = run.phases.read_set_misses;
+                    par_batch_spans = run.phases.batch_spans;
                     par_skipped = run.skipped.len();
                     // Read by the diagnosis below, which must see what this
                     // step actually built.
@@ -2728,6 +2731,15 @@ where
                     read_set_misses = par_read_set_misses,
                     read_set_reads_provider = par_read_set.reads_provider,
                     read_set_reads_view = par_read_set.reads_view,
+                    // Each batch's wall on the pool, start to end (always on).
+                    batch_max_ms = par_batch_spans.max_ms,
+                    batch_min_ms = par_batch_spans.min_ms,
+                    batch_median_ms = par_batch_spans.median_ms,
+                    batch_cpu_max_ms = par_batch_spans.cpu_max_ms,
+                    batch_txs_max = par_batch_spans.txs_max,
+                    batch_txs_min = par_batch_spans.txs_min,
+                    batch_start_skew_ms = par_batch_spans.start_skew_ms,
+                    batch_wait_ms = par_batch_spans.wait_ms,
                     graft_base_ms = par_graft_base_ms,
                     graft_reserve_ms = par_graft_reserve_ms,
                     graft_insert_ms = par_graft_insert_ms,

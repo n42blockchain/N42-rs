@@ -5728,45 +5728,21 @@ mod tests {
         }
     }
 
-    /// Plan v6 attempt H on the bench: a full block of the fleet's shape --
-    /// 163,008 transfers in runs of 64 (2,547 senders of 6,000), recipients
-    /// drawn from two million -- executed on the build's pool with its state
-    /// served from a QMDB read view over a two-million-account entry file,
-    /// behind the parent block's changes (150,000 accounts), and executed
-    /// again with the block's accounts prefetched (`N42_BUILD_PREFETCH`), in
-    /// pulled batches of 1,024 as the fleet's puller hands them over.
-    ///
-    /// ```text
-    /// RAYON_NUM_THREADS=16 taskset -c 0-31 \
-    ///   cargo test --release -p n42-engine-types --lib bench_build_prefetch -- --ignored --nocapture
-    /// ```
-    ///
-    /// Prints the execution (`par_exec_ms`) without and with the prefetch,
-    /// and the prefetch's wall time and summed pool time (`par_prefetch_ms`).
-    /// Idle here, the prefetch is extra wall time; on the fleet it runs beside
-    /// the pull and the prep (32 ms).
-    ///
-    /// What it reads (2026-09-24, idle box): exec 32-35 without the prefetch,
-    /// 16-17 with it -- half the leg's 65, so the fleet's read path is the
-    /// heavier one -- and the prefetch 35-37 ms of wall, 545-585 ms of pool
-    /// time for 159,230 accounts: 3.5 us a read with sixteen threads reading,
-    /// where one thread alone reads the same accounts at ~0.7 us. The reads
-    /// contend with each other; what on (the view's one `versions` lock is
-    /// the only state every read shares) is not measured here.
-    #[test]
-    #[ignore = "timing"]
-    fn bench_build_prefetch() {
+    /// The benches' parent state: a QMDB read view over an entry file of the
+    /// beneficiary (`addr(1)`), `senders` funded senders and `recipients`
+    /// recipients, behind the parent block's changes (150,000 accounts).
+    /// Returns the view and the scratch directory to remove.
+    fn fleet_view_db(
+        tag: &str,
+        senders: u64,
+        recipients: u64,
+        sender_of: impl Fn(u64) -> Address,
+        recipient_of: impl Fn(u64) -> Address,
+    ) -> (ViewDb, std::path::PathBuf) {
         use n42_twig_core::qmdb_compat::{encode_gov5_account_value, gov5_account_key, GOV5_EMPTY_CODE_HASH};
         use std::io::Write as _;
-        let senders = 6_000u64;
-        let recipients = 2_000_000u64;
-        let run = 64u64;
-        let block_senders = 2_547u64;
-        let sender_of = |s: u64| addr(100 + s);
-        let recipient_of = |r: u64| addr(1_000_000 + r);
-
         // The entry file: `[key 32][len u32 LE][value]` per account.
-        let dir = std::env::temp_dir().join(format!("n42-bench-build-prefetch-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("n42-bench-build-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("a scratch directory");
         let path = dir.join("entries.log");
         let mut live = Vec::with_capacity((senders + recipients) as usize);
@@ -5802,6 +5778,45 @@ mod tests {
             overlay.insert(recipient_of(r), Some(AccountInfo::from(account)));
         }
         let db = ViewDb { view, head: 1, overlay: std::sync::Arc::new(overlay), count: false };
+        (db, dir)
+    }
+
+    /// Plan v6 attempt H on the bench: a full block of the fleet's shape --
+    /// 163,008 transfers in runs of 64 (2,547 senders of 6,000), recipients
+    /// drawn from two million -- executed on the build's pool with its state
+    /// served from a QMDB read view over a two-million-account entry file,
+    /// behind the parent block's changes (150,000 accounts), and executed
+    /// again with the block's accounts prefetched (`N42_BUILD_PREFETCH`), in
+    /// pulled batches of 1,024 as the fleet's puller hands them over.
+    ///
+    /// ```text
+    /// RAYON_NUM_THREADS=16 taskset -c 0-31 \
+    ///   cargo test --release -p n42-engine-types --lib bench_build_prefetch -- --ignored --nocapture
+    /// ```
+    ///
+    /// Prints the execution (`par_exec_ms`) without and with the prefetch,
+    /// and the prefetch's wall time and summed pool time (`par_prefetch_ms`).
+    /// Idle here, the prefetch is extra wall time; on the fleet it runs beside
+    /// the pull and the prep (32 ms).
+    ///
+    /// What it reads (2026-09-24, idle box): exec 32-35 without the prefetch,
+    /// 16-17 with it -- half the leg's 65, so the fleet's read path is the
+    /// heavier one -- and the prefetch 35-37 ms of wall, 545-585 ms of pool
+    /// time for 159,230 accounts: 3.5 us a read with sixteen threads reading,
+    /// where one thread alone reads the same accounts at ~0.7 us. The reads
+    /// contend with each other; what on (the view's one `versions` lock is
+    /// the only state every read shares) is not measured here.
+    #[test]
+    #[ignore = "timing"]
+    fn bench_build_prefetch() {
+        let senders = 6_000u64;
+        let recipients = 2_000_000u64;
+        let run = 64u64;
+        let block_senders = 2_547u64;
+        let sender_of = |s: u64| addr(100 + s);
+        let recipient_of = |r: u64| addr(1_000_000 + r);
+
+        let (db, dir) = fleet_view_db("prefetch", senders, recipients, sender_of, recipient_of);
 
         let beneficiary = addr(1);
         let mut envs = Vec::new();
@@ -5932,6 +5947,141 @@ mod tests {
                     pass.resolve_us * 1000 * threads as u64 / pass.accounts.max(1) as u64,
                 );
             }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The batch loop as the fleet's leader runs it (docs/BREAKTHROUGH_DESIGN.md
+    /// 10.23): a full block of the fleet's shape (as [`bench_build_prefetch`])
+    /// made of real 0x50 transfers -- `N42TxEnvelope::AltSig` with their
+    /// pubkey and signature bytes, pooled as the ingest pools them -- fetched
+    /// through the builder's `convert`, with every batch handed to
+    /// `OutputShards` in index mode (16 shards) as the fleet's
+    /// `N42_OUTPUT_SHARDS=16 N42_OUTPUT_INDEX=1` does, the slots left in
+    /// place. Odd rounds run the builder's transactions-root job beside the
+    /// batches, as `N42_SEAL_AT_EXEC=1` does.
+    ///
+    /// ```text
+    /// N42_PHASE_TIMERS=1 RAYON_NUM_THREADS=16 taskset -c 0-15 \
+    ///   cargo test --release -p n42-engine-types --lib bench_build_real_path -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "timing"]
+    fn bench_build_real_path() {
+        use n42_tx_types::{AltSigTx, N42TxEnvelope, TxAltSig, ALG_ED25519};
+        use reth_evm::ConfigureEvm as _;
+        use reth_transaction_pool::{
+            identifier::{SenderId, TransactionId},
+            TransactionOrigin, ValidPoolTransaction,
+        };
+        let senders = 6_000u64;
+        let recipients = 2_000_000u64;
+        let run = 64u64;
+        let block_senders = 2_547u64;
+        let sender_of = |s: u64| addr(100 + s);
+        let recipient_of = |r: u64| addr(1_000_000 + r);
+        let (db, dir) = fleet_view_db("real-path", senders, recipients, sender_of, recipient_of);
+
+        let beneficiary = addr(1);
+        let mut cands: Vec<std::sync::Arc<ValidPoolTransaction<crate::N42PooledTransaction>>> = Vec::new();
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        for s in 0..block_senders {
+            let mut pubkey = [0u8; 32];
+            pubkey[..8].copy_from_slice(&s.to_be_bytes());
+            for k in 0..run {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let tx = TxAltSig {
+                    chain_id: 1,
+                    nonce: k,
+                    max_priority_fee_per_gas: 1_000_000_000,
+                    max_fee_per_gas: 10_000_000_000,
+                    gas_limit: 21_000,
+                    to: recipient_of(seed % recipients),
+                    value: U256::from(1_000 + k),
+                    input: Bytes::new(),
+                    access_list: Default::default(),
+                    alg_type: ALG_ED25519,
+                    pubkey: Bytes::copy_from_slice(&pubkey),
+                };
+                // Heap bytes, as the ingest decodes them; the signature is
+                // never checked on this path.
+                let mut signature = [0u8; 64];
+                signature[..8].copy_from_slice(&seed.to_be_bytes());
+                let envelope = N42TxEnvelope::AltSig(AltSigTx::new(tx, Bytes::copy_from_slice(&signature)));
+                let encoded = alloy_eips::eip2718::Encodable2718::encode_2718_len(&envelope);
+                let pooled = crate::N42PooledTransaction::new(Recovered::new_unchecked(envelope, sender_of(s)), encoded);
+                cands.push(std::sync::Arc::new(ValidPoolTransaction {
+                    transaction: pooled,
+                    transaction_id: TransactionId::new(SenderId::from(s), k),
+                    propagate: false,
+                    timestamp: std::time::Instant::now(),
+                    origin: TransactionOrigin::External,
+                    authority_ids: None,
+                }));
+            }
+        }
+        let header = Header { number: 20_000_000, beneficiary, gas_limit: 5_000_000_000, base_fee_per_gas: Some(1_000_000_000), timestamp: 1_800_000_000, ..Default::default() };
+        let evm_config = crate::n42_evm::N42EvmConfig::new_with_evm_factory(MAINNET.clone(), N42EvmFactory::with_fast_transfers(true));
+        let evm_env = evm_config.evm_env(&header).expect("env");
+        let keys: Vec<(Address, Address)> =
+            cands.iter().map(|tx| (tx.sender(), alloy_consensus::Transaction::to(&tx.transaction).unwrap_or_default())).collect();
+        // The builder's `convert` (payload.rs), as it is.
+        let convert = |i: usize| {
+            let recovered: Recovered<N42TxEnvelope> = cands[i].to_consensus();
+            let env = evm_config.tx_env(recovered.as_recovered_ref());
+            (recovered, env)
+        };
+        println!("block: {} 0x50 transfers, {} pool threads", cands.len(), build_pool().current_num_threads());
+        for round in 0..6 {
+            let with_root = round % 2 == 1;
+            let shards = crate::output_shards::OutputShards::with_index(beneficiary, keys.len(), 16, true);
+            let sink = |bundle: BundleState| shards.add(bundle);
+            let run = std::thread::scope(|scope| {
+                let root = with_root.then(|| {
+                    let cands = &cands;
+                    scope.spawn(move || {
+                        use alloy_eips::eip2718::Encodable2718 as _;
+                        crate::assembler::parallel_transaction_root_by(cands.len(), |i| cands[i].to_consensus().into_inner().encoded_2718())
+                    })
+                });
+                let run = execute_for_build_in_place(&evm_env, &keys, &convert, &|| Some(db.clone()), Some(&sink), true)
+                    .expect("a block of transfers");
+                if let Some(root) = root {
+                    let _ = root.join();
+                }
+                run
+            });
+            let executed = run.slots.iter().filter(|slot| slot.get().is_some()).count();
+            assert_eq!(executed, cands.len(), "every transfer executed");
+            let frozen = shards.freeze();
+            println!(
+                "round {round} (root job {with_root}): exec {} ms, append {} ms of pool time, batches {:?}",
+                run.phases.groups_ms,
+                frozen.append_ms(),
+                run.phases.batch_spans
+            );
+            if crate::fast_transfer::phase_timers() {
+                let (l, t) = (run.phases.loop_timers, run.phases.transfer_timers);
+                let per = |ns: u64| l.per_tx(ns);
+                println!(
+                    "  loop ns a transfer: fetch {} transfer {} (read {} evm {} write {}) gas {} sink {} other {}; batch setup {} close {}; total {}",
+                    per(l.fetch_ns),
+                    per(l.transfer_ns),
+                    per(t.read_ns),
+                    per(t.evm_ns),
+                    per(t.write_ns),
+                    per(l.gas_ns),
+                    per(l.sink_ns),
+                    per(l.other_ns),
+                    per(l.batch_setup_ns),
+                    per(l.batch_close_ns),
+                    per(l.fetch_ns + l.check_ns + l.transfer_ns + l.receipt_ns + l.gas_ns + l.sink_ns + l.other_ns + l.batch_setup_ns + l.batch_close_ns),
+                );
+            }
+            drop(frozen);
+            drop(run);
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

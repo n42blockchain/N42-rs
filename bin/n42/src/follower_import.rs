@@ -2617,9 +2617,20 @@ fn fields_early() -> bool {
 /// holds it and waits for its own hashing may steal whatever else is queued
 /// here -- a second root would then wait for the lock its own thread holds
 /// (loop164 O17). Serialised, nothing else is ever queued on this pool.
+///
+/// `N42_FOLLOWER_ROOT_ON_BUILD_POOL=1`: on the build pool instead, whose
+/// threads the build path's batches (`N42_FOLLOWER_BUILD_PATH=1`) have just
+/// left -- the root starts when they are done -- so the node keeps no
+/// separate eight threads for it. The next block's batches may start while
+/// the root runs; a worker then finishes the root's queued pieces (its own
+/// and stolen ones) before it takes a new batch from the pool's queue.
 fn on_root_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
     static ONE: Mutex<()> = Mutex::new(());
+    if root_on_build_pool() {
+        let _one = ONE.lock().unwrap_or_else(|p| p.into_inner());
+        return n42_engine_types::parallel_transfer::build_pool().install(f);
+    }
     match POOL.get_or_init(|| side_pool("N42_FOLLOWER_ROOT_THREADS", "qmdb-root", 8)) {
         Some(pool) => {
             let _one = ONE.lock().unwrap_or_else(|p| p.into_inner());
@@ -2628,6 +2639,12 @@ fn on_root_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
         None => f(),
     }
 }
+/// `N42_FOLLOWER_ROOT_ON_BUILD_POOL=1` ([`on_root_pool`]), read once.
+fn root_on_build_pool() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_ROOT_ON_BUILD_POOL").is_ok_and(|v| v == "1"))
+}
+
 /// Milliseconds from `from` to `to`, zero if `to` is earlier.
 fn ms_between(from: std::time::Instant, to: std::time::Instant) -> u64 {
     to.saturating_duration_since(from).as_millis() as u64

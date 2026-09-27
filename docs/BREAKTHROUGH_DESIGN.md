@@ -362,3 +362,28 @@ inserts each took 33 ms wall -- 3.6 us an insert, twelve times the graft's -- wh
 (the transposition, per-task allocation, cloning in the add rules, the pool's wake-up), not at the idea. Next: a
 microbenchmark of the fold against the graft on the block's shape, off the fleet, until the fold is under ~8 ms
 wall, then one leg.
+
+### 10.11 The fold off the fleet (microbenchmark, e3179b06d): the fold is 4 ms, the fleet's 33 is the cores
+
+`crates/n42/engine-types/tests/output_shards_bench.rs` (ignored; the block's shape, jemalloc with the fleet's
+`MALLOC_CONF`, 16 cores, medians of 20). Milliseconds:
+
+| path | v2 | v4 |
+| --- | --- | --- |
+| graft (single-threaded) | 23.2 | 24.3 |
+| append, wall / summed pool | 3.7 / 55 | 0.8 / 8 |
+| fold, wall | 3.5-3.9 | 4.5 |
+| merge | 25.2 | 28.9 |
+| roots from the merged bundle (QMDB ops / hashed) | 4.9 / 16.4 | 5.2 / 16.5 |
+| roots from the shard view (build / ops / hashed) | 0.44 / 4.5 / 15.6 | 0.46 / 4.6 / 15.8 |
+| fold pipelined with 0 / 8 / 16 busy threads on the cores | 4.5 / 13.4 / 28.0 | 7.6 / 18.1 / 32.1 |
+
+The fold's own work is 0.38 us an insert -- the graft's speed, sixteen ways. The fleet's 33 ms is reproduced
+only by putting 16-32 busy threads on the fold's cores: the fold waits for its slowest task, and on the fleet
+the parent's merge (25-29) and roots run on those cores beside it; the roots' 66-vs-39 is the same contention
+(merge + roots together 34-37 against roots alone 21, the same 1.7x). The append's 55 ms of pool time was the
+move of a 264-byte account into a fresh per-shard vector inside the execution; v4 hands the batch's map over
+whole with per-shard address lists, so the fold copies from it (append 8, fold +1 idle / +3 pipelined). What
+remains, on the fleet, is the ordering in `payload.rs`: the merge and the roots must not share the build pool's
+cores with the child's execution and fold. loop276 runs v4 with the fold split logged ("output shards folded":
+queue / skew / task_max / tail) to name the fleet's fold.

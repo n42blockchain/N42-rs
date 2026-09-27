@@ -500,6 +500,9 @@ impl QmdbNodeState {
     pub fn on_persisted(&self, blocks: &[(u64, B256)]) {
         use crate::read_view::Position;
         let Some(view) = self.inner.read_view.get() else { return };
+        // Called ahead of the batch's commit: the database's readers stay at
+        // the view's head until then, however far the view advances here.
+        view.hold_journals_from(view.head().0);
         for &(number, hash) in blocks {
             match view.position(number, hash) {
                 Position::Held => {}

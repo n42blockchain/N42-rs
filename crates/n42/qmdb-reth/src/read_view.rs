@@ -82,6 +82,10 @@ struct Versions {
     journals: VecDeque<Step>,
     /// The block whose index writes may be in flight (the head's child).
     pending: Option<Journal>,
+    /// The version the database's readers stand at while a persistence batch
+    /// is being applied ([`QmdbReadView::hold_journals_from`]): the steps
+    /// above it are kept past [`JOURNAL_DEPTH`] until the next batch.
+    held_from: Option<u64>,
 }
 
 /// Where a persisted block stands against the view.
@@ -186,6 +190,7 @@ impl QmdbReadView {
                 head_floor: floor,
                 journals: VecDeque::new(),
                 pending: None,
+                held_from: None,
             }),
             floor: AtomicU64::new(floor),
             cuts: AtomicU64::new(0),
@@ -323,9 +328,30 @@ impl QmdbReadView {
         versions.journals.push_back(Step { number, hash, journal, floor_before });
         versions.head = (number, hash);
         versions.head_floor = floor_before.max(raised.floor);
-        while versions.journals.len() > JOURNAL_DEPTH {
+        while versions.journals.len() > JOURNAL_DEPTH
+            && versions.journals.front().is_some_and(|step| versions.held_from.is_none_or(|held| step.number <= held))
+        {
             versions.journals.pop_front();
         }
+    }
+
+    /// A persistence batch starts: the database's readers stand at `number`
+    /// (the view's head, which the previous batch's commit made the
+    /// database's version) until this batch commits, and the view advances
+    /// ahead of that commit. The steps above `number` are kept past
+    /// [`JOURNAL_DEPTH`] until the next batch, so those readers are answered
+    /// however many blocks the batch holds.
+    ///
+    /// Without it a batch of more than [`JOURNAL_DEPTH`] blocks -- the lag
+    /// reaches ~100 late in a fleet leg -- popped the journals the database's
+    /// version needed while its commit was still in flight, and every read in
+    /// that window was declined: with `N42_HASHED_TABLES=off` an error
+    /// ("the QMDB reader did not answer slot 0x546 of 0x0000F908...", the
+    /// history contract's first read in a block's execution), and the block
+    /// was rejected as invalid (loop279 IDX/IDXP100, block 1351).
+    pub fn hold_journals_from(&self, number: u64) {
+        let mut versions = self.versions.write().unwrap_or_else(PoisonError::into_inner);
+        versions.held_from = Some(number);
     }
 
     /// Steps the view back to block `number` (the database unwound the state
@@ -446,6 +472,69 @@ mod tests {
     /// again on the same mapping (`warm`), beside the same reads with no
     /// versions lock (`raw`: index and record only). Pinned:
     /// `taskset -c 0-31 cargo test -p n42-qmdb-reth --release --lib bench_concurrent_reads -- --ignored --nocapture`.
+    /// A persistence batch longer than the journals: the database's readers
+    /// stay at the batch's start until it commits, and are answered.
+    #[test]
+    fn a_batch_longer_than_the_journals_keeps_the_readers_at_its_start() {
+        use n42_twig_core::qmdb_compat::GOV5_EMPTY_CODE_HASH;
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("n42-view-held-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let path = dir.join("entries.log");
+        let mut file = std::io::BufWriter::new(std::fs::File::create(&path).expect("the entry file"));
+        let mut offset = 0u64;
+        let address = Address::with_last_byte(0x42);
+        let mut put = |file: &mut std::io::BufWriter<std::fs::File>, nonce: u64| {
+            let key = gov5_account_key(&address.0 .0);
+            let value = encode_gov5_account_value(nonce, &U256::from(nonce).to_be_bytes::<32>(), &GOV5_EMPTY_CODE_HASH);
+            file.write_all(&key).expect("write");
+            file.write_all(&(value.len() as u32).to_le_bytes()).expect("write");
+            file.write_all(&value).expect("write");
+            let at = offset;
+            offset += 36 + value.len() as u64;
+            (key, at)
+        };
+        let live = vec![put(&mut file, 1)];
+        let batch = JOURNAL_DEPTH as u64 + 20;
+        let blocks: Vec<Vec<(Hash, Option<u64>)>> =
+            (0..batch).map(|b| vec![put(&mut file, b + 2)]).map(|v| vec![(v[0].0, Some(v[0].1))]).collect();
+        file.flush().expect("flush");
+        drop(file);
+        let nonce_at = |view: &QmdbReadView, at: u64| view.account(&address, at).map(|a| a.map(|a| a.nonce));
+        for held in [false, true] {
+            let view = QmdbReadView::build(&path, (1, B256::ZERO), live.clone()).expect("the view");
+            if held {
+                view.hold_journals_from(1);
+            }
+            for (b, changes) in blocks.iter().enumerate() {
+                let raised = view.raise_floor(changes);
+                view.advance(b as u64 + 2, B256::with_last_byte(b as u8 + 2), changes, raised);
+            }
+            assert_eq!(nonce_at(&view, batch + 1), Some(Some(batch + 1)), "the head answers");
+            if held {
+                assert_eq!(nonce_at(&view, 1), Some(Some(1)), "the batch's start answers until the next batch");
+                // The next batch: the previous one committed, the journals trim.
+                view.hold_journals_from(batch + 1);
+                let changes = vec![{
+                    let mut file = std::fs::OpenOptions::new().append(true).open(&path).expect("the entry file");
+                    let key = gov5_account_key(&address.0 .0);
+                    let value = encode_gov5_account_value(batch + 2, &U256::from(batch + 2).to_be_bytes::<32>(), &GOV5_EMPTY_CODE_HASH);
+                    file.write_all(&key).expect("write");
+                    file.write_all(&(value.len() as u32).to_le_bytes()).expect("write");
+                    file.write_all(&value).expect("write");
+                    (key, Some(offset))
+                }];
+                let raised = view.raise_floor(&changes);
+                view.advance(batch + 2, B256::with_last_byte(0xEE), &changes, raised);
+                assert_eq!(nonce_at(&view, 1), None, "trimmed to the depth once the batch is behind");
+                assert_eq!(nonce_at(&view, batch + 1), Some(Some(batch + 1)));
+            } else {
+                assert_eq!(nonce_at(&view, 1), None, "without the hold the start is past the journals");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     #[ignore = "timing"]
     fn bench_concurrent_reads() {

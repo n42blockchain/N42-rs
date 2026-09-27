@@ -3537,6 +3537,56 @@ where
     execute_transfers_with_plan(evm_config, block, main_db, open, graft, sender_groups, None, false)
 }
 
+/// Whether the follower's batches run on the leader's batch state (default;
+/// `N42_FOLLOWER_BATCH_STATE=0` goes back to revm's `State`): the three cuts
+/// of step 4b (be80847cc, 921de3899) -- [`crate::batch_state::BatchState`] as
+/// the sink, `transfer_plain` handing the computed accounts over without an
+/// `EvmState`, and the loaded info moved rather than cloned on a read. The
+/// bundle a batch yields is the one `State`'s
+/// `merge_transitions(BundleRetention::Reverts)` and `take_bundle` return
+/// (`batch_state`'s tests, and `parallel_matches_serial*` here on the
+/// follower's own path), so the block's post-state is unchanged.
+pub fn follower_batch_state() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_FOLLOWER_BATCH_STATE").map_or(true, |v| v != "0"))
+}
+
+/// One follower batch on the leader's cuts ([`follower_batch_state`]): the
+/// batch's groups in order, each transfer straight into a
+/// [`crate::batch_state::BatchState`] over `db`, and the batch's bundle with
+/// the gas each transaction used. A transaction the transfer path does not
+/// take, or a change the batch state does not model, sends the block to the
+/// serial executor as before.
+fn follower_batch<G>(
+    members: &[&Vec<usize>],
+    txs: &[TxEnv],
+    evm_env: &reth_evm::EvmEnv,
+    db: G,
+) -> Result<(BundleState, Vec<(usize, u64)>), NotParallel>
+where
+    G: Database + std::fmt::Debug,
+    G::Error: std::fmt::Display,
+{
+    let count = members.iter().map(|group| group.len()).sum::<usize>();
+    // A sender and a recipient a transfer at most, the beneficiary once.
+    let mut state = crate::batch_state::BatchState::with_capacity(db, 2 * count + 1);
+    let mut gas = Vec::with_capacity(count);
+    {
+        let mut evm = N42EvmFactory::with_fast_transfers(true).create_evm(&mut state, evm_env.clone());
+        for &i in members.iter().flat_map(|group| group.iter()) {
+            match evm.transfer_plain(&txs[i]) {
+                Ok(Some((plain, result))) => {
+                    gas.push((i, result.gas_used()));
+                    evm.db_mut().commit_transfer(plain).map_err(|err| NotParallel::Failed(i, err.to_string()))?;
+                }
+                Ok(None) => return Err(NotParallel::NotATransfer(i)),
+                Err(err) => return Err(NotParallel::Failed(i, err.to_string())),
+            }
+        }
+    }
+    Ok((state.take_bundle(), gas))
+}
+
 /// [`execute_transfers_with`] with a plan made ahead ([`plan_transfers`]) and
 /// the grafted reverts' sort beside the rest of the merge
 /// ([`follower_merge_behind`]).
@@ -3619,24 +3669,28 @@ where
             .par_iter()
             .map(|members| {
                 let db = open().ok_or(NotParallel::NoState)?;
-                let mut state = State::builder().with_database(db).with_bundle_update().build();
-                let mut gas = Vec::with_capacity(members.iter().map(|g| g.len()).sum());
-                {
-                    let mut evm =
-                        N42EvmFactory::with_fast_transfers(true).create_evm(&mut state, evm_env.clone());
-                    for &i in members.iter().flat_map(|g| g.iter()) {
-                        match evm.transfer(&txs[i]) {
-                            Ok(Some(out)) => {
-                                gas.push((i, out.result.gas_used()));
-                                evm.db_mut().commit(out.state);
+                let (bundle, gas) = if follower_batch_state() {
+                    follower_batch(members, &txs, &evm_env, db)?
+                } else {
+                    let mut state = State::builder().with_database(db).with_bundle_update().build();
+                    let mut gas = Vec::with_capacity(members.iter().map(|g| g.len()).sum());
+                    {
+                        let mut evm =
+                            N42EvmFactory::with_fast_transfers(true).create_evm(&mut state, evm_env.clone());
+                        for &i in members.iter().flat_map(|g| g.iter()) {
+                            match evm.transfer(&txs[i]) {
+                                Ok(Some(out)) => {
+                                    gas.push((i, out.result.gas_used()));
+                                    evm.db_mut().commit(out.state);
+                                }
+                                Ok(None) => return Err(NotParallel::NotATransfer(i)),
+                                Err(err) => return Err(NotParallel::Failed(i, err.to_string())),
                             }
-                            Ok(None) => return Err(NotParallel::NotATransfer(i)),
-                            Err(err) => return Err(NotParallel::Failed(i, err.to_string())),
                         }
                     }
-                }
-                state.merge_transitions(BundleRetention::Reverts);
-                let bundle = state.take_bundle();
+                    state.merge_transitions(BundleRetention::Reverts);
+                    (state.take_bundle(), gas)
+                };
                 // See the leader's batch loop above: drained here, on the
                 // batch's own thread, `N42_PHASE_TIMERS=1` only.
                 let timers = crate::fast_transfer::drain_timers();

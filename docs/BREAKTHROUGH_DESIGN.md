@@ -908,3 +908,24 @@ seal at 94-98 beside it. The queue sits at the gate line again at 80-90 (807-824
 second window collapsed to 37% full blocks. So the pacing stays at 100 and the terms are the two chains'
 overheads: the leader's tick-to-send (step 6b, in flight), and the follower's road (26-29 for what the design
 priced at ~5) and the gaps between its execution's end, its root and its fields.
+
+### 10.36 The leader's tick-to-send and the follower's road, off the fleet (steps 6b and 5e)
+
+Step 6b (825edb99d..37e3a8709): the 23 ms from the pacing tick to the proposal's send, read from loop289's
+leader: the late wake 5.6 (a 10 ms retry poll where the tick should have been a `sleep_until`), the wait for
+the build ahead ~4 (the seal late in a few blocks), the sign 7 (the BLS header seal plus a clone of the 163k
+payload), the cache copy 2, the body encode 6 (26 MB of RLP for a 12.5 KB description and the body store); and
+after the body is prepared, the vote log's fsync (8 median, kept: safety) and the proposal's wait for the
+step's drain behind the next build request. The cuts: the leader sleeps until the tick itself; the proposal is
+published the moment the engine makes it; a build ahead is sealed, cached and encoded in its own task before
+the tick (taken only if view and hash match). A "proposal sent" line names the parts. Expected tick-to-send
+~2-3 plus the vote sync.
+
+Step 5e (0030ff71d..f1ada820f): the road's `check_ms` 14 is entirely `check_includable` -- a scan of every
+transaction (chain id, fee caps, intrinsic gas, nonce runs, costs) in 32 chunks on the 4-thread check pool,
+then a per-sender fold and each sender's total against the parent's shards. With `N42_FOLLOWER_FRAME_SCAN=1`
+the ingest sums each clean frame once (gas, smallest fee cap, chain id, sender runs with nonces and costs,
+~40 us a frame on the supply side) and the check reads the summary for every frame the block took whole. The
+root's thread starts with the execution (its spawn and its wait for the parent's fields overlap the batches),
+and the header/body consensus checks move onto the road beside the execution. The copy (8) stays on the road:
+the build-path execution reads the owned block, not the frames' Arcs. loop291: P100 / P100S / P90S / P100Sb.

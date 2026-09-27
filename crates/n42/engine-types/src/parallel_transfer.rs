@@ -223,8 +223,8 @@ impl BatchSpans {
 pub struct LoopTimers {
     /// Transactions the loop executed (the scale's denominator).
     pub txs: u64,
-    /// Getting the transaction and its EVM environment (`convert`: the
-    /// envelope's clone, the sender, the `TxEnv`).
+    /// Getting the transaction's EVM environment (`convert`: on the builder,
+    /// the `TxEnv` read off the pooled transaction by reference).
     pub fetch_ns: u64,
     /// Pre-checks in the loop outside `transfer` (none today: `transfer`
     /// makes every check itself).
@@ -6028,11 +6028,8 @@ mod tests {
         let keys: Vec<(Address, Address)> =
             cands.iter().map(|tx| (tx.sender(), alloy_consensus::Transaction::to(&tx.transaction).unwrap_or_default())).collect();
         // The builder's `convert` (payload.rs), as it is.
-        let convert = |i: usize| {
-            let recovered: Recovered<N42TxEnvelope> = cands[i].to_consensus();
-            let env = evm_config.tx_env(recovered.as_recovered_ref());
-            (recovered, env)
-        };
+        let convert =
+            |i: usize| ((), evm_config.tx_env(reth_transaction_pool::PoolTransaction::consensus_ref(&cands[i].transaction)));
         println!("block: {} 0x50 transfers, {} pool threads", cands.len(), build_pool().current_num_threads());
         for round in 0..6 {
             let with_root = round % 2 == 1;
@@ -6043,7 +6040,9 @@ mod tests {
                     let cands = &cands;
                     scope.spawn(move || {
                         use alloy_eips::eip2718::Encodable2718 as _;
-                        crate::assembler::parallel_transaction_root_by(cands.len(), |i| cands[i].to_consensus().into_inner().encoded_2718())
+                        crate::assembler::parallel_transaction_root_by(cands.len(), |i| {
+                            reth_transaction_pool::PoolTransaction::consensus_ref(&cands[i].transaction).into_inner().encoded_2718()
+                        })
                     })
                 });
                 let run = execute_for_build_in_place(&evm_env, &keys, &convert, &|| Some(db.clone()), Some(&sink), true)

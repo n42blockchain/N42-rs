@@ -632,10 +632,21 @@ fn body_matches_pull<A, P>(body: &[A], pulled: &[P], body_hash: impl Fn(&A) -> B
     [0, last / 2, last].into_iter().all(|i| body_hash(&body[i]) == pulled_hash(&pulled[i]))
 }
 
+/// The pooled candidates of a parallel step, in pull order: a slot's
+/// `index` names its transaction here (the slot keeps no copy of it).
+type Pulled<P> = [Arc<reth_transaction_pool::ValidPoolTransaction<P>>];
+
+/// The consensus transaction inside a pooled one, by reference.
+fn pooled_consensus<P: PoolTransaction<Consensus = TransactionSigned>>(
+    tx: &reth_transaction_pool::ValidPoolTransaction<P>,
+) -> &TransactionSigned {
+    tx.transaction.consensus_ref().into_inner()
+}
+
 /// The cumulative gas through each transaction of a block the parallel step
 /// left in its slots, in block order, and the block's gas.
 fn cumulative_gas(
-    refs: &[&crate::parallel_transfer::BuiltTransfer<reth_primitives_traits::Recovered<TransactionSigned>>],
+    refs: &[&crate::parallel_transfer::BuiltTransfer<()>],
 ) -> (Vec<u64>, u64) {
     let mut cumulative = Vec::with_capacity(refs.len());
     let mut tx_gas = 0u64;
@@ -648,15 +659,16 @@ fn cumulative_gas(
 
 /// The receipts of a block the parallel step left in its slots, in block
 /// order, with `cumulative[i]` the block's gas through transaction `i`.
-fn receipts_from_slots(
-    refs: &[&crate::parallel_transfer::BuiltTransfer<reth_primitives_traits::Recovered<TransactionSigned>>],
+fn receipts_from_slots<P: PoolTransaction<Consensus = TransactionSigned>>(
+    refs: &[&crate::parallel_transfer::BuiltTransfer<()>],
     cumulative: &[u64],
+    pulled: &Pulled<P>,
 ) -> Vec<n42_tx_types::Receipt> {
     use rayon::prelude::*;
     refs.par_iter()
         .zip(cumulative.par_iter())
         .map(|(built, cumulative_gas_used)| n42_tx_types::Receipt {
-            tx_type: <TransactionSigned as alloy_consensus::TransactionEnvelope>::tx_type(built.tx.inner()),
+            tx_type: <TransactionSigned as alloy_consensus::TransactionEnvelope>::tx_type(pooled_consensus(&pulled[built.index])),
             success: built.result.is_success(),
             cumulative_gas_used: *cumulative_gas_used,
             logs: built.result.logs().to_vec(),
@@ -1613,11 +1625,14 @@ where
                 lookahead.push_front(tx);
             }
         } else {
-            let convert = |i: usize| {
-                let recovered: reth_primitives_traits::Recovered<TransactionSigned> = cands[i].to_consensus();
-                let env = evm_config.tx_env(recovered.as_recovered_ref());
-                (recovered, env)
-            };
+            // The environment is read off the pooled transaction by
+            // reference (the sender the ingest recorded), and the slot keeps
+            // only the candidate's index: the envelope's clone here (its 0x50
+            // pubkey and signature bytes) was part of the fetch's 450 ns a
+            // transfer on the fleet (loop283), and a slot holding it was 470
+            // bytes to write. The body copies each transaction once, from
+            // `cands`, behind the execution.
+            let convert = |i: usize| ((), evm_config.tx_env(cands[i].transaction.consensus_ref()));
             // Without the prefetch the layer is empty and every read goes
             // to the provider, as before.
             let open = || open_db().map(|db| crate::parallel_transfer::WarmDb::new(&warm, db));
@@ -1684,7 +1699,7 @@ where
                     scope.spawn(move || {
                         use alloy_eips::eip2718::Encodable2718 as _;
                         crate::assembler::parallel_transaction_root_by(pulled_set.len(), |i| {
-                            pulled_set[i].to_consensus().into_inner().encoded_2718()
+                            pooled_consensus(&pulled_set[i]).encoded_2718()
                         })
                     })
                 });
@@ -1807,7 +1822,7 @@ where
                         total_fees += refs
                             .par_iter()
                             .map(|built| {
-                                let tip = built.tx.effective_tip_per_gas(base_fee).unwrap_or_default();
+                                let tip = pooled_consensus(&cands[built.index]).effective_tip_per_gas(base_fee).unwrap_or_default();
                                 U256::from(tip) * U256::from(built.gas_used)
                             })
                             .reduce(|| U256::ZERO, |a, b| a + b);
@@ -1816,11 +1831,11 @@ where
                         // Ahead: one pass on the build pool for both vectors.
                         let (transactions, senders): (Vec<TransactionSigned>, Vec<alloy_primitives::Address>) = if ahead {
                             crate::parallel_transfer::build_pool()
-                                .install(|| refs.par_iter().map(|built| (built.tx.inner().clone(), built.tx.signer())).unzip())
+                                .install(|| refs.par_iter().map(|built| (pooled_consensus(&cands[built.index]).clone(), cands[built.index].sender())).unzip())
                         } else {
                             (
-                                refs.par_iter().map(|built| built.tx.inner().clone()).collect(),
-                                refs.par_iter().map(|built| built.tx.signer()).collect(),
+                                refs.par_iter().map(|built| pooled_consensus(&cands[built.index]).clone()).collect(),
+                                refs.par_iter().map(|built| cands[built.index].sender()).collect(),
                             )
                         };
                         commit_body_ms = step_at.elapsed().as_millis() as u64;
@@ -1828,7 +1843,7 @@ where
                         tx_count += executed_count as u64;
                         direct_body = Some((transactions, senders));
                         if let Some((cumulative, tx_gas)) = cumulative {
-                            direct_receipts = Some((receipts_from_slots(refs, &cumulative), tx_gas));
+                            direct_receipts = Some((receipts_from_slots(refs, &cumulative, &cands), tx_gas));
                             // The slots' 77 MB are freed on the pool, off this thread.
                             let slots = std::mem::take(&mut run.slots);
                             crate::parallel_transfer::build_pool().spawn(move || drop(slots));
@@ -1847,7 +1862,7 @@ where
                         total_fees += executed
                             .par_iter()
                             .map(|built| {
-                                let tip = built.tx.effective_tip_per_gas(base_fee).unwrap_or_default();
+                                let tip = pooled_consensus(&cands[built.index]).effective_tip_per_gas(base_fee).unwrap_or_default();
                                 U256::from(tip) * U256::from(built.gas_used)
                             })
                             .reduce(|| U256::ZERO, |a, b| a + b);
@@ -1855,7 +1870,7 @@ where
                             .into_par_iter()
                             .zip(cumulative.into_par_iter())
                             .map(|(built, cumulative_gas_used)| {
-                                let tx_type = <TransactionSigned as alloy_consensus::TransactionEnvelope>::tx_type(built.tx.inner());
+                                let tx_type = <TransactionSigned as alloy_consensus::TransactionEnvelope>::tx_type(pooled_consensus(&cands[built.index]));
                                 let receipt = n42_tx_types::Receipt {
                                     tx_type,
                                     success: built.result.is_success(),
@@ -1865,8 +1880,8 @@ where
                                 // Split here, on the pool, where the transaction
                                 // is already in hand: the seal takes the two
                                 // vectors as they are.
-                                let (tx, sender) = built.tx.into_parts();
-                                (tx, (sender, receipt))
+                                // The body's copy, the only one.
+                                (pooled_consensus(&cands[built.index]).clone(), (cands[built.index].sender(), receipt))
                             })
                             .unzip();
                         let (senders, receipts): (Vec<alloy_primitives::Address>, Vec<n42_tx_types::Receipt>) =
@@ -1879,7 +1894,7 @@ where
                         // The receipts and the gas, one transfer at a time, with
                         // no state to commit: the state comes in one piece below.
                         for built in run.take_executed() {
-                            let recovered = built.tx;
+                            let recovered = cands[built.index].to_consensus();
                             let tip = recovered.effective_tip_per_gas(base_fee).unwrap_or_default();
                             total_fees += U256::from(tip) * U256::from(built.gas_used);
                             cumulative_gas_used += built.gas_used;
@@ -1999,10 +2014,11 @@ where
                         // slots, beside the graft, instead of the root.
                         let receipts_job = receipts_behind.then(|| {
                             let slots: &[_] = &run.slots;
+                            let pulled: &[_] = &cands;
                             scope.spawn(move || {
                                 let refs: Vec<_> = slots.iter().filter_map(std::sync::OnceLock::get).collect();
                                 let (cumulative, tx_gas) = cumulative_gas(&refs);
-                                (receipts_from_slots(&refs, &cumulative), tx_gas)
+                                (receipts_from_slots(&refs, &cumulative, pulled), tx_gas)
                             })
                         });
                         let root = (sealing_early && sealed_ahead.is_none() && frame_plan.is_none()).then(|| match direct_body.as_ref() {

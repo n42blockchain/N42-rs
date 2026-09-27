@@ -681,3 +681,27 @@ mapped file (a SIGBUS for a reader without the lock).
 `bench_build_prefetch`: the resolve pass 390 / 805 / 2,014 -> 391 / 482 / 659 ns a read at 1 / 4 / 16 threads;
 plain execution 28-32 -> 14 ms; batch max / median 14 / 13 -> 7 / 6. The 16-behind read is the walk through 16
 journals, untouched. loop284 runs it on the fleet (both sides read through the view).
+
+### 10.25 The view's lock on the fleet (loop284): the fleet reads elsewhere; 1,094,594; the followers' chain is the cycle
+
+| leg | win1 | cycle | par_exec | batch max / median | exec_read (pool) | reads: cache / provider / view | sealed_at | import total / exec |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| T | 1,080,591 | 151 | 49 | 24 / 17 | 196-258 | 326k / 135k / 11-28k | 116 | 207 / 78 |
+| Tb | 1,089,690 | 149 | 52 | 27 / 17 | 195-288 | 326k / 125-134k / 21-29k | 120 | 206 / 78 |
+| P100 (no timers) | **1,094,594** | 149 | 50 | 28 / 17 | - | - | 119 | 204 / 75 |
+
+The best window so far (1,094,594), but not from the lock: the fleet's execution reads 326k from the batch's
+own cache, 125-135k through the provider door (the parent's index-mode output and the grandparent's map) and
+only 11-29k through the QMDB view -- the door the lock sat on is 5% of the fleet's reads, and `exec_read`,
+`par_exec` and the batch are unchanged. The bench's halving was the bench's shape (every read a view read).
+Where the fleet's reads go is now the provider door (the index probe + the batch map, 125-135k at ~0.5 us) and
+the cache (326k) -- both per-thread structures with no lock to hoist; their cost is the memory line each touch
+takes, which section 4's design B (dense ids, a flat table) is about.
+
+The cycle is 149-151 with the leader's seal at 116-120: **the followers' chain is the cycle now.** A follower
+votes on n+1 only after it has n's execution fields (deferred execution: n+1's header carries n's state root),
+so per block it runs the road (28-42), the execution (75-78, the old loop: revm's `State`, the clone per read,
+the `EvmState` map) and the QMDB root (38-46) in sequence -- ~150 -- and the leader, sealed at 120, waits for
+the quorum. Section 5 is the step: start the follower's execution before the road ends (the frames are all
+held; the description names them in order), give its loop 4b's cuts (75 -> ~50), and put the root on the pool
+beside the last batches, so the follower's chain is ~80-90 and the leader's seal binds again.

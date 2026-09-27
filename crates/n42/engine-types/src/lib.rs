@@ -41,6 +41,7 @@ pub mod engine_validator;
 pub mod claimed_build;
 pub mod fast_transfer;
 pub mod frame_blocks;
+pub mod batch_state;
 pub mod parallel_transfer;
 pub mod output_shards;
 pub mod hotstuff_consensus;

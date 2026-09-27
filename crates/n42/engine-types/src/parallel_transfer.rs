@@ -3143,7 +3143,10 @@ where
                 let mut sampler = LoopSampler::new();
                 let setup_at = sampler.on.then(std::time::Instant::now);
                 let db = ReadSetDb::new(read_set_ref, open().ok_or(NotParallel::NoState)?);
-                let mut state = State::builder().with_database(db).with_bundle_update().build();
+                // A sender, a recipient a transfer and the beneficiary, sized
+                // once: growing from empty rehashed the map a dozen times a
+                // batch.
+                let mut state = crate::batch_state::BatchState::with_capacity(db, txs + txs / 4 + 1);
                 let mut skipped = Vec::new();
                 let mut setup_ns = 0;
                 let close_at;
@@ -3165,14 +3168,16 @@ where
                             // the builder's own thread otherwise.
                             let (tx, env) = convert(i);
                             let t1 = mark();
-                            match evm.transfer(&env) {
-                                Ok(Some(out)) => {
+                            match evm.transfer_plain(&env) {
+                                Ok(Some((plain, result))) => {
                                     let t2 = mark();
-                                    let gas_used = out.result.gas_used();
+                                    let gas_used = result.gas_used();
                                     let t3 = mark();
-                                    evm.db_mut().commit(out.state);
+                                    // Straight into the batch's state, no
+                                    // `EvmState` built (`BatchState`).
+                                    evm.db_mut().commit_transfer(plain).map_err(|err| NotParallel::Failed(i, err.to_string()))?;
                                     let t4 = mark();
-                                    if slots_ref[i].set(BuiltTransfer { index: i, tx, result: out.result, gas_used }).is_err() {
+                                    if slots_ref[i].set(BuiltTransfer { index: i, tx, result, gas_used }).is_err() {
                                         return Err(NotParallel::Failed(i, "executed twice".to_string()));
                                     }
                                     if let (Some(t0), Some(t1), Some(t2), Some(t3), Some(t4)) = (t0, t1, t2, t3, t4) {
@@ -3192,7 +3197,6 @@ where
                     }
                     close_at = sampler.on.then(std::time::Instant::now);
                 }
-                state.merge_transitions(BundleRetention::Reverts);
                 let bundle = state.take_bundle();
                 // Drained here, on the batch's own thread, right after its
                 // transfers are done: `N42_PHASE_TIMERS=1` only (see

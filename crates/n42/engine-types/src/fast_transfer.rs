@@ -41,7 +41,7 @@ use revm::{
     database_interface::DBErrorMarker,
     inspector::NoOpInspector,
     primitives::{hardfork::SpecId, HashMap, TxKind},
-    state::{Account, EvmState, TransactionId},
+    state::{Account, AccountInfo, EvmState, TransactionId},
     Inspector,
 };
 
@@ -419,6 +419,28 @@ impl<DB: Database, I: Inspector<EthEvmContext<DB>>> N42Evm<DB, I> {
     /// error is the same error the interpreter would have hit loading the
     /// account.
     pub(crate) fn transfer(&mut self, tx: &TxEnv) -> Result<Option<ResultAndState>, DB::Error> {
+        Ok(self.transfer_with(tx, PlainTransfer::into_state)?.map(|(state, result)| ResultAndState::new(result, state)))
+    }
+
+    /// [`Self::transfer`] with the three accounts' changes handed back as
+    /// they were computed ([`PlainTransfer`]) rather than as revm's
+    /// `EvmState`: the build's batches apply them to their
+    /// [`crate::batch_state::BatchState`] directly, without the map and the
+    /// three boxed original infos per transfer that the `EvmState` costs.
+    pub(crate) fn transfer_plain(
+        &mut self,
+        tx: &TxEnv,
+    ) -> Result<Option<(PlainTransfer, ExecutionResult<HaltReason>)>, DB::Error> {
+        self.transfer_with(tx, |plain| plain)
+    }
+
+    /// The transfer path; `build` makes its output from the computed changes.
+    #[inline(always)]
+    fn transfer_with<R>(
+        &mut self,
+        tx: &TxEnv,
+        build: impl FnOnce(PlainTransfer) -> R,
+    ) -> Result<Option<(R, ExecutionResult<HaltReason>)>, DB::Error> {
         // The transaction's shape.
         let TxKind::Call(to) = tx.kind else { return refused(0) };
         if !tx.data.is_empty()
@@ -548,29 +570,17 @@ impl<DB: Database, I: Inspector<EthEvmContext<DB>>> N42Evm<DB, I> {
         let Some(coinbase_balance) = coinbase.balance.checked_add(U256::from(reward)) else { return refused(10) };
         let t6 = now();
 
-        // The accounts as the journal would return them: touched, with the
-        // pre-state kept as the original, and a recipient that did not exist
-        // marked as loaded that way.
-        // Three accounts, sized once: growing from empty reallocated twice per
-        // transaction, 326,000 allocations a full block on both the builder and
-        // the follower.
-        let mut state: EvmState = EvmState::with_capacity_and_hasher(4, Default::default());
-        let mut sender_account = Account::from(sender);
-        sender_account.info.balance = sender_balance;
-        sender_account.info.nonce += 1;
-        sender_account.mark_touch();
-        state.insert(caller, sender_account);
-        let mut recipient_account = match recipient {
-            Some(info) => Account::from(info),
-            None => Account::new_not_existing(TransactionId::ZERO),
-        };
-        recipient_account.info.balance = recipient_balance;
-        recipient_account.mark_touch();
-        state.insert(to, recipient_account);
-        let mut coinbase_account = Account::from(coinbase);
-        coinbase_account.info.balance = coinbase_balance;
-        coinbase_account.mark_touch();
-        state.insert(beneficiary, coinbase_account);
+        let out = build(PlainTransfer {
+            caller,
+            sender,
+            sender_balance,
+            to,
+            recipient,
+            recipient_balance,
+            beneficiary,
+            coinbase,
+            coinbase_balance,
+        });
         let t7 = now();
 
         // The result revm's handler builds for a call into an account without
@@ -582,7 +592,7 @@ impl<DB: Database, I: Inspector<EthEvmContext<DB>>> N42Evm<DB, I> {
             logs: Vec::new(),
             output: Output::Call(Bytes::new()),
         };
-        let out = Ok(Some(ResultAndState::new(result, state)));
+        let out = Ok(Some((out, result)));
         if let (Some(t0), Some(t1), Some(t2), Some(t3), Some(t4), Some(t5), Some(t6), Some(t7)) =
             (t0, t1, t2, t3, t4, t5, t6, t7)
         {
@@ -594,6 +604,59 @@ impl<DB: Database, I: Inspector<EthEvmContext<DB>>> N42Evm<DB, I> {
             timers::sample_done();
         }
         out
+    }
+}
+
+/// A qualifying transfer's three accounts as read, and the balances the
+/// transfer leaves them with (the sender's nonce goes up by one).
+#[derive(Debug)]
+pub struct PlainTransfer {
+    /// The sender.
+    pub caller: Address,
+    /// The sender's account as read.
+    pub sender: AccountInfo,
+    /// The sender's balance after the value and the gas.
+    pub sender_balance: U256,
+    /// The recipient.
+    pub to: Address,
+    /// The recipient's account as read; `None` if it did not exist.
+    pub recipient: Option<AccountInfo>,
+    /// The recipient's balance after the value.
+    pub recipient_balance: U256,
+    /// The block's beneficiary.
+    pub beneficiary: Address,
+    /// The beneficiary's account as read.
+    pub coinbase: AccountInfo,
+    /// The beneficiary's balance after the tip.
+    pub coinbase_balance: U256,
+}
+
+impl PlainTransfer {
+    /// The accounts as the journal would return them: touched, with the
+    /// pre-state kept as the original, and a recipient that did not exist
+    /// marked as loaded that way.
+    pub fn into_state(self) -> EvmState {
+        // Three accounts, sized once: growing from empty reallocated twice per
+        // transaction, 326,000 allocations a full block on both the builder and
+        // the follower.
+        let mut state: EvmState = EvmState::with_capacity_and_hasher(4, Default::default());
+        let mut sender_account = Account::from(self.sender);
+        sender_account.info.balance = self.sender_balance;
+        sender_account.info.nonce += 1;
+        sender_account.mark_touch();
+        state.insert(self.caller, sender_account);
+        let mut recipient_account = match self.recipient {
+            Some(info) => Account::from(info),
+            None => Account::new_not_existing(TransactionId::ZERO),
+        };
+        recipient_account.info.balance = self.recipient_balance;
+        recipient_account.mark_touch();
+        state.insert(self.to, recipient_account);
+        let mut coinbase_account = Account::from(self.coinbase);
+        coinbase_account.info.balance = self.coinbase_balance;
+        coinbase_account.mark_touch();
+        state.insert(self.beneficiary, coinbase_account);
+        state
     }
 }
 

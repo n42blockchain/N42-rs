@@ -1721,6 +1721,25 @@ where
         plan
     });
 
+    // `N42_FOLLOWER_PARTITION_AHEAD=1` on the build path: the block's
+    // (sender, recipient) keys, which its partition reads, made on the build
+    // pool from here, beside the wait for the parent and the check, instead
+    // of inside the execution (`exec_part_ms`).
+    let keys_ahead = (deferred
+        && follower_parallel()
+        && n42_engine_types::parallel_transfer::follower_partition_ahead()
+        && n42_engine_types::parallel_transfer::follower_build_path())
+    .then(|| {
+        let (made, keys) = std::sync::mpsc::sync_channel(1);
+        let block = Arc::clone(&recovered);
+        n42_engine_types::parallel_transfer::build_pool().spawn(move || {
+            let keys = n42_engine_types::parallel_transfer::build_path_keys(&block);
+            drop(block);
+            let _ = made.send(keys);
+        });
+        keys
+    });
+
     // The parent: in, and under deferred execution executed here, since the
     // header's fields are checked against its result and the transactions
     // against its post-state.
@@ -1941,6 +1960,11 @@ where
             Err(_) => None,
         });
         let ahead_wait_us = ahead_at.elapsed().as_micros() as u64;
+        // The build path's keys made ahead; one that failed is made again in
+        // the execution, which then declines the block the same way.
+        let keys_at = std::time::Instant::now();
+        let keys = keys_ahead.as_ref().and_then(|keys| keys.recv().ok()).and_then(Result::ok);
+        let keys_wait_us = keys_at.elapsed().as_micros() as u64;
         let gate_at = std::time::Instant::now();
         let _gate = exec_gate();
         let gate_ms = gate_at.elapsed().as_millis() as u64;
@@ -1989,11 +2013,12 @@ where
                     .ok()
                     .map(|s| n42_engine_types::fast_transfer::doors::CountedDb::new(StateProviderDatabase::new(s)))
             };
-            match n42_engine_types::parallel_transfer::execute_transfers_build_path(
+            match n42_engine_types::parallel_transfer::execute_transfers_build_path_keyed(
                 evm_config,
                 &recovered,
                 cached.as_db_mut(StateProviderDatabase::new(&state)),
                 &open,
+                keys,
             )
             .map_err(|err| format!("parallel execution: {err}"))?
             {
@@ -2025,6 +2050,7 @@ where
                         exec_setup_ms = out.split.setup_us / 1000,
                         exec_keys_ms = out.split.keys_us / 1000,
                         keys_ahead = out.split.keys_ahead,
+                        keys_ahead_wait_ms = keys_wait_us / 1000,
                         exec_pre_ms = out.split.pre_us / 1000,
                         exec_post_ms = out.split.post_us / 1000,
                         exec_overrun_ms = out.split.executor_overrun_us / 1000,

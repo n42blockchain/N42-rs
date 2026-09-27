@@ -3985,27 +3985,78 @@ where
     G: Database + std::fmt::Debug + Send,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
+    execute_transfers_build_path_keyed(evm_config, block, main_db, open, None)
+}
+
+/// The (sender, recipient) keys the build path's partition reads
+/// ([`execute_transfers_build_path`]): every transaction a call with no
+/// input, its sender the recovered one. One pass on the build pool, as the
+/// leader's prep reads its candidates (`par_prep_ms`): read serially, the
+/// 163,000 transactions' cold memory was most of the follower's
+/// `exec_part_ms` (10 against the leader's 4, loop288). Made ahead of the
+/// execution when the block's senders are first known
+/// (`N42_FOLLOWER_PARTITION_AHEAD=1` on the build path) and handed to
+/// [`execute_transfers_build_path_keyed`].
+pub fn build_path_keys(block: &RecoveredBlock<Block>) -> Result<Vec<(Address, Address)>, NotParallel> {
+    use alloy_consensus::Transaction as _;
+    use rayon::prelude::*;
+    let txs = &block.body().transactions;
+    let senders = block.senders();
+    if txs.len() != senders.len() {
+        return Err(NotParallel::Failed(txs.len().min(senders.len()), "a transaction without its sender".to_string()));
+    }
+    build_pool().install(|| {
+        txs.par_iter()
+            .zip(senders.par_iter())
+            .enumerate()
+            .with_min_len(1024)
+            .map(|(i, (tx, sender))| match tx.kind() {
+                alloy_primitives::TxKind::Call(to) if tx.input().is_empty() => Ok((*sender, to)),
+                _ => Err(NotParallel::NotATransfer(i)),
+            })
+            .collect()
+    })
+}
+
+/// [`execute_transfers_build_path`] with the block's keys made ahead
+/// ([`build_path_keys`]); `None`, or keys that are not this block's length,
+/// and the call makes them itself.
+pub fn execute_transfers_build_path_keyed<EvmConfig, DB, G>(
+    evm_config: &EvmConfig,
+    block: &RecoveredBlock<Block>,
+    main_db: DB,
+    open: &(dyn Fn() -> Option<G> + Sync),
+    keys_ahead: Option<Vec<(Address, Address)>>,
+) -> Result<Result<(ShardedExecution, Phases), NotParallel>, BlockExecutionError>
+where
+    EvmConfig: ConfigureEvm<Primitives = EthPrimitives, BlockExecutorFactory = FastExecutorFactory> + Sync,
+    DB: Database + std::fmt::Debug,
+    DB::Error: Send + Sync + 'static,
+    G: Database + std::fmt::Debug + Send,
+    G::Error: std::fmt::Display + Send + Sync + 'static,
+{
     use alloy_consensus::Transaction as _;
     let call_at = std::time::Instant::now();
     let evm_env = evm_config.evm_env(block.header()).map_err(BlockExecutionError::other)?;
     let beneficiary = evm_env.block_env.beneficiary;
+    let txs = &block.body().transactions;
+    let senders = block.senders();
 
-    // The keys the build's partition reads: every transaction a call with no
-    // input, its sender recovered.
+    // The keys the build's partition reads, made ahead or here.
     let at = std::time::Instant::now();
-    let recovered: Vec<_> = block.transactions_recovered().collect();
-    let mut keys: Vec<(Address, Address)> = Vec::with_capacity(recovered.len());
-    for (i, tx) in recovered.iter().enumerate() {
-        let alloy_primitives::TxKind::Call(to) = tx.kind() else {
-            return Ok(Err(NotParallel::NotATransfer(i)));
-        };
-        if !tx.input().is_empty() {
-            return Ok(Err(NotParallel::NotATransfer(i)));
+    let mut split = BuildPathSplit::default();
+    let keys = match keys_ahead.filter(|keys| keys.len() == txs.len()) {
+        Some(keys) => {
+            split.keys_ahead = true;
+            keys
         }
-        keys.push((tx.signer(), to));
-    }
+        None => match build_path_keys(block) {
+            Ok(keys) => keys,
+            Err(why) => return Ok(Err(why)),
+        },
+    };
     let keys_us = at.elapsed().as_micros() as u64;
-    let mut split = BuildPathSplit { keys_us, ..Default::default() };
+    split.keys_us = keys_us;
 
     // The batches, as the leader's: the environment converted on the batch's
     // thread, each batch's bundle handed to the shards whole as it ends.
@@ -4015,7 +4066,7 @@ where
     };
     let sink_shards = crate::output_shards::OutputShards::with_index(beneficiary, keys.len(), shard_count, true);
     let sink = |bundle: BundleState| sink_shards.add(bundle);
-    let convert = |i: usize| ((), evm_config.tx_env(recovered[i]));
+    let convert = |i: usize| ((), evm_config.tx_env(reth_primitives_traits::Recovered::new_unchecked(&txs[i], senders[i])));
     split.setup_us = (call_at.elapsed().as_micros() as u64).saturating_sub(keys_us);
     let run_at = std::time::Instant::now();
     let run = match execute_for_build_run(&evm_env, &keys, &convert, open, Some(&sink), false, None) {
@@ -4086,7 +4137,7 @@ where
     // Receipts in block order, gas cumulated.
     let at = std::time::Instant::now();
     let mut cumulative = 0u64;
-    let receipts: Vec<Receipt> = recovered
+    let receipts: Vec<Receipt> = txs
         .iter()
         .zip(&run.executed)
         .map(|(tx, built)| {
@@ -5487,9 +5538,11 @@ mod tests {
         // The build path (`N42_FOLLOWER_BUILD_PATH=1`): the leader's
         // partition, pool and batch loop into index-mode shards; the merge
         // into one bundle, which the node builds off the chain, timed apart.
-        for round in 0..3 {
+        // Round 3: the keys made ahead (`N42_FOLLOWER_PARTITION_AHEAD=1`).
+        for round in 0..4 {
+            let keys = (round == 3).then(|| build_path_keys(&block).expect("the block's keys"));
             let at = std::time::Instant::now();
-            let (sharded, phases) = execute_transfers_build_path(&evm_config, &block, db.clone(), &|| Some(db.clone()))
+            let (sharded, phases) = execute_transfers_build_path_keyed(&evm_config, &block, db.clone(), &|| Some(db.clone()), keys)
                 .expect("no execution error")
                 .expect("the block qualifies on the build path");
             let call_ms = at.elapsed().as_millis();

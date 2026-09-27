@@ -279,3 +279,32 @@ step 1's leftovers -- `take_frames` looks each of 163k transactions up by (sende
 the body is still copied and re-encoded for the payload list -- and the leader's period holds step 3's target
 (the state wait 20-29 behind the graft's 40) and step 4's (the reads, 55-60 of execution). Ten legs now sit at
 1.037-1.064M; pool 1M stays (2M changed nothing and threw 8 TCs once).
+
+### 10.8 The road by reference confirmed; the first output shards lose to the graft (loop273)
+
+Pool 1M, offer 1.1M, pacing 125, attested frames, frame blocks; REF/REFb = the road by reference (4783c3df6:
+the frame index holds the transactions' Arcs, `take_frames` is one clone per frame, the payload list is encoded
+beside the import), S16/S64 = the same plus step 3's output shards (2a46d9f7a, `N42_OUTPUT_SHARDS`).
+
+| leg | win1 | cycle | B | D | E | assemble | par_exec | graft | state_wait | sealed_at | shard_insert / wait (pool ms) | merge |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| REF | 1,062,799 | 146 | 76 | 41.6 | 8 | 4 (take 0, body 2, encode 0) | 55 | 42 | 10 | 128 | - | - |
+| S16 | 1,021,421 | 156 | 41 | 78.5 | 21 | 3 | 107 | 0 | 0 | 164 | 138 / 637 | 52 |
+| S64 | 999,006 | 162 | 42 | 77.8 | 31 | 4 | 110 | 0 | 0 | 169 | 122 / 535 | 52 |
+| REFb | **1,064,718** | 144 | 84 | 38.1 | 8 | 3 | 54 | 41 | 12 | 127 | - | - |
+
+The road is now what section 1 asked for: `assemble_ms` 20-22 -> 3-4, with no per-transaction lookup and no
+encoding on it (the whole vote road 51-60 -> 34-38, the rest being the description check 14-16 and the copy 8).
+The window did not move because the road was not the cycle's term: the cycle is the leader's build chain
+(`sealed_at` 128 from the build's start plus ~18 to the next start = 146), and the vote (B 76-84) overlaps it.
+
+The shards did what the design said -- no graft, no state wait, the chained opener reads the shard set -- but
+the inserts cost more than the graft they replaced: 122-138 ms of pool time under the shard mutexes with 535-637
+ms of waiting on them (16 batches folding at once, each shard's map growing under its lock), so `par_exec` 55 ->
+107-110 and the seal moved from 128 to 164-169; the lazy merge behind the seal (52) then delays `state_ready`
+and the roots. 16 and 64 shards wait the same, so it is not the shard count -- it is the fold's shape. The fix
+is the design's own point taken literally: the batch appends to a local per-shard vector (no lock, no hashing),
+and the fold is S parallel tasks each building its own shard map with the exact capacity reserved, so the whole
+fold is one parallel pass of 147k / 16 threads (~3-5 ms wall) instead of a serialised insert. With that the
+leader's period is 128 - 42 - 10 = ~76 + the exec, and pacing 125 becomes the bound (loop272 showed pacing 100
+only raises B while the seal is 128; with the seal at ~80 the pacing can follow).

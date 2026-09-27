@@ -545,6 +545,28 @@ const HELD_TOO_LONG: std::time::Duration = std::time::Duration::from_secs(2);
 const MAX_IMPORTED: usize = 8192;
 /// Between the end of one catch-up and the start of the next.
 const CATCH_UP_RETRY: Duration = Duration::from_secs(3);
+/// The body of a block this node built and sealed, in gov5's block RLP.
+///
+/// A node that built this block does not have to take it apart to send it:
+/// the payload already carries every transaction as the EIP-2718 bytes this
+/// encoding wants, and the header came out of sealing.
+fn encode_own_body(
+    execution: &alloy_rpc_types_engine::ExecutionData,
+    header: &alloy_consensus::Header,
+) -> Vec<u8> {
+    let rewards = n42_h2_consensus::withdrawals_to_rewards(
+        execution.payload.as_v2().map_or(&[][..], |v2| v2.withdrawals.as_slice()),
+    );
+    // The access list travels with the block or the fleet cannot import it:
+    // on an Amsterdam chain a payload without one is refused, and on any
+    // chain a block without one is executed serially.
+    let bal = match &execution.payload {
+        alloy_rpc_types_engine::ExecutionPayload::V4(v4) => Some(v4.block_access_list.clone()),
+        _ => None,
+    };
+    n42_h2_net::encode_block_rlp_raw(header, &execution.payload.as_v1().transactions, &rewards, bal.as_ref())
+}
+
 /// Between one broadcast request for a block's body and the next.
 ///
 /// Without this the two halves of the body path chase each other: consensus
@@ -1016,6 +1038,11 @@ impl<E: ExecutionLayer> H2Service<E> {
             }
             .map(|(data, header)| (data, Some(header)))
             .map_err(|e| e.to_string())
+        });
+        // The body of a block sealed ahead is encoded ahead too, with the
+        // very function `publish_body` uses for an own block.
+        self.driver.set_own_body_encoder(|execution, header| {
+            Some(alloy_primitives::Bytes::from(encode_own_body(execution, header)))
         });
         self
     }
@@ -2398,7 +2425,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         let on_seal = on_seal && self.build_on_seal;
         info!(target: "n42.h2.node", ?parent, next, on_seal, chain = chain.is_some(), "build ahead requested");
         let started = if on_seal {
-            self.driver.prepare_build_on_sealed(parent, header, attrs, chain).await
+            self.driver.prepare_build_on_sealed_for_view(parent, header, attrs, chain, Some(next)).await
         } else {
             self.driver.prepare_build_on(parent, attrs).await
         };
@@ -2726,7 +2753,14 @@ impl<E: ExecutionLayer> H2Service<E> {
                     }
                 }
                 let describe_at = std::time::Instant::now();
-                self.publish_body(&built.execution_data, built.header.as_ref(), &built.tx_hashes, &built.frame_layout);
+                let encoded = self.driver.take_encoded_body(built.hash);
+                self.publish_body(
+                    &built.execution_data,
+                    built.header.as_ref(),
+                    &built.tx_hashes,
+                    &built.frame_layout,
+                    encoded,
+                );
                 let describe_us = describe_at.elapsed().as_micros() as u64;
                 let publish_at = std::time::Instant::now();
                 if let Err(err) = self
@@ -3612,6 +3646,7 @@ impl<E: ExecutionLayer> H2Service<E> {
         sealed: Option<&alloy_consensus::Header>,
         tx_hashes: &[B256],
         frame_layout: &[(B256, u32)],
+        encoded: Option<alloy_primitives::Bytes>,
     ) {
         let block_hash = execution.block_hash();
         // Timed in three because the gap between a leader finishing a block and
@@ -3627,26 +3662,15 @@ impl<E: ExecutionLayer> H2Service<E> {
         // rebuilt over the whole block to check our own work -- is 346-401 ms
         // at the 163,000-transaction tier against 9-10 ms to compress the
         // result. The general path stays for blocks this node did not build.
-        let own = sealed.map(|header| {
-            let rewards = n42_h2_consensus::withdrawals_to_rewards(
-                execution.payload.as_v2().map_or(&[][..], |v2| v2.withdrawals.as_slice()),
-            );
-            // The access list travels with the block or the fleet cannot import
-            // it: on an Amsterdam chain a payload without one is refused, and
-            // on any chain a block without one is executed serially.
-            let bal = match &execution.payload {
-                alloy_rpc_types_engine::ExecutionPayload::V4(v4) => Some(v4.block_access_list.clone()),
-                _ => None,
-            };
-            n42_h2_net::encode_block_rlp_raw(
-                header,
-                &execution.payload.as_v1().transactions,
-                &rewards,
-                bal.as_ref(),
-            )
+        // Encoded ahead when the block was sealed ahead (the driver's build
+        // task, with this same function), else here.
+        let own = encoded.or_else(|| {
+            sealed.map(|header| alloy_primitives::Bytes::from(encode_own_body(execution, header)))
         });
         let mut pushed_to_all = false;
-        let rlp = match own.map(Ok).unwrap_or_else(|| encode_block_rlp(execution, self.header_profile)) {
+        let rlp = match own.map(Ok).unwrap_or_else(|| {
+            encode_block_rlp(execution, self.header_profile).map(alloy_primitives::Bytes::from)
+        }) {
             Ok(rlp) => rlp,
             Err(err) => {
                 // A block nobody else can receive is a block nobody else can
@@ -3655,11 +3679,10 @@ impl<E: ExecutionLayer> H2Service<E> {
                 return;
             }
         };
-        let encoded = started.elapsed();
         // Shared from here: the pushes to every member and the body store
         // hold the same bytes; the leader used to copy the 19 MB once more
         // for the pushers.
-        let rlp = alloy_primitives::Bytes::from(rlp);
+        let encoded = started.elapsed();
         // Beside the body, not instead of it: the compact form for the
         // members that read it, the whole body for everyone else and for
         // the topic, the store and every peer that asks by hash.

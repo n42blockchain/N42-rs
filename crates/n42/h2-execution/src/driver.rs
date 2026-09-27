@@ -315,7 +315,72 @@ impl std::fmt::Debug for BodyDecoder {
     }
 }
 
-struct Normalizer(Box<PayloadNormalizer>);
+#[derive(Clone)]
+struct Normalizer(std::sync::Arc<PayloadNormalizer>);
+
+/// Encodes a block this node built and sealed into the body the fleet is
+/// sent, from its payload and its sealed header. Installed by the node, which
+/// owns the wire format; run in a build ahead's task so the body is ready
+/// when the proposal wants it.
+pub type OwnBodyEncoder =
+    dyn Fn(&ExecutionData, &alloy_consensus::Header) -> Option<alloy_primitives::Bytes> + Send + Sync;
+
+/// A build ahead finished for the view it was expected to be proposed in:
+/// the header sealed, the payload's cache copy made and the body encoded in
+/// the build's task, between its seal and the pacing tick, instead of on the
+/// proposal's path after the tick (`docs/BREAKTHROUGH_DESIGN.md` 10.34: 7 ms
+/// of sealing, 2 of the cache copy and 6 of the body a proposal).
+#[derive(Debug)]
+struct Presealed {
+    /// The view the header was stamped with.
+    view: u64,
+    /// The hash of the block as built, before the seal.
+    raw_hash: B256,
+    execution: ExecutionData,
+    header: Option<alloy_consensus::Header>,
+    /// A second copy of `execution`, for the payload cache.
+    cached: ExecutionData,
+    body: Option<alloy_primitives::Bytes>,
+}
+
+type PresealSlot = std::sync::Arc<std::sync::Mutex<Option<Presealed>>>;
+
+#[derive(Clone)]
+struct BodyEncoder(std::sync::Arc<OwnBodyEncoder>);
+
+impl std::fmt::Debug for BodyEncoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OwnBodyEncoder")
+    }
+}
+
+/// Seals `built` for `view` into `slot`. The task's own result stays the
+/// block as built, so the proposal path decides: the sealed block when the
+/// view is the one it proposes in, the ordinary seal of the raw block when
+/// not.
+fn preseal(
+    built: &BuiltBlock,
+    view: u64,
+    normalizer: &Normalizer,
+    encoder: Option<&OwnBodyEncoder>,
+    slot: &PresealSlot,
+) {
+    let (execution, header) = match (normalizer.0)(&built.execution_data, built.header.as_ref(), view) {
+        Ok(finished) => finished,
+        Err(err) => {
+            debug!(target: "n42.h2.el", %err, view, "could not seal the build ahead early; sealing at the proposal");
+            return;
+        }
+    };
+    let cached = execution.clone();
+    let body = match (encoder, header.as_ref()) {
+        (Some(encode), Some(header)) => encode(&execution, header),
+        _ => None,
+    };
+    if let Ok(mut slot) = slot.lock() {
+        *slot = Some(Presealed { view, raw_hash: built.hash, execution, header, cached, body });
+    }
+}
 
 /// Where the last [`ExecutionDriver::build_block_on`] spent its time, in
 /// microseconds: the leader's path from the pacing tick to the proposal,
@@ -362,6 +427,9 @@ struct AheadBuild {
     /// the import had landed was answered SYNCING and the leader built on
     /// its critical path 38 times).
     refused: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The block sealed ahead for the view it is expected in, when the
+    /// build's task could (see [`Presealed`]).
+    presealed: PresealSlot,
     /// Set when the build is given up. A build a forkchoice started holds a
     /// payload job in the execution layer until the job is resolved or its
     /// deadline passes (12 s at `--builder.deadline 3` once the chain's clock
@@ -421,6 +489,11 @@ pub struct ExecutionDriver<E> {
     /// Finishes a built payload before it is proposed. `None` proposes the
     /// payload exactly as built.
     normalizer: Option<Normalizer>,
+    /// Encodes an own block's body in a build ahead's task; see
+    /// [`OwnBodyEncoder`].
+    body_encoder: Option<BodyEncoder>,
+    /// The body the last [`Self::build_block_on`] took encoded, by block hash.
+    encoded_body: Option<(B256, alloy_primitives::Bytes)>,
     /// A build started before this node needed the block. See
     /// [`Self::prepare_build_on`].
     prepared: Option<AheadBuild>,
@@ -620,6 +693,8 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         Self {
             el: std::sync::Arc::new(el),
             normalizer: None,
+            body_encoder: None,
+            encoded_body: None,
             prepared: None,
             last_build: (false, None),
             last_build_timing: BuildTiming::default(),
@@ -663,7 +738,28 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             + Sync
             + 'static,
     ) {
-        self.normalizer = Some(Normalizer(Box::new(normalizer)));
+        self.normalizer = Some(Normalizer(std::sync::Arc::new(normalizer)));
+    }
+
+    /// Installs the [`OwnBodyEncoder`] a build ahead runs once it has sealed
+    /// its block early.
+    pub fn set_own_body_encoder(
+        &mut self,
+        encoder: impl Fn(&ExecutionData, &alloy_consensus::Header) -> Option<alloy_primitives::Bytes>
+            + Send
+            + Sync
+            + 'static,
+    ) {
+        self.body_encoder = Some(BodyEncoder(std::sync::Arc::new(encoder)));
+    }
+
+    /// The body of `block_hash` encoded ahead, when the last
+    /// [`Self::build_block_on`] took it that way.
+    pub fn take_encoded_body(&mut self, block_hash: B256) -> Option<alloy_primitives::Bytes> {
+        match self.encoded_body.take() {
+            Some((hash, body)) if hash == block_hash => Some(body),
+            _ => None,
+        }
     }
 
     /// Overrides the payload cache bound.
@@ -844,7 +940,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             );
             Ok(built)
         });
-        self.prepared = Some(AheadBuild { parent, attrs, task, refused: Default::default(), give_up: Some(give_up) });
+        self.prepared = Some(AheadBuild { parent, attrs, task, refused: Default::default(), presealed: Default::default(), give_up: Some(give_up) });
         Ok(())
     }
 
@@ -871,6 +967,22 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         attrs: PayloadAttributes,
         chain: Option<crate::el::ChainAhead>,
     ) -> Result<(), ElError> {
+        let view = chain.map(|chain| chain.view);
+        self.prepare_build_on_sealed_for_view(parent, header, attrs, chain, view).await
+    }
+
+    /// [`Self::prepare_build_on_sealed`] for a block expected to be proposed
+    /// in `view`: the build's task seals it for that view, caches its copy
+    /// and encodes its body as soon as it is built, off the proposal's path.
+    /// A proposal in another view seals it the ordinary way.
+    pub async fn prepare_build_on_sealed_for_view(
+        &mut self,
+        parent: B256,
+        header: alloy_consensus::Header,
+        attrs: PayloadAttributes,
+        chain: Option<crate::el::ChainAhead>,
+        view: Option<u64>,
+    ) -> Result<(), ElError> {
         if self.prepared.as_ref().is_some_and(|ahead| ahead.covers(parent, &attrs)) {
             return Ok(());
         }
@@ -885,6 +997,10 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         let task_attrs = attrs.clone();
         let refused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mark_refused = std::sync::Arc::clone(&refused);
+        let presealed = PresealSlot::default();
+        let seal_ahead = view.zip(self.normalizer.clone());
+        let encoder = self.body_encoder.clone();
+        let slot = std::sync::Arc::clone(&presealed);
         info!(target: "n42.h2.el", ?parent, "starting a build ahead on the sealed block");
         let task = tokio::spawn(async move {
             let started = std::time::Instant::now();
@@ -901,6 +1017,9 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                         on_seal = true,
                         "built a block ahead of leading"
                     );
+                    if let Some((view, normalizer)) = &seal_ahead {
+                        preseal(&built, *view, normalizer, encoder.as_ref().map(|encoder| &*encoder.0), &slot);
+                    }
                     Ok(built)
                 }
                 // No forkchoice fallback here: the parent's import is still in
@@ -920,7 +1039,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                 }
             }
         });
-        self.prepared = Some(AheadBuild { parent, attrs, task, refused, give_up: None });
+        self.prepared = Some(AheadBuild { parent, attrs, task, refused, presealed, give_up: None });
         Ok(())
     }
 
@@ -1041,6 +1160,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         // this file has been wrong before.
         let started = std::time::Instant::now();
         let mut miss: Option<String> = None;
+        let mut preseal_slot: Option<PresealSlot> = None;
         // A build prepared earlier counts only if it was started on this exact
         // parent with these exact attributes. Anything else and the block it
         // assembled is not the block this node is about to propose. One that
@@ -1055,8 +1175,12 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
                 None
             }
             Some(prepared) if prepared.parent == parent && prepared.attrs == attrs => {
+                let slot = std::sync::Arc::clone(&prepared.presealed);
                 match prepared.task.await {
-                    Ok(Ok(built)) => Some(built),
+                    Ok(Ok(built)) => {
+                        preseal_slot = Some(slot);
+                        Some(built)
+                    }
                     Ok(Err(err)) => {
                         warn!(target: "n42.h2.el", %err, ?parent, "the build prepared ahead failed; building now");
                         miss = Some(format!("the build prepared ahead failed: {err}"));
@@ -1130,7 +1254,24 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         // stamped and sealed first, and that changes the hash. From here on
         // only the finished block exists — it is what gets imported, and the
         // hash consensus sees.
-        if let Some(normalize) = &self.normalizer {
+        // Sealed ahead for this very view and this very block: taken as is.
+        let presealed = if ahead {
+            preseal_slot
+                .and_then(|slot| slot.lock().ok().and_then(|mut slot| slot.take()))
+                .filter(|early| early.view == view && early.raw_hash == built.hash)
+        } else {
+            None
+        };
+        let mut cached = None;
+        self.encoded_body = None;
+        let was_presealed = presealed.is_some();
+        if let Some(early) = presealed {
+            built.hash = early.execution.block_hash();
+            built.execution_data = early.execution;
+            built.header = early.header;
+            cached = Some(early.cached);
+            self.encoded_body = early.body.map(|body| (built.hash, body));
+        } else if let Some(normalize) = &self.normalizer {
             // The header the execution layer handed over, when it did: the
             // seal then touches the header alone and never decodes the block.
             let (finished, header) = (normalize.0)(&built.execution_data, built.header.as_ref(), view)
@@ -1141,13 +1282,14 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         }
 
         let after_seal = started.elapsed();
-        self.cache_payload(built.hash, built.execution_data.clone());
+        let cached = cached.unwrap_or_else(|| built.execution_data.clone());
+        self.cache_payload(built.hash, cached);
         let after_cache = started.elapsed();
         self.last_build_timing = BuildTiming {
             take_us: after_resolve.as_micros() as u64,
             seal_us: after_seal.saturating_sub(after_resolve).as_micros() as u64,
             cache_us: after_cache.saturating_sub(after_seal).as_micros() as u64,
-            presealed: false,
+            presealed: was_presealed,
         };
 
         info!(

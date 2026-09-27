@@ -385,6 +385,79 @@ const GRANDPARENT_WAIT: std::time::Duration = std::time::Duration::from_millis(1
 /// How often the wait looks again.
 const GRANDPARENT_POLL: std::time::Duration = std::time::Duration::from_millis(2);
 
+/// Where a build's open of its parent's state waited (`state_wait_on` on the
+/// seal-first phases line): the parent's output (`StateReady` / the shards,
+/// [`opener_on_sealed_parent`]), the state under it (the grandparent in the
+/// engine, [`state_at_soon`]), and, when the grandparent was missing while the
+/// parent finished, the parent's QMDB root and its `Complete`
+/// ([`grandparent_state`]). Kept per thread: the build's open runs on the
+/// builder's thread, which takes it before and after the open.
+pub mod open_wait {
+    use std::cell::Cell;
+
+    /// One open's waits, in milliseconds.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct OpenWait {
+        /// The parent's output filed (`built_executions::wait_for_state`).
+        pub output_ms: u64,
+        /// The state under the parent's output (the grandparent), first look
+        /// and the bounded wait for its import.
+        pub grandparent_ms: u64,
+        /// How many times that wait looked again (2 ms apart).
+        pub grandparent_polls: u32,
+        /// The grandparent still missing: the wait for the parent's QMDB root
+        /// and the look after it.
+        pub parent_root_ms: u64,
+        /// Still missing: the wait for the parent's `Complete` and the look after it.
+        pub parent_complete_ms: u64,
+    }
+
+    impl OpenWait {
+        /// The largest of the waits, by name; `none` when every one is under
+        /// a millisecond.
+        pub fn label(&self) -> &'static str {
+            [
+                (self.output_ms, "output"),
+                (self.grandparent_ms, "grandparent"),
+                (self.parent_root_ms, "parent_root"),
+                (self.parent_complete_ms, "parent_complete"),
+            ]
+            .into_iter()
+            .filter(|(ms, _)| *ms > 0)
+            .max_by_key(|(ms, _)| *ms)
+            .map_or("none", |(_, name)| name)
+        }
+
+        /// `output/grandparent/parent_root/parent_complete` in ms, then the
+        /// grandparent's polls.
+        pub fn split(&self) -> String {
+            format!(
+                "{}/{}/{}/{} polls={}",
+                self.output_ms, self.grandparent_ms, self.parent_root_ms, self.parent_complete_ms, self.grandparent_polls
+            )
+        }
+    }
+
+    thread_local! {
+        static WAIT: Cell<OpenWait> = const {
+            Cell::new(OpenWait { output_ms: 0, grandparent_ms: 0, grandparent_polls: 0, parent_root_ms: 0, parent_complete_ms: 0 })
+        };
+    }
+
+    pub(crate) fn add(f: impl FnOnce(&mut OpenWait)) {
+        WAIT.with(|cell| {
+            let mut wait = cell.get();
+            f(&mut wait);
+            cell.set(wait);
+        });
+    }
+
+    /// This thread's waits since the last take, reset.
+    pub fn take() -> OpenWait {
+        WAIT.with(Cell::take)
+    }
+}
+
 /// The state at `block`, waiting up to [`GRANDPARENT_WAIT`] for an import
 /// that is already in flight to land.
 ///
@@ -406,6 +479,7 @@ where
         {
             return Err(err);
         }
+        open_wait::add(|wait| wait.grandparent_polls += 1);
         std::thread::sleep(GRANDPARENT_POLL);
     }
 }
@@ -445,7 +519,9 @@ where
     let missing = |result: &ProviderResult<StateProviderBox>| {
         matches!(result, Err(reth_storage_api::errors::ProviderError::StateForHashNotFound(_)))
     };
+    let first_at = std::time::Instant::now();
     let first = state_at_soon(client, grandparent);
+    open_wait::add(|wait| wait.grandparent_ms += first_at.elapsed().as_millis() as u64);
     if !missing(&first) || !finishing() {
         return first;
     }
@@ -453,6 +529,7 @@ where
     let _ = crate::executed_fields::wait_for(&built_hash, crate::hotstuff_consensus::PARENT_FIELDS_WAIT);
     let after_root = state_at_soon(client, grandparent);
     let root_ms = at.elapsed().as_millis() as u64;
+    open_wait::add(|wait| wait.parent_root_ms += root_ms);
     if !missing(&after_root) || !finishing() {
         tracing::info!(
             target: "payload_builder",
@@ -463,6 +540,7 @@ where
         );
         return after_root;
     }
+    let complete_at = std::time::Instant::now();
     let _ = crate::built_executions::wait_for(built_hash, Stage::Complete);
     tracing::info!(
         target: "payload_builder",
@@ -471,7 +549,9 @@ where
         waited_ms = at.elapsed().as_millis() as u64,
         "the grandparent was not in the engine; waited for the parent's QMDB root and finish"
     );
-    state_at_soon(client, grandparent)
+    let after_complete = state_at_soon(client, grandparent);
+    open_wait::add(|wait| wait.parent_complete_ms += complete_at.elapsed().as_millis() as u64);
+    after_complete
 }
 
 /// An opener for the parent's post-state: the chain's state at the
@@ -529,8 +609,10 @@ where
             Some(filed) => filed.clone(),
             None => {
                 let at = std::time::Instant::now();
-                let state = crate::built_executions::wait_for_state(built_hash)
-                    .ok_or(reth_storage_api::errors::ProviderError::StateForHashNotFound(parent.hash()))?;
+                let state = crate::built_executions::wait_for_state(built_hash);
+                open_wait::add(|wait| wait.output_ms += at.elapsed().as_millis() as u64);
+                let state =
+                    state.ok_or(reth_storage_api::errors::ProviderError::StateForHashNotFound(parent.hash()))?;
                 let sharded = matches!(state, crate::built_executions::ParentState::Sharded(_));
                 tracing::debug!(
                     target: "payload_builder",
@@ -1101,5 +1183,21 @@ mod tests {
         assert_eq!(read(untouched), Some((4, U256::from(40))), "the grandparent's");
         assert_eq!(read(Address::with_last_byte(0x44)), None);
         assert_eq!(on_shards.block_hash(42).expect("read"), Some(sealed.hash()), "BLOCKHASH is the sealed hash");
+    }
+
+    #[test]
+    fn the_largest_open_wait_names_the_open_and_a_take_resets_it() {
+        use super::open_wait::{self, OpenWait};
+        assert_eq!(OpenWait::default().label(), "none");
+        open_wait::add(|wait| wait.output_ms += 3);
+        open_wait::add(|wait| {
+            wait.grandparent_ms += 150;
+            wait.grandparent_polls += 60;
+        });
+        open_wait::add(|wait| wait.parent_root_ms += 40);
+        let wait = open_wait::take();
+        assert_eq!(wait.label(), "grandparent");
+        assert_eq!(wait.split(), "3/150/40/0 polls=60");
+        assert_eq!(open_wait::take(), OpenWait::default());
     }
 }

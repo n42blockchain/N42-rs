@@ -317,6 +317,22 @@ impl std::fmt::Debug for BodyDecoder {
 
 struct Normalizer(Box<PayloadNormalizer>);
 
+/// Where the last [`ExecutionDriver::build_block_on`] spent its time, in
+/// microseconds: the leader's path from the pacing tick to the proposal,
+/// named part by part (`docs/BREAKTHROUGH_DESIGN.md` 10.34).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BuildTiming {
+    /// Taking the block: the wait for a build prepared ahead (its seal, when
+    /// it had not sealed yet), or the whole build when none was prepared.
+    pub take_us: u64,
+    /// The normalizer: the view stamped into the header and the header sealed.
+    pub seal_us: u64,
+    /// Caching the finished payload for the block's own import.
+    pub cache_us: u64,
+    /// Whether the header was sealed ahead, in the prepared build's task.
+    pub presealed: bool,
+}
+
 impl std::fmt::Debug for Normalizer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("PayloadNormalizer")
@@ -411,6 +427,8 @@ pub struct ExecutionDriver<E> {
     /// What the last [`Self::build_block_on`] did: whether it took a build
     /// prepared ahead and, when it did not, why. See [`Self::last_build_path`].
     last_build: (bool, Option<String>),
+    /// Where the last [`Self::build_block_on`] spent its time.
+    last_build_timing: BuildTiming,
     /// Where [`Self::spawn_import_own_block`] reports a block the execution
     /// layer has taken, for the loop to build ahead on: a leader's own block
     /// raises no `BlockImported` -- that event belongs to the follower path
@@ -604,6 +622,7 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
             normalizer: None,
             prepared: None,
             last_build: (false, None),
+            last_build_timing: BuildTiming::default(),
             own_imports: own_imports_tx,
             own_imports_rx: Some(own_imports_rx),
             own_importing: Default::default(),
@@ -951,6 +970,11 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
         (self.last_build.0, self.last_build.1.as_deref())
     }
 
+    /// Where the last [`Self::build_block_on`] spent its time.
+    pub const fn last_build_timing(&self) -> BuildTiming {
+        self.last_build_timing
+    }
+
     /// Leader path: builds a block on top of the current head.
     ///
     /// Returns the built block *and* caches its payload, so the subsequent
@@ -1118,6 +1142,13 @@ impl<E: ExecutionLayer> ExecutionDriver<E> {
 
         let after_seal = started.elapsed();
         self.cache_payload(built.hash, built.execution_data.clone());
+        let after_cache = started.elapsed();
+        self.last_build_timing = BuildTiming {
+            take_us: after_resolve.as_micros() as u64,
+            seal_us: after_seal.saturating_sub(after_resolve).as_micros() as u64,
+            cache_us: after_cache.saturating_sub(after_seal).as_micros() as u64,
+            presealed: false,
+        };
 
         info!(
             target: "n42.h2.el",

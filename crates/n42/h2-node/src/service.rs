@@ -218,6 +218,14 @@ pub struct H2Service<E> {
     chain_sealer_installed: bool,
     /// How long to wait before asking the builder again; see [`PROPOSE_RETRY`].
     propose_retry: Duration,
+    /// The block pacing ([`Self::with_block_pacing`]): the attribute builder
+    /// declines until this long after the head was seen, which puts the
+    /// pacing tick at `block_seen[head] + pacing`. `None`: not known here.
+    block_pacing: Option<Duration>,
+    /// The view the attribute builder last declined for: a proposal for it
+    /// then waited for the pacing tick, and its line says how late the loop
+    /// woke after the tick.
+    declined_view: Option<u64>,
     /// How long a leader waits, after the previous view was decided, for the
     /// Round 1 votes of the validators outside the quorum before proposing
     /// the next block (see [`Self::with_straggler_grace`]). `None`: not at all.
@@ -915,6 +923,8 @@ impl<E: ExecutionLayer> H2Service<E> {
             chain_seal_key: None,
             chain_sealer_installed: false,
             propose_retry: PROPOSE_RETRY,
+            block_pacing: None,
+            declined_view: None,
             straggler_grace: None,
             last_drain: (0, 0, 0, ""),
             proposed_view: None,
@@ -1091,6 +1101,7 @@ impl<E: ExecutionLayer> H2Service<E> {
     pub fn with_block_pacing(mut self, pacing: Duration) -> Self {
         self.propose_retry = (pacing / PROPOSE_RETRY_FRACTION)
             .clamp(PROPOSE_RETRY_FLOOR, PROPOSE_RETRY);
+        self.block_pacing = (!pacing.is_zero()).then_some(pacing);
         self
     }
 
@@ -2440,6 +2451,16 @@ impl<E: ExecutionLayer> H2Service<E> {
         true
     }
 
+    /// The pacing tick for a proposal on `head`: `pacing` after the head was
+    /// seen, which is the instant the attribute builder stops declining (it
+    /// compares `head_seen.elapsed()` with the pacing). `None` when the pacing
+    /// or the head's arrival is not known here.
+    fn pacing_tick(&self, head: &B256) -> Option<std::time::Instant> {
+        let pacing = self.block_pacing?;
+        let seen = self.block_seen.get(head)?;
+        seen.checked_add(pacing)
+    }
+
     /// Builds and announces a block when this node is the leader of a view it
     /// has not yet proposed for.
     async fn propose_if_leader(&mut self, events: &mut Vec<ServiceEvent>) {
@@ -2529,9 +2550,17 @@ impl<E: ExecutionLayer> H2Service<E> {
             // than its commit latency.
             self.proposal_deferred = true;
             self.defer_reason = Some("the attribute builder declined");
+            self.declined_view = Some(view);
             return;
         };
         let attrs_at = decided.elapsed();
+        // The proposal's timeline from here: when the builder had declined
+        // for this view the proposal waited for the pacing tick, and the
+        // clock starts at the tick; otherwise at the decision above (the
+        // quorum, the seal or the parent's import came after the tick).
+        let tick = (self.declined_view == Some(view)).then(|| self.pacing_tick(&head)).flatten();
+        let tick_late_us = tick.map_or(0, |tick| decided.saturating_duration_since(tick).as_micros() as u64);
+        let timeline_from = tick.unwrap_or(decided);
         self.proposal_deferred = false;
         self.defer_reason = None;
         self.proposed_view = Some(view);
@@ -2593,6 +2622,7 @@ impl<E: ExecutionLayer> H2Service<E> {
             }
             None => None,
         };
+        let built_at = decided.elapsed();
         let built = self.driver.build_block_on(head, attrs, view).await;
         if let Some(via) = first_on_output {
             let waited_ms = decided.elapsed().as_millis() as u64;
@@ -2649,7 +2679,10 @@ impl<E: ExecutionLayer> H2Service<E> {
                         Err(err) => debug!(target: "n42.h2.node", %err, "built payload has no header to remember"),
                     }
                 }
+                let describe_at = std::time::Instant::now();
                 self.publish_body(&built.execution_data, built.header.as_ref(), &built.tx_hashes, &built.frame_layout);
+                let describe_us = describe_at.elapsed().as_micros() as u64;
+                let publish_at = std::time::Instant::now();
                 if let Err(err) = self
                     .engine
                     .process_event(ConsensusEvent::BlockReady(built.hash, None))
@@ -2678,6 +2711,29 @@ impl<E: ExecutionLayer> H2Service<E> {
                 // executed like any other, and that request finds it already in
                 // the tree.
                 self.flush_outbox(events);
+                // Always on, one line a proposal: the leader's path from the
+                // pacing tick (or the decision, when something else came
+                // after the tick) to the proposal on the wire, part by part
+                // (`docs/BREAKTHROUGH_DESIGN.md` 10.34). `publish_us` is the
+                // engine's proposal (its vote persisted first) and the gossip
+                // publish.
+                let timing = self.driver.last_build_timing();
+                info!(
+                    target: "n42.h2.node",
+                    view,
+                    block = ?built.hash,
+                    tick_bound = tick.is_some(),
+                    tick_late_us,
+                    preamble_us = built_at.as_micros() as u64,
+                    take_sealed_us = timing.take_us,
+                    sign_us = timing.seal_us,
+                    cache_us = timing.cache_us,
+                    presealed = timing.presealed,
+                    describe_us,
+                    publish_us = publish_at.elapsed().as_micros() as u64,
+                    tick_to_send_us = timeline_from.elapsed().as_micros() as u64,
+                    "proposal sent"
+                );
                 // Build-on-seal: the next build starts here, on this block's
                 // own post-state, before the import below is even sent.
                 // Without it the build waits for the import's answer and a

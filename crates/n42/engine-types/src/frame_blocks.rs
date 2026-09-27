@@ -217,6 +217,24 @@ pub fn remember_verified(block: B256, root: B256, layout: &[(B256, u32)]) {
     }
 }
 
+/// Remembers the transactions root and frame layout a block's description
+/// *claims*, before anything has checked them: the description of a block
+/// whose transactions this node does not hold is refused (the vote road asks
+/// for the whole body instead), and the whole body -- a payload, which does
+/// not carry the header's root -- then had no layout to be rooted by. It fell
+/// back to the MPT root and to "no gov5 header variant hashes to the
+/// payload's block hash" (loop278 IDX, blocks 1033 and 1038: 13,000 of
+/// 14,000 transactions not held after a view change, every node refusing the
+/// block). Safe unchecked: [`root_for_body`] uses a claim only when the frame
+/// tree over the body's own hashes reproduces it, and the block hash is
+/// confirmed after that; a verified record made first is kept.
+pub fn remember_claimed(block: B256, root: B256, layout: &[(B256, u32)]) {
+    if layout.is_empty() {
+        return;
+    }
+    remember_verified(block, root, layout);
+}
+
 /// The transactions root [`remember_verified`] recorded for `block`.
 pub fn root_of_block(block: &B256) -> Option<B256> {
     BLOCK_ROOTS
@@ -475,4 +493,36 @@ pub fn root_for_body_counted(claimed: Option<B256>, hashes: &[B256], mpt: impl F
 /// layout does not cover the body.
 pub fn root_of_hashes(hashes: &[B256], counts: &[usize]) -> Option<B256> {
     frame_tree_root_known(counts, &vec![None; counts.len()], hashes.len(), |i| hashes[i]).map(|tree| tree.root)
+}
+
+#[cfg(test)]
+mod claimed_root_tests {
+    use super::*;
+
+    /// A block whose description was refused here (its frames not held) is
+    /// fetched whole; the payload's conversion roots it by the description's
+    /// claim, checked against the body's own hashes (loop278: without it the
+    /// MPT root, and "no gov5 header variant hashes to the payload's block
+    /// hash" on every follower).
+    #[test]
+    fn a_refused_description_roots_the_whole_body_by_its_claim() {
+        let hashes: Vec<B256> = (0..7u8).map(|i| B256::repeat_byte(0x40 + i)).collect();
+        let counts = [3usize, 2, 2];
+        let root = root_of_hashes(&hashes, &counts).expect("the layout covers the body");
+        let layout: Vec<(B256, u32)> =
+            counts.iter().zip(0u8..).map(|(count, k)| (B256::repeat_byte(0xa0 + k), *count as u32)).collect();
+        let mpt = B256::repeat_byte(0x11);
+        let block = B256::repeat_byte(0x77);
+        assert_eq!(root_for_body(root_of_block(&block), &hashes, || mpt), (mpt, false));
+        remember_claimed(block, root, &layout);
+        assert_eq!(root_for_body(root_of_block(&block), &hashes, || mpt), (root, true));
+        // A claim the body does not reproduce is not used.
+        let lying = B256::repeat_byte(0x78);
+        remember_claimed(lying, B256::repeat_byte(0x99), &layout);
+        assert_eq!(root_for_body(root_of_block(&lying), &hashes, || mpt), (mpt, false));
+        // No layout, no claim.
+        let bare = B256::repeat_byte(0x79);
+        remember_claimed(bare, root, &[]);
+        assert_eq!(root_of_block(&bare), None);
+    }
 }

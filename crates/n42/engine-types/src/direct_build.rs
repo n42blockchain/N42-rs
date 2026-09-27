@@ -410,6 +410,46 @@ where
     }
 }
 
+/// The state at `grandparent` for a build on the sealed own parent filed
+/// under `built_hash`: [`state_at_soon`], and when the grandparent is still
+/// not in the engine while the parent's finish behind its seal is running,
+/// once more after that finish.
+///
+/// The grandparent is this node's own block, handed to the engine after its
+/// own finish, and that hand-off can be held behind the parent's finish: on
+/// loop278 IDX/IDXb and every `N42_OUTPUT_SHARDS` leg of loop276-277 the
+/// grandparent's hand-off (`own block handed to the engine as executed`,
+/// 590-640 ms) ended with the parent's slow QMDB roots (575-650 ms, every
+/// ~44 blocks), where the ordinary hand-off takes ~40 ms -- with the shards
+/// the parent's roots start at its seal, before the grandparent's hand-off
+/// is through. The 150 ms wait then refused the chained build ("no state
+/// found for block" the grandparent: 1-3 a leg on the leader, 0 on every
+/// flag-off leg) and the leader lost the view (5-6 s, then a TC). Waiting is
+/// no loss: this build cannot seal before the parent's finish anyway -- its
+/// header carries the parent's execution (`PARENT_FIELDS_WAIT`).
+fn grandparent_state<C>(client: &C, grandparent: B256, built_hash: B256) -> ProviderResult<StateProviderBox>
+where
+    C: StateProviderFactory,
+{
+    use crate::built_executions::Stage;
+    match state_at_soon(client, grandparent) {
+        Err(reth_storage_api::errors::ProviderError::StateForHashNotFound(_))
+            if crate::built_executions::stage_of(built_hash).is_some_and(|stage| stage < Stage::Complete) =>
+        {
+            let at = std::time::Instant::now();
+            let _ = crate::built_executions::wait_for(built_hash, Stage::Complete);
+            tracing::info!(
+                target: "payload_builder",
+                %grandparent,
+                waited_ms = at.elapsed().as_millis() as u64,
+                "the grandparent was not in the engine; waited for the parent's finish"
+            );
+            state_at_soon(client, grandparent)
+        }
+        other => other,
+    }
+}
+
 /// An opener for the parent's post-state: the chain's state at the
 /// grandparent with the parent's bundle laid over it.
 pub fn opener_on_built_parent<C>(client: C, grandparent: B256, executed: ExecutedBlock<N42Primitives>) -> ParentStateOpener
@@ -487,7 +527,7 @@ where
                     .clone()
             }
         };
-        let historical = state_at_soon(&client, parent.parent_hash)?;
+        let historical = grandparent_state(&client, parent.parent_hash, built_hash)?;
         let historical: StateProviderBox = match shards {
             Some(shards) => Box::new(crate::output_shards::ShardLayer::new(historical, shards)),
             None => historical,

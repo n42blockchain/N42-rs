@@ -118,8 +118,19 @@ fn finish(
     grafted: impl Fn(&State<CacheDB<EmptyDB>>, &Address) -> Option<AccountInfo>,
 ) -> BundleState {
     let (w1, w2) = withdrawn();
+    finish_paying(state, fees, keep_cache, grafted, &[(w1, 5), (w2, 3)])
+}
+
+/// [`finish`] with the block's withdrawals paying `withdrawals`.
+fn finish_paying(
+    state: &mut State<CacheDB<EmptyDB>>,
+    fees: U256,
+    keep_cache: bool,
+    grafted: impl Fn(&State<CacheDB<EmptyDB>>, &Address) -> Option<AccountInfo>,
+    withdrawals: &[(Address, u64)],
+) -> BundleState {
     if !keep_cache {
-        for address in [w1, w2] {
+        for &(address, _) in withdrawals {
             if let Some(info) = grafted(state, &address) {
                 state.insert_account(address, info);
             }
@@ -137,7 +148,7 @@ fn finish(
     revm::DatabaseCommit::commit(state, EvmState::from_iter([(beneficiary(), account)]));
     // The withdrawals' credit, as the executor's finish makes it: each
     // recipient read through the block's state and committed.
-    for (address, amount) in [(w1, 5u64), (w2, 3u64)] {
+    for &(address, amount) in withdrawals {
         let current = state.basic(address).expect("an in-memory database");
         let existed = current.is_some();
         let mut info = current.unwrap_or_default();
@@ -407,5 +418,63 @@ fn the_index_reads_roots_and_merge_equal_the_graft() {
         }
         let from_merged = HashedPostState::from_bundle_state::<KeccakKeyHasher>(merged.state.iter());
         assert_eq!(hashed_post_state_of(&view), from_merged, "{count} shards: hashed post-state");
+    }
+}
+
+/// The paths the builder takes on one block, with the withdrawals paying the
+/// accounts the index handles apart: a conflict (a recipient every batch
+/// paid, summed out of the batches' maps), the beneficiary (moved out of the
+/// batches in `add`), an account one batch wrote, the pre-execution cached
+/// account, and one nobody touched. The early seal (`take_cached`, the
+/// finish on the block's own state), the fallback with the cache dropped
+/// and with it kept (`into_staged` + `install_staged`, the tenure's first
+/// build and any build that did not seal early), and a chained child's read
+/// of the result (the residual over the shards, as `opener_on_sealed_parent`
+/// lays them) all equal the direct graft, in both modes.
+#[test]
+fn every_path_with_withdrawals_to_conflicts_and_the_beneficiary_equals_the_direct_graft() {
+    let db = parent();
+    let bundles = batch_bundles(&db);
+    let paid = [(addr(5_000_000), 5u64), (beneficiary(), 3), (addr(9_000_001), 2), (system(), 1), (addr(88_000_000), 4)];
+    let direct_paying = |keep_cache: bool| {
+        let mut state = block_state(&db);
+        let graft = graft_bundles_folded(&mut state, bundles.clone(), beneficiary(), keep_cache, GraftFold::Direct, None)
+            .expect("an in-memory database");
+        let mut bundle = finish_paying(&mut state, graft.beneficiary_delta, keep_cache, from_bundle, &paid);
+        append_reverts(&mut bundle, graft.reverts);
+        bundle
+    };
+    let expected = direct_paying(false);
+    assert!(expected.state.contains_key(&addr(9_000_001)) && expected.state.contains_key(&addr(88_000_000)));
+    assert_same("direct, cache kept", &expected, &direct_paying(true));
+    for index in MODES {
+        if index {
+            assert!(shards_of(bundles.clone(), 16, index).index_conflicts() > 0, "the shared recipients are conflicts");
+        }
+        // The early seal.
+        let mut state = block_state(&db);
+        let mut early = shards_of(bundles.clone(), 16, index);
+        early.take_cached(&mut state);
+        let fees = early.beneficiary_delta();
+        let residual =
+            finish_paying(&mut state, fees, false, |_, address| early.get(address).and_then(|a| a.info.clone()), &paid);
+        // A chained child's reads: the residual first, then the shards.
+        for (address, account) in &expected.state {
+            let read = match residual.state.get(address) {
+                Some(account) => account.info.clone(),
+                None => early.get(address).and_then(|a| a.info.clone()),
+            };
+            assert_eq!(read, account.info, "index {index}: a child's read of {address}");
+        }
+        assert_same(&format!("early seal, index {index}"), &expected, &early.merged(&residual));
+        // The fallback, the cache dropped and kept.
+        for keep_cache in [false, true] {
+            let mut state = block_state(&db);
+            let staged = shards_of(bundles.clone(), 16, index).into_staged();
+            let graft = install_staged(&mut state, staged, keep_cache).expect("an in-memory database");
+            let mut got = finish_paying(&mut state, graft.beneficiary_delta, keep_cache, from_bundle, &paid);
+            append_reverts(&mut got, graft.reverts);
+            assert_same(&format!("fallback, index {index}, cache kept {keep_cache}"), &expected, &got);
+        }
     }
 }

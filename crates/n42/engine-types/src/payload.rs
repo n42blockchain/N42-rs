@@ -2453,8 +2453,8 @@ where
             // `N42_OUTPUT_SHARDS`: the executor's bundle holds only what it
             // changed after the batches. The next build is let go on it laid
             // over the shards; the QMDB root and the hashed post-state read
-            // the shards and it directly, while the block's one bundle (for
-            // the engine and every `StateReady` reader) is merged beside them
+            // the shards and it directly, and the block's one bundle (for
+            // the engine and every `StateReady` reader) is merged after them
             // on the build pool.
             let mut shard_ready_ms = 0u64;
             let mut shard_merge_ms = 0u64;
@@ -2536,10 +2536,13 @@ where
                     let roots = crate::hotstuff_consensus::gov5_receipt_root_bloom(&execution_result.receipts);
                     (execution_result, roots)
                 });
-                // The merge, then `StateReady` with the one bundle: on a
-                // thread of its own (the copies on the build pool), beside the
-                // roots, which do not wait for it.
-                let filer = scope.spawn(move || {
+                // The merge, then `StateReady` with the one bundle: after the
+                // roots, not beside them (BREAKTHROUGH_DESIGN 10.11/10.15: the
+                // merge's copies on the build pool took the roots' cores, 61-65
+                // ms of roots beside a 59-61 ms merge). Nothing on the chain
+                // waits for it -- the next build reads the shards -- only the
+                // hand-off to the engine (`Complete`) does.
+                let filer = move || {
                     let merge_at = std::time::Instant::now();
                     let mut merged = shards_ref.merged(residual_state);
                     crate::parallel_transfer::append_reverts(&mut merged, shard_reverts);
@@ -2557,7 +2560,7 @@ where
                         },
                     );
                     Some((execution_output, roots, merge_ms, finish_at.elapsed().as_millis() as u64))
-                });
+                };
                 rename_parent()?;
                 let roots_from = std::time::Instant::now();
                 let qmdb_job = &qmdb_state;
@@ -2575,16 +2578,16 @@ where
                 } else {
                     Some(Ok(crate::output_shards::hashed_post_state_of(view_ref)))
                 };
-                let filed = filer.join().ok().flatten().ok_or_else(|| {
-                    PayloadBuilderError::other(std::io::Error::other("the shards' merge or the receipts root panicked"))
+                let prepared = root.join().map_err(|_| {
+                    PayloadBuilderError::other(std::io::Error::other("the QMDB root job panicked"))
+                })?;
+                let filed = filer().ok_or_else(|| {
+                    PayloadBuilderError::other(std::io::Error::other("the receipts root panicked"))
                 })?;
                 let hashed = match hashed {
                     Some(hashed) => hashed,
                     None => parent_state_ref().and_then(|state_provider| state_provider.hashed_post_state(&filed.0.state)),
                 };
-                let prepared = root.join().map_err(|_| {
-                    PayloadBuilderError::other(std::io::Error::other("the QMDB root job panicked"))
-                })?;
                 Ok((filed, hashed, prepared, roots_from))
             });
             let ((execution_output, roots, merge_ms, filed_ms), hashed_state, prepared, roots_from) = scoped?;

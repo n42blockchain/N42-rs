@@ -431,6 +431,14 @@ where
         if !crate::frame_blocks::active() {
             return Err(other("a frame description on a node without N42_FRAME_BLOCKS=1".to_owned()));
         }
+        // Before any refusal below: a body this node cannot fill here is
+        // fetched whole, and that payload's conversion roots it by this claim
+        // (checked there against the body's own hashes).
+        crate::frame_blocks::remember_claimed(
+            body.block_hash,
+            body.header.transactions_root,
+            body.frames.as_deref().unwrap_or_default(),
+        );
         let frames: Vec<(B256, usize)> =
             body.frames.as_deref().unwrap_or_default().iter().map(|(id, count)| (*id, *count as usize)).collect();
         let total = body.len();

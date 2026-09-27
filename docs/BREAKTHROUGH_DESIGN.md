@@ -596,3 +596,24 @@ key and two random reads of the mapped entry file; the bench cannot tell the loc
 (perf can). On the bench the batches run in two waves (32 batches on 16 threads, start skew one batch, no
 waits), so `par_exec` is two batch lengths -- loop282 (T, Tb) puts the same spans on the fleet's line to say
 whether its 59 ms is waves, imbalance, or per-batch overhead, and runs the read set once.
+
+### 10.21 The batches' spans on the fleet (loop282): two waves of 29 ms, and 3.3 us a transfer outside the reads
+
+| leg | win1 | par_exec | batch max / median / min | batch CPU max | start skew | wait | txs per batch | exec_read (pool) | read set | sealed_at |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| T | 1,064,891 | 58 | 29 / 23 / 10 | 27 | 27 | 0 | 2,500-6,000 | 228-270 | - | 123 |
+| Tb | 1,075,760 | 58 | 29 / 21 / 10 | 26 | 26 | 0 | 2,500-6,000 | 215-270 | - | 124 |
+| RS | **1,081,190** | 72 | 22 / 18 / 8 | 22 | 21 | 0 | 2,500-6,000 | 169-222 | 20 (158k, 0 misses) | 135 |
+
+The execution's wall is two waves of batches (start skew = one batch length, no waits, ~40 batches of 2,500-6,000
+on 16 threads), each batch's CPU equal to its wall: no gaps, no imbalance -- the term is the batch's CPU, 29 ms
+for 6,000 transfers = **4.8 us a transfer of pool time** (~850 pool ms a block on 16 threads is the 58 wall,
+close to perfectly parallel). The timers inside `transfer` see 1.7 us of it (read 0.55 x 3, evm 0.12, write
+0.18, other 0.06); the read set confirms the reads' share from the other side (batch max 29 -> 22 with the reads
+resolved ahead, the pass 20 on top: falsified on the fleet as on the bench, `par_exec` 58 -> 72). **~3.3 us a
+transfer is spent in the batch loop outside `transfer`** -- the transaction's access and sender resolution, the
+checks, the receipt and its bloom, the sink's append, the gas accounting, the per-transaction allocations --
+untimed and unnamed. That is the execution's largest term by a wide margin, on the leader and, by the same
+loop, on the follower (`import_exec` 75). Next: time the batch loop's sections per transaction under
+`N42_PHASE_TIMERS=1`, read the loop for its per-transaction costs, and cut them; the bench (batch 13 ms for 5k
+= 2.6 us a transfer) can drive it off the fleet.

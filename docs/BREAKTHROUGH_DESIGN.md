@@ -801,3 +801,24 @@ question. The follower's threads with it: the build pool (16) + the check pool (
 0 with `N42_FOLLOWER_ROOT_ON_BUILD_POOL=1`) + the merge thread beside the next block's 16. The fleet's 80-82
 against the leader's 32-34 is still not explained by the bench (its batches are the leader's 23). loop287:
 BASE / BP / BPR / BPb at the 1.25M offer.
+
+### 10.31 The build path on the fleet (loop287): the follower's execution 82 -> 69-72, and the merge on the vote's chain
+
+| leg | win1 | cycle (dissect) | B | D | follower exec (part / batches wall, count, max / median / merge) | road end / exec end / root end = fields | leader par_exec / sealed_at | win2 | imports > 600 ms |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| BASE (first leg) | 1,149,978 | 131 | 54 | 37 | 99 (0 / 80, 263, 17 / 3 / 11) | 48 / 149 / 195 | 36 / 118 | 635k | 97 |
+| BP | 1,124,178 | - | - | - | 71 (10 / 35, 30, 19 / 13 / 13) | 42 / 110 / 163 | 32 / 108 | 619k | 35 |
+| BPR (root on the build pool) | 1,117,631 | - | - | - | 72 (10 / 36, 30, 20 / 13 / 13) | 39 / 111 / 155 | 33 / 113 | 706k | 37 |
+| BPb | 1,117,075 | 139 | **106** | 5 | 69 (10 / 33, 30, 18 / 12 / 13) | 33 / 102 / 153 | 32 / 104 | **853k** | 23 |
+
+The build path does what the bench said on the follower: the execution 82-99 -> 69-72 (the batches 33-36 wall,
+30 of them at 12-13 median, the leader's shape), the fields ready at 153-163 instead of 169-195, a quarter of the
+slow imports, and a much better second window (853k against 619-706k). But the first window fell 2-3% with the
+cycle up 3-4 ms, and the dissection says why: **B (proposal -> quorum) 54 -> 106 while the leader's wait D
+37 -> 5** -- the followers vote later. The vote on n+1 does not wait for n's fields (`parent_fields_wait` 0);
+it waits for n's *published output*, which the child's includability check and early execution read, and on
+the build path that output is the 45 ms single-threaded merge after the execution (10.30): the merge is on the
+vote's chain. The fix is the leader's own: the child's check and execution read the parent's frozen shards
+(as `ShardLayer` does for the chained build) and the merge is only for the engine's hand-off, off the chain.
+Then the follower's chain is road 33 + exec 69 + root 38 = ~140 with nothing waiting on a merge, and the vote
+lands at the road's end as in BASE (B ~55) with the fields 40 ms earlier than BASE's.

@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use alloy_primitives::{Address, B256};
 use n42_twig_core::qmdb_compat::{
     gov5_account_key, gov5_storage_key, BlockUndo, QmdbCompatTree, QmdbEntrySnapshot,
-    QmdbOperation, QmdbProof, QmdbSnapshot, TwigNodes,
+    QmdbOps, QmdbProof, QmdbSnapshot, TwigNodes,
 };
 use serde::{Deserialize, Serialize};
 
@@ -60,7 +60,7 @@ pub struct PreparedBlock {
     /// The root the block's header must carry.
     pub root: B256,
     parent: B256,
-    ops: Vec<QmdbOperation>,
+    ops: QmdbOps,
     /// The block's delta from its parent (see `BlockRecord::delta`); its head
     /// fields are filled in when the block is filed under its hash.
     delta: Option<ForestDelta>,
@@ -258,8 +258,10 @@ struct BlockRecord {
     number: u64,
     /// The sorted leaf operations, kept so the block can be re-applied after
     /// a revert. Empty for the block the forest was restored at, which is
-    /// never re-applied because nothing lies beneath it.
-    ops: Vec<QmdbOperation>,
+    /// never re-applied because nothing lies beneath it. One arena, so a
+    /// record leaving the window is a couple of `free`s, not one a value
+    /// (`docs/BREAKTHROUGH_DESIGN.md` 10.39).
+    ops: QmdbOps,
     root: B256,
     /// Present exactly while the block is applied on the tree's current path.
     undo: Option<BlockUndo>,
@@ -458,7 +460,7 @@ impl QmdbForest {
             BlockRecord {
                 parent: B256::ZERO,
                 number,
-                ops: Vec::new(),
+                ops: QmdbOps::new(),
                 root,
                 undo: None,
                 delta: None,
@@ -536,12 +538,12 @@ impl QmdbForest {
         let undo = record.undo.as_ref()?;
         let mut slot = undo.prev_next_slot;
         let mut changes = Vec::with_capacity(record.ops.len());
-        for operation in &record.ops {
-            if operation.value.is_some() {
-                changes.push((operation.key, Some(self.tree.entry_offset(slot)?)));
+        for (key, value) in record.ops.iter() {
+            if value.is_some() {
+                changes.push((*key, Some(self.tree.entry_offset(slot)?)));
                 slot += 1;
             } else {
-                changes.push((operation.key, None));
+                changes.push((*key, None));
             }
         }
         (slot == self.tree.next_slot() || self.records.values().any(|other| {
@@ -661,10 +663,10 @@ impl QmdbForest {
     /// the tree reverts it first.
     pub fn compute(&mut self, parent: B256, changes: &BlockChanges) -> Result<PreparedBlock, StateError> {
         self.move_to(parent)?;
-        let mut ops = changes.operations();
-        ops.sort_unstable_by_key(|operation| operation.key);
-        // Applied from the slice the record keeps: no clone of the block.
-        let (root, undo) = self.tree.apply_sorted_slice_recorded(&ops)?;
+        let mut ops = changes.ops();
+        ops.sort();
+        // Applied from the arena the record keeps: no clone of the block.
+        let (root, undo) = self.tree.apply_ops_recorded(&ops)?;
         self.note_move(&undo);
         let delta = self.delta_of_applied(&undo);
         self.pending = Some((parent, undo));
@@ -682,14 +684,16 @@ impl QmdbForest {
     /// straight from the execution's bundle -- the change set and its
     /// operations were 75 ms of a 190 ms root phase on a 147,000-account
     /// block). The operations need not be sorted; the tree sorts them.
-    pub fn compute_operations(&mut self, parent: B256, mut ops: Vec<QmdbOperation>) -> Result<PreparedBlock, StateError> {
+    /// Owned operations (`Vec<QmdbOperation>`) are copied into one arena
+    /// first; the node's builders hand a [`QmdbOps`] built as one.
+    pub fn compute_operations(&mut self, parent: B256, ops: impl Into<QmdbOps>) -> Result<PreparedBlock, StateError> {
+        let mut ops = ops.into();
         self.move_to(parent)?;
-        if !ops.is_sorted_by_key(|operation| operation.key) {
-            ops.sort_unstable_by_key(|operation| operation.key);
+        if !ops.is_sorted() {
+            ops.sort();
         }
-        // Applied from the slice the record keeps: no clone of the block
-        // (168,000 operations and as many value allocations a full block).
-        let (root, undo) = self.tree.apply_sorted_slice_recorded(&ops)?;
+        // Applied from the arena the record keeps: no clone of the block.
+        let (root, undo) = self.tree.apply_ops_recorded(&ops)?;
         self.note_move(&undo);
         let delta = self.delta_of_applied(&undo);
         self.pending = Some((parent, undo));
@@ -1082,7 +1086,7 @@ impl QmdbForest {
                 .get(hash)
                 .ok_or(StateError::UnknownBlock(*hash))?;
             let expected = record.root;
-            let (root, undo) = self.tree.apply_sorted_slice_recorded(&record.ops)?;
+            let (root, undo) = self.tree.apply_ops_recorded(&record.ops)?;
             self.note_move(&undo);
             let root = B256::from(root);
             if root != expected {
@@ -1726,13 +1730,11 @@ mod tests {
         let mut parent = GENESIS;
         let mut key_seed = 0u64;
         for n in 1..=blocks + 1 {
-            let ops = (0..per_block)
-                .map(|_| {
-                    key_seed += 1;
-                    let key = *alloy_primitives::keccak256(key_seed.to_be_bytes());
-                    QmdbOperation { key, value: Some(vec![n as u8; 72]) }
-                })
-                .collect();
+            let mut ops = QmdbOps::with_capacity(per_block as usize, per_block as usize * 72);
+            for _ in 0..per_block {
+                key_seed += 1;
+                ops.push(*alloy_primitives::keccak256(key_seed.to_be_bytes()), Some(&[n as u8; 72]));
+            }
             let prepared = forest.compute_operations(parent, ops).unwrap();
             let hash = B256::from(alloy_primitives::keccak256(n.to_be_bytes()));
             forest.insert(hash, n, prepared).unwrap();

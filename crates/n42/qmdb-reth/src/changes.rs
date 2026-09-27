@@ -28,7 +28,7 @@
 use alloy_primitives::{address, Address, B256, U256};
 use n42_qmdb_state::{AccountState, BlockChanges};
 use revm_database::BundleState;
-use n42_twig_core::qmdb_compat::QmdbOperation;
+use n42_twig_core::qmdb_compat::QmdbOps;
 
 /// The leaves a block writes, from the bundle its execution left behind.
 pub fn changes_from_bundle(bundle: &BundleState) -> BlockChanges {
@@ -96,7 +96,7 @@ pub fn changes_from_execution(bundle: &BundleState, prague_active: bool) -> Bloc
 /// a keccak and an encoding per leaf, serial) were 75 ms of the follower's
 /// 190 ms root phase; here the leaves are keyed and encoded on the worker
 /// pool and sorted there too.
-pub fn sorted_operations_from_execution(bundle: &BundleState, prague_active: bool) -> Vec<QmdbOperation> {
+pub fn sorted_operations_from_execution(bundle: &BundleState, prague_active: bool) -> QmdbOps {
     let accounts: Vec<(&Address, &revm_database::BundleAccount)> = bundle.state.iter().collect();
     sorted_operations_from_accounts(&accounts, prague_active)
 }
@@ -109,40 +109,59 @@ pub fn sorted_operations_from_execution(bundle: &BundleState, prague_active: boo
 pub fn sorted_operations_from_accounts(
     accounts: &[(&Address, &revm_database::BundleAccount)],
     prague_active: bool,
-) -> Vec<QmdbOperation> {
-    use n42_twig_core::qmdb_compat::{encode_gov5_account_value, gov5_account_key, gov5_storage_key};
+) -> QmdbOps {
+    use n42_twig_core::qmdb_compat::{encode_gov5_account_value_into, gov5_account_key, gov5_storage_key};
     use rayon::prelude::*;
-    let mut ops: Vec<QmdbOperation> = accounts
-        .par_iter()
-        .flat_map_iter(|(address, account)| {
-            // The system caller's leaf is written below, as gov5 writes it,
-            // over whatever the execution left for that address.
-            let skip = prague_active && **address == PRAGUE_SYSTEM_CALLER;
-            let account_op = (!skip).then(|| QmdbOperation {
-                key: gov5_account_key(&address.0 .0),
-                // A bundle account is a state object gov5 would hold, live
-                // even when empty (`set_account_initialised`); a missing info
-                // deletes the leaf.
-                value: account.info.as_ref().map(|info| {
-                    encode_gov5_account_value(info.nonce, &info.balance.to_be_bytes::<32>(), &info.code_hash.0)
-                }),
-            });
-            let storage_ops = account.storage.iter().map(move |(slot, value)| QmdbOperation {
-                key: gov5_storage_key(&address.0 .0, &B256::from(slot.to_be_bytes::<32>()).0),
-                value: (!value.present_value.is_zero()).then(|| value.present_value.to_be_bytes::<32>().to_vec()),
-            });
-            account_op.into_iter().chain(storage_ops)
+    // Each chunk of accounts writes its leaves into an arena of its own on
+    // the worker pool, and the chunks are joined into one: a block's
+    // operations are a few hundred allocations, not one a value, and so is
+    // the forest record that keeps them (BREAKTHROUGH_DESIGN 10.39).
+    let pieces: Vec<QmdbOps> = accounts
+        .par_chunks(ACCOUNTS_PER_CHUNK)
+        .map(|chunk| {
+            let slots: usize = chunk.iter().map(|(_, account)| account.storage.len()).sum();
+            // An account leaf is at most 76 bytes, typically ~10; a storage leaf is 32.
+            let mut ops = QmdbOps::with_capacity(chunk.len() + slots, chunk.len() * 16 + slots * 32);
+            for (address, account) in chunk {
+                // The system caller's leaf is written below, as gov5 writes it,
+                // over whatever the execution left for that address.
+                let skip = prague_active && **address == PRAGUE_SYSTEM_CALLER;
+                if !skip {
+                    let key = gov5_account_key(&address.0 .0);
+                    // A bundle account is a state object gov5 would hold, live
+                    // even when empty (`set_account_initialised`); a missing info
+                    // deletes the leaf.
+                    match account.info.as_ref() {
+                        Some(info) => ops.push_with(key, |out| {
+                            encode_gov5_account_value_into(out, info.nonce, &info.balance.to_be_bytes::<32>(), &info.code_hash.0)
+                        }),
+                        None => ops.push(key, None),
+                    }
+                }
+                for (slot, value) in &account.storage {
+                    let key = gov5_storage_key(&address.0 .0, &B256::from(slot.to_be_bytes::<32>()).0);
+                    if value.present_value.is_zero() {
+                        ops.push(key, None);
+                    } else {
+                        ops.push(key, Some(&value.present_value.to_be_bytes::<32>()));
+                    }
+                }
+            }
+            ops
         })
         .collect();
+    let mut ops = QmdbOps::concat(pieces);
     if prague_active {
-        ops.push(QmdbOperation {
-            key: gov5_account_key(&PRAGUE_SYSTEM_CALLER.0 .0),
-            value: Some(encode_gov5_account_value(0, &U256::ZERO.to_be_bytes::<32>(), &alloy_primitives::KECCAK256_EMPTY.0)),
+        ops.push_with(gov5_account_key(&PRAGUE_SYSTEM_CALLER.0 .0), |out| {
+            encode_gov5_account_value_into(out, 0, &U256::ZERO.to_be_bytes::<32>(), &alloy_primitives::KECCAK256_EMPTY.0)
         });
     }
-    ops.par_sort_unstable_by_key(|op| op.key);
+    ops.sort();
     ops
 }
+
+/// Accounts a worker writes into one arena in [`sorted_operations_from_accounts`].
+const ACCOUNTS_PER_CHUNK: usize = 1024;
 
 /// `SYSTEM_ADDRESS` (EIP-4788): the caller of every system call.
 pub const PRAGUE_SYSTEM_CALLER: Address = address!("fffffffffffffffffffffffffffffffffffffffe");
@@ -367,9 +386,9 @@ mod state_commit_bench {
                 expected.sort_unstable_by_key(|op| op.key);
                 let got = sorted_operations_from_execution(bundle, prague);
                 assert_eq!(got.len(), expected.len(), "count (prague {prague})");
-                for (g, e) in got.iter().zip(&expected) {
-                    assert_eq!(g.key, e.key, "key (prague {prague})");
-                    assert_eq!(g.value, e.value, "value (prague {prague})");
+                for ((key, value), e) in got.iter().zip(&expected) {
+                    assert_eq!(*key, e.key, "key (prague {prague})");
+                    assert_eq!(value, e.value.as_deref(), "value (prague {prague})");
                 }
             }
         }

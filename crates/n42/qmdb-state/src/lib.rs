@@ -50,7 +50,7 @@ pub use forest::{ForestCheckpoint, ForestDelta, ForestSnapshot, PreparedBlock, Q
     DEFAULT_RETAIN_DEPTH, READER_KEEP_CAP,
 };
 use n42_twig_core::qmdb_compat::{
-    encode_gov5_account_value, gov5_account_key, gov5_storage_key, QmdbCompatTree, QmdbOperation,
+    encode_gov5_account_value_into, gov5_account_key, gov5_storage_key, QmdbCompatTree, QmdbOperation, QmdbOps,
     QmdbOperationError, QmdbProof, GOV5_EMPTY_CODE_HASH,
 };
 
@@ -163,29 +163,37 @@ impl BlockChanges {
     /// agree byte for byte, and a caller comparing the two wants the operations
     /// rather than only the root they produce.
     pub fn operations(&self) -> Vec<QmdbOperation> {
-        let mut operations = Vec::with_capacity(self.len());
+        self.ops().to_operations()
+    }
+
+    /// [`Self::operations`] in one arena: the same operations in the same
+    /// order, every value in one buffer.
+    pub fn ops(&self) -> QmdbOps {
+        let storage_len = self.len() - self.accounts.len();
+        // An account leaf is at most 76 bytes; a storage leaf is 32.
+        let mut operations = QmdbOps::with_capacity(self.len(), self.accounts.len() * 76 + storage_len * 32);
         for (address, account) in &self.accounts {
             let key = gov5_account_key(&address.0 .0);
             let live = self.initialised.contains(address);
-            let value = account.filter(|state| live || !state.is_empty()).map(|state| {
-                encode_gov5_account_value(
-                    state.nonce,
-                    &state.balance.to_be_bytes::<32>(),
-                    &state.code_hash.0,
-                )
-            });
-            operations.push(QmdbOperation { key, value });
+            match account.filter(|state| live || !state.is_empty()) {
+                Some(state) => operations.push_with(key, |out| {
+                    encode_gov5_account_value_into(out, state.nonce, &state.balance.to_be_bytes::<32>(), &state.code_hash.0)
+                }),
+                None => operations.push(key, None),
+            }
         }
         for (address, slots) in &self.storage {
             for (slot, value) in slots {
-                operations.push(QmdbOperation {
-                    key: gov5_storage_key(&address.0 .0, &slot.0),
-                    // A zero slot is a deletion, not a leaf holding zero: gov5
-                    // writes 32 big-endian bytes for a non-zero value and
-                    // deletes otherwise, and a leaf of 32 zero bytes is a
-                    // different tree.
-                    value: (!value.is_zero()).then(|| value.to_be_bytes::<32>().to_vec()),
-                });
+                let key = gov5_storage_key(&address.0 .0, &slot.0);
+                // A zero slot is a deletion, not a leaf holding zero: gov5
+                // writes 32 big-endian bytes for a non-zero value and
+                // deletes otherwise, and a leaf of 32 zero bytes is a
+                // different tree.
+                if value.is_zero() {
+                    operations.push(key, None);
+                } else {
+                    operations.push(key, Some(&value.to_be_bytes::<32>()));
+                }
             }
         }
         operations

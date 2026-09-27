@@ -63,7 +63,7 @@
 //! `N42_QMDB_CHECKPOINT_RATIO=<n>` lets the log grow to `n` times the
 //! checkpoint before either path runs (default 1).
 
-use n42_twig_core::qmdb_compat::QmdbOperation;
+use n42_twig_core::qmdb_compat::QmdbOps;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -1070,7 +1070,8 @@ impl QmdbNodeState {
 
     /// [`Self::compute`] from leaf operations already built
     /// (`sorted_operations_from_execution`).
-    pub fn compute_operations(&self, parent: B256, ops: Vec<QmdbOperation>) -> Result<PreparedBlock, NodeStateError> {
+    pub fn compute_operations(&self, parent: B256, ops: impl Into<QmdbOps>) -> Result<PreparedBlock, NodeStateError> {
+        let ops = ops.into();
         self.with_forest(|forest| forest.compute_operations(parent, ops))
     }
 
@@ -1080,9 +1081,10 @@ impl QmdbNodeState {
         parent: B256,
         block_hash: B256,
         number: u64,
-        ops: Vec<QmdbOperation>,
+        ops: impl Into<QmdbOps>,
         header_root: B256,
     ) -> Result<B256, NodeStateError> {
+        let ops = ops.into();
         self.with_forest(|forest| {
             if let Some(root) = forest.root_of(&block_hash) {
                 return Ok(root);
@@ -1116,8 +1118,9 @@ impl QmdbNodeState {
         parent: B256,
         block_hash: B256,
         number: u64,
-        ops: Vec<QmdbOperation>,
+        ops: impl Into<QmdbOps>,
     ) -> Result<B256, NodeStateError> {
+        let ops = ops.into();
         self.with_forest(|forest| {
             if let Some(root) = forest.root_of(&block_hash) {
                 return Ok(root);

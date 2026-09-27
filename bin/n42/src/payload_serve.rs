@@ -198,7 +198,10 @@ pub type ForeignImport = dyn Fn(
         Option<tokio::sync::oneshot::Sender<()>>,
         crate::follower_import::VoteRoad,
     ) -> Result<
-        (Box<reth_payload_primitives::BuiltPayloadExecutedBlock<n42_tx_types::N42Primitives>>, [u64; 12]),
+        (
+            Box<reth_payload_primitives::BuiltPayloadExecutedBlock<n42_tx_types::N42Primitives>>,
+            [u64; crate::follower_import::IMPORT_TIMES],
+        ),
         String,
     > + Send
     + Sync;
@@ -1315,7 +1318,7 @@ where
     // Another node's block: executed here and handed to the
     // engine as executed, when configured. Any failure logs
     // and leaves the block to the engine's own path.
-    let mut direct_ms: Option<[u64; 16]> = None;
+    let mut direct_ms: Option<[u64; 22]> = None;
     // The block's transaction hashes, known once the direct
     // import converted the payload: the prune below then
     // needs no keccak over the raw bytes.
@@ -1511,6 +1514,12 @@ where
                         phases[9],
                         phases[10],
                         phases[11],
+                        phases[12],
+                        phases[13],
+                        phases[14],
+                        phases[15],
+                        phases[16],
+                        phases[17],
                     ]);
                 } else {
                     warn!(target: "n42.payload_serve", number, "direct import: the engine did not take the executed block; importing the ordinary way");
@@ -1560,6 +1569,12 @@ where
                 parent_engine_wait_ms = ms[13],
                 gate_ms = ms[14],
                 root_wait_ms = ms[15],
+                road_end_ms = ms[16],
+                exec_start_ms = ms[17],
+                exec_end_ms = ms[18],
+                root_end_ms = ms[19],
+                fields_ready_ms = ms[20],
+                parent_fields_wait_ms = ms[21],
                 answered_ms = answered,
                 "direct import: answered before the engine's own pass"
             );
@@ -1728,6 +1743,12 @@ where
                     parent_engine_wait_ms = ms[13],
                     gate_ms = ms[14],
                     root_wait_ms = ms[15],
+                    road_end_ms = ms[16],
+                    exec_start_ms = ms[17],
+                    exec_end_ms = ms[18],
+                    root_end_ms = ms[19],
+                    fields_ready_ms = ms[20],
+                    parent_fields_wait_ms = ms[21],
                     engine_ms = (started.elapsed().saturating_sub(decoded).as_millis() as u64).saturating_sub(ms[7]),
                     engine_remember_ms = remember_ms,
                     engine_listing_ms = listing_ms,

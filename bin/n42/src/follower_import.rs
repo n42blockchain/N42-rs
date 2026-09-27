@@ -990,6 +990,10 @@ struct Executed {
     gate_ms: u64,
     state_ms: u64,
     exec_ms: u64,
+    /// When the execution proper began (after the gate and the state's
+    /// opening) and ended, for the import's timeline.
+    exec_started: std::time::Instant,
+    exec_ended: std::time::Instant,
 }
 
 /// What the block's road to this node's vote cost before the import began,
@@ -1111,6 +1115,10 @@ struct RoadPhases {
     check_us: u64,
     /// Waiting for the parent's execution fields, and the header against them.
     fields_us: u64,
+    /// Of `fields_us` (or, under `N42_FOLLOWER_EXEC_EARLY=1`, of the check):
+    /// the wait alone for the parent's execution fields -- what the vote on
+    /// this block waited for the parent's QMDB root. Not in the line's sum.
+    parent_fields_wait_us: u64,
 }
 
 /// The one line a bench leg greps: where a block's road to this node's vote
@@ -1176,6 +1184,7 @@ fn log_vote_road(road: VoteRoad, number: u64, txs: usize, phases: RoadPhases) {
         parent_wait_ms = phases.parent_wait_us / 1000,
         check_ms = phases.check_us / 1000,
         fields_ms = phases.fields_us / 1000,
+        parent_fields_wait_ms = phases.parent_fields_wait_us / 1000,
         other_ms = total.saturating_sub(named) / 1000,
         total_ms = total / 1000,
         "vote road"
@@ -1267,7 +1276,7 @@ pub fn import_foreign_block<Provider, Evm, ChainSpec>(
     chain_spec: &ChainSpec,
     mut checked: Option<tokio::sync::oneshot::Sender<()>>,
     road: VoteRoad,
-) -> Result<(Box<BuiltPayloadExecutedBlock<EthPrimitives>>, [u64; 12]), String>
+) -> Result<(Box<BuiltPayloadExecutedBlock<EthPrimitives>>, [u64; IMPORT_TIMES]), String>
 where
     Provider: StateProviderFactory + HeaderProvider<Header = alloy_consensus::Header> + Sync,
     Evm: ConfigureEvm<
@@ -1278,6 +1287,13 @@ where
 {
     let qmdb = qmdb.ok_or("no QMDB state: the direct import needs the chain's root")?;
     let started = std::time::Instant::now();
+    // The block's chain on this node, against the instant its request's first
+    // byte landed (the road's start): when the vote was released, when the
+    // execution ran, when the root and the fields were done.
+    let road_started = road.started;
+    let vote_at: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    // The vote's wait for the parent's fields, out of whichever road waited.
+    let parent_fields_wait_us = std::sync::atomic::AtomicU64::new(0);
     let stage = ImportStage(sealed.number);
     stage.at(1);
     let parent_hash = sealed.parent_hash;
@@ -1605,6 +1621,8 @@ where
             let fields_at = std::time::Instant::now();
             if parent_state.is_some() {
                 wait_for_parent_fields(parent_hash)?;
+                phases.parent_fields_wait_us = fields_at.elapsed().as_micros() as u64;
+                parent_fields_wait_us.store(phases.parent_fields_wait_us, std::sync::atomic::Ordering::Relaxed);
                 against_parent()?;
             }
             phases.fields_us = fields_at.elapsed().as_micros() as u64;
@@ -1618,6 +1636,7 @@ where
             if let Some(checked) = checked.take() {
                 let _ = checked.send(());
             }
+            let _ = vote_at.set(std::time::Instant::now());
             log_vote_road(road, number, tx_count, phases);
         } else {
             // Two roads from here (plan v4 step 2, [`two_roads`]): the rest of
@@ -1814,9 +1833,30 @@ where
                 .execute(&recovered)
                 .map_err(|err| format!("execution: {err}"))?,
         };
-        Ok(Executed { state, cached, output, parallel, gate_ms, state_ms, exec_ms: executed_at.elapsed().as_millis() as u64 })
+        let exec_ended = std::time::Instant::now();
+        Ok(Executed {
+            state,
+            cached,
+            output,
+            parallel,
+            gate_ms,
+            state_ms,
+            exec_ms: exec_ended.duration_since(executed_at).as_millis() as u64,
+            exec_started: executed_at,
+            exec_ended,
+        })
     };
-    let Executed { state, mut cached, output, parallel: parallel_executed, gate_ms, state_ms, exec_ms } = match roads_at {
+    let Executed {
+        state,
+        mut cached,
+        output,
+        parallel: parallel_executed,
+        gate_ms,
+        state_ms,
+        exec_ms,
+        exec_started,
+        exec_ended,
+    } = match roads_at {
         None => execute_block()?,
         Some(roads_at) => {
             // References rather than the values: the vote road's closure is
@@ -1824,19 +1864,24 @@ where
             let header = recovered.sealed_header();
             let parent_header = &parent;
             let vote_checked = checked.take();
+            let vote_at = &vote_at;
+            let parent_fields_wait_us = &parent_fields_wait_us;
             two_roads(
                 number,
                 roads_at,
                 move || {
                     let fields_at = std::time::Instant::now();
                     wait_for_parent_fields(parent_hash)?;
-                    validate_against_parent(consensus, header, parent_header)?;
                     let mut phases = phases;
+                    phases.parent_fields_wait_us = fields_at.elapsed().as_micros() as u64;
+                    parent_fields_wait_us.store(phases.parent_fields_wait_us, std::sync::atomic::Ordering::Relaxed);
+                    validate_against_parent(consensus, header, parent_header)?;
                     phases.fields_us = fields_at.elapsed().as_micros() as u64;
                     // The vote, with this block's execution still running.
                     if let Some(checked) = vote_checked {
                         let _ = checked.send(());
                     }
+                    let _ = vote_at.set(std::time::Instant::now());
                     log_vote_road(road, number, tx_count, phases);
                     Ok(())
                 },
@@ -1849,6 +1894,9 @@ where
     consensus
         .validate_block_post_execution(&recovered, &output.result, None, None)
         .map_err(|err| format!("post-execution: {err}"))?;
+    // Under deferred execution the check above filed the receipt half of this
+    // block's fields; the root below files the other.
+    let receipts_filed = std::time::Instant::now();
     let checks_ms = checks_at.elapsed().as_millis() as u64;
     let execution_output = Arc::new(output);
     // The child's check can start now: its ~6,000 senders are in this
@@ -1905,6 +1953,10 @@ where
     // of a 438 ms import (round 43, loop99). `N42_ROOT_HASHED_PARALLEL=1` puts
     // them on the worker pool together.
     let bundle = &execution_output.state;
+    // When the root job filed this block's state root (deferred execution
+    // only): with the receipts filed above, when its fields became complete.
+    let root_filed: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let root_filed = &root_filed;
     let root_job = || -> Result<B256, String> {
         if deferred {
             // The header carries the parent's root (checked against the
@@ -1915,6 +1967,7 @@ where
                 .insert_block_operations(parent_hash, block_hash, number, ops)
                 .map_err(|err| format!("state root: {err}"))?;
             n42_engine_types::executed_fields::remember_state_root(block_hash, root);
+            let _ = root_filed.set(std::time::Instant::now());
             return Ok(root);
         }
         if parallel_state_commit() {
@@ -1978,6 +2031,7 @@ where
         let both = root_at.elapsed().as_millis() as u64;
         (both, 0, hashed?)
     };
+    let root_end = root_filed.get().copied().unwrap_or_else(std::time::Instant::now);
 
     if carry_async && !parallel_executed {
         let state = Arc::clone(&execution_output);
@@ -2028,9 +2082,22 @@ where
             parent_engine_wait_us / 1000,
             gate_ms,
             root_wait_ms,
+            // The chain, ms after the road's start: the vote released (0
+            // before the fork, where the import is the answer), the execution,
+            // the root filed, the fields complete, and how long this block's
+            // vote waited for its parent's fields.
+            vote_at.get().map_or(0, |at| ms_between(road_started, *at)),
+            ms_between(road_started, exec_started),
+            ms_between(road_started, exec_ended),
+            ms_between(road_started, root_end),
+            if deferred { ms_between(road_started, root_end.max(receipts_filed)) } else { 0 },
+            parent_fields_wait_us.load(std::sync::atomic::Ordering::Relaxed) / 1000,
         ],
     ))
 }
+
+/// How many timings [`import_foreign_block`] returns (see its last lines).
+pub const IMPORT_TIMES: usize = 18;
 
 /// Copies a block's post-state into the read cache the next import starts
 /// from, and files it under the block's hash.
@@ -2129,6 +2196,11 @@ fn carry_async() -> bool {
 fn root_hashed_parallel() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("N42_ROOT_HASHED_PARALLEL").map_or(true, |v| v != "0"))
+}
+
+/// Milliseconds from `from` to `to`, zero if `to` is earlier.
+fn ms_between(from: std::time::Instant, to: std::time::Instant) -> u64 {
+    to.saturating_duration_since(from).as_millis() as u64
 }
 
 /// `N42_FOLLOWER_PARALLEL`, read once.

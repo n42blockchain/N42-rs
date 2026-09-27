@@ -763,3 +763,22 @@ since the frames the blocks are not full (90-92% occupancy, 137-159 of 225-231 a
 (~1.0-1.05M delivered) is under what the fleet now consumes. The follower's execution is 86-88 here against 75
 in BASE (the extra pools share the node's cores), which is the next term after the supply. Next: the offer at
 1.2 and 1.3M with both flags, then the follower's execution.
+
+### 10.29 The offer above the consumption (loop286): 1,156,338 with full blocks; the followers' chain again
+
+| leg | offer | win1 | cycle | occupancy / full | queued | gate us | leader par_exec / sealed_at | follower: road end / exec end / fields ready | exec / root | win2 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| R1200 (first leg) | 1.2M | 1,027,696 | 158 | 99.6% | 834,500 | 26,395 | 38 / 116 | 49 / 152 / 201 | 99 / 37 | 738k |
+| R1300 | 1.3M | 1,139,512 | 143 | 99.8% | 787,000 | 17,027 | 34 / 114 | 38 / 124 / 169 | 80 / 38 | 700k |
+| R1250 | 1.25M | **1,156,338** | 140 | 99.5% | 786,000 | 16,821 | 32 / 113 | 37 / 123 / 169 | 82 / 37 | 619k |
+| R1200b | 1.2M | 1,148,373 | 142 | 99.7% | 797,000 | 16,636 | 33 / 114 | 37 / 123 / 169 | 82 / 38 | 641k |
+
+With the offer at 1.2-1.3M the blocks are full again and the window is 1,139-1,156k -- the fleet's consumption at
+a 140-143 ms cycle. The first leg after the build is the slow kind (10.6's void: the gate at 26 ms, the queue
+at the line, the follower's execution 99). The queue now sits *under* the gate line (786-797k against 834k):
+the supply no longer piles up, the fleet is the term. Its term is the followers' chain: fields ready at 169
+after the road's start (road end 37, execution 80-82, root 37-38), against the leader's seal at 113-114 --
+the follower's execution is 2.5x the leader's for the same transactions (section 5b: the follower through the
+leader's build path -- the sender partition, `BatchState`, the index shards, no graft, the build pool). Window 2
+falls to 619-738k at these offers (the base fee runs to 1e19 and the cycle to 0.22-0.26 s): window 1 is the
+metric, as always, but the second window's decay is steeper than at 1.1M and is noted.

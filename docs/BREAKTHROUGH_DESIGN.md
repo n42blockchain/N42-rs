@@ -744,3 +744,22 @@ includability check, which runs beside it on its own small pool; the check's err
 follows the check); `N42_FOLLOWER_FIELDS_EARLY=1` (the QMDB root starts on its own thread the instant the
 execution returns, hashed on a dedicated pool of 8, one root at a time). loop285 runs BASE / FIELDS / BOTH /
 BOTHb with step 4d on the leader.
+
+### 10.28 Step 4d and the follower's chain on the fleet (loop285): 1,130,438, and the blocks are no longer full
+
+| leg | win1 | cycle | occupancy / full | leader par_exec / sealed_at | follower: road end / exec start / exec end / root end = fields ready | exec / root | import total | fields wait |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| BASE (4d, follower BatchState) | 1,097,485 | 149 | 99.9% / 201 of 202 | 33 / 102 | 58 / 47 / 125 / 206 | 75 / 56 | 204 | 0 |
+| FIELDS (+ fields early) | 1,126,383 | 133 | 92.0% / 149 of 225 | 39 / 116 | 44 / 43 / 137 / 179 | 88 / 35 | 170 | 0 |
+| BOTH (+ exec early) | **1,130,438** | 133 | 92.4% / 159 of 225 | 36 / 109 | 37 / 40 / 130 / 174 | 86 / 37 | 163 | 0 |
+| BOTHb | 1,126,458 | 130 | 89.9% / 137 of 231 | 33 / 107 | 38 / 41 / 131 / 174 | 87 / 38 | 163 | 0 |
+
+Step 4d on the leader: `par_exec` 48 -> 33 and the seal 116-120 -> 102-109 (the fetch, the slot and the close
+were the fleet's 1.4 us outside `transfer`). On the followers the root on its own pool the instant the execution
+returns takes the alternating 100 out (root 56 -> 35-38, fields ready 206 -> 174-179), and the execution
+starting before the check moves the road's end from 58 to 37 -- the follower's chain is 174 from the road
+start against 206. **The cycle fell 149 -> 130-133 and the window to 1,126-1,130k**, and for the first time
+since the frames the blocks are not full (90-92% occupancy, 137-159 of 225-231 at 95%): the flood's 1.1M offer
+(~1.0-1.05M delivered) is under what the fleet now consumes. The follower's execution is 86-88 here against 75
+in BASE (the extra pools share the node's cores), which is the next term after the supply. Next: the offer at
+1.2 and 1.3M with both flags, then the follower's execution.

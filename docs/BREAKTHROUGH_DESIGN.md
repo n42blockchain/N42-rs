@@ -929,3 +929,21 @@ the ingest sums each clean frame once (gas, smallest fee cap, chain id, sender r
 root's thread starts with the execution (its spawn and its wait for the parent's fields overlap the batches),
 and the header/body consensus checks move onto the road beside the execution. The copy (8) stays on the road:
 the build-path execution reads the owned block, not the frames' Arcs. loop291: P100 / P100S / P90S / P100Sb.
+
+### 10.37 Steps 6b and 5e on the fleet (loop291): 1,211,401; tick-to-send 4.5 ms; the check 4 -> 0
+
+| leg | win1 | cycle (dissect) | B | D | leader sealed_at | tick-to-send (us): late / preamble / take / sign / publish / total, presealed, tick-bound | follower: road end / check / exec / fields | win2 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| P100 | **1,211,401** | 128 | 46 | 53 | 102 | 576 / 444 / 7 / 1,123 / 783 / **4,480**, 1,021 of 1,023, 760 | 27 / 4 / 46 / 110 | 825k |
+| P100S (frame scan) | 1,205,773 | - | - | - | 106 | - | 21 / 0 / 43 / 106 | 835k |
+| P90S | 1,190,504 | - | - | - | 110 | - | 21 / 0 / 44 / 107 | 847k |
+| P100Sb (slow kind, gate 22 ms) | 1,114,514 | - | - | - | 116 | - | 25 / 0 / 46 / 115 | 787k |
+
+The leader's tick-to-send is 4.5 ms (23 in 10.34): the wake 0.6 late, the build presealed in 1,021 of 1,023
+views, the sign 1.1, the publish 0.8. The follower's check is 0 with the frame summaries (326 of 326 frames
+summarized; 4 without, 14 before 5e's split named it), the road's end 27 -> 21, the fields 106-110. The
+window is 1,206-1,211k with the second window at 825-847k. But the cycle is still 128-135 with D 53: the tick
+binds in 760 of 1,023 views yet the cycle is not the pacing plus 4.5 -- the tick is `block_seen[head]` + 100,
+measured from when the leader saw its own head, not from the previous proposal's send, so the interval carries
+B inside it. That is the next thing to read and set: the pacing from the send, or the pacing lowered to
+match (loop290's 70-90 were before 6b).

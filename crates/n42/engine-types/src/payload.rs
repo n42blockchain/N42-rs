@@ -2580,6 +2580,10 @@ where
             let mut shard_merge_ms = 0u64;
             let mut shards_used = 0usize;
             let roots_ms;
+            // Where the QMDB root spent its time (`root_*` on the phases line),
+            // and how long its publication took.
+            let root_split: n42_qmdb_reth::RootSplit;
+            let root_publish_us = std::cell::Cell::new(0u64);
             let state_ready_ms;
             // The block's own execution fields, published the moment its QMDB
             // root is in: the child's header carries them (deferred
@@ -2641,8 +2645,11 @@ where
                 (hashed, prepared, roots)
             });
             let hashed_state = hashed_state.map_err(PayloadBuilderError::other)?;
+            let published_at = std::time::Instant::now();
             publish(prepared, roots, execution_result.gas_used)?;
+            root_publish_us.set(published_at.elapsed().as_micros() as u64);
             roots_ms = roots_at.elapsed().as_millis() as u64;
+            root_split = qmdb_state.take_root_split(&parent_sealed).unwrap_or_default();
             (execution_output, hashed_state)
                 }
                 Some(shards) => {
@@ -2708,7 +2715,9 @@ where
                 let (execution_result, roots) = receipts.join().map_err(|_| {
                     PayloadBuilderError::other(std::io::Error::other("the receipts root panicked"))
                 })?;
+                let published_at = std::time::Instant::now();
                 publish_ref(prepared, roots, execution_result.gas_used)?;
+                root_publish_us.set(published_at.elapsed().as_micros() as u64);
                 let roots_ms = roots_from.elapsed().as_millis() as u64;
                 let shards = Arc::clone(&shards);
                 let residual = Arc::clone(&residual);
@@ -2755,6 +2764,7 @@ where
             };
             shard_merge_ms = merge_ms;
             roots_ms = shard_roots_ms;
+            root_split = qmdb_state.take_root_split(&parent_sealed).unwrap_or_default();
             state_ready_ms = filed_ms;
             (execution_output, hashed_state)
                 }
@@ -2948,6 +2958,17 @@ where
                     state_wait_ms,
                     state_wait_on = state_wait_label(state_wait_ms, &state_wait_on),
                     state_wait_split = %state_wait_on.split(),
+                    root_lock_wait_ms = root_split.lock_wait_ms,
+                    root_lock_held_by = root_split.held_by,
+                    root_move_ms = root_split.move_ms,
+                    root_apply_ms = root_split.apply_ms,
+                    root_hash_ms = root_split.hash_ms,
+                    root_publish_ms = root_publish_us.get() / 1000,
+                    root_faults = root_split.faults,
+                    root_majflt = root_split.majflt,
+                    root_twig_pool_misses = root_split.twig_pool_misses,
+                    root_seals = root_split.seals,
+                    root_seal_ms = root_split.seal_ms,
                     "seal-first build phases"
                 );
             }

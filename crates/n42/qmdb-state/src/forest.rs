@@ -354,6 +354,9 @@ pub struct QmdbForest {
     /// deactivated — they were abandoned and reused — so nothing names them but
     /// the cursor's low-water mark.
     min_cursor: u64,
+    /// Where the last [`Self::compute_operations`] spent its time: the move
+    /// to the parent (microseconds) and the apply's phases.
+    last_compute: (u64, n42_twig_core::qmdb_compat::ApplyPhases),
 }
 
 impl QmdbForest {
@@ -479,7 +482,15 @@ impl QmdbForest {
             dirty_slots: Vec::new(),
             dirty_slots_deduped: 0,
             min_cursor: next_slot,
+            last_compute: Default::default(),
         }
+    }
+
+    /// Where the last [`Self::compute_operations`] spent its time: the move
+    /// of the tree to the block's parent, in microseconds, and the apply's
+    /// phases (the hashing is `rehash_us` and `root_us`).
+    pub const fn last_compute(&self) -> (u64, n42_twig_core::qmdb_compat::ApplyPhases) {
+        self.last_compute
     }
 
     /// Records what a move touched: the slots the undo names, and how far back
@@ -688,12 +699,15 @@ impl QmdbForest {
     /// first; the node's builders hand a [`QmdbOps`] built as one.
     pub fn compute_operations(&mut self, parent: B256, ops: impl Into<QmdbOps>) -> Result<PreparedBlock, StateError> {
         let mut ops = ops.into();
+        let moved_at = std::time::Instant::now();
         self.move_to(parent)?;
+        let move_us = moved_at.elapsed().as_micros() as u64;
         if !ops.is_sorted() {
             ops.sort();
         }
         // Applied from the arena the record keeps: no clone of the block.
-        let (root, undo) = self.tree.apply_ops_recorded(&ops)?;
+        let (root, undo, phases) = self.tree.apply_ops_recorded_phased(&ops)?;
+        self.last_compute = (move_us, phases);
         self.note_move(&undo);
         let delta = self.delta_of_applied(&undo);
         self.pending = Some((parent, undo));

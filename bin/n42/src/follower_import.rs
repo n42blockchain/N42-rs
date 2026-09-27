@@ -2789,6 +2789,9 @@ where
             early_root.join().unwrap_or_else(|_| Err("the early QMDB root thread panicked".to_string()))?;
         root_wait_ms = wait_ms;
         if let Some(returned) = root_returned {
+            // Where the root spent its time (the forest's lock, the apply,
+            // the hashing, the filing, faults, the entry file's seals).
+            let split = qmdb.take_root_split(&block_hash).unwrap_or_default();
             tracing::info!(
                 target: "n42.follower_import",
                 number,
@@ -2796,6 +2799,17 @@ where
                 root_gap_us = began.saturating_duration_since(returned).as_micros() as u64,
                 root_wait_ms = wait_ms,
                 root_ms = ms_between(began, ended),
+                root_lock_wait_ms = split.lock_wait_ms,
+                root_lock_held_by = split.held_by,
+                root_move_ms = split.move_ms,
+                root_apply_ms = split.apply_ms,
+                root_hash_ms = split.hash_ms,
+                root_publish_ms = split.publish_ms,
+                root_faults = split.faults,
+                root_majflt = split.majflt,
+                root_twig_pool_misses = split.twig_pool_misses,
+                root_seals = split.seals,
+                root_seal_ms = split.seal_ms,
                 "build path: the root's start after the execution"
             );
         }

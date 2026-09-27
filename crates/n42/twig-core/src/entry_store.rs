@@ -49,6 +49,21 @@ const LEN_LEN: usize = 4;
 /// past the last sealed chunk are read from a tail buffer.
 const CHUNK_BYTES: usize = 256 << 20;
 
+/// Chunks sealed since the process started, and the microseconds their
+/// sealing took (the tail's write, the mapping), for a caller that wants
+/// to say how much of a QMDB root a seal was ([`seal_stats`]). The tree
+/// that seals is under its owner's lock, so a difference across one root
+/// is that root's.
+static SEALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SEAL_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many entry-file chunks have been sealed in this process, and the
+/// microseconds the seals took in all.
+pub fn seal_stats() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (SEALS.load(Relaxed), SEAL_US.load(Relaxed))
+}
+
 /// One sealed, populated mapping of `[start, start + len)` of the file.
 struct Chunk {
     start: u64,
@@ -283,6 +298,14 @@ impl FileEntries {
         if self.tail.is_empty() {
             return Ok(());
         }
+        let started = std::time::Instant::now();
+        let sealed = self.seal_tail_timed();
+        SEALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        SEAL_US.fetch_add(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        sealed
+    }
+
+    fn seal_tail_timed(&mut self) -> io::Result<()> {
         self.flush()?;
         // SAFETY: the mapping is read-only over bytes that `push` wrote
         // before this call and that nothing rewrites: the file is only ever

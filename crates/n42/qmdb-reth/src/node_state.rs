@@ -359,6 +359,11 @@ pub enum NodeStateError {
 
 struct Inner {
     forest: Mutex<Option<QmdbForest>>,
+    /// The label the forest's lock was last taken for ([`QmdbNodeState::lock_as`]),
+    /// read by a caller that has to wait to say whom it waited for.
+    forest_holder: Mutex<&'static str>,
+    /// The last roots' splits, by key ([`QmdbNodeState::take_root_split`]).
+    root_splits: Mutex<std::collections::VecDeque<(B256, RootSplit)>>,
     chain: Arc<ChainSpec>,
     dir: PathBuf,
     /// Where the delta log stands: the append cursor the next delta will be
@@ -402,6 +407,123 @@ struct Inner {
     compaction_phases: Mutex<[u64; 5]>,
 }
 
+/// A forest-lock wait or hold longer than this is logged at WARN
+/// (`forest lock waited` / `forest lock held`, with the holder's label).
+pub const FOREST_LOCK_WARN_MS: u64 = 20;
+
+/// How many roots' splits [`QmdbNodeState::take_root_split`] can still find.
+const ROOT_SPLITS_KEPT: usize = 32;
+
+/// The forest's lock, taken for a label ([`QmdbNodeState::lock_as`]); a
+/// hold over [`FOREST_LOCK_WARN_MS`] is logged when it is dropped.
+struct ForestGuard<'a> {
+    guard: MutexGuard<'a, Option<QmdbForest>>,
+    label: &'static str,
+    acquired: std::time::Instant,
+    waited_ms: u64,
+    held_by: &'static str,
+}
+
+impl std::ops::Deref for ForestGuard<'_> {
+    type Target = Option<QmdbForest>;
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for ForestGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl Drop for ForestGuard<'_> {
+    fn drop(&mut self) {
+        let ms = self.acquired.elapsed().as_millis() as u64;
+        if ms > FOREST_LOCK_WARN_MS {
+            warn!(target: "n42.qmdb", label = self.label, ms, "forest lock held");
+        }
+    }
+}
+
+/// Where one QMDB root spent its time ([`QmdbNodeState::take_root_split`]).
+/// The hashing of the touched twigs and the upper tree is `hash_ms`; the rest
+/// of the apply (leaf hashes, slot lookups, undo, retire, writes, index) is
+/// `apply_ms`. The faults are the computing thread's own (its pool's are not
+/// counted); `majflt` is the whole process's major faults over the root.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RootSplit {
+    /// Whether a root was computed (a block already held answers without).
+    pub computed: bool,
+    /// The wait for the forest's lock.
+    pub lock_wait_ms: u64,
+    /// The label that held the lock when the wait began ("" for none).
+    pub held_by: &'static str,
+    /// Standing the tree at the parent.
+    pub move_ms: u64,
+    /// The apply without its hashing.
+    pub apply_ms: u64,
+    /// Rehashing the touched twigs and the upper tree.
+    pub hash_ms: u64,
+    /// Filing the block's record (zero for a producer's compute).
+    pub publish_ms: u64,
+    /// Minor and major faults of the computing thread.
+    pub faults: u64,
+    /// Major faults of the whole process over the root.
+    pub majflt: u64,
+    /// Twigs opened without a pooled leaf tree.
+    pub twig_pool_misses: u64,
+    /// Entry-file chunks sealed during the root, and what they took.
+    pub seals: u64,
+    /// See `seals`.
+    pub seal_ms: u64,
+}
+
+/// The counters a [`RootSplit`] is the difference of.
+struct RootCounters {
+    thread_faults: u64,
+    process_majflt: u64,
+    twig_pool_misses: u64,
+    seals: u64,
+    seal_us: u64,
+}
+
+impl RootCounters {
+    fn now() -> Self {
+        let (seals, seal_us) = n42_twig_core::entry_store::seal_stats();
+        let (thread_faults, _) = rusage(libc::RUSAGE_THREAD);
+        let (_, process_majflt) = rusage(libc::RUSAGE_SELF);
+        Self {
+            thread_faults,
+            process_majflt,
+            twig_pool_misses: n42_twig_core::qmdb_compat::twig_pool_misses(),
+            seals,
+            seal_us,
+        }
+    }
+
+    fn finish(self, split: &mut RootSplit) {
+        let now = Self::now();
+        split.faults = now.thread_faults.saturating_sub(self.thread_faults);
+        split.majflt = now.process_majflt.saturating_sub(self.process_majflt);
+        split.twig_pool_misses = now.twig_pool_misses.saturating_sub(self.twig_pool_misses);
+        split.seals = now.seals.saturating_sub(self.seals);
+        split.seal_ms = now.seal_us.saturating_sub(self.seal_us) / 1000;
+    }
+}
+
+/// `getrusage(who)`: (minor + major faults, major faults); zeros if it fails.
+fn rusage(who: libc::c_int) -> (u64, u64) {
+    // SAFETY: `getrusage` writes one `rusage` into the zeroed struct it is given.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: as above; `who` is RUSAGE_SELF or RUSAGE_THREAD.
+    if unsafe { libc::getrusage(who, &mut usage) } != 0 {
+        return (0, 0);
+    }
+    let (minor, major) = (usage.ru_minflt.max(0) as u64, usage.ru_majflt.max(0) as u64);
+    (minor + major, major)
+}
+
 /// The delta log's position, as the node last left it.
 #[derive(Debug, Default, Clone, Copy)]
 struct PersistCursor {
@@ -442,7 +564,7 @@ impl Eq for QmdbNodeState {}
 
 impl std::fmt::Debug for QmdbNodeState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let forest = self.lock();
+        let forest = self.lock_as("fmt");
         f.debug_struct("QmdbNodeState")
             .field("dir", &self.inner.dir)
             .field("initialised", &forest.is_some())
@@ -464,6 +586,8 @@ impl QmdbNodeState {
         Self {
             inner: Arc::new(Inner {
                 forest: Mutex::new(None),
+                forest_holder: Mutex::new(""),
+                root_splits: Mutex::new(std::collections::VecDeque::new()),
                 chain,
                 dir: dir.into(),
                 persist: Mutex::new(PersistCursor::default()),
@@ -568,7 +692,7 @@ impl QmdbNodeState {
                     return self.release_reader_records();
                 }
                 Position::Next => {
-                    let changes = self.with_forest(|forest| {
+                    let changes = self.with_forest("on_persisted", |forest| {
                         forest.flush_entries_for_sync()?;
                         Ok(forest.block_changes(&hash).map(|changes| {
                             let raised = view.raise_floor(&changes);
@@ -602,7 +726,7 @@ impl QmdbNodeState {
             return;
         }
         if view.revert_to(number) {
-            let _ = self.with_forest(|forest| {
+            let _ = self.with_forest("on_unwound", |forest| {
                 forest.set_keep_from(Some(number + 1));
                 Ok(())
             });
@@ -657,7 +781,7 @@ impl QmdbNodeState {
     /// An invalid view needs no records kept: the forest goes back to its
     /// retention depth.
     fn release_reader_records(&self) {
-        let _ = self.with_forest(|forest| {
+        let _ = self.with_forest("release_reader_records", |forest| {
             forest.set_keep_from(None);
             Ok(())
         });
@@ -700,21 +824,82 @@ impl QmdbNodeState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn lock(&self) -> MutexGuard<'_, Option<QmdbForest>> {
-        self.inner
-            .forest
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    /// Takes the forest's lock for `label` (the caller, as the WARN lines
+    /// name it): a wait over [`FOREST_LOCK_WARN_MS`] is logged with the label
+    /// that held it, and so is a hold, when the guard is dropped.
+    fn lock_as(&self, label: &'static str) -> ForestGuard<'_> {
+        let asked = std::time::Instant::now();
+        let (guard, held_by) = match self.inner.forest.try_lock() {
+            Ok(guard) => (guard, ""),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => (poisoned.into_inner(), ""),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let held_by = *self.inner.forest_holder.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                (self.inner.forest.lock().unwrap_or_else(std::sync::PoisonError::into_inner), held_by)
+            }
+        };
+        let acquired = std::time::Instant::now();
+        let waited_ms = acquired.saturating_duration_since(asked).as_millis() as u64;
+        if waited_ms > FOREST_LOCK_WARN_MS {
+            warn!(target: "n42.qmdb", label, ms = waited_ms, held_by, "forest lock waited");
+        }
+        *self.inner.forest_holder.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = label;
+        ForestGuard { guard, label, acquired, waited_ms, held_by }
     }
 
-    /// Runs `f` on the forest, or fails if nothing has initialised it.
+    /// Runs `f` on the forest under the lock taken for `label`, or fails if
+    /// nothing has initialised it.
     fn with_forest<T>(
         &self,
+        label: &'static str,
         f: impl FnOnce(&mut QmdbForest) -> Result<T, StateError>,
     ) -> Result<T, NodeStateError> {
-        let mut guard = self.lock();
+        let mut guard = self.lock_as(label);
         let forest = guard.as_mut().ok_or(NodeStateError::Uninitialised)?;
         Ok(f(forest)?)
+    }
+
+    /// [`Self::with_forest`] for a QMDB root: `f` computes (and files) it
+    /// and says whether it computed anything and how long the filing took;
+    /// the split ([`RootSplit`]) is kept under `key` for
+    /// [`Self::take_root_split`].
+    fn with_forest_root<T>(
+        &self,
+        label: &'static str,
+        key: B256,
+        f: impl FnOnce(&mut QmdbForest) -> Result<(T, Option<u64>), StateError>,
+    ) -> Result<T, NodeStateError> {
+        let before = RootCounters::now();
+        let mut guard = self.lock_as(label);
+        let mut split = RootSplit { lock_wait_ms: guard.waited_ms, held_by: guard.held_by, ..RootSplit::default() };
+        let forest = guard.as_mut().ok_or(NodeStateError::Uninitialised)?;
+        let (value, publish_us) = f(forest)?;
+        if let Some(publish_us) = publish_us {
+            let (move_us, phases) = forest.last_compute();
+            split.computed = true;
+            split.move_ms = move_us / 1000;
+            split.apply_ms = (phases.sort_us + phases.leaves_us + phases.retire_us + phases.writes_us + phases.index_us) / 1000;
+            split.hash_ms = (phases.rehash_us + phases.root_us) / 1000;
+            split.publish_ms = publish_us / 1000;
+        }
+        drop(guard);
+        before.finish(&mut split);
+        let mut splits = self.inner.root_splits.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if splits.len() >= ROOT_SPLITS_KEPT {
+            splits.pop_front();
+        }
+        splits.push_back((key, split));
+        Ok(value)
+    }
+
+    /// Where the root last computed under `key` spent its time: the block's
+    /// hash for [`Self::insert_block_operations`] and
+    /// [`Self::validate_block_operations`], the parent's for
+    /// [`Self::compute_operations`]. Taken once; the last
+    /// [`ROOT_SPLITS_KEPT`] are kept.
+    pub fn take_root_split(&self, key: &B256) -> Option<RootSplit> {
+        let mut splits = self.inner.root_splits.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let at = splits.iter().rposition(|(k, _)| k == key)?;
+        splits.remove(at).map(|(_, split)| split)
     }
 
     /// Restores the trees for a database whose canonical head is `head`.
@@ -729,7 +914,7 @@ impl QmdbNodeState {
         // thing keeping it from deadlocking would be that initialisation
         // happens to finish before the canonical follower is spawned.
         let mut cursor = self.cursor();
-        let mut guard = self.lock();
+        let mut guard = self.lock_as("initialize");
         if guard.is_some() {
             return Ok(());
         }
@@ -988,7 +1173,7 @@ impl QmdbNodeState {
         if self.inner.entry_file {
             let forest = self.adopt_entry_file(forest, &mut cursor)?;
             info!(target: "n42.qmdb", block = expected_head.0, head = %expected_head.1, %root, "restored the QMDB forest from a portable snapshot");
-            *self.lock() = Some(self.configured(forest)?);
+            *self.lock_as("initialize_from_portable") = Some(self.configured(forest)?);
             return Ok(());
         }
         let snapshot = forest.snapshot()?;
@@ -1006,7 +1191,7 @@ impl QmdbNodeState {
             compacting: false,
         };
         info!(target: "n42.qmdb", block = expected_head.0, head = %expected_head.1, %root, "restored the QMDB forest from a portable snapshot");
-        *self.lock() = Some(self.configured(forest)?);
+        *self.lock_as("initialize_from_portable#2") = Some(self.configured(forest)?);
         Ok(())
     }
 
@@ -1059,20 +1244,22 @@ impl QmdbNodeState {
 
     /// Whether [`Self::initialize`] has run.
     pub fn is_initialized(&self) -> bool {
-        self.lock().is_some()
+        self.lock_as("is_initialized").is_some()
     }
 
     /// Computes the tree a block would have on `parent`, for a producer that
     /// will learn the block's hash only after sealing the root into it.
     pub fn compute(&self, parent: B256, changes: &BlockChanges) -> Result<PreparedBlock, NodeStateError> {
-        self.with_forest(|forest| forest.compute(parent, changes))
+        self.with_forest("compute", |forest| forest.compute(parent, changes))
     }
 
     /// [`Self::compute`] from leaf operations already built
     /// (`sorted_operations_from_execution`).
     pub fn compute_operations(&self, parent: B256, ops: impl Into<QmdbOps>) -> Result<PreparedBlock, NodeStateError> {
         let ops = ops.into();
-        self.with_forest(|forest| forest.compute_operations(parent, ops))
+        self.with_forest_root("compute_operations", parent, |forest| {
+            forest.compute_operations(parent, ops).map(|prepared| (prepared, Some(0)))
+        })
     }
 
     /// [`Self::validate_block`] from leaf operations already built.
@@ -1085,12 +1272,13 @@ impl QmdbNodeState {
         header_root: B256,
     ) -> Result<B256, NodeStateError> {
         let ops = ops.into();
-        self.with_forest(|forest| {
+        self.with_forest_root("validate_block_operations", block_hash, |forest| {
             if let Some(root) = forest.root_of(&block_hash) {
-                return Ok(root);
+                return Ok((root, None));
             }
             let prepared = forest.compute_operations(parent, ops)?;
             let root = prepared.root;
+            let filed = std::time::Instant::now();
             if root == header_root {
                 forest.insert(block_hash, number, prepared)?;
             } else {
@@ -1100,13 +1288,13 @@ impl QmdbNodeState {
                     "block's state root does not match its QMDB root",
                 );
             }
-            Ok(root)
+            Ok((root, Some(filed.elapsed().as_micros() as u64)))
         })
     }
 
     /// Files a producer's computed tree under the block it turned out to be.
     pub fn insert(&self, block_hash: B256, number: u64, prepared: PreparedBlock) -> Result<(), NodeStateError> {
-        self.with_forest(|forest| forest.insert(block_hash, number, prepared))
+        self.with_forest("insert", |forest| forest.insert(block_hash, number, prepared))
     }
 
     /// Computes a block's root and files its tree whatever its header says:
@@ -1121,14 +1309,15 @@ impl QmdbNodeState {
         ops: impl Into<QmdbOps>,
     ) -> Result<B256, NodeStateError> {
         let ops = ops.into();
-        self.with_forest(|forest| {
+        self.with_forest_root("insert_block_operations", block_hash, |forest| {
             if let Some(root) = forest.root_of(&block_hash) {
-                return Ok(root);
+                return Ok((root, None));
             }
             let prepared = forest.compute_operations(parent, ops)?;
             let root = prepared.root;
+            let filed = std::time::Instant::now();
             forest.insert(block_hash, number, prepared)?;
-            Ok(root)
+            Ok((root, Some(filed.elapsed().as_micros() as u64)))
         })
     }
 
@@ -1146,7 +1335,7 @@ impl QmdbNodeState {
         changes: &BlockChanges,
         header_root: B256,
     ) -> Result<B256, NodeStateError> {
-        self.with_forest(|forest| {
+        self.with_forest("validate_block", |forest| {
             if let Some(root) = forest.root_of(&block_hash) {
                 return Ok(root);
             }
@@ -1169,17 +1358,17 @@ impl QmdbNodeState {
     /// Files a computed block under the hash consensus sealed it with. See
     /// `QmdbForest::rename`.
     pub fn rename(&self, from: B256, to: B256) -> Result<(), NodeStateError> {
-        self.with_forest(|forest| forest.rename(from, to))
+        self.with_forest("rename", |forest| forest.rename(from, to))
     }
 
     /// The root of a block the forest holds, if it does.
     pub fn root_of(&self, block_hash: &B256) -> Option<B256> {
-        self.lock().as_ref()?.root_of(block_hash)
+        self.lock_as("root_of").as_ref()?.root_of(block_hash)
     }
 
     /// The canonical head the forest stands at.
     pub fn head(&self) -> Option<(u64, B256)> {
-        self.lock().as_ref().map(QmdbForest::head)
+        self.lock_as("head").as_ref().map(QmdbForest::head)
     }
 
     /// Advances the canonical head and persists its tree.
@@ -1209,7 +1398,7 @@ impl QmdbNodeState {
         // off this thread (`release_off_lock`): after a persistence batch it
         // is the whole batch, and freed under the lock it held every build's
         // and import's QMDB root for up to a second (BREAKTHROUGH_DESIGN 10.38).
-        let (number, ready, released) = self.with_forest(|forest| {
+        let (number, ready, released) = self.with_forest("on_canonical", |forest| {
             let released = forest.set_canonical_releasing(block_hash)?;
             Ok((forest.head().0, forest.take_block_deltas(cursor.head, cursor.next_slot, block_hash), released))
         })?;
@@ -1233,7 +1422,7 @@ impl QmdbNodeState {
             // The tree's move bookkeeping describes changes since the last
             // measured delta; what these deltas carried is measured now, and
             // any move that follows records itself afresh.
-            self.with_forest(|forest| {
+            self.with_forest("on_canonical#2", |forest| {
                 forest.forget_changes();
                 Ok(())
             })?;
@@ -1242,7 +1431,7 @@ impl QmdbNodeState {
             }
             return Ok(());
         }
-        let (delta, released) = self.with_forest(|forest| {
+        let (delta, released) = self.with_forest("on_canonical#3", |forest| {
             let released = forest.set_canonical_releasing(block_hash)?;
             Ok((forest.delta_since(cursor.next_slot)?, released))
         })?;
@@ -1281,7 +1470,7 @@ impl QmdbNodeState {
         if !self.inner.entry_file {
             return Ok(());
         }
-        let handle = self.with_forest(|forest| forest.flush_entries_for_sync())?;
+        let handle = self.with_forest("sync_entries_if_file", |forest| forest.flush_entries_for_sync())?;
         if let Some(handle) = handle {
             handle.sync_data().map_err(|source| NodeStateError::Io { path: self.entry_file_path(), source })?;
         }
@@ -1304,7 +1493,7 @@ impl QmdbNodeState {
             // and the next head asks again.
             return Ok(());
         }
-        let head = self.with_forest(|forest| Ok(forest.head()))?;
+        let head = self.with_forest("rewrite_checkpoint", |forest| Ok(forest.head()))?;
         let sealed_path = self.sealed_log_path();
         if sealed_path.exists() {
             // A compaction that failed left its segment behind (it is still
@@ -1483,7 +1672,7 @@ impl QmdbNodeState {
     ) -> Result<(), NodeStateError> {
         let started = std::time::Instant::now();
         if self.inner.entry_file {
-            let ckpt = self.with_forest(|forest| {
+            let ckpt = self.with_forest("checkpoint", |forest| {
                 forest.set_canonical(block_hash)?;
                 forest.sync_entries()?;
                 let ckpt = forest.checkpoint()?;
@@ -1509,7 +1698,7 @@ impl QmdbNodeState {
             );
             return Ok(());
         }
-        let snapshot = self.with_forest(|forest| {
+        let snapshot = self.with_forest("checkpoint#2", |forest| {
             forest.set_canonical(block_hash)?;
             let snapshot = forest.snapshot()?;
             // The changes are in the snapshot now, so the next delta must be
@@ -1550,15 +1739,15 @@ fn checkpoint_due(cursor: &PersistCursor) -> bool {
 
 impl StateProofProvider for QmdbNodeState {
     fn state_root(&self) -> B256 {
-        self.lock().as_ref().map(QmdbForest::root).unwrap_or_default()
+        self.lock_as("state_root").as_ref().map(QmdbForest::root).unwrap_or_default()
     }
 
     fn prove_account(&self, address: Address) -> Option<QmdbProof> {
-        self.lock().as_mut()?.prove_account(address)
+        self.lock_as("prove_account").as_mut()?.prove_account(address)
     }
 
     fn prove_storage(&self, address: Address, slot: B256) -> Option<QmdbProof> {
-        self.lock().as_mut()?.prove_storage(address, slot)
+        self.lock_as("prove_storage").as_mut()?.prove_storage(address, slot)
     }
 }
 
@@ -2198,7 +2387,7 @@ mod tests {
         restarted.initialize((40, parent)).unwrap();
         assert_eq!(restarted.head(), Some((40, parent)));
         assert_eq!(restarted.state_root(), root);
-        assert!(restarted.lock().as_ref().unwrap().has_entry_file());
+        assert!(restarted.lock_as("the_entry_file_restores_the_head_and_survives_a_torn_tail").as_ref().unwrap().has_entry_file());
         // A block after the restart appends to the same file and persists.
         let (hash41, root41) = advance(&restarted, 41, parent);
         drop(restarted);
@@ -2601,7 +2790,7 @@ mod tests {
         state.on_persisted(&[(11, hashes[11])]);
         let old_twelve = hashes[12];
         let changes = state
-            .with_forest(|forest| {
+            .with_forest("test", |forest| {
                 forest.flush_entries_for_sync()?;
                 Ok(forest.block_changes(&old_twelve))
             })

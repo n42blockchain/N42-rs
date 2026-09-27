@@ -1038,6 +1038,8 @@ pub struct ApplyPhases {
     pub index_us: u64,
     /// Rehashing the touched twigs, in parallel.
     pub rehash_us: u64,
+    /// The upper tree's refresh and the root read after the rehash.
+    pub root_us: u64,
 }
 
 /// Rehashes every twig marked in `dirty`, each independently of the others.
@@ -1298,6 +1300,15 @@ pub struct QmdbCompatTree {
 /// after a persistence batch evicts up to a few thousand at once; the rest
 /// go back to the caller ([`QmdbCompatTree::evict_twig_nodes_into`]).
 pub const TWIG_POOL_CAP: usize = 1024;
+
+/// Twigs opened with no leaf tree in the pool ([`TWIG_POOL_CAP`]): each is a
+/// fresh 128 KiB allocation under the tree's owner's lock.
+static TWIG_POOL_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many twigs this process opened without a pooled leaf tree.
+pub fn twig_pool_misses() -> u64 {
+    TWIG_POOL_MISSES.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 impl std::fmt::Debug for QmdbCompatTree {
     /// Summary only. The leaf set is the whole world state, so printing it would
@@ -1844,9 +1855,18 @@ impl QmdbCompatTree {
     /// arena ([`QmdbOps`]), which a block record keeps for a re-apply after
     /// a revert. Unsorted operations are sorted in a copy.
     pub fn apply_ops_recorded(&mut self, operations: &QmdbOps) -> Result<(Hash, BlockUndo), QmdbOperationError> {
+        self.apply_ops_recorded_phased(operations).map(|(root, undo, _)| (root, undo))
+    }
+
+    /// [`Self::apply_ops_recorded`], also answering where the apply spent
+    /// its time.
+    pub fn apply_ops_recorded_phased(
+        &mut self,
+        operations: &QmdbOps,
+    ) -> Result<(Hash, BlockUndo, ApplyPhases), QmdbOperationError> {
         self.start_undo_recording();
         match self.apply_ops_phased(operations) {
-            Ok((root, _)) => Ok((root, self.recording.take().unwrap_or_default())),
+            Ok((root, phases)) => Ok((root, self.recording.take().unwrap_or_default(), phases)),
             Err(error) => {
                 // A refused batch mutates nothing, so there is nothing to undo.
                 self.recording = None;
@@ -1952,7 +1972,10 @@ impl QmdbCompatTree {
         let at = std::time::Instant::now();
         rehash_dirty(&mut self.twigs, &dirty);
         phases.rehash_us = at.elapsed().as_micros() as u64;
-        Ok((self.root(), phases))
+        let at = std::time::Instant::now();
+        let root = self.root();
+        phases.root_us = at.elapsed().as_micros() as u64;
+        Ok((root, phases))
     }
 
     /// `set` for the block apply: the slot the key held already retired and
@@ -2152,7 +2175,11 @@ impl QmdbCompatTree {
         }
         let nulls = null_level();
         while self.twigs.len() <= twig_id {
-            self.twigs.push(Twig::new_in(&nulls, self.spare_twig_nodes.pop()));
+            let spare = self.spare_twig_nodes.pop();
+            if spare.is_none() {
+                TWIG_POOL_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.twigs.push(Twig::new_in(&nulls, spare));
         }
     }
 

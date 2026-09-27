@@ -410,6 +410,15 @@ pub mod open_wait {
         pub parent_root_ms: u64,
         /// Still missing: the wait for the parent's `Complete` and the look after it.
         pub parent_complete_ms: u64,
+        /// Opens that read the grandparent from its kept layer (its shards
+        /// under its residual, or its filed bundle) over the engine's state
+        /// at the great-grandparent instead of the grandparent in the engine
+        /// (`N42_GRANDPARENT_SHARDS`, [`super::leader_layers`]).
+        pub grandparent_layer: u32,
+        /// Opens whose grandparent layer was kept but whose great-grandparent
+        /// was not yet in the engine (a stall): they fell back to the wait
+        /// for the grandparent in the engine.
+        pub great_grandparent_missing: u32,
     }
 
     impl OpenWait {
@@ -429,18 +438,33 @@ pub mod open_wait {
         }
 
         /// `output/grandparent/parent_root/parent_complete` in ms, then the
-        /// grandparent's polls.
+        /// grandparent's polls, the opens on the grandparent's kept layer and
+        /// the great-grandparent's misses.
         pub fn split(&self) -> String {
             format!(
-                "{}/{}/{}/{} polls={}",
-                self.output_ms, self.grandparent_ms, self.parent_root_ms, self.parent_complete_ms, self.grandparent_polls
+                "{}/{}/{}/{} polls={} gp_layer={} ggp_missing={}",
+                self.output_ms,
+                self.grandparent_ms,
+                self.parent_root_ms,
+                self.parent_complete_ms,
+                self.grandparent_polls,
+                self.grandparent_layer,
+                self.great_grandparent_missing
             )
         }
     }
 
     thread_local! {
         static WAIT: Cell<OpenWait> = const {
-            Cell::new(OpenWait { output_ms: 0, grandparent_ms: 0, grandparent_polls: 0, parent_root_ms: 0, parent_complete_ms: 0 })
+            Cell::new(OpenWait {
+                output_ms: 0,
+                grandparent_ms: 0,
+                grandparent_polls: 0,
+                parent_root_ms: 0,
+                parent_complete_ms: 0,
+                grandparent_layer: 0,
+                great_grandparent_missing: 0,
+            })
         };
     }
 
@@ -600,10 +624,113 @@ pub fn opener_on_sealed_parent<C>(client: C, parent: SealedHeader, built_hash: B
 where
     C: StateProviderFactory + Send + Sync + 'static,
 {
+    opener_on_sealed_parent_with(client, parent, built_hash, leader_layers::enabled())
+}
+
+/// `N42_GRANDPARENT_SHARDS` (on by default; `0` turns it off): the chained
+/// build reads its grandparent -- this node's own block two seals back --
+/// from the layer the previous chained build opened its parent on (its frozen
+/// shards under its residual, or its filed bundle), over the engine's state at
+/// the great-grandparent, instead of waiting for the grandparent to reach the
+/// engine (BREAKTHROUGH_DESIGN 10.40: that hand-off comes after the
+/// grandparent's `Complete` and through the engine's loop, and in 22% of the
+/// builds of loop293 P100 it was not there yet at the parent's seal:
+/// `state_wait` 16-35 ms on the grandparent). The follower keeps the same two
+/// generations (`FOLLOWER_SHARDS` in `bin/n42/src/follower_import.rs`).
+///
+/// The store holds two blocks' layers: the one a build just opened its parent
+/// on, and that parent's parent -- the layer its own child will read as the
+/// grandparent. Keeping a new parent drops every other entry, so the
+/// great-grandparent's shards are released at the child's first open.
+pub mod leader_layers {
+    use super::*;
+    use std::{collections::VecDeque, sync::Mutex};
+
+    /// A block's post-state as a chained build reads it: the block under its
+    /// sealed header with the bundle (the residual over the shards, or the
+    /// filed full bundle), and the shards when it was filed as a shard set.
+    pub type Layer = (ExecutedParent, Option<Arc<crate::output_shards::FrozenShards>>);
+
+    static KEPT: Mutex<VecDeque<Layer>> = Mutex::new(VecDeque::new());
+
+    /// Whether chained builds read their grandparent from its kept layer.
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("N42_GRANDPARENT_SHARDS").map_or(true, |v| v.trim() != "0"))
+    }
+
+    /// Keeps `layer` (the parent a build just opened on) and its own parent's
+    /// layer, and releases every other block's.
+    pub fn keep(layer: &Layer) {
+        let hash = layer.0.recovered_block.hash();
+        let parent_hash = layer.0.recovered_block.header().parent_hash;
+        let released: Vec<Layer> = {
+            let mut kept = KEPT.lock().unwrap_or_else(|p| p.into_inner());
+            let (stay, released): (VecDeque<Layer>, VecDeque<Layer>) =
+                std::mem::take(&mut *kept).into_iter().partition(|(executed, _)| executed.recovered_block.hash() == parent_hash);
+            *kept = stay;
+            kept.push_back(layer.clone());
+            released.into_iter().filter(|(executed, _)| executed.recovered_block.hash() != hash).collect()
+        };
+        // The released shard sets (the last reference, usually) are dropped
+        // here, after the lock.
+        drop(released);
+    }
+
+    /// The kept layer of the block sealed as `hash`.
+    pub fn find(hash: B256) -> Option<Layer> {
+        KEPT.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .find(|(executed, _)| executed.recovered_block.hash() == hash)
+            .cloned()
+    }
+
+    /// How many blocks' layers are kept (at most two once the chain runs).
+    pub fn len() -> usize {
+        KEPT.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
+    /// `layers` (newest first) over `historical`: a block held as shards is a
+    /// [`crate::output_shards::ShardLayer`] with its residual overlaid on
+    /// top, consecutive bundles one overlay -- the follower's
+    /// `open_on_layers`.
+    pub fn open_on(historical: StateProviderBox, layers: &[Layer]) -> StateProviderBox {
+        let mut state = historical;
+        let mut pending: Vec<ExecutedParent> = Vec::new();
+        for (executed, shards) in layers.iter().rev() {
+            match shards {
+                None => pending.insert(0, executed.clone()),
+                Some(shards) => {
+                    if !pending.is_empty() {
+                        state = overlay_on_executed(state, std::mem::take(&mut pending));
+                    }
+                    let layer: StateProviderBox =
+                        Box::new(crate::output_shards::ShardLayer::new(state, Arc::clone(shards)));
+                    state = overlay_on_executed(layer, vec![executed.clone()]);
+                }
+            }
+        }
+        if pending.is_empty() { state } else { overlay_on_executed(state, pending) }
+    }
+}
+
+/// [`opener_on_sealed_parent`] with [`leader_layers::enabled`] given.
+fn opener_on_sealed_parent_with<C>(
+    client: C,
+    parent: SealedHeader,
+    built_hash: B256,
+    grandparent_layers: bool,
+) -> ParentStateOpener
+where
+    C: StateProviderFactory + Send + Sync + 'static,
+{
     // The parent as filed, and (`N42_OUTPUT_SHARDS`) the shard set its
     // residual is laid over, when the shards came before `StateReady`.
-    type Filed = (ExecutedParent, Option<Arc<crate::output_shards::FrozenShards>>);
+    type Filed = leader_layers::Layer;
     let filed: Arc<OnceLock<Filed>> = Arc::new(OnceLock::new());
+    // The grandparent's kept layer, looked up once at the first open.
+    let grandparent: Arc<OnceLock<Option<Filed>>> = Arc::new(OnceLock::new());
     Arc::new(move || {
         let (executed, shards) = match filed.get() {
             Some(filed) => filed.clone(),
@@ -633,12 +760,41 @@ where
                     .clone()
             }
         };
+        let parent_layer: Filed = (executed, shards);
+        let grandparent_layer = grandparent
+            .get_or_init(|| {
+                if !grandparent_layers {
+                    return None;
+                }
+                leader_layers::keep(&parent_layer);
+                leader_layers::find(parent.parent_hash)
+            })
+            .clone();
+        // The grandparent from its kept layer over the engine's state at the
+        // great-grandparent (three seals back, long committed); the engine's
+        // grandparent when no layer was kept or the great-grandparent is not
+        // in the engine yet (a stall: today's wait, counted).
+        if let Some(grandparent_layer) = grandparent_layer {
+            let great_grandparent = grandparent_layer.0.recovered_block.header().parent_hash;
+            match client.state_by_block_hash(great_grandparent) {
+                Ok(historical) => {
+                    open_wait::add(|wait| wait.grandparent_layer += 1);
+                    return Ok(leader_layers::open_on(historical, &[parent_layer, grandparent_layer]));
+                }
+                Err(reth_storage_api::errors::ProviderError::StateForHashNotFound(_)) => {
+                    open_wait::add(|wait| wait.great_grandparent_missing += 1);
+                    tracing::debug!(
+                        target: "payload_builder",
+                        number = parent.number,
+                        %great_grandparent,
+                        "the great-grandparent is not in the engine; the build opens on the engine's grandparent"
+                    );
+                }
+                Err(err) => return Err(err),
+            }
+        }
         let historical = grandparent_state(&client, parent.parent_hash, built_hash)?;
-        let historical: StateProviderBox = match shards {
-            Some(shards) => Box::new(crate::output_shards::ShardLayer::new(historical, shards)),
-            None => historical,
-        };
-        Ok(overlay_on_executed(historical, vec![executed]))
+        Ok(leader_layers::open_on(historical, &[parent_layer]))
     })
 }
 
@@ -1117,7 +1273,7 @@ mod tests {
                 crate::built_executions::state_ready(built_hash, execution);
             })
         };
-        let on_seal = opener_on_sealed_parent(grandparent_state(), sealed.clone(), built_hash)()
+        let on_seal = opener_on_sealed_parent_with(grandparent_state(), sealed.clone(), built_hash, false)()
             .expect("the parent's state opens once its output is filed");
         finish.join().expect("the finish thread");
         let ordinary = opener_on_built_parent(grandparent_state(), grandparent, executed_under_seal(&sealed, &execution))()
@@ -1132,7 +1288,7 @@ mod tests {
         assert_eq!(on_seal.block_hash(41).expect("read"), Some(sealed.hash()), "BLOCKHASH is the sealed hash");
         assert_eq!(on_seal.block_hash(41).expect("read"), ordinary.block_hash(41).expect("read"));
         // A second open (one per execution batch) reuses the filed parent.
-        let again = opener_on_sealed_parent(grandparent_state(), sealed, built_hash)().expect("opens again");
+        let again = opener_on_sealed_parent_with(grandparent_state(), sealed, built_hash, false)().expect("opens again");
         assert_eq!(again.basic_account(&sender).expect("read").map(|a| a.nonce), Some(5));
     }
 
@@ -1173,7 +1329,7 @@ mod tests {
             built_hash,
             crate::built_executions::ShardedParent { residual: execution.execution_output.clone(), shards },
         );
-        let on_shards = opener_on_sealed_parent(grandparent_state(), sealed.clone(), built_hash)()
+        let on_shards = opener_on_sealed_parent_with(grandparent_state(), sealed.clone(), built_hash, false)()
             .expect("the parent's state opens on its shards");
         let read = |address: Address| {
             on_shards.basic_account(&address).expect("read").map(|a| (a.nonce, a.balance))
@@ -1183,6 +1339,122 @@ mod tests {
         assert_eq!(read(untouched), Some((4, U256::from(40))), "the grandparent's");
         assert_eq!(read(Address::with_last_byte(0x44)), None);
         assert_eq!(on_shards.block_hash(42).expect("read"), Some(sealed.hash()), "BLOCKHASH is the sealed hash");
+    }
+
+    /// `N42_GRANDPARENT_SHARDS`, in index mode: a chain of three own blocks
+    /// -- the great-grandparent in the engine, the grandparent and the parent
+    /// each filed as index shards under a residual. The child's open through
+    /// both kept layers over the engine's great-grandparent must read what the
+    /// open through the parent's shards over the engine's *grandparent* reads:
+    /// an account only the grandparent wrote (and its slot), one only the
+    /// parent wrote, one both residuals touched, an untouched one and an
+    /// absent one.
+    #[test]
+    fn the_grandparents_shards_read_as_the_engines_grandparent() {
+        let from_gp = Address::with_last_byte(0x51);
+        let from_parent = Address::with_last_byte(0x52);
+        let coinbase = Address::with_last_byte(0x53);
+        let untouched = Address::with_last_byte(0x54);
+        let slot = B256::with_last_byte(7);
+        let great_grandparent = B256::with_last_byte(0x5a);
+        let info = |nonce: u64, balance: u64| AccountInfo { nonce, balance: U256::from(balance), ..Default::default() };
+        // The engine at the great-grandparent, and at the grandparent (the
+        // same plus the grandparent's writes): `MockEthProvider` answers any
+        // hash with its one state, so each stands for the engine at one block.
+        let engine_at_ggp = || {
+            let client = MockEthProvider::default();
+            client.add_account(from_gp, ExtendedAccount::new(1, U256::from(10)).extend_storage([(slot, U256::from(3))]));
+            client.add_account(from_parent, ExtendedAccount::new(3, U256::from(30)));
+            client.add_account(coinbase, ExtendedAccount::new(0, U256::from(1)));
+            client.add_account(untouched, ExtendedAccount::new(4, U256::from(40)));
+            client
+        };
+        let engine_at_gp = || {
+            let client = engine_at_ggp();
+            client.add_account(from_gp, ExtendedAccount::new(2, U256::from(20)).extend_storage([(slot, U256::from(9))]));
+            client.add_account(coinbase, ExtendedAccount::new(0, U256::from(2)));
+            client
+        };
+        let shards_of = |bundle: BundleState| {
+            let shards = crate::output_shards::OutputShards::with_index_live(Address::with_last_byte(0x01), 4, 16, true, true);
+            shards.add(bundle);
+            Arc::new(shards.freeze())
+        };
+        // One own block: sealed, its shards and residual filed.
+        let file = |number: u64, parent_hash: B256, batch: BundleState, residual: BundleState| {
+            let header = Header { number, parent_hash, gas_used: number * 1_000, ..Default::default() };
+            let execution = execution_of(&header, residual);
+            let built_hash = execution.block.hash();
+            let sealed = SealedHeader::seal_slow(Header { extra_data: format!("view {number}").into_bytes().into(), ..header });
+            crate::built_executions::remember_pending(built_hash, execution.block.clone());
+            crate::built_executions::shards_ready(
+                built_hash,
+                crate::built_executions::ShardedParent {
+                    residual: execution.execution_output.clone(),
+                    shards: shards_of(batch),
+                },
+            );
+            (sealed, built_hash)
+        };
+        let (gp_sealed, gp_built) = file(
+            51,
+            great_grandparent,
+            BundleState::builder(51..=51)
+                .state_original_account_info(from_gp, info(1, 10))
+                .state_present_account_info(from_gp, info(2, 20))
+                .state_storage(from_gp, [(U256::from(7), (U256::from(3), U256::from(9)))].into_iter().collect())
+                .build(),
+            BundleState::builder(51..=51)
+                .state_original_account_info(coinbase, info(0, 1))
+                .state_present_account_info(coinbase, info(0, 2))
+                .build(),
+        );
+        // The parent's build opened on the grandparent: that keeps its layer.
+        // (Each open follows its filing at once: the store of builds keeps
+        // three, and the crate's other tests file theirs in parallel.)
+        opener_on_sealed_parent_with(engine_at_ggp(), gp_sealed.clone(), gp_built, true)()
+            .expect("the grandparent's child opens");
+        assert!(leader_layers::find(gp_sealed.hash()).is_some(), "the grandparent's layer is kept");
+        let (p_sealed, p_built) = file(
+            52,
+            gp_sealed.hash(),
+            BundleState::builder(52..=52)
+                .state_original_account_info(from_parent, info(3, 30))
+                .state_present_account_info(from_parent, info(4, 31))
+                .build(),
+            BundleState::builder(52..=52)
+                .state_original_account_info(coinbase, info(0, 2))
+                .state_present_account_info(coinbase, info(0, 3))
+                .build(),
+        );
+        let _ = open_wait::take();
+        // The child: both layers over the engine's great-grandparent.
+        let layered = opener_on_sealed_parent_with(engine_at_ggp(), p_sealed.clone(), p_built, true)()
+            .expect("the child opens on the two layers");
+        let wait = open_wait::take();
+        assert_eq!((wait.grandparent_layer, wait.great_grandparent_missing), (1, 0), "{}", wait.split());
+        assert_eq!(wait.grandparent_ms, 0, "the engine's grandparent was not waited for");
+        assert!(leader_layers::len() <= 2, "two blocks' layers at most");
+        // Today's path: the parent's shards over the engine's grandparent.
+        let direct = opener_on_sealed_parent_with(engine_at_gp(), p_sealed.clone(), p_built, false)()
+            .expect("the child opens on the engine's grandparent");
+
+        let read = |state: &StateProviderBox, address: Address| {
+            state.basic_account(&address).expect("read").map(|a| (a.nonce, a.balance))
+        };
+        for address in [from_gp, from_parent, coinbase, untouched, Address::with_last_byte(0x55)] {
+            assert_eq!(read(&layered, address), read(&direct, address), "{address}: the layers read as the engine's grandparent");
+        }
+        assert_eq!(read(&layered, from_gp), Some((2, U256::from(20))), "the grandparent's write");
+        assert_eq!(read(&layered, from_parent), Some((4, U256::from(31))), "the parent's write");
+        assert_eq!(read(&layered, coinbase), Some((0, U256::from(3))), "the parent's residual over the grandparent's");
+        assert_eq!(read(&layered, untouched), Some((4, U256::from(40))), "the great-grandparent's");
+        let storage = |state: &StateProviderBox| state.storage(from_gp, slot).expect("read");
+        assert_eq!(storage(&layered), storage(&direct));
+        assert_eq!(storage(&layered), Some(U256::from(9)), "the grandparent's slot");
+        assert_eq!(layered.block_hash(52).expect("read"), Some(p_sealed.hash()), "BLOCKHASH of the parent");
+        assert_eq!(layered.block_hash(52).expect("read"), direct.block_hash(52).expect("read"));
+        assert_eq!(layered.block_hash(51).expect("read"), Some(gp_sealed.hash()), "BLOCKHASH of the grandparent");
     }
 
     #[test]
@@ -1197,7 +1469,7 @@ mod tests {
         open_wait::add(|wait| wait.parent_root_ms += 40);
         let wait = open_wait::take();
         assert_eq!(wait.label(), "grandparent");
-        assert_eq!(wait.split(), "3/150/40/0 polls=60");
+        assert_eq!(wait.split(), "3/150/40/0 polls=60 gp_layer=0 ggp_missing=0");
         assert_eq!(open_wait::take(), OpenWait::default());
     }
 }

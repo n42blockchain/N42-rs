@@ -489,3 +489,17 @@ build (1033: 14,000 transactions).
 It is after the windows, so the numbers above stand, but the mode is not sound until the new leader's first
 build (the path that does not seal early: the kept cache, `into_staged`, withdrawals put back) matches the
 direct graft's header. Then pacing 100 and 110 with the index.
+
+The handover read (ec04b9322): no state was wrong -- the followers refused the compact body ("13,000 of 14,000
+transactions not held here"), fetched the whole payload and rooted it with the MPT while the leader had sealed
+it with the frame tree, so no header variant matched; loop277 OFF had the same refusal once at 1348. Behind it,
+in shard mode the parent's roots start at its seal, and the slow roots that come every ~44 blocks (575-650 ms)
+hold the grandparent's hand-off to the engine (620 instead of ~40), so the chained build's 150 ms wait refused
+with "no state found for block <grandparent>" -- 1-3 times a leg in every S16/IDX leg, never with the flag off --
+and the view changes that followed left the followers with descriptions whose frames they did not hold. The fix
+waits for the parent's `Complete` when the grandparent is missing, records a description's claimed root before
+any refusal so a whole-payload conversion roots by the claim when the body reproduces it, and runs the merge
+after the QMDB root instead of beside it. Still open: after a refused chained build the leader's prepared build
+ends in "no payload build for id" ~5 s later (the actual stall), a separate defect. loop279: IDX (the handover
+check), then pacing 100, 110, 100.
+

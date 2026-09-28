@@ -1201,3 +1201,22 @@ is populated 32 MiB ahead of the cursor; the offsets grow by pre-touched 8 MiB s
 grow on the pool. The bench (200 blocks of 163k on jemalloc): the apply 8.5 / 9.6 / 38 -> 7.3 / 7.9 / 11 ms
 (median / p90 / max), faults 12 / 1,900 / 3,000 -> 0 / 2-7 / 640-1,900, blocks over 50 faults 81-86 -> 3-6 of
 180. loop302: three P100 legs and a P90 with 32 build threads.
+
+### 10.49 Defect 25 on the fleet (loop302): the median root faults nothing; one root in five still faults its append
+
+| leg | win1 | cycle mean / median | roots median / p90 | root faults median / p90 | append faults | twig misses | sealed_at / p90 | follower fields | imports > 600 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| F100 (slow kind, gate 22 ms) | 1,088,945 | 149 / 136 | 32 / 67 | 17 / 1,610 | 11 | 0 | 84 / 148 | 103 | 15 |
+| F100b | 1,166,082 | 140 / 132 | 32 / 59 | 11 / 1,553 | 6 | 0 | 83 / 131 | 95 | 7 |
+| F100c | 1,121,981 | 145 / 136 | 33 / 71 | 23 / 1,866 | 7 | 0 | 87 / 156 | 101 | 19 |
+| F90 | 1,171,063 | 138 / 127 | 32-33 / 70 | 12 / 1,569 | 5 | 0 | 84 / 135 | 97 | 2 |
+
+The twig pool never misses and the median root faults 11-23 times, but the p90 is 1,550-1,870: on F100b, 148 of
+750 roots fault ~1,456 times, 1,070 of them in the append (`root_append_faults` 7 -> 1,070), and those roots
+take 44 against 31 (`root_apply` 15 -> 20). ~1,070 faults is a block's entries (163k x ~26 bytes = 4.2 MB of
+4 KiB pages): in those blocks the append region was not populated ahead -- the faulting blocks come in bursts
+(gaps of 1-2 blocks), which reads as the populate falling behind: it shares a thread with the twig refills
+(80 trees a block) and the undo lists' cleaning, and after a chunk seal the window starts again. The fix is
+the populate on its own thread with a wider margin (populate 64 MiB when under 32 MiB remain, before the
+append, never after), and a counter for "the append ran past the populated window". The windows (1,089-1,171k)
+are within the noise of the plateau; the cycle's mean 138-149 is the tail as before.

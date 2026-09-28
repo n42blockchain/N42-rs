@@ -1191,3 +1191,13 @@ those faults are expensive (the reclaim storm, 4 KB fallbacks). The tail's fix i
 thread: the twig pool topped up ahead on the release thread, the entry file's append region populated ahead of
 the cursor. The leader's per-block chain is then ~84 flat and the followers' ~96, both under the pacing, and the
 cycle would follow the tick (~105: 1.55M/s) instead of its tail.
+
+Defect 25, read and fixed off the fleet (5ce67ed06..081e0183d): the root's faults were the structural writes --
+the leaves into fresh 128 KiB twig trees (79-80 pool misses a block for 30 of every 44 blocks: the pool refilled
+only at a batch's head move), the undo record's lists (5.2 + 1.3 MB) doubling into returned pages, the offsets
+`Vec` doubling (17-38 ms applies with few faults), the append buffer while the first chunk fills. A prefault
+thread keeps a pool of pre-touched twig trees at a floor (512) and recycles the undo lists; the append buffer
+is populated 32 MiB ahead of the cursor; the offsets grow by pre-touched 8 MiB segments; the key index's shards
+grow on the pool. The bench (200 blocks of 163k on jemalloc): the apply 8.5 / 9.6 / 38 -> 7.3 / 7.9 / 11 ms
+(median / p90 / max), faults 12 / 1,900 / 3,000 -> 0 / 2-7 / 640-1,900, blocks over 50 faults 81-86 -> 3-6 of
+180. loop302: three P100 legs and a P90 with 32 build threads.

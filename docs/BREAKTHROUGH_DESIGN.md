@@ -1086,3 +1086,16 @@ occupant: anything else that needs the forest (a head move, a persistence step, 
 same node) waits behind ~22 ms of apply. The cycle's mean (133-135) against its median (116-118) is still
 16%: with the seal's and the imports' tails both cut, what is late in the slow cycles has to be read from the
 cycle itself -- per block, which of the leader's seal, the followers' fields or the vote's transit is late.
+
+### 10.44 The slow cycles read (loop295 P100c): two chains' variance against a 100 ms pacing
+
+Window 1's cycle: p25 103.5, median 120, p75 157, p90 177, p99 250, max 337; 67 of 221 over 150. The slow
+cycles are two classes of near-equal weight: (a) the tick came and the leader's own block was not sealed
+(`take_sealed_us` 77-108 ms in those views: the seal chain's p75-p90 is over the pacing), and (b) the quorum
+ran long (B 82 median, up to 253) because one follower's vote waited -- its vote delay tracks how far behind
+its import pipeline is (r = 0.65), and the followers are systematically 164-205 ms behind on *finishing* the
+parent's import when the new body arrives (the fields come earlier, at ~103, but their tail does not). Forest
+lock holds, QMDB releases and TCs appear near 5 of the 15 slowest and do not scale with the cycle. **The tail
+is the variance of two ~95-105 ms chains against a 100 ms pacing**: the median fits, the p75 does not. The
+cheap experiment first: the pacing at 110-120 so both chains' p90 fit under it (loop290's 70-90 were the
+other direction, before the chains were cut) -- a flat cycle of ~120 would beat a 120-median with a 133 mean.

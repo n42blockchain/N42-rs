@@ -1067,3 +1067,22 @@ root_faults root_majflt root_twig_pool_misses root_seals root_seal_ms`). Still a
 the offsets/twigs `Vec`s doubling under the lock (1-2 GB copies, once or twice a leg), `move_to` off the
 parent, writeback stalls on the seal, page-cache misses on entry keys, the follower's one-root-at-a-time
 cascade. loop295 measures.
+
+### 10.43 Defect 24 on the fleet (loop295): the seals 2-3 ms, the slow imports a quarter; the cycle's mean still 133-135
+
+| leg | win1 | cycle mean / median (w1) | sealed_at median / p90 / over 130 | roots median / p90 | root seals (count, ms) | forest-lock WARNs | imports > 600 ms | follower fields | win2 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| P100 | 1,196,934 | 135 / 116 | 89 / 130 / 115 | 34 / 60 | 81, 3 | 3,879 | 15 | 103 | 841k |
+| P100b | 1,203,637 | 134 / 117 | 90 / 131 / 118 | 33-34 / 61 | 78, 2 | 4,194 | 15 | 106 | 879k |
+| P100c | 1,223,578 | 133 / 118 | 91 / 124 / 102 | 34 / 57 | 80, 2 | 3,601 | 12 | 102 | 847k |
+| P90 | 1,119,735 | 144 / 133 | 91 / 152 / 182 | 35 / 76 | 78, 3 | 4,991 | 6 | 110 | 830k |
+
+The chunk seals are 2-3 ms now (78-81 a leg), the imports over 600 ms fell from 26-58 to 6-15, the seal's
+p90 to 124-131 and the roots' p90 to 57-61; the windows are 1,197-1,224k at pacing 100 (the record 1,226k
+stands, within the noise). The lock's holders, named: `insert_block_operations` holds the forest lock 21-26 ms
+on every block -- the root's apply runs under it -- and `compute_operations` 21-23; 3,600-5,000 WARNs a leg
+are those two at their normal length, so the threshold is under the normal hold and the apply is the lock's
+occupant: anything else that needs the forest (a head move, a persistence step, the other side's root on the
+same node) waits behind ~22 ms of apply. The cycle's mean (133-135) against its median (116-118) is still
+16%: with the seal's and the imports' tails both cut, what is late in the slow cycles has to be read from the
+cycle itself -- per block, which of the leader's seal, the followers' fields or the vote's transit is late.

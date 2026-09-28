@@ -99,6 +99,65 @@ fn populate_off_lock(map: &std::sync::Arc<memmap2::Mmap>) {
     let _ = map;
 }
 
+/// Where each slot's record starts, in segments of
+/// [`crate::prefault::OFFSET_SEGMENT_SLOTS`] slots instead of one `Vec`: a
+/// `Vec` of a hundred million offsets grows by doubling, a copy of up to a
+/// gigabyte into fresh pages inside one block's apply, under the tree's lock
+/// (BREAKTHROUGH_DESIGN 10.42). A segment is 8 MiB, taken already faulted in
+/// from the prefault thread.
+#[derive(Clone, Default)]
+struct Offsets {
+    segments: Vec<Box<[u64]>>,
+    len: usize,
+}
+
+impl Offsets {
+    const BITS: u32 = crate::prefault::OFFSET_SEGMENT_BITS;
+    const MASK: usize = crate::prefault::OFFSET_SEGMENT_SLOTS - 1;
+
+    fn from_vec(offsets: Vec<u64>) -> Self {
+        let mut out = Self::default();
+        for offset in offsets {
+            out.push(offset);
+        }
+        out
+    }
+
+    const fn len(&self) -> usize {
+        self.len
+    }
+
+    fn get(&self, slot: usize) -> Option<u64> {
+        (slot < self.len).then(|| self.segments[slot >> Self::BITS][slot & Self::MASK])
+    }
+
+    fn push(&mut self, offset: u64) {
+        let slot = self.len;
+        if slot >> Self::BITS == self.segments.len() {
+            self.segments.push(crate::prefault::take_offset_segment());
+        }
+        self.segments[slot >> Self::BITS][slot & Self::MASK] = offset;
+        self.len += 1;
+    }
+
+    fn truncate(&mut self, len: usize) {
+        if len >= self.len {
+            return;
+        }
+        self.len = len;
+        self.segments.truncate(len.div_ceil(crate::prefault::OFFSET_SEGMENT_SLOTS));
+    }
+}
+
+impl std::ops::Index<usize> for Offsets {
+    type Output = u64;
+
+    fn index(&self, slot: usize) -> &u64 {
+        assert!(slot < self.len, "offset {slot} past {} slots", self.len);
+        &self.segments[slot >> Self::BITS][slot & Self::MASK]
+    }
+}
+
 /// The append-only entry file, mapped for reads.
 pub(crate) struct FileEntries {
     path: PathBuf,
@@ -114,10 +173,15 @@ pub(crate) struct FileEntries {
     tail: Vec<u8>,
     /// How many bytes of `tail` the file already holds.
     written: usize,
+    /// The tail buffer's address when `populated` was last set, and how
+    /// many of its bytes are populated or asked to be
+    /// ([`Self::populate_ahead`]).
+    populated_base: usize,
+    populated: usize,
     /// Bytes of the file that belong to slots.
     len_bytes: u64,
     /// Where each slot's record starts.
-    offsets: Vec<u64>,
+    offsets: Offsets,
     /// One bit per slot.
     active: Vec<u64>,
 }
@@ -147,8 +211,10 @@ impl FileEntries {
             sealed_len: 0,
             tail: Vec::new(),
             written: 0,
+            populated_base: 0,
+            populated: 0,
             len_bytes: 0,
-            offsets: Vec::new(),
+            offsets: Offsets::default(),
             active: Vec::new(),
         })
     }
@@ -193,8 +259,10 @@ impl FileEntries {
             sealed_len: 0,
             tail: Vec::new(),
             written: 0,
+            populated_base: 0,
+            populated: 0,
             len_bytes,
-            offsets,
+            offsets: Offsets::from_vec(offsets),
             active: vec![0u64; (kept as usize).div_ceil(64)],
         };
         for (word, bits) in store.active.iter_mut().zip(active) {
@@ -246,7 +314,7 @@ impl FileEntries {
 
     fn record(&self, slot: usize) -> &[u8] {
         let start = self.offsets[slot];
-        let end = self.offsets.get(slot + 1).copied().unwrap_or(self.len_bytes);
+        let end = self.offsets.get(slot + 1).unwrap_or(self.len_bytes);
         if start >= self.sealed_len {
             let s = (start - self.sealed_len) as usize;
             let e = (end - self.sealed_len) as usize;
@@ -266,7 +334,7 @@ impl FileEntries {
 
     /// Where `slot`'s record starts in the file.
     pub(crate) fn offset(&self, slot: usize) -> Option<u64> {
-        self.offsets.get(slot).copied()
+        self.offsets.get(slot)
     }
 
     pub(crate) fn key(&self, slot: usize) -> Hash {
@@ -307,6 +375,7 @@ impl FileEntries {
         if self.tail.capacity() < CHUNK_BYTES {
             self.tail.reserve_exact(CHUNK_BYTES.max(record_len) - self.tail.len());
         }
+        self.populate_ahead();
         self.tail.extend_from_slice(key);
         self.tail.extend_from_slice(&(value.len() as u32).to_le_bytes());
         self.tail.extend_from_slice(value);
@@ -317,6 +386,29 @@ impl FileEntries {
         self.set_active(slot, true);
         self.len_bytes += record_len as u64;
         Ok(())
+    }
+
+    /// Asks the prefault thread to populate the tail buffer's pages ahead of
+    /// the append cursor (`N42_QMDB_APPEND_AHEAD_MB`), half a window before
+    /// the cursor reaches the populated edge, so the appends a block's apply
+    /// makes never fault. The buffer is reused chunk after chunk, so once it
+    /// has been populated to its capacity nothing more is asked until it is
+    /// reallocated.
+    fn populate_ahead(&mut self) {
+        let ahead = crate::prefault::append_ahead_bytes();
+        if ahead == 0 {
+            return;
+        }
+        let base = self.tail.as_ptr() as usize;
+        if base != self.populated_base {
+            self.populated_base = base;
+            self.populated = self.tail.len();
+        }
+        let want = (self.tail.len() + ahead).min(self.tail.capacity());
+        if self.populated < self.tail.len() + ahead / 2 && self.populated < want {
+            crate::prefault::populate_write(base + self.populated, want - self.populated);
+            self.populated = want;
+        }
     }
 
     /// Writes the tail's unwritten bytes to the file, in one call.
@@ -397,11 +489,14 @@ impl FileEntries {
             let keep = self.chunks.partition_point(|chunk| chunk.start < new_len_bytes);
             let cut = &self.chunks[keep - 1];
             let within = (new_len_bytes - cut.start) as usize;
-            let mut bytes = cut.map[..within].to_vec();
             let start = cut.start;
+            // Into the tail's own buffer, whose pages are faulted in
+            // already: a fresh one would be reserved, and faulted, by the
+            // next append, inside a block's apply.
+            self.tail.clear();
+            self.tail.extend_from_slice(&cut.map[..within]);
             self.chunks.truncate(keep - 1);
             self.sealed_len = start;
-            std::mem::swap(&mut self.tail, &mut bytes);
             // The chunk's bytes are on disk already.
             self.written = self.tail.len();
         }
@@ -411,7 +506,7 @@ impl FileEntries {
 
     /// Reserves room for `additional` more slots' bookkeeping.
     pub(crate) fn reserve(&mut self, additional: usize) {
-        self.offsets.reserve(additional);
+        // The offsets grow a segment at a time (`Offsets`).
         self.active.reserve(additional.div_ceil(64));
     }
 
@@ -436,6 +531,8 @@ impl FileEntries {
             sealed_len: self.sealed_len,
             tail: self.tail.clone(),
             written: self.written,
+            populated_base: 0,
+            populated: 0,
             len_bytes: self.len_bytes,
             offsets: self.offsets.clone(),
             active: self.active.clone(),

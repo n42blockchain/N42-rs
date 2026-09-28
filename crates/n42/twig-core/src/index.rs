@@ -211,6 +211,18 @@ impl TagIndex {
     /// Room for `additional` more keys, spread evenly over the shards.
     pub(crate) fn reserve(&mut self, additional: usize) {
         let per = additional / SHARDS + 1;
+        // On the worker pool: the keys spread evenly over the shards, so the
+        // shards cross their load bound together and a growth rebuilds the
+        // whole index in one block -- in sequence on the applying thread, and
+        // with every fresh table's pages faulted there, it was the apply's
+        // longest hold in the block it happened. Each shard's table depends
+        // only on its own keys, so the result is the same either way.
+        #[cfg(feature = "rayon")]
+        {
+            use rayon::prelude::*;
+            self.shards.par_iter_mut().for_each(|shard| shard.ensure_capacity(shard.len + per));
+        }
+        #[cfg(not(feature = "rayon"))]
         for shard in &mut self.shards {
             shard.ensure_capacity(shard.len + per);
         }

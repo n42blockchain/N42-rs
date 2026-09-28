@@ -1136,3 +1136,7 @@ consumes what the flood delivers, ~1.2M/s, and the flood is the wall** -- its ge
 its 17 cores, ~70k signatures a second a core) tops out where the fleet now is. The pre-generated set
 (`/data/n42-pregen/o900000`, 192M transactions, made for this in 10.x when the generator was reply-bound and
 not yet the term) is the next leg: replay at 1.6-1.9M with 200-250k blocks.
+
+loop298 did not run: the flood refuses to replay a set made for other arguments -- `o900000` was generated
+before the attested frames (no gateway key), and the attestation is baked into a set's frames. A set with the
+gateway key (`g900000`) is generated first in loop299's launcher, then the same four legs.

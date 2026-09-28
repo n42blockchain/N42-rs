@@ -1053,3 +1053,17 @@ second-long roots a leg (the leader had them too: 10.38's `roots_ms` 975) each c
 more, which is the mean's 135 against the median's 116. What holds a root for a second when the records are
 no longer freed under the forest lock is the next read: the lock's other holders (the head move itself, the
 journal hold, the read view's advance, the persistence batch) timed and named.
+
+Defect 24, read (28f0a5076): the slow roots land on the same blocks on every node -- 834, 877, 921, 964, 1007,
+1051, ... -- a period of ~44 blocks, and what repeats every 44 blocks is the entry file sealing a 256 MiB chunk
+inside the block's own append, under the forest lock: the append that crossed the chunk first doubled the write
+buffer (a 256 MiB copy into 512 MiB of fresh pages, under direct compaction), then wrote the pending bytes and
+mapped the chunk with `MAP_POPULATE` (65,536 page faults, read back from disk once the reclaim storm has dropped
+them). The fix reserves the buffer once at the chunk size and seals before the record that would not fit, and
+maps a chunk sealed while the tree grows without populate, faulting it in by `MADV_POPULATE_READ` on its own
+thread. Every forest-lock acquisition is now labelled and timed (WARN over 20 ms held or waited), and the root
+split named (`root_lock_wait_ms root_lock_held_by root_move_ms root_apply_ms root_hash_ms root_publish_ms
+root_faults root_majflt root_twig_pool_misses root_seals root_seal_ms`). Still able to hold a root over 50 ms:
+the offsets/twigs `Vec`s doubling under the lock (1-2 GB copies, once or twice a leg), `move_to` off the
+parent, writeback stalls on the seal, page-cache misses on entry keys, the follower's one-root-at-a-time
+cascade. loop295 measures.

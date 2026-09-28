@@ -1220,3 +1220,13 @@ take 44 against 31 (`root_apply` 15 -> 20). ~1,070 faults is a block's entries (
 the populate on its own thread with a wider margin (populate 64 MiB when under 32 MiB remain, before the
 append, never after), and a counter for "the append ran past the populated window". The windows (1,089-1,171k)
 are within the noise of the plateau; the cycle's mean 138-149 is the tail as before.
+
+The follow-up (9a384bed4): the append buffer is anonymous heap memory (a 256 MiB jemalloc `Vec` reused for every
+chunk) and the populate never restarts after the first chunk -- so ~1,070 faults in a root after block 44 mean
+the pages were *taken back*, not outrun. **The host's swap is full** (`/swap.img` 8 GB, 116 KiB free, swappiness
+60; the "swap empty" host rule of the campaign is broken), so anonymous pages are swapped out under the thp:always
+heaps' pressure and a swap-cache hit is a minor fault -- which fits `root_majflt` 0 and the bursts without a
+period. `mlock` is out (`ulimit -l` 8 MiB). The populate now runs on its own thread with a 64 MiB window, and
+`root_append_behind` / `populate_lag_mb` on the root lines tell "outrun" from "taken back" (behind 0 with
+append faults = taken back). The swap needs emptying on the host (`swapoff -a`, root) before the next legs are
+comparable to the plateau's.

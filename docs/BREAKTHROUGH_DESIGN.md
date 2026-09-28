@@ -1119,3 +1119,20 @@ around them (the road, the tick, the transit, the vote, B's 25). **Section 6 is 
 larger blocks amortise the fixed costs and the chains' tails -- `--gasceil` sets the genesis gas limit, so
 250k-transaction blocks (5.25 G gas) at a ~140 ms cycle would be 1.8M/s if the supply and the memory-bound
 terms scale (they are linear in the accounts touched: 10.14, `docs/BLOCK_SHAPE_SURVEY.md`).
+
+### 10.46 Larger blocks (loop297): the fleet reads 1.16-1.19M whatever the block, because the supply is ~1.2M/s
+
+| leg | block | offer | pacing | win1 | cycle mean / median | occupancy / full | queued | leader sealed_at / par_exec / roots | follower fields / exec / root | win2 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| G200 | 200k | 1.6M | 115 | 1,165,292 | 168 / 156 | 97.4% / 157 of 179 | 738k | 109 / 49 / 41 | 133 / 56 / 41 | 839k |
+| G250 | 250k | 1.9M | 130 | 1,193,146 | 176 / 153 | 84.1% / 83 of 170 | 697k | 132 / 60 / 44-49 | 158 / 71 / 48 | 790k |
+| G250b | 250k | 1.9M | 130 | 1,165,283 | 185 / 162 | 86.2% / 83 of 162 | 708k | 133 / 62 / 46-50 | 164 / 73 / 49 | 849k |
+| G300 | 300k | 2.2M | 150 | 1,161,436 | 192 / 155 | 74.1% / 48 of 156 | 678k | 135 / 52 / 41-62 | 182 / 80 / 57 | 889k |
+
+The chains scale as the shape survey said (the leader's execution 39 -> 49 / 60 / 52, the seal 89 -> 109 /
+132 / 135; the followers' fields 103 -> 133 / 158 / 182), the blocks are not full (84-86% at 250k, 74% at
+300k, the queue under the gate line at 678-738k) and the window is 1,161-1,193k in every leg: **the fleet
+consumes what the flood delivers, ~1.2M/s, and the flood is the wall** -- its generation (Ed25519 signing on
+its 17 cores, ~70k signatures a second a core) tops out where the fleet now is. The pre-generated set
+(`/data/n42-pregen/o900000`, 192M transactions, made for this in 10.x when the generator was reply-bound and
+not yet the term) is the next leg: replay at 1.6-1.9M with 200-250k blocks.

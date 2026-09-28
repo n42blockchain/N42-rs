@@ -171,6 +171,8 @@ fn root_faults() {
         prep.0, prep.1, prep.2, writes.0, writes.1, writes.2, hash.0, hash.1, hash.2,
         n42_twig_core::qmdb_compat::twig_pool_refills() - refills_before,
     );
+    let (behind, lag) = n42_twig_core::prefault::append_populate_stats();
+    println!("appends past the populate's edge {behind}; populate lag at the end {} MiB", lag >> 20);
     drop(forest);
     let _ = std::fs::remove_file(&path);
 }

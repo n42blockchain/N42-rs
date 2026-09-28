@@ -479,6 +479,12 @@ pub struct RootSplit {
     /// The computing thread's faults in the apply's structural writes (the
     /// entry appends, the new twigs, the leaves), part of `faults`.
     pub append_faults: u64,
+    /// Records the root appended into entry-file buffer pages the populate
+    /// thread had not reached yet.
+    pub append_behind: u64,
+    /// How far the append populate is behind the window last asked for, in
+    /// MiB, when the root finished.
+    pub populate_lag_mb: u64,
     /// Entry-file chunks sealed during the root, and what they took.
     pub seals: u64,
     /// See `seals`.
@@ -491,6 +497,7 @@ struct RootCounters {
     process_majflt: u64,
     twig_pool_misses: u64,
     twig_pool_refills: u64,
+    append_behind: u64,
     seals: u64,
     seal_us: u64,
 }
@@ -505,6 +512,7 @@ impl RootCounters {
             process_majflt,
             twig_pool_misses: n42_twig_core::qmdb_compat::twig_pool_misses(),
             twig_pool_refills: n42_twig_core::qmdb_compat::twig_pool_refills(),
+            append_behind: n42_twig_core::prefault::append_populate_stats().0,
             seals,
             seal_us,
         }
@@ -516,6 +524,8 @@ impl RootCounters {
         split.majflt = now.process_majflt.saturating_sub(self.process_majflt);
         split.twig_pool_misses = now.twig_pool_misses.saturating_sub(self.twig_pool_misses);
         split.twig_pool_refills = now.twig_pool_refills.saturating_sub(self.twig_pool_refills);
+        split.append_behind = now.append_behind.saturating_sub(self.append_behind);
+        split.populate_lag_mb = (n42_twig_core::prefault::append_populate_stats().1 >> 20) as u64;
         split.seals = now.seals.saturating_sub(self.seals);
         split.seal_ms = now.seal_us.saturating_sub(self.seal_us) / 1000;
     }

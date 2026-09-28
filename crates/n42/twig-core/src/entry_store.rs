@@ -178,6 +178,11 @@ pub(crate) struct FileEntries {
     /// ([`Self::populate_ahead`]).
     populated_base: usize,
     populated: usize,
+    /// The append epoch the populate's progress is matched against
+    /// (`prefault::note_append`): new with every buffer and every seal.
+    populate_epoch: u64,
+    /// The cursor when a window was last asked for.
+    populate_asked_at: usize,
     /// Bytes of the file that belong to slots.
     len_bytes: u64,
     /// Where each slot's record starts.
@@ -213,6 +218,8 @@ impl FileEntries {
             written: 0,
             populated_base: 0,
             populated: 0,
+            populate_epoch: 0,
+            populate_asked_at: 0,
             len_bytes: 0,
             offsets: Offsets::default(),
             active: Vec::new(),
@@ -261,6 +268,8 @@ impl FileEntries {
             written: 0,
             populated_base: 0,
             populated: 0,
+            populate_epoch: 0,
+            populate_asked_at: 0,
             len_bytes,
             offsets: Offsets::from_vec(offsets),
             active: vec![0u64; (kept as usize).div_ceil(64)],
@@ -376,6 +385,7 @@ impl FileEntries {
             self.tail.reserve_exact(CHUNK_BYTES.max(record_len) - self.tail.len());
         }
         self.populate_ahead();
+        crate::prefault::note_append(self.populate_epoch, self.tail.len() + record_len);
         self.tail.extend_from_slice(key);
         self.tail.extend_from_slice(&(value.len() as u32).to_le_bytes());
         self.tail.extend_from_slice(value);
@@ -388,26 +398,43 @@ impl FileEntries {
         Ok(())
     }
 
-    /// Asks the prefault thread to populate the tail buffer's pages ahead of
-    /// the append cursor (`N42_QMDB_APPEND_AHEAD_MB`), half a window before
-    /// the cursor reaches the populated edge, so the appends a block's apply
-    /// makes never fault. The buffer is reused chunk after chunk, so once it
-    /// has been populated to its capacity nothing more is asked until it is
-    /// reallocated.
+    /// Asks the append populate thread to populate the tail buffer's pages
+    /// ahead of the append cursor (`N42_QMDB_APPEND_AHEAD_MB`), so the
+    /// appends a block's apply makes never fault.
     fn populate_ahead(&mut self) {
         let ahead = crate::prefault::append_ahead_bytes();
         if ahead == 0 {
             return;
         }
         let base = self.tail.as_ptr() as usize;
-        if base != self.populated_base {
+        if base != self.populated_base || self.populate_epoch == 0 {
             self.populated_base = base;
             self.populated = self.tail.len();
+            self.populate_asked_at = self.tail.len();
+            self.populate_epoch = crate::prefault::next_append_epoch();
         }
-        let want = (self.tail.len() + ahead).min(self.tail.capacity());
-        if self.populated < self.tail.len() + ahead / 2 && self.populated < want {
-            crate::prefault::populate_write(base + self.populated, want - self.populated);
+        // The window is re-walked from the cursor, not from the last edge,
+        // every eighth of a window as well as when half of it is left: a
+        // populate of pages still present is a page-table walk, and the
+        // pages of a window populated seconds before the append reaches
+        // them were taken back under the fleet's memory pressure (the host
+        // swaps; loop302: ~1,070 faults in the appends of one root in five
+        // while the populate had long covered them -- after the first chunk
+        // it was never asked again, since the buffer is reused).
+        let cursor = self.tail.len();
+        let want = (cursor + ahead).min(self.tail.capacity());
+        let rewalk = crate::prefault::append_rewalk() && cursor >= self.populate_asked_at + ahead / 8;
+        if (self.populated < cursor + ahead / 2 || rewalk) && cursor < want {
+            // From the populated edge on, never over the pages the append
+            // is writing: populating from the cursor, or the buffer's start
+            // again after a seal, made the append fault ~1,100 pages a
+            // block for the four blocks after every seal in `root_faults`
+            // (why is not established); the re-walk is left behind
+            // `N42_QMDB_APPEND_REWALK=1`.
+            let from = if rewalk { cursor } else { self.populated.max(cursor) };
+            crate::prefault::populate_append(self.populate_epoch, base, from, want);
             self.populated = want;
+            self.populate_asked_at = cursor;
         }
     }
 
@@ -448,6 +475,14 @@ impl FileEntries {
         self.tail.clear();
         self.written = 0;
         self.tail.shrink_to(CHUNK_BYTES);
+        // The next chunk starts at the buffer's start: its window is asked
+        // for now, under a new epoch.
+        if crate::prefault::append_rewalk() {
+            self.populated = 0;
+            self.populate_asked_at = 0;
+            self.populate_epoch = crate::prefault::next_append_epoch();
+            self.populate_ahead();
+        }
         Ok(())
     }
 
@@ -533,6 +568,8 @@ impl FileEntries {
             written: self.written,
             populated_base: 0,
             populated: 0,
+            populate_epoch: 0,
+            populate_asked_at: 0,
             len_bytes: self.len_bytes,
             offsets: self.offsets.clone(),
             active: self.active.clone(),

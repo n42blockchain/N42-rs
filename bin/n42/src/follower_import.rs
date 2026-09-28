@@ -2810,6 +2810,8 @@ where
                 root_twig_pool_misses = split.twig_pool_misses,
                 root_twig_pool_refills = split.twig_pool_refills,
                 root_append_faults = split.append_faults,
+                root_append_behind = split.append_behind,
+                populate_lag_mb = split.populate_lag_mb,
                 root_seals = split.seals,
                 root_seal_ms = split.seal_ms,
                 "build path: the root's start after the execution"

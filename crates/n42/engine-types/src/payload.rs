@@ -2969,6 +2969,8 @@ where
                     root_twig_pool_misses = root_split.twig_pool_misses,
                     root_twig_pool_refills = root_split.twig_pool_refills,
                     root_append_faults = root_split.append_faults,
+                    root_append_behind = root_split.append_behind,
+                    populate_lag_mb = root_split.populate_lag_mb,
                     root_seals = root_split.seals,
                     root_seal_ms = root_split.seal_ms,
                     "seal-first build phases"

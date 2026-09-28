@@ -17,9 +17,15 @@
 //!   trees, 64 MiB; `0` turns the pool off and the tree keeps its own pool
 //!   of evicted trees as before). Evicted trees come back through
 //!   [`recycle_twig_nodes`] and are cleaned here, not under the lock;
-//! - the entry file's append buffer, populated writable
-//!   (`MADV_POPULATE_WRITE`) ahead of the cursor
-//!   (`N42_QMDB_APPEND_AHEAD_MB`, default 32; `0` off);
+//! - the entry file's append buffer (anonymous heap memory), populated
+//!   writable (`MADV_POPULATE_WRITE`) ahead of the cursor on a thread of its
+//!   own, `n42-qmdb-append-populate`: a window of
+//!   `N42_QMDB_APPEND_AHEAD_MB` (default 64; `0` off) from the cursor
+//!   whenever less than half of it is left or the cursor has moved an
+//!   eighth of it, and from the buffer's start right after a chunk is
+//!   sealed. The window is re-walked from the cursor every time, so pages
+//!   the kernel took back since (the fleet's host swaps) are faulted in
+//!   again off the root's thread;
 //! - the slot offsets' next segments, allocated and written through ahead
 //!   (`N42_QMDB_OFFSET_SEGMENTS_AHEAD`, default 2 segments of 8 MiB; `0`
 //!   off);
@@ -37,7 +43,7 @@
 //! memory's content as it is.
 
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     mpsc::Sender,
     Mutex, OnceLock,
 };
@@ -70,7 +76,7 @@ fn twig_pool_cap() -> usize {
 /// (`N42_QMDB_APPEND_AHEAD_MB`), 0 when off.
 pub(crate) fn append_ahead_bytes() -> usize {
     static AHEAD: OnceLock<usize> = OnceLock::new();
-    *AHEAD.get_or_init(|| env_usize("N42_QMDB_APPEND_AHEAD_MB", 32).saturating_mul(1 << 20))
+    *AHEAD.get_or_init(|| env_usize("N42_QMDB_APPEND_AHEAD_MB", 64).saturating_mul(1 << 20))
 }
 
 /// Undo list sets the pool keeps at most (`N42_QMDB_UNDO_POOL`), 0 when off.
@@ -80,7 +86,7 @@ fn undo_pool_cap() -> usize {
 }
 
 /// Undo list sets written through ahead when the pool has fewer.
-const UNDO_POOL_FLOOR: usize = 4;
+const UNDO_POOL_FLOOR: usize = 8;
 
 /// The largest undo list a block asked for, which the sets written through
 /// ahead are sized to.
@@ -132,8 +138,15 @@ pub fn twig_pool_refills() -> u64 {
 
 enum Job {
     TopUp,
-    /// `[addr, addr + len)` of a live heap buffer, populated writable.
-    PopulateWrite { addr: usize, len: usize },
+}
+
+/// One window of the append buffer to populate: `[base + from, base + to)`
+/// of a live heap buffer, for the append epoch `epoch`.
+struct PopulateJob {
+    epoch: u64,
+    base: usize,
+    from: usize,
+    to: usize,
 }
 
 /// The prefault thread, spawned on first use; `None` if it could not be.
@@ -148,7 +161,6 @@ fn worker() -> Option<&'static Sender<Job>> {
                     for job in receiver {
                         match job {
                             Job::TopUp => top_up(),
-                            Job::PopulateWrite { addr, len } => populate_write_now(addr, len),
                         }
                     }
                 })
@@ -195,6 +207,17 @@ fn fresh_twig_nodes() -> TwigNodes {
 fn top_up() {
     TOP_UP_QUEUED.store(false, Ordering::Release);
     const BATCH: usize = 32;
+    // The undo lists first: a block without one faults ~6.5 MiB on the
+    // root's thread, a twig tree short of the floor costs nothing yet.
+    let ops = UNDO_OPS.load(Ordering::Relaxed) as usize;
+    if undo_pool_cap() > 0 && ops > 0 {
+        while pools().undo_keys.len() < UNDO_POOL_FLOOR {
+            pools().undo_keys.push(touched_list(ops, [0u8; 32]));
+        }
+        while pools().undo_slots.len() < UNDO_POOL_FLOOR {
+            pools().undo_slots.push(touched_list(ops, 0u64));
+        }
+    }
     let floor = twig_pool_floor();
     loop {
         let mut dirty: Vec<TwigNodes> = {
@@ -224,15 +247,6 @@ fn top_up() {
         let mut segment = vec![0u64; OFFSET_SEGMENT_SLOTS].into_boxed_slice();
         touch_pages(&mut segment);
         pools().segments.push(segment);
-    }
-    let ops = UNDO_OPS.load(Ordering::Relaxed) as usize;
-    if undo_pool_cap() > 0 && ops > 0 {
-        while pools().undo_slots.len() < UNDO_POOL_FLOOR {
-            pools().undo_slots.push(touched_list(ops, 0u64));
-        }
-        while pools().undo_keys.len() < UNDO_POOL_FLOOR {
-            pools().undo_keys.push(touched_list(ops, [0u8; 32]));
-        }
     }
 }
 
@@ -349,18 +363,102 @@ pub(crate) fn take_offset_segment() -> Box<[u64]> {
     segment.unwrap_or_else(|| vec![0u64; OFFSET_SEGMENT_SLOTS].into_boxed_slice())
 }
 
-/// Populates `[addr, addr + len)` writable on the prefault thread. The
-/// range is a live heap buffer's spare capacity; should the buffer be
-/// reallocated before the thread gets to it, the populate lands on memory
-/// that is free or someone else's, which a populate cannot harm: it faults
-/// pages in and changes no byte.
-pub(crate) fn populate_write(addr: usize, len: usize) {
-    if len == 0 || POPULATE_OFF.load(Ordering::Relaxed) {
+/// The append populate's progress: the epoch of the last piece it
+/// finished, and the buffer offset that piece reached (its edge only grows
+/// within an epoch).
+static DONE_EPOCH: AtomicU64 = AtomicU64::new(0);
+static DONE_TO: AtomicUsize = AtomicUsize::new(0);
+/// The window the appender last asked for, as epoch and offset.
+static ASKED_EPOCH: AtomicU64 = AtomicU64::new(0);
+static ASKED_TO: AtomicUsize = AtomicUsize::new(0);
+/// Records appended past the populate's finished edge.
+static APPEND_BEHIND: AtomicU64 = AtomicU64::new(0);
+/// Epochs handed out to appenders (one per buffer and seal).
+static EPOCHS: AtomicU64 = AtomicU64::new(0);
+
+/// A new append epoch: a fresh buffer, or the buffer restarted by a seal.
+pub(crate) fn next_append_epoch() -> u64 {
+    EPOCHS.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// Whether the append window is also re-walked every eighth of a window
+/// (`N42_QMDB_APPEND_REWALK=1`), not only when half of it is left.
+pub(crate) fn append_rewalk() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_usize("N42_QMDB_APPEND_REWALK", 0) == 1)
+}
+
+/// Pieces a window is populated in, so the progress moves before the whole
+/// window is done.
+const POPULATE_PIECE: usize = 4 << 20;
+
+/// The append populate's own thread: queued on the pool thread, a populate
+/// waited behind the top-ups (thousands of twig trees cleaned after a
+/// persistence batch).
+fn append_populator() -> Option<&'static Sender<PopulateJob>> {
+    static WORKER: OnceLock<Option<Sender<PopulateJob>>> = OnceLock::new();
+    WORKER
+        .get_or_init(|| {
+            let (sender, receiver) = std::sync::mpsc::channel::<PopulateJob>();
+            std::thread::Builder::new()
+                .name("n42-qmdb-append-populate".into())
+                .spawn(move || {
+                    for job in receiver {
+                        let mut at = job.from;
+                        while at < job.to {
+                            let end = (at + POPULATE_PIECE).min(job.to);
+                            populate_write_now(job.base + at, end - at);
+                            if DONE_EPOCH.load(Ordering::Acquire) == job.epoch {
+                                DONE_TO.fetch_max(end, Ordering::AcqRel);
+                            } else {
+                                DONE_TO.store(end, Ordering::Release);
+                                DONE_EPOCH.store(job.epoch, Ordering::Release);
+                            }
+                            at = end;
+                        }
+                    }
+                })
+                .ok()
+                .map(|_| sender)
+        })
+        .as_ref()
+}
+
+/// Populates `[base + from, base + to)` writable on the append populate
+/// thread, for append epoch `epoch`. The range is a live heap buffer's
+/// spare capacity; should the buffer be reallocated before the thread gets
+/// to it, the populate lands on memory that is free or someone else's,
+/// which a populate cannot harm: it faults pages in and changes no byte.
+pub(crate) fn populate_append(epoch: u64, base: usize, from: usize, to: usize) {
+    if to <= from || POPULATE_OFF.load(Ordering::Relaxed) {
         return;
     }
-    if let Some(worker) = worker() {
-        let _ = worker.send(Job::PopulateWrite { addr, len });
+    ASKED_TO.store(to, Ordering::Relaxed);
+    ASKED_EPOCH.store(epoch, Ordering::Relaxed);
+    if let Some(worker) = append_populator() {
+        let _ = worker.send(PopulateJob { epoch, base, from, to });
     }
+}
+
+/// Notes an append reaching buffer offset `end` in epoch `epoch`: counted
+/// as behind when the populate has not finished that far.
+#[inline]
+pub(crate) fn note_append(epoch: u64, end: usize) {
+    let done = if DONE_EPOCH.load(Ordering::Acquire) == epoch { DONE_TO.load(Ordering::Acquire) } else { 0 };
+    if end > done {
+        APPEND_BEHIND.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Records appended in this process into pages the populate had not
+/// reached, and how far the populate is behind the window last asked for,
+/// in bytes (0 when it has caught up).
+pub fn append_populate_stats() -> (u64, usize) {
+    let behind = APPEND_BEHIND.load(Ordering::Relaxed);
+    let asked_epoch = ASKED_EPOCH.load(Ordering::Relaxed);
+    let asked = ASKED_TO.load(Ordering::Relaxed);
+    let done = if DONE_EPOCH.load(Ordering::Acquire) == asked_epoch { DONE_TO.load(Ordering::Acquire) } else { 0 };
+    (behind, asked.saturating_sub(done))
 }
 
 /// `MADV_POPULATE_WRITE` (Linux 5.14); the libc crate's constant is recent.

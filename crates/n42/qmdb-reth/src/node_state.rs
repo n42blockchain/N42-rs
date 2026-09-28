@@ -517,7 +517,7 @@ fn rusage(who: libc::c_int) -> (u64, u64) {
     // SAFETY: `getrusage` writes one `rusage` into the zeroed struct it is given.
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     // SAFETY: as above; `who` is RUSAGE_SELF or RUSAGE_THREAD.
-    if unsafe { libc::getrusage(who, &mut usage) } != 0 {
+    if unsafe { libc::getrusage(who, &raw mut usage) } != 0 {
         return (0, 0);
     }
     let (minor, major) = (usage.ru_minflt.max(0) as u64, usage.ru_majflt.max(0) as u64);

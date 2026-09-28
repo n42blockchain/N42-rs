@@ -1140,3 +1140,10 @@ not yet the term) is the next leg: replay at 1.6-1.9M with 200-250k blocks.
 loop298 did not run: the flood refuses to replay a set made for other arguments -- `o900000` was generated
 before the attested frames (no gateway key), and the attestation is baked into a set's frames. A set with the
 gateway key (`g900000`) is generated first in loop299's launcher, then the same four legs.
+
+loop299 (the replay set `g900000`: 192M attested frames, generated in 26 s at 7.3M/s) ran with a broken
+runner -- the gas ceiling and the rate cap were lost in the leg lines -- so it read the replay at 163k blocks
+with no rate limit: 1,114-1,171k with the queue at the gate line (840-852k) and the gate holding 21-25 ms;
+the set ran out before the leg ended. Two things it still says: the attested replay works (384,000 frames
+attested, 0 bad), and beyond ~1.2M/s the 163k block's cycle is the wall, not the supply -- an unlimited
+supply changed nothing at 163k. loop300 repeats the larger blocks with the replay capped at the offer.

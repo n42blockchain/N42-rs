@@ -1169,3 +1169,25 @@ next terms are (a) the memory parallelism -- the build pool's 16 threads run the
 CPU equal to wall (memory latency), and a node has 37 physical cores: 24-32 threads on the pool and the
 root is the cheap experiment; (b) design B (section 4: dense account ids, flat tables) for the bytes each
 account costs; (c) the tails (the cycle's mean over its median, 10.44).
+
+### 10.48 The memory parallelism (loop301): 24-32 threads cut both chains; the window stays; the root's faults are the tail
+
+| leg | build threads | win1 | cycle mean / median | leader par_exec / batch max / median / sealed_at / p90 | roots median / p90 | follower exec / fields | imports > 600 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| T16 | 16 | 1,175,174 | 138 / 118 | 41 / 22-23 / 15 / 92 / 149 | 34 / 72 | 47 / 111 | 22 |
+| T24 | 24 | 1,165,804 | 139 / 127 | 35 / 19-20 / 11 / 85 / 153 | 35 / 76 | 40 / 101 | 13 |
+| T32 | 32 | 1,180,070 | 137 / 122 | 34 / 23 / 12-13 / 85 / 147 | 35 / 73 | 40 / 100 | 5 |
+| T32b | 32 | 1,182,703 | 137 / 121 | 33 / 22 / 12-13 / 84 / 137 | 34 / 61 | 39 / 96 | 9 |
+
+More threads do what memory latency predicts: the execution 41 -> 33-35 on the leader and 47 -> 39-40 on the
+follower, the seal 92 -> 84-85, the fields 111 -> 96-100 -- and the window stays at 1,166-1,183k with the
+cycle's mean 137-139. The medians are now 15-20 under the pacing; the tail is the whole term. On T32b the
+slow seals (105 of 746, over 120) differ from the rest in `parent_fields` 0 -> 47 and `sealed` 7 -> 56: the
+child's seal waits for the parent's state root, and the parent's root is slow one time in seven (`roots_ms`
+32 -> 66 in 109 of 746) with **`root_apply` 17 -> 28 and `root_faults` 276 -> 1,923**: page faults during the
+apply. The twig pool misses 79 times a block even on the fast roots (fresh 128 KiB trees, 32 pages each; the
+pool refills only at a head move), and the entry file's append touches fresh pages; a slow root is one where
+those faults are expensive (the reclaim storm, 4 KB fallbacks). The tail's fix is to fault nothing on the root's
+thread: the twig pool topped up ahead on the release thread, the entry file's append region populated ahead of
+the cursor. The leader's per-block chain is then ~84 flat and the followers' ~96, both under the pacing, and the
+cycle would follow the tick (~105: 1.55M/s) instead of its tail.

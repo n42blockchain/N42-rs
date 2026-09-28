@@ -1147,3 +1147,25 @@ with no rate limit: 1,114-1,171k with the queue at the gate line (840-852k) and 
 the set ran out before the leg ended. Two things it still says: the attested replay works (384,000 frames
 attested, 0 bad), and beyond ~1.2M/s the 163k block's cycle is the wall, not the supply -- an unlimited
 supply changed nothing at 163k. loop300 repeats the larger blocks with the replay capped at the offer.
+
+### 10.47 The replay at larger blocks (loop300): the chains scale with the block, the window does not move
+
+| leg | block | offer (replay) | pacing | win1 | cycle mean / median | occupancy | queued | leader sealed_at / p90 / par_exec / roots | follower fields / exec / root | imports > 600 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| R250 | 250k | 1.9M | 130 | 1,128,966 | 204 / 186 | 91.5% | 772k | 134 / 209 / 63 / 48-49 | 165 / 71 / 50 | 34 |
+| R250b | 250k | 1.9M | 130 | 1,181,951 | 196 / 179 | 92.7% | 763k | 136 / 209 / 62 / 47-48 | 158 / 71 / 48 | 27 |
+| R200 | 200k | 1.7M | 115 | 1,199,143 | 165 / 149 | 98.3% | 810k | 109 / 168 / 48 / 40 | 126 / 55 / 39 | 17 |
+| R300 | 300k | 2.2M | 150 | 1,191,038 | 205 / 175 | 81.6% | 731k | 145 / 193 / 54 / 43-58 | 177 / 78 / 57 | 6 |
+
+With the attested replay the supply is whatever is asked (384,000 frames attested a leg, the set ran out only
+at the end), and the larger blocks still read 1,129-1,199k: **the chains scale with the block** -- the
+leader's seal 89 -> 109 / 135 / 145 and the followers' fields 103 -> 126 / 160 / 177 for 163k -> 200k / 250k
+/ 300k -- and the cycle with them (median 149 / 180 / 175, mean 165 / 200 / 205), so the transactions a second
+stay where they are. The per-transaction chain cost is ~0.55-0.6 us on either side (execution + root +
+index, all memory-bound per account, 10.14 / 10.21) and the fixed costs around a block are already small
+(the road 21, the tick 4.5, B's transit ~7), so a bigger block buys nothing and a smaller cycle needs a
+cheaper account. **This is the memory-bound plateau of the present design on this box, ~1.2M/s**; the
+next terms are (a) the memory parallelism -- the build pool's 16 threads run the batches in two waves with
+CPU equal to wall (memory latency), and a node has 37 physical cores: 24-32 threads on the pool and the
+root is the cheap experiment; (b) design B (section 4: dense account ids, flat tables) for the bytes each
+account costs; (c) the tails (the cycle's mean over its median, 10.44).

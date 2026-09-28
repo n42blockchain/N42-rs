@@ -2808,6 +2808,8 @@ where
                 root_faults = split.faults,
                 root_majflt = split.majflt,
                 root_twig_pool_misses = split.twig_pool_misses,
+                root_twig_pool_refills = split.twig_pool_refills,
+                root_append_faults = split.append_faults,
                 root_seals = split.seals,
                 root_seal_ms = split.seal_ms,
                 "build path: the root's start after the execution"

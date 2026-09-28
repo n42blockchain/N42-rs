@@ -473,6 +473,12 @@ pub struct RootSplit {
     pub majflt: u64,
     /// Twigs opened without a pooled leaf tree.
     pub twig_pool_misses: u64,
+    /// Fresh twig trees the prefault thread allocated over the root
+    /// (`n42_twig_core::prefault`).
+    pub twig_pool_refills: u64,
+    /// The computing thread's faults in the apply's structural writes (the
+    /// entry appends, the new twigs, the leaves), part of `faults`.
+    pub append_faults: u64,
     /// Entry-file chunks sealed during the root, and what they took.
     pub seals: u64,
     /// See `seals`.
@@ -484,6 +490,7 @@ struct RootCounters {
     thread_faults: u64,
     process_majflt: u64,
     twig_pool_misses: u64,
+    twig_pool_refills: u64,
     seals: u64,
     seal_us: u64,
 }
@@ -497,6 +504,7 @@ impl RootCounters {
             thread_faults,
             process_majflt,
             twig_pool_misses: n42_twig_core::qmdb_compat::twig_pool_misses(),
+            twig_pool_refills: n42_twig_core::qmdb_compat::twig_pool_refills(),
             seals,
             seal_us,
         }
@@ -507,6 +515,7 @@ impl RootCounters {
         split.faults = now.thread_faults.saturating_sub(self.thread_faults);
         split.majflt = now.process_majflt.saturating_sub(self.process_majflt);
         split.twig_pool_misses = now.twig_pool_misses.saturating_sub(self.twig_pool_misses);
+        split.twig_pool_refills = now.twig_pool_refills.saturating_sub(self.twig_pool_refills);
         split.seals = now.seals.saturating_sub(self.seals);
         split.seal_ms = now.seal_us.saturating_sub(self.seal_us) / 1000;
     }
@@ -879,6 +888,7 @@ impl QmdbNodeState {
             split.move_ms = move_us / 1000;
             split.apply_ms = (phases.sort_us + phases.leaves_us + phases.retire_us + phases.writes_us + phases.index_us) / 1000;
             split.hash_ms = (phases.rehash_us + phases.root_us) / 1000;
+            split.append_faults = phases.writes_faults;
             split.publish_ms = publish_us / 1000;
         }
         drop(guard);

@@ -781,6 +781,22 @@ fn read_bytes<'a>(
 /// hands it out.
 pub type TwigNodes = Box<[Hash; 2 * TWIG_SIZE]>;
 
+/// The internal nodes of an empty twig's leaf tree: every node at depth `d`
+/// is the null subtree root of height `TWIG_HEIGHT - d`.
+fn write_null_levels(nodes: &mut [Hash; 2 * TWIG_SIZE], nulls: &[Hash; TWIG_HEIGHT + 1]) {
+    for (index, node) in nodes.iter_mut().enumerate().take(TWIG_SIZE).skip(1) {
+        let depth = (u32::BITS - 1 - (index as u32).leading_zeros()) as usize;
+        *node = nulls[TWIG_HEIGHT - depth];
+    }
+}
+
+/// Writes a fresh twig's leaf tree into `nodes`: what a newly opened twig
+/// holds before its first leaf.
+pub(crate) fn init_twig_nodes(nodes: &mut [Hash; 2 * TWIG_SIZE]) {
+    nodes.fill(NULL_HASH);
+    write_null_levels(nodes, &null_level());
+}
+
 #[derive(Clone)]
 struct Twig {
     /// The leaf merkle tree: `None` once the twig is evicted (full and below
@@ -814,10 +830,13 @@ impl Twig {
             }
             None => Box::new([NULL_HASH; 2 * TWIG_SIZE]),
         };
-        for (index, node) in nodes.iter_mut().enumerate().take(TWIG_SIZE).skip(1) {
-            let depth = (u32::BITS - 1 - (index as u32).leading_zeros()) as usize;
-            *node = nulls[TWIG_HEIGHT - depth];
-        }
+        write_null_levels(&mut nodes, nulls);
+        Self::with_nodes(nodes)
+    }
+
+    /// An empty twig on a leaf tree that already holds a fresh twig's nodes
+    /// ([`init_twig_nodes`]; the prefault thread's pool).
+    fn with_nodes(nodes: TwigNodes) -> Self {
         let bits = [0u8; BITS_BYTES];
         let bits_root = hash_bits(&bits);
         let leaf_root = nodes[1];
@@ -1040,6 +1059,16 @@ pub struct ApplyPhases {
     pub rehash_us: u64,
     /// The upper tree's refresh and the root read after the rehash.
     pub root_us: u64,
+    /// Page faults the applying thread took before the writes: the sort,
+    /// the leaf hashes and lookups, the undo, the reserves, the retirement
+    /// (the worker pool's own faults are not counted).
+    pub prep_faults: u64,
+    /// Page faults the applying thread took in the structural writes: the
+    /// entry appends, the new twigs, the leaves.
+    pub writes_faults: u64,
+    /// Page faults the applying thread took in the index inserts, the
+    /// rehash and the root read.
+    pub hash_faults: u64,
 }
 
 /// Rehashes every twig marked in `dirty`, each independently of the others.
@@ -1304,6 +1333,8 @@ pub const TWIG_POOL_CAP: usize = 1024;
 /// Twigs opened with no leaf tree in the pool ([`TWIG_POOL_CAP`]): each is a
 /// fresh 128 KiB allocation under the tree's owner's lock.
 static TWIG_POOL_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub use crate::prefault::twig_pool_refills;
 
 /// How many twigs this process opened without a pooled leaf tree.
 pub fn twig_pool_misses() -> u64 {
@@ -1888,6 +1919,7 @@ impl QmdbCompatTree {
     /// The block apply on sorted operations, whichever form holds them.
     fn apply_sorted_leaf_ops<O: LeafOps + ?Sized>(&mut self, operations: &O) -> Result<(Hash, ApplyPhases), QmdbOperationError> {
         let mut phases = ApplyPhases::default();
+        let faults_at = crate::prefault::thread_faults();
         let at = std::time::Instant::now();
         for i in 1..operations.op_count() {
             if operations.op_key(i - 1) == operations.op_key(i) {
@@ -1922,8 +1954,24 @@ impl QmdbCompatTree {
         // The undo record's entries -- what every retired slot held -- built
         // on the worker pool rather than cloned one at a time in the loop.
         if let Some(slots_only) = self.recording.as_ref().map(|record| record.slots_only) {
+            // The record's lists at their final size in one allocation each,
+            // not grown by doubling through the block: every doubling is a
+            // copy into fresh pages, faulted on this thread.
+            if let Some(record) = self.recording.as_mut() {
+                // Lists a released record gave back, or ones the prefault
+                // thread wrote through: their pages are in already.
+                let (slots, keys) = crate::prefault::take_undo_lists(count);
+                if let Some(keys) = keys.filter(|_| record.appended_keys.is_empty()) {
+                    record.appended_keys = keys;
+                }
+                if let Some(slots) = slots.filter(|_| slots_only && record.slots.is_empty()) {
+                    record.slots = slots;
+                }
+                record.appended_keys.reserve_exact(count);
+            }
             if slots_only {
                 if let Some(record) = self.recording.as_mut() {
+                    record.slots.reserve_exact(held.iter().flatten().count());
                     record.slots.extend(held.iter().flatten().copied());
                 }
             } else {
@@ -1946,6 +1994,8 @@ impl QmdbCompatTree {
         self.entries.retire(&held);
         retire_twigs(self.entries.len(), &mut self.twigs, &mut dirty, &held);
         phases.retire_us = at.elapsed().as_micros() as u64;
+        let faults_writes = crate::prefault::thread_faults();
+        phases.prep_faults = faults_writes.saturating_sub(faults_at);
         let at = std::time::Instant::now();
         // The appends' index entries, inserted per shard afterwards; the
         // block's keys are distinct, so no operation reads one.
@@ -1965,6 +2015,8 @@ impl QmdbCompatTree {
             }
         }
         phases.writes_us = at.elapsed().as_micros() as u64;
+        let faults_hash = crate::prefault::thread_faults();
+        phases.writes_faults = faults_hash.saturating_sub(faults_writes);
         let at = std::time::Instant::now();
         let entries = &self.entries;
         self.index.insert_sorted(&appended, |slot| entries.key(slot as usize));
@@ -1975,6 +2027,7 @@ impl QmdbCompatTree {
         let at = std::time::Instant::now();
         let root = self.root();
         phases.root_us = at.elapsed().as_micros() as u64;
+        phases.hash_faults = crate::prefault::thread_faults().saturating_sub(faults_hash);
         Ok((root, phases))
     }
 
@@ -2175,6 +2228,12 @@ impl QmdbCompatTree {
         }
         let nulls = null_level();
         while self.twigs.len() <= twig_id {
+            // A tree the prefault thread initialised and faulted in first,
+            // then one this tree evicted, then a fresh allocation (a miss).
+            if let Some(nodes) = crate::prefault::take_clean_twig_nodes() {
+                self.twigs.push(Twig::with_nodes(nodes));
+                continue;
+            }
             let spare = self.spare_twig_nodes.pop();
             if spare.is_none() {
                 TWIG_POOL_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2205,7 +2264,9 @@ impl QmdbCompatTree {
     /// returns how many twigs this call evicted.
     pub fn evict_twig_nodes(&mut self, before: u64) -> usize {
         let mut released = Vec::new();
-        self.evict_twig_nodes_into(before, &mut released)
+        let evicted = self.evict_twig_nodes_into(before, &mut released);
+        crate::prefault::recycle_twig_nodes(&mut released);
+        evicted
     }
 
     /// [`Self::evict_twig_nodes`], keeping the evicted leaf trees for the
@@ -2216,9 +2277,13 @@ impl QmdbCompatTree {
     pub fn evict_twig_nodes_into(&mut self, before: u64, out: &mut Vec<TwigNodes>) -> usize {
         let full = ((self.next_slot.min(before) as usize) / TWIG_SIZE).min(self.twigs.len());
         let mut evicted = 0;
+        let shared = crate::prefault::shared_twig_pool();
         for twig in &mut self.twigs[self.evicted_below.min(full)..full] {
             if let Some(nodes) = twig.nodes.take() {
-                if self.spare_twig_nodes.len() < TWIG_POOL_CAP {
+                // With the shared pool on, every evicted tree goes to the
+                // caller, which hands it to the pool off its lock
+                // (`prefault::recycle_twig_nodes`).
+                if !shared && self.spare_twig_nodes.len() < TWIG_POOL_CAP {
                     self.spare_twig_nodes.push(nodes);
                 } else {
                     out.push(nodes);

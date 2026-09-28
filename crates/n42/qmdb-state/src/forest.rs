@@ -304,6 +304,25 @@ impl Released {
     }
 }
 
+/// The evicted leaf trees go to the shared twig pool on the way out, to be
+/// cleaned on the prefault thread and reused by the next twigs any tree
+/// opens (`n42_twig_core::prefault`); what the pool has no room for is freed
+/// here, wherever the release is dropped -- off the forest's lock.
+impl Drop for Released {
+    fn drop(&mut self) {
+        n42_twig_core::prefault::recycle_twig_nodes(&mut self.twig_nodes);
+        // The undo records' lists, likewise, for the next blocks' records.
+        for record in &mut self.records {
+            if let Some(undo) = record.undo.as_mut() {
+                n42_twig_core::prefault::recycle_undo_lists(
+                    std::mem::take(&mut undo.slots),
+                    std::mem::take(&mut undo.appended_keys),
+                );
+            }
+        }
+    }
+}
+
 impl std::fmt::Debug for Released {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Released")
@@ -747,8 +766,10 @@ impl QmdbForest {
         };
         // The block only ever deactivates the slots its undo names (a
         // revival is a move, not a block), so no read: the flag is false.
-        let mut slots: Vec<u64> =
-            undo.retired_slots().filter(|slot| *slot < base_next_slot).collect();
+        // Sized up front: grown by doubling it copied into fresh pages on
+        // every block, under the forest's lock.
+        let mut slots: Vec<u64> = Vec::with_capacity(undo.retired_len());
+        slots.extend(undo.retired_slots().filter(|slot| *slot < base_next_slot));
         slots.sort_unstable();
         slots.dedup();
         let changed: Vec<(u64, bool)> = slots.into_iter().map(|slot| (slot, false)).collect();

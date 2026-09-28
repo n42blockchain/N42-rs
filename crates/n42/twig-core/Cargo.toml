@@ -27,6 +27,10 @@ thiserror.workspace = true
 # stays zero-dep (it only verifies proofs).
 rayon = { workspace = true, optional = true }
 
+# `madvise(MADV_POPULATE_WRITE)` and the thread's fault count (`prefault`).
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
 [features]
 default = []
 rayon = ["dep:rayon"]

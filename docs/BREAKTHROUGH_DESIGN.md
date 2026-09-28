@@ -1099,3 +1099,23 @@ lock holds, QMDB releases and TCs appear near 5 of the 15 slowest and do not sca
 is the variance of two ~95-105 ms chains against a 100 ms pacing**: the median fits, the p75 does not. The
 cheap experiment first: the pacing at 110-120 so both chains' p90 fit under it (loop290's 70-90 were the
 other direction, before the chains were cut) -- a flat cycle of ~120 would beat a 120-median with a 133 mean.
+
+### 10.45 The pacing above the chains (loop296): the mean cycle does not move
+
+| leg | pacing | win1 | cycle mean / median (w1) | sealed_at median / p90 / over 130 | follower fields | imports > 600 ms | win2 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| P110 | 110 | 1,180,745 | 138 / 115 | 89 / 126 / 106 | 104 | 8 | 837k |
+| P115 (slow kind, gate 20 ms) | 115 | 1,118,422 | 146 / 128 | 88 / 150 / 162 | 110 | 11 | 831k |
+| P120 | 120 | 1,188,835 | 137 / 123 | 87 / 120 / 88 | 103 | 3 | 873k |
+| P110b | 110 | 1,195,908 | 136 / 115 | 89 / 124 / 97 | 102 | 12 | 825k |
+
+From 100 to 120 the median cycle follows the pacing (115 -> 123) and the mean does not (136-138): at 120 both
+chains' p90 fit under the pacing (the seal's p90 120, the fields' 103) and the mean is still 14 over the
+median. The window is 1,181-1,196k at every pacing: the fleet consumes 163k every ~136 ms whatever the tick
+says, and the remaining tail is thinner than the seal's or the fields'. The per-block terms are now the
+leader's seal (87-91: exec 38-40, start 13, prep 9, index 3, commit 1, seal 7) and the followers' fields
+(102-104: road 21, exec 44, root 33), both memory-bound in their execution and root, and the fixed costs
+around them (the road, the tick, the transit, the vote, B's 25). **Section 6 is the step left in the order**:
+larger blocks amortise the fixed costs and the chains' tails -- `--gasceil` sets the genesis gas limit, so
+250k-transaction blocks (5.25 G gas) at a ~140 ms cycle would be 1.8M/s if the supply and the memory-bound
+terms scale (they are linear in the accounts touched: 10.14, `docs/BLOCK_SHAPE_SURVEY.md`).

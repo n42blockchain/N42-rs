@@ -1230,3 +1230,21 @@ period. `mlock` is out (`ulimit -l` 8 MiB). The populate now runs on its own thr
 `root_append_behind` / `populate_lag_mb` on the root lines tell "outrun" from "taken back" (behind 0 with
 append faults = taken back). The swap needs emptying on the host (`swapoff -a`, root) before the next legs are
 comparable to the plateau's.
+
+### 10.50 The pages are taken back (loop303): the append never outruns the populate; the host's swap is the tail
+
+| leg | win1 | cycle mean / median | root faults median / p90 | append faults | append behind / populate lag MB | roots median / p90 | sealed_at / p90 / over 130 | swap used |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| F100 | 1,148,746 | 142 / 125 | 13 / 1,561 | 7 | 0 / 0 | 32-33 / 62 | 84 / 150 / 155 | 7 G |
+| F100b | 1,121,363 | 145 / 138 | 18 / 1,709 | 7 | 0 / 0 | 33 / 62 | 83 / 134 / 128 | 7 G |
+| F100c | 1,162,787 | 140 / 128 | 36 / 1,728 | 5 | 0 / 4 | 34 / 63 | 84 / 138 / 140 | 7 G |
+| F90 | 1,136,075 | 143 / 129 | 235 / 1,973 | 7 | 0 / 0 | 34 / 64 | 89 / 167 / 214 | 7 G |
+
+`root_append_behind` is 0 on every root and the populate's lag 0-4 MB: the append never writes past the
+populated window, and the root's p90 still faults 1,560-1,970 times. The pages are taken back between the
+populate and the append: the host's swap is full (7 of 8 GB used through all four legs), so anonymous pages
+are the reclaim's prey. **The tail of the root -- and with it the seal's and the cycle's -- is the host's
+memory state, not the code's**; the runs since the swap filled (which of the campaign's legs it was is not
+known -- the counters only started reading it here) are all under it. The next legs need the swap emptied on
+the host (`swapoff -a`) and the "swap empty" rule enforced in the launcher's quiet check (a leg with used swap
+is void, like one with a small huge-page pool).

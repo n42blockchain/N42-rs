@@ -91,6 +91,87 @@ Two designs, one measurement first:
 - Falsified if the profile shows the 2.3 us in the view's lookup itself (then B, the store) rather than a shared
   structure (then A suffices), or if A's read pass costs more than it saves.
 
+## 4B. Dense account ids: the plan (2026-10-01, branch `designB/dense-ids`)
+
+Where it starts (10.47-10.50): ~1.2M/s on 163k-transaction blocks; the leader's seal 84 ms (start 13 + prep 9 +
+exec 33 + index 3 + commit 1 + seal 7 + gaps), the followers' fields 96-100 (road 21 + exec 39 + root 28-33). Every
+per-account term is a hashed probe into a 20-byte-keyed map that misses the cache: the execution's ~490k reads a
+block at 0.55 us (326k from the batch's own `AddressMap`, 125-135k through the parent's index shards and a batch
+map, 11-29k through the QMDB view), the batch's three commits a transfer (`BatchState::commit_transfer`, three more
+probes), the sender partition (`partition_by_sender`, one `AddressHashMap` probe a transfer), the index build
+(`OutputShards` index mode: address -> batch, 3 ms), the parent's `FrozenShards::get` (shard index, then the
+batch map). Design B numbers every account once, off the chain, and keys the block's working structures by number.
+
+**The id table** (`crates/n42/account-ids`, `n42_account_ids::AccountIds`, stage 1). 64 shards chosen by a fixed
+multiply-xor mix of the address (the same in every process); each a `parking_lot::RwLock` over an `AddressMap<u32>`
+(address -> id) and a `Vec<Address>` (position -> address). `id = position << 6 | shard`: the shards number without
+a shared counter, an id's address is one indexed read, and the ids are dense to within the shards' imbalance
+(`id_bound` <= ~1.02 x the count at 2M). It is the only hashed structure. Node-local: never on the wire, never in a
+block, never in QMDB (its key derivation is gov5's contract and stays). Memory ~52 B an account (20 list + ~32 map
+with slack): ~110 MB at the flood's 2M. **Persistence: not used by the node.** Ids are assigned lazily on first sight
+and nothing outside the process sees them, so a restart's renumbering is free of meaning; its cost is one insert
+an account at its next admission (~2M inserts spread over the first ~50 blocks' ingest, on the recovery threads).
+`save`/`load` exist (20 B an account, a 40 MB file at 2M, same ids back) for a node that wants a warm table.
+
+**The id space under the flood.** 6,000 senders + 2,000,000 recipients (`tx_flood --recipients`, the bench's
+2M) + the beneficiary and the system contracts. A block touches ~147k distinct recipients of the 2M, so the table
+covers 1 - e^(-0.074 N) of them after N blocks: 99% at 60, all of them long before 1,000 blocks -- **~2.006M ids
+after 1,000 blocks, `id_bound` ~2.05M**, ~110 MB of table. A direct `Vec<u32>` indexed by id is 8 MB: that is the
+per-block slot map below. On a real chain the space is every account the node has seen (mainnet-like 300M: a
+direct map would be 1.2 GB), so the slot map switches to a per-block remap (sort + dedup of the block's ~300k ids on
+the pool, ~2 ms) when `id_bound` passes 2^24 (64 MB); the code carries both behind one type.
+
+**Ids at admission** (stage 1). The ingest already touches every transaction once on its recovery threads
+(`frame_of`, attested and plain frames alike): under `N42_DENSE_IDS=1` it resolves each sender (once a sender run)
+and each recipient (`transfer_plain`'s `to`; `NO_ID` for a creation), and the frame's record carries them:
+`NewFrame.ids` / the index entry's `FrameIds { senders, recipients: Arc<[u32]> }`, parallel to the frame's
+transactions, 8 B a transaction (8 MB at 2,000 queued frames); `TxQueue::frame_ids(&[id])` hands them out by
+reference. A transaction outside an indexed frame (RPC, an unaligned frame) has no ids and is resolved by the build
+through the table (the miss path). The beneficiary's and the system contracts' ids are resolved once a block. The
+ingest line gains `ids_new`, `ids_hit`, `id_table_size`, `id_resolve_us`, `ids_full`.
+
+**The batch state and the index by slot** (stage 2). The build's keys come with ids (the frames'). One pass on
+the builder's thread (or the pool) assigns block slots in first-appearance order through `slot_of: Vec<u32>`
+indexed by id (8 MB, kept across blocks, reset by walking the block's ids): `S` <= 2 x txs + 1 slots (~300k), and
+`addr_of_slot: Vec<Address>`, `id_of_slot: Vec<u32>`. The sender partition becomes `group_of_slot: Vec<u32>` (no
+hash). The block holds `accounts: Vec<Option<BundleAccount>>` by slot and `owner: Vec<AtomicU16>` (batch index,
+`NONE`): a batch's first touch of a slot claims it by CAS -- **that is the index (slot -> batch), built during the
+execution, no separate pass** -- and the owner reads/writes `accounts[slot]` directly (the cell is the owner's alone);
+a batch that finds a slot owned by another keeps its own entry in a small local map (the conflicts, ~10% of the
+recipients on this shape), folded onto the owner's at the close by the graft's add, as the index mode folds them
+now. `transfer_plain` gets a variant that takes the three slots with the `TxEnv` and reads through
+`BatchSlots::basic_slot(slot, address)` (the address only for a provider miss). Behind `N42_DENSE_IDS=1`.
+
+**The parent's and grandparent's outputs by id** (stage 3). A block's frozen output keeps its `slot_of` (by id),
+its slot table and `owner`/conflicts: `get(id)` = `slot_of[id]` -> `accounts[slot]` (or the conflict fold), two
+array reads. The leader keeps two generations (`leader_layers`: 2 x 8 MB slot maps + the tables, ~2 x 60 MB). The
+child's read: its own slot (array) -> the parent's `get(id)` -> the grandparent's -> the provider by address (the
+11-29k view reads, unchanged). Under the remap (id space > 2^24) a generation's lookup is a binary search over its
+sorted ids (~18 probes in a 1.2 MB array, mostly cached).
+
+**The follower** (stage 4). Its ingest resolved the same frames' ids locally (its own table, its own numbers);
+`execute_transfers_build_path` takes the block's keys with ids from `take_frames` + `frame_ids` (one `Arc` clone a
+frame) and runs stage 2/3's structures; `FOLLOWER_SHARDS` becomes the slot table. A block body that did not come
+from indexed frames resolves its accounts through the table on the pool (counted: `ids_resolved_at_import`).
+
+**The merge** (stage 5). The engine's bundle, the hashed post-state and the QMDB leaves walk the slot table in slot
+order with `addr_of_slot` (written once at slot assignment): no id -> address lookups, no map rebuild; on the pool,
+beside the next block as now.
+
+| stage | what | expected (ms) | test |
+| --- | --- | --- | --- |
+| 1 | id table; ids at admission in the frames; ingest counters; table bench | chain 0 (ingest +~0.1 us a transaction, on the recovery threads) | ids unique/stable (save/load), concurrent resolvers agree, a frame's ids = its senders/recipients in frame order |
+| 2 | batch state + index by slot (`N42_DENSE_IDS=1`) | leader exec 33 -> ~25, index 3 -> 0, partition 3 -> ~1 | `tests/output_shards.rs` and `bench_build_real_path`'s equality: the same bundle, the same index/conflicts as the address path |
+| 3 | parent/grandparent by id | leader exec ~25 -> ~20; seal 84 -> ~66 | a chained build (three blocks) equals the address path; reads per door counted |
+| 4 | follower build path by id | follower exec 39 -> ~25; fields ~98 -> ~80 | `the_build_path_matches_the_follower_path...` with ids; `bench_follower_import` |
+| 5 | merge by slot | root 28-33 -> ~25 (the hashed post-state/leaves walk); fields -> ~75 | the merged bundle and the hashed post-state equal the address path's |
+
+Expected after 2-5: the leader's seal ~84 -> ~65, the followers' fields ~98 -> ~75: both chains well under the
+pacing, so the cycle follows the tick (~1.5M/s at 163k) and, the per-account cost down, larger blocks then pay.
+Falsified if stage 2's batch (bench `batch max`) does not fall by a third with the reads as array indexes -- then
+the per-transfer cost is not the probes but the `BundleAccount`'s size (~150 B a touch) and the next design is a
+compact account (balance, nonce: 40 B) in the slot table.
+
 ## 5. The follower's import off the vote's chain entirely (consensus)
 
 With deferred execution the follower must execute n before voting on n+1 (the header carries n's fields). The

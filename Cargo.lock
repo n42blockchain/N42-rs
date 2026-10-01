@@ -7718,6 +7718,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "n42-account-ids"
+version = "2.1.5"
+dependencies = [
+ "alloy-primitives 1.7.1",
+ "parking_lot 0.12.5",
+ "tikv-jemallocator",
+]
+
+[[package]]
 name = "n42-bmt-core"
 version = "2.1.5"
 dependencies = [
@@ -8380,6 +8389,7 @@ dependencies = [
  "bytes",
  "ed25519-dalek",
  "libc",
+ "n42-account-ids",
  "n42-engine-types",
  "n42-tx-queue",
  "n42-tx-types",

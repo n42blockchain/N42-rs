@@ -263,7 +263,7 @@ impl AccountIds {
             let mut out = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
             out.write_all(MAGIC)?;
             out.write_all(&(SHARDS as u32).to_le_bytes())?;
-            for shard in self.shards.iter() {
+            for shard in &*self.shards {
                 let held = shard.read();
                 let len = u32::try_from(held.addresses.len()).map_err(|_| IdError::Full)?;
                 out.write_all(&len.to_le_bytes())?;

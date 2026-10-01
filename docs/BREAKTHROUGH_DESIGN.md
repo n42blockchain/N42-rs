@@ -1248,3 +1248,23 @@ memory state, not the code's**; the runs since the swap filled (which of the cam
 known -- the counters only started reading it here) are all under it. The next legs need the swap emptied on
 the host (`swapoff -a`) and the "swap empty" rule enforced in the launcher's quiet check (a leg with used swap
 is void, like one with a small huge-page pool).
+
+### 10.51 Design B, stages 1-2 off the fleet (branch `designB/dense-ids`): falsified on the bench
+
+Stage 1 (a node-local id table: 64 shards, id = position << 6 | shard, ids resolved at admission and carried
+by the frames, `N42_DENSE_IDS=1`): a held id resolves in 216-222 ns on 16 threads (50-84 alone), a new one in
+1.15-1.32 us including the table's growth -- all on the ingest's threads, 0 on the chain; 2.006M ids and ~110
+MB after 1,000 blocks of this flood. Stage 2 (each batch keeps its accounts by first touch; a process-wide
+claims table indexed by id, one `AtomicU64` an id claimed by CAS, is the block's account -> batch index, built
+during the execution; the 6,119 accounts another batch claimed, the beneficiary and id-less accounts in a small
+map) gives bundles identical to the address path. On `bench_build_real_path` (163k transfers, 16 threads, 10
+rounds): `par_exec` 11-17 -> 12-22, the batch max / median 6-11 / 5-6 -> 6-15 / 5-7, the read a transfer
+778-805 -> 764-777 ns, the close 96-155 -> 191-358 (the address map built at the close costs more than the
+probes it saves). **The batch max did not fall at all; the plan is falsified on the bench** -- its read is
+one QMDB view read a transfer (the fresh recipient), which no id removes, and the map probes the design
+targets are a small share. The fleet's reads are mostly the batch's own map and the parent's index (10.25),
+so a fleet leg with the ids wired into the builder (not done: `payload.rs` and the follower path do not pass
+the frames' ids) could still read differently; but the per-account term is the account's own cache lines,
+which an index does not touch. The branch stays unmerged (its last commit, the beneficiary fast path, is
+uncompiled). Where the campaign stands: the plateau of ~1.2M/s is the memory system's per-account cost on
+three nodes of this box, and the tail is the host's swap (10.50).

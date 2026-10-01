@@ -141,6 +141,9 @@ struct Dense {
     hint: [(Address, AccountId); 2],
     /// The batch's accounts in first-touch order.
     list: Vec<(Address, BundleAccount)>,
+    /// The beneficiary's position: every batch holds it, so it is never
+    /// claimed and never hashed.
+    beneficiary: Option<usize>,
     /// Positions of accounts not found by claim: another batch's, the
     /// beneficiary, accounts without an id, and positions past
     /// [`POSITION_MAX`].
@@ -165,6 +168,10 @@ impl Dense {
     /// The account's position in `list`, if the batch holds it.
     #[inline]
     fn find(&mut self, address: &Address, id: AccountId) -> Option<usize> {
+        if *address == self.block.beneficiary {
+            self.counts.by_claim += 1;
+            return self.beneficiary;
+        }
         if let Some(claim) = self.block.claims.get(id as usize) {
             let v = claim.load(Ordering::Relaxed);
             if (v >> 32) as u32 == self.block.generation && ((v >> 16) & 0xffff) as u16 == self.batch {
@@ -186,7 +193,11 @@ impl Dense {
     fn insert(&mut self, address: Address, id: AccountId, entry: BundleAccount) -> usize {
         let at = self.list.len();
         self.list.push((address, entry));
-        if at <= POSITION_MAX && address != self.block.beneficiary {
+        if address == self.block.beneficiary {
+            self.beneficiary = Some(at);
+            return at;
+        }
+        if at <= POSITION_MAX {
             if let Some(claim) = self.block.claims.get(id as usize) {
                 let current = claim.load(Ordering::Relaxed);
                 if (current >> 32) as u32 != self.block.generation {
@@ -252,6 +263,7 @@ impl<G: Database> BatchState<G> {
             batch,
             hint: [(Address::ZERO, NO_ID); 2],
             list: Vec::with_capacity(accounts),
+            beneficiary: None,
             others: AddressMap::with_capacity_and_hasher(accounts / 8 + 4, Default::default()),
             counts: DenseCounts::default(),
         };
